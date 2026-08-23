@@ -84,11 +84,16 @@ type RegistrationOptions struct {
 	// disables the floor. See DefaultMinReregisterInterval for why this is a
 	// safeguard rather than the fix.
 	MinReregisterInterval time.Duration
+
+	// ValidateCredentials runs after a cache/network/stub response is decoded
+	// but before it is cached or returned. It is comparison/validation only and
+	// must never treat decoded token claims as authentication authority.
+	ValidateCredentials func(workerID, runtimeToken string) error
 }
 
 // RegisterRequest is the JSON body sent on POST /api/workers/register.
 //
-// The platform contract (see platform/src/app/api/workers/register/route.ts):
+// The orchestrator registration contract is:
 //
 //	{ machineId?: string, hostname: string, capacity: number, version?: string,
 //	  projects?: string[], provides?: []{ kind: string } }
@@ -154,9 +159,8 @@ type RegisterRequest struct {
 	// daemon's local config (daemon.yaml's projects[]). Each entry carries
 	// the project id and resolved repository URL the daemon enforces at
 	// WorkerSpawner.AcceptWork time. Distinct from the legacy `Projects`
-	// []string above, which the platform overwrites with Linear-resolved
-	// names for registration-token auth (see platform/src/app/api/workers/
-	// register/route.ts:265).
+	// []string above, which an orchestrator may project from its own tracker
+	// bindings when registration-token authentication is used.
 	//
 	// Phase 1c of 2026-05-18-daemon-config-sync-DESIGN.md — read-only mirror;
 	// platform persists into worker_hosts.allowed_projects jsonb so the
@@ -388,13 +392,17 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 
 	if !opts.ForceReregister {
 		if cached, _ := LoadCachedJWT(opts.JWTPath); cached != nil && cachedMatchesMode(cached, useStub) {
-			return &RegisterResponse{
+			resp := &RegisterResponse{
 				WorkerID:              cached.WorkerID,
 				RuntimeToken:          cached.RuntimeToken,
 				HeartbeatInterval:     cached.HeartbeatInterval,
 				PollInterval:          cached.PollInterval,
 				RuntimeTokenExpiresAt: cached.RuntimeTokenExpiresAt,
-			}, nil
+			}
+			if err := validateRegistrationCredentials(opts, resp); err != nil {
+				return nil, err
+			}
+			return resp, nil
 		}
 	}
 
@@ -437,6 +445,9 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 			return nil, err
 		}
 	}
+	if err := validateRegistrationCredentials(opts, resp); err != nil {
+		return nil, err
+	}
 
 	if err := SaveCachedJWT(opts.JWTPath, resp, opts.Now()); err != nil {
 		// Cache write failure is non-fatal — the daemon can still run.
@@ -444,6 +455,16 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		return resp, nil
 	}
 	return resp, nil
+}
+
+func validateRegistrationCredentials(opts RegistrationOptions, resp *RegisterResponse) error {
+	if opts.ValidateCredentials == nil || resp == nil {
+		return nil
+	}
+	if err := opts.ValidateCredentials(resp.WorkerID, resp.RuntimeToken); err != nil {
+		return fmt.Errorf("validate registration credentials: %w", err)
+	}
+	return nil
 }
 
 // isStubRuntimeToken reports whether tok was minted by buildStubResponse

@@ -2,11 +2,15 @@ package daemon
 
 import (
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"errors"
 	"fmt"
 	"log/slog"
 	"sort"
+	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
@@ -20,17 +24,93 @@ import (
 // ready. The correlation fields are deliberately per session: session-shim-v1
 // defines no host-wide controller generation.
 type SessionShimAdoptionEvidence struct {
-	Identity             sessionshim.Identity
-	HostID               string
-	ControllerID         string
-	ShimID               string
-	ProcessEpoch         uint64
-	ControllerGeneration uint64
-	LastForwardedSeq     uint64
-	Extensions           shimwire.Extensions
-	PreparedCorrelation  []byte
-	ObservedAtUnixNano   int64
+	Identity               sessionshim.Identity
+	HostID                 string
+	ControllerID           string
+	ShimID                 string
+	ProcessEpoch           uint64
+	ControllerGeneration   uint64
+	LastForwardedSeq       uint64
+	Extensions             shimwire.Extensions
+	PreparedCorrelation    []byte
+	ObservedAtUnixNano     int64
+	ProtocolVersion        uint32
+	CarrierCompatible      bool
+	CarrierIncompatibility SessionShimCarrierIncompatibility
+	// SnapshotProxy is the exact just-adopted controller capability. It is
+	// callable during OnAdoption, before the controller enters the daemon's
+	// published adopted map, so carrier takeover can perform its mandatory fresh
+	// resync without a circular lookup. Nil for selected v1.
+	SnapshotProxy *SessionShimSnapshotProxy
 }
+
+// SessionShimSnapshotProxy exposes only the two fresh authoritative snapshot
+// operations. It owns no VT and has no cache/fabrication fallback.
+type SessionShimSnapshotProxy struct {
+	controller *sessionshim.Controller
+	daemon     *Daemon
+	identity   sessionshim.Identity
+	active     atomic.Bool
+}
+
+// Inspect returns a fresh read-only shim-owned screen and atSeq.
+func (p *SessionShimSnapshotProxy) Inspect(ctx context.Context) (shimwire.SnapshotResult, error) {
+	if p == nil || p.controller == nil || !p.active.Load() {
+		return shimwire.SnapshotResult{}, fmt.Errorf("session shim: %w: authoritative snapshot proxy unavailable", shimwire.ErrVersionMismatch)
+	}
+	return p.controller.InspectSnapshot(ctx)
+}
+
+// Emit asks the shim-owned PTY host to emit exactly one snapshot frame and
+// waits until the daemon's ordered durable stream consumer has accepted it.
+func (p *SessionShimSnapshotProxy) Emit(ctx context.Context) (shimwire.SnapshotResult, error) {
+	if p == nil || p.controller == nil || !p.active.Load() {
+		return shimwire.SnapshotResult{}, fmt.Errorf("session shim: %w: authoritative snapshot proxy unavailable", shimwire.ErrVersionMismatch)
+	}
+	result, err := p.controller.EmitSnapshot(ctx)
+	if err != nil || !result.InStream || p.daemon == nil {
+		return result, err
+	}
+	// The result is completion/correlation evidence, not a second transmission:
+	// the exact frame is delivered once through OnSessionEventDurable. The result
+	// is ordered after the emitted frame on shimwire, but takeover is
+	// not complete until the daemon's early consumer has durably crossed that
+	// frame. This also drains arbitrarily large replay before OnAdoption returns.
+	want := result.AtSeq + 1
+	ticker := time.NewTicker(time.Millisecond)
+	defer ticker.Stop()
+	for p.daemon.SessionShimForwardedSeq(p.identity.OrgID, p.identity.SessionID) < want {
+		select {
+		case <-ctx.Done():
+			return shimwire.SnapshotResult{}, fmt.Errorf("session shim: wait for emitted snapshot durability: %w", ctx.Err())
+		case <-ticker.C:
+		}
+	}
+	return result, nil
+}
+
+func (p *SessionShimSnapshotProxy) deactivate() {
+	if p != nil {
+		p.active.Store(false)
+	}
+}
+
+// SessionShimCarrierIncompatibility is typed capability evidence for a shim
+// that remains adopted/capacity-charged but cannot back the composing carrier.
+type SessionShimCarrierIncompatibility string
+
+// ErrSessionShimCarrierConfig reports an activation configuration that cannot
+// durably consume the authoritative emitted frame.
+var ErrSessionShimCarrierConfig = errors.New("session shim: authoritative snapshot carrier configuration incomplete")
+
+const (
+	// SessionShimCarrierCompatible means selected local wire satisfies the
+	// composing carrier's declared requirements.
+	SessionShimCarrierCompatible SessionShimCarrierIncompatibility = ""
+	// SessionShimCarrierAuthoritativeSnapshotV2Required reports selected v1's
+	// typed external-carrier refusal while retaining local controller ownership.
+	SessionShimCarrierAuthoritativeSnapshotV2Required SessionShimCarrierIncompatibility = "authoritative_snapshot_unsupported"
+)
 
 // SessionShimAdoptionPreparation is the post-Hello, pre-Welcome fact supplied
 // to a composing carrier reservation. HostID is already resolved for the
@@ -44,6 +124,7 @@ type SessionShimAdoptionPreparation struct {
 	ProcessEpoch                uint64
 	CurrentControllerGeneration shimwire.Generation
 	LastForwardedSeq            uint64
+	SelectedVersion             uint32
 }
 
 // SessionShimAdoptionReceipt is opaque durable correlation state returned by a
@@ -115,6 +196,15 @@ type SessionShimConfig struct {
 	// shims no daemon in the fleet knows how to adopt.
 	EnableOwnership bool
 
+	// ControllerID optionally overrides the opaque process-scoped controller
+	// correlation. Empty generates one high-entropy id once in daemon.New.
+	ControllerID string
+
+	// RequireAuthoritativeSnapshot declares that the composing external attach
+	// carrier needs fresh inspect/emit proxying. Selected v1 is still adopted and
+	// capacity-charged, but the carrier callback is not activated.
+	RequireAuthoritativeSnapshot bool
+
 	// OrgID is the organization half of the lifecycle identity (§D2). A
 	// standalone OSS daemon has no organization boundary, so it defaults to
 	// "local" — a real value rather than an empty one, because the identity is
@@ -123,9 +213,8 @@ type SessionShimConfig struct {
 	OrgID string
 
 	// HostID is the durable host authority named by restart fences. It is NOT
-	// the controller id or worker-registration id. Empty preserves the legacy
-	// fallback to the daemon controller id for existing embedders; a hosted
-	// multi-organization composition must supply its real stable host identity.
+	// the controller id or worker-registration id. Empty means no stable host
+	// identity is exposed; it never falls back to another correlation.
 	HostID string
 
 	// HostIDForOrg resolves the durable host authority inside one organization.
@@ -240,6 +329,22 @@ type SessionShimConfig struct {
 	// session (its durable last_forwarded_seq + 1). Nil resumes from the start of
 	// the stream, which can only over-replay, never under-replay.
 	ResumeFrom func(orgID, sessionID string) uint64
+}
+
+func (c SessionShimConfig) requiresStableHostIdentity() bool {
+	return c.HostIDForOrg != nil || c.PrepareAdoption != nil || c.OnAdoption != nil ||
+		c.OnTerminalEvidence != nil || c.PrepareAdoptionBatch != nil || c.OnAdoptionBatch != nil ||
+		c.FenceStore != nil || c.ExactFenceStore != nil
+}
+
+func (c SessionShimConfig) validateSnapshotCarrier() error {
+	if !c.RequireAuthoritativeSnapshot {
+		return nil
+	}
+	if c.OnAdoption == nil || c.OnSessionEventDurable == nil {
+		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs OnAdoption and OnSessionEventDurable", ErrSessionShimCarrierConfig)
+	}
+	return nil
 }
 
 // defaultShimRegistryDir resolves the registry location through the injected
@@ -410,6 +515,9 @@ func (c SessionShimConfig) callbackTimeout() time.Duration {
 // is already running on this host cannot honestly advertise how much it can take.
 func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	cfg := d.sessionShimConfig()
+	if err := cfg.validateSnapshotCarrier(); err != nil {
+		return err
+	}
 
 	// The §D8 inequality is validated at STARTUP, before any session is admitted.
 	// A configuration whose orphan bound can outlast an external release
@@ -490,6 +598,15 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// the composing carrier each exact fact and require its durable handoff
 	// before publishing adoptionComplete or starting registration.
 	entries := make(map[sessionshim.Identity]adoptedShim, len(result.Adopted))
+	gates := make(map[*sessionshim.Controller]*shimAdoptionGate, len(result.Adopted))
+	gatesCommitted := false
+	defer func() {
+		if !gatesCommitted {
+			for _, gate := range gates {
+				gate.finish(false)
+			}
+		}
+	}()
 	for _, c := range result.Adopted {
 		id := c.Identity()
 		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id], hostByID[id])
@@ -497,11 +614,17 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
 		}
+		gate := newShimAdoptionGate()
+		gates[c] = gate
+		d.consumeShimEventsGated(c, gate)
 		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence)
+		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: durable adoption for %s: %w", id, callbackErr)
 		}
+		// The proxy is a synchronous takeover capability, not retained state.
+		evidence.SnapshotProxy = nil
 		entries[id] = adoptedShim{
 			controller:      c,
 			shimID:          c.Hello().ShimID,
@@ -569,10 +692,22 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			for _, controller := range result.Adopted {
 				entry := entries[controller.Identity()]
 				if entry.adoption.Identity.OrgID == orgID {
-					batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
-						Evidence: entry.adoption,
-						Receipt:  entry.adoptionReceipt,
-					})
+					if entry.adoption.CarrierCompatible {
+						batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
+							Evidence: entry.adoption,
+							Receipt:  entry.adoptionReceipt,
+						})
+					} else {
+						hello := entry.controller.Hello()
+						batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
+							OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
+							ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
+							ControllerGeneration: entry.adoption.ControllerGeneration,
+							ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
+							Reason:           sessionshim.QuarantineAuthoritativeSnapshotUnsupported,
+							ConsumesCapacity: true,
+						})
+					}
 				}
 			}
 			for _, quarantined := range result.Quarantined {
@@ -585,6 +720,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 					batch.Tombstoned = append(batch.Tombstoned, terminal)
 				}
 			}
+			sessionshim.SortQuarantined(batch.Quarantined)
 			receipt, batchErr := d.completeSessionShimAdoptionBatch(ctx, batch)
 			if batchErr != nil {
 				result.Close()
@@ -607,7 +743,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			// ResumeFrom is exactly last_forwarded_seq + 1. Seed the replacement
 			// daemon's snapshot before its event consumer starts so an immediate
 			// second planned restart cannot regress the durable correlation to zero.
-			d.shims.forwarded[id] = resumeFrom - 1
+			if durableBeforeAdoption := resumeFrom - 1; durableBeforeAdoption > d.shims.forwarded[id] {
+				d.shims.forwarded[id] = durableBeforeAdoption
+			}
 		}
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
@@ -615,6 +753,12 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	for orgID, receipt := range batchReceipts {
 		d.shims.batchReceipts[orgID] = receipt
 	}
+	d.shims.mu.Unlock()
+	for _, gate := range gates {
+		gate.finish(true)
+	}
+	gatesCommitted = true
+	d.shims.mu.Lock()
 	d.shims.adoptionComplete = true
 	d.shims.adoptionCompletedAtUnixNano = time.Now().UTC().UnixNano()
 	d.shims.mu.Unlock()
@@ -623,13 +767,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			slog.Warn("session shim: dispose startup tombstone after durable terminal handoff",
 				"session", tombstone.Identity().String(), "error", removeErr)
 		}
-	}
-
-	// Adoption without a consumer would be authority this daemon never exercises:
-	// the shim's ring is bounded, so an unread stream costs the next adoption an
-	// avoidable Gap, and a terminal Exit would never reach the cleanup path.
-	for _, c := range result.Adopted {
-		d.consumeShimEvents(c)
 	}
 
 	slog.Info("session shim: startup adoption complete",
@@ -643,18 +780,46 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 
 // controllerID identifies this daemon process in shim diagnostics.
 func (d *Daemon) controllerID() string {
-	d.mu.RLock()
-	defer d.mu.RUnlock()
-	if d.workerID != "" {
-		return d.workerID
+	return d.controllerIDValue
+}
+
+// ControllerID returns the immutable process-scoped session-shim controller id.
+func (d *Daemon) ControllerID() string { return d.controllerID() }
+
+func resolveControllerID(cfg SessionShimConfig) (string, error) {
+	if cfg.ControllerID != "" {
+		if strings.TrimSpace(cfg.ControllerID) != cfg.ControllerID {
+			return "", errors.New("session shim: controller id must not contain surrounding whitespace")
+		}
+		if cfg.ControllerID == "daemon" {
+			return "", errors.New("session shim: controller id refuses reserved alias \"daemon\"")
+		}
+		if cfg.HostID != "" && cfg.ControllerID == cfg.HostID {
+			return "", errors.New("session shim: controller id must differ from stable host id")
+		}
+		return cfg.ControllerID, nil
 	}
-	return "daemon"
+	raw := make([]byte, 32)
+	if _, err := rand.Read(raw); err != nil {
+		return "", fmt.Errorf("session shim: generate controller id: %w", err)
+	}
+	generated := "ctl_" + hex.EncodeToString(raw)
+	if cfg.HostID != "" && generated == cfg.HostID {
+		return "", errors.New("session shim: generated controller id aliases stable host id")
+	}
+	return generated, nil
+}
+
+func (d *Daemon) validateControllerAlias(value, kind string) error {
+	if value != "" && value == d.controllerID() {
+		return fmt.Errorf("session shim: controller id must differ from %s", kind)
+	}
+	return nil
 }
 
 // sessionShimHostID returns the host authority named by restart/adoption
 // evidence for one organization. The resolver wins, then the explicit static
-// config. Falling back to controllerID preserves the old standalone API only;
-// hosted composition supplies one of the first two and never relabels a worker.
+// config. No other correlation is ever substituted.
 func (d *Daemon) sessionShimHostID(ctx context.Context, orgID string) (string, error) {
 	cfg := d.sessionShimConfig()
 	if cfg.HostIDForOrg != nil {
@@ -670,12 +835,21 @@ func (d *Daemon) sessionShimHostID(ctx context.Context, orgID string) (string, e
 		if hostID == "" {
 			return "", fmt.Errorf("session shim: host identity resolver returned empty for organization %q", orgID)
 		}
+		if err := d.validateControllerAlias(hostID, "stable host id"); err != nil {
+			return "", err
+		}
 		return hostID, nil
 	}
 	if cfg.HostID != "" {
+		if err := d.validateControllerAlias(cfg.HostID, "stable host id"); err != nil {
+			return "", err
+		}
 		return cfg.HostID, nil
 	}
-	return d.controllerID(), nil
+	if cfg.requiresStableHostIdentity() {
+		return "", errors.New("session shim: stable host identity is required by composing callbacks")
+	}
+	return "", nil
 }
 
 func cloneShimExtensions(in shimwire.Extensions) shimwire.Extensions {
@@ -711,6 +885,9 @@ func (d *Daemon) prepareSessionShimAdoption(
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
 ) (sessionshim.PreparedAdoption, error) {
+	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V2 {
+		return sessionshim.PreparedAdoption{}, nil
+	}
 	hook := d.sessionShimConfig().PrepareAdoption
 	if hook == nil {
 		return sessionshim.PreparedAdoption{}, nil
@@ -725,6 +902,7 @@ func (d *Daemon) prepareSessionShimAdoption(
 		ProcessEpoch:                evidence.ProcessEpoch,
 		CurrentControllerGeneration: evidence.CurrentControllerGeneration,
 		LastForwardedSeq:            evidence.LastForwardedSeq,
+		SelectedVersion:             evidence.SelectedVersion,
 	})
 	if err != nil {
 		return sessionshim.PreparedAdoption{}, err
@@ -763,10 +941,29 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 		Extensions:           cloneShimExtensions(ctrl.Adoption().Extensions),
 		PreparedCorrelation:  append([]byte(nil), prepared.Correlation...),
 		ObservedAtUnixNano:   d.shimNow().UnixNano(),
+		ProtocolVersion:      ctrl.SelectedVersion(),
+		CarrierCompatible:    !d.sessionShimConfig().RequireAuthoritativeSnapshot || ctrl.SupportsAuthoritativeSnapshot(),
+		CarrierIncompatibility: func() SessionShimCarrierIncompatibility {
+			if d.sessionShimConfig().RequireAuthoritativeSnapshot && !ctrl.SupportsAuthoritativeSnapshot() {
+				return SessionShimCarrierAuthoritativeSnapshotV2Required
+			}
+			return SessionShimCarrierCompatible
+		}(),
+		SnapshotProxy: func() *SessionShimSnapshotProxy {
+			if ctrl.SupportsAuthoritativeSnapshot() {
+				proxy := &SessionShimSnapshotProxy{controller: ctrl, daemon: d, identity: ctrl.Identity()}
+				proxy.active.Store(true)
+				return proxy
+			}
+			return nil
+		}(),
 	}, nil
 }
 
 func (d *Daemon) completeSessionShimAdoption(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+	if !evidence.CarrierCompatible {
+		return SessionShimAdoptionReceipt{}, nil
+	}
 	hook := d.sessionShimConfig().OnAdoption
 	if hook == nil {
 		return SessionShimAdoptionReceipt{}, nil
@@ -920,7 +1117,7 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 // quarantined correlation is retained separately and capacity-charged.
 func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 	cfg := d.sessionShimConfig()
-	status := afclient.DaemonSessionShimStatus{OwnershipMode: sessionShimOwnershipMode(cfg)}
+	status := afclient.DaemonSessionShimStatus{OwnershipMode: sessionShimOwnershipMode(cfg), ControllerID: d.controllerID()}
 	if d.shims == nil {
 		status.AdoptionComplete = !cfg.EnableAdoption
 		return status
@@ -935,7 +1132,8 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 		correlation := afclient.DaemonSessionShimAdoptedCorrelation{
 			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
 			LastForwardedSeq: d.shims.forwarded[id], ConsumesCapacity: true,
-			Source: "adopted",
+			Source:       "adopted",
+			ControllerID: d.controllerID(),
 		}
 		if entry.launched {
 			correlation.Source = "launched"
@@ -949,6 +1147,11 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 			correlation.HarnessStartedAt = hello.HarnessStartedAt
 			correlation.ProtocolMin = hello.Min
 			correlation.ProtocolMax = hello.Max
+			correlation.ProtocolVersion = entry.controller.SelectedVersion()
+			correlation.AuthoritativeSnapshot = entry.controller.SupportsAuthoritativeSnapshot()
+			if cfg.RequireAuthoritativeSnapshot && !entry.controller.SupportsAuthoritativeSnapshot() {
+				correlation.CarrierIncompatibility = string(SessionShimCarrierAuthoritativeSnapshotV2Required)
+			}
 			correlation.Phase = string(hello.Phase)
 		}
 		status.Adopted = append(status.Adopted, correlation)
@@ -977,6 +1180,40 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 	sessionshim.SortQuarantined(status.Quarantined)
 	status.OccupiedSlots = len(status.Adopted) + len(status.Quarantined)
 	return status
+}
+
+// InspectAdoptedSessionShimSnapshot proxies a fresh read-only snapshot to the
+// shim-owned PTY host. The daemon owns no VT and has no cache fallback.
+func (d *Daemon) InspectAdoptedSessionShimSnapshot(ctx context.Context, orgID, sessionID string) (shimwire.SnapshotResult, error) {
+	ctrl, err := d.adoptedShimController(orgID, sessionID)
+	if err != nil {
+		return shimwire.SnapshotResult{}, err
+	}
+	return ctrl.InspectSnapshot(ctx)
+}
+
+// EmitAdoptedSessionShimSnapshot proxies one emitting snapshot call to the
+// shim-owned PTY host and returns its exact encoded interactive-attach frame.
+func (d *Daemon) EmitAdoptedSessionShimSnapshot(ctx context.Context, orgID, sessionID string) (shimwire.SnapshotResult, error) {
+	ctrl, err := d.adoptedShimController(orgID, sessionID)
+	if err != nil {
+		return shimwire.SnapshotResult{}, err
+	}
+	return ctrl.EmitSnapshot(ctx)
+}
+
+func (d *Daemon) adoptedShimController(orgID, sessionID string) (*sessionshim.Controller, error) {
+	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
+	if err := id.Validate(); err != nil {
+		return nil, err
+	}
+	d.shims.mu.RLock()
+	entry, ok := d.shims.adopted[id]
+	d.shims.mu.RUnlock()
+	if !ok || entry.controller == nil {
+		return nil, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+	}
+	return entry.controller, nil
 }
 
 func sessionShimOwnershipMode(cfg SessionShimConfig) afclient.DaemonSessionShimOwnershipMode {
@@ -1111,7 +1348,8 @@ func (d *Daemon) sessionShimFenceSnapshot() []sessionshim.FencedSession {
 		id := q.Identity()
 		covered = append(covered, sessionshim.FencedSession{
 			OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
-			LastForwardedSeq: d.shims.forwarded[id],
+			ControllerGeneration: q.ControllerGeneration,
+			LastForwardedSeq:     d.shims.forwarded[id],
 		})
 	}
 	d.shims.mu.RUnlock()
@@ -1144,6 +1382,9 @@ func (d *Daemon) requestSessionShimRestartFence(ctx context.Context, fenceID, or
 	hostID, err := d.sessionShimHostID(ctx, orgID)
 	if err != nil {
 		return sessionshim.Fence{}, fmt.Errorf("%w: resolve host identity: %w", sessionshim.ErrFenceRequired, err)
+	}
+	if hostID == "" && (cfg.ExactFenceStore != nil || cfg.FenceStore != nil) {
+		return sessionshim.Fence{}, fmt.Errorf("%w: stable host identity is required for a composing fence store", sessionshim.ErrFenceRequired)
 	}
 	policy := sessionshim.FencePolicy{RestartBudget: cfg.RestartBudget, Orphan: cfg.Orphan}
 	var (

@@ -70,6 +70,12 @@ func TestDialRefusesInexactAdoptionCommit(t *testing.T) {
 			if tc.wantErr && !errors.Is(err, ErrAdoptionRefused) {
 				t.Fatalf("Dial = %v, want ErrAdoptionRefused", err)
 			}
+			if tc.wantErr {
+				generation, ok := authenticatedHelloGeneration(err)
+				if !ok || generation != 6 {
+					t.Fatalf("authenticated Hello generation = %d/%v, want 6/true", generation, ok)
+				}
+			}
 			if !tc.wantErr && err != nil {
 				t.Fatalf("Dial exact commit: %v", err)
 			}

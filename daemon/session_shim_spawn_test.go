@@ -17,10 +17,121 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
+
+func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.opts.SessionShim.HostID = "host-takeover-snapshot"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	var emitted shimwire.SnapshotResult
+	var retainedProxy *SessionShimSnapshotProxy
+	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		if evidence.SnapshotProxy == nil || !evidence.CarrierCompatible || evidence.ProtocolVersion != shimwire.V2 {
+			return SessionShimAdoptionReceipt{}, fmt.Errorf("snapshot capability missing during adoption: %+v", evidence)
+		}
+		retainedProxy = evidence.SnapshotProxy
+		var err error
+		emitted, err = evidence.SnapshotProxy.Emit(ctx)
+		if err != nil {
+			return SessionShimAdoptionReceipt{}, err
+		}
+		return SessionShimAdoptionReceipt{DurableCorrelation: []byte("carrier-takeover-complete")}, nil
+	}
+
+	spec := f.interactiveSpec("takeover-snapshot")
+	if _, err := d.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	frame, err := attachwire.DecodeFrame(emitted.Bytes)
+	if err != nil || frame.Type != attachwire.TypeSnapshot || !emitted.InStream {
+		t.Fatalf("callback emit = frame %+v result %+v err=%v", frame, emitted, err)
+	}
+	entry, err := d.adoptedShimEntry(f.orgID, spec.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if entry.adoption.SnapshotProxy != nil {
+		t.Fatal("ephemeral adoption SnapshotProxy was retained after synchronous callback")
+	}
+	if _, err := retainedProxy.Inspect(context.Background()); !errors.Is(err, shimwire.ErrVersionMismatch) {
+		t.Fatalf("retained adoption proxy remained active after callback: %v", err)
+	}
+	fresh, err := d.InspectAdoptedSessionShimSnapshot(context.Background(), f.orgID, spec.SessionID)
+	if err != nil || fresh.InStream || len(fresh.Bytes) == 0 {
+		t.Fatalf("published daemon snapshot proxy = %+v, %v", fresh, err)
+	}
+}
+
+func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	spec := f.interactiveSpec("takeover-large-replay")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatal(err)
+	}
+	id := f.identity(spec.SessionID)
+	for i := 0; i < 72; i++ {
+		f.exchange(t, id, fmt.Sprintf("replay-%03d", i))
+	}
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	var durableCount int
+	var durableSeq uint64
+	var emitted shimwire.SnapshotResult
+	var durableMu sync.Mutex
+	replacement := New(Options{
+		SkipRegistration: true,
+		SessionShim: SessionShimConfig{
+			EnableAdoption: true, RegistryDir: f.registry,
+			HostID: "host-large-replay", RequireAuthoritativeSnapshot: true,
+			OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+				durableMu.Lock()
+				defer durableMu.Unlock()
+				if event.Kind == sessionshim.EventOutput || event.Kind == sessionshim.EventSnapshotFrame {
+					if event.Seq <= durableSeq {
+						return fmt.Errorf("durable stream reordered: %d after %d", event.Seq, durableSeq)
+					}
+					durableSeq = event.Seq
+					durableCount++
+				}
+				return nil
+			},
+			OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+				var err error
+				emitted, err = evidence.SnapshotProxy.Emit(ctx)
+				if err != nil {
+					return SessionShimAdoptionReceipt{}, err
+				}
+				durableMu.Lock()
+				defer durableMu.Unlock()
+				if durableCount <= 64 || durableSeq < emitted.AtSeq+1 {
+					return SessionShimAdoptionReceipt{}, fmt.Errorf("snapshot returned before replay durability: count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
+				}
+				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("large-replay-complete")}, nil
+			},
+		},
+	})
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	if err := replacement.adoptSessionShims(ctx); err != nil {
+		t.Fatalf("replacement adoption with >64 replay frames: %v", err)
+	}
+	if len(emitted.Bytes) == 0 || !emitted.InStream {
+		t.Fatalf("takeover emitted snapshot = %+v", emitted)
+	}
+	if got := replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID); got < emitted.AtSeq+1 {
+		t.Fatalf("early durable high-water regressed at publication: got %d want >= %d", got, emitted.AtSeq+1)
+	}
+	fence, err := replacement.RequestSessionShimRestartFence(context.Background(), "immediate-after-takeover")
+	if err != nil || len(fence.Sessions) != 1 || fence.Sessions[0].LastForwardedSeq < emitted.AtSeq+1 {
+		t.Fatalf("immediate fence lost early durable high-water: fence=%+v err=%v", fence, err)
+	}
+}
 
 // This file is the daemon-side half of the ADR-2026-08-17 acceptance suite.
 //
@@ -375,7 +486,9 @@ func TestInteractiveShimUsesPerSessionOrganizationAndGroupedExactFences(t *testi
 		if covered.ControllerGeneration != uint64(entry.controller.Generation()) {
 			t.Errorf("fenced generation = %d, exact shim generation = %d", covered.ControllerGeneration, entry.controller.Generation())
 		}
-		if entry.adoption.ControllerID != "daemon" || entry.adoption.ControllerID == request.Fence.HostID {
+		if entry.adoption.ControllerID != d.ControllerID() ||
+			entry.adoption.ControllerID == request.Fence.HostID ||
+			entry.adoption.ControllerID == d.WorkerID() {
 			t.Errorf("controller/host correlations collapsed or drifted: controller=%q host=%q",
 				entry.adoption.ControllerID, request.Fence.HostID)
 		}
@@ -457,6 +570,9 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 		}
 		if !evidence.Tombstone.GroupReaped {
 			t.Fatal("terminal callback ran without positive process-group reap proof")
+		}
+		if evidence.Adoption.SnapshotProxy != nil {
+			t.Fatal("terminal evidence retained the ephemeral adoption SnapshotProxy")
 		}
 	case <-time.After(30 * time.Second):
 		t.Fatal("timed out waiting for terminal evidence callback")
@@ -696,7 +812,8 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	}
 	q := quarantined[0]
 	processEpoch := entry.controller.Hello().ProcessEpoch
-	if q.Identity() != id || q.ShimID != entry.shimID || q.ProcessEpoch != processEpoch {
+	if q.Identity() != id || q.ShimID != entry.shimID || q.ProcessEpoch != processEpoch ||
+		q.ControllerGeneration != uint64(entry.controller.Generation()) {
 		t.Errorf("quarantine correlation = %s/%s/%d, want exact %s/%s/%d",
 			q.Identity(), q.ShimID, q.ProcessEpoch, id, entry.shimID, processEpoch)
 	}
@@ -1089,6 +1206,15 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("durable-startup")}, nil
 			},
+			PrepareAdoptionBatch: func(context.Context, string, string) ([]byte, error) {
+				return []byte("expected-startup-batch"), nil
+			},
+			OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+				if len(batch.Adopted) != 1 || batch.Adopted[0].Evidence.SnapshotProxy != nil {
+					return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("batch retained ephemeral snapshot proxy: %+v", batch.Adopted)
+				}
+				return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("startup-batch-revision")}, nil
+			},
 		},
 	})
 	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
@@ -1187,7 +1313,7 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	d.shims.mu.Lock()
 	d.shims.quarantined = append(d.shims.quarantined, sessionshim.QuarantinedSession{
 		OrgID: "test-org", SessionID: "diagnostic-quarantine", ShimID: "shim-quarantine",
-		ProcessEpoch: 9, ProtocolMin: 1, ProtocolMax: 1,
+		ProcessEpoch: 9, ControllerGeneration: 11, ProtocolMin: 1, ProtocolMax: 1,
 		Reason: sessionshim.QuarantineDuplicateIdentity, Detail: "socket /private/secret/path",
 		AgeSeconds: 3, ConsumesCapacity: true,
 	})
@@ -1211,11 +1337,13 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	adopted := diagnostic.Adopted[0]
 	if adopted.OrgID != id.OrgID || adopted.SessionID != id.SessionID || adopted.ShimID == "" ||
 		adopted.ProcessEpoch == 0 || adopted.ControllerGeneration == 0 || adopted.LastForwardedSeq != seq ||
-		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 1 ||
-		adopted.Phase == "" || !adopted.ConsumesCapacity {
+		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 2 ||
+		adopted.ProtocolVersion != 2 || !adopted.AuthoritativeSnapshot || adopted.ControllerID != d.ControllerID() ||
+		adopted.Phase == "" || !adopted.ConsumesCapacity || diagnostic.ControllerID != d.ControllerID() {
 		t.Fatalf("status adopted correlation = %+v", adopted)
 	}
 	if len(diagnostic.Quarantined) != 1 || diagnostic.Quarantined[0].ShimID != "shim-quarantine" ||
+		diagnostic.Quarantined[0].ControllerGeneration != 11 ||
 		diagnostic.Quarantined[0].Detail != "" || !diagnostic.Quarantined[0].ConsumesCapacity {
 		t.Fatalf("status quarantine = %+v", diagnostic.Quarantined)
 	}
@@ -1223,7 +1351,7 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 	if err != nil {
 		t.Fatal(err)
 	}
-	for _, forbidden := range []string{`"hostId"`, `"controllerId"`, `"workarea"`, `"token"`, `"receipt"`, `"path"`, `"data"`} {
+	for _, forbidden := range []string{`"hostId"`, `"workarea"`, `"token"`, `"receipt"`, `"path"`, `"data"`} {
 		if bytes.Contains(raw, []byte(forbidden)) {
 			t.Fatalf("session-shim diagnostic contains forbidden field %s: %s", forbidden, raw)
 		}

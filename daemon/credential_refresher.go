@@ -54,6 +54,10 @@ type CredentialRefresherOptions struct {
 	WorkerID   string
 	RuntimeJWT string
 
+	// ValidateRefresh runs before refreshed credentials become visible to any
+	// lane, cache, or callback. An error refuses the refresh atomically.
+	ValidateRefresh func(result *RefreshTokenResult) error
+
 	// OnRefreshed runs after every successful refresh, before the result is
 	// returned, with the refresher's lock released. Use it for consumers that
 	// are not CredentialLanes — a session-detail cache, an embedder's own
@@ -127,6 +131,11 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 	result, err := RefreshRuntimeToken(ctx, r.opts.Registration, current, reason)
 	if err != nil {
 		return nil, err
+	}
+	if r.opts.ValidateRefresh != nil {
+		if err := r.opts.ValidateRefresh(result); err != nil {
+			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
+		}
 	}
 
 	r.mu.Lock()

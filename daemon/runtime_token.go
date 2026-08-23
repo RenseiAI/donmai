@@ -148,6 +148,18 @@ func (r *runtimeTokenRefresher) remember(result *RefreshTokenResult) *RefreshTok
 	return result
 }
 
+func (r *runtimeTokenRefresher) rememberValidated(regOpts RegistrationOptions, result *RefreshTokenResult) (*RefreshTokenResult, error) {
+	if result == nil {
+		return nil, errors.New("runtime token refresh produced no result")
+	}
+	if regOpts.ValidateCredentials != nil {
+		if err := regOpts.ValidateCredentials(result.WorkerID, result.RuntimeToken); err != nil {
+			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
+		}
+	}
+	return r.remember(result), nil
+}
+
 // markReregistered stamps the full-re-register cooldown. Caller holds r.mu.
 func (r *runtimeTokenRefresher) markReregistered() {
 	r.lastReregisterAt = r.now()
@@ -327,7 +339,7 @@ func (r *runtimeTokenRefresher) refresh(
 				"workerId", currentWorkerID,
 				"reason", reason,
 			)
-			return r.remember(&RefreshTokenResult{
+			return r.rememberValidated(regOpts, &RefreshTokenResult{
 				Mode:                  "refresh",
 				WorkerID:              currentWorkerID,
 				RuntimeToken:          fresh.RuntimeToken,
@@ -335,7 +347,7 @@ func (r *runtimeTokenRefresher) refresh(
 				HeartbeatInterval:     fresh.HeartbeatInterval,
 				PollInterval:          fresh.PollInterval,
 				Reason:                reason,
-			}), nil
+			})
 		}
 		// 404 / 405 → the durable registration is gone, or the endpoint is
 		// not deployed. Fall through. Anything else surfaces as an error so
@@ -364,7 +376,7 @@ func (r *runtimeTokenRefresher) refresh(
 	// unusable cache entry can never be adopted.
 	if probeUsable {
 		if adopted := r.adoptCachedRegistration(ctx, regOpts, currentWorkerID, reason); adopted != nil {
-			return r.remember(adopted), nil
+			return r.rememberValidated(regOpts, adopted)
 		}
 	}
 
@@ -411,7 +423,7 @@ func (r *runtimeTokenRefresher) refresh(
 		"reason", reason,
 		"workerIdSwapped", swapped,
 	)
-	return r.remember(&RefreshTokenResult{
+	return r.rememberValidated(regOpts, &RefreshTokenResult{
 		Mode:                     "reregister",
 		WorkerID:                 rr.WorkerID,
 		RuntimeToken:             rr.RuntimeToken,
@@ -420,7 +432,7 @@ func (r *runtimeTokenRefresher) refresh(
 		PollInterval:             rr.PollInterval,
 		RegistrationTokenSwapped: swapped,
 		Reason:                   reason,
-	}), nil
+	})
 }
 
 // adoptCachedRegistration looks for a DIFFERENT worker id in the on-disk

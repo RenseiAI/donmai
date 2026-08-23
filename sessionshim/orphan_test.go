@@ -1,6 +1,7 @@
 package sessionshim
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"strings"
@@ -170,6 +171,13 @@ func TestQuarantineProjectionAlwaysConsumesCapacity(t *testing.T) {
 		if q.ProcessEpoch != 17 {
 			t.Errorf("reason %q process epoch = %d, want 17", reason, q.ProcessEpoch)
 		}
+		if q.ControllerGeneration != 0 {
+			t.Errorf("reason %q record-only generation = %d, want explicit unknown 0", reason, q.ControllerGeneration)
+		}
+		raw, err := json.Marshal(q)
+		if err != nil || !strings.Contains(string(raw), `"controllerGeneration":0`) {
+			t.Errorf("reason %q JSON omitted explicit unknown generation: %s err=%v", reason, raw, err)
+		}
 	}
 	if QuarantineReason("because").Known() {
 		t.Error("the quarantine-reason registry is not closed")
@@ -187,11 +195,12 @@ func TestSortQuarantinedIsStableAcrossSnapshots(t *testing.T) {
 		{OrgID: "o", SessionID: "s1", ShimID: "z"},
 		{OrgID: "o", SessionID: "s1", ShimID: "a", ProcessEpoch: 2},
 		{OrgID: "o", SessionID: "s1", ShimID: "a", ProcessEpoch: 1},
+		{OrgID: "o", SessionID: "s1", ShimID: "a", ProcessEpoch: 1, ControllerGeneration: 8},
 	}
 	SortQuarantined(in)
-	want := []string{"n/s1/a/0", "o/s1/a/1", "o/s1/a/2", "o/s1/z/0", "o/s2/b/0"}
+	want := []string{"n/s1/a/0/0", "o/s1/a/1/0", "o/s1/a/1/8", "o/s1/a/2/0", "o/s1/z/0/0", "o/s2/b/0/0"}
 	for i, w := range want {
-		got := fmt.Sprintf("%s/%s/%d", in[i].Identity(), in[i].ShimID, in[i].ProcessEpoch)
+		got := fmt.Sprintf("%s/%s/%d/%d", in[i].Identity(), in[i].ShimID, in[i].ProcessEpoch, in[i].ControllerGeneration)
 		if got != w {
 			t.Fatalf("sorted[%d] = %s, want %s", i, got, w)
 		}

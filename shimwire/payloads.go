@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"encoding/binary"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 )
 
 // Generation is the monotonic controller-fencing number (§D4). The SHIM is
@@ -123,6 +125,130 @@ type SnapshotMsg struct {
 	Screen []byte `json:"screen"`
 }
 
+// SnapshotMode is the closed v2 authoritative-snapshot operation set.
+type SnapshotMode uint8
+
+const (
+	// SnapshotInspect reads exact screen bytes without allocating sequence.
+	SnapshotInspect SnapshotMode = 1
+	// SnapshotEmit allocates/delivers one exact interactive-attach frame.
+	SnapshotEmit SnapshotMode = 2
+)
+
+// Known reports whether m is an assigned selected-v2 snapshot mode.
+func (m SnapshotMode) Known() bool { return m == SnapshotInspect || m == SnapshotEmit }
+
+func (m SnapshotMode) String() string {
+	if m == SnapshotInspect {
+		return "inspect"
+	}
+	if m == SnapshotEmit {
+		return "emit"
+	}
+	return fmt.Sprintf("unknown(%d)", m)
+}
+
+// SnapshotRequest is the selected-v2 request correlation. RequestID is local
+// to one controller connection and never creates lifecycle identity.
+type SnapshotRequest struct {
+	RequestID  uint64
+	Generation Generation
+	Mode       SnapshotMode
+}
+
+// SnapshotResult carries an opaque exact byte result. For inspect, Bytes is the
+// attachwire Screen encoding and AtSeq names the state it describes. For emit,
+// Bytes is the complete encoded interactive-attach Snapshot frame.
+type SnapshotResult struct {
+	RequestID  uint64
+	Generation Generation
+	Mode       SnapshotMode
+	Code       ErrorCode
+	AtSeq      uint64
+	InStream   bool
+	Bytes      []byte
+}
+
+const (
+	snapshotRequestLen      = 17
+	snapshotResultHeaderLen = 27
+)
+
+// EncodeSnapshotRequest uses a fixed binary header; arbitrary result bytes are
+// never routed through JSON/base64.
+func EncodeSnapshotRequest(r SnapshotRequest) ([]byte, error) {
+	if r.RequestID == 0 || r.Generation == 0 || !r.Mode.Known() {
+		return nil, fmt.Errorf("shimwire: %w: invalid snapshot request id=%d generation=%d mode=%s", ErrMalformed, r.RequestID, r.Generation, r.Mode)
+	}
+	b := make([]byte, snapshotRequestLen)
+	binary.BigEndian.PutUint64(b[0:8], r.RequestID)
+	binary.BigEndian.PutUint64(b[8:16], uint64(r.Generation))
+	b[16] = byte(r.Mode)
+	return b, nil
+}
+
+// DecodeSnapshotRequest strictly decodes the fixed v2 request body.
+func DecodeSnapshotRequest(body []byte) (SnapshotRequest, error) {
+	if len(body) != snapshotRequestLen {
+		return SnapshotRequest{}, fmt.Errorf("shimwire: %w: snapshot request body %d bytes, want %d", ErrMalformed, len(body), snapshotRequestLen)
+	}
+	r := SnapshotRequest{RequestID: binary.BigEndian.Uint64(body[0:8]), Generation: Generation(binary.BigEndian.Uint64(body[8:16])), Mode: SnapshotMode(body[16])}
+	if r.RequestID == 0 || r.Generation == 0 {
+		return SnapshotRequest{}, fmt.Errorf("shimwire: %w: invalid snapshot request id=%d generation=%d mode=%s", ErrMalformed, r.RequestID, r.Generation, r.Mode)
+	}
+	return r, nil
+}
+
+var snapshotResultCodes = map[ErrorCode]byte{
+	"": 0, CodeMalformed: 1, CodeStaleGeneration: 2, CodeDuplicateChanged: 3,
+	CodeRequestLedgerFull: 4, CodeExited: 5, CodeInternal: 6, CodeRequestMismatch: 7, CodeTimeout: 8,
+}
+
+var snapshotResultCodesByByte = func() map[byte]ErrorCode {
+	m := make(map[byte]ErrorCode, len(snapshotResultCodes))
+	for code, value := range snapshotResultCodes {
+		m[value] = code
+	}
+	return m
+}()
+
+// EncodeSnapshotResult preserves Bytes verbatim after a fixed binary header.
+func EncodeSnapshotResult(r SnapshotResult) ([]byte, error) {
+	status, ok := snapshotResultCodes[r.Code]
+	if !ok || r.RequestID == 0 || r.Generation == 0 || (r.Code == "" && !r.Mode.Known()) {
+		return nil, fmt.Errorf("shimwire: %w: invalid snapshot result correlation/status", ErrMalformed)
+	}
+	if r.Code != "" && (r.AtSeq != 0 || r.InStream || len(r.Bytes) != 0) {
+		return nil, fmt.Errorf("shimwire: %w: refused snapshot result carries success fields", ErrMalformed)
+	}
+	b := make([]byte, snapshotResultHeaderLen+len(r.Bytes))
+	binary.BigEndian.PutUint64(b[0:8], r.RequestID)
+	binary.BigEndian.PutUint64(b[8:16], uint64(r.Generation))
+	b[16], b[17] = byte(r.Mode), status
+	binary.BigEndian.PutUint64(b[18:26], r.AtSeq)
+	if r.InStream {
+		b[26] = 1
+	}
+	copy(b[snapshotResultHeaderLen:], r.Bytes)
+	return b, nil
+}
+
+// DecodeSnapshotResult strictly decodes the fixed header and opaque tail.
+func DecodeSnapshotResult(body []byte) (SnapshotResult, error) {
+	if len(body) < snapshotResultHeaderLen {
+		return SnapshotResult{}, fmt.Errorf("shimwire: %w: snapshot result body %d bytes, need >= %d", ErrMalformed, len(body), snapshotResultHeaderLen)
+	}
+	code, ok := snapshotResultCodesByByte[body[17]]
+	r := SnapshotResult{RequestID: binary.BigEndian.Uint64(body[0:8]), Generation: Generation(binary.BigEndian.Uint64(body[8:16])), Mode: SnapshotMode(body[16]), Code: code, AtSeq: binary.BigEndian.Uint64(body[18:26]), InStream: body[26] == 1, Bytes: append([]byte(nil), body[snapshotResultHeaderLen:]...)}
+	if !ok || body[26] > 1 || r.RequestID == 0 || r.Generation == 0 || (r.Code == "" && !r.Mode.Known()) {
+		return SnapshotResult{}, fmt.Errorf("shimwire: %w: invalid snapshot result correlation/status", ErrMalformed)
+	}
+	if r.Code != "" && (r.AtSeq != 0 || r.InStream || len(r.Bytes) != 0) {
+		return SnapshotResult{}, fmt.Errorf("shimwire: %w: refused snapshot result carries success fields", ErrMalformed)
+	}
+	return r, nil
+}
+
 // ResizeMsg is authoritative geometry from the controller.
 type ResizeMsg struct {
 	Generation Generation `json:"generation"`
@@ -183,10 +309,14 @@ func decodeJSON(body []byte, v any) error {
 	if err := dec.Decode(v); err != nil {
 		return fmt.Errorf("shimwire: %w: %v", ErrMalformed, err)
 	}
-	// Reject trailing bytes: two concatenated JSON documents in one body would
-	// otherwise decode as the first alone.
-	if dec.More() {
-		return fmt.Errorf("shimwire: %w: trailing bytes after message body", ErrMalformed)
+	// Prove EOF. Decoder.More reports array/object membership and does not reject
+	// a second top-level document.
+	var trailing any
+	if err := dec.Decode(&trailing); !errors.Is(err, io.EOF) {
+		if err == nil {
+			return fmt.Errorf("shimwire: %w: trailing document after message body", ErrMalformed)
+		}
+		return fmt.Errorf("shimwire: %w: trailing bytes after message body: %v", ErrMalformed, err)
 	}
 	return nil
 }

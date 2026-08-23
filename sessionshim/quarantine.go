@@ -10,8 +10,10 @@ import (
 // QuarantineReason is the closed set of reasons a survivor was refused adoption
 // (ADR-2026-08-17 §D7).
 //
-// Every reason here means the SAME two things: no authority is granted, and the
-// shim is not killed. The distinction between them is diagnostic — an operator
+// Every local-adoption reason here means the same two things: no controller
+// authority is granted, and the shim is not killed. The external-carrier-only
+// reason is the deliberate exception: local controller ownership is conserved
+// while a capability-dependent carrier is refused. The distinction is diagnostic — an operator
 // needs to know whether a shim is unreachable because of a protocol gap or
 // because two records claim the same session, and those call for different
 // responses.
@@ -52,6 +54,9 @@ const (
 	// capacity until exact positive evidence reconciles it; a tombstone-shaped
 	// file alone is not proof of death (§D10).
 	QuarantineGroupReapUnproven QuarantineReason = "group_reap_unproven"
+	// QuarantineAuthoritativeSnapshotUnsupported is a composing-carrier outcome,
+	// not a local ownership refusal. Selected v1 remains locally adopted.
+	QuarantineAuthoritativeSnapshotUnsupported QuarantineReason = "authoritative_snapshot_unsupported"
 )
 
 // Known reports whether r is an assigned v1 quarantine reason.
@@ -60,7 +65,7 @@ func (r QuarantineReason) Known() bool {
 	case QuarantineProtocolMismatch, QuarantineRecordMalformed, QuarantineDuplicateIdentity,
 		QuarantineIdentityMismatch, QuarantineUnauthenticated, QuarantinePhaseUnknown,
 		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed,
-		QuarantineGroupReapUnproven:
+		QuarantineGroupReapUnproven, QuarantineAuthoritativeSnapshotUnsupported:
 		return true
 	default:
 		return false
@@ -80,8 +85,14 @@ type QuarantinedSession struct {
 
 	ShimID       string `json:"shimId,omitempty"`
 	ProcessEpoch uint64 `json:"processEpoch,omitempty"`
-	ProtocolMin  uint32 `json:"protocolMin,omitempty"`
-	ProtocolMax  uint32 `json:"protocolMax,omitempty"`
+	// ControllerGeneration is the exact committed generation for an adopted
+	// controller, or the last authenticated Hello generation when adoption was
+	// refused before commit. Zero is explicit conservative "unknown": record-only,
+	// malformed, or identity-mismatched discovery has no trustworthy Hello, and
+	// frozen v1 registry JSON deliberately carries no generation to infer from.
+	ControllerGeneration uint64 `json:"controllerGeneration"`
+	ProtocolMin          uint32 `json:"protocolMin,omitempty"`
+	ProtocolMax          uint32 `json:"protocolMax,omitempty"`
 
 	Reason QuarantineReason `json:"reason"`
 	// Detail is display-only. It is never parsed and never carries a secret.
@@ -110,16 +121,17 @@ func (q QuarantinedSession) Identity() Identity {
 // hide occupied capacity.
 func NewQuarantinedSession(rec Record, reason QuarantineReason, detail string, now time.Time) QuarantinedSession {
 	q := QuarantinedSession{
-		OrgID:            rec.OrgID,
-		SessionID:        rec.SessionID,
-		ShimID:           rec.ShimID,
-		ProcessEpoch:     rec.ProcessEpoch,
-		ProtocolMin:      rec.ProtocolMin,
-		ProtocolMax:      rec.ProtocolMax,
-		Reason:           reason,
-		Detail:           detail,
-		ConsumesCapacity: true,
-		Phase:            rec.Phase,
+		OrgID:                rec.OrgID,
+		SessionID:            rec.SessionID,
+		ShimID:               rec.ShimID,
+		ProcessEpoch:         rec.ProcessEpoch,
+		ControllerGeneration: 0, // frozen record v1 has no authenticated generation
+		ProtocolMin:          rec.ProtocolMin,
+		ProtocolMax:          rec.ProtocolMax,
+		Reason:               reason,
+		Detail:               detail,
+		ConsumesCapacity:     true,
+		Phase:                rec.Phase,
 	}
 	if rec.CreatedAtUnixNano > 0 {
 		if age := now.Sub(rec.CreatedAt()); age > 0 {
@@ -144,6 +156,9 @@ func SortQuarantined(in []QuarantinedSession) {
 		if in[i].ShimID != in[j].ShimID {
 			return in[i].ShimID < in[j].ShimID
 		}
-		return in[i].ProcessEpoch < in[j].ProcessEpoch
+		if in[i].ProcessEpoch != in[j].ProcessEpoch {
+			return in[i].ProcessEpoch < in[j].ProcessEpoch
+		}
+		return in[i].ControllerGeneration < in[j].ControllerGeneration
 	})
 }

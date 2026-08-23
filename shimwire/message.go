@@ -1,12 +1,12 @@
 package shimwire
 
-// MessageType is the one-byte discriminator for the CLOSED v1 message
-// vocabulary (ADR-2026-08-17 §D3). "Closed" is load-bearing: a receiver treats
-// an unknown type as a protocol error, so a new message is a version bump and
-// never a v1 addition. That is what lets an old shim trust a new daemon.
+// MessageType is the one-byte discriminator for the versioned, closed message
+// vocabulary (ADR-2026-08-17 §D3). The selected integer version decides which
+// assigned values are legal; selected v1 never accepts a v2 message.
 type MessageType uint8
 
-// The v1-frozen message registry. Values 0x00 and 0x0D–0xFF are reserved.
+// The v1-frozen registry occupies 0x01–0x0C. Selected v1 treats every later
+// value as reserved; selected v2 assigns the two values declared below.
 const (
 	TypeHello     MessageType = 0x01 // shim  -> daemon: range, identity, phase, bounds
 	TypeWelcome   MessageType = 0x02 // daemon -> shim: selected version, proposed generation
@@ -20,10 +20,24 @@ const (
 	TypeHeartbeat MessageType = 0x0A // both:   liveness + acknowledged sequence
 	TypeExit      MessageType = 0x0B // shim  -> daemon: immutable terminal observation
 	TypeError     MessageType = 0x0C // either: closed code + display-only detail
+
+	// v2-only. These values remain illegal under selected v1.
+	TypeSnapshotRequest MessageType = 0x0D // daemon -> shim: correlated authoritative request
+	TypeSnapshotResult  MessageType = 0x0E // shim -> daemon: exact result or closed refusal
 )
 
-// Known reports whether t is an assigned v1 message type.
+// Known reports whether t is assigned in the frozen v1 vocabulary. It remains
+// v1-scoped for source compatibility; AllowedIn is required after selection.
 func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
+
+// AllowedIn reports whether t belongs to the selected version's closed
+// vocabulary. A v2-capable peer selected at v1 therefore cannot send a v2 type.
+func (t MessageType) AllowedIn(version uint32) bool {
+	if t >= TypeHello && t <= TypeError {
+		return version == V1 || version == V2
+	}
+	return version == V2 && (t == TypeSnapshotRequest || t == TypeSnapshotResult)
+}
 
 // Mutating reports whether t carries controller authority and therefore MUST
 // carry a controller generation (§D4). Read-only inspection (Hello/Heartbeat
@@ -34,7 +48,7 @@ func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
 // and a per-caller check is exactly where an omission hides.
 func (t MessageType) Mutating() bool {
 	switch t {
-	case TypeInput, TypeResize, TypeStop:
+	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest:
 		return true
 	default:
 		return false
@@ -67,6 +81,10 @@ func (t MessageType) String() string {
 		return "Exit"
 	case TypeError:
 		return "Error"
+	case TypeSnapshotRequest:
+		return "SnapshotRequest"
+	case TypeSnapshotResult:
+		return "SnapshotResult"
 	default:
 		return "Unknown(0x" + hexByte(byte(t)) + ")"
 	}

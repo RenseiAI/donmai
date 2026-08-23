@@ -64,6 +64,7 @@ type AdoptionPreparation struct {
 	ProcessEpoch                uint64
 	CurrentControllerGeneration shimwire.Generation
 	LastForwardedSeq            uint64
+	SelectedVersion             uint32
 }
 
 // PreparedAdoption is the per-session portion of Welcome supplied by a
@@ -306,7 +307,11 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 				return result, adoptErr
 			}
 			reason, detail := classifyAdoptionFailure(adoptErr)
-			result.Quarantined = append(result.Quarantined, NewQuarantinedSession(rec, reason, detail, now))
+			quarantined := NewQuarantinedSession(rec, reason, detail, now)
+			if generation, ok := authenticatedHelloGeneration(adoptErr); ok {
+				quarantined.ControllerGeneration = uint64(generation)
+			}
+			result.Quarantined = append(result.Quarantined, quarantined)
 			log.Warn("sessionshim: quarantined shim after failed adoption (not killed)",
 				"session", id.String(), "reason", reason, "error", adoptErr)
 			continue

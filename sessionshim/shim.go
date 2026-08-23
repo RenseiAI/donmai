@@ -114,10 +114,23 @@ type Shim struct {
 
 // controllerConn is one attached controller.
 type controllerConn struct {
-	conn      *net.UnixConn
-	w         *shimwire.Writer
-	sub       agent.InteractiveSubscription
-	closeOnce sync.Once
+	conn           *net.UnixConn
+	w              *shimwire.Writer
+	sub            agent.InteractiveSubscription
+	selected       uint32
+	snapshotLedger map[uint64]*snapshotLedgerEntry
+	emissionMu     sync.Mutex
+	emissionBySeq  map[uint64]*snapshotLedgerEntry
+	closeOnce      sync.Once
+}
+
+const snapshotRetryLedgerLimit = 1024
+
+type snapshotLedgerEntry struct {
+	request   shimwire.SnapshotRequest
+	result    shimwire.SnapshotResult
+	delivered chan struct{}
+	writeErr  error
 }
 
 func (c *controllerConn) close() {
@@ -597,7 +610,11 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	}
 	prev := s.ctrl
 	s.gen = welcome.ProposedGeneration
-	ctrl := &controllerConn{conn: conn, w: w}
+	ctrl := &controllerConn{
+		conn: conn, w: w, selected: welcome.Selected,
+		snapshotLedger: make(map[uint64]*snapshotLedgerEntry),
+		emissionBySeq:  make(map[uint64]*snapshotLedgerEntry),
+	}
 	s.ctrl = ctrl
 	s.mu.Unlock()
 
@@ -764,7 +781,6 @@ func (s *Shim) pumpOutput(ctrl *controllerConn) {
 	if ctrl.sub == nil {
 		return
 	}
-	defer ctrl.close()
 	for frame := range ctrl.sub.Frames() {
 		if s.currentController() != ctrl {
 			return // superseded by a newer generation
@@ -784,6 +800,22 @@ func (s *Shim) pumpOutput(ctrl *controllerConn) {
 				return shimwire.EncodeExit(shimwire.ExitMsg{Seq: frame.Seq, ExitCode: exit.ExitCode, Signal: exit.Signal})
 			})
 		case attachwire.TypeSnapshot:
+			if ctrl.selected >= shimwire.V2 {
+				ctrl.emissionMu.Lock()
+				entry := ctrl.emissionBySeq[frame.Seq]
+				if entry != nil {
+					delete(ctrl.emissionBySeq, frame.Seq)
+				}
+				ctrl.emissionMu.Unlock()
+				if entry != nil {
+					entry.writeErr = writeSnapshotResult(ctrl, entry.result)
+					close(entry.delivered)
+					if entry.writeErr != nil {
+						return
+					}
+					continue
+				}
+			}
 			env, decErr := attachwire.DecodeSnapshotEnvelope(frame.Payload)
 			if decErr != nil {
 				s.logger.Warn("sessionshim: decode snapshot frame", "session", s.id.String(), "error", decErr)
@@ -799,9 +831,15 @@ func (s *Shim) pumpOutput(ctrl *controllerConn) {
 			continue
 		}
 		if err != nil {
+			ctrl.close()
 			return // controller gone; readControl arms the orphan clock
 		}
 	}
+	// Exit closes the host subscription but the selected-v2 controller remains a
+	// valid direct-transmission path for the final sequence-zero snapshot. Keep
+	// the socket until readControl observes the controller dropping it. An
+	// unexpected subscription loss cannot grant authority or terminalize the
+	// session; the generation-fenced control loop remains the safer owner.
 }
 
 // readControl consumes controller-originated frames, enforcing the generation
@@ -824,7 +862,7 @@ func (s *Shim) readControl(ctrl *controllerConn, r *shimwire.Reader) {
 	}()
 
 	for {
-		msg, err := r.Read()
+		msg, err := r.ReadVersion(ctrl.selected)
 		if err != nil {
 			return
 		}
@@ -889,10 +927,105 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 		})
 	case shimwire.TypeError:
 		return nil // display-only from the controller; nothing to act on
+	case shimwire.TypeSnapshotRequest:
+		if ctrl.selected < shimwire.V2 {
+			return sendError(ctrl.w, shimwire.CodeMalformed, "SnapshotRequest is not legal in selected v1")
+		}
+		return s.dispatchSnapshotRequest(ctrl, msg.Body)
 	default:
 		return sendError(ctrl.w, shimwire.CodeMalformed, "message type is not controller-originated")
 	}
 	return nil
+}
+
+func (s *Shim) dispatchSnapshotRequest(ctrl *controllerConn, body []byte) error {
+	req, err := shimwire.DecodeSnapshotRequest(body)
+	if err != nil {
+		return sendError(ctrl.w, shimwire.CodeMalformed, "snapshot request did not decode")
+	}
+	if prior := ctrl.snapshotLedger[req.RequestID]; prior != nil {
+		if prior.request != req {
+			return writeSnapshotResult(ctrl, refusedSnapshotResult(req, shimwire.CodeDuplicateChanged))
+		}
+		return writeSnapshotResult(ctrl, prior.result)
+	}
+	if len(ctrl.snapshotLedger) >= snapshotRetryLedgerLimit {
+		return writeSnapshotResult(ctrl, refusedSnapshotResult(req, shimwire.CodeRequestLedgerFull))
+	}
+	entry := &snapshotLedgerEntry{request: req, delivered: make(chan struct{})}
+	ctrl.snapshotLedger[req.RequestID] = entry
+	if !s.authorized(req.Generation) {
+		entry.result = refusedSnapshotResult(req, shimwire.CodeStaleGeneration)
+		return writeSnapshotResult(ctrl, entry.result)
+	}
+
+	switch req.Mode {
+	case shimwire.SnapshotInspect:
+		screen, atSeq, snapErr := s.sess.Snapshot()
+		if snapErr != nil {
+			entry.result = refusedSnapshotResult(req, shimwire.CodeInternal)
+			return writeSnapshotResult(ctrl, entry.result)
+		}
+		encoded, encErr := screen.Encode()
+		if encErr != nil {
+			entry.result = refusedSnapshotResult(req, shimwire.CodeInternal)
+			return writeSnapshotResult(ctrl, entry.result)
+		}
+		entry.result = shimwire.SnapshotResult{
+			RequestID: req.RequestID, Generation: req.Generation, Mode: req.Mode,
+			AtSeq: uint64(atSeq), Bytes: encoded,
+		}
+		return writeSnapshotResult(ctrl, entry.result)
+	case shimwire.SnapshotEmit:
+		// Hold emissionMu across publication and correlation registration. The PTY
+		// host publishes while EmitSnapshot holds its own sequence lock; the pump
+		// cannot observe and forward that frame before this request owns its seq.
+		ctrl.emissionMu.Lock()
+		frame, inStream, emitErr := s.sess.EmitSnapshot()
+		if emitErr != nil {
+			ctrl.emissionMu.Unlock()
+			entry.result = refusedSnapshotResult(req, shimwire.CodeInternal)
+			return writeSnapshotResult(ctrl, entry.result)
+		}
+		env, decErr := attachwire.DecodeSnapshotEnvelope(frame.Payload)
+		if decErr != nil {
+			ctrl.emissionMu.Unlock()
+			entry.result = refusedSnapshotResult(req, shimwire.CodeInternal)
+			return writeSnapshotResult(ctrl, entry.result)
+		}
+		entry.result = shimwire.SnapshotResult{
+			RequestID: req.RequestID, Generation: req.Generation, Mode: req.Mode,
+			AtSeq: env.AtSeq, InStream: inStream, Bytes: frame.Encode(),
+		}
+		if inStream {
+			ctrl.emissionBySeq[frame.Seq] = entry
+		}
+		ctrl.emissionMu.Unlock()
+		if !inStream {
+			return writeSnapshotResult(ctrl, entry.result)
+		}
+		select {
+		case <-entry.delivered:
+			return entry.writeErr
+		case <-s.done:
+			return io.EOF
+		}
+	default:
+		entry.result = refusedSnapshotResult(req, shimwire.CodeMalformed)
+		return writeSnapshotResult(ctrl, entry.result)
+	}
+}
+
+func refusedSnapshotResult(req shimwire.SnapshotRequest, code shimwire.ErrorCode) shimwire.SnapshotResult {
+	return shimwire.SnapshotResult{RequestID: req.RequestID, Generation: req.Generation, Mode: req.Mode, Code: code}
+}
+
+func writeSnapshotResult(ctrl *controllerConn, result shimwire.SnapshotResult) error {
+	body, err := shimwire.EncodeSnapshotResult(result)
+	if err != nil {
+		return err
+	}
+	return ctrl.w.WriteVersion(ctrl.selected, shimwire.TypeSnapshotResult, body)
 }
 
 // authorized is the single generation fence.
