@@ -1,43 +1,48 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-released_sha=cd71337a87aea7cf0e1e877da3816d06f717e778
-actual_sha=$(git rev-parse 'v0.68.1^{}')
-if [[ "$actual_sha" != "$released_sha" ]]; then
-  echo "v0.68.1 resolved to $actual_sha, want $released_sha" >&2
-  exit 1
-fi
-
 overlap_tmp=$(mktemp -d "/tmp/donmai-shim-overlap.XXXXXX")
-old_tree="$overlap_tmp/old"
-registry="$overlap_tmp/registry"
-old_binary="$overlap_tmp/old-shim"
 new_binary="$overlap_tmp/new-controller"
-old_pid=""
+old_pids=()
 cleanup() {
-  if [[ -n "$old_pid" ]]; then
+  for old_pid in "${old_pids[@]}"; do
     kill "$old_pid" 2>/dev/null || true
     wait "$old_pid" 2>/dev/null || true
-  fi
+  done
   rm -rf "$overlap_tmp"
 }
 trap cleanup EXIT
 
-mkdir -p "$old_tree/cmd/session-shim-overlap" "$registry"
-git archive "$released_sha" | tar -x -C "$old_tree"
-cp scripts/testdata/session-shim-overlap/oldshim/main.go "$old_tree/cmd/session-shim-overlap/main.go"
-
-(cd "$old_tree" && GOWORK=off go build -o "$old_binary" ./cmd/session-shim-overlap)
 GOWORK=off go build -o "$new_binary" ./scripts/testdata/session-shim-overlap/newcontroller
 
-"$old_binary" "$registry" org-v0681 session-v0681 "$overlap_tmp/workarea" &
-old_pid=$!
-
-for _ in $(seq 1 400); do
-  if [[ -n "$(find "$registry" -name '*.json' -print -quit)" ]]; then
-    break
+run_overlap() {
+  local tag=$1
+  local released_sha=$2
+  local selected_version=$3
+  local suffix=$4
+  local actual_sha
+  actual_sha=$(git rev-parse "${tag}^{}")
+  if [[ "$actual_sha" != "$released_sha" ]]; then
+    echo "$tag resolved to $actual_sha, want $released_sha" >&2
+    exit 1
   fi
-  sleep 0.025
-done
+  local old_tree="$overlap_tmp/old-$suffix"
+  local registry="$overlap_tmp/registry-$suffix"
+  local old_binary="$overlap_tmp/old-shim-$suffix"
+  mkdir -p "$old_tree/cmd/session-shim-overlap" "$registry"
+  git archive "$released_sha" | tar -x -C "$old_tree"
+  cp scripts/testdata/session-shim-overlap/oldshim/main.go "$old_tree/cmd/session-shim-overlap/main.go"
+  (cd "$old_tree" && GOWORK=off go build -o "$old_binary" ./cmd/session-shim-overlap)
+  "$old_binary" "$registry" "org-$suffix" "session-$suffix" "$overlap_tmp/workarea-$suffix" &
+  old_pids+=("$!")
+  for _ in $(seq 1 400); do
+    if [[ -n "$(find "$registry" -name '*.json' -print -quit)" ]]; then
+      break
+    fi
+    sleep 0.025
+  done
+  "$new_binary" "$registry" "org-$suffix" "session-$suffix" "$overlap_tmp/workarea-$suffix" "$selected_version" "$released_sha"
+}
 
-"$new_binary" "$registry" org-v0681 session-v0681 "$overlap_tmp/workarea"
+run_overlap v0.68.1 cd71337a87aea7cf0e1e877da3816d06f717e778 1 v0681
+run_overlap v0.68.2 65d80580fabdb6a469436965e9e17990cda23716 2 v0682

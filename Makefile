@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -56,10 +56,16 @@ test:
 test-tagged:
 	GOWORK=off go vet -tags "f28_integration,runner_integration,runtime_integration,integration,codex_integration,stophookspike,pi_scale_load" ./...
 
-# Builds the shim side from the released v0.68.1 source commit in an isolated
-# temporary module, then drives it with this checkout's controller.
+# Builds shim sides from the released v0.68.1 (selected v1) and v0.68.2
+# (selected v2) source commits in isolated modules, then drives both with this
+# checkout's controller.
 test-shim-overlap:
 	bash scripts/test-session-shim-v1-overlap.sh
+
+# Compares the current attach-v1 negotiation tokens, binary frame bytes, and
+# complete frozen control registry against the released v0.68.2 artifact.
+test-attach-v1-compat:
+	bash scripts/test-attach-v1-v0682-compat.sh
 
 lint:
 	golangci-lint run

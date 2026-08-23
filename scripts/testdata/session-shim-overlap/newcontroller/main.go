@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"strconv"
 	"strings"
 	"time"
 
@@ -13,9 +14,13 @@ import (
 )
 
 func main() {
-	if len(os.Args) != 5 {
-		fmt.Fprintln(os.Stderr, "usage: new-controller <registry> <org> <session> <workarea>")
+	if len(os.Args) != 7 {
+		fmt.Fprintln(os.Stderr, "usage: new-controller <registry> <org> <session> <workarea> <selected-version> <released-sha>")
 		os.Exit(2)
+	}
+	wantVersion, err := strconv.ParseUint(os.Args[5], 10, 32)
+	if err != nil {
+		die(err)
 	}
 	registry, err := sessionshim.NewRegistry(os.Args[1])
 	if err != nil {
@@ -35,11 +40,25 @@ func main() {
 		die(fmt.Errorf("adopted=%d quarantined=%d", len(result.Adopted), len(result.Quarantined)))
 	}
 	controller := result.Adopted[0]
-	if controller.SelectedVersion() != shimwire.V1 || controller.SupportsAuthoritativeSnapshot() {
-		die(fmt.Errorf("selected=v%d snapshot=%v", controller.SelectedVersion(), controller.SupportsAuthoritativeSnapshot()))
+	if controller.SelectedVersion() != uint32(wantVersion) {
+		die(fmt.Errorf("selected=v%d want=v%d", controller.SelectedVersion(), wantVersion))
 	}
-	if _, err := controller.InspectSnapshot(ctx); !errors.Is(err, shimwire.ErrVersionMismatch) {
-		die(fmt.Errorf("v1 snapshot refusal=%v", err))
+	snapshotResult := "available"
+	if wantVersion == uint64(shimwire.V1) {
+		snapshotResult = "refused"
+		if controller.SupportsAuthoritativeSnapshot() {
+			die(errors.New("selected v1 unexpectedly advertises authoritative snapshot"))
+		}
+		if _, err := controller.InspectSnapshot(ctx); !errors.Is(err, shimwire.ErrVersionMismatch) {
+			die(fmt.Errorf("v1 snapshot refusal=%v", err))
+		}
+	} else {
+		if !controller.SupportsAuthoritativeSnapshot() {
+			die(errors.New("selected v2 omitted authoritative snapshot"))
+		}
+		if snapshot, err := controller.InspectSnapshot(ctx); err != nil || len(snapshot.Bytes) == 0 {
+			die(fmt.Errorf("v2 snapshot=%+v err=%v", snapshot, err))
+		}
 	}
 	if err := controller.WriteInput([]byte("released-overlap\r")); err != nil {
 		die(err)
@@ -51,7 +70,7 @@ func main() {
 			if event.Kind == sessionshim.EventOutput {
 				output.Write(event.Data)
 				if strings.Contains(output.String(), "ack:released-overlap") {
-					fmt.Printf("PINNED-OVERLAP PASS old=%s selected=1 input_output=ok snapshot_v2=refused\n", "cd71337a87aea7cf0e1e877da3816d06f717e778")
+					fmt.Printf("PINNED-OVERLAP PASS old=%s selected=%d input_output=ok snapshot_v2=%s\n", os.Args[6], wantVersion, snapshotResult)
 					return
 				}
 			}

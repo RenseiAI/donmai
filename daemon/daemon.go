@@ -307,6 +307,10 @@ type Daemon struct {
 	// process and independent of registration and credential refresh state.
 	controllerIDValue string
 	controllerIDErr   error
+	// sessionShimAttestationValue is resolved, canonicalized, and frozen beside
+	// controllerIDValue. Registration and every refresh reuse this exact tuple.
+	sessionShimAttestationValue SessionShimHostAttestation
+	sessionShimAttestationErr   error
 
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be
@@ -431,6 +435,10 @@ func New(opts Options) *Daemon {
 		shims:          newSessionShimState(),
 	}
 	d.controllerIDValue, d.controllerIDErr = resolveControllerID(opts.SessionShim)
+	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
+		opts.SessionShim,
+		d.controllerIDValue,
+	)
 	if opts.RulesetSnapshot != nil {
 		snapshotClient := opts.RulesetSnapshot
 		d.routingTraces.SetSnapshotStatusFunc(func() (afclient.RulesetSnapshotStatus, bool) {
@@ -616,6 +624,10 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
+	if d.sessionShimAttestationValue.enabled() &&
+		(d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete()) {
+		return true, "session-shim recovery is not ready"
+	}
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
 		return false, ""
@@ -724,6 +736,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if d.controllerIDErr != nil {
 		return d.controllerIDErr
 	}
+	if d.sessionShimAttestationErr != nil {
+		return d.sessionShimAttestationErr
+	}
 	lease, err := d.claimLifecycle(ctx, lifecycleStart)
 	if err != nil {
 		return err
@@ -768,15 +783,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.capabilitySet = cs
 	slog.Info("daemon: detected substrate capabilities",
 		"count", len(cs.Capabilities()))
-
-	// §D4: adopt BEFORE advertising. Registration is the first thing that tells
-	// anything outside this host how much capacity is available, so every
-	// surviving per-session shim must be discovered and either adopted or
-	// quarantined — and counted — before this point. A daemon that registered
-	// first would advertise slots that surviving harnesses already occupy.
-	if err := d.adoptSessionShims(ctx); err != nil {
-		return err
-	}
 
 	var (
 		regResp *RegisterResponse
@@ -823,16 +829,53 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// never crashes registration.
 			HostInfo:            GatherHostInfo(d.EffectiveVersion(), d.StartedAt()),
 			ValidateCredentials: d.validateControllerCredentials,
+			SessionShim:         d.SessionShimHostAttestation(),
+			AuthOnly:            d.sessionShimAttestationValue.enabled(),
 		}
-		var err error
-		regResp, err = Register(ctx, regOpts)
-		if err != nil {
-			return fmt.Errorf("register: %w", err)
+	}
+
+	register := func() error {
+		if d.opts.SkipRegistration {
+			return nil
+		}
+		var registerErr error
+		regResp, registerErr = Register(ctx, regOpts)
+		if registerErr != nil {
+			return fmt.Errorf("register: %w", registerErr)
+		}
+		if d.sessionShimAttestationValue.enabled() {
+			if receiptErr := d.acquireSessionShimRecoveryReceipts(ctx, regResp.SessionShim); receiptErr != nil {
+				return receiptErr
+			}
 		}
 		d.mu.Lock()
 		d.workerID = regResp.WorkerID
 		d.jwt = regResp.RuntimeToken
 		d.mu.Unlock()
+		return nil
+	}
+
+	// D12's hosted path is deliberately auth-only: acquire every scoped
+	// credential/host/revision receipt first, while heartbeat, spawner, poll,
+	// claim, and capacity publication do not yet exist. The zero-value legacy
+	// path retains the established adopt-before-register order.
+	if d.sessionShimAttestationValue.enabled() {
+		if d.opts.SkipRegistration {
+			return errors.New("session shim: attested recovery cannot skip registration")
+		}
+		d.setState(StateRecovering)
+		if err := register(); err != nil {
+			return err
+		}
+	}
+
+	if err := d.adoptSessionShims(ctx); err != nil {
+		return err
+	}
+	if !d.sessionShimAttestationValue.enabled() {
+		if err := register(); err != nil {
+			return err
+		}
 	}
 
 	// Spawner — built before heartbeat/poll so the poll loop has a target for
@@ -901,6 +944,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.ExternalOccupancy = d.SessionShimOccupancy
 	}
 	d.spawner = NewWorkerSpawner(spawnerOpts)
+	if d.sessionShimAttestationValue.enabled() {
+		// D12: construction is not admission. Keep the spawner closed until the
+		// first exact heartbeat response accepts the published recovery state.
+		d.spawner.Pause()
+	}
 	// Cleanup the per-session detail store when sessions end so
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
@@ -937,7 +985,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 			WorkerID:     regResp.WorkerID,
 			RuntimeJWT:   regResp.RuntimeToken,
 			ValidateRefresh: func(result *RefreshTokenResult) error {
-				return d.validateControllerCredentials(result.WorkerID, result.RuntimeToken)
+				if err := d.validateControllerCredentials(result.WorkerID, result.RuntimeToken); err != nil {
+					return err
+				}
+				return d.validateAndRetainSessionShimRefreshReceipt(result)
 			},
 			OnRefreshed: func(result *RefreshTokenResult) {
 				// Capture the identity being superseded under the same lock that
@@ -967,7 +1018,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// 404 saying the orchestrator does not recognise this worker, we
 		// re-mint via RefreshRuntimeToken — which re-presents the existing
 		// registration wherever it still exists rather than replacing it.
-		d.heartbeat = NewHeartbeatService(HeartbeatOptions{
+		heartbeatOpts := HeartbeatOptions{
 			WorkerID:        regResp.WorkerID,
 			Hostname:        cfg.Machine.ID,
 			OrchestratorURL: cfg.Orchestrator.URL,
@@ -1016,9 +1067,28 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// to af daemon stats. The latest observed status is stored
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
-		})
+		}
+		if d.sessionShimAttestationValue.enabled() {
+			primaryScope := d.sessionShimConfig().orgID()
+			heartbeatOpts.GetSessionShim = func() (SessionShimHeartbeatProjection, error) {
+				return d.SessionShimHeartbeatProjection(primaryScope)
+			}
+		}
+		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
-		d.heartbeat.Start()
+		if d.sessionShimAttestationValue.enabled() {
+			if err := d.heartbeat.StartSynchronized(ctx); err != nil {
+				return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
+			}
+			d.spawner.Resume()
+			d.lifecycleMu.Lock()
+			if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
+				d.setState(StateRunning)
+			}
+			d.lifecycleMu.Unlock()
+		} else {
+			d.heartbeat.Start()
+		}
 
 		// Poll loop — the binding constraint that makes the daemon actually
 		// receive work. Without this the platform's heartbeat-only sidecar
@@ -2140,7 +2210,7 @@ func (d *Daemon) MaxConcurrentSessions() int {
 // configuration.
 func (d *Daemon) RegistrationStatus() RegistrationStatus {
 	switch d.State() {
-	case StateDraining, StateUpdating:
+	case StateStarting, StateRecovering, StateDraining, StateUpdating:
 		return RegistrationDraining
 	case StateRunning:
 		cfg := d.Config()
@@ -2150,7 +2220,7 @@ func (d *Daemon) RegistrationStatus() RegistrationStatus {
 		// §D4: readiness is withheld until the adoption pass has finished. Until
 		// then this daemon does not yet know what is occupied, and "idle" would be
 		// a claim it cannot support.
-		if !d.SessionShimAdoptionComplete() {
+		if !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
 			return RegistrationDraining
 		}
 		active := d.spawnerActiveCount()

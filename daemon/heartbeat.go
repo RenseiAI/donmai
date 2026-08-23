@@ -57,6 +57,13 @@ type HeartbeatOptions struct {
 	// something quarantined to report.
 	GetQuarantinedSessions func() []sessionshim.QuarantinedSession
 
+	// GetSessionShim returns one coherent, non-secret adoption projection. When
+	// configured, every network heartbeat carries it under sessionShim and a
+	// successful call requires the server to echo the exact typed projection.
+	// One callback is load-bearing: assembling host/revision/quarantine fields
+	// through separate callbacks would permit a torn readiness claim.
+	GetSessionShim func() (SessionShimHeartbeatProjection, error)
+
 	// GetActiveInteractiveCount is the legacy separately sampled interactive
 	// occupancy callback. It remains source-compatible with embedders that adopted
 	// the initial activeInteractiveCount contract before GetActiveSessionCounts was
@@ -220,6 +227,22 @@ func NewHeartbeatService(opts HeartbeatOptions) *HeartbeatService {
 // Start launches the heartbeat goroutine. It sends an immediate heartbeat,
 // then continues at IntervalSeconds. Subsequent calls are no-ops.
 func (h *HeartbeatService) Start() {
+	h.start(true)
+}
+
+// StartSynchronized sends and strictly validates one heartbeat before starting
+// the periodic loop. Hosted session-shim recovery uses this after adoption and
+// carrier activation so poll/claim cannot race ahead of the first accepted
+// host/controller/revision projection.
+func (h *HeartbeatService) StartSynchronized(ctx context.Context) error {
+	if err := h.sendOneResult(ctx); err != nil {
+		return err
+	}
+	h.start(false)
+	return nil
+}
+
+func (h *HeartbeatService) start(immediate bool) {
 	h.mu.Lock()
 	if h.running {
 		h.mu.Unlock()
@@ -230,7 +253,7 @@ func (h *HeartbeatService) Start() {
 	h.running = true
 	h.mu.Unlock()
 
-	go h.loop(ctx)
+	go h.loop(ctx, immediate)
 }
 
 // Stop terminates the heartbeat goroutine. Safe to call multiple times.
@@ -270,9 +293,10 @@ func (h *HeartbeatService) CurrentCredentials() (workerID, runtimeJWT string) {
 	return h.workerID, h.jwt
 }
 
-func (h *HeartbeatService) loop(ctx context.Context) {
-	// Immediate first heartbeat.
-	h.sendOne(ctx)
+func (h *HeartbeatService) loop(ctx context.Context, immediate bool) {
+	if immediate {
+		h.sendOne(ctx)
+	}
 
 	tick := time.NewTicker(time.Duration(h.opts.IntervalSeconds) * time.Second)
 	defer tick.Stop()
@@ -287,6 +311,12 @@ func (h *HeartbeatService) loop(ctx context.Context) {
 }
 
 func (h *HeartbeatService) sendOne(ctx context.Context) {
+	if err := h.sendOneResult(ctx); err != nil {
+		h.opts.LogWarn("daemon heartbeat skipped: %v", err)
+	}
+}
+
+func (h *HeartbeatService) sendOneResult(ctx context.Context) error {
 	var (
 		activeCount       int
 		activeInteractive *int
@@ -348,6 +378,17 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 			payload.QuarantinedSessions = q
 		}
 	}
+	if h.opts.GetSessionShim != nil {
+		projection, projectionErr := h.opts.GetSessionShim()
+		if projectionErr != nil {
+			return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
+		}
+		projection = cloneSessionShimHeartbeatProjection(projection)
+		if err := projection.validateReady(); err != nil {
+			return fmt.Errorf("heartbeat: %w", err)
+		}
+		payload.SessionShim = &projection
+	}
 
 	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
 	// ok=false leaves payload.Load nil so the wire body omits the key
@@ -389,15 +430,21 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 	jwt := h.jwt
 	h.mu.Unlock()
 	if stubModeRequested() || strings.HasPrefix(jwt, "stub.") {
-		return
+		return nil
 	}
 	resp, err := h.callEndpoint(ctx, payload, ackApplied, ackFailures)
 	if err == nil {
+		if payload.SessionShim != nil && !resp.Acknowledged {
+			return errors.New("heartbeat response did not acknowledge session shim projection")
+		}
+		if validationErr := validateHeartbeatSessionShimResponse(payload.SessionShim, resp.SessionShim); validationErr != nil {
+			return validationErr
+		}
 		// Successful POST — drop the ACKs we just confirmed, then process
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
 		h.handleHeartbeatResponse(ctx, resp)
-		return
+		return nil
 	}
 	// On 401 (token expired/invalid) or 404 (worker not recognised),
 	// re-register and retry once with fresh credentials. Any other error
@@ -421,7 +468,7 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		newWorkerID, newJWT, regErr := h.opts.OnReregister(ctx, reason)
 		if regErr != nil {
 			h.opts.LogWarn("daemon runtime-token refresh failed: %v", regErr)
-			return
+			return fmt.Errorf("heartbeat runtime-token refresh: %w", regErr)
 		}
 		h.mu.Lock()
 		h.workerID = newWorkerID
@@ -434,13 +481,20 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 		retryResp, retryErr := h.callEndpoint(ctx, retryPayload, ackApplied, ackFailures)
 		if retryErr != nil {
 			h.opts.LogWarn("daemon heartbeat post-refresh also failed: %v", retryErr)
-		} else {
-			h.dropConfirmedAcks(ackApplied, ackFailures)
-			h.handleHeartbeatResponse(ctx, retryResp)
+			return retryErr
 		}
-		return
+		if retryPayload.SessionShim != nil && !retryResp.Acknowledged {
+			return errors.New("heartbeat post-refresh response did not acknowledge session shim projection")
+		}
+		if validationErr := validateHeartbeatSessionShimResponse(retryPayload.SessionShim, retryResp.SessionShim); validationErr != nil {
+			return validationErr
+		}
+		h.dropConfirmedAcks(ackApplied, ackFailures)
+		h.handleHeartbeatResponse(ctx, retryResp)
+		return nil
 	}
 	h.opts.LogWarn("daemon heartbeat HTTP call failed: %v — orchestrator will detect via missed heartbeats", err)
+	return err
 }
 
 // workerIDLocked returns the current worker id under the lock.
@@ -524,6 +578,7 @@ type heartbeatRequestBody struct {
 	// QuarantinedSessions is the §D7 projection: every live per-session shim
 	// this daemon refused to adopt, each carrying consumesCapacity:true.
 	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
+	SessionShim         *SessionShimHeartbeatProjection  `json:"sessionShim,omitempty"`
 }
 
 type heartbeatLoadFields struct {
@@ -607,11 +662,12 @@ func (h *HostStatusDetail) SuspendsClaiming() bool {
 // and pendingMutations. Both are optional — a daemon talking to a
 // pre-Phase-2 platform unmarshals the missing fields to zero values.
 type heartbeatResponseBody struct {
-	Acknowledged     bool              `json:"acknowledged"`
-	ServerTime       string            `json:"serverTime"`
-	PendingWorkCount int               `json:"pendingWorkCount"`
-	HostStatus       *HostStatusDetail `json:"hostStatus,omitempty"`
-	PendingMutations []PendingMutation `json:"pendingMutations,omitempty"`
+	Acknowledged     bool                            `json:"acknowledged"`
+	ServerTime       string                          `json:"serverTime"`
+	PendingWorkCount int                             `json:"pendingWorkCount"`
+	HostStatus       *HostStatusDetail               `json:"hostStatus,omitempty"`
+	PendingMutations []PendingMutation               `json:"pendingMutations,omitempty"`
+	SessionShim      *SessionShimHeartbeatProjection `json:"sessionShim,omitempty"`
 }
 
 func (h *HeartbeatService) callEndpoint(
@@ -643,6 +699,7 @@ func (h *HeartbeatService) callEndpoint(
 		AppliedMutations:       ackApplied,
 		MutationFailures:       ackFailures,
 		QuarantinedSessions:    payload.QuarantinedSessions,
+		SessionShim:            payload.SessionShim,
 	}
 	// NB: region is deliberately NOT sent on the heartbeat leg. The platform's
 	// heartbeat route parses no `region` key — region is a register-time-only
@@ -681,6 +738,25 @@ func (h *HeartbeatService) callEndpoint(
 		return &heartbeatResponseBody{Acknowledged: true}, nil
 	}
 	return &resp, nil
+}
+
+func validateHeartbeatSessionShimResponse(
+	want *SessionShimHeartbeatProjection,
+	got *SessionShimHeartbeatProjection,
+) error {
+	if want == nil {
+		return nil
+	}
+	if got == nil {
+		return errors.New("heartbeat response missing session shim acceptance")
+	}
+	if err := got.validateReady(); err != nil {
+		return fmt.Errorf("heartbeat response: %w", err)
+	}
+	if !want.exactEqual(*got) {
+		return errors.New("heartbeat response did not exactly echo the session shim projection")
+	}
+	return nil
 }
 
 // dropConfirmedAcks removes the ACK entries the platform just accepted

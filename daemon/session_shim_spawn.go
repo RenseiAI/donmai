@@ -169,6 +169,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	receipt, err := d.completeSessionShimAdoption(ctx, evidence)
 	evidence.SnapshotProxy.deactivate()
 	if err != nil {
+		d.cancelStagedSessionShimSnapshot(id)
 		gate.finish(false)
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: durable adoption %s: %w", id, err)
@@ -176,9 +177,52 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// SnapshotProxy exists only for the synchronous carrier takeover callback.
 	// Published daemon state uses the stable lookup APIs instead.
 	evidence.SnapshotProxy = nil
+	if cfg.OnAdoptionPublished != nil {
+		d.setState(StateRecovering)
+		d.shims.mu.Lock()
+		d.shims.carrierActivationComplete = false
+		d.shims.mu.Unlock()
+	}
+	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt)
+	if err != nil {
+		d.failPendingSessionShimActivations()
+		gate.finish(false)
+		_ = ctrl.Close()
+		return nil, fmt.Errorf("session shim: durable adoption batch %s: %w", id, err)
+	}
+	if err := d.updateSessionShimAdoptionRevision(id.OrgID, batchReceipt.AdoptionRevision); err != nil {
+		d.failPendingSessionShimActivations()
+		gate.finish(false)
+		_ = ctrl.Close()
+		return nil, fmt.Errorf("session shim: retain adoption revision %s: %w", id, err)
+	}
+	d.shims.mu.Lock()
+	if len(batchReceipt.DurableCorrelation) > 0 {
+		d.shims.batchReceipts[id.OrgID] = batchReceipt
+	}
+	d.shims.mu.Unlock()
 
 	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, evidence, receipt, false)
 	gate.finish(true)
+	if cfg.OnAdoptionPublished != nil {
+		d.shims.mu.RLock()
+		published := make(map[sessionshim.Identity]adoptedShim, len(d.shims.adopted))
+		for identity, entry := range d.shims.adopted {
+			published[identity] = entry
+		}
+		d.shims.mu.RUnlock()
+		if activationErr := d.activatePublishedSessionShimCarriers(ctx, published); activationErr != nil {
+			// The harness and durable adoption are already real. Preserve the claim
+			// and visible capacity while withholding further claims; returning a
+			// launch failure here would invite a duplicate session.
+			slog.Error("session shim: post-publication carrier activation failed",
+				"session", id.String(), "error", activationErr)
+			d.failPendingSessionShimActivations()
+			_ = ctrl.Close()
+			return &handle, nil
+		}
+		d.setState(StateRunning)
+	}
 	slog.Info("session shim: launched and adopted an interactive session",
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
@@ -397,6 +441,16 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					}
 				}
 			case sessionshim.EventSnapshotFrame:
+				if activationGate, staged := d.retainStagedSessionShimSnapshot(id, ev); staged {
+					// The exact frame is retained locally but deliberately not handed to
+					// the ordinary durable callback and not acknowledged to the shim.
+					// OnAdoption stores it as the candidate Snapshot; carrier_active
+					// resolves it after local publication, then releases this gate.
+					if !activationGate.await() {
+						return
+					}
+					continue
+				}
 				if ev.Seq > lastSeq {
 					lastSeq = ev.Seq
 					if durable != nil {

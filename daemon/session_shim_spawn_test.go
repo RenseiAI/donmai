@@ -28,6 +28,13 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-takeover-snapshot"
 	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	d.opts.SessionShim.CallbackTimeout = 500 * time.Millisecond
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		return sessionshim.PreparedAdoption{
+			ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+			Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "19"}},
+		}, nil
+	}
 	var emitted shimwire.SnapshotResult
 	var retainedProxy *SessionShimSnapshotProxy
 	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
@@ -41,6 +48,20 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 			return SessionShimAdoptionReceipt{}, err
 		}
 		return SessionShimAdoptionReceipt{DurableCorrelation: []byte("carrier-takeover-complete")}, nil
+	}
+	d.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil }
+	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return SessionShimAdoptionBatchReceipt{
+			DurableCorrelation: []byte("snapshot-batch"), AdoptionRevision: "snapshot-revision",
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoptionPublished = func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		if _, err := d.adoptedShimEntry(f.orgID, "takeover-snapshot"); err != nil {
+			return nil, fmt.Errorf("activation ran before local publication: %w", err)
+		}
+		return []SessionShimCarrierActivationReceipt{{
+			Activation: publication.Carriers[0], AckSeq: emitted.AtSeq + 1,
+		}}, nil
 	}
 
 	spec := f.interactiveSpec("takeover-snapshot")
@@ -83,11 +104,19 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 	var durableSeq uint64
 	var emitted shimwire.SnapshotResult
 	var durableMu sync.Mutex
-	replacement := New(Options{
+	var activationObservedForwarded uint64
+	var replacement *Daemon
+	replacement = New(Options{
 		SkipRegistration: true,
 		SessionShim: SessionShimConfig{
 			EnableAdoption: true, RegistryDir: f.registry,
 			HostID: "host-large-replay", RequireAuthoritativeSnapshot: true,
+			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+				return sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "23"}},
+				}, nil
+			},
 			OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
 				durableMu.Lock()
 				defer durableMu.Unlock()
@@ -108,10 +137,21 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 				}
 				durableMu.Lock()
 				defer durableMu.Unlock()
-				if durableCount <= 64 || durableSeq < emitted.AtSeq+1 {
-					return SessionShimAdoptionReceipt{}, fmt.Errorf("snapshot returned before replay durability: count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
+				if durableCount <= 64 || durableSeq != emitted.AtSeq {
+					return SessionShimAdoptionReceipt{}, fmt.Errorf("replay/staged split = count=%d seq=%d snapshot=%d", durableCount, durableSeq, emitted.AtSeq+1)
 				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("large-replay-complete")}, nil
+			},
+			OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+				return SessionShimAdoptionBatchReceipt{
+					DurableCorrelation: []byte("large-replay-batch"), AdoptionRevision: "large-replay-revision",
+				}, nil
+			},
+			OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+				activationObservedForwarded = replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID)
+				return []SessionShimCarrierActivationReceipt{{
+					Activation: publication.Carriers[0], AckSeq: emitted.AtSeq + 1,
+				}}, nil
 			},
 		},
 	})
@@ -123,6 +163,9 @@ func TestOnAdoptionSnapshotDrainsMoreThanEventBufferReplayInDurableOrder(t *test
 	}
 	if len(emitted.Bytes) == 0 || !emitted.InStream {
 		t.Fatalf("takeover emitted snapshot = %+v", emitted)
+	}
+	if activationObservedForwarded >= emitted.AtSeq+1 {
+		t.Fatalf("staged Snapshot advanced before carrier_active: forwarded=%d snapshot=%d", activationObservedForwarded, emitted.AtSeq+1)
 	}
 	if got := replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID); got < emitted.AtSeq+1 {
 		t.Fatalf("early durable high-water regressed at publication: got %d want >= %d", got, emitted.AtSeq+1)
@@ -504,6 +547,7 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-callback"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
 	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 		if preparation.Identity.OrgID != "org-callback" || preparation.HostID != "host-callback" ||
 			preparation.ShimID == "" || preparation.ProcessEpoch == 0 {
@@ -519,9 +563,26 @@ func TestSessionShimAdoptionAndTerminalCallbacksCarryExactCorrelation(t *testing
 		}, nil
 	}
 	var adoption SessionShimAdoptionEvidence
-	d.opts.SessionShim.OnAdoption = func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+	var emitted shimwire.SnapshotResult
+	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 		adoption = evidence
+		var err error
+		emitted, err = evidence.SnapshotProxy.Emit(ctx)
+		if err != nil {
+			return SessionShimAdoptionReceipt{}, err
+		}
 		return SessionShimAdoptionReceipt{DurableCorrelation: []byte(`{"fenceRevision":"73","adoptionRevision":"81"}`)}, nil
+	}
+	d.opts.SessionShim.OnSessionEventDurable = func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil }
+	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return SessionShimAdoptionBatchReceipt{
+			DurableCorrelation: []byte("callback-batch"), AdoptionRevision: "callback-revision",
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoptionPublished = func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		return []SessionShimCarrierActivationReceipt{{
+			Activation: publication.Carriers[0], AckSeq: emitted.AtSeq + 1,
+		}}, nil
 	}
 	terminal := make(chan SessionShimTerminalEvidence, 1)
 	d.opts.SessionShim.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
@@ -1189,23 +1250,32 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 		t.Fatalf("RegistrationStatus after callback refusal = %q, want draining", got)
 	}
 
-	replacement := New(Options{
+	var emitted shimwire.SnapshotResult
+	var replacement *Daemon
+	replacement = New(Options{
 		SkipRegistration: true,
 		SessionShim: SessionShimConfig{
-			EnableAdoption: true,
-			RegistryDir:    f.registry,
-			HostID:         "host-startup",
+			EnableAdoption:               true,
+			RegistryDir:                  f.registry,
+			HostID:                       "host-startup",
+			RequireAuthoritativeSnapshot: true,
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
 					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
 				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1}, nil
 			},
-			OnAdoption: func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+			OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 				if evidence.Identity != id {
 					return SessionShimAdoptionReceipt{}, fmt.Errorf("wrong identity %s", evidence.Identity)
 				}
+				var err error
+				emitted, err = evidence.SnapshotProxy.Emit(ctx)
+				if err != nil {
+					return SessionShimAdoptionReceipt{}, err
+				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("durable-startup")}, nil
 			},
+			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
 			PrepareAdoptionBatch: func(context.Context, string, string) ([]byte, error) {
 				return []byte("expected-startup-batch"), nil
 			},
@@ -1213,7 +1283,17 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 				if len(batch.Adopted) != 1 || batch.Adopted[0].Evidence.SnapshotProxy != nil {
 					return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("batch retained ephemeral snapshot proxy: %+v", batch.Adopted)
 				}
-				return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("startup-batch-revision")}, nil
+				return SessionShimAdoptionBatchReceipt{
+					DurableCorrelation: []byte("startup-batch-revision"), AdoptionRevision: "startup-revision",
+				}, nil
+			},
+			OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+				if _, err := replacement.adoptedShimEntry(id.OrgID, id.SessionID); err != nil {
+					return nil, fmt.Errorf("activation before publication: %w", err)
+				}
+				return []SessionShimCarrierActivationReceipt{{
+					Activation: publication.Carriers[0], AckSeq: emitted.AtSeq + 1,
+				}}, nil
 			},
 		},
 	})

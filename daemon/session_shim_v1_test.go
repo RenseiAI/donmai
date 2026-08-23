@@ -117,7 +117,12 @@ func TestSelectedV1StaysLocallyAdoptedButPublishesCarrierQuarantine(t *testing.T
 			},
 			OnAdoptionBatch: func(_ context.Context, got SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 				batch = got
-				return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("revision-v1")}, nil
+				return SessionShimAdoptionBatchReceipt{
+					DurableCorrelation: []byte("revision-v1"), AdoptionRevision: "revision-v1",
+				}, nil
+			},
+			OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+				return nil, nil
 			},
 		},
 	})

@@ -130,13 +130,14 @@ type DaemonSessionShimAdoptedCorrelation struct {
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.
 type DaemonSessionShimStatus struct {
-	OwnershipMode       DaemonSessionShimOwnershipMode        `json:"ownershipMode"`
-	AdoptionComplete    bool                                  `json:"adoptionComplete"`
-	AdoptionCompletedAt string                                `json:"adoptionCompletedAt,omitempty"`
-	OccupiedSlots       int                                   `json:"occupiedSlots"`
-	Adopted             []DaemonSessionShimAdoptedCorrelation `json:"adopted,omitempty"`
-	Quarantined         []sessionshim.QuarantinedSession      `json:"quarantined,omitempty"`
-	ControllerID        string                                `json:"controllerId,omitempty"`
+	OwnershipMode             DaemonSessionShimOwnershipMode        `json:"ownershipMode"`
+	AdoptionComplete          bool                                  `json:"adoptionComplete"`
+	CarrierActivationComplete bool                                  `json:"carrierActivationComplete,omitempty"`
+	AdoptionCompletedAt       string                                `json:"adoptionCompletedAt,omitempty"`
+	OccupiedSlots             int                                   `json:"occupiedSlots"`
+	Adopted                   []DaemonSessionShimAdoptedCorrelation `json:"adopted,omitempty"`
+	Quarantined               []sessionshim.QuarantinedSession      `json:"quarantined,omitempty"`
+	ControllerID              string                                `json:"controllerId,omitempty"`
 }
 
 // DaemonProjectStatus is one truthful host-project status row.

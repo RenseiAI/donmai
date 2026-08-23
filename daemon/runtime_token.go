@@ -157,6 +157,9 @@ func (r *runtimeTokenRefresher) rememberValidated(regOpts RegistrationOptions, r
 			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
 		}
 	}
+	if err := validateSessionShimCredentialReceipt(regOpts.SessionShim, result.SessionShim, result.WorkerID); err != nil {
+		return nil, fmt.Errorf("validate refreshed session shim receipt: %w", err)
+	}
 	return r.remember(result), nil
 }
 
@@ -218,6 +221,11 @@ type RefreshTokenResult struct {
 	RuntimeTokenExpiresAt string
 	HeartbeatInterval     int
 	PollInterval          int
+
+	// SessionShim is the exact non-secret server receipt returned by the
+	// refresh or full re-registration path. It is retained in the credential
+	// cache so hosted recovery never accepts a fresh-by-expiry legacy bearer.
+	SessionShim *SessionShimCredentialReceipt
 
 	// RegistrationTokenSwapped is true when Mode=reregister produced a
 	// different workerId. Operators care about this signal because the
@@ -346,6 +354,7 @@ func (r *runtimeTokenRefresher) refresh(
 				RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
 				HeartbeatInterval:     fresh.HeartbeatInterval,
 				PollInterval:          fresh.PollInterval,
+				SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
 				Reason:                reason,
 			})
 		}
@@ -430,6 +439,7 @@ func (r *runtimeTokenRefresher) refresh(
 		RuntimeTokenExpiresAt:    rr.RuntimeTokenExpiresAt,
 		HeartbeatInterval:        rr.HeartbeatInterval,
 		PollInterval:             rr.PollInterval,
+		SessionShim:              cloneSessionShimCredentialReceipt(rr.SessionShim),
 		RegistrationTokenSwapped: swapped,
 		Reason:                   reason,
 	})
@@ -465,6 +475,9 @@ func (r *runtimeTokenRefresher) adoptCachedRegistration(
 	if candidate == "" || candidate == currentWorkerID || isStubRuntimeToken(cached.RuntimeToken) {
 		return nil
 	}
+	if !cachedMatchesSessionShim(cached, regOpts.SessionShim) {
+		return nil
+	}
 
 	fresh, probeErr := callRefreshEndpoint(ctx, regOpts, candidate)
 	if probeErr != nil {
@@ -484,6 +497,7 @@ func (r *runtimeTokenRefresher) adoptCachedRegistration(
 		RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
 		HeartbeatInterval:     fresh.HeartbeatInterval,
 		PollInterval:          fresh.PollInterval,
+		SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
 		Reason:                reason,
 	}
 }
@@ -527,6 +541,7 @@ func persistRefreshedToken(jwtPath string, result *RefreshTokenResult, nowFn fun
 		HeartbeatInterval:     result.HeartbeatInterval,
 		PollInterval:          result.PollInterval,
 		RuntimeTokenExpiresAt: result.RuntimeTokenExpiresAt,
+		SessionShim:           cloneSessionShimCredentialReceipt(result.SessionShim),
 	}, nowFn())
 }
 
@@ -550,10 +565,11 @@ func (e *refreshHTTPError) Error() string {
 // fields are honoured when present and ignored when absent (existing
 // services keep their current cadence).
 type refreshResponse struct {
-	RuntimeToken          string `json:"runtimeToken"`
-	RuntimeTokenExpiresAt string `json:"runtimeTokenExpiresAt,omitempty"`
-	HeartbeatInterval     int    `json:"heartbeatInterval,omitempty"`
-	PollInterval          int    `json:"pollInterval,omitempty"`
+	RuntimeToken          string                        `json:"runtimeToken"`
+	RuntimeTokenExpiresAt string                        `json:"runtimeTokenExpiresAt,omitempty"`
+	HeartbeatInterval     int                           `json:"heartbeatInterval,omitempty"`
+	PollInterval          int                           `json:"pollInterval,omitempty"`
+	SessionShim           *SessionShimCredentialReceipt `json:"sessionShim,omitempty"`
 }
 
 // callRefreshEndpoint posts to the platform's refresh probe with the
@@ -567,13 +583,20 @@ func callRefreshEndpoint(
 	opts RegistrationOptions,
 	workerID string,
 ) (*refreshResponse, error) {
+	if err := opts.SessionShim.validate(); err != nil {
+		return nil, err
+	}
 	client := opts.HTTPClient
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	url := strings.TrimRight(opts.OrchestratorURL, "/") +
 		"/api/workers/" + workerID + "/refresh-token"
-	body := bytes.NewBufferString("{}")
+	bodyBytes, err := json.Marshal(opts.SessionShim)
+	if err != nil {
+		return nil, fmt.Errorf("marshal request: %w", err)
+	}
+	body := bytes.NewReader(bodyBytes)
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, body)
 	if err != nil {
 		return nil, fmt.Errorf("build request: %w", err)
@@ -596,6 +619,9 @@ func callRefreshEndpoint(
 	}
 	if resp.RuntimeToken == "" {
 		return nil, fmt.Errorf("refresh response missing runtimeToken")
+	}
+	if err := validateSessionShimCredentialReceipt(opts.SessionShim, resp.SessionShim, workerID); err != nil {
+		return nil, fmt.Errorf("validate refresh session shim receipt: %w", err)
 	}
 	return &resp, nil
 }
