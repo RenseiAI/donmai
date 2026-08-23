@@ -1344,10 +1344,12 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			RequireCredentialAttestation: true,
 			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
-				return sessionshim.PreparedAdoption{Extensions: shimwire.Extensions{
-					Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
-				}, ControllerGeneration: preparation.CurrentControllerGeneration + 1,
-					ResumeFrom: proofResolvedResume(preparation)}, nil
+				return sessionshim.PreparedAdoption{
+					Extensions: shimwire.Extensions{
+						Values: map[string]string{shimwire.ExtCarrierEpoch: "20"},
+					}, ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					ResumeFrom: proofResolvedResume(preparation),
+				}, nil
 			},
 			OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 				if evidence.Identity != id {
