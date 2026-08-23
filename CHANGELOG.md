@@ -8,15 +8,54 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.2 — 2026-08-23
+
 ### Features
 
-- **Proposed v0.68.2 session-shim v2 boundary.** A daemon now resolves one
-  high-entropy, process-scoped controller id at construction (or accepts an
-  explicit non-alias override), and selected local-wire v2 proxies fresh
-  shim-owned PTY snapshot inspection and emission with exact request
-  correlation and interactive-attach frame bytes. The stable family retains
-  selected-v1 adoption; carriers that require fresh snapshots receive typed
-  incompatibility evidence while the older shim remains capacity-charged.
+- **Session-shim controllers have immutable process-scoped identity.** Each
+  daemon resolves one high-entropy controller id exactly once at construction,
+  or accepts an explicit exact override. The correlation stays independent of
+  registration, credential refresh, stable host authority, and every shim's
+  own controller generation. (#381)
+- **Selected local-wire v2 proxies fresh authoritative PTY snapshots.** The
+  read-only operation returns exact shim-owned encoded screen bytes and
+  `at_seq` without allocating output sequence. The emitting operation calls the
+  shim-owned PTY host once and returns the exact interactive-attach frame:
+  delivered once in host-stream order before Exit, or sequence-zero with
+  `at_seq == Exit.seq` after Exit. Request ids, modes, generations, immutable
+  retries, and the bounded per-connection ledger remain explicit. This release
+  ships the OSS protocol and composition boundary; it does not claim downstream
+  carrier activation. (#381)
+- **Selected-v1 shims remain locally owned through the v2 overlap.** A newer
+  daemon still adopts and controls a released v1 shim without sending a v2
+  message. A carrier requiring fresh authoritative snapshots instead receives
+  typed `authoritative_snapshot_unsupported` evidence while the live shim
+  remains capacity-charged; no daemon cache or reconstructed screen substitutes
+  for the missing capability. (#381)
+
+### Fixes
+
+- **Controller identity cannot alias credentials.** Stable host ids, worker
+  registration ids, the comparison-only runtime-token `jti`, and the literal
+  `daemon` are refused as controller sources. Initial, cached, refreshed, and
+  re-registered credentials are checked before they become visible to daemon
+  state, service lanes, callbacks, or the credential cache; decoded token claims
+  never become authentication authority. (#381)
+- **Snapshot results fail closed unless their exact disposition is proven.**
+  The controller now verifies request id, mode, generation, screen format and
+  encoding, emitted frame bytes, live sequence law, and ordered immutable Exit
+  before accepting a result. Changed replay, duplicate delivery, stale
+  generation, malformed bytes, and live/direct Exit-order disagreement close
+  instead of fabricating continuity. The durable event consumer starts before
+  carrier takeover, so replay beyond its bounded event buffer and an emitted
+  snapshot advance one monotonic durable cursor before adoption completes.
+  (#381)
+- **Quarantine keeps the trustworthy controller generation.** Selected-v1
+  carrier incompatibility reports the committed generation, and a pre-commit
+  refusal after authenticated Hello reports that Hello generation. Explicit
+  zero is reserved for discovery with no trustworthy Hello. The value is
+  preserved through status, heartbeat, adoption batch, and restart-fence
+  projections. (#381)
 
 ## v0.68.1 — 2026-08-22
 
