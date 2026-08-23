@@ -4,6 +4,7 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 verify_script="${root_dir}/scripts/verify-release-tag.sh"
 authority_script="${root_dir}/scripts/verify-release-authority.sh"
+signing_key_test="${root_dir}/scripts/test-release-signing-key.sh"
 e2b_script="${root_dir}/scripts/build-e2b-template.cjs"
 temp_dir=$(mktemp -d)
 trap 'rm -rf "${temp_dir}"' EXIT
@@ -256,6 +257,8 @@ grep -Fq 'lightweight tag' "${temp_dir}/v1.2.7-error" || fail 'lightweight tag r
 
 [[ -x "${authority_script}" ]] || fail 'shared release-authority verifier is missing or not executable'
 "${authority_script}" --self-test
+[[ -x "${signing_key_test}" ]] || fail 'release signing-key preflight test is missing or not executable'
+"${signing_key_test}"
 
 # Workflow fixtures keep namespace-qualified dispatch checkouts and share one verifier.
 for workflow in release.yml e2b-template.yml worker-image.yml; do
