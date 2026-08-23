@@ -1097,14 +1097,20 @@ func flockExclusive(file *os.File, nonblocking bool) error {
 	if nonblocking {
 		operation |= syscall.LOCK_NB
 	}
-	return syscall.Flock(int(file.Fd()), operation)
+	fd, err := intFileDescriptor(file.Fd())
+	if err != nil {
+		return err
+	}
+	return syscall.Flock(fd, operation)
 }
 
 func releaseFlock(file *os.File) {
 	if file == nil {
 		return
 	}
-	_ = syscall.Flock(int(file.Fd()), syscall.LOCK_UN)
+	if fd, err := intFileDescriptor(file.Fd()); err == nil {
+		_ = syscall.Flock(fd, syscall.LOCK_UN)
+	}
 	_ = file.Close()
 }
 

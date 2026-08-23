@@ -588,7 +588,11 @@ func (r *WorkareaArchiveRegistry) Restore(
 	// guaranteed under second-resolution.
 	now := time.Now().UTC()
 	newID := fmt.Sprintf("%s-restore-%d", archiveID, now.UnixNano())
-	dest := filepath.Join(r.restoredDir(), newID)
+	restoredDir := r.restoredDir()
+	if err := os.MkdirAll(restoredDir, 0o700); err != nil {
+		return nil, 0, fmt.Errorf("restore: create restored root: %w", err)
+	}
+	dest := filepath.Join(restoredDir, newID)
 	srcTree := r.treeDir(archiveID)
 
 	// Source tree is a hard requirement for restore.
@@ -1056,56 +1060,132 @@ func diffWalkers(idA, idB string, a, b []archiveEntry) (
 
 // copyTree copies the source directory tree to dst, preserving symlinks
 // (re-created with their original target string) and file modes.
-// Directories are created with 0o750; files with the source mode.
+// Every traversal and mutation after the two root opens is descriptor-relative.
 func copyTree(src, dst string) error {
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		target := filepath.Join(dst, rel)
-		info, err := d.Info()
+	sourceParent, sourceLeaf := filepath.Dir(src), filepath.Base(src)
+	if sourceLeaf == "." || sourceLeaf == ".." || sourceLeaf == "" {
+		return fmt.Errorf("archive copy source is not a safe leaf")
+	}
+	sourceParentRoot, err := os.OpenRoot(sourceParent)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sourceParentRoot.Close() }()
+	sourceInfo, err := sourceParentRoot.Lstat(sourceLeaf)
+	if err != nil {
+		return err
+	}
+	if !sourceInfo.IsDir() || sourceInfo.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("archive copy source is not a real directory")
+	}
+	sourceRoot, err := sourceParentRoot.OpenRoot(sourceLeaf)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = sourceRoot.Close() }()
+	openedSourceInfo, err := sourceRoot.Stat(".")
+	if err != nil || !os.SameFile(sourceInfo, openedSourceInfo) {
+		return fmt.Errorf("archive copy source identity changed while opening")
+	}
+	destinationParent, destinationLeaf := filepath.Dir(dst), filepath.Base(dst)
+	if destinationLeaf == "." || destinationLeaf == ".." || destinationLeaf == "" {
+		return fmt.Errorf("archive copy destination is not a safe leaf")
+	}
+	parentRoot, err := os.OpenRoot(destinationParent)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = parentRoot.Close() }()
+	if err := parentRoot.MkdirAll(destinationLeaf, sourceInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	destinationRoot, err := parentRoot.OpenRoot(destinationLeaf)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = destinationRoot.Close() }()
+	if err := destinationRoot.Chmod(".", sourceInfo.Mode().Perm()); err != nil {
+		return err
+	}
+	return copyRootContents(sourceRoot, destinationRoot)
+}
+
+func copyRootContents(source, destination *os.Root) error {
+	directory, err := source.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	if closeErr := directory.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	for _, entry := range entries {
+		name := entry.Name()
+		info, err := source.Lstat(name)
 		if err != nil {
 			return err
 		}
 		switch {
 		case info.Mode()&os.ModeSymlink != 0:
-			linkTarget, err := os.Readlink(path)
+			target, err := source.Readlink(name)
 			if err != nil {
 				return err
 			}
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil { //nolint:gosec
+			if err := destination.Symlink(target, name); err != nil {
 				return err
 			}
-			// The source archive is operator-supplied; symlinks are
-			// recreated as-is (target string preserved). Restore is an
-			// explicit operator action; the gosec G122 warning about
-			// symlink TOCTOU traversal is informational here.
-			return os.Symlink(linkTarget, target) //nolint:gosec
-		case d.IsDir():
-			if err := os.MkdirAll(target, info.Mode().Perm()); err != nil { //nolint:gosec
+		case info.IsDir():
+			if err := destination.Mkdir(name, info.Mode().Perm()); err != nil {
 				return err
 			}
-			return os.Chmod(target, info.Mode().Perm()) //nolint:gosec
+			sourceChild, err := source.OpenRoot(name)
+			if err != nil {
+				return err
+			}
+			openedChildInfo, err := sourceChild.Stat(".")
+			if err != nil || !os.SameFile(info, openedChildInfo) {
+				_ = sourceChild.Close()
+				return fmt.Errorf("archive copy source directory identity changed")
+			}
+			destinationChild, err := destination.OpenRoot(name)
+			if err != nil {
+				_ = sourceChild.Close()
+				return err
+			}
+			copyErr := copyRootContents(sourceChild, destinationChild)
+			_ = sourceChild.Close()
+			_ = destinationChild.Close()
+			if copyErr != nil {
+				return copyErr
+			}
+			if err := destination.Chmod(name, info.Mode().Perm()); err != nil {
+				return err
+			}
+		case info.Mode().IsRegular():
+			if err := copyRootFile(source, destination, name, info); err != nil {
+				return err
+			}
 		default:
-			if err := os.MkdirAll(filepath.Dir(target), 0o750); err != nil { //nolint:gosec
-				return err
-			}
-			return copyFile(path, target, info.Mode())
+			return fmt.Errorf("archive copy refuses special file %q", name)
 		}
-	})
+	}
+	return nil
 }
 
-func copyFile(src, dst string, mode os.FileMode) error {
-	in, err := os.Open(src) //nolint:gosec
+func copyRootFile(source, destination *os.Root, name string, expected os.FileInfo) error {
+	in, err := source.Open(name)
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(dst, os.O_CREATE|os.O_WRONLY|os.O_TRUNC, mode) //nolint:gosec
+	opened, err := in.Stat()
+	if err != nil || !os.SameFile(expected, opened) {
+		return fmt.Errorf("archive copy source file identity changed")
+	}
+	out, err := destination.OpenFile(name, os.O_CREATE|os.O_EXCL|os.O_WRONLY, expected.Mode().Perm())
 	if err != nil {
 		return err
 	}
@@ -1117,7 +1197,10 @@ func copyFile(src, dst string, mode os.FileMode) error {
 		_ = out.Close()
 		return err
 	}
-	return out.Close()
+	if err := out.Close(); err != nil {
+		return err
+	}
+	return destination.Chmod(name, expected.Mode().Perm())
 }
 
 func syncArchiveTree(root string) error {

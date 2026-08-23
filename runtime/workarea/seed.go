@@ -309,7 +309,12 @@ func (s *SeedStore) lockStore() (*os.File, error) {
 	if err != nil {
 		return nil, err
 	}
-	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+	fd, err := intFileDescriptor(lock.Fd())
+	if err != nil {
+		_ = lock.Close()
+		return nil, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_EX); err != nil {
 		_ = lock.Close()
 		return nil, err
 	}

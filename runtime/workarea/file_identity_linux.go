@@ -1,4 +1,4 @@
-//go:build darwin
+//go:build linux
 
 package workarea
 
@@ -14,10 +14,7 @@ func fileIdentity(info os.FileInfo) (FileIdentity, error) {
 	if !ok {
 		return FileIdentity{}, fmt.Errorf("runtime/workarea: filesystem identity unavailable")
 	}
-	if stat.Dev < 0 {
-		return FileIdentity{}, fmt.Errorf("runtime/workarea: negative filesystem device identity")
-	}
-	return FileIdentity{Device: uint64(stat.Dev), Inode: uint64(stat.Ino)}, nil
+	return FileIdentity{Device: stat.Dev, Inode: stat.Ino}, nil
 }
 
 func allocatedFileBytes(info os.FileInfo) (int64, error) {

@@ -632,6 +632,32 @@ func TestWorkareaArchiveRegistry_Restore_CorruptedArchive(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_RestorePreservesSymlinkWithoutFollowing(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("symlinks unreliable on Windows CI")
+	}
+	root := t.TempDir()
+	external := filepath.Join(t.TempDir(), "outside")
+	if err := os.WriteFile(external, []byte("outside"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-symlink-restore", tree: map[string]string{"link": "symlink:" + external},
+	})
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	restored, _, err := registry.Restore("wa-symlink-restore", afclient.WorkareaRestoreRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	target, err := os.Readlink(filepath.Join(restored.Path, "link"))
+	if err != nil || target != external {
+		t.Fatalf("restored symlink target = %q, %v; want %q", target, err, external)
+	}
+	if body, err := os.ReadFile(external); err != nil || string(body) != "outside" {
+		t.Fatalf("restore followed or changed external target: %q, %v", body, err)
+	}
+}
+
 // ── Concurrency: restore + diff under load ────────────────────────────────
 
 func TestWorkareaArchiveRegistry_ConcurrentRestoreAndDiff(t *testing.T) {
