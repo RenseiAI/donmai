@@ -32,7 +32,7 @@ func resolveRepositoryWorkarea(
 	if err := capabilities.ValidateFor(normalized); err != nil {
 		return nil, capabilities, err
 	}
-	if qw.isInteractive() && normalized.Selected.Authority == workarea.RepositoryReadOnly && !supportsReadOnlySelectedCWD {
+	if normalized.Selected.Authority == workarea.RepositoryReadOnly && !supportsReadOnlySelectedCWD {
 		return nil, capabilities, &workarea.RepositoryContractError{
 			Reason: workarea.ReasonAuthorityEnforcementMissing, RuleID: workarea.RuleReadOnlyExecutorEnforced,
 			Repository: normalized.Selected.Name,

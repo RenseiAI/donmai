@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -16,8 +17,9 @@ import (
 )
 
 type workareaGateProvider struct {
-	mu       sync.Mutex
-	observed agent.Spec
+	mu                       sync.Mutex
+	observed                 agent.Spec
+	supportsReadOnlySelected bool
 }
 
 func (*workareaGateProvider) Name() agent.ProviderName { return agent.ProviderStub }
@@ -25,7 +27,7 @@ func (*workareaGateProvider) Capabilities() agent.Capabilities {
 	return agent.Capabilities{SupportsMessageInjection: true, SupportsSessionResume: true, HumanLabel: "Workarea gate"}
 }
 
-func (*workareaGateProvider) Manifest() agent.HarnessManifest {
+func (p *workareaGateProvider) Manifest() agent.HarnessManifest {
 	return agent.HarnessManifest{
 		Name: agent.HarnessStub, HumanLabel: "Workarea gate", Family: agent.FamilyHarness, ContractABI: "workarea-gate/v1",
 		Caps: agent.HarnessCaps{
@@ -33,6 +35,7 @@ func (*workareaGateProvider) Manifest() agent.HarnessManifest {
 			RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
 			NoticeDelivery:                   agent.NoticeDeliveryInBoxLoop,
 			SupportsInteractivePTY:           true,
+			SupportsReadOnlySelectedCWD:      p.supportsReadOnlySelected,
 		},
 	}
 }
@@ -130,7 +133,7 @@ func TestRunNegotiatedDeclarationSelectsExactRepositoryAndBindsAuthority(t *test
 		t.Skip("git not on PATH")
 	}
 	h := newRunnerHarness(t)
-	provider := &workareaGateProvider{}
+	provider := &workareaGateProvider{supportsReadOnlySelected: true}
 	if err := h.runner.registry.Register(provider); err != nil {
 		t.Fatal(err)
 	}
@@ -176,6 +179,39 @@ func TestRunNegotiatedDeclarationSelectsExactRepositoryAndBindsAuthority(t *test
 	if _, err := workarea.ReadDeclaration(workarea.RootPath(res.WorkareaRoot)); err != nil {
 		t.Fatalf("ReadDeclaration: %v", err)
 	}
+	if _, err := os.Stat(filepath.Join(res.WorktreePath, ".agent")); !os.IsNotExist(err) {
+		t.Fatalf("runner-owned state modified selected read-only repository: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(res.WorkareaRoot, workarea.DeclarationDirName, "runner", ".agent", "state.json")); err != nil {
+		t.Fatalf("root-owned runner state missing: %v", err)
+	}
+}
+
+func TestRunAllMutableDeclarationStillBindsCompleteAuthorityPartition(t *testing.T) {
+	h := newRunnerHarness(t)
+	provider := &workareaGateProvider{}
+	if err := h.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	qw := h.queuedWork("ALL-MUTABLE-WORKAREA")
+	qw.WorkType = "acceptance"
+	qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: qw.Repository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: makeBareRepo(t)}, Name: "secondary", Role: workarea.RepositoryRoleSecondary, Authority: workarea.RepositoryMutable},
+		},
+	}
+	res, err := h.runner.Run(t.Context(), qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	provider.mu.Lock()
+	policy := provider.observed.RepositoryAuthority
+	provider.mu.Unlock()
+	if policy == nil || len(policy.MutablePaths) != 2 || len(policy.ReadOnlyPaths) != 0 || policy.WorkareaRoot != res.WorkareaRoot {
+		t.Fatalf("all-mutable authority partition = %#v", policy)
+	}
 }
 
 func TestRunDeclarationRefusedWhenExactExecutorAttestationIsAbsent(t *testing.T) {
@@ -194,6 +230,31 @@ func TestRunDeclarationRefusedWhenExactExecutorAttestationIsAbsent(t *testing.T)
 	}
 	if res.FailureMode != FailureWorktreeProvision || res.WorktreePath != "" {
 		t.Fatalf("result = %#v, want pre-provision refusal", res)
+	}
+}
+
+func TestRunSelectedReadOnlyRefusedWhenExecutorCannotProtectCWD(t *testing.T) {
+	h := newRunnerHarness(t)
+	provider := &workareaGateProvider{}
+	if err := h.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	qw := h.queuedWork("READONLY-CWD-REFUSED")
+	qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: qw.Repository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: makeBareRepo(t)}, Name: "context", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "context"},
+	}
+	res, err := h.runner.Run(t.Context(), qw)
+	var contractErr *workarea.RepositoryContractError
+	if !errors.As(err, &contractErr) || contractErr.Reason != workarea.ReasonAuthorityEnforcementMissing {
+		t.Fatalf("selected read-only refusal = %#v, want authority exclusion", err)
+	}
+	if res.WorktreePath != "" {
+		t.Fatalf("selected read-only refusal provisioned a root: %+v", res)
 	}
 }
 

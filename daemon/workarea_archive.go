@@ -73,24 +73,28 @@ var (
 // emitted to clients is afclient.WorkareaSummary / Workarea — this is the
 // internal carrier.
 type archiveManifest struct {
-	SchemaVersion  string                        `json:"schemaVersion,omitempty"`
-	ID             string                        `json:"id"`
-	AcquisitionID  string                        `json:"acquisitionId,omitempty"`
-	WorkareaID     string                        `json:"workareaId,omitempty"`
-	SessionID      string                        `json:"sessionId,omitempty"`
-	OriginalRoot   string                        `json:"originalRoot,omitempty"`
-	SelectedLeaf   string                        `json:"selectedLeaf,omitempty"`
-	Repositories   []afclient.WorkareaRepository `json:"repositories,omitempty"`
-	ProjectID      string                        `json:"projectId,omitempty"`
-	ProviderID     string                        `json:"providerId,omitempty"`
-	SourceProvider string                        `json:"sourceProvider,omitempty"`
-	Disposition    string                        `json:"disposition,omitempty"`
-	CreatedAt      string                        `json:"createdAt,omitempty"`
-	SizeBytes      int64                         `json:"sizeBytes,omitempty"`
-	Repository     string                        `json:"repository,omitempty"`
-	Ref            string                        `json:"ref,omitempty"`
-	Capabilities   []string                      `json:"capabilities,omitempty"`
-	Toolchain      map[string]string             `json:"toolchain,omitempty"`
+	SchemaVersion   string                        `json:"schemaVersion,omitempty"`
+	ID              string                        `json:"id"`
+	AcquisitionID   string                        `json:"acquisitionId,omitempty"`
+	WorkareaID      string                        `json:"workareaId,omitempty"`
+	SessionID       string                        `json:"sessionId,omitempty"`
+	OriginalRoot    string                        `json:"originalRoot,omitempty"`
+	SelectedLeaf    string                        `json:"selectedLeaf,omitempty"`
+	Repositories    []afclient.WorkareaRepository `json:"repositories,omitempty"`
+	ProjectID       string                        `json:"projectId,omitempty"`
+	ProviderID      string                        `json:"providerId,omitempty"`
+	SourceProvider  string                        `json:"sourceProvider,omitempty"`
+	Disposition     string                        `json:"disposition,omitempty"`
+	CreatedAt       string                        `json:"createdAt,omitempty"`
+	SizeBytes       int64                         `json:"sizeBytes,omitempty"`
+	Repository      string                        `json:"repository,omitempty"`
+	Ref             string                        `json:"ref,omitempty"`
+	Capabilities    []string                      `json:"capabilities,omitempty"`
+	Toolchain       map[string]string             `json:"toolchain,omitempty"`
+	StoreID         string                        `json:"storeId,omitempty"`
+	RootIdentity    workarea.FileIdentity         `json:"rootIdentity,omitempty"`
+	TreeDigest      string                        `json:"treeDigest,omitempty"`
+	SourceSizeBytes int64                         `json:"sourceSizeBytes,omitempty"`
 	// Extra holds any fields not declared above so consumers can render
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
@@ -119,9 +123,13 @@ type WorkareaArchiveRegistry struct {
 	// poolGuard enforces the saturation contract on Restore. Consulted at
 	// the start of each restore; the implementation lives outside this
 	// package (the daemon's WorkerSpawner / pool manager).
-	poolGuard PoolCapacityGuard
+	poolGuard      PoolCapacityGuard
+	acquisitions   *workarea.AcquisitionStore
+	worktreeParent string
+	archiveHook    func(string) error
 
-	mu sync.Mutex
+	mu          sync.Mutex
+	authorityMu sync.Mutex
 }
 
 // ActiveWorkareaProvider exposes the daemon's live pool members in the
@@ -160,6 +168,14 @@ type WorkareaArchiveOptions struct {
 	// PoolGuard is consulted on Restore. May be nil — restore proceeds
 	// without a saturation check.
 	PoolGuard PoolCapacityGuard
+	// AcquisitionStore is required for identity-continuous session-root archive
+	// production and restore. Legacy schema-less archives remain available without it.
+	AcquisitionStore *workarea.AcquisitionStore
+	// WorktreeParent lazily resolves an existing acquisition store in production
+	// without activating negotiated metadata for legacy-flat-only hosts.
+	WorktreeParent string
+	// ArchiveHook is a deterministic crash/race seam for V16 tests.
+	ArchiveHook func(stage string) error
 }
 
 // NewWorkareaArchiveRegistry constructs a registry against the given
@@ -174,7 +190,30 @@ func NewWorkareaArchiveRegistry(opts WorkareaArchiveOptions) *WorkareaArchiveReg
 		root:           root,
 		activeProvider: opts.ActiveProvider,
 		poolGuard:      opts.PoolGuard,
+		acquisitions:   opts.AcquisitionStore,
+		worktreeParent: opts.WorktreeParent,
+		archiveHook:    opts.ArchiveHook,
 	}
+}
+
+func (r *WorkareaArchiveRegistry) acquisitionAuthority() (*workarea.AcquisitionStore, error) {
+	r.authorityMu.Lock()
+	defer r.authorityMu.Unlock()
+	if r.acquisitions != nil {
+		return r.acquisitions, nil
+	}
+	if r.worktreeParent == "" {
+		return nil, fmt.Errorf("workarea archive: acquisition authority is not configured")
+	}
+	store, found, err := workarea.OpenExistingAcquisitionStore(r.worktreeParent, nil)
+	if err != nil {
+		return nil, err
+	}
+	if !found {
+		return nil, fmt.Errorf("workarea archive: acquisition authority does not exist")
+	}
+	r.acquisitions = store
+	return store, nil
 }
 
 // Root returns the archive root directory the registry scans. Exposed
@@ -195,14 +234,33 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if !filepath.IsAbs(root.String()) || !filepath.IsAbs(spec.SelectedPath) {
 		return fmt.Errorf("archive root: absolute root and selected path are required")
 	}
-	rootInfo, err := os.Lstat(root.String())
-	if err != nil {
-		return fmt.Errorf("archive root: inspect source root: %w", err)
-	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("archive root: source root is not a real directory")
-	}
 	nested := filepath.Clean(root.String()) != filepath.Clean(spec.SelectedPath)
+	var acquisition workarea.AcquisitionRecord
+	var acquisitions *workarea.AcquisitionStore
+	if nested {
+		var err error
+		acquisitions, err = r.acquisitionAuthority()
+		if err != nil {
+			return fmt.Errorf("archive root: session-root archive requires acquisition authority: %w", err)
+		}
+		acquisition, err = acquisitions.AuthorizeRoot(spec.AcquisitionID, root)
+		if err != nil {
+			return fmt.Errorf("archive root: authorize source root: %w", err)
+		}
+		if acquisition.WorkareaID != spec.WorkareaID || acquisition.SessionID != spec.SessionID {
+			return fmt.Errorf("archive root: acquisition identity mismatch")
+		}
+	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-authorize"); err != nil {
+			return err
+		}
+	}
+	rootHandle, err := workarea.OpenRootExact(root, acquisition.RootIdentity)
+	if err != nil {
+		return fmt.Errorf("archive root: open exact source root: %w", err)
+	}
+	defer func() { _ = rootHandle.Close() }()
 	schemaVersion := workareaArchiveLegacyFlatV1
 	if nested {
 		schemaVersion = workareaArchiveSchemaV1
@@ -212,13 +270,14 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 		AcquisitionID: spec.AcquisitionID, WorkareaID: spec.WorkareaID,
 		SessionID: spec.SessionID, OriginalRoot: root.String(), CreatedAt: time.Now().UTC().Format(time.RFC3339Nano),
 		Disposition: "archive", SourceProvider: "local",
+		StoreID: acquisition.StoreID, RootIdentity: acquisition.RootIdentity,
 	}
 	if nested {
-		declaration, err := workarea.ReadDeclaration(root)
+		declaration, err := workarea.ReadDeclarationRoot(rootHandle)
 		if err != nil {
 			return fmt.Errorf("archive root: read declaration: %w", err)
 		}
-		if err := workarea.ValidateDeclaredRoot(root, declaration); err != nil {
+		if err := workarea.ValidateDeclaredRootHandle(rootHandle, declaration); err != nil {
 			return fmt.Errorf("archive root: validate declaration: %w", err)
 		}
 		if declaration.WorkareaID != spec.WorkareaID || declaration.SessionID != spec.SessionID || declaration.AcquisitionID == "" || declaration.AcquisitionID != spec.AcquisitionID {
@@ -228,6 +287,7 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 			manifest.Repositories = append(manifest.Repositories, afclient.WorkareaRepository{
 				Name: repository.Name, Leaf: repository.Leaf, Role: string(repository.Role),
 				Authority: string(repository.Authority), RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+				SourceDigest: repository.SourceDigest, SparsePaths: append([]string(nil), repository.SparsePaths...),
 			})
 			if repository.Name == declaration.SelectedRepository {
 				manifest.SelectedLeaf = repository.Leaf
@@ -237,7 +297,7 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 			return fmt.Errorf("archive root: selected repository path mismatch")
 		}
 	}
-	manifest.SizeBytes, err = workarea.PhysicalUsage(root)
+	manifest.SourceSizeBytes, err = workarea.PhysicalUsageRoot(rootHandle)
 	if err != nil {
 		return fmt.Errorf("archive root: physical accounting: %w", err)
 	}
@@ -252,13 +312,18 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 		existing, readErr := r.readManifest(spec.WorkareaID)
 		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID {
 			archivedRoot := workarea.RootPath(r.treeDir(spec.WorkareaID))
+			digest, digestErr := archiveTreeDigest(archivedRoot.String())
+			physical, physicalErr := workarea.PhysicalUsage(archivedRoot)
 			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
-				if info, treeErr := os.Lstat(archivedRoot.String()); treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+				if info, treeErr := os.Lstat(archivedRoot.String()); treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes {
 					return nil
 				}
 			}
 			archivedDeclaration, declarationErr := workarea.ReadDeclaration(archivedRoot)
-			if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && workarea.ValidateDeclaredRoot(archivedRoot, archivedDeclaration) == nil {
+			if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && workarea.ValidateDeclaredRoot(archivedRoot, archivedDeclaration) == nil && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
+				if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
+					return fmt.Errorf("archive root: bind existing immutable archive: %w", err)
+				}
 				return nil
 			}
 		}
@@ -279,8 +344,22 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := copyTree(root.String(), filepath.Join(stage, "tree")); err != nil {
+	if err := copyTreeRoot(rootHandle, filepath.Join(stage, "tree")); err != nil {
 		return fmt.Errorf("archive root: copy complete tree: %w", err)
+	}
+	archiveTree := workarea.RootPath(filepath.Join(stage, "tree"))
+	archiveHandle, err := workarea.OpenRootExact(archiveTree, workarea.FileIdentity{})
+	if err != nil {
+		return fmt.Errorf("archive root: open copied tree: %w", err)
+	}
+	manifest.SizeBytes, err = workarea.PhysicalUsageRoot(archiveHandle)
+	_ = archiveHandle.Close()
+	if err != nil {
+		return fmt.Errorf("archive root: account copied tree: %w", err)
+	}
+	manifest.TreeDigest, err = archiveTreeDigest(archiveTree.String())
+	if err != nil {
+		return fmt.Errorf("archive root: digest copied tree: %w", err)
 	}
 	body, err := json.Marshal(&manifest)
 	if err != nil {
@@ -309,13 +388,18 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := syncArchiveTree(stage); err != nil {
 		return err
 	}
-	if err := os.Rename(stage, final); err != nil {
+	if err := workarea.RenameNoReplace(stage, final); err != nil {
 		return fmt.Errorf("archive root: publish archive: %w", err)
 	}
 	if err := archiveSyncDir(r.root); err != nil {
 		return err
 	}
 	committed = true
+	if nested {
+		if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, manifest.TreeDigest); err != nil {
+			return fmt.Errorf("archive root: bind immutable archive: %w", err)
+		}
+	}
 	return nil
 }
 
@@ -653,50 +737,64 @@ func (r *WorkareaArchiveRegistry) Restore(
 }
 
 func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, manifest *archiveManifest) (*afclient.Workarea, error) {
-	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || !filepath.IsAbs(manifest.OriginalRoot) {
+	if manifest.AcquisitionID == "" || manifest.WorkareaID == "" || manifest.SessionID == "" || manifest.StoreID == "" || manifest.TreeDigest == "" {
 		return nil, fmt.Errorf("restore: incomplete session-root archive identity: %w", ErrArchiveCorrupted)
 	}
-	parent := filepath.Dir(manifest.OriginalRoot)
-	acquisitions, err := workarea.NewAcquisitionStore(parent, nil)
+	acquisitions, err := r.acquisitionAuthority()
 	if err != nil {
-		return nil, fmt.Errorf("restore: open acquisition authority: %w", err)
+		return nil, fmt.Errorf("restore: session-root archive has no acquisition authority: %w", ErrArchiveCorrupted)
 	}
-	r.mu.Lock()
-	defer r.mu.Unlock()
-	if _, err := os.Lstat(manifest.OriginalRoot); err == nil {
-		return nil, fmt.Errorf("restore: original root is occupied: %w", afclient.ErrConflict)
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		return nil, fmt.Errorf("restore: inspect original root: %w", err)
-	}
-	stage, err := os.MkdirTemp(parent, ".workarea-restore-")
+	archiveRoot := workarea.RootPath(r.treeDir(archiveID))
+	archiveHandle, err := workarea.OpenRootExact(archiveRoot, workarea.FileIdentity{})
 	if err != nil {
-		return nil, fmt.Errorf("restore: create atomic root stage: %w", err)
+		return nil, fmt.Errorf("restore: open archive tree: %w", ErrArchiveCorrupted)
 	}
-	committed := false
-	defer func() {
-		if !committed {
-			_ = os.RemoveAll(stage)
+	defer func() { _ = archiveHandle.Close() }()
+	physical, err := workarea.PhysicalUsageRoot(archiveHandle)
+	if err != nil || physical != manifest.SizeBytes {
+		return nil, fmt.Errorf("restore: archive physical accounting mismatch: %w", ErrArchiveCorrupted)
+	}
+	record, err := acquisitions.RecordForAcquisitionID(manifest.AcquisitionID)
+	if err != nil {
+		return nil, fmt.Errorf("restore: read acquisition authority: %w", err)
+	}
+	if record.StoreID != manifest.StoreID || record.WorkareaID != manifest.WorkareaID || record.SessionID != manifest.SessionID || record.ArchiveID != archiveID || record.ArchiveDigest != manifest.TreeDigest {
+		return nil, fmt.Errorf("restore: manifest differs from durable acquisition authority: %w", ErrArchiveCorrupted)
+	}
+	var restored workarea.AcquisitionRecord
+	if err := acquisitions.WithRootTransaction(context.Background(), manifest.WorkareaID, func() error {
+		r.mu.Lock()
+		defer r.mu.Unlock()
+		restore, err := acquisitions.BeginRestore(manifest.AcquisitionID, manifest.WorkareaID, manifest.SessionID, archiveID, manifest.TreeDigest)
+		if err != nil {
+			return err
 		}
-	}()
-	if err := copyTree(r.treeDir(archiveID), stage); err != nil {
-		return nil, fmt.Errorf("restore: copy whole root: %w: %w", err, ErrArchiveCorrupted)
-	}
-	if err := syncArchiveTree(stage); err != nil {
-		return nil, err
-	}
-	if err := os.Rename(stage, manifest.OriginalRoot); err != nil {
-		return nil, fmt.Errorf("restore: publish original root: %w", err)
-	}
-	if err := archiveSyncDir(parent); err != nil {
-		return nil, err
-	}
-	committed = true
-	if _, err := acquisitions.AdoptRestoredRoot(
-		manifest.AcquisitionID, manifest.WorkareaID, manifest.SessionID, workarea.RootPath(manifest.OriginalRoot),
-	); err != nil {
+		committed := false
+		defer func() {
+			if !committed {
+				_ = acquisitions.AbortRestore(manifest.AcquisitionID)
+			}
+		}()
+		if err := copyTreeRoot(archiveHandle, restore.StagingRoot.String()); err != nil {
+			return fmt.Errorf("restore: copy whole root: %w: %w", err, ErrArchiveCorrupted)
+		}
+		if err := syncArchiveTree(restore.StagingRoot.String()); err != nil {
+			return err
+		}
+		digest, err := archiveTreeDigest(restore.StagingRoot.String())
+		if err != nil || digest != manifest.TreeDigest {
+			return fmt.Errorf("restore: copied archive digest mismatch: %w", ErrArchiveCorrupted)
+		}
+		restored, err = acquisitions.CommitRestore(manifest.AcquisitionID)
+		if err != nil {
+			return err
+		}
+		committed = true
+		return nil
+	}); err != nil {
 		return nil, fmt.Errorf("restore: re-enter acquisition authority: %w", err)
 	}
-	wa := manifestToWorkarea(archiveID, manifest, manifest.OriginalRoot)
+	wa := manifestToWorkarea(archiveID, manifest, restored.FinalRoot)
 	wa.ID = manifest.WorkareaID
 	wa.Kind = afclient.WorkareaKindActive
 	wa.Status = afclient.WorkareaStatusReady
@@ -873,20 +971,26 @@ func (r *WorkareaArchiveRegistry) intoSessionIDInUse(sessionID string) (bool, er
 // repo-relative slash-separated path so cross-platform hashing and
 // sorting are deterministic.
 type archiveEntry struct {
-	Path      string
-	IsDir     bool
-	IsSymlink bool
-	SymlinkTo string
-	Size      int64
-	ModeStr   string
-	Hash      string // sha256 hex; empty for directories
+	Path       string
+	IsDir      bool
+	IsSymlink  bool
+	SymlinkTo  string
+	Size       int64
+	ModeStr    string
+	Hash       string // sha256 hex; empty for directories
+	HardlinkTo string
 }
 
 // walkArchiveTree walks a tree root, skipping the well-known .donmai
 // daemon-private subtree. The result is sorted by Path so subsequent
 // merge-walks are deterministic.
 func walkArchiveTree(root string) ([]archiveEntry, error) {
+	return walkArchiveTreeMode(root, true)
+}
+
+func walkArchiveTreeMode(root string, skipDonmai bool) ([]archiveEntry, error) {
 	out := make([]archiveEntry, 0, 64)
+	hardlinks := make(map[workarea.FileIdentity]string)
 	err := filepath.WalkDir(root, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return walkErr
@@ -900,7 +1004,7 @@ func walkArchiveTree(root string) ([]archiveEntry, error) {
 		}
 		rel = filepath.ToSlash(rel)
 		// Skip the well-known daemon-private subtree per ADR D4a.
-		if rel == ".donmai" || strings.HasPrefix(rel, ".donmai/") {
+		if skipDonmai && (rel == ".donmai" || strings.HasPrefix(rel, ".donmai/")) {
 			if d.IsDir() {
 				return fs.SkipDir
 			}
@@ -928,6 +1032,15 @@ func walkArchiveTree(root string) ([]archiveEntry, error) {
 		case d.IsDir():
 			// no hash for directories
 		default:
+			identity, err := workarea.IdentityOf(info)
+			if err != nil {
+				return err
+			}
+			if first := hardlinks[identity]; first != "" {
+				entry.HardlinkTo = first
+			} else {
+				hardlinks[identity] = rel
+			}
 			h, err := hashFile(path)
 			if err != nil {
 				return fmt.Errorf("hash %q: %w", path, err)
@@ -1058,6 +1171,32 @@ func diffWalkers(idA, idB string, a, b []archiveEntry) (
 	return entries, summary
 }
 
+func archiveTreeDigest(root string) (string, error) {
+	entries, err := walkArchiveTreeMode(root, false)
+	if err != nil {
+		return "", err
+	}
+	hash := sha256.New()
+	encoder := json.NewEncoder(hash)
+	encoder.SetEscapeHTML(false)
+	for _, entry := range entries {
+		if err := encoder.Encode(struct {
+			Path          string `json:"path"`
+			Mode          string `json:"mode"`
+			Size          int64  `json:"size"`
+			Hash          string `json:"hash"`
+			SymlinkTarget string `json:"symlinkTarget"`
+			HardlinkTo    string `json:"hardlinkTo"`
+		}{
+			Path: entry.Path, Mode: entry.ModeStr, Size: entry.Size, Hash: entry.Hash,
+			SymlinkTarget: entry.SymlinkTo, HardlinkTo: entry.HardlinkTo,
+		}); err != nil {
+			return "", err
+		}
+	}
+	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
 // copyTree copies the source directory tree to dst, preserving symlinks
 // (re-created with their original target string) and file modes.
 // Every traversal and mutation after the two root opens is descriptor-relative.
@@ -1087,6 +1226,14 @@ func copyTree(src, dst string) error {
 	if err != nil || !os.SameFile(sourceInfo, openedSourceInfo) {
 		return fmt.Errorf("archive copy source identity changed while opening")
 	}
+	return copyTreeRoot(sourceRoot, dst)
+}
+
+func copyTreeRoot(sourceRoot *os.Root, dst string) error {
+	sourceInfo, err := sourceRoot.Stat(".")
+	if err != nil || !sourceInfo.IsDir() {
+		return fmt.Errorf("archive copy source root is unavailable")
+	}
 	destinationParent, destinationLeaf := filepath.Dir(dst), filepath.Base(dst)
 	if destinationLeaf == "." || destinationLeaf == ".." || destinationLeaf == "" {
 		return fmt.Errorf("archive copy destination is not a safe leaf")
@@ -1111,7 +1258,11 @@ func copyTree(src, dst string) error {
 }
 
 func copyRootContents(source, destination *os.Root) error {
-	directory, err := source.Open(".")
+	return copyRootDirectory(source, destination, ".", make(map[workarea.FileIdentity]string))
+}
+
+func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlinks map[workarea.FileIdentity]string) error {
+	directory, err := source.Open(relativeDir)
 	if err != nil {
 		return err
 	}
@@ -1123,7 +1274,7 @@ func copyRootContents(source, destination *os.Root) error {
 		return err
 	}
 	for _, entry := range entries {
-		name := entry.Name()
+		name := filepath.Join(relativeDir, entry.Name())
 		info, err := source.Lstat(name)
 		if err != nil {
 			return err
@@ -1150,14 +1301,8 @@ func copyRootContents(source, destination *os.Root) error {
 				_ = sourceChild.Close()
 				return fmt.Errorf("archive copy source directory identity changed")
 			}
-			destinationChild, err := destination.OpenRoot(name)
-			if err != nil {
-				_ = sourceChild.Close()
-				return err
-			}
-			copyErr := copyRootContents(sourceChild, destinationChild)
+			copyErr := copyRootDirectory(source, destination, name, hardlinks)
 			_ = sourceChild.Close()
-			_ = destinationChild.Close()
 			if copyErr != nil {
 				return copyErr
 			}
@@ -1165,9 +1310,20 @@ func copyRootContents(source, destination *os.Root) error {
 				return err
 			}
 		case info.Mode().IsRegular():
+			identity, err := workarea.IdentityOf(info)
+			if err != nil {
+				return err
+			}
+			if existing := hardlinks[identity]; existing != "" {
+				if err := destination.Link(existing, name); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := copyRootFile(source, destination, name, info); err != nil {
 				return err
 			}
+			hardlinks[identity] = name
 		default:
 			return fmt.Errorf("archive copy refuses special file %q", name)
 		}
@@ -1189,7 +1345,7 @@ func copyRootFile(source, destination *os.Root, name string, expected os.FileInf
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, bufio.NewReader(in)); err != nil {
+	if err := copySparseData(in, out, expected.Size()); err != nil {
 		_ = out.Close()
 		return err
 	}

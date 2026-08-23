@@ -3,6 +3,8 @@ package agent
 import (
 	"context"
 	"fmt"
+	"path/filepath"
+	"strings"
 )
 
 // This file declares Family A — the harness (loop-driver) family — for the
@@ -91,7 +93,7 @@ type HarnessCaps struct {
 	// Missing is exactly none. A harness may declare isolated-read-only-v1 only
 	// after real write/rename/remove/chmod/remount negative proof.
 	RepositoryAuthorityEnforcement string `json:"repositoryAuthorityEnforcement,omitempty"`
-	// SupportsReadOnlySelectedCWD means the interactive executor can run from a
+	// SupportsReadOnlySelectedCWD means the executor can run from a
 	// selected read-only repository without implicitly granting its CWD write.
 	SupportsReadOnlySelectedCWD bool `json:"supportsReadOnlySelectedCwd,omitempty"`
 
@@ -171,18 +173,40 @@ func ValidateSpecCapabilities(spec Spec, manifest HarnessManifest) error {
 				Detail: "the exact selected harness does not attest the requested workarea protocol and repository authority enforcement",
 			}
 		}
-		if policy.SelectedPath == "" || policy.SelectedPath != spec.Cwd || policy.WorkareaRoot == "" || len(policy.ReadOnlyPaths) == 0 {
+		if policy.SelectedPath == "" || policy.SelectedPath != spec.Cwd || policy.WorkareaRoot == "" || len(policy.MutablePaths)+len(policy.ReadOnlyPaths) == 0 {
 			return &SpecAdmissionError{
 				Code:   SpecDenialCapabilityUnsupported,
 				Field:  "repositoryAuthority",
 				Detail: "the repository authority policy is incomplete or does not bind the harness CWD",
 			}
 		}
+		rootPath := filepath.Clean(policy.WorkareaRoot)
+		if !filepath.IsAbs(rootPath) || !filepath.IsAbs(policy.SelectedPath) {
+			return &SpecAdmissionError{Code: SpecDenialCapabilityUnsupported, Field: "repositoryAuthority", Detail: "repository authority paths must be absolute"}
+		}
+		seenPaths := make(map[string]struct{}, len(policy.MutablePaths)+len(policy.ReadOnlyPaths))
+		selectedDeclared := false
+		for _, repositoryPath := range append(append([]string(nil), policy.MutablePaths...), policy.ReadOnlyPaths...) {
+			clean := filepath.Clean(repositoryPath)
+			relative, err := filepath.Rel(rootPath, clean)
+			if repositoryPath == "" || !filepath.IsAbs(clean) || err != nil || relative == "." || relative == ".." || strings.HasPrefix(relative, ".."+string(filepath.Separator)) || filepath.Dir(clean) != rootPath {
+				return &SpecAdmissionError{Code: SpecDenialCapabilityUnsupported, Field: "repositoryAuthority", Detail: "a declared repository path is not a direct child of the workarea root"}
+			}
+			pathKey := strings.ToLower(clean)
+			if _, duplicate := seenPaths[pathKey]; duplicate {
+				return &SpecAdmissionError{Code: SpecDenialCapabilityUnsupported, Field: "repositoryAuthority", Detail: "repository authority paths overlap"}
+			}
+			seenPaths[pathKey] = struct{}{}
+			selectedDeclared = selectedDeclared || clean == filepath.Clean(policy.SelectedPath)
+		}
+		if !selectedDeclared {
+			return &SpecAdmissionError{Code: SpecDenialCapabilityUnsupported, Field: "repositoryAuthority", Detail: "selected CWD is absent from the authority partition"}
+		}
 		if spec.SandboxLevel != SandboxWorkspaceWrite {
 			return &SpecAdmissionError{
 				Code:   SpecDenialCapabilityUnsupported,
 				Field:  "sandboxLevel",
-				Detail: "isolated read-only repository authority requires workspace-write with only the selected CWD writable",
+				Detail: "repository authority requires workspace-write with only declared mutable roots writable",
 			}
 		}
 	}

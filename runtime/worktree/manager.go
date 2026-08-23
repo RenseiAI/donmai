@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strconv"
 	"strings"
 	"sync"
@@ -201,6 +202,7 @@ type Manager struct {
 	restoreSessionID string
 	authorityMu      sync.Mutex
 	now              func() time.Time
+	lifecycleHook    func(string)
 
 	mu           sync.Mutex
 	sessions     map[string]*ProvisionResult
@@ -263,6 +265,8 @@ type Options struct {
 	// RestoreSessionID limits restart bookkeeping to one owner or participant.
 	// Empty is the daemon-wide recovery view.
 	RestoreSessionID string
+	// LifecycleHook is a deterministic V16 seam inside the cross-process root transaction.
+	LifecycleHook func(stage string)
 }
 
 // NewManager returns a Manager configured by opts.
@@ -293,6 +297,16 @@ func NewManager(opts Options) (*Manager, error) {
 	if err := os.MkdirAll(abs, 0o750); err != nil {
 		return nil, fmt.Errorf("runtime/worktree: mkdir ParentDir: %w", err)
 	}
+	acquisitions := opts.AcquisitionStore
+	if acquisitions == nil {
+		acquisitions, _, err = workarea.OpenExistingAcquisitionStore(abs, opts.Now)
+		if err != nil {
+			return nil, fmt.Errorf("runtime/worktree: acquisition store: %w", err)
+		}
+	}
+	// D7.7 recovery order is acquisition/quarantine journal, then leases,
+	// then declarations (restoreReadyAcquisitions below). A lease must never
+	// classify a root whose acquisition identity has not reconciled yet.
 	leases := opts.LeaseStore
 	if leases == nil {
 		leases, err = workarea.NewLeaseStore(workarea.StoreOptions{
@@ -301,13 +315,6 @@ func NewManager(opts Options) (*Manager, error) {
 		})
 		if err != nil {
 			return nil, fmt.Errorf("runtime/worktree: terminal lease store: %w", err)
-		}
-	}
-	acquisitions := opts.AcquisitionStore
-	if acquisitions == nil {
-		acquisitions, _, err = workarea.OpenExistingAcquisitionStore(abs, opts.Now)
-		if err != nil {
-			return nil, fmt.Errorf("runtime/worktree: acquisition store: %w", err)
 		}
 	}
 	seeds := opts.SeedStore
@@ -332,6 +339,7 @@ func NewManager(opts Options) (*Manager, error) {
 		archiveRoot:      opts.ArchiveRoot,
 		restoreSessionID: opts.RestoreSessionID,
 		now:              opts.Now,
+		lifecycleHook:    opts.LifecycleHook,
 		sessions:         make(map[string]*ProvisionResult),
 		sessionLocks:     make(map[string]*sync.Mutex),
 	}
@@ -349,43 +357,108 @@ func (m *Manager) restoreReadyAcquisitions() error {
 		return fmt.Errorf("runtime/worktree: restore acquisitions: %w", err)
 	}
 	for _, record := range records {
-		declaration, err := workarea.ReadDeclaration(workarea.RootPath(record.FinalRoot))
+		declaration, err := m.authorizedDeclaration(record)
 		if err != nil {
 			return err
 		}
-		paths := make(map[string]string, len(declaration.Repositories))
-		selectedPath := ""
-		for _, repository := range declaration.Repositories {
-			path := filepath.Join(record.FinalRoot, repository.Leaf)
-			paths[repository.Name] = path
-			if repository.Name == declaration.SelectedRepository {
-				selectedPath = path
-			}
-		}
-		owner := &ProvisionResult{
-			Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
-			AcquisitionID: record.AcquisitionID, Mode: ModeExclusive, OwnerSessionID: record.SessionID,
-			CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone,
-		}
 		if !record.OwnerReleased && (m.restoreSessionID == "" || m.restoreSessionID == record.SessionID) {
-			m.sessions[record.SessionID] = owner
+			owner, err := provisionResultForSession(record, declaration, record.SessionID)
+			if err != nil {
+				return err
+			}
+			m.sessions[record.SessionID] = &owner
 		}
 		for _, participant := range record.Participants {
 			if m.restoreSessionID != "" && m.restoreSessionID != participant.SessionID {
 				continue
 			}
-			participantPath := paths[participant.SelectedRepository]
-			if participantPath == "" {
-				return fmt.Errorf("runtime/worktree: restore participant %q selected an undeclared repository", participant.SessionID)
+			result, err := provisionResultForSession(record, declaration, participant.SessionID)
+			if err != nil {
+				return err
 			}
-			m.sessions[participant.SessionID] = &ProvisionResult{
-				Path: participantPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
-				AcquisitionID: record.AcquisitionID, Mode: ModeShared, OwnerSessionID: record.SessionID,
-				CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone,
-			}
+			m.sessions[participant.SessionID] = &result
 		}
 	}
 	return nil
+}
+
+func (m *Manager) authorizedDeclaration(record workarea.AcquisitionRecord) (workarea.DeclarationRecord, error) {
+	authorized, err := m.acquisitions.AuthorizeRoot(record.AcquisitionID, workarea.RootPath(record.FinalRoot))
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	root, err := workarea.OpenRootExact(workarea.RootPath(authorized.FinalRoot), authorized.RootIdentity)
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	defer func() { _ = root.Close() }()
+	declaration, err := workarea.ReadDeclarationRoot(root)
+	if err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	if err := workarea.ValidateDeclaredRootHandle(root, declaration); err != nil {
+		return workarea.DeclarationRecord{}, err
+	}
+	return declaration, nil
+}
+
+func provisionResultForSession(record workarea.AcquisitionRecord, declaration workarea.DeclarationRecord, sessionID string) (ProvisionResult, error) {
+	paths := declarationRepositoryPaths(record.FinalRoot, declaration)
+	selectedRepository := declaration.SelectedRepository
+	mode := ModeExclusive
+	if sessionID != record.SessionID {
+		mode = ModeShared
+		selectedRepository = ""
+		for _, participant := range record.Participants {
+			if participant.SessionID == sessionID {
+				selectedRepository = participant.SelectedRepository
+				break
+			}
+		}
+		if selectedRepository == "" {
+			return ProvisionResult{}, fmt.Errorf("runtime/worktree: session %q is not a durable participant", sessionID)
+		}
+	}
+	selectedPath := paths[selectedRepository]
+	if selectedPath == "" {
+		return ProvisionResult{}, fmt.Errorf("runtime/worktree: restore session %q selected an undeclared repository", sessionID)
+	}
+	return ProvisionResult{
+		Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
+		AcquisitionID: record.AcquisitionID, Mode: mode, OwnerSessionID: record.SessionID,
+		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone,
+	}, nil
+}
+
+func (m *Manager) restoredSessionResult(sessionID string) (*ProvisionResult, bool, error) {
+	m.authorityMu.Lock()
+	acquisitions := m.acquisitions
+	m.authorityMu.Unlock()
+	if acquisitions == nil {
+		return nil, false, nil
+	}
+	record, err := acquisitions.RecordForSessionID(sessionID)
+	if errors.Is(err, workarea.ErrAcquisitionNotFound) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, err
+	}
+	// Only an archive-bound generation can appear after this already-running
+	// manager removed its in-memory session. Ordinary ready generations remain
+	// governed by normal admission ownership and are never silently adopted.
+	if record.State != workarea.AcquisitionReady || record.ArchiveID == "" || record.ArchiveDigest == "" {
+		return nil, false, nil
+	}
+	declaration, err := m.authorizedDeclaration(record)
+	if err != nil {
+		return nil, false, err
+	}
+	result, err := provisionResultForSession(record, declaration, sessionID)
+	if err != nil {
+		return nil, false, err
+	}
+	return &result, true, nil
 }
 
 // ParentDir returns the absolute path of the manager's parent
@@ -500,6 +573,42 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if mode == "" {
 		mode = ModeExclusive
 	}
+	m.mu.Lock()
+	existing := m.sessions[spec.SessionID]
+	m.mu.Unlock()
+	if existing != nil {
+		retained, err := m.retainedPath(existing.workareaRootOrPath())
+		if err != nil {
+			return "", fmt.Errorf("runtime/worktree: check terminal lease before re-entry: %w", err)
+		}
+		if retained {
+			return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, existing.workareaRootOrPath())
+		}
+		return m.reenterProvision(spec, mode, *existing)
+	}
+	if spec.RepositoryDeclaration != nil {
+		restored, found, err := m.restoredSessionResult(spec.SessionID)
+		if err != nil {
+			return "", fmt.Errorf("runtime/worktree: resolve restored session generation: %w", err)
+		}
+		if found {
+			retained, err := m.retainedPath(restored.workareaRootOrPath())
+			if err != nil {
+				return "", fmt.Errorf("runtime/worktree: check terminal lease before restored re-entry: %w", err)
+			}
+			if retained {
+				return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, restored.workareaRootOrPath())
+			}
+			path, err := m.reenterProvision(spec, mode, *restored)
+			if err != nil {
+				return "", err
+			}
+			m.mu.Lock()
+			m.sessions[spec.SessionID] = restored
+			m.mu.Unlock()
+			return path, nil
+		}
+	}
 	if mode == ModeShared {
 		return m.provisionShared(ctx, spec)
 	}
@@ -613,7 +722,62 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts", attempts)
 }
 
-func (m *Manager) provisionShared(_ context.Context, spec ProvisionSpec) (string, error) {
+func (m *Manager) reenterProvision(spec ProvisionSpec, mode string, existing ProvisionResult) (string, error) {
+	if existing.AcquisitionID == "" || existing.Mode != mode || spec.RepositoryDeclaration == nil || spec.CacheSeedID != existing.CacheSeedID {
+		return "", fmt.Errorf("runtime/worktree: existing session generation does not match provision request")
+	}
+	normalized, err := spec.RepositoryDeclaration.Normalize()
+	if err != nil {
+		return "", err
+	}
+	if err := normalized.ValidatePrimarySource(workarea.RepositorySource{Repository: spec.RepoURL, Ref: spec.SourceRef}); err != nil {
+		return "", err
+	}
+	if err := spec.ExecutorCapabilities.ValidateFor(normalized); err != nil {
+		return "", err
+	}
+	if mode == ModeShared && !repositoryFiltersEqual(spec.RepositoryDeclaration.Select, spec.RepositoryFilter) {
+		return "", fmt.Errorf("runtime/worktree: shared declaration and repository filter disagree")
+	}
+	if mode == ModeExclusive && (spec.RepositoryFilter != nil || spec.ParentWorkareaID != "") {
+		return "", fmt.Errorf("runtime/worktree: exclusive re-entry cannot carry shared selection")
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return "", err
+	}
+	record, err := acquisitions.RecordForWorkareaID(existing.WorkareaID)
+	if err != nil {
+		return "", err
+	}
+	if record.State != workarea.AcquisitionReady || record.AcquisitionID != existing.AcquisitionID || record.FinalRoot != existing.WorkareaRoot {
+		return "", fmt.Errorf("runtime/worktree: existing session generation is not ready")
+	}
+	declaration, err := m.authorizedDeclaration(record)
+	if err != nil {
+		return "", err
+	}
+	if err := declarationMatchesNormalized(declaration, normalized); err != nil {
+		return "", err
+	}
+	selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+	selectedLeaf := selected.Leaf
+	if mode == ModeExclusive {
+		selectedLeaf = normalized.Selected.Leaf
+		err = nil
+	} else if spec.ParentWorkareaID != record.WorkareaID {
+		return "", fmt.Errorf("runtime/worktree: shared re-entry parent mismatch")
+	}
+	if err != nil {
+		return "", err
+	}
+	if filepath.Clean(filepath.Join(record.FinalRoot, selectedLeaf)) != filepath.Clean(existing.Path) {
+		return "", fmt.Errorf("runtime/worktree: existing selected repository mismatch")
+	}
+	return existing.Path, nil
+}
+
+func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (string, error) {
 	if spec.ParentWorkareaID == "" {
 		return "", errors.New("runtime/worktree: shared mode requires ParentWorkareaID")
 	}
@@ -630,43 +794,61 @@ func (m *Manager) provisionShared(_ context.Context, spec ProvisionSpec) (string
 	if err := spec.ExecutorCapabilities.ValidateFor(normalized); err != nil {
 		return "", err
 	}
+	if !repositoryFiltersEqual(spec.RepositoryDeclaration.Select, spec.RepositoryFilter) {
+		return "", fmt.Errorf("runtime/worktree: shared declaration and repository filter disagree")
+	}
 	acquisitions, err := m.acquisitionStore()
 	if err != nil {
 		return "", err
 	}
-	record, err := acquisitions.RecordForWorkareaID(spec.ParentWorkareaID)
-	if err != nil {
+	var record workarea.AcquisitionRecord
+	var paths map[string]string
+	selectedPath := ""
+	if err := acquisitions.WithRootTransaction(ctx, spec.ParentWorkareaID, func() error {
+		var err error
+		record, err = acquisitions.RecordForWorkareaID(spec.ParentWorkareaID)
+		if err != nil {
+			return err
+		}
+		if record.State != workarea.AcquisitionReady || record.OwnerReleased {
+			return errors.New("runtime/worktree: shared parent is not available")
+		}
+		retained, err := m.retainedPath(record.FinalRoot)
+		if err != nil {
+			return fmt.Errorf("runtime/worktree: check shared parent lease: %w", err)
+		}
+		if retained {
+			return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, record.FinalRoot)
+		}
+		if m.lifecycleHook != nil {
+			m.lifecycleHook("join-before-commit")
+		}
+		declaration, err := m.authorizedDeclaration(record)
+		if err != nil {
+			return err
+		}
+		if err := declarationMatchesNormalized(declaration, normalized); err != nil {
+			return err
+		}
+		selected, err := declaration.ResolveOne(spec.RepositoryFilter)
+		if err != nil {
+			return err
+		}
+		if normalized.Selected.Name != selected.Name {
+			return fmt.Errorf("runtime/worktree: shared declaration selection differs from durable filter resolution")
+		}
+		record, err = acquisitions.JoinShared(spec.ParentWorkareaID, spec.SessionID, selected.Name)
+		if err != nil {
+			return err
+		}
+		paths = declarationRepositoryPaths(record.FinalRoot, declaration)
+		selectedPath = paths[selected.Name]
+		if selectedPath == "" {
+			return errors.New("runtime/worktree: shared selection did not resolve inside parent root")
+		}
+		return nil
+	}); err != nil {
 		return "", err
-	}
-	if record.State != workarea.AcquisitionReady || record.OwnerReleased {
-		return "", errors.New("runtime/worktree: shared parent is not available")
-	}
-	retained, err := m.retainedPath(record.FinalRoot)
-	if err != nil {
-		return "", fmt.Errorf("runtime/worktree: check shared parent lease: %w", err)
-	}
-	if retained {
-		return "", fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, record.FinalRoot)
-	}
-	declaration, err := workarea.ReadDeclaration(workarea.RootPath(record.FinalRoot))
-	if err != nil {
-		return "", err
-	}
-	if err := declarationMatchesNormalized(declaration, normalized); err != nil {
-		return "", err
-	}
-	selected, err := declaration.ResolveOne(spec.RepositoryFilter)
-	if err != nil {
-		return "", err
-	}
-	record, err = acquisitions.JoinShared(spec.ParentWorkareaID, spec.SessionID, selected.Name)
-	if err != nil {
-		return "", err
-	}
-	paths := declarationRepositoryPaths(record.FinalRoot, declaration)
-	selectedPath := paths[selected.Name]
-	if selectedPath == "" {
-		return "", errors.New("runtime/worktree: shared selection did not resolve inside parent root")
 	}
 	m.mu.Lock()
 	m.sessions[spec.SessionID] = &ProvisionResult{
@@ -689,11 +871,22 @@ func declarationMatchesNormalized(record workarea.DeclarationRecord, normalized 
 	}
 	for _, repository := range record.Repositories {
 		bound, ok := byName[repository.Name]
-		if !ok || bound.Leaf != repository.Leaf || bound.Role != repository.Role || bound.Authority != repository.Authority {
+		sourceDigest, err := workarea.RepositorySourceDigest(bound.Source.Repository)
+		if !ok || err != nil || bound.Leaf != repository.Leaf || bound.Role != repository.Role || bound.Authority != repository.Authority || bound.Source.Ref != repository.RequestedRef || sourceDigest != repository.SourceDigest || !slices.Equal(bound.Source.Paths, repository.SparsePaths) {
 			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
 		}
 	}
 	return nil
+}
+
+func repositoryFiltersEqual(left, right *workarea.RepositoryFilter) bool {
+	effective := func(filter *workarea.RepositoryFilter) workarea.RepositoryFilter {
+		if filter == nil {
+			return workarea.RepositoryFilter{Kind: workarea.RepositoryFilterPrimary}
+		}
+		return *filter
+	}
+	return effective(left) == effective(right)
 }
 
 func declarationRepositoryPaths(root string, declaration workarea.DeclarationRecord) map[string]string {
@@ -717,6 +910,25 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	if !ok {
 		return nil
 	}
+	if res.AcquisitionID != "" {
+		acquisitions, err := m.acquisitionStore()
+		if err != nil {
+			return err
+		}
+		return acquisitions.WithRootTransaction(ctx, res.WorkareaID, func() error {
+			retained, err := m.requestReleasePath(ctx, res.workareaRootOrPath())
+			if err != nil {
+				return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
+			}
+			if retained {
+				return nil
+			}
+			if m.lifecycleHook != nil {
+				m.lifecycleHook("teardown-before-disposition")
+			}
+			return m.releaseNestedSessionLocked(acquisitions, *res, sessionID)
+		})
+	}
 	retained, err := m.requestReleasePath(ctx, res.workareaRootOrPath())
 	if err != nil {
 		return fmt.Errorf("runtime/worktree: check terminal lease before teardown: %w", err)
@@ -726,9 +938,6 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 		// owned by this session until acknowledgement or expiry drives the same
 		// teardown through the release callback.
 		return nil
-	}
-	if res.AcquisitionID != "" {
-		return m.releaseNestedSession(*res, sessionID)
 	}
 	if err := m.teardownResult(ctx, *res); err != nil {
 		return err
@@ -741,12 +950,9 @@ func (m *Manager) Teardown(ctx context.Context, sessionID string) error {
 	return nil
 }
 
-func (m *Manager) releaseNestedSession(res ProvisionResult, sessionID string) error {
-	acquisitions, err := m.acquisitionStore()
-	if err != nil {
-		return err
-	}
+func (m *Manager) releaseNestedSessionLocked(acquisitions *workarea.AcquisitionStore, res ProvisionResult, sessionID string) error {
 	releaseRoot := false
+	var err error
 	if res.Mode == ModeShared {
 		releaseRoot, err = acquisitions.LeaveShared(res.WorkareaID, sessionID)
 	} else {
@@ -792,19 +998,6 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 	if spec.WorkareaPath != res.workareaRootOrPath() || spec.WorkareaID != res.WorkareaID {
 		return nil, fmt.Errorf("%w: terminal lease must retain the manager-owned workarea", workarea.ErrLeaseConflict)
 	}
-	if res.AcquisitionID != "" {
-		acquisitions, err := m.acquisitionStore()
-		if err != nil {
-			return nil, err
-		}
-		record, err := acquisitions.RecordForWorkareaID(res.WorkareaID)
-		if err != nil {
-			return nil, err
-		}
-		if res.Mode != ModeExclusive || record.OwnerReleased || len(record.Participants) != 0 {
-			return nil, fmt.Errorf("%w: a shared root cannot enter a terminal lease", workarea.ErrLeaseConflict)
-		}
-	}
 	metadata := make(map[string]string, len(spec.ReleaseMetadata)+3)
 	for key, value := range spec.ReleaseMetadata {
 		metadata[key] = value
@@ -825,6 +1018,33 @@ func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.Acquir
 		metadata["parentRepoPath"] = res.ParentRepoPath
 	}
 	spec.ReleaseMetadata = metadata
+	if res.AcquisitionID != "" {
+		acquisitions, err := m.acquisitionStore()
+		if err != nil {
+			return nil, err
+		}
+		var lease *workarea.TerminalLease
+		if err := acquisitions.WithRootTransaction(ctx, res.WorkareaID, func() error {
+			record, err := acquisitions.RecordForWorkareaID(res.WorkareaID)
+			if err != nil {
+				return err
+			}
+			if record.State != workarea.AcquisitionReady || res.Mode != ModeExclusive || record.OwnerReleased || len(record.Participants) != 0 {
+				return fmt.Errorf("%w: a shared root cannot enter a terminal lease", workarea.ErrLeaseConflict)
+			}
+			if _, err := acquisitions.AuthorizeRoot(record.AcquisitionID, workarea.RootPath(record.FinalRoot)); err != nil {
+				return err
+			}
+			if m.lifecycleHook != nil {
+				m.lifecycleHook("lease-before-commit")
+			}
+			lease, err = m.leases.Acquire(ctx, spec)
+			return err
+		}); err != nil {
+			return nil, err
+		}
+		return lease, nil
+	}
 	return m.leases.Acquire(ctx, spec)
 }
 
@@ -902,7 +1122,7 @@ func (m *Manager) RunTerminalLeaseReaper(ctx context.Context, opts workarea.Reap
 // CleanupTerminalQuarantines destroys quarantined leaves only; it never applies
 // an ordinary return-to-pool or archive disposition.
 func (m *Manager) CleanupTerminalQuarantines(ctx context.Context, opts workarea.SchedulerOptions) (int, error) {
-	return m.leases.CleanupQuarantines(ctx, opts, func(_ context.Context, item workarea.TerminalWorkareaQuarantine) error {
+	return m.leases.CleanupQuarantines(ctx, opts, func(cleanupCtx context.Context, item workarea.TerminalWorkareaQuarantine) error {
 		declaration, declarationErr := workarea.ReadDeclaration(workarea.RootPath(item.WorkareaPath))
 		if declarationErr == nil {
 			if declaration.AcquisitionID == "" {
@@ -912,12 +1132,14 @@ func (m *Manager) CleanupTerminalQuarantines(ctx context.Context, opts workarea.
 			if err != nil {
 				return err
 			}
-			return acquisitions.RemovePublishedRoot(declaration.AcquisitionID)
+			return acquisitions.WithRootTransaction(cleanupCtx, declaration.WorkareaID, func() error {
+				if _, err := acquisitions.AuthorizeRoot(declaration.AcquisitionID, workarea.RootPath(item.WorkareaPath)); err != nil {
+					return err
+				}
+				return acquisitions.RemovePublishedRoot(declaration.AcquisitionID)
+			})
 		}
-		if _, metadataErr := os.Lstat(filepath.Join(item.WorkareaPath, workarea.DeclarationDirName)); metadataErr == nil || !errors.Is(metadataErr, os.ErrNotExist) {
-			return fmt.Errorf("runtime/worktree: quarantine root declaration is unsafe; deletion refused: %w", declarationErr)
-		}
-		return os.RemoveAll(item.WorkareaPath)
+		return fmt.Errorf("runtime/worktree: quarantine root ownership is unproved; deletion refused: %w", declarationErr)
 	})
 }
 
@@ -926,7 +1148,16 @@ func (m *Manager) releaseLeasedWorkarea(ctx context.Context, lease workarea.Term
 	// does not hold its per-result/workarea locks during provider disposition.
 	// Avoid the manager's session lock so independent teardown can proceed while
 	// durable lease state keeps this exact path unavailable.
-	return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	if lease.ReleaseMetadata["acquisitionID"] == "" {
+		return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	}
+	acquisitions, err := m.acquisitionStore()
+	if err != nil {
+		return err
+	}
+	return acquisitions.WithRootTransaction(ctx, lease.WorkareaID, func() error {
+		return m.releaseLeasedWorkareaUnlocked(ctx, lease)
+	})
 }
 
 func (m *Manager) releaseLeasedWorkareaUnlocked(ctx context.Context, lease workarea.TerminalLease) error {
@@ -1283,7 +1514,7 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 		}
 		args := []string{"clone"}
 		if referencePath != "" {
-			args = append(args, "--reference-if-able", referencePath, "--dissociate")
+			args = append(args, "--reference", referencePath, "--dissociate")
 		}
 		if len(spec.SparsePaths) > 0 {
 			args = append(args, "--filter=blob:none", "--sparse")

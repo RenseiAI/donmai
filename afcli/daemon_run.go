@@ -195,9 +195,10 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			if daemonConfig, configErr := daemon.LoadConfig(configPath); configErr == nil {
 				archiveRoot = daemonConfig.Workarea.ArchiveRoot
 			}
-			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot})
+			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
-				ParentDir: statepath.Resolve("worktrees", "/tmp/.donmai/worktrees"),
+				ParentDir: worktreeParent,
 				Logger:    slog.Default(),
 				ArchiveRoot: func(ctx context.Context, spec worktree.ArchiveRootSpec) error {
 					return archiveRegistry.ArchiveRoot(ctx, daemon.WorkareaRootArchiveSpec{

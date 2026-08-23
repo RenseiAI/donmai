@@ -101,13 +101,15 @@ type Workarea struct {
 
 // WorkareaRepository is the secret-free per-leaf operator projection.
 type WorkareaRepository struct {
-	Name         string `json:"name"`
-	Leaf         string `json:"leaf"`
-	Path         string `json:"path,omitempty"`
-	Role         string `json:"role"`
-	Authority    string `json:"authority"`
-	RequestedRef string `json:"requestedRef,omitempty"`
-	ResolvedRef  string `json:"resolvedRef,omitempty"`
+	Name         string   `json:"name"`
+	Leaf         string   `json:"leaf"`
+	Path         string   `json:"path,omitempty"`
+	Role         string   `json:"role"`
+	Authority    string   `json:"authority"`
+	RequestedRef string   `json:"requestedRef,omitempty"`
+	ResolvedRef  string   `json:"resolvedRef,omitempty"`
+	SourceDigest string   `json:"sourceDigest,omitempty"`
+	SparsePaths  []string `json:"sparsePaths,omitempty"`
 }
 
 // ListWorkareasResponse matches GET /api/daemon/workareas. Per ADR D4a,

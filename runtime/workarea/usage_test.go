@@ -79,3 +79,39 @@ func TestPhysicalUsageFailsClosedOnUnsafeOrUnreadableRoot(t *testing.T) {
 		}
 	})
 }
+
+func TestPhysicalUsageRootRemainsPinnedAcrossPathReplacement(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "original"), []byte("original"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	handle, err := OpenRootExact(RootPath(root), FileIdentity{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = handle.Close() }()
+	if err := os.Rename(root, root+"-moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(root, "replacement"), make([]byte, 1<<20), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	pinned, err := PhysicalUsageRoot(handle)
+	if err != nil {
+		t.Fatal(err)
+	}
+	replacement, err := PhysicalUsage(RootPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if pinned >= replacement {
+		t.Fatalf("pinned usage followed replacement: pinned=%d replacement=%d", pinned, replacement)
+	}
+}

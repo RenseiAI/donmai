@@ -2,53 +2,101 @@ package workarea
 
 import (
 	"fmt"
-	"io/fs"
 	"math"
 	"os"
-	"path/filepath"
 )
 
 // PhysicalUsage returns allocated bytes for the complete root. Any walk,
 // metadata, or platform-accounting failure is returned; callers must not report
 // a partial total as authoritative disk usage.
 func PhysicalUsage(root RootPath) (int64, error) {
-	rootInfo, err := os.Lstat(root.String())
+	handle, err := OpenRootExact(root, FileIdentity{})
 	if err != nil {
-		return 0, fmt.Errorf("runtime/workarea: inspect physical usage root: %w", err)
+		return 0, err
 	}
-	if !rootInfo.IsDir() || rootInfo.Mode()&os.ModeSymlink != 0 {
-		return 0, fmt.Errorf("runtime/workarea: physical usage root is not a real directory")
+	defer func() { _ = handle.Close() }()
+	return PhysicalUsageRoot(handle)
+}
+
+// PhysicalUsageRoot returns physical allocation through one pinned descriptor.
+func PhysicalUsageRoot(root *os.Root) (int64, error) {
+	if root == nil {
+		return 0, fmt.Errorf("runtime/workarea: physical usage root descriptor is required")
 	}
-	var total int64
 	seen := make(map[FileIdentity]struct{})
-	err = filepath.WalkDir(root.String(), func(path string, entry fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		info, err := entry.Info()
-		if err != nil {
-			return err
-		}
-		identity, err := fileIdentity(info)
-		if err != nil {
-			return err
-		}
-		if _, duplicate := seen[identity]; duplicate {
-			return nil
-		}
-		seen[identity] = struct{}{}
-		allocated, err := allocatedFileBytes(info)
-		if err != nil {
-			return err
-		}
-		if allocated > 0 && total > math.MaxInt64-allocated {
-			return fmt.Errorf("runtime/workarea: physical usage overflow at %q", path)
-		}
-		total += allocated
-		return nil
-	})
+	total, err := physicalUsageDirectory(root, seen)
 	if err != nil {
-		return 0, fmt.Errorf("runtime/workarea: physical usage for %q: %w", root, err)
+		return 0, fmt.Errorf("runtime/workarea: physical usage: %w", err)
 	}
 	return total, nil
+}
+
+func physicalUsageDirectory(root *os.Root, seen map[FileIdentity]struct{}) (int64, error) {
+	rootInfo, err := root.Stat(".")
+	if err != nil {
+		return 0, err
+	}
+	total, err := accountPhysicalInfo(rootInfo, seen)
+	if err != nil {
+		return 0, err
+	}
+	directory, err := root.Open(".")
+	if err != nil {
+		return 0, err
+	}
+	entries, err := directory.ReadDir(-1)
+	if closeErr := directory.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return 0, err
+	}
+	for _, entry := range entries {
+		info, err := root.Lstat(entry.Name())
+		if err != nil {
+			return 0, err
+		}
+		if info.IsDir() && info.Mode()&os.ModeSymlink == 0 {
+			child, err := root.OpenRoot(entry.Name())
+			if err != nil {
+				return 0, err
+			}
+			openedInfo, err := child.Stat(".")
+			if err != nil || !os.SameFile(info, openedInfo) {
+				_ = child.Close()
+				return 0, fmt.Errorf("physical usage directory identity changed")
+			}
+			childTotal, childErr := physicalUsageDirectory(child, seen)
+			_ = child.Close()
+			if childErr != nil {
+				return 0, childErr
+			}
+			if childTotal > 0 && total > math.MaxInt64-childTotal {
+				return 0, fmt.Errorf("physical usage overflow")
+			}
+			total += childTotal
+			continue
+		}
+		allocated, err := accountPhysicalInfo(info, seen)
+		if err != nil {
+			return 0, err
+		}
+		if allocated > 0 && total > math.MaxInt64-allocated {
+			return 0, fmt.Errorf("physical usage overflow")
+		}
+		total += allocated
+	}
+	return total, nil
+}
+
+func accountPhysicalInfo(info os.FileInfo, seen map[FileIdentity]struct{}) (int64, error) {
+	identity, err := fileIdentity(info)
+	if err != nil {
+		return 0, err
+	}
+	if _, duplicate := seen[identity]; duplicate {
+		return 0, nil
+	}
+	seen[identity] = struct{}{}
+	return allocatedFileBytes(info)
 }

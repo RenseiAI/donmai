@@ -38,10 +38,10 @@ import (
 
 func TestIntegration_RealCodexRepositoryAuthorityNegativeAttempts(t *testing.T) {
 	if os.Getenv("DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION") != "1" {
-		t.Skip("set DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION=1 to run the real executor authority proof")
+		t.Fatal("real executor authority proof is mandatory; set DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION=1")
 	}
 	if _, err := exec.LookPath("codex"); err != nil {
-		t.Skip("codex binary not on PATH")
+		t.Fatalf("real executor authority proof requires codex on PATH: %v", err)
 	}
 	cacheDir, err := os.UserCacheDir()
 	if err != nil {
@@ -154,6 +154,58 @@ verify:
 	}
 	if terminalProviderError != nil {
 		t.Fatalf("authority attempts were enforced, but provider cleanup failed: %+v", *terminalProviderError)
+	}
+	_ = handle.Stop(context.Background())
+	selectedScript := fmt.Sprintf(`set +e
+printf selected-read-only-control > %[1]s/selected-control
+(printf forbidden > %[2]s/selected-write-attempt); printf '%%s' "$?" > %[1]s/selected-write.status
+(mv %[2]s/sentinel %[2]s/selected-renamed); printf '%%s' "$?" > %[1]s/selected-rename.status
+(rm -f %[2]s/sentinel); printf '%%s' "$?" > %[1]s/selected-remove.status
+(chmod 0777 %[2]s/sentinel); printf '%%s' "$?" > %[1]s/selected-chmod.status
+(%[3]s); printf '%%s' "$?" > %[1]s/selected-remount.status
+exit 0`, strconv.Quote(mutable), strconv.Quote(readOnly), remount)
+	selectedHandle, err := provider.Spawn(ctx, agent.Spec{
+		Prompt: "Run exactly this shell script once with the shell tool, do not alter it, do not retry any failed operation, then report done:\n\n" + selectedScript,
+		Cwd:    readOnly, Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxWorkspaceWrite,
+		Model: "gpt-5.6-terra", Effort: agent.EffortLow,
+		RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
+			Protocol: "session-root-v1", WorkareaRoot: root, SelectedPath: readOnly,
+			MutablePaths: []string{mutable}, ReadOnlyPaths: []string{readOnly}, Enforcement: "isolated-read-only-v1",
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn selected read-only CWD: %v", err)
+	}
+	defer func() { _ = selectedHandle.Stop(context.Background()) }()
+	selectedDone := false
+	for !selectedDone {
+		select {
+		case event, ok := <-selectedHandle.Events():
+			if !ok {
+				t.Fatal("selected read-only events closed before result")
+			}
+			switch value := event.(type) {
+			case agent.ResultEvent:
+				if !value.Success {
+					t.Fatalf("selected read-only result failed: %+v", value)
+				}
+				selectedDone = true
+			case agent.ErrorEvent:
+				t.Fatalf("selected read-only executor error: %+v", value)
+			}
+		case <-ctx.Done():
+			t.Fatalf("selected read-only authority proof timed out: %v", ctx.Err())
+		}
+	}
+	if body, err := os.ReadFile(filepath.Join(mutable, "selected-control")); err != nil || string(body) != "selected-read-only-control" {
+		t.Fatalf("selected read-only mutable control = %q, %v", body, err)
+	}
+	selectedWrite, err := os.ReadFile(filepath.Join(mutable, "selected-write.status"))
+	if err != nil || strings.TrimSpace(string(selectedWrite)) != "0" {
+		t.Fatalf("selected read-only executor capability probe = %q, %v; want demonstrated unsafe write", selectedWrite, err)
+	}
+	if provider.Manifest().Caps.SupportsReadOnlySelectedCWD {
+		t.Fatal("Codex advertised selected read-only CWD support despite the real unsafe write")
 	}
 }
 

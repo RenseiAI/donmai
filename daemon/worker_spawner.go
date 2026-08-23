@@ -453,6 +453,10 @@ func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, err
 		if root == "" || item.handle.WorktreePath == "" {
 			return nil, fmt.Errorf("daemon: active session %q has no accountable workarea path", item.spec.SessionID)
 		}
+		rootHandle, err := workarea.OpenRootExact(workarea.RootPath(root), workarea.FileIdentity{})
+		if err != nil {
+			return nil, fmt.Errorf("daemon: pin active workarea %q: %w", item.spec.SessionID, err)
+		}
 		summary := afclient.WorkareaSummary{
 			ID:                     item.spec.SessionID,
 			Kind:                   afclient.WorkareaKindActive,
@@ -466,11 +470,13 @@ func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, err
 		}
 		groupKey := "legacy:" + filepath.Clean(root)
 		if filepath.Clean(root) != filepath.Clean(item.handle.WorktreePath) {
-			record, err := workarea.ReadDeclaration(workarea.RootPath(root))
+			record, err := workarea.ReadDeclarationRoot(rootHandle)
 			if err != nil {
+				_ = rootHandle.Close()
 				return nil, fmt.Errorf("daemon: read active workarea declaration for %q: %w", item.spec.SessionID, err)
 			}
-			if err := workarea.ValidateDeclaredRoot(workarea.RootPath(root), record); err != nil {
+			if err := workarea.ValidateDeclaredRootHandle(rootHandle, record); err != nil {
+				_ = rootHandle.Close()
 				return nil, fmt.Errorf("daemon: validate active workarea declaration for %q: %w", item.spec.SessionID, err)
 			}
 			groupKey = "nested:" + record.WorkareaID
@@ -484,17 +490,21 @@ func (s *WorkerSpawner) ActiveWorkareasStrict() ([]afclient.WorkareaSummary, err
 					Name: repository.Name, Leaf: repository.Leaf, Path: path,
 					Role: string(repository.Role), Authority: string(repository.Authority),
 					RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+					SourceDigest: repository.SourceDigest, SparsePaths: append([]string(nil), repository.SparsePaths...),
 				})
 			}
 			if !selectedMatched {
+				_ = rootHandle.Close()
 				return nil, fmt.Errorf("daemon: selected repository path for %q is not the declared selection", item.spec.SessionID)
 			}
 		}
 		if _, duplicate := seenRoots[groupKey]; duplicate {
+			_ = rootHandle.Close()
 			continue
 		}
 		seenRoots[groupKey] = struct{}{}
-		usage, err := workarea.PhysicalUsage(workarea.RootPath(root))
+		usage, err := workarea.PhysicalUsageRoot(rootHandle)
+		_ = rootHandle.Close()
 		if err != nil {
 			return nil, fmt.Errorf("daemon: account active workarea %q: %w", item.spec.SessionID, err)
 		}

@@ -363,6 +363,7 @@ func (d *Daemon) workareaArchiveRegistry() *WorkareaArchiveRegistry {
 	opts := WorkareaArchiveOptions{Root: root}
 	if d.spawner != nil {
 		opts.ActiveProvider = d.spawner
+		opts.WorktreeParent = d.spawner.opts.WorktreeParentDir
 	}
 	d.workareaArchive = NewWorkareaArchiveRegistry(opts)
 	return d.workareaArchive

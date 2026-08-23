@@ -244,10 +244,28 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, err
 		}
 	}
+	runnerStatePath := wpath
+	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
+	if selectedRepositoryReadOnly {
+		runnerStatePath = filepath.Join(res.WorkareaRoot, workarea.DeclarationDirName, "runner")
+		root, err := os.OpenRoot(res.WorkareaRoot)
+		if err != nil {
+			return res, fmt.Errorf("open workarea root for runner state: %w", err)
+		}
+		if err := root.MkdirAll(filepath.Join(workarea.DeclarationDirName, "runner"), 0o700); err != nil {
+			_ = root.Close()
+			return res, fmt.Errorf("create root-owned runner state: %w", err)
+		}
+		stateInfo, err := root.Lstat(filepath.Join(workarea.DeclarationDirName, "runner"))
+		_ = root.Close()
+		if err != nil || !stateInfo.IsDir() || stateInfo.Mode()&os.ModeSymlink != 0 {
+			return res, fmt.Errorf("root-owned runner state is unsafe")
+		}
+	}
 
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
-	selectedRepositoryMutable := repositoryDeclaration == nil || repositoryDeclaration.Selected.Authority == workarea.RepositoryMutable
+	selectedRepositoryMutable := !selectedRepositoryReadOnly
 	switch {
 	case repositoryDeclaration != nil && refBranch == "":
 		for _, repository := range repositoryDeclaration.Repositories {
@@ -311,6 +329,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, fmt.Errorf("kit demand: %s", res.Error)
 		}
 		if !demand.IsEmpty() {
+			if selectedRepositoryReadOnly {
+				err := fmt.Errorf("selected read-only repository cannot receive runner-owned toolchain provisioning")
+				res.Status, res.FailureMode, res.Error = "failed", FailureKitProvision, err.Error()
+				return res, err
+			}
 			r.logger.Info("kit toolchain provision starting",
 				"sessionId", qw.SessionID,
 				"os", demand.OS,
@@ -653,31 +676,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if qw.isInteractive() {
 		spec.Interactive = &agent.InteractiveSpec{}
 		if qw.RecordingEnabled == nil || *qw.RecordingEnabled {
-			spec.Interactive.RecordPath = termCastPath(wpath)
+			spec.Interactive.RecordPath = termCastPath(runnerStatePath)
 		}
 	}
 	if len(selection.receipt.Bytes()) > 0 {
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {
-			_, err := r.store.Update(wpath, func(s *state.State) error {
+			_, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 				s.PromptReceipt = &receipt
 				return nil
 			})
 			return err
 		}
 		spec.OnToolLifecycleAdapted = func(receipt agent.ToolLifecycleReceipt) error {
-			_, err := r.store.Update(wpath, func(s *state.State) error {
+			_, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 				s.AppendToolLifecycleReceipt(receipt)
 				return nil
 			})
 			return err
 		}
 	}
-	if repositoryDeclaration != nil && repositoryDeclaration.HasReadOnly() {
+	if repositoryDeclaration != nil {
 		policy := &agent.RepositoryAuthorityPolicy{
 			Protocol: string(repositoryDeclaration.Protocol), WorkareaRoot: res.WorkareaRoot,
-			SelectedPath: wpath, Enforcement: string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
+			SelectedPath: wpath, Enforcement: string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement),
 		}
 		for _, repository := range repositoryDeclaration.Repositories {
 			path := declaredRepositoryPaths[repository.Name]
@@ -704,7 +727,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
-	if _, err := r.store.Update(wpath, func(s *state.State) error {
+	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 		s.IssueIdentifier = qw.IssueIdentifier
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
@@ -976,7 +999,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// and drives no Linear state transition (the SDLC handoff happens via
 	// the platform's /complete CloudEvent gate, not here).
 	if qw.isInterview() {
-		return r.dispatchInterview(ctx, handle, wpath, qw, res, sink, traceProcessor, injectCh)
+		return r.dispatchInterview(ctx, handle, runnerStatePath, qw, res, sink, traceProcessor, injectCh)
 	}
 
 	// ── Interactive run-mode branch ───────────────────────────
@@ -1002,7 +1025,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// harness DECLARED before it writes anything: a PTY write is the correct
 	// primitive only where no agent sits behind the terminal.
 	if qw.isInteractive() {
-		return r.dispatchInteractive(ctx, handle, wpath, qw, res, sink, pulser, injectCh, noticeDelivery)
+		return r.dispatchInteractive(ctx, handle, runnerStatePath, qw, res, sink, pulser, injectCh, noticeDelivery)
 	}
 
 	// 10. Stream events; wait for terminal.
@@ -1029,7 +1052,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}()
 	}
 
-	streamRes, streamErr := r.consumeEvents(streamCtx, handle, wpath, qw, res, enforcer, sink, traceProcessor)
+	streamRes, streamErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 
 	// Disambiguate between ctx-cancelled and lost-ownership before
 	// classifying the failure mode.
@@ -1139,7 +1162,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// to the scraped marker. A manifest verdict of "blocked" feeds the same
 	// streamRes.blocked signal the marker scan produces, so the blocked
 	// classification fork below treats both channels identically.
-	r.applyTurnManifest(wpath, qw, res, &streamRes)
+	r.applyTurnManifest(runnerStatePath, qw, res, &streamRes)
 
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
@@ -1165,7 +1188,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
 	if runtimeInjectEnabled && !streamRes.blocked {
-		injRes := r.drainMemoryInjects(ctx, handle, wpath, qw, res, enforcer, sink, traceProcessor, injectCh)
+		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
 	}
 
@@ -1195,7 +1218,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			// makes teardown target whichever handle is now live.
 			handle = newHandle
 			// Re-consume any events the steering inject/resume produced.
-			tailRes, _ := r.consumeEvents(ctx, handle, wpath, qw, res, enforcer, sink, traceProcessor)
+			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 		}
 	}
@@ -1328,7 +1351,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	r.recordRoutingFeedback(ctx, qw, res)
 
 	// Update state.json terminal snapshot (best-effort).
-	if _, err := r.store.Update(wpath, func(s *state.State) error {
+	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
 		s.CurrentStep = "completed"
 		if s.ProviderSessionID == "" {
 			s.ProviderSessionID = res.ProviderSessionID

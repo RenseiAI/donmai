@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"crypto/rand"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -519,6 +520,8 @@ type DeclarationRepositoryRecord struct {
 	Authority    RepositoryAuthority `json:"authority"`
 	RequestedRef string              `json:"requestedRef,omitempty"`
 	ResolvedRef  string              `json:"resolvedRef,omitempty"`
+	SourceDigest string              `json:"sourceDigest"`
+	SparsePaths  []string            `json:"sparsePaths,omitempty"`
 }
 
 // DeclarationRecord is the durable source of truth for root ownership and
@@ -546,10 +549,12 @@ func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDe
 		record.AcquisitionID = acquisitionIDs[0]
 	}
 	for _, repository := range declaration.Repositories {
+		sourceDigest, _ := RepositorySourceDigest(repository.Source.Repository)
 		record.Repositories = append(record.Repositories, DeclarationRepositoryRecord{
 			Name: repository.Name, Leaf: repository.Leaf, Role: repository.Role,
 			Authority: repository.Authority, RequestedRef: repository.Source.Ref,
-			ResolvedRef: resolvedRefs[repository.Name],
+			ResolvedRef: resolvedRefs[repository.Name], SourceDigest: sourceDigest,
+			SparsePaths: append([]string(nil), repository.Source.Paths...),
 		})
 	}
 	return record
@@ -587,12 +592,48 @@ func (r DeclarationRecord) Validate() error {
 		if repository.Authority != RepositoryReadOnly && repository.Authority != RepositoryMutable {
 			return repositoryError(ReasonDeclarationRecordInvalid, RuleReadOnlyExecutorEnforced, repository.Name, "record contains an unknown authority")
 		}
+		if !validRepositorySourceDigest(repository.SourceDigest) {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "record source digest is missing or invalid")
+		}
+		for _, sparsePath := range repository.SparsePaths {
+			if err := validateSparsePath(sparsePath); err != nil {
+				return repositoryError(ReasonDeclarationRecordInvalid, RuleLeafSafe, repository.Name, err.Error())
+			}
+		}
 		selected = selected || repository.Name == r.SelectedRepository
 	}
 	if primary != 1 || !selected {
 		return repositoryError(ReasonDeclarationRecordInvalid, RuleSinglePrimary, r.SelectedRepository, "record must contain one primary and its selected repository")
 	}
 	return nil
+}
+
+// RepositorySourceDigest binds a secret-free canonical repository identity.
+// URL userinfo, query, and fragment are deliberately removed before hashing.
+func RepositorySourceDigest(repository string) (string, error) {
+	trimmed := strings.TrimSpace(repository)
+	if trimmed == "" {
+		return "", fmt.Errorf("runtime/workarea: repository source is empty")
+	}
+	canonical := trimmed
+	if parsed, err := url.Parse(trimmed); err == nil && parsed.Scheme != "" {
+		parsed.User = nil
+		parsed.RawQuery = ""
+		parsed.ForceQuery = false
+		parsed.Fragment = ""
+		canonical = parsed.String()
+	}
+	digest := sha256.Sum256([]byte(canonical))
+	return "sha256:" + hex.EncodeToString(digest[:]), nil
+}
+
+func validRepositorySourceDigest(value string) bool {
+	const prefix = "sha256:"
+	if len(value) != len(prefix)+sha256.Size*2 || !strings.HasPrefix(value, prefix) {
+		return false
+	}
+	decoded, err := hex.DecodeString(strings.TrimPrefix(value, prefix))
+	return err == nil && len(decoded) == sha256.Size
 }
 
 // ResolveOne resolves an exact selected repository from the durable declaration
@@ -676,6 +717,24 @@ func ValidateDeclaredRoot(root RootPath, record DeclarationRecord) error {
 		}
 		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "declared repository is not a real directory")
+		}
+	}
+	return nil
+}
+
+// ValidateDeclaredRootHandle proves every declaration leaf through one pinned
+// root descriptor.
+func ValidateDeclaredRootHandle(root *os.Root, record DeclarationRecord) error {
+	if root == nil {
+		return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root descriptor is required")
+	}
+	if err := record.Validate(); err != nil {
+		return err
+	}
+	for _, repository := range record.Repositories {
+		info, err := root.Lstat(repository.Leaf)
+		if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "declared repository is absent or unsafe")
 		}
 	}
 	return nil
@@ -791,6 +850,35 @@ func ReadDeclaration(root RootPath) (DeclarationRecord, error) {
 	}
 	defer func() { _ = rootHandle.Close() }()
 	return readDeclarationFromRoot(rootHandle)
+}
+
+// OpenRootExact opens one real root and optionally proves its durable identity.
+func OpenRootExact(root RootPath, expected FileIdentity) (*os.Root, error) {
+	handle, err := openDeclarationRoot(root)
+	if err != nil {
+		return nil, err
+	}
+	if !expected.Empty() {
+		info, err := handle.Stat(".")
+		if err != nil {
+			_ = handle.Close()
+			return nil, err
+		}
+		identity, err := fileIdentity(info)
+		if err != nil || identity != expected {
+			_ = handle.Close()
+			return nil, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root identity mismatch")
+		}
+	}
+	return handle, nil
+}
+
+// ReadDeclarationRoot reads through an already pinned root descriptor.
+func ReadDeclarationRoot(root *os.Root) (DeclarationRecord, error) {
+	if root == nil {
+		return DeclarationRecord{}, repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, "", "workarea root descriptor is required")
+	}
+	return readDeclarationFromRoot(root)
 }
 
 func readDeclarationFromRoot(rootHandle *os.Root) (DeclarationRecord, error) {

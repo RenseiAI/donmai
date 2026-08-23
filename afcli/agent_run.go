@@ -11,6 +11,7 @@ import (
 	"net/http"
 	"os"
 	"os/signal"
+	"reflect"
 	"runtime"
 	"strings"
 	"sync"
@@ -1014,20 +1015,24 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		Capabilities:          d.Capabilities,
 	}
 	if len(d.OperationalPayload) > 0 {
-		// Restore the source projection after the compatibility mirror. This is
-		// the lossless path for recursively present-empty collections.
-		_ = json.Unmarshal(d.OperationalPayload, &qw)
+		// Decode into a zero value: absent receipted fields must stay absent rather
+		// than inheriting an unreceipted compatibility mirror.
+		var admitted runner.QueuedWork
+		if err := json.Unmarshal(d.OperationalPayload, &admitted); err != nil {
+			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)
+		}
+		if !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
+			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
+			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID {
+			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
+		}
+		qw = admitted
 		qw.AdmissionReceipt = bytes.Clone(d.AdmissionReceipt)
 		qw.ClaimReceipt = bytes.Clone(d.ClaimReceipt)
 		qw.EffectiveCell = bytes.Clone(d.EffectiveCell)
 		qw.ExecutionRuntimeBinding = bytes.Clone(d.ExecutionRuntimeBinding)
 		qw.OperationalPayload = bytes.Clone(d.OperationalPayload)
 		qw.HostAdaptationReceipt = bytes.Clone(d.HostAdaptationReceipt)
-		qw.RepositoryDeclaration = d.RepositoryDeclaration
-		qw.WorkareaMode = d.WorkareaMode
-		qw.ParentWorkareaID = d.ParentWorkareaID
-		qw.RepositoryFilter = d.RepositoryFilter
-		qw.CacheSeedID = d.CacheSeedID
 		qw.WorkerID, qw.AuthToken, qw.PlatformURL = d.WorkerID, d.AuthToken, d.PlatformURL
 		// Restored beside the worker credentials for the same reason they are:
 		// the detail is authoritative for runtime credentials, so whatever the
