@@ -2642,6 +2642,21 @@ func (d *Daemon) EmitAdoptedSessionShimSnapshot(ctx context.Context, orgID, sess
 	return ctrl.EmitSnapshot(ctx)
 }
 
+// EmitAdoptedSessionShimSnapshotFor emits one Snapshot only when the complete
+// captured adoption authority is still current. The exact frame continues
+// through the controller event stream; this result is correlation evidence,
+// not a second transmission.
+func (d *Daemon) EmitAdoptedSessionShimSnapshotFor(
+	ctx context.Context,
+	ref SessionShimControlRef,
+) (shimwire.SnapshotResult, error) {
+	ctrl, err := d.adoptedSessionShimControllerFor(ref)
+	if err != nil {
+		return shimwire.SnapshotResult{}, err
+	}
+	return ctrl.EmitSnapshot(ctx)
+}
+
 func (d *Daemon) adoptedShimController(orgID, sessionID string) (*sessionshim.Controller, error) {
 	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
 	if err := id.Validate(); err != nil {

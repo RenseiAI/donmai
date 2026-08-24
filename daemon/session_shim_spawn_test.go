@@ -1491,6 +1491,152 @@ func TestExactSessionShimControlRefFencesReplacementAuthority(t *testing.T) {
 	}
 }
 
+func TestExactSessionShimControlRefEmitsOneActiveSnapshot(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.opts.SessionShim.HostID = "host-exact-snapshot"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		return sessionshim.PreparedAdoption{
+			ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+			Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "201"}},
+			ResumeFrom:           proofResolvedResume(preparation),
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		if _, err := evidence.SnapshotProxy.Emit(ctx); err != nil {
+			return SessionShimAdoptionReceipt{}, err
+		}
+		return SessionShimAdoptionReceipt{DurableCorrelation: []byte("exact-snapshot-adoption")}, nil
+	}
+	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return SessionShimAdoptionBatchReceipt{
+			DurableCorrelation: []byte("exact-snapshot-batch"), AdoptionRevision: "exact-snapshot-revision",
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoptionPublished = func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		if len(publication.Carriers) != 1 {
+			return nil, fmt.Errorf("exact Snapshot publication carriers = %d, want 1", len(publication.Carriers))
+		}
+		carrier := publication.Carriers[0]
+		id := sessionshim.Identity{OrgID: carrier.OrgID, SessionID: carrier.SessionID}
+		d.shims.mu.RLock()
+		pending, ok := d.shims.pendingSnapshots[id]
+		d.shims.mu.RUnlock()
+		if !ok {
+			return nil, errors.New("exact Snapshot publication omitted pending candidate")
+		}
+		return []SessionShimCarrierActivationReceipt{{Activation: carrier, AckSeq: pending.Seq}}, nil
+	}
+	observed := make(chan sessionshim.ControllerEvent, 2)
+	durable := make(chan sessionshim.ControllerEvent, 2)
+	var captureActive atomic.Bool
+	cloneSnapshotEvent := func(event sessionshim.ControllerEvent) sessionshim.ControllerEvent {
+		event.FrameBytes = append([]byte(nil), event.FrameBytes...)
+		event.Data = append([]byte(nil), event.Data...)
+		return event
+	}
+	observeExisting := d.opts.SessionShim.OnSessionEvent
+	d.opts.SessionShim.OnSessionEvent = func(id sessionshim.Identity, event sessionshim.ControllerEvent) {
+		observeExisting(id, event)
+		if captureActive.Load() && event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeSnapshot {
+			observed <- cloneSnapshotEvent(event)
+		}
+	}
+	d.opts.SessionShim.OnSessionEventDurable = func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+		if captureActive.Load() && event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeSnapshot {
+			durable <- cloneSnapshotEvent(event)
+		}
+		return nil
+	}
+	id := f.identity("exact-snapshot-control-ref")
+	if _, err := d.spawner.AcceptWork(f.interactiveSpec(id.SessionID)); err != nil {
+		t.Fatalf("launch exact Snapshot session: %v", err)
+	}
+	entry, err := d.adoptedShimEntry(id.OrgID, id.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !entry.controller.SupportsFullHostFrames() {
+		t.Fatal("exact Snapshot fixture did not negotiate selected v3")
+	}
+	projection, err := d.SessionShimHeartbeatProjection(id.OrgID)
+	if err != nil {
+		t.Fatalf("exact Snapshot heartbeat projection: %v", err)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, projection)
+	captureActive.Store(true)
+	ref := SessionShimControlRef{
+		Identity: id, ShimID: entry.shimID,
+		ProcessEpoch: entry.adoption.ProcessEpoch, ControllerGeneration: entry.adoption.ControllerGeneration,
+	}
+	staleRefs := map[string]func(SessionShimControlRef) SessionShimControlRef{
+		"identity": func(in SessionShimControlRef) SessionShimControlRef {
+			in.Identity.SessionID = "replacement-session"
+			return in
+		},
+		"shim id": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ShimID = "replacement-shim"
+			return in
+		},
+		"process epoch": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ProcessEpoch++
+			return in
+		},
+		"controller generation": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ControllerGeneration++
+			return in
+		},
+	}
+	for name, mutate := range staleRefs {
+		t.Run(name, func(t *testing.T) {
+			if _, err := d.EmitAdoptedSessionShimSnapshotFor(context.Background(), mutate(ref)); err == nil {
+				t.Fatal("stale control reference emitted a Snapshot")
+			}
+		})
+	}
+	result, err := d.EmitAdoptedSessionShimSnapshotFor(context.Background(), ref)
+	if err != nil {
+		t.Fatalf("current exact Snapshot: %v", err)
+	}
+	if !result.InStream || len(result.Bytes) != 0 {
+		t.Fatalf("selected-v3 Snapshot result = %+v, want correlation-only in-stream result", result)
+	}
+	wantSeq := result.AtSeq + 1
+	readSnapshot := func(label string, ch <-chan sessionshim.ControllerEvent) sessionshim.ControllerEvent {
+		t.Helper()
+		select {
+		case event := <-ch:
+			if event.Seq != wantSeq || event.RequestID == 0 {
+				t.Fatalf("%s Snapshot correlation = %+v, want seq %d with request id", label, event, wantSeq)
+			}
+			frame, decodeErr := attachwire.DecodeFrame(event.FrameBytes)
+			if decodeErr != nil || frame.Type != attachwire.TypeSnapshot || frame.Seq != wantSeq || !bytes.Equal(frame.Encode(), event.FrameBytes) {
+				t.Fatalf("%s raw Snapshot changed: frame=%+v err=%v event=%+v", label, frame, decodeErr, event)
+			}
+			return event
+		case <-time.After(5 * time.Second):
+			t.Fatalf("timed out waiting for %s Snapshot", label)
+			return sessionshim.ControllerEvent{}
+		}
+	}
+	observedEvent := readSnapshot("observed", observed)
+	durableEvent := readSnapshot("durable", durable)
+	if !bytes.Equal(observedEvent.FrameBytes, durableEvent.FrameBytes) {
+		t.Fatal("observer and durable callbacks received different Snapshot bytes")
+	}
+	for label, ch := range map[string]<-chan sessionshim.ControllerEvent{"observed": observed, "durable": durable} {
+		select {
+		case duplicate := <-ch:
+			t.Fatalf("%s callback received a second mandatory candidate Snapshot: %+v", label, duplicate)
+		case <-time.After(100 * time.Millisecond):
+		}
+	}
+}
+
 func TestInteractiveShimUsesPerSessionOrganizationAndGroupedExactFences(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	d := f.daemon
