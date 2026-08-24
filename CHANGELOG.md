@@ -8,6 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Dynamic session-shim publication is globally ordered and heartbeat-gated.**
+  Concurrent launches serialize adoption, scope-batch publication, and exact
+  candidate activation; already-active carriers are retained without a second
+  activation, and local work admission reopens only after every changed scope
+  echoes its current adoption revision on heartbeat.
+- **Attach-v2 separates durable activation from local mutation authority.** A
+  composing publisher can collect the complete remote `carrier_active` set
+  before explicitly releasing Input, Resize, and Kill callbacks, while existing
+  one-call activation remains compatible. Session-shim carrier callbacks can
+  also bind mutations to the exact current shim incarnation and controller
+  generation rather than an identity alone.
+
 ## v0.68.10 — 2026-08-24
 
 ### Features

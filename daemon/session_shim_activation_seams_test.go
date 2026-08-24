@@ -626,6 +626,33 @@ func TestPrepareAdoptionCallbacksAreMutuallyExclusive(t *testing.T) {
 	}
 }
 
+func TestHostedSnapshotCarrierRequiresHeartbeatDelayedLocalRelease(t *testing.T) {
+	cfg := SessionShimConfig{
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		PrepareAdoption: func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			return sessionshim.PreparedAdoption{}, nil
+		},
+		OnAdoption: func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+			return SessionShimAdoptionReceipt{}, nil
+		},
+		OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
+		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			return SessionShimAdoptionBatchReceipt{}, nil
+		},
+		OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			return nil, nil
+		},
+	}
+	if err := cfg.validateSnapshotCarrier(); err == nil || !strings.Contains(err.Error(), "OnCarrierActivationAcknowledged") {
+		t.Fatalf("hosted config without delayed release hook error = %v", err)
+	}
+	cfg.OnCarrierActivationAcknowledged = func(SessionShimPublishedBatchReceipt) {}
+	if err := cfg.validateSnapshotCarrier(); err != nil {
+		t.Fatalf("complete hosted delayed release config: %v", err)
+	}
+}
+
 func TestOnAdoptionV2ReceivesExactEphemeralRecoveryAuthority(t *testing.T) {
 	now := time.Now()
 	prepared := testAdoptedCandidateRecoveryResult(t, now)
@@ -797,6 +824,7 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 		readinessCalls atomic.Int64
 		readinessError atomic.Bool
 		endpointCalls  atomic.Int64
+		delayedRelease atomic.Int64
 	)
 	d := New(Options{SessionShim: SessionShimConfig{
 		EnableAdoption: true, RequireCredentialAttestation: true,
@@ -809,6 +837,7 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 			}
 			return testSessionShimProofV2Readiness()
 		},
+		OnCarrierActivationAcknowledged: func(SessionShimPublishedBatchReceipt) { delayedRelease.Add(1) },
 	}})
 	if err := d.retainSessionShimCredentialReceipts([]SessionShimScopeCredentialReceipt{{
 		Scope: "org-readiness-wire", WorkerHostID: "stable-host-readiness-wire", AdoptionRevision: "17",
@@ -854,6 +883,9 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	}
 	if readinessCalls.Load() != 1 {
 		t.Fatalf("live readiness resolutions = %d, want exactly 1", readinessCalls.Load())
+	}
+	if delayedRelease.Load() != 0 {
+		t.Fatalf("readiness-only heartbeat invoked carrier release hook %d times", delayedRelease.Load())
 	}
 	assertCanonicalEmptyQuarantine := func(label string, projectionBytes []byte) {
 		t.Helper()
@@ -921,16 +953,17 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
 	var (
-		mu             sync.Mutex
-		order          []string
-		d              *Daemon
-		readinessCalls atomic.Int64
-		readinessOK    atomic.Bool
-		readinessError atomic.Bool
-		driftRevision  atomic.Bool
-		heartbeatCount atomic.Int64
-		pollCount      atomic.Int64
-		lastHeartbeat  heartbeatRequestBody
+		mu                 sync.Mutex
+		order              []string
+		d                  *Daemon
+		readinessCalls     atomic.Int64
+		readinessOK        atomic.Bool
+		readinessError     atomic.Bool
+		driftRevision      atomic.Bool
+		heartbeatCount     atomic.Int64
+		pollCount          atomic.Int64
+		activationReleases atomic.Int64
+		lastHeartbeat      heartbeatRequestBody
 	)
 	readinessOK.Store(true)
 	record := func(step string) {
@@ -1033,6 +1066,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 				return SessionShimAdoptionBatchReceipt{
 					DurableCorrelation: []byte("batch-order"), AdoptionRevision: "revision-batch",
 				}, nil
+			},
+			OnCarrierActivationAcknowledged: func(SessionShimPublishedBatchReceipt) {
+				activationReleases.Add(1)
 			},
 		},
 	})
@@ -1247,6 +1283,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		assertClosed(t, "race", priorHeartbeats, pollAfterRace)
 		reopenAfterAcknowledgedHeartbeat(t, "race")
 	})
+	if activationReleases.Load() != 0 {
+		t.Fatalf("readiness-only recovery invoked delayed carrier release %d times", activationReleases.Load())
+	}
 }
 
 func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
@@ -1306,6 +1345,101 @@ func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
 	}
 	if !d.SessionShimCarrierActivationComplete() {
 		t.Fatal("carrierActivationComplete remained false after exact complete set")
+	}
+}
+
+func TestCarrierActivationPublishesOnlyExactUnresolvedAuthority(t *testing.T) {
+	activeID := sessionshim.Identity{OrgID: "org-filter", SessionID: "active"}
+	pendingID := sessionshim.Identity{OrgID: "org-filter", SessionID: "pending"}
+	recoveryID := sessionshim.Identity{OrgID: "org-filter", SessionID: "recovery"}
+	carrierEntry := func(id sessionshim.Identity, epoch uint64) adoptedShim {
+		return adoptedShim{adoption: SessionShimAdoptionEvidence{
+			Identity: id, CarrierCompatible: true,
+			Extensions: shimwire.Extensions{Values: map[string]string{
+				shimwire.ExtCarrierEpoch: fmt.Sprintf("%d", epoch),
+			}},
+		}}
+	}
+	active := carrierEntry(activeID, 7)
+	active.carrierActivationResolved = true
+	pending := carrierEntry(pendingID, 8)
+	recovery := carrierEntry(recoveryID, 9)
+	recovery.adoptionReceipt = SessionShimAdoptionReceipt{DurableCorrelation: []byte("recovery-adoption")}
+	recovery.consumedRecovery = &sessionShimConsumedRecovery{
+		preStageAckSeq: 20, stagedHighWater: 21,
+		adoptionReceipt: cloneSessionShimAdoptionReceipt(recovery.adoptionReceipt),
+	}
+	wantCarriers := []SessionShimCarrierActivation{
+		{OrgID: pendingID.OrgID, SessionID: pendingID.SessionID, CarrierEpoch: 8},
+		{OrgID: recoveryID.OrgID, SessionID: recoveryID.SessionID, CarrierEpoch: 9},
+	}
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, ControllerID: "controller-filter",
+		OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			if !reflect.DeepEqual(publication.Carriers, wantCarriers) {
+				return nil, fmt.Errorf("activation carriers = %+v, want %+v", publication.Carriers, wantCarriers)
+			}
+			return []SessionShimCarrierActivationReceipt{
+				{Activation: wantCarriers[0], AckSeq: 12},
+				{Activation: wantCarriers[1], AckSeq: 21},
+			}, nil
+		},
+	}})
+	d.shims.adoptionComplete = true
+	d.shims.batchReceipts[activeID.OrgID] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("batch-filter"), AdoptionRevision: "revision-filter",
+	}
+	d.shims.adopted[activeID] = active
+	d.shims.adopted[pendingID] = pending
+	d.shims.adopted[recoveryID] = recovery
+	d.shims.pendingSnapshots[pendingID] = sessionshim.ControllerEvent{
+		Kind: sessionshim.EventHostFrame, FrameType: attachwire.TypeSnapshot, RequestID: 44, Seq: 12,
+	}
+	d.shims.activationGates[pendingID] = newShimAdoptionGate()
+	published := map[sessionshim.Identity]adoptedShim{
+		activeID: active, pendingID: pending, recoveryID: recovery,
+	}
+	if err := d.activatePublishedSessionShimCarriers(context.Background(), published); err != nil {
+		t.Fatalf("candidate-only activation: %v", err)
+	}
+	for _, id := range []sessionshim.Identity{activeID, pendingID, recoveryID} {
+		if !d.shims.adopted[id].carrierActivationResolved {
+			t.Errorf("carrier %s is not marked active after exact resolution", id)
+		}
+	}
+	if d.shims.adopted[recoveryID].consumedRecovery != nil {
+		t.Fatal("exact consumed recovery remained pending after activation")
+	}
+	if _, pending := d.shims.pendingSnapshots[pendingID]; pending {
+		t.Fatal("exact pending Snapshot remained after activation")
+	}
+}
+
+func TestCarrierActivationRefusesCompatibleUnresolvedEntryWithoutCorrelation(t *testing.T) {
+	id := sessionshim.Identity{OrgID: "org-missing-correlation", SessionID: "session-missing-correlation"}
+	entry := adoptedShim{adoption: SessionShimAdoptionEvidence{
+		Identity: id, CarrierCompatible: true,
+		Extensions: shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "31"}},
+	}}
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, ControllerID: "controller-missing-correlation",
+		OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			t.Fatal("missing activation authority reached publication callback")
+			return nil, nil
+		},
+	}})
+	d.shims.adoptionComplete = true
+	d.shims.adopted[id] = entry
+	d.shims.batchReceipts[id.OrgID] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("batch"), AdoptionRevision: "revision",
+	}
+	if err := d.activatePublishedSessionShimCarriers(
+		context.Background(), map[sessionshim.Identity]adoptedShim{id: entry},
+	); err == nil || !strings.Contains(err.Error(), "no pending Snapshot or consumed recovery") {
+		t.Fatalf("missing activation authority error = %v", err)
+	}
+	if d.shims.adopted[id].carrierActivationResolved {
+		t.Fatal("missing activation authority marked carrier active")
 	}
 }
 

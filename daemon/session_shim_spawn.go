@@ -175,6 +175,36 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	gate := newShimAdoptionGate()
 	d.consumeShimEventsGated(ctrl, gate)
+	serializedPublication := cfg.OnAdoptionPublished != nil
+	publicationSucceeded := !serializedPublication
+	if serializedPublication {
+		d.shims.publicationMu.Lock()
+		if d.shims.dynamicPublicationFailed {
+			d.shims.publicationMu.Unlock()
+			evidence.SnapshotProxy.deactivate()
+			gate.finish(false)
+			_ = ctrl.Close()
+			return nil, errors.New("session shim: a prior dynamic adoption publication failed")
+		}
+		defer func() {
+			if !publicationSucceeded {
+				d.shims.dynamicPublicationFailed = true
+			}
+			d.shims.publicationMu.Unlock()
+		}()
+	}
+	heartbeatBarrier := cfg.OnAdoptionPublished != nil && cfg.OnCarrierActivationAcknowledged != nil &&
+		d.sessionShimAttestationValue.enabled()
+	if cfg.OnAdoptionPublished != nil {
+		if heartbeatBarrier {
+			d.beginSessionShimRecoveryHeartbeatBarrier()
+		} else {
+			d.setState(StateRecovering)
+		}
+		d.shims.mu.Lock()
+		d.shims.carrierActivationComplete = false
+		d.shims.mu.Unlock()
+	}
 	receipt, err := d.completeSessionShimAdoption(ctx, evidence, prepared)
 	evidence.SnapshotProxy.deactivate()
 	if err != nil {
@@ -186,12 +216,6 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// SnapshotProxy exists only for the synchronous carrier takeover callback.
 	// Published daemon state uses the stable lookup APIs instead.
 	evidence.SnapshotProxy = nil
-	if cfg.OnAdoptionPublished != nil {
-		d.setState(StateRecovering)
-		d.shims.mu.Lock()
-		d.shims.carrierActivationComplete = false
-		d.shims.mu.Unlock()
-	}
 	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt)
 	if err != nil {
 		d.failPendingSessionShimActivations()
@@ -199,7 +223,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: durable adoption batch %s: %w", id, err)
 	}
-	if err := d.updateSessionShimAdoptionRevision(id.OrgID, batchReceipt.AdoptionRevision); err != nil {
+	if err := d.updateSessionShimAdoptionRevision(id.OrgID, batchReceipt.AdoptionRevision, heartbeatBarrier); err != nil {
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
 		_ = ctrl.Close()
@@ -215,11 +239,14 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	gate.finish(true)
 	if cfg.OnAdoptionPublished != nil {
 		d.shims.mu.RLock()
-		published := make(map[sessionshim.Identity]adoptedShim, len(d.shims.adopted))
-		for identity, entry := range d.shims.adopted {
-			published[identity] = entry
-		}
+		entry, publishedCurrent := d.shims.adopted[id]
 		d.shims.mu.RUnlock()
+		if !publishedCurrent || entry.controller != ctrl {
+			d.failPendingSessionShimActivations()
+			_ = ctrl.Close()
+			return &handle, nil
+		}
+		published := map[sessionshim.Identity]adoptedShim{id: entry}
 		if activationErr := d.activatePublishedSessionShimCarriers(ctx, published); activationErr != nil {
 			// The harness and durable adoption are already real. Preserve the claim
 			// and visible capacity while withholding further claims; returning a
@@ -230,8 +257,11 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			_ = ctrl.Close()
 			return &handle, nil
 		}
-		d.setState(StateRunning)
+		if !heartbeatBarrier {
+			d.setState(StateRunning)
+		}
 	}
+	publicationSucceeded = true
 	slog.Info("session shim: launched and adopted an interactive session",
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
@@ -904,6 +934,18 @@ func (d *Daemon) WriteAdoptedSessionShimInput(orgID, sessionID string, data []by
 	return entry.controller.WriteInput(data)
 }
 
+// WriteAdoptedSessionShimInputFor sends input only when the complete captured
+// adoption authority is still current. The controller's wire request carries
+// the same generation, so a replacement racing after the local comparison also
+// rejects the old controller rather than applying the input to new authority.
+func (d *Daemon) WriteAdoptedSessionShimInputFor(ref SessionShimControlRef, data []byte) error {
+	controller, err := d.adoptedSessionShimControllerFor(ref)
+	if err != nil {
+		return err
+	}
+	return controller.WriteInput(data)
+}
+
 // ResizeAdoptedSessionShim sends authoritative geometry under this daemon's
 // generation.
 func (d *Daemon) ResizeAdoptedSessionShim(orgID, sessionID string, cols, rows, pxWidth, pxHeight uint32) error {
@@ -912,6 +954,54 @@ func (d *Daemon) ResizeAdoptedSessionShim(orgID, sessionID string, cols, rows, p
 		return err
 	}
 	return entry.controller.Resize(cols, rows, pxWidth, pxHeight)
+}
+
+// ResizeAdoptedSessionShimFor applies geometry only under the complete current
+// adoption authority captured by the composing carrier callback.
+func (d *Daemon) ResizeAdoptedSessionShimFor(
+	ref SessionShimControlRef,
+	cols, rows, pxWidth, pxHeight uint32,
+) error {
+	controller, err := d.adoptedSessionShimControllerFor(ref)
+	if err != nil {
+		return err
+	}
+	return controller.Resize(cols, rows, pxWidth, pxHeight)
+}
+
+// StopAdoptedSessionShimFor stops only the exact current adopted incarnation.
+// The identity-only StopAdoptedSessionShim remains for compatibility; composed
+// carrier callbacks should retain and use this stronger authority.
+func (d *Daemon) StopAdoptedSessionShimFor(ref SessionShimControlRef, reason shimwire.StopReason) error {
+	controller, err := d.adoptedSessionShimControllerFor(ref)
+	if err != nil {
+		return err
+	}
+	return controller.Stop(reason)
+}
+
+func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*sessionshim.Controller, error) {
+	if err := ref.Identity.Validate(); err != nil || ref.ShimID == "" || ref.ProcessEpoch == 0 || ref.ControllerGeneration == 0 {
+		return nil, errors.New("session shim: control reference is incomplete")
+	}
+	if d.shims == nil {
+		return nil, errors.New("session shim: adoption is not configured")
+	}
+	d.shims.mu.RLock()
+	entry, ok := d.shims.adopted[ref.Identity]
+	d.shims.mu.RUnlock()
+	if !ok || entry.controller == nil {
+		return nil, fmt.Errorf("session shim: control reference is not current for %s", ref.Identity)
+	}
+	hello := entry.controller.Hello()
+	if entry.adoption.Identity != ref.Identity || entry.controller.Identity() != ref.Identity ||
+		entry.shimID != ref.ShimID || hello.ShimID != ref.ShimID ||
+		entry.adoption.ProcessEpoch != ref.ProcessEpoch || hello.ProcessEpoch != ref.ProcessEpoch ||
+		entry.adoption.ControllerGeneration != ref.ControllerGeneration ||
+		uint64(entry.controller.Generation()) != ref.ControllerGeneration {
+		return nil, fmt.Errorf("session shim: control reference is stale for %s", ref.Identity)
+	}
+	return entry.controller, nil
 }
 
 // adoptedShimEntry resolves one adopted session with a live controller.
