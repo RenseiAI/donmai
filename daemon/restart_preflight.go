@@ -115,6 +115,9 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 	if err != nil {
 		return afclient.DaemonRestartPreflightResponse{}, err
 	}
+	if err := d.consumeSessionShimAcceptanceFenceRefusal(preparation); err != nil {
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("acceptance fence acknowledgement", err)
+	}
 	switch preparation.state {
 	case restartPreparationPrepared:
 		if err := d.validatePreparedRestartPermission(preparation, d.restartPreparationNow()); err != nil {

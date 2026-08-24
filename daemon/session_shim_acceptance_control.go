@@ -1,0 +1,349 @@
+package daemon
+
+import (
+	"bytes"
+	"crypto/subtle"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"io"
+	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
+	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
+)
+
+const (
+	sessionShimAcceptanceRoute   = "/api/daemon/session-shim/acceptance/"
+	maxSessionShimAcceptanceBody = 4 << 10
+	acceptanceGapResizeCycles    = 4096
+)
+
+var errSessionShimAcceptanceFenceRefused = errors.New("restart_fence_refused")
+
+type acceptanceRefusalState uint8
+
+const (
+	acceptanceRefusalArmed acceptanceRefusalState = iota + 1
+	acceptanceRefusalObserved
+)
+
+type sessionShimAcceptanceRequest struct {
+	OrgID        string `json:"orgId"`
+	SessionID    string `json:"sessionId"`
+	ShimID       string `json:"shimId,omitempty"`
+	ProcessEpoch uint64 `json:"processEpoch,omitempty"`
+}
+
+// handleSessionShimAcceptanceControl is a dormant installed-artifact test
+// seam. The route is indistinguishable from an absent route unless a private
+// token file is explicitly configured, and every mutating action is bound to
+// an exact lifecycle already owned by this daemon. Its responses are never an
+// evidence source; callers must re-observe status, heartbeat, wire, and process
+// authority independently.
+func (s *Server) handleSessionShimAcceptanceControl(w http.ResponseWriter, r *http.Request) {
+	if r.Method != http.MethodPost || !sessionShimAcceptanceAuthorized(r) {
+		http.NotFound(w, r)
+		return
+	}
+	action := strings.TrimPrefix(r.URL.Path, sessionShimAcceptanceRoute)
+	if action == "check" {
+		if r.URL.Path != sessionShimAcceptanceRoute+"check" {
+			http.NotFound(w, r)
+			return
+		}
+		w.WriteHeader(http.StatusNoContent)
+		return
+	}
+	var request sessionShimAcceptanceRequest
+	if err := decodeSessionShimAcceptanceRequest(r.Body, &request); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid acceptance control request"})
+		return
+	}
+	if err := request.validate(); err != nil {
+		http.NotFound(w, r)
+		return
+	}
+
+	var err error
+	switch action {
+	case "force-gap":
+		err = s.daemon.forceSessionShimAcceptanceGap(request.identity())
+	case "quarantine-arm":
+		err = s.daemon.armSessionShimAcceptanceQuarantine(request.identity())
+	case "quarantine-clear":
+		err = s.daemon.clearSessionShimAcceptanceQuarantine(request.incarnation())
+	case "fence-refuse-arm":
+		err = s.daemon.armSessionShimAcceptanceFenceRefusal(request.identity())
+	case "fence-refuse-clear":
+		err = s.daemon.clearSessionShimAcceptanceFenceRefusal(request.identity())
+	case "cleanup":
+		err = s.daemon.cleanupSessionShimAcceptanceControl(request)
+	default:
+		http.NotFound(w, r)
+		return
+	}
+	if err != nil {
+		// The seam is deliberately non-disclosing. The independent fixture owns
+		// detailed diagnostics and evidence; this endpoint only acknowledges that
+		// its exact mutation was accepted.
+		http.NotFound(w, r)
+		return
+	}
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func sessionShimAcceptanceAuthorized(r *http.Request) bool {
+	path := strings.TrimSpace(os.Getenv(sessionShimAcceptanceTokenPathEnvironment()))
+	if path == "" || !filepath.IsAbs(path) {
+		return false
+	}
+	root, err := os.OpenRoot(filepath.Dir(path))
+	if err != nil {
+		return false
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(path)
+	info, err := root.Stat(name)
+	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 512 {
+		return false
+	}
+	want, err := root.ReadFile(name)
+	if err != nil {
+		return false
+	}
+	want = bytes.TrimSpace(want)
+	if len(want) < 32 || len(want) > 256 {
+		return false
+	}
+	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+	return len(got) == len(want) && subtle.ConstantTimeCompare([]byte(got), want) == 1
+}
+
+func sessionShimAcceptanceTokenPathEnvironment() string {
+	return strings.Join([]string{"DONMAI", "SESSION", "SHIM", "ACCEPTANCE", "TOKEN", "FILE"}, "_")
+}
+
+func decodeSessionShimAcceptanceRequest(body io.Reader, out *sessionShimAcceptanceRequest) error {
+	dec := json.NewDecoder(io.LimitReader(body, maxSessionShimAcceptanceBody+1))
+	dec.DisallowUnknownFields()
+	if err := dec.Decode(out); err != nil {
+		return err
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		return errors.New("trailing request data")
+	}
+	return nil
+}
+
+func (r sessionShimAcceptanceRequest) validate() error {
+	if err := r.identity().Validate(); err != nil {
+		return err
+	}
+	if (r.ShimID == "") != (r.ProcessEpoch == 0) {
+		return errors.New("partial shim incarnation")
+	}
+	return nil
+}
+
+func (r sessionShimAcceptanceRequest) identity() sessionshim.Identity {
+	return sessionshim.Identity{OrgID: r.OrgID, SessionID: r.SessionID}
+}
+
+func (r sessionShimAcceptanceRequest) incarnation() shimIncarnation {
+	return shimIncarnation{identity: r.identity(), shimID: r.ShimID, processEpoch: r.ProcessEpoch}
+}
+
+func (d *Daemon) forceSessionShimAcceptanceGap(id sessionshim.Identity) error {
+	if _, err := d.adoptedShimEntry(id.OrgID, id.SessionID); err != nil {
+		return err
+	}
+	// Alternate real PTY geometry and attributed input. A terminal application
+	// redraws through the shim-owned PTY/ring path; the independent viewer later
+	// proves whether this volume actually evicted its requested resume point.
+	for i := 0; i < acceptanceGapResizeCycles; i++ {
+		cols := uint32(99 + (i & 1))
+		rows := uint32(29 + ((i >> 1) & 1))
+		if err := d.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, cols, rows, 0, 0); err != nil {
+			return fmt.Errorf("acceptance resize %d: %w", i, err)
+		}
+		if i%32 == 0 {
+			if err := d.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte{0x0c}); err != nil {
+				return fmt.Errorf("acceptance redraw %d: %w", i, err)
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) armSessionShimAcceptanceQuarantine(id sessionshim.Identity) error {
+	originalShimID, originalProcessEpoch, err := d.sessionShimAcceptanceAdoptedCorrelation(id)
+	if err != nil {
+		return err
+	}
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		return err
+	}
+	entries, err := registry.Scan()
+	if err != nil {
+		return err
+	}
+	var candidate *sessionshim.Record
+	for _, scanned := range entries {
+		if scanned.Err != nil || scanned.Record.Identity() != id {
+			continue
+		}
+		if scanned.Record.ShimID == originalShimID && scanned.Record.ProcessEpoch == originalProcessEpoch {
+			continue
+		}
+		if candidate != nil {
+			return errors.New("multiple unexpected shim correlations")
+		}
+		recordCopy := scanned.Record
+		candidate = &recordCopy
+	}
+	if candidate == nil {
+		return errors.New("no unexpected shim correlation")
+	}
+	alive, err := (sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt}).Alive()
+	if err != nil || !alive {
+		return errors.New("unexpected shim process is not live")
+	}
+	if _, err := shimwire.Negotiate(candidate.ProtocolMin, candidate.ProtocolMax, shimwire.ProtocolMin, shimwire.ProtocolMax); err == nil {
+		return errors.New("unexpected shim is protocol-compatible")
+	}
+	q := sessionshim.NewQuarantinedSession(*candidate, sessionshim.QuarantineProtocolMismatch, "acceptance fixture protocol range has no overlap", time.Now())
+	incarnation := shimIncarnation{identity: id, shimID: candidate.ShimID, processEpoch: candidate.ProcessEpoch}
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if _, exists := d.shims.acceptanceQuarantine[incarnation]; exists {
+		return nil
+	}
+	d.upsertShimQuarantineLocked(q)
+	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt}
+	return nil
+}
+
+func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnation) error {
+	if incarnation.shimID == "" || incarnation.processEpoch == 0 {
+		return errors.New("exact shim incarnation is required")
+	}
+	d.shims.mu.Lock()
+	process, exists := d.shims.acceptanceQuarantine[incarnation]
+	d.shims.mu.Unlock()
+	if !exists {
+		return nil
+	}
+	alive, err := process.Alive()
+	if err != nil || alive {
+		return errors.New("mutator-owned shim process remains live")
+	}
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		return err
+	}
+	present, err := registry.HasIncarnation(incarnation.identity, incarnation.shimID, incarnation.processEpoch)
+	if err != nil || present {
+		return errors.New("mutator-owned shim record remains live")
+	}
+	d.shims.mu.Lock()
+	kept := d.shims.quarantined[:0]
+	for _, q := range d.shims.quarantined {
+		if q.Identity() == incarnation.identity && q.ShimID == incarnation.shimID && q.ProcessEpoch == incarnation.processEpoch {
+			continue
+		}
+		kept = append(kept, q)
+	}
+	d.shims.quarantined = kept
+	delete(d.shims.acceptanceQuarantine, incarnation)
+	d.shims.mu.Unlock()
+	return nil
+}
+
+func (d *Daemon) armSessionShimAcceptanceFenceRefusal(id sessionshim.Identity) error {
+	if _, _, err := d.sessionShimAcceptanceAdoptedCorrelation(id); err != nil {
+		return err
+	}
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	d.shims.acceptanceRefusals[id] = acceptanceRefusalArmed
+	return nil
+}
+
+func (d *Daemon) sessionShimAcceptanceAdoptedCorrelation(id sessionshim.Identity) (string, uint64, error) {
+	if d.shims == nil {
+		return "", 0, errors.New("session shim adoption is not configured")
+	}
+	d.shims.mu.RLock()
+	entry, ok := d.shims.adopted[id]
+	d.shims.mu.RUnlock()
+	if !ok {
+		return "", 0, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+	}
+	if entry.controller != nil {
+		hello := entry.controller.Hello()
+		return hello.ShimID, hello.ProcessEpoch, nil
+	}
+	if entry.shimID == "" {
+		return "", 0, errors.New("adopted session has no shim correlation")
+	}
+	return entry.shimID, 0, nil
+}
+
+func (d *Daemon) clearSessionShimAcceptanceFenceRefusal(id sessionshim.Identity) error {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	state, exists := d.shims.acceptanceRefusals[id]
+	if !exists {
+		return nil
+	}
+	if state != acceptanceRefusalObserved {
+		return errors.New("fence refusal was not observed")
+	}
+	delete(d.shims.acceptanceRefusals, id)
+	return nil
+}
+
+func (d *Daemon) consumeSessionShimAcceptanceFenceRefusal(preparation *restartPreparation) error {
+	if preparation == nil {
+		return nil
+	}
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	for _, orgID := range preparation.scopeIDs {
+		for _, covered := range preparation.covered[orgID] {
+			id := sessionshim.Identity{OrgID: covered.OrgID, SessionID: covered.SessionID}
+			if d.shims.acceptanceRefusals[id] == acceptanceRefusalArmed {
+				d.shims.acceptanceRefusals[id] = acceptanceRefusalObserved
+				return errSessionShimAcceptanceFenceRefused
+			}
+		}
+	}
+	return nil
+}
+
+func (d *Daemon) cleanupSessionShimAcceptanceControl(request sessionShimAcceptanceRequest) error {
+	if request.OrgID != "" || request.SessionID != "" {
+		id := request.identity()
+		d.shims.mu.Lock()
+		delete(d.shims.acceptanceRefusals, id)
+		d.shims.mu.Unlock()
+		if request.ShimID != "" {
+			return d.clearSessionShimAcceptanceQuarantine(request.incarnation())
+		}
+		return nil
+	}
+	// Empty cleanup is intentionally conservative: it clears only one-shot
+	// refusal state. Quarantine removal still requires an exact incarnation and
+	// positive process/record absence proof.
+	d.shims.mu.Lock()
+	clear(d.shims.acceptanceRefusals)
+	d.shims.mu.Unlock()
+	return nil
+}
