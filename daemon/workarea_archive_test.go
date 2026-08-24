@@ -872,6 +872,137 @@ func TestWorkareaArchiveRegistryArchivesAndRestoresWholeDeclaredRoot(t *testing.
 	}
 }
 
+func sessionRootArchiveFixture(t *testing.T, selected string) (*WorkareaArchiveRegistry, string) {
+	t.Helper()
+	archiveRoot := t.TempDir()
+	worktreeParent := t.TempDir()
+	sourceRoot := filepath.Join(worktreeParent, "session-root")
+	declaration := workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{Source: workarea.RepositorySource{Repository: "https://example.test/web.git", Ref: "main"}, Name: "web", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable},
+			{Source: workarea.RepositorySource{Repository: "https://example.test/docs.git", Ref: "main"}, Name: "docs", Role: workarea.RepositoryRoleContext, Authority: workarea.RepositoryReadOnly},
+		},
+		Select: &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: selected},
+	}
+	normalized, err := declaration.Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisitions, err := workarea.NewAcquisitionStore(worktreeParent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := acquisitions.Begin("archive-session", "wa_archive_metadata", workarea.RootPath(sourceRoot), selected, "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for leaf, body := range map[string]string{"web/source.txt": "mutable", "docs/context.txt": "readonly"} {
+		path := filepath.Join(acquisition.StagingRoot.String(), leaf)
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	record := workarea.NewDeclarationRecord(
+		"archive-session", "wa_archive_metadata", normalized,
+		map[string]string{"web": "aaa", "docs": "bbb"}, acquisition.Record.AcquisitionID,
+	)
+	if err := workarea.WriteDeclaration(t.Context(), acquisition.StagingRoot, record); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := acquisitions.Commit(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		AcquisitionID: acquisition.Record.AcquisitionID, WorkareaID: "wa_archive_metadata", SessionID: "archive-session",
+		WorkareaRoot: sourceRoot, SelectedPath: filepath.Join(sourceRoot, selected),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	return registry, filepath.Join(archiveRoot, "wa_archive_metadata", "manifest.json")
+}
+
+func TestWorkareaArchiveRegistryRestoreRejectsManifestRepositoryMetadataMismatch(t *testing.T) {
+	tests := []struct {
+		name   string
+		mutate func(*archiveManifest)
+	}{
+		{"empty selected leaf", func(m *archiveManifest) { m.SelectedLeaf = "" }},
+		{"absolute selected leaf", func(m *archiveManifest) { m.SelectedLeaf = filepath.Join(t.TempDir(), "web") }},
+		{"parent-relative selected leaf", func(m *archiveManifest) { m.SelectedLeaf = "../web" }},
+		{"selected leaf outside declaration", func(m *archiveManifest) { m.SelectedLeaf = "other" }},
+		{"absolute repository name", func(m *archiveManifest) { m.Repositories[0].Name = filepath.Join(t.TempDir(), "web") }},
+		{"parent-relative repository leaf", func(m *archiveManifest) { m.Repositories[0].Leaf = "../web" }},
+		{"separator-normalized repository leaf", func(m *archiveManifest) { m.Repositories[0].Leaf = "web/../docs" }},
+		{"second repository leaf outside restored root", func(m *archiveManifest) { m.Repositories[1].Leaf = "../docs" }},
+		{"repository path outside restored root", func(m *archiveManifest) { m.Repositories[0].Path = filepath.Join(t.TempDir(), "web") }},
+		{"repository list mismatch", func(m *archiveManifest) { m.Repositories = m.Repositories[:1] }},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			registry, manifestPath := sessionRootArchiveFixture(t, "docs")
+			body, err := os.ReadFile(manifestPath)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var manifest archiveManifest
+			if err := json.Unmarshal(body, &manifest); err != nil {
+				t.Fatal(err)
+			}
+			tt.mutate(&manifest)
+			body, err = json.Marshal(manifest)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(manifestPath, body, 0o600); err != nil {
+				t.Fatal(err)
+			}
+
+			restored, _, err := registry.RestoreV1("wa_archive_metadata", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
+			if err == nil {
+				t.Fatalf("restore accepted manifest repository metadata that disagrees with the restored declaration: path=%q root=%q repositories=%+v", restored.Path, restored.WorkareaRoot, restored.Repositories)
+			}
+			if !errors.Is(err, ErrArchiveCorrupted) {
+				t.Fatalf("restore error = %v, want ErrArchiveCorrupted", err)
+			}
+			var validation *ArchiveMetadataValidationError
+			if !errors.As(err, &validation) {
+				t.Fatalf("restore error = %T %v, want ArchiveMetadataValidationError", err, err)
+			}
+		})
+	}
+}
+
+func TestWorkareaArchiveRegistryRestorePreservesCanonicalNestedRepositoryMetadata(t *testing.T) {
+	for _, selected := range []string{"web", "docs"} {
+		t.Run(selected, func(t *testing.T) {
+			registry, _ := sessionRootArchiveFixture(t, selected)
+			restored, _, err := registry.RestoreV1("wa_archive_metadata", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if filepath.Base(restored.Path) != selected || restored.Path != restored.RepositoryWorktreePath {
+				t.Fatalf("restored selected repository = %q, want %q", restored.Path, selected)
+			}
+			if len(restored.Repositories) != 2 {
+				t.Fatalf("restored repositories = %+v, want both declared repositories", restored.Repositories)
+			}
+			for _, repository := range restored.Repositories {
+				if repository.Name != repository.Leaf || repository.Path != filepath.Join(restored.WorkareaRoot, repository.Leaf) {
+					t.Fatalf("restored repository = %+v, want declaration-derived path under %q", repository, restored.WorkareaRoot)
+				}
+			}
+		})
+	}
+}
+
 func TestWorkareaArchiveRegistryPreservesLegacyFlatArchiveCompatibility(t *testing.T) {
 	archiveRoot := t.TempDir()
 	flat := filepath.Join(t.TempDir(), "legacy")

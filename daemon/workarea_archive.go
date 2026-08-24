@@ -34,6 +34,7 @@ import (
 	"io/fs"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
@@ -68,6 +69,36 @@ var (
 	// the check is here for a future "archive on restore" code path).
 	ErrArchiveExists = errors.New("workarea archive already exists")
 )
+
+// ArchiveMetadataValidationError reports metadata that cannot safely describe
+// the verified restored declaration. Callers can discriminate this from other
+// corrupt archive failures with errors.As while errors.Is still matches
+// ErrArchiveCorrupted.
+type ArchiveMetadataValidationError struct {
+	Field  string
+	Detail string
+	cause  error
+}
+
+func (e *ArchiveMetadataValidationError) Error() string {
+	if e == nil {
+		return "workarea archive metadata validation failed"
+	}
+	return fmt.Sprintf("workarea archive metadata validation failed for %s: %s", e.Field, e.Detail)
+}
+
+// Unwrap preserves both the public archive corruption sentinel and any typed
+// declaration validation failure that identified the unsafe metadata.
+func (e *ArchiveMetadataValidationError) Unwrap() []error {
+	if e == nil || e.cause == nil {
+		return []error{ErrArchiveCorrupted}
+	}
+	return []error{ErrArchiveCorrupted, e.cause}
+}
+
+func archiveMetadataValidation(field, detail string, cause error) error {
+	return &ArchiveMetadataValidationError{Field: field, Detail: detail, cause: cause}
+}
 
 // archiveManifest is the on-disk shape of manifest.json. The wire shape
 // emitted to clients is afclient.WorkareaSummary / Workarea — this is the
@@ -856,6 +887,13 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 		if err != nil || digest != manifest.TreeDigest {
 			return fmt.Errorf("restore: copied archive digest mismatch: %w", ErrArchiveCorrupted)
 		}
+		selectedLeaf, repositories, err := restoredDeclarationMetadata(restore.StagingRoot)
+		if err != nil {
+			return err
+		}
+		if err := validateArchiveManifestRepositoryMetadata(manifest, restore.StagingRoot, selectedLeaf, repositories); err != nil {
+			return err
+		}
 		restored, err = acquisitions.CommitRestore(manifest.AcquisitionID)
 		if err != nil {
 			return err
@@ -865,7 +903,18 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 	}); err != nil {
 		return nil, fmt.Errorf("restore: re-enter acquisition authority: %w", err)
 	}
-	wa := manifestToWorkareaV1(archiveID, manifest, restored.FinalRoot)
+	restoredRoot := workarea.RootPath(restored.FinalRoot)
+	selectedLeaf, repositories, err := restoredDeclarationMetadata(restoredRoot)
+	if err != nil {
+		return nil, err
+	}
+	if err := validateArchiveManifestRepositoryMetadata(manifest, restoredRoot, selectedLeaf, repositories); err != nil {
+		return nil, err
+	}
+	canonicalManifest := *manifest
+	canonicalManifest.SelectedLeaf = selectedLeaf
+	canonicalManifest.Repositories = repositories
+	wa := manifestToWorkareaV1(archiveID, &canonicalManifest, restored.FinalRoot)
 	wa.ID = manifest.WorkareaID
 	wa.Kind = afclient.WorkareaKindActive
 	wa.Status = afclient.WorkareaStatusReady
@@ -874,6 +923,85 @@ func (r *WorkareaArchiveRegistry) restoreSessionRootArchive(archiveID string, ma
 	now := time.Now().UTC()
 	wa.AcquiredAt = &now
 	return &wa, nil
+}
+
+// restoredDeclarationMetadata derives every returned repository field from the
+// declaration stored in the copied, digest-verified tree. The manifest is a
+// secondary integrity check only; it never selects a repository leaf.
+func restoredDeclarationMetadata(root workarea.RootPath) (string, []afclient.WorkareaRepository, error) {
+	record, err := workarea.ReadDeclaration(root)
+	if err != nil {
+		return "", nil, archiveMetadataValidation("declaration", "the restored declaration is invalid", err)
+	}
+	if err := workarea.ValidateDeclaredRoot(root, record); err != nil {
+		return "", nil, archiveMetadataValidation("declaration", "the restored declaration does not match its root", err)
+	}
+	repositories := make([]afclient.WorkareaRepository, 0, len(record.Repositories))
+	selectedLeaf := ""
+	for _, repository := range record.Repositories {
+		if _, err := (workarea.Layout{Root: root}).RepositoryPathFor(repository.Leaf); err != nil {
+			return "", nil, archiveMetadataValidation("declaration.repositories", "a declared repository leaf escapes the restored root", err)
+		}
+		repositories = append(repositories, afclient.WorkareaRepository{
+			Name: repository.Name, Leaf: repository.Leaf, Role: string(repository.Role),
+			Authority: string(repository.Authority), RequestedRef: repository.RequestedRef, ResolvedRef: repository.ResolvedRef,
+			SourceDigest: repository.SourceDigest, SparsePaths: append([]string(nil), repository.SparsePaths...),
+		})
+		if repository.Name == record.SelectedRepository {
+			selectedLeaf = repository.Leaf
+		}
+	}
+	if selectedLeaf == "" {
+		return "", nil, archiveMetadataValidation("declaration.selectedRepository", "the selected repository is absent", nil)
+	}
+	return selectedLeaf, repositories, nil
+}
+
+// validateArchiveManifestRepositoryMetadata makes the mutable sidecar prove it
+// carries the same normalized selection and repository list as the declaration
+// in the restored tree. Paths are never archive metadata; a present path must
+// still resolve to its exact declared child in this restored root.
+func validateArchiveManifestRepositoryMetadata(manifest *archiveManifest, root workarea.RootPath, selectedLeaf string, repositories []afclient.WorkareaRepository) error {
+	if manifest == nil {
+		return archiveMetadataValidation("manifest", "manifest is required", nil)
+	}
+	if _, err := (workarea.Layout{Root: root}).RepositoryPathFor(manifest.SelectedLeaf); err != nil {
+		return archiveMetadataValidation("manifest.selectedLeaf", "selected leaf is unsafe or outside the restored root", err)
+	}
+	if manifest.SelectedLeaf != selectedLeaf {
+		return archiveMetadataValidation("manifest.selectedLeaf", "selected leaf differs from the restored declaration", nil)
+	}
+
+	normalized := append([]afclient.WorkareaRepository(nil), manifest.Repositories...)
+	for index := range normalized {
+		repository := &normalized[index]
+		if err := workarea.ValidateRepositoryLeaf(repository.Name); err != nil {
+			return archiveMetadataValidation(fmt.Sprintf("manifest.repositories[%d].name", index), "repository name is unsafe", err)
+		}
+		if _, err := (workarea.Layout{Root: root}).RepositoryPathFor(repository.Leaf); err != nil {
+			return archiveMetadataValidation(fmt.Sprintf("manifest.repositories[%d].leaf", index), "repository leaf is unsafe or outside the restored root", err)
+		}
+		if repository.Path != "" {
+			expected, err := (workarea.Layout{Root: root}).RepositoryPathFor(repository.Leaf)
+			if err != nil || filepath.Clean(repository.Path) != expected.String() {
+				return archiveMetadataValidation(fmt.Sprintf("manifest.repositories[%d].path", index), "repository path is outside its restored leaf", err)
+			}
+		}
+		repository.Path = ""
+		repository.SparsePaths = append([]string(nil), repository.SparsePaths...)
+	}
+
+	canonical := append([]afclient.WorkareaRepository(nil), repositories...)
+	for index := range canonical {
+		canonical[index].Path = ""
+		canonical[index].SparsePaths = append([]string(nil), canonical[index].SparsePaths...)
+	}
+	sort.Slice(normalized, func(i, j int) bool { return normalized[i].Name < normalized[j].Name })
+	sort.Slice(canonical, func(i, j int) bool { return canonical[i].Name < canonical[j].Name })
+	if !reflect.DeepEqual(normalized, canonical) {
+		return archiveMetadataValidation("manifest.repositories", "repository list differs from the restored declaration", nil)
+	}
+	return nil
 }
 
 // validArchiveID reports whether id is a safe single-component archive id:
