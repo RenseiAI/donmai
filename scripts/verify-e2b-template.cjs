@@ -56,21 +56,58 @@ async function verifyTemplateVersion({ Sandbox, templateRef, expectedVersion, ap
   }
 }
 
+function redact(message, secret) {
+  if (!secret) {
+    return message
+  }
+  return message.split(secret).join('***')
+}
+
+function formatFailure(error, apiKey) {
+  if (error instanceof AggregateError) {
+    const [primaryError, cleanupError] = error.errors
+    return [
+      'E2B template version verification failed:',
+      `primary: ${redact(String(primaryError?.message || primaryError), apiKey)}`,
+      `cleanup: ${redact(String(cleanupError?.message || cleanupError), apiKey)}`,
+    ].join('\n')
+  }
+  return `E2B template version verification failed: ${redact(String(error?.message || error), apiKey)}`
+}
+
+async function runMain({ Sandbox, templateRef, expectedVersion, apiKey, writeError }) {
+  try {
+    await verifyTemplateVersion({
+      Sandbox,
+      templateRef,
+      expectedVersion,
+      apiKey,
+    })
+    return 0
+  } catch (error) {
+    writeError(`${formatFailure(error, apiKey)}\n`)
+    return 1
+  }
+}
+
 async function main() {
   const { Sandbox } = require('e2b')
-  await verifyTemplateVersion({
+  return runMain({
     Sandbox,
     templateRef: process.env.E2B_TEMPLATE_REF,
     expectedVersion: process.env.DONMAI_VERSION,
     apiKey: process.env.E2B_API_KEY,
+    writeError: (line) => process.stderr.write(line),
   })
 }
 
-module.exports = { assertVersionOutput, verifyTemplateVersion }
+module.exports = { assertVersionOutput, formatFailure, runMain, verifyTemplateVersion }
 
 if (require.main === module) {
-  main().catch((error) => {
-    process.stderr.write(`E2B template version verification failed: ${error.message}\n`)
+  main().then((code) => {
+    process.exitCode = code
+  }).catch((error) => {
+    process.stderr.write(`${formatFailure(error, process.env.E2B_API_KEY)}\n`)
     process.exitCode = 1
   })
 }

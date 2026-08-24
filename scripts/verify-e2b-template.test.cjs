@@ -3,7 +3,7 @@
 const test = require('node:test')
 const assert = require('node:assert/strict')
 
-const { assertVersionOutput, verifyTemplateVersion } = require('./verify-e2b-template.cjs')
+const { assertVersionOutput, runMain, verifyTemplateVersion } = require('./verify-e2b-template.cjs')
 
 test('assertVersionOutput accepts the exact immutable version', () => {
   assert.doesNotThrow(() =>
@@ -58,10 +58,10 @@ async function runProbe(Sandbox) {
   })
 }
 
-function expectedCalls(includeRun = true, includeKill = true) {
-  const calls = [['create', 'donmai-worker:v0.68.5', { apiKey: 'test-key', timeoutMs: 60_000 }]]
+function expectedCalls(includeRun = true, includeKill = true, apiKey = 'test-key') {
+  const calls = [['create', 'donmai-worker:v0.68.5', { apiKey, timeoutMs: 60_000 }]]
   if (includeRun) calls.push(['run', 'donmai --version'])
-  if (includeKill) calls.push(['kill', { apiKey: 'test-key' }])
+  if (includeKill) calls.push(['kill', { apiKey }])
   return calls
 }
 
@@ -118,4 +118,43 @@ test('verifyTemplateVersion destroys the probe sandbox after a successful assert
   await runProbe(Sandbox)
 
   assert.deepEqual(calls, expectedCalls())
+})
+
+test('runMain prints both primary and cleanup failure messages without the API key', async () => {
+  const commandError = new Error('PRIMARY command failure for secret-key')
+  const cleanupError = new Error('CLEANUP kill failure for secret-key')
+  const { Sandbox, calls } = makeSandbox({ commandError, cleanupError })
+  const output = []
+
+  const code = await runMain({
+    Sandbox,
+    templateRef: 'donmai-worker:v0.68.5',
+    expectedVersion: 'v0.68.5',
+    apiKey: 'secret-key',
+    writeError: (line) => output.push(line),
+  })
+
+  assert.equal(code, 1)
+  assert.deepEqual(calls, expectedCalls(true, true, 'secret-key'))
+  assert.match(output.join(''), /PRIMARY command failure for \*\*\*/)
+  assert.match(output.join(''), /CLEANUP kill failure for \*\*\*/)
+  assert.doesNotMatch(output.join(''), /secret-key/)
+})
+
+test('runMain prints a single failure clearly without aggregate labels', async () => {
+  const commandError = new Error('PRIMARY command failure')
+  const { Sandbox, calls } = makeSandbox({ commandError })
+  const output = []
+
+  const code = await runMain({
+    Sandbox,
+    templateRef: 'donmai-worker:v0.68.5',
+    expectedVersion: 'v0.68.5',
+    apiKey: 'test-key',
+    writeError: (line) => output.push(line),
+  })
+
+  assert.equal(code, 1)
+  assert.deepEqual(calls, expectedCalls())
+  assert.equal(output.join(''), 'E2B template version verification failed: PRIMARY command failure\n')
 })
