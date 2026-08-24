@@ -9,6 +9,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -17,6 +18,17 @@ func main() {
 	if len(os.Args) != 7 {
 		fmt.Fprintln(os.Stderr, "usage: new-controller <registry> <org> <session> <workarea> <selected-version> <released-sha>")
 		os.Exit(2)
+	}
+	wantCapabilities := strings.Join([]string{
+		daemon.SessionShimCapabilityAuthoritativeSnapshotV2,
+		daemon.SessionShimCapabilityCarrierEpochPrepareCommit,
+		daemon.SessionShimCapabilityDurableCarrierProofV2,
+		daemon.SessionShimCapabilityFullHostFrameV3,
+		daemon.SessionShimCapabilityInteractiveAttachV2,
+	}, ",")
+	if got := strings.Join(daemon.RequiredSessionShimHostCapabilities(), ","); got != wantCapabilities ||
+		strings.Contains(got, daemon.SessionShimCapabilityDurableCarrierProofV1) {
+		die(fmt.Errorf("new-controller capability tuple=%q want=%q", got, wantCapabilities))
 	}
 	wantVersion, err := strconv.ParseUint(os.Args[5], 10, 32)
 	if err != nil {
@@ -74,7 +86,7 @@ func main() {
 			if event.Kind == sessionshim.EventOutput {
 				output.Write(event.Data)
 				if strings.Contains(output.String(), "ack:released-overlap") {
-					fmt.Printf("PINNED-OVERLAP PASS old=%s selected=%d input_output=ok snapshot_v2=%s\n", os.Args[6], wantVersion, snapshotResult)
+					fmt.Printf("PINNED-OVERLAP PASS old=%s selected=%d input_output=ok snapshot_v2=%s proof_v2=exact\n", os.Args[6], wantVersion, snapshotResult)
 					return
 				}
 			}

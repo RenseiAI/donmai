@@ -1,11 +1,13 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"path/filepath"
 	"sort"
@@ -16,6 +18,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -164,6 +167,95 @@ type SessionShimAdoptionPreparation struct {
 	SelectedVersion  uint32
 }
 
+// SessionShimAdoptionPreparationState is the closed result posture returned by
+// the additive proof-v2 composing prepare seam.
+type SessionShimAdoptionPreparationState string
+
+const (
+	// SessionShimPreparationFreshCandidate follows the full proof-v2 reservation,
+	// receipt, mandatory-Snapshot, adoption, and activation pipeline.
+	SessionShimPreparationFreshCandidate SessionShimAdoptionPreparationState = "fresh_candidate"
+	// SessionShimPreparationAdoptedCandidateRecovery rehydrates the exact
+	// already-consumed candidate with its original bearer and retained receipt.
+	SessionShimPreparationAdoptedCandidateRecovery SessionShimAdoptionPreparationState = "adopted_candidate_recovery"
+)
+
+// SessionShimRecoveryCorrelation is opaque authority returned by a composing
+// resolver. Its bytes are private, non-JSON, defensively copied, and redacted
+// under every fmt verb.
+type SessionShimRecoveryCorrelation struct {
+	value []byte
+}
+
+// NewSessionShimRecoveryCorrelation freezes exact non-empty opaque bytes.
+func NewSessionShimRecoveryCorrelation(value []byte) (SessionShimRecoveryCorrelation, error) {
+	if len(value) == 0 {
+		return SessionShimRecoveryCorrelation{}, errors.New("session shim: adopted-candidate recovery correlation is empty")
+	}
+	return SessionShimRecoveryCorrelation{value: append([]byte(nil), value...)}, nil
+}
+
+// Bytes returns a defensive copy for the composing callback that owns the
+// correlation's protocol. Donmai never parses these bytes.
+func (c SessionShimRecoveryCorrelation) Bytes() []byte { return append([]byte(nil), c.value...) }
+
+// IsZero reports whether no recovery correlation is present.
+func (c SessionShimRecoveryCorrelation) IsZero() bool { return len(c.value) == 0 }
+
+// Format prevents opaque authority bytes from reaching logs or errors.
+func (SessionShimRecoveryCorrelation) Format(state fmt.State, _ rune) {
+	_, _ = io.WriteString(state, "<redacted-session-shim-recovery-correlation>")
+}
+
+// SessionShimAdoptedCandidateRecovery contains only the immutable result
+// server-resolved after proof/receipt adoption consume. Credential and
+// correlation are opaque/non-JSON; the remaining fields are non-secret exact
+// comparison evidence.
+type SessionShimAdoptedCandidateRecovery struct {
+	Credential          attachclient.V2RetainedCredential `json:"-"`
+	RecoveryCorrelation SessionShimRecoveryCorrelation    `json:"-"`
+	CarrierEpoch        uint64                            `json:"carrierEpoch"`
+	PreStageAckSeq      uint64                            `json:"preStageAckSeq"`
+	StagedHighWater     uint64                            `json:"stagedHighWater"`
+	ResumeFrom          uint64                            `json:"resumeFrom"`
+	CredentialExpiresAt time.Time                         `json:"credentialExpiresAt"`
+	ResumeDisposition   attachclient.V2ResumeDisposition  `json:"-"`
+}
+
+// Format keeps original credential, recovery correlation, and retained raw
+// Snapshot bytes out of logs while preserving bounded non-secret comparison
+// evidence useful for diagnostics.
+func (r SessionShimAdoptedCandidateRecovery) Format(state fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(state,
+		"{carrierEpoch:%d preStageAckSeq:%d stagedHighWater:%d resumeFrom:%d credentialExpiresAt:%s authority:%s <redacted-recovery-authority>}",
+		r.CarrierEpoch, r.PreStageAckSeq, r.StagedHighWater, r.ResumeFrom,
+		r.CredentialExpiresAt.UTC().Format(time.RFC3339), r.ResumeDisposition.Authority)
+}
+
+// SessionShimAdoptionPreparationResult is the additive typed prepare result.
+// Existing PrepareAdoption callers keep returning sessionshim.PreparedAdoption;
+// PrepareAdoptionV2 returns this shape and the two callbacks are mutually
+// exclusive.
+type SessionShimAdoptionPreparationResult struct {
+	State                    SessionShimAdoptionPreparationState  `json:"state"`
+	PreparedAdoption         sessionshim.PreparedAdoption         `json:"-"`
+	AdoptedCandidateRecovery *SessionShimAdoptedCandidateRecovery `json:"-"`
+}
+
+// SessionShimAdoptionEvidenceV2 pairs the unchanged V1 adoption evidence with
+// the exact additive proof-v2 preparation outcome for one synchronous callback.
+// The recovery credential is not retained in the daemon's adopted-session map.
+type SessionShimAdoptionEvidenceV2 struct {
+	Evidence          SessionShimAdoptionEvidence
+	PreparationResult SessionShimAdoptionPreparationResult
+}
+
+// Format prevents PreparedAdoption correlation and retained recovery authority
+// from becoming loggable through a detailed struct format.
+func (r SessionShimAdoptionPreparationResult) Format(state fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(state, "{state:%s <redacted-preparation-authority>}", r.State)
+}
+
 // SessionShimAdoptionReceipt is opaque durable correlation state returned by a
 // composing carrier. Donmai never parses or rewrites it. The exact bytes are
 // retained in memory and handed back with terminal evidence so a downstream
@@ -295,6 +387,13 @@ type SessionShimConfig struct {
 	// RequiredSessionShimHostCapabilities.
 	AttestationCapabilities []string
 
+	// GetCarrierProofV2Readiness returns current, independently persisted proof-
+	// v2 readiness. Donmai calls it before initial registration, every refresh
+	// installation, and every hosted heartbeat projection. The carrier-owned
+	// durable acknowledgement and all four composing support facts must each be
+	// explicitly true; one is never inferred from the others.
+	GetCarrierProofV2Readiness func() (SessionShimCarrierProofV2Readiness, error)
+
 	// AcquireRecoveryScopes performs auth-only acquisition for served scopes in
 	// addition to the primary registration scope. It retains all credentials and
 	// returns only deterministic non-secret scope/host/revision receipts. Its
@@ -369,12 +468,23 @@ type SessionShimConfig struct {
 	// aborts startup rather than producing a ready-but-unreachable session.
 	PrepareAdoption func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error)
 
+	// PrepareAdoptionV2 is the additive typed proof-v2 prepare seam. It is
+	// mutually exclusive with PrepareAdoption. The adopted_candidate_recovery
+	// result explicitly supplies retained original-credential, remaining-validity,
+	// candidate, Snapshot, cursor, and recovery-correlation evidence.
+	PrepareAdoptionV2 func(context.Context, SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error)
+
 	// OnAdoption runs after the shim commits the new controller generation and
 	// before readiness/claim advertisement. It returns only after the composing
 	// layer has durably rehydrated its external carrier and, when applicable,
 	// posted adoption evidence. Its opaque receipt is retained for terminal
 	// correlation. An error aborts the launch/startup pass fail-closed.
 	OnAdoption func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error)
+
+	// OnAdoptionV2 consumes the additive typed proof-v2 preparation outcome. It
+	// is mutually exclusive with OnAdoption and is required with
+	// PrepareAdoptionV2, keeping the original callback and evidence shape frozen.
+	OnAdoptionV2 func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error)
 
 	// OnTerminalEvidence runs after exact process-group reap proof exists and
 	// before Donmai disposes the tombstone. It must durably post or retain the
@@ -445,25 +555,108 @@ type SessionShimConfig struct {
 }
 
 func (c SessionShimConfig) requiresStableHostIdentity() bool {
-	return c.HostIDForOrg != nil || c.PrepareAdoption != nil || c.OnAdoption != nil ||
+	return c.HostIDForOrg != nil || c.PrepareAdoption != nil || c.PrepareAdoptionV2 != nil || c.OnAdoption != nil || c.OnAdoptionV2 != nil ||
 		c.OnTerminalEvidence != nil || c.PrepareAdoptionBatch != nil || c.OnAdoptionBatch != nil ||
 		c.OnAdoptionPublished != nil || c.FenceStore != nil || c.ExactFenceStore != nil
 }
 
 func (c SessionShimConfig) validateSnapshotCarrier() error {
+	if c.PrepareAdoption != nil && c.PrepareAdoptionV2 != nil {
+		return fmt.Errorf("%w: PrepareAdoption and PrepareAdoptionV2 cannot both be configured", ErrSessionShimCarrierConfig)
+	}
+	if c.OnAdoption != nil && c.OnAdoptionV2 != nil {
+		return fmt.Errorf("%w: OnAdoption and OnAdoptionV2 cannot both be configured", ErrSessionShimCarrierConfig)
+	}
+	if (c.PrepareAdoptionV2 == nil) != (c.OnAdoptionV2 == nil) {
+		return fmt.Errorf("%w: PrepareAdoptionV2 and OnAdoptionV2 must be configured together", ErrSessionShimCarrierConfig)
+	}
 	if !c.RequireAuthoritativeSnapshot {
 		return nil
 	}
 	if !c.RequireCredentialAttestation {
 		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs the exact hosted credential attestation", ErrSessionShimCarrierConfig)
 	}
-	if c.PrepareAdoption == nil || c.OnAdoption == nil || c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
+	if c.GetCarrierProofV2Readiness == nil {
+		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs proof-v2 readiness evidence", ErrSessionShimCarrierConfig)
+	}
+	if (c.PrepareAdoption == nil && c.PrepareAdoptionV2 == nil) || (c.OnAdoption == nil && c.OnAdoptionV2 == nil) ||
+		c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
 		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs PrepareAdoption, OnAdoption, OnSessionEventDurable, OnAdoptionBatch, and OnAdoptionPublished", ErrSessionShimCarrierConfig)
 	}
 	if c.ResumeFrom != nil {
 		return fmt.Errorf("%w: proof-resolving PrepareAdoption and free-standing ResumeFrom cannot both be configured", ErrSessionShimCarrierConfig)
 	}
 	return nil
+}
+
+func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
+	if !d.sessionShimAttestationValue.enabled() {
+		return nil
+	}
+	resolve := d.sessionShimConfig().GetCarrierProofV2Readiness
+	if resolve == nil {
+		return errors.New("session shim: proof-v2 readiness resolver is required")
+	}
+	readiness, err := resolve()
+	if err != nil {
+		return fmt.Errorf("session shim: resolve proof-v2 readiness: %w", err)
+	}
+	return readiness.validate()
+}
+
+// withdrawSessionShimProofV2Readiness closes every new-work rail on the first
+// dynamic readiness failure. The atomic fence flips first so heartbeat capacity,
+// poll/claim, and Daemon.AcceptWork fail closed even while the spawner/lifecycle
+// projections are converging on recovering.
+func (d *Daemon) withdrawSessionShimProofV2Readiness() {
+	if !d.sessionShimAttestationValue.enabled() ||
+		!d.sessionShimReadinessWithdrawn.CompareAndSwap(false, true) {
+		return
+	}
+	d.lifecycleMu.Lock()
+	if d.spawner != nil {
+		d.spawner.Pause()
+	}
+	if d.stopGen == nil && d.State() == StateRunning {
+		d.setState(StateRecovering)
+	}
+	d.lifecycleMu.Unlock()
+	slog.Warn("session shim: proof-v2 readiness withdrawn; admission paused")
+}
+
+// acknowledgeSessionShimRecoveryHeartbeat is the only dynamic reopening edge.
+// The heartbeat service invokes it after an exact server acknowledgement. A
+// second live readiness resolution is required so a stale positive projection
+// cannot reopen a daemon after the durable store withdrew again in flight.
+func (d *Daemon) acknowledgeSessionShimRecoveryHeartbeat(acknowledged SessionShimHeartbeatProjection) {
+	if !d.sessionShimAttestationValue.enabled() || !d.sessionShimReadinessWithdrawn.Load() {
+		return
+	}
+	current, err := d.SessionShimHeartbeatProjection(d.sessionShimConfig().orgID())
+	if err != nil || !acknowledged.exactEqual(current) {
+		return
+	}
+	if !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
+		return
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.Load() {
+		return
+	}
+	switch d.State() {
+	case StateRecovering:
+		if d.spawner != nil {
+			d.spawner.Resume()
+		}
+		d.setState(StateRunning)
+		d.sessionShimReadinessWithdrawn.Store(false)
+	case StatePaused, StateDraining:
+		// Preserve an operator pause. The acknowledged heartbeat clears only the
+		// proof-v2 fence; ResumeContext remains the explicit admission edge for a
+		// manual pause or non-terminal drain.
+		d.sessionShimReadinessWithdrawn.Store(false)
+	}
 }
 
 // defaultShimRegistryDir resolves the registry location through the injected
@@ -502,6 +695,33 @@ type adoptedShim struct {
 	// generation until terminal proof is handed downstream.
 	adoption        SessionShimAdoptionEvidence
 	adoptionReceipt SessionShimAdoptionReceipt
+	// consumedRecovery is the non-secret local activation resolution for a
+	// proof/receipt adoption that committed before the prior controller died. It
+	// binds carrier_active to the original staged high-water and exact replayed
+	// adoption receipt without retaining the bearer, recovery correlation, raw
+	// Snapshot, or any authority that could mint a second candidate.
+	consumedRecovery *sessionShimConsumedRecovery
+}
+
+type sessionShimConsumedRecovery struct {
+	preStageAckSeq  uint64
+	stagedHighWater uint64
+	adoptionReceipt SessionShimAdoptionReceipt
+}
+
+func newSessionShimConsumedRecovery(
+	preparation SessionShimAdoptionPreparationResult,
+	receipt SessionShimAdoptionReceipt,
+) *sessionShimConsumedRecovery {
+	if preparation.State != SessionShimPreparationAdoptedCandidateRecovery ||
+		preparation.AdoptedCandidateRecovery == nil {
+		return nil
+	}
+	return &sessionShimConsumedRecovery{
+		preStageAckSeq:  preparation.AdoptedCandidateRecovery.PreStageAckSeq,
+		stagedHighWater: preparation.AdoptedCandidateRecovery.StagedHighWater,
+		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
+	}
 }
 
 type shimIncarnation struct {
@@ -686,9 +906,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
 		Logger:                slog.Default(),
 	}
-	preparedByID := make(map[sessionshim.Identity]sessionshim.PreparedAdoption)
+	preparedByID := make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult)
 	hostByID := make(map[sessionshim.Identity]string)
-	if cfg.PrepareAdoption != nil || cfg.HostIDForOrg != nil {
+	if cfg.PrepareAdoption != nil || cfg.PrepareAdoptionV2 != nil || cfg.HostIDForOrg != nil {
 		opts.Prepare = func(prepareCtx context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 			hostID, hostErr := d.sessionShimHostID(prepareCtx, evidence.Identity.OrgID)
 			if hostErr != nil {
@@ -700,7 +920,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			}
 			hostByID[evidence.Identity] = hostID
 			preparedByID[evidence.Identity] = prepared
-			return prepared, nil
+			return prepared.PreparedAdoption, nil
 		}
 	}
 	if cfg.ResumeFrom != nil {
@@ -776,7 +996,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}()
 	for _, c := range result.Adopted {
 		id := c.Identity()
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id], hostByID[id])
+		preparation := preparedByID[id]
+		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
@@ -784,7 +1005,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence)
+		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparation)
+		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
 			result.Close()
@@ -793,10 +1015,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// The proxy is a synchronous takeover capability, not retained state.
 		evidence.SnapshotProxy = nil
 		entries[id] = adoptedShim{
-			controller:      c,
-			shimID:          c.Hello().ShimID,
-			adoption:        evidence,
-			adoptionReceipt: receipt,
+			controller:       c,
+			shimID:           c.Hello().ShimID,
+			adoption:         evidence,
+			adoptionReceipt:  receipt,
+			consumedRecovery: newSessionShimConsumedRecovery(preparation, receipt),
 		}
 	}
 
@@ -1203,17 +1426,27 @@ func (d *Daemon) prepareSessionShimAdoption(
 	ctx context.Context,
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
-) (sessionshim.PreparedAdoption, error) {
-	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
-		return sessionshim.PreparedAdoption{}, nil
+) (SessionShimAdoptionPreparationResult, error) {
+	if d.sessionShimReadinessWithdrawn.Load() {
+		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
 	}
-	hook := d.sessionShimConfig().PrepareAdoption
-	if hook == nil {
-		return sessionshim.PreparedAdoption{}, nil
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return SessionShimAdoptionPreparationResult{}, err
+	}
+	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
+		return SessionShimAdoptionPreparationResult{}, nil
+	}
+	cfg := d.sessionShimConfig()
+	if cfg.PrepareAdoption != nil && cfg.PrepareAdoptionV2 != nil {
+		return SessionShimAdoptionPreparationResult{}, fmt.Errorf("%w: PrepareAdoption and PrepareAdoptionV2 cannot both be configured", ErrSessionShimCarrierConfig)
+	}
+	if cfg.PrepareAdoption == nil && cfg.PrepareAdoptionV2 == nil {
+		return SessionShimAdoptionPreparationResult{}, nil
 	}
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 	defer cancel()
-	prepared, err := hook(callbackCtx, SessionShimAdoptionPreparation{
+	input := SessionShimAdoptionPreparation{
 		Identity:                    evidence.Identity,
 		HostID:                      hostID,
 		ControllerID:                evidence.ControllerID,
@@ -1224,12 +1457,27 @@ func (d *Daemon) prepareSessionShimAdoption(
 		LastHostSeq:                 evidence.LastHostSeq,
 		LastForwardedSeq:            evidence.LastForwardedSeq,
 		SelectedVersion:             evidence.SelectedVersion,
-	})
-	if err != nil {
-		return sessionshim.PreparedAdoption{}, err
 	}
+	var result SessionShimAdoptionPreparationResult
+	var err error
+	if cfg.PrepareAdoptionV2 != nil {
+		result, err = cfg.PrepareAdoptionV2(callbackCtx, input)
+	} else {
+		var prepared sessionshim.PreparedAdoption
+		prepared, err = cfg.PrepareAdoption(callbackCtx, input)
+		result = SessionShimAdoptionPreparationResult{
+			State: SessionShimPreparationFreshCandidate, PreparedAdoption: prepared,
+		}
+	}
+	if err != nil {
+		return SessionShimAdoptionPreparationResult{}, err
+	}
+	if err := validateSessionShimAdoptionPreparationResult(result, evidence.ProcessEpoch, d.shimNow()); err != nil {
+		return SessionShimAdoptionPreparationResult{}, err
+	}
+	prepared := result.PreparedAdoption
 	if d.sessionShimConfig().RequireAuthoritativeSnapshot && prepared.ResumeFrom == nil {
-		return sessionshim.PreparedAdoption{}, fmt.Errorf("%w: proof-bound carrier preparation omitted ResumeFrom", ErrSessionShimCarrierConfig)
+		return SessionShimAdoptionPreparationResult{}, fmt.Errorf("%w: proof-bound carrier preparation omitted ResumeFrom", ErrSessionShimCarrierConfig)
 	}
 	prepared.Extensions = cloneShimExtensions(prepared.Extensions)
 	prepared.Correlation = append([]byte(nil), prepared.Correlation...)
@@ -1237,15 +1485,89 @@ func (d *Daemon) prepareSessionShimAdoption(
 		resume := *prepared.ResumeFrom
 		prepared.ResumeFrom = &resume
 	}
-	return prepared, nil
+	result.PreparedAdoption = prepared
+	return cloneSessionShimAdoptionPreparationResult(result), nil
+}
+
+func validateSessionShimAdoptionPreparationResult(
+	result SessionShimAdoptionPreparationResult,
+	liveProcessEpoch uint64,
+	now time.Time,
+) error {
+	switch result.State {
+	case SessionShimPreparationFreshCandidate:
+		if result.AdoptedCandidateRecovery != nil {
+			return errors.New("session shim: fresh candidate preparation contains adopted recovery authority")
+		}
+		return nil
+	case SessionShimPreparationAdoptedCandidateRecovery:
+		recovery := result.AdoptedCandidateRecovery
+		if recovery == nil || recovery.Credential.IsZero() || recovery.RecoveryCorrelation.IsZero() {
+			return errors.New("session shim: adopted-candidate recovery is missing original credential or correlation")
+		}
+		if recovery.CarrierEpoch == 0 || recovery.StagedHighWater == ^uint64(0) ||
+			recovery.ResumeFrom != recovery.StagedHighWater+1 || result.PreparedAdoption.ResumeFrom == nil ||
+			*result.PreparedAdoption.ResumeFrom != recovery.ResumeFrom {
+			return errors.New("session shim: adopted-candidate recovery cursor is not exact")
+		}
+		if len(result.PreparedAdoption.Correlation) != 0 {
+			return errors.New("session shim: adopted-candidate recovery must not carry a new proof or receipt correlation")
+		}
+		carrierEpoch, ok := result.PreparedAdoption.Extensions.Get(shimwire.ExtCarrierEpoch)
+		if !ok || carrierEpoch != strconv.FormatUint(recovery.CarrierEpoch, 10) {
+			return errors.New("session shim: adopted-candidate recovery extension changed the original carrier")
+		}
+		resume := recovery.ResumeDisposition
+		if err := resume.Validate(); err != nil {
+			return fmt.Errorf("session shim: adopted-candidate recovery disposition: %w", err)
+		}
+		// ResumeDisposition is independently bound to the original bearer claims by
+		// attachclient. Binding the same field here to authenticated shim Hello
+		// evidence closes the other half of the authority chain before Welcome:
+		// live shim PTY == retained disposition PTY == original bearer PTY.
+		if liveProcessEpoch == 0 || resume.PTYEpoch != liveProcessEpoch {
+			return errors.New("session shim: adopted-candidate recovery PTY epoch does not match the authenticated live shim")
+		}
+		if resume.ProofSchemaVersion != attachclient.V2ProofSchemaV2 ||
+			resume.Authority != attachclient.V2ResumeAdoptedCandidateRecovery ||
+			resume.State != attachclient.V2ResumeReceiptStored || resume.CarrierEpoch != recovery.CarrierEpoch ||
+			resume.AckSeq != recovery.PreStageAckSeq || resume.CandidateSnapshotSeq != recovery.StagedHighWater {
+			return errors.New("session shim: adopted-candidate recovery disposition is not exact")
+		}
+		if recovery.CredentialExpiresAt.IsZero() || !recovery.CredentialExpiresAt.After(now) {
+			return errors.New("session shim: adopted-candidate recovery original credential is expired")
+		}
+		return nil
+	default:
+		return errors.New("session shim: unknown proof-v2 adoption preparation state")
+	}
+}
+
+func cloneSessionShimAdoptionPreparationResult(in SessionShimAdoptionPreparationResult) SessionShimAdoptionPreparationResult {
+	in.PreparedAdoption.Extensions = cloneShimExtensions(in.PreparedAdoption.Extensions)
+	in.PreparedAdoption.Correlation = append([]byte(nil), in.PreparedAdoption.Correlation...)
+	if in.PreparedAdoption.ResumeFrom != nil {
+		resume := *in.PreparedAdoption.ResumeFrom
+		in.PreparedAdoption.ResumeFrom = &resume
+	}
+	if in.AdoptedCandidateRecovery != nil {
+		recovery := *in.AdoptedCandidateRecovery
+		recovery.Credential = recovery.Credential.Clone()
+		clonedCorrelation, _ := NewSessionShimRecoveryCorrelation(recovery.RecoveryCorrelation.Bytes())
+		recovery.RecoveryCorrelation = clonedCorrelation
+		recovery.ResumeDisposition.CandidateSnapshot = append([]byte(nil), recovery.ResumeDisposition.CandidateSnapshot...)
+		in.AdoptedCandidateRecovery = &recovery
+	}
+	return in
 }
 
 func (d *Daemon) sessionShimAdoptionEvidence(
 	ctx context.Context,
 	ctrl *sessionshim.Controller,
-	prepared sessionshim.PreparedAdoption,
+	preparation SessionShimAdoptionPreparationResult,
 	preparedHostID string,
 ) (SessionShimAdoptionEvidence, error) {
+	prepared := preparation.PreparedAdoption
 	lastForwarded := uint64(0)
 	if resumeFrom := ctrl.ResumeFrom(); resumeFrom > 0 {
 		lastForwarded = resumeFrom - 1
@@ -1259,7 +1581,7 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 		}
 	}
 	carrierCompatible, carrierIncompatibility := sessionShimCarrierCompatibility(d.sessionShimConfig(), ctrl)
-	return SessionShimAdoptionEvidence{
+	evidence := SessionShimAdoptionEvidence{
 		Identity:               ctrl.Identity(),
 		HostID:                 hostID,
 		ControllerID:           ctrl.ControllerID(),
@@ -1281,7 +1603,11 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 			}
 			return nil
 		}(),
-	}, nil
+	}
+	if preparation.State == SessionShimPreparationAdoptedCandidateRecovery {
+		evidence.SnapshotProxy = nil
+	}
+	return evidence, nil
 }
 
 func sessionShimCarrierCompatibility(cfg SessionShimConfig, ctrl *sessionshim.Controller) (bool, SessionShimCarrierIncompatibility) {
@@ -1304,17 +1630,33 @@ func sessionShimCarrierQuarantineReason(incompatibility SessionShimCarrierIncomp
 	return sessionshim.QuarantineAuthoritativeSnapshotUnsupported
 }
 
-func (d *Daemon) completeSessionShimAdoption(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+func (d *Daemon) completeSessionShimAdoption(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	preparation SessionShimAdoptionPreparationResult,
+) (SessionShimAdoptionReceipt, error) {
 	if !evidence.CarrierCompatible {
 		return SessionShimAdoptionReceipt{}, nil
 	}
-	hook := d.sessionShimConfig().OnAdoption
-	if hook == nil {
+	if preparation.State == SessionShimPreparationAdoptedCandidateRecovery && evidence.SnapshotProxy != nil {
+		return SessionShimAdoptionReceipt{}, errors.New("session shim: adopted-candidate recovery must not receive new Snapshot authority")
+	}
+	cfg := d.sessionShimConfig()
+	if cfg.OnAdoption == nil && cfg.OnAdoptionV2 == nil {
 		return SessionShimAdoptionReceipt{}, nil
 	}
 	callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 	defer cancel()
-	receipt, err := hook(callbackCtx, cloneSessionShimAdoptionEvidence(evidence))
+	var receipt SessionShimAdoptionReceipt
+	var err error
+	if cfg.OnAdoptionV2 != nil {
+		receipt, err = cfg.OnAdoptionV2(callbackCtx, SessionShimAdoptionEvidenceV2{
+			Evidence:          cloneSessionShimAdoptionEvidence(evidence),
+			PreparationResult: cloneSessionShimAdoptionPreparationResult(preparation),
+		})
+	} else {
+		receipt, err = cfg.OnAdoption(callbackCtx, cloneSessionShimAdoptionEvidence(evidence))
+	}
 	if err != nil {
 		return SessionShimAdoptionReceipt{}, err
 	}
@@ -1546,12 +1888,17 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	if !d.sessionShimAttestationValue.enabled() {
 		return nil
 	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return err
+	}
 	if result == nil || result.SessionShim == nil {
 		return errors.New("session shim: refresh omitted credential receipt")
 	}
 	receipt := result.SessionShim
 	wantState := SessionShimCredentialStateRecovering
-	if d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
+	if !d.sessionShimReadinessWithdrawn.Load() && d.State() == StateRunning &&
+		d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
 		wantState = SessionShimCredentialStateReady
 	}
 	if receipt.State != wantState {
@@ -1783,13 +2130,18 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	if !exactSessionShimCarrierActivationSet(carriers, activatedSet) {
 		return errors.New("session shim: carrier activation callback did not return the exact complete set")
 	}
-	type resolvedSnapshot struct {
-		id    sessionshim.Identity
-		event sessionshim.ControllerEvent
-		gate  *shimAdoptionGate
-		ctrl  *sessionshim.Controller
+	type resolvedActivation struct {
+		id                  sessionshim.Identity
+		sequence            uint64
+		requestID           uint64
+		gate                *shimAdoptionGate
+		ctrl                *sessionshim.Controller
+		consumedRecovery    bool
+		recoveryPreStageAck uint64
+		recoveryReceipt     SessionShimAdoptionReceipt
 	}
-	resolved := make([]resolvedSnapshot, 0, len(activated))
+	resolved := make([]resolvedActivation, 0, len(activated))
+	resolvedPendingSnapshots := 0
 	d.shims.mu.Lock()
 	for _, activation := range activated {
 		id := sessionshim.Identity{
@@ -1797,43 +2149,81 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 		}
 		event, ok := d.shims.pendingSnapshots[id]
 		entry, adopted := d.shims.adopted[id]
-		if !ok || !adopted || event.Kind != sessionshim.EventHostFrame ||
-			event.FrameType != attachwire.TypeSnapshot || event.RequestID == 0 || activation.AckSeq != event.Seq {
+		published, wasPublished := entries[id]
+		if !adopted || !wasPublished || entry.controller != published.controller {
 			d.shims.mu.Unlock()
-			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot for %s", id)
+			return fmt.Errorf("session shim: carrier_active ack did not resolve the current adopted entry for %s", id)
 		}
-		resolved = append(resolved, resolvedSnapshot{
-			id: id, event: event, gate: d.shims.activationGates[id], ctrl: entry.controller,
+		recovery := entry.consumedRecovery
+		if recovery == nil && ok && event.Kind == sessionshim.EventHostFrame &&
+			event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0 && activation.AckSeq == event.Seq {
+			resolved = append(resolved, resolvedActivation{
+				id: id, sequence: event.Seq, requestID: event.RequestID,
+				gate: d.shims.activationGates[id], ctrl: entry.controller,
+			})
+			resolvedPendingSnapshots++
+			continue
+		}
+		if ok || recovery == nil || recovery.stagedHighWater == 0 ||
+			activation.AckSeq != recovery.stagedHighWater || recovery.preStageAckSeq >= recovery.stagedHighWater ||
+			len(recovery.adoptionReceipt.DurableCorrelation) == 0 ||
+			!bytes.Equal(recovery.adoptionReceipt.DurableCorrelation, entry.adoptionReceipt.DurableCorrelation) ||
+			published.consumedRecovery == nil ||
+			published.consumedRecovery.preStageAckSeq != recovery.preStageAckSeq ||
+			published.consumedRecovery.stagedHighWater != recovery.stagedHighWater ||
+			!bytes.Equal(published.consumedRecovery.adoptionReceipt.DurableCorrelation, recovery.adoptionReceipt.DurableCorrelation) {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot or consumed recovery for %s", id)
+		}
+		resolved = append(resolved, resolvedActivation{
+			id: id, sequence: recovery.stagedHighWater, ctrl: entry.controller,
+			consumedRecovery: true, recoveryPreStageAck: recovery.preStageAckSeq,
+			recoveryReceipt: cloneSessionShimAdoptionReceipt(recovery.adoptionReceipt),
 		})
 	}
-	if len(d.shims.pendingSnapshots) != len(resolved) {
+	if len(d.shims.pendingSnapshots) != resolvedPendingSnapshots {
 		d.shims.mu.Unlock()
 		return errors.New("session shim: carrier activation left a staged Snapshot unresolved")
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
+	for _, activation := range resolved {
 		var acknowledger sessionShimCursorAcknowledger
-		if snapshot.ctrl != nil {
-			acknowledger = snapshot.ctrl
+		if activation.ctrl != nil {
+			acknowledger = activation.ctrl
 		}
-		if err := d.recordShimForwardedSeqForController(snapshot.id, acknowledger, snapshot.event.Seq); err != nil {
-			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", snapshot.id, err)
+		if err := d.recordShimForwardedSeqForController(activation.id, acknowledger, activation.sequence); err != nil {
+			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", activation.id, err)
 		}
 	}
 	d.shims.mu.Lock()
-	for _, snapshot := range resolved {
-		current, pending := d.shims.pendingSnapshots[snapshot.id]
-		if !pending || current.Seq != snapshot.event.Seq || current.RequestID != snapshot.event.RequestID ||
-			d.shims.activationGates[snapshot.id] != snapshot.gate {
-			d.shims.mu.Unlock()
-			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", snapshot.id)
+	for _, activation := range resolved {
+		if activation.consumedRecovery {
+			current, adopted := d.shims.adopted[activation.id]
+			recovery := current.consumedRecovery
+			if !adopted || current.controller != activation.ctrl || recovery == nil ||
+				recovery.preStageAckSeq != activation.recoveryPreStageAck ||
+				recovery.stagedHighWater != activation.sequence ||
+				!bytes.Equal(recovery.adoptionReceipt.DurableCorrelation, activation.recoveryReceipt.DurableCorrelation) ||
+				!bytes.Equal(current.adoptionReceipt.DurableCorrelation, activation.recoveryReceipt.DurableCorrelation) {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: consumed recovery changed while persisting acknowledgement for %s", activation.id)
+			}
+			current.consumedRecovery = nil
+			d.shims.adopted[activation.id] = current
+			continue
 		}
-		delete(d.shims.pendingSnapshots, snapshot.id)
-		delete(d.shims.activationGates, snapshot.id)
+		current, pending := d.shims.pendingSnapshots[activation.id]
+		if !pending || current.Seq != activation.sequence || current.RequestID != activation.requestID ||
+			d.shims.activationGates[activation.id] != activation.gate {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", activation.id)
+		}
+		delete(d.shims.pendingSnapshots, activation.id)
+		delete(d.shims.activationGates, activation.id)
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
-		snapshot.gate.finish(true)
+	for _, activation := range resolved {
+		activation.gate.finish(true)
 	}
 	d.shims.mu.Lock()
 	d.shims.carrierActivationComplete = true
@@ -1925,6 +2315,10 @@ func (d *Daemon) SessionShimCarrierActivationComplete() bool {
 func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartbeatProjection, error) {
 	if !d.sessionShimAttestationValue.enabled() {
 		return SessionShimHeartbeatProjection{}, nil
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return SessionShimHeartbeatProjection{}, err
 	}
 	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
