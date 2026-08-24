@@ -46,6 +46,13 @@ func termCastPath(wpath string) string {
 	return filepath.Join(wpath, state.AgentDirName, "term.cast")
 }
 
+func worktreeProvisionStrategy(qw QueuedWork) worktree.CloneStrategy {
+	if qw.Repository == "" && qw.RepositoryDeclaration == nil && qw.CacheSeedID == "" && qw.WorkareaMode != worktree.ModeShared {
+		return worktree.StrategyEmpty
+	}
+	return worktree.StrategyClone
+}
+
 // runLoop drives the per-session orchestration steps in F.1.1 §4
 // order. Returns the in-progress Result (always non-nil) plus a
 // terminal err the caller may surface.
@@ -209,12 +216,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	} else if branch == "" {
 		branch = "agent/" + qw.SessionID
 	}
+	provisionStrategy := worktreeProvisionStrategy(qw)
+	repositoryFree := provisionStrategy == worktree.StrategyEmpty
+	provisionBranch := refBranch
+	provisionSourceRef := qw.Ref
+	if repositoryFree {
+		provisionBranch = ""
+		provisionSourceRef = ""
+	}
 	wpath, err := r.wt.Provision(ctx, worktree.ProvisionSpec{
 		SessionID:             qw.SessionID,
 		RepoURL:               qw.Repository,
-		Branch:                refBranch,
-		SourceRef:             qw.Ref,
-		Strategy:              worktree.StrategyClone,
+		Branch:                provisionBranch,
+		SourceRef:             provisionSourceRef,
+		Strategy:              provisionStrategy,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
 		Mode:                  qw.WorkareaMode,
@@ -265,8 +280,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
-	selectedRepositoryMutable := !selectedRepositoryReadOnly
+	selectedRepositoryMutable := !repositoryFree && !selectedRepositoryReadOnly
 	switch {
+	case repositoryFree:
+		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
 		for _, repository := range repositoryDeclaration.Repositories {
 			if repository.Authority != workarea.RepositoryMutable {
@@ -296,7 +313,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
 	// fatal: a failed sibling logs a warning and the session proceeds —
 	// agents fall back to cloning it themselves.
-	if repositoryDeclaration == nil {
+	if !repositoryFree && repositoryDeclaration == nil {
 		r.provisionSiblings(ctx, qw, wpath)
 	}
 
@@ -1225,7 +1242,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
-	backstopEligible := shouldBackstop(res, qw.WorkType)
+	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType)
 	if repositoryDeclaration != nil && isResultSensitive(qw.WorkType) {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
@@ -1303,14 +1320,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// fatal — the platform degrades headSha-less exit events to its
 	// timeout/reconciliation path. Background ctx so a cancelled run
 	// ctx does not lose the capture.
-	shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
-		r.logger.Warn("head commit capture failed",
-			"sessionId", qw.SessionID, "err", shaErr)
-	} else {
-		res.CommitSHA = sha
+	if !repositoryFree {
+		shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
+			r.logger.Warn("head commit capture failed",
+				"sessionId", qw.SessionID, "err", shaErr)
+		} else {
+			res.CommitSHA = sha
+		}
+		shaCancel()
 	}
-	shaCancel()
 
 	// 12. Finalise the Result envelope. Status defaults to
 	// "completed" when no failure mode was set; otherwise the

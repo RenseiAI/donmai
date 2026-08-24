@@ -1,6 +1,6 @@
 # `runtime/worktree/`
 
-Per-session git repository provisioning and root-scoped teardown for the agent runner.
+Per-session repository or repository-free directory provisioning and root-scoped teardown for the agent runner.
 
 ## What it does
 
@@ -35,6 +35,7 @@ the flat singular path and never receive a declaration.
 
 - `StrategyClone` — `git clone --branch <b> <repo> <dst>`. Fully isolated session; one full repo per session.
 - `StrategyWorktreeAdd` — `git worktree add -B <b> <dst> origin/<b>` off an existing parent clone. Cheaper for many concurrent sessions.
+- `StrategyEmpty` — create a fresh flat session directory without invoking Git. Used only for work whose accepted session detail has no repository; versioned declarations and shared participants retain their existing strategies.
 
 ## Retry contract (verbatim port from legacy TS)
 
