@@ -175,6 +175,7 @@ Localhost-only (binds 127.0.0.1). Endpoints:
 | `POST   /api/daemon/stop`              | Graceful stop |
 | `POST   /api/daemon/drain`             | Drain in-flight work |
 | `POST   /api/daemon/restart/prepare`   | Enter draining and obtain the closed planned-restart permission response |
+| `POST   /api/daemon/session-shim/acceptance/<action>` | Dormant bearer-authenticated installed-artifact fault control; absent unless explicitly configured |
 | `POST   /api/daemon/update`            | Trigger manual update check |
 | `POST   /api/daemon/capacity`          | Update a config key (e.g. `capacity.poolMaxDiskGb`) |
 | `GET    /api/daemon/pool/stats`        | Workarea pool snapshot |
@@ -196,6 +197,15 @@ is a refusal: the caller must not invoke the service manager. Partial retries
 reuse the daemon-minted preparation id and exact per-scope bytes. An explicit
 `POST /api/daemon/resume` durably abandons only this controller's local stop
 authorization before reopening admission; it never consumes external holds.
+
+The session-shim acceptance route is disabled by default and returns the same
+404 as an absent route unless `DONMAI_SESSION_SHIM_ACCEPTANCE_TOKEN_FILE` names
+an absolute, private regular file. Even when enabled, each fault mutation binds
+to an exact lifecycle already adopted by this daemon. The route returns no
+evidence: installed acceptance must independently re-observe daemon/doctor,
+heartbeat, process, and viewer-wire effects. The standalone target-owned
+mutator and its closed command protocol live in
+`cmd/session-shim-acceptance-mutator/`.
 
 `POST /api/daemon/update` crosses the same preflight synchronously before it
 reports that an update was initiated. Update success, failure, or absence leaves
