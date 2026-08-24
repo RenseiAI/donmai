@@ -191,10 +191,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Reconcile terminal authorities before the daemon admits work. Receiver
 			// endpoints are resolved from the separate registry on every replay;
 			// no bearer is persisted by this public implementation.
-			archiveRoot := ""
-			if daemonConfig, configErr := daemon.LoadConfig(configPath); configErr == nil {
-				archiveRoot = daemonConfig.Workarea.ArchiveRoot
-			}
+			archiveRoot := workareaArchiveRoot(configPath)
 			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
@@ -314,6 +311,14 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 		"Standalone credential mode (on|off|auto). When on, donmai seeds child agent env from process env + ${gitRoot}/.env.local. When auto, on is selected when DONMAI_DAEMON_JWT is unset (i.e. not running under a downstream embedder's credential pipeline).")
 
 	return cmd
+}
+
+func workareaArchiveRoot(configPath string) string {
+	daemonConfig, err := daemon.LoadConfig(configPath)
+	if err != nil || daemonConfig == nil {
+		return ""
+	}
+	return daemonConfig.Workarea.ArchiveRoot
 }
 
 // resolveStandaloneCredsMode returns true when donmai should seed agent
