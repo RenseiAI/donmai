@@ -39,13 +39,21 @@ func TestLFFramingOnly(t *testing.T) {
 func TestWriteCommand_Framing(t *testing.T) {
 	t.Parallel()
 	var buf bytes.Buffer
-	c := newRPCClient(&buf, strings.NewReader(""))
+	stdout, closeStdout := io.Pipe()
+	t.Cleanup(func() { _ = closeStdout.Close() })
+	// A real pi child keeps stdout open while commands are written. Keep this
+	// test reader open as well, so the background read loop cannot close c
+	// before the framing assertions run.
+	c := newRPCClient(&buf, stdout)
 	if err := c.WriteCommand(map[string]any{"type": "prompt", "message": "hello\nworld"}); err != nil {
 		t.Fatalf("WriteCommand: %v", err)
 	}
 	out := buf.String()
 	if !strings.HasSuffix(out, "\n") {
 		t.Errorf("command not LF-terminated: %q", out)
+	}
+	if strings.Contains(out, "\r\n") {
+		t.Errorf("command uses CRLF instead of LF framing: %q", out)
 	}
 	// The embedded newline in the value must be JSON-escaped, so the framed
 	// line contains exactly one trailing "\n".
