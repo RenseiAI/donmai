@@ -387,7 +387,7 @@ func testAdoptedCandidateRecoveryResult(t *testing.T, now time.Time) SessionShim
 func TestAdoptedCandidateRecoveryIsExactOpaqueAndControllerGenerationIndependent(t *testing.T) {
 	now := time.Now()
 	result := testAdoptedCandidateRecoveryResult(t, now)
-	if err := validateSessionShimAdoptionPreparationResult(result, now); err != nil {
+	if err := validateSessionShimAdoptionPreparationResult(result, 3, now); err != nil {
 		t.Fatalf("valid adopted candidate recovery: %v", err)
 	}
 	encoded, err := json.Marshal(result)
@@ -437,6 +437,44 @@ func TestAdoptedCandidateRecoveryIsExactOpaqueAndControllerGenerationIndependent
 	}
 }
 
+func TestAdoptedCandidateRecoveryRequiresAuthenticatedLivePTYEpoch(t *testing.T) {
+	const liveProcessEpoch = uint64(3)
+	for _, test := range []struct {
+		name       string
+		ptyEpoch   uint64
+		wantRefuse bool
+	}{
+		{name: "exact", ptyEpoch: liveProcessEpoch},
+		{name: "zero", ptyEpoch: 0, wantRefuse: true},
+		{name: "lower_3_to_2", ptyEpoch: 2, wantRefuse: true},
+		{name: "higher_3_to_4", ptyEpoch: 4, wantRefuse: true},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			result := testAdoptedCandidateRecoveryResult(t, time.Now())
+			result.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch = test.ptyEpoch
+			d := New(Options{SessionShim: SessionShimConfig{
+				EnableAdoption: true, RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+				AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+				GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+				PrepareAdoptionV2: func(context.Context, SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+					return cloneSessionShimAdoptionPreparationResult(result), nil
+				},
+			}})
+			_, err := d.prepareSessionShimAdoption(context.Background(), "stable-host", sessionshim.AdoptionPreparation{
+				Identity: sessionshim.Identity{OrgID: "org", SessionID: "session"}, ControllerID: d.ControllerID(),
+				ShimID: "shim", ProcessEpoch: liveProcessEpoch, CurrentControllerGeneration: 7,
+				LocalResumeFrom: 11, LastHostSeq: 12, SelectedVersion: shimwire.V3,
+			})
+			if test.wantRefuse && err == nil {
+				t.Fatalf("adopted-candidate recovery accepted live PTY epoch %d with disposition epoch %d", liveProcessEpoch, test.ptyEpoch)
+			}
+			if !test.wantRefuse && err != nil {
+				t.Fatalf("exact live PTY epoch was refused: %v", err)
+			}
+		})
+	}
+}
+
 func TestAdoptedCandidateRecoveryRejectsRemintAndSecondCursorShapes(t *testing.T) {
 	now := time.Now()
 	mutations := map[string]func(*SessionShimAdoptionPreparationResult){
@@ -473,7 +511,7 @@ func TestAdoptedCandidateRecoveryRejectsRemintAndSecondCursorShapes(t *testing.T
 		t.Run(name, func(t *testing.T) {
 			result := testAdoptedCandidateRecoveryResult(t, now)
 			mutate(&result)
-			if err := validateSessionShimAdoptionPreparationResult(result, now); err == nil {
+			if err := validateSessionShimAdoptionPreparationResult(result, 3, now); err == nil {
 				t.Fatal("invalid adopted-candidate recovery was accepted")
 			}
 		})

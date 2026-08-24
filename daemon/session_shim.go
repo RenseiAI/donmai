@@ -1472,7 +1472,7 @@ func (d *Daemon) prepareSessionShimAdoption(
 	if err != nil {
 		return SessionShimAdoptionPreparationResult{}, err
 	}
-	if err := validateSessionShimAdoptionPreparationResult(result, d.shimNow()); err != nil {
+	if err := validateSessionShimAdoptionPreparationResult(result, evidence.ProcessEpoch, d.shimNow()); err != nil {
 		return SessionShimAdoptionPreparationResult{}, err
 	}
 	prepared := result.PreparedAdoption
@@ -1489,7 +1489,11 @@ func (d *Daemon) prepareSessionShimAdoption(
 	return cloneSessionShimAdoptionPreparationResult(result), nil
 }
 
-func validateSessionShimAdoptionPreparationResult(result SessionShimAdoptionPreparationResult, now time.Time) error {
+func validateSessionShimAdoptionPreparationResult(
+	result SessionShimAdoptionPreparationResult,
+	liveProcessEpoch uint64,
+	now time.Time,
+) error {
 	switch result.State {
 	case SessionShimPreparationFreshCandidate:
 		if result.AdoptedCandidateRecovery != nil {
@@ -1516,6 +1520,13 @@ func validateSessionShimAdoptionPreparationResult(result SessionShimAdoptionPrep
 		resume := recovery.ResumeDisposition
 		if err := resume.Validate(); err != nil {
 			return fmt.Errorf("session shim: adopted-candidate recovery disposition: %w", err)
+		}
+		// ResumeDisposition is independently bound to the original bearer claims by
+		// attachclient. Binding the same field here to authenticated shim Hello
+		// evidence closes the other half of the authority chain before Welcome:
+		// live shim PTY == retained disposition PTY == original bearer PTY.
+		if liveProcessEpoch == 0 || resume.PTYEpoch != liveProcessEpoch {
+			return errors.New("session shim: adopted-candidate recovery PTY epoch does not match the authenticated live shim")
 		}
 		if resume.ProofSchemaVersion != attachclient.V2ProofSchemaV2 ||
 			resume.Authority != attachclient.V2ResumeAdoptedCandidateRecovery ||

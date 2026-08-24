@@ -328,7 +328,67 @@ func TestConsumedAdoptedCandidateRecoveryCompletesPublicationAndActivationWithou
 		recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.GapReason = attachwirev2.GapControllerUnforwarded
 	}
 
+	var mismatchPrepareCalls, mismatchAdoptionCalls, mismatchBatchCalls, mismatchActivationCalls, mismatchDurableFrames int
+	var mismatchLivePTYEpoch uint64
+	var mismatchControllerGeneration shimwire.Generation
+	mismatch := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: f.registry, HostID: "host-consumed-recovery",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			mismatchPrepareCalls++
+			mismatchLivePTYEpoch = preparation.ProcessEpoch
+			mismatchControllerGeneration = preparation.CurrentControllerGeneration
+			resolved := cloneSessionShimAdoptionPreparationResult(recoveryResult)
+			resolved.PreparedAdoption.ControllerGeneration = preparation.CurrentControllerGeneration + 1
+			resolved.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch = preparation.ProcessEpoch + 1
+			return resolved, nil
+		},
+		OnAdoptionV2: func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			mismatchAdoptionCalls++
+			return SessionShimAdoptionReceipt{}, errors.New("forbidden adoption callback reached")
+		},
+		OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+			mismatchDurableFrames++
+			return nil
+		},
+		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			mismatchBatchCalls++
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("must-not-publish"), AdoptionRevision: "must-not-publish",
+			}, nil
+		},
+		OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			mismatchActivationCalls++
+			return nil, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, mismatch, id.OrgID)
+	mismatchErr := mismatch.adoptSessionShims(context.Background())
+	if mismatchErr == nil || !strings.Contains(mismatchErr.Error(), "PTY epoch") {
+		t.Fatalf("cross-PTY recovery = %v, want pre-Welcome PTY epoch refusal", mismatchErr)
+	}
+	if mismatchPrepareCalls != 1 || mismatchAdoptionCalls != 0 || mismatchBatchCalls != 0 ||
+		mismatchActivationCalls != 0 || mismatchDurableFrames != 0 {
+		t.Fatalf("cross-PTY recovery crossed prepare: prepare/adoption/batch/activation/frames = %d/%d/%d/%d/%d",
+			mismatchPrepareCalls, mismatchAdoptionCalls, mismatchBatchCalls, mismatchActivationCalls, mismatchDurableFrames)
+	}
+	if mismatchLivePTYEpoch != 1 || mismatchControllerGeneration != 2 {
+		t.Fatalf("cross-PTY authenticated live identity = PTY %d controller generation %d, want PTY 1 generation 2",
+			mismatchLivePTYEpoch, mismatchControllerGeneration)
+	}
+	if mismatch.SessionShimAdoptionComplete() || mismatch.SessionShimCarrierActivationComplete() ||
+		mismatch.SessionShimForwardedSeq(id.OrgID, id.SessionID) != 0 {
+		t.Fatalf("cross-PTY recovery published state: adoption=%v activation=%v cursor=%d",
+			mismatch.SessionShimAdoptionComplete(), mismatch.SessionShimCarrierActivationComplete(),
+			mismatch.SessionShimForwardedSeq(id.OrgID, id.SessionID))
+	}
+	mismatch.ReleaseAdoptedSessionShims()
+
 	var prepareCalls, adoptionCalls, batchCalls, activationCalls, recoveryDurableFrames int
+	var validLivePTYEpoch uint64
+	var validPriorControllerGeneration shimwire.Generation
 	var recovery *Daemon
 	recovery = New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
 		EnableAdoption: true, RegistryDir: f.registry, HostID: "host-consumed-recovery",
@@ -337,6 +397,12 @@ func TestConsumedAdoptedCandidateRecoveryCompletesPublicationAndActivationWithou
 		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
 		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
 			prepareCalls++
+			validLivePTYEpoch = preparation.ProcessEpoch
+			validPriorControllerGeneration = preparation.CurrentControllerGeneration
+			if preparation.ProcessEpoch != recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch {
+				return SessionShimAdoptionPreparationResult{}, fmt.Errorf("valid recovery live PTY epoch = %d, want %d",
+					preparation.ProcessEpoch, recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch)
+			}
 			resolved := cloneSessionShimAdoptionPreparationResult(recoveryResult)
 			resolved.PreparedAdoption.ControllerGeneration = preparation.CurrentControllerGeneration + 1
 			return resolved, nil
@@ -387,6 +453,16 @@ func TestConsumedAdoptedCandidateRecoveryCompletesPublicationAndActivationWithou
 	}
 	if !recovery.SessionShimAdoptionComplete() || !recovery.SessionShimCarrierActivationComplete() {
 		t.Fatalf("recovery completion = adoption:%v activation:%v", recovery.SessionShimAdoptionComplete(), recovery.SessionShimCarrierActivationComplete())
+	}
+	entry, err := recovery.adoptedShimEntry(id.OrgID, id.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if validLivePTYEpoch != mismatchLivePTYEpoch || validPriorControllerGeneration != mismatchControllerGeneration ||
+		entry.controller.Generation() != validPriorControllerGeneration+1 {
+		t.Fatalf("valid recovery identity/generation = PTY %d prior %d adopted %d; mismatch observed PTY %d prior %d",
+			validLivePTYEpoch, validPriorControllerGeneration, entry.controller.Generation(),
+			mismatchLivePTYEpoch, mismatchControllerGeneration)
 	}
 }
 
