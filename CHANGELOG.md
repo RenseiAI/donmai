@@ -10,6 +10,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **Hosts without a daemon config start cleanly.** Startup now treats the
+  documented missing-config result as an empty workarea archive setting instead
+  of dereferencing it before the first-run defaults can take effect.
 - **Hosted heartbeats carry live proof-v2 readiness.** The authority-bound
   `sessionShim` projection now includes the independently resolved durable
   acknowledgement, proof-v1 closure, retained-credential, remaining-validity,
