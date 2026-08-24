@@ -2054,6 +2054,13 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	ctx context.Context,
 	entries map[sessionshim.Identity]adoptedShim,
 ) error {
+	if d.sessionShimReadinessWithdrawn.Load() {
+		return errors.New("session shim: proof-v2 readiness is withdrawn")
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return fmt.Errorf("session shim: proof-v2 activation readiness: %w", err)
+	}
 	carriers := make([]SessionShimCarrierActivation, 0, len(entries))
 	for _, entry := range entries {
 		carrier, ok, err := sessionShimCarrierActivationFor(entry.adoption)

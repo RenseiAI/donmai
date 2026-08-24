@@ -217,6 +217,23 @@ func (c *controllerConn) failOutputBarrier() {
 	}
 }
 
+func (c *controllerConn) releaseOutputBarrierAfterDurableAdvance() {
+	c.barrierMu.Lock()
+	if c.barrierTimer != nil {
+		c.barrierTimer.Stop()
+		c.barrierTimer = nil
+	}
+	pending := c.outputBarrier
+	c.outputBarrier = nil
+	if c.barrierState == outputBarrierPending {
+		c.barrierState = outputBarrierConsumed
+	}
+	c.barrierMu.Unlock()
+	if pending != nil {
+		pending.Release()
+	}
+}
+
 func (c *controllerConn) emitSnapshot(sess *ptyhost.Session) (attachwire.Frame, bool, error) {
 	c.barrierMu.Lock()
 	switch c.barrierState {
@@ -1217,6 +1234,7 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
 	}
+	advanced := false
 	switch {
 	case heartbeat.AckedSeq < currentAck:
 		s.recordMu.Unlock()
@@ -1236,11 +1254,22 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 		}
 		s.ackedSeq = heartbeat.AckedSeq
 		currentAck = heartbeat.AckedSeq
+		advanced = true
 		close(s.ackNotify)
 		s.ackNotify = make(chan struct{})
 	}
 	s.recordMu.Unlock()
 
+	// A strictly advancing, durably stored ACK is adopted recovery's existing-
+	// wire release for the Hello output barrier. Release follows the durable
+	// state update even if the receipt write is then lost: the activation is
+	// already committed locally, while the daemon still cannot advance its own
+	// cursor without receiving the synchronous receipt. Equal/no-op ACKs never
+	// release; fresh candidates must first allocate their mandatory Snapshot,
+	// while retained recovery reaches this edge only after carrier_active(H).
+	if advanced {
+		ctrl.releaseOutputBarrierAfterDurableAdvance()
+	}
 	// Selected v3 makes persistence synchronous: the daemon cannot advance its
 	// own cursor until this exact fsync-backed receipt arrives.
 	reply := shimwire.HeartbeatMsg{Generation: generation, Phase: phase, AckedSeq: currentAck}
