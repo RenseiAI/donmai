@@ -1509,6 +1509,9 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 		if spec.ParentRepoPath != "" || referencePath != "" || len(spec.SparsePaths) > 0 {
 			return errors.New("git parent, reference, and sparse paths are invalid for StrategyEmpty")
 		}
+		if spec.CacheSeedID != "" || spec.SourceRef != "" || spec.Branch != "" {
+			return errors.New("repository provenance is invalid for StrategyEmpty")
+		}
 		if err := os.Mkdir(dst, 0o750); err != nil {
 			return fmt.Errorf("create empty workarea: %w", err)
 		}

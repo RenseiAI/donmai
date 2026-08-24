@@ -217,11 +217,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		branch = "agent/" + qw.SessionID
 	}
 	provisionStrategy := worktreeProvisionStrategy(qw)
+	repositoryFree := provisionStrategy == worktree.StrategyEmpty
+	provisionBranch := refBranch
+	provisionSourceRef := qw.Ref
+	if repositoryFree {
+		provisionBranch = ""
+		provisionSourceRef = ""
+	}
 	wpath, err := r.wt.Provision(ctx, worktree.ProvisionSpec{
 		SessionID:             qw.SessionID,
 		RepoURL:               qw.Repository,
-		Branch:                refBranch,
-		SourceRef:             qw.Ref,
+		Branch:                provisionBranch,
+		SourceRef:             provisionSourceRef,
 		Strategy:              provisionStrategy,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
@@ -273,9 +280,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
-	selectedRepositoryMutable := !selectedRepositoryReadOnly
+	selectedRepositoryMutable := !repositoryFree && !selectedRepositoryReadOnly
 	switch {
-	case provisionStrategy == worktree.StrategyEmpty:
+	case repositoryFree:
 		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
 		for _, repository := range repositoryDeclaration.Repositories {
@@ -306,7 +313,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
 	// fatal: a failed sibling logs a warning and the session proceeds —
 	// agents fall back to cloning it themselves.
-	if repositoryDeclaration == nil {
+	if !repositoryFree && repositoryDeclaration == nil {
 		r.provisionSiblings(ctx, qw, wpath)
 	}
 
@@ -1235,7 +1242,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
-	backstopEligible := shouldBackstop(res, qw.WorkType)
+	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType)
 	if repositoryDeclaration != nil && isResultSensitive(qw.WorkType) {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
@@ -1313,7 +1320,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// fatal — the platform degrades headSha-less exit events to its
 	// timeout/reconciliation path. Background ctx so a cancelled run
 	// ctx does not lose the capture.
-	if provisionStrategy != worktree.StrategyEmpty {
+	if !repositoryFree {
 		shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
 		if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
 			r.logger.Warn("head commit capture failed",

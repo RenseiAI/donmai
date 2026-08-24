@@ -127,21 +127,35 @@ func TestProvisionEmptySuccess(t *testing.T) {
 	}
 }
 
-func TestProvisionEmptyRejectsRepository(t *testing.T) {
+func TestProvisionEmptyRejectsRepositoryProvenance(t *testing.T) {
 	t.Parallel()
 
-	dir := t.TempDir()
-	m, err := worktree.NewManager(worktree.Options{ParentDir: dir})
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name string
+		spec worktree.ProvisionSpec
+		want string
+	}{
+		{name: "repository", spec: worktree.ProvisionSpec{RepoURL: "https://example.test/repository.git"}, want: "RepoURL must be empty"},
+		{name: "parent repository", spec: worktree.ProvisionSpec{ParentRepoPath: "/tmp/parent"}, want: "git parent, reference, and sparse paths"},
+		{name: "branch", spec: worktree.ProvisionSpec{Branch: "main"}, want: "repository provenance"},
+		{name: "source ref", spec: worktree.ProvisionSpec{SourceRef: "main"}, want: "repository provenance"},
+		{name: "cache seed", spec: worktree.ProvisionSpec{CacheSeedID: "seed-one"}, want: "repository provenance"},
+		{name: "sparse paths", spec: worktree.ProvisionSpec{SparsePaths: []string{"src"}}, want: "git parent, reference, and sparse paths"},
 	}
-	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "not-empty",
-		RepoURL:   "https://example.test/repository.git",
-		Strategy:  worktree.StrategyEmpty,
-	})
-	if err == nil || !strings.Contains(err.Error(), "RepoURL must be empty") {
-		t.Fatalf("Provision error = %v, want repository refusal", err)
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.spec.SessionID = "not-empty"
+			test.spec.Strategy = worktree.StrategyEmpty
+			_, err = m.Provision(context.Background(), test.spec)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Provision error = %v, want %q refusal", err, test.want)
+			}
+		})
 	}
 }
 
