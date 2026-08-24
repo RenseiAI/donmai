@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"net/http"
 	"os"
 	"strings"
 	"sync"
@@ -39,6 +40,14 @@ type Options struct {
 	// JWTPath is where to cache the runtime JWT. Defaults to
 	// DefaultJWTPath().
 	JWTPath string
+	// OrchestratorHTTPClient is the caller-owned client for every outbound
+	// orchestrator lane constructed by Daemon.Start: registration, runtime-token
+	// refresh/full re-registration, heartbeat, and poll. The exact pointer is
+	// passed through without cloning or mutation; embedders own its transport,
+	// TLS, redirect, proxy, and timeout policy.
+	//
+	// Nil preserves each lane's existing generic OSS default client and timeout.
+	OrchestratorHTTPClient *http.Client
 	// SkipWizard, when true, prevents the interactive wizard from running
 	// even when stdin is a TTY. The default config (or existing config) is
 	// used instead.
@@ -855,6 +864,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		regOpts = RegistrationOptions{
 			OrchestratorURL:   cfg.Orchestrator.URL,
 			RegistrationToken: token,
+			HTTPClient:        d.opts.OrchestratorHTTPClient,
 			// MachineID is deliberately left empty so Register resolves the
 			// STABLE machine identity (MachineID()). cfg.Machine.ID is a
 			// hostname-derived label — keying host identity on it forked one
@@ -1073,6 +1083,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			Hostname:        cfg.Machine.ID,
 			OrchestratorURL: cfg.Orchestrator.URL,
 			RuntimeJWT:      regResp.RuntimeToken,
+			HTTPClient:      d.opts.OrchestratorHTTPClient,
 			IntervalSeconds: regResp.HeartbeatIntervalSeconds(),
 			GetActiveCount:  d.spawnerActiveCount,
 			// Interactive-occupancy split: sample the unclassed total and the
@@ -1159,6 +1170,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 				WorkerID:        regResp.WorkerID,
 				OrchestratorURL: cfg.Orchestrator.URL,
 				RuntimeJWT:      regResp.RuntimeToken,
+				HTTPClient:      d.opts.OrchestratorHTTPClient,
 				IntervalSeconds: interval,
 				// Stamps the non-agent lane executors' result/log context with
 				// the running binary's version rather than the library default.

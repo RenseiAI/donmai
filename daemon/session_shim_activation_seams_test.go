@@ -986,6 +986,20 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		}
 	}))
 	t.Cleanup(server.Close)
+	orchestratorTransport := &recordingOrchestratorTransport{
+		base: server.Client().Transport,
+		hits: make(map[string]int),
+	}
+	var redirectRefusals atomic.Int32
+	orchestratorHTTPClient := &http.Client{
+		Transport: orchestratorTransport,
+		Timeout:   3 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			redirectRefusals.Add(1)
+			return http.ErrUseLastResponse
+		},
+	}
+	originalTransport, originalTimeout := orchestratorHTTPClient.Transport, orchestratorHTTPClient.Timeout
 	dir := t.TempDir()
 	configPath := filepath.Join(dir, "daemon.yaml")
 	cfg := DefaultConfig()
@@ -997,6 +1011,7 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	}
 	d = New(Options{
 		ConfigPath: configPath, JWTPath: filepath.Join(dir, "daemon.jwt"), SkipWizard: true,
+		OrchestratorHTTPClient: orchestratorHTTPClient,
 		SessionShim: SessionShimConfig{
 			EnableAdoption: true, RequireCredentialAttestation: true,
 			GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) {
@@ -1049,6 +1064,30 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	}
 	if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
 		t.Fatalf("daemon readiness = state:%s adoption:%v activation:%v", d.State(), d.SessionShimAdoptionComplete(), d.SessionShimCarrierActivationComplete())
+	}
+	if d.heartbeat == nil || d.heartbeat.opts.HTTPClient != orchestratorHTTPClient {
+		t.Fatal("auth-only heartbeat did not retain the exact injected orchestrator client")
+	}
+	if d.poller == nil || d.poller.opts.HTTPClient != orchestratorHTTPClient {
+		t.Fatal("auth-only poll did not retain the exact injected orchestrator client")
+	}
+	if orchestratorHTTPClient.Transport != originalTransport || orchestratorHTTPClient.Timeout != originalTimeout {
+		t.Fatal("auth-only startup mutated the injected orchestrator client")
+	}
+	for _, request := range []struct {
+		method string
+		path   string
+	}{
+		{http.MethodPost, RegisterEndpoint},
+		{http.MethodPost, "/api/workers/worker-order/heartbeat"},
+		{http.MethodGet, "/api/workers/worker-order/poll"},
+	} {
+		if got := orchestratorTransport.count(request.method, request.path); got == 0 {
+			t.Errorf("auth-only injected client did not observe %s %s", request.method, request.path)
+		}
+	}
+	if got := redirectRefusals.Load(); got != 0 {
+		t.Fatalf("auth-only non-redirecting control server invoked redirect policy %d times", got)
 	}
 	if suspended, reason := satelliteClaimGate(); suspended || reason != "" {
 		t.Fatalf("exported poll claim gate at ready startup = (%v, %q), want open", suspended, reason)

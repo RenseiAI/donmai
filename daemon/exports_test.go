@@ -8,9 +8,11 @@
 package daemon_test
 
 import (
+	"context"
 	"encoding/json"
 	"net/http"
 	"net/http/httptest"
+	"path/filepath"
 	"reflect"
 	"sync/atomic"
 	"testing"
@@ -273,5 +275,97 @@ func TestDaemon_PollClaimGate_Exported(t *testing.T) {
 	}
 	if !poller.ClaimsSuspended() {
 		t.Fatal("satellite poll did not latch the exported daemon claim gate")
+	}
+}
+
+func TestDaemon_OrchestratorHTTPClient_ExportedAndRefusesRedirect(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+	var redirectReceiverHits atomic.Int32
+	receiver := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		redirectReceiverHits.Add(1)
+		switch {
+		case r.URL.Path == daemon.RegisterEndpoint:
+			_ = json.NewEncoder(w).Encode(daemon.RegisterResponse{
+				WorkerID: "redirect-worker", RuntimeToken: "runtime.redirect",
+				HeartbeatInterval: 3_600_000, PollInterval: 3_600_000,
+			})
+		case r.URL.Path == "/api/workers/redirect-worker/heartbeat":
+			_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+		case r.URL.Path == "/api/workers/redirect-worker/poll":
+			_ = json.NewEncoder(w).Encode(daemon.PollResponse{})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(receiver.Close)
+	redirector := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var target string
+		switch r.URL.Path {
+		case daemon.RegisterEndpoint:
+			target = receiver.URL + daemon.RegisterEndpoint
+		case "/api/workers/redirect-worker/heartbeat":
+			target = receiver.URL + "/api/workers/redirect-worker/heartbeat"
+		case "/api/workers/redirect-worker/poll":
+			target = receiver.URL + "/api/workers/redirect-worker/poll"
+		default:
+			http.NotFound(w, r)
+			return
+		}
+		http.Redirect(w, r, target, http.StatusTemporaryRedirect)
+	}))
+	t.Cleanup(redirector.Close)
+
+	client := &http.Client{
+		Transport: redirector.Client().Transport,
+		Timeout:   2 * time.Second,
+		CheckRedirect: func(_ *http.Request, _ []*http.Request) error {
+			return http.ErrUseLastResponse
+		},
+	}
+	originalTransport, originalTimeout := client.Transport, client.Timeout
+	dir := t.TempDir()
+	configPath := filepath.Join(dir, "daemon.yaml")
+	cfg := daemon.DefaultConfig()
+	cfg.Machine.ID = "redirect-client-test"
+	cfg.Orchestrator.URL = redirector.URL
+	cfg.Orchestrator.AuthToken = "rsp_live_redirect_test"
+	if err := daemon.WriteConfig(configPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	d := daemon.New(daemon.Options{
+		ConfigPath: configPath, JWTPath: filepath.Join(dir, "daemon.jwt"), SkipWizard: true,
+		OrchestratorHTTPClient: client,
+	})
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	if err := d.Start(ctx); err == nil {
+		_ = d.Stop(context.Background())
+		t.Fatal("redirect-refusing orchestrator client did not stop registration")
+	}
+	if got := redirectReceiverHits.Load(); got != 0 {
+		t.Fatalf("injected orchestrator client followed redirect: receiver hits=%d", got)
+	}
+	if client.Transport != originalTransport || client.Timeout != originalTimeout || client.CheckRedirect == nil {
+		t.Fatal("daemon cloned or mutated the caller-owned orchestrator client")
+	}
+
+	defaultDir := t.TempDir()
+	defaultConfigPath := filepath.Join(defaultDir, "daemon.yaml")
+	if err := daemon.WriteConfig(defaultConfigPath, cfg); err != nil {
+		t.Fatal(err)
+	}
+	defaultDaemon := daemon.New(daemon.Options{
+		ConfigPath: defaultConfigPath, JWTPath: filepath.Join(defaultDir, "daemon.jwt"), SkipWizard: true,
+	})
+	defaultCtx, defaultCancel := context.WithCancel(context.Background())
+	defer defaultCancel()
+	if err := defaultDaemon.Start(defaultCtx); err != nil {
+		t.Fatalf("nil client changed default redirect behavior: %v", err)
+	}
+	if err := defaultDaemon.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := redirectReceiverHits.Load(); got == 0 {
+		t.Fatal("nil orchestrator client no longer follows the generic default client's redirects")
 	}
 }
