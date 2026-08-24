@@ -36,8 +36,8 @@ const (
 	ModeShared = "shared"
 )
 
-// CloneStrategy selects the underlying git operation Provision uses
-// to materialize a worktree directory.
+// CloneStrategy selects the operation Provision uses to materialize a
+// workarea directory. The type name is retained for source compatibility.
 type CloneStrategy int
 
 const (
@@ -49,6 +49,9 @@ const (
 	// parent clone. Cheap and ideal when many sessions share a
 	// long-lived parent under the daemon's clone directory.
 	StrategyWorktreeAdd
+	// StrategyEmpty creates a fresh deterministic session directory without a
+	// git repository. It is reserved for genuinely repository-free work.
+	StrategyEmpty
 )
 
 // String returns a stable name for the strategy — used in log lines
@@ -59,6 +62,8 @@ func (s CloneStrategy) String() string {
 		return "clone"
 	case StrategyWorktreeAdd:
 		return "worktree-add"
+	case StrategyEmpty:
+		return "empty"
 	default:
 		return "unknown"
 	}
@@ -519,13 +524,13 @@ type ProvisionSpec struct {
 	// worktree-directory leaf name.
 	SessionID string
 	// RepoURL is the git URL (or local path) to clone from. Required
-	// for StrategyClone; may be empty for StrategyWorktreeAdd when
-	// ParentRepoPath is set.
+	// for StrategyClone, forbidden for StrategyEmpty, and may be empty for
+	// StrategyWorktreeAdd when ParentRepoPath is set.
 	RepoURL string
 	// Branch is the branch to check out. Empty falls back to the
 	// remote default branch.
 	Branch string
-	// Strategy selects clone vs worktree-add.
+	// Strategy selects clone, worktree-add, or repository-free materialization.
 	Strategy CloneStrategy
 	// ParentRepoPath is the existing parent clone for
 	// StrategyWorktreeAdd. Empty defaults to ParentDir/<repo-leaf>.
@@ -1482,15 +1487,14 @@ func (m *Manager) provisionLayoutOnce(
 	return paths, acquisition, nil
 }
 
-// provisionOnce runs one git invocation per spec.Strategy.
+// provisionOnce performs one materialization attempt for spec.Strategy.
 func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionSpec) error {
 	return m.provisionOnceWithReference(ctx, dst, spec, "")
 }
 
 func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath string) error {
 	if _, err := os.Stat(dst); err == nil {
-		// Path exists. For StrategyWorktreeAdd this is a conflict;
-		// for StrategyClone too. Either way, surface as conflict.
+		// Every strategy requires exclusive ownership of the destination.
 		return fmt.Errorf("destination already exists: %s", dst)
 	}
 	if err := os.MkdirAll(filepath.Dir(dst), 0o750); err != nil {
@@ -1498,6 +1502,17 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 	}
 
 	switch spec.Strategy {
+	case StrategyEmpty:
+		if spec.RepoURL != "" {
+			return errors.New("RepoURL must be empty for StrategyEmpty")
+		}
+		if spec.ParentRepoPath != "" || referencePath != "" || len(spec.SparsePaths) > 0 {
+			return errors.New("git parent, reference, and sparse paths are invalid for StrategyEmpty")
+		}
+		if err := os.Mkdir(dst, 0o750); err != nil {
+			return fmt.Errorf("create empty workarea: %w", err)
+		}
+		return nil
 	case StrategyClone:
 		if spec.RepoURL == "" {
 			return errors.New("RepoURL required for StrategyClone")

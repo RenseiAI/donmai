@@ -19,11 +19,36 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
+
+func TestWorktreeProvisionStrategyRepositoryFreeOnly(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		work QueuedWork
+		want worktree.CloneStrategy
+	}{
+		{name: "repository free", work: QueuedWork{}, want: worktree.StrategyEmpty},
+		{name: "repository clone", work: QueuedWork{QueuedWork: prompt.QueuedWork{Repository: "https://example.test/repository.git"}}, want: worktree.StrategyClone},
+		{name: "versioned declaration", work: QueuedWork{RepositoryDeclaration: &workarea.RepositoryDeclarationV1{}}, want: worktree.StrategyClone},
+		{name: "shared participant", work: QueuedWork{WorkareaMode: worktree.ModeShared}, want: worktree.StrategyClone},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := worktreeProvisionStrategy(test.work); got != test.want {
+				t.Fatalf("worktreeProvisionStrategy() = %s, want %s", got, test.want)
+			}
+		})
+	}
+}
 
 // TestLoop_EventsMirroredToJSONL confirms every event the provider
 // emits is appended to <worktree>/.agent/events.jsonl as a discrete

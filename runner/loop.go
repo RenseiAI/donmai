@@ -46,6 +46,13 @@ func termCastPath(wpath string) string {
 	return filepath.Join(wpath, state.AgentDirName, "term.cast")
 }
 
+func worktreeProvisionStrategy(qw QueuedWork) worktree.CloneStrategy {
+	if qw.Repository == "" && qw.RepositoryDeclaration == nil && qw.WorkareaMode != worktree.ModeShared {
+		return worktree.StrategyEmpty
+	}
+	return worktree.StrategyClone
+}
+
 // runLoop drives the per-session orchestration steps in F.1.1 §4
 // order. Returns the in-progress Result (always non-nil) plus a
 // terminal err the caller may surface.
@@ -209,12 +216,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	} else if branch == "" {
 		branch = "agent/" + qw.SessionID
 	}
+	provisionStrategy := worktreeProvisionStrategy(qw)
 	wpath, err := r.wt.Provision(ctx, worktree.ProvisionSpec{
 		SessionID:             qw.SessionID,
 		RepoURL:               qw.Repository,
 		Branch:                refBranch,
 		SourceRef:             qw.Ref,
-		Strategy:              worktree.StrategyClone,
+		Strategy:              provisionStrategy,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
 		Mode:                  qw.WorkareaMode,
@@ -267,6 +275,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// provisioning at an existing ref — that ref IS the working branch).
 	selectedRepositoryMutable := !selectedRepositoryReadOnly
 	switch {
+	case provisionStrategy == worktree.StrategyEmpty:
+		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
 		for _, repository := range repositoryDeclaration.Repositories {
 			if repository.Authority != workarea.RepositoryMutable {
@@ -1303,14 +1313,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// fatal — the platform degrades headSha-less exit events to its
 	// timeout/reconciliation path. Background ctx so a cancelled run
 	// ctx does not lose the capture.
-	shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
-	if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
-		r.logger.Warn("head commit capture failed",
-			"sessionId", qw.SessionID, "err", shaErr)
-	} else {
-		res.CommitSHA = sha
+	if provisionStrategy != worktree.StrategyEmpty {
+		shaCtx, shaCancel := context.WithTimeout(context.Background(), 10*time.Second)
+		if sha, shaErr := captureHeadSHA(shaCtx, wpath); shaErr != nil {
+			r.logger.Warn("head commit capture failed",
+				"sessionId", qw.SessionID, "err", shaErr)
+		} else {
+			res.CommitSHA = sha
+		}
+		shaCancel()
 	}
-	shaCancel()
 
 	// 12. Finalise the Result envelope. Status defaults to
 	// "completed" when no failure mode was set; otherwise the

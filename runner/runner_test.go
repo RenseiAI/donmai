@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -147,6 +148,31 @@ func TestRun_HappyPath_StubProvider(t *testing.T) {
 	}
 	if want := strings.TrimSpace(headOut); res.CommitSHA != want {
 		t.Errorf("CommitSHA = %q; want worktree HEAD %q", res.CommitSHA, want)
+	}
+}
+
+func TestRun_RepositoryFreeUsesEmptyWorkarea(t *testing.T) {
+	h := newRunnerHarness(t)
+	qw := h.queuedWork("REPOSITORY-FREE")
+	qw.Repository = ""
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q; want completed (FailureMode=%q, Error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if res.WorktreePath == "" || res.WorkareaRoot != res.WorktreePath {
+		t.Fatalf("repository-free paths = root %q cwd %q; want one flat workarea", res.WorkareaRoot, res.WorktreePath)
+	}
+	if _, err := os.Stat(filepath.Join(res.WorktreePath, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("repository-free workarea contains git metadata: %v", err)
+	}
+	if res.CommitSHA != "" {
+		t.Fatalf("repository-free CommitSHA = %q, want empty", res.CommitSHA)
 	}
 }
 

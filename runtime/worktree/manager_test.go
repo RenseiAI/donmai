@@ -87,6 +87,64 @@ func TestProvisionCloneSuccess(t *testing.T) {
 	}
 }
 
+func TestProvisionEmptySuccess(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	runner := newStubRunner()
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "repository-free",
+		Strategy:  worktree.StrategyEmpty,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if path != filepath.Join(dir, "repository-free") {
+		t.Fatalf("path = %q, want %q", path, filepath.Join(dir, "repository-free"))
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatalf("read empty workarea: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("empty workarea contains %d entries", len(entries))
+	}
+	if got := runner.calls.Load(); got != 0 {
+		t.Fatalf("empty workarea invoked git %d time(s)", got)
+	}
+	if got, err := m.Path("repository-free"); err != nil || got != path {
+		t.Fatalf("Path = %q, %v; want %q", got, err, path)
+	}
+	if err := m.Teardown(context.Background(), "repository-free"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty workarea remains after teardown: %v", err)
+	}
+}
+
+func TestProvisionEmptyRejectsRepository(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "not-empty",
+		RepoURL:   "https://example.test/repository.git",
+		Strategy:  worktree.StrategyEmpty,
+	})
+	if err == nil || !strings.Contains(err.Error(), "RepoURL must be empty") {
+		t.Fatalf("Provision error = %v, want repository refusal", err)
+	}
+}
+
 func TestProvisionRetryThenSucceed(t *testing.T) {
 	t.Parallel()
 
