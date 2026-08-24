@@ -87,6 +87,78 @@ func TestProvisionCloneSuccess(t *testing.T) {
 	}
 }
 
+func TestProvisionEmptySuccess(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	runner := newStubRunner()
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "repository-free",
+		Strategy:  worktree.StrategyEmpty,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if path != filepath.Join(dir, "repository-free") {
+		t.Fatalf("path = %q, want %q", path, filepath.Join(dir, "repository-free"))
+	}
+	entries, err := os.ReadDir(path)
+	if err != nil {
+		t.Fatalf("read empty workarea: %v", err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("empty workarea contains %d entries", len(entries))
+	}
+	if got := runner.calls.Load(); got != 0 {
+		t.Fatalf("empty workarea invoked git %d time(s)", got)
+	}
+	if got, err := m.Path("repository-free"); err != nil || got != path {
+		t.Fatalf("Path = %q, %v; want %q", got, err, path)
+	}
+	if err := m.Teardown(context.Background(), "repository-free"); err != nil {
+		t.Fatalf("Teardown: %v", err)
+	}
+	if _, err := os.Stat(path); !os.IsNotExist(err) {
+		t.Fatalf("empty workarea remains after teardown: %v", err)
+	}
+}
+
+func TestProvisionEmptyRejectsRepositoryProvenance(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name string
+		spec worktree.ProvisionSpec
+		want string
+	}{
+		{name: "repository", spec: worktree.ProvisionSpec{RepoURL: "https://example.test/repository.git"}, want: "RepoURL must be empty"},
+		{name: "parent repository", spec: worktree.ProvisionSpec{ParentRepoPath: "/tmp/parent"}, want: "git parent, reference, and sparse paths"},
+		{name: "branch", spec: worktree.ProvisionSpec{Branch: "main"}, want: "repository provenance"},
+		{name: "source ref", spec: worktree.ProvisionSpec{SourceRef: "main"}, want: "repository provenance"},
+		{name: "cache seed", spec: worktree.ProvisionSpec{CacheSeedID: "seed-one"}, want: "repository provenance"},
+		{name: "sparse paths", spec: worktree.ProvisionSpec{SparsePaths: []string{"src"}}, want: "git parent, reference, and sparse paths"},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			test.spec.SessionID = "not-empty"
+			test.spec.Strategy = worktree.StrategyEmpty
+			_, err = m.Provision(context.Background(), test.spec)
+			if err == nil || !strings.Contains(err.Error(), test.want) {
+				t.Fatalf("Provision error = %v, want %q refusal", err, test.want)
+			}
+		})
+	}
+}
+
 func TestProvisionRetryThenSucceed(t *testing.T) {
 	t.Parallel()
 

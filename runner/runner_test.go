@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
@@ -147,6 +148,81 @@ func TestRun_HappyPath_StubProvider(t *testing.T) {
 	}
 	if want := strings.TrimSpace(headOut); res.CommitSHA != want {
 		t.Errorf("CommitSHA = %q; want worktree HEAD %q", res.CommitSHA, want)
+	}
+}
+
+func TestRun_RepositoryFreeUsesEmptyWorkarea(t *testing.T) {
+	h := newRunnerHarness(t)
+	qw := h.queuedWork("REPOSITORY-FREE")
+	qw.Repository = ""
+	qw.Ref = "main"
+	qw.Branch = "existing-branch-metadata"
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q; want completed (FailureMode=%q, Error=%q)", res.Status, res.FailureMode, res.Error)
+	}
+	if res.WorktreePath == "" || res.WorkareaRoot != res.WorktreePath {
+		t.Fatalf("repository-free paths = root %q cwd %q; want one flat workarea", res.WorkareaRoot, res.WorktreePath)
+	}
+	if _, err := os.Stat(filepath.Join(res.WorktreePath, ".git")); !os.IsNotExist(err) {
+		t.Fatalf("repository-free workarea contains git metadata: %v", err)
+	}
+	if res.CommitSHA != "" {
+		t.Fatalf("repository-free CommitSHA = %q, want empty", res.CommitSHA)
+	}
+}
+
+func TestRun_RepositoryFreeDisablesVCRecovery(t *testing.T) {
+	h := newRunnerHarness(t)
+	h.runner.skipSteering = false
+	h.runner.skipBackstop = false
+
+	fakeBin := t.TempDir()
+	marker := filepath.Join(t.TempDir(), "vc-command-ran")
+	t.Setenv("REPOSITORY_FREE_COMMAND_MARKER", marker)
+	command := []byte("#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$REPOSITORY_FREE_COMMAND_MARKER\"\nexit 97\n")
+	for _, name := range []string{"git", "gh"} {
+		path := filepath.Join(fakeBin, name)
+		if err := os.WriteFile(path, command, 0o600); err != nil {
+			t.Fatalf("write fake %s: %v", name, err)
+		}
+		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // owner-only test fixture must be executable
+			t.Fatalf("chmod fake %s: %v", name, err)
+		}
+	}
+	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
+
+	qw := h.queuedWork("REPOSITORY-FREE-RECOVERY")
+	qw.Repository = ""
+	qw.ResolvedProfile.ProviderConfig = map[string]any{"stub.behavior": string(stub.BehaviorSilentFail)}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, _ := h.runner.Run(ctx, qw)
+	if res == nil {
+		t.Fatal("Run returned nil result")
+	}
+	if res.PullRequestURL != "" {
+		t.Fatalf("repository-free PullRequestURL = %q, want empty", res.PullRequestURL)
+	}
+	if res.SteeringTriggered {
+		t.Fatal("repository-free run triggered tail steering")
+	}
+	if res.BackstopReport != nil {
+		t.Fatalf("repository-free run produced backstop report: %+v", res.BackstopReport)
+	}
+	if res.CommitSHA != "" {
+		t.Fatalf("repository-free CommitSHA = %q, want empty", res.CommitSHA)
+	}
+	if body, err := os.ReadFile(marker); err == nil {
+		t.Fatalf("repository-free run invoked a VC command: %s", body)
+	} else if !os.IsNotExist(err) {
+		t.Fatalf("read VC command marker: %v", err)
 	}
 }
 
