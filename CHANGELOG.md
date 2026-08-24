@@ -8,11 +8,68 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.6 — 2026-08-24
+
+_v0.68.5 published its versioned worker image and E2B target, but the binary
+publisher stopped in mandatory smoke before creating a GitHub release or
+updating Homebrew. This patch repairs that startup failure and carries the
+binary release forward._
+
+### Features
+
+- **Linear issues can move between projects without replacement records.** The
+  update command resolves a destination project by name, slug, or UUID within
+  the issue team, composes project and status in one mutation, and reports the
+  resulting project while preserving every unspecified issue field. (#387)
+- **Negotiated session-root workareas are active.** Versioned workarea client
+  projections expose the root, selected repository working directory, and
+  repository metadata for multi-repository workareas while preserving existing
+  flat layouts and released client types. (#384)
+- **Durable session-shim recovery requires proof-v2 authority.** New admission
+  binds the exact proof capability, bearer, receipt, PTY epoch, and cursor.
+  Consumed recovery reuses the original bearer, candidate, and staged Snapshot
+  without issuing a second one. (#395)
+
 ### Fixes
 
-- **Hosts without a daemon config start cleanly.** Startup now treats the
-  documented missing-config result as an empty workarea archive setting instead
-  of dereferencing it before the first-run defaults can take effect.
+- **Daemon startup handles missing and invalid config before recovery
+  authority.** A missing config uses the documented empty archive setting,
+  while read, parse, or validation errors return before lease recovery, replay,
+  or reaper authority is constructed. (#401, #404)
+- **Release tags require authorized creation, immutable refs, and verified
+  signatures.** Binary, worker-image, and E2B-template publishers fail before
+  build unless the required protection rules are active and GitHub verifies
+  the annotated tag signature at its exact commit. (#388)
+- **Restored archived workareas validate repository metadata.** Restore derives
+  selected and repository paths from the copied, digest-verified declaration.
+  Unsafe leaves, paths outside the restored session root, and manifest or
+  declaration mismatches are rejected before publication. (#392)
+- **Attach v2 preserves the released omitted-field resume shape.** Callers that
+  omit both proof schema and authority retain the frozen proof-v1
+  `same_handoff` behavior. Supplying only one field, or an unknown explicit
+  value, remains a closed validation error. (#398)
+- **Proof-v2 readiness is resolved at every new-work edge.** Claim polling,
+  direct admission, and carrier activation each re-read all five durable
+  readiness facts. A withdrawal enters the existing recovering, zero-capacity,
+  heartbeat-acknowledged reopen path. (#398)
+- **Selected-v3 recovery releases buffered PTY progress only after a durable
+  acknowledgement advances.** Equal, ahead, failed-persistence, and timed-out
+  Heartbeats cannot open the Hello output barrier. A successful durable put
+  opens it before the reply write so a lost response cannot deadlock locally
+  committed recovery. (#398)
+
+### Chores
+
+- **Parallel poll tests no longer race on process-global log capture.** The
+  daemon fixture serializes temporary default-logger use and restores the prior
+  logger after each control. (#385)
+- **GitHub workflows declare least-privilege permissions.** Workflow and job
+  token grants are explicit for code scanning, publishing, and read-only
+  verification lanes. (#386)
+- **Release preparation verifies the configured SSH signing key before tag
+  push.** The preflight confirms that the key is registered to the active
+  GitHub account and verifies the candidate tag with a pinned OpenSSH verifier.
+  (#394)
 
 ## v0.68.5 — 2026-08-23
 
