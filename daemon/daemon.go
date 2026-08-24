@@ -781,6 +781,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.config = cfg
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return err
+	}
 
 	// Detect substrate capabilities before registration so they can be
 	// included in the provides[] array on POST /api/workers/register.

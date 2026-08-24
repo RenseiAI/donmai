@@ -140,6 +140,7 @@ func TestOnAdoptionSnapshotDoesNotReplayOrdinaryFramesBeforeActivation(t *testin
 			EnableAdoption: true, RegistryDir: f.registry,
 			HostID: "host-large-replay", RequireAuthoritativeSnapshot: true,
 			RequireCredentialAttestation: true,
+			GetCarrierProofV2Readiness:   testSessionShimProofV2Readiness,
 			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{
@@ -366,6 +367,7 @@ func (r *shimEventRecorder) output(id sessionshim.Identity) (string, uint64) {
 func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string) {
 	t.Helper()
 	d.opts.SessionShim.RequireCredentialAttestation = true
+	d.opts.SessionShim.GetCarrierProofV2Readiness = testSessionShimProofV2Readiness
 	d.opts.SessionShim.AttestationCapabilities = RequiredSessionShimHostCapabilities()
 	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
 		d.opts.SessionShim,
@@ -1342,6 +1344,7 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 			HostID:                       "host-startup",
 			RequireAuthoritativeSnapshot: true,
 			RequireCredentialAttestation: true,
+			GetCarrierProofV2Readiness:   testSessionShimProofV2Readiness,
 			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				return sessionshim.PreparedAdoption{

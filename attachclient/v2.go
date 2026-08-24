@@ -61,11 +61,30 @@ const (
 	V2ResumeActive V2ResumeState = "active"
 )
 
+// V2ResumeAuthority identifies why an already-retained carrier may reconnect.
+// It is explicit so a proof-v1 token can never drift into a fresh admission and
+// a changed controller can never equal-active rebind an old carrier.
+type V2ResumeAuthority string
+
+const (
+	// V2ResumeSameHandoff is exact replay/drain of the original controller
+	// handoff. It is the only authority accepted with the frozen proof-v1 claim
+	// profile.
+	V2ResumeSameHandoff V2ResumeAuthority = "same_handoff"
+	// V2ResumeAdoptedCandidateRecovery rehydrates a proof-v2 candidate whose
+	// proof and Snapshot receipt were already consumed by adoption. It may cross
+	// arbitrary controller generations but reuses the exact original bearer,
+	// jti, candidate epoch, staged Snapshot, and cursor.
+	V2ResumeAdoptedCandidateRecovery V2ResumeAuthority = "adopted_candidate_recovery"
+)
+
 // V2ResumeDisposition carries only the exact non-secret evidence needed to
 // reconnect the already-prepared equal carrier inside the current composing
-// daemon without generating another mandatory Snapshot. It is not replacement-
-// daemon adoption authority: a replacement controller id/generation performs a
-// fresh prepare and the ordinary mandatory-Snapshot path.
+// daemon without generating another mandatory Snapshot. Authority says whether
+// this is exact same-handoff replay/drain or server-resolved recovery after the
+// original proof/receipt adoption consume. An already-active carrier under a
+// changed controller never uses this type: it reserves a strictly higher
+// proof-v2 candidate and follows the full mandatory-Snapshot pipeline.
 //
 // For receipt_stored, AckSeq is the pre-staged daemon/shim cursor while
 // CandidateSnapshotSeq and CandidateSnapshot identify the already-journaled
@@ -77,6 +96,8 @@ const (
 // and CarrierEpoch must exactly equal the authenticated token claims in both
 // states. For active, candidate-specific fields are absent.
 type V2ResumeDisposition struct {
+	ProofSchemaVersion   V2ProofSchemaVersion
+	Authority            V2ResumeAuthority
 	State                V2ResumeState
 	PTYEpoch             uint64
 	CarrierEpoch         uint64
@@ -129,9 +150,35 @@ func cloneV2ResumeDisposition(in V2ResumeDisposition) V2ResumeDisposition {
 	return in
 }
 
+// Format prevents the retained raw Snapshot from reaching logs while keeping
+// the bounded non-secret resume comparison fields visible.
+func (r V2ResumeDisposition) Format(state fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(state,
+		"{proofSchema:%s authority:%s state:%s ptyEpoch:%d carrierEpoch:%d ackSeq:%d candidateSnapshotSeq:%d gap:%d..%d/%s <redacted-snapshot>}",
+		r.ProofSchemaVersion, r.Authority, r.State, r.PTYEpoch, r.CarrierEpoch, r.AckSeq,
+		r.CandidateSnapshotSeq, r.GapFromSeq, r.GapToSeq, r.GapReason)
+}
+
+// Validate checks the exact closed resume shape without dialing or exposing
+// credential material. Composing recovery seams use it before retaining a
+// disposition for later DialV2HostCandidate.
+func (r V2ResumeDisposition) Validate() error { return validateV2ResumeDisposition(r) }
+
 func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 	if resume.CarrierEpoch == 0 {
 		return errors.New("attachclient: v2 resume carrier epoch is required")
+	}
+	if resume.ProofSchemaVersion != V2ProofSchemaV1 && resume.ProofSchemaVersion != V2ProofSchemaV2 {
+		return errors.New("attachclient: v2 resume proof schema version is required")
+	}
+	if resume.Authority != V2ResumeSameHandoff && resume.Authority != V2ResumeAdoptedCandidateRecovery {
+		return errors.New("attachclient: v2 resume authority is required")
+	}
+	if resume.ProofSchemaVersion == V2ProofSchemaV1 && resume.Authority != V2ResumeSameHandoff {
+		return errors.New("attachclient: retained proof-v1 is exact same-handoff replay/drain only")
+	}
+	if resume.Authority == V2ResumeAdoptedCandidateRecovery && resume.State != V2ResumeReceiptStored {
+		return errors.New("attachclient: adopted-candidate recovery requires receipt-stored state")
 	}
 	switch resume.State {
 	case V2ResumeActive:
@@ -286,12 +333,18 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 
 func validateV2ProofDisposition(claims v2HostClaims, cfg V2HostConfig) error {
 	if cfg.ResumeDisposition == nil {
+		if claims.ProofSchemaVersion != V2ProofSchemaV2 {
+			return errors.New("attachclient: fresh v2 candidate requires proof schema v2")
+		}
 		if cfg.DurableHighWater != claims.CarrierBoundary {
 			return errors.New("attachclient: v2 durable high-water does not match signed carrier boundary")
 		}
 		return nil
 	}
 	resume := *cfg.ResumeDisposition
+	if resume.ProofSchemaVersion != claims.ProofSchemaVersion {
+		return errors.New("attachclient: v2 resume proof schema does not match the original bearer")
+	}
 	switch resume.State {
 	case V2ResumeReceiptStored:
 		if resume.AckSeq != claims.CarrierBoundary ||
