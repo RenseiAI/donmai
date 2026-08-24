@@ -441,6 +441,8 @@ func TestV2ActiveResumeKeepsAuthorityClosedUntilLocalPublication(t *testing.T) {
 
 func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *testing.T) {
 	snapshot := v2ResumeSnapshot(12)
+	carrierActiveConsumed := make(chan struct{})
+	releaseServer := make(chan struct{})
 	serverErr := make(chan error, 1)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
@@ -470,9 +472,19 @@ func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *test
 			serverErr <- err
 			return
 		}
+		// Keep the leg open until Activate has consumed the exact acknowledgement.
+		// Closing immediately after Write races the client's read loop and turns a
+		// successful carrier_active into an EOF.
+		select {
+		case <-carrierActiveConsumed:
+		case <-releaseServer:
+			serverErr <- errors.New("client did not consume exact carrier_active")
+			return
+		}
 		serverErr <- nil
 	}))
-	defer server.Close()
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(releaseServer) })
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
@@ -502,11 +514,111 @@ func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *test
 	if err := candidate.SendCandidateSnapshot(ctx, snapshot.Encode()); err == nil {
 		t.Fatal("receipt-stored resume resent its staged Snapshot")
 	}
-	if ack, err := candidate.Activate(ctx); err != nil || ack != 12 {
+	ack, err := candidate.Activate(ctx)
+	if err != nil {
 		t.Fatalf("receipt-stored resume = %d, %v", ack, err)
+	}
+	close(carrierActiveConsumed)
+	if ack != 12 {
+		t.Fatalf("receipt-stored resume acknowledgement = %d, want 12", ack)
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestV2ReceiptStoredResumeRequiresExactCarrierActive(t *testing.T) {
+	snapshot := v2ResumeSnapshot(12)
+	for _, test := range []struct {
+		name   string
+		active *attachwirev2.CarrierActive
+	}{
+		{name: "omitted"},
+		{name: "wrong cursor", active: &attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 11}},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			carrierActiveRejected := make(chan struct{})
+			releaseServer := make(chan struct{})
+			serverErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				defer conn.CloseNow() //nolint:errcheck
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				frame, _, err := readV2TestFrame(ctx, conn)
+				message, controlErr := v2ControlFromFrame(frame)
+				if err != nil || controlErr != nil || message.ControlType() != attachwire.CtrlSubscribe {
+					serverErr <- fmt.Errorf("pending resume first frame = %T/%v/%v", message, err, controlErr)
+					return
+				}
+				frame, _, err = readV2TestFrame(ctx, conn)
+				message, controlErr = v2ControlFromFrame(frame)
+				if err != nil || controlErr != nil || message.ControlType() != attachwirev2.CtrlCarrierActivate {
+					serverErr <- fmt.Errorf("pending resume activation frame = %T/%v/%v", message, err, controlErr)
+					return
+				}
+				if test.active != nil {
+					active, err := attachwirev2.BuildControlFrame(*test.active)
+					if err != nil {
+						serverErr <- err
+						return
+					}
+					if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+						serverErr <- err
+						return
+					}
+					select {
+					case <-carrierActiveRejected:
+					case <-releaseServer:
+						serverErr <- errors.New("client did not reject wrong carrier_active")
+						return
+					}
+				}
+				serverErr <- nil
+			}))
+			t.Cleanup(server.Close)
+			t.Cleanup(func() { close(releaseServer) })
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+				AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+				TokenSource: func(context.Context) (string, error) {
+					return v2TestToken(t, func(claims map[string]any) {
+						claims["carrier_boundary"] = "10"
+						claims["resolved_boundary"] = "11"
+						claims["last_host_seq"] = "11"
+					}), nil
+				},
+				ResumeDisposition: &V2ResumeDisposition{
+					ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+					State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
+					CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
+					GapFromSeq: 11, GapToSeq: 11, GapReason: attachwirev2.GapControllerUnforwarded,
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer candidate.Close() //nolint:errcheck
+			ack, err := candidate.Activate(ctx)
+			if err == nil {
+				t.Fatalf("receipt-stored resume accepted %s carrier_active with acknowledgement %d", test.name, ack)
+			}
+			if test.active != nil {
+				if !strings.Contains(err.Error(), "carrier_active cursor is outside the exact sent stream") {
+					t.Fatalf("wrong carrier_active error = %v", err)
+				}
+				close(carrierActiveRejected)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
