@@ -19,7 +19,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   callbacks.** `SessionShimConfig` rechecks all five readiness facts before
   polling, preparation, and activation. Consumed-adoption recovery carries its
   retained candidate through batch publication and `carrier_active` without a
-  second proof, receipt, Snapshot, or cursor. (#393)
+  second proof, receipt, Snapshot, or cursor. Its exact persisted Heartbeat(H)
+  releases the selected-v3 Hello output barrier; queued H+1 progress remains
+  local beforehand and then flows in canonical order. (#393)
 
 ## v0.68.4 — 2026-08-23
 

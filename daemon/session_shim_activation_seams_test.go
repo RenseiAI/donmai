@@ -9,6 +9,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"path/filepath"
 	"reflect"
 	"slices"
@@ -22,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -785,6 +787,301 @@ func TestAdoptedCandidateRecoveryPublishesAndActivatesWithoutSecondSnapshot(t *t
 	}
 	if err := replacement.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("after-recovery\r")); err != nil {
 		t.Fatalf("post-activation input: %v", err)
+	}
+}
+
+func TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "donmai-retained-stage-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-retained-stage", SessionID: "session-retained-stage"}
+	shim, err := sessionshim.Start(sessionshim.Options{
+		Identity: id, Registry: registry, ProcessEpoch: 7,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		WorkareaPath: filepath.Join(dir, "workarea"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	if err := shim.Session().EmitMarker("pre-stage-proof-boundary"); err != nil {
+		t.Fatal(err)
+	}
+
+	first, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
+		Registry: registry, ControllerID: "first-controller", RequireFullHostFrames: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(first.Adopted) != 1 {
+		t.Fatalf("first adopted = %d", len(first.Adopted))
+	}
+	firstController := first.Adopted[0]
+	var preStageAck uint64
+	select {
+	case event := <-firstController.Events():
+		if event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeMarker || event.Seq == 0 {
+			t.Fatalf("first proof-boundary frame = %+v", event)
+		}
+		preStageAck = event.Seq
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not receive proof-boundary Marker")
+	}
+	if err := firstController.Heartbeat(preStageAck); err != nil {
+		t.Fatalf("persist pre-stage proof boundary: %v", err)
+	}
+	retainedSnapshot, inStream, err := shim.Session().EmitSnapshot()
+	if err != nil || !inStream || retainedSnapshot.Seq != preStageAck+1 {
+		t.Fatalf("retained Snapshot = %+v inStream:%v err:%v", retainedSnapshot, inStream, err)
+	}
+	highWater := retainedSnapshot.Seq
+	select {
+	case event := <-firstController.Events():
+		if event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeSnapshot ||
+			event.Seq != highWater || !bytes.Equal(event.FrameBytes, retainedSnapshot.Encode()) {
+			t.Fatalf("retained Snapshot frame = %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not receive retained Snapshot")
+	}
+	first.Close()
+
+	readAck := func() uint64 {
+		t.Helper()
+		entries, err := os.ReadDir(filepath.Join(dir, "registry"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".ack") {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, "registry", entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ack struct {
+				AckedSeq uint64 `json:"ackedSeq"`
+			}
+			if err := json.Unmarshal(raw, &ack); err != nil {
+				t.Fatal(err)
+			}
+			return ack.AckedSeq
+		}
+		t.Fatal("durable ACK sidecar is missing")
+		return 0
+	}
+	if ack := readAck(); ack != preStageAck {
+		t.Fatalf("pre-stage durable ACK = %d, want %d", ack, preStageAck)
+	}
+
+	type emitAttemptResult struct {
+		name string
+		err  error
+	}
+	cloneEvent := func(event sessionshim.ControllerEvent) sessionshim.ControllerEvent {
+		event.Data = append([]byte(nil), event.Data...)
+		event.FrameBytes = append([]byte(nil), event.FrameBytes...)
+		return event
+	}
+	var (
+		externalMu     sync.Mutex
+		durableFrames  []sessionshim.ControllerEvent
+		observedFrames []sessionshim.ControllerEvent
+		retained       SessionShimCarrierActivationReceipt
+		replacement    *Daemon
+		attemptOnce    sync.Once
+		attempts       = make(chan emitAttemptResult, 3)
+		resizeDone     = make(chan struct{})
+		outputWritten  = make(chan struct{})
+	)
+	replacement = New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: filepath.Join(dir, "registry"),
+		ControllerID: "replacement-controller", HostID: "stable-retained-host",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			if preparation.ProcessEpoch != 7 || preparation.LastHostSeq != highWater {
+				return SessionShimAdoptionPreparationResult{}, fmt.Errorf("replacement preparation = %+v", preparation)
+			}
+			credential, err := attachclient.NewV2RetainedCredential([]byte("retained-stage-bearer"))
+			if err != nil {
+				return SessionShimAdoptionPreparationResult{}, err
+			}
+			correlation, err := NewSessionShimRecoveryCorrelation([]byte("retained-stage-correlation"))
+			if err != nil {
+				return SessionShimAdoptionPreparationResult{}, err
+			}
+			attemptOnce.Do(func() {
+				go func() {
+					err := shim.Session().Resize(113, 41, 0, 0)
+					attempts <- emitAttemptResult{name: "resize", err: err}
+					close(resizeDone)
+				}()
+				go func() {
+					<-resizeDone
+					_, err := shim.Session().WriteInput([]byte("preactive-output\n"))
+					attempts <- emitAttemptResult{name: "output", err: err}
+					close(outputWritten)
+				}()
+				go func() {
+					<-outputWritten
+					deadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(deadline) {
+						_, last, snapshotErr := shim.Session().Snapshot()
+						if snapshotErr != nil {
+							attempts <- emitAttemptResult{name: "marker", err: snapshotErr}
+							return
+						}
+						if uint64(last) >= highWater+2 {
+							attempts <- emitAttemptResult{name: "marker", err: shim.Session().EmitMarker("preactive-marker")}
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+					attempts <- emitAttemptResult{name: "marker", err: errors.New("output did not allocate before marker deadline")}
+				}()
+			})
+			resumeFrom := highWater + 1
+			return SessionShimAdoptionPreparationResult{
+				State: SessionShimPreparationAdoptedCandidateRecovery,
+				PreparedAdoption: sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions: shimwire.Extensions{
+						Required: []string{shimwire.ExtCarrierEpoch},
+						Values:   map[string]string{shimwire.ExtCarrierEpoch: "53"},
+					},
+					ResumeFrom: &resumeFrom,
+				},
+				AdoptedCandidateRecovery: &SessionShimAdoptedCandidateRecovery{
+					Credential: credential, RecoveryCorrelation: correlation,
+					CarrierEpoch: 53, PreStageAckSeq: highWater - 1,
+					StagedHighWater: highWater, ResumeFrom: resumeFrom,
+					CredentialExpiresAt: time.Now().Add(time.Hour),
+					ResumeDisposition: attachclient.V2ResumeDisposition{
+						ProofSchemaVersion: attachclient.V2ProofSchemaV2,
+						Authority:          attachclient.V2ResumeAdoptedCandidateRecovery,
+						State:              attachclient.V2ResumeReceiptStored,
+						PTYEpoch:           7, CarrierEpoch: 53, AckSeq: highWater - 1,
+						CandidateSnapshotSeq: highWater, CandidateSnapshot: retainedSnapshot.Encode(),
+					},
+				},
+			}, nil
+		},
+		OnAdoptionV2: func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			return SessionShimAdoptionReceipt{DurableCorrelation: []byte("retained-stage-adoption")}, nil
+		},
+		OnSessionEvent: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) {
+			externalMu.Lock()
+			observedFrames = append(observedFrames, cloneEvent(event))
+			externalMu.Unlock()
+		},
+		OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+			externalMu.Lock()
+			durableFrames = append(durableFrames, cloneEvent(event))
+			externalMu.Unlock()
+			return nil
+		},
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			if len(batch.Adopted) != 1 || batch.Adopted[0].RetainedCarrierActivation == nil {
+				return SessionShimAdoptionBatchReceipt{}, errors.New("retained activation missing from batch")
+			}
+			retained = *batch.Adopted[0].RetainedCarrierActivation
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("retained-stage-batch"), AdoptionRevision: "retained-stage-revision",
+			}, nil
+		},
+		OnAdoptionPublished: func(_ context.Context, _ SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			time.Sleep(100 * time.Millisecond)
+			externalMu.Lock()
+			externalCount := len(durableFrames) + len(observedFrames)
+			externalMu.Unlock()
+			_, lastSeq, snapshotErr := shim.Session().Snapshot()
+			if snapshotErr != nil {
+				return nil, snapshotErr
+			}
+			if len(attempts) != 0 || uint64(lastSeq) != highWater || externalCount != 0 ||
+				replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID) != highWater || readAck() != preStageAck {
+				return nil, fmt.Errorf("pre-active effects = completed:%d last:%d external:%d forwarded:%d ack:%d",
+					len(attempts), lastSeq, externalCount, replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID), readAck())
+			}
+			return []SessionShimCarrierActivationReceipt{retained}, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, replacement, id.OrgID)
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("replacement adoption: %v", err)
+	}
+	completedAttempts := make(map[string]error, 3)
+	for len(completedAttempts) < 3 {
+		select {
+		case result := <-attempts:
+			completedAttempts[result.name] = result.err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("pre-active emit attempts completed = %+v", completedAttempts)
+		}
+	}
+	for name, err := range completedAttempts {
+		if err != nil {
+			t.Fatalf("%s attempt after activation: %v", name, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		externalMu.Lock()
+		complete := len(durableFrames) >= 3 && durableFrames[len(durableFrames)-1].FrameType == attachwire.TypeMarker
+		externalMu.Unlock()
+		if complete {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	externalMu.Lock()
+	durable := append([]sessionshim.ControllerEvent(nil), durableFrames...)
+	observed := append([]sessionshim.ControllerEvent(nil), observedFrames...)
+	externalMu.Unlock()
+	if len(durable) < 3 || len(observed) != len(durable) || durable[0].FrameType != attachwire.TypeResize ||
+		durable[len(durable)-1].FrameType != attachwire.TypeMarker {
+		t.Fatalf("post-active frame order = durable:%+v observed:%+v", durable, observed)
+	}
+	sawOutput := false
+	for i := range durable {
+		if !bytes.Equal(observed[i].FrameBytes, durable[i].FrameBytes) || durable[i].Seq != highWater+1+uint64(i) {
+			t.Fatalf("post-active frame %d changed: durable=%+v observed=%+v", i, durable[i], observed[i])
+		}
+		if durable[i].FrameType == attachwire.TypeSnapshot || durable[i].FrameType == attachwire.TypeExit {
+			t.Fatalf("forbidden frame crossed activation: %+v", durable[i])
+		}
+		if durable[i].FrameType == attachwire.TypeOutput && bytes.Contains(durable[i].Data, []byte("ack:preactive-output")) {
+			sawOutput = true
+		}
+	}
+	if !sawOutput {
+		t.Fatalf("post-active frames omitted PTY Output: %+v", durable)
+	}
+	wantFinal := highWater + uint64(len(durable))
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID) == wantFinal && readAck() == wantFinal {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != wantFinal || readAck() != wantFinal {
+		t.Fatalf("post-active cursors = forwarded:%d ack:%d want:%d", got, readAck(), wantFinal)
 	}
 }
 

@@ -418,3 +418,64 @@ func TestSelectedV3ProofResumeFreezesHelloTailUntilMandatorySnapshot(t *testing.
 		t.Fatalf("proof barrier ordering = %+v", seen)
 	}
 }
+
+func TestSelectedV3FreshCandidateHeartbeatBeforeSnapshotFailsClosed(t *testing.T) {
+	fixture := startInProcessV3Fixture(t, 0)
+	acked := emitAndPersistV3Ack(t, fixture, "fresh-heartbeat-floor")
+	if err := fixture.shim.Session().EmitMarker("fresh-unforwarded"); err != nil {
+		t.Fatal(err)
+	}
+	_, helloTail, err := fixture.shim.Session().Snapshot()
+	if err != nil || uint64(helloTail) <= acked {
+		t.Fatalf("fresh fixture tail = %d ack=%d err=%v", helloTail, acked, err)
+	}
+	fixture.result.Close()
+	select {
+	case <-fixture.controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not close")
+	}
+	replacement, err := Adopt(context.Background(), AdoptOptions{
+		Registry: fixture.shim.registry, ControllerID: "controller-v3-fresh-heartbeat", RequireFullHostFrames: true,
+		Prepare: func(_ context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			resume := evidence.LastHostSeq + 1
+			return PreparedAdoption{
+				ResumeFrom: &resume,
+				Extensions: shimwire.Extensions{
+					Values: map[string]string{shimwire.ExtCarrierEpoch: "43"}, Required: []string{shimwire.ExtCarrierEpoch},
+				},
+			}, nil
+		},
+	})
+	if err != nil || len(replacement.Adopted) != 1 {
+		t.Fatalf("fresh replacement = %+v err=%v", replacement, err)
+	}
+	t.Cleanup(replacement.Close)
+	controller := replacement.Adopted[0]
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("blocked-before-fresh-snapshot") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("fresh marker crossed before mandatory Snapshot: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := controller.Heartbeat(uint64(helloTail) + 1); err == nil {
+		t.Fatal("fresh candidate accepted Heartbeat for its not-yet-emitted mandatory Snapshot")
+	}
+	select {
+	case <-controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("misordered fresh Heartbeat did not fail the candidate closed")
+	}
+	select {
+	case event, ok := <-controller.Events():
+		if ok {
+			t.Fatalf("misordered fresh Heartbeat leaked candidate event: %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed fresh candidate event stream did not close")
+	}
+	if err := <-markerDone; err != nil {
+		t.Fatalf("failed candidate did not release local output barrier: %v", err)
+	}
+}

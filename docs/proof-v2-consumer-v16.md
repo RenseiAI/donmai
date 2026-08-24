@@ -10,6 +10,46 @@ focused test with `GOWORK=off` and `-count=1`, observed RED for the intended
 reason, restored the exact dependency, and observed GREEN. No weakened control
 was retained.
 
+## Selected-v3 retained output barrier
+
+Removed the post-persistence release of the existing Hello output barrier.
+
+```text
+$ go test ./daemon -run '^TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive$' -count=1 -v
+=== RUN   TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive
+    session_shim_activation_seams_test.go:1034: pre-active emit attempts completed = map[]
+--- FAIL: TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive
+FAIL
+```
+
+Restored the release, then independently bypassed it during handshake before
+`carrier_active` and Heartbeat persistence.
+
+```text
+=== RUN   TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive
+    session_shim_activation_seams_test.go:1026: replacement adoption: session shim: activate published carriers: pre-active effects = completed:3 last:5 external:6 forwarded:5 ack:5
+--- FAIL: TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive
+FAIL
+```
+
+With the release restored only after successful selected-v3 Heartbeat
+persistence, the real two-controller fixture keeps three bounded Resize, PTY
+Output, and Marker attempts behind H, exposes no observer/durable/cursor/ACK
+effect, and then publishes exact H+1... bytes once in order.
+
+```text
+--- PASS: TestAdoptedRecoveryStagesRealV3FramesUntilCarrierActive
+--- PASS: TestSelectedV3FreshCandidateHeartbeatBeforeSnapshotFailsClosed
+--- PASS: TestSelectedV3PriorityEventQueueOverflowFailsClosed
+PASS
+```
+
+The fresh-candidate control sends Heartbeat(K+1) before the mandatory Snapshot.
+The shim refuses it as ahead of the real host sequence, fails that candidate
+closed, and delivers no candidate event. The unchanged selected-v3 controller
+priority queue also refuses its 129th retained event rather than growing without
+bound.
+
 ## Retained adopted candidate through activation
 
 Removed the retained-activation lookup while leaving batch publication and the

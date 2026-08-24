@@ -217,6 +217,23 @@ func (c *controllerConn) failOutputBarrier() {
 	}
 }
 
+func (c *controllerConn) releaseOutputBarrierWithoutSnapshot() {
+	c.barrierMu.Lock()
+	if c.barrierTimer != nil {
+		c.barrierTimer.Stop()
+		c.barrierTimer = nil
+	}
+	pending := c.outputBarrier
+	c.outputBarrier = nil
+	if c.barrierState == outputBarrierPending {
+		c.barrierState = outputBarrierConsumed
+	}
+	c.barrierMu.Unlock()
+	if pending != nil {
+		pending.Release()
+	}
+}
+
 func (c *controllerConn) emitSnapshot(sess *ptyhost.Session) (attachwire.Frame, bool, error) {
 	c.barrierMu.Lock()
 	switch c.barrierState {
@@ -1240,6 +1257,15 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 		s.ackNotify = make(chan struct{})
 	}
 	s.recordMu.Unlock()
+
+	// A selected-v3 Heartbeat is the shim's exact external-durability boundary.
+	// Donmai's fresh-candidate path does not send one until the mandatory Snapshot
+	// is active (and an ahead K+1 heartbeat is refused/fails that candidate
+	// closed). Adopted-candidate recovery instead sends Heartbeat(H) after
+	// carrier_active(H), with no second Snapshot. That daemon ordering is
+	// load-bearing: only a successfully persisted heartbeat reaches this release,
+	// after which queued H+1 progress may flow.
+	ctrl.releaseOutputBarrierWithoutSnapshot()
 
 	// Selected v3 makes persistence synchronous: the daemon cannot advance its
 	// own cursor until this exact fsync-backed receipt arrives.

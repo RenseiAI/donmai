@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,6 +141,24 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 		if sequence != uint64(index+1) {
 			t.Fatalf("priority queue sequence[%d] = %d, want %d", index, sequence, index+1)
 		}
+	}
+}
+
+func TestSelectedV3PriorityEventQueueOverflowFailsClosed(t *testing.T) {
+	controller := &Controller{
+		selected:   shimwire.V3,
+		eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		closing:    make(chan struct{}),
+	}
+	for i := 0; i < selectedV3EventQueueLimit; i++ {
+		if err := controller.publishEvent(ControllerEvent{Kind: EventHostFrame, Seq: uint64(i + 1)}); err != nil {
+			t.Fatalf("fill priority queue at %d: %v", i, err)
+		}
+	}
+	if err := controller.publishEvent(ControllerEvent{
+		Kind: EventHostFrame, Seq: selectedV3EventQueueLimit + 1,
+	}); err == nil || !strings.Contains(err.Error(), "exceeded its bound") {
+		t.Fatalf("priority queue overflow = %v", err)
 	}
 }
 
