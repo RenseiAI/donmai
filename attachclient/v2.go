@@ -57,6 +57,12 @@ const (
 	// V2ResumeReceiptStored resumes a pre-active candidate whose exact mandatory
 	// Snapshot and frozen receipt already exist durably at the relay.
 	V2ResumeReceiptStored V2ResumeState = "receipt_stored"
+	// V2ResumeServerRetained resumes an adopted proof-v2 candidate retained
+	// atomically by the relay. The original bearer identifies the exact retained
+	// receipt, so no raw Snapshot bytes cross the composing boundary. Exact
+	// bounded cursor and gap evidence remains for signed-proof comparison. This
+	// mode is never inferred from missing bytes.
+	V2ResumeServerRetained V2ResumeState = "server_retained"
 	// V2ResumeActive resumes an already-active equal carrier at journal high-water.
 	V2ResumeActive V2ResumeState = "active"
 )
@@ -91,6 +97,14 @@ const (
 // raw Snapshot. GapFromSeq/GapToSeq/GapReason are either all zero or the exact
 // proof-bound controller_unforwarded N+1..K transition immediately before that
 // Snapshot.
+//
+// For server_retained, the exact original proof-v2 bearer, PTY/carrier epochs,
+// AckSeq N, CandidateSnapshotSeq K+1, and optional N+1..K gap remain as bounded
+// comparison evidence, but CandidateSnapshot must be absent. Attachclient binds
+// those fields to the authenticated proof, while the Relay proves its in-lock
+// retained candidate by acknowledging exactly K+1 in carrier_active. Missing
+// Snapshot bytes under receipt_stored remain an error and are never inferred to
+// mean server retention.
 // The Relay-private request UUID is deliberately absent because the ratified
 // host wire never exposes it; Relay binds that correlation internally. PTYEpoch
 // and CarrierEpoch must exactly equal the authenticated token claims in both
@@ -200,8 +214,9 @@ func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 	if resume.ProofSchemaVersion == V2ProofSchemaV1 && resume.Authority != V2ResumeSameHandoff {
 		return errors.New("attachclient: retained proof-v1 is exact same-handoff replay/drain only")
 	}
-	if resume.Authority == V2ResumeAdoptedCandidateRecovery && resume.State != V2ResumeReceiptStored {
-		return errors.New("attachclient: adopted-candidate recovery requires receipt-stored state")
+	if resume.Authority == V2ResumeAdoptedCandidateRecovery &&
+		resume.State != V2ResumeReceiptStored && resume.State != V2ResumeServerRetained {
+		return errors.New("attachclient: adopted-candidate recovery requires receipt-stored or server-retained state")
 	}
 	switch resume.State {
 	case V2ResumeActive:
@@ -229,6 +244,20 @@ func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 			resume.GapReason == attachwirev2.GapControllerUnforwarded
 		if !gapAbsent && !gapExact {
 			return errors.New("attachclient: receipt-stored v2 resume gap is not exact")
+		}
+		return nil
+	case V2ResumeServerRetained:
+		if resume.ProofSchemaVersion != V2ProofSchemaV2 ||
+			resume.Authority != V2ResumeAdoptedCandidateRecovery ||
+			resume.CandidateSnapshotSeq <= resume.AckSeq || len(resume.CandidateSnapshot) != 0 {
+			return errors.New("attachclient: server-retained v2 resume disposition is not exact")
+		}
+		gapAbsent := resume.GapFromSeq == 0 && resume.GapToSeq == 0 && resume.GapReason == ""
+		gapExact := resume.GapFromSeq == resume.AckSeq+1 &&
+			resume.GapToSeq == resume.CandidateSnapshotSeq-1 &&
+			resume.GapReason == attachwirev2.GapControllerUnforwarded
+		if !gapAbsent && !gapExact {
+			return errors.New("attachclient: server-retained v2 resume gap is not exact")
 		}
 		return nil
 	default:
@@ -334,6 +363,11 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 			candidate.highestSent = resume.CandidateSnapshotSeq
 			candidate.pendingSeq = resume.CandidateSnapshotSeq
 			candidate.pendingRaw = append([]byte(nil), resume.CandidateSnapshot...)
+		case V2ResumeServerRetained:
+			candidate.candidateSent = true
+			candidate.snapshotRequestSeen = true
+			candidate.highestSent = resume.CandidateSnapshotSeq
+			candidate.pendingSeq = resume.CandidateSnapshotSeq
 		case V2ResumeActive:
 			candidate.highestSent = resume.AckSeq
 		}
@@ -365,23 +399,27 @@ func validateV2ProofDisposition(claims v2HostClaims, cfg V2HostConfig) error {
 		return nil
 	}
 	resume := *cfg.ResumeDisposition
+	resumeName := "receipt-stored"
+	if resume.State == V2ResumeServerRetained {
+		resumeName = "server-retained"
+	}
 	if resume.ProofSchemaVersion != claims.ProofSchemaVersion {
 		return errors.New("attachclient: v2 resume proof schema does not match the original bearer")
 	}
 	switch resume.State {
-	case V2ResumeReceiptStored:
+	case V2ResumeReceiptStored, V2ResumeServerRetained:
 		if resume.AckSeq != claims.CarrierBoundary ||
 			resume.CandidateSnapshotSeq != claims.ResolvedBoundary+1 {
-			return errors.New("attachclient: receipt-stored resume does not match signed proof boundaries")
+			return fmt.Errorf("attachclient: %s resume does not match signed proof boundaries", resumeName)
 		}
 		if claims.ResolvedBoundary == claims.CarrierBoundary {
 			if resume.GapFromSeq != 0 || resume.GapToSeq != 0 || resume.GapReason != "" {
-				return errors.New("attachclient: receipt-stored resume invented a proof gap")
+				return fmt.Errorf("attachclient: %s resume invented a proof gap", resumeName)
 			}
 		} else if resume.GapFromSeq != claims.CarrierBoundary+1 ||
 			resume.GapToSeq != claims.ResolvedBoundary ||
 			resume.GapReason != attachwirev2.GapControllerUnforwarded {
-			return errors.New("attachclient: receipt-stored resume proof gap does not match signed boundaries")
+			return fmt.Errorf("attachclient: %s resume proof gap does not match signed boundaries", resumeName)
 		}
 	case V2ResumeActive:
 		if resume.AckSeq < claims.ResolvedBoundary+1 {
@@ -428,6 +466,40 @@ func (c *V2HostCandidate) WaitMandatorySnapshotRequest(ctx context.Context) (att
 func (c *V2HostCandidate) SendCandidateSnapshot(ctx context.Context, raw []byte) error {
 	c.durableMu.Lock()
 	defer c.durableMu.Unlock()
+	return c.sendCandidateSnapshotLocked(ctx, raw)
+}
+
+// SendClaimsBoundCandidateSnapshot applies the fresh candidate transition
+// carried by the authenticated proof and then writes its mandatory Snapshot.
+// When the signed resolved boundary K is ahead of the signed carrier boundary
+// N, it emits exactly controller_unforwarded N+1..K before Snapshot K+1. When
+// K equals N it emits no gap. Composing callers therefore never parse the
+// bearer or trust a duplicated boundary supplied outside this client.
+func (c *V2HostCandidate) SendClaimsBoundCandidateSnapshot(ctx context.Context, raw []byte) error {
+	c.durableMu.Lock()
+	defer c.durableMu.Unlock()
+
+	if c.claims.ResolvedBoundary > c.claims.CarrierBoundary {
+		c.mu.Lock()
+		gapAlreadyApplied := c.gapPending &&
+			c.gapTo == c.claims.ResolvedBoundary &&
+			c.gapReason == attachwirev2.GapControllerUnforwarded
+		c.mu.Unlock()
+		if !gapAlreadyApplied {
+			if err := c.declareHostGapWithReasonLocked(
+				ctx,
+				c.claims.CarrierBoundary+1,
+				c.claims.ResolvedBoundary,
+				attachwirev2.GapControllerUnforwarded,
+			); err != nil {
+				return err
+			}
+		}
+	}
+	return c.sendCandidateSnapshotLocked(ctx, raw)
+}
+
+func (c *V2HostCandidate) sendCandidateSnapshotLocked(ctx context.Context, raw []byte) error {
 	frame, err := attachwire.DecodeFrame(raw)
 	if err != nil || frame.Type != attachwire.TypeSnapshot || frame.Seq == 0 {
 		return errors.New("attachclient: v2 candidate requires an exact sequence-bearing Snapshot frame")
@@ -489,6 +561,14 @@ func (c *V2HostCandidate) DeclareHostGapWithReason(
 ) error {
 	c.durableMu.Lock()
 	defer c.durableMu.Unlock()
+	return c.declareHostGapWithReasonLocked(ctx, fromSeq, toSeq, reason)
+}
+
+func (c *V2HostCandidate) declareHostGapWithReasonLocked(
+	ctx context.Context,
+	fromSeq, toSeq uint64,
+	reason attachwirev2.GapReason,
+) error {
 	if fromSeq == 0 || toSeq < fromSeq ||
 		(reason != attachwirev2.GapRingEvicted && reason != attachwirev2.GapControllerUnforwarded) {
 		return errors.New("attachclient: invalid v2 host gap")

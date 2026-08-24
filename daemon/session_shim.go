@@ -1547,8 +1547,15 @@ func validateSessionShimAdoptionPreparationResult(
 		}
 		if resume.ProofSchemaVersion != attachclient.V2ProofSchemaV2 ||
 			resume.Authority != attachclient.V2ResumeAdoptedCandidateRecovery ||
-			resume.State != attachclient.V2ResumeReceiptStored || resume.CarrierEpoch != recovery.CarrierEpoch ||
-			resume.AckSeq != recovery.PreStageAckSeq || resume.CandidateSnapshotSeq != recovery.StagedHighWater {
+			resume.CarrierEpoch != recovery.CarrierEpoch {
+			return errors.New("session shim: adopted-candidate recovery disposition is not exact")
+		}
+		switch resume.State {
+		case attachclient.V2ResumeReceiptStored, attachclient.V2ResumeServerRetained:
+			if resume.AckSeq != recovery.PreStageAckSeq || resume.CandidateSnapshotSeq != recovery.StagedHighWater {
+				return errors.New("session shim: adopted-candidate recovery disposition is not exact")
+			}
+		default:
 			return errors.New("session shim: adopted-candidate recovery disposition is not exact")
 		}
 		if recovery.CredentialExpiresAt.IsZero() || !recovery.CredentialExpiresAt.After(now) {
