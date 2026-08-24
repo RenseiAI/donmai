@@ -342,6 +342,77 @@ func TestProofV2ReadinessRequiresIndependentDurableAckAndEverySupportFact(t *tes
 	}
 }
 
+func TestProofV2LiveReadinessFactsWithdrawEveryNewWorkRail(t *testing.T) {
+	mutations := map[string]func(*SessionShimCarrierProofV2Readiness){
+		"durable acknowledgement":       func(value *SessionShimCarrierProofV2Readiness) { value.DurableCarrierProofV2Ready = false },
+		"v1 writer closure":             func(value *SessionShimCarrierProofV2Readiness) { value.ComposingProofV1WritesClosed = false },
+		"original credential retention": func(value *SessionShimCarrierProofV2Readiness) { value.EncryptedOriginalCredentialRetained = false },
+		"remaining validity gate":       func(value *SessionShimCarrierProofV2Readiness) { value.RemainingValidityConsumeGate = false },
+		"adopted recovery":              func(value *SessionShimCarrierProofV2Readiness) { value.AdoptedCandidateRecovery = false },
+	}
+	newDaemon := func(t *testing.T, mutate func(*SessionShimCarrierProofV2Readiness)) *Daemon {
+		t.Helper()
+		readiness, _ := testSessionShimProofV2Readiness()
+		mutate(&readiness)
+		d := New(Options{SessionShim: SessionShimConfig{
+			EnableAdoption: true, RequireCredentialAttestation: true,
+			ControllerID: "live-readiness-controller", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+			GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) { return readiness, nil },
+		}})
+		d.setState(StateRunning)
+		d.shims.adoptionComplete = true
+		d.shims.carrierActivationComplete = true
+		d.spawner = NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 1})
+		d.spawner.Resume()
+		return d
+	}
+	assertWithdrawn := func(t *testing.T, d *Daemon) {
+		t.Helper()
+		if !d.sessionShimReadinessWithdrawn.Load() || d.State() != StateRecovering ||
+			d.spawner.IsAccepting() || d.RegistrationStatus() != RegistrationDraining {
+			t.Fatalf("withdrawal state = withdrawn:%v state:%s accepting:%v registration:%s",
+				d.sessionShimReadinessWithdrawn.Load(), d.State(), d.spawner.IsAccepting(), d.RegistrationStatus())
+		}
+	}
+	for fact, mutate := range mutations {
+		t.Run(fact+"/claim-and-poll", func(t *testing.T) {
+			d := newDaemon(t, mutate)
+			if blocked, _ := d.claimSuspended(); !blocked {
+				t.Fatal("live claim check stayed open")
+			}
+			assertWithdrawn(t, d)
+			var pollCalls atomic.Int64
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+				pollCalls.Add(1)
+				_ = json.NewEncoder(w).Encode(PollResponse{})
+			}))
+			t.Cleanup(server.Close)
+			poller := NewPollService(PollOptions{
+				WorkerID: "worker", RuntimeJWT: "runtime", OrchestratorURL: server.URL,
+				ClaimSuspended: d.claimSuspended, OnWork: func(PollWorkItem) error { return nil }, HTTPClient: server.Client(),
+			})
+			poller.pollOnce(context.Background())
+			if pollCalls.Load() != 0 || !poller.ClaimsSuspended() {
+				t.Fatalf("poll withdrawal = calls:%d suspended:%v", pollCalls.Load(), poller.ClaimsSuspended())
+			}
+		})
+		t.Run(fact+"/direct-admission", func(t *testing.T) {
+			d := newDaemon(t, mutate)
+			if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: "must-refuse"}, nil); err == nil {
+				t.Fatal("live direct admission check stayed open")
+			}
+			assertWithdrawn(t, d)
+		})
+		t.Run(fact+"/activation", func(t *testing.T) {
+			d := newDaemon(t, mutate)
+			if err := d.activatePublishedSessionShimCarriers(context.Background(), nil); err == nil {
+				t.Fatal("live activation check stayed open")
+			}
+			assertWithdrawn(t, d)
+		})
+	}
+}
+
 func testAdoptedCandidateRecoveryResult(t *testing.T, now time.Time) SessionShimAdoptionPreparationResult {
 	t.Helper()
 	credential, err := attachclient.NewV2RetainedCredential([]byte("original-adopted-candidate-bearer"))

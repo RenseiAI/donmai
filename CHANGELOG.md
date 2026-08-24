@@ -8,6 +8,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Attach v2 preserves the released omitted-field resume shape.** Callers that
+  omit both proof schema and authority retain the frozen proof-v1
+  `same_handoff` behavior. Supplying only one field, or an unknown explicit
+  value, remains a closed validation error.
+- **Proof-v2 readiness is resolved at every new-work edge.** Claim polling,
+  direct admission, and carrier activation each re-read all five durable
+  readiness facts. A withdrawal enters the existing recovering, zero-capacity,
+  heartbeat-acknowledged reopen path.
+- **Selected-v3 recovery releases buffered PTY progress only after a durable
+  acknowledgement advances.** Equal, ahead, failed-persistence, and timed-out
+  Heartbeats cannot open the Hello output barrier. A successful durable put
+  opens it before the receipt write so a lost response cannot deadlock locally
+  committed recovery.
+
 ## v0.68.4 — 2026-08-23
 
 ### Features

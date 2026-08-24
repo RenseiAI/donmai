@@ -466,6 +466,288 @@ func TestConsumedAdoptedCandidateRecoveryCompletesPublicationAndActivationWithou
 	}
 }
 
+func TestConsumedRecoveryHeartbeatReleasesBlockedV3ProgressAfterCarrierActive(t *testing.T) {
+	dir, err := os.MkdirTemp("/tmp", "donmai-consumed-barrier-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-consumed-barrier", SessionID: "session-consumed-barrier"}
+	shim, err := sessionshim.Start(sessionshim.Options{
+		Identity: id, Registry: registry, ProcessEpoch: 9,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		WorkareaPath: filepath.Join(dir, "workarea"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	if err := shim.Session().EmitMarker("pre-stage-boundary"); err != nil {
+		t.Fatal(err)
+	}
+	first, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
+		Registry: registry, ControllerID: "consuming-controller", RequireFullHostFrames: true,
+	})
+	if err != nil || len(first.Adopted) != 1 {
+		t.Fatalf("first adoption = %+v err=%v", first, err)
+	}
+	firstController := first.Adopted[0]
+	var preStageAck uint64
+	select {
+	case event := <-firstController.Events():
+		if event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeMarker || event.Seq == 0 {
+			t.Fatalf("pre-stage frame = %+v", event)
+		}
+		preStageAck = event.Seq
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not receive pre-stage Marker")
+	}
+	if err := firstController.Heartbeat(preStageAck); err != nil {
+		t.Fatalf("persist pre-stage ACK: %v", err)
+	}
+	retainedSnapshot, inStream, err := shim.Session().EmitSnapshot()
+	if err != nil || !inStream || retainedSnapshot.Seq != preStageAck+1 {
+		t.Fatalf("retained Snapshot = %+v inStream:%v err:%v", retainedSnapshot, inStream, err)
+	}
+	highWater := retainedSnapshot.Seq
+	select {
+	case event := <-firstController.Events():
+		if event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeSnapshot ||
+			event.Seq != highWater || !bytes.Equal(event.FrameBytes, retainedSnapshot.Encode()) {
+			t.Fatalf("retained Snapshot event = %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not receive retained Snapshot")
+	}
+	first.Close()
+
+	readAck := func() uint64 {
+		t.Helper()
+		entries, err := os.ReadDir(filepath.Join(dir, "registry"))
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, entry := range entries {
+			if !strings.HasSuffix(entry.Name(), ".ack") {
+				continue
+			}
+			raw, err := os.ReadFile(filepath.Join(dir, "registry", entry.Name()))
+			if err != nil {
+				t.Fatal(err)
+			}
+			var ack struct {
+				AckedSeq uint64 `json:"ackedSeq"`
+			}
+			if err := json.Unmarshal(raw, &ack); err != nil {
+				t.Fatal(err)
+			}
+			return ack.AckedSeq
+		}
+		t.Fatal("durable ACK sidecar is missing")
+		return 0
+	}
+	if readAck() != preStageAck {
+		t.Fatalf("retained Snapshot was acknowledged before activation: %d", readAck())
+	}
+
+	type emitAttemptResult struct {
+		name string
+		err  error
+	}
+	cloneEvent := func(event sessionshim.ControllerEvent) sessionshim.ControllerEvent {
+		event.Data = append([]byte(nil), event.Data...)
+		event.FrameBytes = append([]byte(nil), event.FrameBytes...)
+		return event
+	}
+	var (
+		externalMu     sync.Mutex
+		durableFrames  []sessionshim.ControllerEvent
+		observedFrames []sessionshim.ControllerEvent
+		recovery       *Daemon
+		attemptOnce    sync.Once
+		attempts       = make(chan emitAttemptResult, 3)
+		resizeDone     = make(chan struct{})
+		outputWritten  = make(chan struct{})
+	)
+	credential, err := attachclient.NewV2RetainedCredential([]byte("consumed-barrier-bearer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryCorrelation, err := NewSessionShimRecoveryCorrelation([]byte("consumed-barrier-correlation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	resumeFrom := highWater + 1
+	recovery = New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: filepath.Join(dir, "registry"), HostID: "host-consumed-barrier",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			if preparation.ProcessEpoch != 9 || preparation.LastHostSeq != highWater {
+				return SessionShimAdoptionPreparationResult{}, fmt.Errorf("recovery preparation = %+v", preparation)
+			}
+			attemptOnce.Do(func() {
+				go func() {
+					err := shim.Session().Resize(117, 43, 0, 0)
+					attempts <- emitAttemptResult{name: "resize", err: err}
+					close(resizeDone)
+				}()
+				go func() {
+					<-resizeDone
+					_, err := shim.Session().WriteInput([]byte("blocked-output\n"))
+					attempts <- emitAttemptResult{name: "output", err: err}
+					close(outputWritten)
+				}()
+				go func() {
+					<-outputWritten
+					deadline := time.Now().Add(5 * time.Second)
+					for time.Now().Before(deadline) {
+						_, last, snapshotErr := shim.Session().Snapshot()
+						if snapshotErr != nil {
+							attempts <- emitAttemptResult{name: "marker", err: snapshotErr}
+							return
+						}
+						if uint64(last) >= highWater+2 {
+							attempts <- emitAttemptResult{name: "marker", err: shim.Session().EmitMarker("blocked-marker")}
+							return
+						}
+						time.Sleep(time.Millisecond)
+					}
+					attempts <- emitAttemptResult{name: "marker", err: errors.New("output did not allocate before marker deadline")}
+				}()
+			})
+			return SessionShimAdoptionPreparationResult{
+				State: SessionShimPreparationAdoptedCandidateRecovery,
+				PreparedAdoption: sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "61"}},
+					ResumeFrom:           &resumeFrom,
+				},
+				AdoptedCandidateRecovery: &SessionShimAdoptedCandidateRecovery{
+					Credential: credential, RecoveryCorrelation: recoveryCorrelation,
+					CarrierEpoch: 61, PreStageAckSeq: preStageAck,
+					StagedHighWater: highWater, ResumeFrom: resumeFrom,
+					CredentialExpiresAt: time.Now().Add(time.Hour),
+					ResumeDisposition: attachclient.V2ResumeDisposition{
+						ProofSchemaVersion: attachclient.V2ProofSchemaV2,
+						Authority:          attachclient.V2ResumeAdoptedCandidateRecovery,
+						State:              attachclient.V2ResumeReceiptStored,
+						PTYEpoch:           9, CarrierEpoch: 61, AckSeq: preStageAck,
+						CandidateSnapshotSeq: highWater, CandidateSnapshot: retainedSnapshot.Encode(),
+					},
+				},
+			}, nil
+		},
+		OnAdoptionV2: func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			return SessionShimAdoptionReceipt{DurableCorrelation: []byte("consumed-barrier-adoption")}, nil
+		},
+		OnSessionEvent: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) {
+			externalMu.Lock()
+			observedFrames = append(observedFrames, cloneEvent(event))
+			externalMu.Unlock()
+		},
+		OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+			externalMu.Lock()
+			durableFrames = append(durableFrames, cloneEvent(event))
+			externalMu.Unlock()
+			return nil
+		},
+		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("consumed-barrier-batch"), AdoptionRevision: "consumed-barrier-revision",
+			}, nil
+		},
+		OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			time.Sleep(100 * time.Millisecond)
+			externalMu.Lock()
+			externalCount := len(durableFrames) + len(observedFrames)
+			externalMu.Unlock()
+			_, lastSeq, snapshotErr := shim.Session().Snapshot()
+			if snapshotErr != nil {
+				return nil, snapshotErr
+			}
+			if len(attempts) != 0 || uint64(lastSeq) != highWater || externalCount != 0 ||
+				recovery.SessionShimForwardedSeq(id.OrgID, id.SessionID) != highWater || readAck() != preStageAck {
+				return nil, fmt.Errorf("pre-active effects = completed:%d last:%d external:%d forwarded:%d ack:%d",
+					len(attempts), lastSeq, externalCount, recovery.SessionShimForwardedSeq(id.OrgID, id.SessionID), readAck())
+			}
+			return []SessionShimCarrierActivationReceipt{{Activation: publication.Carriers[0], AckSeq: highWater}}, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, recovery, id.OrgID)
+	t.Cleanup(recovery.ReleaseAdoptedSessionShims)
+	if err := recovery.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("consumed recovery activation: %v", err)
+	}
+	completed := make(map[string]error, 3)
+	for len(completed) < 3 {
+		select {
+		case result := <-attempts:
+			completed[result.name] = result.err
+		case <-time.After(5 * time.Second):
+			t.Fatalf("blocked attempts completed = %+v", completed)
+		}
+	}
+	for name, err := range completed {
+		if err != nil {
+			t.Fatalf("%s after activation: %v", name, err)
+		}
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		externalMu.Lock()
+		complete := len(durableFrames) >= 3 && durableFrames[len(durableFrames)-1].FrameType == attachwire.TypeMarker
+		externalMu.Unlock()
+		if complete {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	externalMu.Lock()
+	durable := append([]sessionshim.ControllerEvent(nil), durableFrames...)
+	observed := append([]sessionshim.ControllerEvent(nil), observedFrames...)
+	externalMu.Unlock()
+	if len(durable) < 3 || len(observed) != len(durable) || durable[0].FrameType != attachwire.TypeResize ||
+		durable[len(durable)-1].FrameType != attachwire.TypeMarker {
+		t.Fatalf("post-active frame order = durable:%+v observed:%+v", durable, observed)
+	}
+	sawOutput := false
+	for i := range durable {
+		if durable[i].Seq != highWater+1+uint64(i) || !bytes.Equal(durable[i].FrameBytes, observed[i].FrameBytes) {
+			t.Fatalf("post-active frame %d changed: durable=%+v observed=%+v", i, durable[i], observed[i])
+		}
+		if durable[i].FrameType == attachwire.TypeSnapshot || durable[i].FrameType == attachwire.TypeExit {
+			t.Fatalf("forbidden second terminal frame: %+v", durable[i])
+		}
+		if durable[i].FrameType == attachwire.TypeOutput && bytes.Contains(durable[i].Data, []byte("ack:blocked-output")) {
+			sawOutput = true
+		}
+	}
+	if !sawOutput {
+		t.Fatalf("post-active frames omitted PTY Output: %+v", durable)
+	}
+	wantFinal := highWater + uint64(len(durable))
+	deadline = time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if recovery.SessionShimForwardedSeq(id.OrgID, id.SessionID) == wantFinal && readAck() == wantFinal {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if got := recovery.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != wantFinal || readAck() != wantFinal {
+		t.Fatalf("post-active cursors = forwarded:%d ack:%d want:%d", got, readAck(), wantFinal)
+	}
+}
+
 // This file is the daemon-side half of the ADR-2026-08-17 acceptance suite.
 //
 // # Why a real second process
