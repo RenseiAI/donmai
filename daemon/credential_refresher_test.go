@@ -147,6 +147,67 @@ func TestCredentialRefresher_ReregisterUsesReloadedProjectProjection(t *testing.
 	}
 }
 
+func TestCredentialRefresher_ReregisterLatestProjectProjectionWins(t *testing.T) {
+	t.Parallel()
+	enteredA := make(chan struct{})
+	releaseA := make(chan struct{})
+	enteredB := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		switch request.ProjectIDs[0] {
+		case "alpha":
+			close(enteredA)
+			<-releaseA
+			_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_alpha", "runtimeToken": "alpha.jwt"})
+		case "beta":
+			close(enteredB)
+			_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_beta", "runtimeToken": "beta.jwt"})
+		default:
+			t.Errorf("unexpected ProjectIDs: %v", request.ProjectIDs)
+		}
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	r := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	r.Attach(lane)
+	r.UpdateRegistrationProjects([]ProjectAllowlistEntry{{ID: "alpha", Repository: "github.com/x/alpha"}}, []string{"alpha"}, ProjectAdmissionModeEnumerated)
+
+	r.RequestReregister()
+	select {
+	case <-enteredA:
+	case <-time.After(2 * time.Second):
+		t.Fatal("older registration did not reach orchestrator")
+	}
+
+	r.UpdateRegistrationProjects([]ProjectAllowlistEntry{{ID: "beta", Repository: "github.com/x/beta"}}, []string{"beta"}, ProjectAdmissionModeAllRouted)
+	r.RequestReregister()
+	close(releaseA)
+	select {
+	case <-enteredB:
+	case <-time.After(2 * time.Second):
+		t.Fatal("newer registration did not reach orchestrator")
+	}
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		workerID, jwt := r.Current()
+		laneWorkerID, laneJWT, _ := lane.current()
+		if workerID == "wkr_beta" && jwt == "beta.jwt" && laneWorkerID == "wkr_beta" && laneJWT == "beta.jwt" {
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	workerID, jwt := r.Current()
+	laneWorkerID, laneJWT, _ := lane.current()
+	t.Fatalf("final credentials = refresher(%q, %q) lane(%q, %q), want newest beta credentials", workerID, jwt, laneWorkerID, laneJWT)
+}
+
 // TestCredentialRefresher_EveryLaneSurvivesAReregistration is the structural
 // regression test for the worker re-registration loop.
 //

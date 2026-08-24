@@ -292,3 +292,46 @@ func TestOnYamlChanged_ReRegistersMergedProjectScopes(t *testing.T) {
 		t.Fatal("yaml reload did not re-register the merged project declaration")
 	}
 }
+
+func TestOnYamlChanged_ModeOnlyChangeReregisters(t *testing.T) {
+	t.Parallel()
+	registrations := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		registrations <- request
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_mode", "runtimeToken": "mode.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			ProjectAdmissionMode:    ProjectAdmissionModeEnumerated,
+			Repositories:            []RepositoryConfig{{ID: "repo-alpha", ProjectID: "alpha", Source: "github.com/x/alpha"}},
+		},
+		credentialRefresher: NewCredentialRefresher(opts),
+	}
+
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		ProjectAdmissionMode:    ProjectAdmissionModeAllRouted,
+		Repositories:            []RepositoryConfig{{ID: "repo-alpha", ProjectID: "alpha", Source: "github.com/x/alpha"}},
+	})
+
+	select {
+	case request := <-registrations:
+		if request.ProjectAdmissionMode != ProjectAdmissionModeAllRouted {
+			t.Fatalf("ProjectAdmissionMode = %q, want %q", request.ProjectAdmissionMode, ProjectAdmissionModeAllRouted)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("mode-only reload did not reach orchestrator")
+	}
+}

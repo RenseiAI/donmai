@@ -35,6 +35,7 @@ import (
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // CredentialLane is a long-lived service that presents worker credentials and
@@ -70,10 +71,14 @@ type CredentialRefresherOptions struct {
 type CredentialRefresher struct {
 	opts CredentialRefresherOptions
 
-	mu         sync.Mutex
-	workerID   string
-	runtimeJWT string
-	lanes      []CredentialLane
+	mu          sync.Mutex
+	operationMu sync.Mutex
+	reloadMu    sync.Mutex
+	reloadRun   bool
+	reloadNext  bool
+	workerID    string
+	runtimeJWT  string
+	lanes       []CredentialLane
 }
 
 // NewCredentialRefresher constructs a refresher seeded with the credentials a
@@ -136,8 +141,11 @@ func (r *CredentialRefresher) UpdateRegistrationProjects(
 // instead of waiting for an unrelated token expiry before the orchestrator can
 // observe the new local declaration.
 func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResult, error) {
+	r.operationMu.Lock()
+	defer r.operationMu.Unlock()
 	r.mu.Lock()
 	regOpts := r.opts.Registration
+	validateRefresh := r.opts.ValidateRefresh
 	r.mu.Unlock()
 	regOpts.ForceReregister = true
 
@@ -150,13 +158,49 @@ func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResu
 		RuntimeToken: response.RuntimeToken,
 		SessionShim:  response.SessionShim,
 	}
-	if r.opts.ValidateRefresh != nil {
-		if err := r.opts.ValidateRefresh(result); err != nil {
+	if validateRefresh != nil {
+		if err := validateRefresh(result); err != nil {
 			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
 		}
 	}
 	r.apply(result, regOpts)
 	return result, nil
+}
+
+// RequestReregister schedules an owned, coalescing project-reload registration.
+// Multiple rapid daemon.yaml edits result in at most one follow-up pass after
+// the in-flight registration, and Reregister's operation lock serializes this
+// path with reactive and proactive refreshes.
+func (r *CredentialRefresher) RequestReregister() {
+	r.reloadMu.Lock()
+	if r.reloadRun {
+		r.reloadNext = true
+		r.reloadMu.Unlock()
+		return
+	}
+	r.reloadRun = true
+	r.reloadMu.Unlock()
+
+	go func() {
+		for {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			_, err := r.Reregister(ctx)
+			cancel()
+			if err != nil {
+				slog.Warn("[runtime-token] project registration refresh failed", "err", err)
+			}
+
+			r.reloadMu.Lock()
+			if r.reloadNext {
+				r.reloadNext = false
+				r.reloadMu.Unlock()
+				continue
+			}
+			r.reloadRun = false
+			r.reloadMu.Unlock()
+			return
+		}
+	}()
 }
 
 // Refresh re-mints the runtime credentials and brings every attached lane onto
@@ -167,17 +211,20 @@ func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResu
 // the scheduled refresher. It is passed through to RefreshRuntimeToken, which
 // owns the decision of whether the existing registration can be re-presented.
 func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*RefreshTokenResult, error) {
+	r.operationMu.Lock()
+	defer r.operationMu.Unlock()
 	r.mu.Lock()
 	current := r.workerID
 	regOpts := r.opts.Registration
+	validateRefresh := r.opts.ValidateRefresh
 	r.mu.Unlock()
 
 	result, err := RefreshRuntimeToken(ctx, regOpts, current, reason)
 	if err != nil {
 		return nil, err
 	}
-	if r.opts.ValidateRefresh != nil {
-		if err := r.opts.ValidateRefresh(result); err != nil {
+	if validateRefresh != nil {
+		if err := validateRefresh(result); err != nil {
 			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
 		}
 	}
@@ -191,6 +238,7 @@ func (r *CredentialRefresher) apply(result *RefreshTokenResult, regOpts Registra
 	r.workerID = result.WorkerID
 	r.runtimeJWT = result.RuntimeToken
 	lanes := append([]CredentialLane(nil), r.lanes...)
+	onRefreshed := r.opts.OnRefreshed
 	r.mu.Unlock()
 
 	// EVERY lane, not just the one that asked. A lane left on a superseded
@@ -223,8 +271,8 @@ func (r *CredentialRefresher) apply(result *RefreshTokenResult, regOpts Registra
 		}
 	}
 
-	if r.opts.OnRefreshed != nil {
-		r.opts.OnRefreshed(result)
+	if onRefreshed != nil {
+		onRefreshed(result)
 	}
 }
 

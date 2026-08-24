@@ -1296,12 +1296,15 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	after := AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs())
 	beforeIDs := strings.Join(d.config.EffectiveEnabledProjectIDs(), "\x00")
 	afterIDs := strings.Join(cfg.EffectiveEnabledProjectIDs(), "\x00")
-	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs {
+	beforeMode := d.config.EffectiveProjectAdmissionMode()
+	afterMode := cfg.EffectiveProjectAdmissionMode()
+	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs && beforeMode == afterMode {
 		d.mu.Unlock()
 		return
 	}
 	d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
 	d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
+	d.config.ProjectAdmissionMode = cfg.ProjectAdmissionMode
 	d.config.Repositories = cfg.Repositories
 	d.config.Projects = cfg.Projects
 	d.mu.Unlock()
@@ -1321,13 +1324,7 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 			cfg.EffectiveEnabledProjectIDs(),
 			cfg.EffectiveProjectAdmissionMode(),
 		)
-		go func() {
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			if _, err := credentials.Reregister(ctx); err != nil {
-				slog.Warn("[yaml-watcher] project registration refresh failed", "err", err)
-			}
-		}()
+		credentials.RequestReregister()
 	}
 }
 
