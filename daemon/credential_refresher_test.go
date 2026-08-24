@@ -6,6 +6,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -94,6 +95,55 @@ func testRefresherOptions(t *testing.T, url, workerID, jwt string) CredentialRef
 		},
 		WorkerID:   workerID,
 		RuntimeJWT: jwt,
+	}
+}
+
+func TestCredentialRefresher_ReregisterUsesReloadedProjectProjection(t *testing.T) {
+	t.Parallel()
+	registrations := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		registrations <- request
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_reloaded", "runtimeToken": "reloaded.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.DaemonProjects = []ProjectAllowlistEntry{{ID: "alpha", Repository: "github.com/x/alpha"}}
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	r := NewCredentialRefresher(opts)
+
+	r.UpdateRegistrationProjects(
+		[]ProjectAllowlistEntry{
+			{ID: "alpha", Repository: "github.com/x/alpha"},
+			{ID: "beta", Repository: "github.com/x/beta"},
+		},
+		[]string{"alpha", "beta"},
+		ProjectAdmissionModeEnumerated,
+	)
+	if _, err := r.Reregister(context.Background()); err != nil {
+		t.Fatalf("Reregister: %v", err)
+	}
+
+	select {
+	case request := <-registrations:
+		if got, want := request.ProjectIDs, []string{"alpha", "beta"}; !slices.Equal(got, want) {
+			t.Errorf("ProjectIDs = %v, want %v", got, want)
+		}
+		if got := request.DaemonProjects; len(got) != 2 || got[0].ID != "alpha" || got[1].ID != "beta" {
+			t.Errorf("DaemonProjects = %+v, want merged alpha and beta", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("reloaded registration did not reach orchestrator")
 	}
 }
 

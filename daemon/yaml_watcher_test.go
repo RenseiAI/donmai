@@ -2,8 +2,12 @@ package daemon
 
 import (
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
@@ -144,6 +148,49 @@ func TestStartYamlWatcher_IgnoresUnrelatedFiles(t *testing.T) {
 	}
 }
 
+func TestStartYamlWatcher_InvalidReloadKeepsLastKnownGoodState(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	if err := WriteConfig(path, &Config{
+		APIVersion:   "v1",
+		Kind:         "DaemonConfig",
+		Machine:      MachineConfig{ID: "m1"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 1},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test", AuthToken: "stub"},
+		Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+	}); err != nil {
+		t.Fatalf("seed yaml: %v", err)
+	}
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	var fires int
+	var mu sync.Mutex
+	stop, err := startYamlWatcher(ctx, path, func(*Config) {
+		mu.Lock()
+		fires++
+		mu.Unlock()
+	})
+	if err != nil {
+		t.Fatalf("startYamlWatcher: %v", err)
+	}
+	defer stop()
+
+	time.Sleep(50 * time.Millisecond)
+	if err := os.WriteFile(path, []byte("projects: [\n"), 0o600); err != nil {
+		t.Fatalf("write invalid yaml: %v", err)
+	}
+	time.Sleep(400 * time.Millisecond)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if fires != 0 {
+		t.Fatalf("invalid reload applied %d config(s), want last-known-good state preserved", fires)
+	}
+}
+
 func TestOnYamlChanged_NoOpWhenAllowlistUnchanged(t *testing.T) {
 	t.Parallel()
 
@@ -192,5 +239,56 @@ func TestOnYamlChanged_UpdatesProjects(t *testing.T) {
 
 	if len(d.config.Projects) != 2 || d.config.Projects[1].ID != "beta" {
 		t.Errorf("d.config.Projects = %+v, want 2 entries with beta", d.config.Projects)
+	}
+}
+
+func TestOnYamlChanged_ReRegistersMergedProjectScopes(t *testing.T) {
+	t.Parallel()
+	registrations := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		registrations <- request
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_reloaded", "runtimeToken": "reloaded.jwt"})
+	}))
+	defer srv.Close()
+
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	r := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			EnabledProjectIDs:       []string{"alpha"},
+			Repositories:            []RepositoryConfig{{ID: "repo-alpha", ProjectID: "alpha", Source: "github.com/x/alpha"}},
+		},
+		credentialRefresher: r,
+	}
+
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha", "beta"},
+		Repositories:            []RepositoryConfig{{ID: "repo-alpha", ProjectID: "alpha", Source: "github.com/x/alpha"}},
+		Projects:                []ProjectConfig{{ID: "beta", Repository: "github.com/x/beta"}},
+	})
+
+	select {
+	case request := <-registrations:
+		if got, want := request.ProjectIDs, []string{"alpha", "beta"}; !slices.Equal(got, want) {
+			t.Errorf("ProjectIDs = %v, want %v", got, want)
+		}
+		if got := request.DaemonProjects; len(got) != 2 || got[0].ID != "alpha" || got[1].ID != "beta" {
+			t.Errorf("DaemonProjects = %+v, want merged alpha and beta", got)
+		}
+	case <-time.After(2 * time.Second):
+		t.Fatal("yaml reload did not re-register the merged project declaration")
 	}
 }

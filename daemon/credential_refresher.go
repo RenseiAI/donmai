@@ -116,6 +116,49 @@ func (r *CredentialRefresher) Current() (workerID, runtimeJWT string) {
 	return r.workerID, r.runtimeJWT
 }
 
+// UpdateRegistrationProjects replaces only the project-derived registration
+// fields. Callers use it after a daemon.yaml project reload so a later
+// registration cannot advertise the boot-time project set.
+func (r *CredentialRefresher) UpdateRegistrationProjects(
+	daemonProjects []ProjectAllowlistEntry,
+	projectIDs []string,
+	projectAdmissionMode string,
+) {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.opts.Registration.DaemonProjects = append([]ProjectAllowlistEntry(nil), daemonProjects...)
+	r.opts.Registration.ProjectIDs = append([]string(nil), projectIDs...)
+	r.opts.Registration.ProjectAdmissionMode = projectAdmissionMode
+}
+
+// Reregister presents the latest registration options and fans the resulting
+// credentials out to every attached lane. A project-set reload uses this
+// instead of waiting for an unrelated token expiry before the orchestrator can
+// observe the new local declaration.
+func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResult, error) {
+	r.mu.Lock()
+	regOpts := r.opts.Registration
+	r.mu.Unlock()
+	regOpts.ForceReregister = true
+
+	response, err := Register(ctx, regOpts)
+	if err != nil {
+		return nil, err
+	}
+	result := &RefreshTokenResult{
+		WorkerID:     response.WorkerID,
+		RuntimeToken: response.RuntimeToken,
+		SessionShim:  response.SessionShim,
+	}
+	if r.opts.ValidateRefresh != nil {
+		if err := r.opts.ValidateRefresh(result); err != nil {
+			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
+		}
+	}
+	r.apply(result, regOpts)
+	return result, nil
+}
+
 // Refresh re-mints the runtime credentials and brings every attached lane onto
 // the result.
 //
@@ -126,9 +169,10 @@ func (r *CredentialRefresher) Current() (workerID, runtimeJWT string) {
 func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*RefreshTokenResult, error) {
 	r.mu.Lock()
 	current := r.workerID
+	regOpts := r.opts.Registration
 	r.mu.Unlock()
 
-	result, err := RefreshRuntimeToken(ctx, r.opts.Registration, current, reason)
+	result, err := RefreshRuntimeToken(ctx, regOpts, current, reason)
 	if err != nil {
 		return nil, err
 	}
@@ -138,6 +182,11 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 		}
 	}
 
+	r.apply(result, regOpts)
+	return result, nil
+}
+
+func (r *CredentialRefresher) apply(result *RefreshTokenResult, regOpts RegistrationOptions) {
 	r.mu.Lock()
 	r.workerID = result.WorkerID
 	r.runtimeJWT = result.RuntimeToken
@@ -158,12 +207,12 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 	// adopt this registration instead of minting a competing one. Best-effort:
 	// a cache-write failure must never abort a refresh that already succeeded
 	// in memory.
-	if r.opts.Registration.JWTPath != "" {
-		if err := persistRefreshedToken(r.opts.Registration.JWTPath, result, r.opts.Registration.Now); err != nil {
+	if regOpts.JWTPath != "" {
+		if err := persistRefreshedToken(regOpts.JWTPath, result, regOpts.Now); err != nil {
 			slog.Warn("[runtime-token]",
 				"event", "refresh.cache-write-failed",
 				"workerId", result.WorkerID,
-				"jwtPath", r.opts.Registration.JWTPath,
+				"jwtPath", regOpts.JWTPath,
 				"err", err.Error(),
 			)
 		} else {
@@ -177,7 +226,6 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 	if r.opts.OnRefreshed != nil {
 		r.opts.OnRefreshed(result)
 	}
-	return result, nil
 }
 
 // OnReregister adapts Refresh to the HeartbeatOptions / PollOptions hook

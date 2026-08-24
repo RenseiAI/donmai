@@ -352,6 +352,11 @@ type Daemon struct {
 	// Nil for stub registrations and when registration is skipped.
 	tokenRefresher *tokenRefresher
 
+	// credentialRefresher owns the active registration options as well as the
+	// runtime credentials. daemon.yaml project reloads update it before forcing
+	// a fresh registration so the orchestrator observes the current declaration.
+	credentialRefresher *CredentialRefresher
+
 	// lastHostStatus stores the most recent hostStatus the platform sent
 	// in a heartbeat response. The pool-deleted / pool-disabled signals
 	// surface here so af daemon stats can show "your pool was deleted —
@@ -1047,6 +1052,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 				}
 			},
 		})
+		d.mu.Lock()
+		d.credentialRefresher = credentials
+		d.mu.Unlock()
 		refreshCreds := credentials.Refresh
 		reregister := credentials.OnReregister
 
@@ -1267,9 +1275,9 @@ func (d *Daemon) GatewayStatus() gateway.Status {
 
 // onYamlChanged is the fsnotify callback wired in Start(). Called whenever
 // daemon.yaml is rewritten on disk (operator edit or our own mutation-apply
-// path). Replaces the in-memory project list and pushes it into the
-// spawner; the heartbeat goroutine's next beat will detect the new hash
-// and report up to the platform.
+// path). Replaces the in-memory project list, pushes it into the spawner, and
+// re-presents the rebuilt registration options so a locally added project
+// reaches the orchestrator without waiting for token expiry or a restart.
 //
 // Defensive: only mutates state when projects[] actually differs from the
 // in-memory copy. Other fields (capacity, orchestrator URL) are NOT
@@ -1303,6 +1311,23 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	if d.spawner != nil {
 		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
 		d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
+	}
+	d.mu.RLock()
+	credentials := d.credentialRefresher
+	d.mu.RUnlock()
+	if credentials != nil {
+		credentials.UpdateRegistrationProjects(
+			AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs()),
+			cfg.EffectiveEnabledProjectIDs(),
+			cfg.EffectiveProjectAdmissionMode(),
+		)
+		go func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			if _, err := credentials.Reregister(ctx); err != nil {
+				slog.Warn("[yaml-watcher] project registration refresh failed", "err", err)
+			}
+		}()
 	}
 }
 
