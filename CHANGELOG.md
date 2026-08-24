@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Composed Snapshot emission can bind exact shim authority.** Embedders can
+  request one active emitting Snapshot through the complete session-shim
+  identity, shim, process-epoch, and controller-generation reference while the
+  existing identity-only API remains compatible.
+
 ## v0.68.11 — 2026-08-24
 
 ### Fixes
