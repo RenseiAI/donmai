@@ -320,6 +320,17 @@ type SessionShimCarrierActivationReceipt struct {
 	AckSeq     uint64
 }
 
+// SessionShimControlRef is the exact authenticated local authority captured
+// from one adoption. It contains no credential or terminal data. Every field
+// must still match the daemon's current adopted controller before a composed
+// carrier callback may mutate the shim.
+type SessionShimControlRef struct {
+	Identity             sessionshim.Identity
+	ShimID               string
+	ProcessEpoch         uint64
+	ControllerGeneration uint64
+}
+
 // SessionShimPublishedBatchReceipt is the non-secret activation view of one
 // retained scope batch. The callback never receives opaque durable selectors.
 type SessionShimPublishedBatchReceipt struct {
@@ -511,6 +522,16 @@ type SessionShimConfig struct {
 	// each exact carrier_active durable cursor.
 	OnAdoptionPublished func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error)
 
+	// OnCarrierActivationAcknowledged is the infallible local-authority release
+	// edge for one exact scope/revision. It runs only after the server has echoed
+	// that current revision on heartbeat, before global admission may reopen.
+	// Stale, foreign, readiness-only, and no-pending acknowledgements never call
+	// it. A composer uses this to release its retained remote-ACKed carrier set.
+	// The hook is synchronous, bounded, infallible, and non-reentrant: Donmai
+	// holds the publication serialization barrier while invoking it, so it must
+	// not call back into adoption, publication, or heartbeat acknowledgement.
+	OnCarrierActivationAcknowledged func(SessionShimPublishedBatchReceipt)
+
 	// CallbackTimeout bounds PrepareAdoption, OnAdoption, and
 	// OnTerminalEvidence. Zero uses the launch timeout/default.
 	CallbackTimeout time.Duration
@@ -580,8 +601,9 @@ func (c SessionShimConfig) validateSnapshotCarrier() error {
 		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs proof-v2 readiness evidence", ErrSessionShimCarrierConfig)
 	}
 	if (c.PrepareAdoption == nil && c.PrepareAdoptionV2 == nil) || (c.OnAdoption == nil && c.OnAdoptionV2 == nil) ||
-		c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil {
-		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs PrepareAdoption, OnAdoption, OnSessionEventDurable, OnAdoptionBatch, and OnAdoptionPublished", ErrSessionShimCarrierConfig)
+		c.OnSessionEventDurable == nil || c.OnAdoptionBatch == nil || c.OnAdoptionPublished == nil ||
+		c.OnCarrierActivationAcknowledged == nil {
+		return fmt.Errorf("%w: RequireAuthoritativeSnapshot needs PrepareAdoption, OnAdoption, OnSessionEventDurable, OnAdoptionBatch, OnAdoptionPublished, and OnCarrierActivationAcknowledged", ErrSessionShimCarrierConfig)
 	}
 	if c.ResumeFrom != nil {
 		return fmt.Errorf("%w: proof-resolving PrepareAdoption and free-standing ResumeFrom cannot both be configured", ErrSessionShimCarrierConfig)
@@ -612,6 +634,27 @@ func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
 	return err
 }
 
+// beginSessionShimRecoveryHeartbeatBarrier closes every new-work rail before a
+// dynamic adoption publication can change a scope's authoritative revision.
+// Carrier activation is necessary but does not clear this fence: only the
+// exact current server-echoed heartbeat does.
+func (d *Daemon) beginSessionShimRecoveryHeartbeatBarrier() {
+	if !d.sessionShimAttestationValue.enabled() {
+		return
+	}
+	d.lifecycleMu.Lock()
+	if d.spawner != nil {
+		d.spawner.Pause()
+	}
+	if d.stopGen == nil {
+		switch d.State() {
+		case StateRunning, StateStopped:
+			d.setState(StateRecovering)
+		}
+	}
+	d.lifecycleMu.Unlock()
+}
+
 // withdrawSessionShimProofV2Readiness closes every new-work rail on the first
 // dynamic readiness failure. The atomic fence flips first so heartbeat capacity,
 // poll/claim, and Daemon.AcceptWork fail closed even while the spawner/lifecycle
@@ -632,16 +675,48 @@ func (d *Daemon) withdrawSessionShimProofV2Readiness() {
 	slog.Warn("session shim: proof-v2 readiness withdrawn; admission paused")
 }
 
-// acknowledgeSessionShimRecoveryHeartbeat is the only dynamic reopening edge.
-// The heartbeat service invokes it after an exact server acknowledgement. A
-// second live readiness resolution is required so a stale positive projection
-// cannot reopen a daemon after the durable store withdrew again in flight.
-func (d *Daemon) acknowledgeSessionShimRecoveryHeartbeat(acknowledged SessionShimHeartbeatProjection) {
+// AcknowledgeSessionShimRecoveryHeartbeat is the only dynamic reopening edge.
+// Primary and satellite heartbeat services invoke it with their explicit scope
+// after an exact server acknowledgement. A second live readiness resolution is
+// required so a stale positive projection cannot reopen a daemon after either
+// the scope revision or durable store changed in flight.
+func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
+	orgID string,
+	acknowledged SessionShimHeartbeatProjection,
+) {
 	if !d.sessionShimAttestationValue.enabled() || !d.sessionShimReadinessWithdrawn.Load() {
 		return
 	}
-	current, err := d.SessionShimHeartbeatProjection(d.sessionShimConfig().orgID())
+	d.shims.publicationMu.Lock()
+	defer d.shims.publicationMu.Unlock()
+	if !d.sessionShimReadinessWithdrawn.Load() || d.shims.dynamicPublicationFailed {
+		return
+	}
+	current, err := d.SessionShimHeartbeatProjection(orgID)
 	if err != nil || !acknowledged.exactEqual(current) {
+		return
+	}
+	var activationAcknowledgement *SessionShimPublishedBatchReceipt
+	d.shims.mu.Lock()
+	if len(d.shims.pendingHeartbeatAcks) > 0 {
+		pendingRevision, pending := d.shims.pendingHeartbeatAcks[orgID]
+		if !pending || pendingRevision != acknowledged.AdoptionRevision {
+			d.shims.mu.Unlock()
+			return
+		}
+		delete(d.shims.pendingHeartbeatAcks, orgID)
+		activationAcknowledgement = &SessionShimPublishedBatchReceipt{
+			Scope: orgID, AdoptionRevision: pendingRevision,
+		}
+	}
+	pendingScopes := len(d.shims.pendingHeartbeatAcks)
+	d.shims.mu.Unlock()
+	if activationAcknowledgement != nil {
+		if hook := d.sessionShimConfig().OnCarrierActivationAcknowledged; hook != nil {
+			hook(*activationAcknowledgement)
+		}
+	}
+	if pendingScopes != 0 {
 		return
 	}
 	if !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
@@ -682,6 +757,12 @@ func defaultShimRegistryDir() string {
 type adoptedShim struct {
 	controller *sessionshim.Controller
 	shimID     string
+	// carrierActivationResolved records only that this exact adopted entry's
+	// remote carrier receipt resolved the pending Snapshot or consumed recovery
+	// and its cursor persisted. Local viewer-mutation authority stays held until
+	// the later exact scope heartbeat invokes OnCarrierActivationAcknowledged.
+	// Absence of pending state alone never proves either fact.
+	carrierActivationResolved bool
 	// handle is the published SessionHandle for a shim this daemon LAUNCHED. A
 	// shim adopted at startup has none: the spec that created it belonged to a
 	// daemon generation that is gone, and inventing project/repository fields
@@ -745,14 +826,23 @@ type sessionShimAdoptionCorrelation struct {
 
 // sessionShimState is the daemon's live view of per-session shim ownership.
 type sessionShimState struct {
-	mu            sync.RWMutex
-	registry      *sessionshim.Registry
-	adopted       map[sessionshim.Identity]adoptedShim
-	quarantined   []sessionshim.QuarantinedSession
-	tombstoned    []sessionshim.Tombstone
-	fence         *sessionshim.Fence
-	fences        map[string]sessionshim.Fence
-	fenceRequests map[string]sessionshim.FenceRequest
+	mu sync.RWMutex
+	// publicationMu serializes the full dynamic adoption -> batch -> local
+	// publication -> carrier activation transaction. Composing batch revisions
+	// are global across served scopes, so overlapping dynamic publications would
+	// otherwise each validate a transient incomplete set.
+	publicationMu sync.Mutex
+	// dynamicPublicationFailed is protected by publicationMu. A launch already
+	// queued across the old admission edge must not publish after an earlier
+	// serialized activation failed and closed readiness.
+	dynamicPublicationFailed bool
+	registry                 *sessionshim.Registry
+	adopted                  map[sessionshim.Identity]adoptedShim
+	quarantined              []sessionshim.QuarantinedSession
+	tombstoned               []sessionshim.Tombstone
+	fence                    *sessionshim.Fence
+	fences                   map[string]sessionshim.Fence
+	fenceRequests            map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.
@@ -762,6 +852,11 @@ type sessionShimState struct {
 	correlations       map[shimIncarnation]sessionShimAdoptionCorrelation
 	batchReceipts      map[string]SessionShimAdoptionBatchReceipt
 	credentialReceipts map[string]SessionShimScopeCredentialReceipt
+	// pendingHeartbeatAcks binds every dynamically published scope to the exact
+	// adoption revision whose first server-echoed heartbeat must be observed
+	// before local capacity, poll, claim, and spawn admission reopen. A later
+	// same-scope revision supersedes the older pending acknowledgement.
+	pendingHeartbeatAcks map[string]string
 	// stagingSnapshots marks the one mandatory emitting snapshot call before it
 	// reaches the ordered event consumer. pendingSnapshots retains the exact event
 	// until carrier_active returns its durable ack; activationGates backpressure
@@ -797,8 +892,10 @@ type sessionShimState struct {
 	// adoptionCompletedAtUnixNano is the completion observation for the current
 	// controller's §D4 pass. Zero means adoption is disabled or did not complete.
 	adoptionCompletedAtUnixNano int64
-	// carrierActivationComplete is distinct from adoptionComplete. Hosted v2
-	// recovery cannot become ready between local publication and carrier_active.
+	// carrierActivationComplete is distinct from adoptionComplete and means the
+	// exact remote carrier_active receipt/cursor set resolved. Local control
+	// authority remains held until each changed scope's later exact heartbeat
+	// invokes OnCarrierActivationAcknowledged.
 	carrierActivationComplete bool
 }
 
@@ -811,6 +908,7 @@ func newSessionShimState() *sessionShimState {
 		fenceRequests:        make(map[string]sessionshim.FenceRequest),
 		batchReceipts:        make(map[string]SessionShimAdoptionBatchReceipt),
 		credentialReceipts:   make(map[string]SessionShimScopeCredentialReceipt),
+		pendingHeartbeatAcks: make(map[string]string),
 		stagingSnapshots:     make(map[sessionshim.Identity]bool),
 		pendingSnapshots:     make(map[sessionshim.Identity]sessionshim.ControllerEvent),
 		activationGates:      make(map[sessionshim.Identity]*shimAdoptionGate),
@@ -1133,7 +1231,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				result.Close()
 				return fmt.Errorf("session shim: durable adoption batch for organization %q: %w", orgID, batchErr)
 			}
-			if revisionErr := d.updateSessionShimAdoptionRevision(orgID, receipt.AdoptionRevision); revisionErr != nil {
+			heartbeatAckPending := d.sessionShimAttestationValue.enabled() && cfg.OnAdoptionPublished != nil &&
+				cfg.OnCarrierActivationAcknowledged != nil
+			if revisionErr := d.updateSessionShimAdoptionRevision(
+				orgID, receipt.AdoptionRevision, heartbeatAckPending,
+			); revisionErr != nil {
 				result.Close()
 				return fmt.Errorf("session shim: retain adoption revision for organization %q: %w", orgID, revisionErr)
 			}
@@ -1890,7 +1992,7 @@ func (d *Daemon) sessionShimCredentialReceipts() []SessionShimScopeCredentialRec
 	return out
 }
 
-func (d *Daemon) updateSessionShimAdoptionRevision(scope, revision string) error {
+func (d *Daemon) updateSessionShimAdoptionRevision(scope, revision string, heartbeatAckPending bool) error {
 	if !d.sessionShimAttestationValue.enabled() {
 		return nil
 	}
@@ -1905,6 +2007,13 @@ func (d *Daemon) updateSessionShimAdoptionRevision(scope, revision string) error
 	}
 	receipt.AdoptionRevision = revision
 	d.shims.credentialReceipts[scope] = receipt
+	if heartbeatAckPending {
+		d.shims.pendingHeartbeatAcks[scope] = revision
+		// The lifecycle state and spawner are already closed. Publish the atomic
+		// admission fence in the same critical section as the exact revision so a
+		// heartbeat can never observe one without the other.
+		d.sessionShimReadinessWithdrawn.Store(true)
+	}
 	return nil
 }
 
@@ -2079,24 +2188,50 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	entries map[sessionshim.Identity]adoptedShim,
 ) error {
 	if d.sessionShimReadinessWithdrawn.Load() {
-		return errors.New("session shim: proof-v2 readiness is withdrawn")
+		d.shims.mu.RLock()
+		awaitingPublicationHeartbeat := len(d.shims.pendingHeartbeatAcks) > 0
+		d.shims.mu.RUnlock()
+		if !awaitingPublicationHeartbeat {
+			return errors.New("session shim: proof-v2 readiness is withdrawn")
+		}
 	}
 	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return fmt.Errorf("session shim: proof-v2 activation readiness: %w", err)
 	}
 	carriers := make([]SessionShimCarrierActivation, 0, len(entries))
-	for _, entry := range entries {
+	d.shims.mu.RLock()
+	for id, entry := range entries {
+		current, adopted := d.shims.adopted[id]
+		if !adopted || current.controller != entry.controller {
+			d.shims.mu.RUnlock()
+			return fmt.Errorf("session shim: carrier activation publication is not the current adopted entry for %s", id)
+		}
+		_, pendingSnapshot := d.shims.pendingSnapshots[id]
+		consumedRecovery := current.consumedRecovery != nil
 		carrier, ok, err := sessionShimCarrierActivationFor(entry.adoption)
 		if err != nil {
+			d.shims.mu.RUnlock()
 			return err
+		}
+		if !pendingSnapshot && !consumedRecovery {
+			if current.carrierActivationResolved {
+				continue
+			}
+			if ok && entry.adoption.CarrierCompatible {
+				d.shims.mu.RUnlock()
+				return fmt.Errorf("session shim: published carrier candidate has no pending Snapshot or consumed recovery for %s", id)
+			}
+			continue
 		}
 		if ok && entry.adoption.CarrierCompatible {
 			carriers = append(carriers, carrier)
 		} else if entry.adoption.CarrierCompatible && d.sessionShimConfig().RequireAuthoritativeSnapshot {
+			d.shims.mu.RUnlock()
 			return errors.New("session shim: authoritative Snapshot carrier omitted carrier_epoch")
 		}
 	}
+	d.shims.mu.RUnlock()
 	sortSessionShimCarrierActivations(carriers)
 	for i := 1; i < len(carriers); i++ {
 		if carriers[i-1] == carriers[i] {
@@ -2240,6 +2375,7 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 				return fmt.Errorf("session shim: consumed recovery changed while persisting acknowledgement for %s", activation.id)
 			}
 			current.consumedRecovery = nil
+			current.carrierActivationResolved = true
 			d.shims.adopted[activation.id] = current
 			continue
 		}
@@ -2251,6 +2387,13 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 		}
 		delete(d.shims.pendingSnapshots, activation.id)
 		delete(d.shims.activationGates, activation.id)
+		entry, adopted := d.shims.adopted[activation.id]
+		if !adopted || entry.controller != activation.ctrl || entry.carrierActivationResolved {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: adopted carrier changed while completing activation for %s", activation.id)
+		}
+		entry.carrierActivationResolved = true
+		d.shims.adopted[activation.id] = entry
 	}
 	d.shims.mu.Unlock()
 	for _, activation := range resolved {
@@ -2328,9 +2471,11 @@ func (d *Daemon) SessionShimAdoptionComplete() bool {
 	return d.shims.adoptionComplete
 }
 
-// SessionShimCarrierActivationComplete reports the separate D13 readiness fact.
-// Adoption can be locally complete while an exact v2 candidate is still
-// waiting for carrier_active; callers must require both.
+// SessionShimCarrierActivationComplete reports remote D13 exact-set completion.
+// It does not mean local viewer-mutation authority has been released: hosted
+// composers do that per scope from OnCarrierActivationAcknowledged after the
+// exact adoption revision heartbeat. Admission therefore also requires the
+// heartbeat fence to be clear.
 func (d *Daemon) SessionShimCarrierActivationComplete() bool {
 	if d.shims == nil || !d.sessionShimConfig().EnableAdoption {
 		return true

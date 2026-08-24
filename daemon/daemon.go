@@ -1134,7 +1134,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 			heartbeatOpts.GetSessionShim = func() (SessionShimHeartbeatProjection, error) {
 				return d.SessionShimHeartbeatProjection(primaryScope)
 			}
-			heartbeatOpts.OnSessionShimAcknowledged = d.acknowledgeSessionShimRecoveryHeartbeat
+			heartbeatOpts.OnSessionShimAcknowledged = func(projection SessionShimHeartbeatProjection) {
+				d.AcknowledgeSessionShimRecoveryHeartbeat(primaryScope, projection)
+			}
 		}
 		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
