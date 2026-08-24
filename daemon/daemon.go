@@ -637,10 +637,17 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
-	if d.sessionShimAttestationValue.enabled() &&
-		(d.sessionShimReadinessWithdrawn.Load() || d.State() != StateRunning ||
-			!d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete()) {
-		return true, "session-shim recovery is not ready"
+	if d.sessionShimAttestationValue.enabled() {
+		if d.sessionShimReadinessWithdrawn.Load() {
+			return true, "session-shim recovery is not ready"
+		}
+		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+			d.withdrawSessionShimProofV2Readiness()
+			return true, "session-shim proof-v2 readiness is unavailable"
+		}
+		if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
+			return true, "session-shim recovery is not ready"
+		}
 	}
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
@@ -1748,6 +1755,10 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return nil, fmt.Errorf("session-shim proof-v2 readiness: %w", err)
 	}
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())

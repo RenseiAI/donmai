@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -140,6 +141,65 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 		if sequence != uint64(index+1) {
 			t.Fatalf("priority queue sequence[%d] = %d, want %d", index, sequence, index+1)
 		}
+	}
+}
+
+func TestSelectedV3PriorityEventQueueOverflowFailsClosed(t *testing.T) {
+	if selectedV3EventQueueLimit != 128 {
+		t.Fatalf("selected-v3 priority queue limit = %d, want 128", selectedV3EventQueueLimit)
+	}
+	controller := &Controller{
+		selected:   shimwire.V3,
+		eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		closing:    make(chan struct{}),
+	}
+	for i := 0; i < selectedV3EventQueueLimit; i++ {
+		if err := controller.publishEvent(ControllerEvent{Kind: EventHostFrame, Seq: uint64(i + 1)}); err != nil {
+			t.Fatalf("fill priority queue at %d: %v", i, err)
+		}
+	}
+	if err := controller.publishEvent(ControllerEvent{
+		Kind: EventHostFrame, Seq: selectedV3EventQueueLimit + 1,
+	}); err == nil || !strings.Contains(err.Error(), "exceeded its bound") {
+		t.Fatalf("priority queue overflow = %v", err)
+	}
+}
+
+func TestSelectedV3HeartbeatTimeoutClosesController(t *testing.T) {
+	clientConn, shimConn := net.Pipe()
+	controller := &Controller{
+		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
+		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
+		events: make(chan ControllerEvent, 1), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
+	}
+	go controller.readLoop()
+	peerDone := make(chan error, 1)
+	go func() {
+		defer shimConn.Close() //nolint:errcheck
+		reader := shimwire.NewReader(shimConn)
+		message, err := reader.ReadVersion(shimwire.V3)
+		if err != nil || message.Type != shimwire.TypeHeartbeat {
+			peerDone <- fmt.Errorf("heartbeat request = %s, %v", message.Type, err)
+			return
+		}
+		_, err = reader.ReadVersion(shimwire.V3)
+		peerDone <- err
+	}()
+	started := time.Now()
+	err := controller.Heartbeat(1)
+	if err == nil || !strings.Contains(err.Error(), "timed out") || time.Since(started) < 5*time.Second {
+		t.Fatalf("heartbeat timeout = %v after %s", err, time.Since(started))
+	}
+	select {
+	case <-controller.closing:
+	case <-time.After(time.Second):
+		t.Fatal("heartbeat timeout did not enter closed state")
+	}
+	_ = clientConn.Close()
+	<-controller.Done()
+	if err := <-peerDone; err == nil {
+		t.Fatal("heartbeat timeout left peer transport open")
 	}
 }
 
