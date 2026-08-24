@@ -25,20 +25,32 @@ artifacts were created. This patch carries those changes forward._
   flat layouts and released client types. (#384)
 - **Durable session-shim recovery requires proof-v2 authority.** New admission
   binds the exact proof capability, bearer, receipt, PTY epoch, and cursor.
-  Consumed recovery reuses the original staged Snapshot without issuing a
-  second one, and a readiness withdrawal closes spawn, poll, claim, and
-  capacity until a fresh draining heartbeat is acknowledged. (#395)
+  Consumed recovery reuses the original bearer, candidate, and staged Snapshot
+  without issuing a second one. (#395)
 
 ### Fixes
 
 - **Release tags require authorized creation, immutable refs, and verified
-  signatures.** Binary, worker-image, and template publishers fail before
+  signatures.** Binary, worker-image, and E2B-template publishers fail before
   build unless the required protection rules are active and GitHub verifies
   the annotated tag signature at its exact commit. (#388)
 - **Restored archived workareas validate repository metadata.** Restore derives
-  selected and repository paths from the copied, digest-verified declaration
-  and rejects malformed or mismatched archive metadata before publication.
-  (#392)
+  selected and repository paths from the copied, digest-verified declaration.
+  Unsafe leaves, paths outside the restored session root, and manifest or
+  declaration mismatches are rejected before publication. (#392)
+- **Attach v2 preserves the released omitted-field resume shape.** Callers that
+  omit both proof schema and authority retain the frozen proof-v1
+  `same_handoff` behavior. Supplying only one field, or an unknown explicit
+  value, remains a closed validation error. (#398)
+- **Proof-v2 readiness is resolved at every new-work edge.** Claim polling,
+  direct admission, and carrier activation each re-read all five durable
+  readiness facts. A withdrawal enters the existing recovering, zero-capacity,
+  heartbeat-acknowledged reopen path. (#398)
+- **Selected-v3 recovery releases buffered PTY progress only after a durable
+  acknowledgement advances.** Equal, ahead, failed-persistence, and timed-out
+  Heartbeats cannot open the Hello output barrier. A successful durable put
+  opens it before the reply write so a lost response cannot deadlock locally
+  committed recovery. (#398)
 
 ### Chores
 
