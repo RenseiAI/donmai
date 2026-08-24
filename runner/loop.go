@@ -47,7 +47,7 @@ func termCastPath(wpath string) string {
 }
 
 func worktreeProvisionStrategy(qw QueuedWork) worktree.CloneStrategy {
-	if qw.Repository == "" && qw.RepositoryDeclaration == nil && qw.WorkareaMode != worktree.ModeShared {
+	if qw.Repository == "" && qw.RepositoryDeclaration == nil && qw.CacheSeedID == "" && qw.WorkareaMode != worktree.ModeShared {
 		return worktree.StrategyEmpty
 	}
 	return worktree.StrategyClone

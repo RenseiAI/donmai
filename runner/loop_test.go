@@ -39,6 +39,7 @@ func TestWorktreeProvisionStrategyRepositoryFreeOnly(t *testing.T) {
 		{name: "repository clone", work: QueuedWork{QueuedWork: prompt.QueuedWork{Repository: "https://example.test/repository.git"}}, want: worktree.StrategyClone},
 		{name: "versioned declaration", work: QueuedWork{RepositoryDeclaration: &workarea.RepositoryDeclarationV1{}}, want: worktree.StrategyClone},
 		{name: "shared participant", work: QueuedWork{WorkareaMode: worktree.ModeShared}, want: worktree.StrategyClone},
+		{name: "declaration seed", work: QueuedWork{CacheSeedID: "seed-one"}, want: worktree.StrategyClone},
 	}
 	for _, test := range tests {
 		t.Run(test.name, func(t *testing.T) {
