@@ -27,17 +27,44 @@ type SessionShimHostAttestation struct {
 const (
 	SessionShimCapabilityAuthoritativeSnapshotV2   = "authoritative_snapshot_v2"
 	SessionShimCapabilityCarrierEpochPrepareCommit = "carrier_epoch_prepare_commit"
-	SessionShimCapabilityDurableCarrierProofV1     = "durable_carrier_proof_v1"
-	SessionShimCapabilityFullHostFrameV3           = "full_host_frame_v3"
-	SessionShimCapabilityInteractiveAttachV2       = "interactive_attach_v2"
+	// SessionShimCapabilityDurableCarrierProofV1 is retained as a public name
+	// for frozen exact same-handoff replay/drain. It is never part of a new
+	// admission attestation after proof-v2 cutover.
+	SessionShimCapabilityDurableCarrierProofV1 = "durable_carrier_proof_v1"
+	SessionShimCapabilityDurableCarrierProofV2 = "durable_carrier_proof_v2"
+	SessionShimCapabilityFullHostFrameV3       = "full_host_frame_v3"
+	SessionShimCapabilityInteractiveAttachV2   = "interactive_attach_v2"
 )
 
 var requiredSessionShimHostCapabilities = []string{
 	SessionShimCapabilityAuthoritativeSnapshotV2,
 	SessionShimCapabilityCarrierEpochPrepareCommit,
-	SessionShimCapabilityDurableCarrierProofV1,
+	SessionShimCapabilityDurableCarrierProofV2,
 	SessionShimCapabilityFullHostFrameV3,
 	SessionShimCapabilityInteractiveAttachV2,
+}
+
+// SessionShimCarrierProofV2Readiness is the exact durable dependency required
+// before the daemon may advertise or continue using the proof-v2 capability.
+// DurableCarrierProofV2Ready is separate carrier-owned durable ACK evidence; it
+// is never derived from the four composing support facts.
+type SessionShimCarrierProofV2Readiness struct {
+	DurableCarrierProofV2Ready          bool `json:"durable_carrier_proof_v2_ready"`
+	ComposingProofV1WritesClosed        bool `json:"composingProofV1WritesClosed"`
+	EncryptedOriginalCredentialRetained bool `json:"encryptedOriginalCredentialRetained"`
+	RemainingValidityConsumeGate        bool `json:"remainingValidityConsumeGate"`
+	AdoptedCandidateRecovery            bool `json:"adoptedCandidateRecovery"`
+}
+
+func (r SessionShimCarrierProofV2Readiness) validate() error {
+	if !r.DurableCarrierProofV2Ready {
+		return errors.New("session shim: durable carrier proof v2 readiness acknowledgement is required")
+	}
+	if !r.ComposingProofV1WritesClosed || !r.EncryptedOriginalCredentialRetained ||
+		!r.RemainingValidityConsumeGate || !r.AdoptedCandidateRecovery {
+		return errors.New("session shim: durable carrier proof v2 composition support is incomplete")
+	}
+	return nil
 }
 
 // RequiredSessionShimHostCapabilities returns the canonical closed hosted set.

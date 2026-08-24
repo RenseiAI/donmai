@@ -138,7 +138,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 
 	var (
-		prepared       sessionshim.PreparedAdoption
+		prepared       SessionShimAdoptionPreparationResult
 		preparedHostID string
 	)
 	controllerOpts := sessionshim.ControllerOptions{
@@ -159,7 +159,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			}
 			preparedHostID = hostID
 			prepared = resolved
-			return resolved, nil
+			return resolved.PreparedAdoption, nil
 		},
 	}
 	ctrl, err := sessionshim.Dial(ctx, rec, controllerOpts)
@@ -175,7 +175,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	gate := newShimAdoptionGate()
 	d.consumeShimEventsGated(ctrl, gate)
-	receipt, err := d.completeSessionShimAdoption(ctx, evidence)
+	receipt, err := d.completeSessionShimAdoption(ctx, evidence, prepared)
 	evidence.SnapshotProxy.deactivate()
 	if err != nil {
 		d.cancelStagedSessionShimSnapshot(id)

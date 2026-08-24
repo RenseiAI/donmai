@@ -111,8 +111,9 @@ func TestAuthoritativeSnapshotCarrierConfigFailsClosedBeforeAdoption(t *testing.
 		},
 		"no durable stream": {
 			EnableAdoption: true, RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
-			AttestationCapabilities: RequiredSessionShimHostCapabilities(),
-			OnAdoption:              adopt, OnAdoptionBatch: batch, OnAdoptionPublished: published,
+			GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+			AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+			OnAdoption:                 adopt, OnAdoptionBatch: batch, OnAdoptionPublished: published,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

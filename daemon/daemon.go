@@ -319,6 +319,11 @@ type Daemon struct {
 	// controllerIDValue. Registration and every refresh reuse this exact tuple.
 	sessionShimAttestationValue SessionShimHostAttestation
 	sessionShimAttestationErr   error
+	// sessionShimReadinessWithdrawn is the single dynamic admission fence shared
+	// by heartbeat capacity, poll/claim, and Daemon.AcceptWork. It flips before
+	// the lifecycle state/spawner are closed and clears only after a newly
+	// acknowledged exact recovery heartbeat.
+	sessionShimReadinessWithdrawn atomic.Bool
 
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be
@@ -633,7 +638,8 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
 	if d.sessionShimAttestationValue.enabled() &&
-		(d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete()) {
+		(d.sessionShimReadinessWithdrawn.Load() || d.State() != StateRunning ||
+			!d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete()) {
 		return true, "session-shim recovery is not ready"
 	}
 	status := d.HostStatus()
@@ -734,6 +740,14 @@ func (d *Daemon) maxConcurrentSessions() int {
 	return d.config.Capacity.MaxConcurrentSessions
 }
 
+func (d *Daemon) heartbeatMaxConcurrentSessions() int {
+	if d.sessionShimAttestationValue.enabled() &&
+		(d.sessionShimReadinessWithdrawn.Load() || d.State() != StateRunning) {
+		return 0
+	}
+	return d.maxConcurrentSessions()
+}
+
 // Start brings the daemon online: load config (or wizard), register, start
 // heartbeat, and start the spawner. The HTTP server is NOT started here;
 // callers do that explicitly via Server.Start so they can pick the bind.
@@ -781,6 +795,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.config = cfg
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return err
+	}
 
 	// Detect substrate capabilities before registration so they can be
 	// included in the provides[] array on POST /api/workers/register.
@@ -1046,7 +1063,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// every beat so a consumer can see occupied-but-unreachable load
 			// instead of inferring an idle host from an unchanged session count.
 			GetQuarantinedSessions: d.QuarantinedSessions,
-			GetMaxCount:            func() int { return d.maxConcurrentSessions() },
+			GetMaxCount:            d.heartbeatMaxConcurrentSessions,
 			GetStatus:              d.RegistrationStatus,
 			Region:                 cfg.Machine.Region,
 			// Item 8: per-beat CPU/mem load sample → last_cpu_pct/last_mem_pct.
@@ -1086,6 +1103,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			heartbeatOpts.GetSessionShim = func() (SessionShimHeartbeatProjection, error) {
 				return d.SessionShimHeartbeatProjection(primaryScope)
 			}
+			heartbeatOpts.OnSessionShimAcknowledged = d.acknowledgeSessionShimRecoveryHeartbeat
 		}
 		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
@@ -1093,9 +1111,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 			if err := d.heartbeat.StartSynchronized(ctx); err != nil {
 				return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
 			}
-			d.spawner.Resume()
+			if !d.sessionShimReadinessWithdrawn.Load() {
+				d.spawner.Resume()
+			}
 			d.lifecycleMu.Lock()
-			if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
+			if d.ownsLifecycleLocked(lease) && d.stopGen == nil && !d.sessionShimReadinessWithdrawn.Load() {
 				d.setState(StateRunning)
 			}
 			d.lifecycleMu.Unlock()
@@ -1187,7 +1207,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	d.lifecycleMu.Lock()
-	if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
+	if d.ownsLifecycleLocked(lease) && d.stopGen == nil && !d.sessionShimReadinessWithdrawn.Load() {
 		d.setState(StateRunning)
 	}
 	d.lifecycleMu.Unlock()
@@ -1683,6 +1703,10 @@ func (d *Daemon) ResumeContext(ctx context.Context) error {
 	defer d.releaseLifecycle(lease)
 
 	d.lifecycleMu.Lock()
+	if d.sessionShimReadinessWithdrawn.Load() {
+		d.lifecycleMu.Unlock()
+		return errors.New("cannot resume while session-shim proof-v2 readiness is withdrawn")
+	}
 	if d.stopGen != nil || (d.State() != StatePaused && d.State() != StateDraining) {
 		state := d.State()
 		d.lifecycleMu.Unlock()
@@ -1722,6 +1746,9 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // corresponding SessionEventEnded event, so stale credentials never linger in
 // memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
+	if d.sessionShimReadinessWithdrawn.Load() {
+		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
+	}
 	if d.State() != StateRunning {
 		return nil, fmt.Errorf("daemon is not running (state %q)", d.State())
 	}
@@ -2222,6 +2249,9 @@ func (d *Daemon) MaxConcurrentSessions() int {
 // satellite heartbeat's GetStatus callback for a shared-spawner multi-identity
 // configuration.
 func (d *Daemon) RegistrationStatus() RegistrationStatus {
+	if d.sessionShimReadinessWithdrawn.Load() {
+		return RegistrationDraining
+	}
 	switch d.State() {
 	case StateStarting, StateRecovering, StateDraining, StateUpdating:
 		return RegistrationDraining

@@ -105,6 +105,7 @@ func TestSelectedV1StaysLocallyAdoptedButPublishesCarrierQuarantine(t *testing.T
 			ControllerID: "controller-v1-overlap", HostID: "stable-host-v1-overlap",
 			RequireAuthoritativeSnapshot: true,
 			RequireCredentialAttestation: true,
+			GetCarrierProofV2Readiness:   testSessionShimProofV2Readiness,
 			AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 			PrepareAdoption: func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 				prepareCalls++
@@ -196,6 +197,7 @@ func TestSelectedV2ConservesOwnershipButRefusesFullFrameCarrier(t *testing.T) {
 		ControllerID: "controller-v2-overlap", HostID: "stable-host-v2-overlap",
 		RequireAuthoritativeSnapshot: true,
 		RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness:   testSessionShimProofV2Readiness,
 		AttestationCapabilities:      RequiredSessionShimHostCapabilities(),
 		PrepareAdoption: func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 			prepareCalls++
