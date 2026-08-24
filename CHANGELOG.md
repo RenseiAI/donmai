@@ -8,6 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Hosts without a daemon config start cleanly.** Startup now treats the
+  documented missing-config result as an empty workarea archive setting instead
+  of dereferencing it before the first-run defaults can take effect.
+
 ## v0.68.5 — 2026-08-23
 
 _v0.68.4 was tagged, but its publishers stopped before build and no release
