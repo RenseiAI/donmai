@@ -9,6 +9,8 @@ import (
 	"testing"
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 func TestDaemonRunControlBindPreflight(t *testing.T) {
@@ -122,8 +124,71 @@ func TestDisplayEnvLocalPath(t *testing.T) {
 func TestWorkareaArchiveRootMissingConfig(t *testing.T) {
 	t.Parallel()
 
-	if got := workareaArchiveRoot(filepath.Join(t.TempDir(), "missing.yaml")); got != "" {
+	got, err := workareaArchiveRoot(filepath.Join(t.TempDir(), "missing.yaml"))
+	if err != nil {
+		t.Fatalf("workareaArchiveRoot(missing config): %v", err)
+	}
+	if got != "" {
 		t.Fatalf("workareaArchiveRoot(missing config) = %q, want empty", got)
+	}
+}
+
+func TestWorkareaArchiveRootPreservesConfiguredRoot(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	want := filepath.Join(t.TempDir(), "archives")
+	config := daemon.DefaultConfig()
+	config.Machine.ID = "test-machine"
+	config.Orchestrator.URL = "https://orchestrator.example"
+	config.Workarea.ArchiveRoot = want
+	if err := daemon.WriteConfig(configPath, config); err != nil {
+		t.Fatalf("write config: %v", err)
+	}
+
+	got, err := workareaArchiveRoot(configPath)
+	if err != nil {
+		t.Fatalf("workareaArchiveRoot(present config): %v", err)
+	}
+	if got != want {
+		t.Fatalf("workareaArchiveRoot(present config) = %q, want %q", got, want)
+	}
+}
+
+func TestWorkareaArchiveRootRejectsMalformedConfig(t *testing.T) {
+	t.Parallel()
+
+	configPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.WriteFile(configPath, []byte("machine: [\n"), 0o600); err != nil {
+		t.Fatalf("write malformed config: %v", err)
+	}
+	if _, err := workareaArchiveRoot(configPath); err == nil || !strings.Contains(err.Error(), "parse daemon config") {
+		t.Fatalf("workareaArchiveRoot(malformed config) error = %v, want typed parse error", err)
+	}
+}
+
+func TestDaemonRunRejectsMalformedConfigBeforeTerminalAuthority(t *testing.T) {
+	home := t.TempDir()
+	priorHome := statehome.BaseHome()
+	statehome.SetBaseHome(home)
+	t.Cleanup(func() { statehome.SetBaseHome(priorHome) })
+
+	configPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.WriteFile(configPath, []byte("machine: [\n"), 0o600); err != nil {
+		t.Fatalf("write malformed config: %v", err)
+	}
+
+	cmd := newDaemonRunCmd("test")
+	cmd.SetArgs([]string{"--config", configPath, "--skip-wizard", "--standalone-creds=off"})
+	var output strings.Builder
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	err := cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "load workarea archive configuration") {
+		t.Errorf("daemon run malformed-config error = %v, want early archive configuration error", err)
+	}
+	if _, statErr := os.Stat(statehome.StateDir("worktrees")); !os.IsNotExist(statErr) {
+		t.Errorf("terminal authority path exists after malformed config: %v", statErr)
 	}
 }
 
