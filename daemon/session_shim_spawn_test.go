@@ -1568,7 +1568,6 @@ func TestExactSessionShimControlRefEmitsOneActiveSnapshot(t *testing.T) {
 		t.Fatalf("exact Snapshot heartbeat projection: %v", err)
 	}
 	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, projection)
-	captureActive.Store(true)
 	ref := SessionShimControlRef{
 		Identity: id, ShimID: entry.shimID,
 		ProcessEpoch: entry.adoption.ProcessEpoch, ControllerGeneration: entry.adoption.ControllerGeneration,
@@ -1598,6 +1597,7 @@ func TestExactSessionShimControlRefEmitsOneActiveSnapshot(t *testing.T) {
 			}
 		})
 	}
+	captureActive.Store(true)
 	result, err := d.EmitAdoptedSessionShimSnapshotFor(context.Background(), ref)
 	if err != nil {
 		t.Fatalf("current exact Snapshot: %v", err)
