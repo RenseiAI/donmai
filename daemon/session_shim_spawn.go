@@ -173,6 +173,11 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: resolve adoption host %s: %w", id, err)
 	}
+	retainedActivation, err := retainedSessionShimCarrierActivationFor(prepared, evidence)
+	if err != nil {
+		_ = ctrl.Close()
+		return nil, fmt.Errorf("session shim: retained carrier activation %s: %w", id, err)
+	}
 	gate := newShimAdoptionGate()
 	d.consumeShimEventsGated(ctrl, gate)
 	receipt, err := d.completeSessionShimAdoption(ctx, evidence, prepared)
@@ -192,7 +197,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		d.shims.carrierActivationComplete = false
 		d.shims.mu.Unlock()
 	}
-	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt)
+	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt, retainedActivation)
 	if err != nil {
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
@@ -211,8 +216,11 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	d.shims.mu.Unlock()
 
-	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, layout.Root.String(), evidence, receipt, false)
-	gate.finish(true)
+	handle := d.trackLaunchedShim(
+		ctrl, spec, project, workarea, layout.Root.String(), evidence, receipt, retainedActivation, gate, false)
+	if retainedActivation == nil {
+		gate.finish(true)
+	}
 	if cfg.OnAdoptionPublished != nil {
 		d.shims.mu.RLock()
 		published := make(map[sessionshim.Identity]adoptedShim, len(d.shims.adopted))
@@ -318,6 +326,8 @@ func (d *Daemon) trackLaunchedShim(
 	workareaRoot string,
 	evidence SessionShimAdoptionEvidence,
 	receipt SessionShimAdoptionReceipt,
+	retainedActivation *SessionShimCarrierActivationReceipt,
+	retainedActivationGate *shimAdoptionGate,
 	startConsumer bool,
 ) SessionHandle {
 	handle := SessionHandle{
@@ -334,16 +344,20 @@ func (d *Daemon) trackLaunchedShim(
 		Repository:   spec.Repository,
 	}
 	entry := adoptedShim{
-		controller:      ctrl,
-		shimID:          ctrl.Hello().ShimID,
-		handle:          handle,
-		spec:            spec,
-		launched:        true,
-		adoption:        evidence,
-		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
+		controller:                ctrl,
+		shimID:                    ctrl.Hello().ShimID,
+		handle:                    handle,
+		spec:                      spec,
+		launched:                  true,
+		adoption:                  evidence,
+		adoptionReceipt:           cloneSessionShimAdoptionReceipt(receipt),
+		retainedCarrierActivation: cloneSessionShimCarrierActivationReceipt(retainedActivation),
 	}
 	d.shims.mu.Lock()
 	d.shims.adopted[ctrl.Identity()] = entry
+	if retainedActivation != nil {
+		d.shims.activationGates[ctrl.Identity()] = retainedActivationGate
+	}
 	d.shims.correlations[shimIncarnationFor(evidence)] = sessionShimAdoptionCorrelation{
 		evidence: evidence,
 		receipt:  cloneSessionShimAdoptionReceipt(receipt),

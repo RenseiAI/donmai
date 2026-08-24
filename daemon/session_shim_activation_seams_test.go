@@ -342,6 +342,91 @@ func TestProofV2ReadinessRequiresIndependentDurableAckAndEverySupportFact(t *tes
 	}
 }
 
+func TestProofV2ReadinessWithdrawalSuspendsPollingAndCandidateOperations(t *testing.T) {
+	current, _ := testSessionShimProofV2Readiness()
+	var prepareCalls atomic.Int64
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		ControllerID: "readiness-controller", AttestationCapabilities: RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) { return current, nil },
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			prepareCalls.Add(1)
+			resumeFrom := preparation.LastHostSeq + 1
+			return SessionShimAdoptionPreparationResult{
+				State: SessionShimPreparationFreshCandidate,
+				PreparedAdoption: sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions:           shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "41"}},
+					ResumeFrom:           &resumeFrom,
+				},
+			}, nil
+		},
+		OnAdoptionV2: func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			return SessionShimAdoptionReceipt{}, nil
+		},
+	}})
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+
+	mutations := map[string]func(*SessionShimCarrierProofV2Readiness){
+		"durable acknowledgement":       func(value *SessionShimCarrierProofV2Readiness) { value.DurableCarrierProofV2Ready = false },
+		"v1 writer closure":             func(value *SessionShimCarrierProofV2Readiness) { value.ComposingProofV1WritesClosed = false },
+		"original credential retention": func(value *SessionShimCarrierProofV2Readiness) { value.EncryptedOriginalCredentialRetained = false },
+		"remaining-validity gate":       func(value *SessionShimCarrierProofV2Readiness) { value.RemainingValidityConsumeGate = false },
+		"adopted recovery":              func(value *SessionShimCarrierProofV2Readiness) { value.AdoptedCandidateRecovery = false },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			value, _ := testSessionShimProofV2Readiness()
+			mutate(&value)
+			current = value
+			if suspended, _ := d.claimSuspended(); !suspended {
+				t.Fatal("claim gate remained open after proof-v2 readiness withdrawal")
+			}
+		})
+	}
+
+	current, _ = testSessionShimProofV2Readiness()
+	current.DurableCarrierProofV2Ready = false
+	var pollCalls atomic.Int64
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		pollCalls.Add(1)
+		_ = json.NewEncoder(w).Encode(PollResponse{})
+	}))
+	t.Cleanup(server.Close)
+	poller := NewPollService(PollOptions{
+		WorkerID: "worker", RuntimeJWT: "runtime", OrchestratorURL: server.URL,
+		ClaimSuspended: d.claimSuspended, OnWork: func(PollWorkItem) error { return nil }, HTTPClient: server.Client(),
+	})
+	poller.pollOnce(context.Background())
+	if pollCalls.Load() != 0 || !poller.ClaimsSuspended() {
+		t.Fatalf("poll withdrawal = calls:%d suspended:%v", pollCalls.Load(), poller.ClaimsSuspended())
+	}
+	preparation := sessionshim.AdoptionPreparation{
+		Identity:     sessionshim.Identity{OrgID: "org", SessionID: "session"},
+		ControllerID: d.ControllerID(), ShimID: "shim", ProcessEpoch: 3,
+		CurrentControllerGeneration: 7, LastHostSeq: 11, LocalResumeFrom: 12, SelectedVersion: shimwire.V3,
+	}
+	if _, err := d.prepareSessionShimAdoption(context.Background(), "host", preparation); err == nil || prepareCalls.Load() != 0 {
+		t.Fatalf("withdrawn preparation = calls:%d err:%v", prepareCalls.Load(), err)
+	}
+	if err := d.activatePublishedSessionShimCarriers(context.Background(), nil); err == nil {
+		t.Fatal("withdrawn readiness allowed carrier activation")
+	}
+
+	current, _ = testSessionShimProofV2Readiness()
+	if suspended, reason := d.claimSuspended(); suspended {
+		t.Fatalf("restored readiness stayed suspended: %s", reason)
+	}
+	if _, err := d.prepareSessionShimAdoption(context.Background(), "host", preparation); err != nil || prepareCalls.Load() != 1 {
+		t.Fatalf("restored preparation = calls:%d err:%v", prepareCalls.Load(), err)
+	}
+	if err := d.activatePublishedSessionShimCarriers(context.Background(), nil); err != nil {
+		t.Fatalf("restored empty activation: %v", err)
+	}
+}
+
 func testAdoptedCandidateRecoveryResult(t *testing.T, now time.Time) SessionShimAdoptionPreparationResult {
 	t.Helper()
 	credential, err := attachclient.NewV2RetainedCredential([]byte("original-adopted-candidate-bearer"))
@@ -387,7 +472,7 @@ func testAdoptedCandidateRecoveryResult(t *testing.T, now time.Time) SessionShim
 func TestAdoptedCandidateRecoveryIsExactOpaqueAndControllerGenerationIndependent(t *testing.T) {
 	now := time.Now()
 	result := testAdoptedCandidateRecoveryResult(t, now)
-	if err := validateSessionShimAdoptionPreparationResult(result, now); err != nil {
+	if err := validateSessionShimAdoptionPreparationResult(result, now, 3); err != nil {
 		t.Fatalf("valid adopted candidate recovery: %v", err)
 	}
 	encoded, err := json.Marshal(result)
@@ -435,6 +520,21 @@ func TestAdoptedCandidateRecoveryIsExactOpaqueAndControllerGenerationIndependent
 			t.Fatalf("generation %d recovery = %+v err=%v", generation, prepared, err)
 		}
 	}
+	mismatch := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		PrepareAdoptionV2: func(context.Context, SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			return result, nil
+		},
+	}})
+	if _, err := mismatch.prepareSessionShimAdoption(context.Background(), "stable-host", sessionshim.AdoptionPreparation{
+		Identity: sessionshim.Identity{OrgID: "org", SessionID: "session"}, ControllerID: mismatch.ControllerID(),
+		ShimID: "shim", ProcessEpoch: 4, CurrentControllerGeneration: 1,
+		LocalResumeFrom: 11, LastHostSeq: 12, SelectedVersion: shimwire.V3,
+	}); err == nil {
+		t.Fatal("adopted-candidate recovery accepted a PTY epoch from another authenticated preparation")
+	}
 }
 
 func TestAdoptedCandidateRecoveryRejectsRemintAndSecondCursorShapes(t *testing.T) {
@@ -459,6 +559,9 @@ func TestAdoptedCandidateRecoveryRejectsRemintAndSecondCursorShapes(t *testing.T
 		"changed carrier extension": func(result *SessionShimAdoptionPreparationResult) {
 			result.PreparedAdoption.Extensions.Values[shimwire.ExtCarrierEpoch] = "10"
 		},
+		"changed pty epoch": func(result *SessionShimAdoptionPreparationResult) {
+			result.AdoptedCandidateRecovery.ResumeDisposition.PTYEpoch++
+		},
 		"proof v1": func(result *SessionShimAdoptionPreparationResult) {
 			result.AdoptedCandidateRecovery.ResumeDisposition.ProofSchemaVersion = attachclient.V2ProofSchemaV1
 		},
@@ -473,7 +576,7 @@ func TestAdoptedCandidateRecoveryRejectsRemintAndSecondCursorShapes(t *testing.T
 		t.Run(name, func(t *testing.T) {
 			result := testAdoptedCandidateRecoveryResult(t, now)
 			mutate(&result)
-			if err := validateSessionShimAdoptionPreparationResult(result, now); err == nil {
+			if err := validateSessionShimAdoptionPreparationResult(result, now, 3); err == nil {
 				t.Fatal("invalid adopted-candidate recovery was accepted")
 			}
 		})
@@ -538,6 +641,150 @@ func TestOnAdoptionV2ReceivesExactEphemeralRecoveryAuthority(t *testing.T) {
 		CarrierCompatible: true, SnapshotProxy: &SessionShimSnapshotProxy{},
 	}, prepared); err == nil || snapshotAuthorityCalls != 0 || calls != 1 {
 		t.Fatal("adopted-candidate recovery accepted new Snapshot authority")
+	}
+}
+
+func TestAdoptedCandidateRecoveryPublishesAndActivatesWithoutSecondSnapshot(t *testing.T) {
+	first := newShimSpawnFixture(t)
+	spec := first.interactiveSpec("adopted-recovery-activation")
+	if _, err := first.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("initial AcceptWork: %v", err)
+	}
+	id := first.identity(spec.SessionID)
+	initialHighWater := first.exchange(t, id, "before-controller-replacement")
+	if initialHighWater == 0 {
+		t.Fatal("initial controller did not establish a positive durable high-water")
+	}
+	first.daemon.ReleaseAdoptedSessionShims()
+
+	var (
+		secondSnapshots atomic.Int64
+		batchCalls      int
+		activationCalls int
+		retained        SessionShimCarrierActivationReceipt
+	)
+	replacement := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: first.registry,
+		ControllerID: "replacement-controller", HostID: "stable-recovery-host",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			highWater := preparation.LastHostSeq
+			if highWater < initialHighWater || highWater == 0 {
+				return SessionShimAdoptionPreparationResult{}, fmt.Errorf(
+					"replacement Hello high-water = %d, want at least %d", highWater, initialHighWater)
+			}
+			credential, err := attachclient.NewV2RetainedCredential([]byte("exact-original-recovery-bearer"))
+			if err != nil {
+				return SessionShimAdoptionPreparationResult{}, err
+			}
+			correlation, err := NewSessionShimRecoveryCorrelation([]byte("exact-recovery-correlation"))
+			if err != nil {
+				return SessionShimAdoptionPreparationResult{}, err
+			}
+			resumeFrom := highWater + 1
+			snapshot := attachwire.Frame{
+				Type: attachwire.TypeSnapshot, Seq: highWater,
+				Payload: (attachwire.SnapshotEnvelope{
+					AtSeq: highWater - 1, SnapFormat: attachwire.SnapFormatScreen, Snap: []byte("retained"),
+				}).Encode(),
+			}.Encode()
+			return SessionShimAdoptionPreparationResult{
+				State: SessionShimPreparationAdoptedCandidateRecovery,
+				PreparedAdoption: sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions: shimwire.Extensions{
+						Required: []string{shimwire.ExtCarrierEpoch},
+						Values:   map[string]string{shimwire.ExtCarrierEpoch: "29"},
+					},
+					ResumeFrom: &resumeFrom,
+				},
+				AdoptedCandidateRecovery: &SessionShimAdoptedCandidateRecovery{
+					Credential: credential, RecoveryCorrelation: correlation,
+					CarrierEpoch: 29, PreStageAckSeq: highWater - 1,
+					StagedHighWater: highWater, ResumeFrom: resumeFrom,
+					CredentialExpiresAt: time.Now().Add(time.Hour),
+					ResumeDisposition: attachclient.V2ResumeDisposition{
+						ProofSchemaVersion: attachclient.V2ProofSchemaV2,
+						Authority:          attachclient.V2ResumeAdoptedCandidateRecovery,
+						State:              attachclient.V2ResumeReceiptStored,
+						PTYEpoch:           preparation.ProcessEpoch, CarrierEpoch: 29,
+						AckSeq: highWater - 1, CandidateSnapshotSeq: highWater,
+						CandidateSnapshot: snapshot,
+					},
+				},
+			}, nil
+		},
+		OnAdoptionV2: func(_ context.Context, got SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			if got.Evidence.SnapshotProxy != nil || got.PreparationResult.State != SessionShimPreparationAdoptedCandidateRecovery {
+				return SessionShimAdoptionReceipt{}, errors.New("recovered adoption gained fresh Snapshot authority")
+			}
+			return SessionShimAdoptionReceipt{DurableCorrelation: []byte("replayed-adoption")}, nil
+		},
+		OnSessionEventDurable: func(_ sessionshim.Identity, event sessionshim.ControllerEvent) error {
+			if event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeSnapshot {
+				secondSnapshots.Add(1)
+			}
+			return nil
+		},
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			batchCalls++
+			if len(batch.Adopted) != 1 || batch.Adopted[0].RetainedCarrierActivation == nil {
+				return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("batch retained activation = %+v", batch.Adopted)
+			}
+			retained = *batch.Adopted[0].RetainedCarrierActivation
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("replayed-batch"), AdoptionRevision: "replayed-revision",
+			}, nil
+		},
+		OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			activationCalls++
+			if len(publication.Carriers) != 1 || publication.Carriers[0] != retained.Activation {
+				return nil, fmt.Errorf("publication carriers = %+v, retained = %+v", publication.Carriers, retained)
+			}
+			return []SessionShimCarrierActivationReceipt{retained}, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, replacement, id.OrgID)
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("replacement adoption: %v", err)
+	}
+	if batchCalls != 1 || activationCalls != 1 || secondSnapshots.Load() != 0 ||
+		!replacement.SessionShimCarrierActivationComplete() {
+		t.Fatalf("recovery completion = batch:%d activation:%d snapshots:%d complete:%v",
+			batchCalls, activationCalls, secondSnapshots.Load(), replacement.SessionShimCarrierActivationComplete())
+	}
+	if retained.Activation != (SessionShimCarrierActivation{OrgID: id.OrgID, SessionID: id.SessionID, CarrierEpoch: 29}) ||
+		retained.AckSeq < initialHighWater {
+		t.Fatalf("retained carrier activation = %+v, initial high-water = %d", retained, initialHighWater)
+	}
+	replacement.shims.mu.RLock()
+	pending, staging, gates := len(replacement.shims.pendingSnapshots), len(replacement.shims.stagingSnapshots), len(replacement.shims.activationGates)
+	entry := replacement.shims.adopted[id]
+	replacement.shims.mu.RUnlock()
+	if pending != 0 || staging != 0 || gates != 0 || entry.retainedCarrierActivation == nil ||
+		*entry.retainedCarrierActivation != retained || !entry.carrierActivationComplete {
+		t.Fatalf("retained activation state = pending:%d staging:%d gates:%d entry:%+v", pending, staging, gates, entry.retainedCarrierActivation)
+	}
+	if got := replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID); got < retained.AckSeq {
+		t.Fatalf("replacement forwarded cursor = %d, want at least retained carrier_active ack %d", got, retained.AckSeq)
+	}
+	replacement.shims.mu.RLock()
+	replayedEntries := make(map[sessionshim.Identity]adoptedShim, len(replacement.shims.adopted))
+	for identity, adopted := range replacement.shims.adopted {
+		replayedEntries[identity] = adopted
+	}
+	replacement.shims.mu.RUnlock()
+	if err := replacement.activatePublishedSessionShimCarriers(context.Background(), replayedEntries); err != nil {
+		t.Fatalf("already-active retained carrier exclusion: %v", err)
+	}
+	if activationCalls != 1 || secondSnapshots.Load() != 0 {
+		t.Fatalf("already-active retained carrier = calls:%d snapshots:%d", activationCalls, secondSnapshots.Load())
+	}
+	if err := replacement.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("after-recovery\r")); err != nil {
+		t.Fatalf("post-activation input: %v", err)
 	}
 }
 

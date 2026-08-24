@@ -585,6 +585,80 @@ func TestV2ResumeDispositionRejectsMismatchedFrameCarrierAndAck(t *testing.T) {
 	}
 }
 
+func TestV2ResumeDispositionReleasedV0684CallerNormalizesToRetainedProofV1(t *testing.T) {
+	// This keyed literal is unchanged from the released v0.68.3/v0.68.4 caller.
+	// Those releases predate ProofSchemaVersion and Authority.
+	config := V2HostConfig{
+		AttachURL:   "ws://example.invalid/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) { return v2TestProofV1Token(t, nil), nil },
+		ResumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		},
+	}
+	if err := config.withDefaults(); err != nil {
+		t.Fatalf("released caller config: %v", err)
+	}
+	resume := config.ResumeDisposition
+	if resume.ProofSchemaVersion != V2ProofSchemaV1 || resume.Authority != V2ResumeSameHandoff {
+		t.Fatalf("released caller normalized to %q/%q", resume.ProofSchemaVersion, resume.Authority)
+	}
+	claims, err := parseV2HostClaims(v2TestProofV1Token(t, nil), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateV2ProofDisposition(claims, config); err != nil {
+		t.Fatalf("released proof-v1 same-handoff caller: %v", err)
+	}
+
+	// This receipt-stored literal is likewise unchanged from v0.68.3/v0.68.4.
+	snapshot := v2ResumeSnapshot(12)
+	pending := V2HostConfig{
+		AttachURL:   "ws://example.invalid/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) { return v2TestProofV1Token(t, nil), nil },
+		ResumeDisposition: &V2ResumeDisposition{
+			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
+			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
+			GapFromSeq: 11, GapToSeq: 11, GapReason: attachwirev2.GapControllerUnforwarded,
+		},
+	}
+	if err := pending.withDefaults(); err != nil {
+		t.Fatalf("released receipt-stored caller config: %v", err)
+	}
+	pendingClaims, err := parseV2HostClaims(v2TestProofV1Token(t, func(claims map[string]any) {
+		claims["carrier_boundary"] = "10"
+		claims["resolved_boundary"] = "11"
+		claims["last_host_seq"] = "11"
+	}), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateV2ProofDisposition(pendingClaims, pending); err != nil {
+		t.Fatalf("released receipt-stored proof-v1 caller: %v", err)
+	}
+}
+
+func TestV2ResumeDispositionExplicitPartialAndInvalidNewShapesRefuse(t *testing.T) {
+	base := V2ResumeDisposition{State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12}
+	for name, mutate := range map[string]func(*V2ResumeDisposition){
+		"schema only":    func(resume *V2ResumeDisposition) { resume.ProofSchemaVersion = V2ProofSchemaV2 },
+		"authority only": func(resume *V2ResumeDisposition) { resume.Authority = V2ResumeSameHandoff },
+		"unknown schema": func(resume *V2ResumeDisposition) {
+			resume.ProofSchemaVersion, resume.Authority = "3", V2ResumeSameHandoff
+		},
+		"unknown authority": func(resume *V2ResumeDisposition) {
+			resume.ProofSchemaVersion, resume.Authority = V2ProofSchemaV2, "unknown"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			resume := base
+			mutate(&resume)
+			if err := resume.Validate(); err == nil {
+				t.Fatal("explicit invalid new resume shape was accepted")
+			}
+		})
+	}
+}
+
 func TestV2HostClaimsAreExactAndIndependentFromV1(t *testing.T) {
 	now := time.Now()
 	if _, err := parseV2HostClaims(v2TestToken(t, nil), now); err != nil {

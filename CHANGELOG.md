@@ -8,6 +8,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Attach-v2 recovery now distinguishes proof schema and resume authority.**
+  New admissions require strict proof-v2 floor and predecessor claims, while the
+  unchanged v0.68.3/v0.68.4 resume-disposition shape normalizes only to frozen
+  proof-v1 same-handoff replay or drain. Retained credentials are opaque,
+  defensively copied, and redacted. (#393)
+- **Session-shim composition has explicit proof-v2 readiness and recovery
+  callbacks.** `SessionShimConfig` rechecks all five readiness facts before
+  polling, preparation, and activation. Consumed-adoption recovery carries its
+  retained candidate through batch publication and `carrier_active` without a
+  second proof, receipt, Snapshot, or cursor. (#393)
+
 ## v0.68.4 — 2026-08-23
 
 ### Features

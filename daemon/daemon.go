@@ -632,9 +632,13 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
-	if d.sessionShimAttestationValue.enabled() &&
-		(d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete()) {
-		return true, "session-shim recovery is not ready"
+	if d.sessionShimAttestationValue.enabled() {
+		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+			return true, "session-shim proof-v2 readiness is unavailable"
+		}
+		if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
+			return true, "session-shim recovery is not ready"
+		}
 	}
 	status := d.HostStatus()
 	if !status.SuspendsClaiming() {
@@ -1730,6 +1734,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	}
 	if d.spawner == nil {
 		return nil, errors.New("spawner not initialised")
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return nil, fmt.Errorf("daemon proof-v2 admission readiness: %w", err)
 	}
 	if detail != nil {
 		if detail.SessionID == "" {

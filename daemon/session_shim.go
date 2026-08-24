@@ -267,8 +267,9 @@ type SessionShimAdoptionReceipt struct {
 // SessionShimAdoptionOutcome pairs one committed local adoption with the exact
 // durable per-session receipt returned by the composing callback.
 type SessionShimAdoptionOutcome struct {
-	Evidence SessionShimAdoptionEvidence
-	Receipt  SessionShimAdoptionReceipt
+	Evidence                  SessionShimAdoptionEvidence
+	Receipt                   SessionShimAdoptionReceipt
+	RetainedCarrierActivation *SessionShimCarrierActivationReceipt
 }
 
 // SessionShimAdoptionBatch is one complete per-organization startup
@@ -639,6 +640,11 @@ type adoptedShim struct {
 	// generation until terminal proof is handed downstream.
 	adoption        SessionShimAdoptionEvidence
 	adoptionReceipt SessionShimAdoptionReceipt
+	// retainedCarrierActivation is exact non-secret evidence for a candidate
+	// whose proof/receipt adoption was consumed before this controller existed.
+	// It replaces, and never fabricates, the fresh path's pendingSnapshots entry.
+	retainedCarrierActivation *SessionShimCarrierActivationReceipt
+	carrierActivationComplete bool
 }
 
 type shimIncarnation struct {
@@ -913,7 +919,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}()
 	for _, c := range result.Adopted {
 		id := c.Identity()
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id], hostByID[id])
+		preparation := preparedByID[id]
+		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
@@ -921,7 +928,12 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparedByID[id])
+		retainedActivation, activationErr := retainedSessionShimCarrierActivationFor(preparation, evidence)
+		if activationErr != nil {
+			result.Close()
+			return fmt.Errorf("session shim: retained carrier activation for %s: %w", id, activationErr)
+		}
+		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparation)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
@@ -931,10 +943,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// The proxy is a synchronous takeover capability, not retained state.
 		evidence.SnapshotProxy = nil
 		entries[id] = adoptedShim{
-			controller:      c,
-			shimID:          c.Hello().ShimID,
-			adoption:        evidence,
-			adoptionReceipt: receipt,
+			controller:                c,
+			shimID:                    c.Hello().ShimID,
+			adoption:                  evidence,
+			adoptionReceipt:           receipt,
+			retainedCarrierActivation: retainedActivation,
 		}
 	}
 
@@ -999,8 +1012,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				if entry.adoption.Identity.OrgID == orgID {
 					if entry.adoption.CarrierCompatible {
 						batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
-							Evidence: entry.adoption,
-							Receipt:  entry.adoptionReceipt,
+							Evidence:                  entry.adoption,
+							Receipt:                   entry.adoptionReceipt,
+							RetainedCarrierActivation: cloneSessionShimCarrierActivationReceipt(entry.retainedCarrierActivation),
 						})
 					} else {
 						hello := entry.controller.Hello()
@@ -1044,6 +1058,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	d.shims.registry = registry
 	for id, entry := range entries {
 		d.shims.adopted[id] = entry
+		if entry.retainedCarrierActivation != nil {
+			d.shims.activationGates[id] = gates[entry.controller]
+		}
 		d.shims.correlations[shimIncarnationFor(entry.adoption)] = sessionShimAdoptionCorrelation{
 			evidence: entry.adoption,
 			receipt:  cloneSessionShimAdoptionReceipt(entry.adoptionReceipt),
@@ -1064,8 +1081,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		d.shims.batchReceipts[orgID] = receipt
 	}
 	d.shims.mu.Unlock()
-	for _, gate := range gates {
-		gate.finish(true)
+	for controller, gate := range gates {
+		if entries[controller.Identity()].retainedCarrierActivation == nil {
+			gate.finish(true)
+		}
 	}
 	gatesCommitted = true
 	d.shims.mu.Lock()
@@ -1324,6 +1343,16 @@ func cloneSessionShimAdoptionReceipt(in SessionShimAdoptionReceipt) SessionShimA
 	return SessionShimAdoptionReceipt{DurableCorrelation: append([]byte(nil), in.DurableCorrelation...)}
 }
 
+func cloneSessionShimCarrierActivationReceipt(
+	in *SessionShimCarrierActivationReceipt,
+) *SessionShimCarrierActivationReceipt {
+	if in == nil {
+		return nil
+	}
+	out := *in
+	return &out
+}
+
 func cloneSessionShimAdoptionEvidence(in SessionShimAdoptionEvidence) SessionShimAdoptionEvidence {
 	in.Extensions = cloneShimExtensions(in.Extensions)
 	in.PreparedCorrelation = append([]byte(nil), in.PreparedCorrelation...)
@@ -1344,6 +1373,9 @@ func (d *Daemon) prepareSessionShimAdoption(
 ) (SessionShimAdoptionPreparationResult, error) {
 	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
 		return SessionShimAdoptionPreparationResult{}, nil
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return SessionShimAdoptionPreparationResult{}, fmt.Errorf("session shim: proof-v2 preparation readiness: %w", err)
 	}
 	cfg := d.sessionShimConfig()
 	if cfg.PrepareAdoption != nil && cfg.PrepareAdoptionV2 != nil {
@@ -1380,7 +1412,7 @@ func (d *Daemon) prepareSessionShimAdoption(
 	if err != nil {
 		return SessionShimAdoptionPreparationResult{}, err
 	}
-	if err := validateSessionShimAdoptionPreparationResult(result, d.shimNow()); err != nil {
+	if err := validateSessionShimAdoptionPreparationResult(result, d.shimNow(), evidence.ProcessEpoch); err != nil {
 		return SessionShimAdoptionPreparationResult{}, err
 	}
 	prepared := result.PreparedAdoption
@@ -1397,7 +1429,11 @@ func (d *Daemon) prepareSessionShimAdoption(
 	return cloneSessionShimAdoptionPreparationResult(result), nil
 }
 
-func validateSessionShimAdoptionPreparationResult(result SessionShimAdoptionPreparationResult, now time.Time) error {
+func validateSessionShimAdoptionPreparationResult(
+	result SessionShimAdoptionPreparationResult,
+	now time.Time,
+	expectedPTYEpoch uint64,
+) error {
 	switch result.State {
 	case SessionShimPreparationFreshCandidate:
 		if result.AdoptedCandidateRecovery != nil {
@@ -1427,7 +1463,8 @@ func validateSessionShimAdoptionPreparationResult(result SessionShimAdoptionPrep
 		}
 		if resume.ProofSchemaVersion != attachclient.V2ProofSchemaV2 ||
 			resume.Authority != attachclient.V2ResumeAdoptedCandidateRecovery ||
-			resume.State != attachclient.V2ResumeReceiptStored || resume.CarrierEpoch != recovery.CarrierEpoch ||
+			resume.State != attachclient.V2ResumeReceiptStored || resume.PTYEpoch != expectedPTYEpoch ||
+			resume.CarrierEpoch != recovery.CarrierEpoch ||
 			resume.AckSeq != recovery.PreStageAckSeq || resume.CandidateSnapshotSeq != recovery.StagedHighWater {
 			return errors.New("session shim: adopted-candidate recovery disposition is not exact")
 		}
@@ -1584,6 +1621,8 @@ func cloneSessionShimAdoptionBatch(in SessionShimAdoptionBatch) SessionShimAdopt
 	for i := range in.Adopted {
 		in.Adopted[i].Evidence = cloneSessionShimAdoptionEvidence(in.Adopted[i].Evidence)
 		in.Adopted[i].Receipt = cloneSessionShimAdoptionReceipt(in.Adopted[i].Receipt)
+		in.Adopted[i].RetainedCarrierActivation = cloneSessionShimCarrierActivationReceipt(
+			in.Adopted[i].RetainedCarrierActivation)
 	}
 	in.Quarantined = append([]sessionshim.QuarantinedSession(nil), in.Quarantined...)
 	in.Tombstoned = append([]SessionShimTerminalEvidence(nil), in.Tombstoned...)
@@ -1635,6 +1674,7 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 	ctx context.Context,
 	evidence SessionShimAdoptionEvidence,
 	receipt SessionShimAdoptionReceipt,
+	retainedActivation *SessionShimCarrierActivationReceipt,
 ) (SessionShimAdoptionBatchReceipt, error) {
 	if d.sessionShimConfig().OnAdoptionBatch == nil {
 		return SessionShimAdoptionBatchReceipt{}, nil
@@ -1647,8 +1687,9 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 		}
 		if entry.adoption.CarrierCompatible {
 			batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
-				Evidence: cloneSessionShimAdoptionEvidence(entry.adoption),
-				Receipt:  cloneSessionShimAdoptionReceipt(entry.adoptionReceipt),
+				Evidence:                  cloneSessionShimAdoptionEvidence(entry.adoption),
+				Receipt:                   cloneSessionShimAdoptionReceipt(entry.adoptionReceipt),
+				RetainedCarrierActivation: cloneSessionShimCarrierActivationReceipt(entry.retainedCarrierActivation),
 			})
 		} else {
 			hello := entry.controller.Hello()
@@ -1677,7 +1718,9 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 	d.shims.mu.RUnlock()
 	if evidence.CarrierCompatible {
 		batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
-			Evidence: cloneSessionShimAdoptionEvidence(evidence), Receipt: cloneSessionShimAdoptionReceipt(receipt),
+			Evidence:                  cloneSessionShimAdoptionEvidence(evidence),
+			Receipt:                   cloneSessionShimAdoptionReceipt(receipt),
+			RetainedCarrierActivation: cloneSessionShimCarrierActivationReceipt(retainedActivation),
 		})
 	} else {
 		batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
@@ -1828,6 +1871,26 @@ func sessionShimCarrierActivationFor(evidence SessionShimAdoptionEvidence) (Sess
 	}, true, nil
 }
 
+func retainedSessionShimCarrierActivationFor(
+	preparation SessionShimAdoptionPreparationResult,
+	evidence SessionShimAdoptionEvidence,
+) (*SessionShimCarrierActivationReceipt, error) {
+	if preparation.State != SessionShimPreparationAdoptedCandidateRecovery {
+		return nil, nil
+	}
+	recovery := preparation.AdoptedCandidateRecovery
+	if recovery == nil || recovery.CarrierEpoch == 0 || recovery.StagedHighWater == 0 {
+		return nil, errors.New("session shim: adopted-candidate recovery omitted retained activation evidence")
+	}
+	return &SessionShimCarrierActivationReceipt{
+		Activation: SessionShimCarrierActivation{
+			OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
+			CarrierEpoch: recovery.CarrierEpoch,
+		},
+		AckSeq: recovery.StagedHighWater,
+	}, nil
+}
+
 func sortSessionShimCarrierActivations(in []SessionShimCarrierActivation) {
 	sort.Slice(in, func(i, j int) bool {
 		if in[i].OrgID != in[j].OrgID {
@@ -1949,14 +2012,30 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	ctx context.Context,
 	entries map[sessionshim.Identity]adoptedShim,
 ) error {
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return fmt.Errorf("session shim: proof-v2 activation readiness: %w", err)
+	}
 	carriers := make([]SessionShimCarrierActivation, 0, len(entries))
-	for _, entry := range entries {
+	retainedActivations := make(map[sessionshim.Identity]SessionShimCarrierActivationReceipt)
+	for id, entry := range entries {
+		if entry.carrierActivationComplete {
+			if entry.retainedCarrierActivation == nil {
+				return fmt.Errorf("session shim: active carrier omitted retained activation evidence for %s", id)
+			}
+			continue
+		}
 		carrier, ok, err := sessionShimCarrierActivationFor(entry.adoption)
 		if err != nil {
 			return err
 		}
 		if ok && entry.adoption.CarrierCompatible {
 			carriers = append(carriers, carrier)
+			if entry.retainedCarrierActivation != nil {
+				if entry.retainedCarrierActivation.Activation != carrier {
+					return fmt.Errorf("session shim: retained carrier activation changed for %s", id)
+				}
+				retainedActivations[id] = *entry.retainedCarrierActivation
+			}
 		} else if entry.adoption.CarrierCompatible && d.sessionShimConfig().RequireAuthoritativeSnapshot {
 			return errors.New("session shim: authoritative Snapshot carrier omitted carrier_epoch")
 		}
@@ -2025,57 +2104,113 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	if !exactSessionShimCarrierActivationSet(carriers, activatedSet) {
 		return errors.New("session shim: carrier activation callback did not return the exact complete set")
 	}
-	type resolvedSnapshot struct {
-		id    sessionshim.Identity
-		event sessionshim.ControllerEvent
-		gate  *shimAdoptionGate
-		ctrl  *sessionshim.Controller
+	type resolvedActivation struct {
+		id           sessionshim.Identity
+		carrierEpoch uint64
+		ackSeq       uint64
+		event        sessionshim.ControllerEvent
+		gate         *shimAdoptionGate
+		ctrl         *sessionshim.Controller
+		retained     bool
 	}
-	resolved := make([]resolvedSnapshot, 0, len(activated))
+	resolved := make([]resolvedActivation, 0, len(activated))
+	freshCount := 0
 	d.shims.mu.Lock()
 	for _, activation := range activated {
 		id := sessionshim.Identity{
 			OrgID: activation.Activation.OrgID, SessionID: activation.Activation.SessionID,
 		}
-		event, ok := d.shims.pendingSnapshots[id]
 		entry, adopted := d.shims.adopted[id]
-		if !ok || !adopted || event.Kind != sessionshim.EventHostFrame ||
-			event.FrameType != attachwire.TypeSnapshot || event.RequestID == 0 || activation.AckSeq != event.Seq {
+		if !adopted {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: carrier_active ack has no adopted session for %s", id)
+		}
+		if retained, ok := retainedActivations[id]; ok {
+			if activation != retained {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: carrier_active ack changed retained activation evidence for %s", id)
+			}
+			if _, pending := d.shims.pendingSnapshots[id]; pending || d.shims.stagingSnapshots[id] {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: retained carrier activation invented a second Snapshot for %s", id)
+			}
+			resolved = append(resolved, resolvedActivation{
+				id: id, carrierEpoch: activation.Activation.CarrierEpoch,
+				ackSeq: activation.AckSeq, gate: d.shims.activationGates[id], ctrl: entry.controller, retained: true,
+			})
+			continue
+		}
+		event, ok := d.shims.pendingSnapshots[id]
+		if !ok || event.Kind != sessionshim.EventHostFrame || event.FrameType != attachwire.TypeSnapshot ||
+			event.RequestID == 0 || activation.AckSeq != event.Seq {
 			d.shims.mu.Unlock()
 			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot for %s", id)
 		}
-		resolved = append(resolved, resolvedSnapshot{
-			id: id, event: event, gate: d.shims.activationGates[id], ctrl: entry.controller,
+		freshCount++
+		resolved = append(resolved, resolvedActivation{
+			id: id, carrierEpoch: activation.Activation.CarrierEpoch,
+			ackSeq: event.Seq, event: event, gate: d.shims.activationGates[id], ctrl: entry.controller,
 		})
 	}
-	if len(d.shims.pendingSnapshots) != len(resolved) {
+	if len(d.shims.pendingSnapshots) != freshCount {
 		d.shims.mu.Unlock()
 		return errors.New("session shim: carrier activation left a staged Snapshot unresolved")
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
+	for _, activation := range resolved {
 		var acknowledger sessionShimCursorAcknowledger
-		if snapshot.ctrl != nil {
-			acknowledger = snapshot.ctrl
+		if activation.ctrl != nil {
+			acknowledger = activation.ctrl
 		}
-		if err := d.recordShimForwardedSeqForController(snapshot.id, acknowledger, snapshot.event.Seq); err != nil {
-			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", snapshot.id, err)
+		if err := d.recordShimForwardedSeqForController(activation.id, acknowledger, activation.ackSeq); err != nil {
+			return fmt.Errorf("session shim: persist carrier activation acknowledgement for %s: %w", activation.id, err)
 		}
 	}
 	d.shims.mu.Lock()
-	for _, snapshot := range resolved {
-		current, pending := d.shims.pendingSnapshots[snapshot.id]
-		if !pending || current.Seq != snapshot.event.Seq || current.RequestID != snapshot.event.RequestID ||
-			d.shims.activationGates[snapshot.id] != snapshot.gate {
+	for _, activation := range resolved {
+		entry, adopted := d.shims.adopted[activation.id]
+		if !adopted {
 			d.shims.mu.Unlock()
-			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", snapshot.id)
+			return fmt.Errorf("session shim: adopted session disappeared while persisting activation for %s", activation.id)
 		}
-		delete(d.shims.pendingSnapshots, snapshot.id)
-		delete(d.shims.activationGates, snapshot.id)
+		if activation.retained {
+			if _, pending := d.shims.pendingSnapshots[activation.id]; pending || d.shims.stagingSnapshots[activation.id] {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: retained activation gained a staged Snapshot for %s", activation.id)
+			}
+			if activation.gate != nil && d.shims.activationGates[activation.id] != activation.gate {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: retained activation publication gate changed for %s", activation.id)
+			}
+			if activation.gate != nil {
+				delete(d.shims.activationGates, activation.id)
+			}
+		} else {
+			current, pending := d.shims.pendingSnapshots[activation.id]
+			if !pending || current.Seq != activation.event.Seq || current.RequestID != activation.event.RequestID ||
+				d.shims.activationGates[activation.id] != activation.gate {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", activation.id)
+			}
+			delete(d.shims.pendingSnapshots, activation.id)
+			delete(d.shims.activationGates, activation.id)
+		}
+		activationReceipt := SessionShimCarrierActivationReceipt{
+			Activation: SessionShimCarrierActivation{
+				OrgID: activation.id.OrgID, SessionID: activation.id.SessionID,
+				CarrierEpoch: activation.carrierEpoch,
+			},
+			AckSeq: activation.ackSeq,
+		}
+		entry.retainedCarrierActivation = &activationReceipt
+		entry.carrierActivationComplete = true
+		d.shims.adopted[activation.id] = entry
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
-		snapshot.gate.finish(true)
+	for _, activation := range resolved {
+		if activation.gate != nil {
+			activation.gate.finish(true)
+		}
 	}
 	d.shims.mu.Lock()
 	d.shims.carrierActivationComplete = true

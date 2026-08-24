@@ -133,6 +133,11 @@ func (c *V2HostConfig) withDefaults() error {
 	}
 	if c.ResumeDisposition != nil {
 		resume := cloneV2ResumeDisposition(*c.ResumeDisposition)
+		var err error
+		resume, err = normalizeV2ResumeDisposition(resume)
+		if err != nil {
+			return err
+		}
 		if err := validateV2ResumeDisposition(resume); err != nil {
 			return err
 		}
@@ -162,7 +167,29 @@ func (r V2ResumeDisposition) Format(state fmt.State, _ rune) {
 // Validate checks the exact closed resume shape without dialing or exposing
 // credential material. Composing recovery seams use it before retaining a
 // disposition for later DialV2HostCandidate.
-func (r V2ResumeDisposition) Validate() error { return validateV2ResumeDisposition(r) }
+func (r V2ResumeDisposition) Validate() error {
+	normalized, err := normalizeV2ResumeDisposition(r)
+	if err != nil {
+		return err
+	}
+	return validateV2ResumeDisposition(normalized)
+}
+
+// normalizeV2ResumeDisposition preserves the exact released v0.68.3/v0.68.4
+// caller shape, which predates ProofSchemaVersion and Authority. Both fields
+// absent together mean the frozen proof-v1 same-handoff posture. Any partial or
+// otherwise explicit new shape is validated as written and fails closed.
+func normalizeV2ResumeDisposition(resume V2ResumeDisposition) (V2ResumeDisposition, error) {
+	if resume.ProofSchemaVersion == "" && resume.Authority == "" {
+		resume.ProofSchemaVersion = V2ProofSchemaV1
+		resume.Authority = V2ResumeSameHandoff
+		return resume, nil
+	}
+	if resume.ProofSchemaVersion == "" || resume.Authority == "" {
+		return V2ResumeDisposition{}, errors.New("attachclient: v2 resume proof schema and authority must be supplied together")
+	}
+	return resume, nil
+}
 
 func validateV2ResumeDisposition(resume V2ResumeDisposition) error {
 	if resume.CarrierEpoch == 0 {
