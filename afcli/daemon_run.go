@@ -191,7 +191,10 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// Reconcile terminal authorities before the daemon admits work. Receiver
 			// endpoints are resolved from the separate registry on every replay;
 			// no bearer is persisted by this public implementation.
-			archiveRoot := workareaArchiveRoot(configPath)
+			archiveRoot, err := workareaArchiveRoot(configPath)
+			if err != nil {
+				return fmt.Errorf("load workarea archive configuration: %w", err)
+			}
 			worktreeParent := statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
 			archiveRegistry := daemon.NewWorkareaArchiveRegistry(daemon.WorkareaArchiveOptions{Root: archiveRoot, WorktreeParent: worktreeParent})
 			leaseManager, err := worktree.NewManager(worktree.Options{
@@ -313,12 +316,15 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 	return cmd
 }
 
-func workareaArchiveRoot(configPath string) string {
+func workareaArchiveRoot(configPath string) (string, error) {
 	daemonConfig, err := daemon.LoadConfig(configPath)
-	if err != nil || daemonConfig == nil {
-		return ""
+	if err != nil {
+		return "", err
 	}
-	return daemonConfig.Workarea.ArchiveRoot
+	if daemonConfig == nil {
+		return "", nil
+	}
+	return daemonConfig.Workarea.ArchiveRoot, nil
 }
 
 // resolveStandaloneCredsMode returns true when donmai should seed agent
