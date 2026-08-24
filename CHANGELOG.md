@@ -8,17 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.7 — 2026-08-24
+
+_v0.68.6 published its versioned worker image and E2B target, but the binary
+publisher stopped in mandatory smoke before creating a GitHub release or
+updating Homebrew. This patch carries the binary release forward with the
+repository-free workarea, live readiness, and installed-service acceptance
+support required by the corrected release lane._
+
+### Features
+
+- **Installed-artifact session-shim restart acceptance has a dormant,
+  authenticated target control.** A Linux/systemd-user mutator can prepare the
+  private bearer, drive real gap, incompatible-quarantine, and one-shot restart
+  fence conditions, and clean up its target-owned state. The daemon route stays
+  indistinguishable from absent unless an absolute private token file is
+  configured, binds every mutation to an adopted lifecycle, and returns no
+  acceptance evidence; external fixtures must independently re-observe every
+  effect. (#409)
+
 ### Fixes
 
 - **Hosted heartbeats carry live proof-v2 readiness.** The authority-bound
   `sessionShim` projection now includes the independently resolved durable
   acknowledgement, proof-v1 closure, retained-credential, remaining-validity,
   and adopted-candidate recovery facts. Missing or changed facts fail closed;
-  a capability declaration is never treated as readiness evidence.
+  a capability declaration is never treated as readiness evidence. (#402)
 - **Repository-free sessions receive a deterministic empty workarea.** The
   local runner creates an isolated flat directory without invoking Git, while
   repository-backed clones and negotiated shared/declaration layouts keep
-  their existing strategies.
+  their existing strategies. (#410)
 
 ## v0.68.6 — 2026-08-24
 
