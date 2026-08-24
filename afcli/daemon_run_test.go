@@ -119,6 +119,14 @@ func TestDisplayEnvLocalPath(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRootMissingConfig(t *testing.T) {
+	t.Parallel()
+
+	if got := workareaArchiveRoot(filepath.Join(t.TempDir(), "missing.yaml")); got != "" {
+		t.Fatalf("workareaArchiveRoot(missing config) = %q, want empty", got)
+	}
+}
+
 // TestStandaloneCredsMergeIntoSpawnerBaseEnv simulates the integration
 // point: a daemon-run startup that has built a LocalSource and is about
 // to construct SpawnerOptions.BaseEnv. The merged map should contain
