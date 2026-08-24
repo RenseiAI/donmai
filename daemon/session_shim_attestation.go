@@ -90,11 +90,18 @@ type SessionShimCredentialReceipt struct {
 // for a heartbeat. Callers supply the whole value through one callback so host,
 // controller, revision, and quarantine state can never come from torn reads.
 type SessionShimHeartbeatProjection struct {
-	Enabled             bool                            `json:"enabled"`
-	AdoptionComplete    bool                            `json:"adoptionComplete"`
-	WorkerHostID        string                          `json:"workerHostId"`
-	ControllerID        string                          `json:"controllerId"`
-	AdoptionRevision    string                          `json:"adoptionRevision"`
+	Enabled          bool   `json:"enabled"`
+	AdoptionComplete bool   `json:"adoptionComplete"`
+	WorkerHostID     string `json:"workerHostId"`
+	ControllerID     string `json:"controllerId"`
+	AdoptionRevision string `json:"adoptionRevision"`
+
+	// SessionShimCarrierProofV2Readiness stays flat on the existing sessionShim
+	// object so the five live facts are covered by the same organization-scoped
+	// host, controller, and adoption-revision echo. The values come from the
+	// configured readiness resolver; capability advertisement is not a fallback.
+	SessionShimCarrierProofV2Readiness
+
 	QuarantinedSessions []SessionShimQuarantinedSession `json:"quarantinedSessions"`
 }
 
@@ -125,6 +132,9 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	if p.WorkerHostID == "" || p.ControllerID == "" || p.AdoptionRevision == "" {
 		return errors.New("session shim heartbeat projection is missing host, controller, or adoption revision")
 	}
+	if err := p.SessionShimCarrierProofV2Readiness.validate(); err != nil {
+		return fmt.Errorf("session shim heartbeat projection: %w", err)
+	}
 	for i, q := range p.QuarantinedSessions {
 		if q.OrgID == "" || q.SessionID == "" || q.Reason == "" || !q.ConsumesCapacity {
 			return fmt.Errorf("session shim heartbeat quarantine %d is incomplete", i)
@@ -144,6 +154,7 @@ func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatPro
 	if p.Enabled != other.Enabled || p.AdoptionComplete != other.AdoptionComplete ||
 		p.WorkerHostID != other.WorkerHostID || p.ControllerID != other.ControllerID ||
 		p.AdoptionRevision != other.AdoptionRevision ||
+		p.SessionShimCarrierProofV2Readiness != other.SessionShimCarrierProofV2Readiness ||
 		len(p.QuarantinedSessions) != len(other.QuarantinedSessions) {
 		return false
 	}
@@ -156,7 +167,7 @@ func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatPro
 }
 
 func cloneSessionShimHeartbeatProjection(in SessionShimHeartbeatProjection) SessionShimHeartbeatProjection {
-	in.QuarantinedSessions = append([]SessionShimQuarantinedSession(nil), in.QuarantinedSessions...)
+	in.QuarantinedSessions = append([]SessionShimQuarantinedSession{}, in.QuarantinedSessions...)
 	return in
 }
 
