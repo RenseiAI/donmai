@@ -26,15 +26,33 @@ async function verifyTemplateVersion({ Sandbox, templateRef, expectedVersion, ap
   }
 
   let sandbox
+  let primaryError
   try {
     sandbox = await Sandbox.create(templateRef, { apiKey, timeoutMs: 60_000 })
     const result = await sandbox.commands.run('donmai --version')
     assertVersionOutput(result, expectedVersion)
     process.stdout.write(`Verified ${templateRef}: donmai version ${expectedVersion}\n`)
-  } finally {
-    if (sandbox) {
+  } catch (error) {
+    primaryError = error
+  }
+
+  if (sandbox) {
+    try {
       await sandbox.kill({ apiKey })
+    } catch (cleanupError) {
+      if (primaryError) {
+        throw new AggregateError(
+          [primaryError, cleanupError],
+          'E2B template version verification and sandbox cleanup both failed',
+          { cause: primaryError },
+        )
+      }
+      throw cleanupError
     }
+  }
+
+  if (primaryError) {
+    throw primaryError
   }
 }
 
