@@ -2,6 +2,7 @@ package ptycli
 
 import (
 	"context"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -10,6 +11,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // shortRegistryDir keeps the registry path inside the platform's Unix socket
@@ -114,6 +116,104 @@ func TestSpawnBecomesShimOwnedUnderTheLaunchContract(t *testing.T) {
 	}
 	if shim.HarnessIdentity().PID == os.Getpid() {
 		t.Error("the shim reports itself as the harness; the harness is the child under the PTY")
+	}
+}
+
+// TestShimOwnedHandleRetainsTerminalLifetimeThroughTheFinalScreenWindow proves
+// the production-facing Handle and its InteractiveSession wrapper do not let a
+// one-shot runner observe completion immediately after the PTY's Exit. The
+// fixture uses a real shim, PTY, controller socket, tombstone, and controller
+// close — no held test listener or fabricated terminal authority.
+func TestShimOwnedHandleRetainsTerminalLifetimeThroughTheFinalScreenWindow(t *testing.T) {
+	requireShell(t)
+
+	dir := shortRegistryDir(t)
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-ptycli-window", SessionID: "session-ptycli-window"}
+	shim, err := sessionshim.Start(sessionshim.Options{
+		Identity: id, Registry: registry, ProcessEpoch: 1,
+		Spec:              ptyhost.Spec{Command: []string{"sh", "-c", "sleep 30"}},
+		Orphan:            sessionshim.OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 250 * time.Millisecond},
+		FinalScreenWindow: 30 * time.Second,
+		ProtocolMin:       shimwire.V1,
+		ProtocolMax:       shimwire.V2,
+	})
+	if errors.Is(err, sessionshim.ErrShimUnsupported) {
+		t.Skip(err)
+	}
+	if err != nil {
+		t.Fatal(err)
+	}
+	adopted, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
+		Registry: registry, ControllerID: "ptycli-window-controller", ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V2,
+	})
+	if err != nil || len(adopted.Adopted) != 1 {
+		_ = shim.Terminate(context.Background())
+		t.Fatalf("Adopt = %+v, %v", adopted, err)
+	}
+	controller := adopted.Adopted[0]
+	t.Cleanup(func() {
+		adopted.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+		_ = shim.Close()
+	})
+
+	h := &Handle{sess: shim.Session(), shim: shim, events: make(chan agent.Event, 1)}
+	isess := h.InteractiveSession()
+	go h.run()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := shim.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	select {
+	case <-shim.TerminalDone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal tombstone was not persisted")
+	}
+	// TerminalDone is after the PTY's Exit but before the final-screen lifetime
+	// ends. A raw *ptyhost.Session here would already be done; the wrapper must
+	// retain the owning runner surface until the shim closes.
+	select {
+	case <-isess.Done():
+		t.Fatal("shim-owned InteractiveSession ended before final-screen window closed")
+	default:
+	}
+	select {
+	case event := <-h.Events():
+		t.Fatalf("Handle emitted terminal event before final-screen window closed: %#v", event)
+	case <-time.After(time.Second):
+	}
+
+	if err := controller.Close(); err != nil {
+		t.Fatalf("controller Close: %v", err)
+	}
+	select {
+	case <-shim.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("controller close did not release terminal shim")
+	}
+	select {
+	case <-isess.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("InteractiveSession did not close with terminal shim")
+	}
+	select {
+	case event, ok := <-h.Events():
+		if !ok {
+			t.Fatal("Handle closed events before terminal ResultEvent")
+		}
+		if _, ok := event.(agent.ResultEvent); !ok {
+			t.Fatalf("terminal event = %T, want ResultEvent", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("Handle did not emit terminal ResultEvent after final-screen window")
 	}
 }
 

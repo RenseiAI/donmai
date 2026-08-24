@@ -41,6 +41,27 @@ type Handle struct {
 	cleanupErr  error
 }
 
+// shimInteractiveSession preserves the PTY-owned data surface while extending
+// the runner-visible lifetime through the shim's bounded final-screen window.
+// The PTY itself still emits Exit and closes its subscriptions at the protocol
+// boundary; only the owner-facing Done waits for the seq-zero Snapshot service
+// to finish, so a one-shot runner cannot take the shim process down early.
+type shimInteractiveSession struct {
+	*ptyhost.Session
+	done <-chan struct{}
+}
+
+func (s shimInteractiveSession) Done() <-chan struct{} { return s.done }
+
+func (s shimInteractiveSession) Exit() (attachwire.ExitPayload, bool) {
+	select {
+	case <-s.done:
+		return s.Session.Exit()
+	default:
+		return attachwire.ExitPayload{}, false
+	}
+}
+
 // Spawn starts binary+argv under a PTY via ptyhost.Spawn and returns a
 // Handle. spec.Interactive supplies the geometry/ring/record knobs
 // (agent.InteractiveSpec); a nil spec.Interactive falls back to ptyhost's own
@@ -178,27 +199,35 @@ func spawnSession(pspec ptyhost.Spec, workarea string, roots ...string) (*ptyhos
 const shimFinalizeGrace = 10 * time.Second
 
 // awaitShimTerminal lets the shim persist its terminal observation before this
-// process goes away.
+// process waits through its bounded final-screen window.
 //
 // Without it the runner could exit first and take the shim's tombstone-writing
 // goroutine with it, leaving a session whose harness is provably gone with no
 // durable proof of that — which under §D10 is not "ended" but "unresolved", and
 // keeps a claim quarantined for something that already finished.
-func (h *Handle) awaitShimTerminal() {
+func (h *Handle) awaitShimTerminal() bool {
 	if h.shim == nil {
-		return
+		return true
 	}
 	select {
-	case <-h.shim.Done():
+	case <-h.shim.TerminalDone():
+		return true
 	case <-time.After(shimFinalizeGrace):
 		slog.Warn("interactive pty: shim did not finalize its terminal observation within the grace window",
 			"session", h.shim.Identity().String())
+		return false
 	}
 }
 
 func (h *Handle) run() {
 	<-h.sess.Done()
-	h.awaitShimTerminal()
+	if h.awaitShimTerminal() && h.shim != nil {
+		// Terminal proof is durable, so the shim's own bounded lifecycle now
+		// owns the remainder. Do not publish this process's terminal ResultEvent
+		// (which one-shot consumers treat as permission to exit) before the
+		// post-Exit seq-zero Snapshot service has closed.
+		<-h.shim.Done()
+	}
 	exit, _ := h.sess.Exit()
 	result := buildResult(exit)
 	if err := h.cleanup(); err != nil {
@@ -284,9 +313,16 @@ func (h *Handle) Stop(ctx context.Context) error {
 	return errors.Join(h.sess.Stop(ctx), h.cleanup())
 }
 
-// InteractiveSession returns the live PTY surface. Never nil for a Handle
-// returned by Spawn — satisfies agent.InteractiveCapable.
-func (h *Handle) InteractiveSession() agent.InteractiveSession { return h.sess }
+// InteractiveSession returns the live PTY surface. A shim-owned session keeps
+// the same input/output/snapshot authority but delays Done until its bounded
+// post-Exit final-screen window has finished, keeping runner lifetime aligned
+// with the protocol's terminal snapshot service.
+func (h *Handle) InteractiveSession() agent.InteractiveSession {
+	if h.shim != nil {
+		return shimInteractiveSession{Session: h.sess, done: h.shim.Done()}
+	}
+	return h.sess
+}
 
 // EmitMarker is a passthrough convenience to the underlying
 // ptyhost.Session.EmitMarker so the P5-WS6 suspend/resume seam does not need

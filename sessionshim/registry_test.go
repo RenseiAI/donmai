@@ -506,3 +506,59 @@ func TestTerminalWithdrawalCannotBeUndoneByAnOrphanRepublish(t *testing.T) {
 		t.Fatalf("the tombstone was disturbed by a post-terminal republish: %v", err)
 	}
 }
+
+// TestShimDoneRequiresDurableTerminalPublication exercises the real terminal
+// path with a registry root that becomes a non-directory only after Start has
+// published its live record. A failed tombstone write must not close Done: that
+// channel is the helper/owner's proof that teardown and durable terminal
+// observation both completed, not merely that the listener happened to close.
+func TestShimDoneRequiresDurableTerminalPublication(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	reg := newTestRegistry(t)
+	id := Identity{OrgID: "org-terminal-write", SessionID: "sess-terminal-write"}
+	shim, err := Start(Options{
+		Identity: id, Registry: reg, ProcessEpoch: 1,
+		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 30"}},
+		Orphan: OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 250 * time.Millisecond},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shim.Close() })
+
+	badRoot := filepath.Join(t.TempDir(), "not-a-directory")
+	if err := os.WriteFile(badRoot, []byte("not a registry"), RecordFileMode); err != nil {
+		t.Fatalf("write bad registry root: %v", err)
+	}
+	// Start has already used reg to publish the live record. Repoint only the
+	// terminal write at an actual invalid filesystem root, rather than mocking
+	// the registry or asserting an invented error.
+	shim.registry = &Registry{dir: badRoot}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	_ = shim.Terminate(ctx)
+	select {
+	case <-shim.acceptDone:
+	case <-time.After(5 * time.Second):
+		t.Fatal("shim did not close its listener after failed terminal publication")
+	}
+	// If watchHarness owns Close, joining the idempotent Close call waits until
+	// its full listener teardown has returned; acceptDone alone fires earlier in
+	// that sequence and would make this failure-path assertion race the cleanup.
+	if err := shim.Close(); err != nil {
+		t.Fatalf("join failed terminal Close: %v", err)
+	}
+	select {
+	case <-shim.TerminalDone():
+		t.Fatal("TerminalDone closed despite failed tombstone publication")
+	default:
+	}
+	select {
+	case <-shim.Done():
+		t.Fatal("Done closed despite failed tombstone publication")
+	default:
+	}
+}

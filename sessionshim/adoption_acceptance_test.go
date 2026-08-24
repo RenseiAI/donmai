@@ -39,12 +39,13 @@ import (
 // generation fencing, capacity accounting, quarantine, and terminal cleanup.
 
 const (
-	envShimHelper   = "DONMAI_TEST_SESSION_SHIM_HELPER"
-	envShimDir      = "DONMAI_TEST_SESSION_SHIM_DIR"
-	envShimOrg      = "DONMAI_TEST_SESSION_SHIM_ORG"
-	envShimSession  = "DONMAI_TEST_SESSION_SHIM_SESSION"
-	envShimWorkarea = "DONMAI_TEST_SESSION_SHIM_WORKAREA"
-	envShimOrphanMS = "DONMAI_TEST_SESSION_SHIM_ORPHAN_MS"
+	envShimHelper        = "DONMAI_TEST_SESSION_SHIM_HELPER"
+	envShimDir           = "DONMAI_TEST_SESSION_SHIM_DIR"
+	envShimOrg           = "DONMAI_TEST_SESSION_SHIM_ORG"
+	envShimSession       = "DONMAI_TEST_SESSION_SHIM_SESSION"
+	envShimWorkarea      = "DONMAI_TEST_SESSION_SHIM_WORKAREA"
+	envShimOrphanMS      = "DONMAI_TEST_SESSION_SHIM_ORPHAN_MS"
+	envShimFinalScreenMS = "DONMAI_TEST_SESSION_SHIM_FINAL_SCREEN_MS"
 )
 
 // interactiveFixture is a real interactive line-oriented program: it blocks on
@@ -81,13 +82,23 @@ func runShimHelperProcess() int {
 			PropagationMargin: 0,
 		}
 	}
+	var finalScreenWindow time.Duration
+	if ms := os.Getenv(envShimFinalScreenMS); ms != "" {
+		d, convErr := strconv.Atoi(ms)
+		if convErr != nil {
+			fmt.Fprintln(os.Stderr, "shim helper: final-screen ms:", convErr)
+			return 1
+		}
+		finalScreenWindow = time.Duration(d) * time.Millisecond
+	}
 	sh, err := Start(Options{
-		Identity:     Identity{OrgID: os.Getenv(envShimOrg), SessionID: os.Getenv(envShimSession)},
-		Registry:     reg,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}},
-		WorkareaPath: os.Getenv(envShimWorkarea),
-		Orphan:       orphan,
-		ProcessEpoch: 1,
+		Identity:          Identity{OrgID: os.Getenv(envShimOrg), SessionID: os.Getenv(envShimSession)},
+		Registry:          reg,
+		Spec:              ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}},
+		WorkareaPath:      os.Getenv(envShimWorkarea),
+		Orphan:            orphan,
+		FinalScreenWindow: finalScreenWindow,
+		ProcessEpoch:      1,
 	})
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "shim helper: start:", err)
@@ -134,6 +145,11 @@ func startShimHelper(t *testing.T, id Identity, orphanMS int) *shimFixture {
 		// process-spawn deadlines. This is also a fair model of production: the
 		// shim is deliberately small.
 		"GOMAXPROCS=2",
+		// The production default is deliberately long enough for a relay's
+		// post-Exit final-screen request. This helper runs a real shim process,
+		// but shortens that same bounded window so terminal-cleanup controls do
+		// not spend a minute waiting after they have proven their condition.
+		envShimFinalScreenMS+"=5000",
 	)
 	if orphanMS > 0 {
 		cmd.Env = append(cmd.Env, envShimOrphanMS+"="+strconv.Itoa(orphanMS))

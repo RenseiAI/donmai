@@ -10,8 +10,166 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
+
+type inProcessV2Fixture struct {
+	shim       *Shim
+	controller *Controller
+	registry   *Registry
+	id         Identity
+	result     AdoptionResult
+}
+
+func startInProcessV2Fixture(t *testing.T, finalScreenWindow time.Duration) *inProcessV2Fixture {
+	t.Helper()
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-v2-window", SessionID: "session-v2-window"}
+	shim, err := Start(Options{
+		Identity: id, Registry: registry, ProcessEpoch: 1,
+		Spec:              ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}},
+		Orphan:            OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 250 * time.Millisecond},
+		FinalScreenWindow: finalScreenWindow,
+		ProtocolMin:       shimwire.V1,
+		ProtocolMax:       shimwire.V2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	result, err := Adopt(context.Background(), AdoptOptions{
+		Registry: registry, ControllerID: "controller-v2-window",
+		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V2,
+	})
+	if err != nil || len(result.Adopted) != 1 {
+		_ = shim.Terminate(context.Background())
+		t.Fatalf("Adopt = %+v, %v", result, err)
+	}
+	fixture := &inProcessV2Fixture{
+		shim: shim, controller: result.Adopted[0], registry: registry, id: id, result: result,
+	}
+	t.Cleanup(func() {
+		result.Close()
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+		_ = shim.Close()
+	})
+	if fixture.controller.SelectedVersion() != shimwire.V2 || !fixture.controller.SupportsAuthoritativeSnapshot() {
+		t.Fatalf("selected/capability = v%d/%v, want v2/true", fixture.controller.SelectedVersion(), fixture.controller.SupportsAuthoritativeSnapshot())
+	}
+	return fixture
+}
+
+func waitForV2Exit(t *testing.T, c *Controller) shimwire.ExitMsg {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	for {
+		select {
+		case ev, ok := <-c.Events():
+			if !ok {
+				t.Fatal("controller closed before Exit")
+			}
+			if ev.Kind == EventExit {
+				return ev.Exit
+			}
+		case <-deadline.C:
+			t.Fatal("timed out waiting for Exit")
+		}
+	}
+}
+
+// TestV2PostExitSnapshotWindowRetainsControllerUntilTimeout uses a real PTY,
+// Unix socket, Stop request, and durable tombstone as its lifecycle barrier.
+// The barrier forces the old Close-before-request ordering to fail rather than
+// relying on scheduler luck: an Exit that has reached terminal finalization must
+// still admit the protocol's direct sequence-zero Snapshot until this bounded
+// window expires.
+func TestV2PostExitSnapshotWindowRetainsControllerUntilTimeout(t *testing.T) {
+	fixture := startInProcessV2Fixture(t, 2*time.Second)
+	if err := fixture.controller.Stop(shimwire.StopOperator); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	exit := waitForV2Exit(t, fixture.controller)
+	select {
+	case <-fixture.shim.finalScreenWindowStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final-screen window never opened after Exit")
+	}
+	select {
+	case <-fixture.shim.TerminalDone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal tombstone was not persisted")
+	}
+	if _, err := fixture.registry.GetTombstone(fixture.id); err != nil {
+		t.Fatalf("GetTombstone after terminal barrier: %v", err)
+	}
+	select {
+	case <-fixture.controller.Done():
+		t.Fatal("controller closed before the post-Exit final-screen request")
+	default:
+	}
+
+	final, err := fixture.controller.EmitSnapshot(context.Background())
+	if err != nil {
+		t.Fatalf("post-Exit EmitSnapshot: %v", err)
+	}
+	frame, err := attachwire.DecodeFrame(final.Bytes)
+	if err != nil {
+		t.Fatalf("decode post-Exit frame: %v", err)
+	}
+	if final.InStream || final.AtSeq != exit.Seq || frame.Seq != attachwire.PostExitSnapshotSeq || frame.RelTime != 0 {
+		t.Fatalf("post-Exit result = %+v frame=%+v, want direct seq-0 atSeq=%d", final, frame, exit.Seq)
+	}
+
+	select {
+	case <-fixture.controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("controller remained open after the bounded final-screen window")
+	}
+	select {
+	case <-fixture.shim.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("shim did not close after the bounded final-screen window")
+	}
+}
+
+// TestV2PostExitControllerCloseEndsWindow proves that a dead controller does
+// not keep a terminal shim/listener alive until its timer expires.
+func TestV2PostExitControllerCloseEndsWindow(t *testing.T) {
+	fixture := startInProcessV2Fixture(t, 30*time.Second)
+	if err := fixture.controller.Stop(shimwire.StopOperator); err != nil {
+		t.Fatalf("Stop: %v", err)
+	}
+	_ = waitForV2Exit(t, fixture.controller)
+	select {
+	case <-fixture.shim.finalScreenWindowStarted:
+	case <-time.After(5 * time.Second):
+		t.Fatal("final-screen window never opened after Exit")
+	}
+	select {
+	case <-fixture.shim.TerminalDone():
+	case <-time.After(5 * time.Second):
+		t.Fatal("terminal tombstone was not persisted")
+	}
+
+	if err := fixture.controller.Close(); err != nil {
+		t.Fatalf("controller Close: %v", err)
+	}
+	select {
+	case <-fixture.shim.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("controller close did not release the terminal shim")
+	}
+	if _, err := fixture.registry.GetTombstone(fixture.id); err != nil {
+		t.Fatalf("GetTombstone after controller close: %v", err)
+	}
+}
 
 func TestV2AuthoritativeSnapshotProxyExactRetryOrderingAndPostExit(t *testing.T) {
 	id := Identity{OrgID: "org-snapshot-v2", SessionID: "session-snapshot-v2"}
