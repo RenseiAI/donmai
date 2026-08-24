@@ -46,10 +46,12 @@ func TestNew_HTTPPortExplicit_Preserved(t *testing.T) {
 	}
 }
 
-// TestEphemeralPortNoCollision soaks the C3 fix: N parallel subtests
-// each construct a Daemon + Server with HTTPPort: 0 and call Start.
-// All N must bind successfully (no shared 7734 collision) and
-// Server.Addr() must report a non-zero ephemeral port string.
+// TestEphemeralPortNoCollision soaks the C3 fix: N concurrent servers with
+// HTTPPort: 0 must all bind successfully (no shared 7734 collision) and each
+// Server.Addr() must report a non-zero ephemeral port string. The workers keep
+// their listeners live until after the parent compares every address: otherwise
+// an earlier worker can release a port and make a later, valid kernel reuse
+// look like a collision.
 //
 // Run under -race with -count=5 to catch lingering flakiness; this
 // test exists specifically because Wave 11's parallel daemon tests
@@ -60,20 +62,27 @@ func TestEphemeralPortNoCollision(t *testing.T) {
 
 	const N = 8
 
-	var (
-		mu        sync.Mutex
-		seenPorts = make(map[int]string)
-	)
+	type startResult struct {
+		index int
+		addr  string
+		err   error
+	}
+	results := make(chan startResult, N)
+	release := make(chan struct{})
+	var workers sync.WaitGroup
+	workers.Add(N)
+	t.Cleanup(func() {
+		close(release)
+		workers.Wait()
+	})
 
 	for i := 0; i < N; i++ {
-		i := i
-		t.Run(fmt.Sprintf("parallel-%d", i), func(t *testing.T) {
-			t.Parallel()
-
-			// Build a Server directly — avoids Daemon.Start's
-			// registration RPC + config-load path. The C3 fix is
-			// about Server.Start binding; a Daemon shell is enough
-			// to thread Options{HTTPPort: 0} through NewServer.
+		go func(i int) {
+			defer workers.Done()
+			// Build a Server directly — avoids Daemon.Start's registration RPC +
+			// config-load path. The C3 fix is about Server.Start binding; a
+			// Daemon shell is enough to thread Options{HTTPPort: 0} through
+			// NewServer.
 			d := New(Options{
 				ConfigPath: "/dev/null",
 				HTTPHost:   "127.0.0.1",
@@ -83,49 +92,54 @@ func TestEphemeralPortNoCollision(t *testing.T) {
 			srv := NewServer(d)
 			errCh, err := srv.Start()
 			if err != nil {
-				t.Fatalf("server Start: %v", err)
+				results <- startResult{index: i, err: err}
+				return
 			}
-			t.Cleanup(func() {
-				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-				defer cancel()
-				_ = srv.Shutdown(ctx)
-				// Drain errCh so the serve goroutine exits cleanly.
-				select {
-				case <-errCh:
-				case <-time.After(2 * time.Second):
-				}
-			})
+			results <- startResult{index: i, addr: srv.Addr()}
+			<-release
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			_ = srv.Shutdown(ctx)
+			// Drain errCh so the serve goroutine exits cleanly.
+			select {
+			case <-errCh:
+			case <-time.After(2 * time.Second):
+			}
+		}(i)
+	}
 
-			addr := srv.Addr()
-			if addr == "" {
-				t.Fatalf("Server.Addr() = empty after Start; expected ephemeral host:port")
-			}
-			// Server.Addr() must NOT report the literal "127.0.0.1:0"
-			// after Start — the listener captures the kernel-picked
-			// port via listener.Addr() and rewrites s.addr.
-			if strings.HasSuffix(addr, ":0") {
-				t.Fatalf("Server.Addr() = %q after Start; ephemeral port was not captured", addr)
-			}
+	seenPorts := make(map[int]int, N)
+	for range N {
+		result := <-results
+		if result.err != nil {
+			t.Fatalf("server %d Start: %v", result.index, result.err)
+		}
+		if result.addr == "" {
+			t.Fatalf("server %d Addr() = empty after Start; expected ephemeral host:port", result.index)
+		}
+		// Server.Addr() must NOT report the literal "127.0.0.1:0" after
+		// Start — the listener captures the kernel-picked port via
+		// listener.Addr() and rewrites s.addr.
+		if strings.HasSuffix(result.addr, ":0") {
+			t.Fatalf("server %d Addr() = %q after Start; ephemeral port was not captured", result.index, result.addr)
+		}
 
-			_, portStr, err := net.SplitHostPort(addr)
-			if err != nil {
-				t.Fatalf("net.SplitHostPort(%q): %v", addr, err)
-			}
-			port, err := strconv.Atoi(portStr)
-			if err != nil {
-				t.Fatalf("port not numeric in %q: %v", addr, err)
-			}
-			if port == 0 {
-				t.Fatalf("ephemeral port resolved to 0 in %q", addr)
-			}
+		_, portStr, err := net.SplitHostPort(result.addr)
+		if err != nil {
+			t.Fatalf("net.SplitHostPort(%q): %v", result.addr, err)
+		}
+		port, err := strconv.Atoi(portStr)
+		if err != nil {
+			t.Fatalf("port not numeric in %q: %v", result.addr, err)
+		}
+		if port == 0 {
+			t.Fatalf("ephemeral port resolved to 0 in %q", result.addr)
+		}
 
-			mu.Lock()
-			defer mu.Unlock()
-			if prev, ok := seenPorts[port]; ok {
-				t.Fatalf("port %d already bound by subtest %s — kernel handed out the same port to two listeners (this should be impossible while listeners are still live)", port, prev)
-			}
-			seenPorts[port] = fmt.Sprintf("parallel-%d", i)
-		})
+		if prev, ok := seenPorts[port]; ok {
+			t.Fatalf("port %d is simultaneously bound by servers %d and %d", port, prev, result.index)
+		}
+		seenPorts[port] = result.index
 	}
 }
 
