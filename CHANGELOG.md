@@ -8,6 +8,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.9 — 2026-08-24
+
 ### Features
 
 - **Composed poll services can share the daemon's exact claim gate.** The
