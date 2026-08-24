@@ -102,6 +102,35 @@ func writeFakeCLI(t *testing.T, name, script string) string {
 func TestWriteFakeCLI_ExecutesWhileFixtureIsWritable(t *testing.T) {
 	t.Parallel()
 
+	if runtime.GOOS == "linux" {
+		t.Run("old direct executable is the literal red control", func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "old-direct-fake-claude.sh")
+			writer, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // deliberate ETXTBSY control
+			if err != nil {
+				t.Fatalf("create old direct fake CLI: %v", err)
+			}
+			t.Cleanup(func() { _ = writer.Close() })
+			if _, err := writer.WriteString("#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"old\"}'\n"); err != nil {
+				t.Fatalf("write old direct fake CLI: %v", err)
+			}
+			if err := writer.Sync(); err != nil {
+				t.Fatalf("sync old direct fake CLI: %v", err)
+			}
+			if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // executable control intentionally retains its writer
+				t.Fatalf("chmod old direct fake CLI: %v", err)
+			}
+
+			p, err := New(Options{Binary: path, LookPath: func(name string) (string, error) { return name, nil }})
+			if err != nil {
+				t.Fatalf("New old direct control: %v", err)
+			}
+			_, err = p.Complete(t.Context(), agent.OneShotRequest{Messages: []agent.Message{{Content: "c"}}})
+			if err == nil || !strings.Contains(strings.ToLower(err.Error()), "text file busy") {
+				t.Fatalf("old direct executable control error = %v, want ETXTBSY/text file busy", err)
+			}
+		})
+	}
+
 	cli := writeFakeCLI(t, "fake-claude-writable-fixture.sh", "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}'\n")
 	fixture, err := os.OpenFile(cli+".fixture", os.O_WRONLY|os.O_APPEND, 0) //nolint:gosec // deliberately holds the fake CLI source open for writing
 	if err != nil {
