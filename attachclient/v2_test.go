@@ -940,6 +940,227 @@ func TestV2AdoptedCandidateRecoveryReusesReceiptStoredCandidate(t *testing.T) {
 	}
 }
 
+func TestV2ServerRetainedAdoptedRecoveryActivatesWithoutSnapshotBytes(t *testing.T) {
+	ordinaryOutput := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 8, Payload: []byte("after-server-retained")}
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- err
+			return
+		}
+		frame, _, err := readV2TestFrame(ctx, conn)
+		message, controlErr := v2ControlFromFrame(frame)
+		activate, ok := message.(attachwirev2.CarrierActivate)
+		if err != nil || controlErr != nil || !ok || uint64(activate.PTYEpoch) != 3 || uint64(activate.CarrierEpoch) != 9 {
+			serverErr <- fmt.Errorf("server-retained activation = %#v/%v/%v", message, err, controlErr)
+			return
+		}
+		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 7,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		_, raw, err := readV2TestFrame(ctx, conn)
+		if err != nil || !bytes.Equal(raw, ordinaryOutput.Encode()) {
+			serverErr <- fmt.Errorf("post-recovery output mismatch: %v", err)
+			return
+		}
+		ack, _ := attachwirev2.BuildControlFrame(attachwirev2.HostAck{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 8,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, ack.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resume := V2ResumeDisposition{
+		ProofSchemaVersion:   V2ProofSchemaV2,
+		Authority:            V2ResumeAdoptedCandidateRecovery,
+		State:                V2ResumeServerRetained,
+		PTYEpoch:             3,
+		CarrierEpoch:         9,
+		AckSeq:               4,
+		CandidateSnapshotSeq: 7,
+		GapFromSeq:           5,
+		GapToSeq:             6,
+		GapReason:            attachwirev2.GapControllerUnforwarded,
+	}
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return v2TestToken(t, func(claims map[string]any) {
+				claims["resolved_boundary"] = "6"
+				claims["last_host_seq"] = "6"
+			}), nil
+		},
+		ResumeDisposition: &resume,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err == nil {
+		t.Fatal("server-retained recovery requested a duplicate mandatory Snapshot")
+	}
+	ack, err := candidate.Activate(ctx)
+	if err != nil || ack != 7 {
+		t.Fatalf("server-retained activation = %d, %v", ack, err)
+	}
+	if err := candidate.SendRawFrameDurable(ctx, ordinaryOutput.Encode()); err != nil {
+		t.Fatalf("post-recovery durable output: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV2ServerRetainedAdoptedRecoveryRequiresExactRelayCandidate(t *testing.T) {
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- err
+			return
+		}
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- err
+			return
+		}
+		wrongCandidate, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 6,
+		})
+		serverErr <- conn.Write(ctx, websocket.MessageBinary, wrongCandidate.Encode())
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resume := V2ResumeDisposition{
+		ProofSchemaVersion:   V2ProofSchemaV2,
+		Authority:            V2ResumeAdoptedCandidateRecovery,
+		State:                V2ResumeServerRetained,
+		PTYEpoch:             3,
+		CarrierEpoch:         9,
+		AckSeq:               4,
+		CandidateSnapshotSeq: 7,
+		GapFromSeq:           5,
+		GapToSeq:             6,
+		GapReason:            attachwirev2.GapControllerUnforwarded,
+	}
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return v2TestToken(t, func(claims map[string]any) {
+				claims["resolved_boundary"] = "6"
+				claims["last_host_seq"] = "6"
+			}), nil
+		},
+		ResumeDisposition: &resume,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.Activate(ctx); err == nil || !strings.Contains(err.Error(), "carrier_active cursor is outside the exact sent stream") {
+		t.Fatalf("wrong retained candidate activation error = %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV2ServerRetainedAdoptedRecoveryIsExplicitAndExact(t *testing.T) {
+	base := V2ResumeDisposition{
+		ProofSchemaVersion:   V2ProofSchemaV2,
+		Authority:            V2ResumeAdoptedCandidateRecovery,
+		State:                V2ResumeServerRetained,
+		PTYEpoch:             3,
+		CarrierEpoch:         9,
+		AckSeq:               4,
+		CandidateSnapshotSeq: 7,
+		GapFromSeq:           5,
+		GapToSeq:             6,
+		GapReason:            attachwirev2.GapControllerUnforwarded,
+	}
+	if err := base.Validate(); err != nil {
+		t.Fatalf("exact server-retained recovery: %v", err)
+	}
+	invalid := map[string]func(*V2ResumeDisposition){
+		"proof v1":     func(value *V2ResumeDisposition) { value.ProofSchemaVersion = V2ProofSchemaV1 },
+		"same handoff": func(value *V2ResumeDisposition) { value.Authority = V2ResumeSameHandoff },
+		"ack cursor":   func(value *V2ResumeDisposition) { value.AckSeq++ },
+		"snapshot seq": func(value *V2ResumeDisposition) { value.CandidateSnapshotSeq++ },
+		"raw snapshot": func(value *V2ResumeDisposition) { value.CandidateSnapshot = v2ResumeSnapshot(7).Encode() },
+		"gap": func(value *V2ResumeDisposition) {
+			value.GapToSeq--
+		},
+	}
+	for name, mutate := range invalid {
+		t.Run(name, func(t *testing.T) {
+			resume := base
+			mutate(&resume)
+			if err := resume.Validate(); err == nil {
+				t.Fatal("non-exact server-retained recovery was accepted")
+			}
+		})
+	}
+	legacyMissingRaw := base
+	legacyMissingRaw.State = V2ResumeReceiptStored
+	if err := legacyMissingRaw.Validate(); err == nil {
+		t.Fatal("receipt-stored raw-Snapshot mode treated missing bytes as server-retained")
+	}
+	configWithDuplicatedCursor := V2HostConfig{
+		AttachURL:         "wss://relay.example/v2/rooms/session-v2",
+		TokenSource:       func(context.Context) (string, error) { return "unused", nil },
+		DurableHighWater:  3,
+		ResumeDisposition: &base,
+	}
+	if err := configWithDuplicatedCursor.withDefaults(); err == nil {
+		t.Fatal("server-retained recovery accepted a mismatched durable cursor")
+	}
+	claims, err := parseV2HostClaims(v2TestToken(t, func(values map[string]any) {
+		values["resolved_boundary"] = "6"
+		values["last_host_seq"] = "6"
+	}), time.Now())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := validateV2ProofDisposition(claims, V2HostConfig{ResumeDisposition: &base}); err != nil {
+		t.Fatalf("server-retained proof binding: %v", err)
+	}
+	wrongSignedBoundary := base
+	wrongSignedBoundary.AckSeq = 3
+	wrongSignedBoundary.GapFromSeq = 4
+	if err := wrongSignedBoundary.Validate(); err != nil {
+		t.Fatalf("structurally exact alternate boundary: %v", err)
+	}
+	if err := validateV2ProofDisposition(claims, V2HostConfig{ResumeDisposition: &wrongSignedBoundary}); err == nil {
+		t.Fatal("server-retained recovery accepted a structurally valid cursor outside the signed proof")
+	}
+}
+
 func TestV2RetainedCredentialIsExactCopiedAndRedacted(t *testing.T) {
 	original := []byte("exact-original-bearer-never-log")
 	credential, err := NewV2RetainedCredential(original)
@@ -1031,6 +1252,94 @@ func TestV2ProofBoundControllerGapPrecedesExactResolvedSnapshot(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestV2ClaimsBoundCandidateSnapshotAppliesExactProofDisposition(t *testing.T) {
+	tests := []struct {
+		name             string
+		resolvedBoundary uint64
+		wantGap          bool
+	}{
+		{name: "equal boundary stays contiguous", resolvedBoundary: 4},
+		{name: "ahead boundary declares controller gap", resolvedBoundary: 6, wantGap: true},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			serverErr := make(chan error, 1)
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				defer conn.CloseNow() //nolint:errcheck
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+					serverErr <- err
+					return
+				}
+				request, _ := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonResync})
+				if err := conn.Write(ctx, websocket.MessageBinary, request.Encode()); err != nil {
+					serverErr <- err
+					return
+				}
+				frame, raw, err := readV2TestFrame(ctx, conn)
+				if err != nil {
+					serverErr <- err
+					return
+				}
+				if test.wantGap {
+					message, controlErr := v2ControlFromFrame(frame)
+					gap, ok := message.(attachwirev2.HostGap)
+					if controlErr != nil || !ok || uint64(gap.FromSeq) != 5 || uint64(gap.ToSeq) != test.resolvedBoundary ||
+						gap.Reason != attachwirev2.GapControllerUnforwarded {
+						serverErr <- fmt.Errorf("claims-bound gap = %#v/%v", message, controlErr)
+						return
+					}
+					frame, raw, err = readV2TestFrame(ctx, conn)
+					if err != nil {
+						serverErr <- err
+						return
+					}
+				}
+				wantSnapshot := v2ResumeSnapshot(test.resolvedBoundary + 1).Encode()
+				if frame.Type != attachwire.TypeSnapshot || !bytes.Equal(raw, wantSnapshot) {
+					serverErr <- fmt.Errorf("claims-bound Snapshot = type:%v raw-equal:%v", frame.Type, bytes.Equal(raw, wantSnapshot))
+					return
+				}
+				serverErr <- nil
+			}))
+			defer server.Close()
+
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+				AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+				TokenSource: func(context.Context) (string, error) {
+					return v2TestToken(t, func(claims map[string]any) {
+						boundary := fmt.Sprint(test.resolvedBoundary)
+						claims["resolved_boundary"] = boundary
+						claims["last_host_seq"] = boundary
+					}), nil
+				},
+				DurableHighWater: 4,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			defer candidate.Close() //nolint:errcheck
+			if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err != nil {
+				t.Fatal(err)
+			}
+			if err := candidate.SendClaimsBoundCandidateSnapshot(ctx, v2ResumeSnapshot(test.resolvedBoundary+1).Encode()); err != nil {
+				t.Fatal(err)
+			}
+			if err := <-serverErr; err != nil {
+				t.Fatal(err)
+			}
+		})
 	}
 }
 
