@@ -76,7 +76,7 @@ func TestDaemonClaimSuspended(t *testing.T) {
 			if tt.status != nil {
 				d.setLastHostStatus(*tt.status)
 			}
-			blocked, reason := d.claimSuspended()
+			blocked, reason := d.PollClaimGate()()
 			if blocked != tt.wantBlocked {
 				t.Fatalf("claimSuspended() blocked = %v, want %v", blocked, tt.wantBlocked)
 			}
@@ -166,7 +166,7 @@ func TestPollServiceHostStatusGate(t *testing.T) {
 					dispatched++
 					return nil
 				},
-				ClaimSuspended: d.claimSuspended,
+				ClaimSuspended: d.PollClaimGate(),
 			})
 
 			p.pollOnce(context.Background())
@@ -226,7 +226,7 @@ func TestPollServiceResumesClaimingWhenHostStatusReturnsToOK(t *testing.T) {
 		LogInfo:         record,
 		LogWarn:         record,
 		OnWork:          func(PollWorkItem) error { return nil },
-		ClaimSuspended:  d.claimSuspended,
+		ClaimSuspended:  d.PollClaimGate(),
 	})
 
 	// Several suspended ticks: no claims, exactly one suspend log line.
@@ -288,7 +288,7 @@ func TestHostStatusSuspensionLeavesInFlightSessionRunning(t *testing.T) {
 		Status:            "pool_deleted",
 		RecommendedAction: "re-bind this host to another pool",
 	})
-	if blocked, _ := d.claimSuspended(); !blocked {
+	if blocked, _ := d.PollClaimGate()(); !blocked {
 		t.Fatal("claim gate did not engage on pool_deleted")
 	}
 
@@ -301,7 +301,7 @@ func TestHostStatusSuspensionLeavesInFlightSessionRunning(t *testing.T) {
 		RuntimeJWT:      "rt-jwt",
 		IntervalSeconds: 1,
 		OnWork:          func(PollWorkItem) error { return nil },
-		ClaimSuspended:  d.claimSuspended,
+		ClaimSuspended:  d.PollClaimGate(),
 	})
 	p.pollOnce(context.Background())
 	if got := hits.Load(); got != 0 {
@@ -333,7 +333,7 @@ func TestHostStatusSuspensionLeavesInFlightSessionRunning(t *testing.T) {
 
 	// And the same session survives the recovery transition.
 	d.setLastHostStatus(HostStatusDetail{Status: "ok"})
-	if blocked, _ := d.claimSuspended(); blocked {
+	if blocked, _ := d.PollClaimGate()(); blocked {
 		t.Fatal("claim gate still engaged after host status returned to ok")
 	}
 	if got := len(d.ActiveSessions()); got != 1 {

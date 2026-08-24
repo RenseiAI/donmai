@@ -8,8 +8,13 @@
 package daemon_test
 
 import (
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"reflect"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/daemon"
 )
@@ -232,5 +237,41 @@ func TestDaemon_RegistrationStatus_Exported(t *testing.T) {
 	got := d.RegistrationStatus()
 	if got != daemon.RegistrationIdle {
 		t.Errorf("RegistrationStatus before Start = %q, want %q", got, daemon.RegistrationIdle)
+	}
+}
+
+func TestDaemon_PollClaimGate_Exported(t *testing.T) {
+	d := daemon.New(daemon.Options{SessionShim: daemon.SessionShimConfig{
+		EnableAdoption: true, RequireCredentialAttestation: true,
+		ControllerID: "external-claim-gate", AttestationCapabilities: daemon.RequiredSessionShimHostCapabilities(),
+		GetCarrierProofV2Readiness: func() (daemon.SessionShimCarrierProofV2Readiness, error) {
+			return daemon.SessionShimCarrierProofV2Readiness{}, nil
+		},
+	}})
+
+	var pollHits atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		pollHits.Add(1)
+		_ = json.NewEncoder(w).Encode(daemon.PollResponse{})
+	}))
+	t.Cleanup(server.Close)
+
+	poller := daemon.NewPollService(daemon.PollOptions{
+		WorkerID: "satellite-worker", RuntimeJWT: "runtime", OrchestratorURL: server.URL,
+		ClaimSuspended: d.PollClaimGate(),
+		OnWork:         func(daemon.PollWorkItem) error { return nil },
+		HTTPClient:     server.Client(),
+	})
+	poller.Start()
+	deadline := time.Now().Add(time.Second)
+	for !poller.ClaimsSuspended() && time.Now().Before(deadline) {
+		time.Sleep(time.Millisecond)
+	}
+	poller.Stop()
+	if got := pollHits.Load(); got != 0 {
+		t.Fatalf("satellite poll reached claim endpoint while proof-v2 readiness was withdrawn: hits=%d", got)
+	}
+	if !poller.ClaimsSuspended() {
+		t.Fatal("satellite poll did not latch the exported daemon claim gate")
 	}
 }
