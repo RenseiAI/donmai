@@ -63,6 +63,11 @@ type HeartbeatOptions struct {
 	// One callback is load-bearing: assembling host/revision/quarantine fields
 	// through separate callbacks would permit a torn readiness claim.
 	GetSessionShim func() (SessionShimHeartbeatProjection, error)
+	// OnSessionShimAcknowledged runs only after the server has acknowledged and
+	// exactly echoed the session-shim projection. A daemon recovering from a
+	// dynamic proof-v2 readiness withdrawal uses this edge to reopen admission;
+	// successful local projection alone is deliberately insufficient.
+	OnSessionShimAcknowledged func(SessionShimHeartbeatProjection)
 
 	// GetActiveInteractiveCount is the legacy separately sampled interactive
 	// occupancy callback. It remains source-compatible with embedders that adopted
@@ -444,6 +449,9 @@ func (h *HeartbeatService) sendOneResult(ctx context.Context) error {
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
 		h.handleHeartbeatResponse(ctx, resp)
+		if payload.SessionShim != nil && h.opts.OnSessionShimAcknowledged != nil {
+			h.opts.OnSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
+		}
 		return nil
 	}
 	// On 401 (token expired/invalid) or 404 (worker not recognised),

@@ -643,6 +643,11 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		d              *Daemon
 		readinessCalls atomic.Int64
 		readinessOK    atomic.Bool
+		readinessError atomic.Bool
+		driftRevision  atomic.Bool
+		heartbeatCount atomic.Int64
+		pollCount      atomic.Int64
+		lastHeartbeat  heartbeatRequestBody
 	)
 	readinessOK.Store(true)
 	record := func(step string) {
@@ -676,9 +681,21 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
 				t.Errorf("decode heartbeat: %v", err)
 			}
+			mu.Lock()
+			lastHeartbeat = body
+			mu.Unlock()
+			if driftRevision.CompareAndSwap(true, false) {
+				d.shims.mu.Lock()
+				receipt := d.shims.credentialReceipts["org-order"]
+				receipt.AdoptionRevision = "revision-drifted-in-flight"
+				d.shims.credentialReceipts["org-order"] = receipt
+				d.shims.mu.Unlock()
+			}
+			heartbeatCount.Add(1)
 			record("heartbeat")
 			_ = json.NewEncoder(w).Encode(heartbeatResponseBody{Acknowledged: true, SessionShim: body.SessionShim})
 		case "/api/workers/worker-order/poll":
+			pollCount.Add(1)
 			record("poll")
 			_ = json.NewEncoder(w).Encode(PollResponse{Work: []PollWorkItem{}})
 		default:
@@ -701,6 +718,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			EnableAdoption: true, RequireCredentialAttestation: true,
 			GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) {
 				readinessCalls.Add(1)
+				if readinessError.Load() {
+					return SessionShimCarrierProofV2Readiness{}, errors.New("proof-v2 store unavailable")
+				}
 				ready, _ := testSessionShimProofV2Readiness()
 				ready.DurableCarrierProofV2Ready = readinessOK.Load()
 				return ready, nil
@@ -749,15 +769,135 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	if readinessCalls.Load() < 2 {
 		t.Fatalf("proof-v2 readiness was not checked at registration and heartbeat: calls=%d", readinessCalls.Load())
 	}
-	readinessOK.Store(false)
-	if _, err := d.SessionShimHeartbeatProjection("org-order"); err == nil {
-		t.Fatal("heartbeat projection remained eligible after durable proof-v2 readiness was withdrawn")
+	assertClosed := func(t *testing.T, reason string, priorHeartbeats, priorPolls int64) {
+		t.Helper()
+		t.Run(reason+"/non-ready", func(t *testing.T) {
+			if d.State() != StateRecovering || d.RegistrationStatus() != RegistrationDraining {
+				t.Fatalf("withdrawal left daemon ready: state=%s registration=%s", d.State(), d.RegistrationStatus())
+			}
+		})
+		t.Run(reason+"/spawn", func(t *testing.T) {
+			if d.spawner.IsAccepting() {
+				t.Fatal("withdrawal left spawner admission open")
+			}
+			if _, err := d.AcceptWork(SessionSpec{SessionID: "must-refuse-" + reason}); err == nil {
+				t.Fatal("withdrawal left Daemon.AcceptWork admission open")
+			}
+		})
+		t.Run(reason+"/claim", func(t *testing.T) {
+			if blocked, _ := d.claimSuspended(); !blocked {
+				t.Fatal("withdrawal left claim admission open")
+			}
+		})
+		t.Run(reason+"/capacity", func(t *testing.T) {
+			if got := heartbeatCount.Load(); got != priorHeartbeats {
+				t.Fatalf("withdrawal published a heartbeat/capacity claim: got %d want %d", got, priorHeartbeats)
+			}
+		})
+		t.Run(reason+"/poll", func(t *testing.T) {
+			d.poller.pollOnce(context.Background())
+			if got := pollCount.Load(); got != priorPolls {
+				t.Fatalf("withdrawal allowed poll/claim: got %d want %d", got, priorPolls)
+			}
+		})
 	}
+	reopenAfterAcknowledgedHeartbeat := func(t *testing.T, reason string) {
+		t.Helper()
+		readinessOK.Store(true)
+		readinessError.Store(false)
+		if _, err := d.SessionShimHeartbeatProjection("org-order"); err != nil {
+			t.Fatalf("%s readiness revalidation: %v", reason, err)
+		}
+		t.Run(reason+"/pre-ack", func(t *testing.T) {
+			if d.State() != StateRecovering || d.spawner.IsAccepting() {
+				t.Fatalf("reopened before a fresh acknowledged heartbeat: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+			}
+		})
+		t.Run(reason+"/recovery-heartbeat", func(t *testing.T) {
+			if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+				t.Fatalf("recovery heartbeat: %v", err)
+			}
+			mu.Lock()
+			recoveryBeat := lastHeartbeat
+			mu.Unlock()
+			if recoveryBeat.Status != string(RegistrationDraining) || recoveryBeat.MaxSessions != 0 {
+				t.Fatalf("recovery heartbeat advertised open capacity: status=%q maxSessions=%d", recoveryBeat.Status, recoveryBeat.MaxSessions)
+			}
+			if d.State() != StateRunning || !d.spawner.IsAccepting() {
+				t.Fatalf("acknowledged heartbeat did not reopen admission: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+			}
+		})
+	}
+
+	priorHeartbeats, priorPolls := heartbeatCount.Load(), pollCount.Load()
+	readinessOK.Store(false)
+	if err := d.heartbeat.sendOneResult(context.Background()); err == nil {
+		t.Fatal("heartbeat remained eligible after durable proof-v2 readiness became false")
+	}
+	assertClosed(t, "false", priorHeartbeats, priorPolls)
 	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
 		State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-refresh",
 	}}); err == nil {
-		t.Fatal("refresh remained eligible after durable proof-v2 readiness was withdrawn")
+		t.Fatal("refresh remained eligible after durable proof-v2 readiness became false")
 	}
+	reopenAfterAcknowledgedHeartbeat(t, "false")
+
+	priorHeartbeats, priorPolls = heartbeatCount.Load(), pollCount.Load()
+	readinessError.Store(true)
+	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
+		State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-refresh-error",
+	}}); err == nil {
+		t.Fatal("refresh remained eligible after proof-v2 readiness resolver error")
+	}
+	assertClosed(t, "error", priorHeartbeats, priorPolls)
+	reopenAfterAcknowledgedHeartbeat(t, "error")
+
+	t.Run("stale-acknowledgement-cannot-reopen", func(t *testing.T) {
+		readinessOK.Store(false)
+		if err := d.heartbeat.sendOneResult(context.Background()); err == nil {
+			t.Fatal("heartbeat remained eligible before stale-acknowledgement control")
+		}
+		readinessOK.Store(true)
+		driftRevision.Store(true)
+		if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+			t.Fatalf("stale but server-echoed heartbeat: %v", err)
+		}
+		if d.State() != StateRecovering || d.spawner.IsAccepting() {
+			t.Fatalf("stale acknowledged revision reopened admission: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+		}
+		if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+			t.Fatalf("fresh current-revision heartbeat: %v", err)
+		}
+		if d.State() != StateRunning || !d.spawner.IsAccepting() {
+			t.Fatalf("fresh current-revision acknowledgement did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+		}
+	})
+
+	t.Run("race/heartbeat-poll-refresh", func(t *testing.T) {
+		priorHeartbeats = heartbeatCount.Load()
+		readinessError.Store(true)
+		var wg sync.WaitGroup
+		for i := 0; i < 12; i++ {
+			wg.Add(1)
+			go func(i int) {
+				defer wg.Done()
+				switch i % 3 {
+				case 0:
+					_ = d.heartbeat.sendOneResult(context.Background())
+				case 1:
+					_ = d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
+						State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-race",
+					}})
+				case 2:
+					d.poller.pollOnce(context.Background())
+				}
+			}(i)
+		}
+		wg.Wait()
+		pollAfterRace := pollCount.Load()
+		assertClosed(t, "race", priorHeartbeats, pollAfterRace)
+		reopenAfterAcknowledgedHeartbeat(t, "race")
+	})
 }
 
 func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
@@ -817,6 +957,70 @@ func TestCarrierActivationExactSetAndAckResolvePendingSnapshot(t *testing.T) {
 	}
 	if !d.SessionShimCarrierActivationComplete() {
 		t.Fatal("carrierActivationComplete remained false after exact complete set")
+	}
+}
+
+func TestConsumedRecoveryActivationRequiresOriginalHighWaterReceiptAndCurrentEntry(t *testing.T) {
+	id := sessionshim.Identity{OrgID: "org-recovery-bind", SessionID: "session-recovery-bind"}
+	carrier := SessionShimCarrierActivation{OrgID: id.OrgID, SessionID: id.SessionID, CarrierEpoch: 17}
+	originalReceipt := SessionShimAdoptionReceipt{DurableCorrelation: []byte("original-replayed-adoption")}
+
+	tests := map[string]func(*Daemon, map[sessionshim.Identity]adoptedShim, *[]SessionShimCarrierActivationReceipt){
+		"changed staged high-water": func(_ *Daemon, _ map[sessionshim.Identity]adoptedShim, activated *[]SessionShimCarrierActivationReceipt) {
+			(*activated)[0].AckSeq = 28
+		},
+		"changed adoption receipt": func(d *Daemon, _ map[sessionshim.Identity]adoptedShim, _ *[]SessionShimCarrierActivationReceipt) {
+			entry := d.shims.adopted[id]
+			entry.adoptionReceipt.DurableCorrelation = []byte("changed-replayed-adoption")
+			d.shims.adopted[id] = entry
+		},
+		"replaced adopted entry": func(d *Daemon, _ map[sessionshim.Identity]adoptedShim, _ *[]SessionShimCarrierActivationReceipt) {
+			entry := d.shims.adopted[id]
+			entry.controller = &sessionshim.Controller{}
+			d.shims.adopted[id] = entry
+		},
+		"second staged Snapshot": func(d *Daemon, _ map[sessionshim.Identity]adoptedShim, _ *[]SessionShimCarrierActivationReceipt) {
+			d.shims.pendingSnapshots[id] = sessionshim.ControllerEvent{
+				Kind: sessionshim.EventHostFrame, FrameType: attachwire.TypeSnapshot, RequestID: 88, Seq: 29,
+			}
+		},
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			activated := []SessionShimCarrierActivationReceipt{{Activation: carrier, AckSeq: 29}}
+			d := New(Options{SessionShim: SessionShimConfig{
+				EnableAdoption: true, ControllerID: "controller-recovery-bind",
+				OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+					return append([]SessionShimCarrierActivationReceipt(nil), activated...), nil
+				},
+			}})
+			d.shims.adoptionComplete = true
+			d.shims.batchReceipts[id.OrgID] = SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("batch"), AdoptionRevision: "revision",
+			}
+			ctrl := &sessionshim.Controller{}
+			entry := adoptedShim{
+				controller: ctrl,
+				adoption: SessionShimAdoptionEvidence{
+					Identity: id, CarrierCompatible: true,
+					Extensions: shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "17"}},
+				},
+				adoptionReceipt: cloneSessionShimAdoptionReceipt(originalReceipt),
+				consumedRecovery: &sessionShimConsumedRecovery{
+					preStageAckSeq: 27, stagedHighWater: 29,
+					adoptionReceipt: cloneSessionShimAdoptionReceipt(originalReceipt),
+				},
+			}
+			d.shims.adopted[id] = entry
+			published := map[sessionshim.Identity]adoptedShim{id: entry}
+			mutate(d, published, &activated)
+			if err := d.activatePublishedSessionShimCarriers(context.Background(), published); err == nil {
+				t.Fatal("consumed recovery activation accepted changed original evidence")
+			}
+			if got := d.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != 0 {
+				t.Fatalf("refused consumed recovery advanced cursor = %d", got)
+			}
+		})
 	}
 }
 

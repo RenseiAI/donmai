@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"crypto/rand"
 	"encoding/hex"
@@ -603,6 +604,61 @@ func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
 	return readiness.validate()
 }
 
+// withdrawSessionShimProofV2Readiness closes every new-work rail on the first
+// dynamic readiness failure. The atomic fence flips first so heartbeat capacity,
+// poll/claim, and Daemon.AcceptWork fail closed even while the spawner/lifecycle
+// projections are converging on recovering.
+func (d *Daemon) withdrawSessionShimProofV2Readiness() {
+	if !d.sessionShimAttestationValue.enabled() ||
+		!d.sessionShimReadinessWithdrawn.CompareAndSwap(false, true) {
+		return
+	}
+	d.lifecycleMu.Lock()
+	if d.spawner != nil {
+		d.spawner.Pause()
+	}
+	if d.stopGen == nil && d.State() == StateRunning {
+		d.setState(StateRecovering)
+	}
+	d.lifecycleMu.Unlock()
+	slog.Warn("session shim: proof-v2 readiness withdrawn; admission paused")
+}
+
+// acknowledgeSessionShimRecoveryHeartbeat is the only dynamic reopening edge.
+// The heartbeat service invokes it after an exact server acknowledgement. A
+// second live readiness resolution is required so a stale positive projection
+// cannot reopen a daemon after the durable store withdrew again in flight.
+func (d *Daemon) acknowledgeSessionShimRecoveryHeartbeat(acknowledged SessionShimHeartbeatProjection) {
+	if !d.sessionShimAttestationValue.enabled() || !d.sessionShimReadinessWithdrawn.Load() {
+		return
+	}
+	current, err := d.SessionShimHeartbeatProjection(d.sessionShimConfig().orgID())
+	if err != nil || !acknowledged.exactEqual(current) {
+		return
+	}
+	if !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
+		return
+	}
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.Load() {
+		return
+	}
+	switch d.State() {
+	case StateRecovering:
+		if d.spawner != nil {
+			d.spawner.Resume()
+		}
+		d.setState(StateRunning)
+		d.sessionShimReadinessWithdrawn.Store(false)
+	case StatePaused, StateDraining:
+		// Preserve an operator pause. The acknowledged heartbeat clears only the
+		// proof-v2 fence; ResumeContext remains the explicit admission edge for a
+		// manual pause or non-terminal drain.
+		d.sessionShimReadinessWithdrawn.Store(false)
+	}
+}
+
 // defaultShimRegistryDir resolves the registry location through the injected
 // state-directory seam.
 func defaultShimRegistryDir() string {
@@ -639,6 +695,33 @@ type adoptedShim struct {
 	// generation until terminal proof is handed downstream.
 	adoption        SessionShimAdoptionEvidence
 	adoptionReceipt SessionShimAdoptionReceipt
+	// consumedRecovery is the non-secret local activation resolution for a
+	// proof/receipt adoption that committed before the prior controller died. It
+	// binds carrier_active to the original staged high-water and exact replayed
+	// adoption receipt without retaining the bearer, recovery correlation, raw
+	// Snapshot, or any authority that could mint a second candidate.
+	consumedRecovery *sessionShimConsumedRecovery
+}
+
+type sessionShimConsumedRecovery struct {
+	preStageAckSeq  uint64
+	stagedHighWater uint64
+	adoptionReceipt SessionShimAdoptionReceipt
+}
+
+func newSessionShimConsumedRecovery(
+	preparation SessionShimAdoptionPreparationResult,
+	receipt SessionShimAdoptionReceipt,
+) *sessionShimConsumedRecovery {
+	if preparation.State != SessionShimPreparationAdoptedCandidateRecovery ||
+		preparation.AdoptedCandidateRecovery == nil {
+		return nil
+	}
+	return &sessionShimConsumedRecovery{
+		preStageAckSeq:  preparation.AdoptedCandidateRecovery.PreStageAckSeq,
+		stagedHighWater: preparation.AdoptedCandidateRecovery.StagedHighWater,
+		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
+	}
 }
 
 type shimIncarnation struct {
@@ -913,7 +996,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}()
 	for _, c := range result.Adopted {
 		id := c.Identity()
-		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparedByID[id], hostByID[id])
+		preparation := preparedByID[id]
+		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
@@ -921,7 +1005,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparedByID[id])
+		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparation)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
@@ -931,10 +1015,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		// The proxy is a synchronous takeover capability, not retained state.
 		evidence.SnapshotProxy = nil
 		entries[id] = adoptedShim{
-			controller:      c,
-			shimID:          c.Hello().ShimID,
-			adoption:        evidence,
-			adoptionReceipt: receipt,
+			controller:       c,
+			shimID:           c.Hello().ShimID,
+			adoption:         evidence,
+			adoptionReceipt:  receipt,
+			consumedRecovery: newSessionShimConsumedRecovery(preparation, receipt),
 		}
 	}
 
@@ -1342,6 +1427,13 @@ func (d *Daemon) prepareSessionShimAdoption(
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
 ) (SessionShimAdoptionPreparationResult, error) {
+	if d.sessionShimReadinessWithdrawn.Load() {
+		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
+	}
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+		return SessionShimAdoptionPreparationResult{}, err
+	}
 	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
 		return SessionShimAdoptionPreparationResult{}, nil
 	}
@@ -1786,6 +1878,7 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 		return nil
 	}
 	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
 		return err
 	}
 	if result == nil || result.SessionShim == nil {
@@ -1793,7 +1886,8 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	}
 	receipt := result.SessionShim
 	wantState := SessionShimCredentialStateRecovering
-	if d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
+	if !d.sessionShimReadinessWithdrawn.Load() && d.State() == StateRunning &&
+		d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
 		wantState = SessionShimCredentialStateReady
 	}
 	if receipt.State != wantState {
@@ -2025,13 +2119,18 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 	if !exactSessionShimCarrierActivationSet(carriers, activatedSet) {
 		return errors.New("session shim: carrier activation callback did not return the exact complete set")
 	}
-	type resolvedSnapshot struct {
-		id    sessionshim.Identity
-		event sessionshim.ControllerEvent
-		gate  *shimAdoptionGate
-		ctrl  *sessionshim.Controller
+	type resolvedActivation struct {
+		id                  sessionshim.Identity
+		sequence            uint64
+		requestID           uint64
+		gate                *shimAdoptionGate
+		ctrl                *sessionshim.Controller
+		consumedRecovery    bool
+		recoveryPreStageAck uint64
+		recoveryReceipt     SessionShimAdoptionReceipt
 	}
-	resolved := make([]resolvedSnapshot, 0, len(activated))
+	resolved := make([]resolvedActivation, 0, len(activated))
+	resolvedPendingSnapshots := 0
 	d.shims.mu.Lock()
 	for _, activation := range activated {
 		id := sessionshim.Identity{
@@ -2039,43 +2138,81 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 		}
 		event, ok := d.shims.pendingSnapshots[id]
 		entry, adopted := d.shims.adopted[id]
-		if !ok || !adopted || event.Kind != sessionshim.EventHostFrame ||
-			event.FrameType != attachwire.TypeSnapshot || event.RequestID == 0 || activation.AckSeq != event.Seq {
+		published, wasPublished := entries[id]
+		if !adopted || !wasPublished || entry.controller != published.controller {
 			d.shims.mu.Unlock()
-			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot for %s", id)
+			return fmt.Errorf("session shim: carrier_active ack did not resolve the current adopted entry for %s", id)
 		}
-		resolved = append(resolved, resolvedSnapshot{
-			id: id, event: event, gate: d.shims.activationGates[id], ctrl: entry.controller,
+		recovery := entry.consumedRecovery
+		if recovery == nil && ok && event.Kind == sessionshim.EventHostFrame &&
+			event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0 && activation.AckSeq == event.Seq {
+			resolved = append(resolved, resolvedActivation{
+				id: id, sequence: event.Seq, requestID: event.RequestID,
+				gate: d.shims.activationGates[id], ctrl: entry.controller,
+			})
+			resolvedPendingSnapshots++
+			continue
+		}
+		if ok || recovery == nil || recovery.stagedHighWater == 0 ||
+			activation.AckSeq != recovery.stagedHighWater || recovery.preStageAckSeq >= recovery.stagedHighWater ||
+			len(recovery.adoptionReceipt.DurableCorrelation) == 0 ||
+			!bytes.Equal(recovery.adoptionReceipt.DurableCorrelation, entry.adoptionReceipt.DurableCorrelation) ||
+			published.consumedRecovery == nil ||
+			published.consumedRecovery.preStageAckSeq != recovery.preStageAckSeq ||
+			published.consumedRecovery.stagedHighWater != recovery.stagedHighWater ||
+			!bytes.Equal(published.consumedRecovery.adoptionReceipt.DurableCorrelation, recovery.adoptionReceipt.DurableCorrelation) {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: carrier_active ack did not exactly resolve the staged Snapshot or consumed recovery for %s", id)
+		}
+		resolved = append(resolved, resolvedActivation{
+			id: id, sequence: recovery.stagedHighWater, ctrl: entry.controller,
+			consumedRecovery: true, recoveryPreStageAck: recovery.preStageAckSeq,
+			recoveryReceipt: cloneSessionShimAdoptionReceipt(recovery.adoptionReceipt),
 		})
 	}
-	if len(d.shims.pendingSnapshots) != len(resolved) {
+	if len(d.shims.pendingSnapshots) != resolvedPendingSnapshots {
 		d.shims.mu.Unlock()
 		return errors.New("session shim: carrier activation left a staged Snapshot unresolved")
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
+	for _, activation := range resolved {
 		var acknowledger sessionShimCursorAcknowledger
-		if snapshot.ctrl != nil {
-			acknowledger = snapshot.ctrl
+		if activation.ctrl != nil {
+			acknowledger = activation.ctrl
 		}
-		if err := d.recordShimForwardedSeqForController(snapshot.id, acknowledger, snapshot.event.Seq); err != nil {
-			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", snapshot.id, err)
+		if err := d.recordShimForwardedSeqForController(activation.id, acknowledger, activation.sequence); err != nil {
+			return fmt.Errorf("session shim: persist staged Snapshot acknowledgement for %s: %w", activation.id, err)
 		}
 	}
 	d.shims.mu.Lock()
-	for _, snapshot := range resolved {
-		current, pending := d.shims.pendingSnapshots[snapshot.id]
-		if !pending || current.Seq != snapshot.event.Seq || current.RequestID != snapshot.event.RequestID ||
-			d.shims.activationGates[snapshot.id] != snapshot.gate {
-			d.shims.mu.Unlock()
-			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", snapshot.id)
+	for _, activation := range resolved {
+		if activation.consumedRecovery {
+			current, adopted := d.shims.adopted[activation.id]
+			recovery := current.consumedRecovery
+			if !adopted || current.controller != activation.ctrl || recovery == nil ||
+				recovery.preStageAckSeq != activation.recoveryPreStageAck ||
+				recovery.stagedHighWater != activation.sequence ||
+				!bytes.Equal(recovery.adoptionReceipt.DurableCorrelation, activation.recoveryReceipt.DurableCorrelation) ||
+				!bytes.Equal(current.adoptionReceipt.DurableCorrelation, activation.recoveryReceipt.DurableCorrelation) {
+				d.shims.mu.Unlock()
+				return fmt.Errorf("session shim: consumed recovery changed while persisting acknowledgement for %s", activation.id)
+			}
+			current.consumedRecovery = nil
+			d.shims.adopted[activation.id] = current
+			continue
 		}
-		delete(d.shims.pendingSnapshots, snapshot.id)
-		delete(d.shims.activationGates, snapshot.id)
+		current, pending := d.shims.pendingSnapshots[activation.id]
+		if !pending || current.Seq != activation.sequence || current.RequestID != activation.requestID ||
+			d.shims.activationGates[activation.id] != activation.gate {
+			d.shims.mu.Unlock()
+			return fmt.Errorf("session shim: staged Snapshot changed while persisting acknowledgement for %s", activation.id)
+		}
+		delete(d.shims.pendingSnapshots, activation.id)
+		delete(d.shims.activationGates, activation.id)
 	}
 	d.shims.mu.Unlock()
-	for _, snapshot := range resolved {
-		snapshot.gate.finish(true)
+	for _, activation := range resolved {
+		activation.gate.finish(true)
 	}
 	d.shims.mu.Lock()
 	d.shims.carrierActivationComplete = true
@@ -2169,6 +2306,7 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		return SessionShimHeartbeatProjection{}, nil
 	}
 	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
 		return SessionShimHeartbeatProjection{}, err
 	}
 	d.reconcileQuarantinedTombstones()

@@ -17,7 +17,9 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
+	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -216,6 +218,175 @@ func TestOnAdoptionSnapshotDoesNotReplayOrdinaryFramesBeforeActivation(t *testin
 	fence, err := replacement.RequestSessionShimRestartFence(context.Background(), "immediate-after-takeover")
 	if err != nil || len(fence.Sessions) != 1 || fence.Sessions[0].LastForwardedSeq < emitted.AtSeq+1 {
 		t.Fatalf("immediate fence lost early durable high-water: fence=%+v err=%v", fence, err)
+	}
+}
+
+func TestConsumedAdoptedCandidateRecoveryCompletesPublicationAndActivationWithoutSecondSnapshot(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	f.daemon.opts.SessionShim.Orphan.Deadline = 30 * time.Second
+	spec := f.interactiveSpec("consumed-candidate-recovery")
+	if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("AcceptWork: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	const carrierEpoch = uint64(41)
+	originalAdoptionReceipt := []byte("original-consumed-adoption-receipt")
+	var staged sessionshim.ControllerEvent
+	consuming := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: f.registry, HostID: "host-consumed-recovery",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			resumeFrom := preparation.LastHostSeq + 1
+			return SessionShimAdoptionPreparationResult{
+				State: SessionShimPreparationFreshCandidate,
+				PreparedAdoption: sessionshim.PreparedAdoption{
+					ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+					Extensions: shimwire.Extensions{Values: map[string]string{
+						shimwire.ExtCarrierEpoch: "41",
+					}},
+					ResumeFrom: &resumeFrom,
+				},
+			}, nil
+		},
+		OnAdoptionV2: func(ctx context.Context, evidence SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			if evidence.PreparationResult.State != SessionShimPreparationFreshCandidate || evidence.Evidence.SnapshotProxy == nil {
+				return SessionShimAdoptionReceipt{}, fmt.Errorf("fresh candidate lost Snapshot authority: %+v", evidence)
+			}
+			if _, err := evidence.Evidence.SnapshotProxy.Emit(ctx); err != nil {
+				return SessionShimAdoptionReceipt{}, err
+			}
+			return SessionShimAdoptionReceipt{DurableCorrelation: append([]byte(nil), originalAdoptionReceipt...)}, nil
+		},
+		OnSessionEventDurable: func(gotID sessionshim.Identity, event sessionshim.ControllerEvent) error {
+			if gotID == id && event.Kind == sessionshim.EventHostFrame && event.FrameType == attachwire.TypeSnapshot && event.RequestID != 0 {
+				staged = event
+			}
+			return nil
+		},
+		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("consumed-batch"), AdoptionRevision: "consumed-revision",
+			}, nil
+		},
+		OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			return nil, errors.New("simulated controller loss after proof and receipt consume")
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, consuming, id.OrgID)
+	if err := consuming.adoptSessionShims(context.Background()); err == nil ||
+		!strings.Contains(err.Error(), "simulated controller loss") {
+		t.Fatalf("consuming adoption = %v, want post-consume activation loss", err)
+	}
+	if staged.Seq == 0 || staged.RequestID == 0 || len(staged.FrameBytes) == 0 {
+		t.Fatalf("original staged Snapshot = %+v", staged)
+	}
+	if got := consuming.SessionShimForwardedSeq(id.OrgID, id.SessionID); got >= staged.Seq {
+		t.Fatalf("failed activation advanced original staged cursor = %d, Snapshot=%d", got, staged.Seq)
+	}
+	consuming.ReleaseAdoptedSessionShims()
+
+	credential, err := attachclient.NewV2RetainedCredential([]byte("original-consumed-candidate-bearer"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	recoveryCorrelation, err := NewSessionShimRecoveryCorrelation([]byte("original-consumed-recovery-correlation"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	preStageAck := staged.Seq - 1
+	resumeFrom := staged.Seq + 1
+	recoveryResult := SessionShimAdoptionPreparationResult{
+		State: SessionShimPreparationAdoptedCandidateRecovery,
+		PreparedAdoption: sessionshim.PreparedAdoption{
+			Extensions: shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "41"}},
+			ResumeFrom: &resumeFrom,
+		},
+		AdoptedCandidateRecovery: &SessionShimAdoptedCandidateRecovery{
+			Credential: credential, RecoveryCorrelation: recoveryCorrelation,
+			CarrierEpoch: carrierEpoch, PreStageAckSeq: preStageAck,
+			StagedHighWater: staged.Seq, ResumeFrom: resumeFrom,
+			CredentialExpiresAt: time.Now().Add(time.Hour),
+			ResumeDisposition: attachclient.V2ResumeDisposition{
+				ProofSchemaVersion:   attachclient.V2ProofSchemaV2,
+				Authority:            attachclient.V2ResumeAdoptedCandidateRecovery,
+				State:                attachclient.V2ResumeReceiptStored,
+				PTYEpoch:             1,
+				CarrierEpoch:         carrierEpoch,
+				AckSeq:               preStageAck,
+				CandidateSnapshotSeq: staged.Seq,
+				CandidateSnapshot:    append([]byte(nil), staged.FrameBytes...),
+			},
+		},
+	}
+	if preStageAck != 0 {
+		recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.GapFromSeq = 1
+		recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.GapToSeq = preStageAck
+		recoveryResult.AdoptedCandidateRecovery.ResumeDisposition.GapReason = attachwirev2.GapControllerUnforwarded
+	}
+
+	var prepareCalls, adoptionCalls, batchCalls, activationCalls, recoveryDurableFrames int
+	var recovery *Daemon
+	recovery = New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: f.registry, HostID: "host-consumed-recovery",
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		PrepareAdoptionV2: func(_ context.Context, preparation SessionShimAdoptionPreparation) (SessionShimAdoptionPreparationResult, error) {
+			prepareCalls++
+			resolved := cloneSessionShimAdoptionPreparationResult(recoveryResult)
+			resolved.PreparedAdoption.ControllerGeneration = preparation.CurrentControllerGeneration + 1
+			return resolved, nil
+		},
+		OnAdoptionV2: func(_ context.Context, evidence SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error) {
+			adoptionCalls++
+			if evidence.Evidence.SnapshotProxy != nil || evidence.PreparationResult.State != SessionShimPreparationAdoptedCandidateRecovery {
+				return SessionShimAdoptionReceipt{}, fmt.Errorf("consumed recovery received new Snapshot authority: %+v", evidence)
+			}
+			return SessionShimAdoptionReceipt{DurableCorrelation: append([]byte(nil), originalAdoptionReceipt...)}, nil
+		},
+		OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+			recoveryDurableFrames++
+			return nil
+		},
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			batchCalls++
+			if len(batch.Adopted) != 1 || !bytes.Equal(batch.Adopted[0].Receipt.DurableCorrelation, originalAdoptionReceipt) {
+				return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("recovery batch lost original adoption receipt: %+v", batch.Adopted)
+			}
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("recovery-batch"), AdoptionRevision: "recovery-revision",
+			}, nil
+		},
+		OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			activationCalls++
+			if _, err := recovery.adoptedShimEntry(id.OrgID, id.SessionID); err != nil {
+				return nil, fmt.Errorf("activation ran before current adopted entry publication: %w", err)
+			}
+			return []SessionShimCarrierActivationReceipt{{
+				Activation: publication.Carriers[0], AckSeq: staged.Seq,
+			}}, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, recovery, id.OrgID)
+	t.Cleanup(recovery.ReleaseAdoptedSessionShims)
+	if err := recovery.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("consumed-candidate recovery: %v", err)
+	}
+	if prepareCalls != 1 || adoptionCalls != 1 || batchCalls != 1 || activationCalls != 1 {
+		t.Fatalf("recovery lifecycle calls prepare/adoption/batch/activation = %d/%d/%d/%d", prepareCalls, adoptionCalls, batchCalls, activationCalls)
+	}
+	if recoveryDurableFrames != 0 {
+		t.Fatalf("consumed recovery emitted %d new durable frames, want zero", recoveryDurableFrames)
+	}
+	if got := recovery.SessionShimForwardedSeq(id.OrgID, id.SessionID); got != staged.Seq {
+		t.Fatalf("recovery forwarded cursor = %d, want original staged high-water %d", got, staged.Seq)
+	}
+	if !recovery.SessionShimAdoptionComplete() || !recovery.SessionShimCarrierActivationComplete() {
+		t.Fatalf("recovery completion = adoption:%v activation:%v", recovery.SessionShimAdoptionComplete(), recovery.SessionShimCarrierActivationComplete())
 	}
 }
 
