@@ -697,9 +697,11 @@ func TestZeroValueSessionShimPreservesRegistrationAndRefreshBytes(t *testing.T) 
 }
 
 func TestHeartbeatSessionShimProjectionIsCoherentAndRequiresExactEcho(t *testing.T) {
+	readiness, _ := testSessionShimProofV2Readiness()
 	projection := SessionShimHeartbeatProjection{
 		Enabled: true, AdoptionComplete: true,
 		WorkerHostID: "stable-host", ControllerID: "controller", AdoptionRevision: "revision",
+		SessionShimCarrierProofV2Readiness: readiness,
 		QuarantinedSessions: []SessionShimQuarantinedSession{{
 			OrgID: "org", SessionID: "session", ShimID: "shim", ProcessEpoch: 4,
 			ControllerGeneration: "18446744073709551615", ProtocolMin: 1, ProtocolMax: 1,
@@ -707,12 +709,17 @@ func TestHeartbeatSessionShimProjectionIsCoherentAndRequiresExactEcho(t *testing
 		}},
 	}
 	var rawBody []byte
-	var changedEcho atomic.Bool
+	var changedEcho atomic.Int64
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		rawBody, _ = io.ReadAll(r.Body)
 		echo := projection
-		if changedEcho.Load() {
+		switch changedEcho.Load() {
+		case 1:
 			echo.AdoptionRevision = "changed"
+		case 2:
+			echo.WorkerHostID = "changed-host"
+		case 3:
+			echo.DurableCarrierProofV2Ready = false
 		}
 		_ = json.NewEncoder(w).Encode(heartbeatResponseBody{Acknowledged: true, SessionShim: &echo})
 	}))
@@ -737,10 +744,130 @@ func TestHeartbeatSessionShimProjectionIsCoherentAndRequiresExactEcho(t *testing
 	if !bytes.Contains(body["sessionShim"], []byte(`"controllerGeneration":"18446744073709551615"`)) {
 		t.Fatalf("controllerGeneration was not a canonical decimal string: %s", body["sessionShim"])
 	}
+	for _, member := range []string{
+		`"durable_carrier_proof_v2_ready":true`, `"composingProofV1WritesClosed":true`,
+		`"encryptedOriginalCredentialRetained":true`, `"remainingValidityConsumeGate":true`,
+		`"adoptedCandidateRecovery":true`,
+	} {
+		if !bytes.Contains(body["sessionShim"], []byte(member)) {
+			t.Fatalf("heartbeat sessionShim omitted readiness member %s: %s", member, body["sessionShim"])
+		}
+	}
 
-	changedEcho.Store(true)
+	withoutReadiness := projection
+	withoutReadiness.SessionShimCarrierProofV2Readiness = SessionShimCarrierProofV2Readiness{}
+	if err := withoutReadiness.validateReady(); err == nil {
+		t.Fatal("capability-bearing session-shim authority was accepted without dynamic proof-v2 readiness")
+	}
+
+	changedEcho.Store(1)
 	if err := service.sendOneResult(context.Background()); err == nil {
 		t.Fatal("heartbeat accepted a changed adoption revision echo")
+	}
+	changedEcho.Store(2)
+	if err := service.sendOneResult(context.Background()); err == nil {
+		t.Fatal("heartbeat accepted a changed stable-host authority echo")
+	}
+	changedEcho.Store(3)
+	if err := service.sendOneResult(context.Background()); err == nil {
+		t.Fatal("heartbeat accepted malformed proof-v2 readiness echo")
+	}
+}
+
+func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) {
+	attestation := activationTestAttestation()
+	var (
+		readinessCalls atomic.Int64
+		readinessError atomic.Bool
+		endpointCalls  atomic.Int64
+	)
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true, RequireCredentialAttestation: true,
+		ControllerID: attestation.ControllerID, AttestationCapabilities: attestation.Capabilities,
+		OrgID: "org-readiness-wire",
+		GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) {
+			readinessCalls.Add(1)
+			if readinessError.Load() {
+				return SessionShimCarrierProofV2Readiness{}, errors.New("readiness authority unavailable")
+			}
+			return testSessionShimProofV2Readiness()
+		},
+	}})
+	if err := d.retainSessionShimCredentialReceipts([]SessionShimScopeCredentialReceipt{{
+		Scope: "org-readiness-wire", WorkerHostID: "stable-host-readiness-wire", AdoptionRevision: "17",
+	}}); err != nil {
+		t.Fatal(err)
+	}
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+
+	var rawBody []byte
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		endpointCalls.Add(1)
+		rawBody, _ = io.ReadAll(r.Body)
+		var body heartbeatRequestBody
+		if err := json.Unmarshal(rawBody, &body); err != nil {
+			t.Errorf("decode heartbeat request: %v", err)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(heartbeatResponseBody{Acknowledged: true, SessionShim: body.SessionShim})
+	}))
+	t.Cleanup(server.Close)
+
+	service := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "worker-readiness-wire", OrchestratorURL: server.URL, RuntimeJWT: "runtime-readiness-wire",
+		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
+		GetStatus: func() RegistrationStatus { return RegistrationDraining },
+		GetSessionShim: func() (SessionShimHeartbeatProjection, error) {
+			return d.SessionShimHeartbeatProjection("org-readiness-wire")
+		},
+		HTTPClient: server.Client(),
+	})
+	if err := service.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("send live readiness heartbeat: %v", err)
+	}
+	if readinessCalls.Load() != 1 {
+		t.Fatalf("live readiness resolutions = %d, want exactly 1", readinessCalls.Load())
+	}
+	for _, member := range []string{
+		`"durable_carrier_proof_v2_ready":true`, `"composingProofV1WritesClosed":true`,
+		`"encryptedOriginalCredentialRetained":true`, `"remainingValidityConsumeGate":true`,
+		`"adoptedCandidateRecovery":true`, `"workerHostId":"stable-host-readiness-wire"`,
+	} {
+		if !bytes.Contains(rawBody, []byte(member)) {
+			t.Fatalf("live heartbeat omitted %s: %s", member, rawBody)
+		}
+	}
+	var heartbeatBody map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &heartbeatBody); err != nil {
+		t.Fatal(err)
+	}
+	var legacyProjection struct {
+		Enabled             bool                            `json:"enabled"`
+		AdoptionComplete    bool                            `json:"adoptionComplete"`
+		WorkerHostID        string                          `json:"workerHostId"`
+		ControllerID        string                          `json:"controllerId"`
+		AdoptionRevision    string                          `json:"adoptionRevision"`
+		QuarantinedSessions []SessionShimQuarantinedSession `json:"quarantinedSessions"`
+	}
+	if err := json.Unmarshal(heartbeatBody["sessionShim"], &legacyProjection); err != nil {
+		t.Fatalf("legacy reader rejected additive readiness fields: %v", err)
+	}
+	if !legacyProjection.Enabled || !legacyProjection.AdoptionComplete ||
+		legacyProjection.WorkerHostID != "stable-host-readiness-wire" ||
+		legacyProjection.ControllerID != attestation.ControllerID || legacyProjection.AdoptionRevision != "17" {
+		t.Fatalf("additive readiness changed legacy authority projection: %+v", legacyProjection)
+	}
+	if _, err := d.SessionShimHeartbeatProjection("other-org"); err == nil {
+		t.Fatal("readiness projection crossed organization authority")
+	}
+
+	readinessError.Store(true)
+	if err := service.sendOneResult(context.Background()); err == nil {
+		t.Fatal("heartbeat reached the endpoint after live readiness resolver failure")
+	}
+	if endpointCalls.Load() != 1 {
+		t.Fatalf("endpoint calls after readiness failure = %d, want 1", endpointCalls.Load())
 	}
 }
 
@@ -877,6 +1004,15 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	}
 	if readinessCalls.Load() < 2 {
 		t.Fatalf("proof-v2 readiness was not checked at registration and heartbeat: calls=%d", readinessCalls.Load())
+	}
+	mu.Lock()
+	startupHeartbeat := lastHeartbeat
+	mu.Unlock()
+	wantStartupReadiness, _ := testSessionShimProofV2Readiness()
+	if startupHeartbeat.SessionShim == nil ||
+		startupHeartbeat.SessionShim.SessionShimCarrierProofV2Readiness != wantStartupReadiness ||
+		startupHeartbeat.SessionShim.WorkerHostID != "stable-host-order" {
+		t.Fatalf("startup heartbeat omitted authority-bound live readiness: %+v", startupHeartbeat.SessionShim)
 	}
 	assertClosed := func(t *testing.T, reason string, priorHeartbeats, priorPolls int64) {
 		t.Helper()
@@ -1178,8 +1314,10 @@ func TestForwardedCursorWaitsForExactShimPersistenceReceipt(t *testing.T) {
 }
 
 func TestHeartbeatQuarantineOrderingUsesNumericControllerGeneration(t *testing.T) {
+	readiness, _ := testSessionShimProofV2Readiness()
 	projection := SessionShimHeartbeatProjection{
 		Enabled: true, AdoptionComplete: true, WorkerHostID: "host", ControllerID: "controller", AdoptionRevision: "revision",
+		SessionShimCarrierProofV2Readiness: readiness,
 		QuarantinedSessions: []SessionShimQuarantinedSession{
 			{OrgID: "org", SessionID: "session", ShimID: "shim", ProcessEpoch: 1, ControllerGeneration: "2", Reason: "x", ConsumesCapacity: true},
 			{OrgID: "org", SessionID: "session", ShimID: "shim", ProcessEpoch: 1, ControllerGeneration: "10", Reason: "x", ConsumesCapacity: true},

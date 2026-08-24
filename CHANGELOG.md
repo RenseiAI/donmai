@@ -8,6 +8,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Hosted heartbeats carry live proof-v2 readiness.** The authority-bound
+  `sessionShim` projection now includes the independently resolved durable
+  acknowledgement, proof-v1 closure, retained-credential, remaining-validity,
+  and adopted-candidate recovery facts. Missing or changed facts fail closed;
+  a capability declaration is never treated as readiness evidence.
+
 ## v0.68.5 — 2026-08-23
 
 _v0.68.4 was tagged, but its publishers stopped before build and no release

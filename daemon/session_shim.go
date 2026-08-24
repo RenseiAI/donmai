@@ -589,19 +589,27 @@ func (c SessionShimConfig) validateSnapshotCarrier() error {
 	return nil
 }
 
-func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
+func (d *Daemon) resolveSessionShimCarrierProofV2Readiness() (SessionShimCarrierProofV2Readiness, error) {
 	if !d.sessionShimAttestationValue.enabled() {
-		return nil
+		return SessionShimCarrierProofV2Readiness{}, nil
 	}
 	resolve := d.sessionShimConfig().GetCarrierProofV2Readiness
 	if resolve == nil {
-		return errors.New("session shim: proof-v2 readiness resolver is required")
+		return SessionShimCarrierProofV2Readiness{}, errors.New("session shim: proof-v2 readiness resolver is required")
 	}
 	readiness, err := resolve()
 	if err != nil {
-		return fmt.Errorf("session shim: resolve proof-v2 readiness: %w", err)
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("session shim: resolve proof-v2 readiness: %w", err)
 	}
-	return readiness.validate()
+	if err := readiness.validate(); err != nil {
+		return SessionShimCarrierProofV2Readiness{}, err
+	}
+	return readiness, nil
+}
+
+func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
+	_, err := d.resolveSessionShimCarrierProofV2Readiness()
+	return err
 }
 
 // withdrawSessionShimProofV2Readiness closes every new-work rail on the first
@@ -2323,7 +2331,8 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 	if !d.sessionShimAttestationValue.enabled() {
 		return SessionShimHeartbeatProjection{}, nil
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	readiness, err := d.resolveSessionShimCarrierProofV2Readiness()
+	if err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return SessionShimHeartbeatProjection{}, err
 	}
@@ -2335,11 +2344,12 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		return SessionShimHeartbeatProjection{}, fmt.Errorf("session shim: no heartbeat authority receipt for organization %q", orgID)
 	}
 	projection := SessionShimHeartbeatProjection{
-		Enabled:          true,
-		AdoptionComplete: d.shims.adoptionComplete,
-		WorkerHostID:     receipt.WorkerHostID,
-		ControllerID:     d.controllerID(),
-		AdoptionRevision: receipt.AdoptionRevision,
+		Enabled:                            true,
+		AdoptionComplete:                   d.shims.adoptionComplete,
+		WorkerHostID:                       receipt.WorkerHostID,
+		ControllerID:                       d.controllerID(),
+		AdoptionRevision:                   receipt.AdoptionRevision,
+		SessionShimCarrierProofV2Readiness: readiness,
 	}
 	if !d.shims.carrierActivationComplete {
 		d.shims.mu.RUnlock()
