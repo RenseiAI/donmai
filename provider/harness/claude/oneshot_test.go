@@ -13,23 +13,113 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// writeFakeCLI writes an executable /bin/sh script and returns its path. The
-// exec bit is added AFTER the write (rather than via WriteFile's mode) to avoid
-// ETXTBSY on fork+exec under parallel test load — same rationale as
-// fakeEnvEchoCLI in endpoint_test.go.
+// fakeCLIDispatcher is written in TestMain before any test can fork. Each
+// per-test fake CLI is a hard link to it, with the test-specific shell source in
+// a non-executable sidecar file. This keeps an inherited writer for a newly
+// created fixture from ever referring to the inode execve uses.
+var (
+	fakeCLIDispatcher    string
+	fakeCLIDispatcherErr string
+)
+
+func TestMain(m *testing.M) {
+	code := func() int {
+		if runtime.GOOS == "windows" {
+			return m.Run()
+		}
+
+		dir, err := os.MkdirTemp("", "claude-fake-cli-dispatcher-")
+		if err != nil {
+			fakeCLIDispatcherErr = "create fake CLI dispatcher directory: " + err.Error()
+			return m.Run()
+		}
+		defer func() { _ = os.RemoveAll(dir) }()
+
+		path := filepath.Join(dir, "fake-cli-dispatcher.sh")
+		// $0 is the per-test symlink path, so its sidecar names that test's
+		// script. /bin/sh reads the sidecar as data rather than execve-ing it.
+		const dispatcher = "#!/bin/sh\nexec /bin/sh \"$0.fixture\" \"$@\"\n"
+		if err := writeFakeCLIFile(path, dispatcher); err != nil {
+			fakeCLIDispatcherErr = "write fake CLI dispatcher: " + err.Error()
+			return m.Run()
+		}
+		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture dispatcher needs exec bit
+			fakeCLIDispatcherErr = "chmod fake CLI dispatcher: " + err.Error()
+			return m.Run()
+		}
+		fakeCLIDispatcher = path
+		return m.Run()
+	}()
+	os.Exit(code)
+}
+
+// writeFakeCLIFile creates a fixture file without execute permission, writes
+// and syncs it, then closes the writable descriptor before publication.
+func writeFakeCLIFile(path, contents string) error {
+	file, err := os.OpenFile(path, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600) //nolint:gosec // isolated test fixture
+	if err != nil {
+		return err
+	}
+	if _, err := file.WriteString(contents); err != nil {
+		_ = file.Close()
+		return err
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return err
+	}
+	return file.Close()
+}
+
+// writeFakeCLI writes a per-test fake claude CLI and returns its path.
+//
+// It must not return a newly-written executable script. A sibling test can
+// fork while that script's writable FD is still open; its child then inherits
+// the writer and execve of the script can fail with ETXTBSY. The dispatcher is
+// immutable before tests begin, while each test script is only shell input.
 func writeFakeCLI(t *testing.T, name, script string) string {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("fake CLI uses /bin/sh; skip on windows")
 	}
-	path := filepath.Join(t.TempDir(), name)
-	if err := os.WriteFile(path, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
-		t.Fatalf("write fake cli: %v", err)
+	if fakeCLIDispatcherErr != "" {
+		t.Fatalf("prepare fake CLI dispatcher: %s", fakeCLIDispatcherErr)
 	}
-	if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // test fixture script needs exec bit
-		t.Fatalf("chmod fake cli: %v", err)
+	path := filepath.Join(t.TempDir(), name)
+	if err := writeFakeCLIFile(path+".fixture", script); err != nil {
+		t.Fatalf("write fake cli fixture: %v", err)
+	}
+	if err := os.Link(fakeCLIDispatcher, path); err != nil { //nolint:gosec // atomically publishes a hard-linked test fixture
+		t.Fatalf("publish fake cli dispatcher: %v", err)
 	}
 	return path
+}
+
+// TestWriteFakeCLI_ExecutesWhileFixtureIsWritable keeps the script source open
+// while the provider forks it. With the old direct-script helper that source
+// was the executable inode, and Linux returned ETXTBSY. The dispatcher safely
+// asks /bin/sh to read the source as a non-executable sidecar instead.
+func TestWriteFakeCLI_ExecutesWhileFixtureIsWritable(t *testing.T) {
+	t.Parallel()
+
+	cli := writeFakeCLI(t, "fake-claude-writable-fixture.sh", "#!/bin/sh\nprintf '%s\\n' '{\"type\":\"result\",\"is_error\":false,\"result\":\"ok\"}'\n")
+	fixture, err := os.OpenFile(cli+".fixture", os.O_WRONLY|os.O_APPEND, 0) //nolint:gosec // deliberately holds the fake CLI source open for writing
+	if err != nil {
+		t.Fatalf("open fake cli source for writing: %v", err)
+	}
+	t.Cleanup(func() { _ = fixture.Close() })
+
+	p, err := New(Options{Binary: cli, LookPath: func(name string) (string, error) { return name, nil }})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	res, err := p.Complete(t.Context(), agent.OneShotRequest{Messages: []agent.Message{{Content: "c"}}})
+	if err != nil {
+		t.Fatalf("Complete while fixture writer is open: %v", err)
+	}
+	if res.Text != "ok" {
+		t.Errorf("Text = %q, want ok", res.Text)
+	}
 }
 
 // fakeArgvRecorderCLI writes a fake claude CLI that records its argv (one arg
