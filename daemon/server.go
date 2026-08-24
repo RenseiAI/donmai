@@ -134,6 +134,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/stop", s.method(http.MethodPost, s.handleStop))
 	mux.HandleFunc("/api/daemon/drain", s.method(http.MethodPost, s.handleDrain))
 	mux.HandleFunc("/api/daemon/restart/prepare", s.method(http.MethodPost, s.handleRestartPrepare))
+	mux.HandleFunc(sessionShimAcceptanceRoute, s.handleSessionShimAcceptanceControl)
 	mux.HandleFunc("/api/daemon/update", s.method(http.MethodPost, s.handleUpdate))
 	mux.HandleFunc("/api/daemon/capacity", s.method(http.MethodPost, s.handleSetCapacity))
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))

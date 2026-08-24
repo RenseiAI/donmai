@@ -775,6 +775,13 @@ type sessionShimState struct {
 	// stop permission. The separate audit file records state but is never read as
 	// recovery authority.
 	restart *restartPreparation
+	// acceptanceRefusals and acceptanceQuarantines are populated only through
+	// the dormant, bearer-authenticated installed-artifact acceptance control.
+	// They never derive authority from request data: a quarantine is admitted
+	// only after a live registry record is matched to an already-adopted
+	// lifecycle, and a refusal can affect only that exact lifecycle.
+	acceptanceRefusals   map[sessionshim.Identity]acceptanceRefusalState
+	acceptanceQuarantine map[shimIncarnation]sessionshim.ProcessIdentity
 	// restartStateWriter and restartID are package-private test seams. Production
 	// uses the atomic secret-free state writer and crypto/rand identifier.
 	restartStateWriter func(restartPreparationAudit) error
@@ -797,16 +804,18 @@ type sessionShimState struct {
 
 func newSessionShimState() *sessionShimState {
 	return &sessionShimState{
-		adopted:            make(map[sessionshim.Identity]adoptedShim),
-		forwarded:          make(map[sessionshim.Identity]uint64),
-		correlations:       make(map[shimIncarnation]sessionShimAdoptionCorrelation),
-		fences:             make(map[string]sessionshim.Fence),
-		fenceRequests:      make(map[string]sessionshim.FenceRequest),
-		batchReceipts:      make(map[string]SessionShimAdoptionBatchReceipt),
-		credentialReceipts: make(map[string]SessionShimScopeCredentialReceipt),
-		stagingSnapshots:   make(map[sessionshim.Identity]bool),
-		pendingSnapshots:   make(map[sessionshim.Identity]sessionshim.ControllerEvent),
-		activationGates:    make(map[sessionshim.Identity]*shimAdoptionGate),
+		adopted:              make(map[sessionshim.Identity]adoptedShim),
+		forwarded:            make(map[sessionshim.Identity]uint64),
+		correlations:         make(map[shimIncarnation]sessionShimAdoptionCorrelation),
+		fences:               make(map[string]sessionshim.Fence),
+		fenceRequests:        make(map[string]sessionshim.FenceRequest),
+		batchReceipts:        make(map[string]SessionShimAdoptionBatchReceipt),
+		credentialReceipts:   make(map[string]SessionShimScopeCredentialReceipt),
+		stagingSnapshots:     make(map[sessionshim.Identity]bool),
+		pendingSnapshots:     make(map[sessionshim.Identity]sessionshim.ControllerEvent),
+		activationGates:      make(map[sessionshim.Identity]*shimAdoptionGate),
+		acceptanceRefusals:   make(map[sessionshim.Identity]acceptanceRefusalState),
+		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
 	}
 }
 
