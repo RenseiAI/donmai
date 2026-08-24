@@ -25,6 +25,7 @@ func v2TestToken(t *testing.T, mutate func(map[string]any)) string {
 		"epoch": 3, "carrier_epoch": 9,
 		"handoff_nonce":                    base64.RawURLEncoding.EncodeToString(make([]byte, 32)),
 		"prepared_correlation_digest":      strings.Repeat("a", 64),
+		"proof_schema_version":             "2",
 		"store_authority_id":               "store-v2-test",
 		"proof_revision":                   "1",
 		"proof_digest":                     strings.Repeat("b", 64),
@@ -34,6 +35,8 @@ func v2TestToken(t *testing.T, mutate func(map[string]any)) string {
 		"reservation_request_id":           "223e4567-e89b-42d3-a456-426614174000",
 		"reservation_request_digest":       strings.Repeat("c", 64),
 		"reserved_candidate_carrier_epoch": "9",
+		"carrier_epoch_floor":              "9",
+		"predecessor_abandonment":          nil,
 		"protocol":                         attachwirev2.ProtocolVersion,
 		"orgId":                            "org-v2",
 		"iat":                              time.Now().Add(-time.Minute).Unix(),
@@ -48,6 +51,27 @@ func v2TestToken(t *testing.T, mutate func(map[string]any)) string {
 	payload, _ := json.Marshal(claims)
 	return base64.RawURLEncoding.EncodeToString(header) + "." +
 		base64.RawURLEncoding.EncodeToString(payload) + "." + base64.RawURLEncoding.EncodeToString(make([]byte, 64))
+}
+
+func v2TestProofV1Token(t *testing.T, mutate func(map[string]any)) string {
+	t.Helper()
+	return v2TestToken(t, func(claims map[string]any) {
+		delete(claims, "proof_schema_version")
+		delete(claims, "carrier_epoch_floor")
+		delete(claims, "predecessor_abandonment")
+		if mutate != nil {
+			mutate(claims)
+		}
+	})
+}
+
+func v2TokenWithRawPayload(t *testing.T, token string, payload []byte) string {
+	t.Helper()
+	parts := strings.Split(token, ".")
+	if len(parts) != 3 {
+		t.Fatal("test token is malformed")
+	}
+	return parts[0] + "." + base64.RawURLEncoding.EncodeToString(payload) + "." + parts[2]
 }
 
 func readV2TestFrame(ctx context.Context, conn *websocket.Conn) (attachwire.Frame, []byte, error) {
@@ -337,6 +361,7 @@ func TestV2ActiveResumeAcceptsImmediateExactCarrierActiveWithoutSnapshot(t *test
 		AttachURL:   strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
 		TokenSource: func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
 		ResumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
 			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
 		},
 		OnInput: func(context.Context, attachwire.InputPayload) error {
@@ -378,8 +403,11 @@ func TestV2ActiveResumeKeepsAuthorityClosedUntilLocalPublication(t *testing.T) {
 			return nil
 		}},
 		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
-		resumeDisposition: &V2ResumeDisposition{State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12},
-		notify:            make(chan struct{}), closedCh: make(chan struct{}), localActiveCh: make(chan struct{}),
+		resumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		},
+		notify: make(chan struct{}), closedCh: make(chan struct{}), localActiveCh: make(chan struct{}),
 	}
 	if err := candidate.acceptCarrierActive(attachwirev2.CarrierActive{
 		PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
@@ -458,6 +486,7 @@ func TestV2ReceiptStoredResumeActivatesExactPendingSnapshotWithoutResend(t *test
 			}), nil
 		},
 		ResumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
 			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
 			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
 			GapFromSeq: 11, GapToSeq: 11, GapReason: attachwirev2.GapControllerUnforwarded,
@@ -489,6 +518,7 @@ func TestV2ResumeDispositionRejectsMismatchedFrameCarrierAndAck(t *testing.T) {
 			return "unused", nil
 		},
 		ResumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
 			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10,
 			CandidateSnapshotSeq: 12, CandidateSnapshot: snapshot.Encode(),
 		},
@@ -525,8 +555,11 @@ func TestV2ResumeDispositionRejectsMismatchedFrameCarrierAndAck(t *testing.T) {
 
 	active := &V2HostCandidate{
 		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
-		resumeDisposition: &V2ResumeDisposition{State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12},
-		notify:            make(chan struct{}), closedCh: make(chan struct{}),
+		resumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		},
+		notify: make(chan struct{}), closedCh: make(chan struct{}),
 	}
 	if err := active.acceptCarrierActive(attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 11}); err == nil || active.active {
 		t.Fatal("active resume accepted a changed journal high-water")
@@ -535,6 +568,7 @@ func TestV2ResumeDispositionRejectsMismatchedFrameCarrierAndAck(t *testing.T) {
 		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 10, highestSent: 12,
 		candidateSent: true, pendingSeq: 12, pendingRaw: snapshot.Encode(),
 		resumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
 			State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 10, CandidateSnapshotSeq: 12,
 		},
 		notify: make(chan struct{}), closedCh: make(chan struct{}),
@@ -569,11 +603,178 @@ func TestV2HostClaimsAreExactAndIndependentFromV1(t *testing.T) {
 		func(claims map[string]any) { claims["last_host_seq"] = "5" },
 		func(claims map[string]any) { claims["reserved_candidate_carrier_epoch"] = "10" },
 		func(claims map[string]any) { claims["reservation_request_digest"] = strings.Repeat("A", 64) },
+		func(claims map[string]any) { claims["proof_schema_version"] = 2 },
+		func(claims map[string]any) { claims["proof_schema_version"] = "02" },
+		func(claims map[string]any) { delete(claims, "carrier_epoch_floor") },
+		func(claims map[string]any) { claims["carrier_epoch_floor"] = 9 },
+		func(claims map[string]any) { claims["carrier_epoch_floor"] = "09" },
+		func(claims map[string]any) { claims["carrier_epoch_floor"] = "10" },
+		func(claims map[string]any) { delete(claims, "predecessor_abandonment") },
+		func(claims map[string]any) { claims["predecessor_abandonment"] = 1 },
 	}
 	for _, mutate := range cases {
 		if _, err := parseV2HostClaims(v2TestToken(t, mutate), now); err == nil {
 			t.Fatal("invalid v2 claim set was accepted")
 		}
+	}
+}
+
+func TestV2ProofSchemaAndPredecessorAreStrict(t *testing.T) {
+	now := time.Now()
+	valid := map[string]any{
+		"target_reservation_request_id":     "323e4567-e89b-42d3-a456-426614174000",
+		"target_reservation_request_digest": strings.Repeat("d", 64),
+		"source_candidate_state":            "receipt_stored",
+		"abandonment_request_id":            "423e4567-e89b-42d3-a456-426614174000",
+		"abandonment_request_digest":        strings.Repeat("e", 64),
+		"abandonment_revision":              "2",
+		"abandonment_digest":                strings.Repeat("f", 64),
+		"abandoned_candidate_carrier_epoch": "8",
+	}
+	if claims, err := parseV2HostClaims(v2TestToken(t, func(claims map[string]any) {
+		claims["predecessor_abandonment"] = valid
+	}), now); err != nil || claims.PredecessorAbandonment == nil || claims.CarrierEpochFloor != 9 {
+		t.Fatalf("parse exact proof-v2 predecessor: claims=%+v err=%v", claims, err)
+	}
+
+	mutations := map[string]func(map[string]any){
+		"unknown":               func(value map[string]any) { value["unknown"] = true },
+		"omitted":               func(value map[string]any) { delete(value, "abandonment_digest") },
+		"partial":               func(value map[string]any) { delete(value, "target_reservation_request_id") },
+		"numeric revision":      func(value map[string]any) { value["abandonment_revision"] = 2 },
+		"noncanonical revision": func(value map[string]any) { value["abandonment_revision"] = "02" },
+		"unknown state":         func(value map[string]any) { value["source_candidate_state"] = "active" },
+		"uppercase digest":      func(value map[string]any) { value["abandonment_digest"] = strings.Repeat("F", 64) },
+		"noncanonical uuid":     func(value map[string]any) { value["abandonment_request_id"] = "423E4567-E89B-42D3-A456-426614174000" },
+		"non-lower epoch":       func(value map[string]any) { value["abandoned_candidate_carrier_epoch"] = "9" },
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			predecessor := make(map[string]any, len(valid))
+			for key, value := range valid {
+				predecessor[key] = value
+			}
+			mutate(predecessor)
+			if _, err := parseV2HostClaims(v2TestToken(t, func(claims map[string]any) {
+				claims["predecessor_abandonment"] = predecessor
+			}), now); err == nil {
+				t.Fatal("invalid proof-v2 predecessor was accepted")
+			}
+		})
+	}
+}
+
+func TestV2ProofSchemaRejectsDuplicateTopLevelAndPredecessorMembers(t *testing.T) {
+	now := time.Now()
+	token := v2TestToken(t, nil)
+	parts := strings.Split(token, ".")
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		t.Fatal(err)
+	}
+	duplicateTop := bytes.Replace(payload,
+		[]byte(`"proof_schema_version":"2"`),
+		[]byte(`"proof_schema_version":"2","proof_schema_version":"2"`), 1)
+	if _, err := parseV2HostClaims(v2TokenWithRawPayload(t, token, duplicateTop), now); err == nil {
+		t.Fatal("duplicate proof_schema_version was accepted")
+	}
+
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		t.Fatal(err)
+	}
+	claims["predecessor_abandonment"] = json.RawMessage(`{
+		"target_reservation_request_id":"323e4567-e89b-42d3-a456-426614174000",
+		"target_reservation_request_digest":"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+		"source_candidate_state":"preparing",
+		"abandonment_request_id":"423e4567-e89b-42d3-a456-426614174000",
+		"abandonment_request_digest":"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee",
+		"abandonment_revision":"2",
+		"abandonment_revision":"2",
+		"abandonment_digest":"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff",
+		"abandoned_candidate_carrier_epoch":"8"}`)
+	duplicateNested, err := json.Marshal(claims)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := parseV2HostClaims(v2TokenWithRawPayload(t, token, duplicateNested), now); err == nil {
+		t.Fatal("duplicate predecessor member was accepted")
+	}
+}
+
+func TestV2ProofV1IsRetainedSameHandoffOnly(t *testing.T) {
+	claims, err := parseV2HostClaims(v2TestProofV1Token(t, nil), time.Now())
+	if err != nil || claims.ProofSchemaVersion != V2ProofSchemaV1 {
+		t.Fatalf("parse retained proof-v1: claims=%+v err=%v", claims, err)
+	}
+	if err := validateV2ProofDisposition(claims, V2HostConfig{DurableHighWater: 4}); err == nil {
+		t.Fatal("fresh admission accepted frozen proof-v1")
+	}
+	snapshot := v2ResumeSnapshot(5)
+	resume := &V2ResumeDisposition{
+		ProofSchemaVersion: V2ProofSchemaV1, Authority: V2ResumeSameHandoff,
+		State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 4,
+		CandidateSnapshotSeq: 5, CandidateSnapshot: snapshot.Encode(),
+	}
+	if err := validateV2ResumeDisposition(*resume); err != nil {
+		t.Fatalf("retained exact same-handoff proof-v1: %v", err)
+	}
+	if err := validateV2ProofDisposition(claims, V2HostConfig{ResumeDisposition: resume}); err != nil {
+		t.Fatalf("retained proof-v1 disposition: %v", err)
+	}
+	active := &V2ResumeDisposition{
+		ProofSchemaVersion: V2ProofSchemaV1, Authority: V2ResumeSameHandoff,
+		State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 5,
+	}
+	if err := validateV2ResumeDisposition(*active); err != nil {
+		t.Fatalf("retained active proof-v1 drain: %v", err)
+	}
+	if err := validateV2ProofDisposition(claims, V2HostConfig{ResumeDisposition: active}); err != nil {
+		t.Fatalf("retained active proof-v1 disposition: %v", err)
+	}
+	resume.Authority = V2ResumeAdoptedCandidateRecovery
+	if err := validateV2ResumeDisposition(*resume); err == nil {
+		t.Fatal("proof-v1 accepted adopted-candidate recovery")
+	}
+}
+
+func TestV2AdoptedCandidateRecoveryReusesReceiptStoredCandidate(t *testing.T) {
+	resume := V2ResumeDisposition{
+		ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeAdoptedCandidateRecovery,
+		State: V2ResumeReceiptStored, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 4,
+		CandidateSnapshotSeq: 5, CandidateSnapshot: v2ResumeSnapshot(5).Encode(),
+	}
+	if err := validateV2ResumeDisposition(resume); err != nil {
+		t.Fatalf("adopted candidate recovery: %v", err)
+	}
+	resume.State = V2ResumeActive
+	resume.CandidateSnapshotSeq = 0
+	resume.CandidateSnapshot = nil
+	resume.AckSeq = 5
+	if err := validateV2ResumeDisposition(resume); err == nil {
+		t.Fatal("changed-controller active carrier reused equal candidate")
+	}
+}
+
+func TestV2RetainedCredentialIsExactCopiedAndRedacted(t *testing.T) {
+	original := []byte("exact-original-bearer-never-log")
+	credential, err := NewV2RetainedCredential(original)
+	if err != nil {
+		t.Fatal(err)
+	}
+	original[0] = 'X'
+	token, err := credential.TokenSource()(context.Background())
+	if err != nil || token != "exact-original-bearer-never-log" {
+		t.Fatalf("retained token changed: token=%q err=%v", token, err)
+	}
+	for _, rendered := range []string{fmt.Sprint(credential), fmt.Sprintf("%+v", credential), fmt.Sprintf("%#v", credential)} {
+		if strings.Contains(rendered, "exact-original") || !strings.Contains(rendered, "redacted") {
+			t.Fatalf("credential formatting leaked or omitted redaction: %q", rendered)
+		}
+	}
+	disposition := V2ResumeDisposition{CandidateSnapshot: []byte("retained-snapshot-never-log")}
+	if rendered := fmt.Sprintf("%+v", disposition); strings.Contains(rendered, "retained-snapshot") || !strings.Contains(rendered, "redacted") {
+		t.Fatalf("resume disposition formatting leaked or omitted redaction: %q", rendered)
 	}
 }
 
