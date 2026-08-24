@@ -8,6 +8,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Attach-v2 fresh candidate composition is claims-bound.** A public candidate
+  helper derives the carrier boundary and resolved boundary only from the
+  authenticated proof, emits the exact optional `controller_unforwarded` gap,
+  and sends the mandatory Snapshot without requiring callers to parse the
+  bearer or duplicate proof fields.
+- **Adopted attach-v2 recovery can use a Relay-retained candidate.** The explicit
+  `server_retained` resume state carries no raw Snapshot; it retains the exact
+  original proof-v2 bearer, PTY/carrier epochs, and bounded cursor/gap evidence,
+  and fails closed unless both the proof and Relay's candidate cursor match.
+
 ## v0.68.7 — 2026-08-24
 
 _v0.68.6 published its versioned worker image and E2B target, but the binary

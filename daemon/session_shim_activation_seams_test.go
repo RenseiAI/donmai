@@ -508,6 +508,23 @@ func TestAdoptedCandidateRecoveryIsExactOpaqueAndControllerGenerationIndependent
 	}
 }
 
+func TestAdoptedCandidateRecoveryAcceptsExplicitServerRetainedDisposition(t *testing.T) {
+	now := time.Now()
+	result := testAdoptedCandidateRecoveryResult(t, now)
+	resume := &result.AdoptedCandidateRecovery.ResumeDisposition
+	resume.State = attachclient.V2ResumeServerRetained
+	resume.CandidateSnapshot = nil
+
+	if err := validateSessionShimAdoptionPreparationResult(result, 3, now); err != nil {
+		t.Fatalf("server-retained adopted candidate recovery: %v", err)
+	}
+	cloned := cloneSessionShimAdoptionPreparationResult(result)
+	if cloned.AdoptedCandidateRecovery.ResumeDisposition.State != attachclient.V2ResumeServerRetained ||
+		len(cloned.AdoptedCandidateRecovery.ResumeDisposition.CandidateSnapshot) != 0 {
+		t.Fatal("server-retained recovery grew client-retained Snapshot authority")
+	}
+}
+
 func TestAdoptedCandidateRecoveryRequiresAuthenticatedLivePTYEpoch(t *testing.T) {
 	const liveProcessEpoch = uint64(3)
 	for _, test := range []struct {
