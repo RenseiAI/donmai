@@ -14,6 +14,12 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
+type heartbeatReplyFailureWriter struct{}
+
+func (heartbeatReplyFailureWriter) Write([]byte) (int, error) {
+	return 0, errors.New("heartbeat reply write failed")
+}
+
 func emitAndPersistV3Ack(t *testing.T, fixture *inProcessV3Fixture, value string) uint64 {
 	t.Helper()
 	if err := fixture.controller.WriteInput([]byte(value + "\r")); err != nil {
@@ -416,5 +422,181 @@ func TestSelectedV3ProofResumeFreezesHelloTailUntilMandatorySnapshot(t *testing.
 	if seen[0].FrameType != attachwire.TypeSnapshot || seen[0].Seq != uint64(helloTail)+1 ||
 		seen[1].FrameType != attachwire.TypeMarker || seen[1].Seq <= seen[0].Seq {
 		t.Fatalf("proof barrier ordering = %+v", seen)
+	}
+}
+
+func TestSelectedV3CommittedAckReleasesBarrierWhenReplyWriteIsLost(t *testing.T) {
+	fixture, _, _, acked, helloTail := startProofBarrierHeartbeatFixture(t, "53")
+	ctrl := fixture.shim.currentController()
+	if ctrl == nil {
+		t.Fatal("replacement controller is missing")
+	}
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("committed-before-lost-reply") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("marker crossed before committed ACK: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	ctrl.w = shimwire.NewWriter(heartbeatReplyFailureWriter{})
+	err := fixture.shim.persistHeartbeatAck(ctrl, shimwire.HeartbeatMsg{
+		Generation: fixture.shim.Generation(), AckedSeq: helloTail,
+	})
+	if err == nil {
+		t.Fatal("heartbeat reply write failure was hidden")
+	}
+	record, recordErr := fixture.shim.registry.Get(fixture.shim.id)
+	if recordErr != nil {
+		t.Fatal(recordErr)
+	}
+	sidecar, sidecarErr := fixture.shim.registry.getDurableAck(record)
+	if sidecarErr != nil || sidecar.AckedSeq != helloTail || sidecar.AckedSeq <= acked {
+		t.Fatalf("committed ACK after lost reply = %+v err=%v", sidecar, sidecarErr)
+	}
+	select {
+	case err := <-markerDone:
+		if err != nil {
+			t.Fatalf("durably committed ACK did not release local barrier: %v", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("durably committed ACK left local barrier closed after reply loss")
+	}
+}
+
+func startProofBarrierHeartbeatFixture(t *testing.T, carrierEpoch string) (*inProcessV3Fixture, AdoptionResult, *Controller, uint64, uint64) {
+	t.Helper()
+	fixture := startInProcessV3Fixture(t, 0)
+	acked := emitAndPersistV3Ack(t, fixture, "heartbeat-barrier-floor")
+	if err := fixture.shim.Session().EmitMarker("heartbeat-barrier-tail"); err != nil {
+		t.Fatal(err)
+	}
+	_, helloTail, err := fixture.shim.Session().Snapshot()
+	if err != nil || uint64(helloTail) <= acked {
+		t.Fatalf("heartbeat barrier tail = %d ack=%d err=%v", helloTail, acked, err)
+	}
+	fixture.result.Close()
+	select {
+	case <-fixture.controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("first controller did not close")
+	}
+	replacement, err := Adopt(context.Background(), AdoptOptions{
+		Registry: fixture.shim.registry, ControllerID: "controller-v3-heartbeat-barrier", RequireFullHostFrames: true,
+		Prepare: func(_ context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			resume := evidence.LastHostSeq + 1
+			return PreparedAdoption{
+				ResumeFrom: &resume,
+				Extensions: shimwire.Extensions{
+					Values: map[string]string{shimwire.ExtCarrierEpoch: carrierEpoch}, Required: []string{shimwire.ExtCarrierEpoch},
+				},
+			}, nil
+		},
+	})
+	if err != nil || len(replacement.Adopted) != 1 {
+		t.Fatalf("heartbeat barrier replacement = %+v err=%v", replacement, err)
+	}
+	t.Cleanup(replacement.Close)
+	return fixture, replacement, replacement.Adopted[0], acked, uint64(helloTail)
+}
+
+func TestSelectedV3EqualHeartbeatDoesNotReleaseProofBarrier(t *testing.T) {
+	fixture, _, controller, acked, _ := startProofBarrierHeartbeatFixture(t, "47")
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("equal-ack-must-not-release") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("marker crossed before equal ACK control: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := controller.Heartbeat(acked); err != nil {
+		t.Fatalf("equal Heartbeat: %v", err)
+	}
+	select {
+	case err := <-markerDone:
+		t.Fatalf("equal/no-op Heartbeat released proof barrier: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if _, err := controller.EmitSnapshot(ctx); err != nil {
+		t.Fatalf("mandatory Snapshot after equal ACK: %v", err)
+	}
+	if err := <-markerDone; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestSelectedV3FreshAheadHeartbeatFailsCandidateClosed(t *testing.T) {
+	fixture, _, controller, _, helloTail := startProofBarrierHeartbeatFixture(t, "49")
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("ahead-ack-fails-closed") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("marker crossed before ahead ACK control: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if err := controller.Heartbeat(helloTail + 1); err == nil {
+		t.Fatal("fresh candidate accepted Heartbeat for its not-yet-emitted mandatory Snapshot")
+	}
+	select {
+	case <-controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("ahead Heartbeat did not fail candidate closed")
+	}
+	select {
+	case event, ok := <-controller.Events():
+		if ok {
+			t.Fatalf("ahead Heartbeat leaked candidate event: %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed candidate event stream did not close")
+	}
+	if err := <-markerDone; err != nil {
+		t.Fatalf("failed candidate did not release local barrier: %v", err)
+	}
+}
+
+func TestSelectedV3AckPersistenceFailureDoesNotReleaseToCandidate(t *testing.T) {
+	fixture, _, controller, _, helloTail := startProofBarrierHeartbeatFixture(t, "51")
+	markerDone := make(chan error, 1)
+	go func() { markerDone <- fixture.shim.Session().EmitMarker("failed-put-no-candidate-release") }()
+	select {
+	case err := <-markerDone:
+		t.Fatalf("marker crossed before persistence failure control: %v", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	registryDir := fixture.shim.registry.Dir()
+	movedRegistry := registryDir + ".unavailable"
+	if err := os.Rename(registryDir, movedRegistry); err != nil {
+		t.Fatal(err)
+	}
+	restored := false
+	t.Cleanup(func() {
+		if !restored {
+			_ = os.Rename(movedRegistry, registryDir)
+		}
+	})
+	if err := controller.Heartbeat(helloTail); err == nil {
+		t.Fatal("Heartbeat succeeded despite unavailable durable ACK store")
+	}
+	if err := os.Rename(movedRegistry, registryDir); err != nil {
+		t.Fatal(err)
+	}
+	restored = true
+	select {
+	case <-controller.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("persistence failure did not close candidate")
+	}
+	select {
+	case event, ok := <-controller.Events():
+		if ok {
+			t.Fatalf("persistence failure leaked candidate event: %+v", event)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("failed candidate event stream did not close")
+	}
+	if err := <-markerDone; err != nil {
+		t.Fatalf("failed candidate did not release local barrier: %v", err)
 	}
 }
