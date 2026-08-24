@@ -33,6 +33,14 @@ func TestCheckIsNonMutatingAndRequiresExactPaths(t *testing.T) {
 	if err := bad.checkForOS("linux"); err == nil {
 		t.Fatal("check accepted a token path outside the exact state directory")
 	}
+
+	wrongCandidate := filepath.Join(dir, "wrong-candidate")
+	writeTestExecutable(t, wrongCandidate, "#!/bin/sh\n# /api/daemon/session-shim/acceptance/\nexit 0\n")
+	bad = cfg
+	bad.candidate = wrongCandidate
+	if err := bad.checkForOS("linux"); err == nil {
+		t.Fatal("check accepted a candidate without the typed fence-refusal behavior")
+	}
 }
 
 func TestControlSendsBearerAndExactCorrelation(t *testing.T) {

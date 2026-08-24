@@ -213,7 +213,6 @@ func (c config) checkForOS(goos string) error {
 		return err
 	}
 	for _, marker := range [][]byte{
-		[]byte(acceptanceTokenPathEnvironment()),
 		[]byte("/api/daemon/session-shim/acceptance/"),
 		[]byte("restart_fence_refused"),
 	} {
