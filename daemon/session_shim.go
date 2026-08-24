@@ -2350,6 +2350,7 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		ControllerID:                       d.controllerID(),
 		AdoptionRevision:                   receipt.AdoptionRevision,
 		SessionShimCarrierProofV2Readiness: readiness,
+		QuarantinedSessions:                []SessionShimQuarantinedSession{},
 	}
 	if !d.shims.carrierActivationComplete {
 		d.shims.mu.RUnlock()

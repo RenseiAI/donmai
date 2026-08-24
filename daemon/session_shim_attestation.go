@@ -167,7 +167,7 @@ func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatPro
 }
 
 func cloneSessionShimHeartbeatProjection(in SessionShimHeartbeatProjection) SessionShimHeartbeatProjection {
-	in.QuarantinedSessions = append([]SessionShimQuarantinedSession(nil), in.QuarantinedSessions...)
+	in.QuarantinedSessions = append([]SessionShimQuarantinedSession{}, in.QuarantinedSessions...)
 	return in
 }
 

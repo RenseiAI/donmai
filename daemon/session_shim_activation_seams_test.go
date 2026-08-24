@@ -801,7 +801,11 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	d.shims.adoptionComplete = true
 	d.shims.carrierActivationComplete = true
 
-	var rawBody []byte
+	var (
+		rawBody                []byte
+		sourceProjection       SessionShimHeartbeatProjection
+		acknowledgedProjection SessionShimHeartbeatProjection
+	)
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		endpointCalls.Add(1)
 		rawBody, _ = io.ReadAll(r.Body)
@@ -819,7 +823,12 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
 		GetStatus: func() RegistrationStatus { return RegistrationDraining },
 		GetSessionShim: func() (SessionShimHeartbeatProjection, error) {
-			return d.SessionShimHeartbeatProjection("org-readiness-wire")
+			projection, err := d.SessionShimHeartbeatProjection("org-readiness-wire")
+			sourceProjection = projection
+			return projection, err
+		},
+		OnSessionShimAcknowledged: func(projection SessionShimHeartbeatProjection) {
+			acknowledgedProjection = projection
 		},
 		HTTPClient: server.Client(),
 	})
@@ -829,6 +838,21 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	if readinessCalls.Load() != 1 {
 		t.Fatalf("live readiness resolutions = %d, want exactly 1", readinessCalls.Load())
 	}
+	assertCanonicalEmptyQuarantine := func(label string, projectionBytes []byte) {
+		t.Helper()
+		var projectionBody map[string]json.RawMessage
+		if err := json.Unmarshal(projectionBytes, &projectionBody); err != nil {
+			t.Fatalf("decode %s projection: %v (raw=%s)", label, err, projectionBytes)
+		}
+		if got := projectionBody["quarantinedSessions"]; !bytes.Equal(got, []byte("[]")) {
+			t.Fatalf("%s quarantinedSessions bytes = %s, want [] (projection=%s)", label, got, projectionBytes)
+		}
+	}
+	sourceProjectionBytes, err := json.Marshal(sourceProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCanonicalEmptyQuarantine("authority source", sourceProjectionBytes)
 	for _, member := range []string{
 		`"durable_carrier_proof_v2_ready":true`, `"composingProofV1WritesClosed":true`,
 		`"encryptedOriginalCredentialRetained":true`, `"remainingValidityConsumeGate":true`,
@@ -842,6 +866,12 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	if err := json.Unmarshal(rawBody, &heartbeatBody); err != nil {
 		t.Fatal(err)
 	}
+	assertCanonicalEmptyQuarantine("raw heartbeat", heartbeatBody["sessionShim"])
+	acknowledgedProjectionBytes, err := json.Marshal(acknowledgedProjection)
+	if err != nil {
+		t.Fatal(err)
+	}
+	assertCanonicalEmptyQuarantine("acknowledgement callback", acknowledgedProjectionBytes)
 	var legacyProjection struct {
 		Enabled             bool                            `json:"enabled"`
 		AdoptionComplete    bool                            `json:"adoptionComplete"`
