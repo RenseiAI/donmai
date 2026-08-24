@@ -8,6 +8,51 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.5 — 2026-08-23
+
+_v0.68.4 was tagged, but its publishers stopped before build and no release
+artifacts were created. This patch carries those changes forward._
+
+### Features
+
+- **Linear issues can move between projects without replacement records.** The
+  update command resolves a destination project by name, slug, or UUID within
+  the issue team, composes project and status in one mutation, and reports the
+  resulting project while preserving every unspecified issue field. (#387)
+- **Negotiated session-root workareas are active.** Versioned workarea client
+  projections expose the root, selected repository working directory, and
+  repository metadata for multi-repository workareas while preserving existing
+  flat layouts and released client types. (#384)
+- **Durable session-shim recovery requires proof-v2 authority.** New admission
+  binds the exact proof capability, bearer, receipt, PTY epoch, and cursor.
+  Consumed recovery reuses the original staged Snapshot without issuing a
+  second one, and a readiness withdrawal closes spawn, poll, claim, and
+  capacity until a fresh draining heartbeat is acknowledged. (#395)
+
+### Fixes
+
+- **Release tags require authorized creation, immutable refs, and verified
+  signatures.** Binary, worker-image, and template publishers fail before
+  build unless the required protection rules are active and GitHub verifies
+  the annotated tag signature at its exact commit. (#388)
+- **Restored archived workareas validate repository metadata.** Restore derives
+  selected and repository paths from the copied, digest-verified declaration
+  and rejects malformed or mismatched archive metadata before publication.
+  (#392)
+
+### Chores
+
+- **Parallel poll tests no longer race on process-global log capture.** The
+  daemon fixture serializes temporary default-logger use and restores the prior
+  logger after each control. (#385)
+- **GitHub workflows declare least-privilege permissions.** Workflow and job
+  token grants are explicit for code scanning, publishing, and read-only
+  verification lanes. (#386)
+- **Release preparation verifies the configured SSH signing key before tag
+  push.** The preflight confirms that the key is registered to the active
+  GitHub account and verifies the candidate tag with a pinned OpenSSH verifier.
+  (#394)
+
 ## v0.68.4 — 2026-08-23
 
 ### Features
