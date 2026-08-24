@@ -219,6 +219,18 @@ sequence, and every quarantined capacity charge. The projection is deliberately
 secret-free: no paths, output bytes, prompts, host/controller ids, tokens,
 credentials, or opaque composing receipts are exposed.
 
+For an externally composed session-shim, the outbound
+`POST /api/workers/<id>/heartbeat` carries a separate authority-bound
+`sessionShim` projection. Alongside the stable host, controller, adoption
+revision, and quarantine set, it includes the five live proof-v2 readiness
+facts: durable carrier acknowledgement, proof-v1 writer closure, encrypted
+original-credential retention, the remaining-validity consume gate, and
+adopted-candidate recovery. All five values are sampled from the configured
+readiness resolver on every beat and must be true. Declaring the
+`durable_carrier_proof_v2` capability is not readiness evidence. Missing,
+malformed, changed, or non-exactly-echoed readiness fails the beat closed; older
+JSON readers may ignore the additive keys.
+
 ## Auto-update signing
 
 Auto-update is **opt-in and fail-closed**: the binary ships with no default

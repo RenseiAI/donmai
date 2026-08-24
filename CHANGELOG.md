@@ -8,6 +8,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Hosted heartbeats carry live proof-v2 readiness.** The authority-bound
+  `sessionShim` projection now includes the independently resolved durable
+  acknowledgement, proof-v1 closure, retained-credential, remaining-validity,
+  and adopted-candidate recovery facts. Missing or changed facts fail closed;
+  a capability declaration is never treated as readiness evidence.
+- **Repository-free sessions receive a deterministic empty workarea.** The
+  local runner creates an isolated flat directory without invoking Git, while
+  repository-backed clones and negotiated shared/declaration layouts keep
+  their existing strategies.
+
 ## v0.68.6 — 2026-08-24
 
 _v0.68.5 published its versioned worker image and E2B target, but the binary
