@@ -377,7 +377,7 @@ func TestProofV2LiveReadinessFactsWithdrawEveryNewWorkRail(t *testing.T) {
 	for fact, mutate := range mutations {
 		t.Run(fact+"/claim-and-poll", func(t *testing.T) {
 			d := newDaemon(t, mutate)
-			if blocked, _ := d.claimSuspended(); !blocked {
+			if blocked, _ := d.PollClaimGate()(); !blocked {
 				t.Fatal("live claim check stayed open")
 			}
 			assertWithdrawn(t, d)
@@ -389,7 +389,7 @@ func TestProofV2LiveReadinessFactsWithdrawEveryNewWorkRail(t *testing.T) {
 			t.Cleanup(server.Close)
 			poller := NewPollService(PollOptions{
 				WorkerID: "worker", RuntimeJWT: "runtime", OrchestratorURL: server.URL,
-				ClaimSuspended: d.claimSuspended, OnWork: func(PollWorkItem) error { return nil }, HTTPClient: server.Client(),
+				ClaimSuspended: d.PollClaimGate(), OnWork: func(PollWorkItem) error { return nil }, HTTPClient: server.Client(),
 			})
 			poller.pollOnce(context.Background())
 			if pollCalls.Load() != 0 || !poller.ClaimsSuspended() {
@@ -1027,6 +1027,7 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		t.Fatalf("Start: %v", err)
 	}
 	t.Cleanup(func() { _ = d.Stop(context.Background()) })
+	satelliteClaimGate := d.PollClaimGate()
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		mu.Lock()
@@ -1048,6 +1049,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	}
 	if d.State() != StateRunning || !d.SessionShimAdoptionComplete() || !d.SessionShimCarrierActivationComplete() {
 		t.Fatalf("daemon readiness = state:%s adoption:%v activation:%v", d.State(), d.SessionShimAdoptionComplete(), d.SessionShimCarrierActivationComplete())
+	}
+	if suspended, reason := satelliteClaimGate(); suspended || reason != "" {
+		t.Fatalf("exported poll claim gate at ready startup = (%v, %q), want open", suspended, reason)
 	}
 	if readinessCalls.Load() < 2 {
 		t.Fatalf("proof-v2 readiness was not checked at registration and heartbeat: calls=%d", readinessCalls.Load())
@@ -1077,7 +1081,7 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			}
 		})
 		t.Run(reason+"/claim", func(t *testing.T) {
-			if blocked, _ := d.claimSuspended(); !blocked {
+			if blocked, _ := satelliteClaimGate(); !blocked {
 				t.Fatal("withdrawal left claim admission open")
 			}
 		})
@@ -1104,6 +1108,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			if d.State() != StateRecovering || d.spawner.IsAccepting() {
 				t.Fatalf("reopened before a fresh acknowledged heartbeat: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
 			}
+			if suspended, _ := satelliteClaimGate(); !suspended {
+				t.Fatal("exported poll claim gate reopened before a fresh acknowledged heartbeat")
+			}
 		})
 		t.Run(reason+"/recovery-heartbeat", func(t *testing.T) {
 			if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
@@ -1117,6 +1124,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			}
 			if d.State() != StateRunning || !d.spawner.IsAccepting() {
 				t.Fatalf("acknowledged heartbeat did not reopen admission: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+			}
+			if suspended, reason := satelliteClaimGate(); suspended || reason != "" {
+				t.Fatalf("exported poll claim gate after acknowledged heartbeat = (%v, %q), want open", suspended, reason)
 			}
 		})
 	}
@@ -1157,11 +1167,17 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		if d.State() != StateRecovering || d.spawner.IsAccepting() {
 			t.Fatalf("stale acknowledged revision reopened admission: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
 		}
+		if suspended, _ := satelliteClaimGate(); !suspended {
+			t.Fatal("stale acknowledged revision reopened exported poll claim gate")
+		}
 		if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
 			t.Fatalf("fresh current-revision heartbeat: %v", err)
 		}
 		if d.State() != StateRunning || !d.spawner.IsAccepting() {
 			t.Fatalf("fresh current-revision acknowledgement did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+		}
+		if suspended, reason := satelliteClaimGate(); suspended || reason != "" {
+			t.Fatalf("fresh current-revision acknowledgement left exported gate closed: (%v, %q)", suspended, reason)
 		}
 	})
 
@@ -1169,11 +1185,11 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		priorHeartbeats = heartbeatCount.Load()
 		readinessError.Store(true)
 		var wg sync.WaitGroup
-		for i := 0; i < 12; i++ {
+		for i := 0; i < 16; i++ {
 			wg.Add(1)
 			go func(i int) {
 				defer wg.Done()
-				switch i % 3 {
+				switch i % 4 {
 				case 0:
 					_ = d.heartbeat.sendOneResult(context.Background())
 				case 1:
@@ -1182,6 +1198,8 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 					}})
 				case 2:
 					d.poller.pollOnce(context.Background())
+				case 3:
+					_, _ = satelliteClaimGate()
 				}
 			}(i)
 		}

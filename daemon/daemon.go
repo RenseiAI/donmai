@@ -660,6 +660,19 @@ func (d *Daemon) claimSuspended() (bool, string) {
 	return true, reason
 }
 
+// PollClaimGate is the per-tick new-work admission predicate consumed by
+// PollOptions. A true result prevents the poll request that would bind work to
+// this host; reason is used only for the suspension transition log.
+type PollClaimGate func() (suspended bool, reason string)
+
+// PollClaimGate returns the daemon's exact concurrency-safe new-work claim
+// predicate for an independently composed PollService. The returned callback
+// delegates to the same internal authority as the daemon's primary poller; it
+// does not snapshot, cache, or duplicate claim-suspension semantics.
+func (d *Daemon) PollClaimGate() PollClaimGate {
+	return d.claimSuspended
+}
+
 // setLastHostStatus is the OnHostStatus callback wired into HeartbeatService.
 // Called on every beat that carries a hostStatus payload (including
 // status='ok', so we always reflect the platform's latest view).
