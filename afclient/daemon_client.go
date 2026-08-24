@@ -130,8 +130,11 @@ type DaemonSessionShimAdoptedCorrelation struct {
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.
 type DaemonSessionShimStatus struct {
-	OwnershipMode             DaemonSessionShimOwnershipMode        `json:"ownershipMode"`
-	AdoptionComplete          bool                                  `json:"adoptionComplete"`
+	OwnershipMode    DaemonSessionShimOwnershipMode `json:"ownershipMode"`
+	AdoptionComplete bool                           `json:"adoptionComplete"`
+	// CarrierActivationComplete reports remote exact-set receipt/cursor
+	// resolution. Hosted local control authority is released later, per scope,
+	// after the exact adoption-revision heartbeat acknowledgement.
 	CarrierActivationComplete bool                                  `json:"carrierActivationComplete,omitempty"`
 	AdoptionCompletedAt       string                                `json:"adoptionCompletedAt,omitempty"`
 	OccupiedSlots             int                                   `json:"occupiedSlots"`

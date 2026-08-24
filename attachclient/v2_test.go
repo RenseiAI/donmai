@@ -10,6 +10,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -396,12 +397,22 @@ func TestV2ActiveResumeAcceptsImmediateExactCarrierActiveWithoutSnapshot(t *test
 }
 
 func TestV2ActiveResumeKeepsAuthorityClosedUntilLocalPublication(t *testing.T) {
-	var inputCalls int
+	var inputCalls, resizeCalls, killCalls atomic.Int64
 	candidate := &V2HostCandidate{
-		cfg: V2HostConfig{OnInput: func(context.Context, attachwire.InputPayload) error {
-			inputCalls++
-			return nil
-		}},
+		cfg: V2HostConfig{
+			OnInput: func(context.Context, attachwire.InputPayload) error {
+				inputCalls.Add(1)
+				return nil
+			},
+			OnResize: func(context.Context, attachwire.ResizePayload) error {
+				resizeCalls.Add(1)
+				return nil
+			},
+			OnKill: func(context.Context, attachwire.Kill) error {
+				killCalls.Add(1)
+				return nil
+			},
+		},
 		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
 		resumeDisposition: &V2ResumeDisposition{
 			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
@@ -421,21 +432,142 @@ func TestV2ActiveResumeKeepsAuthorityClosedUntilLocalPublication(t *testing.T) {
 	input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
 		InputSeq: 1, UserID: []byte("viewer"), Data: []byte("blocked"),
 	}).Encode()}
+	resizePayload, err := (attachwire.ResizePayload{Cols: 100, Rows: 40}).Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	resize := attachwire.Frame{Type: attachwire.TypeResize, Payload: resizePayload}
+	stopSignal := "SIGTERM"
+	kill := mustFrame(t, attachwire.Kill{Reason: attachwire.KillStopped, Signal: &stopSignal})
+	done := []chan error{make(chan error, 1), make(chan error, 1), make(chan error, 1)}
+	for i, frame := range []attachwire.Frame{input, resize, kill} {
+		go func() { done[i] <- candidate.handleV2Inbound(context.Background(), frame) }()
+	}
+	for i := range done {
+		select {
+		case err := <-done[i]:
+			t.Fatalf("pre-release callback %d did not wait: %v", i, err)
+		case <-time.After(50 * time.Millisecond):
+		}
+	}
+	if inputCalls.Load() != 0 || resizeCalls.Load() != 0 || killCalls.Load() != 0 || candidate.ackVersion != ackVersion {
+		t.Fatalf("pre-publication effects = input:%d resize:%d kill:%d ackVersion:%d->%d",
+			inputCalls.Load(), resizeCalls.Load(), killCalls.Load(), ackVersion, candidate.ackVersion)
+	}
+	if ack, err := candidate.ActivateRemote(context.Background()); err != nil || ack != 12 {
+		t.Fatalf("remote activation = %d, %v", ack, err)
+	}
+	if inputCalls.Load() != 0 || resizeCalls.Load() != 0 || killCalls.Load() != 0 {
+		t.Fatalf("remote ACK released local callbacks: input:%d resize:%d kill:%d",
+			inputCalls.Load(), resizeCalls.Load(), killCalls.Load())
+	}
+	candidate.mu.Lock()
+	remotelyReleasedLocalAuthority := candidate.active
+	candidate.mu.Unlock()
+	if remotelyReleasedLocalAuthority {
+		t.Fatal("remote ACK marked the candidate locally active")
+	}
+	if err := candidate.SendRawFrameDurable(context.Background(), (attachwire.Frame{
+		Type: attachwire.TypeOutput, Seq: 13, Payload: []byte("blocked-durable"),
+	}).Encode()); err == nil {
+		t.Fatal("remote ACK released durable ordinary output")
+	}
+	candidate.ReleaseLocalAuthority()
+	for i := range done {
+		if err := <-done[i]; err != nil {
+			t.Fatalf("post-release callback %d: %v", i, err)
+		}
+	}
+	if inputCalls.Load() != 1 || resizeCalls.Load() != 1 || killCalls.Load() != 1 {
+		t.Fatalf("local release callback counts = input:%d resize:%d kill:%d",
+			inputCalls.Load(), resizeCalls.Load(), killCalls.Load())
+	}
+	candidate.ReleaseLocalAuthority()
+	if inputCalls.Load() != 1 || resizeCalls.Load() != 1 || killCalls.Load() != 1 {
+		t.Fatalf("idempotent local release duplicated callbacks: input:%d resize:%d kill:%d",
+			inputCalls.Load(), resizeCalls.Load(), killCalls.Load())
+	}
+}
+
+func TestV2PartialRemoteActivationLeavesEarlierCarrierLocallyClosed(t *testing.T) {
+	newActiveResume := func(onInput func()) *V2HostCandidate {
+		return &V2HostCandidate{
+			cfg: V2HostConfig{OnInput: func(context.Context, attachwire.InputPayload) error {
+				if onInput != nil {
+					onInput()
+				}
+				return nil
+			}},
+			claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
+			resumeDisposition: &V2ResumeDisposition{
+				ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+				State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+			},
+			notify: make(chan struct{}), closedCh: make(chan struct{}), localActiveCh: make(chan struct{}),
+		}
+	}
+	var inputCalls int
+	carrierA := newActiveResume(func() { inputCalls++ })
+	if err := carrierA.acceptCarrierActive(attachwirev2.CarrierActive{
+		PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if ack, err := carrierA.ActivateRemote(context.Background()); err != nil || ack != 12 {
+		t.Fatalf("carrier A remote activation = %d, %v", ack, err)
+	}
+	carrierB := newActiveResume(nil)
+	failedCtx, cancel := context.WithTimeout(context.Background(), 25*time.Millisecond)
+	defer cancel()
+	if _, err := carrierB.ActivateRemote(failedCtx); err == nil {
+		t.Fatal("carrier B remote activation unexpectedly succeeded")
+	}
+	if carrierA.active || inputCalls != 0 {
+		t.Fatalf("partial remote set released carrier A: active=%v inputCalls=%d", carrierA.active, inputCalls)
+	}
+	input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
+		InputSeq: 1, UserID: []byte("viewer"), Data: []byte("still-blocked"),
+	}).Encode()}
 	inputDone := make(chan error, 1)
-	go func() { inputDone <- candidate.handleV2Inbound(context.Background(), input) }()
+	go func() { inputDone <- carrierA.handleV2Inbound(context.Background(), input) }()
 	select {
 	case err := <-inputDone:
-		t.Fatalf("active-resume Input did not wait for local publication: %v", err)
+		t.Fatalf("carrier A input did not remain blocked after B failure: %v", err)
 	case <-time.After(50 * time.Millisecond):
 	}
-	if inputCalls != 0 || candidate.ackVersion != ackVersion {
-		t.Fatalf("pre-publication Input effects = callbacks:%d ackVersion:%d->%d", inputCalls, ackVersion, candidate.ackVersion)
+	carrierA.ReleaseLocalAuthority()
+	if err := <-inputDone; err != nil || inputCalls != 1 {
+		t.Fatalf("carrier A release after complete-set recovery = calls:%d err:%v", inputCalls, err)
+	}
+}
+
+func TestV2LegacyActivateStillReleasesLocalAuthority(t *testing.T) {
+	var inputCalls int
+	candidate := &V2HostCandidate{
+		cfg: V2HostConfig{OnInput: func(context.Context, attachwire.InputPayload) error {
+			inputCalls++
+			return nil
+		}},
+		claims: v2HostClaims{Epoch: 3, CarrierEpoch: 9}, ackSeq: 12, highestSent: 12,
+		resumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+		},
+		notify: make(chan struct{}), closedCh: make(chan struct{}), localActiveCh: make(chan struct{}),
+	}
+	if err := candidate.acceptCarrierActive(attachwirev2.CarrierActive{
+		PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 12,
+	}); err != nil {
+		t.Fatal(err)
 	}
 	if ack, err := candidate.Activate(context.Background()); err != nil || ack != 12 {
-		t.Fatalf("local publication release = %d, %v", ack, err)
+		t.Fatalf("legacy Activate = %d, %v", ack, err)
 	}
-	if err := <-inputDone; err != nil || inputCalls != 1 {
-		t.Fatalf("post-publication Input = calls:%d err:%v", inputCalls, err)
+	input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
+		InputSeq: 1, UserID: []byte("viewer"), Data: []byte("legacy-open"),
+	}).Encode()}
+	if err := candidate.handleV2Inbound(context.Background(), input); err != nil || inputCalls != 1 {
+		t.Fatalf("legacy Activate local authority = calls:%d err:%v", inputCalls, err)
 	}
 }
 
@@ -1020,6 +1152,134 @@ func TestV2ServerRetainedAdoptedRecoveryActivatesWithoutSnapshotBytes(t *testing
 	ack, err := candidate.Activate(ctx)
 	if err != nil || ack != 7 {
 		t.Fatalf("server-retained activation = %d, %v", ack, err)
+	}
+	if err := candidate.SendRawFrameDurable(ctx, ordinaryOutput.Encode()); err != nil {
+		t.Fatalf("post-recovery durable output: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestV2ServerRetainedActiveReloadWaitsForExplicitLocalRelease(t *testing.T) {
+	ordinaryOutput := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 8, Payload: []byte("after-server-retained")}
+	serverErr := make(chan error, 1)
+	remoteFramesSent := make(chan struct{})
+	inputSeen := make(chan struct{}, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- err
+			return
+		}
+		// Relay active-reload proves the exact already-active retained candidate
+		// immediately; the reconnect must not require a second carrier_activate.
+		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 7,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		input := attachwire.Frame{Type: attachwire.TypeInput, Payload: (attachwire.InputPayload{
+			InputSeq: 1, UserID: []byte("viewer"), Data: []byte("queued-before-release"),
+		}).Encode()}
+		if err := conn.Write(ctx, websocket.MessageBinary, input.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		close(remoteFramesSent)
+		_, raw, err := readV2TestFrame(ctx, conn)
+		if err != nil || !bytes.Equal(raw, ordinaryOutput.Encode()) {
+			serverErr <- fmt.Errorf("post-recovery output mismatch: %v", err)
+			return
+		}
+		ack, _ := attachwirev2.BuildControlFrame(attachwirev2.HostAck{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 8,
+		})
+		if err := conn.Write(ctx, websocket.MessageBinary, ack.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		serverErr <- nil
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	resume := V2ResumeDisposition{
+		ProofSchemaVersion:   V2ProofSchemaV2,
+		Authority:            V2ResumeAdoptedCandidateRecovery,
+		State:                V2ResumeServerRetained,
+		PTYEpoch:             3,
+		CarrierEpoch:         9,
+		AckSeq:               4,
+		CandidateSnapshotSeq: 7,
+		GapFromSeq:           5,
+		GapToSeq:             6,
+		GapReason:            attachwirev2.GapControllerUnforwarded,
+	}
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL: strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource: func(context.Context) (string, error) {
+			return v2TestToken(t, func(claims map[string]any) {
+				claims["resolved_boundary"] = "6"
+				claims["last_host_seq"] = "6"
+			}), nil
+		},
+		ResumeDisposition: &resume,
+		OnInput: func(context.Context, attachwire.InputPayload) error {
+			inputSeen <- struct{}{}
+			return nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer candidate.Close() //nolint:errcheck
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err == nil {
+		t.Fatal("server-retained recovery requested a duplicate mandatory Snapshot")
+	}
+	<-remoteFramesSent
+	remoteDeadline := time.Now().Add(time.Second)
+	for {
+		candidate.mu.Lock()
+		remoteActive := candidate.remoteActive
+		candidate.mu.Unlock()
+		if remoteActive {
+			break
+		}
+		if time.Now().After(remoteDeadline) {
+			t.Fatal("server-retained carrier_active was not consumed")
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-inputSeen:
+		t.Fatal("server-retained early carrier_active released Input")
+	case <-time.After(50 * time.Millisecond):
+	}
+	ack, err := candidate.ActivateRemote(ctx)
+	if err != nil || ack != 7 {
+		t.Fatalf("server-retained remote activation = %d, %v", ack, err)
+	}
+	select {
+	case <-inputSeen:
+		t.Fatal("server-retained remote activation released Input")
+	case <-time.After(50 * time.Millisecond):
+	}
+	candidate.ReleaseLocalAuthority()
+	select {
+	case <-inputSeen:
+	case <-ctx.Done():
+		t.Fatal("server-retained queued Input did not drain after local release")
 	}
 	if err := candidate.SendRawFrameDurable(ctx, ordinaryOutput.Encode()); err != nil {
 		t.Fatalf("post-recovery durable output: %v", err)

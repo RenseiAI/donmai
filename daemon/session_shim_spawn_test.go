@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"sort"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -896,6 +897,9 @@ func (r *shimEventRecorder) output(id sessionshim.Identity) (string, uint64) {
 func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string) {
 	t.Helper()
 	d.opts.SessionShim.RequireCredentialAttestation = true
+	if d.opts.SessionShim.OnCarrierActivationAcknowledged == nil {
+		d.opts.SessionShim.OnCarrierActivationAcknowledged = func(SessionShimPublishedBatchReceipt) {}
+	}
 	d.opts.SessionShim.GetCarrierProofV2Readiness = testSessionShimProofV2Readiness
 	d.opts.SessionShim.AttestationCapabilities = RequiredSessionShimHostCapabilities()
 	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
@@ -993,6 +997,363 @@ func (f *shimSpawnFixture) identity(sessionID string) sessionshim.Identity {
 	return sessionshim.Identity{OrgID: f.orgID, SessionID: sessionID}
 }
 
+type dynamicPublicationProbe struct {
+	mu                 sync.Mutex
+	publications       []SessionShimAdoptionPublication
+	batches            []SessionShimAdoptionBatch
+	batchCallsInFlight atomic.Int64
+	maxBatchCalls      atomic.Int64
+	revision           atomic.Int64
+	carrierEpoch       atomic.Uint64
+	prepareBarrier     *sync.WaitGroup
+}
+
+func (p *dynamicPublicationProbe) recordPublication(publication SessionShimAdoptionPublication) {
+	p.mu.Lock()
+	p.publications = append(p.publications, SessionShimAdoptionPublication{
+		ControllerID: publication.ControllerID,
+		Batches:      append([]SessionShimPublishedBatchReceipt(nil), publication.Batches...),
+		Carriers:     append([]SessionShimCarrierActivation(nil), publication.Carriers...),
+	})
+	p.mu.Unlock()
+}
+
+func (p *dynamicPublicationProbe) snapshot() ([]SessionShimAdoptionPublication, []SessionShimAdoptionBatch) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return append([]SessionShimAdoptionPublication(nil), p.publications...),
+		append([]SessionShimAdoptionBatch(nil), p.batches...)
+}
+
+func configureDynamicPublicationProbe(t *testing.T, d *Daemon, probe *dynamicPublicationProbe) {
+	t.Helper()
+	d.opts.SessionShim.CallbackTimeout = 5 * time.Second
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		if probe.prepareBarrier != nil {
+			probe.prepareBarrier.Done()
+			probe.prepareBarrier.Wait()
+		}
+		epoch := probe.carrierEpoch.Add(1)
+		return sessionshim.PreparedAdoption{
+			ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+			Extensions: shimwire.Extensions{Values: map[string]string{
+				shimwire.ExtCarrierEpoch: fmt.Sprintf("%d", epoch),
+			}},
+			ResumeFrom: proofResolvedResume(preparation),
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		if evidence.SnapshotProxy == nil {
+			return SessionShimAdoptionReceipt{}, errors.New("dynamic publication omitted mandatory Snapshot authority")
+		}
+		if _, err := evidence.SnapshotProxy.Emit(ctx); err != nil {
+			return SessionShimAdoptionReceipt{}, err
+		}
+		return SessionShimAdoptionReceipt{DurableCorrelation: []byte("dynamic-adoption-" + evidence.Identity.Key())}, nil
+	}
+	d.opts.SessionShim.OnAdoptionBatch = func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		inFlight := probe.batchCallsInFlight.Add(1)
+		for {
+			prior := probe.maxBatchCalls.Load()
+			if prior >= inFlight || probe.maxBatchCalls.CompareAndSwap(prior, inFlight) {
+				break
+			}
+		}
+		defer probe.batchCallsInFlight.Add(-1)
+		probe.mu.Lock()
+		probe.batches = append(probe.batches, cloneSessionShimAdoptionBatch(batch))
+		probe.mu.Unlock()
+		// Make an un-serialized implementation overlap deterministically after both
+		// real shim handshakes crossed the prepare barrier.
+		time.Sleep(75 * time.Millisecond)
+		revision := probe.revision.Add(1)
+		return SessionShimAdoptionBatchReceipt{
+			DurableCorrelation: []byte(fmt.Sprintf("dynamic-batch-%d", revision)),
+			AdoptionRevision:   fmt.Sprintf("dynamic-revision-%d", revision),
+		}, nil
+	}
+	d.opts.SessionShim.OnAdoptionPublished = func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		probe.recordPublication(publication)
+		receipts := make([]SessionShimCarrierActivationReceipt, 0, len(publication.Carriers))
+		d.shims.mu.RLock()
+		defer d.shims.mu.RUnlock()
+		for _, carrier := range publication.Carriers {
+			id := sessionshim.Identity{OrgID: carrier.OrgID, SessionID: carrier.SessionID}
+			pending, ok := d.shims.pendingSnapshots[id]
+			if !ok {
+				return nil, fmt.Errorf("publication included carrier without pending Snapshot: %s", id)
+			}
+			receipts = append(receipts, SessionShimCarrierActivationReceipt{
+				Activation: carrier,
+				AckSeq:     pending.Seq,
+			})
+		}
+		return receipts, nil
+	}
+}
+
+func assertDynamicPublicationBlocked(t *testing.T, d *Daemon) {
+	t.Helper()
+	if d.State() != StateRecovering || !d.sessionShimReadinessWithdrawn.Load() || d.spawner.IsAccepting() {
+		t.Fatalf("dynamic publication gate = state:%s blocked:%v accepting:%v, want recovering/true/false",
+			d.State(), d.sessionShimReadinessWithdrawn.Load(), d.spawner.IsAccepting())
+	}
+	if d.RegistrationStatus() != RegistrationDraining || d.heartbeatMaxConcurrentSessions() != 0 {
+		t.Fatalf("dynamic publication advertised capacity: registration=%s max=%d",
+			d.RegistrationStatus(), d.heartbeatMaxConcurrentSessions())
+	}
+	if suspended, _ := d.PollClaimGate()(); !suspended {
+		t.Fatal("dynamic publication left poll/claim admission open")
+	}
+	if _, err := d.AcceptWork(SessionSpec{SessionID: "must-remain-blocked"}); err == nil {
+		t.Fatal("dynamic publication left daemon spawn admission open")
+	}
+}
+
+func TestDynamicPublicationActivatesOnlyTheNewSessionAndWaitsForHeartbeat(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.opts.SessionShim.HostID = "host-dynamic"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	probe := &dynamicPublicationProbe{}
+	probe.carrierEpoch.Store(40)
+	configureDynamicPublicationProbe(t, d, probe)
+	var (
+		releaseMu sync.Mutex
+		releases  []SessionShimPublishedBatchReceipt
+	)
+	d.opts.SessionShim.OnCarrierActivationAcknowledged = func(receipt SessionShimPublishedBatchReceipt) {
+		releaseMu.Lock()
+		releases = append(releases, receipt)
+		releaseMu.Unlock()
+	}
+	releaseSnapshot := func() []SessionShimPublishedBatchReceipt {
+		releaseMu.Lock()
+		defer releaseMu.Unlock()
+		return append([]SessionShimPublishedBatchReceipt(nil), releases...)
+	}
+
+	if _, err := d.spawner.AcceptWork(f.interactiveSpec("dynamic-one")); err != nil {
+		t.Fatalf("first dynamic launch: %v", err)
+	}
+	assertDynamicPublicationBlocked(t, d)
+	firstProjection, err := d.SessionShimHeartbeatProjection(f.orgID)
+	if err != nil {
+		t.Fatalf("first dynamic heartbeat projection: %v", err)
+	}
+	staleFirst := firstProjection
+	staleFirst.AdoptionRevision = "test-recovery-revision"
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, staleFirst)
+	d.AcknowledgeSessionShimRecoveryHeartbeat("foreign-org", firstProjection)
+	assertDynamicPublicationBlocked(t, d)
+	if got := releaseSnapshot(); len(got) != 0 {
+		t.Fatalf("stale/foreign heartbeat released carrier authority: %+v", got)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, firstProjection)
+	if d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("exact first heartbeat did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+	if got := releaseSnapshot(); len(got) != 1 || got[0].Scope != f.orgID || got[0].AdoptionRevision != firstProjection.AdoptionRevision {
+		t.Fatalf("first exact heartbeat releases = %+v", got)
+	}
+	if _, err := d.spawner.AcceptWork(f.interactiveSpec("dynamic-two")); err != nil {
+		t.Fatalf("second dynamic launch: %v", err)
+	}
+
+	publications, _ := probe.snapshot()
+	if len(publications) != 2 {
+		t.Fatalf("dynamic publications = %d, want 2: %+v", len(publications), publications)
+	}
+	for i, wantSession := range []string{"dynamic-one", "dynamic-two"} {
+		if len(publications[i].Carriers) != 1 || publications[i].Carriers[0].SessionID != wantSession {
+			t.Fatalf("dynamic publication %d carriers = %+v, want only %s", i+1, publications[i].Carriers, wantSession)
+		}
+	}
+	assertDynamicPublicationBlocked(t, d)
+	if !d.SessionShimCarrierActivationComplete() {
+		t.Fatal("exact second carrier activation did not complete before heartbeat gate")
+	}
+	secondProjection, err := d.SessionShimHeartbeatProjection(f.orgID)
+	if err != nil {
+		t.Fatalf("second dynamic heartbeat projection: %v", err)
+	}
+	staleSecond := secondProjection
+	staleSecond.AdoptionRevision = firstProjection.AdoptionRevision
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, staleSecond)
+	assertDynamicPublicationBlocked(t, d)
+	if got := releaseSnapshot(); len(got) != 1 {
+		t.Fatalf("stale second heartbeat released carrier authority: %+v", got)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, secondProjection)
+	if d.State() != StateRunning || !d.spawner.IsAccepting() || d.sessionShimReadinessWithdrawn.Load() {
+		t.Fatalf("exact second heartbeat did not reopen: state=%s blocked=%v accepting=%v",
+			d.State(), d.sessionShimReadinessWithdrawn.Load(), d.spawner.IsAccepting())
+	}
+	if got := releaseSnapshot(); len(got) != 2 || got[1].AdoptionRevision != secondProjection.AdoptionRevision {
+		t.Fatalf("second exact heartbeat releases = %+v", got)
+	}
+}
+
+func TestConcurrentDynamicPublicationIsGloballySerialized(t *testing.T) {
+	for _, tc := range []struct {
+		name   string
+		orgIDs []string
+	}{
+		{name: "same-scope", orgIDs: []string{"org-shared", "org-shared"}},
+		{name: "cross-scope", orgIDs: []string{"org-alpha", "org-beta"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newShimSpawnFixture(t)
+			d := f.daemon
+			d.setState(StateRunning)
+			d.shims.adoptionComplete = true
+			d.opts.SessionShim.HostID = "host-concurrent"
+			d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+			scopes := []string{tc.orgIDs[0]}
+			if tc.orgIDs[1] != tc.orgIDs[0] {
+				scopes = append(scopes, tc.orgIDs[1])
+			}
+			enableHostedFullHostFramesForTest(t, d, scopes...)
+			barrier := &sync.WaitGroup{}
+			barrier.Add(2)
+			probe := &dynamicPublicationProbe{prepareBarrier: barrier}
+			probe.carrierEpoch.Store(70)
+			configureDynamicPublicationProbe(t, d, probe)
+			var (
+				releaseMu sync.Mutex
+				releases  []SessionShimPublishedBatchReceipt
+			)
+			d.opts.SessionShim.OnCarrierActivationAcknowledged = func(receipt SessionShimPublishedBatchReceipt) {
+				releaseMu.Lock()
+				releases = append(releases, receipt)
+				releaseMu.Unlock()
+			}
+
+			errs := make(chan error, 2)
+			for i, orgID := range tc.orgIDs {
+				spec := f.interactiveSpec(fmt.Sprintf("concurrent-%d", i+1))
+				spec.OrganizationID = orgID
+				go func() {
+					_, err := d.spawner.AcceptWork(spec)
+					errs <- err
+				}()
+			}
+			for range 2 {
+				if err := <-errs; err != nil {
+					t.Fatalf("concurrent dynamic launch: %v", err)
+				}
+			}
+			if got := probe.maxBatchCalls.Load(); got != 1 {
+				t.Fatalf("maximum concurrent batch publications = %d, want 1", got)
+			}
+			publications, batches := probe.snapshot()
+			if len(publications) != 2 || len(batches) != 2 {
+				t.Fatalf("publication counts = callbacks:%d batches:%d, want 2/2", len(publications), len(batches))
+			}
+			if tc.name == "same-scope" {
+				lengths := []int{len(batches[0].Adopted), len(batches[1].Adopted)}
+				sort.Ints(lengths)
+				if !reflect.DeepEqual(lengths, []int{1, 2}) {
+					t.Fatalf("serialized same-scope batch sizes = %v, want [1 2]", lengths)
+				}
+			}
+			assertDynamicPublicationBlocked(t, d)
+			uniqueScopes := append([]string(nil), scopes...)
+			sort.Strings(uniqueScopes)
+			for i, scope := range uniqueScopes {
+				projection, err := d.SessionShimHeartbeatProjection(scope)
+				if err != nil {
+					t.Fatalf("scope %s heartbeat projection: %v", scope, err)
+				}
+				d.AcknowledgeSessionShimRecoveryHeartbeat(scope, projection)
+				releaseMu.Lock()
+				released := append([]SessionShimPublishedBatchReceipt(nil), releases...)
+				releaseMu.Unlock()
+				if len(released) != i+1 || released[i].Scope != scope || released[i].AdoptionRevision != projection.AdoptionRevision {
+					t.Fatalf("scope %s exact release sequence = %+v", scope, released)
+				}
+				if i+1 < len(uniqueScopes) {
+					assertDynamicPublicationBlocked(t, d)
+				}
+			}
+			if d.State() != StateRunning || !d.spawner.IsAccepting() {
+				t.Fatalf("all scoped heartbeat acks did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+			}
+		})
+	}
+}
+
+func TestQueuedDynamicPublicationStopsAfterPriorActivationFailure(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.opts.SessionShim.HostID = "host-failed-publication"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, "org-failed-publication")
+	barrier := &sync.WaitGroup{}
+	barrier.Add(2)
+	probe := &dynamicPublicationProbe{prepareBarrier: barrier}
+	probe.carrierEpoch.Store(90)
+	configureDynamicPublicationProbe(t, d, probe)
+	d.opts.SessionShim.OnAdoptionPublished = func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		probe.recordPublication(publication)
+		return nil, errors.New("first serialized activation refused")
+	}
+
+	errs := make(chan error, 2)
+	for i := 0; i < 2; i++ {
+		spec := f.interactiveSpec(fmt.Sprintf("failed-publication-%d", i+1))
+		spec.OrganizationID = "org-failed-publication"
+		go func() {
+			_, err := d.spawner.AcceptWork(spec)
+			errs <- err
+		}()
+	}
+	var priorFailureRefusals int
+	for range 2 {
+		if err := <-errs; err != nil && strings.Contains(err.Error(), "prior dynamic adoption publication failed") {
+			priorFailureRefusals++
+		}
+	}
+	if priorFailureRefusals != 1 {
+		t.Fatalf("queued prior-publication refusals = %d, want exactly 1", priorFailureRefusals)
+	}
+	publications, batches := probe.snapshot()
+	if len(publications) != 1 || len(batches) != 1 {
+		t.Fatalf("callbacks after failed activation = publications:%d batches:%d, want 1/1", len(publications), len(batches))
+	}
+	if !d.shims.dynamicPublicationFailed || d.State() != StateRecovering || d.spawner.IsAccepting() {
+		t.Fatalf("failed publication did not latch closed: failed=%v state=%s accepting=%v",
+			d.shims.dynamicPublicationFailed, d.State(), d.spawner.IsAccepting())
+	}
+}
+
+func TestDynamicLaunchWithoutPublicationHookDoesNotPoisonLaterSessions(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.opts.SessionShim.HostID = "standalone-host"
+	var attempts atomic.Int64
+	d.opts.SessionShim.OnAdoption = func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+		if attempts.Add(1) == 1 {
+			return SessionShimAdoptionReceipt{}, errors.New("first standalone adoption refused")
+		}
+		return SessionShimAdoptionReceipt{}, nil
+	}
+	if _, err := d.spawner.AcceptWork(f.interactiveSpec("standalone-refused")); err == nil {
+		t.Fatal("first standalone launch unexpectedly succeeded")
+	}
+	if _, err := d.spawner.AcceptWork(f.interactiveSpec("standalone-next")); err != nil {
+		t.Fatalf("independent standalone launch was poisoned: %v", err)
+	}
+	if _, err := d.adoptedShimEntry(f.orgID, "standalone-next"); err != nil {
+		t.Fatalf("second standalone session was not adopted: %v", err)
+	}
+}
+
 // exchange writes one line into the adopted session and waits for the harness's
 // answer to reach the carrier hook, returning the highest sequence forwarded.
 // It proves BOTH directions are live through the adopted connection.
@@ -1066,6 +1427,67 @@ func TestInteractiveSpawnLaunchesThroughAShimAndAdoptsIt(t *testing.T) {
 	}
 	if !entry.launched {
 		t.Error("the launched shim is not marked as launched by this daemon")
+	}
+}
+
+func TestExactSessionShimControlRefFencesReplacementAuthority(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	id := f.identity("exact-control-ref")
+	if _, err := f.daemon.spawner.AcceptWork(f.interactiveSpec(id.SessionID)); err != nil {
+		t.Fatalf("launch exact-control-ref session: %v", err)
+	}
+	entry, err := f.daemon.adoptedShimEntry(id.OrgID, id.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ref := SessionShimControlRef{
+		Identity: id, ShimID: entry.shimID,
+		ProcessEpoch: entry.adoption.ProcessEpoch, ControllerGeneration: entry.adoption.ControllerGeneration,
+	}
+	mutations := map[string]func(SessionShimControlRef) SessionShimControlRef{
+		"identity": func(in SessionShimControlRef) SessionShimControlRef {
+			in.Identity.SessionID = "replacement-session"
+			return in
+		},
+		"shim id": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ShimID = "replacement-shim"
+			return in
+		},
+		"process epoch": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ProcessEpoch++
+			return in
+		},
+		"controller generation": func(in SessionShimControlRef) SessionShimControlRef {
+			in.ControllerGeneration++
+			return in
+		},
+	}
+	for name, mutate := range mutations {
+		t.Run(name, func(t *testing.T) {
+			stale := mutate(ref)
+			if err := f.daemon.WriteAdoptedSessionShimInputFor(stale, []byte("stale\r")); err == nil {
+				t.Fatal("stale control reference wrote input")
+			}
+			if err := f.daemon.ResizeAdoptedSessionShimFor(stale, 100, 40, 0, 0); err == nil {
+				t.Fatal("stale control reference resized the PTY")
+			}
+			if err := f.daemon.StopAdoptedSessionShimFor(stale, shimwire.StopOperator); err == nil {
+				t.Fatal("stale control reference stopped the session")
+			}
+		})
+	}
+	if err := f.daemon.WriteAdoptedSessionShimInputFor(ref, []byte("exact-control\r")); err != nil {
+		t.Fatalf("current control reference input: %v", err)
+	}
+	waitFor(t, 10*time.Second, "current control-reference input", func() bool {
+		output, _ := f.events.output(id)
+		return strings.Contains(output, "ack:exact-control")
+	})
+	if err := f.daemon.ResizeAdoptedSessionShimFor(ref, 101, 41, 0, 0); err != nil {
+		t.Fatalf("current control reference resize: %v", err)
+	}
+	if err := f.daemon.StopAdoptedSessionShimFor(ref, shimwire.StopOperator); err != nil {
+		t.Fatalf("current control reference stop: %v", err)
 	}
 }
 
@@ -1824,6 +2246,152 @@ func TestRestartFenceRetainsTheAdoptionResumeCursor(t *testing.T) {
 	}
 	if got := fence.Sessions[0].LastForwardedSeq; got != lastForwarded {
 		t.Fatalf("fence lastForwardedSeq = %d, want durable adoption cursor %d", got, lastForwarded)
+	}
+}
+
+func TestStartupAdoptionReleasesEachScopeOnlyAfterExactHeartbeat(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	f.daemon.opts.SessionShim.Orphan.Deadline = 15 * time.Second
+	const primaryOrg, satelliteOrg, emptyOrg = "org-restart-primary", "org-restart-satellite", "org-restart-empty"
+	for i, orgID := range []string{primaryOrg, satelliteOrg} {
+		spec := f.interactiveSpec(fmt.Sprintf("restart-multi-%d", i+1))
+		spec.OrganizationID = orgID
+		if _, err := f.daemon.spawner.AcceptWork(spec); err != nil {
+			t.Fatalf("launch %s: %v", orgID, err)
+		}
+	}
+	f.daemon.ReleaseAdoptedSessionShims()
+
+	var (
+		epoch        atomic.Uint64
+		snapshotMu   sync.Mutex
+		snapshotSeqs = make(map[sessionshim.Identity]uint64)
+		releases     []SessionShimPublishedBatchReceipt
+	)
+	epoch.Store(100)
+	replacement := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true, RegistryDir: f.registry, HostID: "host-restart-multi", OrgID: primaryOrg,
+		AdoptionBatchOrgIDs:          []string{primaryOrg, satelliteOrg, emptyOrg},
+		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
+		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
+		PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			return sessionshim.PreparedAdoption{
+				ControllerGeneration: preparation.CurrentControllerGeneration + 1,
+				Extensions: shimwire.Extensions{Values: map[string]string{
+					shimwire.ExtCarrierEpoch: fmt.Sprintf("%d", epoch.Add(1)),
+				}},
+				ResumeFrom: proofResolvedResume(preparation),
+			}, nil
+		},
+		OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+			result, err := evidence.SnapshotProxy.Emit(ctx)
+			if err != nil {
+				return SessionShimAdoptionReceipt{}, err
+			}
+			snapshotMu.Lock()
+			snapshotSeqs[evidence.Identity] = result.AtSeq + 1
+			snapshotMu.Unlock()
+			return SessionShimAdoptionReceipt{DurableCorrelation: []byte("restart-multi-" + evidence.Identity.Key())}, nil
+		},
+		OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			wantAdopted := 1
+			if batch.OrgID == emptyOrg {
+				wantAdopted = 0
+			}
+			if len(batch.Adopted) != wantAdopted {
+				return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("startup batch %s adopted = %d, want %d", batch.OrgID, len(batch.Adopted), wantAdopted)
+			}
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("restart-multi-batch-" + batch.OrgID),
+				AdoptionRevision:   "restart-multi-revision-" + batch.OrgID,
+			}, nil
+		},
+		OnAdoptionPublished: func(_ context.Context, publication SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			if len(publication.Carriers) != 2 {
+				return nil, fmt.Errorf("startup activation carriers = %d, want 2", len(publication.Carriers))
+			}
+			receipts := make([]SessionShimCarrierActivationReceipt, 0, len(publication.Carriers))
+			snapshotMu.Lock()
+			defer snapshotMu.Unlock()
+			for _, carrier := range publication.Carriers {
+				id := sessionshim.Identity{OrgID: carrier.OrgID, SessionID: carrier.SessionID}
+				receipts = append(receipts, SessionShimCarrierActivationReceipt{
+					Activation: carrier, AckSeq: snapshotSeqs[id],
+				})
+			}
+			return receipts, nil
+		},
+		OnCarrierActivationAcknowledged: func(receipt SessionShimPublishedBatchReceipt) {
+			snapshotMu.Lock()
+			releases = append(releases, receipt)
+			snapshotMu.Unlock()
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, replacement, primaryOrg, satelliteOrg, emptyOrg)
+	t.Cleanup(replacement.ReleaseAdoptedSessionShims)
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("multi-session startup adoption: %v", err)
+	}
+	adopted := replacement.AdoptedSessionShims()
+	if len(adopted) != 2 || !replacement.SessionShimCarrierActivationComplete() {
+		t.Fatalf("multi-session startup result = adopted:%+v active:%v", adopted, replacement.SessionShimCarrierActivationComplete())
+	}
+	for _, id := range adopted {
+		entry, err := replacement.adoptedShimEntry(id.OrgID, id.SessionID)
+		if err != nil || !entry.carrierActivationResolved || replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID) == 0 {
+			t.Errorf("startup carrier %s = entry:%+v forwarded:%d err:%v",
+				id, entry, replacement.SessionShimForwardedSeq(id.OrgID, id.SessionID), err)
+		}
+	}
+	replacement.setState(StateRecovering)
+	primaryProjection, err := replacement.SessionShimHeartbeatProjection(primaryOrg)
+	if err != nil {
+		t.Fatalf("primary startup heartbeat projection: %v", err)
+	}
+	stalePrimary := primaryProjection
+	stalePrimary.AdoptionRevision = "stale-startup-revision"
+	replacement.AcknowledgeSessionShimRecoveryHeartbeat(primaryOrg, stalePrimary)
+	snapshotMu.Lock()
+	if len(releases) != 0 {
+		t.Fatalf("stale startup heartbeat released scopes: %+v", releases)
+	}
+	snapshotMu.Unlock()
+	replacement.AcknowledgeSessionShimRecoveryHeartbeat(primaryOrg, primaryProjection)
+	snapshotMu.Lock()
+	primaryReleases := append([]SessionShimPublishedBatchReceipt(nil), releases...)
+	snapshotMu.Unlock()
+	if len(primaryReleases) != 1 || primaryReleases[0].Scope != primaryOrg ||
+		replacement.State() != StateRecovering || !replacement.sessionShimReadinessWithdrawn.Load() {
+		t.Fatalf("primary-only startup release = releases:%+v state:%s blocked:%v",
+			primaryReleases, replacement.State(), replacement.sessionShimReadinessWithdrawn.Load())
+	}
+	satelliteProjection, err := replacement.SessionShimHeartbeatProjection(satelliteOrg)
+	if err != nil {
+		t.Fatalf("satellite startup heartbeat projection: %v", err)
+	}
+	replacement.AcknowledgeSessionShimRecoveryHeartbeat(satelliteOrg, satelliteProjection)
+	snapshotMu.Lock()
+	carrierScopeReleases := append([]SessionShimPublishedBatchReceipt(nil), releases...)
+	snapshotMu.Unlock()
+	if len(carrierScopeReleases) != 2 || carrierScopeReleases[1].Scope != satelliteOrg ||
+		replacement.State() != StateRecovering || !replacement.sessionShimReadinessWithdrawn.Load() {
+		t.Fatalf("carrier-scope startup releases = releases:%+v state:%s blocked:%v",
+			carrierScopeReleases, replacement.State(), replacement.sessionShimReadinessWithdrawn.Load())
+	}
+	emptyProjection, err := replacement.SessionShimHeartbeatProjection(emptyOrg)
+	if err != nil {
+		t.Fatalf("empty-scope startup heartbeat projection: %v", err)
+	}
+	replacement.AcknowledgeSessionShimRecoveryHeartbeat(emptyOrg, emptyProjection)
+	snapshotMu.Lock()
+	allReleases := append([]SessionShimPublishedBatchReceipt(nil), releases...)
+	snapshotMu.Unlock()
+	if len(allReleases) != 3 || allReleases[2].Scope != emptyOrg ||
+		replacement.State() != StateRunning || replacement.sessionShimReadinessWithdrawn.Load() {
+		t.Fatalf("complete startup release = releases:%+v state:%s blocked:%v",
+			allReleases, replacement.State(), replacement.sessionShimReadinessWithdrawn.Load())
 	}
 }
 

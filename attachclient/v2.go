@@ -282,16 +282,17 @@ type V2HostCandidate struct {
 	remoteActive bool
 	active       bool
 	// One shared activation flight makes concurrent callers observe one wire
-	// request and one immutable completion. The first local call is also the
-	// publication release; remote evidence alone never opens authority callbacks.
-	activationStarted bool
-	activationDone    chan struct{}
-	activationAck     uint64
-	activationErr     error
-	localActiveCh     chan struct{}
-	localActiveOnce   sync.Once
-	ackSeq            uint64
-	ackVersion        uint64
+	// request and one immutable remote completion. Local authority remains a
+	// separate explicit release; remote evidence alone never opens callbacks.
+	activationStarted   bool
+	activationCompleted bool
+	activationDone      chan struct{}
+	activationAck       uint64
+	activationErr       error
+	localActiveCh       chan struct{}
+	localActiveOnce     sync.Once
+	ackSeq              uint64
+	ackVersion          uint64
 	// highestSent is the highest sequence-bearing raw frame written on this leg.
 	highestSent         uint64
 	gapTo               uint64
@@ -608,10 +609,13 @@ func (c *V2HostCandidate) declareHostGapWithReasonLocked(
 	return nil
 }
 
-// Activate sends carrier_activate after Donmai's local publication and waits
-// for the exact carrier_active acknowledgement. The returned cursor also
-// resolves the pre-active Snapshot when it covers that sequence.
-func (c *V2HostCandidate) Activate(ctx context.Context) (uint64, error) {
+// ActivateRemote sends carrier_activate and collects the exact carrier_active
+// acknowledgement without releasing local Input/Resize/Kill authority. A
+// composing publisher can therefore collect a complete multi-carrier set before
+// any one leg becomes locally mutable. At the D13 boundary, a composer releases
+// every leg only after collecting the complete exact set; Donmai then verifies
+// those receipts and persists each resolved cursor independently.
+func (c *V2HostCandidate) ActivateRemote(ctx context.Context) (uint64, error) {
 	c.mu.Lock()
 	resumeActive := c.resumeDisposition != nil && c.resumeDisposition.State == V2ResumeActive
 	if c.active {
@@ -628,23 +632,24 @@ func (c *V2HostCandidate) Activate(ctx context.Context) (uint64, error) {
 		c.activationStarted = true
 		c.activationDone = make(chan struct{})
 		if c.remoteActive {
-			c.completeActivationLocked(nil)
+			c.completeRemoteActivationLocked(nil)
 		}
 	}
 	done := c.activationDone
+	remoteAlreadyActive := c.remoteActive
 	c.mu.Unlock()
-	if first && !resumeActive {
+	if first && !resumeActive && !remoteAlreadyActive {
 		control, err := attachwirev2.BuildControlFrame(attachwirev2.CarrierActivate{
 			PTYEpoch:     attachwirev2.DecimalUint64(c.claims.Epoch),
 			CarrierEpoch: attachwirev2.DecimalUint64(c.claims.CarrierEpoch),
 		})
 		if err != nil {
-			c.completeActivation(err)
+			c.completeRemoteActivation(err)
 			return 0, err
 		}
 		if err := c.writeRaw(ctx, control.Encode()); err != nil {
 			activationErr := fmt.Errorf("attachclient: carrier_activate: %w", err)
-			c.completeActivation(activationErr)
+			c.completeRemoteActivation(activationErr)
 			return 0, activationErr
 		}
 	}
@@ -661,27 +666,50 @@ func (c *V2HostCandidate) Activate(ctx context.Context) (uint64, error) {
 	}
 }
 
-func (c *V2HostCandidate) completeActivation(err error) {
+// ReleaseLocalAuthority is the infallible, idempotent local half of activation.
+// It has no I/O and performs no remote validation; before a successful
+// ActivateRemote it is a fail-closed no-op.
+func (c *V2HostCandidate) ReleaseLocalAuthority() {
 	c.mu.Lock()
-	c.completeActivationLocked(err)
+	if c.activationCompleted && c.activationErr == nil && c.remoteActive && !c.active {
+		c.active = true
+		c.localActiveOnce.Do(func() { close(c.localActiveCh) })
+	}
 	c.mu.Unlock()
 }
 
-func (c *V2HostCandidate) completeActivationLocked(err error) {
-	if !c.activationStarted || c.activationErr != nil || c.active {
+// Activate preserves the original one-call behavior for existing embedders by
+// composing remote acknowledgement collection with immediate local release.
+func (c *V2HostCandidate) Activate(ctx context.Context) (uint64, error) {
+	ack, err := c.ActivateRemote(ctx)
+	if err != nil {
+		return 0, err
+	}
+	c.ReleaseLocalAuthority()
+	return ack, nil
+}
+
+func (c *V2HostCandidate) completeRemoteActivation(err error) {
+	c.mu.Lock()
+	c.completeRemoteActivationLocked(err)
+	c.mu.Unlock()
+}
+
+func (c *V2HostCandidate) completeRemoteActivationLocked(err error) {
+	if !c.activationStarted || c.activationCompleted {
 		return
 	}
 	if err != nil {
 		c.activationErr = err
+		c.activationCompleted = true
 		close(c.activationDone)
 		return
 	}
 	if !c.remoteActive {
 		return
 	}
-	c.active = true
 	c.activationAck = c.ackSeq
-	c.localActiveOnce.Do(func() { close(c.localActiveCh) })
+	c.activationCompleted = true
 	close(c.activationDone)
 }
 
@@ -891,6 +919,9 @@ func (c *V2HostCandidate) acceptCarrierActive(message attachwirev2.CarrierActive
 			canActivate = true
 			allowBeforeLocalRequest = true
 			expectedAck = c.resumeDisposition.AckSeq
+		case V2ResumeServerRetained:
+			allowBeforeLocalRequest = true
+			expectedAck = c.resumeDisposition.CandidateSnapshotSeq
 		case V2ResumeReceiptStored:
 			expectedAck = c.resumeDisposition.CandidateSnapshotSeq
 		}
@@ -906,7 +937,7 @@ func (c *V2HostCandidate) acceptCarrierActive(message attachwirev2.CarrierActive
 		c.pendingSeq = 0
 		c.pendingRaw = nil
 	}
-	c.completeActivationLocked(nil)
+	c.completeRemoteActivationLocked(nil)
 	c.signalLocked()
 	return nil
 }
@@ -937,8 +968,9 @@ func (c *V2HostCandidate) waitForLocalAuthority(ctx context.Context) error {
 		c.mu.Unlock()
 		return nil
 	}
-	resumeActive := c.resumeDisposition != nil && c.resumeDisposition.State == V2ResumeActive
-	allowed := c.remoteActive && (c.activationStarted || resumeActive)
+	remoteReload := c.resumeDisposition != nil &&
+		(c.resumeDisposition.State == V2ResumeActive || c.resumeDisposition.State == V2ResumeServerRetained)
+	allowed := c.remoteActive && (c.activationStarted || remoteReload)
 	localActive := c.localActiveCh
 	closed := c.closedCh
 	c.mu.Unlock()
@@ -971,7 +1003,7 @@ func (c *V2HostCandidate) fail(err error) {
 	if !c.closed {
 		c.closed = true
 		c.err = err
-		c.completeActivationLocked(terminalV2Error(err))
+		c.completeRemoteActivationLocked(terminalV2Error(err))
 		close(c.closedCh)
 		c.signalLocked()
 	}
