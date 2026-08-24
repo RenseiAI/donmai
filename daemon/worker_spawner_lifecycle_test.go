@@ -35,6 +35,10 @@ func TestSpawner_TerminalListenerOwnsIDUntilSynchronousDeliveryCompletes(t *test
 	if _, err := s.AcceptWork(spec); err != nil {
 		t.Fatalf("first AcceptWork: %v", err)
 	}
+	released, ok := s.sessionRelease(spec.SessionID)
+	if !ok {
+		t.Fatal("first generation release signal missing after admission")
+	}
 	select {
 	case <-listenerEntered:
 	case <-time.After(2 * time.Second):
@@ -55,6 +59,11 @@ func TestSpawner_TerminalListenerOwnsIDUntilSynchronousDeliveryCompletes(t *test
 	}
 	if got := ended.Load(); got != 1 {
 		t.Fatalf("ended event count for first generation = %d, want 1", got)
+	}
+	select {
+	case <-released:
+	case <-time.After(2 * time.Second):
+		t.Fatal("first generation was not released after terminal listener returned")
 	}
 	if _, err := s.AcceptWork(spec); err != nil {
 		t.Fatalf("same ID after terminal delivery: %v", err)
