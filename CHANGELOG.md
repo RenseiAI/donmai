@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Daemon embedders can supply one orchestrator HTTP client.** The exact
+  caller-owned client now carries registration, runtime-token refresh and
+  re-registration, heartbeat, and poll traffic without imposing transport or
+  TLS policy; nil retains every existing OSS client default.
+
 ## v0.68.9 — 2026-08-24
 
 ### Features
