@@ -8,6 +8,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.8 — 2026-08-24
+
 ### Features
 
 - **Attach-v2 fresh candidate composition is claims-bound.** A public candidate
