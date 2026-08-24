@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **Composed poll services can share the daemon's exact claim gate.** The
+  public `PollClaimGate` callback delegates to the daemon's live host-status and
+  proof-readiness authority, so independently constructed poll loops suspend
+  before requesting work and reopen only through the existing recovery path.
+
 ## v0.68.8 — 2026-08-24
 
 ### Features
