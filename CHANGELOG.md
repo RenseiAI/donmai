@@ -46,6 +46,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   durable heartbeat receipt and must never park behind a consumer waiting on
   one — and hosts that run many sessions at once can lower the per-session
   budget through `SessionShimConfig.EventBacklogBudget`.
+- **The acceptance seam can actually evict the shim's ring.** The seam exists to
+  drive the ring past eviction so the real recovery path — one declared Gap, its
+  exact recovery Snapshot, a continued sequence — is observable, but its own
+  volume is about 50 KB of frames against an 8 MiB ring: 0.6%, so nothing was
+  ever evicted and the run proved nothing while appearing to pass. Nobody could
+  see it while the daemon's controller was collapsing first. A session launched
+  while the acceptance-control seam is armed now carries a ring sized from the
+  seam's own guaranteed volume, through the one optional key in the launch
+  contract. It is never a default: without the private token file that makes the
+  acceptance route exist, the launch environment is byte-for-byte unchanged.
 - **A fail-closed stream drop says why.** Every such decision in the controller's
   read loop closed the socket silently, which left the reason invisible at every
   later caller. Each one now logs the session and the exact reason before

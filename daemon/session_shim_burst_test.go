@@ -24,14 +24,16 @@ import (
 // and its consumer is additionally parked on the activation gate for the whole
 // composing-callback window.
 type readoptedBurstFixture struct {
-	daemon   *Daemon
-	identity sessionshim.Identity
-	shim     *sessionshim.Shim
+	daemon      *Daemon
+	identity    sessionshim.Identity
+	shim        *sessionshim.Shim
+	registryDir string
 }
 
 func newReadoptedBurstFixture(
 	t *testing.T,
 	backlogBudget int,
+	ringBytes int,
 	observe func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent),
 ) *readoptedBurstFixture {
 	t.Helper()
@@ -49,7 +51,7 @@ func newReadoptedBurstFixture(
 	id := sessionshim.Identity{OrgID: "org-burst", SessionID: "session-burst"}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 5,
-		Spec: ptyhost.Spec{Command: []string{
+		Spec: ptyhost.Spec{RingBytes: ringBytes, Command: []string{
 			"/bin/sh", "-c",
 			`stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`,
 		}},
@@ -152,7 +154,9 @@ func newReadoptedBurstFixture(
 		t.Fatalf("startup re-adoption = generation %d contiguous %v, want generation 2 contiguous",
 			entry.controller.Generation(), entry.controller.Adoption().Contiguous)
 	}
-	return &readoptedBurstFixture{daemon: replacement, identity: id, shim: shim}
+	return &readoptedBurstFixture{
+		daemon: replacement, identity: id, shim: shim, registryDir: registryDir,
+	}
 }
 
 // TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor pins the fix for a
@@ -189,7 +193,7 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 		frames   int
 		maxLag   uint64
 	)
-	fixture := newReadoptedBurstFixture(t, 0, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 0, 0, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
 		// Sampled from the carrier's own seat, at the instant the frame is
 		// handed over, which is the only place the question is meaningful.
 		cursor := d.SessionShimForwardedSeq(id.OrgID, id.SessionID)
@@ -266,7 +270,7 @@ func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	var holding atomic.Bool
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	fixture := newReadoptedBurstFixture(t, 8<<10, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 8<<10, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
 		// Adoption itself runs through this callback (the mandatory Snapshot is
 		// staged on the consumer), so the hold only arms once the session is
 		// published and activated.
