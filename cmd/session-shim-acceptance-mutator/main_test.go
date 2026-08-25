@@ -168,6 +168,7 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 		}
 		return atomicWrite(cfg.statePath(), raw, 0o600)
 	}
+	cfg.unsetServiceEnvFunc = func(string) error { return nil }
 
 	err = cfg.completeQuarantineArm(&state{}, controlRequest{OrgID: orgID, SessionID: sessionID}, helper)
 	if err == nil || err.Error() != "injected state disk failure" {
@@ -177,9 +178,9 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 		t.Fatalf("mutation calls = %+v, want one arm for the adopted lifecycle", calls)
 	}
 
-	// GREEN: state.json contains no Helper, yet exact recovery finds only the
-	// durable ready correlation and clears that exact incarnation idempotently.
-	if err := cfg.quarantineClear(sessionID); err != nil {
+	// GREEN: the ordinary cleanup path sees no Helper in state.json, yet finds
+	// only the durable exact ready correlation and clears that incarnation.
+	if err := cfg.cleanup(sessionID); err != nil {
 		t.Fatalf("recover exact helper after state publication failure: %v", err)
 	}
 	if len(calls) != 2 || calls[1] != (controlRequest{OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: 1}) {
@@ -195,7 +196,7 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	if err != nil || loaded.Helper != nil || loaded.SessionID != sessionID || loaded.OrgID != orgID {
 		t.Fatalf("recovered state = %+v, %v", loaded, err)
 	}
-	if err := cfg.quarantineClear(sessionID); err != nil {
+	if err := cfg.cleanup(sessionID); err != nil {
 		t.Fatalf("idempotent recovered cleanup: %v", err)
 	}
 }

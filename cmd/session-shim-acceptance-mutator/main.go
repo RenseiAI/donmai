@@ -48,8 +48,9 @@ type config struct {
 
 	// Test seams only. Production always uses the methods below, which retain
 	// the authenticated loopback control and durable state writer.
-	controlFn   func(string, controlRequest) error
-	saveStateFn func(state) error
+	controlFn           func(string, controlRequest) error
+	saveStateFn         func(state) error
+	unsetServiceEnvFunc func(string) error
 }
 
 type state struct {
@@ -402,8 +403,16 @@ func (c config) cleanup(sessionID string) error {
 	if err != nil && !errors.Is(err, os.ErrNotExist) {
 		return err
 	}
+	helperSessionID := ""
 	if current.Helper != nil {
-		if err := c.quarantineClear(current.Helper.SessionID); err != nil {
+		helperSessionID = current.Helper.SessionID
+	} else if recovered, recoverErr := c.recoverReadyHelper(sessionID); recoverErr != nil {
+		return recoverErr
+	} else if recovered != nil {
+		helperSessionID = recovered.SessionID
+	}
+	if helperSessionID != "" {
+		if err := c.quarantineClear(helperSessionID); err != nil {
 			return err
 		}
 		current, _ = c.loadState()
@@ -417,7 +426,7 @@ func (c config) cleanup(sessionID string) error {
 			_ = c.control("cleanup", correlation)
 		}
 	}
-	if err := unsetServiceEnvironment(acceptanceTokenPathEnvironment()); err != nil {
+	if err := c.unsetServiceEnvironment(acceptanceTokenPathEnvironment()); err != nil {
 		return err
 	}
 	_ = os.Remove(c.tokenFile)
@@ -465,6 +474,13 @@ func (c config) control(action string, body controlRequest) error {
 		}
 	}()
 	return c.request(http.MethodPost, controlPrefix+action, strings.TrimSpace(string(token)), body, nil, http.StatusNoContent)
+}
+
+func (c config) unsetServiceEnvironment(name string) error {
+	if c.unsetServiceEnvFunc != nil {
+		return c.unsetServiceEnvFunc(name)
+	}
+	return unsetServiceEnvironment(name)
 }
 
 func (c config) request(method, path, bearer string, body, out any, allowed ...int) error {
