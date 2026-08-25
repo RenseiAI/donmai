@@ -117,6 +117,10 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		RegistryDir:  registry.Dir(),
 		Orphan:       cfg.Orphan,
 		ProcessEpoch: 1,
+		// Zero on every ordinary launch. Non-zero only while the acceptance
+		// seam is armed, so its burst can actually reach the ring's eviction
+		// path instead of missing it by two orders of magnitude.
+		RingBytes: acceptanceLaunchRingBytes(),
 	}
 
 	started, err := d.startShimProcess(spec, launch, env)
@@ -144,6 +148,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	)
 	controllerOpts := sessionshim.ControllerOptions{
 		ControllerID:          d.controllerID(),
+		EventBacklogBudget:    cfg.EventBacklogBudget,
 		ExpectedWorkarea:      workarea,
 		ExpectedWorkareaRoot:  layout.Root.String(),
 		DialTimeout:           cfg.launchTimeout(),

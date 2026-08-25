@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
@@ -69,7 +70,7 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.dispatchEvents()
@@ -145,31 +146,67 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	}
 }
 
-func TestSelectedV3PriorityEventQueueOverflowFailsClosed(t *testing.T) {
-	if selectedV3EventQueueLimit != 128 {
-		t.Fatalf("selected-v3 priority queue limit = %d, want 128", selectedV3EventQueueLimit)
+// TestEventBacklogBudgetMatchesTheShimRing pins the equality that keeps the
+// daemon from being the first component to give up on a burst.
+//
+// Both numbers answer the same question - how much host output may be in flight
+// before this system admits it has lost some. When they disagreed (a 192-frame
+// controller bound against an 8 MiB ring) the controller collapsed on volume
+// the shim absorbs by design, and the Gap the ring exists to declare became
+// unreachable. Sourcing one from the other is what makes that impossible.
+func TestEventBacklogBudgetMatchesTheShimRing(t *testing.T) {
+	t.Parallel()
+	if EventBacklogBudget != ptyhost.DefaultRingBytes {
+		t.Fatalf("event backlog budget = %d, want the shim ring budget %d",
+			EventBacklogBudget, ptyhost.DefaultRingBytes)
 	}
-	// EventBacklogSlack is the number consumers size their burst tolerance
-	// against. Changing either buffer without changing it would leave every
-	// caller asserting a guarantee this package no longer offers.
-	if publicEventBufferLimit != 64 || EventBacklogSlack != 192 {
-		t.Fatalf("advertised backlog slack = %d (queue %d + buffer %d), want 192 = 128 + 64",
-			EventBacklogSlack, selectedV3EventQueueLimit, publicEventBufferLimit)
+	if publicEventBufferLimit != 64 {
+		t.Fatalf("public event buffer = %d, want 64", publicEventBufferLimit)
 	}
+}
+
+func TestEventBacklogBudgetOverflowFailsClosed(t *testing.T) {
+	t.Parallel()
+	const payload = 100
+	budget := 4 * (eventBacklogOverheadBytes + payload)
 	controller := &Controller{
-		selected:   shimwire.V3,
-		eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
-		closing:    make(chan struct{}),
+		selected: shimwire.V3,
+		backlog:  newEventBacklog(budget),
+		closing:  make(chan struct{}),
 	}
-	for i := 0; i < selectedV3EventQueueLimit; i++ {
-		if err := controller.publishEvent(ControllerEvent{Kind: EventHostFrame, Seq: uint64(i + 1)}); err != nil {
-			t.Fatalf("fill priority queue at %d: %v", i, err)
+	for i := range 4 {
+		event := ControllerEvent{Kind: EventHostFrame, Seq: uint64(i + 1), FrameBytes: make([]byte, payload)}
+		if err := controller.publishEvent(event); err != nil {
+			t.Fatalf("fill backlog at %d: %v", i, err)
 		}
 	}
-	if err := controller.publishEvent(ControllerEvent{
-		Kind: EventHostFrame, Seq: selectedV3EventQueueLimit + 1,
-	}); err == nil || !strings.Contains(err.Error(), "exceeded its bound") {
-		t.Fatalf("priority queue overflow = %v", err)
+	overflow := ControllerEvent{Kind: EventHostFrame, Seq: 5, FrameBytes: make([]byte, payload)}
+	if err := controller.publishEvent(overflow); !errors.Is(err, ErrEventBacklogExceeded) {
+		t.Fatalf("backlog overflow = %v, want ErrEventBacklogExceeded", err)
+	}
+	// Bytes, not frames: draining one event makes room again.
+	if _, ok := controller.backlog.pop(); !ok {
+		t.Fatal("backlog drained empty")
+	}
+	if err := controller.publishEvent(overflow); err != nil {
+		t.Fatalf("backlog refused an event that fits after draining: %v", err)
+	}
+	if got := controller.backlog.queuedBytes(); got != budget {
+		t.Fatalf("queued bytes = %d, want %d", got, budget)
+	}
+}
+
+// TestEventBacklogAcceptsOneOversizedEvent pins the ring's own rule: a single
+// frame larger than the whole budget is still retained when nothing else is
+// queued, because refusing it would strand a session on one big redraw.
+func TestEventBacklogAcceptsOneOversizedEvent(t *testing.T) {
+	t.Parallel()
+	backlog := newEventBacklog(128)
+	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
+		t.Fatalf("oversized first event refused: %v", err)
+	}
+	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2}); !errors.Is(err, ErrEventBacklogExceeded) {
+		t.Fatalf("second event after an oversized one = %v, want refusal", err)
 	}
 }
 
@@ -178,7 +215,7 @@ func TestSelectedV3HeartbeatTimeoutClosesController(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 1), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.readLoop()
@@ -221,7 +258,7 @@ func TestSelectedV3RejectsHeartbeatInterposedInsideLiveSnapshotPair(t *testing.T
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: map[uint64]*snapshotCall{77: call},
 	}
 	go controller.dispatchEvents()
@@ -452,9 +489,10 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 		id: Identity{OrgID: "org-drop", SessionID: "session-drop"},
 		w:  shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 3, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		// A queue with no room at all makes the bound reachable without writing
-		// its full production depth; the decision under test is the same one.
-		events: make(chan ControllerEvent), eventQueue: make(chan ControllerEvent),
+		// A one-byte budget makes the bound reachable without writing its full
+		// production depth; the decision under test is the same one. Nothing
+		// drains it: dispatchEvents is deliberately not started.
+		events: make(chan ControllerEvent), backlog: newEventBacklog(1),
 		logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		done:          make(chan struct{}),
 		closing:       make(chan struct{}),
@@ -470,9 +508,18 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if err := shimwire.NewWriter(shimConn).WriteVersion(shimwire.V3, shimwire.TypeHostFrame, body); err != nil {
+	writer := shimwire.NewWriter(shimConn)
+	if err := writer.WriteVersion(shimwire.V3, shimwire.TypeHostFrame, body); err != nil {
 		t.Fatal(err)
 	}
+	// The first frame is retained even oversized (the ring's own rule); the
+	// second is what exceeds the budget.
+	second := attachwire.Frame{Type: attachwire.TypeOutput, Seq: 2, Payload: attachwire.EncodeOutput([]byte("y"))}
+	secondBody, err := shimwire.EncodeHostFrame(shimwire.HostFrame{FrameBytes: second.Encode()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	go func() { _ = writer.WriteVersion(shimwire.V3, shimwire.TypeHostFrame, secondBody) }()
 	select {
 	case <-controller.closing:
 	case <-time.After(5 * time.Second):
@@ -482,7 +529,7 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 	line := log.String()
 	if !strings.Contains(line, "controller dropped its shim connection") ||
 		!strings.Contains(line, "org-drop/session-drop") ||
-		!strings.Contains(line, "exceeded its bound") {
+		!strings.Contains(line, "exceeded the in-flight budget") {
 		t.Fatalf("fail-closed drop log = %q, want the session and the exact reason", line)
 	}
 }
