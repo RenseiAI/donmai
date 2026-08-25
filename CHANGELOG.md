@@ -8,6 +8,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.68.13 — 2026-08-25
+
 ### Fixes
 
 - **A session shim adopted after startup no longer waits out a heartbeat
@@ -20,7 +22,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   trip. Embedders that own a scope's own heartbeat lane can do the same through
   the new optional `SessionShimConfig.OnAdoptionActivated` hook, and
   `HeartbeatService.SendNow` sends exactly one out-of-band beat without starting
-  or racing the periodic loop.
+  or racing the periodic loop. (#426)
+
+### Chores
+
+- **The repository-free recovery guard proves a completed run.** The
+  regression test now drives the provider stub through a successful
+  tool-using turn rather than a silent failure, asserts the terminal status
+  and the absence of a steering resume fallback, and gives each
+  version-control command fixture its own marker and verified executable
+  mode so neither one can mask the other. (#425)
 
 ## v0.68.12 — 2026-08-24
 
