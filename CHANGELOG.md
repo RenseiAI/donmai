@@ -8,6 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **A busy session no longer loses its own control channel.** Selected-v3
+  acknowledged every forwarded host frame through an fsync-backed round trip to
+  the shim, on the same goroutine that drained the stream — capping the daemon
+  at roughly one frame per fsync. The controller's priority event queue is
+  bounded and fail-closed by design, so a consumer that fell behind did not slow
+  the stream down: the socket reader dropped the connection. One dense terminal
+  redraw was enough. The daemon then kept publishing the session as adopted
+  against a socket it could no longer write to, so every later input, resize, and
+  acknowledgement failed with "use of closed network connection" while the
+  harness stayed alive and unreachable. A session adopted at startup hit this
+  first, because it attaches to a harness that is already producing. The durable
+  cursor is now persisted off the frame path: it still advances only on the
+  shim's exact receipt, and a coalesced acknowledgement replays more after a
+  restart, never less.
+- **Dropping an adopted controller releases ownership.** A consumer that closed
+  its own connection — a durable carrier refusing a frame, a sequence that did
+  not advance — returned without releasing the session, leaving a dead entry in
+  the adopted map for the life of the process. Those paths now take the same
+  release the ordinary disconnect takes: the session is visibly quarantined,
+  still charged against capacity while its harness runs, and writes are refused
+  honestly instead of failing against a closed socket. A consumer whose
+  connection ended can no longer evict a replacement controller that already
+  owns the same session.
+- **A fail-closed stream drop says why.** Every such decision in the controller's
+  read loop closed the socket silently, which left the reason invisible at every
+  later caller. Each one now logs the session and the exact reason before
+  closing.
+
 ## v0.68.13 — 2026-08-25
 
 ### Fixes

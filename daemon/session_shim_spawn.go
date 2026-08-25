@@ -9,6 +9,7 @@ import (
 	"os/exec"
 	"sort"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
@@ -460,7 +461,10 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		durable := cfg.OnSessionEventDurable
 		fullHostFrames := ctrl.SupportsFullHostFrames()
 		legacyDurability := !cfg.RequireAuthoritativeSnapshot
+		cursor := d.startShimCursorAcknowledger(id, ctrl)
+		defer cursor.stop()
 		var lastSeq uint64
+	consume:
 		for ev := range ctrl.Events() {
 			if observe != nil {
 				// Forward first, bookkeep second: a carrier must see output in the
@@ -481,13 +485,13 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// unacknowledged one. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable output acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 					}
 				}
@@ -503,25 +507,29 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							"session", id.String(), "fromSeq", ev.Gap.FromSeq,
 							"toSeq", ev.Gap.ToSeq, "error", err)
 						_ = ctrl.Close()
-						return
+						break consume
 					}
 				}
 			case sessionshim.EventHostFrame:
 				if ev.Seq == 0 || ev.Seq <= lastSeq {
+					slog.Warn("session shim: HostFrame sequence did not advance",
+						"session", id.String(), "seq", ev.Seq, "lastSeq", lastSeq)
 					_ = ctrl.Close()
-					return
+					break consume
 				}
 				lastSeq = ev.Seq
 				if d.isStagedSessionShimSnapshot(id, ev) {
 					if durable == nil {
+						slog.Warn("session shim: staged Snapshot has no durable carrier",
+							"session", id.String(), "seq", ev.Seq)
 						_ = ctrl.Close()
-						return
+						break consume
 					}
 					if err := durable(id, ev); err != nil {
 						slog.Warn("session shim: durable carrier rejected staged Snapshot",
 							"session", id.String(), "seq", ev.Seq, "error", err)
 						_ = ctrl.Close()
-						return
+						break consume
 					}
 					activationGate, retained := d.retainStagedSessionShimSnapshot(id, ev)
 					if !retained || !activationGate.await() {
@@ -534,13 +542,20 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						slog.Warn("session shim: durable carrier rejected host frame",
 							"session", id.String(), "seq", ev.Seq, "type", ev.FrameType, "error", err)
 						_ = ctrl.Close()
-						return
+						break consume
 					}
-					if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
-						slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
-							"session", id.String(), "seq", ev.Seq, "error", err)
-						_ = ctrl.Close()
-						return
+					if ev.FrameType == attachwire.TypeExit {
+						// The terminal cursor must be durable BEFORE a terminal
+						// outcome is reported, so this one frame still pays for a
+						// synchronous receipt.
+						if err := cursor.persist(ev.Seq); err != nil {
+							slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
+								"session", id.String(), "seq", ev.Seq, "error", err)
+							_ = ctrl.Close()
+							break consume
+						}
+					} else {
+						cursor.record(ev.Seq)
 					}
 				}
 				if ev.FrameType == attachwire.TypeExit {
@@ -574,13 +589,13 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// unacknowledged snapshot. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq); err != nil {
 							slog.Warn("session shim: durable Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 					}
 				}
@@ -594,26 +609,142 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							slog.Warn("session shim: durable carrier rejected emitted snapshot",
 								"session", id.String(), "seq", ev.Seq, "error", err)
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable emitted Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
 							_ = ctrl.Close()
-							return
+							break consume
 						}
 					}
 				}
 			}
 		}
-		// The stream ended. If no Exit arrived, this daemon simply lost its
-		// connection — the shim keeps the harness and starts its orphan clock. That
-		// is NOT a terminal outcome and must not be reported as one.
+		// The stream ended, or this consumer dropped it. Either way the shim keeps
+		// the harness and starts its orphan clock, so this is NOT a terminal
+		// outcome and must not be reported as one — but ownership must be released
+		// rather than left published against a socket nobody can write to.
 		if gate.await() {
-			d.releaseShimIfLive(id)
+			d.releaseShimIfLive(id, ctrl)
 		}
 	}()
 }
+
+// shimCursorAcknowledger persists one adopted session's durable forwarded
+// cursor OFF the event path.
+//
+// Selected v3 acknowledges through an fsync-backed round trip to the shim, and
+// paying for one per frame caps the consumer at whatever a single fsync costs —
+// tens of frames a second. The controller's priority event queue is bounded and
+// fail-closed by design, so a consumer that falls behind does not slow the
+// stream down: the reader drops the connection. One ordinary terminal redraw
+// therefore used to be enough to kill a live session's control channel and leave
+// the daemon holding an adopted entry it could no longer write to.
+//
+// Acknowledging from a separate goroutine keeps the cursor exactly as durable
+// while taking the round trip off the frame path. The cursor still advances only
+// on the shim's exact receipt, and a coalesced acknowledgement makes a later
+// adoption replay MORE, never less — which is the direction the resume contract
+// already allows.
+type shimCursorAcknowledger struct {
+	daemon  *Daemon
+	id      sessionshim.Identity
+	ctrl    *sessionshim.Controller
+	pending atomic.Uint64
+	wake    chan struct{}
+	quit    chan struct{}
+	quitOne sync.Once
+
+	// mu serializes acknowledgement round trips so a coalesced background beat
+	// and a synchronous terminal one can never interleave, and never regress the
+	// sequence the shim has already stored.
+	mu    sync.Mutex
+	acked uint64
+}
+
+func (d *Daemon) startShimCursorAcknowledger(
+	id sessionshim.Identity,
+	ctrl *sessionshim.Controller,
+) *shimCursorAcknowledger {
+	a := &shimCursorAcknowledger{
+		daemon: d, id: id, ctrl: ctrl,
+		wake: make(chan struct{}, 1), quit: make(chan struct{}),
+	}
+	d.shims.wg.Add(1)
+	go func() {
+		defer d.shims.wg.Done()
+		for {
+			select {
+			case <-a.wake:
+			case <-a.quit:
+				return
+			case <-ctrl.Done():
+				return
+			}
+			if err := a.persist(a.pending.Load()); err != nil {
+				slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
+					"session", id.String(), "seq", a.pending.Load(), "error", err)
+				// The cursor must never claim a sequence the shim did not durably
+				// store. Drop the connection and let the ordinary disconnect path
+				// release ownership; the shim keeps the harness.
+				_ = ctrl.Close()
+				return
+			}
+			if a.pending.Load() > a.highWater() {
+				a.signal()
+			}
+		}
+	}()
+	return a
+}
+
+// record notes the highest sequence this daemon has durably forwarded and wakes
+// the acknowledger. It never blocks on the shim.
+func (a *shimCursorAcknowledger) record(seq uint64) {
+	for {
+		current := a.pending.Load()
+		if seq <= current {
+			return
+		}
+		if a.pending.CompareAndSwap(current, seq) {
+			break
+		}
+	}
+	a.signal()
+}
+
+// persist acknowledges seq synchronously. It is a no-op for a sequence the shim
+// has already stored, which is what keeps the coalesced beat and the terminal
+// one from ever regressing each other.
+func (a *shimCursorAcknowledger) persist(seq uint64) error {
+	a.record(seq)
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if seq <= a.acked {
+		return nil
+	}
+	if err := a.daemon.recordShimForwardedSeqForController(a.id, a.ctrl, seq); err != nil {
+		return err
+	}
+	a.acked = seq
+	return nil
+}
+
+func (a *shimCursorAcknowledger) highWater() uint64 {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	return a.acked
+}
+
+func (a *shimCursorAcknowledger) signal() {
+	select {
+	case a.wake <- struct{}{}:
+	default:
+	}
+}
+
+func (a *shimCursorAcknowledger) stop() { a.quitOne.Do(func() { close(a.quit) }) }
 
 type sessionShimCursorAcknowledger interface {
 	SupportsFullHostFrames() bool
@@ -828,10 +959,15 @@ func awaitTombstone(
 // without a terminal observation and moves the exact live shim into visible,
 // capacity-consuming quarantine. The session is NOT reported as ended: only a
 // terminal receipt or matching tombstone closes the loop (§D7/§D10).
-func (d *Daemon) releaseShimIfLive(id sessionshim.Identity) {
+func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Controller) {
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	entry, ok := d.shims.adopted[id]
+	if ok && ctrl != nil && entry.controller != ctrl {
+		// A replacement controller already owns this identity. A consumer whose
+		// own connection ended must never evict the live one.
+		ok = false
+	}
 	if ok {
 		delete(d.shims.adopted, id)
 		hello := entry.controller.Hello()

@@ -2,6 +2,7 @@ package sessionshim
 
 import (
 	"bytes"
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -681,7 +682,7 @@ func (c *Controller) Heartbeat(ackedSeq uint64) error {
 		return result.err
 	case <-timer.C:
 		c.clearHeartbeatCall(call)
-		_ = c.Close()
+		c.closeStream("durable heartbeat receipt timed out", nil)
 		return errors.New("sessionshim: selected-v3 heartbeat persistence receipt timed out")
 	case <-c.done:
 		c.clearHeartbeatCall(call)
@@ -789,6 +790,29 @@ func cloneSnapshotResult(in shimwire.SnapshotResult) shimwire.SnapshotResult {
 	return in
 }
 
+// log is the nil-safe controller logger. A controller assembled without one
+// still has to be able to say why it dropped a connection.
+func (c *Controller) log() *slog.Logger {
+	if c.logger == nil {
+		return slog.New(slog.NewTextHandler(io.Discard, nil))
+	}
+	return c.logger
+}
+
+// closeStream drops the connection after a fail-closed stream decision and says
+// why it did.
+//
+// The reason is not decoration. A silent drop here is indistinguishable, from
+// every later caller's side, from a peer that went away: input, resize, and the
+// durable heartbeat all come back with "use of closed network connection" and
+// nothing anywhere names the decision that caused it.
+func (c *Controller) closeStream(reason string, cause error) {
+	c.log().Warn("sessionshim: controller dropped its shim connection",
+		"session", c.id.String(), "reason", reason,
+		"selected", c.selected, "error", cause)
+	_ = c.Close()
+}
+
 // Close drops the controller connection WITHOUT stopping the session. This is
 // what a daemon shutdown does: the shim keeps the harness and starts its bounded
 // orphan clock.
@@ -819,24 +843,24 @@ func (c *Controller) readLoop() {
 		}
 		if pendingRequested != nil && msg.Type != shimwire.TypeSnapshotResult {
 			c.failSnapshotCalls(shimwire.ErrSnapshotMismatch)
-			_ = c.Close()
+			c.closeStream("requested Snapshot was not followed by its result", shimwire.ErrSnapshotMismatch)
 			return
 		}
 		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeHeartbeat {
 			receipt, decodeErr := shimwire.DecodeHeartbeat(msg.Body)
 			if decodeErr != nil {
 				c.failHeartbeatCall(decodeErr)
-				_ = c.Close()
+				c.closeStream("heartbeat receipt did not decode", decodeErr)
 				return
 			}
 			if receiptErr := c.acceptHeartbeatReceipt(receipt); receiptErr != nil {
-				_ = c.Close()
+				c.closeStream("heartbeat receipt was refused", receiptErr)
 				return
 			}
 			continue
 		}
 		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError && c.failHeartbeatFromError(msg.Body) {
-			_ = c.Close()
+			c.closeStream("shim refused the durable heartbeat", nil)
 			return
 		}
 		if c.selected >= shimwire.V3 {
@@ -845,7 +869,7 @@ func (c *Controller) readLoop() {
 				ev, decodeErr := decodeHostFrameEvent(msg.Body)
 				if decodeErr != nil || pendingRequested != nil || stream.exited {
 					c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
-					_ = c.Close()
+					c.closeStream("HostFrame arrived out of contract", cmp.Or(decodeErr, error(shimwire.ErrDuplicateHostFrame)))
 					return
 				}
 				if ev.RequestID != 0 {
@@ -854,13 +878,13 @@ func (c *Controller) readLoop() {
 				}
 				if err := c.publishHostFrameEvent(ev, &stream); err != nil {
 					c.failSnapshotCalls(err)
-					_ = c.Close()
+					c.closeStream("HostFrame could not be published", err)
 					return
 				}
 				continue
 			case shimwire.TypeOutput, shimwire.TypeSnapshot, shimwire.TypeExit:
 				c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
-				_ = c.Close()
+				c.closeStream("selected-v3 peer sent a pre-v3 frame type", shimwire.ErrDuplicateHostFrame)
 				return
 			}
 		}
@@ -869,7 +893,7 @@ func (c *Controller) readLoop() {
 			pendingRequested = nil
 			if resultErr != nil {
 				c.failSnapshotCalls(resultErr)
-				_ = c.Close()
+				c.closeStream("Snapshot result was refused", resultErr)
 				return
 			}
 			if emit {
@@ -877,13 +901,13 @@ func (c *Controller) readLoop() {
 					if err := c.publishHostFrameEvent(ev, &stream); err != nil {
 						c.completeSnapshotCall(completion, err)
 						c.failSnapshotCalls(err)
-						_ = c.Close()
+						c.closeStream("emitted Snapshot could not be published", err)
 						return
 					}
 				} else {
 					if err := c.publishEvent(ev); err != nil {
 						c.failSnapshotCalls(err)
-						_ = c.Close()
+						c.closeStream("emitted Snapshot could not be published", err)
 						return
 					}
 				}
@@ -904,7 +928,7 @@ func (c *Controller) readLoop() {
 				if stream.seen || stream.gap != nil || ev.Gap.FromSeq != expectedFrom ||
 					ev.Gap.ToSeq == ^uint64(0) || ev.Gap.ToSeq+1 != c.adopted.ReplayFrom {
 					c.failSnapshotCalls(shimwire.ErrDuplicateHostFrame)
-					_ = c.Close()
+					c.closeStream("declared Gap does not match the negotiated replay point", shimwire.ErrDuplicateHostFrame)
 					return
 				}
 				gap := ev.Gap
@@ -919,13 +943,13 @@ func (c *Controller) readLoop() {
 		if ev.Kind == EventExit {
 			if err := c.observeExit(ev.Exit); err != nil {
 				c.failSnapshotCalls(err)
-				_ = c.Close()
+				c.closeStream("terminal observation was refused", err)
 				return
 			}
 		}
 		if err := c.publishEvent(ev); err != nil {
 			c.failSnapshotCalls(err)
-			_ = c.Close()
+			c.closeStream("event could not be published", err)
 			return
 		}
 	}
