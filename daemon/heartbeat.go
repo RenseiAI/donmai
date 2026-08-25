@@ -181,6 +181,16 @@ type HeartbeatOptions struct {
 type HeartbeatService struct {
 	opts HeartbeatOptions
 
+	// sendMu serializes whole beats. Every send path — the periodic tick,
+	// StartSynchronized, and the out-of-band SendNow — funnels through
+	// sendOneResult and takes this lock for the entire compose/POST/ACK-drop
+	// sequence. It is what makes an out-of-band beat unable to interleave with
+	// a tick: two concurrent senders would otherwise both snapshot the same
+	// pending-ACK buffer and report the same mutation acknowledgements twice.
+	// It is deliberately separate from mu, which guards field access only and
+	// is never held across the network call.
+	sendMu sync.Mutex
+
 	mu       sync.Mutex
 	cancel   context.CancelFunc
 	running  bool
@@ -321,7 +331,43 @@ func (h *HeartbeatService) sendOne(ctx context.Context) {
 	}
 }
 
+// SendNow sends exactly one heartbeat immediately, out of band with the
+// periodic loop, and reports that single beat's result.
+//
+// It exists for the edges where waiting out a heartbeat interval is an outage
+// rather than a rounding error. A session-shim adoption published after startup
+// raises the recovery barrier: until the control plane has acknowledged the
+// completed projection this host claims no new work and is not visible as
+// adoption-complete. Ringing the beat the moment carrier activation finishes
+// turns an interval-long stall into one round-trip.
+//
+// It never starts the periodic loop. When the loop is not running there is no
+// beat lane to ride, so this is a no-op returning nil — a caller cannot use it
+// to bring a stopped or never-started service to life.
+//
+// It cannot race the ticker either: sendOneResult takes sendMu for the whole
+// compose/POST/ACK-drop sequence, so an out-of-band beat and a tick are
+// ordered, never interleaved. The corollary is that a heartbeat callback must
+// not call SendNow reentrantly.
+//
+// A returned error is that one beat's failure and is safe to log and continue
+// on — the periodic loop is untouched and its next tick retries.
+func (h *HeartbeatService) SendNow(ctx context.Context) error {
+	if h == nil || !h.IsRunning() {
+		return nil
+	}
+	return h.sendOneResult(ctx)
+}
+
+// sendOneResult composes, sends, and reconciles exactly one beat. The lock is
+// the whole point of the split below: see sendMu.
 func (h *HeartbeatService) sendOneResult(ctx context.Context) error {
+	h.sendMu.Lock()
+	defer h.sendMu.Unlock()
+	return h.sendOneSerialized(ctx)
+}
+
+func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	var (
 		activeCount       int
 		activeInteractive *int
