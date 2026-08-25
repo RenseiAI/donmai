@@ -21,6 +21,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   the new optional `SessionShimConfig.OnAdoptionActivated` hook, and
   `HeartbeatService.SendNow` sends exactly one out-of-band beat without starting
   or racing the periodic loop.
+- **Linux process start identity is Unix nanoseconds, not clock ticks.** The
+  session-shim process identity documents its start time as OS-reported Unix
+  nanoseconds, and macOS reported exactly that — but Linux returned field 22 of
+  `/proc/<pid>/stat` verbatim, which is clock ticks since boot. Every transport
+  of the identity (the authenticated hello, the shim registry record, the
+  tombstone, and the daemon's adopted-session projection) therefore carried a
+  Linux value around twelve orders of magnitude away from a timestamp, and no
+  external observer could reconcile it against the process table. The mismatch
+  survived because liveness only ever compares this package's output against
+  its own. Linux now converts through the host's boot instant (`btime` in
+  `/proc/stat`) and its tick rate (`AT_CLKTCK` from the auxiliary vector,
+  falling back to USER_HZ), both resolved once per process so the comparison
+  keeps a fixed frame of reference.
+
+  **Upgrade note:** this changes the Linux encoding, so a shim registry written
+  by an older Linux daemon will not match the recomputed identity — sessions
+  recorded before the upgrade are treated as gone on the first restart after
+  it. That is intentional. The documented contract is nanoseconds, and a
+  one-time reconciliation costs less than continuing to publish a number that
+  cannot be interpreted as a time.
 
 ## v0.68.12 — 2026-08-24
 
