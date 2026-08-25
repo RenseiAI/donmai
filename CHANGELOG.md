@@ -40,7 +40,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   recorded before the upgrade are treated as gone on the first restart after
   it. That is intentional. The documented contract is nanoseconds, and a
   one-time reconciliation costs less than continuing to publish a number that
-  cannot be interpreted as a time.
+  cannot be interpreted as a time. (#427)
 
 ## v0.68.12 — 2026-08-24
 
