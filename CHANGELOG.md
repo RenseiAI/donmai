@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.68.14 — 2026-08-25
+
 ### Fixes
 
 - **A busy session no longer loses its own control channel.** Selected-v3
