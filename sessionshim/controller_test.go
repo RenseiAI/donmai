@@ -149,6 +149,13 @@ func TestSelectedV3PriorityEventQueueOverflowFailsClosed(t *testing.T) {
 	if selectedV3EventQueueLimit != 128 {
 		t.Fatalf("selected-v3 priority queue limit = %d, want 128", selectedV3EventQueueLimit)
 	}
+	// EventBacklogSlack is the number consumers size their burst tolerance
+	// against. Changing either buffer without changing it would leave every
+	// caller asserting a guarantee this package no longer offers.
+	if publicEventBufferLimit != 64 || EventBacklogSlack != 192 {
+		t.Fatalf("advertised backlog slack = %d (queue %d + buffer %d), want 192 = 128 + 64",
+			EventBacklogSlack, selectedV3EventQueueLimit, publicEventBufferLimit)
+	}
 	controller := &Controller{
 		selected:   shimwire.V3,
 		eventQueue: make(chan ControllerEvent, selectedV3EventQueueLimit),

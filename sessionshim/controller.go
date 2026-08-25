@@ -228,7 +228,24 @@ type snapshotCompletion struct {
 const (
 	controllerSnapshotRetryLedgerLimit = 1024
 	selectedV3EventQueueLimit          = 128
+	publicEventBufferLimit             = 64
 )
+
+// EventBacklogSlack is how many stream events one controller can hold between
+// its socket reader and a consumer that is not draining them: the selected-v3
+// priority queue plus the public event buffer.
+//
+// It is the whole of the absorption guarantee, and it is deliberately finite.
+// The reader must never block on a consumer — it is the only goroutine that can
+// receive a durable heartbeat receipt, so parking it behind a full queue would
+// deadlock a consumer waiting on that receipt. Beyond this many undrained
+// events the controller therefore fails closed and drops the connection rather
+// than growing without bound; the shim keeps the harness and the session is
+// released to quarantine.
+//
+// A consumer may of course absorb far more than this over time. What this
+// number bounds is the burst it can be BEHIND by at one instant.
+const EventBacklogSlack = selectedV3EventQueueLimit + publicEventBufferLimit
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
@@ -304,7 +321,7 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 		r:             shimwire.NewReader(conn),
 		resumeFrom:    opts.ResumeFrom,
 		workareaRoot:  rec.WorkareaRoot,
-		events:        make(chan ControllerEvent, 64),
+		events:        make(chan ControllerEvent, publicEventBufferLimit),
 		logger:        opts.logger(),
 		done:          make(chan struct{}),
 		closing:       make(chan struct{}),
