@@ -175,6 +175,27 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	gate := newShimAdoptionGate()
 	d.consumeShimEventsGated(ctrl, gate)
+	// ringPostActivationHeartbeat is set only on the path that raised the
+	// recovery heartbeat barrier for THIS launch AND completed carrier
+	// activation, so the beat below can only ever carry a complete projection.
+	//
+	// This defer is registered BEFORE the publication barrier below precisely so
+	// it runs AFTER that barrier's own deferred unlock — defers are LIFO. The
+	// acknowledgement this beat triggers takes the same publication barrier, so
+	// ringing it while still holding the barrier would deadlock the launch
+	// against its own heartbeat.
+	ringPostActivationHeartbeat := false
+	defer func() {
+		if !ringPostActivationHeartbeat {
+			return
+		}
+		// Snapshot before the beat: donmai's own acknowledgement clears the
+		// scope it owns, and the hook is meant to see the set that activation
+		// actually produced.
+		activated := d.sessionShimActivatedScopes()
+		d.ringSessionShimPostActivationHeartbeat(ctx)
+		d.notifySessionShimAdoptionActivated(ctx, activated)
+	}()
 	serializedPublication := cfg.OnAdoptionPublished != nil
 	publicationSucceeded := !serializedPublication
 	if serializedPublication {
@@ -262,10 +283,36 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		}
 	}
 	publicationSucceeded = true
+	ringPostActivationHeartbeat = heartbeatBarrier
 	slog.Info("session shim: launched and adopted an interactive session",
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
 	return &handle, nil
+}
+
+// ringSessionShimPostActivationHeartbeat sends one immediate heartbeat after a
+// dynamically published adoption has completed carrier activation.
+//
+// The barrier this launch raised clears only on an acknowledged beat. Left to
+// the periodic ticker that acknowledgement arrives up to a full heartbeat
+// interval late, and for that whole window a host that is completely ready
+// claims no new work and does not read as adoption-complete to its control
+// plane. Ringing the beat here collapses that window to one round-trip.
+//
+// Best-effort on purpose: a failed beat is a warning, never a launch failure.
+// The session is already adopted and durable, and the periodic loop clears the
+// barrier on its next tick regardless — this only shortens the wait.
+func (d *Daemon) ringSessionShimPostActivationHeartbeat(ctx context.Context) {
+	d.lifecycleMu.Lock()
+	heartbeat := d.heartbeat
+	d.lifecycleMu.Unlock()
+	if heartbeat == nil {
+		return
+	}
+	if err := heartbeat.SendNow(ctx); err != nil {
+		slog.Warn("session shim: immediate post-activation heartbeat failed; recovery clears on the next tick",
+			"error", err)
+	}
 }
 
 // startShimProcess execs the worker as a detached shim and then RELEASES it.
