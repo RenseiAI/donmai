@@ -2025,25 +2025,38 @@ func (d *Daemon) publishSessionShimProjection(ctx context.Context, orgID string)
 	sessionshim.SortQuarantined(batch.Quarantined)
 	if _, err := d.completeSessionShimAdoptionBatch(ctx, batch); err != nil {
 		slog.Warn("session shim: quarantine projection not published",
-			"org", orgID, "quarantined", len(batch.Quarantined), "error", err)
+			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
+			"tombstoned", len(batch.Tombstoned), "error", err)
 		return
 	}
 	slog.Info("session shim: republished the durable projection after a quarantine change",
 		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined))
 }
 
-// sortSessionShimAdoptionOutcomes puts a batch's adopted set in the daemon's own
-// deterministic order rather than leaking Go map order to the platform.
+// sortSessionShimAdoptionOutcomes puts a batch's adopted set in the exact order
+// the platform's own comparator defines, rather than leaking Go map order.
+//
+// The receiving side re-checks the order and refuses a batch that disagrees, so
+// the two comparators must be the same comparator. This one omitted
+// ControllerGeneration, which the platform's includes: two adopted entries for
+// one shim incarnation differing only in generation could be emitted in an
+// order the platform rejects. SortQuarantined already keys on the full tuple.
 func sortSessionShimAdoptionOutcomes(in []SessionShimAdoptionOutcome) {
 	sort.Slice(in, func(i, j int) bool {
 		a, b := in[i].Evidence, in[j].Evidence
+		if a.Identity.OrgID != b.Identity.OrgID {
+			return a.Identity.OrgID < b.Identity.OrgID
+		}
 		if a.Identity.SessionID != b.Identity.SessionID {
 			return a.Identity.SessionID < b.Identity.SessionID
 		}
 		if a.ShimID != b.ShimID {
 			return a.ShimID < b.ShimID
 		}
-		return a.ProcessEpoch < b.ProcessEpoch
+		if a.ProcessEpoch != b.ProcessEpoch {
+			return a.ProcessEpoch < b.ProcessEpoch
+		}
+		return a.ControllerGeneration < b.ControllerGeneration
 	})
 }
 

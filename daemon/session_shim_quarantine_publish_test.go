@@ -186,3 +186,60 @@ func contains(haystack []string, needle string) bool {
 	}
 	return false
 }
+
+// TestAdoptedBatchOrderMatchesTheReceiverComparator pins the daemon's adopted
+// ordering to the exact tuple the platform re-checks on arrival. The receiving
+// side refuses a batch whose rows are not in ITS order, so a comparator that
+// agrees on a prefix and diverges on the tail produces a batch that is correct
+// here and rejected there. The tail is ControllerGeneration, which this
+// comparator used to omit.
+func TestAdoptedBatchOrderMatchesTheReceiverComparator(t *testing.T) {
+	t.Parallel()
+	outcome := func(org, session, shim string, epoch, generation uint64) SessionShimAdoptionOutcome {
+		return SessionShimAdoptionOutcome{Evidence: SessionShimAdoptionEvidence{
+			Identity:     sessionshim.Identity{OrgID: org, SessionID: session},
+			ShimID:       shim,
+			ProcessEpoch: epoch, ControllerGeneration: generation,
+		}}
+	}
+	// Deliberately reversed on every key, innermost first.
+	in := []SessionShimAdoptionOutcome{
+		outcome("org-b", "session-a", "shim-a", 1, 1),
+		outcome("org-a", "session-a", "shim-a", 1, 9),
+		outcome("org-a", "session-a", "shim-a", 1, 2),
+		outcome("org-a", "session-a", "shim-a", 0, 5),
+		outcome("org-a", "session-a", "shim-0", 1, 5),
+		outcome("org-a", "session-0", "shim-a", 1, 5),
+	}
+	sortSessionShimAdoptionOutcomes(in)
+
+	// The receiver's comparator, transcribed from the platform's
+	// compareBatchCorrelation: org, session, shim, processEpoch, generation.
+	for i := 1; i < len(in); i++ {
+		prev, cur := in[i-1].Evidence, in[i].Evidence
+		switch {
+		case prev.Identity.OrgID != cur.Identity.OrgID:
+			if prev.Identity.OrgID > cur.Identity.OrgID {
+				t.Fatalf("entry %d: org out of order (%q after %q)", i, cur.Identity.OrgID, prev.Identity.OrgID)
+			}
+		case prev.Identity.SessionID != cur.Identity.SessionID:
+			if prev.Identity.SessionID > cur.Identity.SessionID {
+				t.Fatalf("entry %d: session out of order (%q after %q)", i, cur.Identity.SessionID, prev.Identity.SessionID)
+			}
+		case prev.ShimID != cur.ShimID:
+			if prev.ShimID > cur.ShimID {
+				t.Fatalf("entry %d: shim out of order (%q after %q)", i, cur.ShimID, prev.ShimID)
+			}
+		case prev.ProcessEpoch != cur.ProcessEpoch:
+			if prev.ProcessEpoch > cur.ProcessEpoch {
+				t.Fatalf("entry %d: process epoch out of order (%d after %d)", i, cur.ProcessEpoch, prev.ProcessEpoch)
+			}
+		default:
+			if prev.ControllerGeneration > cur.ControllerGeneration {
+				t.Fatalf("entry %d: controller generation out of order (%d after %d) — "+
+					"the receiver refuses a batch whose rows are not in its order",
+					i, cur.ControllerGeneration, prev.ControllerGeneration)
+			}
+		}
+	}
+}
