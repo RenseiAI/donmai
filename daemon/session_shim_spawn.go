@@ -996,6 +996,12 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
 			"session", id.String())
 	}
+	if ok {
+		// The quarantine set just changed outside an adoption. Publish it, or
+		// the platform keeps comparing this host's heartbeat against a snapshot
+		// that predates the quarantine, refuses every beat, and drains the host.
+		d.publishSessionShimProjection(context.Background(), id.OrgID)
+	}
 }
 
 // upsertShimQuarantineLocked adds one exact shim projection without allowing a

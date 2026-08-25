@@ -8,6 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Quarantining a session no longer takes its host out of service.** The
+  platform compares a heartbeat's quarantine set against the snapshot the last
+  adoption-batch commit stored, byte for byte, and demotes a host whose beat
+  disagrees. Two of the four places that change this daemon's quarantine set
+  published the result and two did not — including the ordinary path where an
+  adopted controller's stream ends without a terminal observation. A dropped
+  socket therefore added a quarantined session the platform had never been told
+  about, every following heartbeat was refused, and the host sat draining with
+  its claims disabled until that shim happened to be tombstoned. The projection
+  is now republished wherever it changes, and a test fails if a new call site
+  changes it without publishing.
+
 ---
 
 ## v0.68.14 — 2026-08-25
