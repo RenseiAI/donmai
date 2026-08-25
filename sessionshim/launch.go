@@ -42,6 +42,17 @@ const (
 	EnvTerminationGraceMS  = "DONMAI_SESSION_SHIM_TERMINATION_GRACE_MS"
 	EnvPropagationMarginMS = "DONMAI_SESSION_SHIM_PROPAGATION_MARGIN_MS"
 	EnvExternalReleaseMS   = "DONMAI_SESSION_SHIM_EXTERNAL_RELEASE_MS"
+	// EnvRingBytes optionally overrides the shim-owned output ring budget, in
+	// payload bytes. It exists for one reason: an acceptance run has to be able
+	// to make the ring actually EVICT, and the eviction path is only reachable
+	// by exceeding the budget. The production budget is 8 MiB, which the
+	// acceptance seam's own volume misses by more than two orders of magnitude,
+	// so without this the lane silently proves nothing.
+	//
+	// It is absent from the environment unless a controller sets it, and the
+	// only controller path that sets it is gated on the acceptance-control
+	// token file. A launch without it is byte-for-byte the released contract.
+	EnvRingBytes = "DONMAI_SESSION_SHIM_RING_BYTES"
 )
 
 // ErrNoLaunch reports that the environment does not select shim ownership.
@@ -54,6 +65,10 @@ type Launch struct {
 	RegistryDir  string
 	Orphan       OrphanPolicy
 	ProcessEpoch uint64
+	// RingBytes optionally overrides the shim-owned output ring budget, in
+	// payload bytes. Zero means the worker's own spec decides, which is the
+	// released behaviour.
+	RingBytes int
 }
 
 // Env renders the launch as the environment overlay a controller adds to the
@@ -64,7 +79,7 @@ type Launch struct {
 // would surface as a worker that silently stays on the direct-ownership path
 // while the controller waits for a discovery record that never arrives.
 func (l Launch) Env() map[string]string {
-	return map[string]string{
+	env := map[string]string{
 		EnvOwnership:           "1",
 		EnvOrgID:               l.Identity.OrgID,
 		EnvSessionID:           l.Identity.SessionID,
@@ -75,6 +90,10 @@ func (l Launch) Env() map[string]string {
 		EnvPropagationMarginMS: millis(l.Orphan.PropagationMargin),
 		EnvExternalReleaseMS:   millis(l.Orphan.ExternalReleaseThreshold),
 	}
+	if l.RingBytes > 0 {
+		env[EnvRingBytes] = strconv.Itoa(l.RingBytes)
+	}
+	return env
 }
 
 func millis(d time.Duration) string {
@@ -157,6 +176,23 @@ func LaunchFromEnv(lookup func(string) string) (Launch, error) {
 		}
 		*d.dst = time.Duration(ms) * time.Millisecond //nolint:gosec // G115: bounded above by maxLaunchDurationMS
 	}
+	// The ring override is the one OPTIONAL key in the contract: absent means the
+	// worker's own spec decides, which is the released behaviour. Present and
+	// malformed is still an error — a controller that meant to shrink the ring
+	// and silently got 8 MiB would make an acceptance run prove nothing.
+	if raw := lookup(EnvRingBytes); raw != "" {
+		// maxLaunchRingBytes bounds the parse for the same reason the durations
+		// are bounded: this arrives as text from a process environment.
+		const maxLaunchRingBytes = 1 << 30
+		ring, err := parseUint(raw, EnvRingBytes)
+		if err != nil {
+			return Launch{}, err
+		}
+		if ring == 0 || ring > maxLaunchRingBytes {
+			return Launch{}, fmt.Errorf("sessionshim: %s is %d bytes, want 1..%d", EnvRingBytes, ring, maxLaunchRingBytes)
+		}
+		l.RingBytes = int(ring) //nolint:gosec // G115: bounded above by maxLaunchRingBytes
+	}
 	// Re-validate rather than trust. The launcher already checked this at its own
 	// startup, but the two processes are separately configurable and §D8 makes
 	// the inequality a precondition for ADMITTING a session, not a courtesy the
@@ -195,6 +231,12 @@ func StartFromEnvWithRoot(l Launch, spec ptyhost.Spec, workareaPath, workareaRoo
 	registry, err := NewRegistry(l.RegistryDir)
 	if err != nil {
 		return nil, err
+	}
+	if l.RingBytes > 0 {
+		// The launch is authoritative over the worker's own spec here: the
+		// controller is the only party that knows this session is an acceptance
+		// session, and the ring budget has to be settled before the first frame.
+		spec.RingBytes = l.RingBytes
 	}
 	return Start(Options{
 		Identity:     l.Identity,

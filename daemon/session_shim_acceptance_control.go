@@ -21,7 +21,46 @@ const (
 	sessionShimAcceptanceRoute   = "/api/daemon/session-shim/acceptance/"
 	maxSessionShimAcceptanceBody = 4 << 10
 	acceptanceGapResizeCycles    = 4096
+	// acceptanceRingBytes is the shim-owned output ring budget for a session
+	// launched while the acceptance-control seam is armed.
+	//
+	// The seam exists to drive the ring past eviction so the product's real
+	// recovery path — one declared Gap, its exact recovery Snapshot, a continued
+	// sequence — is observable. Its own volume does not come close: 4096 resize
+	// cycles plus 128 redraws produce about 50 KB of frames, which is 0.6% of the
+	// 8 MiB production budget, so nothing was ever evicted and the lane proved
+	// nothing while appearing to pass. Sizing the ring to the seam is the cheap
+	// half of that fix; sizing the seam to an 8 MiB ring would need roughly
+	// 700,000 cycles, every one of which also has to cross the daemon's consumer
+	// and the composing carrier.
+	//
+	// The size is sourced from the seam, not chosen: this burst puts at least
+	// acceptanceGapResizeCycles applied-Resize frames into the ring, and an
+	// applied-Resize payload at these geometries is four bytes, so the seam is
+	// guaranteed to produce at least 16 KiB of ring-accounted payload. A 4 KiB
+	// budget therefore evicts by a factor of four with nothing left to chance,
+	// and still retains about a thousand frames of replay window.
+	// TestAcceptanceRingIsSmallerThanTheSeamGuarantees fails if the two ever
+	// drift apart.
+	//
+	// This value is NEVER a default. It reaches a shim only through
+	// acceptanceLaunchRingBytes, which is gated on the same private token file
+	// that makes the acceptance route exist at all.
+	acceptanceRingBytes = 4 << 10
 )
+
+// acceptanceLaunchRingBytes reports the ring override a newly launched shim
+// should carry, or 0 for every ordinary launch.
+//
+// The gate is deliberately the same one the control route uses: without a
+// configured, private, well-permissioned token file there is no acceptance seam
+// and no override, and a production daemon is byte-for-byte unchanged.
+func acceptanceLaunchRingBytes() int {
+	if !sessionShimAcceptanceTokenConfigured() {
+		return 0
+	}
+	return acceptanceRingBytes
+}
 
 var errSessionShimAcceptanceFenceRefused = errors.New("restart_fence_refused")
 
@@ -97,27 +136,43 @@ func (s *Server) handleSessionShimAcceptanceControl(w http.ResponseWriter, r *ht
 	w.WriteHeader(http.StatusNoContent)
 }
 
-func sessionShimAcceptanceAuthorized(r *http.Request) bool {
+// sessionShimAcceptanceTokenConfigured reports whether a private acceptance
+// token file is present and safely permissioned. It reads no request and grants
+// nothing on its own.
+func sessionShimAcceptanceTokenConfigured() bool {
+	_, ok := sessionShimAcceptanceToken()
+	return ok
+}
+
+func sessionShimAcceptanceToken() ([]byte, bool) {
 	path := strings.TrimSpace(os.Getenv(sessionShimAcceptanceTokenPathEnvironment()))
 	if path == "" || !filepath.IsAbs(path) {
-		return false
+		return nil, false
 	}
 	root, err := os.OpenRoot(filepath.Dir(path))
 	if err != nil {
-		return false
+		return nil, false
 	}
 	defer func() { _ = root.Close() }()
 	name := filepath.Base(path)
 	info, err := root.Stat(name)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o077 != 0 || info.Size() <= 0 || info.Size() > 512 {
-		return false
+		return nil, false
 	}
 	want, err := root.ReadFile(name)
 	if err != nil {
-		return false
+		return nil, false
 	}
 	want = bytes.TrimSpace(want)
 	if len(want) < 32 || len(want) > 256 {
+		return nil, false
+	}
+	return want, true
+}
+
+func sessionShimAcceptanceAuthorized(r *http.Request) bool {
+	want, ok := sessionShimAcceptanceToken()
+	if !ok {
 		return false
 	}
 	got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))

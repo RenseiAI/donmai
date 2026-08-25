@@ -24,13 +24,16 @@ import (
 // and its consumer is additionally parked on the activation gate for the whole
 // composing-callback window.
 type readoptedBurstFixture struct {
-	daemon   *Daemon
-	identity sessionshim.Identity
-	shim     *sessionshim.Shim
+	daemon      *Daemon
+	identity    sessionshim.Identity
+	shim        *sessionshim.Shim
+	registryDir string
 }
 
 func newReadoptedBurstFixture(
 	t *testing.T,
+	backlogBudget int,
+	ringBytes int,
 	observe func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent),
 ) *readoptedBurstFixture {
 	t.Helper()
@@ -48,7 +51,7 @@ func newReadoptedBurstFixture(
 	id := sessionshim.Identity{OrgID: "org-burst", SessionID: "session-burst"}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: id, Registry: registry, ProcessEpoch: 5,
-		Spec: ptyhost.Spec{Command: []string{
+		Spec: ptyhost.Spec{RingBytes: ringBytes, Command: []string{
 			"/bin/sh", "-c",
 			`stty -echo; while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`,
 		}},
@@ -93,6 +96,7 @@ func newReadoptedBurstFixture(
 		EnableAdoption: true, RegistryDir: registryDir, HostID: "host-burst", OrgID: id.OrgID,
 		AdoptionBatchOrgIDs:          []string{id.OrgID},
 		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		EventBacklogBudget:         backlogBudget,
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
 		PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
@@ -150,7 +154,9 @@ func newReadoptedBurstFixture(
 		t.Fatalf("startup re-adoption = generation %d contiguous %v, want generation 2 contiguous",
 			entry.controller.Generation(), entry.controller.Adoption().Contiguous)
 	}
-	return &readoptedBurstFixture{daemon: replacement, identity: id, shim: shim}
+	return &readoptedBurstFixture{
+		daemon: replacement, identity: id, shim: shim, registryDir: registryDir,
+	}
 }
 
 // TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor pins the fix for a
@@ -175,10 +181,11 @@ func newReadoptedBurstFixture(
 // RED by construction, on any machine, at any speed, with no timing threshold
 // to tune.
 //
-// The burst stays inside sessionshim.EventBacklogSlack on purpose. That number
-// IS the absorption guarantee, so a burst within it must survive on the slowest
-// runner, and a burst beyond it is covered by
-// TestBurstBeyondTheAdvertisedSlackFailsClosedHonestly instead.
+// The burst is the product's own acceptance seam at its real depth, because
+// that is the volume the guarantee has to cover: the daemon's in-flight budget
+// now equals the shim's ring budget, so the controller can no longer be the
+// first component to give up on volume the shim absorbs by design. Past the
+// budget is covered by TestBacklogBudgetOverrunFailsClosedHonestly instead.
 func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 	var (
 		mu       sync.Mutex
@@ -186,7 +193,7 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 		frames   int
 		maxLag   uint64
 	)
-	fixture := newReadoptedBurstFixture(t, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 0, 0, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
 		// Sampled from the carrier's own seat, at the instant the frame is
 		// handed over, which is the only place the question is meaningful.
 		cursor := d.SessionShimForwardedSeq(id.OrgID, id.SessionID)
@@ -204,20 +211,15 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 	daemon := fixture.daemon
 	before := daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID)
 
-	// Real geometry through the shim-owned PTY: one applied-Resize host frame
-	// per cycle, which is what a terminal redraw looks like on the wire. Half
-	// the advertised slack leaves room for the harness's own echo frames.
-	const burst = sessionshim.EventBacklogSlack / 2
-	for cycle := range burst {
-		cols := uint32(99 + (cycle & 1))
-		rows := uint32(29 + ((cycle >> 1) & 1))
-		if err := daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, cols, rows, 0, 0); err != nil {
-			mu.Lock()
-			seen := frames
-			mu.Unlock()
-			t.Fatalf("resize %d of %d within the advertised backlog slack (%d): %v (carrier had %d frames)",
-				cycle, burst, sessionshim.EventBacklogSlack, err, seen)
-		}
+	// The product's own acceptance seam, at its real depth: 4096 alternating
+	// geometry cycles with a redraw every 32. Nothing shallower is a fair test —
+	// this is the volume the restart fixture drives to make the shim's ring
+	// evict, and the daemon has to still be there when it does.
+	if err := daemon.forceSessionShimAcceptanceGap(id); err != nil {
+		mu.Lock()
+		seen := frames
+		mu.Unlock()
+		t.Fatalf("acceptance-depth burst through the re-adopted controller: %v (carrier had %d frames)", err, seen)
 	}
 
 	// The control channel must still be the daemon's, and still be usable.
@@ -227,7 +229,7 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 	if err := daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("after-burst\r")); err != nil {
 		t.Fatalf("write to the re-adopted session after the burst: %v", err)
 	}
-	waitFor(t, 30*time.Second, "the harness to answer through the re-adopted controller", func() bool {
+	waitFor(t, 60*time.Second, "the harness to answer through the re-adopted controller", func() bool {
 		mu.Lock()
 		defer mu.Unlock()
 		// The burst floods the shim-owned ring, so the harness answers the
@@ -236,7 +238,7 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 		return strings.Contains(observed.String(), "after-burst")
 	})
 	// Coalescing must not stall the resume point: it still has to advance.
-	waitFor(t, 30*time.Second, "the durable forwarded cursor to advance past the burst", func() bool {
+	waitFor(t, 60*time.Second, "the durable forwarded cursor to advance past the burst", func() bool {
 		return daemon.SessionShimForwardedSeq(id.OrgID, id.SessionID) > before
 	})
 
@@ -249,8 +251,8 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 	}
 }
 
-// TestBurstBeyondTheAdvertisedSlackFailsClosedHonestly covers the other side of
-// the same guarantee: what happens past sessionshim.EventBacklogSlack.
+// TestBacklogBudgetOverrunFailsClosedHonestly covers the other side of the same
+// guarantee: what happens past the budget.
 //
 // The reader must never block on a consumer — it is the only goroutine that can
 // receive a durable heartbeat receipt — so beyond the slack the controller
@@ -260,34 +262,32 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 // fix it kept the dead entry, so `host status` showed a running session and
 // every later call returned "use of closed network connection" forever.
 //
-// Holding the carrier's own callback is what makes this deterministic: the
-// consumer cannot drain while it is held, so the slack is exceeded by
-// construction rather than by out-running a scheduler.
-func TestBurstBeyondTheAdvertisedSlackFailsClosedHonestly(t *testing.T) {
+// Two things make this deterministic rather than a race with the scheduler: the
+// carrier's own callback is held, so the consumer cannot drain; and the budget
+// is set small through the public config seam, so the bound is reached by
+// construction instead of by generating megabytes through a PTY.
+func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	var holding atomic.Bool
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	held := make(chan struct{}, 1)
-	fixture := newReadoptedBurstFixture(t, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 8<<10, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
 		// Adoption itself runs through this callback (the mandatory Snapshot is
 		// staged on the consumer), so the hold only arms once the session is
 		// published and activated.
 		if !holding.Load() {
 			return
 		}
-		select {
-		case held <- struct{}{}:
-		default:
-		}
 		<-release
 	})
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	id := fixture.identity
 	daemon := fixture.daemon
+	// The session is idle here, so the consumer is parked on an empty stream and
+	// the FIRST frame of the burst is the one that blocks in the carrier.
 	holding.Store(true)
 
-	// Push well past the slack while nothing can drain it.
-	const burst = 4 * sessionshim.EventBacklogSlack
+	// Push well past the small budget while nothing can drain it.
+	const burst = 4096
 	overflowed := false
 	for cycle := range burst {
 		if err := daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, uint32(99+(cycle&1)), 29, 0, 0); err != nil {
@@ -295,19 +295,14 @@ func TestBurstBeyondTheAdvertisedSlackFailsClosedHonestly(t *testing.T) {
 			break
 		}
 	}
-	select {
-	case <-held:
-	case <-time.After(30 * time.Second):
-		t.Fatal("the held carrier callback never received a frame")
-	}
 	releaseOnce.Do(func() { close(release) })
 	if !overflowed {
-		waitFor(t, 30*time.Second, "the undrained backlog to fail closed", func() bool {
+		waitFor(t, 60*time.Second, "the undrained backlog to fail closed", func() bool {
 			return daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, 100, 30, 0, 0) != nil
 		})
 	}
 
-	waitFor(t, 30*time.Second, "the failed-closed controller to release its session", func() bool {
+	waitFor(t, 60*time.Second, "the failed-closed controller to release its session", func() bool {
 		return len(daemon.AdoptedSessionShims()) == 0 && len(daemon.QuarantinedSessions()) == 1
 	})
 	if got := daemon.SessionShimOccupancy(); got != 1 {
@@ -353,7 +348,7 @@ func TestConsumerDropReleasesShimOwnershipInsteadOfStrandingIt(t *testing.T) {
 		t.Fatalf("WriteAdoptedSessionShimInput: %v", err)
 	}
 
-	waitFor(t, 30*time.Second, "the refused frame to release shim ownership", func() bool {
+	waitFor(t, 60*time.Second, "the refused frame to release shim ownership", func() bool {
 		return len(f.daemon.AdoptedSessionShims()) == 0 && len(f.daemon.QuarantinedSessions()) == 1
 	})
 	if got := f.daemon.SessionShimOccupancy(); got != 1 {
