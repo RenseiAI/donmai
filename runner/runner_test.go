@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -184,45 +185,69 @@ func TestRun_RepositoryFreeDisablesVCRecovery(t *testing.T) {
 	h.runner.skipBackstop = false
 
 	fakeBin := t.TempDir()
-	marker := filepath.Join(t.TempDir(), "vc-command-ran")
-	t.Setenv("REPOSITORY_FREE_COMMAND_MARKER", marker)
-	command := []byte("#!/bin/sh\nprintf '%s\\n' \"$0 $*\" >> \"$REPOSITORY_FREE_COMMAND_MARKER\"\nexit 97\n")
-	for _, name := range []string{"git", "gh"} {
+	markers := map[string]string{
+		"git": filepath.Join(t.TempDir(), "git-command-ran"),
+		"gh":  filepath.Join(t.TempDir(), "gh-command-ran"),
+	}
+	for name, marker := range markers {
 		path := filepath.Join(fakeBin, name)
+		command := []byte(fmt.Sprintf("#!/bin/sh\nprintf '%%s\\n' \"$0 $*\" >> %q\nexit 97\n", marker))
 		if err := os.WriteFile(path, command, 0o600); err != nil {
 			t.Fatalf("write fake %s: %v", name, err)
 		}
 		if err := os.Chmod(path, 0o700); err != nil { //nolint:gosec // owner-only test fixture must be executable
 			t.Fatalf("chmod fake %s: %v", name, err)
 		}
+		info, err := os.Stat(path)
+		if err != nil {
+			t.Fatalf("stat fake %s: %v", name, err)
+		}
+		if got := info.Mode().Perm(); got != 0o700 {
+			t.Fatalf("fake %s mode = %o, want 700", name, got)
+		}
 	}
 	t.Setenv("PATH", fakeBin+string(os.PathListSeparator)+os.Getenv("PATH"))
 
 	qw := h.queuedWork("REPOSITORY-FREE-RECOVERY")
 	qw.Repository = ""
-	qw.ResolvedProfile.ProviderConfig = map[string]any{"stub.behavior": string(stub.BehaviorSilentFail)}
+	qw.ResolvedProfile.ProviderConfig = map[string]any{
+		"stub.behavior":          string(stub.BehaviorSlowTool),
+		"stub.injectUnsupported": true,
+		"stub.progressTicks":     0,
+	}
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	res, _ := h.runner.Run(ctx, qw)
+	res, err := h.runner.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
 	if res == nil {
 		t.Fatal("Run returned nil result")
 	}
+	if res.Status != "completed" {
+		t.Errorf("repository-free Status = %q, want completed (FailureMode=%q, Error=%q)", res.Status, res.FailureMode, res.Error)
+	}
 	if res.PullRequestURL != "" {
-		t.Fatalf("repository-free PullRequestURL = %q, want empty", res.PullRequestURL)
+		t.Errorf("repository-free PullRequestURL = %q, want empty", res.PullRequestURL)
 	}
 	if res.SteeringTriggered {
-		t.Fatal("repository-free run triggered tail steering")
+		t.Error("repository-free run triggered tail steering")
+	}
+	if res.SteeringResumeFallback {
+		t.Error("repository-free run used tail steering resume fallback")
 	}
 	if res.BackstopReport != nil {
-		t.Fatalf("repository-free run produced backstop report: %+v", res.BackstopReport)
+		t.Errorf("repository-free run produced backstop report: %+v", res.BackstopReport)
 	}
 	if res.CommitSHA != "" {
-		t.Fatalf("repository-free CommitSHA = %q, want empty", res.CommitSHA)
+		t.Errorf("repository-free CommitSHA = %q, want empty", res.CommitSHA)
 	}
-	if body, err := os.ReadFile(marker); err == nil {
-		t.Fatalf("repository-free run invoked a VC command: %s", body)
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("read VC command marker: %v", err)
+	for name, marker := range markers {
+		if body, err := os.ReadFile(marker); err == nil {
+			t.Errorf("repository-free run invoked %s: %s", name, body)
+		} else if !os.IsNotExist(err) {
+			t.Errorf("read %s command marker: %v", name, err)
+		}
 	}
 }
 
