@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"os"
 	"strings"
@@ -421,4 +422,60 @@ func cloneStringMap(in map[string]string) map[string]string {
 		out[key] = value
 	}
 	return out
+}
+
+// TestFailClosedStreamDropNamesItsReason pins the diagnosis half of a real
+// field failure: a controller that drops its own connection must say why.
+//
+// Every fail-closed decision in the read loop used to close the socket
+// silently. From every later caller's side that is indistinguishable from a
+// peer that went away — input, resize, and the durable heartbeat all come back
+// with "use of closed network connection", minutes later, naming nothing. The
+// one operator-visible line was an acknowledgement failure for a frame the
+// daemon had already accepted, which points at the wrong layer entirely.
+//
+// Restoring the bare `_ = c.Close()` in readLoop turns this RED.
+func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
+	clientConn, shimConn := net.Pipe()
+	defer clientConn.Close() //nolint:errcheck
+	defer shimConn.Close()   //nolint:errcheck
+
+	var log strings.Builder
+	controller := &Controller{
+		id: Identity{OrgID: "org-drop", SessionID: "session-drop"},
+		w:  shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
+		gen: 3, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
+		// A queue with no room at all makes the bound reachable without writing
+		// its full production depth; the decision under test is the same one.
+		events: make(chan ControllerEvent), eventQueue: make(chan ControllerEvent),
+		logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})),
+		done:          make(chan struct{}),
+		closing:       make(chan struct{}),
+		snapshotCalls: make(map[uint64]*snapshotCall),
+	}
+	go controller.readLoop()
+
+	frame := attachwire.Frame{
+		Type: attachwire.TypeOutput, Seq: 1,
+		Payload: attachwire.EncodeOutput([]byte("x")),
+	}
+	body, err := shimwire.EncodeHostFrame(shimwire.HostFrame{FrameBytes: frame.Encode()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := shimwire.NewWriter(shimConn).WriteVersion(shimwire.V3, shimwire.TypeHostFrame, body); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-controller.closing:
+	case <-time.After(5 * time.Second):
+		t.Fatal("fail-closed queue bound did not drop the connection")
+	}
+	<-controller.Done()
+	line := log.String()
+	if !strings.Contains(line, "controller dropped its shim connection") ||
+		!strings.Contains(line, "org-drop/session-drop") ||
+		!strings.Contains(line, "exceeded its bound") {
+		t.Fatalf("fail-closed drop log = %q, want the session and the exact reason", line)
+	}
 }
