@@ -13,3 +13,7 @@ import "fmt"
 func processStartTime(pid int) (int64, error) {
 	return 0, fmt.Errorf("sessionshim: process start identity is unavailable on this platform (pid %d)", pid)
 }
+
+// legacyStartEncoding reports no value: this platform has only ever reported the process
+// start time in Unix nanoseconds, so there is no earlier encoding to accept.
+func legacyStartEncoding(int) (int64, bool) { return 0, false }

@@ -35,12 +35,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   falling back to USER_HZ), both resolved once per process so the comparison
   keeps a fixed frame of reference.
 
-  **Upgrade note:** this changes the Linux encoding, so a shim registry written
-  by an older Linux daemon will not match the recomputed identity — sessions
-  recorded before the upgrade are treated as gone on the first restart after
-  it. That is intentional. The documented contract is nanoseconds, and a
-  one-time reconciliation costs less than continuing to publish a number that
-  cannot be interpreted as a time. (#427)
+  Liveness accepts the legacy tick encoding for a recorded value that cannot be
+  a nanosecond timestamp, so a controller upgraded past this change still
+  recognises a shim recorded by an older Linux binary and no running session is
+  orphaned by the upgrade.
+
+  **Upgrade note:** the reverse direction is NOT compatible. A controller from
+  before this change recomputes ticks and cannot verify a record written after
+  it, so a downgrade — or an older controller sharing the host — loses those
+  sessions. (#427)
 
 ## v0.68.12 — 2026-08-24
 

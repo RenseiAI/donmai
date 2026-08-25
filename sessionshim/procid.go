@@ -51,12 +51,41 @@ func (p ProcessIdentity) Alive() (bool, error) {
 		}
 		return false, err
 	}
-	if started != p.StartedAt {
+	if started != p.StartedAt && !matchesLegacyStartEncoding(p.PID, p.StartedAt) {
 		// The pid is live but it is a DIFFERENT process. Reporting "not alive"
 		// is the safe answer: the recorded process is gone.
 		return false, nil
 	}
 	return true, nil
+}
+
+// legacyStartEncodingCeiling bounds the values the legacy-encoding fallback
+// will even consider.
+//
+// A Unix-nanosecond timestamp for any instant after 1970-01-12 exceeds it, and
+// a clock-tick count since boot cannot reach it (a decade of uptime at 1000 Hz
+// is around 3e11). So a recorded value below the ceiling cannot be a start time
+// in the unit this package reports today, and one above it never reaches the
+// fallback at all.
+const legacyStartEncodingCeiling = int64(1e15)
+
+// matchesLegacyStartEncoding reports whether recorded is the value a binary
+// PREDATING this platform's current start-time encoding would have written for
+// pid — and therefore still names this exact process.
+//
+// Without it, changing a platform's encoding orphans every LIVE workload the
+// moment the controller is upgraded: the recorded identity stops matching, the
+// running process is classified stale, and its session is lost. The fallback is
+// exactly as discriminating as the encoding it accepts, because it is still
+// that pid's own kernel-reported start read fresh from the OS — a reused pid
+// cannot produce the recorded value. The ceiling keeps a genuine current-format
+// identity from ever being compared this way.
+func matchesLegacyStartEncoding(pid int, recorded int64) bool {
+	if recorded <= 0 || recorded >= legacyStartEncodingCeiling {
+		return false
+	}
+	legacy, ok := legacyStartEncoding(pid)
+	return ok && legacy == recorded
 }
 
 // Matches reports whether other names the same process incarnation.

@@ -47,3 +47,7 @@ func isNoSuchProcess(err error) bool {
 		errors.Is(err, unix.EIO) ||
 		errors.Is(err, unix.ENOENT)
 }
+
+// legacyStartEncoding reports no value: darwin has only ever reported the process
+// start time in Unix nanoseconds, so there is no earlier encoding to accept.
+func legacyStartEncoding(int) (int64, bool) { return 0, false }

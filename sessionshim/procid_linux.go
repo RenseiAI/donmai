@@ -237,3 +237,25 @@ func auxvValue(auxv []byte, entryType uint64) (int64, bool) {
 	}
 	return 0, false
 }
+
+// legacyStartEncoding reports the raw starttime tick count for pid: the value
+// this platform recorded before the conversion to Unix nanoseconds.
+//
+// It reproduces the old reader exactly, clamp included, because its whole
+// purpose is to reconstruct what an older binary wrote.
+func legacyStartEncoding(pid int) (int64, bool) {
+	data, err := os.ReadFile(fmt.Sprintf("/proc/%d/stat", pid))
+	if err != nil {
+		return 0, false
+	}
+	ticks, err := parseStartTimeTicks(data, pid)
+	if err != nil {
+		return 0, false
+	}
+	if ticks <= 0 {
+		// The old reader biased a zero tick count to 1 so record validation
+		// would accept it; a record written then holds the 1, not the 0.
+		ticks = 1
+	}
+	return ticks, true
+}

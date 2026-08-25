@@ -381,3 +381,52 @@ func TestSelfStartTimeMatchesProcessTable(t *testing.T) {
 		t.Fatalf("Alive() = false for the running process %s", self)
 	}
 }
+
+// TestAliveAcceptsTheLegacyTickEncoding pins the compatibility half of the
+// conversion: a registry record written by a binary that predated it holds a
+// tick count, and the process it names may still be RUNNING. Refusing to
+// recognise it would classify a live workload as gone on the first upgrade.
+func TestAliveAcceptsTheLegacyTickEncoding(t *testing.T) {
+	t.Parallel()
+
+	self, err := Self()
+	if err != nil {
+		t.Fatalf("Self: %v", err)
+	}
+	legacy, ok := legacyStartEncoding(self.PID)
+	if !ok {
+		t.Fatalf("legacyStartEncoding(%d) reported no value", self.PID)
+	}
+	if legacy == self.StartedAt {
+		t.Fatalf("legacy encoding %d equals the current one; this test cannot discriminate", legacy)
+	}
+
+	cases := []struct {
+		name      string
+		startedAt int64
+		want      bool
+	}{
+		{name: "current nanosecond encoding", startedAt: self.StartedAt, want: true},
+		{name: "legacy tick encoding from an older binary", startedAt: legacy, want: true},
+		{name: "a different tick count is a different process", startedAt: legacy + 1},
+		{name: "a different nanosecond instant is a different process", startedAt: self.StartedAt + int64(time.Second)},
+		{name: "at the ceiling the fallback does not apply", startedAt: legacyStartEncodingCeiling},
+		{name: "zero is never a match", startedAt: 0},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			id := ProcessIdentity{PID: self.PID, StartedAt: tc.startedAt}
+			// A non-positive PID is Alive()'s only error case; a
+			// non-positive start time is simply not a match.
+			alive, err := id.Alive()
+			if err != nil {
+				t.Fatalf("Alive: %v", err)
+			}
+			if alive != tc.want {
+				t.Fatalf("Alive() = %v for %s, want %v", alive, id, tc.want)
+			}
+		})
+	}
+}

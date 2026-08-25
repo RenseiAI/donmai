@@ -32,3 +32,26 @@ func TestSelfStartedAtIsUnixNanoseconds(t *testing.T) {
 			self.StartedAt, started.UTC().Format(time.RFC3339Nano), floor.Format(time.RFC3339), ceiling.UTC().Format(time.RFC3339))
 	}
 }
+
+// TestAliveRejectsAnUnrelatedStartInstant keeps the anti-reuse guarantee
+// honest on every supported platform: a live pid paired with a start time that
+// is not its own is NOT the recorded process, whatever compatibility the
+// platform layer offers for older encodings.
+func TestAliveRejectsAnUnrelatedStartInstant(t *testing.T) {
+	t.Parallel()
+
+	self, err := Self()
+	if err != nil {
+		t.Fatalf("Self: %v", err)
+	}
+	// One second later than this process actually started: a value in the
+	// current encoding's range, so no legacy-compatibility path applies.
+	imposter := ProcessIdentity{PID: self.PID, StartedAt: self.StartedAt + int64(time.Second)}
+	alive, err := imposter.Alive()
+	if err != nil {
+		t.Fatalf("Alive: %v", err)
+	}
+	if alive {
+		t.Fatalf("Alive() = true for %s, but the process started at %d", imposter, self.StartedAt)
+	}
+}
