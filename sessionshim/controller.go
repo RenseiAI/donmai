@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
@@ -115,6 +116,13 @@ type ControllerOptions struct {
 	// the sole selected-v3 host-sequence authority. It enables max 3; it does not
 	// reject a released max-2 shim, which must still be adopted conservatively.
 	RequireFullHostFrames bool
+	// EventBacklogBudget overrides EventBacklogBudget for this controller, in
+	// payload bytes. Zero uses the default. A host running many sessions at once
+	// may want a smaller per-session budget; it must never be set BELOW what the
+	// shim's ring will hold, or the controller becomes the first thing to give
+	// up again.
+	EventBacklogBudget int
+
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
 	DialTimeout time.Duration
 	Logger      *slog.Logger
@@ -146,6 +154,13 @@ func (o ControllerOptions) dialTimeout() time.Duration {
 	return 5 * time.Second
 }
 
+func (o ControllerOptions) eventBacklogBudget() int {
+	if o.EventBacklogBudget > 0 {
+		return o.EventBacklogBudget
+	}
+	return EventBacklogBudget
+}
+
 func (o ControllerOptions) logger() *slog.Logger {
 	if o.Logger != nil {
 		return o.Logger
@@ -175,13 +190,13 @@ type Controller struct {
 	// replayed or live output advances its own bookkeeping.
 	resumeFrom uint64
 	events     chan ControllerEvent
-	// eventQueue is selected-v3-only. It lets the socket reader reach a
-	// synchronous Heartbeat persistence receipt even when the public event buffer
-	// is full, while retaining an explicit fail-closed memory bound.
-	eventQueue chan ControllerEvent
-	logger     *slog.Logger
-	closeOne   sync.Once
-	done       chan struct{}
+	// backlog is selected-v3-only. It lets the socket reader reach a synchronous
+	// Heartbeat persistence receipt even when the public event buffer is full,
+	// while retaining an explicit fail-closed memory bound in payload bytes.
+	backlog  *eventBacklog
+	logger   *slog.Logger
+	closeOne sync.Once
+	done     chan struct{}
 	// closing is closed by Close BEFORE the connection is dropped, so a read
 	// loop parked on an event send has something to select on. Without it, a
 	// caller that stops consuming events and then closes would leave the loop
@@ -227,25 +242,32 @@ type snapshotCompletion struct {
 
 const (
 	controllerSnapshotRetryLedgerLimit = 1024
-	selectedV3EventQueueLimit          = 128
 	publicEventBufferLimit             = 64
+	// eventBacklogOverheadBytes is charged per queued event on top of its
+	// payload, so a flood of empty frames is bounded by the same budget that
+	// bounds a flood of large ones.
+	eventBacklogOverheadBytes = 64
 )
 
-// EventBacklogSlack is how many stream events one controller can hold between
-// its socket reader and a consumer that is not draining them: the selected-v3
-// priority queue plus the public event buffer.
+// EventBacklogBudget bounds, in payload bytes, how far behind the socket reader
+// a consumer may fall before the controller fails closed.
 //
-// It is the whole of the absorption guarantee, and it is deliberately finite.
-// The reader must never block on a consumer — it is the only goroutine that can
-// receive a durable heartbeat receipt, so parking it behind a full queue would
-// deadlock a consumer waiting on that receipt. Beyond this many undrained
-// events the controller therefore fails closed and drops the connection rather
-// than growing without bound; the shim keeps the harness and the session is
-// released to quarantine.
+// It is deliberately EQUAL to the shim's own output ring budget
+// (ptyhost.DefaultRingBytes), and that equality is the point. Both numbers
+// answer the same question — how much host output may be in flight before this
+// system admits it has lost some — and they must answer it in the same currency
+// at the same magnitude. When the daemon-side bound was a frame count (192) it
+// was orders of magnitude tighter than the shim's 8 MiB, so the controller
+// collapsed long before the ring, which is the component actually DESIGNED to
+// evict and declare a Gap (ADR-2026-08-17 §D5). A burst the shim absorbs by
+// design must never be the thing that kills the connection carrying it.
 //
-// A consumer may of course absorb far more than this over time. What this
-// number bounds is the burst it can be BEHIND by at one instant.
-const EventBacklogSlack = selectedV3EventQueueLimit + publicEventBufferLimit
+// The reader still may not block on a consumer: it is the only goroutine that
+// can receive a durable heartbeat receipt, so parking it behind a full backlog
+// would deadlock a consumer waiting on that receipt. Past this budget the
+// controller therefore still fails closed — the shim keeps the harness and the
+// session is released to quarantine. What changed is WHERE that line sits.
+const EventBacklogBudget = ptyhost.DefaultRingBytes
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
@@ -340,7 +362,7 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	_ = conn.SetDeadline(time.Time{})
 
 	if c.selected >= shimwire.V3 {
-		c.eventQueue = make(chan ControllerEvent, selectedV3EventQueueLimit)
+		c.backlog = newEventBacklog(opts.eventBacklogBudget())
 		go c.dispatchEvents()
 	}
 	go c.readLoop()
@@ -846,7 +868,7 @@ func (c *Controller) Close() error {
 func (c *Controller) readLoop() {
 	defer close(c.done)
 	if c.selected >= shimwire.V3 {
-		defer close(c.eventQueue)
+		defer c.backlog.close()
 	} else {
 		defer close(c.events)
 	}
@@ -1056,14 +1078,7 @@ func (c *Controller) publishHostFrameEvent(ev ControllerEvent, stream *hostFrame
 
 func (c *Controller) publishEvent(event ControllerEvent) error {
 	if c.selected >= shimwire.V3 {
-		select {
-		case c.eventQueue <- event:
-			return nil
-		case <-c.closing:
-			return io.EOF
-		default:
-			return errors.New("sessionshim: selected-v3 priority event queue exceeded its bound")
-		}
+		return c.backlog.push(event)
 	}
 	select {
 	case c.events <- event:
@@ -1075,13 +1090,103 @@ func (c *Controller) publishEvent(event ControllerEvent) error {
 
 func (c *Controller) dispatchEvents() {
 	defer close(c.events)
-	for event := range c.eventQueue {
+	for {
+		event, ok := c.backlog.pop()
+		if !ok {
+			return
+		}
 		select {
 		case c.events <- event:
 		case <-c.closing:
 			return
 		}
 	}
+}
+
+// ErrEventBacklogExceeded reports a consumer that fell further behind than the
+// shim's own in-flight budget. It is a fail-closed decision, not a transport
+// error: the connection is dropped, the shim keeps the harness.
+var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
+
+// eventBacklog is the bounded hand-off between the socket reader and the
+// consumer, accounted in payload bytes rather than frames.
+//
+// Frames are not uniform. A frame count cannot bound memory (one frame may be
+// megabytes) and cannot express "as much as the shim itself will hold", which is
+// the only bound with a principled source. Bytes do both.
+type eventBacklog struct {
+	mu     sync.Mutex
+	cond   *sync.Cond
+	queue  []ControllerEvent
+	bytes  int
+	budget int
+	closed bool
+}
+
+func newEventBacklog(budget int) *eventBacklog {
+	if budget <= 0 {
+		budget = EventBacklogBudget
+	}
+	b := &eventBacklog{budget: budget}
+	b.cond = sync.NewCond(&b.mu)
+	return b
+}
+
+func eventBacklogCost(event ControllerEvent) int {
+	return eventBacklogOverheadBytes + len(event.FrameBytes) + len(event.Data) + len(event.Snapshot.Screen)
+}
+
+// push queues one event, or fails closed when the consumer has fallen further
+// behind than the budget allows. It never blocks: the socket reader is the only
+// goroutine that can deliver a durable heartbeat receipt, and parking it here
+// would deadlock a consumer waiting on one.
+func (b *eventBacklog) push(event ControllerEvent) error {
+	cost := eventBacklogCost(event)
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.closed {
+		return io.EOF
+	}
+	// A single event larger than the whole budget is still accepted when the
+	// backlog is otherwise empty, exactly as the shim's ring retains one
+	// oversized frame: refusing it would strand a session on one big redraw.
+	if len(b.queue) > 0 && b.bytes+cost > b.budget {
+		return fmt.Errorf("%w of %d bytes", ErrEventBacklogExceeded, b.budget)
+	}
+	b.queue = append(b.queue, event)
+	b.bytes += cost
+	b.cond.Signal()
+	return nil
+}
+
+// pop blocks until an event is available or the backlog is closed and drained.
+func (b *eventBacklog) pop() (ControllerEvent, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	for len(b.queue) == 0 && !b.closed {
+		b.cond.Wait()
+	}
+	if len(b.queue) == 0 {
+		return ControllerEvent{}, false
+	}
+	event := b.queue[0]
+	b.queue = b.queue[1:]
+	b.bytes -= eventBacklogCost(event)
+	return event, true
+}
+
+func (b *eventBacklog) close() {
+	b.mu.Lock()
+	b.closed = true
+	b.cond.Broadcast()
+	b.mu.Unlock()
+}
+
+// queuedBytes reports the current backlog depth. Diagnostics and tests only.
+func (b *eventBacklog) queuedBytes() int {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.bytes
 }
 
 func decodeHostFrameEvent(body []byte) (ControllerEvent, error) {

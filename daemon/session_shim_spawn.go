@@ -144,6 +144,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	)
 	controllerOpts := sessionshim.ControllerOptions{
 		ControllerID:          d.controllerID(),
+		EventBacklogBudget:    cfg.EventBacklogBudget,
 		ExpectedWorkarea:      workarea,
 		ExpectedWorkareaRoot:  layout.Root.String(),
 		DialTimeout:           cfg.launchTimeout(),
