@@ -33,6 +33,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   honestly instead of failing against a closed socket. A consumer whose
   connection ended can no longer evict a replacement controller that already
   owns the same session.
+- **The controller's absorption guarantee is a named number.**
+  `sessionshim.EventBacklogSlack` is the burst a consumer may be behind by at
+  one instant — the selected-v3 priority queue plus the public event buffer —
+  and beyond it the reader still fails closed, because it is the only goroutine
+  that can receive a durable heartbeat receipt and must never park behind a
+  consumer waiting on one. Consumers can now size a burst against the guarantee
+  instead of a literal.
 - **A fail-closed stream drop says why.** Every such decision in the controller's
   read loop closed the socket silently, which left the reason invisible at every
   later caller. Each one now logs the session and the exact reason before
