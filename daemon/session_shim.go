@@ -532,6 +532,28 @@ type SessionShimConfig struct {
 	// not call back into adoption, publication, or heartbeat acknowledgement.
 	OnCarrierActivationAcknowledged func(SessionShimPublishedBatchReceipt)
 
+	// OnAdoptionActivated announces that an adoption publication has completed
+	// carrier activation for one scope and is now waiting only for the control
+	// plane to echo that exact revision back on heartbeat. It runs once per
+	// scope still awaiting acknowledgement, in scope order.
+	//
+	// It exists for an embedder that owns a scope's own heartbeat lane. Donmai
+	// rings the lane it owns immediately (HeartbeatService.SendNow) so a
+	// dynamically published adoption does not sit behind a full heartbeat
+	// interval; this hook is that same edge offered to lanes donmai does not
+	// own, so a satellite scope need not wait one out either.
+	//
+	// Optional, best-effort, bounded by CallbackTimeout, and never fatal — an
+	// adoption that already committed is not undone by a hook. It MAY call
+	// heartbeat send paths; it MUST NOT call back into adoption or publication.
+	//
+	// Ordering: donmai fires this AFTER its own immediate beat, and on the
+	// dynamic launch path only once the publication serialization barrier has
+	// been released. Firing it under that barrier would forbid the very thing
+	// the hook is for — a beat whose acknowledgement needs the same barrier
+	// would deadlock against the launch that raised it.
+	OnAdoptionActivated func(ctx context.Context, scope, adoptionRevision string)
+
 	// CallbackTimeout bounds PrepareAdoption, OnAdoption, and
 	// OnTerminalEvidence. Zero uses the launch timeout/default.
 	CallbackTimeout time.Duration
@@ -739,6 +761,60 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 		// proof-v2 fence; ResumeContext remains the explicit admission edge for a
 		// manual pause or non-terminal drain.
 		d.sessionShimReadinessWithdrawn.Store(false)
+	}
+}
+
+// sessionShimActivatedScope is one scope whose adoption publication has
+// completed carrier activation and is still waiting for the control plane to
+// echo that revision back on heartbeat.
+type sessionShimActivatedScope struct {
+	scope    string
+	revision string
+}
+
+// sessionShimActivatedScopes snapshots those scopes, in scope order.
+//
+// It reports nothing unless carrier activation is actually complete. The
+// projection a beat would carry is refused until then (see
+// SessionShimHeartbeatProjection), so announcing activation earlier would be
+// announcing a state this daemon cannot yet prove.
+func (d *Daemon) sessionShimActivatedScopes() []sessionShimActivatedScope {
+	if d.shims == nil {
+		return nil
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	if !d.shims.carrierActivationComplete || len(d.shims.pendingHeartbeatAcks) == 0 {
+		return nil
+	}
+	out := make([]sessionShimActivatedScope, 0, len(d.shims.pendingHeartbeatAcks))
+	for scope, revision := range d.shims.pendingHeartbeatAcks {
+		out = append(out, sessionShimActivatedScope{scope: scope, revision: revision})
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].scope < out[j].scope })
+	return out
+}
+
+// notifySessionShimAdoptionActivated offers OnAdoptionActivated one already
+// snapshotted scope at a time.
+//
+// The snapshot is taken by the caller BEFORE any beat this daemon rings itself,
+// so the set announced is the one that existed when activation completed rather
+// than whatever survived donmai's own acknowledgement. Best-effort and
+// infallible by construction: the hook returns nothing, each call is bounded by
+// CallbackTimeout, and every scope is offered even if an earlier one was slow —
+// the acknowledgement each hook chases is per-scope.
+func (d *Daemon) notifySessionShimAdoptionActivated(ctx context.Context, scopes []sessionShimActivatedScope) {
+	hook := d.sessionShimConfig().OnAdoptionActivated
+	if hook == nil {
+		return
+	}
+	for _, activated := range scopes {
+		func() {
+			hookCtx, cancel := d.sessionShimCallbackContext(ctx)
+			defer cancel()
+			hook(hookCtx, activated.scope, activated.revision)
+		}()
 	}
 }
 
@@ -1281,6 +1357,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		return fmt.Errorf("session shim: activate published carriers: %w", activationErr)
 	}
 	carrierActivationSettled = true
+	// Startup's own beat is StartSynchronized, which Daemon.Start rings for the
+	// scope it owns. Announce the activated set here so an embedder holding a
+	// lane donmai does not own can ring that one too.
+	d.notifySessionShimAdoptionActivated(ctx, d.sessionShimActivatedScopes())
 	for _, tombstone := range result.Tombstoned {
 		if removeErr := registry.RemoveTombstoneIncarnation(tombstone); removeErr != nil {
 			slog.Warn("session shim: dispose startup tombstone after durable terminal handoff",

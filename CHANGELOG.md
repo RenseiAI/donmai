@@ -8,6 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **A session shim adopted after startup no longer waits out a heartbeat
+  interval.** Publishing an adoption dynamically raises the recovery barrier,
+  and that barrier clears only on an acknowledged heartbeat — so a host that had
+  already finished carrier activation kept claiming no new work, and did not
+  read as adoption-complete to its control plane, until the periodic ticker
+  happened to fire (up to 30s by default). The daemon now rings one immediate
+  beat the moment activation completes, collapsing that window to a single round
+  trip. Embedders that own a scope's own heartbeat lane can do the same through
+  the new optional `SessionShimConfig.OnAdoptionActivated` hook, and
+  `HeartbeatService.SendNow` sends exactly one out-of-band beat without starting
+  or racing the periodic loop.
+
 ## v0.68.12 — 2026-08-24
 
 ### Fixes
