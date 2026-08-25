@@ -109,16 +109,20 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	// This is the literal pre-publication crash/disk-failure window: daemon
 	// mutation accepts first, then the ordinary state.json write fails. Recovery
 	// must consume only the exact durable ready record, never a PID/prefix guess.
+	// It calls production quarantineArm: omitting the completion helper, or
+	// publishing state before its control mutation, makes this control go RED.
 	dir := t.TempDir()
 	stateDir := filepath.Join(dir, "state")
 	registryDir := filepath.Join(dir, "registry")
+	const orgID = "org-acceptance"
+	const sessionID = "session-acceptance"
 	if err := os.Mkdir(stateDir, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := sessionshim.NewRegistry(registryDir); err != nil {
 		t.Fatal(err)
 	}
-	cfg := config{stateDir: stateDir, registry: registryDir}
+	cfg := config{stateDir: stateDir, registry: registryDir, daemonURL: testAdoptedSessionServer(t, orgID, sessionID)}
 	if err := cfg.saveState(state{}); err != nil {
 		t.Fatal(err)
 	}
@@ -126,26 +130,20 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	if err != nil {
 		t.Fatal(err)
 	}
-	const orgID = "org-acceptance"
-	const sessionID = "session-acceptance"
-	const shimID = "0123456789abcdef0123456789abcdef"
-	name := acceptanceHelperName(orgID, sessionID, shimID)
-	helper := helperState{
-		OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: 1,
-		// Reuse this test process's PID with a mismatched start time: cleanup
-		// must treat it as gone and must not create the helper stop signal.
-		PID: self.PID, ProcessStartedAt: self.StartedAt + 1, HarnessPID: 1,
-		RecordPath: filepath.Join(registryDir, name+".json"),
-		SocketPath: filepath.Join(registryDir, name+".sock"),
-		ReadyPath:  filepath.Join(stateDir, name+".ready.json"),
-		StopPath:   filepath.Join(stateDir, name+".stop"),
-	}
-	ready, err := json.Marshal(helper)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if err := atomicWrite(helper.ReadyPath, ready, 0o600); err != nil {
-		t.Fatal(err)
+	var helper helperState
+	cfg.launchHelperFn = func(launch helperLaunch) error {
+		helper = helperState{
+			OrgID: launch.OrgID, SessionID: launch.SessionID, ShimID: launch.ShimID, ProcessEpoch: launch.ProcessEpoch,
+			// Reuse this test process's PID with a mismatched start time: cleanup
+			// must treat it as gone and must not create the helper stop signal.
+			PID: self.PID, ProcessStartedAt: self.StartedAt + 1, HarnessPID: 1,
+			RecordPath: launch.RecordPath, SocketPath: launch.SocketPath, ReadyPath: launch.ReadyPath, StopPath: launch.StopPath,
+		}
+		ready, err := json.Marshal(helper)
+		if err != nil {
+			return err
+		}
+		return atomicWrite(helper.ReadyPath, ready, 0o600)
 	}
 
 	var calls []controlRequest
@@ -170,7 +168,7 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	}
 	cfg.unsetServiceEnvFunc = func(string) error { return nil }
 
-	err = cfg.completeQuarantineArm(&state{}, controlRequest{OrgID: orgID, SessionID: sessionID}, helper)
+	err = cfg.quarantineArm(sessionID)
 	if err == nil || err.Error() != "injected state disk failure" {
 		t.Fatalf("post-mutation state publication = %v, want injected disk failure", err)
 	}
@@ -183,7 +181,7 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	if err := cfg.cleanup(sessionID); err != nil {
 		t.Fatalf("recover exact helper after state publication failure: %v", err)
 	}
-	if len(calls) != 2 || calls[1] != (controlRequest{OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: 1}) {
+	if len(calls) != 2 || calls[1] != (controlRequest{OrgID: orgID, SessionID: sessionID, ShimID: helper.ShimID, ProcessEpoch: 1}) {
 		t.Fatalf("recovery calls = %+v, want exact clear correlation", calls)
 	}
 	if pathExists(helper.ReadyPath) {
@@ -199,6 +197,78 @@ func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing
 	if err := cfg.cleanup(sessionID); err != nil {
 		t.Fatalf("idempotent recovered cleanup: %v", err)
 	}
+}
+
+func TestQuarantineArmStopsHelperOnlyWhenControlFails(t *testing.T) {
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	registryDir := filepath.Join(dir, "registry")
+	const orgID = "org-control-failure"
+	const sessionID = "session-control-failure"
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionshim.NewRegistry(registryDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{stateDir: stateDir, registry: registryDir, daemonURL: testAdoptedSessionServer(t, orgID, sessionID)}
+	if err := cfg.saveState(state{}); err != nil {
+		t.Fatal(err)
+	}
+	self, err := sessionshim.Self()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var helper helperState
+	cfg.launchHelperFn = func(launch helperLaunch) error {
+		helper = helperState{
+			OrgID: launch.OrgID, SessionID: launch.SessionID, ShimID: launch.ShimID, ProcessEpoch: launch.ProcessEpoch,
+			PID: self.PID, ProcessStartedAt: self.StartedAt + 1, HarnessPID: 1,
+			RecordPath: launch.RecordPath, SocketPath: launch.SocketPath, ReadyPath: launch.ReadyPath, StopPath: launch.StopPath,
+		}
+		raw, err := json.Marshal(helper)
+		if err != nil {
+			return err
+		}
+		return atomicWrite(helper.ReadyPath, raw, 0o600)
+	}
+	cfg.controlFn = func(action string, request controlRequest) error {
+		if action != "quarantine-arm" || request != (controlRequest{OrgID: orgID, SessionID: sessionID}) {
+			return errors.New("unexpected control correlation")
+		}
+		return errors.New("injected control refusal")
+	}
+
+	err = cfg.quarantineArm(sessionID)
+	if err == nil || err.Error() != "injected control refusal" {
+		t.Fatalf("control failure = %v, want injected control refusal", err)
+	}
+	if !pathExists(helper.StopPath) {
+		t.Fatal("control failure did not write the exact helper stop signal")
+	}
+	loaded, err := cfg.loadState()
+	if err != nil || loaded.Helper != nil {
+		t.Fatalf("control failure published helper state = %+v, %v", loaded, err)
+	}
+}
+
+func testAdoptedSessionServer(t *testing.T, orgID, sessionID string) string {
+	t.Helper()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodGet || r.URL.Path != "/api/daemon/status" {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{
+			"sessionShim": map[string]any{
+				"adopted": []map[string]any{{
+					"orgId": orgID, "sessionId": sessionID, "shimId": "owned", "processEpoch": 1,
+				}},
+			},
+		})
+	}))
+	t.Cleanup(server.Close)
+	return server.URL
 }
 
 func writeTestExecutable(t *testing.T, path, content string) {

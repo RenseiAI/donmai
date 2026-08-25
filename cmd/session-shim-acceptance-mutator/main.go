@@ -51,6 +51,7 @@ type config struct {
 	controlFn           func(string, controlRequest) error
 	saveStateFn         func(state) error
 	unsetServiceEnvFunc func(string) error
+	launchHelperFn      func(helperLaunch) error
 }
 
 type state struct {
@@ -301,15 +302,14 @@ func (c config) quarantineArm(sessionID string) error {
 	socketPath := filepath.Join(c.registry, name+".sock")
 	readyPath := filepath.Join(c.stateDir, name+".ready.json")
 	stopPath := filepath.Join(c.stateDir, name+".stop")
-	process, err := startDetachedSelf(helperLaunch{
+	launch := helperLaunch{
 		OrgID: correlation.OrgID, SessionID: sessionID, ShimID: shimID,
 		ProcessEpoch: processEpoch, RegistryDir: c.registry,
 		RecordPath: recordPath, SocketPath: socketPath, ReadyPath: readyPath, StopPath: stopPath,
-	})
-	if err != nil {
+	}
+	if err := c.launchHelper(launch); err != nil {
 		return fmt.Errorf("start incompatible shim fixture: %w", err)
 	}
-	_ = process.Release()
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	var helper helperState
@@ -321,14 +321,9 @@ func (c config) quarantineArm(sessionID string) error {
 	if err := c.validateHelperReady(helper); err != nil {
 		return fmt.Errorf("incompatible helper ready correlation: %w", err)
 	}
-	if err := c.control("quarantine-arm", correlation); err != nil {
+	return c.completeQuarantineArm(&current, correlation, helper, func() {
 		_ = atomicWrite(stopPath, []byte("stop\n"), 0o600)
-		return err
-	}
-	// Do not stop the helper if the ordinary state publication fails here. Its
-	// already-durable ready correlation is the only authority a later cleanup
-	// needs to recover this exact post-mutation window.
-	return c.publishQuarantineState(&current, correlation, helper)
+	})
 }
 
 func (c config) quarantineClear(sessionID string) error {
@@ -556,11 +551,29 @@ func (c config) validateHelperReady(helper helperState) error {
 	return nil
 }
 
-func (c config) completeQuarantineArm(current *state, correlation controlRequest, helper helperState) error {
+func (c config) completeQuarantineArm(current *state, correlation controlRequest, helper helperState, onControlFailure func()) error {
 	if err := c.control("quarantine-arm", correlation); err != nil {
+		if onControlFailure != nil {
+			onControlFailure()
+		}
 		return err
 	}
+	// Do not invoke onControlFailure after this point. The ready record is
+	// already durable, and a state-write error must leave the exact helper alive
+	// for a later cleanup to rediscover.
 	return c.publishQuarantineState(current, correlation, helper)
+}
+
+func (c config) launchHelper(launch helperLaunch) error {
+	if c.launchHelperFn != nil {
+		return c.launchHelperFn(launch)
+	}
+	process, err := startDetachedSelf(launch)
+	if err != nil {
+		return err
+	}
+	_ = process.Release()
+	return nil
 }
 
 func (c config) publishQuarantineState(current *state, correlation controlRequest, helper helperState) error {
