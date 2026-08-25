@@ -45,6 +45,11 @@ type config struct {
 	daemonURL string
 	candidate string
 	tokenFile string
+
+	// Test seams only. Production always uses the methods below, which retain
+	// the authenticated loopback control and durable state writer.
+	controlFn   func(string, controlRequest) error
+	saveStateFn func(state) error
 }
 
 type state struct {
@@ -64,6 +69,7 @@ type helperState struct {
 	HarnessPID       int    `json:"harnessPid"`
 	RecordPath       string `json:"recordPath"`
 	SocketPath       string `json:"socketPath"`
+	ReadyPath        string `json:"readyPath"`
 	StopPath         string `json:"stopPath"`
 }
 
@@ -289,8 +295,7 @@ func (c config) quarantineArm(sessionID string) error {
 		return err
 	}
 	processEpoch := uint64(1)
-	digest := sha256.Sum256([]byte(correlation.OrgID + "\x00" + sessionID + "\x00" + shimID))
-	name := "acceptance-" + hex.EncodeToString(digest[:16])
+	name := acceptanceHelperName(correlation.OrgID, sessionID, shimID)
 	recordPath := filepath.Join(c.registry, name+".json")
 	socketPath := filepath.Join(c.registry, name+".sock")
 	readyPath := filepath.Join(c.stateDir, name+".ready.json")
@@ -312,15 +317,17 @@ func (c config) quarantineArm(sessionID string) error {
 	}); err != nil {
 		return err
 	}
-	if helper.OrgID != correlation.OrgID || helper.SessionID != sessionID || helper.ShimID != shimID || helper.ProcessEpoch != processEpoch || helper.RecordPath != recordPath || helper.SocketPath != socketPath || helper.StopPath != stopPath {
-		return errors.New("incompatible helper changed exact correlation")
+	if err := c.validateHelperReady(helper); err != nil {
+		return fmt.Errorf("incompatible helper ready correlation: %w", err)
 	}
 	if err := c.control("quarantine-arm", correlation); err != nil {
 		_ = atomicWrite(stopPath, []byte("stop\n"), 0o600)
 		return err
 	}
-	current.OrgID, current.SessionID, current.Helper = correlation.OrgID, sessionID, &helper
-	return c.saveState(current)
+	// Do not stop the helper if the ordinary state publication fails here. Its
+	// already-durable ready correlation is the only authority a later cleanup
+	// needs to recover this exact post-mutation window.
+	return c.publishQuarantineState(&current, correlation, helper)
 }
 
 func (c config) quarantineClear(sessionID string) error {
@@ -328,20 +335,50 @@ func (c config) quarantineClear(sessionID string) error {
 	if err != nil {
 		return err
 	}
-	if current.Helper == nil {
-		return nil
+	helper := current.Helper
+	if helper == nil {
+		recovered, err := c.recoverReadyHelper(sessionID)
+		if err != nil {
+			return err
+		}
+		if recovered == nil {
+			return nil
+		}
+		helper = recovered
 	}
-	helper := *current.Helper
 	if helper.SessionID != sessionID {
 		return errors.New("quarantine clear changed session identity")
 	}
-	if err := atomicWrite(helper.StopPath, []byte("stop\n"), 0o600); err != nil {
+	if err := c.validateHelperReady(*helper); err != nil {
+		return fmt.Errorf("invalid exact helper correlation: %w", err)
+	}
+	process := sessionshim.ProcessIdentity{PID: helper.PID, StartedAt: helper.ProcessStartedAt}
+	alive, err := process.Alive()
+	if err != nil {
 		return err
+	}
+	if alive {
+		present, err := c.exactHelperRecordPresent(*helper)
+		if err != nil {
+			return err
+		}
+		if !present || !pathExists(helper.SocketPath) {
+			return errors.New("live helper is not bound to its exact ready record and socket")
+		}
+		// This is a private, deterministic stop file for the exact helper. No
+		// PID is ever signalled, so PID reuse cannot target another process.
+		if err := atomicWrite(helper.StopPath, []byte("stop\n"), 0o600); err != nil {
+			return err
+		}
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
 	if err := waitFor(ctx, 50*time.Millisecond, func() error {
-		if processAlive(helper.PID) || pathExists(helper.RecordPath) || pathExists(helper.SocketPath) {
+		gone, err := c.helperGone(*helper)
+		if err != nil {
+			return err
+		}
+		if !gone {
 			return errors.New("incompatible helper remains live")
 		}
 		return nil
@@ -352,8 +389,12 @@ func (c config) quarantineClear(sessionID string) error {
 	if err := c.control("quarantine-clear", correlation); err != nil {
 		return err
 	}
+	current.OrgID, current.SessionID = helper.OrgID, helper.SessionID
 	current.Helper = nil
-	return c.saveState(current)
+	if err := c.saveState(current); err != nil {
+		return err
+	}
+	return c.removeReadyHelper(*helper)
 }
 
 func (c config) cleanup(sessionID string) error {
@@ -406,6 +447,9 @@ func (c config) resolveSession(sessionID string) (controlRequest, error) {
 }
 
 func (c config) control(action string, body controlRequest) error {
+	if c.controlFn != nil {
+		return c.controlFn(action, body)
+	}
 	tokenRoot, err := os.OpenRoot(filepath.Dir(c.tokenFile))
 	if err != nil {
 		return err
@@ -470,6 +514,142 @@ func (c config) request(method, path, bearer string, body, out any, allowed ...i
 
 func (c config) statePath() string { return filepath.Join(c.stateDir, "state.json") }
 
+func acceptanceHelperName(orgID, sessionID, shimID string) string {
+	digest := sha256.Sum256([]byte(orgID + "\x00" + sessionID + "\x00" + shimID))
+	return "acceptance-" + hex.EncodeToString(digest[:16])
+}
+
+// validateHelperReady accepts only the helper state this mutator itself creates.
+// Recovery can enumerate this fixed, hash-named namespace after a crash, but it
+// never guesses at a record, socket, PID, or a caller-provided path.
+func (c config) validateHelperReady(helper helperState) error {
+	id := sessionshim.Identity{OrgID: helper.OrgID, SessionID: helper.SessionID}
+	if err := id.Validate(); err != nil {
+		return err
+	}
+	if helper.ShimID == "" || helper.ProcessEpoch == 0 || helper.PID <= 0 || helper.ProcessStartedAt <= 0 || helper.HarnessPID <= 0 {
+		return errors.New("helper is missing exact process correlation")
+	}
+	name := acceptanceHelperName(helper.OrgID, helper.SessionID, helper.ShimID)
+	if helper.RecordPath != filepath.Join(c.registry, name+".json") ||
+		helper.SocketPath != filepath.Join(c.registry, name+".sock") ||
+		helper.ReadyPath != filepath.Join(c.stateDir, name+".ready.json") ||
+		helper.StopPath != filepath.Join(c.stateDir, name+".stop") {
+		return errors.New("helper paths do not match its exact correlation")
+	}
+	return nil
+}
+
+func (c config) completeQuarantineArm(current *state, correlation controlRequest, helper helperState) error {
+	if err := c.control("quarantine-arm", correlation); err != nil {
+		return err
+	}
+	return c.publishQuarantineState(current, correlation, helper)
+}
+
+func (c config) publishQuarantineState(current *state, correlation controlRequest, helper helperState) error {
+	// The helper's ready file was atomically fsynced before the daemon mutation.
+	// A crash or state-disk failure here is therefore recoverable without a broad
+	// registry scan or a signal to a bare/reused PID.
+	current.OrgID, current.SessionID, current.Helper = correlation.OrgID, correlation.SessionID, &helper
+	return c.saveState(*current)
+}
+
+func (c config) recoverReadyHelper(sessionID string) (*helperState, error) {
+	entries, err := os.ReadDir(c.stateDir)
+	if errors.Is(err, os.ErrNotExist) {
+		return nil, nil
+	}
+	if err != nil {
+		return nil, err
+	}
+	var recovered *helperState
+	for _, entry := range entries {
+		name := entry.Name()
+		// This is not a prefix sweep of registry records: the state directory is
+		// private to this mutator and this exact suffix is the only durable ready
+		// namespace it publishes.
+		if entry.IsDir() || !strings.HasPrefix(name, "acceptance-") || !strings.HasSuffix(name, ".ready.json") {
+			continue
+		}
+		var helper helperState
+		path := filepath.Join(c.stateDir, name)
+		if err := decodeStrictFile(path, &helper); err != nil {
+			return nil, fmt.Errorf("decode mutator ready correlation %q: %w", name, err)
+		}
+		if err := c.validateHelperReady(helper); err != nil {
+			return nil, fmt.Errorf("validate mutator ready correlation %q: %w", name, err)
+		}
+		if helper.ReadyPath != path {
+			return nil, errors.New("mutator ready correlation path changed")
+		}
+		if sessionID != "" && helper.SessionID != sessionID {
+			continue
+		}
+		if recovered != nil {
+			return nil, errors.New("multiple exact mutator helpers match cleanup")
+		}
+		recoveredHelper := helper
+		recovered = &recoveredHelper
+	}
+	return recovered, nil
+}
+
+func (c config) exactHelperRecordPresent(helper helperState) (bool, error) {
+	registry, err := sessionshim.NewRegistry(c.registry)
+	if err != nil {
+		return false, err
+	}
+	entries, err := registry.Scan()
+	if err != nil {
+		return false, err
+	}
+	for _, entry := range entries {
+		if entry.Name != filepath.Base(helper.RecordPath) {
+			continue
+		}
+		if entry.Err != nil {
+			return false, fmt.Errorf("read exact helper record: %w", entry.Err)
+		}
+		record := entry.Record
+		if record.Identity() != (sessionshim.Identity{OrgID: helper.OrgID, SessionID: helper.SessionID}) ||
+			record.ShimID != helper.ShimID || record.ProcessEpoch != helper.ProcessEpoch ||
+			record.PID != helper.PID || record.ProcessStartedAt != helper.ProcessStartedAt ||
+			record.SocketPath != helper.SocketPath {
+			return false, errors.New("exact helper record correlation changed")
+		}
+		return true, nil
+	}
+	return false, nil
+}
+
+func (c config) helperGone(helper helperState) (bool, error) {
+	alive, err := (sessionshim.ProcessIdentity{PID: helper.PID, StartedAt: helper.ProcessStartedAt}).Alive()
+	if err != nil {
+		return false, err
+	}
+	present, err := c.exactHelperRecordPresent(helper)
+	if err != nil {
+		return false, err
+	}
+	return !alive && !present && !pathExists(helper.SocketPath), nil
+}
+
+func (c config) removeReadyHelper(helper helperState) error {
+	if err := c.validateHelperReady(helper); err != nil {
+		return err
+	}
+	root, err := os.OpenRoot(c.stateDir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	if err := root.Remove(filepath.Base(helper.ReadyPath)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
 func (c config) loadState() (state, error) {
 	var out state
 	if err := decodeStrictFile(c.statePath(), &out); err != nil {
@@ -483,6 +663,9 @@ func (c config) loadState() (state, error) {
 
 func (c config) saveState(value state) error {
 	value.SchemaVersion = stateSchema
+	if c.saveStateFn != nil {
+		return c.saveStateFn(value)
+	}
 	raw, err := json.Marshal(value)
 	if err != nil {
 		return err
@@ -598,7 +781,7 @@ func holdIncompatible() error {
 	ready := helperState{
 		OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: processEpoch,
 		PID: self.PID, ProcessStartedAt: self.StartedAt, HarnessPID: harness.Process.Pid,
-		RecordPath: recordPath, SocketPath: socketPath, StopPath: stopPath,
+		RecordPath: recordPath, SocketPath: socketPath, ReadyPath: readyPath, StopPath: stopPath,
 	}
 	readyRaw, _ := json.Marshal(ready)
 	if err := atomicWrite(readyPath, readyRaw, 0o600); err != nil {
@@ -776,9 +959,15 @@ func atomicWrite(path string, raw []byte, mode os.FileMode) error {
 		return err
 	}
 	d, err := root.Open(".")
-	if err == nil {
-		_ = d.Sync()
+	if err != nil {
+		return err
+	}
+	if err := d.Sync(); err != nil {
 		_ = d.Close()
+		return err
+	}
+	if err := d.Close(); err != nil {
+		return err
 	}
 	return nil
 }
@@ -827,13 +1016,6 @@ func randomHex(size int) (string, error) {
 		return "", err
 	}
 	return hex.EncodeToString(raw), nil
-}
-
-func processAlive(pid int) bool {
-	if pid <= 0 {
-		return false
-	}
-	return syscall.Kill(pid, 0) == nil
 }
 
 func pathExists(path string) bool {

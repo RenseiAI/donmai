@@ -2,12 +2,15 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"runtime"
 	"testing"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 func TestCheckIsNonMutatingAndRequiresExactPaths(t *testing.T) {
@@ -99,6 +102,101 @@ func TestPreparePublishesPrivateTokenThroughServiceManager(t *testing.T) {
 	loaded, err := cfg.loadState()
 	if err != nil || loaded.SchemaVersion != stateSchema {
 		t.Fatalf("prepared state = %+v, %v", loaded, err)
+	}
+}
+
+func TestQuarantineArmStatePublicationFailureRecoversExactReadyHelper(t *testing.T) {
+	// This is the literal pre-publication crash/disk-failure window: daemon
+	// mutation accepts first, then the ordinary state.json write fails. Recovery
+	// must consume only the exact durable ready record, never a PID/prefix guess.
+	dir := t.TempDir()
+	stateDir := filepath.Join(dir, "state")
+	registryDir := filepath.Join(dir, "registry")
+	if err := os.Mkdir(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := sessionshim.NewRegistry(registryDir); err != nil {
+		t.Fatal(err)
+	}
+	cfg := config{stateDir: stateDir, registry: registryDir}
+	if err := cfg.saveState(state{}); err != nil {
+		t.Fatal(err)
+	}
+	self, err := sessionshim.Self()
+	if err != nil {
+		t.Fatal(err)
+	}
+	const orgID = "org-acceptance"
+	const sessionID = "session-acceptance"
+	const shimID = "0123456789abcdef0123456789abcdef"
+	name := acceptanceHelperName(orgID, sessionID, shimID)
+	helper := helperState{
+		OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: 1,
+		// Reuse this test process's PID with a mismatched start time: cleanup
+		// must treat it as gone and must not create the helper stop signal.
+		PID: self.PID, ProcessStartedAt: self.StartedAt + 1, HarnessPID: 1,
+		RecordPath: filepath.Join(registryDir, name+".json"),
+		SocketPath: filepath.Join(registryDir, name+".sock"),
+		ReadyPath:  filepath.Join(stateDir, name+".ready.json"),
+		StopPath:   filepath.Join(stateDir, name+".stop"),
+	}
+	ready, err := json.Marshal(helper)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := atomicWrite(helper.ReadyPath, ready, 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	var calls []controlRequest
+	cfg.controlFn = func(action string, request controlRequest) error {
+		switch action {
+		case "quarantine-arm", "quarantine-clear":
+			calls = append(calls, request)
+			return nil
+		default:
+			return errors.New("unexpected control action")
+		}
+	}
+	cfg.saveStateFn = func(value state) error {
+		if value.Helper != nil {
+			return errors.New("injected state disk failure")
+		}
+		raw, err := json.Marshal(value)
+		if err != nil {
+			return err
+		}
+		return atomicWrite(cfg.statePath(), raw, 0o600)
+	}
+
+	err = cfg.completeQuarantineArm(&state{}, controlRequest{OrgID: orgID, SessionID: sessionID}, helper)
+	if err == nil || err.Error() != "injected state disk failure" {
+		t.Fatalf("post-mutation state publication = %v, want injected disk failure", err)
+	}
+	if len(calls) != 1 || calls[0] != (controlRequest{OrgID: orgID, SessionID: sessionID}) {
+		t.Fatalf("mutation calls = %+v, want one arm for the adopted lifecycle", calls)
+	}
+
+	// GREEN: state.json contains no Helper, yet exact recovery finds only the
+	// durable ready correlation and clears that exact incarnation idempotently.
+	if err := cfg.quarantineClear(sessionID); err != nil {
+		t.Fatalf("recover exact helper after state publication failure: %v", err)
+	}
+	if len(calls) != 2 || calls[1] != (controlRequest{OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: 1}) {
+		t.Fatalf("recovery calls = %+v, want exact clear correlation", calls)
+	}
+	if pathExists(helper.ReadyPath) {
+		t.Fatal("recovered helper ready record remains")
+	}
+	if pathExists(helper.StopPath) {
+		t.Fatal("cleanup wrote a stop signal for a reused PID")
+	}
+	loaded, err := cfg.loadState()
+	if err != nil || loaded.Helper != nil || loaded.SessionID != sessionID || loaded.OrgID != orgID {
+		t.Fatalf("recovered state = %+v, %v", loaded, err)
+	}
+	if err := cfg.quarantineClear(sessionID); err != nil {
+		t.Fatalf("idempotent recovered cleanup: %v", err)
 	}
 }
 
