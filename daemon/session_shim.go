@@ -418,6 +418,14 @@ type SessionShimConfig struct {
 	// are not activated.
 	RequireAuthoritativeSnapshot bool
 
+	// EventBacklogBudget overrides the per-session controller event backlog
+	// budget, in payload bytes. Zero uses sessionshim.EventBacklogBudget, which
+	// equals the shim's own output ring budget. A host running many sessions at
+	// once may want a smaller per-session budget; setting it BELOW what the
+	// shim's ring holds makes the daemon the first component to give up on a
+	// burst again.
+	EventBacklogBudget int
+
 	// OrgID is the organization half of the lifecycle identity (§D2). A
 	// standalone OSS daemon has no organization boundary, so it defaults to
 	// "local" — a real value rather than an empty one, because the identity is
@@ -1094,6 +1102,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	opts := sessionshim.AdoptOptions{
 		Registry:              registry,
 		ControllerID:          d.controllerID(),
+		EventBacklogBudget:    cfg.EventBacklogBudget,
 		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
 		Logger:                slog.Default(),
 	}

@@ -54,6 +54,10 @@ type AdoptOptions struct {
 	// adoption. When set it supersedes the two legacy string-only callbacks.
 	ExpectedWorkareaLayout func(id Identity) (workareaPath, workareaRoot string, err error)
 
+	// EventBacklogBudget overrides the per-controller event backlog budget, in
+	// payload bytes. Zero uses EventBacklogBudget.
+	EventBacklogBudget int
+
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
 	// ProtocolMin/ProtocolMax optionally narrow the adopting controller range.
@@ -419,6 +423,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		LocalResumeFrom:            localResumeFrom,
 		ResumeExternallyConfigured: opts.ResumeFrom != nil,
 		DurableAckGeneration:       durableAckGeneration,
+		EventBacklogBudget:         opts.EventBacklogBudget,
 		ExpectedWorkarea:           expected,
 		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,

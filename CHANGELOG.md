@@ -33,13 +33,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   honestly instead of failing against a closed socket. A consumer whose
   connection ended can no longer evict a replacement controller that already
   owns the same session.
-- **The controller's absorption guarantee is a named number.**
-  `sessionshim.EventBacklogSlack` is the burst a consumer may be behind by at
-  one instant — the selected-v3 priority queue plus the public event buffer —
-  and beyond it the reader still fails closed, because it is the only goroutine
-  that can receive a durable heartbeat receipt and must never park behind a
-  consumer waiting on one. Consumers can now size a burst against the guarantee
-  instead of a literal.
+- **The daemon is no longer the first thing to give up on a burst.** The
+  controller bounded its undrained event backlog by FRAME COUNT (192) while the
+  shim bounds its own output ring by PAYLOAD BYTES (8 MiB). Both numbers answer
+  the same question — how much host output may be in flight before this system
+  admits it has lost some — and they were orders of magnitude apart, so the
+  controller collapsed on volume the shim absorbs by design and the Gap the ring
+  exists to declare became unreachable. The backlog is now bounded in payload
+  bytes by `sessionshim.EventBacklogBudget`, which is defined AS the shim's ring
+  budget, with a test that fails if the two ever diverge. Past the budget the
+  reader still fails closed — it is the only goroutine that can receive a
+  durable heartbeat receipt and must never park behind a consumer waiting on
+  one — and hosts that run many sessions at once can lower the per-session
+  budget through `SessionShimConfig.EventBacklogBudget`.
 - **A fail-closed stream drop says why.** Every such decision in the controller's
   read loop closed the socket silently, which left the reason invisible at every
   later caller. Each one now logs the session and the exact reason before
