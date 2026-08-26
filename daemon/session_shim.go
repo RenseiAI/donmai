@@ -346,17 +346,61 @@ type SessionShimAdoptionPublication struct {
 	Carriers     []SessionShimCarrierActivation
 }
 
-// SessionShimTerminalEvidence is emitted only after a tombstone positively
-// proves process-group reap. It carries every local correlation plus the exact
-// opaque adoption receipt returned above. When a daemon discovers a tombstone
-// after an unplanned gap, Adoption is nil: the callback receives the positive
-// tombstone as such and must not manufacture a live-adoption fact the daemon
-// never observed.
+// SessionShimAbsentAttestation reports a lineage this daemon PROVED it can no
+// longer observe, without ever having watched it terminate.
+//
+// It exists because there are two facts a daemon can hold about a shim that is
+// gone, and only one of them is a tombstone. A shim that exits cleanly writes
+// its own terminal record: exit code, last sequence, and positive proof that
+// it reaped its harness process group. A shim that is SIGKILLed, or whose
+// registry record is removed underneath it, writes nothing — and the lineage
+// it leaves behind is unreportable. It cannot be tombstoned, because no
+// tombstone exists and manufacturing one would forge the reap proof a claim
+// release depends on; and it cannot simply be dropped, because a complete
+// adoption batch that omits a lineage the composer still holds is refused.
+//
+// So this says only what was actually checked, and the receiver must treat it
+// as strictly weaker than a tombstone: enough to stop carrying a lineage that
+// can no longer be observed, never enough to conclude the harness died. The
+// shim vanishing says nothing about the process group it was supervising.
+type SessionShimAbsentAttestation struct {
+	// ProcessIdentityAbsent is true when the recorded (pid, start time) pair is
+	// proven not to be running. The start time is what makes this a proof
+	// rather than a guess: a bare pid can be reused by an unrelated process.
+	ProcessIdentityAbsent bool
+	// RegistryRecordAbsent is true when the shim's registry record is gone.
+	//
+	// Both facts are required together, and they are separate fields rather
+	// than one boolean because either alone means something different: a dead
+	// process with a live record is still adoptable, and a missing record with
+	// a live process is a shim no daemon may forget about.
+	RegistryRecordAbsent bool
+	ObservedAtUnixNano   int64
+}
+
+// Complete reports whether this attestation proves both of its facts. A
+// partial attestation is not weaker evidence, it is no evidence.
+func (a SessionShimAbsentAttestation) Complete() bool {
+	return a.ProcessIdentityAbsent && a.RegistryRecordAbsent && a.ObservedAtUnixNano > 0
+}
+
+// SessionShimTerminalEvidence is emitted after a tombstone positively proves
+// process-group reap, or — carrying Absent instead — after this daemon proved
+// a lineage is no longer observable. It carries every local correlation plus
+// the exact opaque adoption receipt returned above. When a daemon discovers a
+// tombstone after an unplanned gap, Adoption is nil: the callback receives the
+// positive tombstone as such and must not manufacture a live-adoption fact the
+// daemon never observed.
 type SessionShimTerminalEvidence struct {
 	Identity     sessionshim.Identity
 	HostID       string
 	ShimID       string
 	ProcessEpoch uint64
+	// Absent, when set, replaces Tombstone: this evidence proves the lineage is
+	// unobservable, not that it ended. The two are mutually exclusive, and a
+	// receiver that treats an attestation as a reap proof reintroduces exactly
+	// the double execution the restart fence exists to prevent.
+	Absent *SessionShimAbsentAttestation
 	// Adoption is present when this daemon observed the live controller
 	// generation that preceded the terminal fact. It is nil for an orphan
 	// tombstone discovered after restart; D9 permits that authenticated positive
@@ -1879,7 +1923,22 @@ func (d *Daemon) completeSessionShimAdoption(
 }
 
 func (d *Daemon) reportSessionShimTerminalEvidence(ctx context.Context, evidence SessionShimTerminalEvidence) error {
-	if !evidence.Tombstone.GroupReaped {
+	// Exactly one of the two proofs, and it must be a whole one. A report
+	// carrying both would let a receiver pick the stronger reading of a
+	// lineage the daemon only proved unobservable, which is how an
+	// attestation silently becomes a reap proof.
+	switch {
+	case evidence.Absent != nil:
+		if evidence.Tombstone != (sessionshim.Tombstone{}) {
+			return errors.New("session shim: terminal evidence carries both an absent attestation and a tombstone")
+		}
+		if !evidence.Absent.Complete() {
+			return errors.New("session shim: absent attestation does not prove both process and record absence")
+		}
+		if evidence.ShimID == "" || evidence.ProcessEpoch == 0 {
+			return errors.New("session shim: absent attestation requires the exact shim incarnation")
+		}
+	case !evidence.Tombstone.GroupReaped:
 		return errors.New("session shim: terminal tombstone does not prove process-group reap")
 	}
 	hook := d.sessionShimConfig().OnTerminalEvidence
