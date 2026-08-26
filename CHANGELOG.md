@@ -10,6 +10,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.68.16 — 2026-08-26
+
+### Features
+
+- **Public session clients now preserve the work-before-working boundary.**
+  `starting` is a first-class active status for session lists and watch
+  surfaces, without being rendered as `working`. `timed_out` is a first-class
+  terminal status, so stream and detail watchers stop instead of polling
+  forever. Human and JSON output retain both values, the detail timeline names
+  them distinctly, and unknown future status strings still decode without
+  being discarded.
+
+---
+
 ## v0.68.15 — 2026-08-26
 
 ### Features
