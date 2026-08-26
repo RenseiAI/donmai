@@ -313,6 +313,34 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	if err != nil || present {
 		return errors.New("mutator-owned shim record remains live")
 	}
+	// Report what the two checks above just proved BEFORE forgetting the
+	// lineage. Dropping it from the projection first is what made the next
+	// complete batch incomplete: the composer still held a live obligation for
+	// a lineage this daemon had stopped reporting, and refused every batch
+	// after it. The attestation is not a tombstone and does not claim to be —
+	// no tombstone exists here, the helper's record is gone — but it is the
+	// exact evidence this function already required in order to proceed.
+	ctx := context.Background()
+	hostID, err := d.sessionShimHostID(ctx, incarnation.identity.OrgID)
+	if err != nil {
+		return fmt.Errorf("resolve host authority for absent attestation: %w", err)
+	}
+	if err := d.reportSessionShimTerminalEvidence(ctx, SessionShimTerminalEvidence{
+		Identity:     incarnation.identity,
+		HostID:       hostID,
+		ShimID:       incarnation.shimID,
+		ProcessEpoch: incarnation.processEpoch,
+		Absent: &SessionShimAbsentAttestation{
+			ProcessIdentityAbsent: true,
+			RegistryRecordAbsent:  true,
+			ObservedAtUnixNano:    time.Now().UnixNano(),
+		},
+	}); err != nil {
+		// Keep the quarantine. A lineage this daemon still reports is one the
+		// composer and the daemon still agree about; forgetting it while the
+		// report was refused is precisely the divergence being fixed.
+		return fmt.Errorf("retain quarantine after absent attestation refusal: %w", err)
+	}
 	d.shims.mu.Lock()
 	kept := d.shims.quarantined[:0]
 	for _, q := range d.shims.quarantined {
@@ -324,7 +352,7 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	d.shims.quarantined = kept
 	delete(d.shims.acceptanceQuarantine, incarnation)
 	d.shims.mu.Unlock()
-	d.publishSessionShimProjection(context.Background(), incarnation.identity.OrgID)
+	d.publishSessionShimProjection(ctx, incarnation.identity.OrgID)
 	return nil
 }
 
