@@ -1949,16 +1949,20 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	return receipt, nil
 }
 
-func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
-	ctx context.Context,
-	evidence SessionShimAdoptionEvidence,
-	receipt SessionShimAdoptionReceipt,
-) (SessionShimAdoptionBatchReceipt, error) {
-	if d.sessionShimConfig().OnAdoptionBatch == nil {
-		return SessionShimAdoptionBatchReceipt{}, nil
-	}
-	batch := SessionShimAdoptionBatch{OrgID: evidence.Identity.OrgID, HostID: evidence.HostID}
+// sessionShimProjectionBatch assembles this daemon's complete durable
+// projection for one organization from current state: everything adopted,
+// everything quarantined, everything tombstoned. It takes the read lock itself.
+//
+// The platform's heartbeat preflight compares the beat's quarantine set against
+// the snapshot the last adoption-batch commit stored, byte for byte, and demotes
+// the host to `draining` when they disagree. So this projection is not merely
+// informational: whatever changes the quarantine set must publish the result, or
+// the host argues with the platform about its own state until something else
+// happens to change it back.
+func (d *Daemon) sessionShimProjectionBatch(orgID, hostID string) SessionShimAdoptionBatch {
+	batch := SessionShimAdoptionBatch{OrgID: orgID, HostID: hostID}
 	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
 	for _, entry := range d.shims.adopted {
 		if entry.adoption.Identity.OrgID != batch.OrgID {
 			continue
@@ -1968,16 +1972,16 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 				Evidence: cloneSessionShimAdoptionEvidence(entry.adoption),
 				Receipt:  cloneSessionShimAdoptionReceipt(entry.adoptionReceipt),
 			})
-		} else {
-			hello := entry.controller.Hello()
-			batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
-				OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
-				ShimID: entry.shimID, ProcessEpoch: hello.ProcessEpoch,
-				ControllerGeneration: entry.adoption.ControllerGeneration,
-				ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
-				Reason: sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility), ConsumesCapacity: true,
-			})
+			continue
 		}
+		hello := entry.controller.Hello()
+		batch.Quarantined = append(batch.Quarantined, sessionshim.QuarantinedSession{
+			OrgID: entry.adoption.Identity.OrgID, SessionID: entry.adoption.Identity.SessionID,
+			ShimID: entry.shimID, ProcessEpoch: hello.ProcessEpoch,
+			ControllerGeneration: entry.adoption.ControllerGeneration,
+			ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
+			Reason: sessionShimCarrierQuarantineReason(entry.adoption.CarrierIncompatibility), ConsumesCapacity: true,
+		})
 	}
 	for _, quarantined := range d.shims.quarantined {
 		if quarantined.OrgID == batch.OrgID {
@@ -1987,12 +1991,98 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 	for _, tombstone := range d.shims.tombstoned {
 		if tombstone.OrgID == batch.OrgID {
 			batch.Tombstoned = append(batch.Tombstoned, SessionShimTerminalEvidence{
-				Identity: tombstone.Identity(), HostID: evidence.HostID,
+				Identity: tombstone.Identity(), HostID: batch.HostID,
 				ShimID: tombstone.ShimID, ProcessEpoch: tombstone.ProcessEpoch, Tombstone: tombstone,
 			})
 		}
 	}
-	d.shims.mu.RUnlock()
+	return batch
+}
+
+// publishSessionShimProjection republishes an organization's durable projection
+// after the quarantine set changed outside an adoption.
+//
+// Adoption and tombstone reconciliation already publish; a quarantine that
+// arrives between them — a controller stream that ended without a terminal
+// observation, or the acceptance seam — did not, and the host then failed every
+// heartbeat until the shim happened to be tombstoned.
+//
+// A failure here is logged rather than returned: the callers are release paths
+// that must not be blocked by the platform being unreachable, and the next
+// adoption or tombstone republishes the same projection anyway.
+func (d *Daemon) publishSessionShimProjection(ctx context.Context, orgID string) {
+	if d.shims == nil || d.sessionShimConfig().OnAdoptionBatch == nil || orgID == "" {
+		return
+	}
+	hostID, err := d.sessionShimHostID(ctx, orgID)
+	if err != nil {
+		slog.Warn("session shim: quarantine projection not published after host identity resolution failed",
+			"org", orgID, "error", err)
+		return
+	}
+	batch := d.sessionShimProjectionBatch(orgID, hostID)
+	sortSessionShimAdoptionOutcomes(batch.Adopted)
+	sessionshim.SortQuarantined(batch.Quarantined)
+	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
+	if err != nil {
+		slog.Warn("session shim: quarantine projection not published",
+			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
+			"tombstoned", len(batch.Tombstoned), "error", err)
+		return
+	}
+	// Committing a batch advances the host's adoption revision. The heartbeat
+	// attests the revision this daemon believes it is at, and the platform
+	// refuses — and demotes the host — when the two disagree. So a republish
+	// that does not retain its own receipt trades one divergence for another.
+	//
+	// No heartbeat acknowledgement is pending: this batch activates no carrier,
+	// so readiness is not withdrawn and the revision applies immediately.
+	if revisionErr := d.updateSessionShimAdoptionRevision(orgID, receipt.AdoptionRevision, false); revisionErr != nil {
+		slog.Warn("session shim: adoption revision not retained after republishing the projection",
+			"org", orgID, "error", revisionErr)
+		return
+	}
+	slog.Info("session shim: republished the durable projection after a quarantine change",
+		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
+		"revision", receipt.AdoptionRevision)
+}
+
+// sortSessionShimAdoptionOutcomes puts a batch's adopted set in the exact order
+// the platform's own comparator defines, rather than leaking Go map order.
+//
+// The receiving side re-checks the order and refuses a batch that disagrees, so
+// the two comparators must be the same comparator. This one omitted
+// ControllerGeneration, which the platform's includes: two adopted entries for
+// one shim incarnation differing only in generation could be emitted in an
+// order the platform rejects. SortQuarantined already keys on the full tuple.
+func sortSessionShimAdoptionOutcomes(in []SessionShimAdoptionOutcome) {
+	sort.Slice(in, func(i, j int) bool {
+		a, b := in[i].Evidence, in[j].Evidence
+		if a.Identity.OrgID != b.Identity.OrgID {
+			return a.Identity.OrgID < b.Identity.OrgID
+		}
+		if a.Identity.SessionID != b.Identity.SessionID {
+			return a.Identity.SessionID < b.Identity.SessionID
+		}
+		if a.ShimID != b.ShimID {
+			return a.ShimID < b.ShimID
+		}
+		if a.ProcessEpoch != b.ProcessEpoch {
+			return a.ProcessEpoch < b.ProcessEpoch
+		}
+		return a.ControllerGeneration < b.ControllerGeneration
+	})
+}
+
+func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	receipt SessionShimAdoptionReceipt,
+) (SessionShimAdoptionBatchReceipt, error) {
+	if d.sessionShimConfig().OnAdoptionBatch == nil {
+		return SessionShimAdoptionBatchReceipt{}, nil
+	}
+	batch := d.sessionShimProjectionBatch(evidence.Identity.OrgID, evidence.HostID)
 	if evidence.CarrierCompatible {
 		batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
 			Evidence: cloneSessionShimAdoptionEvidence(evidence), Receipt: cloneSessionShimAdoptionReceipt(receipt),
@@ -2005,16 +2095,7 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 			Reason:               sessionShimCarrierQuarantineReason(evidence.CarrierIncompatibility), ConsumesCapacity: true,
 		})
 	}
-	sort.Slice(batch.Adopted, func(i, j int) bool {
-		a, b := batch.Adopted[i].Evidence, batch.Adopted[j].Evidence
-		if a.Identity.SessionID != b.Identity.SessionID {
-			return a.Identity.SessionID < b.Identity.SessionID
-		}
-		if a.ShimID != b.ShimID {
-			return a.ShimID < b.ShimID
-		}
-		return a.ProcessEpoch < b.ProcessEpoch
-	})
+	sortSessionShimAdoptionOutcomes(batch.Adopted)
 	sessionshim.SortQuarantined(batch.Quarantined)
 	return d.completeSessionShimAdoptionBatch(ctx, batch)
 }
