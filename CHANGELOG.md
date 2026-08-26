@@ -10,6 +10,39 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.69.0 — 2026-08-26
+
+### Breaking
+
+- **`SessionShimHostAttestation.Supported` is now `SessionShimSupportState`,
+  not `bool`.** Embedders constructing the tuple move `Supported: true` to
+  `Supported: daemon.SessionShimSupported`, and read it back through
+  `Supports()` / `StandsDown()` rather than comparing to a boolean. The minor
+  version moves rather than the patch because this does not compile for a
+  downstream embedder without that edit.
+
+  The type exists because a host needs to say three different things, and a
+  `bool` can only say two. Absent (the zero value) stays absent: it marshals to
+  no key at all, so a daemon that never had a session shim sends byte-identical
+  registration requests. The new third state is an explicit stand-down.
+
+### Features
+
+- **A host can declare that it has no session shim.** A daemon whose durable-
+  session composition degrades used to register in silence, which a control
+  plane that had already recorded the host as shim-enabled could not
+  distinguish from a daemon too old to speak the wire. It answered the
+  registration with a conflict, `daemon start` failed, the service manager
+  restarted it, and the control port never bound again — a permanent crash
+  loop, entered by the first degraded boot after the feature had ever worked.
+
+  `Options.SessionShimStandDown` makes the absence explicit on both the primary
+  and per-organization registration lanes, and drops a cached credential minted
+  under shim support so the declaration is not bottled up until that cache
+  expires.
+
+---
+
 ## v0.68.16 — 2026-08-26
 
 ### Features
