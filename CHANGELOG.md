@@ -8,6 +8,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.68.15 — 2026-08-26
+
+### Features
+
+- **A lineage this daemon can no longer see is now reportable.** There are two
+  facts a daemon can hold about a shim that is gone, and only one of them is a
+  tombstone. A shim that exits cleanly writes its own terminal record — exit
+  code, last sequence, positive proof it reaped its harness process group. A
+  shim that is SIGKILLed, or whose registry record is removed underneath it,
+  writes nothing, and the lineage it left behind could not be reported at all:
+  not tombstoned, because manufacturing a tombstone would forge the reap proof a
+  claim release depends on, and not dropped either, because a complete adoption
+  batch that omits a lineage the composer still holds is refused — along with
+  every batch after it. `SessionShimAbsentAttestation` reports only what was
+  checked: the recorded `(pid, start time)` pair is proven not to be running,
+  and the registry record is gone. It is strictly weaker than a tombstone and
+  the report path enforces that — evidence carrying both proofs is refused, and
+  a partial attestation is refused outright rather than downgraded. The
+  acceptance quarantine clear now attests before it forgets a lineage, and keeps
+  the quarantine if that report is refused.
+
 ### Fixes
 
 - **Quarantining a session no longer takes its host out of service.** The
