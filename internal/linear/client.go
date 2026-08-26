@@ -36,7 +36,7 @@ const (
   team { id key name }
   project { id name }
   labels { nodes { id name } }
-  parent { id }
+  parent { id identifier }
   assignee { id name email }
 }`
 
@@ -417,6 +417,7 @@ func nodeToIssue(n issueNode) Issue {
 	}
 	if n.Parent != nil {
 		iss.ParentID = n.Parent.ID
+		iss.ParentIdentifier = n.Parent.Identifier
 	}
 	for _, l := range n.Labels.Nodes {
 		iss.Labels = append(iss.Labels, Label{ID: l.ID, Name: l.Name})

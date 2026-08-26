@@ -1024,8 +1024,9 @@ func TestListSubIssuesPaginatesAndPreservesOrder(t *testing.T) {
 			Identifier: identifier,
 			Title:      "Child issue",
 			Parent: &struct {
-				ID string `json:"id"`
-			}{ID: "parent-1"},
+				ID         string `json:"id"`
+				Identifier string `json:"identifier"`
+			}{ID: "parent-1", Identifier: "ENG-1"},
 		}
 	}
 	var requests []map[string]any

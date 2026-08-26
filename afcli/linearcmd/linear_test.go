@@ -210,6 +210,60 @@ func TestLinearGetIssue(t *testing.T) {
 	}
 }
 
+func TestLinearGetIssueParentFields(t *testing.T) {
+	tests := []struct {
+		name                 string
+		parentJSON           string
+		wantParentID         any
+		wantParentIdentifier any
+	}{
+		{
+			name:                 "root issue",
+			parentJSON:           "null",
+			wantParentID:         nil,
+			wantParentIdentifier: nil,
+		},
+		{
+			name:                 "child issue",
+			parentJSON:           `{"id":"parent-1","identifier":"ENG-1"}`,
+			wantParentID:         "parent-1",
+			wantParentIdentifier: "ENG-1",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			issueJSON := issueNodeJSON("issue-2", "ENG-2", "Test Issue", "Backlog", "team-1", "ENG", "Engineering")
+			issueJSON = strings.Replace(issueJSON, `"parent":null`, `"parent":`+tt.parentJSON, 1)
+			setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+				var req struct {
+					Query string `json:"query"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode request: %v", err)
+				}
+				if !strings.Contains(req.Query, "parent { id identifier }") {
+					t.Errorf("get-issue query missing parent id and identifier projection:\n%s", req.Query)
+				}
+				writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+			})
+
+			out, err := runLinearCmd(t, "", "get-issue", "ENG-2")
+			if err != nil {
+				t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+			}
+
+			result := decodeJSON(t, out)
+			if got, ok := result["parentId"]; !ok || got != tt.wantParentID {
+				t.Errorf("parentId = %v (present %v), want %v", got, ok, tt.wantParentID)
+			}
+			if got, ok := result["parentIdentifier"]; !ok || got != tt.wantParentIdentifier {
+				t.Errorf("parentIdentifier = %v (present %v), want %v", got, ok, tt.wantParentIdentifier)
+			}
+		})
+	}
+}
+
 func TestLinearGetIssueNotFound(t *testing.T) {
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, `{"issue":null}`)
