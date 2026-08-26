@@ -6,6 +6,7 @@ bin/
 # env files
 .env
 .env.*
+.envrc
 !.env.example
 
 # agent state
