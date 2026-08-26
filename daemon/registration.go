@@ -89,8 +89,15 @@ type RegistrationOptions struct {
 
 	// SessionShim is the optional, non-secret process attestation presented on
 	// registration and every runtime-token refresh. Its zero value preserves the
-	// legacy request/cache contract. When Supported is true, a matching typed
-	// server receipt is required before credentials may be returned or cached.
+	// legacy request/cache contract. When Supported is SessionShimSupported, a
+	// matching typed server receipt is required before credentials may be
+	// returned or cached.
+	//
+	// SessionShimStandDownAttestation() is the third state: an explicit "no shim
+	// here" for a host that has attested support before and can no longer
+	// compose it. It claims nothing and requires no receipt, but it is SAID
+	// rather than left to silence, which is what lets such a host register at
+	// all.
 	SessionShim SessionShimHostAttestation
 
 	// WorkareaExecutors is the exact harness/adapter-scoped capability set.
@@ -547,6 +554,15 @@ func cachedMatchesMode(cached *CachedJWT, useStub bool) bool {
 }
 
 func cachedMatchesSessionShim(cached *CachedJWT, attestation SessionShimHostAttestation) bool {
+	if attestation.StandsDown() {
+		// The cached credential was minted while this host attested support. A
+		// stand-down that reused it would never be delivered — the daemon would
+		// keep serving on the old credential, the control plane would keep the
+		// host on its recorded shim posture, and the declaration this
+		// attestation exists to make would only ever be attempted once the
+		// cache ran out. Drop the cache so the stand-down actually goes.
+		return cached.SessionShim == nil || !cached.SessionShim.Enabled
+	}
 	if !attestation.enabled() {
 		return true
 	}

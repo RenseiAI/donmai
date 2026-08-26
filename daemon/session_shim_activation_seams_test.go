@@ -28,7 +28,7 @@ import (
 
 func activationTestAttestation() SessionShimHostAttestation {
 	return SessionShimHostAttestation{
-		Supported: true, ControllerID: "controller-activation-test",
+		Supported: SessionShimSupported, ControllerID: "controller-activation-test",
 		ProtocolMin: shimwire.ProtocolMin, ProtocolMax: shimwire.ProtocolMax,
 		Capabilities: RequiredSessionShimHostCapabilities(),
 	}
