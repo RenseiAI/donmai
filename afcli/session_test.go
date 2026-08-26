@@ -48,8 +48,17 @@ func TestSessionParentListsAllSubcommands(t *testing.T) {
 func TestSessionListMatchesAgentList(t *testing.T) {
 	t.Parallel()
 
-	mock := afclient.NewMockClient()
-	ds := func() afclient.DataSource { return mock }
+	stub := &stubDataSource{sessions: []afclient.SessionResponse{
+		{ID: "working", Status: afclient.StatusWorking},
+		{ID: "queued", Status: afclient.StatusQueued},
+		{ID: "parked", Status: afclient.StatusParked},
+		{ID: "starting", Status: afclient.StatusStarting},
+		{ID: "completed", Status: afclient.StatusCompleted},
+		{ID: "failed", Status: afclient.StatusFailed},
+		{ID: "stopped", Status: afclient.StatusStopped},
+		{ID: "timed-out", Status: afclient.StatusTimedOut},
+	}}
+	ds := func() afclient.DataSource { return stub }
 	cmd, buf := newTestSessionCmd(ds, []string{"list"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
@@ -61,12 +70,12 @@ func TestSessionListMatchesAgentList(t *testing.T) {
 			t.Errorf("session list header missing %q; got:\n%s", want, out)
 		}
 	}
-	for _, want := range []string{"working", "queued", "parked"} {
+	for _, want := range []string{"working", "queued", "parked", "starting"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("session list missing active status %q; got:\n%s", want, out)
 		}
 	}
-	for _, reject := range []string{"completed", "failed", "stopped"} {
+	for _, reject := range []string{"completed", "failed", "stopped", "timed_out"} {
 		if strings.Contains(out, reject) {
 			t.Errorf("session list should not contain terminal status %q; got:\n%s", reject, out)
 		}

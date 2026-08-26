@@ -36,7 +36,7 @@ func newSessionStreamCmd(ds func() afclient.DataSource) *cobra.Command {
 	cmd := &cobra.Command{
 		Use:          "stream <session-id>",
 		Short:        "Stream live activity for an agent session",
-		Long:         "Stream live activity events for an agent session by polling the coordinator. Exits when the session reaches a terminal state (completed, failed, stopped) or on SIGINT.",
+		Long:         "Stream live activity events for an agent session by polling the coordinator. Exits when the session reaches a terminal state (completed, failed, stopped, timed_out) or on SIGINT.",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -142,7 +142,7 @@ func advanceCursor(current string, resp *afclient.ActivityListResponse) string {
 // isTerminal reports whether the given status is a terminal session state.
 func isTerminal(status afclient.SessionStatus) bool {
 	switch status {
-	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped:
+	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped, afclient.StatusTimedOut:
 		return true
 	}
 	return false

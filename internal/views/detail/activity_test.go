@@ -117,3 +117,39 @@ func TestDetailModel_WrapKeyTogglesLogViewer(t *testing.T) {
 		t.Fatal("second 'w' press should expand again (wrap on)")
 	}
 }
+
+func TestDetailModelTimedOutIsTerminal(t *testing.T) {
+	t.Parallel()
+
+	m := New(afclient.NewMockClient())
+	m.session = &afclient.SessionDetail{Status: afclient.StatusTimedOut}
+	if !m.isTerminal() {
+		t.Fatal("timed_out session must stop detail activity polling")
+	}
+}
+
+func TestBuildTimelineDistinguishesStartingAndTimedOut(t *testing.T) {
+	t.Parallel()
+
+	started := buildTimeline(afclient.SessionDetail{
+		Status: afclient.StatusStarting,
+		Timeline: afclient.SessionTimeline{
+			Created: "2026-08-26T00:00:00Z",
+		},
+	})
+	if got := started[len(started)-1]; got.label != "Starting..." || !got.active {
+		t.Errorf("starting timeline tail = %#v, want active Starting...", got)
+	}
+
+	completedAt := "2026-08-26T00:01:00Z"
+	timedOut := buildTimeline(afclient.SessionDetail{
+		Status: afclient.StatusTimedOut,
+		Timeline: afclient.SessionTimeline{
+			Created:   "2026-08-26T00:00:00Z",
+			Completed: &completedAt,
+		},
+	})
+	if got := timedOut[len(timedOut)-1]; got.label != "Timed out" || got.active {
+		t.Errorf("timed_out timeline tail = %#v, want terminal Timed out", got)
+	}
+}
