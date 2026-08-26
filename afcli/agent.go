@@ -51,7 +51,7 @@ func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *
 	cmd := &cobra.Command{
 		Use:          "list",
 		Short:        "List agent sessions",
-		Long:         "List agent sessions. Defaults to active (queued, parked, working); use --all to include completed, failed, and stopped.",
+		Long:         "List agent sessions. Defaults to active (queued, parked, starting, working); use --all to include completed, failed, stopped, and timed_out.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client := ds()
@@ -108,7 +108,7 @@ func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *
 		},
 	}
 
-	cmd.Flags().BoolVar(&allMode, "all", false, "Include completed, failed, and stopped sessions")
+	cmd.Flags().BoolVar(&allMode, "all", false, "Include completed, failed, stopped, and timed_out sessions")
 	cmd.Flags().BoolVar(&jsonMode, "json", false, "Output raw JSON (indented)")
 	cmd.Flags().StringVar(&sandboxID, "sandbox", "", "Filter by sandbox provider ID")
 
@@ -116,13 +116,13 @@ func newAgentListCmd(ds func() afclient.DataSource, projectFunc func() string) *
 }
 
 // isActive reports whether a session status is considered active —
-// i.e., queued, parked, or working. Terminal states (completed, failed,
-// stopped) are not active.
+// i.e., queued, parked, starting, or working. Terminal states (completed,
+// failed, stopped, timed_out) are not active.
 func isActive(status afclient.SessionStatus) bool {
 	switch status {
-	case afclient.StatusQueued, afclient.StatusParked, afclient.StatusWorking:
+	case afclient.StatusQueued, afclient.StatusParked, afclient.StatusStarting, afclient.StatusWorking:
 		return true
-	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped:
+	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped, afclient.StatusTimedOut:
 		return false
 	}
 	return false

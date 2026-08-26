@@ -96,6 +96,9 @@ func buildTimeline(s afclient.SessionDetail) []timelineEvent {
 		case afclient.StatusStopped:
 			label = "Stopped"
 			color = lipgloss.NewStyle().Foreground(theme.Default().TextTertiary)
+		case afclient.StatusTimedOut:
+			label = "Timed out"
+			color = redStyle
 		}
 		events = append(events, timelineEvent{
 			label:     label,
@@ -107,6 +110,13 @@ func buildTimeline(s afclient.SessionDetail) []timelineEvent {
 			label:     "Running...",
 			timestamp: format.Duration(s.Duration) + " elapsed",
 			color:     greenStyle,
+			active:    true,
+		})
+	case s.Status == afclient.StatusStarting:
+		events = append(events, timelineEvent{
+			label:     "Starting...",
+			timestamp: format.Duration(s.Duration) + " elapsed",
+			color:     yellowStyle,
 			active:    true,
 		})
 	case s.Status == afclient.StatusQueued:

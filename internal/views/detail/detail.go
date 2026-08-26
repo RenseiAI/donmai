@@ -126,7 +126,7 @@ func (m *Model) isTerminal() bool {
 		return false
 	}
 	switch m.session.Status {
-	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped:
+	case afclient.StatusCompleted, afclient.StatusFailed, afclient.StatusStopped, afclient.StatusTimedOut:
 		return true
 	}
 	return false

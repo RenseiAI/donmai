@@ -353,10 +353,12 @@ func TestIsActive(t *testing.T) {
 	}{
 		{afclient.StatusQueued, true},
 		{afclient.StatusParked, true},
+		{afclient.StatusStarting, true},
 		{afclient.StatusWorking, true},
 		{afclient.StatusCompleted, false},
 		{afclient.StatusFailed, false},
 		{afclient.StatusStopped, false},
+		{afclient.StatusTimedOut, false},
 		{afclient.SessionStatus("unknown"), false},
 	}
 	for _, tc := range cases {
@@ -367,6 +369,73 @@ func TestIsActive(t *testing.T) {
 			}
 		})
 	}
+}
+
+func TestAgentListStartingActiveTimedOutTerminal(t *testing.T) {
+	t.Parallel()
+
+	sessions := []afclient.SessionResponse{
+		{ID: "starting", Identifier: "OSS-1", Status: afclient.StatusStarting, WorkType: "development"},
+		{ID: "timed-out", Identifier: "OSS-2", Status: afclient.StatusTimedOut, WorkType: "qa"},
+	}
+
+	t.Run("human", func(t *testing.T) {
+		t.Parallel()
+		out, err := runListWithStub(t, &stubDataSource{sessions: sessions}, nil)
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		if !strings.Contains(out, "starting") {
+			t.Errorf("active output missing starting status; got:\n%s", out)
+		}
+		if strings.Contains(out, "timed_out") {
+			t.Errorf("active output contains terminal timed_out status; got:\n%s", out)
+		}
+	})
+
+	t.Run("json", func(t *testing.T) {
+		t.Parallel()
+		out, err := runListWithStub(t, &stubDataSource{sessions: sessions}, []string{"--json"})
+		if err != nil {
+			t.Fatalf("execute: %v", err)
+		}
+		var resp afclient.SessionsListResponse
+		if err := json.Unmarshal([]byte(out), &resp); err != nil {
+			t.Fatalf("decode output: %v", err)
+		}
+		if got, want := resp.Count, 1; got != want {
+			t.Fatalf("count = %d, want %d: %s", got, want, out)
+		}
+		if got := resp.Sessions[0].Status; got != afclient.StatusStarting {
+			t.Errorf("status = %q, want %q", got, afclient.StatusStarting)
+		}
+	})
+
+	t.Run("all formats retain both statuses", func(t *testing.T) {
+		t.Parallel()
+		ds := &stubDataSource{sessions: sessions}
+		human, err := runListWithStub(t, ds, []string{"--all"})
+		if err != nil {
+			t.Fatalf("execute human --all: %v", err)
+		}
+		for _, want := range []string{"starting", "timed_out"} {
+			if !strings.Contains(human, want) {
+				t.Errorf("human --all output missing %q; got:\n%s", want, human)
+			}
+		}
+
+		raw, err := runListWithStub(t, &stubDataSource{sessions: sessions}, []string{"--all", "--json"})
+		if err != nil {
+			t.Fatalf("execute JSON --all: %v", err)
+		}
+		var resp afclient.SessionsListResponse
+		if err := json.Unmarshal([]byte(raw), &resp); err != nil {
+			t.Fatalf("decode --all output: %v", err)
+		}
+		if got, want := resp.Count, 2; got != want {
+			t.Errorf("--all count = %d, want %d: %s", got, want, raw)
+		}
+	})
 }
 
 func TestAgentListEmptyAll(t *testing.T) {
