@@ -7,6 +7,64 @@ import (
 	"testing"
 )
 
+func TestSessionStatusWireValues(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status SessionStatus
+		want   string
+	}{
+		{StatusQueued, "queued"},
+		{StatusParked, "parked"},
+		{StatusStarting, "starting"},
+		{StatusWorking, "working"},
+		{StatusCompleted, "completed"},
+		{StatusFailed, "failed"},
+		{StatusStopped, "stopped"},
+		{StatusTimedOut, "timed_out"},
+	}
+
+	for _, test := range tests {
+		t.Run(test.want, func(t *testing.T) {
+			t.Parallel()
+			if got := string(test.status); got != test.want {
+				t.Errorf("status = %q, want %q", got, test.want)
+			}
+		})
+	}
+}
+
+func TestSessionStatusJSONPreservesUnknownValue(t *testing.T) {
+	t.Parallel()
+
+	var got SessionStatus
+	if err := json.Unmarshal([]byte(`"future_status"`), &got); err != nil {
+		t.Fatalf("unmarshal future status: %v", err)
+	}
+	if got != SessionStatus("future_status") {
+		t.Errorf("status = %q, want future_status", got)
+	}
+}
+
+func TestSessionsListResponseDecodesStartingAndTimedOut(t *testing.T) {
+	t.Parallel()
+
+	var resp SessionsListResponse
+	data := []byte(`{"sessions":[{"id":"s-start","status":"starting"},{"id":"s-timeout","status":"timed_out"}],"count":2,"timestamp":"now"}`)
+	if err := json.Unmarshal(data, &resp); err != nil {
+		t.Fatalf("unmarshal sessions: %v", err)
+	}
+	if got, want := len(resp.Sessions), 2; got != want {
+		t.Fatalf("session count = %d, want %d", got, want)
+	}
+	if got := resp.Sessions[0].Status; got != StatusStarting {
+		t.Errorf("first status = %q, want %q", got, StatusStarting)
+	}
+	if got := resp.Sessions[1].Status; got != StatusTimedOut {
+		t.Errorf("second status = %q, want %q", got, StatusTimedOut)
+	}
+}
+
 func TestStopSessionResponseRoundTrip(t *testing.T) {
 	in := StopSessionResponse{
 		Stopped:        true,

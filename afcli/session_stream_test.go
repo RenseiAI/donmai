@@ -304,6 +304,34 @@ func TestSessionStreamTerminatesOnCompleted(t *testing.T) {
 	}
 }
 
+func TestIsTerminalSessionStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		status afclient.SessionStatus
+		want   bool
+	}{
+		{afclient.StatusQueued, false},
+		{afclient.StatusParked, false},
+		{afclient.StatusStarting, false},
+		{afclient.StatusWorking, false},
+		{afclient.StatusCompleted, true},
+		{afclient.StatusFailed, true},
+		{afclient.StatusStopped, true},
+		{afclient.StatusTimedOut, true},
+		{afclient.SessionStatus("unknown"), false},
+	}
+
+	for _, test := range tests {
+		t.Run(string(test.status), func(t *testing.T) {
+			t.Parallel()
+			if got := isTerminal(test.status); got != test.want {
+				t.Errorf("isTerminal(%q) = %v, want %v", test.status, got, test.want)
+			}
+		})
+	}
+}
+
 func TestSessionStreamContextCancellation(t *testing.T) {
 	t.Parallel()
 
