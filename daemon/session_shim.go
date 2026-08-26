@@ -1556,7 +1556,7 @@ func resolveSessionShimHostAttestation(cfg SessionShimConfig, controllerID strin
 		return SessionShimHostAttestation{}, err
 	}
 	attestation := SessionShimHostAttestation{
-		Supported:    true,
+		Supported:    SessionShimSupported,
 		ControllerID: controllerID,
 		ProtocolMin:  shimwire.ProtocolMin,
 		ProtocolMax:  shimwire.ProtocolMax,
