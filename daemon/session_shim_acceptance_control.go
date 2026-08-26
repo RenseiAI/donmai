@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"bytes"
+	"context"
 	"crypto/subtle"
 	"encoding/json"
 	"errors"
@@ -276,12 +277,17 @@ func (d *Daemon) armSessionShimAcceptanceQuarantine(id sessionshim.Identity) err
 	q := sessionshim.NewQuarantinedSession(*candidate, sessionshim.QuarantineProtocolMismatch, "acceptance fixture protocol range has no overlap", time.Now())
 	incarnation := shimIncarnation{identity: id, shimID: candidate.ShimID, processEpoch: candidate.ProcessEpoch}
 	d.shims.mu.Lock()
-	defer d.shims.mu.Unlock()
 	if _, exists := d.shims.acceptanceQuarantine[incarnation]; exists {
+		d.shims.mu.Unlock()
 		return nil
 	}
 	d.upsertShimQuarantineLocked(q)
 	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: candidate.PID, StartedAt: candidate.ProcessStartedAt}
+	d.shims.mu.Unlock()
+	// Simulating a quarantine means simulating all of it. A real quarantine is
+	// durably published; one that is not leaves the host arguing with the
+	// platform about a session the platform has never heard of.
+	d.publishSessionShimProjection(context.Background(), id.OrgID)
 	return nil
 }
 
@@ -318,6 +324,7 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	d.shims.quarantined = kept
 	delete(d.shims.acceptanceQuarantine, incarnation)
 	d.shims.mu.Unlock()
+	d.publishSessionShimProjection(context.Background(), incarnation.identity.OrgID)
 	return nil
 }
 
