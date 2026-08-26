@@ -20,7 +20,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   about, every following heartbeat was refused, and the host sat draining with
   its claims disabled until that shim happened to be tombstoned. The projection
   is now republished wherever it changes, and a test fails if a new call site
-  changes it without publishing.
+  changes it without publishing. The republish also retains its own receipt:
+  committing a batch advances the host's adoption revision, the heartbeat
+  attests the revision this daemon believes it is at, and discarding the receipt
+  would trade one divergence for another.
 
 ---
 

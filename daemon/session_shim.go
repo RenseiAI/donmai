@@ -2023,14 +2023,28 @@ func (d *Daemon) publishSessionShimProjection(ctx context.Context, orgID string)
 	batch := d.sessionShimProjectionBatch(orgID, hostID)
 	sortSessionShimAdoptionOutcomes(batch.Adopted)
 	sessionshim.SortQuarantined(batch.Quarantined)
-	if _, err := d.completeSessionShimAdoptionBatch(ctx, batch); err != nil {
+	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
+	if err != nil {
 		slog.Warn("session shim: quarantine projection not published",
 			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
 			"tombstoned", len(batch.Tombstoned), "error", err)
 		return
 	}
+	// Committing a batch advances the host's adoption revision. The heartbeat
+	// attests the revision this daemon believes it is at, and the platform
+	// refuses — and demotes the host — when the two disagree. So a republish
+	// that does not retain its own receipt trades one divergence for another.
+	//
+	// No heartbeat acknowledgement is pending: this batch activates no carrier,
+	// so readiness is not withdrawn and the revision applies immediately.
+	if revisionErr := d.updateSessionShimAdoptionRevision(orgID, receipt.AdoptionRevision, false); revisionErr != nil {
+		slog.Warn("session shim: adoption revision not retained after republishing the projection",
+			"org", orgID, "error", revisionErr)
+		return
+	}
 	slog.Info("session shim: republished the durable projection after a quarantine change",
-		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined))
+		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
+		"revision", receipt.AdoptionRevision)
 }
 
 // sortSessionShimAdoptionOutcomes puts a batch's adopted set in the exact order

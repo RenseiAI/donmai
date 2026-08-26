@@ -243,3 +243,62 @@ func TestAdoptedBatchOrderMatchesTheReceiverComparator(t *testing.T) {
 		}
 	}
 }
+
+// TestQuarantinePublishRetainsTheAdoptionRevision is the control for the second
+// half of the same divergence. Committing a batch advances the host's adoption
+// revision; the heartbeat attests the revision this daemon believes it is at,
+// and the platform refuses the beat and demotes the host when the two disagree.
+//
+// A republish that publishes correctly but discards its own receipt therefore
+// trades one divergence for another — observed on a real host as the quarantine
+// projection landing and every following heartbeat answering
+// SESSION_SHIM_ADOPTION_REVISION_STALE.
+func TestQuarantinePublishRetainsTheAdoptionRevision(t *testing.T) {
+	t.Parallel()
+	const scope = "org-revision"
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		EnableAdoption: true,
+		OrgID:          scope,
+		HostID:         "wh_revision_host",
+		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("rev-7"),
+				AdoptionRevision:   "7",
+			}, nil
+		},
+	}})
+	enableHostedFullHostFramesForTest(t, d, scope)
+
+	d.shims.mu.RLock()
+	before := d.shims.credentialReceipts[scope].AdoptionRevision
+	d.shims.mu.RUnlock()
+	if before == "7" {
+		t.Fatalf("precondition: the seeded revision is already the one the batch returns (%q)", before)
+	}
+
+	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         scope, SessionID: "session-revision",
+		ShimID: "shim-revision", ProcessEpoch: 1,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}, sessionshim.QuarantineSocketUnreachable, "controller stream ended before a terminal observation", time.Now())
+	d.shims.mu.Lock()
+	d.upsertShimQuarantineLocked(q)
+	d.shims.mu.Unlock()
+
+	d.publishSessionShimProjection(context.Background(), scope)
+
+	d.shims.mu.RLock()
+	after := d.shims.credentialReceipts[scope].AdoptionRevision
+	pending, ackPending := d.shims.pendingHeartbeatAcks[scope]
+	d.shims.mu.RUnlock()
+	if after != "7" {
+		t.Fatalf("retained adoption revision = %q, want the batch receipt's %q — "+
+			"the next heartbeat attests this value and the platform demotes the host when it is stale",
+			after, "7")
+	}
+	if ackPending {
+		t.Fatalf("republish left a heartbeat acknowledgement pending (%q); it activates no carrier, "+
+			"so it must not withdraw readiness", pending)
+	}
+}
