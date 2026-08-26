@@ -70,7 +70,12 @@ func TestAcquisitionStoreProcessHelper(t *testing.T) {
 	if beginErr == nil {
 		outcome = "success"
 	}
-	if err := parentRoot.WriteFile("result-"+suffix, []byte(outcome), 0o600); err != nil {
+	resultName := "result-" + suffix
+	temporaryResultName := resultName + ".tmp"
+	if err := parentRoot.WriteFile(temporaryResultName, []byte(outcome), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := parentRoot.Rename(temporaryResultName, resultName); err != nil {
 		t.Fatal(err)
 	}
 	if err := waitForAcquisitionTestRootFile(parentRoot, "process-release", 10*time.Second); err != nil {
