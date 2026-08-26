@@ -372,19 +372,28 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				s := issue.Project.Name
 				projectName = &s
 			}
+			var parentID, parentIdentifier any
+			if issue.ParentID != "" {
+				parentID = issue.ParentID
+			}
+			if issue.ParentIdentifier != "" {
+				parentIdentifier = issue.ParentIdentifier
+			}
 
 			out := map[string]any{
-				"id":          issue.ID,
-				"identifier":  issue.Identifier,
-				"title":       issue.Title,
-				"description": issue.Description,
-				"url":         issue.URL,
-				"status":      issue.State.Name,
-				"team":        issue.Team.Name,
-				"project":     projectName,
-				"labels":      labelNames(issue.Labels),
-				"createdAt":   issue.CreatedAt,
-				"updatedAt":   issue.UpdatedAt,
+				"id":               issue.ID,
+				"identifier":       issue.Identifier,
+				"title":            issue.Title,
+				"description":      issue.Description,
+				"url":              issue.URL,
+				"status":           issue.State.Name,
+				"team":             issue.Team.Name,
+				"project":          projectName,
+				"labels":           labelNames(issue.Labels),
+				"parentId":         parentID,
+				"parentIdentifier": parentIdentifier,
+				"createdAt":        issue.CreatedAt,
+				"updatedAt":        issue.UpdatedAt,
 			}
 			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
