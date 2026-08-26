@@ -335,6 +335,9 @@ donmai linear list-unblocked-backlog --project "..."
 donmai linear create-blocker <source-issue-id> --title "..."
 ```
 
+`get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
+strings for a child issue and explicit `null` values for a root issue.
+
 **Authentication**: set `LINEAR_API_KEY` (or `LINEAR_ACCESS_TOKEN`).
 
 ### `donmai github`

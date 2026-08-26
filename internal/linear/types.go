@@ -28,9 +28,10 @@ type Issue struct {
 		ID   string `json:"id,omitempty"`
 		Name string `json:"name"`
 	} `json:"project,omitempty"`
-	Labels   []Label `json:"labels,omitempty"`
-	ParentID string  `json:"parentId,omitempty"`
-	Assignee *User   `json:"assignee,omitempty"`
+	Labels           []Label `json:"labels,omitempty"`
+	ParentID         string  `json:"parentId,omitempty"`
+	ParentIdentifier string  `json:"parentIdentifier,omitempty"`
+	Assignee         *User   `json:"assignee,omitempty"`
 }
 
 // Label represents a Linear issue label.
@@ -156,7 +157,8 @@ type issueNode struct {
 		} `json:"nodes"`
 	} `json:"labels"`
 	Parent *struct {
-		ID string `json:"id"`
+		ID         string `json:"id"`
+		Identifier string `json:"identifier"`
 	} `json:"parent,omitempty"`
 	Assignee *struct {
 		ID    string `json:"id"`
