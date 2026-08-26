@@ -8,8 +8,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.68.15 — 2026-08-26
+
+### Features
+
+- **A daemon can attest a session-shim lineage it proved absent without
+  forging a tombstone.** When the recorded process identity is no longer
+  running and its registry record is gone, the daemon can report those two
+  facts as a weaker, mutually exclusive absence attestation. A refused report
+  retains quarantine instead of silently dropping a lineage the receiver still
+  expects, while clean terminal records keep their stronger reap proof.
+
 ### Fixes
 
+- **Linear issue reads expose their native parent edge.** `linear get-issue`
+  now returns `parentId` and `parentIdentifier` as strings for child issues and
+  explicit JSON nulls for root issues. Existing response fields remain
+  unchanged, so graph-aware callers can distinguish owned children from roots
+  without re-querying the provider.
 - **Quarantining a session no longer takes its host out of service.** The
   platform compares a heartbeat's quarantine set against the snapshot the last
   adoption-batch commit stored, byte for byte, and demotes a host whose beat
@@ -24,8 +42,6 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   committing a batch advances the host's adoption revision, the heartbeat
   attests the revision this daemon believes it is at, and discarding the receipt
   would trade one divergence for another.
-
----
 
 ## v0.68.14 — 2026-08-25
 
