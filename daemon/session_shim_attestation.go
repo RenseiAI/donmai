@@ -1,12 +1,86 @@
 package daemon
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"sort"
 	"strconv"
 	"strings"
 )
+
+// SessionShimSupportState is the three-state session-shim support fact a host
+// may present, encoded so that each state has exactly one wire form.
+//
+// A plain bool cannot carry this: with `omitempty` a false is indistinguishable
+// from silence, and without it every legacy daemon starts emitting a key it
+// never emitted before. Both matter, because a control plane distinguishes
+// them — a host it has recorded as shim-enabled must repeat its complete
+// attestation, and silence from such a host is refused rather than read as
+// "no longer running one". A daemon that cannot compose the shim therefore
+// needs a way to SAY so; that is SessionShimStandDown.
+//
+// The state is a distinct type rather than a *bool for two reasons. Every
+// existing equality and copy site keeps working by construction (a *bool turns
+// `a.Supported == b.Supported` from a value comparison into a silent pointer
+// comparison), and the marshaller stays scoped to this field: encoding/json
+// promotes a Marshaler implemented on SessionShimHostAttestation itself onto
+// every request type that embeds it, which would replace the whole
+// registration body with the attestation tuple.
+type SessionShimSupportState uint8
+
+const (
+	// SessionShimSupportAbsent presents no support fact at all. It is the zero
+	// value, and it emits NO sessionShimSupported key, so a daemon that never
+	// touches this field sends the pre-session-shim request bytes exactly.
+	SessionShimSupportAbsent SessionShimSupportState = iota
+
+	// SessionShimStandDown explicitly declares that this host is NOT running a
+	// session shim. It emits {"sessionShimSupported": false} and no other shim
+	// key. This is the one thing silence cannot express: a host that attested
+	// support before, and has since lost its composition, says so with this.
+	SessionShimStandDown
+
+	// SessionShimSupported is the positive fact, valid only alongside the
+	// complete controller/protocol/capability tuple. It emits
+	// {"sessionShimSupported": true}.
+	SessionShimSupported
+)
+
+// MarshalJSON writes the boolean the wire contract defines for the two states
+// that have one. Absent has no wire form and never reaches here: `omitempty`
+// drops the zero value before the field is encoded, which is what preserves
+// the legacy request bytes. Reaching here with Absent means a caller put this
+// state somewhere `omitempty` does not cover, where the only two available
+// encodings would both be a lie — so it fails loudly instead of picking one.
+func (s SessionShimSupportState) MarshalJSON() ([]byte, error) {
+	switch s {
+	case SessionShimSupported:
+		return []byte("true"), nil
+	case SessionShimStandDown:
+		return []byte("false"), nil
+	case SessionShimSupportAbsent:
+		return nil, errors.New("session shim attestation: absent support has no wire form; it must be omitted")
+	default:
+		return nil, fmt.Errorf("session shim attestation: unknown support state %d", uint8(s))
+	}
+}
+
+// UnmarshalJSON reads the two present forms. An absent key never calls this,
+// leaving the field at SessionShimSupportAbsent, so decode is the exact
+// inverse of encode across all three states.
+func (s *SessionShimSupportState) UnmarshalJSON(data []byte) error {
+	var supported bool
+	if err := json.Unmarshal(data, &supported); err != nil {
+		return fmt.Errorf("session shim attestation: sessionShimSupported must be a boolean: %w", err)
+	}
+	if supported {
+		*s = SessionShimSupported
+	} else {
+		*s = SessionShimStandDown
+	}
+	return nil
+}
 
 // SessionShimHostAttestation is the additive, non-secret recovery capability
 // tuple presented on worker registration and every runtime-token refresh.
@@ -15,12 +89,34 @@ import (
 // produces the public wire keys without adding a nested object. Its zero value
 // is absent, preserving the pre-session-shim request bytes.
 type SessionShimHostAttestation struct {
-	Supported    bool     `json:"sessionShimSupported,omitempty"`
-	ControllerID string   `json:"sessionShimControllerId,omitempty"`
-	ProtocolMin  uint32   `json:"sessionShimProtocolMin,omitempty"`
-	ProtocolMax  uint32   `json:"sessionShimProtocolMax,omitempty"`
-	Capabilities []string `json:"sessionShimCapabilities,omitempty"`
+	Supported    SessionShimSupportState `json:"sessionShimSupported,omitempty"`
+	ControllerID string                  `json:"sessionShimControllerId,omitempty"`
+	ProtocolMin  uint32                  `json:"sessionShimProtocolMin,omitempty"`
+	ProtocolMax  uint32                  `json:"sessionShimProtocolMax,omitempty"`
+	Capabilities []string                `json:"sessionShimCapabilities,omitempty"`
 }
+
+// SessionShimStandDownAttestation is the attestation a host presents when it
+// has no session-shim composition to attest: an explicit "not me", carrying no
+// controller, protocol, or capability claim.
+//
+// It exists so a degraded daemon can complete registration instead of going
+// silent. Silence from a host the control plane has recorded as shim-enabled
+// is a conflict, and a daemon that cannot get past registration cannot serve
+// at all — which turns one unavailable feature into a dead host.
+func SessionShimStandDownAttestation() SessionShimHostAttestation {
+	return SessionShimHostAttestation{Supported: SessionShimStandDown}
+}
+
+// StandsDown reports whether this attestation is the explicit "not running a
+// shim" declaration, as opposed to saying nothing at all.
+func (a SessionShimHostAttestation) StandsDown() bool {
+	return a.Supported == SessionShimStandDown
+}
+
+// Supports reports whether this attestation claims session-shim support. It is
+// the exported reading of the same fact the package gates recovery on.
+func (a SessionShimHostAttestation) Supports() bool { return a.enabled() }
 
 // The closed hosted session-shim capability vocabulary. The canonical tuple is
 // the lexical complete set returned by RequiredSessionShimHostCapabilities.
@@ -199,12 +295,19 @@ const (
 	SessionShimCredentialStateReady = "ready"
 )
 
-func (a SessionShimHostAttestation) enabled() bool { return a.Supported }
+func (a SessionShimHostAttestation) enabled() bool { return a.Supported == SessionShimSupported }
 
 func (a SessionShimHostAttestation) validate() error {
-	if !a.Supported {
+	if !a.enabled() {
+		// Absent and stand-down are both "no shim here", and neither may carry
+		// a controller, protocol range, or capability claim: a stand-down that
+		// smuggled one would be read as a malformed hosted attestation rather
+		// than as the declaration it is.
 		if a.ControllerID != "" || a.ProtocolMin != 0 || a.ProtocolMax != 0 || len(a.Capabilities) != 0 {
 			return errors.New("session shim attestation: fields require sessionShimSupported")
+		}
+		if a.Supported != SessionShimSupportAbsent && a.Supported != SessionShimStandDown {
+			return fmt.Errorf("session shim attestation: unknown support state %d", uint8(a.Supported))
 		}
 		return nil
 	}
@@ -283,8 +386,11 @@ func validateSessionShimCredentialReceipt(
 	if workerID != "" && (receipt.WorkerHostID == workerID || attestation.ControllerID == workerID) {
 		return errors.New("session shim credential receipt aliases worker registration identity")
 	}
+	// receipt.Enabled is known true here (checked above), and a receipt echoes a
+	// supported attestation or it echoes nothing — there is no stand-down
+	// receipt to mirror.
 	got := SessionShimHostAttestation{
-		Supported:    receipt.Enabled,
+		Supported:    SessionShimSupported,
 		ControllerID: receipt.ControllerID,
 		ProtocolMin:  receipt.ProtocolMin,
 		ProtocolMax:  receipt.ProtocolMax,

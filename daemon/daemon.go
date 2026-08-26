@@ -113,6 +113,25 @@ type Options struct {
 	// behaves exactly as it did before shim ownership existed.
 	SessionShim SessionShimConfig
 
+	// SessionShimStandDown makes this daemon DECLARE the absence of a shim
+	// composition on registration and refresh, instead of saying nothing:
+	// SessionShimStandDownAttestation() rides the normal worker registration.
+	//
+	// It is for an embedder whose composition is conditional. A host that has
+	// attested support before is expected to keep repeating that attestation,
+	// so a control plane may read silence from it as a conflict rather than as
+	// a stand-down — and a registration that cannot complete takes the whole
+	// daemon down with it, not just the feature that failed to compose. An
+	// embedder that offers the shim conditionally therefore sets this whenever
+	// its composition is not active.
+	//
+	// Off by default: a daemon that never composes a shim at all keeps sending
+	// the pre-session-shim request bytes, with no sessionShimSupported key.
+	// Setting it while SessionShim composes a real attestation is a
+	// contradiction and fails at New — the two states cannot both be true, and
+	// silently preferring one would make the wire disagree with the config.
+	SessionShimStandDown bool
+
 	// EnableGateway starts the translating-gateway loopback host (the
 	// ModelEndpoint host kind "gateway", ADR-2026-07-24 / 08) alongside the
 	// daemon. Off by default: the gateway is experimental at M1 and is only
@@ -461,6 +480,14 @@ func New(opts Options) *Daemon {
 		opts.SessionShim,
 		d.controllerIDValue,
 	)
+	if opts.SessionShimStandDown && d.sessionShimAttestationErr == nil {
+		if d.sessionShimAttestationValue.enabled() {
+			d.sessionShimAttestationErr = errors.New(
+				"session shim: stand-down contradicts the composed host attestation")
+		} else {
+			d.sessionShimAttestationValue = SessionShimStandDownAttestation()
+		}
+	}
 	if opts.RulesetSnapshot != nil {
 		snapshotClient := opts.RulesetSnapshot
 		d.routingTraces.SetSnapshotStatusFunc(func() (afclient.RulesetSnapshotStatus, bool) {
