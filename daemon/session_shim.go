@@ -808,6 +808,22 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 		}
 		d.setState(StateRunning)
 		d.sessionShimReadinessWithdrawn.Store(false)
+	case StateRunning:
+		// The fence was raised while this daemon was already SERVING. Every
+		// other path that raises it also moves the lifecycle to recovering
+		// first, so this case did not exist — but a composition installed after
+		// startup publishes its adoption revision without ever leaving
+		// StateRunning, which is the entire point of installing it late.
+		//
+		// The acknowledgement is still the one reopening edge; the state the
+		// daemon happened to be in when the fence went up is not what the fence
+		// is about. Without this case the fence stays raised for the life of the
+		// process and the poll lane never claims again — a host that came up
+		// faster and then silently stopped taking work.
+		//
+		// Nothing paused the spawner on this path (the paths that do also leave
+		// recovering), so nothing is resumed here.
+		d.sessionShimReadinessWithdrawn.Store(false)
 	case StatePaused, StateDraining:
 		// Preserve an operator pause. The acknowledged heartbeat clears only the
 		// proof-v2 fence; ResumeContext remains the explicit admission edge for a

@@ -174,8 +174,14 @@ func (h *compositionHarness) composedConfig(
 		OrgID:                        h.orgID,
 		RegistryDir:                  h.registryDir,
 		OnAdoptionBatch:              onBatch,
-		OnCarrierActivationAcknowledged: func(SessionShimPublishedBatchReceipt) {
+		// Both hooks are what an embedder with a real control plane supplies,
+		// and together they make the adoption revision publish behind a
+		// heartbeat-acknowledgement fence. A harness that omitted them would
+		// never raise that fence and would prove nothing about clearing it.
+		OnAdoptionPublished: func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+			return nil, nil
 		},
+		OnCarrierActivationAcknowledged: func(SessionShimPublishedBatchReceipt) {},
 	}
 }
 

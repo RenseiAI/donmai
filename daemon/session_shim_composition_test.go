@@ -373,6 +373,39 @@ func TestInstalledCompositionEndsWithTheAttestationDeclared(t *testing.T) {
 	}
 }
 
+// TestInstalledCompositionReopensTheClaimLaneOfAServingDaemon is the fence this
+// deferral moves: publishing an adoption revision raises an admission fence
+// that only an exact acknowledged heartbeat clears. Every other path that
+// raises it leaves the daemon in a pre-serving state on the way; a composition
+// installed after startup never does, because readiness did not wait for it. A
+// host that came up faster and then silently stopped claiming work would be a
+// worse outcome than the slow start.
+func TestInstalledCompositionReopensTheClaimLaneOfAServingDaemon(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	if err := h.daemon.InstallSessionShimComposition(ctx, h.composedConfig(
+		func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			return SessionShimAdoptionBatchReceipt{
+				DurableCorrelation: []byte("composition"), AdoptionRevision: "revision-batch",
+			}, nil
+		})); err != nil {
+		t.Fatalf("composition install: %v", err)
+	}
+
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after the composition = %q, want %q", state, StateRunning)
+	}
+	if suspended, reason := h.daemon.PollClaimGate()(); suspended {
+		t.Fatalf("claim lane still suspended after the composition installed: %s", reason)
+	}
+	if h.daemon.heartbeatMaxConcurrentSessions() == 0 {
+		t.Fatal("the composition left this host publishing zero capacity")
+	}
+}
+
 // TestDeclareSessionShimRestoresThePreviousAttestationOnFailure covers the
 // refresher on its own. A refusal must not leave the lane presenting a claim
 // authority rejected — the next unattended expiry refresh would present it
