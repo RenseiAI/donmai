@@ -1,6 +1,9 @@
 package afclient
 
-import "errors"
+import (
+	"errors"
+	"fmt"
+)
 
 // Sentinel errors for expected API failure modes.
 var (
@@ -39,3 +42,32 @@ var (
 	// final signature without depending on a half-finished call site.
 	ErrUnimplemented = errors.New("unimplemented")
 )
+
+// StopSessionError is the bounded, whitelisted error receipt returned by the
+// public session-stop endpoint. It deliberately does not retain the raw HTTP
+// body: platform error payloads may contain fields that are not safe to echo.
+type StopSessionError struct {
+	HTTPStatus        int           `json:"httpStatus"`
+	Stopped           bool          `json:"stopped"`
+	SessionID         string        `json:"sessionId"`
+	PreviousStatus    SessionStatus `json:"previousStatus"`
+	Code              string        `json:"code"`
+	Refusal           string        `json:"refusal"`
+	Retryable         bool          `json:"retryable"`
+	Disposition       string        `json:"disposition,omitempty"`
+	OwnerLiveness     string        `json:"ownerLiveness,omitempty"`
+	PreparedAgeMs     *int64        `json:"preparedAgeMs,omitempty"`
+	MutationID        string        `json:"mutationId,omitempty"`
+	RetryAfterSeconds *int          `json:"retryAfterSeconds,omitempty"`
+}
+
+func (e *StopSessionError) Error() string {
+	if e.Disposition != "" {
+		return fmt.Sprintf("%s (%s)", e.Refusal, e.Disposition)
+	}
+	return e.Refusal
+}
+
+// Unwrap preserves compatibility for callers that already branch on the
+// coarse HTTP 409 sentinel.
+func (e *StopSessionError) Unwrap() error { return ErrConflict }

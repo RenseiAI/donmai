@@ -29,6 +29,14 @@ func newAgentStopCmd(ds func() afclient.DataSource) *cobra.Command {
 
 			resp, err := client.StopSession(id)
 			if err != nil {
+				var stopErr *afclient.StopSessionError
+				if errors.As(err, &stopErr) && jsonMode {
+					enc := json.NewEncoder(cmd.OutOrStdout())
+					enc.SetIndent("", "  ")
+					if encodeErr := enc.Encode(stopErr); encodeErr != nil {
+						return fmt.Errorf("encode typed stop refusal: %w", encodeErr)
+					}
+				}
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("stop agent %s: session not found: %w", id, err)
 				}
