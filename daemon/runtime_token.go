@@ -298,6 +298,54 @@ func RefreshRuntimeToken(
 	return refresherFor(regOpts).refresh(ctx, regOpts, currentWorkerID, reason)
 }
 
+// RepresentRuntimeToken re-presents the CURRENT registration and returns fresh
+// credentials bound to the SAME worker id. It is step 1 of RefreshRuntimeToken
+// and nothing else: no cached-sibling adoption, and no fall back to a full
+// re-registration.
+//
+// That refusal is the point. A full re-register mints a new worker identity and
+// retires the one every lane is presenting, which is the mutual-eviction shape
+// documented above — an acceptable last resort when the alternative is a daemon
+// with no credentials at all, and never acceptable for a caller that has
+// working credentials and only wants to change what it attests about itself. A
+// caller here can always keep the identity it has and try again later; it must
+// not be able to burn it as a side effect of an optional feature.
+func RepresentRuntimeToken(
+	ctx context.Context,
+	regOpts RegistrationOptions,
+	currentWorkerID string,
+	reason string,
+) (*RefreshTokenResult, error) {
+	if strings.TrimSpace(currentWorkerID) == "" {
+		return nil, errors.New("re-present runtime token: no worker identity to re-present")
+	}
+	if !looksLikeRegistrationToken(regOpts.RegistrationToken) {
+		return nil, errors.New("re-present runtime token: no usable registration token")
+	}
+	r := refresherFor(regOpts)
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	fresh, err := callRefreshEndpoint(ctx, regOpts, currentWorkerID)
+	if err != nil {
+		return nil, fmt.Errorf("re-present runtime token: %w", err)
+	}
+	slog.Default().Info("[runtime-token]",
+		"event", "represent",
+		"workerId", currentWorkerID,
+		"reason", reason,
+	)
+	return r.rememberValidated(regOpts, &RefreshTokenResult{
+		Mode:                  "refresh",
+		WorkerID:              currentWorkerID,
+		RuntimeToken:          fresh.RuntimeToken,
+		RuntimeTokenExpiresAt: fresh.RuntimeTokenExpiresAt,
+		HeartbeatInterval:     fresh.HeartbeatInterval,
+		PollInterval:          fresh.PollInterval,
+		SessionShim:           cloneSessionShimCredentialReceipt(fresh.SessionShim),
+		Reason:                reason,
+	})
+}
+
 // refresh is the body of RefreshRuntimeToken, serialized per registration so
 // that two lanes reacting to the same rejection produce ONE refresh rather
 // than two competing registrations.

@@ -126,12 +126,22 @@ func (r *CredentialRefresher) Current() (workerID, runtimeJWT string) {
 func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*RefreshTokenResult, error) {
 	r.mu.Lock()
 	current := r.workerID
+	registration := r.opts.Registration
 	r.mu.Unlock()
 
-	result, err := RefreshRuntimeToken(ctx, r.opts.Registration, current, reason)
+	result, err := RefreshRuntimeToken(ctx, registration, current, reason)
 	if err != nil {
 		return nil, err
 	}
+	return r.adopt(result, registration)
+}
+
+// adopt is the post-refresh half every path shares: validate, bring every lane
+// onto the result, keep the on-disk cache current, and notify.
+func (r *CredentialRefresher) adopt(
+	result *RefreshTokenResult,
+	registration RegistrationOptions,
+) (*RefreshTokenResult, error) {
 	if r.opts.ValidateRefresh != nil {
 		if err := r.opts.ValidateRefresh(result); err != nil {
 			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
@@ -158,12 +168,12 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 	// adopt this registration instead of minting a competing one. Best-effort:
 	// a cache-write failure must never abort a refresh that already succeeded
 	// in memory.
-	if r.opts.Registration.JWTPath != "" {
-		if err := persistRefreshedToken(r.opts.Registration.JWTPath, result, r.opts.Registration.Now); err != nil {
+	if registration.JWTPath != "" {
+		if err := persistRefreshedToken(registration.JWTPath, result, registration.Now); err != nil {
 			slog.Warn("[runtime-token]",
 				"event", "refresh.cache-write-failed",
 				"workerId", result.WorkerID,
-				"jwtPath", r.opts.Registration.JWTPath,
+				"jwtPath", registration.JWTPath,
 				"err", err.Error(),
 			)
 		} else {
@@ -176,6 +186,60 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 
 	if r.opts.OnRefreshed != nil {
 		r.opts.OnRefreshed(result)
+	}
+	return result, nil
+}
+
+// SessionShimAttestation returns the host attestation this refresher currently
+// presents on every refresh and full re-registration.
+func (r *CredentialRefresher) SessionShimAttestation() SessionShimHostAttestation {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	return cloneSessionShimHostAttestation(r.opts.Registration.SessionShim)
+}
+
+// DeclareSessionShim swaps the host attestation this refresher presents and
+// re-mints on the spot, so the swap and the round trip that carries it cannot
+// be separated by an unrelated refresh.
+//
+// This is how a daemon moves between session-shim postures without re-
+// registering: the refresh re-presents THIS worker id carrying the new
+// attestation, where a full re-registration would mint a competing identity and
+// retire the one every lane is already holding.
+//
+// A failed round trip restores the previous attestation before returning. The
+// refresher must never be left presenting a claim the control plane refused —
+// the next ordinary expiry refresh would present it again, unattended.
+func (r *CredentialRefresher) DeclareSessionShim(
+	ctx context.Context,
+	attestation SessionShimHostAttestation,
+	reason string,
+) (*RefreshTokenResult, error) {
+	r.mu.Lock()
+	previous := cloneSessionShimHostAttestation(r.opts.Registration.SessionShim)
+	r.opts.Registration.SessionShim = cloneSessionShimHostAttestation(attestation)
+	r.mu.Unlock()
+
+	r.mu.Lock()
+	current := r.workerID
+	registration := r.opts.Registration
+	r.mu.Unlock()
+
+	// RepresentRuntimeToken, not Refresh: a declaration must never be able to
+	// mint a competing worker identity. If this control plane will not
+	// re-present the identity we hold with the attestation we are declaring,
+	// the honest outcome is that the declaration failed — not a new
+	// registration that retires the one every lane is using for an optional
+	// feature the caller was merely offering.
+	result, err := RepresentRuntimeToken(ctx, registration, current, reason)
+	if err == nil {
+		result, err = r.adopt(result, registration)
+	}
+	if err != nil {
+		r.mu.Lock()
+		r.opts.Registration.SessionShim = previous
+		r.mu.Unlock()
+		return nil, err
 	}
 	return result, nil
 }

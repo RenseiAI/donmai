@@ -339,14 +339,16 @@ type Daemon struct {
 	workerID  string
 	jwt       string
 	startedAt time.Time
-	// controllerID is resolved exactly once in New. It is immutable for this
-	// process and independent of registration and credential refresh state.
-	controllerIDValue string
-	controllerIDErr   error
-	// sessionShimAttestationValue is resolved, canonicalized, and frozen beside
-	// controllerIDValue. Registration and every refresh reuse this exact tuple.
-	sessionShimAttestationValue SessionShimHostAttestation
-	sessionShimAttestationErr   error
+	// shimIdentityRef holds the durable-session tuple this process presents:
+	// the composed configuration and the controller id / host attestation
+	// derived from it. It is a pointer swapped wholesale, never mutated in
+	// place, so every reader sees one coherent generation and a composition
+	// installed after New (InstallSessionShimComposition) cannot race the
+	// readers that were already consulting the previous one.
+	shimIdentityRef atomic.Pointer[sessionShimIdentity]
+	// installingComposition admits exactly one deferred composition install at
+	// a time.
+	installingComposition atomic.Bool
 	// sessionShimReadinessWithdrawn is the single dynamic admission fence shared
 	// by heartbeat capacity, poll/claim, and Daemon.AcceptWork. It flips before
 	// the lifecycle state/spawner are closed and clears only after a newly
@@ -362,6 +364,14 @@ type Daemon struct {
 	heartbeat *HeartbeatService
 	poller    *PollService
 	spawner   *WorkerSpawner
+
+	// credentials is the single refresher every lane draws its worker identity
+	// from, constructed in Start once registration has produced one. A durable-
+	// session composition that lands after startup re-declares this daemon's
+	// host attestation through it, so the declaration reaches the control plane
+	// on the identity the lanes are already presenting rather than minting a
+	// competing one.
+	credentials *CredentialRefresher
 
 	// shims is the daemon's live view of per-session shim ownership: which
 	// shims it adopted at startup, which it quarantined, and the restart fence
@@ -475,19 +485,7 @@ func New(opts Options) *Daemon {
 		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
 		shims:          newSessionShimState(),
 	}
-	d.controllerIDValue, d.controllerIDErr = resolveControllerID(opts.SessionShim)
-	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
-		opts.SessionShim,
-		d.controllerIDValue,
-	)
-	if opts.SessionShimStandDown && d.sessionShimAttestationErr == nil {
-		if d.sessionShimAttestationValue.enabled() {
-			d.sessionShimAttestationErr = errors.New(
-				"session shim: stand-down contradicts the composed host attestation")
-		} else {
-			d.sessionShimAttestationValue = SessionShimStandDownAttestation()
-		}
-	}
+	d.shimIdentityRef.Store(newSessionShimIdentity(&d.opts.SessionShim, opts.SessionShimStandDown))
 	if opts.RulesetSnapshot != nil {
 		snapshotClient := opts.RulesetSnapshot
 		d.routingTraces.SetSnapshotStatusFunc(func() (afclient.RulesetSnapshotStatus, bool) {
@@ -673,7 +671,7 @@ func (d *Daemon) HostStatus() *HostStatusDetail {
 // heartbeat goroutine's setLastHostStatus (write side) can always make
 // progress. The two never nest.
 func (d *Daemon) claimSuspended() (bool, string) {
-	if d.sessionShimAttestationValue.enabled() {
+	if d.sessionShimEnabled() {
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}
@@ -797,7 +795,7 @@ func (d *Daemon) maxConcurrentSessions() int {
 }
 
 func (d *Daemon) heartbeatMaxConcurrentSessions() int {
-	if d.sessionShimAttestationValue.enabled() &&
+	if d.sessionShimEnabled() &&
 		(d.sessionShimReadinessWithdrawn.Load() || d.State() != StateRunning) {
 		return 0
 	}
@@ -811,11 +809,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
 	}
-	if d.controllerIDErr != nil {
-		return d.controllerIDErr
+	if d.sessionShimControllerIDError() != nil {
+		return d.sessionShimControllerIDError()
 	}
-	if d.sessionShimAttestationErr != nil {
-		return d.sessionShimAttestationErr
+	if d.sessionShimAttestationError() != nil {
+		return d.sessionShimAttestationError()
 	}
 	lease, err := d.claimLifecycle(ctx, lifecycleStart)
 	if err != nil {
@@ -917,7 +915,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			ValidateCredentials: d.validateControllerCredentials,
 			SessionShim:         d.SessionShimHostAttestation(),
 			WorkareaExecutors:   workareaExecutors,
-			AuthOnly:            d.sessionShimAttestationValue.enabled(),
+			AuthOnly:            d.sessionShimEnabled(),
 		}
 	}
 
@@ -930,7 +928,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		if registerErr != nil {
 			return fmt.Errorf("register: %w", registerErr)
 		}
-		if d.sessionShimAttestationValue.enabled() {
+		if d.sessionShimEnabled() {
 			if receiptErr := d.acquireSessionShimRecoveryReceipts(ctx, regResp.SessionShim); receiptErr != nil {
 				return receiptErr
 			}
@@ -946,7 +944,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// credential/host/revision receipt first, while heartbeat, spawner, poll,
 	// claim, and capacity publication do not yet exist. The zero-value legacy
 	// path retains the established adopt-before-register order.
-	if d.sessionShimAttestationValue.enabled() {
+	if d.sessionShimEnabled() {
 		if d.opts.SkipRegistration {
 			return errors.New("session shim: attested recovery cannot skip registration")
 		}
@@ -959,7 +957,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if err := d.adoptSessionShims(ctx); err != nil {
 		return err
 	}
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		if err := register(); err != nil {
 			return err
 		}
@@ -1031,7 +1029,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.ExternalOccupancy = d.SessionShimOccupancy
 	}
 	d.spawner = NewWorkerSpawner(spawnerOpts)
-	if d.sessionShimAttestationValue.enabled() {
+	if d.sessionShimEnabled() {
 		// D12: construction is not admission. Keep the spawner closed until the
 		// first exact heartbeat response accepts the published recovery state.
 		d.spawner.Pause()
@@ -1099,6 +1097,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 		})
 		refreshCreds := credentials.Refresh
 		reregister := credentials.OnReregister
+		// Retained so a durable-session composition that lands after startup can
+		// re-declare this daemon's attestation on the identity the lanes hold,
+		// instead of registering a second one (session_shim_composition.go).
+		d.mu.Lock()
+		d.credentials = credentials
+		d.mu.Unlock()
 
 		// Heartbeat. OnReregister handles reactive credential rejection (the
 		// backstop behind the proactive refresher below): on a 401, or on a
@@ -1156,7 +1160,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			// in d.hostStatus; callers read via Daemon.HostStatus().
 			OnHostStatus: d.setLastHostStatus,
 		}
-		if d.sessionShimAttestationValue.enabled() {
+		if d.sessionShimEnabled() {
 			primaryScope := d.sessionShimConfig().orgID()
 			heartbeatOpts.GetSessionShim = func() (SessionShimHeartbeatProjection, error) {
 				return d.SessionShimHeartbeatProjection(primaryScope)
@@ -1167,7 +1171,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		}
 		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
-		if d.sessionShimAttestationValue.enabled() {
+		if d.sessionShimEnabled() {
 			if err := d.heartbeat.StartSynchronized(ctx); err != nil {
 				return fmt.Errorf("session shim: first recovery heartbeat: %w", err)
 			}

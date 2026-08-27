@@ -68,8 +68,8 @@ func TestControllerIDResolvedOnceGeneratedOrExactOverrideAndRefusesAliases(t *te
 
 	const override = "controller-exact-override"
 	overridden := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{ControllerID: override, HostID: "stable-host"}})
-	if overridden.ControllerID() != override || overridden.controllerIDErr != nil {
-		t.Fatalf("override = %q err=%v, want exact %q", overridden.ControllerID(), overridden.controllerIDErr, override)
+	if overridden.ControllerID() != override || overridden.sessionShimControllerIDError() != nil {
+		t.Fatalf("override = %q err=%v, want exact %q", overridden.ControllerID(), overridden.sessionShimControllerIDError(), override)
 	}
 	for name, cfg := range map[string]SessionShimConfig{
 		"literal":     {ControllerID: "daemon"},
@@ -78,7 +78,7 @@ func TestControllerIDResolvedOnceGeneratedOrExactOverrideAndRefusesAliases(t *te
 		"padded":      {ControllerID: " controller "},
 	} {
 		bad := New(Options{SkipRegistration: true, SessionShim: cfg})
-		if bad.controllerIDErr == nil {
+		if bad.sessionShimControllerIDError() == nil {
 			t.Errorf("%s alias was accepted as controller id", name)
 		}
 	}

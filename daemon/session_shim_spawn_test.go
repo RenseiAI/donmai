@@ -902,12 +902,8 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 	}
 	d.opts.SessionShim.GetCarrierProofV2Readiness = testSessionShimProofV2Readiness
 	d.opts.SessionShim.AttestationCapabilities = RequiredSessionShimHostCapabilities()
-	d.sessionShimAttestationValue, d.sessionShimAttestationErr = resolveSessionShimHostAttestation(
-		d.opts.SessionShim,
-		d.controllerID(),
-	)
-	if d.sessionShimAttestationErr != nil {
-		t.Fatalf("resolve hosted full-frame attestation: %v", d.sessionShimAttestationErr)
+	if err := d.refreshSessionShimIdentity().attestationErr; err != nil {
+		t.Fatalf("resolve hosted full-frame attestation: %v", err)
 	}
 	if len(scopes) == 0 {
 		scopes = []string{d.sessionShimConfig().orgID()}
