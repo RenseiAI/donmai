@@ -686,7 +686,7 @@ func (c SessionShimConfig) validateSnapshotCarrier() error {
 }
 
 func (d *Daemon) resolveSessionShimCarrierProofV2Readiness() (SessionShimCarrierProofV2Readiness, error) {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return SessionShimCarrierProofV2Readiness{}, nil
 	}
 	resolve := d.sessionShimConfig().GetCarrierProofV2Readiness
@@ -713,7 +713,7 @@ func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
 // Carrier activation is necessary but does not clear this fence: only the
 // exact current server-echoed heartbeat does.
 func (d *Daemon) beginSessionShimRecoveryHeartbeatBarrier() {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return
 	}
 	d.lifecycleMu.Lock()
@@ -734,7 +734,7 @@ func (d *Daemon) beginSessionShimRecoveryHeartbeatBarrier() {
 // poll/claim, and Daemon.AcceptWork fail closed even while the spawner/lifecycle
 // projections are converging on recovering.
 func (d *Daemon) withdrawSessionShimProofV2Readiness() {
-	if !d.sessionShimAttestationValue.enabled() ||
+	if !d.sessionShimEnabled() ||
 		!d.sessionShimReadinessWithdrawn.CompareAndSwap(false, true) {
 		return
 	}
@@ -758,7 +758,7 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 	orgID string,
 	acknowledged SessionShimHeartbeatProjection,
 ) {
-	if !d.sessionShimAttestationValue.enabled() || !d.sessionShimReadinessWithdrawn.Load() {
+	if !d.sessionShimEnabled() || !d.sessionShimReadinessWithdrawn.Load() {
 		return
 	}
 	d.shims.publicationMu.Lock()
@@ -807,6 +807,22 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 			d.spawner.Resume()
 		}
 		d.setState(StateRunning)
+		d.sessionShimReadinessWithdrawn.Store(false)
+	case StateRunning:
+		// The fence was raised while this daemon was already SERVING. Every
+		// other path that raises it also moves the lifecycle to recovering
+		// first, so this case did not exist — but a composition installed after
+		// startup publishes its adoption revision without ever leaving
+		// StateRunning, which is the entire point of installing it late.
+		//
+		// The acknowledgement is still the one reopening edge; the state the
+		// daemon happened to be in when the fence went up is not what the fence
+		// is about. Without this case the fence stays raised for the life of the
+		// process and the poll lane never claims again — a host that came up
+		// faster and then silently stopped taking work.
+		//
+		// Nothing paused the spawner on this path (the paths that do also leave
+		// recovering), so nothing is resumed here.
 		d.sessionShimReadinessWithdrawn.Store(false)
 	case StatePaused, StateDraining:
 		// Preserve an operator pause. The acknowledged heartbeat clears only the
@@ -980,6 +996,11 @@ type sessionShimState struct {
 	correlations       map[shimIncarnation]sessionShimAdoptionCorrelation
 	batchReceipts      map[string]SessionShimAdoptionBatchReceipt
 	credentialReceipts map[string]SessionShimScopeCredentialReceipt
+	// declaringComposition is set only while a deferred composition install is
+	// performing the ONE refresh that first presents its attestation. That
+	// refresh's receipt is the scope's founding authority, so it has nothing
+	// retained to be checked against; every other refresh does, and is.
+	declaringComposition bool
 	// pendingHeartbeatAcks binds every dynamically published scope to the exact
 	// adoption revision whose first server-echoed heartbeat must be observed
 	// before local capacity, poll, claim, and spawn admission reopen. A later
@@ -1045,6 +1066,14 @@ func newSessionShimState() *sessionShimState {
 	}
 }
 
+// setDeclaringComposition arms (or disarms) the founding-declaration window
+// for a deferred composition install. See declaringComposition.
+func (s *sessionShimState) setDeclaringComposition(declaring bool) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	s.declaringComposition = declaring
+}
+
 func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
 	return shimIncarnation{
 		identity:     evidence.Identity,
@@ -1054,8 +1083,12 @@ func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
 }
 
 // sessionShimConfig returns the effective configuration.
+//
+// It reads the CURRENT identity generation rather than a value snapshotted at
+// New, which is what lets a composition installed after startup take effect for
+// every caller at once (see session_shim_composition.go).
 func (d *Daemon) sessionShimConfig() SessionShimConfig {
-	cfg := d.opts.SessionShim
+	cfg := *d.shimIdentity().config
 	if cfg.RegistryDir == "" {
 		cfg.RegistryDir = defaultShimRegistryDir()
 	}
@@ -1115,8 +1148,8 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	if err := cfg.validateSnapshotCarrier(); err != nil {
 		return err
 	}
-	if d.sessionShimAttestationErr != nil {
-		return d.sessionShimAttestationErr
+	if d.sessionShimAttestationError() != nil {
+		return d.sessionShimAttestationError()
 	}
 
 	// The §D8 inequality is validated at STARTUP, before any session is admitted.
@@ -1126,7 +1159,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	if err := cfg.Orphan.Validate(); err != nil {
 		return fmt.Errorf("session shim: %w", err)
 	}
-	if d.sessionShimAttestationValue.enabled() && cfg.OnAdoptionBatch == nil {
+	if d.sessionShimEnabled() && cfg.OnAdoptionBatch == nil {
 		return errors.New("session shim: attested recovery requires OnAdoptionBatch")
 	}
 
@@ -1147,7 +1180,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		Registry:              registry,
 		ControllerID:          d.controllerID(),
 		EventBacklogBudget:    cfg.EventBacklogBudget,
-		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
+		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
 		Logger:                slog.Default(),
 	}
 	preparedByID := make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult)
@@ -1360,7 +1393,7 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				result.Close()
 				return fmt.Errorf("session shim: durable adoption batch for organization %q: %w", orgID, batchErr)
 			}
-			heartbeatAckPending := d.sessionShimAttestationValue.enabled() && cfg.OnAdoptionPublished != nil &&
+			heartbeatAckPending := d.sessionShimEnabled() && cfg.OnAdoptionPublished != nil &&
 				cfg.OnCarrierActivationAcknowledged != nil
 			if revisionErr := d.updateSessionShimAdoptionRevision(
 				orgID, receipt.AdoptionRevision, heartbeatAckPending,
@@ -1474,7 +1507,7 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 	ctx context.Context,
 	primary *SessionShimCredentialReceipt,
 ) error {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return nil
 	}
 	if primary == nil || primary.State != SessionShimCredentialStateRecovering {
@@ -1507,7 +1540,7 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 		additional, err := cfg.AcquireRecoveryScopes(
 			callbackCtx,
-			cloneSessionShimHostAttestation(d.sessionShimAttestationValue),
+			d.SessionShimHostAttestation(),
 		)
 		cancel()
 		if err != nil {
@@ -1532,16 +1565,19 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 
 // controllerID identifies this daemon process in shim diagnostics.
 func (d *Daemon) controllerID() string {
-	return d.controllerIDValue
+	return d.shimIdentity().controllerID
 }
 
 // ControllerID returns the immutable process-scoped session-shim controller id.
 func (d *Daemon) ControllerID() string { return d.controllerID() }
 
-// SessionShimHostAttestation returns a defensive copy of the immutable D12
-// tuple this process presents. Its zero value means attested recovery is off.
+// SessionShimHostAttestation returns a defensive copy of the D12 tuple this
+// process presents. Its zero value means attested recovery is off; the explicit
+// stand-down is StandsDown(). The tuple is immutable within one generation —
+// installing a composed configuration publishes a new one (see
+// session_shim_composition.go), it never edits this one.
 func (d *Daemon) SessionShimHostAttestation() SessionShimHostAttestation {
-	return cloneSessionShimHostAttestation(d.sessionShimAttestationValue)
+	return cloneSessionShimHostAttestation(d.shimIdentity().attestation)
 }
 
 func resolveSessionShimHostAttestation(cfg SessionShimConfig, controllerID string) (SessionShimHostAttestation, error) {
@@ -1604,7 +1640,7 @@ func (d *Daemon) validateControllerAlias(value, kind string) error {
 // config. No other correlation is ever substituted.
 func (d *Daemon) sessionShimHostID(ctx context.Context, orgID string) (string, error) {
 	cfg := d.sessionShimConfig()
-	if d.sessionShimAttestationValue.enabled() {
+	if d.sessionShimEnabled() {
 		d.shims.mu.RLock()
 		receipt, ok := d.shims.credentialReceipts[orgID]
 		d.shims.mu.RUnlock()
@@ -2001,7 +2037,7 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	if len(receipt.DurableCorrelation) == 0 {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: adoption batch callback omitted durable revision receipt")
 	}
-	if (d.sessionShimAttestationValue.enabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
+	if (d.sessionShimEnabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: attested adoption batch omitted adoption revision")
 	}
 	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
@@ -2183,7 +2219,7 @@ func validateSessionShimScopeReceipts(in []SessionShimScopeCredentialReceipt) er
 }
 
 func (d *Daemon) retainSessionShimCredentialReceipts(receipts []SessionShimScopeCredentialReceipt) error {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return nil
 	}
 	cloned := append([]SessionShimScopeCredentialReceipt(nil), receipts...)
@@ -2222,7 +2258,7 @@ func (d *Daemon) sessionShimCredentialReceipts() []SessionShimScopeCredentialRec
 }
 
 func (d *Daemon) updateSessionShimAdoptionRevision(scope, revision string, heartbeatAckPending bool) error {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return nil
 	}
 	if revision == "" {
@@ -2247,7 +2283,7 @@ func (d *Daemon) updateSessionShimAdoptionRevision(scope, revision string, heart
 }
 
 func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshTokenResult) error {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return nil
 	}
 	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
@@ -2271,6 +2307,13 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	defer d.shims.mu.Unlock()
 	prior, ok := d.shims.credentialReceipts[scope]
 	if !ok {
+		if d.shims.declaringComposition {
+			// The refresh that declares a deferred composition IS the round
+			// trip that establishes this scope's host authority. There is
+			// nothing retained yet to compare against, and retention is the
+			// installer's next step — see declareSessionShimComposition.
+			return nil
+		}
 		return fmt.Errorf("session shim: no retained credential receipt for refresh scope %q", scope)
 	}
 	if prior.WorkerHostID != receipt.WorkerHostID {
@@ -2718,7 +2761,7 @@ func (d *Daemon) SessionShimCarrierActivationComplete() bool {
 // the first and subsequent strict heartbeats. It never includes credentials,
 // opaque composing receipts, paths, or display detail.
 func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartbeatProjection, error) {
-	if !d.sessionShimAttestationValue.enabled() {
+	if !d.sessionShimEnabled() {
 		return SessionShimHeartbeatProjection{}, nil
 	}
 	readiness, err := d.resolveSessionShimCarrierProofV2Readiness()

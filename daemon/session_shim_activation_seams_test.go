@@ -226,8 +226,8 @@ func TestRecoveryScopeHookRequiresExactCompleteNonSecretSet(t *testing.T) {
 			}}, nil
 		},
 	}})
-	if d.sessionShimAttestationErr != nil {
-		t.Fatal(d.sessionShimAttestationErr)
+	if d.sessionShimAttestationError() != nil {
+		t.Fatal(d.sessionShimAttestationError())
 	}
 	primary := activationTestCredentialReceipt(
 		attestation, SessionShimCredentialStateRecovering, "host-primary", "revision-primary",
