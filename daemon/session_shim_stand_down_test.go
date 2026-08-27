@@ -339,8 +339,8 @@ func TestDaemonStandDownOptionDeclaresAbsenceAndRefusesContradiction(t *testing.
 	if got := standDown.SessionShimHostAttestation(); !got.StandsDown() || got.Supports() {
 		t.Fatalf("stand-down daemon attestation = %#v, want an explicit stand-down", got)
 	}
-	if standDown.sessionShimAttestationErr != nil {
-		t.Fatalf("stand-down daemon failed to compose: %v", standDown.sessionShimAttestationErr)
+	if standDown.sessionShimAttestationError() != nil {
+		t.Fatalf("stand-down daemon failed to compose: %v", standDown.sessionShimAttestationError())
 	}
 
 	silent := New(Options{})

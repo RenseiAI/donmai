@@ -211,6 +211,15 @@ type HeartbeatService struct {
 	// so they re-ride the next attempt.
 	pendingApplied  []string
 	pendingFailures []HeartbeatMutationFailure
+
+	// shimProjection / shimAcknowledged are the session-shim hooks, seeded from
+	// opts and REPLACEABLE afterwards (SetSessionShimProjection). A daemon whose
+	// durable-session composition lands after startup has to be able to start
+	// carrying the projection on a heartbeat that is already running; keeping
+	// them here rather than in opts is what makes that swap race-free, because
+	// opts is read by the beat without a lock.
+	shimProjection   func() (SessionShimHeartbeatProjection, error)
+	shimAcknowledged func(SessionShimHeartbeatProjection)
 }
 
 // NewHeartbeatService constructs a HeartbeatService from opts. Required
@@ -233,10 +242,48 @@ func NewHeartbeatService(opts HeartbeatOptions) *HeartbeatService {
 		opts.HTTPClient = &http.Client{Timeout: 5 * time.Second}
 	}
 	return &HeartbeatService{
-		opts:     opts,
-		workerID: opts.WorkerID,
-		jwt:      opts.RuntimeJWT,
+		opts:             opts,
+		workerID:         opts.WorkerID,
+		jwt:              opts.RuntimeJWT,
+		shimProjection:   opts.GetSessionShim,
+		shimAcknowledged: opts.OnSessionShimAcknowledged,
 	}
+}
+
+// SetSessionShimProjection installs (or, with a nil getter, withdraws) the
+// session-shim projection this heartbeat carries.
+//
+// Passing nil is the explicit stand-down: the beat goes back to omitting the
+// key entirely, which is what a control plane reads as "this host is not
+// projecting a shim" rather than "this host is projecting an empty one".
+//
+// The two hooks move together on purpose. An acknowledgement callback left
+// behind a withdrawn projection would fire against a state nobody published,
+// and a projection installed without one would never let the daemon learn that
+// authority accepted it.
+func (h *HeartbeatService) SetSessionShimProjection(
+	get func() (SessionShimHeartbeatProjection, error),
+	onAcknowledged func(SessionShimHeartbeatProjection),
+) {
+	if h == nil {
+		return
+	}
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.shimProjection = get
+	h.shimAcknowledged = onAcknowledged
+}
+
+// sessionShimHooks returns the projection hooks in effect for one beat. Both
+// are read under one lock so a beat can never compose a projection with one
+// generation's getter and acknowledge it with another's callback.
+func (h *HeartbeatService) sessionShimHooks() (
+	func() (SessionShimHeartbeatProjection, error),
+	func(SessionShimHeartbeatProjection),
+) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.shimProjection, h.shimAcknowledged
 }
 
 // Start launches the heartbeat goroutine. It sends an immediate heartbeat,
@@ -429,8 +476,9 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			payload.QuarantinedSessions = q
 		}
 	}
-	if h.opts.GetSessionShim != nil {
-		projection, projectionErr := h.opts.GetSessionShim()
+	getSessionShim, onSessionShimAcknowledged := h.sessionShimHooks()
+	if getSessionShim != nil {
+		projection, projectionErr := getSessionShim()
 		if projectionErr != nil {
 			return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
 		}
@@ -495,8 +543,8 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		// the platform's response (hostStatus + pendingMutations).
 		h.dropConfirmedAcks(ackApplied, ackFailures)
 		h.handleHeartbeatResponse(ctx, resp)
-		if payload.SessionShim != nil && h.opts.OnSessionShimAcknowledged != nil {
-			h.opts.OnSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
+		if payload.SessionShim != nil && onSessionShimAcknowledged != nil {
+			onSessionShimAcknowledged(cloneSessionShimHeartbeatProjection(*payload.SessionShim))
 		}
 		return nil
 	}

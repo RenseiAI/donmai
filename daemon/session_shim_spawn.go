@@ -67,7 +67,17 @@ const shimRecordPollInterval = 25 * time.Millisecond
 // destroyed by a daemon restart. A headless worker that dies with its daemon is
 // re-dispatched; a human's terminal is not.
 func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
-	if !d.sessionShimConfig().EnableOwnership {
+	identity := d.shimIdentity()
+	if identity.pendingComposition {
+		// A composition installed after startup is live for the adoption pass
+		// before it is live for ownership: until that pass has accounted for
+		// what is already running on this host, a session handed to a shim is
+		// a session admitted against capacity nobody has counted. Direct
+		// ownership in that window is the same posture the host had a moment
+		// earlier, so nothing regresses by waiting.
+		return false
+	}
+	if !identity.config.EnableOwnership {
 		return false
 	}
 	return spec.Mode == interactiveRunMode
@@ -92,8 +102,8 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	if err := cfg.validateSnapshotCarrier(); err != nil {
 		return nil, err
 	}
-	if d.sessionShimAttestationErr != nil {
-		return nil, d.sessionShimAttestationErr
+	if d.sessionShimAttestationError() != nil {
+		return nil, d.sessionShimAttestationError()
 	}
 	id := sessionshim.Identity{OrgID: cfg.orgIDForSession(spec), SessionID: spec.SessionID}
 	if err := id.Validate(); err != nil {
@@ -152,7 +162,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		ExpectedWorkarea:      workarea,
 		ExpectedWorkareaRoot:  layout.Root.String(),
 		DialTimeout:           cfg.launchTimeout(),
-		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimAttestationValue.enabled(),
+		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
 		Logger:                slog.Default(),
 		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
@@ -221,7 +231,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		}()
 	}
 	heartbeatBarrier := cfg.OnAdoptionPublished != nil && cfg.OnCarrierActivationAcknowledged != nil &&
-		d.sessionShimAttestationValue.enabled()
+		d.sessionShimEnabled()
 	if cfg.OnAdoptionPublished != nil {
 		if heartbeatBarrier {
 			d.beginSessionShimRecoveryHeartbeatBarrier()
