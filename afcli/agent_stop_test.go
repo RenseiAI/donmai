@@ -156,3 +156,49 @@ func TestAgentStopHTTPNotFound(t *testing.T) {
 		t.Errorf("expected 'session not found' messaging; got: %v", err)
 	}
 }
+
+func TestAgentStopJSONPreservesTypedReconciliationRequiredReceipt(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/stop") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusConflict)
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-live-red","previousStatus":"starting","code":"SESSION_LIFECYCLE_RECONCILIATION_REQUIRED","refusal":"session_lifecycle_reconciliation_required","retryable":false,"disposition":"reconciliation_required","ownerLiveness":"unverified","preparedAgeMs":19019000,"mutationId":"cleanup:claimed-stale:sess-live-red"}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd := newAgentStopCmd(ds)
+	var stdout strings.Builder
+	var stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"sess-live-red", "--json"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("expected typed 409 to retain a nonzero command result")
+	}
+	if !errors.Is(err, afclient.ErrConflict) {
+		t.Fatalf("expected errors.Is(err, ErrConflict); got: %v", err)
+	}
+	var receipt map[string]any
+	if decodeErr := json.Unmarshal([]byte(stdout.String()), &receipt); decodeErr != nil {
+		t.Fatalf("typed 409 did not emit machine JSON: %v\nstdout=%q\nstderr=%q\nerror=%v", decodeErr, stdout.String(), stderr.String(), err)
+	}
+	if receipt["code"] != "SESSION_LIFECYCLE_RECONCILIATION_REQUIRED" ||
+		receipt["disposition"] != "reconciliation_required" ||
+		receipt["ownerLiveness"] != "unverified" || receipt["retryable"] != false {
+		t.Fatalf("typed receipt fields lost: %#v", receipt)
+	}
+	if _, ok := receipt["retryAfterSeconds"]; ok {
+		t.Fatalf("reconciliation-required receipt invented Retry-After: %#v", receipt)
+	}
+	if !strings.Contains(err.Error(), "reconciliation_required") {
+		t.Fatalf("human error omitted typed disposition: %v", err)
+	}
+}

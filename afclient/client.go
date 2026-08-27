@@ -10,6 +10,7 @@ import (
 	"io"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -329,6 +330,17 @@ func hashSessionID(sessionID string) string {
 }
 
 func (c *Client) post(path string, body any, target any) error {
+	return c.postWithErrorDecoder(path, body, target, nil)
+}
+
+type responseErrorDecoder func(*http.Response, error) error
+
+func (c *Client) postWithErrorDecoder(
+	path string,
+	body any,
+	target any,
+	decodeError responseErrorDecoder,
+) error {
 	data, err := json.Marshal(body)
 	if err != nil {
 		return fmt.Errorf("marshal failed: %w", err)
@@ -346,6 +358,9 @@ func (c *Client) post(path string, body any, target any) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 	if err := statusToError(resp.StatusCode, path); err != nil {
+		if decodeError != nil {
+			return decodeError(resp, err)
+		}
 		return err
 	}
 	if target != nil {
@@ -354,11 +369,139 @@ func (c *Client) post(path string, body any, target any) error {
 	return nil
 }
 
+const maxStopSessionErrorBodyBytes = 16 << 10
+
+type stopSessionErrorWire struct {
+	Stopped        *bool         `json:"stopped"`
+	SessionID      string        `json:"sessionId"`
+	PreviousStatus SessionStatus `json:"previousStatus"`
+	Code           string        `json:"code"`
+	Refusal        string        `json:"refusal"`
+	Retryable      *bool         `json:"retryable"`
+	Disposition    string        `json:"disposition"`
+	OwnerLiveness  string        `json:"ownerLiveness"`
+	PreparedAgeMs  *int64        `json:"preparedAgeMs"`
+	MutationID     string        `json:"mutationId"`
+}
+
+func decodeStopSessionError(resp *http.Response, fallback error) error {
+	if resp.StatusCode != http.StatusConflict ||
+		!strings.Contains(resp.Header.Get("Content-Type"), "application/json") {
+		return fallback
+	}
+	raw, err := io.ReadAll(io.LimitReader(resp.Body, maxStopSessionErrorBodyBytes+1))
+	if err != nil || len(raw) == 0 || len(raw) > maxStopSessionErrorBodyBytes {
+		return fallback
+	}
+	var untrusted any
+	if err := json.Unmarshal(raw, &untrusted); err != nil || containsSecretMaterial(untrusted) {
+		return fallback
+	}
+	var wire stopSessionErrorWire
+	if err := json.Unmarshal(raw, &wire); err != nil || !validStopSessionError(wire) {
+		return fallback
+	}
+	receipt := &StopSessionError{
+		HTTPStatus:     resp.StatusCode,
+		Stopped:        *wire.Stopped,
+		SessionID:      wire.SessionID,
+		PreviousStatus: wire.PreviousStatus,
+		Code:           wire.Code,
+		Refusal:        wire.Refusal,
+		Retryable:      *wire.Retryable,
+		Disposition:    wire.Disposition,
+		OwnerLiveness:  wire.OwnerLiveness,
+		PreparedAgeMs:  wire.PreparedAgeMs,
+		MutationID:     wire.MutationID,
+	}
+	if seconds, ok := parseBoundedRetryAfter(resp.Header.Get("Retry-After")); ok {
+		receipt.RetryAfterSeconds = &seconds
+	}
+	return receipt
+}
+
+func validStopSessionError(wire stopSessionErrorWire) bool {
+	return wire.Stopped != nil && !*wire.Stopped && wire.Retryable != nil &&
+		safeReceiptAtom(wire.SessionID, 256) &&
+		safeReceiptAtom(string(wire.PreviousStatus), 64) &&
+		safeReceiptAtom(wire.Code, 128) &&
+		safeReceiptAtom(wire.Refusal, 128) &&
+		optionalReceiptAtom(wire.Disposition, 128) &&
+		optionalReceiptAtom(wire.OwnerLiveness, 64) &&
+		optionalReceiptAtom(wire.MutationID, 256) &&
+		(wire.PreparedAgeMs == nil || *wire.PreparedAgeMs >= 0)
+}
+
+func safeReceiptAtom(value string, maxLen int) bool {
+	if value == "" || len(value) > maxLen {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || strings.ContainsRune("._:-", r)) {
+			return false
+		}
+	}
+	return true
+}
+
+func optionalReceiptAtom(value string, maxLen int) bool {
+	return value == "" || safeReceiptAtom(value, maxLen)
+}
+
+func parseBoundedRetryAfter(value string) (int, bool) {
+	seconds, err := strconv.Atoi(strings.TrimSpace(value))
+	if err != nil || seconds < 1 || seconds > 3600 {
+		return 0, false
+	}
+	return seconds, true
+}
+
+func containsSecretMaterial(value any) bool {
+	switch typed := value.(type) {
+	case map[string]any:
+		for key, child := range typed {
+			lowerKey := strings.ToLower(key)
+			if lowerKey == "apikey" || lowerKey == "privatekey" ||
+				lowerKey == "accesskey" || strings.HasSuffix(lowerKey, "_key") {
+				return true
+			}
+			for _, fragment := range []string{"authorization", "credential", "password", "secret", "token"} {
+				if strings.Contains(lowerKey, fragment) {
+					return true
+				}
+			}
+			if containsSecretMaterial(child) {
+				return true
+			}
+		}
+	case []any:
+		for _, child := range typed {
+			if containsSecretMaterial(child) {
+				return true
+			}
+		}
+	case string:
+		lower := strings.ToLower(strings.TrimSpace(typed))
+		for _, prefix := range []string{"bearer ", "rsk_", "lin_api_", "ghp_", "sk-"} {
+			if strings.HasPrefix(lower, prefix) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // StopSession sends a stop request for the given session and returns the
 // coordinator's response describing the status transition.
 func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
 	var resp StopSessionResponse
-	if err := c.post("/api/public/sessions/"+id+"/stop", nil, &resp); err != nil {
+	if err := c.postWithErrorDecoder(
+		"/api/public/sessions/"+id+"/stop",
+		nil,
+		&resp,
+		decodeStopSessionError,
+	); err != nil {
 		return nil, err
 	}
 	return &resp, nil
