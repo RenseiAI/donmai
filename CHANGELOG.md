@@ -10,6 +10,57 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.70.0 — 2026-08-27
+
+### Breaking
+
+- **A composed session-shim configuration may now be installed after `New`.**
+  `Daemon.InstallSessionShimComposition` and `Server.StartBeforeDaemon` are new
+  public surface, and `SessionShimOwnsSession` reports ownership through the
+  live generation rather than a captured answer. Embedders that still pass
+  `Options.SessionShim` to `New` keep today's semantics exactly — the inline
+  path is unchanged, including its startup safety checks.
+
+### Features
+
+- **Daemon readiness no longer waits on the durable-session composition.**
+  Readiness used to sit behind work whose duration the host does not control: a
+  registration round trip, and a startup adoption pass whose failure aborted
+  `Start` outright. On a healthy host that is a second; on a slow or wedged
+  control plane it is a timeout, and every caller polling for ready — service
+  installers most of all — inherited the wait.
+
+  The control listener now answers before the daemon has started, so "still
+  coming up" and "nothing is there" stop being indistinguishable, and a
+  composition can be installed on a daemon that is already serving. The
+  sequence is install → declare → adopt → announce: the declaration comes
+  first because host authority resolves from credential receipts that do not
+  exist until a round trip has happened, so adopting before declaring cannot
+  work.
+
+  Nothing announces the shim as active before the adoption pass completes, and
+  new sessions are not handed to a shim while a composition is still pending —
+  a host that came up fast must not claim to have recovered work it has not
+  counted yet.
+
+### Fixes
+
+- **A late-published adoption revision no longer strands the claim lane.**
+  Publishing an adoption revision raises an admission fence that only an exact
+  acknowledged heartbeat clears. The reopening switch handled a daemon that was
+  recovering, paused, or draining, but not one that was already running —
+  every prior path reached the fence through `recovering`, so the case had
+  never existed. A composition installed after startup never leaves `running`,
+  so the daemon came up faster and then silently stopped claiming work.
+
+- **Declaring a session-shim attestation can no longer mint a competing worker
+  identity.** The declaration went through the runtime-token refresh, which
+  falls back to a full re-registration on a missing endpoint — the documented
+  mutual-eviction shape — to deliver an optional capability. It now uses a
+  represent-only path with no such fallback.
+
+---
+
 ## v0.69.2 — 2026-08-27
 
 ### Fixes
