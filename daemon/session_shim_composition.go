@@ -228,6 +228,9 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 		}
 		d.shimIdentityRef.Store(prior)
 		d.discardSessionShimCompositionState()
+		// Before the stand-down goes back on the wire: admission is local and
+		// must not wait on a network round trip that is itself best-effort.
+		d.restoreSessionShimAdmissionAfterFailedInstall()
 		if declared {
 			d.redeclareSessionShimStandDown(ctx, prior.attestation)
 		}
@@ -331,6 +334,36 @@ func (d *Daemon) redeclareSessionShimStandDown(ctx context.Context, attestation 
 	); err != nil {
 		slog.Warn("session shim: could not re-declare stand-down after a failed composition install",
 			"err", err.Error())
+	}
+}
+
+// restoreSessionShimAdmissionAfterFailedInstall clears a proof-v2 readiness
+// withdrawal that the install's own window provoked. While a composition is
+// pending, this daemon already presents the composed attestation, so a poll
+// tick's claim gate or a heartbeat projection resolve can consult the
+// embedder's readiness resolver at the one moment it cannot answer yet —
+// before the founding receipt exists — and withdraw admission: latch raised,
+// spawner paused, lifecycle moved to recovering. A SUCCESSFUL install
+// self-heals through the acknowledged projected heartbeat; a failed one used
+// to roll back the identity and leave the withdrawal standing — a daemon
+// claiming to serve while refusing every admission, forever. A withdrawal the
+// install provoked must not outlive the install it belongs to.
+//
+// Mirrors the reopen in AcknowledgeSessionShimRecoveryHeartbeat: same lock,
+// same stopGen guard so a daemon mid-shutdown is not resurrected, and only the
+// recovering state is reopened — an operator pause or drain stays an operator
+// pause or drain.
+func (d *Daemon) restoreSessionShimAdmissionAfterFailedInstall() {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.CompareAndSwap(true, false) {
+		return
+	}
+	if d.State() == StateRecovering {
+		if d.spawner != nil {
+			d.spawner.Resume()
+		}
+		d.setState(StateRunning)
 	}
 }
 

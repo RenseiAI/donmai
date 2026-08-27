@@ -14,6 +14,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -235,7 +236,18 @@ func TestFailedInstallAfterAnAcceptedDeclarationWithdrawsItExactlyOnce(t *testin
 			tc.configure(embedder)
 			cfg := h.composedConfig(acceptingBatch)
 			cfg.GetCarrierProofV2Readiness = embedder.readiness
-			cfg.AcquireRecoveryScopes = embedder.acquireRecoveryScopes
+			// The deterministic stand-in for a poll tick landing inside the
+			// install window: the pending identity is live, the resolver
+			// cannot answer yet, and admission gets withdrawn. CI hits this
+			// timing on its own; the test must not depend on winning a race.
+			var withdrewDuringWindow atomic.Bool
+			cfg.AcquireRecoveryScopes = func(
+				cbCtx context.Context, att SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt,
+			) ([]SessionShimScopeCredentialReceipt, error) {
+				h.daemon.withdrawSessionShimProofV2Readiness()
+				withdrewDuringWindow.Store(h.daemon.sessionShimReadinessWithdrawn.Load())
+				return embedder.acquireRecoveryScopes(cbCtx, att, primary)
+			}
 			installErr := h.daemon.InstallSessionShimComposition(ctx, cfg)
 			if !errors.Is(installErr, tc.want) {
 				t.Fatalf("install err = %v, want %v", installErr, tc.want)
@@ -252,7 +264,23 @@ func TestFailedInstallAfterAnAcceptedDeclarationWithdrawsItExactlyOnce(t *testin
 				t.Fatalf("the last refresh presented %#v, want the stand-down", last)
 			}
 
-			// And the daemon is serving, stood down, on every surface.
+			// The forced withdrawal really latched inside the window — without
+			// this the reopening assertions below could pass by never having
+			// had anything to reopen.
+			if !withdrewDuringWindow.Load() {
+				t.Fatal("the install window never withdrew admission; the probe proves nothing")
+			}
+
+			// And the daemon is serving, stood down, on every surface —
+			// including admission, which the install window's own withdrawal
+			// had closed.
+			if h.daemon.sessionShimReadinessWithdrawn.Load() {
+				t.Error("the install window's readiness withdrawal outlived the failed install")
+			}
+			if _, err := h.daemon.AcceptWorkWithDetail(SessionSpec{}, &SessionDetail{}); err == nil ||
+				strings.Contains(err.Error(), "withdrawn") {
+				t.Errorf("work admission after the failed install: err = %v, want the benign spec refusal", err)
+			}
 			if state := h.daemon.State(); state != StateRunning {
 				t.Fatalf("daemon state after the failed install = %q, want %q", state, StateRunning)
 			}

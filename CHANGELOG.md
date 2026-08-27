@@ -32,6 +32,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   is now deferred for the founding refresh alone — it runs once the primary
   receipt is retained and handed to the embedder — and every other refresh
   checks readiness before adopting, exactly as before.
+- **An install abandoned mid-window no longer leaves the daemon refusing all
+  work.** While a composition install is pending, the daemon already presents
+  the composed attestation, so a poll tick or heartbeat projection resolve
+  could consult the embedder's readiness resolver before the founding receipt
+  existed and withdraw admission (spawner paused, state recovering, every
+  `AcceptWork` refused). A successful install self-heals through the
+  acknowledged heartbeat; a failed one rolled back the identity but left the
+  withdrawal standing. The rollback now restores the admission its own window
+  closed.
 - **An install that fails after the control plane accepted its attestation
   withdraws it.** The rollback re-declares the stand-down as soon as the
   declaring round trip was accepted, not only once the receipts and readiness
