@@ -453,7 +453,21 @@ type SessionShimConfig struct {
 	// addition to the primary registration scope. It retains all credentials and
 	// returns only deterministic non-secret scope/host/revision receipts. Its
 	// result must exactly cover AdoptionBatchOrgIDs excluding the primary scope.
-	AcquireRecoveryScopes func(context.Context, SessionShimHostAttestation) ([]SessionShimScopeCredentialReceipt, error)
+	//
+	// primary is the primary scope's receipt exactly as the founding round trip
+	// resolved it — the registration on the inline path, the declaring refresh
+	// on a deferred composition install: Scope is OrgID, WorkerHostID the stable
+	// host authority, AdoptionRevision the revision the control plane answered
+	// with. It is non-secret, and the embedder must RETAIN it for its own
+	// host-authority lookups rather than re-derive it: the only other way to
+	// learn the host id is to present the attestation again, and a presentation
+	// outside the credential refresher's lock races the lanes the refresher
+	// keeps on one identity — the control plane sees the posture flip-flop,
+	// answers an attestation conflict, and revokes the losing credential. The
+	// hook is called AFTER the primary receipt is retained here and BEFORE any
+	// readiness resolver that needs the host id runs, so the embedder can
+	// record it first.
+	AcquireRecoveryScopes func(ctx context.Context, attestation SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt) ([]SessionShimScopeCredentialReceipt, error)
 
 	// RequireAuthoritativeSnapshot declares that the composing external attach
 	// carrier needs fresh inspect/emit proxying and the selected-v3 raw HostFrame
@@ -1515,9 +1529,10 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 	}
 	cfg := d.sessionShimConfig()
 	primaryScope := cfg.orgID()
-	receipts := []SessionShimScopeCredentialReceipt{{
+	primaryReceipt := SessionShimScopeCredentialReceipt{
 		Scope: primaryScope, WorkerHostID: primary.WorkerHostID, AdoptionRevision: primary.AdoptionRevision,
-	}}
+	}
+	receipts := []SessionShimScopeCredentialReceipt{primaryReceipt}
 	expected := make([]string, 0, len(cfg.AdoptionBatchOrgIDs))
 	seen := make(map[string]bool, len(cfg.AdoptionBatchOrgIDs))
 	for _, scope := range cfg.AdoptionBatchOrgIDs {
@@ -1541,6 +1556,7 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 		additional, err := cfg.AcquireRecoveryScopes(
 			callbackCtx,
 			d.SessionShimHostAttestation(),
+			cloneSessionShimScopeCredentialReceipt(primaryReceipt),
 		)
 		cancel()
 		if err != nil {
