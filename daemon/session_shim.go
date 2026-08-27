@@ -763,6 +763,113 @@ func (d *Daemon) withdrawSessionShimProofV2Readiness() {
 	slog.Warn("session shim: proof-v2 readiness withdrawn; admission paused")
 }
 
+// sessionShimPublicationCheckpoint is one scope's exact publication posture,
+// captured under publicationMu immediately before a dynamic adoption attempt
+// mutates it. It exists because the attempt closes the heartbeat lane
+// (carrierActivationComplete drops, the recovery barrier pauses admission) on
+// the promise that the attempt will either commit or restore — and before this
+// checkpoint existed the failure path restored nothing: the projection kept
+// erroring, HeartbeatService skipped every beat, and a NACKed launch left the
+// daemon permanently silent with no repair channel.
+type sessionShimPublicationCheckpoint struct {
+	scope                       string
+	adoptionComplete            bool
+	carrierActivationComplete   bool
+	adoptionCompletedAtUnixNano int64
+	pendingRevision             string
+	pendingAckPresent           bool
+	readinessWithdrawn          bool
+	lifecycleState              State
+	spawnerAccepting            bool
+}
+
+// checkpointSessionShimPublication snapshots the last-committed posture for
+// one scope. Callers must hold publicationMu: the checkpoint is only coherent
+// while no other dynamic publication can move the flags it captures.
+func (d *Daemon) checkpointSessionShimPublication(scope string) sessionShimPublicationCheckpoint {
+	cp := sessionShimPublicationCheckpoint{
+		scope:              scope,
+		lifecycleState:     d.State(),
+		readinessWithdrawn: d.sessionShimReadinessWithdrawn.Load(),
+	}
+	if d.spawner != nil {
+		cp.spawnerAccepting = d.spawner.IsAccepting()
+	}
+	d.shims.mu.RLock()
+	cp.adoptionComplete = d.shims.adoptionComplete
+	cp.carrierActivationComplete = d.shims.carrierActivationComplete
+	cp.adoptionCompletedAtUnixNano = d.shims.adoptionCompletedAtUnixNano
+	cp.pendingRevision, cp.pendingAckPresent = d.shims.pendingHeartbeatAcks[scope]
+	d.shims.mu.RUnlock()
+	return cp
+}
+
+// rollbackSessionShimPublication restores the pre-attempt posture after a
+// dynamic publication failed BEFORE its durable batch committed.
+//
+// The beat is the repair channel and must never fall silent: restoring the
+// last-committed projection means the next beat re-attests exactly the state
+// the platform last acknowledged, so a control plane that cleared or demoted
+// the host's row while the attempt was in flight receives a correcting beat
+// instead of eternal silence. The barrier's invariant — never announce an
+// adoption that did not commit — holds because everything restored here was
+// already announced and acknowledged; the rolled-back beat says nothing new.
+//
+// Admission reopens with the projection: nothing durable advanced, so the base
+// a queued launch would publish from is exactly the base this attempt started
+// from, and there is nothing left for a heartbeat acknowledgement to clear on
+// this scope's behalf (on the measured failure path the readiness fence was
+// never even withdrawn, so no acknowledgement edge could ever have reopened
+// admission — the restore has to do it directly).
+//
+// Callers must hold publicationMu.
+func (d *Daemon) rollbackSessionShimPublication(cp sessionShimPublicationCheckpoint) {
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = cp.adoptionComplete
+	d.shims.carrierActivationComplete = cp.carrierActivationComplete
+	d.shims.adoptionCompletedAtUnixNano = cp.adoptionCompletedAtUnixNano
+	if cp.pendingAckPresent {
+		d.shims.pendingHeartbeatAcks[cp.scope] = cp.pendingRevision
+	} else {
+		delete(d.shims.pendingHeartbeatAcks, cp.scope)
+	}
+	// Same critical section as the pending-ack bookkeeping, mirroring
+	// updateSessionShimAdoptionRevision: a heartbeat must never observe the
+	// fence without the bookkeeping it fences, in either direction.
+	d.sessionShimReadinessWithdrawn.Store(cp.readinessWithdrawn)
+	d.shims.mu.Unlock()
+	d.lifecycleMu.Lock()
+	if d.stopGen == nil && d.State() == StateRecovering && cp.lifecycleState != StateRecovering {
+		d.setState(cp.lifecycleState)
+	}
+	if d.spawner != nil && cp.spawnerAccepting {
+		d.spawner.Resume()
+	}
+	d.lifecycleMu.Unlock()
+	slog.Warn("session shim: dynamic publication failed; rolled back to the last-committed projection so the heartbeat lane stays live",
+		"scope", cp.scope)
+}
+
+// restoreSessionShimHeartbeatLane re-arms only the heartbeat projection after
+// a dynamic publication whose durable batch DID commit could not complete
+// locally (a stale published entry, a refused carrier activation).
+//
+// The committed revision is real and retained, so admission deliberately stays
+// latched closed exactly as before — but the projection flags are restored so
+// the beat keeps flowing and attests the committed truth, rather than skipping
+// forever with "carrier activation is not complete" while the platform's row
+// decays with no channel left to repair it.
+//
+// Callers must hold publicationMu.
+func (d *Daemon) restoreSessionShimHeartbeatLane(cp sessionShimPublicationCheckpoint) {
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = cp.adoptionComplete
+	d.shims.carrierActivationComplete = cp.carrierActivationComplete
+	d.shims.mu.Unlock()
+	slog.Warn("session shim: committed dynamic publication could not complete; admission stays closed but the heartbeat lane stays live",
+		"scope", cp.scope)
+}
+
 // AcknowledgeSessionShimRecoveryHeartbeat is the only dynamic reopening edge.
 // Primary and satellite heartbeat services invoke it with their explicit scope
 // after an exact server acknowledgement. A second live readiness resolution is
@@ -1164,6 +1271,26 @@ func (c SessionShimConfig) callbackTimeout() time.Duration {
 		return c.CallbackTimeout
 	}
 	return c.launchTimeout()
+}
+
+// sessionShimAdoptionPublicationStages is the depth of the dynamic adoption
+// publication pipeline: durable adoption (OnAdoption/OnAdoptionV2), batch
+// preparation (PrepareAdoptionBatch), batch commit (OnAdoptionBatch), and
+// carrier activation (OnAdoptionPublished). Sequential, fixed, and each stage
+// individually bounded by sessionShimCallbackContext.
+const sessionShimAdoptionPublicationStages = 4
+
+// adoptionPublicationTimeout bounds one whole dynamic adoption publication.
+//
+// It is derived, not chosen: every stage of the pipeline already runs under
+// callbackTimeout, and the pipeline has a fixed depth, so the flow's bound is
+// exactly the per-stage bound times that depth. Deriving it keeps this one
+// stream bounded in one unit — a second hand-picked number is how the launch
+// clock came to be the binding constraint on the batch prepare, handing it the
+// one or two seconds discovery left over while the callback's own retry policy
+// still held a full budget.
+func (c SessionShimConfig) adoptionPublicationTimeout() time.Duration {
+	return sessionShimAdoptionPublicationStages * c.callbackTimeout()
 }
 
 // adoptSessionShims runs the §D4 startup pass: discover, classify, adopt every

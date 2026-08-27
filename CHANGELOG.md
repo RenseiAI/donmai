@@ -6,6 +6,34 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **A failed dynamic adoption publication rolls back to the last-committed
+  projection and keeps the heartbeat alive.** A launch-time adoption raises the
+  recovery barrier and drops the carrier-activation flag for the attempt; when
+  the durable batch then failed, nothing restored that state — the heartbeat
+  projection erred with "carrier activation is not complete" forever, every
+  beat was skipped, admission stayed closed, and the host was stranded with no
+  repair channel (ready-looking platform row, claims disabled, beats silent).
+  The failure path now restores the exact pre-attempt posture (projection
+  flags, pending-ack bookkeeping, readiness fence, lifecycle/spawner) when
+  nothing durable committed, rings one immediate correcting beat that
+  re-attests the state the control plane last acknowledged, and reopens
+  admission on the same committed base. A publication whose batch DID commit
+  but could not complete locally keeps admission latched closed as before, but
+  the heartbeat lane is restored so the committed truth stays attested.
+- **The durable adoption publication runs on its own budget, not the launch
+  clock's remainder.** The batch prepare inherited whatever one or two seconds
+  discovery and handshake left of the launch timeout and died on "context
+  deadline exceeded" while its own retry policy still held a full budget. The
+  publication pipeline (durable adoption, batch prepare, batch commit, carrier
+  activation) now gets a bound derived from the existing per-callback bound
+  times the pipeline depth; a claim that still cannot complete inside that
+  budget NACKs through the same rollback, leaving the daemon beating and
+  claimable.
+
 ## v0.71.0 — 2026-08-27
 
 ### Breaking

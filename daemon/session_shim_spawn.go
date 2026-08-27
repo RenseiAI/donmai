@@ -23,7 +23,9 @@ import (
 // It is generous because the shim's first act is spawning a real harness under a
 // PTY on a possibly-loaded host, and it is BOUNDED because a launch that never
 // produces a record must fail the accept rather than hold a capacity slot for a
-// session that does not exist.
+// session that does not exist. It bounds discovery and handshake ONLY: the
+// durable adoption publication that follows runs on its own derived budget
+// (adoptionPublicationTimeout), never on this clock's remainder.
 const defaultShimLaunchTimeout = 30 * time.Second
 
 type shimAdoptionGate struct {
@@ -204,9 +206,26 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	}
 	gate := newShimAdoptionGate()
 	d.consumeShimEventsGated(ctrl, gate)
+	// The launch clock (cfg.launchTimeout()) exists to bound discovery and
+	// handshake of the freshly launched shim. Everything from here on is the
+	// durable adoption publication: a fixed pipeline of composing callbacks,
+	// each individually bounded by sessionShimCallbackContext. Running that
+	// pipeline on the launch clock's REMAINDER made the wrong stream the
+	// binding constraint — a slow discovery handed the batch prepare one or
+	// two seconds while the callback's own retry policy still held a full
+	// budget, and the whole claim NACKed on a deadline nobody chose for it.
+	// The publication gets its own bound, derived from the per-callback bound
+	// times the pipeline depth (see adoptionPublicationTimeout).
+	pubCtx, cancelPublication := context.WithTimeout(
+		context.WithoutCancel(ctx), cfg.adoptionPublicationTimeout())
+	defer cancelPublication()
 	// ringPostActivationHeartbeat is set only on the path that raised the
 	// recovery heartbeat barrier for THIS launch AND completed carrier
 	// activation, so the beat below can only ever carry a complete projection.
+	// ringCorrectingHeartbeat is its failure twin: a failed serialized
+	// publication restores the last-committed projection, and this one beat is
+	// what tells the control plane so immediately — the row it cleared for the
+	// in-flight attempt would otherwise sit demoted until the next tick.
 	//
 	// This defer is registered BEFORE the publication barrier below precisely so
 	// it runs AFTER that barrier's own deferred unlock — defers are LIFO. The
@@ -214,19 +233,30 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// ringing it while still holding the barrier would deadlock the launch
 	// against its own heartbeat.
 	ringPostActivationHeartbeat := false
+	ringCorrectingHeartbeat := false
 	defer func() {
-		if !ringPostActivationHeartbeat {
+		if ringPostActivationHeartbeat {
+			// Snapshot before the beat: donmai's own acknowledgement clears the
+			// scope it owns, and the hook is meant to see the set that activation
+			// actually produced.
+			activated := d.sessionShimActivatedScopes()
+			d.ringSessionShimPostActivationHeartbeat(pubCtx)
+			d.notifySessionShimAdoptionActivated(pubCtx, activated)
 			return
 		}
-		// Snapshot before the beat: donmai's own acknowledgement clears the
-		// scope it owns, and the hook is meant to see the set that activation
-		// actually produced.
-		activated := d.sessionShimActivatedScopes()
-		d.ringSessionShimPostActivationHeartbeat(ctx)
-		d.notifySessionShimAdoptionActivated(ctx, activated)
+		if !ringCorrectingHeartbeat {
+			return
+		}
+		// The publication budget may be the very thing that just expired, so
+		// the correcting beat rides one fresh callback-sized bound of its own.
+		beatCtx, cancelBeat := context.WithTimeout(
+			context.WithoutCancel(pubCtx), cfg.callbackTimeout())
+		defer cancelBeat()
+		d.ringSessionShimPostActivationHeartbeat(beatCtx)
 	}()
 	serializedPublication := cfg.OnAdoptionPublished != nil
 	publicationSucceeded := !serializedPublication
+	publicationCommitted := false
 	if serializedPublication {
 		d.shims.publicationMu.Lock()
 		if d.shims.dynamicPublicationFailed {
@@ -236,9 +266,27 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			_ = ctrl.Close()
 			return nil, errors.New("session shim: a prior dynamic adoption publication failed")
 		}
+		checkpoint := d.checkpointSessionShimPublication(id.OrgID)
 		defer func() {
 			if !publicationSucceeded {
-				d.shims.dynamicPublicationFailed = true
+				if publicationCommitted {
+					// The durable batch committed; only the local completion
+					// after it failed. The committed revision is real and
+					// retained, so admission stays latched closed exactly as
+					// before — but the heartbeat lane is restored: a beat that
+					// attests the committed truth is the only channel through
+					// which this divergence can ever be repaired.
+					d.shims.dynamicPublicationFailed = true
+					d.restoreSessionShimHeartbeatLane(checkpoint)
+				} else {
+					// Nothing durable advanced: restore the last-committed
+					// projection wholesale. The next beat re-attests the state
+					// the control plane last acknowledged, admission reopens on
+					// the same base this attempt started from, and the NACK
+					// releases the claim for another host.
+					d.rollbackSessionShimPublication(checkpoint)
+				}
+				ringCorrectingHeartbeat = true
 			}
 			d.shims.publicationMu.Unlock()
 		}()
@@ -255,7 +303,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		d.shims.carrierActivationComplete = false
 		d.shims.mu.Unlock()
 	}
-	receipt, err := d.completeSessionShimAdoption(ctx, evidence, prepared)
+	receipt, err := d.completeSessionShimAdoption(pubCtx, evidence, prepared)
 	evidence.SnapshotProxy.deactivate()
 	if err != nil {
 		d.cancelStagedSessionShimSnapshot(id)
@@ -266,13 +314,17 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// SnapshotProxy exists only for the synchronous carrier takeover callback.
 	// Published daemon state uses the stable lookup APIs instead.
 	evidence.SnapshotProxy = nil
-	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt)
+	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(pubCtx, evidence, receipt)
 	if err != nil {
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: durable adoption batch %s: %w", id, err)
 	}
+	// The batch is durably committed from here on: a later failure must keep
+	// the committed revision rather than roll it back — the platform advanced,
+	// and a beat re-attesting the superseded revision would argue forever.
+	publicationCommitted = true
 	if err := d.updateSessionShimAdoptionRevision(id.OrgID, batchReceipt.AdoptionRevision, heartbeatBarrier); err != nil {
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
@@ -297,7 +349,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			return &handle, nil
 		}
 		published := map[sessionshim.Identity]adoptedShim{id: entry}
-		if activationErr := d.activatePublishedSessionShimCarriers(ctx, published); activationErr != nil {
+		if activationErr := d.activatePublishedSessionShimCarriers(pubCtx, published); activationErr != nil {
 			// The harness and durable adoption are already real. Preserve the claim
 			// and visible capacity while withholding further claims; returning a
 			// launch failure here would invite a duplicate session.
