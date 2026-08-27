@@ -146,7 +146,7 @@ func TestSessionShimIsNotAnnouncedActiveBeforeAdoptionCompletes(t *testing.T) {
 			// this is exactly the moment an early announcement would happen.
 			observed.attestationSupported = h.daemon.SessionShimHostAttestation().Supports()
 			observed.adoptionComplete = h.daemon.SessionShimAdoptionComplete()
-			observed.ownsInteractive = h.daemon.shimOwnsSession(SessionSpec{
+			observed.ownsInteractive = h.daemon.SessionShimOwnsSession(SessionSpec{
 				SessionID: "session-mid-adoption", Mode: interactiveRunMode,
 			})
 			before := len(h.heartbeats())
@@ -187,7 +187,7 @@ func TestSessionShimIsNotAnnouncedActiveBeforeAdoptionCompletes(t *testing.T) {
 	if !beat.SessionShim.AdoptionComplete {
 		t.Fatalf("projected heartbeat adoptionComplete = false: %+v", beat.SessionShim)
 	}
-	if !h.daemon.shimOwnsSession(SessionSpec{SessionID: "session-after", Mode: interactiveRunMode}) {
+	if !h.daemon.SessionShimOwnsSession(SessionSpec{SessionID: "session-after", Mode: interactiveRunMode}) {
 		t.Fatal("an interactive session was not claimed by the shim after the composition installed")
 	}
 }
@@ -288,7 +288,7 @@ func TestFailedCompositionLeavesTheDaemonServingAndStoodDown(t *testing.T) {
 	if h.daemon.sessionShimConfig().EnableOwnership {
 		t.Fatal("a failed composition left session ownership enabled")
 	}
-	if h.daemon.shimOwnsSession(SessionSpec{SessionID: "session-degraded", Mode: interactiveRunMode}) {
+	if h.daemon.SessionShimOwnsSession(SessionSpec{SessionID: "session-degraded", Mode: interactiveRunMode}) {
 		t.Fatal("a failed composition left an interactive session claimed by the shim")
 	}
 
@@ -427,7 +427,7 @@ func TestCompositionInstallDoesNotRaceLiveConfigurationReaders(t *testing.T) {
 				}
 				_ = h.daemon.sessionShimConfig().orgID()
 				_ = h.daemon.SessionShimHostAttestation()
-				_ = h.daemon.shimOwnsSession(SessionSpec{SessionID: "s", Mode: interactiveRunMode})
+				_ = h.daemon.SessionShimOwnsSession(SessionSpec{SessionID: "s", Mode: interactiveRunMode})
 				reads.Add(1)
 			}
 		}()

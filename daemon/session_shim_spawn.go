@@ -83,6 +83,19 @@ func (d *Daemon) shimOwnsSession(spec SessionSpec) bool {
 	return spec.Mode == interactiveRunMode
 }
 
+// SessionShimOwnsSession reports whether this daemon will launch spec under
+// per-session shim ownership, right now.
+//
+// It is exported for the one caller that must not answer this question for
+// itself: an embedder whose pre-spawn chain suppresses an interactive rail
+// exactly when the shim owns the session. That decision has to agree with this
+// one for every session, and the only way to guarantee agreement is to ask
+// rather than to mirror. A copy of the rule was correct while the composition
+// was resolved before the daemon existed; it is not correct once the
+// composition can land mid-flight, because a copy captured at startup answers
+// for a posture the daemon has since left.
+func (d *Daemon) SessionShimOwnsSession(spec SessionSpec) bool { return d.shimOwnsSession(spec) }
+
 // launchSessionShim is the spawner's shim launch path (SpawnerOptions.ShimSpawn).
 //
 // It returns (nil, nil) for a session this daemon does not own through a shim,
