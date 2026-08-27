@@ -59,6 +59,107 @@ func TestClientStopSessionSuccess(t *testing.T) {
 	}
 }
 
+func TestClientStopSessionTypedConflictReceipts(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		body              string
+		retryAfter        string
+		wantCode          string
+		wantDisposition   string
+		wantRetryable     bool
+		wantRetryAfterSec *int
+	}{
+		{
+			name:            "reconciliation required has no retry header",
+			body:            `{"stopped":false,"sessionId":"sess-1","previousStatus":"starting","code":"SESSION_LIFECYCLE_RECONCILIATION_REQUIRED","refusal":"session_lifecycle_reconciliation_required","retryable":false,"disposition":"reconciliation_required","ownerLiveness":"unverified","preparedAgeMs":19019000,"mutationId":"cleanup:claimed-stale:sess-1"}`,
+			wantCode:        "SESSION_LIFECYCLE_RECONCILIATION_REQUIRED",
+			wantDisposition: "reconciliation_required",
+		},
+		{
+			name:              "busy preserves bounded retry header",
+			body:              `{"stopped":false,"sessionId":"sess-1","previousStatus":"starting","code":"SESSION_LIFECYCLE_BUSY","refusal":"session_lifecycle_busy","retryable":true,"disposition":"retryable_busy","mutationId":"cleanup:claimed-stale:sess-1"}`,
+			retryAfter:        "1",
+			wantCode:          "SESSION_LIFECYCLE_BUSY",
+			wantDisposition:   "retryable_busy",
+			wantRetryable:     true,
+			wantRetryAfterSec: intPtr(1),
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", "application/json")
+				if tc.retryAfter != "" {
+					w.Header().Set("Retry-After", tc.retryAfter)
+				}
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.StopSession("sess-1")
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+			}
+			var receipt *StopSessionError
+			if !errors.As(err, &receipt) {
+				t.Fatalf("error did not retain typed receipt: %T %v", err, err)
+			}
+			if receipt.Code != tc.wantCode || receipt.Disposition != tc.wantDisposition ||
+				receipt.Retryable != tc.wantRetryable {
+				t.Fatalf("receipt = %#v", receipt)
+			}
+			if (receipt.RetryAfterSeconds == nil) != (tc.wantRetryAfterSec == nil) ||
+				(receipt.RetryAfterSeconds != nil && *receipt.RetryAfterSeconds != *tc.wantRetryAfterSec) {
+				t.Fatalf("RetryAfterSeconds = %v, want %v", receipt.RetryAfterSeconds, tc.wantRetryAfterSec)
+			}
+		})
+	}
+}
+
+func TestClientStopSessionRejectsUnsafeConflictBodies(t *testing.T) {
+	t.Parallel()
+
+	validPrefix := `{"stopped":false,"sessionId":"sess-1","previousStatus":"starting","code":"SESSION_LIFECYCLE_BUSY","refusal":"session_lifecycle_busy","retryable":true`
+	tests := []struct {
+		name        string
+		contentType string
+		body        string
+		forbidden   string
+	}{
+		{name: "malformed", contentType: "application/json", body: `{`},
+		{name: "oversized", contentType: "application/json", body: strings.Repeat("x", maxStopSessionErrorBodyBytes+1)},
+		{name: "non json", contentType: "text/html", body: `<html>conflict</html>`},
+		{name: "secret key", contentType: "application/json", body: validPrefix + `,"apiToken":"rsk_do_not_echo"}`, forbidden: "rsk_do_not_echo"},
+		{name: "private key variant", contentType: "application/json", body: validPrefix + `,"privateKey":"do_not_echo"}`, forbidden: "do_not_echo"},
+		{name: "secret value", contentType: "application/json", body: validPrefix + `,"mutationId":"Bearer do_not_echo"}`, forbidden: "do_not_echo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+				w.Header().Set("Content-Type", tc.contentType)
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(tc.body))
+			})
+			_, err := c.StopSession("sess-1")
+			if !errors.Is(err, ErrConflict) {
+				t.Fatalf("errors.Is(err, ErrConflict) = false: %v", err)
+			}
+			var receipt *StopSessionError
+			if errors.As(err, &receipt) {
+				t.Fatalf("unsafe body became typed receipt: %#v", receipt)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
+
+func intPtr(value int) *int { return &value }
+
 func TestClientChatSessionSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.URL.Path != "/api/public/sessions/sess-1/prompt" {
