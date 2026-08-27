@@ -14,6 +14,7 @@ import (
 	"strconv"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
@@ -54,18 +55,32 @@ type Server struct {
 	// agentCardRegistryOrDefault using the daemon's sessionDetailStore.
 	// Tests inject a fake by assigning the field directly before serving.
 	agentReg agentCardRegistry
+
+	// daemonStarted gates every handler behind Daemon.Start having returned.
+	// It is set at construction for the ordinary bind-after-start callers and
+	// cleared by StartBeforeDaemon, which binds the listener first.
+	//
+	// It is an atomic, not a plain bool, for a reason beyond the obvious data
+	// race: Daemon.Start publishes the spawner, the heartbeat, and the poller by
+	// plain assignment, and handlers read them the same way. That is correct
+	// only while the ordering guarantees it — a listener bound before Start has
+	// no such ordering of its own. A handler that observes this flag set
+	// synchronizes-with DaemonStarted, and therefore with everything Start
+	// wrote before it.
+	daemonStarted atomic.Bool
 }
 
 // NewServer builds an HTTP server for d. The handler is registered but the
 // server is not yet listening — call Start to bind.
 func NewServer(d *Daemon) *Server {
 	s := &Server{daemon: d}
+	s.daemonStarted.Store(true)
 	mux := http.NewServeMux()
 	s.register(mux)
 	addr := fmt.Sprintf("%s:%d", d.opts.HTTPHost, d.opts.HTTPPort)
 	s.httpd = &http.Server{
 		Addr:              addr,
-		Handler:           mux,
+		Handler:           s.gateHandler(mux),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       15 * time.Second,
 		WriteTimeout:      30 * time.Second,
@@ -110,6 +125,54 @@ func (s *Server) Start() (<-chan error, error) {
 	}()
 	s.started = true
 	return errCh, nil
+}
+
+// StartBeforeDaemon binds the control listener BEFORE Daemon.Start has been
+// called, and answers every request with 503 + Retry-After until DaemonStarted
+// is called.
+//
+// It exists because "connection refused" and "still coming up" are the same
+// signal to every caller, and they mean opposite things. A daemon whose
+// registration is slow looks, from the outside, exactly like a daemon that
+// crashed on boot or was never installed — so an operator, a health check, and
+// a supervisor all have to guess, and the sensible guess ("it is gone") is the
+// wrong one. Binding first replaces the guess with an answer.
+//
+// It does not by itself make the daemon ready any sooner. What it does is stop
+// the wait from being indistinguishable from a failure.
+func (s *Server) StartBeforeDaemon() (<-chan error, error) {
+	s.daemonStarted.Store(false)
+	errCh, err := s.Start()
+	if err != nil {
+		// Nothing is listening, so nothing is gated: restore the ordinary
+		// posture rather than leaving a server that would refuse forever if the
+		// caller retried Start.
+		s.daemonStarted.Store(true)
+		return nil, err
+	}
+	return errCh, nil
+}
+
+// DaemonStarted opens the gate StartBeforeDaemon closed. Call it once
+// Daemon.Start has RETURNED — not before, and not from another goroutine
+// racing it, because this is the edge that publishes everything Start built to
+// the handlers that read it.
+func (s *Server) DaemonStarted() { s.daemonStarted.Store(true) }
+
+// gateHandler wraps the endpoint mux so a listener bound ahead of the daemon
+// answers honestly instead of serving handlers against half-built state.
+func (s *Server) gateHandler(mux http.Handler) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !s.daemonStarted.Load() {
+			w.Header().Set("Retry-After", "1")
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{
+				"error":  "daemon is still starting",
+				"status": "starting",
+			})
+			return
+		}
+		mux.ServeHTTP(w, r)
+	})
 }
 
 // Shutdown gracefully shuts down the HTTP server.

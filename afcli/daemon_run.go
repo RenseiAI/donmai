@@ -258,9 +258,29 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			}()
 
 			out := cmd.OutOrStdout()
+
+			// Bind the control listener BEFORE the daemon starts. Registration
+			// is a network round trip whose duration this host does not own,
+			// and until the port answers, every caller — an operator, a health
+			// check, the service manager — sees "connection refused", which is
+			// also what a daemon that failed to boot looks like. Binding first
+			// turns that silence into a 503 that says "starting": the same
+			// wait, but no longer indistinguishable from a failure.
+			//
+			// The gate is not cosmetic. Handlers read state Start publishes by
+			// plain assignment, so the listener must refuse to reach them until
+			// DaemonStarted has run.
+			srv := daemon.NewServer(d)
+			errCh, err := srv.StartBeforeDaemon()
+			if err != nil {
+				return fmt.Errorf("daemon HTTP server start: %w", err)
+			}
+			_, _ = fmt.Fprintf(out, "[daemon] http listening on %s (starting)\n", srv.Addr())
+
 			if err := d.Start(ctx); err != nil {
 				return fmt.Errorf("daemon start: %w", err)
 			}
+			srv.DaemonStarted()
 			_, _ = fmt.Fprintf(out, "[daemon] state -> %s\n", d.State())
 			// Print the worker id only after Start() completes registration so
 			// the value is the live, platform-assigned id (or a clearly-marked
@@ -271,13 +291,6 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			if line := formatStartupWorkerLine(d.WorkerID()); line != "" {
 				_, _ = fmt.Fprintln(out, line)
 			}
-
-			srv := daemon.NewServer(d)
-			errCh, err := srv.Start()
-			if err != nil {
-				return fmt.Errorf("daemon HTTP server start: %w", err)
-			}
-			_, _ = fmt.Fprintf(out, "[daemon] http listening on %s\n", srv.Addr())
 
 			// Wait for signal or HTTP error.
 			sigCh := make(chan os.Signal, 1)
