@@ -10,6 +10,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.69.2 — 2026-08-27
+
+### Fixes
+
+- **Successful `agent stop --json` responses now retain their durable receipt.**
+  The optional nested receipt preserves its version, kind, storage-session
+  identity, mutation identity, intent revision, terminal disposition, and
+  idempotent-replay bit while the top-level session id remains the public id.
+  Older servers that omit the receipt remain compatible.
+
+  Receipt fields use the same bounded atom and secret-rejection policy as typed
+  conflict receipts. Malformed or secret-bearing success content fails decode
+  without reflecting the raw response.
+
+  This is client projection only; downstream release and live idempotency
+  acceptance remain separate.
+
+---
+
 ## v0.69.1 — 2026-08-27
 
 ### Fixes
