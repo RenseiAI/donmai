@@ -72,7 +72,7 @@ func (d *Daemon) PrepareRestart(ctx context.Context) (afclient.DaemonRestartPref
 	}
 	lease, err := d.claimLifecycle(ctx, lifecycleRestartPrepare)
 	if err != nil {
-		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("acquire lifecycle", err)
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseAcquireLifecycle, "acquire lifecycle", err)
 	}
 	defer d.releaseLifecycle(lease)
 	return d.prepareRestartWithLease(ctx, lease)
@@ -102,7 +102,7 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 
 	if spawner != nil {
 		if err := spawner.pauseAndWaitSpawnReservations(ctx); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("settle session admissions", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseSettleSessionAdmissions, "settle session admissions", err)
 		}
 		if active, _ := spawner.ActiveSessionCounts(); active != 0 {
 			return afclient.DaemonRestartPreflightResponse{}, restartPreflightError(
@@ -116,32 +116,32 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 		return afclient.DaemonRestartPreflightResponse{}, err
 	}
 	if err := d.consumeSessionShimAcceptanceFenceRefusal(preparation); err != nil {
-		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("acceptance fence acknowledgement", err)
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseFenceRefused, "acceptance fence acknowledgement", err)
 	}
 	switch preparation.state {
 	case restartPreparationPrepared:
 		if err := d.validatePreparedRestartPermission(preparation, d.restartPreparationNow()); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("revalidate cached prepared authorization", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseRevalidateCachedPreparedAuthorization, "revalidate cached prepared authorization", err)
 		}
 		return restartPreparationResponse(preparation), nil
 	case restartPreparationNotRequired:
 		if err := d.validateNotRequiredRestartPermission(preparation); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("revalidate cached not-required authorization", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseRevalidateCachedNotRequiredAuthorization, "revalidate cached not-required authorization", err)
 		}
 		return restartPreparationResponse(preparation), nil
 	}
 	if !preparation.persisted {
 		if err := d.persistRestartPreparation(preparation, restartPreparationPreparing); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("persist local preparation", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCausePersistLocalPreparation, "persist local preparation", err)
 		}
 		preparation.persisted = true
 	}
 	if len(preparation.scopeIDs) == 0 {
 		if err := d.persistRestartPreparation(preparation, restartPreparationNotRequired); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("persist not-required preparation", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCausePersistNotRequiredPreparation, "persist not-required preparation", err)
 		}
 		if err := d.validateNotRequiredRestartPermission(preparation); err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("validate not-required authorization after persistence", err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseValidateNotRequiredAuthorizationAfterPersistence, "validate not-required authorization after persistence", err)
 		}
 		preparation.state = restartPreparationNotRequired
 		return restartPreparationResponse(preparation), nil
@@ -153,7 +153,7 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 		}
 		fence, err := d.acknowledgeRestartPreparationScope(ctx, preparation, orgID)
 		if err != nil {
-			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("organization "+fmt.Sprintf("%q", orgID), err)
+			return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseFenceRefused, "organization "+fmt.Sprintf("%q", orgID), err)
 		}
 		preparation.acked[orgID] = fence
 		d.shims.mu.Lock()
@@ -165,10 +165,10 @@ func (d *Daemon) prepareRestartWithLease(ctx context.Context, lease *lifecycleLe
 		d.shims.mu.Unlock()
 	}
 	if err := d.persistRestartPreparation(preparation, restartPreparationPrepared); err != nil {
-		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("persist prepared authorization", err)
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCausePersistPreparedAuthorization, "persist prepared authorization", err)
 	}
 	if err := d.validatePreparedRestartPermission(preparation, d.restartPreparationNow()); err != nil {
-		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause("validate prepared authorization after persistence", err)
+		return afclient.DaemonRestartPreflightResponse{}, restartPreflightCause(afclient.DaemonRestartCauseValidatePreparedAuthorizationAfterPersistence, "validate prepared authorization after persistence", err)
 	}
 	preparation.state = restartPreparationPrepared
 	return restartPreparationResponse(preparation), nil
@@ -184,7 +184,7 @@ func (d *Daemon) restartPreparationSnapshot() (*restartPreparation, error) {
 
 	covered := d.sessionShimFenceSnapshot()
 	if err := d.verifyRestartRegistryCoverage(covered); err != nil {
-		return nil, restartPreflightCause("registry coverage", err)
+		return nil, restartPreflightCause(afclient.DaemonRestartCauseRegistryCoverage, "registry coverage", err)
 	}
 	byOrg := make(map[string][]sessionshim.FencedSession)
 	for _, session := range covered {
@@ -198,7 +198,7 @@ func (d *Daemon) restartPreparationSnapshot() (*restartPreparation, error) {
 
 	id, err := d.newRestartPreparationID()
 	if err != nil {
-		return nil, restartPreflightCause("mint preparation identity", err)
+		return nil, restartPreflightCause(afclient.DaemonRestartCauseMintPreparationIdentity, "mint preparation identity", err)
 	}
 	preparation := &restartPreparation{
 		id:            id,
@@ -400,8 +400,29 @@ func restartPreflightError(format string, args ...any) error {
 	return fmt.Errorf("%w: %s", ErrRestartPreflightRefused, fmt.Sprintf(format, args...))
 }
 
-func restartPreflightCause(operation string, err error) error {
-	return fmt.Errorf("%w: %s: %w", ErrRestartPreflightRefused, operation, err)
+// restartPreflightStageError binds a refusal to its closed wire cause token so
+// the HTTP writer derives the cause structurally (errors.As), never by
+// matching message strings. Its own message is exactly the refusal prefix and
+// it unwraps to the sentinel, so the composed error text stays byte-identical
+// to the untyped form.
+type restartPreflightStageError struct{ cause string }
+
+func (e *restartPreflightStageError) Error() string { return ErrRestartPreflightRefused.Error() }
+func (e *restartPreflightStageError) Unwrap() error { return ErrRestartPreflightRefused }
+
+func restartPreflightCause(cause, operation string, err error) error {
+	return fmt.Errorf("%w: %s: %w", &restartPreflightStageError{cause: cause}, operation, err)
+}
+
+// restartPreflightRefusalCause resolves the closed cause token for a refusal
+// chain. An unmapped or untyped refusal answers the closed top-level code
+// itself — never an open string.
+func restartPreflightRefusalCause(err error) string {
+	var stage *restartPreflightStageError
+	if errors.As(err, &stage) && stage.cause != "" {
+		return stage.cause
+	}
+	return afclient.DaemonRestartPreflightRefusalCode
 }
 
 func (d *Daemon) newRestartPreparationID() (string, error) {

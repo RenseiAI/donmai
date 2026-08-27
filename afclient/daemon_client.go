@@ -247,20 +247,59 @@ const DaemonRestartPreflightRefusalCode = "restart_preflight_refused"
 type DaemonRestartPreflightRefusal struct {
 	Error string `json:"error"`
 	Code  string `json:"code"`
+	// Cause is the closed refusal-cause token (see the DaemonRestartCause*
+	// registry). It discriminates WHICH preflight stage refused while Code stays
+	// the single closed top-level discriminator. Older daemons omit it.
+	Cause string `json:"cause,omitempty"`
 }
+
+// The closed refusal-cause token registry for
+// DaemonRestartPreflightRefusal.Cause. Every token names the exact preflight
+// stage that refused; the daemon never sends an open string — a stage without
+// an assigned token reports DaemonRestartPreflightRefusalCode itself as the
+// cause.
+const (
+	// DaemonRestartCauseFenceRefused: the restart fence acknowledgement was
+	// refused — the per-scope durable-fence acknowledgement or the acceptance
+	// fence-acknowledgement seam.
+	DaemonRestartCauseFenceRefused                                     = "restart_fence_refused"
+	DaemonRestartCauseAcquireLifecycle                                 = "acquire_lifecycle"
+	DaemonRestartCauseSettleSessionAdmissions                          = "settle_session_admissions"
+	DaemonRestartCauseRevalidateCachedPreparedAuthorization            = "revalidate_cached_prepared_authorization"
+	DaemonRestartCauseRevalidateCachedNotRequiredAuthorization         = "revalidate_cached_not_required_authorization"
+	DaemonRestartCausePersistLocalPreparation                          = "persist_local_preparation"
+	DaemonRestartCausePersistNotRequiredPreparation                    = "persist_not_required_preparation"
+	DaemonRestartCauseValidateNotRequiredAuthorizationAfterPersistence = "validate_not_required_authorization_after_persistence"
+	DaemonRestartCausePersistPreparedAuthorization                     = "persist_prepared_authorization"
+	DaemonRestartCauseValidatePreparedAuthorizationAfterPersistence    = "validate_prepared_authorization_after_persistence"
+	DaemonRestartCauseRegistryCoverage                                 = "registry_coverage"
+	DaemonRestartCauseMintPreparationIdentity                          = "mint_preparation_identity"
+)
 
 // DaemonRestartPreflightRefusalError preserves the typed refusal for callers
 // while remaining compatible with errors.Is checks for ErrConflict.
 type DaemonRestartPreflightRefusalError struct {
 	Code    string
+	Cause   string
 	Message string
 }
 
 func (e *DaemonRestartPreflightRefusalError) Error() string {
-	if e == nil || e.Message == "" {
-		return ErrRestartPreflightRefused.Error()
+	base := ErrRestartPreflightRefused.Error()
+	if e == nil {
+		return base
 	}
-	return ErrRestartPreflightRefused.Error() + ": " + e.Message
+	// The cause is printed exactly once, and the server's fixed message — which
+	// is the same string as the prefix — is never appended to itself: the
+	// doubled "refused: ... refused" form is what made the CLI output
+	// undiagnosable.
+	if e.Cause != "" {
+		return base + " (" + e.Cause + ")"
+	}
+	if e.Message != "" && e.Message != base {
+		return base + ": " + e.Message
+	}
+	return base
 }
 
 func (e *DaemonRestartPreflightRefusalError) Unwrap() []error {
@@ -529,7 +568,7 @@ func (c *DaemonClient) prepareRestart(ctx context.Context, httpClient *http.Clie
 		dec := json.NewDecoder(io.LimitReader(resp.Body, 8192))
 		dec.DisallowUnknownFields()
 		if decodeErr := dec.Decode(&refusal); decodeErr == nil && refusal.Code == DaemonRestartPreflightRefusalCode {
-			return nil, &DaemonRestartPreflightRefusalError{Code: refusal.Code, Message: refusal.Error}
+			return nil, &DaemonRestartPreflightRefusalError{Code: refusal.Code, Cause: refusal.Cause, Message: refusal.Error}
 		}
 	}
 	if err := daemonStatusToError(resp, "/api/daemon/restart/prepare"); err != nil {

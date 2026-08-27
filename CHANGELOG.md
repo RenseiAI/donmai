@@ -33,6 +33,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **A refused restart preflight names its cause on the wire, once.** The 409
+  refusal kept the single closed top-level code `restart_preflight_refused`
+  but carried no cause, so a caller could not tell a correct fence refusal
+  from any other preflight failure — and the client then appended the
+  server's fixed message to its own identical prefix, printing
+  "daemon restart preflight refused: daemon restart preflight refused". The
+  refusal body gains an additive closed `cause` token derived structurally
+  from the refusing stage (`restart_fence_refused` for the durable-fence /
+  acceptance-fence-acknowledgement stage; each remaining stage gets its own
+  snake_case token; an unmapped stage answers the closed top-level code
+  itself, never an open string), the refusal log line carries it, and the
+  client error prints the prefix and the cause exactly once
+  (`daemon restart preflight refused (restart_fence_refused)`).
 - **A failed dynamic adoption publication rolls back to the last-committed
   projection and keeps the heartbeat alive.** A launch-time adoption raises the
   recovery barrier and drops the carrier-activation flag for the attempt; when

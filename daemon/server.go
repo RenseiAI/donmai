@@ -412,10 +412,12 @@ func (s *Server) handleRestartPrepare(w http.ResponseWriter, r *http.Request) {
 }
 
 func writeRestartPreflightRefusal(w http.ResponseWriter, err error) {
-	slog.Warn("daemon restart preflight refused; daemon remains draining", "err", err)
+	cause := restartPreflightRefusalCause(err)
+	slog.Warn("daemon restart preflight refused; daemon remains draining", "cause", cause, "err", err)
 	writeJSON(w, http.StatusConflict, &afclient.DaemonRestartPreflightRefusal{
 		Error: "daemon restart preflight refused",
 		Code:  afclient.DaemonRestartPreflightRefusalCode,
+		Cause: cause,
 	})
 }
 
