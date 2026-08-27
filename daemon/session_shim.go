@@ -453,7 +453,21 @@ type SessionShimConfig struct {
 	// addition to the primary registration scope. It retains all credentials and
 	// returns only deterministic non-secret scope/host/revision receipts. Its
 	// result must exactly cover AdoptionBatchOrgIDs excluding the primary scope.
-	AcquireRecoveryScopes func(context.Context, SessionShimHostAttestation) ([]SessionShimScopeCredentialReceipt, error)
+	//
+	// primary is the primary scope's receipt exactly as the founding round trip
+	// resolved it — the registration on the inline path, the declaring refresh
+	// on a deferred composition install: Scope is OrgID, WorkerHostID the stable
+	// host authority, AdoptionRevision the revision the control plane answered
+	// with. It is non-secret, and the embedder must RETAIN it for its own
+	// host-authority lookups rather than re-derive it: the only other way to
+	// learn the host id is to present the attestation again, and a presentation
+	// outside the credential refresher's lock races the lanes the refresher
+	// keeps on one identity — the control plane sees the posture flip-flop,
+	// answers an attestation conflict, and revokes the losing credential. The
+	// hook is called AFTER the primary receipt is retained here and BEFORE any
+	// readiness resolver that needs the host id runs, so the embedder can
+	// record it first.
+	AcquireRecoveryScopes func(ctx context.Context, attestation SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt) ([]SessionShimScopeCredentialReceipt, error)
 
 	// RequireAuthoritativeSnapshot declares that the composing external attach
 	// carrier needs fresh inspect/emit proxying and the selected-v3 raw HostFrame
@@ -1074,6 +1088,22 @@ func (s *sessionShimState) setDeclaringComposition(declaring bool) {
 	s.declaringComposition = declaring
 }
 
+// sessionShimFoundingDeclaration reports whether the refresh receipt about to
+// be validated for scope is the FOUNDING one: a deferred composition is in its
+// declaring window and nothing has been retained for the scope yet. Both halves
+// matter — the window alone would also match an unrelated lane refresh that
+// happens to land after retention, and an empty retention alone would match a
+// refresh on a daemon that never declared at all.
+func (d *Daemon) sessionShimFoundingDeclaration(scope string) bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	_, retained := d.shims.credentialReceipts[scope]
+	return d.shims.declaringComposition && !retained
+}
+
 func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
 	return shimIncarnation{
 		identity:     evidence.Identity,
@@ -1515,9 +1545,10 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 	}
 	cfg := d.sessionShimConfig()
 	primaryScope := cfg.orgID()
-	receipts := []SessionShimScopeCredentialReceipt{{
+	primaryReceipt := SessionShimScopeCredentialReceipt{
 		Scope: primaryScope, WorkerHostID: primary.WorkerHostID, AdoptionRevision: primary.AdoptionRevision,
-	}}
+	}
+	receipts := []SessionShimScopeCredentialReceipt{primaryReceipt}
 	expected := make([]string, 0, len(cfg.AdoptionBatchOrgIDs))
 	seen := make(map[string]bool, len(cfg.AdoptionBatchOrgIDs))
 	for _, scope := range cfg.AdoptionBatchOrgIDs {
@@ -1541,6 +1572,7 @@ func (d *Daemon) acquireSessionShimRecoveryReceipts(
 		additional, err := cfg.AcquireRecoveryScopes(
 			callbackCtx,
 			d.SessionShimHostAttestation(),
+			cloneSessionShimScopeCredentialReceipt(primaryReceipt),
 		)
 		cancel()
 		if err != nil {
@@ -2286,9 +2318,23 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	if !d.sessionShimEnabled() {
 		return nil
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
-		d.withdrawSessionShimProofV2Readiness()
-		return err
+	scope := d.sessionShimConfig().orgID()
+	// Readiness is checked before a refreshed receipt is adopted — except for
+	// the ONE receipt that founds the scope's host authority. An embedder's
+	// readiness resolver answers for the primary host, and the primary host id
+	// is what this very receipt carries: asking before it is retained asks for a
+	// fact this round trip is producing. That is what drove an embedder to
+	// present the attestation early, outside the refresher's lock, to learn the
+	// id some other way — and the control plane answered the resulting posture
+	// flip-flop with an attestation conflict. The check is deferred, not
+	// dropped: declareSessionShimComposition runs it once the receipt is
+	// retained and the embedder has been handed it. Every other refresh keeps
+	// the check exactly here.
+	if !d.sessionShimFoundingDeclaration(scope) {
+		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+			d.withdrawSessionShimProofV2Readiness()
+			return err
+		}
 	}
 	if result == nil || result.SessionShim == nil {
 		return errors.New("session shim: refresh omitted credential receipt")
@@ -2302,7 +2348,6 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	if receipt.State != wantState {
 		return fmt.Errorf("session shim: refresh receipt state %q, want %q", receipt.State, wantState)
 	}
-	scope := d.sessionShimConfig().orgID()
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
 	prior, ok := d.shims.credentialReceipts[scope]
