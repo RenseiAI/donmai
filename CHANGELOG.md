@@ -10,6 +10,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.69.1 — 2026-08-27
+
+### Fixes
+
+- **`agent stop` now preserves typed conflict receipts.** JSON callers receive
+  the bounded stop-refusal fields before the command returns its nonzero exit,
+  including retry and reconciliation metadata. Existing callers can still use
+  `errors.Is(err, ErrConflict)`, while human output names the disposition
+  instead of reducing every HTTP 409 response to a generic conflict.
+
+  Error bodies are size-limited, parsed into a strict allowlist, and rejected
+  when malformed, non-JSON, or secret-bearing; arbitrary response content is
+  never retained or echoed.
+
+---
+
 ## v0.69.0 — 2026-08-26
 
 ### Breaking
