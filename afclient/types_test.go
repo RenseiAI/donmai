@@ -3,6 +3,7 @@ package afclient
 import (
 	"bytes"
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -71,6 +72,11 @@ func TestStopSessionResponseRoundTrip(t *testing.T) {
 		SessionID:      "sess-1",
 		PreviousStatus: StatusWorking,
 		NewStatus:      StatusStopped,
+		Receipt: &StopSessionReceipt{
+			Version: 1, Kind: "session_stop", SessionID: "storage-1",
+			MutationID: "linear-stop:external:storage-1", IntentRevision: "7",
+			Disposition: StatusStopped, IdempotentReplay: true,
+		},
 	}
 	data, err := json.Marshal(in)
 	if err != nil {
@@ -80,13 +86,23 @@ func TestStopSessionResponseRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Errorf("round-trip mismatch: got %+v, want %+v", out, in)
 	}
-	for _, f := range []string{"stopped", "sessionId", "previousStatus", "newStatus"} {
+	for _, f := range []string{"stopped", "sessionId", "previousStatus", "newStatus", "receipt", "mutationId", "intentRevision", "idempotentReplay"} {
 		if !bytes.Contains(data, []byte(f)) {
 			t.Errorf("marshalled output missing field %q: %s", f, data)
 		}
+	}
+}
+
+func TestStopSessionResponseDecodesLegacySuccessWithoutReceipt(t *testing.T) {
+	var out StopSessionResponse
+	if err := json.Unmarshal([]byte(`{"stopped":true,"sessionId":"public","previousStatus":"working","newStatus":"stopped"}`), &out); err != nil {
+		t.Fatalf("unmarshal legacy success: %v", err)
+	}
+	if out.Receipt != nil || !out.Stopped || out.SessionID != "public" {
+		t.Fatalf("legacy response changed: %+v", out)
 	}
 }
 

@@ -48,6 +48,7 @@ func TestClientStopSessionSuccess(t *testing.T) {
 		writeJSON(w, StopSessionResponse{
 			Stopped: true, SessionID: "sess-1",
 			PreviousStatus: StatusWorking, NewStatus: StatusStopped,
+			Receipt: &StopSessionReceipt{Version: 1, Kind: "session_stop", SessionID: "storage-1", MutationID: "stop:storage-1", IntentRevision: "9", Disposition: StatusStopped},
 		})
 	})
 	resp, err := c.StopSession("sess-1")
@@ -56,6 +57,19 @@ func TestClientStopSessionSuccess(t *testing.T) {
 	}
 	if !resp.Stopped || resp.NewStatus != StatusStopped {
 		t.Errorf("unexpected response: %+v", resp)
+	}
+	if resp.Receipt == nil || resp.Receipt.SessionID != "storage-1" || resp.Receipt.IntentRevision != "9" {
+		t.Fatalf("durable receipt lost: %+v", resp)
+	}
+}
+
+func TestClientStopSessionRejectsMalformedSuccessReceipt(t *testing.T) {
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"public","previousStatus":"claimed","newStatus":"stopped","receipt":{"version":"one"}}`))
+	})
+	if _, err := c.StopSession("public"); err == nil {
+		t.Fatal("malformed success receipt decoded without error")
 	}
 }
 

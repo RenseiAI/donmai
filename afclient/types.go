@@ -106,10 +106,24 @@ type ActivityListResponse struct {
 
 // StopSessionResponse matches POST /api/public/sessions/:id/stop.
 type StopSessionResponse struct {
-	Stopped        bool          `json:"stopped"`
-	SessionID      string        `json:"sessionId"`
-	PreviousStatus SessionStatus `json:"previousStatus"`
-	NewStatus      SessionStatus `json:"newStatus"`
+	Stopped        bool                `json:"stopped"`
+	SessionID      string              `json:"sessionId"`
+	PreviousStatus SessionStatus       `json:"previousStatus"`
+	NewStatus      SessionStatus       `json:"newStatus"`
+	Receipt        *StopSessionReceipt `json:"receipt,omitempty"`
+}
+
+// StopSessionReceipt is the durable lifecycle identity returned by a
+// successful public stop. SessionID is the storage identity; the response's
+// top-level SessionID remains the public identifier supplied by the caller.
+type StopSessionReceipt struct {
+	Version          int           `json:"version"`
+	Kind             string        `json:"kind"`
+	SessionID        string        `json:"sessionId"`
+	MutationID       string        `json:"mutationId"`
+	IntentRevision   string        `json:"intentRevision"`
+	Disposition      SessionStatus `json:"disposition"`
+	IdempotentReplay bool          `json:"idempotentReplay"`
 }
 
 // ChatSessionRequest is the body of POST /api/public/sessions/:id/prompt.

@@ -202,3 +202,41 @@ func TestAgentStopJSONPreservesTypedReconciliationRequiredReceipt(t *testing.T) 
 		t.Fatalf("human error omitted typed disposition: %v", err)
 	}
 }
+
+func TestAgentStopJSONPreservesDurableSuccessReceipt(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/stop") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"public-hash","previousStatus":"claimed","newStatus":"stopped","receipt":{"version":1,"kind":"session_stop","sessionId":"storage-uuid","mutationId":"linear-stop:reconcile:7:storage-uuid","intentRevision":"7","disposition":"stopped","idempotentReplay":false}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	ds := func() afclient.DataSource { return client }
+	cmd := newAgentStopCmd(ds)
+	var stdout strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"public-hash", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(stdout.String()), &output); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	receipt, ok := output["receipt"].(map[string]any)
+	if !ok {
+		t.Fatalf("durable success receipt was dropped: %#v", output)
+	}
+	if output["sessionId"] != "public-hash" || receipt["sessionId"] != "storage-uuid" ||
+		receipt["mutationId"] != "linear-stop:reconcile:7:storage-uuid" ||
+		receipt["intentRevision"] != "7" || receipt["disposition"] != "stopped" ||
+		receipt["idempotentReplay"] != false {
+		t.Fatalf("receipt identity/truth changed: %#v", output)
+	}
+}
