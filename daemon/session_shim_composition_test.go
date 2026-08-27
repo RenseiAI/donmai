@@ -376,29 +376,69 @@ func TestInstalledCompositionEndsWithTheAttestationDeclared(t *testing.T) {
 // TestDeclareSessionShimRestoresThePreviousAttestationOnFailure covers the
 // refresher on its own. A refusal must not leave the lane presenting a claim
 // authority rejected — the next unattended expiry refresh would present it
-// again, with nobody watching.
+// again, with nobody watching — and it must not burn the worker identity to
+// deliver an attestation nobody asked for.
 func TestDeclareSessionShimRestoresThePreviousAttestationOnFailure(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
-	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
-		http.Error(w, "attestation refused", http.StatusBadRequest)
-	}))
-	t.Cleanup(server.Close)
-
-	refresher := NewCredentialRefresher(CredentialRefresherOptions{
-		Registration: RegistrationOptions{
-			OrchestratorURL: server.URL, RegistrationToken: "rsp_live_declare",
-			JWTPath:     filepath.Join(t.TempDir(), "daemon.jwt"),
-			SessionShim: SessionShimStandDownAttestation(),
+	for name, tc := range map[string]struct {
+		handler http.HandlerFunc
+		reason  string
+	}{
+		"authority refuses the attestation": {
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "attestation refused", http.StatusBadRequest)
+			},
+			reason: "declaration-refused",
 		},
-		WorkerID: "worker-declare", RuntimeJWT: "runtime-declare",
-	})
-	if _, err := refresher.DeclareSessionShim(
-		context.Background(), activationTestAttestation(), "test-declaration",
-	); err == nil {
-		t.Fatal("a refused declaration reported success")
-	}
-	if got := refresher.SessionShimAttestation(); !got.StandsDown() || got.Supports() {
-		t.Fatalf("attestation after a refused declaration = %#v, want the previous stand-down", got)
+		"authority cannot re-present this identity": {
+			// A 404 is what RefreshRuntimeToken treats as "the registration is
+			// gone" and answers with a FULL re-register. A declaration must not
+			// take that path: it would mint a competing worker identity and
+			// retire the one every lane is presenting, for a feature this host
+			// was merely offering.
+			handler: func(w http.ResponseWriter, _ *http.Request) {
+				http.Error(w, "worker not found", http.StatusNotFound)
+			},
+			reason: "declaration-unavailable",
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			var registrations atomic.Int32
+			server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path == RegisterEndpoint {
+					registrations.Add(1)
+					_ = json.NewEncoder(w).Encode(RegisterResponse{
+						WorkerID: "worker-competing", RuntimeToken: "runtime-competing",
+					})
+					return
+				}
+				tc.handler(w, r)
+			}))
+			t.Cleanup(server.Close)
+
+			refresher := NewCredentialRefresher(CredentialRefresherOptions{
+				Registration: RegistrationOptions{
+					OrchestratorURL: server.URL, RegistrationToken: "rsp_live_declare",
+					JWTPath:     filepath.Join(t.TempDir(), "daemon.jwt"),
+					SessionShim: SessionShimStandDownAttestation(),
+				},
+				WorkerID: "worker-declare", RuntimeJWT: "runtime-declare",
+			})
+			if _, err := refresher.DeclareSessionShim(
+				context.Background(), activationTestAttestation(), tc.reason,
+			); err == nil {
+				t.Fatal("a refused declaration reported success")
+			}
+			if got := refresher.SessionShimAttestation(); !got.StandsDown() || got.Supports() {
+				t.Fatalf("attestation after a refused declaration = %#v, want the previous stand-down", got)
+			}
+			if got := registrations.Load(); got != 0 {
+				t.Fatalf("a failed declaration performed %d full re-registrations, want none", got)
+			}
+			if workerID, _ := refresher.Current(); workerID != "worker-declare" {
+				t.Fatalf("worker identity after a failed declaration = %q, want the one it already held", workerID)
+			}
+		})
 	}
 }
 

@@ -133,6 +133,15 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 	if err != nil {
 		return nil, err
 	}
+	return r.adopt(result, registration)
+}
+
+// adopt is the post-refresh half every path shares: validate, bring every lane
+// onto the result, keep the on-disk cache current, and notify.
+func (r *CredentialRefresher) adopt(
+	result *RefreshTokenResult,
+	registration RegistrationOptions,
+) (*RefreshTokenResult, error) {
 	if r.opts.ValidateRefresh != nil {
 		if err := r.opts.ValidateRefresh(result); err != nil {
 			return nil, fmt.Errorf("validate refreshed credentials: %w", err)
@@ -211,7 +220,21 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	r.opts.Registration.SessionShim = cloneSessionShimHostAttestation(attestation)
 	r.mu.Unlock()
 
-	result, err := r.Refresh(ctx, reason)
+	r.mu.Lock()
+	current := r.workerID
+	registration := r.opts.Registration
+	r.mu.Unlock()
+
+	// RepresentRuntimeToken, not Refresh: a declaration must never be able to
+	// mint a competing worker identity. If this control plane will not
+	// re-present the identity we hold with the attestation we are declaring,
+	// the honest outcome is that the declaration failed — not a new
+	// registration that retires the one every lane is using for an optional
+	// feature the caller was merely offering.
+	result, err := RepresentRuntimeToken(ctx, registration, current, reason)
+	if err == nil {
+		result, err = r.adopt(result, registration)
+	}
 	if err != nil {
 		r.mu.Lock()
 		r.opts.Registration.SessionShim = previous
