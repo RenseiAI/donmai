@@ -1088,6 +1088,22 @@ func (s *sessionShimState) setDeclaringComposition(declaring bool) {
 	s.declaringComposition = declaring
 }
 
+// sessionShimFoundingDeclaration reports whether the refresh receipt about to
+// be validated for scope is the FOUNDING one: a deferred composition is in its
+// declaring window and nothing has been retained for the scope yet. Both halves
+// matter — the window alone would also match an unrelated lane refresh that
+// happens to land after retention, and an empty retention alone would match a
+// refresh on a daemon that never declared at all.
+func (d *Daemon) sessionShimFoundingDeclaration(scope string) bool {
+	if d.shims == nil {
+		return false
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	_, retained := d.shims.credentialReceipts[scope]
+	return d.shims.declaringComposition && !retained
+}
+
 func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
 	return shimIncarnation{
 		identity:     evidence.Identity,
@@ -2302,9 +2318,23 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	if !d.sessionShimEnabled() {
 		return nil
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
-		d.withdrawSessionShimProofV2Readiness()
-		return err
+	scope := d.sessionShimConfig().orgID()
+	// Readiness is checked before a refreshed receipt is adopted — except for
+	// the ONE receipt that founds the scope's host authority. An embedder's
+	// readiness resolver answers for the primary host, and the primary host id
+	// is what this very receipt carries: asking before it is retained asks for a
+	// fact this round trip is producing. That is what drove an embedder to
+	// present the attestation early, outside the refresher's lock, to learn the
+	// id some other way — and the control plane answered the resulting posture
+	// flip-flop with an attestation conflict. The check is deferred, not
+	// dropped: declareSessionShimComposition runs it once the receipt is
+	// retained and the embedder has been handed it. Every other refresh keeps
+	// the check exactly here.
+	if !d.sessionShimFoundingDeclaration(scope) {
+		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+			d.withdrawSessionShimProofV2Readiness()
+			return err
+		}
 	}
 	if result == nil || result.SessionShim == nil {
 		return errors.New("session shim: refresh omitted credential receipt")
@@ -2318,7 +2348,6 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	if receipt.State != wantState {
 		return fmt.Errorf("session shim: refresh receipt state %q, want %q", receipt.State, wantState)
 	}
-	scope := d.sessionShimConfig().orgID()
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
 	prior, ok := d.shims.credentialReceipts[scope]

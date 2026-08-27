@@ -23,8 +23,23 @@ package daemon
 // composition failed — not a new state.
 //
 // When the composition resolves, InstallSessionShimComposition installs it,
-// runs the startup adoption pass, and only then re-declares the full
-// attestation through the credential refresh and the heartbeat projection.
+// declares it, runs the startup adoption pass, and only then announces it
+// through the heartbeat projection.
+//
+// THE DECLARATION FOUNDS HOST AUTHORITY
+//
+// The declaring refresh is the only round trip that may resolve the primary
+// scope's stable host id and adoption revision, and it happens inside the
+// credential refresher's lock like every other presentation. An embedder that
+// learned the host id any other way — by presenting the composed attestation
+// itself, ahead of the install — raced the running lanes: the refresher kept
+// presenting the stand-down while the embedder presented the composition, and
+// the control plane answered the flip-flop with an attestation conflict and a
+// revoked credential. So the receipt the declaration answers with is handed to
+// the embedder (AcquireRecoveryScopes' primary argument) before anything asks
+// the embedder a question that needs it. The proof-v2 readiness check is that
+// question: for the founding refresh alone it runs AFTER the receipt is
+// retained and delivered, not before — deferred, never dropped.
 //
 // THE ORDER IS THE WHOLE POINT
 //
@@ -200,7 +215,11 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 	// what makes it safe to install first and validate against the control
 	// plane second. `declared` distinguishes the two rollbacks: before the
 	// declaration the control plane never heard the attestation, after it the
-	// stand-down has to be said again.
+	// stand-down has to be said again. It flips the moment the control plane
+	// ACCEPTED the attestation — not when everything the declaration leads to
+	// has also succeeded — because a refresher left presenting a composition
+	// its daemon has abandoned is the flip-flop this file exists to prevent,
+	// approached from the other side.
 	installed := false
 	declared := false
 	defer func() {
@@ -215,10 +234,10 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 	}()
 	d.shimIdentityRef.Store(pending)
 
-	if err := d.declareSessionShimComposition(ctx); err != nil {
+	var err error
+	if declared, err = d.declareSessionShimComposition(ctx); err != nil {
 		return err
 	}
-	declared = true
 
 	if err := d.adoptSessionShims(ctx); err != nil {
 		return fmt.Errorf("session shim: composition adoption: %w", err)
@@ -240,25 +259,31 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 }
 
 // declareSessionShimComposition presents the composed attestation to the
-// control plane on the registration this daemon already holds, and retains the
-// scoped receipts the adoption pass needs to resolve host authority.
+// control plane on the registration this daemon already holds, retains the
+// scoped receipts the adoption pass needs to resolve host authority, and then
+// runs the readiness check the founding refresh deferred.
 //
 // It goes through the credential refresher rather than Register: a full
 // re-registration mints a NEW worker identity and retires the current one,
 // which is exactly the mutual-eviction shape RefreshRuntimeToken exists to
 // avoid. The refresh re-presents this worker id with the new attestation and
 // answers with the receipt.
-func (d *Daemon) declareSessionShimComposition(ctx context.Context) error {
+//
+// declared reports whether the control plane accepted the attestation, which
+// is true for every failure past the round trip itself. The caller's rollback
+// reads it: an accepted declaration has to be withdrawn, a refused one does
+// not.
+func (d *Daemon) declareSessionShimComposition(ctx context.Context) (declared bool, err error) {
 	d.mu.RLock()
 	credentials := d.credentials
 	d.mu.RUnlock()
 	if credentials == nil {
-		return errors.New("session shim: composition install requires a registered daemon")
+		return false, errors.New("session shim: composition install requires a registered daemon")
 	}
 	// The retention this refresh's receipt validation would otherwise demand is
-	// the caller's very next step: this round trip IS what establishes the
-	// scope's host authority, so there is nothing retained yet to compare it
-	// against.
+	// the very next step: this round trip IS what establishes the scope's host
+	// authority, so there is nothing retained yet to compare it against, and no
+	// host id yet for the readiness resolver to answer about.
 	d.shims.setDeclaringComposition(true)
 	defer d.shims.setDeclaringComposition(false)
 
@@ -266,9 +291,25 @@ func (d *Daemon) declareSessionShimComposition(ctx context.Context) error {
 		ctx, d.SessionShimHostAttestation(), sessionShimCompositionRefreshReason,
 	)
 	if err != nil {
-		return fmt.Errorf("session shim: declare composition: %w", err)
+		return false, fmt.Errorf("session shim: declare composition: %w", err)
 	}
-	return d.acquireSessionShimRecoveryReceipts(ctx, result.SessionShim)
+	// From here on the control plane holds the composed attestation and every
+	// lane presents the credential it minted for it. Whatever fails below
+	// fails an install the control plane has already been told about.
+	if err := d.acquireSessionShimRecoveryReceipts(ctx, result.SessionShim); err != nil {
+		return true, err
+	}
+	// The primary receipt is retained and the embedder has been handed it. Only
+	// now can a readiness resolver that answers for the primary host answer at
+	// all. Not held under d.shims.mu: the resolver is embedder code.
+	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		return true, fmt.Errorf("session shim: founding declaration readiness: %w", err)
+	}
+	slog.Info("session shim: founding declaration resolved host authority",
+		"scope", d.sessionShimConfig().orgID(),
+		"workerHostId", result.SessionShim.WorkerHostID,
+		"adoptionRevision", result.SessionShim.AdoptionRevision)
+	return true, nil
 }
 
 // redeclareSessionShimStandDown puts the stand-down back on the wire after a

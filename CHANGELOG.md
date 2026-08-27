@@ -8,6 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Breaking
+
+- **`SessionShimConfig.AcquireRecoveryScopes` receives the founding primary
+  receipt.** The callback is now
+  `func(ctx context.Context, attestation SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt) ([]SessionShimScopeCredentialReceipt, error)`.
+  `primary` is the primary scope's receipt exactly as the founding round trip
+  resolved it (`Scope`, `WorkerHostID`, `AdoptionRevision`): the registration
+  on the inline path, the declaring refresh on a deferred install. It is
+  non-secret; embedders retain it for their own host-authority lookups instead
+  of re-deriving it. Embedders that set the hook must add the third parameter.
+
+### Fixes
+
+- **The founding declaration resolves session-shim host authority, and nothing
+  else may.** A deferred composition install demanded proof-v2 readiness inside
+  the very refresh that first presented its attestation, and an embedder whose
+  readiness resolver answers for the primary host could not answer before that
+  refresh's receipt existed. The only other way to learn the host id was to
+  present the attestation outside the credential refresher's lock, which raced
+  the running lanes: the control plane saw the posture flip-flop, answered an
+  attestation conflict, and revoked the losing credential. The readiness check
+  is now deferred for the founding refresh alone — it runs once the primary
+  receipt is retained and handed to the embedder — and every other refresh
+  checks readiness before adopting, exactly as before.
+- **An install that fails after the control plane accepted its attestation
+  withdraws it.** The rollback re-declares the stand-down as soon as the
+  declaring round trip was accepted, not only once the receipts and readiness
+  behind it had also succeeded. A refresher left presenting a composition for a
+  daemon that is standing down was the same flip-flop from the other side.
+
 ---
 
 ## v0.70.0 — 2026-08-27
