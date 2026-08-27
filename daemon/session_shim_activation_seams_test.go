@@ -217,9 +217,14 @@ func TestRecoveryScopeHookRequiresExactCompleteNonSecretSet(t *testing.T) {
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		ControllerID:               attestation.ControllerID, AttestationCapabilities: attestation.Capabilities,
 		OrgID: "org-primary", AdoptionBatchOrgIDs: []string{"org-primary", "org-secondary"},
-		AcquireRecoveryScopes: func(_ context.Context, got SessionShimHostAttestation) ([]SessionShimScopeCredentialReceipt, error) {
+		AcquireRecoveryScopes: func(_ context.Context, got SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt) ([]SessionShimScopeCredentialReceipt, error) {
 			if !got.exactEqual(attestation) {
 				return nil, errors.New("attestation changed")
+			}
+			if primary != (SessionShimScopeCredentialReceipt{
+				Scope: "org-primary", WorkerHostID: "host-primary", AdoptionRevision: "revision-primary",
+			}) {
+				return nil, fmt.Errorf("primary receipt = %+v", primary)
 			}
 			return []SessionShimScopeCredentialReceipt{{
 				Scope: "org-secondary", WorkerHostID: "host-secondary", AdoptionRevision: "revision-secondary",
@@ -247,7 +252,7 @@ func TestRecoveryScopeHookRequiresExactCompleteNonSecretSet(t *testing.T) {
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		ControllerID:               attestation.ControllerID, AttestationCapabilities: attestation.Capabilities,
 		OrgID: "org-primary", AdoptionBatchOrgIDs: []string{"org-primary", "org-secondary"},
-		AcquireRecoveryScopes: func(context.Context, SessionShimHostAttestation) ([]SessionShimScopeCredentialReceipt, error) {
+		AcquireRecoveryScopes: func(context.Context, SessionShimHostAttestation, SessionShimScopeCredentialReceipt) ([]SessionShimScopeCredentialReceipt, error) {
 			return nil, nil
 		},
 	}})

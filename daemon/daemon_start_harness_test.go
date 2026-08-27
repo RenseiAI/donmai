@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net"
 	"net/http"
@@ -32,6 +33,20 @@ type compositionHarness struct {
 	refreshBodies    [][]byte
 	heartbeatBodies  []heartbeatRequestBody
 	registerBlockFor time.Duration
+	// refreshReceiptState is the credential state the control plane echoes on
+	// a refresh that presents the composed attestation. It starts as
+	// recovering, which is what a declaring refresh must be answered with; a
+	// test exercising refreshes AFTER a completed install sets it to ready,
+	// because that is the state the daemon then demands.
+	refreshReceiptState string
+}
+
+// setRefreshReceiptState changes what the control plane answers to later
+// composed refreshes. See refreshReceiptState.
+func (h *compositionHarness) setRefreshReceiptState(state string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refreshReceiptState = state
 }
 
 // heartbeats returns every heartbeat body the control plane has received.
@@ -113,14 +128,20 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			raw, _ := io.ReadAll(r.Body)
 			h.mu.Lock()
 			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
+			// Every refresh mints a DISTINCT token, so a test can tell a refresh
+			// that was adopted from one that was refused before adoption.
+			token := fmt.Sprintf("runtime-composition-refreshed-%d", len(h.refreshBodies))
+			state := h.refreshReceiptState
 			h.mu.Unlock()
+			if state == "" {
+				state = SessionShimCredentialStateRecovering
+			}
 			var presented SessionShimHostAttestation
 			_ = json.Unmarshal(raw, &presented)
-			resp := refreshResponse{RuntimeToken: "runtime-composition-refreshed"}
+			resp := refreshResponse{RuntimeToken: token}
 			if presented.Supports() {
 				resp.SessionShim = activationTestCredentialReceipt(
-					presented, SessionShimCredentialStateRecovering,
-					"stable-host-composition", "revision-declared",
+					presented, state, "stable-host-composition", "revision-declared",
 				)
 			}
 			_ = json.NewEncoder(w).Encode(resp)
