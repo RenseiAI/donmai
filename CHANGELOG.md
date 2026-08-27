@@ -8,6 +8,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **An acceptance-cleared quarantine is reported as an explicit abandoned
+  disposition instead of silently vanishing from the projection.** The
+  adoption batch gains a top-level `cleared` section, sibling to
+  adopted/quarantined/tombstoned: each entry names a currently-quarantined
+  unterminated lineage by its exact lifecycle identity and carries
+  `disposition: "abandoned"` (the only admissible value — absence of evidence
+  proves unobservability, never death) plus a closed reason token. Previously
+  the token-gated acceptance quarantine-clear dropped the helper from the
+  daemon's quarantine projection and the next published batch simply OMITTED
+  the lineage; the control plane, still holding an active recovery obligation,
+  refused the batch as incomplete, the next heartbeat disagreed with the last
+  committed set, and the host was demoted to draining permanently. The clear
+  now stages the entry, publishes it through `cleared`
+  (reason `acceptance_clear_without_terminal_evidence`), keeps projecting the
+  lineage quarantined on the heartbeat while the commit is in flight, and
+  forgets it locally only after the batch receipt echoes the cleared entry
+  exactly — a receipt that fails to echo is refused and the lineage stays
+  projected and staged for the next publish. The production remover is
+  unchanged: terminal evidence still leaves through the tombstone lane, and
+  genuine omission is still refused.
+
 ### Fixes
 
 - **A failed dynamic adoption publication rolls back to the last-committed

@@ -1230,7 +1230,14 @@ type sessionShimState struct {
 	forwarded map[sessionshim.Identity]uint64
 	// correlations survive a controller disconnect so the later exact tombstone
 	// callback still receives the same opaque durable adoption receipt.
-	correlations       map[shimIncarnation]sessionShimAdoptionCorrelation
+	correlations map[shimIncarnation]sessionShimAdoptionCorrelation
+	// pendingCleared stages quarantined lineages the acceptance clear has
+	// explicitly abandoned but no committed batch receipt has confirmed yet.
+	// While staged, the lineage keeps its row in quarantined — the heartbeat
+	// must keep projecting it until the control plane's completeness set has
+	// verifiably let it go — and every published batch reports it through the
+	// cleared section instead of the quarantined one.
+	pendingCleared     map[shimIncarnation]SessionShimClearedQuarantine
 	batchReceipts      map[string]SessionShimAdoptionBatchReceipt
 	credentialReceipts map[string]SessionShimScopeCredentialReceipt
 	// declaringComposition is set only while a deferred composition install is
@@ -1290,6 +1297,7 @@ func newSessionShimState() *sessionShimState {
 		adopted:              make(map[sessionshim.Identity]adoptedShim),
 		forwarded:            make(map[sessionshim.Identity]uint64),
 		correlations:         make(map[shimIncarnation]sessionShimAdoptionCorrelation),
+		pendingCleared:       make(map[shimIncarnation]SessionShimClearedQuarantine),
 		fences:               make(map[string]sessionshim.Fence),
 		fenceRequests:        make(map[string]sessionshim.FenceRequest),
 		batchReceipts:        make(map[string]SessionShimAdoptionBatchReceipt),
@@ -2316,9 +2324,69 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	if (d.sessionShimEnabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: attested adoption batch omitted adoption revision")
 	}
+	if err := validateSessionShimClearedReceiptEcho(batch.Cleared, receipt.Cleared); err != nil {
+		return SessionShimAdoptionBatchReceipt{}, err
+	}
 	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
 	receipt.Cleared = append([]SessionShimClearedQuarantine(nil), receipt.Cleared...)
+	// Only now — the commit is durable and the receipt echoed every cleared
+	// entry exactly — may the daemon forget the abandoned lineages. Dropping
+	// them any earlier is what made the next heartbeat disagree with the last
+	// committed set and demoted the host to draining.
+	d.dropSessionShimClearedQuarantinesCommitted(batch.Cleared)
 	return receipt, nil
+}
+
+// validateSessionShimClearedReceiptEcho requires a batch receipt to echo the
+// cleared section exactly: same entries, same order, byte-identical fields. A
+// receipt silent about a cleared entry gives this daemon no confirmation the
+// composer's recovery obligation moved active → abandoned, so the lineage must
+// stay projected; a receipt claiming entries that were never sent is a
+// fabricated commit and is refused the same way.
+func validateSessionShimClearedReceiptEcho(sent, echoed []SessionShimClearedQuarantine) error {
+	if len(echoed) != len(sent) {
+		return fmt.Errorf("session shim: adoption batch receipt echoed %d cleared entries, want %d", len(echoed), len(sent))
+	}
+	for i := range sent {
+		if echoed[i] != sent[i] {
+			return fmt.Errorf("session shim: adoption batch receipt did not exactly echo cleared entry %d", i)
+		}
+	}
+	return nil
+}
+
+// dropSessionShimClearedQuarantinesCommitted forgets cleared lineages whose
+// abandonment a committed batch receipt just confirmed: the staged entry, the
+// acceptance bookkeeping, and the quarantined projection row all go together,
+// so the next heartbeat and the control plane's post-commit completeness set
+// agree by construction.
+//
+// Only two callers are admissible, and TestClearedQuarantineDropsOnlyAtCommit
+// pins the set: completeSessionShimAdoptionBatch (the commit choke point, after
+// the exact receipt echo) and the standalone branch of
+// clearSessionShimAcceptanceQuarantine (no composer holds an obligation, so the
+// local drop is the commit).
+func (d *Daemon) dropSessionShimClearedQuarantinesCommitted(cleared []SessionShimClearedQuarantine) {
+	if len(cleared) == 0 || d.shims == nil {
+		return
+	}
+	d.shims.mu.Lock()
+	for _, entry := range cleared {
+		key := shimIncarnation{identity: entry.Identity(), shimID: entry.ShimID, processEpoch: entry.ProcessEpoch}
+		delete(d.shims.pendingCleared, key)
+		delete(d.shims.acceptanceQuarantine, key)
+		kept := d.shims.quarantined[:0]
+		for _, q := range d.shims.quarantined {
+			if q.Identity() == key.identity && q.ShimID == key.shimID && q.ProcessEpoch == key.processEpoch {
+				continue
+			}
+			kept = append(kept, q)
+		}
+		d.shims.quarantined = kept
+	}
+	d.shims.mu.Unlock()
+	slog.Info("session shim: acceptance-cleared quarantine committed as an explicit abandoned disposition",
+		"cleared", len(cleared))
 }
 
 // sessionShimProjectionBatch assembles this daemon's complete durable
@@ -2356,9 +2424,22 @@ func (d *Daemon) sessionShimProjectionBatch(orgID, hostID string) SessionShimAdo
 		})
 	}
 	for _, quarantined := range d.shims.quarantined {
-		if quarantined.OrgID == batch.OrgID {
-			batch.Quarantined = append(batch.Quarantined, quarantined)
+		if quarantined.OrgID != batch.OrgID {
+			continue
 		}
+		key := shimIncarnation{
+			identity: quarantined.Identity(), shimID: quarantined.ShimID, processEpoch: quarantined.ProcessEpoch,
+		}
+		if cleared, pending := d.shims.pendingCleared[key]; pending {
+			// A staged abandonment is still projected quarantined on the
+			// heartbeat, but the durable batch reports it through the cleared
+			// section: carrying it quarantined would ask the receiver to keep
+			// the obligation this batch abandons, and omitting it outright is
+			// refused as incomplete.
+			batch.Cleared = append(batch.Cleared, cleared)
+			continue
+		}
+		batch.Quarantined = append(batch.Quarantined, quarantined)
 	}
 	for _, tombstone := range d.shims.tombstoned {
 		if tombstone.OrgID == batch.OrgID {
@@ -2381,26 +2462,37 @@ func (d *Daemon) sessionShimProjectionBatch(orgID, hostID string) SessionShimAdo
 //
 // A failure here is logged rather than returned: the callers are release paths
 // that must not be blocked by the platform being unreachable, and the next
-// adoption or tombstone republishes the same projection anyway.
+// adoption or tombstone republishes the same projection anyway. A caller that
+// must observe the outcome — the acceptance clear waiting for its cleared
+// entry's confirmed commit — uses republishSessionShimProjection directly.
 func (d *Daemon) publishSessionShimProjection(ctx context.Context, orgID string) {
+	_ = d.republishSessionShimProjection(ctx, orgID)
+}
+
+// republishSessionShimProjection publishes the organization's complete current
+// projection and returns the first failure (host resolution, batch commit,
+// receipt retention). Every failure is also logged, so the fire-and-forget
+// wrapper above loses nothing.
+func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID string) error {
 	if d.shims == nil || d.sessionShimConfig().OnAdoptionBatch == nil || orgID == "" {
-		return
+		return nil
 	}
 	hostID, err := d.sessionShimHostID(ctx, orgID)
 	if err != nil {
 		slog.Warn("session shim: quarantine projection not published after host identity resolution failed",
 			"org", orgID, "error", err)
-		return
+		return fmt.Errorf("session shim: resolve host authority for republish: %w", err)
 	}
 	batch := d.sessionShimProjectionBatch(orgID, hostID)
 	sortSessionShimAdoptionOutcomes(batch.Adopted)
 	sessionshim.SortQuarantined(batch.Quarantined)
+	sortSessionShimClearedQuarantines(batch.Cleared)
 	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
 	if err != nil {
 		slog.Warn("session shim: quarantine projection not published",
 			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
-			"tombstoned", len(batch.Tombstoned), "error", err)
-		return
+			"tombstoned", len(batch.Tombstoned), "cleared", len(batch.Cleared), "error", err)
+		return err
 	}
 	// Committing a batch advances the host's adoption revision. The heartbeat
 	// attests the revision this daemon believes it is at, and the platform
@@ -2412,11 +2504,12 @@ func (d *Daemon) publishSessionShimProjection(ctx context.Context, orgID string)
 	if revisionErr := d.updateSessionShimAdoptionRevision(orgID, receipt.AdoptionRevision, false); revisionErr != nil {
 		slog.Warn("session shim: adoption revision not retained after republishing the projection",
 			"org", orgID, "error", revisionErr)
-		return
+		return revisionErr
 	}
 	slog.Info("session shim: republished the durable projection after a quarantine change",
 		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
 		"revision", receipt.AdoptionRevision)
+	return nil
 }
 
 // sortSessionShimAdoptionOutcomes puts a batch's adopted set in the exact order
@@ -2469,6 +2562,7 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 	}
 	sortSessionShimAdoptionOutcomes(batch.Adopted)
 	sessionshim.SortQuarantined(batch.Quarantined)
+	sortSessionShimClearedQuarantines(batch.Cleared)
 	return d.completeSessionShimAdoptionBatch(ctx, batch)
 }
 

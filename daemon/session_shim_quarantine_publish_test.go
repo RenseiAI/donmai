@@ -178,6 +178,71 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 	}
 }
 
+// TestClearedQuarantineDropsOnlyAtCommit is the structural half of the
+// retain-until-confirmed ordering. A cleared lineage leaves the local
+// quarantine projection through exactly one helper, and that helper may be
+// called from exactly two places: the batch commit choke point (after the
+// receipt echoed the cleared section) and the standalone branch of the
+// acceptance clear (no composer, so the local drop IS the commit). A new call
+// site would be a path that can forget a lineage the composer still holds —
+// the divergence the cleared section exists to prevent.
+func TestClearedQuarantineDropsOnlyAtCommit(t *testing.T) {
+	t.Parallel()
+	const dropper = "dropSessionShimClearedQuarantinesCommitted"
+	allowed := map[string]bool{
+		"completeSessionShimAdoptionBatch":     true,
+		"clearSessionShimAcceptanceQuarantine": true,
+	}
+	entries, err := os.ReadDir("./")
+	if err != nil {
+		t.Fatal(err)
+	}
+	callers := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		fset := token.NewFileSet()
+		file, parseErr := parser.ParseFile(fset, filepath.Join("./", name), nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", name, parseErr)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil || fn.Name.Name == dropper {
+				continue
+			}
+			var calls []string
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				switch fun := call.Fun.(type) {
+				case *ast.SelectorExpr:
+					calls = append(calls, fun.Sel.Name)
+				case *ast.Ident:
+					calls = append(calls, fun.Name)
+				}
+				return true
+			})
+			if !contains(calls, dropper) {
+				continue
+			}
+			callers++
+			if !allowed[fn.Name.Name] {
+				t.Errorf("%s: %s drops a cleared quarantine outside the commit choke point — "+
+					"forgetting a lineage before the batch receipt confirms it is what made the "+
+					"next heartbeat disagree with the last committed set", name, fn.Name.Name)
+			}
+		}
+	}
+	if callers < 2 {
+		t.Fatalf("found %d call sites of %s, want both admissible ones — the guard is not watching anything", callers, dropper)
+	}
+}
+
 func contains(haystack []string, needle string) bool {
 	for _, item := range haystack {
 		if item == needle {

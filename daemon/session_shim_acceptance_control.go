@@ -313,47 +313,63 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	if err != nil || present {
 		return errors.New("mutator-owned shim record remains live")
 	}
-	// Report what the two checks above just proved BEFORE forgetting the
-	// lineage. Dropping it from the projection first is what made the next
-	// complete batch incomplete: the composer still held a live obligation for
-	// a lineage this daemon had stopped reporting, and refused every batch
-	// after it. The attestation is not a tombstone and does not claim to be —
-	// no tombstone exists here, the helper's record is gone — but it is the
-	// exact evidence this function already required in order to proceed.
-	ctx := context.Background()
-	hostID, err := d.sessionShimHostID(ctx, incarnation.identity.OrgID)
-	if err != nil {
-		return fmt.Errorf("resolve host authority for absent attestation: %w", err)
-	}
-	if err := d.reportSessionShimTerminalEvidence(ctx, SessionShimTerminalEvidence{
-		Identity:     incarnation.identity,
-		HostID:       hostID,
-		ShimID:       incarnation.shimID,
-		ProcessEpoch: incarnation.processEpoch,
-		Absent: &SessionShimAbsentAttestation{
-			ProcessIdentityAbsent: true,
-			RegistryRecordAbsent:  true,
-			ObservedAtUnixNano:    time.Now().UnixNano(),
-		},
-	}); err != nil {
-		// Keep the quarantine. A lineage this daemon still reports is one the
-		// composer and the daemon still agree about; forgetting it while the
-		// report was refused is precisely the divergence being fixed.
-		return fmt.Errorf("retain quarantine after absent attestation refusal: %w", err)
-	}
+	// The two checks above prove the helper is unobservable — not dead. No
+	// tombstone exists and none may be manufactured, so the lineage cannot
+	// leave through terminal evidence; and a batch that simply OMITS a lineage
+	// the composer still holds an active obligation for is refused as
+	// incomplete, after which the next heartbeat disagrees with the last
+	// committed set and the host is demoted to draining. Stage the explicit
+	// abandoned disposition instead: the next published batch carries the
+	// entry in its cleared section, the composer converts the obligation
+	// active → abandoned, and the lineage is forgotten locally only once the
+	// batch receipt echoes the entry back (the commit choke point in
+	// completeSessionShimAdoptionBatch). Until then the heartbeat keeps
+	// projecting it quarantined, so the beat never disagrees.
 	d.shims.mu.Lock()
-	kept := d.shims.quarantined[:0]
-	for _, q := range d.shims.quarantined {
-		if q.Identity() == incarnation.identity && q.ShimID == incarnation.shimID && q.ProcessEpoch == incarnation.processEpoch {
-			continue
+	if _, pending := d.shims.pendingCleared[incarnation]; !pending {
+		staged := false
+		for _, q := range d.shims.quarantined {
+			if q.Identity() != incarnation.identity || q.ShimID != incarnation.shimID || q.ProcessEpoch != incarnation.processEpoch {
+				continue
+			}
+			entry := SessionShimClearedQuarantine{
+				OrgID:                q.OrgID,
+				SessionID:            q.SessionID,
+				ShimID:               q.ShimID,
+				ProcessEpoch:         q.ProcessEpoch,
+				ControllerGeneration: q.ControllerGeneration,
+				Disposition:          SessionShimDispositionAbandoned,
+				Reason:               SessionShimClearedReasonAcceptanceClearWithoutTerminalEvidence,
+			}
+			if err := entry.Validate(); err != nil {
+				d.shims.mu.Unlock()
+				return err
+			}
+			d.shims.pendingCleared[incarnation] = entry
+			staged = true
+			break
 		}
-		kept = append(kept, q)
+		if !staged {
+			// No quarantined projection row exists for this incarnation, so
+			// there is nothing the composer could still be holding; drop only
+			// the acceptance bookkeeping.
+			delete(d.shims.acceptanceQuarantine, incarnation)
+			d.shims.mu.Unlock()
+			return nil
+		}
 	}
-	d.shims.quarantined = kept
-	delete(d.shims.acceptanceQuarantine, incarnation)
 	d.shims.mu.Unlock()
-	d.publishSessionShimProjection(ctx, incarnation.identity.OrgID)
-	return nil
+	if d.sessionShimConfig().OnAdoptionBatch == nil {
+		// Standalone: no composer holds a recovery obligation for this lineage,
+		// so there is no durable commit to confirm — the local drop is the
+		// commit.
+		d.shims.mu.RLock()
+		entry := d.shims.pendingCleared[incarnation]
+		d.shims.mu.RUnlock()
+		d.dropSessionShimClearedQuarantinesCommitted([]SessionShimClearedQuarantine{entry})
+		return nil
+	}
+	return d.republishSessionShimProjection(context.Background(), incarnation.identity.OrgID)
 }
 
 func (d *Daemon) armSessionShimAcceptanceFenceRefusal(id sessionshim.Identity) error {
