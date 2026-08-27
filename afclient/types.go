@@ -1,5 +1,10 @@
 package afclient
 
+import (
+	"encoding/json"
+	"fmt"
+)
+
 // SessionStatus matches the public API status union type.
 type SessionStatus string
 
@@ -124,6 +129,38 @@ type StopSessionReceipt struct {
 	IntentRevision   string        `json:"intentRevision"`
 	Disposition      SessionStatus `json:"disposition"`
 	IdempotentReplay bool          `json:"idempotentReplay"`
+}
+
+// UnmarshalJSON keeps successful stop receipts on the same bounded policy as
+// typed conflict receipts. It never includes untrusted values in errors.
+func (r *StopSessionReceipt) UnmarshalJSON(data []byte) error {
+	var untrusted any
+	if err := json.Unmarshal(data, &untrusted); err != nil || containsSecretMaterial(untrusted) {
+		return fmt.Errorf("decode stop receipt: malformed or unsafe receipt")
+	}
+	type receiptWire StopSessionReceipt
+	var decoded receiptWire
+	if err := json.Unmarshal(data, &decoded); err != nil {
+		return fmt.Errorf("decode stop receipt: invalid field type")
+	}
+	if decoded.Version != 1 || decoded.Kind != "session_stop" ||
+		!safeReceiptAtom(decoded.SessionID, 256) ||
+		!safeReceiptAtom(decoded.MutationID, 256) ||
+		!safeReceiptAtom(decoded.IntentRevision, 64) ||
+		!validStopDisposition(decoded.Disposition) {
+		return fmt.Errorf("decode stop receipt: invalid receipt fields")
+	}
+	*r = StopSessionReceipt(decoded)
+	return nil
+}
+
+func validStopDisposition(status SessionStatus) bool {
+	switch status {
+	case StatusStopped, StatusFailed, StatusCompleted, StatusTimedOut:
+		return true
+	default:
+		return false
+	}
 }
 
 // ChatSessionRequest is the body of POST /api/public/sessions/:id/prompt.

@@ -240,3 +240,31 @@ func TestAgentStopJSONPreservesDurableSuccessReceipt(t *testing.T) {
 		t.Fatalf("receipt identity/truth changed: %#v", output)
 	}
 }
+
+func TestAgentStopJSONRejectsSecretBearingSuccessReceiptWithoutEcho(t *testing.T) {
+	t.Parallel()
+	const secret = "rsk_do_not_echo"
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"public-hash","previousStatus":"claimed","newStatus":"stopped","receipt":{"version":1,"kind":"session_stop","sessionId":"` + secret + `","mutationId":"stop:storage","intentRevision":"7","disposition":"stopped","idempotentReplay":false}}`))
+	}))
+	t.Cleanup(srv.Close)
+	client := afclient.NewClient(srv.URL)
+	cmd := newAgentStopCmd(func() afclient.DataSource { return client })
+	var stdout strings.Builder
+	var stderr strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetErr(&stderr)
+	cmd.SetArgs([]string{"public-hash", "--json"})
+	err := cmd.Execute()
+	if err == nil {
+		t.Fatal("secret-bearing success receipt decoded without error")
+	}
+	combined := stdout.String() + stderr.String() + err.Error()
+	if strings.Contains(combined, secret) {
+		t.Fatalf("secret reflected in output: %q", combined)
+	}
+	if stdout.Len() != 0 {
+		t.Fatalf("failed success receipt emitted stdout: %q", stdout.String())
+	}
+}

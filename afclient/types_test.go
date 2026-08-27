@@ -106,6 +106,42 @@ func TestStopSessionResponseDecodesLegacySuccessWithoutReceipt(t *testing.T) {
 	}
 }
 
+func TestStopSessionReceiptRejectsUnsafeFields(t *testing.T) {
+	valid := `{"version":1,"kind":"session_stop","sessionId":"storage-uuid","mutationId":"linear-stop:reconcile:7:storage-uuid","intentRevision":"7","disposition":"stopped","idempotentReplay":false}`
+	var legitimate StopSessionReceipt
+	if err := json.Unmarshal([]byte(valid), &legitimate); err != nil {
+		t.Fatalf("legitimate reconciliation receipt rejected: %v", err)
+	}
+
+	tests := []struct {
+		name      string
+		json      string
+		forbidden string
+	}{
+		{"secret storage id", strings.Replace(valid, "storage-uuid", "rsk_do_not_echo", 1), "rsk_do_not_echo"},
+		{"secret mutation id", strings.Replace(valid, "linear-stop:reconcile:7:storage-uuid", "Bearer do_not_echo", 1), "do_not_echo"},
+		{"secret revision", strings.Replace(valid, `"intentRevision":"7"`, `"intentRevision":"sk-do_not_echo"`, 1), "sk-do_not_echo"},
+		{"secret unknown key", strings.TrimSuffix(valid, "}") + `,"privateKey":"do_not_echo"}`, "do_not_echo"},
+		{"overlength storage id", strings.Replace(valid, "storage-uuid", strings.Repeat("a", 257), 1), ""},
+		{"non atom mutation id", strings.Replace(valid, "linear-stop:reconcile:7:storage-uuid", "mutation with spaces", 1), ""},
+		{"invalid version", strings.Replace(valid, `"version":1`, `"version":2`, 1), ""},
+		{"invalid kind", strings.Replace(valid, "session_stop", "other", 1), ""},
+		{"nonterminal disposition", strings.Replace(valid, `"disposition":"stopped"`, `"disposition":"working"`, 1), ""},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var receipt StopSessionReceipt
+			err := json.Unmarshal([]byte(tc.json), &receipt)
+			if err == nil {
+				t.Fatalf("unsafe receipt decoded: %+v", receipt)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("decode error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
+
 func TestChatSessionRequestMarshal(t *testing.T) {
 	in := ChatSessionRequest{Prompt: "hello agent"}
 	data, err := json.Marshal(in)
