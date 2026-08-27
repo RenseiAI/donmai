@@ -2,7 +2,7 @@
 
 All notable changes to the `donmai` binary are documented here.
 
-Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores`. Unreleased work goes under `## [Unreleased]`.
+Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores`. Unreleased work goes under `## v0.71.0 — 2026-08-27`.
 
 ---
 
