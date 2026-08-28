@@ -20,6 +20,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   bounded drain. The path remains off unless queued work includes the additive
   `execution-event-ingest` capability, preserving mixed-version behavior for
   standalone and older compositions.
+- **Pi interactive profile v3 now declares
+  `pi_additional_extension_registration`.** Real bare-PTY conformance proves
+  the extension's registered tool and one safe invocation/receipt; MCP
+  delivery remains `unsupported` (unchanged).
 
 ## v0.72.0 — 2026-08-28
 
