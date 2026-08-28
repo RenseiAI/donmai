@@ -93,6 +93,16 @@ func (s *executionEventSink) Send(ctx context.Context, event agent.Event) {
 
 func (s *executionEventSink) Close(result *Result) {
 	s.once.Do(func() {
+		if result != nil && result.FailureMode == FailureAgentBlocked {
+			if err := s.uploader.SendSessionBlocked("agent declined to proceed"); err != nil && s.logger != nil {
+				s.logger.Warn("execution-event blocked journal append failed", "err", err)
+			}
+		}
+		for _, fact := range executionEventPullRequestFacts(result) {
+			if err := s.uploader.SendPullRequestOpened(fact); err != nil && s.logger != nil {
+				s.logger.Warn("execution-event pull request journal append failed", "err", err)
+			}
+		}
 		outcome, evidence := executionEventOutcome(result)
 		var digest string
 		if result != nil {
@@ -107,6 +117,37 @@ func (s *executionEventSink) Close(result *Result) {
 			s.logger.Warn("execution-event terminal drain incomplete; journal retained", "err", err)
 		}
 	})
+}
+
+func executionEventPullRequestFacts(result *Result) []agent.PullRequestFact {
+	if result == nil {
+		return nil
+	}
+	seen := make(map[string]struct{})
+	facts := make([]agent.PullRequestFact, 0, 2)
+	appendFact := func(fact *agent.PullRequestFact) {
+		if fact == nil || agent.ValidatePullRequestFact(*fact) != nil {
+			return
+		}
+		key := fact.Provider + "\x00" + fact.Repository + "\x00" + fmt.Sprintf("%d", fact.Number)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		facts = append(facts, *fact)
+	}
+	// PullRequestURL is agent-observable completion metadata, not authority for
+	// repository or branch facts. Promote it only after the runner performs a
+	// bounded GitHub readback from the session worktree. A failed readback
+	// deliberately leaves the legacy URL intact while omitting pr.opened.
+	appendFact(lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL))
+	if result.BackstopReport != nil {
+		appendFact(result.BackstopReport.PullRequest)
+		for _, repository := range result.BackstopReport.Repositories {
+			appendFact(repository.Report.PullRequest)
+		}
+	}
+	return facts
 }
 
 func executionEventOutcome(result *Result) (string, string) {

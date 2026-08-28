@@ -101,6 +101,37 @@ func NewSessionEndedRecordWithEvidence(sessionID string, seq uint64, observedAt 
 	return NewRecord(sessionID, seq, observedAt, "session.ended", payload)
 }
 
+// NewSessionBlockedRecord creates the runner-owned fact for a deliberate
+// agent refusal. Callers supply a bounded, classified reason only; raw result
+// errors may contain provider or prompt material and never belong on this wire.
+func NewSessionBlockedRecord(sessionID string, seq uint64, observedAt time.Time, reason string) (Record, error) {
+	reason = strings.TrimSpace(reason)
+	if reason == "" || len(reason) > 2048 {
+		return Record{}, fmt.Errorf("executionevent: blocked reason must be 1..2048 bytes")
+	}
+	return NewRecord(sessionID, seq, observedAt, "session.blocked", map[string]any{"reason": reason})
+}
+
+// NewPullRequestOpenedRecord creates a complete GitHub PR fact. A URL alone
+// is insufficient for this topic because it cannot establish both branches.
+func NewPullRequestOpenedRecord(sessionID string, seq uint64, observedAt time.Time, fact agent.PullRequestFact) (Record, error) {
+	if err := agent.ValidatePullRequestFact(fact); err != nil {
+		return Record{}, fmt.Errorf("executionevent: invalid pull request fact: %w", err)
+	}
+	payload := map[string]any{
+		"provider":   fact.Provider,
+		"number":     fact.Number,
+		"repository": fact.Repository,
+		"url":        fact.URL,
+		"baseBranch": fact.BaseBranch,
+		"headBranch": fact.HeadBranch,
+	}
+	if fact.Author != "" {
+		payload["author"] = fact.Author
+	}
+	return NewRecord(sessionID, seq, observedAt, "pr.opened", payload)
+}
+
 // DigestResult returns a digest-only result reference for terminal evidence.
 func DigestResult(status, summary, failure string) string {
 	b, _ := MarshalCompact(map[string]string{"status": status, "summary": summary, "failure": failure})

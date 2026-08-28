@@ -213,6 +213,37 @@ func TestResult_RoundTrip(t *testing.T) {
 	}
 }
 
+func TestValidatePullRequestFact(t *testing.T) {
+	t.Parallel()
+	valid := PullRequestFact{
+		Provider: "github", Number: 42, Repository: "RenseiAI/donmai",
+		URL: "https://github.com/RenseiAI/donmai/pull/42", BaseBranch: "main", HeadBranch: "agent/test-fact",
+	}
+	for name, mutate := range map[string]func(*PullRequestFact){
+		"valid":                        func(*PullRequestFact) {},
+		"unknown provider":             func(f *PullRequestFact) { f.Provider = "gitlab" },
+		"zero number":                  func(f *PullRequestFact) { f.Number = 0 },
+		"missing repository":           func(f *PullRequestFact) { f.Repository = "" },
+		"missing base branch":          func(f *PullRequestFact) { f.BaseBranch = "" },
+		"missing head branch":          func(f *PullRequestFact) { f.HeadBranch = "" },
+		"URL mismatches number":        func(f *PullRequestFact) { f.URL = "https://github.com/RenseiAI/donmai/pull/43" },
+		"URL carries query":            func(f *PullRequestFact) { f.URL += "?tab=files" },
+		"URL has untrusted whitespace": func(f *PullRequestFact) { f.URL = " " + f.URL },
+	} {
+		t.Run(name, func(t *testing.T) {
+			fact := valid
+			mutate(&fact)
+			err := ValidatePullRequestFact(fact)
+			if name == "valid" && err != nil {
+				t.Fatalf("ValidatePullRequestFact(valid): %v", err)
+			}
+			if name != "valid" && err == nil {
+				t.Fatalf("ValidatePullRequestFact(%+v) = nil, want error", fact)
+			}
+		})
+	}
+}
+
 // TestIsSupported is a table-driven check on the named-capability gate.
 func TestIsSupported(t *testing.T) {
 	t.Parallel()
