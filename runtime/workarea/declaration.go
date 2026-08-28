@@ -520,8 +520,12 @@ type DeclarationRepositoryRecord struct {
 	Authority    RepositoryAuthority `json:"authority"`
 	RequestedRef string              `json:"requestedRef,omitempty"`
 	ResolvedRef  string              `json:"resolvedRef,omitempty"`
-	SourceDigest string              `json:"sourceDigest"`
-	SparsePaths  []string            `json:"sparsePaths,omitempty"`
+	// CanonicalGitHubRepository is the secret-free canonical GitHub slug
+	// derived from Source.Repository when, and only when, the declaration source
+	// is the exact github.com https/ssh form this runner trusts for PR facts.
+	CanonicalGitHubRepository string   `json:"canonicalGitHubRepository,omitempty"`
+	SourceDigest              string   `json:"sourceDigest"`
+	SparsePaths               []string `json:"sparsePaths,omitempty"`
 }
 
 // DeclarationRecord is the durable source of truth for root ownership and
@@ -553,8 +557,9 @@ func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDe
 		record.Repositories = append(record.Repositories, DeclarationRepositoryRecord{
 			Name: repository.Name, Leaf: repository.Leaf, Role: repository.Role,
 			Authority: repository.Authority, RequestedRef: repository.Source.Ref,
-			ResolvedRef: resolvedRefs[repository.Name], SourceDigest: sourceDigest,
-			SparsePaths: append([]string(nil), repository.Source.Paths...),
+			ResolvedRef:               resolvedRefs[repository.Name],
+			CanonicalGitHubRepository: CanonicalGitHubRepositorySource(repository.Source.Repository),
+			SourceDigest:              sourceDigest, SparsePaths: append([]string(nil), repository.Source.Paths...),
 		})
 	}
 	return record
@@ -592,6 +597,9 @@ func (r DeclarationRecord) Validate() error {
 		if repository.Authority != RepositoryReadOnly && repository.Authority != RepositoryMutable {
 			return repositoryError(ReasonDeclarationRecordInvalid, RuleReadOnlyExecutorEnforced, repository.Name, "record contains an unknown authority")
 		}
+		if repository.CanonicalGitHubRepository != "" && normalizeGitHubRepositorySlug(repository.CanonicalGitHubRepository) != repository.CanonicalGitHubRepository {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "record canonical GitHub repository is invalid")
+		}
 		if !validRepositorySourceDigest(repository.SourceDigest) {
 			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "record source digest is missing or invalid")
 		}
@@ -606,6 +614,49 @@ func (r DeclarationRecord) Validate() error {
 		return repositoryError(ReasonDeclarationRecordInvalid, RuleSinglePrimary, r.SelectedRepository, "record must contain one primary and its selected repository")
 	}
 	return nil
+}
+
+// CanonicalGitHubRepositorySource returns the normalized lower-case
+// "owner/repo" slug when source is one of the exact GitHub repository source
+// forms PR facts are allowed to bind to. Anything else fails closed.
+func CanonicalGitHubRepositorySource(source string) string {
+	s := strings.TrimSpace(source)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "git@github.com:") {
+		return normalizeGitHubRepositorySlug(strings.TrimPrefix(s, "git@github.com:"))
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return ""
+	}
+	if u.User != nil {
+		return ""
+	}
+	if !strings.EqualFold(u.Hostname(), "github.com") || u.Port() != "" {
+		return ""
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	return normalizeGitHubRepositorySlug(u.Path)
+}
+
+func normalizeGitHubRepositorySlug(repository string) string {
+	s := strings.TrimSpace(repository)
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimSuffix(s, ".git")
+	parts := strings.Split(strings.Trim(s, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return strings.ToLower(parts[0] + "/" + parts[1])
 }
 
 // RepositorySourceDigest binds a secret-free canonical repository identity.

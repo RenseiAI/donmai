@@ -123,13 +123,15 @@ func TestExecutionEventSinkAppendsBlockedAndCompletePullRequestBeforeSoleTermina
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
-	worktree := t.TempDir()
-	gitInitWithOrigin(t, worktree, "https://github.com/RenseiAI/donmai.git")
+	root, worktree := writeDeclaredMutableWorkarea(t, "../retargeted/local-origin", []workarea.DeclaredRepositoryV1{{
+		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
+		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+	}})
 	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "failed", FailureMode: FailureAgentBlocked,
-		WorktreePath: worktree, PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
+		WorktreePath: worktree, WorkareaRoot: root.String(), PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
 	}})
 	records := uploader.Journal().Records
 	if len(records) != 3 {
@@ -166,12 +168,14 @@ func TestExecutionEventSinkRejectsSuccessfulForeignReadbackForSelectedRepository
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
-	worktree := t.TempDir()
-	gitInitWithOrigin(t, worktree, "https://github.com/RenseiAI/donmai.git")
+	root, worktree := writeDeclaredMutableWorkarea(t, "../retargeted/local-origin", []workarea.DeclaredRepositoryV1{{
+		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
+		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+	}})
 	stubGhOnPath(t, 0, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated","repository":{"nameWithOwner":"unrelated/private"}}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
-		Status: "completed", WorktreePath: worktree,
+		Status: "completed", WorktreePath: worktree, WorkareaRoot: root.String(),
 		PullRequestURL: "https://github.com/unrelated/private/pull/2",
 	}})
 	records := uploader.Journal().Records
@@ -180,18 +184,44 @@ func TestExecutionEventSinkRejectsSuccessfulForeignReadbackForSelectedRepository
 	}
 }
 
-func TestExecutionEventSinkRejectsSpoofedGitHubOriginForSelectedRepository(t *testing.T) {
+func TestExecutionEventSinkAllowsSelectedRepositoryFactWithRetargetedOriginAndDeclarationAuthority(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(server.Close)
-	uploader, err := executionevent.New(executionevent.Config{SessionID: "session_spoofed_origin", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test", MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {}})
+	uploader, err := executionevent.New(executionevent.Config{SessionID: "session_retargeted_origin", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test", MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = uploader.Journal().Close() })
+	root, worktree := writeDeclaredMutableWorkarea(t, "../retargeted/local-origin", []workarea.DeclaredRepositoryV1{{
+		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
+		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+	}})
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	sink := newExecutionEventSink(nil, uploader, nil)
+	sink.Close(&Result{Result: agent.Result{
+		Status: "completed", WorktreePath: worktree, WorkareaRoot: root.String(),
+		PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
+	}})
+	records := uploader.Journal().Records
+	if len(records) != 2 || records[0].EventType != "pr.opened" || records[1].EventType != "session.ended" {
+		t.Fatalf("retargeted origin emitted records = %+v, want pr.opened then session.ended", records)
+	}
+}
+
+func TestExecutionEventSinkFailsClosedWithoutDeclarationAuthority(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	uploader, err := executionevent.New(executionevent.Config{SessionID: "session_no_declaration", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test", MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {}})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
 	worktree := t.TempDir()
-	gitInitWithOrigin(t, worktree, "https://github.com.evil.example/RenseiAI/donmai.git")
+	gitInitWithOrigin(t, worktree, "../retargeted/local-origin")
 	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
@@ -200,16 +230,16 @@ func TestExecutionEventSinkRejectsSpoofedGitHubOriginForSelectedRepository(t *te
 	}})
 	records := uploader.Journal().Records
 	if len(records) != 1 || records[0].EventType != "session.ended" {
-		t.Fatalf("spoofed origin emitted records = %+v, want sole session.ended", records)
+		t.Fatalf("no declaration authority emitted records = %+v, want sole session.ended", records)
 	}
 }
 
-func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepository(t *testing.T) {
+func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepositoryWithRetargetedOrigin(t *testing.T) {
 	root := workarea.RootPath(t.TempDir())
 	selectedPath := filepath.Join(root.String(), "primary")
 	docsPath := filepath.Join(root.String(), "docs")
-	gitInitWithOrigin(t, selectedPath, "https://github.com/RenseiAI/donmai.git")
-	gitInitWithOrigin(t, docsPath, "https://github.com/RenseiAI/docs.git")
+	gitInitWithOrigin(t, selectedPath, "https://github.com.invalid/RenseiAI/donmai.git")
+	gitInitWithOrigin(t, docsPath, "../retargeted/docs-origin")
 	declaration, err := (workarea.RepositoryDeclarationV1{
 		Protocol: workarea.ProtocolSessionRootV1,
 		Repositories: []workarea.DeclaredRepositoryV1{
@@ -232,21 +262,48 @@ func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepository(t *testing
 	})); err != nil {
 		t.Fatal(err)
 	}
-	facts := executionEventPullRequestFacts(&Result{Result: agent.Result{
+	stubGhOnPath(t, 0, `{"number":9,"url":"https://github.com/RenseiAI/docs/pull/9","baseRefName":"main","headRefName":"agent/docs-pr","repository":{"nameWithOwner":"RenseiAI/docs"}}`)
+	r := minimalRunner(t)
+	res := &Result{Result: agent.Result{
 		Status:       "completed",
 		WorktreePath: selectedPath,
 		WorkareaRoot: root.String(),
-		BackstopReport: &agent.BackstopReport{Repositories: []agent.RepositoryBackstopReport{{
-			Name: "docs",
-			Report: agent.BackstopReport{PullRequest: &agent.PullRequestFact{
-				Provider: "github", Number: 9, Repository: "RenseiAI/docs",
-				URL: "https://github.com/RenseiAI/docs/pull/9", BaseBranch: "main", HeadBranch: "agent/docs-pr",
-			}},
+		Manifest: &agent.TurnManifest{Repositories: &[]agent.TurnManifestRepository{{
+			Name: "docs", PullRequestURL: "https://github.com/RenseiAI/docs/pull/9",
 		}}},
+	}}
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-DOCS-9")}
+	qw.WorkType = WorkTypeQAStr
+	report := r.runDeclaredBackstops(context.Background(), qw, "feature/docs", res, declaration, map[string]string{
+		"primary": selectedPath,
+		"docs":    docsPath,
+	})
+	facts := executionEventPullRequestFacts(&Result{Result: agent.Result{
+		Status: "completed", WorktreePath: selectedPath, WorkareaRoot: root.String(), BackstopReport: &report,
 	}})
 	if len(facts) != 1 || facts[0].Repository != "RenseiAI/docs" {
 		t.Fatalf("executionEventPullRequestFacts = %+v, want docs fact", facts)
 	}
+}
+
+func writeDeclaredMutableWorkarea(t *testing.T, origin string, repositories []workarea.DeclaredRepositoryV1) (workarea.RootPath, string) {
+	t.Helper()
+	root := workarea.RootPath(t.TempDir())
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol:     workarea.ProtocolSessionRootV1,
+		Repositories: repositories,
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	selectedPath := filepath.Join(root.String(), declaration.Selected.Leaf)
+	gitInitWithOrigin(t, selectedPath, origin)
+	if err := workarea.WriteDeclaration(context.Background(), root, workarea.NewDeclarationRecord("session_declared_selected", "wa_declared_selected", declaration, map[string]string{
+		declaration.Selected.Name: "abc123",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	return root, selectedPath
 }
 
 func gitInitWithOrigin(t *testing.T, dir, origin string) {

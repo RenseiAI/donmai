@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 func TestPullRequestFactFromGitHubView(t *testing.T) {
@@ -75,8 +76,8 @@ func TestCanonicalGitHubOriginRepository(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			if got := canonicalGitHubOriginRepository(tc.origin); got != tc.want {
-				t.Fatalf("canonicalGitHubOriginRepository(%q) = %q, want %q", tc.origin, got, tc.want)
+			if got := workarea.CanonicalGitHubRepositorySource(tc.origin); got != tc.want {
+				t.Fatalf("CanonicalGitHubRepositorySource(%q) = %q, want %q", tc.origin, got, tc.want)
 			}
 		})
 	}
@@ -305,7 +306,7 @@ func TestRunBackstop_FiltersBuildArtifacts(t *testing.T) {
 
 	report := r.runBackstop(context.Background(), QueuedWork{
 		QueuedWork: queuedWorkBase("REN-T-1"),
-	}, "feature/x", res)
+	}, "feature/x", res, nil)
 
 	// Push will fail (no remote), but the commit should already have
 	// happened. Check the staged-then-committed file is `src/main.go`.
@@ -471,7 +472,7 @@ func TestRunBackstop_CommitIdentity(t *testing.T) {
 		res.WorktreePath = repo
 
 		// runBackstop stages + commits fix.go then fails on push (no remote).
-		r.runBackstop(context.Background(), qw, "feature/session-identity", res)
+		r.runBackstop(context.Background(), qw, "feature/session-identity", res, nil)
 
 		authorOut, err := runGit(context.Background(), repo, gitIdentity{}, "log", "-1", "--pretty=format:%an <%ae>")
 		if err != nil {
@@ -526,7 +527,7 @@ func TestRunBackstop_RefusesMain(t *testing.T) {
 	res := &Result{}
 	res.WorktreePath = repo
 
-	report := r.runBackstop(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("REN-T-2")}, "main", res)
+	report := r.runBackstop(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("REN-T-2")}, "main", res, nil)
 
 	if !strings.Contains(report.Diagnostics, "main/master") {
 		t.Fatalf("expected main/master refusal in diagnostics; got %q", report.Diagnostics)
@@ -582,7 +583,7 @@ func TestRunBackstop_RecoversExistingPR(t *testing.T) {
 
 	report := r.runBackstop(context.Background(), QueuedWork{
 		QueuedWork: queuedWorkBase("ENG-77"),
-	}, "feature/already-exists", res)
+	}, "feature/already-exists", res, nil)
 
 	if report.Diagnostics != "" {
 		t.Fatalf("expected no diagnostics on already-exists recovery; got %q", report.Diagnostics)

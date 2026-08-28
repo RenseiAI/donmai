@@ -1291,7 +1291,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.BackstopReport = &bsReport
 		default:
 			bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
-			bsReport := r.runBackstop(bsCtx, qw, branch, res)
+			bsReport := r.runBackstop(bsCtx, qw, branch, res, nil)
 			bsCancel()
 			res.BackstopReport = &bsReport
 			if bsReport.PRURL != "" && res.PullRequestURL == "" {

@@ -4,7 +4,6 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
-	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -220,7 +219,7 @@ func shouldBackstop(res *Result, workType string) bool {
 // them as Result.FailureMode = FailureBackstop.
 //
 //nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
-func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result) agent.BackstopReport {
+func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
 	report := agent.BackstopReport{Triggered: true}
 	worktreePath := res.WorktreePath
 	if worktreePath == "" {
@@ -369,7 +368,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		if u := scanPRURL(prOut); u != "" {
 			report.PRURL = u
 			report.PRCreated = true
-			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL)
+			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
 			return report
 		}
 		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
@@ -384,7 +383,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRURL = strings.TrimSpace(prOut)
 		report.PRCreated = true
 	}
-	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL)
+	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
 	return report
 }
 
@@ -407,6 +406,7 @@ func (r *Runner) runDeclaredBackstops(
 		if repository.Authority != workarea.RepositoryMutable {
 			continue
 		}
+		allowedRepositories := pullRequestAuthorityForDeclaredSource(repository.Source.Repository)
 		repositoryResult := *res
 		repositoryResult.WorktreePath = repositoryPaths[repository.Name]
 		repositoryResult.BackstopReport = nil
@@ -416,7 +416,9 @@ func (r *Runner) runDeclaredBackstops(
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
 		if shouldBackstop(&repositoryResult, qw.WorkType) {
-			report = r.runBackstop(ctx, qw, branch, &repositoryResult)
+			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
+		} else if report.PRURL != "" {
+			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)
 		}
 		aggregate.Repositories = append(aggregate.Repositories, agent.RepositoryBackstopReport{Name: repository.Name, Report: report})
 		aggregate.Triggered = aggregate.Triggered || report.Triggered
@@ -456,12 +458,8 @@ type ghPullRequestView struct {
 // or detected a URL. The URL-only completion contract remains valid when this
 // best-effort metadata query cannot run; only the normalized pr.opened fact is
 // omitted in that case.
-func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string) *agent.PullRequestFact {
-	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" {
-		return nil
-	}
-	allowedRepositories := pullRequestAuthorityForWorktree(ctx, worktreePath)
-	if len(allowedRepositories) == 0 {
+func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" || len(allowedRepositories) == 0 {
 		return nil
 	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
@@ -512,46 +510,12 @@ func pullRequestRepositoryAllowed(repository string, allowedRepositories map[str
 	return ok
 }
 
-func pullRequestAuthorityForWorktree(ctx context.Context, worktreePath string) map[string]struct{} {
-	if strings.TrimSpace(worktreePath) == "" {
-		return nil
-	}
-	out, err := runGit(ctx, worktreePath, gitIdentity{}, "remote", "get-url", "origin")
-	if err != nil {
-		return nil
-	}
-	slug := canonicalGitHubOriginRepository(out)
+func pullRequestAuthorityForDeclaredSource(source string) map[string]struct{} {
+	slug := workarea.CanonicalGitHubRepositorySource(source)
 	if slug == "" {
 		return nil
 	}
 	return map[string]struct{}{slug: {}}
-}
-
-func canonicalGitHubOriginRepository(origin string) string {
-	s := strings.TrimSpace(origin)
-	if s == "" {
-		return ""
-	}
-	if strings.HasPrefix(s, "git@github.com:") {
-		return normalizeGitHubRepositorySlug(strings.TrimPrefix(s, "git@github.com:"))
-	}
-	u, err := url.Parse(s)
-	if err != nil {
-		return ""
-	}
-	if !strings.EqualFold(u.Scheme, "https") {
-		return ""
-	}
-	if u.User != nil {
-		return ""
-	}
-	if !strings.EqualFold(u.Hostname(), "github.com") || u.Port() != "" {
-		return ""
-	}
-	if u.RawQuery != "" || u.Fragment != "" {
-		return ""
-	}
-	return normalizeGitHubRepositorySlug(u.Path)
 }
 
 func normalizeGitHubRepositorySlug(repository string) string {
