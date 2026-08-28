@@ -74,8 +74,10 @@ func TestExecutionEventOutcomePreservesFailureTruth(t *testing.T) {
 		status, failure, outcome, evidence string
 	}{
 		{"completed", "", "succeeded", "graceful"},
-		{"stopped", "", "cancelled", "terminated"},
+		{"stopped", "", "terminated", "inferred"},
+		{"stopped", FailureOperatorCancelled, "cancelled", "graceful"},
 		{"failed", FailureOperatorCancelled, "cancelled", "graceful"},
+		{"failed", FailureAgentBlocked, "interrupted", "inferred"},
 		{"failed", FailureTimeout, "expired", "forced"},
 		{"failed", FailureLostOwnership, "lost", "inferred"},
 		{"failed", FailureSilentExit, "lost", "inferred"},
@@ -86,5 +88,20 @@ func TestExecutionEventOutcomePreservesFailureTruth(t *testing.T) {
 		if got != tc.outcome || evidence != tc.evidence {
 			t.Errorf("outcome(%q,%q) = %q/%q, want %q/%q", tc.status, tc.failure, got, evidence, tc.outcome, tc.evidence)
 		}
+		if _, err := executionevent.NewSessionEndedRecordWithEvidence("session_outcome", 1, time.Now(), got, evidence, executionevent.DigestResult(tc.status, "summary", tc.failure)); err != nil {
+			t.Errorf("outcome(%q,%q) cannot construct platform record: %v", tc.status, tc.failure, err)
+		}
+	}
+}
+
+func TestExecutionEventCapabilityOffDoesNotConstructOrSend(t *testing.T) {
+	called := false
+	qw := QueuedWork{}
+	sink, err := newExecutionEventSinkForWork(qw, nil, nil, func() (*executionevent.Uploader, error) {
+		called = true
+		return nil, nil
+	})
+	if err != nil || sink != nil || called {
+		t.Fatalf("capability-off factory: sink=%v err=%v called=%v", sink, err, called)
 	}
 }

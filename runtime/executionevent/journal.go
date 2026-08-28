@@ -138,6 +138,54 @@ func (j *Journal) load(sessionID string) error {
 		}
 		j.Acked = ack.StructuredSeq
 	}
+	if err := j.loadQuarantine(sessionID); err != nil {
+		return err
+	}
+	return nil
+}
+
+func (j *Journal) loadQuarantine(sessionID string) error {
+	f, err := os.Open(filepath.Join(j.dir, quarantineFileName))
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return nil
+		}
+		return fmt.Errorf("executionevent: open quarantine: %w", err)
+	}
+	defer func() { _ = f.Close() }()
+	scanner := bufio.NewScanner(f)
+	scanner.Buffer(make([]byte, 4096), MaxRecordBytes+4096)
+	quarantined := make(map[uint64]bool)
+	for scanner.Scan() {
+		var entry quarantineRecord
+		decoder := json.NewDecoder(bytesReader(scanner.Bytes()))
+		decoder.DisallowUnknownFields()
+		if err := decoder.Decode(&entry); err != nil {
+			return fmt.Errorf("executionevent: decode quarantine record: %w", err)
+		}
+		if entry.Status != 400 && entry.Status != 404 && entry.Status != 409 && entry.Status != 413 {
+			return fmt.Errorf("executionevent: invalid quarantine status %d", entry.Status)
+		}
+		if entry.Reason == "" || len(entry.Reason) > 256 {
+			return errors.New("executionevent: invalid quarantine reason")
+		}
+		if err := validateRecordShape(sessionID, entry.Record); err != nil {
+			return fmt.Errorf("executionevent: invalid quarantined record: %w", err)
+		}
+		if entry.Record.StructuredSeq > uint64(len(j.Records)) || j.Records[entry.Record.StructuredSeq-1].EventID != entry.Record.EventID {
+			return errors.New("executionevent: quarantine record is not present in journal")
+		}
+		if quarantined[entry.Record.StructuredSeq] {
+			return errors.New("executionevent: duplicate quarantined sequence")
+		}
+		quarantined[entry.Record.StructuredSeq] = true
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("executionevent: read quarantine: %w", err)
+	}
+	for j.Acked < uint64(len(j.Records)) && quarantined[j.Acked+1] {
+		j.Acked++
+	}
 	return nil
 }
 

@@ -1,6 +1,10 @@
 package executionevent
 
 import (
+	"bytes"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 )
@@ -52,4 +56,66 @@ func mustCompact(v any) []byte {
 		panic(err)
 	}
 	return b
+}
+
+func TestCompactJSONAndExactRecordBatchCaps(t *testing.T) {
+	compact, err := MarshalCompact(map[string]string{"text": "<safe>"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(compact, []byte(`\u003c`)) {
+		t.Fatalf("SetEscapeHTML(false) not honored: %s", compact)
+	}
+	low, high := 0, MaxRecordBytes
+	for low < high {
+		mid := (low + high + 1) / 2
+		candidate := testCapRecord(t, strings.Repeat("x", mid))
+		if len(mustCompact(candidate)) <= MaxRecordBytes {
+			low = mid
+		} else {
+			high = mid - 1
+		}
+	}
+	fit := testCapRecord(t, strings.Repeat("x", low))
+	if err := ValidateRecord("session_cap", fit, 0); err != nil {
+		t.Fatalf("record at cap boundary rejected: %v", err)
+	}
+	over := testCapRecord(t, strings.Repeat("x", low+1))
+	if err := ValidateRecord("session_cap", over, 0); err == nil {
+		t.Fatal("record over exact byte cap accepted")
+	}
+	first := testCapRecord(t, 1)
+	second := testCapRecordSeq(t, 2, 2)
+	if err := ValidateBatch(Batch{Version: BatchVersion, SessionID: "session_cap", Records: []Record{first, second}}); err != nil {
+		t.Fatalf("batch under cap rejected: %v", err)
+	}
+	if len(mustCompact(Batch{Version: BatchVersion, SessionID: "session_cap", Records: []Record{first, second}})) > MaxBatchBytes {
+		t.Fatal("small batch unexpectedly exceeds cap")
+	}
+}
+
+func testCapRecord(t *testing.T, value any) Record {
+	return testCapRecordSeq(t, 1, value)
+}
+
+func testCapRecordSeq(t *testing.T, seq uint64, value any) Record {
+	t.Helper()
+	return Record{Version: RecordVersion, EventID: RuntimeSourceEventID("session_cap", seq), StructuredSeq: seq, ObservedAt: "2026-08-27T12:00:00Z", EventType: "tool.called", PersistencePolicy: "durable", Evidence: Evidence{Kind: "native"}, Payload: map[string]any{"toolName": value}}
+}
+
+func TestJournalReopenFailsClosedForMalformedOrOutOfOrderRows(t *testing.T) {
+	for name, content := range map[string]string{
+		"malformed":    "{not-json}\n",
+		"out-of-order": "{\"version\":\"" + RecordVersion + "\",\"eventId\":\"evt_bad\",\"structuredSeq\":2,\"observedAt\":\"2026-08-27T12:00:00Z\",\"eventType\":\"tool.called\",\"persistencePolicy\":\"durable\",\"evidence\":{\"kind\":\"native\"},\"payload\":{\"toolName\":\"Read\"}}\n",
+	} {
+		t.Run(name, func(t *testing.T) {
+			dir := t.TempDir()
+			if err := os.WriteFile(filepath.Join(dir, journalFileName), []byte(content), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if _, err := OpenJournal(dir, "session_cap"); err == nil {
+				t.Fatal("malformed/out-of-order journal reopened successfully")
+			}
+		})
+	}
 }

@@ -2,12 +2,25 @@ package runner
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/executionevent"
 )
+
+func newExecutionEventSinkForWork(qw QueuedWork, primary activitySink, logger *slog.Logger, factory func() (*executionevent.Uploader, error)) (*executionEventSink, error) {
+	if !qw.hasCapability(CapabilityExecutionEventIngest) {
+		return nil, nil
+	}
+	uploader, err := factory()
+	if err != nil {
+		return nil, fmt.Errorf("execution-event uploader: %w", err)
+	}
+	return newExecutionEventSink(primary, uploader, logger), nil
+}
 
 // executionEventSink keeps the durable local append synchronous while
 // delivering remotely on one coalescing background flusher. A slow platform
@@ -18,17 +31,30 @@ type executionEventSink struct {
 	logger   *slog.Logger
 	wake     chan struct{}
 	done     chan struct{}
-	cancel   context.CancelFunc
+	stop     chan struct{}
 	once     sync.Once
 }
 
+type executionEventContext struct{ done <-chan struct{} }
+
+func (c executionEventContext) Deadline() (time.Time, bool) { return time.Time{}, false }
+func (c executionEventContext) Done() <-chan struct{}       { return c.done }
+func (c executionEventContext) Err() error {
+	select {
+	case <-c.done:
+		return context.Canceled
+	default:
+		return nil
+	}
+}
+func (c executionEventContext) Value(any) any { return nil }
+
 func newExecutionEventSink(primary activitySink, uploader *executionevent.Uploader, logger *slog.Logger) *executionEventSink {
-	ctx, cancel := context.WithCancel(context.Background())
 	s := &executionEventSink{
 		primary: primary, uploader: uploader, logger: logger,
-		wake: make(chan struct{}, 1), done: make(chan struct{}), cancel: cancel,
+		wake: make(chan struct{}, 1), done: make(chan struct{}), stop: make(chan struct{}),
 	}
-	go s.flushLoop(ctx)
+	go s.flushLoop(executionEventContext{done: s.stop})
 	return s
 }
 
@@ -75,7 +101,7 @@ func (s *executionEventSink) Close(result *Result) {
 		if err := s.uploader.SendSessionEndedWithEvidence(outcome, evidence, digest); err != nil && s.logger != nil {
 			s.logger.Warn("execution-event terminal journal append failed", "err", err)
 		}
-		s.cancel()
+		close(s.stop)
 		<-s.done
 		if _, err := s.uploader.Stop(); err != nil && s.logger != nil {
 			s.logger.Warn("execution-event terminal drain incomplete; journal retained", "err", err)
@@ -87,19 +113,24 @@ func executionEventOutcome(result *Result) (string, string) {
 	if result == nil {
 		return "failed", "inferred"
 	}
-	switch result.Status {
-	case "completed":
-		return "succeeded", "graceful"
-	case "stopped":
-		return "cancelled", "terminated"
-	}
 	switch result.FailureMode {
 	case FailureOperatorCancelled:
 		return "cancelled", "graceful"
+	case FailureAgentBlocked:
+		return "interrupted", "inferred"
 	case FailureTimeout:
 		return "expired", "forced"
 	case FailureLostOwnership, FailureSilentExit:
 		return "lost", "inferred"
+	}
+	switch result.Status {
+	case "completed":
+		return "succeeded", "graceful"
+	case "stopped":
+		// The platform terminal-evidence vocabulary has no "terminated"
+		// value. A generic stopped result is still truthful as an inferred
+		// terminated outcome; operator cancellation is handled above.
+		return "terminated", "inferred"
 	default:
 		return "failed", "inferred"
 	}
