@@ -33,6 +33,34 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **An ambiguous adoption-batch commit reconciles instead of stranding the
+  daemon one revision behind forever.** A batch commit that failed with a
+  transport error, deadline, or 5xx was treated exactly like a decoded
+  refusal: roll back and keep beating the last-committed projection. When the
+  control plane had actually stamped the batch (the request applied; only the
+  answer was lost), the daemon then presented a superseded adoption revision
+  on every beat, the control plane refused each one with the closed
+  revision-stale conflict, and every clear/republish retry was refused with
+  it — permanently. Commit failures are now classified: a decoded refusal
+  keeps today's rollback exactly, while an outcome-unknown failure (the new
+  `ErrSessionShimCommitOutcomeUnknown` sentinel a composing `OnAdoptionBatch`
+  wraps transport/deadline/5xx failures in; context deadline/cancellation and
+  `net.Error` chains classify without it) schedules a bounded reconciliation:
+  one credential refresh through the ONE refresher learns the control plane's
+  committed revision (the refresh receipt already carries it), and the
+  COMPLETE current batch republishes through the existing publish path at
+  that authority — a staged cleared entry rides the republished batch and
+  still drops only on a confirmed exact echo. A beat answered with the closed
+  revision-stale conflict now arms the same reconciliation instead of
+  skipping forever. The heartbeat presents the last-committed projection
+  until the republish confirms; a reconciliation republish is a commit
+  attempt, never an announcement. The loop's bounds are derived, not chosen
+  (attempts = the adoption-publication pipeline depth; backoff = the
+  per-callback bound), and exhaustion leaves the daemon serving and beating
+  the last-committed projection. The new `SessionShimScopeAuthority(scope)`
+  getter exposes a clone of the retained non-secret scope receipt so a
+  composer can re-resolve its expected revision after a revision-stale
+  refusal or an ambiguous commit.
 - **A refused restart preflight names its cause on the wire, once.** The 409
   refusal kept the single closed top-level code `restart_preflight_refused`
   but carried no cause, so a caller could not tell a correct fence refusal

@@ -316,6 +316,15 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	evidence.SnapshotProxy = nil
 	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(pubCtx, evidence, receipt)
 	if err != nil {
+		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+			// OUTCOME-UNKNOWN: the rollback below still restores the
+			// last-committed projection — the beat announces nothing new —
+			// and reconciliation resolves whether the control plane committed
+			// this batch, republishing the complete set at the revision the
+			// refresher answers. The scheduled pass serializes behind this
+			// launch's own publication barrier.
+			d.scheduleSessionShimReconciliation(id.OrgID, "ambiguous-launch-batch-commit")
+		}
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
 		_ = ctrl.Close()
