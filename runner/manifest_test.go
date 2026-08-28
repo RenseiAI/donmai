@@ -6,6 +6,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -51,6 +52,12 @@ func TestParseManifest(t *testing.T) {
 				PullRequestURL: "https://github.com/o/r/pull/7",
 				CommitSHA:      "abc123",
 			},
+		},
+		{
+			name:      "agent-authored complete pull request fact is rejected",
+			writeFile: true,
+			raw:       `{"schemaVersion":1,"verdict":"passed","pullRequest":{"provider":"github","number":7,"repository":"o/r","url":"https://github.com/o/r/pull/7","baseBranch":"main","headBranch":"agent/test-fact"}}`,
+			wantErr:   true,
 		},
 		{
 			name:      "valid minimal failed",
@@ -122,6 +129,18 @@ func TestParseManifest(t *testing.T) {
 			raw:       `["passed"]`,
 			wantErr:   true,
 		},
+		{
+			name:      "incomplete pull request fact is rejected",
+			writeFile: true,
+			raw:       `{"schemaVersion":1,"verdict":"passed","pullRequest":{"provider":"github","number":7,"repository":"o/r","url":"https://github.com/o/r/pull/7","baseBranch":"main"}}`,
+			wantErr:   true,
+		},
+		{
+			name:      "mismatched scalar pull request URL is rejected",
+			writeFile: true,
+			raw:       `{"schemaVersion":1,"verdict":"passed","pullRequestUrl":"https://github.com/o/r/pull/8","pullRequest":{"provider":"github","number":7,"repository":"o/r","url":"https://github.com/o/r/pull/7","baseBranch":"main","headBranch":"agent/test-fact"}}`,
+			wantErr:   true,
+		},
 	}
 
 	for _, tt := range tests {
@@ -152,7 +171,7 @@ func TestParseManifest(t *testing.T) {
 			if err != nil {
 				t.Fatalf("ParseManifest() unexpected error: %v", err)
 			}
-			if *got != *tt.want {
+			if !reflect.DeepEqual(got, tt.want) {
 				t.Fatalf("ParseManifest() = %+v, want %+v", *got, *tt.want)
 			}
 		})

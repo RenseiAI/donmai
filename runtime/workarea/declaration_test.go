@@ -6,6 +6,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -183,6 +184,33 @@ func TestDeclarationRecordIsAtomicModeBoundAndSecretFree(t *testing.T) {
 	}
 	if len(entries) != 1 || entries[0].Name() != DeclarationFileName {
 		t.Fatalf("metadata entries = %v, want only declaration.json", entries)
+	}
+}
+
+func TestDeclarationRecordCarriesOnlyCanonicalGitHubRepositorySlug(t *testing.T) {
+	normalized, err := (RepositoryDeclarationV1{
+		Protocol: ProtocolSessionRootV1,
+		Repositories: []DeclaredRepositoryV1{
+			{Source: RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"}, Role: RepositoryRolePrimary, Authority: RepositoryMutable},
+			{Source: RepositorySource{Repository: "git@github.com:RenseiAI/docs.git", Ref: "main"}, Name: "docs", Role: RepositoryRoleSecondary, Authority: RepositoryMutable},
+			{Source: RepositorySource{Repository: "ssh://git@github.com/RenseiAI/noncanonical.git", Ref: "main"}, Name: "noncanonical", Role: RepositoryRoleContext, Authority: RepositoryReadOnly},
+		},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := NewDeclarationRecord("session", "wa_slug", normalized, nil)
+	got := map[string]string{}
+	for _, repository := range record.Repositories {
+		got[repository.Name] = repository.CanonicalGitHubRepository
+	}
+	want := map[string]string{
+		"donmai":       "renseiai/donmai",
+		"docs":         "renseiai/docs",
+		"noncanonical": "",
+	}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("canonical GitHub repositories = %#v, want %#v", got, want)
 	}
 }
 

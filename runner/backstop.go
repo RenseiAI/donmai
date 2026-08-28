@@ -2,11 +2,15 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
@@ -217,7 +221,7 @@ func shouldBackstop(res *Result, workType string) bool {
 // them as Result.FailureMode = FailureBackstop.
 //
 //nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
-func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result) agent.BackstopReport {
+func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
 	report := agent.BackstopReport{Triggered: true}
 	worktreePath := res.WorktreePath
 	if worktreePath == "" {
@@ -366,6 +370,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		if u := scanPRURL(prOut); u != "" {
 			report.PRURL = u
 			report.PRCreated = true
+			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
 			return report
 		}
 		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
@@ -380,6 +385,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRURL = strings.TrimSpace(prOut)
 		report.PRCreated = true
 	}
+	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL, allowedRepositories)
 	return report
 }
 
@@ -402,6 +408,7 @@ func (r *Runner) runDeclaredBackstops(
 		if repository.Authority != workarea.RepositoryMutable {
 			continue
 		}
+		allowedRepositories := pullRequestAuthorityForDeclaredSource(repository.Source.Repository)
 		repositoryResult := *res
 		repositoryResult.WorktreePath = repositoryPaths[repository.Name]
 		repositoryResult.BackstopReport = nil
@@ -411,7 +418,9 @@ func (r *Runner) runDeclaredBackstops(
 		}
 		report := agent.BackstopReport{PRURL: repositoryResult.PullRequestURL}
 		if shouldBackstop(&repositoryResult, qw.WorkType) {
-			report = r.runBackstop(ctx, qw, branch, &repositoryResult)
+			report = r.runBackstop(ctx, qw, branch, &repositoryResult, allowedRepositories)
+		} else if report.PRURL != "" {
+			report.PullRequest = lookupGitHubPullRequest(ctx, repositoryResult.WorktreePath, report.PRURL, allowedRepositories)
 		}
 		aggregate.Repositories = append(aggregate.Repositories, agent.RepositoryBackstopReport{Name: repository.Name, Report: report})
 		aggregate.Triggered = aggregate.Triggered || report.Triggered
@@ -429,9 +438,131 @@ func (r *Runner) runDeclaredBackstops(
 			if res.PullRequestURL == "" {
 				res.PullRequestURL = report.PRURL
 			}
+			if report.PullRequest != nil {
+				aggregate.PullRequest = report.PullRequest
+			}
 		}
 	}
 	return aggregate
+}
+
+type ghPullRequestView struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	BaseRefName string `json:"baseRefName"`
+	HeadRefName string `json:"headRefName"`
+}
+
+// lookupGitHubPullRequest reads the complete PR projection after gh created
+// or detected a URL. The URL-only completion contract remains valid when this
+// best-effort metadata query cannot run; only the normalized pr.opened fact is
+// omitted in that case.
+func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" || len(allowedRepositories) == 0 {
+		return nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
+		"--json", "number,url,baseRefName,headRefName")
+	if err != nil {
+		return nil
+	}
+	var view ghPullRequestView
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		return nil
+	}
+	return pullRequestFactFromGitHubViewAuthorized(view, allowedRepositories)
+}
+
+func pullRequestFactFromGitHubView(view ghPullRequestView) *agent.PullRequestFact {
+	repository, number, err := parseCanonicalGitHubPullRequestURL(view.URL)
+	if err != nil || number != view.Number {
+		return nil
+	}
+	fact := &agent.PullRequestFact{
+		Provider: "github", Number: view.Number, Repository: repository,
+		URL: view.URL, BaseBranch: view.BaseRefName, HeadBranch: view.HeadRefName,
+	}
+	if err := agent.ValidatePullRequestFact(*fact); err != nil {
+		return nil
+	}
+	return fact
+}
+
+func pullRequestFactFromGitHubViewAuthorized(view ghPullRequestView, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	fact := pullRequestFactFromGitHubView(view)
+	if fact == nil {
+		return nil
+	}
+	return authorizePullRequestFact(fact, allowedRepositories)
+}
+
+func authorizePullRequestFact(fact *agent.PullRequestFact, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	if fact == nil || !pullRequestRepositoryAllowed(fact.Repository, allowedRepositories) {
+		return nil
+	}
+	return fact
+}
+
+func pullRequestRepositoryAllowed(repository string, allowedRepositories map[string]struct{}) bool {
+	if len(allowedRepositories) == 0 {
+		return false
+	}
+	_, ok := allowedRepositories[normalizeGitHubRepositorySlug(repository)]
+	return ok
+}
+
+func pullRequestAuthorityForDeclaredSource(source string) map[string]struct{} {
+	slug := workarea.CanonicalGitHubRepositorySource(source)
+	if slug == "" {
+		return nil
+	}
+	return map[string]struct{}{slug: {}}
+}
+
+func normalizeGitHubRepositorySlug(repository string) string {
+	s := strings.TrimSpace(repository)
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimSuffix(s, ".git")
+	parts := strings.Split(strings.Trim(s, "/"), "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return strings.ToLower(parts[0] + "/" + parts[1])
+}
+
+func parseCanonicalGitHubPullRequestURL(raw string) (string, int, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", 0, fmt.Errorf("parse GitHub pull request URL: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must use https")
+	}
+	if parsed.User != nil {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include userinfo")
+	}
+	if !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Hostname() == "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must target github.com")
+	}
+	if parsed.Port() != "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include a port")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include query or fragment")
+	}
+	parts := strings.Split(parsed.EscapedPath(), "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] == "" || parts[2] == "" || parts[3] != "pull" || parts[4] == "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must match /<owner>/<repo>/pull/<number>")
+	}
+	number, err := strconv.Atoi(parts[4])
+	if err != nil || number <= 0 {
+		return "", 0, fmt.Errorf("GitHub pull request URL must end with a positive pull request number")
+	}
+	return parts[1] + "/" + parts[2], number, nil
 }
 
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
