@@ -6,6 +6,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.1 — 2026-08-28
+
+### Features
+
+- **Runtime execution events can be durably journaled and uploaded when the
+  composing control plane explicitly advertises support.** The runner writes
+  normalized, secret-free event records to a state-home journal before a
+  background uploader sends bounded batches. Unacknowledged records survive
+  process restarts and worktree deletion, transient failures retry without
+  blocking provider output, permanent record failures are quarantined with
+  crash-safe acknowledgement recovery, and terminal shutdown performs a
+  bounded drain. The path remains off unless queued work includes the additive
+  `execution-event-ingest` capability, preserving mixed-version behavior for
+  standalone and older compositions.
+
 ## v0.72.0 — 2026-08-28
 
 ### Features
