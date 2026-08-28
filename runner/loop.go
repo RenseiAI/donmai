@@ -20,6 +20,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/activity"
+	"github.com/RenseiAI/donmai/runtime/executionevent"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -904,6 +905,39 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	} else {
 		sink = actPoster
 		defer func() { _ = actPoster.Stop() }()
+	}
+
+	// 9b.1 Start normalized execution-event capture only when the target
+	// explicitly advertises its ingest route. The uploader owns its durable
+	// journal and never extends the activity poster's best-effort contract.
+	var eventUploader *executionevent.Uploader
+	var eventSink *executionEventSink
+	if qw.hasCapability(CapabilityExecutionEventIngest) {
+		var eventCredentialProvider executionevent.CredentialProvider
+		if r.credentialProvider != nil {
+			eventCredentialProvider = func(ctx context.Context) (executionevent.RuntimeCredentials, error) {
+				creds, credErr := r.credentialProvider(ctx)
+				return executionevent.RuntimeCredentials{WorkerID: creds.WorkerID, AuthToken: creds.AuthToken}, credErr
+			}
+		}
+		var eventErr error
+		eventUploader, eventErr = executionevent.New(executionevent.Config{
+			SessionID:          qw.SessionID,
+			BaseURL:            qw.PlatformURL,
+			AuthToken:          qw.AuthToken,
+			CredentialProvider: eventCredentialProvider,
+			HTTPClient:         r.httpClient,
+			Logger:             r.logger,
+		})
+		if eventErr != nil {
+			r.logger.Warn("execution-event uploader construct failed", "err", eventErr)
+		} else {
+			eventSink = newExecutionEventSink(sink, eventUploader, r.logger)
+			sink = eventSink
+			defer func() {
+				eventSink.Close(res)
+			}()
+		}
 	}
 
 	// 9c. Start the additive per-call span pipeline when explicitly enabled by
