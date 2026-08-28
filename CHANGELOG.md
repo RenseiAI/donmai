@@ -10,15 +10,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
-- **`pr.opened` execution facts now bind only to the declaration's canonical
-  GitHub repository authority.** The runner no longer treats a retargeted
-  local checkout or foreign Git origin as sufficient authority for a PR fact.
-  It emits `pr.opened` only when the declaration truthfully authorizes the
-  canonical GitHub repository slug and the provider supplies the complete pull
-  request identity (number, repository, URL, base branch, and head branch).
-  When that authority is absent or noncanonical, the runner now fails closed
-  to URL-only terminal completion metadata while preserving the existing
-  ordering, deduplication, manifest rejection, and terminal-event contracts.
+- **Blocked terminal execution facts now land in runner-owned order, and
+  `pr.opened` facts fail closed to declaration-authorized GitHub identity.**
+  A blocked run now emits `session.blocked` before any terminal `pr.opened`
+  and before the sole `session.ended` record, so deliberate agent refusal is
+  preserved as an explicit terminal fact instead of being inferred later. In
+  the same terminal sequence, the runner emits `pr.opened` only when the
+  declaration authorizes the canonical GitHub repository slug and the provider
+  supplies the complete pull request identity (number, repository, URL, base
+  branch, and head branch). Retargeted local checkouts and foreign Git origins
+  no longer count as authority; when that proof is absent or incomplete, the
+  runner keeps only the URL in terminal completion metadata and omits
+  `pr.opened` entirely.
 
 ## v0.72.1 — 2026-08-28
 
