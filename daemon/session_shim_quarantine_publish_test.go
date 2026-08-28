@@ -127,6 +127,11 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 		mutator   = "upsertShimQuarantineLocked"
 		publishes = "publishSessionShimProjection"
 		assembles = "completeSessionShimAdoptionBatch"
+		// The disconnect path publishes through a named helper whose ORDER is
+		// the contract — consume any terminal proof, then publish — so it
+		// counts as a publisher here. Everything the guard is watching for
+		// still applies: a new mutation site must name one of these three.
+		ordered = "publishQuarantineAfterConsumingTerminalProof"
 	)
 	entries, err := os.ReadDir("./")
 	if err != nil {
@@ -166,7 +171,7 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 				continue
 			}
 			checked++
-			if !contains(calls, publishes) && !contains(calls, assembles) {
+			if !contains(calls, publishes) && !contains(calls, assembles) && !contains(calls, ordered) {
 				t.Errorf("%s: %s changes the quarantine projection without publishing it — "+
 					"the platform demotes a host whose heartbeat disagrees with the last published batch",
 					name, fn.Name.Name)

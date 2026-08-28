@@ -790,11 +790,30 @@ func (d *Daemon) startShimCursorAcknowledger(
 				return
 			}
 			if err := a.persist(a.pending.Load()); err != nil {
-				slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
-					"session", id.String(), "seq", a.pending.Load(), "error", err)
+				// A shim that refuses because its TERMINAL PROOF IS PUBLISHED is
+				// not a broken socket — it is telling this daemon that the
+				// tombstone is already on disk. Measured on an installed host:
+				// treating that as an ordinary transport failure published a
+				// quarantine at one adoption revision, drew a heartbeat 409
+				// SESSION_SHIM_ADOPTION_REVISION_STALE, armed commit-outcome
+				// reconciliation and republished at the next revision — 26
+				// seconds of churn to reach a terminal outcome the shim had
+				// already handed over. Consume the proof instead.
+				exited := errors.Is(err, sessionshim.ErrShimExited)
+				if exited {
+					slog.Info("session shim: the shim refused the cursor acknowledgement because its terminal proof is published",
+						"session", id.String(), "seq", a.pending.Load())
+				} else {
+					slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
+						"session", id.String(), "seq", a.pending.Load(), "error", err)
+				}
 				// The cursor must never claim a sequence the shim did not durably
 				// store. Drop the connection and let the ordinary disconnect path
 				// release ownership; the shim keeps the harness.
+				// The reconcile itself runs in releaseShimIfLive, which is where
+				// the quarantine this would otherwise publish is created —
+				// calling it here would race that publication instead of
+				// preventing it.
 				_ = ctrl.Close()
 				return
 			}
@@ -1099,11 +1118,24 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 			"session", id.String())
 	}
 	if ok {
-		// The quarantine set just changed outside an adoption. Publish it, or
-		// the platform keeps comparing this host's heartbeat against a snapshot
-		// that predates the quarantine, refuses every beat, and drains the host.
-		d.publishSessionShimProjection(context.Background(), id.OrgID)
+		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
+}
+
+// publishQuarantineAfterConsumingTerminalProof is the disconnect path's
+// publication, and the order in its name is the point.
+//
+// A shim can finalize between its last frame and the disconnect — it answers a
+// late acknowledgement with "terminal proof is published" (ErrShimExited) and
+// then closes — so the lineage about to be projected as quarantined may already
+// have its tombstone on disk. Publishing it anyway costs an adoption revision,
+// a heartbeat 409 SESSION_SHIM_ADOPTION_REVISION_STALE, commit-outcome
+// reconciliation and a second publication to undo, all to reach an outcome the
+// shim had already handed over. Consume the proof first; the publish then
+// carries the terminal fact instead of a quarantine nothing holds.
+func (d *Daemon) publishQuarantineAfterConsumingTerminalProof(orgID string) {
+	d.reconcileQuarantinedTombstones()
+	d.publishSessionShimProjection(context.Background(), orgID)
 }
 
 // upsertShimQuarantineLocked adds one exact shim projection without allowing a

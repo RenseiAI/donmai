@@ -491,3 +491,55 @@ func TestQuarantinedLineageIsReportedWithoutAnAdoptionCorrelation(t *testing.T) 
 			reported[0].Adoption, reported[0].DurableAdoptionCorrelation)
 	}
 }
+
+// A shim that refuses a late cursor acknowledgement because its terminal proof
+// is already published must not cost a quarantine publication.
+//
+// Measured on an installed host: the shim answered the daemon's in-flight
+// durable heartbeat with `exited` — "heartbeat rejected: terminal proof is
+// published" — the daemon read that as an ordinary transport failure, closed
+// the stream and PUBLISHED the lineage as quarantined. That publication drew a
+// heartbeat 409 SESSION_SHIM_ADOPTION_REVISION_STALE, armed commit-outcome
+// reconciliation and needed a second publication to undo: 26 seconds of churn
+// to reach a terminal outcome the shim had already handed over.
+//
+// The disconnect path now consumes the proof BEFORE it publishes, so the
+// quarantine never reaches the composer at all.
+func TestDisconnectWithAPublishedTombstoneNeverPublishesAQuarantine(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	// The shim finalized before the disconnect: its tombstone is on disk.
+	want := f.publishHelperTombstone(t)
+	// Drop the acceptance bookkeeping and the pre-seeded projection; this test
+	// is the ordinary disconnect path, not the acceptance seam.
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.quarantined = nil
+	delete(f.daemon.shims.acceptanceQuarantine, f.incarnation)
+	f.daemon.shims.mu.Unlock()
+
+	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         f.identity.OrgID, SessionID: f.identity.SessionID,
+		ShimID: f.incarnation.shimID, ProcessEpoch: f.incarnation.processEpoch,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}, sessionshim.QuarantineSocketUnreachable, "controller stream ended before a terminal observation", time.Now())
+	f.daemon.shims.mu.Lock()
+	f.daemon.upsertShimQuarantineLocked(q)
+	f.daemon.shims.mu.Unlock()
+	// The production publication the disconnect path uses.
+	f.daemon.publishQuarantineAfterConsumingTerminalProof(f.identity.OrgID)
+
+	reported := f.reported()
+	if len(reported) != 1 || reported[0].Tombstone != want {
+		t.Fatalf("terminal evidence reported %d times (%+v), want the shim's exact proof once", len(reported), reported)
+	}
+	for i, batch := range f.published() {
+		if len(batch.Quarantined) != 0 {
+			t.Fatalf("batch %d published a quarantine for a lineage whose tombstone was already on disk: %+v — "+
+				"that publication costs an adoption revision the next one has to undo", i, batch.Quarantined)
+		}
+	}
+	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("disconnect left %d lineages projected quarantined", len(projected))
+	}
+}

@@ -63,6 +63,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   reads the projection in the middle of a withdrawal — a committed handoff is
   never re-committed, and a refused one backs off instead of being re-POSTed on
   every poll.
+- **A shim that refuses a late acknowledgement because its terminal proof is
+  published no longer costs a quarantine publication.** That refusal is a fact
+  about the lifecycle, not a broken socket: it now arrives as the actionable
+  `sessionshim.ErrShimExited` sentinel, and the disconnect path consumes any
+  terminal proof BEFORE it publishes. Measured on an installed host, reading it
+  as a transport failure published a quarantine for a lineage whose tombstone
+  was already on disk, which drew a heartbeat 409
+  `SESSION_SHIM_ADOPTION_REVISION_STALE`, armed commit-outcome reconciliation
+  and needed a second publication to undo — 26 seconds of churn to reach an
+  outcome the shim had already handed over.
 - **A quarantined lineage's terminal evidence no longer carries an adoption
   correlation.** The obligation the composer holds for a quarantined lineage is
   quarantined-kind and resolves on lifecycle identity plus shim id and process

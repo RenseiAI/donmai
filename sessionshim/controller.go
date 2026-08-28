@@ -1022,9 +1022,17 @@ func (c *Controller) failHeartbeatFromError(body []byte) bool {
 	c.heartbeatCall = nil
 	c.heartbeatMu.Unlock()
 	message, err := shimwire.DecodeError(body)
-	if err != nil {
+	switch {
+	case err != nil:
 		call.done <- heartbeatResult{err: err}
-	} else {
+	case message.Code == shimwire.CodeExited:
+		// The shim is not failing to answer — it is answering that its terminal
+		// proof is already published (shim.go's "heartbeat rejected: terminal
+		// proof is published"). That is a FACT about the lifecycle, not a
+		// transport failure, and a caller that only sees a formatted string
+		// throws it away and quarantines a session whose tombstone is on disk.
+		call.done <- heartbeatResult{err: fmt.Errorf("%w: %s", ErrShimExited, message.Code)}
+	default:
 		call.done <- heartbeatResult{err: fmt.Errorf("sessionshim: selected-v3 heartbeat refused: %s", message.Code)}
 	}
 	return true
@@ -1107,6 +1115,16 @@ func (c *Controller) dispatchEvents() {
 // shim's own in-flight budget. It is a fail-closed decision, not a transport
 // error: the connection is dropped, the shim keeps the harness.
 var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
+
+// ErrShimExited reports that a shim refused a request because it has already
+// published its terminal proof.
+//
+// It is a sentinel rather than a message because the refusal is ACTIONABLE: the
+// tombstone exists by the time the shim answers this way, so the right response
+// is to go and consume it, not to treat the exchange as a broken socket and
+// leave the lineage in reconciliation quarantine until some later surface
+// happens to look.
+var ErrShimExited = errors.New("sessionshim: shim refused: terminal proof is already published")
 
 // eventBacklog is the bounded hand-off between the socket reader and the
 // consumer, accounted in payload bytes rather than frames.

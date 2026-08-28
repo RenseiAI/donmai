@@ -2,6 +2,7 @@ package sessionshim
 
 import (
 	"context"
+	"errors"
 	"testing"
 	"time"
 
@@ -109,4 +110,49 @@ func waitForShimSequence(t *testing.T, shim *Shim, want uint64, within time.Dura
 		time.Sleep(10 * time.Millisecond)
 	}
 	t.Fatalf("the shim never allocated %d host output sequences", want)
+}
+
+// TestHeartbeatRefusalCarriesTheExitedSentinel pins the one distinction the
+// daemon acts on.
+//
+// A finalized shim answers a late cursor acknowledgement with `exited` —
+// "heartbeat rejected: terminal proof is published" (shim.go). That is a FACT
+// about the lifecycle, not a broken socket, and the caller has to be able to
+// tell them apart: measured on an installed host, reading it as a transport
+// failure published a quarantine for a lineage whose tombstone was already on
+// disk, which cost an adoption revision, a heartbeat 409, commit-outcome
+// reconciliation and a second publication to undo.
+func TestHeartbeatRefusalCarriesTheExitedSentinel(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		code shimwire.ErrorCode
+		want bool
+	}{
+		{name: "terminal proof is published", code: shimwire.CodeExited, want: true},
+		{name: "an ordinary refusal is not terminal", code: shimwire.CodeInternal},
+		{name: "an unauthenticated refusal is not terminal", code: shimwire.CodeUnauthenticated},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			body, err := shimwire.EncodeError(shimwire.ErrorMsg{Code: tc.code, Detail: "refused"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &Controller{}
+			call := &heartbeatCall{done: make(chan heartbeatResult, 1)}
+			c.heartbeatCall = call
+			if !c.failHeartbeatFromError(body) {
+				t.Fatal("the refusal did not reach the pending acknowledgement")
+			}
+			result := <-call.done
+			if result.err == nil {
+				t.Fatal("a refused heartbeat reported success")
+			}
+			if got := errors.Is(result.err, ErrShimExited); got != tc.want {
+				t.Fatalf("errors.Is(%v, ErrShimExited) = %t, want %t — the daemon distinguishes "+
+					"\"terminal proof is published\" from a broken socket on exactly this", result.err, got, tc.want)
+			}
+		})
+	}
 }
