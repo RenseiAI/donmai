@@ -1163,13 +1163,21 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		// One report per incarnation, even with several reconcile passes in
 		// flight: every occupancy and heartbeat surface calls this, and two
 		// passes reading the same tombstone would both commit it.
-		if !d.claimSessionShimTerminalReport(key, time.Now()) {
+		own, inFlight := d.claimSessionShimTerminalReport(key, time.Now())
+		if !own {
+			if inFlight != nil {
+				// Wait out the owner so this pass's caller reads the projection
+				// AFTER the withdrawal, not in the middle of it.
+				timer := time.NewTimer(tombstoneSettleWindow)
+				select {
+				case <-inFlight:
+				case <-timer.C:
+				}
+				timer.Stop()
+			}
 			continue
 		}
 		reported := false
-		d.shims.mu.RLock()
-		correlation, hasCorrelation := d.shims.correlations[key]
-		d.shims.mu.RUnlock()
 		hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
 		if hostErr != nil {
 			slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
@@ -1177,18 +1185,23 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 			d.releaseSessionShimTerminalReport(key, reported, time.Now())
 			continue
 		}
+		// NO adoption correlation, even when this daemon still retains one.
+		//
+		// This lineage is being reported out of the QUARANTINE set, and the
+		// obligation the composer holds for it is quarantined-kind: it resolves
+		// on lifecycle identity plus shim id and process epoch. Attaching an
+		// adoption receipt asks the receiver for the ADOPTED-kind predicate
+		// instead, which matches nothing once the lineage was reported
+		// quarantined — measured on an installed host as a terminal observation
+		// that committed while the obligation stayed `active`, after which every
+		// complete batch was refused `adoption_batch_live_lineage_omitted` and
+		// the host could not recover.
 		terminalEvidence := SessionShimTerminalEvidence{
 			Identity:     id,
 			HostID:       hostID,
 			ShimID:       tombstone.ShimID,
 			ProcessEpoch: tombstone.ProcessEpoch,
 			Tombstone:    tombstone,
-		}
-		if hasCorrelation {
-			adoption := correlation.evidence
-			terminalEvidence.Adoption = &adoption
-			terminalEvidence.DurableAdoptionCorrelation = append(
-				[]byte(nil), correlation.receipt.DurableCorrelation...)
 		}
 		if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
 			slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
@@ -1253,30 +1266,37 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 // hundreds of POSTs of the same evidence.
 const sessionShimTerminalReportBackoff = tombstoneSettleWindow / 5
 
-// claimSessionShimTerminalReport marks one incarnation as having a durable
-// terminal handoff in flight. It reports false when another pass already holds
-// it, when a pass already committed one, or while a refusal is cooling off.
-func (d *Daemon) claimSessionShimTerminalReport(key shimIncarnation, now time.Time) bool {
+// claimSessionShimTerminalReport takes ownership of one incarnation's durable
+// terminal handoff. It returns (true, nil) to the one pass that owns it; to any
+// other pass it returns false plus the channel to WAIT on when a handoff is
+// already in flight, or a nil channel when there is nothing to wait for (the
+// handoff already committed, or a refusal is cooling off).
+func (d *Daemon) claimSessionShimTerminalReport(key shimIncarnation, now time.Time) (bool, <-chan struct{}) {
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
 	state := d.shims.reportingTerminal[key]
-	if state.inFlight || state.committed || now.Before(state.retryAt) {
-		return false
+	switch {
+	case state.committed:
+		return false, nil
+	case state.inFlight != nil:
+		return false, state.inFlight
+	case now.Before(state.retryAt):
+		return false, nil
 	}
-	state.inFlight = true
+	state.inFlight = make(chan struct{})
 	d.shims.reportingTerminal[key] = state
-	return true
+	return true, nil
 }
 
-// releaseSessionShimTerminalReport clears the in-flight mark. A handoff that
-// COMMITTED keeps a permanent mark: the evidence is durable, and a later pass
-// reading a not-yet-disposed tombstone must not commit it a second time. A
-// refused one is retried, but only after the backoff.
+// releaseSessionShimTerminalReport clears the in-flight mark and wakes anyone
+// waiting on it. A handoff that COMMITTED keeps a permanent mark: the evidence
+// is durable, and a later pass reading a not-yet-disposed tombstone must not
+// commit it a second time. A refused one is retried, but only after the backoff.
 func (d *Daemon) releaseSessionShimTerminalReport(key shimIncarnation, committed bool, now time.Time) {
 	d.shims.mu.Lock()
-	defer d.shims.mu.Unlock()
 	state := d.shims.reportingTerminal[key]
-	state.inFlight = false
+	done := state.inFlight
+	state.inFlight = nil
 	if committed {
 		state.committed = true
 		state.retryAt = time.Time{}
@@ -1284,6 +1304,10 @@ func (d *Daemon) releaseSessionShimTerminalReport(key shimIncarnation, committed
 		state.retryAt = now.Add(sessionShimTerminalReportBackoff)
 	}
 	d.shims.reportingTerminal[key] = state
+	d.shims.mu.Unlock()
+	if done != nil {
+		close(done)
+	}
 }
 
 // WriteAdoptedSessionShimInput sends attributed input bytes to one adopted

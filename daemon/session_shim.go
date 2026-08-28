@@ -1203,7 +1203,12 @@ type shimIncarnation struct {
 // sessionShimTerminalReport is the per-incarnation durable-handoff state the
 // reconcile keeps so repeated passes cannot re-commit or re-POST one tombstone.
 type sessionShimTerminalReport struct {
-	inFlight  bool
+	// inFlight is non-nil while one pass owns the durable handoff and is closed
+	// when it finishes. A second pass WAITS on it rather than skipping: every
+	// reconcile call site reads the quarantine projection straight afterwards,
+	// and a pass that returned early would let its caller observe a lineage the
+	// winner is in the middle of withdrawing.
+	inFlight  chan struct{}
 	committed bool
 	retryAt   time.Time
 }

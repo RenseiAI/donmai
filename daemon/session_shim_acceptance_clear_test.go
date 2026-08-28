@@ -453,3 +453,41 @@ func TestConcurrentReconcilesReportOneTombstoneOnce(t *testing.T) {
 		t.Fatalf("%d additional passes entered the durable handoff for one incarnation", extra)
 	}
 }
+
+// A quarantined lineage is reported WITHOUT an adoption correlation, even when
+// this daemon still retains one from before the lineage was quarantined.
+//
+// The composer's obligation for a quarantined lineage is quarantined-kind and
+// resolves on lifecycle identity plus shim id and process epoch. An attached
+// adoption receipt asks the receiver for the ADOPTED-kind predicate instead,
+// which matches nothing once the lineage has been reported quarantined:
+// measured on an installed host as a terminal observation that committed while
+// the obligation stayed `active`, after which every complete batch was refused
+// `adoption_batch_live_lineage_omitted` and the host could not recover.
+func TestQuarantinedLineageIsReportedWithoutAnAdoptionCorrelation(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	// The lineage was adopted once and this daemon still holds the receipt.
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.correlations[f.incarnation] = sessionShimAdoptionCorrelation{
+		evidence: SessionShimAdoptionEvidence{
+			Identity: f.identity, ShimID: f.incarnation.shimID,
+			ProcessEpoch: f.incarnation.processEpoch, ControllerGeneration: 6,
+		},
+		receipt: SessionShimAdoptionReceipt{DurableCorrelation: []byte("adoption-receipt")},
+	}
+	f.daemon.shims.mu.Unlock()
+	f.publishHelperTombstone(t)
+
+	f.daemon.reconcileQuarantinedTombstones()
+
+	reported := f.reported()
+	if len(reported) != 1 {
+		t.Fatalf("terminal evidence reported %d times, want exactly once", len(reported))
+	}
+	if reported[0].Adoption != nil || len(reported[0].DurableAdoptionCorrelation) != 0 {
+		t.Fatalf("a quarantined lineage was reported with an adoption correlation (%+v / %q) — the receiver "+
+			"then looks for an adopted-kind obligation that no longer exists and the quarantined one stays active",
+			reported[0].Adoption, reported[0].DurableAdoptionCorrelation)
+	}
+}

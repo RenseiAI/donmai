@@ -58,9 +58,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   that identity is still live — a v1 reader could otherwise conclude a running
   session's harness group had been reaped.
 - **One tombstone is reported once.** The reconcile runs from every occupancy
-  and heartbeat surface; concurrent passes now serialize per incarnation, a
-  committed handoff is never re-committed, and a refused one backs off instead
-  of being re-POSTed on every poll.
+  and heartbeat surface; concurrent passes now serialize per incarnation — a
+  second pass WAITS for the owner rather than returning early, so no caller
+  reads the projection in the middle of a withdrawal — a committed handoff is
+  never re-committed, and a refused one backs off instead of being re-POSTed on
+  every poll.
+- **A quarantined lineage's terminal evidence no longer carries an adoption
+  correlation.** The obligation the composer holds for a quarantined lineage is
+  quarantined-kind and resolves on lifecycle identity plus shim id and process
+  epoch; attaching a retained adoption receipt asked the receiver for the
+  adopted-kind predicate instead, which matches nothing once the lineage has
+  been reported quarantined. Measured on an installed host: the terminal
+  observation committed while the obligation stayed `active`, after which every
+  complete batch was refused `adoption_batch_live_lineage_omitted` and the host
+  could not recover.
 
 ## v0.72.2 — 2026-08-28
 
