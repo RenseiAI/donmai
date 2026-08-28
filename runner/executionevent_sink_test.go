@@ -231,6 +231,7 @@ func gitInitWithOrigin(t *testing.T, dir, origin string) {
 		t.Fatal(err)
 	}
 	gitInit(t, dir)
+	//nolint:gosec // G204: test fixture, origin comes from the test case.
 	cmd := exec.Command("git", "remote", "add", "origin", origin)
 	cmd.Dir = dir
 	if out, err := cmd.CombinedOutput(); err != nil {
