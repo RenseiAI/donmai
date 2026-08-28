@@ -459,6 +459,10 @@ func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string) *a
 	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" {
 		return nil
 	}
+	allowedRepositories := pullRequestAuthorityForWorktree(ctx, worktreePath)
+	if len(allowedRepositories) == 0 {
+		return nil
+	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
@@ -470,7 +474,7 @@ func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string) *a
 	if err := json.Unmarshal([]byte(out), &view); err != nil {
 		return nil
 	}
-	return pullRequestFactFromGitHubView(view)
+	return pullRequestFactFromGitHubViewAuthorized(view, allowedRepositories)
 }
 
 func pullRequestFactFromGitHubView(view ghPullRequestView) *agent.PullRequestFact {
@@ -482,6 +486,65 @@ func pullRequestFactFromGitHubView(view ghPullRequestView) *agent.PullRequestFac
 		return nil
 	}
 	return fact
+}
+
+func pullRequestFactFromGitHubViewAuthorized(view ghPullRequestView, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	fact := pullRequestFactFromGitHubView(view)
+	if fact == nil {
+		return nil
+	}
+	return authorizePullRequestFact(fact, allowedRepositories)
+}
+
+func authorizePullRequestFact(fact *agent.PullRequestFact, allowedRepositories map[string]struct{}) *agent.PullRequestFact {
+	if fact == nil || !pullRequestRepositoryAllowed(fact.Repository, allowedRepositories) {
+		return nil
+	}
+	return fact
+}
+
+func pullRequestRepositoryAllowed(repository string, allowedRepositories map[string]struct{}) bool {
+	if len(allowedRepositories) == 0 {
+		return false
+	}
+	_, ok := allowedRepositories[githubRepositorySlug(repository)]
+	return ok
+}
+
+func pullRequestAuthorityForWorktree(ctx context.Context, worktreePath string) map[string]struct{} {
+	if strings.TrimSpace(worktreePath) == "" {
+		return nil
+	}
+	out, err := runGit(ctx, worktreePath, gitIdentity{}, "remote", "get-url", "origin")
+	if err != nil {
+		return nil
+	}
+	slug := githubRepositorySlug(out)
+	if slug == "" {
+		return nil
+	}
+	return map[string]struct{}{slug: {}}
+}
+
+func githubRepositorySlug(repository string) string {
+	s := strings.TrimSpace(repository)
+	if s == "" {
+		return ""
+	}
+	s = strings.TrimSuffix(s, ".git")
+	if i := strings.Index(s, ":"); i >= 0 && !strings.Contains(s[:i], "/") {
+		s = s[i+1:]
+	} else if i := strings.Index(s, "://"); i >= 0 {
+		s = s[i+3:]
+		if i := strings.Index(s, "/"); i >= 0 {
+			s = s[i+1:]
+		}
+	}
+	parts := strings.Split(strings.Trim(s, "/"), "/")
+	if len(parts) < 2 {
+		return ""
+	}
+	return strings.ToLower(parts[len(parts)-2] + "/" + parts[len(parts)-1])
 }
 
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
