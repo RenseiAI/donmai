@@ -158,6 +158,11 @@ const (
 	// additive span batch contract. Missing/false keeps mixed-version workers
 	// from posting to a server that has not shipped the ingest route yet.
 	CapabilitySpanIngest = "llm-span-ingest"
+	// CapabilityExecutionEventIngest is true when the dispatch target accepts
+	// the strict journal-first normalized execution-event source contract.
+	// Missing/false preserves mixed-version safety: no unknown ingest request
+	// is emitted to a server that has not shipped the route.
+	CapabilityExecutionEventIngest = "execution-event-ingest"
 )
 
 // hasCapability reports whether the daemon advertised the named capability as
