@@ -6,9 +6,153 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
+
+func TestPullRequestFactFromGitHubView(t *testing.T) {
+	t.Parallel()
+	valid := ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"}
+	got := pullRequestFactFromGitHubView(valid)
+	want := &agent.PullRequestFact{Provider: "github", Number: 77, Repository: "RenseiAI/donmai", URL: "https://github.com/RenseiAI/donmai/pull/77", BaseBranch: "main", HeadBranch: "agent/test-fact"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pullRequestFactFromGitHubView() = %+v, want %+v", got, want)
+	}
+
+	invalid := valid
+	invalid.HeadRefName = ""
+	if got := pullRequestFactFromGitHubView(invalid); got != nil {
+		t.Fatalf("pullRequestFactFromGitHubView(incomplete) = %+v, want nil", got)
+	}
+}
+
+func TestPullRequestFactFromGitHubViewRejectsSpoofedURLs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		view ghPullRequestView
+	}{
+		{
+			name: "host spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com.evil.example/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "userinfo spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://token@github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "port spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com:444/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "path spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/issues/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "number spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/78", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "query spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77?tab=files", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "fragment spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77#discussion_r1", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "http scheme",
+			view: ghPullRequestView{Number: 77, URL: "http://github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pullRequestFactFromGitHubView(tc.view); got != nil {
+				t.Fatalf("pullRequestFactFromGitHubView(%+v) = %+v, want nil", tc.view, got)
+			}
+		})
+	}
+}
+
+func TestCanonicalGitHubOriginRepository(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		{
+			name:   "accepts canonical https origin",
+			origin: "https://github.com/RenseiAI/donmai.git",
+			want:   "renseiai/donmai",
+		},
+		{
+			name:   "accepts canonical ssh origin",
+			origin: "git@github.com:RenseiAI/donmai.git",
+			want:   "renseiai/donmai",
+		},
+		{
+			name:   "rejects github lookalike host",
+			origin: "https://github.com.evil.example/RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects https credentials spoofing",
+			origin: "https://token:x-oauth-basic@github.com/RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects local path origin",
+			origin: "../example/src/donmai",
+			want:   "",
+		},
+		{
+			name:   "rejects non github ssh host",
+			origin: "git@evil.example:RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects ssh url form outside canonical allowlist",
+			origin: "ssh://git@github.com/RenseiAI/donmai.git",
+			want:   "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := workarea.CanonicalGitHubRepositorySource(tc.origin); got != tc.want {
+				t.Fatalf("CanonicalGitHubRepositorySource(%q) = %q, want %q", tc.origin, got, tc.want)
+			}
+		})
+	}
+}
+
+func TestLookupGitHubPullRequestUsesSupportedGhFields(t *testing.T) {
+	worktree := t.TempDir()
+	gitInit(t, worktree)
+	const prURL = "https://github.com/RenseiAI/donmai/pull/463"
+	stubGhOnPathExpectingPullRequestView(t, prURL, 0, `{"number":463,"url":"https://github.com/RenseiAI/donmai/pull/463","baseRefName":"main","headRefName":"worktree-pr-fact-github-origin-final-clean"}`)
+	fact := lookupGitHubPullRequest(context.Background(), worktree, prURL, map[string]struct{}{
+		"renseiai/donmai": {},
+	})
+	if fact == nil {
+		t.Fatal("lookupGitHubPullRequest() = nil, want fact")
+	}
+	if fact.Repository != "RenseiAI/donmai" || fact.Number != 463 {
+		t.Fatalf("lookupGitHubPullRequest() = %+v, want RenseiAI/donmai#463", fact)
+	}
+
+	stubGhOnPathExpectingPullRequestView(t, prURL, 0, `{"number":463,"url":"https://github.com/RenseiAI/docs/pull/463","baseRefName":"main","headRefName":"worktree-pr-fact-github-origin-final-clean"}`)
+	if fact := lookupGitHubPullRequest(context.Background(), worktree, prURL, map[string]struct{}{
+		"renseiai/donmai": {},
+	}); fact != nil {
+		t.Fatalf("lookupGitHubPullRequest() = %+v, want nil for unauthorized repository", fact)
+	}
+}
 
 // TestCaptureHeadSHA table-tests the correlation-key capture for the
 // orchestration-owned durable CI wait (ADR-2026-06-10-durable-ci-wait.md).
@@ -233,7 +377,7 @@ func TestRunBackstop_FiltersBuildArtifacts(t *testing.T) {
 
 	report := r.runBackstop(context.Background(), QueuedWork{
 		QueuedWork: queuedWorkBase("REN-T-1"),
-	}, "feature/x", res)
+	}, "feature/x", res, nil)
 
 	// Push will fail (no remote), but the commit should already have
 	// happened. Check the staged-then-committed file is `src/main.go`.
@@ -399,7 +543,7 @@ func TestRunBackstop_CommitIdentity(t *testing.T) {
 		res.WorktreePath = repo
 
 		// runBackstop stages + commits fix.go then fails on push (no remote).
-		r.runBackstop(context.Background(), qw, "feature/session-identity", res)
+		r.runBackstop(context.Background(), qw, "feature/session-identity", res, nil)
 
 		authorOut, err := runGit(context.Background(), repo, gitIdentity{}, "log", "-1", "--pretty=format:%an <%ae>")
 		if err != nil {
@@ -454,7 +598,7 @@ func TestRunBackstop_RefusesMain(t *testing.T) {
 	res := &Result{}
 	res.WorktreePath = repo
 
-	report := r.runBackstop(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("REN-T-2")}, "main", res)
+	report := r.runBackstop(context.Background(), QueuedWork{QueuedWork: queuedWorkBase("REN-T-2")}, "main", res, nil)
 
 	if !strings.Contains(report.Diagnostics, "main/master") {
 		t.Fatalf("expected main/master refusal in diagnostics; got %q", report.Diagnostics)
@@ -510,7 +654,7 @@ func TestRunBackstop_RecoversExistingPR(t *testing.T) {
 
 	report := r.runBackstop(context.Background(), QueuedWork{
 		QueuedWork: queuedWorkBase("ENG-77"),
-	}, "feature/already-exists", res)
+	}, "feature/already-exists", res, nil)
 
 	if report.Diagnostics != "" {
 		t.Fatalf("expected no diagnostics on already-exists recovery; got %q", report.Diagnostics)
@@ -543,6 +687,29 @@ func stubGhOnPath(t *testing.T, exitCode int, output string) {
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
 	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func stubGhOnPathExpectingPullRequestView(t *testing.T, expectedURL string, exitCode int, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "gh-output.txt")
+	if err := os.WriteFile(outFile, []byte(output), 0o600); err != nil {
+		t.Fatalf("write gh stub output: %v", err)
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName" ]; then
+  echo "unexpected gh argv: $*" 1>&2
+  exit 1
+fi
+cat %[2]q 1>&2
+exit %[3]d
+`, expectedURL, outFile, exitCode)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh validating stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }

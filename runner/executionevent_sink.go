@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/executionevent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 func newExecutionEventSinkForWork(qw QueuedWork, primary activitySink, logger *slog.Logger, factory func() (*executionevent.Uploader, error)) (*executionEventSink, error) {
@@ -93,6 +95,16 @@ func (s *executionEventSink) Send(ctx context.Context, event agent.Event) {
 
 func (s *executionEventSink) Close(result *Result) {
 	s.once.Do(func() {
+		if result != nil && result.FailureMode == FailureAgentBlocked {
+			if err := s.uploader.SendSessionBlocked("agent declined to proceed"); err != nil && s.logger != nil {
+				s.logger.Warn("execution-event blocked journal append failed", "err", err)
+			}
+		}
+		for _, fact := range executionEventPullRequestFacts(result) {
+			if err := s.uploader.SendPullRequestOpened(fact); err != nil && s.logger != nil {
+				s.logger.Warn("execution-event pull request journal append failed", "err", err)
+			}
+		}
 		outcome, evidence := executionEventOutcome(result)
 		var digest string
 		if result != nil {
@@ -107,6 +119,106 @@ func (s *executionEventSink) Close(result *Result) {
 			s.logger.Warn("execution-event terminal drain incomplete; journal retained", "err", err)
 		}
 	})
+}
+
+func executionEventPullRequestFacts(result *Result) []agent.PullRequestFact {
+	if result == nil {
+		return nil
+	}
+	authority := executionEventPullRequestAuthorityForResult(result)
+	seen := make(map[string]struct{})
+	facts := make([]agent.PullRequestFact, 0, 2)
+	appendFact := func(fact *agent.PullRequestFact) {
+		if fact == nil || agent.ValidatePullRequestFact(*fact) != nil {
+			return
+		}
+		key := fact.Provider + "\x00" + fact.Repository + "\x00" + fmt.Sprintf("%d", fact.Number)
+		if _, exists := seen[key]; exists {
+			return
+		}
+		seen[key] = struct{}{}
+		facts = append(facts, *fact)
+	}
+	// PullRequestURL is agent-observable completion metadata, not authority for
+	// repository or branch facts. Promote it only after the runner performs a
+	// bounded GitHub readback from the session worktree and matches the
+	// declaration-bound canonical repository. A failed readback deliberately
+	// leaves the legacy URL intact while omitting pr.opened.
+	appendFact(authorizePullRequestFact(
+		lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL, authority.selected),
+		authority.selected,
+	))
+	if result.BackstopReport != nil {
+		appendFact(authorizePullRequestFact(result.BackstopReport.PullRequest, authority.selected))
+		for _, repository := range result.BackstopReport.Repositories {
+			appendFact(authorizePullRequestFact(repository.Report.PullRequest, authority.mutableByName[repository.Name]))
+		}
+	}
+	return facts
+}
+
+type executionEventPullRequestAuthority struct {
+	selected      map[string]struct{}
+	mutableByName map[string]map[string]struct{}
+}
+
+func executionEventPullRequestAuthorityForResult(result *Result) executionEventPullRequestAuthority {
+	authority := executionEventPullRequestAuthority{
+		selected:      nil,
+		mutableByName: make(map[string]map[string]struct{}),
+	}
+	root := strings.TrimSpace(result.WorkareaRoot)
+	if root == "" {
+		return authority
+	}
+	record, err := workarea.ReadDeclaration(workarea.RootPath(root))
+	if err != nil {
+		return authority
+	}
+	authority.selected = pullRequestAuthorityForDeclarationRecord(record, record.SelectedRepository)
+	if selectedMutable := selectedMutableRepository(record); !selectedMutable {
+		authority.selected = nil
+	}
+	for _, repository := range record.Repositories {
+		if repository.Authority != workarea.RepositoryMutable {
+			continue
+		}
+		allowed := pullRequestAuthorityForDeclarationRecordRepository(repository)
+		if len(allowed) == 0 {
+			continue
+		}
+		authority.mutableByName[repository.Name] = allowed
+		if repository.Name == record.SelectedRepository {
+			authority.selected = allowed
+		}
+	}
+	return authority
+}
+
+func selectedMutableRepository(record workarea.DeclarationRecord) bool {
+	for _, repository := range record.Repositories {
+		if repository.Name == record.SelectedRepository {
+			return repository.Authority == workarea.RepositoryMutable
+		}
+	}
+	return false
+}
+
+func pullRequestAuthorityForDeclarationRecord(record workarea.DeclarationRecord, repositoryName string) map[string]struct{} {
+	for _, repository := range record.Repositories {
+		if repository.Name == repositoryName {
+			return pullRequestAuthorityForDeclarationRecordRepository(repository)
+		}
+	}
+	return nil
+}
+
+func pullRequestAuthorityForDeclarationRecordRepository(repository workarea.DeclarationRepositoryRecord) map[string]struct{} {
+	slug := normalizeGitHubRepositorySlug(repository.CanonicalGitHubRepository)
+	if slug == "" {
+		return nil
+	}
+	return map[string]struct{}{slug: {}}
 }
 
 func executionEventOutcome(result *Result) (string, string) {
