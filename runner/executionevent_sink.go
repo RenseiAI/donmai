@@ -4,11 +4,13 @@ import (
 	"context"
 	"fmt"
 	"log/slog"
+	"strings"
 	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/executionevent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 func newExecutionEventSinkForWork(qw QueuedWork, primary activitySink, logger *slog.Logger, factory func() (*executionevent.Uploader, error)) (*executionEventSink, error) {
@@ -123,6 +125,7 @@ func executionEventPullRequestFacts(result *Result) []agent.PullRequestFact {
 	if result == nil {
 		return nil
 	}
+	authority := executionEventPullRequestAuthorityForResult(result)
 	seen := make(map[string]struct{})
 	facts := make([]agent.PullRequestFact, 0, 2)
 	appendFact := func(fact *agent.PullRequestFact) {
@@ -140,14 +143,72 @@ func executionEventPullRequestFacts(result *Result) []agent.PullRequestFact {
 	// repository or branch facts. Promote it only after the runner performs a
 	// bounded GitHub readback from the session worktree. A failed readback
 	// deliberately leaves the legacy URL intact while omitting pr.opened.
-	appendFact(lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL))
+	appendFact(authorizePullRequestFact(
+		lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL),
+		authority.selected,
+	))
 	if result.BackstopReport != nil {
-		appendFact(result.BackstopReport.PullRequest)
+		appendFact(authorizePullRequestFact(result.BackstopReport.PullRequest, authority.selected))
 		for _, repository := range result.BackstopReport.Repositories {
-			appendFact(repository.Report.PullRequest)
+			appendFact(authorizePullRequestFact(repository.Report.PullRequest, authority.mutableByName[repository.Name]))
 		}
 	}
 	return facts
+}
+
+type executionEventPullRequestAuthority struct {
+	selected      map[string]struct{}
+	mutableByName map[string]map[string]struct{}
+}
+
+func executionEventPullRequestAuthorityForResult(result *Result) executionEventPullRequestAuthority {
+	authority := executionEventPullRequestAuthority{
+		selected:      pullRequestAuthorityForWorktree(context.Background(), result.WorktreePath),
+		mutableByName: make(map[string]map[string]struct{}),
+	}
+	root := strings.TrimSpace(result.WorkareaRoot)
+	if root == "" {
+		return authority
+	}
+	record, err := workarea.ReadDeclaration(workarea.RootPath(root))
+	if err != nil {
+		return authority
+	}
+	if selectedMutable := selectedMutableRepository(record); !selectedMutable {
+		authority.selected = nil
+	}
+	layout := workarea.Layout{Root: workarea.RootPath(root), Repository: workarea.RepositoryPath(result.WorktreePath)}
+	for _, repository := range record.Repositories {
+		if repository.Authority != workarea.RepositoryMutable {
+			continue
+		}
+		repositoryPath := strings.TrimSpace(result.WorktreePath)
+		if repository.Name != record.SelectedRepository || repositoryPath == "" {
+			path, pathErr := layout.RepositoryPathFor(repository.Leaf)
+			if pathErr != nil {
+				continue
+			}
+			repositoryPath = path.String()
+		}
+		allowed := pullRequestAuthorityForWorktree(context.Background(), repositoryPath)
+		if len(allowed) == 0 {
+			continue
+		}
+		authority.mutableByName[repository.Name] = allowed
+		if repository.Name == record.SelectedRepository {
+			authority.selected = allowed
+		}
+	}
+	return authority
+}
+
+func selectedMutableRepository(record workarea.DeclarationRecord) bool {
+	for _, repository := range record.Repositories {
+		if repository.Name == record.SelectedRepository {
+			return repository.Authority == workarea.RepositoryMutable
+		}
+	}
+	return false
 }
 
 func executionEventOutcome(result *Result) (string, string) {
