@@ -1200,6 +1200,14 @@ type shimIncarnation struct {
 	processEpoch uint64
 }
 
+// sessionShimTerminalReport is the per-incarnation durable-handoff state the
+// reconcile keeps so repeated passes cannot re-commit or re-POST one tombstone.
+type sessionShimTerminalReport struct {
+	inFlight  bool
+	committed bool
+	retryAt   time.Time
+}
+
 type sessionShimAdoptionCorrelation struct {
 	evidence SessionShimAdoptionEvidence
 	receipt  SessionShimAdoptionReceipt
@@ -1221,23 +1229,21 @@ type sessionShimState struct {
 	adopted                  map[sessionshim.Identity]adoptedShim
 	quarantined              []sessionshim.QuarantinedSession
 	tombstoned               []sessionshim.Tombstone
-	fence                    *sessionshim.Fence
-	fences                   map[string]sessionshim.Fence
-	fenceRequests            map[string]sessionshim.FenceRequest
+	// reportingTerminal marks incarnations whose durable terminal handoff is in
+	// flight, already committed, or cooling off after a refusal, so the
+	// reconcile's many call sites cannot double-report one tombstone and a
+	// polling caller cannot amplify one refusal into a burst of commits.
+	reportingTerminal map[shimIncarnation]sessionShimTerminalReport
+	fence             *sessionshim.Fence
+	fences            map[string]sessionshim.Fence
+	fenceRequests     map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.
 	forwarded map[sessionshim.Identity]uint64
 	// correlations survive a controller disconnect so the later exact tombstone
 	// callback still receives the same opaque durable adoption receipt.
-	correlations map[shimIncarnation]sessionShimAdoptionCorrelation
-	// pendingCleared stages quarantined lineages the acceptance clear has
-	// explicitly abandoned but no committed batch receipt has confirmed yet.
-	// While staged, the lineage keeps its row in quarantined — the heartbeat
-	// must keep projecting it until the control plane's completeness set has
-	// verifiably let it go — and every published batch reports it through the
-	// cleared section instead of the quarantined one.
-	pendingCleared     map[shimIncarnation]SessionShimClearedQuarantine
+	correlations       map[shimIncarnation]sessionShimAdoptionCorrelation
 	batchReceipts      map[string]SessionShimAdoptionBatchReceipt
 	credentialReceipts map[string]SessionShimScopeCredentialReceipt
 	// declaringComposition is set only while a deferred composition install is
@@ -1306,7 +1312,7 @@ func newSessionShimState() *sessionShimState {
 		adopted:              make(map[sessionshim.Identity]adoptedShim),
 		forwarded:            make(map[sessionshim.Identity]uint64),
 		correlations:         make(map[shimIncarnation]sessionShimAdoptionCorrelation),
-		pendingCleared:       make(map[shimIncarnation]SessionShimClearedQuarantine),
+		reportingTerminal:    make(map[shimIncarnation]sessionShimTerminalReport),
 		fences:               make(map[string]sessionshim.Fence),
 		fenceRequests:        make(map[string]sessionshim.FenceRequest),
 		batchReceipts:        make(map[string]SessionShimAdoptionBatchReceipt),
@@ -2348,70 +2354,18 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	if (d.sessionShimEnabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: attested adoption batch omitted adoption revision")
 	}
-	if err := validateSessionShimClearedReceiptEcho(batch.Cleared, receipt.Cleared); err != nil {
-		return SessionShimAdoptionBatchReceipt{}, err
-	}
 	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
 	receipt.Cleared = append([]SessionShimClearedQuarantine(nil), receipt.Cleared...)
-	// Only now — the commit is durable and the receipt echoed every cleared
-	// entry exactly — may the daemon forget the abandoned lineages. Dropping
-	// them any earlier is what made the next heartbeat disagree with the last
-	// committed set and demoted the host to draining.
-	d.dropSessionShimClearedQuarantinesCommitted(batch.Cleared)
 	return receipt, nil
 }
 
-// validateSessionShimClearedReceiptEcho requires a batch receipt to echo the
-// cleared section exactly: same entries, same order, byte-identical fields. A
-// receipt silent about a cleared entry gives this daemon no confirmation the
-// composer's recovery obligation moved active → abandoned, so the lineage must
-// stay projected; a receipt claiming entries that were never sent is a
-// fabricated commit and is refused the same way.
-func validateSessionShimClearedReceiptEcho(sent, echoed []SessionShimClearedQuarantine) error {
-	if len(echoed) != len(sent) {
-		return fmt.Errorf("session shim: adoption batch receipt echoed %d cleared entries, want %d", len(echoed), len(sent))
-	}
-	for i := range sent {
-		if echoed[i] != sent[i] {
-			return fmt.Errorf("session shim: adoption batch receipt did not exactly echo cleared entry %d", i)
-		}
-	}
-	return nil
-}
-
-// dropSessionShimClearedQuarantinesCommitted forgets cleared lineages whose
-// abandonment a committed batch receipt just confirmed: the staged entry, the
-// acceptance bookkeeping, and the quarantined projection row all go together,
-// so the next heartbeat and the control plane's post-commit completeness set
-// agree by construction.
-//
-// Only two callers are admissible, and TestClearedQuarantineDropsOnlyAtCommit
-// pins the set: completeSessionShimAdoptionBatch (the commit choke point, after
-// the exact receipt echo) and the standalone branch of
-// clearSessionShimAcceptanceQuarantine (no composer holds an obligation, so the
-// local drop is the commit).
-func (d *Daemon) dropSessionShimClearedQuarantinesCommitted(cleared []SessionShimClearedQuarantine) {
-	if len(cleared) == 0 || d.shims == nil {
-		return
-	}
-	d.shims.mu.Lock()
-	for _, entry := range cleared {
-		key := shimIncarnation{identity: entry.Identity(), shimID: entry.ShimID, processEpoch: entry.ProcessEpoch}
-		delete(d.shims.pendingCleared, key)
-		delete(d.shims.acceptanceQuarantine, key)
-		kept := d.shims.quarantined[:0]
-		for _, q := range d.shims.quarantined {
-			if q.Identity() == key.identity && q.ShimID == key.shimID && q.ProcessEpoch == key.processEpoch {
-				continue
-			}
-			kept = append(kept, q)
-		}
-		d.shims.quarantined = kept
-	}
-	d.shims.mu.Unlock()
-	slog.Info("session shim: acceptance-cleared quarantine committed as an explicit abandoned disposition",
-		"cleared", len(cleared))
-}
+// The daemon has no producer for the cleared/abandoned disposition any more.
+// An acceptance clear leaves through a real terminal tombstone, and that was
+// the only path that ever staged one. The WIRE types below the daemon
+// (SessionShimClearedQuarantine, the batch's Cleared section, the receipt's
+// echo of it) are retained because the composing plane accepts and records
+// them; the local staging, the receipt-echo validation and the
+// drop-at-commit bookkeeping are deleted rather than deprecated.
 
 // sessionShimProjectionBatch assembles this daemon's complete durable
 // projection for one organization from current state: everything adopted,
@@ -2449,18 +2403,6 @@ func (d *Daemon) sessionShimProjectionBatch(orgID, hostID string) SessionShimAdo
 	}
 	for _, quarantined := range d.shims.quarantined {
 		if quarantined.OrgID != batch.OrgID {
-			continue
-		}
-		key := shimIncarnation{
-			identity: quarantined.Identity(), shimID: quarantined.ShimID, processEpoch: quarantined.ProcessEpoch,
-		}
-		if cleared, pending := d.shims.pendingCleared[key]; pending {
-			// A staged abandonment is still projected quarantined on the
-			// heartbeat, but the durable batch reports it through the cleared
-			// section: carrying it quarantined would ask the receiver to keep
-			// the obligation this batch abandons, and omitting it outright is
-			// refused as incomplete.
-			batch.Cleared = append(batch.Cleared, cleared)
 			continue
 		}
 		batch.Quarantined = append(batch.Quarantined, quarantined)
@@ -2582,7 +2524,11 @@ func sortSessionShimAdoptionBatch(batch *SessionShimAdoptionBatch) {
 // tuple as every other section. A terminal entry carries no controller
 // generation, so the lineage correlation is the whole key.
 func sortSessionShimTerminalEvidence(in []SessionShimTerminalEvidence) {
-	sort.Slice(in, func(i, j int) bool {
+	// Stable: the key ends at the process epoch, so two entries for one exact
+	// incarnation compare equal and an unstable sort could reorder them between
+	// two publications of the same set — which the receiver reads as a changed
+	// batch.
+	sort.SliceStable(in, func(i, j int) bool {
 		a, b := in[i], in[j]
 		if a.Identity.OrgID != b.Identity.OrgID {
 			return a.Identity.OrgID < b.Identity.OrgID
@@ -3628,7 +3574,59 @@ func (d *Daemon) SessionShimReleaseDecision(orgID, sessionID string, proof sessi
 		}
 		d.shims.mu.RUnlock()
 	}
+	// Every lineage this daemon still holds for the identity must be proven,
+	// not just SOME lineage of it.
+	//
+	// §D10 requires proof that "that exact harness process group" was reaped.
+	// One lifecycle identity can hold several incarnations at once (§D7's
+	// duplicate-identity case), and the scalar proof is identity-scoped: a
+	// sibling's group-reaped tombstone would otherwise answer ReleaseAllowed
+	// for a session whose real harness is still running, for the rest of this
+	// daemon's life, because the retained tombstone never expires. When no
+	// fence enumerates the correlations, this daemon's own live set is the
+	// enumeration.
+	if live := d.liveSessionShimCorrelations(id); len(live) > 0 {
+		for _, correlation := range live {
+			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch) {
+				if fence != nil && fence.Covers(id) && !fence.Expired(time.Now()) && fence.State == sessionshim.FenceHeld {
+					return sessionshim.ReleaseHeld
+				}
+				return sessionshim.ReleaseReconcile
+			}
+		}
+	}
 	return sessionshim.ReleaseDecision(fence, id, proof, time.Now())
+}
+
+// liveSessionShimCorrelations enumerates the incarnations of one identity this
+// daemon still holds: every adopted lineage and every quarantined one. A
+// quarantined lineage counts — §D7 refuses it authority, not existence, and its
+// harness is still running.
+func (d *Daemon) liveSessionShimCorrelations(id sessionshim.Identity) []shimIncarnation {
+	if d.shims == nil {
+		return nil
+	}
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	var out []shimIncarnation
+	if entry, ok := d.shims.adopted[id]; ok {
+		correlation := shimIncarnation{identity: id, shimID: entry.shimID}
+		if entry.controller != nil {
+			hello := entry.controller.Hello()
+			if hello.ShimID != "" {
+				correlation.shimID = hello.ShimID
+			}
+			correlation.processEpoch = hello.ProcessEpoch
+		}
+		out = append(out, correlation)
+	}
+	for _, q := range d.shims.quarantined {
+		if q.Identity() != id {
+			continue
+		}
+		out = append(out, shimIncarnation{identity: id, shimID: q.ShimID, processEpoch: q.ProcessEpoch})
+	}
+	return out
 }
 
 // SessionShimTerminalProof gathers whatever durable evidence exists that a

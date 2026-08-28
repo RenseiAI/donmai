@@ -28,14 +28,39 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   nothing.** Withdrawing one terminalized incarnation kept the durable
   forwarded high-water of any lineage that still shares its lifecycle identity
   — previously the whole identity's high-water went with the sibling, and a
-  surviving session's fence correlation regressed to zero. The reconcile also
-  republishes the complete projection for every organization whose quarantine
-  set it changed, because a heartbeat that disagrees with the last committed
-  batch demotes the host to draining.
+  surviving session's fence correlation regressed to zero. The acceptance clear
+  republishes the projection it changed, because a heartbeat that disagrees
+  with the last committed batch demotes the host to draining.
 - **Every adoption-batch section is ordered at the one place every batch passes
   through.** The tombstoned section was ordered by nothing but append order,
   which the receiver refuses as soon as one lifecycle identity has two terminal
   incarnations.
+- **A terminal observation the daemon already made durable is no longer thrown
+  away when its acknowledgement cannot be delivered.** The cursor
+  acknowledgement is the SHIM's replay position, and a shim that published Exit
+  and then closed has nothing left to replay; failing to deliver it used to
+  abort the consume loop before the terminal outcome was reported, leaving a
+  session quarantined `socket_unreachable` with its harness already reaped —
+  which §D10 calls unresolved rather than ended, and which no later stop could
+  reach.
+- **A reaped harness leaves its proof even when the host stops waiting.** The
+  shim now publishes its tombstone BEFORE the best-effort delivery that follows
+  it (the selected-v3 pump flush and the durable-ack wait), and the runner's
+  grace for that finalization is derived from the shim's own bound instead of
+  being a second number picked beside it. The two were equal, so the wait could
+  expire in the same instant the tombstone was about to be written: the process
+  exited, a provably-reaped harness left no proof at all, and no live shim
+  remained to run the orphan clock.
+- **A sibling incarnation's tombstone no longer releases a live lineage.** The
+  claim-release predicate now requires every lineage this daemon holds for an
+  identity to be proven, not just some lineage of it, and the registry no
+  longer writes the identity-only tombstone alias while another incarnation of
+  that identity is still live — a v1 reader could otherwise conclude a running
+  session's harness group had been reaped.
+- **One tombstone is reported once.** The reconcile runs from every occupancy
+  and heartbeat surface; concurrent passes now serialize per incarnation, a
+  committed handoff is never re-committed, and a refused one backs off instead
+  of being re-POSTed on every poll.
 
 ## v0.72.2 — 2026-08-28
 

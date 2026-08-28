@@ -129,6 +129,12 @@ type Shim struct {
 	stopOnce   sync.Once
 	done       chan struct{}
 	acceptDone chan struct{}
+	// onTerminalCourtesy runs at the boundary between the durable terminal
+	// proof and the best-effort delivery that follows it. It is nil in every
+	// production build; it exists so a test can observe WHICH side of that
+	// boundary the tombstone is written on, which no timing assertion can do
+	// reliably when a controller happens to drain quickly.
+	onTerminalCourtesy func()
 }
 
 // controllerConn is one attached controller.
@@ -497,40 +503,6 @@ func (s *Shim) finalizeTerminal() error {
 	ctrl := s.ctrl
 	s.mu.Unlock()
 
-	if ctrl != nil && ctrl.selected >= shimwire.V3 && ctrl.pumpDone != nil {
-		// In v3 the one raw Exit HostFrame is the terminal observation. Session
-		// Done closes the subscription after publishing Exit. Give the pump a
-		// bounded flush opportunity, then close a stalled controller so terminal
-		// proof cannot deadlock behind socket backpressure.
-		flushBound := s.orphan.TerminationGrace
-		if flushBound <= 0 || flushBound > 5*time.Second {
-			flushBound = 5 * time.Second
-		}
-		timer := time.NewTimer(flushBound)
-		select {
-		case <-ctrl.pumpDone:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-			ctrl.close()
-			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
-				"session", s.id.String())
-		}
-		// Socket write completion is not the carrier durability boundary. Give the
-		// exact selected-v3 persistence receipt the same bounded opportunity before
-		// replacing replayable state with the terminal proof.
-		s.waitForDurableAck(uint64(lastSeq), flushBound)
-	}
-
-	if ctrl != nil && ctrl.selected < shimwire.V3 {
-		// Best-effort: the controller may already be gone, which is exactly the
-		// case the tombstone exists for.
-		_ = writeTyped(ctrl.w, shimwire.TypeExit, func() ([]byte, error) {
-			return shimwire.EncodeExit(shimwire.ExitMsg{Seq: uint64(lastSeq), ExitCode: exit.ExitCode, Signal: exit.Signal})
-		})
-	}
-
 	t := Tombstone{
 		SchemaVersion:      RecordSchemaVersion,
 		OrgID:              s.id.OrgID,
@@ -558,9 +530,81 @@ func (s *Shim) finalizeTerminal() error {
 	if err != nil {
 		return fmt.Errorf("sessionshim: persist tombstone: %w", err)
 	}
+
+	if s.onTerminalCourtesy != nil {
+		s.onTerminalCourtesy()
+	}
+	// PROOF FIRST, COURTESY SECOND. Everything below is best-effort delivery to
+	// a controller that may already be gone; none of it changes a single field
+	// of the observation above, and all of it can block for the full finalize
+	// bound. Publishing the tombstone first is what makes the proof independent
+	// of controller latency and of this process's own teardown: a host that
+	// stops waiting mid-courtesy now leaves a lineage that is provably ended
+	// rather than one that is merely unobservable (§D10).
+	if ctrl != nil && ctrl.selected < shimwire.V3 {
+		// The controller may already be gone, which is exactly the case the
+		// tombstone exists for.
+		_ = writeTyped(ctrl.w, shimwire.TypeExit, func() ([]byte, error) {
+			return shimwire.EncodeExit(shimwire.ExitMsg{Seq: uint64(lastSeq), ExitCode: exit.ExitCode, Signal: exit.Signal})
+		})
+	}
+	if ctrl != nil && ctrl.selected >= shimwire.V3 && ctrl.pumpDone != nil {
+		// In v3 the one raw Exit HostFrame is the terminal observation. Session
+		// Done closes the subscription after publishing Exit. Give the pump a
+		// bounded flush opportunity, then close a stalled controller so the
+		// courtesy cannot deadlock behind socket backpressure.
+		flushBound := s.finalizeWaitBound()
+		timer := time.NewTimer(flushBound)
+		select {
+		case <-ctrl.pumpDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			ctrl.close()
+			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
+				"session", s.id.String())
+		}
+		// Socket write completion is not the carrier durability boundary. Give
+		// the exact selected-v3 persistence receipt the same bounded
+		// opportunity so an adopting controller can resume from the exact
+		// terminal cursor.
+		s.waitForDurableAck(uint64(lastSeq), flushBound)
+	}
 	close(s.done)
 	return nil
 }
+
+// FinalizeBoundFor is FinalizeBound for a policy, for a host that must size its
+// own grace before a shim exists.
+func FinalizeBoundFor(policy OrphanPolicy) time.Duration {
+	return 2 * finalizeWaitBoundFor(policy.TerminationGrace)
+}
+
+func finalizeWaitBoundFor(grace time.Duration) time.Duration {
+	if grace <= 0 || grace > maxFinalizeWaitBound {
+		return maxFinalizeWaitBound
+	}
+	return grace
+}
+
+// finalizeWaitBound is one of the two equal courtesy windows finalizeTerminal
+// spends after the tombstone is durable: the selected-v3 pump flush and the
+// durable-ack wait.
+func (s *Shim) finalizeWaitBound() time.Duration {
+	return finalizeWaitBoundFor(s.orphan.TerminationGrace)
+}
+
+// FinalizeBound is the longest finalizeTerminal can run after the harness is
+// reaped: the two equal courtesy windows above. A host that waits for
+// Done() must derive its grace from THIS, never from a second number picked
+// beside it — the two silently drifting apart is how a process exits in the
+// same instant its own proof was about to be written.
+func (s *Shim) FinalizeBound() time.Duration { return 2 * s.finalizeWaitBound() }
+
+// maxFinalizeWaitBound caps each courtesy window regardless of the configured
+// termination grace.
+const maxFinalizeWaitBound = 5 * time.Second
 
 // watchHarness turns an ordinary harness exit into the terminal observation.
 func (s *Shim) watchHarness() {

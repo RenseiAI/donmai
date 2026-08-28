@@ -506,3 +506,73 @@ func TestTerminalWithdrawalCannotBeUndoneByAnOrphanRepublish(t *testing.T) {
 		t.Fatalf("the tombstone was disturbed by a post-terminal republish: %v", err)
 	}
 }
+
+// TestLegacyTombstoneAliasIsRefusedWhileASiblingRecordIsLive pins the one
+// assertion the identity-only alias makes: "this SESSION's harness group was
+// reaped".
+//
+// A v1 reader can only read the alias. §D7's duplicate-identity case makes a
+// sibling lineage tombstoning beside a running session real — the acceptance
+// seam creates exactly that — and writing the alias there tells such a reader
+// the LIVE session's group is gone. Worse, the alias is deliberately never
+// overwritten, so the real lineage's later tombstone could never replace it.
+func TestLegacyTombstoneAliasIsRefusedWhileASiblingRecordIsLive(t *testing.T) {
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-alias", SessionID: "session-alias"}
+	live := Record{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-live", ProcessEpoch: 1,
+		PID: os.Getpid(), ProcessStartedAt: 1,
+		SocketPath:  dir + "/live.sock",
+		ProtocolMin: 1, ProtocolMax: 3,
+		Phase:             shimwire.PhaseRunning,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.Put(live); err != nil {
+		t.Fatal(err)
+	}
+	sibling := Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-sibling", ProcessEpoch: 2,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(sibling); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+
+	// The exact incarnation is readable, as always.
+	if _, err := registry.GetTombstoneIncarnation(id, "shim-sibling", 2); err != nil {
+		t.Fatalf("per-incarnation tombstone missing: %v", err)
+	}
+	// The identity-only alias is NOT written while the identity has another
+	// live record.
+	if _, err := registry.readEntry(id.TombstoneName()); err == nil {
+		t.Fatal("the identity-only alias was written while a sibling lineage is still live; a v1 reader " +
+			"would conclude the live session's harness group was reaped")
+	}
+	// The live lineage is untouched by its sibling's terminal publication.
+	if got, err := registry.Get(id); err != nil || got.ShimID != "shim-live" {
+		t.Fatalf("live discovery record after a sibling tombstone = %+v, %v", got, err)
+	}
+
+	// Control: an identity whose only incarnation is the one that ended still
+	// gets the alias, so v1 readers keep working for the ordinary case.
+	soleID := Identity{OrgID: "org-alias", SessionID: "session-alias-sole"}
+	sole := sibling
+	sole.SessionID = soleID.SessionID
+	sole.ShimID = "shim-sole"
+	sole.ProcessEpoch = 1
+	if err := registry.PutTombstone(sole); err != nil {
+		t.Fatalf("PutTombstone(sole): %v", err)
+	}
+	if _, err := registry.readEntry(soleID.TombstoneName()); err != nil {
+		t.Fatalf("the identity-only alias is missing for an unambiguous identity: %v", err)
+	}
+}

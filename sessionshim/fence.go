@@ -407,6 +407,20 @@ func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedS
 		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
 }
 
+// TerminalProofCovers reports whether proof positively closes ONE exact
+// incarnation of id.
+//
+// It is the incarnation-scoped question, exported because the scalar
+// TerminalProof fields are identity-scoped by design (they predate duplicate
+// identities) and a caller that holds several live correlations must be able to
+// ask about each one rather than about "the session".
+func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64) bool {
+	return proof.provesCorrelation(id, FencedSession{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: processEpoch,
+	})
+}
+
 // ReleaseVerdict is the outcome of the single claim-release predicate.
 type ReleaseVerdict string
 

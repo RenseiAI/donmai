@@ -377,11 +377,35 @@ func (r *Registry) tombstoneEntries() ([]tombstoneFile, error) {
 }
 
 func (r *Registry) legacyTombstoneAliasSafe(t Tombstone) (bool, error) {
-	names, err := r.entryNames(tombstoneSuffix)
+	// The alias says "this IDENTITY's harness group was reaped", so it may only
+	// be written while the identity has no OTHER live incarnation. §D7's
+	// duplicate-identity case makes that real: a sibling lineage tombstoning
+	// beside a running session would otherwise leave a v1 reader — which can
+	// only read the alias — believing the live session's group was reaped, and
+	// the real lineage's later tombstone could never replace an alias that is
+	// deliberately never overwritten.
+	entries, err := r.Scan()
 	if err != nil {
 		return false, err
 	}
 	want := terminalIncarnationForTombstone(t)
+	for _, entry := range entries {
+		if entry.Err != nil {
+			// An unreadable record cannot be shown to be a sibling, and the
+			// alias is an assertion about the whole identity: refuse it.
+			return false, nil
+		}
+		if entry.Record.Identity() != t.Identity() {
+			continue
+		}
+		if entry.Record.ShimID != t.ShimID || entry.Record.ProcessEpoch != t.ProcessEpoch {
+			return false, nil
+		}
+	}
+	names, err := r.entryNames(tombstoneSuffix)
+	if err != nil {
+		return false, err
+	}
 	for _, name := range names {
 		data, readErr := r.readEntry(name)
 		if readErr != nil {

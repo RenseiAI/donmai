@@ -331,17 +331,20 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	// settle window — the mutator already proved the record is withdrawn, and
 	// PutTombstone publishes the proof BEFORE it withdraws the record, so the
 	// tombstone is on disk by the time this runs.
-	deadline := d.shimNow().Add(tombstoneSettleWindow)
+	// ONE clock. The wait sleeps in real time, so the deadline is real time
+	// too; mixing an injectable now() with a real Sleep makes the bound mean
+	// different things in a test and on a host.
+	deadline := time.Now().Add(tombstoneSettleWindow)
 	for {
 		d.reconcileQuarantinedTombstones()
 		quarantined, tombstoned := d.sessionShimLineageDisposition(incarnation)
 		if !quarantined && tombstoned {
 			break
 		}
-		if !d.shimNow().Before(deadline) {
+		if !time.Now().Before(deadline) {
 			return errors.New("acceptance clear: the quarantined lineage did not reconcile through its terminal tombstone")
 		}
-		time.Sleep(shimRecordPollInterval)
+		time.Sleep(acceptanceClearPollInterval)
 	}
 	// The quarantine set changed, so the projection has to be republished from
 	// HERE. The platform compares each beat's quarantine set against the
@@ -357,6 +360,11 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	d.shims.mu.Unlock()
 	return nil
 }
+
+// acceptanceClearPollInterval paces the wait for the production reconcile. It
+// is derived from the settle window rather than picked: a 25ms poll spent the
+// whole window re-driving a reconcile whose own commit is rate-limited anyway.
+const acceptanceClearPollInterval = tombstoneSettleWindow / 20
 
 // sessionShimLineageDisposition reports whether one exact incarnation is still
 // projected quarantined, and whether this daemon retains a terminal tombstone

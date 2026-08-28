@@ -181,13 +181,9 @@ func TestAcceptanceClearLeavesThroughTheHelpersTerminalTombstone(t *testing.T) {
 	}
 	f.daemon.shims.mu.RLock()
 	_, stillArmed := f.daemon.shims.acceptanceQuarantine[f.incarnation]
-	_, staged := f.daemon.shims.pendingCleared[f.incarnation]
 	f.daemon.shims.mu.RUnlock()
 	if stillArmed {
 		t.Fatal("clear left the acceptance bookkeeping armed")
-	}
-	if staged {
-		t.Fatal("clear staged an abandoned disposition alongside real terminal evidence")
 	}
 }
 
@@ -262,12 +258,14 @@ func TestAcceptanceClearAcceptsAnAlreadyReconciledLineage(t *testing.T) {
 func TestReconcileKeepsTheForwardedHighWaterForALiveSibling(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
-		name        string
-		liveSibling bool
-		want        uint64
+		name               string
+		liveSibling        bool
+		quarantinedSibling bool
+		want               uint64
 	}{
 		{name: "live adopted sibling retains it", liveSibling: true, want: 42},
-		{name: "last lineage of the identity drops it", liveSibling: false, want: 0},
+		{name: "remaining quarantined sibling retains it", quarantinedSibling: true, want: 42},
+		{name: "last lineage of the identity drops it", want: 0},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -300,6 +298,15 @@ func TestReconcileKeepsTheForwardedHighWaterForALiveSibling(t *testing.T) {
 			if tc.liveSibling {
 				d.shims.adopted[id] = adoptedShim{shimID: "shim-live"}
 			}
+			if tc.quarantinedSibling {
+				sibling := sessionshim.NewQuarantinedSession(sessionshim.Record{
+					SchemaVersion: sessionshim.RecordSchemaVersion,
+					OrgID:         id.OrgID, SessionID: id.SessionID,
+					ShimID: "shim-sibling", ProcessEpoch: 2,
+					CreatedAtUnixNano: time.Now().UnixNano(),
+				}, sessionshim.QuarantineSocketUnreachable, "sibling lineage still quarantined", time.Now())
+				d.upsertShimQuarantineLocked(sibling)
+			}
 			d.shims.mu.Unlock()
 
 			d.reconcileQuarantinedTombstones()
@@ -308,12 +315,141 @@ func TestReconcileKeepsTheForwardedHighWaterForALiveSibling(t *testing.T) {
 			got := d.shims.forwarded[id]
 			remaining := len(d.shims.quarantined)
 			d.shims.mu.RUnlock()
-			if remaining != 0 {
-				t.Fatalf("reconcile left %d quarantined lineages", remaining)
+			wantRemaining := 0
+			if tc.quarantinedSibling {
+				wantRemaining = 1
+			}
+			if remaining != wantRemaining {
+				t.Fatalf("reconcile left %d quarantined lineages, want %d", remaining, wantRemaining)
 			}
 			if got != tc.want {
 				t.Fatalf("forwarded high-water = %d, want %d", got, tc.want)
 			}
 		})
+	}
+}
+
+// The clear's break condition has two halves and both must hold. A lineage that
+// simply VANISHED from the projection — dropped by some other path, or never
+// there — is unobservable, not ended, and accepting it would put back exactly
+// the disposition this change removed.
+func TestAcceptanceClearRefusesALineageThatVanishedWithoutATombstone(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	// Someone else drops the projection row; no tombstone is ever written.
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.quarantined = nil
+	f.daemon.shims.mu.Unlock()
+
+	if err := f.daemon.clearSessionShimAcceptanceQuarantine(f.incarnation); err == nil {
+		t.Fatal("clear accepted a lineage that vanished with no terminal evidence")
+	}
+	if len(f.reported()) != 0 {
+		t.Fatalf("clear reported terminal evidence for a lineage that left no proof: %+v", f.reported())
+	}
+	f.daemon.shims.mu.RLock()
+	_, stillArmed := f.daemon.shims.acceptanceQuarantine[f.incarnation]
+	f.daemon.shims.mu.RUnlock()
+	if !stillArmed {
+		t.Fatal("refused clear dropped the acceptance bookkeeping")
+	}
+}
+
+// A SIBLING's tombstone must never release a live session's claim.
+//
+// The scalar terminal proof is identity-scoped, so before this guard a
+// quarantined helper's group-reaped tombstone answered ReleaseAllowed for a
+// session whose real harness was still running — and kept answering it for the
+// rest of the daemon's life, because the retained tombstone never expires.
+// Invariant 10 requires proof that THAT EXACT harness process group was reaped.
+func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{RegistryDir: dir}})
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := sessionshim.Identity{OrgID: "org-sibling", SessionID: "session-sibling"}
+	sibling := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-helper", ProcessEpoch: 1,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(sibling); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	d.shims.mu.Lock()
+	d.shims.registry = registry
+	d.shims.adopted[id] = adoptedShim{shimID: "shim-live"}
+	d.shims.mu.Unlock()
+
+	proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
+	if !proof.Proves() {
+		t.Fatal("precondition: the sibling tombstone is not even a proof; this test would pass vacuously")
+	}
+	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict == sessionshim.ReleaseAllowed {
+		t.Fatal("a sibling incarnation's tombstone released a session whose adopted lineage is still live — " +
+			"§D10 requires proof for that exact harness process group")
+	}
+
+	// Control: once the live lineage's OWN tombstone exists, release is allowed.
+	live := sibling
+	live.ShimID = "shim-live"
+	live.ProcessEpoch = 0
+	if err := registry.PutTombstone(live); err != nil {
+		t.Fatalf("PutTombstone(live): %v", err)
+	}
+	proof = d.SessionShimTerminalProof(id.OrgID, id.SessionID)
+	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict != sessionshim.ReleaseAllowed {
+		t.Fatalf("release verdict with the adopted lineage's own reap proof = %q, want %q",
+			verdict, sessionshim.ReleaseAllowed)
+	}
+}
+
+// The reconcile runs from eight surfaces. Two passes reading one tombstone
+// before either has finished its durable handoff would both commit it, and the
+// composer would record the same terminal observation twice.
+func TestConcurrentReconcilesReportOneTombstoneOnce(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	f.publishHelperTombstone(t)
+	// Hold the report inside the hook so both passes are genuinely in flight.
+	release := make(chan struct{})
+	entered := make(chan struct{}, 4)
+	f.daemon.opts.SessionShim.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+		entered <- struct{}{}
+		<-release
+		f.mu.Lock()
+		f.terminals = append(f.terminals, evidence)
+		f.mu.Unlock()
+		return nil
+	}
+
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.daemon.reconcileQuarantinedTombstones()
+		}()
+	}
+	select {
+	case <-entered:
+	case <-time.After(10 * time.Second):
+		close(release)
+		wg.Wait()
+		t.Fatal("no reconcile pass reported the tombstone")
+	}
+	close(release)
+	wg.Wait()
+
+	if got := len(f.reported()); got != 1 {
+		t.Fatalf("concurrent reconciles reported the same tombstone %d times, want exactly one", got)
+	}
+	if extra := len(entered); extra != 0 {
+		t.Fatalf("%d additional passes entered the durable handoff for one incarnation", extra)
 	}
 }

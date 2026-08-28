@@ -624,11 +624,18 @@ func holdIncompatible() error {
 	if err := atomicWrite(recordPath, raw, sessionshim.RecordFileMode); err != nil {
 		return err
 	}
-	// No record-removal defer: this lineage withdraws its liveness claim the
-	// way every real one does — PutTombstone publishes the terminal proof and
-	// then removes the exact discovery record, in that order. Deleting the
-	// record on the way out instead would leave a lineage that is merely
-	// unobservable, which is not evidence of anything (§D10).
+	// The record is withdrawn by PutTombstone — proof first, liveness claim
+	// second — so there is no unconditional removal defer here. But every path
+	// that fails BEFORE the terminal publication must still take it back:
+	// leaving a record for a process that is about to exit would publish a
+	// lineage that is merely unobservable, which is not evidence of anything
+	// (§D10) and which the daemon's clear then refuses forever.
+	recordPublished := true
+	defer func() {
+		if recordPublished {
+			_ = registryRoot.Remove(filepath.Base(recordPath))
+		}
+	}()
 	ready := helperState{
 		OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: processEpoch,
 		PID: self.PID, ProcessStartedAt: self.StartedAt,
@@ -659,6 +666,10 @@ func holdIncompatible() error {
 		}
 	}
 	reaped = true
+	// PutTombstone owns the record from here: on success it removes it after
+	// the proof is durable, and on failure it must STAY so the daemon's clear
+	// refuses rather than accepting an unobservable lineage.
+	recordPublished = false
 	return publishHelperTombstone(registry, record, harness, harnessIdentity)
 }
 
@@ -678,6 +689,10 @@ func publishHelperTombstone(
 ) error {
 	state := reapProcessGroup(harness)
 	alive, aliveErr := harnessIdentity.Alive()
+	// Two questions, both asked of the OS: is the recorded LEADER incarnation
+	// gone, and is the process GROUP gone? A leader can be reaped while a
+	// grandchild it forked keeps the group alive, and §D8 promises the group.
+	groupGone := errors.Is(syscall.Kill(-harnessIdentity.PID, 0), syscall.ESRCH)
 	exitCode, signalName := helperTerminalOutcome(state)
 	tombstone := sessionshim.Tombstone{
 		SchemaVersion:    sessionshim.RecordSchemaVersion,
@@ -693,7 +708,7 @@ func publishHelperTombstone(
 		// the final sequence it allocated is zero. That is the measured value,
 		// not a placeholder for one.
 		LastSeq:            0,
-		GroupReaped:        aliveErr == nil && !alive,
+		GroupReaped:        aliveErr == nil && !alive && groupGone,
 		ObservedAtUnixNano: time.Now().UnixNano(),
 	}
 	if err := registry.PutTombstone(tombstone); err != nil {

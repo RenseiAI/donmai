@@ -178,73 +178,6 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 	}
 }
 
-// TestClearedQuarantineDropsOnlyAtCommit is the structural half of the
-// retain-until-confirmed ordering. A cleared lineage leaves the local
-// quarantine projection through exactly one helper, and that helper may be
-// called from exactly one place: the batch commit choke point, after the
-// receipt echoed the cleared section. A new call site would be a path that can
-// forget a lineage the composer still holds — the divergence the cleared
-// section exists to prevent.
-//
-// The acceptance clear used to be the second admissible site. It is not any
-// more: its helper leaves a real terminal tombstone, so that lineage goes
-// through the tombstone lane and never stages an abandonment at all.
-func TestClearedQuarantineDropsOnlyAtCommit(t *testing.T) {
-	t.Parallel()
-	const dropper = "dropSessionShimClearedQuarantinesCommitted"
-	allowed := map[string]bool{
-		"completeSessionShimAdoptionBatch": true,
-	}
-	entries, err := os.ReadDir("./")
-	if err != nil {
-		t.Fatal(err)
-	}
-	callers := 0
-	for _, entry := range entries {
-		name := entry.Name()
-		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
-			continue
-		}
-		fset := token.NewFileSet()
-		file, parseErr := parser.ParseFile(fset, filepath.Join("./", name), nil, 0)
-		if parseErr != nil {
-			t.Fatalf("parse %s: %v", name, parseErr)
-		}
-		for _, decl := range file.Decls {
-			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || fn.Name.Name == dropper {
-				continue
-			}
-			var calls []string
-			ast.Inspect(fn.Body, func(n ast.Node) bool {
-				call, isCall := n.(*ast.CallExpr)
-				if !isCall {
-					return true
-				}
-				switch fun := call.Fun.(type) {
-				case *ast.SelectorExpr:
-					calls = append(calls, fun.Sel.Name)
-				case *ast.Ident:
-					calls = append(calls, fun.Name)
-				}
-				return true
-			})
-			if !contains(calls, dropper) {
-				continue
-			}
-			callers++
-			if !allowed[fn.Name.Name] {
-				t.Errorf("%s: %s drops a cleared quarantine outside the commit choke point — "+
-					"forgetting a lineage before the batch receipt confirms it is what made the "+
-					"next heartbeat disagree with the last committed set", name, fn.Name.Name)
-			}
-		}
-	}
-	if callers != 1 {
-		t.Fatalf("found %d call sites of %s, want exactly the commit choke point — the guard is not watching anything", callers, dropper)
-	}
-}
-
 func contains(haystack []string, needle string) bool {
 	for _, item := range haystack {
 		if item == needle {
@@ -363,6 +296,78 @@ func TestBatchSectionsAreOrderedForTheReceiver(t *testing.T) {
 					i, cur.ProcessEpoch, prev.ProcessEpoch)
 			}
 		}
+	}
+}
+
+// TestBatchOrderingIsEnforcedAtTheCommitChokePoint is the pin the two
+// comparator tests above do NOT provide: they call the sort helpers directly,
+// so replacing the choke point's call with a no-op leaves them green while
+// every real batch ships in Go map order and the receiver refuses it.
+func TestBatchOrderingIsEnforcedAtTheCommitChokePoint(t *testing.T) {
+	t.Parallel()
+	const scope = "org-choke"
+	var mu sync.Mutex
+	var published []SessionShimAdoptionBatch
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		OrgID: scope, HostID: "wh_choke_host",
+		HostIDForOrg: func(context.Context, string) (string, error) { return "wh_choke_host", nil },
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			mu.Lock()
+			published = append(published, cloneSessionShimAdoptionBatch(batch))
+			mu.Unlock()
+			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-1"), AdoptionRevision: "1"}, nil
+		},
+	}})
+	adopted := func(session, shim string, epoch, generation uint64) SessionShimAdoptionOutcome {
+		return SessionShimAdoptionOutcome{Evidence: SessionShimAdoptionEvidence{
+			Identity:     sessionshim.Identity{OrgID: scope, SessionID: session},
+			ShimID:       shim,
+			ProcessEpoch: epoch, ControllerGeneration: generation,
+		}}
+	}
+	terminal := func(session, shim string, epoch uint64) SessionShimTerminalEvidence {
+		return SessionShimTerminalEvidence{
+			Identity: sessionshim.Identity{OrgID: scope, SessionID: session},
+			ShimID:   shim, ProcessEpoch: epoch,
+			Tombstone: sessionshim.Tombstone{
+				SchemaVersion: sessionshim.RecordSchemaVersion,
+				OrgID:         scope, SessionID: session, ShimID: shim, ProcessEpoch: epoch,
+				GroupReaped: true, ObservedAtUnixNano: 1,
+			},
+		}
+	}
+	quarantined := func(session, shim string, epoch uint64) sessionshim.QuarantinedSession {
+		return sessionshim.QuarantinedSession{
+			OrgID: scope, SessionID: session, ShimID: shim, ProcessEpoch: epoch,
+			Reason: sessionshim.QuarantineSocketUnreachable, ConsumesCapacity: true,
+		}
+	}
+	// Every section reversed on its innermost key, exactly what Go map order
+	// produces on a host carrying more than one lineage.
+	batch := SessionShimAdoptionBatch{
+		OrgID: scope, HostID: "wh_choke_host", ExpectedRevision: []byte("0"),
+		Adopted:     []SessionShimAdoptionOutcome{adopted("session-b", "shim-b", 2, 9), adopted("session-a", "shim-a", 1, 1)},
+		Tombstoned:  []SessionShimTerminalEvidence{terminal("session-b", "shim-b", 2), terminal("session-a", "shim-a", 1)},
+		Quarantined: []sessionshim.QuarantinedSession{quarantined("session-b", "shim-b", 2), quarantined("session-a", "shim-a", 1)},
+	}
+	if _, err := d.completeSessionShimAdoptionBatch(context.Background(), batch); err != nil {
+		t.Fatalf("commit: %v", err)
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(published) != 1 {
+		t.Fatalf("published %d batches, want one", len(published))
+	}
+	got := published[0]
+	if len(got.Adopted) != 2 || got.Adopted[0].Evidence.Identity.SessionID != "session-a" {
+		t.Fatalf("adopted section left the choke point unordered: %+v", got.Adopted)
+	}
+	if len(got.Tombstoned) != 2 || got.Tombstoned[0].Identity.SessionID != "session-a" {
+		t.Fatalf("tombstoned section left the choke point unordered: %+v", got.Tombstoned)
+	}
+	if len(got.Quarantined) != 2 || got.Quarantined[0].SessionID != "session-a" {
+		t.Fatalf("quarantined section left the choke point unordered: %+v", got.Quarantined)
 	}
 }
 
