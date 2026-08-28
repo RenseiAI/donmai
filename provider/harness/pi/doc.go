@@ -105,35 +105,38 @@
 // registration THROUGH THE CLOSED TOOL-LIFECYCLE PLAN (ToolPluginDelivery /
 // Caps.SupportsToolPlugins — see manifest.go) now lands: Spec.
 // AdditionalExtensions projects onto agent/tool_adaptation.go's generic
-// tool_plugin channel (legacyToolRequirements), the headless profile's
-// ToolPluginDelivery answers ToolDeliveryPiAdditionalExtension truthfully
-// (manifest.go's ID bumped tool-lifecycle-v1 → v2 per ADR-2026-08-12 D6/
-// D1.3a — the adapter version moves, the family ABI and binary pin do not),
-// and Caps.SupportsToolPlugins now agrees. The ADDITIONAL-EXTENSION DELIVERY
+// tool_plugin channel (legacyToolRequirements), both exact mode profiles'
+// ToolPluginDelivery answer ToolDeliveryPiAdditionalExtension truthfully
+// (the interactive ID moved v2 → v3 when that surface gained independent
+// bare-PTY evidence; per ADR-2026-08-12 D6/D1.3a the adapter version moves,
+// while the family ABI and binary pin do not), and Caps.SupportsToolPlugins
+// now agrees. The ADDITIONAL-EXTENSION DELIVERY
 // SEAM itself (ADR-2026-08-12) shipped separately and gets its own row below
 // — that row proves real registerTool delivery against the pinned binary;
 // this row proves the SAME AdditionalExtensions list is admitted and
 // receipted through the generic cross-harness-compiled plan/receipt path
-// before it ever reaches pi's own materializer, and — on a harness/mode whose
-// profile does not declare the channel — denies closed when the batch carries
-// any required delivery, or drops an all-advisory batch with a receipt and
-// strips it from the adapted Spec (ExtensionDelivery.Required decides;
-// interactive PTY stays Unsupported — no fixture proves tool registration
-// through that lane yet, so it declares the gap per D6 rather than inheriting
-// headless evidence). Generic-path fixtures:
+// before it ever reaches pi's own materializer. Both pi modes now admit it;
+// a harness/mode whose profile does not declare the channel still denies
+// closed when the batch carries any required delivery, or drops an
+// all-advisory batch with a receipt and strips it from the adapted Spec
+// (ExtensionDelivery.Required decides). Generic-path fixtures:
 // agent/tool_adaptation_test.go —
 // TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
-// (positive: headless admits + receipts; negative: interactive denies by
-// name; negative: a malformed batch denies before the requirement loop runs;
+// and TestToolLifecyclePiAdditionalExtensionsAdmitOnInteractiveProfile
+// (positive: both exact pi modes admit + receipt; negative: a malformed batch
+// denies before the requirement loop runs;
 // negative: another harness with AdditionalExtensions populated denies —
 // there is still no cross-harness "supports extensions" boolean, D5.5).
 // pi-package integration fixture: extension_delivery_test.go —
 // TestSpawn_AdditionalExtensions_ProducesToolPluginReceiptEntry (a real
 // Spawn call's ToolLifecycleReceipt names the tool_plugin channel, admitted,
 // with the ToolDeliveryPiAdditionalExtension delivery) and
-// TestSpawn_Interactive_AdditionalExtensionsDeniesBeforePTYWork (the
-// interactive-mode denial fires inside prepare(), before spawnInteractive
-// ever runs). The rest of the original family is proved here:
+// TestSpawn_Interactive_AdditionalExtensionRealBarePTYRegistersAndExecutesTool
+// (bare pi under the real PTY driver exposes the registered name, executes one
+// safe call, returns its tool receipt, and retains the local policy/env
+// boundaries). Malformed and duplicate deliveries still deny before PTY in
+// TestSpawn_Interactive_InvalidAdditionalExtensionsFailBeforePTY. The rest of
+// the original family is proved here:
 //
 //   - RPC policy-handshake boundary (positive + tampered/forged negatives):
 //     handle_test.go — TestSpawn_HandshakeVerified,
@@ -252,11 +255,13 @@
 //
 // # Interactive allowed/disallowed-tools channel (local, no RPC)
 //
-// One exception to "the interactive profile only ever declares gaps" above:
-// NativeToolPolicyDelivery is REAL on the interactive profile
+// The interactive profile has two narrow, independently evidenced non-gap
+// declarations. ToolPluginDelivery uses the same explicit -e registration
+// mechanism as headless. NativeToolPolicyDelivery is also REAL
 // (agent.ToolDeliveryPiInteractiveLocalToolPolicy, manifest.go's
-// pi/interactive/tool-lifecycle-v2 — bumped from v1 per the seam ADR's
-// adapter-version rule, ADR-2026-08-12 D1.3a/D6). The SAME embedded extension
+// pi/interactive/tool-lifecycle-v3; v2 introduced this local channel and v3
+// added tool-plugin delivery per the adapter-version rule,
+// ADR-2026-08-12 D1.3a/D6). The SAME embedded extension
 // this lane loads also matches a stamped Spec.AllowedTools/DisallowedTools
 // list LOCALLY against every guarded tool_call, entirely in-process, with no
 // RPC and no handshake (extensions/donmai-policy.ts's !rpcMode branch).
