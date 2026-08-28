@@ -4,9 +4,11 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
+	"strconv"
 	"strings"
 	"time"
 
@@ -449,9 +451,6 @@ type ghPullRequestView struct {
 	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
 	HeadRefName string `json:"headRefName"`
-	Repository  struct {
-		NameWithOwner string `json:"nameWithOwner"`
-	} `json:"repository"`
 }
 
 // lookupGitHubPullRequest reads the complete PR projection after gh created
@@ -465,7 +464,7 @@ func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, al
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
-		"--json", "number,url,baseRefName,headRefName,repository")
+		"--json", "number,url,baseRefName,headRefName")
 	if err != nil {
 		return nil
 	}
@@ -477,8 +476,12 @@ func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, al
 }
 
 func pullRequestFactFromGitHubView(view ghPullRequestView) *agent.PullRequestFact {
+	repository, number, err := parseCanonicalGitHubPullRequestURL(view.URL)
+	if err != nil || number != view.Number {
+		return nil
+	}
 	fact := &agent.PullRequestFact{
-		Provider: "github", Number: view.Number, Repository: view.Repository.NameWithOwner,
+		Provider: "github", Number: view.Number, Repository: repository,
 		URL: view.URL, BaseBranch: view.BaseRefName, HeadBranch: view.HeadRefName,
 	}
 	if err := agent.ValidatePullRequestFact(*fact); err != nil {
@@ -529,6 +532,37 @@ func normalizeGitHubRepositorySlug(repository string) string {
 		return ""
 	}
 	return strings.ToLower(parts[0] + "/" + parts[1])
+}
+
+func parseCanonicalGitHubPullRequestURL(raw string) (string, int, error) {
+	parsed, err := url.Parse(strings.TrimSpace(raw))
+	if err != nil {
+		return "", 0, fmt.Errorf("parse GitHub pull request URL: %w", err)
+	}
+	if parsed.Scheme != "https" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must use https")
+	}
+	if parsed.User != nil {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include userinfo")
+	}
+	if !strings.EqualFold(parsed.Hostname(), "github.com") || parsed.Hostname() == "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must target github.com")
+	}
+	if parsed.Port() != "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include a port")
+	}
+	if parsed.RawQuery != "" || parsed.Fragment != "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must not include query or fragment")
+	}
+	parts := strings.Split(parsed.EscapedPath(), "/")
+	if len(parts) != 5 || parts[0] != "" || parts[1] == "" || parts[2] == "" || parts[3] != "pull" || parts[4] == "" {
+		return "", 0, fmt.Errorf("GitHub pull request URL must match /<owner>/<repo>/pull/<number>")
+	}
+	number, err := strconv.Atoi(parts[4])
+	if err != nil || number <= 0 {
+		return "", 0, fmt.Errorf("GitHub pull request URL must end with a positive pull request number")
+	}
+	return parts[1] + "/" + parts[2], number, nil
 }
 
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
