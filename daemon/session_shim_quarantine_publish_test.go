@@ -181,17 +181,19 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 // TestClearedQuarantineDropsOnlyAtCommit is the structural half of the
 // retain-until-confirmed ordering. A cleared lineage leaves the local
 // quarantine projection through exactly one helper, and that helper may be
-// called from exactly two places: the batch commit choke point (after the
-// receipt echoed the cleared section) and the standalone branch of the
-// acceptance clear (no composer, so the local drop IS the commit). A new call
-// site would be a path that can forget a lineage the composer still holds —
-// the divergence the cleared section exists to prevent.
+// called from exactly one place: the batch commit choke point, after the
+// receipt echoed the cleared section. A new call site would be a path that can
+// forget a lineage the composer still holds — the divergence the cleared
+// section exists to prevent.
+//
+// The acceptance clear used to be the second admissible site. It is not any
+// more: its helper leaves a real terminal tombstone, so that lineage goes
+// through the tombstone lane and never stages an abandonment at all.
 func TestClearedQuarantineDropsOnlyAtCommit(t *testing.T) {
 	t.Parallel()
 	const dropper = "dropSessionShimClearedQuarantinesCommitted"
 	allowed := map[string]bool{
-		"completeSessionShimAdoptionBatch":     true,
-		"clearSessionShimAcceptanceQuarantine": true,
+		"completeSessionShimAdoptionBatch": true,
 	}
 	entries, err := os.ReadDir("./")
 	if err != nil {
@@ -238,8 +240,8 @@ func TestClearedQuarantineDropsOnlyAtCommit(t *testing.T) {
 			}
 		}
 	}
-	if callers < 2 {
-		t.Fatalf("found %d call sites of %s, want both admissible ones — the guard is not watching anything", callers, dropper)
+	if callers != 1 {
+		t.Fatalf("found %d call sites of %s, want exactly the commit choke point — the guard is not watching anything", callers, dropper)
 	}
 }
 
@@ -304,6 +306,61 @@ func TestAdoptedBatchOrderMatchesTheReceiverComparator(t *testing.T) {
 				t.Fatalf("entry %d: controller generation out of order (%d after %d) — "+
 					"the receiver refuses a batch whose rows are not in its order",
 					i, cur.ControllerGeneration, prev.ControllerGeneration)
+			}
+		}
+	}
+}
+
+// TestBatchSectionsAreOrderedForTheReceiver extends the same pin to the whole
+// batch. The receiver checks the order of ALL FOUR sections and refuses one
+// that disagrees, and the tombstoned section was ordered by nothing but append
+// order — invisible while a host only ever carried one tombstone, and a refused
+// batch the moment one lifecycle identity had two terminal incarnations, which
+// is exactly what an acceptance quarantine plus its session's own end produce.
+func TestBatchSectionsAreOrderedForTheReceiver(t *testing.T) {
+	t.Parallel()
+	terminal := func(org, session, shim string, epoch uint64) SessionShimTerminalEvidence {
+		return SessionShimTerminalEvidence{
+			Identity: sessionshim.Identity{OrgID: org, SessionID: session},
+			ShimID:   shim, ProcessEpoch: epoch,
+			Tombstone: sessionshim.Tombstone{
+				SchemaVersion: sessionshim.RecordSchemaVersion,
+				OrgID:         org, SessionID: session, ShimID: shim, ProcessEpoch: epoch,
+				GroupReaped: true, ObservedAtUnixNano: 1,
+			},
+		}
+	}
+	// Deliberately reversed on every key, innermost first.
+	batch := SessionShimAdoptionBatch{Tombstoned: []SessionShimTerminalEvidence{
+		terminal("org-b", "session-a", "shim-a", 1),
+		terminal("org-a", "session-a", "shim-a", 9),
+		terminal("org-a", "session-a", "shim-0", 1),
+		terminal("org-a", "session-0", "shim-a", 1),
+	}}
+	sortSessionShimAdoptionBatch(&batch)
+
+	// The receiver's comparator, transcribed from the platform's
+	// compareBatchCorrelation: org, session, shim, processEpoch.
+	for i := 1; i < len(batch.Tombstoned); i++ {
+		prev, cur := batch.Tombstoned[i-1], batch.Tombstoned[i]
+		switch {
+		case prev.Identity.OrgID != cur.Identity.OrgID:
+			if prev.Identity.OrgID > cur.Identity.OrgID {
+				t.Fatalf("entry %d: org out of order (%q after %q)", i, cur.Identity.OrgID, prev.Identity.OrgID)
+			}
+		case prev.Identity.SessionID != cur.Identity.SessionID:
+			if prev.Identity.SessionID > cur.Identity.SessionID {
+				t.Fatalf("entry %d: session out of order (%q after %q)", i, cur.Identity.SessionID, prev.Identity.SessionID)
+			}
+		case prev.ShimID != cur.ShimID:
+			if prev.ShimID > cur.ShimID {
+				t.Fatalf("entry %d: shim out of order (%q after %q)", i, cur.ShimID, prev.ShimID)
+			}
+		default:
+			if prev.ProcessEpoch > cur.ProcessEpoch {
+				t.Fatalf("entry %d: process epoch out of order (%d after %d) — "+
+					"the receiver refuses a batch whose rows are not in its order",
+					i, cur.ProcessEpoch, prev.ProcessEpoch)
 			}
 		}
 	}

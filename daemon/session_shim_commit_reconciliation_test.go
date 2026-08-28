@@ -105,6 +105,10 @@ func newReconciliationFixture(ctx context.Context, t *testing.T) (*compositionHa
 // stageReconciliationQuarantine plants one quarantined lineage plus the
 // acceptance bookkeeping a later clear needs (a recorded process identity
 // provably not running, and no registry record).
+//
+// No tombstone yet: the acceptance helper publishes its terminal proof on the
+// way out, so the lineage is live-and-quarantined until
+// publishReconciliationTombstone runs.
 func stageReconciliationQuarantine(t *testing.T, d *Daemon, orgID string) shimIncarnation {
 	t.Helper()
 	id := sessionshim.Identity{OrgID: orgID, SessionID: "session-reconcile"}
@@ -121,6 +125,26 @@ func stageReconciliationQuarantine(t *testing.T, d *Daemon, orgID string) shimIn
 	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: os.Getpid(), StartedAt: 1}
 	d.shims.mu.Unlock()
 	return incarnation
+}
+
+// publishReconciliationTombstone writes the group-reaped tombstone the
+// acceptance helper leaves behind when it reaps its own harness process group.
+func publishReconciliationTombstone(t *testing.T, d *Daemon, incarnation shimIncarnation) {
+	t.Helper()
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	if err := registry.PutTombstone(sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         incarnation.identity.OrgID, SessionID: incarnation.identity.SessionID,
+		ShimID: incarnation.shimID, ProcessEpoch: incarnation.processEpoch,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		ExitCode: 143, Signal: "SIGTERM",
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
@@ -206,13 +230,15 @@ func TestAmbiguousArmCommitReconcilesToTheCommittedRevision(t *testing.T) {
 		h.setHeartbeatRequireRevision("revision-4")
 		return confirmedReceipt(batch, "revision-4"), nil
 	})
+	publishReconciliationTombstone(t, d, incarnation)
 	if err := d.clearSessionShimAcceptanceQuarantine(incarnation); err != nil {
 		t.Fatalf("clear after reconciliation: %v", err)
 	}
 	clearBatch := f.lastBatch(t)
-	if len(clearBatch.Cleared) != 1 || len(clearBatch.Quarantined) != 0 {
-		t.Fatalf("post-reconciliation clear published %d cleared / %d quarantined, want the abandoned disposition",
-			len(clearBatch.Cleared), len(clearBatch.Quarantined))
+	if len(clearBatch.Tombstoned) != 1 || len(clearBatch.Quarantined) != 0 || len(clearBatch.Cleared) != 0 {
+		t.Fatalf("post-reconciliation clear published %d tombstoned / %d quarantined / %d cleared, want the "+
+			"lineage leaving through its terminal tombstone",
+			len(clearBatch.Tombstoned), len(clearBatch.Quarantined), len(clearBatch.Cleared))
 	}
 	if remaining := d.QuarantinedSessions(); len(remaining) != 0 {
 		t.Fatalf("confirmed clear left %d lineages projected", len(remaining))
@@ -309,6 +335,10 @@ func TestRefusedBatchCommitKeepsTodaysBehavior(t *testing.T) {
 // reconciliation republish carries it in the cleared section again, and it
 // drops only on the confirmed exact echo — unchanged from the disposition
 // contract.
+//
+// The disposition is staged directly here. It is retained machinery with a
+// deployed receiver half, but nothing in the daemon produces it any more: the
+// acceptance clear it was written for now leaves through a real tombstone.
 func TestStagedClearedEntrySurvivesReconciliation(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -330,8 +360,9 @@ func TestStagedClearedEntrySurvivesReconciliation(t *testing.T) {
 		return SessionShimAdoptionBatchReceipt{}, transportLostCommitAnswer()
 	})
 
-	if err := d.clearSessionShimAcceptanceQuarantine(incarnation); err == nil {
-		t.Fatal("a clear whose commit answer was lost reported success")
+	stageClearedDisposition(t, d, incarnation)
+	if err := d.republishSessionShimProjection(ctx, h.orgID); err == nil {
+		t.Fatal("a cleared publish whose commit answer was lost reported success")
 	}
 
 	select {

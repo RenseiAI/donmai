@@ -25,6 +25,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -37,6 +38,16 @@ const (
 	controlPrefix = "/api/daemon/session-shim/acceptance/"
 	stateSchema   = 1
 	maxBody       = 2 << 20
+	// helperHarnessLifetime outlives any acceptance run, so the harness is
+	// always reaped by this helper rather than expiring on its own — a child
+	// that exited by itself would prove nothing about the reap.
+	helperHarnessLifetime = "600"
+	// helperTerminationGrace is the SIGTERM→SIGKILL window, matching the shim's
+	// own bounded teardown shape.
+	helperTerminationGrace = 2 * time.Second
+	// helperTombstoneMarker names this helper's terminal publication. It is the
+	// provenance string a build can be grepped for.
+	helperTombstoneMarker = "acceptance helper tombstone written"
 )
 
 type config struct {
@@ -62,6 +73,7 @@ type helperState struct {
 	PID              int    `json:"pid"`
 	ProcessStartedAt int64  `json:"processStartedAt"`
 	HarnessPID       int    `json:"harnessPid"`
+	HarnessStartedAt int64  `json:"harnessStartedAt"`
 	RecordPath       string `json:"recordPath"`
 	SocketPath       string `json:"socketPath"`
 	StopPath         string `json:"stopPath"`
@@ -340,6 +352,10 @@ func (c config) quarantineClear(sessionID string) error {
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
+	// The withdrawn record is also the tombstone's receipt: PutTombstone
+	// publishes the terminal proof and only THEN removes the exact discovery
+	// record, so a helper whose record is gone has already left its evidence
+	// behind for the daemon's clear to reconcile.
 	if err := waitFor(ctx, 50*time.Millisecond, func() error {
 		if processAlive(helper.PID) || pathExists(helper.RecordPath) || pathExists(helper.SocketPath) {
 			return errors.New("incompatible helper remains live")
@@ -545,12 +561,26 @@ func holdIncompatible() error {
 	if err := registryRoot.Chmod(socketName, 0o600); err != nil {
 		return err
 	}
-	harness := exec.Command("sleep", "600")
+	harness := exec.Command("sleep", helperHarnessLifetime)
 	harness.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
 	if err := harness.Start(); err != nil {
 		return err
 	}
-	defer stopProcessGroup(harness)
+	// Pin the harness NOW, while it is running. The tombstone this helper must
+	// leave behind names WHICH process was reaped, and a start time is
+	// unreadable once the process is gone — a tombstone written from a bare pid
+	// could not tell "this group is gone" from "a new process reused the pid".
+	harnessIdentity, identityErr := sessionshim.ProcessIdentityFor(harness.Process.Pid)
+	if identityErr != nil {
+		reapProcessGroup(harness)
+		return fmt.Errorf("incompatible helper: pin harness process identity: %w", identityErr)
+	}
+	reaped := false
+	defer func() {
+		if !reaped {
+			reapProcessGroup(harness)
+		}
+	}()
 	self, err := sessionshim.Self()
 	if err != nil {
 		return err
@@ -594,10 +624,15 @@ func holdIncompatible() error {
 	if err := atomicWrite(recordPath, raw, sessionshim.RecordFileMode); err != nil {
 		return err
 	}
-	defer func() { _ = registryRoot.Remove(filepath.Base(recordPath)) }()
+	// No record-removal defer: this lineage withdraws its liveness claim the
+	// way every real one does — PutTombstone publishes the terminal proof and
+	// then removes the exact discovery record, in that order. Deleting the
+	// record on the way out instead would leave a lineage that is merely
+	// unobservable, which is not evidence of anything (§D10).
 	ready := helperState{
 		OrgID: orgID, SessionID: sessionID, ShimID: shimID, ProcessEpoch: processEpoch,
-		PID: self.PID, ProcessStartedAt: self.StartedAt, HarnessPID: harness.Process.Pid,
+		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		HarnessPID: harnessIdentity.PID, HarnessStartedAt: harnessIdentity.StartedAt,
 		RecordPath: recordPath, SocketPath: socketPath, StopPath: stopPath,
 	}
 	readyRaw, _ := json.Marshal(ready)
@@ -611,32 +646,100 @@ func holdIncompatible() error {
 	defer signal.Stop(sig)
 	ticker := time.NewTicker(50 * time.Millisecond)
 	defer ticker.Stop()
-	for {
+	held := true
+	for held {
 		select {
 		case <-sig:
-			return nil
+			held = false
 		case <-ticker.C:
 			if _, err := stateRoot.Lstat(filepath.Base(stopPath)); err == nil {
 				_ = stateRoot.Remove(filepath.Base(stopPath))
-				return nil
+				held = false
 			}
 		}
 	}
+	reaped = true
+	return publishHelperTombstone(registry, record, harness, harnessIdentity)
 }
 
-func stopProcessGroup(cmd *exec.Cmd) {
+// publishHelperTombstone runs the terminal half of this lineage: reap the
+// harness process GROUP, ask the OS whether the exact recorded incarnation is
+// really gone, and durably publish what was observed.
+//
+// Every field is measured. GroupReaped in particular is the answer to a live
+// liveness probe and never a constant: a tombstone that claims a reap it did
+// not verify is worse than no tombstone at all, because §D10 lets a proven one
+// release a claim.
+func publishHelperTombstone(
+	registry *sessionshim.Registry,
+	record sessionshim.Record,
+	harness *exec.Cmd,
+	harnessIdentity sessionshim.ProcessIdentity,
+) error {
+	state := reapProcessGroup(harness)
+	alive, aliveErr := harnessIdentity.Alive()
+	exitCode, signalName := helperTerminalOutcome(state)
+	tombstone := sessionshim.Tombstone{
+		SchemaVersion:    sessionshim.RecordSchemaVersion,
+		OrgID:            record.OrgID,
+		SessionID:        record.SessionID,
+		ShimID:           record.ShimID,
+		ProcessEpoch:     record.ProcessEpoch,
+		HarnessPID:       harnessIdentity.PID,
+		HarnessStartedAt: harnessIdentity.StartedAt,
+		ExitCode:         exitCode,
+		Signal:           signalName,
+		// This lineage owns no PTY and allocates no host output sequence, so
+		// the final sequence it allocated is zero. That is the measured value,
+		// not a placeholder for one.
+		LastSeq:            0,
+		GroupReaped:        aliveErr == nil && !alive,
+		ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(tombstone); err != nil {
+		return fmt.Errorf("incompatible helper: publish terminal tombstone: %w", err)
+	}
+	_, _ = fmt.Fprintf(os.Stderr, "%s: session=%s shim=%s harnessPid=%d groupReaped=%t\n",
+		helperTombstoneMarker, record.SessionID, record.ShimID, tombstone.HarnessPID, tombstone.GroupReaped)
+	return nil
+}
+
+// helperTerminalOutcome renders a collected child's wait status in the §12.2
+// vocabulary the product's own Exit payload uses: signal death carries the
+// signal name and exitCode = 128 + signum.
+func helperTerminalOutcome(state *os.ProcessState) (uint64, string) {
+	if state == nil {
+		return 0, ""
+	}
+	if status, ok := state.Sys().(syscall.WaitStatus); ok && status.Signaled() {
+		signum := int(status.Signal())
+		return attachwire.ExitCodeForSignal(signum), attachwire.SignalName(signum)
+	}
+	code := state.ExitCode()
+	if code < 0 {
+		return 0, ""
+	}
+	return uint64(code), ""
+}
+
+// reapProcessGroup runs the bounded teardown a shim runs on its own harness:
+// SIGTERM to the process GROUP, a grace window, then SIGKILL — and a wait that
+// actually collects the child, so the caller's liveness probe is answering
+// about a reaped process rather than a zombie.
+func reapProcessGroup(cmd *exec.Cmd) *os.ProcessState {
 	if cmd == nil || cmd.Process == nil {
-		return
+		return nil
 	}
 	_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	done := make(chan struct{})
 	go func() { _ = cmd.Wait(); close(done) }()
 	select {
 	case <-done:
-	case <-time.After(2 * time.Second):
+	case <-time.After(helperTerminationGrace):
 		_ = syscall.Kill(-cmd.Process.Pid, syscall.SIGKILL)
 		<-done
 	}
+	return cmd.ProcessState
 }
 
 func setServiceEnvironment(name, value string) error {

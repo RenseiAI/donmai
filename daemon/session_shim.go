@@ -1679,7 +1679,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 					batch.Tombstoned = append(batch.Tombstoned, terminal)
 				}
 			}
-			sessionshim.SortQuarantined(batch.Quarantined)
 			receipt, batchErr := d.completeSessionShimAdoptionBatch(ctx, batch)
 			if batchErr != nil {
 				result.Close()
@@ -2311,6 +2310,12 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	if cfg.OnAdoptionBatch == nil {
 		return SessionShimAdoptionBatchReceipt{}, nil
 	}
+	// Order every section at the one place every batch passes through. The
+	// receiver re-checks the order of ALL FOUR and refuses a batch that
+	// disagrees, so leaving it to each assembling caller means whichever one
+	// forgets ships an unpublishable batch — which is what happened to the
+	// tombstoned section, ordered by nothing but append order until now.
+	sortSessionShimAdoptionBatch(&batch)
 	if cfg.PrepareAdoptionBatch != nil {
 		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 		expected, err := cfg.PrepareAdoptionBatch(callbackCtx, batch.OrgID, batch.HostID)
@@ -2503,9 +2508,6 @@ func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID strin
 		return fmt.Errorf("session shim: resolve host authority for republish: %w", err)
 	}
 	batch := d.sessionShimProjectionBatch(orgID, hostID)
-	sortSessionShimAdoptionOutcomes(batch.Adopted)
-	sessionshim.SortQuarantined(batch.Quarantined)
-	sortSessionShimClearedQuarantines(batch.Cleared)
 	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
 	if err != nil {
 		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
@@ -2567,6 +2569,34 @@ func sortSessionShimAdoptionOutcomes(in []SessionShimAdoptionOutcome) {
 	})
 }
 
+// sortSessionShimAdoptionBatch puts every section of one batch in the exact
+// order the receiver's comparator defines.
+func sortSessionShimAdoptionBatch(batch *SessionShimAdoptionBatch) {
+	sortSessionShimAdoptionOutcomes(batch.Adopted)
+	sessionshim.SortQuarantined(batch.Quarantined)
+	sortSessionShimTerminalEvidence(batch.Tombstoned)
+	sortSessionShimClearedQuarantines(batch.Cleared)
+}
+
+// sortSessionShimTerminalEvidence orders a batch's tombstoned set by the same
+// tuple as every other section. A terminal entry carries no controller
+// generation, so the lineage correlation is the whole key.
+func sortSessionShimTerminalEvidence(in []SessionShimTerminalEvidence) {
+	sort.Slice(in, func(i, j int) bool {
+		a, b := in[i], in[j]
+		if a.Identity.OrgID != b.Identity.OrgID {
+			return a.Identity.OrgID < b.Identity.OrgID
+		}
+		if a.Identity.SessionID != b.Identity.SessionID {
+			return a.Identity.SessionID < b.Identity.SessionID
+		}
+		if a.ShimID != b.ShimID {
+			return a.ShimID < b.ShimID
+		}
+		return a.ProcessEpoch < b.ProcessEpoch
+	})
+}
+
 func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 	ctx context.Context,
 	evidence SessionShimAdoptionEvidence,
@@ -2588,9 +2618,6 @@ func (d *Daemon) completeLaunchedSessionShimAdoptionBatch(
 			Reason:               sessionShimCarrierQuarantineReason(evidence.CarrierIncompatibility), ConsumesCapacity: true,
 		})
 	}
-	sortSessionShimAdoptionOutcomes(batch.Adopted)
-	sessionshim.SortQuarantined(batch.Quarantined)
-	sortSessionShimClearedQuarantines(batch.Cleared)
 	return d.completeSessionShimAdoptionBatch(ctx, batch)
 }
 

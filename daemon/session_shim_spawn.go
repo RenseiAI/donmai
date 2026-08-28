@@ -1165,16 +1165,28 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		d.shims.mu.Lock()
 		removed := false
 		kept := d.shims.quarantined[:0]
+		remainingForIdentity := false
 		for _, current := range d.shims.quarantined {
 			if current.Identity() == id && current.ShimID == tombstone.ShimID && current.ProcessEpoch == tombstone.ProcessEpoch {
 				removed = true
 				continue
 			}
+			if current.Identity() == id {
+				remainingForIdentity = true
+			}
 			kept = append(kept, current)
 		}
 		d.shims.quarantined = kept
 		if removed {
-			delete(d.shims.forwarded, id)
+			// forwarded is keyed by LIFECYCLE IDENTITY, not by incarnation, and
+			// one identity can hold a quarantined lineage and a live adopted one
+			// at the same time (§D7's duplicate-identity case). Dropping the
+			// durable high-water because a SIBLING incarnation terminalized
+			// would regress the surviving session's fence correlation to zero.
+			_, stillAdopted := d.shims.adopted[id]
+			if !stillAdopted && !remainingForIdentity {
+				delete(d.shims.forwarded, id)
+			}
 			delete(d.shims.correlations, key)
 			alreadyRecorded := false
 			for _, existing := range d.shims.tombstoned {

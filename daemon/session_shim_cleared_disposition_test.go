@@ -2,10 +2,16 @@ package daemon
 
 // Provenance: cleared-disposition-acceptance-clear-2026-08-27 — grep for this
 // marker to prove a build carries the explicit abandoned-disposition clear.
+//
+// The cleared section is the daemon's way of saying "I no longer carry this
+// lineage and I cannot prove how it ended". It is RETAINED here — the wire
+// contract and the composer's half of it are deployed — but it is no longer
+// how the acceptance clear leaves: an acceptance helper now publishes a real
+// terminal tombstone and leaves through the production reconcile. See
+// session_shim_acceptance_clear_test.go.
 
 import (
 	"context"
-	"os"
 	"strings"
 	"sync"
 	"testing"
@@ -14,7 +20,9 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
-func newAcceptanceClearedFixture(t *testing.T, onBatch func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error)) (*Daemon, sessionshim.Identity, shimIncarnation) {
+// newStagedClearedFixture plants one quarantined lineage plus the staged
+// abandoned disposition a publish is expected to carry.
+func newStagedClearedFixture(t *testing.T, onBatch func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error)) (*Daemon, sessionshim.Identity, shimIncarnation) {
 	t.Helper()
 	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
 		RegistryDir:     t.TempDir(),
@@ -32,27 +40,52 @@ func newAcceptanceClearedFixture(t *testing.T, onBatch func(context.Context, Ses
 	incarnation := shimIncarnation{identity: id, shimID: "shim-cleared", processEpoch: 9}
 	d.shims.mu.Lock()
 	d.upsertShimQuarantineLocked(q)
-	// Our own pid with a deliberately wrong start time: Alive() reports the
-	// recorded process as gone without depending on some pid being free.
-	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: os.Getpid(), StartedAt: 1}
 	d.shims.mu.Unlock()
+	stageClearedDisposition(t, d, incarnation)
 	return d, id, incarnation
 }
 
-// An acceptance clear must not make the next complete batch simply OMIT the
+// stageClearedDisposition stages the explicit abandoned disposition for one
+// quarantined lineage. It is the retained cleared-section machinery driven
+// directly: the acceptance clear that used to produce these entries now leaves
+// through a real terminal tombstone instead.
+func stageClearedDisposition(t *testing.T, d *Daemon, incarnation shimIncarnation) {
+	t.Helper()
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	for _, q := range d.shims.quarantined {
+		if q.Identity() != incarnation.identity || q.ShimID != incarnation.shimID || q.ProcessEpoch != incarnation.processEpoch {
+			continue
+		}
+		entry := SessionShimClearedQuarantine{
+			OrgID: q.OrgID, SessionID: q.SessionID, ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
+			ControllerGeneration: q.ControllerGeneration,
+			Disposition:          SessionShimDispositionAbandoned,
+			Reason:               SessionShimClearedReasonAcceptanceClearWithoutTerminalEvidence,
+		}
+		if err := entry.Validate(); err != nil {
+			t.Fatalf("staged cleared entry: %v", err)
+		}
+		d.shims.pendingCleared[incarnation] = entry
+		return
+	}
+	t.Fatalf("no quarantined lineage matches %+v", incarnation)
+}
+
+// A staged abandonment must not make the next complete batch simply OMIT the
 // lineage — a composer that still holds an active recovery obligation refuses
 // an incomplete batch, and the host then argues with the control plane until it
-// is demoted to draining. The clear instead publishes the lineage in the
+// is demoted to draining. The publish instead carries the lineage in the
 // batch's cleared section with the explicit abandoned disposition, keeps
-// projecting it quarantined on the heartbeat while the commit is in flight, and
-// forgets it locally only once the batch receipt echoes it back.
-func TestAcceptanceClearPublishesAbandonedDisposition(t *testing.T) {
+// projecting it quarantined while the commit is in flight, and forgets it
+// locally only once the batch receipt echoes it back.
+func TestStagedClearedDispositionPublishesAndDropsAtCommit(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var published []SessionShimAdoptionBatch
 	var projectedDuringCommit []sessionshim.QuarantinedSession
 	var d *Daemon
-	d, id, incarnation := newAcceptanceClearedFixture(t,
+	d, id, incarnation := newStagedClearedFixture(t,
 		func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 			mu.Lock()
 			published = append(published, cloneSessionShimAdoptionBatch(batch))
@@ -67,8 +100,8 @@ func TestAcceptanceClearPublishesAbandonedDisposition(t *testing.T) {
 			}, nil
 		})
 
-	if err := d.clearSessionShimAcceptanceQuarantine(incarnation); err != nil {
-		t.Fatalf("clear: %v", err)
+	if err := d.republishSessionShimProjection(context.Background(), id.OrgID); err != nil {
+		t.Fatalf("publish: %v", err)
 	}
 
 	mu.Lock()
@@ -94,7 +127,7 @@ func TestAcceptanceClearPublishesAbandonedDisposition(t *testing.T) {
 		t.Fatalf("cleared lineage still occupies the quarantined section: %+v", batch.Quarantined)
 	}
 	if len(batch.Tombstoned) != 0 {
-		t.Fatalf("acceptance clear manufactured terminal evidence: %+v", batch.Tombstoned)
+		t.Fatalf("cleared publish manufactured terminal evidence: %+v", batch.Tombstoned)
 	}
 	if len(projectedDuringCommit) != 1 {
 		t.Fatalf("beat projection during the in-flight commit had %d quarantined entries, want 1 — "+
@@ -105,10 +138,10 @@ func TestAcceptanceClearPublishesAbandonedDisposition(t *testing.T) {
 		t.Fatalf("confirmed clear left %d entries projected quarantined", len(after))
 	}
 	d.shims.mu.RLock()
-	_, stillArmed := d.shims.acceptanceQuarantine[incarnation]
+	_, stillStaged := d.shims.pendingCleared[incarnation]
 	d.shims.mu.RUnlock()
-	if stillArmed {
-		t.Fatal("confirmed clear left the acceptance bookkeeping armed")
+	if stillStaged {
+		t.Fatal("confirmed clear left the abandonment staged")
 	}
 }
 
@@ -121,7 +154,7 @@ func TestClearedReceiptEchoRefusalRetainsTheQuarantine(t *testing.T) {
 	t.Parallel()
 	var mu sync.Mutex
 	var published []SessionShimAdoptionBatch
-	d, id, incarnation := newAcceptanceClearedFixture(t,
+	d, id, incarnation := newStagedClearedFixture(t,
 		func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 			mu.Lock()
 			published = append(published, cloneSessionShimAdoptionBatch(batch))
@@ -131,19 +164,19 @@ func TestClearedReceiptEchoRefusalRetainsTheQuarantine(t *testing.T) {
 			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-2"), AdoptionRevision: "2"}, nil
 		})
 
-	err := d.clearSessionShimAcceptanceQuarantine(incarnation)
+	err := d.republishSessionShimProjection(context.Background(), id.OrgID)
 	if err == nil || !strings.Contains(err.Error(), "cleared") {
-		t.Fatalf("clear err = %v, want a refusal naming the missing cleared echo", err)
+		t.Fatalf("publish err = %v, want a refusal naming the missing cleared echo", err)
 	}
 
 	if beat := d.QuarantinedSessions(); len(beat) != 1 {
 		t.Fatalf("refused echo left %d entries projected, want the lineage retained", len(beat))
 	}
 	d.shims.mu.RLock()
-	_, stillArmed := d.shims.acceptanceQuarantine[incarnation]
+	_, stillStaged := d.shims.pendingCleared[incarnation]
 	d.shims.mu.RUnlock()
-	if !stillArmed {
-		t.Fatal("refused echo dropped the acceptance bookkeeping")
+	if !stillStaged {
+		t.Fatal("refused echo dropped the staged abandonment")
 	}
 
 	// The staged abandonment survives: a later projection publish still carries

@@ -6,6 +6,37 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **A quarantined session-shim lineage that ends now leaves through its own
+  terminal evidence, and the daemon publishes the projection change that
+  removal makes.** The installed-artifact acceptance seam's helper is a real
+  mini-shim lineage: it owns a real child process group, reaps that group on
+  the way out, verifies the exact recorded incarnation is gone, and publishes a
+  real terminal tombstone before withdrawing its discovery record. Clearing
+  that quarantine therefore routes through the ordinary tombstone reconcile —
+  the lineage is reported as `shim_terminal_tombstone` terminal evidence and
+  the recovery obligation resolves — instead of staging an `abandoned`
+  disposition. An abandoned obligation is a shim-absent attestation: it closes
+  what the daemon owes the composer and never what the session owes the fence,
+  so a lineage cleared that way held its session's release predicate forever
+  and that session could never terminalize. The cleared-disposition machinery
+  is retained for composers that use it; nothing in the daemon produces it now.
+- **Tombstone reconciliation no longer drops sibling state or publishes
+  nothing.** Withdrawing one terminalized incarnation kept the durable
+  forwarded high-water of any lineage that still shares its lifecycle identity
+  — previously the whole identity's high-water went with the sibling, and a
+  surviving session's fence correlation regressed to zero. The reconcile also
+  republishes the complete projection for every organization whose quarantine
+  set it changed, because a heartbeat that disagrees with the last committed
+  batch demotes the host to draining.
+- **Every adoption-batch section is ordered at the one place every batch passes
+  through.** The tombstoned section was ordered by nothing but append order,
+  which the receiver refuses as soon as one lifecycle identity has two terminal
+  incarnations.
+
 ## v0.72.2 — 2026-08-28
 
 ### Fixes

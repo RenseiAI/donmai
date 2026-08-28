@@ -34,6 +34,43 @@ func ExitCodeForSignal(signum int) uint64 {
 	return uint64(ExitSignalBase + signum) //nolint:gosec // G115: signum is a POSIX signal number (1-64), so 128+signum is always positive and well under MaxInt64
 }
 
+// SignalName maps a POSIX signal number to the conventional name the §12.2
+// Exit payload carries ("SIGTERM" rather than the Go runtime's "terminated"),
+// or "" for zero and for a signal outside the mapped set.
+//
+// It lives here, beside the exit-code convention it pairs with, so that every
+// producer of an Exit payload or a terminal tombstone spells one signal the
+// same way. Taking an int rather than a syscall.Signal keeps the package
+// buildable everywhere the wire types are.
+func SignalName(signum int) string {
+	switch signum {
+	case 1:
+		return "SIGHUP"
+	case 2:
+		return "SIGINT"
+	case 3:
+		return "SIGQUIT"
+	case 4:
+		return "SIGILL"
+	case 6:
+		return "SIGABRT"
+	case 8:
+		return "SIGFPE"
+	case 9:
+		return "SIGKILL"
+	case 11:
+		return "SIGSEGV"
+	case 13:
+		return "SIGPIPE"
+	case 14:
+		return "SIGALRM"
+	case 15:
+		return "SIGTERM"
+	default:
+		return ""
+	}
+}
+
 // SignumFromExitCode inverts the §12.2 convention: if code is in the
 // signal-death band (128 < code ≤ 128+255) it returns the signal number and
 // true; otherwise it returns 0 and false. Note that a program may legitimately
