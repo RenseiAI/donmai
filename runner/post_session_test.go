@@ -367,6 +367,17 @@ func TestQueuedWork_hasCapability(t *testing.T) {
 	}
 }
 
+func TestQueuedWork_executionEventIngestCapabilityIsExplicit(t *testing.T) {
+	withCapability := QueuedWork{Capabilities: map[string]bool{CapabilityExecutionEventIngest: true}}
+	if !withCapability.hasCapability(CapabilityExecutionEventIngest) {
+		t.Fatal("execution-event-ingest capability should be enabled only when explicitly true")
+	}
+	withoutCapability := QueuedWork{}
+	if withoutCapability.hasCapability(CapabilityExecutionEventIngest) {
+		t.Fatal("execution-event-ingest capability must default to disabled")
+	}
+}
+
 // TestRunPostSession_NonResultSensitive_PromotesOnComplete covers the
 // research/refinement fast-path: completion alone triggers the
 // configured status transition (when one exists).
