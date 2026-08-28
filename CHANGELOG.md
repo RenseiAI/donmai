@@ -6,6 +6,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.2 — 2026-08-28
+
+### Fixes
+
+- **`pr.opened` execution facts now bind only to the declaration's canonical
+  GitHub repository authority.** The runner no longer treats a retargeted
+  local checkout or foreign Git origin as sufficient authority for a PR fact.
+  It emits `pr.opened` only when the declaration truthfully authorizes the
+  canonical GitHub repository slug and the provider supplies the complete pull
+  request identity (number, repository, URL, base branch, and head branch).
+  When that authority is absent or noncanonical, the runner now fails closed
+  to URL-only terminal completion metadata while preserving the existing
+  ordering, deduplication, manifest rejection, and terminal-event contracts.
+
 ## v0.72.1 — 2026-08-28
 
 ### Features
