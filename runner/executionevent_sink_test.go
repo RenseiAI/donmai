@@ -4,11 +4,15 @@ import (
 	"context"
 	"net/http"
 	"net/http/httptest"
+	"os"
+	"os/exec"
+	"path/filepath"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/executionevent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 type recordingActivitySink struct{ count int }
@@ -119,11 +123,13 @@ func TestExecutionEventSinkAppendsBlockedAndCompletePullRequestBeforeSoleTermina
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
+	worktree := t.TempDir()
+	gitInitWithOrigin(t, worktree, "https://github.com/RenseiAI/donmai.git")
 	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "failed", FailureMode: FailureAgentBlocked,
-		WorktreePath: t.TempDir(), PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
+		WorktreePath: worktree, PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
 	}})
 	records := uploader.Journal().Records
 	if len(records) != 3 {
@@ -150,7 +156,7 @@ func TestExecutionEventSinkAppendsBlockedAndCompletePullRequestBeforeSoleTermina
 	}
 }
 
-func TestExecutionEventSinkRejectsAgentPRURLWhenGitHubReadbackFails(t *testing.T) {
+func TestExecutionEventSinkRejectsSuccessfulForeignReadbackForSelectedRepository(t *testing.T) {
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(http.StatusOK)
 	}))
@@ -160,14 +166,74 @@ func TestExecutionEventSinkRejectsAgentPRURLWhenGitHubReadbackFails(t *testing.T
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
-	stubGhOnPath(t, 1, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated","repository":{"nameWithOwner":"unrelated/private"}}`)
+	worktree := t.TempDir()
+	gitInitWithOrigin(t, worktree, "https://github.com/RenseiAI/donmai.git")
+	stubGhOnPath(t, 0, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated","repository":{"nameWithOwner":"unrelated/private"}}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
-		Status: "completed", WorktreePath: t.TempDir(),
+		Status: "completed", WorktreePath: worktree,
 		PullRequestURL: "https://github.com/unrelated/private/pull/2",
 	}})
 	records := uploader.Journal().Records
 	if len(records) != 1 || records[0].EventType != "session.ended" {
 		t.Fatalf("unverified PR URL emitted records = %+v, want sole session.ended", records)
+	}
+}
+
+func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepository(t *testing.T) {
+	root := workarea.RootPath(t.TempDir())
+	selectedPath := filepath.Join(root.String(), "primary")
+	docsPath := filepath.Join(root.String(), "docs")
+	gitInitWithOrigin(t, selectedPath, "https://github.com/RenseiAI/donmai.git")
+	gitInitWithOrigin(t, docsPath, "https://github.com/RenseiAI/docs.git")
+	declaration, err := (workarea.RepositoryDeclarationV1{
+		Protocol: workarea.ProtocolSessionRootV1,
+		Repositories: []workarea.DeclaredRepositoryV1{
+			{
+				Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
+				Name:   "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryReadOnly,
+			},
+			{
+				Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/docs.git", Ref: "main"},
+				Name:   "docs", Role: workarea.RepositoryRoleSecondary, Authority: workarea.RepositoryMutable,
+			},
+		},
+	}).Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := workarea.WriteDeclaration(context.Background(), root, workarea.NewDeclarationRecord("session_declared_pr", "wa_declared_pr", declaration, map[string]string{
+		"primary": "abc123",
+		"docs":    "def456",
+	})); err != nil {
+		t.Fatal(err)
+	}
+	facts := executionEventPullRequestFacts(&Result{Result: agent.Result{
+		Status:       "completed",
+		WorktreePath: selectedPath,
+		WorkareaRoot: root.String(),
+		BackstopReport: &agent.BackstopReport{Repositories: []agent.RepositoryBackstopReport{{
+			Name: "docs",
+			Report: agent.BackstopReport{PullRequest: &agent.PullRequestFact{
+				Provider: "github", Number: 9, Repository: "RenseiAI/docs",
+				URL: "https://github.com/RenseiAI/docs/pull/9", BaseBranch: "main", HeadBranch: "agent/docs-pr",
+			}},
+		}}},
+	}})
+	if len(facts) != 1 || facts[0].Repository != "RenseiAI/docs" {
+		t.Fatalf("executionEventPullRequestFacts = %+v, want docs fact", facts)
+	}
+}
+
+func gitInitWithOrigin(t *testing.T, dir, origin string) {
+	t.Helper()
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	gitInit(t, dir)
+	cmd := exec.Command("git", "remote", "add", "origin", origin)
+	cmd.Dir = dir
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("git remote add origin: %v\n%s", err, out)
 	}
 }
