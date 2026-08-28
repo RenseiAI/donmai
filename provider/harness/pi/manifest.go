@@ -48,17 +48,13 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			// headless ToolLifecycle profile below declares a real
 			// ToolPluginDelivery for it — a populated delivery list is
 			// admitted and receipted, never silently dropped, and the real
-			// pi.registerTool call is proven against the pinned binary
-			// (extension_delivery_real_binary_test.go). This flag used to
-			// disagree with a truthful ToolPluginDelivery: Unsupported below;
-			// both now agree. The interactive PTY profile still declares
-			// ToolPluginDelivery: Unsupported (no fixture proves tool
-			// registration through that lane yet — ADR-2026-08-06 D6:
-			// interactive evidence never inherits headless), so a caller
-			// that hands pi's PTY spawn mode a required AdditionalExtensions
-			// delivery denies closed, and an all-advisory batch is dropped
-			// with a receipt at the generic plan layer — never silently
-			// loaded unevidenced either way.
+			// pi.registerTool call is proven against the real binary in both
+			// exact modes: extension_delivery_real_binary_test.go owns the
+			// headless evidence, while extension_delivery_test.go owns the
+			// independent bare-PTY registration + invocation fixture. Both
+			// exact profiles therefore declare the same delivery mechanism;
+			// interactive evidence does not inherit the headless claim
+			// (ADR-2026-08-06 D6).
 			SupportsToolPlugins:     true,
 			AcceptsMcpServerSpec:    false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
 			AcceptsAllowedToolsList: true,  // enforced by OUR policy extension, not by pi
@@ -156,17 +152,13 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// Declaring the injected-boundary GAP (Unsupported) rather than
 				// inheriting the headless profile's evidence is D6's exact
 				// requirement — interactive evidence never inherits headless.
-				// ToolPluginDelivery stays Unsupported for the same reason:
-				// materializeAdditionalExtensions runs in this lane too
-				// (interactive.go), but no real-binary fixture proves tool
-				// registration through it, so the generic plan layer answers
-				// per the batch's declared posture instead of loading
-				// unevidenced: a batch carrying any required delivery denies
-				// closed, and an all-advisory batch is dropped with a
-				// receipt and stripped from the adapted Spec
-				// (dropDeniedAdvisoryExtensions) before this lane's
-				// materializer ever sees it — the headless profile's flip
-				// does not carry over.
+				// ToolPluginDelivery is now independently real in this mode:
+				// materializeAdditionalExtensions (interactive.go) digest-verifies
+				// each delivery, bare pi receives it as an explicit -e path, and
+				// TestSpawn_Interactive_AdditionalExtensionRealBarePTYRegistersAndExecutesTool
+				// observes the registered name in pi's actual model request plus
+				// one safe tool-result round trip. The mechanism matches headless;
+				// the evidence does not inherit from it.
 				//
 				// NativeToolPolicyDelivery is REAL, though, and for a different
 				// reason than the injected-boundary claim above stays a gap. The
@@ -185,19 +177,19 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// regex/containment/default-decision engine (policy.go) still needs
 				// the Go round trip this lane does not run.
 				//
-				// Bumped v1 -> v2 per the seam ADR's adapter-version rule
-				// (ADR-2026-08-12 D1.3a / D6: a profile whose declared surface moves
-				// bumps the ADAPTER version; the family ABI and binary pin do not).
-				// A receipt pinned to "pi/interactive/tool-lifecycle-v1" now denies
-				// at spawn rather than silently reusing a stale profile identity.
+				// Bumped v2 -> v3 per the seam ADR's adapter-version rule: the
+				// tool-plugin surface moved after v2 added the local allowed/
+				// disallowed-tools channel. The family ABI and binary pin do not
+				// move, and a receipt pinned to v2 denies rather than silently
+				// acquiring this new delivery claim.
 				// Conformance: agent/tool_adaptation_test.go
 				// TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally
 				// (generic-plan admission) and this package's scripted
 				// interactive-local-tool-policy fixtures (the extension's actual
 				// enforcement, against the real production source, no pi binary
 				// needed).
-				ID: "pi/interactive/tool-lifecycle-v2", Mode: agent.PromptModeHumanControlled,
-				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
+				ID: "pi/interactive/tool-lifecycle-v3", Mode: agent.PromptModeHumanControlled,
+				ToolPluginDelivery: agent.ToolDeliveryPiAdditionalExtension, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryPiInteractiveLocalToolPolicy, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
