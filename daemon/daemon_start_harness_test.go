@@ -39,6 +39,16 @@ type compositionHarness struct {
 	// test exercising refreshes AFTER a completed install sets it to ready,
 	// because that is the state the daemon then demands.
 	refreshReceiptState string
+	// refreshReceiptRevision is the adoption revision the control plane's
+	// refresh receipt answers with. Empty answers the founding
+	// "revision-declared"; a reconciliation test sets it to whatever revision
+	// the fake control plane has committed to.
+	refreshReceiptRevision string
+	// heartbeatRequireRevision, when set, makes the heartbeat endpoint refuse
+	// a beat presenting any OTHER session-shim adoption revision with the
+	// closed 409 revision-stale conflict, the way the real preflight does.
+	// Empty keeps the legacy always-acknowledge behavior.
+	heartbeatRequireRevision string
 }
 
 // setRefreshReceiptState changes what the control plane answers to later
@@ -47,6 +57,22 @@ func (h *compositionHarness) setRefreshReceiptState(state string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.refreshReceiptState = state
+}
+
+// setRefreshReceiptRevision changes the adoption revision later refresh
+// receipts answer with. See refreshReceiptRevision.
+func (h *compositionHarness) setRefreshReceiptRevision(revision string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refreshReceiptRevision = revision
+}
+
+// setHeartbeatRequireRevision arms (or, with "", disarms) the heartbeat
+// endpoint's revision preflight. See heartbeatRequireRevision.
+func (h *compositionHarness) setHeartbeatRequireRevision(revision string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.heartbeatRequireRevision = revision
 }
 
 // heartbeats returns every heartbeat body the control plane has received.
@@ -132,16 +158,20 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			// that was adopted from one that was refused before adoption.
 			token := fmt.Sprintf("runtime-composition-refreshed-%d", len(h.refreshBodies))
 			state := h.refreshReceiptState
+			revision := h.refreshReceiptRevision
 			h.mu.Unlock()
 			if state == "" {
 				state = SessionShimCredentialStateRecovering
+			}
+			if revision == "" {
+				revision = "revision-declared"
 			}
 			var presented SessionShimHostAttestation
 			_ = json.Unmarshal(raw, &presented)
 			resp := refreshResponse{RuntimeToken: token}
 			if presented.Supports() {
 				resp.SessionShim = activationTestCredentialReceipt(
-					presented, state, "stable-host-composition", "revision-declared",
+					presented, state, "stable-host-composition", revision,
 				)
 			}
 			_ = json.NewEncoder(w).Encode(resp)
@@ -152,7 +182,14 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			}
 			h.mu.Lock()
 			h.heartbeatBodies = append(h.heartbeatBodies, body)
+			requireRevision := h.heartbeatRequireRevision
 			h.mu.Unlock()
+			if requireRevision != "" &&
+				(body.SessionShim == nil || body.SessionShim.AdoptionRevision != requireRevision) {
+				w.WriteHeader(http.StatusConflict)
+				_, _ = w.Write([]byte(`{"error":"SESSION_SHIM_ADOPTION_REVISION_STALE"}`))
+				return
+			}
 			_ = json.NewEncoder(w).Encode(heartbeatResponseBody{
 				Acknowledged: true, SessionShim: body.SessionShim,
 			})

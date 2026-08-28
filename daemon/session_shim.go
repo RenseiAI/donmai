@@ -1270,6 +1270,15 @@ type sessionShimState struct {
 	// lifecycle, and a refusal can affect only that exact lifecycle.
 	acceptanceRefusals   map[sessionshim.Identity]acceptanceRefusalState
 	acceptanceQuarantine map[shimIncarnation]sessionshim.ProcessIdentity
+	// reconciling marks scopes with one commit-outcome reconciliation pass in
+	// flight, so concurrent triggers (an ambiguous commit and the
+	// revision-stale beat it causes) arm exactly one bounded loop.
+	// reconcileStop is closed when the daemon releases its shims; a
+	// reconciliation loop parked in backoff exits on it instead of outliving
+	// the daemon. Protected by mu; the channel itself is assigned once.
+	reconciling      map[string]bool
+	reconcileStop    chan struct{}
+	reconcileStopped bool
 	// restartStateWriter and restartID are package-private test seams. Production
 	// uses the atomic secret-free state writer and crypto/rand identifier.
 	restartStateWriter func(restartPreparationAudit) error
@@ -1308,6 +1317,8 @@ func newSessionShimState() *sessionShimState {
 		activationGates:      make(map[sessionshim.Identity]*shimAdoptionGate),
 		acceptanceRefusals:   make(map[sessionshim.Identity]acceptanceRefusalState),
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
+		reconciling:          make(map[string]bool),
+		reconcileStop:        make(chan struct{}),
 	}
 }
 
@@ -2316,6 +2327,14 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	defer cancel()
 	receipt, err := cfg.OnAdoptionBatch(callbackCtx, cloneSessionShimAdoptionBatch(batch))
 	if err != nil {
+		if sessionShimCommitOutcomeUnknown(err) {
+			// The commit request went out and no decoded refusal came back:
+			// the control plane may have stamped this batch and advanced the
+			// scope's adoption revision while our copy of the answer was lost.
+			// Callers classify on this wrap and schedule reconciliation
+			// instead of latching the superseded revision forever.
+			return SessionShimAdoptionBatchReceipt{}, fmt.Errorf("%w: %w", errSessionShimAmbiguousBatchCommit, err)
+		}
 		return SessionShimAdoptionBatchReceipt{}, err
 	}
 	if len(receipt.DurableCorrelation) == 0 {
@@ -2489,6 +2508,15 @@ func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID strin
 	sortSessionShimClearedQuarantines(batch.Cleared)
 	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
 	if err != nil {
+		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+			// OUTCOME-UNKNOWN: the control plane may hold this batch and a
+			// revision this daemon never learned. The beat keeps presenting
+			// the last-committed projection meanwhile; reconciliation learns
+			// the committed revision through the refresher and republishes
+			// the complete batch. A trigger landing from inside the
+			// reconciliation loop itself is deduplicated by the scope mark.
+			d.scheduleSessionShimReconciliation(orgID, "ambiguous-batch-commit")
+		}
 		slog.Warn("session shim: quarantine projection not published",
 			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
 			"tombstoned", len(batch.Tombstoned), "cleared", len(batch.Cleared), "error", err)
@@ -3647,6 +3675,13 @@ func (d *Daemon) ReleaseAdoptedSessionShims() {
 	d.shims.adoptionComplete = false
 	d.shims.carrierActivationComplete = false
 	d.shims.adoptionCompletedAtUnixNano = 0
+	// Stop commit-outcome reconciliation with the shims it reconciles: a loop
+	// parked in backoff exits on the closed channel, and the consumer join
+	// below then observes a fully settled daemon.
+	if !d.shims.reconcileStopped {
+		d.shims.reconcileStopped = true
+		close(d.shims.reconcileStop)
+	}
 	d.shims.mu.Unlock()
 	for _, entry := range adopted {
 		if entry.controller != nil {

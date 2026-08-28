@@ -69,6 +69,16 @@ type HeartbeatOptions struct {
 	// successful local projection alone is deliberately insufficient.
 	OnSessionShimAcknowledged func(SessionShimHeartbeatProjection)
 
+	// OnSessionShimRevisionStale runs when the server answers a beat with the
+	// closed session-shim revision-stale conflict: this daemon presented a
+	// superseded adoption revision, which means a batch commit advanced the
+	// server while the daemon's copy of the answer was lost. The daemon wires
+	// it to schedule commit-outcome reconciliation, so a stale beat is a
+	// repair trigger rather than a skip-forever. It must not block: the beat
+	// that observed the conflict is already being reported as failed, and the
+	// reconciliation it arms runs on its own goroutine.
+	OnSessionShimRevisionStale func()
+
 	// GetActiveInteractiveCount is the legacy separately sampled interactive
 	// occupancy callback. It remains source-compatible with embedders that adopted
 	// the initial activeInteractiveCount contract before GetActiveSessionCounts was
@@ -582,6 +592,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		retryPayload.WorkerID = newWorkerID
 		retryResp, retryErr := h.callEndpoint(ctx, retryPayload, ackApplied, ackFailures)
 		if retryErr != nil {
+			h.noteSessionShimRevisionStaleBeat(retryErr)
 			h.opts.LogWarn("daemon heartbeat post-refresh also failed: %v", retryErr)
 			return retryErr
 		}
@@ -595,8 +606,26 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		h.handleHeartbeatResponse(ctx, retryResp)
 		return nil
 	}
+	h.noteSessionShimRevisionStaleBeat(err)
 	h.opts.LogWarn("daemon heartbeat HTTP call failed: %v — orchestrator will detect via missed heartbeats", err)
 	return err
+}
+
+// noteSessionShimRevisionStaleBeat turns the server's revision-stale heartbeat
+// conflict into the configured reconciliation trigger.
+func (h *HeartbeatService) noteSessionShimRevisionStaleBeat(err error) {
+	if h.opts.OnSessionShimRevisionStale == nil || !isSessionShimRevisionStale(err) {
+		return
+	}
+	h.opts.OnSessionShimRevisionStale()
+}
+
+// isSessionShimRevisionStale reports whether a heartbeat error is the control
+// plane's closed 409 for a superseded session-shim adoption revision.
+func isSessionShimRevisionStale(err error) bool {
+	var hErr *heartbeatHTTPError
+	return errors.As(err, &hErr) && hErr.status == http.StatusConflict &&
+		strings.Contains(hErr.body, sessionShimRevisionStaleCode)
 }
 
 // workerIDLocked returns the current worker id under the lock.

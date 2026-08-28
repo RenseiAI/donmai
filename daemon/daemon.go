@@ -1169,6 +1169,15 @@ func (d *Daemon) Start(ctx context.Context) error {
 				d.AcknowledgeSessionShimRecoveryHeartbeat(primaryScope, projection)
 			}
 		}
+		// Wired unconditionally (not only when the shim is enabled at startup):
+		// a composition installed after Start moves this daemon onto revisioned
+		// beats, and a beat answered with the closed revision-stale conflict is
+		// a reconciliation trigger, never a skip-forever. The scope resolves at
+		// trigger time for the same reason; the schedule refuses on a daemon
+		// with no composed attestation.
+		heartbeatOpts.OnSessionShimRevisionStale = func() {
+			d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), "heartbeat-revision-stale")
+		}
 		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
 		if d.sessionShimEnabled() {
