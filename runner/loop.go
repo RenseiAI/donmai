@@ -910,9 +910,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// 9b.1 Start normalized execution-event capture only when the target
 	// explicitly advertises its ingest route. The uploader owns its durable
 	// journal and never extends the activity poster's best-effort contract.
-	var eventUploader *executionevent.Uploader
 	var eventSink *executionEventSink
-	if qw.hasCapability(CapabilityExecutionEventIngest) {
+	eventSink, eventErr := newExecutionEventSinkForWork(qw, sink, r.logger, func() (*executionevent.Uploader, error) {
 		var eventCredentialProvider executionevent.CredentialProvider
 		if r.credentialProvider != nil {
 			eventCredentialProvider = func(ctx context.Context) (executionevent.RuntimeCredentials, error) {
@@ -920,8 +919,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				return executionevent.RuntimeCredentials{WorkerID: creds.WorkerID, AuthToken: creds.AuthToken}, credErr
 			}
 		}
-		var eventErr error
-		eventUploader, eventErr = executionevent.New(executionevent.Config{
+		return executionevent.New(executionevent.Config{
 			SessionID:          qw.SessionID,
 			BaseURL:            qw.PlatformURL,
 			AuthToken:          qw.AuthToken,
@@ -929,15 +927,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			HTTPClient:         r.httpClient,
 			Logger:             r.logger,
 		})
-		if eventErr != nil {
-			r.logger.Warn("execution-event uploader construct failed", "err", eventErr)
-		} else {
-			eventSink = newExecutionEventSink(sink, eventUploader, r.logger)
-			sink = eventSink
-			defer func() {
-				eventSink.Close(res)
-			}()
-		}
+	})
+	if eventErr != nil {
+		r.logger.Warn("execution-event uploader construct failed", "err", eventErr)
+	} else if eventSink != nil {
+		sink = eventSink
+		defer func() { eventSink.Close(res) }()
 	}
 
 	// 9c. Start the additive per-call span pipeline when explicitly enabled by
