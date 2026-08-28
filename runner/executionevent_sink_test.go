@@ -180,6 +180,30 @@ func TestExecutionEventSinkRejectsSuccessfulForeignReadbackForSelectedRepository
 	}
 }
 
+func TestExecutionEventSinkRejectsSpoofedGitHubOriginForSelectedRepository(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	uploader, err := executionevent.New(executionevent.Config{SessionID: "session_spoofed_origin", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test", MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = uploader.Journal().Close() })
+	worktree := t.TempDir()
+	gitInitWithOrigin(t, worktree, "https://github.com.evil.example/RenseiAI/donmai.git")
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	sink := newExecutionEventSink(nil, uploader, nil)
+	sink.Close(&Result{Result: agent.Result{
+		Status: "completed", WorktreePath: worktree,
+		PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
+	}})
+	records := uploader.Journal().Records
+	if len(records) != 1 || records[0].EventType != "session.ended" {
+		t.Fatalf("spoofed origin emitted records = %+v, want sole session.ended", records)
+	}
+}
+
 func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepository(t *testing.T) {
 	root := workarea.RootPath(t.TempDir())
 	selectedPath := filepath.Join(root.String(), "primary")

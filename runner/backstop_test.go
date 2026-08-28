@@ -30,6 +30,58 @@ func TestPullRequestFactFromGitHubView(t *testing.T) {
 	}
 }
 
+func TestCanonicalGitHubOriginRepository(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		origin string
+		want   string
+	}{
+		{
+			name:   "accepts canonical https origin",
+			origin: "https://github.com/RenseiAI/donmai.git",
+			want:   "renseiai/donmai",
+		},
+		{
+			name:   "accepts canonical ssh origin",
+			origin: "git@github.com:RenseiAI/donmai.git",
+			want:   "renseiai/donmai",
+		},
+		{
+			name:   "rejects github lookalike host",
+			origin: "https://github.com.evil.example/RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects https credentials spoofing",
+			origin: "https://token:x-oauth-basic@github.com/RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects local path origin",
+			origin: "../example/src/donmai",
+			want:   "",
+		},
+		{
+			name:   "rejects non github ssh host",
+			origin: "git@evil.example:RenseiAI/donmai.git",
+			want:   "",
+		},
+		{
+			name:   "rejects ssh url form outside canonical allowlist",
+			origin: "ssh://git@github.com/RenseiAI/donmai.git",
+			want:   "",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := canonicalGitHubOriginRepository(tc.origin); got != tc.want {
+				t.Fatalf("canonicalGitHubOriginRepository(%q) = %q, want %q", tc.origin, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestCaptureHeadSHA table-tests the correlation-key capture for the
 // orchestration-owned durable CI wait (ADR-2026-06-10-durable-ci-wait.md).
 // A worktree with a commit yields its full hex object name; a non-repo

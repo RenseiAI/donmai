@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"os/exec"
 	"regexp"
@@ -507,7 +508,7 @@ func pullRequestRepositoryAllowed(repository string, allowedRepositories map[str
 	if len(allowedRepositories) == 0 {
 		return false
 	}
-	_, ok := allowedRepositories[githubRepositorySlug(repository)]
+	_, ok := allowedRepositories[normalizeGitHubRepositorySlug(repository)]
 	return ok
 }
 
@@ -519,32 +520,51 @@ func pullRequestAuthorityForWorktree(ctx context.Context, worktreePath string) m
 	if err != nil {
 		return nil
 	}
-	slug := githubRepositorySlug(out)
+	slug := canonicalGitHubOriginRepository(out)
 	if slug == "" {
 		return nil
 	}
 	return map[string]struct{}{slug: {}}
 }
 
-func githubRepositorySlug(repository string) string {
+func canonicalGitHubOriginRepository(origin string) string {
+	s := strings.TrimSpace(origin)
+	if s == "" {
+		return ""
+	}
+	if strings.HasPrefix(s, "git@github.com:") {
+		return normalizeGitHubRepositorySlug(strings.TrimPrefix(s, "git@github.com:"))
+	}
+	u, err := url.Parse(s)
+	if err != nil {
+		return ""
+	}
+	if !strings.EqualFold(u.Scheme, "https") {
+		return ""
+	}
+	if u.User != nil {
+		return ""
+	}
+	if !strings.EqualFold(u.Hostname(), "github.com") || u.Port() != "" {
+		return ""
+	}
+	if u.RawQuery != "" || u.Fragment != "" {
+		return ""
+	}
+	return normalizeGitHubRepositorySlug(u.Path)
+}
+
+func normalizeGitHubRepositorySlug(repository string) string {
 	s := strings.TrimSpace(repository)
 	if s == "" {
 		return ""
 	}
 	s = strings.TrimSuffix(s, ".git")
-	if i := strings.Index(s, ":"); i >= 0 && !strings.Contains(s[:i], "/") {
-		s = s[i+1:]
-	} else if i := strings.Index(s, "://"); i >= 0 {
-		s = s[i+3:]
-		if i := strings.Index(s, "/"); i >= 0 {
-			s = s[i+1:]
-		}
-	}
 	parts := strings.Split(strings.Trim(s, "/"), "/")
-	if len(parts) < 2 {
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
 		return ""
 	}
-	return strings.ToLower(parts[len(parts)-2] + "/" + parts[len(parts)-1])
+	return strings.ToLower(parts[0] + "/" + parts[1])
 }
 
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
