@@ -546,7 +546,6 @@ func githubRepositorySlug(repository string) string {
 	}
 	return strings.ToLower(parts[len(parts)-2] + "/" + parts[len(parts)-1])
 }
-
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {
 	known := make(map[string]string)
 	if res != nil && res.Manifest != nil {

@@ -210,7 +210,6 @@ func selectedMutableRepository(record workarea.DeclarationRecord) bool {
 	}
 	return false
 }
-
 func executionEventOutcome(result *Result) (string, string) {
 	if result == nil {
 		return "failed", "inferred"
