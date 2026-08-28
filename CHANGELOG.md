@@ -6,6 +6,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.2 — 2026-08-28
+
+### Fixes
+
+- **Blocked terminal execution facts now land in runner-owned order, and
+  `pr.opened` facts fail closed to declaration-authorized GitHub identity.**
+  A blocked run now emits `session.blocked` before any terminal `pr.opened`
+  and before the sole `session.ended` record, so deliberate agent refusal is
+  preserved as an explicit terminal fact instead of being inferred later. In
+  the same terminal sequence, the runner emits `pr.opened` only when the
+  declaration authorizes the canonical GitHub repository slug and the provider
+  supplies the complete pull request identity (number, repository, URL, base
+  branch, and head branch). Retargeted local checkouts and foreign Git origins
+  no longer count as authority; when that proof is absent or incomplete, the
+  runner keeps only the URL in terminal completion metadata and omits
+  `pr.opened` entirely.
+
 ## v0.72.1 — 2026-08-28
 
 ### Features
