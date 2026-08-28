@@ -141,10 +141,11 @@ func executionEventPullRequestFacts(result *Result) []agent.PullRequestFact {
 	}
 	// PullRequestURL is agent-observable completion metadata, not authority for
 	// repository or branch facts. Promote it only after the runner performs a
-	// bounded GitHub readback from the session worktree. A failed readback
-	// deliberately leaves the legacy URL intact while omitting pr.opened.
+	// bounded GitHub readback from the session worktree and matches the
+	// declaration-bound canonical repository. A failed readback deliberately
+	// leaves the legacy URL intact while omitting pr.opened.
 	appendFact(authorizePullRequestFact(
-		lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL),
+		lookupGitHubPullRequest(context.Background(), result.WorktreePath, result.PullRequestURL, authority.selected),
 		authority.selected,
 	))
 	if result.BackstopReport != nil {
@@ -163,7 +164,7 @@ type executionEventPullRequestAuthority struct {
 
 func executionEventPullRequestAuthorityForResult(result *Result) executionEventPullRequestAuthority {
 	authority := executionEventPullRequestAuthority{
-		selected:      pullRequestAuthorityForWorktree(context.Background(), result.WorktreePath),
+		selected:      nil,
 		mutableByName: make(map[string]map[string]struct{}),
 	}
 	root := strings.TrimSpace(result.WorkareaRoot)
@@ -174,23 +175,15 @@ func executionEventPullRequestAuthorityForResult(result *Result) executionEventP
 	if err != nil {
 		return authority
 	}
+	authority.selected = pullRequestAuthorityForDeclarationRecord(record, record.SelectedRepository)
 	if selectedMutable := selectedMutableRepository(record); !selectedMutable {
 		authority.selected = nil
 	}
-	layout := workarea.Layout{Root: workarea.RootPath(root), Repository: workarea.RepositoryPath(result.WorktreePath)}
 	for _, repository := range record.Repositories {
 		if repository.Authority != workarea.RepositoryMutable {
 			continue
 		}
-		repositoryPath := strings.TrimSpace(result.WorktreePath)
-		if repository.Name != record.SelectedRepository || repositoryPath == "" {
-			path, pathErr := layout.RepositoryPathFor(repository.Leaf)
-			if pathErr != nil {
-				continue
-			}
-			repositoryPath = path.String()
-		}
-		allowed := pullRequestAuthorityForWorktree(context.Background(), repositoryPath)
+		allowed := pullRequestAuthorityForDeclarationRecordRepository(repository)
 		if len(allowed) == 0 {
 			continue
 		}
@@ -209,6 +202,23 @@ func selectedMutableRepository(record workarea.DeclarationRecord) bool {
 		}
 	}
 	return false
+}
+
+func pullRequestAuthorityForDeclarationRecord(record workarea.DeclarationRecord, repositoryName string) map[string]struct{} {
+	for _, repository := range record.Repositories {
+		if repository.Name == repositoryName {
+			return pullRequestAuthorityForDeclarationRecordRepository(repository)
+		}
+	}
+	return nil
+}
+
+func pullRequestAuthorityForDeclarationRecordRepository(repository workarea.DeclarationRepositoryRecord) map[string]struct{} {
+	slug := normalizeGitHubRepositorySlug(repository.CanonicalGitHubRepository)
+	if slug == "" {
+		return nil
+	}
+	return map[string]struct{}{slug: {}}
 }
 
 func executionEventOutcome(result *Result) (string, string) {
