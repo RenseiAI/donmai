@@ -7,7 +7,13 @@ package agent
 // the verbatim Go translation. JSON tags use camelCase to match the TS
 // wire format consumed by QueuedWork.resolvedProfile readers.
 
-import "encoding/json"
+import (
+	"encoding/json"
+	"fmt"
+	"net/url"
+	"strconv"
+	"strings"
+)
 
 // ProviderName is the stable identifier for an agent provider family.
 //
@@ -728,6 +734,58 @@ type TurnManifestRepository struct {
 	CommitSHA      string `json:"commitSha,omitempty"`
 }
 
+// PullRequestFact is the closed, secret-free projection emitted as a
+// pr.opened execution event. The fact is present only when every field is
+// known from a GitHub source; callers omit it rather than guessing a branch
+// name or repository identity from a URL alone.
+type PullRequestFact struct {
+	Provider   string `json:"provider"`
+	Number     int    `json:"number"`
+	Repository string `json:"repository"`
+	URL        string `json:"url"`
+	BaseBranch string `json:"baseBranch"`
+	HeadBranch string `json:"headBranch"`
+	Author     string `json:"author,omitempty"`
+}
+
+// ValidatePullRequestFact rejects incomplete or internally inconsistent PR
+// facts before they reach the terminal result or execution-event journal.
+func ValidatePullRequestFact(fact PullRequestFact) error {
+	if fact.Provider != "github" {
+		return fmt.Errorf("agent: pull request provider must be github")
+	}
+	if fact.Number <= 0 {
+		return fmt.Errorf("agent: pull request number must be positive")
+	}
+	for _, field := range []struct {
+		name  string
+		value string
+	}{
+		{"repository", fact.Repository},
+		{"baseBranch", fact.BaseBranch},
+		{"headBranch", fact.HeadBranch},
+	} {
+		if strings.TrimSpace(field.value) == "" || len(field.value) > 256 || field.value != strings.TrimSpace(field.value) {
+			return fmt.Errorf("agent: pull request %s must be 1..256 trimmed bytes", field.name)
+		}
+	}
+	if fact.Author != "" && (len(fact.Author) > 256 || fact.Author != strings.TrimSpace(fact.Author)) {
+		return fmt.Errorf("agent: pull request author must be 1..256 trimmed bytes when present")
+	}
+	if len(fact.URL) == 0 || len(fact.URL) > 2048 || fact.URL != strings.TrimSpace(fact.URL) {
+		return fmt.Errorf("agent: pull request URL must be 1..2048 trimmed bytes")
+	}
+	parsed, err := url.Parse(fact.URL)
+	if err != nil || (parsed.Scheme != "http" && parsed.Scheme != "https") || parsed.Host == "" || parsed.RawQuery != "" || parsed.Fragment != "" {
+		return fmt.Errorf("agent: pull request URL must be an absolute http(s) URL without query or fragment")
+	}
+	expectedPath := "/" + fact.Repository + "/pull/" + strconv.Itoa(fact.Number)
+	if parsed.EscapedPath() != expectedPath {
+		return fmt.Errorf("agent: pull request URL does not match repository and number")
+	}
+	return nil
+}
+
 // BackstopReport captures what the post-session backstop did, if
 // anything. Populated by runner/backstop.go (F.1.1 §5.6).
 type BackstopReport struct {
@@ -743,6 +801,11 @@ type BackstopReport struct {
 
 	// PRURL is the URL of a PR the backstop created or detected.
 	PRURL string `json:"prUrl,omitempty"`
+
+	// PullRequest is the complete GitHub fact when the backstop could read it
+	// back after creating or detecting the PR. Nil is deliberate when metadata
+	// is unavailable; URL-only recovery must not fabricate branch facts.
+	PullRequest *PullRequestFact `json:"pullRequest,omitempty"`
 
 	// UnfilledFields lists the contract fields the backstop could not
 	// auto-recover (e.g. work_result, comment_posted). The platform

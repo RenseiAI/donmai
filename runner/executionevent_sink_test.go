@@ -105,3 +105,69 @@ func TestExecutionEventCapabilityOffDoesNotConstructOrSend(t *testing.T) {
 		t.Fatalf("capability-off factory: sink=%v err=%v called=%v", sink, err, called)
 	}
 }
+
+func TestExecutionEventSinkAppendsBlockedAndCompletePullRequestBeforeSoleTerminal(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	uploader, err := executionevent.New(executionevent.Config{
+		SessionID: "session_terminal", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test",
+		MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = uploader.Journal().Close() })
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	sink := newExecutionEventSink(nil, uploader, nil)
+	sink.Close(&Result{Result: agent.Result{
+		Status: "failed", FailureMode: FailureAgentBlocked,
+		WorktreePath: t.TempDir(), PullRequestURL: "https://github.com/RenseiAI/donmai/pull/88",
+	}})
+	records := uploader.Journal().Records
+	if len(records) != 3 {
+		t.Fatalf("journal records = %d, want 3: %+v", len(records), records)
+	}
+	for index, wantType := range []string{"session.blocked", "pr.opened", "session.ended"} {
+		if records[index].StructuredSeq != uint64(index+1) || records[index].EventType != wantType {
+			t.Fatalf("record[%d] = seq %d %q, want seq %d %q", index, records[index].StructuredSeq, records[index].EventType, index+1, wantType)
+		}
+	}
+	if records[0].Payload["reason"] != "agent declined to proceed" {
+		t.Fatalf("blocked payload = %#v", records[0].Payload)
+	}
+	for key, want := range map[string]any{
+		"provider": "github", "number": 88, "repository": "RenseiAI/donmai",
+		"url": "https://github.com/RenseiAI/donmai/pull/88", "baseBranch": "main", "headBranch": "agent/test-fact",
+	} {
+		if got := records[1].Payload[key]; got != want {
+			t.Fatalf("pr payload[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+	if records[2].Payload["outcome"] != "interrupted" {
+		t.Fatalf("terminal payload = %#v", records[2].Payload)
+	}
+}
+
+func TestExecutionEventSinkRejectsAgentPRURLWhenGitHubReadbackFails(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(server.Close)
+	uploader, err := executionevent.New(executionevent.Config{SessionID: "session_incomplete_pr", BaseURL: server.URL, JournalDir: t.TempDir(), AuthToken: "test", MaxRetries: 1, InitialBackoff: time.Nanosecond, Sleep: func(time.Duration) {}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = uploader.Journal().Close() })
+	stubGhOnPath(t, 1, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated","repository":{"nameWithOwner":"unrelated/private"}}`)
+	sink := newExecutionEventSink(nil, uploader, nil)
+	sink.Close(&Result{Result: agent.Result{
+		Status: "completed", WorktreePath: t.TempDir(),
+		PullRequestURL: "https://github.com/unrelated/private/pull/2",
+	}})
+	records := uploader.Journal().Records
+	if len(records) != 1 || records[0].EventType != "session.ended" {
+		t.Fatalf("unverified PR URL emitted records = %+v, want sole session.ended", records)
+	}
+}

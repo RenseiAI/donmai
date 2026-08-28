@@ -6,9 +6,29 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
+
+func TestPullRequestFactFromGitHubView(t *testing.T) {
+	t.Parallel()
+	valid := ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"}
+	valid.Repository.NameWithOwner = "RenseiAI/donmai"
+	got := pullRequestFactFromGitHubView(valid)
+	want := &agent.PullRequestFact{Provider: "github", Number: 77, Repository: "RenseiAI/donmai", URL: "https://github.com/RenseiAI/donmai/pull/77", BaseBranch: "main", HeadBranch: "agent/test-fact"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("pullRequestFactFromGitHubView() = %+v, want %+v", got, want)
+	}
+
+	invalid := valid
+	invalid.HeadRefName = ""
+	if got := pullRequestFactFromGitHubView(invalid); got != nil {
+		t.Fatalf("pullRequestFactFromGitHubView(incomplete) = %+v, want nil", got)
+	}
+}
 
 // TestCaptureHeadSHA table-tests the correlation-key capture for the
 // orchestration-owned durable CI wait (ADR-2026-06-10-durable-ci-wait.md).
