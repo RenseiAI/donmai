@@ -773,28 +773,48 @@ func TestToolLifecyclePiAdditionalExtensionsRouteThroughGenericToolPluginChannel
 	}
 }
 
-// TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile is the
-// per-mode negative half: pi's interactive PTY profile still declares
-// ToolPluginDelivery: Unsupported (no fixture proves tool registration
-// through that lane), so the SAME spec that admits cleanly headless must
-// deny by name on the interactive profile — ADR-2026-08-06 D6's "interactive
-// evidence never inherits headless," enforced at the generic plan layer
-// rather than left to whatever the exact adapter happens to do with an
-// unevidenced capability.
-func TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile(t *testing.T) {
+// TestToolLifecyclePiAdditionalExtensionsAdmitOnInteractiveProfile is the
+// per-mode positive half: the interactive PTY profile carries its own real
+// bare-PTY conformance evidence, so the SAME delivery that admits headless
+// must stay attached and receive the exact pi additional-extension delivery
+// receipt in human-controlled mode too. This is independent evidence for the
+// interactive adapter, not inheritance from the headless profile (ADR-2026-08-06
+// D6).
+func TestToolLifecyclePiAdditionalExtensionsAdmitOnInteractiveProfile(t *testing.T) {
 	t.Parallel()
 	manifest := (&pi.Provider{}).Manifest()
 	spec := agent.Spec{
 		Interactive:          &agent.InteractiveSpec{},
 		AdditionalExtensions: []agent.ExtensionDelivery{extensionDelivery("pack-1")},
 	}
-	_, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
-	var adaptationErr *agent.ToolAdaptationError
-	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialDeliveryUnsupported || adaptationErr.Channel != agent.ToolChannelToolPlugin {
-		t.Fatalf("error = %v, want a typed tool_plugin denial (pi's interactive profile has no proven extension-tool-registration evidence)", err)
+	adapted, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeHumanControlled))
+	if err != nil {
+		t.Fatalf("AdaptToolLifecycle: %v", err)
 	}
-	if receipt.Decision != "denied" {
-		t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+	if receipt.Decision != "ready" {
+		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+	}
+	var found bool
+	for _, entry := range receipt.Entries {
+		if entry.Channel != agent.ToolChannelToolPlugin {
+			continue
+		}
+		found = true
+		if entry.Outcome != agent.ToolOutcomeAdmitted {
+			t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
+		}
+		if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
+			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
+		}
+		if !entry.Required {
+			t.Error("tool_plugin entry must preserve the required posture")
+		}
+	}
+	if !found {
+		t.Fatalf("receipt must name the tool_plugin channel; entries=%+v", receipt.Entries)
+	}
+	if len(adapted.AdditionalExtensions) != 1 {
+		t.Fatalf("admitted interactive delivery must remain attached, got %d", len(adapted.AdditionalExtensions))
 	}
 }
 
@@ -852,14 +872,6 @@ func TestToolLifecycleAdvisoryAdditionalExtensionsDropWithReceiptWhereUndelivera
 		// codex has no host-side extension API in any mode.
 		{"codex headless", (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.Spec{
 			Autonomous:           true,
-			AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")},
-		}},
-		// pi's interactive PTY profile declares the tool_plugin gap even
-		// though its headless profile delivers — the per-mode split of
-		// TestToolLifecyclePiAdditionalExtensionsDenyOnInteractiveProfile,
-		// now non-fatal for an advisory batch.
-		{"pi interactive", (&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled, agent.Spec{
-			Interactive:          &agent.InteractiveSpec{},
 			AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")},
 		}},
 	}
@@ -931,43 +943,52 @@ func TestToolLifecycleMixedRequiredAndAdvisoryExtensionsDenyWhereUndeliverable(t
 }
 
 // TestToolLifecycleAdvisoryAdditionalExtensionsRideWhereDeliverable proves
-// the advisory flag changes nothing on a profile that DOES deliver the
-// channel: an all-advisory batch against pi's headless profile is admitted
-// and receipted exactly like a required one — Required: false recorded
-// truthfully on the entry — and the deliveries stay on the adapted Spec for
-// the exact adapter to materialize.
+// the advisory flag changes nothing on either pi profile now that both exact
+// modes deliver the channel: the batch is admitted and receipted with
+// Required:false, and it stays on the adapted Spec for the exact adapter to
+// materialize.
 func TestToolLifecycleAdvisoryAdditionalExtensionsRideWhereDeliverable(t *testing.T) {
 	t.Parallel()
 	manifest := (&pi.Provider{}).Manifest()
-	spec := agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")}}
-	adapted, receipt, err := agent.AdaptToolLifecycle(spec, mustProfile(t, manifest, agent.PromptModeAutonomous))
-	if err != nil {
-		t.Fatalf("AdaptToolLifecycle: %v", err)
-	}
-	if receipt.Decision != "ready" {
-		t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
-	}
-	var found bool
-	for _, entry := range receipt.Entries {
-		if entry.Channel != agent.ToolChannelToolPlugin {
-			continue
-		}
-		found = true
-		if entry.Outcome != agent.ToolOutcomeAdmitted {
-			t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
-		}
-		if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
-			t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
-		}
-		if entry.Required {
-			t.Errorf("tool_plugin entry must record Required: false for an all-advisory batch")
-		}
-	}
-	if !found {
-		t.Fatalf("receipt must name the tool_plugin channel; entries=%+v", receipt.Entries)
-	}
-	if len(adapted.AdditionalExtensions) != 1 {
-		t.Fatalf("admitted deliveries must stay on the adapted Spec, got %d", len(adapted.AdditionalExtensions))
+	for _, tc := range []struct {
+		name string
+		mode agent.PromptSessionMode
+		spec agent.Spec
+	}{
+		{name: "headless", mode: agent.PromptModeAutonomous, spec: agent.Spec{Autonomous: true, AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")}}},
+		{name: "interactive", mode: agent.PromptModeHumanControlled, spec: agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{advisoryExtensionDelivery("pack-1")}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			adapted, receipt, err := agent.AdaptToolLifecycle(tc.spec, mustProfile(t, manifest, tc.mode))
+			if err != nil {
+				t.Fatalf("AdaptToolLifecycle: %v", err)
+			}
+			if receipt.Decision != "ready" {
+				t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+			}
+			var found bool
+			for _, entry := range receipt.Entries {
+				if entry.Channel != agent.ToolChannelToolPlugin {
+					continue
+				}
+				found = true
+				if entry.Outcome != agent.ToolOutcomeAdmitted {
+					t.Errorf("tool_plugin entry outcome = %q, want admitted", entry.Outcome)
+				}
+				if entry.Delivery != agent.ToolDeliveryPiAdditionalExtension {
+					t.Errorf("tool_plugin entry delivery = %q, want %q", entry.Delivery, agent.ToolDeliveryPiAdditionalExtension)
+				}
+				if entry.Required {
+					t.Error("tool_plugin entry must record Required:false for an all-advisory batch")
+				}
+			}
+			if !found {
+				t.Fatalf("receipt must name the tool_plugin channel; entries=%+v", receipt.Entries)
+			}
+			if len(adapted.AdditionalExtensions) != 1 {
+				t.Fatalf("admitted deliveries must stay on the adapted Spec, got %d", len(adapted.AdditionalExtensions))
+			}
+		})
 	}
 }
 
