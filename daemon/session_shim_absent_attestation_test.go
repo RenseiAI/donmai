@@ -2,11 +2,8 @@ package daemon
 
 import (
 	"context"
-	"errors"
-	"os"
 	"strings"
 	"testing"
-	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -126,51 +123,9 @@ func TestCompleteAbsentAttestationReachesTheComposer(t *testing.T) {
 	}
 }
 
-// A refused report must leave the quarantine in place. Forgetting a lineage
-// whose report the composer rejected is precisely the divergence that made
-// every following batch incomplete.
-func TestRefusedAttestationRetainsTheQuarantine(t *testing.T) {
-	t.Parallel()
-	refusal := errors.New("composer refused")
-	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
-		RegistryDir:  t.TempDir(),
-		HostIDForOrg: func(context.Context, string) (string, error) { return "wh_test_host", nil },
-		OnTerminalEvidence: func(context.Context, SessionShimTerminalEvidence) error {
-			return refusal
-		},
-		OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
-			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-1"), AdoptionRevision: "1"}, nil
-		},
-	}})
-
-	id := sessionshim.Identity{OrgID: "org-retain", SessionID: "session-retain"}
-	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
-		SchemaVersion: sessionshim.RecordSchemaVersion,
-		OrgID:         id.OrgID, SessionID: id.SessionID,
-		ShimID: "shim-retain", ProcessEpoch: 7,
-		CreatedAtUnixNano: time.Now().UnixNano(),
-	}, sessionshim.QuarantineProtocolMismatch, "acceptance fixture", time.Now())
-	incarnation := shimIncarnation{identity: id, shimID: "shim-retain", processEpoch: 7}
-
-	d.shims.mu.Lock()
-	d.upsertShimQuarantineLocked(q)
-	// Our own pid with a deliberately wrong start time. Alive() reports the
-	// recorded process as gone without depending on some pid being free.
-	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{
-		PID: os.Getpid(), StartedAt: 1,
-	}
-	d.shims.mu.Unlock()
-
-	err := d.clearSessionShimAcceptanceQuarantine(incarnation)
-	if err == nil || !errors.Is(err, refusal) {
-		t.Fatalf("clear err = %v, want the composer refusal wrapped", err)
-	}
-
-	d.shims.mu.RLock()
-	remaining := len(d.shims.quarantined)
-	_, stillArmed := d.shims.acceptanceQuarantine[incarnation]
-	d.shims.mu.RUnlock()
-	if remaining != 1 || !stillArmed {
-		t.Errorf("quarantine dropped after a refused report: %d rows, armed=%v", remaining, stillArmed)
-	}
-}
+// The acceptance clear used to leave through an absent-attestation terminal
+// report; it now leaves through the batch's cleared section with an explicit
+// abandoned disposition, and the retain-on-refusal invariant this file used to
+// pin moved with it — see TestClearedReceiptEchoRefusalRetainsTheQuarantine in
+// session_shim_cleared_disposition_test.go. The attestation itself remains a
+// valid terminal-evidence shape, pinned by the tests above.
