@@ -2,11 +2,13 @@ package runner
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"os/exec"
 	"regexp"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
@@ -366,6 +368,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		if u := scanPRURL(prOut); u != "" {
 			report.PRURL = u
 			report.PRCreated = true
+			report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL)
 			return report
 		}
 		report.Diagnostics = fmt.Sprintf("gh pr create failed: %v\noutput: %s", err, prOut)
@@ -380,6 +383,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRURL = strings.TrimSpace(prOut)
 		report.PRCreated = true
 	}
+	report.PullRequest = lookupGitHubPullRequest(ctx, worktreePath, report.PRURL)
 	return report
 }
 
@@ -429,9 +433,55 @@ func (r *Runner) runDeclaredBackstops(
 			if res.PullRequestURL == "" {
 				res.PullRequestURL = report.PRURL
 			}
+			if report.PullRequest != nil {
+				aggregate.PullRequest = report.PullRequest
+			}
 		}
 	}
 	return aggregate
+}
+
+type ghPullRequestView struct {
+	Number      int    `json:"number"`
+	URL         string `json:"url"`
+	BaseRefName string `json:"baseRefName"`
+	HeadRefName string `json:"headRefName"`
+	Repository  struct {
+		NameWithOwner string `json:"nameWithOwner"`
+	} `json:"repository"`
+}
+
+// lookupGitHubPullRequest reads the complete PR projection after gh created
+// or detected a URL. The URL-only completion contract remains valid when this
+// best-effort metadata query cannot run; only the normalized pr.opened fact is
+// omitted in that case.
+func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string) *agent.PullRequestFact {
+	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" {
+		return nil
+	}
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
+		"--json", "number,url,baseRefName,headRefName,repository")
+	if err != nil {
+		return nil
+	}
+	var view ghPullRequestView
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		return nil
+	}
+	return pullRequestFactFromGitHubView(view)
+}
+
+func pullRequestFactFromGitHubView(view ghPullRequestView) *agent.PullRequestFact {
+	fact := &agent.PullRequestFact{
+		Provider: "github", Number: view.Number, Repository: view.Repository.NameWithOwner,
+		URL: view.URL, BaseBranch: view.BaseRefName, HeadBranch: view.HeadRefName,
+	}
+	if err := agent.ValidatePullRequestFact(*fact); err != nil {
+		return nil
+	}
+	return fact
 }
 
 func missingMutablePullRequests(res *Result, declaration workarea.NormalizedDeclaration) []string {

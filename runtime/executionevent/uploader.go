@@ -179,6 +179,26 @@ func (u *Uploader) SendSessionEndedWithEvidence(outcome, evidence, resultDigest 
 	return u.SendRecord(record)
 }
 
+// SendSessionBlocked appends a runner-owned blocked fact before terminal
+// settlement. The journal sequence is allocated at append time, preserving
+// contiguous ordering with provider-normalized events and session.ended.
+func (u *Uploader) SendSessionBlocked(reason string) error {
+	record, err := NewSessionBlockedRecord(u.config.SessionID, u.journal.NextSequence(), u.config.now(), reason)
+	if err != nil {
+		return err
+	}
+	return u.SendRecord(record)
+}
+
+// SendPullRequestOpened appends one complete, validated GitHub PR fact.
+func (u *Uploader) SendPullRequestOpened(fact agent.PullRequestFact) error {
+	record, err := NewPullRequestOpenedRecord(u.config.SessionID, u.journal.NextSequence(), u.config.now(), fact)
+	if err != nil {
+		return err
+	}
+	return u.SendRecord(record)
+}
+
 // Flush delivers the lowest-unacknowledged contiguous batch. Retryable
 // failures leave the journal and ack untouched. Permanent HTTP failures are
 // durably quarantined and acknowledged, allowing later records to progress.
