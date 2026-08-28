@@ -127,7 +127,7 @@ func TestExecutionEventSinkAppendsBlockedAndCompletePullRequestBeforeSoleTermina
 		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
 		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
 	}})
-	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact"}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "failed", FailureMode: FailureAgentBlocked,
@@ -172,7 +172,7 @@ func TestExecutionEventSinkRejectsSuccessfulForeignReadbackForSelectedRepository
 		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
 		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
 	}})
-	stubGhOnPath(t, 0, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated","repository":{"nameWithOwner":"unrelated/private"}}`)
+	stubGhOnPath(t, 0, `{"number":2,"url":"https://github.com/unrelated/private/pull/2","baseRefName":"main","headRefName":"fabricated"}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "completed", WorktreePath: worktree, WorkareaRoot: root.String(),
@@ -198,7 +198,7 @@ func TestExecutionEventSinkAllowsSelectedRepositoryFactWithRetargetedOriginAndDe
 		Source: workarea.RepositorySource{Repository: "https://github.com/RenseiAI/donmai.git", Ref: "main"},
 		Role:   workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
 	}})
-	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact"}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "completed", WorktreePath: worktree, WorkareaRoot: root.String(),
@@ -222,7 +222,7 @@ func TestExecutionEventSinkFailsClosedWithoutDeclarationAuthority(t *testing.T) 
 	t.Cleanup(func() { _ = uploader.Journal().Close() })
 	worktree := t.TempDir()
 	gitInitWithOrigin(t, worktree, "../retargeted/local-origin")
-	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact","repository":{"nameWithOwner":"RenseiAI/donmai"}}`)
+	stubGhOnPath(t, 0, `{"number":88,"url":"https://github.com/RenseiAI/donmai/pull/88","baseRefName":"main","headRefName":"agent/test-fact"}`)
 	sink := newExecutionEventSink(nil, uploader, nil)
 	sink.Close(&Result{Result: agent.Result{
 		Status: "completed", WorktreePath: worktree,
@@ -262,7 +262,7 @@ func TestExecutionEventPullRequestFactsAllowDeclaredMutableRepositoryWithRetarge
 	})); err != nil {
 		t.Fatal(err)
 	}
-	stubGhOnPath(t, 0, `{"number":9,"url":"https://github.com/RenseiAI/docs/pull/9","baseRefName":"main","headRefName":"agent/docs-pr","repository":{"nameWithOwner":"RenseiAI/docs"}}`)
+	stubGhOnPath(t, 0, `{"number":9,"url":"https://github.com/RenseiAI/docs/pull/9","baseRefName":"main","headRefName":"agent/docs-pr"}`)
 	r := minimalRunner(t)
 	res := &Result{Result: agent.Result{
 		Status:       "completed",

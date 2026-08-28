@@ -17,7 +17,6 @@ import (
 func TestPullRequestFactFromGitHubView(t *testing.T) {
 	t.Parallel()
 	valid := ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"}
-	valid.Repository.NameWithOwner = "RenseiAI/donmai"
 	got := pullRequestFactFromGitHubView(valid)
 	want := &agent.PullRequestFact{Provider: "github", Number: 77, Repository: "RenseiAI/donmai", URL: "https://github.com/RenseiAI/donmai/pull/77", BaseBranch: "main", HeadBranch: "agent/test-fact"}
 	if !reflect.DeepEqual(got, want) {
@@ -28,6 +27,55 @@ func TestPullRequestFactFromGitHubView(t *testing.T) {
 	invalid.HeadRefName = ""
 	if got := pullRequestFactFromGitHubView(invalid); got != nil {
 		t.Fatalf("pullRequestFactFromGitHubView(incomplete) = %+v, want nil", got)
+	}
+}
+
+func TestPullRequestFactFromGitHubViewRejectsSpoofedURLs(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		view ghPullRequestView
+	}{
+		{
+			name: "host spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com.evil.example/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "userinfo spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://token@github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "port spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com:444/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "path spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/issues/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "number spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/78", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "query spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77?tab=files", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "fragment spoof",
+			view: ghPullRequestView{Number: 77, URL: "https://github.com/RenseiAI/donmai/pull/77#discussion_r1", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+		{
+			name: "http scheme",
+			view: ghPullRequestView{Number: 77, URL: "http://github.com/RenseiAI/donmai/pull/77", BaseRefName: "main", HeadRefName: "agent/test-fact"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := pullRequestFactFromGitHubView(tc.view); got != nil {
+				t.Fatalf("pullRequestFactFromGitHubView(%+v) = %+v, want nil", tc.view, got)
+			}
+		})
 	}
 }
 
@@ -80,6 +128,29 @@ func TestCanonicalGitHubOriginRepository(t *testing.T) {
 				t.Fatalf("CanonicalGitHubRepositorySource(%q) = %q, want %q", tc.origin, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestLookupGitHubPullRequestUsesSupportedGhFields(t *testing.T) {
+	worktree := t.TempDir()
+	gitInit(t, worktree)
+	const prURL = "https://github.com/RenseiAI/donmai/pull/463"
+	stubGhOnPathExpectingPullRequestView(t, prURL, 0, `{"number":463,"url":"https://github.com/RenseiAI/donmai/pull/463","baseRefName":"main","headRefName":"worktree-pr-fact-github-origin-final-clean"}`)
+	fact := lookupGitHubPullRequest(context.Background(), worktree, prURL, map[string]struct{}{
+		"renseiai/donmai": {},
+	})
+	if fact == nil {
+		t.Fatal("lookupGitHubPullRequest() = nil, want fact")
+	}
+	if fact.Repository != "RenseiAI/donmai" || fact.Number != 463 {
+		t.Fatalf("lookupGitHubPullRequest() = %+v, want RenseiAI/donmai#463", fact)
+	}
+
+	stubGhOnPathExpectingPullRequestView(t, prURL, 0, `{"number":463,"url":"https://github.com/RenseiAI/docs/pull/463","baseRefName":"main","headRefName":"worktree-pr-fact-github-origin-final-clean"}`)
+	if fact := lookupGitHubPullRequest(context.Background(), worktree, prURL, map[string]struct{}{
+		"renseiai/donmai": {},
+	}); fact != nil {
+		t.Fatalf("lookupGitHubPullRequest() = %+v, want nil for unauthorized repository", fact)
 	}
 }
 
@@ -616,6 +687,29 @@ func stubGhOnPath(t *testing.T, exitCode int, output string) {
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
 	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
+func stubGhOnPathExpectingPullRequestView(t *testing.T, expectedURL string, exitCode int, output string) {
+	t.Helper()
+	dir := t.TempDir()
+	outFile := filepath.Join(dir, "gh-output.txt")
+	if err := os.WriteFile(outFile, []byte(output), 0o600); err != nil {
+		t.Fatalf("write gh stub output: %v", err)
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName" ]; then
+  echo "unexpected gh argv: $*" 1>&2
+  exit 1
+fi
+cat %[2]q 1>&2
+exit %[3]d
+`, expectedURL, outFile, exitCode)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh validating stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 }
