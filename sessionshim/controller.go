@@ -898,9 +898,21 @@ func (c *Controller) readLoop() {
 			}
 			continue
 		}
-		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError && c.failHeartbeatFromError(msg.Body) {
-			c.closeStream("shim refused the durable heartbeat", nil)
-			return
+		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError {
+			if refused, terminal := c.failHeartbeatFromError(msg.Body); refused {
+				if !terminal {
+					c.closeStream("shim refused the durable heartbeat", nil)
+					return
+				}
+				// A TERMINAL refusal is not a reason to drop the stream — it is
+				// the shim saying its tombstone is already on disk while it is
+				// still flushing the one Exit HostFrame that ends the session
+				// on THIS connection. Dropping here threw that observation
+				// away: the consumer then saw a stream that ended without a
+				// terminal frame, quarantined a lineage whose proof existed,
+				// and left the harness held. Keep reading.
+				continue
+			}
 		}
 		if c.selected >= shimwire.V3 {
 			switch msg.Type {
@@ -1012,22 +1024,35 @@ func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error
 	return nil
 }
 
-func (c *Controller) failHeartbeatFromError(body []byte) bool {
+// failHeartbeatFromError completes a pending acknowledgement from a refusal
+// frame. It reports whether the frame was consumed as one, and whether the
+// refusal was the TERMINAL one — the two answers the read loop needs, because
+// only one of them is a reason to drop the connection.
+func (c *Controller) failHeartbeatFromError(body []byte) (refused, terminal bool) {
 	c.heartbeatMu.Lock()
 	call := c.heartbeatCall
 	if call == nil {
 		c.heartbeatMu.Unlock()
-		return false
+		return false, false
 	}
 	c.heartbeatCall = nil
 	c.heartbeatMu.Unlock()
 	message, err := shimwire.DecodeError(body)
-	if err != nil {
+	switch {
+	case err != nil:
 		call.done <- heartbeatResult{err: err}
-	} else {
+	case message.Code == shimwire.CodeExited:
+		// The shim is not failing to answer — it is answering that its terminal
+		// proof is already published (shim.go's "heartbeat rejected: terminal
+		// proof is published"). That is a FACT about the lifecycle, not a
+		// transport failure, and a caller that only sees a formatted string
+		// throws it away and quarantines a session whose tombstone is on disk.
+		call.done <- heartbeatResult{err: fmt.Errorf("%w: %s", ErrShimExited, message.Code)}
+		return true, true
+	default:
 		call.done <- heartbeatResult{err: fmt.Errorf("sessionshim: selected-v3 heartbeat refused: %s", message.Code)}
 	}
-	return true
+	return true, false
 }
 
 func (c *Controller) failHeartbeatCall(err error) {
@@ -1107,6 +1132,16 @@ func (c *Controller) dispatchEvents() {
 // shim's own in-flight budget. It is a fail-closed decision, not a transport
 // error: the connection is dropped, the shim keeps the harness.
 var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
+
+// ErrShimExited reports that a shim refused a request because it has already
+// published its terminal proof.
+//
+// It is a sentinel rather than a message because the refusal is ACTIONABLE: the
+// tombstone exists by the time the shim answers this way, so the right response
+// is to go and consume it, not to treat the exchange as a broken socket and
+// leave the lineage in reconciliation quarantine until some later surface
+// happens to look.
+var ErrShimExited = errors.New("sessionshim: shim refused: terminal proof is already published")
 
 // eventBacklog is the bounded hand-off between the socket reader and the
 // consumer, accounted in payload bytes rather than frames.

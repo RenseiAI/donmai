@@ -376,26 +376,69 @@ func (r *Registry) tombstoneEntries() ([]tombstoneFile, error) {
 	return out, nil
 }
 
+// legacyTombstoneAliasSafe reports whether the identity-only alias may carry
+// this incarnation's proof.
+//
+// The alias says "this IDENTITY's harness group was reaped", so it may only be
+// written while the identity has no OTHER live incarnation, and it is never
+// overwritten once some incarnation owns it. §D7's duplicate-identity case
+// makes both real: a sibling lineage tombstoning beside a running session would
+// otherwise leave a v1 reader — which can only read the alias — believing the
+// live session's group was reaped, and the real lineage's later tombstone could
+// never replace an alias that is deliberately never overwritten.
+//
+// Both questions are answered from the two files that can possibly hold the
+// answer, addressed by name. This runs on every PutTombstone, under the shim's
+// recordMu, on the terminal path: scanning and decoding the whole registry
+// there made a shim's own finalization cost grow with every other session on
+// the host, and made one unreadable file belonging to a stranger suppress the
+// alias for everyone.
 func (r *Registry) legacyTombstoneAliasSafe(t Tombstone) (bool, error) {
-	names, err := r.entryNames(tombstoneSuffix)
-	if err != nil {
+	if err := r.checkDirMode(); err != nil {
 		return false, err
 	}
 	want := terminalIncarnationForTombstone(t)
-	for _, name := range names {
-		data, readErr := r.readEntry(name)
-		if readErr != nil {
-			return false, nil
-		}
-		existing, decodeErr := decodeTombstone(data)
-		if decodeErr != nil {
-			return false, nil
-		}
-		if existing.Identity() == t.Identity() && terminalIncarnationForTombstone(existing) != want {
-			return false, nil
-		}
+
+	// LIVE siblings only, and only this identity's. Put writes one discovery
+	// record per identity under Identity().RecordName(), so TODAY an identity
+	// has at most one record on disk and a later incarnation OVERWRITES the
+	// earlier one — this reads that single file because that is the whole store
+	// there is, not because the format guarantees it stays that way. Nothing
+	// here enforces it; a store that ever kept a record per incarnation would
+	// need this to read them all. What it does rule out is the case the
+	// whole-registry scan got wrong: a tombstone belonging to a DEAD sibling is
+	// not a liveness claim, and treating it as one refused the alias for a
+	// lineage whose identity had nothing running at all.
+	record, err := r.Get(t.Identity())
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		// No liveness claim for this identity at all.
+	case err != nil:
+		// This identity's OWN record is unreadable, so a sibling cannot be
+		// ruled out. Errors on any other entry are not this question's
+		// business and are never reached.
+		return false, nil
+	case record.Identity() != t.Identity():
+		// A record whose contents disagree with the name it was read under.
+		return false, nil
+	case record.ShimID != t.ShimID || record.ProcessEpoch != t.ProcessEpoch:
+		return false, nil
 	}
-	return true, nil
+
+	// The alias is a single file. If some incarnation already owns it, it keeps
+	// it; if this one owns it, rewriting is idempotent.
+	raw, err := r.readEntry(t.Identity().TombstoneName())
+	switch {
+	case errors.Is(err, fs.ErrNotExist):
+		return true, nil
+	case err != nil:
+		return false, nil
+	}
+	existing, err := decodeTombstone(raw)
+	if err != nil {
+		return false, nil
+	}
+	return terminalIncarnationForTombstone(existing) == want, nil
 }
 
 func (r *Registry) removeTombstoneFiles(files []tombstoneFile) error {

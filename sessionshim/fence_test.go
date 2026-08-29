@@ -431,3 +431,85 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 		t.Fatalf("request bytes omitted the per-session controller generation: %s", received.RequestBytes)
 	}
 }
+
+// TestTerminalProofCoversIsStrictlyIncarnationScoped pins the incarnation-scoped
+// question to evidence that NAMES an incarnation, and to nothing else.
+//
+// Two admissible §D10 forms name one: a correlation proof, and the scalar
+// Tombstone, which carries a shim id and a process epoch of its own. Consulting
+// only Correlations refused the second and answered `reconcile` forever for a
+// session whose proof arrived in the scalar field.
+//
+// The scalar AdoptedReceipt names NONE, and this question is only ever asked
+// about a lineage that is still live, so it can never be the answer: honouring
+// it here reported "covered" for a running sibling of a terminalized lineage and
+// released a live harness. Its §D10 admissibility lives in ReleaseDecision's
+// len(covered) <= 1 path instead, where "no other lineage is left" is a
+// precondition rather than an assumption.
+func TestTerminalProofCoversIsStrictlyIncarnationScoped(t *testing.T) {
+	t.Parallel()
+	id := Identity{OrgID: "org-covers", SessionID: "session-covers"}
+	const (
+		shimID = "shim-covers"
+		epoch  = uint64(5)
+	)
+	reaped := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: epoch, GroupReaped: true,
+	}
+	sibling := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-sibling", ProcessEpoch: 9, GroupReaped: true,
+	}
+	unreaped := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: epoch,
+	}
+	for _, tc := range []struct {
+		name  string
+		proof TerminalProof
+		want  bool
+	}{
+		{name: "no evidence proves nothing"},
+		{
+			name:  "an exact correlation tombstone covers it",
+			proof: TerminalProof{Correlations: []TerminalCorrelationProof{{ShimID: shimID, ProcessEpoch: epoch, Tombstone: reaped}}},
+			want:  true,
+		},
+		{
+			name:  "the scalar tombstone for this exact incarnation covers it",
+			proof: TerminalProof{Tombstone: reaped},
+			want:  true,
+		},
+		{
+			name:  "an adopted owner's terminal receipt names no incarnation and covers none",
+			proof: TerminalProof{AdoptedReceipt: true},
+		},
+		{
+			name:  "a sibling's tombstone does not cover it",
+			proof: TerminalProof{Tombstone: sibling},
+		},
+		{
+			name:  "a tombstone that did not prove a reap does not cover it",
+			proof: TerminalProof{Tombstone: unreaped},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := TerminalProofCovers(tc.proof, id, shimID, epoch); got != tc.want {
+				t.Fatalf("TerminalProofCovers = %t, want %t", got, tc.want)
+			}
+			if tc.want && !tc.proof.Proves() {
+				t.Fatal("the incarnation-scoped answer is more permissive than Proves() — those cannot disagree in this direction")
+			}
+		})
+	}
+	// The receipt is not merely unproven for THIS incarnation — it covers no
+	// incarnation at all, including one it was never asked about before.
+	if TerminalProofCovers(TerminalProof{AdoptedReceipt: true}, id, "shim-B", 2) {
+		t.Fatal("an identity-scoped adopted receipt covered an arbitrary incarnation of the identity")
+	}
+}

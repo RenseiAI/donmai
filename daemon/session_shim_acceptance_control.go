@@ -313,63 +313,113 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	if err != nil || present {
 		return errors.New("mutator-owned shim record remains live")
 	}
-	// The two checks above prove the helper is unobservable — not dead. No
-	// tombstone exists and none may be manufactured, so the lineage cannot
-	// leave through terminal evidence; and a batch that simply OMITS a lineage
-	// the composer still holds an active obligation for is refused as
-	// incomplete, after which the next heartbeat disagrees with the last
-	// committed set and the host is demoted to draining. Stage the explicit
-	// abandoned disposition instead: the next published batch carries the
-	// entry in its cleared section, the composer converts the obligation
-	// active → abandoned, and the lineage is forgotten locally only once the
-	// batch receipt echoes the entry back (the commit choke point in
-	// completeSessionShimAdoptionBatch). Until then the heartbeat keeps
-	// projecting it quarantined, so the beat never disagrees.
-	d.shims.mu.Lock()
-	if _, pending := d.shims.pendingCleared[incarnation]; !pending {
-		staged := false
-		for _, q := range d.shims.quarantined {
-			if q.Identity() != incarnation.identity || q.ShimID != incarnation.shimID || q.ProcessEpoch != incarnation.processEpoch {
-				continue
-			}
-			entry := SessionShimClearedQuarantine{
-				OrgID:                q.OrgID,
-				SessionID:            q.SessionID,
-				ShimID:               q.ShimID,
-				ProcessEpoch:         q.ProcessEpoch,
-				ControllerGeneration: q.ControllerGeneration,
-				Disposition:          SessionShimDispositionAbandoned,
-				Reason:               SessionShimClearedReasonAcceptanceClearWithoutTerminalEvidence,
-			}
-			if err := entry.Validate(); err != nil {
-				d.shims.mu.Unlock()
-				return err
-			}
-			d.shims.pendingCleared[incarnation] = entry
-			staged = true
+	// The helper reaps its own harness process GROUP, verifies the exact
+	// recorded incarnation is gone, and durably publishes a real tombstone
+	// before it exits — so this lineage leaves the way every other
+	// quarantined-then-terminal lineage leaves: through the production
+	// reconcile, which reports shim_terminal_tombstone evidence for the exact
+	// incarnation, drops the quarantine, and republishes the complete batch.
+	//
+	// Nothing is staged as abandoned here, and nothing is manufactured. An
+	// abandoned disposition closes what the daemon owes the composer and never
+	// what the session owes the fence (§D10), so a lineage cleared that way
+	// holds the release predicate forever — the session it belongs to can
+	// never terminalize afterwards. Driving the reconcile is also why this
+	// waits rather than returning: an acceptance clear whose caller then
+	// observes an unreconciled projection would be reporting the seam's own
+	// latency as product behaviour. The bound is the terminal path's own
+	// settle window — the mutator already proved the record is withdrawn, and
+	// PutTombstone publishes the proof BEFORE it withdraws the record, so the
+	// tombstone is on disk by the time this runs.
+	// ONE clock. The wait sleeps in real time, so the deadline is real time
+	// too; mixing an injectable now() with a real Sleep makes the bound mean
+	// different things in a test and on a host.
+	//
+	// And the deadline is STRICTLY LARGER than the longest single wait one
+	// reconcile pass can spend inside it — two callback round trips, not one.
+	// It used to equal the settle window exactly, which left zero margin: one
+	// contended pass consumed the whole budget and the clear then reported a
+	// timeout for a lineage that was reconciling normally.
+	deadline := time.Now().Add(acceptanceClearDeadlineFor(d.sessionShimConfig().callbackTimeout()))
+	for {
+		d.reconcileQuarantinedTombstones()
+		quarantined, tombstoned := d.sessionShimLineageDisposition(incarnation)
+		if !quarantined && tombstoned {
 			break
 		}
-		if !staged {
-			// No quarantined projection row exists for this incarnation, so
-			// there is nothing the composer could still be holding; drop only
-			// the acceptance bookkeeping.
-			delete(d.shims.acceptanceQuarantine, incarnation)
-			d.shims.mu.Unlock()
-			return nil
+		if !time.Now().Before(deadline) {
+			return errors.New("acceptance clear: the quarantined lineage did not reconcile through its terminal tombstone")
+		}
+		time.Sleep(acceptanceClearPollInterval)
+	}
+	// The quarantine set changed, so the projection has to be republished from
+	// HERE. The platform compares each beat's quarantine set against the
+	// snapshot the last batch commit stored and demotes the host to `draining`
+	// when the two disagree. Publishing from inside the reconcile instead would
+	// put a blocking durable commit on every occupancy and heartbeat surface
+	// that calls it, including the middle of a beat's own projection build.
+	if err := d.republishSessionShimProjection(context.Background(), incarnation.identity.OrgID); err != nil {
+		return err
+	}
+	d.shims.mu.Lock()
+	delete(d.shims.acceptanceQuarantine, incarnation)
+	d.shims.mu.Unlock()
+	return nil
+}
+
+// acceptanceClearPollInterval paces the wait for the production reconcile. It
+// is derived from the settle window rather than picked: a 25ms poll spent the
+// whole window re-driving a reconcile whose own commit is rate-limited anyway.
+const acceptanceClearPollInterval = tombstoneSettleWindow / 20
+
+// acceptanceClearDeadlineMargin is the headroom above the longest inner wait.
+// It is derived from the settle window for the same reason the poll interval
+// is: one number moves, and everything sized from it moves with it.
+const acceptanceClearDeadlineMargin = tombstoneSettleWindow / 2
+
+// acceptanceClearDeadlineFor sizes the clear's own bound.
+//
+// The clear drives the production reconcile in a loop, and ONE pass of that
+// reconcile can block for TWO full platform round trips, not one: the owning
+// pass resolves the host identity under its own callback context and then hands
+// the terminal evidence over under a second one, each bounded separately by the
+// callback timeout. A budget equal to the settle window had zero margin — a
+// single contended pass spent all of it and the clear failed a lineage that was
+// reconciling correctly — and a budget of one round trip still under-counts the
+// wait it is meant to survive. The bound is the settle window the tombstone
+// itself needs, PLUS the longest single inner pass, plus margin.
+func acceptanceClearDeadlineFor(callbackTimeout time.Duration) time.Duration {
+	if callbackTimeout < 0 {
+		callbackTimeout = 0
+	}
+	return tombstoneSettleWindow + 2*callbackTimeout + acceptanceClearDeadlineMargin
+}
+
+// sessionShimLineageDisposition reports whether one exact incarnation is still
+// projected quarantined, and whether this daemon retains a terminal tombstone
+// for it.
+//
+// Both halves are needed because the reconcile runs from every occupancy and
+// heartbeat surface: by the time an acceptance clear arrives the lineage may
+// already have left through its tombstone, and the tombstone itself is disposed
+// once the durable handoff succeeds. "Gone" alone would let a lineage that
+// vanished some other way pass as a reconciled one.
+func (d *Daemon) sessionShimLineageDisposition(incarnation shimIncarnation) (quarantined, tombstoned bool) {
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	for _, q := range d.shims.quarantined {
+		if q.Identity() == incarnation.identity && q.ShimID == incarnation.shimID && q.ProcessEpoch == incarnation.processEpoch {
+			quarantined = true
+			break
 		}
 	}
-	d.shims.mu.Unlock()
-	if d.sessionShimConfig().OnAdoptionBatch == nil {
-		// Standalone: no composer holds a recovery obligation for this lineage,
-		// so there is no durable commit to confirm — the local drop is the
-		// commit.
-		d.shims.mu.RLock()
-		entry := d.shims.pendingCleared[incarnation]
-		d.shims.mu.RUnlock()
-		d.dropSessionShimClearedQuarantinesCommitted([]SessionShimClearedQuarantine{entry})
-		return nil
+	for _, t := range d.shims.tombstoned {
+		if t.Identity() == incarnation.identity && t.ShimID == incarnation.shimID && t.ProcessEpoch == incarnation.processEpoch {
+			tombstoned = true
+			break
+		}
 	}
-	return d.republishSessionShimProjection(context.Background(), incarnation.identity.OrgID)
+	return quarantined, tombstoned
 }
 
 func (d *Daemon) armSessionShimAcceptanceFenceRefusal(id sessionshim.Identity) error {
