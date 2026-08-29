@@ -6,7 +6,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
-## [Unreleased]
+## v0.72.3 — 2026-08-29
 
 ### Fixes
 
