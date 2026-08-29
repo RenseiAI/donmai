@@ -31,9 +31,31 @@ func TestTombstoneIsPublishedBeforeTheCourtesyWaits(t *testing.T) {
 	// One courtesy window, long enough that "before" and "after" are not a
 	// scheduling accident.
 	const grace = 2 * time.Second
+	// The boundary itself, not a stopwatch: the courtesy section announces
+	// itself, and the proof must already be on disk when it does. It is
+	// installed through Options because Start launches watchHarness before it
+	// returns — assigning it on the returned Shim is a cross-goroutine write
+	// with no happens-before edge.
+	courtesy := make(chan bool, 1)
 	shim, err := Start(Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
 		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V3,
+		onTerminalCourtesy: func() {
+			// By identity and epoch, not by shim id: the shim id is only known
+			// after Start returns, and this callback is installed before it.
+			tombstones, scanErr := registry.ScanTombstones()
+			if scanErr != nil {
+				courtesy <- false
+				return
+			}
+			for _, tombstone := range tombstones {
+				if tombstone.Identity() == id && tombstone.ProcessEpoch == 1 {
+					courtesy <- true
+					return
+				}
+			}
+			courtesy <- false
+		},
 		// Real output: the durable-ack wait is skipped for a session that never
 		// allocated a sequence, and a courtesy window that returns instantly
 		// would make this test prove nothing.
@@ -63,14 +85,6 @@ func TestTombstoneIsPublishedBeforeTheCourtesyWaits(t *testing.T) {
 	waitForShimSequence(t, shim, 1, 10*time.Second)
 	if want := shim.FinalizeBound(); want != 2*grace {
 		t.Fatalf("FinalizeBound() = %s, want the two courtesy windows (%s)", want, 2*grace)
-	}
-
-	// The boundary itself, not a stopwatch: the courtesy section announces
-	// itself, and the proof must already be on disk when it does.
-	courtesy := make(chan bool, 1)
-	shim.onTerminalCourtesy = func() {
-		_, tombErr := registry.GetTombstoneIncarnation(id, shim.ShimID(), 1)
-		courtesy <- tombErr == nil
 	}
 
 	terminated := make(chan error, 1)
@@ -184,14 +198,24 @@ func TestTerminalCursorAcknowledgementSurvivesTheTombstone(t *testing.T) {
 		t.Fatal(err)
 	}
 	id := Identity{OrgID: "org-terminal-ack", SessionID: "session-terminal-ack"}
-	// One courtesy window, long enough that spending it and not spending it are
-	// not a scheduling accident.
-	const grace = 2 * time.Second
+	// One courtesy window. The elapsed assertion below is against HALF of it,
+	// so the window has to be wide enough that half of it still comfortably
+	// covers a spawn, a handshake and a Terminate on a loaded parallel -race
+	// run — while the whole of it is what the pre-fix code burned every time.
+	const grace = 4 * time.Second
+	// The acknowledgement is released by the tombstone, not by a sleep: the
+	// courtesy boundary fires immediately after the proof is durable, so an
+	// acknowledgement gated on it is provably a POST-terminal one. It is
+	// installed through Options because Start launches watchHarness before it
+	// returns — assigning it on the returned Shim is a cross-goroutine write
+	// with no happens-before edge.
+	tombstoned := make(chan struct{})
 	shim, err := Start(Options{
 		Identity: id, Registry: registry, ProcessEpoch: 1,
 		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V3,
-		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "while :; do sleep 0.05; done"}},
-		Orphan: OrphanPolicy{Deadline: 90 * time.Second, TerminationGrace: grace, PropagationMargin: 30 * time.Second},
+		Spec:               ptyhost.Spec{Command: []string{"/bin/sh", "-c", "while :; do sleep 0.05; done"}},
+		Orphan:             OrphanPolicy{Deadline: 90 * time.Second, TerminationGrace: grace, PropagationMargin: 30 * time.Second},
+		onTerminalCourtesy: func() { close(tombstoned) },
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -206,12 +230,6 @@ func TestTerminalCursorAcknowledgementSurvivesTheTombstone(t *testing.T) {
 	}
 	t.Cleanup(result.Close)
 	controller := result.Adopted[0]
-
-	// The acknowledgement is released by the tombstone, not by a sleep: the
-	// courtesy boundary fires immediately after the proof is durable, so an
-	// acknowledgement gated on it is provably a POST-terminal one.
-	tombstoned := make(chan struct{})
-	shim.onTerminalCourtesy = func() { close(tombstoned) }
 
 	type ackOutcome struct {
 		exitSeq uint64
@@ -277,8 +295,13 @@ func TestTerminalCursorAcknowledgementSurvivesTheTombstone(t *testing.T) {
 	if frozen != out.exitSeq {
 		t.Fatalf("terminal proof froze sequence %d, want the Exit frame's own %d", frozen, out.exitSeq)
 	}
-	if elapsed >= grace {
-		t.Fatalf("finalization took %s, i.e. at least the whole %s courtesy window — the shim refused the "+
-			"acknowledgement it was waiting for, so every terminal exit pays the full bound", elapsed, grace)
+	// Half the injected bound, not a picked number. The pre-fix shim refused
+	// the very acknowledgement its durable-ack courtesy was waiting for and
+	// therefore burned the WHOLE window on every terminal exit; anything under
+	// half of it cannot be that, and the other half is slack for the spawn,
+	// handshake and Terminate this span also contains.
+	if budget := grace / 2; elapsed >= budget {
+		t.Fatalf("finalization took %s, over half the %s courtesy window (budget %s) — the shim refused the "+
+			"acknowledgement it was waiting for, so every terminal exit pays the full bound", elapsed, grace, budget)
 	}
 }

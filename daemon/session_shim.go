@@ -3629,8 +3629,14 @@ func (d *Daemon) SessionShimReleaseDecision(orgID, sessionID string, proof sessi
 	// fence enumerates the correlations, this daemon's own live set is the
 	// enumeration.
 	if live := d.liveSessionShimCorrelations(id); len(live) > 0 {
+		// The scalar, identity-scoped AdoptedReceipt closes an exact
+		// incarnation only when the identity HAS exactly one — the same
+		// precondition ReleaseDecision applies to a fence's covered set. With a
+		// sibling still live it names no incarnation at all, and honouring it
+		// per correlation would release a running harness.
+		sole := len(live) == 1
 		for _, correlation := range live {
-			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch) {
+			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch, sole) {
 				if fence != nil && fence.Covers(id) && !fence.Expired(time.Now()) && fence.State == sessionshim.FenceHeld {
 					return sessionshim.ReleaseHeld
 				}

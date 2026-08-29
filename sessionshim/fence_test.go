@@ -433,12 +433,19 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 }
 
 // TestTerminalProofCoversHonoursBothAdmissibleForms pins the incarnation-scoped
-// question to the same evidence §D10 admits.
+// question to the same evidence §D10 admits — and to no more than that.
 //
 // A pre-check that is stricter than the predicate it guards is not caution — it
 // is a different rule. Consulting only Correlations refused every proof carried
 // in the scalar fields, so a session whose adopted owner had already reported an
 // ordinary terminal receipt answered `reconcile` forever.
+//
+// A pre-check that is LOOSER is worse: the scalar AdoptedReceipt names no shim
+// id and no epoch, so honouring it for each of several live correlations
+// answered "covered" for a running sibling and released a live harness. Both
+// scalar halves therefore carry the same negative sibling case here; the
+// receipt's is gated on being the identity's sole correlation, exactly as
+// ReleaseDecision gates it on len(covered) <= 1.
 func TestTerminalProofCoversHonoursBothAdmissibleForms(t *testing.T) {
 	t.Parallel()
 	id := Identity{OrgID: "org-covers", SessionID: "session-covers"}
@@ -464,37 +471,58 @@ func TestTerminalProofCoversHonoursBothAdmissibleForms(t *testing.T) {
 	for _, tc := range []struct {
 		name  string
 		proof TerminalProof
-		want  bool
+		// sole says the asked-about incarnation is the identity's only live
+		// correlation. false means a sibling of it is still running.
+		sole bool
+		want bool
 	}{
-		{name: "no evidence proves nothing"},
+		{name: "no evidence proves nothing", sole: true},
 		{
 			name:  "an exact correlation tombstone covers it",
 			proof: TerminalProof{Correlations: []TerminalCorrelationProof{{ShimID: shimID, ProcessEpoch: epoch, Tombstone: reaped}}},
 			want:  true,
 		},
 		{
+			name:  "an exact correlation tombstone covers it beside a live sibling",
+			proof: TerminalProof{Correlations: []TerminalCorrelationProof{{ShimID: shimID, ProcessEpoch: epoch, Tombstone: reaped}}},
+			want:  true,
+		},
+		{
 			name:  "the scalar tombstone for this exact incarnation covers it",
+			proof: TerminalProof{Tombstone: reaped},
+			sole:  true,
+			want:  true,
+		},
+		{
+			name:  "the scalar tombstone still covers it beside a live sibling",
 			proof: TerminalProof{Tombstone: reaped},
 			want:  true,
 		},
 		{
-			name:  "an adopted owner's terminal receipt covers it",
+			name:  "an adopted owner's terminal receipt covers the sole correlation",
 			proof: TerminalProof{AdoptedReceipt: true},
+			sole:  true,
 			want:  true,
+		},
+		{
+			name:  "an adopted owner's terminal receipt does not cover it beside a live sibling",
+			proof: TerminalProof{AdoptedReceipt: true},
 		},
 		{
 			name:  "a sibling's tombstone does not cover it",
 			proof: TerminalProof{Tombstone: sibling},
+			sole:  true,
 		},
 		{
 			name:  "a tombstone that did not prove a reap does not cover it",
 			proof: TerminalProof{Tombstone: unreaped},
+			sole:  true,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := TerminalProofCovers(tc.proof, id, shimID, epoch); got != tc.want {
-				t.Fatalf("TerminalProofCovers = %t, want %t", got, tc.want)
+			if got := TerminalProofCovers(tc.proof, id, shimID, epoch, tc.sole); got != tc.want {
+				t.Fatalf("TerminalProofCovers(sole=%t) = %t, want %t", tc.sole, got, tc.want)
 			}
 			if tc.want && !tc.proof.Proves() {
 				t.Fatal("the incarnation-scoped answer is more permissive than Proves() — those cannot disagree in this direction")

@@ -56,6 +56,14 @@ type Options struct {
 
 	// Now lets tests drive deterministic timestamps.
 	Now func() time.Time
+
+	// onTerminalCourtesy is the unexported test seam described on Shim's field
+	// of the same name. It is set HERE rather than on the returned Shim because
+	// Start launches watchHarness before it returns: a harness that exits on
+	// its own reads the field from that goroutine, so assigning it afterwards
+	// is an unsynchronized cross-goroutine write with no happens-before edge —
+	// a data race whether or not a given run happens to lose it.
+	onTerminalCourtesy func()
 }
 
 func (o Options) logger() *slog.Logger {
@@ -138,6 +146,10 @@ type Shim struct {
 	// production build; it exists so a test can observe WHICH side of that
 	// boundary the tombstone is written on, which no timing assertion can do
 	// reliably when a controller happens to drain quickly.
+	//
+	// It is set ONCE, from Options, before Start launches watchHarness — the
+	// goroutine that reads it. Assigning it on a returned Shim would be an
+	// unsynchronized cross-goroutine write.
 	onTerminalCourtesy func()
 }
 
@@ -382,6 +394,8 @@ func Start(opts Options) (*Shim, error) {
 		done:         make(chan struct{}),
 		acceptDone:   make(chan struct{}),
 		ackNotify:    make(chan struct{}),
+
+		onTerminalCourtesy: opts.onTerminalCourtesy,
 	}
 
 	if err := s.publishRecord(); err != nil {
@@ -570,10 +584,20 @@ func (s *Shim) finalizeTerminal() error {
 			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
 				"session", s.id.String())
 		}
-		// Socket write completion is not the carrier durability boundary. Give
-		// the exact selected-v3 persistence receipt the same bounded
-		// opportunity so an adopting controller can resume from the exact
-		// terminal cursor.
+		// Socket write completion is not the acknowledgement boundary: the pump
+		// having handed the Exit frame to the kernel says nothing about the
+		// controller having read it. Give the controller the same bounded
+		// opportunity to acknowledge that exact sequence back.
+		//
+		// AFTER THE TOMBSTONE THIS IS DELIVERY CONFIRMATION, NOT PERSISTENCE.
+		// PutTombstone already removed the live incarnation's durable-ack
+		// sidecar, and the heartbeat path deliberately does not write one back
+		// — an entry whose discovery record no longer exists is unreachable and
+		// uncollectable. The resume cursor an adopting controller reads is the
+		// tombstone's own fsync-backed LastSeq, which equals the frozen
+		// terminalSeq this waits for. So what is being waited on is the
+		// controller's receipt of the terminal frame; the durable half is
+		// already on disk before the wait begins.
 		s.waitForDurableAck(uint64(lastSeq), flushBound)
 	}
 	close(s.done)

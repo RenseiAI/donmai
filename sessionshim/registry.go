@@ -400,9 +400,14 @@ func (r *Registry) legacyTombstoneAliasSafe(t Tombstone) (bool, error) {
 	want := terminalIncarnationForTombstone(t)
 
 	// LIVE siblings only, and only this identity's. Put writes one discovery
-	// record per identity under Identity().RecordName(), so that single file is
-	// the identity's whole liveness claim — a tombstone belonging to a DEAD
-	// sibling is not one, and treating it as one refused the alias for a
+	// record per identity under Identity().RecordName(), so TODAY an identity
+	// has at most one record on disk and a later incarnation OVERWRITES the
+	// earlier one — this reads that single file because that is the whole store
+	// there is, not because the format guarantees it stays that way. Nothing
+	// here enforces it; a store that ever kept a record per incarnation would
+	// need this to read them all. What it does rule out is the case the
+	// whole-registry scan got wrong: a tombstone belonging to a DEAD sibling is
+	// not a liveness claim, and treating it as one refused the alias for a
 	// lineage whose identity had nothing running at all.
 	record, err := r.Get(t.Identity())
 	switch {

@@ -399,31 +399,48 @@ func (p TerminalProof) provesCorrelation(id Identity, fenced FencedSession) bool
 	return false
 }
 
+// provesScalarTombstone answers the scalar Tombstone half. The scalar field
+// predates duplicate identities, but it names a shim id and a process epoch, so
+// it is incarnation-scoped on its own and admissible whatever else is live.
+func (p TerminalProof) provesScalarTombstone(id Identity, fenced FencedSession) bool {
+	return p.Tombstone != nil && p.Tombstone.GroupReaped && p.Tombstone.Identity() == id &&
+		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
+}
+
 func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedSession) bool {
 	if p.AdoptedReceipt {
 		return true
 	}
-	return p.Tombstone != nil && p.Tombstone.GroupReaped && p.Tombstone.Identity() == id &&
-		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
+	return p.provesScalarTombstone(id, fenced)
 }
 
 // TerminalProofCovers reports whether proof positively closes ONE exact
 // incarnation of id, by EITHER admissible §D10 form.
 //
-// It is the incarnation-scoped question, exported because a caller that holds
-// several live correlations must be able to ask about each one rather than
-// about "the session". It still honours the scalar AdoptedReceipt and scalar
-// Tombstone: those are identity-scoped by design — they predate duplicate
-// identities — and ReleaseDecision itself accepts them, so a pre-check that
-// consulted only Correlations would be STRICTER than the predicate it guards
-// and would answer `reconcile` for a session whose adopted owner had already
-// reported an ordinary terminal receipt.
-func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64) bool {
+// soleCorrelation says whether that incarnation is the ONLY one the caller
+// holds for this identity, and it is load-bearing rather than a hint. The
+// scalar AdoptedReceipt carries no shim id and no epoch: it says "an adopted
+// owner reported a terminal receipt for this session", which closes an exact
+// incarnation only when the session HAS exactly one. Consulting it per
+// incarnation without that precondition answered "covered" for a running
+// sibling of a terminalized lineage — precisely the double-execution invariant
+// 10 exists to prevent — and it is why ReleaseDecision itself only reaches the
+// legacy form under len(covered) <= 1. The scalar Tombstone half needs no such
+// gate: it names the incarnation it proves.
+//
+// The question is exported because a caller that holds several live
+// correlations must be able to ask about each one rather than about "the
+// session", and it must not be STRICTER than the predicate it guards: with a
+// sole correlation it still accepts the scalar receipt ReleaseDecision accepts.
+func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64, soleCorrelation bool) bool {
 	fenced := FencedSession{
 		OrgID: id.OrgID, SessionID: id.SessionID,
 		ShimID: shimID, ProcessEpoch: processEpoch,
 	}
-	return proof.provesCorrelation(id, fenced) || proof.legacyProvesSingleCorrelation(id, fenced)
+	if proof.provesCorrelation(id, fenced) || proof.provesScalarTombstone(id, fenced) {
+		return true
+	}
+	return soleCorrelation && proof.AdoptedReceipt
 }
 
 // ReleaseVerdict is the outcome of the single claim-release predicate.
