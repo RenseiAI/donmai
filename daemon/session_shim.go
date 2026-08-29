@@ -3617,7 +3617,7 @@ func (d *Daemon) SessionShimReleaseDecision(orgID, sessionID string, proof sessi
 		}
 		d.shims.mu.RUnlock()
 	}
-	// Every lineage this daemon still holds for the identity must be proven,
+	// Every lineage this daemon STILL holds for the identity must be proven,
 	// not just SOME lineage of it.
 	//
 	// §D10 requires proof that "that exact harness process group" was reaped.
@@ -3628,15 +3628,19 @@ func (d *Daemon) SessionShimReleaseDecision(orgID, sessionID string, proof sessi
 	// daemon's life, because the retained tombstone never expires. When no
 	// fence enumerates the correlations, this daemon's own live set is the
 	// enumeration.
+	//
+	// The set enumerated here is the REMAINING one: a terminalizing path drops
+	// its own entry before it asks (finishAdoptedShim deletes the adopted entry,
+	// then decides), so an empty set is the ordinary single-lineage case and any
+	// member of a non-empty one is a SIBLING that is still running. That is why
+	// the per-incarnation question is strictly incarnation-scoped and refuses
+	// the identity-scoped AdoptedReceipt outright: a receipt can never name a
+	// remaining sibling. The receipt keeps its §D10 admissibility through
+	// ReleaseDecision's len(covered) <= 1 path below, which this pre-check
+	// reaches only when nothing else is left alive.
 	if live := d.liveSessionShimCorrelations(id); len(live) > 0 {
-		// The scalar, identity-scoped AdoptedReceipt closes an exact
-		// incarnation only when the identity HAS exactly one — the same
-		// precondition ReleaseDecision applies to a fence's covered set. With a
-		// sibling still live it names no incarnation at all, and honouring it
-		// per correlation would release a running harness.
-		sole := len(live) == 1
 		for _, correlation := range live {
-			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch, sole) {
+			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch) {
 				if fence != nil && fence.Covers(id) && !fence.Expired(time.Now()) && fence.State == sessionshim.FenceHeld {
 					return sessionshim.ReleaseHeld
 				}

@@ -1181,7 +1181,9 @@ func (d *Daemon) upsertShimQuarantineLocked(q sessionshim.QuarantinedSession) {
 // tombstone for the exact quarantined shim proves its harness group was reaped.
 // It is called by the occupancy/reporting surfaces that already run on every
 // admission and heartbeat, so reconciliation needs no unbounded background
-// goroutine and cannot delay intentional daemon shutdown.
+// goroutine. The pass that OWNS a lineage's handoff reports it synchronously,
+// bounded by the two callback timeouts that round trip costs (host identity,
+// then the terminal evidence); every other pass skips immediately.
 func (d *Daemon) reconcileQuarantinedTombstones() {
 	if d.shims == nil {
 		return
@@ -1231,70 +1233,104 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		if !own {
 			continue
 		}
-		hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
-		if hostErr != nil {
-			slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
-				"session", id.String(), "error", hostErr)
-			d.releaseSessionShimTerminalReport(key, false, time.Now())
-			continue
-		}
-		// NO adoption correlation, even when this daemon still retains one.
-		//
-		// This lineage is being reported out of the QUARANTINE set, and the
-		// obligation the composer holds for it is quarantined-kind: it resolves
-		// on lifecycle identity plus shim id and process epoch. Attaching an
-		// adoption receipt asks the receiver for the ADOPTED-kind predicate
-		// instead, which matches nothing once the lineage was reported
-		// quarantined — measured on an installed host as a terminal observation
-		// that committed while the obligation stayed `active`, after which every
-		// complete batch was refused `adoption_batch_live_lineage_omitted` and
-		// the host could not recover.
-		terminalEvidence := SessionShimTerminalEvidence{
-			Identity:     id,
-			HostID:       hostID,
-			ShimID:       tombstone.ShimID,
-			ProcessEpoch: tombstone.ProcessEpoch,
-			Tombstone:    tombstone,
-		}
-		if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
-			slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
-				"session", id.String(), "error", err)
-			d.releaseSessionShimTerminalReport(key, false, time.Now())
-			continue
-		}
-		// ONLY NOW. The evidence is durably accepted, so the composer has
-		// resolved this lineage's quarantined obligation and the row may leave
-		// the quarantine projection for the terminal set.
-		//
-		// A false answer means the row left by another route while the report
-		// was in flight. The evidence committed either way, so the proof is
-		// still disposed below — leaving it on disk would strand a permanent
-		// handoff mark guarding a tombstone no pass can reach any more.
-		_ = d.withdrawQuarantinedLineageAfterDurableHandoff(key, tombstone)
+		d.handOffQuarantinedTerminalProof(registry, key, tombstone)
+	}
+}
 
-		// Withdraw the liveness claim BEFORE disposing the proof, exactly as
-		// finishAdoptedShim does. Disposing first would collapse "terminal,
-		// proven" into "a record whose process is gone", which §D10 classifies
-		// as stale and leaves unresolved. Remove is idempotent, so the ordinary
-		// case where the shim already withdrew its own record costs nothing.
-		disposed := false
-		if err := registry.RemoveIncarnation(id, tombstone.ShimID, tombstone.ProcessEpoch); err != nil {
-			slog.Warn("session shim: withdraw discovery record after durable terminal handoff",
-				"session", id.String(), "error", err)
-		} else if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
-			slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
-				"session", id.String(), "error", err)
-		} else {
-			disposed = true
-		}
-		d.releaseSessionShimTerminalReport(key, true, time.Now())
-		if disposed {
-			// The proof is off disk, so no later pass can rediscover this
-			// incarnation and no mark is needed to stop it. Keeping one would
-			// make this map grow for the daemon's whole life.
+// handOffQuarantinedTerminalProof performs the durable terminal handoff for the
+// ONE incarnation whose in-flight mark this caller already owns, and releases
+// that mark however it leaves.
+//
+// The release is a defer keyed on a flag, not three explicit calls at the exits.
+// This runs on the daemon's control-API handler goroutines, where net/http
+// RECOVERS a panic raised inside a downstream callback — so an explicit release
+// below a panicking HostIDForOrg or OnTerminalEvidence is simply never reached,
+// the mark stays in flight for the rest of the daemon's life, every later pass
+// answers "not mine" and skips, and the lineage stays projected quarantined and
+// charged against capacity forever. The ordinary paths behave exactly as they
+// did: the flag carries the same committed/refused answer they used to pass by
+// hand, and a refusal (a panic included) still cools off before a retry.
+func (d *Daemon) handOffQuarantinedTerminalProof(
+	registry *sessionshim.Registry,
+	key shimIncarnation,
+	tombstone sessionshim.Tombstone,
+) {
+	id := key.identity
+	committed := false
+	forget := false
+	defer func() {
+		d.releaseSessionShimTerminalReport(key, committed, time.Now())
+		if forget {
 			d.forgetSessionShimTerminalReport(key)
 		}
+	}()
+
+	hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
+	if hostErr != nil {
+		slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
+			"session", id.String(), "error", hostErr)
+		return
 	}
+	// NO adoption correlation, even when this daemon still retains one.
+	//
+	// This lineage is being reported out of the QUARANTINE set, and the
+	// obligation the composer holds for it is quarantined-kind: it resolves on
+	// lifecycle identity plus shim id and process epoch. Attaching an adoption
+	// receipt asks the receiver for the ADOPTED-kind predicate instead, which
+	// matches nothing once the lineage was reported quarantined — measured on an
+	// installed host as a terminal observation that committed while the
+	// obligation stayed `active`, after which every complete batch was refused
+	// `adoption_batch_live_lineage_omitted` and the host could not recover.
+	terminalEvidence := SessionShimTerminalEvidence{
+		Identity:     id,
+		HostID:       hostID,
+		ShimID:       tombstone.ShimID,
+		ProcessEpoch: tombstone.ProcessEpoch,
+		Tombstone:    tombstone,
+	}
+	if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
+		slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
+			"session", id.String(), "error", err)
+		return
+	}
+	committed = true
+
+	// ONLY NOW. The evidence is durably accepted, so the composer has resolved
+	// this lineage's quarantined obligation and the row may leave the quarantine
+	// projection for the terminal set.
+	if !d.withdrawQuarantinedLineageAfterDurableHandoff(key, tombstone) {
+		// The row left by another route while the report was in flight. The
+		// evidence committed either way, but THIS pass withdrew nothing and
+		// recorded nothing in the terminal set — so the on-disk proof stays
+		// where it is. Disposing it here would delete the only artifact
+		// SessionShimTerminalProof can still read for this incarnation and turn
+		// a proven death back into an unresolved one; a later pass, or the next
+		// startup, re-proves it from disk. The mark may go: the reconcile only
+		// ever reaches a lineage through the quarantine set, and this one is no
+		// longer in it.
+		forget = true
+		return
+	}
+
+	// Withdraw the liveness claim BEFORE disposing the proof, exactly as
+	// finishAdoptedShim does. Disposing first would collapse "terminal, proven"
+	// into "a record whose process is gone", which §D10 classifies as stale and
+	// leaves unresolved. Remove is idempotent, so the ordinary case where the
+	// shim already withdrew its own record costs nothing.
+	if err := registry.RemoveIncarnation(id, tombstone.ShimID, tombstone.ProcessEpoch); err != nil {
+		slog.Warn("session shim: withdraw discovery record after durable terminal handoff",
+			"session", id.String(), "error", err)
+		return
+	}
+	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
+		slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
+			"session", id.String(), "error", err)
+		return
+	}
+	// The proof is off disk, so no later pass can rediscover this incarnation
+	// and no mark is needed to stop it. Keeping one would make this map grow for
+	// the daemon's whole life.
+	forget = true
 }
 
 // withdrawQuarantinedLineageAfterDurableHandoff moves one exact incarnation out
@@ -1334,6 +1370,12 @@ func (d *Daemon) withdrawQuarantinedLineageAfterDurableHandoff(
 		kept = append(kept, current)
 	}
 	d.shims.quarantined = kept
+	// The correlation goes whether or not this daemon still held the row. The
+	// caller only reaches here AFTER the terminal evidence was durably accepted,
+	// and a retained adoption correlation for a lineage the composer has already
+	// resolved is what makes a later batch attach an ADOPTED-kind receipt to a
+	// lineage the receiver only knows as quarantined.
+	delete(d.shims.correlations, key)
 	if !removed {
 		return false
 	}
@@ -1345,7 +1387,6 @@ func (d *Daemon) withdrawQuarantinedLineageAfterDurableHandoff(
 	if _, stillAdopted := d.shims.adopted[key.identity]; !stillAdopted && !remainingForIdentity {
 		delete(d.shims.forwarded, key.identity)
 	}
-	delete(d.shims.correlations, key)
 	for _, existing := range d.shims.tombstoned {
 		if existing.Identity() == key.identity && existing.ShimID == key.shimID &&
 			existing.ProcessEpoch == key.processEpoch {

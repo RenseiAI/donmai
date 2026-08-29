@@ -98,21 +98,34 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   belonging to an unrelated session suppressed the alias for everyone, a DEAD
   sibling's tombstone counted as evidence of a LIVE sibling, and the cost of
   finalizing one shim grew with every other session on the host.
-- **The incarnation-scoped release pre-check honours both admissible terminal
-  proofs, and no more than that.** It consulted only the per-correlation proofs,
-  so evidence carried in the scalar fields — an adopted owner's ordinary
-  terminal receipt, or a tombstone naming this exact incarnation — was refused,
-  and the pre-check answered `reconcile` for sessions the predicate it guards
-  would have released. The scalar receipt, however, names no shim id and no
-  epoch: it is admissible only when the identity holds exactly ONE live
-  correlation, the same precondition the release predicate itself applies to a
-  fence's covered set. Consulting it per correlation without that gate answered
-  "covered" for a running sibling of a terminalized lineage.
+- **The incarnation-scoped release pre-check is strictly incarnation-scoped.**
+  It consulted only the per-correlation proofs, so a tombstone naming this exact
+  incarnation in the scalar field was refused and the pre-check answered
+  `reconcile` for sessions the predicate it guards would have released. The
+  scalar adopted receipt names no shim id and no epoch, and the set the
+  pre-check enumerates is the set of lineages that REMAIN live for the identity
+  — a terminalizing path drops its own entry before it asks — so a receipt can
+  never be an answer there: every member of a non-empty remaining set is a
+  sibling whose harness is still running. The receipt keeps its admissibility
+  where the release predicate already grants it, on the path taken when no other
+  live lineage is left.
 - **The acceptance clear's own deadline is strictly larger than the longest
   wait one reconcile pass can spend inside it.** It equalled the tombstone
   settle window exactly, leaving zero margin: one contended pass consumed the
   whole budget and the clear then reported a timeout for a lineage that was
-  reconciling correctly.
+  reconciling correctly. The bound now counts the TWO callback round trips one
+  pass can make — host identity, then the terminal evidence handoff — each
+  bounded separately.
+- **A durable terminal handoff releases its in-flight mark however it leaves.**
+  The mark was cleared by the explicit calls below each exit, and the reconcile
+  runs on control-API handler goroutines where a panic raised inside a
+  downstream callback is recovered rather than fatal — so a panicking resolver
+  or evidence hook left the mark set for the daemon's whole life, every later
+  pass skipped the lineage, and it stayed projected quarantined and charged
+  against capacity forever. The release is a defer now, and a pass that reported
+  its evidence but withdrew nothing (the row left by another route mid-handoff)
+  no longer disposes the on-disk proof, which is then the only artifact left
+  that can prove the incarnation ended.
 - **A batch receipt can no longer fabricate a cleared disposition.** The daemon
   has no producer for the cleared/abandoned disposition any more, but the
   receipt's echo of it is still copied and retained — so the exact-echo

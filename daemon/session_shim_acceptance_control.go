@@ -336,10 +336,10 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	// different things in a test and on a host.
 	//
 	// And the deadline is STRICTLY LARGER than the longest single wait one
-	// reconcile pass can spend inside it. It used to equal the settle window
-	// exactly, which left zero margin: one contended pass consumed the whole
-	// budget and the clear then reported a timeout for a lineage that was
-	// reconciling normally.
+	// reconcile pass can spend inside it — two callback round trips, not one.
+	// It used to equal the settle window exactly, which left zero margin: one
+	// contended pass consumed the whole budget and the clear then reported a
+	// timeout for a lineage that was reconciling normally.
 	deadline := time.Now().Add(acceptanceClearDeadlineFor(d.sessionShimConfig().callbackTimeout()))
 	for {
 		d.reconcileQuarantinedTombstones()
@@ -380,17 +380,19 @@ const acceptanceClearDeadlineMargin = tombstoneSettleWindow / 2
 // acceptanceClearDeadlineFor sizes the clear's own bound.
 //
 // The clear drives the production reconcile in a loop, and ONE pass of that
-// reconcile can block for a full platform round trip — the durable terminal
-// handoff, bounded by the callback timeout, not by the settle window. A budget
-// equal to the settle window therefore had zero margin: a single contended pass
-// spent all of it and the clear failed a lineage that was reconciling
-// correctly. The bound is the settle window the tombstone itself needs, PLUS
-// the longest single inner wait, plus margin.
+// reconcile can block for TWO full platform round trips, not one: the owning
+// pass resolves the host identity under its own callback context and then hands
+// the terminal evidence over under a second one, each bounded separately by the
+// callback timeout. A budget equal to the settle window had zero margin — a
+// single contended pass spent all of it and the clear failed a lineage that was
+// reconciling correctly — and a budget of one round trip still under-counts the
+// wait it is meant to survive. The bound is the settle window the tombstone
+// itself needs, PLUS the longest single inner pass, plus margin.
 func acceptanceClearDeadlineFor(callbackTimeout time.Duration) time.Duration {
 	if callbackTimeout < 0 {
 		callbackTimeout = 0
 	}
-	return tombstoneSettleWindow + callbackTimeout + acceptanceClearDeadlineMargin
+	return tombstoneSettleWindow + 2*callbackTimeout + acceptanceClearDeadlineMargin
 }
 
 // sessionShimLineageDisposition reports whether one exact incarnation is still

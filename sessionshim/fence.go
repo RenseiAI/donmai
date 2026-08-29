@@ -415,32 +415,32 @@ func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedS
 }
 
 // TerminalProofCovers reports whether proof positively closes ONE exact
-// incarnation of id, by EITHER admissible §D10 form.
+// incarnation of id, and it is strictly incarnation-scoped: a correlation proof
+// naming that shim id and process epoch, or the scalar Tombstone, which names
+// them too.
 //
-// soleCorrelation says whether that incarnation is the ONLY one the caller
-// holds for this identity, and it is load-bearing rather than a hint. The
-// scalar AdoptedReceipt carries no shim id and no epoch: it says "an adopted
-// owner reported a terminal receipt for this session", which closes an exact
-// incarnation only when the session HAS exactly one. Consulting it per
-// incarnation without that precondition answered "covered" for a running
-// sibling of a terminalized lineage — precisely the double-execution invariant
-// 10 exists to prevent — and it is why ReleaseDecision itself only reaches the
-// legacy form under len(covered) <= 1. The scalar Tombstone half needs no such
-// gate: it names the incarnation it proves.
+// The scalar AdoptedReceipt is deliberately NOT admissible here, whatever else
+// the caller holds. It carries no shim id and no epoch — it says "an adopted
+// owner reported a terminal receipt for this session", which names no
+// incarnation at all — and every caller of this function is asking the question
+// "is this REMAINING live lineage covered?". A receipt can never be an answer to
+// that: the lineage it belongs to is by construction not one of the remaining
+// ones. Honouring it per incarnation answered "covered" for a running sibling of
+// a terminalized lineage, which is precisely the double-execution invariant 10
+// exists to prevent.
+//
+// The receipt stays admissible exactly where §D10 allows it — ReleaseDecision's
+// len(covered) <= 1 path, reached only once no other live lineage remains.
 //
 // The question is exported because a caller that holds several live
 // correlations must be able to ask about each one rather than about "the
-// session", and it must not be STRICTER than the predicate it guards: with a
-// sole correlation it still accepts the scalar receipt ReleaseDecision accepts.
-func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64, soleCorrelation bool) bool {
+// session".
+func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64) bool {
 	fenced := FencedSession{
 		OrgID: id.OrgID, SessionID: id.SessionID,
 		ShimID: shimID, ProcessEpoch: processEpoch,
 	}
-	if proof.provesCorrelation(id, fenced) || proof.provesScalarTombstone(id, fenced) {
-		return true
-	}
-	return soleCorrelation && proof.AdoptedReceipt
+	return proof.provesCorrelation(id, fenced) || proof.provesScalarTombstone(id, fenced)
 }
 
 // ReleaseVerdict is the outcome of the single claim-release predicate.

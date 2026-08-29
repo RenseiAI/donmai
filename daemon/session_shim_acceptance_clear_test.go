@@ -409,17 +409,18 @@ func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
 	}
 }
 
-// TestAdoptedReceiptDoesNotReleaseASiblingOfTheReceiptsLineage is the same
-// invariant for the OTHER admissible §D10 form.
+// TestAdoptedReceiptDoesNotReleaseARemainingSibling is the same invariant for
+// the OTHER admissible §D10 form, staged in the state the PRODUCTION caller is
+// actually in.
 //
-// The scalar AdoptedReceipt carries no shim id and no epoch. Asking it about
-// each of several live correlations answered "covered" for every one of them,
-// so a caller holding a terminal receipt for one lineage released a sibling
-// whose harness was still running. It is admissible only when the identity has
-// exactly ONE live correlation — the precondition ReleaseDecision applies to a
-// fence's covered set, and the daemon's own live set is the enumeration when no
-// fence is in force.
-func TestAdoptedReceiptDoesNotReleaseASiblingOfTheReceiptsLineage(t *testing.T) {
+// finishAdoptedShim deletes its own adopted entry and THEN asks for a verdict,
+// so the live set the pre-check enumerates is the set of lineages that REMAIN:
+// empty in the ordinary single-lineage case, and otherwise a sibling whose
+// harness is still running. The scalar AdoptedReceipt carries no shim id and no
+// epoch, so it can never be an answer about a remaining sibling — and a
+// per-incarnation check that consulted it "when only one other lineage is left"
+// read the count backwards and released exactly the case it exists to refuse.
+func TestAdoptedReceiptDoesNotReleaseARemainingSibling(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
 	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{RegistryDir: dir}})
@@ -430,25 +431,53 @@ func TestAdoptedReceiptDoesNotReleaseASiblingOfTheReceiptsLineage(t *testing.T) 
 		ShimID: "shim-quarantined", ProcessEpoch: 3,
 		CreatedAtUnixNano: time.Now().UnixNano(),
 	}, sessionshim.QuarantineProtocolMismatch, "sibling lineage refused authority", time.Now())
+	// The receipt's own lineage is already gone from the adopted map — that is
+	// the order finishAdoptedShim uses — and ONE quarantined sibling, whose
+	// harness §D7 refuses authority but never stops, remains.
 	d.shims.mu.Lock()
-	d.shims.adopted[id] = adoptedShim{shimID: "shim-live"}
 	d.upsertShimQuarantineLocked(q)
 	d.shims.mu.Unlock()
 
 	receipt := sessionshim.TerminalProof{AdoptedReceipt: true}
 	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, receipt); verdict == sessionshim.ReleaseAllowed {
-		t.Fatal("an identity-scoped adopted receipt released a session holding two live correlations — " +
+		t.Fatal("an identity-scoped adopted receipt released a session with a live sibling lineage remaining — " +
 			"§D10 requires proof for that exact harness process group, and the receipt names none")
 	}
 
-	// Control: with the quarantined sibling gone the receipt is the identity's
-	// whole story again, and it must still release.
+	// Control: with nothing left alive for the identity the receipt is the whole
+	// story again, and it must still release. A pre-check stricter than the
+	// predicate it guards is a different rule, not caution.
 	d.shims.mu.Lock()
 	d.shims.quarantined = nil
 	d.shims.mu.Unlock()
 	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, receipt); verdict != sessionshim.ReleaseAllowed {
-		t.Fatalf("release verdict for a sole correlation with an adopted receipt = %q, want %q — a pre-check "+
-			"stricter than the predicate it guards is a different rule", verdict, sessionshim.ReleaseAllowed)
+		t.Fatalf("release verdict for a receipt with no remaining lineage = %q, want %q",
+			verdict, sessionshim.ReleaseAllowed)
+	}
+
+	// And the same control for the other form: a lineage that leaves behind its
+	// OWN group-reaped tombstone releases too.
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	own := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-live", ProcessEpoch: 7,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(own); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	d.shims.mu.Lock()
+	d.shims.registry = registry
+	d.shims.mu.Unlock()
+	proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
+	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict != sessionshim.ReleaseAllowed {
+		t.Fatalf("release verdict for a lineage's own reap proof = %q, want %q",
+			verdict, sessionshim.ReleaseAllowed)
 	}
 }
 
@@ -794,17 +823,44 @@ func TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff(t *testing.T) {
 		t.Fatal("the owning reconcile never reached its durable handoff")
 	}
 
-	cleared := make(chan error, 1)
-	go func() { cleared <- f.daemon.clearSessionShimAcceptanceQuarantine(f.incarnation) }()
+	// The negative statement, made deterministically instead of over a wall-clock
+	// window. The clear breaks out of its poll on "no longer quarantined AND
+	// tombstoned", so what keeps it inside the loop is that condition being FALSE
+	// for the whole hold — and the hold is a channel, so this instant is exactly
+	// the mid-handoff state every poll during it would read. A fixed sleep is a
+	// guess in both directions: too short and the clear has not polled yet, too
+	// long and it is dead time in every run.
+	quarantined, tombstoned := f.daemon.sessionShimLineageDisposition(f.incarnation)
+	if !quarantined || tombstoned {
+		close(release)
+		t.Fatalf("mid-handoff disposition = quarantined %t / tombstoned %t, want still quarantined and not yet "+
+			"tombstoned — the clear breaks out on the opposite, and its republish then commits a batch that "+
+			"reports a lineage terminal whose obligation is still active", quarantined, tombstoned)
+	}
 
-	// Long enough to be several poll intervals, short enough to be nowhere
-	// near the clear's own deadline.
+	// And end to end: whenever the clear returns, the evidence must already have
+	// landed. The report cannot proceed past `release`, so the sample below is
+	// exact rather than timing-dependent.
+	started := make(chan struct{})
+	cleared := make(chan error, 1)
+	evidenceAtReturn := make(chan int, 1)
+	go func() {
+		close(started)
+		err := f.daemon.clearSessionShimAcceptanceQuarantine(f.incarnation)
+		// Sampled at the instant of return. A clear that broke out mid-handoff
+		// sees ZERO reports here whenever it returned, because the fake report
+		// appends nothing until `release` is closed.
+		evidenceAtReturn <- len(f.reported())
+		cleared <- err
+	}()
+	<-started
+
 	select {
 	case err := <-cleared:
 		close(release)
 		t.Fatalf("the clear returned (%v) while the terminal report was still in flight — its republish then "+
 			"commits a batch that reports a lineage terminal whose obligation is still active", err)
-	case <-time.After(4 * acceptanceClearPollInterval):
+	default:
 	}
 
 	close(release)
@@ -815,6 +871,10 @@ func TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff(t *testing.T) {
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("the clear never completed after the durable handoff landed")
+	}
+	if got := <-evidenceAtReturn; got == 0 {
+		t.Fatal("the clear returned before its lineage's terminal evidence was durably accepted — " +
+			"whenever it returned, the held report had not landed")
 	}
 	select {
 	case <-owner:
@@ -915,10 +975,12 @@ func TestTerminalWithdrawalRefusesALineageItDoesNotHold(t *testing.T) {
 // not the number.
 //
 // The clear drives the production reconcile in a loop, and ONE pass of that
-// reconcile can block for a full platform round trip bounded by the callback
-// timeout. A budget equal to the settle window had zero margin: one contended
-// pass consumed all of it and the clear reported a timeout for a lineage that
-// was reconciling correctly.
+// reconcile can block for TWO platform round trips — host identity, then the
+// terminal evidence handoff — each bounded separately by the callback timeout.
+// A budget equal to the settle window had zero margin: one contended pass
+// consumed all of it and the clear reported a timeout for a lineage that was
+// reconciling correctly. A budget of ONE round trip is the same defect at half
+// the size.
 func TestAcceptanceClearDeadlineExceedsItsLongestInnerWait(t *testing.T) {
 	t.Parallel()
 	for _, callback := range []time.Duration{
@@ -937,9 +999,143 @@ func TestAcceptanceClearDeadlineExceedsItsLongestInnerWait(t *testing.T) {
 			t.Fatalf("clear deadline %s for callback timeout %s — the tombstone's own settle window fits inside it "+
 				"with nothing left over", deadline, callback)
 		}
-		if deadline <= callback+tombstoneSettleWindow {
-			t.Fatalf("clear deadline %s for callback timeout %s leaves no margin above one settle window plus one "+
-				"round trip", deadline, callback)
+		if deadline <= 2*callback+tombstoneSettleWindow {
+			t.Fatalf("clear deadline %s for callback timeout %s leaves no margin above one settle window plus the "+
+				"TWO round trips one reconcile pass can spend", deadline, callback)
 		}
+	}
+}
+
+// TestAPanickingTerminalHandoffReleasesItsInFlightMark pins the mark's release
+// to a defer rather than to the exits that happen to be taken.
+//
+// The reconcile runs on the daemon's control-API handler goroutines, and
+// net/http RECOVERS a panic raised inside a handler. A panic in a downstream
+// callback therefore does not crash the daemon — it just skips whatever release
+// was written below the call, and the in-flight mark then survives for the rest
+// of the process's life: every later pass answers "not mine", the lineage is
+// never re-reported, and it stays projected quarantined and charged against
+// capacity forever.
+func TestAPanickingTerminalHandoffReleasesItsInFlightMark(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	f.publishHelperTombstone(t)
+	f.daemon.opts.SessionShim.OnTerminalEvidence = func(context.Context, SessionShimTerminalEvidence) error {
+		panic("downstream terminal-evidence callback panicked mid-handoff")
+	}
+
+	var recovered any
+	func() {
+		defer func() { recovered = recover() }()
+		f.daemon.reconcileQuarantinedTombstones()
+	}()
+	if recovered == nil {
+		t.Fatal("precondition: the hook did not panic, so this test would pass vacuously")
+	}
+
+	f.daemon.shims.mu.RLock()
+	state := f.daemon.shims.reportingTerminal[f.incarnation]
+	f.daemon.shims.mu.RUnlock()
+	if state.inFlight != nil {
+		t.Fatal("a panicking durable handoff left its in-flight mark set — every later pass then skips the " +
+			"lineage, which stays projected quarantined and charged for the daemon's whole life")
+	}
+	if state.committed {
+		t.Fatal("a handoff that panicked before its evidence was accepted was recorded as committed")
+	}
+	if got := len(f.reported()); got != 0 {
+		t.Fatalf("terminal evidence recorded %d times by a handoff that panicked", got)
+	}
+
+	// And a later pass, once the refusal backoff has elapsed, takes it again.
+	own, _ := f.daemon.claimSessionShimTerminalReport(
+		f.incarnation, time.Now().Add(2*sessionShimTerminalReportBackoff))
+	if !own {
+		t.Fatal("no later pass could claim the handoff a panicking one abandoned")
+	}
+}
+
+// TestALostWithdrawalRaceKeepsTheProofOnDisk pins what a pass that reported the
+// evidence but withdrew NOTHING is allowed to destroy.
+//
+// The reconcile iterates a snapshot, so the row can leave by another route while
+// the report is in flight. The evidence committed either way — but this pass
+// never moved the lineage into this daemon's terminal set, so the on-disk
+// tombstone is the ONLY artifact left that can prove the incarnation ended.
+// Disposing it there turned a proven death back into an unresolved one for every
+// later reader. The adoption correlation goes regardless: the composer has
+// resolved the lineage, and a retained correlation is what makes a later batch
+// attach an ADOPTED-kind receipt to a lineage the receiver knows as quarantined.
+func TestALostWithdrawalRaceKeepsTheProofOnDisk(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	want := f.publishHelperTombstone(t)
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.correlations[f.incarnation] = sessionShimAdoptionCorrelation{
+		evidence: SessionShimAdoptionEvidence{
+			Identity: f.identity, ShimID: f.incarnation.shimID,
+			ProcessEpoch: f.incarnation.processEpoch, ControllerGeneration: 6,
+		},
+		receipt: SessionShimAdoptionReceipt{DurableCorrelation: []byte("adoption-receipt")},
+	}
+	f.daemon.shims.mu.Unlock()
+
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.daemon.opts.SessionShim.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+		close(entered)
+		<-release
+		f.mu.Lock()
+		defer f.mu.Unlock()
+		f.terminals = append(f.terminals, evidence)
+		return nil
+	}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		f.daemon.reconcileQuarantinedTombstones()
+	}()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		close(release)
+		t.Fatal("the reconcile never reached its durable handoff")
+	}
+	// Another route takes the row while the report is in flight.
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.quarantined = nil
+	f.daemon.shims.mu.Unlock()
+	close(release)
+	select {
+	case <-done:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the reconcile never returned")
+	}
+
+	f.daemon.shims.mu.RLock()
+	terminal := len(f.daemon.shims.tombstoned)
+	marks := len(f.daemon.shims.reportingTerminal)
+	_, correlated := f.daemon.shims.correlations[f.incarnation]
+	f.daemon.shims.mu.RUnlock()
+	if terminal != 0 {
+		t.Fatalf("precondition: the withdrawal recorded %d terminal dispositions for a row it did not hold, "+
+			"so the on-disk proof would not be the last one left", terminal)
+	}
+	got, err := f.registry.GetTombstoneIncarnation(f.identity, f.incarnation.shimID, f.incarnation.processEpoch)
+	if err != nil {
+		t.Fatalf("a pass that withdrew nothing disposed the proof anyway: %v — this daemon holds no terminal "+
+			"disposition for the lineage either, so its terminal fact is now unprovable", err)
+	}
+	if got != want {
+		t.Fatalf("the retained proof = %+v, want the published one %+v", got, want)
+	}
+	if proof := f.daemon.SessionShimTerminalProof(f.identity.OrgID, f.identity.SessionID); !proof.Proves() {
+		t.Fatal("the lineage's terminal fact is no longer provable after a lost withdrawal race")
+	}
+	if correlated {
+		t.Fatal("the adoption correlation outlived a committed terminal report")
+	}
+	if marks != 0 {
+		t.Fatalf("the handoff mark outlived a lineage no reconcile pass can reach again: %d entries retained", marks)
 	}
 }
