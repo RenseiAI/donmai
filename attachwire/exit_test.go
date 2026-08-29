@@ -59,3 +59,32 @@ func TestExitTruncation(t *testing.T) {
 		t.Fatalf("want framing error, got %v", err)
 	}
 }
+
+// TestSignalNameSpellsTheConventionalNames pins the vocabulary every producer
+// of an Exit payload or a terminal tombstone shares. Go's own Signal.String()
+// yields "terminated"; the §12.2 convention is "SIGTERM", and two producers
+// spelling one signal differently is a correlation that silently stops
+// matching.
+//
+// The table is keyed by NUMBER, so it deliberately excludes the signals whose
+// number differs across the unixes (SIGBUS is 7 on Linux and 10 on darwin);
+// those stay with their platform-specific caller.
+func TestSignalNameSpellsTheConventionalNames(t *testing.T) {
+	for _, tc := range []struct {
+		signum int
+		want   string
+	}{
+		{signum: 0, want: ""},
+		{signum: 1, want: "SIGHUP"},
+		{signum: 2, want: "SIGINT"},
+		{signum: 9, want: "SIGKILL"},
+		{signum: 15, want: "SIGTERM"},
+		{signum: 7, want: ""},
+		{signum: 10, want: ""},
+		{signum: 64, want: ""},
+	} {
+		if got := SignalName(tc.signum); got != tc.want {
+			t.Errorf("SignalName(%d) = %q, want %q", tc.signum, got, tc.want)
+		}
+	}
+}

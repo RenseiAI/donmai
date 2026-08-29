@@ -5,6 +5,8 @@ package ptyhost
 import (
 	"os/exec"
 	"syscall"
+
+	"github.com/RenseiAI/donmai/attachwire"
 )
 
 // signalProcessGroup sends sig to the entire process group whose leader is
@@ -27,40 +29,24 @@ func signalProcessGroup(cmd *exec.Cmd, sig syscall.Signal) {
 
 // signalName maps a syscall.Signal to its conventional name for the Exit
 // payload (§12.2). It returns the empty string for a nil / zero signal.
+//
+// The common set lives in attachwire beside the exit-code convention it pairs
+// with, so an Exit payload and a terminal tombstone spell one signal the same
+// way. SIGBUS stays here because its NUMBER differs across the unixes (7 on
+// Linux, 10 on darwin) and the portable table is keyed by number.
 func signalName(sig syscall.Signal) string {
 	if sig == 0 {
 		return ""
 	}
-	// syscall.Signal.String() yields e.g. "killed"; the ansi/shell convention
-	// wants "SIGKILL". Map the common ones and fall back to the numeric form.
-	switch sig {
-	case syscall.SIGHUP:
-		return "SIGHUP"
-	case syscall.SIGINT:
-		return "SIGINT"
-	case syscall.SIGQUIT:
-		return "SIGQUIT"
-	case syscall.SIGILL:
-		return "SIGILL"
-	case syscall.SIGABRT:
-		return "SIGABRT"
-	case syscall.SIGFPE:
-		return "SIGFPE"
-	case syscall.SIGKILL:
-		return "SIGKILL"
-	case syscall.SIGSEGV:
-		return "SIGSEGV"
-	case syscall.SIGPIPE:
-		return "SIGPIPE"
-	case syscall.SIGALRM:
-		return "SIGALRM"
-	case syscall.SIGTERM:
-		return "SIGTERM"
-	case syscall.SIGBUS:
-		return "SIGBUS"
-	default:
-		return "SIG" + upperSignal(sig)
+	if name := attachwire.SignalName(int(sig)); name != "" {
+		return name
 	}
+	if sig == syscall.SIGBUS {
+		return "SIGBUS"
+	}
+	// syscall.Signal.String() yields e.g. "user defined signal 1"; the
+	// ansi/shell convention wants a SIG-prefixed name, so fall back to one.
+	return "SIG" + upperSignal(sig)
 }
 
 func upperSignal(sig syscall.Signal) string {

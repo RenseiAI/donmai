@@ -172,10 +172,23 @@ func spawnSession(pspec ptyhost.Spec, workarea string, roots ...string) (*ptyhos
 	return shim.Session(), shim, nil
 }
 
-// shimFinalizeGrace bounds the wait for the shim's own terminal finalization
-// after the harness exits. It is short because the work is one Alive() probe and
-// one atomic tombstone write; it is bounded because a runner must not hang on it.
-const shimFinalizeGrace = 10 * time.Second
+// shimFinalizeMargin is the only number this file adds to the shim's own
+// finalize bound: scheduling slack on top of a window the shim already
+// enforces. The bound itself is DERIVED (Shim.FinalizeBound), never picked
+// here.
+//
+// It used to be picked here — a flat 10s beside a finalize path whose worst
+// case is exactly 10s. Zero margin is not a grace window: when the controller
+// was slow, this wait expired in the same instant the tombstone was about to
+// be written, the process exited, and a provably-reaped harness left no proof
+// at all (and no live shim to run the orphan clock either).
+const shimFinalizeMargin = 2 * time.Second
+
+// shimTerminalGrace derives this process's wait from the shim's own finalize
+// bound. The only number added here is scheduling slack.
+func shimTerminalGrace(finalizeBound time.Duration) time.Duration {
+	return finalizeBound + shimFinalizeMargin
+}
 
 // awaitShimTerminal lets the shim persist its terminal observation before this
 // process goes away.
@@ -188,11 +201,14 @@ func (h *Handle) awaitShimTerminal() {
 	if h.shim == nil {
 		return
 	}
+	grace := shimTerminalGrace(h.shim.FinalizeBound())
+	timer := time.NewTimer(grace)
+	defer timer.Stop()
 	select {
 	case <-h.shim.Done():
-	case <-time.After(shimFinalizeGrace):
+	case <-timer.C:
 		slog.Warn("interactive pty: shim did not finalize its terminal observation within the grace window",
-			"session", h.shim.Identity().String())
+			"session", h.shim.Identity().String(), "grace", grace)
 	}
 }
 

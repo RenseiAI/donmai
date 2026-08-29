@@ -56,6 +56,14 @@ type Options struct {
 
 	// Now lets tests drive deterministic timestamps.
 	Now func() time.Time
+
+	// onTerminalCourtesy is the unexported test seam described on Shim's field
+	// of the same name. It is set HERE rather than on the returned Shim because
+	// Start launches watchHarness before it returns: a harness that exits on
+	// its own reads the field from that goroutine, so assigning it afterwards
+	// is an unsynchronized cross-goroutine write with no happens-before edge —
+	// a data race whether or not a given run happens to lose it.
+	onTerminalCourtesy func()
 }
 
 func (o Options) logger() *slog.Logger {
@@ -114,7 +122,11 @@ type Shim struct {
 	// sidecar are one durability transition.
 	ackedSeq          uint64
 	terminalPublished bool
-	ackNotify         chan struct{}
+	// terminalSeq is the host sequence the terminal proof froze — the Exit
+	// frame's own sequence, the same value the tombstone carries as LastSeq. It
+	// is the ceiling every post-terminal acknowledgement is measured against.
+	terminalSeq uint64
+	ackNotify   chan struct{}
 
 	mu    sync.Mutex
 	gen   shimwire.Generation
@@ -129,6 +141,16 @@ type Shim struct {
 	stopOnce   sync.Once
 	done       chan struct{}
 	acceptDone chan struct{}
+	// onTerminalCourtesy runs at the boundary between the durable terminal
+	// proof and the best-effort delivery that follows it. It is nil in every
+	// production build; it exists so a test can observe WHICH side of that
+	// boundary the tombstone is written on, which no timing assertion can do
+	// reliably when a controller happens to drain quickly.
+	//
+	// It is set ONCE, from Options, before Start launches watchHarness — the
+	// goroutine that reads it. Assigning it on a returned Shim would be an
+	// unsynchronized cross-goroutine write.
+	onTerminalCourtesy func()
 }
 
 // controllerConn is one attached controller.
@@ -372,6 +394,8 @@ func Start(opts Options) (*Shim, error) {
 		done:         make(chan struct{}),
 		acceptDone:   make(chan struct{}),
 		ackNotify:    make(chan struct{}),
+
+		onTerminalCourtesy: opts.onTerminalCourtesy,
 	}
 
 	if err := s.publishRecord(); err != nil {
@@ -497,40 +521,6 @@ func (s *Shim) finalizeTerminal() error {
 	ctrl := s.ctrl
 	s.mu.Unlock()
 
-	if ctrl != nil && ctrl.selected >= shimwire.V3 && ctrl.pumpDone != nil {
-		// In v3 the one raw Exit HostFrame is the terminal observation. Session
-		// Done closes the subscription after publishing Exit. Give the pump a
-		// bounded flush opportunity, then close a stalled controller so terminal
-		// proof cannot deadlock behind socket backpressure.
-		flushBound := s.orphan.TerminationGrace
-		if flushBound <= 0 || flushBound > 5*time.Second {
-			flushBound = 5 * time.Second
-		}
-		timer := time.NewTimer(flushBound)
-		select {
-		case <-ctrl.pumpDone:
-			if !timer.Stop() {
-				<-timer.C
-			}
-		case <-timer.C:
-			ctrl.close()
-			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
-				"session", s.id.String())
-		}
-		// Socket write completion is not the carrier durability boundary. Give the
-		// exact selected-v3 persistence receipt the same bounded opportunity before
-		// replacing replayable state with the terminal proof.
-		s.waitForDurableAck(uint64(lastSeq), flushBound)
-	}
-
-	if ctrl != nil && ctrl.selected < shimwire.V3 {
-		// Best-effort: the controller may already be gone, which is exactly the
-		// case the tombstone exists for.
-		_ = writeTyped(ctrl.w, shimwire.TypeExit, func() ([]byte, error) {
-			return shimwire.EncodeExit(shimwire.ExitMsg{Seq: uint64(lastSeq), ExitCode: exit.ExitCode, Signal: exit.Signal})
-		})
-	}
-
 	t := Tombstone{
 		SchemaVersion:      RecordSchemaVersion,
 		OrgID:              s.id.OrgID,
@@ -553,14 +543,97 @@ func (s *Shim) finalizeTerminal() error {
 	err := s.registry.PutTombstone(t)
 	if err == nil {
 		s.terminalPublished = true
+		s.terminalSeq = uint64(lastSeq)
 	}
 	s.recordMu.Unlock()
 	if err != nil {
 		return fmt.Errorf("sessionshim: persist tombstone: %w", err)
 	}
+
+	if s.onTerminalCourtesy != nil {
+		s.onTerminalCourtesy()
+	}
+	// PROOF FIRST, COURTESY SECOND. Everything below is best-effort delivery to
+	// a controller that may already be gone; none of it changes a single field
+	// of the observation above, and all of it can block for the full finalize
+	// bound. Publishing the tombstone first is what makes the proof independent
+	// of controller latency and of this process's own teardown: a host that
+	// stops waiting mid-courtesy now leaves a lineage that is provably ended
+	// rather than one that is merely unobservable (§D10).
+	if ctrl != nil && ctrl.selected < shimwire.V3 {
+		// The controller may already be gone, which is exactly the case the
+		// tombstone exists for.
+		_ = writeTyped(ctrl.w, shimwire.TypeExit, func() ([]byte, error) {
+			return shimwire.EncodeExit(shimwire.ExitMsg{Seq: uint64(lastSeq), ExitCode: exit.ExitCode, Signal: exit.Signal})
+		})
+	}
+	if ctrl != nil && ctrl.selected >= shimwire.V3 && ctrl.pumpDone != nil {
+		// In v3 the one raw Exit HostFrame is the terminal observation. Session
+		// Done closes the subscription after publishing Exit. Give the pump a
+		// bounded flush opportunity, then close a stalled controller so the
+		// courtesy cannot deadlock behind socket backpressure.
+		flushBound := s.finalizeWaitBound()
+		timer := time.NewTimer(flushBound)
+		select {
+		case <-ctrl.pumpDone:
+			if !timer.Stop() {
+				<-timer.C
+			}
+		case <-timer.C:
+			ctrl.close()
+			s.logger.Warn("sessionshim: selected-v3 controller stalled before terminal frame flush",
+				"session", s.id.String())
+		}
+		// Socket write completion is not the acknowledgement boundary: the pump
+		// having handed the Exit frame to the kernel says nothing about the
+		// controller having read it. Give the controller the same bounded
+		// opportunity to acknowledge that exact sequence back.
+		//
+		// AFTER THE TOMBSTONE THIS IS DELIVERY CONFIRMATION, NOT PERSISTENCE.
+		// PutTombstone already removed the live incarnation's durable-ack
+		// sidecar, and the heartbeat path deliberately does not write one back
+		// — an entry whose discovery record no longer exists is unreachable and
+		// uncollectable. The resume cursor an adopting controller reads is the
+		// tombstone's own fsync-backed LastSeq, which equals the frozen
+		// terminalSeq this waits for. So what is being waited on is the
+		// controller's receipt of the terminal frame; the durable half is
+		// already on disk before the wait begins.
+		s.waitForDurableAck(uint64(lastSeq), flushBound)
+	}
 	close(s.done)
 	return nil
 }
+
+// FinalizeBoundFor is FinalizeBound for a policy, for a host that must size its
+// own grace before a shim exists.
+func FinalizeBoundFor(policy OrphanPolicy) time.Duration {
+	return 2 * finalizeWaitBoundFor(policy.TerminationGrace)
+}
+
+func finalizeWaitBoundFor(grace time.Duration) time.Duration {
+	if grace <= 0 || grace > maxFinalizeWaitBound {
+		return maxFinalizeWaitBound
+	}
+	return grace
+}
+
+// finalizeWaitBound is one of the two equal courtesy windows finalizeTerminal
+// spends after the tombstone is durable: the selected-v3 pump flush and the
+// durable-ack wait.
+func (s *Shim) finalizeWaitBound() time.Duration {
+	return finalizeWaitBoundFor(s.orphan.TerminationGrace)
+}
+
+// FinalizeBound is the longest finalizeTerminal can run after the harness is
+// reaped: the two equal courtesy windows above. A host that waits for
+// Done() must derive its grace from THIS, never from a second number picked
+// beside it — the two silently drifting apart is how a process exits in the
+// same instant its own proof was about to be written.
+func (s *Shim) FinalizeBound() time.Duration { return 2 * s.finalizeWaitBound() }
+
+// maxFinalizeWaitBound caps each courtesy window regardless of the configured
+// termination grace.
+const maxFinalizeWaitBound = 5 * time.Second
 
 // watchHarness turns an ordinary harness exit into the terminal observation.
 func (s *Shim) watchHarness() {
@@ -1215,7 +1288,19 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 		})
 	}
 	s.recordMu.Lock()
-	if s.terminalPublished {
+	terminal, terminalSeq := s.terminalPublished, s.terminalSeq
+	// A published terminal proof does NOT close the acknowledgement rail — it
+	// FREEZES it. finalizeTerminal writes the tombstone BEFORE its courtesy
+	// waits, and the wait it then spends is for this very acknowledgement of
+	// the Exit sequence, so refusing everything the instant the proof lands
+	// makes the shim refuse the one receipt it is waiting for: every terminal
+	// exit burned the whole flush bound and the controller's ack was rejected
+	// as an error it then acted on. An acknowledgement AT OR BELOW the frozen
+	// sequence is exactly the cursor an adopting controller resumes from and is
+	// honoured normally. Only a claim BEYOND it is refused: no such sequence
+	// exists — the harness is reaped and the shim will never allocate another —
+	// so it can only be a fabricated or misdirected cursor.
+	if terminal && heartbeat.AckedSeq > terminalSeq {
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeExited, "heartbeat rejected: terminal proof is published")
 	}
@@ -1229,28 +1314,41 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 	currentAck := s.ackedSeq
 	s.mu.Unlock()
 
-	_, lastSeq, snapshotErr := s.sess.Snapshot()
-	if snapshotErr != nil {
-		s.recordMu.Unlock()
-		return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
+	hostSeq := terminalSeq
+	if !terminal {
+		_, lastSeq, snapshotErr := s.sess.Snapshot()
+		if snapshotErr != nil {
+			s.recordMu.Unlock()
+			return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
+		}
+		hostSeq = uint64(lastSeq)
 	}
 	advanced := false
 	switch {
 	case heartbeat.AckedSeq < currentAck:
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement regressed")
-	case heartbeat.AckedSeq > uint64(lastSeq):
+	case heartbeat.AckedSeq > hostSeq:
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement is ahead of host sequence")
 	case heartbeat.AckedSeq > currentAck:
-		ack := durableAckCursor{
-			SchemaVersion: durableAckSchemaVersion,
-			OrgID:         s.id.OrgID, SessionID: s.id.SessionID, ShimID: s.shimID, ProcessEpoch: s.epoch,
-			ControllerGeneration: generation, AckedSeq: heartbeat.AckedSeq,
-		}
-		if err := s.registry.putDurableAck(ack); err != nil {
-			s.recordMu.Unlock()
-			return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat acknowledgement was not persisted")
+		// The sidecar is the LIVE incarnation's crash-restart cursor, and
+		// PutTombstone already removed it: writing one back now would leave an
+		// entry in the registry whose discovery record no longer exists and
+		// which nothing will ever collect. It would also be redundant — the
+		// tombstone is itself fsync-backed and carries LastSeq, so after the
+		// terminal proof the durable cursor IS the proof. Advance in memory so
+		// the receipt below is still exact, and skip the write.
+		if !terminal {
+			ack := durableAckCursor{
+				SchemaVersion: durableAckSchemaVersion,
+				OrgID:         s.id.OrgID, SessionID: s.id.SessionID, ShimID: s.shimID, ProcessEpoch: s.epoch,
+				ControllerGeneration: generation, AckedSeq: heartbeat.AckedSeq,
+			}
+			if err := s.registry.putDurableAck(ack); err != nil {
+				s.recordMu.Unlock()
+				return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat acknowledgement was not persisted")
+			}
 		}
 		s.ackedSeq = heartbeat.AckedSeq
 		currentAck = heartbeat.AckedSeq

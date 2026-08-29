@@ -399,12 +399,56 @@ func (p TerminalProof) provesCorrelation(id Identity, fenced FencedSession) bool
 	return false
 }
 
+// provesScalarTombstone answers the scalar Tombstone half. The scalar field
+// predates duplicate identities, but it names a shim id and a process epoch, so
+// it is incarnation-scoped on its own and admissible whatever else is live.
+func (p TerminalProof) provesScalarTombstone(id Identity, fenced FencedSession) bool {
+	return p.Tombstone != nil && p.Tombstone.GroupReaped && p.Tombstone.Identity() == id &&
+		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
+}
+
 func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedSession) bool {
 	if p.AdoptedReceipt {
 		return true
 	}
-	return p.Tombstone != nil && p.Tombstone.GroupReaped && p.Tombstone.Identity() == id &&
-		p.Tombstone.ShimID == fenced.ShimID && p.Tombstone.ProcessEpoch == fenced.ProcessEpoch
+	return p.provesScalarTombstone(id, fenced)
+}
+
+// TerminalProofCovers reports whether proof positively closes ONE exact
+// incarnation of id, and it is strictly incarnation-scoped: a correlation proof
+// naming that shim id and process epoch, or the scalar Tombstone, which names
+// them too.
+//
+// The scalar AdoptedReceipt is deliberately NOT admissible here, whatever else
+// the caller holds. It carries no shim id and no epoch — it says "an adopted
+// owner reported a terminal receipt for this session", which names no
+// incarnation at all — and every caller of this function is asking the question
+// "is this REMAINING live lineage covered?". A receipt can never be an answer to
+// that: the lineage it belongs to is by construction not one of the remaining
+// ones. Honouring it per incarnation answered "covered" for a running sibling of
+// a terminalized lineage, which is precisely the double-execution invariant 10
+// exists to prevent.
+//
+// The receipt's admissibility does not run through this file's fenced
+// len(covered) <= 1 branch in ReleaseDecision below — that branch is reached
+// only when a fence is in force. The session-shim caller usually holds none,
+// so ReleaseDecision admits the receipt earlier, via proof.Proves(), before
+// covered is ever built. What actually gates the receipt against a remaining
+// sibling is the daemon's own pre-check ahead of ReleaseDecision
+// (SessionShimReleaseDecision in daemon/session_shim.go): every REMAINING live
+// correlation must be covered by an incarnation-scoped proof, and an
+// identity-scoped receipt covers none of them, so any remaining sibling
+// refuses release there.
+//
+// The question is exported because a caller that holds several live
+// correlations must be able to ask about each one rather than about "the
+// session".
+func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64) bool {
+	fenced := FencedSession{
+		OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: processEpoch,
+	}
+	return proof.provesCorrelation(id, fenced) || proof.provesScalarTombstone(id, fenced)
 }
 
 // ReleaseVerdict is the outcome of the single claim-release predicate.

@@ -61,12 +61,10 @@ func (f *reconciliationFixture) lastBatch(t *testing.T) SessionShimAdoptionBatch
 	return batches[len(batches)-1]
 }
 
-// confirmedReceipt is the fixture's honest commit: durable, revisioned, and
-// echoing the cleared section exactly.
-func confirmedReceipt(batch SessionShimAdoptionBatch, revision string) SessionShimAdoptionBatchReceipt {
+// confirmedReceipt is the fixture's honest commit: durable and revisioned.
+func confirmedReceipt(_ SessionShimAdoptionBatch, revision string) SessionShimAdoptionBatchReceipt {
 	return SessionShimAdoptionBatchReceipt{
 		DurableCorrelation: []byte(revision), AdoptionRevision: revision,
-		Cleared: append([]SessionShimClearedQuarantine(nil), batch.Cleared...),
 	}
 }
 
@@ -105,6 +103,10 @@ func newReconciliationFixture(ctx context.Context, t *testing.T) (*compositionHa
 // stageReconciliationQuarantine plants one quarantined lineage plus the
 // acceptance bookkeeping a later clear needs (a recorded process identity
 // provably not running, and no registry record).
+//
+// No tombstone yet: the acceptance helper publishes its terminal proof on the
+// way out, so the lineage is live-and-quarantined until
+// publishReconciliationTombstone runs.
 func stageReconciliationQuarantine(t *testing.T, d *Daemon, orgID string) shimIncarnation {
 	t.Helper()
 	id := sessionshim.Identity{OrgID: orgID, SessionID: "session-reconcile"}
@@ -121,6 +123,26 @@ func stageReconciliationQuarantine(t *testing.T, d *Daemon, orgID string) shimIn
 	d.shims.acceptanceQuarantine[incarnation] = sessionshim.ProcessIdentity{PID: os.Getpid(), StartedAt: 1}
 	d.shims.mu.Unlock()
 	return incarnation
+}
+
+// publishReconciliationTombstone writes the group-reaped tombstone the
+// acceptance helper leaves behind when it reaps its own harness process group.
+func publishReconciliationTombstone(t *testing.T, d *Daemon, incarnation shimIncarnation) {
+	t.Helper()
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	if err := registry.PutTombstone(sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         incarnation.identity.OrgID, SessionID: incarnation.identity.SessionID,
+		ShimID: incarnation.shimID, ProcessEpoch: incarnation.processEpoch,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		ExitCode: 143, Signal: "SIGTERM",
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
 }
 
 func waitForCondition(t *testing.T, timeout time.Duration, what string, cond func() bool) {
@@ -206,13 +228,15 @@ func TestAmbiguousArmCommitReconcilesToTheCommittedRevision(t *testing.T) {
 		h.setHeartbeatRequireRevision("revision-4")
 		return confirmedReceipt(batch, "revision-4"), nil
 	})
+	publishReconciliationTombstone(t, d, incarnation)
 	if err := d.clearSessionShimAcceptanceQuarantine(incarnation); err != nil {
 		t.Fatalf("clear after reconciliation: %v", err)
 	}
 	clearBatch := f.lastBatch(t)
-	if len(clearBatch.Cleared) != 1 || len(clearBatch.Quarantined) != 0 {
-		t.Fatalf("post-reconciliation clear published %d cleared / %d quarantined, want the abandoned disposition",
-			len(clearBatch.Cleared), len(clearBatch.Quarantined))
+	if len(clearBatch.Tombstoned) != 1 || len(clearBatch.Quarantined) != 0 || len(clearBatch.Cleared) != 0 {
+		t.Fatalf("post-reconciliation clear published %d tombstoned / %d quarantined / %d cleared, want the "+
+			"lineage leaving through its terminal tombstone",
+			len(clearBatch.Tombstoned), len(clearBatch.Quarantined), len(clearBatch.Cleared))
 	}
 	if remaining := d.QuarantinedSessions(); len(remaining) != 0 {
 		t.Fatalf("confirmed clear left %d lineages projected", len(remaining))
@@ -301,70 +325,6 @@ func TestRefusedBatchCommitKeepsTodaysBehavior(t *testing.T) {
 	}
 	if projected := d.QuarantinedSessions(); len(projected) != 1 {
 		t.Fatalf("refusal left %d lineages projected, want the quarantine retained", len(projected))
-	}
-}
-
-// TestStagedClearedEntrySurvivesReconciliation: a cleared-quarantine batch
-// whose commit answer was lost keeps the entry STAGED and PROJECTED; the
-// reconciliation republish carries it in the cleared section again, and it
-// drops only on the confirmed exact echo — unchanged from the disposition
-// contract.
-func TestStagedClearedEntrySurvivesReconciliation(t *testing.T) {
-	ctx, cancel := context.WithCancel(context.Background())
-	defer cancel()
-	h, f := newReconciliationFixture(ctx, t)
-	d := h.daemon
-	incarnation := stageReconciliationQuarantine(t, d, h.orgID)
-
-	entered := make(chan struct{})
-	var enterOnce sync.Once
-	release := make(chan struct{})
-	f.setCommit(func(SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
-		h.setRefreshReceiptRevision("revision-2")
-		f.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
-			enterOnce.Do(func() { close(entered) })
-			<-release
-			h.setRefreshReceiptRevision("revision-3")
-			return confirmedReceipt(batch, "revision-3"), nil
-		})
-		return SessionShimAdoptionBatchReceipt{}, transportLostCommitAnswer()
-	})
-
-	if err := d.clearSessionShimAcceptanceQuarantine(incarnation); err == nil {
-		t.Fatal("a clear whose commit answer was lost reported success")
-	}
-
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("reconciliation never republished the cleared batch")
-	}
-	// The reconciliation republish is in flight and NOT yet confirmed: the
-	// entry must still be staged and still projected quarantined on the beat.
-	if projected := d.QuarantinedSessions(); len(projected) != 1 {
-		t.Fatalf("mid-reconciliation projection carried %d lineages, want the staged clear still projected", len(projected))
-	}
-	d.shims.mu.RLock()
-	_, staged := d.shims.pendingCleared[incarnation]
-	d.shims.mu.RUnlock()
-	if !staged {
-		t.Fatal("the staged cleared entry did not survive into reconciliation")
-	}
-	reconcileBatch := f.lastBatch(t)
-	if len(reconcileBatch.Cleared) != 1 || len(reconcileBatch.Quarantined) != 0 {
-		t.Fatalf("reconciliation republished %d cleared / %d quarantined, want the staged clear riding the "+
-			"cleared section", len(reconcileBatch.Cleared), len(reconcileBatch.Quarantined))
-	}
-	close(release)
-
-	waitForCondition(t, 5*time.Second, "the confirmed echo to drop the cleared lineage", func() bool {
-		d.shims.mu.RLock()
-		_, stillStaged := d.shims.pendingCleared[incarnation]
-		d.shims.mu.RUnlock()
-		return !stillStaged && len(d.QuarantinedSessions()) == 0
-	})
-	if receipt, ok := d.SessionShimScopeAuthority(h.orgID); !ok || receipt.AdoptionRevision != "revision-3" {
-		t.Fatalf("retained authority after the reconciled clear = %+v (%v), want revision-3", receipt, ok)
 	}
 }
 

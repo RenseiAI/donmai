@@ -26,10 +26,27 @@ type ProcessIdentity struct {
 
 // Self returns the running process's own identity.
 func Self() (ProcessIdentity, error) {
-	pid := os.Getpid()
-	started, err := processStartTime(pid)
+	id, err := ProcessIdentityFor(os.Getpid())
 	if err != nil {
 		return ProcessIdentity{}, fmt.Errorf("sessionshim: own process identity: %w", err)
+	}
+	return id, nil
+}
+
+// ProcessIdentityFor pins a live process by PID, reading the OS-reported start
+// time that disambiguates it from a later reuse of the same PID.
+//
+// Pinning has to happen while the process is still running: once it exits the
+// start time is unreadable, and a tombstone written from a bare PID could not
+// tell "this group is gone" from "a new process reused the pid". Anything that
+// owns a child it will later have to prove dead pins it here at spawn time.
+func ProcessIdentityFor(pid int) (ProcessIdentity, error) {
+	if pid <= 0 {
+		return ProcessIdentity{}, fmt.Errorf("%w: non-positive pid %d", ErrProcessIdentity, pid)
+	}
+	started, err := processStartTime(pid)
+	if err != nil {
+		return ProcessIdentity{}, fmt.Errorf("sessionshim: process identity for pid %d: %w", pid, err)
 	}
 	return ProcessIdentity{PID: pid, StartedAt: started}, nil
 }
