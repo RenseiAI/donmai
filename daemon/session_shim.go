@@ -1750,6 +1750,19 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// lane donmai does not own can ring that one too.
 	d.notifySessionShimAdoptionActivated(ctx, d.sessionShimActivatedScopes())
 	for _, tombstone := range result.Tombstoned {
+		// Withdraw the liveness claim BEFORE disposing the proof. A shim
+		// publishes its tombstone and then removes its record, so a crash
+		// between the two leaves both on disk — and disposing first collapses
+		// "terminal, proven" into "a record whose process is gone", which §D10
+		// classifies as stale and leaves unresolved with no proof left to
+		// reach the other conclusion. Remove is idempotent, so the ordinary
+		// case where the shim withdrew its own record costs nothing.
+		if removeErr := registry.RemoveIncarnation(
+			tombstone.Identity(), tombstone.ShimID, tombstone.ProcessEpoch); removeErr != nil {
+			slog.Warn("session shim: withdraw startup discovery record after durable terminal handoff",
+				"session", tombstone.Identity().String(), "error", removeErr)
+			continue
+		}
 		if removeErr := registry.RemoveTombstoneIncarnation(tombstone); removeErr != nil {
 			slog.Warn("session shim: dispose startup tombstone after durable terminal handoff",
 				"session", tombstone.Identity().String(), "error", removeErr)
@@ -2359,9 +2372,34 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	if (d.sessionShimEnabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: attested adoption batch omitted adoption revision")
 	}
+	if err := validateSessionShimClearedReceiptEcho(batch.Cleared, receipt.Cleared); err != nil {
+		return SessionShimAdoptionBatchReceipt{}, err
+	}
 	receipt.DurableCorrelation = append([]byte(nil), receipt.DurableCorrelation...)
 	receipt.Cleared = append([]SessionShimClearedQuarantine(nil), receipt.Cleared...)
 	return receipt, nil
+}
+
+// validateSessionShimClearedReceiptEcho requires a batch receipt to echo the
+// cleared section exactly: same entries, same order, byte-identical fields.
+//
+// This daemon has no producer for the cleared/abandoned disposition any more —
+// an acceptance clear leaves through a real terminal tombstone — so in practice
+// this asserts that a receipt claims NOTHING the batch did not send. Keeping
+// the check rather than deleting it is deliberate: receipt.Cleared is still
+// copied and retained, and a retained field nothing validates is a field a
+// receiver can fabricate for free. If a producer ever returns, the check is
+// already the right one.
+func validateSessionShimClearedReceiptEcho(sent, echoed []SessionShimClearedQuarantine) error {
+	if len(echoed) != len(sent) {
+		return fmt.Errorf("session shim: adoption batch receipt echoed %d cleared entries, want %d", len(echoed), len(sent))
+	}
+	for i := range sent {
+		if echoed[i] != sent[i] {
+			return fmt.Errorf("session shim: adoption batch receipt did not exactly echo cleared entry %d", i)
+		}
+	}
+	return nil
 }
 
 // The daemon has no producer for the cleared/abandoned disposition any more.
@@ -2369,7 +2407,7 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 // the only path that ever staged one. The WIRE types below the daemon
 // (SessionShimClearedQuarantine, the batch's Cleared section, the receipt's
 // echo of it) are retained because the composing plane accepts and records
-// them; the local staging, the receipt-echo validation and the
+// them, and the echo is still validated above; the local staging and the
 // drop-at-commit bookkeeping are deleted rather than deprecated.
 
 // sessionShimProjectionBatch assembles this daemon's complete durable

@@ -6,6 +6,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -142,8 +143,13 @@ func TestHeartbeatRefusalCarriesTheExitedSentinel(t *testing.T) {
 			c := &Controller{}
 			call := &heartbeatCall{done: make(chan heartbeatResult, 1)}
 			c.heartbeatCall = call
-			if !c.failHeartbeatFromError(body) {
+			refused, terminal := c.failHeartbeatFromError(body)
+			if !refused {
 				t.Fatal("the refusal did not reach the pending acknowledgement")
+			}
+			if terminal != tc.want {
+				t.Fatalf("terminal refusal = %t, want %t — only a terminal refusal may keep the stream open "+
+					"for the Exit frame the shim is still flushing", terminal, tc.want)
 			}
 			result := <-call.done
 			if result.err == nil {
@@ -154,5 +160,125 @@ func TestHeartbeatRefusalCarriesTheExitedSentinel(t *testing.T) {
 					"\"terminal proof is published\" from a broken socket on exactly this", result.err, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestTerminalCursorAcknowledgementSurvivesTheTombstone is the other half of
+// the ordering above, and the one that decides whether the ordering is free.
+//
+// Publishing the tombstone BEFORE the courtesy waits means the terminal proof
+// is already published when the controller answers the Exit — and a shim that
+// refuses every acknowledgement from that instant refuses the exact receipt its
+// own durable-ack courtesy is waiting for. Measured on an installed host: every
+// terminal exit burned the whole flush bound, and the daemon read the refusal as
+// a reason to drop a live connection.
+//
+// The rail is FROZEN by the proof, not closed by it: an acknowledgement at or
+// below the sequence the tombstone recorded is the cursor an adopting
+// controller resumes from and is honoured; only a claim beyond it — a sequence
+// that can never exist, because the harness is reaped — is refused `exited`.
+func TestTerminalCursorAcknowledgementSurvivesTheTombstone(t *testing.T) {
+	dir := shortTempDir(t)
+	registry, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-terminal-ack", SessionID: "session-terminal-ack"}
+	// One courtesy window, long enough that spending it and not spending it are
+	// not a scheduling accident.
+	const grace = 2 * time.Second
+	shim, err := Start(Options{
+		Identity: id, Registry: registry, ProcessEpoch: 1,
+		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V3,
+		Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "while :; do sleep 0.05; done"}},
+		Orphan: OrphanPolicy{Deadline: 90 * time.Second, TerminationGrace: grace, PropagationMargin: 30 * time.Second},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = shim.Close() })
+
+	result, err := Adopt(context.Background(), AdoptOptions{
+		Registry: registry, ControllerID: "controller-terminal-ack", RequireFullHostFrames: true,
+	})
+	if err != nil || len(result.Adopted) != 1 {
+		t.Fatalf("adoption = %+v, %v", result, err)
+	}
+	t.Cleanup(result.Close)
+	controller := result.Adopted[0]
+
+	// The acknowledgement is released by the tombstone, not by a sleep: the
+	// courtesy boundary fires immediately after the proof is durable, so an
+	// acknowledgement gated on it is provably a POST-terminal one.
+	tombstoned := make(chan struct{})
+	shim.onTerminalCourtesy = func() { close(tombstoned) }
+
+	type ackOutcome struct {
+		exitSeq uint64
+		beyond  error
+		exact   error
+	}
+	acknowledged := make(chan ackOutcome, 1)
+	go func() {
+		for event := range controller.Events() {
+			if event.Kind != EventHostFrame || event.FrameType != attachwire.TypeExit {
+				continue
+			}
+			<-tombstoned
+			out := ackOutcome{exitSeq: event.Seq}
+			// Refusal FIRST, on purpose: a terminal refusal that dropped the
+			// stream would take the acknowledgement below down with it, which
+			// is exactly the connection loss the read loop must no longer cause.
+			out.beyond = controller.Heartbeat(event.Seq + 1)
+			out.exact = controller.Heartbeat(event.Seq)
+			acknowledged <- out
+			return
+		}
+	}()
+
+	terminated := make(chan error, 1)
+	started := time.Now()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		terminated <- shim.Terminate(ctx)
+	}()
+
+	var out ackOutcome
+	select {
+	case out = <-acknowledged:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the controller never saw the terminal frame it had to acknowledge")
+	}
+	select {
+	case err := <-terminated:
+		if err != nil {
+			t.Fatalf("Terminate: %v", err)
+		}
+	case <-time.After(30 * time.Second):
+		t.Fatal("Terminate never returned")
+	}
+	elapsed := time.Since(started)
+
+	if out.exact != nil {
+		t.Fatalf("the acknowledgement of the terminal sequence was refused: %v — a controller resuming from "+
+			"the exact terminal cursor is what the durable-ack courtesy exists to allow", out.exact)
+	}
+	if !errors.Is(out.beyond, ErrShimExited) {
+		t.Fatalf("an acknowledgement BEYOND the terminal sequence returned %v, want ErrShimExited — no such "+
+			"sequence can exist once the harness is reaped", out.beyond)
+	}
+	shim.recordMu.Lock()
+	acked, frozen := shim.ackedSeq, shim.terminalSeq
+	shim.recordMu.Unlock()
+	if acked != out.exitSeq {
+		t.Fatalf("shim stored acknowledgement = %d, want the terminal sequence %d", acked, out.exitSeq)
+	}
+	if frozen != out.exitSeq {
+		t.Fatalf("terminal proof froze sequence %d, want the Exit frame's own %d", frozen, out.exitSeq)
+	}
+	if elapsed >= grace {
+		t.Fatalf("finalization took %s, i.e. at least the whole %s courtesy window — the shim refused the "+
+			"acknowledgement it was waiting for, so every terminal exit pays the full bound", elapsed, grace)
 	}
 }

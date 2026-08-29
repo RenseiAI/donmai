@@ -57,12 +57,68 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   longer writes the identity-only tombstone alias while another incarnation of
   that identity is still live — a v1 reader could otherwise conclude a running
   session's harness group had been reaped.
-- **One tombstone is reported once.** The reconcile runs from every occupancy
-  and heartbeat surface; concurrent passes now serialize per incarnation — a
-  second pass WAITS for the owner rather than returning early, so no caller
-  reads the projection in the middle of a withdrawal — a committed handoff is
+- **One tombstone is reported once, and no occupancy or heartbeat surface waits
+  for a platform round trip to say so.** The reconcile runs from every such
+  surface; concurrent passes serialize per incarnation, a committed handoff is
   never re-committed, and a refused one backs off instead of being re-POSTed on
-  every poll.
+  every poll. The withdrawal now happens BEFORE the durable report — the same
+  order the adopted terminal path uses — and a refused report puts the lineage
+  back exactly as it was and republishes. That removes the reason a second pass
+  ever had to wait: previously every caller could block for the tombstone settle
+  window while the owner'"'"'s own bound was the platform callback timeout, so the
+  waiter stalled a heartbeat on a remote round trip and still read
+  mid-withdrawal state at the end of it. The per-incarnation handoff mark is
+  also dropped once the proof is off disk, instead of being retained for the
+  daemon'"'"'s life.
+- **A published terminal proof freezes the acknowledgement rail instead of
+  closing it.** The tombstone is written before the courtesy waits that follow
+  it, and one of those waits is for the controller'"'"'s acknowledgement of the
+  Exit sequence — so refusing every acknowledgement from the instant the proof
+  landed made the shim refuse the exact receipt it was waiting for. Every
+  terminal exit then burned the full flush bound, and the controller acted on
+  the refusal. An acknowledgement at or below the frozen terminal sequence is
+  now honoured normally (it is precisely the cursor an adopting controller
+  resumes from); only a claim BEYOND it — a sequence the reaped harness can
+  never have allocated — is refused `exited`.
+- **A terminal refusal no longer drops the connection the shim is still
+  flushing its Exit on.** Both the controller read loop and the daemon'"'"'s
+  off-path cursor acknowledger treated `exited` as a dead socket and closed.
+  The Exit HostFrame that ends the session travels on that same connection, so
+  closing it diverted the lineage out of the terminal path and into the
+  disconnect path: no lifecycle end was emitted — the only thing that clears
+  the per-session detail cache — and the fallback republished a whole adoption
+  batch that flipped the host out of adoption completeness until its next beat.
+  A genuine persistence failure still drops the connection, because the cursor
+  may never claim a sequence the shim did not durably store.
+- **The identity-only tombstone alias is decided from this identity'"'"'s own two
+  files.** It used to scan and decode the whole registry on every tombstone
+  write, under the shim'"'"'s record lock on the terminal path: one unreadable file
+  belonging to an unrelated session suppressed the alias for everyone, a DEAD
+  sibling'"'"'s tombstone counted as evidence of a LIVE sibling, and the cost of
+  finalizing one shim grew with every other session on the host.
+- **The incarnation-scoped release pre-check honours both admissible terminal
+  proofs.** It consulted only the per-correlation proofs, so evidence carried in
+  the scalar fields — an adopted owner'"'"'s ordinary terminal receipt, or a
+  tombstone naming this exact incarnation — was refused, and the pre-check
+  answered `reconcile` for sessions the predicate it guards would have released.
+- **The acceptance clear'"'"'s own deadline is strictly larger than the longest
+  wait one reconcile pass can spend inside it.** It equalled the tombstone
+  settle window exactly, leaving zero margin: one contended pass consumed the
+  whole budget and the clear then reported a timeout for a lineage that was
+  reconciling correctly.
+- **A batch receipt can no longer fabricate a cleared disposition.** The daemon
+  has no producer for the cleared/abandoned disposition any more, but the
+  receipt'"'"'s echo of it is still copied and retained — so the exact-echo
+  validation is retained with it. An abandoned disposition is the one outcome
+  that closes an obligation with no terminal proof behind it, and a retained
+  field nothing validates is a field a receiver can invent for free.
+- **Every tombstone disposal withdraws the discovery record first.** A shim
+  publishes its tombstone and then removes its record, so a crash between the
+  two leaves both on disk by design; disposing the proof first collapses
+  "terminal, proven" into "a record whose process is gone", which is classified
+  as stale and left unresolved with no evidence remaining to reach the other
+  conclusion. The quarantine reconcile disposed without withdrawing at all, and
+  the startup adoption path disposed without withdrawing either.
 - **A shim that refuses a late acknowledgement because its terminal proof is
   published no longer costs a quarantine publication.** That refusal is a fact
   about the lifecycle, not a broken socket: it now arrives as the actionable
@@ -82,6 +138,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   observation committed while the obligation stayed `active`, after which every
   complete batch was refused `adoption_batch_live_lineage_omitted` and the host
   could not recover.
+
+**LOCK-STEP.** These changes move the terminal handoff onto the exact
+shim/process incarnation, and a downstream binary that embeds this library
+composes its own carrier close on top of it. Before shipping this, that binary
+must close its carrier by shim id AND process epoch, never by lifecycle
+identity alone: one identity can hold a terminalized lineage and a live one at
+the same time, and an identity-scoped close reaches the wrong one. Release the
+embedding binary in lock step with this library.
 
 ## v0.72.2 — 2026-08-28
 

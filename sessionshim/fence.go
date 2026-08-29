@@ -408,17 +408,22 @@ func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedS
 }
 
 // TerminalProofCovers reports whether proof positively closes ONE exact
-// incarnation of id.
+// incarnation of id, by EITHER admissible §D10 form.
 //
-// It is the incarnation-scoped question, exported because the scalar
-// TerminalProof fields are identity-scoped by design (they predate duplicate
-// identities) and a caller that holds several live correlations must be able to
-// ask about each one rather than about "the session".
+// It is the incarnation-scoped question, exported because a caller that holds
+// several live correlations must be able to ask about each one rather than
+// about "the session". It still honours the scalar AdoptedReceipt and scalar
+// Tombstone: those are identity-scoped by design — they predate duplicate
+// identities — and ReleaseDecision itself accepts them, so a pre-check that
+// consulted only Correlations would be STRICTER than the predicate it guards
+// and would answer `reconcile` for a session whose adopted owner had already
+// reported an ordinary terminal receipt.
 func TerminalProofCovers(proof TerminalProof, id Identity, shimID string, processEpoch uint64) bool {
-	return proof.provesCorrelation(id, FencedSession{
+	fenced := FencedSession{
 		OrgID: id.OrgID, SessionID: id.SessionID,
 		ShimID: shimID, ProcessEpoch: processEpoch,
-	})
+	}
+	return proof.provesCorrelation(id, fenced) || proof.legacyProvesSingleCorrelation(id, fenced)
 }
 
 // ReleaseVerdict is the outcome of the single claim-release predicate.

@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -432,5 +433,187 @@ func TestQuarantinePublishRetainsTheAdoptionRevision(t *testing.T) {
 	if ackPending {
 		t.Fatalf("republish left a heartbeat acknowledgement pending (%q); it activates no carrier, "+
 			"so it must not withdraw readiness", pending)
+	}
+}
+
+// TestReleaseShimIfLiveConsumesTerminalProofBeforePublishing pins the order at
+// the CALL SITE, not in the helper.
+//
+// The helper's name states the contract, and a test that drives the helper
+// directly proves only that the helper honours its own name: inlining a plain
+// publish back into releaseShimIfLive would keep such a test green while
+// restoring the exact defect. This drives the disconnect path itself, with a
+// real adopted controller and a real tombstone on disk, and asserts that no
+// quarantine ever reaches the composer.
+func TestReleaseShimIfLiveConsumesTerminalProofBeforePublishing(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("/tmp", "dp8")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-release-order", SessionID: "session-release-order"}
+	shim, err := sessionshim.Start(sessionshim.Options{
+		Identity: id, Registry: registry, ProcessEpoch: 11,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		WorkareaPath: filepath.Join(dir, "workarea"),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	adoption, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
+		Registry: registry, ControllerID: "controller-release-order",
+	})
+	if err != nil || len(adoption.Adopted) != 1 {
+		t.Fatalf("Adopt = %+v, %v", adoption, err)
+	}
+	controller := adoption.Adopted[0]
+	hello := controller.Hello()
+
+	var mu sync.Mutex
+	var batches []SessionShimAdoptionBatch
+	var terminals []SessionShimTerminalEvidence
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		RegistryDir:  filepath.Join(dir, "registry"),
+		HostIDForOrg: func(context.Context, string) (string, error) { return "wh_test_host", nil },
+		OnTerminalEvidence: func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+			mu.Lock()
+			defer mu.Unlock()
+			terminals = append(terminals, evidence)
+			return nil
+		},
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			batches = append(batches, cloneSessionShimAdoptionBatch(batch))
+			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-1"), AdoptionRevision: "1"}, nil
+		},
+	}})
+	d.shims.mu.Lock()
+	d.shims.registry = registry
+	d.shims.adopted[id] = adoptedShim{controller: controller, shimID: hello.ShimID}
+	d.shims.mu.Unlock()
+
+	// The shim finalized between its last frame and this disconnect: its proof
+	// is already on disk when the consumer notices the stream is gone. That is
+	// the measured race — the shim answers a late acknowledgement with `exited`
+	// and closes.
+	want := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
+		HarnessPID: hello.HarnessPID, HarnessStartedAt: hello.HarnessStartedAt,
+		ExitCode: 143, Signal: "SIGTERM",
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(want); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+
+	d.releaseShimIfLive(id, controller)
+
+	mu.Lock()
+	reported := append([]SessionShimTerminalEvidence(nil), terminals...)
+	published := append([]SessionShimAdoptionBatch(nil), batches...)
+	mu.Unlock()
+	if len(reported) != 1 || reported[0].Tombstone != want {
+		t.Fatalf("terminal evidence reported %d times (%+v), want the shim's exact proof once", len(reported), reported)
+	}
+	for i, batch := range published {
+		if len(batch.Quarantined) != 0 {
+			t.Fatalf("batch %d published a quarantine for a lineage whose tombstone was already on disk: %+v — "+
+				"that publication costs an adoption revision the next one has to undo", i, batch.Quarantined)
+		}
+	}
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("the disconnect left %d lineages projected quarantined", len(projected))
+	}
+}
+
+// TestTerminalDisposalWithdrawsTheRecordFirst pins the disposal ORDER at every
+// site that disposes a tombstone.
+//
+// A shim publishes its tombstone and then removes its discovery record, so a
+// crash between the two leaves BOTH on disk by design. Disposing the tombstone
+// first collapses "terminal, proven" into "a record whose process is gone",
+// which §D10 classifies as stale and leaves unresolved forever — there is no
+// proof left to reach the other conclusion with. finishAdoptedShim documents
+// this order; the quarantine reconcile disposed without withdrawing at all,
+// which is the same defect with the first step missing.
+func TestTerminalDisposalWithdrawsTheRecordFirst(t *testing.T) {
+	t.Parallel()
+	const (
+		withdraw = "RemoveIncarnation"
+		dispose  = "RemoveTombstoneIncarnation"
+	)
+	fset := token.NewFileSet()
+	entries, err := os.ReadDir("./")
+	if err != nil {
+		t.Fatal(err)
+	}
+	checked := 0
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() || !strings.HasSuffix(name, ".go") || strings.HasSuffix(name, "_test.go") {
+			continue
+		}
+		file, parseErr := parser.ParseFile(fset, filepath.Join("./", name), nil, 0)
+		if parseErr != nil {
+			t.Fatalf("parse %s: %v", name, parseErr)
+		}
+		for _, decl := range file.Decls {
+			fn, ok := decl.(*ast.FuncDecl)
+			if !ok || fn.Body == nil {
+				continue
+			}
+			firstWithdraw, firstDispose := token.NoPos, token.NoPos
+			ast.Inspect(fn.Body, func(n ast.Node) bool {
+				call, isCall := n.(*ast.CallExpr)
+				if !isCall {
+					return true
+				}
+				sel, isSel := call.Fun.(*ast.SelectorExpr)
+				if !isSel {
+					return true
+				}
+				switch sel.Sel.Name {
+				case withdraw:
+					if !firstWithdraw.IsValid() {
+						firstWithdraw = call.Pos()
+					}
+				case dispose:
+					if !firstDispose.IsValid() {
+						firstDispose = call.Pos()
+					}
+				}
+				return true
+			})
+			if !firstDispose.IsValid() {
+				continue
+			}
+			checked++
+			if !firstWithdraw.IsValid() {
+				t.Errorf("%s: %s disposes a terminal tombstone without withdrawing the discovery record — "+
+					"the surviving record then reads as stale liveness with no proof left to resolve it",
+					name, fn.Name.Name)
+				continue
+			}
+			if firstWithdraw > firstDispose {
+				t.Errorf("%s: %s disposes the tombstone before withdrawing the record", name, fn.Name.Name)
+			}
+		}
+	}
+	if checked < 2 {
+		t.Fatalf("found %d tombstone-disposing functions, want at least the adopted and quarantined paths — "+
+			"the guard is not watching what it claims to", checked)
 	}
 }

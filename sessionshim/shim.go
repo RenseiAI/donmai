@@ -114,7 +114,11 @@ type Shim struct {
 	// sidecar are one durability transition.
 	ackedSeq          uint64
 	terminalPublished bool
-	ackNotify         chan struct{}
+	// terminalSeq is the host sequence the terminal proof froze — the Exit
+	// frame's own sequence, the same value the tombstone carries as LastSeq. It
+	// is the ceiling every post-terminal acknowledgement is measured against.
+	terminalSeq uint64
+	ackNotify   chan struct{}
 
 	mu    sync.Mutex
 	gen   shimwire.Generation
@@ -525,6 +529,7 @@ func (s *Shim) finalizeTerminal() error {
 	err := s.registry.PutTombstone(t)
 	if err == nil {
 		s.terminalPublished = true
+		s.terminalSeq = uint64(lastSeq)
 	}
 	s.recordMu.Unlock()
 	if err != nil {
@@ -1259,7 +1264,19 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 		})
 	}
 	s.recordMu.Lock()
-	if s.terminalPublished {
+	terminal, terminalSeq := s.terminalPublished, s.terminalSeq
+	// A published terminal proof does NOT close the acknowledgement rail — it
+	// FREEZES it. finalizeTerminal writes the tombstone BEFORE its courtesy
+	// waits, and the wait it then spends is for this very acknowledgement of
+	// the Exit sequence, so refusing everything the instant the proof lands
+	// makes the shim refuse the one receipt it is waiting for: every terminal
+	// exit burned the whole flush bound and the controller's ack was rejected
+	// as an error it then acted on. An acknowledgement AT OR BELOW the frozen
+	// sequence is exactly the cursor an adopting controller resumes from and is
+	// honoured normally. Only a claim BEYOND it is refused: no such sequence
+	// exists — the harness is reaped and the shim will never allocate another —
+	// so it can only be a fabricated or misdirected cursor.
+	if terminal && heartbeat.AckedSeq > terminalSeq {
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeExited, "heartbeat rejected: terminal proof is published")
 	}
@@ -1273,28 +1290,41 @@ func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.Hear
 	currentAck := s.ackedSeq
 	s.mu.Unlock()
 
-	_, lastSeq, snapshotErr := s.sess.Snapshot()
-	if snapshotErr != nil {
-		s.recordMu.Unlock()
-		return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
+	hostSeq := terminalSeq
+	if !terminal {
+		_, lastSeq, snapshotErr := s.sess.Snapshot()
+		if snapshotErr != nil {
+			s.recordMu.Unlock()
+			return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat could not sample host sequence")
+		}
+		hostSeq = uint64(lastSeq)
 	}
 	advanced := false
 	switch {
 	case heartbeat.AckedSeq < currentAck:
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement regressed")
-	case heartbeat.AckedSeq > uint64(lastSeq):
+	case heartbeat.AckedSeq > hostSeq:
 		s.recordMu.Unlock()
 		return sendError(ctrl.w, shimwire.CodeMalformed, "heartbeat acknowledgement is ahead of host sequence")
 	case heartbeat.AckedSeq > currentAck:
-		ack := durableAckCursor{
-			SchemaVersion: durableAckSchemaVersion,
-			OrgID:         s.id.OrgID, SessionID: s.id.SessionID, ShimID: s.shimID, ProcessEpoch: s.epoch,
-			ControllerGeneration: generation, AckedSeq: heartbeat.AckedSeq,
-		}
-		if err := s.registry.putDurableAck(ack); err != nil {
-			s.recordMu.Unlock()
-			return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat acknowledgement was not persisted")
+		// The sidecar is the LIVE incarnation's crash-restart cursor, and
+		// PutTombstone already removed it: writing one back now would leave an
+		// entry in the registry whose discovery record no longer exists and
+		// which nothing will ever collect. It would also be redundant — the
+		// tombstone is itself fsync-backed and carries LastSeq, so after the
+		// terminal proof the durable cursor IS the proof. Advance in memory so
+		// the receipt below is still exact, and skip the write.
+		if !terminal {
+			ack := durableAckCursor{
+				SchemaVersion: durableAckSchemaVersion,
+				OrgID:         s.id.OrgID, SessionID: s.id.SessionID, ShimID: s.shimID, ProcessEpoch: s.epoch,
+				ControllerGeneration: generation, AckedSeq: heartbeat.AckedSeq,
+			}
+			if err := s.registry.putDurableAck(ack); err != nil {
+				s.recordMu.Unlock()
+				return sendError(ctrl.w, shimwire.CodeInternal, "heartbeat acknowledgement was not persisted")
+			}
 		}
 		s.ackedSeq = heartbeat.AckedSeq
 		currentAck = heartbeat.AckedSeq

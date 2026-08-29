@@ -898,9 +898,21 @@ func (c *Controller) readLoop() {
 			}
 			continue
 		}
-		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError && c.failHeartbeatFromError(msg.Body) {
-			c.closeStream("shim refused the durable heartbeat", nil)
-			return
+		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeError {
+			if refused, terminal := c.failHeartbeatFromError(msg.Body); refused {
+				if !terminal {
+					c.closeStream("shim refused the durable heartbeat", nil)
+					return
+				}
+				// A TERMINAL refusal is not a reason to drop the stream — it is
+				// the shim saying its tombstone is already on disk while it is
+				// still flushing the one Exit HostFrame that ends the session
+				// on THIS connection. Dropping here threw that observation
+				// away: the consumer then saw a stream that ended without a
+				// terminal frame, quarantined a lineage whose proof existed,
+				// and left the harness held. Keep reading.
+				continue
+			}
 		}
 		if c.selected >= shimwire.V3 {
 			switch msg.Type {
@@ -1012,12 +1024,16 @@ func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error
 	return nil
 }
 
-func (c *Controller) failHeartbeatFromError(body []byte) bool {
+// failHeartbeatFromError completes a pending acknowledgement from a refusal
+// frame. It reports whether the frame was consumed as one, and whether the
+// refusal was the TERMINAL one — the two answers the read loop needs, because
+// only one of them is a reason to drop the connection.
+func (c *Controller) failHeartbeatFromError(body []byte) (refused, terminal bool) {
 	c.heartbeatMu.Lock()
 	call := c.heartbeatCall
 	if call == nil {
 		c.heartbeatMu.Unlock()
-		return false
+		return false, false
 	}
 	c.heartbeatCall = nil
 	c.heartbeatMu.Unlock()
@@ -1032,10 +1048,11 @@ func (c *Controller) failHeartbeatFromError(body []byte) bool {
 		// transport failure, and a caller that only sees a formatted string
 		// throws it away and quarantines a session whose tombstone is on disk.
 		call.done <- heartbeatResult{err: fmt.Errorf("%w: %s", ErrShimExited, message.Code)}
+		return true, true
 	default:
 		call.done <- heartbeatResult{err: fmt.Errorf("sessionshim: selected-v3 heartbeat refused: %s", message.Code)}
 	}
-	return true
+	return true, false
 }
 
 func (c *Controller) failHeartbeatCall(err error) {

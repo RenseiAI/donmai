@@ -757,7 +757,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 type shimCursorAcknowledger struct {
 	daemon  *Daemon
 	id      sessionshim.Identity
-	ctrl    *sessionshim.Controller
+	ctrl    shimCursorController
 	pending atomic.Uint64
 	wake    chan struct{}
 	quit    chan struct{}
@@ -770,9 +770,19 @@ type shimCursorAcknowledger struct {
 	acked uint64
 }
 
+// shimCursorController is the controller surface the acknowledger uses. It is
+// an interface so a test can drive the REAL goroutine against a shim that
+// refuses, and observe whether the connection is dropped — the one decision
+// this loop makes that a caller can never see from the outside.
+type shimCursorController interface {
+	sessionShimCursorAcknowledger
+	Done() <-chan struct{}
+	Close() error
+}
+
 func (d *Daemon) startShimCursorAcknowledger(
 	id sessionshim.Identity,
-	ctrl *sessionshim.Controller,
+	ctrl shimCursorController,
 ) *shimCursorAcknowledger {
 	a := &shimCursorAcknowledger{
 		daemon: d, id: id, ctrl: ctrl,
@@ -799,17 +809,28 @@ func (d *Daemon) startShimCursorAcknowledger(
 				// reconciliation and republished at the next revision — 26
 				// seconds of churn to reach a terminal outcome the shim had
 				// already handed over. Consume the proof instead.
-				exited := errors.Is(err, sessionshim.ErrShimExited)
-				if exited {
+				if errors.Is(err, sessionshim.ErrShimExited) {
+					// STOP ACKNOWLEDGING, DO NOT DROP THE CONNECTION. This
+					// refusal says the tombstone is on disk — and the shim is
+					// still flushing the one Exit HostFrame that ends the
+					// session on this very stream. Closing here took that frame
+					// away from the consume loop: the lineage then left through
+					// releaseShimIfLive instead of finishAdoptedShim, so
+					// SessionEventEnded — the only cleanup of the per-session
+					// detail cache — was never emitted, and the fallback
+					// republished a whole adoption batch that flipped the host
+					// out of adoption_complete until its next beat. Measured on
+					// an installed host, in that order.
 					slog.Info("session shim: the shim refused the cursor acknowledgement because its terminal proof is published",
 						"session", id.String(), "seq", a.pending.Load())
-				} else {
-					slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
-						"session", id.String(), "seq", a.pending.Load(), "error", err)
+					return
 				}
-				// The cursor must never claim a sequence the shim did not durably
-				// store. Drop the connection and let the ordinary disconnect path
-				// release ownership; the shim keeps the harness.
+				slog.Warn("session shim: durable HostFrame acknowledgement was not persisted",
+					"session", id.String(), "seq", a.pending.Load(), "error", err)
+				// A genuine persistence failure is different: the cursor must
+				// never claim a sequence the shim did not durably store. Drop the
+				// connection and let the ordinary disconnect path release
+				// ownership; the shim keeps the harness.
 				// The reconcile itself runs in releaseShimIfLive, which is where
 				// the quarantine this would otherwise publish is created —
 				// calling it here would race that publication instead of
@@ -1195,26 +1216,38 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		// One report per incarnation, even with several reconcile passes in
 		// flight: every occupancy and heartbeat surface calls this, and two
 		// passes reading the same tombstone would both commit it.
-		own, inFlight := d.claimSessionShimTerminalReport(key, time.Now())
+		//
+		// A pass that does NOT own the handoff returns immediately. It used to
+		// wait out the owner so its caller would read the projection after the
+		// withdrawal — but the owner's wait is a platform round trip bounded by
+		// the callback timeout, not by the wait, so the waiter both stalled a
+		// heartbeat surface AND still read mid-withdrawal state. The withdrawal
+		// below now happens BEFORE the report, which removes the reason to wait
+		// at all: by the time any other pass can observe this lineage, it has
+		// already left the quarantine projection.
+		own, _ := d.claimSessionShimTerminalReport(key, time.Now())
 		if !own {
-			if inFlight != nil {
-				// Wait out the owner so this pass's caller reads the projection
-				// AFTER the withdrawal, not in the middle of it.
-				timer := time.NewTimer(tombstoneSettleWindow)
-				select {
-				case <-inFlight:
-				case <-timer.C:
-				}
-				timer.Stop()
-			}
 			continue
 		}
-		reported := false
+		// Move the lineage out of quarantine and into the terminal set as ONE
+		// locked transition, before the durable handoff — the same order
+		// finishAdoptedShim uses for an adopted lineage. It is never absent from
+		// a batch: it is quarantined, or it is tombstoned, and a refused handoff
+		// puts it back exactly as it was.
+		withdrawn, staged := d.stageSessionShimTerminalWithdrawal(key, tombstone)
+		if !staged {
+			// The row left by some other route between the snapshot above and
+			// this lock. Nothing was moved, so there is nothing to report and
+			// nothing to undo.
+			d.releaseSessionShimTerminalReport(key, false, time.Now())
+			continue
+		}
 		hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
 		if hostErr != nil {
 			slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
 				"session", id.String(), "error", hostErr)
-			d.releaseSessionShimTerminalReport(key, reported, time.Now())
+			d.restoreQuarantinedLineageAfterRefusedHandoff(withdrawn, key)
+			d.releaseSessionShimTerminalReport(key, false, time.Now())
 			continue
 		}
 		// NO adoption correlation, even when this daemon still retains one.
@@ -1238,57 +1271,121 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
 			slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
 				"session", id.String(), "error", err)
-			d.releaseSessionShimTerminalReport(key, reported, time.Now())
+			d.restoreQuarantinedLineageAfterRefusedHandoff(withdrawn, key)
+			d.releaseSessionShimTerminalReport(key, false, time.Now())
 			continue
 		}
-		reported = true
 
 		d.shims.mu.Lock()
-		removed := false
-		kept := d.shims.quarantined[:0]
+		// forwarded is keyed by LIFECYCLE IDENTITY, not by incarnation, and one
+		// identity can hold a quarantined lineage and a live adopted one at the
+		// same time (§D7's duplicate-identity case). Dropping the durable
+		// high-water because a SIBLING incarnation terminalized would regress
+		// the surviving session's fence correlation to zero.
+		_, stillAdopted := d.shims.adopted[id]
 		remainingForIdentity := false
 		for _, current := range d.shims.quarantined {
-			if current.Identity() == id && current.ShimID == tombstone.ShimID && current.ProcessEpoch == tombstone.ProcessEpoch {
-				removed = true
-				continue
-			}
 			if current.Identity() == id {
 				remainingForIdentity = true
-			}
-			kept = append(kept, current)
-		}
-		d.shims.quarantined = kept
-		if removed {
-			// forwarded is keyed by LIFECYCLE IDENTITY, not by incarnation, and
-			// one identity can hold a quarantined lineage and a live adopted one
-			// at the same time (§D7's duplicate-identity case). Dropping the
-			// durable high-water because a SIBLING incarnation terminalized
-			// would regress the surviving session's fence correlation to zero.
-			_, stillAdopted := d.shims.adopted[id]
-			if !stillAdopted && !remainingForIdentity {
-				delete(d.shims.forwarded, id)
-			}
-			delete(d.shims.correlations, key)
-			alreadyRecorded := false
-			for _, existing := range d.shims.tombstoned {
-				if existing.Identity() == id && existing.ShimID == tombstone.ShimID && existing.ProcessEpoch == tombstone.ProcessEpoch {
-					alreadyRecorded = true
-					break
-				}
-			}
-			if !alreadyRecorded {
-				d.shims.tombstoned = append(d.shims.tombstoned, tombstone)
+				break
 			}
 		}
+		if !stillAdopted && !remainingForIdentity {
+			delete(d.shims.forwarded, id)
+		}
+		delete(d.shims.correlations, key)
 		d.shims.mu.Unlock()
-		if removed {
-			if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
-				slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
-					"session", id.String(), "error", err)
-			}
+
+		// Withdraw the liveness claim BEFORE disposing the proof, exactly as
+		// finishAdoptedShim does. Disposing first would collapse "terminal,
+		// proven" into "a record whose process is gone", which §D10 classifies
+		// as stale and leaves unresolved. Remove is idempotent, so the ordinary
+		// case where the shim already withdrew its own record costs nothing.
+		disposed := false
+		if err := registry.RemoveIncarnation(id, tombstone.ShimID, tombstone.ProcessEpoch); err != nil {
+			slog.Warn("session shim: withdraw discovery record after durable terminal handoff",
+				"session", id.String(), "error", err)
+		} else if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
+			slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
+				"session", id.String(), "error", err)
+		} else {
+			disposed = true
 		}
-		d.releaseSessionShimTerminalReport(key, reported, time.Now())
+		d.releaseSessionShimTerminalReport(key, true, time.Now())
+		if disposed {
+			// The proof is off disk, so no later pass can rediscover this
+			// incarnation and no mark is needed to stop it. Keeping one would
+			// make this map grow for the daemon's whole life.
+			d.forgetSessionShimTerminalReport(key)
+		}
 	}
+}
+
+// stageSessionShimTerminalWithdrawal moves one exact incarnation out of the
+// quarantine projection and into the terminal set in a single locked
+// transition, returning the row it removed so a refused handoff can put it
+// back. It reports false when the row was already gone.
+//
+// Doing this BEFORE the durable report is what lets every occupancy and
+// heartbeat surface run without waiting on a platform round trip: a lineage
+// whose handoff is in flight is already projected as terminal rather than as a
+// quarantine the caller must not see yet.
+func (d *Daemon) stageSessionShimTerminalWithdrawal(
+	key shimIncarnation,
+	tombstone sessionshim.Tombstone,
+) (sessionshim.QuarantinedSession, bool) {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	var withdrawn sessionshim.QuarantinedSession
+	removed := false
+	kept := d.shims.quarantined[:0]
+	for _, current := range d.shims.quarantined {
+		if current.Identity() == key.identity && current.ShimID == key.shimID &&
+			current.ProcessEpoch == key.processEpoch {
+			withdrawn, removed = current, true
+			continue
+		}
+		kept = append(kept, current)
+	}
+	d.shims.quarantined = kept
+	if !removed {
+		return sessionshim.QuarantinedSession{}, false
+	}
+	for _, existing := range d.shims.tombstoned {
+		if existing.Identity() == key.identity && existing.ShimID == key.shimID &&
+			existing.ProcessEpoch == key.processEpoch {
+			return withdrawn, true
+		}
+	}
+	d.shims.tombstoned = append(d.shims.tombstoned, tombstone)
+	return withdrawn, true
+}
+
+// restoreQuarantinedLineageAfterRefusedHandoff undoes the staged withdrawal
+// when the durable handoff is refused, and publishes the restored projection.
+//
+// The publish is not optional bookkeeping: the platform compares each beat's
+// quarantine set against the snapshot the last committed batch stored, so a set
+// that changed twice — out and back — has to end on a published state. It costs
+// one round trip on a path that is already rate-limited by
+// sessionShimTerminalReportBackoff.
+func (d *Daemon) restoreQuarantinedLineageAfterRefusedHandoff(
+	q sessionshim.QuarantinedSession,
+	key shimIncarnation,
+) {
+	d.shims.mu.Lock()
+	kept := d.shims.tombstoned[:0]
+	for _, tombstone := range d.shims.tombstoned {
+		if tombstone.Identity() == key.identity && tombstone.ShimID == key.shimID &&
+			tombstone.ProcessEpoch == key.processEpoch {
+			continue
+		}
+		kept = append(kept, tombstone)
+	}
+	d.shims.tombstoned = kept
+	d.upsertShimQuarantineLocked(q)
+	d.shims.mu.Unlock()
+	d.publishSessionShimProjection(context.Background(), key.identity.OrgID)
 }
 
 // sessionShimTerminalReportBackoff is the cool-down after a refused durable
@@ -1298,11 +1395,24 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 // hundreds of POSTs of the same evidence.
 const sessionShimTerminalReportBackoff = tombstoneSettleWindow / 5
 
+// forgetSessionShimTerminalReport drops one incarnation's handoff mark once its
+// tombstone is off disk. Nothing can rediscover the lineage after that, so the
+// mark has no reader left — and this map is consulted from every occupancy and
+// heartbeat surface, so an entry per lineage that never leaves is a leak for
+// the daemon's whole life.
+func (d *Daemon) forgetSessionShimTerminalReport(key shimIncarnation) {
+	d.shims.mu.Lock()
+	delete(d.shims.reportingTerminal, key)
+	d.shims.mu.Unlock()
+}
+
 // claimSessionShimTerminalReport takes ownership of one incarnation's durable
 // terminal handoff. It returns (true, nil) to the one pass that owns it; to any
-// other pass it returns false plus the channel to WAIT on when a handoff is
-// already in flight, or a nil channel when there is nothing to wait for (the
-// handoff already committed, or a refusal is cooling off).
+// other pass it returns false plus the channel a WAITING caller would use when
+// a handoff is in flight, or a nil channel when there is nothing to wait for
+// (the handoff already committed, or a refusal is cooling off). No production
+// caller waits — see reconcileQuarantinedTombstones — but the channel is still
+// closed on release so a future one could without a second mechanism.
 func (d *Daemon) claimSessionShimTerminalReport(key shimIncarnation, now time.Time) (bool, <-chan struct{}) {
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()

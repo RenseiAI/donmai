@@ -576,3 +576,145 @@ func TestLegacyTombstoneAliasIsRefusedWhileASiblingRecordIsLive(t *testing.T) {
 		t.Fatalf("the identity-only alias is missing for an unambiguous identity: %v", err)
 	}
 }
+
+// TestLegacyTombstoneAliasScopeIsTheIdentity pins what the identity-only alias
+// is allowed to depend on.
+//
+// The alias asserts something about ONE identity, and it is written on the
+// terminal path under the shim's own record lock. Deciding it from a full
+// registry scan made two things true that must not be: an unreadable file
+// belonging to some unrelated session suppressed the alias for everyone, and a
+// DEAD sibling's tombstone counted as evidence of a live sibling. Liveness is
+// what a `.json` discovery record claims; a tombstone is the opposite claim.
+func TestLegacyTombstoneAliasScopeIsTheIdentity(t *testing.T) {
+	t.Parallel()
+	id := Identity{OrgID: "org-alias", SessionID: "session-alias"}
+	terminal := func(shimID string, epoch uint64) Tombstone {
+		return Tombstone{
+			SchemaVersion: RecordSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID: shimID, ProcessEpoch: epoch,
+			HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+			ExitCode: 0, GroupReaped: true, ObservedAtUnixNano: 1700000000,
+		}
+	}
+	liveRecord := func(shimID string, epoch uint64, reg *Registry) Record {
+		return Record{
+			SchemaVersion: RecordSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID:            shimID,
+			ProcessEpoch:      epoch,
+			PID:               os.Getpid(),
+			ProcessStartedAt:  1700000000,
+			SocketPath:        reg.SocketPath(id),
+			SocketDevice:      1,
+			SocketInode:       2,
+			ProtocolMin:       shimwire.V1,
+			ProtocolMax:       shimwire.V3,
+			Phase:             shimwire.PhaseRunning,
+			CreatedAtUnixNano: 1700000000,
+		}
+	}
+
+	for _, tc := range []struct {
+		name  string
+		stage func(t *testing.T, reg *Registry, dir string)
+		want  bool
+	}{
+		{
+			name:  "no other entry: the alias is written",
+			stage: func(*testing.T, *Registry, string) {},
+			want:  true,
+		},
+		{
+			name: "an unrelated unreadable entry is not this identity's business",
+			stage: func(t *testing.T, _ *Registry, dir string) {
+				t.Helper()
+				other := Identity{OrgID: "org-alias", SessionID: "someone-else"}
+				if err := os.WriteFile(filepath.Join(dir, other.RecordName()), []byte("{not json"), RecordFileMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "a dead sibling that never owned the alias does not block it",
+			stage: func(t *testing.T, _ *Registry, dir string) {
+				t.Helper()
+				sibling := terminal("shim-sibling", 9)
+				raw, err := sibling.encode()
+				if err != nil {
+					t.Fatal(err)
+				}
+				// The exact-incarnation proof only: the sibling's tombstone is a
+				// statement that IT is gone, not that anything is alive.
+				if err := os.WriteFile(filepath.Join(dir, tombstoneIncarnationName(sibling)), raw, RecordFileMode); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: true,
+		},
+		{
+			name: "a sibling that already owns the alias keeps it",
+			stage: func(t *testing.T, reg *Registry, _ string) {
+				t.Helper()
+				if err := reg.PutTombstone(terminal("shim-sibling", 9)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: false,
+		},
+		{
+			name: "a LIVE sibling record refuses the alias",
+			stage: func(t *testing.T, reg *Registry, _ string) {
+				t.Helper()
+				if err := reg.Put(liveRecord("shim-sibling", 9, reg)); err != nil {
+					t.Fatal(err)
+				}
+			},
+			want: false,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := shortTempDir(t)
+			reg, err := NewRegistry(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			tc.stage(t, reg, dir)
+			mine := terminal("shim-mine", 3)
+			safe, err := reg.legacyTombstoneAliasSafe(mine)
+			if err != nil {
+				t.Fatalf("legacyTombstoneAliasSafe: %v", err)
+			}
+			if safe != tc.want {
+				t.Fatalf("legacyTombstoneAliasSafe = %t, want %t", safe, tc.want)
+			}
+			if err := reg.PutTombstone(mine); err != nil {
+				t.Fatalf("PutTombstone: %v", err)
+			}
+			// The exact-incarnation proof is unconditional; only the alias is
+			// scoped, so read it back to prove the decision above is the one
+			// that reached disk.
+			if _, err := reg.GetTombstoneIncarnation(id, mine.ShimID, mine.ProcessEpoch); err != nil {
+				t.Fatalf("exact tombstone: %v", err)
+			}
+			raw, statErr := os.ReadFile(filepath.Join(dir, id.TombstoneName()))
+			switch {
+			case tc.want && statErr != nil:
+				t.Fatalf("the legacy alias was not written: %v", statErr)
+			case tc.want:
+				alias, decErr := decodeTombstone(raw)
+				if decErr != nil || alias.ShimID != mine.ShimID {
+					t.Fatalf("alias carries %+v, %v, want this incarnation's proof", alias, decErr)
+				}
+			case !tc.want && statErr == nil:
+				alias, decErr := decodeTombstone(raw)
+				if decErr == nil && alias.ShimID == mine.ShimID {
+					t.Fatal("the alias was overwritten with this incarnation's proof")
+				}
+			}
+		})
+	}
+}

@@ -543,3 +543,215 @@ func TestDisconnectWithAPublishedTombstoneNeverPublishesAQuarantine(t *testing.T
 		t.Fatalf("disconnect left %d lineages projected quarantined", len(projected))
 	}
 }
+
+// TestClearedReceiptEchoIsValidated keeps a retained wire field from becoming a
+// field a receiver can fabricate for free.
+//
+// This daemon no longer produces a cleared/abandoned disposition at all, so
+// every batch it commits sends an empty cleared section — and the receipt is
+// still copied and retained. Without this check a receiver could answer with
+// cleared entries the daemon never sent, and the daemon would store them as
+// though it had. An abandoned disposition is the one outcome that closes an
+// obligation without any terminal proof, so a fabricated one is exactly the
+// thing that must not be silently accepted.
+func TestClearedReceiptEchoIsValidated(t *testing.T) {
+	t.Parallel()
+	fabricated := SessionShimClearedQuarantine{
+		OrgID: "org-echo", SessionID: "session-echo",
+		ShimID: "shim-echo", ProcessEpoch: 2, ControllerGeneration: 3,
+	}
+	for _, tc := range []struct {
+		name    string
+		echoed  []SessionShimClearedQuarantine
+		wantErr bool
+	}{
+		{name: "an empty echo of an empty section commits"},
+		{name: "a fabricated cleared entry is refused", echoed: []SessionShimClearedQuarantine{fabricated}, wantErr: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+				OnAdoptionBatch: func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+					return SessionShimAdoptionBatchReceipt{
+						DurableCorrelation: []byte("rev-echo"), AdoptionRevision: "1",
+						Cleared: append([]SessionShimClearedQuarantine(nil), tc.echoed...),
+					}, nil
+				},
+			}})
+			_, err := d.completeSessionShimAdoptionBatch(context.Background(),
+				SessionShimAdoptionBatch{OrgID: "org-echo", HostID: "wh_test_host"})
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("completeSessionShimAdoptionBatch error = %v, want error=%t", err, tc.wantErr)
+			}
+		})
+	}
+}
+
+// TestQuarantineSurfacesNeverWaitOnAnInFlightTerminalHandoff pins the one thing
+// an occupancy or heartbeat surface may never do.
+//
+// The reconcile runs from every such surface. When one pass owns a lineage's
+// durable terminal handoff, the others used to WAIT for it — a wait bounded by
+// the tombstone settle window while the owner's own bound is the platform
+// callback timeout, so the waiter stalled a heartbeat on a remote round trip
+// AND still read mid-withdrawal state at the end of it. The withdrawal now
+// happens before the report instead, which removes the reason to wait: a
+// lineage whose handoff is in flight has already left the quarantine
+// projection.
+func TestQuarantineSurfacesNeverWaitOnAnInFlightTerminalHandoff(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	f.publishHelperTombstone(t)
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	f.daemon.opts.SessionShim.OnTerminalEvidence = func(context.Context, SessionShimTerminalEvidence) error {
+		close(entered)
+		<-release
+		return nil
+	}
+	reconciled := make(chan struct{})
+	go func() {
+		defer close(reconciled)
+		f.daemon.reconcileQuarantinedTombstones()
+	}()
+	select {
+	case <-entered:
+	case <-time.After(30 * time.Second):
+		close(release)
+		t.Fatal("the reconcile never reached its durable handoff")
+	}
+
+	// The surface budget. A heartbeat must not pay for a platform round trip.
+	const surfaceBudget = 250 * time.Millisecond
+	started := time.Now()
+	projected := f.daemon.QuarantinedSessions()
+	occupancy := f.daemon.SessionShimOccupancy()
+	elapsed := time.Since(started)
+	close(release)
+	select {
+	case <-reconciled:
+	case <-time.After(30 * time.Second):
+		t.Fatal("the owning reconcile never returned")
+	}
+
+	if elapsed > surfaceBudget {
+		t.Fatalf("the quarantine surfaces took %s while one handoff was in flight, budget %s — a heartbeat "+
+			"that blocks on a platform round trip takes the host out of service to answer a local question",
+			elapsed, surfaceBudget)
+	}
+	if len(projected) != 0 {
+		t.Fatalf("a lineage whose terminal handoff is in flight is still projected quarantined: %+v", projected)
+	}
+	if occupancy != 0 {
+		t.Fatalf("occupancy during the in-flight handoff = %d, want 0", occupancy)
+	}
+}
+
+// TestTerminalHandoffMarkDoesNotOutliveItsProof pins the two dispositions the
+// per-incarnation handoff mark can end in.
+//
+// The mark exists so several reconcile passes cannot commit one tombstone
+// twice. Once the proof is off disk nothing can rediscover the lineage, so the
+// mark has no reader left — and this map is consulted from every occupancy and
+// heartbeat surface, so an entry per lineage that never leaves grows for the
+// daemon's whole life. A lineage that was never staged must not leave a mark at
+// all: nothing was reported, so nothing may be recorded as committed.
+func TestTerminalHandoffMarkDoesNotOutliveItsProof(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	want := f.publishHelperTombstone(t)
+
+	f.daemon.reconcileQuarantinedTombstones()
+
+	if reported := f.reported(); len(reported) != 1 || reported[0].Tombstone != want {
+		t.Fatalf("terminal evidence reported %d times, want the exact proof once", len(reported))
+	}
+	if _, err := f.registry.GetTombstoneIncarnation(
+		f.identity, f.incarnation.shimID, f.incarnation.processEpoch); err == nil {
+		t.Fatal("the tombstone survived a committed durable handoff")
+	}
+	f.daemon.shims.mu.RLock()
+	marks := len(f.daemon.shims.reportingTerminal)
+	f.daemon.shims.mu.RUnlock()
+	if marks != 0 {
+		t.Fatalf("the handoff mark outlived the proof it guards: %d entries retained", marks)
+	}
+
+	// A second pass has nothing to find, and must not manufacture a mark for a
+	// lineage it never staged.
+	f.daemon.reconcileQuarantinedTombstones()
+	f.daemon.shims.mu.RLock()
+	marks = len(f.daemon.shims.reportingTerminal)
+	f.daemon.shims.mu.RUnlock()
+	if marks != 0 {
+		t.Fatalf("a reconcile with nothing to do left %d handoff marks behind", marks)
+	}
+}
+
+// TestStagedWithdrawalRefusesALineageItDoesNotHold pins the deterministic
+// answer for the row that is already gone.
+//
+// The reconcile iterates a SNAPSHOT of the quarantine set, so by the time it
+// takes the lock the row may have left by another route. Staging must then
+// report that it moved nothing — and above all must not add the tombstone to
+// the terminal set, which would publish a terminal disposition for a lineage
+// this daemon never withdrew.
+func TestStagedWithdrawalRefusesALineageItDoesNotHold(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	absent := shimIncarnation{identity: f.identity, shimID: "shim-absent", processEpoch: 77}
+	tombstone := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         f.identity.OrgID, SessionID: f.identity.SessionID,
+		ShimID: absent.shimID, ProcessEpoch: absent.processEpoch,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	withdrawn, staged := f.daemon.stageSessionShimTerminalWithdrawal(absent, tombstone)
+	if staged {
+		t.Fatalf("staging claimed to withdraw %+v, which was never quarantined", withdrawn)
+	}
+	f.daemon.shims.mu.RLock()
+	terminal := len(f.daemon.shims.tombstoned)
+	quarantined := len(f.daemon.shims.quarantined)
+	f.daemon.shims.mu.RUnlock()
+	if terminal != 0 {
+		t.Fatalf("staging recorded %d terminal dispositions for a lineage it did not hold", terminal)
+	}
+	if quarantined != 1 {
+		t.Fatalf("the unrelated quarantined lineage count = %d, want the seeded one untouched", quarantined)
+	}
+}
+
+// TestAcceptanceClearDeadlineExceedsItsLongestInnerWait pins the relationship,
+// not the number.
+//
+// The clear drives the production reconcile in a loop, and ONE pass of that
+// reconcile can block for a full platform round trip bounded by the callback
+// timeout. A budget equal to the settle window had zero margin: one contended
+// pass consumed all of it and the clear reported a timeout for a lineage that
+// was reconciling correctly.
+func TestAcceptanceClearDeadlineExceedsItsLongestInnerWait(t *testing.T) {
+	t.Parallel()
+	for _, callback := range []time.Duration{
+		0,
+		time.Second,
+		tombstoneSettleWindow,
+		30 * time.Second,
+		5 * time.Minute,
+	} {
+		deadline := acceptanceClearDeadlineFor(callback)
+		if deadline <= callback {
+			t.Fatalf("clear deadline %s for callback timeout %s — one inner round trip can spend the whole budget",
+				deadline, callback)
+		}
+		if deadline <= tombstoneSettleWindow {
+			t.Fatalf("clear deadline %s for callback timeout %s — the tombstone's own settle window fits inside it "+
+				"with nothing left over", deadline, callback)
+		}
+		if deadline <= callback+tombstoneSettleWindow {
+			t.Fatalf("clear deadline %s for callback timeout %s leaves no margin above one settle window plus one "+
+				"round trip", deadline, callback)
+		}
+	}
+}

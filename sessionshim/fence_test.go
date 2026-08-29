@@ -431,3 +431,74 @@ func TestRequestFencePreservesExactOrderedCoverageAndAcknowledgementBytes(t *tes
 		t.Fatalf("request bytes omitted the per-session controller generation: %s", received.RequestBytes)
 	}
 }
+
+// TestTerminalProofCoversHonoursBothAdmissibleForms pins the incarnation-scoped
+// question to the same evidence §D10 admits.
+//
+// A pre-check that is stricter than the predicate it guards is not caution — it
+// is a different rule. Consulting only Correlations refused every proof carried
+// in the scalar fields, so a session whose adopted owner had already reported an
+// ordinary terminal receipt answered `reconcile` forever.
+func TestTerminalProofCoversHonoursBothAdmissibleForms(t *testing.T) {
+	t.Parallel()
+	id := Identity{OrgID: "org-covers", SessionID: "session-covers"}
+	const (
+		shimID = "shim-covers"
+		epoch  = uint64(5)
+	)
+	reaped := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: epoch, GroupReaped: true,
+	}
+	sibling := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-sibling", ProcessEpoch: 9, GroupReaped: true,
+	}
+	unreaped := &Tombstone{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: shimID, ProcessEpoch: epoch,
+	}
+	for _, tc := range []struct {
+		name  string
+		proof TerminalProof
+		want  bool
+	}{
+		{name: "no evidence proves nothing"},
+		{
+			name:  "an exact correlation tombstone covers it",
+			proof: TerminalProof{Correlations: []TerminalCorrelationProof{{ShimID: shimID, ProcessEpoch: epoch, Tombstone: reaped}}},
+			want:  true,
+		},
+		{
+			name:  "the scalar tombstone for this exact incarnation covers it",
+			proof: TerminalProof{Tombstone: reaped},
+			want:  true,
+		},
+		{
+			name:  "an adopted owner's terminal receipt covers it",
+			proof: TerminalProof{AdoptedReceipt: true},
+			want:  true,
+		},
+		{
+			name:  "a sibling's tombstone does not cover it",
+			proof: TerminalProof{Tombstone: sibling},
+		},
+		{
+			name:  "a tombstone that did not prove a reap does not cover it",
+			proof: TerminalProof{Tombstone: unreaped},
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := TerminalProofCovers(tc.proof, id, shimID, epoch); got != tc.want {
+				t.Fatalf("TerminalProofCovers = %t, want %t", got, tc.want)
+			}
+			if tc.want && !tc.proof.Proves() {
+				t.Fatal("the incarnation-scoped answer is more permissive than Proves() — those cannot disagree in this direction")
+			}
+		})
+	}
+}

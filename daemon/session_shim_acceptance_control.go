@@ -334,7 +334,13 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 	// ONE clock. The wait sleeps in real time, so the deadline is real time
 	// too; mixing an injectable now() with a real Sleep makes the bound mean
 	// different things in a test and on a host.
-	deadline := time.Now().Add(tombstoneSettleWindow)
+	//
+	// And the deadline is STRICTLY LARGER than the longest single wait one
+	// reconcile pass can spend inside it. It used to equal the settle window
+	// exactly, which left zero margin: one contended pass consumed the whole
+	// budget and the clear then reported a timeout for a lineage that was
+	// reconciling normally.
+	deadline := time.Now().Add(acceptanceClearDeadlineFor(d.sessionShimConfig().callbackTimeout()))
 	for {
 		d.reconcileQuarantinedTombstones()
 		quarantined, tombstoned := d.sessionShimLineageDisposition(incarnation)
@@ -365,6 +371,27 @@ func (d *Daemon) clearSessionShimAcceptanceQuarantine(incarnation shimIncarnatio
 // is derived from the settle window rather than picked: a 25ms poll spent the
 // whole window re-driving a reconcile whose own commit is rate-limited anyway.
 const acceptanceClearPollInterval = tombstoneSettleWindow / 20
+
+// acceptanceClearDeadlineMargin is the headroom above the longest inner wait.
+// It is derived from the settle window for the same reason the poll interval
+// is: one number moves, and everything sized from it moves with it.
+const acceptanceClearDeadlineMargin = tombstoneSettleWindow / 2
+
+// acceptanceClearDeadlineFor sizes the clear's own bound.
+//
+// The clear drives the production reconcile in a loop, and ONE pass of that
+// reconcile can block for a full platform round trip — the durable terminal
+// handoff, bounded by the callback timeout, not by the settle window. A budget
+// equal to the settle window therefore had zero margin: a single contended pass
+// spent all of it and the clear failed a lineage that was reconciling
+// correctly. The bound is the settle window the tombstone itself needs, PLUS
+// the longest single inner wait, plus margin.
+func acceptanceClearDeadlineFor(callbackTimeout time.Duration) time.Duration {
+	if callbackTimeout < 0 {
+		callbackTimeout = 0
+	}
+	return tombstoneSettleWindow + callbackTimeout + acceptanceClearDeadlineMargin
+}
 
 // sessionShimLineageDisposition reports whether one exact incarnation is still
 // projected quarantined, and whether this daemon retains a terminal tombstone
