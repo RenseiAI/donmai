@@ -603,6 +603,130 @@ func TestConcurrentReconcilesReportOneTombstoneOnce(t *testing.T) {
 	}
 }
 
+// TestAStaleReconcilePassCannotReReportAWithdrawnLineage is the deterministic
+// form of the race the concurrent test above only samples.
+//
+// The tombstone is fetched BEFORE the claim — a registry round trip must not run
+// under d.shims.mu — and the owner's success path disposes the proof and then
+// FORGETS the mark, because nothing can rediscover a lineage whose tombstone is
+// off disk. A pass descheduled between its own fetch and its claim therefore
+// wakes to an empty mark map, claims a lineage that is no longer quarantined,
+// and commits the stale tombstone it is still holding a second time. Two
+// terminal observations for one incarnation is exactly what a loaded runner
+// produced.
+func TestAStaleReconcilePassCannotReReportAWithdrawnLineage(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	tombstone := f.publishHelperTombstone(t)
+
+	// One complete owning pass: it reports the evidence, withdraws the row,
+	// disposes the proof, and forgets its mark.
+	f.daemon.reconcileQuarantinedTombstones()
+	if got := len(f.reported()); got != 1 {
+		t.Fatalf("precondition: the owning pass reported %d times, want exactly one", got)
+	}
+	f.daemon.shims.mu.RLock()
+	held := len(f.daemon.shims.quarantined)
+	marks := len(f.daemon.shims.reportingTerminal)
+	f.daemon.shims.mu.RUnlock()
+	if held != 0 || marks != 0 {
+		t.Fatalf("precondition: quarantined=%d marks=%d after a complete handoff, want 0 and 0 — this test needs "+
+			"the state a forgotten mark leaves behind", held, marks)
+	}
+
+	// The stale pass, replayed exactly: it fetched this tombstone before the
+	// owner disposed it and only now reaches the claim. The claim SUCCEEDS, so
+	// the quarantine projection is the only thing left that can stop it.
+	own, _ := f.daemon.claimSessionShimTerminalReport(f.incarnation, time.Now())
+	if !own {
+		t.Fatal("precondition: the stale pass could not claim the forgotten mark, so it never reaches the handoff")
+	}
+	f.daemon.handOffQuarantinedTerminalProof(f.registry, f.incarnation, tombstone)
+
+	if got := len(f.reported()); got != 1 {
+		t.Fatalf("a reconcile pass holding a stale tombstone reported the withdrawn lineage again: %d terminal "+
+			"observations for one incarnation, want exactly one", got)
+	}
+	f.daemon.shims.mu.RLock()
+	marks = len(f.daemon.shims.reportingTerminal)
+	f.daemon.shims.mu.RUnlock()
+	if marks != 0 {
+		t.Fatalf("the refused stale pass retained %d handoff marks for a lineage no pass can reach again, want 0",
+			marks)
+	}
+}
+
+// TestReconcilesDescheduledAfterTheirFetchReportOneTombstoneOnce is the stress
+// variant of TestConcurrentReconcilesReportOneTombstoneOnce: it holds every
+// non-owning pass in the fetch-to-claim window for the owner's WHOLE handoff,
+// which is the scheduling a loaded parallel -race runner produces on its own and
+// a same-machine run almost never does.
+func TestReconcilesDescheduledAfterTheirFetchReportOneTombstoneOnce(t *testing.T) {
+	t.Parallel()
+	f := newAcceptanceClearFixture(t)
+	f.publishHelperTombstone(t)
+
+	const passes = 4
+	arrived := make(chan struct{}, passes)
+	ownerTicket := make(chan struct{}, 1)
+	ownerTicket <- struct{}{}
+	allFetched := make(chan struct{})
+	ownerDone := make(chan struct{})
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.afterTombstoneFetch = func(shimIncarnation) {
+		arrived <- struct{}{}
+		select {
+		case <-ownerTicket:
+			// The owner waits only until every other pass holds the tombstone,
+			// then runs its handoff to completion.
+			<-allFetched
+		default:
+			// Descheduled across the owner's report, withdrawal, disposal and
+			// the forgetting of its mark.
+			<-ownerDone
+		}
+	}
+	f.daemon.shims.mu.Unlock()
+
+	var wg sync.WaitGroup
+	for i := 0; i < passes; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			f.daemon.reconcileQuarantinedTombstones()
+		}()
+	}
+	for i := 0; i < passes; i++ {
+		select {
+		case <-arrived:
+		case <-time.After(30 * time.Second):
+			close(allFetched)
+			close(ownerDone)
+			wg.Wait()
+			t.Fatalf("only %d of %d passes reached the fetch-to-claim window", i, passes)
+		}
+	}
+	close(allFetched)
+	waitFor(t, 30*time.Second, "the owning pass to report, withdraw and forget", func() bool {
+		f.daemon.shims.mu.RLock()
+		defer f.daemon.shims.mu.RUnlock()
+		return len(f.daemon.shims.quarantined) == 0 && len(f.daemon.shims.reportingTerminal) == 0
+	})
+	close(ownerDone)
+	wg.Wait()
+
+	if got := len(f.reported()); got != 1 {
+		t.Fatalf("passes descheduled between their tombstone fetch and their claim reported the same incarnation "+
+			"%d times, want exactly one", got)
+	}
+	f.daemon.shims.mu.RLock()
+	marks := len(f.daemon.shims.reportingTerminal)
+	f.daemon.shims.mu.RUnlock()
+	if marks != 0 {
+		t.Fatalf("%d handoff marks outlived a lineage no reconcile pass can reach again, want 0", marks)
+	}
+}
+
 // A quarantined lineage is reported WITHOUT an adoption correlation, even when
 // this daemon still retains one from before the lineage was quarantined.
 //

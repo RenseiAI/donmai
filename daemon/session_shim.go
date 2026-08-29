@@ -1204,10 +1204,11 @@ type shimIncarnation struct {
 // reconcile keeps so repeated passes cannot re-commit or re-POST one tombstone.
 type sessionShimTerminalReport struct {
 	// inFlight is non-nil while one pass owns the durable handoff and is closed
-	// when it finishes. A second pass WAITS on it rather than skipping: every
-	// reconcile call site reads the quarantine projection straight afterwards,
-	// and a pass that returned early would let its caller observe a lineage the
-	// winner is in the middle of withdrawing.
+	// when it finishes. A second pass SKIPS rather than waiting — the owner's
+	// bound is a platform round trip, and a lineage whose report is in flight is
+	// still quarantined, so the row a skipping pass projects is the right one
+	// (see reconcileQuarantinedTombstones). The channel is still closed on
+	// release so a future waiter needs no second mechanism.
 	inFlight  chan struct{}
 	committed bool
 	retryAt   time.Time
@@ -1239,9 +1240,16 @@ type sessionShimState struct {
 	// reconcile's many call sites cannot double-report one tombstone and a
 	// polling caller cannot amplify one refusal into a burst of commits.
 	reportingTerminal map[shimIncarnation]sessionShimTerminalReport
-	fence             *sessionshim.Fence
-	fences            map[string]sessionshim.Fence
-	fenceRequests     map[string]sessionshim.FenceRequest
+	// afterTombstoneFetch, when set, runs in a reconcile pass between its
+	// tombstone read and its claim. Nil in every production daemon: it exists so
+	// a test can hold passes inside the exact window a loaded runner opens on
+	// its own — the one in which the owner finishes, disposes the proof and
+	// forgets the mark while another pass still holds the tombstone it fetched.
+	// Set once, under mu, before the passes that read it start.
+	afterTombstoneFetch func(shimIncarnation)
+	fence               *sessionshim.Fence
+	fences              map[string]sessionshim.Fence
+	fenceRequests       map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.

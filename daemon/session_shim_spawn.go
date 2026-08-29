@@ -1191,6 +1191,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 	d.shims.mu.RLock()
 	registry := d.shims.registry
 	quarantined := append([]sessionshim.QuarantinedSession(nil), d.shims.quarantined...)
+	afterTombstoneFetch := d.shims.afterTombstoneFetch
 	d.shims.mu.RUnlock()
 	if registry == nil || len(quarantined) == 0 {
 		return
@@ -1215,6 +1216,9 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 			continue
 		}
 		key := shimIncarnation{identity: id, shimID: tombstone.ShimID, processEpoch: tombstone.ProcessEpoch}
+		if afterTombstoneFetch != nil {
+			afterTombstoneFetch(key)
+		}
 		// One report per incarnation, even with several reconcile passes in
 		// flight: every occupancy and heartbeat surface calls this, and two
 		// passes reading the same tombstone would both commit it.
@@ -1229,6 +1233,11 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		// quarantined and cleared sections — so this lineage MUST keep being
 		// projected as quarantined until the evidence lands. A skipped pass
 		// leaves the row exactly where the composer still expects it.
+		//
+		// Owning the mark is NECESSARY but not sufficient: the mark is disposed
+		// with the tombstone, so a pass descheduled since its fetch can claim a
+		// lineage that is already gone. The handoff re-reads the quarantine
+		// projection under the lock before it reports anything.
 		own, _ := d.claimSessionShimTerminalReport(key, time.Now())
 		if !own {
 			continue
@@ -1264,6 +1273,23 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 			d.forgetSessionShimTerminalReport(key)
 		}
 	}()
+
+	// The claim proves no OTHER pass is mid-handoff; it does NOT prove this
+	// lineage is still there to hand over. The tombstone is read BEFORE the
+	// claim on purpose — a registry round trip must not run under d.shims.mu —
+	// so a pass descheduled between the two can wake after the owner reported,
+	// withdrew the row and, its proof now off disk, FORGOT the mark. The claim
+	// then succeeds against an empty map and the stale tombstone this pass is
+	// still holding gets committed a second time; measured as two terminal
+	// observations for one incarnation on a loaded CI runner. d.shims.quarantined
+	// is the source of truth for what may still be reported: if the exact
+	// incarnation has left it, there is nothing to report and nothing to retry,
+	// so the mark goes with the refusal rather than cooling off for a pass that
+	// can never reach this lineage again.
+	if !d.quarantineHoldsIncarnation(key) {
+		forget = true
+		return
+	}
 
 	hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
 	if hostErr != nil {
@@ -1331,6 +1357,23 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	// and no mark is needed to stop it. Keeping one would make this map grow for
 	// the daemon's whole life.
 	forget = true
+}
+
+// quarantineHoldsIncarnation answers whether the EXACT incarnation is still in
+// the quarantine projection. That projection is the only route a reconcile pass
+// has to a lineage, so it is also the answer to "may this pass still report it?"
+// — a pass holding a tombstone the projection no longer names is holding a fact
+// another pass has already handed over.
+func (d *Daemon) quarantineHoldsIncarnation(key shimIncarnation) bool {
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	for _, current := range d.shims.quarantined {
+		if current.Identity() == key.identity && current.ShimID == key.shimID &&
+			current.ProcessEpoch == key.processEpoch {
+			return true
+		}
+	}
+	return false
 }
 
 // withdrawQuarantinedLineageAfterDurableHandoff moves one exact incarnation out

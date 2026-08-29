@@ -72,6 +72,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   would make every batch composed during the round trip report a live obligation
   as terminal. The per-incarnation handoff mark is also dropped once the proof
   is off disk, instead of being retained for the daemon's life.
+- **Owning the handoff mark is no longer taken as proof the lineage is still
+  there to hand over.** A reconcile pass reads the tombstone BEFORE it claims
+  the mark — a registry round trip must not run under the shim lock — and the
+  owner's success path disposes the proof and then forgets the mark, since
+  nothing can rediscover a lineage whose tombstone is off disk. A pass
+  descheduled between its own fetch and its claim therefore woke to an empty
+  mark map, claimed a lineage that had already left the quarantine projection,
+  and committed the stale tombstone it was still holding a second time. The
+  handoff now re-reads the quarantine projection — the source of truth for what
+  may still be reported — under the lock before it reports anything, and
+  releases the claim with no report and no retry when the incarnation is gone.
 - **A published terminal proof freezes the acknowledgement rail instead of
   closing it.** The tombstone is written before the courtesy waits that follow
   it, and one of those waits is for the controller's acknowledgement of the

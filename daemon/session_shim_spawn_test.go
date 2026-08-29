@@ -2110,6 +2110,18 @@ func TestShimControllerDisconnectDoesNotEmitTerminalLifecycle(t *testing.T) {
 	if err := registry.PutTombstone(tombstone); err != nil {
 		t.Fatalf("restore exact tombstone: %v", err)
 	}
+	// One owning reconcile FIRST. A projection surface that lands inside the
+	// owner's report window correctly still sees the lineage: its obligation is
+	// `active` until the terminal evidence is durably accepted, and the
+	// composer's completeness cover-set for an active quarantined obligation is
+	// the quarantined and cleared sections, so every surface must keep saying
+	// "quarantined" until the handoff lands. What the 32 readers below pin is
+	// that REPEATED projections never resurrect a withdrawn charge, so they
+	// assert the settled answer — after the owning handoff, not across it.
+	d.SessionShimOccupancy()
+	waitFor(t, 30*time.Second, "the owning reconcile to hand off the restored tombstone", func() bool {
+		return d.SessionShimOccupancy() == 0 && len(d.QuarantinedSessions()) == 0
+	})
 	var reconcileReaders sync.WaitGroup
 	reconcileReaders.Add(32)
 	for range 32 {
