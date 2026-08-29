@@ -429,8 +429,16 @@ func (p TerminalProof) legacyProvesSingleCorrelation(id Identity, fenced FencedS
 // a terminalized lineage, which is precisely the double-execution invariant 10
 // exists to prevent.
 //
-// The receipt stays admissible exactly where §D10 allows it — ReleaseDecision's
-// len(covered) <= 1 path, reached only once no other live lineage remains.
+// The receipt's admissibility does not run through this file's fenced
+// len(covered) <= 1 branch in ReleaseDecision below — that branch is reached
+// only when a fence is in force. The session-shim caller usually holds none,
+// so ReleaseDecision admits the receipt earlier, via proof.Proves(), before
+// covered is ever built. What actually gates the receipt against a remaining
+// sibling is the daemon's own pre-check ahead of ReleaseDecision
+// (SessionShimReleaseDecision in daemon/session_shim.go): every REMAINING live
+// correlation must be covered by an incarnation-scoped proof, and an
+// identity-scoped receipt covers none of them, so any remaining sibling
+// refuses release there.
 //
 // The question is exported because a caller that holds several live
 // correlations must be able to ask about each one rather than about "the

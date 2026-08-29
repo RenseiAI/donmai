@@ -1336,8 +1336,9 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 // withdrawQuarantinedLineageAfterDurableHandoff moves one exact incarnation out
 // of the quarantine projection and into the terminal set, as ONE locked
 // transition, AFTER its terminal evidence is durably accepted. It reports false
-// when the row had already left by another route, in which case it records
-// nothing as terminal either.
+// when the row had already left by another route; the adoption correlation for
+// the incarnation is dropped unconditionally either way, but nothing is
+// appended to the terminal set in that case.
 //
 // The ORDER is the contract, not an implementation detail. Doing this before
 // the report — to spare the other reconcile passes a wait — makes every

@@ -3635,9 +3635,15 @@ func (d *Daemon) SessionShimReleaseDecision(orgID, sessionID string, proof sessi
 	// member of a non-empty one is a SIBLING that is still running. That is why
 	// the per-incarnation question is strictly incarnation-scoped and refuses
 	// the identity-scoped AdoptedReceipt outright: a receipt can never name a
-	// remaining sibling. The receipt keeps its §D10 admissibility through
-	// ReleaseDecision's len(covered) <= 1 path below, which this pre-check
-	// reaches only when nothing else is left alive.
+	// remaining sibling. This loop IS the receipt's real gate: it runs whenever
+	// this daemon still holds a live correlation for the identity, and it never
+	// admits the receipt for one, so any remaining sibling forces
+	// ReleaseReconcile (or ReleaseHeld, under a live fence). Only once no live
+	// correlation remains — the finishing lineage's own case, after it has
+	// dropped its own entry — does this pre-check no-op and fall through to
+	// sessionshim.ReleaseDecision below, which (this caller usually holding no
+	// fence) admits the receipt via proof.Proves() rather than through its
+	// fenced len(covered) <= 1 path.
 	if live := d.liveSessionShimCorrelations(id); len(live) > 0 {
 		for _, correlation := range live {
 			if !sessionshim.TerminalProofCovers(proof, id, correlation.shimID, correlation.processEpoch) {

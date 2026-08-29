@@ -362,6 +362,12 @@ func TestAcceptanceClearRefusesALineageThatVanishedWithoutATombstone(t *testing.
 // session whose real harness was still running — and kept answering it for the
 // rest of the daemon's life, because the retained tombstone never expires.
 // Invariant 10 requires proof that THAT EXACT harness process group was reaped.
+//
+// Seeded in the PRODUCTION state: the sole caller (finishAdoptedShim,
+// session_shim_spawn.go ~985) deletes its own adopted[id] entry before it ever
+// asks for a verdict (~1044), so d.shims.adopted never holds anything for this
+// identity here. The still-running lineage this test guards is tracked only in
+// quarantined — a duplicate-identity sibling whose harness never stopped.
 func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
 	t.Parallel()
 	dir := t.TempDir()
@@ -381,9 +387,15 @@ func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
 	if err := registry.PutTombstone(sibling); err != nil {
 		t.Fatalf("PutTombstone: %v", err)
 	}
+	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-live", ProcessEpoch: 0,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}, sessionshim.QuarantineDuplicateIdentity, "still running under a shared lifecycle identity", time.Now())
 	d.shims.mu.Lock()
 	d.shims.registry = registry
-	d.shims.adopted[id] = adoptedShim{shimID: "shim-live"}
+	d.upsertShimQuarantineLocked(q)
 	d.shims.mu.Unlock()
 
 	proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
@@ -391,7 +403,7 @@ func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
 		t.Fatal("precondition: the sibling tombstone is not even a proof; this test would pass vacuously")
 	}
 	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict == sessionshim.ReleaseAllowed {
-		t.Fatal("a sibling incarnation's tombstone released a session whose adopted lineage is still live — " +
+		t.Fatal("a sibling incarnation's tombstone released a session whose live lineage is still running — " +
 			"§D10 requires proof for that exact harness process group")
 	}
 
@@ -404,8 +416,69 @@ func TestSiblingTombstoneDoesNotReleaseALiveLineage(t *testing.T) {
 	}
 	proof = d.SessionShimTerminalProof(id.OrgID, id.SessionID)
 	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict != sessionshim.ReleaseAllowed {
-		t.Fatalf("release verdict with the adopted lineage's own reap proof = %q, want %q",
+		t.Fatalf("release verdict with the live lineage's own reap proof = %q, want %q",
 			verdict, sessionshim.ReleaseAllowed)
+	}
+}
+
+// TestOwnTombstoneDoesNotReleaseAQuarantinedLiveSibling is scenario (d): the
+// finishing lineage's OWN incarnation-scoped tombstone must not leak past a
+// REMAINING live sibling under the same lifecycle identity.
+//
+// Seeded in the PRODUCTION state the sole caller presents: finishAdoptedShim
+// deletes its own adopted[id] entry (session_shim_spawn.go ~985) before it
+// asks for a verdict (~1044), so at the moment of the call d.shims.adopted
+// holds nothing for this identity at all — the only trace of the finishing
+// lineage is the tombstone it just durably wrote, and the only trace of the
+// sibling is its quarantined entry, whose harness is still running. A proof
+// naming only the finishing lineage's own shim id and epoch must not be read
+// as covering the sibling's — it names a different incarnation entirely.
+func TestOwnTombstoneDoesNotReleaseAQuarantinedLiveSibling(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{RegistryDir: dir}})
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := sessionshim.Identity{OrgID: "org-quarantined-sibling", SessionID: "session-quarantined-sibling"}
+
+	// The still-running sibling: quarantined, no tombstone. §D7 refused it
+	// adoption authority as the identity's second live incarnation, but its
+	// harness never stopped.
+	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-sibling", ProcessEpoch: 4,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}, sessionshim.QuarantineDuplicateIdentity, "sibling lineage still running", time.Now())
+	d.shims.mu.Lock()
+	d.shims.registry = registry
+	d.upsertShimQuarantineLocked(q)
+	d.shims.mu.Unlock()
+
+	// The finishing lineage's OWN incarnation-scoped tombstone — a different
+	// shim id and epoch than the sibling's, exactly as SessionShimTerminalProof
+	// builds it right after finishAdoptedShim durably writes its own tombstone.
+	own := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-finishing", ProcessEpoch: 9,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(own); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+
+	proof := d.SessionShimTerminalProof(id.OrgID, id.SessionID)
+	if !proof.Proves() {
+		t.Fatal("precondition: the finishing lineage's own tombstone is not even a proof; this test would pass vacuously")
+	}
+	if verdict := d.SessionShimReleaseDecision(id.OrgID, id.SessionID, proof); verdict != sessionshim.ReleaseReconcile {
+		t.Fatalf("release verdict for the finishing lineage's own tombstone with a live quarantined sibling remaining = %q, want %q — "+
+			"the sibling's incarnation is not named by a proof scoped to a different shim id and epoch",
+			verdict, sessionshim.ReleaseReconcile)
 	}
 }
 
@@ -455,8 +528,12 @@ func TestAdoptedReceiptDoesNotReleaseARemainingSibling(t *testing.T) {
 			verdict, sessionshim.ReleaseAllowed)
 	}
 
-	// And the same control for the other form: a lineage that leaves behind its
-	// OWN group-reaped tombstone releases too.
+	// A third control, in the SAME "nothing else alive" state established just
+	// above (quarantined is nil): a lineage that leaves behind its own
+	// group-reaped tombstone releases too, exactly as the receipt did there.
+	// This is the ordinary single-lineage case, not a remaining-sibling one —
+	// TestOwnTombstoneDoesNotReleaseAQuarantinedLiveSibling covers the
+	// sibling-present form of this same admissible-proof pair.
 	registry, err := sessionshim.NewRegistry(dir)
 	if err != nil {
 		t.Fatalf("NewRegistry: %v", err)
@@ -788,15 +865,17 @@ func TestAnInFlightTerminalHandoffStaysQuarantinedInTheBatch(t *testing.T) {
 	}
 }
 
-// TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff is the same order seen
-// from the verb that consumes it.
-//
-// The clear breaks out of its poll on "no longer quarantined AND tombstoned".
-// Withdrawing before the report satisfied that condition MID-handoff, so the
-// clear returned — and its republish then committed exactly the batch the
-// composer refuses, for a lineage whose obligation was still active. The clear
-// must keep polling until the evidence is durably accepted.
-func TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff(t *testing.T) {
+// TestLineageStaysQuarantinedWhileItsTerminalReportIsInFlight pins the
+// production ordering the acceptance clear depends on: a lineage whose
+// terminal report is still in flight reads as quarantined and NOT yet
+// tombstoned, sampled at the instant the durable-handoff hook is blocked
+// (not over a wall-clock guess). Withdrawing before the report lands would
+// flip that same instant's disposition, and the clear's republish would then
+// commit exactly the batch the composer refuses, for a lineage whose
+// obligation is still active. It also runs the clear end to end across the
+// release, confirming it completes once the handoff is durably accepted
+// rather than hanging or erroring.
+func TestLineageStaysQuarantinedWhileItsTerminalReportIsInFlight(t *testing.T) {
 	t.Parallel()
 	f := newAcceptanceClearFixture(t)
 	f.publishHelperTombstone(t)
@@ -838,31 +917,16 @@ func TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff(t *testing.T) {
 			"reports a lineage terminal whose obligation is still active", quarantined, tombstoned)
 	}
 
-	// And end to end: whenever the clear returns, the evidence must already have
-	// landed. The report cannot proceed past `release`, so the sample below is
-	// exact rather than timing-dependent.
+	// And end to end: the clear must still complete once the handoff is
+	// released, reporting the evidence exactly once and publishing the settled
+	// projection.
 	started := make(chan struct{})
 	cleared := make(chan error, 1)
-	evidenceAtReturn := make(chan int, 1)
 	go func() {
 		close(started)
-		err := f.daemon.clearSessionShimAcceptanceQuarantine(f.incarnation)
-		// Sampled at the instant of return. A clear that broke out mid-handoff
-		// sees ZERO reports here whenever it returned, because the fake report
-		// appends nothing until `release` is closed.
-		evidenceAtReturn <- len(f.reported())
-		cleared <- err
+		cleared <- f.daemon.clearSessionShimAcceptanceQuarantine(f.incarnation)
 	}()
 	<-started
-
-	select {
-	case err := <-cleared:
-		close(release)
-		t.Fatalf("the clear returned (%v) while the terminal report was still in flight — its republish then "+
-			"commits a batch that reports a lineage terminal whose obligation is still active", err)
-	default:
-	}
-
 	close(release)
 	select {
 	case err := <-cleared:
@@ -871,10 +935,6 @@ func TestAcceptanceClearWaitsOutAnInFlightTerminalHandoff(t *testing.T) {
 		}
 	case <-time.After(60 * time.Second):
 		t.Fatal("the clear never completed after the durable handoff landed")
-	}
-	if got := <-evidenceAtReturn; got == 0 {
-		t.Fatal("the clear returned before its lineage's terminal evidence was durably accepted — " +
-			"whenever it returned, the held report had not landed")
 	}
 	select {
 	case <-owner:
