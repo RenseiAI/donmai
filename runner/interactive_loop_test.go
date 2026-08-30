@@ -906,6 +906,34 @@ func TestInteractive_LocalOnlyNonzeroExitFails(t *testing.T) {
 	}
 }
 
+func TestInteractive_LocalOnlyCleanupFailureIsDurable(t *testing.T) {
+	requireSh(t)
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	r := minimalRunner(t)
+	h, err := ptycli.SpawnWithCleanup(
+		context.Background(),
+		"/bin/sh",
+		[]string{"-c", "exit 0"},
+		agent.Spec{Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{}},
+		agent.HarnessManifest{},
+		func() error { return errors.New("named app-server exited: socket unavailable") },
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	res := &Result{SessionID: "s"}
+	qw := QueuedWork{}
+	qw.SessionID = "s"
+	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+	defer cancel()
+	out, _ := r.dispatchInteractive(ctx, h, t.TempDir(), qw, res, noopSink{}, nil, nil, agent.NoticeDeliveryPTYNotice)
+	if out.Status != "failed" || !strings.Contains(out.Error, "named app-server exited: socket unavailable") {
+		t.Fatalf("cleanup failure result = status %q error %q", out.Status, out.Error)
+	}
+}
+
 // TestInteractive_ExitDetailIsNotASummary: the terminal Result's Summary field
 // carries the AGENT's account of the work, and consumers read it as content. A
 // session that ends without one leaves it EMPTY rather than synthesizing a

@@ -375,7 +375,7 @@ func (r *Runner) dispatchInteractive(
 
 		case <-isess.Done():
 			// Child exited and the PTY drained to EOF (Exit emitted).
-			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil
+			return r.finishInteractive(worktreePath, qw, res, sink, handle, isess), nil
 
 		case <-interactiveCtx.Done():
 			// Runner stop / cancel / wall-clock cap. The deferred handle.Stop
@@ -451,6 +451,7 @@ func (r *Runner) finishInteractive(
 	qw QueuedWork,
 	res *Result,
 	sink activitySink,
+	handle agent.Handle,
 	isess agent.InteractiveSession,
 ) *Result {
 	exit, ok := isess.Exit()
@@ -472,6 +473,24 @@ func (r *Runner) finishInteractive(
 		res.Status = "failed"
 		if res.Error == "" {
 			res.Error = "interactive session ended: " + detail
+		}
+	}
+	type terminalResultSource interface {
+		AwaitInteractiveTerminalResult(context.Context) (agent.ResultEvent, error)
+	}
+	if source, ok := handle.(terminalResultSource); ok {
+		terminalCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		terminal, terminalErr := source.AwaitInteractiveTerminalResult(terminalCtx)
+		cancel()
+		if terminalErr != nil {
+			res.PostSessionWarnings = append(res.PostSessionWarnings,
+				"interactive terminal diagnostics unavailable: "+terminalErr.Error())
+		} else if !terminal.Success {
+			res.Status = "failed"
+			if len(terminal.Errors) > 0 {
+				detail = strings.Join(terminal.Errors, "; ")
+				res.Error = detail
+			}
 		}
 	}
 	// Summary is deliberately NOT synthesized here. It carries the AGENT's

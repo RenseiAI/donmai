@@ -318,7 +318,7 @@ func TestHandle_FreshThreadIsNamedBeforeFirstTurn(t *testing.T) {
 	}
 }
 
-func TestCreateAndVerifyNamedThread_ReadsBackDurableNativeName(t *testing.T) {
+func TestSetAndVerifyNamedThread_ReadsBackDurableNativeName(t *testing.T) {
 	t.Parallel()
 	fs, stdinW, stdoutR := newFakeServer()
 	go fs.run(t, "thread-bootstrap")
@@ -330,14 +330,14 @@ func TestCreateAndVerifyNamedThread_ReadsBackDurableNativeName(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
-	threadID, err := createAndVerifyNamedThread(ctx, client, agent.Spec{
-		SessionName: "chief-of-staff", Cwd: "/tmp/wt",
-	}, time.Second)
-	if err != nil {
-		t.Fatalf("createAndVerifyNamedThread: %v", err)
-	}
-	if threadID != "thread-bootstrap" {
-		t.Fatalf("thread id = %q", threadID)
+	if err := setAndVerifyNamedThreadWithRequest(
+		ctx,
+		"thread-bootstrap",
+		"chief-of-staff",
+		client.RequestWithRetry,
+		time.Second,
+	); err != nil {
+		t.Fatalf("setAndVerifyNamedThreadWithRequest: %v", err)
 	}
 }
 
