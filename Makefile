@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -66,6 +66,13 @@ test-shim-overlap:
 # complete frozen control registry against the released v0.68.2 artifact.
 test-attach-v1-compat:
 	bash scripts/test-attach-v1-v0682-compat.sh
+
+# Replays a raw adversarial poll item through the exact v0.72.2 git archive.
+# The temporary probe calls the release's daemon projection and runner digest
+# directly, then byte-compares the resulting self-digested artifact. GOPROXY
+# is disabled by the command, so this verification has no network dependency.
+verify-operational-payload-provenance:
+	GOWORK=off go run ./cmd/operational-payload-provenance
 
 lint:
 	golangci-lint run
