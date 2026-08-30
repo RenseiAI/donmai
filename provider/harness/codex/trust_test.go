@@ -292,6 +292,24 @@ func TestBuildInteractiveLaunch_SeedsTrustAheadOfPromptAndOverrides(t *testing.T
 	}
 }
 
+func TestBuildInteractiveLaunch_PlatformSessionMarksProjectUntrusted(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	launch, err := buildInteractiveLaunchEnv(agent.Spec{
+		Cwd: workspace,
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "https://platform.example/api/mcp/session",
+		}},
+	}, func(string) string { return "" })
+	if err != nil {
+		t.Fatal(err)
+	}
+	trust := decodeTrustOverride(t, launch.argv)
+	if trust[workspace] != codexTrustLevelUntrusted {
+		t.Fatalf("platform workspace trust = %q, want %q", trust[workspace], codexTrustLevelUntrusted)
+	}
+}
+
 func TestBuildInteractiveLaunch_UnknownHooksPolicyFailsClosed(t *testing.T) {
 	t.Parallel()
 	_, err := buildInteractiveLaunchEnv(agent.Spec{Cwd: t.TempDir(), Prompt: "hi"}, func(string) string {

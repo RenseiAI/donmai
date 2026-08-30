@@ -348,7 +348,7 @@ func TestReconciliationExhaustsItsDerivedBoundAndKeepsServing(t *testing.T) {
 	h.setRefreshReceiptRevision("revision-1")
 	var ambiguousOnce sync.Once
 	f.setCommit(func(SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
-		var err error = errors.New("adoption revision compare-and-swap refused (closed code, decoded 4xx)")
+		err := errors.New("adoption revision compare-and-swap refused (closed code, decoded 4xx)")
 		ambiguousOnce.Do(func() { err = transportLostCommitAnswer() })
 		return SessionShimAdoptionBatchReceipt{}, err
 	})

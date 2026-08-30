@@ -2,7 +2,9 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -415,6 +417,187 @@ func TestSpawnInteractive_RunsFakeCLIUnderPTY(t *testing.T) {
 		case <-deadline:
 			t.Fatal("timed out waiting for events")
 		}
+	}
+}
+
+// An on-platform interactive session must never inherit the operator's
+// external MCP registration. The platform-minted bearer and
+// per-session endpoint are one authority; ambient config may neither coexist
+// with it nor redirect identical tool names to an external facade.
+func TestSpawnInteractive_IsolatesPoisonedGlobalMCPConfigAndHeaders(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	clearInteractiveCodexAuthEnv(t)
+	root := t.TempDir()
+	ambientHome := filepath.Join(root, "ambient-codex-home")
+	boundaryRoot := filepath.Join(root, "session-boundaries")
+	workdir := filepath.Join(root, "work")
+	for _, dir := range []string{ambientHome, boundaryRoot, workdir} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatalf("mkdir %s: %v", dir, err)
+		}
+	}
+	const ambientConfig = `[mcp_servers.external]
+url = "https://external.example.com/mcp"
+[mcp_servers.external.env_http_headers]
+Authorization = "POISON_EXTERNAL_AUTH"
+X-Org = "POISON_EXTERNAL_ORG"
+X-Project = "POISON_EXTERNAL_PROJECT"
+`
+	ambientConfigPath := filepath.Join(ambientHome, "config.toml")
+	if err := os.WriteFile(ambientConfigPath, []byte(ambientConfig), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	hostAuth := filepath.Join(ambientHome, codexAuthFileName)
+	if err := os.WriteFile(hostAuth, []byte(`{"auth_mode":"chatgpt","tokens":{"access_token":"host-login"}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", ambientHome)
+	t.Setenv("POISON_EXTERNAL_AUTH", "Bearer external-registration")
+	t.Setenv("POISON_EXTERNAL_ORG", "org_wrong")
+	t.Setenv("POISON_EXTERNAL_PROJECT", "proj_wrong")
+
+	bin := writeFakeCodexScript(t, `
+set -e
+printf '%s' "$CODEX_HOME" > "$PWD/observed-home"
+cp "$CODEX_HOME/config.toml" "$PWD/observed-config.toml"
+printf '%s\n' "$@" > "$PWD/observed-argv"
+for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' "$key" "${!key}"; done > "$PWD/observed-auth-env"
+test -f "$CODEX_HOME/auth.json"
+`)
+	const sessionBearer = "session-mcp-bearer"
+	h, err := SpawnInteractive(context.Background(), Options{
+		CodexBin:      bin,
+		configTempDir: boundaryRoot,
+		interactiveMCPInventoryRunner: inventoryRunnerFor(t, []agent.MCPServerConfig{{
+			Name: "donmai-platform",
+			Type: "http",
+			URL:  "https://platform.example.com/api/mcp/sess_project",
+			Headers: map[string]string{
+				"Authorization": "Bearer " + sessionBearer,
+			},
+		}}),
+	}, agent.Spec{
+		Cwd: workdir,
+		Env: map[string]string{
+			// A work-item or credential layer cannot override the runner-owned
+			// boundary either.
+			"CODEX_HOME": ambientHome,
+		},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform",
+			Type: "http",
+			URL:  "https://platform.example.com/api/mcp/sess_project",
+			Headers: map[string]string{
+				"Authorization": "Bearer " + sessionBearer,
+			},
+		}},
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("SpawnInteractive: %v", err)
+	}
+	for ev := range h.Events() {
+		if result, ok := ev.(agent.ResultEvent); ok && !result.Success {
+			t.Fatalf("fake codex failed: %+v", result)
+		}
+	}
+
+	observedHomeBytes, err := os.ReadFile(filepath.Join(workdir, "observed-home"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	observedHome := string(observedHomeBytes)
+	if observedHome == ambientHome || !sameResolvedPath(filepath.Dir(observedHome), boundaryRoot) {
+		t.Fatalf("child CODEX_HOME = %q, want private boundary under %q", observedHome, boundaryRoot)
+	}
+	remainingBoundaries, err := os.ReadDir(boundaryRoot)
+	if err != nil || len(remainingBoundaries) != 0 {
+		t.Fatalf("private CODEX_HOME survived child exit: err=%v entries=%v", err, remainingBoundaries)
+	}
+	seenConfig, err := os.ReadFile(filepath.Join(workdir, "observed-config.toml"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(seenConfig), "external.example.com") || strings.Contains(string(seenConfig), "POISON_EXTERNAL") {
+		t.Fatalf("ambient MCP authority entered private config:\n%s", seenConfig)
+	}
+	if !strings.Contains(string(seenConfig), codexConfigBaseline) || !strings.Contains(string(seenConfig), codexFileAuthConfig) {
+		t.Fatalf("private config omitted its empty MCP/file-auth baseline:\n%s", seenConfig)
+	}
+	argv, err := os.ReadFile(filepath.Join(workdir, "observed-argv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(argv), "/api/mcp/sess_project") || strings.Contains(string(argv), "external.example.com") || strings.Contains(string(argv), sessionBearer) {
+		t.Fatalf("session MCP argv is not endpoint-exact and secret-free:\n%s", argv)
+	}
+	authEnv, err := os.ReadFile(filepath.Join(workdir, "observed-auth-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		if !strings.Contains(string(authEnv), key+"=\n") {
+			t.Fatalf("child retained %s authority: %s", key, authEnv)
+		}
+	}
+	unchanged, err := os.ReadFile(ambientConfigPath)
+	if err != nil || string(unchanged) != ambientConfig {
+		t.Fatalf("ambient config changed: err=%v body=%q", err, unchanged)
+	}
+}
+
+func inventoryRunnerFor(t *testing.T, servers []agent.MCPServerConfig) interactiveMCPInventoryRunner {
+	t.Helper()
+	return func(_ context.Context, _ string, _ string, childEnv []string, configArgs, queryArgs []string) ([]byte, error) {
+		for _, key := range codexEnvironmentAuthKeys {
+			want := key + "="
+			found := false
+			for _, entry := range childEnv {
+				if entry == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("effective-config child env did not clear %s", key)
+			}
+		}
+		if !slices.ContainsFunc(configArgs, func(arg string) bool {
+			return strings.Contains(arg, "trust_level=\"untrusted\"")
+		}) {
+			t.Fatalf("effective-config readback did not mark the project untrusted: %q", configArgs)
+		}
+		entries := make([]codexMCPInventoryEntry, 0, len(servers))
+		for _, server := range servers {
+			entry := codexMCPInventoryEntry{Name: server.Name, Enabled: true}
+			switch strings.ToLower(strings.TrimSpace(server.Type)) {
+			case "http":
+				entry.Transport.Type = "streamable_http"
+				entry.Transport.URL = server.URL
+				entry.Transport.EnvHTTPHeaders = make(map[string]string, len(server.Headers))
+				for header := range server.Headers {
+					entry.Transport.EnvHTTPHeaders[header] = codexHTTPHeaderEnvName(server.Name, header)
+				}
+			default:
+				entry.Transport.Type = "stdio"
+				entry.Transport.Command = server.Command
+				entry.Transport.Args = append([]string(nil), server.Args...)
+				entry.Transport.EnvVars = sortedStringKeys(server.Env)
+			}
+			entries = append(entries, entry)
+		}
+		if slices.Contains(queryArgs, "list") {
+			return json.Marshal(entries)
+		}
+		if len(queryArgs) >= 3 && queryArgs[1] == "get" {
+			for _, entry := range entries {
+				if entry.Name == queryArgs[2] {
+					return json.Marshal(entry)
+				}
+			}
+		}
+		return nil, fmt.Errorf("unexpected fake inventory query: %q", queryArgs)
 	}
 }
 
