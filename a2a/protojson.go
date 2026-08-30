@@ -6,30 +6,31 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
 // Timestamp is a ProtoJSON google.protobuf.Timestamp string.
 type Timestamp string
 
-func (t Timestamp) validate() error {
+func (t Timestamp) parse() (time.Time, error) {
 	if t == "" {
-		return errors.New("timestamp is empty")
+		return time.Time{}, errors.New("timestamp is empty")
+	}
+	if !strings.HasSuffix(string(t), "Z") {
+		return time.Time{}, fmt.Errorf("invalid ProtoJSON timestamp %q: literal uppercase Z suffix is required", t)
 	}
 	parsed, err := time.Parse(time.RFC3339Nano, string(t))
 	if err != nil || parsed.Year() < 1 || parsed.Year() > 9999 {
-		return fmt.Errorf("invalid ProtoJSON timestamp %q", t)
+		return time.Time{}, fmt.Errorf("invalid ProtoJSON timestamp %q", t)
 	}
-	return nil
+	return parsed, nil
 }
 
 // MarshalJSON validates and emits a ProtoJSON timestamp string.
 func (t Timestamp) MarshalJSON() ([]byte, error) {
-	parsed, err := time.Parse(time.RFC3339Nano, string(t))
-	if err != nil || parsed.Year() < 1 || parsed.Year() > 9999 {
-		return nil, fmt.Errorf("invalid ProtoJSON timestamp %q", t)
-	}
-	if err := t.validate(); err != nil {
+	parsed, err := t.parse()
+	if err != nil {
 		return nil, err
 	}
 	return json.Marshal(formatTimestamp(parsed))
@@ -46,10 +47,10 @@ func (t *Timestamp) UnmarshalJSON(data []byte) error {
 		return fmt.Errorf("decode timestamp: %w", err)
 	}
 	parsed := Timestamp(value)
-	if err := parsed.validate(); err != nil {
+	parsedTime, err := parsed.parse()
+	if err != nil {
 		return err
 	}
-	parsedTime, _ := time.Parse(time.RFC3339Nano, value)
 	*t = Timestamp(formatTimestamp(parsedTime))
 	return nil
 }

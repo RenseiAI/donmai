@@ -86,12 +86,46 @@ func TestProtoJSONStrictEnumTimestampAndUnknownFields(t *testing.T) {
 		})
 	}
 
-	var task Task
-	if err := json.Unmarshal([]byte(`{"id":"t","status":{"state":"TASK_STATE_WORKING","timestamp":"2026-08-30T03:04:05.12-04:00"}}`), &task); err != nil {
-		t.Fatalf("valid timestamp: %v", err)
+	for _, timestamp := range []string{
+		"2026-08-30T07:04:05+00:00",
+		"2026-08-30T03:04:05-04:00",
+		"2026-08-30T07:04:05z",
+	} {
+		timestamp := timestamp
+		t.Run("refuse_"+timestamp, func(t *testing.T) {
+			var task Task
+			fixture := `{"id":"t","status":{"state":"TASK_STATE_WORKING","timestamp":"` + timestamp + `"}}`
+			if err := json.Unmarshal([]byte(fixture), &task); err == nil {
+				t.Fatalf("Unmarshal timestamp %q succeeded, want literal-Z refusal", timestamp)
+			}
+			if _, err := json.Marshal(Timestamp(timestamp)); err == nil {
+				t.Fatalf("Marshal timestamp %q succeeded, want literal-Z refusal", timestamp)
+			}
+		})
 	}
-	if task.Status.Timestamp != "2026-08-30T07:04:05.120Z" {
-		t.Fatalf("timestamp = %q, want canonical UTC ProtoJSON", task.Status.Timestamp)
+
+	for input, want := range map[string]Timestamp{
+		"2026-08-30T07:04:05Z":           "2026-08-30T07:04:05Z",
+		"2026-08-30T07:04:05.12Z":        "2026-08-30T07:04:05.120Z",
+		"2026-08-30T07:04:05.123Z":       "2026-08-30T07:04:05.123Z",
+		"2026-08-30T07:04:05.123456Z":    "2026-08-30T07:04:05.123456Z",
+		"2026-08-30T07:04:05.123456789Z": "2026-08-30T07:04:05.123456789Z",
+	} {
+		var task Task
+		fixture := `{"id":"t","status":{"state":"TASK_STATE_WORKING","timestamp":"` + input + `"}}`
+		if err := json.Unmarshal([]byte(fixture), &task); err != nil {
+			t.Fatalf("valid timestamp %q: %v", input, err)
+		}
+		if task.Status.Timestamp != want {
+			t.Fatalf("timestamp %q = %q, want %q", input, task.Status.Timestamp, want)
+		}
+		raw, err := json.Marshal(Timestamp(input))
+		if err != nil {
+			t.Fatalf("Marshal valid timestamp %q: %v", input, err)
+		}
+		if string(raw) != `"`+string(want)+`"` {
+			t.Fatalf("Marshal timestamp %q = %s, want %q", input, raw, want)
+		}
 	}
 
 	var numeric Message
