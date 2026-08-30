@@ -95,15 +95,15 @@ func main() {
 	if err != nil {
 		fatal(err)
 	}
-	path := *artifactFlag
-	if !filepath.IsAbs(path) {
-		path = filepath.Join(root, path)
+	path, err := artifactFile(root, *artifactFlag)
+	if err != nil {
+		fatal(err)
 	}
 	if *checkArtifact {
 		if *write || *emptyCacheControl {
 			fatal(errors.New("-check-artifact cannot be combined with -write or -empty-cache-control"))
 		}
-		committed, err := os.ReadFile(path)
+		committed, err := os.ReadFile(path) // #nosec G304 -- artifactFile accepts only <repository-root>/runner/testdata/v0.72.2-operational-payload-provenance.json.
 		if err != nil {
 			fatal(fmt.Errorf("read committed artifact: %w", err))
 		}
@@ -117,15 +117,15 @@ func main() {
 		fatal(err)
 	}
 	if *write {
-		if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(path), 0o750); err != nil {
 			fatal(fmt.Errorf("create artifact directory: %w", err))
 		}
-		if err := os.WriteFile(path, generated, 0o644); err != nil {
+		if err := os.WriteFile(path, generated, 0o600); err != nil {
 			fatal(fmt.Errorf("write artifact: %w", err))
 		}
 		return
 	}
-	committed, err := os.ReadFile(path)
+	committed, err := os.ReadFile(path) // #nosec G304 -- artifactFile accepts only <repository-root>/runner/testdata/v0.72.2-operational-payload-provenance.json.
 	if err != nil {
 		fatal(fmt.Errorf("read committed artifact: %w", err))
 	}
@@ -143,11 +143,42 @@ func fatal(err error) {
 }
 
 func repositoryRoot() (string, error) {
-	output, err := run("", nil, "git", "rev-parse", "--show-toplevel")
+	output, err := runCommand("", nil, commandGit, "rev-parse", "--show-toplevel")
 	if err != nil {
 		return "", fmt.Errorf("locate repository root: %w", err)
 	}
 	return strings.TrimSpace(string(output)), nil
+}
+
+func artifactFile(root, requested string) (string, error) {
+	expected, err := fixedRepositoryFile(root, artifactPath)
+	if err != nil {
+		return "", err
+	}
+	candidate := requested
+	if !filepath.IsAbs(candidate) {
+		candidate = filepath.Join(root, candidate)
+	}
+	if filepath.Clean(candidate) != expected {
+		return "", fmt.Errorf("artifact path must be %s", artifactPath)
+	}
+	return expected, nil
+}
+
+func fixedRepositoryFile(root, relative string) (string, error) {
+	if filepath.IsAbs(relative) || filepath.Clean(relative) != relative {
+		return "", fmt.Errorf("unsafe repository-relative path %q", relative)
+	}
+	absoluteRoot, err := filepath.Abs(root)
+	if err != nil {
+		return "", fmt.Errorf("resolve repository root: %w", err)
+	}
+	path := filepath.Join(absoluteRoot, relative)
+	contained, err := filepath.Rel(absoluteRoot, path)
+	if err != nil || contained == ".." || strings.HasPrefix(contained, ".."+string(filepath.Separator)) || contained != relative {
+		return "", fmt.Errorf("repository-relative path escapes root: %q", relative)
+	}
+	return path, nil
 }
 
 type replayOptions struct {
@@ -184,7 +215,11 @@ func generate(root string, options replayOptions) ([]byte, error) {
 		return nil, fmt.Errorf("pinned archive Go version = %q, want %q", probe.GoVersion, pinnedGoVersion)
 	}
 
-	source, err := os.ReadFile(filepath.Join(root, generatorSource))
+	sourcePath, err := fixedRepositoryFile(root, generatorSource)
+	if err != nil {
+		return nil, err
+	}
+	source, err := os.ReadFile(sourcePath) // #nosec G304 -- fixedRepositoryFile accepts only the generator's fixed repository-relative path.
 	if err != nil {
 		return nil, fmt.Errorf("read generator source: %w", err)
 	}
@@ -251,7 +286,7 @@ func verifyTagCommit(tag, got, want string) error {
 	return nil
 }
 
-func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput, error) {
+func runPinnedProbe(root string, raw []byte, options replayOptions) (result probeOutput, resultErr error) {
 	if err := validateProbeSource(probeProgram); err != nil {
 		return probeOutput{}, err
 	}
@@ -259,12 +294,25 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput
 	if err != nil {
 		return probeOutput{}, fmt.Errorf("create temporary archive tree: %w", err)
 	}
-	defer os.RemoveAll(temporary)
+	defer func() {
+		if err := os.RemoveAll(temporary); err != nil {
+			cleanupErr := fmt.Errorf("remove temporary archive tree: %w", err)
+			if resultErr == nil {
+				resultErr = cleanupErr
+			}
+		}
+	}()
 
-	archiveCommand := exec.Command("git", "-C", root, "archive", "--format=tar", pinnedCommit)
+	archiveCommand, err := commandFor(root, nil, commandGit, "archive", "--format=tar", pinnedCommit)
+	if err != nil {
+		return probeOutput{}, err
+	}
 	// A pipe is used so archive bytes never pass through a shell or a file that
 	// could be mistaken for release source.
-	tarCommand := exec.Command("tar", "-x", "-C", temporary)
+	tarCommand, err := commandFor(temporary, nil, commandTar, "-x", "-C", temporary)
+	if err != nil {
+		return probeOutput{}, err
+	}
 	archiveInput, err := archiveCommand.StdoutPipe()
 	if err != nil {
 		return probeOutput{}, fmt.Errorf("open archive stream: %w", err)
@@ -294,7 +342,7 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput
 		return probeOutput{}, fmt.Errorf("write forged probe input: %w", err)
 	}
 	probeSourcePath := filepath.Join(temporary, probePath)
-	if err := os.MkdirAll(filepath.Dir(probeSourcePath), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(probeSourcePath), 0o750); err != nil {
 		return probeOutput{}, fmt.Errorf("create probe directory: %w", err)
 	}
 	if err := os.WriteFile(probeSourcePath, []byte(probeProgram), 0o600); err != nil {
@@ -313,19 +361,19 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput
 	// v0.72.2 has no vendor directory. The exact archived go.mod/go.sum (both
 	// blob-pinned above) therefore resolve dependencies through normal Go module
 	// verification. A warm cache makes this local; an empty cache may fetch.
-	if _, err := run(temporary, goEnv, "go", "mod", "download"); err != nil {
+	if _, err := runCommand(temporary, goEnv, commandGo, "mod", "download"); err != nil {
 		return probeOutput{}, fmt.Errorf("resolve pinned archive modules: %w", err)
 	}
-	if _, err := run(temporary, goEnv, "go", "mod", "verify"); err != nil {
+	if _, err := runCommand(temporary, goEnv, commandGo, "mod", "verify"); err != nil {
 		return probeOutput{}, fmt.Errorf("verify pinned archive modules against go.sum: %w", err)
 	}
-	goVersion, err := run(temporary, goEnv, "go", "env", "GOVERSION")
+	goVersion, err := runCommand(temporary, goEnv, commandGo, "env", "GOVERSION")
 	if err != nil {
 		return probeOutput{}, fmt.Errorf("read pinned archive Go version: %w", err)
 	}
-	output, err := run(temporary, goEnv, "go", "run", "./cmd/pinned-operational-payload-probe", inputPath, forgedPath)
+	output, err := runCommand(temporary, goEnv, commandGo, "run", "./cmd/pinned-operational-payload-probe", inputPath, forgedPath)
 	if err != nil {
-		return probeOutput{}, fmt.Errorf("run pinned Go probe without network: %w", err)
+		return probeOutput{}, fmt.Errorf("run pinned Go probe: %w", err)
 	}
 	var decoded probeOutput
 	if err := json.Unmarshal(output, &decoded); err != nil {
@@ -336,22 +384,134 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput
 }
 
 func git(root string, args ...string) (string, error) {
-	output, err := run(root, nil, "git", args...)
+	output, err := runCommand(root, nil, commandGit, args...)
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(output)), nil
 }
 
-func run(dir string, extraEnv []string, name string, args ...string) ([]byte, error) {
-	command := exec.Command(name, args...)
-	command.Dir = dir
-	command.Env = append(os.Environ(), extraEnv...)
+type commandKind uint8
+
+const (
+	commandGit commandKind = iota + 1
+	commandTar
+	commandGo
+)
+
+func runCommand(dir string, extraEnv []string, kind commandKind, args ...string) ([]byte, error) {
+	command, err := commandFor(dir, extraEnv, kind, args...)
+	if err != nil {
+		return nil, err
+	}
 	output, err := command.CombinedOutput()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w\n%s", name, strings.Join(args, " "), err, output)
+		return nil, fmt.Errorf("%s %s: %w\n%s", command.Path, strings.Join(args, " "), err, output)
 	}
 	return output, nil
+}
+
+func commandFor(dir string, extraEnv []string, kind commandKind, args ...string) (*exec.Cmd, error) {
+	if err := validateCommand(kind, dir, args); err != nil {
+		return nil, err
+	}
+	var command *exec.Cmd
+	switch kind {
+	case commandGit:
+		command = exec.Command("git", args...) // #nosec G204 -- command kind and every argument shape are closed by validateCommand.
+	case commandTar:
+		command = exec.Command("tar", args...) // #nosec G204 -- command kind and every argument shape are closed by validateCommand.
+	case commandGo:
+		command = exec.Command("go", args...) // #nosec G204 -- command kind and every argument shape are closed by validateCommand.
+	default:
+		return nil, fmt.Errorf("unsupported command kind %d", kind)
+	}
+	command.Dir = dir
+	command.Env = append(os.Environ(), extraEnv...)
+	return command, nil
+}
+
+func validateCommand(kind commandKind, dir string, args []string) error {
+	if err := validateCommandDirectory(dir); err != nil {
+		return err
+	}
+	switch kind {
+	case commandGit:
+		if matches(args, "rev-parse", "--show-toplevel") ||
+			(len(args) == 2 && args[0] == "rev-parse" && safeGitReference(args[1])) ||
+			(len(args) == 4 && args[0] == "ls-tree" && safeCommit(args[1]) && args[2] == "--" && safePinnedBlobPath(args[3])) ||
+			matches(args, "archive", "--format=tar", pinnedCommit) {
+			return nil
+		}
+	case commandTar:
+		if len(args) == 3 && args[0] == "-x" && args[1] == "-C" && args[2] == dir {
+			return nil
+		}
+	case commandGo:
+		if matches(args, "mod", "download") || matches(args, "mod", "verify") || matches(args, "env", "GOVERSION") {
+			return nil
+		}
+		if len(args) == 4 && args[0] == "run" && args[1] == "./cmd/pinned-operational-payload-probe" && args[2] == filepath.Join(dir, "pinned-poll-item.json") && args[3] == filepath.Join(dir, "pinned-forged-poll-item.json") {
+			return nil
+		}
+	}
+	return fmt.Errorf("refused unsafe %s arguments %q", commandName(kind), args)
+}
+
+func validateCommandDirectory(dir string) error {
+	if dir == "" {
+		return nil
+	}
+	info, err := os.Stat(dir)
+	if err != nil {
+		return fmt.Errorf("stat command directory: %w", err)
+	}
+	if !info.IsDir() {
+		return fmt.Errorf("command directory is not a directory: %q", dir)
+	}
+	return nil
+}
+
+func commandName(kind commandKind) string {
+	switch kind {
+	case commandGit:
+		return "git"
+	case commandTar:
+		return "tar"
+	case commandGo:
+		return "go"
+	default:
+		return "unknown"
+	}
+}
+
+func matches(got []string, want ...string) bool {
+	return len(got) == len(want) && strings.Join(got, "\x00") == strings.Join(want, "\x00")
+}
+
+func safeGitReference(value string) bool {
+	return value == pinnedTag+"^{commit}" || (strings.HasPrefix(value, "v") && strings.HasSuffix(value, "^{commit}") && !strings.ContainsAny(value, "\\/:; \t\n"))
+}
+
+func safeCommit(value string) bool {
+	if len(value) != 40 {
+		return false
+	}
+	for _, character := range value {
+		if !strings.ContainsRune("0123456789abcdef", character) {
+			return false
+		}
+	}
+	return true
+}
+
+func safePinnedBlobPath(value string) bool {
+	for _, blob := range pinnedBlobs {
+		if value == blob.Path {
+			return true
+		}
+	}
+	return false
 }
 
 func bytesValue(raw []byte) byteValue {

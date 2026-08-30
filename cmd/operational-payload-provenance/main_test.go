@@ -2,9 +2,49 @@ package main
 
 import (
 	"encoding/json"
+	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestPathAndCommandRefusals(t *testing.T) {
+	root, err := repositoryRoot()
+	if err != nil {
+		t.Fatal(err)
+	}
+	expected, err := artifactFile(root, artifactPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got, err := artifactFile(root, expected); err != nil || got != expected {
+		t.Fatalf("absolute expected artifact path = %q, %v; want %q, nil", got, err, expected)
+	}
+	for _, path := range []string{"../outside.json", filepath.Join(root, "..", "outside.json"), "/tmp/outside.json"} {
+		if _, err := artifactFile(root, path); err == nil {
+			t.Fatalf("malicious artifact path %q unexpectedly passed", path)
+		}
+	}
+	if _, err := fixedRepositoryFile(root, "../go.mod"); err == nil {
+		t.Fatal("escaping generator source path unexpectedly passed")
+	}
+	for _, tc := range []struct {
+		name string
+		kind commandKind
+		args []string
+	}{
+		{name: "unknown binary kind", kind: commandKind(99), args: []string{"sh", "-c", "echo unsafe"}},
+		{name: "git configuration", kind: commandGit, args: []string{"config", "--global", "core.hooksPath", "/tmp"}},
+		{name: "git option injection", kind: commandGit, args: []string{"rev-parse", "--upload-pack=sh^{commit}"}},
+		{name: "tar escape", kind: commandTar, args: []string{"-x", "-C", "/tmp"}},
+		{name: "go arbitrary run", kind: commandGo, args: []string{"run", "./cmd/evil", "one", "two"}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if err := validateCommand(tc.kind, root, tc.args); err == nil {
+				t.Fatalf("unsafe command %s %q unexpectedly passed", commandName(tc.kind), tc.args)
+			}
+		})
+	}
+}
 
 func TestArtifactIntegrityControls(t *testing.T) {
 	root, err := repositoryRoot()
