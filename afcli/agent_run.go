@@ -953,8 +953,9 @@ func kitScanPaths() []string {
 // detailToQueuedWork translates the daemon's SessionDetail wire shape
 // into the runner's QueuedWork. Pure function; no I/O. This is the seam
 // where a dispatched endpoint binding enters the runner path — a malformed
-// BaseURL is rejected here (see agent.ValidateEndpointBindingBaseURL via
-// detailEndpointBinding) rather than reaching the runner's Spec.
+// BaseURL is rejected here (see agent.ValidateEndpointBindingBaseURL, run via
+// runner.ReconcileResolvedProfile below) rather than reaching the runner's
+// Spec.
 func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	qw := runner.QueuedWork{
 		AdmissionReceipt:        bytes.Clone(d.AdmissionReceipt),
@@ -1065,55 +1066,40 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	// runner uses the exact model the platform chose rather than the
 	// local-config fallback. Falls back to ResolvedProfile → default
 	// provider chain for backwards compat.
-	if d.ModelProfile != nil {
-		mp := runner.ResolvedModelProfile{
-			ID:              d.ModelProfile.ID,
-			ProviderID:      d.ModelProfile.ProviderID,
-			Harness:         d.ModelProfile.Harness,
-			Model:           d.ModelProfile.Model,
-			Mode:            d.ModelProfile.Mode,
-			Context:         d.ModelProfile.Context,
-			MaxOutputTokens: d.ModelProfile.MaxOutputTokens,
-		}
-		// ToResolvedProfile bridges into the legacy QueuedWork shape so the
-		// runner's authoritative harness admission and Spec translation consume
-		// the same profile.
-		qw.ResolvedProfile = mp.ToResolvedProfile()
-		// Preserve CredentialID from ResolvedProfile when present — the
-		// platform may send it alongside ModelProfile.
-		if d.ResolvedProfile != nil {
-			if d.ResolvedProfile.CredentialID != "" {
-				qw.ResolvedProfile.CredentialID = d.ResolvedProfile.CredentialID
-			}
-			if d.ResolvedProfile.ProviderConfig != nil {
-				qw.ResolvedProfile.ProviderConfig = d.ResolvedProfile.ProviderConfig
-			}
-			qw.ResolvedProfile.ProviderConfig = providerConfigWithContextWindow(
-				qw.ResolvedProfile.ProviderConfig, d.ResolvedProfile.ContextWindow)
-			endpoint, err := detailEndpointBinding(d.ResolvedProfile.Endpoint)
-			if err != nil {
-				return runner.QueuedWork{}, err
-			}
-			qw.ResolvedProfile.Endpoint = endpoint
-		}
-	} else if d.ResolvedProfile != nil {
-		endpoint, err := detailEndpointBinding(d.ResolvedProfile.Endpoint)
-		if err != nil {
-			return runner.QueuedWork{}, err
-		}
-		qw.ResolvedProfile = runner.ResolvedProfile{
-			Harness:      d.ResolvedProfile.Harness,
-			Provider:     agent.ProviderName(d.ResolvedProfile.Provider),
-			Runner:       d.ResolvedProfile.Runner,
-			Model:        d.ResolvedProfile.Model,
-			Effort:       agent.EffortLevel(d.ResolvedProfile.Effort),
-			CredentialID: d.ResolvedProfile.CredentialID,
-			ProviderConfig: providerConfigWithContextWindow(
-				d.ResolvedProfile.ProviderConfig, d.ResolvedProfile.ContextWindow),
-			Endpoint: endpoint,
-		}
+	//
+	// This reconciliation is delegated to runner.ReconcileResolvedProfile
+	// (raw JSON in, not the typed daemon.SessionModelProfile/
+	// SessionResolvedProfile shapes — see that function's doc comment for
+	// why) so the daemon's preflight compiler applies the IDENTICAL logic
+	// over the IDENTICAL ModelProfile/ResolvedProfile the platform sent:
+	// before this was shared, preflight never saw these two SessionDetail
+	// fields at all, so a receipt-bearing session whose authority depended
+	// on either — Model, ProviderConfig, Endpoint — could never pass
+	// ApplyPreparedHarness's authority digest.
+	modelProfileJSON, err := marshalOptional(d.ModelProfile)
+	if err != nil {
+		return runner.QueuedWork{}, fmt.Errorf("marshal model profile: %w", err)
+	}
+	resolvedProfileJSON, err := marshalOptional(d.ResolvedProfile)
+	if err != nil {
+		return runner.QueuedWork{}, fmt.Errorf("marshal resolved profile: %w", err)
+	}
+	qw, err = runner.ReconcileResolvedProfile(qw, modelProfileJSON, resolvedProfileJSON)
+	if err != nil {
+		return runner.QueuedWork{}, err
 	}
 	return qw, nil
+}
+
+// marshalOptional returns nil (never the 4-byte JSON literal "null") for a
+// nil pointer, so callers that gate reconciliation on len(raw) > 0 — see
+// runner.ReconcileResolvedProfile — correctly treat an absent profile as
+// absent rather than as a present-but-null one.
+func marshalOptional[T any](v *T) (json.RawMessage, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
 }
 
 func applyResolvedRepositoryCompatibility(d *daemon.SessionDetail, admitted *runner.QueuedWork) error {
@@ -1160,63 +1146,12 @@ func applyResolvedRepositoryCompatibility(d *daemon.SessionDetail, admitted *run
 	return nil
 }
 
-// providerConfigWithContextWindow bridges the resolvedProfile's top-level
-// contextWindow field (daemon.SessionResolvedProfile.ContextWindow) into the
-// ProviderConfig map under the same "contextWindow" key
-// runner.ResolvedModelProfile.ToResolvedProfile produces, so every downstream
-// consumer (runner Spec translation → provider harnesses) reads one key
-// regardless of which wire field carried the value. An explicit
-// providerConfig.contextWindow wins — the top-level field only fills the key
-// when it is absent. Zero/negative (absent on every legacy dispatch) is a
-// no-op. Never mutates the input map: detailToQueuedWork is a pure
-// translation over the daemon's wire shape.
-func providerConfigWithContextWindow(pc map[string]any, contextWindow int) map[string]any {
-	if contextWindow <= 0 {
-		return pc
-	}
-	if _, ok := pc["contextWindow"]; ok {
-		return pc
-	}
-	out := make(map[string]any, len(pc)+1)
-	for k, v := range pc {
-		out[k] = v
-	}
-	out["contextWindow"] = contextWindow
-	return out
-}
-
-// detailEndpointBinding converts the daemon's wire-safe SessionEndpointBinding
-// into the runner-consumable agent.EndpointBinding. This is where a dispatched
-// BaseURL enters the runner path: agent.ValidateEndpointBindingBaseURL applies
-// the fail-closed shape check (absolute http(s), no userinfo, https for any
-// non-loopback host) before the value is trusted — malformed input is
-// rejected here, never silently stripped.
-func detailEndpointBinding(in *daemon.SessionEndpointBinding) (*agent.EndpointBinding, error) {
-	if in == nil {
-		return nil, nil
-	}
-	if err := agent.ValidateEndpointBindingBaseURL(in.BaseURL); err != nil {
-		return nil, fmt.Errorf("session endpoint binding: %w", err)
-	}
-	return &agent.EndpointBinding{
-		Company:            agent.Company(in.Company),
-		Model:              in.Model,
-		BaseURL:            in.BaseURL,
-		Protocol:           agent.WireProtocol(in.Protocol),
-		Host:               agent.ServingHost(in.Host),
-		EndpointID:         in.EndpointID,
-		EndpointOperator:   in.EndpointOperator,
-		EndpointRevision:   in.EndpointRevision,
-		ModelAuthor:        in.ModelAuthor,
-		AuthBindingID:      in.AuthBindingID,
-		AuthAuthority:      in.AuthAuthority,
-		AuthCommercialMode: in.AuthCommercialMode,
-		AuthBindingScope:   in.AuthBindingScope,
-		AuthPortability:    in.AuthPortability,
-		AuthDelivery:       in.AuthDelivery,
-		Mechanism:          agent.AuthMechanism(in.Mechanism),
-	}, nil
-}
+// providerConfigWithContextWindow and detailEndpointBinding used to live
+// here; both moved to runner.ReconcileResolvedProfile (runner/
+// resolved_profile_reconcile.go) so the daemon's preflight compiler
+// (runner.ProviderView.PreflightExecution) applies the identical
+// reconciliation this function delegates to above — see that function's doc
+// comment.
 
 // detailMCPServers re-types the daemon's PollMCPServer mirror slice into the
 // runner-consumable agent.MCPServerConfig slice (WS5 agent-card MCP set). The

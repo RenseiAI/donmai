@@ -1874,6 +1874,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if !ok || d.opts.ExecutionPreflightStore == nil {
 				return nil, errors.New("receipt-bearing work requires daemon execution preflight and durable receipt store")
 			}
+			modelProfileJSON, err := marshalOptional(detail.ModelProfile)
+			if err != nil {
+				return nil, fmt.Errorf("marshal model profile: %w", err)
+			}
+			resolvedProfileJSON, err := marshalOptional(detail.ResolvedProfile)
+			if err != nil {
+				return nil, fmt.Errorf("marshal resolved profile: %w", err)
+			}
 			preflightInput := struct {
 				SessionID               string          `json:"sessionId"`
 				WorkerID                string          `json:"workerId"`
@@ -1882,11 +1890,24 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				EffectiveCell           json.RawMessage `json:"effectiveCell"`
 				ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
 				OperationalPayload      json.RawMessage `json:"operationalPayload"`
+				// ModelProfile and ResolvedProfile are SessionDetail's sibling
+				// profile fields — never embedded in OperationalPayload itself
+				// (see the doc comment on each in session_detail.go). Forwarded
+				// here so ProviderView.PreflightExecution can apply the exact
+				// same runner.ReconcileResolvedProfile reconciliation the
+				// spawned child applies (afcli.detailToQueuedWork) BEFORE
+				// compiling the PreparedHarness plan: without this, preflight
+				// and spawn could derive Model/Effort/ProviderConfig/Endpoint
+				// from different inputs and ApplyPreparedHarness's authority
+				// digest could never agree.
+				ModelProfile    json.RawMessage `json:"modelProfile,omitempty"`
+				ResolvedProfile json.RawMessage `json:"resolvedProfile,omitempty"`
 			}{
 				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
 				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
 				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
 				OperationalPayload: detail.OperationalPayload,
+				ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
 			}
 			detailJSON, err := json.Marshal(preflightInput)
 			if err != nil {
@@ -1936,6 +1957,18 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		return nil, err
 	}
 	return handle, nil
+}
+
+// marshalOptional returns nil (never the 4-byte JSON literal "null") for a
+// nil pointer, so a decoder gating on len(raw) > 0 — see
+// runner.ReconcileResolvedProfile, which the preflight compiler feeds this
+// output — correctly treats an absent profile as absent rather than as a
+// present-but-null one.
+func marshalOptional[T any](v *T) (json.RawMessage, error) {
+	if v == nil {
+		return nil, nil
+	}
+	return json.Marshal(v)
 }
 
 func (d *Daemon) validateExecutionRuntimeBinding(detail *SessionDetail) error {

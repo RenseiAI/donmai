@@ -30,15 +30,44 @@ type HarnessMaterialization struct {
 // PreparedHarness is the digest-only host authority later materialized by the
 // child. It contains no prompt, environment, credential, or config values.
 type PreparedHarness struct {
-	ContractVersion          string                   `json:"contractVersion"`
-	Harness                  string                   `json:"harness"`
-	Mode                     PromptSessionMode        `json:"mode"`
-	OperationalPayloadDigest string                   `json:"operationalPayloadDigest"`
-	AuthorityDigest          string                   `json:"authorityDigest"`
-	RuntimeMCPNames          []string                 `json:"runtimeMcpNames"`
-	Materializations         []HarnessMaterialization `json:"materializations"`
-	PromptReceipt            PromptDeliveryReceipt    `json:"promptReceipt"`
-	ToolLifecycleReceipt     ToolLifecycleReceipt     `json:"toolLifecycleReceipt"`
+	ContractVersion          string            `json:"contractVersion"`
+	Harness                  string            `json:"harness"`
+	Mode                     PromptSessionMode `json:"mode"`
+	OperationalPayloadDigest string            `json:"operationalPayloadDigest"`
+	AuthorityDigest          string            `json:"authorityDigest"`
+	// AuthorityFieldDigests is a per-field SHA-256 digest of the same
+	// harnessAuthorityProjection AuthorityDigest hashes as a whole — still
+	// digest-only, never a raw value. AuthorityDigest alone is the pass/fail
+	// gate; this map exists only so a mismatch can NAME which projection
+	// field(s) drifted (see AuthorityDriftError) instead of surfacing one
+	// undiagnosable 64-hex inequality. Keyed by the projection's JSON field
+	// names (e.g. "model", "mcpServers").
+	AuthorityFieldDigests map[string]string        `json:"authorityFieldDigests,omitempty"`
+	RuntimeMCPNames       []string                 `json:"runtimeMcpNames"`
+	Materializations      []HarnessMaterialization `json:"materializations"`
+	PromptReceipt         PromptDeliveryReceipt    `json:"promptReceipt"`
+	ToolLifecycleReceipt  ToolLifecycleReceipt     `json:"toolLifecycleReceipt"`
+}
+
+// AuthorityDriftError is returned by ApplyPreparedHarness when the child's
+// materialized Spec does not byte-match the host-persisted authority plan.
+// Fields names exactly which harnessAuthorityDigest projection fields
+// disagree — never the field values, which may carry prompt text, tool
+// names, or endpoint identity — so a production failure is diagnosable from
+// the error string and log line alone, without an authority value ever
+// appearing in either.
+type AuthorityDriftError struct {
+	// Fields is the sorted set of projection field names (e.g. "model",
+	// "mcpServers", "systemPromptAppend") whose per-field digest differs
+	// between the host-compiled plan and the child's recompute. Non-empty
+	// whenever the combined AuthorityDigest differed, EXCEPT when the plan
+	// predates AuthorityFieldDigests (an old plan with no per-field digests
+	// to compare against) — that legacy case is reported as ["unknown"].
+	Fields []string
+}
+
+func (e *AuthorityDriftError) Error() string {
+	return fmt.Sprintf("agent: materialized Spec differs from host adaptation authority (fields: %s)", strings.Join(e.Fields, ", "))
 }
 
 // CompilePreparedHarness compiles the exact source Spec and harness profile
@@ -53,7 +82,9 @@ func CompilePreparedHarness(spec Spec, manifest HarnessManifest, operationalDige
 		Materializations:         append([]HarnessMaterialization(nil), materializations...),
 	}
 	sort.Strings(plan.RuntimeMCPNames)
-	plan.AuthorityDigest = harnessAuthorityDigest(spec, plan)
+	projection := newHarnessAuthorityProjection(spec, plan)
+	plan.AuthorityDigest = digestAuthorityProjection(projection)
+	plan.AuthorityFieldDigests = authorityFieldDigests(projection)
 	promptProfile, ok := manifest.PromptProfile(mode)
 	if !ok {
 		return plan, &PromptAdaptationError{Code: PromptDenialDeliveryUnsupported, Detail: "manifest has no prompt profile for admitted session mode"}
@@ -90,8 +121,9 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	if plan.ContractVersion != HarnessAdaptationContractVersion || plan.Harness != string(manifest.Name) || plan.Mode != PromptModeForSpec(spec) {
 		return spec, errors.New("agent: prepared harness identity does not match exact harness and mode")
 	}
-	if got := harnessAuthorityDigest(spec, plan); got != plan.AuthorityDigest {
-		return spec, errors.New("agent: materialized Spec differs from host adaptation authority")
+	gotProjection := newHarnessAuthorityProjection(spec, plan)
+	if got := digestAuthorityProjection(gotProjection); got != plan.AuthorityDigest {
+		return spec, &AuthorityDriftError{Fields: driftingAuthorityFields(plan.AuthorityFieldDigests, authorityFieldDigests(gotProjection))}
 	}
 	promptProfile, ok := manifest.PromptProfile(plan.Mode)
 	if !ok {
@@ -132,34 +164,41 @@ func DigestPreparedHarness(plan *PreparedHarness) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func harnessAuthorityDigest(spec Spec, plan *PreparedHarness) string {
+// harnessAuthorityProjection is the exact set of Spec fields the host
+// adaptation authority covers. Adding a field to Spec that must be part of
+// the authority contract requires adding it here — see the field-name keys
+// authorityFieldDigests derives from the json tags below, which
+// AuthorityDriftError.Fields reports on a mismatch.
+type harnessAuthorityProjection struct {
+	Prompt             string                `json:"prompt"`
+	Autonomous         bool                  `json:"autonomous"`
+	SandboxEnabled     bool                  `json:"sandboxEnabled"`
+	SandboxLevel       SandboxLevel          `json:"sandboxLevel"`
+	AllowedTools       []string              `json:"allowedTools"`
+	DisallowedTools    []string              `json:"disallowedTools"`
+	MCPServers         []MCPServerConfig     `json:"mcpServers"`
+	MCPToolNames       []string              `json:"mcpToolNames"`
+	MaxTurns           *int                  `json:"maxTurns"`
+	Model              string                `json:"model"`
+	Endpoint           any                   `json:"endpoint"`
+	Effort             EffortLevel           `json:"effort"`
+	ResponseSchema     json.RawMessage       `json:"responseSchema"`
+	Interactive        *InteractiveSpec      `json:"interactive"`
+	BaseInstructions   string                `json:"baseInstructions"`
+	SystemPromptAppend string                `json:"systemPromptAppend"`
+	InitialContext     string                `json:"initialContext"`
+	PermissionConfig   *PermissionConfig     `json:"permissionConfig"`
+	CodeIntel          *CodeIntelEnforcement `json:"codeIntel"`
+	ProviderConfig     map[string]any        `json:"providerConfig"`
+	SubAgentProvider   ProviderName          `json:"subAgentProvider"`
+	PromptPlan         *PromptPlan           `json:"promptPlan"`
+	ToolLifecyclePlan  *ToolLifecyclePlan    `json:"toolLifecyclePlan"`
+	PromptMode         PromptSessionMode     `json:"promptMode"`
+}
+
+func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuthorityProjection {
 	normalized := normalizeHarnessAuthoritySpec(spec, plan)
-	projection := struct {
-		Prompt             string                `json:"prompt"`
-		Autonomous         bool                  `json:"autonomous"`
-		SandboxEnabled     bool                  `json:"sandboxEnabled"`
-		SandboxLevel       SandboxLevel          `json:"sandboxLevel"`
-		AllowedTools       []string              `json:"allowedTools"`
-		DisallowedTools    []string              `json:"disallowedTools"`
-		MCPServers         []MCPServerConfig     `json:"mcpServers"`
-		MCPToolNames       []string              `json:"mcpToolNames"`
-		MaxTurns           *int                  `json:"maxTurns"`
-		Model              string                `json:"model"`
-		Endpoint           any                   `json:"endpoint"`
-		Effort             EffortLevel           `json:"effort"`
-		ResponseSchema     json.RawMessage       `json:"responseSchema"`
-		Interactive        *InteractiveSpec      `json:"interactive"`
-		BaseInstructions   string                `json:"baseInstructions"`
-		SystemPromptAppend string                `json:"systemPromptAppend"`
-		InitialContext     string                `json:"initialContext"`
-		PermissionConfig   *PermissionConfig     `json:"permissionConfig"`
-		CodeIntel          *CodeIntelEnforcement `json:"codeIntel"`
-		ProviderConfig     map[string]any        `json:"providerConfig"`
-		SubAgentProvider   ProviderName          `json:"subAgentProvider"`
-		PromptPlan         *PromptPlan           `json:"promptPlan"`
-		ToolLifecyclePlan  *ToolLifecyclePlan    `json:"toolLifecyclePlan"`
-		PromptMode         PromptSessionMode     `json:"promptMode"`
-	}{
+	return harnessAuthorityProjection{
 		Prompt:             normalized.Prompt,
 		Autonomous:         normalized.Autonomous,
 		SandboxEnabled:     normalized.SandboxEnabled,
@@ -185,9 +224,76 @@ func harnessAuthorityDigest(spec Spec, plan *PreparedHarness) string {
 		ToolLifecyclePlan:  normalized.ToolLifecyclePlan,
 		PromptMode:         normalized.PromptMode,
 	}
-	raw, _ := json.Marshal(projection)
+}
+
+func digestValue(v any) string {
+	raw, _ := json.Marshal(v)
 	sum := sha256.Sum256(raw)
 	return hex.EncodeToString(sum[:])
+}
+
+func digestAuthorityProjection(p harnessAuthorityProjection) string {
+	return digestValue(p)
+}
+
+// authorityFieldDigests hashes each harnessAuthorityProjection field
+// independently, keyed by its json tag. Still digest-only — no field value
+// is ever returned or logged — but broken out per field so a mismatch on the
+// combined AuthorityDigest can be localized to the field(s) that actually
+// drifted instead of surfacing one undiagnosable 64-hex inequality.
+func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
+	return map[string]string{
+		"prompt":             digestValue(p.Prompt),
+		"autonomous":         digestValue(p.Autonomous),
+		"sandboxEnabled":     digestValue(p.SandboxEnabled),
+		"sandboxLevel":       digestValue(p.SandboxLevel),
+		"allowedTools":       digestValue(p.AllowedTools),
+		"disallowedTools":    digestValue(p.DisallowedTools),
+		"mcpServers":         digestValue(p.MCPServers),
+		"mcpToolNames":       digestValue(p.MCPToolNames),
+		"maxTurns":           digestValue(p.MaxTurns),
+		"model":              digestValue(p.Model),
+		"endpoint":           digestValue(p.Endpoint),
+		"effort":             digestValue(p.Effort),
+		"responseSchema":     digestValue(p.ResponseSchema),
+		"interactive":        digestValue(p.Interactive),
+		"baseInstructions":   digestValue(p.BaseInstructions),
+		"systemPromptAppend": digestValue(p.SystemPromptAppend),
+		"initialContext":     digestValue(p.InitialContext),
+		"permissionConfig":   digestValue(p.PermissionConfig),
+		"codeIntel":          digestValue(p.CodeIntel),
+		"providerConfig":     digestValue(p.ProviderConfig),
+		"subAgentProvider":   digestValue(p.SubAgentProvider),
+		"promptPlan":         digestValue(p.PromptPlan),
+		"toolLifecyclePlan":  digestValue(p.ToolLifecyclePlan),
+		"promptMode":         digestValue(p.PromptMode),
+	}
+}
+
+// driftingAuthorityFields returns the sorted set of field names present in
+// want or got whose digest disagrees (including a field missing from one
+// side, e.g. want being empty because the persisted plan predates
+// AuthorityFieldDigests — every field is then reported, since which single
+// field actually drifted is genuinely unknown for that legacy shape).
+func driftingAuthorityFields(want, got map[string]string) []string {
+	if len(want) == 0 {
+		return []string{"unknown"}
+	}
+	seen := make(map[string]struct{}, len(want)+len(got))
+	for name := range want {
+		seen[name] = struct{}{}
+	}
+	for name := range got {
+		seen[name] = struct{}{}
+	}
+	var fields []string
+	for name := range seen {
+		if want[name] != got[name] {
+			fields = append(fields, name)
+		}
+	}
+	sort.Strings(fields)
+	return fields
 }
 
 func normalizeHarnessAuthoritySpec(spec Spec, plan *PreparedHarness) Spec {

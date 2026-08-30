@@ -128,6 +128,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, err
 		}
 		if _, err = agent.ApplyPreparedHarness(preparedSource, harness.Manifest()); err != nil {
+			// A drift error names exactly which authority-projection fields
+			// disagreed (never their values — see agent.AuthorityDriftError);
+			// log it as a structured line so a production refusal is
+			// diagnosable from the daemon/runner log alone, instead of a
+			// bare 64-hex digest inequality nobody could triage.
+			var driftErr *agent.AuthorityDriftError
+			if errors.As(err, &driftErr) {
+				r.logger.Error("prepared harness authority drift",
+					"sessionId", qw.SessionID,
+					"harness", selection.Harness.ID,
+					"provider", provider.Name(),
+					"driftFields", driftErr.Fields,
+				)
+			}
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
