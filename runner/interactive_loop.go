@@ -328,6 +328,12 @@ func (r *Runner) dispatchInteractive(
 		}
 	}()
 
+	// Interactive byte delivery is the product, but provider-owned system
+	// conditions can still be meaningful (for example pi detecting that its
+	// own session JSONL vanished). Consume that existing Handle event seam
+	// solely for typed SystemEvents; normal Init/Result events remain governed
+	// by the PTY session lifecycle below.
+	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
 		var noticeSrc <-chan heartbeat.InjectPayload
@@ -389,6 +395,15 @@ func (r *Runner) dispatchInteractive(
 
 		case <-lost:
 			return r.finishInteractiveOwnershipLoss(worktreePath, qw, res, sink, pulser)
+
+		case event, ok := <-handleEvents:
+			if !ok {
+				handleEvents = nil
+				continue
+			}
+			if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
+				r.postInteractiveActivity(interactiveCtx, worktreePath, sink, system.Subtype, system.Message)
+			}
 
 		case err := <-attachDone:
 			// The attach leg terminated (epoch-stale, a non-retryable relay

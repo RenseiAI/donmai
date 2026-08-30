@@ -2,6 +2,7 @@ package pi
 
 import (
 	"context"
+	"encoding/json"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -471,5 +472,68 @@ func TestSpawn_Interactive_RealBinary_NoUIArtifact(t *testing.T) {
 		if strings.Contains(string(b), donmaiUIMarker) {
 			t.Errorf("the policy extension rendered a UI round-trip (%q) in TUI mode — the RPC-mode gate leaked", donmaiUIMarker)
 		}
+	}
+}
+
+// TestSpawn_Interactive_RealBinary_StateDirGuardRefusesAndSessionContinues is
+// the real-binary conformance control for the PTY-only branch. The local model
+// stub first asks pi to run the exact destructive command, then completes the
+// turn after the extension returns its typed refusal. This proves the command
+// reaches pi's actual interactive tool lifecycle rather than only our Node
+// extension harness, and that the live session survives the refusal.
+func TestSpawn_Interactive_RealBinary_StateDirGuardRefusesAndSessionContinues(t *testing.T) {
+	realBinaryAvailable(t)
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+
+	stub := newRealBinaryStub(t, realBinaryModel)
+	stub.responses = []stubResponse{
+		{ToolCall: &stubToolCall{ID: "state-dir-guard-call", Name: "bash", Arguments: `{"command":"rm -rf .pi"}`}},
+		{Text: "state-guard-continuity-marker"},
+	}
+	workdir := t.TempDir()
+	spec := realBinarySpec(workdir, "run the requested command", stub.baseURL())
+	spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+
+	p, err := New(Options{})
+	if err != nil {
+		t.Fatalf("New(real pi): %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	deadline := time.After(40 * time.Second)
+	for len(stub.recordedTurns()) < 2 {
+		select {
+		case <-deadline:
+			t.Fatalf("real pi did not request a follow-up model turn after the typed state-dir refusal; turns=%d", len(stub.recordedTurns()))
+		case <-time.After(25 * time.Millisecond):
+		}
+	}
+	turns := stub.recordedTurns()
+	secondTurn, err := json.Marshal(turns[1].Messages)
+	if err != nil {
+		t.Fatalf("marshal second model turn: %v", err)
+	}
+	if !strings.Contains(string(secondTurn), stateDirGuardReasonPrefix) {
+		t.Fatalf("second real-pi model turn did not receive the typed refusal: %s", secondTurn)
+	}
+	if _, err := os.Stat(filepath.Join(workdir, piStateDir)); err != nil {
+		t.Fatalf("the guarded state directory did not survive the real tool call: %v", err)
+	}
+	capable, ok := h.(agent.InteractiveCapable)
+	if !ok || capable.InteractiveSession() == nil {
+		t.Fatal("interactive spawn returned no live PTY surface")
+	}
+	select {
+	case <-capable.InteractiveSession().Done():
+		t.Fatal("pi session exited after the refusal instead of remaining interactive")
+	default:
 	}
 }
