@@ -22,6 +22,7 @@ import (
 // of `session list` prints.
 func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	var jsonMode bool
+	var idempotencyKey string
 
 	cmd := &cobra.Command{
 		Use:          "chat <session-id> <message>",
@@ -38,7 +39,7 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 
 			client := ds()
 
-			resp, err := client.ChatSession(id, afclient.ChatSessionRequest{Prompt: message})
+			resp, err := client.ChatSession(id, afclient.ChatSessionRequest{Prompt: message, IdempotencyKey: idempotencyKey})
 			if err != nil {
 				if errors.Is(err, afclient.ErrNotFound) {
 					return fmt.Errorf("prompt session %s: session not found: %w", id, err)
@@ -56,9 +57,12 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 				return nil
 			}
 
-			verb := "delivered"
-			if !resp.Delivered {
+			verb := resp.Disposition
+			if verb == "" {
 				verb = "queued"
+			}
+			if resp.Delivered {
+				verb = "delivered"
 			}
 			_, _ = fmt.Fprintf(out, "Prompt %s %s to %s (status: %s)\n",
 				resp.PromptID, verb, resp.SessionID, resp.SessionStatus)
@@ -67,6 +71,7 @@ func newAgentChatCmd(ds func() afclient.DataSource) *cobra.Command {
 	}
 
 	cmd.Flags().BoolVar(&jsonMode, "json", false, "Output raw JSON (indented)")
+	cmd.Flags().StringVar(&idempotencyKey, "idempotency-key", "", "Stable key for safe prompt retries")
 
 	return cmd
 }
