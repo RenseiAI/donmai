@@ -7,6 +7,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -210,6 +211,11 @@ func spawnNamedInteractivePTY(
 		nameTimeout = 30 * time.Second
 	}
 	if err := finishNamingLiveInteractiveThread(ctx, spec, server, nameTimeout); err != nil {
+		// Stop below can take up to the shim finalize grace window (see
+		// ptycli.Handle.awaitShimTerminal); log the reason now so a slow
+		// teardown is not silent about why it started.
+		slog.Warn("codex: fresh interactive session naming failed; stopping the PTY",
+			"session", spec.SessionName, "err", err)
 		_ = handle.Stop(ctx)
 		return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err)
 	}

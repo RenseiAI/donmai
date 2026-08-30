@@ -106,10 +106,20 @@ func TestAwaitAndNameLiveThreadWithRequest_EmptyNameFailsClosed(t *testing.T) {
 	}
 }
 
+// testThreadUUID is a codex-thread-id-shaped fixture value: the same
+// 8-4-4-4-12 hex form observed from a real codex-cli 0.151.0 thread/start
+// response (e.g. "01a0548d-9a06-7a30-a72c-f7c94b8c899c").
+const testThreadUUID = "01a0548d-9a06-7a30-a72c-f7c94b8c899c"
+
 // TestResumeExistingNamedThreadWithRequest_ExistingSucceeds pins the
-// attach-to-existing sequence: a single thread/resume RPC call, keyed on
-// SessionName, proves the target exists before any PTY side effect — the
-// same primitive Provider.Resume already uses for the headless lane.
+// attach-to-existing sequence: a single thread/resume RPC call, keyed on a
+// thread-id-shaped SessionName, proves the target exists before any PTY
+// side effect — the same primitive Provider.Resume already uses for the
+// headless lane. A real codex-cli 0.151.0 probe confirmed thread/resume
+// accepts a still-live thread by id even when it has taken no turn yet (it
+// is only the `codex resume` CLI subcommand's own separate rollout-file
+// lookup — used by the fresh-session path's PTY attach, not this RPC — that
+// requires persistence).
 func TestResumeExistingNamedThreadWithRequest_ExistingSucceeds(t *testing.T) {
 	t.Parallel()
 	var gotMethod string
@@ -119,36 +129,59 @@ func TestResumeExistingNamedThreadWithRequest_ExistingSucceeds(t *testing.T) {
 		gotThreadID = params["threadId"]
 		return json.RawMessage(`{}`), nil
 	}
-	err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, request, time.Second)
+	err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{SessionName: testThreadUUID}, request, time.Second)
 	if err != nil {
 		t.Fatalf("resumeExistingNamedThreadWithRequest: %v", err)
 	}
-	if gotMethod != "thread/resume" || gotThreadID != "chief-of-staff" {
-		t.Fatalf("request = method %q threadId %v, want thread/resume chief-of-staff", gotMethod, gotThreadID)
+	if gotMethod != "thread/resume" || gotThreadID != testThreadUUID {
+		t.Fatalf("request = method %q threadId %v, want thread/resume %s", gotMethod, gotThreadID, testThreadUUID)
 	}
 }
 
 // TestResumeExistingNamedThreadWithRequest_AbsentFailsTyped pins the exact
-// failure this exists to produce: a signalled attach whose target does not
-// exist must fail with agent.ErrSessionNotFound naming the session — never
-// a silent fallback that could go on to spawn a PTY against a different
-// (freshly created) thread. The fake error text below is the exact message
-// codex-cli 0.151.0 returns for a thread/resume against a thread with no
-// persisted rollout (verified against a real codex binary).
+// failure this exists to produce: a signalled attach whose properly-shaped
+// (thread-id-shaped) target does not exist must fail with
+// agent.ErrSessionNotFound naming the session — never a silent fallback
+// that could go on to spawn a PTY against a different (freshly created)
+// thread. The fake error text below is the exact message codex-cli 0.151.0
+// returns for a thread/resume against a thread with no persisted rollout
+// (verified against a real codex binary).
 func TestResumeExistingNamedThreadWithRequest_AbsentFailsTyped(t *testing.T) {
 	t.Parallel()
 	request := func(context.Context, string, map[string]any, time.Duration) (json.RawMessage, error) {
 		return nil, &RPCError{
 			Method: "thread/resume", Code: -32600,
-			Message: "no rollout found for thread id chief-of-staff",
+			Message: "no rollout found for thread id " + testThreadUUID,
 		}
 	}
-	err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, request, time.Second)
+	err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{SessionName: testThreadUUID}, request, time.Second)
 	if !errors.Is(err, agent.ErrSessionNotFound) {
 		t.Fatalf("error = %v, want wrapping agent.ErrSessionNotFound", err)
 	}
-	if !strings.Contains(err.Error(), "chief-of-staff") {
+	if !strings.Contains(err.Error(), testThreadUUID) {
 		t.Fatalf("error does not name the session: %v", err)
+	}
+}
+
+// TestResumeExistingNamedThreadWithRequest_NonUUIDNameFailsWithoutProbing
+// pins the F3 fix: thread/resume's threadId parameter is a thread id, never
+// a human-assigned name (a real codex-cli 0.151.0 probe rejects a non-UUID
+// id with its own distinct "invalid session id" error — a different failure
+// than "not found"). A name-shaped SessionName must fail closed with
+// ErrResumeRequiresThreadID BEFORE any RPC is attempted, never silently
+// probed as though it were an id and misreported as agent.ErrSessionNotFound.
+func TestResumeExistingNamedThreadWithRequest_NonUUIDNameFailsWithoutProbing(t *testing.T) {
+	t.Parallel()
+	request := func(context.Context, string, map[string]any, time.Duration) (json.RawMessage, error) {
+		t.Fatal("must not probe thread/resume with a non-thread-id-shaped name")
+		return nil, nil
+	}
+	err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, request, time.Second)
+	if !errors.Is(err, ErrResumeRequiresThreadID) {
+		t.Fatalf("error = %v, want wrapping ErrResumeRequiresThreadID", err)
+	}
+	if errors.Is(err, agent.ErrSessionNotFound) {
+		t.Fatalf("a wrong-shape name must not be misreported as agent.ErrSessionNotFound: %v", err)
 	}
 }
 

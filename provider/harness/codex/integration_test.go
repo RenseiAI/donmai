@@ -78,6 +78,17 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	if server.client == nil {
 		t.Fatal("named app-server did not leave its RPC connection open for post-spawn naming")
 	}
+	// Production closes this diagnostic connection eagerly once its job is
+	// done (see namedInteractiveAppServer.closeClient's doc comment) rather
+	// than leaving it open for the life of the session. This test's job is
+	// done as soon as the handshake is proven, so it closes the same way:
+	// eagerly, while the app-server is still fully alive — proving
+	// interactiveWebSocketClient.close (CloseNow, not a graceful handshake
+	// close a real codex-cli 0.151.0 app-server never reciprocates) succeeds
+	// cleanly against a live peer.
+	if err := server.closeClient(); err != nil {
+		t.Fatalf("close bootstrap RPC connection while the app-server peer is still alive: %v", err)
+	}
 	t.Logf("bootstrap app-server for %s is live at %s", name, server.remoteURL)
 }
 

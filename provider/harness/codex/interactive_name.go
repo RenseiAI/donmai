@@ -10,6 +10,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"sync"
 	"time"
 
@@ -172,6 +173,15 @@ func startNamedInteractiveAppServer(
 		if err := resumeExistingNamedThreadWithRequest(setupCtx, spec, client.request, rpcTimeout); err != nil {
 			return nil, errors.Join(err, server.close())
 		}
+		// The target is now proven to exist; the PTY opens its own
+		// independent --remote connection to attach (`codex resume --remote
+		// <socket> <name>`), so nothing further is needed on this
+		// diagnostic connection. Close it now, while the app-server peer is
+		// still fully alive, rather than leaving it open for the life of
+		// the session — see namedInteractiveAppServer.closeClient's doc
+		// comment for why a teardown-time close instead produced a
+		// spurious "cleanup_failed" ResultEvent for every named session.
+		_ = server.closeClient()
 	}
 	if opts.interactiveNameServerStarted != nil {
 		opts.interactiveNameServerStarted(server.remoteURL)
@@ -189,7 +199,16 @@ func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, ser
 	if server == nil || server.client == nil {
 		return errors.New("codex interactive name bootstrap connection is not open")
 	}
-	return awaitAndNameLiveThreadWithRequest(ctx, spec, server.client.awaitNotification, server.client.request, timeout)
+	if err := awaitAndNameLiveThreadWithRequest(ctx, spec, server.client.awaitNotification, server.client.request, timeout); err != nil {
+		return err
+	}
+	// Naming succeeded and the PTY already has its own independent
+	// connection to the app-server (the one that created the thread just
+	// named). Close this diagnostic connection now, while the app-server
+	// peer is still fully alive, instead of leaving it open for the life of
+	// the session — see namedInteractiveAppServer.closeClient's doc comment.
+	_ = server.closeClient()
+	return nil
 }
 
 type namedThreadRequest func(context.Context, string, map[string]any, time.Duration) (json.RawMessage, error)
@@ -256,11 +275,43 @@ func awaitAndNameLiveThreadWithRequest(
 	return nil
 }
 
+// codexThreadIDPattern matches the shape of a codex-native thread id (the
+// same 8-4-4-4-12 hex form observed from thread/start responses against a
+// real codex-cli 0.151.0 binary, e.g. "01a0548d-9a06-7a30-a72c-f7c94b8c899c").
+// thread/resume's threadId parameter is a thread id, never a human-assigned
+// name — see resumeExistingNamedThreadWithRequest.
+var codexThreadIDPattern = regexp.MustCompile(`^[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}$`)
+
+// ErrResumeRequiresThreadID is returned when an attach-to-existing request's
+// SessionName is not shaped like a codex thread id. thread/resume only
+// accepts a thread id (verified against a real codex-cli 0.151.0 binary: a
+// non-UUID id is rejected with its own distinct "invalid session id" error,
+// never treated as a name lookup) — resolving a human-assigned name to its
+// thread id is not implemented here. No current producer sets
+// agent.InteractiveSpec.ResumeExisting, so this is forward-compatible
+// scaffolding, not a regression: whoever first wires that signal must also
+// supply (or resolve) a real thread id, or extend this function with a
+// name-to-id lookup as its own change.
+var ErrResumeRequiresThreadID = errors.New("codex: resume-by-name is not supported; thread/resume requires a thread id")
+
 // resumeExistingNamedThreadWithRequest proves the ATTACH target actually
 // exists — via the same thread/resume JSON-RPC method the headless
 // Provider.Resume already uses in production — before any PTY side effect.
-// A missing/unresumable target returns agent.ErrSessionNotFound naming the
-// session, never a silent fallback that could spawn a PTY against a
+//
+// spec.SessionName must be shaped like a codex thread id: thread/resume
+// takes a thread id, never a name, and silently probing a name-shaped
+// value as though it were an id would surface the CLI's "invalid session
+// id" rejection mis-mapped onto agent.ErrSessionNotFound (a "wrong shape"
+// error, not a "doesn't exist" error). A non-id-shaped name instead fails
+// closed with ErrResumeRequiresThreadID before any RPC is attempted.
+//
+// A properly-shaped id that thread/resume rejects (including one for a
+// thread that has taken no turn yet — a real codex-cli 0.151.0 probe
+// confirmed thread/resume itself accepts a still-live, never-turned thread
+// by id; it is only the `codex resume` CLI subcommand's own separate
+// rollout-file lookup, used by the fresh-session path's PTY attach, that
+// requires persistence) returns agent.ErrSessionNotFound naming the
+// session — never a silent fallback that could spawn a PTY against a
 // different (freshly created) thread.
 func resumeExistingNamedThreadWithRequest(
 	ctx context.Context,
@@ -270,6 +321,9 @@ func resumeExistingNamedThreadWithRequest(
 ) error {
 	if spec.SessionName == "" {
 		return errors.New("codex interactive attach-to-existing requires a session name")
+	}
+	if !codexThreadIDPattern.MatchString(spec.SessionName) {
+		return fmt.Errorf("%w: %q", ErrResumeRequiresThreadID, spec.SessionName)
 	}
 	if _, err := request(ctx, "thread/resume", map[string]any{
 		"threadId": spec.SessionName,
@@ -383,8 +437,21 @@ func (c *interactiveWebSocketClient) notify(ctx context.Context, method string, 
 	return c.conn.Write(ctx, websocket.MessageText, body)
 }
 
+// close tears down this diagnostic connection with CloseNow rather than
+// Close: Close performs a graceful handshake that WRITES a close frame and
+// then WAITS to READ the peer's own close frame in reply (coder/websocket's
+// documented behavior). A real codex-cli 0.151.0 app-server does not
+// reciprocate that handshake — it drops the raw connection once it is done
+// with it, regardless of how soon after the handshake this runs — so Close
+// reliably surfaced as "failed to close WebSocket: failed to read frame
+// header: EOF" here, which ptycli.Handle.run treats as a cleanup failure and
+// turns a normal session exit into agent.ResultEvent{Success: false,
+// ErrorSubtype: "cleanup_failed"} for every named session (reproduced 3/3
+// against a real binary before this fix). CloseNow closes the underlying
+// connection immediately without attempting that handshake, so there is
+// nothing left to read and nothing to fail.
 func (c *interactiveWebSocketClient) close() error {
-	err := c.conn.Close(websocket.StatusNormalClosure, "setup complete")
+	err := c.conn.CloseNow()
 	c.transport.CloseIdleConnections()
 	return err
 }
@@ -440,11 +507,51 @@ func remoteInteractiveArgs(argv []string, remoteURL string) []string {
 	return append(out, argv...)
 }
 
+// closeClient closes the diagnostic RPC connection this server opened for
+// the bootstrap handshake and any pre-PTY naming/resume RPCs, and clears the
+// field so a later call (including from close's teardown) is a no-op.
+//
+// It is called EAGERLY, right after that connection's job is done (naming
+// completes for the fresh path, the existence check completes for the
+// attach path) — never left open for the life of the PTY session. Two
+// independent things make that matter:
+//
+//   - interactiveWebSocketClient.close uses CloseNow, not a graceful
+//     handshake close, because a real codex-cli 0.151.0 app-server does not
+//     reciprocate a close handshake at all (see that method's doc comment)
+//     — so the "EOF at teardown" failure this fixes is not actually a
+//     function of HOW LONG the connection sat open; it reproduced even
+//     closing immediately after the handshake, before this file also
+//     switched to CloseNow.
+//   - Even with CloseNow in place, this connection is the only reader on
+//     its socket. Leaving it open and unread for the life of a session (a
+//     PTY session can run for a long time) is unnecessary exposure to
+//     notification backpressure or an app-server-initiated idle close for
+//     no benefit — its RPC job is done once naming/the existence check
+//     completes, so closing it then, while the app-server is still fully
+//     alive and mid-handshake with the PTY's own separate connection, is
+//     strictly safer than holding it open.
+//
+// ptycli.Handle.run treats ANY non-nil cleanup error as session failure, so
+// the original EOF (from graceful Close, reproduced regardless of timing)
+// silently turned every named session's successful exit into
+// agent.ResultEvent{Success: false, ErrorSubtype: "cleanup_failed"} —
+// reproduced against a real codex-cli 0.151.0 binary before this fix, both
+// via TestIntegration_RealCodexNamedInteractivePTYFreshCreateAndCleanup and,
+// more simply, by closing a fresh diagnostic connection immediately after
+// its own initialize/initialized handshake with nothing else in between.
+func (s *namedInteractiveAppServer) closeClient() error {
+	if s.client == nil {
+		return nil
+	}
+	err := s.client.close()
+	s.client = nil
+	return err
+}
+
 func (s *namedInteractiveAppServer) close() error {
 	s.closeOnce.Do(func() {
-		if s.client != nil {
-			s.closeErr = s.client.close()
-		}
+		s.closeErr = s.closeClient()
 		if s.cmd.Process != nil {
 			_ = s.cmd.Process.Signal(syscallSIGTERM())
 		}
