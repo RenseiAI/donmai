@@ -62,16 +62,6 @@ func interactiveCodexAuthError(detail string) error {
 // entries are scoped to the canonical host CODEX_HOME and Codex exposes no
 // secret-free projection API for a different home.
 func resolveInteractiveCodexAuth(specEnv map[string]string) (interactiveCodexAuthProjection, error) {
-	hostAuthFile, err := resolveHostSessionAuthFile()
-	if err != nil {
-		return interactiveCodexAuthProjection{}, interactiveCodexAuthError(err.Error())
-	}
-	hostHome := filepath.Dir(hostAuthFile)
-	storeMode, explicitMode, err := readHostCodexAuthStoreMode(hostHome)
-	if err != nil {
-		return interactiveCodexAuthProjection{}, interactiveCodexAuthError(err.Error())
-	}
-
 	key, value, ok, err := resolveEnvironmentCodexAuth(specEnv)
 	if err != nil {
 		return interactiveCodexAuthProjection{}, err
@@ -83,6 +73,16 @@ func resolveInteractiveCodexAuth(specEnv map[string]string) (interactiveCodexAut
 			envKey:    key,
 			envValue:  value,
 		}, nil
+	}
+
+	hostAuthFile, err := resolveHostSessionAuthFile()
+	if err != nil {
+		return interactiveCodexAuthProjection{}, interactiveCodexAuthError(err.Error())
+	}
+	hostHome := filepath.Dir(hostAuthFile)
+	storeMode, explicitMode, err := readHostCodexAuthStoreMode(hostHome)
+	if err != nil {
+		return interactiveCodexAuthProjection{}, interactiveCodexAuthError(err.Error())
 	}
 
 	switch storeMode {

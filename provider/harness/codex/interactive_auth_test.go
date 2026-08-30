@@ -47,6 +47,14 @@ func TestResolveInteractiveCodexAuthDistinguishesEnvironmentFileAndKeyring(t *te
 		}
 	})
 
+	t.Run("explicit environment auth needs no host Codex home", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+		projection, err := resolveInteractiveCodexAuth(map[string]string{"OPENAI_API_KEY": "fixture"})
+		if err != nil || projection.kind != interactiveCodexAuthEnvironment {
+			t.Fatalf("environment projection with absent home = %+v err=%v", projection, err)
+		}
+	})
+
 	t.Run("session API key conflicts with ambient access token", func(t *testing.T) {
 		t.Setenv("CODEX_ACCESS_TOKEN", "ambient-access")
 		_, err := resolveInteractiveCodexAuth(map[string]string{"OPENAI_API_KEY": "session-api"})
@@ -105,6 +113,14 @@ func TestResolveInteractiveCodexAuthRefusesAbsentOrMalformedAuthority(t *testing
 		_, err := resolveInteractiveCodexAuth(nil)
 		if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !strings.Contains(err.Error(), "auth.json is absent") {
 			t.Fatalf("missing-auth error = %v", err)
+		}
+	})
+
+	t.Run("no environment and no Codex home", func(t *testing.T) {
+		t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+		_, err := resolveInteractiveCodexAuth(nil)
+		if !errors.Is(err, ErrInteractiveCodexAuthProjection) {
+			t.Fatalf("missing-home error = %v", err)
 		}
 	})
 
@@ -202,5 +218,26 @@ func TestSpawnInteractiveConflictingAuthRefusesBeforePTY(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workdir, "spawned")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("PTY started after conflicting auth refusal: %v", statErr)
+	}
+}
+
+func TestSpawnInteractiveMissingAuthRefusesBeforePTY(t *testing.T) {
+	clearInteractiveCodexAuthEnv(t)
+	workdir := t.TempDir()
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+	bin := writeFakeCodexScript(t, `touch "$PWD/spawned"`)
+
+	_, err := SpawnInteractive(context.Background(), Options{CodexBin: bin}, agent.Spec{
+		Cwd: workdir,
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "https://platform.example/api/mcp/session",
+		}},
+		Interactive: &agent.InteractiveSpec{},
+	})
+	if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("missing-auth spawn error = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(workdir, "spawned")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("PTY started without authentication authority: %v", statErr)
 	}
 }
