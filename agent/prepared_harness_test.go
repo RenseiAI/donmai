@@ -1,6 +1,9 @@
 package agent_test
 
 import (
+	"errors"
+	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -69,6 +72,111 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 	mutated.Model = "different-model"
 	if _, err := agent.PrepareHarness(mutated, manifest); err == nil {
 		t.Fatal("authority-changing child mutation was accepted")
+	}
+}
+
+// TestApplyPreparedHarnessNamesDriftingFields covers: on a
+// materialized-Spec-differs-from-authority mismatch, ApplyPreparedHarness
+// must return a *agent.AuthorityDriftError naming exactly which
+// harnessAuthorityDigest projection field(s) drifted — never just the bare
+// "materialized Spec differs" message a production failure could not be
+// diagnosed from. Table-driven so each case pins ONE (or a known set of)
+// drifting field name(s), proving the localization is precise and not just
+// "any error, any field".
+func TestApplyPreparedHarnessNamesDriftingFields(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	base := func() agent.Spec {
+		return agent.Spec{
+			PromptMode:         agent.PromptModeHumanControlled,
+			SandboxEnabled:     true,
+			SandboxLevel:       agent.SandboxWorkspaceWrite,
+			Model:              "gpt-test",
+			SystemPromptAppend: "base system append",
+			PromptPlan: &agent.PromptPlan{
+				ContractVersion:  agent.PromptContractVersion,
+				BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+				UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
+			},
+			Interactive: &agent.InteractiveSpec{},
+		}
+	}
+	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+
+	tests := []struct {
+		name   string
+		mutate func(agent.Spec) agent.Spec
+		want   []string
+	}{
+		{
+			name:   "model differs (a genuine authority field, e.g. a routing swap between preflight and spawn)",
+			mutate: func(s agent.Spec) agent.Spec { s.Model = "different-model"; return s },
+			want:   []string{"model"},
+		},
+		{
+			name:   "system prompt append differs (prompt adaptation applied after preflight)",
+			mutate: func(s agent.Spec) agent.Spec { s.SystemPromptAppend = "mutated append"; return s },
+			want:   []string{"systemPromptAppend"},
+		},
+		{
+			name:   "allowed tools differ (capability-pack tool policy applied after preflight)",
+			mutate: func(s agent.Spec) agent.Spec { s.AllowedTools = []string{"Read", "Write"}; return s },
+			want:   []string{"allowedTools"},
+		},
+		{
+			name: "a non-runtime mcp server is added (e.g. a session gateway server not in plan.RuntimeMCPNames)",
+			mutate: func(s agent.Spec) agent.Spec {
+				s.MCPServers = append(append([]agent.MCPServerConfig(nil), s.MCPServers...), agent.MCPServerConfig{
+					Name: "session-gateway", Type: "http", URL: "https://platform.example/api/mcp/session",
+					Headers: map[string]string{"Authorization": "Bearer real-bearer"},
+				})
+				return s
+			},
+			want: []string{"mcpServers"},
+		},
+		{
+			name: "model and allowed tools both differ",
+			mutate: func(s agent.Spec) agent.Spec {
+				s.Model = "different-model"
+				s.AllowedTools = []string{"Read", "Write"}
+				return s
+			},
+			want: []string{"allowedTools", "model"},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			source := base()
+			plan, err := agent.CompilePreparedHarness(source, manifest, operationalDigest, nil, materializations)
+			if err != nil {
+				t.Fatalf("CompilePreparedHarness: %v", err)
+			}
+			materialized := tc.mutate(source)
+			materialized.PreparedHarness = plan
+
+			_, err = agent.PrepareHarness(materialized, manifest)
+			if err == nil {
+				t.Fatalf("expected an authority drift error, got nil")
+			}
+			var driftErr *agent.AuthorityDriftError
+			if !errors.As(err, &driftErr) {
+				t.Fatalf("expected *agent.AuthorityDriftError, got %T: %v", err, err)
+			}
+			if !reflect.DeepEqual(driftErr.Fields, tc.want) {
+				t.Fatalf("Fields = %v, want %v", driftErr.Fields, tc.want)
+			}
+			for _, field := range tc.want {
+				if !strings.Contains(err.Error(), field) {
+					t.Fatalf("Error() = %q must name drifting field %q", err.Error(), field)
+				}
+			}
+		})
 	}
 }
 
