@@ -6,6 +6,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **Named interactive Codex sessions attach to the TUI-owned thread.** Codex
+  does not make an app-server-created no-turn thread resumable from the TUI's
+  second connection. The named lane now starts a fresh TUI on the isolated
+  per-session app-server, observes that TUI's `thread/start`, applies and reads
+  back the requested name, and only then delivers the initial prompt through
+  the PTY. Bootstrap process failures retain bounded, credential-redacted
+  diagnostics instead of collapsing to an exit code.
+
 ## v0.72.8 — 2026-08-30
 
 ### Features

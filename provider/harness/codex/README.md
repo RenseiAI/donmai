@@ -188,12 +188,13 @@ on its own default when it did not:
   `DefaultCodexModel`.
 
 When `Spec.SessionName` is present, the interactive lane starts a bounded
-per-session Unix-socket app-server, creates the thread, applies and reads back
-`thread/name/set`, then attaches the TUI with
-`codex resume --remote <socket> <name>`. The server stays alive through the
-first turn so the already-named thread becomes the durable resume target; the
-PTY lifecycle owns its cleanup. Unnamed interactive sessions retain the bare
-TUI path.
+per-session Unix-socket app-server and launches a fresh TUI against it. The TUI
+creates the durable thread; the control connection observes that exact
+`thread/started`, applies and reads back `thread/name/set`, and only then sends
+the initial prompt through the PTY. This ordering is required because Codex does
+not make an app-server-created no-turn thread resumable from the TUI's second
+connection. The PTY lifecycle owns the server cleanup. Unnamed interactive
+sessions retain the bare TUI path.
 
 The pinned CLI exposes no supported Windows local transport for that shared
 name-set/TUI-attach sequence. A named interactive request on Windows therefore
@@ -359,13 +360,14 @@ surfacing as a spurious `client stopped` Spawn failure.
 - `*_test.go` — unit tests using a fake stdio JSON-RPC server.
 - `integration_test.go` (build-tagged `codex_integration`) — smoke
   tests against a real Codex install, including native named-thread readback
-  and the full PTY `resume --remote`/Stop/socket/config-home cleanup seam.
+  and the full fresh-remote-TUI/name/readback/prompt/Stop/config-home seam with
+  file-backed host authentication.
 
 ```bash
 # Unit tests (default)
 go test -race ./provider/harness/codex/
 
-# Integration tests (requires codex + OPENAI_API_KEY)
+# Integration tests (requires codex + configured environment or file auth)
 go test -tags codex_integration -timeout 120s ./provider/harness/codex/
 ```
 

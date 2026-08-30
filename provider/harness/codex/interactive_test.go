@@ -17,6 +17,7 @@ import (
 
 	"github.com/BurntSushi/toml"
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/attachwire"
 )
 
 func TestInteractiveArgs(t *testing.T) {
@@ -119,15 +120,46 @@ func TestSpawnInteractivePrepared_WindowsNameGatePrecedesBinarySideEffects(t *te
 	}
 }
 
-func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T) {
+func TestRemoteInteractiveArgs_StartsFreshRemoteTUIWithoutPrematurePrompt(t *testing.T) {
 	t.Parallel()
-	got := remoteInteractiveArgs(
+	got, err := remoteInteractiveArgs(
 		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"},
 		"unix:///tmp/codex.sock",
+		agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"},
 	)
-	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"}
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
+	}
+}
+
+func TestCodexInteractiveErrorLine_ActionableAndSecretSafe(t *testing.T) {
+	t.Parallel()
+	screenWithLine := func(line string) attachwire.Screen {
+		cells := make([]attachwire.Cell, len(line))
+		for i := range line {
+			cells[i].RuneBytes = []byte(line[i : i+1])
+		}
+		return attachwire.Screen{Cols: uint64(len(cells)), Rows: 1, Primary: cells}
+	}
+	if got := codexInteractiveErrorLine(screenWithLine("ERROR: no rollout found for prepared thread")); got != "ERROR: no rollout found for prepared thread" {
+		t.Fatalf("actionable detail = %q", got)
+	}
+	if got := codexInteractiveErrorLine(screenWithLine("ERROR: Authorization Bearer private-value failed")); got != "Codex remote TUI reported a credential-bearing error (detail redacted)" {
+		t.Fatalf("secret-bearing detail = %q", got)
+	}
+}
+
+func TestSanitizeInteractiveAppServerDiagnostic(t *testing.T) {
+	t.Parallel()
+	if got := sanitizeInteractiveAppServerDiagnostic("  app-server failed to bind socket\n"); got != "app-server failed to bind socket" {
+		t.Fatalf("diagnostic = %q", got)
+	}
+	if got := sanitizeInteractiveAppServerDiagnostic("Authorization: Bearer private-value"); got != "[credential-bearing diagnostic redacted]" {
+		t.Fatalf("secret-bearing diagnostic = %q", got)
 	}
 }
 

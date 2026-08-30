@@ -13,19 +13,22 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
 // SpawnInteractive opens the codex CLI's own interactive TUI under a PTY via
 // ptycli, seeded with spec.Prompt when set. An unnamed session uses bare
-// `codex`. A named session uses a bounded per-session app-server, applies and
-// reads back thread/name/set before the first turn, then attaches with
-// `codex resume --remote <socket> <name>`. The pinned CLI supports that local
-// transport only through Unix sockets; named Windows requests fail before any
-// spawn side effect while unnamed Windows requests retain the bare-TUI path.
+// `codex`. A named session uses a bounded per-session app-server, starts a fresh
+// TUI against that server, applies and reads back thread/name/set on the
+// TUI-created thread, then delivers the first prompt through the PTY. The pinned
+// CLI supports that local transport only through Unix sockets; named Windows
+// requests fail before any spawn side effect while unnamed Windows requests
+// retain the bare-TUI path.
 //
 // It remains independent of the Provider's shared headless app-server state:
 // it never touches Provider.client/cmd and resolves the binary itself. The
@@ -81,13 +84,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			if homeErr != nil {
 				return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, homeErr)
 			}
-			server, nameErr := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, home)
-			if nameErr != nil {
-				return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, nameErr)
-			}
-			launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
-			spec.Env = launch.env
-			return ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), server.close)
+			return spawnPreparedNamedInteractive(ctx, bin, opts, spec, launch, home, nil)
 		}
 		spec.Env = launch.env
 		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
@@ -136,22 +133,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		)
 	}
 	if spec.SessionName != "" {
-		server, err := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, config.home)
-		if err != nil {
-			return nil, errors.Join(
-				fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err),
-				config.remove(),
-			)
-		}
-		launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
-		return ptycli.SpawnWithCleanup(
-			ctx,
-			bin,
-			launch.argv,
-			spec,
-			(&Provider{}).Manifest(),
-			func() error { return errors.Join(server.close(), config.remove()) },
-		)
+		return spawnPreparedNamedInteractive(ctx, bin, opts, spec, launch, config.home, config.remove)
 	}
 	return ptycli.SpawnWithCleanup(
 		ctx,
@@ -161,6 +143,105 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		(&Provider{}).Manifest(),
 		config.remove,
 	)
+}
+
+func spawnPreparedNamedInteractive(
+	ctx context.Context,
+	bin string,
+	opts Options,
+	spec agent.Spec,
+	launch interactiveLaunch,
+	codexHome string,
+	extraCleanup func() error,
+) (agent.Handle, error) {
+	server, err := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, codexHome)
+	if err != nil {
+		if extraCleanup != nil {
+			err = errors.Join(err, extraCleanup())
+		}
+		return nil, fmt.Errorf("%w: prepare named Codex interactive app-server: %w", agent.ErrSpawnFailed, err)
+	}
+	cleanup := func() error {
+		serverErr := server.close()
+		var extraErr error
+		if extraCleanup != nil {
+			extraErr = extraCleanup()
+		}
+		return errors.Join(serverErr, extraErr)
+	}
+	launch.argv, err = remoteInteractiveArgs(launch.argv, server.remoteURL, spec)
+	if err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("%w: prepare named Codex remote attach: %w", agent.ErrSpawnFailed, err),
+			cleanup(),
+		)
+	}
+	spec.Env = launch.env
+	handle, err := ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), cleanup)
+	if err != nil {
+		return nil, err
+	}
+	interactiveSession := handle.InteractiveSession()
+	if _, err := server.waitAndNameInteractiveThread(ctx, spec, opts.RPCTimeout, interactiveSession.Done()); err != nil {
+		if errors.Is(err, errNamedInteractiveTUIExited) {
+			if detail := codexInteractiveFailureDetail(interactiveSession); detail != "" {
+				err = fmt.Errorf("%w: %s", err, detail)
+			}
+		}
+		stopCtx, cancel := context.WithTimeout(context.Background(), 12*time.Second)
+		defer cancel()
+		return nil, errors.Join(
+			fmt.Errorf("%w: name Codex remote TUI thread: %w", agent.ErrSpawnFailed, err),
+			handle.Stop(stopCtx),
+		)
+	}
+	if err := ptycli.DeliverSeed(ctx, handle, interactiveSession, spec.Prompt); err != nil {
+		return nil, fmt.Errorf("%w: deliver named Codex initial prompt: %w", agent.ErrSpawnFailed, err)
+	}
+	return handle, nil
+}
+
+const maxCodexInteractiveFailureDetailBytes = 1024
+
+func codexInteractiveFailureDetail(session agent.InteractiveSession) string {
+	screen, _, err := session.Snapshot()
+	if err != nil {
+		return ""
+	}
+	return codexInteractiveErrorLine(screen)
+}
+
+func codexInteractiveErrorLine(screen attachwire.Screen) string {
+	lines := make([][]attachwire.Cell, 0, len(screen.Scrollback))
+	lines = append(lines, screen.Scrollback...)
+	grid := screen.Primary
+	if screen.ActiveBuffer == attachwire.BufferAlt && screen.AltPresent {
+		grid = screen.Alt
+	}
+	if screen.Cols > 0 && screen.Cols <= uint64(len(grid)) {
+		cols := int(screen.Cols) //nolint:gosec // bounded above by len(grid), which is an int.
+		for start := 0; start+cols <= len(grid); start += cols {
+			lines = append(lines, grid[start:start+cols])
+		}
+	}
+	for i := len(lines) - 1; i >= 0; i-- {
+		var row strings.Builder
+		for _, cell := range lines[i] {
+			row.Write(cell.RuneBytes)
+		}
+		detail := strings.Join(strings.Fields(row.String()), " ")
+		lower := strings.ToLower(detail)
+		if detail == "" || (!strings.Contains(lower, "error") && !strings.Contains(lower, "failed")) {
+			continue
+		}
+		for _, sensitive := range []string{"authorization", "bearer", "api_key", "api-key", "x-api-key", "cookie", "secret", "access_token", "refresh_token", "token:", "token="} {
+			if strings.Contains(lower, sensitive) {
+				return "Codex remote TUI reported a credential-bearing error (detail redacted)"
+			}
+		}
+		return truncateUTF8Detail(detail, maxCodexInteractiveFailureDetailBytes)
+	}
+	return ""
 }
 
 // validateNamedInteractiveTransport keeps the optional naming layer honest on

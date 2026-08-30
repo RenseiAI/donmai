@@ -38,7 +38,7 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 )
 
-func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
+func TestIntegration_RealCodexInteractiveAppServerBootstrap(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {
 		t.Fatalf("real interactive-name proof requires codex on PATH: %v", err)
@@ -64,10 +64,10 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	if server.remoteURL == "" {
 		t.Fatal("named app-server returned no remote URL")
 	}
-	t.Logf("named thread %s is live at %s", name, server.remoteURL)
+	t.Logf("named-session app-server for %s is live at %s", name, server.remoteURL)
 }
 
-func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) {
+func TestIntegration_RealCodexNamedInteractivePTYFreshRemoteAndCleanup(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {
 		t.Fatalf("real named PTY proof requires codex on PATH: %v", err)
@@ -143,21 +143,21 @@ func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) 
 		select {
 		case frame, ok := <-sub.Frames():
 			if !ok {
-				t.Fatal("named Codex PTY closed before rendering the resumed TUI")
+				t.Fatal("named Codex PTY closed before rendering the remote TUI")
 			}
 			if frame.Type == attachwire.TypeExit {
-				t.Fatal("named Codex PTY exited before the resumed TUI was ready")
+				t.Fatal("named Codex PTY exited before the remote TUI was ready")
 			}
 			if frame.Type == attachwire.TypeOutput && len(frame.Payload) > 0 {
 				sawOutput = true
 			}
 		case <-ctx.Done():
-			t.Fatalf("named Codex PTY produced no resumed-TUI output: %v", ctx.Err())
+			t.Fatalf("named Codex PTY produced no remote-TUI output: %v", ctx.Err())
 		}
 	}
 	select {
 	case <-interactive.InteractiveSession().Done():
-		t.Fatal("named Codex PTY exited immediately after rendering; native resume attach did not stay live")
+		t.Fatal("named Codex PTY exited immediately after rendering; fresh remote attach did not stay live")
 	case <-time.After(250 * time.Millisecond):
 	}
 
@@ -176,6 +176,134 @@ func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) 
 	}
 	if len(entries) != 0 {
 		t.Fatalf("interactive config home survived PTY Stop: %v", entries)
+	}
+}
+
+func TestIntegration_RealCodexNamedInteractivePTYFileAuthStaysLive(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real named file-auth PTY proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	hostAuthFile, err := resolveHostSessionAuthFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostAuthInfo, err := os.Stat(hostAuthFile)
+	if err != nil {
+		t.Fatalf("real named file-auth PTY proof requires a host auth.json: %v", err)
+	}
+	hostHome := t.TempDir()
+	if err := os.Link(hostAuthFile, filepath.Join(hostHome, codexAuthFileName)); err != nil {
+		t.Fatalf("project host auth fixture by inode: %v", err)
+	}
+	if err := os.WriteFile(
+		filepath.Join(hostHome, "config.toml"),
+		[]byte("cli_auth_credentials_store = \"file\"\n[mcp_servers.user_poison]\ncommand = \"/usr/bin/false\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("CODEX_HOME", hostHome)
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	name := "donmai-pty-file-auth-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	configParent := t.TempDir()
+	remoteCh := make(chan string, 1)
+	ctx, cancel := context.WithTimeout(t.Context(), 40*time.Second)
+	defer cancel()
+	h, err := SpawnInteractive(ctx, Options{
+		CodexBin: binary, RPCTimeout: 10 * time.Second, configTempDir: configParent,
+		interactiveNameServerStarted: func(remoteURL string) { remoteCh <- remoteURL },
+	}, agent.Spec{
+		SessionName: name,
+		Prompt:      "Reply with exactly READY, then wait for another user message.",
+		Cwd:         cwd,
+		Model:       "gpt-5.6-sol",
+		Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 30},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "http://127.0.0.1:1/api/mcp/session",
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SpawnInteractive named file-auth PTY: %v", err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = h.Stop(context.Background())
+		}
+	})
+	remoteURL := <-remoteCh
+	socketDir := filepath.Dir(strings.TrimPrefix(remoteURL, "unix://"))
+	entries, err := os.ReadDir(configParent)
+	if err != nil || len(entries) != 1 {
+		t.Fatalf("private named config home count: err=%v entries=%v", err, entries)
+	}
+	privateHome := filepath.Join(configParent, entries[0].Name())
+	privateAuthInfo, err := os.Stat(filepath.Join(privateHome, codexAuthFileName))
+	if err != nil || !os.SameFile(hostAuthInfo, privateAuthInfo) {
+		t.Fatalf("private named auth is not the file-backed host credential inode: %v", err)
+	}
+	privateConfig, err := os.ReadFile(filepath.Join(privateHome, "config.toml"))
+	if err != nil || strings.Contains(string(privateConfig), "user_poison") || !strings.Contains(string(privateConfig), codexConfigBaseline) {
+		t.Fatalf("private named config admitted ambient MCP authority: err=%v config=%q", err, privateConfig)
+	}
+	interactive, ok := h.(agent.InteractiveCapable)
+	if !ok {
+		t.Fatal("named Codex file-auth spawn did not return an interactive handle")
+	}
+	sub, err := interactive.InteractiveSession().Subscribe(0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = sub.Close() }()
+
+	deadline := time.NewTimer(25 * time.Second)
+	defer deadline.Stop()
+	var output strings.Builder
+	survived := false
+	for !survived {
+		select {
+		case frame, ok := <-sub.Frames():
+			if !ok {
+				t.Fatal("named Codex file-auth PTY stream closed before the sustained-live deadline")
+			}
+			if frame.Type == attachwire.TypeExit {
+				t.Fatalf("named Codex file-auth PTY exited before the sustained-live deadline: payload=%x output=%q", frame.Payload, output.String())
+			}
+			if frame.Type == attachwire.TypeOutput && output.Len() < 128<<10 {
+				_, _ = output.Write(frame.Payload)
+			}
+		case event, ok := <-h.Events():
+			if !ok {
+				t.Fatal("named Codex file-auth PTY events closed before the sustained-live deadline")
+			}
+			if result, ok := event.(agent.ResultEvent); ok {
+				t.Fatalf("named Codex file-auth PTY ended before the sustained-live deadline: %+v", result)
+			}
+		case <-deadline.C:
+			survived = true
+		case <-ctx.Done():
+			t.Fatalf("named Codex file-auth PTY did not survive: %v", ctx.Err())
+		}
+	}
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 12*time.Second)
+	defer stopCancel()
+	if err := h.Stop(stopCtx); err != nil {
+		t.Fatalf("stop sustained named file-auth PTY: %v", err)
+	}
+	stopped = true
+	if _, err := os.Stat(socketDir); !os.IsNotExist(err) {
+		t.Fatalf("named file-auth socket directory survived Stop: %v", err)
+	}
+	entries, err = os.ReadDir(configParent)
+	if err != nil || len(entries) != 0 {
+		t.Fatalf("named file-auth config home survived Stop: err=%v entries=%v", err, entries)
 	}
 }
 

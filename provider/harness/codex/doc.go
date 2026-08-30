@@ -57,9 +57,10 @@
 // HarnessCaps.SupportsInteractivePTY declares a SECOND spawn mode
 // (interactive.go: SpawnInteractive): Spec.Interactive != nil routes Spawn to
 // the codex TUI under a PTY (provider/harness/ptycli). Named sessions use a
-// per-session app-server to apply thread/name/set before attaching the TUI by
-// name; they never reuse the Provider's shared headless client/process. See
-// interactive.go for the full contract.
+// per-session app-server, let the remote TUI create its own durable thread,
+// apply/read back thread/name/set to that exact thread, then deliver the first
+// prompt through the PTY. They never reuse the Provider's shared headless
+// client/process. See interactive.go for the full contract.
 //
 // # Approval bridge
 //

@@ -39,6 +39,8 @@ type Handle struct {
 	cleanupOnce sync.Once
 	cleanupFn   func() error
 	cleanupErr  error
+	terminal    agent.ResultEvent
+	terminalSet chan struct{}
 }
 
 // Spawn starts binary+argv under a PTY via ptyhost.Spawn and returns a
@@ -120,8 +122,9 @@ func SpawnWithCleanup(ctx context.Context, binary string, argv []string, spec ag
 		// Buffered for exactly the two events this driver ever emits
 		// (InitEvent, terminal ResultEvent) so sendEvent never blocks on a
 		// slow/absent consumer.
-		events:    make(chan agent.Event, 2),
-		cleanupFn: cleanup,
+		events:      make(chan agent.Event, 2),
+		cleanupFn:   cleanup,
+		terminalSet: make(chan struct{}),
 	}
 	// The session is up the instant ptyhost.Spawn returns (pty.StartWithSize
 	// blocks until fork+exec completes) — emit InitEvent synchronously,
@@ -220,11 +223,13 @@ func (h *Handle) run() {
 	if err := h.cleanup(); err != nil {
 		result = cleanupFailureResult(err)
 	}
+	h.terminal = result
+	close(h.terminalSet)
 	h.events <- result
 	h.closeOnce.Do(func() { close(h.events) })
 }
 
-func cleanupFailureResult(err error) agent.Event {
+func cleanupFailureResult(err error) agent.ResultEvent {
 	return agent.ResultEvent{
 		Success:      false,
 		ErrorSubtype: "cleanup_failed",
@@ -259,7 +264,7 @@ func (h *Handle) watchCtx(ctx context.Context) {
 // success, anything else is a failure carrying the exit/signal detail.
 // Mirrors the ErrorSubtype convention agycli's buildResult uses
 // ("nonzero_exit").
-func buildResult(exit attachwire.ExitPayload) agent.Event {
+func buildResult(exit attachwire.ExitPayload) agent.ResultEvent {
 	if exit.ExitCode == 0 && !exit.BySignal() {
 		return agent.ResultEvent{Success: true}
 	}
@@ -271,6 +276,19 @@ func buildResult(exit attachwire.ExitPayload) agent.Event {
 		Success:      false,
 		ErrorSubtype: "nonzero_exit",
 		Errors:       []string{msg},
+	}
+}
+
+// AwaitInteractiveTerminalResult returns the exact coarse terminal event after
+// PTY teardown and owned-resource cleanup finish. The interactive runner uses
+// this structural seam to persist cleanup diagnostics that would otherwise
+// lose a race to InteractiveSession.Done closing first.
+func (h *Handle) AwaitInteractiveTerminalResult(ctx context.Context) (agent.ResultEvent, error) {
+	select {
+	case <-h.terminalSet:
+		return h.terminal, nil
+	case <-ctx.Done():
+		return agent.ResultEvent{}, ctx.Err()
 	}
 }
 
