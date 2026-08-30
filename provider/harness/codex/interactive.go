@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -22,7 +23,9 @@ import (
 // ptycli, seeded with spec.Prompt when set. An unnamed session uses bare
 // `codex`. A named session uses a bounded per-session app-server, applies and
 // reads back thread/name/set before the first turn, then attaches with
-// `codex resume --remote <socket> <name>`.
+// `codex resume --remote <socket> <name>`. The pinned CLI supports that local
+// transport only through Unix sockets; named Windows requests fail before any
+// spawn side effect while unnamed Windows requests retain the bare-TUI path.
 //
 // It remains independent of the Provider's shared headless app-server state:
 // it never touches Provider.client/cmd and resolves the binary itself. The
@@ -54,6 +57,13 @@ func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent
 // PrepareHarness. Keeping all PTY/config/process work below this boundary
 // prevents interactive mode from minting a second prompt or tool authority.
 func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
+	return spawnInteractivePreparedForGOOS(ctx, opts, spec, runtime.GOOS)
+}
+
+func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec agent.Spec, goos string) (agent.Handle, error) {
+	if err := validateNamedInteractiveTransport(spec, goos); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
 	}
@@ -150,6 +160,21 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 		spec,
 		(&Provider{}).Manifest(),
 		config.remove,
+	)
+}
+
+// validateNamedInteractiveTransport keeps the optional naming layer honest on
+// platforms where the pinned Codex CLI has no supported local transport for
+// sharing one app-server between the name-set RPC and the interactive TUI.
+// Unnamed sessions never enter that layer and retain the historical bare-TUI
+// path unchanged.
+func validateNamedInteractiveTransport(spec agent.Spec, goos string) error {
+	if spec.SessionName == "" || goos != "windows" {
+		return nil
+	}
+	return fmt.Errorf(
+		"named Codex interactive sessions require Unix-socket app-server attach; Windows supports unnamed interactive sessions only: %w",
+		agent.ErrUnsupported,
 	)
 }
 

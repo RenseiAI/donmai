@@ -64,6 +64,61 @@ func TestInteractiveArgs_NamedSessionResumesNativeThreadByName(t *testing.T) {
 	}
 }
 
+func TestValidateNamedInteractiveTransport_WindowsRefusesOnlyNamedSessions(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name        string
+		goos        string
+		sessionName string
+		wantErr     bool
+	}{
+		{name: "windows named", goos: "windows", sessionName: "chief-of-staff", wantErr: true},
+		{name: "windows unnamed preserves bare TUI", goos: "windows"},
+		{name: "darwin named", goos: "darwin", sessionName: "chief-of-staff"},
+		{name: "linux named", goos: "linux", sessionName: "chief-of-staff"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			err := validateNamedInteractiveTransport(agent.Spec{SessionName: tt.sessionName}, tt.goos)
+			if tt.wantErr {
+				if !errors.Is(err, agent.ErrUnsupported) {
+					t.Fatalf("error = %v; want agent.ErrUnsupported", err)
+				}
+				if !strings.Contains(err.Error(), "Windows") || !strings.Contains(err.Error(), "unnamed") {
+					t.Fatalf("error is not an actionable Windows refusal: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+		})
+	}
+}
+
+func TestSpawnInteractivePrepared_WindowsNameGatePrecedesBinarySideEffects(t *testing.T) {
+	t.Parallel()
+	missing := filepath.Join(t.TempDir(), "missing-codex")
+	_, err := spawnInteractivePreparedForGOOS(context.Background(), Options{CodexBin: missing}, agent.Spec{
+		SessionName: "chief-of-staff",
+		Interactive: &agent.InteractiveSpec{},
+	}, "windows")
+	if !errors.Is(err, agent.ErrUnsupported) || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("named Windows spawn error = %v; want ErrSpawnFailed + ErrUnsupported", err)
+	}
+	if strings.Contains(err.Error(), "not found") || strings.Contains(err.Error(), "not on PATH") {
+		t.Fatalf("named Windows spawn reached binary resolution before refusal: %v", err)
+	}
+
+	_, unnamedErr := spawnInteractivePreparedForGOOS(context.Background(), Options{CodexBin: missing}, agent.Spec{
+		Interactive: &agent.InteractiveSpec{},
+	}, "windows")
+	if unnamedErr == nil || errors.Is(unnamedErr, agent.ErrUnsupported) {
+		t.Fatalf("unnamed Windows spawn did not preserve the prior binary-resolution path: %v", unnamedErr)
+	}
+}
+
 func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T) {
 	t.Parallel()
 	got := remoteInteractiveArgs(

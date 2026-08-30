@@ -136,6 +136,10 @@ type Options struct {
 	// interactiveAuthSeeder is a test seam for projecting an explicit
 	// environment credential into the private, ephemeral session auth store.
 	interactiveAuthSeeder interactiveCodexAuthSeeder
+	// interactiveNameServerStarted observes the exact runner-owned endpoint
+	// after native name readback and before PTY attach. Test-only; production
+	// leaves it nil.
+	interactiveNameServerStarted func(remoteURL string)
 }
 
 // New constructs the Provider WITHOUT starting the codex app-server.

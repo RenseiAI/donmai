@@ -195,6 +195,12 @@ first turn so the already-named thread becomes the durable resume target; the
 PTY lifecycle owns its cleanup. Unnamed interactive sessions retain the bare
 TUI path.
 
+The pinned CLI exposes no supported Windows local transport for that shared
+name-set/TUI-attach sequence. A named interactive request on Windows therefore
+fails before config, credential, or process side effects with
+`agent.ErrUnsupported`; an unnamed Windows request retains the original bare
+TUI behavior. The adapter never silently drops the requested name.
+
 Neither lane validates a model id before spawn — codex is the sole
 authority. A rejected id surfaces as codex's own nonzero exit (or, for the
 headless lane, a JSON-RPC error), never a silent fallback to a different
@@ -352,7 +358,8 @@ surfacing as a spurious `client stopped` Spawn failure.
 
 - `*_test.go` — unit tests using a fake stdio JSON-RPC server.
 - `integration_test.go` (build-tagged `codex_integration`) — smoke
-  test against a real `codex app-server` if installed.
+  tests against a real Codex install, including native named-thread readback
+  and the full PTY `resume --remote`/Stop/socket/config-home cleanup seam.
 
 ```bash
 # Unit tests (default)

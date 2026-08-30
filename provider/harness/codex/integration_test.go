@@ -6,17 +6,17 @@
 // to spawn codex (it requires network access + a configured OpenAI
 // key).
 //
-// To run: `go test -tags codex_integration -timeout 120s ./provider/codex/`.
+// To run: `go test -tags codex_integration -timeout 120s ./provider/harness/codex/`.
 //
 // Pre-requisites:
 //   - `codex` on PATH (see https://developers.openai.com/codex/)
 //   - OPENAI_API_KEY (or whatever auth codex requires) configured
 //   - network access
 //
-// The test does the bare minimum lifecycle smoke: spawn a session
-// against a `read-only` sandbox with a trivial prompt, verify we get
-// at least one InitEvent, then Stop the session and Shutdown the
-// Provider.
+// The suite covers headless lifecycle and interactive PTY behavior against the
+// real binary. The named interactive control executes the production native
+// resume-by-name attach, observes live PTY output, stops it, and verifies both
+// the Unix-socket directory and isolated config home are removed.
 
 package codex
 
@@ -65,6 +65,118 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 		t.Fatal("named app-server returned no remote URL")
 	}
 	t.Logf("named thread %s is live at %s", name, server.remoteURL)
+}
+
+func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real named PTY proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	cwd := t.TempDir()
+	if err := os.Mkdir(filepath.Join(cwd, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	configParent := t.TempDir()
+	remoteCh := make(chan string, 1)
+	name := "donmai-pty-name-proof-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	ctx, cancel := context.WithTimeout(t.Context(), 30*time.Second)
+	defer cancel()
+	h, err := SpawnInteractive(ctx, Options{
+		CodexBin:         binary,
+		configTempDir:    configParent,
+		HandshakeTimeout: 20 * time.Second,
+		RPCTimeout:       10 * time.Second,
+		interactiveNameServerStarted: func(remoteURL string) {
+			remoteCh <- remoteURL
+		},
+	}, agent.Spec{
+		SessionName: name,
+		Cwd:         cwd,
+		Env:         map[string]string{"OPENAI_API_KEY": "integration-fixture"},
+		Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 30},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform",
+			Type: "http",
+			URL:  "https://platform.example/api/mcp/session",
+			Headers: map[string]string{
+				"Authorization": "Bearer session-fixture",
+			},
+		}},
+	})
+	if err != nil {
+		t.Fatalf("SpawnInteractive named PTY: %v", err)
+	}
+	stopped := false
+	t.Cleanup(func() {
+		if !stopped {
+			_ = h.Stop(context.Background())
+		}
+	})
+	interactive, ok := h.(agent.InteractiveCapable)
+	if !ok {
+		t.Fatal("named Codex spawn did not return an interactive handle")
+	}
+	var remoteURL string
+	select {
+	case remoteURL = <-remoteCh:
+	case <-ctx.Done():
+		t.Fatalf("named app-server endpoint was never prepared: %v", ctx.Err())
+	}
+	if !strings.HasPrefix(remoteURL, "unix://") {
+		t.Fatalf("remote URL = %q, want unix://", remoteURL)
+	}
+	socketDir := filepath.Dir(strings.TrimPrefix(remoteURL, "unix://"))
+	if _, err := os.Stat(socketDir); err != nil {
+		t.Fatalf("named app-server socket directory is not live before PTY attach: %v", err)
+	}
+
+	sub, err := interactive.InteractiveSession().Subscribe(0)
+	if err != nil {
+		t.Fatalf("subscribe PTY: %v", err)
+	}
+	defer func() { _ = sub.Close() }()
+	sawOutput := false
+	for !sawOutput {
+		select {
+		case frame, ok := <-sub.Frames():
+			if !ok {
+				t.Fatal("named Codex PTY closed before rendering the resumed TUI")
+			}
+			if frame.Type == attachwire.TypeExit {
+				t.Fatal("named Codex PTY exited before the resumed TUI was ready")
+			}
+			if frame.Type == attachwire.TypeOutput && len(frame.Payload) > 0 {
+				sawOutput = true
+			}
+		case <-ctx.Done():
+			t.Fatalf("named Codex PTY produced no resumed-TUI output: %v", ctx.Err())
+		}
+	}
+	select {
+	case <-interactive.InteractiveSession().Done():
+		t.Fatal("named Codex PTY exited immediately after rendering; native resume attach did not stay live")
+	case <-time.After(250 * time.Millisecond):
+	}
+
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer stopCancel()
+	if err := h.Stop(stopCtx); err != nil {
+		t.Fatalf("stop named Codex PTY: %v", err)
+	}
+	stopped = true
+	if _, err := os.Stat(socketDir); !os.IsNotExist(err) {
+		t.Fatalf("named app-server socket directory survived PTY Stop: err=%v", err)
+	}
+	entries, err := os.ReadDir(configParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("interactive config home survived PTY Stop: %v", entries)
+	}
 }
 
 func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.T) {

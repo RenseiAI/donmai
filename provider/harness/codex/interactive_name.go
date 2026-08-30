@@ -134,6 +134,9 @@ func startNamedInteractiveAppServer(
 	if _, err := createAndVerifyNamedThreadWithRequest(setupCtx, spec, client.request, rpcTimeout); err != nil {
 		return nil, errors.Join(err, server.close())
 	}
+	if opts.interactiveNameServerStarted != nil {
+		opts.interactiveNameServerStarted(server.remoteURL)
+	}
 	return server, nil
 }
 
