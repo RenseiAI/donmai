@@ -1724,6 +1724,17 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			evidence: entry.adoption,
 			receipt:  cloneSessionShimAdoptionReceipt(entry.adoptionReceipt),
 		}
+		// This entry is unconditionally in d.shims.adopted from this line on
+		// — nothing later in this function ever removes it again, even if a
+		// later step here fails and the whole call returns an error — so its
+		// eventual termination is already guaranteed to run through
+		// finishAdoptedShim (or a later reconciliation pass), which disposes
+		// of the log file and, by removing it, stops this goroutine. Without
+		// this, a daemon restart would silently stop enforcing the redaction
+		// scrub and the 4 MiB cap for every shim that outlives it — exactly
+		// the shim-outlives-daemon case startShimProcess's own doc comment
+		// cites as the reason this file is captured this way at all.
+		go runShimChildLogGuard(shimChildLogPath(registry.Dir(), id))
 		c := entry.controller
 		if resumeFrom := c.ResumeFrom(); resumeFrom > 0 {
 			// ResumeFrom is exactly last_forwarded_seq + 1. Seed the replacement

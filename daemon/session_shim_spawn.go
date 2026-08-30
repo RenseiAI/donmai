@@ -156,9 +156,28 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		return nil, err
 	}
 	// The guard runs for as long as the log file exists (guardShimChildLogOnce
-	// self-terminates the loop once removeShimChildLog disposes of it at
-	// terminal cleanup) — no cancellation plumbing needed here.
-	go runShimChildLogGuard(shimChildLogPath(launch.RegistryDir, launch.Identity))
+	// self-terminates the loop once removeShimChildLog disposes of it) — no
+	// cancellation plumbing needed for the ordinary adopted-and-terminated
+	// case, where removeShimChildLog runs at the SAME terminal cleanup that
+	// withdraws the discovery record and tombstone.
+	//
+	// launchAdopted covers every OTHER exit from this function: every
+	// early-return failure path below this point (awaitShimRecord, Dial,
+	// adoption evidence, durable publication, batch commit, revision
+	// retention, …) leaves this session NEVER entering d.shims.adopted, so
+	// none of finishAdoptedShim / the startup adoption pass / the
+	// quarantine reconciliation pass will ever run for it — nothing else
+	// would otherwise dispose of this log file or stop this goroutine, ever.
+	// Once trackLaunchedShim below hands the session to the ordinary
+	// adopted-session lifecycle, this defer becomes a no-op.
+	logPath := shimChildLogPath(launch.RegistryDir, launch.Identity)
+	launchAdopted := false
+	defer func() {
+		if !launchAdopted {
+			removeShimChildLog(launch.RegistryDir, launch.Identity)
+		}
+	}()
+	go runShimChildLogGuard(logPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
 	defer cancel()
@@ -354,6 +373,14 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	d.shims.mu.Unlock()
 
 	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, layout.Root.String(), evidence, receipt, false)
+	// The session is now in d.shims.adopted: its eventual termination runs
+	// through finishAdoptedShim (or, across a daemon restart, the startup
+	// adoption / quarantine reconciliation passes), which disposes of the
+	// log file and — by removing it — stops the guard goroutine started
+	// above. Everything from here on can still return a non-nil handle with
+	// a nil error even after a "degraded" publication/activation hiccup
+	// (see below); none of that changes who now owns this log's lifecycle.
+	launchAdopted = true
 	gate.finish(true)
 	if cfg.OnAdoptionPublished != nil {
 		d.shims.mu.RLock()
@@ -609,12 +636,22 @@ func redactShimChildLog(f *os.File, size int64) error {
 }
 
 // capShimChildLog truncates f back to shimChildLogCapBytes and appends one
-// truncation marker line when size exceeds the cap. Truncate is a
-// metadata-only size change (it never rewrites bytes [0,shimChildLogCapBytes)),
-// so — like redactShimChildLog — it never races the child's own concurrent
-// O_APPEND writes: the child's next write() always seeks to whatever the
-// current end-of-file is at that moment, exactly the same guarantee
-// O_APPEND gives this function's own marker write.
+// truncation marker line when size exceeds the cap.
+//
+// Truncate is a metadata-only size change — it never rewrites bytes
+// [0,shimChildLogCapBytes) — so, like redactShimChildLog, it never races the
+// child's own concurrent O_APPEND writes.
+//
+// The marker write is a SEPARATE fd opened O_APPEND specifically for this
+// write, not f.Seek(END)+f.Write on f itself: f is opened O_RDWR without
+// O_APPEND (guardShimChildLogOnce), so a plain Seek+Write is two syscalls —
+// a concurrent append from the child's own O_APPEND fd landing between them
+// would move the true end-of-file out from under the Seek's result, and
+// this function's Write would then land at that now-stale offset and
+// OVERWRITE the child's just-appended bytes instead of following them. A
+// fresh O_APPEND-opened fd makes the marker write one atomic
+// seek-to-current-EOF-then-write kernel operation, exactly the same
+// guarantee the child's own writes already rely on.
 func capShimChildLog(f *os.File, size int64) error {
 	if size <= shimChildLogCapBytes {
 		return nil
@@ -622,10 +659,12 @@ func capShimChildLog(f *os.File, size int64) error {
 	if err := f.Truncate(shimChildLogCapBytes); err != nil {
 		return err
 	}
-	if _, err := f.Seek(0, io.SeekEnd); err != nil {
+	appendFile, err := os.OpenFile(f.Name(), os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: f.Name() is this daemon's own already-open handle's path, never external input
+	if err != nil {
 		return err
 	}
-	_, err := f.Write([]byte(fmt.Sprintf(shimChildLogTruncationMarkerFormat, size, shimChildLogCapBytes)))
+	defer func() { _ = appendFile.Close() }()
+	_, err = appendFile.Write([]byte(fmt.Sprintf(shimChildLogTruncationMarkerFormat, size, shimChildLogCapBytes)))
 	return err
 }
 
