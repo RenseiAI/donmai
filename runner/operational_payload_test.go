@@ -19,7 +19,7 @@ import (
 func fullOperationalFixture() QueuedWork {
 	qw := exactReceiptQueuedWork("session_operational_fixture")
 	qw.QueuedWork = prompt.QueuedWork{
-		SessionID: "session_operational_fixture", IssueID: "issue-id", IssueIdentifier: "fixture-2034",
+		SessionID: "session_operational_fixture", SessionName: "chief-of-staff", IssueID: "issue-id", IssueIdentifier: "fixture-2034",
 		LinearSessionID: "linear-session", ProviderSessionID: "provider-session", ProjectName: "Donmai",
 		OrganizationID: "org-id", Repository: "RenseiAI/donmai", Ref: "refs/heads/main", WorkType: "development",
 		PromptContext: "prompt context", Body: "issue body", Title: "issue title", MentionContext: "mention",
@@ -72,7 +72,7 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 		"allowedTools", "body", "branch", "codeIntel", "disallowedTools", "initialPrompt", "interviewBudget",
 		"interviewDefinition", "issueId", "issueIdentifier", "kits", "linearSessionId", "mcpServers", "memoryBlock",
 		"mentionContext", "mode", "organizationId", "parentContext", "projectName", "promptContext", "providerSessionId",
-		"ref", "repository", "resolvedProfile", "sessionId", "skills", "stageBudget", "stageId", "stageLifecycle",
+		"ref", "repository", "resolvedProfile", "sessionId", "sessionName", "skills", "stageBudget", "stageId", "stageLifecycle",
 		"stagePrompt", "stageSourceEventId", "systemPromptOverride", "terminalWorkareaLease", "title", "workType",
 	}
 	if fmt.Sprint(actualKeys) != fmt.Sprint(expectedKeys) {
@@ -82,7 +82,7 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const architectureDigest = "7a026971ca9122a365025bb655c87469c639aa582cc1c257f2d906c76df707fe"
+	const architectureDigest = "897ad0e2769f774d75cd941ad15274536841ac19174fd0d0fad9342c09cbfd07"
 	if digest != architectureDigest {
 		t.Fatalf("architecture digest = %q, want %q; canonical=%s", digest, architectureDigest, canonical)
 	}

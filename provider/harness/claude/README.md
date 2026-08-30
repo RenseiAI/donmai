@@ -15,7 +15,7 @@ F.1.1 §10.
 |---|---|
 | `doc.go` | Package overview + capability table + failure-mode notes |
 | `claude.go` | `Provider` struct, `New(Options)` constructor, fail-fast probe |
-| `cli_args.go` | `Spec → []string` translator covering all 19 Spec fields |
+| `cli_args.go` | `Spec → []string` translator accounting for every Spec field |
 | `mcp.go` | Per-session MCP `--mcp-config` JSON tmpfile writer + cleanup |
 | `jsonl.go` | JSONL → `agent.Event` mapper (port of legacy `mapSDKMessage`) |
 | `handle.go` | `Handle` struct: subprocess lifecycle, events channel, Stop |
@@ -195,7 +195,7 @@ Test inventory (per cardinal rule 10):
 
 - `claude_test.go` — `New()` happy/binary-missing, capability matrix,
   Resume/Inject unsupported, Shutdown no-op.
-- `cli_args_test.go` — `buildArgs` covers all 19 Spec fields,
+- `cli_args_test.go` — `buildArgs` accounts for every Spec field,
   Linear MCP block list gating on `Autonomous`, deduplication, env
   composition determinism.
 - `mcp_test.go` — tmpfile write happy path, idempotent cleanup,

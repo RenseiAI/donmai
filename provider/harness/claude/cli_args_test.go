@@ -40,6 +40,7 @@ func TestBuildArgs_AllSpecFields(t *testing.T) {
 
 	maxTurns := 7
 	spec := agent.Spec{
+		SessionName:        "chief-of-staff",
 		Prompt:             "implement ENG-1",
 		Cwd:                "/tmp/work",
 		Env:                map[string]string{"FOO": "bar"},
@@ -76,6 +77,7 @@ func TestBuildArgs_AllSpecFields(t *testing.T) {
 		flag, val string
 	}
 	expectedPairs := []want{
+		{"--name", "chief-of-staff"},
 		{"--add-dir", "/tmp/work"},
 		{"--model", "claude-sonnet-4-7"},
 		{"--max-turns", "7"},

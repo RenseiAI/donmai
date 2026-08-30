@@ -12,10 +12,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 // openai-chat per its Drives). No wire-level SSE/ndjson framing — the
 // app-server is the transport surface, so StreamingTransport is "none".
 //
-// SupportsInteractivePTY (W4) declares an ADDITIONAL spawn mode: bare
-// `codex` under a PTY (interactive.go: SpawnInteractive), entirely
-// independent of the app-server subprocess above — NOT a change to the
-// declared Transport. Transport names how the DEFAULT headless loop runs
+// SupportsInteractivePTY (W4) declares an ADDITIONAL spawn mode: the codex TUI
+// under a PTY (interactive.go: SpawnInteractive), independent of the shared
+// headless app-server above. Named PTY sessions own a bounded per-session
+// app-server used only for native thread naming and TUI attach. This is NOT a
+// change to the declared Transport. Transport names how the DEFAULT headless loop runs
 // (subprocess-jsonrpc, unchanged); TransportPTY is used only where PTY is a
 // harness's ONLY transport (see provider/harness/shell/manifest.go) — codex
 // keeps subprocess-jsonrpc here and gets PTY strictly as a per-Spawn-call
