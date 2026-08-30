@@ -4,6 +4,8 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"io"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -50,7 +52,7 @@ func TestClientCoreMethodsUseV1WireAndRotatingAuthorization(t *testing.T) {
 	client, err := NewClientFromCard(AgentCard{
 		SupportedInterfaces: []AgentInterface{
 			{URL: "https://legacy.invalid", ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: "0.3"},
-			{URL: server.URL, ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: "1.0", Tenant: "seat-7"},
+			{URL: server.URL, ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: "1.0.7", Tenant: "seat-7"},
 		},
 		Capabilities: AgentCapabilities{Extensions: []AgentExtension{{URI: "https://example.test/ext/v1"}}},
 	}, WithTenant("forged-seat"), WithExtensions("https://example.test/ext/v1"), WithAuthorizationProvider(func(context.Context) (string, error) {
@@ -208,8 +210,38 @@ func TestSendMessageParsesDirectMessageOneof(t *testing.T) {
 	if err != nil {
 		t.Fatalf("SendMessage: %v", err)
 	}
-	if response.Task != nil || response.Message == nil || response.Message.Role != RoleAgent || response.Message.Parts[0].Text == nil || *response.Message.Parts[0].Text != "ready" {
+	if response.Task != nil || response.Message == nil {
 		t.Fatalf("response = %+v, want direct agent Message", response)
+	}
+	text, isText := response.Message.Parts[0].Text()
+	if response.Message.Role != RoleAgent || !isText || text != "ready" {
+		t.Fatalf("response = %+v, want direct agent Message", response)
+	}
+}
+
+func TestClientSelectsOnlyCompatibleMajorMinorVersions(t *testing.T) {
+	t.Parallel()
+	for _, version := range []string{"1.0", "1.0.0", "1.0.27"} {
+		version := version
+		t.Run("accept_"+version, func(t *testing.T) {
+			client, err := NewClientFromCard(AgentCard{SupportedInterfaces: []AgentInterface{{
+				URL: "https://agent.example/rpc", ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: version,
+			}}})
+			if err != nil || client == nil {
+				t.Fatalf("NewClientFromCard(%q) = (%v, %v), want accepted", version, client, err)
+			}
+		})
+	}
+	for _, version := range []string{"0.3", "1.1", "2.0", "1", "1.0.", "1.0.0-rc1"} {
+		version := version
+		t.Run("refuse_"+version, func(t *testing.T) {
+			_, err := NewClientFromCard(AgentCard{SupportedInterfaces: []AgentInterface{{
+				URL: "https://agent.example/rpc", ProtocolBinding: ProtocolBindingJSONRPC, ProtocolVersion: version,
+			}}})
+			if err == nil {
+				t.Fatalf("NewClientFromCard(%q) succeeded, want refusal", version)
+			}
+		})
 	}
 }
 
@@ -238,6 +270,63 @@ func TestClientRejectsMismatchedResponseIDAndHTTPFailure(t *testing.T) {
 		var transportErr *TransportError
 		if !errors.As(err, &transportErr) || transportErr.StatusCode != http.StatusServiceUnavailable {
 			t.Fatalf("error = %#v, want HTTP TransportError", err)
+		}
+	})
+}
+
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(request *http.Request) (*http.Response, error) {
+	return f(request)
+}
+
+type errorReader struct{ err error }
+
+func (r errorReader) Read([]byte) (int, error) { return 0, r.err }
+
+func TestClientWrapsTransportIOFailuresAndPreservesCause(t *testing.T) {
+	t.Parallel()
+	t.Run("connection refusal", func(t *testing.T) {
+		listener, err := net.Listen("tcp", "127.0.0.1:0")
+		if err != nil {
+			t.Fatalf("Listen: %v", err)
+		}
+		address := listener.Addr().String()
+		_ = listener.Close()
+		client, _ := NewClient("http://" + address)
+		_, err = client.GetTask(context.Background(), GetTaskRequest{ID: "task-1"})
+		var transportErr *TransportError
+		var operationErr *net.OpError
+		if !errors.As(err, &transportErr) || !errors.As(err, &operationErr) {
+			t.Fatalf("error = %#v, want TransportError wrapping net.OpError", err)
+		}
+	})
+
+	t.Run("context cancellation", func(t *testing.T) {
+		client, _ := NewClient("https://agent.example/rpc")
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		_, err := client.GetTask(ctx, GetTaskRequest{ID: "task-1"})
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || !errors.Is(err, context.Canceled) {
+			t.Fatalf("error = %#v, want TransportError preserving context.Canceled", err)
+		}
+	})
+
+	t.Run("response read", func(t *testing.T) {
+		readErr := errors.New("fixture read failed")
+		httpClient := &http.Client{Transport: roundTripFunc(func(*http.Request) (*http.Response, error) {
+			return &http.Response{
+				StatusCode: http.StatusOK,
+				Header:     make(http.Header),
+				Body:       io.NopCloser(errorReader{err: readErr}),
+			}, nil
+		})}
+		client, _ := NewClient("https://agent.example/rpc", WithHTTPClient(httpClient))
+		_, err := client.GetTask(context.Background(), GetTaskRequest{ID: "task-1"})
+		var transportErr *TransportError
+		if !errors.As(err, &transportErr) || !errors.Is(err, readErr) {
+			t.Fatalf("error = %#v, want TransportError preserving read cause", err)
 		}
 	})
 }
@@ -291,7 +380,7 @@ func TestSendMessageRejectsMalformedOneofResponse(t *testing.T) {
 	client, _ := NewClient(server.URL)
 	_, err := client.SendMessage(context.Background(), SendMessageRequest{Message: Message{MessageID: "message-1", Role: RoleUser, Parts: []Part{DataPart(map[string]any{"hello": "world"})}}})
 	var transportErr *TransportError
-	if !errors.As(err, &transportErr) || !strings.Contains(err.Error(), "exactly one") {
+	if !errors.As(err, &transportErr) || !strings.Contains(err.Error(), "expected A2A response") {
 		t.Fatalf("error = %#v, want malformed-oneof TransportError", err)
 	}
 }

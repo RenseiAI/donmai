@@ -67,24 +67,71 @@ func (s TaskState) StopsPolling() bool {
 	}
 }
 
-// Part is one unit of message or artifact content. Exactly one of Text, Raw,
-// URL, or Data should be present. Pointers retain the oneof distinction when a
-// valid value is the type's zero value.
+// PartKind identifies the active member of Part's content oneof.
+type PartKind uint8
+
+const (
+	// PartKindUnspecified indicates that no content member is active.
+	PartKindUnspecified PartKind = iota
+	// PartKindText identifies string content.
+	PartKindText
+	// PartKindRaw identifies base64-encoded bytes content.
+	PartKindRaw
+	// PartKindURL identifies URL-addressed content.
+	PartKindURL
+	// PartKindData identifies arbitrary structured JSON content.
+	PartKindData
+)
+
+// Part is one unit of message or artifact content. Its content member is a
+// discriminated oneof and can only be set through a constructor or ProtoJSON
+// decoding, so a Go value cannot emit multiple content arms.
 type Part struct {
-	Text      *string        `json:"text,omitempty"`
-	Raw       *[]byte        `json:"raw,omitempty"`
-	URL       *string        `json:"url,omitempty"`
-	Data      *any           `json:"data,omitempty"`
-	Metadata  map[string]any `json:"metadata,omitempty"`
-	Filename  string         `json:"filename,omitempty"`
-	MediaType string         `json:"mediaType,omitempty"`
+	kind      PartKind
+	text      string
+	raw       []byte
+	url       string
+	data      any
+	Metadata  map[string]any
+	Filename  string
+	MediaType string
 }
 
 // TextPart constructs a text content part.
-func TextPart(text string) Part { return Part{Text: &text} }
+func TextPart(text string) Part { return Part{kind: PartKindText, text: text} }
+
+// RawPart constructs a raw bytes content part.
+func RawPart(raw []byte) Part {
+	return Part{kind: PartKindRaw, raw: append([]byte{}, raw...)}
+}
+
+// URLPart constructs a URL-addressed content part.
+func URLPart(url string) Part { return Part{kind: PartKindURL, url: url} }
 
 // DataPart constructs a structured data content part.
-func DataPart(data any) Part { return Part{Data: &data} }
+// A nil value is an active data arm and emits as `"data": null`.
+func DataPart(data any) Part { return Part{kind: PartKindData, data: data} }
+
+// Kind reports the active content member.
+func (p Part) Kind() PartKind { return p.kind }
+
+// Text returns text content when that arm is active.
+func (p Part) Text() (string, bool) { return p.text, p.kind == PartKindText }
+
+// Raw returns a copy of raw content when that arm is active.
+func (p Part) Raw() ([]byte, bool) {
+	if p.kind != PartKindRaw {
+		return nil, false
+	}
+	return append([]byte(nil), p.raw...), true
+}
+
+// URL returns URL content when that arm is active.
+func (p Part) URL() (string, bool) { return p.url, p.kind == PartKindURL }
+
+// Data returns structured content when that arm is active. The boolean
+// distinguishes an active JSON null from an unspecified Part.
+func (p Part) Data() (any, bool) { return p.data, p.kind == PartKindData }
 
 // Message is one unit of communication between a client and an agent.
 type Message struct {
@@ -112,7 +159,7 @@ type Artifact struct {
 type TaskStatus struct {
 	State     TaskState `json:"state"`
 	Message   *Message  `json:"message,omitempty"`
-	Timestamp string    `json:"timestamp,omitempty"`
+	Timestamp Timestamp `json:"timestamp,omitempty"`
 }
 
 // Task is the protocol's core unit of action.
@@ -127,9 +174,10 @@ type Task struct {
 
 // SendMessageConfiguration controls synchronous versus asynchronous return.
 type SendMessageConfiguration struct {
-	AcceptedOutputModes []string `json:"acceptedOutputModes,omitempty"`
-	HistoryLength       *int32   `json:"historyLength,omitempty"`
-	ReturnImmediately   bool     `json:"returnImmediately,omitempty"`
+	AcceptedOutputModes        []string        `json:"acceptedOutputModes,omitempty"`
+	TaskPushNotificationConfig json.RawMessage `json:"taskPushNotificationConfig,omitempty"`
+	HistoryLength              *int32          `json:"historyLength,omitempty"`
+	ReturnImmediately          bool            `json:"returnImmediately,omitempty"`
 }
 
 // SendMessageRequest starts or continues an interaction.
@@ -167,7 +215,7 @@ type ListTasksRequest struct {
 	PageSize             *int32    `json:"pageSize,omitempty"`
 	PageToken            string    `json:"pageToken,omitempty"`
 	HistoryLength        *int32    `json:"historyLength,omitempty"`
-	StatusTimestampAfter string    `json:"statusTimestampAfter,omitempty"`
+	StatusTimestampAfter Timestamp `json:"statusTimestampAfter,omitempty"`
 	IncludeArtifacts     *bool     `json:"includeArtifacts,omitempty"`
 }
 
@@ -258,7 +306,12 @@ func (e *RPCError) Error() string {
 type TransportError struct {
 	StatusCode int
 	Message    string
+	Cause      error
 }
+
+// Unwrap preserves cancellation, deadline, DNS, connection, and body-read
+// causes for errors.Is/errors.As callers.
+func (e *TransportError) Unwrap() error { return e.Cause }
 
 func (e *TransportError) Error() string {
 	if e.StatusCode == 0 {

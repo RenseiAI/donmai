@@ -136,11 +136,12 @@ func NewClient(endpoint string, options ...Option) (*Client, error) {
 	return c, nil
 }
 
-// NewClientFromCard selects the first preferred JSONRPC v1.0 interface. A
-// card without that exact interface is refused instead of silently degrading.
+// NewClientFromCard selects the first preferred JSONRPC v1.0-compatible
+// interface. Patch suffixes are accepted but the wire header remains 1.0. A
+// card without that major/minor interface is refused instead of degrading.
 func NewClientFromCard(card AgentCard, options ...Option) (*Client, error) {
 	for _, candidate := range card.SupportedInterfaces {
-		if candidate.ProtocolBinding != ProtocolBindingJSONRPC || candidate.ProtocolVersion != ProtocolVersion {
+		if candidate.ProtocolBinding != ProtocolBindingJSONRPC || !supportsProtocolVersion(candidate.ProtocolVersion) {
 			continue
 		}
 		client, err := NewClient(candidate.URL, options...)
@@ -296,12 +297,12 @@ func (c *Client) call(ctx context.Context, method string, params any, target any
 
 	response, err := c.httpClient.Do(req)
 	if err != nil {
-		return fmt.Errorf("a2a %s: send request: %w", method, err)
+		return &TransportError{Message: "send request failed", Cause: err}
 	}
 	defer func() { _ = response.Body.Close() }()
 	raw, err := io.ReadAll(io.LimitReader(response.Body, maxResponseBytes+1))
 	if err != nil {
-		return fmt.Errorf("a2a %s: read response: %w", method, err)
+		return &TransportError{StatusCode: response.StatusCode, Message: "read response failed", Cause: err}
 	}
 	if len(raw) > maxResponseBytes {
 		return &TransportError{StatusCode: response.StatusCode, Message: "response exceeded 4 MiB"}
@@ -311,7 +312,7 @@ func (c *Client) call(ctx context.Context, method string, params any, target any
 	}
 
 	var envelope responseEnvelope
-	if err := json.Unmarshal(raw, &envelope); err != nil {
+	if err := unmarshalStrict(raw, &envelope); err != nil {
 		return &TransportError{StatusCode: response.StatusCode, Message: "response was not valid JSON-RPC JSON"}
 	}
 	if envelope.JSONRPC != "2.0" {
@@ -332,6 +333,28 @@ func (c *Client) call(ctx context.Context, method string, params any, target any
 		return &TransportError{StatusCode: response.StatusCode, Message: "result did not match the expected A2A response"}
 	}
 	return nil
+}
+
+func supportsProtocolVersion(version string) bool {
+	parts := strings.Split(version, ".")
+	if len(parts) != 2 && len(parts) != 3 {
+		return false
+	}
+	if parts[0] != "1" || parts[1] != "0" {
+		return false
+	}
+	if len(parts) == 2 {
+		return true
+	}
+	if parts[2] == "" {
+		return false
+	}
+	for _, digit := range parts[2] {
+		if digit < '0' || digit > '9' {
+			return false
+		}
+	}
+	return true
 }
 
 func withTenant(tenant string, value any) (map[string]any, error) {
