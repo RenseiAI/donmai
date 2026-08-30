@@ -593,10 +593,24 @@ func guardShimChildLogOnce(logPath string) bool {
 	}
 	size := info.Size()
 	if err := redactShimChildLog(f, size); err != nil {
-		slog.Warn("session shim: redact child log", "path", logPath, "error", err)
+		// logPath is this daemon's own registry directory plus a
+		// digest-named file (shimChildLogPath) — never external input —
+		// but gosec's taint analysis (G706) cannot see that provenance
+		// through the call chain, so it flags the structured field the
+		// same way every other slog call in this package that logs a
+		// daemon-owned path already does; see e.g.
+		// kit_registry.go's "kit registry: read scan path" for the same
+		// precedent.
+		slog.Warn("session shim: redact child log", //nolint:gosec // structured slog handler escapes values
+			"path", logPath,
+			"error", err,
+		)
 	}
 	if err := capShimChildLog(f, size); err != nil {
-		slog.Warn("session shim: cap child log", "path", logPath, "error", err)
+		slog.Warn("session shim: cap child log", //nolint:gosec // structured slog handler escapes values
+			"path", logPath,
+			"error", err,
+		)
 	}
 	return true
 }
