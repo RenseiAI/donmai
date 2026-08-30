@@ -6,6 +6,22 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **Interactive Codex sessions now use their platform-minted session MCP
+  authority exclusively.** Each on-platform PTY launch receives a private,
+  lifecycle-bound `CODEX_HOME` with an explicit empty MCP baseline;
+  file-backed Codex login is projected into it without copying the operator's
+  configuration. Ambient or
+  work-item-supplied Codex homes can therefore no longer add a second platform
+  server carrying an external requester registration, stale organization, or
+  stale project beside the runner-authored `/api/mcp/<sessionId>` server. The
+  private home is removed on spawn failure, child exit, cancellation, or stop.
+  Claude's existing per-session `--mcp-config --strict-mcp-config` boundary is
+  unchanged.
+
 ## v0.72.4 — 2026-08-30
 
 ### Fixes

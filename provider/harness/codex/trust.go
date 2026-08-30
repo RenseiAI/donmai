@@ -56,12 +56,14 @@ import (
 //
 // # Why overrides rather than writes
 //
-// The interactive spawn mode deliberately runs against the operator's ambient
-// codex home (that is where its authentication lives), so every seed here is a
-// process-local `--config` override — a `sessionFlags` configuration layer in
-// codex's own vocabulary. Nothing on this path reads, copies, or writes the
-// operator's `config.toml`: a trust decision the platform made for one session
-// must not outlive that session or accumulate in a file the operator owns.
+// The on-platform interactive spawn mode runs against a private,
+// process-owned CODEX_HOME; file-backed authentication is hard-linked into
+// that boundary without ever copying the operator's config.toml. Every seed
+// here is still a process-local `--config` override — a `sessionFlags`
+// configuration layer in codex's own vocabulary — so a trust decision the
+// platform made for one session cannot outlive that session or accumulate in a
+// file the operator owns. Standalone interactive use retains its historical
+// ambient configuration.
 //
 // One consequence is deliberate and worth stating: the `projects` override
 // SHADOWS the ambient projects table for this process, so the session's trusted

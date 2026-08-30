@@ -5,8 +5,10 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
@@ -68,8 +70,83 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	if !hasPlatformSessionMCPAuthority(spec.MCPServers) {
+		spec.Env = launch.env
+		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
+	}
+	config, err := newInteractiveCodexConfigBoundary(opts.configTempDir)
+	if err != nil {
+		return nil, fmt.Errorf("%w: isolate codex interactive config: %v", agent.ErrSpawnFailed, err)
+	}
+	if launch.env == nil {
+		launch.env = make(map[string]string)
+	}
+	// CODEX_HOME is runner-owned for this process. Overwrite both an ambient
+	// value and a value supplied through Spec.Env: either one may contain a
+	// caller-global MCP server carrying an external requester registration.
+	// The selected session's MCP server and bearer remain in the process-local
+	// --config override built above, while the private config.toml starts from
+	// an explicit empty mcp_servers table.
+	launch.env["CODEX_HOME"] = config.home
 	spec.Env = launch.env
-	return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
+	return ptycli.SpawnWithCleanup(
+		ctx,
+		bin,
+		launch.argv,
+		spec,
+		(&Provider{}).Manifest(),
+		config.remove,
+	)
+}
+
+// hasPlatformSessionMCPAuthority identifies the reserved gateway entry the
+// runner prepends for a platform-launched session. Standalone interactive use
+// retains its historical ambient Codex configuration; only the session shape
+// carrying the runner-owned authority needs the exclusive boundary.
+func hasPlatformSessionMCPAuthority(servers []agent.MCPServerConfig) bool {
+	if len(servers) == 0 {
+		return false
+	}
+	gateway := servers[0]
+	return strings.EqualFold(strings.TrimSpace(gateway.Type), "http") &&
+		strings.HasSuffix(strings.TrimSpace(gateway.Name), "-platform") &&
+		strings.Contains(gateway.URL, "/api/mcp/")
+}
+
+// newInteractiveCodexConfigBoundary creates the same exclusive user-config
+// boundary used by the headless app-server lane. If the host login is
+// file-backed, its auth.json inode is projected into the private home; no
+// config.toml, project table, MCP server, or header mapping is copied. Hosts
+// authenticated through an environment variable or the OS credential store
+// have no auth.json to project and still receive the empty private config.
+func newInteractiveCodexConfigBoundary(tempDir string) (*codexConfigBoundary, error) {
+	hostAuthFile, err := resolveHostSessionAuthFile()
+	if err != nil {
+		return nil, err
+	}
+	_, statErr := os.Lstat(hostAuthFile)
+	fileAuth := statErr == nil
+	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
+		return nil, fmt.Errorf("inspect host codex auth: %w", statErr)
+	}
+
+	boundaryParent := tempDir
+	if fileAuth && boundaryParent == "" {
+		// A hard link cannot cross filesystems. Keeping the private directory
+		// beside the host credential makes the projection portable to hosts
+		// whose system temp directory is a separate mount.
+		boundaryParent = filepath.Dir(hostAuthFile)
+	}
+	boundary, err := newCodexConfigBoundary(boundaryParent, fileAuth)
+	if err != nil {
+		return nil, err
+	}
+	if fileAuth {
+		if err := boundary.linkHostSessionAuth(hostAuthFile); err != nil {
+			return nil, errors.Join(err, boundary.remove())
+		}
+	}
+	return boundary, nil
 }
 
 type interactiveLaunch struct {
@@ -90,10 +167,12 @@ func interactiveArgs(spec agent.Spec) []string {
 }
 
 // buildInteractiveLaunch projects requested MCP servers into one process-local
-// Codex CLI override. Codex recursively merges ambient user MCP configuration
-// and bare interactive mode has no ignore-user-config switch, so this proves
-// requested per-process delivery but deliberately does not claim exclusive MCP
-// isolation.
+// Codex CLI override. For a platform-launched session,
+// spawnInteractivePrepared points the child at a private CODEX_HOME whose
+// config starts with `mcp_servers = {}`, so the effective MCP set is
+// exclusively the servers in this override. The host's persistent user and
+// project configuration never participates in that session. Standalone
+// interactive use retains its historical ambient configuration.
 //
 // It also seeds the startup trust codex would otherwise raise a modal review
 // for — see trust.go, which owns that decision and the rule for what may be
