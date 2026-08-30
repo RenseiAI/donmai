@@ -6,6 +6,56 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.4 — 2026-08-30
+
+### Fixes
+
+- **A live session can no longer delete the harness state directory it is
+  running out of.** A seat ran `git status`, saw the harness's own session
+  state directory reported as untracked, deleted it, and the live session ran
+  on against paths that no longer existed — no error, no terminal event, just
+  "Working…" forever. Both halves of that are closed, because either one alone
+  leaves the loss reachable. Enforcement: the bash adjudicator now refuses, as
+  a built-in rule no allow pattern can override, any command that deletes or
+  moves away the session state directory or anything inside it —
+  `rm`/`rmdir`/`unlink`/`shred`, a `mv` whose source is inside it, a `find`
+  rooted at it with a deleting action, and a forced `git clean` that names it
+  or sweeps the whole worktree. Compound one-liners are split into segments
+  first: the observed loss hid its deletion in the third of four. The refusal
+  text says what the directory is and that the harness reads it for the
+  session's life, so the model learns the constraint rather than just hitting a
+  wall. Motive: materializing a session's state now appends the state directory
+  to the checkout's own git exclude file, resolved through `git rev-parse
+  --git-path info/exclude` so a linked worktree gets the file git actually
+  reads — idempotent however many sessions start, never touching the tracked
+  `.gitignore`, a silent no-op outside a git checkout, and best-effort, because
+  git hygiene must not be able to fail a spawn. Stated limit: the adjudicator
+  runs only on the headless lane; the interactive PTY lane has no round trip by
+  design, so there the exclude — not the deny — is what keeps the directory
+  from reading as deletable junk.
+
+- **Every harness's state directory is excluded at provision, and the backstop
+  unstages all of them.** Two lists were deciding what counts as harness state
+  and neither knew about the other: the backstop's top-level unstage list named
+  exactly one directory, and the git exclude named exactly one other. Every
+  other checkout-resident state directory — the project-local configuration a
+  harness CLI writes into its working directory — was eligible for a backstop
+  commit AND showed up as untracked junk, which is the condition that got a
+  live session's storage deleted. `runtime/harnessstate` is now the single
+  source of truth: one table whose rows carry who writes each directory and
+  what is lost with it. The backstop's top-level exclude list is that table,
+  the runner's state-directory constant is that table's runner row, and the pi
+  harness's own constant is its pi row, so the names cannot drift. The exclude
+  writer iterates the whole table and the workarea provision step calls it, so
+  a session's state is quiet in `git status` for every harness, not just the
+  one that happened to be fixed. `.donmai` is deliberately not in the table: it
+  is the repository's own tracked configuration and a session may legitimately
+  edit and commit it — only its generated code-index subdirectory is excluded,
+  and that rule stays where it already lives. A repository-free session still
+  invokes no git at all: provision skips the exclusion for the empty strategy,
+  and the writer answers "not a checkout" structurally, by a `.git` lookup up
+  the tree, before it would spawn anything.
+
 ## v0.72.3 — 2026-08-29
 
 ### Fixes
