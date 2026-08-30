@@ -3,6 +3,7 @@ package sessionshim
 import (
 	"errors"
 	"fmt"
+	"log/slog"
 	"strconv"
 	"time"
 
@@ -246,5 +247,18 @@ func StartFromEnvWithRoot(l Launch, spec ptyhost.Spec, workareaPath, workareaRoo
 		WorkareaRoot: workareaRoot,
 		Orphan:       l.Orphan,
 		ProcessEpoch: l.ProcessEpoch,
+		// Options.logger() defaults to io.Discard when Logger is nil — every
+		// "sessionshim: ..." adoption/orphan/finalize diagnostic this Shim
+		// emits (Close, watchHarness, the terminal-observation path, …) was
+		// therefore silently dropped regardless of where this process's
+		// stdout/stderr pointed. slog.Default() is the ambient logger the
+		// daemon side of this same launch already uses for its own
+		// sessionshim diagnostics (daemon/session_shim_spawn.go's
+		// ControllerOptions.Logger) and the one this process's own
+		// configureLogging (cmd/donmai/main.go) wires to stderr — the same
+		// sink startShimProcess now captures to a per-session log file
+		// instead of discarding, so this Shim's own lifecycle logging is
+		// captured there too rather than staying a separate blind spot.
+		Logger: slog.Default(),
 	})
 }
