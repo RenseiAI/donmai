@@ -74,9 +74,9 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 		spec.Env = launch.env
 		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 	}
-	config, err := newInteractiveCodexConfigBoundary(opts.configTempDir)
+	config, auth, err := newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env)
 	if err != nil {
-		return nil, fmt.Errorf("%w: isolate codex interactive config: %v", agent.ErrSpawnFailed, err)
+		return nil, fmt.Errorf("%w: isolate codex interactive config: %w", agent.ErrSpawnFailed, err)
 	}
 	if launch.env == nil {
 		launch.env = make(map[string]string)
@@ -89,6 +89,29 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 	// an explicit empty mcp_servers table.
 	launch.env["CODEX_HOME"] = config.home
 	spec.Env = launch.env
+	authSeeder := opts.interactiveAuthSeeder
+	if authSeeder == nil {
+		authSeeder = seedInteractiveCodexEnvironmentAuth
+	}
+	if err := authSeeder(ctx, bin, config.home, auth); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+			config.remove(),
+		)
+	}
+	if err := verifyExclusiveInteractiveMCP(
+		ctx,
+		opts.interactiveMCPInventoryRunner,
+		bin,
+		spec,
+		launch,
+		config.home,
+	); err != nil {
+		return nil, errors.Join(
+			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+			config.remove(),
+		)
+	}
 	return ptycli.SpawnWithCleanup(
 		ctx,
 		bin,
@@ -117,36 +140,33 @@ func hasPlatformSessionMCPAuthority(servers []agent.MCPServerConfig) bool {
 // boundary used by the headless app-server lane. If the host login is
 // file-backed, its auth.json inode is projected into the private home; no
 // config.toml, project table, MCP server, or header mapping is copied. Hosts
-// authenticated through an environment variable or the OS credential store
-// have no auth.json to project and still receive the empty private config.
-func newInteractiveCodexConfigBoundary(tempDir string) (*codexConfigBoundary, error) {
-	hostAuthFile, err := resolveHostSessionAuthFile()
+// authenticated through an environment variable are seeded through Codex's
+// own login command into an ephemeral private auth.json. An OS-keyring
+// credential cannot be safely projected to a different CODEX_HOME and is
+// refused before the PTY starts.
+func newInteractiveCodexConfigBoundary(tempDir string, specEnv map[string]string) (*codexConfigBoundary, interactiveCodexAuthProjection, error) {
+	auth, err := resolveInteractiveCodexAuth(specEnv)
 	if err != nil {
-		return nil, err
-	}
-	_, statErr := os.Lstat(hostAuthFile)
-	fileAuth := statErr == nil
-	if statErr != nil && !errors.Is(statErr, os.ErrNotExist) {
-		return nil, fmt.Errorf("inspect host codex auth: %w", statErr)
+		return nil, interactiveCodexAuthProjection{}, err
 	}
 
 	boundaryParent := tempDir
-	if fileAuth && boundaryParent == "" {
+	if auth.kind == interactiveCodexAuthFile && boundaryParent == "" {
 		// A hard link cannot cross filesystems. Keeping the private directory
 		// beside the host credential makes the projection portable to hosts
 		// whose system temp directory is a separate mount.
-		boundaryParent = filepath.Dir(hostAuthFile)
+		boundaryParent = filepath.Dir(auth.hostAuthFile)
 	}
-	boundary, err := newCodexConfigBoundary(boundaryParent, fileAuth)
+	boundary, err := newCodexConfigBoundaryWithAuthMode(boundaryParent, auth.storeMode)
 	if err != nil {
-		return nil, err
+		return nil, interactiveCodexAuthProjection{}, err
 	}
-	if fileAuth {
-		if err := boundary.linkHostSessionAuth(hostAuthFile); err != nil {
-			return nil, errors.Join(err, boundary.remove())
+	if auth.kind == interactiveCodexAuthFile {
+		if err := boundary.linkHostSessionAuth(auth.hostAuthFile); err != nil {
+			return nil, interactiveCodexAuthProjection{}, errors.Join(err, boundary.remove())
 		}
 	}
-	return boundary, nil
+	return boundary, auth, nil
 }
 
 type interactiveLaunch struct {
@@ -231,7 +251,14 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	if err != nil {
 		return interactiveLaunch{}, err
 	}
-	trustArgs, err := interactiveTrustArgs(spec.Cwd, hooks, os.Getwd)
+	trustLevel := codexTrustLevelTrusted
+	if hasPlatformSessionMCPAuthority(spec.MCPServers) {
+		trustLevel = codexTrustLevelUntrusted
+		// An unattended platform session cannot answer Codex's self-update
+		// modal. The fleet upgrades the binary out of band.
+		args = append(args, "--config", "check_for_update_on_startup=false")
+	}
+	trustArgs, err := interactiveTrustArgsWithLevel(spec.Cwd, hooks, trustLevel, os.Getwd)
 	if err != nil {
 		return interactiveLaunch{}, err
 	}

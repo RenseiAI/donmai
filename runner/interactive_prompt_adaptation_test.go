@@ -359,10 +359,22 @@ func TestRun_InteractiveDefaultHTTPMCPReachesCodexCLI(t *testing.T) {
 	}
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
+	t.Setenv("OPENAI_API_KEY", "runner-codex-auth-fixture")
 	server := mockPlatformServer(t)
 	defer server.Close()
 	bin := filepath.Join(t.TempDir(), "fake-codex")
 	script := `#!/bin/bash
+if [[ " $* " == *" mcp list --json "* ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      mcp_servers=*) mcp_config="$arg" ;;
+    esac
+  done
+  url=$(printf '%s' "$mcp_config" | sed -n 's/.*"url"="\([^"]*\)".*/\1/p')
+  header_env=$(printf '%s' "$mcp_config" | sed -n 's/.*"Authorization"="\([^"]*\)".*/\1/p')
+  printf '[{"name":"donmai-platform","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"%s","bearer_token_env_var":null,"http_headers":null,"env_http_headers":{"Authorization":"%s"},"http_headers_helper":null},"startup_timeout_sec":null,"tool_timeout_sec":null}]\n' "$url" "$header_env"
+  exit 0
+fi
 printf '%s\n' "$@" > "$PWD/codex-argv"
 env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
 `

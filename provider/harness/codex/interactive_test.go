@@ -2,6 +2,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"os/exec"
@@ -466,6 +467,14 @@ test -f "$CODEX_HOME/auth.json"
 	h, err := SpawnInteractive(context.Background(), Options{
 		CodexBin:      bin,
 		configTempDir: boundaryRoot,
+		interactiveMCPInventoryRunner: inventoryRunnerFor(t, []agent.MCPServerConfig{{
+			Name: "donmai-platform",
+			Type: "http",
+			URL:  "https://platform.example.com/api/mcp/sess_project",
+			Headers: map[string]string{
+				"Authorization": "Bearer " + sessionBearer,
+			},
+		}}),
 	}, agent.Spec{
 		Cwd: workdir,
 		Env: map[string]string{
@@ -524,6 +533,37 @@ test -f "$CODEX_HOME/auth.json"
 	unchanged, err := os.ReadFile(ambientConfigPath)
 	if err != nil || string(unchanged) != ambientConfig {
 		t.Fatalf("ambient config changed: err=%v body=%q", err, unchanged)
+	}
+}
+
+func inventoryRunnerFor(t *testing.T, servers []agent.MCPServerConfig) interactiveMCPInventoryRunner {
+	t.Helper()
+	return func(_ context.Context, _ string, _ string, _ []string, configArgs []string) ([]byte, error) {
+		if !slices.ContainsFunc(configArgs, func(arg string) bool {
+			return strings.Contains(arg, "trust_level=\"untrusted\"")
+		}) {
+			t.Fatalf("effective-config readback did not mark the project untrusted: %q", configArgs)
+		}
+		entries := make([]codexMCPInventoryEntry, 0, len(servers))
+		for _, server := range servers {
+			entry := codexMCPInventoryEntry{Name: server.Name, Enabled: true}
+			switch strings.ToLower(strings.TrimSpace(server.Type)) {
+			case "http":
+				entry.Transport.Type = "streamable_http"
+				entry.Transport.URL = server.URL
+				entry.Transport.EnvHTTPHeaders = make(map[string]string, len(server.Headers))
+				for header := range server.Headers {
+					entry.Transport.EnvHTTPHeaders[header] = codexHTTPHeaderEnvName(server.Name, header)
+				}
+			default:
+				entry.Transport.Type = "stdio"
+				entry.Transport.Command = server.Command
+				entry.Transport.Args = append([]string(nil), server.Args...)
+				entry.Transport.EnvVars = sortedStringKeys(server.Env)
+			}
+			entries = append(entries, entry)
+		}
+		return json.Marshal(entries)
 	}
 }
 
