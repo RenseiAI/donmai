@@ -1676,6 +1676,7 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 			d.WorkerID(),
 			d.runtimeJWT(),
 			fmt.Sprintf("accept work failed: %v", err),
+			receiptPreflightNackReasonForError(err),
 			&item,
 		)
 		if nackErr != nil {
