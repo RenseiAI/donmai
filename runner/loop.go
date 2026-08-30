@@ -764,8 +764,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		// The authority declaration is stronger than a caller's autonomous
 		// full-access preference. Only declared mutable paths may be writable.
-		spec.SandboxEnabled = true
-		spec.SandboxLevel = agent.SandboxWorkspaceWrite
+		// ReconcileRepositorySandbox (repository_sandbox_reconcile.go) is the
+		// SAME function the daemon preflight compiler applies
+		// (provider_view.go's PreflightExecution, via compilePreparedHarness)
+		// — a receipt-bearing session with a declared repository must derive
+		// this exact mutation identically on both sides, or the host-compiled
+		// authority digest can never agree with what this spawn lane
+		// materializes even though nothing genuinely changed.
+		spec = ReconcileRepositorySandbox(spec, repositoryDeclaration)
 		spec.RepositoryAuthority = policy
 	}
 

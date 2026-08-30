@@ -70,6 +70,49 @@ func (e *AuthorityDriftError) Error() string {
 	return fmt.Sprintf("agent: materialized Spec differs from host adaptation authority (fields: %s)", strings.Join(e.Fields, ", "))
 }
 
+// ToolLifecycleDriftError is returned by ApplyPreparedHarness when the
+// child's recomputed ToolLifecycleReceipt does not byte-match the
+// host-persisted plan.ToolLifecycleReceipt, even though the combined
+// AuthorityDigest agreed (see AuthorityDriftError's doc comment — that check
+// runs first and catches every drift within the harnessAuthorityProjection).
+// Reaching this error means a Spec field the tool/lifecycle compiler
+// consumes but the projection does not cover changed between host compile
+// and child apply. Same doctrine as AuthorityDriftError: Fields names
+// exactly which ToolLifecycleReceipt field(s) disagree — never their
+// values, which may carry tool/MCP identity or denial detail — so a
+// production refusal is diagnosable from the error string and log line
+// alone.
+type ToolLifecycleDriftError struct {
+	// Fields is the sorted set of toolLifecycleReceiptFieldDigests key names
+	// (e.g. "entries", "decision") whose per-field digest differs between
+	// the host-compiled receipt and the child's recompute.
+	Fields []string
+}
+
+func (e *ToolLifecycleDriftError) Error() string {
+	return fmt.Sprintf("agent: tool/lifecycle application differs from host adaptation receipt (fields: %s)", strings.Join(e.Fields, ", "))
+}
+
+// toolLifecycleReceiptFieldDigests hashes each ToolLifecycleReceipt field
+// independently, digest-only — see authorityFieldDigests's doc comment for
+// why: Entries may carry tool/MCP identity or denial detail in a future
+// contract version, so no field value is ever returned or logged. Keyed by
+// the receipt's JSON field names, the exact set ToolLifecycleDriftError.Fields
+// reports on a mismatch.
+func toolLifecycleReceiptFieldDigests(r ToolLifecycleReceipt) map[string]string {
+	return map[string]string{
+		"contractVersion":          digestValue(r.ContractVersion),
+		"admissionReceiptId":       digestValue(r.AdmissionReceiptID),
+		"claimReceiptId":           digestValue(r.ClaimReceiptID),
+		"operationalPayloadDigest": digestValue(r.OperationalPayloadDigest),
+		"profileId":                digestValue(r.ProfileID),
+		"decision":                 digestValue(r.Decision),
+		"evidenceTier":             digestValue(r.EvidenceTier),
+		"productionEligible":       digestValue(r.ProductionEligible),
+		"entries":                  digestValue(r.Entries),
+	}
+}
+
 // CompilePreparedHarness compiles the exact source Spec and harness profile
 // into the secret-free authority persisted before child side effects.
 func CompilePreparedHarness(spec Spec, manifest HarnessManifest, operationalDigest string, runtimeMCPNames []string, materializations []HarnessMaterialization) (*PreparedHarness, error) {
@@ -139,8 +182,26 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	}
 	normalized := normalizeHarnessAuthoritySpec(adapted, plan)
 	_, toolReceipt, err := AdaptToolLifecycle(normalized, toolProfile)
-	if err != nil || !equalJSON(toolReceipt, plan.ToolLifecycleReceipt) {
-		return spec, errors.New("agent: tool/lifecycle application differs from host adaptation receipt")
+	if err != nil {
+		return spec, fmt.Errorf("agent: tool/lifecycle application failed: %w", err)
+	}
+	if !equalJSON(toolReceipt, plan.ToolLifecycleReceipt) {
+		// The combined AuthorityDigest check above (line ~125) already caught
+		// every drifting field IN THE harnessAuthorityProjection. Reaching
+		// here means the recomputed ToolLifecycleReceipt itself differs from
+		// the host-persisted one even though that projection agreed — e.g. a
+		// Spec field the tool/lifecycle compiler consumes but the projection
+		// does not cover (Spec.ToolSurfaceRequired, Spec.AdditionalExtensions)
+		// changed after preflight. Name the drifting receipt field(s) with the
+		// same digest-only, never-raw-value doctrine AuthorityDriftError
+		// uses, so a production refusal is diagnosable from the error string
+		// and log line alone instead of the bare, undiagnosable
+		// "differs from host adaptation receipt" a production incident
+		// reported (repository_sandbox_reconcile.go's doc comment).
+		return spec, &ToolLifecycleDriftError{Fields: driftingAuthorityFields(
+			toolLifecycleReceiptFieldDigests(plan.ToolLifecycleReceipt),
+			toolLifecycleReceiptFieldDigests(toolReceipt),
+		)}
 	}
 	// The recompute above ran on the redacted normalized copy, so its adapted
 	// Spec cannot be returned — re-apply the receipt-recorded drop of a

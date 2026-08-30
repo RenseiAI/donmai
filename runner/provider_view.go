@@ -100,10 +100,20 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if admission == nil || admission.selection.Provider == nil {
 		return encode(fmt.Errorf("host adaptation requires explicit receipt admission"))
 	}
-	if _, _, err := resolveRepositoryWorkarea(qw, admission.selection.Provider); err != nil {
+	// repositoryDeclaration is forwarded into compilePreparedHarness so
+	// ReconcileRepositorySandbox (runner/repository_sandbox_reconcile.go)
+	// applies the identical repository-authority-driven sandbox mutation
+	// the spawn lane applies (runner/loop.go) — mirroring how #482 forwarded
+	// the sibling resolved profile via daemon.go's preflightInput. Before
+	// this, the resolved declaration was computed here only to validate the
+	// workarea contract and then discarded, so the host-compiled receipt's
+	// SandboxEnabled/SandboxLevel never reflected it even though the spawn
+	// lane's final Spec always did for a declared repository.
+	repositoryDeclaration, _, err := resolveRepositoryWorkarea(qw, admission.selection.Provider)
+	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarness(qw, admission.selection)
+	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)

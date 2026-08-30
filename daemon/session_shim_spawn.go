@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -405,6 +406,17 @@ func (d *Daemon) ringSessionShimPostActivationHeartbeat(ctx context.Context) {
 	}
 }
 
+// shimChildLogPath returns the per-session log file path a launched shim's
+// stdout/stderr is captured to: <registryDir>/<sessionID>.log — alongside
+// that same session's discovery record and adoption socket
+// (sessionshim.Registry), which is already the exact directory production
+// resolves via defaultShimRegistryDir/statepath.Resolve and tests override
+// via SessionShimConfig.RegistryDir, so this needs no separate state-home
+// seam or test-only override of its own.
+func shimChildLogPath(registryDir, sessionID string) string {
+	return filepath.Join(registryDir, sessionID+".log")
+}
+
 // startShimProcess execs the worker as a detached shim and then RELEASES it.
 //
 // Release is the ownership move made concrete. os/exec would otherwise leave the
@@ -420,15 +432,34 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
 
-	// A shim outlives this daemon, so it cannot inherit this daemon's stdio: a
-	// closed pipe after the daemon exits would hand the shim EPIPE on its own
-	// logging. It gets the null device and speaks over its socket instead.
+	// A shim outlives this daemon, so it cannot inherit this daemon's stdio
+	// via a pipe THIS process reads: a closed pipe after the daemon exits
+	// would hand the shim EPIPE on its own logging (the constraint a plain
+	// os.Pipe()-and-forward, worker_spawner.go-style approach cannot honor
+	// here). stdin still gets the null device — nothing ever writes to a
+	// detached shim's stdin. stdout/stderr are instead duped into a
+	// per-session log FILE: unlike a pipe, a file fd stays valid for the
+	// child's entire lifetime regardless of whether this daemon process is
+	// still around to hold the other end, so every runner/provider error the
+	// shim child would otherwise silently swallow (including the exact
+	// class of tool/lifecycle adaptation refusal
+	// repository_sandbox_reconcile.go's doc comment describes) is now
+	// captured rather than discarded into /dev/null.
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return 0, fmt.Errorf("session shim: open %s: %w", os.DevNull, err)
 	}
 	defer func() { _ = devNull.Close() }()
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, devNull, devNull
+	logPath := shimChildLogPath(launch.RegistryDir, spec.SessionID)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return 0, fmt.Errorf("session shim: create log directory for %s: %w", logPath, err)
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G302: session-scoped operator diagnostics, same 0o600 convention as the rest of daemon/
+	if err != nil {
+		return 0, fmt.Errorf("session shim: open %s: %w", logPath, err)
+	}
+	defer func() { _ = logFile.Close() }()
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, logFile, logFile
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
