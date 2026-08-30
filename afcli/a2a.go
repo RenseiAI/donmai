@@ -20,12 +20,11 @@ import (
 )
 
 type a2aCommandOptions struct {
-	cardURL        string
-	peer           string
-	bearerFile     string
-	extensions     []string
-	pollInterval   time.Duration
-	cardURLChanged bool
+	cardURL      string
+	peer         string
+	bearerFile   string
+	extensions   []string
+	pollInterval time.Duration
 }
 
 func newA2ACmd(cfg Config) *cobra.Command {
@@ -41,13 +40,6 @@ func newA2ACmd(cfg Config) *cobra.Command {
 	cmd.PersistentFlags().StringVar(&options.bearerFile, "bearer-token-file", "", "file containing a bearer token; reread for every request")
 	cmd.PersistentFlags().StringSliceVar(&options.extensions, "extension", nil, "implemented extension URI to negotiate (repeatable)")
 	cmd.PersistentFlags().DurationVar(&options.pollInterval, "poll-interval", time.Second, "task polling interval used by send --wait")
-	cmd.PersistentPreRunE = func(cmd *cobra.Command, _ []string) error {
-		options.cardURLChanged = cmd.Flags().Changed("card")
-		if options.cardURLChanged && strings.TrimSpace(options.peer) != "" {
-			return errors.New("a2a: --card and --peer are mutually exclusive")
-		}
-		return nil
-	}
 	cmd.AddCommand(newA2ASendCmd(cfg, options))
 	cmd.AddCommand(newA2AGetCmd(cfg, options))
 	cmd.AddCommand(newA2AListCmd(cfg, options))
@@ -296,6 +288,9 @@ func newA2ACancelCmd(cfg Config, options *a2aCommandOptions) *cobra.Command {
 
 func resolveA2AProtocolClient(ctx context.Context, cfg Config, options *a2aCommandOptions) (*a2a.Client, error) {
 	cardURL := strings.TrimSpace(options.cardURL)
+	if cardURL != "" && strings.TrimSpace(options.peer) != "" {
+		return nil, errors.New("a2a: --card and --peer are mutually exclusive")
+	}
 	if cardURL == "" && strings.TrimSpace(options.peer) != "" {
 		if cfg.A2ACardURL == nil {
 			return nil, errors.New("a2a: --peer requires an embedder Agent Card resolver; use --card")

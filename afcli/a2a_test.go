@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -194,6 +195,42 @@ func TestA2ACLIEmbedderPeerResolverAndAuth(t *testing.T) {
 	_, headers := fixture.snapshot()
 	if headers[0].Get("Authorization") != "Bearer config-token" {
 		t.Fatalf("authorization = %q", headers[0].Get("Authorization"))
+	}
+}
+
+func TestA2ACLILeavesEmbedderRootInitializationAuthoritative(t *testing.T) {
+	t.Parallel()
+	fixture := newA2ACLIFixture(t, "")
+	var initialized bool
+	root := &cobra.Command{
+		Use: "embedder",
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			initialized = true
+			return nil
+		},
+	}
+	root.AddCommand(newA2ACmd(Config{
+		A2AHTTPClient: fixture.server.Client(),
+		A2AAuthorization: func(context.Context) (string, error) {
+			if !initialized {
+				return "", errors.New("embedder authority was not initialized")
+			}
+			return "Bearer initialized-authority", nil
+		},
+	}))
+	var output bytes.Buffer
+	root.SetOut(&output)
+	root.SetErr(&output)
+	root.SetArgs([]string{"a2a", "get", "--card", fixture.server.URL + "/card", "--id", "task-get", "--json"})
+	if err := root.ExecuteContext(context.Background()); err != nil {
+		t.Fatalf("execute: %v\n%s", err, output.String())
+	}
+	if !initialized {
+		t.Fatal("embedding root PersistentPreRunE did not execute")
+	}
+	_, headers := fixture.snapshot()
+	if len(headers) != 1 || headers[0].Get("Authorization") != "Bearer initialized-authority" {
+		t.Fatalf("headers = %v, want initialized embedder authority", headers)
 	}
 }
 
