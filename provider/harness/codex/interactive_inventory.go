@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os/exec"
 	"slices"
 	"sort"
@@ -25,6 +26,7 @@ type interactiveMCPInventoryRunner func(
 	cwd string,
 	env []string,
 	configArgs []string,
+	queryArgs []string,
 ) ([]byte, error)
 
 type codexMCPInventoryEntry struct {
@@ -34,6 +36,8 @@ type codexMCPInventoryEntry struct {
 	Transport      codexMCPInventoryTransport `json:"transport"`
 	StartupTimeout *float64                   `json:"startup_timeout_sec"`
 	ToolTimeout    *float64                   `json:"tool_timeout_sec"`
+	EnabledTools   []string                   `json:"enabled_tools"`
+	DisabledTools  []string                   `json:"disabled_tools"`
 }
 
 type codexMCPInventoryTransport struct {
@@ -56,9 +60,10 @@ func runCodexMCPInventory(
 	cwd string,
 	env []string,
 	configArgs []string,
+	queryArgs []string,
 ) ([]byte, error) {
 	args := append([]string(nil), configArgs...)
-	args = append(args, "mcp", "list", "--json")
+	args = append(args, queryArgs...)
 	var stdout, stderr bytes.Buffer
 	cmd := &exec.Cmd{
 		Path:   binary,
@@ -123,7 +128,8 @@ func verifyExclusiveInteractiveMCP(
 	if runner == nil {
 		runner = runCodexMCPInventory
 	}
-	body, err := runner(ctx, binary, spec.Cwd, mergeEnv(nil, launch.env, ownedHome), configArgs)
+	env := mergeEnv(nil, launch.env, ownedHome)
+	body, err := runner(ctx, binary, spec.Cwd, env, configArgs, []string{"mcp", "list", "--json"})
 	if err != nil {
 		return fmt.Errorf("%w: effective-config readback failed: %v", ErrInteractiveCodexMCPIsolation, err)
 	}
@@ -131,13 +137,36 @@ func verifyExclusiveInteractiveMCP(
 	if err := json.Unmarshal(body, &inventory); err != nil {
 		return fmt.Errorf("%w: decode effective-config readback: %v", ErrInteractiveCodexMCPIsolation, err)
 	}
-	if err := compareInteractiveMCPInventory(spec.MCPServers, inventory); err != nil {
+	if err := compareInteractiveMCPListNames(spec.MCPServers, inventory); err != nil {
 		return fmt.Errorf("%w: %v", ErrInteractiveCodexMCPIsolation, err)
+	}
+	for _, server := range spec.MCPServers {
+		body, err := runner(
+			ctx,
+			binary,
+			spec.Cwd,
+			env,
+			configArgs,
+			[]string{"mcp", "get", strings.TrimSpace(server.Name), "--json"},
+		)
+		if err != nil {
+			return fmt.Errorf("%w: effective server readback for %q failed: %v", ErrInteractiveCodexMCPIsolation, server.Name, err)
+		}
+		entry, err := decodeStrictMCPInventoryEntry(body)
+		if err != nil {
+			return fmt.Errorf("%w: decode effective server %q: %v", ErrInteractiveCodexMCPIsolation, server.Name, err)
+		}
+		if entry.Name != strings.TrimSpace(server.Name) {
+			return fmt.Errorf("%w: requested server %q read back as %q", ErrInteractiveCodexMCPIsolation, server.Name, entry.Name)
+		}
+		if err := compareInteractiveMCPEntry(server, entry); err != nil {
+			return fmt.Errorf("%w: server %q: %v", ErrInteractiveCodexMCPIsolation, entry.Name, err)
+		}
 	}
 	return nil
 }
 
-func compareInteractiveMCPInventory(want []agent.MCPServerConfig, got []codexMCPInventoryEntry) error {
+func compareInteractiveMCPListNames(want []agent.MCPServerConfig, got []codexMCPInventoryEntry) error {
 	wantByName := make(map[string]agent.MCPServerConfig, len(want))
 	for _, server := range want {
 		wantByName[strings.TrimSpace(server.Name)] = server
@@ -146,20 +175,33 @@ func compareInteractiveMCPInventory(want []agent.MCPServerConfig, got []codexMCP
 		return fmt.Errorf("effective MCP server count is %d, want %d", len(got), len(wantByName))
 	}
 	for _, entry := range got {
-		server, ok := wantByName[entry.Name]
-		if !ok {
+		if _, ok := wantByName[entry.Name]; !ok {
 			return fmt.Errorf("effective MCP surface contains undeclared server %q", entry.Name)
-		}
-		if err := compareInteractiveMCPEntry(server, entry); err != nil {
-			return fmt.Errorf("server %q: %w", entry.Name, err)
 		}
 	}
 	return nil
 }
 
+func decodeStrictMCPInventoryEntry(body []byte) (codexMCPInventoryEntry, error) {
+	var entry codexMCPInventoryEntry
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&entry); err != nil {
+		return codexMCPInventoryEntry{}, err
+	}
+	var trailing json.RawMessage
+	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
+		return codexMCPInventoryEntry{}, errors.New("multiple JSON values in server readback")
+	}
+	return entry, nil
+}
+
 func compareInteractiveMCPEntry(want agent.MCPServerConfig, got codexMCPInventoryEntry) error {
 	if !got.Enabled || got.DisabledReason != nil || got.StartupTimeout != nil || got.ToolTimeout != nil {
 		return errors.New("effective status or timeout fields were widened by another config layer")
+	}
+	if len(got.EnabledTools) != 0 || len(got.DisabledTools) != 0 {
+		return errors.New("effective tool filters were widened by another config layer")
 	}
 	t := got.Transport
 	if t.Cwd != nil || len(t.Env) != 0 || t.BearerTokenEnvVar != nil || len(t.HTTPHeaders) != 0 || t.HTTPHeadersHelper != nil {

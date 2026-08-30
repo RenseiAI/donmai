@@ -364,7 +364,7 @@ func TestRun_InteractiveDefaultHTTPMCPReachesCodexCLI(t *testing.T) {
 	defer server.Close()
 	bin := filepath.Join(t.TempDir(), "fake-codex")
 	script := `#!/bin/bash
-if [[ " $* " == *" mcp list --json "* ]]; then
+if [[ " $* " == *" mcp list --json "* || " $* " == *" mcp get "* ]]; then
   for arg in "$@"; do
     case "$arg" in
       mcp_servers=*) mcp_config="$arg" ;;
@@ -372,7 +372,12 @@ if [[ " $* " == *" mcp list --json "* ]]; then
   done
   url=$(printf '%s' "$mcp_config" | sed -n 's/.*"url"="\([^"]*\)".*/\1/p')
   header_env=$(printf '%s' "$mcp_config" | sed -n 's/.*"Authorization"="\([^"]*\)".*/\1/p')
-  printf '[{"name":"donmai-platform","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"%s","bearer_token_env_var":null,"http_headers":null,"env_http_headers":{"Authorization":"%s"},"http_headers_helper":null},"startup_timeout_sec":null,"tool_timeout_sec":null}]\n' "$url" "$header_env"
+  server=$(printf '{"name":"donmai-platform","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"%s","bearer_token_env_var":null,"http_headers":null,"env_http_headers":{"Authorization":"%s"},"http_headers_helper":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$url" "$header_env")
+  if [[ " $* " == *" mcp list --json "* ]]; then
+    printf '[%s]\n' "$server"
+  else
+    printf '%s\n' "$server"
+  fi
   exit 0
 fi
 printf '%s\n' "$@" > "$PWD/codex-argv"

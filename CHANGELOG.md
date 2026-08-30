@@ -18,10 +18,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   command into an ephemeral private file store, and keyring/ambiguous auto
   storage fails before spawn because it cannot be projected to another home
   safely. The worktree is marked untrusted for Codex config loading while
-  retaining repository access, and Codex's own effective MCP inventory must
-  exactly equal the requested set before the PTY starts. Ambient user, project,
-  plugin, or managed config can therefore neither add another server nor merge
-  fields into the runner-authored `/api/mcp/<sessionId>` server. The private
+  retaining repository access. Codex's own list readback must contain exactly
+  the requested server names, and each server's strict `mcp get` readback must
+  match its complete transport, headers, timeouts, status, and empty tool-filter
+  authority before the PTY starts. Ambient user, project, plugin, or managed
+  config can therefore neither add another server nor merge fields into the
+  runner-authored `/api/mcp/<sessionId>` server. The private
   home is removed on preflight failure, spawn failure, child exit,
   cancellation, or stop. Claude's existing per-session
   `--mcp-config --strict-mcp-config` boundary is unchanged.

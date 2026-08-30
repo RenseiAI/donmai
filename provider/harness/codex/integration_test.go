@@ -64,7 +64,7 @@ func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.
 	}
 	if err := os.WriteFile(
 		filepath.Join(project, ".codex", "config.toml"),
-		[]byte("[mcp_servers.project_poison]\ncommand = \"/usr/bin/false\"\n"),
+		[]byte("[mcp_servers.\"donmai-platform\"]\ndisabled_tools = [\"a2a_send_message\"]\n"),
 		0o600,
 	); err != nil {
 		t.Fatal(err)
@@ -94,6 +94,53 @@ func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.
 	launch.env["CODEX_HOME"] = boundary.home
 	if err := seedInteractiveCodexEnvironmentAuth(t.Context(), binary, boundary.home, auth); err != nil {
 		t.Fatalf("seed real environment auth: %v", err)
+	}
+
+	// Negative control: Codex's list surface reports the one expected NAME and
+	// omits its merged disabled_tools, while get exposes the authority-changing
+	// field. This is why list remains only the extra-name oracle and get is the
+	// exact per-server oracle.
+	trustedLaunch := launch
+	trustedLaunch.argv = append([]string(nil), launch.argv...)
+	for i, arg := range trustedLaunch.argv {
+		trustedLaunch.argv[i] = strings.ReplaceAll(
+			arg,
+			`trust_level="untrusted"`,
+			`trust_level="trusted"`,
+		)
+	}
+	trustedConfigArgs, err := interactiveConfigArgs(trustedLaunch.argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveEnv := mergeEnv(nil, trustedLaunch.env, boundary.home)
+	listBody, err := runCodexMCPInventory(
+		t.Context(), binary, project, effectiveEnv, trustedConfigArgs,
+		[]string{"mcp", "list", "--json"},
+	)
+	if err != nil {
+		t.Fatalf("real Codex list negative control: %v", err)
+	}
+	var listInventory []codexMCPInventoryEntry
+	if err := json.Unmarshal(listBody, &listInventory); err != nil {
+		t.Fatal(err)
+	}
+	if err := compareInteractiveMCPListNames(spec.MCPServers, listInventory); err != nil {
+		t.Fatalf("list unexpectedly exposed the same-name filter: %v", err)
+	}
+	getBody, err := runCodexMCPInventory(
+		t.Context(), binary, project, effectiveEnv, trustedConfigArgs,
+		[]string{"mcp", "get", "donmai-platform", "--json"},
+	)
+	if err != nil {
+		t.Fatalf("real Codex get negative control: %v", err)
+	}
+	poisoned, err := decodeStrictMCPInventoryEntry(getBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compareInteractiveMCPEntry(spec.MCPServers[0], poisoned); err == nil {
+		t.Fatal("get-based exact comparison accepted a same-name disabled_tools merge")
 	}
 
 	if err := verifyExclusiveInteractiveMCP(

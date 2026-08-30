@@ -24,28 +24,34 @@ func TestCompareInteractiveMCPInventoryRequiresExactExclusiveSurface(t *testing.
 		"Authorization": codexHTTPHeaderEnvName("donmai-platform", "Authorization"),
 	}
 
-	if err := compareInteractiveMCPInventory(want, []codexMCPInventoryEntry{exact}); err != nil {
+	if err := compareInteractiveMCPEntry(want[0], exact); err != nil {
 		t.Fatalf("exact inventory: %v", err)
 	}
 
 	extra := codexMCPInventoryEntry{Name: "ambient", Enabled: true}
 	extra.Transport.Type = "stdio"
 	extra.Transport.Command = "ambient-server"
-	if err := compareInteractiveMCPInventory(want, []codexMCPInventoryEntry{exact, extra}); err == nil {
+	if err := compareInteractiveMCPListNames(want, []codexMCPInventoryEntry{exact, extra}); err == nil {
 		t.Fatal("undeclared ambient server was accepted")
 	}
 
 	widened := exact
 	widened.Transport.HTTPHeaders = map[string]string{"X-Poison": "present"}
-	if err := compareInteractiveMCPInventory(want, []codexMCPInventoryEntry{widened}); err == nil {
+	if err := compareInteractiveMCPEntry(want[0], widened); err == nil {
 		t.Fatal("same-name server with a merged literal header was accepted")
 	}
 
 	widened = exact
 	timeout := 30.0
 	widened.ToolTimeout = &timeout
-	if err := compareInteractiveMCPInventory(want, []codexMCPInventoryEntry{widened}); err == nil {
+	if err := compareInteractiveMCPEntry(want[0], widened); err == nil {
 		t.Fatal("same-name server with a merged timeout was accepted")
+	}
+
+	widened = exact
+	widened.DisabledTools = []string{"a2a_send_message"}
+	if err := compareInteractiveMCPEntry(want[0], widened); err == nil {
+		t.Fatal("same-name server with a merged tool filter was accepted")
 	}
 }
 
@@ -62,7 +68,7 @@ func TestVerifyExclusiveInteractiveMCPFailsBeforePTYOnReadbackError(t *testing.T
 	}
 	err = verifyExclusiveInteractiveMCP(
 		t.Context(),
-		func(context.Context, string, string, []string, []string) ([]byte, error) {
+		func(context.Context, string, string, []string, []string, []string) ([]byte, error) {
 			return nil, errors.New("readback unavailable")
 		},
 		"codex",

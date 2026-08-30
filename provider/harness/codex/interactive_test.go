@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -538,7 +539,7 @@ test -f "$CODEX_HOME/auth.json"
 
 func inventoryRunnerFor(t *testing.T, servers []agent.MCPServerConfig) interactiveMCPInventoryRunner {
 	t.Helper()
-	return func(_ context.Context, _ string, _ string, _ []string, configArgs []string) ([]byte, error) {
+	return func(_ context.Context, _ string, _ string, _ []string, configArgs, queryArgs []string) ([]byte, error) {
 		if !slices.ContainsFunc(configArgs, func(arg string) bool {
 			return strings.Contains(arg, "trust_level=\"untrusted\"")
 		}) {
@@ -563,7 +564,17 @@ func inventoryRunnerFor(t *testing.T, servers []agent.MCPServerConfig) interacti
 			}
 			entries = append(entries, entry)
 		}
-		return json.Marshal(entries)
+		if slices.Contains(queryArgs, "list") {
+			return json.Marshal(entries)
+		}
+		if len(queryArgs) >= 3 && queryArgs[1] == "get" {
+			for _, entry := range entries {
+				if entry.Name == queryArgs[2] {
+					return json.Marshal(entry)
+				}
+			}
+		}
+		return nil, fmt.Errorf("unexpected fake inventory query: %q", queryArgs)
 	}
 }
 
