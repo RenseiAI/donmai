@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -67,12 +67,29 @@ test-shim-overlap:
 test-attach-v1-compat:
 	bash scripts/test-attach-v1-v0682-compat.sh
 
-# Replays a raw adversarial poll item through the exact v0.72.2 git archive.
-# The temporary probe calls the release's daemon projection and runner digest
-# directly, then byte-compares the resulting self-digested artifact. GOPROXY
-# is disabled by the command, so this verification has no network dependency.
+# Replays a raw adversarial poll item through the exact pinned v0.72.2 commit
+# archive. The temporary probe calls the release's daemon projection and runner
+# digest directly, then byte-compares the resulting self-digested artifact.
+# v0.72.2 has no vendor tree: the archived, blob-pinned go.mod/go.sum resolve
+# normally and may fetch dependencies on a cold module cache.
 verify-operational-payload-provenance:
 	GOWORK=off go run ./cmd/operational-payload-provenance
+
+# Verifies the committed artifact's schema, release/source pins, byte digests,
+# and self-digest only. It does not archive or execute the release source and
+# is the offline Platform-consumer check.
+verify-operational-payload-provenance-artifact:
+	GOWORK=off go run ./cmd/operational-payload-provenance -check-artifact
+
+# Uses fresh temporary Go build/module caches to prove the normal replay can
+# resolve its exact go.mod/go.sum dependencies. This is network-enabled by
+# design and should be used deliberately in CI or cache-warming jobs.
+verify-operational-payload-provenance-empty-cache:
+	GOWORK=off go run ./cmd/operational-payload-provenance -empty-cache-control
+
+# A normal replay also runs `go mod download` against the pinned archive and
+# warms the caller's module cache; it is the deterministic cache-warming path.
+warm-operational-payload-provenance-cache: verify-operational-payload-provenance
 
 lint:
 	golangci-lint run

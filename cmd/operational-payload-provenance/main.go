@@ -13,6 +13,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"go/ast"
+	"go/parser"
+	"go/token"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -20,14 +23,16 @@ import (
 )
 
 const (
-	artifactSchema    = "donmai.operational-payload-provenance/v1"
-	generatorVersion  = "1"
-	pinnedTag         = "v0.72.2"
-	pinnedCommit      = "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff"
-	artifactPath      = "runner/testdata/v0.72.2-operational-payload-provenance.json"
-	generatorSource   = "cmd/operational-payload-provenance/main.go"
-	probePath         = "cmd/pinned-operational-payload-probe/main.go"
-	forgedSidecarMark = "FORGED_SIDECAR_MUST_NOT_REACH_OPERATIONAL_PAYLOAD"
+	artifactSchema      = "donmai.operational-payload-provenance/v2"
+	generatorVersion    = "2"
+	pinnedTag           = "v0.72.2"
+	pinnedCommit        = "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff"
+	pinnedGoVersion     = "go1.26.6"
+	artifactPath        = "runner/testdata/v0.72.2-operational-payload-provenance.json"
+	generatorSource     = "cmd/operational-payload-provenance/main.go"
+	probePath           = "cmd/pinned-operational-payload-probe/main.go"
+	forgedSidecarMark   = "FORGED_SIDECAR_MUST_NOT_REACH_OPERATIONAL_PAYLOAD"
+	probeTemplateSHA256 = "b35557887a36575901f8a287c245fc91e1f04bd4de268d0960c8ffaf30c1a232"
 )
 
 var pinnedBlobs = []sourceBlob{
@@ -37,6 +42,8 @@ var pinnedBlobs = []sourceBlob{
 	{Path: "prompt/queued_work.go", SHA1: "70303ccba809ac004c74f4028c2ed2b585c9ba8b"},
 	{Path: "executioncell/runtime_binding.go", SHA1: "2bc69f4e886deb499cb844e904557bd7f6b02d98"},
 	{Path: "executioncell/codec.go", SHA1: "4a3e0829e86cd7931ae2c2c9fd0a387cce5530d7"},
+	{Path: "go.mod", SHA1: "b616039f1dffecc6b7b97e874f49038d9d88be6e"},
+	{Path: "go.sum", SHA1: "7fca448b4d51d4897799c2f1c4c8be55f8fc748f"},
 }
 
 type sourceBlob struct {
@@ -56,8 +63,10 @@ type artifact struct {
 	GeneratorVersion   string       `json:"generatorVersion"`
 	GeneratorSource    string       `json:"generatorSource"`
 	GeneratorSourceSHA string       `json:"generatorSourceSha256"`
+	ProbeSourceSHA     string       `json:"probeSourceSha256"`
 	Tag                string       `json:"tag"`
 	Commit             string       `json:"commit"`
+	GoVersion          string       `json:"goVersion"`
 	SourceBlobs        []sourceBlob `json:"sourceBlobs"`
 	RawPollItem        byteValue    `json:"rawPollItem"`
 	ProjectedPayload   byteValue    `json:"projectedOperationalPayload"`
@@ -72,10 +81,13 @@ type probeOutput struct {
 	CanonicalPayload   string `json:"canonicalPayloadBase64"`
 	OperationalDigest  string `json:"operationalDigest"`
 	ForgedSidecarError string `json:"forgedSidecarError"`
+	GoVersion          string `json:"goVersion"`
 }
 
 func main() {
 	write := flag.Bool("write", false, "write the regenerated artifact instead of byte-comparing it")
+	checkArtifact := flag.Bool("check-artifact", false, "verify only the committed artifact's self-contained hashes; no git archive or release-source execution")
+	emptyCacheControl := flag.Bool("empty-cache-control", false, "replay the pinned source with fresh Go build and module caches; dependency resolution may use the network")
 	artifactFlag := flag.String("artifact", artifactPath, "artifact path relative to the repository root, or absolute")
 	flag.Parse()
 
@@ -87,7 +99,20 @@ func main() {
 	if !filepath.IsAbs(path) {
 		path = filepath.Join(root, path)
 	}
-	generated, err := generate(root)
+	if *checkArtifact {
+		if *write || *emptyCacheControl {
+			fatal(errors.New("-check-artifact cannot be combined with -write or -empty-cache-control"))
+		}
+		committed, err := os.ReadFile(path)
+		if err != nil {
+			fatal(fmt.Errorf("read committed artifact: %w", err))
+		}
+		if err := validateArtifact(committed); err != nil {
+			fatal(err)
+		}
+		return
+	}
+	generated, err := generate(root, replayOptions{emptyCaches: *emptyCacheControl})
 	if err != nil {
 		fatal(err)
 	}
@@ -105,7 +130,7 @@ func main() {
 		fatal(fmt.Errorf("read committed artifact: %w", err))
 	}
 	if !bytes.Equal(committed, generated) {
-		fatal(fmt.Errorf("provenance artifact differs from a clean %s archive; run go run ./cmd/operational-payload-provenance -write", pinnedTag))
+		fatal(fmt.Errorf("provenance artifact differs from a clean %s commit archive; run go run ./cmd/operational-payload-provenance -write", pinnedTag))
 	}
 	if err := validateArtifact(committed); err != nil {
 		fatal(err)
@@ -125,12 +150,16 @@ func repositoryRoot() (string, error) {
 	return strings.TrimSpace(string(output)), nil
 }
 
-func generate(root string) ([]byte, error) {
+type replayOptions struct {
+	emptyCaches bool
+}
+
+func generate(root string, options replayOptions) ([]byte, error) {
 	if err := verifyPinnedSource(root); err != nil {
 		return nil, err
 	}
 	raw := adversarialPollItem()
-	probe, err := runPinnedProbe(root, raw)
+	probe, err := runPinnedProbe(root, raw, options)
 	if err != nil {
 		return nil, err
 	}
@@ -151,6 +180,9 @@ func generate(root string) ([]byte, error) {
 	if probe.ForgedSidecarError != "daemon poll: operationalPayload does not match raw poll item" {
 		return nil, fmt.Errorf("pinned forged operationalPayload rejection = %q", probe.ForgedSidecarError)
 	}
+	if probe.GoVersion != pinnedGoVersion {
+		return nil, fmt.Errorf("pinned archive Go version = %q, want %q", probe.GoVersion, pinnedGoVersion)
+	}
 
 	source, err := os.ReadFile(filepath.Join(root, generatorSource))
 	if err != nil {
@@ -161,8 +193,10 @@ func generate(root string) ([]byte, error) {
 		GeneratorVersion:   generatorVersion,
 		GeneratorSource:    generatorSource,
 		GeneratorSourceSHA: sha256Hex(source),
+		ProbeSourceSHA:     probeTemplateSHA256,
 		Tag:                pinnedTag,
 		Commit:             pinnedCommit,
+		GoVersion:          probe.GoVersion,
 		SourceBlobs:        append([]sourceBlob(nil), pinnedBlobs...),
 		RawPollItem:        bytesValue(raw),
 		ProjectedPayload:   bytesValue(projected),
@@ -191,17 +225,17 @@ func verifyPinnedSourceWith(root, tag, wantCommit string, blobs []sourceBlob) er
 	if err != nil {
 		return fmt.Errorf("resolve %s: %w", tag, err)
 	}
-	if commit != wantCommit {
-		return fmt.Errorf("%s commit = %s, want %s", tag, commit, wantCommit)
+	if err := verifyTagCommit(tag, commit, wantCommit); err != nil {
+		return err
 	}
 	for _, expected := range blobs {
-		line, err := git(root, "ls-tree", tag, "--", expected.Path)
+		line, err := git(root, "ls-tree", wantCommit, "--", expected.Path)
 		if err != nil {
 			return fmt.Errorf("read %s blob: %w", expected.Path, err)
 		}
 		parts := strings.Fields(line)
 		if len(parts) < 3 || parts[1] != "blob" {
-			return fmt.Errorf("%s is not a source blob in %s", expected.Path, tag)
+			return fmt.Errorf("%s is not a source blob in pinned commit %s", expected.Path, wantCommit)
 		}
 		if parts[2] != expected.SHA1 {
 			return fmt.Errorf("%s blob = %s, want %s", expected.Path, parts[2], expected.SHA1)
@@ -210,8 +244,15 @@ func verifyPinnedSourceWith(root, tag, wantCommit string, blobs []sourceBlob) er
 	return nil
 }
 
-func runPinnedProbe(root string, raw []byte) (probeOutput, error) {
-	if err := assertProbeUsesPinnedFunctions(probeProgram); err != nil {
+func verifyTagCommit(tag, got, want string) error {
+	if got != want {
+		return fmt.Errorf("%s commit = %s, want %s", tag, got, want)
+	}
+	return nil
+}
+
+func runPinnedProbe(root string, raw []byte, options replayOptions) (probeOutput, error) {
+	if err := validateProbeSource(probeProgram); err != nil {
 		return probeOutput{}, err
 	}
 	temporary, err := os.MkdirTemp("", "donmai-operational-payload-provenance-")
@@ -220,7 +261,7 @@ func runPinnedProbe(root string, raw []byte) (probeOutput, error) {
 	}
 	defer os.RemoveAll(temporary)
 
-	archiveCommand := exec.Command("git", "-C", root, "archive", "--format=tar", pinnedTag)
+	archiveCommand := exec.Command("git", "-C", root, "archive", "--format=tar", pinnedCommit)
 	// A pipe is used so archive bytes never pass through a shell or a file that
 	// could be mistaken for release source.
 	tarCommand := exec.Command("tar", "-x", "-C", temporary)
@@ -260,7 +301,29 @@ func runPinnedProbe(root string, raw []byte) (probeOutput, error) {
 		return probeOutput{}, fmt.Errorf("write probe source: %w", err)
 	}
 
-	output, err := run(temporary, []string{"GOWORK=off", "GOPROXY=off", "GOSUMDB=off", "GOTOOLCHAIN=local"}, "go", "run", "./cmd/pinned-operational-payload-probe", inputPath, forgedPath)
+	goEnv := []string{"GOWORK=off", "GOTOOLCHAIN=local"}
+	if options.emptyCaches {
+		moduleCache := filepath.Join(temporary, "gomodcache")
+		buildCache := filepath.Join(temporary, "gocache")
+		if err := os.MkdirAll(moduleCache, 0o700); err != nil {
+			return probeOutput{}, fmt.Errorf("create empty module cache: %w", err)
+		}
+		goEnv = append(goEnv, "GOMODCACHE="+moduleCache, "GOCACHE="+buildCache)
+	}
+	// v0.72.2 has no vendor directory. The exact archived go.mod/go.sum (both
+	// blob-pinned above) therefore resolve dependencies through normal Go module
+	// verification. A warm cache makes this local; an empty cache may fetch.
+	if _, err := run(temporary, goEnv, "go", "mod", "download"); err != nil {
+		return probeOutput{}, fmt.Errorf("resolve pinned archive modules: %w", err)
+	}
+	if _, err := run(temporary, goEnv, "go", "mod", "verify"); err != nil {
+		return probeOutput{}, fmt.Errorf("verify pinned archive modules against go.sum: %w", err)
+	}
+	goVersion, err := run(temporary, goEnv, "go", "env", "GOVERSION")
+	if err != nil {
+		return probeOutput{}, fmt.Errorf("read pinned archive Go version: %w", err)
+	}
+	output, err := run(temporary, goEnv, "go", "run", "./cmd/pinned-operational-payload-probe", inputPath, forgedPath)
 	if err != nil {
 		return probeOutput{}, fmt.Errorf("run pinned Go probe without network: %w", err)
 	}
@@ -268,6 +331,7 @@ func runPinnedProbe(root string, raw []byte) (probeOutput, error) {
 	if err := json.Unmarshal(output, &decoded); err != nil {
 		return probeOutput{}, fmt.Errorf("decode pinned Go probe output: %w", err)
 	}
+	decoded.GoVersion = strings.TrimSpace(string(goVersion))
 	return decoded, nil
 }
 
@@ -299,17 +363,160 @@ func sha256Hex(raw []byte) string {
 	return hex.EncodeToString(sum[:])
 }
 
-func assertProbeUsesPinnedFunctions(source string) error {
-	for _, call := range []string{
-		"daemon.PollWorkItem",
-		"runner.CanonicalOperationalPayload",
-		"runner.DigestOperationalPayload",
-	} {
-		if !strings.Contains(source, call) {
-			return fmt.Errorf("probe bypasses required pinned function path %q", call)
+func validateProbeSource(source string) error {
+	if sha256Hex([]byte(source)) != probeTemplateSHA256 {
+		return errors.New("probe source hash does not match the pinned template")
+	}
+	return validateProbeStructure(source)
+}
+
+func validateProbeStructure(source string) error {
+	file, err := parser.ParseFile(token.NewFileSet(), probePath, source, 0)
+	if err != nil {
+		return fmt.Errorf("parse probe source: %w", err)
+	}
+	imports := map[string]string{}
+	for _, spec := range file.Imports {
+		path := strings.Trim(spec.Path.Value, "\"")
+		name := filepath.Base(path)
+		if spec.Name != nil {
+			name = spec.Name.Name
 		}
+		imports[name] = path
+	}
+	if imports["daemon"] != "github.com/RenseiAI/donmai/daemon" || imports["runner"] != "github.com/RenseiAI/donmai/runner" {
+		return errors.New("probe imports are not the pinned daemon and runner packages")
+	}
+	var declaredItem, unmarshaledItem, canonicalFromItem, digestFromItem, emittedOutput bool
+	ast.Inspect(file, func(node ast.Node) bool {
+		switch typed := node.(type) {
+		case *ast.ValueSpec:
+			if len(typed.Names) == 1 && typed.Names[0].Name == "item" && isSelector(typed.Type, "daemon", "PollWorkItem") {
+				declaredItem = true
+			}
+		case *ast.AssignStmt:
+			if len(typed.Lhs) > 0 && len(typed.Rhs) > 0 {
+				call, ok := typed.Rhs[0].(*ast.CallExpr)
+				if ok && isIdentifier(typed.Lhs[0], "canonical") && isSelector(call.Fun, "runner", "CanonicalOperationalPayload") && len(call.Args) == 1 && isQueuedWorkFromItem(call.Args[0]) {
+					canonicalFromItem = true
+				}
+				if ok && isIdentifier(typed.Lhs[0], "digest") && isSelector(call.Fun, "runner", "DigestOperationalPayload") && len(call.Args) == 1 && isQueuedWorkFromItem(call.Args[0]) {
+					digestFromItem = true
+				}
+			}
+		case *ast.CallExpr:
+			switch {
+			case isSelector(typed.Fun, "json", "Unmarshal") && len(typed.Args) == 2 && isIdentifier(typed.Args[0], "raw") && isAddressOfIdentifier(typed.Args[1], "item"):
+				unmarshaledItem = true
+			case isEncoderOutputCall(typed):
+				emittedOutput = true
+			}
+		}
+		return true
+	})
+	if !declaredItem || !unmarshaledItem || !canonicalFromItem || !digestFromItem || !emittedOutput {
+		return errors.New("probe does not preserve the required direct PollWorkItem to CanonicalOperationalPayload/Digest output dataflow")
+	}
+	if !probeOutputFieldsAreDirect(file) {
+		return errors.New("probe output is not populated directly from the pinned PollWorkItem, canonical, and digest values")
 	}
 	return nil
+}
+
+func isSelector(expression ast.Expr, packageName, selector string) bool {
+	value, ok := expression.(*ast.SelectorExpr)
+	return ok && isIdentifier(value.X, packageName) && value.Sel.Name == selector
+}
+
+func isIdentifier(expression ast.Expr, want string) bool {
+	value, ok := expression.(*ast.Ident)
+	return ok && value.Name == want
+}
+
+func isAddressOfIdentifier(expression ast.Expr, want string) bool {
+	value, ok := expression.(*ast.UnaryExpr)
+	return ok && value.Op == token.AND && isIdentifier(value.X, want)
+}
+
+func isQueuedWorkFromItem(expression ast.Expr) bool {
+	value, ok := expression.(*ast.CompositeLit)
+	if !ok || !isSelector(value.Type, "runner", "QueuedWork") || len(value.Elts) != 1 {
+		return false
+	}
+	field, ok := value.Elts[0].(*ast.KeyValueExpr)
+	return ok && isIdentifier(field.Key, "OperationalPayload") && isItemOperationalPayload(field.Value)
+}
+
+func isItemOperationalPayload(expression ast.Expr) bool {
+	return isSelector(expression, "item", "OperationalPayload")
+}
+
+func isEncoderOutputCall(call *ast.CallExpr) bool {
+	if len(call.Args) != 1 || !isIdentifier(call.Args[0], "output") {
+		return false
+	}
+	encode, ok := call.Fun.(*ast.SelectorExpr)
+	if !ok || encode.Sel.Name != "Encode" {
+		return false
+	}
+	newEncoder, ok := encode.X.(*ast.CallExpr)
+	return ok && isSelector(newEncoder.Fun, "json", "NewEncoder") && len(newEncoder.Args) == 1 && isSelector(newEncoder.Args[0], "os", "Stdout")
+}
+
+func probeOutputFieldsAreDirect(file *ast.File) bool {
+	valid := false
+	ast.Inspect(file, func(node ast.Node) bool {
+		assignment, ok := node.(*ast.AssignStmt)
+		if !ok || len(assignment.Lhs) != 1 || !isIdentifier(assignment.Lhs[0], "output") || len(assignment.Rhs) != 1 {
+			return true
+		}
+		literal, ok := assignment.Rhs[0].(*ast.CompositeLit)
+		if !ok {
+			return true
+		}
+		fields := map[string]ast.Expr{}
+		for _, element := range literal.Elts {
+			field, ok := element.(*ast.KeyValueExpr)
+			if !ok {
+				return true
+			}
+			name, ok := field.Key.(*ast.Ident)
+			if !ok {
+				return true
+			}
+			fields[name.Name] = field.Value
+		}
+		valid = isBase64EncodingOf(fields["ProjectedPayload"], "item") &&
+			isBase64EncodingOf(fields["CanonicalPayload"], "canonical") &&
+			isIdentifier(fields["OperationalDigest"], "digest") && isErrorString(fields["ForgedSidecarError"])
+		return true
+	})
+	return valid
+}
+
+func isBase64EncodingOf(expression ast.Expr, name string) bool {
+	call, ok := expression.(*ast.CallExpr)
+	return ok && isBase64EncodeCall(call, name)
+}
+
+func isBase64EncodeCall(call *ast.CallExpr, name string) bool {
+	if !isStdEncodingEncodeToString(call.Fun) {
+		return false
+	}
+	return len(call.Args) == 1 && ((name == "item" && isItemOperationalPayload(call.Args[0])) || isIdentifier(call.Args[0], name))
+}
+
+func isStdEncodingEncodeToString(expression ast.Expr) bool {
+	call, ok := expression.(*ast.SelectorExpr)
+	if !ok || call.Sel.Name != "EncodeToString" {
+		return false
+	}
+	return isSelector(call.X, "base64", "StdEncoding")
+}
+
+func isErrorString(expression ast.Expr) bool {
+	call, ok := expression.(*ast.CallExpr)
+	return ok && isSelector(call.Fun, "err", "Error") && len(call.Args) == 0
 }
 
 func validateArtifact(raw []byte) error {
@@ -319,6 +526,12 @@ func validateArtifact(raw []byte) error {
 	}
 	if decoded.Schema != artifactSchema || decoded.Tag != pinnedTag || decoded.Commit != pinnedCommit {
 		return errors.New("committed artifact has the wrong schema, tag, or commit")
+	}
+	if decoded.GoVersion != pinnedGoVersion || decoded.ProbeSourceSHA != probeTemplateSHA256 {
+		return errors.New("committed artifact has the wrong Go version or probe template hash")
+	}
+	if !sameSourceBlobs(decoded.SourceBlobs, pinnedBlobs) {
+		return errors.New("committed artifact source blobs do not match the pinned release")
 	}
 	if decoded.ArtifactDigest == "" {
 		return errors.New("committed artifact has no artifactDigest")
@@ -345,6 +558,18 @@ func validateArtifact(raw []byte) error {
 		return errors.New("committed artifact does not record the pinned forged-sidecar rejection")
 	}
 	return nil
+}
+
+func sameSourceBlobs(got, want []sourceBlob) bool {
+	if len(got) != len(want) {
+		return false
+	}
+	for index := range want {
+		if got[index] != want[index] {
+			return false
+		}
+	}
+	return true
 }
 
 // The input is intentionally raw JSON, not a Go struct. The daemon's release
@@ -385,12 +610,18 @@ func main() {
 	if err != nil { panic(err) }
 	var rejected daemon.PollWorkItem
 	if err := json.Unmarshal(forged, &rejected); err == nil { panic("forged operationalPayload was accepted") } else if err.Error() != "daemon poll: operationalPayload does not match raw poll item" { panic(err) } else {
-		json.NewEncoder(os.Stdout).Encode(struct {
+		output := struct {
 			ProjectedPayload string ` + "`json:\"projectedPayloadBase64\"`" + `
 			CanonicalPayload string ` + "`json:\"canonicalPayloadBase64\"`" + `
 			OperationalDigest string ` + "`json:\"operationalDigest\"`" + `
 			ForgedSidecarError string ` + "`json:\"forgedSidecarError\"`" + `
-		}{base64.StdEncoding.EncodeToString(item.OperationalPayload), base64.StdEncoding.EncodeToString(canonical), digest, err.Error()})
+		}{
+			ProjectedPayload: base64.StdEncoding.EncodeToString(item.OperationalPayload),
+			CanonicalPayload: base64.StdEncoding.EncodeToString(canonical),
+			OperationalDigest: digest,
+			ForgedSidecarError: err.Error(),
+		}
+		if err := json.NewEncoder(os.Stdout).Encode(output); err != nil { panic(err) }
 	}
 }
 `
