@@ -6,6 +6,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.8 — 2026-08-30
+
+### Features
+
+- **Session names now remain consistent from fleet admission through the native
+  harness.** Claude and Pi receive the normalized session name at startup;
+  headless Codex names its thread before the first turn; and interactive Codex
+  uses the app-server naming surface, verifies the assigned thread name, then
+  resumes that exact thread in the terminal. Unsupported named-interactive
+  combinations fail before launch instead of silently substituting a generated
+  identity.
+- **Interactive prompt submissions expose durable retry receipts.** The public
+  client and `agent chat` command accept a caller-owned idempotency key and
+  return the server receipt fields needed to distinguish accepted, replayed,
+  unavailable, and forbidden outcomes without guessing from transport success.
+
+### Fixes
+
+- **Prepared-harness preflight and spawn now reconcile the same resolved model
+  profile.** Receipt-bearing interactive work no longer fails because the
+  daemon compiled authority from a different profile shape than the child
+  runner. Genuine authority changes still fail closed, and diagnostic errors
+  name only the drifting projection fields while retaining digest-only values.
+
 ## v0.72.7 — 2026-08-30
 
 ### Features
