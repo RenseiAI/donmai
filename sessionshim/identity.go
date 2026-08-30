@@ -89,6 +89,7 @@ const (
 	recordSuffix    = ".json"
 	socketSuffix    = ".sock"
 	tombstoneSuffix = ".tombstone.json"
+	logSuffix       = ".log"
 )
 
 // TombstoneName is the legacy v1 identity-only tombstone alias. New writes also
@@ -96,4 +97,13 @@ const (
 func (id Identity) TombstoneName() string {
 	sum := sha256.Sum256([]byte(id.Key()))
 	return hex.EncodeToString(sum[:]) + tombstoneSuffix
+}
+
+// LogName is the on-disk filename for this identity's launched shim child's
+// captured stdout/stderr. Same fixed-length digest convention as RecordName/
+// TombstoneName (the full digest, not truncated like SocketName — a log path
+// carries no AF_UNIX sun_path bound, so there is no reason to shorten it).
+func (id Identity) LogName() string {
+	sum := sha256.Sum256([]byte(id.Key()))
+	return hex.EncodeToString(sum[:]) + logSuffix
 }

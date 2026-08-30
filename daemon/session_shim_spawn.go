@@ -4,9 +4,12 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"regexp"
 	"sort"
 	"sync"
 	"sync/atomic"
@@ -152,6 +155,29 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	if err != nil {
 		return nil, err
 	}
+	// The guard runs for as long as the log file exists (guardShimChildLogOnce
+	// self-terminates the loop once removeShimChildLog disposes of it) — no
+	// cancellation plumbing needed for the ordinary adopted-and-terminated
+	// case, where removeShimChildLog runs at the SAME terminal cleanup that
+	// withdraws the discovery record and tombstone.
+	//
+	// launchAdopted covers every OTHER exit from this function: every
+	// early-return failure path below this point (awaitShimRecord, Dial,
+	// adoption evidence, durable publication, batch commit, revision
+	// retention, …) leaves this session NEVER entering d.shims.adopted, so
+	// none of finishAdoptedShim / the startup adoption pass / the
+	// quarantine reconciliation pass will ever run for it — nothing else
+	// would otherwise dispose of this log file or stop this goroutine, ever.
+	// Once trackLaunchedShim below hands the session to the ordinary
+	// adopted-session lifecycle, this defer becomes a no-op.
+	logPath := shimChildLogPath(launch.RegistryDir, launch.Identity)
+	launchAdopted := false
+	defer func() {
+		if !launchAdopted {
+			removeShimChildLog(launch.RegistryDir, launch.Identity)
+		}
+	}()
+	go runShimChildLogGuard(logPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
 	defer cancel()
@@ -347,6 +373,14 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	d.shims.mu.Unlock()
 
 	handle := d.trackLaunchedShim(ctrl, spec, project, workarea, layout.Root.String(), evidence, receipt, false)
+	// The session is now in d.shims.adopted: its eventual termination runs
+	// through finishAdoptedShim (or, across a daemon restart, the startup
+	// adoption / quarantine reconciliation passes), which disposes of the
+	// log file and — by removing it — stops the guard goroutine started
+	// above. Everything from here on can still return a non-nil handle with
+	// a nil error even after a "degraded" publication/activation hiccup
+	// (see below); none of that changes who now owns this log's lifecycle.
+	launchAdopted = true
 	gate.finish(true)
 	if cfg.OnAdoptionPublished != nil {
 		d.shims.mu.RLock()
@@ -405,6 +439,20 @@ func (d *Daemon) ringSessionShimPostActivationHeartbeat(ctx context.Context) {
 	}
 }
 
+// shimChildLogPath returns the per-session log file path a launched shim's
+// stdout/stderr is captured to: <registryDir>/<id.LogName()> — alongside
+// that same session's discovery record and adoption socket
+// (sessionshim.Registry), which is already the exact directory production
+// resolves via defaultShimRegistryDir/statepath.Resolve and tests override
+// via SessionShimConfig.RegistryDir, so this needs no separate state-home
+// seam or test-only override of its own. The filename is the SAME
+// fixed-length digest convention as every other sibling artifact under this
+// directory (Identity.RecordName/SocketName/TombstoneName) rather than the
+// raw session id — see sessionshim/identity.go's doc comments for why.
+func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
+	return filepath.Join(registryDir, id.LogName())
+}
+
 // startShimProcess execs the worker as a detached shim and then RELEASES it.
 //
 // Release is the ownership move made concrete. os/exec would otherwise leave the
@@ -420,15 +468,34 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
 
-	// A shim outlives this daemon, so it cannot inherit this daemon's stdio: a
-	// closed pipe after the daemon exits would hand the shim EPIPE on its own
-	// logging. It gets the null device and speaks over its socket instead.
+	// A shim outlives this daemon, so it cannot inherit this daemon's stdio
+	// via a pipe THIS process reads: a closed pipe after the daemon exits
+	// would hand the shim EPIPE on its own logging (the constraint a plain
+	// os.Pipe()-and-forward, worker_spawner.go-style approach cannot honor
+	// here). stdin still gets the null device — nothing ever writes to a
+	// detached shim's stdin. stdout/stderr are instead duped into a
+	// per-session log FILE: unlike a pipe, a file fd stays valid for the
+	// child's entire lifetime regardless of whether this daemon process is
+	// still around to hold the other end, so every runner/provider error the
+	// shim child would otherwise silently swallow (including the exact
+	// class of tool/lifecycle adaptation refusal
+	// repository_sandbox_reconcile.go's doc comment describes) is now
+	// captured rather than discarded into /dev/null.
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
 		return 0, fmt.Errorf("session shim: open %s: %w", os.DevNull, err)
 	}
 	defer func() { _ = devNull.Close() }()
-	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, devNull, devNull
+	logPath := shimChildLogPath(launch.RegistryDir, launch.Identity)
+	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
+		return 0, fmt.Errorf("session shim: create log directory for %s: %w", logPath, err)
+	}
+	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G302: session-scoped operator diagnostics, same 0o600 convention as the rest of daemon/
+	if err != nil {
+		return 0, fmt.Errorf("session shim: open %s: %w", logPath, err)
+	}
+	defer func() { _ = logFile.Close() }()
+	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, logFile, logFile
 
 	if err := cmd.Start(); err != nil {
 		return 0, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
@@ -442,6 +509,192 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 			"session", spec.SessionID, "pid", pid, "error", err)
 	}
 	return pid, nil
+}
+
+// shimChildLogCapBytes bounds the per-session shim child log file
+// (shimChildLogPath). O_APPEND alone is unbounded — a long-running
+// interactive session could otherwise fill the disk.
+const shimChildLogCapBytes = 4 << 20 // 4 MiB
+
+// shimChildLogGuardInterval is how often runShimChildLogGuard re-scans a
+// live session's log file to redact secret-shaped content and enforce
+// shimChildLogCapBytes.
+const shimChildLogGuardInterval = 2 * time.Second
+
+// shimChildLogTruncationMarkerFormat is appended once a tick truncates the
+// file back to shimChildLogCapBytes.
+const shimChildLogTruncationMarkerFormat = "\n[donmai] shim child log truncated at %d bytes (cap %d bytes)\n"
+
+// shimChildLogSecretPatterns are the credential shapes redacted from a
+// launched shim's captured stdout/stderr before the guard leaves them on
+// disk: an authorization header ("Bearer <token>"), well-known prefixed
+// API-key/machine-token shapes (OpenAI-style sk-, and the dmk_/rsk_/rsp_
+// prefixes cmd/donmai/main.go's own credential resolution already
+// recognizes), and a generic catch-all for any other long opaque
+// base64/hex-shaped run a provider's own stderr might carry (e.g.
+// provider/harness/clijsonl's raw claude-CLI stderr passthrough). The
+// catch-all is deliberately broad — it will also mask non-secret long
+// identifiers (commit SHAs, session hashes) — a false positive there is the
+// accepted trade-off for an OSS-safe, provider-agnostic default; this file
+// never inspects or special-cases any one provider's output shape.
+var shimChildLogSecretPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`),
+	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{16,}`),
+	regexp.MustCompile(`\brsk_[A-Za-z0-9_-]{16,}`),
+	regexp.MustCompile(`\brsp_[A-Za-z0-9_-]{16,}`),
+	regexp.MustCompile(`\bdmk_[A-Za-z0-9]{16,}`),
+	regexp.MustCompile(`\b[A-Za-z0-9+/_-]{32,}\b`),
+}
+
+// runShimChildLogGuard periodically redacts and caps a launched shim's
+// captured stdout/stderr file. It exits on its own once the file is gone —
+// removeShimChildLog deletes it exactly once, at the same terminal cleanup
+// that disposes of this session's discovery record and tombstone — so no
+// separate cancellation signal is threaded in.
+//
+// This is deliberately NOT a live writer sitting in the child's stdout/
+// stderr path (contrast worker_spawner.go's pipe-to-log pattern for the
+// direct-child lane): startShimProcess dupes a raw *os.File straight into
+// the child so a detached shim's stdio survives this daemon exiting or
+// restarting (see that function's doc comment). Threading a daemon-owned
+// io.Writer through cmd.Stdout/Stderr instead would make os/exec fall back
+// to an internal pipe + copying goroutine — and this child is our own Go
+// binary, whose stdout/stderr (fds 1/2) the Go runtime kills the process on
+// SIGPIPE for by default, so a reader that vanishes on daemon restart could
+// SILENTLY KILL a session a human may still be attached to, not just lose
+// its logs. Scanning and rewriting the file on disk out-of-band avoids that
+// risk entirely, at the cost of a short exposure window (one guard
+// interval) before a secret-shaped run is masked, and a short window
+// before growth past the cap is trimmed back — both bounded by
+// shimChildLogGuardInterval.
+func runShimChildLogGuard(logPath string) {
+	ticker := time.NewTicker(shimChildLogGuardInterval)
+	defer ticker.Stop()
+	for range ticker.C {
+		if !guardShimChildLogOnce(logPath) {
+			return
+		}
+	}
+}
+
+// guardShimChildLogOnce runs one redact+cap pass. It reports whether logPath
+// still exists — false tells the caller's loop to stop, because
+// removeShimChildLog already disposed of the file as part of this session's
+// terminal cleanup.
+func guardShimChildLogOnce(logPath string) bool {
+	f, err := os.OpenFile(logPath, os.O_RDWR, 0o600) //nolint:gosec // G304: logPath is derived from this daemon's own registry directory + a digest filename, never external input
+	if err != nil {
+		return !errors.Is(err, os.ErrNotExist)
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return true
+	}
+	size := info.Size()
+	if err := redactShimChildLog(f, size); err != nil {
+		// logPath is this daemon's own registry directory plus a
+		// digest-named file (shimChildLogPath) — never external input —
+		// but gosec's taint analysis (G706) cannot see that provenance
+		// through the call chain, so it flags the structured field the
+		// same way every other slog call in this package that logs a
+		// daemon-owned path already does; see e.g.
+		// kit_registry.go's "kit registry: read scan path" for the same
+		// precedent.
+		slog.Warn("session shim: redact child log", //nolint:gosec // structured slog handler escapes values
+			"path", logPath,
+			"error", err,
+		)
+	}
+	if err := capShimChildLog(f, size); err != nil {
+		slog.Warn("session shim: cap child log", //nolint:gosec // structured slog handler escapes values
+			"path", logPath,
+			"error", err,
+		)
+	}
+	return true
+}
+
+// redactShimChildLog masks every shimChildLogSecretPatterns match found in
+// f's first size bytes with the ASCII byte 'x', repeated for the exact
+// matched span. Same-length, same-offset in-place substitution is
+// deliberate: it is race-safe against the shim child's own concurrent
+// O_APPEND writes past size (offsets [0,size) were already durably on disk
+// before this snapshot was taken, and nothing here ever touches offset
+// size or beyond), whereas a rewrite that could shift or shorten content
+// would not be.
+func redactShimChildLog(f *os.File, size int64) error {
+	if size <= 0 {
+		return nil
+	}
+	buf := make([]byte, size)
+	if _, err := f.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
+		return err
+	}
+	changed := false
+	for _, pattern := range shimChildLogSecretPatterns {
+		for _, loc := range pattern.FindAllIndex(buf, -1) {
+			for i := loc[0]; i < loc[1]; i++ {
+				if buf[i] != 'x' {
+					changed = true
+				}
+				buf[i] = 'x'
+			}
+		}
+	}
+	if !changed {
+		return nil
+	}
+	_, err := f.WriteAt(buf, 0)
+	return err
+}
+
+// capShimChildLog truncates f back to shimChildLogCapBytes and appends one
+// truncation marker line when size exceeds the cap.
+//
+// Truncate is a metadata-only size change — it never rewrites bytes
+// [0,shimChildLogCapBytes) — so, like redactShimChildLog, it never races the
+// child's own concurrent O_APPEND writes.
+//
+// The marker write is a SEPARATE fd opened O_APPEND specifically for this
+// write, not f.Seek(END)+f.Write on f itself: f is opened O_RDWR without
+// O_APPEND (guardShimChildLogOnce), so a plain Seek+Write is two syscalls —
+// a concurrent append from the child's own O_APPEND fd landing between them
+// would move the true end-of-file out from under the Seek's result, and
+// this function's Write would then land at that now-stale offset and
+// OVERWRITE the child's just-appended bytes instead of following them. A
+// fresh O_APPEND-opened fd makes the marker write one atomic
+// seek-to-current-EOF-then-write kernel operation, exactly the same
+// guarantee the child's own writes already rely on.
+func capShimChildLog(f *os.File, size int64) error {
+	if size <= shimChildLogCapBytes {
+		return nil
+	}
+	if err := f.Truncate(shimChildLogCapBytes); err != nil {
+		return err
+	}
+	appendFile, err := os.OpenFile(f.Name(), os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G304: f.Name() is this daemon's own already-open handle's path, never external input
+	if err != nil {
+		return err
+	}
+	defer func() { _ = appendFile.Close() }()
+	_, err = appendFile.Write([]byte(fmt.Sprintf(shimChildLogTruncationMarkerFormat, size, shimChildLogCapBytes)))
+	return err
+}
+
+// removeShimChildLog disposes of the per-session stdout/stderr capture file
+// (shimChildLogPath) as part of the SAME terminal cleanup that withdraws
+// this session's discovery record and disposes its tombstone (see this
+// file's finishAdoptedShim and the quarantine/startup-adoption terminal
+// disposal call sites) — never left behind indefinitely the way an
+// unmanaged log file would be. Best-effort and idempotent: a missing file
+// is not an error, and a removal failure only leaks one log file, never a
+// reason to fail a terminal cleanup pass whose durable evidence is already
+// committed.
+func removeShimChildLog(registryDir string, id sessionshim.Identity) {
+	if err := os.Remove(shimChildLogPath(registryDir, id)); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("session shim: remove per-session log file", "session", id.String(), "error", err)
+	}
 }
 
 // shimCommand is the argv used to launch a shim. It is the SAME worker command
@@ -1063,6 +1316,9 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
 		slog.Warn("session shim: dispose tombstone", "session", id.String(), "error", err)
 	}
+	// The captured stdout/stderr file is disposed alongside the record/
+	// tombstone above — see removeShimChildLog's doc comment.
+	removeShimChildLog(registry.Dir(), id)
 }
 
 // tombstoneSettleWindow bounds the wait for a shim's tombstone after its Exit
@@ -1353,6 +1609,9 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 			"session", id.String(), "error", err)
 		return
 	}
+	// The captured stdout/stderr file is disposed alongside the record/
+	// tombstone above — see removeShimChildLog's doc comment.
+	removeShimChildLog(registry.Dir(), id)
 	// The proof is off disk, so no later pass can rediscover this incarnation
 	// and no mark is needed to stop it. Keeping one would make this map grow for
 	// the daemon's whole life.

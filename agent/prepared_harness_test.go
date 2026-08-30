@@ -8,6 +8,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
 func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
@@ -237,5 +238,80 @@ func TestPreparedHarnessDropsDeniedAdvisoryExtensionsOnApply(t *testing.T) {
 	}
 	if len(adapted.AdditionalExtensions) != 0 {
 		t.Fatalf("dropped deliveries must be stripped on the prepared-harness lane too, got %d riding", len(adapted.AdditionalExtensions))
+	}
+}
+
+// TestApplyPreparedHarnessNamesToolLifecycleOnlyDriftingFields is the
+// control for the tool/lifecycle drift naming fix: a genuine tool-policy
+// difference that changes ApplyPreparedHarness's recomputed
+// ToolLifecycleReceipt WITHOUT changing the harnessAuthorityProjection
+// digest must still refuse, and must name the drifting field via
+// *agent.ToolLifecycleDriftError rather than the bare, undiagnosable
+// "agent: tool/lifecycle application differs from host adaptation receipt"
+// a production incident reported (see
+// runner/repository_sandbox_reconcile.go's doc comment for that incident).
+//
+// Spec.ToolSurfaceRequired is the lever: it governs only the "allowed-tools"
+// receipt entry's Required flag (agent/tool_adaptation.go's
+// legacyToolRequirements) and is deliberately absent from
+// harnessAuthorityProjection (agent/prepared_harness.go) — flipping it after
+// preflight cannot be caught by the AuthorityDigest check the same way
+// TestApplyPreparedHarnessNamesDriftingFields's cases are, so this isolates
+// the SEPARATE ToolLifecycleReceipt check this fix adds naming to. pi's
+// autonomous NativeToolPolicyDelivery (ToolDeliveryPiInjectedBoundary) admits
+// AllowedTools regardless of Required, so AdaptToolLifecycle succeeds on
+// both sides and only the receipt's "entries" digest differs.
+func TestApplyPreparedHarnessNamesToolLifecycleOnlyDriftingFields(t *testing.T) {
+	t.Parallel()
+	manifest := (&pi.Provider{}).Manifest()
+	source := agent.Spec{
+		PromptMode:   agent.PromptModeAutonomous,
+		Autonomous:   true,
+		Model:        "gpt-test",
+		AllowedTools: []string{"Read"},
+		PromptPlan: &agent.PromptPlan{
+			ContractVersion:  agent.PromptContractVersion,
+			BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+			UserPrompt:       agent.PromptContent{ID: "actual-user-task", Text: "inspect the actual input", Required: true},
+		},
+	}
+	const operationalDigest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	var materializations []agent.HarnessMaterialization
+	for _, channel := range []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"} {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	plan, err := agent.CompilePreparedHarness(source, manifest, operationalDigest, nil, materializations)
+	if err != nil {
+		t.Fatalf("CompilePreparedHarness: %v", err)
+	}
+
+	optional := false
+	materialized := source
+	materialized.ToolSurfaceRequired = &optional
+	materialized.PreparedHarness = plan
+
+	_, err = agent.PrepareHarness(materialized, manifest)
+	if err == nil {
+		t.Fatal("expected a tool-lifecycle drift error, got nil")
+	}
+	var authDrift *agent.AuthorityDriftError
+	if errors.As(err, &authDrift) {
+		t.Fatalf("control invalid: ToolSurfaceRequired leaked into the projection digest (fields=%v) — it must be caught ONLY by the separate ToolLifecycleReceipt check", authDrift.Fields)
+	}
+	var toolDrift *agent.ToolLifecycleDriftError
+	if !errors.As(err, &toolDrift) {
+		t.Fatalf("expected *agent.ToolLifecycleDriftError, got %T: %v", err, err)
+	}
+	found := false
+	for _, field := range toolDrift.Fields {
+		if field == "entries" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("Fields = %v, want it to name %q", toolDrift.Fields, "entries")
+	}
+	if !strings.Contains(err.Error(), "entries") {
+		t.Fatalf("Error() = %q must name the drifting field", err.Error())
 	}
 }

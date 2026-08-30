@@ -6,6 +6,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // runtimeMaterializedCredential is the placeholder the prepared-source lane
@@ -104,11 +105,21 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.S
 	return spec, runtimeNames, nil
 }
 
-func compilePreparedHarness(qw QueuedWork, selection harnessSelection) (*agent.PreparedHarness, agent.Spec, error) {
+// compilePreparedHarness compiles the receipt-bearing host authority for qw.
+// repositoryDeclaration is the SAME normalized declaration the spawn lane
+// resolves (runner.resolveRepositoryWorkarea) — the daemon preflight
+// compiler resolves it independently (ProviderView.PreflightExecution) and
+// forwards it here so ReconcileRepositorySandbox applies identically on both
+// sides; see that function's doc comment for why a receipt-bearing session
+// with a declared repository must never leave this reconciliation to only
+// one of the two compile sites. Nil is a legitimate value: a repository-free
+// or non-multi-repo-protocol session never had this mutation to reconcile.
+func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration) (*agent.PreparedHarness, agent.Spec, error) {
 	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection)
 	if err != nil {
 		return nil, agent.Spec{}, err
 	}
+	spec = ReconcileRepositorySandbox(spec, repositoryDeclaration)
 	harness, ok := selection.Provider.(agent.HarnessProvider)
 	if !ok {
 		return nil, agent.Spec{}, errors.New("runner: selected provider has no exact harness manifest")
