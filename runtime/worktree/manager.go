@@ -17,6 +17,7 @@ import (
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -692,6 +693,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = res
 			m.mu.Unlock()
+			m.excludeHarnessState(res.Path, spec.Strategy)
 			m.logger.Debug("worktree provisioned",
 				"sessionId", spec.SessionID, "path", res.Path, "workareaRoot", res.WorkareaRoot,
 				"nested", layout.IsNested(),
@@ -862,6 +864,7 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone, Attempts: 1,
 	}
 	m.mu.Unlock()
+	m.excludeHarnessState(selectedPath, StrategyClone)
 	m.logger.Debug("shared workarea participant joined", "sessionId", spec.SessionID, "ownerSessionId", record.SessionID, "workareaRoot", record.FinalRoot)
 	return selectedPath, nil
 }
@@ -1281,6 +1284,33 @@ func (m *Manager) worktreeAlreadyRemoved(ctx context.Context, parentRepoPath, pa
 		}
 	}
 	return true, nil
+}
+
+// excludeHarnessState keeps every checkout-resident harness state directory
+// (runtime/harnessstate) out of `git status` for a workarea this manager just
+// materialized. A session that sees its own live state reported as untracked
+// junk is one `rm -rf` away from stranding itself — that is not hypothetical,
+// it happened on 2026-08-29.
+//
+// Best-effort by design, and logged rather than returned: a workarea whose
+// exclude file could not be written is noisier, not broken, and failing a
+// provision over git hygiene would turn a cosmetic problem into a lost
+// session. A non-git workarea is a silent no-op inside the helper.
+func (m *Manager) excludeHarnessState(path string, strategy CloneStrategy) {
+	if path == "" {
+		return
+	}
+	// A repository-free workarea has no version control by construction, and
+	// the runner's repository-free contract is that such a session invokes NO
+	// git at all — a marker-based test enforces exactly that. There is nothing
+	// to exclude and nothing to ask.
+	if strategy == StrategyEmpty {
+		return
+	}
+	if err := harnessstate.EnsureExcluded(path); err != nil {
+		m.logger.Warn("could not exclude harness state from git status",
+			"path", path, "err", err)
+	}
 }
 
 // Path returns the worktree path for a previously-provisioned session.

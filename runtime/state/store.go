@@ -10,11 +10,17 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
 // AgentDirName is the conventional sub-directory name inside a worktree
 // where state.json (and friends — heartbeat.json, todos.json) live.
-const AgentDirName = ".agent"
+//
+// It is defined by runtime/harnessstate, which is the single source of
+// truth for every checkout-resident state directory — the same list the
+// backstop refuses to commit and the provision step excludes from git.
+// Declaring the name here as well would be a second copy that could drift.
+const AgentDirName = harnessstate.RunnerStateDir
 
 // StateFileName is the conventional file name for the state file.
 const StateFileName = "state.json"

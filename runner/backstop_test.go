@@ -234,11 +234,25 @@ func TestShouldExcludeFromBackstop_Table(t *testing.T) {
 		{"gocache/x", true},
 		{".golangci-lint-cache/x", true},
 
-		// Top-level only — `.agent/state.json` excluded; a file
-		// literally named `.agent` is not.
+		// Top-level only — a state dir's contents are excluded; a file
+		// literally named like one, or a nested directory of that name,
+		// is not.
 		{".agent/state.json", true},
 		{".agent", false},
 		{"app/.agent", false},
+		{".pi/session.jsonl", true},
+		{".pi/agent-home/config.json", true},
+		{".pi", false},
+		{"app/.pi", false},
+		{".claude/settings.local.json", true},
+		{".codex/history.jsonl", true},
+		// A directory that merely shares a prefix with a state dir is
+		// ordinary project content.
+		{".pi-cache/blob", false},
+		{".agentic/plan.md", false},
+		// `.donmai` is tracked repo configuration, not harness state —
+		// only its generated index is excluded (path-prefix table below).
+		{".donmai/config.yaml", false},
 
 		// Extensions.
 		{"server.log", true},

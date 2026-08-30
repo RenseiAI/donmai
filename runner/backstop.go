@@ -15,6 +15,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/gitexec"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -50,14 +51,17 @@ var excludeDirAnyDepth = []string{
 }
 
 // excludeDirTopLevel lists directory names that disqualify a path
-// only when they are the top-level component. Mirrors
-// EXCLUDE_DIR_TOP_LEVEL from the legacy TS.
+// only when they are the top-level component. The legacy TS
+// EXCLUDE_DIR_TOP_LEVEL named only `.agent` — the runner's own state
+// dir — which left every OTHER harness's checkout-resident state
+// (session storage, project-local CLI config) eligible for a backstop
+// commit purely because nothing had thought to list it.
 //
-// `.agent` is the runner's own state dir; the backstop must never
-// commit it even if a previous commit accidentally tracked it.
-var excludeDirTopLevel = []string{
-	".agent",
-}
+// The list now comes from runtime/harnessstate, the single source of
+// truth shared with the provision-time git exclude. Two lists that must
+// agree about what "harness state" means will eventually disagree; one
+// list cannot.
+var excludeDirTopLevel = harnessstate.Dirs()
 
 // excludeExtensions is the set of file extensions (with leading dot)
 // that disqualify a path. Mirrors EXCLUDE_EXTENSIONS.
@@ -112,7 +116,7 @@ func shouldExcludeFromBackstop(path string) bool {
 
 	// Top-level-only directory names. Index 0 is the top-level
 	// component; require parts.length > 1 so we don't exclude a
-	// file *named* ".agent".
+	// file *named* like a state dir.
 	if len(parts) > 1 {
 		for _, ex := range excludeDirTopLevel {
 			if parts[0] == ex {

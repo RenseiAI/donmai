@@ -12,6 +12,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -831,5 +832,97 @@ func TestProvisionGitAuthHeaderNotEmittedForUnscopableRemote(t *testing.T) {
 	}
 	if v, ok := configValueForKey(gotEnv, "credential.helper"); !ok || v != "" {
 		t.Errorf("credential.helper = %q present=%v, want empty+present", v, ok)
+	}
+}
+
+// TestProvisionExcludesHarnessStateFromGitStatus is the provision-side control
+// for the harness-state hygiene rule: a workarea this manager hands to a
+// session must not report the session's own live state as untracked junk. It
+// is the general form of the 2026-08-29 loss, in which a seat read `?? .pi/`
+// in `git status` and deleted a running session's storage.
+//
+// The stub clone materializes a REAL git checkout so the exclusion is measured
+// by git itself rather than asserted against our own writer.
+//
+// RED (with the excludeHarnessState call removed from Provision):
+//
+//	git status --porcelain = "?? .agent/\n?? .claude/\n?? .codex/\n?? .pi/"
+//
+// GREEN: empty.
+func TestProvisionExcludesHarnessStateFromGitStatus(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+
+	dir := t.TempDir()
+	runner := newStubRunner(
+		func(name string, args ...string) ([]byte, error) {
+			if name != "git" || args[0] != "clone" {
+				t.Errorf("unexpected call: %s %v", name, args)
+			}
+			dst := args[len(args)-1]
+			if err := os.MkdirAll(dst, 0o750); err != nil {
+				return nil, err
+			}
+			// A real checkout, so `git status` is the judge.
+			for _, initArgs := range [][]string{
+				{"init", "--quiet", "-b", "main"},
+				{"config", "user.email", "test@example.invalid"},
+				{"config", "user.name", "test"},
+			} {
+				cmd := exec.Command("git", append([]string{"-C", dst}, initArgs...)...) //nolint:gosec // G204: test fixture; dst is under t.TempDir().
+				if out, err := cmd.CombinedOutput(); err != nil {
+					return nil, fmt.Errorf("git %v: %w (%s)", initArgs, err, out)
+				}
+			}
+			return []byte(""), nil
+		},
+	)
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner.run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "s-exclude",
+		RepoURL:   "git@example.com:org/repo.git",
+		Branch:    "main",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+
+	// Every harness state dir a session could create, created.
+	for _, name := range harnessstate.Dirs() {
+		sub := filepath.Join(path, name)
+		if err := os.MkdirAll(sub, 0o700); err != nil {
+			t.Fatalf("create %s: %v", name, err)
+		}
+		if err := os.WriteFile(filepath.Join(sub, "state"), []byte("x\n"), 0o600); err != nil {
+			t.Fatalf("write into %s: %v", name, err)
+		}
+	}
+
+	status := exec.Command("git", "-C", path, "status", "--porcelain") //nolint:gosec // G204: test fixture; path is under t.TempDir().
+	out, statusErr := status.CombinedOutput()
+	if statusErr != nil {
+		t.Fatalf("git status: %v\n%s", statusErr, out)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("provisioned workarea reports harness state as untracked:\n%s", out)
+	}
+
+	// Ordinary session output is still visible — the exclusion must not have
+	// silenced the whole checkout.
+	if err := os.WriteFile(filepath.Join(path, "new.go"), []byte("package main\n"), 0o600); err != nil {
+		t.Fatalf("write new.go: %v", err)
+	}
+	out, statusErr = exec.Command("git", "-C", path, "status", "--porcelain").CombinedOutput() //nolint:gosec // G204: test fixture; path is under t.TempDir().
+	if statusErr != nil {
+		t.Fatalf("git status: %v\n%s", statusErr, out)
+	}
+	if !strings.Contains(string(out), "new.go") {
+		t.Fatalf("real session output is not reported by git status:\n%s", out)
 	}
 }
