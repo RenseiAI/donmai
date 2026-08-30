@@ -12,6 +12,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
 // embeddedExtensions ships the donmai policy extension INSIDE the donmai
@@ -32,7 +33,7 @@ const (
 	// an auto-discovered extensions/ subdir): the harness loads it explicitly
 	// with `pi --mode rpc -e <path> --no-extensions`, so keeping it out of any
 	// auto-scan location prevents a double-load.
-	piStateDir = ".pi"
+	piStateDir = harnessstate.PiStateDir
 
 	// donmaiUIMarker is the extension_ui_request placeholder the policy
 	// extension stamps on every trust-boundary round-trip. The pump dispatches
@@ -171,13 +172,18 @@ func materializeExtension(cwd string) (sessionLayout, error) {
 	if err := os.MkdirAll(layout.root, 0o700); err != nil {
 		return layout, fmt.Errorf("pi: create state dir: %w", err)
 	}
-	// Keep the state dir out of `git status` for the checkout that is about to
-	// run this session (gitexclude.go explains why that is the difference
-	// between live harness state and something that reads as deletable junk).
+	// Keep every harness state dir out of `git status` for the checkout that
+	// is about to run this session (runtime/harnessstate explains why that is
+	// the difference between live harness state and something that reads as
+	// deletable junk). The workarea provision step calls the same function, so
+	// a fleet-provisioned session is already covered; this call is what covers
+	// an INTERACTIVE seat attached to a checkout the runner never provisioned —
+	// the shape the 2026-08-29 loss actually took.
+	//
 	// Deliberately best-effort: a session whose exclude file could not be
 	// written is noisier, not broken, and refusing to spawn over git hygiene
 	// would turn a cosmetic problem into a hard failure.
-	_ = ensureGitExcluded(cwd, piGitExcludeEntries()...)
+	_ = harnessstate.EnsureExcluded(cwd)
 	// The boundary extension's bytes are BYTE-IDENTICAL across every session
 	// this process spawns (it is compiled into the binary — extensionSource()
 	// never varies), so every concurrent spawn is writing the same content to
