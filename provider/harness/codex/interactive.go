@@ -99,6 +99,11 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 			config.remove(),
 		)
 	}
+	// The verified private store is now the sole child authority. Empty values
+	// deliberately override inherited parent credentials in both the effective
+	// config preflight and the PTY process environment.
+	launch.env = clearInteractiveCodexAuthEnvironment(launch.env)
+	spec.Env = launch.env
 	if err := verifyExclusiveInteractiveMCP(
 		ctx,
 		opts.interactiveMCPInventoryRunner,

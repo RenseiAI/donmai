@@ -313,6 +313,28 @@ func TestIntegration_RealCodexPlatformPTYStartsWithoutProjectTrustReview(t *test
 	}
 }
 
+func TestIntegration_RealCodexConflictingEnvironmentAuthRefusesBeforePTY(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real conflicting-auth proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	t.Setenv("CODEX_ACCESS_TOKEN", "ambient-access")
+	_, err = SpawnInteractive(t.Context(), Options{CodexBin: binary}, agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{"OPENAI_API_KEY": "session-api"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "http://127.0.0.1:1/api/mcp/session",
+		}},
+		Interactive: &agent.InteractiveSpec{},
+	})
+	if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("conflicting environment authority error = %v", err)
+	}
+}
+
 func TestIntegration_RealCodexRepositoryAuthorityNegativeAttempts(t *testing.T) {
 	if os.Getenv("DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION") != "1" {
 		t.Fatal("real executor authority proof is mandatory; set DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION=1")

@@ -47,6 +47,22 @@ func TestResolveInteractiveCodexAuthDistinguishesEnvironmentFileAndKeyring(t *te
 		}
 	})
 
+	t.Run("session API key conflicts with ambient access token", func(t *testing.T) {
+		t.Setenv("CODEX_ACCESS_TOKEN", "ambient-access")
+		_, err := resolveInteractiveCodexAuth(map[string]string{"OPENAI_API_KEY": "session-api"})
+		if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !strings.Contains(err.Error(), "session:OPENAI_API_KEY") || !strings.Contains(err.Error(), "ambient:CODEX_ACCESS_TOKEN") {
+			t.Fatalf("conflict error = %v", err)
+		}
+	})
+
+	t.Run("session API key conflicts with ambient Codex API key", func(t *testing.T) {
+		t.Setenv("CODEX_API_KEY", "ambient-api")
+		_, err := resolveInteractiveCodexAuth(map[string]string{"OPENAI_API_KEY": "session-api"})
+		if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !strings.Contains(err.Error(), "ambient:CODEX_API_KEY") {
+			t.Fatalf("conflict error = %v", err)
+		}
+	})
+
 	t.Run("file mode projects the exact host auth inode", func(t *testing.T) {
 		writeHostCodexAuthConfig(t, hostHome, "file")
 		hostAuth := writeHostCodexAuthFile(t, hostHome)
@@ -162,5 +178,29 @@ func TestSpawnInteractiveKeyringAuthRefusesBeforePTY(t *testing.T) {
 	}
 	if _, statErr := os.Stat(filepath.Join(workdir, "spawned")); !errors.Is(statErr, os.ErrNotExist) {
 		t.Fatalf("PTY started after keyring projection refusal: %v", statErr)
+	}
+}
+
+func TestSpawnInteractiveConflictingAuthRefusesBeforePTY(t *testing.T) {
+	clearInteractiveCodexAuthEnv(t)
+	hostHome := t.TempDir()
+	workdir := t.TempDir()
+	t.Setenv("CODEX_HOME", hostHome)
+	t.Setenv("CODEX_ACCESS_TOKEN", "ambient-access")
+	bin := writeFakeCodexScript(t, `touch "$PWD/spawned"`)
+
+	_, err := SpawnInteractive(context.Background(), Options{CodexBin: bin}, agent.Spec{
+		Cwd: workdir,
+		Env: map[string]string{"OPENAI_API_KEY": "session-api"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "https://platform.example/api/mcp/session",
+		}},
+		Interactive: &agent.InteractiveSpec{},
+	})
+	if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("conflicting-auth spawn error = %v", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(workdir, "spawned")); !errors.Is(statErr, os.ErrNotExist) {
+		t.Fatalf("PTY started after conflicting auth refusal: %v", statErr)
 	}
 }

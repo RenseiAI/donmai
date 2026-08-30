@@ -359,7 +359,7 @@ func TestRun_InteractiveDefaultHTTPMCPReachesCodexCLI(t *testing.T) {
 	}
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
-	t.Setenv("OPENAI_API_KEY", "runner-codex-auth-fixture")
+	t.Setenv("CODEX_ACCESS_TOKEN", "runner-codex-auth-fixture")
 	server := mockPlatformServer(t)
 	defer server.Close()
 	bin := filepath.Join(t.TempDir(), "fake-codex")
@@ -382,6 +382,7 @@ if [[ " $* " == *" mcp list --json "* || " $* " == *" mcp get "* ]]; then
 fi
 printf '%s\n' "$@" > "$PWD/codex-argv"
 env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
+for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' "$key" "${!key}"; done > "$PWD/codex-auth-env"
 `
 	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
@@ -428,6 +429,15 @@ env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
 	}
 	if !strings.Contains(string(childEnv), "Bearer "+token) {
 		t.Fatalf("Codex child env omitted HTTP header secret: %s", childEnv)
+	}
+	authEnv, err := os.ReadFile(filepath.Join(provider.raw.Cwd, "codex-auth-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"} {
+		if !strings.Contains(string(authEnv), key+"=\n") {
+			t.Fatalf("Codex child retained %s authority: %s", key, authEnv)
+		}
 	}
 	persisted, err := state.NewStore().Read(provider.raw.Cwd)
 	if err != nil {

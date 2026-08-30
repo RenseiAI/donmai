@@ -428,6 +428,7 @@ func TestSpawnInteractive_IsolatesPoisonedGlobalMCPConfigAndHeaders(t *testing.T
 	if runtime.GOOS == "windows" {
 		t.Skip("pty spawn tests are unix-only")
 	}
+	clearInteractiveCodexAuthEnv(t)
 	root := t.TempDir()
 	ambientHome := filepath.Join(root, "ambient-codex-home")
 	boundaryRoot := filepath.Join(root, "session-boundaries")
@@ -462,6 +463,7 @@ set -e
 printf '%s' "$CODEX_HOME" > "$PWD/observed-home"
 cp "$CODEX_HOME/config.toml" "$PWD/observed-config.toml"
 printf '%s\n' "$@" > "$PWD/observed-argv"
+for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' "$key" "${!key}"; done > "$PWD/observed-auth-env"
 test -f "$CODEX_HOME/auth.json"
 `)
 	const sessionBearer = "session-mcp-bearer"
@@ -531,6 +533,15 @@ test -f "$CODEX_HOME/auth.json"
 	if !strings.Contains(string(argv), "/api/mcp/sess_project") || strings.Contains(string(argv), "external.example.com") || strings.Contains(string(argv), sessionBearer) {
 		t.Fatalf("session MCP argv is not endpoint-exact and secret-free:\n%s", argv)
 	}
+	authEnv, err := os.ReadFile(filepath.Join(workdir, "observed-auth-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		if !strings.Contains(string(authEnv), key+"=\n") {
+			t.Fatalf("child retained %s authority: %s", key, authEnv)
+		}
+	}
 	unchanged, err := os.ReadFile(ambientConfigPath)
 	if err != nil || string(unchanged) != ambientConfig {
 		t.Fatalf("ambient config changed: err=%v body=%q", err, unchanged)
@@ -539,7 +550,19 @@ test -f "$CODEX_HOME/auth.json"
 
 func inventoryRunnerFor(t *testing.T, servers []agent.MCPServerConfig) interactiveMCPInventoryRunner {
 	t.Helper()
-	return func(_ context.Context, _ string, _ string, _ []string, configArgs, queryArgs []string) ([]byte, error) {
+	return func(_ context.Context, _ string, _ string, childEnv []string, configArgs, queryArgs []string) ([]byte, error) {
+		for _, key := range codexEnvironmentAuthKeys {
+			want := key + "="
+			found := false
+			for _, entry := range childEnv {
+				if entry == want {
+					found = true
+				}
+			}
+			if !found {
+				t.Fatalf("effective-config child env did not clear %s", key)
+			}
+		}
 		if !slices.ContainsFunc(configArgs, func(arg string) bool {
 			return strings.Contains(arg, "trust_level=\"untrusted\"")
 		}) {

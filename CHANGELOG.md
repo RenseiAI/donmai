@@ -17,7 +17,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   configuration, explicit environment auth is seeded through Codex's own login
   command into an ephemeral private file store, and keyring/ambiguous auto
   storage fails before spawn because it cannot be projected to another home
-  safely. The worktree is marked untrusted for Codex config loading while
+  safely. Multiple nonempty session/ambient auth sources are refused as
+  ambiguous; after seeding, every recognized Codex auth variable is blanked for
+  both readback and PTY so the verified private store is the sole authority.
+  The worktree is marked untrusted for Codex config loading while
   retaining repository access. Codex's own list readback must contain exactly
   the requested server names, and each server's strict `mcp get` readback must
   match its complete transport, headers, timeouts, status, and empty tool-filter

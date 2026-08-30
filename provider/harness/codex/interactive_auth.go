@@ -72,7 +72,11 @@ func resolveInteractiveCodexAuth(specEnv map[string]string) (interactiveCodexAut
 		return interactiveCodexAuthProjection{}, interactiveCodexAuthError(err.Error())
 	}
 
-	if key, value, ok := resolveEnvironmentCodexAuth(specEnv); ok {
+	key, value, ok, err := resolveEnvironmentCodexAuth(specEnv)
+	if err != nil {
+		return interactiveCodexAuthProjection{}, err
+	}
+	if ok {
 		return interactiveCodexAuthProjection{
 			kind:      interactiveCodexAuthEnvironment,
 			storeMode: "file",
@@ -121,19 +125,48 @@ func resolveInteractiveCodexAuth(specEnv map[string]string) (interactiveCodexAut
 	}
 }
 
-func resolveEnvironmentCodexAuth(specEnv map[string]string) (key, value string, ok bool) {
-	for _, key := range codexEnvironmentAuthKeys {
-		if value, ok := specEnv[key]; ok {
-			if strings.TrimSpace(value) != "" {
-				return key, value, true
+type interactiveCodexAuthSource struct {
+	key   string
+	value string
+	layer string
+}
+
+func resolveEnvironmentCodexAuth(specEnv map[string]string) (key, value string, ok bool, err error) {
+	var sources []interactiveCodexAuthSource
+	for _, candidateKey := range codexEnvironmentAuthKeys {
+		if candidateValue, present := specEnv[candidateKey]; present {
+			if strings.TrimSpace(candidateValue) != "" {
+				sources = append(sources, interactiveCodexAuthSource{key: candidateKey, value: candidateValue, layer: "session"})
 			}
 			continue
 		}
-		if value := os.Getenv(key); strings.TrimSpace(value) != "" {
-			return key, value, true
+		if candidateValue := os.Getenv(candidateKey); strings.TrimSpace(candidateValue) != "" {
+			sources = append(sources, interactiveCodexAuthSource{key: candidateKey, value: candidateValue, layer: "ambient"})
 		}
 	}
-	return "", "", false
+	if len(sources) == 0 {
+		return "", "", false, nil
+	}
+	if len(sources) > 1 {
+		names := make([]string, 0, len(sources))
+		for _, source := range sources {
+			names = append(names, source.layer+":"+source.key)
+		}
+		return "", "", false, interactiveCodexAuthError(
+			"multiple nonempty Codex authentication sources are active (" + strings.Join(names, ", ") + "); select exactly one",
+		)
+	}
+	return sources[0].key, sources[0].value, true, nil
+}
+
+func clearInteractiveCodexAuthEnvironment(env map[string]string) map[string]string {
+	if env == nil {
+		env = make(map[string]string, len(codexEnvironmentAuthKeys))
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		env[key] = ""
+	}
+	return env
 }
 
 func seedInteractiveCodexEnvironmentAuth(
@@ -151,7 +184,7 @@ func seedInteractiveCodexEnvironmentAuth(
 	}
 	cmd := exec.CommandContext(ctx, binary, "login", flag)
 	cmd.Dir = ownedHome
-	cmd.Env = mergeEnv(nil, map[string]string{projection.envKey: projection.envValue}, ownedHome)
+	cmd.Env = mergeEnv(nil, clearInteractiveCodexAuthEnvironment(nil), ownedHome)
 	cmd.Stdin = strings.NewReader(projection.envValue)
 	cmd.Stdout = io.Discard
 	cmd.Stderr = io.Discard
