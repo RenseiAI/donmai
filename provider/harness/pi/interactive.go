@@ -73,7 +73,11 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// an explicit override.
 	spec.Env = interactiveChildEnv(spec, layout)
 
-	return ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
+	handle, err := ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
+	if err != nil {
+		return nil, err
+	}
+	return newInteractiveStateLossHandle(handle, layout.root), nil
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.

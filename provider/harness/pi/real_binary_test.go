@@ -116,8 +116,23 @@ type realBinaryStub struct {
 	srv   *httptest.Server
 	model string
 
-	mu    sync.Mutex
-	turns []stubTurn
+	mu        sync.Mutex
+	turns     []stubTurn
+	responses []stubResponse
+}
+
+// stubResponse lets a focused conformance test make the real pi binary drive
+// one native tool call before the next model turn completes. The default stub
+// behavior remains the simple one-text-turn reply used by the existing tests.
+type stubResponse struct {
+	Text     string
+	ToolCall *stubToolCall
+}
+
+type stubToolCall struct {
+	ID        string
+	Name      string
+	Arguments string
 }
 
 func newRealBinaryStub(t *testing.T, model string) *realBinaryStub {
@@ -147,9 +162,12 @@ func (s *realBinaryStub) handle(w http.ResponseWriter, r *http.Request) {
 	s.mu.Lock()
 	n := len(s.turns) + 1
 	s.turns = append(s.turns, stubTurn{Model: body.Model, Stream: body.Stream, Messages: body.Messages})
+	response := stubResponse{Text: fmt.Sprintf("stub-reply-%d", n)}
+	if n <= len(s.responses) {
+		response = s.responses[n-1]
+	}
 	s.mu.Unlock()
 
-	text := fmt.Sprintf("stub-reply-%d", n)
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
 	flusher, _ := w.(http.Flusher)
@@ -165,9 +183,19 @@ func (s *realBinaryStub) handle(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 	chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}}}})
-	chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": text}}}})
+	finishReason := "stop"
+	if response.ToolCall != nil {
+		finishReason = "tool_calls"
+		chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": []map[string]any{{
+			"index": 0, "id": response.ToolCall.ID, "type": "function", "function": map[string]any{
+				"name": response.ToolCall.Name, "arguments": response.ToolCall.Arguments,
+			},
+		}}}}}})
+	} else {
+		chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"content": response.Text}}}})
+	}
 	chunk(map[string]any{
-		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": "stop"}},
+		"choices": []map[string]any{{"index": 0, "delta": map[string]any{}, "finish_reason": finishReason}},
 		"usage":   map[string]any{"prompt_tokens": 5, "completion_tokens": 3, "total_tokens": 8},
 	})
 	_, _ = fmt.Fprint(w, "data: [DONE]\n\n")
