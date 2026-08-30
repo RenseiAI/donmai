@@ -168,6 +168,12 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 				return Decision{Allow: false, Reason: sd.reason}
 			}
 		}
+		// 1b. The harness's own state directory. Same standing as the rules
+		// above — built-in, un-overridable — because losing it strands the
+		// running session (statedir_guard.go).
+		if reason := stateDirDeletionReason(call.Command, e.containmentRoot(call)); reason != "" {
+			return Decision{Allow: false, Reason: reason}
+		}
 	}
 
 	// 2. Path containment for file ops.
@@ -213,6 +219,17 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		return Decision{Allow: true}
 	}
 	return Decision{Allow: false, Reason: "default decision is deny/prompt and no allow pattern matched"}
+}
+
+// containmentRoot is the session worktree root a call is judged against. The
+// Spec's Cwd (captured at construction) is authoritative; a call that carries
+// its own Cwd is only consulted when the engine has none, so a tool call
+// cannot relocate the boundary it is being judged against.
+func (e *PolicyEngine) containmentRoot(call ToolCall) string {
+	if e.cwd != "" {
+		return e.cwd
+	}
+	return call.Cwd
 }
 
 // subject returns the string the allow/deny regexes match against: the
