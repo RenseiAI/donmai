@@ -165,15 +165,23 @@ func validStopDisposition(status SessionStatus) bool {
 
 // ChatSessionRequest is the body of POST /api/public/sessions/:id/prompt.
 type ChatSessionRequest struct {
-	Prompt string `json:"prompt"`
+	Prompt         string `json:"prompt"`
+	IdempotencyKey string `json:"idempotencyKey,omitempty"`
 }
 
 // ChatSessionResponse matches POST /api/public/sessions/:id/prompt.
 type ChatSessionResponse struct {
-	Delivered     bool          `json:"delivered"`
-	PromptID      string        `json:"promptId"`
-	SessionID     string        `json:"sessionId"`
-	SessionStatus SessionStatus `json:"sessionStatus"`
+	Delivered      bool          `json:"delivered"`
+	DeliveryTier   string        `json:"deliveryTier,omitempty"`
+	Disposition    string        `json:"disposition,omitempty"`
+	IdempotencyKey string        `json:"idempotencyKey,omitempty"`
+	PromptID       string        `json:"promptId"`
+	SessionID      string        `json:"sessionId"`
+	SessionStatus  SessionStatus `json:"sessionStatus"`
+	Code           string        `json:"code,omitempty"`
+	Error          string        `json:"error,omitempty"`
+	RecoveryAction string        `json:"recoveryAction,omitempty"`
+	MissingFields  []string      `json:"missingProjectionFields,omitempty"`
 }
 
 // ReconnectSessionRequest is the body of POST /api/public/sessions/:id/reconnect.

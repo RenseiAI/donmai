@@ -143,12 +143,12 @@ func TestStopSessionReceiptRejectsUnsafeFields(t *testing.T) {
 }
 
 func TestChatSessionRequestMarshal(t *testing.T) {
-	in := ChatSessionRequest{Prompt: "hello agent"}
+	in := ChatSessionRequest{Prompt: "hello agent", IdempotencyKey: "prompt-key-123"}
 	data, err := json.Marshal(in)
 	if err != nil {
 		t.Fatalf("marshal: %v", err)
 	}
-	if got, want := string(data), `{"prompt":"hello agent"}`; got != want {
+	if got, want := string(data), `{"prompt":"hello agent","idempotencyKey":"prompt-key-123"}`; got != want {
 		t.Errorf("marshal = %s, want %s", got, want)
 	}
 	var out ChatSessionRequest
@@ -162,10 +162,16 @@ func TestChatSessionRequestMarshal(t *testing.T) {
 
 func TestChatSessionResponseRoundTrip(t *testing.T) {
 	in := ChatSessionResponse{
-		Delivered:     true,
-		PromptID:      "p-123",
-		SessionID:     "sess-1",
-		SessionStatus: StatusWorking,
+		Delivered:      false,
+		DeliveryTier:   "durable",
+		Disposition:    "held",
+		IdempotencyKey: "prompt-key-123",
+		PromptID:       "p-123",
+		SessionID:      "sess-1",
+		SessionStatus:  SessionStatus("held"),
+		Code:           "TERMINAL_PROMPT_CONTINUITY_UNAVAILABLE",
+		RecoveryAction: "start_new_session",
+		MissingFields:  []string{"workType", "providerSessionId"},
 	}
 	data, err := json.Marshal(in)
 	if err != nil {
@@ -175,7 +181,7 @@ func TestChatSessionResponseRoundTrip(t *testing.T) {
 	if err := json.Unmarshal(data, &out); err != nil {
 		t.Fatalf("unmarshal: %v", err)
 	}
-	if out != in {
+	if !reflect.DeepEqual(out, in) {
 		t.Errorf("round-trip mismatch: got %+v, want %+v", out, in)
 	}
 }

@@ -22,18 +22,20 @@ import (
 // zero-value behaviour to satisfy the interface.
 type chatStubDataSource struct {
 	stubDataSource
-	chatResp      *afclient.ChatSessionResponse
-	chatErr       error
-	chatCalls     int
-	lastID        string
-	lastPrompt    string
-	failIfInvoked *testing.T
+	chatResp           *afclient.ChatSessionResponse
+	chatErr            error
+	chatCalls          int
+	lastID             string
+	lastPrompt         string
+	lastIdempotencyKey string
+	failIfInvoked      *testing.T
 }
 
 func (c *chatStubDataSource) ChatSession(id string, req afclient.ChatSessionRequest) (*afclient.ChatSessionResponse, error) {
 	c.chatCalls++
 	c.lastID = id
 	c.lastPrompt = req.Prompt
+	c.lastIdempotencyKey = req.IdempotencyKey
 	if c.failIfInvoked != nil {
 		c.failIfInvoked.Fatal("ChatSession must not be called; empty-message guard should have rejected the request first")
 	}
@@ -61,6 +63,9 @@ func TestAgentChatHelp(t *testing.T) {
 	}
 	if !strings.Contains(out, "--json") {
 		t.Errorf("chat --help missing --json flag; got:\n%s", out)
+	}
+	if !strings.Contains(out, "--idempotency-key") {
+		t.Errorf("chat --help missing --idempotency-key flag; got:\n%s", out)
 	}
 }
 
@@ -153,7 +158,7 @@ func TestAgentChatInvokesChatSession(t *testing.T) {
 		SessionID:     "sess-abc",
 		SessionStatus: afclient.StatusWorking,
 	}}
-	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "sess-abc", "hello there"})
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "--idempotency-key", "prompt-retry-1", "sess-abc", "hello there"})
 	if err := cmd.Execute(); err != nil {
 		t.Fatalf("execute: %v", err)
 	}
@@ -165,6 +170,9 @@ func TestAgentChatInvokesChatSession(t *testing.T) {
 	}
 	if ds.lastPrompt != "hello there" {
 		t.Errorf("ChatSession prompt = %q, want %q", ds.lastPrompt, "hello there")
+	}
+	if ds.lastIdempotencyKey != "prompt-retry-1" {
+		t.Errorf("ChatSession idempotency key = %q, want %q", ds.lastIdempotencyKey, "prompt-retry-1")
 	}
 	const want = "Prompt prm-1 delivered to sess-abc (status: working)\n"
 	if got := buf.String(); got != want {
@@ -188,6 +196,26 @@ func TestAgentChatQueuedVerb(t *testing.T) {
 		t.Fatalf("execute: %v", err)
 	}
 	const want = "Prompt prm-2 queued to sess-xyz (status: queued)\n"
+	if got := buf.String(); got != want {
+		t.Errorf("stdout = %q, want %q", got, want)
+	}
+}
+
+func TestAgentChatDurableDisposition(t *testing.T) {
+	t.Parallel()
+
+	ds := &chatStubDataSource{chatResp: &afclient.ChatSessionResponse{
+		Delivered:     false,
+		Disposition:   "held",
+		PromptID:      "prm-held",
+		SessionID:     "sess-held",
+		SessionStatus: afclient.SessionStatus("held"),
+	}}
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return ds }, []string{"chat", "sess-held", "retry safely"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	const want = "Prompt prm-held held to sess-held (status: held)\n"
 	if got := buf.String(); got != want {
 		t.Errorf("stdout = %q, want %q", got, want)
 	}
