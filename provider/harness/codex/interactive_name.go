@@ -34,14 +34,40 @@ type namedInteractiveAppServer struct {
 	cmd       *exec.Cmd
 	waitCh    <-chan error
 	socketDir string
-	// client stays open for the life of the server so the caller can drive
-	// further RPCs against the exact same connection — required for the
-	// fresh-session path, which must observe a thread/started notification
-	// emitted after this function returns (see
+	// client stays open until its RPC job is done (naming for the fresh
+	// path, the existence check for the attach path) — required so the
+	// fresh-session path can observe a thread/started notification emitted
+	// after startNamedInteractiveAppServer returns (see
 	// awaitAndNameLiveThreadWithRequest).
+	//
+	// clientMu guards it: the eager close in finishNamingLiveInteractiveThread
+	// (or the attach-path close in startNamedInteractiveAppServer) runs on
+	// the spawn goroutine, while close's teardown can run concurrently on
+	// ptycli's own cleanup goroutine — e.g. if the TUI exits inside the
+	// naming window. Every access goes through getClient/setClient/
+	// closeClient rather than reading/writing the field directly, so no
+	// caller can race a check against a concurrent nil-out.
+	clientMu  sync.Mutex
 	client    *interactiveWebSocketClient
 	closeOnce sync.Once
 	closeErr  error
+}
+
+// getClient returns the current diagnostic RPC connection, or nil once it
+// has been closed. Callers that need to use the connection for more than
+// one operation should capture this ONE snapshot and reuse it, rather than
+// calling getClient again for each operation — a concurrent closeClient can
+// nil the field out between two separate reads.
+func (s *namedInteractiveAppServer) getClient() *interactiveWebSocketClient {
+	s.clientMu.Lock()
+	defer s.clientMu.Unlock()
+	return s.client
+}
+
+func (s *namedInteractiveAppServer) setClient(c *interactiveWebSocketClient) {
+	s.clientMu.Lock()
+	s.client = c
+	s.clientMu.Unlock()
 }
 
 // startNamedInteractiveAppServer starts one bounded Unix-socket app-server in
@@ -146,7 +172,7 @@ func startNamedInteractiveAppServer(
 	if err != nil {
 		return nil, errors.Join(err, server.close())
 	}
-	server.client = client
+	server.setClient(client)
 
 	initRaw, err := client.request(setupCtx, "initialize", map[string]any{
 		"clientInfo": map[string]any{
@@ -196,10 +222,14 @@ func startNamedInteractiveAppServer(
 // the PTY has been spawned — see startNamedInteractiveAppServer's doc
 // comment for why the sequencing must be this way around.
 func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, server *namedInteractiveAppServer, timeout time.Duration) error {
-	if server == nil || server.client == nil {
+	if server == nil {
 		return errors.New("codex interactive name bootstrap connection is not open")
 	}
-	if err := awaitAndNameLiveThreadWithRequest(ctx, spec, server.client.awaitNotification, server.client.request, timeout); err != nil {
+	client := server.getClient()
+	if client == nil {
+		return errors.New("codex interactive name bootstrap connection is not open")
+	}
+	if err := awaitAndNameLiveThreadWithRequest(ctx, spec, client.awaitNotification, client.request, timeout); err != nil {
 		return err
 	}
 	// Naming succeeded and the PTY already has its own independent
@@ -541,12 +571,14 @@ func remoteInteractiveArgs(argv []string, remoteURL string) []string {
 // more simply, by closing a fresh diagnostic connection immediately after
 // its own initialize/initialized handshake with nothing else in between.
 func (s *namedInteractiveAppServer) closeClient() error {
-	if s.client == nil {
+	s.clientMu.Lock()
+	c := s.client
+	s.client = nil
+	s.clientMu.Unlock()
+	if c == nil {
 		return nil
 	}
-	err := s.client.close()
-	s.client = nil
-	return err
+	return c.close()
 }
 
 func (s *namedInteractiveAppServer) close() error {

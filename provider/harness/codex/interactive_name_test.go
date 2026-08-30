@@ -4,11 +4,17 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net/http"
+	"net/http/httptest"
+	"os/exec"
+	"runtime"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/coder/websocket"
 )
 
 // TestAwaitAndNameLiveThreadWithRequest_NamesTheObservedThread pins the
@@ -193,5 +199,81 @@ func TestResumeExistingNamedThreadWithRequest_EmptyNameFailsClosed(t *testing.T)
 	}
 	if err := resumeExistingNamedThreadWithRequest(context.Background(), agent.Spec{}, request, time.Second); err == nil {
 		t.Fatal("expected an error")
+	}
+}
+
+// TestNamedInteractiveAppServer_CloseClientConcurrentWithFullClose hammers
+// closeClient's two real callers against each other: the spawn goroutine's
+// eager close right after naming/the existence check completes (see
+// finishNamingLiveInteractiveThread and startNamedInteractiveAppServer), and
+// ptycli's own cleanup goroutine (Handle.run), which calls close and can run
+// concurrently if the TUI exits inside the naming window. Before the
+// clientMu guard this raced (and could nil-deref) on the client field
+// itself; -race must stay clean here and every iteration must leave the
+// client cleared exactly once.
+func TestNamedInteractiveAppServer_CloseClientConcurrentWithFullClose(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix process signaling; the production code path is unix-only for the same reason (signal_windows.go)")
+	}
+	t.Parallel()
+
+	// A minimal local WebSocket peer gives closeClient/close a real
+	// *websocket.Conn to operate on, mirroring what a live bootstrap
+	// connection looks like in production, without spawning a real codex
+	// binary.
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		c, err := websocket.Accept(w, r, nil)
+		if err != nil {
+			return
+		}
+		defer func() { _ = c.CloseNow() }()
+		<-r.Context().Done()
+	}))
+	defer srv.Close()
+	wsURL := "ws" + strings.TrimPrefix(srv.URL, "http")
+
+	const iterations = 50
+	for i := 0; i < iterations; i++ {
+		conn, _, err := websocket.Dial(context.Background(), wsURL, nil)
+		if err != nil {
+			t.Fatalf("iteration %d: dial: %v", i, err)
+		}
+		cmd := exec.Command("true")
+		if err := cmd.Start(); err != nil {
+			t.Fatalf("iteration %d: start fixture process: %v", i, err)
+		}
+		waitCh := make(chan error, 1)
+		go func() { waitCh <- cmd.Wait() }()
+
+		server := &namedInteractiveAppServer{
+			remoteURL: "unix:///dev/null",
+			cmd:       cmd,
+			waitCh:    waitCh,
+			socketDir: t.TempDir(),
+		}
+		server.setClient(&interactiveWebSocketClient{conn: conn, transport: &http.Transport{}})
+
+		var wg sync.WaitGroup
+		wg.Add(2)
+		// Caller 1: the spawn goroutine's eager close.
+		go func() {
+			defer wg.Done()
+			_ = server.closeClient()
+		}()
+		// Caller 2: ptycli's cleanup path (Handle.run -> cleanupFn -> close).
+		go func() {
+			defer wg.Done()
+			_ = server.close()
+		}()
+		wg.Wait()
+
+		if got := server.getClient(); got != nil {
+			t.Fatalf("iteration %d: client still set after both closers ran: %v", i, got)
+		}
+		// close is independently idempotent (closeOnce); calling it again
+		// here must not hang, panic, or change the outcome.
+		if err := server.close(); err != nil {
+			t.Fatalf("iteration %d: repeat close: %v", i, err)
+		}
 	}
 }

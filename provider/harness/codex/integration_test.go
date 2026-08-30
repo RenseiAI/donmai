@@ -75,7 +75,7 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	if server.remoteURL == "" {
 		t.Fatal("named app-server returned no remote URL")
 	}
-	if server.client == nil {
+	if server.getClient() == nil {
 		t.Fatal("named app-server did not leave its RPC connection open for post-spawn naming")
 	}
 	// Production closes this diagnostic connection eagerly once its job is
