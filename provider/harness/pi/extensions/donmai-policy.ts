@@ -57,6 +57,7 @@ import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
+import { basename, isAbsolute, join, normalize, sep } from "node:path";
 
 // The wire marker that identifies this extension's UI round-trips to the Go
 // side (carried in the extension_ui_request `placeholder`). The Go handler
@@ -98,6 +99,175 @@ function selfSHA256(): string {
 // headless-vs-interactive evidence).
 const DONMAI_ALLOWED_TOOLS_ENV = "DONMAI_PI_ALLOWED_TOOLS";
 const DONMAI_DISALLOWED_TOOLS_ENV = "DONMAI_PI_DISALLOWED_TOOLS";
+
+// The interactive lane cannot round-trip to policy.go, but it MUST keep this
+// one non-negotiable local safety rail. The state directory is created by the
+// harness and pi keeps appending its own session JSONL beneath it; deleting it
+// strands an otherwise-live session. Keep the refusal bytes in lock-step with
+// statedir_guard.go: the model sees the same reason on either launch mode.
+const PI_STATE_DIR = ".pi";
+const STATE_DIR_GUARD_REASON_PREFIX = "refusing to delete the pi harness state directory";
+const STATE_DIR_GUARD_EXPLANATION =
+  " — " +
+  PI_STATE_DIR +
+  " holds this session's own storage (session transcript, the loaded policy extension, and the per-session agent home). " +
+  "The harness created it before the session started and reads it for the session's whole life; " +
+  "removing it does not fail loudly, it silently strands the run. " +
+  "It is harness state, not project output — leave it in place.";
+
+function shellTokens(segment: string): string[] {
+  const out: string[] = [];
+  let current = "";
+  let quote = "";
+  let escaped = false;
+  let started = false;
+  const flush = () => {
+    if (started) {
+      out.push(current);
+      current = "";
+      started = false;
+    }
+  };
+  for (const ch of segment) {
+    if (escaped) {
+      current += ch;
+      escaped = false;
+      started = true;
+    } else if (ch === "\\" && quote !== "'") {
+      escaped = true;
+      started = true;
+    } else if (quote) {
+      if (ch === quote) quote = "";
+      else current += ch;
+    } else if (ch === "'" || ch === '"') {
+      quote = ch;
+      started = true;
+    } else if (/\s/.test(ch)) {
+      flush();
+    } else {
+      current += ch;
+      started = true;
+    }
+  }
+  flush();
+  return out;
+}
+
+function stateDirRoot(cwd: string): string {
+  return cwd ? join(normalize(cwd), PI_STATE_DIR) : PI_STATE_DIR;
+}
+
+function resolvesIntoStateDir(operand: string, cwd: string, root: string): boolean {
+  const trimmed = operand.trim();
+  if (!trimmed || trimmed === "~" || trimmed.startsWith("~/")) return false;
+  const resolved = isAbsolute(trimmed)
+    ? normalize(trimmed)
+    : cwd
+      ? normalize(join(normalize(cwd), trimmed))
+      : normalize(trimmed);
+  return resolved === root || resolved.startsWith(root + sep);
+}
+
+function pathOperands(args: string[]): string[] {
+  const out: string[] = [];
+  let skipNext = false;
+  for (const arg of args) {
+    if (skipNext) {
+      skipNext = false;
+    } else if (!arg || arg === "--") {
+      continue;
+    } else if (/^[0-9&]*(>>?|<)$/.test(arg)) {
+      skipNext = true;
+    } else if (/^[0-9&]*(>>?|<)/.test(arg) || arg.startsWith("-")) {
+      continue;
+    } else {
+      out.push(arg);
+    }
+  }
+  return out;
+}
+
+function firstStateDirPath(args: string[], cwd: string, root: string): string | undefined {
+  return pathOperands(args).find((arg) => resolvesIntoStateDir(arg, cwd, root));
+}
+
+function stateDirRefusal(command: string, path: string): string {
+  return STATE_DIR_GUARD_REASON_PREFIX + " via `" + command + "` (" + path + ")" + STATE_DIR_GUARD_EXPLANATION;
+}
+
+function findDeletes(args: string[]): boolean {
+  return args.some((arg, index) =>
+    arg === "-delete" ||
+    ((arg === "-exec" || arg === "-execdir" || arg === "-ok" || arg === "-okdir") &&
+      args.slice(index + 1).some((rest) => ["rm", "rmdir", "unlink", "shred"].includes(basename(rest)))),
+  );
+}
+
+function findSearchRoots(args: string[]): string[] {
+  const roots: string[] = [];
+  for (const arg of args) {
+    if (arg.startsWith("-")) break;
+    roots.push(arg);
+  }
+  return roots;
+}
+
+function gitCleanStateDirReason(args: string[], cwd: string, root: string): string | undefined {
+  let commandIndex = -1;
+  for (let index = 0; index < args.length; index++) {
+    const arg = args[index];
+    if (["-C", "-c", "--git-dir", "--work-tree", "--namespace"].includes(arg)) index++;
+    else if (!arg.startsWith("-")) {
+      if (arg !== "clean") return undefined;
+      commandIndex = index;
+      break;
+    }
+  }
+  if (commandIndex < 0) return undefined;
+  const rest = args.slice(commandIndex + 1);
+  let forced = false;
+  for (const arg of rest) {
+    if (arg === "--dry-run" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("n"))) return undefined;
+    if (arg === "--force" || (arg.startsWith("-") && !arg.startsWith("--") && arg.includes("f"))) forced = true;
+  }
+  if (!forced) return undefined;
+  const paths = pathOperands(rest);
+  if (paths.length === 0) {
+    return STATE_DIR_GUARD_REASON_PREFIX + " via an unrestricted `git clean` (it sweeps the whole worktree, " + PI_STATE_DIR + " included)" + STATE_DIR_GUARD_EXPLANATION;
+  }
+  const hit = firstStateDirPath(paths, cwd, root);
+  return hit ? stateDirRefusal("git clean", hit) : undefined;
+}
+
+// interactiveStateDirDeletionReason is the local !rpcMode counterpart to
+// stateDirDeletionReason in statedir_guard.go. It deliberately covers only
+// the session state rail; the richer policy/containment engine remains RPC.
+export function interactiveStateDirDeletionReason(command: string, cwd: string): string | undefined {
+  if (!command.trim()) return undefined;
+  const root = stateDirRoot(cwd);
+  for (const segment of command.split(/&&|\|\||;|\||&|\n/)) {
+    let tokens = shellTokens(segment);
+    while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens = tokens.slice(1);
+    if (tokens.length === 0) continue;
+    const commandName = basename(tokens[0]);
+    const args = tokens.slice(1);
+    if (["rm", "rmdir", "unlink", "shred"].includes(commandName)) {
+      const hit = firstStateDirPath(args, cwd, root);
+      if (hit) return stateDirRefusal(commandName, hit);
+    } else if (commandName === "mv") {
+      const paths = pathOperands(args);
+      const hit = firstStateDirPath(paths.slice(0, -1), cwd, root);
+      if (hit) return stateDirRefusal(commandName, hit);
+    } else if (commandName === "find" && findDeletes(args)) {
+      const hit = firstStateDirPath(findSearchRoots(args), cwd, root);
+      if (hit) return stateDirRefusal(commandName, hit);
+    } else if (commandName === "git") {
+      const reason = gitCleanStateDirReason(args, cwd, root);
+      if (reason) return reason;
+    }
+  }
+  return undefined;
+}
 
 interface LocalToolPattern {
   raw: string;
@@ -260,13 +430,17 @@ export default function activate(pi: ExtensionAPI) {
   if (!rpcMode) {
     const allowed = parseLocalToolPatterns(process.env[DONMAI_ALLOWED_TOOLS_ENV]);
     const disallowed = parseLocalToolPatterns(process.env[DONMAI_DISALLOWED_TOOLS_ENV]);
-    if (allowed.length > 0 || disallowed.length > 0) {
-      pi.on("tool_call", (event: any) => {
-        const tool = String(event?.toolName ?? "").toLowerCase();
-        if (!GUARDED_TOOLS.has(tool)) return;
+    pi.on("tool_call", (event: any, ctx: any) => {
+      const tool = String(event?.toolName ?? "").toLowerCase();
+      if (!GUARDED_TOOLS.has(tool)) return;
+      if (tool === "bash") {
+        const reason = interactiveStateDirDeletionReason(String(event?.input?.command ?? ""), String(ctx?.cwd ?? ""));
+        if (reason) return { block: true, reason };
+      }
+      if (allowed.length > 0 || disallowed.length > 0) {
         return evaluateLocalToolPolicy(allowed, disallowed, tool, event?.input ?? {});
-      });
-    }
+      }
+    });
     // Provider registration already ran, which is everything else this mode
     // needs from us — no handshake, no Go-side adjudication round trip.
     return;
