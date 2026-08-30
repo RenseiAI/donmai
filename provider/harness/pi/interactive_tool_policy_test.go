@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -236,7 +237,54 @@ func TestInteractiveLocalToolPolicyFixture_AllowGateDeniesUnlistedTool(t *testin
 func TestInteractiveLocalToolPolicyFixture_NoStampedListRegistersNoHandler(t *testing.T) {
 	t.Parallel()
 	out := localToolPolicyFixtureVerdict(t, "[]", "[]", "bash", `{"command":"git status"}`)
-	if registered, _ := out["registered"].(bool); registered {
-		t.Errorf("no tool_call handler should register when no allowed/disallowed list is stamped: %v", out)
+	if registered, _ := out["registered"].(bool); !registered {
+		t.Fatalf("the always-on state-directory safety handler was not registered: %v", out)
+	}
+	if verdict := out["verdict"]; verdict != nil {
+		t.Errorf("ordinary bash must remain allowed without a stamped list, got %v", verdict)
+	}
+}
+
+// TestInteractiveLocalToolPolicyFixture_StateDirDeletionDenied proves the
+// interactive embedded extension keeps the same non-overridable local safety
+// rail as the headless Go adjudicator. This is deliberately unstamped: the
+// state-dir guard protects a pi session even when no allowed/disallowed tool
+// policy was requested.
+func TestInteractiveLocalToolPolicyFixture_StateDirDeletionDenied(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name    string
+		command string
+		blocked bool
+	}{
+		{name: "rm", command: "rm -rf .pi", blocked: true},
+		{name: "rmdir", command: "rmdir .pi", blocked: true},
+		{name: "forced git clean", command: "git clean -fd", blocked: true},
+		{name: "find root delete", command: "find .pi -name '*.jsonl' -delete", blocked: true},
+		// `.pi` after the first find predicate is an expression operand,
+		// not a search root. Go's findSearchRoots stops at that predicate;
+		// the local extension must preserve the same discrimination.
+		{name: "find predicate mentions state dir", command: "find build -path .pi -delete", blocked: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			out := localToolPolicyFixtureVerdict(t, "[]", "[]", "bash", `{"command":`+strconv.Quote(tc.command)+`}`)
+			verdict, _ := out["verdict"].(map[string]any)
+			if !tc.blocked {
+				if verdict != nil {
+					t.Fatalf("unrelated find root was blocked: %v", verdict)
+				}
+				return
+			}
+			if verdict == nil {
+				t.Fatalf("want local refusal for deleting the pi state dir, got %v", out)
+			}
+			if block, _ := verdict["block"].(bool); !block {
+				t.Errorf("want block=true, got %v", verdict)
+			}
+			reason, _ := verdict["reason"].(string)
+			if !strings.Contains(reason, stateDirGuardReasonPrefix) || !strings.Contains(reason, "harness state") {
+				t.Errorf("state-dir refusal must retain the typed headless reason, got %q", reason)
+			}
+		})
 	}
 }

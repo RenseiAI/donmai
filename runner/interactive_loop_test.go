@@ -476,6 +476,69 @@ func TestInteractive_CapabilityFailure(t *testing.T) {
 	}
 }
 
+// TestInteractive_HarnessStateLostWritesTypedActivity proves the interactive
+// supervisor consumes the provider's existing SystemEvent seam, mirrors the
+// typed condition to .agent/events.jsonl, and forwards it to the activity
+// sink. Before the state-loss event case existed, this same emitted event was
+// never read on the interactive path and neither receipt was written.
+func TestInteractive_HarnessStateLostWritesTypedActivity(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	worktreePath := t.TempDir()
+	session := liveRecordingInteractiveSession()
+	base := &fakeHandle{events: make(chan agent.Event, 1)}
+	base.events <- agent.SystemEvent{
+		Subtype: "harness_state_lost",
+		Message: "pi reported ENOENT for its own session JSONL; harness state was lost",
+	}
+	close(base.events)
+	handle := &testInteractiveHandle{Handle: base, session: session}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "loss-signal"}}
+	runner := minimalRunner(t)
+
+	type outcome struct {
+		result *Result
+		err    error
+	}
+	done := make(chan outcome, 1)
+	go func() {
+		result, err := runner.dispatchInteractive(
+			context.Background(), handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+		)
+		done <- outcome{result: result, err: err}
+	}()
+
+	jsonlPath := filepath.Join(worktreePath, ".agent", "events.jsonl")
+	deadline := time.After(3 * time.Second)
+	for {
+		body, err := os.ReadFile(jsonlPath)
+		if err == nil && strings.Contains(string(body), `"subtype":"harness_state_lost"`) {
+			break
+		}
+		select {
+		case <-deadline:
+			t.Fatalf("typed state-loss event was not written to %s", jsonlPath)
+		case <-time.After(10 * time.Millisecond):
+		}
+	}
+	close(session.done)
+	got := <-done
+	if got.err != nil || got.result.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want completed after observable condition", got.result.Status, got.err)
+	}
+	var saw bool
+	for _, event := range sink.events {
+		if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
+			saw = true
+		}
+	}
+	if !saw {
+		t.Fatal("typed state-loss event was not forwarded to the activity sink")
+	}
+}
+
 // TestInteractive_InitialPromptContract locks the supervisor boundary:
 // dispatchInteractive never writes task bytes after Provider.Spawn. A
 // non-empty interactive seed is reported as already delivered by the native
