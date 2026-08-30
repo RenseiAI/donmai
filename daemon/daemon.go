@@ -1933,8 +1933,19 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if (err == nil && hostReceipt.Decision != "ready") || (err != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
 			}
-			if err := d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt); err != nil {
-				return nil, fmt.Errorf("persist execution adaptation receipt: %w", err)
+			if persistErr := d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt); persistErr != nil {
+				persistFailure := fmt.Errorf("persist execution adaptation receipt: %w", persistErr)
+				if err != nil {
+					// A denied preflight receipt is still authoritative when its
+					// durable audit write fails. Keep both independently observable:
+					// callers project typed denials into the NACK contract, while
+					// operators must also see the persistence failure.
+					return nil, errors.Join(
+						persistFailure,
+						fmt.Errorf("execution adaptation preflight: %w", err),
+					)
+				}
+				return nil, persistFailure
 			}
 			if err != nil {
 				return nil, fmt.Errorf("execution adaptation preflight: %w", err)

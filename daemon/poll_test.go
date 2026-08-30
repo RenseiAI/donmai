@@ -1444,6 +1444,101 @@ func TestDaemonHandlePollWorkItem_ThreadsTypedReceiptPreflightReason(t *testing.
 	}
 }
 
+type failingExecutionPreflightStore struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (s *failingExecutionPreflightStore) Persist(string, json.RawMessage) error {
+	s.calls.Add(1)
+	return s.err
+}
+
+// TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersistenceFails
+// proves that the denied host receipt's durable-write failure does not erase the
+// canonical admission denial. The outer poll path must still project its closed
+// typed reason onto the actual NACK body; matching the denial's prose would not
+// be authority-safe.
+func TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersistenceFails(t *testing.T) {
+	denial := &runner.HarnessAdmissionError{
+		Code:    executioncell.DenialFallbackNotAllowed,
+		Harness: "codex",
+		Detail:  "the receipt forbids fallback",
+	}
+	persistErr := errors.New("persist denied execution adaptation receipt")
+	store := &failingExecutionPreflightStore{err: persistErr}
+	cell := daemonExecutionCell()
+	provider := &countingExecutionPreflight{
+		receipt: rawJSON(t, executioncell.HostAdaptationReceipt{
+			ContractVersion: executioncell.HostAdaptationContractVersion,
+			RequestID:       "s1",
+			WorkerID:        "wkr-test",
+			PlacementID:     cell.Placement.ID,
+			Decision:        "denied",
+			Denial:          "fallback is not allowed",
+		}),
+		err: denial,
+	}
+
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode NACK body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newRunningTestDaemon(t, Options{
+		ProviderRegistry:        provider,
+		ExecutionPreflightStore: store,
+	}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}}, nil)
+	d.mu.Lock()
+	d.jwt = "jwt-token"
+	d.mu.Unlock()
+
+	err := d.handlePollWorkItem(PollWorkItem{
+		SessionID: "s1", ProjectID: "project", Repository: "github.com/acme/repo",
+		IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1,
+		AdmissionReceipt: json.RawMessage(`{"valid":"admission"}`),
+		EffectiveCell:    rawJSON(t, cell),
+		ExecutionRuntimeBinding: rawJSON(t, executioncell.RuntimeBinding{
+			ContractVersion: executioncell.RuntimeBindingContractVersion,
+			RequestID:       "s1",
+			WorkerID:        "wkr-test",
+			PlacementID:     cell.Placement.ID,
+		}),
+	}, srv.URL)
+
+	var gotDenial *runner.HarnessAdmissionError
+	if !errors.As(err, &gotDenial) || gotDenial.Code != executioncell.DenialFallbackNotAllowed {
+		t.Fatalf("handlePollWorkItem error = %v, want fallback_not_allowed HarnessAdmissionError", err)
+	}
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("handlePollWorkItem error = %v, want observable persistence error", err)
+	}
+	if store.calls.Load() != 1 || provider.calls.Load() != 1 {
+		t.Fatalf("persist calls = %d, preflight calls = %d, want one each", store.calls.Load(), provider.calls.Load())
+	}
+	if got := body["receiptPreflightReason"]; !mapsEqual(got, map[string]any{
+		"contractVersion": receiptPreflightNackReasonContractVersion,
+		"code":            string(executioncell.DenialFallbackNotAllowed),
+	}) {
+		t.Fatalf("receiptPreflightReason = %#v, want exact closed reason", got)
+	}
+
+	truthful := false
+	for _, capability := range effectiveRegistrationCapabilities(nil) {
+		if capability == receiptPreflightNackReasonCapability {
+			truthful = true
+			break
+		}
+	}
+	if !truthful {
+		t.Fatalf("registration capabilities = %v, missing implemented NACK producer %q", effectiveRegistrationCapabilities(nil), receiptPreflightNackReasonCapability)
+	}
+}
+
 func mapsEqual(got any, want map[string]any) bool {
 	gotMap, ok := got.(map[string]any)
 	if !ok || len(gotMap) != len(want) {
