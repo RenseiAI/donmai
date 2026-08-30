@@ -22,6 +22,7 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
@@ -34,7 +35,305 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/attachwire"
 )
+
+func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real effective-config proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	hostHome := t.TempDir()
+	project := t.TempDir()
+	boundaryParent := t.TempDir()
+	t.Setenv("CODEX_HOME", hostHome)
+	if err := os.WriteFile(
+		filepath.Join(hostHome, "config.toml"),
+		[]byte("cli_auth_credentials_store = \"keyring\"\n[mcp_servers.user_poison]\ncommand = \"/usr/bin/false\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{filepath.Join(project, ".git"), filepath.Join(project, ".codex")} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(project, ".codex", "config.toml"),
+		[]byte("[mcp_servers.\"donmai-platform\"]\ndisabled_tools = [\"a2a_send_message\"]\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	spec := agent.Spec{
+		Cwd: project,
+		Env: map[string]string{"OPENAI_API_KEY": "integration-fixture"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform",
+			Type: "http",
+			URL:  "https://platform.example/api/mcp/session",
+			Headers: map[string]string{
+				"Authorization": "Bearer session-fixture",
+			},
+		}},
+	}
+	launch, err := buildInteractiveLaunch(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary, auth, err := newInteractiveCodexConfigBoundary(boundaryParent, launch.env)
+	if err != nil {
+		t.Fatalf("private boundary: %v", err)
+	}
+	t.Cleanup(func() { _ = boundary.remove() })
+	launch.env["CODEX_HOME"] = boundary.home
+	if err := seedInteractiveCodexEnvironmentAuth(t.Context(), binary, boundary.home, auth); err != nil {
+		t.Fatalf("seed real environment auth: %v", err)
+	}
+
+	// Negative control: Codex's list surface reports the one expected NAME and
+	// omits its merged disabled_tools, while get exposes the authority-changing
+	// field. This is why list remains only the extra-name oracle and get is the
+	// exact per-server oracle.
+	trustedLaunch := launch
+	trustedLaunch.argv = append([]string(nil), launch.argv...)
+	for i, arg := range trustedLaunch.argv {
+		trustedLaunch.argv[i] = strings.ReplaceAll(
+			arg,
+			`trust_level="untrusted"`,
+			`trust_level="trusted"`,
+		)
+	}
+	trustedConfigArgs, err := interactiveConfigArgs(trustedLaunch.argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	effectiveEnv := mergeEnv(nil, trustedLaunch.env, boundary.home)
+	listBody, err := runCodexMCPInventory(
+		t.Context(), binary, project, effectiveEnv, trustedConfigArgs,
+		[]string{"mcp", "list", "--json"},
+	)
+	if err != nil {
+		t.Fatalf("real Codex list negative control: %v", err)
+	}
+	var listInventory []codexMCPInventoryEntry
+	if err := json.Unmarshal(listBody, &listInventory); err != nil {
+		t.Fatal(err)
+	}
+	if err := compareInteractiveMCPListNames(spec.MCPServers, listInventory); err != nil {
+		t.Fatalf("list unexpectedly exposed the same-name filter: %v", err)
+	}
+	getBody, err := runCodexMCPInventory(
+		t.Context(), binary, project, effectiveEnv, trustedConfigArgs,
+		[]string{"mcp", "get", "donmai-platform", "--json"},
+	)
+	if err != nil {
+		t.Fatalf("real Codex get negative control: %v", err)
+	}
+	poisoned, err := decodeStrictMCPInventoryEntry(getBody)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := compareInteractiveMCPEntry(spec.MCPServers[0], poisoned); err == nil {
+		t.Fatal("get-based exact comparison accepted a same-name disabled_tools merge")
+	}
+
+	if err := verifyExclusiveInteractiveMCP(
+		t.Context(),
+		runCodexMCPInventory,
+		binary,
+		spec,
+		launch,
+		boundary.home,
+	); err != nil {
+		t.Fatalf("real Codex effective MCP inventory: %v", err)
+	}
+
+	configArgs, err := interactiveConfigArgs(launch.argv)
+	if err != nil {
+		t.Fatal(err)
+	}
+	doctorArgs := append(configArgs, "doctor", "--json")
+	cmd := exec.CommandContext(t.Context(), binary, doctorArgs...)
+	cmd.Dir = project
+	cmd.Env = mergeEnv(nil, launch.env, boundary.home)
+	doctorBody, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("real Codex startup/auth diagnostic: %v", err)
+	}
+	var doctor struct {
+		Checks map[string]struct {
+			Status  string `json:"status"`
+			Summary string `json:"summary"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(doctorBody, &doctor); err != nil {
+		t.Fatalf("decode real Codex doctor output: %v", err)
+	}
+	foundSeededAuth := false
+	if check, ok := doctor.Checks["auth.credentials"]; ok && check.Status == "ok" && strings.Contains(check.Summary, "configured") {
+		foundSeededAuth = true
+	}
+	if !foundSeededAuth {
+		t.Fatalf("real Codex did not start from seeded environment auth: %+v", doctor.Checks)
+	}
+	if _, err := os.Stat(filepath.Join(boundary.home, codexAuthFileName)); err != nil {
+		t.Fatalf("environment auth was not seeded into the private store: %v", err)
+	}
+}
+
+func TestIntegration_RealCodexFileAuthProjectionStarts(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real file-auth proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	hostAuthFile, err := resolveHostSessionAuthFile()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostInfo, err := os.Stat(hostAuthFile)
+	if err != nil {
+		t.Fatalf("real file-auth proof requires a host auth.json: %v", err)
+	}
+	boundary, _, err := newInteractiveCodexConfigBoundary("", nil)
+	if err != nil {
+		t.Fatalf("project real file auth: %v", err)
+	}
+	t.Cleanup(func() { _ = boundary.remove() })
+	linkedInfo, err := os.Stat(boundary.authPath)
+	if err != nil || !os.SameFile(hostInfo, linkedInfo) {
+		t.Fatalf("isolated auth is not the host auth inode: err=%v", err)
+	}
+
+	cmd := exec.CommandContext(t.Context(), binary, "doctor", "--json")
+	cmd.Dir = t.TempDir()
+	cmd.Env = mergeEnv(nil, nil, boundary.home)
+	doctorBody, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("real Codex file-auth startup diagnostic: %v", err)
+	}
+	var doctor struct {
+		Checks map[string]struct {
+			Status string `json:"status"`
+		} `json:"checks"`
+	}
+	if err := json.Unmarshal(doctorBody, &doctor); err != nil {
+		t.Fatalf("decode real Codex doctor output: %v", err)
+	}
+	if doctor.Checks["auth.credentials"].Status != "ok" {
+		t.Fatalf("real Codex did not accept projected file auth: %+v", doctor.Checks["auth.credentials"])
+	}
+}
+
+func TestIntegration_RealCodexPlatformPTYStartsWithoutProjectTrustReview(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real PTY startup proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	hostHome := t.TempDir()
+	project := t.TempDir()
+	t.Setenv("CODEX_HOME", hostHome)
+	if err := os.WriteFile(
+		filepath.Join(hostHome, "config.toml"),
+		[]byte("cli_auth_credentials_store = \"keyring\"\n[mcp_servers.user_poison]\ncommand = \"/usr/bin/false\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+	for _, dir := range []string{filepath.Join(project, ".git"), filepath.Join(project, ".codex")} {
+		if err := os.Mkdir(dir, 0o700); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(
+		filepath.Join(project, ".codex", "config.toml"),
+		[]byte("[mcp_servers.project_poison]\ncommand = \"/usr/bin/false\"\n"),
+		0o600,
+	); err != nil {
+		t.Fatal(err)
+	}
+
+	ctx, cancel := context.WithTimeout(t.Context(), 15*time.Second)
+	defer cancel()
+	h, err := SpawnInteractive(ctx, Options{CodexBin: binary}, agent.Spec{
+		Cwd: project,
+		Env: map[string]string{"OPENAI_API_KEY": "integration-fixture"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "http://127.0.0.1:1/api/mcp/session",
+		}},
+		Interactive: &agent.InteractiveSpec{Cols: 100, Rows: 30},
+	})
+	if err != nil {
+		t.Fatalf("real platform PTY spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	interactive, ok := h.(agent.InteractiveCapable)
+	if !ok {
+		t.Fatal("real platform PTY handle is not interactive")
+	}
+
+	deadline := time.Now().Add(8 * time.Second)
+	var screenText string
+	for time.Now().Before(deadline) {
+		screen, _, snapshotErr := interactive.InteractiveSession().Snapshot()
+		if snapshotErr != nil {
+			t.Fatalf("real PTY snapshot: %v", snapshotErr)
+		}
+		var rendered strings.Builder
+		for _, cell := range append(append([]attachwire.Cell(nil), screen.Primary...), screen.Alt...) {
+			rendered.Write(cell.RuneBytes)
+		}
+		for _, row := range screen.Scrollback {
+			for _, cell := range row {
+				rendered.Write(cell.RuneBytes)
+			}
+		}
+		screenText = rendered.String()
+		if strings.Contains(screenText, "OpenAI Codex") {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	if !strings.Contains(screenText, "OpenAI Codex") {
+		t.Fatalf("real Codex TUI did not reach its startup screen: %q", screenText)
+	}
+	if strings.Contains(strings.ToLower(screenText), "trust the contents") {
+		t.Fatalf("real Codex TUI parked on project trust review: %q", screenText)
+	}
+}
+
+func TestIntegration_RealCodexConflictingEnvironmentAuthRefusesBeforePTY(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real conflicting-auth proof requires codex on PATH: %v", err)
+	}
+	for _, key := range codexEnvironmentAuthKeys {
+		t.Setenv(key, "")
+	}
+	t.Setenv("CODEX_ACCESS_TOKEN", "ambient-access")
+	_, err = SpawnInteractive(t.Context(), Options{CodexBin: binary}, agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{"OPENAI_API_KEY": "session-api"},
+		MCPServers: []agent.MCPServerConfig{{
+			Name: "donmai-platform", Type: "http", URL: "http://127.0.0.1:1/api/mcp/session",
+		}},
+		Interactive: &agent.InteractiveSpec{},
+	})
+	if !errors.Is(err, ErrInteractiveCodexAuthProjection) || !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("conflicting environment authority error = %v", err)
+	}
+}
 
 func TestIntegration_RealCodexRepositoryAuthorityNegativeAttempts(t *testing.T) {
 	if os.Getenv("DONMAI_CODEX_WORKAREA_AUTHORITY_INTEGRATION") != "1" {

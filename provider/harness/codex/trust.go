@@ -36,8 +36,10 @@ import (
 // The rule is provenance, not convenience: the platform may pre-answer a trust
 // question about something the PLATFORM ITSELF provisioned, and nothing else.
 //
-//   - The session working directory IS platform-provisioned — the runner
-//     created it and placed its contents there — so it is pre-trusted.
+//   - A standalone session working directory may be pre-trusted to clear the
+//     modal. A platform session is explicitly UNTRUSTED instead: Codex keeps
+//     full repository filesystem access but skips project `.codex/` config,
+//     hooks, and rules so repo content cannot widen session MCP authority.
 //   - Requested MCP servers ARE platform-provisioned, and they need no trust
 //     entry at all: codex starts every server named in effective configuration
 //     without an approval step (measured against codex-cli 0.146.0; a server
@@ -56,18 +58,19 @@ import (
 //
 // # Why overrides rather than writes
 //
-// The interactive spawn mode deliberately runs against the operator's ambient
-// codex home (that is where its authentication lives), so every seed here is a
-// process-local `--config` override — a `sessionFlags` configuration layer in
-// codex's own vocabulary. Nothing on this path reads, copies, or writes the
-// operator's `config.toml`: a trust decision the platform made for one session
-// must not outlive that session or accumulate in a file the operator owns.
+// The on-platform interactive spawn mode runs against a private,
+// process-owned CODEX_HOME; file-backed authentication is hard-linked into
+// that boundary without ever copying the operator's config.toml. Every seed
+// here is still a process-local `--config` override — a `sessionFlags`
+// configuration layer in codex's own vocabulary — so a trust decision the
+// platform made for one session cannot outlive that session or accumulate in a
+// file the operator owns. Standalone interactive use retains its historical
+// ambient configuration.
 //
 // One consequence is deliberate and worth stating: the `projects` override
-// SHADOWS the ambient projects table for this process, so the session's trusted
-// set is exactly the workspace the platform provisioned. That is narrower than
-// what the operator's own configuration may grant (a broad entry such as `/`
-// stops applying inside the session), never broader.
+// SHADOWS the ambient projects table for this process. A platform session's
+// workspace is untrusted even when the operator granted a broad ambient entry
+// such as `/`; standalone sessions retain the historical trusted seed.
 //
 // # The headless app-server lane is deliberately NOT seeded
 //
@@ -85,6 +88,10 @@ const (
 	// codexTrustLevelTrusted is codex's own value for a directory whose
 	// contents may be loaded: `[projects."<dir>"] trust_level = "trusted"`.
 	codexTrustLevelTrusted = "trusted"
+	// Platform sessions deliberately mark the worktree untrusted so Codex
+	// skips project `.codex/` config, hooks, and rules while retaining ordinary
+	// filesystem access to the repository.
+	codexTrustLevelUntrusted = "untrusted"
 
 	// codexHooksEnv selects what happens to hooks codex discovers for the
 	// session. It exists for the attended case only; see codexHooksPolicy.
@@ -137,12 +144,16 @@ func codexHooksPolicy(getenv func(string) string) (string, error) {
 // sit on it forever — so the session is refused with a message that names the
 // missing trust instead.
 func interactiveTrustArgs(cwd string, hooksPolicy string, getwd func() (string, error)) ([]string, error) {
+	return interactiveTrustArgsWithLevel(cwd, hooksPolicy, codexTrustLevelTrusted, getwd)
+}
+
+func interactiveTrustArgsWithLevel(cwd, hooksPolicy, trustLevel string, getwd func() (string, error)) ([]string, error) {
 	dirs, err := sessionWorkspaceTrustDirs(cwd, getwd)
 	if err != nil {
 		return nil, err
 	}
 
-	args := []string{"--config", trustedProjectsOverride(dirs)}
+	args := []string{"--config", projectsTrustOverride(dirs, trustLevel)}
 	if hooksPolicy == codexHooksOff {
 		// Disables codex's hooks feature for this process only. Expressed as a
 		// dotted config path rather than the `--disable <feature>` flag on
@@ -196,6 +207,10 @@ func sessionWorkspaceTrustDirs(cwd string, getwd func() (string, error)) ([]stri
 // a workspace path containing quotes, backslashes, or non-ASCII characters
 // round-trips as one key rather than splitting the dotted path.
 func trustedProjectsOverride(dirs []string) string {
+	return projectsTrustOverride(dirs, codexTrustLevelTrusted)
+}
+
+func projectsTrustOverride(dirs []string, trustLevel string) string {
 	var body strings.Builder
 	body.WriteString("projects={")
 	for i, dir := range dirs {
@@ -204,7 +219,7 @@ func trustedProjectsOverride(dirs []string) string {
 		}
 		body.WriteString(tomlBasicString(dir))
 		body.WriteString("={trust_level=")
-		body.WriteString(tomlBasicString(codexTrustLevelTrusted))
+		body.WriteString(tomlBasicString(trustLevel))
 		body.WriteByte('}')
 	}
 	body.WriteByte('}')

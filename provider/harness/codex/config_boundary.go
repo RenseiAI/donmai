@@ -40,6 +40,23 @@ type codexConfigBoundary struct {
 }
 
 func newCodexConfigBoundary(tempDir string, fileAuth bool) (*codexConfigBoundary, error) {
+	authMode := ""
+	if fileAuth {
+		authMode = "file"
+	}
+	return newCodexConfigBoundaryWithAuthMode(tempDir, authMode)
+}
+
+// newCodexConfigBoundaryWithAuthMode builds the private user layer while
+// preserving the host's explicit credential-store selection. It copies only
+// the one non-secret enum, never the host config or any credential bytes.
+func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigBoundary, error) {
+	authMode = strings.ToLower(strings.TrimSpace(authMode))
+	switch authMode {
+	case "", "file", "keyring", "auto":
+	default:
+		return nil, fmt.Errorf("unsupported Codex credential store %q", authMode)
+	}
 	parent := tempDir
 	if parent == "" {
 		parent = os.TempDir()
@@ -88,11 +105,10 @@ func newCodexConfigBoundary(tempDir string, fileAuth bool) (*codexConfigBoundary
 		return nil, fmt.Errorf("create isolated Codex config: %w", err)
 	}
 	baseline := codexConfigBaseline
-	if fileAuth {
-		// Pin file-backed auth explicitly before app-server initialization. The
-		// credential itself is linked later, only on the selected Spawn/Resume
-		// path.
-		baseline = codexFileAuthConfig + baseline
+	if authMode != "" {
+		// Pin the selected store before process initialization. File credential
+		// bytes are linked separately, only on the selected Spawn/Resume path.
+		baseline = "cli_auth_credentials_store = " + fmt.Sprintf("%q", authMode) + "\n" + baseline
 	}
 	if _, err := f.WriteString(baseline); err != nil {
 		_ = f.Close()

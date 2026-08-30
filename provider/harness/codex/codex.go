@@ -129,6 +129,13 @@ type Options struct {
 	// always verify it.
 	verifyMCPReadback bool
 	configTempDir     string
+	// interactiveMCPInventoryRunner is a test seam for the pre-PTY effective
+	// config readback. Production executes the selected Codex binary's own
+	// `mcp list --json` semantics.
+	interactiveMCPInventoryRunner interactiveMCPInventoryRunner
+	// interactiveAuthSeeder is a test seam for projecting an explicit
+	// environment credential into the private, ephemeral session auth store.
+	interactiveAuthSeeder interactiveCodexAuthSeeder
 }
 
 // New constructs the Provider WITHOUT starting the codex app-server.

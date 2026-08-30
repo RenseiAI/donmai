@@ -359,12 +359,30 @@ func TestRun_InteractiveDefaultHTTPMCPReachesCodexCLI(t *testing.T) {
 	}
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
+	t.Setenv("CODEX_ACCESS_TOKEN", "runner-codex-auth-fixture")
 	server := mockPlatformServer(t)
 	defer server.Close()
 	bin := filepath.Join(t.TempDir(), "fake-codex")
 	script := `#!/bin/bash
+if [[ " $* " == *" mcp list --json "* || " $* " == *" mcp get "* ]]; then
+  for arg in "$@"; do
+    case "$arg" in
+      mcp_servers=*) mcp_config="$arg" ;;
+    esac
+  done
+  url=$(printf '%s' "$mcp_config" | sed -n 's/.*"url"="\([^"]*\)".*/\1/p')
+  header_env=$(printf '%s' "$mcp_config" | sed -n 's/.*"Authorization"="\([^"]*\)".*/\1/p')
+  server=$(printf '{"name":"donmai-platform","enabled":true,"disabled_reason":null,"transport":{"type":"streamable_http","url":"%s","bearer_token_env_var":null,"http_headers":null,"env_http_headers":{"Authorization":"%s"},"http_headers_helper":null},"enabled_tools":null,"disabled_tools":null,"startup_timeout_sec":null,"tool_timeout_sec":null}' "$url" "$header_env")
+  if [[ " $* " == *" mcp list --json "* ]]; then
+    printf '[%s]\n' "$server"
+  else
+    printf '%s\n' "$server"
+  fi
+  exit 0
+fi
 printf '%s\n' "$@" > "$PWD/codex-argv"
 env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
+for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' "$key" "${!key}"; done > "$PWD/codex-auth-env"
 `
 	if err := os.WriteFile(bin, []byte(script), 0o600); err != nil {
 		t.Fatal(err)
@@ -411,6 +429,15 @@ env | LC_ALL=C sort | grep '^DONMAI_MCP_HEADER_' > "$PWD/codex-mcp-env" || true
 	}
 	if !strings.Contains(string(childEnv), "Bearer "+token) {
 		t.Fatalf("Codex child env omitted HTTP header secret: %s", childEnv)
+	}
+	authEnv, err := os.ReadFile(filepath.Join(provider.raw.Cwd, "codex-auth-env"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, key := range []string{"OPENAI_API_KEY", "CODEX_API_KEY", "CODEX_ACCESS_TOKEN"} {
+		if !strings.Contains(string(authEnv), key+"=\n") {
+			t.Fatalf("Codex child retained %s authority: %s", key, authEnv)
+		}
 	}
 	persisted, err := state.NewStore().Read(provider.raw.Cwd)
 	if err != nil {
