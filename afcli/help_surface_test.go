@@ -27,7 +27,7 @@ import (
 )
 
 // standaloneTree builds the command tree exactly as the standalone binary does
-// (cmd/donmai/main.go): the legacy worker/fleet subtree enabled, dashboard on.
+// (cmd/donmai/main.go): legacy worker/fleet, dashboard, and formal A2A on.
 func standaloneTree(t *testing.T) *cobra.Command {
 	t.Helper()
 	root := &cobra.Command{Use: "donmai"}
@@ -36,6 +36,7 @@ func standaloneTree(t *testing.T) *cobra.Command {
 		ClientFactory:           func() afclient.DataSource { return afclient.NewMockClient() },
 		EnableDashboard:         true,
 		EnableLegacyWorkerFleet: true,
+		EnableA2AClient:         true,
 	})
 	if len(root.Commands()) == 0 {
 		t.Fatal("RegisterCommands registered nothing — test fixture is stale")

@@ -4,6 +4,10 @@
 package afcli
 
 import (
+	"context"
+	"net/http"
+
+	"github.com/RenseiAI/donmai/a2a"
 	"github.com/RenseiAI/donmai/afcli/credentials"
 	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
@@ -104,6 +108,26 @@ type Config struct {
 	// Optional; nil registers every provider exactly as before (no wrapping,
 	// no behavior change).
 	AgentSpecExtensionDecorator agent.ExtensionDecorator
+
+	// EnableA2AClient registers the formal A2A v1 client command group. It is
+	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
+	// command using the same noun before enabling the public surface.
+	EnableA2AClient bool
+
+	// A2AAuthorization resolves the complete Authorization header value for
+	// each formal A2A request. Nil permits unauthenticated peers. Commands can
+	// override it with --bearer-token-file, which is reread per request.
+	A2AAuthorization a2a.AuthorizationProvider
+
+	// A2AHTTPClient is the optional caller-owned transport used for both Agent
+	// Card discovery and JSON-RPC calls. Nil uses the a2a package default.
+	A2AHTTPClient *http.Client
+
+	// A2ACardURL resolves an embedder-owned peer reference to an explicit Agent
+	// Card URL. Standalone callers use --card directly. This callback lets a
+	// registry-backed embedder preserve a human peer selector without teaching
+	// OSS Donmai any proprietary directory semantics.
+	A2ACardURL func(context.Context, string) (string, error)
 }
 
 // scopedClientFactory wraps cfg.ClientFactory so every produced Client
@@ -177,6 +201,9 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newOrchestratorCmd(cfg))
 	root.AddCommand(newCodeCmd(cfg))
 	root.AddCommand(newMCPCmd(cfg))
+	if cfg.EnableA2AClient {
+		root.AddCommand(newA2ACmd(cfg))
+	}
 	root.AddCommand(newEvalCmd(cfg))
 	root.AddCommand(newArchCmd(cfg))
 	root.AddCommand(linearcmd.New(ds, binaryName(cfg)))

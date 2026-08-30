@@ -196,6 +196,7 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 		EnableDashboard:         true,
 		EnableLegacyWorkerFleet: true,
 		HostBinaryVersion:       version,
+		EnableA2AClient:         true,
 	})
 
 	return cmd, flags
