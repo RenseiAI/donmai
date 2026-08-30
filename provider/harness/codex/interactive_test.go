@@ -50,6 +50,44 @@ func TestInteractiveArgs(t *testing.T) {
 	}
 }
 
+func TestInteractiveArgs_NamedSessionResumesNativeThreadByName(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	seed := launchSeedPrefixFor(t, workspace)
+	want := append([]string{"resume"}, seed...)
+	want = append(want, "chief-of-staff", "coordinate")
+	got := interactiveArgs(agent.Spec{
+		Cwd: workspace, SessionName: "chief-of-staff", Prompt: "coordinate",
+	})
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("interactiveArgs = %q; want %q", got, want)
+	}
+}
+
+func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T) {
+	t.Parallel()
+	got := remoteInteractiveArgs(
+		[]string{"resume", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"},
+		"unix:///tmp/codex.sock",
+	)
+	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
+	}
+}
+
+func TestAppServerConfigArgs_ProjectsOnlyConfigAuthority(t *testing.T) {
+	t.Parallel()
+	got := appServerConfigArgs([]string{
+		"resume", "--config", `model="gpt-5.6-sol"`, "--add-dir", "/work/other",
+		"--config", `mcp_servers={}`, "--strict-config", "chief-of-staff", "coordinate",
+	})
+	want := []string{"--config", `model="gpt-5.6-sol"`, "--config", `mcp_servers={}`, "--strict-config"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("appServerConfigArgs = %q; want %q", got, want)
+	}
+}
+
 // TestBuildInteractiveLaunch_Model is the regression guard for the
 // platform-model-selection defect: the interactive TUI launch never read
 // Spec.Model at all (unlike the headless app-server lane's

@@ -970,6 +970,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		CacheSeedID:             d.CacheSeedID,
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
+			SessionName:          d.SessionName,
 			IssueID:              d.IssueID,
 			IssueIdentifier:      d.IssueIdentifier,
 			LinearSessionID:      d.LinearSessionID,

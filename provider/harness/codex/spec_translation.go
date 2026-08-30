@@ -293,7 +293,7 @@ type SpecFieldNote struct {
 // NewSpawnPlan returns the JSON-RPC params for Spawn, plus the
 // accounting of which Spec fields were translated and which were
 // dropped. The accounting is exercised by spec_translation_test.go to
-// ensure every one of the 19 Spec fields is either translated or
+// ensure every relevant Spec field is either translated or
 // explicitly noted.
 func NewSpawnPlan(spec agent.Spec) SpawnPlan {
 	threadStart := threadStartParams(spec)

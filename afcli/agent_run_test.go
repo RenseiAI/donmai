@@ -1756,3 +1756,25 @@ func TestDonmaiSpanTracingEnabled(t *testing.T) {
 		})
 	}
 }
+
+func TestSessionNameSurvivesDaemonWireIntoRunnerQueuedWork(t *testing.T) {
+	t.Parallel()
+	var item daemon.PollWorkItem
+	if err := json.Unmarshal([]byte(`{"sessionId":"sess-name","sessionName":"chief-of-staff"}`), &item); err != nil {
+		t.Fatalf("decode poll item: %v", err)
+	}
+	if item.SessionName != "chief-of-staff" {
+		t.Fatalf("PollWorkItem.SessionName = %q", item.SessionName)
+	}
+	detail := daemon.PollItemToSessionDetail(item, nil, "https://platform.invalid", "token", "worker")
+	if detail.SessionName != "chief-of-staff" {
+		t.Fatalf("SessionDetail.SessionName = %q", detail.SessionName)
+	}
+	work, err := detailToQueuedWork(detail)
+	if err != nil {
+		t.Fatalf("detailToQueuedWork: %v", err)
+	}
+	if work.SessionName != "chief-of-staff" {
+		t.Fatalf("QueuedWork.SessionName = %q", work.SessionName)
+	}
+}

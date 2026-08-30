@@ -54,12 +54,12 @@
 //
 // # Interactive spawn mode (W4)
 //
-// HarnessCaps.SupportsInteractivePTY declares a SECOND, independent spawn
-// mode (interactive.go: SpawnInteractive): Spec.Interactive != nil routes
-// Spawn to the bare `codex` TUI under a PTY (provider/harness/ptycli)
-// instead of `codex app-server`/`codex exec`. It never touches the
-// JSON-RPC client or thread/turn machinery below — see interactive.go for
-// the full contract.
+// HarnessCaps.SupportsInteractivePTY declares a SECOND spawn mode
+// (interactive.go: SpawnInteractive): Spec.Interactive != nil routes Spawn to
+// the codex TUI under a PTY (provider/harness/ptycli). Named sessions use a
+// per-session app-server to apply thread/name/set before attaching the TUI by
+// name; they never reuse the Provider's shared headless client/process. See
+// interactive.go for the full contract.
 //
 // # Approval bridge
 //

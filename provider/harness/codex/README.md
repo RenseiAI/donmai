@@ -187,6 +187,14 @@ on its own default when it did not:
   both stay on the codex CLI's own default rather than being pinned to
   `DefaultCodexModel`.
 
+When `Spec.SessionName` is present, the interactive lane starts a bounded
+per-session Unix-socket app-server, creates the thread, applies and reads back
+`thread/name/set`, then attaches the TUI with
+`codex resume --remote <socket> <name>`. The server stays alive through the
+first turn so the already-named thread becomes the durable resume target; the
+PTY lifecycle owns its cleanup. Unnamed interactive sessions retain the bare
+TUI path.
+
 Neither lane validates a model id before spawn — codex is the sole
 authority. A rejected id surfaces as codex's own nonzero exit (or, for the
 headless lane, a JSON-RPC error), never a silent fallback to a different
@@ -332,7 +340,8 @@ surfacing as a spurious `client stopped` Spawn failure.
 | `jsonrpc.go`          | Bidirectional JSON-RPC 2.0 client over stdio      |
 | `handle.go`           | Per-session `Handle` + forwarder goroutine        |
 | `approval.go`         | Approval bridge (Spec.PermissionConfig → decision) |
-| `interactive.go`      | Interactive PTY spawn mode (bare `codex` TUI)     |
+| `interactive.go`      | Interactive PTY spawn mode and native name attach |
+| `interactive_name.go` | Per-session app-server name/readback lifecycle    |
 | `trust.go`            | Startup trust seeding for the interactive mode    |
 | `spec_translation.go` | `agent.Spec` → JSON-RPC param mapping             |
 | `event_mapping.go`    | JSON-RPC notification → `agent.Event` mapping     |

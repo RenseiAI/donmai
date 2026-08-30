@@ -108,6 +108,9 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 		"--approve",
 		"--session-dir", layout.root,
 	)
+	if spec.SessionName != "" {
+		args = append(args, "--name", spec.SessionName)
+	}
 	args = append(args, modelPinArgs(spec)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)

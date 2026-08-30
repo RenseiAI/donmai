@@ -1,10 +1,31 @@
 package pi
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
 )
+
+func TestRPCArgs_ProjectsSessionNameAtStartup(t *testing.T) {
+	t.Parallel()
+	layout := sessionLayout{root: "/tmp/session"}
+	got := rpcArgs(layout, nil, launchPrompt, "", agent.Spec{SessionName: "chief-of-staff"})
+	want := []string{"--mode", "rpc", "--no-extensions", "--approve", "--session-dir", "/tmp/session", "--name", "chief-of-staff"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("rpcArgs = %q; want %q", got, want)
+	}
+}
+
+func TestInteractiveArgs_ProjectsSessionNameAtStartup(t *testing.T) {
+	t.Parallel()
+	layout := sessionLayout{root: "/tmp/session"}
+	got := interactiveArgs(agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"}, layout, nil)
+	want := []string{"--no-extensions", "--approve", "--session-dir", "/tmp/session", "--name", "chief-of-staff", "coordinate"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("interactiveArgs = %q; want %q", got, want)
+	}
+}
 
 // TestCodeIntelEnforcementNote_UnsetReturnsNil pins the non-note half of the
 // contract: no CodeIntelEnforcement configured, no note (nothing to name).

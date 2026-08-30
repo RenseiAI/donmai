@@ -22,7 +22,9 @@ type fakeServer struct {
 
 	mu        sync.Mutex
 	threads   map[string]bool
+	names     map[string]string
 	methods   []string
+	params    []map[string]any
 	mcpWrites []string
 	activeMCP map[string]any
 }
@@ -37,6 +39,7 @@ func newFakeServer() (*fakeServer, *io.PipeWriter, *io.PipeReader) {
 		stdin:     stdinReader,
 		stdout:    stdoutWriter,
 		threads:   map[string]bool{},
+		names:     map[string]string{},
 		activeMCP: map[string]any{},
 	}
 	return fs, stdinWriter, stdoutReader
@@ -86,6 +89,8 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 		idRaw, hasID := msg["id"]
 		fs.mu.Lock()
 		fs.methods = append(fs.methods, method)
+		params, _ := msg["params"].(map[string]any)
+		fs.params = append(fs.params, params)
 		if method == "config/batchWrite" {
 			encoded, _ := json.Marshal(msg["params"])
 			fs.mcpWrites = append(fs.mcpWrites, string(encoded))
@@ -135,6 +140,24 @@ func (fs *fakeServer) run(t *testing.T, threadID string) {
 				"jsonrpc": "2.0",
 				"id":      idRaw,
 				"result":  map[string]any{"thread": map[string]any{"id": threadID}},
+			})
+		case method == "thread/name/set" && hasID:
+			params, _ := msg["params"].(map[string]any)
+			threadID, _ := params["threadId"].(string)
+			name, _ := params["name"].(string)
+			fs.mu.Lock()
+			fs.names[threadID] = name
+			fs.mu.Unlock()
+			fs.replyOK(t, idRaw)
+		case method == "thread/read" && hasID:
+			params, _ := msg["params"].(map[string]any)
+			threadID, _ := params["threadId"].(string)
+			fs.mu.Lock()
+			name := fs.names[threadID]
+			fs.mu.Unlock()
+			fs.write(t, map[string]any{
+				"jsonrpc": "2.0", "id": idRaw,
+				"result": map[string]any{"thread": map[string]any{"id": threadID, "name": name}},
 			})
 		case method == "turn/start" && hasID:
 			fs.replyOK(t, idRaw)
@@ -252,6 +275,69 @@ func TestHandle_SpawnEventsTerminalResult(t *testing.T) {
 	}
 	if h.SessionID() != "thread-A" {
 		t.Fatalf("expected SessionID=thread-A, got %q", h.SessionID())
+	}
+}
+
+func TestHandle_FreshThreadIsNamedBeforeFirstTurn(t *testing.T) {
+	p, fs := newTestProvider(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, agent.Spec{
+		SessionName: "chief-of-staff",
+		Prompt:      "coordinate",
+		Cwd:         "/tmp/wt",
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	_ = drainEvents(t, h.Events(), 5*time.Second)
+
+	fs.mu.Lock()
+	methods := append([]string(nil), fs.methods...)
+	params := append([]map[string]any(nil), fs.params...)
+	fs.mu.Unlock()
+	start := -1
+	name := -1
+	turn := -1
+	for i, method := range methods {
+		switch method {
+		case "thread/start":
+			start = i
+		case "thread/name/set":
+			name = i
+			if params[i]["threadId"] != "thread-A" || params[i]["name"] != "chief-of-staff" {
+				t.Fatalf("thread/name/set params = %#v", params[i])
+			}
+		case "turn/start":
+			turn = i
+		}
+	}
+	if start < 0 || name <= start || turn <= name {
+		t.Fatalf("method order = %v; want thread/start -> thread/name/set -> turn/start", methods)
+	}
+}
+
+func TestCreateAndVerifyNamedThread_ReadsBackDurableNativeName(t *testing.T) {
+	t.Parallel()
+	fs, stdinW, stdoutR := newFakeServer()
+	go fs.run(t, "thread-bootstrap")
+	client := NewClient(stdinW, stdoutR)
+	t.Cleanup(func() {
+		client.Stop(errors.New("test complete"))
+		fs.close()
+	})
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	threadID, err := createAndVerifyNamedThread(ctx, client, agent.Spec{
+		SessionName: "chief-of-staff", Cwd: "/tmp/wt",
+	}, time.Second)
+	if err != nil {
+		t.Fatalf("createAndVerifyNamedThread: %v", err)
+	}
+	if threadID != "thread-bootstrap" {
+		t.Fatalf("thread id = %q", threadID)
 	}
 }
 

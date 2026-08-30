@@ -29,10 +29,16 @@ const InteractiveRunMode = "interactive"
 // (../donmai-libraries/packages/server/src/work-queue.ts) and the live
 // Redis session payload observed during F.2.7 verification.
 type QueuedWork struct {
-	// SessionID is the Rensei session UUID (e.g.
+	// SessionID is the control-plane session UUID (e.g.
 	// "0b5e88d9-32d0-4aca-9f8c-caf82f2b399c"). It uniquely identifies
 	// this session record on the platform side.
 	SessionID string `json:"sessionId,omitempty"`
+
+	// SessionName is the canonical user-facing name for this session. When
+	// A2A is enabled it is also the normalized peer handle. The runner forwards
+	// it unchanged to the exact harness adapter; it is never derived from the
+	// provider-native session id.
+	SessionName string `json:"sessionName,omitempty"`
 
 	// IssueID is the Linear issue UUID this session was triggered for.
 	// May be empty for governor-generated sessions.
@@ -57,7 +63,7 @@ type QueuedWork struct {
 	// prompt so the agent knows which project it is operating in.
 	ProjectName string `json:"projectName,omitempty"`
 
-	// OrganizationID is the Rensei tenant UUID (e.g.
+	// OrganizationID is the tenant UUID (e.g.
 	// "org_ejkmv9ojdyifipydw5l1"). Surfaced in the system prompt so
 	// templated org-aware instructions can render.
 	OrganizationID string `json:"organizationId,omitempty"`
@@ -324,7 +330,7 @@ type QueuedWork struct {
 	// tolerates its absence — nil = capability off).
 	CodeIntel *CodeIntelWork `json:"codeIntel,omitempty"`
 
-	// ── W3C trace-context correlation (REN-2649) ─────────────────────────
+	// ── W3C trace-context correlation ────────────────────────────────────
 	//
 	// Platform dispatch stamps these opaquely per
 	// src/lib/observability/trace-context.ts (DispatchTraceContextFields).

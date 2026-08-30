@@ -38,6 +38,35 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 )
 
+func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real interactive-name proof requires codex on PATH: %v", err)
+	}
+	boundary, err := newCodexConfigBoundaryWithAuthMode(t.TempDir(), "")
+	if err != nil {
+		t.Fatalf("private boundary: %v", err)
+	}
+	t.Cleanup(func() { _ = boundary.remove() })
+	name := "donmai-name-proof-" + strconv.FormatInt(time.Now().UnixNano(), 36)
+	server, err := startNamedInteractiveAppServer(
+		t.Context(), binary, Options{HandshakeTimeout: 30 * time.Second, RPCTimeout: 10 * time.Second},
+		agent.Spec{SessionName: name, Cwd: t.TempDir()}, interactiveLaunch{}, nil, boundary.home,
+	)
+	if err != nil {
+		t.Fatalf("bootstrap named interactive thread: %v", err)
+	}
+	t.Cleanup(func() {
+		if err := server.close(); err != nil {
+			t.Errorf("stop named app-server: %v", err)
+		}
+	})
+	if server.remoteURL == "" {
+		t.Fatal("named app-server returned no remote URL")
+	}
+	t.Logf("named thread %s is live at %s", name, server.remoteURL)
+}
+
 func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {

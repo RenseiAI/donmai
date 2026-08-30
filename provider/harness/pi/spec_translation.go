@@ -94,6 +94,9 @@ func rpcArgs(layout sessionLayout, extensionPaths []string, mode launchMode, ses
 		"--approve",
 		"--session-dir", layout.root,
 	)
+	if spec.SessionName != "" && mode == launchPrompt {
+		args = append(args, "--name", spec.SessionName)
+	}
 	args = append(args, modelPinArgs(spec)...)
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--append-system-prompt", spec.SystemPromptAppend)
