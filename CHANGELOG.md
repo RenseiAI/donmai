@@ -6,6 +6,46 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.8 — 2026-08-30
+
+### Features
+
+- **Session names reach native harnesses.** One optional canonical
+  `sessionName` is carried through queued work, daemon session detail, runner
+  translation, and `agent.Spec`; fresh sessions are projected into the native
+  Claude and Pi `--name` startup flags, and Codex app-server threads are named
+  before their first turn (named interactive Codex sessions use a bounded
+  per-session Unix-socket app-server with native `resume --remote` attach).
+  Empty names and existing native resume targets are unchanged. (#480)
+
+- **The public Go client and `agent chat` CLI can carry an idempotency key and
+  read durable prompt receipts.** `ChatSessionRequest` accepts an optional
+  `IdempotencyKey`, exposed as `agent chat`'s new `--idempotency-key` flag for
+  safe prompt retries. `ChatSessionResponse` gains typed `DeliveryTier`,
+  `Disposition`, `IdempotencyKey`, `Code`, `Error`, `RecoveryAction`, and
+  `MissingFields` fields, so callers can read a durable receipt's delivery tier
+  and terminal disposition (e.g. `held`) instead of only a `delivered` boolean;
+  `agent chat`'s status line now prints the response's disposition when
+  present. Server behavior is unchanged. (#481)
+
+### Fixes
+
+- **Preflight and spawn now build the harness authority from the same
+  inputs.** The daemon's execution preflight compiled its prepared harness from
+  the operational payload alone, while the spawn path also applied the session
+  detail's sibling `modelProfile`/`resolvedProfile` (model, effort, provider
+  config, endpoint, credential id). The first receipt-bearing interactive spawn
+  therefore failed `ApplyPreparedHarness` with an authority-digest mismatch.
+  Both lanes now call one shared `runner.ReconcileResolvedProfile`, and the
+  preflight forwards the sibling fields. `ApplyPreparedHarness` reports an
+  `AuthorityDriftError` naming the drifting projection fields (digests only,
+  never raw values). The digest algorithm is unchanged, so receipts persisted by
+  earlier daemons stay valid; a child binary older than this release cannot read
+  the new per-field digests, so do not roll a daemon back across this version
+  while receipt-bearing sessions are active. (#482)
+
+---
+
 ## v0.72.7 — 2026-08-30
 
 ### Features
