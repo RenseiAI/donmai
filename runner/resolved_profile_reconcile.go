@@ -137,7 +137,10 @@ func providerConfigWithContextWindow(pc map[string]any, contextWindow int) map[s
 	if _, ok := pc["contextWindow"]; ok {
 		return pc
 	}
-	out := make(map[string]any, len(pc)+1)
+	// CodeQL (go/allocation-size-overflow) flags an unbounded +1 capacity hint
+	// as a possible allocation-size overflow; len(pc) alone is a safe hint and
+	// the map still grows correctly when the "contextWindow" key is inserted.
+	out := make(map[string]any, len(pc))
 	for k, v := range pc {
 		out[k] = v
 	}
