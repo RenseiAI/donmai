@@ -419,6 +419,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// we forward whatever the caller set plus the standard session
 	// metadata.
 	specEnv := buildSessionEnv(qw)
+	bootstrapMCPBearerCleanup, err := prepareSessionMCPBearerEnv(
+		qw,
+		specEnv,
+		os.Getenv(mcpGatewayTokenFileEnv),
+	)
+	if err != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureSpawn
+		res.Error = err.Error()
+		return res, err
+	}
+	defer bootstrapMCPBearerCleanup()
 
 	// 4. Build MCP config. The exact harness adapter applies or denies the
 	// resulting set before spawn; nothing here is silently dropped.
