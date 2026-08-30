@@ -14,9 +14,12 @@
 //   - network access
 //
 // The suite covers headless lifecycle and interactive PTY behavior against the
-// real binary. The named interactive control executes the production native
-// resume-by-name attach, observes live PTY output, stops it, and verifies both
-// the Unix-socket directory and isolated config home are removed.
+// real binary. The named interactive control executes the production
+// fresh-session flow (PTY creates its own thread over --remote, the bootstrap
+// connection names it post-hoc — see interactive_name.go's package doc
+// comment for why this replaced #480's original create-then-resume design),
+// observes live PTY output, stops it, and verifies both the Unix-socket
+// directory and isolated config home are removed.
 
 package codex
 
@@ -38,6 +41,14 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 )
 
+// TestIntegration_RealCodexInteractiveNameBootstrap proves the bootstrap
+// app-server itself comes up and completes its initialize/initialized
+// handshake against a real codex binary — the shared first step of BOTH
+// named interactive shapes (fresh and attach-to-existing). It deliberately
+// does not create or name a thread here: for the fresh (default) shape that
+// only happens after the PTY itself creates one — see
+// TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup for the full
+// end-to-end proof.
 func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {
@@ -51,10 +62,10 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	name := "donmai-name-proof-" + strconv.FormatInt(time.Now().UnixNano(), 36)
 	server, err := startNamedInteractiveAppServer(
 		t.Context(), binary, Options{HandshakeTimeout: 30 * time.Second, RPCTimeout: 10 * time.Second},
-		agent.Spec{SessionName: name, Cwd: t.TempDir()}, interactiveLaunch{}, nil, boundary.home,
+		agent.Spec{SessionName: name, Cwd: t.TempDir(), Interactive: &agent.InteractiveSpec{}}, interactiveLaunch{}, nil, boundary.home,
 	)
 	if err != nil {
-		t.Fatalf("bootstrap named interactive thread: %v", err)
+		t.Fatalf("bootstrap named interactive app-server: %v", err)
 	}
 	t.Cleanup(func() {
 		if err := server.close(); err != nil {
@@ -64,10 +75,33 @@ func TestIntegration_RealCodexInteractiveNameBootstrap(t *testing.T) {
 	if server.remoteURL == "" {
 		t.Fatal("named app-server returned no remote URL")
 	}
-	t.Logf("named thread %s is live at %s", name, server.remoteURL)
+	if server.getClient() == nil {
+		t.Fatal("named app-server did not leave its RPC connection open for post-spawn naming")
+	}
+	// Production closes this diagnostic connection eagerly once its job is
+	// done (see namedInteractiveAppServer.closeClient's doc comment) rather
+	// than leaving it open for the life of the session. This test's job is
+	// done as soon as the handshake is proven, so it closes the same way:
+	// eagerly, while the app-server is still fully alive — proving
+	// interactiveWebSocketClient.close (CloseNow, not a graceful handshake
+	// close a real codex-cli 0.151.0 app-server never reciprocates) succeeds
+	// cleanly against a live peer.
+	if err := server.closeClient(); err != nil {
+		t.Fatalf("close bootstrap RPC connection while the app-server peer is still alive: %v", err)
+	}
+	t.Logf("bootstrap app-server for %s is live at %s", name, server.remoteURL)
 }
 
-func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) {
+// TestIntegration_RealCodexNamedInteractivePTYFreshCreateAndCleanup proves
+// the production (default) named interactive flow end-to-end against a real
+// codex binary: SpawnInteractive with a non-empty SessionName and no attach
+// signal never invokes `codex resume` (the production defect this PR fixes)
+// — the PTY attaches bare over --remote, creates its own thread, and the
+// bootstrap connection names it post-hoc. The TUI must render output and
+// stay live (not exit immediately, e.g. on a "No saved session found"
+// error), and Stop must clean up both the socket directory and the isolated
+// config home.
+func TestIntegration_RealCodexNamedInteractivePTYFreshCreateAndCleanup(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {
 		t.Fatalf("real named PTY proof requires codex on PATH: %v", err)
@@ -143,21 +177,21 @@ func TestIntegration_RealCodexNamedInteractivePTYResumeAndCleanup(t *testing.T) 
 		select {
 		case frame, ok := <-sub.Frames():
 			if !ok {
-				t.Fatal("named Codex PTY closed before rendering the resumed TUI")
+				t.Fatal("named Codex PTY closed before rendering the fresh TUI")
 			}
 			if frame.Type == attachwire.TypeExit {
-				t.Fatal("named Codex PTY exited before the resumed TUI was ready")
+				t.Fatal("named Codex PTY exited before the fresh TUI was ready (a resume-shaped invocation for a fresh session fails exactly this way — see interactive_name.go's package doc comment)")
 			}
 			if frame.Type == attachwire.TypeOutput && len(frame.Payload) > 0 {
 				sawOutput = true
 			}
 		case <-ctx.Done():
-			t.Fatalf("named Codex PTY produced no resumed-TUI output: %v", ctx.Err())
+			t.Fatalf("named Codex PTY produced no output: %v", ctx.Err())
 		}
 	}
 	select {
 	case <-interactive.InteractiveSession().Done():
-		t.Fatal("named Codex PTY exited immediately after rendering; native resume attach did not stay live")
+		t.Fatal("named Codex PTY exited immediately after rendering; fresh --remote attach did not stay live")
 	case <-time.After(250 * time.Millisecond):
 	}
 
