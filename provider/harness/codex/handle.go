@@ -258,6 +258,15 @@ func (h *Handle) start(ctx context.Context, plan SpawnPlan, resumeThreadID strin
 		h.threadID = resp.Thread.ID
 		h.idMu.Unlock()
 		h.client.Subscribe(resp.Thread.ID, provisionalSub)
+		if h.spec.SessionName != "" {
+			if _, err := h.client.RequestWithRetry(ctx, "thread/name/set", map[string]any{
+				"threadId": resp.Thread.ID,
+				"name":     h.spec.SessionName,
+			}, h.rpcTimeout); err != nil {
+				h.client.Unsubscribe(resp.Thread.ID)
+				return fmt.Errorf("thread/name/set: %w", err)
+			}
+		}
 	}
 
 	// First turn — fill in threadId now that we have it.

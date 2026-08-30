@@ -83,6 +83,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	}
 
 	spec := agent.Spec{
+		SessionName:        strings.TrimSpace(qw.SessionName),
 		Prompt:             in.Prompt,
 		Cwd:                in.Cwd,
 		Env:                in.Env,

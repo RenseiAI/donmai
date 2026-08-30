@@ -136,6 +136,10 @@ type Options struct {
 	// interactiveAuthSeeder is a test seam for projecting an explicit
 	// environment credential into the private, ephemeral session auth store.
 	interactiveAuthSeeder interactiveCodexAuthSeeder
+	// interactiveNameServerStarted observes the exact runner-owned endpoint
+	// after native name readback and before PTY attach. Test-only; production
+	// leaves it nil.
+	interactiveNameServerStarted func(remoteURL string)
 }
 
 // New constructs the Provider WITHOUT starting the codex app-server.
@@ -370,8 +374,8 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	// Interactive spawn mode (W4): completely independent of the app-server
-	// JSON-RPC subprocess this Provider otherwise drives — see interactive.go.
+	// Interactive spawn mode (W4): independent of this Provider's shared
+	// headless app-server state — see interactive.go.
 	// Capability-gated on the live manifest so a future edit that flips
 	// SupportsInteractivePTY back to false silently falls through to the
 	// headless app-server path instead of a hardcoded branch always firing.
@@ -856,9 +860,9 @@ func (p *Provider) checkAlive() error {
 
 // resolveCodexBinary applies the shared CodexBin → $CODEX_BIN → "codex"
 // fallback chain and resolves the result via exec.LookPath. Used by New (the
-// app-server subprocess) and by SpawnInteractive (interactive.go, the bare
-// TUI spawn mode) — both need the same codex binary, resolved the same way,
-// even though they never share a process. Returns the raw LookPath error
+// app-server subprocess) and by SpawnInteractive (interactive.go, the PTY
+// spawn mode) — both need the same codex binary, resolved the same way, even
+// though they never share the Provider's headless process. Returns the raw LookPath error
 // (unwrapped by any agent sentinel) so each call site can wrap it with the
 // sentinel appropriate to when the resolution happens: New's failure is
 // probe-time (agent.ErrProviderUnavailable); SpawnInteractive's is per-Spawn

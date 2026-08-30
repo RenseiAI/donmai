@@ -67,9 +67,10 @@ var linearMCPDisallowList = []string{
 // because SupportsSessionResume=false, but the implementation is in
 // place for the F.5 capability flip.
 //
-// Spec → CLI mapping covers all 19 Spec fields. Fields the CLI cannot
+// Spec → CLI mapping accounts for every Spec field. Fields the CLI cannot
 // honor are silently dropped per the capability-gating contract:
 //
+//	SessionName         → --name <name> on a fresh session
 //	Prompt              → stdin (returned alongside argv via stdinPrompt)
 //	Cwd                 → cmd.Dir (set by handle.go) + --add-dir for read access
 //	Env                 → cmd.Env (set by handle.go)
@@ -103,6 +104,9 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 		"--output-format", "stream-json",
 		"--verbose",
 		"--dangerously-skip-permissions",
+	}
+	if spec.SessionName != "" && resumeSessionID == "" {
+		argv = append(argv, "--name", spec.SessionName)
 	}
 
 	// Provide --add-dir so the agent can read outside the strict cwd

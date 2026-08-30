@@ -44,6 +44,8 @@ import (
 // silently drop pre-claimed sessions.
 type PollWorkItem struct {
 	SessionID string `json:"sessionId"`
+	// SessionName is forwarded opaquely to the selected native harness.
+	SessionName string `json:"sessionName,omitempty"`
 
 	// AdmissionReceipt is forwarded opaquely to the per-session runner payload.
 	// The daemon does not interpret or reconstruct this closed contract.
@@ -1349,6 +1351,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 	}
 	detail := &SessionDetail{
 		SessionID:               item.SessionID,
+		SessionName:             item.SessionName,
 		AdmissionReceipt:        bytes.Clone(item.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(item.ClaimReceipt),
 		EffectiveCell:           bytes.Clone(item.EffectiveCell),

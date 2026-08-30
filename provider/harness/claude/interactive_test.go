@@ -32,6 +32,11 @@ func TestInteractiveArgs(t *testing.T) {
 			want: []string{"fix the bug"},
 		},
 		{
+			name: "session name precedes the prompt",
+			spec: agent.Spec{SessionName: "chief-of-staff", Prompt: "coordinate"},
+			want: []string{"--name", "chief-of-staff", "coordinate"},
+		},
+		{
 			name: "autonomous adds bypassPermissions before the prompt",
 			spec: agent.Spec{Prompt: "fix the bug", Autonomous: true},
 			want: []string{"--permission-mode", "bypassPermissions", "fix the bug"},

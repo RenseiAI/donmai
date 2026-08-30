@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"runtime"
 	"sort"
 	"strconv"
 	"strings"
@@ -18,20 +19,18 @@ import (
 	"github.com/RenseiAI/donmai/runtime/mcp"
 )
 
-// SpawnInteractive opens the codex CLI's OWN interactive TUI — bare
-// `codex`, NOT `codex exec` (the non-interactive/headless subcommand this
-// package's default Spawn drives via the app-server) — under a PTY via
-// ptycli, seeded with spec.Prompt when set.
+// SpawnInteractive opens the codex CLI's own interactive TUI under a PTY via
+// ptycli, seeded with spec.Prompt when set. An unnamed session uses bare
+// `codex`. A named session uses a bounded per-session app-server, applies and
+// reads back thread/name/set before the first turn, then attaches with
+// `codex resume --remote <socket> <name>`. The pinned CLI supports that local
+// transport only through Unix sockets; named Windows requests fail before any
+// spawn side effect while unnamed Windows requests retain the bare-TUI path.
 //
-// It is completely independent of the app-server JSON-RPC subprocess this
-// package otherwise drives: it never touches Provider.client/cmd, resolving
-// the codex binary itself via resolveCodexBinary. That is why it is a
-// package-level function taking Options rather than a (*Provider) method
-// bound to a live app-server — the interactive spawn mode needs no live
-// Provider at all, only the same binary-resolution rule New uses. Provider's
-// Spawn (codex.go) is the production call site; it is exported so a caller
-// (or a test) that only wants the interactive path can reach it directly
-// without paying for an app-server handshake.
+// It remains independent of the Provider's shared headless app-server state:
+// it never touches Provider.client/cmd and resolves the binary itself. The
+// optional named-session server is owned and cleaned up with this one PTY
+// session, so no headless thread or configuration is shared by accident.
 //
 // This is a distinct SPAWN MODE from the default headless loop, not a
 // different Transport: Manifest().Caps.Transport stays
@@ -43,9 +42,8 @@ import (
 //
 // Event semantics are the coarse ptycli contract (program decision D4 — the
 // byte-accurate PTY stream is the product): an InitEvent once the PTY child
-// is up (SessionID stays empty — codex's thread id is only observable
-// through the app-server's JSON-RPC notifications, which the interactive TUI
-// never emits) and a single terminal ResultEvent when the CLI process exits.
+// is up (SessionID stays empty on this coarse PTY surface) and a single
+// terminal ResultEvent when the CLI process exits.
 func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
 	var err error
 	spec, err = agent.PrepareHarness(spec, (&Provider{}).Manifest())
@@ -59,6 +57,13 @@ func SpawnInteractive(ctx context.Context, opts Options, spec agent.Spec) (agent
 // PrepareHarness. Keeping all PTY/config/process work below this boundary
 // prevents interactive mode from minting a second prompt or tool authority.
 func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec) (agent.Handle, error) {
+	return spawnInteractivePreparedForGOOS(ctx, opts, spec, runtime.GOOS)
+}
+
+func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec agent.Spec, goos string) (agent.Handle, error) {
+	if err := validateNamedInteractiveTransport(spec, goos); err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	if err := validateCodexCLIMCPServers(spec.MCPServers); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, persistInteractiveMCPApplicationDenial(spec, err))
 	}
@@ -71,6 +76,19 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	if !hasPlatformSessionMCPAuthority(spec.MCPServers) {
+		if spec.SessionName != "" {
+			home, homeErr := ambientCodexHome()
+			if homeErr != nil {
+				return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, homeErr)
+			}
+			server, nameErr := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, home)
+			if nameErr != nil {
+				return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, nameErr)
+			}
+			launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
+			spec.Env = launch.env
+			return ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), server.close)
+		}
 		spec.Env = launch.env
 		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 	}
@@ -117,6 +135,24 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 			config.remove(),
 		)
 	}
+	if spec.SessionName != "" {
+		server, err := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, config.home)
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
+		launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
+		return ptycli.SpawnWithCleanup(
+			ctx,
+			bin,
+			launch.argv,
+			spec,
+			(&Provider{}).Manifest(),
+			func() error { return errors.Join(server.close(), config.remove()) },
+		)
+	}
 	return ptycli.SpawnWithCleanup(
 		ctx,
 		bin,
@@ -124,6 +160,21 @@ func spawnInteractivePrepared(ctx context.Context, opts Options, spec agent.Spec
 		spec,
 		(&Provider{}).Manifest(),
 		config.remove,
+	)
+}
+
+// validateNamedInteractiveTransport keeps the optional naming layer honest on
+// platforms where the pinned Codex CLI has no supported local transport for
+// sharing one app-server between the name-set RPC and the interactive TUI.
+// Unnamed sessions never enter that layer and retain the historical bare-TUI
+// path unchanged.
+func validateNamedInteractiveTransport(spec agent.Spec, goos string) error {
+	if spec.SessionName == "" || goos != "windows" {
+		return nil
+	}
+	return fmt.Errorf(
+		"named Codex interactive sessions require Unix-socket app-server attach; Windows supports unnamed interactive sessions only: %w",
+		agent.ErrUnsupported,
 	)
 }
 
@@ -293,6 +344,10 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 		}
 		env = nextEnv
 		args = append(args, "--config", override, "--strict-config")
+	}
+	if spec.SessionName != "" {
+		args = append([]string{"resume"}, args...)
+		args = append(args, spec.SessionName)
 	}
 	if spec.Prompt != "" {
 		args = append(args, spec.Prompt)

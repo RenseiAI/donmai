@@ -33,6 +33,10 @@ type SessionDetail struct {
 	// SessionID is the platform session UUID. Always populated.
 	SessionID string `json:"sessionId"`
 
+	// SessionName is the canonical user-facing name projected onto the native
+	// harness session. It remains unchanged across daemon and runner hops.
+	SessionName string `json:"sessionName,omitempty"`
+
 	// AdmissionReceipt is the opaque, immutable execution-cell admission
 	// evidence produced before enqueue. The runner owns strict decoding.
 	AdmissionReceipt json.RawMessage `json:"admissionReceipt,omitempty"`

@@ -53,6 +53,11 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// whether the test Spec actually populates them — so the union
 	// coverage check works regardless of input.
 	ignoredFields := []string{
+		// SessionName is consumed by the spawn lifecycle rather than encoded in
+		// thread/start: fresh headless sessions issue thread/name/set after the
+		// thread id exists and before turn/start; named interactive sessions use
+		// the same method before the TUI attaches by name.
+		"SessionName",
 		"Env",
 		"AllowedTools",
 		"DisallowedTools",
@@ -83,8 +88,8 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// Interactive (W4, interactive-attach-v1) is INTENTIONALLY IGNORED by
 		// NewSpawnPlan/this JSON-RPC translation layer: Provider.Spawn
 		// (codex.go) branches on Spec.Interactive != nil BEFORE NewSpawnPlan
-		// ever runs, routing to SpawnInteractive (interactive.go) — the bare
-		// `codex` TUI under a PTY, entirely independent of the app-server
+		// ever runs, routing to SpawnInteractive (interactive.go) — the codex
+		// TUI under a PTY, independent of the Provider's shared headless
 		// JSON-RPC thread/turn machinery this file translates into. So
 		// NewSpawnPlan's own translation table is correctly untouched by
 		// Interactive; the field just never reaches it.

@@ -96,6 +96,7 @@ func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notic
 //
 // Spec → CLI mapping (interactive spawn mode):
 //
+//	SessionName        → --name <name>
 //	Model              → --model <id>
 //	Autonomous         → --permission-mode bypassPermissions
 //	SystemPromptAppend → --append-system-prompt <text>
@@ -152,6 +153,9 @@ func interactiveArgsWithMCP(spec agent.Spec, mcpConfigPath string) []string {
 // the one this flag is here to make.
 func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []string {
 	var argv []string
+	if spec.SessionName != "" {
+		argv = append(argv, "--name", spec.SessionName)
+	}
 
 	// Notice channel first: it is a session-level flag like the rest, and every
 	// flag-shaped argument must precede the positional prompt.

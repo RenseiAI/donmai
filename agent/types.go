@@ -348,6 +348,11 @@ type Spec struct {
 	// PreparedHarness is the host-persisted sole adaptation authority. Provider
 	// PrepareHarness calls become idempotent application/equality checks.
 	PreparedHarness *PreparedHarness `json:"-"`
+
+	// SessionName is the canonical user-facing name for the session. Harnesses
+	// with a native naming surface project it at fresh startup; empty preserves
+	// the harness's generated-name behavior.
+	SessionName string `json:"sessionName,omitempty"`
 	// Prompt is the task-specific directive.
 	Prompt string `json:"prompt"`
 

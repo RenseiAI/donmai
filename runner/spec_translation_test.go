@@ -9,6 +9,18 @@ import (
 	"github.com/RenseiAI/donmai/prompt"
 )
 
+func TestTranslateSpec_ProjectsSessionName(t *testing.T) {
+	t.Parallel()
+	got := translateSpec(
+		QueuedWork{QueuedWork: prompt.QueuedWork{SessionName: "chief-of-staff"}},
+		agent.Capabilities{},
+		SpecInputs{},
+	)
+	if got.SessionName != "chief-of-staff" {
+		t.Fatalf("Spec.SessionName = %q; want %q", got.SessionName, "chief-of-staff")
+	}
+}
+
 // TestTranslateSpec_PlatformDisallowedTools_Appended verifies that
 // platform-supplied DisallowedTools patterns (Option B) are
 // appended to the runner's defaultDisallowedTools() baseline rather
@@ -25,7 +37,7 @@ func TestTranslateSpec_PlatformDisallowedTools_Appended(t *testing.T) {
 	}
 
 	platformPatterns := []string{
-		"Read(/Users/**/.env*)",
+		"Read(/home/**/.env*)",
 		"Bash(gh secret*)",
 		"WebFetch(http://169.254.169.254/*)",
 	}
