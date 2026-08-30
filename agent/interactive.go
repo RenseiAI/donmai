@@ -55,6 +55,31 @@ type InteractiveSpec struct {
 	// RingBytes bounds the host output-frame ring buffer. Zero falls
 	// back to the 8 MiB default.
 	RingBytes int `json:"ringBytes,omitempty"`
+
+	// ResumeExisting signals that Spec.SessionName identifies an
+	// ALREADY-EXISTING native session to attach to, not a name to assign to
+	// a freshly created one. Only meaningful together with a non-empty
+	// Spec.SessionName.
+	//
+	// False — the default, and the value every existing producer sends,
+	// custom name or platform-canonical id-shaped name alike — always takes
+	// the harness's create-and-name path for a non-empty SessionName. A
+	// harness's native resume/attach mechanism is used ONLY when this is
+	// explicitly set: mere SessionName presence is not an attach signal.
+	// This distinction matters because a harness's resume/attach primitive
+	// may be able to locate only an ALREADY-PERSISTED native session — a
+	// freshly assigned name for a session that has never run is not
+	// resumable by that same mechanism (see
+	// provider/harness/codex/interactive_name.go for the case that
+	// motivated this field: attempting to resume-by-name a codex thread
+	// that has taken no turn yet fails with the CLI's own "No saved
+	// session found" error, because the CLI's resume lookup is keyed to a
+	// persisted rollout, not a live in-memory thread).
+	//
+	// Honored only by harnesses whose native session surface distinguishes
+	// fresh-naming from resume/attach; other interactive harnesses ignore
+	// it. No current producer sets this field.
+	ResumeExisting bool `json:"resumeExisting,omitempty"`
 }
 
 // InteractiveCapable is the optional capability a Handle implements

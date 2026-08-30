@@ -188,12 +188,29 @@ on its own default when it did not:
   `DefaultCodexModel`.
 
 When `Spec.SessionName` is present, the interactive lane starts a bounded
-per-session Unix-socket app-server, creates the thread, applies and reads back
-`thread/name/set`, then attaches the TUI with
-`codex resume --remote <socket> <name>`. The server stays alive through the
-first turn so the already-named thread becomes the durable resume target; the
-PTY lifecycle owns its cleanup. Unnamed interactive sessions retain the bare
-TUI path.
+per-session Unix-socket app-server. Two distinct native shapes exist, gated
+by `Spec.Interactive.ResumeExisting` — mere `SessionName` presence is never
+an attach signal:
+
+- **Fresh (the default — every current producer, custom name or the
+  platform's canonical id-shaped name alike):** the PTY attaches with bare
+  `codex --remote <socket>` (no resume subcommand) and creates its own
+  thread; the bootstrap connection observes that thread's `thread/started`
+  notification and names it post-hoc via `thread/name/set`, reading the
+  result back before the Handle is returned. A thread created via
+  `thread/start` BEFORE the PTY exists cannot later be reattached by any
+  resume/`--remote` invocation this CLI supports — its resume lookup is
+  keyed to a persisted rollout file, not live app-server state — so the
+  bootstrap server deliberately never calls `thread/start` on this path.
+- **Attach-to-existing (`ResumeExisting` true, set only by an explicit
+  platform signal):** the bootstrap connection first resumes the target by
+  name via `thread/resume` — proving it exists before any PTY side effect —
+  then the PTY attaches with `codex resume --remote <socket> <name>`. A
+  missing target fails closed with `agent.ErrSessionNotFound` naming the
+  session; no PTY is spawned.
+
+The server stays alive through the first turn either way; the PTY lifecycle
+owns its cleanup. Unnamed interactive sessions retain the bare TUI path.
 
 The pinned CLI exposes no supported Windows local transport for that shared
 name-set/TUI-attach sequence. A named interactive request on Windows therefore
@@ -358,8 +375,9 @@ surfacing as a spurious `client stopped` Spawn failure.
 
 - `*_test.go` — unit tests using a fake stdio JSON-RPC server.
 - `integration_test.go` (build-tagged `codex_integration`) — smoke
-  tests against a real Codex install, including native named-thread readback
-  and the full PTY `resume --remote`/Stop/socket/config-home cleanup seam.
+  tests against a real Codex install, including the fresh named-interactive
+  bootstrap/post-hoc-name sequence and the full PTY `--remote`/Stop/socket/
+  config-home cleanup seam.
 
 ```bash
 # Unit tests (default)

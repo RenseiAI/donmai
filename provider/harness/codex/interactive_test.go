@@ -50,17 +50,69 @@ func TestInteractiveArgs(t *testing.T) {
 	}
 }
 
-func TestInteractiveArgs_NamedSessionResumesNativeThreadByName(t *testing.T) {
+// TestInteractiveArgs_SessionNameResumeGating pins the fix for a production
+// defect (first real use of #480's named-codex path, donmai v0.72.8): every
+// platform-launched interactive codex session carries a non-empty
+// SessionName (a custom name, or — since #1621 — the platform's canonical
+// id-shaped name), and #480 unconditionally read that presence alone as an
+// attach signal, running `codex resume <name>` for a thread that had never
+// taken a turn. Codex's resume lookup is keyed to a persisted rollout file,
+// not live app-server state, so this failed every fresh named interactive
+// spawn with the CLI's own "No saved session found with ID <name>. Run
+// codex resume without an ID..." error. resume must only be invoked when
+// Spec.Interactive.ResumeExisting explicitly signals attach-to-existing —
+// mere name presence, custom or canonical-id-shaped, never does.
+func TestInteractiveArgs_SessionNameResumeGating(t *testing.T) {
 	t.Parallel()
 	workspace := t.TempDir()
 	seed := launchSeedPrefixFor(t, workspace)
-	want := append([]string{"resume"}, seed...)
-	want = append(want, "chief-of-staff", "coordinate")
-	got := interactiveArgs(agent.Spec{
-		Cwd: workspace, SessionName: "chief-of-staff", Prompt: "coordinate",
-	})
-	if !reflect.DeepEqual(got, want) {
-		t.Fatalf("interactiveArgs = %q; want %q", got, want)
+
+	tests := []struct {
+		name        string
+		sessionName string
+		interactive *agent.InteractiveSpec
+		want        []string
+	}{
+		{
+			name: "empty name unchanged",
+			want: append(slices.Clone(seed), "coordinate"),
+		},
+		{
+			name:        "fresh custom name never invokes resume",
+			sessionName: "chief-of-staff",
+			interactive: &agent.InteractiveSpec{},
+			want:        append(slices.Clone(seed), "coordinate"),
+		},
+		{
+			name:        "fresh platform-canonical id-shaped name never invokes resume",
+			sessionName: "3105355a",
+			interactive: &agent.InteractiveSpec{},
+			want:        append(slices.Clone(seed), "coordinate"),
+		},
+		{
+			name:        "nil Interactive with a name still defaults to fresh, never resume",
+			sessionName: "chief-of-staff",
+			interactive: nil,
+			want:        append(slices.Clone(seed), "coordinate"),
+		},
+		{
+			name:        "explicit attach-to-existing resumes by name",
+			sessionName: "chief-of-staff",
+			interactive: &agent.InteractiveSpec{ResumeExisting: true},
+			want:        append(append([]string{"resume"}, seed...), "chief-of-staff", "coordinate"),
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{
+				Cwd: workspace, SessionName: tt.sessionName, Prompt: "coordinate",
+				Interactive: tt.interactive,
+			})
+			if !reflect.DeepEqual(got, tt.want) {
+				t.Fatalf("interactiveArgs = %q; want %q", got, tt.want)
+			}
+		})
 	}
 }
 
@@ -126,6 +178,23 @@ func TestRemoteInteractiveArgs_AttachesNamedResumeToPreparedServer(t *testing.T)
 		"unix:///tmp/codex.sock",
 	)
 	want := []string{"resume", "--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "chief-of-staff", "coordinate"}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
+	}
+}
+
+// TestRemoteInteractiveArgs_FreshSessionPrependsRemoteWithoutResume covers
+// the fresh-session shape: argv never starts with "resume" (see
+// TestInteractiveArgs_SessionNameResumeGating), so --remote is prepended in
+// front of the whole launch instead of being spliced after a resume
+// subcommand that was never added.
+func TestRemoteInteractiveArgs_FreshSessionPrependsRemoteWithoutResume(t *testing.T) {
+	t.Parallel()
+	got := remoteInteractiveArgs(
+		[]string{"--config", `model="gpt-5.6-sol"`, "coordinate"},
+		"unix:///tmp/codex.sock",
+	)
+	want := []string{"--remote", "unix:///tmp/codex.sock", "--config", `model="gpt-5.6-sol"`, "coordinate"}
 	if !reflect.DeepEqual(got, want) {
 		t.Fatalf("remoteInteractiveArgs = %q; want %q", got, want)
 	}

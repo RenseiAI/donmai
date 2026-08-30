@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
@@ -21,11 +22,30 @@ import (
 
 // SpawnInteractive opens the codex CLI's own interactive TUI under a PTY via
 // ptycli, seeded with spec.Prompt when set. An unnamed session uses bare
-// `codex`. A named session uses a bounded per-session app-server, applies and
-// reads back thread/name/set before the first turn, then attaches with
-// `codex resume --remote <socket> <name>`. The pinned CLI supports that local
-// transport only through Unix sockets; named Windows requests fail before any
-// spawn side effect while unnamed Windows requests retain the bare-TUI path.
+// `codex`. A named session uses a bounded per-session app-server:
+//
+//   - fresh (spec.Interactive.ResumeExisting false — the default; every
+//     current producer, custom name or platform-canonical id-shaped name
+//     alike): the PTY attaches to the bootstrap server with bare
+//     `--remote <socket>` (no resume subcommand) and creates its own
+//     thread there; the bootstrap connection observes that thread's
+//     thread/started notification and names it post-hoc via
+//     thread/name/set, reading back the result before the Handle is
+//     returned.
+//   - attach-to-existing (spec.Interactive.ResumeExisting true, only ever
+//     set by an explicit platform signal): the bootstrap connection first
+//     resumes the target by name via thread/resume — proving it exists —
+//     then the PTY attaches with `codex resume --remote <socket> <name>`.
+//
+// The pinned CLI supports the --remote local transport only through Unix
+// sockets; named Windows requests fail before any spawn side effect while
+// unnamed Windows requests retain the bare-TUI path. See
+// interactive_name.go's startNamedInteractiveAppServer for why these are
+// two genuinely different native RPC sequences, not one gated by name
+// presence alone (that conflation was the root cause of a production
+// defect: a thread created before the PTY starts, but never given a turn,
+// cannot be reattached by any resume/--remote invocation this CLI
+// supports).
 //
 // It remains independent of the Provider's shared headless app-server state:
 // it never touches Provider.client/cmd and resolves the binary itself. The
@@ -85,9 +105,8 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			if nameErr != nil {
 				return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, nameErr)
 			}
-			launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
 			spec.Env = launch.env
-			return ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), server.close)
+			return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
 		}
 		spec.Env = launch.env
 		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
@@ -143,15 +162,8 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 				config.remove(),
 			)
 		}
-		launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
-		return ptycli.SpawnWithCleanup(
-			ctx,
-			bin,
-			launch.argv,
-			spec,
-			(&Provider{}).Manifest(),
-			func() error { return errors.Join(server.close(), config.remove()) },
-		)
+		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
+		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
 	}
 	return ptycli.SpawnWithCleanup(
 		ctx,
@@ -161,6 +173,47 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		(&Provider{}).Manifest(),
 		config.remove,
 	)
+}
+
+// spawnNamedInteractivePTY points launch's argv at server (remoteInteractiveArgs
+// already knows, from whether buildInteractiveLaunchEnv prepended "resume",
+// which of the two named shapes this is), spawns the PTY, and — for the
+// fresh (non-attach) path only — waits for and names the thread the PTY
+// itself creates. cleanup is whatever the caller owns for server (plus any
+// isolated-config-boundary removal); it always runs on PTY teardown, exactly
+// as before this refactor.
+//
+// For the attach-to-existing path, startNamedInteractiveAppServer has
+// already proven the target exists (via thread/resume) before this function
+// is ever reached, so no further post-spawn step is needed here: the argv
+// already carries `resume --remote <socket> <name>`, the #480 construction,
+// unchanged.
+func spawnNamedInteractivePTY(
+	ctx context.Context,
+	bin string,
+	opts Options,
+	spec agent.Spec,
+	launch interactiveLaunch,
+	server *namedInteractiveAppServer,
+	cleanup func() error,
+) (agent.Handle, error) {
+	launch.argv = remoteInteractiveArgs(launch.argv, server.remoteURL)
+	handle, err := ptycli.SpawnWithCleanup(ctx, bin, launch.argv, spec, (&Provider{}).Manifest(), cleanup)
+	if err != nil {
+		return nil, err
+	}
+	if attachToExistingNamedSession(spec) {
+		return handle, nil
+	}
+	nameTimeout := opts.HandshakeTimeout
+	if nameTimeout <= 0 {
+		nameTimeout = 30 * time.Second
+	}
+	if err := finishNamingLiveInteractiveThread(ctx, spec, server, nameTimeout); err != nil {
+		_ = handle.Stop(ctx)
+		return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err)
+	}
+	return handle, nil
 }
 
 // validateNamedInteractiveTransport keeps the optional naming layer honest on
@@ -345,7 +398,18 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 		env = nextEnv
 		args = append(args, "--config", override, "--strict-config")
 	}
-	if spec.SessionName != "" {
+	// Mere SessionName presence is NOT an attach signal: every current
+	// producer (custom name or the platform's canonical id-shaped name
+	// alike) sets a fresh session's name this way, and #480 unconditionally
+	// running `resume <name>` here for a session that had never taken a
+	// turn was the production defect this gate closes. resume is invoked
+	// only when the caller explicitly signals attach-to-existing (see
+	// agent.InteractiveSpec.ResumeExisting and interactive_name.go's
+	// startNamedInteractiveAppServer doc comment for why the two shapes are
+	// not interchangeable). A fresh named session's thread is instead
+	// created by the PTY itself and named post-hoc — see
+	// spawnNamedInteractivePTY.
+	if spec.SessionName != "" && attachToExistingNamedSession(spec) {
 		args = append([]string{"resume"}, args...)
 		args = append(args, spec.SessionName)
 	}
