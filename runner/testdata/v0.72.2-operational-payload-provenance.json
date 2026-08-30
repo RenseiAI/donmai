@@ -1,10 +1,12 @@
 {
-  "schema": "donmai.operational-payload-provenance/v1",
-  "generatorVersion": "1",
+  "schema": "donmai.operational-payload-provenance/v2",
+  "generatorVersion": "2",
   "generatorSource": "cmd/operational-payload-provenance/main.go",
-  "generatorSourceSha256": "622c218ace1ce6bf86d22a77d73880e4f9103db98c08f794b29a0ec4a8aa433b",
+  "generatorSourceSha256": "ba67ea05e08e1354a9a34e20f474939f7b77d32242c1a1abb4442cac23372443",
+  "probeSourceSha256": "b35557887a36575901f8a287c245fc91e1f04bd4de268d0960c8ffaf30c1a232",
   "tag": "v0.72.2",
   "commit": "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff",
+  "goVersion": "go1.26.6",
   "sourceBlobs": [
     {
       "path": "daemon/poll.go",
@@ -29,6 +31,14 @@
     {
       "path": "executioncell/codec.go",
       "sha1": "4a3e0829e86cd7931ae2c2c9fd0a387cce5530d7"
+    },
+    {
+      "path": "go.mod",
+      "sha1": "b616039f1dffecc6b7b97e874f49038d9d88be6e"
+    },
+    {
+      "path": "go.sum",
+      "sha1": "7fca448b4d51d4897799c2f1c4c8be55f8fc748f"
     }
   ],
   "rawPollItem": {
@@ -51,5 +61,5 @@
   },
   "operationalPayloadSha256": "b3b20e7c63d864d3084d4e7511320848777534c06b82a80914525be3ce1bcbf0",
   "forgedOperationalPayloadError": "daemon poll: operationalPayload does not match raw poll item",
-  "artifactDigest": "6fbd5e3034b29efc9c2a777840074761912b6c5746a68b9703f0139409b942c3"
+  "artifactDigest": "818c4985b182fd49db7160ed0b5773758a8b5858d79fda273aed530f61f00927"
 }
