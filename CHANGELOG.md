@@ -6,6 +6,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **Direct runner launches now publish the platform-minted session MCP bearer
+  through the generic token-file rail.** When no provisioning daemon already
+  owns `MCP_GATEWAY_TOKEN_FILE`, the runner creates a private mode-0600
+  bootstrap file for the session and removes it at teardown. Existing refreshed
+  files remain authoritative, worker/runtime bearers are never projected onto
+  the session rail, and bearer bytes remain absent from child environment
+  values and serialized work payloads.
+
+---
+
 ## v0.72.5 — 2026-08-30
 
 ### Fixes
