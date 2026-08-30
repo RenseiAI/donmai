@@ -6,6 +6,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.7 — 2026-08-30
+
+### Features
+
+- **Donmai now ships a standards-native A2A v1 client and CLI.** The public
+  `a2a` package implements strict JSON-RPC v1 task, message, artifact, Agent
+  Card, tenant, extension-negotiation, error, and polling contracts. Standalone
+  users can run `donmai a2a send|get|list|cancel` against an explicit Agent Card
+  or embedder-provided peer, with per-request authorization and native protocol
+  JSON output. Embedders opt in explicitly, so platform-specific directory and
+  inbox extensions can coexist without shadowing the formal operations or the
+  embedder's root initialization and authority setup.
+
+### Fixes
+
+- **Interactive Pi sessions protect their harness state throughout the live
+  session.** Checkout-local state is excluded from normal git status and
+  backstop commits, while destructive headless commands that target the active
+  session-state directory fail closed. A session can no longer delete the
+  files its own harness is still using and continue indefinitely without a
+  terminal fact.
+
+---
+
 ## v0.72.6 — 2026-08-30
 
 ### Fixes
