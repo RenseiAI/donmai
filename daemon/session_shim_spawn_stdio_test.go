@@ -5,6 +5,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // TestShimChildStdoutStderrLandInThePerSessionLogFile pins the un-blinding
@@ -12,11 +14,13 @@ import (
 // (startShimProcess), so every runner/provider error the child process wrote
 // — including the exact class of tool/lifecycle adaptation refusal
 // repository_sandbox_reconcile.go's doc comment describes — was invisible.
-// startShimProcess now captures both streams to shimChildLogPath(registryDir,
-// sessionID), a plain file rather than a daemon-owned pipe (a shim is a
-// DETACHED process that outlives this daemon — worker_spawner.go's
-// pipe-to-log pattern would hand the shim EPIPE the moment this daemon
-// exits or restarts).
+// startShimProcess now captures both streams to
+// shimChildLogPath(registryDir, identity), a plain file rather than a
+// daemon-owned pipe (a shim is a DETACHED process that outlives this daemon
+// — worker_spawner.go's pipe-to-log pattern would hand the shim EPIPE the
+// moment this daemon exits or restarts). The filename is the fixed-length
+// digest sessionshim.Identity.LogName() produces — the same convention as
+// every sibling registry artifact — never the raw session id.
 //
 // This drives the launch through AcceptWork with a WorkerCommand that writes
 // one distinguishable line to each of stdout and stderr and exits
@@ -66,7 +70,7 @@ func TestShimChildStdoutStderrLandInThePerSessionLogFile(t *testing.T) {
 		t.Fatal("AcceptWork = nil error; a shim launch that never announced itself must fail the accept (see TestLaunchFailureFailsTheAcceptClosed)")
 	}
 
-	logPath := shimChildLogPath(registryDir, sessionID)
+	logPath := shimChildLogPath(registryDir, sessionshim.Identity{OrgID: "test-org", SessionID: sessionID})
 	var content []byte
 	deadline := time.Now().Add(2 * time.Second)
 	for {

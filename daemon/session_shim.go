@@ -1774,7 +1774,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		if removeErr := registry.RemoveTombstoneIncarnation(tombstone); removeErr != nil {
 			slog.Warn("session shim: dispose startup tombstone after durable terminal handoff",
 				"session", tombstone.Identity().String(), "error", removeErr)
+			continue
 		}
+		// The captured stdout/stderr file is disposed alongside the record/
+		// tombstone above — see removeShimChildLog's doc comment.
+		removeShimChildLog(registry.Dir(), tombstone.Identity())
 	}
 
 	slog.Info("session shim: startup adoption complete",
