@@ -36,6 +36,12 @@ type Client struct {
 	nextID        atomic.Uint64
 }
 
+// ActivatedExtensions returns the card-advertised extension intersection this
+// client sends on every request. The returned slice is caller-owned.
+func (c *Client) ActivatedExtensions() []string {
+	return append([]string(nil), c.extensions...)
+}
+
 // Option configures a Client.
 type Option func(*Client) error
 
