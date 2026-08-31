@@ -105,3 +105,16 @@ CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear\.go :: /api/cl[i]/ :: (platform U
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist\.go :: rens[e]i-tui :: (- rens[e]i-tui renders a Go baseline from the same var|normalization as rens[e]i-tui, so all three repos tie to one hash)
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_json_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's generated baseline \(daemon/credentials/generated_blocklist\.go,|this constant is updated deliberately in the same commit — and rens[e]i-tui's|update this constant AND expect rens[e]i-tui/platform freshness checks)
 CLOSED_TUI_REPO :: ^internal/credentials/blocklist_test\.go :: rens[e]i-tui :: (// rens[e]i-tui's daemon/credentials/socket\.go hardcodes the same list and|AgentEnvBlocklist drifted \(sync with rens[e]i-tui daemon/credentials/socket\.go\))
+
+# provider/harness/agycli/testdata/transcript_sample.jsonl: a synthetic agent
+# transcript fixture whose recorded tool calls reference a made-up sandbox
+# path, "/Us[e]rs/dev/work/probe/sandbox/...". "dev" here is the fixture's
+# fake home-directory user, not a real contributor's account — pre-existing,
+# and (as of this change) the only tracked, non-allowlisted DEV_ABS_PATH hit
+# in the repo besides the committed .golangci-cache/ directory (a separate,
+# already-tracked leak this change does not touch — untracking it is handled
+# by another change). Rewriting the fixture would require re-deriving its
+# expected-output assertions for no behavioural gain. Scoped to the exact
+# literal fixture path so a real developer path landing in this file some
+# other way is still reported.
+DEV_ABS_PATH :: ^provider/harness/agycli/testdata/transcript_sample\.jsonl :: /Us[e]rs/dev/

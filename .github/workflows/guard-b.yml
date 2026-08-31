@@ -9,27 +9,53 @@ name: Closed-source content guard
 # closed-source environment variable names, and production measurements of
 # the closed control plane.
 #
-# Five checks:
-#   1. self-test    — proves each rule and engine path still fires. BLOCKING.
-#   2. vendor drift  — this repo's copy of guard-b-lint.sh /
-#                      guard-b-lint-selftest.sh still matches the pinned
-#                      donmai-architecture commit. BLOCKING.
-#   3. commits       — the commit messages this PR adds, merge commits
-#                      included. BLOCKING.
-#   4. squash msg     — the message GitHub composes from the PR title + body
-#                      when squash-merged — that text becomes a published
-#                      commit no branch commit contains. BLOCKING.
-#   5. push range     — commit messages just pushed to main, as a backstop
-#                      for anything that bypassed a pull request. BLOCKING.
+# Seven checks:
+#   1. self-test          — proves each rule and engine path still fires.
+#                            BLOCKING.
+#   2. vendor drift        — this repo's copy of guard-b-lint.sh /
+#                            guard-b-lint-selftest.sh still matches the pinned
+#                            donmai-architecture commit. BLOCKING.
+#   3. diff-gate self-test — proves scripts/guard-b-diff-gate.sh (below) still
+#                            catches a DEV_ABS_PATH violation and still leaves
+#                            an untouched pre-existing one alone. BLOCKING.
+#   4. commits             — the commit messages this PR adds, merge commits
+#                            included. BLOCKING.
+#   5. squash msg          — the message GitHub composes from the PR title +
+#                            body when squash-merged — that text becomes a
+#                            published commit no branch commit contains.
+#                            BLOCKING.
+#   6. push range          — commit messages just pushed to main, as a
+#                            backstop for anything that bypassed a pull
+#                            request. BLOCKING.
+#   7. DEV_ABS_PATH diff gate — scripts/guard-b-diff-gate.sh, scoped to the
+#                            files this PR/push adds or modifies (whole file
+#                            content, same as guard-b-lint.sh --staged).
+#                            BLOCKING.
 #
-# `--all` (the tracked-tree scan) is a SEPARATE, NON-BLOCKING job below. This
-# repo carries a large pre-existing residue that predates guard-b and was
-# never curated against it (see .guard-allowlist's header) — making --all
-# blocking today would redden every PR for content nobody touched. It still
-# runs, every push and PR, so the residue count stays visible in CI rather
-# than silently forgotten; curate it file-by-file (allowlist the legitimate
-# hits, rewrite the rest) the same way tui-components' and donmai-smokes'
-# were, then fold it into the blocking job above.
+# `--all` (the tracked-tree scan) is a SEPARATE, NON-BLOCKING job below, for
+# every rule EXCEPT DEV_ABS_PATH. This repo carries a large pre-existing
+# residue for most rules that predates guard-b and was never curated against
+# it (see .guard-allowlist's header) — making --all blocking today for all of
+# them would redden every PR for content nobody touched. It still runs, every
+# push and PR, so the residue count stays visible in CI rather than silently
+# forgotten; curate it file-by-file (allowlist the legitimate hits, rewrite
+# the rest) the same way tui-components' and donmai-smokes' were, then fold
+# each rule into the blocking job above once its own residue is curated.
+#
+# DEV_ABS_PATH went first: the tree scan already reports it correctly (see
+# .guard-allowlist for the one legitimate pre-existing hit, a synthetic test
+# fixture — the rest of the historical --all residue for this rule was 10,611
+# files under .golangci-cache/, a committed linter-cache directory untracked
+# by a separate change), but a report nobody gates on has no teeth — it is
+# how that cache directory shipped in the first place despite being flagged.
+# Rather than wait for every OTHER rule's residue to be curated before this
+# one rule could go blocking, check #7 scopes to the diff instead of the
+# whole tree: a path this change doesn't touch cannot regress DEV_ABS_PATH,
+# so it needs no allowlisting to go blocking today, and a path it DOES touch
+# is scanned in full, exactly like --staged already does for a local
+# `make guard` run. See scripts/guard-b-diff-gate.sh's own header for the
+# full reasoning; it is repo-owned, not vendored, so it can gain more rules
+# as their residue gets curated without waiting on donmai-architecture.
 #
 # No `paths:` filter: a leak in a .txt, .json, or .go file is still a leak,
 # and a filtered trigger reports "green" by not running.
@@ -62,11 +88,19 @@ jobs:
       - name: Vendor drift — vendored guard-b matches its pinned upstream commit
         run: bash scripts/check-guard-b-vendor-drift.sh
 
+      - name: Self-test — prove the DEV_ABS_PATH diff gate fires correctly
+        run: bash scripts/guard-b-diff-gate-selftest.sh
+
       - name: Run guard-b-lint (commit messages added by this PR, merges included)
         if: github.event_name == 'pull_request'
         run: |
           git fetch --no-tags origin "${{ github.base_ref }}"
           bash scripts/guard-b-lint.sh --commits "origin/${{ github.base_ref }}..HEAD"
+
+      - name: Run guard-b DEV_ABS_PATH gate (files this PR adds or modifies)
+        if: github.event_name == 'pull_request'
+        run: |
+          bash scripts/guard-b-diff-gate.sh DEV_ABS_PATH "origin/${{ github.base_ref }}...HEAD"
 
       - name: Run guard-b-lint (the squash-merge message GitHub will compose)
         if: github.event_name == 'pull_request'
@@ -92,7 +126,12 @@ jobs:
             RANGE="${BEFORE}..HEAD"
           fi
           echo "scanning commit messages in $RANGE"
+          echo "RANGE=$RANGE" >> "$GITHUB_ENV"
           bash scripts/guard-b-lint.sh --commits "$RANGE"
+
+      - name: Run guard-b DEV_ABS_PATH gate (files just pushed to main)
+        if: github.event_name == 'push'
+        run: bash scripts/guard-b-diff-gate.sh DEV_ABS_PATH "$RANGE"
 
   guard-b-tree-residue:
     name: guard-b tree scan (report-only — see guard-b.yml header)

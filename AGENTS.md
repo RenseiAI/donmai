@@ -127,10 +127,14 @@ count, and a suite that quietly starts skipping protects nothing.
   (`.github/workflows/guard-b.yml`) additionally scans this PR's commits,
   the squash-merge message GitHub will compose, and whatever just landed on
   main — all BLOCKING. The tracked-tree `--all` scan runs separately and
-  NON-BLOCKING (`make guard-report`, or the `guard-b-tree-residue` CI job):
-  this repo carries a pre-existing residue `--all` surfaces that predates
-  guard-b (disclosed in `.guard-allowlist`'s header) and was never curated
-  against it — allowlist: `.guard-allowlist`.
+  NON-BLOCKING (`make guard-report`, or the `guard-b-tree-residue` CI job)
+  for every rule EXCEPT `DEV_ABS_PATH`: this repo carries a pre-existing
+  residue `--all` surfaces that predates guard-b (disclosed in
+  `.guard-allowlist`'s header) and was never curated against it — allowlist:
+  `.guard-allowlist`. `DEV_ABS_PATH` carries no such residue, so it is
+  additionally gated BLOCKING on every PR and push, scoped to the changed
+  files, by `scripts/guard-b-diff-gate.sh` (repo-owned, not vendored — see
+  its own header).
 - Platform-needing features do not ship half-working clients here: OSS defines
   interfaces AND ships a working implementation of each; commercial extensions
   live downstream. When only a downstream implementation would exist, split the
