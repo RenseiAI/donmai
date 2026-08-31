@@ -1611,6 +1611,19 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
+			// NOT retried here, deliberately noted rather than silently
+			// accepted: a quarantined lineage keeps its shim (never killed),
+			// but no controller ever renews its orphan clock, so a callback
+			// failure that was really just a transient blip still condemns an
+			// otherwise-healthy session to self-teardown at
+			// DefaultOrphanPolicy's deadline (~90s) with no second attempt in
+			// THIS pass. The retry doctrine this PR applies to the batch
+			// commit (completeLaunchedSessionShimAdoptionBatchResilient) is
+			// intentionally NOT duplicated here: this pass already has to stay
+			// bounded across every lineage it composes, and a future
+			// bounded per-lineage retry (or a reconciliation pass that
+			// re-attempts a quarantined lineage before its orphan deadline)
+			// is the right follow-up rather than something to fold in here.
 			slog.Error("session shim: durable adoption failed for one lineage; quarantining it and composing the rest of the host",
 				"session", id.String(), "error", callbackErr)
 			hello := c.Hello()

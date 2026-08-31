@@ -61,11 +61,11 @@ func TestShimChildStdoutStderrLandInThePerSessionLogFile(t *testing.T) {
 		Orphan:       sessionshim.DefaultOrphanPolicy(),
 		ProcessEpoch: 1,
 	}
-	pid, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, nil)
+	started, err := d.startShimProcess(SessionSpec{SessionID: sessionID}, launch, nil)
 	if err != nil {
 		t.Fatalf("startShimProcess: %v", err)
 	}
-	if pid == 0 {
+	if started.PID == 0 {
 		t.Fatal("startShimProcess returned pid 0")
 	}
 

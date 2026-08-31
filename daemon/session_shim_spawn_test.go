@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -789,11 +790,24 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// envDaemonShimHelperStartDelayMS is a TEST-ONLY seam, read only by this
+// helper (never by production sessionshim.Start): it lets an end-to-end
+// launch test reproduce a harness cold start that lands a real discovery
+// record a hair past the daemon's configured launch timeout, without
+// touching production code at all — see
+// TestLaunchSessionShimAdoptsThroughTheRealPathWhenDiscoveryArrivesLate.
+const envDaemonShimHelperStartDelayMS = "DONMAI_TEST_SHIM_HELPER_START_DELAY_MS"
+
 func runDaemonShimHelper() int {
 	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "daemon shim helper: launch env:", err)
 		return 1
+	}
+	if raw := os.Getenv(envDaemonShimHelperStartDelayMS); raw != "" {
+		if ms, parseErr := strconv.Atoi(raw); parseErr == nil && ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
 	}
 	// The worker resolves the same <parent>/<sessionID> leaf the daemon
 	// publishes, which is what makes the adoption-time workarea comparison a real
@@ -2616,6 +2630,16 @@ func TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry(t *testi
 	// authority over it.
 	if got := refusing.SessionShimOccupancy(); got != 1 {
 		t.Fatalf("SessionShimOccupancy after quarantining the only lineage = %d, want 1", got)
+	}
+	// Deliberately NOT draining: pre-fix, a refused lineage kept
+	// adoptionComplete false forever, which RegistrationStatus reads as
+	// draining. Composition now completes with the lineage quarantined
+	// instead, so RegistrationStatus falls through to its ordinary
+	// idle/busy accounting — capacity honesty is carried by
+	// SessionShimOccupancy/ConsumesCapacity above, not by holding the whole
+	// host in draining for one lineage it could not durably back.
+	if got := refusing.RegistrationStatus(); got == RegistrationDraining {
+		t.Fatalf("RegistrationStatus after quarantining the only lineage = %q, want NOT draining (capacity honesty is carried by occupancy, not registration status)", got)
 	}
 
 	var emitted shimwire.SnapshotResult
