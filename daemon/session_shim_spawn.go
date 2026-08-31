@@ -372,7 +372,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// SnapshotProxy exists only for the synchronous carrier takeover callback.
 	// Published daemon state uses the stable lookup APIs instead.
 	evidence.SnapshotProxy = nil
-	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(pubCtx, evidence, receipt)
+	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatchResilient(pubCtx, evidence, receipt)
 	if err != nil {
 		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
 			// OUTCOME-UNKNOWN: the rollback below still restores the
@@ -444,6 +444,153 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		"session", id.String(), "shimId", ctrl.Hello().ShimID,
 		"generation", ctrl.Generation(), "harnessPid", ctrl.HarnessIdentity().PID)
 	return &handle, nil
+}
+
+// sessionShimAdoptionBatchCommitAttempts bounds how many times
+// completeLaunchedSessionShimAdoptionBatchResilient retries a DEFINITE
+// (decoded, non-ambiguous) adoption-batch commit refusal before giving up.
+//
+// Three, not sessionShimAdoptionPublicationStages: that bound sizes the
+// OUTCOME-UNKNOWN reconciliation pipeline (a slower, heavier mechanism —
+// pipeline depth times a verified credential refresh per attempt) this
+// function deliberately never engages for a definite refusal. Three
+// same-call, no-refresh, immediate-requery attempts are enough to absorb one
+// lost compare-and-swap race against a concurrent writer without turning an
+// already-doomed refusal into a long synchronous stall on the accept path.
+const sessionShimAdoptionBatchCommitAttempts = 3
+
+// sessionShimAdoptionBatchCommitBaseBackoff is the first delay between
+// adoption-batch commit retries; each subsequent attempt doubles it, capped
+// by the callback timeout so the whole retry budget never outgrows one
+// publication stage.
+const sessionShimAdoptionBatchCommitBaseBackoff = 100 * time.Millisecond
+
+// completeLaunchedSessionShimAdoptionBatchResilient wraps
+// completeLaunchedSessionShimAdoptionBatch with the retry-then-restore
+// discipline a live incident proved this daemon needed.
+//
+// THE STRAND THIS UNDOES: the control plane's adoption-batch compare-and-swap
+// clears the host's durably-published readiness the moment PrepareAdoptionBatch
+// resolves a new expected revision — restoring it is the COMMIT's job, not the
+// prepare's. Measured live: the commit that followed one prepare came back
+// HTTP 409, this daemon surfaced that as an immediately fatal launch failure,
+// and the host was left exactly as demoted as the moment prepare ran — every
+// later poll refused with the control plane's durable-publication gate until
+// an operator restarted the daemon. A fresh boot's own §D4 pass re-ran
+// prepare+commit from scratch and committed cleanly, proving the condition
+// was transient and entirely recoverable without ever leaving process memory.
+//
+// (a) A DEFINITE refusal — a decoded answer the control plane returned,
+// classified by the same sessionShimCommitOutcomeUnknown predicate the
+// ambiguous-outcome reconciliation subsystem already uses — is retried under
+// bounded exponential backoff. Each retry calls
+// completeLaunchedSessionShimAdoptionBatch again from scratch, which (via
+// completeSessionShimAdoptionBatch's own PrepareAdoptionBatch call) re-reads
+// the control plane's current expected revision rather than resending the
+// stale one that just lost a race.
+//
+// An AMBIGUOUS outcome (the control plane may already have committed) is
+// NEVER retried here: synchronously resending a guessed revision would race
+// the one mechanism that can safely resolve it — the existing bounded
+// reconciliation pass in session_shim_reconcile.go, which only ever learns
+// the true current revision through the credential refresher before
+// republishing. This function returns an ambiguous failure immediately, on
+// whichever attempt first produces one, so its caller's existing
+// scheduleSessionShimReconciliation call fires exactly as it always has —
+// this wrapper changes nothing about that classification or that path.
+//
+// (b) On exhausting every retry of a definite refusal, this makes ONE
+// best-effort attempt to commit the host's actual current truth — everything
+// genuinely already adopted, quarantined, or tombstoned, WITHOUT the new
+// session this launch could not durably publish — so a host that cannot
+// publish one new arrival is not left durably-unpublished for every session
+// already running on it. The attempt is unretried, and its own failure only
+// widens the log line: this function still reports the ORIGINAL launch
+// failure to its caller either way, because the new session's adoption
+// genuinely did not durably commit.
+//
+// (c) Together: a single refused batch — the definite-refusal case this bug
+// was measured on — can no longer be silently fatal to the rest of the
+// host's ability to claim.
+func (d *Daemon) completeLaunchedSessionShimAdoptionBatchResilient(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	receipt SessionShimAdoptionReceipt,
+) (SessionShimAdoptionBatchReceipt, error) {
+	var lastErr error
+	backoff := sessionShimAdoptionBatchCommitBaseBackoff
+	backoffCap := d.sessionShimConfig().callbackTimeout()
+	for attempt := 1; attempt <= sessionShimAdoptionBatchCommitAttempts; attempt++ {
+		if attempt > 1 {
+			if !sleepSessionShimAdoptionBatchBackoff(ctx, backoff) {
+				lastErr = ctx.Err()
+				break
+			}
+			backoff *= 2
+			if backoff > backoffCap {
+				backoff = backoffCap
+			}
+		}
+		batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(ctx, evidence, receipt)
+		if err == nil {
+			return batchReceipt, nil
+		}
+		lastErr = err
+		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+			return SessionShimAdoptionBatchReceipt{}, err
+		}
+		slog.Warn("session shim: adoption batch commit was refused; retrying with freshly re-read authority",
+			"session", evidence.Identity.String(), "attempt", attempt,
+			"attempts", sessionShimAdoptionBatchCommitAttempts, "error", err)
+	}
+	d.restoreSessionShimReadinessAfterExhaustedBatchCommit(ctx, evidence, lastErr)
+	return SessionShimAdoptionBatchReceipt{}, lastErr
+}
+
+// sleepSessionShimAdoptionBatchBackoff waits d, or returns false early when
+// ctx ends first.
+func sleepSessionShimAdoptionBatchBackoff(ctx context.Context, d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-timer.C:
+		return true
+	}
+}
+
+// restoreSessionShimReadinessAfterExhaustedBatchCommit makes one best-effort
+// attempt to commit the host's actual current truth after every retry of a
+// NEW session's batch commit has been definitively refused — see
+// completeLaunchedSessionShimAdoptionBatchResilient's doc comment for why
+// this is the best available repair with no separate "cancel prepare"
+// primitive on offer. It never returns an error: the outcome is only logged,
+// loudly, alongside the exhausted commit's own last error, so an operator can
+// see both what failed and whether the host recovered on its own.
+//
+// It runs on a FRESH callback-sized budget detached from ctx's own deadline,
+// mirroring the correcting-heartbeat idiom elsewhere in this file: by the
+// time every retry above has been spent, ctx may have little or nothing left,
+// and this best-effort repair deserves its own full attempt rather than
+// whatever remainder happens to survive it.
+func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	causeErr error,
+) {
+	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout())
+	defer cancel()
+	fallback := d.sessionShimProjectionBatch(evidence.Identity.OrgID, evidence.HostID)
+	if _, err := d.completeSessionShimAdoptionBatch(restoreCtx, fallback); err != nil {
+		slog.Error("session shim: adoption batch commit exhausted its retries and the best-effort readiness restore also failed; "+
+			"the host may remain unable to durably publish until its next successful commit",
+			"session", evidence.Identity.String(), "commitError", causeErr, "restoreError", err)
+		return
+	}
+	slog.Error("session shim: adoption batch commit exhausted its retries; restored the host's last-known-good durable "+
+		"projection so the rest of its sessions can keep claiming work",
+		"session", evidence.Identity.String(), "commitError", causeErr)
 }
 
 // ringSessionShimPostActivationHeartbeat sends one immediate heartbeat after a
