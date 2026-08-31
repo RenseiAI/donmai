@@ -99,9 +99,13 @@ lint:
 # reports a large pre-existing residue this repo hasn't been curated against
 # yet (see .guard-allowlist's header) — `make guard-report` runs it
 # non-blocking so that residue stays visible without making ordinary commits
-# red for content nobody touched.
+# red for content nobody touched. DEV_ABS_PATH carries no such residue (see
+# .github/workflows/guard-b.yml's header) and CI additionally gates it with
+# scripts/guard-b-diff-gate.sh scoped to the PR/push diff; its own self-test
+# runs here too so a local `make guard` proves it before CI does.
 guard:
 	bash scripts/guard-b-lint-selftest.sh
+	bash scripts/guard-b-diff-gate-selftest.sh
 	bash scripts/guard-b-lint.sh --staged
 	bash scripts/check-no-inbound-attach.sh
 
