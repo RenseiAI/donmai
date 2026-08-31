@@ -83,11 +83,12 @@ const shimRecordPollInterval = 25 * time.Millisecond
 var (
 	shimRecordDiscoveryGraceAttempts = 4
 	// shimRecordDiscoveryGraceBaseDelay is the first backoff delay between
-	// grace polls; each subsequent attempt doubles it. Four attempts
-	// doubling from this base span 1.5s of additional wait in the worst
-	// case — long enough to catch a discovery record landing "moments"
-	// late, short enough that a launch that genuinely produced nothing
-	// still fails promptly.
+	// grace polls; each subsequent attempt doubles it. The FIRST check is
+	// immediate (no sleep) and only the three checks after it sleep first, so
+	// four attempts doubling from this base sleep 100+200+400 = 700ms of
+	// additional wait in the worst case — long enough to catch a discovery
+	// record landing "moments" late, short enough that a launch that
+	// genuinely produced nothing still fails promptly.
 	shimRecordDiscoveryGraceBaseDelay = 100 * time.Millisecond
 )
 
@@ -221,8 +222,27 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		// target §D10 forbids guessing at. Its own orphan deadline is the escape
 		// hatch.
 		slog.Error("session shim: launched worker never published a discovery record",
-			"session", id.String(), "pid", started, "error", err)
+			"session", id.String(), "pid", started.PID, "error", err)
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
+	}
+	if ctx.Err() != nil {
+		// The record only arrived through the post-deadline grace poll: ctx's
+		// own deadline has already passed. Everything downstream of this point
+		// — Dial, the PrepareAdoption closure below, and the adoption-evidence
+		// call — either derives its own working context from ctx directly or
+		// (PrepareAdoption) closes over this exact variable, so an already-dead
+		// parent would make Dial's own DialTimeout moot: context.WithTimeout
+		// never outlives an expired parent, and the dial fails immediately
+		// regardless of how generous DialTimeout is. Left uncorrected, this
+		// would silently convert "never published a discovery record" into
+		// "could not adopt the shim it just launched" — the same stranded
+		// outcome the grace poll exists to undo, just one step later. Detach
+		// and re-arm exactly the way pubCtx is later detached from this same
+		// ctx for durable publication, so discovery's late finish gets a live
+		// clock to adopt on.
+		var graceCancel context.CancelFunc
+		ctx, graceCancel = context.WithTimeout(context.WithoutCancel(ctx), cfg.launchTimeout())
+		defer graceCancel()
 	}
 
 	var (
@@ -457,12 +477,29 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 // same-call, no-refresh, immediate-requery attempts are enough to absorb one
 // lost compare-and-swap race against a concurrent writer without turning an
 // already-doomed refusal into a long synchronous stall on the accept path.
+//
+// EACH attempt re-runs the full completeSessionShimAdoptionBatch pipeline,
+// including its own PrepareAdoptionBatch call — the SAME destructive prepare
+// step whose compare-and-swap clears the host's durably-published readiness
+// on every invocation, refusal or not (see this function's THE STRAND THIS
+// UNDOES). Retrying is still correct: prepare's demotion is already in
+// effect from the FIRST attempt, and only a successful commit (this attempt
+// or the exhaustion restore below) ever clears it — but this is not a free
+// retry, and the bound above exists precisely so a doomed refusal cannot
+// re-trigger prepare indefinitely.
 const sessionShimAdoptionBatchCommitAttempts = 3
 
 // sessionShimAdoptionBatchCommitBaseBackoff is the first delay between
 // adoption-batch commit retries; each subsequent attempt doubles it, capped
-// by the callback timeout so the whole retry budget never outgrows one
-// publication stage.
+// by the callback timeout.
+//
+// The CAP is one callback timeout, not the whole retry's total cost: each of
+// the sessionShimAdoptionBatchCommitAttempts attempts itself spends up to two
+// callback timeouts (PrepareAdoptionBatch, then OnAdoptionBatch), so the
+// worst-case total is bounded by roughly attempts×2 callback timeouts for the
+// attempts themselves, plus up to (attempts-1) capped backoff sleeps between
+// them — six callback-timeout-equivalents for the default three attempts,
+// not one publication stage.
 const sessionShimAdoptionBatchCommitBaseBackoff = 100 * time.Millisecond
 
 // completeLaunchedSessionShimAdoptionBatchResilient wraps
@@ -569,6 +606,23 @@ func sleepSessionShimAdoptionBatchBackoff(ctx context.Context, d time.Duration) 
 // loudly, alongside the exhausted commit's own last error, so an operator can
 // see both what failed and whether the host recovered on its own.
 //
+// The restore batch MUST still present this exact lineage, in its
+// Quarantined section with ConsumesCapacity: true — never simply omit it.
+// By the time every retry above has run, d.completeSessionShimAdoption
+// (called before this function's caller ever reaches the batch commit) has
+// already succeeded for THIS lineage: the control plane holds a per-session
+// adoption record for it, live and independent of whatever batch commit
+// keeps failing. d.sessionShimProjectionBatch alone reflects only
+// d.shims.adopted, which this lineage has not entered yet (trackLaunchedShim
+// runs later, only after a batch commit actually succeeds) — a restore built
+// from that alone would omit a lineage the control plane already considers
+// live, and a batch that omits a live lineage is refused wholesale
+// (the same complete-snapshot discipline the startup composition pass
+// already applies correctly for a per-lineage durable-adoption failure).
+// Quarantining it here does not claim durable batch-level backing this
+// attempt could not obtain; it only satisfies completeness so the REST of
+// the host's already-adopted sessions are not held hostage by the omission.
+//
 // It runs on a FRESH callback-sized budget detached from ctx's own deadline,
 // mirroring the correcting-heartbeat idiom elsewhere in this file: by the
 // time every retry above has been spent, ctx may have little or nothing left,
@@ -582,6 +636,14 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 	restoreCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout())
 	defer cancel()
 	fallback := d.sessionShimProjectionBatch(evidence.Identity.OrgID, evidence.HostID)
+	fallback.Quarantined = append(fallback.Quarantined, sessionshim.QuarantinedSession{
+		OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
+		ShimID: evidence.ShimID, ProcessEpoch: evidence.ProcessEpoch,
+		ControllerGeneration: evidence.ControllerGeneration,
+		Reason:               sessionshim.QuarantineAdoptionFailed,
+		Detail:               "adoption batch commit exhausted its retries; already durably adopted server-side, presented quarantined pending a successful batch commit",
+		ConsumesCapacity:     true,
+	})
 	if _, err := d.completeSessionShimAdoptionBatch(restoreCtx, fallback); err != nil {
 		slog.Error("session shim: adoption batch commit exhausted its retries and the best-effort readiness restore also failed; "+
 			"the host may remain unable to durably publish until its next successful commit",
@@ -589,7 +651,7 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 		return
 	}
 	slog.Error("session shim: adoption batch commit exhausted its retries; restored the host's last-known-good durable "+
-		"projection so the rest of its sessions can keep claiming work",
+		"projection (with this lineage presented quarantined, pending a successful commit) so the rest of its sessions can keep claiming work",
 		"session", evidence.Identity.String(), "commitError", causeErr)
 }
 
@@ -638,10 +700,10 @@ func shimChildLogPath(registryDir string, id sessionshim.Identity) string {
 // daemon as the process's parent and waiter, which is precisely the coupling
 // §D1 removes: a daemon that still had to reap this process could not be
 // replaced without ending it.
-func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (int, error) {
+func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, env []string) (sessionshim.ProcessIdentity, error) {
 	command := d.shimCommand()
 	if len(command) == 0 {
-		return 0, errors.New("session shim: no worker command is configured to launch a shim with")
+		return sessionshim.ProcessIdentity{}, errors.New("session shim: no worker command is configured to launch a shim with")
 	}
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
 	configureShimProcess(cmd)
@@ -662,24 +724,37 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	// captured rather than discarded into /dev/null.
 	devNull, err := os.OpenFile(os.DevNull, os.O_RDWR, 0)
 	if err != nil {
-		return 0, fmt.Errorf("session shim: open %s: %w", os.DevNull, err)
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: open %s: %w", os.DevNull, err)
 	}
 	defer func() { _ = devNull.Close() }()
 	logPath := shimChildLogPath(launch.RegistryDir, launch.Identity)
 	if err := os.MkdirAll(filepath.Dir(logPath), 0o700); err != nil {
-		return 0, fmt.Errorf("session shim: create log directory for %s: %w", logPath, err)
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: create log directory for %s: %w", logPath, err)
 	}
 	logFile, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600) //nolint:gosec // G302: session-scoped operator diagnostics, same 0o600 convention as the rest of daemon/
 	if err != nil {
-		return 0, fmt.Errorf("session shim: open %s: %w", logPath, err)
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: open %s: %w", logPath, err)
 	}
 	defer func() { _ = logFile.Close() }()
 	cmd.Stdin, cmd.Stdout, cmd.Stderr = devNull, logFile, logFile
 
 	if err := cmd.Start(); err != nil {
-		return 0, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
+		return sessionshim.ProcessIdentity{}, fmt.Errorf("session shim: start %s: %w", spec.SessionID, err)
 	}
 	pid := cmd.Process.Pid
+	// Pin the OS-reported start time now, while the process is definitely
+	// still running (mirrors the acceptance mutator's own harness-pinning
+	// discipline): PID reuse is ordinary, and a bare PID cannot later
+	// distinguish this exact incarnation from something else that reuses the
+	// number. A failure to pin it degrades this launch's later discovery-match
+	// check to PID alone rather than failing an otherwise-successful spawn.
+	identity := sessionshim.ProcessIdentity{PID: pid}
+	if pinned, identityErr := sessionshim.ProcessIdentityFor(pid); identityErr == nil {
+		identity = pinned
+	} else {
+		slog.Warn("session shim: could not pin the launched process's start time",
+			"session", spec.SessionID, "pid", pid, "error", identityErr)
+	}
 	if err := cmd.Process.Release(); err != nil {
 		// Release failing leaves this daemon as the waiter, which contradicts the
 		// ownership boundary. Report it rather than proceeding as if the shim were
@@ -687,7 +762,7 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 		slog.Warn("session shim: could not release the launched process",
 			"session", spec.SessionID, "pid", pid, "error", err)
 	}
-	return pid, nil
+	return identity, nil
 }
 
 // shimChildLogCapBytes bounds the per-session shim child log file
@@ -905,7 +980,7 @@ func awaitShimRecord(
 	registry *sessionshim.Registry,
 	id sessionshim.Identity,
 	launch sessionshim.Launch,
-	pid int,
+	started sessionshim.ProcessIdentity,
 ) (sessionshim.Record, error) {
 	ticker := time.NewTicker(shimRecordPollInterval)
 	defer ticker.Stop()
@@ -918,7 +993,7 @@ func awaitShimRecord(
 		lastErr = err
 		select {
 		case <-ctx.Done():
-			if rec, ok := awaitShimRecordPostDeadlineGrace(registry, id, launch, pid); ok {
+			if rec, ok := awaitShimRecordPostDeadlineGrace(registry, id, launch, started); ok {
 				return rec, nil
 			}
 			return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
@@ -944,7 +1019,7 @@ func awaitShimRecordPostDeadlineGrace(
 	registry *sessionshim.Registry,
 	id sessionshim.Identity,
 	launch sessionshim.Launch,
-	pid int,
+	started sessionshim.ProcessIdentity,
 ) (sessionshim.Record, bool) {
 	delay := shimRecordDiscoveryGraceBaseDelay
 	for attempt := 0; attempt < shimRecordDiscoveryGraceAttempts; attempt++ {
@@ -956,14 +1031,15 @@ func awaitShimRecordPostDeadlineGrace(
 		if err != nil {
 			continue
 		}
-		if !shimDiscoveryRecordMatchesLaunch(rec, id, launch, pid) {
+		if !shimDiscoveryRecordMatchesLaunch(rec, id, launch, started) {
 			// A record exists but is not this launch's — something else's
 			// record, not a slow arrival of this one. Waiting longer cannot
 			// change whose record this is, so stop rather than keep polling
 			// toward a match that will never happen.
 			slog.Warn("session shim: a discovery record appeared after the launch timeout but did not match this launch; still failing the accept",
-				"session", id.String(), "wantProcessEpoch", launch.ProcessEpoch, "wantPid", pid,
-				"gotProcessEpoch", rec.ProcessEpoch, "gotPid", rec.PID)
+				"session", id.String(), "wantProcessEpoch", launch.ProcessEpoch, "wantPid", started.PID,
+				"wantProcessStartedAt", started.StartedAt,
+				"gotProcessEpoch", rec.ProcessEpoch, "gotPid", rec.PID, "gotProcessStartedAt", rec.ProcessStartedAt)
 			return sessionshim.Record{}, false
 		}
 		slog.Warn("session shim: discovery record appeared after the launch timeout; adopting it rather than failing the accept",
@@ -976,12 +1052,19 @@ func awaitShimRecordPostDeadlineGrace(
 // shimDiscoveryRecordMatchesLaunch reports whether rec is plausibly the exact
 // discovery record this launch's own worker eventually published: the same
 // identity, at the process epoch this launch requested and the PID this
-// launch actually started. It is deliberately NOT a liveness check — §D10
-// forbids inferring anything from PID reuse or process state — only a check
-// against the record's own declared identity.
-func shimDiscoveryRecordMatchesLaunch(rec sessionshim.Record, id sessionshim.Identity, launch sessionshim.Launch, pid int) bool {
-	return rec.OrgID == id.OrgID && rec.SessionID == id.SessionID &&
-		rec.ProcessEpoch == launch.ProcessEpoch && rec.PID == pid
+// launch actually started. When started's start time was pinned at spawn
+// time (see startShimProcess), the record's own reported start time must
+// also agree — PID reuse is ordinary, and this is the one signal that
+// disambiguates a genuinely reused PID from a slow arrival of this exact
+// incarnation. It is deliberately NOT a liveness check — §D10 forbids
+// inferring anything from process state — only a check against the record's
+// own declared identity.
+func shimDiscoveryRecordMatchesLaunch(rec sessionshim.Record, id sessionshim.Identity, launch sessionshim.Launch, started sessionshim.ProcessIdentity) bool {
+	if rec.OrgID != id.OrgID || rec.SessionID != id.SessionID ||
+		rec.ProcessEpoch != launch.ProcessEpoch || rec.PID != started.PID {
+		return false
+	}
+	return started.StartedAt == 0 || rec.ProcessStartedAt == started.StartedAt
 }
 
 // trackLaunchedShim records a newly adopted controller and starts consuming its
