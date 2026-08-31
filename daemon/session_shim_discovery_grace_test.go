@@ -249,12 +249,16 @@ func TestShimDiscoveryRecordMatchesLaunch(t *testing.T) {
 	if shimDiscoveryRecordMatchesLaunch(wrongSession, id, launch, started) {
 		t.Fatal("a mismatched session id was accepted")
 	}
-	// A launch whose own start time could not be pinned (startShimProcess
-	// degrades to PID-only rather than failing an otherwise-successful spawn)
-	// must not require a start-time match it never had.
+	// A launch whose own start time could not be pinned (startShimProcess logs
+	// a warning and proceeds rather than failing an otherwise-successful
+	// spawn) must FAIL CLOSED here, never fall back to a bare-PID match:
+	// launch.ProcessEpoch is a hardcoded constant in production, so
+	// PID+StartedAt are the only two real discriminators this check has, and
+	// this repo's own ProcessIdentity doc calls a bare-PID comparison unsafe
+	// because PID reuse is ordinary.
 	unpinnedLaunchStart := sessionshim.ProcessIdentity{PID: 99}
-	if !shimDiscoveryRecordMatchesLaunch(base, id, launch, unpinnedLaunchStart) {
-		t.Fatal("an unpinned launch start time wrongly required a start-time match")
+	if shimDiscoveryRecordMatchesLaunch(base, id, launch, unpinnedLaunchStart) {
+		t.Fatal("an unpinned launch start time was accepted instead of refused")
 	}
 }
 

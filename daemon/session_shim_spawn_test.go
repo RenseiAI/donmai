@@ -2577,6 +2577,22 @@ func TestStartupAdoptionReleasesEachScopeOnlyAfterExactHeartbeat(t *testing.T) {
 // not the same as a host that does not know what it has. The shim's record
 // survives the quarantine untouched, so a LATER daemon can still adopt it —
 // which is exactly what this test's second half already proved.
+//
+// DELIBERATE READINESS-SEMANTICS INVERSION, REVIEWED AND ACCEPTED — not an
+// incidental test tweak: this daemon now comes up with
+// SessionShimAdoptionComplete() == true and RegistrationStatus() != draining
+// even though its ONE AND ONLY lineage's durable adoption was refused. Before
+// this fix, the identical scenario left the daemon adoptionComplete==false
+// forever and RegistrationStatus()==draining forever (a daemon restart was
+// the only recovery). The inversion is intentional and correctly scoped:
+// failure is scoped to the ONE lineage that actually failed rather than to
+// the whole host, exactly like the multi-lineage case; capacity honesty for
+// the refused lineage is carried by SessionShimOccupancy/ConsumesCapacity
+// (asserted below), NOT by holding the whole host in draining. A composing
+// carrier that is genuinely down (rather than one specific lineage's own
+// resume state being unusable) still fails closed at the batch commit itself
+// — this quarantine path is reached only after that per-lineage callback
+// already ran and refused.
 func TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	// Give two replacement attempts ample room before the shim-owned orphan
