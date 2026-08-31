@@ -135,7 +135,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 	}
 
 	t.Run("preflight and spawn agree once both reconcile the sibling profile", func(t *testing.T) {
-		receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+		receipt, err := NewProviderView(registry, nil).PreflightExecution(rawJSONForRunner(t, detail))
 		if err != nil {
 			t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 		}
@@ -169,7 +169,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: piReceiptCell("harness/v2", realModel, executioncell.SessionHumanControlled, nil),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -187,7 +187,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 	})
 
 	t.Run("control: a genuine model authority difference at spawn still fails, naming model", func(t *testing.T) {
-		receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+		receipt, err := NewProviderView(registry, nil).PreflightExecution(rawJSONForRunner(t, detail))
 		if err != nil {
 			t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 		}
@@ -216,7 +216,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: piReceiptCell("harness/v2", realModel, executioncell.SessionHumanControlled, nil),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

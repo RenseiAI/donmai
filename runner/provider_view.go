@@ -22,6 +22,16 @@ import (
 // Construct via NewProviderView. Read-only and safe for concurrent use.
 type ProviderView struct {
 	reg *Registry
+	// decorate is the embedder's additional-extension decorator
+	// (afcli.Config.AgentSpecExtensionDecorator). PreflightExecution forwards
+	// it into compilePreparedHarness so the daemon's persisted
+	// ToolLifecycleReceipt reflects the SAME decorated AdditionalExtensions
+	// the real spawn's decorated Provider will apply — see
+	// ReconcileAdditionalExtensions's doc comment for why leaving this only
+	// to the spawn lane surfaces as an undiagnosable
+	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
+	// preserves the historical undecorated behavior.
+	decorate agent.ExtensionDecorator
 }
 
 type hostAdaptationReceipt struct {
@@ -113,7 +123,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration)
+	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
@@ -133,8 +143,17 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 // NewProviderView returns a ProviderView backed by reg. Pass the result
 // to daemon.Options.ProviderRegistry to expose the runner's registered
 // AgentRuntime providers via the daemon's HTTP control API.
-func NewProviderView(reg *Registry) *ProviderView {
-	return &ProviderView{reg: reg}
+//
+// decorate is the SAME agent.ExtensionDecorator (afcli.Config.
+// AgentSpecExtensionDecorator) an embedder registers for the `agent run`
+// subcommand's own registry (afcli/agent_run.go's decorateRegistryProviders)
+// — pass it here too so PreflightExecution's persisted plan and the real
+// spawn agree on Spec.AdditionalExtensions (see ReconcileAdditionalExtensions).
+// nil is a legitimate value: an embedder with no registered decorator, or the
+// standalone donmai binary, passes nil and gets the historical undecorated
+// behavior unchanged.
+func NewProviderView(reg *Registry, decorate agent.ExtensionDecorator) *ProviderView {
+	return &ProviderView{reg: reg, decorate: decorate}
 }
 
 // Names returns the sorted list of registered provider names as plain

@@ -32,7 +32,7 @@ func (f *fakeProvider) Shutdown(_ context.Context) error { return nil }
 func (f *fakeProvider) Manifest() agent.HarnessManifest  { return f.manifest }
 
 func TestProviderView_Names_EmptyRegistry(t *testing.T) {
-	view := runner.NewProviderView(runner.NewRegistry())
+	view := runner.NewProviderView(runner.NewRegistry(), nil)
 	if got := view.Names(); len(got) != 0 {
 		t.Errorf("empty registry Names() = %v, want []", got)
 	}
@@ -45,7 +45,7 @@ func TestProviderView_Names_SortedAndStringTyped(t *testing.T) {
 			t.Fatalf("Register %q: %v", name, err)
 		}
 	}
-	view := runner.NewProviderView(reg)
+	view := runner.NewProviderView(reg, nil)
 	got := view.Names()
 	want := []string{"claude", "codex", "stub"}
 	if !sort.StringsAreSorted(got) {
@@ -72,7 +72,7 @@ func TestProviderView_Capabilities_KnownProvider(t *testing.T) {
 	if err := reg.Register(&fakeProvider{name: agent.ProviderClaude, caps: caps}); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	view := runner.NewProviderView(reg)
+	view := runner.NewProviderView(reg, nil)
 	got, ok := view.Capabilities("claude")
 	if !ok {
 		t.Fatal("Capabilities(claude) ok=false, want true")
@@ -93,7 +93,7 @@ func TestProviderView_Capabilities_KnownProvider(t *testing.T) {
 }
 
 func TestProviderView_Capabilities_UnknownProvider(t *testing.T) {
-	view := runner.NewProviderView(runner.NewRegistry())
+	view := runner.NewProviderView(runner.NewRegistry(), nil)
 	got, ok := view.Capabilities("nope")
 	if ok {
 		t.Errorf("Capabilities(nope) ok=true, want false")
@@ -131,7 +131,7 @@ func TestProviderViewWorkareaCapabilitiesStayExactHarnessScoped(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	attestations := runner.NewProviderView(reg).WorkareaExecutorCapabilities()
+	attestations := runner.NewProviderView(reg, nil).WorkareaExecutorCapabilities()
 	if len(attestations) != 1 {
 		t.Fatalf("attestations = %#v, want only exact executor", attestations)
 	}

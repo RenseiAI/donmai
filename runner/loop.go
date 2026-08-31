@@ -115,7 +115,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
-		preparedSource, _, err = buildPreparedSourceSpec(qw, selection)
+		preparedSource, _, err = buildPreparedSourceSpec(qw, selection, r.additionalExtensionDecorator)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err

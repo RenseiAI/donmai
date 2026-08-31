@@ -145,7 +145,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository(t *tes
 
 	compileHostPlan := func(t *testing.T) agent.PreparedHarness {
 		t.Helper()
-		receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+		receipt, err := NewProviderView(registry, nil).PreflightExecution(rawJSONForRunner(t, detail))
 		if err != nil {
 			t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 		}
@@ -186,7 +186,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository(t *tes
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: receiptCell(),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -313,7 +313,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository(t *
 		"operationalPayload": baseQW.OperationalPayload,
 	}
 
-	receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+	receipt, err := NewProviderView(registry, nil).PreflightExecution(rawJSONForRunner(t, detail))
 	if err != nil {
 		t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 	}
@@ -345,7 +345,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository(t *
 	source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 		effectiveCell: receiptCell(),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

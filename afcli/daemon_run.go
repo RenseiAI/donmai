@@ -73,7 +73,16 @@ func rotateDaemonLogs(errOut io.Writer) {
 //
 // The installer registers `<host-binary> host run` as the service entrypoint; this
 // command is what runs on those service managers.
-func newDaemonRunCmd(hostVersion string) *cobra.Command {
+//
+// cfg is threaded through (rather than just cfg.HostBinaryVersion, the only
+// field this command used before) so cfg.AgentSpecExtensionDecorator reaches
+// the daemon's own provider registry — see BuildDecoratedAgentRunRegistry's
+// doc comment for why the daemon's preflight compiler (ProviderView.
+// PreflightExecution) must apply the identical embedder decorator
+// newAgentRunCmd's per-session registry already applies, or the two never
+// agree on a receipt-bearing session's ToolLifecycleReceipt.
+func newDaemonRunCmd(cfg Config) *cobra.Command {
+	hostVersion := cfg.HostBinaryVersion
 	var (
 		configPath      string
 		jwtPath         string
@@ -122,7 +131,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 			// operator queries. Probes that fail (e.g. ollama not
 			// running) emit WARN logs but do not block daemon start.
 			// Wave 9 / A1.
-			providerReg := BuildAgentRunRegistry(slog.Default())
+			providerReg := BuildDecoratedAgentRunRegistry(slog.Default(), cfg.AgentSpecExtensionDecorator)
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
@@ -179,7 +188,7 @@ func newDaemonRunCmd(hostVersion string) *cobra.Command {
 				HTTPHost:         host,
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
-				ProviderRegistry: runner.NewProviderView(providerReg),
+				ProviderRegistry: runner.NewProviderView(providerReg, cfg.AgentSpecExtensionDecorator),
 				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
 					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
 				SpawnerOptions: spawnerOpts,

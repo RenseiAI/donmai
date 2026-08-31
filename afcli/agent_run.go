@@ -348,6 +348,14 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// precedence when set (see runner/runner.go field docs).
 		KitSkillDetector:          kitReg.SkillSourcesForRepo,
 		KitPromptFragmentDetector: kitReg.PromptFragmentSourcesForRepo,
+		// AdditionalExtensionDecorator mirrors opts.specDecorator into
+		// Runner's own prepared-source authority self-check (runLoop, via
+		// buildPreparedSourceSpec) — the SAME decorator
+		// decorateRegistryProviders already wraps this registry's providers
+		// with above, so both computations this process performs agree with
+		// each other and with the daemon's preflight compiler (see
+		// runner.ReconcileAdditionalExtensions).
+		AdditionalExtensionDecorator: opts.specDecorator,
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory
@@ -665,7 +673,36 @@ type providerCtor struct {
 // single-sourcing gain. Keeping it here, behind a public builder, is the clean
 // realization of "single source + no fork".
 func BuildAgentRunRegistry(logger *slog.Logger) *runner.Registry {
-	return buildRegistryFromCtors(logger, agentRunProviderCtors(), "donmai")
+	return BuildDecoratedAgentRunRegistry(logger, nil)
+}
+
+// BuildDecoratedAgentRunRegistry is [BuildAgentRunRegistry] plus one more
+// step: when decorate is non-nil, every registered provider is wrapped via
+// agent.DecorateProvider(p, decorate) — the SAME wrapping runAgentRun applies
+// to its own per-session registry (decorateRegistryProviders below) when
+// Config.AgentSpecExtensionDecorator is set.
+//
+// Every entry point that can reach agent.ApplyPreparedHarness for a
+// receipt-bearing session — the daemon's own preflight compiler
+// (afcli/daemon_run.go's newDaemonRunCmd, via runner.NewProviderView) and the
+// per-session `agent run` registry (runAgentRun) alike — MUST build its
+// registry through this one function (or BuildAgentRunRegistry, its
+// decorate==nil case) with the SAME decorate value, or the two can silently
+// diverge again: before this function existed, only runAgentRun's registry
+// carried the wrapping, so a provider's decorator-appended
+// Spec.AdditionalExtensions were invisible to the daemon's persisted
+// ToolLifecycleReceipt but present in the real spawn's recompute — an
+// *agent.ToolLifecycleDriftError{Fields:["entries"]} at spawn instead of a
+// receipt that already told the truth. See runner.ReconcileAdditionalExtensions
+// for the sibling half of this fix (the daemon's compile-time Spec itself
+// must also apply decorate before persisting a plan — wrapping the Provider
+// alone does nothing for a compile site that never calls Provider.Spawn).
+func BuildDecoratedAgentRunRegistry(logger *slog.Logger, decorate agent.ExtensionDecorator) *runner.Registry {
+	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(), "donmai")
+	if decorate != nil {
+		decorateRegistryProviders(reg, decorate)
+	}
+	return reg
 }
 
 // agentRunCtorHints carries per-session signals, derived from the fetched
