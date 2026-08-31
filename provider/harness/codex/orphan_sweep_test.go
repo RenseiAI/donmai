@@ -581,7 +581,7 @@ func TestPinDonmaiChildIdentity_PreservesOwnerIdentity(t *testing.T) {
 }
 
 // TestSweepOrphans_PreservesResumableSessionStateWhileReclaimingScratch is
-// the founder-directed probe for the resume-safety constraint: a dead-owner,
+// a probe for the resume-safety constraint: a dead-owner,
 // dead-child "codex-home" directory that still holds a rollout file under
 // sessions/ must NEVER be fully deleted. Scratch around it (config.toml,
 // the manifest) is removed, but sessions/ — and therefore the directory
