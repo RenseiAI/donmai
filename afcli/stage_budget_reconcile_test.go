@@ -1,6 +1,8 @@
 package afcli
 
 import (
+	"encoding/json"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/daemon"
@@ -37,5 +39,16 @@ func TestDetailToQueuedWorkReconcilesSiblingStageBudget(t *testing.T) {
 				t.Fatalf("StageBudget = %+v, want %+v", *work.StageBudget, tt.budget)
 			}
 		})
+	}
+}
+
+func TestDetailToQueuedWorkRejectsSiblingStageBudgetAbsentFromOperationalPayload(t *testing.T) {
+	_, err := detailToQueuedWork(&daemon.SessionDetail{
+		SessionID:          "receipt-stage-budget-mismatch",
+		OperationalPayload: json.RawMessage(`{"sessionId":"receipt-stage-budget-mismatch"}`),
+		StageBudget:        &daemon.PollStageBudget{MaxTokens: 24_000},
+	})
+	if err == nil || !strings.Contains(err.Error(), "stage budget compatibility mirror differs from operational payload") {
+		t.Fatalf("detailToQueuedWork error = %v, want operational-payload mismatch refusal", err)
 	}
 }
