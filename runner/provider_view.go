@@ -69,6 +69,10 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 		// Effort/ProviderConfig/Endpoint the child will materialize.
 		ModelProfile    json.RawMessage `json:"modelProfile"`
 		ResolvedProfile json.RawMessage `json:"resolvedProfile"`
+		// StageBudget is another SessionDetail sibling. Autonomous stage
+		// dispatch renders it into prompt authority, so preflight must apply
+		// the same reconciliation as the spawned child.
+		StageBudget json.RawMessage `json:"stageBudget"`
 	}
 	if err := json.Unmarshal(detailJSON, &wire); err != nil {
 		return nil, err
@@ -83,6 +87,10 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	qw, err := ReconcileResolvedProfile(qw, wire.ModelProfile, wire.ResolvedProfile)
 	if err != nil {
 		return nil, fmt.Errorf("decode host resolved profile: %w", err)
+	}
+	qw, err = ReconcileStageBudget(qw, wire.StageBudget)
+	if err != nil {
+		return nil, fmt.Errorf("decode host stage budget: %w", err)
 	}
 	binding, err := executioncell.DecodeRuntimeBinding(wire.ExecutionRuntimeBinding)
 	if err != nil {
