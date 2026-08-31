@@ -16,7 +16,9 @@ import (
 // Error dispositions:
 //   - a *attachwire.FramingError (unknown/invalid payload, 0-dim Resize) → the
 //     caller closes the leg with an error control (code framing) then reconnects;
-//   - ErrEpochStale / *RelayStopError → terminal, RunHost stops;
+//   - ErrEpochStale → RunHost validates current grant authority against the
+//     immutable local PTY epoch and applies finite same-epoch recovery;
+//   - *RelayStopError → terminal, RunHost stops;
 //   - *RelayRingMissError → RESET-AND-RETRY: never terminal (§13), the
 //     reconnect loop drops the local resume position and re-attaches fresh;
 //   - any other error → transient, the caller reconnects.

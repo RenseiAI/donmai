@@ -142,6 +142,15 @@ func (s *StubRelay) HostBound() bool {
 	return s.room.hostBound
 }
 
+// HostJTI returns the logical connection id of the currently bound host leg.
+// Tests use it to distinguish a same-epoch recovery from the incumbent leg
+// that made the relay return epoch-stale.
+func (s *StubRelay) HostJTI() string {
+	s.room.mu.Lock()
+	defer s.room.mu.Unlock()
+	return s.room.hostJti
+}
+
 // Head is the highest host seq currently in the ring.
 func (s *StubRelay) Head() uint64 {
 	s.room.mu.Lock()

@@ -7,11 +7,20 @@ import (
 	"github.com/RenseiAI/donmai/attachwire"
 )
 
-// ErrEpochStale is the terminal sentinel RunHost returns when the relay rejects
-// the host leg with error.code = epoch-stale (§ 6.2): a newer host process for
-// the session exists, so this process is a zombie and MUST NOT keep retrying.
+// ErrEpochStale is the terminal sentinel RunHost returns when current grant
+// authority proves a successor PTY epoch, or when bounded same-epoch recovery
+// after error.code = epoch-stale (§ 6.2) is exhausted. An equal local epoch is
+// ambiguous while a prior carrier may be half-open and therefore retries first.
 // It is distinct from a transient disconnect (which reconnects with backoff).
-var ErrEpochStale = errors.New("attachclient: epoch-stale — a newer host process owns the room (§6.2)")
+var ErrEpochStale = errors.New("attachclient: epoch-stale — host authority was superseded or bounded recovery was exhausted (§6.2)")
+
+// Internal authority classifications returned by validatedToken. Both stay
+// private: callers observe only RunHost's public ErrEpochStale or context/error
+// result, never a second wire-visible taxonomy.
+var (
+	errEpochGrantSuperseded = errors.New("attachclient: current grant belongs to a newer local PTY epoch")
+	errEpochGrantAmbiguous  = errors.New("attachclient: current grant does not yet match the local PTY epoch")
+)
 
 // RelayStopError is the terminal error RunHost returns when the relay closes the
 // leg with a non-retryable error control (retryable == false, § 7) other than

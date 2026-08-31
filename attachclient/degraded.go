@@ -190,7 +190,10 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 
 	legCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	tokH := &tokenHolder{cur: tok, src: h.cfg.TokenSource}
+	// Every refresh path (401 recovery + upgrade probe) must preserve the live
+	// Session's immutable PTY epoch, not merely parse a bearer. validatedToken
+	// applies the same ground-truth check as the top-level reconnect loop.
+	tokH := &tokenHolder{cur: tok, src: h.validatedToken}
 
 	// Open SSE-down: binds the host leg (epoch CAS). 409 == epoch-stale.
 	sseResp, err := h.openHostSSE(legCtx, sseURL, tokH, cl)
@@ -199,6 +202,8 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 	}
 	defer sseResp.Body.Close() //nolint:errcheck
 	res.progressed = true      // SSE bound → success (reset backoff)
+	res.authorityConfirmed = true
+	res.progressedAt = h.now()
 
 	outCh := make(chan attachwire.Frame, 32) // post-Exit snapshot replies → outOfSeq
 	dedup := newDedupSet(h.cfg.DedupWindow)
@@ -206,7 +211,7 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 	downErr := make(chan error, 1)
 	go func() { downErr <- h.degradedDown(legCtx, sseResp, dedup, outCh) }()
 
-	upgradeCh := make(chan struct{}, 1)
+	upgradeCh := make(chan error, 1)
 	go h.upgradeProbe(legCtx, tokH, upgradeCh)
 
 	// Announce the host leg with a subscribe control in the first batch's
@@ -244,9 +249,11 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 			return res, ctx.Err()
 		case derr := <-downErr:
 			return res, fmt.Errorf("attachclient: degraded SSE-down: %w", derr)
-		case <-upgradeCh:
-			// Between batches → all POSTed batches are acked; a clean drain.
-			return res, errUpgraded
+		case upgradeResult := <-upgradeCh:
+			// Between batches → all POSTed batches are acked. errUpgraded is a
+			// clean carrier switch; a confirmed successor-grant error must reach
+			// RunHost immediately rather than leaving the old degraded leg live.
+			return res, upgradeResult
 		case oof := <-outCh:
 			batch := attachwire.HostFrameBatch{
 				BatchID:  newBatchID(),
@@ -385,7 +392,8 @@ func (h *host) degradedWindow(legCtx context.Context, postURL string, tokH *toke
 // openHostSSE opens the host SSE-down GET, binding the host leg (epoch CAS on
 // the relay). It carries the Authorization header and ?epoch=<epoch> (host legs
 // are always native, header-only; the host-inbound stream has no seq to resume,
-// § 14). 401 → re-mint and retry; 409 → epoch-stale (terminal).
+// § 14). 401 → re-mint and retry; 409 → epoch-stale, surfaced to RunHost's
+// local-PTY-grounded bounded recovery decision.
 func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder, cl hostClaims) (*http.Response, error) {
 	u := sseURL + "?epoch=" + strconv.FormatInt(cl.Epoch, 10)
 	authRetried := false
@@ -610,7 +618,7 @@ func backoffStep(attempt int) time.Duration {
 // upgradeProbe periodically re-dials WSS in the background (§ 14 upgrade-back).
 // On a successful handshake it signals once and returns; RunHost then switches
 // back to the WSS lane. The token is re-resolved per attempt (§ 15).
-func (h *host) upgradeProbe(ctx context.Context, tokH *tokenHolder, signal chan struct{}) {
+func (h *host) upgradeProbe(ctx context.Context, tokH *tokenHolder, result chan error) {
 	t := time.NewTicker(h.cfg.UpgradeProbeInterval)
 	defer t.Stop()
 	for {
@@ -620,11 +628,18 @@ func (h *host) upgradeProbe(ctx context.Context, tokH *tokenHolder, signal chan 
 		case <-t.C:
 			tok, err := tokH.remint(ctx)
 			if err != nil {
+				if errors.Is(err, errEpochGrantSuperseded) {
+					select {
+					case result <- err:
+					default:
+					}
+					return
+				}
 				continue
 			}
 			if h.probeWSS(ctx, tok) {
 				select {
-				case signal <- struct{}{}:
+				case result <- errUpgraded:
 				default:
 				}
 				return
