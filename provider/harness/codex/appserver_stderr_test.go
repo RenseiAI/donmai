@@ -178,8 +178,146 @@ func TestRedactAppServerStderr(t *testing.T) {
 			wantSurviving: []string{"using credential", "[REDACTED]", "for host auth"},
 		},
 		{
+			// B1: a single-quoted value defeated the previous double-quote-only
+			// character class outright — the match simply failed to start,
+			// leaking the secret verbatim.
+			name:          "single-quoted value bypasses the old double-quote-only class",
+			in:            "api_key='sk-single-quoted-secret-1234'",
+			wantRedacted:  []string{"sk-single-quoted-secret-1234"},
+			wantSurviving: []string{"api_key", "[REDACTED]"},
+		},
+		{
+			// B3: bare "token" label, absent from the original alternation.
+			name:          "bare token label",
+			in:            `token: "raw-token-secret-654321"`,
+			wantRedacted:  []string{"raw-token-secret-654321"},
+			wantSurviving: []string{"token", "[REDACTED]"},
+		},
+		{
+			// B3: bare "password" label.
+			name:          "bare password label",
+			in:            "password=hunter2-is-not-really-the-password",
+			wantRedacted:  []string{"hunter2-is-not-really-the-password"},
+			wantSurviving: []string{"password", "[REDACTED]"},
+		},
+		{
+			// B3: bare "passwd" label (distinct spelling from "password").
+			name:          "bare passwd label",
+			in:            "passwd=another-secret-value-000111",
+			wantRedacted:  []string{"another-secret-value-000111"},
+			wantSurviving: []string{"passwd", "[REDACTED]"},
+		},
+		{
+			// B3: bare "credential" label.
+			name:          "bare credential label",
+			in:            "credential=cred-secret-abcdef123456",
+			wantRedacted:  []string{"cred-secret-abcdef123456"},
+			wantSurviving: []string{"credential", "[REDACTED]"},
+		},
+		{
+			// B3: "private_key" label.
+			name:          "private key label",
+			in:            `private_key: "pk-material-abcdef123456"`,
+			wantRedacted:  []string{"pk-material-abcdef123456"},
+			wantSurviving: []string{"private_key", "[REDACTED]"},
+		},
+		{
+			// B3: bare "cookie" label.
+			name:          "bare cookie label",
+			in:            "cookie=session-cookie-value-abcdef99",
+			wantRedacted:  []string{"session-cookie-value-abcdef99"},
+			wantSurviving: []string{"cookie", "[REDACTED]"},
+		},
+		{
+			// B3: bare "session" label.
+			name:          "bare session label",
+			in:            "session=session-token-abcdef123456",
+			wantRedacted:  []string{"session-token-abcdef123456"},
+			wantSurviving: []string{"session", "[REDACTED]"},
+		},
+		{
+			// B2: a realistic env_http_headers JSON key ("X-Donmai-Token") —
+			// the label match is unanchored so it catches the tail of a
+			// compound JSON key, not just an exact bare word.
+			name:          "env_http_headers JSON key carrying a token",
+			in:            `"X-Donmai-Token": "header-secret-value-778899"`,
+			wantRedacted:  []string{"header-secret-value-778899"},
+			wantSurviving: []string{"X-Donmai-Token", "[REDACTED]"},
+		},
+		{
+			// B2: an env-var dump, KEY=VALUE shape, with a compound
+			// identifier no exact-label match would catch.
+			name:          "env-var dump KEY=VALUE shape",
+			in:            "DONMAI_MCP_TOKEN=env-dump-secret-abcxyz99",
+			wantRedacted:  []string{"env-dump-secret-abcxyz99"},
+			wantSurviving: []string{"DONMAI_MCP_TOKEN", "[REDACTED]"},
+		},
+		{
+			// B2: a URL query token embedded in a panic line — the highest-
+			// value capture target per review. The `&` boundary must stop
+			// the match before the NEXT query parameter, which must survive
+			// so the excerpt keeps other diagnostic detail readable.
+			name:          "URL query token in a panic line",
+			in:            "panic: dial failed: https://api.example.com/mcp?token=panic-query-secret&retry=1",
+			wantRedacted:  []string{"panic-query-secret"},
+			wantSurviving: []string{"[REDACTED]", "retry=1", "https://api.example.com/mcp?token="},
+		},
+		{
+			// B2: URL userinfo credentials, user:password form — only the
+			// password is redacted; the username and host stay visible.
+			name:          "URL userinfo credentials, user:password form",
+			in:            "dial tcp failed: https://svc:userinfo-secret-pw@mcp.internal:443/socket",
+			wantRedacted:  []string{"userinfo-secret-pw"},
+			wantSurviving: []string{"svc", "[REDACTED]", "mcp.internal"},
+		},
+		{
+			// B2: URL userinfo credentials, bare-token form (no
+			// username:password split).
+			name:          "URL userinfo credentials, bare-token form",
+			in:            "https://bare-userinfo-secret-token@mcp.internal/socket",
+			wantRedacted:  []string{"bare-userinfo-secret-token"},
+			wantSurviving: []string{"[REDACTED]", "mcp.internal"},
+		},
+		{
+			// Shape-based rule (point 4 of the review): a well-known PUBLIC
+			// token format (OpenAI sk-) with no label anywhere nearby.
+			name:          "shape-based OpenAI-style secret, no label",
+			in:            "leaked: sk-thisisnotarealopenaikeyfixture",
+			wantRedacted:  []string{"sk-thisisnotarealopenaikeyfixture"},
+			wantSurviving: []string{"[REDACTED]"},
+		},
+		{
+			// Shape-based rule: a well-known PUBLIC GitHub token format.
+			name:          "shape-based GitHub-style token, no label",
+			in:            "found ghp_thisisnotarealgithubtokenfixture in stderr",
+			wantRedacted:  []string{"ghp_thisisnotarealgithubtokenfixture"},
+			wantSurviving: []string{"[REDACTED]", "found", "in stderr"},
+		},
+		{
+			// Shape-based rule: a well-known PUBLIC Slack token format.
+			name:          "shape-based Slack-style token, no label",
+			in:            "xoxb-thisisnotarealslacktokenfixture",
+			wantRedacted:  []string{"xoxb-thisisnotarealslacktokenfixture"},
+			wantSurviving: []string{"[REDACTED]"},
+		},
+		{
 			name:           "plain diagnostic text is untouched",
 			in:             "fatal: failed to start MCP server \"fixture\": exit status 1",
+			wantUnmodified: true,
+		},
+		{
+			// Safety net: the new bare "session" label must not sweep up
+			// ordinary prose that happens to use the word with no [:=]
+			// immediately after it.
+			name:           "bare word 'session' in ordinary prose is untouched",
+			in:             "session ended without error",
+			wantUnmodified: true,
+		},
+		{
+			// Safety net: same, for "api_key" mentioned descriptively rather
+			// than assigned.
+			name:           "label word mentioned descriptively is untouched",
+			in:             "the api_key parameter is optional",
 			wantUnmodified: true,
 		},
 	}

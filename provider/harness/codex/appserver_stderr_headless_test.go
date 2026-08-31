@@ -122,16 +122,12 @@ func findRecord(records []slog.Record, want string) *slog.Record {
 	return nil
 }
 
-// TestWatchExitLogsExactlyOnceOnAppServerExit pins item 3 for the headless
-// lane: the shared app-server's exit — successful handshake, then killed —
-// produces exactly one structured log line carrying the redacted excerpt,
-// regardless of the JSON-RPC client-close race (readLoop's own EOF-triggered
-// Stop can win that race; the log line does not depend on it).
-//
-// RED proof: comment out watchExit's call to p.logAppServerExit(err) and
-// this test's "exactly one" assertion fails (findRecord returns nil) — see
-// the completion report for the revert/run/restore actually performed.
-func TestWatchExitLogsExactlyOnceOnAppServerExit(t *testing.T) {
+// codexHeadlessWatchExitProbe brings up a Provider whose app-server is this
+// test binary in fake mode, spawns one session against it, and returns the
+// Provider plus a slog recorder installed as the package default so a test
+// can observe watchExit's structured exit line.
+func codexHeadlessWatchExitProbe(t *testing.T) (*Provider, *slogRecorder) {
+	t.Helper()
 	self, err := os.Executable()
 	if err != nil {
 		t.Fatalf("resolve test binary: %v", err)
@@ -161,46 +157,100 @@ func TestWatchExitLogsExactlyOnceOnAppServerExit(t *testing.T) {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(recorder))
 	t.Cleanup(func() { slog.SetDefault(prev) })
+	return p, recorder
+}
+
+// awaitAppServerExitLogRecord polls recorder for the "codex: app-server
+// process exited" line and returns it, plus how many times it was logged.
+//
+// A poll is required rather than a synchronous check because watchExit
+// sends to p.processDone BEFORE calling logAppServerExit — a caller that
+// already waited on processDone still has not necessarily observed the log
+// line land.
+func awaitAppServerExitLogRecord(t *testing.T, recorder *slogRecorder) (*slog.Record, int) {
+	t.Helper()
+	const msg = "codex: app-server process exited"
+	deadline := time.Now().Add(2 * time.Second)
+	var records []slog.Record
+	for time.Now().Before(deadline) {
+		records = recorder.snapshot()
+		if findRecord(records, msg) != nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	rec := findRecord(records, msg)
+	if rec == nil {
+		t.Fatalf("no %q log line observed; got %d records", msg, len(records))
+	}
+	var matches int
+	for _, r := range records {
+		if r.Message == msg {
+			matches++
+		}
+	}
+	return rec, matches
+}
+
+// TestWatchExitLogsExactlyOnceOnAppServerExit pins item 3 for the headless
+// lane: the shared app-server's exit — successful handshake, then killed —
+// produces exactly one structured log line carrying the redacted excerpt,
+// regardless of the JSON-RPC client-close race (readLoop's own EOF-triggered
+// Stop can win that race; the log line does not depend on it). An
+// unrequested kill logs at Warn, not Info — see
+// TestWatchExitLogsInfoOnRequestedShutdown for the other half of that
+// distinction.
+//
+// RED proof: comment out watchExit's call to p.logAppServerExit(err) and
+// this test's "exactly one" assertion fails (findRecord returns nil) — see
+// the completion report for the revert/run/restore actually performed.
+func TestWatchExitLogsExactlyOnceOnAppServerExit(t *testing.T) {
+	p, recorder := codexHeadlessWatchExitProbe(t)
 
 	if err := p.cmd.Process.Kill(); err != nil {
 		t.Fatalf("kill fake app-server: %v", err)
 	}
-	// watchExit runs on its own goroutine; wait for its log line rather than
-	// racing it. processDone is fed from the exact same p.cmd.Wait() call
-	// watchExit's own logAppServerExit already ran before, so its arrival
-	// proves the log line already landed.
+	// watchExit runs on its own goroutine; wait for the process to actually
+	// exit rather than racing it. processDone is fed from the exact same
+	// p.cmd.Wait() call watchExit uses.
 	select {
 	case <-p.processDone:
 	case <-time.After(5 * time.Second):
 		t.Fatal("app-server exit was not observed within 5s")
 	}
-	// logAppServerExit runs synchronously before watchExit reads p.processDone
-	// is fed... no: processDone is fed BEFORE logAppServerExit runs, so give
-	// the log call a brief moment to land.
-	deadline := time.Now().Add(2 * time.Second)
-	var records []slog.Record
-	for time.Now().Before(deadline) {
-		records = recorder.snapshot()
-		if findRecord(records, "codex: app-server process exited") != nil {
-			break
-		}
-		time.Sleep(10 * time.Millisecond)
-	}
 
-	rec := findRecord(records, "codex: app-server process exited")
-	if rec == nil {
-		t.Fatalf("no \"codex: app-server process exited\" log line observed; got %d records", len(records))
-	}
-	var matches int
-	for _, r := range records {
-		if r.Message == "codex: app-server process exited" {
-			matches++
-		}
-	}
+	rec, matches := awaitAppServerExitLogRecord(t, recorder)
 	if matches != 1 {
 		t.Fatalf("app-server exit logged %d times, want exactly 1", matches)
 	}
 	if rec.Level != slog.LevelWarn {
 		t.Fatalf("exit log level = %v, want Warn (this was an unrequested kill, not a Shutdown)", rec.Level)
+	}
+}
+
+// TestWatchExitLogsInfoOnRequestedShutdown is the other half of item 3's
+// level distinction: an app-server exit that Shutdown itself asked for is
+// expected, not diagnostic, and must log at Info rather than Warn — a
+// long-lived headless Provider's ordinary teardown should not read as a
+// crash in the logs.
+//
+// RED proof: in logAppServerExit, delete the `select { case <-p.shutdown:
+// level = slog.LevelInfo ... }` branch (always log Warn) and this test's
+// level assertion fails. Verified by deleting that branch: FAILED ("exit
+// log level = WARN, want Info"), then PASSED again after restoring — see
+// the completion report for the exact quotes.
+func TestWatchExitLogsInfoOnRequestedShutdown(t *testing.T) {
+	p, recorder := codexHeadlessWatchExitProbe(t)
+
+	if err := p.Shutdown(context.Background()); err != nil {
+		t.Fatalf("Shutdown: %v", err)
+	}
+
+	rec, matches := awaitAppServerExitLogRecord(t, recorder)
+	if matches != 1 {
+		t.Fatalf("app-server exit logged %d times, want exactly 1", matches)
+	}
+	if rec.Level != slog.LevelInfo {
+		t.Fatalf("exit log level = %v, want Info (Shutdown requested this exit)", rec.Level)
 	}
 }

@@ -126,30 +126,107 @@ func (b *boundedBuffer) Excerpt() string {
 	return strings.TrimSpace(redacted)
 }
 
+// appServerStderrValuePattern matches a secret-shaped value up to a REAL
+// boundary — a matching closing quote (double OR single), or the next
+// whitespace/quote/`&`/EOL when unquoted — instead of a fixed character
+// class. A character class has to keep guessing at which punctuation a real
+// secret might contain (base64 uses `+/=`, JWTs use `.`, API keys use
+// `-_`); worse, a single-quoted value (api_key='SECRET') defeated an
+// earlier double-quote-only version of this pattern outright, since the
+// leading `'` was not in the class and the match simply failed to start.
+// `&` is excluded from the unquoted branch so a URL query token
+// (?token=SECRET&next=1) redacts only the token, not the rest of the
+// query string.
+const appServerStderrValuePattern = `(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'&\r\n]+)`
+
+// appServerStderrRedaction pairs a pattern with its own replacement
+// template (rather than inferring one from NumSubexp, which cannot express
+// the two-group userinfo templates below).
+type appServerStderrRedaction struct {
+	pattern     *regexp.Regexp
+	replacement string
+}
+
 // appServerStderrRedactions scrub secret-shaped substrings out of a captured
 // excerpt before it is ever logged or placed in a returned error. The codex
 // app-server this package spawns is handed real credentials — host-session
 // auth, MCP server bearer tokens delivered via env_http_headers — so a
 // panic or a debug trace that happens to echo one of those must not turn a
-// forensic log line into a leak. Each pattern keeps any label it matched
-// (e.g. "Authorization:") and replaces only the secret-shaped value that
+// forensic log line into a leak. Most patterns keep any label they matched
+// (e.g. "Authorization:") and replace only the secret-shaped value that
 // followed it, so the excerpt stays readable.
-var appServerStderrRedactions = []*regexp.Regexp{
-	// An Authorization header rendered inline in a log line. The value runs
-	// to end-of-line (rather than stopping at the first token) so a scheme
-	// prefix — "Authorization: Bearer <token>" — is consumed as one secret
-	// instead of leaving "Bearer" behind for the next pattern to mangle.
-	// Ordered before the bare-bearer pattern below for exactly that reason.
-	regexp.MustCompile(`(?i)(authorization["']?\s*[:=]\s*)[^\r\n]+`),
-	// A bare "Bearer <token>" / "bearer=<token>" NOT already consumed above
-	// (e.g. no "Authorization" label present at all).
-	regexp.MustCompile(`(?i)(bearer[\s:=]+)\S+`),
-	// Any other *_token / *_key / *_secret-labeled value, KEY=VALUE or JSON
-	// shaped: api_key: "sk-...", access_token=..., "client_secret":"...".
-	regexp.MustCompile(`(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|secret)["']?\s*[:=]\s*)"?[A-Za-z0-9._~+/=-]{4,}"?`),
-	// donmai's own machine-token format (dmk_<hex>) — no label needed, the
-	// shape alone is distinctive enough to redact outright.
-	regexp.MustCompile(`\bdmk_[0-9a-f]{16,}\b`),
+var appServerStderrRedactions = []appServerStderrRedaction{
+	{
+		// An Authorization header rendered inline in a log line. The value
+		// runs to end-of-line (rather than stopping at a boundary) so a
+		// scheme prefix — "Authorization: Bearer <token>" — is consumed as
+		// one secret instead of leaving "Bearer" behind for the next
+		// pattern to mangle. Ordered before the bare-bearer pattern below
+		// for exactly that reason.
+		regexp.MustCompile(`(?i)(authorization["']?\s*[:=]\s*)[^\r\n]+`),
+		"${1}[REDACTED]",
+	},
+	{
+		// A bare "Bearer <token>" NOT already consumed above (no
+		// "Authorization" label present at all).
+		regexp.MustCompile(`(?i)(bearer[\s:=]+)\S+`),
+		"${1}[REDACTED]",
+	},
+	{
+		// Any secret-labeled value, KEY=VALUE or JSON shaped:
+		// api_key: "sk-...", access_token=..., "client_secret":"...",
+		// token='...', password=..., cookie: "...", session=....
+		//
+		// Deliberately UNANCHORED on the left — the label only needs to
+		// appear as a substring immediately before the [:=], not as a
+		// whole word — so this also catches shapes a stricter match would
+		// miss without a dedicated pattern per shape:
+		//   - env_http_headers JSON key names: "X-Donmai-Token": "..."
+		//     (the "token" alternative matches the tail of the JSON key).
+		//   - env-var dumps: DONMAI_MCP_TOKEN=... (same reasoning, applied
+		//     to a KEY=VALUE shell-env line instead of a JSON key).
+		//   - a bare token in a URL query string embedded in a panic line:
+		//     .../mcp?token=SECRET&retry=1 (appServerStderrValuePattern's
+		//     `&` boundary stops the match before the next query param).
+		regexp.MustCompile(`(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|secret|token|password|passwd|credential|cookie|session)["']?\s*[:=]\s*)` + appServerStderrValuePattern),
+		"${1}[REDACTED]",
+	},
+	{
+		// URL userinfo credentials, user:password form:
+		// scheme://user:PASSWORD@host/... — redact only the password,
+		// keep the username and host visible.
+		regexp.MustCompile(`(://[^/\s:@'"]*:)[^/\s@'"]+(@)`),
+		"${1}[REDACTED]${2}",
+	},
+	{
+		// URL userinfo credentials, bare-token form (no username:password
+		// split): scheme://TOKEN@host/...
+		regexp.MustCompile(`(://)[^/\s:@'"]+(@)`),
+		"${1}[REDACTED]${2}",
+	},
+	{
+		// Well-known PUBLIC token-format conventions — OpenAI sk-/pk-,
+		// GitHub gh[oprsu]_, Slack xox[baprs]- — redacted by shape alone,
+		// no label needed, the same way donmai's own dmk_ format already
+		// was below. This is deliberately a short, well-documented,
+		// vendor-public prefix list rather than a general high-entropy
+		// scanner: RE2 (Go's regexp engine) has no practical way to
+		// approximate entropy without also sweeping up ordinary git SHAs,
+		// UUIDs, and content hashes that are NOT secrets and ARE exactly
+		// the kind of diagnostic detail this excerpt exists to preserve.
+		// It must never encode a closed-source/org-internal token prefix —
+		// this file is OSS and ships to every downstream consumer of this
+		// package, not just whichever closed-source product happens to
+		// embed it.
+		regexp.MustCompile(`\b(?:sk|pk|gh[oprsu]|xox[baprs])[-_][A-Za-z0-9]{10,}\b`),
+		"[REDACTED]",
+	},
+	{
+		// donmai's own machine-token format (dmk_<hex>) — no label needed,
+		// the shape alone is distinctive enough to redact outright.
+		regexp.MustCompile(`\bdmk_[0-9a-f]{16,}\b`),
+		"[REDACTED]",
+	},
 }
 
 // redactAppServerStderr applies every appServerStderrRedactions pattern in
@@ -157,12 +234,8 @@ var appServerStderrRedactions = []*regexp.Regexp{
 // the pure scrubbing behavior can be pinned without spinning up a buffer or
 // a subprocess.
 func redactAppServerStderr(s string) string {
-	for _, pattern := range appServerStderrRedactions {
-		if pattern.NumSubexp() > 0 {
-			s = pattern.ReplaceAllString(s, "${1}[REDACTED]")
-		} else {
-			s = pattern.ReplaceAllString(s, "[REDACTED]")
-		}
+	for _, r := range appServerStderrRedactions {
+		s = r.pattern.ReplaceAllString(s, r.replacement)
 	}
 	return s
 }
