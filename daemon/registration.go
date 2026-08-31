@@ -457,7 +457,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 	// Capacity is derived from MaxAgents except during D12 auth-only recovery,
 	// where publishing a claimable slot before adoption would be false.
 	capacity := opts.MaxAgents
-	if opts.AuthOnly {
+	if opts.AuthOnly || opts.SessionShim.enabled() {
 		capacity = 0
 	} else if capacity <= 0 {
 		capacity = 1
