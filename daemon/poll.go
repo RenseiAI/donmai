@@ -16,6 +16,7 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/kgextract"
+	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/worker"
 )
@@ -959,10 +960,32 @@ func callPollEndpoint(ctx context.Context, client *http.Client, orchestratorURL,
 // stale-claim sweep eventually reclaims it — minutes of latency, and
 // the session looks healthy to operators in the meantime.
 //
-// The body shape mirrors the orchestrator's NackRequestBody:
+// The legacy body shape mirrors the orchestrator's NackRequestBody:
 //
 //	{ "workerId": "wkr_…", "reason": "<short>", "work": <queued work> }
 //
+// receiptPreflightReason is an additive, optional closed reason projection. It
+// is deliberately absent for every error except the canonical typed
+// HarnessAdmissionError with DenialFallbackNotAllowed; prose is never trusted
+// as authority.
+const receiptPreflightNackReasonContractVersion = "receipt-preflight-nack-reason/v1"
+
+type receiptPreflightNackReason struct {
+	ContractVersion string `json:"contractVersion"`
+	Code            string `json:"code"`
+}
+
+func receiptPreflightNackReasonForError(err error) *receiptPreflightNackReason {
+	var admissionErr *runner.HarnessAdmissionError
+	if !errors.As(err, &admissionErr) || admissionErr.Code != executioncell.DenialFallbackNotAllowed {
+		return nil
+	}
+	return &receiptPreflightNackReason{
+		ContractVersion: receiptPreflightNackReasonContractVersion,
+		Code:            string(executioncell.DenialFallbackNotAllowed),
+	}
+}
+
 // `work` must carry the five fields the orchestrator validates as
 // `QueuedWork` (sessionId, issueId, issueIdentifier, priority,
 // queuedAt). PollWorkItem already JSON-marshals to a superset of that
@@ -975,6 +998,7 @@ func callNackEndpoint(
 	ctx context.Context,
 	client *http.Client,
 	orchestratorURL, sessionID, workerID, runtimeJWT, reason string,
+	receiptPreflightReason *receiptPreflightNackReason,
 	work *PollWorkItem,
 ) error {
 	if sessionID == "" {
@@ -990,13 +1014,15 @@ func callNackEndpoint(
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	body := struct {
-		WorkerID string        `json:"workerId"`
-		Reason   string        `json:"reason,omitempty"`
-		Work     *PollWorkItem `json:"work"`
+		WorkerID               string                      `json:"workerId"`
+		Reason                 string                      `json:"reason,omitempty"`
+		ReceiptPreflightReason *receiptPreflightNackReason `json:"receiptPreflightReason,omitempty"`
+		Work                   *PollWorkItem               `json:"work"`
 	}{
-		WorkerID: workerID,
-		Reason:   reason,
-		Work:     work,
+		WorkerID:               workerID,
+		Reason:                 reason,
+		ReceiptPreflightReason: receiptPreflightReason,
+		Work:                   work,
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {

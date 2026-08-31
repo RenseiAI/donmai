@@ -22,22 +22,22 @@ func TestEffectiveRegistrationCapabilities(t *testing.T) {
 		{
 			name:     "nil_embedder_gets_base_substrate_plus_lanes",
 			embedder: nil,
-			want:     []string{"local", "sandbox", "workarea", kgextract.WorkTypeKGExtraction},
+			want:     []string{"local", "sandbox", "workarea", kgextract.WorkTypeKGExtraction, receiptPreflightNackReasonCapability},
 		},
 		{
 			name:     "embedder_list_is_preserved_and_extended",
 			embedder: []string{"local", "sandbox", "workarea", "merge-queue"},
-			want:     []string{"local", "sandbox", "workarea", "merge-queue", kgextract.WorkTypeKGExtraction},
+			want:     []string{"local", "sandbox", "workarea", "merge-queue", kgextract.WorkTypeKGExtraction, receiptPreflightNackReasonCapability},
 		},
 		{
 			name:     "embedder_that_already_advertises_the_lane_is_not_duplicated",
 			embedder: []string{"local", kgextract.WorkTypeKGExtraction},
-			want:     []string{"local", kgextract.WorkTypeKGExtraction},
+			want:     []string{"local", kgextract.WorkTypeKGExtraction, receiptPreflightNackReasonCapability},
 		},
 		{
 			name:     "explicit_empty_list_is_an_opinion_and_only_gains_the_lanes",
 			embedder: []string{},
-			want:     []string{kgextract.WorkTypeKGExtraction},
+			want:     []string{kgextract.WorkTypeKGExtraction, receiptPreflightNackReasonCapability},
 		},
 	}
 
@@ -64,6 +64,10 @@ func TestEffectiveRegistrationCapabilities_AdvertisesOnlyExecutedLanes(t *testin
 	executed := map[string]bool{
 		// Wired unconditionally in NewPollService.
 		kgextract.WorkTypeKGExtraction: true,
+		// handlePollWorkItem always runs the NACK producer after every local
+		// accept-work rejection, and receiptPreflightNackReasonForError only
+		// emits the closed reason for the canonical typed denial.
+		receiptPreflightNackReasonCapability: true,
 	}
 	substrate := map[string]bool{}
 	for _, c := range baseSubstrateCapabilities {
@@ -81,6 +85,11 @@ func TestEffectiveRegistrationCapabilities_AdvertisesOnlyExecutedLanes(t *testin
 		if !executed[tag] {
 			t.Errorf("lane capability %q has no executor recorded in this test — "+
 				"wire the executor in NewPollService before advertising the tag", tag)
+		}
+	}
+	for _, tag := range producerCapabilities {
+		if !executed[tag] {
+			t.Errorf("producer capability %q has no daemon implementation recorded in this test", tag)
 		}
 	}
 }
