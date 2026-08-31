@@ -474,6 +474,45 @@ func (opts SweepOptions) ownerAlive(manifest donmaiOwnerManifest) bool {
 	return false
 }
 
+// codexSessionStateSubdir is the ONE CODEX_HOME subdirectory SweepOrphans
+// will NEVER delete as part of directory reclamation, no matter how old the
+// surrounding directory is or how confidently its owner and child are
+// proven dead.
+//
+// LOAD-BEARING CONSTRAINT — read before changing this:
+//
+// A real codex-cli persists a named thread's rollout-*.jsonl file under
+// CODEX_HOME/sessions/<date>/ (see interactive_name.go's
+// isRolloutFlushRaceError / codexRolloutFlushRaceMessage fixture for the
+// exact shape observed against a real codex-cli release, and that file's
+// package doc comment on why a thread that never took a turn cannot be
+// reattached at all). This is what codex's OWN native `resume` is keyed
+// on: once a thread has taken a turn, that file — not the process, not the
+// donmai session that spawned it — is what makes the session durable, for
+// as long as a user or a future resume feature might want to resume it.
+// Deleting it out from under a dead-but-resumable session is not an orphan
+// cleanup, it is silently destroying product data, hours after the session
+// ended, which is precisely when someone would go looking for it.
+//
+// This is a deliberately conservative bridge, not a final design: a
+// separate, already-planned initiative to move every harness's session
+// state out of these ephemeral, process-scoped directories into a
+// purpose-built, lifecycle-bound location (owned by session/worktree
+// teardown, not by this process-liveness-based sweep) will eventually give
+// this content a proper home outside os.TempDir() entirely. Any future
+// change to this retention policy must land consistent with wherever that
+// work puts session state — check for it before changing this constant.
+// Until it lands, the sweep's only safe move for a home directory that
+// still holds session state is reclaimSweepScratch below: strip everything
+// ELSE (config.toml, the linked auth.json, the plugin-cache staging copy,
+// the owner manifest itself) and leave sessions/ — and therefore the
+// directory itself — in place, indefinitely, rather than guess at a
+// retention window no timer could honestly justify (a resume request has
+// no natural expiry). Do not "simplify" this back to an unconditional
+// RemoveAll without confirming that relocation work has landed and this is
+// where it wants the cleanup enforced.
+const codexSessionStateSubdir = "sessions"
+
 // reclaim removes path, UNLESS it still holds resumable session state (see
 // codexSessionStateSubdir), in which case it strips everything else and
 // preserves that subdirectory instead of deleting path outright. Only
@@ -485,19 +524,6 @@ func (opts SweepOptions) ownerAlive(manifest donmaiOwnerManifest) bool {
 // otherwise simply lost, for exactly the sessions most likely to need the
 // cache-reuse mechanism (ones that crashed before they could call
 // remove()/harvestPluginCache() themselves).
-// codexSessionStateSubdir is the ONE CODEX_HOME subdirectory SweepOrphans
-// will NEVER delete as part of directory reclamation: CODEX_HOME/sessions/<date>/
-// holds codex's own rollout-*.jsonl files, which is what native `resume` is
-// keyed on (see isRolloutFlushRaceError in interactive_name.go for the exact
-// shape). Deleting it out from under a dead-but-resumable session destroys
-// product data a user or the platform may still want, silently, long after
-// the owning process exited. This is a deliberately conservative bridge until
-// Linear REN-3090 ("Move every harness's session state out of the checkout in
-// the flat layout", backlog as of 2026-08-31) gives this content a
-// purpose-built, lifecycle-bound home outside os.TempDir() — read that issue
-// before changing this policy.
-const codexSessionStateSubdir = "sessions"
-
 func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) {
 	opts.harvestOrphanedPluginCache(path)
 	hasSessionState, err := dirHasEntries(filepath.Join(path, codexSessionStateSubdir))
