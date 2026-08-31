@@ -53,9 +53,11 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -221,6 +223,15 @@ func TestLaunchAdoptionBatchCommitExhaustionRestoresPriorTruthWithoutStranding(t
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 	d.opts.SessionShim.HostID = "host-exhaustion-restores"
+	// Hosted/attested (sessionShimEnabled() == true) so d.shims.credentialReceipts
+	// is populated and d.updateSessionShimAdoptionRevision is not a no-op —
+	// otherwise the retained-revision assertions below would pass vacuously
+	// regardless of whether the restore's own receipt is ever retained.
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	before, ok := d.SessionShimScopeAuthority(f.orgID)
+	if !ok {
+		t.Fatal("no retained authority before any launch")
+	}
 
 	fake := &sessionShimBatchCompletenessFake{}
 	d.opts.SessionShim.OnAdoption = fake.onAdoption
@@ -254,6 +265,31 @@ func TestLaunchAdoptionBatchCommitExhaustionRestoresPriorTruthWithoutStranding(t
 	if got := len(results); got < sessionShimAdoptionBatchCommitAttempts+1 {
 		t.Fatalf("OnAdoptionBatch was called %d times after exhaustion, want at least attempts+1 restore = %d",
 			got, sessionShimAdoptionBatchCommitAttempts+1)
+	}
+
+	// THE RETAINED-REVISION PROOF: the restore batch committed durably (the
+	// completeness assertions below confirm the fake accepted it), which
+	// means the control plane's adoption revision just advanced. A version
+	// that discarded that receipt left this daemon attesting the
+	// PRE-LAUNCH revision forever — the very next beat would be answered
+	// SESSION_SHIM_ADOPTION_REVISION_STALE and the host demoted all over
+	// again, despite the log line claiming readiness was restored.
+	afterRestore, ok := d.SessionShimScopeAuthority(f.orgID)
+	if !ok {
+		t.Fatal("no retained authority after the restore committed")
+	}
+	if afterRestore.AdoptionRevision == before.AdoptionRevision {
+		t.Fatalf("retained revision after the restore committed = %q, want it advanced from the pre-launch %q "+
+			"(the restore's own receipt was committed but never retained)", afterRestore.AdoptionRevision, before.AdoptionRevision)
+	}
+	restoreBatch := results[len(results)-1]
+	if restoreBatch.err != nil {
+		t.Fatalf("the restore batch itself was refused: %v", restoreBatch.err)
+	}
+	wantRevision := fmt.Sprintf("revision-%d", fake.revision.Load())
+	if afterRestore.AdoptionRevision != wantRevision {
+		t.Fatalf("retained revision after the restore committed = %q, want the exact committed %q",
+			afterRestore.AdoptionRevision, wantRevision)
 	}
 
 	// The failed session was never adopted.
@@ -319,5 +355,60 @@ func TestLaunchAdoptionBatchCommitExhaustionRestoresPriorTruthWithoutStranding(t
 	}
 	if _, stillQuarantined := batchQuarantinesSession(finalBatch.batch, failing.SessionID); !stillQuarantined {
 		t.Fatalf("the third launch's batch dropped the still-live exhausted lineage instead of continuing to present it: %+v", finalBatch.batch)
+	}
+}
+
+// TestLaunchAdoptionBatchCommitPreservesTheRefusalWhenBackoffIsCutShort pins
+// the OTHER half of a cut-short retry loop: when the context ends mid-backoff
+// (attempt N's own real refusal already recorded, the sleep before attempt
+// N+1 interrupted), the error this function returns and logs must still be
+// that REAL refusal — the string an operator actually diagnoses from — never
+// overwritten with a bare ctx.Err() that says nothing about why the control
+// plane refused the batch. Exercises completeLaunchedSessionShimAdoptionBatchResilient
+// directly: the bug is entirely local to this function's own loop, not
+// something that requires driving the full launch path to observe (unlike
+// the ctx-reuse bug earlier in this file, which spanned Dial and needed
+// exactly that).
+func TestLaunchAdoptionBatchCommitPreservesTheRefusalWhenBackoffIsCutShort(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.opts.SessionShim.HostID = "host-cutshort-backoff"
+	const refusalDetail = "adoption revision compare-and-swap refused (closed code, decoded 4xx): backoff-cutshort-probe"
+	var calls atomic.Int64
+	d.opts.SessionShim.OnAdoptionBatch = func(context.Context, SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		calls.Add(1)
+		return SessionShimAdoptionBatchReceipt{}, errors.New(refusalDetail)
+	}
+
+	evidence := SessionShimAdoptionEvidence{
+		Identity: sessionshim.Identity{OrgID: f.orgID, SessionID: "cutshort-backoff-probe"},
+		HostID:   "host-cutshort-backoff",
+	}
+	// sessionShimAdoptionBatchCommitBaseBackoff is 100ms; a 20ms ctx budget
+	// lets attempt 1's own (near-instant, in-process) call complete and its
+	// refusal land in lastErr, then expires during the backoff sleep before
+	// attempt 2 — never during attempt 1 itself, and never leaving attempt 2
+	// time to actually run.
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Millisecond)
+	defer cancel()
+	_, err := d.completeLaunchedSessionShimAdoptionBatchResilient(ctx, evidence, SessionShimAdoptionReceipt{})
+	if err == nil {
+		t.Fatal("expected the cut-short exhaustion to still report an error")
+	}
+	if !strings.Contains(err.Error(), refusalDetail) {
+		t.Fatalf("error after a cut-short backoff = %q, want it to preserve the real refusal %q", err, refusalDetail)
+	}
+	if errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("error after a cut-short backoff = %v, want the real refusal preserved instead of ctx.Err() overwriting it", err)
+	}
+	// Exactly 2 calls: attempt 1 (whose refusal must survive) plus the
+	// best-effort exhaustion restore that always follows — NOT a second
+	// synchronous retry-loop attempt, which never runs because its own
+	// backoff was cut short. The restore runs on its own detached budget
+	// (see restoreSessionShimReadinessAfterExhaustedBatchCommit), so ctx
+	// ending here does not block it too.
+	if got := calls.Load(); got != 2 {
+		t.Fatalf("OnAdoptionBatch was called %d times, want exactly 2 (attempt 1, then the exhaustion restore) — "+
+			"a cut-short backoff must never let a second synchronous retry-loop attempt run", got)
 	}
 }

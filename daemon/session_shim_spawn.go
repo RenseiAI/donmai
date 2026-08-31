@@ -689,10 +689,29 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 	// outgoing batch never needs a separate manual append, and neither will
 	// any later batch this daemon ever sends for this scope.
 	fallback := d.sessionShimProjectionBatch(evidence.Identity.OrgID, evidence.HostID)
-	if _, err := d.completeSessionShimAdoptionBatch(restoreCtx, fallback); err != nil {
+	receipt, err := d.completeSessionShimAdoptionBatch(restoreCtx, fallback)
+	if err != nil {
 		slog.Error("session shim: adoption batch commit exhausted its retries and the best-effort readiness restore also failed; "+
-			"the lineage is retained in this daemon's own quarantine projection so a later batch gets another chance",
+			"the lineage stays quarantined in this daemon's own live projection so no later batch silently omits it — nothing "+
+			"here schedules a fresh publish attempt, so recovery waits on the shim's own orphan deadline producing a terminal "+
+			"tombstone for reconcileQuarantinedTombstones to clear",
 			"session", evidence.Identity.String(), "commitError", causeErr, "restoreError", err)
+		return
+	}
+	// The restore batch committed durably, which means the control plane's
+	// adoption revision just advanced — exactly like any other successful
+	// batch commit (see republishSessionShimProjection, which retains its
+	// own receipt for the identical reason). Retaining nothing here would
+	// leave this daemon attesting the STALE pre-restore revision on its very
+	// next beat, which the control plane answers
+	// SESSION_SHIM_ADOPTION_REVISION_STALE — demoting the host all over
+	// again, the same divergence session_shim_reconcile.go's own doc comment
+	// warns a republish that skips this step trades one divergence for
+	// another.
+	if revisionErr := d.updateSessionShimAdoptionRevision(evidence.Identity.OrgID, receipt.AdoptionRevision, false); revisionErr != nil {
+		slog.Error("session shim: adoption batch commit exhausted its retries; the best-effort readiness restore committed but "+
+			"its revision was not retained — the next beat may present a stale revision until reconciliation relearns it",
+			"session", evidence.Identity.String(), "commitError", causeErr, "revisionError", revisionErr)
 		return
 	}
 	slog.Error("session shim: adoption batch commit exhausted its retries; restored the host's last-known-good durable "+

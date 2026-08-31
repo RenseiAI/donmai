@@ -260,6 +260,21 @@ func TestShimDiscoveryRecordMatchesLaunch(t *testing.T) {
 	if shimDiscoveryRecordMatchesLaunch(base, id, launch, unpinnedLaunchStart) {
 		t.Fatal("an unpinned launch start time was accepted instead of refused")
 	}
+	// THE DISCRIMINATING CASE for the fail-closed guard: base.ProcessStartedAt
+	// (555) already differs from unpinnedLaunchStart.StartedAt (0) above, so
+	// that check alone passes even WITHOUT the explicit
+	// "if started.StartedAt == 0 { return false }" guard — the ordinary
+	// equality comparison already rejects it, for an unrelated reason. The
+	// ONLY shape that actually exercises the guard is a record whose OWN
+	// reported start time is ALSO zero: without the guard, 0 == 0 and every
+	// other field already matches, so the equality check alone would accept
+	// it. Deleting the guard turns this one case RED while leaving every
+	// other case above GREEN.
+	recordWithNoStartTime := base
+	recordWithNoStartTime.ProcessStartedAt = 0
+	if shimDiscoveryRecordMatchesLaunch(recordWithNoStartTime, id, launch, unpinnedLaunchStart) {
+		t.Fatal("a record with no recorded start time matched an unpinned launch on 0 == 0 instead of being refused")
+	}
 }
 
 // TestLaunchSessionShimAdoptsThroughTheRealPathWhenDiscoveryArrivesLate is the

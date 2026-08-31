@@ -311,10 +311,24 @@ func TestFailedPublicationCarryingAQuarantineChangeRollsBackAndKeepsBeating(t *t
 	// — never leaving local state claiming "nothing happened" when the
 	// control plane's own per-session record says otherwise, which is what
 	// let a later, unrelated batch get refused for omitting it (measured in
-	// review, independent of this rollback path). The checkpoint/rollback
-	// machinery this test otherwise pins never touches d.shims.quarantined
-	// at all, so this addition is orthogonal to — not undone by — the
-	// rollback this test is really about.
+	// review, independent of this rollback path).
+	//
+	// NOT free of consequence, though: in THIS test the restore batch also
+	// fails (refuse never clears), so this entry was never durably committed
+	// to the control plane either. The beat now presents a quarantine set
+	// the platform's own last-COMMITTED batch does not know about, and
+	// sessionShimProjectionBatch's own doc comment says exactly what a real
+	// control plane does with that mismatch: demote the host to draining
+	// until the sets agree again. This test's fake heartbeat receiver does
+	// not model that comparison, so it cannot fail this assertion — but a
+	// real deployment would ride out one bounded demotion window here,
+	// cleared by the same orphan-deadline tombstone path that already
+	// clears every other quarantined lineage (measured: ~2.26s from
+	// exhaustion to occupancy 1→0 in review). Bounded and self-healing, and
+	// strictly better than a prior round's permanent full-batch refusal —
+	// but not orthogonal to, and not something the checkpoint/rollback
+	// machinery here corrects for. That machinery genuinely never touches
+	// d.shims.quarantined at all; it just doesn't make this consequence-free.
 	wantQuarantined := map[string]bool{"quarantine-flavor-drop": true, "quarantine-flavor-launch": true}
 	if len(projection.QuarantinedSessions) != len(wantQuarantined) {
 		t.Fatalf("post-rollback quarantine set = %+v, want exactly %v", projection.QuarantinedSessions, wantQuarantined)
