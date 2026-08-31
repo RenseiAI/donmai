@@ -50,5 +50,16 @@ func processLooksLikeCodexOS(int, string) bool { return false }
 // existed, and nothing is ever deleted or signalled on the word of a
 // manifest whose provenance this platform cannot check.
 func readOwnedManifestBytes(string) ([]byte, error) {
-	return nil, errors.New("owner-manifest ownership verification is unimplemented on windows")
+	return nil, errWindowsOwnershipUnverifiable
 }
+
+// verifyOwnedDirectory has no ACL-based implementation on windows either, so
+// no directory is ever provenanced there and the sweep neither reads from
+// nor deletes inside any of them. Same fail-safe direction as above.
+func verifyOwnedDirectory(string) error { return errWindowsOwnershipUnverifiable }
+
+// verifyOwnedDirectoryNotWritableByOthers is likewise unimplemented, so
+// plugin-cache seeding is skipped on windows rather than done unverified.
+func verifyOwnedDirectoryNotWritableByOthers(string) error { return errWindowsOwnershipUnverifiable }
+
+var errWindowsOwnershipUnverifiable = errors.New("directory ownership verification is unimplemented on windows")

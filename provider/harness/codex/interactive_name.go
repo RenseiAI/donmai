@@ -196,7 +196,7 @@ func startNamedInteractiveAppServer(
 	// later orphan sweep (orphan_sweep.go) can identify and terminate it
 	// specifically if this process never gets to call close() itself — see
 	// donmaiOwnerManifest's doc comment for why identity, not bare PID.
-	writeDonmaiOwnerManifest(socketDir, sweepKindAppSocket)
+	writeDonmaiOwnerManifest(socketDir)
 	pinDonmaiChildIdentity(socketDir, cmd.Process.Pid)
 	stderrBuf := captureAppServerStderr(stderr)
 	waitCh := make(chan error, 1)

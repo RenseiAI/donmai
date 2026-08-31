@@ -122,11 +122,12 @@ func resolveCodexPluginCacheDir(explicit string) string {
 //
 // This is the ONLY thing this boundary ever shares across sessions: the
 // per-session config.toml, the linked auth.json, and every other file this
-// boundary manages stay exactly as isolated as before. Only the four
-// allowlisted cache/ entries (codexPluginCacheAllowedTopLevel) are ever
-// shared — they hold nothing session- or credential-specific: Codex's own
-// network-fetched, content/request-hash-keyed vendor discovery data,
-// identical regardless of which session fetched it.
+// boundary manages stay exactly as isolated as before. Only the allowlisted
+// cache/ entries (codexPluginCacheAllowedTopLevel) are ever shared — today
+// that is remote_plugin_catalog alone, Codex's own network-fetched,
+// content/request-hash-keyed vendor discovery document, identical regardless
+// of which session fetched it. See that var's doc comment for why the
+// per-app caches beside it are deliberately not on the list.
 //
 // Called at most once, right after successful construction, by a boundary's
 // owner (New's headless boundary, newInteractiveCodexConfigBoundary's
@@ -143,6 +144,21 @@ func (b *codexConfigBoundary) enablePluginCacheReuse(hostCacheDir string) {
 		return
 	}
 	b.pluginCacheDir = hostCacheDir
+	// Seeding is the mirror image of the sweep's harvest, and it needs the
+	// mirror-image proof. A host cache this process cannot prove it
+	// exclusively owns is exactly the poisoning primitive the sweep refuses
+	// on the way out: reuseCacheTree's never-overwrite rule makes whatever
+	// lands here permanent, and its payload drives a session's advertised
+	// tool surface. The default location sits under the per-user state dir,
+	// but resolveCodexPluginCacheDir falls back to a predictable name in a
+	// world-writable os.TempDir() when home resolution fails, and the env
+	// override can point anywhere at all — so the check is on the directory,
+	// not on how it was chosen.
+	if err := verifyOwnedDirectoryNotWritableByOthers(hostCacheDir); err != nil && !errors.Is(err, os.ErrNotExist) {
+		slog.Warn("codex: refusing to seed a session from a plugin cache this process cannot prove it exclusively owns",
+			"hostCacheDir", hostCacheDir, "err", err)
+		return
+	}
 	dst := filepath.Join(b.home, codexPluginCacheSubdir)
 	if err := reuseCacheTree(hostCacheDir, dst); err != nil {
 		slog.Debug("codex: plugin cache seed skipped", "hostCacheDir", hostCacheDir, "err", err)
@@ -170,11 +186,11 @@ func (b *codexConfigBoundary) harvestPluginCache() {
 // reuseCacheTree reproduces every allowlisted, regular file under src into
 // the corresponding relative path under dst.
 //
-//   - Only the four allowlisted top-level entries (codexPluginCacheAllowedTopLevel)
-//     are ever descended into; anything else directly under src — a future
-//     vendor cache this package has not been taught about, or anything
-//     unexpected — is skipped entirely, never read or reproduced. See that
-//     var's doc comment.
+//   - Only the allowlisted top-level entries (codexPluginCacheAllowedTopLevel)
+//     are ever descended into; anything else directly under src — a per-app
+//     cache, a future vendor cache this package has not been taught about,
+//     or anything unexpected — is skipped entirely, never read or
+//     reproduced. See that var's doc comment.
 //   - A destination entry that already exists at the same relative path is
 //     left untouched, never overwritten: cache entries are named by
 //     content/request hash, so the same relative path can only ever mean the

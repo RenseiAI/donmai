@@ -134,7 +134,7 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 	// long gone, can tell a live session apart from an orphan without
 	// guessing from directory age alone. Best-effort — see
 	// writeDonmaiOwnerManifest's doc comment.
-	writeDonmaiOwnerManifest(home, sweepKindCodexHome)
+	writeDonmaiOwnerManifest(home)
 	keep = true
 	return b, nil
 }

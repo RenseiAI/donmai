@@ -2,6 +2,8 @@ package codex
 
 import (
 	"context"
+	"fmt"
+	"io/fs"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -80,15 +82,6 @@ func ownedFixtureDir(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return dir
-}
-
-// ageEntry backdates path's mtime by age relative to asOf.
-func ageEntry(t *testing.T, path string, asOf time.Time, age time.Duration) {
-	t.Helper()
-	stamp := asOf.Add(-age)
-	if err := os.Chtimes(path, stamp, stamp); err != nil {
-		t.Fatalf("chtimes %s: %v", path, err)
-	}
 }
 
 // spawnSweepFixtureProcess starts a short-lived real child process (`sleep`,
@@ -267,7 +260,7 @@ func TestSweepOrphans_ReclaimsOldEntryWithNoManifest(t *testing.T) {
 		t.Fatal(err)
 	}
 	now := time.Now()
-	ageEntry(t, home, now, 2*time.Hour)
+	ageTree(t, home, now, 2*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, UnverifiedMinAge: time.Hour})
 	if report.Reclaimed != 1 {
@@ -302,7 +295,7 @@ func TestSweepOrphans_ManifestLessLiveSessionSurvives(t *testing.T) {
 	// Well past MinAge (an hour), nowhere near the default 24h
 	// UnverifiedMinAge — exactly the gap a live session's own idle mtime can
 	// sit in.
-	ageEntry(t, home, now, 2*time.Hour)
+	ageTree(t, home, now, 2*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
 	if report.Reclaimed != 0 {
@@ -346,7 +339,7 @@ func TestSweepOrphans_ForeignlyWritableDirectoryIsTreatedAsUnverified(t *testing
 	if err := os.Chmod(dir, 0o707); err != nil { //nolint:gosec // G302: the test deliberately makes this world-writable to exercise the ownership-rejection path.
 		t.Fatal(err)
 	}
-	ageEntry(t, dir, time.Now(), 2*time.Hour) // past MinAge, nowhere near UnverifiedMinAge.
+	ageTree(t, dir, time.Now(), 2*time.Hour) // past MinAge, nowhere near UnverifiedMinAge.
 
 	report := SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, BinaryHint: "sleep",
@@ -374,11 +367,11 @@ func TestSweepOrphans_NeverTouchesADirectoryWhoseOwnerIsStillAlive(t *testing.T)
 	if err := os.Mkdir(home, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	writeDonmaiOwnerManifest(home, sweepKindCodexHome) // records THIS test process's own identity.
+	writeDonmaiOwnerManifest(home) // records THIS test process's own identity.
 	// Backdate mtime AFTER writing the manifest: writing the manifest file
 	// itself touches the directory's mtime, exactly as it would in
 	// production (the manifest is written once, right at creation).
-	ageEntry(t, home, time.Now(), 24*time.Hour)
+	ageTree(t, home, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
 	if report.SkippedLive != 1 || report.Reclaimed != 0 {
@@ -401,7 +394,7 @@ func TestSweepOrphans_ReclaimsDirectoryWhoseOwnerIsGone(t *testing.T) {
 		t.Fatal(err)
 	}
 	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
-	ageEntry(t, home, time.Now(), 24*time.Hour)
+	ageTree(t, home, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
 	if report.Reclaimed != 1 {
@@ -440,7 +433,7 @@ func TestSweepOrphans_TerminatesAndReclaimsWhenIdentityAndBinaryMatch(t *testing
 		ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
 		StartedAt:     time.Now(),
 	})
-	ageEntry(t, dir, time.Now(), 24*time.Hour)
+	ageTree(t, dir, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, BinaryHint: "sleep",
@@ -485,7 +478,7 @@ func TestSweepOrphans_NeverTerminatesOnPIDReuseEvenWhenBinaryNameMatches(t *test
 		ChildIdentity: stale,
 		StartedAt:     time.Now(),
 	})
-	ageEntry(t, dir, time.Now(), 25*time.Hour) // past even the production UnverifiedMinAge default.
+	ageTree(t, dir, time.Now(), 25*time.Hour) // past even the production UnverifiedMinAge default.
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root})
 	if report.Terminated != 0 {
@@ -514,7 +507,7 @@ func TestSweepOrphans_SkipsAmbiguousPIDReuseWithoutTouchingProcessOrDirectory(t 
 		ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
 		StartedAt:     time.Now(),
 	})
-	ageEntry(t, dir, time.Now(), 24*time.Hour)
+	ageTree(t, dir, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, BinaryHint: "definitely-not-this-process",
@@ -531,22 +524,27 @@ func TestSweepOrphans_SkipsAmbiguousPIDReuseWithoutTouchingProcessOrDirectory(t 
 }
 
 // TestSweepOrphans_BoundsWorkPerCall pins the bounded-work requirement: with
-// MaxEntries set below the number of donmai-named orphans present, the
-// sweep must stop early rather than examine every one of them.
+// MaxEntries set below the number of reclaimable orphans present, the sweep
+// must stop early rather than act on every one of them. The bound is on
+// entries ACTED on — see MaxEntries for why counting entries merely resolved
+// made this ceiling protect nothing on a real host.
 func TestSweepOrphans_BoundsWorkPerCall(t *testing.T) {
 	root := t.TempDir()
 	now := time.Now()
-	for i := 0; i < 5; i++ {
+	for i := range 5 {
 		home := filepath.Join(root, codexHomePrefix+string(rune('a'+i)))
 		if err := os.Mkdir(home, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		ageEntry(t, home, now, 2*time.Hour)
+		ageTree(t, home, now, 48*time.Hour)
 	}
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, MaxEntries: 2})
-	if report.Scanned > 2 {
-		t.Fatalf("Scanned = %d, want <= MaxEntries (2)", report.Scanned)
+	if report.Acted > 2 {
+		t.Fatalf("Acted = %d, want <= MaxEntries (2) (report %+v)", report.Acted, report)
+	}
+	if report.Reclaimed > 2 {
+		t.Fatalf("Reclaimed = %d past a MaxEntries of 2 (report %+v)", report.Reclaimed, report)
 	}
 }
 
@@ -562,7 +560,7 @@ func TestSweepOrphans_StopsOnContextCancellation(t *testing.T) {
 		if err := os.Mkdir(home, 0o700); err != nil {
 			t.Fatal(err)
 		}
-		ageEntry(t, home, now, 2*time.Hour)
+		ageTree(t, home, now, 2*time.Hour)
 	}
 	ctx, cancel := context.WithCancel(context.Background())
 	cancel()
@@ -619,7 +617,7 @@ func TestReadVerifiedDonmaiOwnerManifest_RefusesAWorldWritableManifestFile(t *te
 // disturb the owner identity recorded at directory-creation time.
 func TestPinDonmaiChildIdentity_PreservesOwnerIdentity(t *testing.T) {
 	dir := t.TempDir()
-	writeDonmaiOwnerManifest(dir, "codex-home")
+	writeDonmaiOwnerManifest(dir)
 	before, ok := readDonmaiOwnerManifestUnchecked(dir)
 	if !ok {
 		t.Fatal("expected a manifest immediately after writeDonmaiOwnerManifest")
@@ -680,11 +678,17 @@ func TestSweepOrphans_PreservesResumableSessionStateWhileReclaimingScratch(t *te
 		t.Fatal(err)
 	}
 	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
-	ageEntry(t, home, time.Now(), 24*time.Hour)
+	ageTree(t, home, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
-	if report.PartiallyReclaimed != 1 || report.Reclaimed != 0 {
-		t.Fatalf("report = %+v, want PartiallyReclaimed=1 Reclaimed=0", report)
+	// Nothing here is deletable at all: session state is present, so only
+	// cache/ would be, and this home never had one. That is an inert
+	// directory, not a partial reclaim, and it costs no budget.
+	if report.Reclaimed != 0 || report.SkippedIrreducible != 1 {
+		t.Fatalf("report = %+v, want Reclaimed=0 SkippedIrreducible=1", report)
+	}
+	if report.Acted != 0 {
+		t.Fatalf("report = %+v, want Acted=0 — a directory with nothing to delete must not consume the scan budget", report)
 	}
 	body, err := os.ReadFile(rolloutPath)
 	if err != nil {
@@ -714,7 +718,7 @@ func TestSweepOrphans_FullyReclaimsWhenSessionsDirIsEmptyOrAbsent(t *testing.T) 
 		t.Fatal(err)
 	}
 	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
-	ageEntry(t, home, time.Now(), 24*time.Hour)
+	ageTree(t, home, time.Now(), 24*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
 	if report.Reclaimed != 1 || report.PartiallyReclaimed != 0 {
@@ -760,7 +764,7 @@ func TestSweepOrphans_NeverHarvestsFromADirectoryItDoesNotOwn(t *testing.T) {
 	if err := os.Chmod(foreign, 0o777); err != nil { //nolint:gosec // G302: the test deliberately makes this world-writable to exercise the ownership-rejection path.
 		t.Fatal(err)
 	}
-	ageEntry(t, foreign, time.Now(), 48*time.Hour) // past every floor the sweep has.
+	ageTree(t, foreign, time.Now(), 48*time.Hour) // past every floor the sweep has.
 
 	SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, UnverifiedMinAge: time.Hour, PluginCacheDir: hostCache,
@@ -812,7 +816,7 @@ func TestSweepOrphans_PreservesRestartAdoptionKeysAlongsideSessionState(t *testi
 	// one thing this directory should lose.
 	writeCacheFixture(t, home, filepath.Join(codexPluginCacheSubdir, "remote_plugin_catalog", "abc123.json"), "warm")
 	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
-	ageEntry(t, home, time.Now(), 48*time.Hour)
+	ageTree(t, home, time.Now(), 48*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, UnverifiedMinAge: time.Hour, PluginCacheDir: t.TempDir(),
@@ -871,7 +875,7 @@ func TestSweepOrphans_NeverDeletesStateNoManifestDeclares(t *testing.T) {
 		t.Fatal(err)
 	}
 	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
-	ageEntry(t, home, time.Now(), 48*time.Hour)
+	ageTree(t, home, time.Now(), 48*time.Hour)
 
 	report := SweepOrphans(context.Background(), SweepOptions{
 		Root: root, MinAge: time.Hour, UnverifiedMinAge: time.Hour, PluginCacheDir: t.TempDir(),
@@ -892,37 +896,35 @@ func TestSweepOrphans_NeverDeletesStateNoManifestDeclares(t *testing.T) {
 	}
 }
 
-// TestSweepOrphans_ManifestLessSessionNeverLosesItsConfig pins the raised
-// floor for the shape every pre-upgrade session has and every failed
-// best-effort manifest write produces: with no manifest there is nothing
-// declaring ANY of this directory's contents deletable, so a manifest-less
-// home keeps its config.toml and auth link no matter how old it looks —
-// including a LIVE session whose top-level mtime stopped moving the moment
-// its writes went into subdirectories.
-func TestSweepOrphans_ManifestLessSessionNeverLosesItsConfig(t *testing.T) {
+// TestSweepOrphans_ManifestLessIdleHomeLosesOnlyReconstructibleEntries
+// states the trade this sweep makes, so it is a decision on the record
+// rather than an emergent behaviour.
+//
+// An earlier revision refused to delete anything at all from a manifest-less
+// home. That is safe and it is also inert: on a host that has been running
+// codex sessions, essentially every leftover home predates the manifest, so
+// the sweep did nothing for the population it exists to clean up.
+//
+// What is deleted here — config.toml, the auth link, cache/ — is the exact
+// set this package writes, and every member is reconstructible: config.toml
+// is regenerated at boundary construction, auth.json is a hard link whose
+// removal leaves the host credential untouched, cache/ is re-fetchable. The
+// irreplaceable state is never in the set, so the worst case for a home
+// misjudged idle is a session that must be restarted, never one whose
+// history is gone. That is what makes an idle-age floor an acceptable stand
+// in for the liveness proof a manifest would have given.
+func TestSweepOrphans_ManifestLessIdleHomeLosesOnlyReconstructibleEntries(t *testing.T) {
+	requireManifestVerification(t)
 	root := t.TempDir()
-	home := filepath.Join(root, codexHomePrefix+"manifest-less-live")
-	if err := os.Mkdir(home, 0o700); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if err := os.WriteFile(filepath.Join(home, codexAuthFileName), []byte(`{"tokens":{}}`), 0o600); err != nil {
-		t.Fatal(err)
-	}
-	ageEntry(t, home, time.Now(), 30*24*time.Hour) // a month old by mtime, and still live.
+	home := legacyHome(t, root, "idle-legacy", 30*24*time.Hour)
 
-	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour})
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, PluginCacheDir: t.TempDir()})
 
-	if report.Reclaimed != 0 {
-		t.Fatalf("report = %+v, want Reclaimed=0", report)
+	if report.Reclaimed != 1 {
+		t.Fatalf("report = %+v, want Reclaimed=1", report)
 	}
-	if _, err := os.Stat(filepath.Join(home, codexConfigFileName)); err != nil {
-		t.Fatalf("a manifest-less session lost its config.toml: %v", err)
-	}
-	if _, err := os.Stat(filepath.Join(home, codexAuthFileName)); err != nil {
-		t.Fatalf("a manifest-less session lost its auth link: %v", err)
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatalf("an idle manifest-less home survived: err=%v", err)
 	}
 }
 
@@ -957,7 +959,7 @@ func TestSweepOrphans_BoundsTotalWallClockNotJustEntryCount(t *testing.T) {
 			ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
 			StartedAt:     time.Now(),
 		})
-		ageEntry(t, dir, time.Now(), 48*time.Hour)
+		ageTree(t, dir, time.Now(), 48*time.Hour)
 	}
 
 	start := time.Now()
@@ -1001,7 +1003,7 @@ func TestSweepOrphans_TerminationWaitHonoursTheWallClockBudget(t *testing.T) {
 		ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
 		StartedAt:     time.Now(),
 	})
-	ageEntry(t, dir, time.Now(), 48*time.Hour)
+	ageTree(t, dir, time.Now(), 48*time.Hour)
 
 	start := time.Now()
 	report := SweepOrphans(context.Background(), SweepOptions{
@@ -1021,5 +1023,244 @@ func TestSweepOrphans_TerminationWaitHonoursTheWallClockBudget(t *testing.T) {
 	}
 	if _, err := os.Stat(dir); err != nil {
 		t.Fatalf("the directory of an unconfirmed termination was reclaimed: %v", err)
+	}
+}
+
+// --- Review-round-3 probes: the sweep must not be starved by, and must have
+// --- a path to reclaim, the manifest-less legacy homes that are ~all of the
+// --- real population on a host that has been running codex sessions.
+
+// legacyHome creates the shape a session from a build predating the owner
+// manifest leaves behind: donmai-named, exclusively ours, holding the config
+// and auth link this package writes at construction, and no manifest.
+func legacyHome(t *testing.T, root, name string, age time.Duration) string {
+	t.Helper()
+	home := filepath.Join(root, codexHomePrefix+name)
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexAuthFileName), []byte(`{"tokens":{}}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, home, time.Now(), age)
+	return home
+}
+
+// ageTree backdates path and everything under it. Backdating only the
+// top-level directory is not enough once the sweep looks at the whole tree
+// for signs of recent activity.
+func ageTree(t *testing.T, path string, asOf time.Time, age time.Duration) {
+	t.Helper()
+	stamp := asOf.Add(-age)
+	if err := filepath.WalkDir(path, func(p string, _ fs.DirEntry, err error) error {
+		if err != nil {
+			return err
+		}
+		return os.Chtimes(p, stamp, stamp) //nolint:gosec // G122: p is inside a t.TempDir() tree this test just built itself; there is no other writer to race with.
+	}); err != nil {
+		t.Fatalf("backdate tree %s: %v", path, err)
+	}
+	// The directory's own mtime moves again as children are stamped, so it
+	// has to go last.
+	if err := os.Chtimes(path, stamp, stamp); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// TestSweepOrphans_UnreclaimableEntriesDoNotStarveTheScanBudget pins the
+// budget property that matters on a real host rather than in a fixture.
+//
+// os.ReadDir returns entries sorted by name and MaxEntries caps how many the
+// sweep will look at, so an entry the sweep can never change still consumed a
+// slot — permanently, and always the same lexically-first ones. A host with
+// thousands of manifest-less legacy homes therefore spent its entire budget,
+// on every daemon start forever, on directories nothing would ever come of,
+// and never reached the reclaimable orphan behind them. The population that
+// motivates this sweep is exactly the population that starved it.
+func TestSweepOrphans_UnreclaimableEntriesDoNotStarveTheScanBudget(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	// Well past the default MaxEntries of 500, and named to sort first.
+	for i := range 600 {
+		home := filepath.Join(root, codexHomePrefix+"aaa"+fmt.Sprintf("%04d", i))
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		// Non-empty and carrying state the sweep may never delete, so it can
+		// never be reduced further: a permanent no-op.
+		if err := os.WriteFile(filepath.Join(home, "state_5.sqlite"), []byte("x"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		ageTree(t, home, time.Now(), 48*time.Hour)
+	}
+	// One genuinely reclaimable orphan, sorting last.
+	orphan := filepath.Join(root, codexHomePrefix+"zzz-reclaimable")
+	if err := os.Mkdir(orphan, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(orphan, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+	ageTree(t, orphan, time.Now(), 48*time.Hour)
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("the one reclaimable orphan was never reached (report %+v): err=%v — permanently unreclaimable entries monopolised the scan budget", report, err)
+	}
+}
+
+// TestSweepOrphans_ReclaimsALegacyManifestLessHome pins the other half: a
+// manifest-less home must have SOME path to being reclaimed, or the sweep
+// does nothing at all for ~all of the real population on a host that has
+// been running codex sessions since before the manifest existed.
+//
+// What licenses deleting anything here is provenance, not the manifest: the
+// directory carries a name only this package creates and is exclusively
+// owned by this uid at 0700, so donmai created it and nothing else could
+// have written into it. The manifest answers a different question — who owns
+// it NOW — and its absence is what the much larger idle-age floor stands in
+// for. Only the entries this package itself writes are removed, all of them
+// reconstructible; anything else is preserved exactly as before.
+func TestSweepOrphans_ReclaimsALegacyManifestLessHome(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := legacyHome(t, root, "legacy", 48*time.Hour)
+	writeCacheFixture(t, home, filepath.Join(codexPluginCacheSubdir, "remote_plugin_catalog", "abc.json"), "warm")
+	ageTree(t, home, time.Now(), 48*time.Hour)
+	hostCache := t.TempDir()
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: hostCache})
+
+	if report.Reclaimed != 1 {
+		t.Fatalf("report = %+v, want Reclaimed=1 — a manifest-less legacy home has no path to reclamation at all", report)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatalf("legacy home survived: err=%v", err)
+	}
+	// The cache it had already paid for is still harvested: this directory is
+	// provably ours, so reading from it is exactly what B1 permits.
+	if _, err := os.Stat(filepath.Join(hostCache, "remote_plugin_catalog", "abc.json")); err != nil {
+		t.Fatalf("a provenanced legacy home's cache was not harvested: %v", err)
+	}
+}
+
+// TestSweepOrphans_LegacyHomeKeepsUndeclaredStateAndResumeKeys pins that
+// widening reclamation to manifest-less homes does NOT widen what may be
+// deleted. The derived set is still only what this package writes, and a
+// home holding session state still keeps its resume keys.
+func TestSweepOrphans_LegacyHomeKeepsUndeclaredStateAndResumeKeys(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := legacyHome(t, root, "legacy-stateful", 48*time.Hour)
+	rollout := filepath.Join(home, codexSessionStateSubdir, "2026", "08", "31", "rollout-thread.jsonl")
+	if err := os.MkdirAll(filepath.Dir(rollout), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rollout, []byte(`{"type":"session_meta"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	sqlite := filepath.Join(home, "memories_1.sqlite")
+	if err := os.WriteFile(sqlite, []byte("user memories"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, home, time.Now(), 48*time.Hour)
+
+	SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	for _, keep := range []string{rollout, sqlite, filepath.Join(home, codexConfigFileName), filepath.Join(home, codexAuthFileName)} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("widening reclamation to manifest-less homes deleted %s: %v", filepath.Base(keep), err)
+		}
+	}
+}
+
+// TestSweepOrphans_ManifestLessLiveSessionIsProtectedByDeepActivity replaces
+// a blanket "never touch a manifest-less home" rule with the signal that
+// rule was standing in for. A live session's TOP-LEVEL CODEX_HOME mtime
+// stops moving minutes in, because its writes land in subdirectories — which
+// is precisely why top-level mtime cannot be the liveness proxy. The sweep
+// looks at the whole tree instead, so a home whose top level looks a month
+// stale but which wrote a rollout entry seconds ago is left completely
+// alone.
+func TestSweepOrphans_ManifestLessLiveSessionIsProtectedByDeepActivity(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := legacyHome(t, root, "live-no-manifest", 30*24*time.Hour)
+	// A turn taken just now, the way a live session writes.
+	rollout := filepath.Join(home, codexSessionStateSubdir, "2026", "08", "31", "rollout-thread.jsonl")
+	if err := os.MkdirAll(filepath.Dir(rollout), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(rollout, []byte(`{"type":"turn"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// Top level backdated a month; the fresh write inside is left alone.
+	stale := time.Now().Add(-30 * 24 * time.Hour)
+	if err := os.Chtimes(home, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing reclaimed — a live session was judged by its top-level mtime alone", report)
+	}
+	for _, keep := range []string{rollout, filepath.Join(home, codexConfigFileName), filepath.Join(home, codexAuthFileName)} {
+		if _, err := os.Stat(keep); err != nil {
+			t.Fatalf("a live manifest-less session lost %s: %v", filepath.Base(keep), err)
+		}
+	}
+}
+
+// TestReadVerifiedDonmaiOwnerManifest_RefusesASymlinkedManifest is the
+// discriminating test for the fd-pinned read. Verifying a directory by
+// os.Lstat and then opening the manifest by NAME is two independent
+// resolutions, and a symlink sitting at the manifest's name is the simplest
+// thing that makes the second resolve somewhere the first never vetted.
+//
+// The fixture is decisive in both directions: the symlink points at a real,
+// well-formed, correctly-owned manifest naming a LIVE owner. A path-based
+// read follows it, believes the directory is in use, and reports
+// SkippedLive. The fd-pinned read refuses to follow it, finds no manifest at
+// all, and reclaims the idle directory instead. The two implementations
+// cannot both pass.
+//
+// RED proof: in readOwnedManifestBytes, replace the openat sequence with
+// `os.ReadFile(filepath.Join(dir, donmaiOwnerManifestName))` after an
+// os.Lstat ownership check, and this test fails — the sweep reads a manifest
+// from outside the directory it vetted.
+func TestReadVerifiedDonmaiOwnerManifest_RefusesASymlinkedManifest(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+
+	// A real, correctly-owned manifest naming this live test process, kept
+	// outside the artifact directory.
+	elsewhere := ownedFixtureDir(t)
+	writeDonmaiOwnerManifest(elsewhere)
+	planted := filepath.Join(elsewhere, donmaiOwnerManifestName)
+	if _, err := os.Stat(planted); err != nil {
+		t.Fatal(err)
+	}
+
+	home := filepath.Join(root, codexHomePrefix+"symlinked-manifest")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(planted, filepath.Join(home, donmaiOwnerManifestName)); err != nil {
+		t.Fatal(err)
+	}
+	ageTree(t, home, time.Now(), 48*time.Hour)
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.SkippedLive != 0 {
+		t.Fatalf("report = %+v, want SkippedLive=0 — the sweep read a manifest through a symlink, from outside the directory whose ownership it verified", report)
+	}
+	// The symlink target is somebody else's file: removing the link must
+	// never reach through it.
+	if _, err := os.Stat(planted); err != nil {
+		t.Fatalf("the symlink target was followed and removed: %v", err)
 	}
 }

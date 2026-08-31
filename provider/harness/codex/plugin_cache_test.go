@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"runtime"
 	"strconv"
 	"strings"
 	"testing"
@@ -417,5 +418,37 @@ func TestResolveCodexPluginCacheDir_PrefersExplicitThenEnvThenDefault(t *testing
 	t.Setenv(codexPluginCacheDirEnv, "/env/wins")
 	if got, want := resolveCodexPluginCacheDir(""), "/env/wins"; got != want {
 		t.Fatalf("resolveCodexPluginCacheDir(env) = %q, want %q", got, want)
+	}
+}
+
+// TestEnablePluginCacheReuse_RefusesAHostCacheOthersCanWrite pins the seed
+// side of the same rule the sweep enforces on the harvest side: read nothing
+// from a cache this process cannot prove only it can write.
+//
+// Seeding is where a poisoned catalog would actually reach a session, and
+// the never-overwrite rule would make it permanent. The default host cache
+// lives under the per-user state dir, but resolveCodexPluginCacheDir falls
+// back to a predictable name in a world-writable os.TempDir() when home
+// resolution fails, and the env override can point anywhere — so the check
+// is on the directory itself, not on how it was chosen.
+func TestEnablePluginCacheReuse_RefusesAHostCacheOthersCanWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: directory ownership verification is unix-only")
+	}
+	hostCache := t.TempDir()
+	writeCacheFixture(t, hostCache, filepath.Join("remote_plugin_catalog", "abc123.json"), "attacker-supplied")
+	if err := os.Chmod(hostCache, 0o777); err != nil { //nolint:gosec // G302: the test deliberately makes this world-writable to exercise the rejection path.
+		t.Fatal(err)
+	}
+
+	b, err := newCodexConfigBoundary(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("boundary: %v", err)
+	}
+	t.Cleanup(func() { _ = b.remove() })
+	b.enablePluginCacheReuse(hostCache)
+
+	if _, err := os.Lstat(filepath.Join(b.home, codexPluginCacheSubdir, "remote_plugin_catalog", "abc123.json")); !os.IsNotExist(err) {
+		t.Fatalf("a session was seeded from a world-writable host cache: err=%v", err)
 	}
 }
