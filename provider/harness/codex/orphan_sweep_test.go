@@ -114,9 +114,9 @@ func spawnSweepFixtureProcess(t *testing.T) *exec.Cmd {
 // This test process is the fixture's real OS parent — nothing else will
 // ever reap it — and a signalled-but-unreaped zombie still answers both a
 // bare signal-0 probe and sessionshim's identity check as "alive". Without
-// this, SweepOrphans's own post-signal liveness re-probes (see terminate's
-// F8 fix) could never observe death within any grace window, since nothing
-// would be collecting the exit while the sweep polls.
+// this, SweepOrphans's own post-signal liveness re-probes (see terminate)
+// could never observe death within any grace window, since nothing would be
+// collecting the exit while the sweep polls.
 func reapEagerlyAndOnce(cmd *exec.Cmd) {
 	go func() { _ = cmd.Wait() }()
 }
@@ -253,11 +253,13 @@ func TestSweepOrphans_SkipsYoungEntriesRegardlessOfManifest(t *testing.T) {
 }
 
 // TestSweepOrphans_ReclaimsOldEntryWithNoManifest pins the fallback path:
-// a donmai-named directory with no manifest at all (a pre-upgrade leftover,
-// or a failed manifest write) is reclaimed once it clears the SEPARATE,
-// larger UnverifiedMinAge floor — never MinAge alone (see F3/
+// a donmai-named EMPTY directory with no manifest at all (a pre-upgrade
+// leftover, or a failed manifest write) is reclaimed once it clears the
+// SEPARATE, larger UnverifiedMinAge floor — never MinAge alone (see
 // UnverifiedMinAge's doc comment: a live session's own mtime is not a safe
-// signal once writes have moved into subdirectories).
+// signal once writes have moved into subdirectories). An empty directory is
+// the one thing the sweep may remove without a manifest declaring anything
+// deletable, because there is nothing inside it to lose.
 func TestSweepOrphans_ReclaimsOldEntryWithNoManifest(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, codexHomePrefix+"noage")
@@ -276,21 +278,20 @@ func TestSweepOrphans_ReclaimsOldEntryWithNoManifest(t *testing.T) {
 	}
 }
 
-// TestSweepOrphans_ManifestLessLiveSessionSurvives is the reviewer's F3
-// probe: a donmai-named directory with NO manifest — exactly what a
-// pre-upgrade rollout's still-running session, or a failed best-effort
-// manifest write, looks like — must survive a sweep whose UnverifiedMinAge
-// it has not yet cleared, even though it is well past the ordinary MinAge.
-// A live session's top-level CODEX_HOME mtime stops moving minutes in
-// (writes land in subdirectories), so MinAge alone proves nothing about
-// whether this is still in active use.
+// TestSweepOrphans_ManifestLessLiveSessionSurvives pins the age floor for a
+// donmai-named directory with NO manifest — exactly what a pre-upgrade
+// rollout's still-running session, or a failed best-effort manifest write,
+// looks like. It must survive a sweep whose UnverifiedMinAge it has not yet
+// cleared, even though it is well past the ordinary MinAge. A live session's
+// top-level CODEX_HOME mtime stops moving minutes in (writes land in
+// subdirectories), so MinAge alone proves nothing about whether this is
+// still in active use.
 //
-// RED proof: in sweepOne, replace the `opts.reclaimUnverified(path, kind, info, report)`
-// call for the no-manifest branch with an unconditional `opts.reclaim(path, kind, report)`
-// and this test fails — the manifest-less directory (standing in for a live
-// session) is deleted out from under it. Verified: FAILED ("manifest-less
-// entry was reclaimed while still within its unverified grace window"), then
-// PASSED again after restoring — see the completion report.
+// RED proof: in sweepOne, drop the `age < opts.UnverifiedMinAge` guard on
+// the undeclared branch so it falls straight through to
+// `opts.reclaim(path, kind, false, report)`, and this test fails — the
+// manifest-less directory (standing in for a live session) is reclaimed
+// inside its grace window.
 func TestSweepOrphans_ManifestLessLiveSessionSurvives(t *testing.T) {
 	root := t.TempDir()
 	home := filepath.Join(root, codexHomePrefix+"live-no-manifest")
@@ -312,24 +313,20 @@ func TestSweepOrphans_ManifestLessLiveSessionSurvives(t *testing.T) {
 	}
 }
 
-// TestSweepOrphans_ForeignlyWritableDirectoryIsTreatedAsUnverified is the
-// reviewer's F2 probe: a directory this process does not exclusively own —
-// here, made group/other-writable, the same half of
-// verifyManifestDirectoryOwnershipOS a cross-uid attacker would also fail,
-// and the only half a single-user CI runner can exercise without a second
-// real system account — must have its manifest ignored entirely, exactly
-// like a directory with no manifest. A world-writable os.TempDir() (ordinary
-// unix /tmp) makes an unverified manifest an unprivileged local kill
-// primitive otherwise: any user could plant one naming a PID they want
-// signalled.
+// TestSweepOrphans_ForeignlyWritableDirectoryIsTreatedAsUnverified pins the
+// ownership proof: a directory this process does not exclusively own — here,
+// made group/other-writable, the same half of verifyOwnedDescriptor a
+// cross-uid attacker would also fail, and the only half a single-account CI
+// runner can exercise without a second real system user — must have its
+// manifest ignored entirely, exactly like a directory with no manifest. A
+// world-writable os.TempDir() (ordinary unix /tmp) makes an unverified
+// manifest an unprivileged local kill primitive otherwise: any user could
+// plant one naming a PID they want signalled.
 //
-// RED proof: in readDonmaiOwnerManifest, delete the
-// `if err := verifyManifestDirectoryOwnership(info); err != nil { ... return donmaiOwnerManifest{}, false }`
-// guard (falling through to trust readDonmaiOwnerManifestUnchecked
-// unconditionally) and this test fails — the foreign-writable manifest is
-// trusted, and a live child recorded in it gets terminated. Verified: FAILED
-// (process was killed / directory removed), then PASSED again after
-// restoring — see the completion report.
+// RED proof: in readVerifiedDonmaiOwnerManifest, swap readOwnedManifestBytes
+// for a plain os.ReadFile of dir/donmaiOwnerManifestName, and this test
+// fails — the foreign-writable manifest is trusted, and the live child
+// recorded in it gets terminated.
 func TestSweepOrphans_ForeignlyWritableDirectoryIsTreatedAsUnverified(t *testing.T) {
 	requireManifestVerification(t)
 	root := t.TempDir()
@@ -455,17 +452,17 @@ func TestSweepOrphans_TerminatesAndReclaimsWhenIdentityAndBinaryMatch(t *testing
 	if _, err := os.Stat(dir); !os.IsNotExist(err) {
 		t.Fatalf("socket directory survived the sweep: err=%v", err)
 	}
-	// terminate() itself only ever reports Terminated++ after re-probing
-	// liveness post-signal (the F8 fix) — reapEagerlyAndOnce (in
-	// spawnSweepFixtureProcess) is what makes that re-probe able to observe
-	// a genuine exit at all, rather than a signalled-but-unreaped zombie.
+	// terminate() only ever reports Terminated++ after re-probing liveness
+	// post-signal — reapEagerlyAndOnce (in spawnSweepFixtureProcess) is what
+	// makes that re-probe able to observe a genuine exit at all, rather than
+	// a signalled-but-unreaped zombie.
 	if processAliveOS(child.Process.Pid) {
 		t.Fatal("child process was reported terminated but is still alive")
 	}
 }
 
-// TestSweepOrphans_NeverTerminatesOnPIDReuseEvenWhenBinaryNameMatches is the
-// reviewer's F1 counterexample, reproduced and proven fixed: a REAL,
+// TestSweepOrphans_NeverTerminatesOnPIDReuseEvenWhenBinaryNameMatches
+// reproduces the PID-reuse counterexample end to end: a REAL,
 // independently-running process is deliberately named "codex" (so the
 // binary-identity gate alone would have passed it), its manifest carries a
 // deliberately WRONG start time — exactly what a manifest written for an
@@ -975,5 +972,54 @@ func TestSweepOrphans_BoundsTotalWallClockNotJustEntryCount(t *testing.T) {
 	if elapsed > 3*time.Second {
 		t.Fatalf("sweep took %s for %d entries at a %s grace (report %+v) — total wall clock is bounded only by entry count, not by time",
 			elapsed, entries, grace, report)
+	}
+}
+
+// TestSweepOrphans_TerminationWaitHonoursTheWallClockBudget is the
+// discriminating half of the bound above, and it exists because the
+// many-entries test alone does NOT discriminate: checking the budget once
+// per entry already caps that one, so a sweep whose termination waits ignore
+// ctx entirely still passes it. The bound has to hold INSIDE a single
+// entry too.
+//
+// One entry, a production-sized 5s grace, and a 300ms budget: a sweep that
+// only checks its budget between entries blocks for the full 2 x grace = 10s
+// before it ever looks. The fixture is the same genuine un-reaped child as
+// above — signalled, then a zombie the identity check keeps calling alive —
+// so awaitDeath really cannot confirm death and really does run out its
+// window.
+func TestSweepOrphans_TerminationWaitHonoursTheWallClockBudget(t *testing.T) {
+	bin := buildSweepFixtureBinary(t, "codex")
+	root := t.TempDir()
+	dir := filepath.Join(root, codexAppSocketPrefix+"unreaped-single")
+	if err := os.Mkdir(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	child := startSweepFixtureBinary(t, bin, "60")
+	persistDonmaiOwnerManifest(dir, donmaiOwnerManifest{
+		OwnerPID:      fakeDeadPID(t),
+		ChildIdentity: mustProcessIdentity(t, child.Process.Pid),
+		StartedAt:     time.Now(),
+	})
+	ageEntry(t, dir, time.Now(), 48*time.Hour)
+
+	start := time.Now()
+	report := SweepOrphans(context.Background(), SweepOptions{
+		Root: root, MinAge: time.Hour, UnverifiedMinAge: time.Hour,
+		BinaryHint: "codex", TerminationGrace: 5 * time.Second, MaxDuration: 300 * time.Millisecond,
+	})
+	elapsed := time.Since(start)
+
+	if elapsed > 2*time.Second {
+		t.Fatalf("a single entry blocked the sweep for %s against a 300ms budget (report %+v) — the termination wait does not observe ctx",
+			elapsed, report)
+	}
+	// Nothing may be claimed on a budget stop: the process was signalled but
+	// never confirmed dead, so its directory has to stay.
+	if report.Terminated != 0 || report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing terminated or reclaimed when the budget stops an unconfirmed termination", report)
+	}
+	if _, err := os.Stat(dir); err != nil {
+		t.Fatalf("the directory of an unconfirmed termination was reclaimed: %v", err)
 	}
 }

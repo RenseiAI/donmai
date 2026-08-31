@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 )
@@ -26,9 +27,10 @@ func writeCacheFixture(t *testing.T, dir, rel, body string) string {
 // reproduced at the destination with the same content and no leftover temp
 // artifact — see copyFileAtomic's doc comment for why every copy goes
 // through a same-directory temp file + rename rather than a direct write or
-// a hard link (F6: a hard link would share ONE inode across every
+// a hard link: a hard link would share ONE inode across every
 // concurrently-live session, silently propagating any in-place rewrite
-// Codex might ever do; nothing in this package has verified Codex does not).
+// Codex might ever do, and nothing in this package has verified Codex does
+// not do one.
 func TestReuseCacheTree_CopiesExistingHostEntriesAtomically(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
@@ -54,8 +56,8 @@ func TestReuseCacheTree_CopiesExistingHostEntriesAtomically(t *testing.T) {
 	}
 }
 
-// TestReuseCacheTree_NeverLeavesATruncatedFileAtTheCanonicalName is the
-// reviewer's F4 probe: a copy that cannot complete (here, a destination
+// TestReuseCacheTree_NeverLeavesATruncatedFileAtTheCanonicalName pins the
+// atomicity of a copy: a copy that cannot complete (here, a destination
 // directory with no write permission — standing in for any interrupted-
 // write cause, crash included, since harvestPluginCache runs inside
 // remove() on exactly that exit path) must never leave anything at the
@@ -63,12 +65,10 @@ func TestReuseCacheTree_CopiesExistingHostEntriesAtomically(t *testing.T) {
 // doc comment) would otherwise make a truncated file there permanent for
 // every future session on the host.
 //
-// RED proof: in copyFileAtomic, replace the temp-file-then-rename sequence
+// RED proof: in copyReaderAtomic, replace the temp-file-then-rename sequence
 // with a direct `os.OpenFile(target, os.O_WRONLY|os.O_CREATE, mode.Perm())`
-// write and this test fails — a failed/interrupted copy can leave a partial
-// file sitting at the canonical name. Verified: FAILED ("canonical target
-// exists despite a failed copy"), then PASSED again after restoring — see
-// the completion report.
+// write and this test fails — a failed/interrupted copy leaves a partial
+// file sitting at the canonical name.
 func TestReuseCacheTree_NeverLeavesATruncatedFileAtTheCanonicalName(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
@@ -116,7 +116,7 @@ func (f *failingReaderAfter) Read(p []byte) (int, error) {
 }
 
 // TestCopyReaderAtomic_InterruptedReadNeverLeavesFileAtCanonicalName is the
-// reviewer's F4 probe in its most direct form: a read that fails partway
+// same property in its most direct form: a read that fails partway
 // through — exactly what a process dying mid-copy looks like from
 // io.Copy's point of view — must never leave anything at the file's own
 // canonical name, and must not leave an orphaned temp file behind either.
@@ -124,9 +124,7 @@ func (f *failingReaderAfter) Read(p []byte) (int, error) {
 // RED proof: in copyFileAtomic/copyReaderAtomic, replace the temp-file-then-
 // rename sequence with a direct `os.OpenFile(target, os.O_WRONLY|os.O_CREATE, mode.Perm())`
 // write straight to target and this test fails — the canonical name ends up
-// holding the partial bytes the reader delivered before failing. Verified:
-// FAILED ("canonical target exists despite an interrupted copy"), then
-// PASSED again after restoring — see the completion report.
+// holding the partial bytes the reader delivered before failing.
 func TestCopyReaderAtomic_InterruptedReadNeverLeavesFileAtCanonicalName(t *testing.T) {
 	dst := t.TempDir()
 	target := filepath.Join(dst, "abc123.json")
@@ -147,36 +145,98 @@ func TestCopyReaderAtomic_InterruptedReadNeverLeavesFileAtCanonicalName(t *testi
 	}
 }
 
-// TestReuseCacheTree_SkipsNonAllowlistedTopLevelEntries is the reviewer's F5
-// probe: only the four known cache/ top-level names are ever seeded or
-// harvested (codexPluginCacheAllowedTopLevel) — anything else is inert by
-// default, never shared, even though it lives in the same cache/
-// subdirectory this package otherwise trusts.
+// TestReuseCacheTree_SharesOnlyTheCatalogNotPerAppCaches pins the closed
+// allowlist (codexPluginCacheAllowedTopLevel), using the two shapes that
+// actually matter.
+//
+// The per-app names here are real entries a live codex-cli home carries, not
+// invented ones: they describe ONE app — its server info, its tool schemas —
+// including a private or self-hosted app. This cache is shared host-wide
+// across every session on the box, so reproducing them would persist one
+// session's private app surface where unrelated sessions are seeded from it.
+// A vendor cache this package has never heard of is inert for the same
+// reason: sharing it would be a guess about a Codex version nobody has
+// looked at.
 //
 // RED proof: in reuseCacheTree, delete the
 // `if !codexPluginCacheAllowedTopLevel[topLevel] { ... }` branch (walking
-// every top-level entry unconditionally) and this test fails — the
-// non-allowlisted entry is reproduced at the destination. Verified: FAILED
-// ("non-allowlisted top-level entry was reproduced"), then PASSED again
-// after restoring — see the completion report.
-func TestReuseCacheTree_SkipsNonAllowlistedTopLevelEntries(t *testing.T) {
+// every top-level entry unconditionally) and this test fails — the per-app
+// caches are reproduced at the destination.
+func TestReuseCacheTree_SharesOnlyTheCatalogNotPerAppCaches(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
-	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), "allowed")
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), "catalog-wide, host-invariant")
+	perApp := []string{"codex_app_directory", "codex_apps_server_info", "codex_apps_tools"}
+	for _, name := range perApp {
+		writeCacheFixture(t, src, filepath.Join(name, "private-app.json"), "one app's own surface")
+	}
 	writeCacheFixture(t, src, filepath.Join("some_future_vendor_cache", "new.json"), "not yet allowlisted")
 
 	if err := reuseCacheTree(src, dst); err != nil {
 		t.Fatalf("reuseCacheTree: %v", err)
 	}
 	if _, err := os.Stat(filepath.Join(dst, "remote_plugin_catalog", "abc123.json")); err != nil {
-		t.Fatalf("allowlisted entry was not reused: %v", err)
+		t.Fatalf("the catalog-wide entry was not reused: %v", err)
 	}
-	if _, err := os.Lstat(filepath.Join(dst, "some_future_vendor_cache")); !os.IsNotExist(err) {
-		t.Fatalf("non-allowlisted top-level entry was reproduced: err=%v", err)
+	for _, name := range append(perApp, "some_future_vendor_cache") {
+		if _, err := os.Lstat(filepath.Join(dst, name)); !os.IsNotExist(err) {
+			t.Fatalf("%s was reproduced into a host-wide cache shared across unrelated sessions: err=%v", name, err)
+		}
 	}
 }
 
-// TestReuseCacheTree_BoundsTotalBytesPerCall pins the reviewer's F7 fix: a
+// TestCopyReaderAtomic_IsNotBlockedByACrashLeftoverTempFile pins the
+// crash-recovery property of the temp naming. A pid-derived temp name is not
+// unique over time: the crash this mechanism exists to survive leaves one
+// behind, and the next process to draw that pid then collides with it on
+// every attempt — permanently, because the never-overwrite rule means
+// nothing ever cleans the canonical name up either. The fixture plants
+// exactly the name a pid-derived scheme would choose for this process.
+func TestCopyReaderAtomic_IsNotBlockedByACrashLeftoverTempFile(t *testing.T) {
+	dst := t.TempDir()
+	target := filepath.Join(dst, "abc123.json")
+	leftover := target + codexPluginCacheTempMarker + strconv.Itoa(os.Getpid())
+	if err := os.WriteFile(leftover, []byte("truncated bytes from a crashed copy"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	const body = `{"schema_version":1,"plugins":[]}`
+	if err := copyReaderAtomic(strings.NewReader(body), target, 0o600); err != nil {
+		t.Fatalf("a crash leftover made this cache entry permanently uncopyable: %v", err)
+	}
+	got, err := os.ReadFile(target)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(got) != body {
+		t.Fatalf("copied body = %q, want %q", got, body)
+	}
+}
+
+// TestReuseCacheTree_SkipsLeftoverTempFiles pins the other half: a temp file
+// a crashed copy left inside an ALLOWLISTED directory is litter, not a cache
+// entry. Reproducing it would carry it from one session's home into the
+// host-level cache and from there into every future session, where the
+// never-overwrite rule would keep it forever.
+func TestReuseCacheTree_SkipsLeftoverTempFiles(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), "a real entry")
+	litter := "abc123.json" + codexPluginCacheTempMarker + "1234567"
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", litter), "truncated bytes")
+
+	if err := reuseCacheTree(src, dst); err != nil {
+		t.Fatalf("reuseCacheTree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "remote_plugin_catalog", "abc123.json")); err != nil {
+		t.Fatalf("the real entry was not reused: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "remote_plugin_catalog", litter)); !os.IsNotExist(err) {
+		t.Fatalf("a crashed copy's leftover temp file was reproduced at the destination: err=%v", err)
+	}
+}
+
+// TestReuseCacheTree_BoundsTotalBytesPerCall pins the aggregate cap: a
 // per-file cap alone does not bound a directory holding many files, which
 // matters specifically because os.TempDir() is commonly tmpfs (RAM-backed)
 // on a typical Linux daemon host. Four files sit right at the per-file cap;
@@ -278,9 +338,7 @@ func TestReuseCacheTree_NeverOverwritesAnExistingDestinationEntry(t *testing.T) 
 // RED proof: comment out the `boundary.enablePluginCacheReuse(...)` call in
 // codex.go's New (or interactive.go's spawnInteractivePreparedForGOOS) and
 // this test fails — session two's home has no cache/ entry at all, because
-// nothing ever seeded it. Verified: FAILED ("second session home has no
-// seeded cache entry"), then PASSED again after restoring — see the
-// completion report for the exact quotes.
+// nothing ever seeded it.
 func TestPluginCacheReuse_SecondSessionDoesNotRefetch(t *testing.T) {
 	hostCache := t.TempDir()
 	sessionParent := t.TempDir()

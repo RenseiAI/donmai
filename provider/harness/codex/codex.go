@@ -137,10 +137,6 @@ type Options struct {
 	// always verify it.
 	verifyMCPReadback bool
 	configTempDir     string
-	// pluginCacheDir is a test seam overriding the host-level warm cache
-	// directory (see plugin_cache.go's resolveCodexPluginCacheDir).
-	// Production leaves it empty and gets the real per-host location.
-	pluginCacheDir string
 	// interactiveMCPInventoryRunner is a test seam for the pre-PTY effective
 	// config readback. Production executes the selected Codex binary's own
 	// `mcp list --json` semantics.
@@ -215,7 +211,7 @@ func New(opts Options) (*Provider, error) {
 	// bootstrap network fetch of the vendor plugin catalog is a cache hit
 	// after the first session on this host. Best-effort and non-fallible —
 	// it never returns an error, preserving the invariant below.
-	boundary.enablePluginCacheReuse(resolveCodexPluginCacheDir(opts.pluginCacheDir))
+	boundary.enablePluginCacheReuse(resolveCodexPluginCacheDir(""))
 	// No fallible step follows: the boundary is the last thing New allocates,
 	// and the app-server start that used to run here (and could leak it on a
 	// failed handshake) is now deferred to ensureHeadlessReady, whose failure

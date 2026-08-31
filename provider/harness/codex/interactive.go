@@ -121,7 +121,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// and plugin_cache.go) — the named bootstrap app-server started below
 	// and the PTY itself both run under this same CODEX_HOME, so this one
 	// call covers the cold-fetch cost for both.
-	config.enablePluginCacheReuse(resolveCodexPluginCacheDir(opts.pluginCacheDir))
+	config.enablePluginCacheReuse(resolveCodexPluginCacheDir(""))
 	if launch.env == nil {
 		launch.env = make(map[string]string)
 	}

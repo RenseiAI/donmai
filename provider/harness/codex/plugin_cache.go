@@ -8,7 +8,6 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
-	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
@@ -24,19 +23,32 @@ import (
 const codexPluginCacheSubdir = "cache"
 
 // codexPluginCacheAllowedTopLevel is the exact, closed set of cache/
-// top-level entries this package will ever seed or harvest — observed
-// directly against a real codex-cli home: a remote plugin/apps catalog and
-// three per-app siblings (directory listing, per-app server info, per-app
-// tool schemas). A new vendor cache entry Codex introduces later is inert
-// by default — never shared between sessions — until this list is
-// deliberately extended, rather than shared automatically the moment it
-// appears. Sharing everything under cache/ unconditionally would be an
-// observation about one Codex version, not a guarantee about any other.
+// top-level entries this package will ever seed or harvest. A new vendor
+// cache entry Codex introduces later is inert by default — never shared
+// between sessions — until this list is deliberately extended, rather than
+// shared automatically the moment it appears. Sharing everything under
+// cache/ unconditionally would be an observation about one Codex version,
+// not a guarantee about any other.
+//
+// It holds ONE entry on purpose. A real codex-cli home also carries three
+// per-app siblings (codex_app_directory, codex_apps_server_info,
+// codex_apps_tools), and an earlier revision of this file shared them too on
+// the grounds that nothing under cache/ is session- or credential-specific.
+// That was an assertion, not a demonstration, and the three are per-APP by
+// construction: an app's server info and its tool schemas describe that one
+// app, including a private or self-hosted one. This cache is shared
+// host-wide across every session on the box, so sharing them would persist
+// one session's private app surface where unrelated sessions are seeded from
+// it. remote_plugin_catalog is the entry that is actually catalog-wide —
+// the same vendor discovery document regardless of who fetched it.
+//
+// The cost of the narrower list is one extra cold fetch per app per session:
+// bounded, recoverable, and paid only by sessions that use apps. The cost of
+// being wrong the other way is a private app's tool surface leaking into a
+// session that never asked for it. Widening this list later needs evidence
+// that a given entry is genuinely host-invariant — not a redesign.
 var codexPluginCacheAllowedTopLevel = map[string]bool{
-	"remote_plugin_catalog":  true,
-	"codex_app_directory":    true,
-	"codex_apps_server_info": true,
-	"codex_apps_tools":       true,
+	"remote_plugin_catalog": true,
 }
 
 const (
@@ -58,6 +70,13 @@ const (
 	codexPluginCacheMaxEntries = 4096
 )
 
+// codexPluginCacheTempMarker is the infix every in-flight copy's temp file
+// carries (see copyReaderAtomic). reuseCacheTree refuses to reproduce a file
+// whose name contains it: a temp left behind by a crashed copy is not a
+// cache entry, and copying it onward would spread litter from one session's
+// home into the host cache and from there into every future session.
+const codexPluginCacheTempMarker = ".donmai-tmp-"
+
 // codexPluginCacheDirEnv is a test/operator override for the host-level warm
 // cache location; production leaves it unset and gets the real per-host
 // state-dir path.
@@ -76,9 +95,14 @@ func codexPluginCacheDisabled() bool {
 // resolveCodexPluginCacheDir returns the host-level directory donmai uses to
 // persist Codex's own warm, host-invariant network caches ACROSS the
 // otherwise-fresh-per-session CODEX_HOME boundary (see enablePluginCacheReuse).
-// explicit is Options.pluginCacheDir, a test seam; production leaves it empty
-// and this resolves to ~/.donmai/codex/plugin-cache (or the env override,
-// for an operator who wants it elsewhere without a code change).
+//
+// explicit is SweepOptions.PluginCacheDir, the one caller that genuinely
+// carries its own location; every session-spawn path passes "" and resolves
+// to ~/.donmai/codex/plugin-cache. codexPluginCacheDirEnv is the seam a test
+// or an operator uses to point every path somewhere else without a code
+// change — deliberately an env var rather than a field, because it has to
+// reach the headless and interactive spawn paths identically, and a field
+// only one of them threads is a field that silently does nothing.
 func resolveCodexPluginCacheDir(explicit string) string {
 	if explicit != "" {
 		return explicit
@@ -160,6 +184,10 @@ func (b *codexConfigBoundary) harvestPluginCache() {
 //     a legitimate vendor cache never contains one, so this is pure defense
 //     against a tampered cache directory smuggling a path escape into either
 //     direction (host→session seed or session→host harvest).
+//   - A leftover temp file from a crashed copy (see
+//     codexPluginCacheTempMarker) is skipped rather than reproduced — it is
+//     not a cache entry, and copying it onward would spread litter into
+//     every future session on the host.
 //   - Every copy is atomic (see copyFileAtomic): a process that dies
 //     mid-copy — the exact crash class this whole mechanism exists to
 //     survive, and harvest runs inside remove(), on the same exit path —
@@ -214,6 +242,9 @@ func reuseCacheTree(src, dst string) error {
 		if d.Type()&os.ModeSymlink != 0 || !d.Type().IsRegular() {
 			return nil
 		}
+		if strings.Contains(d.Name(), codexPluginCacheTempMarker) {
+			return nil // a crashed copy's leftover, not a cache entry.
+		}
 		fi, err := d.Info()
 		if err != nil || fi.Size() > codexPluginCacheMaxFileBytes {
 			return nil
@@ -253,20 +284,36 @@ func copyFileAtomic(source, target string, mode os.FileMode) error {
 }
 
 // copyReaderAtomic is copyFileAtomic's core, taking an io.Reader directly so
-// an interrupted-read failure partway through a copy — the exact "process
-// dies mid-copy" class F4 exists to close, and the one case a real *os.File
-// source cannot deterministically reproduce in a test — is exercisable
-// without a real filesystem-level fault.
+// an interrupted-read failure partway through a copy — what a process dying
+// mid-copy looks like from io.Copy's point of view, and the one case a real
+// *os.File source cannot deterministically reproduce in a test — is
+// exercisable without a real filesystem-level fault.
+//
+// The temp name comes from os.CreateTemp rather than being derived from the
+// pid. A pid-derived name is not unique over time: the crash this whole
+// mechanism exists to survive leaves <name>.donmai-tmp-<pid> behind, and the
+// next process to draw that pid then fails O_EXCL on it forever, making that
+// one cache entry permanently uncopyable. os.CreateTemp picks a fresh name
+// per attempt, so a leftover can only ever be litter — and reuseCacheTree
+// skips litter by name (see codexPluginCacheTempMarker).
 func copyReaderAtomic(r io.Reader, target string, mode os.FileMode) error {
-	tmp := target + ".donmai-tmp-" + strconv.Itoa(os.Getpid())
-	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm()) //nolint:gosec // G304: tmp is derived from target, a path this package's own WalkDir just built.
+	out, err := os.CreateTemp(filepath.Dir(target), filepath.Base(target)+codexPluginCacheTempMarker+"*")
 	if err != nil {
 		return err
 	}
-	if _, err := io.Copy(out, r); err != nil {
+	tmp := out.Name()
+	abandon := func(err error) error {
 		_ = out.Close()
 		_ = os.Remove(tmp)
 		return err
+	}
+	// os.CreateTemp always creates 0600; restore the source's own mode so a
+	// reused entry is indistinguishable from one Codex fetched itself.
+	if err := out.Chmod(mode.Perm()); err != nil {
+		return abandon(err)
+	}
+	if _, err := io.Copy(out, r); err != nil {
+		return abandon(err)
 	}
 	if err := out.Close(); err != nil {
 		_ = os.Remove(tmp)
