@@ -186,11 +186,56 @@ check_touching_preexisting_fires() {
 }
 check_touching_preexisting_fires
 
+# ---- Case 5: an UNRESOLVABLE range must FAIL CLOSED, never report clean ----
+# A range git cannot evaluate (unfetched base ref, a typo, any other git-diff
+# error) must not look identical to "this range legitimately touches
+# nothing" — that would be the exact silent-green failure this gate exists
+# to eliminate. Exit code must be non-zero and distinct from the RED case's
+# rule-violation exit (1), so a caller can tell "the rule fired" apart from
+# "the range could not be read" if it ever needs to.
+check_unresolvable_range_fails_closed() {
+  local d="$TMP/unresolvable-repo" out rc
+  init_repo "$d"
+  echo "clean base content" > "$d/base.txt"
+  commit_all "$d" "base"
+
+  set +e
+  out="$(cd "$d" && "$GATE" DEV_ABS_PATH "no-such-ref-anywhere...HEAD" 2>&1)"
+  rc=$?
+  set -e
+
+  echo "--- unresolvable-range case: literal output ---"
+  printf '%s
+' "$out"
+  echo "--- exit code: $rc ---"
+
+  if [[ $rc -eq 0 ]]; then
+    fail "an unresolvable rev-range reported a clean scan (rc=0) instead of failing closed"
+    return
+  fi
+  if [[ $rc -eq 1 ]]; then
+    fail "an unresolvable rev-range exited 1 — indistinguishable from a real rule violation"
+    return
+  fi
+  if ! printf '%s
+' "$out" | grep -q 'could not evaluate rev-range'; then
+    fail "gate failed closed but did not explain why (no 'could not evaluate rev-range' message)"
+    return
+  fi
+  if ! printf '%s
+' "$out" | grep -qi 'bad revision\|unknown revision'; then
+    fail "git's own error was not visible in the gate's output"
+    return
+  fi
+  PASS=$((PASS + 1))
+}
+check_unresolvable_range_fails_closed
+
 # ---- Report -----------------------------------------------------------------
 echo ""
 if [[ $FAIL -eq 0 ]]; then
-  echo "guard-b-diff-gate self-test: OK — $PASS/4 checks behaved as specified."
+  echo "guard-b-diff-gate self-test: OK — $PASS/5 checks behaved as specified."
   exit 0
 fi
-echo "guard-b-diff-gate self-test: FAILED — $FAIL failing, $PASS passing (of 4)." >&2
+echo "guard-b-diff-gate self-test: FAILED — $FAIL failing, $PASS passing (of 5)." >&2
 exit 1

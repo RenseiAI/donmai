@@ -41,7 +41,8 @@
 #                commits it actually adds.
 #
 # Exit codes: 0 clean (or nothing to scan), 1 the named rule fired on a
-# changed file, 2 usage error.
+# changed file, 2 usage error OR the rev-range could not be evaluated at all
+# (fails closed — see below, never reported as a clean scan).
 #
 # Run from the repo root being scanned (same expectation guard-b-lint.sh's
 # own --staged/--all modes have) — every git and path operation below is
@@ -66,11 +67,35 @@ RANGE="$2"
 # ---- Collect files this range adds, copies, modifies, or renames -----------
 # --diff-filter=ACMR excludes Deleted files (nothing to scan there) — same
 # filter guard-b-lint.sh's own --staged mode applies to the index.
+#
+# Fail CLOSED on a git-diff error. An unresolvable range (an unfetched base
+# ref, a typo, a repo git can't read) must never look identical to a range
+# that legitimately touches nothing — that is precisely the silent-green
+# failure this gate exists to prevent (see the header above and the workflow
+# comment this script's introduction quotes: "a filtered trigger reports
+# 'green' by not running"). git's own stderr is left unredirected so an
+# operator sees the real reason inline, right above this gate's own message.
+DIFF_OUT="$(mktemp)"
+trap 'rm -f "$DIFF_OUT"' EXIT
+
+set +e
+git diff --name-only --diff-filter=ACMR "$RANGE" -- . > "$DIFF_OUT"
+DIFF_RC=$?
+set -e
+
+if [[ $DIFF_RC -ne 0 ]]; then
+  echo "guard-b-diff-gate ($RULE_ID): FAILED — could not evaluate rev-range '$RANGE' (git diff exited $DIFF_RC; see git's error above)." >&2
+  echo "guard-b-diff-gate: refusing to report a clean scan for a range that could not be read. Common" >&2
+  echo "cause: the base ref was never fetched locally (run 'git fetch origin <base-branch>' first) or" >&2
+  echo "the range syntax is invalid." >&2
+  exit 2
+fi
+
 FILES=()
 while IFS= read -r f; do
   [[ -n "$f" ]] || continue
   FILES+=("$f")
-done < <(git diff --name-only --diff-filter=ACMR "$RANGE" -- . 2>/dev/null || true)
+done < "$DIFF_OUT"
 
 if [[ ${#FILES[@]} -eq 0 ]]; then
   echo "guard-b-diff-gate ($RULE_ID): no added/copied/modified/renamed files in $RANGE — nothing to scan."
