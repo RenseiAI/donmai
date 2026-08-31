@@ -118,7 +118,7 @@ func TestLaunchAdoptionBatchCommitExhaustionRestoresPriorTruthWithoutStranding(t
 	d.opts.SessionShim.HostID = "host-exhaustion-restores"
 
 	fake := &recordingBatchCommit{}
-	fake.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+	fake.setCommit(func(SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 		return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("revision-baseline")}, nil
 	})
 	d.opts.SessionShim.OnAdoptionBatch = fake.handle
