@@ -289,4 +289,35 @@ func TestLaunchAdoptionBatchCommitExhaustionRestoresPriorTruthWithoutStranding(t
 	if _, err := d.adoptedShimEntry(f.orgID, baseline.SessionID); err != nil {
 		t.Fatalf("the baseline session was collaterally lost after the sibling launch's commit exhausted: %v", err)
 	}
+
+	// THE ACTUAL PROOF OF "WITHOUT STRANDING": a THIRD, entirely healthy
+	// launch, with no refusal armed at all, must still succeed. A version of
+	// the fix that appended the exhausted lineage only to the ONE outgoing
+	// restore batch — without also recording it into d.shims.quarantined —
+	// passes every assertion above and then fails exactly here: the next
+	// batch this daemon ever sends omits a lineage the control plane still
+	// holds live (the fake's onAdoption already marked "commit-always-
+	// refused" live, and nothing ever un-marks it), so the completeness rule
+	// refuses THIS batch too — a healthy, unrelated session stranded by a
+	// sibling's failure from two launches ago. That is the reviewer's exact
+	// reproduction, and this is the test that pins it closed.
+	fake.setRefusals(0)
+	healthy := f.interactiveSpec("healthy-after-exhaustion")
+	if _, err := d.spawner.AcceptWork(healthy); err != nil {
+		t.Fatalf("a third, entirely healthy launch failed after an unrelated sibling's commit exhausted two launches ago: %v", err)
+	}
+	if _, err := d.adoptedShimEntry(f.orgID, healthy.SessionID); err != nil {
+		t.Fatalf("the third healthy session was not adopted: %v", err)
+	}
+	finalResults := fake.snapshot()
+	finalBatch := finalResults[len(finalResults)-1]
+	if finalBatch.err != nil {
+		t.Fatalf("the third launch's batch was refused: %v", finalBatch.err)
+	}
+	if !batchAdoptsSession(finalBatch.batch, baseline.SessionID) || !batchAdoptsSession(finalBatch.batch, healthy.SessionID) {
+		t.Fatalf("the third launch's batch = %+v, want both the baseline and the new healthy session adopted", finalBatch.batch)
+	}
+	if _, stillQuarantined := batchQuarantinesSession(finalBatch.batch, failing.SessionID); !stillQuarantined {
+		t.Fatalf("the third launch's batch dropped the still-live exhausted lineage instead of continuing to present it: %+v", finalBatch.batch)
+	}
 }
