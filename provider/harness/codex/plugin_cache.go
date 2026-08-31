@@ -154,15 +154,42 @@ func (b *codexConfigBoundary) enablePluginCacheReuse(hostCacheDir string) {
 	// world-writable os.TempDir() when home resolution fails, and the env
 	// override can point anywhere at all — so the check is on the directory,
 	// not on how it was chosen.
-	if err := verifyOwnedDirectoryNotWritableByOthers(hostCacheDir); err != nil && !errors.Is(err, os.ErrNotExist) {
-		slog.Warn("codex: refusing to seed a session from a plugin cache this process cannot prove it exclusively owns",
-			"hostCacheDir", hostCacheDir, "err", err)
+	if !hostPluginCacheUsable(hostCacheDir) {
 		return
 	}
 	dst := filepath.Join(b.home, codexPluginCacheSubdir)
 	if err := reuseCacheTree(hostCacheDir, dst); err != nil {
 		slog.Debug("codex: plugin cache seed skipped", "hostCacheDir", hostCacheDir, "err", err)
 	}
+}
+
+// hostPluginCacheUsable reports whether dir is safe to exchange cache bytes
+// with — in EITHER direction.
+//
+// Reading is the direction with teeth: a catalog seeded from a cache another
+// user can write becomes, via reuseCacheTree's never-overwrite rule, the
+// permanent seed for every future session on the host, and its payload drives
+// a session's advertised tool surface. But writing matters too, and refusing
+// to read from a directory while still writing catalog bytes into it is the
+// same contradiction the sweep's harvest gate closed on the other side. Both
+// directions go through here.
+//
+// A directory that does not exist yet is fine: the first harvest creates it,
+// at 0700, and every later call re-checks what it created. What is refused is
+// one that exists and is group- or other-WRITABLE. Readability is not the
+// threat — a vendor catalog is not a secret, and the default location under a
+// user's own state tree is commonly 0755. resolveCodexPluginCacheDir falls
+// back to a predictable name in a world-writable os.TempDir() when home
+// resolution fails, and the env override can point anywhere, so the check is
+// on the directory itself rather than on how it was chosen.
+func hostPluginCacheUsable(dir string) bool {
+	err := verifyOwnedDirectoryNotWritableByOthers(dir)
+	if err == nil || errors.Is(err, os.ErrNotExist) {
+		return true
+	}
+	slog.Warn("codex: refusing to exchange plugin-cache entries with a directory this process cannot prove only it can write",
+		"hostCacheDir", dir, "err", err)
+	return false
 }
 
 // harvestPluginCache copies back whatever this session's own cache/
@@ -175,6 +202,9 @@ func (b *codexConfigBoundary) enablePluginCacheReuse(hostCacheDir string) {
 // doesn't opt in).
 func (b *codexConfigBoundary) harvestPluginCache() {
 	if b == nil || b.pluginCacheDir == "" || b.home == "" {
+		return
+	}
+	if !hostPluginCacheUsable(b.pluginCacheDir) {
 		return
 	}
 	src := filepath.Join(b.home, codexPluginCacheSubdir)

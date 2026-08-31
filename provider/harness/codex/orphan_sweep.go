@@ -6,6 +6,7 @@ import (
 	"errors"
 	"io/fs"
 	"log/slog"
+	"math/rand/v2"
 	"os"
 	"path/filepath"
 	"strings"
@@ -247,6 +248,13 @@ type SweepOptions struct {
 	// including the ones it leaves alone. Resolving an entry costs a handful
 	// of syscalls, so this can be far larger than MaxEntries and still bound
 	// the walk; MaxDuration backstops it. Empty means 20000.
+	//
+	// Which entries those are is randomised — see startAt. A ceiling plus a
+	// sorted listing would otherwise examine the same arbitrary prefix on
+	// every daemon start forever, and the population that fills that prefix
+	// grows by design: every crash-leftover home that took a turn keeps its
+	// session state permanently, so the count of entries the sweep can never
+	// reduce only ever rises.
 	MaxScan int
 	// MaxDuration bounds the TOTAL wall clock one sweep call may spend.
 	// MaxEntries bounds how MANY entries are examined and says nothing about
@@ -278,12 +286,17 @@ type SweepOptions struct {
 	// default resolveCodexPluginCacheDir("") gives every boundary.
 	PluginCacheDir string
 
-	// processAlive / processLooksLikeCodex / identityAlive / now are test
-	// seams; production leaves them nil and gets the real implementations.
+	// processAlive / processLooksLikeCodex / identityAlive / now / startAt
+	// are test seams; production leaves them nil and gets the real
+	// implementations.
 	processAlive          func(pid int) bool
 	processLooksLikeCodex func(pid int, binaryHint string) bool
 	identityAlive         func(identity sessionshim.ProcessIdentity) (bool, error)
 	now                   func() time.Time
+	// startAt picks which candidate a sweep begins at, given how many there
+	// are. Production draws uniformly at random; see MaxScan for why a fixed
+	// starting point is the problem it solves.
+	startAt func(candidates int) int
 }
 
 // SweepReport summarizes one SweepOrphans call for the caller's own
@@ -362,6 +375,20 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 	if opts.now == nil {
 		opts.now = time.Now
 	}
+	if opts.startAt == nil {
+		opts.startAt = func(candidates int) int {
+			if candidates <= 0 {
+				return 0
+			}
+			// G404: this picks which of its OWN artifact directories the
+			// sweep looks at first, purely so a sorted listing plus a
+			// ceiling does not exclude the same subset every start. No
+			// safety decision reads it — every one of those is a separate,
+			// verified gate — so unpredictability is not a requirement and
+			// a CSPRNG would buy nothing.
+			return rand.IntN(candidates) //nolint:gosec // G404: scan ordering only; see above.
+		}
+	}
 	return opts
 }
 
@@ -396,9 +423,12 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 //  2. Age: MinAge for a verified-dead owner with a pinned child; the much
 //     larger UnverifiedMinAge for anything without that liveness proof (no
 //     manifest, or a dead owner with no tracked child). The larger floor is
-//     measured across the WHOLE tree, not the top-level mtime — a live
+//     measured across the whole tree, not the top-level mtime — a live
 //     session's CODEX_HOME stops moving minutes in, so top-level mtime is
-//     the one signal that cannot answer "is this still in use".
+//     the one signal that cannot answer "is this still in use". That measure
+//     fails CLOSED: a scan truncated at sweepDeepScanMaxEntries, or blocked
+//     by a subtree it cannot read, reports the entry as in use rather than
+//     as idle. See idleLongerThan.
 //  3. Owner liveness: a manifest naming a still-running owner (by verified
 //     identity, or by bare PID where identity pinning was unavailable) is
 //     never touched — that owner's own in-memory Handle/boundary may yet
@@ -451,21 +481,37 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		return report
 	}
 
+	// Collect the in-scope names first, then start at a random one and wrap.
+	// os.ReadDir returns them sorted, so a ceiling applied to that order
+	// examines the same prefix on every start — permanently excluding
+	// everything behind a large enough unreclaimable population. Randomising
+	// the entry point cannot make one sweep complete, but it does make every
+	// candidate reachable across restarts instead of a fixed arbitrary
+	// subset being the only thing ever considered.
+	type candidate struct{ name, kind string }
+	candidates := make([]candidate, 0, len(entries))
 	for _, entry := range entries {
+		name := entry.Name()
+		switch {
+		case strings.HasPrefix(name, codexHomePrefix):
+			candidates = append(candidates, candidate{name, sweepKindCodexHome})
+		case strings.HasPrefix(name, codexAppSocketPrefix):
+			candidates = append(candidates, candidate{name, sweepKindAppSocket})
+		default:
+			// outside the fence: never even looked at further.
+		}
+	}
+	start := 0
+	if len(candidates) > 0 {
+		start = opts.startAt(len(candidates)) % len(candidates)
+	}
+	for offset := range candidates {
 		if ctx.Err() != nil {
 			opts.Logger.Warn("codex: orphan sweep stopped early", "reason", ctx.Err())
 			break
 		}
-		name := entry.Name()
-		var kind string
-		switch {
-		case strings.HasPrefix(name, codexHomePrefix):
-			kind = sweepKindCodexHome
-		case strings.HasPrefix(name, codexAppSocketPrefix):
-			kind = sweepKindAppSocket
-		default:
-			continue // outside the fence: never even looked at further.
-		}
+		chosen := candidates[(start+offset)%len(candidates)]
+		name, kind := chosen.name, chosen.kind
 		if report.Scanned >= opts.MaxScan {
 			opts.Logger.Warn("codex: orphan sweep hit its scan ceiling",
 				"root", opts.Root, "maxScan", opts.MaxScan)
@@ -593,19 +639,54 @@ func (opts SweepOptions) sweepManifested(ctx context.Context, path, kind string,
 	return true
 }
 
-// sweepDeepScanMaxEntries bounds the per-directory walk idleLongerThan does.
-// A real CODEX_HOME holds a few dozen entries; the ceiling only exists so one
-// pathological directory cannot make a single sweep entry unbounded.
+// sweepDeepScanMaxEntries bounds the per-directory walk idleLongerThan does,
+// so one pathological directory cannot make a single sweep entry unbounded.
+//
+// Hitting it is not a neutral event: the walk has then NOT examined the whole
+// tree, so idleLongerThan reports the directory as in use rather than idle
+// (see its doc comment). Raising this ceiling trades startup work for fewer
+// deferred reclaims; lowering it defers more. Neither direction can make the
+// sweep act on a directory it failed to examine.
 const sweepDeepScanMaxEntries = 4096
 
-// idleLongerThan reports whether NOTHING anywhere under path has been
-// written within floor.
+// idleLongerThan reports whether the sweep can PROVE that nothing anywhere
+// under path has been written within floor. A false answer means either
+// "something is recent" or "this could not be established" — the two are
+// deliberately not distinguished, because both must stop the sweep.
 //
 // The top-level mtime alone cannot answer this. A live session's CODEX_HOME
 // stops moving minutes in, because its writes land in sessions/ and other
 // subdirectories — which is exactly why a directory that looks a month stale
 // at the top can be in active use. Looking at the whole tree is what makes
 // it safe to act on a directory with no manifest to prove liveness for it.
+//
+// FAILING CLOSED IS THE WHOLE POINT — read before changing any exit below.
+//
+// This function is not an optimisation. Everywhere a manifest cannot supply
+// a liveness proof — a legacy home, and the PTY shape, whose ptycli driver
+// exposes no child PID at all so a restarted daemon has neither a live owner
+// nor a child to check — this measure is the SOLE thing standing between a
+// still-running codex session and having its config and auth link deleted.
+// A measure that answers "no activity" when what actually happened is "I
+// stopped looking" is not that measure: it silently widens the set of live
+// sessions the sweep acts on, by an amount nothing bounds.
+//
+// So every exit that has NOT examined the whole tree reports not-idle:
+//
+//   - Truncation at sweepDeepScanMaxEntries. Stopping early is evidence of
+//     nothing, and a live session's only recent write can sit past the
+//     ceiling. This is not hypothetical and it gets likelier over time: the
+//     host warm cache this package seeds from is append-only — never pruned,
+//     never overwritten — so a home's cache/ entry count grows monotonically
+//     toward the very ceiling the walk truncates at, and cache/ sorts before
+//     nearly everything else a codex home holds.
+//   - A directory that cannot be read, or an entry that cannot be stat'd.
+//     An unreadable subtree is the one place a recent write is guaranteed
+//     invisible.
+//
+// The cost of failing closed is one deferred reclaim, re-evaluated on the
+// next sweep, and under this file's budget accounting a not-idle verdict is
+// free (see MaxEntries). The cost of failing open is a live session broken.
 //
 // Returns as soon as it finds anything newer than the floor, so the case
 // that matters most — a live session — is also the cheapest to resolve.
@@ -614,27 +695,37 @@ func (opts SweepOptions) idleLongerThan(path string, info os.FileInfo, floor tim
 	if info.ModTime().After(cutoff) {
 		return false
 	}
-	idle := true
+	proven := true
 	seen := 0
-	_ = filepath.WalkDir(path, func(_ string, d fs.DirEntry, err error) error {
+	_ = filepath.WalkDir(path, func(walked string, d fs.DirEntry, err error) error {
 		if err != nil {
-			return nil //nolint:nilerr // best-effort: an unreadable entry proves nothing about activity.
+			// Could not read this directory or entry, so a recent write
+			// under it would be invisible. Not proof of idleness.
+			proven = false
+			opts.Logger.Debug("codex: orphan sweep could not examine part of an artifact directory; treating it as in use",
+				"path", path, "entry", walked, "err", err)
+			return fs.SkipAll
 		}
 		seen++
 		if seen > sweepDeepScanMaxEntries {
+			// Stopped before the end of the tree; the rest is unexamined.
+			proven = false
+			opts.Logger.Debug("codex: orphan sweep hit its per-directory scan ceiling before proving an artifact directory idle; treating it as in use",
+				"path", path, "maxEntries", sweepDeepScanMaxEntries)
 			return fs.SkipAll
 		}
 		fi, err := d.Info()
 		if err != nil {
-			return nil //nolint:nilerr // same: skip what cannot be stat'd.
+			proven = false
+			return fs.SkipAll
 		}
 		if fi.ModTime().After(cutoff) {
-			idle = false
+			proven = false
 			return fs.SkipAll
 		}
 		return nil
 	})
-	return idle
+	return proven
 }
 
 // ownerAlive reports whether manifest's owner is still running. A pinned
@@ -874,6 +965,9 @@ func (opts SweepOptions) harvestOrphanedPluginCache(path string) {
 	}
 	src := filepath.Join(path, codexPluginCacheSubdir)
 	dst := resolveCodexPluginCacheDir(opts.PluginCacheDir)
+	if !hostPluginCacheUsable(dst) {
+		return
+	}
 	if err := reuseCacheTree(src, dst); err != nil {
 		opts.Logger.Debug("codex: orphan sweep plugin-cache harvest skipped", "path", path, "err", err)
 	}

@@ -1264,3 +1264,281 @@ func TestReadVerifiedDonmaiOwnerManifest_RefusesASymlinkedManifest(t *testing.T)
 		t.Fatalf("the symlink target was followed and removed: %v", err)
 	}
 }
+
+// --- Review-round-4 probes: the whole-tree activity measure must never
+// --- report "nothing is in use" when what actually happened is "I could not
+// --- finish looking". That measure is what stands in for a liveness proof
+// --- everywhere a manifest cannot supply one, so failing it open widens the
+// --- set of LIVE sessions the sweep acts on, by an amount nothing bounds.
+
+// fillCacheEntries writes n files under home's cache/remote_plugin_catalog,
+// the subtree the host warm cache seeds and which grows monotonically because
+// entries are never pruned or overwritten. "cache" sorts before "config.toml"
+// and "log", so a lexical walk meets these first.
+func fillCacheEntries(t *testing.T, home string, n int) {
+	t.Helper()
+	dir := filepath.Join(home, codexPluginCacheSubdir, "remote_plugin_catalog")
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	for i := range n {
+		if err := os.WriteFile(filepath.Join(dir, fmt.Sprintf("entry-%05d.json", i)), []byte("{}"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+}
+
+// liveHomeWithDeepActivity builds a home whose top level looks long idle but
+// which has a fresh write buried in a subdirectory that sorts late — the
+// shape of every live session, whose CODEX_HOME stops moving minutes in
+// because its writes land underneath it.
+func liveHomeWithDeepActivity(t *testing.T, root, name string, cacheEntries int) string {
+	t.Helper()
+	home := legacyHome(t, root, name, 48*time.Hour)
+	fillCacheEntries(t, home, cacheEntries)
+	ageTree(t, home, time.Now(), 48*time.Hour)
+	// The only recent write in the tree, in a subdirectory sorting after
+	// "cache" and "config.toml".
+	logDir := filepath.Join(home, "log")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, "codex-tui.log"), []byte("a turn, seconds ago"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(home, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	return home
+}
+
+// TestSweepOrphans_TruncatedDeepScanCannotProveIdle is the blocking case. The
+// per-directory walk stops at sweepDeepScanMaxEntries, and stopping early is
+// not evidence of anything: a live session's only recent write can sit past
+// the ceiling. This PR makes that likelier over time rather than less — the
+// host warm cache is append-only, never pruned and never overwritten, so the
+// seeded entry count grows monotonically toward the very ceiling the walk
+// truncates at.
+//
+// RED proof: in idleLongerThan, revert the truncation branch to a bare
+// `return fs.SkipAll` without clearing idle, and this test fails — a live
+// session loses config.toml and the auth link purely because its cache grew.
+func TestSweepOrphans_TruncatedDeepScanCannotProveIdle(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := liveHomeWithDeepActivity(t, root, "live-big-cache", sweepDeepScanMaxEntries+100)
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing reclaimed — a truncated scan was reported as proof of idleness", report)
+	}
+	for _, keep := range []string{codexConfigFileName, codexAuthFileName, codexPluginCacheSubdir} {
+		if _, err := os.Lstat(filepath.Join(home, keep)); err != nil {
+			t.Fatalf("a live session lost %s because its cache grew past the scan ceiling: %v", keep, err)
+		}
+	}
+}
+
+// TestSweepOrphans_SmallCacheControlProvesEntryCountIsTheOnlyVariable is the
+// control for the test above: the identical home shape, differing only in how
+// many cache entries sit before the recent write, must reach the same verdict.
+// If these two ever disagree, the activity measure is answering a question
+// about directory size rather than about activity.
+func TestSweepOrphans_SmallCacheControlProvesEntryCountIsTheOnlyVariable(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := liveHomeWithDeepActivity(t, root, "live-small-cache", 100)
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.SkippedYoung != 1 {
+		t.Fatalf("report = %+v, want SkippedYoung=1", report)
+	}
+	if _, err := os.Stat(filepath.Join(home, codexConfigFileName)); err != nil {
+		t.Fatalf("control home lost config.toml: %v", err)
+	}
+}
+
+// TestSweepOrphans_UnreadableSubtreeCannotProveIdle covers the second
+// fail-open path: a subdirectory the walk cannot read tells the sweep
+// nothing, and "nothing" is not "no activity". Here the only recent write in
+// the tree is hidden behind a directory with no permissions.
+//
+// RED proof: in idleLongerThan, revert the walk-error branch to a bare
+// `return nil` without clearing idle, and this test fails.
+func TestSweepOrphans_UnreadableSubtreeCannotProveIdle(t *testing.T) {
+	requireManifestVerification(t)
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions, so an unreadable subtree cannot be staged")
+	}
+	root := t.TempDir()
+	home := legacyHome(t, root, "live-unreadable", 48*time.Hour)
+	logDir := filepath.Join(home, "log")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, "codex-tui.log"), []byte("a turn, seconds ago"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The directory's OWN mtime is backdated, so the only recent thing in
+	// the tree is the file inside it — reachable solely by reading a
+	// directory the next line makes unreadable.
+	stale := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(logDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(logDir, 0o000); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(home, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	//nolint:gosec // G302: restoring a readable mode so t.TempDir()'s own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(logDir, 0o700) })
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing reclaimed — an unreadable subtree was reported as proof of idleness", report)
+	}
+	if _, err := os.Stat(filepath.Join(home, codexConfigFileName)); err != nil {
+		t.Fatalf("a live session lost config.toml because part of its tree could not be read: %v", err)
+	}
+}
+
+// TestSweepOrphans_PTYShapeIsProtectedByAnHonestActivityMeasure pins the
+// shape that makes this blocking rather than theoretical. A PTY session
+// carries a manifest, but ptycli exposes no child PID, so ChildIdentity is
+// zero and after a daemon restart the recorded owner is dead. Both liveness
+// proofs are therefore unavailable and the whole-tree activity measure is the
+// SOLE signal standing between a still-running codex PTY and having its
+// config and auth link deleted — which is precisely the scenario this sweep
+// exists for.
+func TestSweepOrphans_PTYShapeIsProtectedByAnHonestActivityMeasure(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := liveHomeWithDeepActivity(t, root, "live-pty", sweepDeepScanMaxEntries+100)
+	// The PTY manifest shape: an owner that a daemon restart has made dead,
+	// and no child identity at all.
+	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+	stale := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(filepath.Join(home, donmaiOwnerManifestName), stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chtimes(home, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing reclaimed — a live PTY session was judged idle by a scan that never finished", report)
+	}
+	for _, keep := range []string{codexConfigFileName, codexAuthFileName} {
+		if _, err := os.Stat(filepath.Join(home, keep)); err != nil {
+			t.Fatalf("a live PTY session lost %s: %v", keep, err)
+		}
+	}
+}
+
+// TestSweepOrphans_UnstattableEntryCannotProveIdle covers the third
+// fail-open exit: an entry the walk can NAME but cannot stat. A directory
+// that is readable but not searchable (mode 0600) produces exactly that —
+// ReadDir lists its children, and lstat of each child is refused — so the
+// walk sees an entry whose mtime it can never learn. An unknown mtime is not
+// an old mtime.
+//
+// RED proof: in idleLongerThan, revert the `d.Info()` error branch to a bare
+// `return nil` without clearing the proof flag, and this test fails.
+func TestSweepOrphans_UnstattableEntryCannotProveIdle(t *testing.T) {
+	requireManifestVerification(t)
+	if os.Getuid() == 0 {
+		t.Skip("root bypasses directory permissions, so an unstattable entry cannot be staged")
+	}
+	root := t.TempDir()
+	home := legacyHome(t, root, "live-unstattable", 48*time.Hour)
+	logDir := filepath.Join(home, "log")
+	if err := os.Mkdir(logDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(logDir, "codex-tui.log"), []byte("a turn, seconds ago"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	stale := time.Now().Add(-48 * time.Hour)
+	if err := os.Chtimes(logDir, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+	// Readable but not searchable: the child is listed, and stat'ing it is
+	// refused.
+	if err := os.Chmod(logDir, 0o600); err != nil { //nolint:gosec // G302: the test deliberately drops the search bit to make lstat of the children fail.
+		t.Fatal(err)
+	}
+	//nolint:gosec // G302: restoring a usable mode so t.TempDir()'s own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(logDir, 0o700) })
+	if err := os.Chtimes(home, stale, stale); err != nil {
+		t.Fatal(err)
+	}
+
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, PluginCacheDir: t.TempDir()})
+
+	if report.Reclaimed != 0 || report.PartiallyReclaimed != 0 {
+		t.Fatalf("report = %+v, want nothing reclaimed — an entry whose mtime could not be read was treated as old", report)
+	}
+	if _, err := os.Stat(filepath.Join(home, codexConfigFileName)); err != nil {
+		t.Fatalf("a live session lost config.toml because one entry could not be stat'd: %v", err)
+	}
+}
+
+// TestSweepOrphans_ScanStartIsRotatedSoNoEntryIsPermanentlyExcluded pins the
+// mitigation for the scan ceiling one level up from MaxEntries. os.ReadDir
+// returns sorted names, so a ceiling applied to that order examines the same
+// arbitrary prefix on every daemon start — and the population that fills
+// that prefix grows by design, since every crash-leftover home that took a
+// turn keeps its session state permanently. Randomising where a sweep begins
+// cannot make one call complete, but it stops a fixed subset being the only
+// thing ever considered.
+//
+// The fixture drives the real path with the scan ceiling set to 1, so the
+// entry the sweep picks is the only one it can possibly act on: an orphan
+// placed last in sorted order is reclaimed purely because the start offset
+// selected it.
+func TestSweepOrphans_ScanStartIsRotatedSoNoEntryIsPermanentlyExcluded(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	const count = 10
+	var orphan string
+	for i := range count {
+		name := fmt.Sprintf("entry-%02d", i)
+		home := filepath.Join(root, codexHomePrefix+name)
+		if err := os.Mkdir(home, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if i == count-1 {
+			// Sorts last, and is the only reclaimable one.
+			orphan = home
+			persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+		} else {
+			if err := os.WriteFile(filepath.Join(home, "state_5.sqlite"), []byte("x"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+		}
+		ageTree(t, home, time.Now(), 48*time.Hour)
+	}
+
+	// A sorted scan with a ceiling of 1 would examine entry-00 forever. With
+	// the start rotated to the last candidate, the orphan is the one entry
+	// this call looks at.
+	report := SweepOrphans(context.Background(), SweepOptions{
+		Root: root, MaxScan: 1, PluginCacheDir: t.TempDir(),
+		startAt: func(candidates int) int { return candidates - 1 },
+	})
+
+	if report.Scanned != 1 {
+		t.Fatalf("report = %+v, want Scanned=1 under a MaxScan of 1", report)
+	}
+	if _, err := os.Stat(orphan); !os.IsNotExist(err) {
+		t.Fatalf("the sweep did not begin where startAt pointed: the last-sorting orphan survived (report %+v): err=%v", report, err)
+	}
+}

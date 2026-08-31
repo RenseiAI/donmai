@@ -452,3 +452,33 @@ func TestEnablePluginCacheReuse_RefusesAHostCacheOthersCanWrite(t *testing.T) {
 		t.Fatalf("a session was seeded from a world-writable host cache: err=%v", err)
 	}
 }
+
+// TestHarvestPluginCache_RefusesAHostCacheOthersCanWrite is the write-side
+// mirror of the seed-side refusal. Reading is the direction with teeth, but
+// refusing to read from a directory while still writing catalog bytes into it
+// is the same contradiction the sweep's harvest gate closed on the other
+// side — and the fallback location this can resolve to lives in a
+// world-writable os.TempDir() at a predictable name.
+func TestHarvestPluginCache_RefusesAHostCacheOthersCanWrite(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("unix-only: directory ownership verification is unix-only")
+	}
+	hostCache := t.TempDir()
+	b, err := newCodexConfigBoundary(t.TempDir(), false)
+	if err != nil {
+		t.Fatalf("boundary: %v", err)
+	}
+	b.enablePluginCacheReuse(hostCache)
+	writeCacheFixture(t, b.home, filepath.Join(codexPluginCacheSubdir, "remote_plugin_catalog", "abc123.json"), "this session's fetch")
+	if err := os.Chmod(hostCache, 0o777); err != nil { //nolint:gosec // G302: the test deliberately makes this world-writable to exercise the rejection path.
+		t.Fatal(err)
+	}
+
+	if err := b.remove(); err != nil {
+		t.Fatalf("remove: %v", err)
+	}
+
+	if _, err := os.Lstat(filepath.Join(hostCache, "remote_plugin_catalog", "abc123.json")); !os.IsNotExist(err) {
+		t.Fatalf("catalog bytes were written into a world-writable host cache: err=%v", err)
+	}
+}
