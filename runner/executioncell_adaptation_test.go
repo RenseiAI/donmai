@@ -556,12 +556,17 @@ func TestEveryEffectiveCellFieldMutationDeniesBeforeSpawn(t *testing.T) {
 	}
 }
 
+// TestEveryEndpointBindingFieldMismatchDeniesBeforeSpawn covers the endpoint
+// fields the admitted execution cell carries an axis for. Company is
+// deliberately absent: the cell has no company axis, so a company mismatch has
+// nothing in the cell to disagree with. Company is pinned by the
+// operational-payload digest instead — see
+// TestReceiptDeniesEndpointCompanySubstitutedAfterAdmission.
 func TestEveryEndpointBindingFieldMismatchDeniesBeforeSpawn(t *testing.T) {
 	tests := []struct {
 		name   string
 		mutate func(*agent.EndpointBinding)
 	}{
-		{"company", func(e *agent.EndpointBinding) { e.Company = agent.CompanyAnthropic }},
 		{"model", func(e *agent.EndpointBinding) { e.Model = "gpt-other" }},
 		{"protocol", func(e *agent.EndpointBinding) { e.Protocol = agent.ProtoOpenAIChat }},
 		{"host", func(e *agent.EndpointBinding) { e.Host = agent.HostAzure }},
@@ -908,4 +913,88 @@ func codexManifestForTest() agent.HarnessManifest {
 
 func codexCapabilitiesForTest() agent.Capabilities {
 	return (&codex.Provider{}).Capabilities()
+}
+
+// TestReceiptAdmitsCellWhoseModelAuthorDiffersFromEndpointCompany pins the
+// two-field vocabulary the receipt lane must honor. Company is the SPEAK-axis
+// endpoint identity — which wire dialect and vendor surface the request is
+// spoken to (anthropic/openai/google/local/stub). ModelAuthor is who authored
+// the model. They coincide only for first-party direct cells; every
+// OpenAI-compatible aggregator, gateway, or local serving cell diverges (the
+// worker-local gateway always binds Company=openai regardless of the model it
+// serves). A receipt lane that requires them to be equal denies legitimate
+// work and asserts a falsehood about which vendor authored the model that ran.
+func TestReceiptAdmitsCellWhoseModelAuthorDiffersFromEndpointCompany(t *testing.T) {
+	t.Parallel()
+	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
+	registry := selectorRegistry(t, provider)
+
+	// A gateway cell: spoken to an OpenAI-compatible surface, serving a model
+	// authored by someone else entirely.
+	qw := exactReceiptQueuedWork("session_gateway_authorship")
+	qw.ResolvedProfile.Model = "llama-3.3-70b"
+	qw.ResolvedProfile.Endpoint.Model = "llama-3.3-70b"
+	qw.ResolvedProfile.Endpoint.Company = agent.CompanyOpenAI
+	qw.ResolvedProfile.Endpoint.ModelAuthor = "meta"
+
+	cell := exactReceiptCell("harness/v2", "llama-3.3-70b", executioncell.SessionAutonomous, nil)
+	cell.Model.Author = "meta"
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+
+	admission, err := registry.PreflightHarness(qw)
+	if err != nil {
+		t.Fatalf("PreflightHarness denied a coherent cell whose model author differs from the endpoint company: %v", err)
+	}
+	ref, ok := admission.CanonicalHarnessRef()
+	if !ok || ref.ID != string(agent.HarnessCodex) {
+		t.Fatalf("canonical harness = %+v, %t", ref, ok)
+	}
+}
+
+// TestReceiptDeniesModelAuthorThatDisagreesWithAdmittedCell is the other half
+// of the vocabulary: the endpoint's ModelAuthor — not its Company — is the
+// field that must equal the admitted cell's model author.
+func TestReceiptDeniesModelAuthorThatDisagreesWithAdmittedCell(t *testing.T) {
+	t.Parallel()
+	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
+	registry := selectorRegistry(t, provider)
+
+	qw := exactReceiptQueuedWork("session_author_disagreement")
+	qw.ResolvedProfile.Endpoint.Company = agent.CompanyOpenAI
+	qw.ResolvedProfile.Endpoint.ModelAuthor = "meta"
+
+	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, nil)
+	cell.Model.Author = "openai"
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+
+	admission, err := registry.PreflightHarness(qw)
+	var denial *HarnessAdmissionError
+	if admission == nil || !errors.As(err, &denial) || provider.spawnCalls.Load() != 0 {
+		t.Fatalf("model-author disagreement = admission %+v, err %v, spawn %d", admission, err, provider.spawnCalls.Load())
+	}
+	if denial.Code != executioncell.DenialUnknownEndpoint {
+		t.Fatalf("denial code = %q; want %q", denial.Code, executioncell.DenialUnknownEndpoint)
+	}
+}
+
+// TestReceiptDeniesEndpointCompanySubstitutedAfterAdmission proves the
+// endpoint Company stays pinned once the model-author conflation is gone. The
+// admitted execution cell carries no company axis, so Company is anchored by
+// the operational-payload digest the platform stamped pre-enqueue: substituting
+// it in flight still denies before spawn.
+func TestReceiptDeniesEndpointCompanySubstitutedAfterAdmission(t *testing.T) {
+	t.Parallel()
+	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
+	registry := selectorRegistry(t, provider)
+
+	qw := exactReceiptQueuedWork("session_company_substitution")
+	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, nil))
+	// Substitute the endpoint company after the platform admitted the payload.
+	qw.ResolvedProfile.Endpoint.Company = agent.CompanyAnthropic
+
+	admission, err := registry.PreflightHarness(qw)
+	var denial *HarnessAdmissionError
+	if admission == nil || !errors.As(err, &denial) || provider.spawnCalls.Load() != 0 {
+		t.Fatalf("post-admission company substitution = admission %+v, err %v, spawn %d", admission, err, provider.spawnCalls.Load())
+	}
 }

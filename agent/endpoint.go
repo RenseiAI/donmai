@@ -15,7 +15,13 @@ import (
 // new files. Verbatim from 02-two-axis-architecture.md §2.3 (minus the
 // Signature field, which is deferred to Phase 7).
 
-// Company names a model-endpoint vendor (the SPEAK axis identity).
+// Company names the SPEAK-axis endpoint identity: the vendor surface and wire
+// dialect a request is spoken to. It is NOT the author of the model that runs
+// — see EndpointBinding.ModelAuthor for that. The two coincide only for
+// first-party direct cells (anthropic serving an Anthropic-authored model);
+// they diverge for every gateway, OpenAI-compatible aggregator, and local
+// serving cell, where an openai-chat surface may serve a model authored by
+// anyone. Consumers must never read one as the other.
 type Company string
 
 // Company constants name each model-endpoint vendor.
@@ -124,9 +130,14 @@ type EndpointBinding struct {
 	// are required for receipt-bearing work so a concrete endpoint/auth binding
 	// can be compared without inferring identity from Company, Host, BaseURL, or
 	// ambient CLI state.
-	EndpointID         string `json:"endpointId,omitempty"`
-	EndpointOperator   string `json:"endpointOperator,omitempty"`
-	EndpointRevision   string `json:"endpointRevision,omitempty"`
+	EndpointID       string `json:"endpointId,omitempty"`
+	EndpointOperator string `json:"endpointOperator,omitempty"`
+	EndpointRevision string `json:"endpointRevision,omitempty"`
+	// ModelAuthor is who authored the model this binding serves — the value
+	// receipt-bearing work compares against the admitted cell's
+	// ModelRef.Author. It is a separate axis from Company (the endpoint
+	// surface spoken to) and from EndpointOperator (who runs the endpoint);
+	// none of the three may be inferred from another.
 	ModelAuthor        string `json:"modelAuthor,omitempty"`
 	AuthBindingID      string `json:"authBindingId,omitempty"`
 	AuthAuthority      string `json:"authAuthority,omitempty"`
