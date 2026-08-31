@@ -19,6 +19,20 @@ import (
 // the directory's own creation use the exact same literal.
 const codexAppSocketPrefix = "donmai-codex-app-"
 
+// sweepKindCodexHome / sweepKindAppSocket name the two artifact shapes this
+// package creates under os.TempDir(). Each has its OWN set of entries donmai
+// declares it created — see declaredDeletableEntries.
+const (
+	sweepKindCodexHome = "codex-home"
+	sweepKindAppSocket = "codex-app-socket"
+)
+
+// codexAppSocketFileName is the single file startNamedInteractiveAppServer
+// creates inside a codexAppSocketPrefix directory. Shared here for the same
+// reason as the prefix above: the sweep's declared-deletable set and the
+// file's own creation must use the exact same literal.
+const codexAppSocketFileName = "app.sock"
+
 // donmaiOwnerManifestName is the one file this package ever writes inside a
 // donmai-owned artifact directory purely for the sweep's benefit. It is
 // metadata only (a PID, an OS-reported start time, and a timestamp) — never
@@ -116,17 +130,29 @@ func persistDonmaiOwnerManifest(dir string, manifest donmaiOwnerManifest) {
 }
 
 // readDonmaiOwnerManifestUnchecked reads dir's manifest WITHOUT the
-// directory-ownership verification readDonmaiOwnerManifest applies (see
-// verifyManifestDirectoryOwnership) — safe here ONLY because
-// pinDonmaiChildIdentity's caller is reading back a manifest it just wrote,
-// under a directory donmai itself created moments ago in the same process,
-// never an artifact discovered by a sweep. SweepOrphans itself must NEVER
-// call this directly; see readDonmaiOwnerManifest.
+// ownership proof readVerifiedDonmaiOwnerManifest requires — safe here ONLY
+// because pinDonmaiChildIdentity's caller is reading back a manifest it just
+// wrote, under a directory donmai itself created moments ago in the same
+// process, never an artifact discovered by a sweep. SweepOrphans itself must
+// NEVER call this directly; see readVerifiedDonmaiOwnerManifest.
 func readDonmaiOwnerManifestUnchecked(dir string) (donmaiOwnerManifest, bool) {
 	body, err := os.ReadFile(filepath.Join(dir, donmaiOwnerManifestName)) //nolint:gosec // G304: dir is always a donmai-owned artifact directory this package itself just created.
 	if err != nil {
 		return donmaiOwnerManifest{}, false
 	}
+	return decodeDonmaiOwnerManifest(body)
+}
+
+// donmaiOwnerManifestMaxBytes bounds how much of a manifest file the sweep
+// will read. A real manifest is a few hundred bytes; the cap only exists so
+// a corrupted or adversarial file cannot make the read itself unbounded.
+const donmaiOwnerManifestMaxBytes = 64 << 10
+
+// decodeDonmaiOwnerManifest parses manifest bytes, rejecting one that names
+// no owner at all — such a manifest can neither prove a directory is still
+// in use nor authorize reclaiming it, so it is worth exactly as much as no
+// manifest.
+func decodeDonmaiOwnerManifest(body []byte) (donmaiOwnerManifest, bool) {
 	var manifest donmaiOwnerManifest
 	if err := json.Unmarshal(body, &manifest); err != nil {
 		return donmaiOwnerManifest{}, false
@@ -137,40 +163,37 @@ func readDonmaiOwnerManifestUnchecked(dir string) (donmaiOwnerManifest, bool) {
 	return manifest, true
 }
 
-// verifyManifestDirectoryOwnership requires dir to be owned by this process's
-// own user and not writable by group or other — the same rigor
-// config_boundary.go already applies to the isolated session home itself
-// (rejectSymlink + a pinned parent + 0700 — see newCodexConfigBoundaryWithAuthMode).
+// readVerifiedDonmaiOwnerManifest is the ONLY entry point SweepOrphans
+// itself may use to read a manifest. It returns ok=true only for a manifest
+// read through readOwnedManifestBytes, which proves — on inodes it holds
+// open, not on names — that both the directory and the manifest inside it
+// are owned by this process's own user and grant no group or other access,
+// the same rigor config_boundary.go already applies to a live session home
+// (rejectSymlink + a pinned parent + 0700 — see
+// newCodexConfigBoundaryWithAuthMode).
 //
-// Without this, os.TempDir() being a shared, world-writable directory on a
-// typical unix host (ordinary /tmp) makes an unverified manifest an
+// Without that proof, os.TempDir() being a shared, world-writable directory
+// on a typical unix host (ordinary /tmp) would make a manifest an
 // unprivileged local kill primitive: any user could mkdir a
 // donmai-codex-app-*/donmai-codex-home-* directory, drop a manifest naming
 // any PID they want signalled, backdate it, and wait for the next sweep.
-// info is the caller's own Lstat of dir, reused rather than re-stat'd so
-// there is exactly one stat between "this is the directory the sweep is
-// examining" and "this is the directory whose ownership was verified".
-func verifyManifestDirectoryOwnership(info os.FileInfo) error {
-	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
-		return errors.New("not a plain directory")
-	}
-	return verifyManifestDirectoryOwnershipOS(info)
-}
-
-// readDonmaiOwnerManifest is the ONLY entry point SweepOrphans itself may use
-// to read a manifest: it refuses to trust one at all unless
-// verifyManifestDirectoryOwnership passes first. ok is false for a
-// non-donmai-owned directory, a missing file, an unreadable/malformed one,
-// or one whose PID fields are all non-positive — sweepOne treats every one
-// of those identically (fall back to the unverified-age heuristic), so
-// callers never need to distinguish the reasons.
-func readDonmaiOwnerManifest(dir string, info os.FileInfo) (donmaiOwnerManifest, bool) {
-	if err := verifyManifestDirectoryOwnership(info); err != nil {
-		slog.Warn("codex: orphan sweep found an artifact directory it does not own; treating its manifest as unverifiable",
-			"path", dir, "err", err)
+//
+// ok is false for a directory this process cannot prove it owns, a missing
+// manifest, an unreadable/malformed one, or one whose PID fields are all
+// non-positive. sweepOne treats every one of those identically — the
+// directory is "undeclared": nothing inside it may be read, and nothing
+// inside it may be deleted — so callers never need to distinguish the
+// reasons.
+func (opts SweepOptions) readVerifiedDonmaiOwnerManifest(dir string) (donmaiOwnerManifest, bool) {
+	body, err := readOwnedManifestBytes(dir)
+	if err != nil {
+		if !errors.Is(err, os.ErrNotExist) {
+			opts.Logger.Warn("codex: orphan sweep will not trust an artifact directory it cannot prove it owns; treating it as having no manifest at all",
+				"path", dir, "err", err)
+		}
 		return donmaiOwnerManifest{}, false
 	}
-	return readDonmaiOwnerManifestUnchecked(dir)
+	return decodeDonmaiOwnerManifest(body)
 }
 
 // SweepOptions configures SweepOrphans. The zero value is a usable, fully
@@ -180,27 +203,40 @@ type SweepOptions struct {
 	// os.TempDir() — the same parent newCodexConfigBoundaryWithAuthMode and
 	// startNamedInteractiveAppServer use by default.
 	Root string
-	// MinAge is how old (by directory mtime) an entry with a verified,
-	// dead owner must be before the sweep will reclaim it. Empty means 1
-	// hour.
+	// MinAge is how old (by directory mtime) an entry must be before the
+	// sweep will act on the STRONGEST evidence it can have: a verified
+	// manifest whose owner is dead and whose pinned child identity it can
+	// check directly. It is deliberately the only floor short enough to
+	// matter within one daemon's uptime, and it applies only on that path —
+	// every weaker verdict goes through UnverifiedMinAge instead. Empty
+	// means 1 hour.
 	MinAge time.Duration
 	// UnverifiedMinAge is the SEPARATE, much larger age floor required
-	// before the sweep will reclaim a directory it cannot fully verify:
-	// no manifest at all (every pre-upgrade rollout's still-running
+	// before the sweep will act at all on a directory it cannot fully
+	// verify: no manifest at all (every pre-upgrade rollout's still-running
 	// sessions look like this the moment a new daemon starts, and a
-	// manifest write is best-effort and can fail), an unowned manifest (see
-	// verifyManifestDirectoryOwnership), or a dead owner with no tracked
-	// child identity (the PTY session shape — a live orphaned codex process
-	// could still be using it, and there is no PID to check at all). A live
-	// session's top-level CODEX_HOME mtime stops moving minutes in (writes
-	// land in subdirectories), so MinAge alone is not a safe bar for any of
-	// these; only reclaiming the directory (never a process) and only past
-	// this much longer floor is. Empty means 24 hours.
+	// manifest write is best-effort and can fail), a manifest this process
+	// cannot prove it owns (see readVerifiedDonmaiOwnerManifest), or a dead
+	// owner with no tracked child identity (the PTY session shape — a live
+	// orphaned codex process could still be using it, and there is no PID
+	// to check at all). A live session's top-level CODEX_HOME mtime stops
+	// moving minutes in (writes land in subdirectories), so MinAge alone is
+	// not a safe bar for any of these; only reclaiming the directory (never
+	// a process) and only past this much longer floor is. Empty means 24
+	// hours.
 	UnverifiedMinAge time.Duration
 	// MaxEntries bounds how many donmai-named entries one sweep call will
 	// examine, so a pathologically large temp directory cannot turn daemon
 	// startup into unbounded filesystem/process work. Empty means 500.
 	MaxEntries int
+	// MaxDuration bounds the TOTAL wall clock one sweep call may spend.
+	// MaxEntries bounds how MANY entries are examined and says nothing about
+	// how LONG each takes: an entry that reaches terminate costs up to
+	// 2 x TerminationGrace, so the entry ceiling alone still admits well over
+	// an hour of work on a path documented as "run once, early, on daemon
+	// start". Both bounds are required; neither implies the other. Empty
+	// means 30s.
+	MaxDuration time.Duration
 	// TerminationGrace bounds how long the sweep waits after SIGTERM (and
 	// again after SIGKILL) before giving up on confirming a live orphaned
 	// app-server process actually died. Empty means 5s, matching
@@ -237,18 +273,25 @@ type SweepOptions struct {
 type SweepReport struct {
 	Scanned   int
 	Reclaimed int
-	// PartiallyReclaimed counts a "codex-home" directory whose scratch was
-	// removed but whose sessions/ subdirectory was deliberately left in
-	// place — see codexSessionStateSubdir's doc comment. Not a failure: an
-	// operator watching this climb over time is the intended signal that
-	// retained session state is accumulating and its own lifecycle policy
-	// (not this sweep) needs to exist.
+	// PartiallyReclaimed counts a directory whose declared-deletable entries
+	// were removed but which still holds something donmai never declared it
+	// created — resumable session state, or any codex artifact this package
+	// has not been taught about. Not a failure: an operator watching this
+	// climb over time is the intended signal that retained state is
+	// accumulating and its own lifecycle policy (not this sweep) needs to
+	// exist. See declaredDeletableEntries.
 	PartiallyReclaimed int
-	Terminated         int
-	SkippedYoung       int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
-	SkippedLive        int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
-	SkippedAmbiguous   int // a live PID that failed identity or binary-identity verification — never touched.
-	Errors             int
+	// SkippedUndeclared counts a non-empty directory the sweep could not
+	// prove it owns, so NOTHING inside it was read or deleted. On a shared
+	// os.TempDir() this is the expected count for another user's
+	// donmai-named directory; a persistent count under this daemon's own
+	// artifacts means manifest writes are failing.
+	SkippedUndeclared int
+	Terminated        int
+	SkippedYoung      int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
+	SkippedLive       int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
+	SkippedAmbiguous  int // a live PID that failed identity or binary-identity verification — never touched.
+	Errors            int
 }
 
 func (opts SweepOptions) withDefaults() SweepOptions {
@@ -263,6 +306,9 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 	}
 	if opts.MaxEntries <= 0 {
 		opts.MaxEntries = 500
+	}
+	if opts.MaxDuration <= 0 {
+		opts.MaxDuration = 30 * time.Second
 	}
 	if opts.TerminationGrace <= 0 {
 		opts.TerminationGrace = 5 * time.Second
@@ -303,10 +349,12 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 // any one of them failing leaves the entry (and any process it might name)
 // untouched:
 //
-//  1. Ownership (verifyManifestDirectoryOwnership): a manifest is trusted
-//     only when its directory is owned by this process's own user and not
-//     writable by group or other. Anything else is treated exactly like
-//     "no manifest at all" — never read, let alone acted on.
+//  1. Ownership (readVerifiedDonmaiOwnerManifest): a manifest is trusted
+//     only when the directory holding it, and the manifest file itself, are
+//     proven — on descriptors this process holds open — to be owned by its
+//     own user and to grant no group or other access. Anything else is
+//     "undeclared": the sweep reads NOTHING from it (its plugin cache
+//     included) and deletes NOTHING inside it.
 //  2. Age: MinAge for a verified-dead owner; the much larger
 //     UnverifiedMinAge for anything the sweep cannot fully verify (no
 //     manifest, an unowned one, or a dead owner with no tracked child) —
@@ -328,17 +376,33 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 //  6. Confirmed termination: SIGTERM, then SIGKILL, each followed by a
 //     liveness re-probe — reclaiming a directory (or reporting a kill) is
 //     never claimed on an unconfirmed signal.
-//  7. Resumable session state (codexSessionStateSubdir): even once a
-//     "codex-home" directory clears every gate above, a non-empty
-//     sessions/ subdirectory is NEVER deleted — see that constant's doc
-//     comment. Only scratch around it is removed, reported as
-//     PartiallyReclaimed rather than Reclaimed.
+//  7. Declared deletability (declaredDeletableEntries): even once an entry
+//     clears every gate above, the sweep removes only the specific
+//     top-level entries donmai's own manifest declares donmai created.
+//     Anything else stays, and the directory itself is removed only if
+//     nothing was left behind. A cleanup path that decided what to delete
+//     by walking the filesystem could not know whether it was deleting a
+//     resume key.
+//  8. Resume keys (codexSessionStateSubdir): a "codex-home" that still
+//     holds session state keeps its config.toml and auth link too — see
+//     that constant's doc comment. Process death is the PRECONDITION for
+//     resume, so it cannot also be the trigger for deleting what resume
+//     needs.
 //
-// Work is bounded by opts.MaxEntries so a pathological temp directory
-// cannot turn daemon startup into unbounded filesystem or process work.
+// Work is bounded on both axes: opts.MaxEntries caps how many entries one
+// call examines, and opts.MaxDuration caps the total wall clock it may
+// spend — an entry that reaches termination costs real time regardless of
+// how few entries there are, so neither bound implies the other.
 func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 	opts = opts.withDefaults()
 	var report SweepReport
+
+	// The wall-clock budget is enforced through ctx so that every blocking
+	// step below — the per-entry loop AND the termination waits inside it —
+	// observes the same deadline. Bounding only the loop would leave a
+	// single entry free to burn 2 x TerminationGrace with nothing watching.
+	ctx, cancel := context.WithTimeout(ctx, opts.MaxDuration)
+	defer cancel()
 
 	entries, err := os.ReadDir(opts.Root)
 	if err != nil {
@@ -355,9 +419,9 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		var kind string
 		switch {
 		case strings.HasPrefix(name, codexHomePrefix):
-			kind = "codex-home"
+			kind = sweepKindCodexHome
 		case strings.HasPrefix(name, codexAppSocketPrefix):
-			kind = "codex-app-socket"
+			kind = sweepKindAppSocket
 		default:
 			continue // outside the fence: never even looked at further.
 		}
@@ -367,7 +431,7 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 			break
 		}
 		report.Scanned++
-		opts.sweepOne(filepath.Join(opts.Root, name), kind, &report)
+		opts.sweepOne(ctx, filepath.Join(opts.Root, name), kind, &report)
 	}
 
 	opts.Logger.Info("codex: orphan sweep complete",
@@ -375,6 +439,7 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		"scanned", report.Scanned,
 		"reclaimed", report.Reclaimed,
 		"partiallyReclaimed", report.PartiallyReclaimed,
+		"skippedUndeclared", report.SkippedUndeclared,
 		"terminated", report.Terminated,
 		"skippedYoung", report.SkippedYoung,
 		"skippedLive", report.SkippedLive,
@@ -384,19 +449,24 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 	return report
 }
 
-func (opts SweepOptions) sweepOne(path, kind string, report *SweepReport) {
+func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report *SweepReport) {
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		// Not a plain directory (or already gone) — never our shape.
 		return
 	}
-	if opts.now().Sub(info.ModTime()) < opts.MinAge {
-		report.SkippedYoung++
-		return
-	}
-	manifest, hasManifest := readDonmaiOwnerManifest(path, info)
-	if !hasManifest {
-		opts.reclaimUnverified(path, kind, info, report)
+	age := opts.now().Sub(info.ModTime())
+	manifest, declared := opts.readVerifiedDonmaiOwnerManifest(path)
+	if !declared {
+		// No manifest this process can prove is its own. Nothing here is
+		// declared deletable and nothing here may be read — the most the
+		// sweep can do is remove the directory if it is already empty, and
+		// only past the much larger unverified floor.
+		if age < opts.UnverifiedMinAge {
+			report.SkippedYoung++
+			return
+		}
+		opts.reclaim(path, kind, false, report)
 		return
 	}
 	if opts.ownerAlive(manifest) {
@@ -407,9 +477,20 @@ func (opts SweepOptions) sweepOne(path, kind string, report *SweepReport) {
 		// Owner is gone, but no child was ever tracked for this directory
 		// shape (the PTY session case — ptycli exposes no child PID at
 		// all). A live orphaned codex process could still be using it;
-		// there is no PID to check. Reclaiming the directory ALONE (never
-		// a process) still requires the much larger age floor.
-		opts.reclaimUnverified(path, kind, info, report)
+		// there is no PID to check. Acting on the directory ALONE (never a
+		// process) still requires the much larger age floor.
+		if age < opts.UnverifiedMinAge {
+			report.SkippedYoung++
+			return
+		}
+		opts.reclaim(path, kind, true, report)
+		return
+	}
+	if age < opts.MinAge {
+		// The strongest-evidence path (a verified manifest with a pinned
+		// child identity) is the only one MinAge governs — see its doc
+		// comment.
+		report.SkippedYoung++
 		return
 	}
 	alive, err := opts.identityAlive(manifest.ChildIdentity)
@@ -422,7 +503,7 @@ func (opts SweepOptions) sweepOne(path, kind string, report *SweepReport) {
 	if !alive {
 		// Confirmed: the owner is dead AND the exact child incarnation it
 		// started is dead too (identity-verified, not just "PID absent").
-		opts.reclaim(path, kind, report)
+		opts.reclaim(path, kind, true, report)
 		return
 	}
 	if !opts.processLooksLikeCodex(manifest.ChildIdentity.PID, opts.BinaryHint) {
@@ -435,21 +516,10 @@ func (opts SweepOptions) sweepOne(path, kind string, report *SweepReport) {
 			"path", path, "kind", kind, "pid", manifest.ChildIdentity.PID)
 		return
 	}
-	if !opts.terminate(manifest.ChildIdentity, path, report) {
+	if !opts.terminate(ctx, manifest.ChildIdentity, path, report) {
 		return // termination could not be confirmed; its directory stays too.
 	}
-	opts.reclaim(path, kind, report)
-}
-
-// reclaimUnverified applies UnverifiedMinAge — the separate, much larger age
-// floor — before reclaiming a directory the sweep could not fully verify
-// (see UnverifiedMinAge's doc comment). Never touches a process.
-func (opts SweepOptions) reclaimUnverified(path, kind string, info os.FileInfo, report *SweepReport) {
-	if opts.now().Sub(info.ModTime()) < opts.UnverifiedMinAge {
-		report.SkippedYoung++
-		return
-	}
-	opts.reclaim(path, kind, report)
+	opts.reclaim(path, kind, true, report)
 }
 
 // ownerAlive reports whether manifest's owner is still running. A pinned
@@ -503,54 +573,168 @@ func (opts SweepOptions) ownerAlive(manifest donmaiOwnerManifest) bool {
 // change to this retention policy must land consistent with wherever that
 // work puts session state — check for it before changing this constant.
 // Until it lands, the sweep's only safe move for a home directory that
-// still holds session state is reclaimSweepScratch below: strip everything
-// ELSE (config.toml, the linked auth.json, the plugin-cache staging copy,
-// the owner manifest itself) and leave sessions/ — and therefore the
-// directory itself — in place, indefinitely, rather than guess at a
-// retention window no timer could honestly justify (a resume request has
-// no natural expiry). Do not "simplify" this back to an unconditional
-// RemoveAll without confirming that relocation work has landed and this is
-// where it wants the cleanup enforced.
+// still holds session state is to strip the one thing a resume provably
+// does not need — the plugin-cache staging copy, which is re-derivable
+// network data and is harvested into the host cache first — and leave
+// everything else in place, indefinitely, rather than guess at a retention
+// window no timer could honestly justify (a resume request has no natural
+// expiry). Do not "simplify" this back to an unconditional RemoveAll
+// without confirming that relocation work has landed and this is where it
+// wants the cleanup enforced.
+//
+// "Everything else" deliberately includes config.toml and the linked
+// auth.json. An earlier shape of this sweep deleted exactly those two and
+// kept only the rollout file, which has the causality backwards: a daemon
+// restart makes the previous daemon dead, and "owner dead" is the very
+// condition that admits a directory to reclamation — so process death was
+// simultaneously the precondition for a resume and the trigger for deleting
+// what the resume needs. The retained auth link is a real, honest cost of
+// that choice (a credential hard link living in os.TempDir() for as long as
+// the session state beside it does); it is retained on purpose, for the
+// same reason and with the same expiry as the session state itself, and the
+// relocation work above is what removes both.
 const codexSessionStateSubdir = "sessions"
 
-// reclaim removes path, UNLESS it still holds resumable session state (see
-// codexSessionStateSubdir), in which case it strips everything else and
-// preserves that subdirectory instead of deleting path outright. Only
-// codex-home entries can ever hold session state at all — a
-// codex-app-socket bootstrap directory contains nothing but a Unix socket
-// and is always removed outright. Either way, whatever the directory's own
-// cache/ subtree holds is harvested into the host-level plugin cache first
-// (see harvestOrphanedPluginCache) — the fetch that session paid for is
-// otherwise simply lost, for exactly the sessions most likely to need the
-// cache-reuse mechanism (ones that crashed before they could call
-// remove()/harvestPluginCache() themselves).
-func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) {
+// declaredDeletableEntries returns the exact top-level entries donmai itself
+// creates inside an artifact directory of this kind — the ONLY things a
+// sweep may ever delete from it.
+//
+// This is an allowlist on purpose. Its predecessor was a preserve-list: it
+// deleted every top-level entry except one hardcoded name, which means any
+// codex state this package has not been taught about (archived_sessions/,
+// history.jsonl, whatever a future codex release adds) was deleted by
+// discovery. A cleanup path that decides what to delete by walking the
+// filesystem cannot know whether it is deleting a resume key; one that
+// deletes only what a manifest declares donmai created can. New state is
+// therefore preserved by default and only becomes deletable when this
+// function is deliberately taught about it.
+//
+// cache/ is removed recursively. That is not deletion by discovery: the
+// whole subtree is donmai's own staging copy, created and populated by
+// plugin_cache.go, and it is harvested into the host-level cache before
+// anything is removed.
+func declaredDeletableEntries(kind string, hasSessionState bool) map[string]bool {
+	switch kind {
+	case sweepKindCodexHome:
+		deletable := map[string]bool{codexPluginCacheSubdir: true}
+		if hasSessionState {
+			// A resume key is present: keep config.toml, the auth link, and
+			// the manifest that proves who owns this directory. See
+			// codexSessionStateSubdir above.
+			return deletable
+		}
+		deletable[codexConfigFileName] = true
+		deletable[codexAuthFileName] = true
+		deletable[donmaiOwnerManifestName] = true
+		return deletable
+	case sweepKindAppSocket:
+		// A bootstrap app-server directory holds exactly one socket plus
+		// the manifest; it never holds session state.
+		return map[string]bool{codexAppSocketFileName: true, donmaiOwnerManifestName: true}
+	default:
+		return nil
+	}
+}
+
+// reclaim removes the entries declaredDeletableEntries says donmai created
+// inside path, and then path itself only if nothing was left behind.
+//
+// declared reports whether a manifest this process PROVED it owns was read
+// from path (see readVerifiedDonmaiOwnerManifest). It gates two separate
+// things, and both directions matter:
+//
+//   - Deleting. Without a manifest declaring what donmai created here,
+//     nothing inside is deletable at all. The most the sweep may do is
+//     remove the directory if it is already empty.
+//   - Reading. The plugin-cache harvest runs ONLY for a declared directory.
+//     Refusing to trust a foreign directory's manifest while still copying
+//     out of its cache/ subtree would be a contradiction with teeth: on a
+//     world-writable os.TempDir() any local user can plant a
+//     donmai-named directory holding a doctored remote plugin catalog, and
+//     reuseCacheTree's never-overwrite rule would then make that file the
+//     permanent seed for every future session on the host. Read nothing
+//     from a directory you have declared foreign.
+//
+// The harvest itself is why a declared directory is read at all: the fetch
+// that session paid for is otherwise simply lost, for exactly the sessions
+// most likely to need the cache-reuse mechanism (ones that crashed before
+// they could call remove()/harvestPluginCache() themselves).
+func (opts SweepOptions) reclaim(path, kind string, declared bool, report *SweepReport) {
+	if !declared {
+		opts.reclaimEmptyDirectoryOnly(path, kind, report)
+		return
+	}
 	opts.harvestOrphanedPluginCache(path)
 	hasSessionState, err := dirHasEntries(filepath.Join(path, codexSessionStateSubdir))
 	if err != nil {
 		// Could not even determine whether resumable state exists. The
-		// conservative answer is "assume yes" rather than risk deleting it.
+		// conservative answer is "assume yes" rather than risk deleting the
+		// keys a resume needs.
 		hasSessionState = true
 	}
-	if hasSessionState {
-		if err := reclaimSweepScratch(path, codexSessionStateSubdir); err != nil {
-			report.Errors++
-			opts.Logger.Warn("codex: orphan sweep failed to reclaim scratch around preserved session state",
-				"path", path, "kind", kind, "err", err)
-			return
-		}
-		report.PartiallyReclaimed++
-		opts.Logger.Info("codex: orphan sweep reclaimed scratch but PRESERVED resumable session state",
-			"path", path, "kind", kind, "preserved", filepath.Join(path, codexSessionStateSubdir))
+	if err := removeDeclaredDeletables(path, declaredDeletableEntries(kind, hasSessionState)); err != nil {
+		report.Errors++
+		opts.Logger.Warn("codex: orphan sweep failed to remove the entries its own manifest declares deletable",
+			"path", path, "kind", kind, "err", err)
 		return
 	}
-	if err := os.RemoveAll(path); err != nil {
+	remaining, err := os.ReadDir(path)
+	if err != nil {
+		report.Errors++
+		opts.Logger.Warn("codex: orphan sweep could not list an artifact directory after removing its declared entries",
+			"path", path, "kind", kind, "err", err)
+		return
+	}
+	if len(remaining) > 0 {
+		report.PartiallyReclaimed++
+		opts.Logger.Info("codex: orphan sweep removed only the entries donmai declares it created and PRESERVED everything else",
+			"path", path, "kind", kind, "preserved", entryNames(remaining))
+		return
+	}
+	if err := os.Remove(path); err != nil {
 		report.Errors++
 		opts.Logger.Warn("codex: orphan sweep failed to reclaim", "path", path, "kind", kind, "err", err)
 		return
 	}
 	report.Reclaimed++
 	opts.Logger.Info("codex: orphan sweep reclaimed", "path", path, "kind", kind)
+}
+
+// reclaimEmptyDirectoryOnly is everything the sweep is permitted to do to a
+// directory it cannot prove it owns: a NON-recursive remove, which succeeds
+// exactly when the directory is already empty and fails harmlessly
+// otherwise. An empty directory is the one case where "delete only what a
+// manifest declares deletable" and "delete the directory" cannot conflict —
+// there is nothing inside to lose.
+//
+// The cost is deliberate and worth stating plainly: a manifest-less
+// directory holding content is never reclaimed. That population is bounded
+// (sessions predating the manifest, plus the best-effort writes that
+// failed), and SkippedUndeclared is the count an operator watches. Deleting
+// contents the sweep cannot attribute to donmai — to reclaim disk in
+// os.TempDir(), of all places — is not a trade this package is willing to
+// make silently.
+func (opts SweepOptions) reclaimEmptyDirectoryOnly(path, kind string, report *SweepReport) {
+	if err := os.Remove(path); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return
+		}
+		report.SkippedUndeclared++
+		opts.Logger.Info("codex: orphan sweep left an artifact directory untouched because nothing it can verify declares any of the contents deletable",
+			"path", path, "kind", kind, "err", err)
+		return
+	}
+	report.Reclaimed++
+	opts.Logger.Info("codex: orphan sweep reclaimed an empty artifact directory", "path", path, "kind", kind)
+}
+
+// entryNames renders a directory listing for a log line.
+func entryNames(entries []os.DirEntry) []string {
+	names := make([]string, 0, len(entries))
+	for _, entry := range entries {
+		names = append(names, entry.Name())
+	}
+	return names
 }
 
 // harvestOrphanedPluginCache copies back whatever an orphaned directory's
@@ -587,15 +771,21 @@ func dirHasEntries(dir string) (bool, error) {
 	return len(entries) > 0, nil
 }
 
-// reclaimSweepScratch removes every top-level entry of dir except preserve.
-func reclaimSweepScratch(dir, preserve string) error {
+// removeDeclaredDeletables removes exactly those top-level entries of dir
+// whose names appear in deletable, and nothing else. An entry named in
+// deletable but absent from dir is simply not there; an entry present in
+// dir but absent from deletable is left completely alone.
+func removeDeclaredDeletables(dir string, deletable map[string]bool) error {
+	if len(deletable) == 0 {
+		return nil
+	}
 	entries, err := os.ReadDir(dir)
 	if err != nil {
 		return err
 	}
 	var errs []error
 	for _, entry := range entries {
-		if entry.Name() == preserve {
+		if !deletable[entry.Name()] {
 			continue
 		}
 		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
@@ -614,24 +804,46 @@ func reclaimSweepScratch(dir, preserve string) error {
 // whether termination was confirmed — sweepOne only reclaims the directory
 // when this is true, since an unconfirmed-dead process could still be using
 // it.
-func (opts SweepOptions) terminate(identity sessionshim.ProcessIdentity, path string, report *SweepReport) bool {
+//
+// ctx is the sweep's wall-clock budget and is honoured at every step. It has
+// to be: sessionshim's identity check reports a ZOMBIE as alive (the process
+// table entry survives until someone reaps it, and its start time still
+// answers), so a signalled child whose real parent is gone can never be
+// confirmed dead here and burns the entire grace window twice. Multiply that
+// by MaxEntries and a "run once, early, on daemon start" path becomes over
+// an hour of blocking work. Giving up on the budget is the right answer:
+// nothing is reclaimed and nothing is claimed to have been killed.
+func (opts SweepOptions) terminate(ctx context.Context, identity sessionshim.ProcessIdentity, path string, report *SweepReport) bool {
+	if ctx.Err() != nil {
+		return false
+	}
 	process, err := os.FindProcess(identity.PID)
 	if err != nil {
 		report.Errors++
 		return false
 	}
 	_ = process.Signal(syscallSIGTERM())
-	if opts.awaitDeath(identity, opts.TerminationGrace) {
+	if opts.awaitDeath(ctx, identity, opts.TerminationGrace) {
 		report.Terminated++
 		opts.Logger.Info("codex: orphan sweep terminated an orphaned app-server", "pid", identity.PID, "path", path)
 		return true
 	}
+	if ctx.Err() != nil {
+		opts.Logger.Warn("codex: orphan sweep ran out of its wall-clock budget while waiting for an orphaned app-server to exit; leaving it and its directory alone",
+			"pid", identity.PID, "path", path, "reason", ctx.Err())
+		return false
+	}
 	_ = process.Kill()
-	if opts.awaitDeath(identity, opts.TerminationGrace) {
+	if opts.awaitDeath(ctx, identity, opts.TerminationGrace) {
 		report.Terminated++
 		opts.Logger.Warn("codex: orphan sweep force-killed an orphaned app-server after its grace window expired",
 			"pid", identity.PID, "path", path)
 		return true
+	}
+	if ctx.Err() != nil {
+		opts.Logger.Warn("codex: orphan sweep ran out of its wall-clock budget while confirming an orphaned app-server's death; leaving its directory alone",
+			"pid", identity.PID, "path", path, "reason", ctx.Err())
+		return false
 	}
 	report.Errors++
 	opts.Logger.Warn("codex: orphan sweep could not confirm an orphaned app-server was terminated; leaving its directory in place",
@@ -639,10 +851,12 @@ func (opts SweepOptions) terminate(identity sessionshim.ProcessIdentity, path st
 	return false
 }
 
-// awaitDeath polls identity's liveness until it reports dead or grace
-// elapses.
-func (opts SweepOptions) awaitDeath(identity sessionshim.ProcessIdentity, grace time.Duration) bool {
+// awaitDeath polls identity's liveness until it reports dead, grace elapses,
+// or the sweep's wall-clock budget runs out — whichever comes first.
+func (opts SweepOptions) awaitDeath(ctx context.Context, identity sessionshim.ProcessIdentity, grace time.Duration) bool {
 	deadline := opts.now().Add(grace)
+	ticker := time.NewTicker(20 * time.Millisecond)
+	defer ticker.Stop()
 	for {
 		if alive, err := opts.identityAlive(identity); err == nil && !alive {
 			return true
@@ -650,6 +864,10 @@ func (opts SweepOptions) awaitDeath(identity sessionshim.ProcessIdentity, grace 
 		if !opts.now().Before(deadline) {
 			return false
 		}
-		time.Sleep(20 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			return false
+		case <-ticker.C:
+		}
 	}
 }
