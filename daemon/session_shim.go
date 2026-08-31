@@ -1573,6 +1573,16 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// the composing carrier each exact fact and require its durable handoff
 	// before publishing adoptionComplete or starting registration.
 	entries := make(map[sessionshim.Identity]adoptedShim, len(result.Adopted))
+	// adoptionFailures collects lineages whose OWN durable-adoption callback
+	// refused them — e.g. a durable resume proof that does not match what the
+	// shim now proves (measured live: an attachclient v2 high-water/carrier-
+	// boundary mismatch). That is a fact about the ONE lineage, never about
+	// this daemon's ability to establish its host identity, so it must not
+	// fail the whole composition closed the way sessionShimAdoptionEvidence's
+	// host-resolution failure genuinely does below. Each failed lineage is
+	// quarantined instead — no controller authority granted, its shim not
+	// killed — and composition continues for every other lineage.
+	adoptionFailures := make(map[sessionshim.Identity]sessionshim.QuarantinedSession)
 	gates := make(map[*sessionshim.Controller]*shimAdoptionGate, len(result.Adopted))
 	gatesCommitted := false
 	defer func() {
@@ -1587,6 +1597,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		preparation := preparedByID[id]
 		evidence, evidenceErr := d.sessionShimAdoptionEvidence(ctx, c, preparation, hostByID[id])
 		if evidenceErr != nil {
+			// Host authority itself could not be resolved for this
+			// controller's organization — every OTHER lineage in that same
+			// organization would fail identically, so there is nothing
+			// narrower than the whole composition to abort here.
 			result.Close()
 			return fmt.Errorf("session shim: resolve adoption host for %s: %w", id, evidenceErr)
 		}
@@ -1597,8 +1611,32 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
-			result.Close()
-			return fmt.Errorf("session shim: durable adoption for %s: %w", id, callbackErr)
+			// NOT retried here, deliberately noted rather than silently
+			// accepted: a quarantined lineage keeps its shim (never killed),
+			// but no controller ever renews its orphan clock, so a callback
+			// failure that was really just a transient blip still condemns an
+			// otherwise-healthy session to self-teardown at
+			// DefaultOrphanPolicy's deadline (~90s) with no second attempt in
+			// THIS pass. The retry doctrine this PR applies to the batch
+			// commit (completeLaunchedSessionShimAdoptionBatchResilient) is
+			// intentionally NOT duplicated here: this pass already has to stay
+			// bounded across every lineage it composes, and a future
+			// bounded per-lineage retry (or a reconciliation pass that
+			// re-attempts a quarantined lineage before its orphan deadline)
+			// is the right follow-up rather than something to fold in here.
+			slog.Error("session shim: durable adoption failed for one lineage; quarantining it and composing the rest of the host",
+				"session", id.String(), "error", callbackErr)
+			hello := c.Hello()
+			adoptionFailures[id] = sessionshim.QuarantinedSession{
+				OrgID: id.OrgID, SessionID: id.SessionID,
+				ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
+				ControllerGeneration: uint64(c.Generation()),
+				ProtocolMin:          hello.Min, ProtocolMax: hello.Max, Phase: hello.Phase,
+				Reason:           sessionshim.QuarantineAdoptionFailed,
+				Detail:           callbackErr.Error(),
+				ConsumesCapacity: true,
+			}
+			continue
 		}
 		// The proxy is a synchronous takeover capability, not retained state.
 		evidence.SnapshotProxy = nil
@@ -1668,7 +1706,19 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			}
 			batch := SessionShimAdoptionBatch{OrgID: orgID, HostID: hostID}
 			for _, controller := range result.Adopted {
-				entry := entries[controller.Identity()]
+				id := controller.Identity()
+				if failed, ok := adoptionFailures[id]; ok {
+					// A batch is a COMPLETE snapshot: a lineage quarantined
+					// for a failed durable adoption is still LIVE capacity
+					// and must still be presented, never silently omitted,
+					// or the commit is refused for an unaccounted-for
+					// lineage.
+					if id.OrgID == orgID {
+						batch.Quarantined = append(batch.Quarantined, failed)
+					}
+					continue
+				}
+				entry := entries[id]
 				if entry.adoption.Identity.OrgID == orgID {
 					if entry.adoption.CarrierCompatible {
 						batch.Adopted = append(batch.Adopted, SessionShimAdoptionOutcome{
@@ -1746,12 +1796,29 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		}
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
+	for _, failed := range adoptionFailures {
+		// upsertShimQuarantineLocked keeps this daemon's live-state
+		// projection (§D7: visible, capacity-honest) in sync with what the
+		// batch above already durably published for these lineages.
+		d.upsertShimQuarantineLocked(failed)
+	}
 	d.shims.tombstoned = append(d.shims.tombstoned, result.Tombstoned...)
 	for orgID, receipt := range batchReceipts {
 		d.shims.batchReceipts[orgID] = receipt
 	}
 	d.shims.mu.Unlock()
-	for _, gate := range gates {
+	for c, gate := range gates {
+		if _, failed := adoptionFailures[c.Identity()]; failed {
+			// Never adopted: no controller authority granted, so its gate
+			// resolves false exactly as an ordinary refused adoption would.
+			// releaseShimIfLive would no-op here (this identity never enters
+			// d.shims.adopted), so this closes the connection directly — the
+			// shim itself is not killed, only this daemon's control socket
+			// to it.
+			gate.finish(false)
+			_ = c.Close()
+			continue
+		}
 		gate.finish(true)
 	}
 	gatesCommitted = true
@@ -1793,8 +1860,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	}
 
 	slog.Info("session shim: startup adoption complete",
-		"adopted", len(result.Adopted),
-		"quarantined", len(result.Quarantined),
+		"adopted", len(entries),
+		"quarantined", len(result.Quarantined)+len(adoptionFailures),
+		"failedDurableAdoption", len(adoptionFailures),
 		"tombstoned", len(result.Tombstoned),
 		"stale", len(result.Stale),
 		"occupiedSlots", result.OccupiedSlots())

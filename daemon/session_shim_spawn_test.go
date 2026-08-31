@@ -11,6 +11,7 @@ import (
 	"path/filepath"
 	"reflect"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -789,11 +790,24 @@ func TestMain(m *testing.M) {
 	os.Exit(m.Run())
 }
 
+// envDaemonShimHelperStartDelayMS is a TEST-ONLY seam, read only by this
+// helper (never by production sessionshim.Start): it lets an end-to-end
+// launch test reproduce a harness cold start that lands a real discovery
+// record a hair past the daemon's configured launch timeout, without
+// touching production code at all — see
+// TestLaunchSessionShimAdoptsThroughTheRealPathWhenDiscoveryArrivesLate.
+const envDaemonShimHelperStartDelayMS = "DONMAI_TEST_SHIM_HELPER_START_DELAY_MS"
+
 func runDaemonShimHelper() int {
 	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
 	if err != nil {
 		fmt.Fprintln(os.Stderr, "daemon shim helper: launch env:", err)
 		return 1
+	}
+	if raw := os.Getenv(envDaemonShimHelperStartDelayMS); raw != "" {
+		if ms, parseErr := strconv.Atoi(raw); parseErr == nil && ms > 0 {
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
 	}
 	// The worker resolves the same <parent>/<sessionID> leaf the daemon
 	// publishes, which is what makes the adoption-time workarea comparison a real
@@ -2549,7 +2563,37 @@ func TestStartupAdoptionReleasesEachScopeOnlyAfterExactHeartbeat(t *testing.T) {
 	}
 }
 
-func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T) {
+// TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry covers a
+// composing carrier's durable-adoption refusal for the ONLY lineage a startup
+// pass finds.
+//
+// Pre-fix, ANY OnAdoption refusal aborted the whole composition
+// (adoptSessionShims returned the error and adoptionComplete never latched) —
+// indistinguishable, from a single-lineage host, from the multi-lineage
+// collateral-damage bug this file's other partial-composition test pins.
+// Post-fix, a refused lineage is quarantined (visible, capacity-honest, no
+// controller authority granted, its shim not killed) and the composition
+// still completes — a host that could not durably back its only session is
+// not the same as a host that does not know what it has. The shim's record
+// survives the quarantine untouched, so a LATER daemon can still adopt it —
+// which is exactly what this test's second half already proved.
+//
+// DELIBERATE READINESS-SEMANTICS INVERSION, REVIEWED AND ACCEPTED — not an
+// incidental test tweak: this daemon now comes up with
+// SessionShimAdoptionComplete() == true and RegistrationStatus() != draining
+// even though its ONE AND ONLY lineage's durable adoption was refused. Before
+// this fix, the identical scenario left the daemon adoptionComplete==false
+// forever and RegistrationStatus()==draining forever (a daemon restart was
+// the only recovery). The inversion is intentional and correctly scoped:
+// failure is scoped to the ONE lineage that actually failed rather than to
+// the whole host, exactly like the multi-lineage case; capacity honesty for
+// the refused lineage is carried by SessionShimOccupancy/ConsumesCapacity
+// (asserted below), NOT by holding the whole host in draining. A composing
+// carrier that is genuinely down (rather than one specific lineage's own
+// resume state being unusable) still fails closed at the batch commit itself
+// — this quarantine path is reached only after that per-lineage callback
+// already ran and refused.
+func TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	// Give two replacement attempts ample room before the shim-owned orphan
 	// deadline. The first is deliberately refused by the composing callback.
@@ -2574,15 +2618,44 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 	})
 	refusing.config = &Config{Capacity: CapacityConfig{MaxConcurrentSessions: 4}}
 	refusing.setState(StateRunning)
-	err := refusing.adoptSessionShims(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "durable carrier unavailable") {
-		t.Fatalf("adoptSessionShims = %v, want durable carrier refusal", err)
+	if err := refusing.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("adoptSessionShims = %v, want the refused lineage quarantined rather than a host-wide failure", err)
 	}
-	if refusing.SessionShimAdoptionComplete() {
-		t.Fatal("adoption reads complete after durable carrier refusal")
+	if !refusing.SessionShimAdoptionComplete() {
+		t.Fatal("adoption did not complete after quarantining the one lineage that refused")
 	}
-	if got := refusing.RegistrationStatus(); got != RegistrationDraining {
-		t.Fatalf("RegistrationStatus after callback refusal = %q, want draining", got)
+	if _, err := refusing.adoptedShimEntry(id.OrgID, id.SessionID); err == nil {
+		t.Fatal("the refused lineage was granted controller authority anyway")
+	}
+	found := false
+	for _, q := range refusing.QuarantinedSessions() {
+		if q.Identity() != id {
+			continue
+		}
+		found = true
+		if q.Reason != sessionshim.QuarantineAdoptionFailed || !strings.Contains(q.Detail, "durable carrier unavailable") {
+			t.Fatalf("refused lineage quarantine = %+v, want reason %q with the callback's detail",
+				q, sessionshim.QuarantineAdoptionFailed)
+		}
+	}
+	if !found {
+		t.Fatal("the refused lineage was not surfaced as quarantined")
+	}
+	// Capacity honesty (§D7): the quarantined lineage's harness is still
+	// running and still occupies a slot, even though this daemon holds no
+	// authority over it.
+	if got := refusing.SessionShimOccupancy(); got != 1 {
+		t.Fatalf("SessionShimOccupancy after quarantining the only lineage = %d, want 1", got)
+	}
+	// Deliberately NOT draining: pre-fix, a refused lineage kept
+	// adoptionComplete false forever, which RegistrationStatus reads as
+	// draining. Composition now completes with the lineage quarantined
+	// instead, so RegistrationStatus falls through to its ordinary
+	// idle/busy accounting — capacity honesty is carried by
+	// SessionShimOccupancy/ConsumesCapacity above, not by holding the whole
+	// host in draining for one lineage it could not durably back.
+	if got := refusing.RegistrationStatus(); got == RegistrationDraining {
+		t.Fatalf("RegistrationStatus after quarantining the only lineage = %q, want NOT draining (capacity honesty is carried by occupancy, not registration status)", got)
 	}
 
 	var emitted shimwire.SnapshotResult

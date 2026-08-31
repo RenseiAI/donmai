@@ -300,8 +300,43 @@ func TestFailedPublicationCarryingAQuarantineChangeRollsBackAndKeepsBeating(t *t
 	if projection.AdoptionRevision != committed.AdoptionRevision {
 		t.Fatalf("post-rollback revision = %q, want the committed %q", projection.AdoptionRevision, committed.AdoptionRevision)
 	}
-	if len(projection.QuarantinedSessions) != 1 || projection.QuarantinedSessions[0].SessionID != "quarantine-flavor-drop" {
-		t.Fatalf("post-rollback quarantine set = %+v, want the committed releaseShimIfLive entry", projection.QuarantinedSessions)
+	// TWO entries now, not one: the pre-existing "quarantine-flavor-drop" the
+	// committed republish already carried, PLUS "quarantine-flavor-launch"
+	// itself. The launch's own OnAdoption succeeded (configureDynamicPublicationProbe's
+	// fake durably records it) before the batch commit ever ran, so the
+	// control plane already holds "quarantine-flavor-launch" live regardless
+	// of how many times the batch that would durably publish it gets
+	// refused. completeLaunchedSessionShimAdoptionBatchResilient's exhaustion
+	// path records exactly that into this daemon's own quarantine projection
+	// — never leaving local state claiming "nothing happened" when the
+	// control plane's own per-session record says otherwise, which is what
+	// let a later, unrelated batch get refused for omitting it (measured in
+	// review, independent of this rollback path).
+	//
+	// NOT free of consequence, though: in THIS test the restore batch also
+	// fails (refuse never clears), so this entry was never durably committed
+	// to the control plane either. The beat now presents a quarantine set
+	// the platform's own last-COMMITTED batch does not know about, and
+	// sessionShimProjectionBatch's own doc comment says exactly what a real
+	// control plane does with that mismatch: demote the host to draining
+	// until the sets agree again. This test's fake heartbeat receiver does
+	// not model that comparison, so it cannot fail this assertion — but a
+	// real deployment would ride out one bounded demotion window here,
+	// cleared by the same orphan-deadline tombstone path that already
+	// clears every other quarantined lineage (measured: ~2.26s from
+	// exhaustion to occupancy 1→0 in review). Bounded and self-healing, and
+	// strictly better than a prior round's permanent full-batch refusal —
+	// but not orthogonal to, and not something the checkpoint/rollback
+	// machinery here corrects for. That machinery genuinely never touches
+	// d.shims.quarantined at all; it just doesn't make this consequence-free.
+	wantQuarantined := map[string]bool{"quarantine-flavor-drop": true, "quarantine-flavor-launch": true}
+	if len(projection.QuarantinedSessions) != len(wantQuarantined) {
+		t.Fatalf("post-rollback quarantine set = %+v, want exactly %v", projection.QuarantinedSessions, wantQuarantined)
+	}
+	for _, q := range projection.QuarantinedSessions {
+		if !wantQuarantined[q.SessionID] {
+			t.Fatalf("post-rollback quarantine set = %+v, want exactly %v", projection.QuarantinedSessions, wantQuarantined)
+		}
 	}
 	waitFor(t, 5*time.Second, "the correcting beat after the quarantine-flavor rollback", func() bool {
 		return rb.recorder.count() > baseline
