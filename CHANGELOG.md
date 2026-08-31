@@ -6,6 +6,45 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.12 — 2026-08-31
+
+### Fixes
+
+- **Forced re-registration after a lost worker registration no longer
+  publishes stale capacity for a session-shim-attested daemon.** Registration
+  capacity used to zero out only when the caller explicitly requested
+  auth-only recovery, so a daemon that had already composed durable sessions
+  after boot could re-register with a nonzero capacity while its session-shim
+  attestation was still enabled — a claimable slot the platform's auth-only
+  guard correctly refuses, looping the re-registration instead of recovering.
+  Capacity now derives from the same session-shim option that governs the
+  attestation itself, so any session-shim-attested registration — forced or
+  not — publishes zero capacity until adoption completes. (#495)
+
+- **The codex bootstrap app-server's stderr is captured instead of
+  discarded, so a crash during spawn is diagnosable from the log alone.**
+  Named interactive sessions spawn a bootstrap `codex app-server` process
+  that a PTY client attaches to over a local socket; when that process died
+  mid-startup, the client only observed a dropped socket and exited clean,
+  hiding the real cause. Its stderr is now held in a bounded, redacted ring
+  buffer (last 64KiB, tail-excerpted) shared with the headless app-server,
+  surfaced in a structured, level-differentiated line on every exit — logged
+  exactly once per process — and attached as a bounded excerpt to
+  spawn/lifecycle errors. Values shaped like bearer tokens, API keys, and
+  donmai's own machine-token format are redacted before anything is logged
+  or returned. (#496)
+
+- **Named codex interactive sessions no longer fail spawn when the naming
+  read-back races the rollout flush.** The read-back verification issued
+  right after naming a session's thread could land before codex's
+  app-server had finished flushing that thread's rollout metadata to disk;
+  the resulting transient error was treated as a spawn failure and killed
+  the session seconds after start, most reproducibly on hosts with slow
+  disk I/O. That specific error shape now gets a bounded exponential-backoff
+  retry; any other error, including an unrelated failure with the same error
+  code, still fails immediately, and an exhausted retry surfaces the genuine
+  underlying error with the attempt count folded in for diagnosis. (#497)
+
 ## v0.72.11 — 2026-08-31
 
 ### Fixes
