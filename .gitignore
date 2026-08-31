@@ -28,5 +28,6 @@ __pycache__/
 **/.gocache/
 **/go-build/
 **/.golangci-lint-cache/
+**/.golangci-cache/
 
 dist/
