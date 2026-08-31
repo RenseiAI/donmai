@@ -169,7 +169,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: piReceiptCell("harness/v2", realModel, executioncell.SessionHumanControlled, nil),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -216,7 +216,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: piReceiptCell("harness/v2", realModel, executioncell.SessionHumanControlled, nil),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}

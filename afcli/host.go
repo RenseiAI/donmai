@@ -76,13 +76,12 @@ func newHostCmdWithFactory(factory daemonClientFactory, ds func() afclient.DataS
 // for the daemon-targeted families. The behaviour is identical because the
 // leaves are pure functions of (factory, cfg).
 func addHostLifecycleCommands(parent *cobra.Command, factory daemonClientFactory, cfg Config) {
-	hostVersion := cfg.HostBinaryVersion
 	bin := binaryName(cfg)
 
 	parent.AddCommand(newDaemonInstallCmd(bin))
 	parent.AddCommand(newDaemonUninstallCmd(bin))
 	parent.AddCommand(newDaemonSetupCmd())
-	parent.AddCommand(newDaemonRunCmd(hostVersion))
+	parent.AddCommand(newDaemonRunCmd(cfg))
 	parent.AddCommand(newDaemonStatusCmd(factory, bin))
 	parent.AddCommand(newDaemonLogsCmd())
 	parent.AddCommand(newDaemonDoctorCmd(bin))

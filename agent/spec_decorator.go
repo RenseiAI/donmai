@@ -41,6 +41,27 @@ import "context"
 // capability-gated Spec field the exact selected harness doesn't honor.
 type ExtensionDecorator func(spec Spec) []ExtensionDelivery
 
+// ApplyExtensionDecorator returns spec with decorate's deliveries appended to
+// AdditionalExtensions — the exact mutation DecorateProvider's wrapped
+// Spawn/Resume applies (decorateSpec, below), exported so a preflight
+// compiler can apply the identical decorator to the identical spec shape
+// BEFORE persisting a ToolLifecycleReceipt from it.
+//
+// This exists because CompilePreparedHarness/ApplyPreparedHarness must stay
+// side-effect-free (PreparedHarness is a secret-free, digest-only authority —
+// see its doc comment), so a compile site can never reach a decorator by
+// calling through Provider.Spawn/Resume the way DecorateProvider does — it
+// has to apply the same pure function directly. See
+// runner.ReconcileAdditionalExtensions for the shared constructor that
+// threads this into both the daemon's preflight compiler and the runner's
+// own prepared-source authority check, so an embedder's
+// AgentSpecExtensionDecorator (donmai-architecture
+// 002-provider-base-contract.md §E) can never be visible to only one of the
+// two compile sites that must agree on Spec.AdditionalExtensions.
+func ApplyExtensionDecorator(spec Spec, decorate ExtensionDecorator) Spec {
+	return decorateSpec(spec, decorate)
+}
+
 // decorateSpec returns spec with decorate's deliveries appended to
 // AdditionalExtensions, without mutating spec's own backing array. A nil
 // decorate, or one that returns no deliveries, returns spec unchanged

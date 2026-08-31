@@ -32,7 +32,15 @@ func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
 	return qw
 }
 
-func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.Spec, []string, error) {
+// decorate is the embedder's additional-extension decorator
+// (afcli.Config.AgentSpecExtensionDecorator), applied via
+// ReconcileAdditionalExtensions before this function returns spec — see that
+// function's doc comment for why every caller that persists or compares a
+// ToolLifecycleReceipt against this Spec must supply the SAME decorate value
+// the real spawn's decorated Provider will apply. nil is a legitimate value:
+// a session with no registered decorator never had this mutation to
+// reconcile.
+func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
@@ -102,6 +110,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.S
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
+	spec = ReconcileAdditionalExtensions(spec, decorate)
 	return spec, runtimeNames, nil
 }
 
@@ -114,8 +123,12 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection) (agent.S
 // with a declared repository must never leave this reconciliation to only
 // one of the two compile sites. Nil is a legitimate value: a repository-free
 // or non-multi-repo-protocol session never had this mutation to reconcile.
-func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration) (*agent.PreparedHarness, agent.Spec, error) {
-	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection)
+// decorate is forwarded to buildPreparedSourceSpec — see its doc comment and
+// ReconcileAdditionalExtensions for why the daemon's preflight compiler
+// (ProviderView.PreflightExecution, the sole caller of this function) must
+// supply the SAME embedder decorator the real spawn's Provider will apply.
+func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator) (*agent.PreparedHarness, agent.Spec, error) {
+	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, decorate)
 	if err != nil {
 		return nil, agent.Spec{}, err
 	}

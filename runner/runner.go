@@ -254,6 +254,18 @@ type Options struct {
 	// sets this to the SANDBOX OS ("linux") for cloud-targeted sessions so
 	// install scripts match the sandbox, not the dispatching host (OD-2).
 	KitTargetOS string
+
+	// AdditionalExtensionDecorator is the SAME agent.ExtensionDecorator
+	// (afcli.Config.AgentSpecExtensionDecorator) the `agent run` subcommand
+	// applies to every provider it registers (afcli/agent_run.go's
+	// decorateRegistryProviders). Runner's own prepared-source authority
+	// self-check (runLoop, via buildPreparedSourceSpec) must apply the
+	// identical decorator, or that self-check's recomputed
+	// ToolLifecycleReceipt can drift from the daemon-persisted plan the
+	// moment PreflightExecution's own compile also starts accounting for it
+	// — see runner.ReconcileAdditionalExtensions's doc comment. nil
+	// preserves the historical undecorated behavior.
+	AdditionalExtensionDecorator agent.ExtensionDecorator
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -283,33 +295,34 @@ type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptF
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry              *Registry
-	wt                    *worktree.Manager
-	poster                *result.Poster
-	credentialProvider    CredentialProvider
-	envc                  *env.Composer
-	mcpb                  *mcp.Builder
-	store                 *state.Store
-	promptBuilder         *prompt.Builder
-	httpClient            *http.Client
-	logger                *slog.Logger
-	now                   func() time.Time
-	maxDuration           time.Duration
-	idleTimeout           time.Duration
-	preserveOnFail        bool
-	preserveAlways        bool
-	skipBackstop          bool
-	skipSteering          bool
-	skipPostSession       bool
-	hbInterval            time.Duration
-	spanEmissionEnabled   bool
-	spanEndpointPath      string
-	kitSkillSources       []kit.KitSkillSource
-	kitSkillDetector      KitSkillDetector
-	kitPromptFragDetector KitPromptFragmentDetector
-	kitDetector           KitDetector
-	kitComposer           KitComposer
-	kitTargetOS           string
+	registry                     *Registry
+	wt                           *worktree.Manager
+	poster                       *result.Poster
+	credentialProvider           CredentialProvider
+	envc                         *env.Composer
+	mcpb                         *mcp.Builder
+	store                        *state.Store
+	promptBuilder                *prompt.Builder
+	httpClient                   *http.Client
+	logger                       *slog.Logger
+	now                          func() time.Time
+	maxDuration                  time.Duration
+	idleTimeout                  time.Duration
+	preserveOnFail               bool
+	preserveAlways               bool
+	skipBackstop                 bool
+	skipSteering                 bool
+	skipPostSession              bool
+	hbInterval                   time.Duration
+	spanEmissionEnabled          bool
+	spanEndpointPath             string
+	kitSkillSources              []kit.KitSkillSource
+	kitSkillDetector             KitSkillDetector
+	kitPromptFragDetector        KitPromptFragmentDetector
+	kitDetector                  KitDetector
+	kitComposer                  KitComposer
+	kitTargetOS                  string
+	additionalExtensionDecorator agent.ExtensionDecorator
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -342,33 +355,34 @@ func New(opts Options) (*Runner, error) {
 		return nil, errors.New("runner: Poster is required")
 	}
 	r := &Runner{
-		registry:              opts.Registry,
-		wt:                    opts.WorktreeManager,
-		poster:                opts.Poster,
-		credentialProvider:    opts.CredentialProvider,
-		envc:                  opts.EnvComposer,
-		mcpb:                  opts.MCPBuilder,
-		store:                 opts.StateStore,
-		promptBuilder:         opts.PromptBuilder,
-		httpClient:            opts.HTTPClient,
-		logger:                opts.Logger,
-		now:                   opts.Now,
-		maxDuration:           opts.MaxSessionDuration,
-		idleTimeout:           opts.IdleTimeout,
-		preserveOnFail:        opts.PreserveWorktreeOnFailure,
-		preserveAlways:        opts.PreserveWorktreeAlways,
-		skipBackstop:          opts.SkipBackstop,
-		skipSteering:          opts.SkipSteering,
-		skipPostSession:       opts.SkipPostSession,
-		hbInterval:            opts.HeartbeatInterval,
-		spanEmissionEnabled:   opts.SpanEmissionEnabled,
-		spanEndpointPath:      opts.SpanEndpointPath,
-		kitSkillSources:       opts.KitSkillSources,
-		kitSkillDetector:      opts.KitSkillDetector,
-		kitPromptFragDetector: opts.KitPromptFragmentDetector,
-		kitDetector:           opts.KitDetector,
-		kitComposer:           opts.KitComposer,
-		kitTargetOS:           opts.KitTargetOS,
+		registry:                     opts.Registry,
+		wt:                           opts.WorktreeManager,
+		poster:                       opts.Poster,
+		credentialProvider:           opts.CredentialProvider,
+		envc:                         opts.EnvComposer,
+		mcpb:                         opts.MCPBuilder,
+		store:                        opts.StateStore,
+		promptBuilder:                opts.PromptBuilder,
+		httpClient:                   opts.HTTPClient,
+		logger:                       opts.Logger,
+		now:                          opts.Now,
+		maxDuration:                  opts.MaxSessionDuration,
+		idleTimeout:                  opts.IdleTimeout,
+		preserveOnFail:               opts.PreserveWorktreeOnFailure,
+		preserveAlways:               opts.PreserveWorktreeAlways,
+		skipBackstop:                 opts.SkipBackstop,
+		skipSteering:                 opts.SkipSteering,
+		skipPostSession:              opts.SkipPostSession,
+		hbInterval:                   opts.HeartbeatInterval,
+		spanEmissionEnabled:          opts.SpanEmissionEnabled,
+		spanEndpointPath:             opts.SpanEndpointPath,
+		kitSkillSources:              opts.KitSkillSources,
+		kitSkillDetector:             opts.KitSkillDetector,
+		kitPromptFragDetector:        opts.KitPromptFragmentDetector,
+		kitDetector:                  opts.KitDetector,
+		kitComposer:                  opts.KitComposer,
+		kitTargetOS:                  opts.KitTargetOS,
+		additionalExtensionDecorator: opts.AdditionalExtensionDecorator,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

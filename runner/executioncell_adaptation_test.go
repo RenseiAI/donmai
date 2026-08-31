@@ -863,7 +863,7 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	source, _, err := buildPreparedSourceSpec(qw, harnessSelection{
 		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt),
 		effectiveCell: exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

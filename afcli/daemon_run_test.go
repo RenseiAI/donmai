@@ -33,7 +33,7 @@ func TestDaemonRunControlBindPreflight(t *testing.T) {
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
 			t.Parallel()
-			cmd := newDaemonRunCmd("")
+			cmd := newDaemonRunCmd(Config{})
 			if err := cmd.Flags().Parse(tt.args); err != nil {
 				t.Fatalf("parse flags: %v", err)
 			}
@@ -178,7 +178,7 @@ func TestDaemonRunRejectsMalformedConfigBeforeTerminalAuthority(t *testing.T) {
 		t.Fatalf("write malformed config: %v", err)
 	}
 
-	cmd := newDaemonRunCmd("test")
+	cmd := newDaemonRunCmd(Config{HostBinaryVersion: "test"})
 	cmd.SetArgs([]string{"--config", configPath, "--skip-wizard", "--standalone-creds=off"})
 	var output strings.Builder
 	cmd.SetOut(&output)
