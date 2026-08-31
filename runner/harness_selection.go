@@ -391,9 +391,21 @@ func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, 
 	if endpoint == nil {
 		return receiptHarnessDenial(receipt, executioncell.DenialUnknownEndpoint, "receipt-bearing work requires an explicit endpoint binding")
 	}
+	// The endpoint carries two distinct identities and they must not be
+	// conflated. Company is the SPEAK-axis endpoint identity — the vendor
+	// surface and wire dialect the request is spoken to
+	// (anthropic/openai/google/local/stub). ModelAuthor is who authored the
+	// model that runs. They coincide only for first-party direct cells; a
+	// gateway or aggregator cell speaks openai-chat to a model authored by
+	// someone else, and a local cell speaks to no vendor at all. The admitted
+	// execution cell has no company axis (ServingEndpointRef is id, protocol,
+	// operator, revision), so ModelAuthor is the only field that may be
+	// compared against cell.Model.Author. Company stays pinned by the
+	// operational-payload digest, which binds it as part of the stable
+	// endpoint identity.
 	if endpoint.EndpointID != cell.Endpoint.ID || endpoint.EndpointOperator != cell.Endpoint.Operator ||
 		endpoint.EndpointRevision != cell.Endpoint.Revision || string(endpoint.Protocol) != cell.Endpoint.Protocol ||
-		endpoint.Model != cell.Model.ID || endpoint.ModelAuthor != cell.Model.Author || string(endpoint.Company) != cell.Model.Author {
+		endpoint.Model != cell.Model.ID || endpoint.ModelAuthor != cell.Model.Author {
 		return receiptHarnessDenial(receipt, executioncell.DenialUnknownEndpoint, "resolved endpoint/model identity does not match the effective cell")
 	}
 	if endpoint.AuthBindingID != cell.AuthBinding.ID || endpoint.Mechanism != cell.AuthBinding.Mechanism ||
