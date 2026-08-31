@@ -116,6 +116,12 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	if err != nil {
 		return nil, fmt.Errorf("%w: isolate codex interactive config: %w", agent.ErrSpawnFailed, err)
 	}
+	// Seed this interactive session's isolated home from the same
+	// host-level warm cache the headless boundary uses (see New in codex.go
+	// and plugin_cache.go) — the named bootstrap app-server started below
+	// and the PTY itself both run under this same CODEX_HOME, so this one
+	// call covers the cold-fetch cost for both.
+	config.enablePluginCacheReuse(resolveCodexPluginCacheDir(opts.pluginCacheDir))
 	if launch.env == nil {
 		launch.env = make(map[string]string)
 	}
