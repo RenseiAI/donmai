@@ -3,6 +3,7 @@ package codex
 import (
 	"bufio"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"errors"
 	"maps"
@@ -28,6 +29,18 @@ const (
 	// codexFakeAppServerThreadID is the thread id the fake hands back so a
 	// Spawn can complete against it.
 	codexFakeAppServerThreadID = "thread-env-overlay"
+
+	// codexFakeAppServerStderrEnv carries base64-encoded bytes the fake
+	// writes to its own stderr before doing anything else — a fixture for
+	// the bounded stderr capture (appserver_stderr.go). base64 avoids
+	// fighting exec.Cmd.Env over embedded newlines/binary content.
+	codexFakeAppServerStderrEnv = "DONMAI_CODEX_FAKE_APP_SERVER_STDERR"
+	// codexFakeAppServerCrashEnv, when "1", makes the fake os.Exit(1)
+	// immediately after writing its stderr — before ever reading a
+	// request — simulating an app-server that dies during its own startup
+	// (e.g. while starting an MCP server) instead of completing the
+	// initialize handshake.
+	codexFakeAppServerCrashEnv = "DONMAI_CODEX_FAKE_APP_SERVER_CRASH"
 )
 
 // codexEnvProbeKeys are the only variables the fake reports. Keeping the dump
@@ -39,6 +52,14 @@ var codexEnvProbeKeys = []string{"CODEX_HOME", "DONMAI_API_URL", "DONMAI_SESSION
 // environment it was handed, then speaks just enough of the app-server
 // JSON-RPC surface to carry a Spawn/Resume through thread start.
 func runCodexFakeAppServer() {
+	if encoded := os.Getenv(codexFakeAppServerStderrEnv); encoded != "" {
+		if raw, err := base64.StdEncoding.DecodeString(encoded); err == nil {
+			_, _ = os.Stderr.Write(raw)
+		}
+	}
+	if os.Getenv(codexFakeAppServerCrashEnv) == "1" {
+		os.Exit(1)
+	}
 	if dump := os.Getenv(codexFakeAppServerDumpEnv); dump != "" {
 		observed := map[string][]string{}
 		for _, entry := range os.Environ() {

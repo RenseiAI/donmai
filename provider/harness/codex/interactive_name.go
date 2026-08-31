@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"log/slog"
 	"net"
 	"net/http"
 	"os"
@@ -12,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sync"
+	"sync/atomic"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -34,6 +36,37 @@ type namedInteractiveAppServer struct {
 	cmd       *exec.Cmd
 	waitCh    <-chan error
 	socketDir string
+
+	// sessionName is spec.SessionName, kept only to label the exit-log line
+	// (see logAppServerExit) — the naming RPCs themselves take spec directly.
+	sessionName string
+
+	// stderr is the bounded, redaction-aware capture of this process's
+	// stderr (see appserver_stderr.go). Nil in the direct-construction
+	// concurrency test (TestNamedInteractiveAppServer_CloseClientConcurrentWithFullClose),
+	// which never sets one — Excerpt() on a nil buffer is safe and returns "".
+	stderr *boundedBuffer
+
+	// exitDone is closed exactly once, when cmd.Wait() returns; exitErr is
+	// safe to read only after a receive from exitDone (channel-close
+	// happens-before its close(exitDone) call, and every reader receives
+	// rather than reads the field directly). Unlike waitCh — a single-value,
+	// single-consumer channel close()'s own SIGTERM/kill escalation already
+	// owns, and that the direct-construction test still supplies directly —
+	// exitDone is a broadcast: close()'s own unexpected-exit precheck and
+	// the always-on logAppServerExit watcher each observe it independently.
+	// A nil exitDone (the direct-construction test again) simply never
+	// becomes ready in a select, which is exactly the pre-existing behavior
+	// close() had before this field existed — see close()'s doc comment.
+	exitDone chan struct{}
+	exitErr  error
+
+	// closeRequested records whether close() had already been asked to run
+	// BEFORE the process exited — the difference between "we tore this
+	// down" and "it died on us" — read by logAppServerExit to pick a log
+	// level. Zero value (false) is correct until close() actually runs.
+	closeRequested atomic.Bool
+
 	// client stays open until its RPC job is done (naming for the fresh
 	// path, the existence check for the attach path) — required so the
 	// fresh-session path can observe a thread/started notification emitted
@@ -157,20 +190,32 @@ func startNamedInteractiveAppServer(
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("codex interactive name bootstrap spawn: %w", err)
 	}
-	go drainStderr(stderr)
+	stderrBuf := captureAppServerStderr(stderr)
 	waitCh := make(chan error, 1)
-	go func() { waitCh <- cmd.Wait() }()
 	server := &namedInteractiveAppServer{
-		remoteURL: remoteURL, cmd: cmd, waitCh: waitCh, socketDir: socketDir,
+		remoteURL:   remoteURL,
+		cmd:         cmd,
+		waitCh:      waitCh,
+		socketDir:   socketDir,
+		sessionName: spec.SessionName,
+		stderr:      stderrBuf,
+		exitDone:    make(chan struct{}),
 	}
+	go func() {
+		waitErr := cmd.Wait()
+		server.exitErr = waitErr
+		close(server.exitDone)
+		waitCh <- waitErr
+	}()
+	go server.logAppServerExit() //nolint:gosec // G118: this exit-log line must outlive setupCtx, which is scoped to the handshake, not the process
 	probe, err := dialInteractiveAppServer(setupCtx, socketPath)
 	if err != nil {
-		return nil, errors.Join(err, server.close())
+		return nil, errors.Join(withAppServerStderr(err, server), server.close())
 	}
 	_ = probe.Close()
 	client, err := dialInteractiveWebSocket(setupCtx, socketPath)
 	if err != nil {
-		return nil, errors.Join(err, server.close())
+		return nil, errors.Join(withAppServerStderr(err, server), server.close())
 	}
 	server.setClient(client)
 
@@ -183,21 +228,21 @@ func startNamedInteractiveAppServer(
 		"capabilities": map[string]any{"experimentalApi": true},
 	}, timeout)
 	if err != nil {
-		return nil, errors.Join(fmt.Errorf("codex interactive name bootstrap initialize: %w", err), server.close())
+		return nil, errors.Join(withAppServerStderr(fmt.Errorf("codex interactive name bootstrap initialize: %w", err), server), server.close())
 	}
 	var initResp struct {
 		CodexHome string `json:"codexHome"`
 	}
 	if err := json.Unmarshal(initRaw, &initResp); err != nil || initResp.CodexHome == "" ||
 		!sameResolvedPath(initResp.CodexHome, codexHome) {
-		return nil, errors.Join(errors.New("codex interactive name bootstrap did not confirm the selected config home"), server.close())
+		return nil, errors.Join(withAppServerStderr(errors.New("codex interactive name bootstrap did not confirm the selected config home"), server), server.close())
 	}
 	if err := client.notify(setupCtx, "initialized", map[string]any{}); err != nil {
-		return nil, errors.Join(fmt.Errorf("codex interactive name bootstrap initialized notification: %w", err), server.close())
+		return nil, errors.Join(withAppServerStderr(fmt.Errorf("codex interactive name bootstrap initialized notification: %w", err), server), server.close())
 	}
 	if attachToExistingNamedSession(spec) {
 		if err := resumeExistingNamedThreadWithRequest(setupCtx, spec, client.request, rpcTimeout); err != nil {
-			return nil, errors.Join(err, server.close())
+			return nil, errors.Join(withAppServerStderr(err, server), server.close())
 		}
 		// The target is now proven to exist; the PTY opens its own
 		// independent --remote connection to attach (`codex resume --remote
@@ -581,27 +626,115 @@ func (s *namedInteractiveAppServer) closeClient() error {
 	return c.close()
 }
 
+// close tears the bootstrap app-server down: the diagnostic RPC connection
+// first, then the process itself (SIGTERM, then SIGKILL after a grace
+// period), then its socket directory.
+//
+// It also carries the fix for the ordering bug this file exists to close:
+// exitDone lets close distinguish "the process was still alive when we
+// asked it to stop" from "it had already exited on its own before we ever
+// got here" — a crash during MCP server startup, say. Only the SECOND case
+// is surfaced as an error (and only when the exit itself was abnormal — see
+// below): a clean self-exit the process happened to make a moment before
+// close() ran is not evidence of anything wrong, and every ordinary,
+// intentional teardown races this exact same check. A nil exitDone (only
+// the direct-construction concurrency test builds one, and never sets it)
+// never becomes ready in the select, so it always falls through to the
+// original SIGTERM/kill escalation below, unchanged.
 func (s *namedInteractiveAppServer) close() error {
 	s.closeOnce.Do(func() {
+		s.closeRequested.Store(true)
 		s.closeErr = s.closeClient()
-		if s.cmd.Process != nil {
-			_ = s.cmd.Process.Signal(syscallSIGTERM())
-		}
 		select {
-		case <-s.waitCh:
-		case <-time.After(interactiveNameBootstrapShutdownTimeout):
+		case <-s.exitDone:
+			// The process exited before this call ever asked it to. A nil
+			// exitErr (Wait reported a clean, zero exit code) is not
+			// evidence of anything wrong; a non-nil one — non-zero exit or
+			// killed by signal — is exactly the ordering that lets a
+			// downstream --remote PTY client observe only a dropped socket
+			// and exit 0, hiding the real cause. Surface it with whatever
+			// redacted stderr survived.
+			if s.exitErr != nil {
+				s.closeErr = errors.Join(s.closeErr, unexpectedAppServerExitError(s.exitErr, s.stderr.Excerpt()))
+			}
+		default:
 			if s.cmd.Process != nil {
-				_ = s.cmd.Process.Kill()
+				_ = s.cmd.Process.Signal(syscallSIGTERM())
 			}
 			select {
 			case <-s.waitCh:
 			case <-time.After(interactiveNameBootstrapShutdownTimeout):
-				s.closeErr = errors.Join(s.closeErr, errors.New("codex interactive app-server process did not exit"))
+				if s.cmd.Process != nil {
+					_ = s.cmd.Process.Kill()
+				}
+				select {
+				case <-s.waitCh:
+				case <-time.After(interactiveNameBootstrapShutdownTimeout):
+					s.closeErr = errors.Join(s.closeErr, appServerDidNotExitError(s.stderr.Excerpt()))
+				}
 			}
 		}
 		s.closeErr = errors.Join(s.closeErr, os.RemoveAll(s.socketDir))
 	})
 	return s.closeErr
+}
+
+// logAppServerExit emits exactly one structured line the moment this
+// bootstrap app-server process exits, regardless of whether the exit code
+// looks clean. A zero exit is not proof nothing went wrong: the pinned
+// codex CLI's --remote client only ever observes that its socket peer went
+// away and exits 0 itself, so this app-server's own exit — logged here with
+// whatever stderr survived, redacted — is sometimes the only place the real
+// cause is ever recorded. See appserver_stderr.go's package doc for the
+// full ordering bug this closes.
+func (s *namedInteractiveAppServer) logAppServerExit() {
+	<-s.exitDone
+	level := slog.LevelWarn
+	if s.closeRequested.Load() {
+		level = slog.LevelInfo // this teardown was requested by close(), not a surprise.
+	}
+	args := []any{"session", s.sessionName, "error", s.exitErr}
+	if excerpt := s.stderr.Excerpt(); excerpt != "" {
+		args = append(args, "stderrExcerpt", excerpt)
+	}
+	slog.Log(context.Background(), level, "codex interactive name bootstrap app-server exited", args...)
+}
+
+// withAppServerStderr appends server's current redacted stderr excerpt to
+// err's message, when there is one. Used at every bootstrap-phase RPC
+// failure return in startNamedInteractiveAppServer so the excerpt is
+// attached whether or not the process had already died by the time the
+// failure surfaced — close()'s own attachment (see close's doc comment)
+// only fires when it can prove the process beat it to exiting, so a
+// process that is merely hung (an RPC times out, but the process is still
+// alive) would otherwise carry no diagnostic stderr at all.
+func withAppServerStderr(err error, server *namedInteractiveAppServer) error {
+	if err == nil || server == nil {
+		return err
+	}
+	if excerpt := server.stderr.Excerpt(); excerpt != "" {
+		return fmt.Errorf("%w (app-server stderr: %s)", err, excerpt)
+	}
+	return err
+}
+
+// unexpectedAppServerExitError reports that the bootstrap app-server
+// process terminated on its own, before anything asked it to, carrying
+// whatever redacted stderr excerpt survived.
+func unexpectedAppServerExitError(waitErr error, excerpt string) error {
+	if excerpt == "" {
+		return fmt.Errorf("codex interactive app-server exited unexpectedly: %w", waitErr)
+	}
+	return fmt.Errorf("codex interactive app-server exited unexpectedly: %w (stderr: %s)", waitErr, excerpt)
+}
+
+// appServerDidNotExitError reports the escalation-timeout case: the
+// process ignored both SIGTERM and SIGKILL within their grace windows.
+func appServerDidNotExitError(excerpt string) error {
+	if excerpt == "" {
+		return errors.New("codex interactive app-server process did not exit")
+	}
+	return fmt.Errorf("codex interactive app-server process did not exit (stderr: %s)", excerpt)
 }
 
 func ambientCodexHome() (string, error) {
