@@ -137,6 +137,10 @@ type Options struct {
 	// always verify it.
 	verifyMCPReadback bool
 	configTempDir     string
+	// pluginCacheDir is a test seam overriding the host-level warm cache
+	// directory (see plugin_cache.go's resolveCodexPluginCacheDir).
+	// Production leaves it empty and gets the real per-host location.
+	pluginCacheDir string
 	// interactiveMCPInventoryRunner is a test seam for the pre-PTY effective
 	// config readback. Production executes the selected Codex binary's own
 	// `mcp list --json` semantics.
@@ -206,6 +210,12 @@ func New(opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	p.config = boundary
+	// Seed this session's isolated home from the host-level warm cache of
+	// Codex's own cache/ subtree (see plugin_cache.go) so the app-server's
+	// bootstrap network fetch of the vendor plugin catalog is a cache hit
+	// after the first session on this host. Best-effort and non-fallible —
+	// it never returns an error, preserving the invariant below.
+	boundary.enablePluginCacheReuse(resolveCodexPluginCacheDir(opts.pluginCacheDir))
 	// No fallible step follows: the boundary is the last thing New allocates,
 	// and the app-server start that used to run here (and could leak it on a
 	// failed handshake) is now deferred to ensureHeadlessReady, whose failure
@@ -285,6 +295,11 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		p.stdin = stdin
 		p.stdout = stdout
 		p.stderr = stderr
+		// Record the app-server's own PID against its isolated home so a
+		// later orphan sweep (orphan_sweep.go) can identify and terminate it
+		// specifically, rather than only ever reclaiming the directory
+		// underneath a still-running orphaned process.
+		updateDonmaiOwnerManifestChildPID(p.config.home, cmd.Process.Pid)
 		// Drain stderr into a bounded, redacted capture so the child never
 		// deadlocks on a full pipe and a crash leaves a forensic excerpt
 		// instead of nothing — see appserver_stderr.go and failStartLocked /
