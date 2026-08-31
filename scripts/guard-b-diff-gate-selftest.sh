@@ -38,10 +38,13 @@ fail() {
   FAIL=$((FAIL + 1))
 }
 
-# The literal string "/Users/<name>/" must not appear in this file's own
-# source, or guard-b would flag this selftest the same way it flags the
-# fixtures it builds. Assembled at runtime, same convention
-# guard-b-lint-selftest.sh uses for its own banned-literal fragments.
+# A literal developer-absolute-path shape ("/Us[e]rs/<name>/") must not
+# appear in this file's own source, or guard-b would flag this selftest the
+# same way it flags the fixtures it builds below — see guard-b-lint.sh's own
+# header for why a single bracketed letter defeats the match without
+# changing what the pattern matches at scan time. Assembled at runtime here
+# too, same convention guard-b-lint-selftest.sh uses for its own
+# banned-literal fragments.
 UD='U'
 DEVPATH="/${UD}sers/someone/Developer/org/repo/notes.txt"
 
