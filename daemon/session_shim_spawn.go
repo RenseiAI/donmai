@@ -61,6 +61,36 @@ func (g *shimAdoptionGate) await() bool {
 // while waiting for the new shim's record.
 const shimRecordPollInterval = 25 * time.Millisecond
 
+// shimRecordDiscoveryGraceAttempts bounds how many extra registry reads
+// awaitShimRecord makes, with exponential backoff, after the launch
+// timeout's own deadline has already passed, before it truly gives up.
+//
+// defaultShimLaunchTimeout's budget must cover an ordinary harness cold
+// start, but some harnesses' first run also does network-bound work (e.g. a
+// first-time provider handshake) that can occasionally push discovery a
+// little past even a generous budget. Measured live: the daemon gave up
+// exactly at the deadline, and the record appeared under the exact expected
+// filename for the exact expected identity moments later, with the shim
+// process still alive — a session that then hung forever holding capacity
+// nobody could ever release. This grace window exists to catch "a hair
+// slow", never to turn the launch timeout into a suggestion: it is short,
+// independently bounded, and every record it accepts must still pass
+// shimDiscoveryRecordMatchesLaunch.
+//
+// Variables, not constants, only so a test can shrink the wall-clock cost of
+// exercising both ends of the bound (a late-but-real record, and a
+// never-arriving one) without changing what production ships with.
+var (
+	shimRecordDiscoveryGraceAttempts = 4
+	// shimRecordDiscoveryGraceBaseDelay is the first backoff delay between
+	// grace polls; each subsequent attempt doubles it. Four attempts
+	// doubling from this base span 1.5s of additional wait in the worst
+	// case — long enough to catch a discovery record landing "moments"
+	// late, short enough that a launch that genuinely produced nothing
+	// still fails promptly.
+	shimRecordDiscoveryGraceBaseDelay = 100 * time.Millisecond
+)
+
 // shimOwnsSession is the §D11 SELECTION rule: which sessions this daemon
 // launches under per-session shim ownership.
 //
@@ -182,12 +212,14 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
 	defer cancel()
 
-	rec, err := awaitShimRecord(ctx, registry, id)
+	rec, err := awaitShimRecord(ctx, registry, id, launch, started)
 	if err != nil {
-		// The shim never announced itself. Nothing is adopted and nothing is
-		// counted; the process is left alone rather than signalled, because a
-		// launch this daemon cannot identify is exactly the target §D10 forbids
-		// guessing at. Its own orphan deadline is the escape hatch.
+		// The shim never announced itself — including through the bounded
+		// post-deadline grace poll awaitShimRecord already applied. Nothing is
+		// adopted and nothing is counted; the process is left alone rather than
+		// signalled, because a launch this daemon cannot identify is exactly the
+		// target §D10 forbids guessing at. Its own orphan deadline is the escape
+		// hatch.
 		slog.Error("session shim: launched worker never published a discovery record",
 			"session", id.String(), "pid", started, "error", err)
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
@@ -710,7 +742,24 @@ func (d *Daemon) shimCommand() []string {
 
 // awaitShimRecord polls the registry until the launched shim publishes a valid
 // discovery record, or ctx expires.
-func awaitShimRecord(ctx context.Context, registry *sessionshim.Registry, id sessionshim.Identity) (sessionshim.Record, error) {
+//
+// A plain expiry is not the last word: sessionshim.Start deliberately spawns
+// the harness under a PTY BEFORE publishing the record (sessionshim/shim.go),
+// so the launch timeout's budget covers the harness's entire cold start —
+// and some harnesses occasionally need a hair longer than even a generous
+// budget. Rather than fail a launch whose record was seconds from landing,
+// ctx expiring here hands off to a short, independently bounded grace poll
+// (awaitShimRecordPostDeadlineGrace) that only ever turns a false "never
+// arrived" into a true "arrived late" — it can never turn a genuine non-event
+// into a fabricated success, because it still requires the record to
+// identity-match this exact launch.
+func awaitShimRecord(
+	ctx context.Context,
+	registry *sessionshim.Registry,
+	id sessionshim.Identity,
+	launch sessionshim.Launch,
+	pid int,
+) (sessionshim.Record, error) {
 	ticker := time.NewTicker(shimRecordPollInterval)
 	defer ticker.Stop()
 	var lastErr error
@@ -722,10 +771,70 @@ func awaitShimRecord(ctx context.Context, registry *sessionshim.Registry, id ses
 		lastErr = err
 		select {
 		case <-ctx.Done():
+			if rec, ok := awaitShimRecordPostDeadlineGrace(registry, id, launch, pid); ok {
+				return rec, nil
+			}
 			return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
 		case <-ticker.C:
 		}
 	}
+}
+
+// awaitShimRecordPostDeadlineGrace polls a short, independently bounded
+// number of times AFTER the launch timeout's own deadline has already
+// passed, on the chance the worker's discovery record lands moments late —
+// the exact condition measured live: the daemon gave up at the deadline, and
+// the record appeared under the expected filename for the expected identity
+// moments afterward, with the shim process still alive.
+//
+// It returns the record only when it is plausibly THIS launch's own — see
+// shimDiscoveryRecordMatchesLaunch. A record that never appears, or that
+// appears but belongs to a different incarnation, still fails the launch
+// exactly as before: §D10's prohibition on guessing at an unidentifiable
+// launch is preserved, not relaxed. This grace window only ever converts a
+// false negative into a true positive, never the reverse.
+func awaitShimRecordPostDeadlineGrace(
+	registry *sessionshim.Registry,
+	id sessionshim.Identity,
+	launch sessionshim.Launch,
+	pid int,
+) (sessionshim.Record, bool) {
+	delay := shimRecordDiscoveryGraceBaseDelay
+	for attempt := 0; attempt < shimRecordDiscoveryGraceAttempts; attempt++ {
+		if attempt > 0 {
+			time.Sleep(delay)
+			delay *= 2
+		}
+		rec, err := registry.Get(id)
+		if err != nil {
+			continue
+		}
+		if !shimDiscoveryRecordMatchesLaunch(rec, id, launch, pid) {
+			// A record exists but is not this launch's — something else's
+			// record, not a slow arrival of this one. Waiting longer cannot
+			// change whose record this is, so stop rather than keep polling
+			// toward a match that will never happen.
+			slog.Warn("session shim: a discovery record appeared after the launch timeout but did not match this launch; still failing the accept",
+				"session", id.String(), "wantProcessEpoch", launch.ProcessEpoch, "wantPid", pid,
+				"gotProcessEpoch", rec.ProcessEpoch, "gotPid", rec.PID)
+			return sessionshim.Record{}, false
+		}
+		slog.Warn("session shim: discovery record appeared after the launch timeout; adopting it rather than failing the accept",
+			"session", id.String(), "attempt", attempt+1, "processEpoch", rec.ProcessEpoch, "pid", rec.PID)
+		return rec, true
+	}
+	return sessionshim.Record{}, false
+}
+
+// shimDiscoveryRecordMatchesLaunch reports whether rec is plausibly the exact
+// discovery record this launch's own worker eventually published: the same
+// identity, at the process epoch this launch requested and the PID this
+// launch actually started. It is deliberately NOT a liveness check — §D10
+// forbids inferring anything from PID reuse or process state — only a check
+// against the record's own declared identity.
+func shimDiscoveryRecordMatchesLaunch(rec sessionshim.Record, id sessionshim.Identity, launch sessionshim.Launch, pid int) bool {
+	return rec.OrgID == id.OrgID && rec.SessionID == id.SessionID &&
+		rec.ProcessEpoch == launch.ProcessEpoch && rec.PID == pid
 }
 
 // trackLaunchedShim records a newly adopted controller and starts consuming its
