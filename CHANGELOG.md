@@ -6,6 +6,33 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.10 — 2026-08-30
+
+### Fixes
+
+- **The attach client recovers from a stale PTY epoch instead of treating
+  every stale rejection as terminal.** A transient network blip that minted a
+  fresh epoch on the relay side used to end the host leg immediately, even
+  when the local process still held valid authority. Every token refresh is
+  now bound to the immutable spawn-time authority and the local PTY epoch
+  (epoch 0 remains a valid legacy value); a same-epoch stale rejection is
+  retried under a finite, capped backoff window, redialing with fresh
+  authority, while a confirmed successor or foreign-session grant still ends
+  the leg right away. (#490)
+
+- **A receipt-bearing session that fails preflight for a known reason keeps
+  that reason even when the receipt itself fails to persist.** A denied
+  preflight's typed reason used to be discarded whenever the durable audit
+  write of the adaptation receipt failed, surfacing only a generic
+  persistence error to the caller. The daemon now preserves the original
+  typed denial alongside the persistence failure, and NACKs gain an
+  additive, versioned reason field that the daemon advertises only for the
+  one denial it actually produces; unrelated authority or tool-lifecycle
+  mismatches from the preflight reconciliation path stay outside that closed
+  reason. (#491)
+
+---
+
 ## v0.72.9 — 2026-08-30
 
 ### Fixes
