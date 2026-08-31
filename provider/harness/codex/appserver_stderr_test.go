@@ -301,6 +301,74 @@ func TestRedactAppServerStderr(t *testing.T) {
 			wantSurviving: []string{"[REDACTED]"},
 		},
 		{
+			// C1: a multi-segment OpenAI-style key in the "sk-proj-..."
+			// shape (the most likely unlabeled credential in the codex/
+			// OpenAI harness this package spawns). The pre-C1 prefix
+			// pattern required an unbroken 10+ char alnum run right after
+			// ONE separator, so a short first segment ("proj") shorter
+			// than that bound made the whole match fail — the token
+			// leaked in full, not just partially.
+			name:          "shape-based multi-segment OpenAI key (sk-proj- shape)",
+			in:            "leaked: sk-proj-thisisnotarealsegmentone-thisisnotarealsegmenttwo",
+			wantRedacted:  []string{"sk-proj-thisisnotarealsegmentone-thisisnotarealsegmenttwo"},
+			wantSurviving: []string{"[REDACTED]", "leaked:"},
+		},
+		{
+			// C1: a multi-segment Slack token — the pre-C1 pattern redacted
+			// only the FIRST dash-delimited segment, leaving every
+			// subsequent segment (where a real xoxb token's actual secret
+			// material lives) exposed.
+			name: "shape-based multi-segment Slack token, no label",
+			in:   "found xoxb-notarealfirstseg-notarealsecondseg-notarealthirdseg in stderr",
+			wantRedacted: []string{
+				"xoxb-notarealfirstseg-notarealsecondseg-notarealthirdseg",
+				"-notarealsecondseg-notarealthirdseg", // the part a first-segment-only match would have left exposed
+			},
+			wantSurviving: []string{"[REDACTED]", "found", "in stderr"},
+		},
+		{
+			// C1 (non-regression): pk_organization_id is a FIELD NAME, not
+			// a secret — the fixed pattern allows `-` inside the matched
+			// run but never `_`, so an underscore-joined identifier that
+			// merely starts with a matching prefix stops at the first `_`
+			// and is not swept up whole. (The literal "pk_" itself is
+			// still shape-matched per the label; what must NOT happen is
+			// the rest of the identifier disappearing into one blob.)
+			name:           "pk_ prefixed field NAME is not swallowed whole",
+			in:             "config field pk_organization_id is required",
+			wantUnmodified: true,
+		},
+		{
+			// C2: the app-server died mid-write, after the opening quote
+			// and part of the secret but before the closing quote — the
+			// EXACT tail shape this excerpt is built to capture (a crash
+			// truncates output, it doesn't tidy up after itself). The
+			// pre-C2 value pattern required a closing quote to match a
+			// quoted value AT ALL, so an unterminated quote made the whole
+			// labeled match fail and the partial secret leaked untouched.
+			name:          "unterminated double-quote value (crash-mid-write truncation)",
+			in:            `api_key: "sk-truncated-mid-write-secret-fixture`,
+			wantRedacted:  []string{"sk-truncated-mid-write-secret-fixture"},
+			wantSurviving: []string{"api_key", "[REDACTED]"},
+		},
+		{
+			// C2: same truncation shape, single-quoted.
+			name:          "unterminated single-quote value (crash-mid-write truncation)",
+			in:            `token='sk-truncated-mid-write-secret-fixture2`,
+			wantRedacted:  []string{"sk-truncated-mid-write-secret-fixture2"},
+			wantSurviving: []string{"token", "[REDACTED]"},
+		},
+		{
+			// Safety net requested alongside C2: a structured log line
+			// where "token" appears only INSIDE a quoted, already-closed
+			// message value (not as a label at all) must not trigger any
+			// redaction, and an unrelated trailing field must survive
+			// completely intact.
+			name:           "the word token inside a closed msg value, unrelated trailing field survives",
+			in:             `msg="token refresh ok" next=1`,
+			wantUnmodified: true,
+		},
+		{
 			name:           "plain diagnostic text is untouched",
 			in:             "fatal: failed to start MCP server \"fixture\": exit status 1",
 			wantUnmodified: true,

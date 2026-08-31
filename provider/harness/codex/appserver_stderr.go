@@ -137,7 +137,7 @@ func (b *boundedBuffer) Excerpt() string {
 // `&` is excluded from the unquoted branch so a URL query token
 // (?token=SECRET&next=1) redacts only the token, not the rest of the
 // query string.
-const appServerStderrValuePattern = `(?:"[^"\r\n]*"|'[^'\r\n]*'|[^\s"'&\r\n]+)`
+const appServerStderrValuePattern = `(?:"[^"\r\n]*"?|'[^'\r\n]*'?|[^\s"'&\r\n]+)`
 
 // appServerStderrRedaction pairs a pattern with its own replacement
 // template (rather than inferring one from NumSubexp, which cannot express
@@ -175,7 +175,10 @@ var appServerStderrRedactions = []appServerStderrRedaction{
 	{
 		// Any secret-labeled value, KEY=VALUE or JSON shaped:
 		// api_key: "sk-...", access_token=..., "client_secret":"...",
-		// token='...', password=..., cookie: "...", session=....
+		// token='...', password=..., cookie: "...", session=.... Each
+		// label also matches its plural (tokens, passwords, secrets, ...)
+		// since a labeled COLLECTION line is just as capable of holding a
+		// live secret as a labeled scalar.
 		//
 		// Deliberately UNANCHORED on the left — the label only needs to
 		// appear as a substring immediately before the [:=], not as a
@@ -188,7 +191,7 @@ var appServerStderrRedactions = []appServerStderrRedaction{
 		//   - a bare token in a URL query string embedded in a panic line:
 		//     .../mcp?token=SECRET&retry=1 (appServerStderrValuePattern's
 		//     `&` boundary stops the match before the next query param).
-		regexp.MustCompile(`(?i)((?:api[_-]?key|access[_-]?token|refresh[_-]?token|auth[_-]?token|client[_-]?secret|private[_-]?key|secret|token|password|passwd|credential|cookie|session)["']?\s*[:=]\s*)` + appServerStderrValuePattern),
+		regexp.MustCompile(`(?i)((?:api[_-]?keys?|access[_-]?tokens?|refresh[_-]?tokens?|auth[_-]?tokens?|client[_-]?secrets?|private[_-]?keys?|secrets?|tokens?|passwords?|passwds?|credentials?|cookies?|sessions?)["']?\s*[:=]\s*)` + appServerStderrValuePattern),
 		"${1}[REDACTED]",
 	},
 	{
@@ -218,7 +221,14 @@ var appServerStderrRedactions = []appServerStderrRedaction{
 		// this file is OSS and ships to every downstream consumer of this
 		// package, not just whichever closed-source product happens to
 		// embed it.
-		regexp.MustCompile(`\b(?:sk|pk|gh[oprsu]|xox[baprs])[-_][A-Za-z0-9]{10,}\b`),
+		//
+		// The body allows `-` (but never `_`) so a multi-segment real-world
+		// token — sk-proj-..., a multi-segment xoxb-...-... — is captured
+		// in full rather than just its first segment, while a `_`-joined
+		// identifier that merely starts with a matching prefix (e.g.
+		// pk_organization_id, which is a field NAME, not a secret) stops at
+		// the first underscore and is left alone.
+		regexp.MustCompile(`\b(?:sk|pk|gh[oprsu]|xox[baprs])[-_][A-Za-z0-9](?:[A-Za-z0-9-]{8,})[A-Za-z0-9]\b`),
 		"[REDACTED]",
 	},
 	{
