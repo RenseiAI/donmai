@@ -4,7 +4,9 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"net/http/httptest"
@@ -14,6 +16,10 @@ import (
 	"sync/atomic"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/runner"
 )
 
 // pollTestSlogMu serializes the process-global slog default while tests in
@@ -1185,6 +1191,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 		"wkr-1",
 		"jwt-token",
 		"accept work failed: allowlist mismatch",
+		nil,
 		item,
 	)
 	if err != nil {
@@ -1239,6 +1246,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		"wkr-1",
 		"jwt",
 		"reason",
+		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
@@ -1267,8 +1275,7 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := callNackEndpoint(
-				context.Background(),
-				nil, "http://x", tc.sessionID, tc.workerID, "j", "r", tc.work,
+				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, tc.work,
 			)
 			if err == nil {
 				t.Fatalf("expected error")
@@ -1278,6 +1285,285 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 			}
 		})
 	}
+}
+
+// TestCallNackEndpoint_ReceiptPreflightReasonWire pins the additive typed NACK
+// reason contract. It is deliberately derived from the wrapped typed admission
+// error rather than matching its prose: an identical generic message must not
+// gain authority on the wire.
+func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
+	typed := &runner.HarnessAdmissionError{
+		Code:    executioncell.DenialFallbackNotAllowed,
+		Harness: "codex",
+		Detail:  "the receipt forbids fallback",
+	}
+	typedProse := typed.Error()
+	cases := []struct {
+		name       string
+		err        error
+		wantReason map[string]any
+	}{
+		{
+			name: "typed fallback_not_allowed has exact closed reason",
+			err:  fmt.Errorf("accept work: %w", typed),
+			wantReason: map[string]any{
+				"contractVersion": receiptPreflightNackReasonContractVersion,
+				"code":            string(executioncell.DenialFallbackNotAllowed),
+			},
+		},
+		{
+			name: "identical generic prose is omitted",
+			err:  errors.New(typedProse),
+		},
+		{
+			name: "unrelated typed unknown_endpoint is omitted",
+			err:  &runner.HarnessAdmissionError{Code: executioncell.DenialUnknownEndpoint, Detail: "same fallback prose is irrelevant"},
+		},
+		{
+			name: "unrelated typed unknown_harness is omitted",
+			err:  &runner.HarnessAdmissionError{Code: executioncell.DenialUnknownHarness, Detail: "same fallback prose is irrelevant"},
+		},
+		{
+			name: "unrelated typed unsupported_session_mode is omitted",
+			err:  &runner.HarnessAdmissionError{Code: executioncell.DenialUnsupportedSessionMode, Detail: "same fallback prose is irrelevant"},
+		},
+		// #485 makes these two typed mismatches more observable at the
+		// preflight/spawn authority boundary. They remain diagnostic errors, not
+		// receipt admission denials, so the closed NACK reason must stay absent:
+		// advertising fallback_not_allowed for either would give an orchestrator
+		// authority to branch on a cause the admission receipt never supplied.
+		{
+			name: "repository sandbox authority drift from #485 is omitted",
+			err:  &agent.AuthorityDriftError{Fields: []string{"sandboxLevel"}},
+		},
+		{
+			name: "tool lifecycle drift from #485 is omitted",
+			err:  &agent.ToolLifecycleDriftError{Fields: []string{"decision"}},
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			var body map[string]any
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode NACK body: %v", err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(srv.Close)
+
+			err := callNackEndpoint(
+				context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
+				"accept work failed: "+tc.err.Error(), receiptPreflightNackReasonForError(tc.err),
+				&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
+			)
+			if err != nil {
+				t.Fatalf("callNackEndpoint: %v", err)
+			}
+			if got, ok := body["receiptPreflightReason"]; tc.wantReason == nil {
+				if ok {
+					t.Fatalf("receiptPreflightReason = %#v, want omitted", got)
+				}
+			} else if !mapsEqual(got, tc.wantReason) {
+				t.Fatalf("receiptPreflightReason = %#v, want %#v", got, tc.wantReason)
+			}
+		})
+	}
+}
+
+// TestCallNackEndpoint_ReceiptPreflightReasonLegacyWireCompatibility proves
+// that a generic rejection keeps the legacy byte shape, so an older consumer
+// receives exactly workerId/reason/work and no additive typed member.
+func TestCallNackEndpoint_ReceiptPreflightReasonLegacyWireCompatibility(t *testing.T) {
+	var raw []byte
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var err error
+		raw, err = io.ReadAll(r.Body)
+		if err != nil {
+			t.Fatalf("read NACK body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	err := callNackEndpoint(
+		context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
+		"accept work failed: fallback_not_allowed", receiptPreflightNackReasonForError(errors.New("accept work failed: fallback_not_allowed")),
+		&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
+	)
+	if err != nil {
+		t.Fatalf("callNackEndpoint: %v", err)
+	}
+	var legacy struct {
+		WorkerID string        `json:"workerId"`
+		Reason   string        `json:"reason"`
+		Work     *PollWorkItem `json:"work"`
+	}
+	if err := json.Unmarshal(raw, &legacy); err != nil {
+		t.Fatalf("old consumer decode: %v", err)
+	}
+	if legacy.WorkerID != "wkr-1" || legacy.Reason != "accept work failed: fallback_not_allowed" || legacy.Work == nil || legacy.Work.SessionID != "s1" {
+		t.Fatalf("old consumer body = %+v, want preserved legacy values", legacy)
+	}
+	var object map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &object); err != nil {
+		t.Fatalf("decode object: %v", err)
+	}
+	if len(object) != 3 || object["receiptPreflightReason"] != nil {
+		t.Fatalf("generic NACK JSON = %s, want legacy three-field body", raw)
+	}
+}
+
+// TestDaemonHandlePollWorkItem_ThreadsTypedReceiptPreflightReason proves the
+// daemon preserves the typed cause across AcceptWorkWithDetail's wrapping and
+// carries it to the actual NACK sender. The legacy reason remains prose.
+func TestDaemonHandlePollWorkItem_ThreadsTypedReceiptPreflightReason(t *testing.T) {
+	denial := &runner.HarnessAdmissionError{
+		Code:    executioncell.DenialFallbackNotAllowed,
+		Harness: "codex",
+		Detail:  "the receipt forbids fallback",
+	}
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode NACK body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newRunningTestDaemon(t, Options{}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}},
+		func(SessionSpec, []string) ([]string, error) { return nil, fmt.Errorf("spawn denied: %w", denial) })
+	d.mu.Lock()
+	d.jwt = "jwt-token"
+	d.mu.Unlock()
+
+	err := d.handlePollWorkItem(PollWorkItem{
+		SessionID: "s1", ProjectID: "project", Repository: "github.com/acme/repo",
+		IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1,
+	}, srv.URL)
+	var gotDenial *runner.HarnessAdmissionError
+	if !errors.As(err, &gotDenial) || gotDenial.Code != executioncell.DenialFallbackNotAllowed {
+		t.Fatalf("handlePollWorkItem error = %v, want wrapped fallback_not_allowed HarnessAdmissionError", err)
+	}
+	if got := body["receiptPreflightReason"]; !mapsEqual(got, map[string]any{
+		"contractVersion": receiptPreflightNackReasonContractVersion,
+		"code":            string(executioncell.DenialFallbackNotAllowed),
+	}) {
+		t.Fatalf("receiptPreflightReason = %#v, want exact closed reason", got)
+	}
+	if body["reason"] != "accept work failed: pre-spawn hook: spawn denied: "+denial.Error() {
+		t.Fatalf("reason = %#v, want compatibility prose", body["reason"])
+	}
+}
+
+type failingExecutionPreflightStore struct {
+	calls atomic.Int32
+	err   error
+}
+
+func (s *failingExecutionPreflightStore) Persist(string, json.RawMessage) error {
+	s.calls.Add(1)
+	return s.err
+}
+
+// TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersistenceFails
+// proves that the denied host receipt's durable-write failure does not erase the
+// canonical admission denial. The outer poll path must still project its closed
+// typed reason onto the actual NACK body; matching the denial's prose would not
+// be authority-safe.
+func TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersistenceFails(t *testing.T) {
+	denial := &runner.HarnessAdmissionError{
+		Code:    executioncell.DenialFallbackNotAllowed,
+		Harness: "codex",
+		Detail:  "the receipt forbids fallback",
+	}
+	persistErr := errors.New("persist denied execution adaptation receipt")
+	store := &failingExecutionPreflightStore{err: persistErr}
+	cell := daemonExecutionCell()
+	provider := &countingExecutionPreflight{
+		receipt: rawJSON(t, executioncell.HostAdaptationReceipt{
+			ContractVersion: executioncell.HostAdaptationContractVersion,
+			RequestID:       "s1",
+			WorkerID:        "wkr-test",
+			PlacementID:     cell.Placement.ID,
+			Decision:        "denied",
+			Denial:          "fallback is not allowed",
+		}),
+		err: denial,
+	}
+
+	var body map[string]any
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Fatalf("decode NACK body: %v", err)
+		}
+		w.WriteHeader(http.StatusNoContent)
+	}))
+	t.Cleanup(srv.Close)
+
+	d := newRunningTestDaemon(t, Options{
+		ProviderRegistry:        provider,
+		ExecutionPreflightStore: store,
+	}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}}, nil)
+	d.mu.Lock()
+	d.jwt = "jwt-token"
+	d.mu.Unlock()
+
+	err := d.handlePollWorkItem(PollWorkItem{
+		SessionID: "s1", ProjectID: "project", Repository: "github.com/acme/repo",
+		IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1,
+		AdmissionReceipt: json.RawMessage(`{"valid":"admission"}`),
+		EffectiveCell:    rawJSON(t, cell),
+		ExecutionRuntimeBinding: rawJSON(t, executioncell.RuntimeBinding{
+			ContractVersion: executioncell.RuntimeBindingContractVersion,
+			RequestID:       "s1",
+			WorkerID:        "wkr-test",
+			PlacementID:     cell.Placement.ID,
+		}),
+	}, srv.URL)
+
+	var gotDenial *runner.HarnessAdmissionError
+	if !errors.As(err, &gotDenial) || gotDenial.Code != executioncell.DenialFallbackNotAllowed {
+		t.Fatalf("handlePollWorkItem error = %v, want fallback_not_allowed HarnessAdmissionError", err)
+	}
+	if !errors.Is(err, persistErr) {
+		t.Fatalf("handlePollWorkItem error = %v, want observable persistence error", err)
+	}
+	if store.calls.Load() != 1 || provider.calls.Load() != 1 {
+		t.Fatalf("persist calls = %d, preflight calls = %d, want one each", store.calls.Load(), provider.calls.Load())
+	}
+	if got := body["receiptPreflightReason"]; !mapsEqual(got, map[string]any{
+		"contractVersion": receiptPreflightNackReasonContractVersion,
+		"code":            string(executioncell.DenialFallbackNotAllowed),
+	}) {
+		t.Fatalf("receiptPreflightReason = %#v, want exact closed reason", got)
+	}
+
+	truthful := false
+	for _, capability := range effectiveRegistrationCapabilities(nil) {
+		if capability == receiptPreflightNackReasonCapability {
+			truthful = true
+			break
+		}
+	}
+	if !truthful {
+		t.Fatalf("registration capabilities = %v, missing implemented NACK producer %q", effectiveRegistrationCapabilities(nil), receiptPreflightNackReasonCapability)
+	}
+}
+
+func mapsEqual(got any, want map[string]any) bool {
+	gotMap, ok := got.(map[string]any)
+	if !ok || len(gotMap) != len(want) {
+		return false
+	}
+	for key, wantValue := range want {
+		if gotMap[key] != wantValue {
+			return false
+		}
+	}
+	return true
 }
 
 // TestPollService_RoutesLandingWork verifies that the per-(orgId,repoId)

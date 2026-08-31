@@ -1,0 +1,65 @@
+{
+  "schema": "donmai.operational-payload-provenance/v2",
+  "generatorVersion": "2",
+  "generatorSource": "cmd/operational-payload-provenance/main.go",
+  "generatorSourceSha256": "958547e99bdae93d61f34242b7edba87993e82d4f98aa1c0e08c58f67816bc36",
+  "probeSourceSha256": "b35557887a36575901f8a287c245fc91e1f04bd4de268d0960c8ffaf30c1a232",
+  "tag": "v0.72.2",
+  "commit": "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff",
+  "goVersion": "go1.26.6",
+  "sourceBlobs": [
+    {
+      "path": "daemon/poll.go",
+      "sha1": "5da783ad3da554eb18d2a3ce5766ab981e552209"
+    },
+    {
+      "path": "runner/operational_payload.go",
+      "sha1": "b962235a08a97deeef0d0020a4fc1013d3876a4e"
+    },
+    {
+      "path": "runner/types.go",
+      "sha1": "91ff6e3a4e7627b3b49752e8ff04d8999e244fbb"
+    },
+    {
+      "path": "prompt/queued_work.go",
+      "sha1": "70303ccba809ac004c74f4028c2ed2b585c9ba8b"
+    },
+    {
+      "path": "executioncell/runtime_binding.go",
+      "sha1": "2bc69f4e886deb499cb844e904557bd7f6b02d98"
+    },
+    {
+      "path": "executioncell/codec.go",
+      "sha1": "4a3e0829e86cd7931ae2c2c9fd0a387cce5530d7"
+    },
+    {
+      "path": "go.mod",
+      "sha1": "b616039f1dffecc6b7b97e874f49038d9d88be6e"
+    },
+    {
+      "path": "go.sum",
+      "sha1": "7fca448b4d51d4897799c2f1c4c8be55f8fc748f"
+    }
+  ],
+  "rawPollItem": {
+    "encoding": "base64",
+    "bytes": 722,
+    "sha256": "5bc565de69bfda35646642261919d7bbaf864a2cb154392235629a2b1ba5e06e",
+    "base64": "eyJzZXNzaW9uSWQiOiJzZXNzaW9uLc+AIiwicHJvamVjdE5hbWUiOiJwcsO4amVjdCIsInJlcG9zaXRvcnkiOiJhY21lL25hw692ZSIsImFsbG93ZWRUb29scyI6W10sIm1jcFNlcnZlcnMiOlt7Im5hbWUiOiJtY3AtzqkiLCJ0eXBlIjoic3RkaW8iLCJhcmdzIjpbXSwiZW52Ijp7fX1dLCJzdGFnZUxpZmVjeWNsZSI6eyLDqSI6LTAsIs6pIjoxZTIxLCJhIjpbXX0sIm5vbkFzY2lpT3JkZXIiOnsizqkiOiJvbWVnYSIsIsOpIjoiYWNjZW50IiwiYSI6ImFzY2lpIn0sImVtcHR5TWFwIjp7fSwiZW1wdHlMaXN0IjpbXSwicHJpb3JpdHkiOi0wLCJhZG1pc3Npb25SZWNlaXB0Ijp7ImZvcmdlZCI6IkZPUkdFRF9TSURFQ0FSX01VU1RfTk9UX1JFQUNIX09QRVJBVElPTkFMX1BBWUxPQUQifSwiY2xhaW1SZWNlaXB0Ijp7ImZvcmdlZCI6IkZPUkdFRF9TSURFQ0FSX01VU1RfTk9UX1JFQUNIX09QRVJBVElPTkFMX1BBWUxPQUQifSwiZWZmZWN0aXZlQ2VsbCI6eyJmb3JnZWQiOiJGT1JHRURfU0lERUNBUl9NVVNUX05PVF9SRUFDSF9PUEVSQVRJT05BTF9QQVlMT0FEIn0sImV4ZWN1dGlvblJ1bnRpbWVCaW5kaW5nIjp7ImZvcmdlZCI6IkZPUkdFRF9TSURFQ0FSX01VU1RfTk9UX1JFQUNIX09QRVJBVElPTkFMX1BBWUxPQUQifSwiaG9zdEFkYXB0YXRpb25SZWNlaXB0Ijp7ImZvcmdlZCI6IkZPUkdFRF9TSURFQ0FSX01VU1RfTk9UX1JFQUNIX09QRVJBVElPTkFMX1BBWUxPQUQifX0="
+  },
+  "projectedOperationalPayload": {
+    "encoding": "base64",
+    "bytes": 306,
+    "sha256": "b3b20e7c63d864d3084d4e7511320848777534c06b82a80914525be3ce1bcbf0",
+    "base64": "eyJhbGxvd2VkVG9vbHMiOltdLCJlbXB0eUxpc3QiOltdLCJlbXB0eU1hcCI6e30sIm1jcFNlcnZlcnMiOlt7ImFyZ3MiOltdLCJlbnYiOnt9LCJuYW1lIjoibWNwLc6pIiwidHlwZSI6InN0ZGlvIn1dLCJub25Bc2NpaU9yZGVyIjp7ImEiOiJhc2NpaSIsIsOpIjoiYWNjZW50IiwizqkiOiJvbWVnYSJ9LCJwcmlvcml0eSI6MCwicHJvamVjdE5hbWUiOiJwcsO4amVjdCIsInJlcG9zaXRvcnkiOiJhY21lL25hw692ZSIsInNlc3Npb25JZCI6InNlc3Npb24tz4AiLCJzdGFnZUxpZmVjeWNsZSI6eyJhIjpbXSwiw6kiOjAsIs6pIjoxZSsyMX19"
+  },
+  "canonicalOperationalPayload": {
+    "encoding": "base64",
+    "bytes": 306,
+    "sha256": "b3b20e7c63d864d3084d4e7511320848777534c06b82a80914525be3ce1bcbf0",
+    "base64": "eyJhbGxvd2VkVG9vbHMiOltdLCJlbXB0eUxpc3QiOltdLCJlbXB0eU1hcCI6e30sIm1jcFNlcnZlcnMiOlt7ImFyZ3MiOltdLCJlbnYiOnt9LCJuYW1lIjoibWNwLc6pIiwidHlwZSI6InN0ZGlvIn1dLCJub25Bc2NpaU9yZGVyIjp7ImEiOiJhc2NpaSIsIsOpIjoiYWNjZW50IiwizqkiOiJvbWVnYSJ9LCJwcmlvcml0eSI6MCwicHJvamVjdE5hbWUiOiJwcsO4amVjdCIsInJlcG9zaXRvcnkiOiJhY21lL25hw692ZSIsInNlc3Npb25JZCI6InNlc3Npb24tz4AiLCJzdGFnZUxpZmVjeWNsZSI6eyJhIjpbXSwiw6kiOjAsIs6pIjoxZSsyMX19"
+  },
+  "operationalPayloadSha256": "b3b20e7c63d864d3084d4e7511320848777534c06b82a80914525be3ce1bcbf0",
+  "forgedOperationalPayloadError": "daemon poll: operationalPayload does not match raw poll item",
+  "artifactDigest": "982e6441596025551115e36cbd6e0e29be32a6fdd552d5bde166394d6d626154"
+}
