@@ -8,6 +8,8 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strconv"
+	"strings"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
 )
@@ -21,11 +23,34 @@ import (
 // live OUTSIDE this subdirectory and this file never looks at them.
 const codexPluginCacheSubdir = "cache"
 
+// codexPluginCacheAllowedTopLevel is the exact, closed set of cache/
+// top-level entries this package will ever seed or harvest — observed
+// directly against a real codex-cli home: a remote plugin/apps catalog and
+// three per-app siblings (directory listing, per-app server info, per-app
+// tool schemas). A new vendor cache entry Codex introduces later is inert
+// by default — never shared between sessions — until this list is
+// deliberately extended, rather than shared automatically the moment it
+// appears. Sharing everything under cache/ unconditionally would be an
+// observation about one Codex version, not a guarantee about any other.
+var codexPluginCacheAllowedTopLevel = map[string]bool{
+	"remote_plugin_catalog":  true,
+	"codex_app_directory":    true,
+	"codex_apps_server_info": true,
+	"codex_apps_tools":       true,
+}
+
 const (
-	// codexPluginCacheMaxFileBytes bounds a single reused cache entry so a
-	// corrupted or unexpectedly huge host cache cannot make every fresh
-	// session pay to reproduce an unbounded amount of data.
-	codexPluginCacheMaxFileBytes = 256 << 20 // 256 MiB
+	// codexPluginCacheMaxFileBytes bounds a single reused cache entry. The
+	// largest observed real catalog file is ~16.5 MiB; this leaves headroom
+	// for growth without inviting a corrupted or adversarial host cache to
+	// make every fresh session reproduce an unbounded amount of data.
+	codexPluginCacheMaxFileBytes = 32 << 20 // 32 MiB
+	// codexPluginCacheMaxTotalBytes bounds the TOTAL bytes copied across one
+	// seed or harvest call — the per-file cap alone does not bound a
+	// directory with many files, and os.TempDir() is commonly tmpfs
+	// (RAM-backed) on a typical Linux daemon host, where "bounded per file"
+	// and "bounded in aggregate" are very different promises.
+	codexPluginCacheMaxTotalBytes = 96 << 20 // 96 MiB
 	// codexPluginCacheMaxEntries bounds total files walked per seed/harvest
 	// call. The real catalog is a handful of files; this ceiling only exists
 	// so a pathologically large cache directory cannot turn every session
@@ -73,11 +98,11 @@ func resolveCodexPluginCacheDir(explicit string) string {
 //
 // This is the ONLY thing this boundary ever shares across sessions: the
 // per-session config.toml, the linked auth.json, and every other file this
-// boundary manages stay exactly as isolated as before. cache/ is safe to
-// share because it holds nothing session- or credential-specific — it is
-// Codex's own network-fetched, content/request-hash-keyed vendor discovery
-// data (a remote plugin/apps catalog and its per-app siblings), identical
-// regardless of which session fetched it.
+// boundary manages stay exactly as isolated as before. Only the four
+// allowlisted cache/ entries (codexPluginCacheAllowedTopLevel) are ever
+// shared — they hold nothing session- or credential-specific: Codex's own
+// network-fetched, content/request-hash-keyed vendor discovery data,
+// identical regardless of which session fetched it.
 //
 // Called at most once, right after successful construction, by a boundary's
 // owner (New's headless boundary, newInteractiveCodexConfigBoundary's
@@ -118,9 +143,14 @@ func (b *codexConfigBoundary) harvestPluginCache() {
 	}
 }
 
-// reuseCacheTree reproduces every regular file under src into the
-// corresponding relative path under dst.
+// reuseCacheTree reproduces every allowlisted, regular file under src into
+// the corresponding relative path under dst.
 //
+//   - Only the four allowlisted top-level entries (codexPluginCacheAllowedTopLevel)
+//     are ever descended into; anything else directly under src — a future
+//     vendor cache this package has not been taught about, or anything
+//     unexpected — is skipped entirely, never read or reproduced. See that
+//     var's doc comment.
 //   - A destination entry that already exists at the same relative path is
 //     left untouched, never overwritten: cache entries are named by
 //     content/request hash, so the same relative path can only ever mean the
@@ -130,12 +160,12 @@ func (b *codexConfigBoundary) harvestPluginCache() {
 //     a legitimate vendor cache never contains one, so this is pure defense
 //     against a tampered cache directory smuggling a path escape into either
 //     direction (host→session seed or session→host harvest).
-//   - A hard link is tried first: src and dst always sit under the same
-//     host-owned state-directory tree in production, so this is normally
-//     free (no data copied) and keeps the multi-hundred-megabyte catalog
-//     file from being duplicated once per session. A cross-device or
-//     otherwise link-incapable filesystem (test temp dirs on separate
-//     mounts, a `configTempDir` override) falls back to a plain copy.
+//   - Every copy is atomic (see copyFileAtomic): a process that dies
+//     mid-copy — the exact crash class this whole mechanism exists to
+//     survive, and harvest runs inside remove(), on the same exit path —
+//     never leaves a truncated file at the file's own canonical name, which
+//     the never-overwrite rule above would otherwise make a permanently
+//     poisoned entry for every future session on the host.
 //
 // Every per-file error is swallowed and that one file is skipped — the walk
 // always completes, and one unreadable or unwritable entry never blocks
@@ -155,9 +185,24 @@ func reuseCacheTree(src, dst string) error {
 		return fmt.Errorf("cache source %q is not a plain directory", src)
 	}
 	entries := 0
+	var totalBytes int64
 	return filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
 		if walkErr != nil {
 			return nil //nolint:nilerr // best-effort: skip an unreadable entry, keep walking.
+		}
+		rel, err := filepath.Rel(src, path)
+		if err != nil || rel == "." {
+			return nil //nolint:nilerr // unreachable in practice (path is always under src); never fatal to the walk.
+		}
+		topLevel := rel
+		if idx := strings.IndexRune(rel, filepath.Separator); idx >= 0 {
+			topLevel = rel[:idx]
+		}
+		if !codexPluginCacheAllowedTopLevel[topLevel] {
+			if d.IsDir() {
+				return fs.SkipDir
+			}
+			return nil
 		}
 		if d.IsDir() {
 			return nil
@@ -169,51 +214,67 @@ func reuseCacheTree(src, dst string) error {
 		if d.Type()&os.ModeSymlink != 0 || !d.Type().IsRegular() {
 			return nil
 		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return nil //nolint:nilerr // unreachable in practice (path is always under src); never fatal to the walk.
+		fi, err := d.Info()
+		if err != nil || fi.Size() > codexPluginCacheMaxFileBytes {
+			return nil
 		}
-		reuseCacheEntry(path, filepath.Join(dst, rel), d)
+		if totalBytes+fi.Size() > codexPluginCacheMaxTotalBytes {
+			return fs.SkipAll
+		}
+		target := filepath.Join(dst, rel)
+		if _, err := os.Lstat(target); err == nil {
+			return nil // already present; cache entries are immutable by name.
+		}
+		if err := os.MkdirAll(filepath.Dir(target), codexHomeMode); err != nil {
+			return nil
+		}
+		if err := copyFileAtomic(path, target, fi.Mode()); err == nil {
+			totalBytes += fi.Size()
+		}
 		return nil
 	})
 }
 
-// reuseCacheEntry reproduces one cache file at target, skipping anything
-// already there. Errors are for the caller's optional debug log only —
-// reuseCacheTree never propagates them.
-func reuseCacheEntry(source, target string, d fs.DirEntry) {
-	if _, err := os.Lstat(target); err == nil {
-		return // already present; cache entries are immutable by name.
-	}
-	fi, err := d.Info()
-	if err != nil || fi.Size() > codexPluginCacheMaxFileBytes {
-		return
-	}
-	if err := os.MkdirAll(filepath.Dir(target), codexHomeMode); err != nil {
-		return
-	}
-	if err := os.Link(source, target); err == nil {
-		return
-	}
-	_ = copyFileBestEffort(source, target, fi.Mode())
-}
-
-// copyFileBestEffort is reuseCacheEntry's fallback when a hard link is not
-// possible (typically a cross-device destination). O_EXCL makes a
-// concurrent duplicate attempt (two sessions racing to seed or harvest the
-// same new hash) fail harmlessly on whichever loses, rather than corrupt the
-// file either side reads.
-func copyFileBestEffort(source, target string, mode os.FileMode) error {
-	in, err := os.Open(source) //nolint:gosec // G304: source is a path this package's own WalkDir just enumerated under a codex-owned cache directory.
+// copyFileAtomic copies source to target by writing into a sibling temp file
+// in target's own directory (guaranteeing the same filesystem, so the final
+// rename is atomic) and renaming it into place only once the copy fully
+// succeeds. target's canonical name never exists until that rename completes
+// — a crash, kill, or write error at any point before then leaves at most an
+// orphaned, uniquely-named temp file, never a truncated file at the name
+// reuseCacheTree's never-overwrite rule would otherwise treat as valid
+// content forever.
+func copyFileAtomic(source, target string, mode os.FileMode) error {
+	in, err := os.Open(source) //nolint:gosec // G304: source is a path this package's own WalkDir just enumerated under a codex-owned, allowlisted cache directory.
 	if err != nil {
 		return err
 	}
 	defer func() { _ = in.Close() }()
-	out, err := os.OpenFile(target, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm()) //nolint:gosec // G304: target is a path this package's own WalkDir just built under a codex-owned cache directory.
+	return copyReaderAtomic(in, target, mode)
+}
+
+// copyReaderAtomic is copyFileAtomic's core, taking an io.Reader directly so
+// an interrupted-read failure partway through a copy — the exact "process
+// dies mid-copy" class F4 exists to close, and the one case a real *os.File
+// source cannot deterministically reproduce in a test — is exercisable
+// without a real filesystem-level fault.
+func copyReaderAtomic(r io.Reader, target string, mode os.FileMode) error {
+	tmp := target + ".donmai-tmp-" + strconv.Itoa(os.Getpid())
+	out, err := os.OpenFile(tmp, os.O_WRONLY|os.O_CREATE|os.O_EXCL, mode.Perm()) //nolint:gosec // G304: tmp is derived from target, a path this package's own WalkDir just built.
 	if err != nil {
 		return err
 	}
-	defer func() { _ = out.Close() }()
-	_, err = io.Copy(out, in)
-	return err
+	if _, err := io.Copy(out, r); err != nil {
+		_ = out.Close()
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := out.Close(); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	if err := os.Rename(tmp, target); err != nil {
+		_ = os.Remove(tmp)
+		return err
+	}
+	return nil
 }

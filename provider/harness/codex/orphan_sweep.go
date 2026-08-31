@@ -3,11 +3,14 @@ package codex
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"log/slog"
 	"os"
 	"path/filepath"
 	"strings"
 	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // codexAppSocketPrefix names the Unix-socket directory
@@ -18,9 +21,9 @@ const codexAppSocketPrefix = "donmai-codex-app-"
 
 // donmaiOwnerManifestName is the one file this package ever writes inside a
 // donmai-owned artifact directory purely for the sweep's benefit. It is
-// metadata only (a PID and a timestamp) — never a credential, never
-// session content — and its removal happens for free whenever the
-// directory it lives in is reclaimed or normally cleaned up.
+// metadata only (a PID, an OS-reported start time, and a timestamp) — never
+// a credential, never session content — and its removal happens for free
+// whenever the directory it lives in is reclaimed or normally cleaned up.
 const donmaiOwnerManifestName = ".donmai-owner.json"
 
 // donmaiOwnerManifest records who is responsible for a donmai-owned
@@ -28,22 +31,38 @@ const donmaiOwnerManifestName = ".donmai-owner.json"
 // after a restart) can tell a live session apart from an orphan without
 // guessing from age alone.
 //
-//   - OwnerPID is the donmai process that created the directory (the one
-//     whose in-memory Handle/*codexConfigBoundary owns cleaning it up). If
-//     that process is gone, nothing will EVER call remove()/close() for
+//   - OwnerIdentity pins the donmai process that created the directory (the
+//     one whose in-memory Handle/*codexConfigBoundary owns cleaning it up).
+//     If that process is gone, nothing will EVER call remove()/close() for
 //     this directory again — it is now the sweep's sole responsibility.
-//   - ChildPID is the codex subprocess PID this directory's owner started
-//     under it, when one is knowable at write time (the headless app-server
-//     in startLocked, the named bootstrap app-server in
-//     startNamedInteractiveAppServer). Zero when not applicable — ptycli's
-//     PTY driver deliberately exposes no child PID at all (see
-//     ptycli.Spawn's doc comment), so a plain interactive PTY session's home
-//     directory carries OwnerPID only.
+//     Pairing the PID with its OS-reported start time (sessionshim's own
+//     anti-reuse primitive — see sessionshim/procid.go) is what lets the
+//     sweep tell "the owner is still running" apart from "a PID it reused
+//     belongs to something else now"; a bare PID cannot make that
+//     distinction. OwnerPID is a same-information fallback for a platform
+//     where identity pinning is unavailable (see sessionshim's
+//     procid_other.go) — liveness read from a bare PID can still be WRONG
+//     in the reused-PID direction, but the consequence here is only ever a
+//     missed reclaim, never a wrongful kill (see ownerAlive).
+//   - ChildIdentity pins the codex subprocess this directory's owner
+//     started under it, when one is knowable at write time (the headless
+//     app-server in startLocked, the named bootstrap app-server in
+//     startNamedInteractiveAppServer) — pinned via pinDonmaiChildIdentity
+//     immediately after the child's own cmd.Start(), the only moment its
+//     start time is still readable. Zero (PID<=0) when no child was ever
+//     tracked for this directory shape (ptycli's PTY driver exposes no
+//     child PID at all — see its Spawn doc comment) or identity pinning
+//     failed/is unavailable on this platform. There is deliberately NO
+//     bare-PID fallback for a child: unlike the owner, a wrong answer here
+//     gates an actual SIGTERM/SIGKILL, so SweepOrphans never signals a
+//     process it cannot prove, via a verified identity match, that donmai
+//     itself started under this exact directory.
 type donmaiOwnerManifest struct {
-	OwnerPID  int       `json:"ownerPid"`
-	ChildPID  int       `json:"childPid,omitempty"`
-	StartedAt time.Time `json:"startedAt"`
-	Kind      string    `json:"kind"`
+	OwnerIdentity sessionshim.ProcessIdentity `json:"ownerIdentity,omitzero"`
+	OwnerPID      int                         `json:"ownerPid,omitempty"`
+	ChildIdentity sessionshim.ProcessIdentity `json:"childIdentity,omitzero"`
+	StartedAt     time.Time                   `json:"startedAt"`
+	Kind          string                      `json:"kind"`
 }
 
 // writeDonmaiOwnerManifest records this process as dir's owner. Best-effort:
@@ -51,28 +70,44 @@ type donmaiOwnerManifest struct {
 // heuristic for this one directory (see sweepOne) — it never fails
 // construction of the directory it describes.
 func writeDonmaiOwnerManifest(dir, kind string) {
-	writeDonmaiOwnerManifestManifest(dir, donmaiOwnerManifest{
-		OwnerPID:  os.Getpid(),
-		StartedAt: time.Now().UTC(),
-		Kind:      kind,
-	})
-}
-
-// updateDonmaiOwnerManifestChildPID re-reads dir's manifest (falling back to
-// a fresh one for this process if none exists yet) and records childPID —
-// called once the caller's own codex subprocess has actually started, so
-// the sweep can later distinguish "still owned by a live donmai process"
-// from "the live process is gone but its own codex child kept running."
-func updateDonmaiOwnerManifestChildPID(dir string, childPID int) {
-	manifest, ok := readDonmaiOwnerManifest(dir)
-	if !ok {
-		manifest = donmaiOwnerManifest{OwnerPID: os.Getpid(), StartedAt: time.Now().UTC()}
+	manifest := donmaiOwnerManifest{StartedAt: time.Now().UTC(), Kind: kind}
+	if identity, err := sessionshim.Self(); err == nil {
+		manifest.OwnerIdentity = identity
+	} else {
+		manifest.OwnerPID = os.Getpid()
 	}
-	manifest.ChildPID = childPID
-	writeDonmaiOwnerManifestManifest(dir, manifest)
+	persistDonmaiOwnerManifest(dir, manifest)
 }
 
-func writeDonmaiOwnerManifestManifest(dir string, manifest donmaiOwnerManifest) {
+// pinDonmaiChildIdentity is the single call site codex.go's startLocked and
+// interactive_name.go's startNamedInteractiveAppServer use immediately
+// after their own cmd.Start() succeeds — the only moment a child's OS-
+// reported start time is still readable (see sessionshim.ProcessIdentityFor's
+// doc comment). Best-effort: a pinning failure (identity unavailable on this
+// platform, or the vanishingly unlikely race where the child has already
+// exited by the time this runs) just means SweepOrphans can never verify —
+// and therefore never terminates — this directory's child. That is the safe
+// direction: see donmaiOwnerManifest's doc comment on why ChildIdentity has
+// no bare-PID fallback the way OwnerIdentity does.
+func pinDonmaiChildIdentity(dir string, pid int) {
+	identity, err := sessionshim.ProcessIdentityFor(pid)
+	if err != nil {
+		return
+	}
+	manifest, ok := readDonmaiOwnerManifestUnchecked(dir)
+	if !ok {
+		manifest = donmaiOwnerManifest{StartedAt: time.Now().UTC()}
+		if self, selfErr := sessionshim.Self(); selfErr == nil {
+			manifest.OwnerIdentity = self
+		} else {
+			manifest.OwnerPID = os.Getpid()
+		}
+	}
+	manifest.ChildIdentity = identity
+	persistDonmaiOwnerManifest(dir, manifest)
+}
+
+func persistDonmaiOwnerManifest(dir string, manifest donmaiOwnerManifest) {
 	body, err := json.Marshal(manifest)
 	if err != nil {
 		return
@@ -80,20 +115,62 @@ func writeDonmaiOwnerManifestManifest(dir string, manifest donmaiOwnerManifest) 
 	_ = os.WriteFile(filepath.Join(dir, donmaiOwnerManifestName), body, 0o600)
 }
 
-// readDonmaiOwnerManifest reads dir's owner manifest. ok is false for a
-// missing, unreadable, or malformed manifest — every one of those is
-// treated identically by the sweep (fall back to the pure age heuristic),
-// so callers never need to distinguish the reasons.
-func readDonmaiOwnerManifest(dir string) (donmaiOwnerManifest, bool) {
-	body, err := os.ReadFile(filepath.Join(dir, donmaiOwnerManifestName)) //nolint:gosec // G304: dir is always a donmai-owned artifact directory this package itself created.
+// readDonmaiOwnerManifestUnchecked reads dir's manifest WITHOUT the
+// directory-ownership verification readDonmaiOwnerManifest applies (see
+// verifyManifestDirectoryOwnership) — safe here ONLY because
+// pinDonmaiChildIdentity's caller is reading back a manifest it just wrote,
+// under a directory donmai itself created moments ago in the same process,
+// never an artifact discovered by a sweep. SweepOrphans itself must NEVER
+// call this directly; see readDonmaiOwnerManifest.
+func readDonmaiOwnerManifestUnchecked(dir string) (donmaiOwnerManifest, bool) {
+	body, err := os.ReadFile(filepath.Join(dir, donmaiOwnerManifestName)) //nolint:gosec // G304: dir is always a donmai-owned artifact directory this package itself just created.
 	if err != nil {
 		return donmaiOwnerManifest{}, false
 	}
 	var manifest donmaiOwnerManifest
-	if err := json.Unmarshal(body, &manifest); err != nil || manifest.OwnerPID <= 0 {
+	if err := json.Unmarshal(body, &manifest); err != nil {
+		return donmaiOwnerManifest{}, false
+	}
+	if manifest.OwnerIdentity.PID <= 0 && manifest.OwnerPID <= 0 {
 		return donmaiOwnerManifest{}, false
 	}
 	return manifest, true
+}
+
+// verifyManifestDirectoryOwnership requires dir to be owned by this process's
+// own user and not writable by group or other — the same rigor
+// config_boundary.go already applies to the isolated session home itself
+// (rejectSymlink + a pinned parent + 0700 — see newCodexConfigBoundaryWithAuthMode).
+//
+// Without this, os.TempDir() being a shared, world-writable directory on a
+// typical unix host (ordinary /tmp) makes an unverified manifest an
+// unprivileged local kill primitive: any user could mkdir a
+// donmai-codex-app-*/donmai-codex-home-* directory, drop a manifest naming
+// any PID they want signalled, backdate it, and wait for the next sweep.
+// info is the caller's own Lstat of dir, reused rather than re-stat'd so
+// there is exactly one stat between "this is the directory the sweep is
+// examining" and "this is the directory whose ownership was verified".
+func verifyManifestDirectoryOwnership(info os.FileInfo) error {
+	if info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
+		return errors.New("not a plain directory")
+	}
+	return verifyManifestDirectoryOwnershipOS(info)
+}
+
+// readDonmaiOwnerManifest is the ONLY entry point SweepOrphans itself may use
+// to read a manifest: it refuses to trust one at all unless
+// verifyManifestDirectoryOwnership passes first. ok is false for a
+// non-donmai-owned directory, a missing file, an unreadable/malformed one,
+// or one whose PID fields are all non-positive — sweepOne treats every one
+// of those identically (fall back to the unverified-age heuristic), so
+// callers never need to distinguish the reasons.
+func readDonmaiOwnerManifest(dir string, info os.FileInfo) (donmaiOwnerManifest, bool) {
+	if err := verifyManifestDirectoryOwnership(info); err != nil {
+		slog.Warn("codex: orphan sweep found an artifact directory it does not own; treating its manifest as unverifiable",
+			"path", dir, "err", err)
+		return donmaiOwnerManifest{}, false
+	}
+	return readDonmaiOwnerManifestUnchecked(dir)
 }
 
 // SweepOptions configures SweepOrphans. The zero value is a usable, fully
@@ -103,32 +180,54 @@ type SweepOptions struct {
 	// os.TempDir() — the same parent newCodexConfigBoundaryWithAuthMode and
 	// startNamedInteractiveAppServer use by default.
 	Root string
-	// MinAge is how old (by directory mtime) an entry must be before the
-	// sweep will even consider it — the first, unconditional line of
-	// defense against touching a session that only just started. Empty
-	// means 1 hour.
+	// MinAge is how old (by directory mtime) an entry with a verified,
+	// dead owner must be before the sweep will reclaim it. Empty means 1
+	// hour.
 	MinAge time.Duration
+	// UnverifiedMinAge is the SEPARATE, much larger age floor required
+	// before the sweep will reclaim a directory it cannot fully verify:
+	// no manifest at all (every pre-upgrade rollout's still-running
+	// sessions look like this the moment a new daemon starts, and a
+	// manifest write is best-effort and can fail), an unowned manifest (see
+	// verifyManifestDirectoryOwnership), or a dead owner with no tracked
+	// child identity (the PTY session shape — a live orphaned codex process
+	// could still be using it, and there is no PID to check at all). A live
+	// session's top-level CODEX_HOME mtime stops moving minutes in (writes
+	// land in subdirectories), so MinAge alone is not a safe bar for any of
+	// these; only reclaiming the directory (never a process) and only past
+	// this much longer floor is. Empty means 24 hours.
+	UnverifiedMinAge time.Duration
 	// MaxEntries bounds how many donmai-named entries one sweep call will
 	// examine, so a pathologically large temp directory cannot turn daemon
 	// startup into unbounded filesystem/process work. Empty means 500.
 	MaxEntries int
-	// TerminationGrace bounds how long the sweep waits after SIGTERM before
-	// escalating to SIGKILL for a live orphaned app-server process. Empty
-	// means 5s, matching namedInteractiveAppServer.close's own escalation
-	// window.
+	// TerminationGrace bounds how long the sweep waits after SIGTERM (and
+	// again after SIGKILL) before giving up on confirming a live orphaned
+	// app-server process actually died. Empty means 5s, matching
+	// namedInteractiveAppServer.close's own escalation window.
 	TerminationGrace time.Duration
 	// BinaryHint names the codex binary the sweep expects a live orphaned
-	// process to be running, for the process-identity check before it will
-	// ever terminate anything. Empty means "codex".
+	// process to be running — an extra, independent check (on top of the
+	// verified process identity) before it will ever terminate anything.
+	// Empty means "codex".
 	BinaryHint string
 	// Logger receives one structured line per entry examined plus one
 	// summary line. Empty means slog.Default().
 	Logger *slog.Logger
+	// PluginCacheDir is the host-level warm cache reclaim/harvestOrphanedPluginCache harvests
+	// an orphaned session's own cache/ subtree into (see plugin_cache.go)
+	// before its scratch is removed — the fetch that session paid for is
+	// otherwise simply discarded, for exactly the sessions most likely to
+	// need the cache-reuse mechanism (ones that crashed before they could
+	// call remove()/harvestPluginCache() themselves). Empty means the same
+	// default resolveCodexPluginCacheDir("") gives every boundary.
+	PluginCacheDir string
 
-	// processAlive / processLooksLikeCodex / now are test seams; production
-	// leaves them nil and gets the real, platform-specific implementations.
+	// processAlive / processLooksLikeCodex / identityAlive / now are test
+	// seams; production leaves them nil and gets the real implementations.
 	processAlive          func(pid int) bool
 	processLooksLikeCodex func(pid int, binaryHint string) bool
+	identityAlive         func(identity sessionshim.ProcessIdentity) (bool, error)
 	now                   func() time.Time
 }
 
@@ -136,12 +235,20 @@ type SweepOptions struct {
 // logging/metrics; every field is also emitted as a structured field on the
 // summary log line SweepOrphans itself writes.
 type SweepReport struct {
-	Scanned          int
-	Reclaimed        int
-	Terminated       int
-	SkippedLive      int
-	SkippedAmbiguous int
-	Errors           int
+	Scanned   int
+	Reclaimed int
+	// PartiallyReclaimed counts a "codex-home" directory whose scratch was
+	// removed but whose sessions/ subdirectory was deliberately left in
+	// place — see codexSessionStateSubdir's doc comment. Not a failure: an
+	// operator watching this climb over time is the intended signal that
+	// retained session state is accumulating and its own lifecycle policy
+	// (not this sweep) needs to exist.
+	PartiallyReclaimed int
+	Terminated         int
+	SkippedYoung       int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
+	SkippedLive        int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
+	SkippedAmbiguous   int // a live PID that failed identity or binary-identity verification — never touched.
+	Errors             int
 }
 
 func (opts SweepOptions) withDefaults() SweepOptions {
@@ -150,6 +257,9 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 	}
 	if opts.MinAge <= 0 {
 		opts.MinAge = time.Hour
+	}
+	if opts.UnverifiedMinAge <= 0 {
+		opts.UnverifiedMinAge = 24 * time.Hour
 	}
 	if opts.MaxEntries <= 0 {
 		opts.MaxEntries = 500
@@ -169,6 +279,9 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 	if opts.processLooksLikeCodex == nil {
 		opts.processLooksLikeCodex = processLooksLikeCodexOS
 	}
+	if opts.identityAlive == nil {
+		opts.identityAlive = sessionshim.ProcessIdentity.Alive
+	}
 	if opts.now == nil {
 		opts.now = time.Now
 	}
@@ -186,22 +299,40 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 // state) is never a directory with either prefix, so it is never a
 // candidate at all, let alone examined.
 //
-// Within that fence, three independent gates must ALL agree before this
-// function ever terminates a process, and any one of them failing leaves
-// the entry untouched:
+// Within that fence, every decision funnels through independent gates, and
+// any one of them failing leaves the entry (and any process it might name)
+// untouched:
 //
-//  1. Age: an entry younger than opts.MinAge is always skipped outright — a
-//     session that only just started must never race the sweep.
-//  2. Ownership: the entry's own .donmai-owner.json (written at creation —
-//     see writeDonmaiOwnerManifest) must name a live child PID. No
-//     manifest, or a manifest whose owner process is STILL running (it may
-//     yet clean this up itself), or whose child PID is not alive, never
-//     reaches the termination path — those fall back to (or stop at) plain
-//     directory reclamation once independently proven safe.
-//  3. Identity: the live child PID must independently look like the
-//     configured codex binary (opts.BinaryHint) — a PID that survived long
-//     enough to be reused by an unrelated process fails this check and is
-//     left alone, along with its directory, rather than guessed at.
+//  1. Ownership (verifyManifestDirectoryOwnership): a manifest is trusted
+//     only when its directory is owned by this process's own user and not
+//     writable by group or other. Anything else is treated exactly like
+//     "no manifest at all" — never read, let alone acted on.
+//  2. Age: MinAge for a verified-dead owner; the much larger
+//     UnverifiedMinAge for anything the sweep cannot fully verify (no
+//     manifest, an unowned one, or a dead owner with no tracked child) —
+//     see UnverifiedMinAge's doc comment for why a short bar is unsafe
+//     there.
+//  3. Owner liveness: a manifest naming a still-running owner (by verified
+//     identity, or by bare PID where identity pinning was unavailable) is
+//     never touched — that owner's own in-memory Handle/boundary may yet
+//     clean it up itself.
+//  4. Child identity (sessionshim.ProcessIdentity, PID + OS-reported start
+//     time): termination requires a LIVE, MATCHING identity — a PID that
+//     merely exists is not enough, because PID reuse on a host churning
+//     thousands of codex spawns is not a corner case. A manifest whose
+//     child was never pinned, or whose pinned identity is no longer alive
+//     under that exact PID+start-time pairing, is never signalled.
+//  5. Binary identity: even a live, identity-matched child must
+//     independently look like the configured codex binary
+//     (opts.BinaryHint, via `ps`) before the sweep will ever terminate it.
+//  6. Confirmed termination: SIGTERM, then SIGKILL, each followed by a
+//     liveness re-probe — reclaiming a directory (or reporting a kill) is
+//     never claimed on an unconfirmed signal.
+//  7. Resumable session state (codexSessionStateSubdir): even once a
+//     "codex-home" directory clears every gate above, a non-empty
+//     sessions/ subdirectory is NEVER deleted — see that constant's doc
+//     comment. Only scratch around it is removed, reported as
+//     PartiallyReclaimed rather than Reclaimed.
 //
 // Work is bounded by opts.MaxEntries so a pathological temp directory
 // cannot turn daemon startup into unbounded filesystem or process work.
@@ -243,7 +374,9 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		"root", opts.Root,
 		"scanned", report.Scanned,
 		"reclaimed", report.Reclaimed,
+		"partiallyReclaimed", report.PartiallyReclaimed,
 		"terminated", report.Terminated,
+		"skippedYoung", report.SkippedYoung,
 		"skippedLive", report.SkippedLive,
 		"skippedAmbiguous", report.SkippedAmbiguous,
 		"errors", report.Errors,
@@ -257,45 +390,134 @@ func (opts SweepOptions) sweepOne(path, kind string, report *SweepReport) {
 		// Not a plain directory (or already gone) — never our shape.
 		return
 	}
-	if age := opts.now().Sub(info.ModTime()); age < opts.MinAge {
-		report.SkippedLive++
+	if opts.now().Sub(info.ModTime()) < opts.MinAge {
+		report.SkippedYoung++
 		return
 	}
-	manifest, hasManifest := readDonmaiOwnerManifest(path)
+	manifest, hasManifest := readDonmaiOwnerManifest(path, info)
 	if !hasManifest {
-		// No PID to check either way. The age gate above already proves
-		// nothing has touched this directory recently, so age alone is
-		// enough to reclaim it safely.
-		opts.reclaim(path, kind, report)
+		opts.reclaimUnverified(path, kind, info, report)
 		return
 	}
-	if opts.processAlive(manifest.OwnerPID) {
-		// The donmai process that owns this directory is still running and
-		// may yet clean it up itself. Never touch it.
+	if opts.ownerAlive(manifest) {
 		report.SkippedLive++
 		return
 	}
-	if manifest.ChildPID == 0 || !opts.processAlive(manifest.ChildPID) {
-		// Owner is gone and there is no live child to worry about (or none
-		// was ever tracked for this directory shape — see
-		// donmaiOwnerManifest's doc comment). Safe to reclaim.
+	if manifest.ChildIdentity.PID <= 0 {
+		// Owner is gone, but no child was ever tracked for this directory
+		// shape (the PTY session case — ptycli exposes no child PID at
+		// all). A live orphaned codex process could still be using it;
+		// there is no PID to check. Reclaiming the directory ALONE (never
+		// a process) still requires the much larger age floor.
+		opts.reclaimUnverified(path, kind, info, report)
+		return
+	}
+	alive, err := opts.identityAlive(manifest.ChildIdentity)
+	if err != nil {
+		report.SkippedAmbiguous++
+		opts.Logger.Warn("codex: orphan sweep could not verify a recorded child identity; leaving it alone",
+			"path", path, "kind", kind, "pid", manifest.ChildIdentity.PID, "err", err)
+		return
+	}
+	if !alive {
+		// Confirmed: the owner is dead AND the exact child incarnation it
+		// started is dead too (identity-verified, not just "PID absent").
 		opts.reclaim(path, kind, report)
 		return
 	}
-	if !opts.processLooksLikeCodex(manifest.ChildPID, opts.BinaryHint) {
-		// The recorded PID is alive but does not look like our own child —
-		// almost certainly PID reuse after the real one exited. Ambiguous:
-		// touch neither the process nor the directory.
+	if !opts.processLooksLikeCodex(manifest.ChildIdentity.PID, opts.BinaryHint) {
+		// The recorded identity is alive and IS the same incarnation this
+		// directory's owner started — but it no longer looks like the
+		// configured binary at all. Ambiguous: touch neither the process
+		// nor the directory rather than guess.
 		report.SkippedAmbiguous++
-		opts.Logger.Warn("codex: orphan sweep found a live but unidentifiable PID; skipping",
-			"path", path, "kind", kind, "pid", manifest.ChildPID)
+		opts.Logger.Warn("codex: orphan sweep found a live, identity-matched child that no longer looks like the configured binary; skipping",
+			"path", path, "kind", kind, "pid", manifest.ChildIdentity.PID)
 		return
 	}
-	opts.terminate(manifest.ChildPID, path, report)
+	if !opts.terminate(manifest.ChildIdentity, path, report) {
+		return // termination could not be confirmed; its directory stays too.
+	}
 	opts.reclaim(path, kind, report)
 }
 
+// reclaimUnverified applies UnverifiedMinAge — the separate, much larger age
+// floor — before reclaiming a directory the sweep could not fully verify
+// (see UnverifiedMinAge's doc comment). Never touches a process.
+func (opts SweepOptions) reclaimUnverified(path, kind string, info os.FileInfo, report *SweepReport) {
+	if opts.now().Sub(info.ModTime()) < opts.UnverifiedMinAge {
+		report.SkippedYoung++
+		return
+	}
+	opts.reclaim(path, kind, report)
+}
+
+// ownerAlive reports whether manifest's owner is still running. A pinned
+// identity is checked for an exact live match (PID reuse reported as NOT
+// alive — the safe direction for a read that only ever gates a SKIP, never
+// a kill); a bare-PID fallback (identity pinning unavailable on this
+// platform) accepts the same reuse risk bare-PID checks always have, which
+// is acceptable ONLY because the consequence here is a missed reclaim, never
+// a wrongful termination.
+func (opts SweepOptions) ownerAlive(manifest donmaiOwnerManifest) bool {
+	if manifest.OwnerIdentity.PID > 0 {
+		if alive, err := opts.identityAlive(manifest.OwnerIdentity); err == nil {
+			return alive
+		}
+		// Identity check errored (not "confirmed dead" — Alive() reports
+		// that as false, nil): fall through to the bare-PID probe rather
+		// than treat an error as proof of death.
+	}
+	if manifest.OwnerPID > 0 {
+		return opts.processAlive(manifest.OwnerPID)
+	}
+	return false
+}
+
+// reclaim removes path, UNLESS it still holds resumable session state (see
+// codexSessionStateSubdir), in which case it strips everything else and
+// preserves that subdirectory instead of deleting path outright. Only
+// codex-home entries can ever hold session state at all — a
+// codex-app-socket bootstrap directory contains nothing but a Unix socket
+// and is always removed outright. Either way, whatever the directory's own
+// cache/ subtree holds is harvested into the host-level plugin cache first
+// (see harvestOrphanedPluginCache) — the fetch that session paid for is
+// otherwise simply lost, for exactly the sessions most likely to need the
+// cache-reuse mechanism (ones that crashed before they could call
+// remove()/harvestPluginCache() themselves).
+// codexSessionStateSubdir is the ONE CODEX_HOME subdirectory SweepOrphans
+// will NEVER delete as part of directory reclamation: CODEX_HOME/sessions/<date>/
+// holds codex's own rollout-*.jsonl files, which is what native `resume` is
+// keyed on (see isRolloutFlushRaceError in interactive_name.go for the exact
+// shape). Deleting it out from under a dead-but-resumable session destroys
+// product data a user or the platform may still want, silently, long after
+// the owning process exited. This is a deliberately conservative bridge until
+// Linear REN-3090 ("Move every harness's session state out of the checkout in
+// the flat layout", backlog as of 2026-08-31) gives this content a
+// purpose-built, lifecycle-bound home outside os.TempDir() — read that issue
+// before changing this policy.
+const codexSessionStateSubdir = "sessions"
+
 func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) {
+	opts.harvestOrphanedPluginCache(path)
+	hasSessionState, err := dirHasEntries(filepath.Join(path, codexSessionStateSubdir))
+	if err != nil {
+		// Could not even determine whether resumable state exists. The
+		// conservative answer is "assume yes" rather than risk deleting it.
+		hasSessionState = true
+	}
+	if hasSessionState {
+		if err := reclaimSweepScratch(path, codexSessionStateSubdir); err != nil {
+			report.Errors++
+			opts.Logger.Warn("codex: orphan sweep failed to reclaim scratch around preserved session state",
+				"path", path, "kind", kind, "err", err)
+			return
+		}
+		report.PartiallyReclaimed++
+		opts.Logger.Info("codex: orphan sweep reclaimed scratch but PRESERVED resumable session state",
+			"path", path, "kind", kind, "preserved", filepath.Join(path, codexSessionStateSubdir))
+		return
+	}
 	if err := os.RemoveAll(path); err != nil {
 		report.Errors++
 		opts.Logger.Warn("codex: orphan sweep failed to reclaim", "path", path, "kind", kind, "err", err)
@@ -305,28 +527,103 @@ func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) {
 	opts.Logger.Info("codex: orphan sweep reclaimed", "path", path, "kind", kind)
 }
 
-// terminate sends the escalating SIGTERM→SIGKILL sequence this package uses
-// everywhere else (see namedInteractiveAppServer.close) to a proven-orphaned
-// codex child before its directory is reclaimed, so it stops retrying
-// whatever network call has kept it alive instead of leaking a live process
-// under a directory that is about to disappear out from under it.
-func (opts SweepOptions) terminate(pid int, path string, report *SweepReport) {
-	process, err := os.FindProcess(pid)
-	if err != nil {
+// harvestOrphanedPluginCache copies back whatever an orphaned directory's
+// own cache/ subtree holds into the host-level warm cache (see
+// plugin_cache.go's reuseCacheTree) before that directory is reclaimed —
+// mirrors codexConfigBoundary.harvestPluginCache, but reachable from a
+// SEPARATE sweep process that never held the original in-memory boundary
+// object at all. A no-op (via reuseCacheTree's own missing-source handling)
+// for a codex-app-socket directory, which never has a cache/ subtree.
+func (opts SweepOptions) harvestOrphanedPluginCache(path string) {
+	if codexPluginCacheDisabled() {
 		return
 	}
-	_ = process.Signal(syscallSIGTERM())
-	deadline := opts.now().Add(opts.TerminationGrace)
-	for opts.now().Before(deadline) {
-		if !opts.processAlive(pid) {
-			report.Terminated++
-			opts.Logger.Info("codex: orphan sweep terminated an orphaned app-server", "pid", pid, "path", path)
-			return
+	src := filepath.Join(path, codexPluginCacheSubdir)
+	dst := resolveCodexPluginCacheDir(opts.PluginCacheDir)
+	if err := reuseCacheTree(src, dst); err != nil {
+		opts.Logger.Debug("codex: orphan sweep plugin-cache harvest skipped", "path", path, "err", err)
+	}
+}
+
+// dirHasEntries reports whether dir exists and contains at least one entry.
+// A missing dir is "no entries", not an error — the ordinary case for a
+// codex-app-socket directory (which never has a sessions/ subdirectory at
+// all) and for a codex-home directory whose session never got as far as a
+// named, turned thread.
+func dirHasEntries(dir string) (bool, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
 		}
-		time.Sleep(50 * time.Millisecond)
+		return false, err
+	}
+	return len(entries) > 0, nil
+}
+
+// reclaimSweepScratch removes every top-level entry of dir except preserve.
+func reclaimSweepScratch(dir, preserve string) error {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return err
+	}
+	var errs []error
+	for _, entry := range entries {
+		if entry.Name() == preserve {
+			continue
+		}
+		if err := os.RemoveAll(filepath.Join(dir, entry.Name())); err != nil {
+			errs = append(errs, err)
+		}
+	}
+	return errors.Join(errs...)
+}
+
+// terminate sends the escalating SIGTERM→SIGKILL sequence this package uses
+// everywhere else (see namedInteractiveAppServer.close) to a proven-orphaned,
+// identity-verified codex child, re-probing liveness after EACH signal
+// before reporting anything: a bare Kill() call can itself fail silently
+// (EPERM, a process the OS will not let this one signal), and reporting a
+// kill that was never confirmed would make the summary log lie. Returns
+// whether termination was confirmed — sweepOne only reclaims the directory
+// when this is true, since an unconfirmed-dead process could still be using
+// it.
+func (opts SweepOptions) terminate(identity sessionshim.ProcessIdentity, path string, report *SweepReport) bool {
+	process, err := os.FindProcess(identity.PID)
+	if err != nil {
+		report.Errors++
+		return false
+	}
+	_ = process.Signal(syscallSIGTERM())
+	if opts.awaitDeath(identity, opts.TerminationGrace) {
+		report.Terminated++
+		opts.Logger.Info("codex: orphan sweep terminated an orphaned app-server", "pid", identity.PID, "path", path)
+		return true
 	}
 	_ = process.Kill()
-	report.Terminated++
-	opts.Logger.Warn("codex: orphan sweep force-killed an orphaned app-server after its grace window expired",
-		"pid", pid, "path", path)
+	if opts.awaitDeath(identity, opts.TerminationGrace) {
+		report.Terminated++
+		opts.Logger.Warn("codex: orphan sweep force-killed an orphaned app-server after its grace window expired",
+			"pid", identity.PID, "path", path)
+		return true
+	}
+	report.Errors++
+	opts.Logger.Warn("codex: orphan sweep could not confirm an orphaned app-server was terminated; leaving its directory in place",
+		"pid", identity.PID, "path", path)
+	return false
+}
+
+// awaitDeath polls identity's liveness until it reports dead or grace
+// elapses.
+func (opts SweepOptions) awaitDeath(identity sessionshim.ProcessIdentity, grace time.Duration) bool {
+	deadline := opts.now().Add(grace)
+	for {
+		if alive, err := opts.identityAlive(identity); err == nil && !alive {
+			return true
+		}
+		if !opts.now().Before(deadline) {
+			return false
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
 }

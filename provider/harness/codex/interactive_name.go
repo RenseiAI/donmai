@@ -191,12 +191,13 @@ func startNamedInteractiveAppServer(
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("codex interactive name bootstrap spawn: %w", err)
 	}
-	// Record this bootstrap app-server's own PID against its socket
-	// directory so a later orphan sweep (orphan_sweep.go) can identify and
-	// terminate it specifically if this process never gets to call close()
-	// itself — see donmaiOwnerManifest's doc comment.
+	// Record this bootstrap app-server's own verified process identity
+	// (PID + OS-reported start time) against its socket directory so a
+	// later orphan sweep (orphan_sweep.go) can identify and terminate it
+	// specifically if this process never gets to call close() itself — see
+	// donmaiOwnerManifest's doc comment for why identity, not bare PID.
 	writeDonmaiOwnerManifest(socketDir, "codex-app-socket")
-	updateDonmaiOwnerManifestChildPID(socketDir, cmd.Process.Pid)
+	pinDonmaiChildIdentity(socketDir, cmd.Process.Pid)
 	stderrBuf := captureAppServerStderr(stderr)
 	waitCh := make(chan error, 1)
 	server := &namedInteractiveAppServer{
