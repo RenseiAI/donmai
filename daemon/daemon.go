@@ -1883,6 +1883,10 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if err != nil {
 				return nil, fmt.Errorf("marshal resolved profile: %w", err)
 			}
+			stageBudgetJSON, err := marshalOptional(detail.StageBudget)
+			if err != nil {
+				return nil, fmt.Errorf("marshal stage budget: %w", err)
+			}
 			preflightInput := struct {
 				SessionID               string          `json:"sessionId"`
 				WorkerID                string          `json:"workerId"`
@@ -1903,12 +1907,17 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				// digest could never agree.
 				ModelProfile    json.RawMessage `json:"modelProfile,omitempty"`
 				ResolvedProfile json.RawMessage `json:"resolvedProfile,omitempty"`
+				// StageBudget is also a SessionDetail sibling. It contributes to
+				// autonomous prompt authority, so preflight and spawn must apply
+				// the same shared reconciliation over this exact value.
+				StageBudget json.RawMessage `json:"stageBudget,omitempty"`
 			}{
 				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
 				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
 				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
 				OperationalPayload: detail.OperationalPayload,
 				ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
+				StageBudget: stageBudgetJSON,
 			}
 			detailJSON, err := json.Marshal(preflightInput)
 			if err != nil {

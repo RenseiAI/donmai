@@ -1085,12 +1085,13 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		qw.McpAuthToken, qw.McpAuthTokenExpiresAt = d.McpAuthToken, d.McpAuthTokenExpiresAt
 		qw.Capabilities = d.Capabilities
 	}
-	if d.StageBudget != nil {
-		qw.StageBudget = &prompt.StageBudget{
-			MaxDurationSeconds: d.StageBudget.MaxDurationSeconds,
-			MaxSubAgents:       d.StageBudget.MaxSubAgents,
-			MaxTokens:          d.StageBudget.MaxTokens,
-		}
+	stageBudgetJSON, err := marshalOptional(d.StageBudget)
+	if err != nil {
+		return runner.QueuedWork{}, fmt.Errorf("marshal stage budget: %w", err)
+	}
+	qw, err = runner.ReconcileStageBudget(qw, stageBudgetJSON)
+	if err != nil {
+		return runner.QueuedWork{}, err
 	}
 	if d.InterviewBudget != nil {
 		qw.InterviewBudget = &prompt.InterviewBudget{
