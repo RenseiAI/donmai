@@ -295,11 +295,12 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		p.stdin = stdin
 		p.stdout = stdout
 		p.stderr = stderr
-		// Record the app-server's own PID against its isolated home so a
-		// later orphan sweep (orphan_sweep.go) can identify and terminate it
-		// specifically, rather than only ever reclaiming the directory
-		// underneath a still-running orphaned process.
-		updateDonmaiOwnerManifestChildPID(p.config.home, cmd.Process.Pid)
+		// Pin the app-server's own verified process identity (PID + OS-
+		// reported start time) against its isolated home so a later orphan
+		// sweep (orphan_sweep.go) can identify and terminate it specifically
+		// — never by bare PID alone, which PID reuse on a host churning
+		// thousands of codex spawns can make point at an unrelated process.
+		pinDonmaiChildIdentity(p.config.home, cmd.Process.Pid)
 		// Drain stderr into a bounded, redacted capture so the child never
 		// deadlocks on a full pipe and a crash leaves a forensic excerpt
 		// instead of nothing — see appserver_stderr.go and failStartLocked /

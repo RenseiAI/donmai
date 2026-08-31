@@ -1,8 +1,10 @@
 package codex
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 )
 
@@ -19,14 +21,18 @@ func writeCacheFixture(t *testing.T, dir, rel, body string) string {
 	return path
 }
 
-// TestReuseCacheTree_HardLinksExistingHostEntries pins the cheap-path case:
-// a file the host cache already has is reproduced at the destination as a
-// hard link (same inode) — never a copy — so a multi-hundred-megabyte
-// catalog is never duplicated per session.
-func TestReuseCacheTree_HardLinksExistingHostEntries(t *testing.T) {
+// TestReuseCacheTree_CopiesExistingHostEntriesAtomically pins the seed
+// path's basic shape — an allowlisted file the host cache already has is
+// reproduced at the destination with the same content and no leftover temp
+// artifact — see copyFileAtomic's doc comment for why every copy goes
+// through a same-directory temp file + rename rather than a direct write or
+// a hard link (F6: a hard link would share ONE inode across every
+// concurrently-live session, silently propagating any in-place rewrite
+// Codex might ever do; nothing in this package has verified Codex does not).
+func TestReuseCacheTree_CopiesExistingHostEntriesAtomically(t *testing.T) {
 	src := t.TempDir()
 	dst := t.TempDir()
-	srcFile := writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), `{"plugins":[]}`)
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), `{"plugins":[]}`)
 
 	if err := reuseCacheTree(src, dst); err != nil {
 		t.Fatalf("reuseCacheTree: %v", err)
@@ -39,16 +45,160 @@ func TestReuseCacheTree_HardLinksExistingHostEntries(t *testing.T) {
 	if string(body) != `{"plugins":[]}` {
 		t.Fatalf("reused entry body = %q", body)
 	}
-	srcInfo, err := os.Stat(srcFile)
+	entries, err := os.ReadDir(filepath.Join(dst, "remote_plugin_catalog"))
 	if err != nil {
 		t.Fatal(err)
 	}
-	dstInfo, err := os.Stat(dstFile)
+	if len(entries) != 1 {
+		t.Fatalf("expected exactly the reused entry with no leftover temp file, got %v", entries)
+	}
+}
+
+// TestReuseCacheTree_NeverLeavesATruncatedFileAtTheCanonicalName is the
+// reviewer's F4 probe: a copy that cannot complete (here, a destination
+// directory with no write permission — standing in for any interrupted-
+// write cause, crash included, since harvestPluginCache runs inside
+// remove() on exactly that exit path) must never leave anything at the
+// file's own canonical name. reuseCacheTree's never-overwrite rule (see its
+// doc comment) would otherwise make a truncated file there permanent for
+// every future session on the host.
+//
+// RED proof: in copyFileAtomic, replace the temp-file-then-rename sequence
+// with a direct `os.OpenFile(target, os.O_WRONLY|os.O_CREATE, mode.Perm())`
+// write and this test fails — a failed/interrupted copy can leave a partial
+// file sitting at the canonical name. Verified: FAILED ("canonical target
+// exists despite a failed copy"), then PASSED again after restoring — see
+// the completion report.
+func TestReuseCacheTree_NeverLeavesATruncatedFileAtTheCanonicalName(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), strings.Repeat("x", 1024))
+	targetDir := filepath.Join(dst, "remote_plugin_catalog")
+	if err := os.MkdirAll(targetDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(targetDir, 0o500); err != nil { //nolint:gosec // G302: the test deliberately removes write permission to force a failed copy.
+		t.Fatal(err)
+	}
+	//nolint:gosec // G302: restoring 0700 so t.TempDir()'s own cleanup can remove it.
+	t.Cleanup(func() { _ = os.Chmod(targetDir, 0o700) })
+
+	if err := reuseCacheTree(src, dst); err != nil {
+		t.Fatalf("reuseCacheTree: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(targetDir, "abc123.json")); !os.IsNotExist(err) {
+		t.Fatalf("canonical target exists despite a failed copy: err=%v", err)
+	}
+	entries, err := os.ReadDir(targetDir)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !os.SameFile(srcInfo, dstInfo) {
-		t.Fatal("reused entry is a copy, not a hard link — every session would duplicate the catalog on disk")
+	if len(entries) != 0 {
+		t.Fatalf("an orphaned temp file was left behind: %v", entries)
+	}
+}
+
+// failingReaderAfter returns some real bytes and then a fixed error — used
+// to force an interrupted-mid-copy failure deterministically, something a
+// real *os.File source cannot reproduce on demand in a test.
+type failingReaderAfter struct {
+	data []byte
+	err  error
+}
+
+func (f *failingReaderAfter) Read(p []byte) (int, error) {
+	if len(f.data) > 0 {
+		n := copy(p, f.data)
+		f.data = f.data[n:]
+		return n, nil
+	}
+	return 0, f.err
+}
+
+// TestCopyReaderAtomic_InterruptedReadNeverLeavesFileAtCanonicalName is the
+// reviewer's F4 probe in its most direct form: a read that fails partway
+// through — exactly what a process dying mid-copy looks like from
+// io.Copy's point of view — must never leave anything at the file's own
+// canonical name, and must not leave an orphaned temp file behind either.
+//
+// RED proof: in copyFileAtomic/copyReaderAtomic, replace the temp-file-then-
+// rename sequence with a direct `os.OpenFile(target, os.O_WRONLY|os.O_CREATE, mode.Perm())`
+// write straight to target and this test fails — the canonical name ends up
+// holding the partial bytes the reader delivered before failing. Verified:
+// FAILED ("canonical target exists despite an interrupted copy"), then
+// PASSED again after restoring — see the completion report.
+func TestCopyReaderAtomic_InterruptedReadNeverLeavesFileAtCanonicalName(t *testing.T) {
+	dst := t.TempDir()
+	target := filepath.Join(dst, "abc123.json")
+	r := &failingReaderAfter{data: []byte("partial content before the read fails"), err: errors.New("simulated interrupted read")}
+
+	if err := copyReaderAtomic(r, target, 0o600); err == nil {
+		t.Fatal("expected an error from the failing reader")
+	}
+	if _, err := os.Lstat(target); !os.IsNotExist(err) {
+		t.Fatalf("canonical target exists despite an interrupted copy: err=%v", err)
+	}
+	entries, err := os.ReadDir(dst)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("an orphaned temp file was left behind: %v", entries)
+	}
+}
+
+// TestReuseCacheTree_SkipsNonAllowlistedTopLevelEntries is the reviewer's F5
+// probe: only the four known cache/ top-level names are ever seeded or
+// harvested (codexPluginCacheAllowedTopLevel) — anything else is inert by
+// default, never shared, even though it lives in the same cache/
+// subdirectory this package otherwise trusts.
+//
+// RED proof: in reuseCacheTree, delete the
+// `if !codexPluginCacheAllowedTopLevel[topLevel] { ... }` branch (walking
+// every top-level entry unconditionally) and this test fails — the
+// non-allowlisted entry is reproduced at the destination. Verified: FAILED
+// ("non-allowlisted top-level entry was reproduced"), then PASSED again
+// after restoring — see the completion report.
+func TestReuseCacheTree_SkipsNonAllowlistedTopLevelEntries(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", "abc123.json"), "allowed")
+	writeCacheFixture(t, src, filepath.Join("some_future_vendor_cache", "new.json"), "not yet allowlisted")
+
+	if err := reuseCacheTree(src, dst); err != nil {
+		t.Fatalf("reuseCacheTree: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(dst, "remote_plugin_catalog", "abc123.json")); err != nil {
+		t.Fatalf("allowlisted entry was not reused: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(dst, "some_future_vendor_cache")); !os.IsNotExist(err) {
+		t.Fatalf("non-allowlisted top-level entry was reproduced: err=%v", err)
+	}
+}
+
+// TestReuseCacheTree_BoundsTotalBytesPerCall pins the reviewer's F7 fix: a
+// per-file cap alone does not bound a directory holding many files, which
+// matters specifically because os.TempDir() is commonly tmpfs (RAM-backed)
+// on a typical Linux daemon host. Four files sit right at the per-file cap;
+// the fourth pushes cumulative bytes past codexPluginCacheMaxTotalBytes and
+// must be skipped.
+func TestReuseCacheTree_BoundsTotalBytesPerCall(t *testing.T) {
+	src := t.TempDir()
+	dst := t.TempDir()
+	body := strings.Repeat("x", codexPluginCacheMaxFileBytes)
+	for _, name := range []string{"a.json", "b.json", "c.json", "d.json"} {
+		writeCacheFixture(t, src, filepath.Join("remote_plugin_catalog", name), body)
+	}
+
+	if err := reuseCacheTree(src, dst); err != nil {
+		t.Fatalf("reuseCacheTree: %v", err)
+	}
+	entries, err := os.ReadDir(filepath.Join(dst, "remote_plugin_catalog"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 3 {
+		t.Fatalf("copied %d files, want exactly 3 before the total-bytes cap stopped the walk (of 4, %d bytes each)", len(entries), codexPluginCacheMaxFileBytes)
 	}
 }
 

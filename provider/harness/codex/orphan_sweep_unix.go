@@ -3,6 +3,8 @@
 package codex
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -45,4 +47,24 @@ func processLooksLikeCodexOS(pid int, binaryHint string) bool {
 		hint = "codex"
 	}
 	return comm != "" && strings.Contains(comm, hint)
+}
+
+// verifyManifestDirectoryOwnershipOS requires info's directory to be owned by
+// this process's own unix uid and to grant no group/other access at all
+// (matching codexHomeMode's own 0700) — see verifyManifestDirectoryOwnership's
+// doc comment for the threat this closes: an unprivileged local user planting
+// a directory (and a manifest naming an arbitrary PID) under a shared,
+// world-writable os.TempDir().
+func verifyManifestDirectoryOwnershipOS(info os.FileInfo) error {
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return errors.New("cannot read unix ownership metadata")
+	}
+	if stat.Uid != uint32(os.Getuid()) { //nolint:gosec // G115: os.Getuid() is a small non-negative uid on any real unix system.
+		return fmt.Errorf("owned by uid %d, not this process's uid %d", stat.Uid, os.Getuid())
+	}
+	if info.Mode().Perm()&0o077 != 0 {
+		return fmt.Errorf("mode %04o grants group or other access", info.Mode().Perm())
+	}
+	return nil
 }
