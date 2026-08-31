@@ -2549,7 +2549,21 @@ func TestStartupAdoptionReleasesEachScopeOnlyAfterExactHeartbeat(t *testing.T) {
 	}
 }
 
-func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T) {
+// TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry covers a
+// composing carrier's durable-adoption refusal for the ONLY lineage a startup
+// pass finds.
+//
+// Pre-fix, ANY OnAdoption refusal aborted the whole composition
+// (adoptSessionShims returned the error and adoptionComplete never latched) —
+// indistinguishable, from a single-lineage host, from the multi-lineage
+// collateral-damage bug this file's other partial-composition test pins.
+// Post-fix, a refused lineage is quarantined (visible, capacity-honest, no
+// controller authority granted, its shim not killed) and the composition
+// still completes — a host that could not durably back its only session is
+// not the same as a host that does not know what it has. The shim's record
+// survives the quarantine untouched, so a LATER daemon can still adopt it —
+// which is exactly what this test's second half already proved.
+func TestStartupAdoptionQuarantinesARefusedLineageThenRehydratesOnRetry(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	// Give two replacement attempts ample room before the shim-owned orphan
 	// deadline. The first is deliberately refused by the composing callback.
@@ -2574,15 +2588,34 @@ func TestStartupAdoptionRefusesReadyUntilDurableCarrierRehydration(t *testing.T)
 	})
 	refusing.config = &Config{Capacity: CapacityConfig{MaxConcurrentSessions: 4}}
 	refusing.setState(StateRunning)
-	err := refusing.adoptSessionShims(context.Background())
-	if err == nil || !strings.Contains(err.Error(), "durable carrier unavailable") {
-		t.Fatalf("adoptSessionShims = %v, want durable carrier refusal", err)
+	if err := refusing.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("adoptSessionShims = %v, want the refused lineage quarantined rather than a host-wide failure", err)
 	}
-	if refusing.SessionShimAdoptionComplete() {
-		t.Fatal("adoption reads complete after durable carrier refusal")
+	if !refusing.SessionShimAdoptionComplete() {
+		t.Fatal("adoption did not complete after quarantining the one lineage that refused")
 	}
-	if got := refusing.RegistrationStatus(); got != RegistrationDraining {
-		t.Fatalf("RegistrationStatus after callback refusal = %q, want draining", got)
+	if _, err := refusing.adoptedShimEntry(id.OrgID, id.SessionID); err == nil {
+		t.Fatal("the refused lineage was granted controller authority anyway")
+	}
+	found := false
+	for _, q := range refusing.QuarantinedSessions() {
+		if q.Identity() != id {
+			continue
+		}
+		found = true
+		if q.Reason != sessionshim.QuarantineAdoptionFailed || !strings.Contains(q.Detail, "durable carrier unavailable") {
+			t.Fatalf("refused lineage quarantine = %+v, want reason %q with the callback's detail",
+				q, sessionshim.QuarantineAdoptionFailed)
+		}
+	}
+	if !found {
+		t.Fatal("the refused lineage was not surfaced as quarantined")
+	}
+	// Capacity honesty (§D7): the quarantined lineage's harness is still
+	// running and still occupies a slot, even though this daemon holds no
+	// authority over it.
+	if got := refusing.SessionShimOccupancy(); got != 1 {
+		t.Fatalf("SessionShimOccupancy after quarantining the only lineage = %d, want 1", got)
 	}
 
 	var emitted shimwire.SnapshotResult
