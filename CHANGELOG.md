@@ -6,6 +6,35 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.9 — 2026-08-30
+
+### Fixes
+
+- **Fresh named codex interactive sessions no longer fail with "No saved
+  session found".** The interactive launch treated any session name as a
+  signal to resume; since the platform names every session, every fresh codex
+  spawn tried to resume a thread that had never existed. Fresh sessions now
+  launch a new app-server thread and name it before the first turn; resuming
+  is gated behind an explicit attach signal that requires a thread id and
+  proves the target exists before any side effect, failing closed with a
+  typed error otherwise. Teardown of named sessions no longer reports a
+  spurious cleanup failure. (#487)
+
+- **Receipt-bearing spawns with a declared repository no longer refuse with a
+  tool/lifecycle adaptation mismatch.** The daemon's execution preflight never
+  saw the repository-driven sandbox settings the spawn path applied, so the
+  persisted adaptation receipt disagreed with the spawn-time application. Both
+  lanes now derive the repository sandbox through one shared reconciliation,
+  and adaptation mismatches name the differing fields (digests only). (#485)
+
+- **Session-shim child output is captured instead of discarded.** Shim-hosted
+  session processes wrote stdout/stderr to /dev/null, hiding every spawn-time
+  error. Output now lands in a digest-named, size-capped, credential-redacted
+  per-session log under the daemon state home, cleaned up with the session's
+  other artifacts and maintained across daemon restarts. (#485)
+
+---
+
 ## v0.72.8 — 2026-08-30
 
 ### Features
