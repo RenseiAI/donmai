@@ -186,7 +186,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithDeclaredRepository(t *tes
 		source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 			Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 			effectiveCell: receiptCell(),
-		})
+		}, nil)
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -345,7 +345,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository(t *
 	source, _, err := buildPreparedSourceSpec(spawnQW, harnessSelection{
 		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, spawnQW.AdmissionReceipt),
 		effectiveCell: receiptCell(),
-	})
+	}, nil)
 	if err != nil {
 		t.Fatal(err)
 	}

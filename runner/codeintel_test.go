@@ -601,7 +601,7 @@ func TestBuildPreparedSourceSpec_OmitsImplicitGatewayWithoutMCPDelivery(t *testi
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
 
-	spec, runtimeNames, err := buildPreparedSourceSpec(qw, harnessSelection{Provider: provider})
+	spec, runtimeNames, err := buildPreparedSourceSpec(qw, harnessSelection{Provider: provider}, nil)
 	if err != nil {
 		t.Fatalf("buildPreparedSourceSpec: %v", err)
 	}

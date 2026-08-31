@@ -115,7 +115,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
-		preparedSource, _, err = buildPreparedSourceSpec(qw, selection)
+		preparedSource, _, err = buildPreparedSourceSpec(qw, selection, r.additionalExtensionDecorator)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
@@ -140,6 +140,27 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 					"harness", selection.Harness.ID,
 					"provider", provider.Name(),
 					"driftFields", driftErr.Fields,
+				)
+			}
+			// The AuthorityDigest projection agreeing does not mean the
+			// recomputed ToolLifecycleReceipt does — see
+			// agent.ToolLifecycleDriftError's doc comment (a Spec field the
+			// tool/lifecycle compiler consumes but the projection does not
+			// cover, e.g. Spec.AdditionalExtensions, changed after
+			// preflight). Same doctrine as the AuthorityDriftError log
+			// above: name exactly which receipt field(s) disagreed so this
+			// self-check's own failure is diagnosable from the log alone,
+			// not just the eventual spawn-time refusal
+			// (runner.ReconcileAdditionalExtensions's doc comment records
+			// the production incident this self-check exists to catch
+			// early).
+			var toolDriftErr *agent.ToolLifecycleDriftError
+			if errors.As(err, &toolDriftErr) {
+				r.logger.Error("prepared harness tool-lifecycle drift",
+					"sessionId", qw.SessionID,
+					"harness", selection.Harness.ID,
+					"provider", provider.Name(),
+					"driftFields", toolDriftErr.Fields,
 				)
 			}
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
