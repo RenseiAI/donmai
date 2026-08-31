@@ -294,13 +294,10 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (result prob
 	if err != nil {
 		return probeOutput{}, fmt.Errorf("create temporary archive tree: %w", err)
 	}
+	var moduleCache string
+	var cleanupGoEnv []string
 	defer func() {
-		if err := os.RemoveAll(temporary); err != nil {
-			cleanupErr := fmt.Errorf("remove temporary archive tree: %w", err)
-			if resultErr == nil {
-				resultErr = cleanupErr
-			}
-		}
+		resultErr = joinReplayAndCleanupError(resultErr, cleanupPinnedProbeTemporary(temporary, moduleCache, cleanupGoEnv, runCommand, os.RemoveAll))
 	}()
 
 	archiveCommand, err := commandFor(root, nil, commandGit, "archive", "--format=tar", pinnedCommit)
@@ -351,12 +348,13 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (result prob
 
 	goEnv := []string{"GOWORK=off", "GOTOOLCHAIN=local"}
 	if options.emptyCaches {
-		moduleCache := filepath.Join(temporary, "gomodcache")
+		moduleCache = filepath.Join(temporary, "gomodcache")
 		buildCache := filepath.Join(temporary, "gocache")
 		if err := os.MkdirAll(moduleCache, 0o700); err != nil {
 			return probeOutput{}, fmt.Errorf("create empty module cache: %w", err)
 		}
 		goEnv = append(goEnv, "GOMODCACHE="+moduleCache, "GOCACHE="+buildCache)
+		cleanupGoEnv = append([]string(nil), goEnv...)
 	}
 	// v0.72.2 has no vendor directory. The exact archived go.mod/go.sum (both
 	// blob-pinned above) therefore resolve dependencies through normal Go module
@@ -381,6 +379,66 @@ func runPinnedProbe(root string, raw []byte, options replayOptions) (result prob
 	}
 	decoded.GoVersion = strings.TrimSpace(string(goVersion))
 	return decoded, nil
+}
+
+type commandRunner func(dir string, extraEnv []string, kind commandKind, args ...string) ([]byte, error)
+
+type removeTree func(path string) error
+
+// cleanupPinnedProbeTemporary cleans only a module cache we created as the
+// exact gomodcache child of temporary. Go deliberately makes downloaded module
+// content read-only; asking the same Go toolchain to clean that cache avoids a
+// host-specific chmod walk while leaving symlinks and paths outside temporary
+// outside this cleanup authority.
+func cleanupPinnedProbeTemporary(temporary, moduleCache string, goEnv []string, run commandRunner, remove removeTree) error {
+	if moduleCache != "" {
+		if err := validateOwnedModuleCache(temporary, moduleCache); err != nil {
+			return err
+		}
+		if run == nil {
+			return errors.New("cleanup pinned probe temporary: Go command runner is required for module cache cleanup")
+		}
+		if _, err := run(temporary, goEnv, commandGo, "clean", "-modcache"); err != nil {
+			return fmt.Errorf("clean owned temporary Go module cache: %w", err)
+		}
+	}
+	if err := remove(temporary); err != nil {
+		return fmt.Errorf("remove temporary archive tree: %w", err)
+	}
+	return nil
+}
+
+func validateOwnedModuleCache(temporary, moduleCache string) error {
+	temporaryRoot, err := filepath.Abs(temporary)
+	if err != nil {
+		return fmt.Errorf("resolve temporary archive tree: %w", err)
+	}
+	moduleRoot, err := filepath.Abs(moduleCache)
+	if err != nil {
+		return fmt.Errorf("resolve temporary module cache: %w", err)
+	}
+	relative, err := filepath.Rel(temporaryRoot, moduleRoot)
+	if err != nil || relative != "gomodcache" {
+		return fmt.Errorf("temporary module cache must be the owned gomodcache child, got %q", moduleCache)
+	}
+	info, err := os.Lstat(moduleRoot)
+	if err != nil {
+		return fmt.Errorf("lstat temporary module cache: %w", err)
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("temporary module cache is not an owned directory: %q", moduleCache)
+	}
+	return nil
+}
+
+func joinReplayAndCleanupError(primary, cleanup error) error {
+	if cleanup == nil {
+		return primary
+	}
+	if primary == nil {
+		return cleanup
+	}
+	return errors.Join(primary, cleanup)
 }
 
 func git(root string, args ...string) (string, error) {
@@ -448,7 +506,7 @@ func validateCommand(kind commandKind, dir string, args []string) error {
 			return nil
 		}
 	case commandGo:
-		if matches(args, "mod", "download") || matches(args, "mod", "verify") || matches(args, "env", "GOVERSION") {
+		if matches(args, "mod", "download") || matches(args, "mod", "verify") || matches(args, "env", "GOVERSION") || matches(args, "clean", "-modcache") {
 			return nil
 		}
 		if len(args) == 4 && args[0] == "run" && args[1] == "./cmd/pinned-operational-payload-probe" && args[2] == filepath.Join(dir, "pinned-poll-item.json") && args[3] == filepath.Join(dir, "pinned-forged-poll-item.json") {

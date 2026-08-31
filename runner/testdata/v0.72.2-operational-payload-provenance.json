@@ -2,7 +2,7 @@
   "schema": "donmai.operational-payload-provenance/v2",
   "generatorVersion": "2",
   "generatorSource": "cmd/operational-payload-provenance/main.go",
-  "generatorSourceSha256": "79abf7aadcefeb228084893e5ca72b443990af61af95d000e23ef5f13acb7574",
+  "generatorSourceSha256": "958547e99bdae93d61f34242b7edba87993e82d4f98aa1c0e08c58f67816bc36",
   "probeSourceSha256": "b35557887a36575901f8a287c245fc91e1f04bd4de268d0960c8ffaf30c1a232",
   "tag": "v0.72.2",
   "commit": "a177e8929f1b0b0cd27fc6c8480f6cc210fde1ff",
@@ -61,5 +61,5 @@
   },
   "operationalPayloadSha256": "b3b20e7c63d864d3084d4e7511320848777534c06b82a80914525be3ce1bcbf0",
   "forgedOperationalPayloadError": "daemon poll: operationalPayload does not match raw poll item",
-  "artifactDigest": "642ac97d93ebd58f0b3b54fb1dc2b34626403c4f635a6abcde84c809682e6aa3"
+  "artifactDigest": "982e6441596025551115e36cbd6e0e29be32a6fdd552d5bde166394d6d626154"
 }

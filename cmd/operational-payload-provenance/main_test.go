@@ -2,10 +2,79 @@ package main
 
 import (
 	"encoding/json"
+	"errors"
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 )
+
+func TestCleanupPinnedProbeTemporary_RemovesReadOnlyModuleCacheWithoutFollowingSymlink(t *testing.T) {
+	temporary, err := os.MkdirTemp("", "operational-payload-cleanup-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	moduleCache := filepath.Join(temporary, "gomodcache")
+	nested := filepath.Join(moduleCache, "gopkg.in", "yaml.v3@v3.0.1")
+	if err := os.MkdirAll(nested, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	moduleFile := filepath.Join(nested, "module.go")
+	if err := os.WriteFile(moduleFile, []byte("read-only module content"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Chmod(moduleFile, 0o444); err != nil { // #nosec G302 -- cleanup control must reproduce Go's read-only module files.
+		t.Fatal(err)
+	}
+	escapeTarget := t.TempDir()
+	escapeMarker := filepath.Join(escapeTarget, "must-survive")
+	if err := os.WriteFile(escapeMarker, []byte("outside owned cache"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(escapeTarget, filepath.Join(moduleCache, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{nested, filepath.Dir(nested), moduleCache} {
+		if err := os.Chmod(path, 0o555); err != nil { // #nosec G302 -- cleanup control must reproduce Go's read-only module directories.
+			t.Fatal(err)
+		}
+	}
+
+	if err := cleanupPinnedProbeTemporary(temporary, moduleCache, []string{"GOWORK=off", "GOTOOLCHAIN=local", "GOMODCACHE=" + moduleCache}, runCommand, os.RemoveAll); err != nil {
+		t.Fatalf("cleanupPinnedProbeTemporary: %v", err)
+	}
+	if _, err := os.Stat(temporary); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("temporary tree remains after cleanup: %v", err)
+	}
+	if contents, err := os.ReadFile(escapeMarker); err != nil || string(contents) != "outside owned cache" {
+		t.Fatalf("symlink escape target changed: contents=%q err=%v", contents, err)
+	}
+}
+
+func TestCleanupPinnedProbeTemporary_ReportsCleanupWithoutMaskingPrimary(t *testing.T) {
+	temporary := t.TempDir()
+	cleanupFailure := errors.New("simulated remove failure")
+	cleanupErr := cleanupPinnedProbeTemporary(temporary, "", nil, nil, func(string) error { return cleanupFailure })
+	if !errors.Is(cleanupErr, cleanupFailure) {
+		t.Fatalf("cleanup error = %v, want observable %v", cleanupErr, cleanupFailure)
+	}
+	primary := errors.New("simulated replay failure")
+	combined := joinReplayAndCleanupError(primary, cleanupErr)
+	if !errors.Is(combined, primary) || !errors.Is(combined, cleanupFailure) {
+		t.Fatalf("combined error = %v, want both primary and cleanup errors", combined)
+	}
+}
+
+func TestCleanupPinnedProbeTemporary_RefusesModuleCacheOutsideOwnedChild(t *testing.T) {
+	temporary := t.TempDir()
+	outside := t.TempDir()
+	if err := cleanupPinnedProbeTemporary(temporary, outside, nil, runCommand, os.RemoveAll); err == nil {
+		t.Fatal("outside module cache unexpectedly accepted")
+	}
+	if _, err := os.Stat(outside); err != nil {
+		t.Fatalf("outside module cache was touched: %v", err)
+	}
+}
 
 func TestPathAndCommandRefusals(t *testing.T) {
 	root, err := repositoryRoot()
