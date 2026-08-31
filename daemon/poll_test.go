@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runner"
 )
@@ -1325,6 +1326,19 @@ func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
 		{
 			name: "unrelated typed unsupported_session_mode is omitted",
 			err:  &runner.HarnessAdmissionError{Code: executioncell.DenialUnsupportedSessionMode, Detail: "same fallback prose is irrelevant"},
+		},
+		// #485 makes these two typed mismatches more observable at the
+		// preflight/spawn authority boundary. They remain diagnostic errors, not
+		// receipt admission denials, so the closed NACK reason must stay absent:
+		// advertising fallback_not_allowed for either would give an orchestrator
+		// authority to branch on a cause the admission receipt never supplied.
+		{
+			name: "repository sandbox authority drift from #485 is omitted",
+			err:  &agent.AuthorityDriftError{Fields: []string{"sandboxLevel"}},
+		},
+		{
+			name: "tool lifecycle drift from #485 is omitted",
+			err:  &agent.ToolLifecycleDriftError{Fields: []string{"decision"}},
 		},
 	}
 
