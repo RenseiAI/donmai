@@ -213,11 +213,21 @@ func spawnNamedInteractivePTY(
 	if err := finishNamingLiveInteractiveThread(ctx, spec, server, nameTimeout); err != nil {
 		// Stop below can take up to the shim finalize grace window (see
 		// ptycli.Handle.awaitShimTerminal); log the reason now so a slow
-		// teardown is not silent about why it started.
+		// teardown is not silent about why it started. The bootstrap
+		// app-server's own bounded, redacted stderr excerpt rides along here
+		// (and into the returned error below) because this is exactly the
+		// failure shape a dead-mid-startup app-server produces: naming times
+		// out or errors while the process itself already carries the real
+		// cause in what it printed before dying.
+		excerpt := server.stderr.Excerpt()
 		slog.Warn("codex: fresh interactive session naming failed; stopping the PTY",
-			"session", spec.SessionName, "err", err)
-		_ = handle.Stop(ctx)
-		return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err)
+			"session", spec.SessionName, "err", err, "stderrExcerpt", excerpt)
+		stopErr := handle.Stop(ctx)
+		wrapped := fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, err)
+		if excerpt != "" {
+			wrapped = fmt.Errorf("%w (app-server stderr: %s)", wrapped, excerpt)
+		}
+		return nil, errors.Join(wrapped, stopErr)
 	}
 	return handle, nil
 }

@@ -7,6 +7,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"os"
 	"os/exec"
@@ -49,6 +50,13 @@ type Provider struct {
 	startMu      sync.Mutex
 	startErr     error
 	started      bool
+
+	// appServerStderr is the bounded, redaction-aware capture of this
+	// shared app-server child's stderr (see appserver_stderr.go). Nil until
+	// startLocked's real-subprocess branch runs; Excerpt() on a nil buffer
+	// is safe and returns "", which is what every skipProcess-based test
+	// (no real subprocess spawned) sees.
+	appServerStderr *boundedBuffer
 
 	// pinnedSessionEnv is the per-session environment layer that was frozen
 	// into the app-server child at start, and sessionEnvPinned records that a
@@ -277,10 +285,13 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		p.stdin = stdin
 		p.stdout = stdout
 		p.stderr = stderr
-		// Drain stderr to a sink so the child does not deadlock when the
-		// buffer fills. Logs go to the parent's stderr.
+		// Drain stderr into a bounded, redacted capture so the child never
+		// deadlocks on a full pipe and a crash leaves a forensic excerpt
+		// instead of nothing — see appserver_stderr.go and failStartLocked /
+		// watchExit / onClientClose / checkAlive below, which are what
+		// actually surface it.
 		p.processDone = make(chan error, 1)
-		go drainStderr(stderr)
+		p.appServerStderr = captureAppServerStderr(stderr)
 	}
 
 	p.client = NewClient(p.stdin, p.stdout)
@@ -326,6 +337,9 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 }
 
 func (p *Provider) failStartLocked(err error) error {
+	if excerpt := p.appServerStderr.Excerpt(); excerpt != "" {
+		err = fmt.Errorf("%w (app-server stderr: %s)", err, excerpt)
+	}
 	p.startErr = errors.Join(err, p.terminateLocked(context.Background()))
 	return p.startErr
 }
@@ -766,6 +780,16 @@ func (p *Provider) onClientClose(cause error) {
 	if cause == nil {
 		cause = errors.New("codex app-server stream closed")
 	}
+	// Attach the excerpt here, at the one place every live Handle's failure
+	// actually flows through, rather than at whichever of watchExit's
+	// p.client.Stop(cause) or the JSON-RPC read loop's own EOF-triggered
+	// Stop happens to win the race to set the close cause (both call Stop;
+	// only the first writes p.client.closeErr). Enriching centrally means
+	// the excerpt reaches h.failNow's ErrorEvent regardless of which cause
+	// won.
+	if excerpt := p.appServerStderr.Excerpt(); excerpt != "" {
+		cause = fmt.Errorf("%w (app-server stderr: %s)", cause, excerpt)
+	}
 	for _, h := range live {
 		h.failNow(cause)
 	}
@@ -784,6 +808,7 @@ func (p *Provider) watchExit() {
 	if p.processDone != nil {
 		p.processDone <- err
 	}
+	p.logAppServerExit(err)
 	cause := err
 	if cause == nil {
 		cause = errors.New("codex app-server exited")
@@ -791,6 +816,27 @@ func (p *Provider) watchExit() {
 	if p.client != nil {
 		p.client.Stop(cause)
 	}
+}
+
+// logAppServerExit emits exactly one structured line whenever the shared
+// headless app-server process exits, regardless of whether the exit looks
+// clean. A zero exit code is not proof nothing went wrong: a downstream
+// consumer that only observes a dropped connection can exit 0 itself while
+// the app-server's own exit — logged here with whatever redacted stderr
+// survived — is sometimes the only place the real cause is ever recorded.
+// See appserver_stderr.go.
+func (p *Provider) logAppServerExit(waitErr error) {
+	level := slog.LevelWarn
+	select {
+	case <-p.shutdown:
+		level = slog.LevelInfo // Shutdown initiated this exit; expected.
+	default:
+	}
+	args := []any{"error", waitErr}
+	if excerpt := p.appServerStderr.Excerpt(); excerpt != "" {
+		args = append(args, "stderrExcerpt", excerpt)
+	}
+	slog.Log(context.Background(), level, "codex: app-server process exited", args...)
 }
 
 // terminate is the internal shutdown path. Idempotent.
@@ -854,6 +900,9 @@ func (p *Provider) checkAlive() error {
 	}
 	if p.client != nil {
 		if err := p.client.CloseErr(); err != nil {
+			if excerpt := p.appServerStderr.Excerpt(); excerpt != "" {
+				err = fmt.Errorf("%w (app-server stderr: %s)", err, excerpt)
+			}
 			return fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 		}
 	}
@@ -954,17 +1003,4 @@ func divergentSessionEnvKeys(pinned, want map[string]string) []string {
 	}
 	sort.Strings(keys)
 	return keys
-}
-
-func drainStderr(r io.ReadCloser) {
-	defer func() { _ = r.Close() }()
-	buf := make([]byte, 4096)
-	for {
-		_, err := r.Read(buf)
-		if err != nil {
-			return
-		}
-		// Discard. Future iteration could plumb this to slog if
-		// useful for codex debugging.
-	}
 }

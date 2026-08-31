@@ -26,6 +26,16 @@ func TestMain(m *testing.M) {
 		runCodexFakeAppServer()
 		os.Exit(0)
 	}
+	if os.Getenv(codexFakeNamedAppServerEnv) == "1" {
+		runCodexFakeNamedAppServer()
+		os.Exit(0)
+	}
+	if os.Getenv(codexFakePTYClientEnv) == "1" {
+		// The documented bug signature this package's stderr-capture change
+		// exists to stop hiding: a --remote PTY client that only observes a
+		// dropped connection exits 0 and reports nothing wrong.
+		os.Exit(0)
+	}
 	os.Exit(m.Run())
 }
 
