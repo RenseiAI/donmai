@@ -6,6 +6,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.11 — 2026-08-31
+
+### Fixes
+
+- **Interactive sessions with kit or extension tools configured no longer
+  fail at spawn with a tool-lifecycle receipt mismatch.** The daemon's
+  preflight compiled a `ToolLifecycleReceipt` without ever applying the
+  embedder's additional-extension decorator (the seam kit-provided tools and
+  a2a tool registration append onto a spec's additional extensions), while
+  the real spawn's own receipt recompute did apply it — so any embedder that
+  registered the decorator saw the two entry points disagree and the session
+  refused to start, ~2s in, on a receipt the preflight had already admitted.
+  Both compile sites now derive additional extensions through one shared
+  reconciliation constructor, matching the existing pattern used for the
+  resolved model profile and the repository-authority sandbox override. The
+  runner's own prepared-source self-check also logs a structured line naming
+  the drifting field(s) on this failure class, so it stays diagnosable from
+  the runner log alone. (#493)
+
 ## v0.72.10 — 2026-08-30
 
 ### Fixes
