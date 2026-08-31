@@ -68,6 +68,38 @@ func rotateDaemonLogs(errOut io.Writer) {
 	}
 }
 
+// daemonRegistryBuilder is the production registry-construction seam
+// daemonProviderView calls — the same "package-level var a test replaces"
+// idiom bindWorkerGatewayForAgentRun (agent_run.go) already uses in this
+// package. Tests substitute a small, always-successful registry (a fake
+// provider with a complete manifest) so
+// TestDaemonProviderViewAppliesConfiguredDecorator can observe the compiled
+// receipt deterministically, without depending on any external harness
+// binary (claude/codex/pi/…) being installed in the test/CI environment —
+// BuildDecoratedAgentRunRegistry's real ctor list probes every one of them.
+var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
+
+// daemonProviderView constructs the daemon's own in-process AgentRuntime
+// registry — the same registry shape `donmai agent run` rebuilds per-session
+// — and wraps it as a runner.ProviderView, applying
+// cfg.AgentSpecExtensionDecorator identically to how runAgentRun decorates
+// its own per-session registry (decorateRegistryProviders). Extracted as its
+// own function (rather than inlined in newDaemonRunCmd's RunE) so a test can
+// call it directly and assert BEHAVIORALLY that a configured decorator
+// changes what PreflightExecution compiles — see
+// daemon_provider_view_test.go, which pins the wiring this function performs
+// (a regression here previously stayed green: reverting the decorator
+// plumbing left every existing test passing because none of them exercised
+// this exact call path).
+//
+// Startup use: the daemon builds this registry once so the local
+// /api/daemon/providers* HTTP surface can introspect it. Probes that fail
+// (e.g. ollama not running) emit WARN logs but do not block daemon start.
+func daemonProviderView(cfg Config, logger *slog.Logger) *runner.ProviderView {
+	providerReg := daemonRegistryBuilder(logger, cfg.AgentSpecExtensionDecorator)
+	return runner.NewProviderViewWithDecorator(providerReg, cfg.AgentSpecExtensionDecorator)
+}
+
 // newDaemonRunCmd constructs the `host run` subcommand. This is the
 // long-running entry point registered by the launchd plist / systemd unit.
 //
@@ -124,14 +156,6 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			// files don't exist there and this is a no-op.)
 			rotateDaemonLogs(cmd.ErrOrStderr())
 
-			// Build the in-process AgentRuntime registry once at daemon
-			// startup so the local /api/daemon/providers* HTTP surface
-			// can introspect it. The same registry shape is rebuilt
-			// per-session by `donmai agent run`; here we surface it for
-			// operator queries. Probes that fail (e.g. ollama not
-			// running) emit WARN logs but do not block daemon start.
-			// Wave 9 / A1.
-			providerReg := BuildDecoratedAgentRunRegistry(slog.Default(), cfg.AgentSpecExtensionDecorator)
 			// Substitute the well-known DefaultHTTPPort here when the
 			// operator did not pass `--port`. Leaving zero through to
 			// daemon.New would bind an ephemeral port — correct for
@@ -188,7 +212,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				HTTPHost:         host,
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
-				ProviderRegistry: runner.NewProviderView(providerReg, cfg.AgentSpecExtensionDecorator),
+				ProviderRegistry: daemonProviderView(cfg, slog.Default()),
 				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
 					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
 				SpawnerOptions: spawnerOpts,

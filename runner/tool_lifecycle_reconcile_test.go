@@ -125,7 +125,7 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithAdditionalExtensionDecora
 
 	compileHostPlan := func(t *testing.T, viewDecorate agent.ExtensionDecorator) agent.PreparedHarness {
 		t.Helper()
-		receipt, err := NewProviderView(registry, viewDecorate).PreflightExecution(rawJSONForRunner(t, detail))
+		receipt, err := NewProviderViewWithDecorator(registry, viewDecorate).PreflightExecution(rawJSONForRunner(t, detail))
 		if err != nil {
 			t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 		}

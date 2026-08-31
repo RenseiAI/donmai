@@ -794,7 +794,7 @@ func TestHostProviderViewCompilesAdmissionLifecycleBeforeChild(t *testing.T) {
 		"operationalPayload": qw.OperationalPayload,
 	}
 	raw := rawJSONForRunner(t, detail)
-	receipt, err := NewProviderView(registry, nil).PreflightExecution(raw)
+	receipt, err := NewProviderView(registry).PreflightExecution(raw)
 	if err != nil {
 		t.Fatalf("host compile of an admitted watch grant: %v receipt=%s", err, receipt)
 	}
@@ -845,7 +845,7 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 		"effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding,
 		"operationalPayload": qw.OperationalPayload,
 	}
-	receipt, err := NewProviderView(registry, nil).PreflightExecution(rawJSONForRunner(t, detail))
+	receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
 	if err != nil {
 		t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 	}

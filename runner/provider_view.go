@@ -140,19 +140,33 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	return encode(nil)
 }
 
-// NewProviderView returns a ProviderView backed by reg. Pass the result
-// to daemon.Options.ProviderRegistry to expose the runner's registered
-// AgentRuntime providers via the daemon's HTTP control API.
+// NewProviderView returns a ProviderView backed by reg, with no additional-
+// extension decorator applied — the historical, source-compatible
+// constructor. Pass the result to daemon.Options.ProviderRegistry to expose
+// the runner's registered AgentRuntime providers via the daemon's HTTP
+// control API.
 //
-// decorate is the SAME agent.ExtensionDecorator (afcli.Config.
-// AgentSpecExtensionDecorator) an embedder registers for the `agent run`
-// subcommand's own registry (afcli/agent_run.go's decorateRegistryProviders)
-// — pass it here too so PreflightExecution's persisted plan and the real
-// spawn agree on Spec.AdditionalExtensions (see ReconcileAdditionalExtensions).
-// nil is a legitimate value: an embedder with no registered decorator, or the
-// standalone donmai binary, passes nil and gets the historical undecorated
-// behavior unchanged.
-func NewProviderView(reg *Registry, decorate agent.ExtensionDecorator) *ProviderView {
+// This signature is part of the OSS embed surface and stays exactly as it
+// was: an embedder building a ProviderView with no
+// Config.AgentSpecExtensionDecorator registered keeps compiling unchanged.
+// An embedder that DOES register a decorator must call
+// NewProviderViewWithDecorator instead — see its doc comment for why.
+func NewProviderView(reg *Registry) *ProviderView {
+	return &ProviderView{reg: reg}
+}
+
+// NewProviderViewWithDecorator is NewProviderView plus one more step: decorate
+// is the SAME agent.ExtensionDecorator (afcli.Config.AgentSpecExtensionDecorator)
+// an embedder registers for the `agent run` subcommand's own registry
+// (afcli/agent_run.go's decorateRegistryProviders) — pass it here too so
+// PreflightExecution's persisted plan and the real spawn agree on
+// Spec.AdditionalExtensions (see ReconcileAdditionalExtensions). Any embedder
+// that registers Config.AgentSpecExtensionDecorator for its own daemon-side
+// registry construction must build its ProviderView through this
+// constructor, not NewProviderView — this repo's own afcli/daemon_run.go
+// (daemonProviderView) is the reference wiring. nil is a legitimate value,
+// equivalent to NewProviderView.
+func NewProviderViewWithDecorator(reg *Registry, decorate agent.ExtensionDecorator) *ProviderView {
 	return &ProviderView{reg: reg, decorate: decorate}
 }
 
