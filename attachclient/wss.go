@@ -58,9 +58,17 @@ func (h *host) runWSS(ctx context.Context, tok string, cl hostClaims, exitDeadli
 	return h.runWSSLeg(ctx, conn, cl, exitDeadline)
 }
 
-func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaims, exitDeadline time.Time) (attemptResult, error) {
-	var res attemptResult
+func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaims, exitDeadline time.Time) (res attemptResult, retErr error) {
 	leg := &wssLeg{conn: conn}
+	authorityAt := make(chan time.Time, 1)
+	defer func() {
+		select {
+		case observedAt := <-authorityAt:
+			res.authorityConfirmed = true
+			res.progressedAt = observedAt
+		default:
+		}
+	}()
 
 	legCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
@@ -74,7 +82,8 @@ func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaim
 	if err := leg.write(legCtx, subFrame.Encode()); err != nil {
 		return res, fmt.Errorf("attachclient: writing subscribe: %w", err)
 	}
-	// Negotiated open + subscribe accepted → success (reset backoff).
+	// Negotiated open + subscribe written → transport progress (reset ordinary
+	// backoff). It is NOT authority confirmation until the relay sends a frame.
 	res.progressed = true
 
 	fromSeq, err := h.subscribeFromSeq()
@@ -101,7 +110,7 @@ func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaim
 
 	// Inbound reader: relay control → Session effects.
 	readerErr := make(chan error, 1)
-	go func() { readerErr <- h.wssReadLoop(legCtx, leg) }()
+	go func() { readerErr <- h.wssReadLoop(legCtx, leg, authorityAt) }()
 
 	select {
 	case <-ctx.Done():
@@ -143,7 +152,7 @@ func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaim
 // message) closes the leg with an error control (code framing, § 2.1/§ 3) and
 // returns a transient error → reconnect. Terminal controls surface ErrEpochStale
 // / *RelayStopError.
-func (h *host) wssReadLoop(ctx context.Context, leg *wssLeg) error {
+func (h *host) wssReadLoop(ctx context.Context, leg *wssLeg, authorityAt chan<- time.Time) error {
 	for {
 		typ, data, err := leg.conn.Read(ctx)
 		if err != nil {
@@ -174,6 +183,10 @@ func (h *host) wssReadLoop(ctx context.Context, leg *wssLeg) error {
 			if err := leg.write(ctx, bf.Encode()); err != nil {
 				return err
 			}
+		}
+		select {
+		case authorityAt <- h.now():
+		default:
 		}
 	}
 }

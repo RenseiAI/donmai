@@ -1,6 +1,7 @@
 package attachclient
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -12,6 +13,9 @@ import (
 const (
 	defaultBackoffFloor      = 250 * time.Millisecond
 	defaultBackoffCeiling    = 30 * time.Second
+	defaultEpochStaleRetries = 8
+	defaultEpochStaleWindow  = 2 * time.Minute
+	defaultEpochStableWindow = 30 * time.Second
 	defaultRingMissCeiling   = 60 * time.Second
 	defaultFallbackAfterN    = 3
 	defaultFinalScreenWindow = 60 * time.Second
@@ -30,9 +34,20 @@ type HostConfig struct {
 	// (§ 14): wss→https / ws→http, plus the /host/sse and /host/output suffixes.
 	AttachURL string
 
+	// InitialAuthorityToken is the immutable bearer supplied when this local
+	// PTY process was spawned. It is parsed only to bind the expected session
+	// and process epoch; reconnect transport still uses TokenSource. It is
+	// required when Session.Snapshot reports the valid legacy epoch zero, where
+	// the session surface alone cannot distinguish unstamped compatibility from
+	// the exact spawn authority.
+	InitialAuthorityToken string
+
 	// TokenSource yields the current bearer JWT. It is resolved before each
 	// top-level carrier attempt and may also be called concurrently by degraded-
-	// lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15).
+	// lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15). Every
+	// token epoch is checked against Session.Snapshot's immutable local PTY
+	// epoch and InitialAuthorityToken before use. A later higher token belongs to
+	// a successor process and is never applied to this Session.
 	TokenSource TokenSource
 
 	// Session is the live PTY surface (structurally == agent.InteractiveSession).
@@ -55,6 +70,19 @@ type HostConfig struct {
 	// success). Defaults 250ms / 30s.
 	BackoffMin time.Duration
 	BackoffMax time.Duration
+
+	// EpochStaleMaxRetries and EpochStaleRetryWindow jointly bound recovery
+	// when the relay rejects the current PTY epoch while its previous carrier
+	// may still be half-open. Exhausting either returns ErrEpochStale. Defaults
+	// to 8 retries within 2 minutes.
+	EpochStaleMaxRetries  int
+	EpochStaleRetryWindow time.Duration
+
+	// EpochStaleStableWindow is the minimum duration of a subsequently admitted
+	// carrier attempt before an older stale-retry budget is cleared. Short
+	// interleaved network failures do not reset the budget to its floor. Default
+	// 30 seconds.
+	EpochStaleStableWindow time.Duration
 
 	// RingMissRetryCeiling bounds the reconnect backoff used after a §13
 	// ring-miss reset (the relay — or our own retained ring — lost history,
@@ -98,6 +126,9 @@ type HostConfig struct {
 
 	// now is an injectable clock seam for tests. nil uses time.Now.
 	now func() time.Time
+	// epochStaleSleep observes stale-retry delays in package tests. Production
+	// leaves it nil and uses sleepCtx.
+	epochStaleSleep func(context.Context, time.Duration) error
 }
 
 func (c *HostConfig) withDefaults() error {
@@ -121,6 +152,15 @@ func (c *HostConfig) withDefaults() error {
 		if c.BackoffMax < c.BackoffMin {
 			c.BackoffMax = c.BackoffMin
 		}
+	}
+	if c.EpochStaleMaxRetries <= 0 {
+		c.EpochStaleMaxRetries = defaultEpochStaleRetries
+	}
+	if c.EpochStaleRetryWindow <= 0 {
+		c.EpochStaleRetryWindow = defaultEpochStaleWindow
+	}
+	if c.EpochStaleStableWindow <= 0 {
+		c.EpochStaleStableWindow = defaultEpochStableWindow
 	}
 	if c.RingMissRetryCeiling < c.BackoffMin {
 		c.RingMissRetryCeiling = defaultRingMissCeiling

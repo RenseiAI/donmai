@@ -155,6 +155,47 @@ type recordingInteractiveSession struct {
 	noticeErr error
 }
 
+// zeroEpochInteractiveSession models the shipped legacy PTY surface whose
+// valid epoch zero cannot identify its spawn authority without the immutable
+// ATTACH_TOKEN value. The other attach methods are deliberately never reached:
+// the successor token under test must be rejected during authority validation.
+type zeroEpochInteractiveSession struct {
+	*recordingInteractiveSession
+}
+
+func (s *zeroEpochInteractiveSession) Snapshot() (attachwire.Screen, attachwire.HostSeq, error) {
+	return attachwire.Screen{Epoch: 0}, 0, nil
+}
+
+// attachLossLogWriter records structured logs and lets a test wait until the
+// attach goroutine's terminal disposition has been applied to the Result.
+type attachLossLogWriter struct {
+	mu   sync.Mutex
+	buf  bytes.Buffer
+	seen chan struct{}
+	once sync.Once
+}
+
+func newAttachLossLogWriter() *attachLossLogWriter {
+	return &attachLossLogWriter{seen: make(chan struct{})}
+}
+
+func (w *attachLossLogWriter) Write(p []byte) (int, error) {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	n, err := w.buf.Write(p)
+	if bytes.Contains(p, []byte("[interactive] attach lost")) {
+		w.once.Do(func() { close(w.seen) })
+	}
+	return n, err
+}
+
+func (w *attachLossLogWriter) String() string {
+	w.mu.Lock()
+	defer w.mu.Unlock()
+	return w.buf.String()
+}
+
 // TryWriteNotice makes the recorder an agent.InteractiveNotifier: an accepted
 // notice is recorded as ONE write (so tests can assert single-write
 // atomicity), a refused one records nothing.
@@ -1112,6 +1153,96 @@ func TestInteractive_AttachTokenFileRotatesAcrossReconnect(t *testing.T) {
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("dispatchInteractive did not finish after token-file reconnect")
+	}
+}
+
+func TestInteractive_AttachInitialAuthorityRemainsStaticWhenFileAlreadySuccessor(t *testing.T) {
+	const sessionID = "sess-initial-authority"
+	initialToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "initial-authority-secret",
+		"epoch":     int64(1),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	successorToken := fakeInteractiveJWT(map[string]any{
+		"sessionId": sessionID,
+		"roomId":    "room-1",
+		"role":      "host",
+		"aud":       "relay",
+		"jti":       "successor-authority-secret",
+		"epoch":     int64(2),
+		"exp":       time.Now().Add(time.Hour).Unix(),
+	})
+	tokenPath := filepath.Join(t.TempDir(), "attach-token")
+	if err := os.WriteFile(tokenPath, []byte(successorToken+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(envAttachURL, "ws://127.0.0.1:1/v1/rooms/room-1")
+	t.Setenv(envAttachToken, initialToken)
+	t.Setenv(envAttachTokenFile, tokenPath)
+
+	logs := newAttachLossLogWriter()
+	r := minimalRunner(t)
+	r.logger = slog.New(slog.NewTextHandler(logs, &slog.HandlerOptions{Level: slog.LevelDebug}))
+	session := &zeroEpochInteractiveSession{recordingInteractiveSession: liveRecordingInteractiveSession()}
+	handle := &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: session,
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	t.Cleanup(cancel)
+	type dispatchResult struct {
+		res *Result
+		err error
+	}
+	resultCh := make(chan dispatchResult, 1)
+	go func() {
+		qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: sessionID, Mode: interactiveRunMode}}
+		initialResult := &Result{SessionID: sessionID}
+		initialResult.ProviderName = agent.ProviderShell
+		res, err := r.dispatchInteractive(
+			ctx,
+			handle,
+			t.TempDir(),
+			qw,
+			initialResult,
+			noopSink{},
+			nil,
+			nil,
+			agent.NoticeDeliveryPTYNotice,
+		)
+		resultCh <- dispatchResult{res: res, err: err}
+	}()
+
+	select {
+	case <-logs.seen:
+		close(session.done)
+	case <-ctx.Done():
+		t.Fatalf("attach authority was not resolved: %v\nlogs:\n%s", ctx.Err(), logs.String())
+	}
+
+	got := <-resultCh
+	if got.err != nil {
+		t.Fatalf("dispatchInteractive: %v", got.err)
+	}
+	if got.res.Status != "completed" {
+		t.Fatalf("status=%q error=%q; want completed local session", got.res.Status, got.res.Error)
+	}
+	wantWarning := "interactive attach: epoch-stale — a newer host process owns the room; local session continues"
+	if len(got.res.PostSessionWarnings) != 1 || got.res.PostSessionWarnings[0] != wantWarning {
+		t.Fatalf("attach warnings=%q; want [%q]", got.res.PostSessionWarnings, wantWarning)
+	}
+	logged := logs.String()
+	for name, secret := range map[string]string{
+		"initial ATTACH_TOKEN":        initialToken,
+		"successor ATTACH_TOKEN_FILE": successorToken,
+	} {
+		if strings.Contains(logged, secret) {
+			t.Errorf("logs exposed %s", name)
+		}
 	}
 }
 
