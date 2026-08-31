@@ -10,6 +10,7 @@ import (
 	"runtime"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -60,6 +61,145 @@ func TestAwaitAndNameLiveThreadWithRequest_NamesTheObservedThread(t *testing.T) 
 	}
 	if len(calls) != 2 || calls[0] != "thread/name/set" || calls[1] != "thread/read" {
 		t.Fatalf("request call order = %v, want [thread/name/set thread/read]", calls)
+	}
+}
+
+// codexRolloutFlushRaceMessage is the fake error text this suite injects for
+// codex's transient "rollout file not flushed yet" failure — the same
+// -32603 shape a real app-server returns from thread/read immediately after
+// thread/name/set when the thread-store's rollout-*.jsonl metadata file has
+// not reached disk yet. Both an "is empty"/unreadable phrase and the
+// "rollout" artifact name must be present for isRolloutFlushRaceError to
+// classify it as this specific race (see that function's doc comment).
+const codexRolloutFlushRaceMessage = "failed to read session metadata from " +
+	"/home/ci/.codex/sessions/2026/08/31/rollout-2026-08-31T00-00-00-thread-live.jsonl: " +
+	"rollout at that path is empty"
+
+// TestAwaitAndNameLiveThreadWithRequest_TransientRolloutFlushRaceRetries pins
+// the fix for a live spawn-failure race: a named interactive session's
+// thread/read verification (right after thread/name/set) can land before
+// codex's app-server has flushed the new thread's rollout file to disk,
+// returning a transient -32603 that named this file empty/unreadable. Before
+// this fix that single failure was fatal and killed the session seconds
+// after start, reproducing reliably on hosts with slow codex-home I/O. A
+// bounded number of these transient failures must instead be retried with
+// backoff until the flush catches up.
+func TestAwaitAndNameLiveThreadWithRequest_TransientRolloutFlushRaceRetries(t *testing.T) {
+	t.Parallel()
+	await := func(context.Context, string, time.Duration) (json.RawMessage, error) {
+		return json.RawMessage(`{"thread":{"id":"thread-live"}}`), nil
+	}
+
+	const failCount = 3
+	var reads int32
+	request := func(_ context.Context, method string, params map[string]any, _ time.Duration) (json.RawMessage, error) {
+		switch method {
+		case "thread/name/set":
+			return json.RawMessage(`{}`), nil
+		case "thread/read":
+			if params["threadId"] != "thread-live" {
+				t.Fatalf("thread/read params = %#v", params)
+			}
+			n := atomic.AddInt32(&reads, 1)
+			if n <= failCount {
+				return nil, &RPCError{Method: "thread/read", Code: -32603, Message: codexRolloutFlushRaceMessage}
+			}
+			return json.RawMessage(`{"thread":{"id":"thread-live","name":"chief-of-staff"}}`), nil
+		default:
+			t.Fatalf("unexpected request method %q", method)
+			return nil, nil
+		}
+	}
+
+	retry := rolloutReadRetryPolicy{initialBackoff: time.Millisecond, capTotal: 200 * time.Millisecond}
+	err := awaitAndNameLiveThreadWithRequestAndRetry(
+		context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second, retry,
+	)
+	if err != nil {
+		t.Fatalf("awaitAndNameLiveThreadWithRequestAndRetry: %v", err)
+	}
+	if got := atomic.LoadInt32(&reads); got != failCount+1 {
+		t.Fatalf("thread/read attempts = %d, want %d", got, failCount+1)
+	}
+}
+
+// TestAwaitAndNameLiveThreadWithRequest_PersistentRolloutFlushRaceFailsAfterExhaustion
+// pins the other half of the contract: a thread/read that NEVER recovers
+// (a genuine failure wearing the same -32603/rollout shape, or a host whose
+// I/O never catches up) must still fail the spawn — retrying forever would
+// just trade one hang for another. The final RPCError must surface, and the
+// message must say how many attempts were tolerated so a genuine failure
+// stays diagnosable.
+func TestAwaitAndNameLiveThreadWithRequest_PersistentRolloutFlushRaceFailsAfterExhaustion(t *testing.T) {
+	t.Parallel()
+	await := func(context.Context, string, time.Duration) (json.RawMessage, error) {
+		return json.RawMessage(`{"thread":{"id":"thread-live"}}`), nil
+	}
+
+	var reads int32
+	rolloutErr := &RPCError{Method: "thread/read", Code: -32603, Message: codexRolloutFlushRaceMessage}
+	request := func(_ context.Context, method string, _ map[string]any, _ time.Duration) (json.RawMessage, error) {
+		switch method {
+		case "thread/name/set":
+			return json.RawMessage(`{}`), nil
+		case "thread/read":
+			atomic.AddInt32(&reads, 1)
+			return nil, rolloutErr
+		default:
+			t.Fatalf("unexpected request method %q", method)
+			return nil, nil
+		}
+	}
+
+	retry := rolloutReadRetryPolicy{initialBackoff: time.Millisecond, capTotal: 10 * time.Millisecond}
+	err := awaitAndNameLiveThreadWithRequestAndRetry(
+		context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second, retry,
+	)
+	if err == nil {
+		t.Fatal("expected an error once retries are exhausted")
+	}
+	var rpc *RPCError
+	if !errors.As(err, &rpc) || rpc.Code != -32603 {
+		t.Fatalf("expected the final RPCError (code -32603) to surface, got %v", err)
+	}
+	if !strings.Contains(err.Error(), "attempts") {
+		t.Fatalf("expected the error to name the retry attempts made, got %v", err)
+	}
+	if got := atomic.LoadInt32(&reads); got < 2 {
+		t.Fatalf("expected more than one thread/read attempt before giving up, got %d", got)
+	}
+}
+
+// TestIsRolloutFlushRaceError_ConservativeMatch pins the deliberately narrow
+// classification: only a -32603 whose message names BOTH the rollout
+// artifact and an empty/unreadable-read phrase is retried. An unrelated
+// -32603 (or any other code) must fail fast, exactly like before this fix —
+// otherwise a genuine internal error would be silently retried for up to
+// the full backoff cap instead of surfacing.
+func TestIsRolloutFlushRaceError_ConservativeMatch(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		err  error
+		want bool
+	}{
+		{"nil", nil, false},
+		{"non-rpc error", errors.New("boom"), false},
+		{"matching rollout-empty message", &RPCError{Code: -32603, Message: codexRolloutFlushRaceMessage}, true},
+		{
+			"matching session-metadata phrasing without 'is empty'",
+			&RPCError{Code: -32603, Message: "failed to read session metadata for rollout-thread-live.jsonl"},
+			true,
+		},
+		{"unrelated -32603 internal error", &RPCError{Code: -32603, Message: "panic: nil pointer dereference"}, false},
+		{"wrong code with matching text", &RPCError{Code: -32600, Message: codexRolloutFlushRaceMessage}, false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := isRolloutFlushRaceError(tc.err); got != tc.want {
+				t.Fatalf("isRolloutFlushRaceError(%v) = %v, want %v", tc.err, got, tc.want)
+			}
+		})
 	}
 }
 
