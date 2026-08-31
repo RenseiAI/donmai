@@ -3,7 +3,9 @@ package attachclient
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"sync"
 	"sync/atomic"
 	"time"
 
@@ -13,8 +15,9 @@ import (
 // RunHost runs the host leg of one interactive PTY session. It BLOCKS until the
 // Session ends and the bounded post-Exit final-screen window (§ 12.2) elapses —
 // returning nil — or until ctx is cancelled — returning ctx's error — or until a
-// terminal condition (epoch-stale, or a non-retryable relay error control other
-// than ring-miss) — returning ErrEpochStale or a *RelayStopError.
+// terminal condition (a locally-confirmed successor epoch, exhausted bounded
+// epoch-stale recovery, or a non-retryable relay error control other than
+// ring-miss) — returning ErrEpochStale or a *RelayStopError.
 //
 // A ring miss — the relay (or the host's own retained ring) having lost history,
 // most commonly from a relay restart — is deliberately NOT terminal (§ 13: "ring
@@ -50,6 +53,15 @@ type host struct {
 	// Mutated only by the single reconnect goroutine.
 	hasStreamed bool
 
+	// authorityMu protects the effective local PTY epoch and immutable spawn
+	// session id because degraded refresh and upgrade probes may call
+	// validatedToken concurrently. A valid legacy zero snapshot uses the
+	// InitialAuthorityToken rather than trusting the shared live token rail.
+	authorityMu      sync.Mutex
+	authoritySet     bool
+	localPTYEpoch    uint64
+	authoritySession string
+
 	// killed guards the Kill hook against a second invocation (the degraded
 	// lane's at-least-once SSE may redeliver a kill, § 14).
 	killed atomic.Bool
@@ -60,8 +72,15 @@ type host struct {
 // and decide whether it is fully done.
 type attemptResult struct {
 	// progressed is true once the carrier negotiated open + had its subscribe
-	// accepted (or saw an authoritative inbound frame): success → reset backoff.
+	// written: transport progress → reset ordinary reconnect backoff.
 	progressed bool
+	// authorityConfirmed means the relay proved this carrier was admitted: SSE
+	// returned 200 after bind, or WSS delivered an inbound frame. A bare WSS
+	// subscribe write is not confirmation.
+	authorityConfirmed bool
+	// progressedAt is when authority was confirmed. Epoch-stale budget reset
+	// measures actual admitted dwell, never dial/backoff/socket-hold time.
+	progressedAt time.Time
 	// exitDelivered is true once the Exit frame went out on this carrier.
 	exitDelivered bool
 	// windowServed is true once the post-Exit final-screen window fully elapsed
@@ -70,6 +89,53 @@ type attemptResult struct {
 	// windowDeadline is the absolute post-Exit deadline the carrier used, so a
 	// reconnect after a mid-window drop serves only the remainder.
 	windowDeadline time.Time
+}
+
+// epochRetryState is one finite recovery episode. It is independent from the
+// ordinary carrier backoff so a WSS subscribe that reaches an epoch-stale
+// response cannot reset the stale cadence to its floor.
+type epochRetryState struct {
+	bo        *backoff
+	attempts  int
+	startedAt time.Time
+}
+
+func newEpochRetryState(lo, hi time.Duration) *epochRetryState {
+	return &epochRetryState{bo: newBackoff(lo, hi)}
+}
+
+func (s *epochRetryState) active() bool { return !s.startedAt.IsZero() }
+
+func (s *epochRetryState) expired(now time.Time, cfg HostConfig) bool {
+	if !s.active() {
+		return false
+	}
+	return !now.Before(s.startedAt.Add(cfg.EpochStaleRetryWindow))
+}
+
+func (s *epochRetryState) next(now time.Time, cfg HostConfig) (time.Duration, bool) {
+	if !s.active() {
+		s.startedAt = now
+	}
+	if s.attempts >= cfg.EpochStaleMaxRetries || s.expired(now, cfg) {
+		return 0, false
+	}
+	s.attempts++
+	delay := s.bo.next()
+	remaining := s.startedAt.Add(cfg.EpochStaleRetryWindow).Sub(now)
+	if delay > remaining {
+		delay = remaining
+	}
+	if delay <= 0 {
+		return 0, false
+	}
+	return delay, true
+}
+
+func (s *epochRetryState) reset() {
+	s.attempts = 0
+	s.startedAt = time.Time{}
+	s.bo.reset()
 }
 
 func (h *host) now() time.Time {
@@ -81,6 +147,7 @@ func (h *host) now() time.Time {
 
 func (h *host) run(ctx context.Context) error {
 	bo := newBackoff(h.cfg.BackoffMin, h.cfg.BackoffMax)
+	epochRetry := newEpochRetryState(h.cfg.BackoffMin, h.cfg.BackoffMax)
 	// ringBo is the RESET-AND-RETRY cadence for §13 ring misses — deliberately
 	// separate from bo (which governs ordinary dial/network reconnects): it
 	// shares the same floor but a slower, dedicated ceiling, and repeated ring
@@ -102,10 +169,22 @@ func (h *host) run(ctx context.Context) error {
 		if err := ctx.Err(); err != nil {
 			return err
 		}
+		if epochRetry.expired(h.now(), h.cfg) {
+			return ErrEpochStale
+		}
 
-		tok, terr := h.cfg.TokenSource(ctx) // per-attempt re-resolution (§ 15)
+		tok, terr := h.validatedToken(ctx) // per-attempt re-resolution (§ 15)
 		if terr != nil {
+			if errors.Is(terr, errEpochGrantSuperseded) {
+				return ErrEpochStale
+			}
 			h.log.Warn("attachclient: token source failed", "err", terr)
+			if epochRetry.active() || errors.Is(terr, errEpochGrantAmbiguous) {
+				if err := h.waitEpochRetry(ctx, epochRetry, "grant authority is ambiguous", terr); err != nil {
+					return err
+				}
+				continue
+			}
 			if err := sleepCtx(ctx, bo.next()); err != nil {
 				return err
 			}
@@ -137,6 +216,11 @@ func (h *host) run(ctx context.Context) error {
 			bo.reset()
 			consecFails = 0
 		}
+		if epochRetry.active() && res.authorityConfirmed && !res.progressedAt.IsZero() &&
+			!errors.Is(rerr, ErrEpochStale) &&
+			h.now().Sub(res.progressedAt) >= h.cfg.EpochStaleStableWindow {
+			epochRetry.reset()
+		}
 		if res.exitDelivered && exitDeadline.IsZero() && !res.windowDeadline.IsZero() {
 			exitDeadline = res.windowDeadline
 		}
@@ -158,8 +242,13 @@ func (h *host) run(ctx context.Context) error {
 				continue
 			}
 			return nil
-		case errors.Is(rerr, ErrEpochStale):
+		case errors.Is(rerr, errEpochGrantSuperseded):
 			return ErrEpochStale
+		case errors.Is(rerr, ErrEpochStale), errors.Is(rerr, errEpochGrantAmbiguous):
+			if err := h.waitEpochRetry(ctx, epochRetry, "relay rejected the current PTY epoch", rerr); err != nil {
+				return err
+			}
+			continue
 		case isRelayStop(rerr):
 			return rerr
 		case isRelayRingMiss(rerr):
@@ -173,6 +262,10 @@ func (h *host) run(ctx context.Context) error {
 			// window (several restarts in a row) keeps deepening the backoff
 			// instead of hammering a relay that keeps coming back wiped.
 			h.log.Warn("attachclient: relay lost ring state — resetting for a fresh re-attach", "err", rerr)
+			// Receiving ring-miss control proves this carrier was admitted for
+			// the current local PTY epoch. Clear any older stale-ownership episode
+			// so its elapsed bound can never override §13's non-terminal repair.
+			epochRetry.reset()
 			h.hasStreamed = false
 			if err := sleepCtx(ctx, ringBo.next()); err != nil {
 				return err
@@ -196,6 +289,99 @@ func (h *host) run(ctx context.Context) error {
 			continue
 		}
 	}
+}
+
+// validatedToken binds every bearer resolution — including degraded 401
+// refresh and upgrade probes — to the live Session's effective PTY epoch. A
+// nonzero Snapshot epoch is ground truth. The shipped legacy session surface
+// reports the valid epoch zero, so that compatibility shape requires the
+// immutable InitialAuthorityToken instead of trusting the first live token-file
+// read. A later higher grant is successor evidence and is never used by this
+// Session; a lower grant is ambiguous refresh lag.
+func (h *host) validatedToken(ctx context.Context) (string, error) {
+	tok, err := h.cfg.TokenSource(ctx)
+	if err != nil {
+		return "", err
+	}
+	claims, err := parseHostClaims(tok)
+	if err != nil {
+		return "", err
+	}
+	if claims.Epoch < 0 {
+		return "", fmt.Errorf("%w: negative grant epoch %d", errEpochGrantAmbiguous, claims.Epoch)
+	}
+
+	h.authorityMu.Lock()
+	defer h.authorityMu.Unlock()
+	if !h.authoritySet {
+		screen, _, snapErr := h.cfg.Session.Snapshot()
+		if snapErr != nil {
+			return "", fmt.Errorf("attachclient: reading local PTY epoch: %w", snapErr)
+		}
+		initialClaims := claims
+		if h.cfg.InitialAuthorityToken != "" {
+			parsedInitial, initialErr := parseHostClaims(h.cfg.InitialAuthorityToken)
+			if initialErr != nil {
+				return "", fmt.Errorf("attachclient: parsing InitialAuthorityToken: %w", initialErr)
+			}
+			initialClaims = parsedInitial
+		}
+		if screen.Epoch == 0 {
+			if h.cfg.InitialAuthorityToken == "" {
+				return "", errors.New("attachclient: HostConfig.InitialAuthorityToken is required when Session snapshot epoch is zero")
+			}
+			if initialClaims.Epoch < 0 {
+				return "", fmt.Errorf("attachclient: InitialAuthorityToken has negative epoch %d", initialClaims.Epoch)
+			}
+			h.localPTYEpoch = uint64(initialClaims.Epoch)
+		} else {
+			h.localPTYEpoch = screen.Epoch
+			if initialClaims.Epoch < 0 || uint64(initialClaims.Epoch) != screen.Epoch {
+				return "", fmt.Errorf("%w: initial authority epoch %d does not match local PTY epoch %d",
+					errEpochGrantSuperseded, initialClaims.Epoch, screen.Epoch)
+			}
+		}
+		h.authoritySession = initialClaims.SessionID
+		h.authoritySet = true
+	}
+	if claims.SessionID != h.authoritySession {
+		return "", fmt.Errorf("%w: grant session changed from %q to %q",
+			errEpochGrantSuperseded, h.authoritySession, claims.SessionID)
+	}
+	grantEpoch := uint64(claims.Epoch)
+	switch {
+	case grantEpoch > h.localPTYEpoch:
+		return "", fmt.Errorf("%w: grant epoch %d exceeds local PTY epoch %d",
+			errEpochGrantSuperseded, grantEpoch, h.localPTYEpoch)
+	case grantEpoch < h.localPTYEpoch:
+		return "", fmt.Errorf("%w: grant epoch %d trails local PTY epoch %d",
+			errEpochGrantAmbiguous, grantEpoch, h.localPTYEpoch)
+	default:
+		return tok, nil
+	}
+}
+
+func (h *host) waitEpochRetry(
+	ctx context.Context,
+	state *epochRetryState,
+	reason string,
+	cause error,
+) error {
+	delay, ok := state.next(h.now(), h.cfg)
+	if !ok {
+		return ErrEpochStale
+	}
+	h.log.Warn("attachclient: epoch authority unresolved — retrying with bounded backoff",
+		"reason", reason,
+		"attempt", state.attempts,
+		"maxAttempts", h.cfg.EpochStaleMaxRetries,
+		"delay", delay,
+		"err", cause)
+	sleep := sleepCtx
+	if h.cfg.epochStaleSleep != nil {
+		sleep = h.cfg.epochStaleSleep
+	}
+	return sleep(ctx, delay)
 }
 
 // maybeFallback bumps the consecutive-failure counter and, if the degraded lane

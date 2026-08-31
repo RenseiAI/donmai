@@ -273,7 +273,8 @@ func (r *Runner) dispatchInteractive(
 		defer attachCancel()
 		attachDone = make(chan error, 1)
 		hostCfg := attachclient.HostConfig{
-			AttachURL: attachURL,
+			AttachURL:             attachURL,
+			InitialAuthorityToken: attachToken,
 			// Token re-mint rail: the provisioner may maintain a fresh
 			// short-exp token at ATTACH_TOKEN_FILE (atomically rewritten
 			// before each expiry); the source re-reads it before carrier

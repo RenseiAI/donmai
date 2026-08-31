@@ -100,7 +100,8 @@ func TestUnknownFrameTypeIsFramingErrorAndReconnects(t *testing.T) {
 func TestDegradedHostSSEEpochStaleTerminal(t *testing.T) {
 	// WSS is refused, so both host legs use the degraded lane. Host A binds via
 	// the SSE GET; host B (equal epoch, different jti) hits the CAS reject → the
-	// SSE GET returns 409 → openHostSSE surfaces ErrEpochStale (terminal).
+	// SSE GET returns 409 → openHostSSE surfaces ErrEpochStale to RunHost's
+	// local-PTY-grounded bounded recovery decision.
 	relay := attachtest.New(attachtest.Config{RoomID: "room-1", RefuseWSS: true})
 	if err := relay.Start(); err != nil {
 		t.Fatalf("relay start: %v", err)

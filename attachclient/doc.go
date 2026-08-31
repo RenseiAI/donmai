@@ -20,6 +20,13 @@
 // short-exp token (e.g. rewritten to a file the source re-reads, see the
 // runner's ATTACH_TOKEN_FILE contract) keeps the host leg reconnectable past
 // the initial token's exp; a static closure bounds reconnectability at that exp.
+// The same seam repairs an epoch-stale race without allowing zombie takeover:
+// every token is checked against Session.Snapshot's local PTY epoch plus the
+// immutable InitialAuthorityToken supplied at spawn. The initial token is
+// mandatory for the shipped valid-zero legacy epoch surface, so a successor in
+// the shared live token file can never redefine an old process's authority. An
+// exact same-epoch stale response retries under a finite capped budget while a
+// higher current grant stops this host leg as superseded.
 //
 // # Two carriers, one interface
 //

@@ -115,7 +115,9 @@ func TestDegradedPersistentSSE401BacksOffRecoversAndCancels(t *testing.T) {
 	}))
 	defer srv.Close()
 
-	sess := newFakeSession(32)
+	// The local PTY epoch and every refreshed grant must describe the same
+	// process generation; this test varies jti/auth freshness, not ownership.
+	sess := newFakeSession(1)
 	ctx, cancel := context.WithCancel(context.Background())
 	done := make(chan error, 1)
 	go func() {
