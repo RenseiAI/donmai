@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -361,6 +362,133 @@ func TestRefreshRuntimeToken_WorkerNotFound_ReregistersOnlyWhenRecordIsGone(t *t
 	}
 	if !result.RegistrationTokenSwapped {
 		t.Error("expected RegistrationTokenSwapped=true when the identity changed")
+	}
+}
+
+// TestRefreshRuntimeToken_WorkerNotFoundReregisterPreservesAdmissionCapacity
+// keeps the forced-registration fallback aligned with the registration mode
+// that started the daemon. In particular, an auth-only recovery must remain
+// unclaimable until its post-recovery heartbeat has completed.
+func TestRefreshRuntimeToken_WorkerNotFoundReregisterPreservesAdmissionCapacity(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	tests := []struct {
+		name         string
+		authOnly     bool
+		maxAgents    int
+		wantCapacity int
+		wantShim     bool
+	}{
+		{name: "ordinary registration keeps capacity", maxAgents: 3, wantCapacity: 3},
+		{name: "auth-only recovery remains unclaimable", authOnly: true, maxAgents: 3, wantCapacity: 0, wantShim: true},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			resetRefreshersForTest()
+			t.Cleanup(resetRefreshersForTest)
+
+			var attestation SessionShimHostAttestation
+			if tc.authOnly {
+				attestation = activationTestAttestation()
+			}
+
+			var gotCapacity int
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.URL.Path {
+				case "/api/workers/wkr_retired/refresh-token":
+					http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+				case RegisterEndpoint:
+					var request RegisterRequest
+					if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+						t.Errorf("decode registration: %v", err)
+						return
+					}
+					gotCapacity = request.Capacity
+					if tc.wantShim && !reflect.DeepEqual(request.SessionShimHostAttestation, attestation) {
+						t.Errorf("reregister session-shim attestation = %#v, want %#v", request.SessionShimHostAttestation, attestation)
+					}
+					response := RegisterResponse{WorkerID: "wkr_replacement", RuntimeToken: "replacement.jwt"}
+					if tc.authOnly {
+						response.SessionShim = activationTestCredentialReceipt(
+							attestation, SessionShimCredentialStateRecovering, "stable-host", "revision-replacement",
+						)
+					}
+					_ = json.NewEncoder(w).Encode(response)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+
+			result, err := RefreshRuntimeToken(context.Background(), RegistrationOptions{
+				OrchestratorURL:   srv.URL,
+				RegistrationToken: "rsp_live_test",
+				Hostname:          "host",
+				MaxAgents:         tc.maxAgents,
+				JWTPath:           t.TempDir() + "/daemon.jwt",
+				HTTPClient:        srv.Client(),
+				AuthOnly:          tc.authOnly,
+				SessionShim:       attestation,
+			}, "wkr_retired", "worker-not-found")
+			if err != nil {
+				t.Fatalf("RefreshRuntimeToken: %v", err)
+			}
+			if result.Mode != "reregister" {
+				t.Fatalf("mode = %q, want reregister", result.Mode)
+			}
+			if gotCapacity != tc.wantCapacity {
+				t.Errorf("reregister capacity = %d, want %d", gotCapacity, tc.wantCapacity)
+			}
+		})
+	}
+}
+
+func TestCredentialRefresher_ComposedShimReregisterRemainsAuthOnly(t *testing.T) {
+	resetRefreshersForTest()
+	t.Cleanup(resetRefreshersForTest)
+	attestation := activationTestAttestation()
+	var refreshes, registrations int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch r.URL.Path {
+		case "/api/workers/wkr_boot/refresh-token":
+			refreshes++
+			if refreshes == 1 {
+				_ = json.NewEncoder(w).Encode(refreshResponse{RuntimeToken: "declared.jwt", SessionShim: activationTestCredentialReceipt(attestation, SessionShimCredentialStateRecovering, "host", "revision-declared")})
+				return
+			}
+			http.Error(w, `{"error":"Worker not found"}`, http.StatusNotFound)
+		case RegisterEndpoint:
+			registrations++
+			var request RegisterRequest
+			if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+				t.Errorf("decode registration: %v", err)
+				return
+			}
+			if request.Capacity != 0 {
+				t.Errorf("composed-shim reregister capacity = %d, want 0", request.Capacity)
+			}
+			if !reflect.DeepEqual(request.SessionShimHostAttestation, attestation) {
+				t.Errorf("reregister session-shim attestation = %#v, want %#v", request.SessionShimHostAttestation, attestation)
+			}
+			_ = json.NewEncoder(w).Encode(RegisterResponse{WorkerID: "wkr_replacement", RuntimeToken: "replacement.jwt", SessionShim: activationTestCredentialReceipt(attestation, SessionShimCredentialStateRecovering, "host", "revision-replacement")})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	defer server.Close()
+
+	registration := RegistrationOptions{OrchestratorURL: server.URL, RegistrationToken: "rsp_live_test", Hostname: "host", MaxAgents: 3, JWTPath: t.TempDir() + "/daemon.jwt", HTTPClient: server.Client()}
+	refresher := NewCredentialRefresher(CredentialRefresherOptions{Registration: registration, WorkerID: "wkr_boot", RuntimeJWT: "boot.jwt"})
+	if _, err := refresher.DeclareSessionShim(context.Background(), attestation, "composition"); err != nil {
+		t.Fatalf("DeclareSessionShim: %v", err)
+	}
+	result, err := refresher.Refresh(context.Background(), "worker-not-found")
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if result.WorkerID != "wkr_replacement" || registrations != 1 || refreshes != 2 {
+		t.Fatalf("result=%+v registrations=%d refreshes=%d", result, registrations, refreshes)
 	}
 }
 
