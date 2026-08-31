@@ -12,6 +12,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -290,6 +291,91 @@ type namedThreadRequest func(context.Context, string, map[string]any, time.Durat
 
 type notificationWaiter func(ctx context.Context, method string, timeout time.Duration) (json.RawMessage, error)
 
+// rolloutReadRetryPolicy bounds the retry applied to thread/read when it
+// hits codex's rollout-flush race (see isRolloutFlushRaceError): codex
+// persists a freshly named thread's metadata to a rollout-*.jsonl file
+// asynchronously, and a thread/read landing before that write reaches disk
+// returns a transient -32603 naming the file as empty or unreadable.
+// Retrying with backoff lets a slow-I/O host catch up instead of the caller
+// treating the race as a genuine spawn failure and killing the session
+// seconds after start — reproduces reliably on hosts with slow codex-home
+// I/O.
+type rolloutReadRetryPolicy struct {
+	initialBackoff time.Duration
+	capTotal       time.Duration
+}
+
+// defaultRolloutReadRetryPolicy is the production policy: a 250ms initial
+// backoff doubling on each attempt, capped at 10s of total elapsed wait.
+var defaultRolloutReadRetryPolicy = rolloutReadRetryPolicy{
+	initialBackoff: 250 * time.Millisecond,
+	capTotal:       10 * time.Second,
+}
+
+// isRolloutFlushRaceError reports whether err is codex's transient
+// "rollout file not flushed yet" failure surfaced by thread/read
+// immediately after thread/name/set: the app-server's thread-store has not
+// finished writing the new thread's rollout-*.jsonl metadata file to disk
+// when the read lands, so it replies with a -32603 Internal error naming an
+// empty or unreadable rollout file. This is a pure timing race, not a
+// protocol or programmer error — but the match stays conservative because
+// -32603 alone covers many unrelated internal failures a caller must NOT
+// retry forever: both the rollout artifact and an empty/unreadable-read
+// phrase must be present in the message.
+func isRolloutFlushRaceError(err error) bool {
+	var rpc *RPCError
+	if !errors.As(err, &rpc) || rpc.Code != -32603 {
+		return false
+	}
+	msg := strings.ToLower(rpc.Message)
+	if !strings.Contains(msg, "rollout") {
+		return false
+	}
+	return strings.Contains(msg, "is empty") || strings.Contains(msg, "session metadata")
+}
+
+// requestThreadReadTolerant issues thread/read and retries with bounded
+// exponential backoff while the failure is codex's rollout-flush race (see
+// isRolloutFlushRaceError). Any other error — including a -32603 for an
+// unrelated reason — returns immediately, unretried. Once the next backoff
+// would push total elapsed wait past retry.capTotal, the loop gives up and
+// returns the last error, annotated with the attempt count so a genuine
+// failure stays diagnosable rather than looking like a silent hang.
+func requestThreadReadTolerant(
+	ctx context.Context,
+	request namedThreadRequest,
+	threadID string,
+	timeout time.Duration,
+	retry rolloutReadRetryPolicy,
+) (json.RawMessage, error) {
+	backoff := retry.initialBackoff
+	var elapsed time.Duration
+	attempts := 0
+	for {
+		attempts++
+		raw, err := request(ctx, "thread/read", map[string]any{"threadId": threadID}, timeout)
+		if err == nil {
+			return raw, nil
+		}
+		if !isRolloutFlushRaceError(err) || elapsed+backoff > retry.capTotal {
+			if attempts > 1 {
+				return nil, fmt.Errorf(
+					"thread/read after name set: %w (gave up after %d attempts tolerating a rollout-flush race)",
+					err, attempts,
+				)
+			}
+			return nil, fmt.Errorf("thread/read after name set: %w", err)
+		}
+		select {
+		case <-ctx.Done():
+			return nil, fmt.Errorf("thread/read after name set: %w", ctx.Err())
+		case <-time.After(backoff):
+		}
+		elapsed += backoff
+		backoff *= 2
+	}
+}
+
 // awaitAndNameLiveThreadWithRequest waits for the method/thread that the PTY
 // itself created (a thread/started notification), then names that exact
 // live thread and verifies the readback — the fresh-session sequence. The
@@ -301,6 +387,21 @@ func awaitAndNameLiveThreadWithRequest(
 	awaitNotification notificationWaiter,
 	request namedThreadRequest,
 	timeout time.Duration,
+) error {
+	return awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, awaitNotification, request, timeout, defaultRolloutReadRetryPolicy)
+}
+
+// awaitAndNameLiveThreadWithRequestAndRetry is awaitAndNameLiveThreadWithRequest
+// with the thread/read retry policy injected, so tests can exercise the
+// rollout-flush-race tolerance (both the transient and exhausted-retries
+// paths) with a fast backoff schedule instead of the production one.
+func awaitAndNameLiveThreadWithRequestAndRetry(
+	ctx context.Context,
+	spec agent.Spec,
+	awaitNotification notificationWaiter,
+	request namedThreadRequest,
+	timeout time.Duration,
+	retry rolloutReadRetryPolicy,
 ) error {
 	if spec.SessionName == "" {
 		return errors.New("codex interactive live-thread naming requires a session name")
@@ -326,11 +427,9 @@ func awaitAndNameLiveThreadWithRequest(
 	}, timeout); err != nil {
 		return fmt.Errorf("thread/name/set: %w", err)
 	}
-	readRaw, err := request(ctx, "thread/read", map[string]any{
-		"threadId": started.Thread.ID,
-	}, timeout)
+	readRaw, err := requestThreadReadTolerant(ctx, request, started.Thread.ID, timeout, retry)
 	if err != nil {
-		return fmt.Errorf("thread/read after name set: %w", err)
+		return err
 	}
 	var readback struct {
 		Thread struct {
