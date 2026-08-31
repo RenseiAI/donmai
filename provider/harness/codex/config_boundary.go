@@ -11,6 +11,7 @@ import (
 
 const (
 	codexHomePrefix       = "donmai-codex-home-"
+	codexConfigFileName   = "config.toml"
 	codexConfigBaseline   = "mcp_servers = {}\n"
 	codexFileAuthConfig   = "cli_auth_credentials_store = \"file\"\n"
 	codexHomeMode         = 0o700
@@ -90,7 +91,7 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 		home:       home,
 		parent:     parent,
 		parentInfo: parentInfo,
-		configPath: filepath.Join(home, "config.toml"),
+		configPath: filepath.Join(home, codexConfigFileName),
 	}
 	keep := false
 	defer func() {
@@ -133,7 +134,7 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 	// long gone, can tell a live session apart from an orphan without
 	// guessing from directory age alone. Best-effort — see
 	// writeDonmaiOwnerManifest's doc comment.
-	writeDonmaiOwnerManifest(home, "codex-home")
+	writeDonmaiOwnerManifest(home, sweepKindCodexHome)
 	keep = true
 	return b, nil
 }

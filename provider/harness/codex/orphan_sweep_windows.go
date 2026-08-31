@@ -2,7 +2,10 @@
 
 package codex
 
-import "os"
+import (
+	"errors"
+	"os"
+)
 
 // processAliveOS reports whether pid is a currently running process.
 //
@@ -32,11 +35,20 @@ func processAliveOS(pid int) bool {
 // path.
 func processLooksLikeCodexOS(int, string) bool { return false }
 
-// verifyManifestDirectoryOwnershipOS has no ACL-based implementation on
-// windows today. Unverified, not verified-and-passing: windows' per-user
-// %TEMP% layout differs fundamentally from a shared, world-writable unix
-// /tmp (the concrete threat verifyManifestDirectoryOwnership exists to
-// close — see its doc comment), but that difference has not been audited
-// here, so treat this the same way as F10's liveness caveat above: a known,
-// documented gap, not a proven-safe default.
-func verifyManifestDirectoryOwnershipOS(os.FileInfo) error { return nil }
+// readOwnedManifestBytes has no ACL-based ownership implementation on
+// windows today, so this package refuses to read an owner manifest there at
+// all. Unverified is not verified-and-passing: windows' per-user %TEMP%
+// layout differs fundamentally from a shared, world-writable unix /tmp (the
+// concrete threat readVerifiedDonmaiOwnerManifest exists to close — see its
+// doc comment), but that difference has not been audited here, and an
+// unverified manifest drives directory reclamation, not just termination.
+//
+// The practical effect is the same fail-safe direction as the liveness
+// caveat above: on windows every artifact directory is treated as having no
+// manifest at all, so the sweep can only ever remove one that is already
+// empty. Directories accumulate exactly as they did before this package
+// existed, and nothing is ever deleted or signalled on the word of a
+// manifest whose provenance this platform cannot check.
+func readOwnedManifestBytes(string) ([]byte, error) {
+	return nil, errors.New("owner-manifest ownership verification is unimplemented on windows")
+}
