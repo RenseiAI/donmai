@@ -82,6 +82,12 @@ const sessionShimReconciliationRefreshReason = "session-shim-commit-reconciliati
 // a heartbeat that presented a superseded session-shim adoption revision.
 const sessionShimRevisionStaleCode = "SESSION_SHIM_ADOPTION_REVISION_STALE"
 
+// The classified reconciliation triggers, for the armed/attempt log lines.
+const (
+	sessionShimReconcileCauseAmbiguous        = "ambiguous-batch-commit"
+	sessionShimReconcileCauseRevisionAdvanced = "adoption-revision-advanced"
+)
+
 // sessionShimCommitOutcomeUnknown classifies one batch-commit error.
 // OUTCOME-UNKNOWN — the request may have applied — is the explicit sentinel, a
 // context deadline/cancellation (the bound expired around an in-flight
@@ -165,16 +171,48 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 		delete(d.shims.reconciling, scope)
 		d.shims.mu.Unlock()
 	}()
+	// A pass that ends because the CONTROL PLANE ITSELF reported a revision it
+	// has moved to is not an exhausted pass — it is a pass that learned a new
+	// fact and has to be spent against it. Measured on an installed host: four
+	// attempts all answered "the expected revision changed", the loop declared
+	// exhaustion, and the daemon then served the superseded revision forever
+	// with no trigger left to re-arm it. Re-arming on that specific answer is
+	// what makes "serve a stale revision forever" unreachable; a control plane
+	// that merely refuses keeps the original bounded behaviour exactly.
+	for {
+		lastErr := d.runBoundedSessionShimReconciliationPass(scope, cause)
+		var advanced *SessionShimAdoptionRevisionAdvanced
+		if !errors.As(lastErr, &advanced) || d.sessionShimReconcileStopped() {
+			return
+		}
+		cause = sessionShimReconcileCauseRevisionAdvanced
+		slog.Warn("session shim: reconciliation spent its derived bound against a control plane that keeps reporting a further "+
+			"advanced adoption revision; re-arming rather than serving a superseded revision "+
+			"(shim-adoption-reconvergence-2026-09-01)",
+			"scope", scope, "advancedTo", advanced.Advanced)
+		// Paced by the same unit every other bound here is expressed in, so a
+		// control plane stuck reporting an advance cannot be spun against.
+		if !d.sleepSessionShimReconcileBackoff(d.sessionShimConfig().callbackTimeout()) {
+			return
+		}
+	}
+}
+
+// runBoundedSessionShimReconciliationPass is ONE derived-bound pass. It returns
+// nil once a republish confirms (or the daemon released its shims), and
+// otherwise the last attempt's failure, which is what the caller classifies.
+func (d *Daemon) runBoundedSessionShimReconciliationPass(scope, cause string) error {
 	cfg := d.sessionShimConfig()
 	attempts := sessionShimAdoptionPublicationStages
 	backoff := cfg.callbackTimeout()
 	budget := cfg.adoptionPublicationTimeout()
+	var lastErr error
 	for attempt := 1; attempt <= attempts; attempt++ {
 		if attempt > 1 && !d.sleepSessionShimReconcileBackoff(backoff) {
-			return
+			return nil
 		}
 		if d.sessionShimReconcileStopped() {
-			return
+			return nil
 		}
 		err := d.reconcileSessionShimScope(scope, budget)
 		if err == nil {
@@ -187,16 +225,18 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 			beatCtx, cancelBeat := context.WithTimeout(context.Background(), cfg.callbackTimeout())
 			d.ringSessionShimPostActivationHeartbeat(beatCtx)
 			cancelBeat()
-			return
+			return nil
 		}
+		lastErr = err
 		if d.sessionShimReconcileStopped() {
-			return
+			return nil
 		}
 		slog.Warn("session shim: commit-outcome reconciliation attempt failed",
 			"scope", scope, "cause", cause, "attempt", attempt, "attempts", attempts, "error", err)
 	}
 	slog.Warn("session shim: commit-outcome reconciliation exhausted its derived bound; serving and beating the last-committed projection",
 		"scope", scope, "cause", cause, "attempts", attempts)
+	return lastErr
 }
 
 // reconcileSessionShimScope is one attempt: one refresh through the ONE

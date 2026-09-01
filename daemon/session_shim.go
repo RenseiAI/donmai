@@ -9,6 +9,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
@@ -382,9 +383,17 @@ type SessionShimAdoptionBatch struct {
 	OrgID            string
 	HostID           string
 	ExpectedRevision []byte
-	Adopted          []SessionShimAdoptionOutcome
-	Quarantined      []sessionshim.QuarantinedSession
-	Tombstoned       []SessionShimTerminalEvidence
+	// OperationalDigest is a stable fingerprint of everything below — the
+	// batch's idempotency key, resolved at the single commit choke point after
+	// the sections are ordered. A composing plane sends it with the commit and
+	// echoes it back on SessionShimAdoptionRevisionAdvanced, which is what lets
+	// this daemon recognise an already-committed batch as its own after its copy
+	// of the answer was lost. It never enters the digest of itself, and the
+	// expected revision never enters it either.
+	OperationalDigest string
+	Adopted           []SessionShimAdoptionOutcome
+	Quarantined       []sessionshim.QuarantinedSession
+	Tombstoned        []SessionShimTerminalEvidence
 	// Cleared enumerates currently-quarantined unterminated lineages this batch
 	// explicitly abandons. Each entry must name a lineage the receiver still
 	// holds quarantined; the commit removes it from the completeness set and the
@@ -1386,9 +1395,36 @@ func (d *Daemon) sessionShimConfig() SessionShimConfig {
 	if cfg.Orphan.Deadline == 0 {
 		policy := sessionshim.DefaultOrphanPolicy()
 		policy.ExternalReleaseThreshold = cfg.Orphan.ExternalReleaseThreshold
+		if operator, ok := operatorOrphanDeadline(); ok {
+			policy.Deadline = operator
+		}
 		cfg.Orphan = policy
 	}
 	return cfg
+}
+
+// operatorOrphanDeadline reads the §D8 orphan deadline an operator set on this
+// installed host, in milliseconds.
+//
+// The knob already exists on the launch contract this daemon writes into every
+// shim's environment; reading the same key here is what makes it settable from
+// outside the embedder's source, which is where an operator actually is when a
+// deployment's grace turns out to be wrong. An embedder that configures
+// OrphanPolicy.Deadline explicitly still wins — this only fills the default —
+// and an unreadable or non-positive value is ignored rather than obeyed, since
+// OrphanPolicy.Validate would refuse a daemon that took it literally.
+func operatorOrphanDeadline() (time.Duration, bool) {
+	raw, ok := os.LookupEnv(sessionshim.EnvOrphanDeadlineMS)
+	if !ok || raw == "" {
+		return 0, false
+	}
+	millis, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || millis <= 0 {
+		slog.Warn("session shim: ignoring an unreadable operator orphan deadline",
+			"env", sessionshim.EnvOrphanDeadlineMS, "value", raw)
+		return 0, false
+	}
+	return time.Duration(millis) * time.Millisecond, true
 }
 
 // defaultShimOrgID is the organization identity a standalone OSS daemon uses.
@@ -1749,6 +1785,17 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				}
 			}
 			receipt, batchErr := d.completeSessionShimAdoptionBatch(ctx, batch)
+			if batchErr != nil {
+				// A boot batch the control plane refuses because it ALREADY
+				// HOLDS this lineage's adoption evidence — the planned-restart
+				// collision — must cost that lineage its controller authority
+				// and nothing else. Aborting here would close every controller
+				// on the host and bring durable sessions up OFF, which is how a
+				// single lineage's bookkeeping conflict reaped healthy
+				// harnesses on an installed host.
+				receipt, batchErr = d.commitBootBatchAroundRecordedEvidence(
+					ctx, batch, batchErr, entries, adoptionFailures)
+			}
 			if batchErr != nil {
 				result.Close()
 				return fmt.Errorf("session shim: durable adoption batch for organization %q: %w", orgID, batchErr)
@@ -2431,11 +2478,26 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	// forgets ships an unpublishable batch — which is what happened to the
 	// tombstoned section, ordered by nothing but append order until now.
 	sortSessionShimAdoptionBatch(&batch)
+	// The digest is resolved here, once, after ordering and before anything is
+	// sent: it is the idempotency key both callbacks carry, and a key computed
+	// per caller would differ between two presentations of the same set.
+	batch.OperationalDigest = sessionShimAdoptionBatchDigest(batch)
 	if cfg.PrepareAdoptionBatch != nil {
 		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 		expected, err := cfg.PrepareAdoptionBatch(callbackCtx, batch.OrgID, batch.HostID)
 		cancel()
 		if err != nil {
+			// A preparation that reports the expected revision already advanced
+			// past ours, by exactly one, for a batch whose digest is the one we
+			// are holding, is this daemon's own lost commit coming back. Adopt
+			// its receipt instead of arguing with a control plane that already
+			// did what we asked. Anything else stays a failure.
+			if adopted, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
+				slog.Warn("session shim: adopting the control plane's advanced adoption revision as the outcome of this daemon's own commit "+
+					"(shim-adoption-reconvergence-2026-09-01)",
+					"org", batch.OrgID, "revision", adopted.AdoptionRevision, "digest", batch.OperationalDigest)
+				return d.validateSessionShimAdoptionBatchReceipt(batch, adopted)
+			}
 			return SessionShimAdoptionBatchReceipt{}, err
 		}
 		if len(expected) == 0 {
@@ -2447,6 +2509,12 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	defer cancel()
 	receipt, err := cfg.OnAdoptionBatch(callbackCtx, cloneSessionShimAdoptionBatch(batch))
 	if err != nil {
+		if adopted, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
+			slog.Warn("session shim: adopting the control plane's advanced adoption revision as the outcome of this daemon's own commit "+
+				"(shim-adoption-reconvergence-2026-09-01)",
+				"org", batch.OrgID, "revision", adopted.AdoptionRevision, "digest", batch.OperationalDigest)
+			return d.validateSessionShimAdoptionBatchReceipt(batch, adopted)
+		}
 		if sessionShimCommitOutcomeUnknown(err) {
 			// The commit request went out and no decoded refusal came back:
 			// the control plane may have stamped this batch and advanced the
@@ -2457,10 +2525,22 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 		}
 		return SessionShimAdoptionBatchReceipt{}, err
 	}
+	return d.validateSessionShimAdoptionBatchReceipt(batch, receipt)
+}
+
+// validateSessionShimAdoptionBatchReceipt is the one place a batch receipt is
+// admitted. Both routes in — the ordinary commit answer and the receipt an
+// advanced-revision preparation echoed back for an already-committed batch —
+// pass through it, so an adopted receipt is held to exactly the completeness
+// the committed one is.
+func (d *Daemon) validateSessionShimAdoptionBatchReceipt(
+	batch SessionShimAdoptionBatch,
+	receipt SessionShimAdoptionBatchReceipt,
+) (SessionShimAdoptionBatchReceipt, error) {
 	if len(receipt.DurableCorrelation) == 0 {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: adoption batch callback omitted durable revision receipt")
 	}
-	if (d.sessionShimEnabled() || cfg.OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
+	if (d.sessionShimEnabled() || d.sessionShimConfig().OnAdoptionPublished != nil) && receipt.AdoptionRevision == "" {
 		return SessionShimAdoptionBatchReceipt{}, errors.New("session shim: attested adoption batch omitted adoption revision")
 	}
 	if err := validateSessionShimClearedReceiptEcho(batch.Cleared, receipt.Cleared); err != nil {
@@ -2586,14 +2666,22 @@ func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID strin
 	batch := d.sessionShimProjectionBatch(orgID, hostID)
 	receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
 	if err != nil {
-		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+		var advanced *SessionShimAdoptionRevisionAdvanced
+		if errors.As(err, &advanced) {
+			// The control plane moved and this batch is NOT the batch that moved
+			// it (an adoptable advance never reaches here — it returns a
+			// receipt). Re-present the complete current projection at the
+			// advanced revision, which is what one reconciliation pass does
+			// after the refresher relearns the revision.
+			d.scheduleSessionShimReconciliation(orgID, sessionShimReconcileCauseRevisionAdvanced)
+		} else if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
 			// OUTCOME-UNKNOWN: the control plane may hold this batch and a
 			// revision this daemon never learned. The beat keeps presenting
 			// the last-committed projection meanwhile; reconciliation learns
 			// the committed revision through the refresher and republishes
 			// the complete batch. A trigger landing from inside the
 			// reconciliation loop itself is deduplicated by the scope mark.
-			d.scheduleSessionShimReconciliation(orgID, "ambiguous-batch-commit")
+			d.scheduleSessionShimReconciliation(orgID, sessionShimReconcileCauseAmbiguous)
 		}
 		slog.Warn("session shim: quarantine projection not published",
 			"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),

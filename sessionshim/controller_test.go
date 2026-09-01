@@ -210,8 +210,25 @@ func TestEventBacklogAcceptsOneOversizedEvent(t *testing.T) {
 	}
 }
 
-func TestSelectedV3HeartbeatTimeoutClosesController(t *testing.T) {
+// TestSelectedV3HeartbeatReceiptTimeoutKeepsTheController replaces the pin that
+// used to require the OPPOSITE — that a receipt timeout drop the connection.
+//
+// Measured on an installed host: a durable write that was merely slow took the
+// persistence receipt past the wait bound, this controller dropped the shim
+// connection over it, nothing re-adopted the shim, and it reaped its own live
+// harness when its orphan deadline expired. Twice, in the same minute, on two
+// healthy sessions. "The receipt has not arrived yet" is a statement about how
+// fast the durable side is answering; it is not evidence that this socket is
+// broken, and it is never a reason to unsupervise a running harness.
+//
+// So the bound now bounds ONE CALLER'S WAIT: it reports the receipt pending,
+// keeps the stream, and a receipt that lands late is consumed as the answer it
+// is rather than as the unsolicited frame that WOULD be a reason to drop. The
+// cursor still does not advance — the shim has not said it stored that
+// sequence — which is what makes retrying safe rather than optimistic.
+func TestSelectedV3HeartbeatReceiptTimeoutKeepsTheController(t *testing.T) {
 	clientConn, shimConn := net.Pipe()
+	defer clientConn.Close() //nolint:errcheck
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
@@ -219,32 +236,76 @@ func TestSelectedV3HeartbeatTimeoutClosesController(t *testing.T) {
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.readLoop()
+
 	peerDone := make(chan error, 1)
+	releaseLateReceipt := make(chan struct{})
 	go func() {
 		defer shimConn.Close() //nolint:errcheck
-		reader := shimwire.NewReader(shimConn)
+		reader, writer := shimwire.NewReader(shimConn), shimwire.NewWriter(shimConn)
+		// The slow one: read the request and answer nothing until released.
 		message, err := reader.ReadVersion(shimwire.V3)
 		if err != nil || message.Type != shimwire.TypeHeartbeat {
-			peerDone <- fmt.Errorf("heartbeat request = %s, %v", message.Type, err)
+			peerDone <- fmt.Errorf("first heartbeat request = %s, %v", message.Type, err)
 			return
 		}
-		_, err = reader.ReadVersion(shimwire.V3)
-		peerDone <- err
+		first, err := shimwire.DecodeHeartbeat(message.Body)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		<-releaseLateReceipt
+		late, _ := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{
+			Generation: first.Generation, AckedSeq: first.AckedSeq, Phase: shimwire.PhaseRunning,
+		})
+		if err := writer.WriteVersion(shimwire.V3, shimwire.TypeHeartbeat, late); err != nil {
+			peerDone <- err
+			return
+		}
+		// The retry: answered promptly, proving the stream survived the stall.
+		message, err = reader.ReadVersion(shimwire.V3)
+		if err != nil || message.Type != shimwire.TypeHeartbeat {
+			peerDone <- fmt.Errorf("retried heartbeat request = %s, %v", message.Type, err)
+			return
+		}
+		retried, err := shimwire.DecodeHeartbeat(message.Body)
+		if err != nil {
+			peerDone <- err
+			return
+		}
+		receipt, _ := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{
+			Generation: retried.Generation, AckedSeq: retried.AckedSeq, Phase: shimwire.PhaseRunning,
+		})
+		peerDone <- writer.WriteVersion(shimwire.V3, shimwire.TypeHeartbeat, receipt)
 	}()
+
 	started := time.Now()
 	err := controller.Heartbeat(1)
-	if err == nil || !strings.Contains(err.Error(), "timed out") || time.Since(started) < 5*time.Second {
-		t.Fatalf("heartbeat timeout = %v after %s", err, time.Since(started))
+	if !errors.Is(err, ErrHeartbeatReceiptPending) {
+		t.Fatalf("heartbeat with an unanswered receipt = %v, want ErrHeartbeatReceiptPending", err)
 	}
+	if waited := time.Since(started); waited < heartbeatReceiptWaitBound {
+		t.Fatalf("heartbeat reported the receipt pending after %s, want at least the %s wait bound",
+			waited, heartbeatReceiptWaitBound)
+	}
+	// THE POINT: the shim connection is still up. A closed one here is the
+	// measured regression, and every later assertion would be unreachable.
 	select {
 	case <-controller.closing:
-	case <-time.After(time.Second):
-		t.Fatal("heartbeat timeout did not enter closed state")
+		t.Fatal("a pending persistence receipt dropped the shim connection")
+	case <-controller.Done():
+		t.Fatal("a pending persistence receipt ended the controller read loop")
+	default:
 	}
-	_ = clientConn.Close()
-	<-controller.Done()
-	if err := <-peerDone; err == nil {
-		t.Fatal("heartbeat timeout left peer transport open")
+
+	// The late receipt is the answer to a heartbeat this controller really
+	// sent; consuming it must not be read as an unsolicited frame.
+	close(releaseLateReceipt)
+
+	if err := controller.Heartbeat(2); err != nil {
+		t.Fatalf("heartbeat retried after a pending receipt: %v", err)
+	}
+	if err := <-peerDone; err != nil {
+		t.Fatalf("peer transport: %v", err)
 	}
 }
 

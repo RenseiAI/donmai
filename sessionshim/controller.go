@@ -214,7 +214,27 @@ type Controller struct {
 	heartbeatCallMu sync.Mutex
 	heartbeatMu     sync.Mutex
 	heartbeatCall   *heartbeatCall
+	// pendingReceipts records, oldest first, the heartbeats whose persistence
+	// receipt has not arrived within the wait bound. The connection is NOT
+	// dropped for one — see ErrHeartbeatReceiptPending — so a receipt that lands
+	// late has to be recognised as the answer to a heartbeat this controller
+	// really sent, rather than as the unsolicited frame that WOULD be a reason
+	// to drop. Bounded by controllerPendingReceiptLimit: an unbounded ledger of
+	// answers that never came is a leak, and the oldest one is the one least
+	// likely to still be in flight.
+	pendingReceipts []heartbeatCorrelation
 }
+
+// heartbeatCorrelation is the exact pair a persistence receipt must echo. The
+// phase is deliberately absent: the request carries none and the receipt
+// carries the shim's current one, so including it would never match.
+type heartbeatCorrelation struct {
+	generation shimwire.Generation
+	ackedSeq   uint64
+}
+
+// controllerPendingReceiptLimit bounds the outstanding-receipt ledger.
+const controllerPendingReceiptLimit = 8
 
 type heartbeatCall struct {
 	expected shimwire.HeartbeatMsg
@@ -709,24 +729,72 @@ func (c *Controller) Heartbeat(ackedSeq uint64) error {
 		return errors.New("sessionshim: selected-v3 heartbeat already pending")
 	}
 	c.heartbeatCall = call
+	// A retry that re-sends the SAME correlation reclaims it: the outstanding
+	// entry and this call are the same question, and leaving the entry in place
+	// would let the answer be swallowed as a late receipt while the live call
+	// waited out its bound for a reply that already arrived.
+	c.consumePendingHeartbeatReceiptLocked(heartbeat)
 	c.heartbeatMu.Unlock()
 	if err := c.w.WriteVersion(c.selected, shimwire.TypeHeartbeat, body); err != nil {
 		c.clearHeartbeatCall(call)
 		return err
 	}
-	timer := time.NewTimer(5 * time.Second)
+	timer := time.NewTimer(heartbeatReceiptWaitBound)
 	defer timer.Stop()
 	select {
 	case result := <-call.done:
 		return result.err
 	case <-timer.C:
+		// A receipt that has not arrived within the bound is a statement about
+		// how fast the durable side is answering, NOT about whether this
+		// connection works. Dropping the connection here cost two healthy seats
+		// on an installed host: the shims lost their controllers, nothing
+		// re-adopted them, and they reaped their own harnesses on the orphan
+		// deadline — over a persistence step that was merely slow. The cursor
+		// still must not claim a sequence the shim did not store, so the caller
+		// gets a distinguishable retryable failure and the stream stays up.
 		c.clearHeartbeatCall(call)
-		c.closeStream("durable heartbeat receipt timed out", nil)
-		return errors.New("sessionshim: selected-v3 heartbeat persistence receipt timed out")
+		c.rememberPendingHeartbeatReceipt(heartbeat)
+		c.log().Warn("sessionshim: durable heartbeat receipt is still pending; keeping the shim connection and retrying",
+			"session", c.id.String(), "selected", c.selected,
+			"ackedSeq", heartbeat.AckedSeq, "waited", heartbeatReceiptWaitBound)
+		return fmt.Errorf("%w: acked sequence %d", ErrHeartbeatReceiptPending, heartbeat.AckedSeq)
 	case <-c.done:
 		c.clearHeartbeatCall(call)
 		return io.EOF
 	}
+}
+
+// rememberPendingHeartbeatReceipt records one outstanding correlation so a late
+// receipt is consumed rather than treated as unsolicited.
+func (c *Controller) rememberPendingHeartbeatReceipt(sent shimwire.HeartbeatMsg) {
+	correlation := heartbeatCorrelation{generation: sent.Generation, ackedSeq: sent.AckedSeq}
+	c.heartbeatMu.Lock()
+	defer c.heartbeatMu.Unlock()
+	for _, pending := range c.pendingReceipts {
+		if pending == correlation {
+			return
+		}
+	}
+	c.pendingReceipts = append(c.pendingReceipts, correlation)
+	if len(c.pendingReceipts) > controllerPendingReceiptLimit {
+		c.pendingReceipts = c.pendingReceipts[len(c.pendingReceipts)-controllerPendingReceiptLimit:]
+	}
+}
+
+// consumePendingHeartbeatReceiptLocked reports whether receipt answers a
+// heartbeat whose receipt this controller already stopped waiting for, and
+// forgets it when it does. c.heartbeatMu must be held.
+func (c *Controller) consumePendingHeartbeatReceiptLocked(receipt shimwire.HeartbeatMsg) bool {
+	correlation := heartbeatCorrelation{generation: receipt.Generation, ackedSeq: receipt.AckedSeq}
+	for i, pending := range c.pendingReceipts {
+		if pending != correlation {
+			continue
+		}
+		c.pendingReceipts = append(c.pendingReceipts[:i], c.pendingReceipts[i+1:]...)
+		return true
+	}
+	return false
 }
 
 func (c *Controller) clearHeartbeatCall(call *heartbeatCall) {
@@ -1008,6 +1076,20 @@ func (c *Controller) readLoop() {
 
 func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error {
 	c.heartbeatMu.Lock()
+	// A receipt for a heartbeat this controller gave up waiting for is LATE,
+	// not unsolicited — and it is not the answer to whatever call is live now
+	// either. Consuming it is what makes ErrHeartbeatReceiptPending safe: the
+	// stream survives the stall, and a live retry keeps waiting for its own
+	// answer. (A retry that re-sent the same correlation already reclaimed the
+	// outstanding entry, so it resolves here as the live call, not as a late
+	// one.)
+	if c.consumePendingHeartbeatReceiptLocked(receipt) {
+		c.heartbeatMu.Unlock()
+		if !receipt.Phase.Known() {
+			return errors.New("sessionshim: late selected-v3 heartbeat receipt carried an unknown phase")
+		}
+		return nil
+	}
 	call := c.heartbeatCall
 	if call == nil {
 		c.heartbeatMu.Unlock()
@@ -1142,6 +1224,24 @@ var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded th
 // leave the lineage in reconciliation quarantine until some later surface
 // happens to look.
 var ErrShimExited = errors.New("sessionshim: shim refused: terminal proof is already published")
+
+// heartbeatReceiptWaitBound is how long Heartbeat waits for a selected-v3
+// persistence receipt before reporting the receipt PENDING. It bounds one
+// caller's wait; it is not a health verdict on the connection.
+const heartbeatReceiptWaitBound = 5 * time.Second
+
+// ErrHeartbeatReceiptPending reports that a selected-v3 durable heartbeat's
+// persistence receipt had not arrived within heartbeatReceiptWaitBound.
+//
+// It is a sentinel rather than a message because the distinction is the whole
+// fix: a receipt that is merely SLOW says nothing about whether this connection
+// works, and dropping the shim's controller over one costs a live harness its
+// supervision. The cursor still must not advance — the shim has not said it
+// stored that sequence — so the caller keeps the connection, treats the
+// acknowledgement as outstanding, and retries with backoff. A receipt that
+// arrives after the wait is consumed as the answer it is, never as an
+// unsolicited frame.
+var ErrHeartbeatReceiptPending = errors.New("sessionshim: durable heartbeat persistence receipt is still pending")
 
 // eventBacklog is the bounded hand-off between the socket reader and the
 // consumer, accounted in payload bytes rather than frames.
