@@ -437,6 +437,16 @@ func providerPinEnv(spec agent.Spec) []string {
 			model = ep.Model
 		}
 	}
+	if _, bare, ok := splitBuiltinProviderPin(model); ok {
+		// The injected "donmai" provider's registered model.id must always
+		// be bare — whichever routing modelPinArgs chose for
+		// --provider/--model (pi's own built-in provider natively, or this
+		// injected one), a "<builtin-provider>/" prefix is pi's OWN --model
+		// syntax, not a wire model code; passing it through verbatim as
+		// this provider's model.id is exactly the bug this package fixes
+		// (the upstream API rejects the prefixed string with a 400).
+		model = bare
+	}
 	out := []string{
 		piBaseURLEnvVar + "=" + baseURL,
 		piAPIEnvVar + "=" + api,

@@ -123,19 +123,62 @@ func modelPinArgs(spec agent.Spec) []string {
 	if spec.Model == "" {
 		return nil
 	}
-	modelArg := spec.Model
+	provider, bareModel, useNative := nativeProviderPin(spec.Model, spec.Endpoint)
+	modelArg := bareModel
 	if lvl := thinkingLevelForEffort(spec.Effort); lvl != "" {
 		modelArg += ":" + lvl
 	}
-	if spec.Endpoint != nil && spec.Endpoint.BaseURL != "" {
+	switch {
+	case useNative:
+		// The pin names one of pi's built-in providers and this cell is
+		// not a translating loopback gateway — select that provider
+		// NATIVELY with the bare model id (BYOK: applyEndpoint's
+		// credential mirror below put the resolved key on the provider's
+		// own env var) instead of routing through the injected "donmai"
+		// provider, which would otherwise receive the prefixed string
+		// verbatim as a wire model code (the exact upstream 400 this
+		// package fixes).
+		return []string{"--provider", provider, "--model", modelArg}
+	case spec.Endpoint != nil && spec.Endpoint.BaseURL != "":
 		return []string{"--provider", pinnedProviderName, "--model", modelArg}
+	default:
+		return []string{"--model", modelArg}
 	}
-	return []string{"--model", modelArg}
 }
 
 // pinnedProviderName is the provider name the policy extension registers from
 // env and the harness pins the model against (design §6).
 const pinnedProviderName = "donmai"
+
+// nativeProviderPin classifies model against pi's built-in-provider allowlist
+// (builtin_providers.go) and, together with the endpoint's serving host,
+// decides whether the pin should route NATIVELY through that built-in
+// provider (BYOK: bare model id, credential on the provider's own env var —
+// modelPinArgs' first branch, applyEndpoint's credential mirror) or stay on
+// the injected "donmai" provider (metered/gateway modes: HostGateway's
+// loopback baseURL is not any built-in provider's own endpoint, so selecting
+// one natively would silently bypass the gateway instead of routing through
+// it).
+//
+// Requirement 1's two sentences map exactly onto this function's two
+// "recognized" outcomes: ok-and-useNative is "pass the pin so pi selects
+// that built-in provider … BYOK"; ok-and-not-useNative is "when the
+// injected provider must carry the credential (metered/gateway modes),
+// register the bare <model> id under it". Either way bareModel is stripped
+// of the "<provider>/" prefix — providerPinEnv (extension.go) applies the
+// same strip unconditionally, since the injected provider stays registered,
+// and may still be selected, regardless of useNative. When model does not
+// have the "<builtin-provider>/" shape at all, provider is "" and bareModel
+// is model unchanged — the unprefixed-pin behavior (e.g. "claude-opus-4-8",
+// "gpt-5.4") is byte-identical to before this function existed.
+func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareModel string, useNative bool) {
+	provider, bareModel, ok := splitBuiltinProviderPin(model)
+	if !ok {
+		return "", model, false
+	}
+	gateway := ep != nil && ep.Host == agent.HostGateway
+	return provider, bareModel, !gateway
+}
 
 // composeChildEnv builds the child process env with the env-hygiene posture
 // design §5.3 requires: because pi runs tools with the FULL permissions of the
@@ -309,6 +352,25 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	if _, ok := env[PiKeyEnvVar]; !ok {
 		if key := pickAPIKey(ep.Env); key != "" {
 			env[PiKeyEnvVar] = key
+		}
+	}
+
+	// BYOK credential routing (requirement 1's "route the control-plane
+	// credential to that provider" sentence): when the resolved model names
+	// one of pi's built-in providers and this cell is not a translating
+	// loopback gateway, ALSO mirror the resolved key onto that provider's
+	// own credential env var (builtin_providers.go) — so modelPinArgs'
+	// native "--provider <name>" selection can authenticate without going
+	// through the injected "donmai" provider at all. Additive only:
+	// PiKeyEnvVar above still carries the same value for the injected
+	// provider, which stays registered (harmless if unused) either way.
+	if provider, _, useNative := nativeProviderPin(spec.Model, ep); useNative {
+		if envVar, known := builtinProviderCredentialEnv[provider]; known {
+			if _, already := env[envVar]; !already {
+				if key := pickAPIKey(ep.Env); key != "" {
+					env[envVar] = key
+				}
+			}
 		}
 	}
 	spec.Env = env

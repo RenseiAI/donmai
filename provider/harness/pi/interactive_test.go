@@ -105,6 +105,17 @@ func flagValue(argv []string, flag string) (string, bool) {
 // consumes the binding from birth. RED proof: remove the modelPinArgs(spec) call
 // from interactiveArgs, or move applyEndpoint back inside launch, and the pin
 // argv/env vanish from the child.
+//
+// The catalog slug deliberately uses a "agg-vendor/" prefix that is NOT one
+// of pi's built-in providers (builtin_providers.go): this fixture is an
+// aggregator's OWN naming convention riding a Host:direct + external
+// BaseURL binding that must be preserved verbatim — nativeProviderPin
+// (spec_translation.go) only reroutes a RECOGNIZED built-in-provider prefix.
+// See builtin_providers_test.go for that split and
+// spec_translation_test.go's TestNativeProviderPin /
+// TestModelPinArgs_NativeBuiltinProviderRouting for the case where the
+// prefix IS recognized and this cell's BaseURL is correctly NOT the one
+// consulted.
 func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 	workdir := t.TempDir()
 	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
@@ -118,7 +129,7 @@ func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 			// openai-chat dialect surface, the model named by the full catalog
 			// slug, the key riding the binding env.
 			Company:  agent.CompanyAnthropic,
-			Model:    "anthropic/claude-3-haiku",
+			Model:    "agg-vendor/claude-3-haiku",
 			Protocol: agent.ProtoOpenAIChat,
 			Host:     agent.HostDirect,
 			BaseURL:  "https://ai-gateway.invalid/v1",
@@ -139,7 +150,7 @@ func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 		t.Errorf("--provider = %q (present=%v), want %q; argv: %q", provider, hasProvider, pinnedProviderName, argv)
 	}
 	model, hasModel := flagValue(argv, "--model")
-	if !hasModel || model != "anthropic/claude-3-haiku" {
+	if !hasModel || model != "agg-vendor/claude-3-haiku" {
 		t.Errorf("--model = %q (present=%v), want the endpoint slug; argv: %q", model, hasModel, argv)
 	}
 	// Session-isolation posture: the embedded extension is loaded explicitly and
@@ -155,7 +166,7 @@ func TestSpawn_Interactive_PinArgvAndEnvFromBinding(t *testing.T) {
 	for _, want := range []string{
 		"DONMAI_PI_BASE_URL=https://ai-gateway.invalid/v1",
 		"DONMAI_PI_API=openai-completions",
-		"DONMAI_PI_MODEL=anthropic/claude-3-haiku",
+		"DONMAI_PI_MODEL=agg-vendor/claude-3-haiku",
 		"DONMAI_PI_KEY=gw-secret",
 	} {
 		if !strings.Contains(env, want) {
@@ -228,7 +239,7 @@ func TestSpawn_Interactive_DonmaiPiKeyMirrorSurvivesPreset(t *testing.T) {
 		Env:         map[string]string{PiKeyEnvVar: "snapshot-key-wins"},
 		Endpoint: &agent.EndpointBinding{
 			Company:  agent.CompanyAnthropic,
-			Model:    "anthropic/claude-3-haiku",
+			Model:    "agg-vendor/claude-3-haiku",
 			Protocol: agent.ProtoOpenAIChat,
 			Host:     agent.HostDirect,
 			BaseURL:  "https://ai-gateway.invalid/v1",
@@ -266,7 +277,7 @@ func TestInteractiveChildEnv_OmitsHandshakeTokenVsHeadless(t *testing.T) {
 		Cwd: cwd,
 		Env: map[string]string{PiKeyEnvVar: "k"},
 		Endpoint: &agent.EndpointBinding{
-			Model: "anthropic/claude-3-haiku", Protocol: agent.ProtoOpenAIChat,
+			Model: "agg-vendor/claude-3-haiku", Protocol: agent.ProtoOpenAIChat,
 			Host: agent.HostDirect, BaseURL: "https://ai-gateway.invalid/v1",
 		},
 	}
@@ -453,7 +464,7 @@ func TestSpawn_Interactive_RealBinary_NoUIArtifact(t *testing.T) {
 		Cwd:         workdir,
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24, RecordPath: cast},
 		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyAnthropic, Model: "anthropic/claude-3-haiku",
+			Company: agent.CompanyAnthropic, Model: "agg-vendor/claude-3-haiku",
 			Protocol: agent.ProtoOpenAIChat, Host: agent.HostDirect,
 			BaseURL: "https://ai-gateway.invalid/v1",
 			Env:     map[string]string{"OPENAI_API_KEY": "gw-secret"},
