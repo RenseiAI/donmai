@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -100,11 +101,13 @@ func runCodexFakeNamedAppServer() {
 		os.Exit(3)
 	}
 
+	hub := &fakeNamedAppServerHub{}
 	handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		conn, err := websocket.Accept(w, r, nil)
 		if err != nil {
 			return
 		}
+		hub.add(conn)
 		defer func() { _ = conn.CloseNow() }()
 		ctx := context.Background()
 		for {
@@ -128,10 +131,86 @@ func runCodexFakeNamedAppServer() {
 					writeStderr()
 					os.Exit(1)
 				}
+			case "thread/start":
+				// Fresh-session shape (interactive.go's spawnNamedInteractivePTY):
+				// the PTY's OWN connection sends this once it attaches with bare
+				// --remote; the response goes back to IT, and the notification
+				// broadcasts to every open connection (the diagnostic one is what
+				// awaitAndNameLiveThreadWithRequest is waiting on).
+				threadID := fakeNamedAppServerThreadID
+				result, _ := json.Marshal(map[string]any{"thread": map[string]any{"id": threadID}})
+				body, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: result})
+				if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
+					return
+				}
+				notifyBody, _ := json.Marshal(rpcRequest{
+					JSONRPC: "2.0", Method: "thread/started",
+					Params: map[string]any{"thread": map[string]any{"id": threadID}},
+				})
+				hub.broadcast(ctx, notifyBody)
+			case "thread/name/set":
+				var params struct {
+					Name string `json:"name"`
+				}
+				_ = json.Unmarshal(inbound.Params, &params)
+				hub.setName(params.Name)
+				body, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: json.RawMessage(`{}`)})
+				if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
+					return
+				}
+			case "thread/read":
+				result, _ := json.Marshal(map[string]any{
+					"thread": map[string]any{"id": fakeNamedAppServerThreadID, "name": hub.name()},
+				})
+				body, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: result})
+				if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
+					return
+				}
 			}
 		}
 	})
 	_ = (&http.Server{Handler: handler, ReadHeaderTimeout: 5 * time.Second}).Serve(listener)
+}
+
+// fakeNamedAppServerThreadID is the fixed thread id runCodexFakeNamedAppServer
+// hands out for the one thread its "thread/start" case ever creates.
+const fakeNamedAppServerThreadID = "thread-fresh-fixture"
+
+// fakeNamedAppServerHub broadcasts to every websocket connection currently
+// open on one fake bootstrap app-server process — standing in for the real
+// app-server's own fan-out from one PTY-created thread to every other
+// connection (the diagnostic bootstrap connection) watching for it.
+type fakeNamedAppServerHub struct {
+	mu    sync.Mutex
+	conns []*websocket.Conn
+	named string
+}
+
+func (h *fakeNamedAppServerHub) add(c *websocket.Conn) {
+	h.mu.Lock()
+	h.conns = append(h.conns, c)
+	h.mu.Unlock()
+}
+
+func (h *fakeNamedAppServerHub) broadcast(ctx context.Context, body []byte) {
+	h.mu.Lock()
+	conns := append([]*websocket.Conn(nil), h.conns...)
+	h.mu.Unlock()
+	for _, c := range conns {
+		_ = c.Write(ctx, websocket.MessageText, body)
+	}
+}
+
+func (h *fakeNamedAppServerHub) setName(name string) {
+	h.mu.Lock()
+	h.named = name
+	h.mu.Unlock()
+}
+
+func (h *fakeNamedAppServerHub) name() string {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	return h.named
 }
 
 // codexFakeNamedAppServerOpts is the fixed Options every test in this file

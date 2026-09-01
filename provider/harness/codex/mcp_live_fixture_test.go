@@ -26,7 +26,7 @@ func TestMain(m *testing.M) {
 		runCodexFakeAppServer()
 		os.Exit(0)
 	}
-	if os.Getenv(codexFakeNamedAppServerEnv) == "1" {
+	if os.Getenv(codexFakeNamedAppServerEnv) == "1" && argvHasFlag(os.Args, "--listen") {
 		runCodexFakeNamedAppServer()
 		os.Exit(0)
 	}
@@ -36,7 +36,42 @@ func TestMain(m *testing.M) {
 		// dropped connection exits 0 and reports nothing wrong.
 		os.Exit(0)
 	}
-	os.Exit(m.Run())
+	if os.Getenv(codexFakePTYClientCreatesThreadEnv) == "1" && argvHasFlag(os.Args, "--remote") {
+		os.Exit(runCodexFakePTYClientCreatesThread())
+	}
+	// Sandbox the plugin-cache host directory (plugin_cache.go) for every
+	// test in this package's normal (non-fixture-role) run: without this,
+	// any test that builds a boundary through New or SpawnInteractive
+	// without itself overriding Options.pluginCacheDir would resolve
+	// resolveCodexPluginCacheDir's default and seed/harvest against this
+	// MACHINE's real ~/.donmai state directory — a real host-state side
+	// effect no test in this suite should ever have. Tests that want to
+	// exercise the reuse mechanism itself pass an explicit hostCacheDir (or
+	// Options.pluginCacheDir) directly and are unaffected by this default.
+	pluginCacheSandbox, sandboxErr := os.MkdirTemp("", "donmai-codex-plugin-cache-test-")
+	if sandboxErr == nil {
+		_ = os.Setenv(codexPluginCacheDirEnv, pluginCacheSandbox)
+	}
+	code := m.Run()
+	if pluginCacheSandbox != "" {
+		_ = os.RemoveAll(pluginCacheSandbox)
+	}
+	os.Exit(code)
+}
+
+// argvHasFlag reports whether flag appears as its own argument anywhere in
+// argv — used to disambiguate the two child roles a single fixture env
+// var pair can select between (the bootstrap app-server's own --listen
+// invocation vs. the PTY's --remote attach), since both processes inherit
+// the same session-scoped env in production and therefore the same fixture
+// env vars in these tests.
+func argvHasFlag(argv []string, flag string) bool {
+	for _, a := range argv {
+		if a == flag {
+			return true
+		}
+	}
+	return false
 }
 
 func runCodexFakeMCPStdio() {

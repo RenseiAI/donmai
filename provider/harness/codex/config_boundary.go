@@ -11,6 +11,7 @@ import (
 
 const (
 	codexHomePrefix       = "donmai-codex-home-"
+	codexConfigFileName   = "config.toml"
 	codexConfigBaseline   = "mcp_servers = {}\n"
 	codexFileAuthConfig   = "cli_auth_credentials_store = \"file\"\n"
 	codexHomeMode         = 0o700
@@ -35,8 +36,13 @@ type codexConfigBoundary struct {
 	// admitting the host's config.toml.
 	hostAuthPath string
 	hostAuthInfo os.FileInfo
-	cleanup      sync.Once
-	cleanupErr   error
+	// pluginCacheDir is set only by enablePluginCacheReuse (plugin_cache.go).
+	// Its zero value ("") means cache reuse was never opted into for this
+	// boundary, and remove() skips the harvest step entirely — the default
+	// for every construction path and test that predates this field.
+	pluginCacheDir string
+	cleanup        sync.Once
+	cleanupErr     error
 }
 
 func newCodexConfigBoundary(tempDir string, fileAuth bool) (*codexConfigBoundary, error) {
@@ -85,7 +91,7 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 		home:       home,
 		parent:     parent,
 		parentInfo: parentInfo,
-		configPath: filepath.Join(home, "config.toml"),
+		configPath: filepath.Join(home, codexConfigFileName),
 	}
 	keep := false
 	defer func() {
@@ -123,6 +129,12 @@ func newCodexConfigBoundaryWithAuthMode(tempDir, authMode string) (*codexConfigB
 	if err := rejectSymlink(b.configPath, false); err != nil {
 		return nil, err
 	}
+	// Record this process as home's owner so a later orphan sweep (see
+	// orphan_sweep.go), possibly running in a fresh daemon after this one is
+	// long gone, can tell a live session apart from an orphan without
+	// guessing from directory age alone. Best-effort — see
+	// writeDonmaiOwnerManifest's doc comment.
+	writeDonmaiOwnerManifest(home)
 	keep = true
 	return b, nil
 }
@@ -308,6 +320,11 @@ func (b *codexConfigBoundary) remove() error {
 			b.cleanupErr = fmt.Errorf("refusing to remove Codex home: %w", err)
 			return
 		}
+		// Harvest whatever this session's own cache/ subtree fetched that the
+		// host-level cache did not already have, so the NEXT session skips
+		// that fetch too. Best-effort and skipped entirely when
+		// enablePluginCacheReuse was never called (pluginCacheDir == "").
+		b.harvestPluginCache()
 		// os.RemoveAll removes a symlink itself rather than following it. The
 		// path is nevertheless Lstat-validated before process start, and its
 		// 0700 mode prevents other users from replacing children.
