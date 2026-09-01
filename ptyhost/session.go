@@ -63,6 +63,13 @@ type Session struct {
 	// it is a deliberately coarse model, but one that can report an empty
 	// line again after an edit rather than latching shut. Guarded by writeMu.
 	compose composeTracker
+	// lastInputWriteAt is the completion time of the most recent PTY-master
+	// input write, from ANY author (human or SYSTEM-attributed) — WriteInput
+	// and WriteAttributedInput both update it. WriteAttributedInput reads it
+	// to decide whether a SYSTEM-attributed bare CR/LF needs systemInputPacingGap
+	// (systeminput.go); an ordinary WriteInput caller never consults it.
+	// Guarded by writeMu.
+	lastInputWriteAt time.Time
 
 	// altActive mirrors the VT's alternate-screen flag for the notice gate.
 	// An atomic rather than a field under s.mu so TryWriteNotice (which holds
@@ -339,20 +346,64 @@ func (s *Session) lastSeqLocked() attachwire.HostSeq { return s.nextSeq - 1 }
 // WriteInput writes already-encoded terminal input bytes verbatim to the PTY
 // master (§5: input is never re-sanitized).
 //
-// This is the ONLY path human keystrokes take — the relay leg
-// (attachclient/inbound.go, attachclient/degraded.go), the standalone local
-// attach (local.go) and the harness seed all funnel here — so it is also
-// where the session observes whether a composition is outstanding. The write
-// itself is unchanged and still verbatim; only the bookkeeping is new.
+// This is the ONLY path human keystrokes take — the standalone local attach
+// (local.go) and the harness seed call it directly; the relay leg
+// (attachclient/inbound.go, attachclient/degraded.go) calls
+// WriteAttributedInput instead, which forwards here verbatim for every
+// userID except the SYSTEM sentinel (see WriteAttributedInput,
+// systeminput.go) — so it is also where the session observes whether a
+// composition is outstanding. The write itself is unchanged and still
+// verbatim; only the bookkeeping is new.
 func (s *Session) WriteInput(p []byte) (int, error) {
 	if s.closedFlag.Load() {
 		return 0, errExited
 	}
 	s.writeMu.Lock()
 	defer s.writeMu.Unlock()
+	return s.writeInputLocked(p)
+}
+
+// WriteAttributedInput is WriteInput plus two last-hop guarantees that apply
+// ONLY when userID identifies the write as SYSTEM-authority — relay-stamped
+// with attachwire.SystemNudgeUserID, the one constant this host and the relay
+// share for that purpose (never a locally hardcoded literal, see
+// systeminput.go):
+//
+//  1. A dangling bracketed-paste region (ptyhost/compose.go: CSI 200~ open,
+//     no CSI 201~ yet) is closed first, so the write's own bytes never land
+//     inside someone else's abandoned paste.
+//  2. A write that is nothing but a bare CR/LF is delayed until at least
+//     systemInputPacingGap has elapsed since the previous PTY write, so the
+//     harness's next read() cannot coalesce it with whatever came right
+//     before it — the exact shape that trips a TUI's paste-detection
+//     heuristic and leaves an operator nudge typed but never submitted.
+//
+// A userID that is not the system sentinel gets exactly WriteInput's
+// behavior: verbatim, immediate, never delayed. Human input is never paced —
+// only a write this host can affirmatively attribute to SYSTEM authority is
+// ever held back.
+func (s *Session) WriteAttributedInput(userID, p []byte) (int, error) {
+	if s.closedFlag.Load() {
+		return 0, errExited
+	}
+	s.writeMu.Lock()
+	defer s.writeMu.Unlock()
+	if !isSystemAttributedInput(userID) {
+		return s.writeInputLocked(p)
+	}
+
+	n, lastWrite, err := writeSystemAttributed(s.ptmx, &s.compose, s.lastInputWriteAt, p)
+	s.lastInputWriteAt = lastWrite
+	return n, err
+}
+
+// writeInputLocked is the verbatim PTY-master write shared by WriteInput and
+// WriteAttributedInput's non-system branch. Callers must hold writeMu.
+func (s *Session) writeInputLocked(p []byte) (int, error) {
 	n, err := s.ptmx.Write(p)
 	if n > 0 && n <= len(p) {
 		s.compose.feed(p[:n])
+		s.lastInputWriteAt = time.Now()
 	}
 	if err != nil {
 		return n, fmt.Errorf("ptyhost: write input: %w", err)

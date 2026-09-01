@@ -54,7 +54,7 @@ func (h *host) applyInput(payload []byte) ([]attachwire.Frame, error) {
 		h.log.Warn("attachclient: dropping unstamped Input (userIdLen==0) — host trust posture §5", "inputSeq", in.InputSeq)
 		return nil, nil
 	}
-	if _, err := h.cfg.Session.WriteInput(in.Data); err != nil {
+	if _, err := writeStampedInput(h.cfg.Session, in.UserID, in.Data); err != nil {
 		return nil, fmt.Errorf("attachclient: writing input to the session: %w", err)
 	}
 	return nil, nil

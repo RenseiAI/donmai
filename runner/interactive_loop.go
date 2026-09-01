@@ -90,6 +90,29 @@ func (a sessAdapter) Subscribe(from attachwire.HostSeq) (attachclient.Subscripti
 	return a.InteractiveSession.Subscribe(from)
 }
 
+// WriteAttributedInput forwards to the embedded session's own
+// WriteAttributedInput when its concrete type implements the OPTIONAL
+// systemAttributedWriter capability (attachclient/session.go) — e.g.
+// *ptyhost.Session, which uses it for last-hop pacing/paste-guard on
+// SYSTEM-attributed input (ptyhost/systeminput.go). This method is what lets
+// attachclient's writeStampedInput reach that capability THROUGH sessAdapter:
+// embedding the agent.InteractiveSession INTERFACE only promotes methods that
+// interface declares, never the dynamic underlying type's full method set, so
+// without this explicit forwarder the assertion in writeStampedInput would
+// always miss even when the real session underneath supports it.
+//
+// A session that does not implement it falls back to plain WriteInput,
+// exactly attachclient's own fallback — this adds no new requirement on any
+// agent.InteractiveSession implementation.
+func (a sessAdapter) WriteAttributedInput(userID, p []byte) (int, error) {
+	if aw, ok := a.InteractiveSession.(interface {
+		WriteAttributedInput(userID, p []byte) (int, error)
+	}); ok {
+		return aw.WriteAttributedInput(userID, p)
+	}
+	return a.InteractiveSession.WriteInput(p)
+}
+
 // dispatchInteractive drives a mode:"interactive" session: it attaches the
 // spawned PTY surface's live byte stream OUTBOUND to the relay and
 // supervises the session until the child exits, ctx cancel / wall-clock

@@ -247,6 +247,45 @@ func TestWriteInputReachesChild(t *testing.T) {
 	}
 }
 
+// TestWriteAttributedInputSystemPacingAndHumanBypass proves the real
+// Session wiring end to end: a human (non-system) userID never triggers
+// systemInputPacingGap even for a bare CR right after another write — "do
+// not delay human input" — while the shared SYSTEM sentinel
+// (attachwire.SystemNudgeUserID) does, landing its CR at least
+// systemInputPacingGap after the write before it. The isolated
+// segment-by-segment behavior is exhaustively covered against a fake writer
+// in systeminput_test.go; this pins the one real *os.File write path that
+// wiring reaches.
+func TestWriteAttributedInputSystemPacingAndHumanBypass(t *testing.T) {
+	orig := systemInputPacingGap
+	systemInputPacingGap = 30 * time.Millisecond
+	t.Cleanup(func() { systemInputPacingGap = orig })
+
+	s := mustSpawn(t, Spec{Command: []string{"cat"}})
+
+	if _, err := s.WriteAttributedInput([]byte("user_01hz3k9xyz"), []byte("x")); err != nil {
+		t.Fatalf("WriteAttributedInput(human text): %v", err)
+	}
+	start := time.Now()
+	if _, err := s.WriteAttributedInput([]byte("user_01hz3k9xyz"), []byte("\r")); err != nil {
+		t.Fatalf("WriteAttributedInput(human CR): %v", err)
+	}
+	if since := time.Since(start); since >= systemInputPacingGap {
+		t.Errorf("human CR waited %v, want < %v (human input must never be delayed)", since, systemInputPacingGap)
+	}
+
+	if _, err := s.WriteAttributedInput([]byte(attachwire.SystemNudgeUserID), []byte("y")); err != nil {
+		t.Fatalf("WriteAttributedInput(system text): %v", err)
+	}
+	start = time.Now()
+	if _, err := s.WriteAttributedInput([]byte(attachwire.SystemNudgeUserID), []byte("\r")); err != nil {
+		t.Fatalf("WriteAttributedInput(system CR): %v", err)
+	}
+	if since := time.Since(start); since < systemInputPacingGap {
+		t.Errorf("system-attributed CR waited only %v, want >= %v", since, systemInputPacingGap)
+	}
+}
+
 // TestResizeEchoAndFraming: an applied resize is echoed as a seq-bearing Resize
 // frame (§8) carrying the exact geometry, and a zero-dimension resize is a
 // framing error.
