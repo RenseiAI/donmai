@@ -290,3 +290,59 @@ func TestSelectedVersionsKeepV1V2ClosedAndAdmitV3HostFrame(t *testing.T) {
 		t.Fatalf("selected v2 accepted HostFrame: %v", err)
 	}
 }
+
+// TestSelectedV4AdmitsAttributedInputWithoutChangingV1V2V3 pins the same
+// additive-only pattern TestSelectedVersionsKeepV1V2ClosedAndAdmitV3HostFrame
+// pins for V3: a NEW capability is a NEW type legal only at the NEW selected
+// version, and every version below it is completely unaffected — including
+// V3's own HostFrame/SnapshotRequest/SnapshotResult, which MUST remain legal
+// at V4 too (V4 is a superset of V3's vocabulary, not a parallel one), or
+// every existing `selected >= V3` call site would silently break the moment
+// negotiation reached V4.
+func TestSelectedV4AdmitsAttributedInputWithoutChangingV1V2V3(t *testing.T) {
+	t.Parallel()
+
+	if TypeAttributedInput.Known() {
+		t.Error("TypeAttributedInput.Known() = true; it is outside the v1-frozen registry")
+	}
+	if TypeAttributedInput.AllowedIn(V1) || TypeAttributedInput.AllowedIn(V2) || TypeAttributedInput.AllowedIn(V3) {
+		t.Fatalf("AttributedInput vocabulary: v1=%v v2=%v v3=%v, want all false",
+			TypeAttributedInput.AllowedIn(V1), TypeAttributedInput.AllowedIn(V2), TypeAttributedInput.AllowedIn(V3))
+	}
+	if !TypeAttributedInput.AllowedIn(V4) {
+		t.Fatal("TypeAttributedInput.AllowedIn(V4) = false, want true")
+	}
+	if !TypeAttributedInput.Mutating() {
+		t.Error("TypeAttributedInput.Mutating() = false; it carries the controller generation fence (§D4)")
+	}
+
+	var buf bytes.Buffer
+	if err := NewWriter(&buf).WriteVersion(V4, TypeAttributedInput, []byte{1}); err != nil {
+		t.Fatalf("v4 WriteVersion(AttributedInput): %v", err)
+	}
+	if _, err := NewReader(bytes.NewReader(buf.Bytes())).ReadVersion(V3); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("selected v3 accepted AttributedInput: %v", err)
+	}
+	buf.Reset()
+	if err := NewWriter(&buf).WriteVersion(V4, TypeAttributedInput, []byte{1}); err != nil {
+		t.Fatalf("v4 WriteVersion(AttributedInput): %v", err)
+	}
+	msg, err := NewReader(bytes.NewReader(buf.Bytes())).ReadVersion(V4)
+	if err != nil || msg.Type != TypeAttributedInput {
+		t.Fatalf("v4 ReadVersion(AttributedInput) = (%+v,%v)", msg, err)
+	}
+
+	// V3's own vocabulary must survive the V4 bump untouched: a HostFrame
+	// write is still legal — and a SnapshotRequest/Result write is still
+	// legal — at the newly negotiated V4, exactly as it was at V3.
+	for _, mt := range []MessageType{TypeHostFrame, TypeSnapshotRequest, TypeSnapshotResult} {
+		if !mt.AllowedIn(V3) || !mt.AllowedIn(V4) {
+			t.Errorf("%s: AllowedIn(V3)=%v AllowedIn(V4)=%v, want both true", mt, mt.AllowedIn(V3), mt.AllowedIn(V4))
+		}
+	}
+	// And the v1-frozen registry (TypeInput included) is legal at V4 too —
+	// an old, unattributed Input write still has somewhere to go.
+	if !TypeInput.AllowedIn(V4) {
+		t.Error("TypeInput.AllowedIn(V4) = false; the v1-frozen registry must remain legal at every later version")
+	}
+}

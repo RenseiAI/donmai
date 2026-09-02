@@ -577,3 +577,51 @@ func DecodeInput(body []byte) (Generation, []byte, error) {
 	}
 	return Generation(binary.BigEndian.Uint64(body[0:8])), body[inputHeaderLen:], nil
 }
+
+// attributedInputHeaderLen is generation(u64) + userIdLen(u16).
+const attributedInputHeaderLen = 8 + 2
+
+// maxAttributedInputUserID bounds the relay-stamped userId this frame can
+// carry — comfortably above any real platform-issued id or the shared SYSTEM
+// sentinel (attachwire.SystemNudgeUserID) — while keeping the length prefix a
+// fixed 2 bytes.
+const maxAttributedInputUserID = 1<<16 - 1
+
+// EncodeAttributedInput frames v4 AttributedInput (TypeAttributedInput, legal
+// only at selected v4+): the fencing generation, then the relay-stamped
+// userId length-prefixed so a decoder never has to guess where it ends and
+// the input bytes begin, then the input bytes verbatim.
+//
+// This is a NEW message type carrying a NEW payload shape — it does not
+// change EncodeInput/DecodeInput or TypeInput's byte-identical selected
+// v1/v2/v3 wire in any way (see the V4 doc in version.go for why: the corpus
+// treats "change what an existing selected version's bytes mean" as the one
+// unacceptable move, and "add a new type at a new selected version" as the
+// compatible one).
+func EncodeAttributedInput(gen Generation, userID, data []byte) ([]byte, error) {
+	if len(userID) > maxAttributedInputUserID {
+		return nil, fmt.Errorf("shimwire: %w: attributed input userId %d bytes, max %d", ErrMalformed, len(userID), maxAttributedInputUserID)
+	}
+	buf := make([]byte, attributedInputHeaderLen+len(userID)+len(data))
+	binary.BigEndian.PutUint64(buf[0:8], uint64(gen))
+	binary.BigEndian.PutUint16(buf[8:10], uint16(len(userID))) //nolint:gosec // G115: bounded by maxAttributedInputUserID above
+	copy(buf[attributedInputHeaderLen:attributedInputHeaderLen+len(userID)], userID)
+	copy(buf[attributedInputHeaderLen+len(userID):], data)
+	return buf, nil
+}
+
+// DecodeAttributedInput splits an AttributedInput body. The returned
+// userID/data slices alias body.
+func DecodeAttributedInput(body []byte) (gen Generation, userID, data []byte, err error) {
+	if len(body) < attributedInputHeaderLen {
+		return 0, nil, nil, fmt.Errorf("shimwire: %w: attributed input body %d bytes, need >= %d", ErrMalformed, len(body), attributedInputHeaderLen)
+	}
+	gen = Generation(binary.BigEndian.Uint64(body[0:8]))
+	userIDLen := int(binary.BigEndian.Uint16(body[8:10]))
+	if len(body) < attributedInputHeaderLen+userIDLen {
+		return 0, nil, nil, fmt.Errorf("shimwire: %w: attributed input declared userId length %d exceeds body", ErrMalformed, userIDLen)
+	}
+	userID = body[attributedInputHeaderLen : attributedInputHeaderLen+userIDLen]
+	data = body[attributedInputHeaderLen+userIDLen:]
+	return gen, userID, data, nil
+}

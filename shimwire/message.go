@@ -27,6 +27,9 @@ const (
 
 	// v3-only. This value remains illegal under selected v1 and v2.
 	TypeHostFrame MessageType = 0x0F // shim -> daemon: request id + exact encoded attach frame
+
+	// v4-only. This value remains illegal under selected v1, v2, and v3.
+	TypeAttributedInput MessageType = 0x10 // daemon -> shim: generation + relay-stamped userId + input bytes
 )
 
 // Known reports whether t is assigned in the frozen v1 vocabulary. It remains
@@ -34,15 +37,23 @@ const (
 func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
 
 // AllowedIn reports whether t belongs to the selected version's closed
-// vocabulary. A v2-capable peer selected at v1 therefore cannot send a v2 type.
+// vocabulary. A v2-capable peer selected at v1 therefore cannot send a v2
+// type. Each version's vocabulary is a SUPERSET of the one before it — V4
+// keeps HostFrame and SnapshotRequest/Result legal exactly as V3 does — so
+// every existing `selected >= V3` (or `>= V2`) call site keeps working
+// unchanged the moment negotiation reaches V4; only the brand-new
+// TypeAttributedInput is exclusive to it.
 func (t MessageType) AllowedIn(version uint32) bool {
 	if t >= TypeHello && t <= TypeError {
-		return version == V1 || version == V2 || version == V3
+		return version == V1 || version == V2 || version == V3 || version == V4
 	}
 	if t == TypeSnapshotRequest || t == TypeSnapshotResult {
-		return version == V2 || version == V3
+		return version == V2 || version == V3 || version == V4
 	}
-	return version == V3 && t == TypeHostFrame
+	if t == TypeHostFrame {
+		return version == V3 || version == V4
+	}
+	return version == V4 && t == TypeAttributedInput
 }
 
 // Mutating reports whether t carries controller authority and therefore MUST
@@ -54,7 +65,7 @@ func (t MessageType) AllowedIn(version uint32) bool {
 // and a per-caller check is exactly where an omission hides.
 func (t MessageType) Mutating() bool {
 	switch t {
-	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest:
+	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest, TypeAttributedInput:
 		return true
 	default:
 		return false
@@ -93,6 +104,8 @@ func (t MessageType) String() string {
 		return "SnapshotResult"
 	case TypeHostFrame:
 		return "HostFrame"
+	case TypeAttributedInput:
+		return "AttributedInput"
 	default:
 		return "Unknown(0x" + hexByte(byte(t)) + ")"
 	}

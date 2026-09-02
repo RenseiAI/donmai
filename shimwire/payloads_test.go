@@ -303,6 +303,88 @@ func TestByteCarryingDecodersRejectShortBodies(t *testing.T) {
 	if _, _, err := DecodeInput([]byte{1, 2, 3}); !errors.Is(err, ErrMalformed) {
 		t.Fatalf("DecodeInput short body = %v, want ErrMalformed", err)
 	}
+	if _, _, _, err := DecodeAttributedInput([]byte{1, 2, 3}); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("DecodeAttributedInput short body = %v, want ErrMalformed", err)
+	}
+}
+
+// TestAttributedInputRoundTrip is item 4's wire round-trip: the new field
+// (userId) present and absent, both surviving a full Encode/Decode cycle
+// byte-for-byte, and TypeInput/EncodeInput/DecodeInput staying completely
+// untouched by the new payload existing alongside them.
+func TestAttributedInputRoundTrip(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name   string
+		gen    Generation
+		userID []byte
+		data   []byte
+	}{
+		{name: "the shared SYSTEM sentinel, a bare CR", gen: 7, userID: []byte(attachwire.SystemNudgeUserID), data: []byte("\r")},
+		{name: "an ordinary human userId, a typed line", gen: 42, userID: []byte("user_01hz3k9xyz"), data: []byte("ls -la\r")},
+		{name: "userId present, empty data", gen: 1, userID: []byte("u"), data: nil},
+		{name: "userId absent (new field not present)", gen: 9, userID: nil, data: []byte("hi")},
+		{name: "both absent", gen: 0, userID: nil, data: nil},
+		{
+			name: "data is arbitrary binary, not re-encoded",
+			gen:  5, userID: []byte("u"),
+			data: []byte{0x00, 0x1b, 0x5b, 0x32, 0x4a, 0xff, 0xfe, 0x80, 0x0a},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			body, err := EncodeAttributedInput(tc.gen, tc.userID, tc.data)
+			if err != nil {
+				t.Fatalf("EncodeAttributedInput: %v", err)
+			}
+			gen, userID, data, err := DecodeAttributedInput(body)
+			if err != nil {
+				t.Fatalf("DecodeAttributedInput: %v", err)
+			}
+			if gen != tc.gen {
+				t.Errorf("gen = %d, want %d", gen, tc.gen)
+			}
+			if !bytes.Equal(userID, tc.userID) {
+				t.Errorf("userID = %q, want %q", userID, tc.userID)
+			}
+			if !bytes.Equal(data, tc.data) {
+				t.Errorf("data = %q, want %q", data, tc.data)
+			}
+		})
+	}
+
+	// TypeInput's own codec is untouched: a plain (unattributed) frame
+	// encoded through the ORIGINAL EncodeInput/DecodeInput pair still round
+	// trips exactly as it always has, independent of AttributedInput existing.
+	raw := []byte("ls -la\r")
+	body := EncodeInput(99, raw)
+	gen, got, err := DecodeInput(body)
+	if err != nil {
+		t.Fatalf("DecodeInput (unchanged): %v", err)
+	}
+	if gen != 99 || !bytes.Equal(got, raw) {
+		t.Fatalf("DecodeInput (unchanged) = (%d,%q), want (99,%q)", gen, got, raw)
+	}
+}
+
+func TestEncodeAttributedInputRejectsOversizedUserID(t *testing.T) {
+	t.Parallel()
+	oversized := make([]byte, maxAttributedInputUserID+1)
+	if _, err := EncodeAttributedInput(1, oversized, nil); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("EncodeAttributedInput(oversized userId) = %v, want ErrMalformed", err)
+	}
+}
+
+func TestDecodeAttributedInputRejectsDeclaredLengthPastBody(t *testing.T) {
+	t.Parallel()
+	// Header claims a userId length that the body does not actually carry.
+	body := make([]byte, attributedInputHeaderLen)
+	body[8] = 0xFF
+	body[9] = 0xFF // userIdLen = 65535, but nothing follows the header
+	if _, _, _, err := DecodeAttributedInput(body); !errors.Is(err, ErrMalformed) {
+		t.Fatalf("DecodeAttributedInput(declared length past body) = %v, want ErrMalformed", err)
+	}
 }
 
 func TestClosedRegistriesRejectUnassignedValues(t *testing.T) {

@@ -1231,6 +1231,26 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 		if _, err := s.sess.WriteInput(data); err != nil {
 			return sendError(ctrl.w, shimwire.CodeExited, "input write failed")
 		}
+	case shimwire.TypeAttributedInput:
+		if ctrl.selected < shimwire.V4 {
+			return sendError(ctrl.w, shimwire.CodeMalformed, "AttributedInput is not legal in selected v1/v2/v3")
+		}
+		gen, userID, data, err := shimwire.DecodeAttributedInput(msg.Body)
+		if err != nil {
+			return sendError(ctrl.w, shimwire.CodeMalformed, "attributed input did not decode")
+		}
+		if !s.authorized(gen) {
+			return sendError(ctrl.w, shimwire.CodeStaleGeneration, "attributed input rejected: stale controller generation")
+		}
+		// The one call site that can identify SYSTEM-authority input at the
+		// PTY write boundary: WriteAttributedInput applies last-hop
+		// pacing/paste-guard (ptyhost/systeminput.go) only when userID is the
+		// shared attachwire.SystemNudgeUserID sentinel — every other userID
+		// (ordinary human input, relay-stamped but not SYSTEM) gets exactly
+		// WriteInput's verbatim, never-delayed write.
+		if _, err := s.sess.WriteAttributedInput(userID, data); err != nil {
+			return sendError(ctrl.w, shimwire.CodeExited, "attributed input write failed")
+		}
 	case shimwire.TypeResize:
 		rz, err := shimwire.DecodeResize(msg.Body)
 		if err != nil {

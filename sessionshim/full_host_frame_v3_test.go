@@ -50,8 +50,12 @@ func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
 		_ = shim.Terminate(ctx)
 		_ = shim.Close()
 	})
-	if fixture.controller.SelectedVersion() != shimwire.V3 || !fixture.controller.SupportsFullHostFrames() {
-		t.Fatalf("selected/capability = v%d/%v", fixture.controller.SelectedVersion(), fixture.controller.SupportsFullHostFrames())
+	// Both sides negotiate the highest tier THIS build supports — shimwire.ProtocolMax,
+	// not a version pinned by literal number — so this fixture keeps exercising
+	// the newest full-host-frame tier across a protocol bump (e.g. v3 -> v4)
+	// without an edit here, exactly as SupportsFullHostFrames (>= v3) intends.
+	if fixture.controller.SelectedVersion() != shimwire.ProtocolMax || !fixture.controller.SupportsFullHostFrames() {
+		t.Fatalf("selected/capability = v%d/%v, want v%d/true", fixture.controller.SelectedVersion(), fixture.controller.SupportsFullHostFrames(), shimwire.ProtocolMax)
 	}
 	return fixture
 }
@@ -372,8 +376,8 @@ func TestSelectedV3SlowControllerCannotBlockTerminalTombstone(t *testing.T) {
 	}
 	t.Cleanup(result.Close)
 	controller := result.Adopted[0]
-	if controller.SelectedVersion() != shimwire.V3 {
-		t.Fatalf("selected version = %d, want 3", controller.SelectedVersion())
+	if controller.SelectedVersion() != shimwire.ProtocolMax {
+		t.Fatalf("selected version = %d, want %d", controller.SelectedVersion(), shimwire.ProtocolMax)
 	}
 	if err := controller.WriteInput([]byte("flood\r")); err != nil {
 		t.Fatal(err)

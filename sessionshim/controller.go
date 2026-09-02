@@ -686,6 +686,37 @@ func (c *Controller) WriteInput(data []byte) error {
 	return c.w.Write(shimwire.TypeInput, shimwire.EncodeInput(c.gen, data))
 }
 
+// SupportsAttributedInput reports whether the selected local wire can carry a
+// relay-stamped userId alongside input bytes (shimwire.TypeAttributedInput,
+// v4+). Selected v1/v2/v3 controllers never negotiate it — WriteAttributedInput
+// degrades to WriteInput's exact byte-identical unattributed send for them.
+func (c *Controller) SupportsAttributedInput() bool { return c.selected >= shimwire.V4 }
+
+// WriteAttributedInput sends input bytes under this controller's generation,
+// additionally carrying userID — the relay-stamped sender identity (§5 of the
+// wire protocol) — when the selected local wire supports it
+// (SupportsAttributedInput, v4+). It exists so the shim's last-hop
+// pacing/paste-guard for SYSTEM-authority input (ptyhost/systeminput.go,
+// attachwire.SystemNudgeUserID) can be applied at the true PTY write boundary
+// instead of only on the composition paths that talk to ptyhost directly.
+//
+// A shim negotiated below v4 cannot decode the attribution field — sending it
+// anyway would either desync the wire or be silently misinterpreted as input
+// bytes, neither acceptable — so this falls back to the exact byte-identical
+// WriteInput send those shims have always received. The write still lands,
+// verbatim; only the last-hop guarantee is unavailable there, exactly like an
+// old selected-v2 shim never receiving HostFrame.
+func (c *Controller) WriteAttributedInput(userID, data []byte) error {
+	if !c.SupportsAttributedInput() {
+		return c.WriteInput(data)
+	}
+	body, err := shimwire.EncodeAttributedInput(c.gen, userID, data)
+	if err != nil {
+		return err
+	}
+	return c.w.WriteVersion(c.selected, shimwire.TypeAttributedInput, body)
+}
+
 // Resize sends authoritative geometry under this controller's generation.
 func (c *Controller) Resize(cols, rows, pxWidth, pxHeight uint32) error {
 	return writeTyped(c.w, shimwire.TypeResize, func() ([]byte, error) {
