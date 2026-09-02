@@ -4,6 +4,10 @@ import (
 	"context"
 	"errors"
 	"io"
+	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 	"time"
@@ -259,4 +263,161 @@ func TestSpawn_NativeRouting_CatalogPreflightAllowsKnownModel(t *testing.T) {
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
 	drain(t, h)
+}
+
+// newFakeCatalogProbeBinary writes an executable bash script standing in for
+// `pi` and returns its path — the same fixture pattern
+// newFakeInteractivePiProvider (interactive_test.go) uses, scoped here to a
+// bare binary path since defaultCatalogProbe takes one directly (no
+// *Provider needed).
+func newFakeCatalogProbeBinary(t *testing.T, script string) string {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("fake-binary fixture is unix-only")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	dir := t.TempDir()
+	bin := filepath.Join(dir, "fake-pi")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\n"+script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+		t.Fatal(err)
+	}
+	return bin
+}
+
+// ambientCredentialAwareFakePi mimics the load-bearing half of pi's OWN
+// documented credential resolution: an entry under $PI_CODING_AGENT_DIR
+// stands in for auth.json (docs/providers.md: "Auth file credentials take
+// priority over environment variables"). It reports the pinned zai/glm-5.3
+// pair present IFF it was handed BOTH a real, isolated agent directory (one
+// that exists but carries no ambient credential file) AND the ZAI_API_KEY
+// env var — echoing the received PI_CODING_AGENT_DIR on its own marker line
+// so the test can assert isolation (non-empty, exists, fresh per call)
+// independently of the credential check.
+const ambientCredentialAwareFakePi = `
+echo "AGENTDIR:$PI_CODING_AGENT_DIR"
+if [ -n "$PI_CODING_AGENT_DIR" ] && [ -d "$PI_CODING_AGENT_DIR" ] && [ -f "$PI_CODING_AGENT_DIR/auth.json" ]; then
+  echo "provider  model"
+  echo "zai       glm-5.3"
+elif [ -n "$ZAI_API_KEY" ]; then
+  echo "provider  model"
+  echo "zai       glm-5.3"
+else
+  echo 'No models matching "zai/glm-5.3"'
+fi
+`
+
+// TestDefaultCatalogProbe_AmbientCredentialCannotSatisfyPreflight is the
+// regression proof for review finding [HIGH] (catalog_preflight.go): before
+// the fix, defaultCatalogProbe let the child inherit whatever
+// PI_CODING_AGENT_DIR the daemon process happened to have (unset ⇒ pi's own
+// default, ~/.pi/agent), so an OPERATOR'S PERSONAL LOGIN for the same
+// provider — an ambient auth.json entry entirely unrelated to this cell —
+// would satisfy pi's own auth check regardless of the cell's OWN BYOK
+// credential. The fixture above models exactly that resolution order (an
+// auth-file-shaped entry under the agent dir wins over the env var); this
+// test proves the isolated, freshly-created, per-call agent dir this
+// package now sets NEVER carries that file, so presence hinges solely on
+// the credential this function explicitly passed — never on anything
+// ambient. RED proof: revert defaultCatalogProbe to not setting
+// PI_CODING_AGENT_DIR at all (or to reusing a fixed/shared directory this
+// test can pre-seed a fake auth.json into) and the "empty credential"
+// case below starts reporting present.
+func TestDefaultCatalogProbe_AmbientCredentialCannotSatisfyPreflight(t *testing.T) {
+	t.Parallel()
+	bin := newFakeCatalogProbeBinary(t, ambientCredentialAwareFakePi)
+
+	// Empty credential: the isolated agent dir is real but carries no
+	// auth.json (fresh MkdirTemp every call), so an ambient credential can
+	// never satisfy this — the fake pi must report absent.
+	raw, err := defaultCatalogProbe(context.Background(), bin, "zai", "glm-5.3", "ZAI_API_KEY", "")
+	if err != nil {
+		t.Fatalf("defaultCatalogProbe(no credential): %v", err)
+	}
+	if catalogHasModel(raw, "zai", "glm-5.3") {
+		t.Errorf("an isolated agent dir with no credential reported the model present; ambient/leftover state must not satisfy the preflight: %q", raw)
+	}
+	agentDir1, ok := catalogProbeAgentDirMarker(raw)
+	if !ok || agentDir1 == "" {
+		t.Fatalf("fake pi did not receive a non-empty PI_CODING_AGENT_DIR: %q", raw)
+	}
+
+	// Real credential: same isolation, but now the explicit env var this
+	// function set carries the resolved key — reports present.
+	raw2, err := defaultCatalogProbe(context.Background(), bin, "zai", "glm-5.3", "ZAI_API_KEY", "resolved-cell-key")
+	if err != nil {
+		t.Fatalf("defaultCatalogProbe(with credential): %v", err)
+	}
+	if !catalogHasModel(raw2, "zai", "glm-5.3") {
+		t.Errorf("a real credential on the explicit env var must satisfy the preflight: %q", raw2)
+	}
+	agentDir2, ok := catalogProbeAgentDirMarker(raw2)
+	if !ok || agentDir2 == "" {
+		t.Fatalf("fake pi did not receive a non-empty PI_CODING_AGENT_DIR: %q", raw2)
+	}
+
+	// Fresh per call — proves this is a throwaway directory minted for this
+	// exact probe, never a shared/reused location a prior call's (or a real
+	// session's) state could bleed into.
+	if agentDir1 == agentDir2 {
+		t.Errorf("PI_CODING_AGENT_DIR was reused across calls (%q); each probe must get its own throwaway directory", agentDir1)
+	}
+
+	// The throwaway directory is cleaned up after the call returns — it
+	// must not accumulate on disk across a fleet's worth of preflights.
+	if _, statErr := os.Stat(agentDir1); !os.IsNotExist(statErr) {
+		t.Errorf("PI_CODING_AGENT_DIR %q still exists after defaultCatalogProbe returned (stat err: %v); it must be removed", agentDir1, statErr)
+	}
+}
+
+// catalogProbeAgentDirMarker extracts the "AGENTDIR:<value>" line
+// ambientCredentialAwareFakePi emits, so tests can assert on the exact
+// PI_CODING_AGENT_DIR value the probe received.
+func catalogProbeAgentDirMarker(raw string) (string, bool) {
+	const prefix = "AGENTDIR:"
+	for _, line := range strings.Split(raw, "\n") {
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix), true
+		}
+	}
+	return "", false
+}
+
+// envDumpingFakePi dumps its ENTIRE received environment (one KEY=VALUE per
+// line) so a test can assert on exactly what did and did not reach it.
+const envDumpingFakePi = `env`
+
+// TestDefaultCatalogProbe_BuildsMinimalEnv_BlocklistedVarNeverReachesChild is
+// the regression proof for review finding [MEDIUM]: defaultCatalogProbe must
+// build the child's env from an explicit, minimal base rather than
+// `append(os.Environ(), …)`, which would hand the probe the daemon's FULL
+// env — including any AgentEnvBlocklist-covered credential
+// (runtime/env/composer.go) present in the parent process — bypassing the
+// exact boundary composeChildEnv exists to enforce for a real spawn. RED
+// proof: revert the env construction to `cmd.Env = append(os.Environ(), …)`
+// and the blocklisted canary below starts appearing in the child's env.
+func TestDefaultCatalogProbe_BuildsMinimalEnv_BlocklistedVarNeverReachesChild(t *testing.T) {
+	// Not parallel: mutates process env (t.Setenv).
+	const canary = "sk-host-canary-must-not-reach-probe"
+	t.Setenv("ANTHROPIC_API_KEY", canary) // AgentEnvBlocklist-covered (runtime/env/composer.go)
+
+	bin := newFakeCatalogProbeBinary(t, envDumpingFakePi)
+	raw, err := defaultCatalogProbe(context.Background(), bin, "zai", "glm-5.3", "ZAI_API_KEY", "resolved-cell-key")
+	if err != nil {
+		t.Fatalf("defaultCatalogProbe: %v", err)
+	}
+	if strings.Contains(raw, canary) {
+		t.Errorf("blocklisted host credential leaked into the catalog-preflight probe's env: %q", raw)
+	}
+	// Positive control: the minimal env this function DOES build must still
+	// carry the explicit credential and the isolated agent dir — an
+	// over-aggressively minimal env would silently break the preflight
+	// instead of leaking a secret.
+	if !strings.Contains(raw, "ZAI_API_KEY=resolved-cell-key") {
+		t.Errorf("probe env missing the explicit credential var: %q", raw)
+	}
+	if !strings.Contains(raw, piCodingAgentDirEnvVar+"=") {
+		t.Errorf("probe env missing %s: %q", piCodingAgentDirEnvVar, raw)
+	}
 }

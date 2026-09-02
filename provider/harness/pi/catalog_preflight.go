@@ -3,6 +3,7 @@ package pi
 import (
 	"context"
 	"fmt"
+	"log/slog"
 	"os"
 	"os/exec"
 	"strings"
@@ -39,16 +40,55 @@ type catalogProbeFunc func(ctx context.Context, binary, provider, model, credEnv
 // offlinePostureEnv) keeps the preflight bounded and deterministic: it must
 // answer from pi's already-installed/cached catalog only, never block a
 // spawn on a live catalog refresh.
+//
+// Two isolation properties, both load-bearing (found in review):
+//
+//   - Credential isolation. pi's own resolution order puts an auth.json
+//     entry ABOVE an environment variable (docs/providers.md: "Auth file
+//     credentials take priority over environment variables"). A bare
+//     exec.Command would inherit whatever PI_CODING_AGENT_DIR the daemon
+//     process happens to have (unset ⇒ pi's own default, ~/.pi/agent) — so
+//     an OPERATOR'S PERSONAL LOGIN for the same provider (an ambient
+//     auth.json entry entirely unrelated to this cell) would satisfy pi's
+//     own auth check regardless of credEnvValue, reporting the model
+//     "present" even when the cell's OWN BYOK credential is empty or wrong.
+//     defaultCatalogProbe therefore points PI_CODING_AGENT_DIR at a
+//     throwaway, freshly-created, per-call directory — never the real
+//     ~/.pi/agent, never any session's real agentHome — so the ONLY
+//     credential source pi can resolve for this probe is the env var this
+//     function explicitly sets.
+//   - Env-hygiene parity. The child env is built from a MINIMAL, explicit
+//     base (PATH, HOME, TMPDIR, the isolated agent dir, and the single
+//     resolved credential var) rather than inheriting the full parent
+//     process env (os.Environ()): the daemon process may carry ambient
+//     credentials for OTHER providers/companies that composeChildEnv's
+//     AgentEnvBlocklist (runtime/env/composer.go) exists specifically to
+//     keep out of a harness child. A read-only preflight probe must honor
+//     the same boundary, not bypass it via a wider default.
 func defaultCatalogProbe(ctx context.Context, binary, provider, model, credEnvVar, credEnvValue string) (string, error) {
+	agentDir, err := os.MkdirTemp("", "donmai-pi-catalog-probe-*")
+	if err != nil {
+		return "", fmt.Errorf("pi --list-models: create isolated agent dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(agentDir) }()
+
+	env := []string{
+		"PATH=" + os.Getenv("PATH"),
+		"HOME=" + os.Getenv("HOME"),
+		"TMPDIR=" + os.TempDir(),
+		piCodingAgentDirEnvVar + "=" + agentDir,
+	}
+	if credEnvVar != "" && credEnvValue != "" {
+		env = append(env, credEnvVar+"="+credEnvValue)
+	}
+
 	// nolint:gosec // G204: binary is the resolved-from-PATH path New() also
 	// uses to exec `pi --mode rpc`; --list-models is a read-only query, and
 	// provider/model are this package's own already-classified strings
 	// (builtin_providers.go's allowlist + the pin split), never raw
 	// caller-supplied shell text.
 	cmd := exec.CommandContext(ctx, binary, "--list-models", provider+"/"+model, "--offline")
-	if credEnvVar != "" && credEnvValue != "" {
-		cmd.Env = append(os.Environ(), credEnvVar+"="+credEnvValue)
-	}
+	cmd.Env = env
 	out, err := cmd.Output()
 	if err != nil {
 		return "", fmt.Errorf("pi --list-models: %w", err)
@@ -125,7 +165,12 @@ func (p *Provider) preflightCatalogCheck(ctx context.Context, probe catalogProbe
 	defer cancel()
 	raw, err := probe(pctx, p.binary, provider, model, credEnvVar, credEnvValue)
 	if err != nil {
-		// Unverifiable, not fatal — see doc comment (DEC-2 precedent).
+		// Unverifiable, not fatal — see doc comment (DEC-2 precedent). Still
+		// logged (not swallowed silently): an unsupported `--list-models`/
+		// `--offline` flag on some future pi release, or any other probe
+		// failure, should be visible to an operator even though it does not
+		// block this spawn.
+		slog.Warn("pi catalog preflight probe failed; proceeding unverified", "provider", provider, "model", model, "error", err)
 		return nil
 	}
 	if catalogHasModel(raw, provider, model) {

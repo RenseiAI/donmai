@@ -22,11 +22,14 @@ import "strings"
 // preflight is to catch this map drifting from a real pi install rather than
 // trusting it silently. Deliberately scoped to providers.md's plain
 // API-key table only — OAuth/subscription-only providers (openai-codex,
-// github-copilot, google-vertex, radius, …) and llama.cpp have no static env
-// var to route a BYOK credential through, so a "<name>/<model>" pin using
-// one of those prefixes is left unsplit (falls through to the injected
-// "donmai" provider, or is treated as an opaque unprefixed model id) rather
-// than guessed at.
+// github-copilot, google-vertex, …) and llama.cpp have no static env var to
+// route a BYOK credential through, so a "<name>/<model>" pin using one of
+// those prefixes is left unsplit (falls through to the injected "donmai"
+// provider, or is treated as an opaque unprefixed model id) rather than
+// guessed at. Radius (below) is a genuine exception to that OAuth-only
+// pattern: docs/providers.md documents it as BOTH an OAuth subscription
+// (`/login radius`) AND a plain API-key credential (`RADIUS_API_KEY`), so it
+// keeps its entry in this map.
 //
 // Keep in sync with docs/providers.md when the pi version pin
 // (probe.go PinnedVersion) moves; builtin_providers_test.go documents the
