@@ -1602,24 +1602,18 @@ func (s *Shim) writeSnapshotMsg(ctrl *controllerConn, snap shimwire.SnapshotMsg)
 // result that was bounded on the way out but stored unbounded would answer the
 // same request id with two different payloads.
 func (s *Shim) boundSnapshotResultBytes(result shimwire.SnapshotResult) (shimwire.SnapshotResult, error) {
+	// The header is fixed-width and the payload is copied verbatim, so the framed
+	// size is arithmetic — no probe encode anywhere on this path, and none at all
+	// in the common case, which then hands writeSnapshotResult the only encode
+	// the request pays for.
 	sizeOf := func(payload []byte) (int, error) {
-		probe := result
-		probe.Bytes = payload
-		body, err := shimwire.EncodeSnapshotResult(probe)
-		if err != nil {
-			return 0, err
-		}
-		return messageBytes(body), nil
+		return shimwire.SnapshotResultMessageBytes(len(payload)), nil
 	}
 	// The overwhelmingly common case answers here, before anything is decoded or
-	// re-encoded: an emit result that already fits is returned with its frame
-	// bytes untouched rather than paying a full DecodeFrame plus Encode round
-	// trip on every snapshot request.
-	size, err := sizeOf(result.Bytes)
-	if err != nil {
-		return shimwire.SnapshotResult{}, err
-	}
-	if size <= shimwire.MaxMessageBytes {
+	// re-encoded: a result that already fits is returned with its bytes untouched
+	// rather than paying a DecodeFrame plus Encode round trip on every snapshot
+	// request.
+	if shimwire.SnapshotResultMessageBytes(len(result.Bytes)) <= shimwire.MaxMessageBytes {
 		return result, nil
 	}
 	if result.Mode == shimwire.SnapshotEmit {

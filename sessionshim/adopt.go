@@ -65,9 +65,11 @@ type AdoptOptions struct {
 	// EventBacklogBudget overrides the per-controller event backlog budget, in
 	// payload bytes. Zero uses EventBacklogBudget.
 	EventBacklogBudget int
-	// EventBacklogStallDeadline overrides how long a controller's socket reader
-	// may stall waiting for its consumer to drain before failing closed. Zero
-	// uses the sessionshim default.
+	// EventBacklogStallDeadline overrides how long a controller's consumer may go
+	// without taking a whole budget's worth of bytes before the controller fails
+	// closed. Zero uses the sessionshim default. Values below the package floor
+	// (which sits above the durable-heartbeat receipt wait bound) are raised to
+	// it rather than honoured — see ControllerOptions.EventBacklogStallDeadline.
 	EventBacklogStallDeadline time.Duration
 
 	// DialTimeout bounds one shim handshake.

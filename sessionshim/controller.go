@@ -123,8 +123,14 @@ type ControllerOptions struct {
 	// up again.
 	EventBacklogBudget int
 	// EventBacklogStallDeadline overrides eventBacklogStallDeadline for this
-	// controller: how long the socket reader may stall waiting for the consumer
-	// to drain before the controller fails closed. Zero uses the default.
+	// controller: how long the consumer may go without taking a whole budget's
+	// worth of bytes before the controller fails closed. Zero uses the default.
+	//
+	// It is clamped up to eventBacklogStallFloor, which sits above
+	// heartbeatReceiptWaitBound. A shorter deadline cannot be configured by any
+	// route: a reader that fails closed while its consumer is still waiting on a
+	// receipt only that reader can deliver severs the carrier through the very
+	// knob meant to tune the back-pressure.
 	EventBacklogStallDeadline time.Duration
 
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
@@ -308,32 +314,60 @@ const (
 // receive a durable heartbeat receipt, so a consumer that has genuinely stopped
 // would park it behind a queue nobody will ever drain. That is what
 // eventBacklogStallDeadline bounds, and only crossing THAT deadline still fails
-// closed.
+// closed. "Stopped" there means measured in bytes taken, not in queue depth: a
+// consumer keeping up at volume against a saturating producer never empties the
+// queue and must never be mistaken for one that has stopped.
 const EventBacklogBudget = ptyhost.DefaultRingBytes
 
-// eventBacklogStallDeadline bounds how long the consumer may fail to CATCH UP —
-// cumulatively, across every push — before the controller fails closed.
+// eventBacklogStallDeadline bounds how long the consumer may fail to make
+// PROGRESS — cumulatively, across every push — before the controller fails
+// closed.
 //
-// It is not a per-call idle timer. The clock starts the first time a push has to
-// wait and is reset in exactly one place: when the queue reaches empty. A
-// consumer that hands back one event every few seconds never empties the queue,
-// so it never resets the clock, and it trips this deadline like any other
-// consumer that has stopped keeping up. A per-call timer would let that consumer
-// hold the socket reader indefinitely: every individual push would return before
-// its own clock expired, heartbeat receipts would only trickle through, and the
-// daemon's cursor acknowledger would loop on ErrHeartbeatReceiptPending forever.
+// It is not a per-call idle timer. A per-call timer measures one caller's
+// patience, which a dribbling consumer resets for free: hand back one event
+// every few seconds and every push returns before its own clock runs out, while
+// the reader stays parked in push essentially forever, heartbeat receipts only
+// trickle through, and the daemon's cursor acknowledger loops on
+// ErrHeartbeatReceiptPending with nothing ever resolving it. So the clock is
+// anchored on the BACKLOG, at the moment the consumer first falls behind.
 //
-// It is deliberately LONGER than heartbeatReceiptWaitBound, and that ordering
-// is load-bearing. The one way a stalled reader can deadlock its own consumer
-// is a consumer that drains events and calls Heartbeat on the same goroutine:
-// it waits for a receipt only the reader can deliver while the reader waits for
-// it to drain. heartbeatReceiptWaitBound breaks that inversion on its own —
-// Heartbeat gives up after 5s with ErrHeartbeatReceiptPending, KEEPS the
-// connection, and the consumer returns to draining — so the deadline only has
-// to outlast it for the stall to resolve itself rather than sever the carrier.
-// Crossing it means the consumer produced no progress at all for half a minute,
-// which is a consumer that has stopped, not a consumer that is behind.
+// What resets it is defined in bytes, not in queue depth — see
+// eventBacklogProgressBytes. Measuring emptiness instead would refuse a consumer
+// that is keeping up perfectly well at volume: a saturating producer means the
+// queue never once reaches zero, so a carrier turning over megabytes a second
+// under a heavy build log would lose its carrier at the deadline. That is the
+// exact failure class this whole mechanism exists to remove, and it would have
+// been reintroduced by the definition of progress rather than by the drop.
+//
+// The deadline is deliberately LONGER than heartbeatReceiptWaitBound, and that
+// ordering is load-bearing — see eventBacklogStallFloor, which enforces it
+// against any override.
 const eventBacklogStallDeadline = 30 * time.Second
+
+// eventBacklogStallFloor is the shortest stall deadline this package will honour,
+// however short an embedder asks for.
+//
+// The one way a stalled reader can deadlock its own consumer is a consumer that
+// drains events and calls Heartbeat on the same goroutine: it waits for a receipt
+// only the reader can deliver while the reader waits for it to drain.
+// heartbeatReceiptWaitBound breaks that inversion on its own — Heartbeat gives up
+// after 5s with ErrHeartbeatReceiptPending, KEEPS the connection, and the consumer
+// returns to draining. A deadline SHORTER than that bound never gives the
+// inversion a chance to resolve: the reader fails closed while the consumer is
+// still waiting on the receipt, and the carrier is severed by the very knob that
+// was supposed to tune the back-pressure. So an override below this floor is
+// raised to it rather than honoured. The slack above the bound is headroom for
+// the consumer to actually resume draining once Heartbeat returns.
+const eventBacklogStallFloor = heartbeatReceiptWaitBound + 2*time.Second
+
+// clampEventBacklogStall applies eventBacklogStallFloor to a configured deadline.
+// Zero means "use the default", which already satisfies the floor.
+func clampEventBacklogStall(stall time.Duration) time.Duration {
+	if stall <= 0 {
+		return eventBacklogStallDeadline
+	}
+	return max(stall, eventBacklogStallFloor)
+}
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
@@ -1336,9 +1370,13 @@ type eventBacklog struct {
 	bytes  int
 	closed bool
 	// stalledSince is when the consumer last failed to keep up: set the first
-	// time a push has to wait, cleared only when pop drains the queue to empty.
-	// It is the anchor of the CUMULATIVE stall deadline — see push.
+	// time a push has to wait, cleared when the consumer makes progress. It is
+	// the anchor of the CUMULATIVE stall deadline — see push.
 	stalledSince time.Time
+	// drainedSinceStall is how many payload bytes pop has handed over since
+	// stalledSince was set. Reaching one budget's worth of them is what counts
+	// as progress; see eventBacklogProgressBytes.
+	drainedSinceStall int
 
 	// budget, stall and abort are immutable after construction; push reads them
 	// without the lock.
@@ -1362,17 +1400,30 @@ func newEventBacklog(budget int, stall time.Duration, abort <-chan struct{}) *ev
 	if budget <= 0 {
 		budget = EventBacklogBudget
 	}
-	if stall <= 0 {
-		stall = eventBacklogStallDeadline
-	}
 	return &eventBacklog{
-		budget:  budget,
-		stall:   stall,
+		budget: budget,
+		// Clamped HERE rather than at the option seam, because this is the one
+		// place every controller passes through: an embedder cannot reach a
+		// deadline below eventBacklogStallFloor by any route.
+		stall:   clampEventBacklogStall(stall),
 		abort:   abort,
 		arrived: make(chan struct{}),
 		drained: make(chan struct{}),
 	}
 }
+
+// eventBacklogProgressBytes is how much the consumer must take before the stall
+// clock is considered answered: one whole budget's worth.
+//
+// The unit is the point. Queue depth cannot express progress — a saturating
+// producer keeps the queue non-empty no matter how fast the consumer runs, so an
+// emptiness test refuses a carrier that is turning over megabytes a second and
+// keeping up fine. Bytes separate the two cases cleanly: a consumer that hands
+// back one small event every few seconds accumulates a rounding error against
+// the budget and is correctly refused, while a consumer moving a budget's worth
+// repeatedly is making exactly the progress this deadline was asking for, and
+// resets the clock every time it does.
+func (b *eventBacklog) progressBytes() int { return b.budget }
 
 // releaseLatch closes the current latch and installs a fresh one, waking every
 // waiter exactly once. b.mu must be held.
@@ -1422,22 +1473,24 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		// The deadline lives on the BACKLOG, not on this call. A per-push timer
 		// measures one caller's patience, which a dribbling consumer resets for
 		// free: hand back one event every few seconds and every push returns
-		// before its own clock runs out while the queue never once empties. The
-		// reader is then parked in push essentially forever, heartbeat receipts
-		// only trickle through, and the fail-closed verdict this deadline exists
-		// to reach is never reached. stalledSince is cleared in exactly one
-		// place — pop, when the queue actually reaches EMPTY — so what is bounded
-		// is the consumer catching up, not any single hand-off.
+		// before its own clock runs out. The reader is then parked in push
+		// essentially forever, heartbeat receipts only trickle through, and the
+		// fail-closed verdict this deadline exists to reach is never reached.
+		// stalledSince is cleared in exactly one place — pop, once the consumer
+		// has taken a budget's worth of BYTES (or emptied the queue outright) —
+		// so what is bounded is the consumer making progress, not any single
+		// hand-off, and not the queue happening to reach zero.
 		if b.stalledSince.IsZero() {
-			b.stalledSince = time.Now()
+			b.stalledSince, b.drainedSinceStall = time.Now(), 0
 		}
 		remaining := b.stall - time.Since(b.stalledSince)
-		stalled := b.stalledSince
+		stalled, drained := b.stalledSince, b.drainedSinceStall
 		room := b.drained
 		b.mu.Unlock()
 		if remaining <= 0 {
-			return fmt.Errorf("%w of %d bytes: the consumer has not caught up for %s",
-				ErrEventBacklogExceeded, b.budget, time.Since(stalled).Round(time.Millisecond))
+			return fmt.Errorf("%w of %d bytes: the consumer took %d bytes in %s, short of the %d it owed",
+				ErrEventBacklogExceeded, b.budget, drained,
+				time.Since(stalled).Round(time.Millisecond), b.progressBytes())
 		}
 		if timer == nil {
 			timer = time.NewTimer(remaining)
@@ -1455,7 +1508,7 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		case <-b.abort:
 			return io.EOF
 		case <-timer.C:
-			return fmt.Errorf("%w of %d bytes: the consumer has not caught up for %s",
+			return fmt.Errorf("%w of %d bytes: the consumer made no budget's worth of progress in %s",
 				ErrEventBacklogExceeded, b.budget, b.stall)
 		}
 	}
@@ -1470,12 +1523,15 @@ func (b *eventBacklog) pop() (ControllerEvent, bool) {
 			b.queue[0] = ControllerEvent{} // let the frame bytes go
 			b.queue = b.queue[1:]
 			b.bytes -= eventBacklogCost(event)
-			if len(b.queue) == 0 {
-				// The consumer caught up. That — and only that — is progress
-				// against the stall deadline; a partial hand-off that leaves the
-				// queue standing is the dribble the cumulative bound exists to
-				// catch.
-				b.stalledSince = time.Time{}
+			if !b.stalledSince.IsZero() {
+				// Progress is measured in bytes taken, plus the degenerate case
+				// where the consumer has drained everything there was. Anything
+				// less than a budget's worth still standing after a full deadline
+				// is the dribble this bound exists to catch.
+				b.drainedSinceStall += eventBacklogCost(event)
+				if len(b.queue) == 0 || b.drainedSinceStall >= b.progressBytes() {
+					b.stalledSince, b.drainedSinceStall = time.Time{}, 0
+				}
 			}
 			releaseLatch(&b.drained)
 			b.mu.Unlock()

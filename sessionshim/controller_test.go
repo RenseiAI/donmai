@@ -9,6 +9,7 @@ import (
 	"net"
 	"os"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -16,6 +17,21 @@ import (
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
+
+// newTestBacklog builds a backlog whose stall deadline is set BELOW the
+// production floor.
+//
+// newEventBacklog clamps every configured deadline to eventBacklogStallFloor,
+// deliberately and unbypassably, so an embedder cannot tune the back-pressure
+// into the drop it replaced (TestEventBacklogStallDeadlineIsClampedToTheFloor
+// pins that). Tests still need sub-second deadlines to exercise the stall
+// semantics in bounded time, so they write the field directly, in-package,
+// where the intent is visible rather than smuggled through the public seam.
+func newTestBacklog(budget int, stall time.Duration, abort <-chan struct{}) *eventBacklog {
+	b := newEventBacklog(budget, 0, abort)
+	b.stall = stall
+	return b
+}
 
 func TestControllerProtocolRangeRequiresExplicitFullFrameConsumption(t *testing.T) {
 	t.Parallel()
@@ -186,7 +202,7 @@ func TestEventBacklogAtBudgetStallsInsteadOfDropping(t *testing.T) {
 	budget := 4 * (eventBacklogOverheadBytes + payload)
 	controller := &Controller{
 		selected: shimwire.V3,
-		backlog:  newEventBacklog(budget, 30*time.Second, nil),
+		backlog:  newTestBacklog(budget, 30*time.Second, nil),
 		closing:  make(chan struct{}),
 	}
 	for i := range 4 {
@@ -237,7 +253,7 @@ func TestEventBacklogAtBudgetStallsInsteadOfDropping(t *testing.T) {
 // receipt. Removing the deadline turns this RED by hanging.
 func TestEventBacklogFailsClosedOnlyOnAStuckConsumer(t *testing.T) {
 	t.Parallel()
-	backlog := newEventBacklog(64, 50*time.Millisecond, nil)
+	backlog := newTestBacklog(64, 50*time.Millisecond, nil)
 	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
 		t.Fatalf("oversized first event refused: %v", err)
 	}
@@ -254,37 +270,47 @@ func TestEventBacklogFailsClosedOnlyOnAStuckConsumer(t *testing.T) {
 // TestEventBacklogDeadlineIsCumulativeNotPerPush is the pin for the hole a
 // per-call timer leaves open.
 //
-// A consumer that hands back one event every few seconds is not keeping up, but
-// it does release a waiter — so with a timer declared per push, EVERY push
-// returns before its own clock expires and the fail-closed verdict is never
+// A consumer that hands back one small event every few seconds is not keeping
+// up, but it does release a waiter — so with a timer declared per push, EVERY
+// push returns before its own clock expires and the fail-closed verdict is never
 // reached. The reader is then parked in push essentially forever: heartbeat
 // receipts only trickle through, and the daemon's cursor acknowledger loops on
 // ErrHeartbeatReceiptPending with nothing ever resolving it.
 //
-// The deadline therefore lives on the backlog and resets only when the queue
-// reaches EMPTY. Moving it back onto the call (a `timer` declared in push and
-// armed on first stall) turns this RED: the dribbling consumer is never refused.
+// The deadline therefore lives on the backlog. Moving it back onto the call (a
+// `timer` declared in push and armed on first stall) turns this RED: the
+// dribbling consumer is never refused.
+//
+// The margins are deliberately wide, and the hand-off count is asserted. An
+// earlier version of this test used a tight 400ms deadline and could pass for
+// the WRONG reason under load — the ticker consumer starved past the deadline,
+// making it a STUCK consumer, which any implementation refuses. Requiring that
+// the consumer really did dribble is what makes the pin discriminate.
 func TestEventBacklogDeadlineIsCumulativeNotPerPush(t *testing.T) {
 	t.Parallel()
 	const payload = 100
-	const stall = 400 * time.Millisecond
-	budget := 2 * (eventBacklogOverheadBytes + payload)
-	backlog := newEventBacklog(budget, stall, nil)
+	const stall = time.Second
+	const handOff = stall / 10
+	// Twenty events of headroom against ten hand-offs per deadline: the consumer
+	// takes about half a budget in a full deadline, so it never earns the reset
+	// however many individual pushes it releases.
+	budget := 20 * (eventBacklogOverheadBytes + payload)
+	backlog := newTestBacklog(budget, stall, nil)
 
-	// A consumer that dribbles: one event every quarter of the deadline, so
-	// every individual push is released well inside a per-call clock, while the
-	// queue never once reaches empty.
+	var delivered atomic.Int64
 	stop := make(chan struct{})
 	defer close(stop)
 	go func() {
-		ticker := time.NewTicker(stall / 4)
+		ticker := time.NewTicker(handOff)
 		defer ticker.Stop()
 		for {
 			select {
 			case <-stop:
 				return
 			case <-ticker.C:
-				backlog.pop()
+				if _, ok := backlog.pop(); ok {
+					delivered.Add(1)
+				}
 			}
 		}
 	}()
@@ -293,6 +319,12 @@ func TestEventBacklogDeadlineIsCumulativeNotPerPush(t *testing.T) {
 	for seq := uint64(1); ; seq++ {
 		err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: seq, FrameBytes: make([]byte, payload)})
 		if errors.Is(err, ErrEventBacklogExceeded) {
+			// It must have been refused for DRIBBLING, not for having starved
+			// into a stuck consumer that every implementation refuses.
+			if got := delivered.Load(); got < 3 {
+				t.Fatalf("refused after only %d hand-offs: the consumer starved rather than dribbled, "+
+					"so this run did not exercise the cumulative bound", got)
+			}
 			return
 		}
 		if err != nil {
@@ -300,26 +332,92 @@ func TestEventBacklogDeadlineIsCumulativeNotPerPush(t *testing.T) {
 		}
 		select {
 		case <-deadline:
-			t.Fatal("a consumer that never catches up was never refused: " +
-				"the stall deadline is a per-push idle timer, not a cumulative no-progress bound")
+			t.Fatalf("a consumer that never caught up was never refused after %d hand-offs: "+
+				"the stall deadline is a per-push idle timer, not a cumulative no-progress bound",
+				delivered.Load())
 		default:
 		}
 	}
 }
 
-// TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp is the other half: the
+// TestEventBacklogSaturatedConsumerKeepsItsCarrier is the pin for the other way
+// a cumulative bound can be wrong: by measuring the wrong thing.
+//
+// Anchoring the reset on queue EMPTINESS refuses a consumer that is keeping up
+// perfectly well. A saturating producer means the queue never reaches zero no
+// matter how fast the consumer runs, so a carrier draining megabytes a second
+// under a heavy build log accumulates against the deadline exactly like a
+// consumer that has stopped, and loses its carrier — reintroducing, through the
+// definition of progress, the failure class this whole mechanism exists to
+// remove.
+//
+// Progress is therefore counted in BYTES taken. This drives the case in
+// lock-step so there is no race to lose: the queue is held at the budget and
+// every iteration hands over exactly one event, so it PROVABLY never reaches
+// empty, while the consumer turns over many budgets' worth over many deadlines.
+//
+// Restoring the emptiness test (`if len(b.queue) == 0 { b.stalledSince = ... }`
+// as the only reset) turns this RED at the first deadline.
+func TestEventBacklogSaturatedConsumerKeepsItsCarrier(t *testing.T) {
+	t.Parallel()
+	const payload = 100
+	const stall = 200 * time.Millisecond
+	const depth = 4
+	budget := depth * (eventBacklogOverheadBytes + payload)
+	backlog := newTestBacklog(budget, stall, nil)
+	event := func(seq uint64) ControllerEvent {
+		return ControllerEvent{Kind: EventHostFrame, Seq: seq, FrameBytes: make([]byte, payload)}
+	}
+
+	// Fill to the budget. Every push from here has to wait for a hand-off.
+	for seq := range uint64(depth) {
+		if err := backlog.push(event(seq + 1)); err != nil {
+			t.Fatalf("fill at %d: %v", seq, err)
+		}
+	}
+
+	// Run well past several deadlines, never letting the queue reach empty.
+	until := time.Now().Add(8 * stall)
+	seq := uint64(depth)
+	for time.Now().Before(until) {
+		seq++
+		landed := make(chan error, 1)
+		go func() { landed <- backlog.push(event(seq)) }()
+		time.Sleep(stall / 20)
+		if _, ok := backlog.pop(); !ok {
+			t.Fatal("backlog closed mid-run")
+		}
+		select {
+		case err := <-landed:
+			if err != nil {
+				t.Fatalf("a saturated consumer that drained %d events was refused: %v — "+
+					"progress is being measured as queue emptiness, which a saturating producer "+
+					"never allows however fast the consumer runs", seq-uint64(depth), err)
+			}
+		case <-time.After(5 * time.Second):
+			t.Fatal("hand-off did not release the stalled push")
+		}
+		if got := backlog.queuedBytes(); got == 0 {
+			t.Fatal("the queue reached empty: this run did not exercise a saturated backlog")
+		}
+	}
+	if drained := seq - uint64(depth); drained < uint64(4*depth) {
+		t.Fatalf("only %d events were handed over; the run was too short to cross a deadline", drained)
+	}
+}
+
+// TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp is the third case: the
 // cumulative bound must not accumulate against a consumer that DOES catch up, or
 // a long-lived busy session would eventually be refused for having been briefly
-// behind hours earlier. Draining to empty is the progress that clears it.
+// behind minutes earlier.
 //
-// Deleting the `b.stalledSince = time.Time{}` reset in pop turns this RED at the
-// second burst.
+// Deleting the reset in pop turns this RED at the second burst.
 func TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp(t *testing.T) {
 	t.Parallel()
 	const payload = 100
 	const stall = 300 * time.Millisecond
 	budget := 2 * (eventBacklogOverheadBytes + payload)
-	backlog := newEventBacklog(budget, stall, nil)
+	backlog := newTestBacklog(budget, stall, nil)
 	event := func(seq uint64) ControllerEvent {
 		return ControllerEvent{Kind: EventHostFrame, Seq: seq, FrameBytes: make([]byte, payload)}
 	}
@@ -349,8 +447,8 @@ func TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp(t *testing.T) {
 		case <-time.After(5 * time.Second):
 			t.Fatal("catching up did not release the stalled push")
 		}
-		// The third pop above is what emptied the queue and cleared the anchor;
-		// the released push then re-queued exactly one event, so drain it too.
+		// The pops above cleared the anchor; the released push then re-queued
+		// exactly one event, so drain it too.
 		if _, ok := backlog.pop(); !ok {
 			t.Fatal("backlog closed before the queue emptied")
 		}
@@ -366,6 +464,49 @@ func TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp(t *testing.T) {
 	fillToBudgetAndStall(t, 10)
 }
 
+// TestEventBacklogStallDeadlineIsClampedToTheFloor pins the guard on the public
+// knob.
+//
+// EventBacklogStallDeadline is exported on ControllerOptions, AdoptOptions and
+// the daemon's session-shim config, and an embedder reaching for a "tighter"
+// value can set it BELOW heartbeatReceiptWaitBound — at which point the reader
+// fails closed while the consumer is still waiting on a receipt only the reader
+// can deliver, and the knob reintroduces exactly the drop it was meant to tune
+// away. The clamp lives in newEventBacklog, the one place every controller
+// passes through, so no configuration route can get under it.
+func TestEventBacklogStallDeadlineIsClampedToTheFloor(t *testing.T) {
+	t.Parallel()
+	if eventBacklogStallFloor <= heartbeatReceiptWaitBound {
+		t.Fatalf("stall floor %s does not exceed the heartbeat receipt wait bound %s",
+			eventBacklogStallFloor, heartbeatReceiptWaitBound)
+	}
+	tests := []struct {
+		name       string
+		configured time.Duration
+		want       time.Duration
+	}{
+		{name: "zero takes the default", want: eventBacklogStallDeadline},
+		{name: "negative takes the default", configured: -time.Second, want: eventBacklogStallDeadline},
+		{name: "under the heartbeat bound is raised", configured: 2 * time.Second, want: eventBacklogStallFloor},
+		{name: "exactly the bound is still raised", configured: heartbeatReceiptWaitBound, want: eventBacklogStallFloor},
+		{name: "above the floor is honoured", configured: time.Minute, want: time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := newEventBacklog(1024, tc.configured, nil).stall; got != tc.want {
+				t.Fatalf("newEventBacklog(stall=%s).stall = %s, want %s", tc.configured, got, tc.want)
+			}
+			// And through the public option seam an embedder actually uses, which
+			// is the route the clamp has to close.
+			opts := ControllerOptions{EventBacklogStallDeadline: tc.configured}
+			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil).stall; got != tc.want {
+				t.Fatalf("through ControllerOptions(stall=%s) = %s, want %s", tc.configured, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestEventBacklogAdmitsAnOversizedFrameAfterDraining pins the rule that the
 // production drop actually broke: a single frame larger than the whole budget —
 // a resume Snapshot of a long-lived screen is exactly that — is admitted, it
@@ -374,7 +515,7 @@ func TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp(t *testing.T) {
 // refusal severed the carrier.
 func TestEventBacklogAdmitsAnOversizedFrameAfterDraining(t *testing.T) {
 	t.Parallel()
-	backlog := newEventBacklog(1024, 30*time.Second, nil)
+	backlog := newTestBacklog(1024, 30*time.Second, nil)
 	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 16)}); err != nil {
 		t.Fatalf("first event refused: %v", err)
 	}
@@ -409,7 +550,7 @@ func TestEventBacklogAdmitsAnOversizedFrameAfterDraining(t *testing.T) {
 func TestEventBacklogStallAbortsWhenTheControllerCloses(t *testing.T) {
 	t.Parallel()
 	closing := make(chan struct{})
-	backlog := newEventBacklog(64, time.Hour, closing)
+	backlog := newTestBacklog(64, time.Hour, closing)
 	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
 		t.Fatalf("first event refused: %v", err)
 	}
@@ -771,7 +912,7 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 		// deadline; the decision under test is the same one. Nothing drains it:
 		// dispatchEvents is deliberately not started, which is what makes this a
 		// STUCK consumer rather than a slow one.
-		events: make(chan ControllerEvent), backlog: newEventBacklog(1, 100*time.Millisecond, nil),
+		events: make(chan ControllerEvent), backlog: newTestBacklog(1, 100*time.Millisecond, nil),
 		logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		done:          make(chan struct{}),
 		closing:       make(chan struct{}),

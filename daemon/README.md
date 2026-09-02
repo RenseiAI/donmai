@@ -421,6 +421,18 @@ Symptom to recognise in the log: repeated
 `controller dropped its shim connection` line — that is a consumer that is behind,
 being absorbed, not a broken socket.
 
+What separates "behind" from "stopped" is **bytes taken, not queue depth**. The
+deadline's clock is anchored when the carrier first falls behind and is cleared
+once the consumer has taken a whole backlog budget's worth of bytes. A carrier
+draining a heavy build log keeps resetting it however saturated the queue stays,
+because it is moving real volume; a carrier handing back one small frame every
+few seconds never earns the reset and is refused. Queue emptiness is deliberately
+NOT the test: a saturating producer means the queue never reaches zero no matter
+how fast the consumer runs, so an emptiness test would drop exactly the healthy
+high-volume carriers this mechanism exists to protect. When a session IS refused,
+the error names both numbers — bytes taken and bytes owed — so the log says which
+of the two cases it was.
+
 ## Failure modes the daemon classifies (high-level)
 
 | Symptom | Where it surfaces |

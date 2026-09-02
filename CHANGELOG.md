@@ -37,10 +37,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   trimmed screen than a selected-v3 one because the ceiling applies to a
   base64-inflated control message rather than raw frame bytes. The stall
   deadline is CUMULATIVE, not a per-call idle timer: it is anchored on the
-  backlog when the consumer first falls behind and reset only when the queue
-  reaches empty, so a consumer that dribbles back one event at a time cannot
-  hold the socket reader indefinitely. `sessionshim.AdoptOptions` /
-  `daemon.SessionShimConfig` gain an additive `EventBacklogStallDeadline` knob.
+  backlog when the consumer first falls behind, and cleared once the consumer
+  has taken a whole budget's worth of BYTES. Measuring progress in bytes rather
+  than in queue depth is what keeps a healthy high-volume carrier — one draining
+  a heavy build log against a saturating producer, so its queue never reaches
+  empty — from being refused alongside a consumer that hands back one small
+  frame every few seconds. `sessionshim.AdoptOptions` /
+  `daemon.SessionShimConfig` gain an additive `EventBacklogStallDeadline` knob,
+  clamped up to a floor above the durable-heartbeat receipt wait bound so it
+  cannot be tuned back into the drop it replaced.
 
 ---
 

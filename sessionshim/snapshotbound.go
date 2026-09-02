@@ -1,6 +1,7 @@
 package sessionshim
 
 import (
+	"bytes"
 	"errors"
 	"fmt"
 
@@ -107,7 +108,17 @@ func boundSnapshotFrame(
 	if err != nil {
 		return attachwire.Frame{}, snapshotBound{}, err
 	}
-	return snapshotFrameWithScreen(frame, envelope, bounded), result, nil
+	rebuilt := snapshotFrameWithScreen(frame, envelope, bounded)
+	// Rebuilding the envelope is itself a re-encode. For a canonically encoded
+	// input it reproduces the same bytes, but a non-canonical payload (an
+	// over-long varint, say) shrinks — which can bring the frame inside the limit
+	// with no line dropped, and would otherwise be reported as "nothing changed"
+	// while the bytes on the wire changed. Compare what is leaving against what
+	// arrived, rather than trusting the line count to speak for it.
+	if !bytes.Equal(rebuilt.Payload, frame.Payload) {
+		result.Rewritten = true
+	}
+	return rebuilt, result, nil
 }
 
 // snapshotFrameWithScreen rebuilds frame around a different serialized screen,

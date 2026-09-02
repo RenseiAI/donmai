@@ -611,9 +611,13 @@ type SessionShimConfig struct {
 	// burst again.
 	EventBacklogBudget int
 
-	// EventBacklogStallDeadline overrides how long a controller's socket reader
-	// may stall applying back-pressure to a behind consumer before it fails
-	// closed. Zero uses the sessionshim default.
+	// EventBacklogStallDeadline overrides how long a session's carrier may go
+	// without taking a whole backlog budget's worth of bytes before the
+	// controller fails closed and the session is released to quarantine. Zero
+	// uses the sessionshim default. Values below the package floor (which sits
+	// above the durable-heartbeat receipt wait bound) are raised to it rather
+	// than honoured: a deadline under that bound severs carriers through the
+	// very knob meant to tune the back-pressure.
 	EventBacklogStallDeadline time.Duration
 
 	// OrgID is the organization half of the lifecycle identity (§D2). A
