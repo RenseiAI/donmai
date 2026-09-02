@@ -23,6 +23,7 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -948,6 +949,90 @@ func TestBuildSessionEnv_PopulatesStandardKeys(t *testing.T) {
 		if envOut[key] == "" {
 			t.Errorf("env missing %q", key)
 		}
+	}
+}
+
+// TestBuildSessionEnv_NeverExportsGHToken pins the credential-scope contract:
+// QueuedWork.AuthToken is the worker's platform runtime bearer (heartbeat,
+// result post, session preflight) and is never a GitHub token, so the runner
+// must not surface it as GH_TOKEN on ANY work item — ref-bearing or not,
+// headless or interactive. Doing so clobbers the seat's real gh auth (the
+// composer lets Spec.Env win over the host env) and sends the platform bearer
+// to api.github.com on every gh call.
+func TestBuildSessionEnv_NeverExportsGHToken(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		mode string
+		ref  string
+	}{
+		{name: "headless without ref", mode: "", ref: ""},
+		{name: "headless ref-bearing", mode: "", ref: "fix/existing-branch"},
+		{name: "interactive without ref", mode: interactiveRunMode, ref: ""},
+		{name: "interactive ref-bearing", mode: interactiveRunMode, ref: "fix/existing-branch"},
+		{name: "interactive ref-bearing with whitespace", mode: interactiveRunMode, ref: "  fix/existing-branch  "},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := queuedWorkBase("ENV-GH-1")
+			base.Mode = tc.mode
+			base.Ref = tc.ref
+			qw := QueuedWork{
+				QueuedWork:  base,
+				WorkerID:    "w1",
+				AuthToken:   "platform-runtime-jwt",
+				PlatformURL: "https://example.test",
+			}
+			envOut := buildSessionEnv(qw)
+			if v, ok := envOut["GH_TOKEN"]; ok {
+				t.Fatalf("GH_TOKEN exported from the runner layer (value present=%t); the platform bearer must never be presented to gh", v != "")
+			}
+			if envOut["WORKER_AUTH_TOKEN"] != "platform-runtime-jwt" {
+				t.Fatalf("WORKER_AUTH_TOKEN = %q; the runtime bearer must still reach the worker env", envOut["WORKER_AUTH_TOKEN"])
+			}
+		})
+	}
+}
+
+// TestSessionEnv_ComposerPreservesHostGHToken is the composer-level pin: the
+// per-session Spec.Env the runner builds must leave the host's own GH_TOKEN
+// (a seat's real gh auth, or a provisioner-stamped short-lived git token in a
+// sandbox) intact after composition. Spec.Env wins over the base layer, so
+// the only way this holds is for the runner never to put GH_TOKEN there.
+func TestSessionEnv_ComposerPreservesHostGHToken(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		mode string
+		ref  string
+	}{
+		{name: "interactive ref-bearing", mode: interactiveRunMode, ref: "feature/pinned"},
+		{name: "headless ref-bearing", mode: "", ref: "feature/pinned"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			base := queuedWorkBase("ENV-GH-2")
+			base.Mode = tc.mode
+			base.Ref = tc.ref
+			qw := QueuedWork{
+				QueuedWork:  base,
+				WorkerID:    "w1",
+				AuthToken:   "platform-runtime-jwt",
+				PlatformURL: "https://example.test",
+			}
+			host := map[string]string{"GH_TOKEN": "host-real-gh-token", "PATH": "/usr/bin"}
+			composed := envToMap(runtimeenv.NewComposer().Compose(host, agent.Spec{Env: buildSessionEnv(qw)}))
+			if got := composed["GH_TOKEN"]; got != "host-real-gh-token" {
+				t.Fatalf("composed GH_TOKEN = %q; want the host value preserved", got)
+			}
+			if composed["WORKER_AUTH_TOKEN"] != "platform-runtime-jwt" {
+				t.Fatalf("composed WORKER_AUTH_TOKEN = %q; want the runtime bearer", composed["WORKER_AUTH_TOKEN"])
+			}
+		})
 	}
 }
 

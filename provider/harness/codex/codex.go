@@ -999,7 +999,7 @@ func (p *Provider) checkSessionEnvLocked(sessionEnv map[string]string) error {
 //
 // It returns NAMES ONLY, never values. The caller renders these into an error
 // that reaches stderr, structured logs and session records, and this layer is
-// exactly where the runner puts WORKER_AUTH_TOKEN and GH_TOKEN. Naming the keys
+// exactly where the runner puts WORKER_AUTH_TOKEN. Naming the keys
 // is what makes the failure actionable; quoting them would make it a leak.
 func divergentSessionEnvKeys(pinned, want map[string]string) []string {
 	var keys []string
