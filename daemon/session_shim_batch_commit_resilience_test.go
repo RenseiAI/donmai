@@ -104,7 +104,16 @@ func (f *sessionShimBatchCompletenessFake) onAdoption(_ context.Context, evidenc
 	return SessionShimAdoptionReceipt{DurableCorrelation: []byte("adopted-" + evidence.Identity.SessionID)}, nil
 }
 
-func (f *sessionShimBatchCompletenessFake) prepareBatch(context.Context, string, string) ([]byte, error) {
+// prepareBatch HONORS ITS CONTEXT, and that is load-bearing rather than
+// decoration: a real PrepareAdoptionBatch is an HTTP round trip that fails
+// immediately when its context is already expired, which is exactly what
+// happens to a callback handed a budget an earlier stage already burned. A fake
+// that ignored the context could not see that failure at all — it answered
+// happily on a dead context — so no test could catch a publish issued on one.
+func (f *sessionShimBatchCompletenessFake) prepareBatch(ctx context.Context, _, _ string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("prepare adoption batch: %w", err)
+	}
 	return []byte(fmt.Sprintf("revision-%d", f.revision.Add(1))), nil
 }
 
@@ -132,7 +141,8 @@ func (f *sessionShimBatchCompletenessFake) setAnswers(answers ...error) {
 	f.mu.Unlock()
 }
 
-func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+// onAdoptionBatch honors its context for the same reason prepareBatch does.
+func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(ctx context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	record := func(err error) (SessionShimAdoptionBatchReceipt, error) {
@@ -144,6 +154,9 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 			DurableCorrelation: []byte(fmt.Sprintf("batch-revision-%d", f.revision.Load())),
 			AdoptionRevision:   fmt.Sprintf("revision-%d", f.revision.Load()),
 		}, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return record(fmt.Errorf("commit adoption batch: %w", err))
 	}
 	if len(f.scripted) > 0 {
 		answer := f.scripted[0]
