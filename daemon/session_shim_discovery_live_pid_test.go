@@ -50,16 +50,21 @@ type fakeShimLaunchProcess struct {
 	mu sync.Mutex
 	// aliveUntil is when the scripted process exits. Zero means it never does.
 	aliveUntil time.Time
-	stopErr    error
-	probes     int
-	stops      int
-	reaps      int
+	// aliveErr scripts an UNPROBEABLE process: neither alive nor gone.
+	aliveErr error
+	stopErr  error
+	probes   int
+	stops    int
+	reaps    int
 }
 
 func (p *fakeShimLaunchProcess) Alive() (bool, error) {
 	p.mu.Lock()
 	defer p.mu.Unlock()
 	p.probes++
+	if p.aliveErr != nil {
+		return false, p.aliveErr
+	}
 	if p.aliveUntil.IsZero() || time.Now().Before(p.aliveUntil) {
 		return true, nil
 	}
@@ -359,6 +364,43 @@ func TestAwaitShimRecordAbandonsALiveProcessHoldingAForeignRecord(t *testing.T) 
 	}
 	if elapsed := time.Since(start); elapsed > 3*time.Second {
 		t.Fatalf("the wait took %s; a foreign record is decidable immediately", elapsed)
+	}
+}
+
+// TestAwaitShimRecordLogsAnUnprobeableProcessOnceParLaunch pins the log volume,
+// which is a correctness property here rather than tidiness: processIsGone runs
+// at shimRecordPollInterval (25ms), so a probe failing for a persistent reason
+// would emit thousands of identical lines across one live bound and bury the two
+// lines that carry the actual disposition.
+func TestAwaitShimRecordLogsAnUnprobeableProcessOnceParLaunch(t *testing.T) {
+	withShortShimDiscoveryGrace(t, 2, 5*time.Millisecond)
+	dir := t.TempDir()
+	registry, err := sessionshim.NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := sessionshim.Identity{OrgID: "org-unprobeable", SessionID: "session-unprobeable"}
+	launch := sessionshim.Launch{Identity: id, RegistryDir: dir, ProcessEpoch: 1}
+	process := &fakeShimLaunchProcess{aliveErr: errors.New("kern.proc.pid: device error")}
+
+	buf, restore := captureSlog(t)
+	defer restore()
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Millisecond)
+	defer cancel()
+	_, err = awaitShimRecord(ctx, shimDiscoveryWait{
+		registry: registry, id: id, launch: launch,
+		started: sessionshim.ProcessIdentity{PID: 4242, StartedAt: 111},
+		process: process, liveBound: 400 * time.Millisecond,
+	})
+	if !errors.Is(err, errShimDiscoveryAbandonedLiveProcess) {
+		t.Fatalf("an unprobeable process must be treated as alive and abandoned as such, got: %v", err)
+	}
+	probes, _, _ := process.counts()
+	if probes < 5 {
+		t.Fatalf("the wait probed only %d times; this test needs many polls to be meaningful", probes)
+	}
+	if got := strings.Count(string(buf.snapshot()), "could not probe the launched process"); got != 1 {
+		t.Fatalf("the unprobeable-process warning was logged %d times across %d probes, want exactly 1", got, probes)
 	}
 }
 

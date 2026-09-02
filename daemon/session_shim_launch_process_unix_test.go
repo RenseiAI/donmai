@@ -7,6 +7,7 @@ package daemon
 import (
 	"errors"
 	"os/exec"
+	"strings"
 	"syscall"
 	"testing"
 	"time"
@@ -103,6 +104,112 @@ func TestShimLaunchProcessAliveReapsAnExitedChild(t *testing.T) {
 				t.Fatal("a running child read as not alive")
 			}
 		})
+	}
+}
+
+// TestShimLaunchProcessStopAndReapClassifiesARefusedSignal is the measured-shape
+// guard for the ONE refusal a stop cannot stage from outside the kernel: the
+// group's last member dies between the liveness probe and the signal, leaving a
+// zombie-only group, which BSD/macOS answers EPERM rather than ESRCH.
+//
+// Treating that as a failed stop would make stopAbandonedShimLaunch log "may
+// keep running un-adopted" about a worker that is already gone and reaped —
+// precisely the false statement about the host this whole change exists to
+// prevent, inverted. So the classification is by evidence (waitpid), not by
+// errno: a refusal whose child turns out to be reaped is a SUCCESS, and a
+// refusal whose child is still running is still a failure.
+func TestShimLaunchProcessStopAndReapClassifiesARefusedSignal(t *testing.T) {
+	tests := []struct {
+		name string
+		// killDuringSignal reproduces the race: the real group dies while the
+		// kernel refuses our signal.
+		killDuringSignal bool
+		signalErr        error
+		wantErr          bool
+	}{
+		{
+			name:             "a refusal whose group is already gone is a successful stop",
+			killDuringSignal: true,
+			signalErr:        syscall.EPERM,
+		},
+		{
+			name:      "a refusal whose group is still running is still a failure",
+			signalErr: syscall.EPERM,
+			wantErr:   true,
+		},
+		{
+			name:             "ESRCH is a successful stop and still discharges the reap",
+			killDuringSignal: true,
+			signalErr:        syscall.ESRCH,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			cmd := exec.Command("/bin/sh", "-c", "sleep 60") //nolint:gosec // G204: literal test command
+			configureShimProcess(cmd)
+			if err := cmd.Start(); err != nil {
+				t.Fatalf("Start: %v", err)
+			}
+			pid := cmd.Process.Pid
+			started, err := sessionshim.ProcessIdentityFor(pid)
+			if err != nil {
+				t.Fatalf("ProcessIdentityFor: %v", err)
+			}
+			if err := cmd.Process.Release(); err != nil {
+				t.Fatalf("Release: %v", err)
+			}
+			t.Cleanup(func() { _ = newShimLaunchProcess(started).StopAndReap() })
+
+			process := osShimLaunchProcess{
+				identity: started,
+				signalGroupFn: func(syscall.Signal) error {
+					if tc.killDuringSignal {
+						_ = syscall.Kill(-pid, syscall.SIGKILL)
+					}
+					return tc.signalErr
+				},
+			}
+			stopErr := process.StopAndReap()
+			if tc.wantErr {
+				if stopErr == nil {
+					t.Fatal("a refused signal against a still-running group was reported as a successful stop")
+				}
+				return
+			}
+			if stopErr != nil {
+				t.Fatalf("a refused signal against an already-gone group was reported as a failure: %v", stopErr)
+			}
+			assertShimChildReaped(t, pid)
+		})
+	}
+}
+
+// TestShimLaunchProcessStopAndReapRefusesAnUnpinnedUnprobeableLaunch pins the
+// crash-matrix rule literally: the recorded leader's start identity is verified
+// before any SIGTERM/SIGKILL. A launch whose start time was never pinned AND
+// whose waitpid answer is unavailable has neither half of that verification, so
+// signalling it would address a bare PID — the reuse-unsafe comparison
+// sessionshim.ProcessIdentity exists to forbid. It must refuse rather than
+// signal.
+func TestShimLaunchProcessStopAndReapRefusesAnUnpinnedUnprobeableLaunch(t *testing.T) {
+	signalled := false
+	// PID 1 is refused by the probe's own guard (never a child of this daemon,
+	// and never a legitimate stop target), so Alive() answers with an ERROR
+	// rather than a disposition — which, paired with StartedAt == 0, is exactly
+	// the unverifiable identity the crash-matrix rule forbids signalling.
+	process := osShimLaunchProcess{
+		identity:      sessionshim.ProcessIdentity{PID: 1},
+		signalGroupFn: func(syscall.Signal) error { signalled = true; return nil },
+	}
+	err := process.StopAndReap()
+	if err == nil {
+		t.Fatal("an unpinned, unprobeable launch was stopped instead of refused")
+	}
+	if signalled {
+		t.Fatal("an unpinned, unprobeable launch was signalled; the start identity must be verified first")
+	}
+	if !strings.Contains(err.Error(), "start identity was never pinned") {
+		t.Fatalf("StopAndReap failed with %v, want the unpinned-identity refusal", err)
 	}
 }
 

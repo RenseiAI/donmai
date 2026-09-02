@@ -1494,7 +1494,10 @@ func (d *Daemon) shimCommand() []string {
 // failure, on whichever budget was running. Neither branch changes the happy
 // path: every iteration reads the registry BEFORE it consults the process, so a
 // record that lands in five seconds still adopts in five seconds.
-func awaitShimRecord(ctx context.Context, w shimDiscoveryWait) (sessionshim.Record, error) {
+func awaitShimRecord(ctx context.Context, wait shimDiscoveryWait) (sessionshim.Record, error) {
+	// One addressable wait for the whole call: the probe-error log below is
+	// once-per-launch state, and a value copy per phase would reset it.
+	w := &wait
 	start := time.Now()
 	ticker := time.NewTicker(shimRecordPollInterval)
 	defer ticker.Stop()
@@ -1517,8 +1520,8 @@ func awaitShimRecord(ctx context.Context, w shimDiscoveryWait) (sessionshim.Reco
 			// extended wait below applies, applied to the budget that runs first;
 			// it never delays a record, because the registry read above always
 			// runs before this probe.
-			if gone, cause := w.processIsGone(); gone {
-				return sessionshim.Record{}, w.exitedError(cause, lastErr)
+			if w.processIsGone() {
+				return sessionshim.Record{}, w.exitedError(lastErr)
 			}
 		}
 	}
@@ -1543,6 +1546,10 @@ type shimDiscoveryWait struct {
 	// wait, for a launch whose process stays alive — not an extra budget added
 	// on top of the launch clock. See SessionShimConfig.liveDiscoveryTimeout.
 	liveBound time.Duration
+	// probeErrorLogged makes the "could not probe the launched process" warning
+	// once-per-launch rather than once-per-poll. Owned by the single goroutine
+	// running the wait; never read after it returns.
+	probeErrorLogged bool
 }
 
 // errShimDiscoveryAbandonedLiveProcess classifies the one discovery failure that
@@ -1565,7 +1572,7 @@ var errShimDiscoveryAbandonedLiveProcess = errors.New("the launched process was 
 // a launch that produced nothing; it was a launch given a budget sized for an
 // unloaded host. While the pid lives there is something to wait for, so this
 // keeps waiting to liveBound; when it dies there is not, so this ends at once.
-func (w shimDiscoveryWait) awaitWhileProcessLives(
+func (w *shimDiscoveryWait) awaitWhileProcessLives(
 	ctx context.Context,
 	start time.Time,
 	lastErr error,
@@ -1574,8 +1581,8 @@ func (w shimDiscoveryWait) awaitWhileProcessLives(
 	if w.process == nil || w.liveBound <= 0 || !time.Now().Before(deadline) {
 		return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
 	}
-	if gone, cause := w.processIsGone(); gone {
-		return sessionshim.Record{}, w.exitedError(cause, lastErr)
+	if w.processIsGone() {
+		return sessionshim.Record{}, w.exitedError(lastErr)
 	}
 	// ONE line at the old bound, not one per poll: a slow bootstrap is visible in
 	// the log exactly where an operator used to see the give-up, and the launch
@@ -1612,8 +1619,8 @@ func (w shimDiscoveryWait) awaitWhileProcessLives(
 			return sessionshim.Record{}, w.abandonedLiveError(start, fmt.Sprintf("last read: %v", lastErr))
 		}
 		<-ticker.C
-		if gone, cause := w.processIsGone(); gone {
-			return sessionshim.Record{}, w.exitedError(cause, lastErr)
+		if w.processIsGone() {
+			return sessionshim.Record{}, w.exitedError(lastErr)
 		}
 	}
 }
@@ -1625,34 +1632,45 @@ func (w shimDiscoveryWait) awaitWhileProcessLives(
 // A probe that ERRORS is not a death: an unprobeable process is treated as still
 // running, so the wait keeps its bound and the caller still stops it at the end.
 // Guessing "gone" from an unreadable probe is how a live harness gets abandoned.
-func (w shimDiscoveryWait) processIsGone() (bool, error) {
+//
+// The error is logged ONCE per launch, not once per probe: this runs at
+// shimRecordPollInterval, so a probe that fails for a persistent reason would
+// otherwise emit thousands of identical lines across one live bound and bury the
+// two lines that carry the actual disposition. The condition is a property of
+// the launch, and one line reports it.
+func (w *shimDiscoveryWait) processIsGone() bool {
 	if w.process == nil {
-		return false, nil
+		return false
 	}
 	alive, err := w.process.Alive()
 	if err != nil {
-		slog.Warn("session shim: could not probe the launched process while waiting for its discovery record; "+
-			"treating it as alive", "session", w.id.String(), "pid", w.started.PID, "error", err)
-		return false, err
+		if !w.probeErrorLogged {
+			w.probeErrorLogged = true
+			slog.Warn("session shim: could not probe the launched process while waiting for its discovery record; "+
+				"treating it as alive (logged once per launch)",
+				"session", w.id.String(), "pid", w.started.PID, "error", err)
+		}
+		return false
 	}
-	return !alive, nil
+	return !alive
 }
 
 // exitedError is the DEFINITE failure for a launch whose process died before
 // publishing anything. It deliberately does not wrap
 // errShimDiscoveryAbandonedLiveProcess: there is nothing left to stop.
-func (w shimDiscoveryWait) exitedError(cause, lastErr error) error {
-	if cause != nil {
-		return fmt.Errorf("waiting for discovery record: the launched process %s could not be confirmed running (%v) "+
-			"and published nothing (last read: %v)", w.started, cause, lastErr)
-	}
+//
+// It has exactly one shape because processIsGone reports "gone" from exactly one
+// observation — a successful probe that answered "not alive". An errored probe
+// never reports gone, so there is no such thing as a launch that exited AND
+// could not be probed reaching here.
+func (w *shimDiscoveryWait) exitedError(lastErr error) error {
 	return fmt.Errorf("waiting for discovery record: the launched process %s exited without publishing one "+
 		"(last read: %v)", w.started, lastErr)
 }
 
 // abandonedLiveError is the give-up that leaves a live worker behind — the one
 // the caller answers with a stop.
-func (w shimDiscoveryWait) abandonedLiveError(start time.Time, detail string) error {
+func (w *shimDiscoveryWait) abandonedLiveError(start time.Time, detail string) error {
 	return fmt.Errorf("waiting for discovery record: %w after %s (%s)",
 		errShimDiscoveryAbandonedLiveProcess, time.Since(start).Round(time.Millisecond), detail)
 }

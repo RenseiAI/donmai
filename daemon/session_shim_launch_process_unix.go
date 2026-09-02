@@ -31,6 +31,12 @@ const shimAbandonedLaunchReapInterval = 10 * time.Millisecond
 // addressed by the identity startShimProcess pinned at spawn time.
 type osShimLaunchProcess struct {
 	identity sessionshim.ProcessIdentity
+	// signalGroupFn, when set, replaces the syscall-backed group signal. Nil in
+	// every production path: it exists so a test can present the one refusal
+	// that cannot be staged from outside the kernel — a group whose only member
+	// died between the liveness probe and the signal, which BSD/macOS answers
+	// EPERM rather than ESRCH.
+	signalGroupFn func(syscall.Signal) error
 }
 
 func newShimLaunchProcess(started sessionshim.ProcessIdentity) shimLaunchProcess {
@@ -84,25 +90,52 @@ func (p osShimLaunchProcess) Alive() (bool, error) {
 // SIGTERM first, then SIGKILL after a bounded grace, then a bounded reap. The
 // reap is not optional politeness: without it the daemon's own child list keeps
 // a defunct entry for as long as this daemon lives.
+//
+// A REFUSED SIGNAL IS NOT AUTOMATICALLY A FAILURE. ESRCH is the obvious "nothing
+// there", but it is not the only one: a group whose last member died between the
+// probe above and the signal below is zombie-only, and BSD/macOS answers a
+// signal to it EPERM, not ESRCH. Reporting that as a failed stop would make
+// stopAbandonedShimLaunch log "may keep running un-adopted" about a worker that
+// is already gone — the exact false statement this whole change exists to
+// prevent, inverted. So every signal failure is classified the same way
+// waitSessionProcessGroup classifies the direct-child lane's: by re-probing, and
+// by treating a reaped child as the success it is.
 func (p osShimLaunchProcess) StopAndReap() error {
 	alive, err := p.Alive()
 	if err != nil {
-		// An unprobeable process is still worth signalling — the signal itself
-		// reports ESRCH if there is nothing there — but say what was unknown.
+		if p.identity.StartedAt == 0 {
+			// UNPINNED AND UNPROBEABLE. ADR-2026-08-17's crash matrix requires the
+			// recorded leader's start identity to be verified before a SIGTERM →
+			// SIGKILL, and neither half is available here: startShimProcess could
+			// not pin a start time (so the identity cannot be verified even in
+			// principle) and waitpid cannot answer either. Signalling anyway would
+			// address a bare PID, which is exactly the reuse-unsafe comparison
+			// sessionshim.ProcessIdentity exists to forbid. Refuse, loudly, and
+			// leave the pid in the caller's log.
+			return fmt.Errorf("session shim: refusing to stop abandoned launch %s: its start identity was never "+
+				"pinned and it could not be probed: %w", p.identity, err)
+		}
+		// An unprobeable but PINNED process is still worth signalling — the
+		// signal reports ESRCH if there is nothing there, and the classification
+		// below re-probes before calling anything a failure.
 		alive = true
 	}
 	if !alive {
 		return nil // already exited and reaped by the probe above
 	}
-	if signalErr := p.signalGroup(syscall.SIGTERM); signalErr != nil &&
-		!errors.Is(signalErr, syscall.ESRCH) {
+	if signalErr := p.signalGroup(syscall.SIGTERM); signalErr != nil {
+		if p.stopFailureMeansGone(signalErr) {
+			return nil
+		}
 		return fmt.Errorf("session shim: terminate abandoned launch %s: %w", p.identity, signalErr)
 	}
 	if p.awaitReap(shimAbandonedLaunchStopGrace) {
 		return nil
 	}
-	if signalErr := p.signalGroup(syscall.SIGKILL); signalErr != nil &&
-		!errors.Is(signalErr, syscall.ESRCH) {
+	if signalErr := p.signalGroup(syscall.SIGKILL); signalErr != nil {
+		if p.stopFailureMeansGone(signalErr) {
+			return nil
+		}
 		return fmt.Errorf("session shim: kill abandoned launch %s: %w", p.identity, signalErr)
 	}
 	if p.awaitReap(shimAbandonedLaunchStopGrace) {
@@ -110,6 +143,32 @@ func (p osShimLaunchProcess) StopAndReap() error {
 	}
 	return fmt.Errorf("session shim: abandoned launch %s did not exit within %s of SIGKILL",
 		p.identity, shimAbandonedLaunchStopGrace)
+}
+
+// stopFailureMeansGone reports whether a refused group signal only means the
+// launched child is already gone — in which case the stop SUCCEEDED and must not
+// be reported as a failure.
+//
+// ESRCH says so outright. Every other refusal is decided by the same evidence
+// this file trusts everywhere else: waitpid. A zombie-only group answers EPERM on
+// BSD/macOS, and its leader is precisely the child a re-probe reaps, so the
+// re-probe both settles the question and discharges the reap. The bounded window
+// is the same stop grace: the member that died between the probe and the signal
+// may still be a moment from being reportable.
+//
+// What it deliberately cannot prove is a surviving DESCENDANT: nothing can wait
+// on a process that is not this daemon's child. That limit is the same one
+// waitSessionProcessGroup carries, and the conservative half of it is already
+// paid — the leader is dead and reaped, so nothing here holds a session open.
+func (p osShimLaunchProcess) stopFailureMeansGone(signalErr error) bool {
+	// The reap runs FIRST, and for every refusal including ESRCH: "there was
+	// nothing to signal" does not mean "there is nothing to reap". A child that
+	// exited a moment ago is not signallable and is still a defunct entry until
+	// waitpid collects it, and this is the last place that can collect it.
+	if p.awaitReap(shimAbandonedLaunchStopGrace) {
+		return true
+	}
+	return errors.Is(signalErr, syscall.ESRCH)
 }
 
 // signalGroup sends sig to the launched worker's whole process group.
@@ -120,6 +179,9 @@ func (p osShimLaunchProcess) StopAndReap() error {
 // exec.Cmd to address: startShimProcess released it, which is the ownership move
 // §D1 is built on.
 func (p osShimLaunchProcess) signalGroup(sig syscall.Signal) error {
+	if p.signalGroupFn != nil {
+		return p.signalGroupFn(sig)
+	}
 	pid := p.identity.PID
 	if pid <= 1 {
 		return fmt.Errorf("session shim: refusing to signal pid %d", pid)
