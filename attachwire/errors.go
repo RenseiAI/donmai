@@ -21,6 +21,38 @@ const (
 	CodeRateLimited  ErrorCode = "rate-limited"
 	CodeEpochStale   ErrorCode = "epoch-stale"
 	CodeInternal     ErrorCode = "internal"
+
+	// CodeHostLost is a viewer-leg-only §7 error.code (§13 extension): the
+	// relay has no live host transport for the room and served a resume with
+	// the current Snapshot plus only the newest bytes of the ring that fit
+	// the viewer's remaining send-queue headroom (§11.2), followed by an
+	// `error` control message carrying this code so the viewer can render a
+	// truncation notice instead of assuming it received the full tail. The
+	// host/shim never receives CodeHostLost — it is meaningful only on a
+	// resume reply the relay serves to a viewer while host-less.
+	//
+	// message grammar: "<RFC3339 loss instant> <truncated byte count>",
+	// e.g. "2026-09-02T20:35:42Z 4096" — the instant the relay lost the host
+	// transport, and the number of ring bytes dropped ahead of the served
+	// tail to fit the viewer's headroom. Deployment-specific sizing (the
+	// viewer send-budget, the ring depth) is relay policy and is not named
+	// here.
+	CodeHostLost ErrorCode = "host-lost"
+
+	// CodeHostStillAbsent is a viewer-leg-only §7 error.code (§13 extension):
+	// a repeat resume from the same viewer leg, inside the relay's per-leg
+	// throttle window, while the host is still absent and nothing in the
+	// room has changed since the last CodeHostLost reply. The relay serves
+	// the (unchanged) Snapshot again — a viewer is never brought live
+	// without a Snapshot and cursor — followed by an `error` control message
+	// carrying this code in place of a second host-lost truncation notice.
+	// The host/shim never receives CodeHostStillAbsent.
+	//
+	// message grammar: the same "<RFC3339 loss instant> <truncated byte
+	// count>" pair from the original CodeHostLost reply, so a client can
+	// tell a repeat notice apart from a newly-observed loss without
+	// re-deriving it.
+	CodeHostStillAbsent ErrorCode = "host-still-absent"
 )
 
 // FramingError classifies a wire-format violation that §2.1/§3 mandate be
