@@ -339,6 +339,12 @@ func TestShouldBackstop_ContractGate(t *testing.T) {
 		{WorkTypeRefinement, false},
 		{WorkTypeBacklogCreation, false},
 		{"imaginary-future-type", false},
+		// Interactive work items ("interactive" is the platform's work type for
+		// a PTY-hosted session) are not result-sensitive, so the whole backstop
+		// block — including the ref-bearing "skip gh pr create" arm — is
+		// unreachable for them. A ref on an interactive item only pins the
+		// checkout; it never changes what the runner does at teardown.
+		{"interactive", false},
 		// Result-sensitive → behaviour preserved (still backstops).
 		{WorkTypeDevelopmentStr, true},
 		{WorkTypeInflight, true},

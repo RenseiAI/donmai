@@ -2140,13 +2140,19 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 	if qw.PlatformURL != "" {
 		envMap["DONMAI_API_URL"] = qw.PlatformURL
 	}
-	// Ref-bearing credential scope: expose GH_TOKEN only for ref-bearing runs so
-	// the agent can read the PR it was asked to fix. Least-privilege —
-	// absent Ref means no token in env, so gh 404 is the correct signal
-	// that this run has no PR-read scope.
-	if trimRef(qw.Ref) != "" && strings.TrimSpace(qw.AuthToken) != "" {
-		envMap["GH_TOKEN"] = strings.TrimSpace(qw.AuthToken)
-	}
+	// Credential-scope contract: AuthToken is the worker's platform runtime
+	// bearer (heartbeat, result post, session preflight) and NOTHING else. It
+	// is never a GitHub token on any work type or mode — a local daemon
+	// forwards its own runtime JWT, a sandbox runner receives the runtime JWT
+	// the provisioner minted at pre-registration, and a standalone daemon
+	// carries its registration token — so it must never be surfaced as
+	// GH_TOKEN. The composer lets Spec.Env win over the host env, so exporting
+	// it here would clobber the seat's real gh auth (or a provisioner-stamped
+	// short-lived git token) and present the platform bearer to api.github.com
+	// on every gh call. GitHub access for the agent comes from the host env
+	// and the credential snapshot, never from this layer. A ref-bearing run
+	// (headless repair on an existing branch, or an interactive seat pinned to
+	// a branch) changes the checkout, not the credentials.
 	if qw.AuthToken != "" {
 		envMap["WORKER_AUTH_TOKEN"] = qw.AuthToken
 	}

@@ -60,7 +60,7 @@ session's environment. The layer applied at start is pinned, and a later
 removed, or changed — is refused rather than silently handed the first
 session's `DONMAI_SESSION_ID` and `DONMAI_API_URL`. The refusal names the
 diverging keys and never quotes a value, because this is the layer the
-runner puts `WORKER_AUTH_TOKEN` and `GH_TOKEN` in. An identical layer is
+runner puts `WORKER_AUTH_TOKEN` in. An identical layer is
 always accepted, so a session resuming its own thread is unaffected, and
 the interactive PTY spawn mode runs its own process and is outside the
 invariant entirely. `donmai agent run` builds one Provider per session,
