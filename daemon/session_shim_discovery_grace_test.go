@@ -107,7 +107,7 @@ func TestAwaitShimRecordAdoptsALateArrivingMatchingRecord(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	got, err := awaitShimRecord(ctx, registry, id, launch, started)
+	got, err := awaitShimRecord(ctx, shimDiscoveryWait{registry: registry, id: id, launch: launch, started: started})
 	if putErr := <-errCh; putErr != nil {
 		t.Fatalf("Put late record: %v", putErr)
 	}
@@ -135,7 +135,10 @@ func TestAwaitShimRecordStillFailsWhenNoRecordEverAppears(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	if _, err := awaitShimRecord(ctx, registry, id, launch, sessionshim.ProcessIdentity{PID: 4242, StartedAt: 111}); err == nil {
+	if _, err := awaitShimRecord(ctx, shimDiscoveryWait{
+		registry: registry, id: id, launch: launch,
+		started: sessionshim.ProcessIdentity{PID: 4242, StartedAt: 111},
+	}); err == nil {
 		t.Fatal("awaitShimRecord succeeded for a launch that never published a record")
 	}
 }
@@ -168,7 +171,7 @@ func TestAwaitShimRecordRefusesALateRecordFromADifferentIncarnation(t *testing.T
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	_, err = awaitShimRecord(ctx, registry, id, launch, wantStarted)
+	_, err = awaitShimRecord(ctx, shimDiscoveryWait{registry: registry, id: id, launch: launch, started: wantStarted})
 	if putErr := <-errCh; putErr != nil {
 		t.Fatalf("Put stale record: %v", putErr)
 	}
@@ -208,7 +211,7 @@ func TestAwaitShimRecordRefusesAReusedPIDWithADifferentStartTime(t *testing.T) {
 
 	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Millisecond)
 	defer cancel()
-	_, err = awaitShimRecord(ctx, registry, id, launch, wantStarted)
+	_, err = awaitShimRecord(ctx, shimDiscoveryWait{registry: registry, id: id, launch: launch, started: wantStarted})
 	if putErr := <-errCh; putErr != nil {
 		t.Fatalf("Put reused-pid record: %v", putErr)
 	}

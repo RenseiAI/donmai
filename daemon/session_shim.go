@@ -1269,9 +1269,17 @@ type sessionShimState struct {
 	// would therefore never return mid-test). Set once, before the launch that
 	// arms it.
 	afterAmbiguousLaunchDischarge func(sessionshim.Identity, bool)
-	fence                         *sessionshim.Fence
-	fences                        map[string]sessionshim.Fence
-	fenceRequests                 map[string]sessionshim.FenceRequest
+	// launchProcess, when set, replaces the OS-backed control the discovery wait
+	// uses to ask whether a freshly launched worker is still alive and to stop it
+	// when the wait abandons it. Nil in every production daemon: it exists so a
+	// test can script a process's liveness deterministically, or observe the pid
+	// a real launch spawned — which is otherwise unobservable, because
+	// startShimProcess releases the process handle by design. Set once, under mu,
+	// before the launch that reads it.
+	launchProcess func(sessionshim.ProcessIdentity) shimLaunchProcess
+	fence         *sessionshim.Fence
+	fences        map[string]sessionshim.Fence
+	fenceRequests map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.
