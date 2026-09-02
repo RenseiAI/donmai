@@ -277,13 +277,14 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		preparedHostID string
 	)
 	controllerOpts := sessionshim.ControllerOptions{
-		ControllerID:          d.controllerID(),
-		EventBacklogBudget:    cfg.EventBacklogBudget,
-		ExpectedWorkarea:      workarea,
-		ExpectedWorkareaRoot:  layout.Root.String(),
-		DialTimeout:           cfg.launchTimeout(),
-		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
-		Logger:                slog.Default(),
+		ControllerID:              d.controllerID(),
+		EventBacklogBudget:        cfg.EventBacklogBudget,
+		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		ExpectedWorkarea:          workarea,
+		ExpectedWorkareaRoot:      layout.Root.String(),
+		DialTimeout:               cfg.launchTimeout(),
+		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
+		Logger:                    slog.Default(),
 		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
 			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
 			if hostErr != nil {

@@ -611,6 +611,15 @@ type SessionShimConfig struct {
 	// burst again.
 	EventBacklogBudget int
 
+	// EventBacklogStallDeadline overrides how long a session's carrier may go
+	// without taking a whole backlog budget's worth of bytes before the
+	// controller fails closed and the session is released to quarantine. Zero
+	// uses the sessionshim default. Values below the package floor (which sits
+	// above the durable-heartbeat receipt wait bound) are raised to it rather
+	// than honoured: a deadline under that bound severs carriers through the
+	// very knob meant to tune the back-pressure.
+	EventBacklogStallDeadline time.Duration
+
 	// OrgID is the organization half of the lifecycle identity (§D2). A
 	// standalone OSS daemon has no organization boundary, so it defaults to
 	// "local" — a real value rather than an empty one, because the identity is
@@ -1690,11 +1699,12 @@ func (d *Daemon) sessionShimAdoptOptions(
 	cfg SessionShimConfig,
 ) (sessionshim.AdoptOptions, *sessionShimAdoptionPreparations, error) {
 	opts := sessionshim.AdoptOptions{
-		Registry:              registry,
-		ControllerID:          d.controllerID(),
-		EventBacklogBudget:    cfg.EventBacklogBudget,
-		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
-		Logger:                slog.Default(),
+		Registry:                  registry,
+		ControllerID:              d.controllerID(),
+		EventBacklogBudget:        cfg.EventBacklogBudget,
+		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
+		Logger:                    slog.Default(),
 	}
 	preparations := &sessionShimAdoptionPreparations{
 		prepared: make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult),

@@ -305,6 +305,23 @@ var snapshotResultCodesByByte = func() map[byte]ErrorCode {
 	return m
 }()
 
+// MaxSnapshotResultBytes is the largest verbatim payload a SnapshotResult can
+// carry and still fit one wire message, after the type byte and fixed header.
+//
+// It exists so a producer can decide whether a result fits by ARITHMETIC rather
+// than by encoding it to find out: the header is fixed-width and the payload is
+// copied verbatim, so the encoded size is exactly known in advance. The bounded
+// Snapshot path measures millions of bytes per emit; making it encode twice to
+// learn a number it can compute is pure waste.
+const MaxSnapshotResultBytes = MaxMessageBytes - 1 - snapshotResultHeaderLen
+
+// SnapshotResultMessageBytes is the exact framed size — type byte plus body —
+// that EncodeSnapshotResult will produce for a payload of payloadLen bytes. It
+// is the number Writer compares against MaxMessageBytes.
+func SnapshotResultMessageBytes(payloadLen int) int {
+	return 1 + snapshotResultHeaderLen + payloadLen
+}
+
 // EncodeSnapshotResult preserves Bytes verbatim after a fixed binary header.
 func EncodeSnapshotResult(r SnapshotResult) ([]byte, error) {
 	status, ok := snapshotResultCodes[r.Code]

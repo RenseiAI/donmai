@@ -30,6 +30,42 @@
 // downgrade); the two byte-carrying messages (Output, Input) use a fixed binary
 // header so terminal bytes are never base64-inflated through a control encoding.
 //
+// # Snapshots are bounded at the producer, not by the frame shape
+//
+// Every message type but one has an inherent size: Output is capped by the PTY
+// host at 32 KiB, Input by its caller, and the control bodies are small and
+// fixed. A Snapshot is the exception — it carries a serialized screen whose
+// scrollback tail is a per-session policy, so a lineage with a long screen
+// history produces one that does not fit MaxMessageBytes at all.
+//
+// A message the framer refuses is a message the SHIM cannot send, and a shim
+// that cannot send its resume Snapshot used to close the connection carrying it,
+// which cost live sessions their controllers on production hosts. The shim
+// therefore bounds an oversized Snapshot before it writes: it re-encodes the
+// screen keeping the newest scrollback lines that fit and dropping the oldest
+// (sessionshim's boundSnapshotFrame).
+//
+// This is deliberately NOT a wire change and is gated on no protocol version:
+// attachwire.Screen already carries its scrollback as a length-prefixed list, so
+// a bounded Snapshot is an ordinary canonical Screen inside an ordinary
+// canonical frame, and every receiver — including a released selected-v2 one —
+// decodes it exactly as it decodes any other. A receiver-visible truncation
+// marker was considered and rejected for the same reason: the Screen decoder
+// rejects trailing bytes, so a new field would stop precisely the older
+// controllers this protocol exists to keep adopting. The shortening is announced
+// in the shim's structured log instead.
+//
+// The bound is a pure function of the frame and the ceiling, so a retained frame
+// bounds to identical wire bytes on every delivery — a re-adoption ring hit
+// replays the same bytes for the same host sequence.
+//
+// The governing rule is ADR-2026-08-17 §D5.1, which is where this carve-out from
+// §D5's byte-for-byte rule is declared normatively, along with the cross-version
+// caveat: the ceiling applies to raw frame bytes on a selected-v3 HostFrame, to
+// the whole base64-inflated control message on a selected-v1/v2 Snapshot, and to
+// the whole result message on a SnapshotResult, so a selected-v2 controller sees
+// a more aggressively trimmed screen than a selected-v3 one for the same session.
+//
 // # Versioning
 //
 // Compatibility is an advertised min/max RANGE plus a selected version, never

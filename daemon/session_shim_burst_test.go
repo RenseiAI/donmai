@@ -33,6 +33,7 @@ type readoptedBurstFixture struct {
 func newReadoptedBurstFixture(
 	t *testing.T,
 	backlogBudget int,
+	backlogStall time.Duration,
 	ringBytes int,
 	observe func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent),
 ) *readoptedBurstFixture {
@@ -97,6 +98,7 @@ func newReadoptedBurstFixture(
 		AdoptionBatchOrgIDs:          []string{id.OrgID},
 		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
 		EventBacklogBudget:         backlogBudget,
+		EventBacklogStallDeadline:  backlogStall,
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
 		PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
@@ -193,7 +195,7 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 		frames   int
 		maxLag   uint64
 	)
-	fixture := newReadoptedBurstFixture(t, 0, 0, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 0, 0, 0, func(d *Daemon, id sessionshim.Identity, event sessionshim.ControllerEvent) {
 		// Sampled from the carrier's own seat, at the instant the frame is
 		// handed over, which is the only place the question is meaningful.
 		cursor := d.SessionShimForwardedSeq(id.OrgID, id.SessionID)
@@ -252,25 +254,30 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 }
 
 // TestBacklogBudgetOverrunFailsClosedHonestly covers the other side of the same
-// guarantee: what happens past the budget.
+// guarantee: what happens when a consumer STOPS.
 //
-// The reader must never block on a consumer — it is the only goroutine that can
-// receive a durable heartbeat receipt — so beyond the slack the controller
-// fails closed and drops the connection. That is deliberate and stays. What the
-// daemon owes is honesty about it: release the session rather than keep
-// publishing it as adopted against a socket nobody can write to. Before the
-// fix it kept the dead entry, so `host status` showed a running session and
-// every later call returned "use of closed network connection" forever.
+// Reaching the budget is no longer that decision — a consumer that is merely
+// behind now gets back-pressure, which is what
+// TestBackPressureKeepsTheCarrierWhenTheConsumerIsBehind covers. But the reader
+// still may not stall forever: it is the only goroutine that can receive a
+// durable heartbeat receipt. So past the STALL DEADLINE the controller fails
+// closed and drops the connection. That is deliberate and stays. What the daemon
+// owes is honesty about it: release the session rather than keep publishing it
+// as adopted against a socket nobody can write to. Before the fix it kept the
+// dead entry, so `host status` showed a running session and every later call
+// returned "use of closed network connection" forever.
 //
-// Two things make this deterministic rather than a race with the scheduler: the
-// carrier's own callback is held, so the consumer cannot drain; and the budget
-// is set small through the public config seam, so the bound is reached by
-// construction instead of by generating megabytes through a PTY.
+// Three things make this deterministic rather than a race with the scheduler:
+// the carrier's own callback is held for the whole decision, so the consumer
+// genuinely never drains; the budget is set small through the public config
+// seam, so the bound is reached by construction instead of by generating
+// megabytes through a PTY; and the stall deadline is set short through the same
+// seam, so the test does not wait out the production half-minute.
 func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	var holding atomic.Bool
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	fixture := newReadoptedBurstFixture(t, 8<<10, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+	fixture := newReadoptedBurstFixture(t, 8<<10, 500*time.Millisecond, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
 		// Adoption itself runs through this callback (the mandatory Snapshot is
 		// staged on the consumer), so the hold only arms once the session is
 		// published and activated.
@@ -295,12 +302,14 @@ func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 			break
 		}
 	}
-	releaseOnce.Do(func() { close(release) })
 	if !overflowed {
-		waitFor(t, 60*time.Second, "the undrained backlog to fail closed", func() bool {
+		waitFor(t, 60*time.Second, "the stalled backlog to fail closed on a stuck consumer", func() bool {
 			return daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, 100, 30, 0, 0) != nil
 		})
 	}
+	// Released only AFTER the fail-closed decision, so the consumer was
+	// genuinely stopped for the whole of it rather than merely behind.
+	releaseOnce.Do(func() { close(release) })
 
 	waitFor(t, 60*time.Second, "the failed-closed controller to release its session", func() bool {
 		return len(daemon.AdoptedSessionShims()) == 0 && len(daemon.QuarantinedSessions()) == 1
@@ -317,6 +326,60 @@ func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "is not adopted by this daemon") {
 		t.Fatalf("write after failing closed = %v, want an honest not-adopted refusal", err)
 	}
+}
+
+// TestBackPressureKeepsTheCarrierWhenTheConsumerIsBehind is the daemon-level pin
+// for the failure this whole change is about.
+//
+// Field symptom, twice in one day on production hosts: a re-adopted lineage
+// pushed more through its carrier than the consumer could take at that instant,
+// the controller answered "event backlog exceeded the in-flight budget of
+// 8388608", dropped the shim connection, and a healthy seat was quarantined and
+// later reaped. The consumer was never stuck — it was BEHIND, which every other
+// layer of this stack answers with back-pressure.
+//
+// So the budget is a high-water mark now: the reader stalls, which stalls the
+// shim's output pump behind a socket nobody is draining, and the shim's ring
+// does the one job it exists for. The carrier survives.
+//
+// The consumer here drains on every event but slowly enough that a burst of
+// thousands cannot keep up with it, against a budget small enough that the bound
+// is reached by construction. Restoring the immediate refusal in
+// eventBacklog.push turns this RED at the first assertion: the session is gone
+// from the adopted set and sitting in quarantine.
+func TestBackPressureKeepsTheCarrierWhenTheConsumerIsBehind(t *testing.T) {
+	var delivered atomic.Int64
+	fixture := newReadoptedBurstFixture(t, 8<<10, 0, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+		delivered.Add(1)
+		// Slow, never stopped. This is the distinction the fix turns on.
+		time.Sleep(200 * time.Microsecond)
+	})
+	id := fixture.identity
+	daemon := fixture.daemon
+
+	const burst = 2048
+	for cycle := range burst {
+		//nolint:gosec // G115: the alternation is 0 or 1 on a small literal
+		if err := daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, uint32(99+(cycle&1)), 29, 0, 0); err != nil {
+			t.Fatalf("resize %d through a merely-behind carrier: %v — "+
+				"back-pressure was replaced by a drop (%d events delivered)", cycle, err, delivered.Load())
+		}
+	}
+
+	if adopted := daemon.AdoptedSessionShims(); len(adopted) != 1 || adopted[0] != id {
+		t.Fatalf("adopted sessions after the burst = %+v, want exactly [%s]; quarantined %+v",
+			adopted, id, daemon.QuarantinedSessions())
+	}
+	if quarantined := daemon.QuarantinedSessions(); len(quarantined) != 0 {
+		t.Fatalf("quarantined after a burst a behind consumer absorbed = %+v", quarantined)
+	}
+	// The control channel is still this daemon's, and still usable.
+	if err := daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("after-backpressure\r")); err != nil {
+		t.Fatalf("write to the session after the burst: %v", err)
+	}
+	waitFor(t, 60*time.Second, "the behind consumer to keep receiving after the burst", func() bool {
+		return delivered.Load() > burst/2
+	})
 }
 
 // TestConsumerDropReleasesShimOwnershipInsteadOfStrandingIt pins the same
