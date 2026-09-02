@@ -57,8 +57,14 @@
 //
 // The bound is a pure function of the frame and the ceiling, so a retained frame
 // bounds to identical wire bytes on every delivery — a re-adoption ring hit
-// replays the same bytes for the same host sequence, which is what §D5's
-// byte-for-byte rule requires of one sequence.
+// replays the same bytes for the same host sequence.
+//
+// The governing rule is ADR-2026-08-17 §D5.1, which is where this carve-out from
+// §D5's byte-for-byte rule is declared normatively, along with the cross-version
+// caveat: the ceiling applies to raw frame bytes on a selected-v3 HostFrame, to
+// the whole base64-inflated control message on a selected-v1/v2 Snapshot, and to
+// the whole result message on a SnapshotResult, so a selected-v2 controller sees
+// a more aggressively trimmed screen than a selected-v3 one for the same session.
 //
 // # Versioning
 //

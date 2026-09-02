@@ -32,7 +32,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   carrier. No wire change: a bounded Snapshot is an ordinary canonical Screen
   that every receiver, including a released selected-v2 one, already decodes,
   and the bound is deterministic so one host sequence never carries two
-  different payloads. `sessionshim.AdoptOptions` /
+  different payloads — declared normatively as ADR-2026-08-17 §D5.1, with the
+  cross-version caveat that a selected-v2 controller sees a more aggressively
+  trimmed screen than a selected-v3 one because the ceiling applies to a
+  base64-inflated control message rather than raw frame bytes. The stall
+  deadline is CUMULATIVE, not a per-call idle timer: it is anchored on the
+  backlog when the consumer first falls behind and reset only when the queue
+  reaches empty, so a consumer that dribbles back one event at a time cannot
+  hold the socket reader indefinitely. `sessionshim.AdoptOptions` /
   `daemon.SessionShimConfig` gain an additive `EventBacklogStallDeadline` knob.
 
 ---

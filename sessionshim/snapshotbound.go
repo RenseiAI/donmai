@@ -31,6 +31,10 @@ import (
 // the same "keep the recent, declare the loss" shape the ring already uses for
 // output (§D5).
 //
+// The governing rule is ADR-2026-08-17 §D5.1 — the normative carve-out from
+// §D5's byte-for-byte rule, which this code implements and which states the
+// four properties that keep it compatible with the rest of §D5.
+//
 // # Wire compatibility
 //
 // This changes no message shape and no encoding. attachwire.Screen already
@@ -55,43 +59,55 @@ import (
 // so.
 var ErrSnapshotUnboundable = errors.New("sessionshim: snapshot exceeds the local wire without any scrollback")
 
+// snapshotBound reports what bounding did to a Snapshot.
+//
+// Rewritten is tracked separately from Dropped because the two can disagree: a
+// screen that did not fit as it arrived can be brought inside the ceiling by the
+// re-encode alone, with every scrollback line retained. The bytes still changed,
+// and a log line keyed on the dropped COUNT would stay silent about it.
+type snapshotBound struct {
+	// Dropped is how many scrollback lines were removed, oldest first.
+	Dropped int
+	// Rewritten reports that the returned payload is not the one passed in.
+	Rewritten bool
+}
+
 // boundSnapshotFrame returns frame unchanged when sizeOf already reports it
 // within limit, and otherwise the same Snapshot frame — same sequence, same
 // rel-time, same atSeq, same snapshot format — re-encoded with the oldest
-// scrollback lines dropped until it fits. The second result is how many lines
-// were dropped; zero means the frame was returned verbatim.
+// scrollback lines dropped until it fits.
 func boundSnapshotFrame(
 	frame attachwire.Frame,
 	limit int,
 	sizeOf func(attachwire.Frame) (int, error),
-) (attachwire.Frame, int, error) {
+) (attachwire.Frame, snapshotBound, error) {
 	size, err := sizeOf(frame)
 	if err != nil {
-		return attachwire.Frame{}, 0, err
+		return attachwire.Frame{}, snapshotBound{}, err
 	}
 	if size <= limit {
-		return frame, 0, nil
+		return frame, snapshotBound{}, nil
 	}
 	if frame.Type != attachwire.TypeSnapshot {
-		return attachwire.Frame{}, 0, fmt.Errorf(
+		return attachwire.Frame{}, snapshotBound{}, fmt.Errorf(
 			"sessionshim: %w: a %s host frame of %d bytes has no scrollback to shorten",
 			ErrSnapshotUnboundable, frame.Type, size)
 	}
 	envelope, err := attachwire.DecodeSnapshotEnvelope(frame.Payload)
 	if err != nil {
-		return attachwire.Frame{}, 0, fmt.Errorf("sessionshim: bound snapshot: %w", err)
+		return attachwire.Frame{}, snapshotBound{}, fmt.Errorf("sessionshim: bound snapshot: %w", err)
 	}
 	if envelope.SnapFormat != attachwire.SnapFormatScreen {
-		return attachwire.Frame{}, 0, fmt.Errorf(
+		return attachwire.Frame{}, snapshotBound{}, fmt.Errorf(
 			"sessionshim: %w: snapshot format %d is not a screen", ErrSnapshotUnboundable, envelope.SnapFormat)
 	}
-	bounded, dropped, err := boundSnapshotScreen(envelope.Snap, limit, func(screen []byte) (int, error) {
+	bounded, result, err := boundSnapshotScreen(envelope.Snap, limit, func(screen []byte) (int, error) {
 		return sizeOf(snapshotFrameWithScreen(frame, envelope, screen))
 	})
 	if err != nil {
-		return attachwire.Frame{}, 0, err
+		return attachwire.Frame{}, snapshotBound{}, err
 	}
-	return snapshotFrameWithScreen(frame, envelope, bounded), dropped, nil
+	return snapshotFrameWithScreen(frame, envelope, bounded), result, nil
 }
 
 // snapshotFrameWithScreen rebuilds frame around a different serialized screen,
@@ -119,17 +135,17 @@ func boundSnapshotScreen(
 	screen []byte,
 	limit int,
 	sizeOf func([]byte) (int, error),
-) ([]byte, int, error) {
+) ([]byte, snapshotBound, error) {
 	size, err := sizeOf(screen)
 	if err != nil {
-		return nil, 0, err
+		return nil, snapshotBound{}, err
 	}
 	if size <= limit {
-		return screen, 0, nil
+		return screen, snapshotBound{}, nil
 	}
 	decoded, err := attachwire.DecodeScreen(screen)
 	if err != nil {
-		return nil, 0, fmt.Errorf("sessionshim: bound snapshot: decode screen: %w", err)
+		return nil, snapshotBound{}, fmt.Errorf("sessionshim: bound snapshot: decode screen: %w", err)
 	}
 	history := decoded.Scrollback
 	total := len(history)
@@ -151,10 +167,10 @@ func boundSnapshotScreen(
 	// trimming helps and there is nothing honest left to try.
 	best, size, err := keeping(0)
 	if err != nil {
-		return nil, 0, err
+		return nil, snapshotBound{}, err
 	}
 	if size > limit {
-		return nil, 0, fmt.Errorf(
+		return nil, snapshotBound{}, fmt.Errorf(
 			"sessionshim: %w: %d bytes with no scrollback, limit %d", ErrSnapshotUnboundable, size, limit)
 	}
 	// Encoded size is monotone in the number of retained lines, so the largest
@@ -165,7 +181,7 @@ func boundSnapshotScreen(
 		mid := lo + (hi-lo)/2
 		encoded, measured, keepErr := keeping(mid)
 		if keepErr != nil {
-			return nil, 0, keepErr
+			return nil, snapshotBound{}, keepErr
 		}
 		if measured <= limit {
 			best, bestKeep = encoded, mid
@@ -174,5 +190,8 @@ func boundSnapshotScreen(
 		}
 		hi = mid - 1
 	}
-	return best, total - bestKeep, nil
+	// Rewritten is unconditionally true here: this point is only reached when the
+	// screen did NOT fit as it arrived, so the bytes changed even in the corner
+	// where the re-encode alone was enough and every line survived.
+	return best, snapshotBound{Dropped: total - bestKeep, Rewritten: true}, nil
 }

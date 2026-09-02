@@ -1174,25 +1174,29 @@ func (s *Shim) hostFrameBody(requestID uint64, frame attachwire.Frame) ([]byte, 
 	if !errors.Is(err, shimwire.ErrMessageTooLarge) {
 		return nil, err
 	}
-	bounded, dropped, boundErr := boundSnapshotFrame(frame, shimwire.MaxHostFrameBytes,
+	bounded, result, boundErr := boundSnapshotFrame(frame, shimwire.MaxHostFrameBytes,
 		func(f attachwire.Frame) (int, error) { return len(f.Encode()), nil })
 	if boundErr != nil {
 		return nil, boundErr
 	}
-	s.logSnapshotTrim("host frame", frame, dropped)
+	s.logSnapshotTrim("host frame", frame.Seq, result)
 	return encode(bounded)
 }
 
 // logSnapshotTrim is the only place a bounded Snapshot is announced. The trim is
 // deliberately not a wire field (see snapshotbound.go), so this log line is the
 // audit trail for a shortened history.
-func (s *Shim) logSnapshotTrim(carrier string, frame attachwire.Frame, dropped int) {
-	if dropped == 0 {
+//
+// It keys on Rewritten, not on the dropped COUNT: a screen can be brought inside
+// the ceiling by the re-encode alone with every line retained, and bytes that
+// changed must not go unreported just because no line was dropped.
+func (s *Shim) logSnapshotTrim(carrier string, seq uint64, bound snapshotBound) {
+	if !bound.Rewritten {
 		return
 	}
 	s.logger.Warn("sessionshim: snapshot history truncated to fit the local wire",
-		"session", s.id.String(), "carrier", carrier, "seq", frame.Seq,
-		"droppedScrollbackLines", dropped)
+		"session", s.id.String(), "carrier", carrier, "seq", seq,
+		"droppedScrollbackLines", bound.Dropped)
 }
 
 func (s *Shim) writeHostFrameSnapshotPair(
@@ -1560,20 +1564,33 @@ func writeSnapshotResult(ctrl *controllerConn, result shimwire.SnapshotResult) e
 // body is JSON: the screen bytes are base64-inflated on the way out, so any
 // arithmetic on the raw length would be measuring the wrong number.
 func (s *Shim) writeSnapshotMsg(ctrl *controllerConn, snap shimwire.SnapshotMsg) error {
-	sizeOf := func(screen []byte) (int, error) {
-		body, err := shimwire.EncodeSnapshot(shimwire.SnapshotMsg{AtSeq: snap.AtSeq, Screen: screen})
-		if err != nil {
-			return 0, err
-		}
-		return messageBytes(body), nil
+	encode := func(screen []byte) ([]byte, error) {
+		return shimwire.EncodeSnapshot(shimwire.SnapshotMsg{AtSeq: snap.AtSeq, Screen: screen})
 	}
-	bounded, dropped, err := boundSnapshotScreen(snap.Screen, shimwire.MaxMessageBytes, sizeOf)
+	// The ordinary path encodes exactly once and decodes nothing: the body it
+	// built is the body it writes.
+	body, err := encode(snap.Screen)
 	if err != nil {
 		return err
 	}
-	s.logSnapshotTrim("snapshot message", attachwire.Frame{Seq: snap.AtSeq}, dropped)
-	snap.Screen = bounded
-	return writeTyped(ctrl.w, shimwire.TypeSnapshot, func() ([]byte, error) { return shimwire.EncodeSnapshot(snap) })
+	if messageBytes(body) > shimwire.MaxMessageBytes {
+		bounded, result, boundErr := boundSnapshotScreen(snap.Screen, shimwire.MaxMessageBytes,
+			func(screen []byte) (int, error) {
+				encoded, encErr := encode(screen)
+				if encErr != nil {
+					return 0, encErr
+				}
+				return messageBytes(encoded), nil
+			})
+		if boundErr != nil {
+			return boundErr
+		}
+		s.logSnapshotTrim("snapshot message", snap.AtSeq, result)
+		if body, err = encode(bounded); err != nil {
+			return err
+		}
+	}
+	return ctrl.w.Write(shimwire.TypeSnapshot, body)
 }
 
 // boundSnapshotResultBytes bounds the screen or encoded Snapshot frame a
@@ -1594,25 +1611,36 @@ func (s *Shim) boundSnapshotResultBytes(result shimwire.SnapshotResult) (shimwir
 		}
 		return messageBytes(body), nil
 	}
+	// The overwhelmingly common case answers here, before anything is decoded or
+	// re-encoded: an emit result that already fits is returned with its frame
+	// bytes untouched rather than paying a full DecodeFrame plus Encode round
+	// trip on every snapshot request.
+	size, err := sizeOf(result.Bytes)
+	if err != nil {
+		return shimwire.SnapshotResult{}, err
+	}
+	if size <= shimwire.MaxMessageBytes {
+		return result, nil
+	}
 	if result.Mode == shimwire.SnapshotEmit {
-		frame, err := attachwire.DecodeFrame(result.Bytes)
-		if err != nil {
-			return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: bound snapshot result: %w", err)
+		frame, decErr := attachwire.DecodeFrame(result.Bytes)
+		if decErr != nil {
+			return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: bound snapshot result: %w", decErr)
 		}
-		bounded, dropped, boundErr := boundSnapshotFrame(frame, shimwire.MaxMessageBytes,
+		bounded, boundResult, boundErr := boundSnapshotFrame(frame, shimwire.MaxMessageBytes,
 			func(f attachwire.Frame) (int, error) { return sizeOf(f.Encode()) })
 		if boundErr != nil {
 			return shimwire.SnapshotResult{}, boundErr
 		}
-		s.logSnapshotTrim("snapshot result frame", frame, dropped)
+		s.logSnapshotTrim("snapshot result frame", frame.Seq, boundResult)
 		result.Bytes = bounded.Encode()
 		return result, nil
 	}
-	bounded, dropped, err := boundSnapshotScreen(result.Bytes, shimwire.MaxMessageBytes, sizeOf)
+	bounded, boundResult, err := boundSnapshotScreen(result.Bytes, shimwire.MaxMessageBytes, sizeOf)
 	if err != nil {
 		return shimwire.SnapshotResult{}, err
 	}
-	s.logSnapshotTrim("snapshot result screen", attachwire.Frame{Seq: result.AtSeq}, dropped)
+	s.logSnapshotTrim("snapshot result screen", result.AtSeq, boundResult)
 	result.Bytes = bounded
 	return result, nil
 }

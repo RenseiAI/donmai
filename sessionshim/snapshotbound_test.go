@@ -297,12 +297,12 @@ func TestBoundSnapshotMessageFitsThePreV3JSONCarrier(t *testing.T) {
 		t.Fatalf("fixture screen encodes to %d bytes (err %v); it must exceed %d to exercise the bound",
 			size, err, shimwire.MaxMessageBytes)
 	}
-	bounded, dropped, err := boundSnapshotScreen(raw, shimwire.MaxMessageBytes, sizeOf)
+	bounded, result, err := boundSnapshotScreen(raw, shimwire.MaxMessageBytes, sizeOf)
 	if err != nil {
 		t.Fatalf("boundSnapshotScreen: %v", err)
 	}
-	if dropped == 0 {
-		t.Fatal("boundSnapshotScreen reported no dropped lines for a screen that did not fit")
+	if result.Dropped == 0 || !result.Rewritten {
+		t.Fatalf("boundSnapshotScreen reported %+v for a screen that did not fit", result)
 	}
 	size, err := sizeOf(bounded)
 	if err != nil {
@@ -326,13 +326,13 @@ func TestBoundSnapshotMessageFitsThePreV3JSONCarrier(t *testing.T) {
 func TestBoundedSnapshotIsAnOrdinaryScreenForAnyReceiver(t *testing.T) {
 	t.Parallel()
 	frame := snapshotFrame(t, 91, 90, screenWithHistory(200, 24, 1500))
-	bounded, dropped, err := boundSnapshotFrame(frame, shimwire.MaxHostFrameBytes,
+	bounded, result, err := boundSnapshotFrame(frame, shimwire.MaxHostFrameBytes,
 		func(f attachwire.Frame) (int, error) { return len(f.Encode()), nil })
 	if err != nil {
 		t.Fatalf("boundSnapshotFrame: %v", err)
 	}
-	if dropped == 0 {
-		t.Fatal("fixture did not exercise the bound")
+	if result.Dropped == 0 || !result.Rewritten {
+		t.Fatalf("fixture did not exercise the bound: %+v", result)
 	}
 	encoded := bounded.Encode()
 	roundTripped, err := attachwire.DecodeFrame(encoded)

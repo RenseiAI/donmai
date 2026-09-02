@@ -386,6 +386,41 @@ When a session appears wedged in the dashboard:
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
 
+### Adopted session-shim carriers — back-pressure and the control-plane wedge
+
+When a session-shim carrier's consumer falls behind, the controller's socket
+reader stalls rather than dropping the connection (`sessionshim.EventBacklogBudget`
+is a back-pressure high-water mark, not a kill threshold). The stall propagates:
+the shim's output pump blocks writing to a socket nobody is draining.
+
+**Accepted trade — a stalled carrier delays every shim→controller REPLY for that
+one session.** `shimwire.Writer` serialises every message behind a single mutex
+so a torn message cannot desynchronise the length framing, and the shim's output
+pump and its control replies share one writer. The shim's `readControl` goroutine
+keeps reading and keeps ACTING immediately — input reaches the PTY, a `Resize`
+is applied, a `Stop` starts terminating the harness — but anything it has to
+WRITE back queues behind the blocked pump: durable heartbeat receipts, snapshot
+results, error frames, and the terminal `Exit` frame itself. Each of those can
+wait up to `sessionshim`'s stall deadline (30s by default,
+`SessionShimConfig.EventBacklogStallDeadline`).
+
+Concretely, a `Stop` into a stalled carrier takes effect at once but its exit
+observation may not surface for up to that deadline, and `Controller.Heartbeat`
+returns `ErrHeartbeatReceiptPending` in the meantime (which keeps the connection
+and is retried, by design).
+
+That is deliberately preferred to the alternative it replaced: dropping the shim
+connection outright, which loses the durable carrier, leaves the harness
+unsupervised, and quarantines a healthy seat. A delayed acknowledgement is
+recoverable; a severed carrier is not. Past the stall deadline the controller
+fails closed as before, and the session is released to quarantine rather than
+published as adopted against a socket nobody can write to.
+
+Symptom to recognise in the log: repeated
+`durable heartbeat persistence receipt is still pending` on one session with no
+`controller dropped its shim connection` line — that is a consumer that is behind,
+being absorbed, not a broken socket.
+
 ## Failure modes the daemon classifies (high-level)
 
 | Symptom | Where it surfaces |

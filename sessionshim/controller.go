@@ -311,8 +311,17 @@ const (
 // closed.
 const EventBacklogBudget = ptyhost.DefaultRingBytes
 
-// eventBacklogStallDeadline bounds how long the socket reader will wait for a
-// consumer to drain before the controller fails closed.
+// eventBacklogStallDeadline bounds how long the consumer may fail to CATCH UP —
+// cumulatively, across every push — before the controller fails closed.
+//
+// It is not a per-call idle timer. The clock starts the first time a push has to
+// wait and is reset in exactly one place: when the queue reaches empty. A
+// consumer that hands back one event every few seconds never empties the queue,
+// so it never resets the clock, and it trips this deadline like any other
+// consumer that has stopped keeping up. A per-call timer would let that consumer
+// hold the socket reader indefinitely: every individual push would return before
+// its own clock expired, heartbeat receipts would only trickle through, and the
+// daemon's cursor acknowledger would loop on ErrHeartbeatReceiptPending forever.
 //
 // It is deliberately LONGER than heartbeatReceiptWaitBound, and that ordering
 // is load-bearing. The one way a stalled reader can deadlock its own consumer
@@ -1326,6 +1335,10 @@ type eventBacklog struct {
 	queue  []ControllerEvent
 	bytes  int
 	closed bool
+	// stalledSince is when the consumer last failed to keep up: set the first
+	// time a push has to wait, cleared only when pop drains the queue to empty.
+	// It is the anchor of the CUMULATIVE stall deadline — see push.
+	stalledSince time.Time
 
 	// budget, stall and abort are immutable after construction; push reads them
 	// without the lock.
@@ -1390,7 +1403,6 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 			timer.Stop()
 		}
 	}()
-	var expired <-chan time.Time
 	for {
 		b.mu.Lock()
 		if b.closed {
@@ -1407,21 +1419,43 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 			b.mu.Unlock()
 			return nil
 		}
+		// The deadline lives on the BACKLOG, not on this call. A per-push timer
+		// measures one caller's patience, which a dribbling consumer resets for
+		// free: hand back one event every few seconds and every push returns
+		// before its own clock runs out while the queue never once empties. The
+		// reader is then parked in push essentially forever, heartbeat receipts
+		// only trickle through, and the fail-closed verdict this deadline exists
+		// to reach is never reached. stalledSince is cleared in exactly one
+		// place — pop, when the queue actually reaches EMPTY — so what is bounded
+		// is the consumer catching up, not any single hand-off.
+		if b.stalledSince.IsZero() {
+			b.stalledSince = time.Now()
+		}
+		remaining := b.stall - time.Since(b.stalledSince)
+		stalled := b.stalledSince
 		room := b.drained
 		b.mu.Unlock()
-		// The deadline is armed on the FIRST stall and runs across the whole
-		// wait, so a consumer that dribbles out one event every few seconds
-		// cannot reset it indefinitely while never catching up.
+		if remaining <= 0 {
+			return fmt.Errorf("%w of %d bytes: the consumer has not caught up for %s",
+				ErrEventBacklogExceeded, b.budget, time.Since(stalled).Round(time.Millisecond))
+		}
 		if timer == nil {
-			timer = time.NewTimer(b.stall)
-			expired = timer.C
+			timer = time.NewTimer(remaining)
+		} else {
+			if !timer.Stop() {
+				select {
+				case <-timer.C:
+				default:
+				}
+			}
+			timer.Reset(remaining)
 		}
 		select {
 		case <-room:
 		case <-b.abort:
 			return io.EOF
-		case <-expired:
-			return fmt.Errorf("%w of %d bytes: the consumer drained nothing for %s",
+		case <-timer.C:
+			return fmt.Errorf("%w of %d bytes: the consumer has not caught up for %s",
 				ErrEventBacklogExceeded, b.budget, b.stall)
 		}
 	}
@@ -1436,6 +1470,13 @@ func (b *eventBacklog) pop() (ControllerEvent, bool) {
 			b.queue[0] = ControllerEvent{} // let the frame bytes go
 			b.queue = b.queue[1:]
 			b.bytes -= eventBacklogCost(event)
+			if len(b.queue) == 0 {
+				// The consumer caught up. That — and only that — is progress
+				// against the stall deadline; a partial hand-off that leaves the
+				// queue standing is the dribble the cumulative bound exists to
+				// catch.
+				b.stalledSince = time.Time{}
+			}
 			releaseLatch(&b.drained)
 			b.mu.Unlock()
 			return event, true

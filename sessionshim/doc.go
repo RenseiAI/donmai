@@ -41,12 +41,19 @@
 //     receipt from an adopted live owner, or a durable tombstone proving the
 //     harness group was reaped (§D8/§D10).
 //
-// # One frame is never a verdict on a carrier
+// # A transmissible frame is never a verdict on a carrier
 //
 // A corollary of invariant 4 that had to be learned twice on production hosts:
-// no single frame, and no momentary lag, may cost a live harness its
-// supervision. Two paths used to do exactly that, and both are now bounded
-// rather than fatal.
+// no frame this shim can actually send, and no momentary consumer lag, may cost
+// a live harness its supervision. Two paths used to do exactly that, and both
+// are now bounded rather than fatal.
+//
+// The qualifier is real, not hedging. A frame that CANNOT be made to fit still
+// ends the connection: ErrSnapshotUnboundable (a live grid larger than the wire
+// with no scrollback left to drop) and an oversized non-Snapshot host frame both
+// return an error from the write path, and pumpOutput closes the controller on
+// it exactly as it always has. Those are producer bugs or impossible geometries,
+// not the ordinary long-history Snapshot this bound exists for.
 //
 //   - A Snapshot too large for one shimwire message is bounded at the shim
 //     before it is written, by dropping the oldest scrollback lines until it
