@@ -6,22 +6,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
-## [Unreleased]
+## v0.72.16 — 2026-09-02
 
 ### Fixes
 
-- **The runner no longer exports the worker's platform bearer as `GH_TOKEN`
-  on ref-bearing work items.** `QueuedWork.AuthToken` is the runtime bearer
-  for heartbeat, result post, and session preflight — never a GitHub token —
-  yet a queued `Ref` made the runner copy it into `GH_TOKEN`, where the env
-  composer's Spec-wins precedence let it clobber the seat's real `gh` auth
-  (or a provisioner-stamped short-lived git token in a sandbox). Every `gh`
-  call on such a run then failed with 401 while presenting the platform
-  bearer to api.github.com. The export is removed for every work type and
-  mode; GitHub access continues to come from the host env and the credential
-  snapshot. A ref only pins the checkout. Pinned at the env-build and
-  composer layers, and the teardown backstop is pinned as unreachable for
-  interactive work items.
+- **Seats and sandboxes keep their real GitHub auth on branch-pinned work:
+  the runner no longer exports the worker's control-plane bearer as
+  `GH_TOKEN` on ref-bearing work items.** `QueuedWork.AuthToken` is the
+  worker's runtime bearer for heartbeat, result post, and session preflight
+  — never a GitHub token — yet a queued `Ref` made the runner copy it into
+  `GH_TOKEN`, where the env composer's Spec-wins precedence let it clobber
+  the seat's real `gh` auth (or a provisioner-stamped short-lived git token
+  in a sandbox). Every `gh` call on such a run then failed with 401 while
+  presenting the control-plane bearer to api.github.com — and with
+  interactive items about to carry a ref for branch-pinned checkouts, every
+  such seat would have hit it. The export is removed for every work type and
+  mode; GitHub access continues to come from the host environment and the
+  credential snapshot, and a ref only pins the checkout. Pinned at the
+  env-build and composer layers, and the teardown backstop is pinned as
+  unreachable for interactive work items. (#530)
 
 ---
 
