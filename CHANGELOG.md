@@ -6,6 +6,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.14 — 2026-09-02
+
+### Fixes
+
+- **An interactive launch whose adoption-batch commit answer was lost (a
+  transport error, a client deadline, or a server error after the request
+  went out) no longer strands the host with a session that has no process
+  and nothing left to release it.** The daemon now resolves the ambiguity
+  from inside the launch instead of leaving it to an asynchronous pass that
+  could never see the session: it re-drives the batch commit once on a
+  bounded budget, and if that does not land on a definite outcome, it stops
+  the harness, records and publishes the lineage quarantined, and consumes
+  the resulting termination proof to discharge the session's recovery
+  obligation — all off the daemon's sequential accept path, so sibling
+  launches, heartbeats, and local control requests are no longer blocked for
+  the multi-minute duration of the resolution. (#526)
+
+---
+
 ## v0.72.13 — 2026-09-02
 
 ### Fixes
