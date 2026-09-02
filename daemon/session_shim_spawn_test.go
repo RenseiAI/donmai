@@ -803,6 +803,15 @@ func TestMain(m *testing.M) {
 // TestLaunchSessionShimAdoptsThroughTheRealPathWhenDiscoveryArrivesLate.
 const envDaemonShimHelperStartDelayMS = "DONMAI_TEST_SHIM_HELPER_START_DELAY_MS"
 
+// envDaemonShimHelperNeverPublishMS is a second TEST-ONLY seam, also read only
+// by this helper: it sleeps this long and then exits WITHOUT ever calling
+// sessionshim.StartFromEnv, so no discovery record is ever published while the
+// process is alive. That is the measured shape
+// shim-discovery-deadline-2026-09-02 is about — a worker whose bootstrap
+// outlives the daemon's discovery bound — and a small value reproduces its
+// opposite, a worker that dies before publishing anything.
+const envDaemonShimHelperNeverPublishMS = "DONMAI_TEST_SHIM_HELPER_NEVER_PUBLISH_MS"
+
 func runDaemonShimHelper() int {
 	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
 	if err != nil {
@@ -812,6 +821,15 @@ func runDaemonShimHelper() int {
 	if raw := os.Getenv(envDaemonShimHelperStartDelayMS); raw != "" {
 		if ms, parseErr := strconv.Atoi(raw); parseErr == nil && ms > 0 {
 			time.Sleep(time.Duration(ms) * time.Millisecond)
+		}
+	}
+	if raw := os.Getenv(envDaemonShimHelperNeverPublishMS); raw != "" {
+		if ms, parseErr := strconv.Atoi(raw); parseErr == nil && ms > 0 {
+			// Deliberately never reaches sessionshim.StartFromEnv: this worker
+			// publishes nothing, ever, and only its own sleep or the daemon's
+			// stop ends it.
+			time.Sleep(time.Duration(ms) * time.Millisecond)
+			return 0
 		}
 	}
 	// The worker resolves the same <parent>/<sessionID> leaf the daemon

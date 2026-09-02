@@ -213,16 +213,30 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
 	defer cancel()
 
-	rec, err := awaitShimRecord(ctx, registry, id, launch, started)
+	launchProcess := d.shimLaunchProcessControl(started)
+	rec, err := awaitShimRecord(ctx, shimDiscoveryWait{
+		registry: registry, id: id, launch: launch, started: started,
+		process: launchProcess, liveBound: cfg.liveDiscoveryTimeout(),
+	})
 	if err != nil {
-		// The shim never announced itself — including through the bounded
-		// post-deadline grace poll awaitShimRecord already applied. Nothing is
-		// adopted and nothing is counted; the process is left alone rather than
-		// signalled, because a launch this daemon cannot identify is exactly the
-		// target §D10 forbids guessing at. Its own orphan deadline is the escape
-		// hatch.
+		// The shim never announced itself — through the ordinary wait, the
+		// bounded post-deadline grace poll, or the longer bound the wait holds
+		// while the launched process is alive. Nothing is adopted and nothing is
+		// counted.
 		slog.Error("session shim: launched worker never published a discovery record",
 			"session", id.String(), "pid", started.PID, "error", err)
+		if errors.Is(err, errShimDiscoveryAbandonedLiveProcess) {
+			// The process this daemon started is STILL RUNNING and can never be
+			// adopted — the launch never reached trackLaunchedShim, and a worker
+			// that published no record never armed sessionshim's own orphan clock
+			// either, so §D10's escape hatch does not exist for it. Leaving it
+			// alone is what let a measured launch run its entire prompt
+			// un-adopted and end defunct. This is not the guess §D10 forbids: the
+			// target is not inferred from a registry record of unknown
+			// provenance, it is the pid+start-time this daemon pinned when it
+			// exec'd the process itself.
+			d.stopAbandonedShimLaunch(id, started, launchProcess, err)
+		}
 		return nil, fmt.Errorf("session shim: %s: %w", id, err)
 	}
 	if ctx.Err() != nil {
@@ -1472,31 +1486,193 @@ func (d *Daemon) shimCommand() []string {
 // arrived" into a true "arrived late" — it can never turn a genuine non-event
 // into a fabricated success, because it still requires the record to
 // identity-match this exact launch.
-func awaitShimRecord(
-	ctx context.Context,
-	registry *sessionshim.Registry,
-	id sessionshim.Identity,
-	launch sessionshim.Launch,
-	started sessionshim.ProcessIdentity,
-) (sessionshim.Record, error) {
+//
+// Past that grace the question stops being about clocks and becomes about the
+// PROCESS: while the worker this launch started is still alive there is
+// something to wait for, so the wait continues to the longer live bound
+// (awaitWhileProcessLives); the moment it is not, the wait ends with a definite
+// failure, on whichever budget was running. Neither branch changes the happy
+// path: every iteration reads the registry BEFORE it consults the process, so a
+// record that lands in five seconds still adopts in five seconds.
+func awaitShimRecord(ctx context.Context, wait shimDiscoveryWait) (sessionshim.Record, error) {
+	// One addressable wait for the whole call: the probe-error log below is
+	// once-per-launch state, and a value copy per phase would reset it.
+	w := &wait
+	start := time.Now()
 	ticker := time.NewTicker(shimRecordPollInterval)
 	defer ticker.Stop()
 	var lastErr error
 	for {
-		rec, err := registry.Get(id)
+		rec, err := w.registry.Get(w.id)
 		if err == nil {
 			return rec, nil
 		}
 		lastErr = err
 		select {
 		case <-ctx.Done():
-			if rec, ok := awaitShimRecordPostDeadlineGrace(registry, id, launch, started); ok {
+			if rec, ok := awaitShimRecordPostDeadlineGrace(w.registry, w.id, w.launch, w.started); ok {
 				return rec, nil
 			}
-			return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
+			return w.awaitWhileProcessLives(ctx, start, lastErr)
 		case <-ticker.C:
+			// A worker that has DIED cannot still be about to publish. Ending
+			// here rather than serving out the launch clock is the same rule the
+			// extended wait below applies, applied to the budget that runs first;
+			// it never delays a record, because the registry read above always
+			// runs before this probe.
+			if w.processIsGone() {
+				return sessionshim.Record{}, w.exitedError(lastErr)
+			}
 		}
 	}
+}
+
+// shimDiscoveryWait is one launch's discovery wait: where to look for the
+// record, which incarnation would count as this launch's own, and — new with
+// shim-discovery-deadline-2026-09-02 — how to ask whether the launched process
+// is still alive, plus the longer bound that liveness buys.
+//
+// process and liveBound are BOTH optional, and a wait missing either keeps
+// exactly the pre-extension behaviour: no liveness knowledge means no basis for
+// waiting longer than the launch clock, and none for claiming a live process was
+// abandoned.
+type shimDiscoveryWait struct {
+	registry *sessionshim.Registry
+	id       sessionshim.Identity
+	launch   sessionshim.Launch
+	started  sessionshim.ProcessIdentity
+	process  shimLaunchProcess
+	// liveBound is the TOTAL discovery budget, measured from the start of the
+	// wait, for a launch whose process stays alive — not an extra budget added
+	// on top of the launch clock. See SessionShimConfig.liveDiscoveryTimeout.
+	liveBound time.Duration
+	// probeErrorLogged makes the "could not probe the launched process" warning
+	// once-per-launch rather than once-per-poll. Owned by the single goroutine
+	// running the wait; never read after it returns.
+	probeErrorLogged bool
+}
+
+// errShimDiscoveryAbandonedLiveProcess classifies the one discovery failure that
+// leaves something running: the bound expired (or the only record on offer
+// belongs to another incarnation) while the process this launch started was
+// still alive.
+//
+// The caller stops that process. Every OTHER discovery failure — a dead worker, a
+// wait with no liveness knowledge — has nothing left to stop, and must not be
+// reported as if it did.
+var errShimDiscoveryAbandonedLiveProcess = errors.New("the launched process was still alive at the discovery bound")
+
+// awaitWhileProcessLives is the extended wait: the launch clock has expired and
+// the bounded post-deadline grace poll found nothing, so the only question left
+// is whether there is still a worker to wait FOR.
+//
+// Measured live under concurrent launch load: a worker whose harness bootstraps
+// slowly had published nothing 31s after spawn, the daemon gave up at its launch
+// bound — and the worker went on to run the whole prompt un-adopted. It was never
+// a launch that produced nothing; it was a launch given a budget sized for an
+// unloaded host. While the pid lives there is something to wait for, so this
+// keeps waiting to liveBound; when it dies there is not, so this ends at once.
+func (w *shimDiscoveryWait) awaitWhileProcessLives(
+	ctx context.Context,
+	start time.Time,
+	lastErr error,
+) (sessionshim.Record, error) {
+	deadline := start.Add(w.liveBound)
+	if w.process == nil || w.liveBound <= 0 || !time.Now().Before(deadline) {
+		return sessionshim.Record{}, fmt.Errorf("waiting for discovery record: %w (last read: %v)", ctx.Err(), lastErr)
+	}
+	if w.processIsGone() {
+		return sessionshim.Record{}, w.exitedError(lastErr)
+	}
+	// ONE line at the old bound, not one per poll: a slow bootstrap is visible in
+	// the log exactly where an operator used to see the give-up, and the launch
+	// that eventually adopts says so on its own.
+	slog.Warn("session shim: still waiting for the discovery record; pid alive "+
+		"(shim-discovery-deadline-2026-09-02)",
+		"session", w.id.String(), "pid", w.started.PID,
+		"launchBoundElapsed", time.Since(start).String(), "liveBound", w.liveBound.String())
+	ticker := time.NewTicker(shimRecordPollInterval)
+	defer ticker.Stop()
+	for {
+		rec, err := w.registry.Get(w.id)
+		switch {
+		case err == nil && shimDiscoveryRecordMatchesLaunch(rec, w.id, w.launch, w.started):
+			slog.Warn("session shim: discovery record appeared past the launch timeout while the launched process stayed "+
+				"alive; adopting it rather than failing the accept (shim-discovery-deadline-2026-09-02)",
+				"session", w.id.String(), "pid", rec.PID, "processEpoch", rec.ProcessEpoch,
+				"elapsed", time.Since(start).String())
+			return rec, nil
+		case err == nil:
+			// A record exists but is not this launch's. Waiting longer cannot
+			// change whose record it is — the same reasoning the grace poll
+			// applies — and THIS launch's process is still running, so the caller
+			// still has something to stop.
+			slog.Warn("session shim: a discovery record for this session belongs to a different incarnation while this "+
+				"launch's own process is still alive; abandoning and stopping it",
+				"session", w.id.String(), "wantPid", w.started.PID, "wantProcessStartedAt", w.started.StartedAt,
+				"gotPid", rec.PID, "gotProcessStartedAt", rec.ProcessStartedAt, "gotProcessEpoch", rec.ProcessEpoch)
+			return sessionshim.Record{}, w.abandonedLiveError(start, "a discovery record for a different incarnation")
+		default:
+			lastErr = err
+		}
+		if !time.Now().Before(deadline) {
+			return sessionshim.Record{}, w.abandonedLiveError(start, fmt.Sprintf("last read: %v", lastErr))
+		}
+		<-ticker.C
+		if w.processIsGone() {
+			return sessionshim.Record{}, w.exitedError(lastErr)
+		}
+	}
+}
+
+// processIsGone reports whether the launched process has exited — and, because
+// shimLaunchProcess.Alive reaps what it observes, guarantees a process reported
+// gone left no defunct entry behind.
+//
+// A probe that ERRORS is not a death: an unprobeable process is treated as still
+// running, so the wait keeps its bound and the caller still stops it at the end.
+// Guessing "gone" from an unreadable probe is how a live harness gets abandoned.
+//
+// The error is logged ONCE per launch, not once per probe: this runs at
+// shimRecordPollInterval, so a probe that fails for a persistent reason would
+// otherwise emit thousands of identical lines across one live bound and bury the
+// two lines that carry the actual disposition. The condition is a property of
+// the launch, and one line reports it.
+func (w *shimDiscoveryWait) processIsGone() bool {
+	if w.process == nil {
+		return false
+	}
+	alive, err := w.process.Alive()
+	if err != nil {
+		if !w.probeErrorLogged {
+			w.probeErrorLogged = true
+			slog.Warn("session shim: could not probe the launched process while waiting for its discovery record; "+
+				"treating it as alive (logged once per launch)",
+				"session", w.id.String(), "pid", w.started.PID, "error", err)
+		}
+		return false
+	}
+	return !alive
+}
+
+// exitedError is the DEFINITE failure for a launch whose process died before
+// publishing anything. It deliberately does not wrap
+// errShimDiscoveryAbandonedLiveProcess: there is nothing left to stop.
+//
+// It has exactly one shape because processIsGone reports "gone" from exactly one
+// observation — a successful probe that answered "not alive". An errored probe
+// never reports gone, so there is no such thing as a launch that exited AND
+// could not be probed reaching here.
+func (w *shimDiscoveryWait) exitedError(lastErr error) error {
+	return fmt.Errorf("waiting for discovery record: the launched process %s exited without publishing one "+
+		"(last read: %v)", w.started, lastErr)
+}
+
+// abandonedLiveError is the give-up that leaves a live worker behind — the one
+// the caller answers with a stop.
+func (w *shimDiscoveryWait) abandonedLiveError(start time.Time, detail string) error {
+	return fmt.Errorf("waiting for discovery record: %w after %s (%s)",
+		errShimDiscoveryAbandonedLiveProcess, time.Since(start).Round(time.Millisecond), detail)
 }
 
 // awaitShimRecordPostDeadlineGrace polls a short, independently bounded
