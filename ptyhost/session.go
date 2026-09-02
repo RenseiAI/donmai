@@ -64,11 +64,13 @@ type Session struct {
 	// line again after an edit rather than latching shut. Guarded by writeMu.
 	compose composeTracker
 	// lastInputWriteAt is the completion time of the most recent PTY-master
-	// input write, from ANY author (human or SYSTEM-attributed) — WriteInput
-	// and WriteAttributedInput both update it. WriteAttributedInput reads it
-	// to decide whether a SYSTEM-attributed bare CR/LF needs systemInputPacingGap
-	// (systeminput.go); an ordinary WriteInput caller never consults it.
-	// Guarded by writeMu.
+	// write, from ANY author — WriteInput, WriteAttributedInput, AND
+	// TryWriteNotice all update it, because all three share writeMu and all
+	// three are a write the harness's next read() can coalesce something
+	// else with. WriteAttributedInput reads it to decide whether a
+	// SYSTEM-attributed bare CR/LF needs systemInputPacingGap
+	// (systeminput.go); WriteInput and TryWriteNotice never consult it, only
+	// advance it. Guarded by writeMu.
 	lastInputWriteAt time.Time
 
 	// altActive mirrors the VT's alternate-screen flag for the notice gate.
@@ -469,6 +471,18 @@ func (s *Session) writeInputLocked(p []byte) (int, error) {
 // The refusal is a structural error, not the (false, nil) "try again later":
 // nothing about it changes for the life of the session, so a caller that
 // retries it is spinning, and a caller that treats it as delivered is lying.
+//
+// # "Try" bounds the OUTCOME, not always the LATENCY
+//
+// This call is not lock-free: it shares writeMu with every other PTY-master
+// author, including WriteAttributedInput's SYSTEM-attributed last-hop pacing
+// (systeminput.go), which can hold that mutex asleep for up to
+// systemInputPacingGap (~120ms in production) mid-call. A notice racing that
+// window blocks for the remainder of the sleep before it can even evaluate
+// compose/alt-screen and decide refuse-or-accept — bounded (the sleep itself
+// is bounded and rare: only a bare CR/LF attributed to the shared SYSTEM
+// sentinel triggers it), but real, and worth knowing before assuming this
+// call is always cheap.
 func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	if len(p) == 0 {
 		return false, nil
@@ -501,6 +515,14 @@ func (s *Session) TryWriteNotice(p []byte) (bool, error) {
 	// A notice is self-submitting (the caller appends the submit byte), so
 	// the line editor is left exactly as empty as it was found — the compose
 	// model needs no update here.
+	//
+	// lastInputWriteAt DOES need updating: it is the timeline
+	// WriteAttributedInput's last-hop pacing measures "the previous write"
+	// against (systeminput.go), from every author, and a notice is as much a
+	// PTY-master write as any of them. Omitting it would leave a hole in the
+	// guarantee — a SYSTEM-attributed nudge CR landing right after a notice
+	// would not see the notice as recent and would go unpaced against it.
+	s.lastInputWriteAt = time.Now()
 	return true, nil
 }
 

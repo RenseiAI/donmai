@@ -13,13 +13,18 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-type inProcessV3Fixture struct {
+// inProcessV4Fixture is an in-process shim + controller pair adopted with
+// RequireFullHostFrames, which negotiates the highest tier this build
+// supports — shimwire.ProtocolMax, currently v4 (named for that, not for the
+// v3 opt-in flag itself: RequireFullHostFrames' V3 opt-in now yields [1,4],
+// a benign superset, per shimwire/version.go's V4 doc).
+type inProcessV4Fixture struct {
 	shim       *Shim
 	controller *Controller
 	result     AdoptionResult
 }
 
-func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
+func startInProcessV4Fixture(t *testing.T, ringBytes int) *inProcessV4Fixture {
 	t.Helper()
 	dir := shortTempDir(t)
 	registry, err := NewRegistry(dir)
@@ -42,7 +47,7 @@ func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
 		_ = shim.Terminate(context.Background())
 		t.Fatalf("Adopt = %+v, %v", result, err)
 	}
-	fixture := &inProcessV3Fixture{shim: shim, controller: result.Adopted[0], result: result}
+	fixture := &inProcessV4Fixture{shim: shim, controller: result.Adopted[0], result: result}
 	t.Cleanup(func() {
 		result.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -67,7 +72,7 @@ type hostFrameCollection struct {
 }
 
 func TestSelectedV3CarriesEveryHostFrameExactlyOnce(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	direct, err := fixture.shim.Session().Subscribe(0)
 	if err != nil {
 		t.Fatal(err)
@@ -178,7 +183,7 @@ func TestSelectedV3CarriesEveryHostFrameExactlyOnce(t *testing.T) {
 }
 
 func TestSelectedV3LiveSnapshotIsOneRawEventPlusEmptyResult(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	const requestID = 77
 	result, err := fixture.controller.SnapshotWithID(context.Background(), requestID, shimwire.SnapshotEmit)
 	if err != nil {

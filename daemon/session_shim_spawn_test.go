@@ -889,17 +889,31 @@ func (r *shimEventRecorder) record(id sessionshim.Identity, ev sessionshim.Contr
 	key := id.Key()
 	switch ev.Kind {
 	case sessionshim.EventOutput:
-		b, ok := r.seen[key]
-		if !ok {
-			b = &strings.Builder{}
-			r.seen[key] = b
-		}
-		b.Write(ev.Data)
-		if ev.Seq > r.seq[key] {
-			r.seq[key] = ev.Seq
+		r.appendOutputLocked(key, ev.Data, ev.Seq)
+	case sessionshim.EventHostFrame:
+		// A controller negotiated selected v3+ (enableHostedFullHostFramesForTest)
+		// carries every host observation on this ONE rail instead of the legacy
+		// EventOutput kind — Data is still the decoded Output payload for a
+		// TypeOutput frame (see decodeHostFrameEvent in sessionshim/controller.go),
+		// so a test using output() need not care which selected version adopted.
+		if ev.FrameType == attachwire.TypeOutput {
+			r.appendOutputLocked(key, ev.Data, ev.Seq)
 		}
 	case sessionshim.EventGap:
 		r.gaps[key]++
+	}
+}
+
+// appendOutputLocked accumulates decoded output bytes for id. Callers hold r.mu.
+func (r *shimEventRecorder) appendOutputLocked(key string, data []byte, seq uint64) {
+	b, ok := r.seen[key]
+	if !ok {
+		b = &strings.Builder{}
+		r.seen[key] = b
+	}
+	b.Write(data)
+	if seq > r.seq[key] {
+		r.seq[key] = seq
 	}
 }
 

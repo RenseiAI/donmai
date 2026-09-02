@@ -2277,6 +2277,37 @@ func (d *Daemon) WriteAdoptedSessionShimInputFor(ref SessionShimControlRef, data
 	return controller.WriteInput(data)
 }
 
+// WriteAdoptedSessionShimInputAttributed is WriteAdoptedSessionShimInput's
+// attributed twin: it additionally carries userID — a composing carrier's
+// relay-stamped sender identity — through to Controller.WriteAttributedInput
+// (sessionshim/controller.go), which the shim uses to apply last-hop
+// pacing/paste-guard to SYSTEM-authority input (ptyhost/systeminput.go,
+// attachwire.SystemNudgeUserID) that a stalled leg let queue and arrive
+// back-to-back. A controller negotiated below selected v4 degrades to the
+// exact byte-identical WriteInput send WriteAdoptedSessionShimInput has
+// always made — the write still lands, verbatim; only the last-hop guarantee
+// is unavailable there. WriteAdoptedSessionShimInput itself is unchanged.
+func (d *Daemon) WriteAdoptedSessionShimInputAttributed(orgID, sessionID, userID string, data []byte) error {
+	entry, err := d.adoptedShimEntry(orgID, sessionID)
+	if err != nil {
+		return err
+	}
+	return entry.controller.WriteAttributedInput([]byte(userID), data)
+}
+
+// WriteAdoptedSessionShimInputAttributedFor is
+// WriteAdoptedSessionShimInputFor's attributed twin — see
+// WriteAdoptedSessionShimInputAttributed for what userID does and the
+// selected-v4 degrade rule. WriteAdoptedSessionShimInputFor itself is
+// unchanged.
+func (d *Daemon) WriteAdoptedSessionShimInputAttributedFor(ref SessionShimControlRef, userID string, data []byte) error {
+	controller, err := d.adoptedSessionShimControllerFor(ref)
+	if err != nil {
+		return err
+	}
+	return controller.WriteAttributedInput([]byte(userID), data)
+}
+
 // ResizeAdoptedSessionShim sends authoritative geometry under this daemon's
 // generation.
 func (d *Daemon) ResizeAdoptedSessionShim(orgID, sessionID string, cols, rows, pxWidth, pxHeight uint32) error {
