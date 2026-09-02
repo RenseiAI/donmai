@@ -32,10 +32,31 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   the shim's orphan deadline for a fault at neither end. The daemon now runs
   the same pipeline the startup pass runs (dial, prepare, durable adoption,
   complete batch, carrier activation) for exactly that identity, bounded by
-  `SessionShimConfig.Readoption` (default three attempts over about thirty
-  seconds; `Disabled` keeps the previous disposition). On success the lineage
-  stays adopted under a strictly newer generation and the shim disarms its
-  orphan clock; a lineage that cannot be re-adopted inside the bound is
+  `SessionShimConfig.Readoption`: `Attempts` (default 3), `Backoff` before
+  the second attempt, doubling after (default 5 s), and `AttemptTimeout`
+  bounding each attempt end to end (default 15 s); `Disabled` keeps the
+  previous disposition. The shim's orphan clock starts the moment the
+  controller stream ends and only an accepted Welcome disarms it, so the
+  whole window has to end before the orphan deadline. That deadline is
+  whatever the daemon resolves: fifteen minutes standalone, and for a
+  composing deployment that declares an external release threshold and
+  leaves `Orphan.Deadline` zero, the derived `threshold − grace − margin −
+  one margin of headroom` — 115 s for the tightest threshold known (three
+  minutes); shims launched before that derivation existed still carry the
+  old 90 s constant in their environment. The default policy's worst case is
+  `3 × 15 s + (5 s + 10 s) = 60 s`, strictly inside all three, and a test
+  computes the derived deadline and asserts it rather than quoting it —
+  `SessionShimReadoptionPolicy.WorstCaseWindow()` computes the same
+  arithmetic for any policy so an embedder can check its own against its
+  own deadline. Without the per-attempt bound an attempt would run under
+  the launch path's publication timeout (four 30 s callback timeouts in a
+  composed deployment), and three attempts would take up to 375 s. On success
+  the lineage stays adopted under a strictly newer generation and the shim
+  disarms its orphan clock; the lost entry stays in the adopted set for the
+  whole window, so a batch or heartbeat projection built meanwhile still
+  presents the lineage adopted at the generation the receiver holds; a
+  re-adoption whose batch is refused restores the lost entry and leaves no
+  batch published; a lineage that cannot be re-adopted inside the bound is
   quarantined exactly as before. Streams the shim itself ended keep the
   previous disposition. `sessionshim.AdoptOptions.Filter` restricts one
   adoption pass to the identities it names.

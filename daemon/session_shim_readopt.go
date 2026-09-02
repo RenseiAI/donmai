@@ -39,12 +39,12 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 	}
 	if lost.readoptedAtUnixNano != 0 {
 		since := d.shimNow().Sub(time.Unix(0, lost.readoptedAtUnixNano))
-		if since < policy.window() {
+		if window := policy.WorstCaseWindow(); since < window {
 			// Re-adopted inside the window and lost again: this carrier is not
 			// one a bounded retry can restore, and every further cycle costs an
 			// adoption revision the receiver has to re-attest.
 			slog.Warn("session shim: controller lost again inside the re-adoption window; quarantining rather than re-adopting",
-				"session", id.String(), "sinceReadoption", since, "window", policy.window())
+				"session", id.String(), "sinceReadoption", since, "window", window)
 			return false
 		}
 	}
@@ -105,6 +105,11 @@ func sessionShimIncarnationStillLive(registry *sessionshim.Registry, id sessions
 // readoptSessionShimOnce is one bounded attempt: the startup adoption pass
 // filtered to this identity, then the dynamic publication the launch path runs
 // after its own dial.
+//
+// The attempt runs under the policy's AttemptTimeout, not the dynamic
+// publication timeout the launch path uses: the shim's orphan clock is already
+// running, and the whole window (every attempt plus every backoff) has to end
+// before it fires — see SessionShimReadoptionPolicy.WorstCaseWindow.
 func (d *Daemon) readoptSessionShimOnce(
 	registry *sessionshim.Registry,
 	cfg SessionShimConfig,
@@ -112,7 +117,7 @@ func (d *Daemon) readoptSessionShimOnce(
 	lost adoptedShim,
 	lostHello shimwire.Hello,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.adoptionPublicationTimeout())
+	ctx, cancel := context.WithTimeout(context.Background(), cfg.readoptionAttemptTimeout())
 	defer cancel()
 	opts, preparations, err := d.sessionShimAdoptOptions(registry, cfg)
 	if err != nil {

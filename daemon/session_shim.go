@@ -1513,10 +1513,23 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 // re-adopted stays adopted and the shim disarms its own orphan clock; only a
 // lineage that cannot be re-adopted inside the bound is quarantined.
 //
-// The bound must fit inside the resolved orphan deadline with room to spare —
-// the default three attempts over about thirty seconds sit well inside the
-// shortest deadline a composing deployment derives (see
-// sessionShimOrphanDeadlineUnderExternalRelease).
+// The whole window — every attempt AND every backoff between them — must end
+// before the shim's orphan deadline, because the shim's clock started the
+// moment the controller stream ended and only a Welcome it accepts disarms
+// it. The window is therefore a pure function of this policy, with each
+// attempt bounded by AttemptTimeout rather than by the dynamic publication
+// timeout (four callback timeouts: thirty seconds each in a composed
+// deployment, so 120 s per attempt and a worst case of 3 × 120 s + 15 s of
+// backoff = 375 s — several times any deadline a composing deployment
+// resolves to). The deadline it is held to is whatever sessionShimConfig
+// resolves: the standalone default is fifteen minutes, and a composing
+// deployment that declares an external release threshold and leaves
+// Orphan.Deadline zero gets sessionShimOrphanDeadlineUnderExternalRelease's
+// derivation — a three-minute threshold yields 3m − 5s − 30s − 30s = 115 s.
+// See WorstCaseWindow for the arithmetic; the default policy's window is
+// pinned strictly below that derived deadline (and below the 90 s constant
+// shims launched before the derivation still carry in their environment) in
+// session_shim_readopt_test.go.
 type SessionShimReadoptionPolicy struct {
 	// Disabled keeps the pre-existing disposition: no re-dial, immediate
 	// quarantine. It is a separate flag so the zero policy means "default".
@@ -1527,20 +1540,45 @@ type SessionShimReadoptionPolicy struct {
 	// Backoff is the delay before the second attempt; each later attempt
 	// doubles it. Zero uses defaultSessionShimReadoptionBackoff.
 	Backoff time.Duration
+	// AttemptTimeout bounds ONE attempt end to end — dial, prepare, durable
+	// adoption, complete batch, carrier activation. It is the number that
+	// makes the window provable: without it an attempt runs under the dynamic
+	// publication timeout, which is sized for a launch, not for a shim whose
+	// orphan clock is already running. Zero uses
+	// defaultSessionShimReadoptionAttemptTimeout. The dynamic publication
+	// timeout still applies when it is the smaller of the two.
+	AttemptTimeout time.Duration
 }
 
 const (
-	defaultSessionShimReadoptionAttempts = 3
-	defaultSessionShimReadoptionBackoff  = 10 * time.Second
+	defaultSessionShimReadoptionAttempts       = 3
+	defaultSessionShimReadoptionBackoff        = 5 * time.Second
+	defaultSessionShimReadoptionAttemptTimeout = 15 * time.Second
 )
 
 // DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
-// three attempts, the second after ten seconds and the third after a further
-// twenty — about thirty seconds of bounded re-adoption.
+// three attempts of at most fifteen seconds each, the second after a five
+// second backoff and the third after a further ten.
+//
+// Worst case, every attempt runs to its bound:
+//
+//	attempt 1  starts  0 s, ends ≤ 15 s
+//	backoff             5 s            → 20 s
+//	attempt 2  starts ≤ 20 s, ends ≤ 35 s
+//	backoff            10 s            → 45 s
+//	attempt 3  starts ≤ 45 s, ends ≤ 60 s
+//
+// so the window is 3 × 15 s + (5 s + 10 s) = 60 s: 55 s inside the 115 s a
+// composing deployment derives from a three-minute external release
+// threshold, and 30 s inside the 90 s constant shims launched before that
+// derivation still carry — room in both for the shim to observe the Welcome.
+// The backoffs follow the attempts, not a fixed schedule: an attempt that
+// fails fast simply starts the next one sooner.
 func DefaultSessionShimReadoptionPolicy() SessionShimReadoptionPolicy {
 	return SessionShimReadoptionPolicy{
-		Attempts: defaultSessionShimReadoptionAttempts,
-		Backoff:  defaultSessionShimReadoptionBackoff,
+		Attempts:       defaultSessionShimReadoptionAttempts,
+		Backoff:        defaultSessionShimReadoptionBackoff,
+		AttemptTimeout: defaultSessionShimReadoptionAttemptTimeout,
 	}
 }
 
@@ -1553,18 +1591,42 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 	if policy.Backoff <= 0 {
 		policy.Backoff = defaultSessionShimReadoptionBackoff
 	}
+	if policy.AttemptTimeout <= 0 {
+		policy.AttemptTimeout = defaultSessionShimReadoptionAttemptTimeout
+	}
 	return policy
 }
 
-// window is the longest the policy can keep a lineage between controllers:
-// the sum of every backoff it may sleep. A lineage re-adopted less than one
-// window ago is not re-adopted again — a carrier that keeps dropping is not a
-// carrier a bounded retry can restore, and every cycle costs an adoption
-// revision the receiver has to re-attest.
-func (p SessionShimReadoptionPolicy) window() time.Duration {
-	total := time.Duration(0)
+// readoptionAttemptTimeout bounds one re-adoption attempt: the policy's
+// AttemptTimeout, or the dynamic publication timeout when that is smaller.
+// The policy can only tighten the pipeline's own bound, never loosen it.
+func (c SessionShimConfig) readoptionAttemptTimeout() time.Duration {
+	return min(c.readoption().AttemptTimeout, c.adoptionPublicationTimeout())
+}
+
+// WorstCaseWindow is the longest the policy can keep a lineage between
+// controllers: every attempt run to its AttemptTimeout plus every backoff
+// slept between them. It is pure arithmetic over the policy so an embedder can
+// check its own policy against its own orphan deadline before configuring it.
+//
+// A lineage re-adopted less than one window ago is not re-adopted again — a
+// carrier that keeps dropping is not a carrier a bounded retry can restore,
+// and every cycle costs an adoption revision the receiver has to re-attest.
+func (p SessionShimReadoptionPolicy) WorstCaseWindow() time.Duration {
+	attempts := p.Attempts
+	if attempts <= 0 {
+		attempts = defaultSessionShimReadoptionAttempts
+	}
+	attemptTimeout := p.AttemptTimeout
+	if attemptTimeout <= 0 {
+		attemptTimeout = defaultSessionShimReadoptionAttemptTimeout
+	}
 	backoff := p.Backoff
-	for attempt := 2; attempt <= p.Attempts; attempt++ {
+	if backoff <= 0 {
+		backoff = defaultSessionShimReadoptionBackoff
+	}
+	total := time.Duration(attempts) * attemptTimeout
+	for attempt := 2; attempt <= attempts; attempt++ {
 		total += backoff
 		backoff *= 2
 	}
