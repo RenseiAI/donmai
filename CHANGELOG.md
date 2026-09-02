@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.72.18 — 2026-09-02
+
 ### Fixes
 
 - **A single oversized Snapshot, or a consumer that is momentarily behind, no
@@ -45,7 +49,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   frame every few seconds. `sessionshim.AdoptOptions` /
   `daemon.SessionShimConfig` gain an additive `EventBacklogStallDeadline` knob,
   clamped up to a floor above the durable-heartbeat receipt wait bound so it
-  cannot be tuned back into the drop it replaced.
+  cannot be tuned back into the drop it replaced. (#533)
+
+### Chores
+
+- **Three non-blocking review nits from #533 landed with this prep.** The
+  `eventBacklogStallDeadline` comment in `sessionshim/controller.go` and the
+  `daemon/README.md` runbook now state that the bound is a throughput bound
+  (budget / deadline, about 273 KiB/s at the 8 MiB / 30 s defaults — a
+  tighter deadline RAISES the required drain rate, it does not loosen it),
+  and that worst-case time from first-behind to fail-closed is about 2x the
+  deadline while time-to-refusal after the consumer actually stops stays
+  <= 1x. `shimwire.MaxSnapshotResultBytes`, exported with zero consumers, is
+  deleted; `shimwire.SnapshotResultMessageBytes` is now pinned against the
+  length of a real `EncodeSnapshotResult` output for two payload sizes. The
+  README runbook line about `SessionShimConfig.EventBacklogStallDeadline` now
+  states the 7 s clamp (`eventBacklogStallFloor` =
+  `heartbeatReceiptWaitBound` + 2 s). (#533)
 
 ---
 

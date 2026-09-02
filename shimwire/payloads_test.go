@@ -218,6 +218,20 @@ func TestV2SnapshotBodiesPreserveEveryByteAndValidateCorrelation(t *testing.T) {
 	}
 }
 
+func TestSnapshotResultMessageBytesMatchesEncodedLength(t *testing.T) {
+	t.Parallel()
+	for _, payloadLen := range []int{0, 4096} {
+		result := SnapshotResult{RequestID: 1, Generation: 1, Mode: SnapshotEmit, Bytes: make([]byte, payloadLen)}
+		body, err := EncodeSnapshotResult(result)
+		if err != nil {
+			t.Fatalf("EncodeSnapshotResult(len=%d): %v", payloadLen, err)
+		}
+		if got, want := 1+len(body), SnapshotResultMessageBytes(payloadLen); got != want {
+			t.Fatalf("SnapshotResultMessageBytes(%d) = %d, want %d (1 type byte + %d encoded body bytes)", payloadLen, want, got, len(body))
+		}
+	}
+}
+
 func TestGapDecodeRejectsUnknownReasonAndInvertedRange(t *testing.T) {
 	t.Parallel()
 

@@ -402,7 +402,19 @@ is applied, a `Stop` starts terminating the harness — but anything it has to
 WRITE back queues behind the blocked pump: durable heartbeat receipts, snapshot
 results, error frames, and the terminal `Exit` frame itself. Each of those can
 wait up to `sessionshim`'s stall deadline (30s by default,
-`SessionShimConfig.EventBacklogStallDeadline`).
+`SessionShimConfig.EventBacklogStallDeadline`, clamped to a 7s floor —
+`eventBacklogStallFloor = heartbeatReceiptWaitBound + 2s` — so an override
+cannot be tuned back into the drop this mechanism replaced).
+
+The deadline is a THROUGHPUT bound, not a latency one: to keep resetting its
+own clock, the consumer must sustain at least `budget / deadline`, about
+273 KiB/s at the 8 MiB budget / 30s deadline defaults — a TIGHTER deadline
+RAISES the drain rate a consumer must sustain, it does not make the carrier
+more forgiving. Because the clock anchors on the backlog when the consumer
+first falls behind rather than resetting per call, worst-case wall time from
+"first fell behind" to fail-closed is about 2x the deadline; time-to-refusal
+measured from the moment the consumer actually STOPS making progress stays
+<= 1x the deadline.
 
 Concretely, a `Stop` into a stalled carrier takes effect at once but its exit
 observation may not surface for up to that deadline, and `Controller.Heartbeat`
