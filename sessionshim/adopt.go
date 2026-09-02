@@ -54,6 +54,14 @@ type AdoptOptions struct {
 	// adoption. When set it supersedes the two legacy string-only callbacks.
 	ExpectedWorkareaLayout func(id Identity) (workareaPath, workareaRoot string, err error)
 
+	// Filter, when set, restricts the pass to the identities it accepts. The
+	// scan, the tombstone read, and duplicate detection still run over the
+	// WHOLE registry — "two live records claim one identity" is only visible
+	// in aggregate — but no other record is dialled, classified, or reported.
+	// It is how a daemon re-adopts ONE live shim through exactly the pipeline
+	// the startup pass runs, rather than through a second adoption path.
+	Filter func(id Identity) bool
+
 	// EventBacklogBudget overrides the per-controller event backlog budget, in
 	// payload bytes. Zero uses EventBacklogBudget.
 	EventBacklogBudget int
@@ -227,6 +235,9 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	}
 	tombstoneByIncarnation := make(map[terminalIncarnation]Tombstone, len(tombstones))
 	for _, t := range tombstones {
+		if opts.Filter != nil && !opts.Filter(t.Identity()) {
+			continue
+		}
 		if t.GroupReaped {
 			tombstoneByIncarnation[terminalIncarnationForTombstone(t)] = t
 			result.Tombstoned = append(result.Tombstoned, t)
@@ -267,6 +278,13 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 	for _, e := range entries {
 		if e.Err != nil {
+			if opts.Filter != nil {
+				// A filtered pass is asking about ONE identity. An undecodable
+				// entry has none to match, and reporting it here would let a
+				// single-lineage re-adoption re-quarantine every malformed
+				// entry on the host as a side effect.
+				continue
+			}
 			// A record we cannot even decode still occupies a slot: something is
 			// running out there. Quarantine with whatever identity we have.
 			result.Quarantined = append(result.Quarantined, QuarantinedSession{
@@ -279,6 +297,9 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 		}
 		rec := e.Record
 		id := rec.Identity()
+		if opts.Filter != nil && !opts.Filter(id) {
+			continue
+		}
 
 		if _, ok := tombstoneByIncarnation[terminalIncarnationForRecord(rec)]; ok {
 			// The shim already proved its outcome. The live record is a crash

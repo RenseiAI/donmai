@@ -649,6 +649,14 @@ type SessionShimConfig struct {
 	// standalone daemon.
 	Orphan sessionshim.OrphanPolicy
 
+	// Readoption bounds the re-adoption this daemon attempts when an adopted
+	// shim's controller stream ends without a terminal observation while the
+	// shim's discovery record is still live (§D10: the shim and its harness are
+	// alive; only the controller connection is gone). A zero policy uses
+	// DefaultSessionShimReadoptionPolicy; Disabled keeps the pre-existing
+	// disposition — quarantine `socket_unreachable` at once, no re-dial.
+	Readoption SessionShimReadoptionPolicy
+
 	// RestartBudget is how long a planned restart is expected to take. It sizes
 	// the restart fence's hold window together with the orphan bound.
 	RestartBudget time.Duration
@@ -1184,6 +1192,12 @@ type adoptedShim struct {
 	// adoption receipt without retaining the bearer, recovery correlation, raw
 	// Snapshot, or any authority that could mint a second candidate.
 	consumedRecovery *sessionShimConsumedRecovery
+	// readoptedAtUnixNano is when this entry's controller replaced one whose
+	// stream ended without a terminal observation (see
+	// readoptSessionShimAfterControllerLoss). Zero for a launched or
+	// startup-adopted controller. It is what bounds re-adoption ACROSS losses:
+	// a lineage re-adopted inside the policy's window is not re-adopted again.
+	readoptedAtUnixNano int64
 }
 
 type sessionShimConsumedRecovery struct {
@@ -1486,6 +1500,142 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 	return c.orgID()
 }
 
+// SessionShimReadoptionPolicy bounds how a daemon re-adopts a live shim whose
+// controller stream ended without a terminal observation.
+//
+// The loss the policy exists for is the CARRIER's, not the shim's: a composing
+// relay restarts, every durable append fails, the daemon closes its controller
+// — and the shim, its harness, and its discovery record are all still there.
+// Quarantining that lineage at once leaves it to the shim's orphan deadline,
+// which is the very outcome §D8 reserves for a daemon that never came back.
+// Re-adopting runs the exact pipeline the startup pass runs (dial, prepare,
+// durable adoption, complete batch, carrier activation), so a lineage that is
+// re-adopted stays adopted and the shim disarms its own orphan clock; only a
+// lineage that cannot be re-adopted inside the bound is quarantined.
+//
+// The whole window — every attempt AND every backoff between them — must end
+// before the shim's orphan deadline, because the shim's clock started the
+// moment the controller stream ended and only a Welcome it accepts disarms
+// it. The window is therefore a pure function of this policy, with each
+// attempt bounded by AttemptTimeout rather than by the dynamic publication
+// timeout (four callback timeouts: thirty seconds each in a composed
+// deployment, so 120 s per attempt and a worst case of 3 × 120 s + 15 s of
+// backoff = 375 s — several times any deadline a composing deployment
+// resolves to). The deadline it is held to is whatever sessionShimConfig
+// resolves: the standalone default is fifteen minutes. A composing deployment
+// that declares an external release threshold and leaves Orphan.Deadline zero
+// gets sessionShimOrphanDeadlineUnderExternalRelease's derivation — a
+// three-minute threshold yields 3m − 5s − 30s − 30s = 115 s — but the one
+// composing deployment known today does not leave it zero: it sets
+// Orphan.Deadline explicitly to 90 s, so 90 s is the deadline that
+// composition is actually held to, and 115 s is only what a composition that
+// left the field zero would derive. See WorstCaseWindow for the arithmetic;
+// the default policy's window is pinned strictly below both the explicit 90 s
+// and the derived 115 s in session_shim_readopt_test.go.
+type SessionShimReadoptionPolicy struct {
+	// Disabled keeps the pre-existing disposition: no re-dial, immediate
+	// quarantine. It is a separate flag so the zero policy means "default".
+	Disabled bool
+	// Attempts is how many re-adoptions are tried before quarantining. Zero
+	// uses defaultSessionShimReadoptionAttempts.
+	Attempts int
+	// Backoff is the delay before the second attempt; each later attempt
+	// doubles it. Zero uses defaultSessionShimReadoptionBackoff.
+	Backoff time.Duration
+	// AttemptTimeout bounds ONE attempt end to end — dial, prepare, durable
+	// adoption, complete batch, carrier activation. It is the number that
+	// makes the window provable: without it an attempt runs under the dynamic
+	// publication timeout, which is sized for a launch, not for a shim whose
+	// orphan clock is already running. Zero uses
+	// defaultSessionShimReadoptionAttemptTimeout. The dynamic publication
+	// timeout still applies when it is the smaller of the two.
+	AttemptTimeout time.Duration
+}
+
+const (
+	defaultSessionShimReadoptionAttempts       = 3
+	defaultSessionShimReadoptionBackoff        = 5 * time.Second
+	defaultSessionShimReadoptionAttemptTimeout = 15 * time.Second
+)
+
+// DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
+// three attempts of at most fifteen seconds each, the second after a five
+// second backoff and the third after a further ten.
+//
+// Worst case, every attempt runs to its bound:
+//
+//	attempt 1  starts  0 s, ends ≤ 15 s
+//	backoff             5 s            → 20 s
+//	attempt 2  starts ≤ 20 s, ends ≤ 35 s
+//	backoff            10 s            → 45 s
+//	attempt 3  starts ≤ 45 s, ends ≤ 60 s
+//
+// so the window is 3 × 15 s + (5 s + 10 s) = 60 s: 30 s inside the 90 s the
+// one composing deployment known today sets Orphan.Deadline to explicitly,
+// and 55 s inside the 115 s that same deployment would instead derive from
+// its three-minute external release threshold if it left the field zero —
+// room in both for the shim to observe the Welcome. The backoffs follow the
+// attempts, not a fixed schedule: an attempt that fails fast simply starts
+// the next one sooner.
+func DefaultSessionShimReadoptionPolicy() SessionShimReadoptionPolicy {
+	return SessionShimReadoptionPolicy{
+		Attempts:       defaultSessionShimReadoptionAttempts,
+		Backoff:        defaultSessionShimReadoptionBackoff,
+		AttemptTimeout: defaultSessionShimReadoptionAttemptTimeout,
+	}
+}
+
+// readoption returns the effective re-adoption policy.
+func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
+	policy := c.Readoption
+	if policy.Attempts <= 0 {
+		policy.Attempts = defaultSessionShimReadoptionAttempts
+	}
+	if policy.Backoff <= 0 {
+		policy.Backoff = defaultSessionShimReadoptionBackoff
+	}
+	if policy.AttemptTimeout <= 0 {
+		policy.AttemptTimeout = defaultSessionShimReadoptionAttemptTimeout
+	}
+	return policy
+}
+
+// readoptionAttemptTimeout bounds one re-adoption attempt: the policy's
+// AttemptTimeout, or the dynamic publication timeout when that is smaller.
+// The policy can only tighten the pipeline's own bound, never loosen it.
+func (c SessionShimConfig) readoptionAttemptTimeout() time.Duration {
+	return min(c.readoption().AttemptTimeout, c.adoptionPublicationTimeout())
+}
+
+// WorstCaseWindow is the longest the policy can keep a lineage between
+// controllers: every attempt run to its AttemptTimeout plus every backoff
+// slept between them. It is pure arithmetic over the policy so an embedder can
+// check its own policy against its own orphan deadline before configuring it.
+//
+// A lineage re-adopted less than one window ago is not re-adopted again — a
+// carrier that keeps dropping is not a carrier a bounded retry can restore,
+// and every cycle costs an adoption revision the receiver has to re-attest.
+func (p SessionShimReadoptionPolicy) WorstCaseWindow() time.Duration {
+	attempts := p.Attempts
+	if attempts <= 0 {
+		attempts = defaultSessionShimReadoptionAttempts
+	}
+	attemptTimeout := p.AttemptTimeout
+	if attemptTimeout <= 0 {
+		attemptTimeout = defaultSessionShimReadoptionAttemptTimeout
+	}
+	backoff := p.Backoff
+	if backoff <= 0 {
+		backoff = defaultSessionShimReadoptionBackoff
+	}
+	total := time.Duration(attempts) * attemptTimeout
+	for attempt := 2; attempt <= attempts; attempt++ {
+		total += backoff
+		backoff *= 2
+	}
+	return total
+}
+
 // launchTimeout returns the effective bound on one shim launch.
 func (c SessionShimConfig) launchTimeout() time.Duration {
 	if c.LaunchTimeout <= 0 {
@@ -1519,6 +1669,92 @@ const sessionShimAdoptionPublicationStages = 4
 // still held a full budget.
 func (c SessionShimConfig) adoptionPublicationTimeout() time.Duration {
 	return sessionShimAdoptionPublicationStages * c.callbackTimeout()
+}
+
+// sessionShimAdoptionPreparations retains, per identity, what the adoption
+// pass's Prepare hook resolved for it: the typed preparation result and the
+// host authority it was prepared under. Adopt runs its dials sequentially, so
+// the maps need no lock of their own.
+type sessionShimAdoptionPreparations struct {
+	prepared map[sessionshim.Identity]SessionShimAdoptionPreparationResult
+	hosts    map[sessionshim.Identity]string
+}
+
+// sessionShimAdoptOptions assembles the ONE adoption pass this daemon runs —
+// the composing prepare hook, the resume/workarea seams, and the workarea
+// adoption journal — so the startup pass and a single-lineage re-adoption
+// after controller loss dial through exactly the same pipeline. A second copy
+// of this assembly is how one path would come to adopt what the other refuses.
+func (d *Daemon) sessionShimAdoptOptions(
+	registry *sessionshim.Registry,
+	cfg SessionShimConfig,
+) (sessionshim.AdoptOptions, *sessionShimAdoptionPreparations, error) {
+	opts := sessionshim.AdoptOptions{
+		Registry:              registry,
+		ControllerID:          d.controllerID(),
+		EventBacklogBudget:    cfg.EventBacklogBudget,
+		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
+		Logger:                slog.Default(),
+	}
+	preparations := &sessionShimAdoptionPreparations{
+		prepared: make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult),
+		hosts:    make(map[sessionshim.Identity]string),
+	}
+	if cfg.PrepareAdoption != nil || cfg.PrepareAdoptionV2 != nil || cfg.HostIDForOrg != nil {
+		opts.Prepare = func(prepareCtx context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			hostID, hostErr := d.sessionShimHostID(prepareCtx, evidence.Identity.OrgID)
+			if hostErr != nil {
+				return sessionshim.PreparedAdoption{}, hostErr
+			}
+			prepared, err := d.prepareSessionShimAdoption(prepareCtx, hostID, evidence)
+			if err != nil {
+				return sessionshim.PreparedAdoption{}, err
+			}
+			preparations.hosts[evidence.Identity] = hostID
+			preparations.prepared[evidence.Identity] = prepared
+			return prepared.PreparedAdoption, nil
+		}
+	}
+	if cfg.ResumeFrom != nil {
+		resume := cfg.ResumeFrom
+		opts.ResumeFrom = func(id sessionshim.Identity) uint64 {
+			return resume(id.OrgID, id.SessionID)
+		}
+	}
+	if cfg.ExpectedWorkarea != nil {
+		expected := cfg.ExpectedWorkarea
+		opts.ExpectedWorkarea = func(id sessionshim.Identity) string {
+			return expected(id.OrgID, id.SessionID)
+		}
+	}
+	if cfg.ExpectedWorkareaRoot != nil {
+		expected := cfg.ExpectedWorkareaRoot
+		opts.ExpectedWorkareaRoot = func(id sessionshim.Identity) string {
+			return expected(id.OrgID, id.SessionID)
+		}
+	}
+	if cfg.ExpectedWorkarea == nil && cfg.ExpectedWorkareaRoot == nil {
+		worktreeParent := d.opts.SpawnerOptions.WorktreeParentDir
+		if worktreeParent == "" {
+			worktreeParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
+		}
+		acquisitions, found, storeErr := workarea.OpenExistingAcquisitionStore(worktreeParent, nil)
+		if storeErr != nil {
+			return sessionshim.AdoptOptions{}, nil, fmt.Errorf("session shim: open workarea adoption journal: %w", storeErr)
+		}
+		if found {
+			readyWorkareas, readyErr := acquisitions.ReadyRecords()
+			if readyErr != nil {
+				return sessionshim.AdoptOptions{}, nil, fmt.Errorf("session shim: read workarea adoption journal: %w", readyErr)
+			}
+			if len(readyWorkareas) > 0 {
+				opts.ExpectedWorkareaLayout = func(id sessionshim.Identity) (string, string, error) {
+					return resolveExpectedAdoptionWorkarea(acquisitions, worktreeParent, id.SessionID)
+				}
+			}
+		}
+	}
+	return opts, preparations, nil
 }
 
 // adoptSessionShims runs the §D4 startup pass: discover, classify, adopt every
@@ -1561,69 +1797,12 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		return err
 	}
 
-	opts := sessionshim.AdoptOptions{
-		Registry:              registry,
-		ControllerID:          d.controllerID(),
-		EventBacklogBudget:    cfg.EventBacklogBudget,
-		RequireFullHostFrames: cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
-		Logger:                slog.Default(),
+	opts, preparations, err := d.sessionShimAdoptOptions(registry, cfg)
+	if err != nil {
+		return err
 	}
-	preparedByID := make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult)
-	hostByID := make(map[sessionshim.Identity]string)
-	if cfg.PrepareAdoption != nil || cfg.PrepareAdoptionV2 != nil || cfg.HostIDForOrg != nil {
-		opts.Prepare = func(prepareCtx context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
-			hostID, hostErr := d.sessionShimHostID(prepareCtx, evidence.Identity.OrgID)
-			if hostErr != nil {
-				return sessionshim.PreparedAdoption{}, hostErr
-			}
-			prepared, err := d.prepareSessionShimAdoption(prepareCtx, hostID, evidence)
-			if err != nil {
-				return sessionshim.PreparedAdoption{}, err
-			}
-			hostByID[evidence.Identity] = hostID
-			preparedByID[evidence.Identity] = prepared
-			return prepared.PreparedAdoption, nil
-		}
-	}
-	if cfg.ResumeFrom != nil {
-		resume := cfg.ResumeFrom
-		opts.ResumeFrom = func(id sessionshim.Identity) uint64 {
-			return resume(id.OrgID, id.SessionID)
-		}
-	}
-	if cfg.ExpectedWorkarea != nil {
-		expected := cfg.ExpectedWorkarea
-		opts.ExpectedWorkarea = func(id sessionshim.Identity) string {
-			return expected(id.OrgID, id.SessionID)
-		}
-	}
-	if cfg.ExpectedWorkareaRoot != nil {
-		expected := cfg.ExpectedWorkareaRoot
-		opts.ExpectedWorkareaRoot = func(id sessionshim.Identity) string {
-			return expected(id.OrgID, id.SessionID)
-		}
-	}
-	if cfg.ExpectedWorkarea == nil && cfg.ExpectedWorkareaRoot == nil {
-		worktreeParent := d.opts.SpawnerOptions.WorktreeParentDir
-		if worktreeParent == "" {
-			worktreeParent = statepath.Resolve("worktrees", "/tmp/.donmai/worktrees")
-		}
-		acquisitions, found, storeErr := workarea.OpenExistingAcquisitionStore(worktreeParent, nil)
-		if storeErr != nil {
-			return fmt.Errorf("session shim: open workarea adoption journal: %w", storeErr)
-		}
-		if found {
-			readyWorkareas, readyErr := acquisitions.ReadyRecords()
-			if readyErr != nil {
-				return fmt.Errorf("session shim: read workarea adoption journal: %w", readyErr)
-			}
-			if len(readyWorkareas) > 0 {
-				opts.ExpectedWorkareaLayout = func(id sessionshim.Identity) (string, string, error) {
-					return resolveExpectedAdoptionWorkarea(acquisitions, worktreeParent, id.SessionID)
-				}
-			}
-		}
-	}
+	preparedByID := preparations.prepared
+	hostByID := preparations.hosts
 
 	result, err := sessionshim.Adopt(ctx, opts)
 	if err != nil {
@@ -1689,9 +1868,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			// accepted: a quarantined lineage keeps its shim (never killed),
 			// but no controller ever renews its orphan clock, so a callback
 			// failure that was really just a transient blip still condemns an
-			// otherwise-healthy session to self-teardown at
-			// DefaultOrphanPolicy's deadline (~90s) with no second attempt in
-			// THIS pass. The retry doctrine this PR applies to the batch
+			// otherwise-healthy session to self-teardown at the shim's
+			// configured orphan deadline (90 s under a composing deployment's
+			// explicit setting today) with no second attempt in THIS pass.
+			// The retry doctrine this PR applies to the batch
 			// commit (completeLaunchedSessionShimAdoptionBatchResilient) is
 			// intentionally NOT duplicated here: this pass already has to stay
 			// bounded across every lineage it composes, and a future
@@ -2765,7 +2945,32 @@ func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID strin
 	slog.Info("session shim: republished the durable projection after a quarantine change",
 		"org", orgID, "adopted", len(batch.Adopted), "quarantined", len(batch.Quarantined),
 		"revision", receipt.AdoptionRevision)
+	// Every batch commit demotes the receiver's readiness for this host until
+	// a beat re-attests the committed revision and quarantine set. Left to the
+	// periodic ticker that beat arrives up to a whole interval late, and for
+	// that window the host refuses every poll. Ring it now — detached, because
+	// this republish can run INSIDE a beat's own projection build (the
+	// tombstone reconcile runs there) and the beat lane serializes its sends.
+	d.ringSessionShimHeartbeatDetached()
 	return nil
+}
+
+// ringSessionShimHeartbeatDetached rings one immediate beat on a goroutine of
+// its own, bounded by one callback timeout.
+//
+// Detached is the point, not a convenience: the callers are republish paths
+// that may already hold the publication barrier (a reconciliation pass) or run
+// on the heartbeat lane's own goroutine (a tombstone handoff inside the
+// projection build), and a synchronous SendNow from either would wait on a lock
+// the caller holds. The beat still carries exactly the projection the daemon
+// holds when it composes, which is at or past the republish that rang it.
+func (d *Daemon) ringSessionShimHeartbeatDetached() {
+	timeout := d.sessionShimConfig().callbackTimeout()
+	go func() {
+		ctx, cancel := context.WithTimeout(context.Background(), timeout)
+		defer cancel()
+		d.ringSessionShimPostActivationHeartbeat(ctx)
+	}()
 }
 
 // sortSessionShimAdoptionOutcomes puts a batch's adopted set in the exact order

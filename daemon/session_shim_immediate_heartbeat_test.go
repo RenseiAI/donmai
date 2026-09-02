@@ -45,6 +45,17 @@ func (r *immediateBeatRecorder) count() int {
 	return r.beats
 }
 
+// revisions lists the adoption revision every beat attested, in wire order.
+func (r *immediateBeatRecorder) revisions() []string {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	out := make([]string, 0, len(r.projections))
+	for _, projection := range r.projections {
+		out = append(out, projection.AdoptionRevision)
+	}
+	return out
+}
+
 func (r *immediateBeatRecorder) adoptionCompleteRevisions() []string {
 	r.mu.Lock()
 	defer r.mu.Unlock()

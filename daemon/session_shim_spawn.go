@@ -1832,6 +1832,13 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		// and the loop ends immediately afterwards rather than reading a socket
 		// nobody owns.
 		terminalStreamClosed := false
+		// cause records WHY the stream ended. A stream this daemon closed
+		// because its durable carrier refused is a carrier loss — the shim and
+		// its harness are untouched — and is the one ending the release path
+		// re-adopts before it quarantines. Every other ending (the shim closed,
+		// the socket went away, the shim broke the sequence contract) keeps the
+		// pre-existing disposition.
+		cause := shimStreamEnded
 	consume:
 		for ev := range ctrl.Events() {
 			if observe != nil {
@@ -1852,12 +1859,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// A later frame must never advance the cursor past this
 							// unacknowledged one. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable output acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
@@ -1874,6 +1883,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						slog.Warn("session shim: durable carrier rejected output gap",
 							"session", id.String(), "fromSeq", ev.Gap.FromSeq,
 							"toSeq", ev.Gap.ToSeq, "error", err)
+						cause = shimStreamCarrierLost
 						_ = ctrl.Close()
 						break consume
 					}
@@ -1896,6 +1906,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					if err := durable(id, ev); err != nil {
 						slog.Warn("session shim: durable carrier rejected staged Snapshot",
 							"session", id.String(), "seq", ev.Seq, "error", err)
+						cause = shimStreamCarrierLost
 						_ = ctrl.Close()
 						break consume
 					}
@@ -1909,6 +1920,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					if err := durable(id, ev); err != nil {
 						slog.Warn("session shim: durable carrier rejected host frame",
 							"session", id.String(), "seq", ev.Seq, "type", ev.FrameType, "error", err)
+						cause = shimStreamCarrierLost
 						_ = ctrl.Close()
 						break consume
 					}
@@ -1969,12 +1981,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// A later frame must never advance the cursor past this
 							// unacknowledged snapshot. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq); err != nil {
 							slog.Warn("session shim: durable Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
@@ -1989,12 +2003,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected emitted snapshot",
 								"session", id.String(), "seq", ev.Seq, "error", err)
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable emitted Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
+							cause = shimStreamCarrierLost
 							_ = ctrl.Close()
 							break consume
 						}
@@ -2005,12 +2021,26 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		// The stream ended, or this consumer dropped it. Either way the shim keeps
 		// the harness and starts its orphan clock, so this is NOT a terminal
 		// outcome and must not be reported as one — but ownership must be released
-		// rather than left published against a socket nobody can write to.
+		// rather than left published against a socket nobody can write to, or
+		// (after a carrier loss) re-established through a fresh adoption.
 		if gate.await() {
-			d.releaseShimIfLive(id, ctrl)
+			d.releaseShimIfLive(id, ctrl, cause)
 		}
 	}()
 }
+
+// shimStreamEndCause says why an adopted session's controller stream ended.
+type shimStreamEndCause uint8
+
+const (
+	// shimStreamEnded: the shim, or its socket, ended the stream — or this
+	// daemon closed it because the shim broke the sequence contract.
+	shimStreamEnded shimStreamEndCause = iota
+	// shimStreamCarrierLost: this daemon closed the stream because its
+	// durable carrier refused an append or an acknowledgement. The shim and
+	// its harness are alive and untouched.
+	shimStreamCarrierLost
+)
 
 // shimCursorAcknowledger persists one adopted session's durable forwarded
 // cursor OFF the event path.
@@ -2449,17 +2479,53 @@ func awaitTombstone(
 	}
 }
 
-// releaseShimIfLive withdraws authority from a controller whose stream ended
-// without a terminal observation and moves the exact live shim into visible,
-// capacity-consuming quarantine. The session is NOT reported as ended: only a
-// terminal receipt or matching tombstone closes the loop (§D7/§D10).
-func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Controller) {
-	now := d.shimNow()
-	d.shims.mu.Lock()
+// releaseShimIfLive handles a controller whose stream ended without a terminal
+// observation. The session is NOT reported as ended: only a terminal receipt or
+// matching tombstone closes the loop (§D7/§D10).
+//
+// A CARRIER loss — this daemon closed the stream because its durable carrier
+// refused — is re-adopted first, through the same pipeline the startup pass
+// runs, and the lineage stays adopted under a strictly newer generation when
+// that succeeds. Every other ending, and a carrier loss whose re-adoption
+// fails inside its bound, withdraws authority and moves the exact live shim
+// into visible, capacity-consuming quarantine.
+func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Controller, cause shimStreamEndCause) {
+	d.shims.mu.RLock()
 	entry, ok := d.shims.adopted[id]
 	if ok && ctrl != nil && entry.controller != ctrl {
 		// A replacement controller already owns this identity. A consumer whose
 		// own connection ended must never evict the live one.
+		ok = false
+	}
+	d.shims.mu.RUnlock()
+	if !ok {
+		return
+	}
+	if entry.controller != nil {
+		_ = entry.controller.Close()
+		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
+			"session", id.String(), "carrierLost", cause == shimStreamCarrierLost)
+	}
+	// The adopted entry stays in place while re-adoption runs: the receiver
+	// holds this lineage adopted at exactly this generation, and every
+	// projection built meanwhile must keep saying so. Removing it first would
+	// have a concurrent republish omit a live lineage, which the receiver
+	// refuses as an incomplete snapshot.
+	if cause == shimStreamCarrierLost && d.readoptSessionShimAfterControllerLoss(id, entry) {
+		return
+	}
+	d.quarantineLostSessionShim(id, entry)
+}
+
+// quarantineLostSessionShim withdraws authority from the lost controller and
+// projects the exact live shim as quarantined `socket_unreachable`, then
+// publishes. It is a no-op when the entry has already left by another route —
+// a shutdown release, or a replacement controller.
+func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adoptedShim) {
+	now := d.shimNow()
+	d.shims.mu.Lock()
+	current, ok := d.shims.adopted[id]
+	if ok && current.controller != entry.controller {
 		ok = false
 	}
 	if ok {
@@ -2480,11 +2546,6 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		d.upsertShimQuarantineLocked(q)
 	}
 	d.shims.mu.Unlock()
-	if ok && entry.controller != nil {
-		_ = entry.controller.Close()
-		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
-			"session", id.String())
-	}
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
@@ -2500,9 +2561,13 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 // a heartbeat 409 SESSION_SHIM_ADOPTION_REVISION_STALE, commit-outcome
 // reconciliation and a second publication to undo, all to reach an outcome the
 // shim had already handed over. Consume the proof first; the publish then
-// carries the terminal fact instead of a quarantine nothing holds.
+// carries the terminal fact instead of a quarantine nothing holds — and when
+// the handoff itself already published this scope's complete projection, that
+// publication IS the one, and a second would cost a revision for nothing.
 func (d *Daemon) publishQuarantineAfterConsumingTerminalProof(orgID string) {
-	d.reconcileQuarantinedTombstones()
+	if published := d.reconcileQuarantinedTombstones(); published[orgID] {
+		return
+	}
 	d.publishSessionShimProjection(context.Background(), orgID)
 }
 
@@ -2531,9 +2596,14 @@ func (d *Daemon) upsertShimQuarantineLocked(q sessionshim.QuarantinedSession) {
 // goroutine. The pass that OWNS a lineage's handoff reports it synchronously,
 // bounded by the two callback timeouts that round trip costs (host identity,
 // then the terminal evidence); every other pass skips immediately.
-func (d *Daemon) reconcileQuarantinedTombstones() {
+//
+// It returns the scopes whose complete projection a handoff republished, so a
+// caller about to publish the same scope for its own reason can see that the
+// receiver already holds the current set.
+func (d *Daemon) reconcileQuarantinedTombstones() map[string]bool {
+	published := make(map[string]bool)
 	if d.shims == nil {
-		return
+		return published
 	}
 	d.shims.mu.RLock()
 	registry := d.shims.registry
@@ -2541,7 +2611,7 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 	afterTombstoneFetch := d.shims.afterTombstoneFetch
 	d.shims.mu.RUnlock()
 	if registry == nil || len(quarantined) == 0 {
-		return
+		return published
 	}
 
 	for _, q := range quarantined {
@@ -2589,13 +2659,18 @@ func (d *Daemon) reconcileQuarantinedTombstones() {
 		if !own {
 			continue
 		}
-		d.handOffQuarantinedTerminalProof(registry, key, tombstone)
+		if d.handOffQuarantinedTerminalProof(registry, key, tombstone) {
+			published[id.OrgID] = true
+		}
 	}
+	return published
 }
 
 // handOffQuarantinedTerminalProof performs the durable terminal handoff for the
 // ONE incarnation whose in-flight mark this caller already owns, and releases
-// that mark however it leaves.
+// that mark however it leaves. It reports whether the lineage left the
+// quarantine projection AND that scope's complete projection was republished
+// to carry the change.
 //
 // The release is a defer keyed on a flag, not three explicit calls at the exits.
 // This runs on the daemon's control-API handler goroutines, where net/http
@@ -2610,7 +2685,7 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	registry *sessionshim.Registry,
 	key shimIncarnation,
 	tombstone sessionshim.Tombstone,
-) {
+) (republished bool) {
 	id := key.identity
 	committed := false
 	forget := false
@@ -2635,14 +2710,14 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	// can never reach this lineage again.
 	if !d.quarantineHoldsIncarnation(key) {
 		forget = true
-		return
+		return false
 	}
 
 	hostID, hostErr := d.sessionShimHostID(context.Background(), id.OrgID)
 	if hostErr != nil {
 		slog.Warn("session shim: retain quarantined terminal proof after host identity resolution failed",
 			"session", id.String(), "error", hostErr)
-		return
+		return false
 	}
 	// NO adoption correlation, even when this daemon still retains one.
 	//
@@ -2664,7 +2739,7 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	if err := d.reportSessionShimTerminalEvidence(context.Background(), terminalEvidence); err != nil {
 		slog.Warn("session shim: retain quarantined terminal proof after durable evidence refusal",
 			"session", id.String(), "error", err)
-		return
+		return false
 	}
 	committed = true
 
@@ -2682,8 +2757,22 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 		// ever reaches a lineage through the quarantine set, and this one is no
 		// longer in it.
 		forget = true
-		return
+		return false
 	}
+
+	// The daemon's quarantine set just changed, and the receiver's did not:
+	// accepting the terminal evidence resolved this lineage's obligation but
+	// nothing on that side prunes the host row's quarantine snapshot — only a
+	// batch moves it. Without this publish the next beat carries
+	// `quarantined=[]` against a row still holding `[X]` at the same revision,
+	// is refused stale, and demotes the host to draining on every beat until
+	// something else republishes. Measured on an installed host as ten minutes
+	// of 409s that ended only with a restart. The publish is fire-and-forget
+	// for the same reason the disconnect path's is: a refusal is logged and
+	// the next adoption, tombstone, or reconciliation republishes the same
+	// projection.
+	d.publishSessionShimProjection(context.Background(), id.OrgID)
+	republished = true
 
 	// Withdraw the liveness claim BEFORE disposing the proof, exactly as
 	// finishAdoptedShim does. Disposing first would collapse "terminal, proven"
@@ -2693,12 +2782,12 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	if err := registry.RemoveIncarnation(id, tombstone.ShimID, tombstone.ProcessEpoch); err != nil {
 		slog.Warn("session shim: withdraw discovery record after durable terminal handoff",
 			"session", id.String(), "error", err)
-		return
+		return republished
 	}
 	if err := registry.RemoveTombstoneIncarnation(tombstone); err != nil {
 		slog.Warn("session shim: dispose quarantined tombstone after durable terminal handoff",
 			"session", id.String(), "error", err)
-		return
+		return republished
 	}
 	// The captured stdout/stderr file is disposed alongside the record/
 	// tombstone above — see removeShimChildLog's doc comment.
@@ -2707,6 +2796,7 @@ func (d *Daemon) handOffQuarantinedTerminalProof(
 	// and no mark is needed to stop it. Keeping one would make this map grow for
 	// the daemon's whole life.
 	forget = true
+	return republished
 }
 
 // quarantineHoldsIncarnation answers whether the EXACT incarnation is still in

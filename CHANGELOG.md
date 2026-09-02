@@ -6,6 +6,74 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **A quarantined session whose tombstone is handed over now republishes the
+  host's durable projection, so the receiver's quarantine set advances with
+  the daemon's.** Accepting the terminal evidence resolved the lineage's
+  obligation on the receiver, but nothing there pruned the host row's
+  quarantine snapshot — only a batch moves it — and the daemon withdrew the
+  lineage locally without publishing one. The next heartbeat then carried
+  `quarantined=[]` against a row still holding `[X]` at the same adoption
+  revision, was refused stale, and demoted the host to draining on every
+  beat until a restart republished. The handoff now publishes the complete
+  projection the moment the lineage leaves quarantine, every republish rings
+  one immediate heartbeat (detached, so a republish inside the beat's own
+  projection build cannot wait on the lane it is ringing), and the
+  every-mutation-publishes guard now watches the withdrawal as well as the
+  upsert.
+- **A live shim whose controller stream ended because the daemon's durable
+  carrier refused is re-adopted before it is quarantined.** A carrier
+  restart made every durable append fail, the daemon closed its controller,
+  and the disconnect path quarantined the lineage `socket_unreachable` at once
+  with nothing ever dialling it again — so a healthy harness was reaped at
+  the shim's orphan deadline for a fault at neither end. The daemon now runs
+  the same pipeline the startup pass runs (dial, prepare, durable adoption,
+  complete batch, carrier activation) for exactly that identity, bounded by
+  `SessionShimConfig.Readoption`: `Attempts` (default 3), `Backoff` before
+  the second attempt, doubling after (default 5 s), and `AttemptTimeout`
+  bounding each attempt end to end (default 15 s); `Disabled` keeps the
+  previous disposition. The shim's orphan clock starts the moment the
+  controller stream ends and only an accepted Welcome disarms it, so the
+  whole window has to end before the orphan deadline. That deadline is
+  whatever the daemon resolves: fifteen minutes standalone; the one
+  composing deployment known today declares an external release threshold
+  AND sets `Orphan.Deadline` explicitly to 90 s, so 90 s is what it is
+  actually held to. A composition that instead LEAVES `Orphan.Deadline`
+  zero gets the derived `threshold − grace − margin − one margin of
+  headroom` — 115 s for the tightest threshold known (three minutes) — and
+  the window is held below that too. The default policy's worst case is
+  `3 × 15 s + (5 s + 10 s) = 60 s`, strictly inside all three, and a test
+  computes the derived deadline and asserts it rather than quoting it —
+  `SessionShimReadoptionPolicy.WorstCaseWindow()` computes the same
+  arithmetic for any policy so an embedder can check its own against its
+  own deadline. Without the per-attempt bound an attempt would run under
+  the launch path's publication timeout (four 30 s callback timeouts in a
+  composed deployment), and three attempts would take up to 375 s. On success
+  the lineage stays adopted under a strictly newer generation and the shim
+  disarms its orphan clock; the lost entry stays in the adopted set for the
+  whole window, so a batch or heartbeat projection built meanwhile still
+  presents the lineage adopted at the generation the receiver holds; a
+  re-adoption whose batch is refused restores the lost entry and leaves no
+  batch published; a lineage that cannot be re-adopted inside the bound is
+  quarantined exactly as before. Streams the shim itself ended keep the
+  previous disposition. `sessionshim.AdoptOptions.Filter` restricts one
+  adoption pass to the identities it names; a daemon-level regression test
+  now adopts two lineages, loses the carrier under only one, and pins that
+  the other's controller and controller generation come out exactly as they
+  went in — nothing about it is ever dialled.
+- **`Daemon.ScheduleSessionShimReconciliation(scope, cause)` is exported** so
+  a heartbeat lane the daemon does not own — a composition serving several
+  scopes beats each on its own lane — can arm the bounded
+  reconcile-and-republish pass on a revision-stale refusal for that scope,
+  the same pass the daemon's own lane arms. At most one pass runs per scope
+  at a time; a scope with no retained authority receipt is refused with a
+  warning.
+
+---
+
 ## v0.72.16 — 2026-09-02
 
 ### Fixes
