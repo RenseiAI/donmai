@@ -86,11 +86,13 @@ type batchCommitResult struct {
 // transient control-plane compare-and-swap conflict independent of
 // completeness.
 type sessionShimBatchCompletenessFake struct {
-	mu                sync.Mutex
-	live              map[string]bool
-	refusalsRemaining int
-	revision          atomic.Int64
-	results           []batchCommitResult
+	mu                 sync.Mutex
+	live               map[string]bool
+	refusalsRemaining  int
+	ambiguousRemaining int
+	ambiguousErr       error
+	revision           atomic.Int64
+	results            []batchCommitResult
 }
 
 func (f *sessionShimBatchCompletenessFake) onAdoption(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
@@ -117,6 +119,19 @@ func (f *sessionShimBatchCompletenessFake) setRefusals(n int) {
 	f.mu.Unlock()
 }
 
+// setAmbiguous arms n leading onAdoptionBatch calls to APPLY the batch and
+// then lose the answer: err is returned to the daemon after the (fake) control
+// plane has already accepted the set, which is exactly the outcome-unknown
+// shape sessionShimCommitOutcomeUnknown classifies. Unlike setRefusals this is
+// not a refusal — the completeness bookkeeping still advances, so a later
+// batch is judged against a control plane that DID commit.
+func (f *sessionShimBatchCompletenessFake) setAmbiguous(n int, err error) {
+	f.mu.Lock()
+	f.ambiguousRemaining = n
+	f.ambiguousErr = err
+	f.mu.Unlock()
+}
+
 func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
@@ -133,6 +148,14 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 	if f.refusalsRemaining > 0 {
 		f.refusalsRemaining--
 		return record(batchCommitRefusal())
+	}
+	if f.ambiguousRemaining > 0 {
+		f.ambiguousRemaining--
+		// The revision the control plane would have stamped is consumed here
+		// exactly as a committed batch consumes one: the daemon's copy of the
+		// answer is what was lost, not the commit.
+		f.revision.Add(1)
+		return record(f.ambiguousErr)
 	}
 	present := make(map[string]bool, len(batch.Adopted)+len(batch.Quarantined))
 	for _, outcome := range batch.Adopted {
@@ -155,6 +178,23 @@ func (f *sessionShimBatchCompletenessFake) snapshot() []batchCommitResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]batchCommitResult(nil), f.results...)
+}
+
+// lastCommittedBatch returns the batch of the fake's most recent call, and
+// fails the test unless the fake ACCEPTED it: a batch that was merely SENT
+// proves nothing about the server's completeness rule, which is the whole
+// point of enforcing it here.
+func (f *sessionShimBatchCompletenessFake) lastCommittedBatch(t *testing.T) SessionShimAdoptionBatch {
+	t.Helper()
+	results := f.snapshot()
+	if len(results) == 0 {
+		t.Fatal("no adoption batch was ever committed")
+	}
+	last := results[len(results)-1]
+	if last.err != nil {
+		t.Fatalf("the last adoption batch was refused by the completeness-enforcing fake: %v", last.err)
+	}
+	return last.batch
 }
 
 func batchAdoptsSession(batch SessionShimAdoptionBatch, sessionID string) bool {

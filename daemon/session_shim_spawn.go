@@ -414,7 +414,16 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 			// this batch, republishing the complete set at the revision the
 			// refresher answers. The scheduled pass serializes behind this
 			// launch's own publication barrier.
-			d.scheduleSessionShimReconciliation(id.OrgID, "ambiguous-launch-batch-commit")
+			//
+			// Recording the lineage FIRST is what makes that republish
+			// composable at all: the rollback restores a projection that by
+			// construction does not contain a session whose adoption never
+			// finished, while the control plane already holds it live from
+			// this launch's own completeSessionShimAdoption. See
+			// recordAmbiguousLaunchBatchQuarantine.
+			if !d.recordAmbiguousLaunchBatchQuarantine(pubCtx, evidence, err) {
+				d.scheduleSessionShimReconciliation(id.OrgID, sessionShimReconcileCauseAmbiguousLaunch)
+			}
 		}
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
@@ -668,6 +677,10 @@ func sleepSessionShimAdoptionBatchBackoff(ctx context.Context, d time.Duration) 
 // time every retry above has been spent, ctx may have little or nothing left,
 // and this best-effort repair deserves its own full attempt rather than
 // whatever remainder happens to survive it.
+//
+// The OUTCOME-UNKNOWN twin of the recording half is
+// recordAmbiguousLaunchBatchQuarantine — same complete-snapshot obligation,
+// arrived at from the other side of the same round trip.
 func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 	ctx context.Context,
 	evidence SessionShimAdoptionEvidence,
@@ -717,6 +730,122 @@ func (d *Daemon) restoreSessionShimReadinessAfterExhaustedBatchCommit(
 	slog.Error("session shim: adoption batch commit exhausted its retries; restored the host's last-known-good durable "+
 		"projection (with this lineage presented quarantined, pending a successful commit) so the rest of its sessions can keep claiming work",
 		"session", evidence.Identity.String(), "commitError", causeErr)
+}
+
+// ambiguousLaunchBatchQuarantineDetail is the quarantine detail an
+// outcome-unknown launch batch commit leaves on the lineage. It says what is
+// and is not known, because it is the string an operator reads off the host's
+// own projection while the ambiguity is still open.
+const ambiguousLaunchBatchQuarantineDetail = "adoption batch commit outcome was never learned (transport, deadline or 5xx after the " +
+	"request went out); already durably adopted server-side and no longer running here, presented quarantined until a " +
+	"reconciliation republish commits a complete snapshot that includes it"
+
+// recordAmbiguousLaunchBatchQuarantine records the launching lineage into this
+// daemon's own live projection after an adoption-batch commit whose outcome was
+// never learned — the OUTCOME-UNKNOWN twin of the recording half of
+// restoreSessionShimReadinessAfterExhaustedBatchCommit, and the step whose
+// absence was measured live.
+//
+// # THE STRAND THIS UNDOES
+//
+// By the time a launch reaches the batch commit, d.completeSessionShimAdoption
+// has ALREADY succeeded for this lineage: the control plane holds a live
+// per-session adoption record for it, independent of any batch, and refuses
+// every later batch that omits it (adoption_batch_live_lineage_omitted). That
+// is true whether the lost answer was a commit or a refusal — the obligation
+// comes from the per-session adoption, not from the batch.
+//
+// The caller's rollback then restores the LAST-COMMITTED projection, which by
+// construction cannot contain a session whose adoption never finished, and
+// trackLaunchedShim has not run, so d.shims.adopted does not hold it either.
+// Without this call the lineage exists nowhere in this daemon's state: every
+// batch it can compose from here on omits it and is refused — INCLUDING every
+// reconciliation republish, which is the one mechanism that could resolve the
+// ambiguity. Measured end state: bounded reconciliation exhausting against a
+// completeness rule no retry could satisfy, no later launch able to commit
+// either, and a session left in its pre-running state with no process on the
+// host and nothing to release it.
+//
+// Recording it here makes the projection composable again, and therefore makes
+// the ambiguity RESOLVABLE: the scheduled reconciliation pass relearns the
+// control plane's committed revision through the one credential refresher and
+// republishes a complete snapshot that presents this lineage as quarantined —
+// which is the truth, because the caller closes its controller on this path.
+// The entry consumes capacity until a terminal tombstone for the exact
+// incarnation proves the harness group was reaped, at which point
+// reconcileQuarantinedTombstones clears it through the same door every other
+// quarantined lineage leaves by.
+//
+// Quarantining is correct under BOTH resolutions of the ambiguity. If the
+// control plane committed the batch, it holds this lineage adopted at a
+// revision this daemon never learned, and the republish corrects that adopted
+// entry to the quarantine the host can actually back. If it did not commit,
+// the per-session adoption record still stands and the republish is the first
+// batch that presents it at all. Neither outcome is guessed here: the
+// republish carries only server-issued revisions.
+// THE PUBLISH IS PART OF THE RECORDING, NOT AN OPTIMIZATION
+//
+// The platform compares every beat's quarantine set against the snapshot the
+// last committed batch stored and demotes a host whose beat disagrees, so a
+// quarantine recorded and left unpublished trades this bug for a draining
+// host (TestEveryQuarantineMutationPublishes is the invariant). The publish
+// here is also the FIRST and cheapest attempt of the bounded resolution: it
+// re-reads the control plane's expected revision through PrepareAdoptionBatch
+// rather than resending the one that was just in flight, so a flake that is
+// already over is resolved in this one round trip and the heavier
+// reconciliation pipeline is never engaged.
+//
+// It returns whether the ambiguity was resolved here. On false the caller arms
+// the bounded reconciliation pass, which relearns the revision through the ONE
+// credential refresher and republishes the same complete snapshot — now
+// composable, because this function recorded the lineage before returning.
+func (d *Daemon) recordAmbiguousLaunchBatchQuarantine(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	causeErr error,
+) bool {
+	d.shims.mu.Lock()
+	d.upsertShimQuarantineLocked(sessionshim.QuarantinedSession{
+		OrgID: evidence.Identity.OrgID, SessionID: evidence.Identity.SessionID,
+		ShimID: evidence.ShimID, ProcessEpoch: evidence.ProcessEpoch,
+		ControllerGeneration: evidence.ControllerGeneration,
+		Reason:               sessionshim.QuarantineAdoptionFailed,
+		Detail:               ambiguousLaunchBatchQuarantineDetail,
+		ConsumesCapacity:     true,
+	})
+	d.shims.mu.Unlock()
+	slog.Warn("session shim: adoption batch commit outcome unknown; recorded the launching lineage quarantined so every later "+
+		"batch presents it and the commit can be driven to a definite outcome "+
+		"(shim-ambiguous-launch-lineage-2026-09-02)",
+		"session", evidence.Identity.String(), "shimId", evidence.ShimID,
+		"processEpoch", evidence.ProcessEpoch, "commitError", causeErr)
+	// A fresh callback-sized budget detached from ctx's deadline, mirroring
+	// restoreSessionShimReadinessAfterExhaustedBatchCommit: the publication
+	// budget may be the very thing that just expired, and this repair deserves
+	// its own full attempt rather than whatever remainder survives.
+	publishCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout())
+	defer cancel()
+	batch := d.sessionShimProjectionBatch(evidence.Identity.OrgID, evidence.HostID)
+	receipt, err := d.completeSessionShimAdoptionBatch(publishCtx, batch)
+	if err != nil {
+		slog.Warn("session shim: the immediate republish after an outcome-unknown commit did not land; "+
+			"bounded reconciliation now owns driving it to a definite outcome",
+			"session", evidence.Identity.String(), "commitError", causeErr, "republishError", err)
+		return false
+	}
+	if revisionErr := d.updateSessionShimAdoptionRevision(evidence.Identity.OrgID, receipt.AdoptionRevision, false); revisionErr != nil {
+		// The republish committed but its revision was not retained, so the
+		// next beat would present a superseded one. Reconciliation relearns it
+		// through the refresher — the same repair a republish that skips this
+		// step needs anywhere else in this subsystem.
+		slog.Warn("session shim: the immediate republish after an outcome-unknown commit landed but its revision was not retained",
+			"session", evidence.Identity.String(), "commitError", causeErr, "revisionError", revisionErr)
+		return false
+	}
+	slog.Info("session shim: outcome-unknown adoption batch commit resolved by an immediate republish; the control plane now "+
+		"holds a complete snapshot presenting this lineage quarantined, and no reconciliation pass was needed",
+		"session", evidence.Identity.String(), "revision", receipt.AdoptionRevision, "commitError", causeErr)
+	return true
 }
 
 // ringSessionShimPostActivationHeartbeat sends one immediate heartbeat after a
