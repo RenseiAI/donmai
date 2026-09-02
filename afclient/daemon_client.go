@@ -141,6 +141,25 @@ type DaemonSessionShimStatus struct {
 	Adopted                   []DaemonSessionShimAdoptedCorrelation `json:"adopted,omitempty"`
 	Quarantined               []sessionshim.QuarantinedSession      `json:"quarantined,omitempty"`
 	ControllerID              string                                `json:"controllerId,omitempty"`
+	// Reconverging lists the scopes whose durable projection has not converged
+	// with the control plane's committed revision yet. Empty is the normal
+	// state. A host that is serving correctly but not converging looks healthy
+	// in every other field here, which is exactly how one stayed unnoticed.
+	Reconverging []DaemonSessionShimReconvergence `json:"reconverging,omitempty"`
+}
+
+// DaemonSessionShimReconvergence is one scope's live re-convergence condition.
+type DaemonSessionShimReconvergence struct {
+	Scope string `json:"scope"`
+	// Cause is the classified trigger that armed the current attempt.
+	Cause string `json:"cause,omitempty"`
+	// Rearms counts complete bounded passes spent without converging. A value
+	// that keeps growing is the operator-visible form of "this host cannot
+	// agree with the control plane on its own".
+	Rearms int `json:"rearms"`
+	// AdvancedTo is the revision the control plane last reported holding, when
+	// it reported one.
+	AdvancedTo string `json:"advancedTo,omitempty"`
 }
 
 // DaemonProjectStatus is one truthful host-project status row.

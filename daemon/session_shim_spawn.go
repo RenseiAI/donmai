@@ -1437,6 +1437,29 @@ type shimCursorAcknowledger struct {
 	// sequence the shim has already stored.
 	mu    sync.Mutex
 	acked uint64
+
+	// backoffMu guards lastBackoff, the delay the loop most recently waited for
+	// a pending persistence receipt. It exists so the reset-on-success rule is
+	// observable: a backoff that keeps its earned cap after the stall cleared
+	// makes the next unrelated hiccup wait a full callback timeout for nothing,
+	// and nothing else about the loop distinguishes the two.
+	backoffMu   sync.Mutex
+	lastBackoff time.Duration
+}
+
+// noteReceiptBackoff records the delay the loop is about to wait.
+func (a *shimCursorAcknowledger) noteReceiptBackoff(d time.Duration) {
+	a.backoffMu.Lock()
+	a.lastBackoff = d
+	a.backoffMu.Unlock()
+}
+
+// receiptBackoffUsed reports the delay most recently waited for a pending
+// persistence receipt.
+func (a *shimCursorAcknowledger) receiptBackoffUsed() time.Duration {
+	a.backoffMu.Lock()
+	defer a.backoffMu.Unlock()
+	return a.lastBackoff
 }
 
 // shimCursorController is the controller surface the acknowledger uses. It is
@@ -1458,6 +1481,11 @@ func (d *Daemon) startShimCursorAcknowledger(
 		wake: make(chan struct{}, 1), quit: make(chan struct{}),
 	}
 	d.shims.wg.Add(1)
+	// The pending-receipt retry reuses the batch commit's derived units rather
+	// than inventing a second pair: one base delay, doubling, capped by the
+	// composing callback bound this daemon already waits a round trip for.
+	receiptBackoff := sessionShimAdoptionBatchCommitBaseBackoff
+	receiptBackoffCap := d.sessionShimConfig().callbackTimeout()
 	go func() {
 		defer d.shims.wg.Done()
 		for {
@@ -1469,6 +1497,28 @@ func (d *Daemon) startShimCursorAcknowledger(
 				return
 			}
 			if err := a.persist(a.pending.Load()); err != nil {
+				// A receipt that is merely SLOW is a condition of the durable
+				// side, not of this connection. Measured on an installed host:
+				// a persistence stall of tens of seconds dropped two healthy
+				// shims, and both reaped their own harnesses once their orphan
+				// clocks ran out — two working seats lost to a slow write. Keep
+				// the connection, leave the acknowledgement outstanding (the
+				// cursor never advances past what the shim confirmed), and come
+				// back to it after one bounded backoff.
+				if errors.Is(err, sessionshim.ErrHeartbeatReceiptPending) {
+					slog.Warn("session shim: durable HostFrame acknowledgement is still pending; keeping the shim connection and retrying "+
+						"(shim-adoption-reconvergence-2026-09-01)",
+						"session", id.String(), "seq", a.pending.Load(), "backoff", receiptBackoff, "error", err)
+					a.noteReceiptBackoff(receiptBackoff)
+					if !a.sleepPendingReceiptBackoff(receiptBackoff) {
+						return
+					}
+					if receiptBackoff *= 2; receiptBackoff > receiptBackoffCap {
+						receiptBackoff = receiptBackoffCap
+					}
+					a.signal()
+					continue
+				}
 				// A shim that refuses because its TERMINAL PROOF IS PUBLISHED is
 				// not a broken socket — it is telling this daemon that the
 				// tombstone is already on disk. Measured on an installed host:
@@ -1507,6 +1557,10 @@ func (d *Daemon) startShimCursorAcknowledger(
 				_ = ctrl.Close()
 				return
 			}
+			// A confirmed acknowledgement ends the stall: the next one that has
+			// to wait starts from the base delay rather than inheriting a cap
+			// earned by a condition that has since cleared.
+			receiptBackoff = sessionShimAdoptionBatchCommitBaseBackoff
 			if a.pending.Load() > a.highWater() {
 				a.signal()
 			}
@@ -1561,6 +1615,22 @@ func (a *shimCursorAcknowledger) signal() {
 }
 
 func (a *shimCursorAcknowledger) stop() { a.quitOne.Do(func() { close(a.quit) }) }
+
+// sleepPendingReceiptBackoff waits d before the next acknowledgement attempt,
+// or returns false when the acknowledger was stopped or the controller ended
+// first — the two reasons there is nothing left to retry for.
+func (a *shimCursorAcknowledger) sleepPendingReceiptBackoff(d time.Duration) bool {
+	timer := time.NewTimer(d)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return true
+	case <-a.quit:
+		return false
+	case <-a.ctrl.Done():
+		return false
+	}
+}
 
 type sessionShimCursorAcknowledger interface {
 	SupportsFullHostFrames() bool

@@ -8,10 +8,28 @@ import (
 
 // Default bounds for the shim-owned orphan rule (ADR-2026-08-17 §D8).
 const (
-	// DefaultOrphanDeadline is the §D8 first-implementation value: how long a
-	// shim keeps running after losing its controller before it terminates and
-	// reaps its own harness process group.
-	DefaultOrphanDeadline = 90 * time.Second
+	// DefaultOrphanDeadline is how long a shim keeps running after losing its
+	// controller before it terminates and reaps its own harness process group.
+	//
+	// §D8 fixes an INEQUALITY, not a number, and the number is a policy choice
+	// inside it (Validate enforces the inequality; the first implementation
+	// chose 90 seconds). Ninety seconds turned out to be a choice that answers
+	// the wrong question: it is far shorter than the time a control plane can
+	// take to come back, so every transient stall that cost a shim its
+	// controller also cost a live harness its work. Measured on an installed
+	// host: two healthy sessions were dropped by a slow durable write and both
+	// self-terminated ninety seconds later, with nothing wrong on either end.
+	//
+	// The deadline exists to bound DOUBLE EXECUTION, and it bounds that exactly
+	// as well at fifteen minutes as at ninety seconds — as long as the
+	// inequality still holds against whatever external threshold a composing
+	// deployment declares, which Validate checks at startup and refuses to
+	// start without. The window is long enough for a daemon restart, a control
+	// plane outage, or an operator to intervene; a session that is genuinely
+	// abandoned is still reaped, just not eagerly. Deployments that need a
+	// tighter bound set OrphanPolicy.Deadline (the daemon also reads
+	// DONMAI_SESSION_SHIM_ORPHAN_DEADLINE_MS).
+	DefaultOrphanDeadline = 15 * time.Minute
 
 	// DefaultTerminationGrace is the SIGTERM→SIGKILL window the shim uses when
 	// the deadline fires. It matches the PTY host's own stop grace.
