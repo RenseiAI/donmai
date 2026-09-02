@@ -89,6 +89,7 @@ type sessionShimBatchCompletenessFake struct {
 	mu                sync.Mutex
 	live              map[string]bool
 	refusalsRemaining int
+	scripted          []error
 	revision          atomic.Int64
 	results           []batchCommitResult
 }
@@ -103,7 +104,16 @@ func (f *sessionShimBatchCompletenessFake) onAdoption(_ context.Context, evidenc
 	return SessionShimAdoptionReceipt{DurableCorrelation: []byte("adopted-" + evidence.Identity.SessionID)}, nil
 }
 
-func (f *sessionShimBatchCompletenessFake) prepareBatch(context.Context, string, string) ([]byte, error) {
+// prepareBatch HONORS ITS CONTEXT, and that is load-bearing rather than
+// decoration: a real PrepareAdoptionBatch is an HTTP round trip that fails
+// immediately when its context is already expired, which is exactly what
+// happens to a callback handed a budget an earlier stage already burned. A fake
+// that ignored the context could not see that failure at all — it answered
+// happily on a dead context — so no test could catch a publish issued on one.
+func (f *sessionShimBatchCompletenessFake) prepareBatch(ctx context.Context, _, _ string) ([]byte, error) {
+	if err := ctx.Err(); err != nil {
+		return nil, fmt.Errorf("prepare adoption batch: %w", err)
+	}
 	return []byte(fmt.Sprintf("revision-%d", f.revision.Add(1))), nil
 }
 
@@ -117,7 +127,22 @@ func (f *sessionShimBatchCompletenessFake) setRefusals(n int) {
 	f.mu.Unlock()
 }
 
-func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+// setAnswers scripts the fake's next calls one at a time, which setRefusals
+// cannot express: a bounded count of one kind of answer cannot say "OUTCOME-
+// UNKNOWN, THEN a decoded refusal" — the exact sequence a re-drive of a lost
+// commit answer meets. A nil element means "answer this call honestly", i.e.
+// fall through to the completeness check; calls past the end of the script fall
+// through too. A scripted OUTCOME-UNKNOWN answer models a control plane that
+// APPLIED the batch and lost the reply, so it consumes a revision exactly as a
+// committed batch does.
+func (f *sessionShimBatchCompletenessFake) setAnswers(answers ...error) {
+	f.mu.Lock()
+	f.scripted = append([]error(nil), answers...)
+	f.mu.Unlock()
+}
+
+// onAdoptionBatch honors its context for the same reason prepareBatch does.
+func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(ctx context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	record := func(err error) (SessionShimAdoptionBatchReceipt, error) {
@@ -130,16 +155,39 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 			AdoptionRevision:   fmt.Sprintf("revision-%d", f.revision.Load()),
 		}, nil
 	}
+	if err := ctx.Err(); err != nil {
+		return record(fmt.Errorf("commit adoption batch: %w", err))
+	}
+	if len(f.scripted) > 0 {
+		answer := f.scripted[0]
+		f.scripted = f.scripted[1:]
+		if answer != nil {
+			if sessionShimCommitOutcomeUnknown(answer) {
+				f.revision.Add(1)
+			}
+			return record(answer)
+		}
+	}
 	if f.refusalsRemaining > 0 {
 		f.refusalsRemaining--
 		return record(batchCommitRefusal())
 	}
-	present := make(map[string]bool, len(batch.Adopted)+len(batch.Quarantined))
+	present := make(map[string]bool, len(batch.Adopted)+len(batch.Quarantined)+len(batch.Tombstoned))
 	for _, outcome := range batch.Adopted {
 		present[outcome.Evidence.Identity.SessionID] = true
 	}
 	for _, q := range batch.Quarantined {
 		present[q.SessionID] = true
+	}
+	// A TOMBSTONED presentation both satisfies completeness and DISCHARGES the
+	// lineage: it is how every lineage legitimately leaves a host's projection,
+	// and a server that kept demanding it afterwards could never let one go. A
+	// fake that only counted Adopted and Quarantined refused the very batch
+	// that ends the obligation.
+	discharged := make([]string, 0, len(batch.Tombstoned))
+	for _, terminal := range batch.Tombstoned {
+		present[terminal.Identity.SessionID] = true
+		discharged = append(discharged, terminal.Identity.SessionID)
 	}
 	for sessionID := range f.live {
 		if !present[sessionID] {
@@ -148,6 +196,9 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 			return record(fmt.Errorf("adoption_batch_live_lineage_omitted: sc-refused (session %s)", sessionID))
 		}
 	}
+	for _, sessionID := range discharged {
+		delete(f.live, sessionID)
+	}
 	return record(nil)
 }
 
@@ -155,6 +206,23 @@ func (f *sessionShimBatchCompletenessFake) snapshot() []batchCommitResult {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 	return append([]batchCommitResult(nil), f.results...)
+}
+
+// lastCommittedBatch returns the batch of the fake's most recent call, and
+// fails the test unless the fake ACCEPTED it: a batch that was merely SENT
+// proves nothing about the server's completeness rule, which is the whole
+// point of enforcing it here.
+func (f *sessionShimBatchCompletenessFake) lastCommittedBatch(t *testing.T) SessionShimAdoptionBatch {
+	t.Helper()
+	results := f.snapshot()
+	if len(results) == 0 {
+		t.Fatal("no adoption batch was ever committed")
+	}
+	last := results[len(results)-1]
+	if last.err != nil {
+		t.Fatalf("the last adoption batch was refused by the completeness-enforcing fake: %v", last.err)
+	}
+	return last.batch
 }
 
 func batchAdoptsSession(batch SessionShimAdoptionBatch, sessionID string) bool {

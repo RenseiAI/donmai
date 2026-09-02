@@ -1260,9 +1260,18 @@ type sessionShimState struct {
 	// forgets the mark while another pass still holds the tombstone it fetched.
 	// Set once, under mu, before the passes that read it start.
 	afterTombstoneFetch func(shimIncarnation)
-	fence               *sessionshim.Fence
-	fences              map[string]sessionshim.Fence
-	fenceRequests       map[string]sessionshim.FenceRequest
+	// afterAmbiguousLaunchDischarge, when set, runs as the LAST statement of the
+	// detached discharge started by releaseAmbiguousLaunchSessionShim, reporting
+	// whether the lineage's recovery obligation was discharged inside the bound.
+	// Nil in every production daemon: it exists so a test can join a goroutine
+	// that is deliberately off the accept path, without waiting on the whole
+	// consumer WaitGroup (which also joins long-lived per-session consumers and
+	// would therefore never return mid-test). Set once, before the launch that
+	// arms it.
+	afterAmbiguousLaunchDischarge func(sessionshim.Identity, bool)
+	fence                         *sessionshim.Fence
+	fences                        map[string]sessionshim.Fence
+	fenceRequests                 map[string]sessionshim.FenceRequest
 	// forwarded is the highest output sequence this daemon durably forwarded per
 	// session — the resume point a LATER adoption asks the shim to replay from
 	// (§D5). The daemon records only this; it never allocates sequence.

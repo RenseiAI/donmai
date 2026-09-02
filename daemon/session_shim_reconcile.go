@@ -85,6 +85,7 @@ const sessionShimRevisionStaleCode = "SESSION_SHIM_ADOPTION_REVISION_STALE"
 // The classified reconciliation triggers, for the armed/attempt log lines.
 const (
 	sessionShimReconcileCauseAmbiguous        = "ambiguous-batch-commit"
+	sessionShimReconcileCauseAmbiguousLaunch  = "ambiguous-launch-batch-commit"
 	sessionShimReconcileCauseRevisionAdvanced = "adoption-revision-advanced"
 )
 
