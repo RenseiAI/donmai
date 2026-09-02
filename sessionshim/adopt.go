@@ -65,6 +65,10 @@ type AdoptOptions struct {
 	// EventBacklogBudget overrides the per-controller event backlog budget, in
 	// payload bytes. Zero uses EventBacklogBudget.
 	EventBacklogBudget int
+	// EventBacklogStallDeadline overrides how long a controller's socket reader
+	// may stall waiting for its consumer to drain before failing closed. Zero
+	// uses the sessionshim default.
+	EventBacklogStallDeadline time.Duration
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -445,6 +449,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		ResumeExternallyConfigured: opts.ResumeFrom != nil,
 		DurableAckGeneration:       durableAckGeneration,
 		EventBacklogBudget:         opts.EventBacklogBudget,
+		EventBacklogStallDeadline:  opts.EventBacklogStallDeadline,
 		ExpectedWorkarea:           expected,
 		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,

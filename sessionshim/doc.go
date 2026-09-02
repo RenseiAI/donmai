@@ -41,6 +41,26 @@
 //     receipt from an adopted live owner, or a durable tombstone proving the
 //     harness group was reaped (§D8/§D10).
 //
+// # One frame is never a verdict on a carrier
+//
+// A corollary of invariant 4 that had to be learned twice on production hosts:
+// no single frame, and no momentary lag, may cost a live harness its
+// supervision. Two paths used to do exactly that, and both are now bounded
+// rather than fatal.
+//
+//   - A Snapshot too large for one shimwire message is bounded at the shim
+//     before it is written, by dropping the oldest scrollback lines until it
+//     fits (snapshotbound.go). It used to be refused by the framer, which closed
+//     the connection carrying it — on the resume Snapshot, at adoption, which is
+//     the least survivable moment there is.
+//   - A consumer at the controller's in-flight budget gets BACK-PRESSURE: the
+//     socket reader stalls, which stalls the shim's output pump, and the shim's
+//     ring does the job it exists for — evict and declare an explicit Gap (§D5).
+//     Reaching the budget used to drop the connection outright. It still fails
+//     closed past a bounded stall deadline, because the reader is the only
+//     goroutine that can deliver a durable heartbeat receipt and a consumer that
+//     has STOPPED must not park it forever. Behind is not stopped.
+//
 // # Boundary
 //
 // Everything here is OSS and brand-neutral. The restart fence is an OPTIONAL

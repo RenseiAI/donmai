@@ -8,6 +8,33 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **A single oversized Snapshot, or a consumer that is momentarily behind, no
+  longer severs a live session's carrier.** Observed twice in one day on
+  production hosts: a session-shim controller re-adopted a lineage whose harness
+  had a long screen history, the resume Snapshot exceeded the controller's
+  in-flight budget, the controller dropped its shim connection, nothing
+  re-adopted the shim, and a healthy seat was quarantined and later reaped. Two
+  independent paths could produce that, and both are fixed at the design level
+  rather than by raising a cap. (1) A Snapshot larger than one shimwire message
+  was refused by the framer at the shim, which closed the connection carrying
+  it; the shim now bounds an oversized Snapshot before writing it, keeping the
+  newest scrollback lines that fit and dropping the oldest — the live screen is
+  never touched, and the shortening is announced in the shim's log. (2) Reaching
+  the controller's event-backlog budget was a fail-closed verdict on the
+  connection; it is now a back-pressure high-water mark — the socket reader
+  stalls, which stalls the shim's output pump, and the shim's ring does the job
+  it exists for (evict and declare an explicit Gap). The reader still fails
+  closed past a bounded 30s stall deadline, because it is the only goroutine
+  that can deliver a durable heartbeat receipt and a consumer that has STOPPED
+  must not park it forever — but a consumer that is merely BEHIND keeps its
+  carrier. No wire change: a bounded Snapshot is an ordinary canonical Screen
+  that every receiver, including a released selected-v2 one, already decodes,
+  and the bound is deterministic so one host sequence never carries two
+  different payloads. `sessionshim.AdoptOptions` /
+  `daemon.SessionShimConfig` gain an additive `EventBacklogStallDeadline` knob.
+
 ---
 
 ## v0.72.17 — 2026-09-02

@@ -134,7 +134,7 @@ func TestAcceptanceRingOverrideRidesTheLaunchContract(t *testing.T) {
 // Raising the ring back to the production budget turns this RED at the eviction
 // assertion: the resume stays a ring HIT and no Gap is ever declared.
 func TestAcceptanceSeamEvictsTheRingAndRecoversThroughAGap(t *testing.T) {
-	fixture := newReadoptedBurstFixture(t, 0, acceptanceRingBytes,
+	fixture := newReadoptedBurstFixture(t, 0, 0, acceptanceRingBytes,
 		func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {})
 	id := fixture.identity
 

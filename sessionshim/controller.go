@@ -122,6 +122,10 @@ type ControllerOptions struct {
 	// shim's ring will hold, or the controller becomes the first thing to give
 	// up again.
 	EventBacklogBudget int
+	// EventBacklogStallDeadline overrides eventBacklogStallDeadline for this
+	// controller: how long the socket reader may stall waiting for the consumer
+	// to drain before the controller fails closed. Zero uses the default.
+	EventBacklogStallDeadline time.Duration
 
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
 	DialTimeout time.Duration
@@ -159,6 +163,13 @@ func (o ControllerOptions) eventBacklogBudget() int {
 		return o.EventBacklogBudget
 	}
 	return EventBacklogBudget
+}
+
+func (o ControllerOptions) eventBacklogStallDeadline() time.Duration {
+	if o.EventBacklogStallDeadline > 0 {
+		return o.EventBacklogStallDeadline
+	}
+	return eventBacklogStallDeadline
 }
 
 func (o ControllerOptions) logger() *slog.Logger {
@@ -269,8 +280,9 @@ const (
 	eventBacklogOverheadBytes = 64
 )
 
-// EventBacklogBudget bounds, in payload bytes, how far behind the socket reader
-// a consumer may fall before the controller fails closed.
+// EventBacklogBudget bounds, in payload bytes, how much undelivered stream the
+// socket reader will hold for a consumer before it stops reading and applies
+// back-pressure to the shim.
 //
 // It is deliberately EQUAL to the shim's own output ring budget
 // (ptyhost.DefaultRingBytes), and that equality is the point. Both numbers
@@ -282,12 +294,37 @@ const (
 // evict and declare a Gap (ADR-2026-08-17 §D5). A burst the shim absorbs by
 // design must never be the thing that kills the connection carrying it.
 //
-// The reader still may not block on a consumer: it is the only goroutine that
-// can receive a durable heartbeat receipt, so parking it behind a full backlog
-// would deadlock a consumer waiting on that receipt. Past this budget the
-// controller therefore still fails closed — the shim keeps the harness and the
-// session is released to quarantine. What changed is WHERE that line sits.
+// Reaching this budget is NOT a fail-closed decision. It used to be, and that
+// cost healthy seats: a re-adopted lineage whose consumer was momentarily
+// behind hit the bound on the resume Snapshot, the controller dropped the shim
+// connection, nothing re-adopted the shim, and a live harness was quarantined
+// and reaped. A single frame is never a verdict on a connection. Past the
+// budget the reader now STALLS — which stalls the shim's output pump behind a
+// socket nobody is draining, which is the same back-pressure every other layer
+// of this stack already applies, and leaves the shim's ring to do the one job
+// it exists for: evict and declare an explicit Gap (§D5).
+//
+// The reader still may not stall FOREVER: it is the only goroutine that can
+// receive a durable heartbeat receipt, so a consumer that has genuinely stopped
+// would park it behind a queue nobody will ever drain. That is what
+// eventBacklogStallDeadline bounds, and only crossing THAT deadline still fails
+// closed.
 const EventBacklogBudget = ptyhost.DefaultRingBytes
+
+// eventBacklogStallDeadline bounds how long the socket reader will wait for a
+// consumer to drain before the controller fails closed.
+//
+// It is deliberately LONGER than heartbeatReceiptWaitBound, and that ordering
+// is load-bearing. The one way a stalled reader can deadlock its own consumer
+// is a consumer that drains events and calls Heartbeat on the same goroutine:
+// it waits for a receipt only the reader can deliver while the reader waits for
+// it to drain. heartbeatReceiptWaitBound breaks that inversion on its own —
+// Heartbeat gives up after 5s with ErrHeartbeatReceiptPending, KEEPS the
+// connection, and the consumer returns to draining — so the deadline only has
+// to outlast it for the stall to resolve itself rather than sever the carrier.
+// Crossing it means the consumer produced no progress at all for half a minute,
+// which is a consumer that has stopped, not a consumer that is behind.
+const eventBacklogStallDeadline = 30 * time.Second
 
 // ErrAdoptionRefused reports a handshake the shim or this daemon declined.
 var ErrAdoptionRefused = errors.New("sessionshim: adoption refused")
@@ -382,7 +419,7 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	_ = conn.SetDeadline(time.Time{})
 
 	if c.selected >= shimwire.V3 {
-		c.backlog = newEventBacklog(opts.eventBacklogBudget())
+		c.backlog = newEventBacklog(opts.eventBacklogBudget(), opts.eventBacklogStallDeadline(), c.closing)
 		go c.dispatchEvents()
 	}
 	go c.readLoop()
@@ -1241,9 +1278,13 @@ func (c *Controller) dispatchEvents() {
 	}
 }
 
-// ErrEventBacklogExceeded reports a consumer that fell further behind than the
-// shim's own in-flight budget. It is a fail-closed decision, not a transport
-// error: the connection is dropped, the shim keeps the harness.
+// ErrEventBacklogExceeded reports a consumer that made NO progress for the
+// whole of eventBacklogStallDeadline while the backlog sat at its budget. It is
+// a fail-closed decision, not a transport error: the connection is dropped, the
+// shim keeps the harness.
+//
+// Merely reaching the budget no longer produces this. A consumer that is behind
+// gets back-pressure; only a consumer that has stopped gets this.
 var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
 
 // ErrShimExited reports that a shim refused a request because it has already
@@ -1282,69 +1323,140 @@ var ErrHeartbeatReceiptPending = errors.New("sessionshim: durable heartbeat pers
 // the only bound with a principled source. Bytes do both.
 type eventBacklog struct {
 	mu     sync.Mutex
-	cond   *sync.Cond
 	queue  []ControllerEvent
 	bytes  int
-	budget int
 	closed bool
+
+	// budget, stall and abort are immutable after construction; push reads them
+	// without the lock.
+	budget int
+	stall  time.Duration
+	// abort unblocks a stalled push when the controller is being closed. Without
+	// it, Close would wait on a read loop parked behind a queue that only the
+	// read loop's own unwinding will ever release.
+	abort <-chan struct{}
+
+	// arrived and drained are broadcast latches: each is CLOSED and replaced
+	// whenever the queue grows or shrinks. A condition variable cannot be used
+	// here because sync.Cond has no timed wait, and the stall deadline is the
+	// whole point — a Cond would park the reader on a consumer that stopped and
+	// never reach the fail-closed decision.
+	arrived chan struct{}
+	drained chan struct{}
 }
 
-func newEventBacklog(budget int) *eventBacklog {
+func newEventBacklog(budget int, stall time.Duration, abort <-chan struct{}) *eventBacklog {
 	if budget <= 0 {
 		budget = EventBacklogBudget
 	}
-	b := &eventBacklog{budget: budget}
-	b.cond = sync.NewCond(&b.mu)
-	return b
+	if stall <= 0 {
+		stall = eventBacklogStallDeadline
+	}
+	return &eventBacklog{
+		budget:  budget,
+		stall:   stall,
+		abort:   abort,
+		arrived: make(chan struct{}),
+		drained: make(chan struct{}),
+	}
+}
+
+// releaseLatch closes the current latch and installs a fresh one, waking every
+// waiter exactly once. b.mu must be held.
+func releaseLatch(latch *chan struct{}) {
+	close(*latch)
+	*latch = make(chan struct{})
 }
 
 func eventBacklogCost(event ControllerEvent) int {
 	return eventBacklogOverheadBytes + len(event.FrameBytes) + len(event.Data) + len(event.Snapshot.Screen)
 }
 
-// push queues one event, or fails closed when the consumer has fallen further
-// behind than the budget allows. It never blocks: the socket reader is the only
-// goroutine that can deliver a durable heartbeat receipt, and parking it here
-// would deadlock a consumer waiting on one.
+// push queues one event, STALLING while the consumer is at the budget, and
+// fails closed only when the consumer produced no progress for the whole stall
+// deadline.
+//
+// Stalling here stalls the socket reader, which stalls the shim's output pump
+// behind a socket nobody is draining. That is the intended chain: back-pressure
+// reaches the producer, and the shim's ring — the one component designed to
+// evict and declare an explicit Gap — absorbs the overflow. Dropping the
+// connection instead put an oversized or ill-timed frame in a position to sever
+// a healthy carrier.
 func (b *eventBacklog) push(event ControllerEvent) error {
 	cost := eventBacklogCost(event)
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	if b.closed {
-		return io.EOF
+	var timer *time.Timer
+	defer func() {
+		if timer != nil {
+			timer.Stop()
+		}
+	}()
+	var expired <-chan time.Time
+	for {
+		b.mu.Lock()
+		if b.closed {
+			b.mu.Unlock()
+			return io.EOF
+		}
+		// A single event larger than the whole budget is admitted once the
+		// backlog has drained, exactly as the shim's ring retains one oversized
+		// frame: refusing it would strand a session on one big redraw.
+		if len(b.queue) == 0 || b.bytes+cost <= b.budget {
+			b.queue = append(b.queue, event)
+			b.bytes += cost
+			releaseLatch(&b.arrived)
+			b.mu.Unlock()
+			return nil
+		}
+		room := b.drained
+		b.mu.Unlock()
+		// The deadline is armed on the FIRST stall and runs across the whole
+		// wait, so a consumer that dribbles out one event every few seconds
+		// cannot reset it indefinitely while never catching up.
+		if timer == nil {
+			timer = time.NewTimer(b.stall)
+			expired = timer.C
+		}
+		select {
+		case <-room:
+		case <-b.abort:
+			return io.EOF
+		case <-expired:
+			return fmt.Errorf("%w of %d bytes: the consumer drained nothing for %s",
+				ErrEventBacklogExceeded, b.budget, b.stall)
+		}
 	}
-	// A single event larger than the whole budget is still accepted when the
-	// backlog is otherwise empty, exactly as the shim's ring retains one
-	// oversized frame: refusing it would strand a session on one big redraw.
-	if len(b.queue) > 0 && b.bytes+cost > b.budget {
-		return fmt.Errorf("%w of %d bytes", ErrEventBacklogExceeded, b.budget)
-	}
-	b.queue = append(b.queue, event)
-	b.bytes += cost
-	b.cond.Signal()
-	return nil
 }
 
 // pop blocks until an event is available or the backlog is closed and drained.
 func (b *eventBacklog) pop() (ControllerEvent, bool) {
-	b.mu.Lock()
-	defer b.mu.Unlock()
-	for len(b.queue) == 0 && !b.closed {
-		b.cond.Wait()
+	for {
+		b.mu.Lock()
+		if len(b.queue) > 0 {
+			event := b.queue[0]
+			b.queue[0] = ControllerEvent{} // let the frame bytes go
+			b.queue = b.queue[1:]
+			b.bytes -= eventBacklogCost(event)
+			releaseLatch(&b.drained)
+			b.mu.Unlock()
+			return event, true
+		}
+		if b.closed {
+			b.mu.Unlock()
+			return ControllerEvent{}, false
+		}
+		next := b.arrived
+		b.mu.Unlock()
+		<-next
 	}
-	if len(b.queue) == 0 {
-		return ControllerEvent{}, false
-	}
-	event := b.queue[0]
-	b.queue = b.queue[1:]
-	b.bytes -= eventBacklogCost(event)
-	return event, true
 }
 
 func (b *eventBacklog) close() {
 	b.mu.Lock()
-	b.closed = true
-	b.cond.Broadcast()
+	if !b.closed {
+		b.closed = true
+		releaseLatch(&b.arrived)
+		releaseLatch(&b.drained)
+	}
 	b.mu.Unlock()
 }
 

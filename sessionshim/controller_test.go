@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net"
 	"os"
@@ -70,7 +71,7 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.dispatchEvents()
@@ -165,13 +166,27 @@ func TestEventBacklogBudgetMatchesTheShimRing(t *testing.T) {
 	}
 }
 
-func TestEventBacklogBudgetOverflowFailsClosed(t *testing.T) {
+// TestEventBacklogAtBudgetStallsInsteadOfDropping is the pin for the failure
+// this file's budget was supposed to prevent and did not.
+//
+// Reaching the budget used to be a verdict on the CONNECTION: push refused, the
+// read loop dropped the shim connection, the durable carrier was lost, and a
+// healthy seat was quarantined and later reaped. It happened on production hosts
+// twice in one day, on the resume Snapshot of a lineage with a long screen
+// history — one frame, arriving at the one moment a carrier is most fragile.
+//
+// A consumer that is BEHIND is not a consumer that is broken. So the budget is
+// now a back-pressure high-water mark: the reader stalls, the shim's pump stalls
+// behind a socket nobody is draining, and the moment the consumer drains the
+// stream continues on the same carrier. Restoring the immediate refusal turns
+// this RED at the first assertion.
+func TestEventBacklogAtBudgetStallsInsteadOfDropping(t *testing.T) {
 	t.Parallel()
 	const payload = 100
 	budget := 4 * (eventBacklogOverheadBytes + payload)
 	controller := &Controller{
 		selected: shimwire.V3,
-		backlog:  newEventBacklog(budget),
+		backlog:  newEventBacklog(budget, 30*time.Second, nil),
 		closing:  make(chan struct{}),
 	}
 	for i := range 4 {
@@ -180,33 +195,119 @@ func TestEventBacklogBudgetOverflowFailsClosed(t *testing.T) {
 			t.Fatalf("fill backlog at %d: %v", i, err)
 		}
 	}
-	overflow := ControllerEvent{Kind: EventHostFrame, Seq: 5, FrameBytes: make([]byte, payload)}
-	if err := controller.publishEvent(overflow); !errors.Is(err, ErrEventBacklogExceeded) {
-		t.Fatalf("backlog overflow = %v, want ErrEventBacklogExceeded", err)
+
+	stalled := make(chan error, 1)
+	go func() {
+		stalled <- controller.publishEvent(
+			ControllerEvent{Kind: EventHostFrame, Seq: 5, FrameBytes: make([]byte, payload)})
+	}()
+	select {
+	case err := <-stalled:
+		t.Fatalf("publish at the budget returned %v, want a stall until the consumer drains", err)
+	case <-time.After(50 * time.Millisecond):
 	}
-	// Bytes, not frames: draining one event makes room again.
+
+	// Bytes, not frames: draining one event makes room, and the stalled publish
+	// completes on the SAME connection.
 	if _, ok := controller.backlog.pop(); !ok {
 		t.Fatal("backlog drained empty")
 	}
-	if err := controller.publishEvent(overflow); err != nil {
-		t.Fatalf("backlog refused an event that fits after draining: %v", err)
+	select {
+	case err := <-stalled:
+		if err != nil {
+			t.Fatalf("stalled publish after draining = %v, want it to land", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("draining an event did not release the stalled publish")
 	}
 	if got := controller.backlog.queuedBytes(); got != budget {
 		t.Fatalf("queued bytes = %d, want %d", got, budget)
 	}
+	select {
+	case <-controller.closing:
+		t.Fatal("the controller dropped its connection over a consumer that was merely behind")
+	default:
+	}
 }
 
-// TestEventBacklogAcceptsOneOversizedEvent pins the ring's own rule: a single
-// frame larger than the whole budget is still retained when nothing else is
-// queued, because refusing it would strand a session on one big redraw.
-func TestEventBacklogAcceptsOneOversizedEvent(t *testing.T) {
+// TestEventBacklogFailsClosedOnlyOnAStuckConsumer keeps the other half of the
+// guarantee: a consumer that produces NO progress for the whole stall deadline
+// is not behind, it has stopped, and the reader must not be parked behind it
+// forever — it is the only goroutine that can deliver a durable heartbeat
+// receipt. Removing the deadline turns this RED by hanging.
+func TestEventBacklogFailsClosedOnlyOnAStuckConsumer(t *testing.T) {
 	t.Parallel()
-	backlog := newEventBacklog(128)
+	backlog := newEventBacklog(64, 50*time.Millisecond, nil)
 	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
 		t.Fatalf("oversized first event refused: %v", err)
 	}
-	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2}); !errors.Is(err, ErrEventBacklogExceeded) {
-		t.Fatalf("second event after an oversized one = %v, want refusal", err)
+	start := time.Now()
+	err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2})
+	if !errors.Is(err, ErrEventBacklogExceeded) {
+		t.Fatalf("push against a stuck consumer = %v, want ErrEventBacklogExceeded", err)
+	}
+	if waited := time.Since(start); waited < 50*time.Millisecond {
+		t.Fatalf("push failed closed after %s, want it to stall the whole deadline first", waited)
+	}
+}
+
+// TestEventBacklogAdmitsAnOversizedFrameAfterDraining pins the rule that the
+// production drop actually broke: a single frame larger than the whole budget —
+// a resume Snapshot of a long-lived screen is exactly that — is admitted, it
+// just has to wait for the queue ahead of it. Before the fix the SAME frame was
+// refused outright whenever anything at all was queued in front of it, and the
+// refusal severed the carrier.
+func TestEventBacklogAdmitsAnOversizedFrameAfterDraining(t *testing.T) {
+	t.Parallel()
+	backlog := newEventBacklog(1024, 30*time.Second, nil)
+	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 16)}); err != nil {
+		t.Fatalf("first event refused: %v", err)
+	}
+	oversized := ControllerEvent{Kind: EventHostFrame, Seq: 2, FrameBytes: make([]byte, 16<<10)}
+	admitted := make(chan error, 1)
+	go func() { admitted <- backlog.push(oversized) }()
+	select {
+	case err := <-admitted:
+		t.Fatalf("oversized push behind a queued event returned %v, want a stall", err)
+	case <-time.After(50 * time.Millisecond):
+	}
+	if _, ok := backlog.pop(); !ok {
+		t.Fatal("backlog drained empty")
+	}
+	select {
+	case err := <-admitted:
+		if err != nil {
+			t.Fatalf("oversized push after draining = %v, want it admitted", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("oversized push was never admitted after the backlog drained")
+	}
+	event, ok := backlog.pop()
+	if !ok || event.Seq != 2 || len(event.FrameBytes) != 16<<10 {
+		t.Fatalf("popped %+v ok=%v, want the intact oversized frame", event.Seq, ok)
+	}
+}
+
+// TestEventBacklogStallAbortsWhenTheControllerCloses pins the liveness the abort
+// channel exists for: Close must not have to wait out the stall deadline on a
+// read loop parked behind a queue only that read loop's unwinding would drain.
+func TestEventBacklogStallAbortsWhenTheControllerCloses(t *testing.T) {
+	t.Parallel()
+	closing := make(chan struct{})
+	backlog := newEventBacklog(64, time.Hour, closing)
+	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
+		t.Fatalf("first event refused: %v", err)
+	}
+	aborted := make(chan error, 1)
+	go func() { aborted <- backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2}) }()
+	close(closing)
+	select {
+	case err := <-aborted:
+		if !errors.Is(err, io.EOF) {
+			t.Fatalf("stalled push on close = %v, want io.EOF", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("closing the controller did not release the stalled push")
 	}
 }
 
@@ -232,7 +333,7 @@ func TestSelectedV3HeartbeatReceiptTimeoutKeepsTheController(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0),
+		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0, 0, nil),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.readLoop()
@@ -319,7 +420,7 @@ func TestSelectedV3RejectsHeartbeatInterposedInsideLiveSnapshotPair(t *testing.T
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: map[uint64]*snapshotCall{77: call},
 	}
 	go controller.dispatchEvents()
@@ -550,10 +651,12 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 		id: Identity{OrgID: "org-drop", SessionID: "session-drop"},
 		w:  shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 3, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		// A one-byte budget makes the bound reachable without writing its full
-		// production depth; the decision under test is the same one. Nothing
-		// drains it: dispatchEvents is deliberately not started.
-		events: make(chan ControllerEvent), backlog: newEventBacklog(1),
+		// A one-byte budget plus a short stall deadline makes the bound reachable
+		// without writing its full production depth or waiting out the real
+		// deadline; the decision under test is the same one. Nothing drains it:
+		// dispatchEvents is deliberately not started, which is what makes this a
+		// STUCK consumer rather than a slow one.
+		events: make(chan ControllerEvent), backlog: newEventBacklog(1, 100*time.Millisecond, nil),
 		logger:        slog.New(slog.NewTextHandler(&log, &slog.HandlerOptions{Level: slog.LevelWarn})),
 		done:          make(chan struct{}),
 		closing:       make(chan struct{}),
