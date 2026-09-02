@@ -1522,14 +1522,16 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 // deployment, so 120 s per attempt and a worst case of 3 × 120 s + 15 s of
 // backoff = 375 s — several times any deadline a composing deployment
 // resolves to). The deadline it is held to is whatever sessionShimConfig
-// resolves: the standalone default is fifteen minutes, and a composing
-// deployment that declares an external release threshold and leaves
-// Orphan.Deadline zero gets sessionShimOrphanDeadlineUnderExternalRelease's
-// derivation — a three-minute threshold yields 3m − 5s − 30s − 30s = 115 s.
-// See WorstCaseWindow for the arithmetic; the default policy's window is
-// pinned strictly below that derived deadline (and below the 90 s constant
-// shims launched before the derivation still carry in their environment) in
-// session_shim_readopt_test.go.
+// resolves: the standalone default is fifteen minutes. A composing deployment
+// that declares an external release threshold and leaves Orphan.Deadline zero
+// gets sessionShimOrphanDeadlineUnderExternalRelease's derivation — a
+// three-minute threshold yields 3m − 5s − 30s − 30s = 115 s — but the one
+// composing deployment known today does not leave it zero: it sets
+// Orphan.Deadline explicitly to 90 s, so 90 s is the deadline that
+// composition is actually held to, and 115 s is only what a composition that
+// left the field zero would derive. See WorstCaseWindow for the arithmetic;
+// the default policy's window is pinned strictly below both the explicit 90 s
+// and the derived 115 s in session_shim_readopt_test.go.
 type SessionShimReadoptionPolicy struct {
 	// Disabled keeps the pre-existing disposition: no re-dial, immediate
 	// quarantine. It is a separate flag so the zero policy means "default".
@@ -1568,12 +1570,13 @@ const (
 //	backoff            10 s            → 45 s
 //	attempt 3  starts ≤ 45 s, ends ≤ 60 s
 //
-// so the window is 3 × 15 s + (5 s + 10 s) = 60 s: 55 s inside the 115 s a
-// composing deployment derives from a three-minute external release
-// threshold, and 30 s inside the 90 s constant shims launched before that
-// derivation still carry — room in both for the shim to observe the Welcome.
-// The backoffs follow the attempts, not a fixed schedule: an attempt that
-// fails fast simply starts the next one sooner.
+// so the window is 3 × 15 s + (5 s + 10 s) = 60 s: 30 s inside the 90 s the
+// one composing deployment known today sets Orphan.Deadline to explicitly,
+// and 55 s inside the 115 s that same deployment would instead derive from
+// its three-minute external release threshold if it left the field zero —
+// room in both for the shim to observe the Welcome. The backoffs follow the
+// attempts, not a fixed schedule: an attempt that fails fast simply starts
+// the next one sooner.
 func DefaultSessionShimReadoptionPolicy() SessionShimReadoptionPolicy {
 	return SessionShimReadoptionPolicy{
 		Attempts:       defaultSessionShimReadoptionAttempts,
@@ -1865,9 +1868,10 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			// accepted: a quarantined lineage keeps its shim (never killed),
 			// but no controller ever renews its orphan clock, so a callback
 			// failure that was really just a transient blip still condemns an
-			// otherwise-healthy session to self-teardown at
-			// DefaultOrphanPolicy's deadline (~90s) with no second attempt in
-			// THIS pass. The retry doctrine this PR applies to the batch
+			// otherwise-healthy session to self-teardown at the shim's
+			// configured orphan deadline (90 s under a composing deployment's
+			// explicit setting today) with no second attempt in THIS pass.
+			// The retry doctrine this PR applies to the batch
 			// commit (completeLaunchedSessionShimAdoptionBatchResilient) is
 			// intentionally NOT duplicated here: this pass already has to stay
 			// bounded across every lineage it composes, and a future

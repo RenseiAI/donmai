@@ -21,6 +21,7 @@ import (
 type readoptFixture struct {
 	daemon     *Daemon
 	registry   *sessionshim.Registry
+	dir        string
 	id         sessionshim.Identity
 	controller *sessionshim.Controller
 
@@ -76,7 +77,7 @@ func newReadoptFixtureWithAdoption(t *testing.T, policy SessionShimReadoptionPol
 	if err != nil {
 		t.Fatal(err)
 	}
-	f := &readoptFixture{registry: registry}
+	f := &readoptFixture{registry: registry, dir: dir}
 	f.id = sessionshim.Identity{OrgID: "org-readopt", SessionID: "session-readopt"}
 	shim, err := sessionshim.Start(sessionshim.Options{
 		Identity: f.id, Registry: registry, ProcessEpoch: 5,
@@ -180,6 +181,136 @@ func (f *readoptFixture) recordPhase(t *testing.T) shimwire.Phase {
 		t.Fatalf("registry.Get: %v", err)
 	}
 	return rec.Phase
+}
+
+// readoptOtherShim is a second live shim adopted under the SAME daemon and
+// registry as the fixture's own lineage — the "OTHER" identity a controller
+// loss on the fixture's lineage must never touch.
+type readoptOtherShim struct {
+	id         sessionshim.Identity
+	controller *sessionshim.Controller
+}
+
+// adoptSecondLiveShim starts a second real shim under a DIFFERENT identity in
+// the fixture's registry, adopts it through the ordinary startup pipeline, and
+// seeds the daemon's adopted set with it exactly as newReadoptFixture seeded
+// the first — so a test has two independently adopted, live lineages sharing
+// one daemon.
+func (f *readoptFixture) adoptSecondLiveShim(t *testing.T) readoptOtherShim {
+	t.Helper()
+	id := sessionshim.Identity{OrgID: "org-readopt", SessionID: "session-readopt-other"}
+	shim, err := sessionshim.Start(sessionshim.Options{
+		Identity: id, Registry: f.registry, ProcessEpoch: 5,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
+		WorkareaPath: filepath.Join(f.dir, "workarea-other"),
+		Orphan:       sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second, PropagationMargin: 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	adoption, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
+		Registry: f.registry, ControllerID: "controller-readopt-other",
+		Filter: func(candidate sessionshim.Identity) bool { return candidate == id },
+	})
+	if err != nil || len(adoption.Adopted) != 1 {
+		t.Fatalf("Adopt (other shim) = %+v, %v", adoption, err)
+	}
+	ctrl := adoption.Adopted[0]
+	evidence, err := f.daemon.sessionShimAdoptionEvidence(context.Background(), ctrl, SessionShimAdoptionPreparationResult{}, "wh_readopt_host")
+	if err != nil {
+		t.Fatalf("adoption evidence (other shim): %v", err)
+	}
+	evidence.SnapshotProxy = nil
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.adopted[id] = adoptedShim{
+		controller: ctrl, shimID: ctrl.Hello().ShimID,
+		adoption: evidence, adoptionReceipt: SessionShimAdoptionReceipt{DurableCorrelation: []byte("other-first")},
+	}
+	f.daemon.shims.mu.Unlock()
+	return readoptOtherShim{id: id, controller: ctrl}
+}
+
+// TestControllerLossOnOneLineageLeavesAnotherAdoptedLineageUntouched pins the
+// re-adoption dial down to EXACTLY the lost identity when the daemon holds
+// more than one adopted lineage.
+//
+// AdoptOptions.Filter is what keeps sessionshim.Adopt's scan from dialling
+// every OTHER live shim discoverable in the registry — its doc comment says
+// so: "no other record is dialled, classified, or reported." Without it, the
+// re-adoption pass sees BOTH the lost lineage and the healthy one, Adopt()
+// returns more than the single controller readoptSessionShimOnce expects, and
+// the attempt fails outright — so the healthy lineage is never durably
+// re-adopted (it was never the caller's business) but the LOST lineage never
+// recovers either: it is quarantined instead of restored, and a bounded
+// re-dial exists to prevent exactly that. This fails loudly (the lost lineage
+// stays quarantined) rather than corrupting the other lineage silently,
+// because the daemon's adopted-set entry for the other identity is never
+// itself written by this path — but the assertions below also pin that no
+// batch or durable adoption call ever names it, which is the only place a
+// stray dial into it would be visible.
+func TestControllerLossOnOneLineageLeavesAnotherAdoptedLineageUntouched(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond}, func(int) error { return nil })
+	other := f.adoptSecondLiveShim(t)
+	d := f.daemon
+	previousGeneration := f.controller.Generation()
+	otherGeneration := other.controller.Generation()
+
+	d.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
+
+	adoptions, batches := f.snapshot()
+	if adoptions != 1 {
+		t.Fatalf("durable adoption ran %d times, want exactly one — the lost lineage's only attempt", adoptions)
+	}
+	// Every published batch is a COMPLETE projection snapshot (the
+	// adoption-batch contract), so the OTHER lineage legitimately appears in
+	// it alongside the re-adopted one — that is not evidence of a stray dial.
+	// What would be is its evidence carrying a generation newer than the one
+	// it held before this attempt: that can only happen if something dialled
+	// and re-Welcomed it too.
+	for i, batch := range batches {
+		for _, a := range batch.Adopted {
+			if a.Evidence.Identity == other.id && a.Evidence.ControllerGeneration != uint64(otherGeneration) {
+				t.Fatalf("batch %d reports the OTHER lineage at generation %d, want the untouched %d — it was re-dialled",
+					i, a.Evidence.ControllerGeneration, otherGeneration)
+			}
+		}
+		for _, q := range batch.Quarantined {
+			if q.SessionID == other.id.SessionID {
+				t.Fatalf("batch %d quarantined the OTHER lineage %+v; it was never a candidate", i, q)
+			}
+		}
+	}
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("re-adoption left %d lineages projected quarantined: %+v", len(projected), projected)
+	}
+	entry, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	if err != nil {
+		t.Fatalf("the lost lineage never returned to the adopted set: %v", err)
+	}
+	if entry.controller == f.controller || entry.controller.Generation() <= previousGeneration {
+		t.Fatalf("lost lineage's adopted entry still names the lost controller (generation %d)", entry.controller.Generation())
+	}
+	otherEntry, err := d.adoptedShimEntry(other.id.OrgID, other.id.SessionID)
+	if err != nil {
+		t.Fatalf("the OTHER lineage left the adopted set: %v", err)
+	}
+	if otherEntry.controller != other.controller {
+		t.Fatalf("OTHER lineage's adopted entry names a different controller (generation %d); it should never have been touched",
+			otherEntry.controller.Generation())
+	}
+	if otherEntry.controller.Generation() != otherGeneration {
+		t.Fatalf("OTHER lineage controller generation = %d, want the untouched %d", otherEntry.controller.Generation(), otherGeneration)
+	}
+	if otherEntry.adoption.ControllerGeneration != uint64(otherGeneration) {
+		t.Fatalf("OTHER lineage adopted evidence generation = %d, want the untouched %d",
+			otherEntry.adoption.ControllerGeneration, otherGeneration)
+	}
 }
 
 // TestControllerLossReadoptsALiveShimBeforeQuarantining pins the recovery a
@@ -463,19 +594,21 @@ func TestProjectionBuiltDuringTheReadoptionWindowPresentsTheLineageAdopted(t *te
 // attempt and every backoff must end before the orphan deadline the daemon
 // resolves — with room for the last Welcome to land.
 //
-// The deadline is computed here the way sessionShimConfig computes it, not
-// quoted: a composing deployment declares an external release threshold and
-// leaves Orphan.Deadline zero, so the deadline is
-// sessionShimOrphanDeadlineUnderExternalRelease over the default policy —
-// for the tightest threshold known (three minutes), 3m − 5s − 30s − 30s =
-// 115 s. Shims launched before that derivation existed carry the old 90 s
-// constant in their environment for life, so the window is held below that
-// too. The standalone default (fifteen minutes) is looser than either.
+// Three deadlines bound the window, and the tightest is the one a composing
+// deployment is actually held to today: the one composing deployment known
+// today declares an external release threshold AND sets Orphan.Deadline
+// explicitly to 90 s rather than leaving it zero. The derived deadline —
+// sessionShimOrphanDeadlineUnderExternalRelease over the default policy, for
+// the tightest threshold known (three minutes) 3m − 5s − 30s − 30s = 115 s —
+// is what a composition that LEAVES Orphan.Deadline zero would get instead;
+// the window is held below it too, because nothing here can assume every
+// composing deployment sets the field explicitly forever. The standalone
+// default (fifteen minutes) is looser than either.
 func TestDefaultReadoptionPolicyWindowFitsInsideTheTightestOrphanDeadline(t *testing.T) {
 	t.Parallel()
 	const (
 		tightestExternalReleaseThreshold = 3 * time.Minute
-		legacyLaunchedShimDeadline       = 90 * time.Second
+		explicitHostedOrphanDeadline     = 90 * time.Second
 	)
 	composed := sessionshim.DefaultOrphanPolicy()
 	composed.ExternalReleaseThreshold = tightestExternalReleaseThreshold
@@ -491,8 +624,8 @@ func TestDefaultReadoptionPolicyWindowFitsInsideTheTightestOrphanDeadline(t *tes
 		name string
 		d    time.Duration
 	}{
-		{name: "composed deadline derived from the tightest external release threshold", d: composedDeadline},
-		{name: "legacy launched-shim deadline", d: legacyLaunchedShimDeadline},
+		{name: "derived deadline a composition leaving Orphan.Deadline zero would get from the tightest external release threshold", d: composedDeadline},
+		{name: "explicit deadline the one composing deployment known today actually sets", d: explicitHostedOrphanDeadline},
 		{name: "standalone default", d: sessionshim.DefaultOrphanDeadline},
 	} {
 		if window >= deadline.d {

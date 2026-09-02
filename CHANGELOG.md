@@ -38,12 +38,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   previous disposition. The shim's orphan clock starts the moment the
   controller stream ends and only an accepted Welcome disarms it, so the
   whole window has to end before the orphan deadline. That deadline is
-  whatever the daemon resolves: fifteen minutes standalone, and for a
-  composing deployment that declares an external release threshold and
-  leaves `Orphan.Deadline` zero, the derived `threshold − grace − margin −
-  one margin of headroom` — 115 s for the tightest threshold known (three
-  minutes); shims launched before that derivation existed still carry the
-  old 90 s constant in their environment. The default policy's worst case is
+  whatever the daemon resolves: fifteen minutes standalone; the one
+  composing deployment known today declares an external release threshold
+  AND sets `Orphan.Deadline` explicitly to 90 s, so 90 s is what it is
+  actually held to. A composition that instead LEAVES `Orphan.Deadline`
+  zero gets the derived `threshold − grace − margin − one margin of
+  headroom` — 115 s for the tightest threshold known (three minutes) — and
+  the window is held below that too. The default policy's worst case is
   `3 × 15 s + (5 s + 10 s) = 60 s`, strictly inside all three, and a test
   computes the derived deadline and asserts it rather than quoting it —
   `SessionShimReadoptionPolicy.WorstCaseWindow()` computes the same
@@ -59,7 +60,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   batch published; a lineage that cannot be re-adopted inside the bound is
   quarantined exactly as before. Streams the shim itself ended keep the
   previous disposition. `sessionshim.AdoptOptions.Filter` restricts one
-  adoption pass to the identities it names.
+  adoption pass to the identities it names; a daemon-level regression test
+  now adopts two lineages, loses the carrier under only one, and pins that
+  the other's controller and controller generation come out exactly as they
+  went in — nothing about it is ever dialled.
 - **`Daemon.ScheduleSessionShimReconciliation(scope, cause)` is exported** so
   a heartbeat lane the daemon does not own — a composition serving several
   scopes beats each on its own lane — can arm the bounded
