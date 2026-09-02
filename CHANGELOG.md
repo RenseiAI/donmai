@@ -6,6 +6,49 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## [Unreleased]
+
+### Fixes
+
+- **A quarantined session whose tombstone is handed over now republishes the
+  host's durable projection, so the receiver's quarantine set advances with
+  the daemon's.** Accepting the terminal evidence resolved the lineage's
+  obligation on the receiver, but nothing there pruned the host row's
+  quarantine snapshot — only a batch moves it — and the daemon withdrew the
+  lineage locally without publishing one. The next heartbeat then carried
+  `quarantined=[]` against a row still holding `[X]` at the same adoption
+  revision, was refused stale, and demoted the host to draining on every
+  beat until a restart republished. The handoff now publishes the complete
+  projection the moment the lineage leaves quarantine, every republish rings
+  one immediate heartbeat (detached, so a republish inside the beat's own
+  projection build cannot wait on the lane it is ringing), and the
+  every-mutation-publishes guard now watches the withdrawal as well as the
+  upsert.
+- **A live shim whose controller stream ended because the daemon's durable
+  carrier refused is re-adopted before it is quarantined.** A carrier
+  restart made every durable append fail, the daemon closed its controller,
+  and the disconnect path quarantined the lineage `socket_unreachable` at once
+  with nothing ever dialling it again — so a healthy harness was reaped at
+  the shim's orphan deadline for a fault at neither end. The daemon now runs
+  the same pipeline the startup pass runs (dial, prepare, durable adoption,
+  complete batch, carrier activation) for exactly that identity, bounded by
+  `SessionShimConfig.Readoption` (default three attempts over about thirty
+  seconds; `Disabled` keeps the previous disposition). On success the lineage
+  stays adopted under a strictly newer generation and the shim disarms its
+  orphan clock; a lineage that cannot be re-adopted inside the bound is
+  quarantined exactly as before. Streams the shim itself ended keep the
+  previous disposition. `sessionshim.AdoptOptions.Filter` restricts one
+  adoption pass to the identities it names.
+- **`Daemon.ScheduleSessionShimReconciliation(scope, cause)` is exported** so
+  a heartbeat lane the daemon does not own — a composition serving several
+  scopes beats each on its own lane — can arm the bounded
+  reconcile-and-republish pass on a revision-stale refusal for that scope,
+  the same pass the daemon's own lane arms. At most one pass runs per scope
+  at a time; a scope with no retained authority receipt is refused with a
+  warning.
+
+---
+
 ## v0.72.16 — 2026-09-02
 
 ### Fixes

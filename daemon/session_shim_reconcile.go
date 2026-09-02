@@ -124,6 +124,45 @@ func (d *Daemon) SessionShimScopeAuthority(scope string) (SessionShimScopeCreden
 	return cloneSessionShimScopeCredentialReceipt(receipt), true
 }
 
+// sessionShimReconcileCauseEmbedder is the cause recorded when an embedder
+// arms reconciliation through ScheduleSessionShimReconciliation without naming
+// one of its own.
+const sessionShimReconcileCauseEmbedder = "embedder-requested"
+
+// ScheduleSessionShimReconciliation arms the bounded reconcile-and-republish
+// pass for one served scope: one credential refresh to learn the control
+// plane's committed adoption revision, then one complete-batch republish at
+// it, bounded and paced exactly as the pass the daemon's own heartbeat lane
+// arms on a revision-stale refusal (HeartbeatOptions.OnSessionShimRevisionStale).
+//
+// It exists for the heartbeat lanes the daemon does NOT own. A composition
+// that serves several scopes runs one beat lane per scope, and a beat on one
+// of those lanes answered with the closed revision-stale conflict has, without
+// this, no way to reach the pass that repairs it — the host then beats the
+// same superseded revision or quarantine set every interval, refused each
+// time, with the row demoted until a restart. The embedder's lane calls this
+// from its own revision-stale hook with the scope the beat was for.
+//
+// Safe from any goroutine and at heartbeat cadence: at most one pass runs per
+// scope at a time and a call landing while one runs is served by it. A scope
+// this daemon holds no authority receipt for is refused with a warning rather
+// than armed — a pass for it could learn nothing and republish nothing. An
+// empty cause is recorded as embedder-requested.
+func (d *Daemon) ScheduleSessionShimReconciliation(scope, cause string) {
+	if d == nil || d.shims == nil {
+		return
+	}
+	if cause == "" {
+		cause = sessionShimReconcileCauseEmbedder
+	}
+	if _, known := d.SessionShimScopeAuthority(scope); !known {
+		slog.Warn("session shim: reconciliation requested for a scope this daemon holds no authority receipt for; ignoring",
+			"scope", scope, "cause", cause)
+		return
+	}
+	d.scheduleSessionShimReconciliation(scope, cause)
+}
+
 // scheduleSessionShimReconciliation arms one bounded reconciliation pass for a
 // scope whose committed revision this daemon can no longer prove it holds —
 // after an ambiguous batch commit, or after a beat was answered with the
@@ -271,15 +310,12 @@ func (d *Daemon) runBoundedSessionShimReconciliationPass(scope, cause string) er
 		}
 		err := d.reconcileSessionShimScope(scope, budget)
 		if err == nil {
+			// The republish confirmed and the retained revision advanced. The
+			// republish itself rang the immediate beat that re-attests it
+			// (republishSessionShimProjection), so nothing waits out a
+			// heartbeat interval here.
 			slog.Info("session shim: reconciliation republished the complete batch at the control plane's committed revision",
 				"scope", scope, "cause", cause, "attempt", attempt)
-			// The republish confirmed and the retained revision advanced; ring
-			// one immediate beat so the re-attestation does not wait out a
-			// heartbeat interval. One fresh callback-sized bound, mirroring
-			// the correcting beat on the dynamic launch path.
-			beatCtx, cancelBeat := context.WithTimeout(context.Background(), cfg.callbackTimeout())
-			d.ringSessionShimPostActivationHeartbeat(beatCtx)
-			cancelBeat()
 			return nil
 		}
 		lastErr = err

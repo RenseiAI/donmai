@@ -5,6 +5,7 @@ import (
 	"go/ast"
 	"go/parser"
 	"go/token"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,8 +125,14 @@ func TestQuarantinePublishIsScopedToOneOrganization(t *testing.T) {
 // function.
 func TestEveryQuarantineMutationPublishes(t *testing.T) {
 	t.Parallel()
+	// Both directions mutate the set the receiver compares byte for byte: an
+	// upsert ADDS a lineage, the durable-handoff withdrawal REMOVES one. The
+	// withdrawal used to be invisible to this guard, and a host whose
+	// quarantined lineage was tombstoned then beat `quarantined=[]` against a
+	// row still holding `[X]` at the same revision — refused, and demoted to
+	// draining, on every beat until a restart republished.
+	mutators := []string{"upsertShimQuarantineLocked", "withdrawQuarantinedLineageAfterDurableHandoff"}
 	const (
-		mutator   = "upsertShimQuarantineLocked"
 		publishes = "publishSessionShimProjection"
 		assembles = "completeSessionShimAdoptionBatch"
 		// The disconnect path publishes through a named helper whose ORDER is
@@ -151,7 +158,7 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 		}
 		for _, decl := range file.Decls {
 			fn, ok := decl.(*ast.FuncDecl)
-			if !ok || fn.Body == nil || fn.Name.Name == mutator {
+			if !ok || fn.Body == nil || contains(mutators, fn.Name.Name) {
 				continue
 			}
 			var calls []string
@@ -168,7 +175,13 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 				}
 				return true
 			})
-			if !contains(calls, mutator) {
+			mutates := false
+			for _, mutator := range mutators {
+				if contains(calls, mutator) {
+					mutates = true
+				}
+			}
+			if !mutates {
 				continue
 			}
 			checked++
@@ -179,8 +192,9 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 			}
 		}
 	}
-	if checked == 0 {
-		t.Fatalf("found no call site of %s — the guard is not watching anything", mutator)
+	if checked < 2 {
+		t.Fatalf("found %d call sites of %v, want at least the upsert and the withdrawal — the guard is not watching what it claims to",
+			checked, mutators)
 	}
 }
 
@@ -401,6 +415,11 @@ func TestQuarantinePublishRetainsTheAdoptionRevision(t *testing.T) {
 		},
 	}})
 	enableHostedFullHostFramesForTest(t, d, scope)
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.shims.mu.Unlock()
+	recorder, baselineBeats := startQuarantinePublishBeatRecorder(t, d, scope)
 
 	d.shims.mu.RLock()
 	before := d.shims.credentialReceipts[scope].AdoptionRevision
@@ -419,6 +438,7 @@ func TestQuarantinePublishRetainsTheAdoptionRevision(t *testing.T) {
 	d.upsertShimQuarantineLocked(q)
 	d.shims.mu.Unlock()
 
+	publishedAt := time.Now()
 	d.publishSessionShimProjection(context.Background(), scope)
 
 	d.shims.mu.RLock()
@@ -433,6 +453,143 @@ func TestQuarantinePublishRetainsTheAdoptionRevision(t *testing.T) {
 	if ackPending {
 		t.Fatalf("republish left a heartbeat acknowledgement pending (%q); it activates no carrier, "+
 			"so it must not withdraw readiness", pending)
+	}
+	// The receiver demotes the host's readiness on EVERY batch commit until a
+	// matching beat re-attests it, so a republish that waits for the periodic
+	// ticker leaves the host refusing polls for up to a whole interval. The
+	// interval here is the production default: a beat inside two seconds can
+	// only be the immediate one.
+	waitFor(t, 2*time.Second, "the immediate beat after the republish", func() bool {
+		return recorder.count() >= baselineBeats+1
+	})
+	if elapsed := time.Since(publishedAt); elapsed >= HeartbeatDefaultInterval {
+		t.Fatalf("the beat after the republish took %s — the ticker, not an immediate beat", elapsed)
+	}
+	revisions := recorder.revisions()
+	if len(revisions) == 0 || revisions[len(revisions)-1] != "7" {
+		t.Fatalf("revisions on the wire = %v, want the immediate beat to attest the republished %q", revisions, "7")
+	}
+}
+
+// startQuarantinePublishBeatRecorder puts a real heartbeat lane on d against a
+// control plane that acknowledges every beat, waits for the lane's first
+// periodic beat, and returns the recorder plus the beats already sent.
+func startQuarantinePublishBeatRecorder(t *testing.T, d *Daemon, scope string) (*immediateBeatRecorder, int) {
+	t.Helper()
+	recorder := &immediateBeatRecorder{}
+	server := httptest.NewServer(recorder.handler(t))
+	t.Cleanup(server.Close)
+	service := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "worker-" + scope, OrchestratorURL: server.URL,
+		RuntimeJWT:      "runtime-" + scope,
+		IntervalSeconds: int(HeartbeatDefaultInterval / time.Second),
+		GetActiveCount:  func() int { return 0 },
+		GetMaxCount:     d.heartbeatMaxConcurrentSessions,
+		GetStatus:       d.RegistrationStatus,
+		GetSessionShim: func() (SessionShimHeartbeatProjection, error) {
+			return d.SessionShimHeartbeatProjection(scope)
+		},
+		HTTPClient: server.Client(),
+	})
+	d.lifecycleMu.Lock()
+	d.heartbeat = service
+	d.lifecycleMu.Unlock()
+	service.Start()
+	t.Cleanup(service.Stop)
+	waitFor(t, 5*time.Second, "the periodic lane's first beat", func() bool {
+		return recorder.count() >= 1
+	})
+	return recorder, recorder.count()
+}
+
+// TestTombstoneWithdrawalRepublishesTheProjection is the behavioural half of
+// the guard above, driven through the surface every heartbeat already runs.
+//
+// A quarantined lineage whose harness the shim reaped hands its tombstone over
+// durably and leaves the quarantine projection. The receiver's row still holds
+// that lineage in ITS quarantine set at the same adoption revision, and nothing
+// on the receiver prunes it: only a new batch moves the row. Measured on an
+// installed host as `quarantined=[]` beating against `[X]` every thirty seconds,
+// each beat refused stale and the host demoted to draining, until a restart.
+func TestTombstoneWithdrawalRepublishesTheProjection(t *testing.T) {
+	t.Parallel()
+	dir, err := os.MkdirTemp("/tmp", "dtw")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	const scope = "org-withdrawal"
+	id := sessionshim.Identity{OrgID: scope, SessionID: "session-withdrawal"}
+
+	var mu sync.Mutex
+	var batches []SessionShimAdoptionBatch
+	var terminals []SessionShimTerminalEvidence
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		RegistryDir:  filepath.Join(dir, "registry"),
+		HostIDForOrg: func(context.Context, string) (string, error) { return "wh_withdrawal_host", nil },
+		OnTerminalEvidence: func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+			mu.Lock()
+			defer mu.Unlock()
+			terminals = append(terminals, evidence)
+			return nil
+		},
+		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+			mu.Lock()
+			defer mu.Unlock()
+			batches = append(batches, cloneSessionShimAdoptionBatch(batch))
+			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-41"), AdoptionRevision: "41"}, nil
+		},
+	}})
+	q := sessionshim.NewQuarantinedSession(sessionshim.Record{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-withdrawal", ProcessEpoch: 3,
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}, sessionshim.QuarantineSocketUnreachable, "controller stream ended before a terminal observation", time.Now())
+	d.shims.mu.Lock()
+	d.shims.registry = registry
+	d.upsertShimQuarantineLocked(q)
+	d.shims.mu.Unlock()
+
+	// The shim reached its orphan deadline, reaped the harness group, and left
+	// its proof on disk exactly as §D8 has it do.
+	tombstone := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: q.ShimID, ProcessEpoch: q.ProcessEpoch,
+		ExitCode: 143, Signal: "SIGTERM",
+		GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(tombstone); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+
+	d.reconcileQuarantinedTombstones()
+
+	mu.Lock()
+	reported := append([]SessionShimTerminalEvidence(nil), terminals...)
+	published := append([]SessionShimAdoptionBatch(nil), batches...)
+	mu.Unlock()
+	if len(reported) != 1 || reported[0].Tombstone != tombstone {
+		t.Fatalf("terminal evidence reported %d times (%+v), want the exact proof once", len(reported), reported)
+	}
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("the handoff left %d lineages projected quarantined", len(projected))
+	}
+	if len(published) != 1 {
+		t.Fatalf("published %d batches after the tombstone withdrawal, want exactly one — "+
+			"the receiver's quarantine set advances only through a batch", len(published))
+	}
+	batch := published[0]
+	if batch.OrgID != scope || len(batch.Quarantined) != 0 {
+		t.Fatalf("withdrawal batch = %+v, want scope %q with an empty quarantine set", batch, scope)
+	}
+	if len(batch.Tombstoned) != 1 || batch.Tombstoned[0].Tombstone != tombstone {
+		t.Fatalf("withdrawal batch tombstoned = %+v, want the handed-over lineage", batch.Tombstoned)
 	}
 }
 
@@ -519,7 +676,7 @@ func TestReleaseShimIfLiveConsumesTerminalProofBeforePublishing(t *testing.T) {
 		t.Fatalf("PutTombstone: %v", err)
 	}
 
-	d.releaseShimIfLive(id, controller)
+	d.releaseShimIfLive(id, controller, shimStreamCarrierLost)
 
 	mu.Lock()
 	reported := append([]SessionShimTerminalEvidence(nil), terminals...)

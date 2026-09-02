@@ -387,3 +387,72 @@ func TestReconciliationExhaustsItsDerivedBoundAndKeepsServing(t *testing.T) {
 		t.Fatalf("beat after exhaustion = %+v, want the last-committed revision-1 projection", beat.SessionShim)
 	}
 }
+
+// TestScheduleSessionShimReconciliationArmsOnePassPerScope pins the exported
+// entry point an embedder's own heartbeat lane uses to reach the same
+// reconcile-and-republish pass the daemon's lane arms on a revision-stale
+// refusal. A composition serving several scopes beats each on its own lane, and
+// a satellite lane's stale refusal had no route to this pass at all — the host
+// then beat the same superseded revision every interval until a restart.
+//
+// Armed exactly once per scope while a pass is in flight, no-op for a scope
+// this daemon holds no authority receipt for, and nil-safe.
+func TestScheduleSessionShimReconciliationArmsOnePassPerScope(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, f := newReconciliationFixture(ctx, t)
+	d := h.daemon
+
+	// Hold the commit open so the first armed pass is provably still in flight
+	// when the second call lands.
+	release := make(chan struct{})
+	var commits sync.WaitGroup
+	commits.Add(1)
+	var commitCount int
+	f.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		f.mu.Lock()
+		commitCount++
+		first := commitCount == 1
+		f.mu.Unlock()
+		if first {
+			commits.Done()
+		}
+		<-release
+		h.setRefreshReceiptRevision("revision-2")
+		h.setHeartbeatRequireRevision("revision-2")
+		return confirmedReceipt(batch, "revision-2"), nil
+	})
+
+	d.ScheduleSessionShimReconciliation(h.orgID, "")
+	d.ScheduleSessionShimReconciliation(h.orgID, "satellite-heartbeat-revision-stale")
+	if got := d.reconcilingScopes(); got != 1 {
+		t.Fatalf("armed %d reconciliation passes for one scope, want exactly one", got)
+	}
+	commits.Wait()
+	d.ScheduleSessionShimReconciliation(h.orgID, "satellite-heartbeat-revision-stale")
+	if got := d.reconcilingScopes(); got != 1 {
+		t.Fatalf("a call landing mid-pass armed a second pass (%d armed), want it served by the one in flight", got)
+	}
+	close(release)
+
+	waitForCondition(t, 5*time.Second, "the armed pass to republish at the committed revision", func() bool {
+		receipt, ok := d.SessionShimScopeAuthority(h.orgID)
+		return ok && receipt.AdoptionRevision == "revision-2"
+	})
+	waitForCondition(t, 5*time.Second, "the pass to disarm once it converged", func() bool {
+		return d.reconcilingScopes() == 0
+	})
+	f.mu.Lock()
+	got := commitCount
+	f.mu.Unlock()
+	if got != 1 {
+		t.Fatalf("three calls produced %d commits, want exactly the one pass's republish", got)
+	}
+
+	d.ScheduleSessionShimReconciliation("org-nobody-served", "satellite-heartbeat-revision-stale")
+	if got := d.reconcilingScopes(); got != 0 {
+		t.Fatalf("a scope with no authority receipt armed %d passes, want none", got)
+	}
+	var nilDaemon *Daemon
+	nilDaemon.ScheduleSessionShimReconciliation(h.orgID, "satellite-heartbeat-revision-stale")
+}
