@@ -6,6 +6,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.15 — 2026-09-02
+
+### Fixes
+
+- **A launched worker whose discovery record is merely slow to publish is no
+  longer abandoned while it is still alive and running un-adopted — and if
+  the daemon does give up on it, it now stops the worker instead of leaving
+  it running.** The wait for the discovery record now continues past the
+  ordinary launch deadline for as long as the launched process stays alive,
+  instead of giving up on a bound sized for an unloaded host's cold start; a
+  process that dies still ends the wait immediately with a definite failure.
+  If the extended wait is exhausted with the process still alive, the daemon
+  now stops it (by process group, since no controller or durable record was
+  ever published for it to release through) and reaps it before returning
+  the failure, rather than leaving an unrecoverable, un-adopted process
+  running to completion on its own. A refused stop signal is now classified
+  by re-checking whether the process has actually exited rather than treated
+  as a failure outright, and a launch that can be neither probed nor safely
+  signalled now refuses to signal an unverified process identity instead of
+  guessing. (#528)
+
+---
+
 ## v0.72.14 — 2026-09-02
 
 ### Fixes
