@@ -342,6 +342,17 @@ const EventBacklogBudget = ptyhost.DefaultRingBytes
 // The deadline is deliberately LONGER than heartbeatReceiptWaitBound, and that
 // ordering is load-bearing — see eventBacklogStallFloor, which enforces it
 // against any override.
+//
+// This is a THROUGHPUT bound, not a latency one: the consumer must sustain at
+// least budget/deadline to keep resetting the clock, about 273 KiB/s at the
+// 8 MiB EventBacklogBudget / 30s defaults. Shortening the deadline RAISES the
+// required drain rate — it does not make the mechanism more lenient. Because
+// the clock is anchored when the consumer first falls behind rather than
+// re-armed per push, worst-case wall time from "first fell behind" to
+// fail-closed is about 2x this deadline (a consumer can fall behind, coast
+// just above the required rate for nearly a full deadline without resetting
+// the anchor, then stop); time-to-refusal measured from the moment the
+// consumer actually STOPS making progress stays <= 1x the deadline.
 const eventBacklogStallDeadline = 30 * time.Second
 
 // eventBacklogStallFloor is the shortest stall deadline this package will honour,
