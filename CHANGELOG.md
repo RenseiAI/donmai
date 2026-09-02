@@ -6,6 +6,114 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.13 — 2026-09-02
+
+### Fixes
+
+- **Stage-budget limits set only through the legacy top-level field are now
+  honored during preflight, not just at spawn, and can no longer silently
+  overwrite an already-admitted budget.** The compatibility mirror for stage
+  budgets is now forwarded into daemon preflight and reconciled through one
+  shared constructor on both the preflight and spawned-agent paths; work
+  carrying an admitted execution receipt now rejects a missing, added, or
+  changed legacy value instead of having it silently overwrite the
+  authoritative budget, while work with no receipt can still adopt the
+  legacy value as before. (#499)
+
+- **A `codex` session's remote plugin catalog is now cached and reused
+  across sessions instead of being re-fetched cold on every single launch,
+  and abandoned session homes left behind by a crash or daemon restart are
+  now reclaimed instead of accumulating forever.** Only the shared,
+  content-hashed plugin catalog is reused — everything else in a session's
+  isolated home stays exactly as isolated as before. Reclamation only ever
+  deletes what this feature itself created and can prove it created,
+  preserves whatever a session needs to resume, and fails closed (treats a
+  directory as still in use) whenever it cannot fully prove otherwise,
+  including for the one session type that carries no verifiable process
+  identity at all. (#506)
+
+- **A single stalled or refused step in the session-shim daemon path no
+  longer takes down more than the session it belongs to.** A session whose
+  adoption record appeared just after the daemon's launch deadline used to
+  hang forever with capacity consumed; the daemon now polls briefly past the
+  deadline and adopts on identity match. A refused adoption-batch commit
+  used to strand the whole host — every poll returning an error until a
+  manual restart; it now retries a definite refusal with bounded backoff
+  and, on exhaustion, presents the affected session as quarantined rather
+  than dropping it silently. A durable-adoption failure for one session used
+  to abort startup for every other session on the host; it now quarantines
+  just that one session and lets the rest compose normally. (#507)
+
+- **A closed-source-content violation involving a real contributor's
+  filesystem path is now blocking on any changed file, not just visible in
+  a non-gating report.** The repository's boundary linter already correctly
+  flagged tracked linter-cache blobs carrying a real absolute path, but that
+  scan was report-only, so the finding printed into logs nobody gated on and
+  the content shipped anyway. Changed files are now scanned and blocked on
+  this one violation class as part of every pull request and push to
+  `main`. (#519)
+
+- **A gateway or local-serving cell whose vendor identity differs from its
+  model's actual author no longer gets falsely denied before spawn.**
+  Receipt-bearing admission required the endpoint's vendor-surface identity
+  (which wire dialect a request is spoken to) to equal the model's author,
+  but those only coincide for first-party direct cells — every gateway,
+  OpenAI-compatible aggregator, and local-serving cell legitimately diverges
+  and was rejected outright before ever reaching the harness. A vendor
+  identity substituted after admission is still denied via the existing
+  payload-digest check. (#520)
+
+- **A daemon that loses an adoption-batch commit's answer no longer strands
+  itself at a stale revision.** When the control plane's reply to a commit
+  was lost after the commit itself succeeded, bounded reconciliation kept
+  re-preparing and kept hearing "the expected revision changed" — because it
+  had, by exactly the batch this daemon sent — until it gave up and served
+  every heartbeat and credential receipt against a superseded revision,
+  unusable until authority state was hand-edited. The daemon now recognizes
+  an advance that is exactly one step past its last commit, whose digest
+  matches the batch it just sent, and adopts the control plane's echoed
+  receipt as its own outcome instead of re-committing or stalling. A restart
+  that re-presents a still-live session at a higher generation and gets
+  refused for that one session now quarantines only that session instead of
+  aborting the whole host's startup with durable sessions off. A durable-write
+  receipt that merely arrives late is now retried instead of dropping the
+  connection and reaping two otherwise-healthy sessions; the default
+  control-plane-stall grace before a session is treated as truly orphaned
+  widens from 90 seconds to 15 minutes, and is now tunable on an installed
+  host. (#522)
+
+- **A relay-stamped system-attributed carriage return can no longer be
+  mistaken for a literal newline by a client's paste-detection heuristic.**
+  When an upstream connection stalled and then flushed queued frames
+  back-to-back, a bare CR/LF written on behalf of the daemon itself could
+  land in the same read as user-typed output, and pacing enforced only at
+  send time was lost. Writes attributed to the daemon are now paced at the
+  actual write boundary with a keystroke-scale gap, and any dangling
+  bracketed-paste region is closed first so the daemon's own bytes never
+  land inside an abandoned paste. Human input is never delayed by this.
+  (#523)
+
+- **A pinned `<provider>/<model>` selection for the pi harness no longer
+  fails on its first turn.** pi accepts a provider-prefixed model pin to
+  select one of its own built-in providers, but the harness always forwarded
+  the full prefixed string as the wire model id to its injected default
+  provider, which a direct-hosted endpoint rejects as an unrecognized code.
+  A pin naming one of pi's documented built-in providers is now routed
+  natively with the bare model id and its credential mirrored onto that
+  provider's own environment variable; a launch-time preflight now also
+  denies spawn with an actionable error when the resolved provider/model
+  pair isn't actually in pi's own catalog, instead of failing on the first
+  turn after the process is already running. (#524)
+
+### Chores
+
+- **The linter cache directory is no longer tracked in the repository.** The
+  ignore rule previously matched the wrong directory name, so
+  machine-specific, path-embedding cache blobs were being committed on every
+  run; the rule now matches the directory golangci-lint actually writes to,
+  and the already-tracked blobs have been removed from tracking (working
+  trees are unaffected). (#505, #521)
+
 ## v0.72.12 — 2026-08-31
 
 ### Fixes
