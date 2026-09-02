@@ -1437,6 +1437,29 @@ type shimCursorAcknowledger struct {
 	// sequence the shim has already stored.
 	mu    sync.Mutex
 	acked uint64
+
+	// backoffMu guards lastBackoff, the delay the loop most recently waited for
+	// a pending persistence receipt. It exists so the reset-on-success rule is
+	// observable: a backoff that keeps its earned cap after the stall cleared
+	// makes the next unrelated hiccup wait a full callback timeout for nothing,
+	// and nothing else about the loop distinguishes the two.
+	backoffMu   sync.Mutex
+	lastBackoff time.Duration
+}
+
+// noteReceiptBackoff records the delay the loop is about to wait.
+func (a *shimCursorAcknowledger) noteReceiptBackoff(d time.Duration) {
+	a.backoffMu.Lock()
+	a.lastBackoff = d
+	a.backoffMu.Unlock()
+}
+
+// receiptBackoffUsed reports the delay most recently waited for a pending
+// persistence receipt.
+func (a *shimCursorAcknowledger) receiptBackoffUsed() time.Duration {
+	a.backoffMu.Lock()
+	defer a.backoffMu.Unlock()
+	return a.lastBackoff
 }
 
 // shimCursorController is the controller surface the acknowledger uses. It is
@@ -1486,6 +1509,7 @@ func (d *Daemon) startShimCursorAcknowledger(
 					slog.Warn("session shim: durable HostFrame acknowledgement is still pending; keeping the shim connection and retrying "+
 						"(shim-adoption-reconvergence-2026-09-01)",
 						"session", id.String(), "seq", a.pending.Load(), "backoff", receiptBackoff, "error", err)
+					a.noteReceiptBackoff(receiptBackoff)
 					if !a.sleepPendingReceiptBackoff(receiptBackoff) {
 						return
 					}
@@ -1495,7 +1519,6 @@ func (d *Daemon) startShimCursorAcknowledger(
 					a.signal()
 					continue
 				}
-				receiptBackoff = sessionShimAdoptionBatchCommitBaseBackoff
 				// A shim that refuses because its TERMINAL PROOF IS PUBLISHED is
 				// not a broken socket — it is telling this daemon that the
 				// tombstone is already on disk. Measured on an installed host:
@@ -1534,6 +1557,10 @@ func (d *Daemon) startShimCursorAcknowledger(
 				_ = ctrl.Close()
 				return
 			}
+			// A confirmed acknowledgement ends the stall: the next one that has
+			// to wait starts from the base delay rather than inheriting a cap
+			// earned by a condition that has since cleared.
+			receiptBackoff = sessionShimAdoptionBatchCommitBaseBackoff
 			if a.pending.Load() > a.highWater() {
 				a.signal()
 			}

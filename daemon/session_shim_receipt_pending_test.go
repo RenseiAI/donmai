@@ -35,12 +35,13 @@ import (
 type pendingCursorController struct {
 	pendingAnswers int
 
-	mu       sync.Mutex
-	beats    []uint64
-	closes   int
-	settled  chan struct{}
-	settleOn sync.Once
-	done     chan struct{}
+	mu        sync.Mutex
+	remaining int
+	beats     []uint64
+	closes    int
+	settled   chan struct{}
+	settleOn  sync.Once
+	done      chan struct{}
 }
 
 func (c *pendingCursorController) SupportsFullHostFrames() bool { return true }
@@ -48,13 +49,24 @@ func (c *pendingCursorController) SupportsFullHostFrames() bool { return true }
 func (c *pendingCursorController) Heartbeat(seq uint64) error {
 	c.mu.Lock()
 	c.beats = append(c.beats, seq)
-	pending := len(c.beats) <= c.pendingAnswers
+	pending := c.remaining > 0
+	if pending {
+		c.remaining--
+	}
 	c.mu.Unlock()
 	if pending {
 		return fmt.Errorf("%w: acked sequence %d", sessionshim.ErrHeartbeatReceiptPending, seq)
 	}
 	c.settleOn.Do(func() { close(c.settled) })
 	return nil
+}
+
+// stallAgain makes the next n acknowledgements report a pending receipt, so a
+// test can observe what a SECOND stall costs after the first one cleared.
+func (c *pendingCursorController) stallAgain(n int) {
+	c.mu.Lock()
+	c.remaining = n
+	c.mu.Unlock()
 }
 
 func (c *pendingCursorController) Done() <-chan struct{} { return c.done }
@@ -88,6 +100,7 @@ func TestPendingPersistenceReceiptKeepsTheShimConnectionAndRetries(t *testing.T)
 	d := &Daemon{shims: newSessionShimState()}
 	ctrl := &pendingCursorController{
 		pendingAnswers: 2,
+		remaining:      2,
 		settled:        make(chan struct{}),
 		done:           make(chan struct{}),
 	}
@@ -114,6 +127,25 @@ func TestPendingPersistenceReceiptKeepsTheShimConnectionAndRetries(t *testing.T)
 	waitForCondition(t, 5*time.Second, "the cursor to advance after the shim confirmed it", func() bool {
 		return acknowledger.highWater() == 7
 	})
+	// The stall escalated the delay, which is what a backoff is for.
+	if used := acknowledger.receiptBackoffUsed(); used <= sessionShimAdoptionBatchCommitBaseBackoff {
+		t.Fatalf("backoff after %d pending answers = %s, want it to have escalated past the %s base",
+			ctrl.pendingAnswers, used, sessionShimAdoptionBatchCommitBaseBackoff)
+	}
+
+	// A confirmed acknowledgement ENDS the stall. The next one that has to wait
+	// must start from the base delay again: a backoff that keeps its earned cap
+	// makes an unrelated later hiccup wait a full callback timeout for a
+	// condition that cleared long ago.
+	ctrl.stallAgain(1)
+	acknowledger.record(8)
+	waitForCondition(t, 10*time.Second, "the second stall to clear", func() bool {
+		return acknowledger.highWater() == 8
+	})
+	if used := acknowledger.receiptBackoffUsed(); used != sessionShimAdoptionBatchCommitBaseBackoff {
+		t.Fatalf("backoff on a fresh stall = %s, want the %s base — the earned cap outlived the condition",
+			used, sessionShimAdoptionBatchCommitBaseBackoff)
+	}
 }
 
 // TestPendingReceiptSentinelIsDistinguishedFromARealPersistenceFailure is the

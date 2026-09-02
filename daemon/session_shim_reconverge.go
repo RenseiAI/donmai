@@ -59,9 +59,12 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"math"
 	"strconv"
 	"strings"
+	"time"
 
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -139,8 +142,21 @@ func (e *SessionShimAdoptionEvidenceRecorded) Error() string {
 
 func (e *SessionShimAdoptionEvidenceRecorded) Unwrap() error { return e.Err }
 
-// sessionShimAdoptionBatchDigest is the batch's operational digest: a stable
-// fingerprint of WHAT this batch says, sent as the commit's idempotency key.
+// sessionShimAdoptionBatchDigestEncoding names the exact document this digest
+// is taken over. It is a member of that document, so a future encoding cannot
+// collide with this one even over an identical batch.
+const sessionShimAdoptionBatchDigestEncoding = "session-shim-adoption-batch-v1"
+
+// sessionShimAdoptionBatchDigest is the batch's digest: a stable fingerprint of
+// WHAT this batch says, sent as the commit's idempotency key.
+//
+// The encoding is the corpus's, not this file's: RFC 8785 JSON canonicalization
+// over a document that OMITS ITS OWN DIGEST MEMBER, hashed with SHA-256 and
+// rendered as exactly 64 lowercase hexadecimal characters, with every epoch,
+// cursor, and generation carried as a canonical uint64 decimal STRING rather
+// than a JSON number (a JSON number cannot carry a uint64 without loss, and the
+// corpus refuses a non-canonical spelling rather than accepting an equivalent
+// representation).
 //
 // Only lifecycle-identifying facts enter it. The expected revision is excluded
 // (it is the compare-and-swap state, not the content) and so is every value
@@ -151,76 +167,102 @@ func (e *SessionShimAdoptionEvidenceRecorded) Unwrap() error { return e.Err }
 //
 // The batch must already be sorted; completeSessionShimAdoptionBatch is the one
 // choke point that does both.
-func sessionShimAdoptionBatchDigest(batch SessionShimAdoptionBatch) string {
-	h := sha256.New()
-	// hash.Hash.Write never returns an error, which is what makes the discard
-	// here a fact about the interface rather than an unchecked failure.
-	write := func(format string, args ...any) { _, _ = fmt.Fprintf(h, format, args...) }
-	write("session-shim-adoption-batch-v1\norg=%s\nhost=%s\n", batch.OrgID, batch.HostID)
-	write("adopted=%d\n", len(batch.Adopted))
+func sessionShimAdoptionBatchDigest(batch SessionShimAdoptionBatch) (string, error) {
+	adopted := make([]any, 0, len(batch.Adopted))
 	for _, outcome := range batch.Adopted {
-		e := outcome.Evidence
-		write("a\x1f%s\x1f%s\x1f%s\x1f%d\x1f%d\x1f%t\n",
-			e.Identity.OrgID, e.Identity.SessionID, e.ShimID, e.ProcessEpoch,
-			e.ControllerGeneration, e.CarrierCompatible)
+		evidence := outcome.Evidence
+		adopted = append(adopted, map[string]any{
+			"orgId":                evidence.Identity.OrgID,
+			"sessionId":            evidence.Identity.SessionID,
+			"shimId":               evidence.ShimID,
+			"processEpoch":         strconv.FormatUint(evidence.ProcessEpoch, 10),
+			"controllerGeneration": strconv.FormatUint(evidence.ControllerGeneration, 10),
+			"carrierCompatible":    evidence.CarrierCompatible,
+		})
 	}
-	write("quarantined=%d\n", len(batch.Quarantined))
-	for _, q := range batch.Quarantined {
-		write("q\x1f%s\x1f%s\x1f%s\x1f%d\x1f%d\x1f%s\x1f%t\n",
-			q.OrgID, q.SessionID, q.ShimID, q.ProcessEpoch, q.ControllerGeneration,
-			q.Reason, q.ConsumesCapacity)
+	quarantined := make([]any, 0, len(batch.Quarantined))
+	for _, entry := range batch.Quarantined {
+		quarantined = append(quarantined, map[string]any{
+			"orgId":                entry.OrgID,
+			"sessionId":            entry.SessionID,
+			"shimId":               entry.ShimID,
+			"processEpoch":         strconv.FormatUint(entry.ProcessEpoch, 10),
+			"controllerGeneration": strconv.FormatUint(entry.ControllerGeneration, 10),
+			"reason":               string(entry.Reason),
+			"consumesCapacity":     entry.ConsumesCapacity,
+		})
 	}
-	write("tombstoned=%d\n", len(batch.Tombstoned))
-	for _, tombstone := range batch.Tombstoned {
-		write("t\x1f%s\x1f%s\x1f%s\x1f%d\n",
-			tombstone.Identity.OrgID, tombstone.Identity.SessionID,
-			tombstone.ShimID, tombstone.ProcessEpoch)
+	tombstoned := make([]any, 0, len(batch.Tombstoned))
+	for _, entry := range batch.Tombstoned {
+		tombstoned = append(tombstoned, map[string]any{
+			"orgId":        entry.Identity.OrgID,
+			"sessionId":    entry.Identity.SessionID,
+			"shimId":       entry.ShimID,
+			"processEpoch": strconv.FormatUint(entry.ProcessEpoch, 10),
+		})
 	}
-	write("cleared=%d\n", len(batch.Cleared))
-	for _, cleared := range batch.Cleared {
-		write("c\x1f%s\x1f%s\x1f%s\x1f%d\x1f%d\x1f%s\x1f%s\n",
-			cleared.OrgID, cleared.SessionID, cleared.ShimID, cleared.ProcessEpoch,
-			cleared.ControllerGeneration, cleared.Disposition, cleared.Reason)
+	cleared := make([]any, 0, len(batch.Cleared))
+	for _, entry := range batch.Cleared {
+		cleared = append(cleared, map[string]any{
+			"orgId":                entry.OrgID,
+			"sessionId":            entry.SessionID,
+			"shimId":               entry.ShimID,
+			"processEpoch":         strconv.FormatUint(entry.ProcessEpoch, 10),
+			"controllerGeneration": strconv.FormatUint(entry.ControllerGeneration, 10),
+			"disposition":          string(entry.Disposition),
+			"reason":               string(entry.Reason),
+		})
 	}
-	return hex.EncodeToString(h.Sum(nil))
+	canonical, err := executioncell.CanonicalJSON(map[string]any{
+		"encoding":    sessionShimAdoptionBatchDigestEncoding,
+		"orgId":       batch.OrgID,
+		"hostId":      batch.HostID,
+		"adopted":     adopted,
+		"quarantined": quarantined,
+		"tombstoned":  tombstoned,
+		"cleared":     cleared,
+	})
+	if err != nil {
+		return "", fmt.Errorf("session shim: canonicalize adoption batch for its digest: %w", err)
+	}
+	sum := sha256.Sum256(canonical)
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // sessionShimRevisionAdvancedByOne reports whether advanced is exactly one step
 // past last.
 //
-// Adoption revisions are opaque strings on this wire, but every composition
-// that issues them counts: the value is a decimal counter, optionally behind a
-// stable prefix. So the comparison is "same prefix, successor counter", and a
-// revision whose shape this cannot read is never treated as a successor —
-// adopting an advance this daemon cannot prove is exactly one step is how a
-// host would silently skip a revision somebody else committed.
+// Both must be canonical uint64 decimal revisions — "0", or a non-zero digit
+// followed by digits — which is the only spelling the control boundary defines.
+// A revision in any other shape is never treated as a successor: adopting an
+// advance this daemon cannot prove is exactly one step is how a host would
+// silently skip a revision somebody else committed.
 func sessionShimRevisionAdvancedByOne(last, advanced string) bool {
-	lastPrefix, lastCounter, lastOK := splitSessionShimRevisionCounter(last)
-	nextPrefix, nextCounter, nextOK := splitSessionShimRevisionCounter(advanced)
-	if !lastOK || !nextOK || lastPrefix != nextPrefix {
+	lastCounter, lastOK := canonicalSessionShimRevision(last)
+	nextCounter, nextOK := canonicalSessionShimRevision(advanced)
+	if !lastOK || !nextOK || lastCounter == math.MaxUint64 {
 		return false
 	}
 	return nextCounter == lastCounter+1
 }
 
-// splitSessionShimRevisionCounter splits a revision into its stable prefix and
-// its trailing decimal counter. A value with no trailing digits, with a counter
-// too long to be a counter, or with a leading zero (two spellings of one
-// number would make "exactly one step" ambiguous) is not readable as one.
-func splitSessionShimRevisionCounter(revision string) (prefix string, counter uint64, ok bool) {
-	i := len(revision)
-	for i > 0 && revision[i-1] >= '0' && revision[i-1] <= '9' {
-		i--
+// canonicalSessionShimRevision decodes one canonical uint64 decimal revision. A
+// leading zero, a sign, a non-digit, an empty value, or an overflow is a
+// refusal rather than an equivalent representation.
+func canonicalSessionShimRevision(revision string) (uint64, bool) {
+	if revision == "" || (len(revision) > 1 && revision[0] == '0') {
+		return 0, false
 	}
-	digits := revision[i:]
-	if digits == "" || len(digits) > 19 || (len(digits) > 1 && digits[0] == '0') {
-		return "", 0, false
+	for i := 0; i < len(revision); i++ {
+		if revision[i] < '0' || revision[i] > '9' {
+			return 0, false
+		}
 	}
-	value, err := strconv.ParseUint(digits, 10, 64)
+	value, err := strconv.ParseUint(revision, 10, 64)
 	if err != nil {
-		return "", 0, false
+		return 0, false
 	}
-	return revision[:i], value, true
+	return value, true
 }
 
 // adoptAdvancedSessionShimAdoptionRevision decides whether a preparation or
@@ -241,13 +283,17 @@ func splitSessionShimRevisionCounter(revision string) (prefix string, counter ui
 // Anything short of all four returns false and the caller keeps the failure,
 // which re-presents the daemon's current projection at the advanced revision
 // through the ordinary reconciliation path.
+// It also returns the advance itself, so a caller that then REFUSES the adopted
+// receipt can re-wrap its own refusal in the advance rather than degrading it
+// to an untyped error — a republish that lost the type stops re-arming
+// reconciliation, which is the exact failure this whole file exists to prevent.
 func (d *Daemon) adoptAdvancedSessionShimAdoptionRevision(
 	batch SessionShimAdoptionBatch,
 	err error,
-) (SessionShimAdoptionBatchReceipt, bool) {
+) (SessionShimAdoptionBatchReceipt, *SessionShimAdoptionRevisionAdvanced, bool) {
 	var advanced *SessionShimAdoptionRevisionAdvanced
 	if !errors.As(err, &advanced) || advanced.Advanced == "" {
-		return SessionShimAdoptionBatchReceipt{}, false
+		return SessionShimAdoptionBatchReceipt{}, advanced, false
 	}
 	lastCommitted := advanced.LastCommitted
 	if receipt, ok := d.SessionShimScopeAuthority(batch.OrgID); ok && receipt.AdoptionRevision != "" {
@@ -255,21 +301,30 @@ func (d *Daemon) adoptAdvancedSessionShimAdoptionRevision(
 		// the control plane's reading of what we presented, and if the two
 		// disagree we do not know which batch the advance belongs to.
 		if lastCommitted != "" && lastCommitted != receipt.AdoptionRevision {
-			return SessionShimAdoptionBatchReceipt{}, false
+			return SessionShimAdoptionBatchReceipt{}, advanced, false
 		}
 		lastCommitted = receipt.AdoptionRevision
 	}
 	if lastCommitted == "" || !sessionShimRevisionAdvancedByOne(lastCommitted, advanced.Advanced) {
-		return SessionShimAdoptionBatchReceipt{}, false
+		return SessionShimAdoptionBatchReceipt{}, advanced, false
 	}
-	if advanced.CommittedBatchDigest == "" || advanced.CommittedBatchDigest != batch.OperationalDigest {
-		return SessionShimAdoptionBatchReceipt{}, false
+	if advanced.CommittedBatchDigest == "" || advanced.CommittedBatchDigest != batch.BatchDigest {
+		return SessionShimAdoptionBatchReceipt{}, advanced, false
 	}
 	committed := advanced.Committed
 	if len(committed.DurableCorrelation) == 0 || committed.AdoptionRevision != advanced.Advanced {
-		return SessionShimAdoptionBatchReceipt{}, false
+		return SessionShimAdoptionBatchReceipt{}, advanced, false
 	}
-	return committed, true
+	return committed, advanced, true
+}
+
+// rewrapSessionShimAdvance returns a copy of one advance carrying cause as its
+// underlying answer, so the typed classification survives a refusal raised
+// AFTER the advance was recognised.
+func rewrapSessionShimAdvance(advanced *SessionShimAdoptionRevisionAdvanced, cause error) error {
+	rewrapped := *advanced
+	rewrapped.Err = cause
+	return &rewrapped
 }
 
 // sessionShimBatchAfterEvidenceRecorded moves every lineage the control plane
@@ -325,13 +380,27 @@ func sessionShimBatchAfterEvidenceRecorded(
 // It quarantines exactly those lineages — dropping them from the adopted set
 // the caller is about to publish locally, recording them in the caller's
 // failure map so the live projection, the gate resolution, and every LATER
-// batch this daemon sends all agree — and commits the batch once more without
-// them. The shims themselves are untouched: a lineage whose evidence the
-// control plane already holds is not a lineage that died.
+// batch this daemon sends all agree — and commits the batch again without
+// them. It repeats while each answer names another adopted lineage, bounded by
+// the number of adopted entries, because every pass must remove at least one
+// or it stops: a control plane that reports its conflicts one lineage at a time
+// would otherwise still cost the host its durable sessions on the second name.
 //
-// A conflict that names no adopted lineage, or a re-commit that fails on its
-// own, returns a failure and the caller aborts the composition exactly as
-// before. This narrows a host-wide failure to a per-lineage one; it does not
+// WHAT THIS COSTS THE LINEAGE, EXACTLY. Recording it in adoptionFailures puts
+// it on the caller's release path: this daemon RELEASES its control socket to
+// that shim (Controller.Close), the same disposition every other failed
+// per-lineage adoption gets. The harness is NOT killed and the shim is not
+// stopped — the shim keeps it and starts its own bounded §D8 orphan clock, so
+// the window before an unattended harness is reaped is that deadline, not
+// zero. That is the honest cost of this recovery and it is deliberate: the
+// alternative — keeping local controller authority over a lineage the control
+// plane refused in the batch — would present the same lineage as both adopted
+// and quarantined in the very next projection, which the receiver refuses as a
+// duplicate, and would double-count it against capacity.
+//
+// A conflict that names no adopted lineage, or a re-commit that fails for any
+// other reason, returns a failure and the caller aborts the composition exactly
+// as before. This narrows a host-wide failure to a per-lineage one; it does not
 // invent a way to succeed.
 func (d *Daemon) commitBootBatchAroundRecordedEvidence(
 	ctx context.Context,
@@ -340,27 +409,85 @@ func (d *Daemon) commitBootBatchAroundRecordedEvidence(
 	entries map[sessionshim.Identity]adoptedShim,
 	adoptionFailures map[sessionshim.Identity]sessionshim.QuarantinedSession,
 ) (SessionShimAdoptionBatchReceipt, error) {
-	var recorded *SessionShimAdoptionEvidenceRecorded
-	if !errors.As(cause, &recorded) || len(recorded.Lineages) == 0 {
+	// Every pass removes at least one adopted lineage, so the adopted count is
+	// the loop's own bound — derived from the batch rather than chosen.
+	bound := len(batch.Adopted)
+	accumulated := make([]sessionshim.QuarantinedSession, 0, bound)
+	for pass := 0; pass < bound; pass++ {
+		var recorded *SessionShimAdoptionEvidenceRecorded
+		if !errors.As(cause, &recorded) || len(recorded.Lineages) == 0 {
+			break
+		}
+		amended, quarantines := sessionShimBatchAfterEvidenceRecorded(batch, recorded.Lineages)
+		if len(quarantines) == 0 {
+			// The conflict names nothing this batch adopts; there is nothing
+			// narrower than the whole composition left to do.
+			break
+		}
+		batch = amended
+		accumulated = append(accumulated, quarantines...)
+		receipt, err := d.completeSessionShimAdoptionBatch(ctx, batch)
+		if err == nil {
+			for _, quarantine := range accumulated {
+				id := sessionshim.Identity{OrgID: quarantine.OrgID, SessionID: quarantine.SessionID}
+				delete(entries, id)
+				adoptionFailures[id] = quarantine
+				slog.Warn("session shim: the control plane already holds this lineage's adoption evidence; releasing this daemon's "+
+					"control socket to it, quarantining it, and composing the rest of the host — the shim keeps its harness and "+
+					"starts its own bounded orphan clock (shim-adoption-reconvergence-2026-09-01)",
+					"session", id.String(), "revision", receipt.AdoptionRevision,
+					"orphanDeadline", d.sessionShimConfig().Orphan.Deadline)
+			}
+			return receipt, nil
+		}
+		cause = err
+	}
+	if len(accumulated) == 0 {
 		return SessionShimAdoptionBatchReceipt{}, cause
 	}
-	amended, quarantines := sessionShimBatchAfterEvidenceRecorded(batch, recorded.Lineages)
-	if len(quarantines) == 0 {
-		return SessionShimAdoptionBatchReceipt{}, cause
+	return SessionShimAdoptionBatchReceipt{}, fmt.Errorf(
+		"session shim: re-committing the boot batch without %d already-recorded lineage(s): %w",
+		len(accumulated), cause)
+}
+
+// sessionShimOrphanDeadlineUnderExternalRelease returns the largest orphan
+// deadline that keeps the §D8 inequality strictly satisfied against a declared
+// external release threshold, never exceeding preferred.
+//
+// §D8 fixes deadline + grace + margin < threshold and rejects a violating
+// configuration AT STARTUP, which prevents session admission. So a default
+// chosen for a standalone host — where nothing external can release a claim and
+// the inequality has no upper bound — cannot simply be handed to a composing
+// deployment that declared one: it would refuse to admit anything, and a host
+// that comes up refusing every session is a worse outcome than a shorter grace.
+//
+// The headroom reserved below the exclusive ceiling is one propagation margin,
+// which is derived rather than chosen: the margin is exactly the unit this
+// policy already uses to express how much clock and propagation slop the host
+// must assume it cannot see.
+//
+// When no positive deadline can satisfy the bound at all, the preferred value
+// is returned unchanged and Validate refuses the daemon at startup. Inventing a
+// deadline there would hide a configuration that can produce double execution,
+// which is the one thing this bound exists to prevent.
+func sessionShimOrphanDeadlineUnderExternalRelease(
+	policy sessionshim.OrphanPolicy,
+	preferred time.Duration,
+) time.Duration {
+	if policy.ExternalReleaseThreshold <= 0 {
+		return preferred
 	}
-	receipt, err := d.completeSessionShimAdoptionBatch(ctx, amended)
-	if err != nil {
-		return SessionShimAdoptionBatchReceipt{}, fmt.Errorf(
-			"session shim: re-committing the boot batch without %d already-recorded lineage(s): %w (original refusal: %v)",
-			len(quarantines), err, cause)
+	ceiling := policy.ExternalReleaseThreshold - policy.TerminationGrace - policy.PropagationMargin
+	if ceiling <= 0 {
+		return preferred
 	}
-	for _, quarantine := range quarantines {
-		id := sessionshim.Identity{OrgID: quarantine.OrgID, SessionID: quarantine.SessionID}
-		delete(entries, id)
-		adoptionFailures[id] = quarantine
-		slog.Warn("session shim: the control plane already holds this lineage's adoption evidence; quarantining it and composing "+
-			"the rest of the host (shim-adoption-reconvergence-2026-09-01)",
-			"session", id.String(), "revision", receipt.AdoptionRevision, "error", cause)
+	headroom := policy.PropagationMargin
+	if headroom <= 0 || headroom >= ceiling {
+		headroom = ceiling / 2
 	}
-	return receipt, nil
+	derived := ceiling - headroom
+	if derived <= 0 {
+		return preferred
+	}
+	return min(derived, preferred)
 }

@@ -383,17 +383,21 @@ type SessionShimAdoptionBatch struct {
 	OrgID            string
 	HostID           string
 	ExpectedRevision []byte
-	// OperationalDigest is a stable fingerprint of everything below — the
-	// batch's idempotency key, resolved at the single commit choke point after
-	// the sections are ordered. A composing plane sends it with the commit and
+	// BatchDigest is a stable fingerprint of everything below — the batch's
+	// idempotency key, resolved at the single commit choke point after the
+	// sections are ordered. A composing plane sends it with the commit and
 	// echoes it back on SessionShimAdoptionRevisionAdvanced, which is what lets
 	// this daemon recognise an already-committed batch as its own after its copy
-	// of the answer was lost. It never enters the digest of itself, and the
+	// of the answer was lost.
+	//
+	// Encoding: SHA-256 over RFC 8785 canonical JSON of the
+	// session-shim-adoption-batch-v1 document, rendered as exactly 64 lowercase
+	// hexadecimal characters. The document omits its own digest member, and the
 	// expected revision never enters it either.
-	OperationalDigest string
-	Adopted           []SessionShimAdoptionOutcome
-	Quarantined       []sessionshim.QuarantinedSession
-	Tombstoned        []SessionShimTerminalEvidence
+	BatchDigest string
+	Adopted     []SessionShimAdoptionOutcome
+	Quarantined []sessionshim.QuarantinedSession
+	Tombstoned  []SessionShimTerminalEvidence
 	// Cleared enumerates currently-quarantined unterminated lineages this batch
 	// explicitly abandons. Each entry must name a lineage the receiver still
 	// holds quarantined; the commit removes it from the completeness set and the
@@ -1307,6 +1311,11 @@ type sessionShimState struct {
 	reconciling      map[string]bool
 	reconcileStop    chan struct{}
 	reconcileStopped bool
+	// reconverging is the live, operator-visible condition for a scope whose
+	// reconciliation keeps re-arming against a control plane that reports a
+	// further advanced revision. A host stuck here is serving correctly but is
+	// not converging, which is invisible from every other status field.
+	reconverging map[string]sessionShimReconvergenceState
 	// restartStateWriter and restartID are package-private test seams. Production
 	// uses the atomic secret-free state writer and crypto/rand identifier.
 	restartStateWriter func(restartPreparationAudit) error
@@ -1395,8 +1404,20 @@ func (d *Daemon) sessionShimConfig() SessionShimConfig {
 	if cfg.Orphan.Deadline == 0 {
 		policy := sessionshim.DefaultOrphanPolicy()
 		policy.ExternalReleaseThreshold = cfg.Orphan.ExternalReleaseThreshold
+		preferred := policy.Deadline
 		if operator, ok := operatorOrphanDeadline(); ok {
-			policy.Deadline = operator
+			preferred = operator
+		}
+		// The default (and the operator's value) is what this host WANTS. What
+		// it may actually take is bounded by whatever external release threshold
+		// the composition declared: §D8 rejects a violating policy at startup
+		// and prevents session admission, so handing a standalone-sized default
+		// to a composed deployment would bring the host up refusing everything.
+		policy.Deadline = sessionShimOrphanDeadlineUnderExternalRelease(policy, preferred)
+		if policy.Deadline < preferred {
+			slog.Debug("session shim: orphan deadline reduced to fit the declared external release threshold",
+				"preferred", preferred, "deadline", policy.Deadline,
+				"externalReleaseThreshold", policy.ExternalReleaseThreshold)
 		}
 		cfg.Orphan = policy
 	}
@@ -2481,7 +2502,11 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	// The digest is resolved here, once, after ordering and before anything is
 	// sent: it is the idempotency key both callbacks carry, and a key computed
 	// per caller would differ between two presentations of the same set.
-	batch.OperationalDigest = sessionShimAdoptionBatchDigest(batch)
+	digest, digestErr := sessionShimAdoptionBatchDigest(batch)
+	if digestErr != nil {
+		return SessionShimAdoptionBatchReceipt{}, digestErr
+	}
+	batch.BatchDigest = digest
 	if cfg.PrepareAdoptionBatch != nil {
 		callbackCtx, cancel := d.sessionShimCallbackContext(ctx)
 		expected, err := cfg.PrepareAdoptionBatch(callbackCtx, batch.OrgID, batch.HostID)
@@ -2492,11 +2517,8 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 			// are holding, is this daemon's own lost commit coming back. Adopt
 			// its receipt instead of arguing with a control plane that already
 			// did what we asked. Anything else stays a failure.
-			if adopted, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
-				slog.Warn("session shim: adopting the control plane's advanced adoption revision as the outcome of this daemon's own commit "+
-					"(shim-adoption-reconvergence-2026-09-01)",
-					"org", batch.OrgID, "revision", adopted.AdoptionRevision, "digest", batch.OperationalDigest)
-				return d.validateSessionShimAdoptionBatchReceipt(batch, adopted)
+			if adopted, advance, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
+				return d.retainAdoptedSessionShimAdvance(batch, adopted, advance)
 			}
 			return SessionShimAdoptionBatchReceipt{}, err
 		}
@@ -2509,11 +2531,8 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 	defer cancel()
 	receipt, err := cfg.OnAdoptionBatch(callbackCtx, cloneSessionShimAdoptionBatch(batch))
 	if err != nil {
-		if adopted, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
-			slog.Warn("session shim: adopting the control plane's advanced adoption revision as the outcome of this daemon's own commit "+
-				"(shim-adoption-reconvergence-2026-09-01)",
-				"org", batch.OrgID, "revision", adopted.AdoptionRevision, "digest", batch.OperationalDigest)
-			return d.validateSessionShimAdoptionBatchReceipt(batch, adopted)
+		if adopted, advance, ok := d.adoptAdvancedSessionShimAdoptionRevision(batch, err); ok {
+			return d.retainAdoptedSessionShimAdvance(batch, adopted, advance)
 		}
 		if sessionShimCommitOutcomeUnknown(err) {
 			// The commit request went out and no decoded refusal came back:
@@ -2526,6 +2545,32 @@ func (d *Daemon) completeSessionShimAdoptionBatch(ctx context.Context, batch Ses
 		return SessionShimAdoptionBatchReceipt{}, err
 	}
 	return d.validateSessionShimAdoptionBatchReceipt(batch, receipt)
+}
+
+// retainAdoptedSessionShimAdvance admits the receipt the control plane echoed
+// for an already-committed batch, through exactly the validation a committed
+// receipt passes.
+//
+// A refusal here is re-wrapped in the advance rather than surfaced as a plain
+// error: the classification is what makes a caller re-arm reconciliation, and
+// losing it at the last step would put the daemon straight back to serving a
+// superseded revision — the failure this whole path exists to prevent.
+func (d *Daemon) retainAdoptedSessionShimAdvance(
+	batch SessionShimAdoptionBatch,
+	adopted SessionShimAdoptionBatchReceipt,
+	advance *SessionShimAdoptionRevisionAdvanced,
+) (SessionShimAdoptionBatchReceipt, error) {
+	receipt, err := d.validateSessionShimAdoptionBatchReceipt(batch, adopted)
+	if err != nil {
+		slog.Warn("session shim: the control plane's advanced adoption revision named this daemon's own batch but its echoed receipt "+
+			"was refused (shim-adoption-reconvergence-2026-09-01)",
+			"org", batch.OrgID, "revision", advance.Advanced, "error", err)
+		return SessionShimAdoptionBatchReceipt{}, rewrapSessionShimAdvance(advance, err)
+	}
+	slog.Warn("session shim: adopting the control plane's advanced adoption revision as the outcome of this daemon's own commit "+
+		"(shim-adoption-reconvergence-2026-09-01)",
+		"org", batch.OrgID, "revision", receipt.AdoptionRevision, "digest", batch.BatchDigest)
+	return receipt, nil
 }
 
 // validateSessionShimAdoptionBatchReceipt is the one place a batch receipt is
@@ -3476,7 +3521,15 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 		status.Adopted = append(status.Adopted, correlation)
 	}
 	status.Quarantined = append([]sessionshim.QuarantinedSession(nil), d.shims.quarantined...)
+	for scope, state := range d.shims.reconverging {
+		status.Reconverging = append(status.Reconverging, afclient.DaemonSessionShimReconvergence{
+			Scope: scope, Cause: state.cause, Rearms: state.rearms, AdvancedTo: state.advancedTo,
+		})
+	}
 	d.shims.mu.RUnlock()
+	sort.Slice(status.Reconverging, func(i, j int) bool {
+		return status.Reconverging[i].Scope < status.Reconverging[j].Scope
+	})
 	for i := range status.Quarantined {
 		// Detail is display-only and may contain a local socket/workarea path from
 		// a comparison failure. Status/doctor need the closed reason and exact

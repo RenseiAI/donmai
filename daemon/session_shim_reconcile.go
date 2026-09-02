@@ -179,23 +179,77 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 	// with no trigger left to re-arm it. Re-arming on that specific answer is
 	// what makes "serve a stale revision forever" unreachable; a control plane
 	// that merely refuses keeps the original bounded behaviour exactly.
-	for {
+	//
+	// Re-arming is unbounded ON PURPOSE — there is no number of attempts after
+	// which serving a superseded revision becomes correct — so it is COUNTED
+	// instead of bounded: the count escalates the log from warning to error
+	// after a derived threshold, and it is published on the diagnostics surface
+	// so an operator reading `status`/doctor sees a host stuck re-converging
+	// rather than a host that is merely quiet.
+	defer d.clearSessionShimReconvergence(scope)
+	for rearms := 0; ; rearms++ {
+		d.publishSessionShimReconvergence(scope, cause, rearms, "")
 		lastErr := d.runBoundedSessionShimReconciliationPass(scope, cause)
 		var advanced *SessionShimAdoptionRevisionAdvanced
 		if !errors.As(lastErr, &advanced) || d.sessionShimReconcileStopped() {
 			return
 		}
 		cause = sessionShimReconcileCauseRevisionAdvanced
-		slog.Warn("session shim: reconciliation spent its derived bound against a control plane that keeps reporting a further "+
-			"advanced adoption revision; re-arming rather than serving a superseded revision "+
-			"(shim-adoption-reconvergence-2026-09-01)",
-			"scope", scope, "advancedTo", advanced.Advanced)
+		d.publishSessionShimReconvergence(scope, cause, rearms+1, advanced.Advanced)
+		message := "session shim: reconciliation spent its derived bound against a control plane that keeps reporting a further " +
+			"advanced adoption revision; re-arming rather than serving a superseded revision " +
+			"(shim-adoption-reconvergence-2026-09-01)"
+		if rearms+1 >= sessionShimReconvergenceEscalateAfter {
+			// Past the derived threshold this is no longer a transient
+			// disagreement: something is wrong that this daemon cannot fix on
+			// its own, and a warning nobody pages on would hide it.
+			slog.Error(message, "scope", scope, "advancedTo", advanced.Advanced,
+				"rearms", rearms+1, "escalateAfter", sessionShimReconvergenceEscalateAfter)
+		} else {
+			slog.Warn(message, "scope", scope, "advancedTo", advanced.Advanced, "rearms", rearms+1)
+		}
 		// Paced by the same unit every other bound here is expressed in, so a
 		// control plane stuck reporting an advance cannot be spun against.
 		if !d.sleepSessionShimReconcileBackoff(d.sessionShimConfig().callbackTimeout()) {
 			return
 		}
 	}
+}
+
+// sessionShimReconvergenceEscalateAfter is how many re-arms make a
+// re-convergence an operator problem rather than a transient one. Derived, not
+// chosen: one re-arm per stage of the publication pipeline means the daemon has
+// spent a whole pipeline's worth of complete passes without converging.
+const sessionShimReconvergenceEscalateAfter = sessionShimAdoptionPublicationStages
+
+// publishSessionShimReconvergence records the current re-convergence condition
+// for one scope on the diagnostics surface.
+func (d *Daemon) publishSessionShimReconvergence(scope, cause string, rearms int, advancedTo string) {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if d.shims.reconverging == nil {
+		d.shims.reconverging = make(map[string]sessionShimReconvergenceState)
+	}
+	state := d.shims.reconverging[scope]
+	state.cause = cause
+	state.rearms = rearms
+	if advancedTo != "" {
+		state.advancedTo = advancedTo
+	}
+	d.shims.reconverging[scope] = state
+}
+
+func (d *Daemon) clearSessionShimReconvergence(scope string) {
+	d.shims.mu.Lock()
+	delete(d.shims.reconverging, scope)
+	d.shims.mu.Unlock()
+}
+
+// sessionShimReconvergenceState is one scope's live re-convergence condition.
+type sessionShimReconvergenceState struct {
+	cause      string
+	rearms     int
+	advancedTo string
 }
 
 // runBoundedSessionShimReconciliationPass is ONE derived-bound pass. It returns
