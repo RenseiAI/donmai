@@ -496,7 +496,7 @@ func (h *host) handleDegradedInbound(ctx context.Context, f attachwire.Frame, de
 			return nil
 		}
 		dedup.add(key)
-		if _, err := h.cfg.Session.WriteInput(in.Data); err != nil {
+		if _, err := writeStampedInput(h.cfg.Session, in.UserID, in.Data); err != nil {
 			return fmt.Errorf("attachclient: writing SSE input: %w", err)
 		}
 		return nil

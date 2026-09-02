@@ -20,13 +20,28 @@ const (
 	// V3 adds one exact full-host-frame observation without changing selected
 	// v1 or v2 behavior.
 	V3 uint32 = 3
+	// V4 adds AttributedInput — Input carrying the relay-stamped userId a
+	// SYSTEM-authority write is identified by (see ptyhost/systeminput.go) —
+	// without changing selected v1/v2/v3 Input (still the exact
+	// EncodeInput/DecodeInput byte-identical pair those versions have always
+	// carried) or any other selected v1/v2/v3 behavior. Mirrors the V3
+	// precedent exactly: a new capability is a new message type legal only at
+	// the new selected version, never a silent change to bytes an older
+	// selected version already carries (donmai-architecture
+	// ADR-2026-08-17-session-shim-adoption.md, rejected alternatives "Add a
+	// snapshot-request message to v1" and "Add HostFrame to selected v2").
+	// V4 is additive over V3's vocabulary too (HostFrame, SnapshotRequest/
+	// Result remain legal) so every existing selected>=V3 code path — which
+	// requires ControllerOptions.RequireFullHostFrames — keeps working
+	// unchanged at V4.
+	V4 uint32 = 4
 
 	// ProtocolMin / ProtocolMax is the range THIS build advertises. A protocol
 	// bump widens Max and only ever raises Min after an overlap window at least
 	// as long as the maximum supported session duration (ADR-2026-08-17 §D3) —
 	// raising Min is a separate migration decision, not a release detail.
 	ProtocolMin = V1
-	ProtocolMax = V3
+	ProtocolMax = V4
 )
 
 // Negotiate selects the highest version both peers speak.

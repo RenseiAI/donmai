@@ -13,13 +13,18 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-type inProcessV3Fixture struct {
+// inProcessV4Fixture is an in-process shim + controller pair adopted with
+// RequireFullHostFrames, which negotiates the highest tier this build
+// supports — shimwire.ProtocolMax, currently v4 (named for that, not for the
+// v3 opt-in flag itself: RequireFullHostFrames' V3 opt-in now yields [1,4],
+// a benign superset, per shimwire/version.go's V4 doc).
+type inProcessV4Fixture struct {
 	shim       *Shim
 	controller *Controller
 	result     AdoptionResult
 }
 
-func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
+func startInProcessV4Fixture(t *testing.T, ringBytes int) *inProcessV4Fixture {
 	t.Helper()
 	dir := shortTempDir(t)
 	registry, err := NewRegistry(dir)
@@ -42,7 +47,7 @@ func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
 		_ = shim.Terminate(context.Background())
 		t.Fatalf("Adopt = %+v, %v", result, err)
 	}
-	fixture := &inProcessV3Fixture{shim: shim, controller: result.Adopted[0], result: result}
+	fixture := &inProcessV4Fixture{shim: shim, controller: result.Adopted[0], result: result}
 	t.Cleanup(func() {
 		result.Close()
 		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
@@ -50,8 +55,12 @@ func startInProcessV3Fixture(t *testing.T, ringBytes int) *inProcessV3Fixture {
 		_ = shim.Terminate(ctx)
 		_ = shim.Close()
 	})
-	if fixture.controller.SelectedVersion() != shimwire.V3 || !fixture.controller.SupportsFullHostFrames() {
-		t.Fatalf("selected/capability = v%d/%v", fixture.controller.SelectedVersion(), fixture.controller.SupportsFullHostFrames())
+	// Both sides negotiate the highest tier THIS build supports — shimwire.ProtocolMax,
+	// not a version pinned by literal number — so this fixture keeps exercising
+	// the newest full-host-frame tier across a protocol bump (e.g. v3 -> v4)
+	// without an edit here, exactly as SupportsFullHostFrames (>= v3) intends.
+	if fixture.controller.SelectedVersion() != shimwire.ProtocolMax || !fixture.controller.SupportsFullHostFrames() {
+		t.Fatalf("selected/capability = v%d/%v, want v%d/true", fixture.controller.SelectedVersion(), fixture.controller.SupportsFullHostFrames(), shimwire.ProtocolMax)
 	}
 	return fixture
 }
@@ -63,7 +72,7 @@ type hostFrameCollection struct {
 }
 
 func TestSelectedV3CarriesEveryHostFrameExactlyOnce(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	direct, err := fixture.shim.Session().Subscribe(0)
 	if err != nil {
 		t.Fatal(err)
@@ -174,7 +183,7 @@ func TestSelectedV3CarriesEveryHostFrameExactlyOnce(t *testing.T) {
 }
 
 func TestSelectedV3LiveSnapshotIsOneRawEventPlusEmptyResult(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	const requestID = 77
 	result, err := fixture.controller.SnapshotWithID(context.Background(), requestID, shimwire.SnapshotEmit)
 	if err != nil {
@@ -372,8 +381,8 @@ func TestSelectedV3SlowControllerCannotBlockTerminalTombstone(t *testing.T) {
 	}
 	t.Cleanup(result.Close)
 	controller := result.Adopted[0]
-	if controller.SelectedVersion() != shimwire.V3 {
-		t.Fatalf("selected version = %d, want 3", controller.SelectedVersion())
+	if controller.SelectedVersion() != shimwire.ProtocolMax {
+		t.Fatalf("selected version = %d, want %d", controller.SelectedVersion(), shimwire.ProtocolMax)
 	}
 	if err := controller.WriteInput([]byte("flood\r")); err != nil {
 		t.Fatal(err)

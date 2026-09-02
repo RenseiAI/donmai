@@ -23,8 +23,8 @@ func TestControllerProtocolRangeRequiresExplicitFullFrameConsumption(t *testing.
 		t.Fatalf("zero-value controller range = [%d,%d], %v; want released [1,2]", protocolMin, protocolMax, err)
 	}
 	protocolMin, protocolMax, err = (ControllerOptions{RequireFullHostFrames: true}).protocolRange()
-	if err != nil || protocolMin != shimwire.V1 || protocolMax != shimwire.V3 {
-		t.Fatalf("full-frame controller range = [%d,%d], %v; want [1,3]", protocolMin, protocolMax, err)
+	if err != nil || protocolMin != shimwire.V1 || protocolMax != shimwire.ProtocolMax {
+		t.Fatalf("full-frame controller range = [%d,%d], %v; want [1,%d]", protocolMin, protocolMax, err, shimwire.ProtocolMax)
 	}
 	if _, _, err := (ControllerOptions{ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V3}).protocolRange(); err == nil {
 		t.Fatal("controller advertised max 3 without declaring full HostFrame consumption")

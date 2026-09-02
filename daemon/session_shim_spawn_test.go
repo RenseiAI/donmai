@@ -51,7 +51,12 @@ func TestOnAdoptionCanEmitFreshSnapshotBeforeControllerPublication(t *testing.T)
 	var stagedMu sync.Mutex
 	var retainedProxy *SessionShimSnapshotProxy
 	d.opts.SessionShim.OnAdoption = func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
-		if evidence.SnapshotProxy == nil || !evidence.CarrierCompatible || evidence.ProtocolVersion != shimwire.V3 {
+		// >= V3, not an exact match: both sides negotiate the highest tier
+		// THIS build supports (shimwire.ProtocolMax), so a later protocol bump
+		// (e.g. v3 -> v4) must not make this assertion stale — the snapshot
+		// capability under test here is a v3+ one (RequireFullHostFrames),
+		// unaffected by a newer, purely-additive version existing.
+		if evidence.SnapshotProxy == nil || !evidence.CarrierCompatible || evidence.ProtocolVersion < shimwire.V3 {
 			return SessionShimAdoptionReceipt{}, fmt.Errorf("snapshot capability missing during adoption: %+v", evidence)
 		}
 		retainedProxy = evidence.SnapshotProxy
@@ -884,17 +889,31 @@ func (r *shimEventRecorder) record(id sessionshim.Identity, ev sessionshim.Contr
 	key := id.Key()
 	switch ev.Kind {
 	case sessionshim.EventOutput:
-		b, ok := r.seen[key]
-		if !ok {
-			b = &strings.Builder{}
-			r.seen[key] = b
-		}
-		b.Write(ev.Data)
-		if ev.Seq > r.seq[key] {
-			r.seq[key] = ev.Seq
+		r.appendOutputLocked(key, ev.Data, ev.Seq)
+	case sessionshim.EventHostFrame:
+		// A controller negotiated selected v3+ (enableHostedFullHostFramesForTest)
+		// carries every host observation on this ONE rail instead of the legacy
+		// EventOutput kind — Data is still the decoded Output payload for a
+		// TypeOutput frame (see decodeHostFrameEvent in sessionshim/controller.go),
+		// so a test using output() need not care which selected version adopted.
+		if ev.FrameType == attachwire.TypeOutput {
+			r.appendOutputLocked(key, ev.Data, ev.Seq)
 		}
 	case sessionshim.EventGap:
 		r.gaps[key]++
+	}
+}
+
+// appendOutputLocked accumulates decoded output bytes for id. Callers hold r.mu.
+func (r *shimEventRecorder) appendOutputLocked(key string, data []byte, seq uint64) {
+	b, ok := r.seen[key]
+	if !ok {
+		b = &strings.Builder{}
+		r.seen[key] = b
+	}
+	b.Write(data)
+	if seq > r.seq[key] {
+		r.seq[key] = seq
 	}
 }
 
@@ -2830,9 +2849,13 @@ func TestStatusAndDoctorExposeRealSecretFreeSessionShimDiagnostics(t *testing.T)
 		t.Fatalf("status adopted = %+v, want one", diagnostic.Adopted)
 	}
 	adopted := diagnostic.Adopted[0]
+	// ProtocolMax is the SHIM's own advertised ceiling (shimwire.ProtocolMax by
+	// default) — it tracks a protocol bump automatically; ProtocolVersion is
+	// the NEGOTIATED selected version for this un-RequireFullHostFrames
+	// adoption path and stays pinned at 2 regardless.
 	if adopted.OrgID != id.OrgID || adopted.SessionID != id.SessionID || adopted.ShimID == "" ||
 		adopted.ProcessEpoch == 0 || adopted.ControllerGeneration == 0 || adopted.LastForwardedSeq != seq ||
-		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != 3 ||
+		adopted.HarnessPID <= 0 || adopted.HarnessStartedAt <= 0 || adopted.ProtocolMin != 1 || adopted.ProtocolMax != shimwire.ProtocolMax ||
 		adopted.ProtocolVersion != 2 || !adopted.AuthoritativeSnapshot || adopted.ControllerID != d.ControllerID() ||
 		adopted.Phase == "" || !adopted.ConsumesCapacity || diagnostic.ControllerID != d.ControllerID() {
 		t.Fatalf("status adopted correlation = %+v", adopted)

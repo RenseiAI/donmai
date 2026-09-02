@@ -128,3 +128,30 @@ func TestComposeTracker_OverlongLineStaysBoundedAndClears(t *testing.T) {
 		t.Fatal("submit must clear the gate even after the line exceeded the cap")
 	}
 }
+
+// TestComposeTracker_PasteOpen pins the accessor a SYSTEM-authority write
+// checks before landing its own bytes (ptyhost/systeminput.go): it must
+// report true exactly while a bracketed-paste region is open, independent of
+// pending()'s broader "unsubmitted text" question.
+func TestComposeTracker_PasteOpen(t *testing.T) {
+	tests := []struct {
+		name  string
+		input string
+		want  bool
+	}{
+		{name: "nothing typed", input: "", want: false},
+		{name: "ordinary typed text", input: "abc", want: false},
+		{name: "paste opened, not yet closed", input: "\x1b[200~hi", want: true},
+		{name: "paste opened and closed", input: "\x1b[200~hi\x1b[201~", want: false},
+		{name: "paste closed then more typed", input: "\x1b[200~hi\x1b[201~x", want: false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var c composeTracker
+			c.feed([]byte(tc.input))
+			if got := c.pasteOpen(); got != tc.want {
+				t.Errorf("pasteOpen() after %q = %v, want %v", tc.input, got, tc.want)
+			}
+		})
+	}
+}

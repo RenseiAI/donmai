@@ -50,6 +50,19 @@ type InputPayload struct {
 // unstamped Input (Stamped() == false).
 func (p InputPayload) Stamped() bool { return len(p.UserID) > 0 }
 
+// SystemNudgeUserID is the relay-stamped UserID a SYSTEM-authority Input frame
+// carries — today only the operator "nudge" rail that wakes an idle harness by
+// writing into its own PTY stdin path, never a real viewer connection. It is
+// shaped so it can never collide with a platform-issued end-user id.
+//
+// This is the ONE constant a host and the relay share for recognizing
+// system-authored input at write time (last-hop pacing of a bare CR/LF,
+// closing a dangling bracketed paste before the write — see ptyhost and
+// attachclient). It lives here, in the framing library both sides already
+// import, precisely so neither side has to hardcode its own copy of the
+// literal.
+const SystemNudgeUserID = "system:pty-nudge"
+
 // Encode serializes the Input payload (§5).
 func (p InputPayload) Encode() []byte {
 	buf := make([]byte, 0, 4*MaxVarintLen+len(p.UserID)+len(p.Data))

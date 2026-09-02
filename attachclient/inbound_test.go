@@ -40,6 +40,37 @@ func TestApplyInputStampedAndUnstamped(t *testing.T) {
 	}
 }
 
+// TestApplyInputRoutesUserIDThroughAttributedWriter proves applyInput carries
+// the relay-stamped userID all the way to a session that opts into the
+// systemAttributedWriter capability (session.go) — fakeSession implements it
+// — rather than silently dropping it on the ordinary WriteInput path.
+func TestApplyInputRoutesUserIDThroughAttributedWriter(t *testing.T) {
+	t.Parallel()
+	sess := newFakeSession(1)
+	h := newTestHost(sess, nil)
+
+	stamped := attachwire.InputPayload{InputSeq: 1, UserID: []byte(attachwire.SystemNudgeUserID), Data: []byte("\r")}
+	if _, err := h.applyInput(stamped.Encode()); err != nil {
+		t.Fatalf("applyInput: %v", err)
+	}
+
+	got := sess.AttributedInputs()
+	if len(got) != 1 {
+		t.Fatalf("AttributedInputs = %d entries, want 1", len(got))
+	}
+	if string(got[0].UserID) != attachwire.SystemNudgeUserID {
+		t.Errorf("userID routed = %q, want %q", got[0].UserID, attachwire.SystemNudgeUserID)
+	}
+	if string(got[0].Data) != "\r" {
+		t.Errorf("data routed = %q, want %q", got[0].Data, "\r")
+	}
+	// The compatibility record (Inputs()) still sees it — existing consumers
+	// of the plain-bytes view are unaffected by which path a caller used.
+	if inputs := sess.Inputs(); len(inputs) != 1 || string(inputs[0]) != "\r" {
+		t.Errorf("Inputs() = %q, want [\"\\r\"]", inputs)
+	}
+}
+
 func TestApplyResizeValidAndZeroDim(t *testing.T) {
 	t.Parallel()
 	sess := newFakeSession(1)

@@ -20,7 +20,7 @@ func (heartbeatReplyFailureWriter) Write([]byte) (int, error) {
 	return 0, errors.New("heartbeat reply write failed")
 }
 
-func emitAndPersistV3Ack(t *testing.T, fixture *inProcessV3Fixture, value string) uint64 {
+func emitAndPersistV3Ack(t *testing.T, fixture *inProcessV4Fixture, value string) uint64 {
 	t.Helper()
 	if err := fixture.controller.WriteInput([]byte(value + "\r")); err != nil {
 		t.Fatal(err)
@@ -43,7 +43,7 @@ func emitAndPersistV3Ack(t *testing.T, fixture *inProcessV3Fixture, value string
 }
 
 func TestSelectedV3ColdAdoptionDefaultsToShimPersistedAckPlusOne(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	acked := emitAndPersistV3Ack(t, fixture, "durable-cursor")
 	record, err := fixture.shim.registry.Get(fixture.shim.id)
 	if err != nil {
@@ -100,7 +100,7 @@ func TestSelectedV3ColdAdoptionDefaultsToShimPersistedAckPlusOne(t *testing.T) {
 }
 
 func TestSelectedV3ExternalCursorCannotRegressShimPersistedAck(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	acked := emitAndPersistV3Ack(t, fixture, "external-regression")
 	fixture.result.Close()
 	select {
@@ -121,7 +121,7 @@ func TestSelectedV3ExternalCursorCannotRegressShimPersistedAck(t *testing.T) {
 
 func TestSelectedV3HeartbeatRefusesRegressedAheadAndStaleCursors(t *testing.T) {
 	t.Run("regressed", func(t *testing.T) {
-		fixture := startInProcessV3Fixture(t, 0)
+		fixture := startInProcessV4Fixture(t, 0)
 		acked := emitAndPersistV3Ack(t, fixture, "regressed-ack")
 		if err := fixture.controller.Heartbeat(acked - 1); err == nil {
 			t.Fatal("regressed heartbeat was accepted")
@@ -133,7 +133,7 @@ func TestSelectedV3HeartbeatRefusesRegressedAheadAndStaleCursors(t *testing.T) {
 		}
 	})
 	t.Run("ahead", func(t *testing.T) {
-		fixture := startInProcessV3Fixture(t, 0)
+		fixture := startInProcessV4Fixture(t, 0)
 		_, lastSeq, err := fixture.shim.Session().Snapshot()
 		if err != nil {
 			t.Fatal(err)
@@ -147,7 +147,7 @@ func TestSelectedV3HeartbeatRefusesRegressedAheadAndStaleCursors(t *testing.T) {
 		}
 	})
 	t.Run("stale generation", func(t *testing.T) {
-		fixture := startInProcessV3Fixture(t, 0)
+		fixture := startInProcessV4Fixture(t, 0)
 		if err := fixture.shim.Session().EmitMarker("stale-generation-bound"); err != nil {
 			t.Fatal(err)
 		}
@@ -274,11 +274,11 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 	for _, tc := range []struct {
 		name       string
 		globalFail bool
-		mutate     func(*inProcessV3Fixture, Record, string)
+		mutate     func(*inProcessV4Fixture, Record, string)
 	}{
 		{
 			name: "file mode",
-			mutate: func(_ *inProcessV3Fixture, _ Record, path string) {
+			mutate: func(_ *inProcessV4Fixture, _ Record, path string) {
 				if err := os.Chmod(path, 0o400); err != nil {
 					t.Fatal(err)
 				}
@@ -286,7 +286,7 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 		},
 		{
 			name: "directory mode",
-			mutate: func(fixture *inProcessV3Fixture, _ Record, _ string) {
+			mutate: func(fixture *inProcessV4Fixture, _ Record, _ string) {
 				//nolint:gosec // Deliberately make the directory non-exact for the refusal control.
 				if err := os.Chmod(fixture.shim.registry.Dir(), 0o500); err != nil {
 					t.Fatal(err)
@@ -297,7 +297,7 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 		{
 			name:       "generation ahead of Hello",
 			globalFail: true,
-			mutate: func(fixture *inProcessV3Fixture, record Record, _ string) {
+			mutate: func(fixture *inProcessV4Fixture, record Record, _ string) {
 				if err := fixture.shim.registry.putDurableAck(durableAckCursor{
 					SchemaVersion: durableAckSchemaVersion,
 					OrgID:         record.OrgID, SessionID: record.SessionID, ShimID: record.ShimID, ProcessEpoch: record.ProcessEpoch,
@@ -309,7 +309,7 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			fixture := startInProcessV3Fixture(t, 0)
+			fixture := startInProcessV4Fixture(t, 0)
 			acked := emitAndPersistV3Ack(t, fixture, "refuse-"+tc.name)
 			record, err := fixture.shim.registry.Get(fixture.shim.id)
 			if err != nil {
@@ -341,7 +341,7 @@ func TestSelectedV3RefusesNonExactAckModesAndAheadGeneration(t *testing.T) {
 }
 
 func TestSelectedV3ProofResumeFreezesHelloTailUntilMandatorySnapshot(t *testing.T) {
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	acked := emitAndPersistV3Ack(t, fixture, "proof-floor")
 	if err := fixture.shim.Session().EmitMarker("unforwarded-one"); err != nil {
 		t.Fatal(err)
@@ -463,9 +463,9 @@ func TestSelectedV3CommittedAckReleasesBarrierWhenReplyWriteIsLost(t *testing.T)
 	}
 }
 
-func startProofBarrierHeartbeatFixture(t *testing.T, carrierEpoch string) (*inProcessV3Fixture, AdoptionResult, *Controller, uint64, uint64) {
+func startProofBarrierHeartbeatFixture(t *testing.T, carrierEpoch string) (*inProcessV4Fixture, AdoptionResult, *Controller, uint64, uint64) {
 	t.Helper()
-	fixture := startInProcessV3Fixture(t, 0)
+	fixture := startInProcessV4Fixture(t, 0)
 	acked := emitAndPersistV3Ack(t, fixture, "heartbeat-barrier-floor")
 	if err := fixture.shim.Session().EmitMarker("heartbeat-barrier-tail"); err != nil {
 		t.Fatal(err)

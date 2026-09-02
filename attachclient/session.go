@@ -72,6 +72,34 @@ type Subscription interface {
 	Close() error
 }
 
+// systemAttributedWriter is an OPTIONAL capability a Session may implement:
+// recognizing SYSTEM-authority (relay-stamped) input at the write boundary so
+// the host can apply last-hop guarantees a relay's own send-side pacing
+// cannot make once its frames have queued behind a stalled leg and reached
+// the host back-to-back (pacing a lone CR/LF, closing a dangling bracketed
+// paste — see donmai/ptyhost/systeminput.go).
+//
+// It is declared here, not added to Session itself, so every existing
+// composing binary's Session implementation keeps working completely
+// unchanged — this is an additive, structurally-typed extension point, not a
+// breaking interface change. *ptyhost.Session implements it via
+// WriteAttributedInput.
+type systemAttributedWriter interface {
+	WriteAttributedInput(userID, p []byte) (int, error)
+}
+
+// writeStampedInput writes a relay-stamped Input's already-verified bytes to
+// sess (§ 5), routing through the optional systemAttributedWriter capability
+// when the concrete session supports it. Every other session falls back to
+// the ordinary, unattributed WriteInput — identical behavior to before this
+// existed.
+func writeStampedInput(sess Session, userID, data []byte) (int, error) {
+	if aw, ok := sess.(systemAttributedWriter); ok {
+		return aw.WriteAttributedInput(userID, data)
+	}
+	return sess.WriteInput(data)
+}
+
 // TokenSource yields the current bearer JWT for the host leg. It is resolved
 // before each top-level carrier attempt and may also be called concurrently by
 // degraded-lane 401 recovery and the background WSS upgrade probe (§ 14/§ 15).

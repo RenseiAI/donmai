@@ -96,6 +96,17 @@ func (c *composeTracker) pending() bool {
 	return c.over || c.pste || len(c.line) > 0
 }
 
+// pasteOpen reports whether the tracked line editor is currently inside a
+// bracketed-paste region (CSI 200~ seen, CSI 201~ not yet seen).
+//
+// A SYSTEM-authority write that must land as ordinary keystrokes — never as
+// pasted text — checks this before writing, so it can close a region a
+// dropped 201~ frame left dangling instead of having its own bytes swallowed
+// as paste content (see ptyhost/systeminput.go).
+func (c *composeTracker) pasteOpen() bool {
+	return c.pste
+}
+
 // feed applies every byte the PTY actually accepted.
 func (c *composeTracker) feed(p []byte) {
 	for _, b := range p {

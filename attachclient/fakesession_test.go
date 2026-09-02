@@ -30,8 +30,9 @@ type fakeSession struct {
 	exitSeq     uint64
 	exitPayload attachwire.ExitPayload
 
-	inputs  [][]byte
-	resizes []attachwire.ResizePayload
+	inputs           [][]byte
+	attributedInputs []attributedInput
+	resizes          []attachwire.ResizePayload
 
 	// evictBelow simulates the real host's own bounded local ring having
 	// rotated past this seq (ptyhost's RingBytes eviction, § 13): a Subscribe
@@ -113,6 +114,23 @@ func (fs *fakeSession) Inputs() [][]byte {
 	return out
 }
 
+// attributedInput is one recorded WriteAttributedInput call.
+type attributedInput struct {
+	UserID []byte
+	Data   []byte
+}
+
+// AttributedInputs returns every WriteAttributedInput call fakeSession has
+// observed, in order — tests use it to prove a caller's userID reached the
+// session (systemAttributedWriter routing, § 5).
+func (fs *fakeSession) AttributedInputs() []attributedInput {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	out := make([]attributedInput, len(fs.attributedInputs))
+	copy(out, fs.attributedInputs)
+	return out
+}
+
 // SubscriberCount reports the number of live subscriptions — used by tests to
 // deterministically sequence a push after the client has subscribed.
 func (fs *fakeSession) SubscriberCount() int {
@@ -135,6 +153,23 @@ func (fs *fakeSession) WriteInput(p []byte) (int, error) {
 	fs.mu.Lock()
 	defer fs.mu.Unlock()
 	fs.inputs = append(fs.inputs, append([]byte(nil), p...))
+	return len(p), nil
+}
+
+// WriteAttributedInput implements the OPTIONAL systemAttributedWriter
+// capability (session.go) so tests can prove writeStampedInput actually
+// routes a stamped Input's userID through, instead of silently falling back
+// to WriteInput. It also appends to the same fs.inputs record WriteInput
+// does, so every existing Inputs()-based assertion is unaffected by which of
+// the two paths a given test exercises.
+func (fs *fakeSession) WriteAttributedInput(userID, p []byte) (int, error) {
+	fs.mu.Lock()
+	defer fs.mu.Unlock()
+	fs.inputs = append(fs.inputs, append([]byte(nil), p...))
+	fs.attributedInputs = append(fs.attributedInputs, attributedInput{
+		UserID: append([]byte(nil), userID...),
+		Data:   append([]byte(nil), p...),
+	})
 	return len(p), nil
 }
 
