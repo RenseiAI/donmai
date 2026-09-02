@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.72.17 — 2026-09-02
+
 ### Fixes
 
 - **A quarantined session whose tombstone is handed over now republishes the
@@ -23,7 +27,7 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   one immediate heartbeat (detached, so a republish inside the beat's own
   projection build cannot wait on the lane it is ringing), and the
   every-mutation-publishes guard now watches the withdrawal as well as the
-  upsert.
+  upsert. (#532)
 - **A live shim whose controller stream ended because the daemon's durable
   carrier refused is re-adopted before it is quarantined.** A carrier
   restart made every durable append fail, the daemon closed its controller,
@@ -63,14 +67,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   adoption pass to the identities it names; a daemon-level regression test
   now adopts two lineages, loses the carrier under only one, and pins that
   the other's controller and controller generation come out exactly as they
-  went in — nothing about it is ever dialled.
+  went in — nothing about it is ever dialled. (#532)
 - **`Daemon.ScheduleSessionShimReconciliation(scope, cause)` is exported** so
   a heartbeat lane the daemon does not own — a composition serving several
   scopes beats each on its own lane — can arm the bounded
   reconcile-and-republish pass on a revision-stale refusal for that scope,
   the same pass the daemon's own lane arms. At most one pass runs per scope
   at a time; a scope with no retained authority receipt is refused with a
-  warning.
+  warning. (#532)
 
 ---
 
