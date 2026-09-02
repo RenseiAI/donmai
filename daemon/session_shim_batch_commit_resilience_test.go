@@ -86,13 +86,12 @@ type batchCommitResult struct {
 // transient control-plane compare-and-swap conflict independent of
 // completeness.
 type sessionShimBatchCompletenessFake struct {
-	mu                 sync.Mutex
-	live               map[string]bool
-	refusalsRemaining  int
-	ambiguousRemaining int
-	ambiguousErr       error
-	revision           atomic.Int64
-	results            []batchCommitResult
+	mu                sync.Mutex
+	live              map[string]bool
+	refusalsRemaining int
+	scripted          []error
+	revision          atomic.Int64
+	results           []batchCommitResult
 }
 
 func (f *sessionShimBatchCompletenessFake) onAdoption(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
@@ -119,16 +118,17 @@ func (f *sessionShimBatchCompletenessFake) setRefusals(n int) {
 	f.mu.Unlock()
 }
 
-// setAmbiguous arms n leading onAdoptionBatch calls to APPLY the batch and
-// then lose the answer: err is returned to the daemon after the (fake) control
-// plane has already accepted the set, which is exactly the outcome-unknown
-// shape sessionShimCommitOutcomeUnknown classifies. Unlike setRefusals this is
-// not a refusal — the completeness bookkeeping still advances, so a later
-// batch is judged against a control plane that DID commit.
-func (f *sessionShimBatchCompletenessFake) setAmbiguous(n int, err error) {
+// setAnswers scripts the fake's next calls one at a time, which setRefusals
+// cannot express: a bounded count of one kind of answer cannot say "OUTCOME-
+// UNKNOWN, THEN a decoded refusal" — the exact sequence a re-drive of a lost
+// commit answer meets. A nil element means "answer this call honestly", i.e.
+// fall through to the completeness check; calls past the end of the script fall
+// through too. A scripted OUTCOME-UNKNOWN answer models a control plane that
+// APPLIED the batch and lost the reply, so it consumes a revision exactly as a
+// committed batch does.
+func (f *sessionShimBatchCompletenessFake) setAnswers(answers ...error) {
 	f.mu.Lock()
-	f.ambiguousRemaining = n
-	f.ambiguousErr = err
+	f.scripted = append([]error(nil), answers...)
 	f.mu.Unlock()
 }
 
@@ -145,24 +145,36 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 			AdoptionRevision:   fmt.Sprintf("revision-%d", f.revision.Load()),
 		}, nil
 	}
+	if len(f.scripted) > 0 {
+		answer := f.scripted[0]
+		f.scripted = f.scripted[1:]
+		if answer != nil {
+			if sessionShimCommitOutcomeUnknown(answer) {
+				f.revision.Add(1)
+			}
+			return record(answer)
+		}
+	}
 	if f.refusalsRemaining > 0 {
 		f.refusalsRemaining--
 		return record(batchCommitRefusal())
 	}
-	if f.ambiguousRemaining > 0 {
-		f.ambiguousRemaining--
-		// The revision the control plane would have stamped is consumed here
-		// exactly as a committed batch consumes one: the daemon's copy of the
-		// answer is what was lost, not the commit.
-		f.revision.Add(1)
-		return record(f.ambiguousErr)
-	}
-	present := make(map[string]bool, len(batch.Adopted)+len(batch.Quarantined))
+	present := make(map[string]bool, len(batch.Adopted)+len(batch.Quarantined)+len(batch.Tombstoned))
 	for _, outcome := range batch.Adopted {
 		present[outcome.Evidence.Identity.SessionID] = true
 	}
 	for _, q := range batch.Quarantined {
 		present[q.SessionID] = true
+	}
+	// A TOMBSTONED presentation both satisfies completeness and DISCHARGES the
+	// lineage: it is how every lineage legitimately leaves a host's projection,
+	// and a server that kept demanding it afterwards could never let one go. A
+	// fake that only counted Adopted and Quarantined refused the very batch
+	// that ends the obligation.
+	discharged := make([]string, 0, len(batch.Tombstoned))
+	for _, terminal := range batch.Tombstoned {
+		present[terminal.Identity.SessionID] = true
+		discharged = append(discharged, terminal.Identity.SessionID)
 	}
 	for sessionID := range f.live {
 		if !present[sessionID] {
@@ -170,6 +182,9 @@ func (f *sessionShimBatchCompletenessFake) onAdoptionBatch(_ context.Context, ba
 			// so a RED run's log line is directly comparable to the live one.
 			return record(fmt.Errorf("adoption_batch_live_lineage_omitted: sc-refused (session %s)", sessionID))
 		}
+	}
+	for _, sessionID := range discharged {
+		delete(f.live, sessionID)
 	}
 	return record(nil)
 }

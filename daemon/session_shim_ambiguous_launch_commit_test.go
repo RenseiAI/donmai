@@ -1,50 +1,53 @@
 package daemon
 
 // Provenance: shim-ambiguous-launch-lineage-2026-09-02 — grep a build for this
-// marker to prove it carries the launching lineage through an adoption-batch
-// commit whose outcome was never learned.
+// marker to prove it carries a definite disposition for a launch whose
+// adoption-batch commit outcome was never learned.
 //
 // THE STRAND THIS UNDOES
 //
 // Measured on an installed host: a freshly claimed interactive session got as
 // far as its per-session durable adoption (the control plane recorded the
-// lineage LIVE), and then its adoption-batch commit came back only as
-// "context deadline exceeded (Client.Timeout exceeded while awaiting
-// headers)" — the request went out, the answer never came back. The daemon
-// correctly refused to treat that ambiguity as terminal and armed
-// commit-outcome reconciliation. What it did NOT do was record the launching
-// lineage anywhere: the launch's rollback restored the last-committed
-// projection, which by construction does not contain a session that never
-// finished being adopted, and nothing else ever put it back.
+// lineage LIVE) and then its adoption-batch commit came back only as a client
+// deadline — the request went out, the answer never came back. The daemon
+// correctly refused to treat that ambiguity as terminal, armed the
+// asynchronous commit-outcome reconciliation, closed the controller and
+// returned a launch failure. Three things were then true at once:
 //
-// From that moment every batch this daemon could compose for the scope OMITS
-// a lineage the control plane holds live, so the server's completeness rule
-// (adoption_batch_live_lineage_omitted) refuses it — including every
-// reconciliation republish, which is the one mechanism that could have
-// resolved the ambiguity. The bounded reconciliation therefore exhausted
-// against a rule it could not satisfy, no later launch could commit either,
-// and the session's row sat in its pre-running state for hours with no
-// process on the host and nothing left to release it.
+//   - The launching lineage was recorded NOWHERE. The rollback restores the
+//     last-committed projection, which by construction cannot hold a session
+//     whose adoption never finished, and trackLaunchedShim had not run. Every
+//     batch the daemon could compose from then on omitted a lineage the control
+//     plane held live, so the completeness rule refused it —
+//     INCLUDING every reconciliation republish, the one mechanism that could
+//     have resolved the ambiguity, and including the reconcile that consumes
+//     terminal tombstones, which iterates exactly the quarantine set.
+//   - The harness kept running. A controller Close explicitly does not stop the
+//     session; the shim keeps its harness and starts its own orphan clock. So
+//     the spawner's "aborted" report was false for as long as that clock ran.
+//   - The session's recovery obligation was never discharged, so the row could
+//     not terminalize.
 //
-// The DEFINITE-refusal path already had exactly this fix
-// (restoreSessionShimReadinessAfterExhaustedBatchCommit records the lineage
-// into d.shims.quarantined BEFORE sending anything, so every later batch
-// carries it). The AMBIGUOUS path did not, and these tests pin it closed on
-// the same terms: the reconciliation republish must be a batch the server's
-// own completeness rule accepts, and an unrelated later launch must still be
-// able to commit.
+// These tests pin the replacement contract: the ambiguity is driven to a
+// DEFINITE outcome inside the launch, and the launch returns either a live
+// adoption or a failure whose statement is true — lineage published, harness
+// stopped, obligation discharged through the shim's own terminal proof.
 
 import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
+	"time"
+
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // ambiguousCommitAnswers enumerates the three shapes
-// sessionShimCommitOutcomeUnknown classifies as OUTCOME-UNKNOWN, so the fix is
-// pinned against the classifier rather than against one error value. The live
-// incident produced the third.
+// sessionShimCommitOutcomeUnknown classifies as OUTCOME-UNKNOWN, so the
+// behaviour is pinned against the classifier rather than one error value. The
+// live incident produced the third.
 func ambiguousCommitAnswers() []struct {
 	name string
 	err  error
@@ -60,25 +63,65 @@ func ambiguousCommitAnswers() []struct {
 	}
 }
 
-// launchWithAmbiguousBatchCommit drives one launch whose adoption-batch commit
-// answer is lost, after a healthy baseline launch has established the host's
-// prior truth. It returns the fixture, the completeness-enforcing fake, and
-// the two specs.
-func launchWithAmbiguousBatchCommit(t *testing.T, hostID string, ambiguous error) (
-	*shimSpawnFixture, *sessionShimBatchCompletenessFake, SessionSpec, SessionSpec,
-) {
+// terminalEvidenceRecorder is the composer's seat for the obligation-side
+// call. Discharging a recovery obligation IS this callback firing for the
+// exact incarnation: nothing else the daemon does releases the platform's
+// restart fence.
+type terminalEvidenceRecorder struct {
+	mu   sync.Mutex
+	seen []SessionShimTerminalEvidence
+}
+
+func (r *terminalEvidenceRecorder) record(_ context.Context, evidence SessionShimTerminalEvidence) error {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	r.seen = append(r.seen, evidence)
+	return nil
+}
+
+// forSession returns every terminal report made for one session id.
+func (r *terminalEvidenceRecorder) forSession(sessionID string) []SessionShimTerminalEvidence {
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	var out []SessionShimTerminalEvidence
+	for _, evidence := range r.seen {
+		if evidence.Identity.SessionID == sessionID {
+			out = append(out, evidence)
+		}
+	}
+	return out
+}
+
+// ambiguousLaunchFixture is one hosted daemon with a completeness-enforcing
+// control plane, a recorded terminal-evidence seat, and one already-adopted
+// session standing in for the host's prior truth.
+type ambiguousLaunchFixture struct {
+	*shimSpawnFixture
+	fake     *sessionShimBatchCompletenessFake
+	terminal *terminalEvidenceRecorder
+	baseline SessionSpec
+}
+
+func newAmbiguousLaunchFixture(t *testing.T, hostID string) *ambiguousLaunchFixture {
 	t.Helper()
 	f := newShimSpawnFixture(t)
 	d := f.daemon
 	d.opts.SessionShim.HostID = hostID
-	// Hosted/attested so the retained-authority bookkeeping the republish
-	// depends on is real rather than a no-op.
+	// The release path's wait for terminal proof is sized from the callback
+	// timeout, which otherwise defaults to the 60s launch timeout here and
+	// would put a two-minute bound on a test. Shrinking the ONE unit keeps
+	// every bound derived from it test-sized without inventing a second number.
+	d.opts.SessionShim.CallbackTimeout = 200 * time.Millisecond
+	// Hosted/attested so the retained-authority bookkeeping a committed batch
+	// advances is real rather than a no-op.
 	enableHostedFullHostFramesForTest(t, d, f.orgID)
 
 	fake := &sessionShimBatchCompletenessFake{}
+	terminal := &terminalEvidenceRecorder{}
 	d.opts.SessionShim.OnAdoption = fake.onAdoption
 	d.opts.SessionShim.PrepareAdoptionBatch = fake.prepareBatch
 	d.opts.SessionShim.OnAdoptionBatch = fake.onAdoptionBatch
+	d.opts.SessionShim.OnTerminalEvidence = terminal.record
 
 	baseline := f.interactiveSpec("already-adopted")
 	if _, err := d.spawner.AcceptWork(baseline); err != nil {
@@ -87,92 +130,202 @@ func launchWithAmbiguousBatchCommit(t *testing.T, hostID string, ambiguous error
 	if _, err := d.adoptedShimEntry(f.orgID, baseline.SessionID); err != nil {
 		t.Fatalf("baseline session was not adopted: %v", err)
 	}
-
-	// Exactly one lost answer: the resilient retry loop never retries an
-	// ambiguous outcome (re-sending a guessed revision would race the one
-	// mechanism that can resolve it), so this is the whole injection.
-	fake.setAmbiguous(1, ambiguous)
-	lost := f.interactiveSpec("commit-answer-lost")
-	if _, err := d.spawner.AcceptWork(lost); err == nil {
-		t.Fatal("AcceptWork succeeded despite an adoption-batch commit whose outcome was never learned")
-	}
-	if _, err := d.adoptedShimEntry(f.orgID, lost.SessionID); err == nil {
-		t.Fatal("the session whose commit outcome was never learned was tracked as adopted anyway")
-	}
-	return f, fake, baseline, lost
+	return &ambiguousLaunchFixture{shimSpawnFixture: f, fake: fake, terminal: terminal, baseline: baseline}
 }
 
-// TestAmbiguousLaunchCommitResolvesToACommittedSnapshot pins the bounded
-// resolution path end to end, through both of its doors.
+// TestAmbiguousLaunchCommitReDrivesToACommittedAdoption is the "the control
+// plane DID commit" branch, and the reason the re-drive is worth doing at all:
+// the overwhelmingly common cause of a lost answer is a transient flake that is
+// already over by the time the daemon can ask again. Re-composing the COMPLETE
+// projection and re-reading the expected revision through PrepareAdoptionBatch
+// resolves it in one round trip, and the launch continues as a normal adoption
+// — live session, adopted entry, no quarantine, no release.
 //
-// Door one is the launch's own immediate republish: it re-reads the control
-// plane's expected revision rather than resending the one that was in flight,
-// so a flake that is already over resolves in a single round trip. Door two is
-// the reconciliation pass's republish, which is the ONLY channel that can
-// resolve the ambiguity when door one also fails. Both compose from the same
-// projection, so both must produce a batch the server's completeness rule
-// accepts.
-//
-// RED before the fix: the launching lineage is recorded nowhere, every batch
-// composed from that moment on omits a lineage the (fake) control plane marked
-// live during the launch's own per-session adoption, and both doors are refused
-// adoption_batch_live_lineage_omitted — the bounded reconciliation exhausting
-// against a rule no retry could satisfy.
-func TestAmbiguousLaunchCommitResolvesToACommittedSnapshot(t *testing.T) {
+// RED before the fix: the launch failed outright on the lost answer.
+func TestAmbiguousLaunchCommitReDrivesToACommittedAdoption(t *testing.T) {
 	for _, tc := range ambiguousCommitAnswers() {
 		t.Run(tc.name, func(t *testing.T) {
-			f, fake, baseline, lost := launchWithAmbiguousBatchCommit(t, "host-ambiguous-reconcilable", tc.err)
+			f := newAmbiguousLaunchFixture(t, "host-ambiguous-redrive")
 			d := f.daemon
 
-			assertResolvedSnapshot := func(door string, batch SessionShimAdoptionBatch) {
-				t.Helper()
-				if !batchAdoptsSession(batch, baseline.SessionID) {
-					t.Fatalf("%s dropped the already-adopted baseline session: %+v", door, batch)
-				}
-				quarantine, quarantined := batchQuarantinesSession(batch, lost.SessionID)
-				if !quarantined {
-					t.Fatalf("%s omits the lineage whose commit outcome was never learned — the exact omission the "+
-						"server's adoption_batch_live_lineage_omitted rule refuses: %+v", door, batch)
-				}
-				if !quarantine.ConsumesCapacity {
-					t.Fatalf("%s presents the ambiguous lineage without consuming capacity, so the host would advertise "+
-						"a seat it may still be holding: %+v", door, quarantine)
-				}
-				if batchAdoptsSession(batch, lost.SessionID) {
-					t.Fatalf("%s claims durable Adopted status for a lineage whose commit was never confirmed: %+v", door, batch)
-				}
+			// One lost answer, then an honest control plane.
+			f.fake.setAnswers(tc.err)
+			launched := f.interactiveSpec("commit-answer-lost")
+			if _, err := d.spawner.AcceptWork(launched); err != nil {
+				t.Fatalf("AcceptWork failed even though the control plane answered the very next commit: %v", err)
+			}
+			if _, err := d.adoptedShimEntry(f.orgID, launched.SessionID); err != nil {
+				t.Fatalf("the re-driven session was not adopted, so the launch did not continue the normal adoption: %v", err)
 			}
 
-			// Door one ran inside the failed launch: its committed batch is
-			// the most recent one the fake accepted.
-			assertResolvedSnapshot("the launch's immediate republish", fake.lastCommittedBatch(t))
-
-			// Door two: one reconciliation attempt is a credential refresh
-			// followed by exactly this republish.
-			ctx, cancel := context.WithTimeout(context.Background(), d.sessionShimConfig().adoptionPublicationTimeout())
-			defer cancel()
-			if err := d.republishSessionShimProjection(ctx, f.orgID); err != nil {
-				t.Fatalf("the reconciliation republish — the only path that can resolve an ambiguous commit when the "+
-					"immediate one fails — was refused: %v", err)
+			committed := f.fake.lastCommittedBatch(t)
+			if !batchAdoptsSession(committed, launched.SessionID) {
+				t.Fatalf("the re-driven batch does not adopt the session: %+v", committed)
 			}
-			assertResolvedSnapshot("the reconciliation republish", fake.lastCommittedBatch(t))
+			if !batchAdoptsSession(committed, f.baseline.SessionID) {
+				t.Fatalf("the re-driven batch dropped the already-adopted baseline session: %+v", committed)
+			}
+			if _, quarantined := batchQuarantinesSession(committed, launched.SessionID); quarantined {
+				t.Fatalf("a session that committed on the re-drive was published quarantined anyway: %+v", committed)
+			}
+			// A committed adoption must not be reported terminal: the session
+			// is running.
+			if reports := f.terminal.forSession(launched.SessionID); len(reports) != 0 {
+				t.Fatalf("terminal evidence was reported for a session that adopted successfully: %+v", reports)
+			}
 		})
 	}
 }
 
-// TestAmbiguousLaunchCommitDoesNotStrandTheHost is the operator-visible half:
-// once the flake is over, the very next healthy launch must commit. A host
-// that cannot commit ANY batch after one lost answer is a host parked forever
-// — which is what the incident measured, six and a half hours of it.
+// releaseCase is one way the re-drive can end in a definite "not adopted".
+type releaseCase struct {
+	name    string
+	answers func(ambiguous error) []error
+}
+
+// releaseCases are the two definite non-adoptions. Both must release
+// identically: the difference between them is what the control plane said, not
+// what this host owes.
+func releaseCases() []releaseCase {
+	return []releaseCase{
+		{
+			name: "decoded refusal on the re-drive",
+			answers: func(ambiguous error) []error {
+				// The lost answer, then a decoded refusal: the control plane
+				// did not commit, and said so. The re-drive stops there.
+				return []error{ambiguous, batchCommitRefusal()}
+			},
+		},
+		{
+			name: "never resolved inside the derived bound",
+			answers: func(ambiguous error) []error {
+				// The lost answer and then nothing but lost answers, for the
+				// whole derived bound. The daemon never learns the outcome and
+				// must not report an adoption it cannot prove.
+				answers := make([]error, 0, sessionShimAdoptionPublicationStages+1)
+				for i := 0; i <= sessionShimAdoptionPublicationStages; i++ {
+					answers = append(answers, ambiguous)
+				}
+				return answers
+			},
+		},
+	}
+}
+
+// TestAmbiguousLaunchCommitReleasesTheHarnessAndDischargesTheObligation is the
+// "the control plane did NOT commit" branch, and the whole point of resolving
+// inside the launch. The spawner turns this function's error into an aborted
+// spawn, so every part of that statement has to be true BEFORE the error
+// returns:
 //
-// RED before the fix: the third launch's batch still omits the ambiguous
-// lineage, the completeness rule refuses it, the definite-refusal retry loop
-// exhausts, and AcceptWork fails.
+//   - the session is not adopted;
+//   - the lineage is PUBLISHED, not omitted, because the control plane holds it
+//     live from the launch's own per-session adoption;
+//   - the harness is STOPPED rather than left running to its orphan deadline;
+//   - the recovery obligation is DISCHARGED, through the shim's own
+//     group-reaped tombstone reported for the exact incarnation — never a
+//     manufactured one, and never an absent attestation standing in for a reap
+//     proof.
+//
+// RED before the fix: the launch returned immediately, the lineage was recorded
+// nowhere, the harness ran on, and no terminal evidence was ever reported.
+func TestAmbiguousLaunchCommitReleasesTheHarnessAndDischargesTheObligation(t *testing.T) {
+	for _, release := range releaseCases() {
+		for _, tc := range ambiguousCommitAnswers() {
+			t.Run(release.name+"/"+tc.name, func(t *testing.T) {
+				f := newAmbiguousLaunchFixture(t, "host-ambiguous-release")
+				d := f.daemon
+
+				f.fake.setAnswers(release.answers(tc.err)...)
+				released := f.interactiveSpec("commit-answer-lost")
+				if _, err := d.spawner.AcceptWork(released); err == nil {
+					t.Fatal("AcceptWork succeeded even though the adoption batch was never committed")
+				}
+				if _, err := d.adoptedShimEntry(f.orgID, released.SessionID); err == nil {
+					t.Fatal("a session whose batch never committed was tracked as adopted")
+				}
+
+				// THE OBLIGATION-SIDE CALL. Without it the platform's restart
+				// fence is held forever and the row can never terminalize, no
+				// matter what this host does locally.
+				reports := f.terminal.forSession(released.SessionID)
+				if len(reports) == 0 {
+					t.Fatal("no terminal evidence was reported for the released lineage — its recovery obligation is " +
+						"never discharged and the session can never terminalize")
+				}
+				report := reports[len(reports)-1]
+				if report.Absent != nil {
+					t.Fatalf("the release reported an ABSENT attestation instead of a reap proof; an attestation is "+
+						"strictly weaker than a tombstone and must never stand in for one: %+v", report.Absent)
+				}
+				if !report.Tombstone.GroupReaped {
+					t.Fatalf("the released lineage's terminal evidence does not prove its harness group was reaped: %+v",
+						report.Tombstone)
+				}
+				if report.Tombstone.ShimID != report.ShimID || report.Tombstone.ProcessEpoch != report.ProcessEpoch {
+					t.Fatalf("terminal evidence does not name the exact incarnation it reports: %+v", report)
+				}
+
+				// The published projection must agree with the daemon's own
+				// state at every step, or the beat is refused and the host is
+				// demoted. After the discharge the lineage is gone from both.
+				final := f.fake.lastCommittedBatch(t)
+				if !batchAdoptsSession(final, f.baseline.SessionID) {
+					t.Fatalf("the release dropped the already-adopted baseline session: %+v", final)
+				}
+				if batchAdoptsSession(final, released.SessionID) {
+					t.Fatalf("the release published a released lineage as adopted: %+v", final)
+				}
+				beat := d.QuarantinedSessions()
+				if len(beat) != len(final.Quarantined) {
+					t.Fatalf("the beat's quarantine set (%d) disagrees with the last published batch (%d) — the platform "+
+						"demotes a host whose beat disagrees", len(beat), len(final.Quarantined))
+				}
+
+				// And the harness itself is gone: a group-reaped tombstone for
+				// the exact incarnation is the proof, and the registry no
+				// longer holds a live record for it.
+				assertShimRecordWithdrawn(t, d, report.Identity, report.ShimID, report.ProcessEpoch)
+			})
+		}
+	}
+}
+
+// assertShimRecordWithdrawn proves the released incarnation is no longer a live
+// shim this host has to account for.
+func assertShimRecordWithdrawn(t *testing.T, d *Daemon, id sessionshim.Identity, shimID string, epoch uint64) {
+	t.Helper()
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	present, err := registry.HasIncarnation(id, shimID, epoch)
+	if err != nil {
+		t.Fatalf("HasIncarnation: %v", err)
+	}
+	if present {
+		t.Fatalf("the released shim %s/%d still has a live registry record, so its harness was never stopped", shimID, epoch)
+	}
+}
+
+// TestAmbiguousLaunchCommitDoesNotStrandTheHost is the operator-visible half:
+// a released launch must cost the host nothing afterwards. The next healthy
+// launch has to commit.
+//
+// RED before the fix: the released lineage was recorded nowhere, so every later
+// batch omitted a lineage the control plane held live and was refused —
+// a healthy, unrelated session stranded by a lost answer from a launch ago.
 func TestAmbiguousLaunchCommitDoesNotStrandTheHost(t *testing.T) {
 	for _, tc := range ambiguousCommitAnswers() {
 		t.Run(tc.name, func(t *testing.T) {
-			f, fake, baseline, lost := launchWithAmbiguousBatchCommit(t, "host-ambiguous-no-strand", tc.err)
+			f := newAmbiguousLaunchFixture(t, "host-ambiguous-no-strand")
 			d := f.daemon
+
+			f.fake.setAnswers(tc.err, batchCommitRefusal())
+			released := f.interactiveSpec("commit-answer-lost")
+			if _, err := d.spawner.AcceptWork(released); err == nil {
+				t.Fatal("AcceptWork succeeded even though the adoption batch was never committed")
+			}
 
 			healthy := f.interactiveSpec("healthy-after-ambiguity")
 			if _, err := d.spawner.AcceptWork(healthy); err != nil {
@@ -181,26 +334,21 @@ func TestAmbiguousLaunchCommitDoesNotStrandTheHost(t *testing.T) {
 			if _, err := d.adoptedShimEntry(f.orgID, healthy.SessionID); err != nil {
 				t.Fatalf("the healthy session was not adopted: %v", err)
 			}
-
-			committed := fake.lastCommittedBatch(t)
-			if !batchAdoptsSession(committed, baseline.SessionID) || !batchAdoptsSession(committed, healthy.SessionID) {
+			committed := f.fake.lastCommittedBatch(t)
+			if !batchAdoptsSession(committed, f.baseline.SessionID) || !batchAdoptsSession(committed, healthy.SessionID) {
 				t.Fatalf("the healthy launch's batch = %+v, want both the baseline and the new session adopted", committed)
 			}
-			if _, quarantined := batchQuarantinesSession(committed, lost.SessionID); !quarantined {
-				t.Fatalf("the healthy launch's batch dropped the still-live ambiguous lineage instead of continuing to "+
-					"present it: %+v", committed)
-			}
-			if _, err := d.adoptedShimEntry(f.orgID, baseline.SessionID); err != nil {
-				t.Fatalf("the baseline session was collaterally lost after a sibling launch's ambiguous commit: %v", err)
+			if _, err := d.adoptedShimEntry(f.orgID, f.baseline.SessionID); err != nil {
+				t.Fatalf("the baseline session was collaterally lost after a sibling launch's released commit: %v", err)
 			}
 		})
 	}
 }
 
 // TestAmbiguousCommitClassificationIsUnchangedForDefiniteRefusals guards the
-// blast radius of the fix: a DECODED refusal must keep refusal semantics —
-// no ambiguity quarantine, the existing exhaustion restore instead — so the
-// new recording cannot be reached by widening the classifier.
+// blast radius: a DECODED refusal must keep refusal semantics and its existing
+// retry-then-restore path, so none of the re-drive or release behaviour above
+// can be reached by widening the classifier.
 func TestAmbiguousCommitClassificationIsUnchangedForDefiniteRefusals(t *testing.T) {
 	for _, tc := range []struct {
 		name    string

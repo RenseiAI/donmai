@@ -406,25 +406,22 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// Published daemon state uses the stable lookup APIs instead.
 	evidence.SnapshotProxy = nil
 	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatchResilient(pubCtx, evidence, receipt)
-	if err != nil {
-		if errors.Is(err, errSessionShimAmbiguousBatchCommit) {
-			// OUTCOME-UNKNOWN: the rollback below still restores the
-			// last-committed projection — the beat announces nothing new —
-			// and reconciliation resolves whether the control plane committed
-			// this batch, republishing the complete set at the revision the
-			// refresher answers. The scheduled pass serializes behind this
-			// launch's own publication barrier.
-			//
-			// Recording the lineage FIRST is what makes that republish
-			// composable at all: the rollback restores a projection that by
-			// construction does not contain a session whose adoption never
-			// finished, while the control plane already holds it live from
-			// this launch's own completeSessionShimAdoption. See
-			// recordAmbiguousLaunchBatchQuarantine.
-			if !d.recordAmbiguousLaunchBatchQuarantine(pubCtx, evidence, err) {
-				d.scheduleSessionShimReconciliation(id.OrgID, sessionShimReconcileCauseAmbiguousLaunch)
-			}
+	if err != nil && errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+		// OUTCOME-UNKNOWN. This function's contract is a DEFINITE disposition —
+		// a live adopted handle, or an error the spawner turns into
+		// OnSpawnAborted — so the ambiguity is driven to a definite outcome
+		// HERE, before returning, rather than handed to an asynchronous pass
+		// while an un-adopted harness keeps running.
+		batchReceipt, err = d.redriveAmbiguousLaunchSessionShimBatchCommit(pubCtx, evidence, receipt, err)
+		if err != nil {
+			// Definitely NOT committed (or never resolvable inside the bound).
+			// Release: record and publish the lineage, stop the harness, and
+			// consume whatever terminal proof the stop produces, so the error
+			// this returns is a true statement about the host.
+			d.releaseAmbiguousLaunchSessionShim(pubCtx, ctrl, evidence, err)
 		}
+	}
+	if err != nil {
 		d.failPendingSessionShimActivations()
 		gate.finish(false)
 		_ = ctrl.Close()
@@ -783,6 +780,177 @@ const ambiguousLaunchBatchQuarantineDetail = "adoption batch commit outcome was 
 // the per-session adoption record still stands and the republish is the first
 // batch that presents it at all. Neither outcome is guessed here: the
 // republish carries only server-issued revisions.
+// redriveAmbiguousLaunchSessionShimBatchCommit turns an outcome-unknown batch
+// commit into a DEFINITE one, synchronously, before the launch returns.
+//
+// # WHY IT HAS TO BE SYNCHRONOUS
+//
+// By this point sessionshim.Start has already exec'd the harness. The daemon's
+// only teardown on the failure path is a controller Close, which explicitly
+// does NOT stop the session — the shim keeps its harness and starts its bounded
+// orphan clock. So an ambiguity handed to an asynchronous pass leaves a real
+// harness running, un-adopted and unreachable (the launch never reached
+// trackLaunchedShim, so no adopted-set pass can find it), until that clock
+// expires — while the spawner has already reported the launch aborted. The
+// abort has to be TRUE when it is reported, and that means resolving here.
+//
+// # WHY RE-SENDING IS SAFE HERE, WHERE THE RESILIENT RETRY REFUSES TO
+//
+// completeLaunchedSessionShimAdoptionBatchResilient never retries an ambiguous
+// outcome, because a retry inside ITS loop would resend the expected revision
+// that just lost — a guess. This is a different operation: each attempt
+// re-runs completeLaunchedSessionShimAdoptionBatch from scratch, which
+// re-composes the COMPLETE current projection and re-reads the control plane's
+// expected revision through PrepareAdoptionBatch. Nothing is guessed, the batch
+// digest is the same idempotency key, and a control plane that already
+// committed answers the prepare with its own advance — which
+// adoptAdvancedSessionShimAdoptionRevision recognises and adopts, resolving the
+// ambiguity as COMMITTED without a second commit.
+//
+// The bound is derived, not chosen: attempts = the publication pipeline's depth
+// (the same quotient the reconciliation loop uses), backoff = callbackTimeout,
+// whole-loop budget = adoptionPublicationTimeout, detached from the caller's
+// own budget because the deadline that just expired may BE the caller's.
+//
+// Outcomes, each with its own log line:
+//
+//   - nil error: the control plane holds this session adopted at a revision
+//     this daemon now has. The caller continues the normal adoption.
+//   - a DEFINITE refusal on any attempt: the control plane did not commit, and
+//     said so. Returned immediately — retrying a decoded answer is not this
+//     function's job.
+//   - the bound exhausted while still ambiguous: never resolved. Returned as a
+//     failure, because a launch that cannot prove it was adopted must not be
+//     reported as adopted, and the caller's release makes that true.
+func (d *Daemon) redriveAmbiguousLaunchSessionShimBatchCommit(
+	ctx context.Context,
+	evidence SessionShimAdoptionEvidence,
+	receipt SessionShimAdoptionReceipt,
+	causeErr error,
+) (SessionShimAdoptionBatchReceipt, error) {
+	cfg := d.sessionShimConfig()
+	redriveCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), cfg.adoptionPublicationTimeout())
+	defer cancel()
+	attempts := sessionShimAdoptionPublicationStages
+	backoff := sessionShimAdoptionBatchCommitBaseBackoff
+	backoffCap := cfg.callbackTimeout()
+	lastErr := causeErr
+	for attempt := 1; attempt <= attempts; attempt++ {
+		if attempt > 1 {
+			if !sleepSessionShimAdoptionBatchBackoff(redriveCtx, backoff) {
+				break
+			}
+			backoff *= 2
+			if backoff > backoffCap {
+				backoff = backoffCap
+			}
+		}
+		batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(redriveCtx, evidence, receipt)
+		if err == nil {
+			slog.Info("session shim: outcome-unknown adoption batch commit resolved as COMMITTED; continuing the adoption "+
+				"(shim-ambiguous-launch-lineage-2026-09-02)",
+				"session", evidence.Identity.String(), "attempt", attempt,
+				"revision", batchReceipt.AdoptionRevision, "commitError", causeErr)
+			return batchReceipt, nil
+		}
+		lastErr = err
+		if !sessionShimCommitOutcomeUnknown(err) {
+			slog.Warn("session shim: outcome-unknown adoption batch commit resolved as NOT COMMITTED by a decoded refusal; "+
+				"releasing this launch (shim-ambiguous-launch-lineage-2026-09-02)",
+				"session", evidence.Identity.String(), "attempt", attempt, "commitError", causeErr, "refusal", err)
+			return SessionShimAdoptionBatchReceipt{}, err
+		}
+		slog.Warn("session shim: outcome-unknown adoption batch commit is still unresolved after a re-drive attempt",
+			"session", evidence.Identity.String(), "attempt", attempt, "attempts", attempts, "error", err)
+	}
+	slog.Warn("session shim: outcome-unknown adoption batch commit was never resolved inside its derived bound; releasing this "+
+		"launch rather than reporting an adoption this daemon cannot prove (shim-ambiguous-launch-lineage-2026-09-02)",
+		"session", evidence.Identity.String(), "attempts", attempts, "commitError", causeErr, "lastError", lastErr)
+	return SessionShimAdoptionBatchReceipt{}, lastErr
+}
+
+// releaseAmbiguousLaunchSessionShim makes the launch failure a TRUE statement
+// about this host before the error is returned and the spawner reports the
+// spawn aborted.
+//
+// Three things have to be true for that report to be honest, and none of them
+// happens on its own:
+//
+//  1. The lineage is presented in this daemon's projection and published.
+//     Recording alone is not enough — an unpublished quarantine change makes
+//     every later beat disagree with the last committed batch — and omission is
+//     not an option either, because the control plane holds this lineage live
+//     from the launch's own per-session adoption.
+//  2. The harness is STOPPED. A controller Close leaves it running to its
+//     orphan deadline; the generation-fenced Stop is the verb that asks the
+//     shim to terminate and reap its harness group. Without it "the spawn was
+//     aborted" is false for as long as that clock runs.
+//  3. Whatever terminal proof the stop produces is CONSUMED, bounded. This is
+//     what discharges the recovery obligation the per-session adoption
+//     registered: reconcileQuarantinedTombstones reports the shim's own
+//     group-reaped tombstone for the exact incarnation, drops the quarantine,
+//     and the lineage leaves through the same door every other quarantined
+//     lineage leaves by. Nothing is manufactured here — a tombstone this daemon
+//     did not observe would forge the reap proof a claim release depends on —
+//     so a stop that produces no proof inside the bound leaves the lineage
+//     quarantined and says so, and the obligation is discharged later by the
+//     same reconcile once the proof lands.
+//
+// The stop reason is the closed registry's policy value: this is the daemon's
+// own policy decision that a session it cannot durably adopt must not run here.
+// Neither "operator" nor "host_shutdown" is true, and the registry has no
+// closer word.
+func (d *Daemon) releaseAmbiguousLaunchSessionShim(
+	ctx context.Context,
+	ctrl *sessionshim.Controller,
+	evidence SessionShimAdoptionEvidence,
+	causeErr error,
+) {
+	if !d.recordAmbiguousLaunchBatchQuarantine(ctx, evidence, causeErr) {
+		d.scheduleSessionShimReconciliation(evidence.Identity.OrgID, sessionShimReconcileCauseAmbiguousLaunch)
+	}
+	if ctrl != nil {
+		if stopErr := ctrl.Stop(shimwire.StopPolicy); stopErr != nil {
+			slog.Warn("session shim: could not ask the un-adopted shim to stop after an unresolved commit; it holds its "+
+				"harness until its own orphan deadline",
+				"session", evidence.Identity.String(), "error", stopErr)
+			return
+		}
+	}
+	incarnation := shimIncarnation{
+		identity: evidence.Identity, shimID: evidence.ShimID, processEpoch: evidence.ProcessEpoch,
+	}
+	// The same bound and the same pacing the acceptance clear uses to wait out
+	// this exact handoff: the shim publishes its tombstone before it withdraws
+	// its record, and the reconcile that consumes it costs two callback round
+	// trips.
+	deadline := time.Now().Add(acceptanceClearDeadlineFor(d.sessionShimConfig().callbackTimeout()))
+	for {
+		d.reconcileQuarantinedTombstones()
+		quarantined, tombstoned := d.sessionShimLineageDisposition(incarnation)
+		if !quarantined && tombstoned {
+			// The quarantine set changed again, so the projection has to be
+			// republished from HERE: the reconcile deliberately does not
+			// publish (that would put a durable commit inside every occupancy
+			// and heartbeat surface), and a beat whose quarantine set
+			// disagrees with the last committed batch demotes the host.
+			d.publishSessionShimProjection(ctx, evidence.Identity.OrgID)
+			slog.Info("session shim: released the un-adopted launch and discharged its recovery obligation through the shim's "+
+				"own terminal tombstone (shim-ambiguous-launch-lineage-2026-09-02)",
+				"session", evidence.Identity.String(), "commitError", causeErr)
+			return
+		}
+		if !time.Now().Before(deadline) {
+			slog.Warn("session shim: released the un-adopted launch, but no terminal proof landed inside the bound; the "+
+				"lineage stays quarantined in the published projection and the next reconcile discharges it when its "+
+				"tombstone appears",
+				"session", evidence.Identity.String(), "commitError", causeErr)
+			return
+		}
+		time.Sleep(acceptanceClearPollInterval)
+	}
+}
+
 // THE PUBLISH IS PART OF THE RECORDING, NOT AN OPTIMIZATION
 //
 // The platform compares every beat's quarantine set against the snapshot the
