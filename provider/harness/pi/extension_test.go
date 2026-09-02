@@ -110,6 +110,52 @@ func TestProviderPinEnv(t *testing.T) {
 	}
 }
 
+// TestProviderPinEnv_StripsBuiltinProviderPrefix is the regression proof at
+// the injected-provider registration layer: when the resolved
+// model names one of pi's built-in providers, the env this function exports
+// for the extension's `pi.registerProvider("donmai", …)` call carries the
+// BARE model id — never the "<provider>/" prefix, which is pi's own --model
+// selector syntax, not a wire model code the upstream API understands. This
+// applies REGARDLESS of whether modelPinArgs ultimately selects the
+// injected provider or routes natively — the injected provider stays
+// registered either way, and must never register a code the upstream API
+// will reject with a 400 (the exact z.ai "modelCode: does not exist" this
+// bug report observed).
+func TestProviderPinEnv_StripsBuiltinProviderPrefix(t *testing.T) {
+	t.Parallel()
+	ep := &agent.EndpointBinding{
+		Company:  agent.CompanyOpenAI,
+		Model:    "zai/glm-5.3",
+		BaseURL:  "https://api.z.ai/api/coding/paas/v4",
+		Protocol: agent.ProtoOpenAIChat,
+		Host:     agent.HostDirect,
+		Env:      map[string]string{"OPENAI_API_KEY": "sk-super-secret-canary"},
+	}
+	env := providerPinEnv(agent.Spec{Endpoint: ep, Model: "zai/glm-5.3"})
+	if !containsEnv(env, piModelEnvVar, "glm-5.3") {
+		t.Errorf("pin env model must be bare (\"glm-5.3\"), not the prefixed pin: %v", env)
+	}
+	for _, e := range env {
+		if strings.Contains(e, "zai/glm-5.3") {
+			t.Errorf("pin env still carries the prefixed model string %q: %v", "zai/glm-5.3", env)
+		}
+	}
+}
+
+// TestProviderPinEnv_UnprefixedModelUnchanged is requirement 3's proof at
+// this same layer: a model with no recognized builtin-provider prefix (an
+// unprefixed pin, or an aggregator's own "vendor/model"-shaped catalog slug)
+// rides providerPinEnv completely unchanged, byte-for-byte.
+func TestProviderPinEnv_UnprefixedModelUnchanged(t *testing.T) {
+	t.Parallel()
+	for _, model := range []string{"claude-opus-4-8", "gpt-5.4", "agg-vendor/claude-3-haiku"} {
+		env := providerPinEnv(agent.Spec{Model: model})
+		if !containsEnv(env, piModelEnvVar, model) {
+			t.Errorf("providerPinEnv(%q) changed the model id; env: %v", model, env)
+		}
+	}
+}
+
 // TestProviderPinEnvContextWindow pins the context-window half of the pin:
 // a positive ProviderConfig["contextWindow"] (whatever numeric type the JSON
 // decode produced) rides piContextWindowEnvVar to the child extension, and a

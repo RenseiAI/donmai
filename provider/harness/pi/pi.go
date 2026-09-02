@@ -41,6 +41,20 @@ type Provider struct {
 	// [MinVersion, VerifiedAgainst] (DEC-2: label, don't block). Each session
 	// emits one SystemEvent{unverified_harness_version} when true.
 	unverified bool
+	// realBinary is true ONLY when New() resolved binary from PATH/PiBin (the
+	// non-skipProcess branch). resolveCatalogProbe (catalog_preflight.go)
+	// gates the real `pi --list-models` exec on this rather than on
+	// opts.skipProcess directly, because several fixtures in this package
+	// construct a *Provider by literal (&Provider{binary: fakeScriptPath},
+	// e.g. newFakeInteractivePiProvider in interactive_test.go) rather than
+	// through New() — such a Provider has opts.skipProcess == false (the
+	// zero value) but binary is a fake/test script, not a real pi. Gating on
+	// opts.skipProcess alone would shell out to that fake script for
+	// --list-models on any test whose model happens to carry a recognized
+	// builtin-provider prefix; the zero value of realBinary keeps every
+	// bare-struct-literal Provider probe-free by construction, exactly like
+	// skipProcess:true.
+	realBinary bool
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -58,6 +72,17 @@ type Options struct {
 
 	// VersionProbeTimeout caps the construction-time version probe.
 	VersionProbeTimeout time.Duration
+
+	// CatalogProbe overrides the launch-time catalog preflight's
+	// `--list-models` query (requirement 2; catalog_preflight.go). Tests
+	// inject a scripted catalog here; nil means the real pi binary answers
+	// (or, under skipProcess with no override, the preflight is skipped —
+	// resolveCatalogProbe).
+	CatalogProbe catalogProbeFunc
+
+	// CatalogProbeTimeout caps the launch-time catalog preflight. Defaults
+	// to DefaultCatalogProbeTimeout.
+	CatalogProbeTimeout time.Duration
 
 	// Test seams. skipProcess wires stdin/stdout overrides instead of execing
 	// a real child; used by the pipe-stub tests that replay pi RPC shapes.
@@ -95,6 +120,7 @@ func New(opts Options) (*Provider, error) {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
 	p.binary = full
+	p.realBinary = true
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.VersionProbeTimeout)
 	defer cancel()
@@ -121,7 +147,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	// claude interactive-endpoint fix had to RETROFIT (sibling of #323, whose
 	// interactive spawn forked off before applyEndpoint ran) rather than
 	// repeating it: pi's interactive path consumes the binding from the start.
-	spec, err := p.prepare(spec)
+	spec, err := p.prepare(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
@@ -139,7 +165,7 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // split, so launch and spawnInteractive both receive one admitted,
 // endpoint-projected spec — the interactive lane never sees a raw, unprojected
 // binding.
-func (p *Provider) prepare(spec agent.Spec) (agent.Spec, error) {
+func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, error) {
 	var err error
 	spec, err = agent.PrepareHarness(spec, p.Manifest())
 	if err != nil {
@@ -148,6 +174,18 @@ func (p *Provider) prepare(spec agent.Spec) (agent.Spec, error) {
 	spec, err = applyEndpoint(spec)
 	if err != nil {
 		return spec, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	// Requirement 2: fail fast, before any child spawns, when the resolved
+	// pin routes NATIVELY through one of pi's built-in providers (see
+	// nativeProviderPin) but that exact (provider, model) pair is not in
+	// pi's own catalog — instead of finding out on the first turn's 400.
+	if provider, bareModel, useNative := nativeProviderPin(spec.Model, spec.Endpoint); useNative {
+		if probe := p.resolveCatalogProbe(); probe != nil {
+			credEnvVar := builtinProviderCredentialEnv[provider]
+			if err := p.preflightCatalogCheck(ctx, probe, provider, bareModel, credEnvVar, spec.Env[credEnvVar]); err != nil {
+				return spec, err
+			}
+		}
 	}
 	return spec, nil
 }
@@ -187,7 +225,7 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if sessionID == "" {
 		return nil, agent.ErrSessionNotFound
 	}
-	spec, err := p.prepare(spec)
+	spec, err := p.prepare(ctx, spec)
 	if err != nil {
 		return nil, err
 	}
