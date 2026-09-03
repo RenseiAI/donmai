@@ -246,3 +246,100 @@ func TestFreshDialCarrierAheadWithControllerGapStartsAtTheSignedBoundary(t *test
 		t.Fatal(err)
 	}
 }
+
+// TestActiveResumeKeepsItsOwnCursorAgainstALowerSignedBoundary pins the other
+// half of the seed rule: only a FRESH leg is seeded from the signed carrier
+// boundary. A resume carries its own exact cursor, and for an already-active
+// carrier that cursor is legitimately ABOVE the signed boundary — the carrier
+// activated past it and the resume's job is to pick up where the leg was, not
+// where the proof was minted.
+//
+// Seeding a resume from the boundary would regress a live leg's cursor and make
+// it re-send frames the carrier already holds.
+func TestActiveResumeKeepsItsOwnCursorAgainstALowerSignedBoundary(t *testing.T) {
+	// The fixture token signs carrier_boundary 4 while the leg resumes at 12.
+	const resumeAck, nextSeq = 12, 13
+	serverErr := make(chan error, 1)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		conn, err := websocket.Accept(w, r, &websocket.AcceptOptions{Subprotocols: []string{attachwirev2.SubprotocolVersion}})
+		if err != nil {
+			serverErr <- err
+			return
+		}
+		defer conn.CloseNow() //nolint:errcheck
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		if _, _, err := readV2TestFrame(ctx, conn); err != nil {
+			serverErr <- fmt.Errorf("read subscribe: %w", err)
+			return
+		}
+		active, buildErr := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: resumeAck,
+		})
+		if buildErr != nil {
+			serverErr <- buildErr
+			return
+		}
+		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+			serverErr <- err
+			return
+		}
+		frame, _, err := readV2TestFrame(ctx, conn)
+		if err != nil {
+			serverErr <- fmt.Errorf("read the next durable frame: %w", err)
+			return
+		}
+		if frame.Seq != nextSeq {
+			serverErr <- fmt.Errorf("next durable frame = seq %d, want %d", frame.Seq, nextSeq)
+			return
+		}
+		ack, buildErr := attachwirev2.BuildControlFrame(attachwirev2.HostAck{
+			PTYEpoch: 3, CarrierEpoch: 9, AckSeq: nextSeq,
+		})
+		if buildErr != nil {
+			serverErr <- buildErr
+			return
+		}
+		serverErr <- conn.Write(ctx, websocket.MessageBinary, ack.Encode())
+	}))
+	defer server.Close()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL:   v2BoundaryURL(server),
+		TokenSource: func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		ResumeDisposition: &V2ResumeDisposition{
+			ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff,
+			State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: resumeAck,
+		},
+	})
+	if err != nil {
+		t.Fatalf("active resume dial: %v", err)
+	}
+	defer candidate.Close() //nolint:errcheck
+
+	candidate.mu.Lock()
+	ackSeq, highestSent := candidate.ackSeq, candidate.highestSent
+	candidate.mu.Unlock()
+	if ackSeq != resumeAck || highestSent != resumeAck {
+		t.Fatalf("active resume seeded at ack %d / highestSent %d, want both at its own cursor %d — not the signed boundary",
+			ackSeq, highestSent, resumeAck)
+	}
+
+	if got, activateErr := candidate.Activate(ctx); activateErr != nil || got != resumeAck {
+		t.Fatalf("active resume activation = %d, %v", got, activateErr)
+	}
+	// The wire proof of the seed: the leg's next contiguous frame is 13. A leg
+	// regressed to the signed boundary would refuse it as non-contiguous and
+	// expect 5 — re-sending frames the carrier already holds.
+	next := attachwire.Frame{
+		Type: attachwire.TypeOutput, Seq: nextSeq, Payload: []byte("after-resume"),
+	}
+	if err := candidate.SendRawFrameDurable(ctx, next.Encode()); err != nil {
+		t.Fatalf("durable send at the resumed cursor's successor: %v", err)
+	}
+	if err := <-serverErr; err != nil {
+		t.Fatal(err)
+	}
+}

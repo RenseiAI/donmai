@@ -18,6 +18,30 @@ package daemon
 // exactly that: the proof this dial holds has been overtaken, the repair is a
 // new proof at a strictly greater carrier epoch, and the harness on the other
 // side of it was alive the entire time.
+//
+// WHAT THIS RELIES ON THE COMPOSING AUTHORITY TO DO
+//
+// A re-prepare supersedes a reservation that is ADMITTED and pre-active. This
+// side has no verb to burn it: abandonment is control-authenticated and belongs
+// to the authority that minted it. So the contract this code depends on, stated
+// plainly rather than assumed:
+//
+//   - a re-prepare carries SessionShimPrepareCauseCarrierCursorDrift and its
+//     attempt number, which is this daemon declaring that an earlier
+//     reservation for this lineage is outstanding and stale;
+//   - the authority abandons that reservation before reserving above the
+//     all-time carrier-epoch floor. Under the recovery ADR's §D4 disposition
+//     rule, changed bytes under the same idempotency key are a re-prepare, not
+//     a replay, and every attempt that created or inherited an uncommitted
+//     reservation ends with one durable disposition;
+//   - an authority that will NOT supersede answers a typed conflict
+//     (ErrSessionShimAdoptionPrepareConflict). That is a refusal, not a
+//     failure: this pass spends none of its remaining budget on it and
+//     quarantines with the conflict as the detail.
+//
+// A daemon that asked without saying why would leave the authority unable to
+// tell a re-prepare from a first ask, which is how an admitted candidate
+// becomes an undisposed one.
 
 import (
 	"context"
@@ -104,17 +128,33 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 		// Re-ask with what is true NOW, not with the frozen copy: the controller
 		// generation this daemon committed, and the highest resume floor either
 		// side has proved. Both may only rise, so a re-prepare can never hand the
-		// authority a cursor below the one it already admitted.
+		// authority a cursor below the one it already admitted. The cause travels
+		// with it — see SessionShimPrepareCauseCarrierCursorDrift for what the
+		// authority is being told to do about its previous reservation.
 		next := input
 		next.CurrentControllerGeneration = ctrl.Generation()
 		if resumeFrom := ctrl.ResumeFrom(); resumeFrom > next.LocalResumeFrom {
 			next.LocalResumeFrom = resumeFrom
 			next.LastForwardedSeq = resumeFrom - 1
 		}
-		prepared, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, next)
+		prepared, prepareErr := d.prepareSessionShimAdoptionForCause(
+			ctx, hostID, next, SessionShimPrepareCauseCarrierCursorDrift, attempt,
+		)
 		if prepareErr != nil {
+			if errors.Is(prepareErr, ErrSessionShimAdoptionPrepareConflict) {
+				// A refusal, not a failure. The authority holds state for this
+				// lineage it will not supersede, so the remaining budget cannot
+				// change the answer and spending it would only mint more asks
+				// against the same conflict.
+				return evidence, preparation, SessionShimAdoptionReceipt{},
+					fmt.Errorf("%w; re-prepare %d refused: %v", err, attempt, prepareErr)
+			}
 			return evidence, preparation, SessionShimAdoptionReceipt{},
 				fmt.Errorf("%w; re-prepare %d failed: %v", err, attempt, prepareErr)
+		}
+		if bindErr := bindReprepatedAdoptionToController(ctrl, next, prepared); bindErr != nil {
+			return evidence, preparation, SessionShimAdoptionReceipt{},
+				fmt.Errorf("%w; re-prepare %d unusable: %v", err, attempt, bindErr)
 		}
 		refreshed, evidenceErr := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared, hostID)
 		if evidenceErr != nil {
@@ -133,6 +173,50 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 		err = fmt.Errorf("%w; unresolved after %d bounded re-prepared dials", err, sessionShimDriftRedialAttempts)
 	}
 	return evidence, preparation, receipt, err
+}
+
+// bindReprepatedAdoptionToController checks that a re-prepared answer can
+// actually be honoured by the controller that is already adopted.
+//
+// The first preparation is answered INSIDE the handshake, where its generation
+// and cursor still have a Welcome to travel on and are validated on the way.
+// A re-prepare has neither: the handshake is over, the shim has committed a
+// generation, and the resume cursor it is replaying from is fixed. A second
+// answer that resolves different values cannot be applied — and must not be
+// silently dropped either, because the receipt would then bind the SECOND
+// proof to the FIRST cursor and generation, and a legitimately raised floor
+// would be discarded with none of its own checks ever running.
+//
+// So the answer runs the same validation the handshake runs — via the one
+// exported resolver both paths call — and is then required to agree with what
+// the controller holds. A disagreement is a refusal the caller quarantines,
+// naming both values.
+func bindReprepatedAdoptionToController(
+	ctrl *sessionshim.Controller,
+	asked sessionshim.AdoptionPreparation,
+	prepared SessionShimAdoptionPreparationResult,
+) error {
+	hello := ctrl.Hello()
+	resolved, err := sessionshim.ResolvePreparedAdoption(prepared.PreparedAdoption, sessionshim.PreparedAdoptionBounds{
+		LocalResumeFrom: asked.LocalResumeFrom,
+		HelloLastSeq:    hello.LastSeq,
+	})
+	if err != nil {
+		return err
+	}
+	if resolved.ControllerGeneration != 0 && resolved.ControllerGeneration != ctrl.Generation() {
+		return fmt.Errorf(
+			"re-prepared controller generation %d does not match the committed generation %d",
+			resolved.ControllerGeneration, ctrl.Generation(),
+		)
+	}
+	if resolved.ResumeProvided && resolved.ResumeFrom != ctrl.ResumeFrom() {
+		return fmt.Errorf(
+			"re-prepared resume cursor %d does not match the adopted cursor %d",
+			resolved.ResumeFrom, ctrl.ResumeFrom(),
+		)
+	}
+	return nil
 }
 
 // waitSessionShimDriftBackoff spends the doubling delay before attempt n

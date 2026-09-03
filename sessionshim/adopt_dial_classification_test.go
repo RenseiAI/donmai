@@ -25,6 +25,7 @@ import (
 	"io/fs"
 	"net"
 	"os"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"syscall"
@@ -89,6 +90,100 @@ func proxyConnection(client net.Conn, target string) {
 	_, _ = io.Copy(client, upstream)
 }
 
+// postHelloStallProxy also fronts a real shim socket, but its stalled
+// connection forwards the shim's Hello to the controller and then forwards
+// nothing back. Preparation runs INSIDE the handshake, after Hello is
+// authenticated and before the Welcome write, so this is the shape that reaches
+// preparation and then times out — the shape the measured-live failure had.
+type postHelloStallProxy struct {
+	connections atomic.Int32
+
+	mu       sync.Mutex
+	previous func()
+}
+
+func (p *postHelloStallProxy) releasePrevious() {
+	p.mu.Lock()
+	release := p.previous
+	p.previous = nil
+	p.mu.Unlock()
+	if release != nil {
+		release()
+	}
+}
+
+func (p *postHelloStallProxy) retainPrevious(release func()) {
+	p.mu.Lock()
+	p.previous = release
+	p.mu.Unlock()
+}
+
+func startPostHelloStallProxy(t *testing.T, path, target string, stallThrough int32) *postHelloStallProxy {
+	t.Helper()
+	listener, err := net.Listen("unix", path)
+	if err != nil {
+		t.Fatalf("listen on the interposing socket: %v", err)
+	}
+	proxy := &postHelloStallProxy{}
+	t.Cleanup(func() {
+		_ = listener.Close()
+		proxy.releasePrevious()
+	})
+	go func() {
+		for {
+			client, acceptErr := listener.Accept()
+			if acceptErr != nil {
+				return
+			}
+			// Release the stalled pair before the next handshake begins, so the
+			// shim is never asked to hold two controller connections at once.
+			proxy.releasePrevious()
+			if proxy.connections.Add(1) > stallThrough {
+				go proxyConnection(client, target)
+				continue
+			}
+			upstream, dialErr := net.Dial("unix", target)
+			if dialErr != nil {
+				_ = client.Close()
+				continue
+			}
+			// Shim to controller only: Hello arrives and preparation runs; the
+			// controller's Welcome is never delivered, so its read of Adopted
+			// hits the dial deadline on an established socket.
+			go func() { _, _ = io.Copy(client, upstream) }()
+			proxy.retainPrevious(func() {
+				_ = client.Close()
+				_ = upstream.Close()
+			})
+		}
+	}()
+	return proxy
+}
+
+// repointRecordAtSocket republishes id's record against an interposing socket,
+// leaving every other field the live shim published exactly as it is.
+func repointRecordAtSocket(t *testing.T, reg *Registry, id Identity, socketPath string) {
+	t.Helper()
+	record, err := reg.Get(id)
+	if err != nil {
+		t.Fatalf("read the published record: %v", err)
+	}
+	info, err := os.Stat(socketPath)
+	if err != nil {
+		t.Fatalf("stat the interposing socket: %v", err)
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("socket device/inode identity is unavailable on this platform")
+	}
+	record.SocketPath = socketPath
+	//nolint:gosec,unconvert // Dev/Ino widths are platform-dependent; both are non-negative identifiers
+	record.SocketDevice, record.SocketInode = uint64(stat.Dev), uint64(stat.Ino)
+	if err := reg.Put(record); err != nil {
+		t.Fatalf("republish the record against the interposing socket: %v", err)
+	}
+}
+
 // TestAdoptionRetriesAStalledShimInsteadOfCallingItUnreachable is the RED/GREEN
 // target. A live shim's record is repointed at a socket that accepts and then
 // stalls the first connection for 20s — far past the dial timeout — and answers
@@ -117,20 +212,7 @@ func TestAdoptionRetriesAStalledShimInsteadOfCallingItUnreachable(t *testing.T) 
 	// is how long the first connection takes to answer.
 	proxyPath := dir + "/stall.sock"
 	proxy := startStallingProxy(t, proxyPath, record.SocketPath, 20*time.Second)
-	info, err := os.Stat(proxyPath)
-	if err != nil {
-		t.Fatalf("stat the interposing socket: %v", err)
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		t.Skip("socket device/inode identity is unavailable on this platform")
-	}
-	record.SocketPath = proxyPath
-	//nolint:gosec,unconvert // Dev/Ino widths are platform-dependent; both are non-negative identifiers
-	record.SocketDevice, record.SocketInode = uint64(stat.Dev), uint64(stat.Ino)
-	if err := reg.Put(record); err != nil {
-		t.Fatalf("republish the record against the interposing socket: %v", err)
-	}
+	repointRecordAtSocket(t, reg, id, proxyPath)
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -203,6 +285,32 @@ func TestAdoptionFailureClassificationSeparatesAbsentFromBusy(t *testing.T) {
 			wantTransient: true,
 		},
 		{
+			// The discriminating case. A net.OpError HAS a Timeout method, so a
+			// predicate that only asks whether the method exists calls this
+			// transient. Its errno says otherwise: the peer reset an established
+			// connection. Neither absent nor merely busy — classify it by what
+			// it says, not by what interface it happens to satisfy.
+			name: "a reset established connection is neither absent nor busy",
+			err: fmt.Errorf("sessionshim: read hello: %w", &net.OpError{
+				Op: "read", Net: "unix",
+				Addr: &net.UnixAddr{Name: "/tmp/x.sock", Net: "unix"},
+				Err:  syscall.ECONNRESET,
+			}),
+			wantReason: QuarantineAdoptionFailed,
+		},
+		{
+			// Same shape, same reasoning, the other way: a refused connect also
+			// arrives inside a net.OpError, and its errno is what makes it the
+			// endpoint answering rather than a slow one.
+			name: "a refused connect inside an OpError is still the endpoint answering",
+			err: fmt.Errorf("sessionshim: dial adoption socket: %w", &net.OpError{
+				Op: "dial", Net: "unix",
+				Addr: &net.UnixAddr{Name: "/tmp/x.sock", Net: "unix"},
+				Err:  syscall.ECONNREFUSED,
+			}),
+			wantReason: QuarantineSocketUnreachable,
+		},
+		{
 			name:       "a refusal is neither, and is never retried",
 			err:        fmt.Errorf("%w: shim refused at hello", ErrAdoptionRefused),
 			wantReason: QuarantineIdentityMismatch,
@@ -228,5 +336,209 @@ func TestAdoptionFailureClassificationSeparatesAbsentFromBusy(t *testing.T) {
 	}
 	if !errors.Is(established, os.ErrDeadlineExceeded) {
 		t.Fatal("the fixture's established-socket timeout does not unwrap to a deadline")
+	}
+}
+
+// TestTransientDialRetryDoesNotReprepareTheCandidate pins B4's rule: a retry
+// re-dials the ALREADY-PREPARED candidate.
+//
+// Preparation runs inside the handshake, after Hello authentication and before
+// the Welcome write, so the failure shape this retry exists for happens AFTER
+// preparation has already succeeded. Asking again would mint a second
+// control-plane reservation for a lineage whose first one is admitted and
+// undisposed — on a path with no drift to repair and no abandonment verb to
+// call. The first answer must be retained and replayed.
+func TestTransientDialRetryDoesNotReprepareTheCandidate(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := Identity{OrgID: "org-reprepare", SessionID: "sess-prepared-once"}
+	startInProcessShim(t, reg, dir, id, 1)
+
+	record, err := reg.Get(id)
+	if err != nil {
+		t.Fatalf("read the published record: %v", err)
+	}
+	proxyPath := dir + "/hello.sock"
+	proxy := startPostHelloStallProxy(t, proxyPath, record.SocketPath, 1)
+	repointRecordAtSocket(t, reg, id, proxyPath)
+
+	var (
+		prepareMu sync.Mutex
+		prepares  int
+	)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	result, err := Adopt(ctx, AdoptOptions{
+		Registry:     reg,
+		ControllerID: "controller-reprepare",
+		Filter:       func(candidate Identity) bool { return candidate == id },
+		DialTimeout:  300 * time.Millisecond,
+		Prepare: func(context.Context, AdoptionPreparation) (PreparedAdoption, error) {
+			prepareMu.Lock()
+			defer prepareMu.Unlock()
+			prepares++
+			return PreparedAdoption{Correlation: []byte("candidate-1")}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	defer result.Close()
+
+	if len(result.Quarantined) != 0 {
+		q := result.Quarantined[0]
+		t.Fatalf("a shim that stalled after Hello was quarantined %q: %s", q.Reason, q.Detail)
+	}
+	if len(result.Adopted) != 1 {
+		t.Fatalf("adopted = %d controller(s), want the retried lineage", len(result.Adopted))
+	}
+	if got := proxy.connections.Load(); got < 2 {
+		t.Fatalf("adoption made %d connection(s), want a retry after the post-Hello stall", got)
+	}
+	prepareMu.Lock()
+	defer prepareMu.Unlock()
+	if prepares != 1 {
+		t.Fatalf("preparations = %d across %d dials, want exactly 1 — a retry must not mint a second reservation",
+			prepares, proxy.connections.Load())
+	}
+}
+
+// TestAdoptionRetryDialTimeoutIsCapped pins B3's bound. Adopt walks records in
+// one sequential loop, so a hung record's cost is paid by every lineage behind
+// it. The first attempt keeps the caller's timeout — a first dial is not
+// evidence of anything yet — and every retry is capped, so the worst case for
+// one record is bounded at first + 2s + 2s rather than three full timeouts.
+func TestAdoptionRetryDialTimeoutIsCapped(t *testing.T) {
+	t.Parallel()
+	const defaultDialTimeout = 5 * time.Second
+	tests := []struct {
+		name       string
+		configured time.Duration
+		attempt    int
+		want       time.Duration
+	}{
+		{name: "first attempt keeps the default", configured: 0, attempt: 1, want: 0},
+		{name: "first attempt keeps a configured value", configured: 9 * time.Second, attempt: 1, want: 9 * time.Second},
+		{name: "retry caps the default", configured: 0, attempt: 2, want: adoptionRetryDialTimeout},
+		{name: "retry caps a longer configured value", configured: 9 * time.Second, attempt: 3, want: adoptionRetryDialTimeout},
+		{name: "retry never raises a shorter one", configured: 250 * time.Millisecond, attempt: 2, want: 250 * time.Millisecond},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := adoptionAttemptDialTimeout(test.configured, test.attempt); got != test.want {
+				t.Fatalf("dial timeout = %s, want %s", got, test.want)
+			}
+		})
+	}
+	// The bound is pinned by value: the worst case one hung record can cost the
+	// serialized pass must stay legible next to a shim orphan deadline.
+	if adoptionRetryDialTimeout != 2*time.Second {
+		t.Fatalf("retry dial timeout = %s, want 2s", adoptionRetryDialTimeout)
+	}
+	worst := defaultDialTimeout
+	for attempt := 2; attempt <= adoptionDialAttempts; attempt++ {
+		worst += adoptionAttemptDialTimeout(0, attempt)
+	}
+	if worst != 9*time.Second {
+		t.Fatalf("worst case for one hung record = %s, want 9s (5+2+2)", worst)
+	}
+}
+
+// TestResolvePreparedAdoptionValidatesEveryAnswerTheSameWay pins the extracted
+// resolver both the handshake and a later re-prepare call. A preparation answer
+// that reached the wire through these checks and one that reached a durable
+// receipt through none is how a raised floor gets silently dropped.
+func TestResolvePreparedAdoptionValidatesEveryAnswerTheSameWay(t *testing.T) {
+	t.Parallel()
+	cursor := func(v uint64) *uint64 { return &v }
+	tests := []struct {
+		name     string
+		prepared PreparedAdoption
+		bounds   PreparedAdoptionBounds
+		wantErr  string
+		want     ResolvedPreparedAdoption
+	}{
+		{
+			name:     "no answer resolves to nothing",
+			prepared: PreparedAdoption{},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+		},
+		{
+			name:     "a raised cursor is accepted",
+			prepared: PreparedAdoption{ResumeFrom: cursor(7)},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+			want:     ResolvedPreparedAdoption{ResumeFrom: 7, ResumeProvided: true},
+		},
+		{
+			name:     "the successor of Hello LastSeq is the ceiling",
+			prepared: PreparedAdoption{ResumeFrom: cursor(10)},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+			want:     ResolvedPreparedAdoption{ResumeFrom: 10, ResumeProvided: true},
+		},
+		{
+			name:     "a regressed cursor refuses",
+			prepared: PreparedAdoption{ResumeFrom: cursor(3)},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+			wantErr:  "regresses local floor",
+		},
+		{
+			name:     "a cursor past Hello LastSeq+1 refuses",
+			prepared: PreparedAdoption{ResumeFrom: cursor(11)},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+			wantErr:  "is ahead of Hello LastSeq",
+		},
+		{
+			name:     "an unset Hello cursor bounds nothing, so it refuses",
+			prepared: PreparedAdoption{ResumeFrom: cursor(5)},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: ^uint64(0)},
+			wantErr:  "is ahead of Hello LastSeq",
+		},
+		{
+			name:     "a prepared cursor against a static one refuses",
+			prepared: PreparedAdoption{ResumeFrom: cursor(7)},
+			bounds:   PreparedAdoptionBounds{StaticResumeConfigured: true, LocalResumeFrom: 4, HelloLastSeq: 9},
+			wantErr:  "both configured",
+		},
+		{
+			name:     "a prepared generation is returned",
+			prepared: PreparedAdoption{ControllerGeneration: 12},
+			bounds:   PreparedAdoptionBounds{LocalResumeFrom: 4, HelloLastSeq: 9},
+			want:     ResolvedPreparedAdoption{ControllerGeneration: 12},
+		},
+		{
+			name:     "a prepared generation against a static one refuses",
+			prepared: PreparedAdoption{ControllerGeneration: 12},
+			bounds:   PreparedAdoptionBounds{StaticGenerationConfigured: true, LocalResumeFrom: 4, HelloLastSeq: 9},
+			wantErr:  "both configured",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			got, err := ResolvePreparedAdoption(test.prepared, test.bounds)
+			if test.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), test.wantErr) {
+					t.Fatalf("error = %v, want one containing %q", err, test.wantErr)
+				}
+				if !errors.Is(err, ErrAdoptionPreparation) {
+					t.Fatalf("error %v is not classified as a preparation failure", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("unexpected error: %v", err)
+			}
+			if got.ControllerGeneration != test.want.ControllerGeneration ||
+				got.ResumeFrom != test.want.ResumeFrom || got.ResumeProvided != test.want.ResumeProvided {
+				t.Fatalf("resolved = %+v, want %+v", got, test.want)
+			}
+		})
 	}
 }

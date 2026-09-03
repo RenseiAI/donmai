@@ -54,6 +54,38 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   backoff, a fresh carrier proof each time — before any quarantine. A lineage
   whose proof still does not reconcile is quarantined as before, with the reason
   unchanged and the detail carrying both cursors and the number of dials spent.
+
+  **A re-prepare supersedes a reservation that is admitted and pre-active, and
+  this side has no verb to burn it.** Abandonment is control-authenticated and
+  belongs to the authority that minted it, so the contract is now explicit
+  rather than assumed. `SessionShimAdoptionPreparation` carries `Cause` and
+  `Attempt`: a re-ask arrives as `carrier_cursor_drift`, which is the daemon
+  declaring that an earlier reservation for the lineage is outstanding and
+  stale. The composing authority is expected to abandon it before reserving
+  above the all-time carrier-epoch floor — under the recovery ADR's §D4
+  disposition rule, changed bytes under the same idempotency key are a
+  re-prepare, not a replay, and every attempt that created or inherited an
+  uncommitted reservation ends with one durable disposition. An authority that
+  will not supersede answers `ErrSessionShimAdoptionPrepareConflict`; that is a
+  refusal, not a failure, so the pass spends none of its remaining budget on it
+  and quarantines with the conflict as the detail.
+
+  A re-prepared answer is now applied through the same validation the handshake
+  applies (`sessionshim.ResolvePreparedAdoption`, which both paths call) and is
+  then required to agree with the controller that is already adopted. The first
+  preparation is answered inside the handshake, where its generation and cursor
+  still have a Welcome to travel on; a re-prepare has neither, so an answer
+  resolving different values is refused rather than silently dropped — dropping
+  it would bind the new receipt to the previous proof's cursor and generation.
+- Adoption's transient-dial retry re-dials the already-prepared candidate
+  instead of preparing again. Preparation runs inside the handshake, after Hello
+  authentication and before the Welcome write, so the failure this retry exists
+  for happens after preparation has already succeeded; re-asking would mint a
+  second reservation for a lineage whose first one is admitted and undisposed.
+  Retries are also capped at a 2s dial timeout (the first attempt keeps the
+  caller's own), because the pass walks records sequentially and every later
+  lineage waits behind the current one: one hung record now costs at most
+  5+2+2s of the pass rather than three full timeouts.
 - Adoption no longer reports a stalled shim as an unreachable socket. The
   classifier's predicate asked only whether an error had a `Timeout` method —
   which every `net.OpError` and `os.PathError` has — and never called it, so any

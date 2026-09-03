@@ -166,7 +166,42 @@ type SessionShimAdoptionPreparation struct {
 	// external carrier proof authority.
 	LastForwardedSeq uint64
 	SelectedVersion  uint32
+
+	// Cause names WHY this preparation is being asked for, and Attempt counts
+	// it within one adoption of one lineage (1 for the first).
+	//
+	// They are not diagnostics. A composing authority that mints a reservation
+	// owns disposing of the one it is superseding, and it cannot do that if
+	// every ask looks like a first ask. A cause of
+	// SessionShimPrepareCauseCarrierCursorDrift is this daemon stating that an
+	// earlier reservation for this lineage is admitted, pre-active, and now
+	// stale — the authority is expected to abandon it before reserving above
+	// the carrier-epoch floor, or to answer a typed conflict.
+	Cause   SessionShimAdoptionPrepareCause
+	Attempt int
 }
+
+// SessionShimAdoptionPrepareCause is the closed set of reasons a preparation is
+// requested.
+type SessionShimAdoptionPrepareCause string
+
+const (
+	// SessionShimPrepareCauseInitial is the first ask for one adoption. Nothing
+	// is outstanding for the lineage.
+	SessionShimPrepareCauseInitial SessionShimAdoptionPrepareCause = "initial"
+	// SessionShimPrepareCauseCarrierCursorDrift is a re-ask after the durable
+	// adoption refused the previous proof as drifted. The previous reservation
+	// is admitted and pre-active; this ask supersedes it.
+	SessionShimPrepareCauseCarrierCursorDrift SessionShimAdoptionPrepareCause = "carrier_cursor_drift"
+)
+
+// ErrSessionShimAdoptionPrepareConflict is how a composing authority says its
+// answer is a REFUSAL, not a failure: the ask conflicts with state it already
+// holds for this lineage (a reservation it will not supersede, an episode whose
+// bytes changed under the same idempotency key). Re-asking cannot change it, so
+// the daemon spends none of its remaining budget on it and quarantines with the
+// conflict as the detail. Composing callers wrap their typed conflict with %w.
+var ErrSessionShimAdoptionPrepareConflict = errors.New("session shim: adoption preparation conflicted")
 
 // SessionShimAdoptionPreparationState is the closed result posture returned by
 // the additive proof-v2 composing prepare seam.
@@ -2922,10 +2957,25 @@ func (d *Daemon) sessionShimCallbackContext(parent context.Context) (context.Con
 	return context.WithTimeout(parent, d.sessionShimConfig().callbackTimeout())
 }
 
+// prepareSessionShimAdoption is the ordinary first ask for one adoption.
 func (d *Daemon) prepareSessionShimAdoption(
 	ctx context.Context,
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
+) (SessionShimAdoptionPreparationResult, error) {
+	return d.prepareSessionShimAdoptionForCause(ctx, hostID, evidence, SessionShimPrepareCauseInitial, 1)
+}
+
+// prepareSessionShimAdoptionForCause is the same ask, told why. A re-ask must
+// say so: the composing authority is the only party that can dispose of the
+// reservation this one supersedes, and it cannot if every ask looks like a
+// first ask.
+func (d *Daemon) prepareSessionShimAdoptionForCause(
+	ctx context.Context,
+	hostID string,
+	evidence sessionshim.AdoptionPreparation,
+	cause SessionShimAdoptionPrepareCause,
+	attempt int,
 ) (SessionShimAdoptionPreparationResult, error) {
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
@@ -2957,6 +3007,8 @@ func (d *Daemon) prepareSessionShimAdoption(
 		LastHostSeq:                 evidence.LastHostSeq,
 		LastForwardedSeq:            evidence.LastForwardedSeq,
 		SelectedVersion:             evidence.SelectedVersion,
+		Cause:                       cause,
+		Attempt:                     attempt,
 	}
 	var result SessionShimAdoptionPreparationResult
 	var err error
