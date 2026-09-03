@@ -72,6 +72,11 @@ func (s CloneStrategy) String() string {
 
 // Sentinel errors callers may type-check via errors.Is.
 var (
+	// ErrBaseFetch is returned when the configured base ref cannot be refreshed.
+	// Callers can use errors.Is to classify a launch that was refused because
+	// its workarea would otherwise have been based on stale remote state.
+	ErrBaseFetch = errors.New("runtime/worktree: fetch base ref")
+
 	// ErrLostOwnership is returned by Provision when the OwnershipProber
 	// reports that another worker has claimed this session between
 	// retry attempts. The runner halts work without further retries.
@@ -185,6 +190,12 @@ type ProvisionResult struct {
 	ParentRepoPath string
 	// Attempts is the number of attempts taken (1 on success first try).
 	Attempts int
+	// BaseRef is the ref refreshed before creating a session branch.
+	BaseRef string
+	// BaseSHA is the resolved tip of BaseRef after the refresh.
+	BaseSHA string
+	// BaseFetchDuration is how long refreshing BaseRef took.
+	BaseFetchDuration time.Duration
 }
 
 // Manager owns the lifecycle of per-session worktrees. The zero value
@@ -199,6 +210,7 @@ type Manager struct {
 	runner           CommandRunner
 	envRunner        EnvCommandRunner
 	gitAuth          GitAuth
+	baseFetchTimeout time.Duration
 	delay            time.Duration
 	leases           *workarea.LeaseStore
 	acquisitions     *workarea.AcquisitionStore
@@ -273,6 +285,8 @@ type Options struct {
 	RestoreSessionID string
 	// LifecycleHook is a deterministic V16 seam inside the cross-process root transaction.
 	LifecycleHook func(stage string)
+	// BaseFetchTimeout bounds refreshing a base ref. Zero uses one minute.
+	BaseFetchTimeout time.Duration
 }
 
 // NewManager returns a Manager configured by opts.
@@ -295,6 +309,10 @@ func NewManager(opts Options) (*Manager, error) {
 	delay := opts.RetryDelay
 	if delay == 0 {
 		delay = SpawnRetryDelay
+	}
+	baseFetchTimeout := opts.BaseFetchTimeout
+	if baseFetchTimeout == 0 {
+		baseFetchTimeout = time.Minute
 	}
 	abs, err := filepath.Abs(opts.ParentDir)
 	if err != nil {
@@ -337,6 +355,7 @@ func NewManager(opts Options) (*Manager, error) {
 		runner:           runner,
 		envRunner:        envRunner,
 		gitAuth:          opts.GitAuth,
+		baseFetchTimeout: baseFetchTimeout,
 		delay:            delay,
 		leases:           leases,
 		acquisitions:     acquisitions,
@@ -561,6 +580,11 @@ type ProvisionSpec struct {
 	RepositoryFilter *workarea.RepositoryFilter
 	// CacheSeedID records reusable seed provenance without reusing session identity.
 	CacheSeedID string
+	// BaseRef is the remote ref to refresh before creating a branch. Empty uses
+	// Branch, then SourceRef.
+	BaseRef string
+	// SkipBaseFetch explicitly preserves offline/test behaviour.
+	SkipBaseFetch bool
 }
 
 // Provision creates a worktree for the session, retrying up to
@@ -632,6 +656,10 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			return "", fmt.Errorf("runtime/worktree: resolve ParentRepoPath: %w", err)
 		}
 	}
+	baseInfo, err := m.refreshBase(ctx, parentRepoPath, spec)
+	if err != nil {
+		return "", err
+	}
 
 	leaf := spec.LeafName
 	if leaf == "" {
@@ -682,6 +710,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				Mode: ModeExclusive, OwnerSessionID: spec.SessionID, CacheSeedID: spec.CacheSeedID,
 				Repositories: repositories, Strategy: spec.Strategy,
 				ParentRepoPath: parentRepoPath, Attempts: attempts,
+				BaseRef: baseInfo.Ref, BaseSHA: baseInfo.SHA, BaseFetchDuration: baseInfo.Duration,
 			}
 			if acquisition.AcquisitionID != "" {
 				res.AcquisitionID = acquisition.AcquisitionID
@@ -1351,6 +1380,22 @@ func (m *Manager) RepositoryPaths(sessionID string) (map[string]string, error) {
 	return paths, nil
 }
 
+// Result returns a copy of the provisioning receipt for sessionID.
+func (m *Manager) Result(sessionID string) (ProvisionResult, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res, ok := m.sessions[sessionID]
+	if !ok {
+		return ProvisionResult{}, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+	copy := *res
+	copy.Repositories = make(map[string]string, len(res.Repositories))
+	for name, path := range res.Repositories {
+		copy.Repositories[name] = path
+	}
+	return copy, nil
+}
+
 func (r ProvisionResult) workareaRootOrPath() string {
 	if r.WorkareaRoot != "" {
 		return r.WorkareaRoot
@@ -1520,6 +1565,48 @@ func (m *Manager) provisionLayoutOnce(
 // provisionOnce performs one materialization attempt for spec.Strategy.
 func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionSpec) error {
 	return m.provisionOnceWithReference(ctx, dst, spec, "")
+}
+
+type baseFetchInfo struct {
+	Ref      string
+	SHA      string
+	Duration time.Duration
+}
+
+// refreshBase makes the parent repository's remote tip authoritative before a
+// worktree branch is created. Clone strategy already obtains its base during
+// clone and retains its historical command shape.
+func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (baseFetchInfo, error) {
+	if spec.Strategy != StrategyWorktreeAdd || spec.SkipBaseFetch {
+		return baseFetchInfo{}, nil
+	}
+	if parent == "" {
+		return baseFetchInfo{}, nil
+	}
+	ref := spec.BaseRef
+	if ref == "" {
+		ref = spec.Branch
+	}
+	if ref == "" {
+		ref = spec.SourceRef
+	}
+	if ref == "" {
+		return baseFetchInfo{}, nil
+	}
+	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
+	defer cancel()
+	started := time.Now()
+	out, err := m.runGit(fetchCtx, spec.RepoURL, "-C", parent, "fetch", "origin", ref)
+	duration := time.Since(started)
+	if err != nil {
+		return baseFetchInfo{}, fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
+	}
+	out, err = m.runGit(fetchCtx, "", "-C", parent, "rev-parse", "origin/"+ref)
+	if err != nil {
+		return baseFetchInfo{}, fmt.Errorf("%w %q: resolve fetched tip: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
+	}
+	sha := strings.TrimSpace(string(out))
+	return baseFetchInfo{Ref: ref, SHA: sha, Duration: duration}, nil
 }
 
 func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath string) error {
