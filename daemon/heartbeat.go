@@ -450,6 +450,24 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		}
 	}
 
+	// Sampled BEFORE status and capacity. Resolving the projection is what
+	// discovers a definite not-ready and withdraws readiness, and a beat that
+	// read its status first would publish the capacity claim of the host it was
+	// a moment ago — the one beat where the claim is guaranteed to be wrong.
+	getSessionShim, onSessionShimAcknowledged := h.sessionShimHooks()
+	var sessionShim *SessionShimHeartbeatProjection
+	if getSessionShim != nil {
+		projection, projectionErr := getSessionShim()
+		if projectionErr != nil {
+			return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
+		}
+		projection = cloneSessionShimHeartbeatProjection(projection)
+		if err := projection.validateReady(); err != nil {
+			return fmt.Errorf("heartbeat: %w", err)
+		}
+		sessionShim = &projection
+	}
+
 	payload := HeartbeatPayload{
 		WorkerID:                  h.workerIDLocked(),
 		Hostname:                  h.opts.Hostname,
@@ -486,18 +504,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 			payload.QuarantinedSessions = q
 		}
 	}
-	getSessionShim, onSessionShimAcknowledged := h.sessionShimHooks()
-	if getSessionShim != nil {
-		projection, projectionErr := getSessionShim()
-		if projectionErr != nil {
-			return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
-		}
-		projection = cloneSessionShimHeartbeatProjection(projection)
-		if err := projection.validateReady(); err != nil {
-			return fmt.Errorf("heartbeat: %w", err)
-		}
-		payload.SessionShim = &projection
-	}
+	payload.SessionShim = sessionShim
 
 	// Item 8: sample per-beat CPU/mem load when a sampler is configured.
 	// ok=false leaves payload.Load nil so the wire body omits the key

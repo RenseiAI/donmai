@@ -946,12 +946,67 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 		t.Fatal("readiness projection crossed organization authority")
 	}
 
+	healthyShim := append([]byte(nil), heartbeatBody["sessionShim"]...)
+
+	// A resolver outage degrades the projection to unknown. The beat still
+	// reaches the endpoint on schedule: it is a liveness signal, and a host
+	// that stops beating is a host the control plane has to treat as lost.
 	readinessError.Store(true)
-	if err := service.sendOneResult(context.Background()); err == nil {
-		t.Fatal("heartbeat reached the endpoint after live readiness resolver failure")
+	if err := service.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("heartbeat did not survive a readiness resolver failure: %v", err)
 	}
-	if endpointCalls.Load() != 1 {
-		t.Fatalf("endpoint calls after readiness failure = %d, want 1", endpointCalls.Load())
+	if endpointCalls.Load() != 2 {
+		t.Fatalf("endpoint calls after readiness failure = %d, want 2", endpointCalls.Load())
+	}
+	if d.sessionShimReadinessWithdrawn.Load() {
+		t.Fatal("transient readiness failure withdrew readiness at the heartbeat seam")
+	}
+	var degradedBody map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &degradedBody); err != nil {
+		t.Fatal(err)
+	}
+	var degraded SessionShimHeartbeatProjection
+	if err := json.Unmarshal(degradedBody["sessionShim"], &degraded); err != nil {
+		t.Fatal(err)
+	}
+	if degraded.ReadinessState != SessionShimReadinessUnknown ||
+		degraded.ReadinessReason == "" || degraded.ReadinessObservedAt == "" {
+		t.Fatalf("degraded projection = %+v, want unknown with a reason and an observed-at", degraded)
+	}
+	var degradedShim map[string]json.RawMessage
+	if err := json.Unmarshal(degradedBody["sessionShim"], &degradedShim); err != nil {
+		t.Fatal(err)
+	}
+	for _, fact := range []string{
+		"durable_carrier_proof_v2_ready", "composingProofV1WritesClosed",
+		"encryptedOriginalCredentialRetained", "remainingValidityConsumeGate", "adoptedCandidateRecovery",
+	} {
+		if _, present := degradedShim[fact]; present {
+			t.Fatalf("unknown beat published readiness fact %q: %s", fact, degradedBody["sessionShim"])
+		}
+	}
+
+	// Recovery: the next beat is healthy again and carries no readiness fields
+	// at all, so an unaware consumer sees exactly the bytes it saw before.
+	readinessError.Store(false)
+	if err := service.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("recovered heartbeat: %v", err)
+	}
+	if endpointCalls.Load() != 3 {
+		t.Fatalf("endpoint calls after readiness recovery = %d, want 3", endpointCalls.Load())
+	}
+	var recoveredBody map[string]json.RawMessage
+	if err := json.Unmarshal(rawBody, &recoveredBody); err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(recoveredBody["sessionShim"], healthyShim) {
+		t.Fatalf("healthy beats differ on the wire:\n first=%s\nsecond=%s",
+			healthyShim, recoveredBody["sessionShim"])
+	}
+	for _, key := range []string{"readinessState", "readinessReason", "readinessObservedAt"} {
+		if bytes.Contains(recoveredBody["sessionShim"], []byte(key)) {
+			t.Fatalf("healthy beat carried %q: %s", key, recoveredBody["sessionShim"])
+		}
 	}
 }
 
@@ -969,6 +1024,7 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		pollCount          atomic.Int64
 		activationReleases atomic.Int64
 		lastHeartbeat      heartbeatRequestBody
+		beats              []heartbeatRequestBody
 	)
 	readinessOK.Store(true)
 	record := func(step string) {
@@ -1004,6 +1060,7 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			}
 			mu.Lock()
 			lastHeartbeat = body
+			beats = append(beats, body)
 			mu.Unlock()
 			if driftRevision.CompareAndSwap(true, false) {
 				d.shims.mu.Lock()
@@ -1145,6 +1202,11 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		startupHeartbeat.SessionShim.WorkerHostID != "stable-host-order" {
 		t.Fatalf("startup heartbeat omitted authority-bound live readiness: %+v", startupHeartbeat.SessionShim)
 	}
+	beatsSince := func(mark int64) []heartbeatRequestBody {
+		mu.Lock()
+		defer mu.Unlock()
+		return append([]heartbeatRequestBody(nil), beats[mark:]...)
+	}
 	assertClosed := func(t *testing.T, reason string, priorHeartbeats, priorPolls int64) {
 		t.Helper()
 		t.Run(reason+"/non-ready", func(t *testing.T) {
@@ -1166,14 +1228,53 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			}
 		})
 		t.Run(reason+"/capacity", func(t *testing.T) {
-			if got := heartbeatCount.Load(); got != priorHeartbeats {
-				t.Fatalf("withdrawal published a heartbeat/capacity claim: got %d want %d", got, priorHeartbeats)
+			// A withdrawal closes every new-work rail. The heartbeat is not one
+			// of them: it keeps going, and it is what tells the control plane
+			// this host is alive and taking nothing. So the rule is not "no
+			// beat" but "no beat that claims capacity" — which holds whether or
+			// not this branch happened to publish one.
+			for i, beat := range beatsSince(priorHeartbeats) {
+				if beat.Status != string(RegistrationDraining) || beat.MaxSessions != 0 {
+					t.Fatalf("beat %d after withdrawal advertised capacity: status=%q maxSessions=%d",
+						i, beat.Status, beat.MaxSessions)
+				}
 			}
 		})
 		t.Run(reason+"/poll", func(t *testing.T) {
 			d.poller.pollOnce(context.Background())
 			if got := pollCount.Load(); got != priorPolls {
 				t.Fatalf("withdrawal allowed poll/claim: got %d want %d", got, priorPolls)
+			}
+		})
+	}
+	assertServing := func(t *testing.T, reason string, priorHeartbeats int64) {
+		t.Helper()
+		t.Run(reason+"/non-withdrawal", func(t *testing.T) {
+			if d.sessionShimReadinessWithdrawn.Load() {
+				t.Fatal("transient readiness failure withdrew established readiness")
+			}
+			if d.State() != StateRunning || !d.spawner.IsAccepting() {
+				t.Fatalf("transient readiness failure closed admission: state=%s accepting=%v",
+					d.State(), d.spawner.IsAccepting())
+			}
+		})
+		t.Run(reason+"/claim", func(t *testing.T) {
+			if blocked, why := satelliteClaimGate(); blocked {
+				t.Fatalf("transient readiness failure closed the claim gate: %q", why)
+			}
+		})
+		t.Run(reason+"/beat", func(t *testing.T) {
+			published := beatsSince(priorHeartbeats)
+			if len(published) == 0 {
+				t.Fatal("no heartbeat was published during the readiness resolver outage")
+			}
+			for i, beat := range published {
+				if beat.SessionShim == nil ||
+					beat.SessionShim.ReadinessState != SessionShimReadinessUnknown ||
+					beat.SessionShim.ReadinessReason == "" || beat.SessionShim.ReadinessObservedAt == "" {
+					t.Fatalf("beat %d during the outage = %+v, want unknown with a reason and an observed-at",
+						i, beat.SessionShim)
+				}
 			}
 		})
 	}
@@ -1211,10 +1312,26 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 		})
 	}
 
+	// A DEFINITE not-ready: the resolver answers, and the answer refuses. Every
+	// new-work rail closes exactly as before — but the beat goes out, carrying
+	// the refusal, draining status and zero capacity.
 	priorHeartbeats, priorPolls := heartbeatCount.Load(), pollCount.Load()
 	readinessOK.Store(false)
-	if err := d.heartbeat.sendOneResult(context.Background()); err == nil {
-		t.Fatal("heartbeat remained eligible after durable proof-v2 readiness became false")
+	if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("heartbeat did not survive a definite not-ready: %v", err)
+	}
+	if got := heartbeatCount.Load(); got != priorHeartbeats+1 {
+		t.Fatalf("withdrawal beat count = %d, want %d", got, priorHeartbeats+1)
+	}
+	mu.Lock()
+	withdrawalBeat := lastHeartbeat
+	mu.Unlock()
+	if withdrawalBeat.SessionShim == nil ||
+		withdrawalBeat.SessionShim.ReadinessState != SessionShimReadinessNotReady ||
+		withdrawalBeat.SessionShim.ReadinessReason == "" ||
+		withdrawalBeat.SessionShim.ReadinessObservedAt == "" {
+		t.Fatalf("withdrawal beat projection = %+v, want not-ready with a reason and an observed-at",
+			withdrawalBeat.SessionShim)
 	}
 	assertClosed(t, "false", priorHeartbeats, priorPolls)
 	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
@@ -1224,20 +1341,28 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 	}
 	reopenAfterAcknowledgedHeartbeat(t, "false")
 
-	priorHeartbeats, priorPolls = heartbeatCount.Load(), pollCount.Load()
+	// A TRANSIENT resolver failure. Nothing withdraws: this host was serving
+	// before the resolver went away, and an unavailable answer is not a refusal.
+	priorHeartbeats = heartbeatCount.Load()
 	readinessError.Store(true)
-	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
-		State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-refresh-error",
-	}}); err == nil {
-		t.Fatal("refresh remained eligible after proof-v2 readiness resolver error")
+	if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("heartbeat did not survive a readiness resolver outage: %v", err)
 	}
-	assertClosed(t, "error", priorHeartbeats, priorPolls)
-	reopenAfterAcknowledgedHeartbeat(t, "error")
+	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
+		State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-refresh",
+	}}); err != nil {
+		t.Fatalf("credential refresh refused during a readiness resolver outage: %v", err)
+	}
+	assertServing(t, "error", priorHeartbeats)
+	readinessError.Store(false)
 
 	t.Run("stale-acknowledgement-cannot-reopen", func(t *testing.T) {
 		readinessOK.Store(false)
-		if err := d.heartbeat.sendOneResult(context.Background()); err == nil {
-			t.Fatal("heartbeat remained eligible before stale-acknowledgement control")
+		if err := d.heartbeat.sendOneResult(context.Background()); err != nil {
+			t.Fatalf("withdrawal beat before stale-acknowledgement control: %v", err)
+		}
+		if !d.sessionShimReadinessWithdrawn.Load() {
+			t.Fatal("definite not-ready did not withdraw before the stale-acknowledgement control")
 		}
 		readinessOK.Store(true)
 		driftRevision.Store(true)
@@ -1263,7 +1388,9 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 
 	t.Run("race/heartbeat-poll-refresh", func(t *testing.T) {
 		priorHeartbeats = heartbeatCount.Load()
-		readinessError.Store(true)
+		// Driven by a DEFINITE not-ready: the withdrawal fence is the shared
+		// state this race is about, and only a definite answer raises it.
+		readinessOK.Store(false)
 		var wg sync.WaitGroup
 		for i := 0; i < 16; i++ {
 			wg.Add(1)
