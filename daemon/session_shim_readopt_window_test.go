@@ -194,6 +194,28 @@ func (c *virtualShimClock) elapsed(from time.Time) time.Duration {
 	return c.Now().Sub(from)
 }
 
+// waitForOrphanArmed blocks until the shim has published the armed orphan
+// deadline that losing its controller starts.
+//
+// The shim arms that clock from its own serve-loop teardown, so a daemon that
+// dials back fast enough can present a keepalive before there is a deadline to
+// extend — the shim answers phase_unknown and the exchange extends nothing.
+// That is harmless in production (the next tick lands well inside a deadline
+// measured in tens of seconds) but it is a coin flip in a test whose whole
+// window finishes in milliseconds of real time, so the tests that assert ON the
+// extension wait for the state they are asserting about.
+func (f *readoptFixture) waitForOrphanArmed(t *testing.T, within time.Duration) {
+	t.Helper()
+	deadline := time.Now().Add(within)
+	for time.Now().Before(deadline) {
+		if record, err := f.registry.Get(f.id); err == nil && record.OrphanDeadlineUnixNano != 0 {
+			return
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	t.Fatalf("the shim did not publish an armed orphan deadline within %s", within)
+}
+
 // refusingCarrier is a durable-adoption outcome that refuses every attempt.
 func refusingCarrier() func(context.Context, int) error {
 	return func(context.Context, int) error { return errors.New("injected carrier refusal") }
@@ -398,6 +420,7 @@ func TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff(t *te
 		},
 	})
 	lost := f.lostEntry(t)
+	f.waitForOrphanArmed(t, 5*time.Second)
 
 	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionWindowExhausted {
 		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d) — the shim did not survive the window",
@@ -464,6 +487,7 @@ func TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline(t *t
 	}
 	started := clock.Now()
 	lost := f.lostEntry(t)
+	f.waitForOrphanArmed(t, 5*time.Second)
 
 	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionWindowExhausted {
 		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
@@ -761,7 +785,11 @@ func TestWorstCaseWindowReportsTheGoverningWindowInBothModes(t *testing.T) {
 // worse than the incident the window exists to fix.
 func TestCarrierLossClosesTheLostControllerSoTheShimReapsOnItsDeadline(t *testing.T) {
 	t.Parallel()
-	const orphanDeadline = 500 * time.Millisecond
+	// Long enough that the quarantine is still projected when it is read: the
+	// shim's reap withdraws the row again through the tombstone reconciler, and
+	// a deadline shorter than a loaded quarantine publication would have this
+	// test racing its own success.
+	const orphanDeadline = 3 * time.Second
 	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 		policy: SessionShimReadoptionPolicy{Disabled: true},
 		orphan: sessionshim.OrphanPolicy{
@@ -781,7 +809,8 @@ func TestCarrierLossClosesTheLostControllerSoTheShimReapsOnItsDeadline(t *testin
 		t.Fatal("the lost controller's connection is still usable after the quarantine")
 	}
 	// And because it is gone, the shim armed its own clock and reaped.
-	deadline := time.Now().Add(10 * time.Second)
+	const reapWait = 20 * time.Second
+	deadline := time.Now().Add(reapWait)
 	for time.Now().Before(deadline) {
 		if _, err := f.registry.GetTombstoneIncarnation(f.id, hello.ShimID, hello.ProcessEpoch); err == nil {
 			return
@@ -789,7 +818,7 @@ func TestCarrierLossClosesTheLostControllerSoTheShimReapsOnItsDeadline(t *testin
 		time.Sleep(5 * time.Millisecond)
 	}
 	t.Fatalf("no terminal tombstone %s after a quarantine whose orphan deadline was %s — the harness runs forever",
-		10*time.Second, orphanDeadline)
+		reapWait, orphanDeadline)
 }
 
 // TestStartupRefusesLineageLiveWithoutALinealPredicateUnderAnExternalThreshold
@@ -931,6 +960,7 @@ func TestKeepaliveStopsAsSoonAsTheLineageIsReleased(t *testing.T) {
 		},
 	})
 	lost := f.lostEntry(t)
+	f.waitForOrphanArmed(t, 5*time.Second)
 	registry, err := f.daemon.sessionShimRegistry()
 	if err != nil {
 		t.Fatal(err)

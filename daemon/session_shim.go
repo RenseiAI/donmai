@@ -1800,6 +1800,12 @@ const (
 	// with a very short deadline does not turn the keepalive into a busy loop
 	// against its own shim.
 	minSessionShimKeepaliveInterval = 250 * time.Millisecond
+	// sessionShimKeepaliveRetryInterval is how long a window waits before
+	// trying again while NOTHING has been honoured yet. The one benign reason
+	// for that is a race the shim resolves in milliseconds — it arms its orphan
+	// clock from its own serve-loop teardown — and spending a whole keepalive
+	// interval discovering it would waste most of a short deadline.
+	sessionShimKeepaliveRetryInterval = 20 * time.Millisecond
 	// sessionShimReadoptionWindowExhaustedDetail is the quarantine detail that
 	// makes "the carrier never came back" distinguishable from "the shim is
 	// gone". Both are socket_unreachable — the closed reason registry is not

@@ -319,7 +319,7 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 	id sessionshim.Identity,
 	hello shimwire.Hello,
 ) func() {
-	ticker := time.NewTicker(cfg.readoptionKeepaliveInterval())
+	interval := cfg.readoptionKeepaliveInterval()
 	// The observations are per WINDOW, not per daemon lifetime: "the daemon
 	// extended this shim's clock" is a question about the window being asked
 	// about.
@@ -330,7 +330,7 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 	done := make(chan struct{})
 	go func() {
 		defer close(done)
-		defer ticker.Stop()
+		honoured := false
 		for {
 			if !d.sessionShimLineageHeld(cfg, id) {
 				// The composing layer let this lineage go. Stop extending at
@@ -340,9 +340,22 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 					"session", id.String())
 				return
 			}
-			d.extendSessionShimOrphanDeadline(registry, id, hello)
+			if d.extendSessionShimOrphanDeadline(registry, id, hello) {
+				honoured = true
+			}
+			wait := interval
+			if !honoured {
+				// Nothing has been honoured yet in this window. The likeliest
+				// reason is benign and self-correcting: the shim arms its
+				// orphan clock from its own serve-loop teardown, so a daemon
+				// that re-dials promptly can arrive before there is a deadline
+				// to extend. Waiting a whole interval to find out would spend
+				// most of a short deadline on a race that resolves in
+				// milliseconds.
+				wait = min(interval, sessionShimKeepaliveRetryInterval)
+			}
 			select {
-			case <-ticker.C:
+			case <-d.shimKeepaliveAfter(wait):
 			case <-stop:
 				return
 			case <-d.shims.reconcileStop:
@@ -392,6 +405,13 @@ func (d *Daemon) extendSessionShimOrphanDeadline(
 	d.shims.keepalives[id] = state
 	d.shims.mu.Unlock()
 	return true
+}
+
+// shimKeepaliveAfter is the keepalive's own wait. It is deliberately the REAL
+// clock even when a fixture has injected one: the thing being paced against is
+// the shim's orphan timer, which is a real timer in another process.
+func (d *Daemon) shimKeepaliveAfter(wait time.Duration) <-chan time.Time {
+	return time.After(wait)
 }
 
 // noteSessionShimKeepaliveRefused records one unhonoured keepalive and says so
