@@ -31,6 +31,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // TestDelayedDurableAckKeepsTheLineageAdopted is the RED test for the field
@@ -169,42 +170,127 @@ func TestDurableAckAmbiguityBoundIsTheLineageLiveWindow(t *testing.T) {
 		t.Fatalf("durable-ack ambiguity bound = %s, want the %s lineage-live re-adoption window it is derived from",
 			sessionshim.DurableAckAmbiguityBound, defaultSessionShimReadoptionWindow)
 	}
-	// One re-adoption cycle costs a whole bound, so the cycle budget has to be
-	// small enough that the total stays a visible, bounded retry rather than an
-	// open-ended one.
-	if total := time.Duration(maxConsecutiveDurableAckAmbiguityCycles) * sessionshim.DurableAckAmbiguityBound; total > time.Hour {
-		t.Fatalf("%d cycles of %s is %s of retrying before anything is asserted; that is no longer bounded",
-			maxConsecutiveDurableAckAmbiguityCycles, sessionshim.DurableAckAmbiguityBound, total)
+}
+
+// TestDurableAckAmbiguityBoundFollowsTheConfiguredWindow is the pin the ADR's
+// Risks section asks for by name: "Implementations MUST treat the two as one
+// configured value, not two values that happen to default identically today."
+//
+// Pinning the package default against the package default proves only that two
+// constants match. What has to hold is that a deployment which CONFIGURES a
+// window gets that window as its ambiguity bound — so a controller this daemon
+// dials under a twenty-minute window holds for twenty minutes, not ten.
+func TestDurableAckAmbiguityBoundFollowsTheConfiguredWindow(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name   string
+		policy SessionShimReadoptionPolicy
+		want   time.Duration
+	}{
+		{
+			name: "an unconfigured policy takes the default window",
+			want: defaultSessionShimReadoptionWindow,
+		},
+		{
+			name: "a configured lineage-live window is the bound",
+			policy: SessionShimReadoptionPolicy{
+				Mode: ReadoptionLineageLive, Window: 20 * time.Minute, BackoffCap: 30 * time.Second,
+			},
+			want: 20 * time.Minute,
+		},
+		{
+			// A fixed-attempts policy configures no window at all; its attempt
+			// arithmetic answers a different question. It takes the same
+			// default window an unset one does.
+			name:   "a fixed-attempts policy takes the default window",
+			policy: SessionShimReadoptionPolicy{Mode: ReadoptionFixedAttempts, Attempts: 3},
+			want:   defaultSessionShimReadoptionWindow,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if err := tc.policy.Validate(); tc.policy.Mode != 0 && err != nil {
+				t.Fatalf("fixture policy is invalid: %v", err)
+			}
+			cfg := SessionShimConfig{Readoption: tc.policy}
+			if got := cfg.durableAckAmbiguityBound(); got != tc.want {
+				t.Fatalf("durable-ack ambiguity bound = %s, want the %s window this policy resolves to", got, tc.want)
+			}
+			// And it must actually REACH the controller, not merely be
+			// computable: a derivation nothing passes on is the same drift.
+			if got := (sessionshim.ControllerOptions{
+				DurableAckAmbiguityBound: cfg.durableAckAmbiguityBound(),
+			}).ResolvedDurableAckAmbiguityBound(); got != tc.want {
+				t.Fatalf("the bound a dialled controller resolves = %s, want %s", got, tc.want)
+			}
+		})
 	}
 }
 
-// TestConsecutiveAmbiguityCyclesEventuallyWithdrawForReal pins the livelock
-// fix. A re-adoption that SUCCEEDS hands back a fresh controller with a fresh,
-// un-anchored bound, so against a durable side that is persistently slow rather
-// than transiently slow this path would cycle forever — each cycle issuing
-// batch commits against the very dependency that cannot answer them.
-func TestConsecutiveAmbiguityCyclesEventuallyWithdrawForReal(t *testing.T) {
-	t.Parallel()
-	// Each real cycle costs a whole ambiguity bound, so the streak is seeded
-	// rather than slept through: what is under test is the BUDGET, and driving
-	// it in wall-clock time would also drag in the re-adoption window's own
-	// re-entry guard, which is a different mechanism on a different clock.
-	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
-		return nil // every re-adoption succeeds; the durable side stays slow
-	})
-	d := f.daemon
+// seedAmbiguityStreakToItsBudget puts a lineage one exit short of the cycle
+// budget. The streak is seeded rather than slept through: each real cycle costs
+// a whole ambiguity bound, and driving it in wall-clock time would also drag in
+// the re-adoption window's own re-entry guard — a different mechanism on a
+// different clock.
+func seedAmbiguityStreakToItsBudget(t *testing.T, d *Daemon, id sessionshim.Identity) {
+	t.Helper()
 	for cycle := 1; cycle < maxConsecutiveDurableAckAmbiguityCycles; cycle++ {
-		if got := d.noteDurableAckAmbiguityCycle(f.id); got != cycle {
+		if got := d.noteDurableAckAmbiguityCycle(id); got != cycle {
 			t.Fatalf("consecutive ambiguity cycles = %d after cycle %d, want %d", got, cycle, cycle)
 		}
 	}
+}
 
-	// The budgeted cycle degrades for real, under the same non-terminal reason,
-	// WITHOUT dialling again: re-adopting here is precisely the batch commit
-	// against the slow dependency that this budget exists to stop issuing.
+// TestTheBudgetedAmbiguityCycleStillReadoptsALiveShim is the pin the contract
+// asks for by name. ADR-2026-09-03: exhausting the bound "does not quarantine
+// directly, it re-enters the ordinary re-adoption pipeline first … it must not
+// shortcut past the re-adoption check that would otherwise catch a shim that
+// is, in fact, still live and reachable." A live, reachable shim on the
+// budgeted cycle is re-adopted, not withdrawn.
+func TestTheBudgetedAmbiguityCycleStillReadoptsALiveShim(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return nil // the shim is there; the durable side is merely slow
+	})
+	d := f.daemon
+	seedAmbiguityStreakToItsBudget(t, d, f.id)
+	previousGeneration := f.controller.Generation()
+
 	d.releaseShimIfLive(f.id, f.controller, shimStreamDurableAckAmbiguous)
-	if adoptions, _ := f.snapshot(); adoptions != 0 {
-		t.Fatalf("the spent-budget withdrawal still attempted %d durable adoption(s) against the slow durable side", adoptions)
+
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("the budgeted cycle withdrew a live, reachable shim: %+v — the ADR rejects exactly this shortcut", projected)
+	}
+	entry, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	if err != nil {
+		t.Fatalf("the budgeted cycle left a re-adoptable lineage un-adopted: %v", err)
+	}
+	if entry.controller == f.controller || entry.controller.Generation() <= previousGeneration {
+		t.Fatalf("adopted entry still names the lost controller (generation %d)", entry.controller.Generation())
+	}
+	// The look is cheaper, not skipped: one attempt, not the policy's three.
+	if adoptions, _ := f.snapshot(); adoptions != 1 {
+		t.Fatalf("the budgeted cycle ran %d durable adoption(s), want exactly the one reduced attempt", adoptions)
+	}
+}
+
+// TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails pins the other
+// outcome of that same pipeline run: the shim really is gone, so the reduced
+// attempt fails and the lineage withdraws under its own reason and detail.
+func TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return errors.New("durable acknowledgement never landed")
+	})
+	d := f.daemon
+	seedAmbiguityStreakToItsBudget(t, d, f.id)
+
+	d.releaseShimIfLive(f.id, f.controller, shimStreamDurableAckAmbiguous)
+
+	// The pipeline ran — and ran REDUCED. Three attempts here is the livelock
+	// the budget exists to shrink; zero is the shortcut the ADR rejects.
+	if adoptions, _ := f.snapshot(); adoptions != 1 {
+		t.Fatalf("the budgeted cycle ran %d durable adoption(s), want exactly the one reduced attempt", adoptions)
 	}
 	projected := d.QuarantinedSessions()
 	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
@@ -217,6 +303,27 @@ func TestConsecutiveAmbiguityCyclesEventuallyWithdrawForReal(t *testing.T) {
 	}
 	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
 		t.Fatalf("the streak survived the withdrawal (%d); a later lineage on this identity would inherit a spent budget", got)
+	}
+}
+
+// TestATerminalExitClearsTheAmbiguityStreak pins the path that returns EARLY.
+// finishAdoptedShim removes the adopted entry without going through the
+// withdrawal, so a streak left behind there would be inherited by a RE-LAUNCHED
+// lineage on the same org+session id — whose very first re-adoption would then
+// be reduced to one attempt for a condition it never experienced.
+func TestATerminalExitClearsTheAmbiguityStreak(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Disabled: true}, func(int) error { return nil })
+	d := f.daemon
+	seedAmbiguityStreakToItsBudget(t, d, f.id)
+	if d.durableAckAmbiguityCycles(f.id) == 0 {
+		t.Fatal("the streak was not seeded")
+	}
+
+	d.finishAdoptedShim(f.id, shimwire.ExitMsg{ExitCode: 0})
+
+	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
+		t.Fatalf("consecutive ambiguity cycles = %d after a terminal exit, want 0 — a re-launched lineage would inherit it", got)
 	}
 }
 

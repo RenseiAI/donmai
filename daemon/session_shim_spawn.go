@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -280,6 +281,7 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		ControllerID:              d.controllerID(),
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
 		ExpectedWorkarea:          workarea,
 		ExpectedWorkareaRoot:      layout.Root.String(),
 		DialTimeout:               cfg.launchTimeout(),
@@ -2396,6 +2398,12 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	if stillOwned && current.controller == entry.controller && current.terminal {
 		delete(d.shims.adopted, id)
 		delete(d.shims.forwarded, id)
+		// The streak belongs to a lineage that is still being retried. Every
+		// path that removes the adopted entry clears it — this one returns
+		// early, and leaving the entry behind would have a RE-LAUNCHED lineage
+		// on the same org+session id inherit a spent budget and reduce its very
+		// first re-adoption to one attempt.
+		delete(d.shims.ambiguityCycles, id)
 	} else {
 		stillOwned = false
 	}
@@ -2557,20 +2565,25 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// `durable_ack_timeout`, because the socket was reachable for the whole of
 	// it and no projection of this lineage may say otherwise.
 	lostReason := sessionshim.QuarantineSocketUnreachable
+	// attemptBudget and spentDetail are set only on the last look this path
+	// takes at a lineage — see maxConsecutiveDurableAckAmbiguityCycles.
+	attemptBudget := 0
+	spentDetail := ""
 	if cause == shimStreamDurableAckAmbiguous {
 		lostReason = sessionshim.QuarantineDurableAckTimeout
 		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
-		// un-anchored ambiguity bound — so against a durable side that is
-		// persistently slow rather than transiently slow, this path would cycle
-		// forever: hold ten minutes, fail closed, re-adopt, hold ten minutes,
-		// each cycle issuing durable adoption batch commits against the very
-		// dependency that cannot answer. Retrying is what ambiguity is owed;
-		// retrying WITHOUT END is not, and the contract's ambiguous row says
-		// "then degrade visibly". Consecutive cycles are counted so the third
-		// one degrades for real instead of re-entering the loop.
+		// un-anchored ambiguity bound, so against a durable side that is
+		// persistently slow this path re-enters itself. What the streak buys is
+		// NOT a shortcut past re-adoption — ADR-2026-09-03 rejects that by
+		// name: "it must not shortcut past the re-adoption check that would
+		// otherwise catch a shim that is, in fact, still live and reachable."
+		// It buys a cheaper last look: one attempt instead of the full budget
+		// or a second whole lineage-live window. A shim that is still there is
+		// still re-adopted, however many cycles it has cost; only the pipeline
+		// settles the lineage.
 		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
-			d.quarantineLostSessionShim(id, entry, lostReason, sessionShimDurableAckCyclesSpentDetail)
-			return
+			attemptBudget = 1
+			spentDetail = sessionShimDurableAckCyclesSpentDetail
 		}
 	} else {
 		// Any other ending ends the streak: "consecutive" is the whole claim.
@@ -2588,7 +2601,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	if cause == shimStreamCarrierLost && d.noteSessionShimCarrierBindLost(id, ctrl) {
 		d.raiseSessionShimCarrierBindLost(cfg, id)
 	}
-	switch d.readoptSessionShimAfterControllerLoss(id, entry) {
+	switch d.readoptSessionShimAfterControllerLoss(id, entry, attemptBudget) {
 	case readoptionSucceeded:
 		return
 	case readoptionWindowExhausted:
@@ -2599,11 +2612,11 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// past that would leave an adopted entry whose keepalive has stopped,
 		// whose shim reaps within one orphan deadline, and whose tombstone the
 		// quarantine-only reconciler would never consume.
-		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimReadoptionWindowExhaustedDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimReadoptionWindowExhaustedDetail))
 	case readoptionAttemptsSpent:
-		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimReadoptionAttemptsSpentDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimReadoptionAttemptsSpentDetail))
 	default:
-		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimControllerLostDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimControllerLostDetail))
 	}
 }
 
@@ -2638,6 +2651,9 @@ func (d *Daemon) quarantineLostSessionShim(
 	if ok {
 		delete(d.shims.adopted, id)
 		delete(d.shims.keepalives, id)
+		// Withdrawn: there is nothing left to count, and a later lineage on
+		// this identity must start from a clean streak.
+		delete(d.shims.ambiguityCycles, id)
 		hello := entry.controller.Hello()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
@@ -2656,23 +2672,25 @@ func (d *Daemon) quarantineLostSessionShim(
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
-	// The streak belongs to a lineage that is still being retried. Once it has
-	// been withdrawn there is nothing left to count, and leaving the entry in
-	// place would both leak and make a later re-adoption of the same identity
-	// inherit a spent budget.
-	d.clearDurableAckAmbiguityCycles(id)
 }
 
 // maxConsecutiveDurableAckAmbiguityCycles is how many times in a row a lineage
 // may leave its controller stream on an exhausted durable-acknowledgement
-// ambiguity bound before this daemon stops re-adopting it and withdraws for
-// real. See releaseShimIfLive for why a counter is needed at all.
+// ambiguity bound before this daemon reduces its re-adoption to a single
+// attempt. See releaseShimIfLive for what the streak does and does not buy.
 //
 // Three, because two is indistinguishable from bad luck — a control plane
-// redeploy can plausibly outlast one bound and be caught by the retry after it
-// — and because each cycle already costs a whole ambiguity bound, so three of
-// them is half an hour of visible, capacity-charged retrying before anything is
-// asserted.
+// redeploy can plausibly outlast one bound and be caught by the retry after it.
+//
+// # WHAT THIS COUNTER IS NOT
+//
+// It is IN-MEMORY and per-daemon. A restart resets every streak, so the budget
+// bounds one daemon's patience, not the lineage's history — it FAILS OPEN, and
+// a lineage that keeps costing bounds across restarts keeps getting the full
+// attempt budget. That is the conservative direction (an extra dial at a live
+// shim, never an extra withdrawal), and it is why the streak may reduce the
+// budget but must never skip the pipeline: the only thing that settles a
+// lineage here is an outcome from re-adoption.
 const maxConsecutiveDurableAckAmbiguityCycles = 3
 
 // noteDurableAckAmbiguityCycle records one more consecutive ambiguity-bound

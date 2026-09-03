@@ -156,40 +156,102 @@ func TestDurableAckAmbiguityBoundIsClampedToItsFloor(t *testing.T) {
 	}
 }
 
+// outstandingCorrelations is the ledger durableAckOutstanding reads.
+func outstandingCorrelations(c *Controller) []heartbeatCorrelation {
+	c.heartbeatMu.Lock()
+	defer c.heartbeatMu.Unlock()
+	return append([]heartbeatCorrelation(nil), c.pendingReceipts...)
+}
+
 // TestAnsweredReceiptExpiresOlderOutstandingCorrelations pins the sticky-latch
-// fix. A retry never re-sends the correlation that stalled — the cursor has
+// fix END TO END, through acceptHeartbeatReceipt — the only way the ledger is
+// ever pruned in production.
+//
+// Pinning the pruning helper directly proves the helper works; it stays green
+// with both production call sites deleted, which is the state that reintroduces
+// the bug. So both of acceptHeartbeatReceipt's resolution paths are driven
+// here: the one that resolves a LIVE call, and the one that consumes a LATE
+// receipt.
+//
+// The bug: a retry never re-sends the correlation that stalled — the cursor has
 // advanced — so without expiry one slow receipt leaves the ledger non-empty for
 // the life of the controller, and every LATER stall on it holds the full
 // ambiguity bound instead of failing closed at the stall deadline.
 func TestAnsweredReceiptExpiresOlderOutstandingCorrelations(t *testing.T) {
 	t.Parallel()
-	c := &Controller{done: make(chan struct{}), closing: make(chan struct{})}
-	// A stall at seq 7, then the cursor moves on and the retry stalls at 9.
-	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 7})
-	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9})
-	// A correlation from a LATER generation is not overtaken by an older beat.
-	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 4, AckedSeq: 2})
-	if !c.durableAckOutstanding() {
-		t.Fatal("three outstanding correlations are not reported outstanding")
-	}
+	t.Run("resolving a live call clears what it overtook", func(t *testing.T) {
+		t.Parallel()
+		c := &Controller{done: make(chan struct{}), closing: make(chan struct{})}
+		// A stall at seq 7 left a correlation nothing will ever answer.
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 7})
+		// A correlation from a LATER generation is not overtaken by this beat.
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 4, AckedSeq: 2})
+		// The retry is in flight at the advanced cursor.
+		live := shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9}
+		call := &heartbeatCall{expected: live, done: make(chan heartbeatResult, 1)}
+		c.heartbeatCall = call
 
-	// The durable side finally answers, at 9. Everything it overtook is moot.
-	c.heartbeatMu.Lock()
-	c.prunePendingReceiptsLocked(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9})
-	remaining := append([]heartbeatCorrelation(nil), c.pendingReceipts...)
-	c.heartbeatMu.Unlock()
-	want := []heartbeatCorrelation{{generation: 4, ackedSeq: 2}}
-	if len(remaining) != len(want) || remaining[0] != want[0] {
-		t.Fatalf("outstanding correlations after an answer at (3,9) = %+v, want %+v — a stale entry latches the hold on forever",
-			remaining, want)
-	}
+		if err := c.acceptHeartbeatReceipt(shimwire.HeartbeatMsg{
+			Generation: 3, AckedSeq: 9, Phase: shimwire.PhaseRunning,
+		}); err != nil {
+			t.Fatalf("acceptHeartbeatReceipt for the live call: %v", err)
+		}
+		if result := <-call.done; result.err != nil {
+			t.Fatalf("the live call resolved with %v, want success", result.err)
+		}
 
-	c.heartbeatMu.Lock()
-	c.prunePendingReceiptsLocked(shimwire.HeartbeatMsg{Generation: 4, AckedSeq: 2})
-	c.heartbeatMu.Unlock()
-	if c.durableAckOutstanding() {
-		t.Fatal("the ledger never empties; every later stall on this controller would hold the full ambiguity bound")
-	}
+		remaining := outstandingCorrelations(c)
+		want := []heartbeatCorrelation{{generation: 4, ackedSeq: 2}}
+		if len(remaining) != len(want) || remaining[0] != want[0] {
+			t.Fatalf("outstanding correlations after an answer at (3,9) = %+v, want %+v — a stale entry latches the hold on forever",
+				remaining, want)
+		}
+	})
+
+	t.Run("consuming a late receipt clears what it overtook", func(t *testing.T) {
+		t.Parallel()
+		c := &Controller{done: make(chan struct{}), closing: make(chan struct{})}
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 2, AckedSeq: 4})
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 7})
+		if !c.durableAckOutstanding() {
+			t.Fatal("two outstanding correlations are not reported outstanding")
+		}
+
+		if err := c.acceptHeartbeatReceipt(shimwire.HeartbeatMsg{
+			Generation: 3, AckedSeq: 7, Phase: shimwire.PhaseRunning,
+		}); err != nil {
+			t.Fatalf("acceptHeartbeatReceipt for a late receipt: %v", err)
+		}
+		if remaining := outstandingCorrelations(c); len(remaining) != 0 {
+			t.Fatalf("outstanding correlations after a late answer at (3,7) = %+v, want none — an older generation cannot outlive it",
+				remaining)
+		}
+		if c.durableAckOutstanding() {
+			t.Fatal("the ledger never empties; every later stall on this controller would hold the full ambiguity bound")
+		}
+	})
+
+	t.Run("an older answer does not clear a newer outstanding entry", func(t *testing.T) {
+		t.Parallel()
+		c := &Controller{done: make(chan struct{}), closing: make(chan struct{})}
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 7})
+		c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9})
+
+		// The 7 lands late. The 9 is still genuinely outstanding: the durable
+		// side has not said anything about it, and forgetting it would fail
+		// closed on a consumer that really is still waiting.
+		if err := c.acceptHeartbeatReceipt(shimwire.HeartbeatMsg{
+			Generation: 3, AckedSeq: 7, Phase: shimwire.PhaseRunning,
+		}); err != nil {
+			t.Fatalf("acceptHeartbeatReceipt for the older receipt: %v", err)
+		}
+		remaining := outstandingCorrelations(c)
+		want := []heartbeatCorrelation{{generation: 3, ackedSeq: 9}}
+		if len(remaining) != len(want) || remaining[0] != want[0] {
+			t.Fatalf("outstanding correlations after an answer at (3,7) = %+v, want %+v — pruning ran ahead of the evidence",
+				remaining, want)
+		}
+	})
 }
 
 // TestAnchoredButNoLongerAmbiguousFallsThroughToTheOrdinaryVerdict pins the

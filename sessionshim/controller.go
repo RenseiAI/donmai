@@ -132,10 +132,18 @@ type ControllerOptions struct {
 	// receipt only that reader can deliver severs the carrier through the very
 	// knob meant to tune the back-pressure.
 	EventBacklogStallDeadline time.Duration
-	// DurableAckAmbiguityBound overrides durableAckAmbiguityBound for this
-	// controller: the absolute time a stalled reader is held open while a
-	// durable acknowledgement this controller sent is still outstanding. Zero
-	// uses the default.
+	// DurableAckAmbiguityBound is the absolute time a stalled reader is held
+	// open while a durable acknowledgement this controller sent is still
+	// outstanding.
+	//
+	// A composing daemon MUST set this from its own resolved lineage-live
+	// re-adoption window. ADR-2026-09-03 makes the two ONE configured value
+	// ("Implementations MUST treat the two as one configured value, not two
+	// values that happen to default identically today"), and the package
+	// default satisfies that only for a composition that also runs the default
+	// window: a deployment that configures a twenty-minute window and leaves
+	// this zero gets a ten-minute bound, which is the silent drift the ADR's
+	// Risks section names. Zero uses DurableAckAmbiguityBound.
 	DurableAckAmbiguityBound time.Duration
 
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
@@ -188,6 +196,16 @@ func (o ControllerOptions) durableAckAmbiguityBound() time.Duration {
 		return o.DurableAckAmbiguityBound
 	}
 	return DurableAckAmbiguityBound
+}
+
+// ResolvedDurableAckAmbiguityBound reports the bound a controller built from
+// these options would actually hold for, after the default and the floor.
+//
+// It is exported so the composing daemon can assert that its configured
+// re-adoption window REACHES the controller, rather than that the two defaults
+// happen to agree — the drift ADR-2026-09-03's Risks section names.
+func (o ControllerOptions) ResolvedDurableAckAmbiguityBound() time.Duration {
+	return clampDurableAckAmbiguityBound(o.durableAckAmbiguityBound(), clampEventBacklogStall(o.eventBacklogStallDeadline()))
 }
 
 func (o ControllerOptions) logger() *slog.Logger {

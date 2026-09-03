@@ -2118,6 +2118,34 @@ func (p SessionShimReadoptionPolicy) WorstCaseWindow() time.Duration {
 	return total
 }
 
+// durableAckAmbiguityWindow is the lineage-live re-adoption window this policy
+// resolves to — and, by ADR-2026-09-03, the durable-acknowledgement ambiguity
+// bound as well.
+//
+// The two are ONE configured value, not two that default identically: "a future
+// change to one without considering the other could silently change both …
+// Implementations MUST treat the two as one configured value." So this is the
+// single place the window is resolved for that purpose, and every controller
+// this daemon dials carries the answer.
+//
+// A fixed-attempts policy configures no window — its bound is attempt
+// arithmetic, which answers a different question (how long a bounded RETRY
+// runs) than this one (how long an alive-but-unproven lineage is tolerated
+// before re-adoption decides). It therefore resolves to the same default
+// lineage-live window the ADR names, exactly as an unset Window does.
+func (p SessionShimReadoptionPolicy) durableAckAmbiguityWindow() time.Duration {
+	if p.Window > 0 {
+		return p.Window
+	}
+	return defaultSessionShimReadoptionWindow
+}
+
+// durableAckAmbiguityBound is the bound every controller this daemon dials is
+// given, resolved from the re-adoption policy it is running.
+func (c SessionShimConfig) durableAckAmbiguityBound() time.Duration {
+	return c.readoption().durableAckAmbiguityWindow()
+}
+
 // launchTimeout returns the effective bound on one shim launch.
 func (c SessionShimConfig) launchTimeout() time.Duration {
 	if c.LaunchTimeout <= 0 {
@@ -2176,6 +2204,7 @@ func (d *Daemon) sessionShimAdoptOptions(
 		ControllerID:              d.controllerID(),
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
 		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
 		Logger:                    slog.Default(),
 	}

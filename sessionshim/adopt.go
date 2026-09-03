@@ -71,6 +71,14 @@ type AdoptOptions struct {
 	// (which sits above the durable-heartbeat receipt wait bound) are raised to
 	// it rather than honoured — see ControllerOptions.EventBacklogStallDeadline.
 	EventBacklogStallDeadline time.Duration
+	// DurableAckAmbiguityBound overrides how long a stalled reader is held open
+	// while a durable acknowledgement is outstanding. Zero uses the sessionshim
+	// default, which is the WRONG answer for any composition that configures a
+	// re-adoption window: ADR-2026-09-03 makes this bound and the lineage-live
+	// re-adoption window ONE configured value, so a composing daemon must set
+	// this from its resolved policy rather than letting two defaults agree by
+	// coincidence. See ControllerOptions.DurableAckAmbiguityBound.
+	DurableAckAmbiguityBound time.Duration
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -452,6 +460,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		DurableAckGeneration:       durableAckGeneration,
 		EventBacklogBudget:         opts.EventBacklogBudget,
 		EventBacklogStallDeadline:  opts.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:   opts.DurableAckAmbiguityBound,
 		ExpectedWorkarea:           expected,
 		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,
