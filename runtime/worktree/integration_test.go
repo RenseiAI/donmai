@@ -143,7 +143,7 @@ func TestIntegrationWorktreeBaseRefreshesBetweenLaunches(t *testing.T) {
 	newTip := strings.TrimSpace(run(advance, "rev-parse", "HEAD"))
 	run(advance, "push", "origin", "main")
 	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
-		SessionID: "second", Branch: "session-second", Strategy: worktree.StrategyWorktreeAdd,
+		SessionID: "second", Strategy: worktree.StrategyWorktreeAdd,
 		ParentRepoPath: parent, BaseRef: "origin/main",
 	}); err != nil {
 		t.Fatalf("second Provision: %v", err)

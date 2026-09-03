@@ -7,8 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
-	"slices"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -565,6 +565,7 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls [][]string
+	var worktreePath string
 	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		calls = append(calls, append([]string(nil), args...))
 		switch args[2] {
@@ -573,6 +574,7 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 		case "rev-parse":
 			return []byte("abc123\n"), nil
 		case "worktree":
+			worktreePath = args[len(args)-2]
 			_ = os.MkdirAll(args[len(args)-2], 0o750)
 		}
 		return nil, nil
@@ -596,21 +598,51 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 	if result.BaseRef != "main" || result.BaseSHA != "abc123" || !result.BaseFetched {
 		t.Fatalf("base receipt = %#v", result)
 	}
-	if result.BaseFetchDuration > time.Second {
-		t.Fatalf("base fetch duration = %s, want a bounded test duration", result.BaseFetchDuration)
+	if result.BaseFetchDuration <= 0 || result.BaseFetchDuration > time.Second {
+		t.Fatalf("base fetch duration = %s, want (0, 1s]", result.BaseFetchDuration)
+	}
+	if calls[2][1] != worktreePath {
+		t.Fatalf("receipt rev-parse target = %q, want worktree %q", calls[2][1], worktreePath)
 	}
 }
 
-func TestProvisionWorktreeBaseRefPinsDetachedStartPoint(t *testing.T) {
+func TestProvisionRejectsDashPrefixedBaseRef(t *testing.T) {
 	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		t.Fatal(err)
 	}
-	var worktreeArgs []string
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		t.Fatalf("git invoked for invalid ref: %v", args)
+		return nil, errors.New("unreachable")
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "dash-ref", Strategy: worktree.StrategyWorktreeAdd,
+		ParentRepoPath: parent, BaseRef: "--bad-ref",
+	})
+	if !errors.Is(err, worktree.ErrInvalidBaseRef) {
+		t.Fatalf("error = %v, want ErrInvalidBaseRef", err)
+	}
+}
+
+func TestProvisionConcurrentWorktreeAddsUseNoTrack(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var mu sync.Mutex
+	var worktreeCalls [][]string
 	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		switch args[2] {
+		case "fetch":
+			return nil, nil
 		case "worktree":
-			worktreeArgs = append([]string(nil), args...)
+			mu.Lock()
+			worktreeCalls = append(worktreeCalls, append([]string(nil), args...))
+			mu.Unlock()
 			if err := os.MkdirAll(args[len(args)-2], 0o750); err != nil {
 				return nil, err
 			}
@@ -623,17 +655,28 @@ func TestProvisionWorktreeBaseRefPinsDetachedStartPoint(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "base-ref-only", Strategy: worktree.StrategyWorktreeAdd,
-		ParentRepoPath: parent, BaseRef: "origin/main",
-	}); err != nil {
-		t.Fatal(err)
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, provisionErr := m.Provision(context.Background(), worktree.ProvisionSpec{
+				SessionID: fmt.Sprintf("concurrent-%d", i), Branch: fmt.Sprintf("session-%d", i),
+				Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+			})
+			if provisionErr != nil {
+				t.Errorf("Provision %d: %v", i, provisionErr)
+			}
+		}(i)
 	}
-	if slices.Contains(worktreeArgs, "-B") {
-		t.Fatalf("worktree args unexpectedly create a branch: %v", worktreeArgs)
+	wg.Wait()
+	if len(worktreeCalls) != 4 {
+		t.Fatalf("worktree calls = %d, want 4", len(worktreeCalls))
 	}
-	if got := worktreeArgs[len(worktreeArgs)-1]; got != "origin/main" {
-		t.Fatalf("worktree base = %q, want origin/main: %v", got, worktreeArgs)
+	for _, args := range worktreeCalls {
+		if len(args) < 6 || args[4] != "--no-track" {
+			t.Fatalf("worktree args = %v, want --no-track", args)
+		}
 	}
 }
 

@@ -194,7 +194,8 @@ type ProvisionResult struct {
 	// Attempts is the number of attempts taken (1 on success first try).
 	Attempts int
 	// BaseRef is the ref refreshed before creating a session branch. These
-	// fields are populated only for StrategyWorktreeAdd.
+	// fields are populated only for StrategyWorktreeAdd/WorktreeAdd repository
+	// declarations.
 	BaseRef string
 	// BaseSHA is the resolved tip of BaseRef after the refresh.
 	BaseSHA string
@@ -1737,9 +1738,8 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			return errors.New("ParentRepoPath required for StrategyWorktreeAdd")
 		}
 		args := []string{"-C", parent, "worktree", "add"}
-		args = append(args, "--no-track")
 		if spec.Branch != "" {
-			args = append(args, "-B", spec.Branch)
+			args = append(args, "--no-track", "-B", spec.Branch)
 		}
 		args = append(args, dst)
 		if spec.Branch != "" || spec.BaseRef != "" {
