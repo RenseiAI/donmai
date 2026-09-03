@@ -2,10 +2,12 @@ package worktree_test
 
 import (
 	"context"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -154,5 +156,41 @@ func TestIntegrationWorktreeBaseRefreshesBetweenLaunches(t *testing.T) {
 	}
 	if result.BaseRef != "main" || result.BaseSHA != newTip || !result.BaseFetched {
 		t.Fatalf("second base receipt = %#v, want tip %s", result, newTip)
+	}
+}
+
+func TestIntegrationConcurrentWorktreeAdds(t *testing.T) {
+	requireGit(t)
+
+	bare := initBareRepo(t)
+	parent := filepath.Join(t.TempDir(), "parent")
+	//nolint:gosec // test fixture uses the git binary selected by PATH.
+	clone := exec.Command("git", "clone", "--branch", "main", bare, parent)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Fatalf("clone parent: %v\n%s", err, out)
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var wg sync.WaitGroup
+	errs := make(chan error, 4)
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func(i int) {
+			defer wg.Done()
+			_, provisionErr := m.Provision(context.Background(), worktree.ProvisionSpec{
+				SessionID: fmt.Sprintf("concurrent-%d", i), Branch: fmt.Sprintf("session-%d", i),
+				Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent, BaseRef: "origin/main",
+			})
+			if provisionErr != nil {
+				errs <- provisionErr
+			}
+		}(i)
+	}
+	wg.Wait()
+	close(errs)
+	for provisionErr := range errs {
+		t.Errorf("concurrent Provision: %v", provisionErr)
 	}
 }

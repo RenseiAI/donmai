@@ -194,8 +194,8 @@ type ProvisionResult struct {
 	// Attempts is the number of attempts taken (1 on success first try).
 	Attempts int
 	// BaseRef is the ref refreshed before creating a session branch. These
-	// fields are populated only for StrategyWorktreeAdd/WorktreeAdd repository
-	// declarations.
+	// fields are populated only for a single-repository StrategyWorktreeAdd
+	// provision.
 	BaseRef string
 	// BaseSHA is the resolved tip of BaseRef after the refresh.
 	BaseSHA string

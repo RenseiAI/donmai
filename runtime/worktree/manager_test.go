@@ -570,6 +570,7 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 		calls = append(calls, append([]string(nil), args...))
 		switch args[2] {
 		case "fetch":
+			time.Sleep(5 * time.Millisecond)
 			return nil, nil
 		case "rev-parse":
 			return []byte("abc123\n"), nil
@@ -606,25 +607,31 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 	}
 }
 
-func TestProvisionRejectsDashPrefixedBaseRef(t *testing.T) {
+func TestProvisionRejectsUnsafeBaseRefs(t *testing.T) {
 	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		t.Fatal(err)
 	}
+	var calls atomic.Int64
 	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
-		t.Fatalf("git invoked for invalid ref: %v", args)
-		return nil, errors.New("unreachable")
+		calls.Add(1)
+		return nil, errors.New("runner must not be called")
 	}
 	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
 	if err != nil {
 		t.Fatal(err)
 	}
-	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
-		SessionID: "dash-ref", Strategy: worktree.StrategyWorktreeAdd,
-		ParentRepoPath: parent, BaseRef: "--bad-ref",
-	})
-	if !errors.Is(err, worktree.ErrInvalidBaseRef) {
-		t.Fatalf("error = %v, want ErrInvalidBaseRef", err)
+	for i, ref := range []string{"-upload-pack=x", "origin/-x", "origin/"} {
+		_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+			SessionID: fmt.Sprintf("unsafe-ref-%d", i), Strategy: worktree.StrategyWorktreeAdd,
+			ParentRepoPath: parent, BaseRef: ref,
+		})
+		if !errors.Is(err, worktree.ErrInvalidBaseRef) {
+			t.Fatalf("ref %q: error = %v, want ErrInvalidBaseRef", ref, err)
+		}
+	}
+	if got := calls.Load(); got != 0 {
+		t.Fatalf("git calls = %d, want 0", got)
 	}
 }
 
