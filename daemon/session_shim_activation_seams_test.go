@@ -947,6 +947,9 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	}
 
 	readinessError.Store(true)
+	d.readinessMu.Lock()
+	d.readinessCache.nextTry = time.Time{}
+	d.readinessMu.Unlock()
 	if err := service.sendOneResult(context.Background()); err != nil {
 		t.Fatalf("degraded readiness heartbeat: %v", err)
 	}
@@ -962,6 +965,9 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 		t.Fatalf("degraded session-shim projection = %+v, want unknown with reason and timestamp", degraded.SessionShim)
 	}
 	readinessError.Store(false)
+	d.readinessMu.Lock()
+	d.readinessCache.nextTry = time.Time{}
+	d.readinessMu.Unlock()
 	if err := service.sendOneResult(context.Background()); err != nil {
 		t.Fatalf("recovered readiness heartbeat: %v", err)
 	}
@@ -969,8 +975,9 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	if err := json.Unmarshal(rawBody, &recovered); err != nil {
 		t.Fatalf("decode recovered heartbeat: %v", err)
 	}
-	if endpointCalls.Load() != 3 || recovered.SessionShim == nil || recovered.SessionShim.ReadinessState != "ready" {
-		t.Fatalf("recovered heartbeat calls/projection = %d/%+v, want 3/ready", endpointCalls.Load(), recovered.SessionShim)
+	if endpointCalls.Load() != 3 || recovered.SessionShim == nil || recovered.SessionShim.ReadinessState != "" ||
+		recovered.SessionShim.ReadinessObservedAt != "" {
+		t.Fatalf("recovered heartbeat calls/projection = %d/%+v, want 3/legacy-ready", endpointCalls.Load(), recovered.SessionShim)
 	}
 }
 
@@ -1185,8 +1192,14 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			}
 		})
 		t.Run(reason+"/capacity", func(t *testing.T) {
-			if got := heartbeatCount.Load(); got != priorHeartbeats {
-				t.Fatalf("withdrawal published a heartbeat/capacity claim: got %d want %d", got, priorHeartbeats)
+			if got := heartbeatCount.Load(); got != priorHeartbeats+1 {
+				t.Fatalf("withdrawal did not publish its draining heartbeat: got %d want %d", got, priorHeartbeats+1)
+			}
+			mu.Lock()
+			beat := lastHeartbeat
+			mu.Unlock()
+			if beat.Status != string(RegistrationDraining) || beat.MaxSessions != 0 {
+				t.Fatalf("withdrawal heartbeat advertised capacity: status=%q maxSessions=%d", beat.Status, beat.MaxSessions)
 			}
 		})
 		t.Run(reason+"/poll", func(t *testing.T) {

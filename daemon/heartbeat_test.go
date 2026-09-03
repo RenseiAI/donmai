@@ -3,7 +3,6 @@ package daemon
 import (
 	"context"
 	"encoding/json"
-	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -59,50 +58,37 @@ func TestHeartbeatService_IdempotentStart(_ *testing.T) {
 	hs.Stop()
 }
 
-func TestHeartbeatService_DegradedSessionShimProjectionStillPosts(t *testing.T) {
-	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
-	var got heartbeatRequestBody
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
-			t.Errorf("decode heartbeat: %v", err)
-		}
-		_ = json.NewEncoder(w).Encode(heartbeatResponseBody{
-			Acknowledged: true,
-			SessionShim:  got.SessionShim,
-		})
-	}))
-	t.Cleanup(srv.Close)
-
-	projection := SessionShimHeartbeatProjection{
-		Enabled:             true,
-		AdoptionComplete:    true,
-		WorkerHostID:        "host",
-		ControllerID:        "controller",
-		AdoptionRevision:    "revision",
-		ReadinessState:      "unknown",
-		ReadinessReason:     "resolver: upstream unavailable",
-		ReadinessObservedAt: "2026-09-03T00:00:00Z",
-	}
-	hs := NewHeartbeatService(HeartbeatOptions{
-		WorkerID: "worker", Hostname: "host", OrchestratorURL: srv.URL,
-		RuntimeJWT: "runtime.jwt", IntervalSeconds: 1,
-		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
-		GetStatus: func() RegistrationStatus { return RegistrationIdle },
-		GetSessionShim: func() (SessionShimHeartbeatProjection, error) {
-			return SessionShimHeartbeatProjection{}, errors.New("resolver: upstream unavailable")
+func TestSessionShimReadinessCacheCadenceAndStaleness(t *testing.T) {
+	var calls atomic.Int64
+	d := New(Options{SessionShim: SessionShimConfig{
+		EnableAdoption: true,
+		GetCarrierProofV2Readiness: func() (SessionShimCarrierProofV2Readiness, error) {
+			calls.Add(1)
+			return testSessionShimProofV2Readiness()
 		},
-		GetSessionShimDegraded: func(err error) (SessionShimHeartbeatProjection, error) {
-			if err == nil {
-				t.Fatal("degraded hook received nil error")
-			}
-			return projection, nil
-		},
+	}})
+	d.shimIdentityRef.Store(&sessionShimIdentity{
+		config:      &d.opts.SessionShim,
+		attestation: SessionShimHostAttestation{Supported: SessionShimSupported},
 	})
-	if err := hs.sendOneResult(context.Background()); err != nil {
-		t.Fatalf("sendOneResult: %v", err)
+	if _, state, _, _, err := d.cachedSessionShimReadiness(); err != nil || state != "" {
+		t.Fatalf("first readiness lookup = state %q, err %v", state, err)
 	}
-	if got.SessionShim == nil || got.SessionShim.ReadinessState != "unknown" {
-		t.Fatalf("heartbeat session shim = %+v, want unknown readiness", got.SessionShim)
+	if _, state, _, _, err := d.cachedSessionShimReadiness(); err != nil || state != "" {
+		t.Fatalf("cached readiness lookup = state %q, err %v", state, err)
+	}
+	if got := calls.Load(); got != 1 {
+		t.Fatalf("readiness resolver calls within cadence = %d, want 1", got)
+	}
+	d.readinessMu.Lock()
+	d.readinessCache.state = "unknown"
+	d.readinessCache.reason = "temporary outage"
+	d.readinessCache.observedAt = time.Now().Add(-sessionShimReadinessStaleAfter - time.Second)
+	d.readinessCache.nextTry = time.Time{}
+	d.readinessMu.Unlock()
+	_, state, reason, _, err := d.cachedSessionShimReadiness()
+	if err != nil || state != "not-ready" || reason != "stale" {
+		t.Fatalf("stale readiness = state %q reason %q err %v, want not-ready/stale", state, reason, err)
 	}
 }
 

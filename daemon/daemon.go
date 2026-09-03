@@ -354,6 +354,8 @@ type Daemon struct {
 	// the lifecycle state/spawner are closed and clears only after a newly
 	// acknowledged exact recovery heartbeat.
 	sessionShimReadinessWithdrawn atomic.Bool
+	readinessMu                   sync.Mutex
+	readinessCache                sessionShimReadinessCache
 
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be

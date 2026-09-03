@@ -145,12 +145,18 @@ var requiredSessionShimHostCapabilities = []string{
 // DurableCarrierProofV2Ready is separate carrier-owned durable ACK evidence; it
 // is never derived from the four composing support facts.
 type SessionShimCarrierProofV2Readiness struct {
-	DurableCarrierProofV2Ready          bool `json:"durable_carrier_proof_v2_ready"`
-	ComposingProofV1WritesClosed        bool `json:"composingProofV1WritesClosed"`
-	EncryptedOriginalCredentialRetained bool `json:"encryptedOriginalCredentialRetained"`
-	RemainingValidityConsumeGate        bool `json:"remainingValidityConsumeGate"`
-	AdoptedCandidateRecovery            bool `json:"adoptedCandidateRecovery"`
+	DurableCarrierProofV2Ready          bool `json:"durable_carrier_proof_v2_ready,omitempty"`
+	ComposingProofV1WritesClosed        bool `json:"composingProofV1WritesClosed,omitempty"`
+	EncryptedOriginalCredentialRetained bool `json:"encryptedOriginalCredentialRetained,omitempty"`
+	RemainingValidityConsumeGate        bool `json:"remainingValidityConsumeGate,omitempty"`
+	AdoptedCandidateRecovery            bool `json:"adoptedCandidateRecovery,omitempty"`
 }
+
+var (
+	ErrSessionShimReadinessUnavailable   = errors.New("session shim readiness unavailable")
+	ErrSessionShimReadinessRejected      = errors.New("session shim readiness rejected")
+	ErrSessionShimReadinessMisconfigured = errors.New("session shim readiness misconfigured")
+)
 
 func (r SessionShimCarrierProofV2Readiness) validate() error {
 	if !r.DurableCarrierProofV2Ready {
@@ -238,9 +244,9 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	if state == "" {
 		state = "ready"
 	}
-	if state == "unknown" {
+	if state == "unknown" || state == "not-ready" {
 		if p.ReadinessReason == "" || p.ReadinessObservedAt == "" {
-			return errors.New("session shim heartbeat projection unknown readiness is missing reason or observed-at")
+			return fmt.Errorf("session shim heartbeat projection %s readiness is missing reason or observed-at", state)
 		}
 	} else if state != "ready" {
 		return fmt.Errorf("session shim heartbeat projection has invalid readiness state %q", state)

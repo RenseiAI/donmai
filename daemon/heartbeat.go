@@ -63,11 +63,6 @@ type HeartbeatOptions struct {
 	// One callback is load-bearing: assembling host/revision/quarantine fields
 	// through separate callbacks would permit a torn readiness claim.
 	GetSessionShim func() (SessionShimHeartbeatProjection, error)
-	// GetSessionShimDegraded converts a transient projection/resolver failure
-	// into a heartbeat-safe projection. It is additive so existing embedders
-	// keep the original callback contract; a nil hook preserves the old
-	// fail-fast behavior for embedders that have not adopted degraded readiness.
-	GetSessionShimDegraded func(error) (SessionShimHeartbeatProjection, error)
 	// OnSessionShimAcknowledged runs only after the server has acknowledged and
 	// exactly echoed the session-shim projection. A daemon recovering from a
 	// dynamic proof-v2 readiness withdrawal uses this edge to reopen admission;
@@ -495,13 +490,7 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	if getSessionShim != nil {
 		projection, projectionErr := getSessionShim()
 		if projectionErr != nil {
-			if h.opts.GetSessionShimDegraded == nil {
-				return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
-			}
-			projection, projectionErr = h.opts.GetSessionShimDegraded(projectionErr)
-			if projectionErr != nil {
-				return fmt.Errorf("heartbeat: session shim degraded projection: %w", projectionErr)
-			}
+			return fmt.Errorf("heartbeat: session shim projection: %w", projectionErr)
 		}
 		projection = cloneSessionShimHeartbeatProjection(projection)
 		if err := projection.validateReady(); err != nil {

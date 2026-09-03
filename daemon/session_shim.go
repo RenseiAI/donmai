@@ -851,14 +851,14 @@ func (d *Daemon) resolveSessionShimCarrierProofV2Readiness() (SessionShimCarrier
 	}
 	resolve := d.sessionShimConfig().GetCarrierProofV2Readiness
 	if resolve == nil {
-		return SessionShimCarrierProofV2Readiness{}, errors.New("session shim: proof-v2 readiness resolver is required")
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("%w: proof-v2 readiness resolver is required", ErrSessionShimReadinessMisconfigured)
 	}
 	readiness, err := resolve()
 	if err != nil {
-		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("session shim: resolve proof-v2 readiness: %w", err)
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("%w: %w", ErrSessionShimReadinessUnavailable, err)
 	}
 	if err := readiness.validate(); err != nil {
-		return SessionShimCarrierProofV2Readiness{}, err
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("%w: %w", ErrSessionShimReadinessRejected, err)
 	}
 	return readiness, nil
 }
@@ -3648,10 +3648,13 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 	if !d.sessionShimEnabled() {
 		return SessionShimHeartbeatProjection{}, nil
 	}
-	readiness, readinessErr := d.resolveSessionShimCarrierProofV2Readiness()
-	if readinessErr != nil && isDefiniteSessionShimReadinessFailure(readinessErr) {
+	readiness, readinessState, readinessReason, readinessObservedAt, readinessErr := d.cachedSessionShimReadiness()
+	if readinessErr != nil && errors.Is(readinessErr, ErrSessionShimReadinessMisconfigured) {
 		d.withdrawSessionShimProofV2Readiness()
 		return SessionShimHeartbeatProjection{}, readinessErr
+	}
+	if readinessState == "not-ready" {
+		d.withdrawSessionShimProofV2Readiness()
 	}
 	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
@@ -3666,17 +3669,12 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		WorkerHostID:        receipt.WorkerHostID,
 		ControllerID:        d.controllerID(),
 		AdoptionRevision:    receipt.AdoptionRevision,
-		ReadinessState:      "ready",
-		ReadinessObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		ReadinessState:      readinessState,
+		ReadinessReason:     readinessReason,
+		ReadinessObservedAt: readinessObservedAt,
 		QuarantinedSessions: []SessionShimQuarantinedSession{},
 	}
-	if readinessErr != nil {
-		projection.ReadinessState = "unknown"
-		projection.ReadinessReason = boundedSessionShimReadinessReason(readinessErr)
-		if projection.ReadinessObservedAt == "" {
-			projection.ReadinessObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
-		}
-	} else {
+	if readinessErr == nil && readinessState == "" {
 		projection.SessionShimCarrierProofV2Readiness = readiness
 	}
 	if !d.shims.carrierActivationComplete {
@@ -3716,12 +3714,6 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 	return projection, nil
 }
 
-func isDefiniteSessionShimReadinessFailure(err error) bool {
-	reason := err.Error()
-	return strings.Contains(reason, "readiness acknowledgement is required") ||
-		strings.Contains(reason, "composition support is incomplete")
-}
-
 func boundedSessionShimReadinessReason(err error) string {
 	reason := strings.TrimSpace(err.Error())
 	const maxReasonLength = 256
@@ -3729,6 +3721,77 @@ func boundedSessionShimReadinessReason(err error) string {
 		return reason[:maxReasonLength]
 	}
 	return reason
+}
+
+const (
+	sessionShimReadinessHealthyCadence = 30 * time.Second
+	sessionShimReadinessRetryCadence   = 5 * time.Second
+	sessionShimReadinessStaleAfter     = 10 * time.Minute
+)
+
+type sessionShimReadinessCache struct {
+	readiness  SessionShimCarrierProofV2Readiness
+	state      string
+	reason     string
+	observedAt time.Time
+	nextTry    time.Time
+	failures   int
+	valid      bool
+}
+
+func (d *Daemon) cachedSessionShimReadiness() (SessionShimCarrierProofV2Readiness, string, string, string, error) {
+	now := time.Now()
+	d.readinessMu.Lock()
+	if d.readinessCache.valid && now.Before(d.readinessCache.nextTry) {
+		c := d.readinessCache
+		d.readinessMu.Unlock()
+		return c.readiness, c.state, c.reason, c.observedAt.UTC().Format(time.RFC3339Nano), nil
+	}
+	if d.readinessCache.valid && d.readinessCache.state == "unknown" &&
+		now.Sub(d.readinessCache.observedAt) >= sessionShimReadinessStaleAfter {
+		d.readinessCache.state = "not-ready"
+		d.readinessCache.reason = "stale"
+		d.readinessCache.nextTry = now.Add(sessionShimReadinessHealthyCadence)
+		c := d.readinessCache
+		d.readinessMu.Unlock()
+		return SessionShimCarrierProofV2Readiness{}, "not-ready", "stale", c.observedAt.UTC().Format(time.RFC3339Nano), nil
+	}
+
+	readiness, err := d.resolveSessionShimCarrierProofV2Readiness()
+	defer d.readinessMu.Unlock()
+	if err == nil {
+		d.readinessCache = sessionShimReadinessCache{
+			readiness: readiness, state: "", observedAt: now,
+			nextTry: now.Add(sessionShimReadinessHealthyCadence), valid: true,
+		}
+		return readiness, "", "", "", nil
+	}
+	if errors.Is(err, ErrSessionShimReadinessMisconfigured) {
+		d.readinessCache = sessionShimReadinessCache{}
+		return SessionShimCarrierProofV2Readiness{}, "", "", "", err
+	}
+	if errors.Is(err, ErrSessionShimReadinessRejected) {
+		d.readinessCache = sessionShimReadinessCache{
+			state: "not-ready", reason: boundedSessionShimReadinessReason(err), observedAt: now,
+			nextTry: now.Add(sessionShimReadinessHealthyCadence), valid: true,
+		}
+		return SessionShimCarrierProofV2Readiness{}, "not-ready", d.readinessCache.reason,
+			now.UTC().Format(time.RFC3339Nano), nil
+	}
+	failures := d.readinessCache.failures + 1
+	delay := sessionShimReadinessRetryCadence * time.Duration(1<<min(failures-1, 3))
+	if delay > sessionShimReadinessHealthyCadence {
+		delay = sessionShimReadinessHealthyCadence
+	}
+	observedAt := now
+	if d.readinessCache.valid && d.readinessCache.state == "unknown" {
+		observedAt = d.readinessCache.observedAt
+	}
+	d.readinessCache = sessionShimReadinessCache{
+		state: "unknown", reason: boundedSessionShimReadinessReason(err), observedAt: observedAt,
+		nextTry: now.Add(delay), failures: failures, valid: true,
+	}
+	return SessionShimCarrierProofV2Readiness{}, "unknown", d.readinessCache.reason, observedAt.UTC().Format(time.RFC3339Nano), nil
 }
 
 // SessionShimDiagnostics returns the bounded secret-free ownership projection
