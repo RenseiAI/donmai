@@ -231,11 +231,20 @@ type Manager struct {
 	now              func() time.Time
 	lifecycleHook    func(string)
 
-	mu            sync.Mutex
-	sessions      map[string]*ProvisionResult
-	sessionLocks  map[string]*sync.Mutex
-	worktreeLocks map[string]*sync.Mutex
+	mu           sync.Mutex
+	sessions     map[string]*ProvisionResult
+	sessionLocks map[string]*sync.Mutex
 }
+
+type parentWorktreeLock struct {
+	mu   sync.Mutex
+	refs int
+}
+
+var parentWorktreeLocks = struct {
+	sync.Mutex
+	locks map[string]*parentWorktreeLock
+}{locks: make(map[string]*parentWorktreeLock)}
 
 // ProvisionHook is a test/fault-injection seam at durable crash boundaries.
 type ProvisionHook func(stage string, acquisition workarea.AcquisitionRecord) error
@@ -377,7 +386,6 @@ func NewManager(opts Options) (*Manager, error) {
 		lifecycleHook:    opts.LifecycleHook,
 		sessions:         make(map[string]*ProvisionResult),
 		sessionLocks:     make(map[string]*sync.Mutex),
-		worktreeLocks:    make(map[string]*sync.Mutex),
 	}
 	if acquisitions != nil {
 		if err := manager.restoreReadyAcquisitions(); err != nil {
@@ -693,6 +701,10 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		return "", err
 	}
 
+	baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
+	if fetchErr != nil {
+		return "", fetchErr
+	}
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
 		attempts = attempt
@@ -709,25 +721,6 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 					"sessionId", spec.SessionID, "err", probeErr)
 			}
 		}
-		baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
-		if fetchErr != nil {
-			if errors.Is(fetchErr, ErrInvalidBaseRef) {
-				return "", fetchErr
-			}
-			if attempt == MaxSpawnRetries {
-				return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w", attempt, fetchErr)
-			}
-			m.logger.Warn("worktree base refresh failed; retrying",
-				"sessionId", spec.SessionID, "attempt", attempt,
-				"max", MaxSpawnRetries, "err", fetchErr)
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(m.delay):
-			}
-			continue
-		}
-
 		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec)
 		if err == nil {
 			res := &ProvisionResult{
@@ -735,7 +728,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				Mode: ModeExclusive, OwnerSessionID: spec.SessionID, CacheSeedID: spec.CacheSeedID,
 				Repositories: repositories, Strategy: spec.Strategy,
 				ParentRepoPath: parentRepoPath, Attempts: attempts,
-				BaseRef: baseInfo.Ref, BaseSHA: baseInfo.SHA, BaseFetchDuration: baseInfo.Duration,
+				BaseRef: baseInfo.Ref, BaseFetchDuration: baseInfo.Duration,
 				BaseFetched: baseInfo.Fetched,
 			}
 			if acquisition.AcquisitionID != "" {
@@ -1297,6 +1290,8 @@ func (m *Manager) teardownResult(ctx context.Context, res ProvisionResult) error
 		return errors.New("runtime/worktree: nested root has no acquisition cleanup authority")
 	}
 	if res.Strategy == StrategyWorktreeAdd && res.ParentRepoPath != "" {
+		worktreeUnlock := acquireParentWorktreeLock(res.ParentRepoPath)
+		defer worktreeUnlock()
 		out, err := m.runGit(ctx, "", "-C", res.ParentRepoPath, "worktree", "remove", "--force", res.Path)
 		if err != nil {
 			removed, verifyErr := m.worktreeAlreadyRemoved(ctx, res.ParentRepoPath, res.Path)
@@ -1602,7 +1597,6 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 
 type baseFetchInfo struct {
 	Ref      string
-	SHA      string
 	Duration time.Duration
 	Fetched  bool
 }
@@ -1760,10 +1754,9 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			// branches are also fine because -B resets the branch.
 			args = append(args, "origin/"+baseRef)
 		}
-		worktreeLock := m.parentWorktreeLock(parent)
-		worktreeLock.Lock()
+		worktreeUnlock := acquireParentWorktreeLock(parent)
 		out, err := m.runGit(ctx, spec.RepoURL, args...)
-		worktreeLock.Unlock()
+		worktreeUnlock()
 		if err != nil {
 			return fmt.Errorf("git worktree add: %w (%s)", err, strings.TrimSpace(string(out)))
 		}
@@ -1785,15 +1778,38 @@ func (m *Manager) lockSession(sessionID string) func() {
 	return lock.Unlock
 }
 
-func (m *Manager) parentWorktreeLock(parent string) *sync.Mutex {
-	m.mu.Lock()
-	defer m.mu.Unlock()
-	lock := m.worktreeLocks[parent]
+func acquireParentWorktreeLock(parent string) func() {
+	key := canonicalParentPath(parent)
+	parentWorktreeLocks.Lock()
+	lock := parentWorktreeLocks.locks[key]
 	if lock == nil {
-		lock = &sync.Mutex{}
-		m.worktreeLocks[parent] = lock
+		lock = &parentWorktreeLock{}
+		parentWorktreeLocks.locks[key] = lock
 	}
-	return lock
+	lock.refs++
+	parentWorktreeLocks.Unlock()
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		parentWorktreeLocks.Lock()
+		lock.refs--
+		if lock.refs == 0 {
+			delete(parentWorktreeLocks.locks, key)
+		}
+		parentWorktreeLocks.Unlock()
+	}
+}
+
+func canonicalParentPath(parent string) string {
+	abs, err := filepath.Abs(parent)
+	if err != nil {
+		return filepath.Clean(parent)
+	}
+	abs = filepath.Clean(abs)
+	if resolved, err := filepath.EvalSymlinks(abs); err == nil {
+		return filepath.Clean(resolved)
+	}
+	return abs
 }
 
 // runGit runs a git invocation, applying the credential-hardening seam when a
@@ -1855,6 +1871,8 @@ func (m *Manager) cleanupConflict(ctx context.Context, layout workarea.Layout, s
 		return fmt.Errorf("%w: %s", workarea.ErrWorkareaLeased, root)
 	}
 	if spec.Strategy == StrategyWorktreeAdd && spec.ParentRepoPath != "" {
+		worktreeUnlock := acquireParentWorktreeLock(spec.ParentRepoPath)
+		defer worktreeUnlock()
 		_, _ = m.runGit(ctx, "", "-C", spec.ParentRepoPath, "worktree", "remove", "--force", layout.Repository.String())
 	}
 	if _, err := os.Stat(root); err == nil {

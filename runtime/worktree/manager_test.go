@@ -613,7 +613,7 @@ func TestProvisionRejectsUnsafeBaseRefs(t *testing.T) {
 		t.Fatal(err)
 	}
 	var calls atomic.Int64
-	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+	runner := func(_ context.Context, _ string, _ ...string) ([]byte, error) {
 		calls.Add(1)
 		return nil, errors.New("runner must not be called")
 	}
@@ -707,8 +707,8 @@ func TestProvisionFetchFailureDoesNotCreateBranch(t *testing.T) {
 	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
 		SessionID: "failed-fetch", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
 	})
-	if !errors.Is(err, worktree.ErrBaseFetch) || calls != worktree.MaxSpawnRetries {
-		t.Fatalf("error = %v, calls = %d; want typed fetch failure and no branch", err, calls)
+	if !errors.Is(err, worktree.ErrBaseFetch) || calls != 1 {
+		t.Fatalf("error = %v, calls = %d; want typed fetch failure and one fetch", err, calls)
 	}
 }
 
@@ -747,13 +747,15 @@ func TestProvisionFetchRetryProbesOwnership(t *testing.T) {
 		t.Fatal(err)
 	}
 	var fetchCalls, probeCalls atomic.Int64
+	var worktreeCalls atomic.Int64
 	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
 		switch args[2] {
 		case "fetch":
-			if fetchCalls.Add(1) == 1 {
-				return []byte("network unavailable"), errors.New("fetch failed")
-			}
+			fetchCalls.Add(1)
 		case "worktree":
+			if worktreeCalls.Add(1) == 1 {
+				return []byte("already checked out"), errors.New("worktree conflict")
+			}
 			_ = os.MkdirAll(args[len(args)-2], 0o750)
 		case "rev-parse":
 			return []byte("abc123\n"), nil
@@ -775,8 +777,8 @@ func TestProvisionFetchRetryProbesOwnership(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	if got := fetchCalls.Load(); got != 2 {
-		t.Fatalf("fetch calls = %d, want 2", got)
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1", got)
 	}
 	if got := probeCalls.Load(); got != 1 {
 		t.Fatalf("ownership probes = %d, want 1", got)
