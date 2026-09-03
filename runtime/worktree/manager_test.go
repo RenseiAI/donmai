@@ -526,17 +526,17 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 		t.Fatal(err)
 	}
 	var captured []string
-	runner := newStubRunner(
-		func(_ string, args ...string) ([]byte, error) {
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[2] == "worktree" {
 			captured = append([]string(nil), args...)
 			dst := args[len(args)-2] // dst, then origin/branch tail
 			_ = os.MkdirAll(dst, 0o750)
-			return nil, nil
-		},
-	)
+		}
+		return nil, nil
+	}
 	m, err := worktree.NewManager(worktree.Options{
 		ParentDir:     dir,
-		CommandRunner: runner.run,
+		CommandRunner: runner,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -555,6 +555,92 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 		if captured[i] != want[i] {
 			t.Fatalf("git args mismatch:\n got: %v\nwant prefix: %v", captured, want)
 		}
+	}
+}
+
+func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var calls [][]string
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls = append(calls, append([]string(nil), args...))
+		switch args[2] {
+		case "fetch":
+			return nil, nil
+		case "rev-parse":
+			return []byte("abc123\n"), nil
+		case "worktree":
+			_ = os.MkdirAll(args[len(args)-2], 0o750)
+		}
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "receipt", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if len(calls) != 3 || calls[0][2] != "fetch" || calls[1][2] != "rev-parse" {
+		t.Fatalf("git calls = %#v, want fetch, rev-parse, worktree", calls)
+	}
+	result, err := m.Result("receipt")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaseRef != "main" || result.BaseSHA != "abc123" || result.BaseFetchDuration < 0 {
+		t.Fatalf("base receipt = %#v", result)
+	}
+}
+
+func TestProvisionFetchFailureDoesNotCreateBranch(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var calls int
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
+		if args[2] == "fetch" {
+			return []byte("network unavailable"), errors.New("fetch failed")
+		}
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "failed-fetch", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+	})
+	if !errors.Is(err, worktree.ErrBaseFetch) || calls != 1 {
+		t.Fatalf("error = %v, calls = %d; want typed fetch failure and no branch", err, calls)
+	}
+}
+
+func TestProvisionSkipBaseFetchPreservesOfflineBehaviour(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[2] == "worktree" {
+			_ = os.MkdirAll(args[len(args)-2], 0o750)
+		}
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "offline", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent, SkipBaseFetch: true,
+	}); err != nil {
+		t.Fatal(err)
 	}
 }
 
