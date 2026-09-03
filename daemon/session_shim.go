@@ -672,8 +672,14 @@ type SessionShimConfig struct {
 	// composition that owns the session still wants it. Nil means "yes" — a
 	// standalone daemon has nothing above it to ask — so leaving it unset
 	// leaves the discovery record as the only observation, which is correct and
-	// is the OSS default. It is called once per attempt, off the daemon's lock,
-	// under the attempt's own context.
+	// is the OSS default.
+	//
+	// CALL RATE: once per re-adoption attempt, and once per PACED keepalive
+	// tick during a lineage-live window — so at most once per attempt plus once
+	// per resolved keepalive interval (a third of the orphan deadline by
+	// default), whichever is more frequent. It is deliberately NOT consulted on
+	// the fast probes the keepalive makes before its first honoured exchange.
+	// It runs off the daemon's lock, under its own bounded context.
 	LineageLive func(context.Context, sessionshim.Identity) bool
 
 	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
@@ -1661,13 +1667,14 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 // is still adopted, so a composition that wants its own disposition gets it
 // before the withdrawal rather than instead of it.
 //
-// There is deliberately no "keep it adopted" post-window option. The keepalive
-// stops when the window does, so a retained lineage's shim reaps on its own
-// deadline within minutes and writes a tombstone that nothing consumes — the
-// tombstone reconciler iterates the QUARANTINED set — leaving the daemon
+// There is deliberately no "keep it adopted" post-window option, and the
+// corpus says so: ADR-2026-09-03-readoption-exhaustion-withdraws amends rule 8
+// to make the withdrawal unconditional with the notification first. The
+// keepalive stops when the window does, so a retained lineage's shim reaps on
+// its own deadline within minutes and writes a tombstone that nothing consumes
+// — the tombstone reconciler iterates the QUARANTINED set — leaving the daemon
 // reporting an adopted lineage whose shim is gone, holding its capacity
-// forever. That is a false complete-snapshot and a permanent capacity leak, so
-// the withdrawal is not configurable.
+// forever. That is a false complete-snapshot and a permanent capacity leak.
 //
 // Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
 // only in lineage-live mode. Validate refuses the combinations that would make
@@ -1812,9 +1819,16 @@ const (
 	// this change's to extend — and the amendment asks only that the reason
 	// carried alongside it differ.
 	sessionShimReadoptionWindowExhaustedDetail = "readoption_window_exhausted: the re-adoption window ended with the shim still observable"
-	// sessionShimControllerLostDetail is the dead-shim / bounded-attempt
-	// detail, unchanged from before this amendment.
+	// sessionShimControllerLostDetail is the dead-shim detail, unchanged from
+	// before this amendment: the lineage is no longer observable, or the
+	// control plane already holds conflicting adoption evidence.
 	sessionShimControllerLostDetail = "controller stream ended before a terminal observation"
+	// sessionShimReadoptionAttemptsSpentDetail is a fixed-attempt budget that
+	// ran out with nothing having gone wrong that this daemon could name. It is
+	// its own sentence because "we stopped trying" and "there was nothing left
+	// to try" are different operator-facing facts, and reporting the second for
+	// the first is what makes an attempt budget look like a death.
+	sessionShimReadoptionAttemptsSpentDetail = "readoption_attempts_spent: the bounded re-adoption attempts ran out with the shim still observable"
 )
 
 // DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
@@ -1945,7 +1959,7 @@ func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 			c.Orphan.ExternalReleaseThreshold, ReadoptionFixedAttempts,
 		)
 	}
-	deadline := c.resolvedOrphanDeadline()
+	deadline := c.orphanDeadlineOfResolvedConfig()
 	if interval := policy.KeepaliveInterval; interval > 0 && interval*2 > deadline {
 		return fmt.Errorf(
 			"%w: KeepaliveInterval=%s leaves no slack against the %s orphan deadline it has to keep "+
@@ -1957,9 +1971,18 @@ func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 	return nil
 }
 
-// resolvedOrphanDeadline is the deadline the shims this daemon launches are
-// held to, with the standalone default filled in.
-func (c SessionShimConfig) resolvedOrphanDeadline() time.Duration {
+// orphanDeadlineOfResolvedConfig is the deadline the shims this daemon
+// launches are held to.
+//
+// It REQUIRES an already-resolved config — one that came through
+// sessionShimConfig(), which fills Orphan.Deadline in from
+// sessionShimOrphanDeadlineUnderExternalRelease when a composing deployment
+// declares an external release threshold and leaves the field zero. Both
+// callers are on that path. Handed a raw SessionShimConfig it would answer the
+// standalone fifteen-minute default for a deployment whose real deadline is
+// 115 s, and validate a keepalive interval against a deadline eight times the
+// true one — which is the exact failure the validation exists to prevent.
+func (c SessionShimConfig) orphanDeadlineOfResolvedConfig() time.Duration {
 	if c.Orphan.Deadline > 0 {
 		return c.Orphan.Deadline
 	}
@@ -1979,7 +2002,7 @@ func (c SessionShimConfig) readoptionKeepaliveInterval() time.Duration {
 	if configured := c.readoption().KeepaliveInterval; configured > 0 {
 		return configured
 	}
-	deadline := c.resolvedOrphanDeadline()
+	deadline := c.orphanDeadlineOfResolvedConfig()
 	if interval := deadline / sessionShimKeepaliveDeadlineDivisor; interval > minSessionShimKeepaliveInterval {
 		return interval
 	}

@@ -3,15 +3,18 @@ package daemon
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // readoptFixtureOptions composes one re-adoption fixture. Every field is
@@ -385,7 +388,7 @@ func TestLineageLiveStopsWhenTheLineageIsNoLongerHeld(t *testing.T) {
 
 // TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff is the
 // keepalive's reason for existing, in the one shape that cannot pass without
-// it: an orphan deadline of two seconds and a backoff of three. Between two
+// it: an orphan deadline of five seconds and a backoff of seven. Between two
 // attempts the shim's own clock fires, it reaps its harness, and the window
 // ends on a lineage that is gone — the exhaustion outcome unreachable because
 // the incarnation already left.
@@ -398,16 +401,21 @@ func TestLineageLiveStopsWhenTheLineageIsNoLongerHeld(t *testing.T) {
 // this one is about a real shim's real timer, and sharing a loaded machine with
 // a dozen other shims is how a timing pin becomes a coin flip.
 func TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff(t *testing.T) {
-	const orphanDeadline = 2 * time.Second
+	const orphanDeadline = 5 * time.Second
 	var exhausted struct {
 		sync.Mutex
 		calls int
 	}
 	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		// The backoff exceeds the orphan deadline on purpose: between two
+		// attempts the shim's own clock fires unless the keepalive holds it.
+		// The margin between the interval and the deadline is generous because
+		// CI runs this beside a dozen other real shims under -race, and a
+		// timing pin with one keepalive of slack is a coin flip there.
 		policy: SessionShimReadoptionPolicy{
-			Mode: ReadoptionLineageLive, Backoff: 3 * time.Second,
-			BackoffCap: 3 * time.Second, Window: 3500 * time.Millisecond,
-			KeepaliveInterval: 250 * time.Millisecond,
+			Mode: ReadoptionLineageLive, Backoff: 7 * time.Second,
+			BackoffCap: 7 * time.Second, Window: 8 * time.Second,
+			KeepaliveInterval: 500 * time.Millisecond,
 		},
 		orphan: sessionshim.OrphanPolicy{
 			Deadline: orphanDeadline, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
@@ -533,9 +541,9 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 			wantDetail: sessionShimReadoptionWindowExhaustedDetail,
 		},
 		{
-			name:       "a spent fixed-attempt policy keeps the dead-shim reason",
+			name:       "a spent fixed-attempt budget says so rather than reporting a death",
 			policy:     SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
-			wantDetail: sessionShimControllerLostDetail,
+			wantDetail: sessionShimReadoptionAttemptsSpentDetail,
 		},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -558,8 +566,13 @@ func TestExhaustedWindowQuarantinesUnderItsOwnReason(t *testing.T) {
 			}
 		})
 	}
-	if sessionShimReadoptionWindowExhaustedDetail == sessionShimControllerLostDetail {
-		t.Fatal("the two post-window details are identical; the outcomes are indistinguishable again")
+	details := map[string]bool{
+		sessionShimControllerLostDetail:            true,
+		sessionShimReadoptionAttemptsSpentDetail:   true,
+		sessionShimReadoptionWindowExhaustedDetail: true,
+	}
+	if len(details) != 3 {
+		t.Fatal("two of the three quarantine details are identical; the outcomes are indistinguishable again")
 	}
 	if !strings.Contains(sessionShimReadoptionWindowExhaustedDetail, "readoption_window_exhausted") {
 		t.Fatalf("exhausted detail %q does not name the outcome", sessionShimReadoptionWindowExhaustedDetail)
@@ -1053,5 +1066,327 @@ func TestStartupAdoptionSeedsTheBindObservable(t *testing.T) {
 	if result, err := d.RebindAdoptedSessionShim(context.Background(), id.OrgID, id.SessionID); err != nil ||
 		result != SessionShimAlreadyBound {
 		t.Fatalf("RebindAdoptedSessionShim on a freshly adopted lineage = %s, %v, want SessionShimAlreadyBound", result, err)
+	}
+}
+
+// socketDeviceInode is the (device, inode) pair a discovery record binds to. A
+// record whose pair does not match the live socket is refused before any frame
+// is exchanged, so a fake shim has to carry the real one.
+func socketDeviceInode(t *testing.T, path string) (uint64, uint64) {
+	t.Helper()
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	st, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		t.Skip("this platform does not report socket device/inode")
+	}
+	return uint64(st.Dev), uint64(st.Ino) //nolint:gosec,unconvert // platform-dependent widths, both non-negative identifiers
+}
+
+// preContractShim is a fake that answers every keepalive the way a shim binary
+// built before this contract does: a valid Hello, then the handshake's
+// `expected Welcome` refusal. It never arms an orphan clock, so it can never
+// honour a keepalive — which is what every shim already running on a host makes
+// this daemon the first time the change is rolled out, since surviving a daemon
+// replacement is the whole reason those shims are being re-adopted.
+type preContractShim struct {
+	record   sessionshim.Record
+	listener net.Listener
+
+	mu        sync.Mutex
+	exchanges int
+}
+
+func (p *preContractShim) count() int {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.exchanges
+}
+
+// startPreContractShim publishes a discovery record for the fake and serves it
+// until the test ends.
+func startPreContractShim(t *testing.T, registry *sessionshim.Registry, dir string, id sessionshim.Identity) *preContractShim {
+	t.Helper()
+	socket := filepath.Join(dir, "pre.sock")
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	device, inode := socketDeviceInode(t, socket)
+	self, err := sessionshim.Self()
+	if err != nil {
+		t.Fatal(err)
+	}
+	fake := &preContractShim{
+		listener: listener,
+		record: sessionshim.Record{
+			SchemaVersion: sessionshim.RecordSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID: "00112233445566778899aabbccddeeff", ProcessEpoch: 4,
+			PID: self.PID, ProcessStartedAt: self.StartedAt,
+			SocketPath: socket, SocketDevice: device, SocketInode: inode,
+			ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V1,
+			Phase:             shimwire.PhaseRunning,
+			WorkareaPath:      filepath.Join(dir, "workarea"),
+			CreatedAtUnixNano: time.Now().UnixNano(),
+		},
+	}
+	if err := registry.Put(fake.record); err != nil {
+		t.Fatal(err)
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			go fake.serve(conn)
+		}
+	}()
+	return fake
+}
+
+func (p *preContractShim) serve(conn net.Conn) {
+	defer func() { _ = conn.Close() }()
+	w := shimwire.NewWriter(conn)
+	r := shimwire.NewReader(conn)
+	hello, err := shimwire.EncodeHello(shimwire.Hello{
+		Protocol: shimwire.ProtocolName, Min: shimwire.V1, Max: shimwire.V1,
+		OrgID: p.record.OrgID, SessionID: p.record.SessionID,
+		ShimID: p.record.ShimID, ProcessEpoch: p.record.ProcessEpoch,
+		PID: p.record.PID, ProcessStartedAt: p.record.ProcessStartedAt,
+		WorkareaPath: p.record.WorkareaPath, Phase: shimwire.PhaseRunning,
+	})
+	if err != nil || w.Write(shimwire.TypeHello, hello) != nil {
+		return
+	}
+	if _, err := r.Read(); err != nil {
+		return
+	}
+	p.mu.Lock()
+	p.exchanges++
+	p.mu.Unlock()
+	body, err := shimwire.EncodeError(shimwire.ErrorMsg{Code: shimwire.CodeMalformed, Detail: "expected Welcome"})
+	if err == nil {
+		_ = w.Write(shimwire.TypeError, body)
+	}
+}
+
+// TestKeepaliveAgainstAShimThatCanNeverHonourItStaysBounded is the pin for the
+// cost of the unhonoured path.
+//
+// The fast probe exists for a race that resolves in milliseconds. Repeating it
+// for as long as nothing has been honoured turned it into a spin against the
+// one shim that can never honour anything — fifty exchanges a second for a
+// whole window, each taking the shim's handshake lock and freezing its
+// harness's output sequence through a round trip, and each asking the embedder
+// its control-plane question. Escalating instead costs a handful of probes and
+// then settles onto the configured pacing.
+func TestKeepaliveAgainstAShimThatCanNeverHonourItStaysBounded(t *testing.T) {
+	t.Parallel()
+	const (
+		orphanDeadline = 15 * time.Second // derives a 5 s keepalive interval
+		observeFor     = time.Second
+	)
+	dir, err := os.MkdirTemp("/tmp", "drp")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-pre", SessionID: "session-pre"}
+	fake := startPreContractShim(t, registry, dir, id)
+
+	var live struct {
+		sync.Mutex
+		calls int
+	}
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		RegistryDir:     filepath.Join(dir, "registry"),
+		CallbackTimeout: time.Second,
+		Orphan:          sessionshim.OrphanPolicy{Deadline: orphanDeadline, TerminationGrace: time.Second},
+		Readoption:      DefaultLineageLiveSessionShimReadoptionPolicy(),
+		LineageLive: func(context.Context, sessionshim.Identity) bool {
+			live.Lock()
+			live.calls++
+			live.Unlock()
+			return true
+		},
+	}})
+	t.Cleanup(d.ReleaseAdoptedSessionShims)
+	cfg := d.sessionShimConfig()
+	interval := cfg.readoptionKeepaliveInterval()
+	if interval != orphanDeadline/sessionShimKeepaliveDeadlineDivisor {
+		t.Fatalf("derived keepalive interval = %s, want %s", interval, orphanDeadline/sessionShimKeepaliveDeadlineDivisor)
+	}
+
+	stop := d.startSessionShimOrphanKeepalive(registry, cfg, id, shimwire.Hello{
+		ShimID: fake.record.ShimID, ProcessEpoch: fake.record.ProcessEpoch,
+	})
+	time.Sleep(observeFor)
+	stop()
+
+	// Escalating from 20 ms doubles: 20, 40, 80, … so a second of probing is a
+	// handful of exchanges, not a flood. The bound is deliberately generous —
+	// the point is the order of magnitude, and the repeating version measured
+	// forty-four.
+	const maxExchanges = 12
+	if got := fake.count(); got > maxExchanges {
+		t.Fatalf("%d keepalive exchanges against a shim that can never honour one in %s, want at most %d — the fast probe is repeating rather than escalating",
+			got, observeFor, maxExchanges)
+	}
+	if got := fake.count(); got == 0 {
+		t.Fatal("no keepalive exchange happened at all; the fake was never reached")
+	}
+	live.Lock()
+	calls := live.calls
+	live.Unlock()
+	// Only PACED ticks consult the predicate, and no paced tick is due inside
+	// one second at a five-second interval — so the opening one is all there is.
+	if calls > 2 {
+		t.Fatalf("the embedder's LineageLive predicate was consulted %d times in %s; the fast probe is asking it too",
+			calls, observeFor)
+	}
+	if keepalive := d.sessionShimKeepaliveObservations(id); keepalive.extensions != 0 || keepalive.refusals == 0 {
+		t.Fatalf("observations = %+v, want no honoured extensions and a recorded refusal", keepalive)
+	}
+}
+
+// TestTheFirstKeepaliveOfAWindowDoesNotWaitAWholeInterval pins the fast probe
+// itself, without a fixture that pre-arms the deadline the probe exists to wait
+// for.
+//
+// The window opens while the shim still has a controller attached — the state a
+// daemon that re-dials promptly really arrives in, since the shim arms its
+// orphan clock from its own serve-loop teardown. The first exchange is refused;
+// the extension has to land shortly after the controller goes, not a whole
+// keepalive interval later.
+func TestTheFirstKeepaliveOfAWindowDoesNotWaitAWholeInterval(t *testing.T) {
+	const (
+		orphanDeadline = 6 * time.Second
+		interval       = 3 * time.Second
+	)
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Second,
+			BackoffCap: time.Second, Window: 30 * time.Second,
+			KeepaliveInterval: interval,
+		},
+		orphan: sessionshim.OrphanPolicy{
+			Deadline: orphanDeadline, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
+		},
+	})
+	registry, err := f.daemon.sessionShimRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	hello := f.controller.Hello()
+
+	// Opens against an ATTACHED controller: nothing to extend, so the first
+	// exchange is refused exactly as it is in the race this fallback covers.
+	stop := f.daemon.startSessionShimOrphanKeepalive(registry, f.daemon.sessionShimConfig(), f.id, hello)
+	defer stop()
+	time.Sleep(200 * time.Millisecond)
+	if keepalive := f.daemon.sessionShimKeepaliveObservations(f.id); keepalive.extensions != 0 {
+		t.Fatalf("observations = %+v, want nothing honoured while a controller is attached", keepalive)
+	}
+
+	closed := time.Now()
+	_ = f.controller.Close()
+
+	deadline := time.Now().Add(interval - 500*time.Millisecond)
+	for time.Now().Before(deadline) {
+		if f.daemon.sessionShimKeepaliveObservations(f.id).extensions > 0 {
+			if got := time.Since(closed); got >= interval {
+				t.Fatalf("the first extension landed %s after the controller went, at or past the %s interval", got, interval)
+			}
+			return
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	t.Fatalf("no keepalive was honoured within %s of the controller going; the window waited a whole %s interval for its first probe",
+		interval-500*time.Millisecond, interval)
+}
+
+// TestTheKeepaliveAsksWhetherTheLineageIsHeldBeforeItExtends pins the ORDER of
+// the per-tick gate against the extension it guards. An extension sent after
+// the composing layer released the lineage is the one §D8's inequality forbids,
+// so the check has to come first — with the order reversed the loop lands one
+// more extension on a lineage nobody holds any more.
+func TestTheKeepaliveAsksWhetherTheLineageIsHeldBeforeItExtends(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Millisecond,
+			BackoffCap: time.Millisecond, Window: 30 * time.Second,
+			KeepaliveInterval: 50 * time.Millisecond,
+		},
+		orphan: sessionshim.OrphanPolicy{
+			Deadline: 5 * time.Second, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
+		},
+		// Released before the window ever opens.
+		lineageLive: func(context.Context, sessionshim.Identity) bool { return false },
+	})
+	lost := f.lostEntry(t)
+	// Armed and extendable: the ONLY thing that can stop an extension here is
+	// the gate, which is what makes the count an assertion about ordering.
+	f.waitForOrphanArmed(t, 5*time.Second)
+	registry, err := f.daemon.sessionShimRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	stop := f.daemon.startSessionShimOrphanKeepalive(registry, f.daemon.sessionShimConfig(), f.id, lost.controller.Hello())
+	time.Sleep(300 * time.Millisecond)
+	stop()
+
+	if keepalive := f.daemon.sessionShimKeepaliveObservations(f.id); keepalive.extensions != 0 {
+		t.Fatalf("observations = %+v, want no extension at all: the lineage was already released when the window opened",
+			keepalive)
+	}
+}
+
+// TestKeepaliveObservationsAreResetAtEachWindow pins the projection's meaning.
+// The count answers "did THIS window extend the shim's clock", which is the
+// question an operator watching a mixed-version host is asking; a stale count
+// carried over from a previous window answers a different one and reads as
+// healthy.
+func TestKeepaliveObservationsAreResetAtEachWindow(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Millisecond,
+			BackoffCap: time.Millisecond, Window: 30 * time.Second,
+			KeepaliveInterval: time.Second,
+		},
+		orphan: sessionshim.OrphanPolicy{
+			Deadline: 5 * time.Second, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
+		},
+		// Released, so the goroutine returns before extending anything and the
+		// only thing that can zero the count is the reset itself.
+		lineageLive: func(context.Context, sessionshim.Identity) bool { return false },
+	})
+	lost := f.lostEntry(t)
+	registry, err := f.daemon.sessionShimRegistry()
+	if err != nil {
+		t.Fatal(err)
+	}
+	f.daemon.shims.mu.Lock()
+	f.daemon.shims.keepalives[f.id] = sessionShimKeepaliveState{
+		extensions: 99, refusals: 7, lastDeadlineUnixNano: 1234,
+	}
+	f.daemon.shims.mu.Unlock()
+
+	stop := f.daemon.startSessionShimOrphanKeepalive(registry, f.daemon.sessionShimConfig(), f.id, lost.controller.Hello())
+	stop()
+
+	if got := f.daemon.sessionShimKeepaliveObservations(f.id); got.extensions != 0 || got.refusals != 0 || got.lastDeadlineUnixNano != 0 {
+		t.Fatalf("observations at the start of a new window = %+v, want zero; a previous window's count leaked into the projection", got)
 	}
 }

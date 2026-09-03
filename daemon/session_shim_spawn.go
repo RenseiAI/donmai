@@ -2539,6 +2539,8 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// whose shim reaps within one orphan deadline, and whose tombstone the
 		// quarantine-only reconciler would never consume.
 		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionWindowExhaustedDetail)
+	case readoptionAttemptsSpent:
+		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionAttemptsSpentDetail)
 	default:
 		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
 	}

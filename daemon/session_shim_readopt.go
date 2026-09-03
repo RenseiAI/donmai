@@ -214,7 +214,7 @@ func (d *Daemon) readoptSessionShimAttempt(
 			"session", id.String(), "attempt", attempt)
 		return readoptionLineageGone, true
 	}
-	err := d.readoptSessionShimOnce(context.Background(), registry, cfg, id, lost, hello)
+	err := d.readoptSessionShimOnce(context.Background(), registry, cfg, id, lost, hello, d.shimNow().UnixNano())
 	if err == nil {
 		slog.Info("session shim: re-adopted a live shim after controller loss",
 			"session", id.String(), "attempt", attempt)
@@ -250,6 +250,10 @@ func (d *Daemon) sessionShimLineageHeld(cfg SessionShimConfig, id sessionshim.Id
 // sessionShimWindowExhausted classifies the end of a lineage-live window and,
 // when the shim is still observable, raises the one notification that
 // distinguishes it from a shim that died.
+//
+// The notification runs BEFORE the caller withdraws the lineage, and the
+// withdrawal that follows is unconditional
+// (ADR-2026-09-03-readoption-exhaustion-withdraws, amending rule 8).
 //
 // It is the ONLY producer of readoptionWindowExhausted, which is what makes
 // "fires exactly once per exhausted window" a property of the code shape rather
@@ -331,14 +335,33 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 	go func() {
 		defer close(done)
 		honoured := false
+		// retry escalates from the fast probe up to the paced interval. It
+		// ESCALATES rather than repeating because the two reasons a keepalive
+		// goes unhonoured have opposite time constants: the benign one resolves
+		// in milliseconds, and the other one — a shim binary that predates this
+		// contract, which is every shim already running the first time this
+		// change is rolled out — never resolves at all. Repeating the fast
+		// probe held the loop at fifty exchanges a second for a whole window
+		// against exactly those shims, each one taking the shim's handshake
+		// lock and freezing its harness's output sequence through a round trip.
+		retry := min(sessionShimKeepaliveRetryInterval, interval)
+		paced := true
 		for {
-			if !d.sessionShimLineageHeld(cfg, id) {
-				// The composing layer let this lineage go. Stop extending at
-				// once: from here the shim's own deadline governs, unextended,
-				// which is what keeps the §D8 inequality true.
-				slog.Warn("session shim: the composing layer released the lineage; stopping the orphan keepalive",
-					"session", id.String())
-				return
+			if paced {
+				// The predicate is consulted on PACED ticks only. It is the
+				// composing layer's answer, which in a composed deployment is a
+				// control-plane query; asking it on every fast probe is how a
+				// millisecond-scale fallback comes to drive a network call at
+				// the same rate. A fast probe cannot extend anything the paced
+				// tick before it was not already allowed to extend.
+				if !d.sessionShimLineageHeld(cfg, id) {
+					// The composing layer let this lineage go. Stop extending
+					// at once: from here the shim's own deadline governs,
+					// unextended, which is what keeps the §D8 inequality true.
+					slog.Warn("session shim: the composing layer released the lineage; stopping the orphan keepalive",
+						"session", id.String())
+					return
+				}
 			}
 			if d.extendSessionShimOrphanDeadline(registry, id, hello) {
 				honoured = true
@@ -351,9 +374,15 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 				// that re-dials promptly can arrive before there is a deadline
 				// to extend. Waiting a whole interval to find out would spend
 				// most of a short deadline on a race that resolves in
-				// milliseconds.
-				wait = min(interval, sessionShimKeepaliveRetryInterval)
+				// milliseconds — so probe fast, then back off to the paced
+				// interval, which is where a shim that will never answer ends
+				// up costing no more than one that answers every time.
+				wait = retry
+				retry = min(retry*2, interval)
 			}
+			// Once the escalation has reached the configured interval the loop
+			// is paced again, and the predicate resumes with it.
+			paced = wait >= interval
 			select {
 			case <-d.shimKeepaliveAfter(wait):
 			case <-stop:
@@ -464,6 +493,10 @@ func sessionShimIncarnationStillLive(registry *sessionshim.Registry, id sessions
 // is arithmetic over the daemon's own clock in the loop above, so an injected
 // clock moves the window without moving this timeout and neither can be
 // measured against the other by accident.
+// readoptedAtUnixNano is the instant the installed entry records as its last
+// AUTOMATIC re-adoption. The window passes "now"; an operator-driven rebind
+// passes the lost entry's own value, so a repair does not spend the automatic
+// budget — see RebindAdoptedSessionShim.
 func (d *Daemon) readoptSessionShimOnce(
 	ctx context.Context,
 	registry *sessionshim.Registry,
@@ -471,6 +504,7 @@ func (d *Daemon) readoptSessionShimOnce(
 	id sessionshim.Identity,
 	lost adoptedShim,
 	lostHello shimwire.Hello,
+	readoptedAtUnixNano int64,
 ) error {
 	ctx, cancel := context.WithTimeout(ctx, cfg.readoptionAttemptTimeout())
 	defer cancel()
@@ -577,7 +611,7 @@ func (d *Daemon) readoptSessionShimOnce(
 		adoption:            evidence,
 		adoptionReceipt:     cloneSessionShimAdoptionReceipt(receipt),
 		consumedRecovery:    newSessionShimConsumedRecovery(preparation, receipt),
-		readoptedAtUnixNano: d.shimNow().UnixNano(),
+		readoptedAtUnixNano: readoptedAtUnixNano,
 		// The re-adoption ran the whole publication pipeline, so the carrier
 		// binding holds again. The loss instant is carried forward: it is the
 		// answer to "when was this lineage last unbound", and a re-adoption is

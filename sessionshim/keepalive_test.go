@@ -373,3 +373,54 @@ func TestOrdinaryHeartbeatBytesStayReadableByAStrictOldDecoder(t *testing.T) {
 		t.Fatalf("strict decode of an ordinary heartbeat: %v", err)
 	}
 }
+
+// TestOrphanKeepaliveRefusesADeadlineThatHasAlreadyFired pins the §D10 half of
+// refreshOrphanDeadline's guard, in the one state the phase check beside it
+// cannot cover.
+//
+// Between the orphan timer firing and Terminate moving the phase to exited, the
+// shim is still PhaseOrphaned with a non-nil timer. A keepalive arriving in
+// that window must be refused: the terminal observation is already on its way,
+// and re-arming would put a liveness deadline back on a harness the shim has
+// committed to reaping. Nothing may take that back.
+func TestOrphanKeepaliveRefusesADeadlineThatHasAlreadyFired(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	t.Parallel()
+	reg, shim, id, ctrl := startKeepaliveShim(t, time.Hour)
+	_ = ctrl.Close()
+	waitForPhase(t, shim, shimwire.PhaseOrphaned, 2*time.Second)
+	waitForPublishedOrphanDeadline(t, reg, id, 2*time.Second)
+
+	// A keepalive is honoured while the deadline is live.
+	if _, ok := shim.refreshOrphanDeadline(); !ok {
+		t.Fatal("precondition: an armed deadline refused a keepalive")
+	}
+
+	// Now stand the shim in the state the guard exists for: the timer has
+	// fired, and the phase has not moved yet. Substituting an already-fired
+	// timer reproduces it exactly and deterministically, which racing the real
+	// deadline cannot.
+	fired := make(chan struct{})
+	shim.mu.Lock()
+	shim.orphanTimer.Stop()
+	shim.orphanTimer = time.AfterFunc(time.Millisecond, func() { close(fired) })
+	shim.mu.Unlock()
+	select {
+	case <-fired:
+	case <-time.After(2 * time.Second):
+		t.Fatal("the substituted timer never fired")
+	}
+
+	if deadline, ok := shim.refreshOrphanDeadline(); ok {
+		t.Fatalf("a keepalive re-armed a deadline that had already fired, to %s", deadline)
+	}
+	if phase := func() shimwire.Phase {
+		shim.mu.Lock()
+		defer shim.mu.Unlock()
+		return shim.phase
+	}(); phase != shimwire.PhaseOrphaned {
+		t.Fatalf("precondition: phase = %q, want the shim still orphaned so the phase guard is not what refused", phase)
+	}
+}

@@ -135,7 +135,17 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 		return SessionShimRebindUnknown, fmt.Errorf("session shim: rebind %s: %w", id, err)
 	}
 	cfg := d.sessionShimConfig()
-	if err := d.readoptSessionShimOnce(ctx, registry, cfg, id, entry, entry.controller.Hello()); err != nil {
+	// The lost entry's own re-adoption instant is carried through UNCHANGED.
+	// Stamping "now" here would spend the automatic re-adoption budget on an
+	// audited human action: the re-entry guard refuses a second automatic
+	// re-adoption inside one window, so a carrier fault a minute after an
+	// operator repaired the binding would be quarantined instead of re-adopted,
+	// and the shim would reap a healthy harness. The guard exists to stop a
+	// flapping carrier from spending adoption revisions in a retry loop, which
+	// is not what a rebind is.
+	if err := d.readoptSessionShimOnce(
+		ctx, registry, cfg, id, entry, entry.controller.Hello(), entry.readoptedAtUnixNano,
+	); err != nil {
 		return SessionShimRebindUnknown, fmt.Errorf("session shim: rebind %s: %w", id, err)
 	}
 	// The shim closed the previous connection the moment the new generation

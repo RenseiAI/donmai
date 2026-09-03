@@ -266,3 +266,57 @@ func TestRebindErrorsAreDiscriminableThroughThePublicAPI(t *testing.T) {
 		t.Fatalf("rebind on an unconfigured daemon = %v, want it to wrap ErrSessionShimAdoptionNotConfigured", err)
 	}
 }
+
+// TestARebindDoesNotSpendTheAutomaticReadoptionBudget pins the interaction the
+// repair seam would otherwise make worse than doing nothing.
+//
+// The re-entry guard refuses a second AUTOMATIC re-adoption of a lineage inside
+// one window, because a carrier that keeps dropping is not one a bounded retry
+// can restore and every cycle costs the receiver an adoption revision. A rebind
+// is not that: it is an audited human action on a lineage whose binding is
+// already broken. Stamping it as an automatic re-adoption meant a carrier fault
+// a minute after an operator repaired the binding was quarantined instead of
+// re-adopted, and the shim reaped a healthy harness — the repair made the
+// lineage LESS recoverable than leaving it alone.
+func TestARebindDoesNotSpendTheAutomaticReadoptionBudget(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		// Fixed-attempt mode: the re-entry guard is mode-independent — it
+		// measures against whatever WorstCaseWindow the policy governs by — and
+		// a single bounded attempt keeps the pin about the guard rather than
+		// about a window's machinery.
+		policy: SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+	})
+	loseTheCarrierBinding(t, f)
+
+	if result, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID); err != nil ||
+		result != SessionShimRebound {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v, want SessionShimRebound", result, err)
+	}
+	adoptionsAfterRebind, _ := f.snapshot()
+
+	// The carrier drops again immediately. A ten-minute re-entry window would
+	// refuse this outright.
+	f.daemon.shims.mu.RLock()
+	repaired, ok := f.daemon.shims.adopted[f.id]
+	f.daemon.shims.mu.RUnlock()
+	if !ok {
+		t.Fatal("the lineage left the adopted set after a successful rebind")
+	}
+	if repaired.readoptedAtUnixNano != 0 {
+		t.Fatalf("the rebind stamped readoptedAtUnixNano=%d; an operator repair spent the automatic re-adoption budget",
+			repaired.readoptedAtUnixNano)
+	}
+	// A carrier fault on the repaired lineage, moments after the repair. The
+	// re-entry guard is the first thing the re-adoption evaluates, so a
+	// disposition of readoptionRefused with nothing attempted IS the guard
+	// refusing — which is what a stamped rebind produces for a full window.
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, repaired); got == readoptionRefused {
+		t.Fatalf("disposition after a carrier fault following a rebind = readoptionRefused (%d): the re-entry guard spent the automatic budget on an operator repair",
+			readoptionRefused)
+	}
+	if again, _ := f.snapshot(); again != adoptionsAfterRebind+1 {
+		t.Fatalf("durable adoption ran %d times, want the rebind's %d plus the automatic re-adoption that followed it",
+			again, adoptionsAfterRebind)
+	}
+}
