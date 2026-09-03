@@ -8,6 +8,33 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- A durable acknowledgement that is merely SLOW no longer costs a live session
+  its controller. While an acknowledgement the controller sent is still
+  outstanding, a stalled socket reader is held open instead of failing closed at
+  the event-backlog stall deadline — an outstanding acknowledgement is evidence
+  that the consumer is waiting, not gone. The hold is bounded absolutely
+  (`sessionshim.DurableAckAmbiguityBound`, 10m, floored at the resolved stall
+  deadline and overridable per controller), consecutive re-adoption cycles that
+  each run it out are capped so a persistently slow durable side cannot cycle
+  forever, and `Controller.StreamEndCause` now reports whether the controller
+  dropped its own connection or the peer went away. Previously the reader failed
+  closed after 30s, the daemon read its own back-pressure as the shim's socket
+  going away, and the lineage was withdrawn `socket_unreachable` with no
+  re-adoption at all.
+
+  **Requires a control plane that accepts the `durable_ack_timeout` quarantine
+  reason.** A lineage withdrawn on this path is now published under the new
+  closed-registry reason `sessionshim.QuarantineDurableAckTimeout` =
+  `durable_ack_timeout` rather than `socket_unreachable`, because the socket was
+  reachable throughout. A composing control plane whose adoption-batch schema
+  validates the reason against a strict enum will reject the WHOLE batch commit
+  until it accepts the new value — deploy that side first. The reason is
+  deliberately not terminal: it withdraws controller authority, does not kill
+  the shim, and keeps the lineage visible and capacity-charged until an ordinary
+  terminal receipt or a group-reaped tombstone reconciles it.
+
 ---
 
 ## v0.72.19 — 2026-09-03

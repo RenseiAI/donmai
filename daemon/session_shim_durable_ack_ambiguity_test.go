@@ -24,7 +24,9 @@ package daemon
 // reachable socket whose receipts were slow.
 
 import (
+	"context"
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -148,6 +150,126 @@ func TestSocketFailureAndCarrierRefusalStillQuarantineSocketUnreachable(t *testi
 			}
 			if !projected[0].ConsumesCapacity {
 				t.Fatal("the quarantined lineage stopped consuming capacity")
+			}
+		})
+	}
+}
+
+// TestDurableAckAmbiguityBoundIsTheLineageLiveWindow pins the derivation the
+// bound's own documentation claims.
+//
+// The corpus names no duration for a durable acknowledgement outstanding on a
+// LIVE stream, so the bound takes the longest one it does name for a daemon
+// that is visibly still here: the lineage-live re-adoption window. A default
+// that drifted away from that window would leave the derivation true only
+// historically, and nothing in either package would notice.
+func TestDurableAckAmbiguityBoundIsTheLineageLiveWindow(t *testing.T) {
+	t.Parallel()
+	if sessionshim.DurableAckAmbiguityBound != defaultSessionShimReadoptionWindow {
+		t.Fatalf("durable-ack ambiguity bound = %s, want the %s lineage-live re-adoption window it is derived from",
+			sessionshim.DurableAckAmbiguityBound, defaultSessionShimReadoptionWindow)
+	}
+	// One re-adoption cycle costs a whole bound, so the cycle budget has to be
+	// small enough that the total stays a visible, bounded retry rather than an
+	// open-ended one.
+	if total := time.Duration(maxConsecutiveDurableAckAmbiguityCycles) * sessionshim.DurableAckAmbiguityBound; total > time.Hour {
+		t.Fatalf("%d cycles of %s is %s of retrying before anything is asserted; that is no longer bounded",
+			maxConsecutiveDurableAckAmbiguityCycles, sessionshim.DurableAckAmbiguityBound, total)
+	}
+}
+
+// TestConsecutiveAmbiguityCyclesEventuallyWithdrawForReal pins the livelock
+// fix. A re-adoption that SUCCEEDS hands back a fresh controller with a fresh,
+// un-anchored bound, so against a durable side that is persistently slow rather
+// than transiently slow this path would cycle forever — each cycle issuing
+// batch commits against the very dependency that cannot answer them.
+func TestConsecutiveAmbiguityCyclesEventuallyWithdrawForReal(t *testing.T) {
+	t.Parallel()
+	// Each real cycle costs a whole ambiguity bound, so the streak is seeded
+	// rather than slept through: what is under test is the BUDGET, and driving
+	// it in wall-clock time would also drag in the re-adoption window's own
+	// re-entry guard, which is a different mechanism on a different clock.
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return nil // every re-adoption succeeds; the durable side stays slow
+	})
+	d := f.daemon
+	for cycle := 1; cycle < maxConsecutiveDurableAckAmbiguityCycles; cycle++ {
+		if got := d.noteDurableAckAmbiguityCycle(f.id); got != cycle {
+			t.Fatalf("consecutive ambiguity cycles = %d after cycle %d, want %d", got, cycle, cycle)
+		}
+	}
+
+	// The budgeted cycle degrades for real, under the same non-terminal reason,
+	// WITHOUT dialling again: re-adopting here is precisely the batch commit
+	// against the slow dependency that this budget exists to stop issuing.
+	d.releaseShimIfLive(f.id, f.controller, shimStreamDurableAckAmbiguous)
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("the spent-budget withdrawal still attempted %d durable adoption(s) against the slow durable side", adoptions)
+	}
+	projected := d.QuarantinedSessions()
+	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("quarantine after %d consecutive cycles = %+v, want one durable_ack_timeout lineage",
+			maxConsecutiveDurableAckAmbiguityCycles, projected)
+	}
+	if projected[0].Detail != sessionShimDurableAckCyclesSpentDetail {
+		t.Fatalf("detail = %q, want the spent-cycles detail — an operator cannot otherwise tell this from one slow bound",
+			projected[0].Detail)
+	}
+	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
+		t.Fatalf("the streak survived the withdrawal (%d); a later lineage on this identity would inherit a spent budget", got)
+	}
+}
+
+// TestANonAmbiguousEndingEndsTheAmbiguityStreak pins the word "consecutive".
+func TestANonAmbiguousEndingEndsTheAmbiguityStreak(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return nil
+	})
+	d := f.daemon
+
+	if got := d.noteDurableAckAmbiguityCycle(f.id); got != 1 {
+		t.Fatalf("consecutive ambiguity cycles = %d, want 1", got)
+	}
+
+	// An ordinary carrier loss is a different fact, and it resets the streak —
+	// so an ambiguity exit an hour later starts from one again rather than
+	// inheriting a budget spent on an unrelated condition.
+	d.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLost)
+	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
+		t.Fatalf("consecutive ambiguity cycles = %d after an unrelated ending, want 0", got)
+	}
+}
+
+// TestAmbiguityDoesNotRaiseCarrierBindLost pins that this path asserts only what
+// it observed. The carrier never refused anything on the ambiguity path — it was
+// slow — so the binding is not gone, and raising bind-lost would hand the
+// composing layer a fact that did not happen.
+func TestAmbiguityDoesNotRaiseCarrierBindLost(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name      string
+		cause     shimStreamEndCause
+		wantRaise bool
+	}{
+		{name: "the ambiguity path never raises it", cause: shimStreamDurableAckAmbiguous},
+		{name: "a real carrier loss still raises it", cause: shimStreamCarrierLost, wantRaise: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var raised atomic.Int64
+			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+				policy:   SessionShimReadoptionPolicy{Attempts: 2, Backoff: 5 * time.Millisecond},
+				adoption: func(context.Context, int) error { return nil },
+				onBindLost: func(context.Context, sessionshim.Identity) {
+					raised.Add(1)
+				},
+			})
+
+			f.daemon.releaseShimIfLive(f.id, f.controller, tc.cause)
+
+			if got := raised.Load() > 0; got != tc.wantRaise {
+				t.Fatalf("carrier bind-lost raised = %v (%d times), want %v", got, raised.Load(), tc.wantRaise)
 			}
 		})
 	}

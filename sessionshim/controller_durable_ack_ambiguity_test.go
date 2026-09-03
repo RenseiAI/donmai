@@ -25,17 +25,25 @@ package sessionshim
 
 import (
 	"errors"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-// newAmbiguityTestBacklog builds a backlog with a sub-floor stall deadline (see
-// newTestBacklog) plus the ambiguity predicate and bound this file exercises.
+// newAmbiguityTestBacklog builds a backlog with a sub-floor stall deadline AND
+// a sub-floor ambiguity bound.
+//
+// Both are clamped unbypassably in newEventBacklog — TestDurableAckAmbiguity
+// BoundIsClampedToItsFloor pins that — so, exactly as newTestBacklog does for
+// the stall deadline, the fields are written directly, in-package, where a test
+// reaching below a production floor is visible rather than smuggled through the
+// public seam.
 func newAmbiguityTestBacklog(budget int, stall, bound time.Duration, ambiguous func() bool) *eventBacklog {
-	b := newEventBacklog(budget, 0, nil, ambiguous, bound)
+	b := newEventBacklog(budget, 0, nil, ambiguous, 0)
 	b.stall = stall
+	b.ambiguityBound = bound
 	return b
 }
 
@@ -86,8 +94,134 @@ func TestOutstandingDurableAckHoldsTheStallOpenInsteadOfFailingClosed(t *testing
 	case <-time.After(5 * time.Second):
 		t.Fatal("the held push never completed after the consumer drained")
 	}
-	if _, held := b.ambiguityHeldFor(time.Now()); held {
+	if b.ambiguityAnchored() {
 		t.Fatal("the ambiguity anchor outlived the stall it belonged to; an unrelated later stall would inherit a spent bound")
+	}
+}
+
+// TestDurableAckAmbiguityBoundIsClampedToItsFloor pins the seam B2 asked for.
+// The bound exists to OUTLIVE the stall deadline it holds open, so a bound
+// below that deadline does not tune the hold, it deletes it — the reader fails
+// closed at whichever comes first, and the measured incident returns through
+// the very knob added to prevent it.
+func TestDurableAckAmbiguityBoundIsClampedToItsFloor(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		configured time.Duration
+		stall      time.Duration
+		want       time.Duration
+	}{
+		{
+			name: "zero takes the package default",
+			want: DurableAckAmbiguityBound,
+		},
+		{
+			name:       "a bound under the floor is raised to it",
+			configured: time.Second,
+			want:       durableAckAmbiguityFloor,
+		},
+		{
+			name:       "a bound under the resolved stall deadline is raised to that",
+			configured: time.Second,
+			stall:      durableAckAmbiguityFloor + time.Minute,
+			want:       durableAckAmbiguityFloor + time.Minute,
+		},
+		{
+			name:       "a bound above both is honoured",
+			configured: time.Hour,
+			want:       time.Hour,
+		},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := clampDurableAckAmbiguityBound(tc.configured, tc.stall); got != tc.want {
+				t.Fatalf("clampDurableAckAmbiguityBound(%s, %s) = %s, want %s",
+					tc.configured, tc.stall, got, tc.want)
+			}
+			// The option seam must reach the same answer: an embedder cannot
+			// configure a shorter bound by any route.
+			opts := ControllerOptions{DurableAckAmbiguityBound: tc.configured, EventBacklogStallDeadline: tc.stall}
+			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil,
+				func() bool { return true }, opts.durableAckAmbiguityBound()).ambiguityBound; got != tc.want {
+				t.Fatalf("backlog built through the option seam has ambiguityBound = %s, want %s", got, tc.want)
+			}
+		})
+	}
+	// The floor is the stall deadline itself, not some smaller number that
+	// merely looks like a floor.
+	if durableAckAmbiguityFloor < eventBacklogStallDeadline {
+		t.Fatalf("ambiguity floor %s is shorter than the %s stall deadline it must outlive",
+			durableAckAmbiguityFloor, eventBacklogStallDeadline)
+	}
+}
+
+// TestAnsweredReceiptExpiresOlderOutstandingCorrelations pins the sticky-latch
+// fix. A retry never re-sends the correlation that stalled — the cursor has
+// advanced — so without expiry one slow receipt leaves the ledger non-empty for
+// the life of the controller, and every LATER stall on it holds the full
+// ambiguity bound instead of failing closed at the stall deadline.
+func TestAnsweredReceiptExpiresOlderOutstandingCorrelations(t *testing.T) {
+	t.Parallel()
+	c := &Controller{done: make(chan struct{}), closing: make(chan struct{})}
+	// A stall at seq 7, then the cursor moves on and the retry stalls at 9.
+	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 7})
+	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9})
+	// A correlation from a LATER generation is not overtaken by an older beat.
+	c.rememberPendingHeartbeatReceipt(shimwire.HeartbeatMsg{Generation: 4, AckedSeq: 2})
+	if !c.durableAckOutstanding() {
+		t.Fatal("three outstanding correlations are not reported outstanding")
+	}
+
+	// The durable side finally answers, at 9. Everything it overtook is moot.
+	c.heartbeatMu.Lock()
+	c.prunePendingReceiptsLocked(shimwire.HeartbeatMsg{Generation: 3, AckedSeq: 9})
+	remaining := append([]heartbeatCorrelation(nil), c.pendingReceipts...)
+	c.heartbeatMu.Unlock()
+	want := []heartbeatCorrelation{{generation: 4, ackedSeq: 2}}
+	if len(remaining) != len(want) || remaining[0] != want[0] {
+		t.Fatalf("outstanding correlations after an answer at (3,9) = %+v, want %+v — a stale entry latches the hold on forever",
+			remaining, want)
+	}
+
+	c.heartbeatMu.Lock()
+	c.prunePendingReceiptsLocked(shimwire.HeartbeatMsg{Generation: 4, AckedSeq: 2})
+	c.heartbeatMu.Unlock()
+	if c.durableAckOutstanding() {
+		t.Fatal("the ledger never empties; every later stall on this controller would hold the full ambiguity bound")
+	}
+}
+
+// TestAnchoredButNoLongerAmbiguousFallsThroughToTheOrdinaryVerdict pins the
+// reporting bug. An anchor set by an earlier hold, once the durable side has
+// answered, must not let a stall that continued for its OWN reasons report a
+// ten-minute bound it reached in a second and a bit.
+func TestAnchoredButNoLongerAmbiguousFallsThroughToTheOrdinaryVerdict(t *testing.T) {
+	t.Parallel()
+	var outstanding atomic.Bool
+	outstanding.Store(true)
+	b := fillAmbiguityTestBacklog(t, 100, 20*time.Millisecond, time.Hour, outstanding.Load)
+
+	// One hold anchors it.
+	if outcome, _ := b.holdForDurableAckAmbiguity(time.Now()); outcome != ambiguityHoldGranted {
+		t.Fatalf("first hold = %d, want granted", outcome)
+	}
+	if !b.ambiguityAnchored() {
+		t.Fatal("a granted hold left no anchor")
+	}
+
+	// The durable side answers. The consumer is still behind, but nothing is
+	// outstanding any more, so this is an ordinary stopped consumer again.
+	outstanding.Store(false)
+	err := b.push(ambiguityTestEvent())
+	if errors.Is(err, ErrDurableAckAmbiguityBound) {
+		t.Fatalf("a stall that outlived its ambiguity reported the bound it never reached: %v", err)
+	}
+	if !errors.Is(err, ErrEventBacklogExceeded) {
+		t.Fatalf("push = %v, want ErrEventBacklogExceeded", err)
+	}
+	if b.ambiguityAnchored() {
+		t.Fatal("the anchor survived the end of ambiguity")
 	}
 }
 

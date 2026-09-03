@@ -187,7 +187,7 @@ func (o ControllerOptions) durableAckAmbiguityBound() time.Duration {
 	if o.DurableAckAmbiguityBound > 0 {
 		return o.DurableAckAmbiguityBound
 	}
-	return durableAckAmbiguityBound
+	return DurableAckAmbiguityBound
 }
 
 func (o ControllerOptions) logger() *slog.Logger {
@@ -373,7 +373,7 @@ const EventBacklogBudget = ptyhost.DefaultRingBytes
 // consumer actually STOPS making progress stays <= 1x the deadline.
 const eventBacklogStallDeadline = 30 * time.Second
 
-// durableAckAmbiguityBound is how long a stalled reader is held open while a
+// DurableAckAmbiguityBound is how long a stalled reader is held open while a
 // durable acknowledgement THIS controller sent is still outstanding.
 //
 // # THE STRAND THIS UNDOES
@@ -408,7 +408,35 @@ const eventBacklogStallDeadline = 30 * time.Second
 // window of the 2026-09-03 amendment. Crossing it is still not loss — it
 // degrades visibly, through ErrDurableAckAmbiguityBound and a quarantine reason
 // that says what actually happened.
-const durableAckAmbiguityBound = 10 * time.Minute
+//
+// It is EXPORTED so the composing daemon can pin it against the window it was
+// derived from. A default that silently drifted away from that window would
+// leave the derivation in this comment true only historically, and nothing in
+// either package would notice.
+const DurableAckAmbiguityBound = 10 * time.Minute
+
+// durableAckAmbiguityFloor is the shortest ambiguity bound this package will
+// honour, however short an embedder asks for — the exact counterpart of
+// eventBacklogStallFloor, for the exact same reason.
+//
+// The bound exists to outlive the stall deadline it holds open. A bound BELOW
+// that deadline does not merely tune the hold, it deletes it: the reader fails
+// closed at whichever of the two comes first, which is the ambiguity bound, and
+// a live shim is quarantined over a slow durable side again — reintroducing the
+// measured incident through the very knob added to prevent it. So the resolved
+// bound is raised to the larger of this floor and the controller's own resolved
+// stall deadline, and an override below either is not honoured.
+const durableAckAmbiguityFloor = eventBacklogStallDeadline
+
+// clampDurableAckAmbiguityBound applies durableAckAmbiguityFloor and the
+// resolved stall deadline to a configured bound. Zero means "use the default",
+// which already satisfies both.
+func clampDurableAckAmbiguityBound(bound, stall time.Duration) time.Duration {
+	if bound <= 0 {
+		bound = DurableAckAmbiguityBound
+	}
+	return max(bound, durableAckAmbiguityFloor, stall)
+}
 
 // eventBacklogStallFloor is the shortest stall deadline this package will honour,
 // however short an embedder asks for.
@@ -1305,6 +1333,7 @@ func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error
 	// outstanding entry, so it resolves here as the live call, not as a late
 	// one.)
 	if c.consumePendingHeartbeatReceiptLocked(receipt) {
+		c.prunePendingReceiptsLocked(receipt)
 		c.heartbeatMu.Unlock()
 		if !receipt.Phase.Known() {
 			return errors.New("sessionshim: late selected-v3 heartbeat receipt carried an unknown phase")
@@ -1317,14 +1346,51 @@ func (c *Controller) acceptHeartbeatReceipt(receipt shimwire.HeartbeatMsg) error
 		return errors.New("sessionshim: unsolicited selected-v3 heartbeat receipt")
 	}
 	c.heartbeatCall = nil
+	matched := receipt.Generation == call.expected.Generation &&
+		receipt.AckedSeq == call.expected.AckedSeq && receipt.Phase.Known()
+	if matched {
+		c.prunePendingReceiptsLocked(receipt)
+	}
 	c.heartbeatMu.Unlock()
-	if receipt.Generation != call.expected.Generation || receipt.AckedSeq != call.expected.AckedSeq || !receipt.Phase.Known() {
+	if !matched {
 		err := errors.New("sessionshim: selected-v3 heartbeat receipt changed generation, cursor, or phase")
 		call.done <- heartbeatResult{err: err}
 		return err
 	}
 	call.done <- heartbeatResult{}
 	return nil
+}
+
+// prunePendingReceiptsLocked drops outstanding correlations that a confirmed
+// receipt has made moot. c.heartbeatMu must be held.
+//
+// # WHY THIS IS NOT BOOKKEEPING
+//
+// The ledger is what durableAckOutstanding reads, and without this it is a
+// STICKY LATCH. A retry never re-sends the correlation that stalled — the
+// cursor has advanced, so it carries a new (generation, ackedSeq) — and the
+// stalled entry is only ever removed by a receipt for that exact pair, which a
+// durable side that has since moved on will never send. One slow receipt would
+// therefore leave the ledger non-empty for the life of the controller, and
+// every LATER stall on it, however unrelated, would hold the full ambiguity
+// bound instead of failing closed at the stall deadline: the mechanism would
+// quietly stop distinguishing the two cases it exists to distinguish.
+//
+// A confirmed receipt at (g, n) settles that: the cursor is monotonic and the
+// generation only advances, so every outstanding correlation at an older
+// generation, or at the same generation and a sequence no newer, has been
+// overtaken and is not coming back.
+func (c *Controller) prunePendingReceiptsLocked(receipt shimwire.HeartbeatMsg) {
+	kept := c.pendingReceipts[:0]
+	for _, pending := range c.pendingReceipts {
+		overtaken := pending.generation < receipt.Generation ||
+			(pending.generation == receipt.Generation && pending.ackedSeq <= receipt.AckedSeq)
+		if overtaken {
+			continue
+		}
+		kept = append(kept, pending)
+	}
+	c.pendingReceipts = kept
 }
 
 // failHeartbeatFromError completes a pending acknowledgement from a refusal
@@ -1541,55 +1607,77 @@ func newEventBacklog(
 	if budget <= 0 {
 		budget = EventBacklogBudget
 	}
-	if ambiguityBound <= 0 {
-		ambiguityBound = durableAckAmbiguityBound
-	}
+	// Clamped HERE rather than at the option seam, because this is the one
+	// place every controller passes through: an embedder cannot reach a
+	// deadline below eventBacklogStallFloor, or a bound below
+	// durableAckAmbiguityFloor, by any route.
+	resolvedStall := clampEventBacklogStall(stall)
 	return &eventBacklog{
-		budget: budget,
-		// Clamped HERE rather than at the option seam, because this is the one
-		// place every controller passes through: an embedder cannot reach a
-		// deadline below eventBacklogStallFloor by any route.
-		stall:          clampEventBacklogStall(stall),
+		budget:         budget,
+		stall:          resolvedStall,
 		abort:          abort,
 		ambiguous:      ambiguous,
-		ambiguityBound: ambiguityBound,
+		ambiguityBound: clampDurableAckAmbiguityBound(ambiguityBound, resolvedStall),
 		arrived:        make(chan struct{}),
 		drained:        make(chan struct{}),
 	}
 }
 
-// holdForDurableAckAmbiguity reports whether a stall deadline that has just
-// elapsed must be held open instead of failing closed, and re-anchors the stall
-// clock when it must.
+// ambiguityHoldOutcome is what a stall deadline that has just elapsed is
+// allowed to do about it.
+type ambiguityHoldOutcome uint8
+
+const (
+	// ambiguityHoldNotAmbiguous: nothing is outstanding, so nothing contradicts
+	// the ordinary verdict. The consumer stopped.
+	ambiguityHoldNotAmbiguous ambiguityHoldOutcome = iota
+	// ambiguityHoldGranted: a durable acknowledgement is outstanding and the
+	// bound has room. Keep stalling.
+	ambiguityHoldGranted
+	// ambiguityHoldBoundReached: the hold ran the whole bound out. Degrade
+	// visibly, under the sentinel that says so.
+	ambiguityHoldBoundReached
+)
+
+// holdForDurableAckAmbiguity reports what a stall deadline that has just
+// elapsed may do, re-anchoring the stall clock when the answer is "keep
+// waiting", and returns how long the hold has run.
 //
-// The question it answers is "is this consumer gone, or is it waiting?" — and
-// an outstanding durable acknowledgement answers it. See
-// durableAckAmbiguityBound for the measured incident and the contract clause.
-func (b *eventBacklog) holdForDurableAckAmbiguity(now time.Time) bool {
-	if b.ambiguous == nil || !b.ambiguous() {
-		return false
-	}
+// The three answers are kept distinct because two of them look identical from
+// the anchor alone. An anchor that is SET but no longer ambiguous — the durable
+// side answered, the stall simply continued for its own reasons — must fall
+// through to the ordinary backlog verdict, not report a bound it never reached;
+// reading the anchor as the whole answer produced exactly that, an
+// "ErrDurableAckAmbiguityBound after 1.2s" against a ten-minute bound. So the
+// anchor is cleared the moment ambiguity ends, and only the bound-reached
+// branch may name the sentinel.
+//
+// See DurableAckAmbiguityBound for the measured incident and the contract clause.
+func (b *eventBacklog) holdForDurableAckAmbiguity(now time.Time) (ambiguityHoldOutcome, time.Duration) {
+	ambiguous := b.ambiguous != nil && b.ambiguous()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if !ambiguous {
+		b.ambiguousSince = time.Time{}
+		return ambiguityHoldNotAmbiguous, 0
+	}
 	if b.ambiguousSince.IsZero() {
 		b.ambiguousSince = now
 	}
-	if now.Sub(b.ambiguousSince) >= b.ambiguityBound {
-		return false
+	held := now.Sub(b.ambiguousSince)
+	if held >= b.ambiguityBound {
+		return ambiguityHoldBoundReached, held
 	}
 	b.stalledSince, b.drainedSinceStall = now, 0
-	return true
+	return ambiguityHoldGranted, held
 }
 
-// ambiguityHeldFor reports how long the stall clock has been held open for an
-// outstanding durable acknowledgement, and whether it was held at all.
-func (b *eventBacklog) ambiguityHeldFor(now time.Time) (time.Duration, bool) {
+// ambiguityAnchored reports whether a hold anchor is currently set.
+// Diagnostics and tests only.
+func (b *eventBacklog) ambiguityAnchored() bool {
 	b.mu.Lock()
 	defer b.mu.Unlock()
-	if b.ambiguousSince.IsZero() {
-		return 0, false
-	}
-	return now.Sub(b.ambiguousSince), true
+	return !b.ambiguousSince.IsZero()
 }
 
 // eventBacklogProgressBytes is how much the consumer must take before the stall
@@ -1668,12 +1756,13 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		room := b.drained
 		b.mu.Unlock()
 		if remaining <= 0 {
-			if b.holdForDurableAckAmbiguity(time.Now()) {
+			switch outcome, held := b.holdForDurableAckAmbiguity(time.Now()); outcome {
+			case ambiguityHoldGranted:
 				continue
-			}
-			if held, ambiguous := b.ambiguityHeldFor(time.Now()); ambiguous {
+			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer took %d bytes, short of the %d it owed",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond), drained, b.progressBytes())
+			case ambiguityHoldNotAmbiguous:
 			}
 			return fmt.Errorf("%w of %d bytes: the consumer took %d bytes in %s, short of the %d it owed",
 				ErrEventBacklogExceeded, b.budget, drained,
@@ -1695,12 +1784,13 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		case <-b.abort:
 			return io.EOF
 		case <-timer.C:
-			if b.holdForDurableAckAmbiguity(time.Now()) {
+			switch outcome, held := b.holdForDurableAckAmbiguity(time.Now()); outcome {
+			case ambiguityHoldGranted:
 				continue
-			}
-			if held, ambiguous := b.ambiguityHeldFor(time.Now()); ambiguous {
+			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer made no budget's worth of progress",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond))
+			case ambiguityHoldNotAmbiguous:
 			}
 			return fmt.Errorf("%w of %d bytes: the consumer made no budget's worth of progress in %s",
 				ErrEventBacklogExceeded, b.budget, b.stall)

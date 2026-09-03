@@ -2559,12 +2559,33 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	lostReason := sessionshim.QuarantineSocketUnreachable
 	if cause == shimStreamDurableAckAmbiguous {
 		lostReason = sessionshim.QuarantineDurableAckTimeout
+		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
+		// un-anchored ambiguity bound — so against a durable side that is
+		// persistently slow rather than transiently slow, this path would cycle
+		// forever: hold ten minutes, fail closed, re-adopt, hold ten minutes,
+		// each cycle issuing durable adoption batch commits against the very
+		// dependency that cannot answer. Retrying is what ambiguity is owed;
+		// retrying WITHOUT END is not, and the contract's ambiguous row says
+		// "then degrade visibly". Consecutive cycles are counted so the third
+		// one degrades for real instead of re-entering the loop.
+		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
+			d.quarantineLostSessionShim(id, entry, lostReason, sessionShimDurableAckCyclesSpentDetail)
+			return
+		}
+	} else {
+		// Any other ending ends the streak: "consecutive" is the whole claim.
+		d.clearDurableAckAmbiguityCycles(id)
 	}
 	// The carrier binding is gone from this instant. Recording it before the
 	// re-adoption runs is what lets an embedder see the state DURING the
 	// window, which is the only time the observation is worth anything.
 	cfg := d.sessionShimConfig()
-	if d.noteSessionShimCarrierBindLost(id, ctrl) {
+	// ONLY a carrier loss loses the carrier bind. On the ambiguity path the
+	// carrier never refused anything — it was slow — so the binding is not gone
+	// and raising bind-lost would hand the composing layer a fact that did not
+	// happen, on the exact path whose whole point is not to assert what it
+	// cannot observe.
+	if cause == shimStreamCarrierLost && d.noteSessionShimCarrierBindLost(id, ctrl) {
 		d.raiseSessionShimCarrierBindLost(cfg, id)
 	}
 	switch d.readoptSessionShimAfterControllerLoss(id, entry) {
@@ -2635,6 +2656,50 @@ func (d *Daemon) quarantineLostSessionShim(
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
+	// The streak belongs to a lineage that is still being retried. Once it has
+	// been withdrawn there is nothing left to count, and leaving the entry in
+	// place would both leak and make a later re-adoption of the same identity
+	// inherit a spent budget.
+	d.clearDurableAckAmbiguityCycles(id)
+}
+
+// maxConsecutiveDurableAckAmbiguityCycles is how many times in a row a lineage
+// may leave its controller stream on an exhausted durable-acknowledgement
+// ambiguity bound before this daemon stops re-adopting it and withdraws for
+// real. See releaseShimIfLive for why a counter is needed at all.
+//
+// Three, because two is indistinguishable from bad luck — a control plane
+// redeploy can plausibly outlast one bound and be caught by the retry after it
+// — and because each cycle already costs a whole ambiguity bound, so three of
+// them is half an hour of visible, capacity-charged retrying before anything is
+// asserted.
+const maxConsecutiveDurableAckAmbiguityCycles = 3
+
+// noteDurableAckAmbiguityCycle records one more consecutive ambiguity-bound
+// exit for this lineage and reports the running total.
+func (d *Daemon) noteDurableAckAmbiguityCycle(id sessionshim.Identity) int {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if d.shims.ambiguityCycles == nil {
+		d.shims.ambiguityCycles = make(map[sessionshim.Identity]int)
+	}
+	d.shims.ambiguityCycles[id]++
+	return d.shims.ambiguityCycles[id]
+}
+
+// clearDurableAckAmbiguityCycles ends this lineage's streak.
+func (d *Daemon) clearDurableAckAmbiguityCycles(id sessionshim.Identity) {
+	d.shims.mu.Lock()
+	delete(d.shims.ambiguityCycles, id)
+	d.shims.mu.Unlock()
+}
+
+// durableAckAmbiguityCycles reports this lineage's current streak.
+// Diagnostics and tests only.
+func (d *Daemon) durableAckAmbiguityCycles(id sessionshim.Identity) int {
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return d.shims.ambiguityCycles[id]
 }
 
 // publishQuarantineAfterConsumingTerminalProof is the disconnect path's
