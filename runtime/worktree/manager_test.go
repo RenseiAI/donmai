@@ -576,7 +576,7 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 		}
 		return nil, nil
 	}
-	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -592,8 +592,11 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if result.BaseRef != "main" || result.BaseSHA != "abc123" || result.BaseFetchDuration < 0 {
+	if result.BaseRef != "main" || result.BaseSHA != "abc123" || !result.BaseFetched {
 		t.Fatalf("base receipt = %#v", result)
+	}
+	if result.BaseFetchDuration > time.Second {
+		t.Fatalf("base fetch duration = %s, want a bounded test duration", result.BaseFetchDuration)
 	}
 }
 
@@ -610,14 +613,14 @@ func TestProvisionFetchFailureDoesNotCreateBranch(t *testing.T) {
 		}
 		return nil, nil
 	}
-	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
 	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
 		SessionID: "failed-fetch", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
 	})
-	if !errors.Is(err, worktree.ErrBaseFetch) || calls != 1 {
+	if !errors.Is(err, worktree.ErrBaseFetch) || calls != worktree.MaxSpawnRetries {
 		t.Fatalf("error = %v, calls = %d; want typed fetch failure and no branch", err, calls)
 	}
 }
@@ -627,13 +630,15 @@ func TestProvisionSkipBaseFetchPreservesOfflineBehaviour(t *testing.T) {
 	if err := os.MkdirAll(parent, 0o750); err != nil {
 		t.Fatal(err)
 	}
+	var calls int
 	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		calls++
 		if args[2] == "worktree" {
 			_ = os.MkdirAll(args[len(args)-2], 0o750)
 		}
 		return nil, nil
 	}
-	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -641,6 +646,37 @@ func TestProvisionSkipBaseFetchPreservesOfflineBehaviour(t *testing.T) {
 		SessionID: "offline", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent, SkipBaseFetch: true,
 	}); err != nil {
 		t.Fatal(err)
+	}
+	if calls != 1 {
+		t.Fatalf("git calls = %d, want only worktree add with fetch skipped", calls)
+	}
+}
+
+func TestProvisionBaseFetchTimeoutLeavesNoWorkarea(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	runner := func(ctx context.Context, _ string, args ...string) ([]byte, error) {
+		if args[2] == "fetch" {
+			<-ctx.Done()
+			return nil, ctx.Err()
+		}
+		t.Fatal("branch command ran after fetch timeout")
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, BaseFetchTimeout: time.Millisecond, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "timeout", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+	})
+	if !errors.Is(err, worktree.ErrBaseFetch) {
+		t.Fatalf("error = %v, want typed base-fetch timeout", err)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "timeout")); !os.IsNotExist(statErr) {
+		t.Fatalf("workarea exists after timeout: %v", statErr)
 	}
 }
 

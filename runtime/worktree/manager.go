@@ -196,6 +196,8 @@ type ProvisionResult struct {
 	BaseSHA string
 	// BaseFetchDuration is how long refreshing BaseRef took.
 	BaseFetchDuration time.Duration
+	// BaseFetched reports whether the base refresh was performed successfully.
+	BaseFetched bool
 }
 
 // Manager owns the lifecycle of per-session worktrees. The zero value
@@ -581,7 +583,8 @@ type ProvisionSpec struct {
 	// CacheSeedID records reusable seed provenance without reusing session identity.
 	CacheSeedID string
 	// BaseRef is the remote ref to refresh before creating a branch. Empty uses
-	// Branch, then SourceRef.
+	// Branch. For StrategyWorktreeAdd, ParentRepoPath must have an origin remote
+	// whose fetch refspec publishes the requested branch.
 	BaseRef string
 	// SkipBaseFetch explicitly preserves offline/test behaviour.
 	SkipBaseFetch bool
@@ -656,11 +659,6 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			return "", fmt.Errorf("runtime/worktree: resolve ParentRepoPath: %w", err)
 		}
 	}
-	baseInfo, err := m.refreshBase(ctx, parentRepoPath, spec)
-	if err != nil {
-		return "", err
-	}
-
 	leaf := spec.LeafName
 	if leaf == "" {
 		leaf = spec.SessionID
@@ -689,6 +687,21 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
 		attempts = attempt
+		baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
+		if fetchErr != nil {
+			if attempt == MaxSpawnRetries {
+				return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w", attempt, fetchErr)
+			}
+			m.logger.Warn("worktree base refresh failed; retrying",
+				"sessionId", spec.SessionID, "attempt", attempt,
+				"max", MaxSpawnRetries, "err", fetchErr)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(m.delay):
+			}
+			continue
+		}
 		// Probe ownership before any retry (skip on the very first
 		// attempt — the platform claim already happened).
 		if attempt > 1 && m.prober != nil {
@@ -711,6 +724,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				Repositories: repositories, Strategy: spec.Strategy,
 				ParentRepoPath: parentRepoPath, Attempts: attempts,
 				BaseRef: baseInfo.Ref, BaseSHA: baseInfo.SHA, BaseFetchDuration: baseInfo.Duration,
+				BaseFetched: baseInfo.Fetched,
 			}
 			if acquisition.AcquisitionID != "" {
 				res.AcquisitionID = acquisition.AcquisitionID
@@ -1388,12 +1402,12 @@ func (m *Manager) Result(sessionID string) (ProvisionResult, error) {
 	if !ok {
 		return ProvisionResult{}, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
 	}
-	copy := *res
-	copy.Repositories = make(map[string]string, len(res.Repositories))
+	out := *res
+	out.Repositories = make(map[string]string, len(res.Repositories))
 	for name, path := range res.Repositories {
-		copy.Repositories[name] = path
+		out.Repositories[name] = path
 	}
-	return copy, nil
+	return out, nil
 }
 
 func (r ProvisionResult) workareaRootOrPath() string {
@@ -1571,11 +1585,13 @@ type baseFetchInfo struct {
 	Ref      string
 	SHA      string
 	Duration time.Duration
+	Fetched  bool
 }
 
 // refreshBase makes the parent repository's remote tip authoritative before a
-// worktree branch is created. Clone strategy already obtains its base during
-// clone and retains its historical command shape.
+// worktree branch is created. It is intentionally limited to StrategyWorktreeAdd;
+// clone strategy already obtains its base during clone and retains its historical
+// command shape.
 func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (baseFetchInfo, error) {
 	if spec.Strategy != StrategyWorktreeAdd || spec.SkipBaseFetch {
 		return baseFetchInfo{}, nil
@@ -1583,30 +1599,48 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	if parent == "" {
 		return baseFetchInfo{}, nil
 	}
-	ref := spec.BaseRef
-	if ref == "" {
-		ref = spec.Branch
-	}
-	if ref == "" {
-		ref = spec.SourceRef
-	}
+	ref := baseRefForSpec(spec)
 	if ref == "" {
 		return baseFetchInfo{}, nil
+	}
+	var err error
+	ref, err = normalizeBaseRef(ref)
+	if err != nil {
+		return baseFetchInfo{}, err
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
 	started := time.Now()
-	out, err := m.runGit(fetchCtx, spec.RepoURL, "-C", parent, "fetch", "origin", ref)
+	out, err := m.runGit(fetchCtx, spec.RepoURL, "-C", parent, "fetch", "origin", "--", ref)
 	duration := time.Since(started)
 	if err != nil {
 		return baseFetchInfo{}, fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 	}
-	out, err = m.runGit(fetchCtx, "", "-C", parent, "rev-parse", "origin/"+ref)
+	out, err = m.runGit(fetchCtx, "", "-C", parent, "rev-parse", "FETCH_HEAD")
 	if err != nil {
 		return baseFetchInfo{}, fmt.Errorf("%w %q: resolve fetched tip: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 	}
 	sha := strings.TrimSpace(string(out))
-	return baseFetchInfo{Ref: ref, SHA: sha, Duration: duration}, nil
+	return baseFetchInfo{Ref: ref, SHA: sha, Duration: duration, Fetched: true}, nil
+}
+
+func baseRefForSpec(spec ProvisionSpec) string {
+	if spec.BaseRef != "" {
+		return spec.BaseRef
+	}
+	return spec.Branch
+}
+
+func normalizeBaseRef(ref string) (string, error) {
+	if strings.HasPrefix(ref, "-") {
+		return "", fmt.Errorf("%w %q: ref must not start with a dash", ErrBaseFetch, ref)
+	}
+	ref = strings.TrimPrefix(ref, "origin/")
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	if ref == "" || strings.HasPrefix(ref, "-") {
+		return "", fmt.Errorf("%w: invalid base ref", ErrBaseFetch)
+	}
+	return ref, nil
 }
 
 func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath string) error {
@@ -1682,10 +1716,15 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 		}
 		args = append(args, dst)
 		if spec.Branch != "" {
+			baseRef := baseRefForSpec(spec)
+			baseRef, refErr := normalizeBaseRef(baseRef)
+			if refErr != nil {
+				return refErr
+			}
 			// `git worktree add -B name dst origin/name` checks out
 			// the remote branch when one exists; locally created
 			// branches are also fine because -B resets the branch.
-			args = append(args, "origin/"+spec.Branch)
+			args = append(args, "origin/"+baseRef)
 		}
 		out, err := m.runGit(ctx, spec.RepoURL, args...)
 		if err != nil {
