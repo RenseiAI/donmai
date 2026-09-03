@@ -144,13 +144,55 @@ var requiredSessionShimHostCapabilities = []string{
 // before the daemon may advertise or continue using the proof-v2 capability.
 // DurableCarrierProofV2Ready is separate carrier-owned durable ACK evidence; it
 // is never derived from the four composing support facts.
+//
+// The five facts are omitted from the wire whenever they are not all true,
+// which is exactly the tri-state's non-ready shape: a projection that is not
+// ready carries no readiness facts rather than publishing them as false. A
+// ready projection has all five true, so its bytes are unchanged.
 type SessionShimCarrierProofV2Readiness struct {
-	DurableCarrierProofV2Ready          bool `json:"durable_carrier_proof_v2_ready"`
-	ComposingProofV1WritesClosed        bool `json:"composingProofV1WritesClosed"`
-	EncryptedOriginalCredentialRetained bool `json:"encryptedOriginalCredentialRetained"`
-	RemainingValidityConsumeGate        bool `json:"remainingValidityConsumeGate"`
-	AdoptedCandidateRecovery            bool `json:"adoptedCandidateRecovery"`
+	DurableCarrierProofV2Ready          bool `json:"durable_carrier_proof_v2_ready,omitempty"`
+	ComposingProofV1WritesClosed        bool `json:"composingProofV1WritesClosed,omitempty"`
+	EncryptedOriginalCredentialRetained bool `json:"encryptedOriginalCredentialRetained,omitempty"`
+	RemainingValidityConsumeGate        bool `json:"remainingValidityConsumeGate,omitempty"`
+	AdoptedCandidateRecovery            bool `json:"adoptedCandidateRecovery,omitempty"`
 }
+
+// The readiness tri-state carried by a heartbeat projection.
+//
+// SessionShimReadinessReady is the established state; the projection omits the
+// readiness state field entirely for it, so a healthy beat is byte-identical to
+// one produced before the tri-state existed. SessionShimReadinessNotReady is a
+// definite refusal — the resolver answered, and the answer withdraws readiness.
+// SessionShimReadinessUnknown means the resolver could not be consulted; it
+// never withdraws an established readiness, and it is bounded by the
+// configurable staleness bound, after which it becomes not-ready.
+const (
+	SessionShimReadinessReady    = "ready"
+	SessionShimReadinessNotReady = "not-ready"
+	SessionShimReadinessUnknown  = "unknown"
+)
+
+// SessionShimReadinessStaleReason is the readiness reason published when an
+// unknown readiness state has persisted past the configured staleness bound.
+const SessionShimReadinessStaleReason = "stale"
+
+// The three classes a readiness resolution can fail in. They are wrapped with
+// %w on the way out of the resolver and matched with errors.Is, so a reworded
+// message can never silently reclassify a failure.
+//
+// ErrSessionShimReadinessUnavailable classifies a resolver error or timeout:
+// the answer is unknown, and unknown never withdraws an established readiness.
+// ErrSessionShimReadinessRejected classifies a resolver that answered with an
+// incomplete fact set: a definite not-ready that withdraws as before.
+// ErrSessionShimReadinessMisconfigured classifies a daemon with no readiness
+// resolver configured at all. It is a permanent programming fault, never a
+// transient one: it is never degraded to unknown, never cached, and fails
+// closed at every seam.
+var (
+	ErrSessionShimReadinessUnavailable   = errors.New("session shim: readiness is unavailable")
+	ErrSessionShimReadinessRejected      = errors.New("session shim: readiness is refused")
+	ErrSessionShimReadinessMisconfigured = errors.New("session shim: readiness resolver is misconfigured")
+)
 
 func (r SessionShimCarrierProofV2Readiness) validate() error {
 	if !r.DurableCarrierProofV2Ready {
@@ -192,6 +234,18 @@ type SessionShimHeartbeatProjection struct {
 	ControllerID     string `json:"controllerId"`
 	AdoptionRevision string `json:"adoptionRevision"`
 
+	// ReadinessState is the tri-state: ready, not-ready, or unknown. It is
+	// empty on a ready projection, which is what keeps a healthy beat's bytes
+	// identical to a pre-tri-state beat; an empty state reads as ready. Reason
+	// and ObservedAt accompany every non-ready state and only a non-ready
+	// state. ReadinessObservedAt is the time the CURRENT non-ready state was
+	// first observed — for a continuing unknown it is the onset of the
+	// degradation, not the time of the latest retry, which is what the
+	// staleness bound measures against.
+	ReadinessState      string `json:"readinessState,omitempty"`
+	ReadinessReason     string `json:"readinessReason,omitempty"`
+	ReadinessObservedAt string `json:"readinessObservedAt,omitempty"`
+
 	// SessionShimCarrierProofV2Readiness stays flat on the existing sessionShim
 	// object so the five live facts are covered by the same organization-scoped
 	// host, controller, and adoption-revision echo. The values come from the
@@ -228,8 +282,27 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	if p.WorkerHostID == "" || p.ControllerID == "" || p.AdoptionRevision == "" {
 		return errors.New("session shim heartbeat projection is missing host, controller, or adoption revision")
 	}
-	if err := p.SessionShimCarrierProofV2Readiness.validate(); err != nil {
-		return fmt.Errorf("session shim heartbeat projection: %w", err)
+	switch p.ReadinessState {
+	case "", SessionShimReadinessReady:
+		if p.ReadinessReason != "" || p.ReadinessObservedAt != "" {
+			return errors.New("session shim heartbeat projection carries a readiness reason for a ready state")
+		}
+		if err := p.SessionShimCarrierProofV2Readiness.validate(); err != nil {
+			return fmt.Errorf("session shim heartbeat projection: %w", err)
+		}
+	case SessionShimReadinessUnknown, SessionShimReadinessNotReady:
+		if p.ReadinessReason == "" || p.ReadinessObservedAt == "" {
+			return fmt.Errorf(
+				"session shim heartbeat projection %s readiness is missing reason or observed-at", p.ReadinessState,
+			)
+		}
+		if p.SessionShimCarrierProofV2Readiness != (SessionShimCarrierProofV2Readiness{}) {
+			return fmt.Errorf(
+				"session shim heartbeat projection %s readiness carries proof-v2 facts", p.ReadinessState,
+			)
+		}
+	default:
+		return fmt.Errorf("session shim heartbeat projection has invalid readiness state %q", p.ReadinessState)
 	}
 	for i, q := range p.QuarantinedSessions {
 		if q.OrgID == "" || q.SessionID == "" || q.Reason == "" || !q.ConsumesCapacity {
@@ -246,10 +319,18 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	return nil
 }
 
+// exactEqual compares the identity of two authority claims.
+//
+// ReadinessObservedAt is deliberately NOT part of it. It is a timestamp, not an
+// authority fact, and an acknowledgement re-samples the projection: including a
+// clock reading here makes two samples of one unchanged authority compare
+// unequal, and the acknowledgement edge that reopens admission then never
+// fires. State and reason are compared, because those do identify the claim.
 func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatProjection) bool {
 	if p.Enabled != other.Enabled || p.AdoptionComplete != other.AdoptionComplete ||
 		p.WorkerHostID != other.WorkerHostID || p.ControllerID != other.ControllerID ||
 		p.AdoptionRevision != other.AdoptionRevision ||
+		p.ReadinessState != other.ReadinessState || p.ReadinessReason != other.ReadinessReason ||
 		p.SessionShimCarrierProofV2Readiness != other.SessionShimCarrierProofV2Readiness ||
 		len(p.QuarantinedSessions) != len(other.QuarantinedSessions) {
 		return false

@@ -355,6 +355,14 @@ type Daemon struct {
 	// acknowledged exact recovery heartbeat.
 	sessionShimReadinessWithdrawn atomic.Bool
 
+	// readinessMu guards readinessCache; readinessResolveMu single-flights the
+	// resolution itself. The resolver is embedder code and is called under
+	// neither of them held together with the cache lock — see
+	// sessionShimReadinessWithin.
+	readinessMu        sync.Mutex
+	readinessResolveMu sync.Mutex
+	readinessCache     sessionShimReadinessCache
+
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be
 	// sent to the platform. Exposed via GET /api/daemon/capabilities.
@@ -675,7 +683,10 @@ func (d *Daemon) claimSuspended() (bool, string) {
 		if d.sessionShimReadinessWithdrawn.Load() {
 			return true, "session-shim recovery is not ready"
 		}
-		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		// A transient resolver failure reads as unknown and keeps this gate
+		// open: an outage in the readiness dependency must not stop a host that
+		// was already serving from claiming work.
+		if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 			d.withdrawSessionShimProofV2Readiness()
 			return true, "session-shim proof-v2 readiness is unavailable"
 		}
@@ -849,7 +860,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.config = cfg
 	d.startedAt = time.Now().UTC()
 	d.mu.Unlock()
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
 		return err
 	}
 
@@ -1824,7 +1835,7 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return nil, fmt.Errorf("session-shim proof-v2 readiness: %w", err)
 	}

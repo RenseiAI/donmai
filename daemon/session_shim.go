@@ -574,7 +574,21 @@ type SessionShimConfig struct {
 	// installation, and every hosted heartbeat projection. The carrier-owned
 	// durable acknowledgement and all four composing support facts must each be
 	// explicitly true; one is never inferred from the others.
+	//
+	// It is resolved on one cadence per host and the answer is cached for every
+	// other consumer, so this is not called once per session, per poll tick or
+	// per admission. It is called with no daemon lock held, and it must return
+	// promptly and must not re-enter the daemon.
+	//
+	// An error from it is an UNKNOWN readiness, not a refusal: it never
+	// withdraws a readiness this host had already established. An answer whose
+	// five facts are not all true is a definite not-ready and does withdraw.
 	GetCarrierProofV2Readiness func() (SessionShimCarrierProofV2Readiness, error)
+
+	// ReadinessStaleAfter bounds how long readiness may stay unknown before the
+	// daemon stops giving the resolver the benefit of the doubt and withdraws
+	// with reason "stale". Zero selects DefaultSessionShimReadinessStaleAfter.
+	ReadinessStaleAfter time.Duration
 
 	// AcquireRecoveryScopes performs auth-only acquisition for served scopes in
 	// addition to the primary registration scope. It retains all credentials and
@@ -851,21 +865,20 @@ func (d *Daemon) resolveSessionShimCarrierProofV2Readiness() (SessionShimCarrier
 	}
 	resolve := d.sessionShimConfig().GetCarrierProofV2Readiness
 	if resolve == nil {
-		return SessionShimCarrierProofV2Readiness{}, errors.New("session shim: proof-v2 readiness resolver is required")
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf(
+			"%w: proof-v2 readiness resolver is required", ErrSessionShimReadinessMisconfigured,
+		)
 	}
 	readiness, err := resolve()
 	if err != nil {
-		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("session shim: resolve proof-v2 readiness: %w", err)
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf(
+			"%w: resolve proof-v2 readiness: %w", ErrSessionShimReadinessUnavailable, err,
+		)
 	}
 	if err := readiness.validate(); err != nil {
-		return SessionShimCarrierProofV2Readiness{}, err
+		return SessionShimCarrierProofV2Readiness{}, fmt.Errorf("%w: %w", ErrSessionShimReadinessRejected, err)
 	}
 	return readiness, nil
-}
-
-func (d *Daemon) validateSessionShimCarrierProofV2Readiness() error {
-	_, err := d.resolveSessionShimCarrierProofV2Readiness()
-	return err
 }
 
 // beginSessionShimRecoveryHeartbeatBarrier closes every new-work rail before a
@@ -1028,12 +1041,22 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 	if !d.sessionShimEnabled() || !d.sessionShimReadinessWithdrawn.Load() {
 		return
 	}
+	// Only an ESTABLISHED readiness reopens. A degraded beat is acknowledged
+	// like any other — that is the point of keeping it flowing — but a beat
+	// that published unknown or not-ready asserts liveness, never recovery.
+	if acknowledged.ReadinessState != "" && acknowledged.ReadinessState != SessionShimReadinessReady {
+		return
+	}
 	d.shims.publicationMu.Lock()
 	defer d.shims.publicationMu.Unlock()
 	if !d.sessionShimReadinessWithdrawn.Load() || d.shims.dynamicPublicationFailed {
 		return
 	}
-	current, err := d.SessionShimHeartbeatProjection(orgID)
+	// Cached, not re-resolved: this re-sample verifies that the authority the
+	// server just echoed is still the authority this host holds. Resolving
+	// again would ask the embedder twice per beat and would compare the beat
+	// against a different readiness observation than the one it carried.
+	current, err := d.sessionShimHeartbeatProjection(orgID, sessionShimReadinessCadence)
 	if err != nil || !acknowledged.exactEqual(current) {
 		return
 	}
@@ -2401,7 +2424,7 @@ func (d *Daemon) prepareSessionShimAdoption(
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return SessionShimAdoptionPreparationResult{}, err
 	}
@@ -3170,7 +3193,11 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 	// retained and the embedder has been handed it. Every other refresh keeps
 	// the check exactly here.
 	if !d.sessionShimFoundingDeclaration(scope) {
-		if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+		// Resolved, not read from the cache: this seam is about to install new
+		// credential authority, and a cached answer predates the thing being
+		// installed. The cadence exists to keep the resolver off the per-tick
+		// lanes, not off the lane that changes what it answers about.
+		if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
 			d.withdrawSessionShimProofV2Readiness()
 			return err
 		}
@@ -3351,7 +3378,7 @@ func (d *Daemon) activatePublishedSessionShimCarriers(
 			return errors.New("session shim: proof-v2 readiness is withdrawn")
 		}
 	}
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
 		d.withdrawSessionShimProofV2Readiness()
 		return fmt.Errorf("session shim: proof-v2 activation readiness: %w", err)
 	}
@@ -3644,14 +3671,31 @@ func (d *Daemon) SessionShimCarrierActivationComplete() bool {
 // SessionShimHeartbeatProjection returns one coherent scope-local snapshot for
 // the first and subsequent strict heartbeats. It never includes credentials,
 // opaque composing receipts, paths, or display detail.
+//
+// It is the seam that resolves readiness for the host: the beat refreshes, and
+// every other consumer reads that sample for the rest of the cadence. A
+// resolver failure does not fail the projection — it degrades it to unknown, so
+// the beat still goes out on schedule and this host stays visibly alive while
+// the readiness dependency is down. Only a definite not-ready withdraws, and
+// only a permanent misconfiguration refuses to produce a projection at all.
 func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartbeatProjection, error) {
+	return d.sessionShimHeartbeatProjection(orgID, sessionShimReadinessResolveNow)
+}
+
+func (d *Daemon) sessionShimHeartbeatProjection(
+	orgID string,
+	maxAge time.Duration,
+) (SessionShimHeartbeatProjection, error) {
 	if !d.sessionShimEnabled() {
 		return SessionShimHeartbeatProjection{}, nil
 	}
-	readiness, err := d.resolveSessionShimCarrierProofV2Readiness()
-	if err != nil {
+	sample := d.sessionShimReadinessWithin(maxAge)
+	if sample.blocking != nil && errors.Is(sample.blocking, ErrSessionShimReadinessMisconfigured) {
 		d.withdrawSessionShimProofV2Readiness()
-		return SessionShimHeartbeatProjection{}, err
+		return SessionShimHeartbeatProjection{}, sample.blocking
+	}
+	if sample.state == SessionShimReadinessNotReady {
+		d.withdrawSessionShimProofV2Readiness()
 	}
 	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
@@ -3661,12 +3705,17 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		return SessionShimHeartbeatProjection{}, fmt.Errorf("session shim: no heartbeat authority receipt for organization %q", orgID)
 	}
 	projection := SessionShimHeartbeatProjection{
-		Enabled:                            true,
-		AdoptionComplete:                   d.shims.adoptionComplete,
-		WorkerHostID:                       receipt.WorkerHostID,
-		ControllerID:                       d.controllerID(),
-		AdoptionRevision:                   receipt.AdoptionRevision,
-		SessionShimCarrierProofV2Readiness: readiness,
+		Enabled:             true,
+		AdoptionComplete:    d.shims.adoptionComplete,
+		WorkerHostID:        receipt.WorkerHostID,
+		ControllerID:        d.controllerID(),
+		AdoptionRevision:    receipt.AdoptionRevision,
+		ReadinessState:      sample.state,
+		ReadinessReason:     sample.reason,
+		ReadinessObservedAt: sample.observedAt(),
+		// Zero for every non-ready sample by construction, so a degraded beat
+		// omits the five facts rather than republishing them as false.
+		SessionShimCarrierProofV2Readiness: sample.readiness,
 		QuarantinedSessions:                []SessionShimQuarantinedSession{},
 	}
 	if !d.shims.carrierActivationComplete {
