@@ -951,7 +951,10 @@ func TestStartupRefusesLineageLiveWithoutALineagePredicateUnderAnExternalThresho
 // go, for up to thirty seconds. That extension is exactly the one §D8's
 // inequality forbids.
 func TestKeepaliveStopsAsSoonAsTheLineageIsReleased(t *testing.T) {
-	const orphanDeadline = 2 * time.Second
+	// The orphan deadline is long enough that the shim cannot reap during the
+	// test whatever the machine is doing: this pin is about the predicate
+	// stopping the loop, and a reap would stop it for the wrong reason.
+	const orphanDeadline = 20 * time.Second
 	var held struct {
 		sync.Mutex
 		released bool
@@ -960,7 +963,7 @@ func TestKeepaliveStopsAsSoonAsTheLineageIsReleased(t *testing.T) {
 		policy: SessionShimReadoptionPolicy{
 			Mode: ReadoptionLineageLive, Backoff: 100 * time.Millisecond,
 			BackoffCap: 100 * time.Millisecond, Window: 30 * time.Second,
-			KeepaliveInterval: 50 * time.Millisecond,
+			KeepaliveInterval: 100 * time.Millisecond,
 		},
 		orphan: sessionshim.OrphanPolicy{
 			Deadline: orphanDeadline, TerminationGrace: 200 * time.Millisecond, PropagationMargin: 0,
@@ -983,7 +986,7 @@ func TestKeepaliveStopsAsSoonAsTheLineageIsReleased(t *testing.T) {
 	defer stop()
 
 	extended := func() int { return f.daemon.sessionShimKeepaliveObservations(f.id).extensions }
-	deadline := time.Now().Add(5 * time.Second)
+	deadline := time.Now().Add(20 * time.Second)
 	for extended() < 2 && time.Now().Before(deadline) {
 		time.Sleep(10 * time.Millisecond)
 	}
@@ -996,9 +999,9 @@ func TestKeepaliveStopsAsSoonAsTheLineageIsReleased(t *testing.T) {
 	held.Unlock()
 	// Within a few intervals the extension must have stopped for good. One
 	// exchange may already be in flight; nothing may follow it.
-	time.Sleep(300 * time.Millisecond)
+	time.Sleep(time.Second)
 	settled := extended()
-	time.Sleep(500 * time.Millisecond)
+	time.Sleep(2 * time.Second)
 	if got := extended(); got != settled {
 		t.Fatalf("the keepalive honoured %d extensions after the lineage was released (was %d); it kept the shim alive past the release",
 			got, settled)
