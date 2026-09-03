@@ -249,7 +249,7 @@ func TestLineageLiveWindowReadoptsACarrierThatReturnsAfterTheFixedCutoff(t *test
 	})
 	lost := f.lostEntry(t)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionSucceeded {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionSucceeded {
 		t.Fatalf("disposition = %d, want readoptionSucceeded (%d) after the carrier returned on attempt %d",
 			got, readoptionSucceeded, returnsOnAttempt)
 	}
@@ -293,7 +293,7 @@ func TestLineageLiveBackoffNeverExceedsTheCap(t *testing.T) {
 	})
 	lost := f.lostEntry(t)
 
-	f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost)
+	f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
 
 	var backoffs []time.Duration
 	for _, wait := range clock.requestedWaits() {
@@ -375,7 +375,7 @@ func TestLineageLiveStopsWhenTheLineageIsNoLongerHeld(t *testing.T) {
 	})
 	lost := f.lostEntry(t)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionLineageGone {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionLineageGone {
 		t.Fatalf("disposition = %d, want readoptionLineageGone (%d) once the composing layer let the lineage go",
 			got, readoptionLineageGone)
 	}
@@ -430,7 +430,7 @@ func TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff(t *te
 	lost := f.lostEntry(t)
 	f.waitForOrphanArmed(t, 5*time.Second)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionWindowExhausted {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
 		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d) — the shim did not survive the window",
 			got, readoptionWindowExhausted)
 	}
@@ -497,7 +497,7 @@ func TestLineageLiveWindowReachesTenMinutesUnderANinetySecondOrphanDeadline(t *t
 	lost := f.lostEntry(t)
 	f.waitForOrphanArmed(t, 5*time.Second)
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionWindowExhausted {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionWindowExhausted {
 		t.Fatalf("disposition = %d, want readoptionWindowExhausted (%d)", got, readoptionWindowExhausted)
 	}
 	if elapsed := clock.elapsed(started); elapsed < defaultSessionShimReadoptionWindow-defaultSessionShimReadoptionBackoffCap {
@@ -672,7 +672,7 @@ func TestLineageMayNotReenterAWindowBeforeThePreviousDeadline(t *testing.T) {
 	// measure against, well inside the ten minutes this one does.
 	lost.readoptedAtUnixNano = f.daemon.shimNow().Add(-90 * time.Second).UnixNano()
 
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionRefused {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionRefused {
 		t.Fatalf("disposition = %d, want readoptionRefused (%d) inside the governing window", got, readoptionRefused)
 	}
 	if adoptions, _ := f.snapshot(); adoptions != 0 {
@@ -681,7 +681,7 @@ func TestLineageMayNotReenterAWindowBeforeThePreviousDeadline(t *testing.T) {
 
 	// Past the governing window, the lineage may enter a new one.
 	lost.readoptedAtUnixNano = f.daemon.shimNow().Add(-11 * time.Minute).UnixNano()
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost); got != readoptionSucceeded {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got != readoptionSucceeded {
 		t.Fatalf("disposition = %d, want readoptionSucceeded (%d) after the previous window's deadline had passed",
 			got, readoptionSucceeded)
 	}

@@ -71,6 +71,14 @@ type AdoptOptions struct {
 	// (which sits above the durable-heartbeat receipt wait bound) are raised to
 	// it rather than honoured — see ControllerOptions.EventBacklogStallDeadline.
 	EventBacklogStallDeadline time.Duration
+	// DurableAckAmbiguityBound overrides how long a stalled reader is held open
+	// while a durable acknowledgement is outstanding. Zero uses the sessionshim
+	// default, which is the WRONG answer for any composition that configures a
+	// re-adoption window: ADR-2026-09-03 makes this bound and the lineage-live
+	// re-adoption window ONE configured value, so a composing daemon must set
+	// this from its resolved policy rather than letting two defaults agree by
+	// coincidence. See ControllerOptions.DurableAckAmbiguityBound.
+	DurableAckAmbiguityBound time.Duration
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -384,6 +392,21 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 	return result, nil
 }
 
+// ResolvedDurableAckAmbiguityBound reports the bound a controller dialled by
+// this adoption pass would actually hold for, after the default and the floor.
+//
+// It exists for the same reason ControllerOptions has one: a composing daemon
+// must be able to assert that its configured re-adoption window REACHES the
+// controllers it dials, on the struct its own production code built, rather
+// than on a struct a test rebuilt by hand — the latter passes with the
+// assignment deleted.
+func (o AdoptOptions) ResolvedDurableAckAmbiguityBound() time.Duration {
+	return ControllerOptions{
+		DurableAckAmbiguityBound:  o.DurableAckAmbiguityBound,
+		EventBacklogStallDeadline: o.EventBacklogStallDeadline,
+	}.ResolvedDurableAckAmbiguityBound()
+}
+
 func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Controller, error) {
 	id := rec.Identity()
 	probe := ControllerOptions{
@@ -452,6 +475,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		DurableAckGeneration:       durableAckGeneration,
 		EventBacklogBudget:         opts.EventBacklogBudget,
 		EventBacklogStallDeadline:  opts.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:   opts.DurableAckAmbiguityBound,
 		ExpectedWorkarea:           expected,
 		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,

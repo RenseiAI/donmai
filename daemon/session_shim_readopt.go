@@ -69,7 +69,18 @@ const (
 // must keep saying so. The swap to the new controller happens under the lock,
 // only when the lost controller is still the adopted one, and is undone when
 // the batch that would have told the receiver about it does not commit.
-func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, lost adoptedShim) sessionShimReadoptionDisposition {
+// attemptBudget, when positive, replaces the configured policy for THIS run
+// with that many fixed attempts. It is how the durable-acknowledgement
+// ambiguity path takes its last look at a lineage without either skipping the
+// look (which ADR-2026-09-03 rejects by name) or re-entering a full
+// lineage-live window it has already spent. The re-entry guard below still uses
+// the CONFIGURED policy's window: which window governs "lost again too soon" is
+// a property of the deployment, not of one reduced run.
+func (d *Daemon) readoptSessionShimAfterControllerLoss(
+	id sessionshim.Identity,
+	lost adoptedShim,
+	attemptBudget int,
+) sessionShimReadoptionDisposition {
 	cfg := d.sessionShimConfig()
 	policy := cfg.readoption()
 	if policy.Disabled || lost.controller == nil {
@@ -99,6 +110,14 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 	if err != nil {
 		slog.Warn("session shim: re-adoption after controller loss has no registry", "session", id.String(), "error", err)
 		return readoptionRefused
+	}
+	if attemptBudget > 0 {
+		policy = SessionShimReadoptionPolicy{
+			Mode:           ReadoptionFixedAttempts,
+			Attempts:       attemptBudget,
+			Backoff:        policy.Backoff,
+			AttemptTimeout: policy.AttemptTimeout,
+		}
 	}
 	hello := lost.controller.Hello()
 	if policy.Mode == ReadoptionLineageLive {

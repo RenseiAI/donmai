@@ -366,7 +366,7 @@ func TestReadoptionWhoseBatchIsRefusedRestoresTheLostEntry(t *testing.T) {
 	lost := f.lostEntry(t)
 	lostGeneration := lost.adoption.ControllerGeneration
 
-	if got := d.readoptSessionShimAfterControllerLoss(f.id, lost); got == readoptionSucceeded {
+	if got := d.readoptSessionShimAfterControllerLoss(f.id, lost, 0); got == readoptionSucceeded {
 		t.Fatalf("re-adoption disposition = %d, want anything but success though its batch was refused", got)
 	}
 
@@ -590,7 +590,7 @@ func TestReadoptionAttemptIsBoundedByThePolicyAttemptTimeout(t *testing.T) {
 	lost := f.lostEntry(t)
 
 	started := time.Now()
-	readopted := d.readoptSessionShimAfterControllerLoss(f.id, lost)
+	readopted := d.readoptSessionShimAfterControllerLoss(f.id, lost, 0)
 	elapsed := time.Since(started)
 	if readopted == readoptionSucceeded {
 		t.Fatal("re-adoption reported success though its durable adoption never answered")

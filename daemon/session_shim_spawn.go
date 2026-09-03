@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
@@ -276,28 +277,19 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		prepared       SessionShimAdoptionPreparationResult
 		preparedHostID string
 	)
-	controllerOpts := sessionshim.ControllerOptions{
-		ControllerID:              d.controllerID(),
-		EventBacklogBudget:        cfg.EventBacklogBudget,
-		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
-		ExpectedWorkarea:          workarea,
-		ExpectedWorkareaRoot:      layout.Root.String(),
-		DialTimeout:               cfg.launchTimeout(),
-		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
-		Logger:                    slog.Default(),
-		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
-			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
-			if hostErr != nil {
-				return sessionshim.PreparedAdoption{}, hostErr
-			}
-			resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
-			if prepareErr != nil {
-				return sessionshim.PreparedAdoption{}, prepareErr
-			}
-			preparedHostID = hostID
-			prepared = resolved
-			return resolved.PreparedAdoption, nil
-		},
+	controllerOpts := d.sessionShimLaunchControllerOptions(cfg, workarea, layout.Root.String())
+	controllerOpts.PrepareAdoption = func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
+		if hostErr != nil {
+			return sessionshim.PreparedAdoption{}, hostErr
+		}
+		resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
+		if prepareErr != nil {
+			return sessionshim.PreparedAdoption{}, prepareErr
+		}
+		preparedHostID = hostID
+		prepared = resolved
+		return resolved.PreparedAdoption, nil
 	}
 	ctrl, err := sessionshim.Dial(ctx, rec, controllerOpts)
 	if err != nil {
@@ -2029,9 +2021,37 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		// rather than left published against a socket nobody can write to, or
 		// (after a carrier loss) re-established through a fresh adoption.
 		if gate.await() {
-			d.releaseShimIfLive(id, ctrl, cause)
+			d.releaseShimIfLive(id, ctrl, classifyShimStreamEnd(cause, ctrl.StreamEndCause()))
 		}
 	}()
+}
+
+// sessionShimLaunchControllerOptions assembles everything a launch's controller
+// carries that does not close over the launch itself — identity, the transport
+// bounds, and the workarea it must match. The launch adds only its
+// PrepareAdoption closure on top.
+//
+// It is a named seam rather than a literal inside launchSessionShim so the
+// bounds a launched controller actually receives can be asserted without
+// launching a shim. A test that rebuilds the struct by hand asserts its own
+// arithmetic: deleting the assignment here would leave it green, which is
+// exactly the gap this function exists to close (compare
+// sessionShimAdoptOptions, the same seam for the adoption pass).
+func (d *Daemon) sessionShimLaunchControllerOptions(
+	cfg SessionShimConfig,
+	workarea, workareaRoot string,
+) sessionshim.ControllerOptions {
+	return sessionshim.ControllerOptions{
+		ControllerID:              d.controllerID(),
+		EventBacklogBudget:        cfg.EventBacklogBudget,
+		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
+		ExpectedWorkarea:          workarea,
+		ExpectedWorkareaRoot:      workareaRoot,
+		DialTimeout:               cfg.launchTimeout(),
+		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
+		Logger:                    slog.Default(),
+	}
 }
 
 // shimStreamEndCause says why an adopted session's controller stream ended.
@@ -2045,7 +2065,39 @@ const (
 	// durable carrier refused an append or an acknowledgement. The shim and
 	// its harness are alive and untouched.
 	shimStreamCarrierLost
+	// shimStreamDurableAckAmbiguous: the controller's own back-pressure gave up
+	// while a durable acknowledgement it had sent was still outstanding. The
+	// socket was reachable throughout and the shim never went away — the
+	// durable side was simply too slow for too long. Like a carrier loss this
+	// re-adopts before it withdraws; unlike one, exhausting the bound does not
+	// get the dead-shim REASON, because nothing about this ending is a
+	// statement about the socket.
+	shimStreamDurableAckAmbiguous
 )
+
+// classifyShimStreamEnd refines why an adopted session's stream ended, using
+// the fail-closed decision the controller recorded about its own connection.
+//
+// A stream that ended because THIS daemon's reader hit its ambiguity bound is
+// not the shim ending the stream, and it never was: the socket was answering.
+// Recording it as an ordinary ending is what published `socket_unreachable` for
+// a live shim on a consumer daemon, and the control plane terminalized the
+// lineage 95 s later off that reason. ADR-2026-08-30 D2 classifies "a
+// transport-level acknowledgement without the durable post-condition" as
+// ambiguous, and ambiguous evidence may not emit a terminal outcome.
+//
+// Only the ambiguity sentinel is refined. A plain ErrEventBacklogExceeded is a
+// consumer that stopped with nothing outstanding to prove otherwise, and keeps
+// exactly the disposition it had.
+func classifyShimStreamEnd(cause shimStreamEndCause, endErr error) shimStreamEndCause {
+	if cause != shimStreamEnded {
+		return cause
+	}
+	if errors.Is(endErr, sessionshim.ErrDurableAckAmbiguityBound) {
+		return shimStreamDurableAckAmbiguous
+	}
+	return cause
+}
 
 // shimCursorAcknowledger persists one adopted session's durable forwarded
 // cursor OFF the event path.
@@ -2364,6 +2416,12 @@ func (d *Daemon) finishAdoptedShim(id sessionshim.Identity, exit shimwire.ExitMs
 	if stillOwned && current.controller == entry.controller && current.terminal {
 		delete(d.shims.adopted, id)
 		delete(d.shims.forwarded, id)
+		// The streak belongs to a lineage that is still being retried. Every
+		// path that removes the adopted entry clears it — this one returns
+		// early, and leaving the entry behind would have a RE-LAUNCHED lineage
+		// on the same org+session id inherit a spent budget and reduce its very
+		// first re-adoption to one attempt.
+		delete(d.shims.ambiguityCycles, id)
 	} else {
 		stillOwned = false
 	}
@@ -2516,18 +2574,52 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// projection built meanwhile must keep saying so. Removing it first would
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
-	if cause != shimStreamCarrierLost {
-		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
+	if cause != shimStreamCarrierLost && cause != shimStreamDurableAckAmbiguous {
+		d.quarantineLostSessionShim(id, entry, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 		return
+	}
+	// An ending this daemon reached on an outstanding durable acknowledgement
+	// carries its own reason all the way through: every withdrawal below is
+	// `durable_ack_timeout`, because the socket was reachable for the whole of
+	// it and no projection of this lineage may say otherwise.
+	lostReason := sessionshim.QuarantineSocketUnreachable
+	// attemptBudget and spentDetail are set only on the last look this path
+	// takes at a lineage — see maxConsecutiveDurableAckAmbiguityCycles.
+	attemptBudget := 0
+	spentDetail := ""
+	if cause == shimStreamDurableAckAmbiguous {
+		lostReason = sessionshim.QuarantineDurableAckTimeout
+		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
+		// un-anchored ambiguity bound, so against a durable side that is
+		// persistently slow this path re-enters itself. What the streak buys is
+		// NOT a shortcut past re-adoption — ADR-2026-09-03 rejects that by
+		// name: "it must not shortcut past the re-adoption check that would
+		// otherwise catch a shim that is, in fact, still live and reachable."
+		// It buys a cheaper last look: one attempt instead of the full budget
+		// or a second whole lineage-live window. A shim that is still there is
+		// still re-adopted, however many cycles it has cost; only the pipeline
+		// settles the lineage.
+		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
+			attemptBudget = 1
+			spentDetail = sessionShimDurableAckCyclesSpentDetail
+		}
+	} else {
+		// Any other ending ends the streak: "consecutive" is the whole claim.
+		d.clearDurableAckAmbiguityCycles(id)
 	}
 	// The carrier binding is gone from this instant. Recording it before the
 	// re-adoption runs is what lets an embedder see the state DURING the
 	// window, which is the only time the observation is worth anything.
 	cfg := d.sessionShimConfig()
-	if d.noteSessionShimCarrierBindLost(id, ctrl) {
+	// ONLY a carrier loss loses the carrier bind. On the ambiguity path the
+	// carrier never refused anything — it was slow — so the binding is not gone
+	// and raising bind-lost would hand the composing layer a fact that did not
+	// happen, on the exact path whose whole point is not to assert what it
+	// cannot observe.
+	if cause == shimStreamCarrierLost && d.noteSessionShimCarrierBindLost(id, ctrl) {
 		d.raiseSessionShimCarrierBindLost(cfg, id)
 	}
-	switch d.readoptSessionShimAfterControllerLoss(id, entry) {
+	switch d.readoptSessionShimAfterControllerLoss(id, entry, attemptBudget) {
 	case readoptionSucceeded:
 		return
 	case readoptionWindowExhausted:
@@ -2538,26 +2630,36 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// past that would leave an adopted entry whose keepalive has stopped,
 		// whose shim reaps within one orphan deadline, and whose tombstone the
 		// quarantine-only reconciler would never consume.
-		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionWindowExhaustedDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimReadoptionWindowExhaustedDetail))
 	case readoptionAttemptsSpent:
-		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionAttemptsSpentDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimReadoptionAttemptsSpentDetail))
 	default:
-		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, cmp.Or(spentDetail, sessionShimControllerLostDetail))
 	}
 }
 
 // quarantineLostSessionShim withdraws authority from the lost controller and
-// projects the exact live shim as quarantined `socket_unreachable`, then
-// publishes. It is a no-op when the entry has already left by another route —
-// a shutdown release, or a replacement controller.
+// projects the exact live shim as quarantined under reason, then publishes. It
+// is a no-op when the entry has already left by another route — a shutdown
+// release, or a replacement controller.
 //
-// detail is what distinguishes the two ways a lineage reaches this path: the
-// ordinary controller loss, and a lineage-live re-adoption window that ended
-// with the shim still observable. The closed reason registry is the same for
-// both — this change does not extend it — so the detail is where the
-// amendment's "carrying a reason that distinguishes it from the dead-shim
-// outcome" lives.
-func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adoptedShim, detail string) {
+// detail distinguishes the ways a lineage reaches this path within one reason:
+// the ordinary controller loss, a lineage-live re-adoption window that ended
+// with the shim still observable, and a spent attempt budget.
+//
+// reason distinguishes the ones that are not the same FACT. `socket_unreachable`
+// is a claim about the socket, and a lineage whose socket answered throughout —
+// whose durable acknowledgements simply stayed outstanding past the ambiguity
+// bound — gets `durable_ack_timeout` instead. Both withdraw authority, neither
+// kills the shim, and neither is terminal: the reconciler still needs an
+// ordinary terminal receipt or a group-reaped tombstone before anything about
+// this lineage closes.
+func (d *Daemon) quarantineLostSessionShim(
+	id sessionshim.Identity,
+	entry adoptedShim,
+	reason sessionshim.QuarantineReason,
+	detail string,
+) {
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
@@ -2567,6 +2669,9 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 	if ok {
 		delete(d.shims.adopted, id)
 		delete(d.shims.keepalives, id)
+		// Withdrawn: there is nothing left to count, and a later lineage on
+		// this identity must start from a clean streak.
+		delete(d.shims.ambiguityCycles, id)
 		hello := entry.controller.Hello()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
@@ -2577,7 +2682,7 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 			ProtocolMax:       hello.Max,
 			Phase:             hello.Phase,
 			CreatedAtUnixNano: now.UnixNano(),
-		}, sessionshim.QuarantineSocketUnreachable, detail, now)
+		}, reason, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())
 		d.upsertShimQuarantineLocked(q)
 	}
@@ -2585,6 +2690,52 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
+}
+
+// maxConsecutiveDurableAckAmbiguityCycles is how many times in a row a lineage
+// may leave its controller stream on an exhausted durable-acknowledgement
+// ambiguity bound before this daemon reduces its re-adoption to a single
+// attempt. See releaseShimIfLive for what the streak does and does not buy.
+//
+// Three, because two is indistinguishable from bad luck — a control plane
+// redeploy can plausibly outlast one bound and be caught by the retry after it.
+//
+// # WHAT THIS COUNTER IS NOT
+//
+// It is IN-MEMORY and per-daemon. A restart resets every streak, so the budget
+// bounds one daemon's patience, not the lineage's history — it FAILS OPEN, and
+// a lineage that keeps costing bounds across restarts keeps getting the full
+// attempt budget. That is the conservative direction (an extra dial at a live
+// shim, never an extra withdrawal), and it is why the streak may reduce the
+// budget but must never skip the pipeline: the only thing that settles a
+// lineage here is an outcome from re-adoption.
+const maxConsecutiveDurableAckAmbiguityCycles = 3
+
+// noteDurableAckAmbiguityCycle records one more consecutive ambiguity-bound
+// exit for this lineage and reports the running total.
+func (d *Daemon) noteDurableAckAmbiguityCycle(id sessionshim.Identity) int {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	if d.shims.ambiguityCycles == nil {
+		d.shims.ambiguityCycles = make(map[sessionshim.Identity]int)
+	}
+	d.shims.ambiguityCycles[id]++
+	return d.shims.ambiguityCycles[id]
+}
+
+// clearDurableAckAmbiguityCycles ends this lineage's streak.
+func (d *Daemon) clearDurableAckAmbiguityCycles(id sessionshim.Identity) {
+	d.shims.mu.Lock()
+	delete(d.shims.ambiguityCycles, id)
+	d.shims.mu.Unlock()
+}
+
+// durableAckAmbiguityCycles reports this lineage's current streak.
+// Diagnostics and tests only.
+func (d *Daemon) durableAckAmbiguityCycles(id sessionshim.Identity) int {
+	d.shims.mu.RLock()
+	defer d.shims.mu.RUnlock()
+	return d.shims.ambiguityCycles[id]
 }
 
 // publishQuarantineAfterConsumingTerminalProof is the disconnect path's

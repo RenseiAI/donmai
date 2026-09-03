@@ -60,6 +60,24 @@ const (
 	// QuarantineDurableHostFrameUnsupported is selected-v2 ownership/snapshot
 	// conservation without the exact full host-frame rail required by D14.
 	QuarantineDurableHostFrameUnsupported QuarantineReason = "durable_host_frame_unsupported"
+	// QuarantineDurableAckTimeout: durable acknowledgements stayed outstanding
+	// past the ambiguity bound while the shim's socket was REACHABLE the whole
+	// time — this daemon hung up on its own back-pressure, the shim never went
+	// away.
+	//
+	// It exists because `socket_unreachable` was being published for it, and
+	// that reason is a claim about the socket. ADR-2026-08-30 D2 puts "a
+	// transport-level acknowledgement without the durable post-condition" on
+	// the closed list of evidence that is ALWAYS ambiguous, and ambiguous
+	// evidence "may not unlink, tombstone, release an external claim, ... or
+	// emit a terminal session outcome". So this reason is deliberately NOT
+	// terminal: like every other reason here it withdraws controller authority,
+	// does not kill the shim, and keeps the lineage visible and
+	// capacity-charged until an ordinary terminal receipt or a group-reaped
+	// tombstone reconciles it. An operator reading it learns "the durable side
+	// was too slow for too long", which calls for a different response than
+	// "the socket is gone".
+	QuarantineDurableAckTimeout QuarantineReason = "durable_ack_timeout"
 )
 
 // Known reports whether r is an assigned v1 quarantine reason.
@@ -69,7 +87,7 @@ func (r QuarantineReason) Known() bool {
 		QuarantineIdentityMismatch, QuarantineUnauthenticated, QuarantinePhaseUnknown,
 		QuarantineGenerationNotAdvanced, QuarantineSocketUnreachable, QuarantineAdoptionFailed,
 		QuarantineGroupReapUnproven, QuarantineAuthoritativeSnapshotUnsupported,
-		QuarantineDurableHostFrameUnsupported:
+		QuarantineDurableHostFrameUnsupported, QuarantineDurableAckTimeout:
 		return true
 	default:
 		return false

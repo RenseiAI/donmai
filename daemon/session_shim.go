@@ -1442,6 +1442,13 @@ type sessionShimState struct {
 	// lifecycle, and a refusal can affect only that exact lifecycle.
 	acceptanceRefusals   map[sessionshim.Identity]acceptanceRefusalState
 	acceptanceQuarantine map[shimIncarnation]sessionshim.ProcessIdentity
+	// ambiguityCycles counts each lineage's CONSECUTIVE controller-stream exits
+	// on an exhausted durable-acknowledgement ambiguity bound. A successful
+	// re-adoption hands back a fresh controller with a fresh bound, so without
+	// this the retry a slow durable side is owed would never end; see
+	// maxConsecutiveDurableAckAmbiguityCycles. Any other ending, and the
+	// withdrawal itself, clears the entry.
+	ambiguityCycles map[sessionshim.Identity]int
 	// reconciling marks scopes with one commit-outcome reconciliation pass in
 	// flight, so concurrent triggers (an ambiguous commit and the
 	// revision-stale beat it causes) arm exactly one bounded loop.
@@ -1495,6 +1502,7 @@ func newSessionShimState() *sessionShimState {
 		activationGates:      make(map[sessionshim.Identity]*shimAdoptionGate),
 		acceptanceRefusals:   make(map[sessionshim.Identity]acceptanceRefusalState),
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
+		ambiguityCycles:      make(map[sessionshim.Identity]int),
 		reconciling:          make(map[string]bool),
 		reconcileStop:        make(chan struct{}),
 	}
@@ -1854,6 +1862,12 @@ const (
 	// to try" are different operator-facing facts, and reporting the second for
 	// the first is what makes an attempt budget look like a death.
 	sessionShimReadoptionAttemptsSpentDetail = "readoption_attempts_spent: the bounded re-adoption attempts ran out with the shim still observable"
+	// sessionShimDurableAckCyclesSpentDetail is the third consecutive lineage
+	// exit on an exhausted durable-acknowledgement ambiguity bound: the durable
+	// side is persistently slow rather than transiently slow, and re-adopting
+	// again would only issue more batch commits against the dependency that
+	// cannot answer them.
+	sessionShimDurableAckCyclesSpentDetail = "durable_ack_cycles_spent: consecutive re-adoptions each ran the durable-acknowledgement ambiguity bound out"
 )
 
 // DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
@@ -2104,6 +2118,34 @@ func (p SessionShimReadoptionPolicy) WorstCaseWindow() time.Duration {
 	return total
 }
 
+// durableAckAmbiguityWindow is the lineage-live re-adoption window this policy
+// resolves to — and, by ADR-2026-09-03, the durable-acknowledgement ambiguity
+// bound as well.
+//
+// The two are ONE configured value, not two that default identically: "a future
+// change to one without considering the other could silently change both …
+// Implementations MUST treat the two as one configured value." So this is the
+// single place the window is resolved for that purpose, and every controller
+// this daemon dials carries the answer.
+//
+// A fixed-attempts policy configures no window — its bound is attempt
+// arithmetic, which answers a different question (how long a bounded RETRY
+// runs) than this one (how long an alive-but-unproven lineage is tolerated
+// before re-adoption decides). It therefore resolves to the same default
+// lineage-live window the ADR names, exactly as an unset Window does.
+func (p SessionShimReadoptionPolicy) durableAckAmbiguityWindow() time.Duration {
+	if p.Window > 0 {
+		return p.Window
+	}
+	return defaultSessionShimReadoptionWindow
+}
+
+// durableAckAmbiguityBound is the bound every controller this daemon dials is
+// given, resolved from the re-adoption policy it is running.
+func (c SessionShimConfig) durableAckAmbiguityBound() time.Duration {
+	return c.readoption().durableAckAmbiguityWindow()
+}
+
 // launchTimeout returns the effective bound on one shim launch.
 func (c SessionShimConfig) launchTimeout() time.Duration {
 	if c.LaunchTimeout <= 0 {
@@ -2162,6 +2204,7 @@ func (d *Daemon) sessionShimAdoptOptions(
 		ControllerID:              d.controllerID(),
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
 		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
 		Logger:                    slog.Default(),
 	}

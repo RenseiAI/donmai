@@ -311,7 +311,7 @@ func TestARebindDoesNotSpendTheAutomaticReadoptionBudget(t *testing.T) {
 	// re-entry guard is the first thing the re-adoption evaluates, so a
 	// disposition of readoptionRefused with nothing attempted IS the guard
 	// refusing — which is what a stamped rebind produces for a full window.
-	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, repaired); got == readoptionRefused {
+	if got := f.daemon.readoptSessionShimAfterControllerLoss(f.id, repaired, 0); got == readoptionRefused {
 		t.Fatalf("disposition after a carrier fault following a rebind = readoptionRefused (%d): the re-entry guard spent the automatic budget on an operator repair",
 			readoptionRefused)
 	}
