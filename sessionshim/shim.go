@@ -775,8 +775,13 @@ func (s *Shim) serveController(conn *net.UnixConn) {
 	}
 
 	if err := s.handshake(conn, w, r); err != nil {
-		s.logger.Warn("sessionshim: controller handshake refused",
-			"session", s.id.String(), "error", err)
+		// A keepalive is a served exchange, not a refused handshake: it
+		// deliberately ends the connection without adopting, so logging it as a
+		// refusal would fill an orphaned shim's log with its own liveness.
+		if !errors.Is(err, errOrphanKeepaliveServed) {
+			s.logger.Warn("sessionshim: controller handshake refused",
+				"session", s.id.String(), "error", err)
+		}
 		_ = conn.Close()
 	}
 }
@@ -816,6 +821,26 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	msg, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("sessionshim: read welcome: %w", err)
+	}
+	if msg.Type == shimwire.TypeHeartbeat {
+		// A Heartbeat where a Welcome belongs is the §D8 orphan keepalive: the
+		// daemon is telling this shim it is still observed while its own
+		// re-adoption keeps failing. It proposes no generation and takes no
+		// authority, so it is answered and the connection ends here.
+		//
+		// The output barrier goes FIRST, before the registry write and the
+		// answer. Nothing about the frozen boundary is used on this path, and
+		// holding it would stop the harness's output sequence for a record
+		// write and a round trip — once per keepalive interval, twenty times
+		// across a ten-minute window, on a harness that is still producing.
+		// The connection deadline comes down with it: the adoption barrier's
+		// bound is sized for a whole handshake, not for one frame each way.
+		if outputBarrier != nil {
+			outputBarrier.Release()
+			outputBarrier = nil
+		}
+		_ = conn.SetDeadline(time.Now().Add(orphanKeepaliveAnswerTimeout))
+		return s.serveOrphanKeepalive(w, msg)
 	}
 	if msg.Type != shimwire.TypeWelcome {
 		_ = sendError(w, shimwire.CodeMalformed, "expected Welcome")

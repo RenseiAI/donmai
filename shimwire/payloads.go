@@ -371,6 +371,13 @@ type HeartbeatMsg struct {
 	Generation Generation `json:"generation,omitempty"`
 	AckedSeq   uint64     `json:"ackedSeq,omitempty"`
 	Phase      Phase      `json:"phase,omitempty"`
+	// OrphanDeadlineAt is set only on the shim's answer to a daemon keepalive
+	// sent while the shim is orphaned: the Unix-nanosecond instant the shim
+	// re-armed its own §D8 deadline to. It is an OBSERVATION of the shim's own
+	// clock, never an instruction — the shim owns that deadline, and a daemon
+	// that reads a value it did not expect learns the truth rather than
+	// imposing one. Absent on every ordinary heartbeat.
+	OrphanDeadlineAt int64 `json:"orphanDeadlineAt,omitempty"`
 }
 
 // ExitMsg is the immutable terminal observation. Once emitted it never changes,
