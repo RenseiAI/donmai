@@ -8,6 +8,32 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- Shared-parent worktree sessions now refresh the requested base ref before the
+  session branch is created, and record the branch point (`BaseRef`, `BaseSHA`,
+  and the fetch duration) on the provision receipt. Set `SkipBaseFetch` to keep
+  the previous purely-local behaviour — for offline hosts, or when the caller
+  already refreshed the parent.
+- Sessions launched concurrently against one parent clone no longer fail with
+  `cannot lock ref 'refs/remotes/origin/<ref>'`. Concurrent provisions of the
+  same base ref share a single `git fetch`; that shared fetch runs on its own
+  context, so one session cancelling its launch no longer fails the others.
+  Fetches of *different* refs on one parent still run concurrently — Git locks
+  remote-tracking refs individually, so they do not contend.
+- Every Git operation that mutates a shared parent clone (`worktree add`,
+  `worktree remove` on teardown, and conflict cleanup) is serialized per parent,
+  under a key that treats absolute, relative, and symlinked spellings of one
+  parent as the same repository.
+- A base ref under `refs/tags/` is now rejected with `ErrInvalidBaseRef` instead
+  of silently resolving to a same-named branch. `refs/heads/`, `refs/remotes/`
+  and `origin/` spellings normalize to the same branch as before.
+- A session whose base commit cannot be resolved after checkout is torn down
+  rather than left behind, and a failure of that cleanup is reported alongside
+  the original error rather than discarded.
+- New session branches created by the shared-parent strategy do not configure an
+  automatic upstream; callers that need to push must set one explicitly.
+
 ---
 
 ## v0.72.18 — 2026-09-02
