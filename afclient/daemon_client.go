@@ -126,6 +126,8 @@ type DaemonSessionShimAdoptedCorrelation struct {
 	ProtocolVersion        uint32 `json:"protocolVersion,omitempty"`
 	AuthoritativeSnapshot  bool   `json:"authoritativeSnapshot"`
 	CarrierIncompatibility string `json:"carrierIncompatibility,omitempty"`
+	CarrierBound           bool   `json:"carrierBound"`
+	LastCarrierLossAt      int64  `json:"lastCarrierLossAt,omitempty"`
 }
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.

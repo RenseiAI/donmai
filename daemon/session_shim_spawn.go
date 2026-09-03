@@ -2502,7 +2502,15 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	if !ok {
 		return
 	}
-	if entry.controller != nil {
+	if cause == shimStreamCarrierLost {
+		d.shims.mu.Lock()
+		current := d.shims.adopted[id]
+		current.carrierBound = false
+		current.carrierBoundAtUnixNano = time.Now().UnixNano()
+		d.shims.adopted[id] = current
+		d.shims.mu.Unlock()
+	}
+	if entry.controller != nil && cause != shimStreamCarrierLost {
 		_ = entry.controller.Close()
 		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
 			"session", id.String(), "carrierLost", cause == shimStreamCarrierLost)
@@ -3065,17 +3073,17 @@ func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*se
 // adoptedShimEntry resolves one adopted session with a live controller.
 func (d *Daemon) adoptedShimEntry(orgID, sessionID string) (adoptedShim, error) {
 	if d.shims == nil {
-		return adoptedShim{}, errors.New("session shim: adoption is not configured")
+		return adoptedShim{}, fmt.Errorf("%w: adoption is not configured", ErrSessionShimNotAdopted)
 	}
 	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
 	d.shims.mu.RLock()
 	entry, ok := d.shims.adopted[id]
 	d.shims.mu.RUnlock()
 	if !ok {
-		return adoptedShim{}, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+		return adoptedShim{}, fmt.Errorf("%w: %s is not adopted by this daemon", ErrSessionShimNotAdopted, id)
 	}
 	if entry.controller == nil {
-		return adoptedShim{}, fmt.Errorf("session shim: %s has no live controller connection", id)
+		return adoptedShim{}, fmt.Errorf("%w: %s", ErrSessionShimNoController, id)
 	}
 	return entry, nil
 }

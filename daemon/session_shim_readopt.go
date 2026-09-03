@@ -34,6 +34,10 @@ import (
 func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, lost adoptedShim) bool {
 	cfg := d.sessionShimConfig()
 	policy := cfg.readoption()
+	if err := cfg.Readoption.Validate(); err != nil {
+		slog.Warn("session shim: invalid readoption policy", "session", id.String(), "error", err)
+		return false
+	}
 	if policy.Disabled || lost.controller == nil {
 		return false
 	}
@@ -48,6 +52,11 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 			return false
 		}
 	}
+	window := policy.WorstCaseWindow()
+	if policy.Window > 0 {
+		window = policy.Window
+	}
+	deadline := d.shimNow().Add(window)
 	registry, err := d.sessionShimRegistry()
 	if err != nil {
 		slog.Warn("session shim: re-adoption after controller loss has no registry", "session", id.String(), "error", err)
@@ -55,14 +64,31 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 	}
 	hello := lost.controller.Hello()
 	backoff := policy.Backoff
-	for attempt := 1; attempt <= policy.Attempts; attempt++ {
+	legacyAttempts := policy.Window <= 0
+	windowExhausted := false
+	for attempt := 1; ; attempt++ {
+		if legacyAttempts && attempt > policy.Attempts {
+			break
+		}
+		if !d.shimNow().Before(deadline) {
+			windowExhausted = true
+			break
+		}
 		if attempt > 1 {
+			remaining := deadline.Sub(d.shimNow())
+			if remaining <= 0 || backoff >= remaining {
+				windowExhausted = true
+				break
+			}
 			if !d.sleepSessionShimReconcileBackoff(backoff) {
 				return false
 			}
-			backoff *= 2
+			backoff = min(backoff*2, policy.BackoffCap)
 		}
 		if d.sessionShimReconcileStopped() {
+			return false
+		}
+		if cfg.LineageLive != nil && !cfg.LineageLive(context.Background(), id) {
 			return false
 		}
 		if !sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
@@ -71,7 +97,13 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 			// tombstone before it publishes anything.
 			return false
 		}
-		err := d.readoptSessionShimOnce(registry, cfg, id, lost, hello)
+		attemptDeadline := d.shimNow().Add(policy.AttemptTimeout)
+		if deadline.Before(attemptDeadline) {
+			attemptDeadline = deadline
+		}
+		attemptCtx, cancel := context.WithDeadline(context.Background(), attemptDeadline)
+		err := d.readoptSessionShimOnce(attemptCtx, registry, cfg, id, lost, hello)
+		cancel()
 		if err == nil {
 			slog.Info("session shim: re-adopted a live shim after controller loss",
 				"session", id.String(), "attempt", attempt)
@@ -88,6 +120,11 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(id sessionshim.Identity, 
 		}
 		slog.Warn("session shim: re-adoption attempt after controller loss failed",
 			"session", id.String(), "attempt", attempt, "attempts", policy.Attempts, "error", err)
+	}
+	if policy.Mode == ReadoptionWindowed && windowExhausted && sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
+		if hook := cfg.OnReadoptionWindowExhausted; hook != nil {
+			hook(context.Background(), id)
+		}
 	}
 	return false
 }
@@ -111,14 +148,18 @@ func sessionShimIncarnationStillLive(registry *sessionshim.Registry, id sessions
 // running, and the whole window (every attempt plus every backoff) has to end
 // before it fires — see SessionShimReadoptionPolicy.WorstCaseWindow.
 func (d *Daemon) readoptSessionShimOnce(
+	ctx context.Context,
 	registry *sessionshim.Registry,
 	cfg SessionShimConfig,
 	id sessionshim.Identity,
 	lost adoptedShim,
 	lostHello shimwire.Hello,
 ) error {
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.readoptionAttemptTimeout())
-	defer cancel()
+	if deadline, ok := ctx.Deadline(); ok && time.Until(deadline) > cfg.readoptionAttemptTimeout() {
+		var cancel context.CancelFunc
+		ctx, cancel = context.WithTimeout(ctx, cfg.readoptionAttemptTimeout())
+		defer cancel()
+	}
 	opts, preparations, err := d.sessionShimAdoptOptions(registry, cfg)
 	if err != nil {
 		return err

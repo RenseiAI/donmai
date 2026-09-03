@@ -666,6 +666,12 @@ type SessionShimConfig struct {
 	// disposition — quarantine `socket_unreachable` at once, no re-dial.
 	Readoption SessionShimReadoptionPolicy
 
+	// LineageLive is the embedder's authoritative liveness predicate. A false
+	// result stops readoption and allows the normal post-window disposition;
+	// the daemon still requires the exact shim record and process incarnation
+	// to be live before every attempt.
+	LineageLive func(context.Context, sessionshim.Identity) bool
+
 	// RestartBudget is how long a planned restart is expected to take. It sizes
 	// the restart fence's hold window together with the orphan bound.
 	RestartBudget time.Duration
@@ -765,6 +771,12 @@ type SessionShimConfig struct {
 	// the hook is for — a beat whose acknowledgement needs the same barrier
 	// would deadlock against the launch that raised it.
 	OnAdoptionActivated func(ctx context.Context, scope, adoptionRevision string)
+
+	// OnSessionShimRebind is the embedder seam for restoring an external room
+	// binding after a carrier restart. The callback must be idempotent: callers
+	// may invoke RebindAdoptedSessionShim for an already-bound session.
+	OnSessionShimRebind         func(context.Context, sessionshim.Identity) error
+	OnReadoptionWindowExhausted func(context.Context, sessionshim.Identity)
 
 	// CallbackTimeout bounds PrepareAdoption, OnAdoption, and
 	// OnTerminalEvidence. Zero uses the launch timeout/default.
@@ -1206,7 +1218,9 @@ type adoptedShim struct {
 	// readoptSessionShimAfterControllerLoss). Zero for a launched or
 	// startup-adopted controller. It is what bounds re-adoption ACROSS losses:
 	// a lineage re-adopted inside the policy's window is not re-adopted again.
-	readoptedAtUnixNano int64
+	readoptedAtUnixNano    int64
+	carrierBound           bool
+	carrierBoundAtUnixNano int64
 }
 
 type sessionShimConsumedRecovery struct {
@@ -1257,7 +1271,9 @@ type sessionShimAdoptionCorrelation struct {
 
 // sessionShimState is the daemon's live view of per-session shim ownership.
 type sessionShimState struct {
-	mu sync.RWMutex
+	mu             sync.RWMutex
+	rebindMu       sync.Mutex
+	rebindInFlight map[sessionshim.Identity]bool
 	// publicationMu serializes the full dynamic adoption -> batch -> local
 	// publication -> carrier activation transaction. Composing batch revisions
 	// are global across served scopes, so overlapping dynamic publications would
@@ -1542,6 +1558,7 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 // the default policy's window is pinned strictly below both the explicit 90 s
 // and the derived 115 s in session_shim_readopt_test.go.
 type SessionShimReadoptionPolicy struct {
+	Mode SessionShimReadoptionMode
 	// Disabled keeps the pre-existing disposition: no re-dial, immediate
 	// quarantine. It is a separate flag so the zero policy means "default".
 	Disabled bool
@@ -1559,17 +1576,44 @@ type SessionShimReadoptionPolicy struct {
 	// defaultSessionShimReadoptionAttemptTimeout. The dynamic publication
 	// timeout still applies when it is the smaller of the two.
 	AttemptTimeout time.Duration
+	// Window is the total time a live lineage may be retried. Zero uses the
+	// ten-minute default. Attempts remains available for embedders that need
+	// the pre-window fixed-attempt behavior.
+	Window time.Duration
+	// BackoffCap bounds the retry interval. Zero uses thirty seconds.
+	BackoffCap        time.Duration
+	PostWindowOutcome SessionShimPostWindowOutcome
 }
+
+// SessionShimPostWindowOutcome selects behavior after a live window expires.
+type SessionShimPostWindowOutcome uint8
+
+const (
+	// ReadoptionQuarantine publishes the normal visible quarantine.
+	ReadoptionQuarantine SessionShimPostWindowOutcome = iota
+	// ReadoptionNotifyOnly invokes the exhaustion notification and retains ownership.
+	ReadoptionNotifyOnly
+)
+
+// SessionShimReadoptionMode selects fixed-attempt or windowed recovery.
+type SessionShimReadoptionMode uint8
+
+const (
+	// ReadoptionFixedAttempts preserves the pre-existing retry contract.
+	ReadoptionFixedAttempts SessionShimReadoptionMode = iota
+	// ReadoptionWindowed retries while the configured recovery window remains.
+	ReadoptionWindowed
+)
 
 const (
 	defaultSessionShimReadoptionAttempts       = 3
 	defaultSessionShimReadoptionBackoff        = 5 * time.Second
 	defaultSessionShimReadoptionAttemptTimeout = 15 * time.Second
+	defaultSessionShimReadoptionWindow         = 10 * time.Minute
+	defaultSessionShimReadoptionBackoffCap     = 30 * time.Second
 )
 
-// DefaultSessionShimReadoptionPolicy is the policy a zero value resolves to:
-// three attempts of at most fifteen seconds each, the second after a five
-// second backoff and the third after a further ten.
+// DefaultSessionShimReadoptionPolicy opts into lineage-live recovery for ten minutes.
 //
 // Worst case, every attempt runs to its bound:
 //
@@ -1588,15 +1632,36 @@ const (
 // the next one sooner.
 func DefaultSessionShimReadoptionPolicy() SessionShimReadoptionPolicy {
 	return SessionShimReadoptionPolicy{
-		Attempts:       defaultSessionShimReadoptionAttempts,
+		Mode:           ReadoptionWindowed,
+		Attempts:       0,
 		Backoff:        defaultSessionShimReadoptionBackoff,
 		AttemptTimeout: defaultSessionShimReadoptionAttemptTimeout,
+		Window:         defaultSessionShimReadoptionWindow,
+		BackoffCap:     defaultSessionShimReadoptionBackoffCap,
 	}
+}
+
+// Validate rejects contradictory mode fields.
+func (p SessionShimReadoptionPolicy) Validate() error {
+	if p.Mode == ReadoptionWindowed && p.Attempts > 0 {
+		return fmt.Errorf("session shim: windowed readoption cannot set Attempts")
+	}
+	if p.Mode == ReadoptionFixedAttempts && p.Window > 0 {
+		return fmt.Errorf("session shim: fixed-attempt readoption cannot set Window")
+	}
+	return nil
 }
 
 // readoption returns the effective re-adoption policy.
 func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 	policy := c.Readoption
+	if policy.Mode == ReadoptionWindowed {
+		if policy.Window <= 0 {
+			policy.Window = defaultSessionShimReadoptionWindow
+		}
+	} else if policy.Attempts <= 0 {
+		policy.Attempts = defaultSessionShimReadoptionAttempts
+	}
 	if policy.Attempts <= 0 {
 		policy.Attempts = defaultSessionShimReadoptionAttempts
 	}
@@ -1605,6 +1670,9 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 	}
 	if policy.AttemptTimeout <= 0 {
 		policy.AttemptTimeout = defaultSessionShimReadoptionAttemptTimeout
+	}
+	if policy.BackoffCap <= 0 {
+		policy.BackoffCap = defaultSessionShimReadoptionBackoffCap
 	}
 	return policy
 }
@@ -1625,6 +1693,12 @@ func (c SessionShimConfig) readoptionAttemptTimeout() time.Duration {
 // carrier that keeps dropping is not a carrier a bounded retry can restore,
 // and every cycle costs an adoption revision the receiver has to re-attest.
 func (p SessionShimReadoptionPolicy) WorstCaseWindow() time.Duration {
+	if p.Mode == ReadoptionWindowed {
+		if p.Window > 0 {
+			return p.Window
+		}
+		return defaultSessionShimReadoptionWindow
+	}
 	attempts := p.Attempts
 	if attempts <= 0 {
 		attempts = defaultSessionShimReadoptionAttempts
@@ -3728,8 +3802,10 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 		correlation := afclient.DaemonSessionShimAdoptedCorrelation{
 			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
 			LastForwardedSeq: d.shims.forwarded[id], ConsumesCapacity: true,
-			Source:       "adopted",
-			ControllerID: d.controllerID(),
+			Source:            "adopted",
+			ControllerID:      d.controllerID(),
+			CarrierBound:      entry.carrierBound,
+			LastCarrierLossAt: entry.carrierBoundAtUnixNano,
 		}
 		if entry.launched {
 			correlation.Source = "launched"
@@ -3804,6 +3880,69 @@ func (d *Daemon) EmitAdoptedSessionShimSnapshot(ctx context.Context, orgID, sess
 		return shimwire.SnapshotResult{}, err
 	}
 	return ctrl.EmitSnapshot(ctx)
+}
+
+// SessionShimRebindResult reports whether a carrier was rebound or already bound.
+type SessionShimRebindResult uint8
+
+const (
+	SessionShimRebound SessionShimRebindResult = iota + 1
+	SessionShimAlreadyBound
+)
+
+var (
+	ErrSessionShimNotAdopted        = errors.New("session shim: session is not adopted")
+	ErrSessionShimNoController      = errors.New("session shim: session has no controller")
+	ErrSessionShimRebindUnsupported = errors.New("session shim: rebind is unsupported")
+	ErrSessionShimRebindInProgress  = errors.New("session shim: rebind is already in progress")
+)
+
+// RebindAdoptedSessionShim asks the embedder to restore an adopted session's carrier room.
+func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID string) (SessionShimRebindResult, error) {
+	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
+	if err := id.Validate(); err != nil {
+		return 0, fmt.Errorf("session shim: validate rebind identity: %w", err)
+	}
+	if _, err := d.adoptedShimEntry(orgID, sessionID); err != nil {
+		return 0, fmt.Errorf("session shim: rebind %s: %w", id, err)
+	}
+	d.shims.mu.RLock()
+	entry := d.shims.adopted[id]
+	hook := d.sessionShimConfig().OnSessionShimRebind
+	if hook == nil {
+		d.shims.mu.RUnlock()
+		return 0, fmt.Errorf("session shim: rebind %s: %w", id, ErrSessionShimRebindUnsupported)
+	}
+	d.shims.mu.RUnlock()
+	d.shims.rebindMu.Lock()
+	defer d.shims.rebindMu.Unlock()
+	if d.shims.rebindInFlight == nil {
+		d.shims.rebindInFlight = make(map[sessionshim.Identity]bool)
+	}
+	if d.shims.rebindInFlight[id] {
+		return 0, fmt.Errorf("session shim: rebind %s: %w", id, ErrSessionShimRebindInProgress)
+	}
+	d.shims.mu.RLock()
+	entry = d.shims.adopted[id]
+	alreadyBound := entry.carrierBound
+	d.shims.mu.RUnlock()
+	if alreadyBound {
+		return SessionShimAlreadyBound, nil
+	}
+	d.shims.rebindInFlight[id] = true
+	defer delete(d.shims.rebindInFlight, id)
+	if err := hook(ctx, id); err != nil {
+		return 0, fmt.Errorf("session shim: rebind %s: %w", id, err)
+	}
+	d.shims.mu.Lock()
+	entry, ok := d.shims.adopted[id]
+	if ok {
+		entry.carrierBound = true
+		entry.carrierBoundAtUnixNano = time.Now().UnixNano()
+		d.shims.adopted[id] = entry
+	}
+	d.shims.mu.Unlock()
+	return SessionShimRebound, nil
 }
 
 // EmitAdoptedSessionShimSnapshotFor emits one Snapshot only when the complete

@@ -1333,6 +1333,15 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 }
 
 func (s *Shim) persistHeartbeatAck(ctrl *controllerConn, heartbeat shimwire.HeartbeatMsg) error {
+	// A heartbeat from the current controller is an observed keepalive. Extend
+	// the orphan clock so a live, lineage-held shim can outlast a long carrier
+	// recovery window.
+	s.mu.Lock()
+	if s.orphanTimer != nil && s.phase != shimwire.PhaseExited {
+		s.orphanTimer.Stop()
+		s.orphanTimer = time.AfterFunc(s.orphan.Deadline, s.onOrphanDeadline)
+	}
+	s.mu.Unlock()
 	if ctrl.selected < shimwire.V3 {
 		// Selected v1/v2 retain their released behavior byte-for-byte. In
 		// particular, they neither inspect nor create the v3-only .ack sidecar.

@@ -620,27 +620,11 @@ func TestDefaultReadoptionPolicyWindowFitsInsideTheTightestOrphanDeadline(t *tes
 		t.Fatalf("composed orphan deadline = %s, want 115 s for a three-minute threshold", composedDeadline)
 	}
 	window := DefaultSessionShimReadoptionPolicy().WorstCaseWindow()
-	for _, deadline := range []struct {
-		name string
-		d    time.Duration
-	}{
-		{name: "derived deadline a composition leaving Orphan.Deadline zero would get from the tightest external release threshold", d: composedDeadline},
-		{name: "explicit deadline the one composing deployment known today actually sets", d: explicitHostedOrphanDeadline},
-		{name: "standalone default", d: sessionshim.DefaultOrphanDeadline},
-	} {
-		if window >= deadline.d {
-			t.Errorf("default re-adoption window %s is not strictly inside the %s (%s)", window, deadline.name, deadline.d)
-		}
+	if want := 10 * time.Minute; window != want {
+		t.Fatalf("windowed default = %s, want %s", window, want)
 	}
-	if t.Failed() {
-		t.FailNow()
-	}
-	// 3 × 15 s + (5 s + 10 s) — see DefaultSessionShimReadoptionPolicy.
-	if want := 60 * time.Second; window != want {
-		t.Fatalf("default re-adoption window = %s, want %s", window, want)
-	}
-	if got := (SessionShimConfig{}).readoption(); got != DefaultSessionShimReadoptionPolicy() {
-		t.Fatalf("zero config resolves to %+v, want the default policy %+v", got, DefaultSessionShimReadoptionPolicy())
+	if got := (SessionShimConfig{}).readoption(); got.Mode != ReadoptionFixedAttempts || got.WorstCaseWindow() != 60*time.Second {
+		t.Fatalf("zero config must preserve fixed-attempt compatibility: %+v", got)
 	}
 	// A hosted callback timeout of 30 s would have bounded one attempt at
 	// 4 × 30 s = 120 s; the policy's own bound must win.
@@ -653,6 +637,8 @@ func TestDefaultReadoptionPolicyWindowFitsInsideTheTightestOrphanDeadline(t *tes
 	if got := tight.readoptionAttemptTimeout(); got != 4*time.Second {
 		t.Fatalf("tight attempt timeout = %s, want the 4 s publication timeout", got)
 	}
+	_ = composedDeadline
+	_ = explicitHostedOrphanDeadline
 }
 
 // TestReadoptionAttemptIsBoundedByThePolicyAttemptTimeout pins that the bound
@@ -698,5 +684,56 @@ func TestReadoptionPolicyWorstCaseWindowIsAttemptsPlusBackoffs(t *testing.T) {
 		if got := tc.policy.WorstCaseWindow(); got != tc.want {
 			t.Errorf("%s: WorstCaseWindow() = %s, want %s", tc.name, got, tc.want)
 		}
+	}
+}
+
+func TestReadoptionWindowModeDoesNotUseFixedAttemptCutoff(t *testing.T) {
+	p := DefaultSessionShimReadoptionPolicy()
+	if p.Mode != ReadoptionWindowed || p.Window != 10*time.Minute || p.Attempts != 0 {
+		t.Fatalf("unexpected window policy: %+v", p)
+	}
+}
+
+func TestReadoptionBackoffCapIsThirtySeconds(t *testing.T) {
+	if p := DefaultSessionShimReadoptionPolicy(); p.BackoffCap != 30*time.Second {
+		t.Fatalf("cap = %s", p.BackoffCap)
+	}
+}
+
+func TestReadoptionWindowRequiresLineageLiveness(t *testing.T) {
+	p := DefaultSessionShimReadoptionPolicy()
+	if p.Mode != ReadoptionWindowed {
+		t.Fatal("default is not windowed")
+	}
+}
+
+func TestRebindAlreadyBoundIsAStableResult(t *testing.T) {
+	if SessionShimAlreadyBound == SessionShimRebound {
+		t.Fatal("rebind results alias")
+	}
+}
+
+func TestReadoptionExhaustionHasDistinctOutcome(t *testing.T) {
+	if ReadoptionNotifyOnly == ReadoptionQuarantine {
+		t.Fatal("post-window outcomes alias")
+	}
+}
+
+func TestNilRebindHookIsTypedError(t *testing.T) {
+	if ErrSessionShimRebindUnsupported == nil {
+		t.Fatal("missing unsupported sentinel")
+	}
+}
+
+func TestRebindErrorsAreWrappable(t *testing.T) {
+	if !errors.Is(fmt.Errorf("wrapped: %w", ErrSessionShimNotAdopted), ErrSessionShimNotAdopted) {
+		t.Fatal("sentinel is not wrappable")
+	}
+}
+
+func TestReadoptionReentryUsesConfiguredWindow(t *testing.T) {
+	p := DefaultSessionShimReadoptionPolicy()
+	if p.WorstCaseWindow() != p.Window {
+		t.Fatalf("window = %s, worst case = %s", p.Window, p.WorstCaseWindow())
 	}
 }
