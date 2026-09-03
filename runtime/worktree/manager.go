@@ -76,6 +76,9 @@ var (
 	// Callers can use errors.Is to classify a launch that was refused because
 	// its workarea would otherwise have been based on stale remote state.
 	ErrBaseFetch = errors.New("runtime/worktree: fetch base ref")
+	// ErrInvalidBaseRef identifies deterministic input errors that should not
+	// consume retry attempts.
+	ErrInvalidBaseRef = errors.New("runtime/worktree: invalid base ref")
 
 	// ErrLostOwnership is returned by Provision when the OwnershipProber
 	// reports that another worker has claimed this session between
@@ -197,6 +200,7 @@ type ProvisionResult struct {
 	// BaseFetchDuration is how long refreshing BaseRef took.
 	BaseFetchDuration time.Duration
 	// BaseFetched reports whether the base refresh was performed successfully.
+	// These fields apply only to StrategyWorktreeAdd.
 	BaseFetched bool
 }
 
@@ -687,21 +691,6 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
 		attempts = attempt
-		baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
-		if fetchErr != nil {
-			if attempt == MaxSpawnRetries {
-				return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w", attempt, fetchErr)
-			}
-			m.logger.Warn("worktree base refresh failed; retrying",
-				"sessionId", spec.SessionID, "attempt", attempt,
-				"max", MaxSpawnRetries, "err", fetchErr)
-			select {
-			case <-ctx.Done():
-				return "", ctx.Err()
-			case <-time.After(m.delay):
-			}
-			continue
-		}
 		// Probe ownership before any retry (skip on the very first
 		// attempt — the platform claim already happened).
 		if attempt > 1 && m.prober != nil {
@@ -714,6 +703,24 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				m.logger.Warn("worktree ownership probe error",
 					"sessionId", spec.SessionID, "err", probeErr)
 			}
+		}
+		baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
+		if fetchErr != nil {
+			if errors.Is(fetchErr, ErrInvalidBaseRef) {
+				return "", fetchErr
+			}
+			if attempt == MaxSpawnRetries {
+				return "", fmt.Errorf("runtime/worktree: provisioning failed after %d attempts: %w", attempt, fetchErr)
+			}
+			m.logger.Warn("worktree base refresh failed; retrying",
+				"sessionId", spec.SessionID, "attempt", attempt,
+				"max", MaxSpawnRetries, "err", fetchErr)
+			select {
+			case <-ctx.Done():
+				return "", ctx.Err()
+			case <-time.After(m.delay):
+			}
+			continue
 		}
 
 		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec)
@@ -732,6 +739,13 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				res.WorkareaID = acquisition.WorkareaID
 				res.CacheSeedID = acquisition.CacheSeedID
 				res.Path = filepath.Join(acquisition.FinalRoot, acquisition.SelectedLeaf)
+			}
+			if baseInfo.Fetched {
+				out, headErr := m.runGit(ctx, "", "-C", res.Path, "rev-parse", "HEAD")
+				if headErr != nil {
+					return "", fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, baseInfo.Ref, headErr, strings.TrimSpace(string(out)))
+				}
+				res.BaseSHA = strings.TrimSpace(string(out))
 			}
 			m.mu.Lock()
 			m.sessions[spec.SessionID] = res
@@ -1616,12 +1630,7 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	if err != nil {
 		return baseFetchInfo{}, fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 	}
-	out, err = m.runGit(fetchCtx, "", "-C", parent, "rev-parse", "FETCH_HEAD")
-	if err != nil {
-		return baseFetchInfo{}, fmt.Errorf("%w %q: resolve fetched tip: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
-	}
-	sha := strings.TrimSpace(string(out))
-	return baseFetchInfo{Ref: ref, SHA: sha, Duration: duration, Fetched: true}, nil
+	return baseFetchInfo{Ref: ref, Duration: duration, Fetched: true}, nil
 }
 
 func baseRefForSpec(spec ProvisionSpec) string {
@@ -1633,12 +1642,12 @@ func baseRefForSpec(spec ProvisionSpec) string {
 
 func normalizeBaseRef(ref string) (string, error) {
 	if strings.HasPrefix(ref, "-") {
-		return "", fmt.Errorf("%w %q: ref must not start with a dash", ErrBaseFetch, ref)
+		return "", fmt.Errorf("%w: %w %q: ref must not start with a dash", ErrBaseFetch, ErrInvalidBaseRef, ref)
 	}
 	ref = strings.TrimPrefix(ref, "origin/")
 	ref = strings.TrimPrefix(ref, "refs/heads/")
 	if ref == "" || strings.HasPrefix(ref, "-") {
-		return "", fmt.Errorf("%w: invalid base ref", ErrBaseFetch)
+		return "", fmt.Errorf("%w: %w", ErrBaseFetch, ErrInvalidBaseRef)
 	}
 	return ref, nil
 }
@@ -1715,7 +1724,7 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			args = append(args, "-B", spec.Branch)
 		}
 		args = append(args, dst)
-		if spec.Branch != "" {
+		if spec.Branch != "" || spec.BaseRef != "" {
 			baseRef := baseRefForSpec(spec)
 			baseRef, refErr := normalizeBaseRef(baseRef)
 			if refErr != nil {

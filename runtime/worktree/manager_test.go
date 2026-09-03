@@ -585,8 +585,8 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 	}); err != nil {
 		t.Fatal(err)
 	}
-	if len(calls) != 3 || calls[0][2] != "fetch" || calls[1][2] != "rev-parse" {
-		t.Fatalf("git calls = %#v, want fetch, rev-parse, worktree", calls)
+	if len(calls) != 3 || calls[0][2] != "fetch" || calls[1][2] != "worktree" || calls[2][2] != "rev-parse" {
+		t.Fatalf("git calls = %#v, want fetch, worktree, rev-parse", calls)
 	}
 	result, err := m.Result("receipt")
 	if err != nil {

@@ -1,5 +1,3 @@
-//go:build runtime_integration
-
 package worktree_test
 
 import (
