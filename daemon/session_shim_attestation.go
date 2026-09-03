@@ -319,6 +319,19 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	return nil
 }
 
+// normalizedSessionShimReadinessState maps the two spellings of an established
+// readiness onto one. validateReady accepts "" and "ready" interchangeably, and
+// the exported SessionShimReadinessReady constant invites a consumer to echo
+// "ready" for a healthy beat that sent no field at all; without this the echo
+// would pass validation and then fail the exact comparison, breaking every
+// healthy beat's response processing.
+func normalizedSessionShimReadinessState(state string) string {
+	if state == "" {
+		return SessionShimReadinessReady
+	}
+	return state
+}
+
 // exactEqual compares the identity of two authority claims.
 //
 // ReadinessObservedAt is deliberately NOT part of it. It is a timestamp, not an
@@ -330,7 +343,9 @@ func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatPro
 	if p.Enabled != other.Enabled || p.AdoptionComplete != other.AdoptionComplete ||
 		p.WorkerHostID != other.WorkerHostID || p.ControllerID != other.ControllerID ||
 		p.AdoptionRevision != other.AdoptionRevision ||
-		p.ReadinessState != other.ReadinessState || p.ReadinessReason != other.ReadinessReason ||
+		normalizedSessionShimReadinessState(p.ReadinessState) !=
+			normalizedSessionShimReadinessState(other.ReadinessState) ||
+		p.ReadinessReason != other.ReadinessReason ||
 		p.SessionShimCarrierProofV2Readiness != other.SessionShimCarrierProofV2Readiness ||
 		len(p.QuarantinedSessions) != len(other.QuarantinedSessions) {
 		return false

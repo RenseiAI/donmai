@@ -362,6 +362,12 @@ type Daemon struct {
 	readinessMu        sync.Mutex
 	readinessResolveMu sync.Mutex
 	readinessCache     sessionShimReadinessCache
+	// readinessEstablished records that a readiness resolution has produced a
+	// definite answer — ready or not-ready — at least once in this process. It
+	// is set under readinessMu and never cleared. The non-withdrawal rule is
+	// about not withdrawing a readiness this host already ESTABLISHED, so
+	// before that first answer an unknown fails closed instead.
+	readinessEstablished bool
 
 	// capabilitySet holds the substrate capabilities detected at startup.
 	// It is populated before registration so the provides[] array can be

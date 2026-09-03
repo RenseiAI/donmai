@@ -5,6 +5,7 @@ import (
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 )
 
 // DefaultSessionShimReadinessStaleAfter bounds how long readiness may stay
@@ -14,9 +15,14 @@ const DefaultSessionShimReadinessStaleAfter = 10 * time.Minute
 
 const (
 	// sessionShimReadinessCadence is the maximum age of a cached readiness
-	// sample served to a consumer that is not the heartbeat. It equals the
-	// default heartbeat interval, so a definite not-ready resolved by a beat is
-	// visible to every other seam within one interval.
+	// sample served to a consumer that is not the heartbeat. It is a CONSTANT,
+	// deliberately not derived from the heartbeat interval the control plane
+	// negotiates: the beat resolves live on every beat, so the interval between
+	// resolutions is min(negotiated interval, this constant), and a definite
+	// not-ready is therefore always visible to every other seam within one
+	// heartbeat interval whatever interval was negotiated. A composer that
+	// negotiates something other than the 30s default gets two cadences rather
+	// than one — its own on the beat, this one everywhere else.
 	sessionShimReadinessCadence = 30 * time.Second
 
 	// sessionShimReadinessResolveNow asks for a resolution rather than a cached
@@ -51,10 +57,13 @@ type sessionShimReadinessSample struct {
 	// while ready. A continuing unknown carries the onset forward across
 	// retries, which is the instant the staleness bound measures from.
 	stateSince time.Time
-	// blocking is non-nil only for a state that definitely refuses new work: a
-	// definite not-ready, or a permanent resolver misconfiguration. It is nil
-	// while readiness is established AND while it is unknown — that is the
-	// whole rule this type exists to carry.
+	// blocking is non-nil for a state that refuses new work: a definite
+	// not-ready, a permanent resolver misconfiguration, or an unknown on a host
+	// that has never established readiness at all. It is nil while readiness is
+	// established and while an ESTABLISHED readiness is merely unknown — that
+	// distinction is the whole rule this type exists to carry. "Must not
+	// withdraw" is a statement about a readiness this host once proved; a host
+	// that has never proved one has nothing to keep serving on.
 	blocking error
 }
 
@@ -103,12 +112,27 @@ func sessionShimReadinessRetryBackoff(n int) time.Duration {
 	return delay
 }
 
+// boundedSessionShimReadinessReason renders one resolver failure as the reason
+// a beat publishes, bounded so a verbose embedder error cannot inflate every
+// beat.
+//
+// The cut is on a RUNE boundary, never a byte boundary. A byte cut through a
+// multi-byte rune produces invalid UTF-8; json.Marshal silently substitutes
+// U+FFFD for it, so the reason the consumer receives is not the reason still
+// held in memory, a perfect echo can never satisfy exactEqual, and every beat
+// for the duration of the outage loses its whole response — host status and the
+// pending-mutation drain included. That is a second failure stacked on the one
+// this degradation exists to survive.
 func boundedSessionShimReadinessReason(err error) string {
 	reason := strings.TrimSpace(err.Error())
-	if len(reason) > sessionShimReadinessReasonLimit {
-		return reason[:sessionShimReadinessReasonLimit]
+	if len(reason) <= sessionShimReadinessReasonLimit {
+		return reason
 	}
-	return reason
+	cut := sessionShimReadinessReasonLimit
+	for cut > 0 && !utf8.RuneStart(reason[cut]) {
+		cut--
+	}
+	return reason[:cut]
 }
 
 func (d *Daemon) sessionShimReadinessStaleAfter() time.Duration {
@@ -145,10 +169,13 @@ func (d *Daemon) sessionShimReadinessWithin(maxAge time.Duration) sessionShimRea
 }
 
 // sessionShimReadinessGate is the new-work admission predicate for every seam
-// that is not the heartbeat. It returns nil while readiness is established AND
-// while it is unknown: a resolver outage must not drain a host that was serving
-// before the outage started. Only a definite not-ready and a permanent
-// misconfiguration return an error.
+// that is not the heartbeat. It returns nil while readiness is established and
+// while an ESTABLISHED readiness is unknown: a resolver outage must not drain a
+// host that was serving before the outage started. A definite not-ready, a
+// permanent misconfiguration, and an unknown on a host that has never resolved
+// readiness once all return an error — the last because a host with nothing
+// established has no readiness to keep serving on, and admitting work there
+// would be a loosening rather than a survival.
 func (d *Daemon) sessionShimReadinessGate(maxAge time.Duration) error {
 	return d.sessionShimReadinessWithin(maxAge).blocking
 }
@@ -180,6 +207,7 @@ func (d *Daemon) storeSessionShimReadiness(
 	defer d.readinessMu.Unlock()
 	switch {
 	case err == nil:
+		d.readinessEstablished = true
 		d.readinessCache = sessionShimReadinessCache{
 			sample:     sessionShimReadinessSample{readiness: readiness},
 			valid:      true,
@@ -197,6 +225,10 @@ func (d *Daemon) storeSessionShimReadiness(
 			blocking:   err,
 		}
 	case errors.Is(err, ErrSessionShimReadinessRejected):
+		// A refusal is still an ANSWER: the resolver was reachable and said no.
+		// That establishes readiness for the purpose of the non-withdrawal rule,
+		// so a later outage on this host degrades rather than fails closed.
+		d.readinessEstablished = true
 		d.readinessCache = sessionShimReadinessCache{
 			sample: sessionShimReadinessSample{
 				state:      SessionShimReadinessNotReady,
@@ -212,11 +244,20 @@ func (d *Daemon) storeSessionShimReadiness(
 		if !d.readinessCache.valid || unknownSince.IsZero() {
 			unknownSince = now
 		}
+		// blocking stays nil once readiness has been established — that is the
+		// rule. Before then it is the resolver's own error, so a host that comes
+		// up into the outage refuses new work at every seam instead of serving
+		// on a readiness it has never proved.
+		var blocking error
+		if !d.readinessEstablished {
+			blocking = err
+		}
 		d.readinessCache = sessionShimReadinessCache{
 			sample: sessionShimReadinessSample{
 				state:      SessionShimReadinessUnknown,
 				reason:     boundedSessionShimReadinessReason(err),
 				stateSince: unknownSince,
+				blocking:   blocking,
 			},
 			valid:        true,
 			resolvedAt:   now,
@@ -241,9 +282,14 @@ func (d *Daemon) readinessStateSinceLocked(state string, now time.Time) time.Tim
 // boundStaleReadinessLocked converts an unknown that has outlived the staleness
 // bound into a definite not-ready. Applied on every read, so the conversion
 // needs no timer and happens whether or not the resolver is being retried.
+//
+// The bound applies only AFTER readiness has been established. It exists to
+// stop a host riding out an outage forever on a readiness it once had; a host
+// that never had one is already refusing new work at every seam, and converting
+// it to not-ready would only withdraw a readiness that was never granted.
 func (d *Daemon) boundStaleReadinessLocked(now time.Time) sessionShimReadinessSample {
 	sample := d.readinessCache.sample
-	if sample.state != SessionShimReadinessUnknown {
+	if sample.state != SessionShimReadinessUnknown || !d.readinessEstablished {
 		return sample
 	}
 	bound := d.sessionShimReadinessStaleAfter()

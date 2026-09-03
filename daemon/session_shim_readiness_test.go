@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -56,18 +58,26 @@ func healthyReadiness() (SessionShimCarrierProofV2Readiness, error) {
 func TestSessionShimReadinessSentinelClassification(t *testing.T) {
 	incomplete, _ := testSessionShimProofV2Readiness()
 	incomplete.RemainingValidityConsumeGate = false
+	unreachable := func() (SessionShimCarrierProofV2Readiness, error) {
+		return SessionShimCarrierProofV2Readiness{}, errors.New("carrier unreachable")
+	}
 	for name, tc := range map[string]struct {
-		resolver     func() (SessionShimCarrierProofV2Readiness, error)
-		omitResolver bool
-		wantState    string
-		wantBlocking error
-		wantWithdraw bool
+		resolver       func() (SessionShimCarrierProofV2Readiness, error)
+		establishFirst bool
+		omitResolver   bool
+		wantState      string
+		wantBlocking   error
+		wantWithdraw   bool
 	}{
-		"resolver error is unknown and never withdraws": {
-			resolver: func() (SessionShimCarrierProofV2Readiness, error) {
-				return SessionShimCarrierProofV2Readiness{}, errors.New("carrier unreachable")
-			},
-			wantState: SessionShimReadinessUnknown,
+		"a resolver error on an established readiness is unknown and never withdraws": {
+			resolver:       unreachable,
+			establishFirst: true,
+			wantState:      SessionShimReadinessUnknown,
+		},
+		"a resolver error before readiness was ever established fails closed": {
+			resolver:     unreachable,
+			wantState:    SessionShimReadinessUnknown,
+			wantBlocking: ErrSessionShimReadinessUnavailable,
 		},
 		"incomplete facts are a definite not-ready": {
 			resolver:     func() (SessionShimCarrierProofV2Readiness, error) { return incomplete, nil },
@@ -86,9 +96,26 @@ func TestSessionShimReadinessSentinelClassification(t *testing.T) {
 		},
 	} {
 		t.Run(name, func(t *testing.T) {
-			d, _ := readinessTestDaemon(t, SessionShimConfig{}, tc.resolver)
+			resolver := tc.resolver
+			var healthy atomic.Bool
+			if tc.establishFirst {
+				healthy.Store(true)
+				resolver = func() (SessionShimCarrierProofV2Readiness, error) {
+					if healthy.Load() {
+						return testSessionShimProofV2Readiness()
+					}
+					return tc.resolver()
+				}
+			}
+			d, _ := readinessTestDaemon(t, SessionShimConfig{}, resolver)
 			if tc.omitResolver {
 				d.opts.SessionShim.GetCarrierProofV2Readiness = nil
+			}
+			if tc.establishFirst {
+				if _, err := d.SessionShimHeartbeatProjection(d.sessionShimConfig().orgID()); err != nil {
+					t.Fatalf("establish readiness: %v", err)
+				}
+				healthy.Store(false)
 			}
 			sample := d.sessionShimReadinessWithin(sessionShimReadinessResolveNow)
 			if sample.state != tc.wantState {
@@ -213,22 +240,35 @@ func TestSessionShimDefiniteNotReadyIsNotMaskedByAWarmCache(t *testing.T) {
 
 // TestSessionShimReadinessStalenessBoundIsConfigurable pins the bound itself,
 // not only the mechanism: the test's own bound is supplied, never derived from
-// the constant under test, so raising the default cannot leave this green.
+// the constant under test, so raising the default cannot leave this green. The
+// bound is measured from an ESTABLISHED readiness, so the host establishes one
+// before the resolver goes away.
 func TestSessionShimReadinessStalenessBoundIsConfigurable(t *testing.T) {
 	if DefaultSessionShimReadinessStaleAfter != 10*time.Minute {
 		t.Fatalf("default staleness bound = %s, want 10m", DefaultSessionShimReadinessStaleAfter)
 	}
 	const bound = 40 * time.Millisecond
+	var failing atomic.Bool
 	d, _ := readinessTestDaemon(t, SessionShimConfig{ReadinessStaleAfter: bound},
 		func() (SessionShimCarrierProofV2Readiness, error) {
-			return SessionShimCarrierProofV2Readiness{}, errors.New("readiness authority unavailable")
+			if failing.Load() {
+				return SessionShimCarrierProofV2Readiness{}, errors.New("readiness authority unavailable")
+			}
+			return testSessionShimProofV2Readiness()
 		})
 	if got := d.sessionShimReadinessStaleAfter(); got != bound {
 		t.Fatalf("configured staleness bound = %s, want %s", got, bound)
 	}
+	if _, err := d.SessionShimHeartbeatProjection(d.sessionShimConfig().orgID()); err != nil {
+		t.Fatalf("establish readiness: %v", err)
+	}
+	failing.Store(true)
 	sample := d.sessionShimReadinessWithin(sessionShimReadinessResolveNow)
 	if sample.state != SessionShimReadinessUnknown {
 		t.Fatalf("first failure = %q, want unknown", sample.state)
+	}
+	if sample.blocking != nil {
+		t.Fatalf("an unknown on an established readiness blocked: %v", sample.blocking)
 	}
 	if d.sessionShimReadinessWithdrawn.Load() {
 		t.Fatal("an unknown readiness withdrew before the staleness bound elapsed")
@@ -440,6 +480,26 @@ func TestSessionShimReadinessObservedAtIsNotAuthorityIdentity(t *testing.T) {
 	if base.exactEqual(reasoned) {
 		t.Fatal("a changed readiness reason compared equal")
 	}
+
+	// "" and "ready" are one state. validateReady already accepts both, and the
+	// exported SessionShimReadinessReady constant invites a consumer to echo
+	// "ready" for a healthy beat that sent no field at all; if the comparison
+	// disagreed with the validator, that helpful echo would pass validation and
+	// then break every healthy beat's response processing.
+	ready, _ := testSessionShimProofV2Readiness()
+	healthy := SessionShimHeartbeatProjection{
+		Enabled: true, AdoptionComplete: true, WorkerHostID: "host", ControllerID: "controller",
+		AdoptionRevision: "31", SessionShimCarrierProofV2Readiness: ready,
+		QuarantinedSessions: []SessionShimQuarantinedSession{},
+	}
+	spelled := healthy
+	spelled.ReadinessState = SessionShimReadinessReady
+	if !healthy.exactEqual(spelled) {
+		t.Fatal("an echo spelling the established state \"ready\" did not compare equal to one that omitted it")
+	}
+	if err := spelled.validateReady(); err != nil {
+		t.Fatalf("an explicit ready state was rejected by the validator: %v", err)
+	}
 }
 
 // TestSessionShimHealthyProjectionSamplesAreIdentical is the acknowledgement
@@ -473,11 +533,13 @@ func TestSessionShimHealthyProjectionSamplesAreIdentical(t *testing.T) {
 	}
 }
 
-// TestCompositionDeclarationSurvivesAReadinessResolverOutage covers the seventh
-// seam, the one the table above cannot reach without the composition harness:
-// installing a composition while the readiness dependency is unreachable
-// succeeds and withdraws nothing.
-func TestCompositionDeclarationSurvivesAReadinessResolverOutage(t *testing.T) {
+// TestCompositionDeclarationFailsClosedOnAnUnestablishedReadiness covers the
+// seventh seam, the one the table above cannot reach without the composition
+// harness. The founding declaration is the resolver's FIRST question about this
+// scope's host authority, so there is nothing established to keep serving on: a
+// resolver that cannot be consulted refuses the install rather than admitting a
+// composition on an unproven readiness.
+func TestCompositionDeclarationFailsClosedOnAnUnestablishedReadiness(t *testing.T) {
 	h := newCompositionHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -489,15 +551,130 @@ func TestCompositionDeclarationSurvivesAReadinessResolverOutage(t *testing.T) {
 	cfg.GetCarrierProofV2Readiness = func() (SessionShimCarrierProofV2Readiness, error) {
 		return SessionShimCarrierProofV2Readiness{}, errors.New("readiness authority unavailable")
 	}
-	if err := h.daemon.InstallSessionShimComposition(ctx, cfg); err != nil {
-		t.Fatalf("composition install during a readiness resolver outage: %v", err)
+	err := h.daemon.InstallSessionShimComposition(ctx, cfg)
+	if !errors.Is(err, ErrSessionShimReadinessUnavailable) {
+		t.Fatalf("composition install on an unestablished readiness = %v, want %v",
+			err, ErrSessionShimReadinessUnavailable)
 	}
-	// The withdrawal fence is raised here by the adoption publication awaiting
-	// its heartbeat acknowledgement, not by readiness, so the readiness-specific
-	// assertion is the sample itself: unknown, and not blocking.
-	sample := h.daemon.sessionShimReadinessWithin(sessionShimReadinessCadence)
-	if sample.state != SessionShimReadinessUnknown || sample.blocking != nil {
-		t.Fatalf("composition-declaration readiness = state %q blocking %v, want unknown and non-blocking",
-			sample.state, sample.blocking)
+	// The failed install stands the composition back down, so the daemon's own
+	// readiness sample is no longer the thing under test; the refusal above is.
+	if h.daemon.sessionShimEnabled() {
+		t.Fatal("a composition refused for readiness was left installed")
+	}
+}
+
+// TestSessionShimReadinessReasonCutsOnARuneBoundary pins the reason bound
+// against the failure it would otherwise cause. A byte cut through a multi-byte
+// rune produces invalid UTF-8; json.Marshal substitutes U+FFFD for it, so the
+// value the consumer receives differs from the one still in memory and a
+// PERFECT echo fails exactEqual — which costs the beat its whole response, host
+// status and pending-mutation drain included, for the duration of the outage.
+func TestSessionShimReadinessReasonCutsOnARuneBoundary(t *testing.T) {
+	// The em dash starts at byte 255 and spans 255..257, so a cut at the byte
+	// limit lands inside it. Long enough after it that trimming is forced.
+	raw := strings.Repeat("a", sessionShimReadinessReasonLimit-1) + "—" + strings.Repeat("b", 64)
+	reason := boundedSessionShimReadinessReason(errors.New(raw))
+	if len(reason) > sessionShimReadinessReasonLimit {
+		t.Fatalf("reason is %d bytes, want at most %d", len(reason), sessionShimReadinessReasonLimit)
+	}
+	if !utf8.ValidString(reason) {
+		t.Fatalf("bounded reason is not valid UTF-8: %q", reason)
+	}
+	if reason == raw {
+		t.Fatal("the reason was not bounded at all, so this pin proves nothing")
+	}
+
+	degraded := SessionShimHeartbeatProjection{
+		Enabled: true, AdoptionComplete: true, WorkerHostID: "host", ControllerID: "controller",
+		AdoptionRevision: "31", ReadinessState: SessionShimReadinessUnknown,
+		ReadinessReason: reason, ReadinessObservedAt: "2026-09-03T00:00:00Z",
+		QuarantinedSessions: []SessionShimQuarantinedSession{},
+	}
+	if err := degraded.validateReady(); err != nil {
+		t.Fatalf("degraded projection rejected: %v", err)
+	}
+	encoded, err := json.Marshal(degraded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var echoed SessionShimHeartbeatProjection
+	if err := json.Unmarshal(encoded, &echoed); err != nil {
+		t.Fatal(err)
+	}
+	if !degraded.exactEqual(echoed) {
+		t.Fatalf("a perfect echo of a degraded beat does not compare equal:\n sent=%q\nechoed=%q",
+			degraded.ReadinessReason, echoed.ReadinessReason)
+	}
+}
+
+// TestSessionShimUnknownFailsClosedUntilReadinessIsEstablished pins the scope of
+// the non-withdrawal rule. It is a rule about not withdrawing a readiness this
+// host already proved; a host that comes up into the outage has proved nothing,
+// and must refuse new work rather than serve on an unresolved readiness. The
+// beat still goes out — that half of the rule is unconditional.
+func TestSessionShimUnknownFailsClosedUntilReadinessIsEstablished(t *testing.T) {
+	var failing atomic.Bool
+	failing.Store(true)
+	d, _ := readinessTestDaemon(t, SessionShimConfig{}, func() (SessionShimCarrierProofV2Readiness, error) {
+		if failing.Load() {
+			return SessionShimCarrierProofV2Readiness{}, errors.New("readiness authority unavailable")
+		}
+		return testSessionShimProofV2Readiness()
+	})
+	d.setState(StateRunning)
+	scope := d.sessionShimConfig().orgID()
+
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err == nil {
+		t.Fatal("the readiness gate is open on a host that has never established readiness")
+	}
+	if blocked, _ := d.claimSuspended(); !blocked {
+		t.Fatal("the claim gate is open on a host that has never established readiness")
+	}
+	// The beat is not a new-work seam: it goes out carrying the unknown.
+	projection, err := d.SessionShimHeartbeatProjection(scope)
+	if err != nil {
+		t.Fatalf("beat on an unestablished readiness: %v", err)
+	}
+	if projection.ReadinessState != SessionShimReadinessUnknown {
+		t.Fatalf("beat state = %q, want %q", projection.ReadinessState, SessionShimReadinessUnknown)
+	}
+
+	// Once one resolution has answered, the SAME failure is ridden out.
+	failing.Store(false)
+	if _, err := d.SessionShimHeartbeatProjection(scope); err != nil {
+		t.Fatalf("establish readiness: %v", err)
+	}
+	failing.Store(true)
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
+		t.Fatalf("the readiness gate closed on an established readiness: %v", err)
+	}
+}
+
+// TestSessionShimWithdrawalFenceAloneDrainsTheBeat pins the fence's own
+// contribution. withdrawSessionShimProofV2Readiness also moves the lifecycle to
+// recovering, and the State() != StateRunning arms then produce the same
+// draining/zero answer — so the fence's branches survive every mutation unless
+// the fence is raised WITHOUT that transition. That window, between the atomic
+// CAS and the setState, is exactly what the fence exists for.
+func TestSessionShimWithdrawalFenceAloneDrainsTheBeat(t *testing.T) {
+	d, _ := readinessTestDaemon(t, SessionShimConfig{}, healthyReadiness)
+	config := DefaultConfig()
+	config.Capacity.MaxConcurrentSessions = 4
+	d.mu.Lock()
+	d.config = config
+	d.mu.Unlock()
+	d.setState(StateRunning)
+	if got := d.RegistrationStatus(); got == RegistrationDraining {
+		t.Fatalf("registration status = %s before the fence; this pin proves nothing", got)
+	}
+	if got := d.heartbeatMaxConcurrentSessions(); got == 0 {
+		t.Fatal("advertised capacity is already zero before the fence; this pin proves nothing")
+	}
+	d.sessionShimReadinessWithdrawn.Store(true)
+	if got := d.RegistrationStatus(); got != RegistrationDraining {
+		t.Fatalf("registration status with the fence raised = %s, want %s", got, RegistrationDraining)
+	}
+	if got := d.heartbeatMaxConcurrentSessions(); got != 0 {
+		t.Fatalf("advertised capacity with the fence raised = %d, want 0", got)
 	}
 }
