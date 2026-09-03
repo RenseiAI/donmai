@@ -8,8 +8,24 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.72.19 — 2026-09-03
+
 ### Fixes
 
+- The daemon heartbeat keeps beating when the shim readiness resolver fails.
+  Readiness is now tri-state (ready / not-ready / unknown) with a staleness
+  bound, so a resolver error degrades the reported state instead of stalling
+  the whole heartbeat. A host that has been withdrawn now beats as draining
+  with zero capacity rather than dropping out of the heartbeat entirely, and
+  each heartbeat cadence makes at most one resolver call.
+- Re-adoption after a carrier loss can now run in an opt-in lineage-live
+  window bounded by observed liveness: an escalating, capped keepalive
+  extends the shim's orphan clock for as long as the shim is observed alive.
+  When the window is exhausted, the lineage is withdrawn unconditionally
+  after its exhaustion hook runs. Carrier bind state and a rebind seam are
+  now exposed, and the configured keepalive interval is floored at 250ms.
 - Shared-parent worktree sessions now refresh the requested base ref before the
   session branch is created, and record the branch point (`BaseRef`, `BaseSHA`,
   and the fetch duration) on the provision receipt. Set `SkipBaseFetch` to keep
