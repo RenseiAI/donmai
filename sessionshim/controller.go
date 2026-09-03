@@ -655,30 +655,23 @@ func (c *Controller) handshake(rec Record, opts ControllerOptions) error {
 		if prepareErr != nil {
 			return prepareErr
 		}
-		if prepared.ControllerGeneration != 0 {
-			if opts.ProposedGeneration != 0 || opts.NextGeneration != nil {
-				return fmt.Errorf("%w: prepared and static controller generations are both configured", ErrAdoptionPreparation)
-			}
-			proposed = prepared.ControllerGeneration
+		resolved, resolveErr := ResolvePreparedAdoption(prepared, PreparedAdoptionBounds{
+			StaticGenerationConfigured: opts.ProposedGeneration != 0 || opts.NextGeneration != nil,
+			StaticResumeConfigured: opts.ResumeExternallyConfigured ||
+				(opts.LocalResumeFrom == 0 && opts.ResumeFrom != 0),
+			LocalResumeFrom: localResumeFrom,
+			HelloLastSeq:    hello.LastSeq,
+		})
+		if resolveErr != nil {
+			return resolveErr
 		}
-		extensions = prepared.Extensions
-		if prepared.ResumeFrom != nil {
+		if resolved.ControllerGeneration != 0 {
+			proposed = resolved.ControllerGeneration
+		}
+		extensions = resolved.Extensions
+		if resolved.ResumeProvided {
 			preparedResumeProvided = true
-			staticResumeConfigured := opts.ResumeExternallyConfigured ||
-				(opts.LocalResumeFrom == 0 && opts.ResumeFrom != 0)
-			if staticResumeConfigured {
-				return fmt.Errorf("%w: static and proof-resolved resume cursors are both configured", ErrAdoptionPreparation)
-			}
-			resolved := *prepared.ResumeFrom
-			if resolved < localResumeFrom {
-				return fmt.Errorf("%w: prepared resume %d regresses local floor %d",
-					ErrAdoptionPreparation, resolved, localResumeFrom)
-			}
-			if hello.LastSeq == ^uint64(0) || resolved > hello.LastSeq+1 {
-				return fmt.Errorf("%w: prepared resume %d is ahead of Hello LastSeq %d",
-					ErrAdoptionPreparation, resolved, hello.LastSeq)
-			}
-			opts.ResumeFrom = resolved
+			opts.ResumeFrom = resolved.ResumeFrom
 		}
 	}
 	if _, proofBoundCarrier := extensions.Values[shimwire.ExtCarrierEpoch]; selected >= shimwire.V3 && proofBoundCarrier && !preparedResumeProvided {

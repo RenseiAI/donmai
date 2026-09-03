@@ -83,3 +83,40 @@ func isRelayRingMiss(err error) bool {
 // the degraded carrier detected WSS is reachable again and drained, so RunHost
 // switches back to the WSS lane (§ 14 upgrade-back).
 var errUpgraded = errors.New("attachclient: upgraded back to the WSS lane")
+
+// ErrV2CarrierCursorDrift classifies the ONE fresh-dial refusal a composing
+// daemon may treat as ambiguous rather than terminal: the caller's local
+// durable acknowledgement floor and the signed carrier boundary disagree in the
+// direction that no live carrier can produce.
+//
+// The two cursors are deliberately independent. The local floor is a
+// host-local, fsync-backed acknowledgement successor; the carrier boundary is
+// the external carrier's own durable journal high water. The carrier is
+// ALLOWED to be ahead — every frame it has journaled but not yet acknowledged
+// back to the local sidecar lives in that window, and an abrupt daemon exit
+// freezes it there permanently. Only the reverse skew is evidence of anything:
+// a local floor above the signed boundary means the proof this dial is holding
+// is stale, and the repair is to prepare a new one, not to condemn the lineage.
+//
+// A caller distinguishes it with errors.Is/errors.As through its own wrapping.
+var ErrV2CarrierCursorDrift = errors.New("attachclient: v2 local durable high-water is ahead of the signed carrier boundary")
+
+// V2CarrierCursorDriftError names both cursors so an operator can read the
+// direction and the size of the skew without re-deriving either. It carries no
+// credential, correlation, or frame bytes — only the two sequence numbers.
+type V2CarrierCursorDriftError struct {
+	// DurableHighWater is the caller-supplied local acknowledgement floor.
+	DurableHighWater uint64
+	// CarrierBoundary is the signed carrier boundary N from the authenticated
+	// proof-v2 bearer.
+	CarrierBoundary uint64
+}
+
+func (e *V2CarrierCursorDriftError) Error() string {
+	return fmt.Sprintf(
+		"attachclient: v2 local durable high-water %d is ahead of the signed carrier boundary %d (stale proof; re-prepare)",
+		e.DurableHighWater, e.CarrierBoundary,
+	)
+}
+
+func (e *V2CarrierCursorDriftError) Unwrap() error { return ErrV2CarrierCursorDrift }

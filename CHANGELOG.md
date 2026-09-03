@@ -37,6 +37,100 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   deliberately not terminal: it withdraws controller authority, does not kill
   the shim, and keeps the lineage visible and capacity-charged until an ordinary
   terminal receipt or a group-reaped tombstone reconciles it.
+- A fresh v2 carrier dial now accepts a signed carrier boundary that is ahead of
+  the caller's local durable acknowledgement floor. The two cursors are
+  independent by contract — the external carrier owns the durable journal high
+  water, the local sidecar owns an fsync-backed acknowledgement floor, and the
+  carrier is legitimately ahead by every frame it journaled but had not yet
+  acknowledged back. An abrupt exit of a composing daemon freezes that window
+  permanently, and the old equality precondition then refused the carrier's own
+  successfully admitted reservation. Only the reverse skew still refuses, now
+  with a typed `attachclient.V2CarrierCursorDriftError` naming both cursors, and
+  a fresh leg is seeded from the signed boundary that every pre-active
+  contiguity assertion is already phrased against.
+- The startup adoption pass no longer quarantines a lineage on the first
+  ambiguous refusal. A durable-adoption refusal classified as carrier cursor
+  drift now gets a bounded re-prepared re-dial — three attempts with a doubling
+  backoff, a fresh carrier proof each time — before any quarantine. A lineage
+  whose proof still does not reconcile is quarantined as before, with the reason
+  unchanged and the detail carrying both cursors and the number of dials spent.
+
+  **Scope: this repairs drift only for a lineage that negotiated no carrier
+  epoch.** By the time a re-prepare runs the handshake is over: the shim has
+  committed one generation, one resume cursor, and one exact extension set, and
+  the adoption ADR's D15.3 says no carrier commit occurs before `Adopted` echoes
+  the prepared value. No `Adopted` frame will ever echo a *second* carrier
+  epoch, because the echo was already frozen against the first `Welcome` and
+  there is no second `Welcome` to send. But the same ADR's D10 matrix requires a
+  conforming authority to answer boundary drift by "reprepare at a strictly
+  greater carrier epoch", and says a later preparation "allocates a strictly
+  greater value" — so for a lineage whose committed adoption carries an epoch
+  there is no answer this path can accept.
+
+  Such a lineage is therefore **not re-prepared at all**. It goes straight to
+  quarantine with `ErrSessionShimCarrierEpochBoundDriftNeedsHandshake`, spending
+  no abandonment and minting no successor reservation for a refusal that is
+  already certain. Repairing that case needs a second handshake and is its own
+  change. The bind keeps its own extension check as defence in depth
+  (`ErrSessionShimRepreparedCarrierEpochSupersedes`, naming the differing
+  extension key and both values), because committing a superseding epoch would
+  publish an activation naming the epoch the authority was just told to abandon
+  — the "reactivating its incumbent" the retained-candidate abandonment
+  correction forbids.
+
+  **A re-prepare supersedes a reservation that is admitted and pre-active, and
+  this side has no verb to burn it.** Abandonment is control-authenticated and
+  belongs to the authority that minted it, so the contract is now explicit
+  rather than assumed. `SessionShimAdoptionPreparation` carries `Cause` and
+  `Attempt`: a re-ask arrives as `carrier_cursor_drift`, which is the daemon
+  declaring that an earlier reservation for the lineage is outstanding and
+  stale — and it is only ever sent for a lineage with no committed carrier epoch,
+  per the scope above. The authority disposes of it as **`preparing_reprepare`** — the
+  adoption ADR's one abandonment cause whose source is a `preparing` handoff and
+  which may keep or change the controller; that ADR states the obligation
+  directly, that an admitted `preparing` handoff has no retained Snapshot replay
+  and must abandon before reprepare. `carrier_cursor_drift` is a *prepare* cause
+  on a different axis from the abandonment vocabulary, so the mapping is named
+  rather than left to guess: drift maps to `preparing_reprepare` and to nothing
+  else. A predecessor that already reached `receipt_stored` is **not** that
+  case — the same ADR calls a same-controller `receipt_stored` handoff with
+  changed bytes a changed-replay conflict, not permission to abandon and
+  resample — so an authority in that state answers
+  `ErrSessionShimAdoptionPrepareConflict`; that is a refusal, not a failure, so
+  the pass spends none of its remaining budget on it and quarantines with the
+  conflict as the detail.
+
+  A re-prepared answer is now applied through the same validation the handshake
+  applies (`sessionshim.ResolvePreparedAdoption`, which both paths call) and is
+  then required to agree with the controller that is already adopted —
+  generation, cursor, and negotiated extensions alike. The first preparation is
+  answered inside the handshake, where all three still have a `Welcome` to
+  travel on; a re-prepare has none of that, so an answer resolving different
+  values is refused rather than silently dropped — dropping it would bind the
+  new receipt to the previous proof's cursor, generation, and carrier epoch.
+- Adoption's transient-dial retry re-dials the already-prepared candidate
+  instead of preparing again. Preparation runs inside the handshake, after Hello
+  authentication and before the Welcome write, so the failure this retry exists
+  for happens after preparation has already succeeded; re-asking would mint a
+  second reservation for a lineage whose first one is admitted and undisposed.
+  Retries are also capped at a 2s dial timeout (the first attempt keeps the
+  caller's own), because the pass walks records sequentially and every later
+  lineage waits behind the current one: one hung record now costs at most
+  5+2+2s of the pass rather than three full timeouts. Only the *record* is
+  bounded — the pass is not. N hung records still cost 9N seconds serially, so
+  against a 90s shim orphan deadline that is roughly ten of them (roughly six
+  without the cap, roughly eighteen before this change added retries at all).
+  An aggregate pass budget, or dialing independent lineages concurrently, has
+  its own ordering and capacity consequences and belongs in its own ADR.
+- Adoption no longer reports a stalled shim as an unreachable socket. The
+  classifier's predicate asked only whether an error had a `Timeout` method —
+  which every `net.OpError` and `os.PathError` has — and never called it, so any
+  error the network stack produced became `socket_unreachable`, including a
+  write timeout on an already-established socket to a process that had just been
+  proved alive. `socket_unreachable` is now reserved for the endpoint answering
+  (connect refused, or the socket gone); a timeout or a mid-handshake hang-up is
+  treated as transient and the dial is retried, bounded, before the record is
+  classified at all.
 
 ---
 

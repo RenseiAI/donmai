@@ -7,7 +7,9 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"os"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/RenseiAI/donmai/shimwire"
@@ -141,6 +143,75 @@ type PreparedAdoption struct {
 // controller authority was proposed. Callers fail startup closed rather than
 // converting it into an ordinary compatibility quarantine.
 var ErrAdoptionPreparation = errors.New("sessionshim: adoption preparation failed")
+
+// PreparedAdoptionBounds is the exact local evidence one preparation answer is
+// validated against: what the caller has already configured statically, the
+// local acknowledgement floor, and the authenticated Hello cursor.
+type PreparedAdoptionBounds struct {
+	// StaticGenerationConfigured reports that the caller already fixed the
+	// proposed generation, so a prepared one would be a second, conflicting
+	// authority rather than the answer.
+	StaticGenerationConfigured bool
+	// StaticResumeConfigured reports the same for the resume cursor.
+	StaticResumeConfigured bool
+	// LocalResumeFrom is the normalized local floor. A prepared cursor may raise
+	// it and may never regress it.
+	LocalResumeFrom uint64
+	// HelloLastSeq is the authenticated Hello cursor. A prepared cursor may not
+	// exceed its successor, and an unset (all-ones) Hello cursor cannot bound
+	// anything at all.
+	HelloLastSeq uint64
+}
+
+// ResolvedPreparedAdoption is what a validated preparation answer resolves to.
+// ResumeFrom is meaningful only when ResumeProvided is set: zero is a real
+// cursor, not an absence.
+type ResolvedPreparedAdoption struct {
+	ControllerGeneration shimwire.Generation
+	Extensions           shimwire.Extensions
+	ResumeFrom           uint64
+	ResumeProvided       bool
+}
+
+// ResolvePreparedAdoption validates one preparation answer against the bounds
+// it must hold inside, and returns the generation, extensions, and cursor the
+// adoption will actually use.
+//
+// It exists as a function rather than a stretch of handshake because a
+// preparation answer can now arrive AFTER the handshake — a composing daemon
+// that re-prepares a drifted carrier proof gets a second answer with no Welcome
+// left to spend it on. An answer that reached the wire through one set of checks
+// and an answer that reached a durable receipt through none is how a raised
+// floor gets silently dropped, or a regressed one silently honoured. Both paths
+// call this, so neither can take a route the other does not.
+func ResolvePreparedAdoption(prepared PreparedAdoption, bounds PreparedAdoptionBounds) (ResolvedPreparedAdoption, error) {
+	resolved := ResolvedPreparedAdoption{Extensions: prepared.Extensions}
+	if prepared.ControllerGeneration != 0 {
+		if bounds.StaticGenerationConfigured {
+			return ResolvedPreparedAdoption{},
+				fmt.Errorf("%w: prepared and static controller generations are both configured", ErrAdoptionPreparation)
+		}
+		resolved.ControllerGeneration = prepared.ControllerGeneration
+	}
+	if prepared.ResumeFrom == nil {
+		return resolved, nil
+	}
+	if bounds.StaticResumeConfigured {
+		return ResolvedPreparedAdoption{},
+			fmt.Errorf("%w: static and proof-resolved resume cursors are both configured", ErrAdoptionPreparation)
+	}
+	cursor := *prepared.ResumeFrom
+	if cursor < bounds.LocalResumeFrom {
+		return ResolvedPreparedAdoption{}, fmt.Errorf("%w: prepared resume %d regresses local floor %d",
+			ErrAdoptionPreparation, cursor, bounds.LocalResumeFrom)
+	}
+	if bounds.HelloLastSeq == ^uint64(0) || cursor > bounds.HelloLastSeq+1 {
+		return ResolvedPreparedAdoption{}, fmt.Errorf("%w: prepared resume %d is ahead of Hello LastSeq %d",
+			ErrAdoptionPreparation, cursor, bounds.HelloLastSeq)
+	}
+	resolved.ResumeFrom, resolved.ResumeProvided = cursor, true
+	return resolved, nil
+}
 
 func (o AdoptOptions) now() time.Time {
 	if o.Now != nil {
@@ -366,7 +437,7 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 			continue
 		}
 
-		ctrl, adoptErr := dialForAdoption(ctx, rec, opts)
+		ctrl, adoptErr := dialForAdoptionWithRetry(ctx, rec, opts, log)
 		if adoptErr != nil {
 			if errors.Is(adoptErr, ErrAdoptionPreparation) {
 				result.Close()
@@ -390,6 +461,135 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 	sortResult(&result)
 	return result, nil
+}
+
+const (
+	// adoptionDialAttempts is the TOTAL number of dials one live record gets
+	// when every failure is transient. It bounds ONE record, not the pass —
+	// see adoptionRetryDialTimeout for what that leaves unbounded.
+	adoptionDialAttempts = 3
+	// adoptionDialBackoff is the base delay between transient attempts; it
+	// doubles. The delay is short on purpose — the dial timeout is the real
+	// spacing, and this only avoids hammering a peer that just refused.
+	adoptionDialBackoff = 100 * time.Millisecond
+	// adoptionRetryDialTimeout caps attempts 2 and 3, because Adopt walks
+	// records in ONE sequential loop and every later lineage waits behind the
+	// current one. At the 5s default a retried hang would cost 15s of the pass
+	// instead of 5s, and hung records ahead of a healthy one push that healthy
+	// lineage's adoption toward its own orphan deadline — turning stalled shims
+	// into other sessions' self-teardown, which is the exact harm per-lineage
+	// quarantine exists to prevent. One record's worst case is bounded at
+	// first + 2s + 2s (5+2+2 = 9s at the default dial timeout), and a caller
+	// that configures a shorter DialTimeout keeps it: this only ever lowers.
+	//
+	// Be honest about what that does NOT bound. Only the RECORD is bounded; the
+	// pass is not. N hung records still cost 9N seconds serially — against a 90s
+	// shim orphan deadline that is roughly ten of them, where before this cap it
+	// was roughly six. The exposure predates this change (5s × N crossed the
+	// same deadline at around eighteen records) and the cap reduces it, but
+	// nothing here enforces an aggregate budget. A pass-level budget, or dialing
+	// independent lineages concurrently, is a real change with its own ordering
+	// and capacity consequences and belongs in its own ADR — not in a constant.
+	adoptionRetryDialTimeout = 2 * time.Second
+)
+
+// adoptionAttemptDialTimeout is the dial timeout for one attempt: the caller's
+// own for the first, and the retry cap for every attempt after it. Attempt 1 is
+// deliberately unchanged — a first dial is not evidence of anything yet, and
+// shortening it would convert slow-but-healthy shims into retries.
+func adoptionAttemptDialTimeout(configured time.Duration, attempt int) time.Duration {
+	if attempt <= 1 {
+		return configured
+	}
+	if configured > 0 && configured < adoptionRetryDialTimeout {
+		return configured
+	}
+	return adoptionRetryDialTimeout
+}
+
+// dialForAdoptionWithRetry dials one record, retrying while the failure says
+// only "not this time".
+//
+// A preparation failure is never retried: it aborts the whole pass, and asking
+// a composing authority again for something it already refused is not recovery.
+// Everything else non-transient returns on the first answer, exactly as before.
+//
+// A retry re-dials the ALREADY-PREPARED candidate. Preparation runs inside the
+// handshake, after Hello authentication and before the Welcome write, so the
+// measured failure shape this retry exists for — a write timeout on an
+// established socket — happens AFTER preparation has already succeeded. Asking
+// again would mint a second control-plane reservation for a lineage whose first
+// one is admitted and undisposed, on a path that has no abandonment verb and no
+// drift to repair. The first answer is retained and replayed instead, so a hung
+// lineage costs extra dials and never extra reservations.
+func dialForAdoptionWithRetry(
+	ctx context.Context,
+	rec Record,
+	opts AdoptOptions,
+	log *slog.Logger,
+) (*Controller, error) {
+	configuredTimeout := opts.DialTimeout
+	attemptOpts := opts
+	if opts.Prepare != nil {
+		prepare := opts.Prepare
+		var retained PreparedAdoption
+		var retainedOK bool
+		attemptOpts.Prepare = func(prepareCtx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
+			if retainedOK {
+				return clonePreparedAdoption(retained), nil
+			}
+			prepared, err := prepare(prepareCtx, evidence)
+			if err != nil {
+				return PreparedAdoption{}, err
+			}
+			retained, retainedOK = clonePreparedAdoption(prepared), true
+			return prepared, nil
+		}
+	}
+	attemptOpts.DialTimeout = adoptionAttemptDialTimeout(configuredTimeout, 1)
+	ctrl, err := dialForAdoption(ctx, rec, attemptOpts)
+	for attempt := 2; attempt <= adoptionDialAttempts; attempt++ {
+		if !isTransientDialFailure(err) || errors.Is(err, ErrAdoptionPreparation) {
+			return ctrl, err
+		}
+		log.Warn("sessionshim: adoption dial failed transiently; retrying the prepared candidate before classifying",
+			"session", rec.Identity().String(), "attempt", attempt, "of", adoptionDialAttempts, "error", err)
+		delay := adoptionDialBackoff
+		for i := 2; i < attempt; i++ {
+			delay *= 2
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		}
+		timer.Stop()
+		attemptOpts.DialTimeout = adoptionAttemptDialTimeout(configuredTimeout, attempt)
+		ctrl, err = dialForAdoption(ctx, rec, attemptOpts)
+	}
+	return ctrl, err
+}
+
+// clonePreparedAdoption deep-copies a retained preparation answer so a replay
+// cannot hand a later attempt an aliased map or slice the earlier one still
+// holds.
+func clonePreparedAdoption(in PreparedAdoption) PreparedAdoption {
+	extensions := shimwire.Extensions{Required: append([]string(nil), in.Extensions.Required...)}
+	if in.Extensions.Values != nil {
+		extensions.Values = make(map[string]string, len(in.Extensions.Values))
+		for name, value := range in.Extensions.Values {
+			extensions.Values[name] = value
+		}
+	}
+	in.Extensions = extensions
+	in.Correlation = append([]byte(nil), in.Correlation...)
+	if in.ResumeFrom != nil {
+		cursor := *in.ResumeFrom
+		in.ResumeFrom = &cursor
+	}
+	return in
 }
 
 // ResolvedDurableAckAmbiguityBound reports the bound a controller dialled by
@@ -518,22 +718,49 @@ func classifyAdoptionFailure(err error) (QuarantineReason, string) {
 		return QuarantineIdentityMismatch, err.Error()
 	case errors.Is(err, ErrRecordInvalid):
 		return QuarantineRecordMalformed, err.Error()
-	case isDialFailure(err):
-		// The record's process IS live (checked above) but the socket is not
-		// reachable. §D10: quarantine — do not kill, do not recreate the socket,
-		// do not release a claim. The shim's own orphan deadline is the escape.
+	case isSocketUnreachable(err):
+		// The record's process IS live (checked above) but the endpoint itself
+		// answered: refused, or gone. §D10: quarantine — do not kill, do not
+		// recreate the socket, do not release a claim. The shim's own orphan
+		// deadline is the escape.
 		return QuarantineSocketUnreachable, err.Error()
 	default:
 		return QuarantineAdoptionFailed, err.Error()
 	}
 }
 
-func isDialFailure(err error) bool {
-	var opErr interface{ Timeout() bool }
-	if errors.As(err, &opErr) {
+// isSocketUnreachable is POSITIVE evidence about the endpoint: the connect was
+// refused, or nothing is bound at the path any more. Nothing else qualifies.
+//
+// The predicate this replaced asked only whether the error had a Timeout method
+// and never called it — which every net.OpError and os.PathError has — so any
+// error the network stack produced was reported as an unreachable socket.
+// Measured live: a write timeout on an ALREADY-ESTABLISHED unix socket, to a
+// shim whose pid had just been proved alive, was classified socket_unreachable
+// on the first re-adoption attempt. A stalled peer is not an absent one, and
+// the two disagree about whether anything is still out there to talk to.
+func isSocketUnreachable(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, fs.ErrNotExist)
+}
+
+// isTransientDialFailure reports the shapes that say only "not this time":
+// a real timeout, or a peer that hung up mid-handshake. The socket existed and
+// accepted, and the record's process is live, so the honest reading is that the
+// shim was busy — a shim mid-snapshot, or one whose accept loop had not yet
+// come back around. Retrying is what distinguishes a busy peer from an absent
+// one; classifying without retrying just guesses.
+func isTransientDialFailure(err error) bool {
+	if err == nil || isSocketUnreachable(err) {
+		return false
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
 		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
 }

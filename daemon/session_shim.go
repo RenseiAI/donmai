@@ -166,7 +166,42 @@ type SessionShimAdoptionPreparation struct {
 	// external carrier proof authority.
 	LastForwardedSeq uint64
 	SelectedVersion  uint32
+
+	// Cause names WHY this preparation is being asked for, and Attempt counts
+	// it within one adoption of one lineage (1 for the first).
+	//
+	// They are not diagnostics. A composing authority that mints a reservation
+	// owns disposing of the one it is superseding, and it cannot do that if
+	// every ask looks like a first ask. A cause of
+	// SessionShimPrepareCauseCarrierCursorDrift is this daemon stating that an
+	// earlier reservation for this lineage is admitted, pre-active, and now
+	// stale — the authority is expected to abandon it before reserving above
+	// the carrier-epoch floor, or to answer a typed conflict.
+	Cause   SessionShimAdoptionPrepareCause
+	Attempt int
 }
+
+// SessionShimAdoptionPrepareCause is the closed set of reasons a preparation is
+// requested.
+type SessionShimAdoptionPrepareCause string
+
+const (
+	// SessionShimPrepareCauseInitial is the first ask for one adoption. Nothing
+	// is outstanding for the lineage.
+	SessionShimPrepareCauseInitial SessionShimAdoptionPrepareCause = "initial"
+	// SessionShimPrepareCauseCarrierCursorDrift is a re-ask after the durable
+	// adoption refused the previous proof as drifted. The previous reservation
+	// is admitted and pre-active; this ask supersedes it.
+	SessionShimPrepareCauseCarrierCursorDrift SessionShimAdoptionPrepareCause = "carrier_cursor_drift"
+)
+
+// ErrSessionShimAdoptionPrepareConflict is how a composing authority says its
+// answer is a REFUSAL, not a failure: the ask conflicts with state it already
+// holds for this lineage (a reservation it will not supersede, an episode whose
+// bytes changed under the same idempotency key). Re-asking cannot change it, so
+// the daemon spends none of its remaining budget on it and quarantines with the
+// conflict as the detail. Composing callers wrap their typed conflict with %w.
+var ErrSessionShimAdoptionPrepareConflict = errors.New("session shim: adoption preparation conflicted")
 
 // SessionShimAdoptionPreparationState is the closed result posture returned by
 // the additive proof-v2 composing prepare seam.
@@ -2188,6 +2223,12 @@ func (c SessionShimConfig) adoptionPublicationTimeout() time.Duration {
 type sessionShimAdoptionPreparations struct {
 	prepared map[sessionshim.Identity]SessionShimAdoptionPreparationResult
 	hosts    map[sessionshim.Identity]string
+	// inputs retains what the Prepare hook was ASKED, not only what it
+	// answered. A stale carrier proof can only be repaired by preparing a new
+	// one, and a second prepare needs the same local evidence the first was
+	// resolved against — without it the pass has no way to re-ask and the only
+	// remaining move is to condemn a lineage over a recoverable disagreement.
+	inputs map[sessionshim.Identity]sessionshim.AdoptionPreparation
 }
 
 // sessionShimAdoptOptions assembles the ONE adoption pass this daemon runs —
@@ -2211,6 +2252,7 @@ func (d *Daemon) sessionShimAdoptOptions(
 	preparations := &sessionShimAdoptionPreparations{
 		prepared: make(map[sessionshim.Identity]SessionShimAdoptionPreparationResult),
 		hosts:    make(map[sessionshim.Identity]string),
+		inputs:   make(map[sessionshim.Identity]sessionshim.AdoptionPreparation),
 	}
 	if cfg.PrepareAdoption != nil || cfg.PrepareAdoptionV2 != nil || cfg.HostIDForOrg != nil {
 		opts.Prepare = func(prepareCtx context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
@@ -2224,6 +2266,7 @@ func (d *Daemon) sessionShimAdoptOptions(
 			}
 			preparations.hosts[evidence.Identity] = hostID
 			preparations.prepared[evidence.Identity] = prepared
+			preparations.inputs[evidence.Identity] = evidence
 			return prepared.PreparedAdoption, nil
 		}
 	}
@@ -2350,9 +2393,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// before publishing adoptionComplete or starting registration.
 	entries := make(map[sessionshim.Identity]adoptedShim, len(result.Adopted))
 	// adoptionFailures collects lineages whose OWN durable-adoption callback
-	// refused them — e.g. a durable resume proof that does not match what the
-	// shim now proves (measured live: an attachclient v2 high-water/carrier-
-	// boundary mismatch). That is a fact about the ONE lineage, never about
+	// refused them, and whose refusal survived the bounded re-prepared re-dial
+	// below where the refusal was a recoverable one. That is a fact about the
+	// ONE lineage, never about
 	// this daemon's ability to establish its host identity, so it must not
 	// fail the whole composition closed the way sessionShimAdoptionEvidence's
 	// host-resolution failure genuinely does below. Each failed lineage is
@@ -2383,24 +2426,26 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		receipt, callbackErr := d.completeSessionShimAdoption(ctx, evidence, preparation)
+		// A refusal that is carrier cursor drift is AMBIGUOUS evidence — a stale
+		// proof, not a verdict on the lineage — so it gets the bounded
+		// re-prepared re-dial the recovery corpus requires before any terminal
+		// consequence. Every other refusal keeps its single attempt. The final
+		// evidence and preparation come back because a re-prepare mints new
+		// ones and the receipt below belongs to that pair, not to the first.
+		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithDriftRedial(
+			ctx, c, preparations, hostByID[id], evidence, preparation,
+		)
 		delete(preparedByID, id)
 		evidence.SnapshotProxy.deactivate()
 		if callbackErr != nil {
-			// NOT retried here, deliberately noted rather than silently
-			// accepted: a quarantined lineage keeps its shim (never killed),
-			// but no controller ever renews its orphan clock, so a callback
-			// failure that was really just a transient blip still condemns an
-			// otherwise-healthy session to self-teardown at the shim's
-			// configured orphan deadline (90 s under a composing deployment's
-			// explicit setting today) with no second attempt in THIS pass.
-			// The retry doctrine this PR applies to the batch
-			// commit (completeLaunchedSessionShimAdoptionBatchResilient) is
-			// intentionally NOT duplicated here: this pass already has to stay
-			// bounded across every lineage it composes, and a future
-			// bounded per-lineage retry (or a reconciliation pass that
-			// re-attempts a quarantined lineage before its orphan deadline)
-			// is the right follow-up rather than something to fold in here.
+			// Quarantine is now the answer only AFTER the bound above, and only
+			// for a refusal this daemon could not reconcile. It is still a fact
+			// about the ONE lineage: a quarantined lineage keeps its shim (never
+			// killed), but no controller renews its orphan clock, so it will
+			// self-teardown at the shim's configured orphan deadline. The detail
+			// carries what refused it — for drift, both cursors and the number of
+			// dials spent — so a reconciliation pass that re-attempts a
+			// quarantined lineage before that deadline has something to read.
 			slog.Error("session shim: durable adoption failed for one lineage; quarantining it and composing the rest of the host",
 				"session", id.String(), "error", callbackErr)
 			hello := c.Hello()
@@ -2912,10 +2957,25 @@ func (d *Daemon) sessionShimCallbackContext(parent context.Context) (context.Con
 	return context.WithTimeout(parent, d.sessionShimConfig().callbackTimeout())
 }
 
+// prepareSessionShimAdoption is the ordinary first ask for one adoption.
 func (d *Daemon) prepareSessionShimAdoption(
 	ctx context.Context,
 	hostID string,
 	evidence sessionshim.AdoptionPreparation,
+) (SessionShimAdoptionPreparationResult, error) {
+	return d.prepareSessionShimAdoptionForCause(ctx, hostID, evidence, SessionShimPrepareCauseInitial, 1)
+}
+
+// prepareSessionShimAdoptionForCause is the same ask, told why. A re-ask must
+// say so: the composing authority is the only party that can dispose of the
+// reservation this one supersedes, and it cannot if every ask looks like a
+// first ask.
+func (d *Daemon) prepareSessionShimAdoptionForCause(
+	ctx context.Context,
+	hostID string,
+	evidence sessionshim.AdoptionPreparation,
+	cause SessionShimAdoptionPrepareCause,
+	attempt int,
 ) (SessionShimAdoptionPreparationResult, error) {
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
@@ -2947,6 +3007,8 @@ func (d *Daemon) prepareSessionShimAdoption(
 		LastHostSeq:                 evidence.LastHostSeq,
 		LastForwardedSeq:            evidence.LastForwardedSeq,
 		SelectedVersion:             evidence.SelectedVersion,
+		Cause:                       cause,
+		Attempt:                     attempt,
 	}
 	var result SessionShimAdoptionPreparationResult
 	var err error
