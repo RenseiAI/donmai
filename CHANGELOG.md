@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- Worktree sessions refresh their requested base ref before branching, serialize
+  shared-parent Git mutations, and record the created worktree's base SHA.
+- New session branches created by the shared-parent strategy do not configure an
+  automatic upstream; callers that need to push must set one explicitly.
+
 ---
 
 ## v0.72.18 — 2026-09-02

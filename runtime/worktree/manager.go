@@ -246,6 +246,17 @@ var parentWorktreeLocks = struct {
 	locks map[string]*parentWorktreeLock
 }{locks: make(map[string]*parentWorktreeLock)}
 
+type baseFetchFlight struct {
+	done chan struct{}
+	info baseFetchInfo
+	err  error
+}
+
+var baseFetchFlights = struct {
+	sync.Mutex
+	flights map[string]*baseFetchFlight
+}{flights: make(map[string]*baseFetchFlight)}
+
 // ProvisionHook is a test/fault-injection seam at durable crash boundaries.
 type ProvisionHook func(stage string, acquisition workarea.AcquisitionRecord) error
 
@@ -743,8 +754,11 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			if baseInfo.Fetched {
 				out, headErr := m.runGit(ctx, "", "-C", res.Path, "rev-parse", "HEAD")
 				if headErr != nil {
-					_ = m.teardownResult(ctx, *res)
-					return "", fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, baseInfo.Ref, headErr, strings.TrimSpace(string(out)))
+					resolveErr := fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, baseInfo.Ref, headErr, strings.TrimSpace(string(out)))
+					if cleanupErr := m.teardownResult(ctx, *res); cleanupErr != nil {
+						return "", fmt.Errorf("%w; cleanup worktree: %v", resolveErr, cleanupErr)
+					}
+					return "", resolveErr
 				}
 				res.BaseSHA = strings.TrimSpace(string(out))
 			}
@@ -1608,7 +1622,7 @@ type baseFetchInfo struct {
 // worktree branch is created. It is intentionally limited to StrategyWorktreeAdd;
 // clone strategy already obtains its base during clone and retains its historical
 // command shape.
-func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (baseFetchInfo, error) {
+func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (result baseFetchInfo, resultErr error) {
 	if spec.Strategy != StrategyWorktreeAdd {
 		return baseFetchInfo{}, nil
 	}
@@ -1627,8 +1641,24 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	if spec.SkipBaseFetch {
 		return baseFetchInfo{}, nil
 	}
-	worktreeUnlock := acquireParentWorktreeLock(parent)
-	defer worktreeUnlock()
+	key := canonicalParentPath(parent) + "\x00" + ref
+	baseFetchFlights.Lock()
+	if flight := baseFetchFlights.flights[key]; flight != nil {
+		baseFetchFlights.Unlock()
+		<-flight.done
+		return flight.info, flight.err
+	}
+	flight := &baseFetchFlight{done: make(chan struct{})}
+	baseFetchFlights.flights[key] = flight
+	baseFetchFlights.Unlock()
+	defer func() {
+		baseFetchFlights.Lock()
+		flight.info = result
+		flight.err = resultErr
+		delete(baseFetchFlights.flights, key)
+		close(flight.done)
+		baseFetchFlights.Unlock()
+	}()
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
 	started := time.Now()
@@ -1671,7 +1701,9 @@ func normalizeBaseRef(ref string) (string, error) {
 	ref = strings.TrimPrefix(ref, "origin/")
 	ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
 	ref = strings.TrimPrefix(ref, "refs/heads/")
-	ref = strings.TrimPrefix(ref, "refs/tags/")
+	if strings.HasPrefix(ref, "refs/tags/") {
+		return "", fmt.Errorf("%w: %w %q: tag refs are not supported for worktree base refresh", ErrBaseFetch, ErrInvalidBaseRef, ref)
+	}
 	if ref == "" || strings.HasPrefix(ref, "-") {
 		return "", fmt.Errorf("%w: %w", ErrBaseFetch, ErrInvalidBaseRef)
 	}

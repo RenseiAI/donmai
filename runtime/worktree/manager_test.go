@@ -625,13 +625,22 @@ func TestProvisionRejectsUnsafeBaseRefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	for i, ref := range []string{"-upload-pack=x", "origin/-x", "origin/"} {
+	refs := []struct {
+		ref  string
+		skip bool
+	}{
+		{ref: "-upload-pack=x"},
+		{ref: "origin/-x", skip: true},
+		{ref: "origin/"},
+		{ref: "refs/tags/v1"},
+	}
+	for i, test := range refs {
 		_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
 			SessionID: fmt.Sprintf("unsafe-ref-%d", i), Strategy: worktree.StrategyWorktreeAdd,
-			ParentRepoPath: parent, BaseRef: ref,
+			ParentRepoPath: parent, BaseRef: test.ref, SkipBaseFetch: test.skip,
 		})
 		if !errors.Is(err, worktree.ErrInvalidBaseRef) {
-			t.Fatalf("ref %q: error = %v, want ErrInvalidBaseRef", ref, err)
+			t.Fatalf("ref %q: error = %v, want ErrInvalidBaseRef", test.ref, err)
 		}
 	}
 	if got := calls.Load(); got != 0 {
