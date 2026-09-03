@@ -440,50 +440,47 @@ func TestStartupCompositionQuarantinesDriftOnlyAfterTheBound(t *testing.T) {
 	}
 }
 
-// TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch pins the
-// one field of a re-prepared answer that cannot be honoured after the
-// handshake, and that this path's own contract would otherwise produce.
+// TestStartupCompositionNeverRepreparesACarrierEpochBoundLineage pins the scope
+// of this repair, and pins that its limit costs the control plane nothing.
 //
-// The committed evidence sources its extensions from the shim's Adopted frame,
-// which validateAdoptionCommit froze against the FIRST Welcome. There is no
-// second Welcome, so no Adopted frame will ever echo a second carrier epoch —
-// D15.3's "no carrier commit before Adopted echoes the prepared value". Binding
-// the new candidate to the old epoch would publish an activation naming the
-// epoch the authority was just told to abandon, which is the "reactivating its
-// incumbent" the retained-candidate abandonment correction forbids.
+// The adoption ADR's D10 matrix requires a conforming authority to reprepare at
+// a strictly greater carrier epoch. A greater epoch cannot be committed after
+// the handshake — no Adopted frame will echo it — so for a lineage whose
+// committed adoption carries an epoch the ask has exactly one possible outcome.
+// Making it anyway would burn an epoch and leave a fresh admitted reservation
+// undisposed on the way to the outcome that was available without asking.
 //
-// So: refuse and quarantine, naming both epochs.
-func TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch(t *testing.T) {
+// So: exactly ONE preparation ask, ONE dial, and a quarantine whose typed
+// reason says a second handshake is what this needs.
+func TestStartupCompositionNeverRepreparesACarrierEpochBoundLineage(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	const orgID = "org-drift-epoch"
-	spec := launchOneAdoptableLineage(t, f, orgID, "lineage-superseding-epoch")
+	spec := launchOneAdoptableLineage(t, f, orgID, "lineage-epoch-bound")
 
 	var (
 		batchMu sync.Mutex
 		batches []SessionShimAdoptionBatch
 	)
-	// The shape the header used to promise: the second proof reserves a higher
-	// carrier epoch.
-	adoption := &driftingAdoption{refuseUntil: 2, carrierEpochs: []string{"7", "8"}}
+	adoption := &driftingAdoption{carrierEpochs: []string{"7"}}
 	replacement := newDriftRedialDaemon(t, f.registry, orgID, adoption, &batches, &batchMu)
 
-	// Reaching the carrier-activation stage at all means the bind accepted the
-	// superseding epoch: the evidence was committed, and what it names is the
-	// epoch the shim echoed at the FIRST Welcome, not the one just signed.
 	if err := replacement.adoptSessionShims(context.Background()); err != nil {
-		t.Fatalf("the composition committed a re-prepared candidate at the superseded carrier epoch: %v", err)
+		t.Fatalf("startup composition returned a host-wide failure: %v", err)
 	}
 
-	if _, err := replacement.adoptedShimEntry(orgID, spec.SessionID); err == nil {
-		t.Fatal("a receipt was committed binding a re-prepared candidate to the superseded carrier epoch")
-	}
 	asks, dials := adoption.snapshot()
-	if len(asks) != 2 {
-		t.Fatalf("preparation asks = %d, want 2", len(asks))
+	// The load-bearing assertion: the authority was never asked to abandon and
+	// re-reserve for an answer this path is guaranteed to refuse.
+	if len(asks) != 1 {
+		t.Fatalf("preparation asks = %d, want exactly 1 — an epoch-bound lineage must not spend an abandonment", len(asks))
 	}
 	if dials != 1 {
-		t.Fatalf("durable adoption dials = %d, want 1 — an unusable answer is never dialled", dials)
+		t.Fatalf("durable adoption dials = %d, want 1", dials)
 	}
+	if _, err := replacement.adoptedShimEntry(orgID, spec.SessionID); err == nil {
+		t.Fatal("an epoch-bound lineage was composed through a path that cannot repair it")
+	}
+
 	found := false
 	for _, q := range replacement.QuarantinedSessions() {
 		if q.SessionID != spec.SessionID {
@@ -493,14 +490,18 @@ func TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch(t *tes
 		if q.Reason != sessionshim.QuarantineAdoptionFailed {
 			t.Fatalf("quarantine reason = %q, want %q", q.Reason, sessionshim.QuarantineAdoptionFailed)
 		}
-		for _, want := range []string{"unusable", "carrier epoch 8", "committed 7"} {
+		for _, want := range []string{
+			"needs a new handshake",     // why it was not re-preparable
+			"committed carrier epoch 7", // which epoch made it so
+			"125", "120",                // and the drift that started it, still reported
+		} {
 			if !strings.Contains(q.Detail, want) {
-				t.Fatalf("quarantine detail %q does not name %q", q.Detail, want)
+				t.Fatalf("quarantine detail %q does not carry %q", q.Detail, want)
 			}
 		}
 	}
 	if !found {
-		t.Fatal("the lineage was not surfaced in the live quarantine projection")
+		t.Fatal("the epoch-bound lineage was not surfaced in the live quarantine projection")
 	}
 
 	batchMu.Lock()
@@ -511,16 +512,24 @@ func TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch(t *tes
 	if len(batches[0].Adopted) != 0 {
 		t.Fatalf("batch.Adopted = %+v, want empty — the evidence must never be committed", batches[0].Adopted)
 	}
+	if len(batches[0].Quarantined) != 1 || batches[0].Quarantined[0].SessionID != spec.SessionID {
+		t.Fatalf("batch.Quarantined = %+v, want the epoch-bound lineage presented", batches[0].Quarantined)
+	}
 }
 
-// TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch is the acceptance arm,
-// and the statement of what this path CAN repair: a boundary, not an epoch.
+// TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch pins the bind itself.
 //
-// It works against a REAL adopted controller whose Adopted frame echoed
-// carrier epoch 7, and asks the bind what it will honour. A re-signed
-// same-epoch answer at the same cursor binds — it supersedes nothing, so no
-// abandonment is owed on the succeeding path at all. Every disagreement with
-// what the shim committed is refused, naming both values.
+// The bind is DEFENCE IN DEPTH for the carrier-epoch case, not the mechanism
+// that handles it: the scope gate refuses an epoch-bound lineage before any ask
+// is made, so the redial path never reaches these branches for one. What this
+// pins is that the last line holds anyway — an answer the adopted controller
+// cannot honour is refused however it arrives, and the refusal names which
+// negotiated extension disagrees rather than asserting one key that may not be
+// the one that differs.
+//
+// It works against a REAL adopted controller whose Adopted frame echoed carrier
+// epoch 7, so "what the shim committed" is the shim's own frame and not the
+// test's opinion of it.
 func TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	const orgID = "org-bind-epoch"
@@ -574,6 +583,7 @@ func TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch(t *testing.T) {
 		name     string
 		prepared sessionshim.PreparedAdoption
 		wantErr  []string
+		wantNot  []string
 	}{
 		{
 			name: "a re-signed same epoch at the same cursor binds",
@@ -583,18 +593,43 @@ func TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch(t *testing.T) {
 			},
 		},
 		{
-			name: "a superseding epoch is refused, naming both",
+			name: "a superseding epoch is refused, naming the key and both values",
 			prepared: sessionshim.PreparedAdoption{
 				Extensions: epochs("8"), ResumeFrom: cursor(ctrl.ResumeFrom()),
 			},
-			wantErr: []string{"re-prepared carrier epoch 8", "committed 7"},
+			wantErr: []string{"carrier_epoch: re-prepared 8, committed 7"},
 		},
 		{
 			name: "a dropped epoch is refused, and says so rather than eliding it",
 			prepared: sessionshim.PreparedAdoption{
 				ResumeFrom: cursor(ctrl.ResumeFrom()),
 			},
-			wantErr: []string{"re-prepared carrier epoch absent", "committed 7"},
+			wantErr: []string{"carrier_epoch: re-prepared absent, committed 7"},
+		},
+		{
+			// The comparison is canonical-JSON equality over the WHOLE set, so a
+			// message that only ever names the carrier epoch would one day print
+			// "carrier epoch 7, committed 7" and read as a contradiction.
+			name: "a difference outside the carrier epoch names its own key",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: shimwire.Extensions{Values: map[string]string{
+					shimwire.ExtCarrierEpoch: "7", "future_extension": "on",
+				}},
+				ResumeFrom: cursor(ctrl.ResumeFrom()),
+			},
+			wantErr: []string{"future_extension: re-prepared on, committed absent"},
+			wantNot: []string{"carrier_epoch:"},
+		},
+		{
+			name: "a difference in the required set is reported too",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: shimwire.Extensions{
+					Values:   map[string]string{shimwire.ExtCarrierEpoch: "7"},
+					Required: []string{shimwire.ExtCarrierEpoch},
+				},
+				ResumeFrom: cursor(ctrl.ResumeFrom()),
+			},
+			wantErr: []string{"required: re-prepared [carrier_epoch], committed []"},
 		},
 		{
 			name: "a disagreeing generation is refused",
@@ -637,6 +672,11 @@ func TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch(t *testing.T) {
 			for _, want := range test.wantErr {
 				if !strings.Contains(bindErr.Error(), want) {
 					t.Fatalf("refusal %q does not name %q", bindErr, want)
+				}
+			}
+			for _, unwanted := range test.wantNot {
+				if strings.Contains(bindErr.Error(), unwanted) {
+					t.Fatalf("refusal %q names %q, which does not differ", bindErr, unwanted)
 				}
 			}
 		})

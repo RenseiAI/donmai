@@ -603,6 +603,25 @@ func TestHandshakeWiresTheRealBoundsIntoTheResolver(t *testing.T) {
 			wantErr: "prepared and static controller generations are both configured",
 		},
 		{
+			// HelloLastSeq: the AUTHENTICATED ceiling. A loosened value handed to
+			// the resolver would accept a prepared cursor that skips frames the
+			// shim never had.
+			name:    "a prepared cursor past the authenticated Hello cursor is refused",
+			session: "sess-hello-ceiling",
+			options: func() ControllerOptions {
+				return ControllerOptions{
+					ControllerID: "controller-hello-ceiling",
+					PrepareAdoption: func(evidence AdoptionPreparation) (PreparedAdoption, error) {
+						// One past the ceiling: LastSeq+1 is the highest legal
+						// cursor, so LastSeq+2 asks to resume from a frame the
+						// shim has never produced.
+						return PreparedAdoption{ResumeFrom: cursor(evidence.LastHostSeq + 2)}, nil
+					},
+				}
+			},
+			wantErr: "is ahead of Hello LastSeq",
+		},
+		{
 			// LocalResumeFrom: the floor a prepared cursor may raise and never
 			// regress. A zero handed to the resolver disables it outright.
 			name:    "a prepared cursor under the local floor is refused",

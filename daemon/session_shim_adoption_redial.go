@@ -19,23 +19,38 @@ package daemon
 // RE-SIGNED proof at a corrected boundary, and the harness on the other side of
 // it was alive the entire time.
 //
-// WHAT THIS PATH CAN AND CANNOT REPAIR
+// SCOPE — THIS REPAIRS DRIFT ONLY FOR A LINEAGE THAT NEGOTIATED NO CARRIER EPOCH
 //
-// It can repair a boundary. It cannot repair an epoch.
+// Read this before assuming the path is general. It is not, and the limit is
+// the corpus's, not an oversight.
 //
 // The handshake is over by the time a re-prepare runs. The shim has committed
 // one generation, one resume cursor, and one exact extension set — and the
 // adoption ADR's D15.3 says no carrier commit occurs before Adopted echoes the
 // prepared value. No Adopted frame will ever echo a SECOND carrier epoch,
 // because validateAdoptionCommit already froze the echo against the first
-// Welcome and there is no second Welcome to send. So a re-prepared answer is
-// honourable here only when it re-signs the SAME carrier epoch at a corrected
-// boundary. An answer whose epoch supersedes needs a handshake this path does
-// not have, and is refused and quarantined — the same disposition a
-// disagreeing generation gets. Committing it instead would publish an
-// activation naming the epoch the authority was just told to abandon, which is
-// precisely the "reactivating its incumbent" the 2026-08-23 retained-candidate
-// abandonment correction forbids.
+// Welcome and there is no second Welcome to send.
+//
+// Now read what the same ADR requires a conforming authority to answer with.
+// Its D10 crash matrix, on the row for this exact failure — a carrier journal
+// that advances after the proof reservation but before candidate admission —
+// says to "mutate no room state and reprepare at a strictly greater carrier
+// epoch", and the adoption-fails row says "a later preparation allocates a
+// strictly greater value". A conforming authority CANNOT hand back a re-signed
+// same epoch: a strictly greater one is refused here for want of a second
+// handshake, and re-signing the same reservation is changed bytes under one
+// key, which its own contract calls a changed-replay conflict.
+//
+// So for a lineage whose committed adoption carries a carrier epoch there is no
+// answer this path can accept, and asking would burn an epoch and leave a fresh
+// admitted reservation undisposed to reach an outcome available without asking.
+// Such a lineage is therefore NOT re-prepared at all: it takes the bounded path
+// straight to quarantine with ErrSessionShimCarrierEpochBoundDriftNeedsHandshake,
+// spending no abandonment. Repairing it needs a second handshake, which is its
+// own change and not this one.
+//
+// What remains, and what this path does repair, is drift on a lineage that
+// negotiated no carrier epoch — the shape the live incident had.
 //
 // WHAT THIS RELIES ON THE COMPOSING AUTHORITY TO DO
 //
@@ -46,7 +61,8 @@ package daemon
 //
 //   - a re-prepare carries SessionShimPrepareCauseCarrierCursorDrift and its
 //     attempt number, which is this daemon declaring that an earlier
-//     reservation for this lineage is outstanding and stale;
+//     reservation for this lineage is outstanding and stale. It is only ever
+//     sent for a lineage with no committed carrier epoch — see SCOPE above;
 //   - the authority disposes of it as preparing_reprepare — the adoption ADR's
 //     one abandonment cause whose SOURCE is a preparing handoff and which may
 //     keep or change the controller. That ADR states the obligation directly:
@@ -74,6 +90,9 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"slices"
+	"sort"
+	"strings"
 	"time"
 
 	"github.com/RenseiAI/donmai/attachclient"
@@ -128,6 +147,15 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 	for attempt := 2; attempt <= sessionShimDriftRedialAttempts; attempt++ {
 		if err == nil || !isSessionShimCarrierCursorDrift(err) {
 			return evidence, preparation, receipt, err
+		}
+		// SCOPE gate. A lineage whose committed adoption carries a carrier epoch
+		// has no answer this path can accept — see the file header. Refuse it
+		// here, BEFORE the ask, so no abandonment is spent and no successor
+		// reservation is minted for a refusal that is already certain.
+		if epoch, bound := ctrl.Adoption().Extensions.Get(shimwire.ExtCarrierEpoch); bound {
+			return evidence, preparation, SessionShimAdoptionReceipt{},
+				fmt.Errorf("%w; %w (committed carrier epoch %s)",
+					err, ErrSessionShimCarrierEpochBoundDriftNeedsHandshake, epoch)
 		}
 		input, retained := preparations.inputs[id]
 		if !retained {
@@ -202,6 +230,20 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 	return evidence, preparation, receipt, err
 }
 
+// ErrSessionShimCarrierEpochBoundDriftNeedsHandshake reports drift on a lineage
+// whose committed adoption negotiated a carrier epoch.
+//
+// It is a refusal BEFORE the ask, not after it. The adoption ADR's D10 matrix
+// requires a conforming authority to reprepare at a strictly greater carrier
+// epoch, and a greater epoch cannot be committed here for want of a second
+// handshake — so the ask has exactly one possible outcome, and making it would
+// burn an epoch and leave a fresh admitted reservation undisposed on the way to
+// that outcome. Repairing this case needs a second handshake; that is its own
+// change.
+var ErrSessionShimCarrierEpochBoundDriftNeedsHandshake = errors.New(
+	"session shim: carrier-epoch-bound drift needs a new handshake, not a re-prepare",
+)
+
 // ErrSessionShimRepreparedCarrierEpochSupersedes reports a re-prepared answer
 // whose negotiated extensions — carrier_epoch above all — differ from the ones
 // the shim committed.
@@ -255,10 +297,9 @@ func bindRepreparedAdoptionToController(
 	}
 	committed := ctrl.Adoption()
 	if !resolved.Extensions.ExactEqual(committed.Extensions) {
-		return fmt.Errorf("%w: re-prepared carrier epoch %s, committed %s",
+		return fmt.Errorf("%w: %s",
 			ErrSessionShimRepreparedCarrierEpochSupersedes,
-			shimExtensionCarrierEpoch(resolved.Extensions),
-			shimExtensionCarrierEpoch(committed.Extensions))
+			describeShimExtensionDifference(resolved.Extensions, committed.Extensions))
 	}
 	if resolved.ControllerGeneration != 0 && resolved.ControllerGeneration != ctrl.Generation() {
 		return fmt.Errorf(
@@ -275,14 +316,55 @@ func bindRepreparedAdoptionToController(
 	return nil
 }
 
-// shimExtensionCarrierEpoch renders an extension set's carrier epoch for an
-// operator-facing refusal. An absent epoch is said, not elided: "absent" and
-// "the same as the other one" are different facts about a disagreement.
-func shimExtensionCarrierEpoch(extensions shimwire.Extensions) string {
-	if epoch, ok := extensions.Get(shimwire.ExtCarrierEpoch); ok {
-		return epoch
+// describeShimExtensionDifference renders which negotiated extensions disagree,
+// by key.
+//
+// The comparison behind it is canonical-JSON equality over the WHOLE extension
+// set, so naming only the carrier epoch would one day print
+// "carrier epoch 7, committed 7" for a difference somewhere else and read as a
+// contradiction. Each differing key is named instead, and an absent value is
+// said rather than elided: "absent" and "the same as the other one" are
+// different facts about a disagreement.
+func describeShimExtensionDifference(reprepared, committed shimwire.Extensions) string {
+	names := make([]string, 0, len(reprepared.Values)+len(committed.Values))
+	seen := make(map[string]struct{}, len(reprepared.Values)+len(committed.Values))
+	for _, values := range []map[string]string{reprepared.Values, committed.Values} {
+		for name := range values {
+			if _, already := seen[name]; already {
+				continue
+			}
+			seen[name] = struct{}{}
+			names = append(names, name)
+		}
 	}
-	return "absent"
+	sort.Strings(names)
+	differences := make([]string, 0, len(names)+1)
+	for _, name := range names {
+		got, hasGot := reprepared.Values[name]
+		want, hasWant := committed.Values[name]
+		if hasGot == hasWant && got == want {
+			continue
+		}
+		differences = append(differences, fmt.Sprintf("%s: re-prepared %s, committed %s",
+			name, shimExtensionValueOrAbsent(got, hasGot), shimExtensionValueOrAbsent(want, hasWant)))
+	}
+	if !slices.Equal(reprepared.Required, committed.Required) {
+		differences = append(differences, fmt.Sprintf("required: re-prepared %v, committed %v",
+			reprepared.Required, committed.Required))
+	}
+	if len(differences) == 0 {
+		// ExactEqual said they differ and every field compares equal, so the
+		// difference is in the encoding. Say that rather than an empty reason.
+		return "the negotiated extension sets differ in encoding"
+	}
+	return strings.Join(differences, "; ")
+}
+
+func shimExtensionValueOrAbsent(value string, present bool) string {
+	if !present {
+		return "absent"
+	}
+	return value
 }
 
 // waitSessionShimDriftBackoff spends the doubling delay before attempt n

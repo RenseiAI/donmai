@@ -55,19 +55,28 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   whose proof still does not reconcile is quarantined as before, with the reason
   unchanged and the detail carrying both cursors and the number of dials spent.
 
-  **This path repairs a boundary, not an epoch.** By the time a re-prepare runs
-  the handshake is over: the shim has committed one generation, one resume
-  cursor, and one exact extension set, and the adoption ADR's D15.3 says no
-  carrier commit occurs before `Adopted` echoes the prepared value. No `Adopted`
-  frame will ever echo a *second* carrier epoch, because the echo was already
-  frozen against the first `Welcome` and there is no second `Welcome` to send.
-  So a re-prepared answer is honourable only when it **re-signs the same carrier
-  epoch at a corrected boundary**. An answer whose epoch supersedes is refused
-  and quarantined (`ErrSessionShimRepreparedCarrierEpochSupersedes`, naming both
-  epochs) — the same disposition a disagreeing generation gets. Committing it
-  would publish an activation naming the epoch the authority was just told to
-  abandon, which is the "reactivating its incumbent" the retained-candidate
-  abandonment correction forbids.
+  **Scope: this repairs drift only for a lineage that negotiated no carrier
+  epoch.** By the time a re-prepare runs the handshake is over: the shim has
+  committed one generation, one resume cursor, and one exact extension set, and
+  the adoption ADR's D15.3 says no carrier commit occurs before `Adopted` echoes
+  the prepared value. No `Adopted` frame will ever echo a *second* carrier
+  epoch, because the echo was already frozen against the first `Welcome` and
+  there is no second `Welcome` to send. But the same ADR's D10 matrix requires a
+  conforming authority to answer boundary drift by "reprepare at a strictly
+  greater carrier epoch", and says a later preparation "allocates a strictly
+  greater value" — so for a lineage whose committed adoption carries an epoch
+  there is no answer this path can accept.
+
+  Such a lineage is therefore **not re-prepared at all**. It goes straight to
+  quarantine with `ErrSessionShimCarrierEpochBoundDriftNeedsHandshake`, spending
+  no abandonment and minting no successor reservation for a refusal that is
+  already certain. Repairing that case needs a second handshake and is its own
+  change. The bind keeps its own extension check as defence in depth
+  (`ErrSessionShimRepreparedCarrierEpochSupersedes`, naming the differing
+  extension key and both values), because committing a superseding epoch would
+  publish an activation naming the epoch the authority was just told to abandon
+  — the "reactivating its incumbent" the retained-candidate abandonment
+  correction forbids.
 
   **A re-prepare supersedes a reservation that is admitted and pre-active, and
   this side has no verb to burn it.** Abandonment is control-authenticated and
@@ -75,7 +84,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   rather than assumed. `SessionShimAdoptionPreparation` carries `Cause` and
   `Attempt`: a re-ask arrives as `carrier_cursor_drift`, which is the daemon
   declaring that an earlier reservation for the lineage is outstanding and
-  stale. The authority disposes of it as **`preparing_reprepare`** — the
+  stale — and it is only ever sent for a lineage with no committed carrier epoch,
+  per the scope above. The authority disposes of it as **`preparing_reprepare`** — the
   adoption ADR's one abandonment cause whose source is a `preparing` handoff and
   which may keep or change the controller; that ADR states the obligation
   directly, that an admitted `preparing` handoff has no retained Snapshot replay
