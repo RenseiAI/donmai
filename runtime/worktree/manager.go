@@ -675,6 +675,8 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		if err != nil {
 			return "", fmt.Errorf("runtime/worktree: resolve ParentRepoPath: %w", err)
 		}
+		parentRepoPath = canonicalParentPath(parentRepoPath)
+		spec.ParentRepoPath = parentRepoPath
 	}
 	leaf := spec.LeafName
 	if leaf == "" {
@@ -741,6 +743,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			if baseInfo.Fetched {
 				out, headErr := m.runGit(ctx, "", "-C", res.Path, "rev-parse", "HEAD")
 				if headErr != nil {
+					_ = m.teardownResult(ctx, *res)
 					return "", fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, baseInfo.Ref, headErr, strings.TrimSpace(string(out)))
 				}
 				res.BaseSHA = strings.TrimSpace(string(out))
@@ -1624,6 +1627,8 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	if spec.SkipBaseFetch {
 		return baseFetchInfo{}, nil
 	}
+	worktreeUnlock := acquireParentWorktreeLock(parent)
+	defer worktreeUnlock()
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
 	started := time.Now()
@@ -1664,7 +1669,9 @@ func normalizeBaseRef(ref string) (string, error) {
 		return "", fmt.Errorf("%w: %w %q: ref must not start with a dash", ErrBaseFetch, ErrInvalidBaseRef, ref)
 	}
 	ref = strings.TrimPrefix(ref, "origin/")
+	ref = strings.TrimPrefix(ref, "refs/remotes/origin/")
 	ref = strings.TrimPrefix(ref, "refs/heads/")
+	ref = strings.TrimPrefix(ref, "refs/tags/")
 	if ref == "" || strings.HasPrefix(ref, "-") {
 		return "", fmt.Errorf("%w: %w", ErrBaseFetch, ErrInvalidBaseRef)
 	}

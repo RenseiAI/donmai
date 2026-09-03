@@ -551,7 +551,11 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	want := []string{"-C", parent, "worktree", "add", "--no-track", "-B", "main"}
+	resolvedParent, err := filepath.EvalSymlinks(parent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := []string{"-C", resolvedParent, "worktree", "add", "--no-track", "-B", "main"}
 	for i := range want {
 		if captured[i] != want[i] {
 			t.Fatalf("git args mismatch:\n got: %v\nwant prefix: %v", captured, want)
