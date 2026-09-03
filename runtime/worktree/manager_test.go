@@ -7,6 +7,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -550,7 +551,7 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	want := []string{"-C", parent, "worktree", "add", "-B", "main"}
+	want := []string{"-C", parent, "worktree", "add", "--no-track", "-B", "main"}
 	for i := range want {
 		if captured[i] != want[i] {
 			t.Fatalf("git args mismatch:\n got: %v\nwant prefix: %v", captured, want)
@@ -597,6 +598,42 @@ func TestProvisionWorktreeRefreshesBaseAndRecordsReceipt(t *testing.T) {
 	}
 	if result.BaseFetchDuration > time.Second {
 		t.Fatalf("base fetch duration = %s, want a bounded test duration", result.BaseFetchDuration)
+	}
+}
+
+func TestProvisionWorktreeBaseRefPinsDetachedStartPoint(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var worktreeArgs []string
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch args[2] {
+		case "worktree":
+			worktreeArgs = append([]string(nil), args...)
+			if err := os.MkdirAll(args[len(args)-2], 0o750); err != nil {
+				return nil, err
+			}
+		case "rev-parse":
+			return []byte("base-tip\n"), nil
+		}
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "base-ref-only", Strategy: worktree.StrategyWorktreeAdd,
+		ParentRepoPath: parent, BaseRef: "origin/main",
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if slices.Contains(worktreeArgs, "-B") {
+		t.Fatalf("worktree args unexpectedly create a branch: %v", worktreeArgs)
+	}
+	if got := worktreeArgs[len(worktreeArgs)-1]; got != "origin/main" {
+		t.Fatalf("worktree base = %q, want origin/main: %v", got, worktreeArgs)
 	}
 }
 

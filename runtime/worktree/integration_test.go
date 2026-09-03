@@ -12,8 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-// requireGit skips the test when no git binary is on PATH. The build
-// tag keeps this file out of CI by default; opt-in via -tags=runtime_integration.
+// requireGit skips the test when no git binary is on PATH.
 func requireGit(t *testing.T) {
 	t.Helper()
 	if _, err := exec.LookPath("git"); err != nil {
@@ -28,6 +27,7 @@ func initBareRepo(t *testing.T) string {
 	work := t.TempDir()
 	bare := t.TempDir()
 	run := func(args ...string) {
+		//nolint:gosec // test fixture uses the git binary selected by PATH.
 		cmd := exec.Command("git", args...)
 		cmd.Dir = work
 		out, err := cmd.CombinedOutput()
@@ -38,12 +38,13 @@ func initBareRepo(t *testing.T) string {
 	run("init", "-b", "main")
 	run("config", "user.email", "test@example.com")
 	run("config", "user.name", "test")
-	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hi"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(work, "README.md"), []byte("hi"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run("add", "README.md")
 	run("commit", "-m", "init")
 
+	//nolint:gosec // test fixture uses the git binary selected by PATH.
 	cmd := exec.Command("git", "clone", "--bare", work, bare)
 	if out, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("clone --bare: %v\n%s", err, out)
@@ -88,16 +89,19 @@ func TestIntegrationWorktreeBaseRefreshesBetweenLaunches(t *testing.T) {
 
 	bare := initBareRepo(t)
 	parent := filepath.Join(t.TempDir(), "parent")
+	//nolint:gosec // test fixture uses the git binary selected by PATH.
 	clone := exec.Command("git", "clone", "--branch", "main", bare, parent)
 	if out, err := clone.CombinedOutput(); err != nil {
 		t.Fatalf("clone parent: %v\n%s", err, out)
 	}
 	advance := t.TempDir()
+	//nolint:gosec // test fixture uses the git binary selected by PATH.
 	clone = exec.Command("git", "clone", "--branch", "main", bare, advance)
 	if out, err := clone.CombinedOutput(); err != nil {
 		t.Fatalf("clone advance: %v\n%s", err, out)
 	}
 	run := func(dir string, args ...string) string {
+		//nolint:gosec // test fixture uses the git binary selected by PATH.
 		cmd := exec.Command("git", args...)
 		cmd.Dir = dir
 		out, err := cmd.CombinedOutput()
@@ -106,30 +110,38 @@ func TestIntegrationWorktreeBaseRefreshesBetweenLaunches(t *testing.T) {
 		}
 		return string(out)
 	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	firstPath, err := m.Provision(ctx, worktree.ProvisionSpec{
+		SessionID: "first", Branch: "session-first", Strategy: worktree.StrategyWorktreeAdd,
+		ParentRepoPath: parent, BaseRef: "refs/heads/main",
+	})
+	if err != nil {
+		t.Fatalf("first Provision: %v", err)
+	}
+	firstTip := strings.TrimSpace(run(firstPath, "rev-parse", "HEAD"))
+	firstResult, err := m.Result("first")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstResult.BaseSHA != firstTip {
+		t.Fatalf("first base receipt SHA = %s, worktree HEAD = %s", firstResult.BaseSHA, firstTip)
+	}
+	if err := m.Teardown(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
 	run(advance, "config", "user.email", "test@example.com")
 	run(advance, "config", "user.name", "test")
-	if err := os.WriteFile(filepath.Join(advance, "new.txt"), []byte("new"), 0o644); err != nil {
+	if err := os.WriteFile(filepath.Join(advance, "new.txt"), []byte("new"), 0o600); err != nil {
 		t.Fatal(err)
 	}
 	run(advance, "add", "new.txt")
 	run(advance, "commit", "-m", "advance")
 	newTip := strings.TrimSpace(run(advance, "rev-parse", "HEAD"))
 	run(advance, "push", "origin", "main")
-
-	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), RetryDelay: time.Millisecond})
-	if err != nil {
-		t.Fatal(err)
-	}
-	ctx := context.Background()
-	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
-		SessionID: "first", Branch: "session-first", Strategy: worktree.StrategyWorktreeAdd,
-		ParentRepoPath: parent, BaseRef: "refs/heads/main",
-	}); err != nil {
-		t.Fatalf("first Provision: %v", err)
-	}
-	if err := m.Teardown(ctx, "first"); err != nil {
-		t.Fatal(err)
-	}
 	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
 		SessionID: "second", Branch: "session-second", Strategy: worktree.StrategyWorktreeAdd,
 		ParentRepoPath: parent, BaseRef: "origin/main",

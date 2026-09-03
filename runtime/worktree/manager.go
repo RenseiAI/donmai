@@ -1737,6 +1737,7 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			return errors.New("ParentRepoPath required for StrategyWorktreeAdd")
 		}
 		args := []string{"-C", parent, "worktree", "add"}
+		args = append(args, "--no-track")
 		if spec.Branch != "" {
 			args = append(args, "-B", spec.Branch)
 		}

@@ -49,7 +49,7 @@ the flat singular path and never receive a declaration.
 - `manager_test.go` — unit tests with stub `CommandRunner` (no real git). Covers happy path, retry-then-succeed, lost-ownership, non-retriable, exhausted retries, ctx-cancel, both strategies.
 - `nested_layout_test.go` — declaration selection, concurrent root isolation,
   root-bound cleanup and leases, retained-flat coexistence, and generation identity.
-- `integration_test.go` (build tag `runtime_integration`) — bare-repo fixture exercises real `git clone` against a temp repo.
+- `integration_test.go` — bare-repo fixture exercises real Git clone and worktree refreshes against a temp repo.
 
 ## Failure modes
 
