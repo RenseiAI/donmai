@@ -132,6 +132,11 @@ type ControllerOptions struct {
 	// receipt only that reader can deliver severs the carrier through the very
 	// knob meant to tune the back-pressure.
 	EventBacklogStallDeadline time.Duration
+	// DurableAckAmbiguityBound overrides durableAckAmbiguityBound for this
+	// controller: the absolute time a stalled reader is held open while a
+	// durable acknowledgement this controller sent is still outstanding. Zero
+	// uses the default.
+	DurableAckAmbiguityBound time.Duration
 
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
 	DialTimeout time.Duration
@@ -176,6 +181,13 @@ func (o ControllerOptions) eventBacklogStallDeadline() time.Duration {
 		return o.EventBacklogStallDeadline
 	}
 	return eventBacklogStallDeadline
+}
+
+func (o ControllerOptions) durableAckAmbiguityBound() time.Duration {
+	if o.DurableAckAmbiguityBound > 0 {
+		return o.DurableAckAmbiguityBound
+	}
+	return durableAckAmbiguityBound
 }
 
 func (o ControllerOptions) logger() *slog.Logger {
@@ -223,6 +235,12 @@ type Controller struct {
 	closing chan struct{}
 	exitMu  sync.RWMutex
 	exit    *shimwire.ExitMsg
+
+	// streamEnd is the fail-closed decision this controller made about its own
+	// stream, or nil when the ending came from the peer or a caller. See
+	// StreamEndCause.
+	streamEndMu sync.Mutex
+	streamEnd   error
 
 	snapshotMu     sync.Mutex
 	nextSnapshotID uint64
@@ -355,6 +373,43 @@ const EventBacklogBudget = ptyhost.DefaultRingBytes
 // consumer actually STOPS making progress stays <= 1x the deadline.
 const eventBacklogStallDeadline = 30 * time.Second
 
+// durableAckAmbiguityBound is how long a stalled reader is held open while a
+// durable acknowledgement THIS controller sent is still outstanding.
+//
+// # THE STRAND THIS UNDOES
+//
+// Measured on a consumer daemon: a healthy interactive session whose control
+// plane was answering every request 200 but answering the DURABLE receipt
+// slowly. The reader parked in push behind a consumer waiting on that durable
+// side; parking the reader is what makes the receipt undeliverable, so the
+// cursor acknowledger logged "the durable acknowledgement is still pending;
+// keeping the shim connection and retrying" every 5s — for exactly one
+// eventBacklogStallDeadline. At 30s the reader failed closed, the daemon read
+// the ending as the shim's own, quarantined the lineage `socket_unreachable`
+// with no re-adoption, and the control plane terminalized it 95s later. The
+// socket was reachable throughout.
+//
+// The stall deadline exists to catch a consumer that has genuinely STOPPED. An
+// outstanding durable acknowledgement is positive evidence of the opposite: the
+// consumer is right there, blocked on the durable side, and ADR-2026-08-30 D2
+// puts "a transport-level acknowledgement without the durable post-condition"
+// on the closed list of evidence that is always AMBIGUOUS — "preserve; recheck
+// and retry; then degrade visibly", never a terminal verdict. So while that
+// acknowledgement is outstanding the stall clock is held rather than allowed to
+// fail closed, and the memory bound is unaffected: the queue stays at one
+// budget, which is the number the budget already promised.
+//
+// It is not unbounded, because "held forever" is its own way to strand a
+// lineage. The corpus names no duration for this case (its two bounded-retry
+// mechanisms — the shim's orphan deadline and the re-adoption window — are both
+// keyed to the controller STREAM being lost, which is the opposite of this
+// fact pattern), so this takes the longest bound the corpus does name for a
+// daemon that is visibly still here: the ten-minute lineage-live re-adoption
+// window of the 2026-09-03 amendment. Crossing it is still not loss — it
+// degrades visibly, through ErrDurableAckAmbiguityBound and a quarantine reason
+// that says what actually happened.
+const durableAckAmbiguityBound = 10 * time.Minute
+
 // eventBacklogStallFloor is the shortest stall deadline this package will honour,
 // however short an embedder asks for.
 //
@@ -473,7 +528,10 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	_ = conn.SetDeadline(time.Time{})
 
 	if c.selected >= shimwire.V3 {
-		c.backlog = newEventBacklog(opts.eventBacklogBudget(), opts.eventBacklogStallDeadline(), c.closing)
+		c.backlog = newEventBacklog(
+			opts.eventBacklogBudget(), opts.eventBacklogStallDeadline(), c.closing,
+			c.durableAckOutstanding, opts.durableAckAmbiguityBound(),
+		)
 		go c.dispatchEvents()
 	}
 	go c.readLoop()
@@ -919,6 +977,18 @@ func (c *Controller) consumePendingHeartbeatReceiptLocked(receipt shimwire.Heart
 	return false
 }
 
+// durableAckOutstanding reports whether a durable heartbeat this controller
+// sent has not been answered: either a call is in flight right now, or one gave
+// up on its wait bound and is being retried while its receipt may still land.
+//
+// It is the "the consumer is waiting, not gone" predicate the backlog stall
+// consults — see durableAckAmbiguityBound.
+func (c *Controller) durableAckOutstanding() bool {
+	c.heartbeatMu.Lock()
+	defer c.heartbeatMu.Unlock()
+	return c.heartbeatCall != nil || len(c.pendingReceipts) > 0
+}
+
 func (c *Controller) clearHeartbeatCall(call *heartbeatCall) {
 	c.heartbeatMu.Lock()
 	if c.heartbeatCall == call {
@@ -1036,10 +1106,39 @@ func (c *Controller) log() *slog.Logger {
 // durable heartbeat all come back with "use of closed network connection" and
 // nothing anywhere names the decision that caused it.
 func (c *Controller) closeStream(reason string, cause error) {
+	c.noteStreamEndCause(cause)
 	c.log().Warn("sessionshim: controller dropped its shim connection",
 		"session", c.id.String(), "reason", reason,
 		"selected", c.selected, "error", cause)
 	_ = c.Close()
+}
+
+// noteStreamEndCause records the FIRST fail-closed decision this controller
+// made about its own stream.
+func (c *Controller) noteStreamEndCause(cause error) {
+	if cause == nil {
+		return
+	}
+	c.streamEndMu.Lock()
+	if c.streamEnd == nil {
+		c.streamEnd = cause
+	}
+	c.streamEndMu.Unlock()
+}
+
+// StreamEndCause reports the fail-closed decision THIS controller made to drop
+// its own shim connection, or nil when the stream ended any other way — the
+// peer closed it, the socket went away, or a caller called Close.
+//
+// A consumer that cannot tell those apart has to guess, and the guess it made
+// was the expensive one: it read its own back-pressure hanging up on a
+// perfectly reachable socket as the socket being unreachable, and published
+// that as the lineage's recovery-obligation reason. Nil here means "the ending
+// was not mine"; non-nil names whose decision it was and why.
+func (c *Controller) StreamEndCause() error {
+	c.streamEndMu.Lock()
+	defer c.streamEndMu.Unlock()
+	return c.streamEnd
 }
 
 // Close drops the controller connection WITHOUT stopping the session. This is
@@ -1341,6 +1440,18 @@ func (c *Controller) dispatchEvents() {
 // gets back-pressure; only a consumer that has stopped gets this.
 var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
 
+// ErrDurableAckAmbiguityBound reports the OTHER way a stalled reader gives up:
+// the consumer was provably still there — a durable acknowledgement this
+// controller sent was outstanding the whole time — and the durable side never
+// answered for durableAckAmbiguityBound.
+//
+// It is a separate sentinel from ErrEventBacklogExceeded because the two say
+// opposite things about the peer, and one caller downstream has to tell them
+// apart: an exhausted ambiguity bound is a statement about the DURABLE side's
+// latency with a reachable socket, and reporting it as a socket that could not
+// be reached is the false terminal evidence this sentinel exists to prevent.
+var ErrDurableAckAmbiguityBound = errors.New("sessionshim: durable acknowledgements stayed outstanding past the ambiguity bound")
+
 // ErrShimExited reports that a shim refused a request because it has already
 // published its terminal proof.
 //
@@ -1389,10 +1500,23 @@ type eventBacklog struct {
 	// as progress; see eventBacklogProgressBytes.
 	drainedSinceStall int
 
-	// budget, stall and abort are immutable after construction; push reads them
-	// without the lock.
+	// ambiguousSince is when the stall clock was FIRST held open for an
+	// outstanding durable acknowledgement. It anchors durableAckAmbiguityBound
+	// absolutely: re-anchoring stalledSince must not also re-anchor the bound,
+	// or a durable side that answers nothing at all would hold the reader
+	// forever.
+	ambiguousSince time.Time
+
+	// budget, stall, ambiguityBound, ambiguous and abort are immutable after
+	// construction; push reads them without the lock.
 	budget int
 	stall  time.Duration
+	// ambiguous reports whether a durable acknowledgement this controller sent
+	// is still outstanding — the one condition under which a stalled consumer
+	// is provably present rather than gone. Nil means "never ambiguous", which
+	// is the pre-v3 behaviour: those controllers send no durable heartbeat.
+	ambiguous      func() bool
+	ambiguityBound time.Duration
 	// abort unblocks a stalled push when the controller is being closed. Without
 	// it, Close would wait on a read loop parked behind a queue that only the
 	// read loop's own unwinding will ever release.
@@ -1407,20 +1531,65 @@ type eventBacklog struct {
 	drained chan struct{}
 }
 
-func newEventBacklog(budget int, stall time.Duration, abort <-chan struct{}) *eventBacklog {
+func newEventBacklog(
+	budget int,
+	stall time.Duration,
+	abort <-chan struct{},
+	ambiguous func() bool,
+	ambiguityBound time.Duration,
+) *eventBacklog {
 	if budget <= 0 {
 		budget = EventBacklogBudget
+	}
+	if ambiguityBound <= 0 {
+		ambiguityBound = durableAckAmbiguityBound
 	}
 	return &eventBacklog{
 		budget: budget,
 		// Clamped HERE rather than at the option seam, because this is the one
 		// place every controller passes through: an embedder cannot reach a
 		// deadline below eventBacklogStallFloor by any route.
-		stall:   clampEventBacklogStall(stall),
-		abort:   abort,
-		arrived: make(chan struct{}),
-		drained: make(chan struct{}),
+		stall:          clampEventBacklogStall(stall),
+		abort:          abort,
+		ambiguous:      ambiguous,
+		ambiguityBound: ambiguityBound,
+		arrived:        make(chan struct{}),
+		drained:        make(chan struct{}),
 	}
+}
+
+// holdForDurableAckAmbiguity reports whether a stall deadline that has just
+// elapsed must be held open instead of failing closed, and re-anchors the stall
+// clock when it must.
+//
+// The question it answers is "is this consumer gone, or is it waiting?" — and
+// an outstanding durable acknowledgement answers it. See
+// durableAckAmbiguityBound for the measured incident and the contract clause.
+func (b *eventBacklog) holdForDurableAckAmbiguity(now time.Time) bool {
+	if b.ambiguous == nil || !b.ambiguous() {
+		return false
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ambiguousSince.IsZero() {
+		b.ambiguousSince = now
+	}
+	if now.Sub(b.ambiguousSince) >= b.ambiguityBound {
+		return false
+	}
+	b.stalledSince, b.drainedSinceStall = now, 0
+	return true
+}
+
+// ambiguityHeldFor reports how long the stall clock has been held open for an
+// outstanding durable acknowledgement, and whether it was held at all.
+func (b *eventBacklog) ambiguityHeldFor(now time.Time) (time.Duration, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.ambiguousSince.IsZero() {
+		return 0, false
+	}
+	return now.Sub(b.ambiguousSince), true
 }
 
 // eventBacklogProgressBytes is how much the consumer must take before the stall
@@ -1499,6 +1668,13 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		room := b.drained
 		b.mu.Unlock()
 		if remaining <= 0 {
+			if b.holdForDurableAckAmbiguity(time.Now()) {
+				continue
+			}
+			if held, ambiguous := b.ambiguityHeldFor(time.Now()); ambiguous {
+				return fmt.Errorf("%w after %s: the consumer took %d bytes, short of the %d it owed",
+					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond), drained, b.progressBytes())
+			}
 			return fmt.Errorf("%w of %d bytes: the consumer took %d bytes in %s, short of the %d it owed",
 				ErrEventBacklogExceeded, b.budget, drained,
 				time.Since(stalled).Round(time.Millisecond), b.progressBytes())
@@ -1519,6 +1695,13 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		case <-b.abort:
 			return io.EOF
 		case <-timer.C:
+			if b.holdForDurableAckAmbiguity(time.Now()) {
+				continue
+			}
+			if held, ambiguous := b.ambiguityHeldFor(time.Now()); ambiguous {
+				return fmt.Errorf("%w after %s: the consumer made no budget's worth of progress",
+					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond))
+			}
 			return fmt.Errorf("%w of %d bytes: the consumer made no budget's worth of progress in %s",
 				ErrEventBacklogExceeded, b.budget, b.stall)
 		}
@@ -1541,7 +1724,13 @@ func (b *eventBacklog) pop() (ControllerEvent, bool) {
 				// is the dribble this bound exists to catch.
 				b.drainedSinceStall += eventBacklogCost(event)
 				if len(b.queue) == 0 || b.drainedSinceStall >= b.progressBytes() {
+					// The ambiguity anchor clears with the stall it belongs to.
+					// A consumer that made a budget's worth of progress is not
+					// the one the bound was ever measuring, and carrying the
+					// anchor into an unrelated later stall would spend a bound
+					// that had already been answered.
 					b.stalledSince, b.drainedSinceStall = time.Time{}, 0
+					b.ambiguousSince = time.Time{}
 				}
 			}
 			releaseLatch(&b.drained)

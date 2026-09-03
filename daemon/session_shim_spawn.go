@@ -2029,7 +2029,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		// rather than left published against a socket nobody can write to, or
 		// (after a carrier loss) re-established through a fresh adoption.
 		if gate.await() {
-			d.releaseShimIfLive(id, ctrl, cause)
+			d.releaseShimIfLive(id, ctrl, classifyShimStreamEnd(cause, ctrl.StreamEndCause()))
 		}
 	}()
 }
@@ -2045,7 +2045,39 @@ const (
 	// durable carrier refused an append or an acknowledgement. The shim and
 	// its harness are alive and untouched.
 	shimStreamCarrierLost
+	// shimStreamDurableAckAmbiguous: the controller's own back-pressure gave up
+	// while a durable acknowledgement it had sent was still outstanding. The
+	// socket was reachable throughout and the shim never went away — the
+	// durable side was simply too slow for too long. Like a carrier loss this
+	// re-adopts before it withdraws; unlike one, exhausting the bound does not
+	// get the dead-shim REASON, because nothing about this ending is a
+	// statement about the socket.
+	shimStreamDurableAckAmbiguous
 )
+
+// classifyShimStreamEnd refines why an adopted session's stream ended, using
+// the fail-closed decision the controller recorded about its own connection.
+//
+// A stream that ended because THIS daemon's reader hit its ambiguity bound is
+// not the shim ending the stream, and it never was: the socket was answering.
+// Recording it as an ordinary ending is what published `socket_unreachable` for
+// a live shim on a consumer daemon, and the control plane terminalized the
+// lineage 95 s later off that reason. ADR-2026-08-30 D2 classifies "a
+// transport-level acknowledgement without the durable post-condition" as
+// ambiguous, and ambiguous evidence may not emit a terminal outcome.
+//
+// Only the ambiguity sentinel is refined. A plain ErrEventBacklogExceeded is a
+// consumer that stopped with nothing outstanding to prove otherwise, and keeps
+// exactly the disposition it had.
+func classifyShimStreamEnd(cause shimStreamEndCause, endErr error) shimStreamEndCause {
+	if cause != shimStreamEnded {
+		return cause
+	}
+	if errors.Is(endErr, sessionshim.ErrDurableAckAmbiguityBound) {
+		return shimStreamDurableAckAmbiguous
+	}
+	return cause
+}
 
 // shimCursorAcknowledger persists one adopted session's durable forwarded
 // cursor OFF the event path.
@@ -2516,9 +2548,17 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// projection built meanwhile must keep saying so. Removing it first would
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
-	if cause != shimStreamCarrierLost {
-		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
+	if cause != shimStreamCarrierLost && cause != shimStreamDurableAckAmbiguous {
+		d.quarantineLostSessionShim(id, entry, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 		return
+	}
+	// An ending this daemon reached on an outstanding durable acknowledgement
+	// carries its own reason all the way through: every withdrawal below is
+	// `durable_ack_timeout`, because the socket was reachable for the whole of
+	// it and no projection of this lineage may say otherwise.
+	lostReason := sessionshim.QuarantineSocketUnreachable
+	if cause == shimStreamDurableAckAmbiguous {
+		lostReason = sessionshim.QuarantineDurableAckTimeout
 	}
 	// The carrier binding is gone from this instant. Recording it before the
 	// re-adoption runs is what lets an embedder see the state DURING the
@@ -2538,26 +2578,36 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// past that would leave an adopted entry whose keepalive has stopped,
 		// whose shim reaps within one orphan deadline, and whose tombstone the
 		// quarantine-only reconciler would never consume.
-		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionWindowExhaustedDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimReadoptionWindowExhaustedDetail)
 	case readoptionAttemptsSpent:
-		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionAttemptsSpentDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimReadoptionAttemptsSpentDetail)
 	default:
-		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
+		d.quarantineLostSessionShim(id, entry, lostReason, sessionShimControllerLostDetail)
 	}
 }
 
 // quarantineLostSessionShim withdraws authority from the lost controller and
-// projects the exact live shim as quarantined `socket_unreachable`, then
-// publishes. It is a no-op when the entry has already left by another route —
-// a shutdown release, or a replacement controller.
+// projects the exact live shim as quarantined under reason, then publishes. It
+// is a no-op when the entry has already left by another route — a shutdown
+// release, or a replacement controller.
 //
-// detail is what distinguishes the two ways a lineage reaches this path: the
-// ordinary controller loss, and a lineage-live re-adoption window that ended
-// with the shim still observable. The closed reason registry is the same for
-// both — this change does not extend it — so the detail is where the
-// amendment's "carrying a reason that distinguishes it from the dead-shim
-// outcome" lives.
-func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adoptedShim, detail string) {
+// detail distinguishes the ways a lineage reaches this path within one reason:
+// the ordinary controller loss, a lineage-live re-adoption window that ended
+// with the shim still observable, and a spent attempt budget.
+//
+// reason distinguishes the ones that are not the same FACT. `socket_unreachable`
+// is a claim about the socket, and a lineage whose socket answered throughout —
+// whose durable acknowledgements simply stayed outstanding past the ambiguity
+// bound — gets `durable_ack_timeout` instead. Both withdraw authority, neither
+// kills the shim, and neither is terminal: the reconciler still needs an
+// ordinary terminal receipt or a group-reaped tombstone before anything about
+// this lineage closes.
+func (d *Daemon) quarantineLostSessionShim(
+	id sessionshim.Identity,
+	entry adoptedShim,
+	reason sessionshim.QuarantineReason,
+	detail string,
+) {
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
@@ -2577,7 +2627,7 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 			ProtocolMax:       hello.Max,
 			Phase:             hello.Phase,
 			CreatedAtUnixNano: now.UnixNano(),
-		}, sessionshim.QuarantineSocketUnreachable, detail, now)
+		}, reason, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())
 		d.upsertShimQuarantineLocked(q)
 	}

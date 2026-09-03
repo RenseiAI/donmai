@@ -28,7 +28,7 @@ import (
 // semantics in bounded time, so they write the field directly, in-package,
 // where the intent is visible rather than smuggled through the public seam.
 func newTestBacklog(budget int, stall time.Duration, abort <-chan struct{}) *eventBacklog {
-	b := newEventBacklog(budget, 0, abort)
+	b := newEventBacklog(budget, 0, abort, nil, 0)
 	b.stall = stall
 	return b
 }
@@ -87,7 +87,7 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.dispatchEvents()
@@ -500,13 +500,13 @@ func TestEventBacklogStallDeadlineIsClampedToTheFloor(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := newEventBacklog(1024, tc.configured, nil).stall; got != tc.want {
+			if got := newEventBacklog(1024, tc.configured, nil, nil, 0).stall; got != tc.want {
 				t.Fatalf("newEventBacklog(stall=%s).stall = %s, want %s", tc.configured, got, tc.want)
 			}
 			// And through the public option seam an embedder actually uses, which
 			// is the route the clamp has to close.
 			opts := ControllerOptions{EventBacklogStallDeadline: tc.configured}
-			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil).stall; got != tc.want {
+			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil, nil, 0).stall; got != tc.want {
 				t.Fatalf("through ControllerOptions(stall=%s) = %s, want %s", tc.configured, got, tc.want)
 			}
 		})
@@ -595,7 +595,7 @@ func TestSelectedV3HeartbeatReceiptTimeoutKeepsTheController(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0, 0, nil),
+		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0, 0, nil, nil, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.readLoop()
@@ -682,7 +682,7 @@ func TestSelectedV3RejectsHeartbeatInterposedInsideLiveSnapshotPair(t *testing.T
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: map[uint64]*snapshotCall{77: call},
 	}
 	go controller.dispatchEvents()
