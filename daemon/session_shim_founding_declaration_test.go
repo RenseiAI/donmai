@@ -20,10 +20,7 @@ import (
 	"testing"
 )
 
-var (
-	errHostAuthorityUnknown = errors.New("host authority unknown: no primary receipt has been delivered")
-	errReadinessRefused     = errors.New("proof-v2 readiness refused")
-)
+var errHostAuthorityUnknown = errors.New("host authority unknown: no primary receipt has been delivered")
 
 // foundingEmbedder mirrors the real composer's shape: its readiness resolver
 // answers for the primary host and can only do so once AcquireRecoveryScopes
@@ -58,7 +55,11 @@ func (e *foundingEmbedder) readiness() (SessionShimCarrierProofV2Readiness, erro
 		return SessionShimCarrierProofV2Readiness{}, errHostAuthorityUnknown
 	}
 	if e.refuseReadiness.Load() {
-		return SessionShimCarrierProofV2Readiness{}, errReadinessRefused
+		// A DEFINITE refusal, expressed the only way the contract lets an
+		// embedder express one: an answer whose facts are not all true. An
+		// error out of the resolver means "could not be consulted", which is
+		// unknown and never withdraws an established readiness.
+		return SessionShimCarrierProofV2Readiness{}, nil
 	}
 	return testSessionShimProofV2Readiness()
 }
@@ -195,7 +196,7 @@ func TestPostInstallRefreshStillChecksReadinessBeforeAdoptingTheReceipt(t *testi
 
 	embedder.refuseReadiness.Store(true)
 	_, err := h.daemon.credentials.Refresh(ctx, "proactive-expiry")
-	if !errors.Is(err, errReadinessRefused) {
+	if !errors.Is(err, ErrSessionShimReadinessRejected) {
 		t.Fatalf("post-install refresh with readiness refused: err = %v, want the resolver's refusal", err)
 	}
 	if embedder.readinessCalls.Load() == callsBefore {
@@ -223,7 +224,7 @@ func TestFailedInstallAfterAnAcceptedDeclarationWithdrawsItExactlyOnce(t *testin
 		},
 		"readiness refused once the primary was delivered": {
 			configure: func(e *foundingEmbedder) { e.refuseReadiness.Store(true) },
-			want:      errReadinessRefused,
+			want:      ErrSessionShimReadinessRejected,
 		},
 	} {
 		t.Run(name, func(t *testing.T) {

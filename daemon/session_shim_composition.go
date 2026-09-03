@@ -305,7 +305,10 @@ func (d *Daemon) declareSessionShimComposition(ctx context.Context) (declared bo
 	// The primary receipt is retained and the embedder has been handed it. Only
 	// now can a readiness resolver that answers for the primary host answer at
 	// all. Not held under d.shims.mu: the resolver is embedder code.
-	if err := d.validateSessionShimCarrierProofV2Readiness(); err != nil {
+	// Resolved rather than read from the cache: this is the first moment the
+	// resolver can answer for this scope at all, so any earlier sample answered
+	// a question about a host authority that did not yet exist.
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
 		return true, fmt.Errorf("session shim: founding declaration readiness: %w", err)
 	}
 	slog.Info("session shim: founding declaration resolved host authority",
