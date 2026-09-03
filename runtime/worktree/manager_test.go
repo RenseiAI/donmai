@@ -551,15 +551,21 @@ func TestProvisionStrategyWorktreeAdd(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Provision: %v", err)
 	}
-	resolvedParent, err := filepath.EvalSymlinks(parent)
-	if err != nil {
-		t.Fatal(err)
-	}
-	want := []string{"-C", resolvedParent, "worktree", "add", "--no-track", "-B", "main"}
+	// git receives the caller's spelling made absolute; symlink resolution is a
+	// lock-key concern only (see TestParentLockKeyCanonical) and must not leak
+	// into the command vector or the receipt.
+	want := []string{"-C", parent, "worktree", "add", "--no-track", "-B", "main"}
 	for i := range want {
 		if captured[i] != want[i] {
 			t.Fatalf("git args mismatch:\n got: %v\nwant prefix: %v", captured, want)
 		}
+	}
+	result, err := m.Result("s1")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.ParentRepoPath != parent {
+		t.Fatalf("receipt ParentRepoPath = %q, want the caller's path %q", result.ParentRepoPath, parent)
 	}
 }
 
@@ -625,14 +631,21 @@ func TestProvisionRejectsUnsafeBaseRefs(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
+	// The skip rows are the discriminating ones. With SkipBaseFetch the fetch
+	// path is not taken at all, so the only thing that can reject the ref is the
+	// argv-site validation in provisionOnceWithReference; delete that and every
+	// skip row provisions an unsafe start-point instead of failing.
 	refs := []struct {
 		ref  string
 		skip bool
 	}{
 		{ref: "-upload-pack=x"},
+		{ref: "-upload-pack=x", skip: true},
 		{ref: "origin/-x", skip: true},
 		{ref: "origin/"},
+		{ref: "origin/", skip: true},
 		{ref: "refs/tags/v1"},
+		{ref: "refs/tags/v1", skip: true},
 	}
 	for i, test := range refs {
 		_, err = m.Provision(context.Background(), worktree.ProvisionSpec{

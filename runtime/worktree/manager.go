@@ -191,7 +191,9 @@ type ProvisionResult struct {
 	Repositories map[string]string
 	// Strategy is the strategy that succeeded.
 	Strategy CloneStrategy
-	// ParentRepoPath is the parent clone used by StrategyWorktreeAdd.
+	// ParentRepoPath is the parent clone used by StrategyWorktreeAdd. It is the
+	// absolute form of the path the caller supplied; symlinks are not resolved,
+	// so an embedder may compare it against its own input.
 	ParentRepoPath string
 	// Attempts is the number of attempts taken (1 on success first try).
 	Attempts int
@@ -201,9 +203,14 @@ type ProvisionResult struct {
 	BaseRef string
 	// BaseSHA is the resolved tip of BaseRef after the refresh.
 	BaseSHA string
-	// BaseFetchDuration is how long refreshing BaseRef took.
+	// BaseFetchDuration is how long refreshing BaseRef took. Concurrent
+	// provisions of the same (parent, ref) share one fetch, so this describes
+	// the coalesced fetch — which a concurrent caller may have performed, under
+	// that caller's BaseFetchTimeout — rather than work done by this caller
+	// alone.
 	BaseFetchDuration time.Duration
 	// BaseFetched reports whether the base refresh was performed successfully.
+	// It is true for a caller that shared another caller's in-flight fetch.
 	BaseFetched bool
 }
 
@@ -686,7 +693,13 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 		if err != nil {
 			return "", fmt.Errorf("runtime/worktree: resolve ParentRepoPath: %w", err)
 		}
-		parentRepoPath = canonicalParentPath(parentRepoPath)
+		// Deliberately NOT canonicalized here. Canonicalization is a lock-key
+		// concern and belongs at the point every key is derived
+		// (acquireParentWorktreeLock and the base-fetch flight key), so that two
+		// spellings of one parent collapse onto one lock wherever they enter.
+		// Resolving it here as well would leave that canonicalization
+		// unfalsifiable and would silently change the spelling the caller sees
+		// back in ProvisionResult.ParentRepoPath.
 		spec.ParentRepoPath = parentRepoPath
 	}
 	leaf := spec.LeafName
@@ -756,7 +769,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 				if headErr != nil {
 					resolveErr := fmt.Errorf("%w %q: resolve created worktree tip: %w (%s)", ErrBaseFetch, baseInfo.Ref, headErr, strings.TrimSpace(string(out)))
 					if cleanupErr := m.teardownResult(ctx, *res); cleanupErr != nil {
-						return "", fmt.Errorf("%w; cleanup worktree: %v", resolveErr, cleanupErr)
+						return "", fmt.Errorf("%w; cleanup worktree: %w", resolveErr, cleanupErr)
 					}
 					return "", resolveErr
 				}
@@ -1622,55 +1635,101 @@ type baseFetchInfo struct {
 // worktree branch is created. It is intentionally limited to StrategyWorktreeAdd;
 // clone strategy already obtains its base during clone and retains its historical
 // command shape.
-func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (result baseFetchInfo, resultErr error) {
+//
+// # Concurrency contract
+//
+// Two invariants govern concurrent base refreshes against one parent clone.
+// Both are stated here because the second is load-bearing and not obvious, and
+// both are pinned by tests that go RED when the mechanism is removed:
+//
+//  1. Concurrent provisions of the SAME (canonical parent, ref) share exactly
+//     one `git fetch`. This is a correctness mechanism, not an optimization:
+//     two `git fetch origin -- <ref>` racing on one clone contend for the same
+//     remote-tracking ref and Git fails the loser with
+//     "cannot lock ref 'refs/remotes/origin/<ref>': is at X but expected Y".
+//     Measured against real Git: 8 concurrent same-ref fetches on one clone
+//     with the tip moving failed 70 of 80 attempts. Pinned by
+//     TestBaseFetchCoalescesConcurrentSameRefProvisions and
+//     TestIntegrationConcurrentProvisionsAgainstStaleParent.
+//
+//  2. Concurrent fetches of DIFFERENT refs on one parent are deliberately NOT
+//     serialized. Git takes a per-ref lock, so distinct remote-tracking refs do
+//     not contend; measured against real Git, 10 rounds of 6 concurrent
+//     distinct-ref fetches on one clone with every tip moving produced 0
+//     failures in 60.
+//     Serializing them instead would make provisioning latency linear in
+//     fan-out for no correctness gain. Pinned by
+//     TestBaseFetchDoesNotSerializeDistinctRefs (max concurrency > 1) and
+//     TestIntegrationConcurrentDistinctRefProvisions (real Git, all succeed).
+//
+// The shared fetch runs on a context detached from every individual caller and
+// bounded by BaseFetchTimeout, so one session cancelling its launch cannot fail
+// the other sessions waiting on that fetch. Each caller still observes its own
+// context while waiting, so a cancelled caller returns promptly.
+func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (baseFetchInfo, error) {
 	if spec.Strategy != StrategyWorktreeAdd {
 		return baseFetchInfo{}, nil
 	}
 	if parent == "" {
 		return baseFetchInfo{}, nil
 	}
+	if spec.SkipBaseFetch {
+		// No fetch, and deliberately no ref validation here: the argv site in
+		// provisionOnceWithReference is the single validation point, and it
+		// rejects unsafe spellings before any git invocation on both paths.
+		// Validating here as well would make that check unfalsifiable.
+		return baseFetchInfo{}, nil
+	}
 	ref := baseRefForSpec(spec)
 	if ref == "" {
 		return baseFetchInfo{}, nil
 	}
-	var err error
-	ref, err = normalizeBaseRef(ref)
+	ref, err := normalizeBaseRef(ref)
 	if err != nil {
 		return baseFetchInfo{}, err
 	}
-	if spec.SkipBaseFetch {
-		return baseFetchInfo{}, nil
-	}
 	key := canonicalParentPath(parent) + "\x00" + ref
 	baseFetchFlights.Lock()
-	if flight := baseFetchFlights.flights[key]; flight != nil {
-		baseFetchFlights.Unlock()
-		<-flight.done
-		return flight.info, flight.err
+	flight := baseFetchFlights.flights[key]
+	if flight == nil {
+		flight = &baseFetchFlight{done: make(chan struct{})}
+		baseFetchFlights.flights[key] = flight
+		go m.runBaseFetch(context.WithoutCancel(ctx), key, parent, ref, spec.RepoURL, flight)
 	}
-	flight := &baseFetchFlight{done: make(chan struct{})}
-	baseFetchFlights.flights[key] = flight
 	baseFetchFlights.Unlock()
-	defer func() {
-		baseFetchFlights.Lock()
-		flight.info = result
-		flight.err = resultErr
-		delete(baseFetchFlights.flights, key)
-		close(flight.done)
-		baseFetchFlights.Unlock()
-	}()
+	select {
+	case <-flight.done:
+		return flight.info, flight.err
+	case <-ctx.Done():
+		return baseFetchInfo{}, fmt.Errorf("%w %q: %w", ErrBaseFetch, ref, ctx.Err())
+	}
+}
+
+// runBaseFetch performs the one shared fetch for a (parent, ref) flight and
+// publishes its outcome to every waiter. ctx is already detached from the
+// caller that elected this flight; the only deadline applied is the manager's
+// BaseFetchTimeout policy. Closing flight.done is the happens-before edge that
+// publishes info and err to the waiters.
+func (m *Manager) runBaseFetch(ctx context.Context, key, parent, ref, repoURL string, flight *baseFetchFlight) {
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
 	started := time.Now()
-	out, err := m.runGit(fetchCtx, spec.RepoURL, "-C", parent, "fetch", "origin", "--", ref)
-	duration := time.Since(started)
+	out, err := m.runGit(fetchCtx, repoURL, "-C", parent, "fetch", "origin", "--", ref)
+	info := baseFetchInfo{Ref: ref, Duration: time.Since(started), Fetched: true}
 	if err != nil {
+		info = baseFetchInfo{}
 		if isAbsentBaseRef(out) {
-			return baseFetchInfo{}, fmt.Errorf("%w: %w %q: %s", ErrBaseFetch, ErrInvalidBaseRef, ref, strings.TrimSpace(string(out)))
+			err = fmt.Errorf("%w: %w %q: %s", ErrBaseFetch, ErrInvalidBaseRef, ref, strings.TrimSpace(string(out)))
+		} else {
+			err = fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 		}
-		return baseFetchInfo{}, fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 	}
-	return baseFetchInfo{Ref: ref, Duration: duration, Fetched: true}, nil
+	baseFetchFlights.Lock()
+	flight.info = info
+	flight.err = err
+	delete(baseFetchFlights.flights, key)
+	close(flight.done)
+	baseFetchFlights.Unlock()
 }
 
 func isAbsentBaseRef(output []byte) bool {

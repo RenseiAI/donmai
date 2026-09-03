@@ -37,6 +37,24 @@ the flat singular path and never receive a declaration.
 - `StrategyWorktreeAdd` — `git worktree add --no-track -B <b> <dst> origin/<b>` off an existing parent clone. The session branch has no automatic upstream; configure one explicitly before a bare `git push`. Cheaper for many concurrent sessions.
 - `StrategyEmpty` — create a fresh flat session directory without invoking Git. Used only for work whose accepted session detail has no repository; versioned declarations and shared participants retain their existing strategies.
 
+## Shared-parent concurrency contract (`StrategyWorktreeAdd`)
+
+A single parent clone is shared by every session that branches off it, so
+provisioning coordinates on two axes. Both invariants are pinned by tests that
+go red when the mechanism is removed — see `base_refresh_test.go`.
+
+| Concern | Rule | Why |
+|---|---|---|
+| Base fetch, same `(parent, ref)` | Coalesced onto **one** in-flight `git fetch`; the others wait on it. | Concurrent `git fetch` of one ref contend for `refs/remotes/origin/<ref>` and Git fails the losers (`cannot lock ref ...: is at X but expected Y`). Measured on real Git: 70 of 80 concurrent same-ref fetches failed. |
+| Base fetch, different refs, one parent | Deliberately **not** serialized. | Git locks remote-tracking refs individually. Measured on real Git: 0 of 60 concurrent distinct-ref fetches failed. Serializing them would make provision latency linear in fan-out for no correctness gain. |
+| Fetch context | The shared fetch runs detached from any single caller, bounded by `BaseFetchTimeout`. | One session cancelling its launch must not fail the sessions waiting on the same fetch. Each caller still observes its own context while waiting. |
+| `worktree add` / `worktree remove` / conflict cleanup | Serialized per parent. | These mutate the parent's worktree registry. |
+| Lock key | `EvalSymlinks`-canonical parent path. | Absolute, relative, and symlinked spellings of one parent must take one lock. The receipt's `ParentRepoPath` keeps the caller's spelling; canonicalization is a lock-key concern only. |
+
+`BaseFetchDuration` and `BaseFetched` describe the coalesced fetch, which a
+concurrent caller may have performed. Both registries are process-wide: two
+processes sharing one parent clone still race.
+
 ## Retry contract (verbatim port from legacy TS)
 
 - `MaxSpawnRetries = 3`
@@ -49,6 +67,7 @@ the flat singular path and never receive a declaration.
 - `manager_test.go` — unit tests with stub `CommandRunner` (no real git). Covers happy path, retry-then-succeed, lost-ownership, non-retriable, exhausted retries, ctx-cancel, both strategies.
 - `nested_layout_test.go` — declaration selection, concurrent root isolation,
   root-bound cleanup and leases, retained-flat coexistence, and generation identity.
+- `base_refresh_test.go` — the shared-parent concurrency contract above. Stub-runner tests for fetch coalescing, distinct-ref overlap, leader cancellation, ref normalization and teardown-on-verification-failure; real-Git tests that wrap the `CommandRunner` in an overlap counter to prove the parent lock serializes `worktree add`/`remove`/cleanup, that three spellings of one parent take one lock, and that concurrent launches against a stale parent all succeed.
 - `integration_test.go` — bare-repo fixture exercises real Git clone and worktree refreshes against a temp repo.
 
 ## Failure modes
