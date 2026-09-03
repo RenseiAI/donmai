@@ -193,14 +193,14 @@ type ProvisionResult struct {
 	ParentRepoPath string
 	// Attempts is the number of attempts taken (1 on success first try).
 	Attempts int
-	// BaseRef is the ref refreshed before creating a session branch.
+	// BaseRef is the ref refreshed before creating a session branch. These
+	// fields are populated only for StrategyWorktreeAdd.
 	BaseRef string
 	// BaseSHA is the resolved tip of BaseRef after the refresh.
 	BaseSHA string
 	// BaseFetchDuration is how long refreshing BaseRef took.
 	BaseFetchDuration time.Duration
 	// BaseFetched reports whether the base refresh was performed successfully.
-	// These fields apply only to StrategyWorktreeAdd.
 	BaseFetched bool
 }
 
@@ -1628,9 +1628,26 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	out, err := m.runGit(fetchCtx, spec.RepoURL, "-C", parent, "fetch", "origin", "--", ref)
 	duration := time.Since(started)
 	if err != nil {
+		if isAbsentBaseRef(out) {
+			return baseFetchInfo{}, fmt.Errorf("%w: %w %q: %s", ErrBaseFetch, ErrInvalidBaseRef, ref, strings.TrimSpace(string(out)))
+		}
 		return baseFetchInfo{}, fmt.Errorf("%w %q: %w (%s)", ErrBaseFetch, ref, err, strings.TrimSpace(string(out)))
 	}
 	return baseFetchInfo{Ref: ref, Duration: duration, Fetched: true}, nil
+}
+
+func isAbsentBaseRef(output []byte) bool {
+	msg := strings.ToLower(string(output))
+	for _, fragment := range []string{
+		"couldn't find remote ref",
+		"could not find remote ref",
+		"no such ref",
+	} {
+		if strings.Contains(msg, fragment) {
+			return true
+		}
+	}
+	return false
 }
 
 func baseRefForSpec(spec ProvisionSpec) string {

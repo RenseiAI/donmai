@@ -625,6 +625,77 @@ func TestProvisionFetchFailureDoesNotCreateBranch(t *testing.T) {
 	}
 }
 
+func TestProvisionAbsentBaseRefFailsWithoutRetry(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var fetchCalls atomic.Int64
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if args[2] == "fetch" {
+			fetchCalls.Add(1)
+			return []byte("fatal: couldn't find remote ref missing"), errors.New("fetch failed")
+		}
+		t.Fatal("worktree command ran after absent ref")
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "absent-ref", Branch: "missing", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+	})
+	if !errors.Is(err, worktree.ErrInvalidBaseRef) {
+		t.Fatalf("error = %v, want ErrInvalidBaseRef", err)
+	}
+	if got := fetchCalls.Load(); got != 1 {
+		t.Fatalf("fetch calls = %d, want 1", got)
+	}
+}
+
+func TestProvisionFetchRetryProbesOwnership(t *testing.T) {
+	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
+	if err := os.MkdirAll(parent, 0o750); err != nil {
+		t.Fatal(err)
+	}
+	var fetchCalls, probeCalls atomic.Int64
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		switch args[2] {
+		case "fetch":
+			if fetchCalls.Add(1) == 1 {
+				return []byte("network unavailable"), errors.New("fetch failed")
+			}
+		case "worktree":
+			_ = os.MkdirAll(args[len(args)-2], 0o750)
+		case "rev-parse":
+			return []byte("abc123\n"), nil
+		}
+		return nil, nil
+	}
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond,
+		OwnershipProber: func(context.Context, string) (bool, error) {
+			probeCalls.Add(1)
+			return true, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "fetch-retry", Branch: "main", Strategy: worktree.StrategyWorktreeAdd, ParentRepoPath: parent,
+	}); err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := fetchCalls.Load(); got != 2 {
+		t.Fatalf("fetch calls = %d, want 2", got)
+	}
+	if got := probeCalls.Load(); got != 1 {
+		t.Fatalf("ownership probes = %d, want 1", got)
+	}
+}
+
 func TestProvisionSkipBaseFetchPreservesOfflineBehaviour(t *testing.T) {
 	dir, parent := t.TempDir(), filepath.Join(t.TempDir(), "parent")
 	if err := os.MkdirAll(parent, 0o750); err != nil {
@@ -649,6 +720,13 @@ func TestProvisionSkipBaseFetchPreservesOfflineBehaviour(t *testing.T) {
 	}
 	if calls != 1 {
 		t.Fatalf("git calls = %d, want only worktree add with fetch skipped", calls)
+	}
+	result, err := m.Result("offline")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaseFetched || result.BaseFetchDuration != 0 {
+		t.Fatalf("skipped base receipt = %#v, want not fetched with zero duration", result)
 	}
 }
 
