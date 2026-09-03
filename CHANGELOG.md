@@ -37,6 +37,32 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   deliberately not terminal: it withdraws controller authority, does not kill
   the shim, and keeps the lineage visible and capacity-charged until an ordinary
   terminal receipt or a group-reaped tombstone reconciles it.
+- A fresh v2 carrier dial now accepts a signed carrier boundary that is ahead of
+  the caller's local durable acknowledgement floor. The two cursors are
+  independent by contract — the external carrier owns the durable journal high
+  water, the local sidecar owns an fsync-backed acknowledgement floor, and the
+  carrier is legitimately ahead by every frame it journaled but had not yet
+  acknowledged back. An abrupt exit of a composing daemon freezes that window
+  permanently, and the old equality precondition then refused the carrier's own
+  successfully admitted reservation. Only the reverse skew still refuses, now
+  with a typed `attachclient.V2CarrierCursorDriftError` naming both cursors, and
+  a fresh leg is seeded from the signed boundary that every pre-active
+  contiguity assertion is already phrased against.
+- The startup adoption pass no longer quarantines a lineage on the first
+  ambiguous refusal. A durable-adoption refusal classified as carrier cursor
+  drift now gets a bounded re-prepared re-dial — three attempts with a doubling
+  backoff, a fresh carrier proof each time — before any quarantine. A lineage
+  whose proof still does not reconcile is quarantined as before, with the reason
+  unchanged and the detail carrying both cursors and the number of dials spent.
+- Adoption no longer reports a stalled shim as an unreachable socket. The
+  classifier's predicate asked only whether an error had a `Timeout` method —
+  which every `net.OpError` and `os.PathError` has — and never called it, so any
+  error the network stack produced became `socket_unreachable`, including a
+  write timeout on an already-established socket to a process that had just been
+  proved alive. `socket_unreachable` is now reserved for the endpoint answering
+  (connect refused, or the socket gone); a timeout or a mid-handshake hang-up is
+  treated as transient and the dial is retried, bounded, before the record is
+  classified at all.
 
 ---
 

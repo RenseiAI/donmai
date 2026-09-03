@@ -10,12 +10,12 @@ package daemon
 // each one's durable-adoption callback (OnAdoption/OnAdoptionV2) to accept
 // it. Pre-fix, ONE lineage's callback returning an error aborted the ENTIRE
 // composition (result.Close(); return err) — fail-closed for the whole host,
-// not just the one lineage that failed. Measured live: one lineage failed
-// with an attachclient v2 durable-high-water/carrier-boundary mismatch (its
-// OWN retained state disagreeing with what it now proved), and the
-// consequence was that durable sessions came up OFF for the whole host and
-// every OTHER adoptable lineage was orphaned — three live sessions lost their
-// durable ownership because one unrelated lineage had a stale boundary.
+// not just the one lineage that failed. Measured live: one lineage's own
+// durable-adoption callback refused it — its OWN retained state disagreeing
+// with what it now proved — and the consequence was that durable sessions came
+// up OFF for the whole host and every OTHER adoptable lineage was orphaned:
+// three live sessions lost their durable ownership because one unrelated
+// lineage carried a stale boundary.
 //
 // This test pins the fix: a failing lineage's own durable-adoption refusal
 // quarantines THAT lineage (typed reason, operator-facing detail, presented —
@@ -68,10 +68,15 @@ func TestStartupCompositionQuarantinesOneFailedLineageAndComposesTheRest(t *test
 			OrgID:          orgID,
 			OnAdoption: func(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 				if evidence.Identity.SessionID == bad.SessionID {
-					// The measured live failure shape: a per-lineage durable
-					// resume-state mismatch, not a host-identity problem.
+					// A per-lineage durable refusal, not a host-identity problem.
+					// Deliberately NOT the carrier-cursor-drift shape: drift is
+					// ambiguous evidence with its own bounded re-prepare path
+					// (see session_shim_adoption_redial_test.go). What this test
+					// pins is the partial-composition guarantee for a refusal
+					// that IS dispositive on the first answer.
 					return SessionShimAdoptionReceipt{}, errors.New(
-						"attachclient: v2 durable high-water does not match signed carrier boundary")
+						"the control plane refused this lineage's durable adoption",
+					)
 				}
 				return SessionShimAdoptionReceipt{DurableCorrelation: []byte("good-lineage-committed")}, nil
 			},

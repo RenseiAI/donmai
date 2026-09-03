@@ -29,9 +29,17 @@ type V2HostConfig struct {
 	ReadLimit   int64
 	Now         func() time.Time
 
-	// DurableHighWater is the carrier journal cursor loaded before this leg is
-	// admitted. It seeds gap validation and ordinary contiguous sends; zero is
-	// the safe over-replay default.
+	// DurableHighWater is the caller's LOCAL durable acknowledgement floor,
+	// loaded before this leg is admitted. On a fresh candidate it is a floor for
+	// regression detection only — never the leg's seed. The signed carrier
+	// boundary is the authority for where a fresh leg starts, because the
+	// external carrier alone owns the durable journal high water and is
+	// legitimately ahead of a local sidecar by the whole un-acknowledged window.
+	// Only the reverse skew (this value ABOVE the signed boundary) refuses, with
+	// V2CarrierCursorDriftError. Zero is the safe over-replay default.
+	//
+	// On a resume it still seeds the leg: a resume disposition carries its own
+	// exact cursor, which withDefaults requires this field to equal.
 	DurableHighWater uint64
 
 	// ResumeDisposition is explicit caller-retained evidence for reconnecting the
@@ -349,9 +357,20 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 	}
 	conn.SetReadLimit(cfg.ReadLimit)
 	legCtx, cancel := context.WithCancel(context.Background())
+	// A fresh leg is seeded from the SIGNED carrier boundary, not from the local
+	// acknowledgement floor. Every pre-active contiguity assertion below is
+	// phrased against claims.CarrierBoundary — the mandatory Snapshot must sit at
+	// ResolvedBoundary+1, and a proof-bound controller_unforwarded gap must begin
+	// at CarrierBoundary+1 — so seeding from anything else silently re-imposed
+	// the equality this dial no longer requires. A resume keeps its own exact
+	// cursor: withDefaults has already pinned DurableHighWater to it.
+	seed := cfg.DurableHighWater
+	if cfg.ResumeDisposition == nil {
+		seed = claims.CarrierBoundary
+	}
 	candidate := &V2HostCandidate{
 		cfg: cfg, claims: claims, conn: conn, notify: make(chan struct{}),
-		closedCh: make(chan struct{}), ackSeq: cfg.DurableHighWater, highestSent: cfg.DurableHighWater,
+		closedCh: make(chan struct{}), ackSeq: seed, highestSent: seed,
 		snapshotRequests: make(chan attachwire.SnapshotRequest, 1), localActiveCh: make(chan struct{}), cancel: cancel,
 	}
 	if cfg.ResumeDisposition != nil {
@@ -394,8 +413,20 @@ func validateV2ProofDisposition(claims v2HostClaims, cfg V2HostConfig) error {
 		if claims.ProofSchemaVersion != V2ProofSchemaV2 {
 			return errors.New("attachclient: fresh v2 candidate requires proof schema v2")
 		}
-		if cfg.DurableHighWater != claims.CarrierBoundary {
-			return errors.New("attachclient: v2 durable high-water does not match signed carrier boundary")
+		// An INEQUALITY, matching the durable-proof contract every other
+		// enforcement site encodes: the carrier's signed boundary may be ahead of
+		// the local acknowledgement floor by the whole window of frames it
+		// journaled but never acknowledged back, and an abrupt exit of the
+		// previous composing daemon freezes that window permanently. Refusing
+		// that skew rejected the carrier's own successfully admitted reservation.
+		// Only the reverse — a local floor above the signed boundary — is
+		// evidence, and it is evidence of a STALE PROOF, so it is typed for the
+		// caller to re-prepare against rather than an anonymous refusal.
+		if cfg.DurableHighWater > claims.CarrierBoundary {
+			return &V2CarrierCursorDriftError{
+				DurableHighWater: cfg.DurableHighWater,
+				CarrierBoundary:  claims.CarrierBoundary,
+			}
 		}
 		return nil
 	}

@@ -7,7 +7,9 @@ import (
 	"io"
 	"io/fs"
 	"log/slog"
+	"os"
 	"sort"
+	"syscall"
 	"time"
 
 	"github.com/RenseiAI/donmai/shimwire"
@@ -366,7 +368,7 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 			continue
 		}
 
-		ctrl, adoptErr := dialForAdoption(ctx, rec, opts)
+		ctrl, adoptErr := dialForAdoptionWithRetry(ctx, rec, opts, log)
 		if adoptErr != nil {
 			if errors.Is(adoptErr, ErrAdoptionPreparation) {
 				result.Close()
@@ -390,6 +392,54 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 	sortResult(&result)
 	return result, nil
+}
+
+const (
+	// adoptionDialAttempts is the TOTAL number of dials one live record gets
+	// when every failure is transient. It is bounded because the pass has to
+	// finish before the daemon may advertise capacity, and each attempt already
+	// costs a full dial timeout.
+	adoptionDialAttempts = 3
+	// adoptionDialBackoff is the base delay between transient attempts; it
+	// doubles. The delay is short on purpose — the dial timeout is the real
+	// spacing, and this only avoids hammering a peer that just refused.
+	adoptionDialBackoff = 100 * time.Millisecond
+)
+
+// dialForAdoptionWithRetry dials one record, retrying while the failure says
+// only "not this time".
+//
+// A preparation failure is never retried: it aborts the whole pass, and asking
+// a composing authority again for something it already refused is not recovery.
+// Everything else non-transient returns on the first answer, exactly as before.
+func dialForAdoptionWithRetry(
+	ctx context.Context,
+	rec Record,
+	opts AdoptOptions,
+	log *slog.Logger,
+) (*Controller, error) {
+	ctrl, err := dialForAdoption(ctx, rec, opts)
+	for attempt := 2; attempt <= adoptionDialAttempts; attempt++ {
+		if !isTransientDialFailure(err) || errors.Is(err, ErrAdoptionPreparation) {
+			return ctrl, err
+		}
+		log.Warn("sessionshim: adoption dial failed transiently; retrying before classifying",
+			"session", rec.Identity().String(), "attempt", attempt, "of", adoptionDialAttempts, "error", err)
+		delay := adoptionDialBackoff
+		for i := 2; i < attempt; i++ {
+			delay *= 2
+		}
+		timer := time.NewTimer(delay)
+		select {
+		case <-timer.C:
+		case <-ctx.Done():
+			timer.Stop()
+			return nil, err
+		}
+		timer.Stop()
+		ctrl, err = dialForAdoption(ctx, rec, opts)
+	}
+	return ctrl, err
 }
 
 // ResolvedDurableAckAmbiguityBound reports the bound a controller dialled by
@@ -518,22 +568,49 @@ func classifyAdoptionFailure(err error) (QuarantineReason, string) {
 		return QuarantineIdentityMismatch, err.Error()
 	case errors.Is(err, ErrRecordInvalid):
 		return QuarantineRecordMalformed, err.Error()
-	case isDialFailure(err):
-		// The record's process IS live (checked above) but the socket is not
-		// reachable. §D10: quarantine — do not kill, do not recreate the socket,
-		// do not release a claim. The shim's own orphan deadline is the escape.
+	case isSocketUnreachable(err):
+		// The record's process IS live (checked above) but the endpoint itself
+		// answered: refused, or gone. §D10: quarantine — do not kill, do not
+		// recreate the socket, do not release a claim. The shim's own orphan
+		// deadline is the escape.
 		return QuarantineSocketUnreachable, err.Error()
 	default:
 		return QuarantineAdoptionFailed, err.Error()
 	}
 }
 
-func isDialFailure(err error) bool {
-	var opErr interface{ Timeout() bool }
-	if errors.As(err, &opErr) {
+// isSocketUnreachable is POSITIVE evidence about the endpoint: the connect was
+// refused, or nothing is bound at the path any more. Nothing else qualifies.
+//
+// The predicate this replaced asked only whether the error had a Timeout method
+// and never called it — which every net.OpError and os.PathError has — so any
+// error the network stack produced was reported as an unreachable socket.
+// Measured live: a write timeout on an ALREADY-ESTABLISHED unix socket, to a
+// shim whose pid had just been proved alive, was classified socket_unreachable
+// on the first re-adoption attempt. A stalled peer is not an absent one, and
+// the two disagree about whether anything is still out there to talk to.
+func isSocketUnreachable(err error) bool {
+	return errors.Is(err, syscall.ECONNREFUSED) ||
+		errors.Is(err, syscall.ENOENT) ||
+		errors.Is(err, fs.ErrNotExist)
+}
+
+// isTransientDialFailure reports the shapes that say only "not this time":
+// a real timeout, or a peer that hung up mid-handshake. The socket existed and
+// accepted, and the record's process is live, so the honest reading is that the
+// shim was busy — a shim mid-snapshot, or one whose accept loop had not yet
+// come back around. Retrying is what distinguishes a busy peer from an absent
+// one; classifying without retrying just guesses.
+func isTransientDialFailure(err error) bool {
+	if err == nil || isSocketUnreachable(err) {
+		return false
+	}
+	var timeout interface{ Timeout() bool }
+	if errors.As(err, &timeout) && timeout.Timeout() {
 		return true
 	}
 	return errors.Is(err, context.DeadlineExceeded) ||
+		errors.Is(err, os.ErrDeadlineExceeded) ||
 		errors.Is(err, io.EOF) ||
 		errors.Is(err, io.ErrUnexpectedEOF)
 }
