@@ -3,7 +3,9 @@ package sessionshim
 import (
 	"context"
 	"errors"
+	"net"
 	"os"
+	"strings"
 	"testing"
 	"time"
 
@@ -255,5 +257,119 @@ func TestOrphanKeepaliveOnAVanishedShimIsUnobservable(t *testing.T) {
 	}
 	if _, err := KeepAlive(context.Background(), record, KeepAliveOptions{}); !errors.Is(err, ErrKeepAliveUnobservable) {
 		t.Fatalf("KeepAlive on a shim that is gone = %v, want ErrKeepAliveUnobservable", err)
+	}
+}
+
+// TestKeepAliveOnAShimThatPredatesTheContract pins the mixed-version rollout.
+//
+// A shim binary built before serveOrphanKeepalive reaches its handshake's
+// `expected Welcome` branch and answers CodeMalformed. The daemon must read
+// that as ErrKeepAliveRefused — "this lineage is bounded by its plain orphan
+// deadline after all" — and not as a transport fault it retries into, and not
+// as a success that would have it believe the clock was extended.
+//
+// The fake speaks the wire directly rather than running an old build, which is
+// the only way to have a pre-contract answer in the tree at all.
+func TestKeepAliveOnAShimThatPredatesTheContract(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	t.Parallel()
+	dir, err := os.MkdirTemp("/tmp", "kol")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	socket := dir + "/old.sock"
+	listener, err := net.Listen("unix", socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = listener.Close() })
+	device, inode, err := statSocket(socket)
+	if err != nil {
+		t.Fatal(err)
+	}
+	self, err := Self()
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := Record{
+		SchemaVersion: RecordSchemaVersion,
+		OrgID:         "org-old", SessionID: "session-old",
+		ShimID: "0123456789abcdef0123456789abcdef", ProcessEpoch: 2,
+		PID: self.PID, ProcessStartedAt: self.StartedAt,
+		SocketPath: socket, SocketDevice: device, SocketInode: inode,
+		ProtocolMin: shimwire.V1, ProtocolMax: shimwire.V1,
+		Phase:             shimwire.PhaseOrphaned,
+		WorkareaPath:      dir + "/workarea",
+		CreatedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := record.Validate(); err != nil {
+		t.Fatalf("fake record: %v", err)
+	}
+	served := make(chan error, 1)
+	go func() {
+		conn, err := listener.Accept()
+		if err != nil {
+			served <- err
+			return
+		}
+		defer func() { _ = conn.Close() }()
+		w := shimwire.NewWriter(conn)
+		r := shimwire.NewReader(conn)
+		hello, err := shimwire.EncodeHello(shimwire.Hello{
+			Protocol: shimwire.ProtocolName, Min: shimwire.V1, Max: shimwire.V1,
+			OrgID: record.OrgID, SessionID: record.SessionID,
+			ShimID: record.ShimID, ProcessEpoch: record.ProcessEpoch,
+			PID: record.PID, ProcessStartedAt: record.ProcessStartedAt,
+			WorkareaPath: record.WorkareaPath, Phase: shimwire.PhaseOrphaned,
+		})
+		if err != nil {
+			served <- err
+			return
+		}
+		if err := w.Write(shimwire.TypeHello, hello); err != nil {
+			served <- err
+			return
+		}
+		if _, err := r.Read(); err != nil {
+			served <- err
+			return
+		}
+		// Verbatim the pre-contract answer: the handshake's own refusal for a
+		// frame it does not recognise where a Welcome belongs.
+		served <- sendError(w, shimwire.CodeMalformed, "expected Welcome")
+	}()
+
+	_, err = KeepAlive(context.Background(), record, KeepAliveOptions{})
+	if !errors.Is(err, ErrKeepAliveRefused) {
+		t.Fatalf("KeepAlive against a pre-contract shim = %v, want ErrKeepAliveRefused", err)
+	}
+	if errors.Is(err, ErrKeepAliveUnobservable) {
+		t.Fatalf("KeepAlive read a refusal as unobservability: %v", err)
+	}
+	if err := <-served; err != nil {
+		t.Fatalf("fake shim: %v", err)
+	}
+}
+
+// TestOrdinaryHeartbeatBytesStayReadableByAStrictOldDecoder pins the reverse
+// direction of the same rollout. shimwire's decoder disallows unknown fields,
+// so if OrphanDeadlineAt ever appeared on an ordinary heartbeat, an old peer
+// would refuse the frame outright. It is set only in the keepalive answer,
+// which only a new daemon can provoke — this asserts the encoding, so a future
+// author who populates the field elsewhere finds out here.
+func TestOrdinaryHeartbeatBytesStayReadableByAStrictOldDecoder(t *testing.T) {
+	t.Parallel()
+	body, err := shimwire.EncodeHeartbeat(shimwire.HeartbeatMsg{Generation: 7, AckedSeq: 42, Phase: shimwire.PhaseRunning})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if got := string(body); strings.Contains(got, "orphanDeadlineAt") {
+		t.Fatalf("an ordinary heartbeat carries the keepalive-only field: %s", got)
+	}
+	if _, err := shimwire.DecodeHeartbeat(body); err != nil {
+		t.Fatalf("strict decode of an ordinary heartbeat: %v", err)
 	}
 }

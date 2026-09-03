@@ -370,9 +370,17 @@ func (d *Daemon) reconcileSessionShimScope(scope string, budget time.Duration) e
 
 // sleepSessionShimReconcileBackoff waits one derived backoff unit, or returns
 // false when the daemon released its shims first.
+// It stays on the REAL clock. Its other call sites — the reconcile passes at
+// :253 and :305 and the acceptance-clear poll in session_shim_spawn.go — pair it
+// with `time.Now()` deadlines, so routing it through the injectable clock would
+// turn those loops into hot spins the moment any fixture injected one. The
+// re-adoption window has its own wait (sleepSessionShimWindowBackoff) precisely
+// so one clock governs one loop.
 func (d *Daemon) sleepSessionShimReconcileBackoff(backoff time.Duration) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
 	select {
-	case <-d.shimAfter(backoff):
+	case <-timer.C:
 		return true
 	case <-d.shims.reconcileStop:
 		return false

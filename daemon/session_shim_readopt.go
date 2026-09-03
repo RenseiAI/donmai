@@ -32,8 +32,14 @@ const (
 	// controller-loss quarantine applies.
 	readoptionLineageGone
 	// readoptionWindowExhausted: the lineage-live window ended with the shim
-	// still observable. The policy's PostWindowOutcome decides what happens.
+	// still observable — the one outcome the dead-shim path cannot produce.
 	readoptionWindowExhausted
+	// readoptionAttemptsSpent: a fixed-attempt budget ran out. The caller's
+	// disposition is the same as readoptionLineageGone's, but the fact is not:
+	// "the attempts ran out" and "the shim is no longer there" are different
+	// things, and an enum member whose name says the second while meaning the
+	// first is documentation that lies.
+	readoptionAttemptsSpent
 )
 
 // readoptSessionShimAfterControllerLoss re-adopts ONE live shim whose
@@ -125,7 +131,7 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 			return disposition
 		}
 	}
-	return readoptionLineageGone
+	return readoptionAttemptsSpent
 }
 
 // readoptSessionShimWithinLivenessWindow is the lineage-live bound: retry with
@@ -161,7 +167,7 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 				// outcome came to be unreachable in the common case.
 				return d.sessionShimWindowExhausted(registry, cfg, id, hello, deadline)
 			}
-			if !d.sleepSessionShimReconcileBackoff(backoff) {
+			if !d.sleepSessionShimWindowBackoff(backoff) {
 				return readoptionRefused
 			}
 			if backoff *= 2; backoff > policy.BackoffCap {
@@ -259,7 +265,7 @@ func (d *Daemon) sessionShimWindowExhausted(
 		return readoptionLineageGone
 	}
 	slog.Warn("session shim: the re-adoption window ended with the shim still observable",
-		"session", id.String(), "deadline", deadline, "outcome", cfg.readoption().PostWindowOutcome)
+		"session", id.String(), "deadline", deadline)
 	if cfg.OnReadoptionWindowExhausted != nil {
 		ctx, cancel := context.WithTimeout(context.Background(), cfg.callbackTimeout())
 		cfg.OnReadoptionWindowExhausted(ctx, id)
@@ -268,8 +274,21 @@ func (d *Daemon) sessionShimWindowExhausted(
 	return readoptionWindowExhausted
 }
 
+// sleepSessionShimWindowBackoff waits one re-adoption backoff, or returns false
+// when the daemon released its shims first. It is the ONE loop the injectable
+// session-shim clock governs.
+func (d *Daemon) sleepSessionShimWindowBackoff(backoff time.Duration) bool {
+	select {
+	case <-d.shimAfter(backoff):
+		return true
+	case <-d.shims.reconcileStop:
+		return false
+	}
+}
+
 // startSessionShimOrphanKeepalive extends the shim's orphan clock for as long
-// as the returned stop function has not been called.
+// as the returned stop function has not been called AND the composing layer
+// still holds the lineage.
 //
 // This is the daemon half of the amendment's obligation, and without it the
 // ten-minute window is a fiction under any deadline shorter than it: the shim
@@ -279,6 +298,13 @@ func (d *Daemon) sessionShimWindowExhausted(
 // "shim becomes unobservable falls back to the orphan deadline immediately"
 // behaviour the amendment asks for, and the window's own liveness gate is what
 // concludes the lineage is gone.
+//
+// The LineageLive check on every tick is the other half of the amendment's
+// "and still holds the lineage". The attempt loop checks it too, but it checks
+// it once per backoff — up to a whole BackoffCap apart — and an extension sent
+// after the composing layer released the lineage is exactly the extension §D8's
+// inequality forbids. The keepalive is the thing holding the harness alive, so
+// the keepalive is where that question has to be asked.
 //
 // It paces on the REAL clock, not on the daemon's injectable one, and that is
 // not an inconsistency: the thing being fed is the SHIM's orphan timer, which
@@ -294,8 +320,9 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 	hello shimwire.Hello,
 ) func() {
 	ticker := time.NewTicker(cfg.readoptionKeepaliveInterval())
-	// The count is per WINDOW, not per daemon lifetime: "the daemon extended
-	// this shim's clock" is a question about the window being asked about.
+	// The observations are per WINDOW, not per daemon lifetime: "the daemon
+	// extended this shim's clock" is a question about the window being asked
+	// about.
 	d.shims.mu.Lock()
 	delete(d.shims.keepalives, id)
 	d.shims.mu.Unlock()
@@ -305,6 +332,14 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 		defer close(done)
 		defer ticker.Stop()
 		for {
+			if !d.sessionShimLineageHeld(cfg, id) {
+				// The composing layer let this lineage go. Stop extending at
+				// once: from here the shim's own deadline governs, unextended,
+				// which is what keeps the §D8 inequality true.
+				slog.Warn("session shim: the composing layer released the lineage; stopping the orphan keepalive",
+					"session", id.String())
+				return
+			}
 			d.extendSessionShimOrphanDeadline(registry, id, hello)
 			select {
 			case <-ticker.C:
@@ -323,6 +358,12 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 
 // extendSessionShimOrphanDeadline sends ONE keepalive and records what the shim
 // answered, reporting whether the clock was extended.
+//
+// The first failure of a window is logged at Warn, not Debug. A host running a
+// shim binary that predates this contract answers every keepalive `malformed`,
+// reaps at its plain orphan deadline mid-window, and the lineage is quarantined
+// as if it had died — the daemon knows the obligation was never honoured, and
+// an operator has no other way to find out.
 func (d *Daemon) extendSessionShimOrphanDeadline(
 	registry *sessionshim.Registry,
 	id sessionshim.Identity,
@@ -330,6 +371,7 @@ func (d *Daemon) extendSessionShimOrphanDeadline(
 ) bool {
 	record, err := registry.Get(id)
 	if err != nil {
+		d.noteSessionShimKeepaliveRefused(id, "session shim: orphan keepalive found no discovery record", err)
 		return false
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), sessionshim.DefaultKeepAliveTimeout)
@@ -339,26 +381,43 @@ func (d *Daemon) extendSessionShimOrphanDeadline(
 		ExpectedProcessEpoch: hello.ProcessEpoch,
 	})
 	if err != nil {
-		slog.Debug("session shim: orphan keepalive did not extend the deadline",
-			"session", id.String(), "error", err)
+		d.noteSessionShimKeepaliveRefused(id, "session shim: orphan keepalive did not extend the deadline", err)
 		return false
 	}
 	d.shims.mu.Lock()
 	state := d.shims.keepalives[id]
 	state.extensions++
+	state.refusals = 0
 	state.lastDeadlineUnixNano = deadline.UnixNano()
 	d.shims.keepalives[id] = state
 	d.shims.mu.Unlock()
 	return true
 }
 
-// sessionShimKeepaliveObservations reports how many keepalives this daemon has
-// had honoured for a lineage and the deadline the last one re-armed to.
-func (d *Daemon) sessionShimKeepaliveObservations(id sessionshim.Identity) (int, time.Time) {
+// noteSessionShimKeepaliveRefused records one unhonoured keepalive and says so
+// out loud the first time it happens in a window.
+func (d *Daemon) noteSessionShimKeepaliveRefused(id sessionshim.Identity, msg string, err error) {
+	d.shims.mu.Lock()
+	state := d.shims.keepalives[id]
+	state.refusals++
+	first := state.refusals == 1
+	extensions := state.extensions
+	d.shims.keepalives[id] = state
+	d.shims.mu.Unlock()
+	if first {
+		slog.Warn(msg, "session", id.String(), "extensionsThisWindow", extensions, "error", err)
+		return
+	}
+	slog.Debug(msg, "session", id.String(), "error", err)
+}
+
+// sessionShimKeepaliveObservations reports what the current window's keepalive
+// achieved for a lineage: honoured extensions, consecutive refusals, and the
+// deadline the last honoured one re-armed to.
+func (d *Daemon) sessionShimKeepaliveObservations(id sessionshim.Identity) sessionShimKeepaliveState {
 	d.shims.mu.RLock()
 	defer d.shims.mu.RUnlock()
-	state := d.shims.keepalives[id]
-	return state.extensions, unixNanoTime(state.lastDeadlineUnixNano)
+	return d.shims.keepalives[id]
 }
 
 // sessionShimIncarnationStillLive answers whether the exact incarnation still

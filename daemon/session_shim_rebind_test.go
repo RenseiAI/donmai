@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"errors"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -241,9 +242,11 @@ func TestRebindErrorsAreDiscriminableThroughThePublicAPI(t *testing.T) {
 		t.Fatalf("rebind of an unknown session error = %v, want it to wrap ErrSessionShimNotAdopted", err)
 	}
 
-	// The sentence existing callers and their pins read is preserved.
-	if got := err.Error(); !errors.Is(err, ErrSessionShimNotAdopted) || got == "" {
-		t.Fatalf("refusal message = %q", got)
+	// The exact sentence existing callers read is preserved, byte for byte —
+	// adding %w to adoptedShimEntry must not have reworded the refusal that
+	// session_shim_burst_test.go's own pins match on.
+	if want := "session shim: " + f.id.OrgID + "/no-such-session is not adopted by this daemon"; !strings.HasSuffix(err.Error(), want) {
+		t.Fatalf("refusal message = %q, want it to end in %q", err.Error(), want)
 	}
 
 	// An adopted lineage whose controller is gone is a different refusal.

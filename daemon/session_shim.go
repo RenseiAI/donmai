@@ -678,9 +678,9 @@ type SessionShimConfig struct {
 
 	// OnReadoptionWindowExhausted runs exactly once when a ReadoptionLineageLive
 	// window ends with the shim STILL observable — the case the dead-shim path
-	// cannot produce. It runs before the policy's PostWindowOutcome is applied,
-	// off the daemon's lock, so a composition can record the distinction while
-	// the lineage is still adopted.
+	// cannot produce. It runs BEFORE the lineage is withdrawn, off the daemon's
+	// lock, so a composition can record the distinction — or start its own
+	// repair — while the lineage is still adopted.
 	OnReadoptionWindowExhausted func(context.Context, sessionshim.Identity)
 
 	// OnSessionShimCarrierBindLost runs when this daemon learns a lineage's
@@ -1471,10 +1471,13 @@ func newSessionShimState() *sessionShimState {
 	}
 }
 
-// sessionShimKeepaliveState is one lineage's keepalive bookkeeping: how many
-// extensions the shim honoured and the deadline the last one re-armed to.
+// sessionShimKeepaliveState is one lineage's keepalive bookkeeping for the
+// current re-adoption window: how many extensions the shim honoured, how many
+// consecutive refusals have followed the last honoured one, and the deadline
+// that one re-armed to.
 type sessionShimKeepaliveState struct {
 	extensions           int
+	refusals             int
 	lastDeadlineUnixNano int64
 }
 
@@ -1651,9 +1654,20 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 // that keepalive — or that this daemon can no longer observe — is back on its
 // ordinary orphan deadline immediately, which is exactly the outcome the mode
 // is willing to accept: the daemon never asks a shim it cannot see to stay
-// alive. Window exhaustion with a live shim produces PostWindowOutcome,
-// carrying a reason distinct from the dead-shim path so an operator can tell a
-// carrier that never came back from a harness that died.
+// alive. Window exhaustion with a live shim withdraws the lineage under a
+// reason distinct from the dead-shim path, so an operator can tell a carrier
+// that never came back from a harness that died, and
+// SessionShimConfig.OnReadoptionWindowExhausted fires first, while the lineage
+// is still adopted, so a composition that wants its own disposition gets it
+// before the withdrawal rather than instead of it.
+//
+// There is deliberately no "keep it adopted" post-window option. The keepalive
+// stops when the window does, so a retained lineage's shim reaps on its own
+// deadline within minutes and writes a tombstone that nothing consumes — the
+// tombstone reconciler iterates the QUARANTINED set — leaving the daemon
+// reporting an adopted lineage whose shim is gone, holding its capacity
+// forever. That is a false complete-snapshot and a permanent capacity leak, so
+// the withdrawal is not configurable.
 //
 // Attempts is read only in fixed mode; Window, BackoffCap and KeepaliveInterval
 // only in lineage-live mode. Validate refuses the combinations that would make
@@ -1698,11 +1712,6 @@ type SessionShimReadoptionPolicy struct {
 	// correct when a deployment changes its deadline and forgets this field.
 	// Validate refuses a non-zero value in fixed mode.
 	KeepaliveInterval time.Duration
-	// PostWindowOutcome is what happens when a lineage-live window is
-	// exhausted while the shim is still observable. The zero value quarantines
-	// as before; ReadoptionNotifyOnly keeps the lineage adopted and leaves the
-	// disposition to OnReadoptionWindowExhausted.
-	PostWindowOutcome SessionShimPostWindowOutcome
 }
 
 // SessionShimReadoptionMode selects which bound a re-adoption policy runs
@@ -1728,36 +1737,6 @@ func (m SessionShimReadoptionMode) String() string {
 		return "fixed_attempts"
 	case ReadoptionLineageLive:
 		return "lineage_live"
-	default:
-		return "unknown"
-	}
-}
-
-// SessionShimPostWindowOutcome is what a daemon does when a lineage-live
-// re-adoption window is exhausted while the shim is STILL observable — the one
-// outcome the dead-shim path can never produce.
-type SessionShimPostWindowOutcome uint8
-
-const (
-	// ReadoptionQuarantine withdraws authority and projects the lineage as
-	// quarantined socket_unreachable, carrying
-	// sessionShimReadoptionWindowExhaustedDetail so it is distinguishable from
-	// the dead-shim quarantine. It is the zero value.
-	ReadoptionQuarantine SessionShimPostWindowOutcome = iota
-	// ReadoptionNotifyOnly keeps the lineage in the adopted set and publishes
-	// nothing, leaving the disposition to OnReadoptionWindowExhausted. A
-	// composition that can repair the carrier out of band uses this so the
-	// receiver is never told the lineage was withdrawn.
-	ReadoptionNotifyOnly
-)
-
-// String names the outcome for logs and diagnostics.
-func (o SessionShimPostWindowOutcome) String() string {
-	switch o {
-	case ReadoptionQuarantine:
-		return "quarantine"
-	case ReadoptionNotifyOnly:
-		return "notify_only"
 	default:
 		return "unknown"
 	}
@@ -1794,10 +1773,6 @@ func (p SessionShimReadoptionPolicy) Validate() error {
 		if p.KeepaliveInterval > 0 {
 			return fmt.Errorf("%w: KeepaliveInterval=%s is meaningless in %s mode",
 				ErrSessionShimReadoptionPolicy, p.KeepaliveInterval, p.Mode)
-		}
-		if p.PostWindowOutcome != ReadoptionQuarantine {
-			return fmt.Errorf("%w: PostWindowOutcome=%s is meaningless in %s mode",
-				ErrSessionShimReadoptionPolicy, p.PostWindowOutcome, p.Mode)
 		}
 	case ReadoptionLineageLive:
 		if p.Attempts > 0 {
@@ -1920,6 +1895,71 @@ func (c SessionShimConfig) readoption() SessionShimReadoptionPolicy {
 	return policy
 }
 
+// validateReadoptionAgainstOrphanPolicy refuses the two lineage-live
+// configurations that only a policy and its orphan policy TOGETHER can be seen
+// to be wrong. Validate cannot make these checks: it is a method on the policy
+// and neither the orphan deadline nor the composing seams are in scope there.
+//
+// The first is the §D8 inequality itself. OrphanPolicy.Validate enforces
+// `Deadline + TerminationGrace + PropagationMargin < ExternalReleaseThreshold`
+// and refuses startup otherwise, because an external component that releases a
+// claim while the harness is still running is double execution from a
+// configuration change alone. A lineage-live window's keepalive re-arms that
+// deadline for as long as the window runs, so the real bound becomes
+// `Window + Deadline + grace + margin` — ten minutes past a three-minute
+// threshold for the shipped default. The amendment authorizes exactly one thing
+// in exchange: the extension continues only "while the daemon observes the shim
+// process alive AND still holds the lineage", and "still holds the lineage" is
+// the very claim the external releaser would take away. Only LineageLive can
+// answer it. A nil predicate means "yes, always" — correct for a standalone
+// daemon, which has nothing above it that can release anything, and unsound the
+// moment a threshold is declared. So: declare a threshold, wire the predicate.
+//
+// The second is the keepalive interval against the deadline it has to keep
+// re-arming. An interval at or above the deadline lets the shim reap between
+// two keepalives, mid-window, which also makes the exhaustion outcome
+// unreachable because the incarnation is already gone. The derived interval is
+// a third of the deadline; a configured one is held to half, which is the
+// loosest value that still leaves one whole missed exchange of slack.
+func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
+	policy := c.readoption()
+	if policy.Disabled || policy.Mode != ReadoptionLineageLive {
+		return nil
+	}
+	if c.Orphan.ExternalReleaseThreshold > 0 && c.LineageLive == nil {
+		return fmt.Errorf(
+			"%w: %s mode extends the shim's orphan deadline for up to %s, so the time from controller "+
+				"loss to a reaped harness becomes %s + %s + %s + %s, which is not strictly less than the "+
+				"declared external release threshold %s — an external component could release the claim "+
+				"while the harness is still running. The amendment permits the extension only while this "+
+				"daemon still holds the lineage, and only SessionShimConfig.LineageLive can answer that, "+
+				"so wire it or use %s mode",
+			ErrSessionShimReadoptionPolicy, policy.Mode, policy.WorstCaseWindow(),
+			policy.WorstCaseWindow(), c.Orphan.Deadline, c.Orphan.TerminationGrace, c.Orphan.PropagationMargin,
+			c.Orphan.ExternalReleaseThreshold, ReadoptionFixedAttempts,
+		)
+	}
+	deadline := c.resolvedOrphanDeadline()
+	if interval := policy.KeepaliveInterval; interval > 0 && interval*2 > deadline {
+		return fmt.Errorf(
+			"%w: KeepaliveInterval=%s leaves no slack against the %s orphan deadline it has to keep "+
+				"re-arming; the shim would reap between two keepalives and the window's exhaustion "+
+				"outcome would be unreachable. Use at most %s, or leave it zero to derive it",
+			ErrSessionShimReadoptionPolicy, interval, deadline, deadline/2,
+		)
+	}
+	return nil
+}
+
+// resolvedOrphanDeadline is the deadline the shims this daemon launches are
+// held to, with the standalone default filled in.
+func (c SessionShimConfig) resolvedOrphanDeadline() time.Duration {
+	if c.Orphan.Deadline > 0 {
+		return c.Orphan.Deadline
+	}
+	return sessionshim.DefaultOrphanDeadline
+}
+
 // readoptionKeepaliveInterval is how often a lineage-live window extends the
 // shim's orphan clock: the policy's own interval, or a third of the resolved
 // orphan deadline when it leaves that to the daemon.
@@ -1933,10 +1973,7 @@ func (c SessionShimConfig) readoptionKeepaliveInterval() time.Duration {
 	if configured := c.readoption().KeepaliveInterval; configured > 0 {
 		return configured
 	}
-	deadline := c.Orphan.Deadline
-	if deadline <= 0 {
-		deadline = sessionshim.DefaultOrphanDeadline
-	}
+	deadline := c.resolvedOrphanDeadline()
 	if interval := deadline / sessionShimKeepaliveDeadlineDivisor; interval > minSessionShimKeepaliveInterval {
 		return interval
 	}
@@ -2144,6 +2181,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 	// configured to survive, which is the worst possible moment to discover a
 	// typo.
 	if err := cfg.Readoption.Validate(); err != nil {
+		return err
+	}
+	if err := cfg.validateReadoptionAgainstOrphanPolicy(); err != nil {
 		return err
 	}
 	if d.sessionShimEnabled() && cfg.OnAdoptionBatch == nil {
@@ -3974,6 +4014,14 @@ type SessionShimBinding struct {
 	// is stamped on that transition alone, so "how long has this lineage been
 	// unbound" is answerable from it.
 	LastCarrierLossAt time.Time
+	// KeepaliveExtensions is how many times the current re-adoption window has
+	// had its orphan-clock extension honoured by the shim, and
+	// LastOrphanDeadline is what the last honoured one re-armed to. Zero
+	// extensions during a lineage-live window is the signature of a shim binary
+	// that predates the keepalive contract: it will reap on its plain orphan
+	// deadline mid-window, and this is the only surface that says so.
+	KeepaliveExtensions int
+	LastOrphanDeadline  time.Time
 }
 
 // AdoptedSessionShimBindings returns the carrier-bind state of every lineage
@@ -3991,11 +4039,14 @@ func (d *Daemon) AdoptedSessionShimBindings() []SessionShimBinding {
 	d.shims.mu.RLock()
 	out := make([]SessionShimBinding, 0, len(d.shims.adopted))
 	for id, entry := range d.shims.adopted {
+		keepalive := d.shims.keepalives[id]
 		out = append(out, SessionShimBinding{
-			Identity:          id,
-			CarrierBound:      entry.carrierBound,
-			BoundAt:           unixNanoTime(entry.carrierBoundAtUnixNano),
-			LastCarrierLossAt: unixNanoTime(entry.carrierLostAtUnixNano),
+			Identity:            id,
+			CarrierBound:        entry.carrierBound,
+			BoundAt:             unixNanoTime(entry.carrierBoundAtUnixNano),
+			LastCarrierLossAt:   unixNanoTime(entry.carrierLostAtUnixNano),
+			KeepaliveExtensions: keepalive.extensions,
+			LastOrphanDeadline:  unixNanoTime(keepalive.lastDeadlineUnixNano),
 		})
 	}
 	d.shims.mu.RUnlock()
@@ -4154,10 +4205,12 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 		correlation := afclient.DaemonSessionShimAdoptedCorrelation{
 			OrgID: id.OrgID, SessionID: id.SessionID, ShimID: entry.shimID,
 			LastForwardedSeq: d.shims.forwarded[id], ConsumesCapacity: true,
-			Source:            "adopted",
-			ControllerID:      d.controllerID(),
-			CarrierBound:      entry.carrierBound,
-			LastCarrierLossAt: entry.carrierLostAtUnixNano,
+			Source:              "adopted",
+			ControllerID:        d.controllerID(),
+			CarrierBound:        entry.carrierBound,
+			LastCarrierLossAt:   entry.carrierLostAtUnixNano,
+			KeepaliveExtensions: d.shims.keepalives[id].extensions,
+			LastOrphanDeadline:  d.shims.keepalives[id].lastDeadlineUnixNano,
 		}
 		if entry.launched {
 			correlation.Source = "launched"

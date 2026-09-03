@@ -136,6 +136,13 @@ type DaemonSessionShimAdoptedCorrelation struct {
 	// alone: a field written by both transitions answers "how long has this
 	// lineage been unbound" with the moment it was last bound.
 	LastCarrierLossAt int64 `json:"lastCarrierLossAt,omitempty"`
+	// KeepaliveExtensions is how many orphan-clock extensions the current
+	// re-adoption window has had honoured, and LastOrphanDeadline is the
+	// Unix-nanosecond instant the last honoured one re-armed to. Zero
+	// extensions while a lineage-live window is running is what a shim binary
+	// that predates the keepalive contract looks like from outside the daemon.
+	KeepaliveExtensions int   `json:"keepaliveExtensions,omitempty"`
+	LastOrphanDeadline  int64 `json:"lastOrphanDeadline,omitempty"`
 }
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.

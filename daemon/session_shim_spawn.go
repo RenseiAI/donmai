@@ -2533,13 +2533,11 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	case readoptionWindowExhausted:
 		// The window ended with the shim still observable — an outcome the
 		// dead-shim path cannot produce, so it does not get the dead-shim
-		// disposition. A composition that can repair the carrier out of band
-		// keeps the lineage; the default withdraws it under its own reason.
-		if cfg.readoption().PostWindowOutcome == ReadoptionNotifyOnly {
-			slog.Warn("session shim: keeping the lineage adopted after an exhausted re-adoption window",
-				"session", id.String())
-			return
-		}
+		// reason. It DOES get the withdrawal: OnReadoptionWindowExhausted has
+		// already run, while the lineage was still adopted, and retaining it
+		// past that would leave an adopted entry whose keepalive has stopped,
+		// whose shim reaps within one orphan deadline, and whose tombstone the
+		// quarantine-only reconciler would never consume.
 		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionWindowExhaustedDetail)
 	default:
 		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
@@ -3222,10 +3220,12 @@ func (d *Daemon) shimNow() time.Time {
 	return time.Now()
 }
 
-// shimAfter is the wait side of the one session-shim clock. Every wait the
-// re-adoption window takes goes through it, so an injected clock advances the
+// shimAfter is the wait side of the one session-shim clock, and it governs
+// exactly one loop: the re-adoption window. An injected clock advances that
 // window's instants and its waits together — deriving one from a fake clock and
-// the other from a real timer is what made the window untestable before.
+// the other from a real timer is what made the window untestable before — and
+// it governs nothing else, so no loop that measures itself against time.Now()
+// can be turned into a hot spin by a fixture that injects a clock.
 func (d *Daemon) shimAfter(wait time.Duration) <-chan time.Time {
 	if d.shims != nil {
 		if clock := d.shims.clock.Load(); clock != nil && clock.after != nil {

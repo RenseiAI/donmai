@@ -18,6 +18,12 @@ import (
 // anything.
 const DefaultKeepAliveTimeout = 5 * time.Second
 
+// orphanKeepaliveAnswerTimeout bounds the shim's half of one keepalive: a
+// registry write and one frame. It replaces the adoption output-barrier bound
+// the connection inherits, which is sized for a whole handshake and would keep
+// a stalled daemon's socket alive far longer than an observation needs.
+const orphanKeepaliveAnswerTimeout = 3 * time.Second
+
 var (
 	// ErrKeepAliveRefused reports a shim that answered the keepalive with a
 	// refusal: it is not orphaned, its deadline has already fired, or it does
