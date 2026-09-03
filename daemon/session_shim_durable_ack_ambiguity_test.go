@@ -159,11 +159,14 @@ func TestSocketFailureAndCarrierRefusalStillQuarantineSocketUnreachable(t *testi
 // TestDurableAckAmbiguityBoundIsTheLineageLiveWindow pins the derivation the
 // bound's own documentation claims.
 //
-// The corpus names no duration for a durable acknowledgement outstanding on a
-// LIVE stream, so the bound takes the longest one it does name for a daemon
-// that is visibly still here: the lineage-live re-adoption window. A default
-// that drifted away from that window would leave the derivation true only
-// historically, and nothing in either package would notice.
+// ADR-2026-09-03 makes the bound "equal to the lineage-live readoption window",
+// so the package DEFAULT must equal that window's default. A default that
+// drifted away from it would leave the derivation true only historically, and
+// nothing in either package would notice.
+//
+// This is the weaker of the two assertions and is kept only as a floor: two
+// constants agreeing proves nothing about a CONFIGURED deployment, which is
+// what TestDurableAckAmbiguityBoundFollowsTheConfiguredWindow pins.
 func TestDurableAckAmbiguityBoundIsTheLineageLiveWindow(t *testing.T) {
 	t.Parallel()
 	if sessionshim.DurableAckAmbiguityBound != defaultSessionShimReadoptionWindow {
@@ -216,12 +219,26 @@ func TestDurableAckAmbiguityBoundFollowsTheConfiguredWindow(t *testing.T) {
 			if got := cfg.durableAckAmbiguityBound(); got != tc.want {
 				t.Fatalf("durable-ack ambiguity bound = %s, want the %s window this policy resolves to", got, tc.want)
 			}
-			// And it must actually REACH the controller, not merely be
-			// computable: a derivation nothing passes on is the same drift.
-			if got := (sessionshim.ControllerOptions{
-				DurableAckAmbiguityBound: cfg.durableAckAmbiguityBound(),
-			}).ResolvedDurableAckAmbiguityBound(); got != tc.want {
-				t.Fatalf("the bound a dialled controller resolves = %s, want %s", got, tc.want)
+
+			// And it must actually REACH every controller this daemon dials.
+			// These assert on the structs PRODUCTION builds, not on structs
+			// rebuilt here: a test that composes its own ControllerOptions
+			// asserts its own arithmetic and stays green with both production
+			// assignments deleted, which is precisely the drift the ADR's Risks
+			// section is about.
+			d := &Daemon{shims: newSessionShimState()}
+
+			adoptOpts, _, err := d.sessionShimAdoptOptions(&sessionshim.Registry{}, cfg)
+			if err != nil {
+				t.Fatalf("sessionShimAdoptOptions: %v", err)
+			}
+			if got := adoptOpts.ResolvedDurableAckAmbiguityBound(); got != tc.want {
+				t.Fatalf("the adoption pass dials controllers with a %s bound, want %s", got, tc.want)
+			}
+
+			launchOpts := d.sessionShimLaunchControllerOptions(cfg, "/work/repo", "/work")
+			if got := launchOpts.ResolvedDurableAckAmbiguityBound(); got != tc.want {
+				t.Fatalf("the launch path dials controllers with a %s bound, want %s", got, tc.want)
 			}
 		})
 	}

@@ -277,29 +277,19 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		prepared       SessionShimAdoptionPreparationResult
 		preparedHostID string
 	)
-	controllerOpts := sessionshim.ControllerOptions{
-		ControllerID:              d.controllerID(),
-		EventBacklogBudget:        cfg.EventBacklogBudget,
-		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
-		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
-		ExpectedWorkarea:          workarea,
-		ExpectedWorkareaRoot:      layout.Root.String(),
-		DialTimeout:               cfg.launchTimeout(),
-		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
-		Logger:                    slog.Default(),
-		PrepareAdoption: func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
-			hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
-			if hostErr != nil {
-				return sessionshim.PreparedAdoption{}, hostErr
-			}
-			resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
-			if prepareErr != nil {
-				return sessionshim.PreparedAdoption{}, prepareErr
-			}
-			preparedHostID = hostID
-			prepared = resolved
-			return resolved.PreparedAdoption, nil
-		},
+	controllerOpts := d.sessionShimLaunchControllerOptions(cfg, workarea, layout.Root.String())
+	controllerOpts.PrepareAdoption = func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
+		if hostErr != nil {
+			return sessionshim.PreparedAdoption{}, hostErr
+		}
+		resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
+		if prepareErr != nil {
+			return sessionshim.PreparedAdoption{}, prepareErr
+		}
+		preparedHostID = hostID
+		prepared = resolved
+		return resolved.PreparedAdoption, nil
 	}
 	ctrl, err := sessionshim.Dial(ctx, rec, controllerOpts)
 	if err != nil {
@@ -2034,6 +2024,34 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 			d.releaseShimIfLive(id, ctrl, classifyShimStreamEnd(cause, ctrl.StreamEndCause()))
 		}
 	}()
+}
+
+// sessionShimLaunchControllerOptions assembles everything a launch's controller
+// carries that does not close over the launch itself — identity, the transport
+// bounds, and the workarea it must match. The launch adds only its
+// PrepareAdoption closure on top.
+//
+// It is a named seam rather than a literal inside launchSessionShim so the
+// bounds a launched controller actually receives can be asserted without
+// launching a shim. A test that rebuilds the struct by hand asserts its own
+// arithmetic: deleting the assignment here would leave it green, which is
+// exactly the gap this function exists to close (compare
+// sessionShimAdoptOptions, the same seam for the adoption pass).
+func (d *Daemon) sessionShimLaunchControllerOptions(
+	cfg SessionShimConfig,
+	workarea, workareaRoot string,
+) sessionshim.ControllerOptions {
+	return sessionshim.ControllerOptions{
+		ControllerID:              d.controllerID(),
+		EventBacklogBudget:        cfg.EventBacklogBudget,
+		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
+		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
+		ExpectedWorkarea:          workarea,
+		ExpectedWorkareaRoot:      workareaRoot,
+		DialTimeout:               cfg.launchTimeout(),
+		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
+		Logger:                    slog.Default(),
+	}
 }
 
 // shimStreamEndCause says why an adopted session's controller stream ended.
