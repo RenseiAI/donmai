@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"fmt"
-	"os"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -23,6 +22,7 @@ type readoptFixture struct {
 	registry   *sessionshim.Registry
 	dir        string
 	id         sessionshim.Identity
+	shim       *sessionshim.Shim
 	controller *sessionshim.Controller
 
 	mu        sync.Mutex
@@ -66,85 +66,7 @@ func newReadoptFixtureBlockingAdoption(t *testing.T, policy SessionShimReadoptio
 
 func newReadoptFixtureWithAdoption(t *testing.T, policy SessionShimReadoptionPolicy, adoptionOutcome func(ctx context.Context, attempt int) error) *readoptFixture {
 	t.Helper()
-	// A Unix socket path has a short platform limit, and t.TempDir() bakes
-	// the test name into the path. Keep the registry short.
-	dir, err := os.MkdirTemp("/tmp", "drd")
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() { _ = os.RemoveAll(dir) })
-	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
-	if err != nil {
-		t.Fatal(err)
-	}
-	f := &readoptFixture{registry: registry, dir: dir}
-	f.id = sessionshim.Identity{OrgID: "org-readopt", SessionID: "session-readopt"}
-	shim, err := sessionshim.Start(sessionshim.Options{
-		Identity: f.id, Registry: registry, ProcessEpoch: 5,
-		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", `while IFS= read -r line; do printf 'ack:%s\n' "$line"; done`}},
-		WorkareaPath: filepath.Join(dir, "workarea"),
-		// Long enough that a test never races the shim's own reaper; the
-		// point of re-adoption is that the deadline is never reached.
-		Orphan: sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second, PropagationMargin: 0},
-	})
-	if err != nil {
-		t.Fatal(err)
-	}
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-		defer cancel()
-		_ = shim.Terminate(ctx)
-	})
-	adoption, err := sessionshim.Adopt(context.Background(), sessionshim.AdoptOptions{
-		Registry: registry, ControllerID: "controller-readopt-first",
-	})
-	if err != nil || len(adoption.Adopted) != 1 {
-		t.Fatalf("Adopt = %+v, %v", adoption, err)
-	}
-	f.controller = adoption.Adopted[0]
-
-	f.daemon = New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
-		RegistryDir:     filepath.Join(dir, "registry"),
-		CallbackTimeout: 5 * time.Second,
-		HostIDForOrg:    func(context.Context, string) (string, error) { return "wh_readopt_host", nil },
-		OnAdoption: func(ctx context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
-			f.mu.Lock()
-			f.adoptions++
-			attempt := f.adoptions
-			f.mu.Unlock()
-			if err := adoptionOutcome(ctx, attempt); err != nil {
-				return SessionShimAdoptionReceipt{}, err
-			}
-			return SessionShimAdoptionReceipt{DurableCorrelation: []byte("readopt-" + evidence.Identity.Key())}, nil
-		},
-		OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
-			f.mu.Lock()
-			defer f.mu.Unlock()
-			if f.batchOutcome != nil {
-				if err := f.batchOutcome(batch); err != nil {
-					f.refused = append(f.refused, cloneSessionShimAdoptionBatch(batch))
-					return SessionShimAdoptionBatchReceipt{}, err
-				}
-			}
-			f.batches = append(f.batches, cloneSessionShimAdoptionBatch(batch))
-			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-readopt"), AdoptionRevision: "readopt-revision"}, nil
-		},
-		Readoption: policy,
-	}})
-	t.Cleanup(f.daemon.ReleaseAdoptedSessionShims)
-	evidence, err := f.daemon.sessionShimAdoptionEvidence(context.Background(), f.controller, SessionShimAdoptionPreparationResult{}, "wh_readopt_host")
-	if err != nil {
-		t.Fatalf("adoption evidence: %v", err)
-	}
-	evidence.SnapshotProxy = nil
-	f.daemon.shims.mu.Lock()
-	f.daemon.shims.registry = registry
-	f.daemon.shims.adopted[f.id] = adoptedShim{
-		controller: f.controller, shimID: f.controller.Hello().ShimID,
-		adoption: evidence, adoptionReceipt: SessionShimAdoptionReceipt{DurableCorrelation: []byte("first")},
-	}
-	f.daemon.shims.mu.Unlock()
-	return f
+	return newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: policy, adoption: adoptionOutcome})
 }
 
 func (f *readoptFixture) snapshot() (int, []SessionShimAdoptionBatch) {
@@ -444,8 +366,8 @@ func TestReadoptionWhoseBatchIsRefusedRestoresTheLostEntry(t *testing.T) {
 	lost := f.lostEntry(t)
 	lostGeneration := lost.adoption.ControllerGeneration
 
-	if d.readoptSessionShimAfterControllerLoss(f.id, lost) {
-		t.Fatal("re-adoption reported success though its batch was refused")
+	if got := d.readoptSessionShimAfterControllerLoss(f.id, lost); got == readoptionSucceeded {
+		t.Fatalf("re-adoption disposition = %d, want anything but success though its batch was refused", got)
 	}
 
 	adoptions, published := f.snapshot()
@@ -670,7 +592,7 @@ func TestReadoptionAttemptIsBoundedByThePolicyAttemptTimeout(t *testing.T) {
 	started := time.Now()
 	readopted := d.readoptSessionShimAfterControllerLoss(f.id, lost)
 	elapsed := time.Since(started)
-	if readopted {
+	if readopted == readoptionSucceeded {
 		t.Fatal("re-adoption reported success though its durable adoption never answered")
 	}
 	// Generous slack for a loaded -race run, but far below the fixture's 5 s

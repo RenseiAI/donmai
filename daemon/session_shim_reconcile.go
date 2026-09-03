@@ -371,10 +371,8 @@ func (d *Daemon) reconcileSessionShimScope(scope string, budget time.Duration) e
 // sleepSessionShimReconcileBackoff waits one derived backoff unit, or returns
 // false when the daemon released its shims first.
 func (d *Daemon) sleepSessionShimReconcileBackoff(backoff time.Duration) bool {
-	timer := time.NewTimer(backoff)
-	defer timer.Stop()
 	select {
-	case <-timer.C:
+	case <-d.shimAfter(backoff):
 		return true
 	case <-d.shims.reconcileStop:
 		return false

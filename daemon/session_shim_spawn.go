@@ -1783,6 +1783,10 @@ func (d *Daemon) trackLaunchedShim(
 		launched:        true,
 		adoption:        evidence,
 		adoptionReceipt: cloneSessionShimAdoptionReceipt(receipt),
+		// Launched through the same publication pipeline an adoption runs, so
+		// the carrier binding holds from here (see adoptedShim.carrierBound).
+		carrierBound:           true,
+		carrierBoundAtUnixNano: d.shimNow().UnixNano(),
 	}
 	d.shims.mu.Lock()
 	d.shims.adopted[ctrl.Identity()] = entry
@@ -2512,17 +2516,48 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// projection built meanwhile must keep saying so. Removing it first would
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
-	if cause == shimStreamCarrierLost && d.readoptSessionShimAfterControllerLoss(id, entry) {
+	if cause != shimStreamCarrierLost {
+		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
 		return
 	}
-	d.quarantineLostSessionShim(id, entry)
+	// The carrier binding is gone from this instant. Recording it before the
+	// re-adoption runs is what lets an embedder see the state DURING the
+	// window, which is the only time the observation is worth anything.
+	cfg := d.sessionShimConfig()
+	if d.noteSessionShimCarrierBindLost(id, ctrl) {
+		d.raiseSessionShimCarrierBindLost(cfg, id)
+	}
+	switch d.readoptSessionShimAfterControllerLoss(id, entry) {
+	case readoptionSucceeded:
+		return
+	case readoptionWindowExhausted:
+		// The window ended with the shim still observable — an outcome the
+		// dead-shim path cannot produce, so it does not get the dead-shim
+		// disposition. A composition that can repair the carrier out of band
+		// keeps the lineage; the default withdraws it under its own reason.
+		if cfg.readoption().PostWindowOutcome == ReadoptionNotifyOnly {
+			slog.Warn("session shim: keeping the lineage adopted after an exhausted re-adoption window",
+				"session", id.String())
+			return
+		}
+		d.quarantineLostSessionShim(id, entry, sessionShimReadoptionWindowExhaustedDetail)
+	default:
+		d.quarantineLostSessionShim(id, entry, sessionShimControllerLostDetail)
+	}
 }
 
 // quarantineLostSessionShim withdraws authority from the lost controller and
 // projects the exact live shim as quarantined `socket_unreachable`, then
 // publishes. It is a no-op when the entry has already left by another route —
 // a shutdown release, or a replacement controller.
-func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adoptedShim) {
+//
+// detail is what distinguishes the two ways a lineage reaches this path: the
+// ordinary controller loss, and a lineage-live re-adoption window that ended
+// with the shim still observable. The closed reason registry is the same for
+// both — this change does not extend it — so the detail is where the
+// amendment's "carrying a reason that distinguishes it from the dead-shim
+// outcome" lives.
+func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adoptedShim, detail string) {
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
@@ -2531,6 +2566,7 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 	}
 	if ok {
 		delete(d.shims.adopted, id)
+		delete(d.shims.keepalives, id)
 		hello := entry.controller.Hello()
 		q := sessionshim.NewQuarantinedSession(sessionshim.Record{
 			OrgID:             id.OrgID,
@@ -2541,8 +2577,7 @@ func (d *Daemon) quarantineLostSessionShim(id sessionshim.Identity, entry adopte
 			ProtocolMax:       hello.Max,
 			Phase:             hello.Phase,
 			CreatedAtUnixNano: now.UnixNano(),
-		}, sessionshim.QuarantineSocketUnreachable,
-			"controller stream ended before a terminal observation", now)
+		}, sessionshim.QuarantineSocketUnreachable, detail, now)
 		q.ControllerGeneration = uint64(entry.controller.Generation())
 		d.upsertShimQuarantineLocked(q)
 	}
@@ -3065,17 +3100,20 @@ func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*se
 // adoptedShimEntry resolves one adopted session with a live controller.
 func (d *Daemon) adoptedShimEntry(orgID, sessionID string) (adoptedShim, error) {
 	if d.shims == nil {
-		return adoptedShim{}, errors.New("session shim: adoption is not configured")
+		return adoptedShim{}, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
 	}
 	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
 	d.shims.mu.RLock()
 	entry, ok := d.shims.adopted[id]
 	d.shims.mu.RUnlock()
 	if !ok {
-		return adoptedShim{}, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+		// The sentence is load-bearing: existing callers and their pins read
+		// this refusal, so the sentinel is worded to compose into exactly the
+		// message that was here before %w was added to it.
+		return adoptedShim{}, fmt.Errorf("session shim: %s is %w", id, ErrSessionShimNotAdopted)
 	}
 	if entry.controller == nil {
-		return adoptedShim{}, fmt.Errorf("session shim: %s has no live controller connection", id)
+		return adoptedShim{}, fmt.Errorf("session shim: %s %w", id, ErrSessionShimNoController)
 	}
 	return entry, nil
 }
@@ -3173,10 +3211,28 @@ func (d *Daemon) sessionShimHandles() []SessionHandle {
 // spawner's injectable clock so shim-backed and direct handles are stamped from
 // the same source in tests.
 func (d *Daemon) shimNow() time.Time {
+	if d.shims != nil {
+		if clock := d.shims.clock.Load(); clock != nil && clock.now != nil {
+			return clock.now()
+		}
+	}
 	if d.spawner != nil && d.spawner.opts.Now != nil {
 		return d.spawner.opts.Now()
 	}
 	return time.Now()
+}
+
+// shimAfter is the wait side of the one session-shim clock. Every wait the
+// re-adoption window takes goes through it, so an injected clock advances the
+// window's instants and its waits together — deriving one from a fake clock and
+// the other from a real timer is what made the window untestable before.
+func (d *Daemon) shimAfter(wait time.Duration) <-chan time.Time {
+	if d.shims != nil {
+		if clock := d.shims.clock.Load(); clock != nil && clock.after != nil {
+			return clock.after(wait)
+		}
+	}
+	return time.After(wait)
 }
 
 // sessionShimRegistry opens the registry once and reuses it for the daemon's

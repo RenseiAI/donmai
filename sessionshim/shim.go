@@ -775,8 +775,13 @@ func (s *Shim) serveController(conn *net.UnixConn) {
 	}
 
 	if err := s.handshake(conn, w, r); err != nil {
-		s.logger.Warn("sessionshim: controller handshake refused",
-			"session", s.id.String(), "error", err)
+		// A keepalive is a served exchange, not a refused handshake: it
+		// deliberately ends the connection without adopting, so logging it as a
+		// refusal would fill an orphaned shim's log with its own liveness.
+		if !errors.Is(err, errOrphanKeepaliveServed) {
+			s.logger.Warn("sessionshim: controller handshake refused",
+				"session", s.id.String(), "error", err)
+		}
 		_ = conn.Close()
 	}
 }
@@ -816,6 +821,13 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	msg, err := r.Read()
 	if err != nil {
 		return fmt.Errorf("sessionshim: read welcome: %w", err)
+	}
+	if msg.Type == shimwire.TypeHeartbeat {
+		// A Heartbeat where a Welcome belongs is the §D8 orphan keepalive: the
+		// daemon is telling this shim it is still observed while its own
+		// re-adoption keeps failing. It proposes no generation and takes no
+		// authority, so it is answered and the connection ends here.
+		return s.serveOrphanKeepalive(w, msg)
 	}
 	if msg.Type != shimwire.TypeWelcome {
 		_ = sendError(w, shimwire.CodeMalformed, "expected Welcome")
