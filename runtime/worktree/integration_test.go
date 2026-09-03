@@ -7,7 +7,9 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
@@ -80,5 +82,67 @@ func TestIntegrationProvisionTeardownClone(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("expected worktree gone, stat=%v", err)
+	}
+}
+
+func TestIntegrationWorktreeBaseRefreshesBetweenLaunches(t *testing.T) {
+	requireGit(t)
+
+	bare := initBareRepo(t)
+	parent := filepath.Join(t.TempDir(), "parent")
+	clone := exec.Command("git", "clone", "--branch", "main", bare, parent)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Fatalf("clone parent: %v\n%s", err, out)
+	}
+	advance := t.TempDir()
+	clone = exec.Command("git", "clone", "--branch", "main", bare, advance)
+	if out, err := clone.CombinedOutput(); err != nil {
+		t.Fatalf("clone advance: %v\n%s", err, out)
+	}
+	run := func(dir string, args ...string) string {
+		cmd := exec.Command("git", args...)
+		cmd.Dir = dir
+		out, err := cmd.CombinedOutput()
+		if err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+		return string(out)
+	}
+	run(advance, "config", "user.email", "test@example.com")
+	run(advance, "config", "user.name", "test")
+	if err := os.WriteFile(filepath.Join(advance, "new.txt"), []byte("new"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	run(advance, "add", "new.txt")
+	run(advance, "commit", "-m", "advance")
+	newTip := strings.TrimSpace(run(advance, "rev-parse", "HEAD"))
+	run(advance, "push", "origin", "main")
+
+	m, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), RetryDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
+		SessionID: "first", Branch: "session-first", Strategy: worktree.StrategyWorktreeAdd,
+		ParentRepoPath: parent, BaseRef: "refs/heads/main",
+	}); err != nil {
+		t.Fatalf("first Provision: %v", err)
+	}
+	if err := m.Teardown(ctx, "first"); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := m.Provision(ctx, worktree.ProvisionSpec{
+		SessionID: "second", Branch: "session-second", Strategy: worktree.StrategyWorktreeAdd,
+		ParentRepoPath: parent, BaseRef: "origin/main",
+	}); err != nil {
+		t.Fatalf("second Provision: %v", err)
+	}
+	result, err := m.Result("second")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if result.BaseRef != "main" || result.BaseSHA != newTip || !result.BaseFetched {
+		t.Fatalf("second base receipt = %#v, want tip %s", result, newTip)
 	}
 }
