@@ -47,8 +47,10 @@ const (
 	// to keep sessions fully isolated.
 	StrategyClone CloneStrategy = iota
 	// StrategyWorktreeAdd runs `git worktree add` off an existing
-	// parent clone. Cheap and ideal when many sessions share a
-	// long-lived parent under the daemon's clone directory.
+	// parent clone. New session branches use --no-track to avoid concurrent
+	// updates to the shared parent's .git/config; callers must configure an
+	// upstream explicitly before using a bare `git push`. Cheap and ideal when
+	// many sessions share a long-lived parent under the daemon's clone directory.
 	StrategyWorktreeAdd
 	// StrategyEmpty creates a fresh deterministic session directory without a
 	// git repository. It is reserved for genuinely repository-free work.
@@ -229,9 +231,10 @@ type Manager struct {
 	now              func() time.Time
 	lifecycleHook    func(string)
 
-	mu           sync.Mutex
-	sessions     map[string]*ProvisionResult
-	sessionLocks map[string]*sync.Mutex
+	mu            sync.Mutex
+	sessions      map[string]*ProvisionResult
+	sessionLocks  map[string]*sync.Mutex
+	worktreeLocks map[string]*sync.Mutex
 }
 
 // ProvisionHook is a test/fault-injection seam at durable crash boundaries.
@@ -374,6 +377,7 @@ func NewManager(opts Options) (*Manager, error) {
 		lifecycleHook:    opts.LifecycleHook,
 		sessions:         make(map[string]*ProvisionResult),
 		sessionLocks:     make(map[string]*sync.Mutex),
+		worktreeLocks:    make(map[string]*sync.Mutex),
 	}
 	if acquisitions != nil {
 		if err := manager.restoreReadyAcquisitions(); err != nil {
@@ -1608,7 +1612,7 @@ type baseFetchInfo struct {
 // clone strategy already obtains its base during clone and retains its historical
 // command shape.
 func (m *Manager) refreshBase(ctx context.Context, parent string, spec ProvisionSpec) (baseFetchInfo, error) {
-	if spec.Strategy != StrategyWorktreeAdd || spec.SkipBaseFetch {
+	if spec.Strategy != StrategyWorktreeAdd {
 		return baseFetchInfo{}, nil
 	}
 	if parent == "" {
@@ -1622,6 +1626,9 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	ref, err = normalizeBaseRef(ref)
 	if err != nil {
 		return baseFetchInfo{}, err
+	}
+	if spec.SkipBaseFetch {
+		return baseFetchInfo{}, nil
 	}
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
@@ -1753,7 +1760,10 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			// branches are also fine because -B resets the branch.
 			args = append(args, "origin/"+baseRef)
 		}
+		worktreeLock := m.parentWorktreeLock(parent)
+		worktreeLock.Lock()
 		out, err := m.runGit(ctx, spec.RepoURL, args...)
+		worktreeLock.Unlock()
 		if err != nil {
 			return fmt.Errorf("git worktree add: %w (%s)", err, strings.TrimSpace(string(out)))
 		}
@@ -1773,6 +1783,17 @@ func (m *Manager) lockSession(sessionID string) func() {
 	m.mu.Unlock()
 	lock.Lock()
 	return lock.Unlock
+}
+
+func (m *Manager) parentWorktreeLock(parent string) *sync.Mutex {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	lock := m.worktreeLocks[parent]
+	if lock == nil {
+		lock = &sync.Mutex{}
+		m.worktreeLocks[parent] = lock
+	}
+	return lock
 }
 
 // runGit runs a git invocation, applying the credential-hardening seam when a
@@ -1856,6 +1877,8 @@ func isRetriable(err error) bool {
 		"already exists",
 		"Agent already running",
 		"Agent is still running",
+		"could not lock config file",
+		"failed to read .git/worktrees/",
 	} {
 		if strings.Contains(msg, frag) {
 			return true

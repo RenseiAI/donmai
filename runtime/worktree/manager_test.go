@@ -617,7 +617,7 @@ func TestProvisionRejectsUnsafeBaseRefs(t *testing.T) {
 		calls.Add(1)
 		return nil, errors.New("runner must not be called")
 	}
-	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner})
+	m, err := worktree.NewManager(worktree.Options{ParentDir: dir, CommandRunner: runner, RetryDelay: time.Millisecond})
 	if err != nil {
 		t.Fatal(err)
 	}

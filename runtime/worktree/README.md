@@ -34,7 +34,7 @@ the flat singular path and never receive a declaration.
 ## Strategies
 
 - `StrategyClone` — `git clone --branch <b> <repo> <dst>`. Fully isolated session; one full repo per session.
-- `StrategyWorktreeAdd` — `git worktree add -B <b> <dst> origin/<b>` off an existing parent clone. Cheaper for many concurrent sessions.
+- `StrategyWorktreeAdd` — `git worktree add --no-track -B <b> <dst> origin/<b>` off an existing parent clone. The session branch has no automatic upstream; configure one explicitly before a bare `git push`. Cheaper for many concurrent sessions.
 - `StrategyEmpty` — create a fresh flat session directory without invoking Git. Used only for work whose accepted session detail has no repository; versioned declarations and shared participants retain their existing strategies.
 
 ## Retry contract (verbatim port from legacy TS)
