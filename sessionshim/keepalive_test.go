@@ -198,8 +198,11 @@ func TestOrphanKeepaliveIsRefusedOutsideAnArmedDeadline(t *testing.T) {
 	if !peerCredSupported() {
 		t.Skip("session shim adoption is unsupported on this platform")
 	}
-	t.Parallel()
-	const deadline = 300 * time.Millisecond
+	// Not parallel, and a deadline measured in seconds: the assertions are about
+	// REFUSAL, not about timing, but the second half has to wait for a real
+	// harness to be reaped, and a sub-second deadline makes that wait a race
+	// with the scheduler rather than with the shim.
+	const deadline = 2 * time.Second
 	reg, shim, id, ctrl := startKeepaliveShim(t, deadline)
 	t.Cleanup(func() { _ = ctrl.Close() })
 
@@ -212,7 +215,7 @@ func TestOrphanKeepaliveIsRefusedOutsideAnArmedDeadline(t *testing.T) {
 	}
 
 	_ = ctrl.Close()
-	waitForPhase(t, shim, shimwire.PhaseExited, 5*deadline)
+	waitForPhase(t, shim, shimwire.PhaseExited, 60*time.Second)
 	if _, err := KeepAlive(context.Background(), record, KeepAliveOptions{}); err == nil {
 		t.Fatal("KeepAlive after the deadline fired reported success; a fired deadline may never be taken back")
 	}

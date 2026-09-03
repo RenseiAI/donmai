@@ -799,10 +799,12 @@ func TestWorstCaseWindowReportsTheGoverningWindowInBothModes(t *testing.T) {
 func TestCarrierLossClosesTheLostControllerSoTheShimReapsOnItsDeadline(t *testing.T) {
 	t.Parallel()
 	// Long enough that the quarantine is still projected when it is read: the
-	// shim's reap withdraws the row again through the tombstone reconciler, and
-	// a deadline shorter than a loaded quarantine publication would have this
-	// test racing its own success.
-	const orphanDeadline = 3 * time.Second
+	// shim's reap withdraws the row again through the tombstone reconciler, so
+	// a deadline the loaded publication path can outrun has this test racing
+	// its own success. The reap it waits for afterwards is bounded by the
+	// deadline, not by this number, so buying protection here costs only the
+	// wait below.
+	const orphanDeadline = 10 * time.Second
 	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
 		policy: SessionShimReadoptionPolicy{Disabled: true},
 		orphan: sessionshim.OrphanPolicy{
@@ -822,7 +824,7 @@ func TestCarrierLossClosesTheLostControllerSoTheShimReapsOnItsDeadline(t *testin
 		t.Fatal("the lost controller's connection is still usable after the quarantine")
 	}
 	// And because it is gone, the shim armed its own clock and reaped.
-	const reapWait = 20 * time.Second
+	const reapWait = 90 * time.Second
 	deadline := time.Now().Add(reapWait)
 	for time.Now().Before(deadline) {
 		if _, err := f.registry.GetTombstoneIncarnation(f.id, hello.ShimID, hello.ProcessEpoch); err == nil {
