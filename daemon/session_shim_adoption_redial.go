@@ -16,8 +16,26 @@ package daemon
 // evidence, whose only permitted consequences are preserve, recheck, retry, and
 // then degrade visibly — never a terminal outcome. A stale carrier proof is
 // exactly that: the proof this dial holds has been overtaken, the repair is a
-// new proof at a strictly greater carrier epoch, and the harness on the other
-// side of it was alive the entire time.
+// RE-SIGNED proof at a corrected boundary, and the harness on the other side of
+// it was alive the entire time.
+//
+// WHAT THIS PATH CAN AND CANNOT REPAIR
+//
+// It can repair a boundary. It cannot repair an epoch.
+//
+// The handshake is over by the time a re-prepare runs. The shim has committed
+// one generation, one resume cursor, and one exact extension set — and the
+// adoption ADR's D15.3 says no carrier commit occurs before Adopted echoes the
+// prepared value. No Adopted frame will ever echo a SECOND carrier epoch,
+// because validateAdoptionCommit already froze the echo against the first
+// Welcome and there is no second Welcome to send. So a re-prepared answer is
+// honourable here only when it re-signs the SAME carrier epoch at a corrected
+// boundary. An answer whose epoch supersedes needs a handshake this path does
+// not have, and is refused and quarantined — the same disposition a
+// disagreeing generation gets. Committing it instead would publish an
+// activation naming the epoch the authority was just told to abandon, which is
+// precisely the "reactivating its incumbent" the 2026-08-23 retained-candidate
+// abandonment correction forbids.
 //
 // WHAT THIS RELIES ON THE COMPOSING AUTHORITY TO DO
 //
@@ -29,15 +47,23 @@ package daemon
 //   - a re-prepare carries SessionShimPrepareCauseCarrierCursorDrift and its
 //     attempt number, which is this daemon declaring that an earlier
 //     reservation for this lineage is outstanding and stale;
-//   - the authority abandons that reservation before reserving above the
-//     all-time carrier-epoch floor. Under the recovery ADR's §D4 disposition
-//     rule, changed bytes under the same idempotency key are a re-prepare, not
-//     a replay, and every attempt that created or inherited an uncommitted
-//     reservation ends with one durable disposition;
-//   - an authority that will NOT supersede answers a typed conflict
-//     (ErrSessionShimAdoptionPrepareConflict). That is a refusal, not a
-//     failure: this pass spends none of its remaining budget on it and
-//     quarantines with the conflict as the detail.
+//   - the authority disposes of it as preparing_reprepare — the adoption ADR's
+//     one abandonment cause whose SOURCE is a preparing handoff and which may
+//     keep or change the controller. That ADR states the obligation directly:
+//     an admitted preparing handoff has no retained Snapshot replay and must
+//     abandon before reprepare. carrier_cursor_drift is a PREPARE cause, a
+//     different axis from the abandonment vocabulary, so the mapping is named
+//     here rather than left for an authority to guess: drift maps to
+//     preparing_reprepare and to nothing else;
+//   - a predecessor that has already reached receipt_stored is NOT that case.
+//     The same ADR is explicit that a same-controller receipt_stored handoff
+//     with changed bytes is a changed-replay conflict, not permission to
+//     abandon and resample, and its only same-controller abandonment causes
+//     (credential_lifetime_insufficient, lineage_terminal) need evidence
+//     carrier cursor drift does not have. An authority in that state answers
+//     the typed ErrSessionShimAdoptionPrepareConflict, which is a refusal
+//     rather than a failure: this pass spends none of its remaining budget on
+//     it and quarantines with the conflict as the detail.
 //
 // A daemon that asked without saying why would leave the authority unable to
 // tell a re-prepare from a first ask, which is how an admitted candidate
@@ -52,6 +78,7 @@ import (
 
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 const (
@@ -152,7 +179,7 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 			return evidence, preparation, SessionShimAdoptionReceipt{},
 				fmt.Errorf("%w; re-prepare %d failed: %v", err, attempt, prepareErr)
 		}
-		if bindErr := bindReprepatedAdoptionToController(ctrl, next, prepared); bindErr != nil {
+		if bindErr := bindRepreparedAdoptionToController(ctrl, next, prepared); bindErr != nil {
 			return evidence, preparation, SessionShimAdoptionReceipt{},
 				fmt.Errorf("%w; re-prepare %d unusable: %v", err, attempt, bindErr)
 		}
@@ -175,23 +202,45 @@ func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
 	return evidence, preparation, receipt, err
 }
 
-// bindReprepatedAdoptionToController checks that a re-prepared answer can
+// ErrSessionShimRepreparedCarrierEpochSupersedes reports a re-prepared answer
+// whose negotiated extensions — carrier_epoch above all — differ from the ones
+// the shim committed.
+//
+// It is separate from the other two disagreements because it is the one an
+// authority following this path's own contract will produce if it reads
+// "abandon and re-prepare" as "reserve a higher epoch". The commit that would
+// follow is unsanctioned: the evidence's extensions are sourced from the shim's
+// Adopted frame, which validateAdoptionCommit froze against the FIRST Welcome,
+// so the receipt would name the new candidate while carrying the superseded
+// epoch, and the activation published from it would reactivate exactly what the
+// authority was told to burn.
+var ErrSessionShimRepreparedCarrierEpochSupersedes = errors.New(
+	"session shim: a re-prepared carrier epoch cannot be committed without a second handshake",
+)
+
+// bindRepreparedAdoptionToController checks that a re-prepared answer can
 // actually be honoured by the controller that is already adopted.
 //
-// The first preparation is answered INSIDE the handshake, where its generation
-// and cursor still have a Welcome to travel on and are validated on the way.
-// A re-prepare has neither: the handshake is over, the shim has committed a
-// generation, and the resume cursor it is replaying from is fixed. A second
-// answer that resolves different values cannot be applied — and must not be
-// silently dropped either, because the receipt would then bind the SECOND
-// proof to the FIRST cursor and generation, and a legitimately raised floor
+// The first preparation is answered INSIDE the handshake, where its generation,
+// cursor, and extensions still have a Welcome to travel on and are validated on
+// the way. A re-prepare has none of that: the handshake is over, the shim has
+// committed a generation, the resume cursor it is replaying from is fixed, and
+// its Adopted frame has already echoed one exact extension set. A second answer
+// that resolves different values cannot be applied — and must not be silently
+// dropped either, because the receipt would then bind the SECOND proof to the
+// FIRST cursor, generation, and carrier epoch, and a legitimately raised floor
 // would be discarded with none of its own checks ever running.
 //
 // So the answer runs the same validation the handshake runs — via the one
 // exported resolver both paths call — and is then required to agree with what
 // the controller holds. A disagreement is a refusal the caller quarantines,
 // naming both values.
-func bindReprepatedAdoptionToController(
+//
+// The two static-configuration bounds are passed false deliberately: a
+// re-prepare has no static generation or cursor to conflict with, because the
+// only authority left is the committed adoption itself, and agreement with THAT
+// is a strictly stronger requirement than either flag expresses.
+func bindRepreparedAdoptionToController(
 	ctrl *sessionshim.Controller,
 	asked sessionshim.AdoptionPreparation,
 	prepared SessionShimAdoptionPreparationResult,
@@ -203,6 +252,13 @@ func bindReprepatedAdoptionToController(
 	})
 	if err != nil {
 		return err
+	}
+	committed := ctrl.Adoption()
+	if !resolved.Extensions.ExactEqual(committed.Extensions) {
+		return fmt.Errorf("%w: re-prepared carrier epoch %s, committed %s",
+			ErrSessionShimRepreparedCarrierEpochSupersedes,
+			shimExtensionCarrierEpoch(resolved.Extensions),
+			shimExtensionCarrierEpoch(committed.Extensions))
 	}
 	if resolved.ControllerGeneration != 0 && resolved.ControllerGeneration != ctrl.Generation() {
 		return fmt.Errorf(
@@ -217,6 +273,16 @@ func bindReprepatedAdoptionToController(
 		)
 	}
 	return nil
+}
+
+// shimExtensionCarrierEpoch renders an extension set's carrier epoch for an
+// operator-facing refusal. An absent epoch is said, not elided: "absent" and
+// "the same as the other one" are different facts about a disagreement.
+func shimExtensionCarrierEpoch(extensions shimwire.Extensions) string {
+	if epoch, ok := extensions.Get(shimwire.ExtCarrierEpoch); ok {
+		return epoch
+	}
+	return "absent"
 }
 
 // waitSessionShimDriftBackoff spends the doubling delay before attempt n

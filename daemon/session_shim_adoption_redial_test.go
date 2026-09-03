@@ -6,10 +6,12 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/sessionshim"
@@ -36,6 +38,10 @@ type driftingAdoption struct {
 	// under the lock and is handed the ask, so it can build a value relative to
 	// what the daemon actually reported.
 	answer func(preparedAsk) (sessionshim.PreparedAdoption, error)
+	// carrierEpochs, when set, supplies the carrier epoch each attempt signs.
+	// A proof-bound carrier answer must also resolve a cursor, so an entry here
+	// makes the answer a full proof-v2 shape rather than a bare correlation.
+	carrierEpochs []string
 	// beforeRefuse runs on each refused dial, so a fixture can leave behind the
 	// state a real refused attempt would have left.
 	beforeRefuse func(SessionShimAdoptionEvidence) error
@@ -48,6 +54,17 @@ func (a *driftingAdoption) prepare(_ context.Context, in SessionShimAdoptionPrep
 	defer a.mu.Unlock()
 	ask := preparedAsk{cause: in.Cause, attempt: in.Attempt, generation: in.CurrentControllerGeneration}
 	a.asks = append(a.asks, ask)
+	if len(a.carrierEpochs) > 0 {
+		epoch := a.carrierEpochs[len(a.carrierEpochs)-1]
+		if index := len(a.asks) - 1; index < len(a.carrierEpochs) {
+			epoch = a.carrierEpochs[index]
+		}
+		return sessionshim.PreparedAdoption{
+			Correlation: []byte(fmt.Sprintf("candidate-%d", len(a.asks))),
+			Extensions:  shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: epoch}},
+			ResumeFrom:  proofResolvedResume(in),
+		}, nil
+	}
 	if a.answer != nil {
 		return a.answer(ask)
 	}
@@ -420,5 +437,220 @@ func TestStartupCompositionQuarantinesDriftOnlyAfterTheBound(t *testing.T) {
 	}
 	if len(batches[0].Quarantined) != 1 || batches[0].Quarantined[0].SessionID != spec.SessionID {
 		t.Fatalf("batch.Quarantined = %+v, want the unreconciled lineage presented", batches[0].Quarantined)
+	}
+}
+
+// TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch pins the
+// one field of a re-prepared answer that cannot be honoured after the
+// handshake, and that this path's own contract would otherwise produce.
+//
+// The committed evidence sources its extensions from the shim's Adopted frame,
+// which validateAdoptionCommit froze against the FIRST Welcome. There is no
+// second Welcome, so no Adopted frame will ever echo a second carrier epoch —
+// D15.3's "no carrier commit before Adopted echoes the prepared value". Binding
+// the new candidate to the old epoch would publish an activation naming the
+// epoch the authority was just told to abandon, which is the "reactivating its
+// incumbent" the retained-candidate abandonment correction forbids.
+//
+// So: refuse and quarantine, naming both epochs.
+func TestStartupCompositionRefusesAReprepareThatSupersedesTheCarrierEpoch(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	const orgID = "org-drift-epoch"
+	spec := launchOneAdoptableLineage(t, f, orgID, "lineage-superseding-epoch")
+
+	var (
+		batchMu sync.Mutex
+		batches []SessionShimAdoptionBatch
+	)
+	// The shape the header used to promise: the second proof reserves a higher
+	// carrier epoch.
+	adoption := &driftingAdoption{refuseUntil: 2, carrierEpochs: []string{"7", "8"}}
+	replacement := newDriftRedialDaemon(t, f.registry, orgID, adoption, &batches, &batchMu)
+
+	// Reaching the carrier-activation stage at all means the bind accepted the
+	// superseding epoch: the evidence was committed, and what it names is the
+	// epoch the shim echoed at the FIRST Welcome, not the one just signed.
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("the composition committed a re-prepared candidate at the superseded carrier epoch: %v", err)
+	}
+
+	if _, err := replacement.adoptedShimEntry(orgID, spec.SessionID); err == nil {
+		t.Fatal("a receipt was committed binding a re-prepared candidate to the superseded carrier epoch")
+	}
+	asks, dials := adoption.snapshot()
+	if len(asks) != 2 {
+		t.Fatalf("preparation asks = %d, want 2", len(asks))
+	}
+	if dials != 1 {
+		t.Fatalf("durable adoption dials = %d, want 1 — an unusable answer is never dialled", dials)
+	}
+	found := false
+	for _, q := range replacement.QuarantinedSessions() {
+		if q.SessionID != spec.SessionID {
+			continue
+		}
+		found = true
+		if q.Reason != sessionshim.QuarantineAdoptionFailed {
+			t.Fatalf("quarantine reason = %q, want %q", q.Reason, sessionshim.QuarantineAdoptionFailed)
+		}
+		for _, want := range []string{"unusable", "carrier epoch 8", "committed 7"} {
+			if !strings.Contains(q.Detail, want) {
+				t.Fatalf("quarantine detail %q does not name %q", q.Detail, want)
+			}
+		}
+	}
+	if !found {
+		t.Fatal("the lineage was not surfaced in the live quarantine projection")
+	}
+
+	batchMu.Lock()
+	defer batchMu.Unlock()
+	if len(batches) != 1 {
+		t.Fatalf("adoption batches committed = %d, want exactly 1", len(batches))
+	}
+	if len(batches[0].Adopted) != 0 {
+		t.Fatalf("batch.Adopted = %+v, want empty — the evidence must never be committed", batches[0].Adopted)
+	}
+}
+
+// TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch is the acceptance arm,
+// and the statement of what this path CAN repair: a boundary, not an epoch.
+//
+// It works against a REAL adopted controller whose Adopted frame echoed
+// carrier epoch 7, and asks the bind what it will honour. A re-signed
+// same-epoch answer at the same cursor binds — it supersedes nothing, so no
+// abandonment is owed on the succeeding path at all. Every disagreement with
+// what the shim committed is refused, naming both values.
+func TestRepreparedAdoptionBindsOnlyAResignedCarrierEpoch(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	const orgID = "org-bind-epoch"
+	spec := launchOneAdoptableLineage(t, f, orgID, "lineage-bind-epoch")
+
+	registry, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := sessionshim.Identity{OrgID: orgID, SessionID: spec.SessionID}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	// Adopt exactly as the composing pass does, with a proof-bound carrier
+	// answer, so the controller under test holds a real Adopted echo of epoch 7.
+	result, err := sessionshim.Adopt(ctx, sessionshim.AdoptOptions{
+		Registry:     registry,
+		ControllerID: "controller-bind-epoch",
+		Filter:       func(candidate sessionshim.Identity) bool { return candidate == id },
+		Prepare: func(_ context.Context, evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			resume := evidence.LastHostSeq + 1
+			return sessionshim.PreparedAdoption{
+				Extensions: shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "7"}},
+				ResumeFrom: &resume,
+			}, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("Adopt: %v", err)
+	}
+	defer result.Close()
+	if len(result.Adopted) != 1 {
+		t.Fatalf("adopted = %d, want the one lineage (quarantined: %+v)", len(result.Adopted), result.Quarantined)
+	}
+	ctrl := result.Adopted[0]
+	if got, _ := ctrl.Adoption().Extensions.Get(shimwire.ExtCarrierEpoch); got != "7" {
+		t.Fatalf("committed carrier epoch = %q, want the echoed 7", got)
+	}
+
+	hello := ctrl.Hello()
+	asked := sessionshim.AdoptionPreparation{
+		Identity: id, ShimID: hello.ShimID, ProcessEpoch: hello.ProcessEpoch,
+		CurrentControllerGeneration: ctrl.Generation(),
+		LocalResumeFrom:             ctrl.ResumeFrom(),
+		LastHostSeq:                 hello.LastSeq,
+	}
+	cursor := func(v uint64) *uint64 { return &v }
+	epochs := func(value string) shimwire.Extensions {
+		return shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: value}}
+	}
+	tests := []struct {
+		name     string
+		prepared sessionshim.PreparedAdoption
+		wantErr  []string
+	}{
+		{
+			name: "a re-signed same epoch at the same cursor binds",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: epochs("7"), ResumeFrom: cursor(ctrl.ResumeFrom()),
+				Correlation: []byte("candidate-2"),
+			},
+		},
+		{
+			name: "a superseding epoch is refused, naming both",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: epochs("8"), ResumeFrom: cursor(ctrl.ResumeFrom()),
+			},
+			wantErr: []string{"re-prepared carrier epoch 8", "committed 7"},
+		},
+		{
+			name: "a dropped epoch is refused, and says so rather than eliding it",
+			prepared: sessionshim.PreparedAdoption{
+				ResumeFrom: cursor(ctrl.ResumeFrom()),
+			},
+			wantErr: []string{"re-prepared carrier epoch absent", "committed 7"},
+		},
+		{
+			name: "a disagreeing generation is refused",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: epochs("7"), ResumeFrom: cursor(ctrl.ResumeFrom()),
+				ControllerGeneration: ctrl.Generation() + 7,
+			},
+			wantErr: []string{"does not match the committed generation"},
+		},
+		{
+			// A cursor below the local floor never reaches the binding at all —
+			// the shared resolver refuses it first, which is the point of both
+			// callers going through it. A cursor ABOVE the adopted one is not
+			// reachable here: this shim's Hello cursor pins the only legal value
+			// to exactly the adopted one, so the cursor branch of the binding is
+			// covered by the round-trip acceptance above rather than by a
+			// disagreement this fixture cannot construct.
+			name: "a cursor under the local floor is refused by the shared resolver",
+			prepared: sessionshim.PreparedAdoption{
+				Extensions: epochs("7"), ResumeFrom: cursor(0),
+			},
+			wantErr: []string{"regresses local floor"},
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			bindErr := bindRepreparedAdoptionToController(ctrl, asked,
+				SessionShimAdoptionPreparationResult{
+					State: SessionShimPreparationFreshCandidate, PreparedAdoption: test.prepared,
+				})
+			if len(test.wantErr) == 0 {
+				if bindErr != nil {
+					t.Fatalf("a re-signed same-epoch answer was refused: %v", bindErr)
+				}
+				return
+			}
+			if bindErr == nil {
+				t.Fatal("an answer the adopted controller cannot honour was bound")
+			}
+			for _, want := range test.wantErr {
+				if !strings.Contains(bindErr.Error(), want) {
+					t.Fatalf("refusal %q does not name %q", bindErr, want)
+				}
+			}
+		})
+	}
+	// The superseding-epoch refusal is typed, so a caller can tell it from the
+	// other two disagreements without reading the message.
+	supersedes := bindRepreparedAdoptionToController(ctrl, asked,
+		SessionShimAdoptionPreparationResult{
+			State: SessionShimPreparationFreshCandidate,
+			PreparedAdoption: sessionshim.PreparedAdoption{
+				Extensions: epochs("8"), ResumeFrom: cursor(ctrl.ResumeFrom()),
+			},
+		})
+	if !errors.Is(supersedes, ErrSessionShimRepreparedCarrierEpochSupersedes) {
+		t.Fatalf("refusal %v is not classified as a superseding carrier epoch", supersedes)
 	}
 }

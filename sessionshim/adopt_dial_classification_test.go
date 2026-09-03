@@ -31,6 +31,8 @@ import (
 	"syscall"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // stallingProxy fronts a real shim socket. It holds the FIRST connection open
@@ -538,6 +540,109 @@ func TestResolvePreparedAdoptionValidatesEveryAnswerTheSameWay(t *testing.T) {
 			if got.ControllerGeneration != test.want.ControllerGeneration ||
 				got.ResumeFrom != test.want.ResumeFrom || got.ResumeProvided != test.want.ResumeProvided {
 				t.Fatalf("resolved = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestHandshakeWiresTheRealBoundsIntoTheResolver pins the handshake's CALL to
+// ResolvePreparedAdoption, not the resolver itself.
+//
+// The resolver has its own table, but a table proves only that the function
+// refuses what it is told to refuse. Nothing there notices a caller that hands
+// it `StaticResumeConfigured: false`, `StaticGenerationConfigured: false`, or
+// `LocalResumeFrom: 0` regardless of what it actually has — and each of those
+// silently disables one whole check. Now that a second caller passes different
+// bounds, the wiring is the part that can drift.
+//
+// Each case configures the real condition and requires the refusal it implies.
+func TestHandshakeWiresTheRealBoundsIntoTheResolver(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	cursor := func(v uint64) *uint64 { return &v }
+	tests := []struct {
+		name    string
+		session string
+		options func() ControllerOptions
+		wantErr string
+	}{
+		{
+			// StaticResumeConfigured: the caller already fixed the cursor, so a
+			// prepared one is a second authority rather than the answer.
+			name:    "an externally configured resume conflicts with a prepared one",
+			session: "sess-static-resume",
+			options: func() ControllerOptions {
+				return ControllerOptions{
+					ControllerID:               "controller-static-resume",
+					ResumeFrom:                 1,
+					ResumeExternallyConfigured: true,
+					PrepareAdoption: func(evidence AdoptionPreparation) (PreparedAdoption, error) {
+						return PreparedAdoption{ResumeFrom: cursor(evidence.LastHostSeq + 1)}, nil
+					},
+				}
+			},
+			wantErr: "static and proof-resolved resume cursors are both configured",
+		},
+		{
+			// StaticGenerationConfigured: same shape, on the generation axis.
+			name:    "a static generation conflicts with a prepared one",
+			session: "sess-static-generation",
+			options: func() ControllerOptions {
+				return ControllerOptions{
+					ControllerID:   "controller-static-generation",
+					NextGeneration: func(current shimwire.Generation) shimwire.Generation { return current + 1 },
+					PrepareAdoption: func(evidence AdoptionPreparation) (PreparedAdoption, error) {
+						return PreparedAdoption{
+							ControllerGeneration: evidence.CurrentControllerGeneration + 1,
+							ResumeFrom:           cursor(evidence.LastHostSeq + 1),
+						}, nil
+					},
+				}
+			},
+			wantErr: "prepared and static controller generations are both configured",
+		},
+		{
+			// LocalResumeFrom: the floor a prepared cursor may raise and never
+			// regress. A zero handed to the resolver disables it outright.
+			name:    "a prepared cursor under the local floor is refused",
+			session: "sess-local-floor",
+			options: func() ControllerOptions {
+				return ControllerOptions{
+					ControllerID: "controller-local-floor",
+					PrepareAdoption: func(AdoptionPreparation) (PreparedAdoption, error) {
+						return PreparedAdoption{ResumeFrom: cursor(0)}, nil
+					},
+				}
+			},
+			wantErr: "regresses local floor",
+		},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			dir := shortTempDir(t)
+			reg, err := NewRegistry(dir)
+			if err != nil {
+				t.Fatalf("NewRegistry: %v", err)
+			}
+			id := Identity{OrgID: "org-bounds", SessionID: test.session}
+			startInProcessShim(t, reg, dir, id, 1)
+			rec, err := reg.Get(id)
+			if err != nil {
+				t.Fatalf("read the published record: %v", err)
+			}
+			ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+			defer cancel()
+			ctrl, dialErr := Dial(ctx, rec, test.options())
+			if dialErr == nil {
+				_ = ctrl.Close()
+				t.Fatal("the handshake accepted a preparation answer its own bounds forbid")
+			}
+			if !strings.Contains(dialErr.Error(), test.wantErr) {
+				t.Fatalf("refusal %v does not contain %q", dialErr, test.wantErr)
+			}
+			if !errors.Is(dialErr, ErrAdoptionPreparation) {
+				t.Fatalf("refusal %v is not classified as a preparation failure", dialErr)
 			}
 		})
 	}

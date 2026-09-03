@@ -55,28 +55,49 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   whose proof still does not reconcile is quarantined as before, with the reason
   unchanged and the detail carrying both cursors and the number of dials spent.
 
+  **This path repairs a boundary, not an epoch.** By the time a re-prepare runs
+  the handshake is over: the shim has committed one generation, one resume
+  cursor, and one exact extension set, and the adoption ADR's D15.3 says no
+  carrier commit occurs before `Adopted` echoes the prepared value. No `Adopted`
+  frame will ever echo a *second* carrier epoch, because the echo was already
+  frozen against the first `Welcome` and there is no second `Welcome` to send.
+  So a re-prepared answer is honourable only when it **re-signs the same carrier
+  epoch at a corrected boundary**. An answer whose epoch supersedes is refused
+  and quarantined (`ErrSessionShimRepreparedCarrierEpochSupersedes`, naming both
+  epochs) — the same disposition a disagreeing generation gets. Committing it
+  would publish an activation naming the epoch the authority was just told to
+  abandon, which is the "reactivating its incumbent" the retained-candidate
+  abandonment correction forbids.
+
   **A re-prepare supersedes a reservation that is admitted and pre-active, and
   this side has no verb to burn it.** Abandonment is control-authenticated and
   belongs to the authority that minted it, so the contract is now explicit
   rather than assumed. `SessionShimAdoptionPreparation` carries `Cause` and
   `Attempt`: a re-ask arrives as `carrier_cursor_drift`, which is the daemon
   declaring that an earlier reservation for the lineage is outstanding and
-  stale. The composing authority is expected to abandon it before reserving
-  above the all-time carrier-epoch floor — under the recovery ADR's §D4
-  disposition rule, changed bytes under the same idempotency key are a
-  re-prepare, not a replay, and every attempt that created or inherited an
-  uncommitted reservation ends with one durable disposition. An authority that
-  will not supersede answers `ErrSessionShimAdoptionPrepareConflict`; that is a
-  refusal, not a failure, so the pass spends none of its remaining budget on it
-  and quarantines with the conflict as the detail.
+  stale. The authority disposes of it as **`preparing_reprepare`** — the
+  adoption ADR's one abandonment cause whose source is a `preparing` handoff and
+  which may keep or change the controller; that ADR states the obligation
+  directly, that an admitted `preparing` handoff has no retained Snapshot replay
+  and must abandon before reprepare. `carrier_cursor_drift` is a *prepare* cause
+  on a different axis from the abandonment vocabulary, so the mapping is named
+  rather than left to guess: drift maps to `preparing_reprepare` and to nothing
+  else. A predecessor that already reached `receipt_stored` is **not** that
+  case — the same ADR calls a same-controller `receipt_stored` handoff with
+  changed bytes a changed-replay conflict, not permission to abandon and
+  resample — so an authority in that state answers
+  `ErrSessionShimAdoptionPrepareConflict`; that is a refusal, not a failure, so
+  the pass spends none of its remaining budget on it and quarantines with the
+  conflict as the detail.
 
   A re-prepared answer is now applied through the same validation the handshake
   applies (`sessionshim.ResolvePreparedAdoption`, which both paths call) and is
-  then required to agree with the controller that is already adopted. The first
-  preparation is answered inside the handshake, where its generation and cursor
-  still have a Welcome to travel on; a re-prepare has neither, so an answer
-  resolving different values is refused rather than silently dropped — dropping
-  it would bind the new receipt to the previous proof's cursor and generation.
+  then required to agree with the controller that is already adopted —
+  generation, cursor, and negotiated extensions alike. The first preparation is
+  answered inside the handshake, where all three still have a `Welcome` to
+  travel on; a re-prepare has none of that, so an answer resolving different
+  values is refused rather than silently dropped — dropping it would bind the
+  new receipt to the previous proof's cursor, generation, and carrier epoch.
 - Adoption's transient-dial retry re-dials the already-prepared candidate
   instead of preparing again. Preparation runs inside the handshake, after Hello
   authentication and before the Welcome write, so the failure this retry exists
@@ -85,7 +106,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   Retries are also capped at a 2s dial timeout (the first attempt keeps the
   caller's own), because the pass walks records sequentially and every later
   lineage waits behind the current one: one hung record now costs at most
-  5+2+2s of the pass rather than three full timeouts.
+  5+2+2s of the pass rather than three full timeouts. Only the *record* is
+  bounded — the pass is not. N hung records still cost 9N seconds serially, so
+  against a 90s shim orphan deadline that is roughly ten of them (roughly six
+  without the cap, roughly eighteen before this change added retries at all).
+  An aggregate pass budget, or dialing independent lineages concurrently, has
+  its own ordering and capacity consequences and belongs in its own ADR.
 - Adoption no longer reports a stalled shim as an unreachable socket. The
   classifier's predicate asked only whether an error had a `Timeout` method —
   which every `net.OpError` and `os.PathError` has — and never called it, so any

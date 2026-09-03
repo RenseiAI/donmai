@@ -465,7 +465,8 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 
 const (
 	// adoptionDialAttempts is the TOTAL number of dials one live record gets
-	// when every failure is transient.
+	// when every failure is transient. It bounds ONE record, not the pass —
+	// see adoptionRetryDialTimeout for what that leaves unbounded.
 	adoptionDialAttempts = 3
 	// adoptionDialBackoff is the base delay between transient attempts; it
 	// doubles. The delay is short on purpose — the dial timeout is the real
@@ -474,13 +475,21 @@ const (
 	// adoptionRetryDialTimeout caps attempts 2 and 3, because Adopt walks
 	// records in ONE sequential loop and every later lineage waits behind the
 	// current one. At the 5s default a retried hang would cost 15s of the pass
-	// instead of 5s, and a handful of hung records ahead of a healthy one would
-	// push that healthy lineage's adoption past its own orphan deadline —
-	// turning one stalled shim into other sessions' self-teardown, which is the
-	// exact harm per-lineage quarantine exists to prevent. The worst case is now
-	// bounded at first + 2s + 2s (5+2+2 = 9s at the default dial timeout), and a
-	// caller that configures a shorter DialTimeout keeps it: this only ever
-	// lowers.
+	// instead of 5s, and hung records ahead of a healthy one push that healthy
+	// lineage's adoption toward its own orphan deadline — turning stalled shims
+	// into other sessions' self-teardown, which is the exact harm per-lineage
+	// quarantine exists to prevent. One record's worst case is bounded at
+	// first + 2s + 2s (5+2+2 = 9s at the default dial timeout), and a caller
+	// that configures a shorter DialTimeout keeps it: this only ever lowers.
+	//
+	// Be honest about what that does NOT bound. Only the RECORD is bounded; the
+	// pass is not. N hung records still cost 9N seconds serially — against a 90s
+	// shim orphan deadline that is roughly ten of them, where before this cap it
+	// was roughly six. The exposure predates this change (5s × N crossed the
+	// same deadline at around eighteen records) and the cap reduces it, but
+	// nothing here enforces an aggregate budget. A pass-level budget, or dialing
+	// independent lineages concurrently, is a real change with its own ordering
+	// and capacity consequences and belongs in its own ADR — not in a constant.
 	adoptionRetryDialTimeout = 2 * time.Second
 )
 
