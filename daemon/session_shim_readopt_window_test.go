@@ -906,6 +906,19 @@ func TestStartupRefusesLineageLiveWithoutALineagePredicateUnderAnExternalThresho
 			wantRefusd: true,
 		},
 		{
+			// Only the EFFECTIVE interval catches this: the raw field is far
+			// under the deadline, and the floor is what the loop will really
+			// pace at.
+			name: "a sub-floor interval whose floored value leaves no slack",
+			cfg: SessionShimConfig{
+				Orphan: sessionshim.OrphanPolicy{Deadline: 400 * time.Millisecond, TerminationGrace: time.Second},
+				Readoption: SessionShimReadoptionPolicy{
+					Mode: ReadoptionLineageLive, KeepaliveInterval: 10 * time.Millisecond,
+				},
+			},
+			wantRefusd: true,
+		},
+		{
 			name: "half the deadline is the loosest interval that still leaves a missed exchange of slack",
 			cfg: SessionShimConfig{
 				Orphan: sessionshim.OrphanPolicy{Deadline: time.Minute, TerminationGrace: time.Second},
@@ -1391,5 +1404,128 @@ func TestKeepaliveObservationsAreResetAtEachWindow(t *testing.T) {
 
 	if got := f.daemon.sessionShimKeepaliveObservations(f.id); got.extensions != 0 || got.refusals != 0 || got.lastDeadlineUnixNano != 0 {
 		t.Fatalf("observations at the start of a new window = %+v, want zero; a previous window's count leaked into the projection", got)
+	}
+}
+
+// TestAConfiguredKeepaliveIntervalIsFlooredLikeADerivedOne pins the floor
+// against the field that used to bypass it.
+//
+// The floor is a property of what a keepalive costs — a dial, the shim's
+// handshake lock, and a question put to the embedder's control plane — not of
+// who chose the number. Flooring only the derived interval left the configured
+// field as a way straight past it: ten milliseconds paced the loop, and the
+// LineageLive predicate with it, at nearly ninety calls a second against a shim
+// that gains nothing from being asked more often than its own deadline needs.
+func TestAConfiguredKeepaliveIntervalIsFlooredLikeADerivedOne(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		configured time.Duration
+		deadline   time.Duration
+		want       time.Duration
+	}{
+		{
+			name:       "a configured interval far below the floor is clamped to it",
+			configured: 10 * time.Millisecond, deadline: time.Minute,
+			want: minSessionShimKeepaliveInterval,
+		},
+		{
+			name:       "the floor itself is honoured as written",
+			configured: minSessionShimKeepaliveInterval, deadline: time.Minute,
+			want: minSessionShimKeepaliveInterval,
+		},
+		{
+			name:       "a configured interval above the floor is left alone",
+			configured: 4 * time.Second, deadline: time.Minute,
+			want: 4 * time.Second,
+		},
+		{
+			name:     "a derived interval is floored the same way",
+			deadline: 300 * time.Millisecond,
+			want:     minSessionShimKeepaliveInterval,
+		},
+		{
+			name:     "a derived interval above the floor is a third of the deadline",
+			deadline: 90 * time.Second,
+			want:     30 * time.Second,
+		},
+	} {
+		cfg := SessionShimConfig{
+			Orphan: sessionshim.OrphanPolicy{Deadline: tc.deadline, TerminationGrace: time.Second},
+			Readoption: SessionShimReadoptionPolicy{
+				Mode: ReadoptionLineageLive, KeepaliveInterval: tc.configured,
+			},
+		}
+		if got := cfg.readoptionKeepaliveInterval(); got != tc.want {
+			t.Errorf("%s: effective keepalive interval = %s, want %s", tc.name, got, tc.want)
+		}
+	}
+}
+
+// TestATinyConfiguredKeepaliveIntervalDoesNotPaceTheLoopOrThePredicate is the
+// behavioural half: the floor has to reach the loop, not merely the accessor.
+func TestATinyConfiguredKeepaliveIntervalDoesNotPaceTheLoopOrThePredicate(t *testing.T) {
+	const (
+		orphanDeadline = 15 * time.Second
+		observeFor     = 2 * time.Second
+	)
+	dir, err := os.MkdirTemp("/tmp", "drf")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(dir) })
+	registry, err := sessionshim.NewRegistry(filepath.Join(dir, "registry"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := sessionshim.Identity{OrgID: "org-floor", SessionID: "session-floor"}
+	fake := startPreContractShim(t, registry, dir, id)
+
+	var live struct {
+		sync.Mutex
+		calls int
+	}
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{
+		RegistryDir:     filepath.Join(dir, "registry"),
+		CallbackTimeout: time.Second,
+		Orphan:          sessionshim.OrphanPolicy{Deadline: orphanDeadline, TerminationGrace: time.Second},
+		Readoption: SessionShimReadoptionPolicy{
+			Mode: ReadoptionLineageLive, Backoff: time.Second, BackoffCap: time.Second,
+			Window: time.Minute, KeepaliveInterval: 10 * time.Millisecond,
+		},
+		LineageLive: func(context.Context, sessionshim.Identity) bool {
+			live.Lock()
+			live.calls++
+			live.Unlock()
+			return true
+		},
+	}})
+	t.Cleanup(d.ReleaseAdoptedSessionShims)
+	cfg := d.sessionShimConfig()
+	if got := cfg.readoptionKeepaliveInterval(); got < minSessionShimKeepaliveInterval {
+		t.Fatalf("effective keepalive interval = %s, want it floored at %s", got, minSessionShimKeepaliveInterval)
+	}
+
+	stop := d.startSessionShimOrphanKeepalive(registry, cfg, id, shimwire.Hello{
+		ShimID: fake.record.ShimID, ProcessEpoch: fake.record.ProcessEpoch,
+	})
+	time.Sleep(observeFor)
+	stop()
+
+	// At 10 ms the loop managed ~90 exchanges a second. Floored, the escalation
+	// from 20 ms tops out at the 250 ms floor, so two seconds is a handful.
+	const maxExchanges = 20
+	if got := fake.count(); got > maxExchanges {
+		t.Fatalf("%d keepalive exchanges in %s under a 10ms configured interval, want at most %d — the floor did not reach the loop",
+			got, observeFor, maxExchanges)
+	}
+	live.Lock()
+	calls := live.calls
+	live.Unlock()
+	// Only paced ticks ask, and a paced tick is the floor apart at the fastest.
+	const maxPredicateCalls = 12
+	if calls > maxPredicateCalls {
+		t.Fatalf("the embedder's LineageLive predicate was consulted %d times in %s, want at most %d",
+			calls, observeFor, maxPredicateCalls)
 	}
 }

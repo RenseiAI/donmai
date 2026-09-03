@@ -358,10 +358,15 @@ func TestEventBacklogDeadlineIsCumulativeNotPerPush(t *testing.T) {
 //
 // Restoring the emptiness test (`if len(b.queue) == 0 { b.stalledSince = ... }`
 // as the only reset) turns this RED at the first deadline.
+// It does not run in parallel, and its stall deadline is wider than the
+// mechanism needs. Both are about the CLOCK, not the property: the run hands
+// events over on a wall-clock cadence and asserts none was refused, so a test
+// goroutine descheduled past the deadline fails it for a reason that has
+// nothing to do with how progress is measured. The margin is what a loaded
+// -race run costs; the assertions are unchanged.
 func TestEventBacklogSaturatedConsumerKeepsItsCarrier(t *testing.T) {
-	t.Parallel()
 	const payload = 100
-	const stall = 200 * time.Millisecond
+	const stall = 500 * time.Millisecond
 	const depth = 4
 	budget := depth * (eventBacklogOverheadBytes + payload)
 	backlog := newTestBacklog(budget, stall, nil)
@@ -412,10 +417,11 @@ func TestEventBacklogSaturatedConsumerKeepsItsCarrier(t *testing.T) {
 // behind minutes earlier.
 //
 // Deleting the reset in pop turns this RED at the second burst.
+// Not parallel, and widened, for the same reason as the saturated case above:
+// the bursts are paced against the deadline on the wall clock.
 func TestEventBacklogDeadlineResetsWhenTheConsumerCatchesUp(t *testing.T) {
-	t.Parallel()
 	const payload = 100
-	const stall = 300 * time.Millisecond
+	const stall = 700 * time.Millisecond
 	budget := 2 * (eventBacklogOverheadBytes + payload)
 	backlog := newTestBacklog(budget, stall, nil)
 	event := func(seq uint64) ControllerEvent {

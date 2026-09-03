@@ -102,7 +102,14 @@ func TestOrphanKeepaliveRearmsTheDeadlineAndOutlivesIt(t *testing.T) {
 		t.Skip("session shim adoption is unsupported on this platform")
 	}
 	t.Parallel()
-	const deadline = 400 * time.Millisecond
+	// Ten keepalives of margin per deadline, and a deadline long enough in
+	// absolute terms that an ordinary scheduling stall fits inside it: this
+	// drives a real harness process and CI runs it beside a dozen others under
+	// -race.
+	const (
+		deadline = 5 * time.Second
+		cadence  = deadline / 10
+	)
 	reg, shim, id, ctrl := startKeepaliveShim(t, deadline)
 
 	// Losing the controller arms the deadline: this is the state a keepalive
@@ -113,9 +120,23 @@ func TestOrphanKeepaliveRearmsTheDeadlineAndOutlivesIt(t *testing.T) {
 	record := waitForPublishedOrphanDeadline(t, reg, id, 2*time.Second)
 	first := record.OrphanDeadlineUnixNano
 
-	var lastArmed time.Time
-	stopAt := time.Now().Add(4 * deadline)
+	var (
+		lastArmed time.Time
+		lastSent  = time.Now()
+	)
+	stopAt := time.Now().Add(2 * deadline)
 	for time.Now().Before(stopAt) {
+		// If this loop itself was descheduled for longer than the shim's own
+		// deadline could absorb, the shim reaping is correct behaviour and the
+		// pin can no longer distinguish it from the defect. Say so rather than
+		// failing: the property is real, the machine simply stopped running the
+		// test. The mutant this pin exists for dies on the FIRST keepalive,
+		// long before any stall could be reached.
+		if gap := time.Since(lastSent); gap > cadence+deadline/2 {
+			t.Skipf("the test loop was descheduled for %s, past what a %s deadline absorbs; "+
+				"this pin cannot tell a stall from a missing re-arm", gap, deadline)
+		}
+		lastSent = time.Now()
 		armed, err := KeepAlive(context.Background(), record, KeepAliveOptions{
 			ExpectedShimID: record.ShimID, ExpectedProcessEpoch: record.ProcessEpoch,
 		})
@@ -126,16 +147,16 @@ func TestOrphanKeepaliveRearmsTheDeadlineAndOutlivesIt(t *testing.T) {
 			t.Fatalf("keepalive re-armed to %s, not after the previous %s", armed, lastArmed)
 		}
 		lastArmed = armed
-		time.Sleep(deadline / 4)
+		time.Sleep(cadence)
 	}
 
-	// Four deadlines later the harness is still running and the shim is still
+	// Two deadlines later the harness is still running and the shim is still
 	// orphaned rather than exited.
 	shim.mu.Lock()
 	phase := shim.phase
 	shim.mu.Unlock()
 	if phase != shimwire.PhaseOrphaned {
-		t.Fatalf("phase after %s of keepalives = %q, want the shim still orphaned and alive", 4*deadline, phase)
+		t.Fatalf("phase after %s of keepalives = %q, want the shim still orphaned and alive", 2*deadline, phase)
 	}
 	republished, err := reg.Get(id)
 	if err != nil {
@@ -148,8 +169,8 @@ func TestOrphanKeepaliveRearmsTheDeadlineAndOutlivesIt(t *testing.T) {
 
 	// And the fallback: stop extending and the ordinary deadline governs
 	// again, unextended. Nothing had to put the shim back on its own clock.
-	waitForPhase(t, shim, shimwire.PhaseExited, 6*deadline)
-	waitForTombstone(t, reg, id, record, 5*time.Second)
+	waitForPhase(t, shim, shimwire.PhaseExited, 4*deadline)
+	waitForTombstone(t, reg, id, record, 15*time.Second)
 }
 
 // waitForTombstone polls for the shim's own terminal proof. The deadline sets

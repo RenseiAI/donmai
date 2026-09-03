@@ -1826,9 +1826,11 @@ const (
 	// slack before a shim that is still answering would reap itself, which is
 	// what makes a single lost exchange a retry rather than an incident.
 	sessionShimKeepaliveDeadlineDivisor = 3
-	// minSessionShimKeepaliveInterval floors the derivation so a deployment
-	// with a very short deadline does not turn the keepalive into a busy loop
-	// against its own shim.
+	// minSessionShimKeepaliveInterval floors the keepalive interval — the
+	// derived one AND a configured one — so neither a deployment with a very
+	// short deadline nor one that simply asked for a small number turns the
+	// keepalive into a busy loop against its own shim, and against the
+	// embedder's LineageLive predicate with it.
 	minSessionShimKeepaliveInterval = 250 * time.Millisecond
 	// sessionShimKeepaliveRetryInterval is how long a window waits before
 	// trying again while NOTHING has been honoured yet. The one benign reason
@@ -1983,10 +1985,14 @@ func (c SessionShimConfig) validateReadoptionAgainstOrphanPolicy() error {
 		)
 	}
 	deadline := c.orphanDeadlineOfResolvedConfig()
-	if interval := policy.KeepaliveInterval; interval > 0 && interval*2 > deadline {
+	// The EFFECTIVE interval, after the floor: a configured value below the
+	// floor is paced at the floor, so the floor is what has to fit inside the
+	// deadline. Checking the raw field would clear a policy the loop then runs
+	// four times slower than the number that was checked.
+	if interval := c.readoptionKeepaliveInterval(); interval*2 > deadline {
 		return fmt.Errorf(
-			"%w: KeepaliveInterval=%s leaves no slack against the %s orphan deadline it has to keep "+
-				"re-arming; the shim would reap between two keepalives and the window's exhaustion "+
+			"%w: a keepalive interval of %s leaves no slack against the %s orphan deadline it has to "+
+				"keep re-arming; the shim would reap between two keepalives and the window's exhaustion "+
 				"outcome would be unreachable. Use at most %s, or leave it zero to derive it",
 			ErrSessionShimReadoptionPolicy, interval, deadline, deadline/2,
 		)
@@ -2021,8 +2027,24 @@ func (c SessionShimConfig) orphanDeadlineOfResolvedConfig() time.Duration {
 // never revisits this policy — the exact shape of drift that would otherwise
 // let a shim reap itself in the middle of a window the daemon believes it is
 // holding open.
+//
+// minSessionShimKeepaliveInterval floors BOTH answers. It used to floor only
+// the derived one, which left the configured field as a way past it: a policy
+// asking for ten milliseconds paced the loop — and with it the embedder's
+// LineageLive predicate — at nearly ninety calls a second, against a shim that
+// gains nothing from being asked more often than its own deadline needs. The
+// floor is a property of what a keepalive costs, not of who chose the number,
+// so it applies to both. A configured value below it is CLAMPED rather than
+// refused: it is a number that is too eager, not a configuration that is
+// unsafe, and refusing startup over eagerness would be the harsher answer to
+// the milder mistake. The clamp says so out loud.
 func (c SessionShimConfig) readoptionKeepaliveInterval() time.Duration {
 	if configured := c.readoption().KeepaliveInterval; configured > 0 {
+		if configured < minSessionShimKeepaliveInterval {
+			slog.Warn("session shim: configured keepalive interval is below the floor; clamping",
+				"configured", configured, "effective", minSessionShimKeepaliveInterval)
+			return minSessionShimKeepaliveInterval
+		}
 		return configured
 	}
 	deadline := c.orphanDeadlineOfResolvedConfig()

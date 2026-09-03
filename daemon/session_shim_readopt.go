@@ -368,15 +368,25 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 			}
 			wait := interval
 			if !honoured {
-				// Nothing has been honoured yet in this window. The likeliest
-				// reason is benign and self-correcting: the shim arms its
-				// orphan clock from its own serve-loop teardown, so a daemon
-				// that re-dials promptly can arrive before there is a deadline
-				// to extend. Waiting a whole interval to find out would spend
-				// most of a short deadline on a race that resolves in
-				// milliseconds — so probe fast, then back off to the paced
-				// interval, which is where a shim that will never answer ends
-				// up costing no more than one that answers every time.
+				// Nothing has been honoured yet in this window. The reason
+				// the FIRST probe is fast is one specific, benign race: the
+				// shim arms its orphan clock from its own serve-loop teardown,
+				// so a daemon that re-dials promptly can arrive before there is
+				// a deadline to extend, and that resolves in milliseconds.
+				// Waiting a whole interval to discover it would spend most of a
+				// short deadline on it.
+				//
+				// The escalation is NOT a promise about how soon the first
+				// honoured extension lands in general. A shim that stays
+				// unextendable pushes the schedule to the cap — at the shipped
+				// defaults the probes run 20, 40, 80 … 20480 ms, about 41 s in
+				// total, and from there one paced 30 s interval, so the worst
+				// case before a first honoured extension is roughly 1m11s. That
+				// is deliberate and safe: until an extension is honoured the
+				// shim is on its own unextended deadline, which is the bound
+				// the amendment falls back to anyway. What the escalation buys
+				// is that a shim which will never answer costs no more than one
+				// that answers every time.
 				wait = retry
 				retry = min(retry*2, interval)
 			}
