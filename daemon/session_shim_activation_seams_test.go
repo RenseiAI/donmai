@@ -947,11 +947,30 @@ func TestHeartbeatCarriesLiveProofV2ReadinessFromDaemonProjection(t *testing.T) 
 	}
 
 	readinessError.Store(true)
-	if err := service.sendOneResult(context.Background()); err == nil {
-		t.Fatal("heartbeat reached the endpoint after live readiness resolver failure")
+	if err := service.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("degraded readiness heartbeat: %v", err)
 	}
-	if endpointCalls.Load() != 1 {
-		t.Fatalf("endpoint calls after readiness failure = %d, want 1", endpointCalls.Load())
+	if endpointCalls.Load() != 2 {
+		t.Fatalf("endpoint calls after readiness failure = %d, want 2", endpointCalls.Load())
+	}
+	var degraded heartbeatRequestBody
+	if err := json.Unmarshal(rawBody, &degraded); err != nil {
+		t.Fatalf("decode degraded heartbeat: %v", err)
+	}
+	if degraded.SessionShim == nil || degraded.SessionShim.ReadinessState != "unknown" ||
+		degraded.SessionShim.ReadinessReason == "" || degraded.SessionShim.ReadinessObservedAt == "" {
+		t.Fatalf("degraded session-shim projection = %+v, want unknown with reason and timestamp", degraded.SessionShim)
+	}
+	readinessError.Store(false)
+	if err := service.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("recovered readiness heartbeat: %v", err)
+	}
+	var recovered heartbeatRequestBody
+	if err := json.Unmarshal(rawBody, &recovered); err != nil {
+		t.Fatalf("decode recovered heartbeat: %v", err)
+	}
+	if endpointCalls.Load() != 3 || recovered.SessionShim == nil || recovered.SessionShim.ReadinessState != "ready" {
+		t.Fatalf("recovered heartbeat calls/projection = %d/%+v, want 3/ready", endpointCalls.Load(), recovered.SessionShim)
 	}
 }
 

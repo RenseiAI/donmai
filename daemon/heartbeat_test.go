@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -56,6 +57,53 @@ func TestHeartbeatService_IdempotentStart(_ *testing.T) {
 	hs.Start()
 	hs.Start() // should be a no-op
 	hs.Stop()
+}
+
+func TestHeartbeatService_DegradedSessionShimProjectionStillPosts(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+	var got heartbeatRequestBody
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&got); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(heartbeatResponseBody{
+			Acknowledged: true,
+			SessionShim:  got.SessionShim,
+		})
+	}))
+	t.Cleanup(srv.Close)
+
+	projection := SessionShimHeartbeatProjection{
+		Enabled:             true,
+		AdoptionComplete:    true,
+		WorkerHostID:        "host",
+		ControllerID:        "controller",
+		AdoptionRevision:    "revision",
+		ReadinessState:      "unknown",
+		ReadinessReason:     "resolver: upstream unavailable",
+		ReadinessObservedAt: "2026-09-03T00:00:00Z",
+	}
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "worker", Hostname: "host", OrchestratorURL: srv.URL,
+		RuntimeJWT: "runtime.jwt", IntervalSeconds: 1,
+		GetActiveCount: func() int { return 0 }, GetMaxCount: func() int { return 1 },
+		GetStatus: func() RegistrationStatus { return RegistrationIdle },
+		GetSessionShim: func() (SessionShimHeartbeatProjection, error) {
+			return SessionShimHeartbeatProjection{}, errors.New("resolver: upstream unavailable")
+		},
+		GetSessionShimDegraded: func(err error) (SessionShimHeartbeatProjection, error) {
+			if err == nil {
+				t.Fatal("degraded hook received nil error")
+			}
+			return projection, nil
+		},
+	})
+	if err := hs.sendOneResult(context.Background()); err != nil {
+		t.Fatalf("sendOneResult: %v", err)
+	}
+	if got.SessionShim == nil || got.SessionShim.ReadinessState != "unknown" {
+		t.Fatalf("heartbeat session shim = %+v, want unknown readiness", got.SessionShim)
+	}
 }
 
 // TestHeartbeatService_HitsPlatformEndpoint verifies the heartbeat HTTP call

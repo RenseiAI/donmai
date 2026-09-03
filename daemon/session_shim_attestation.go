@@ -191,6 +191,12 @@ type SessionShimHeartbeatProjection struct {
 	WorkerHostID     string `json:"workerHostId"`
 	ControllerID     string `json:"controllerId"`
 	AdoptionRevision string `json:"adoptionRevision"`
+	// ReadinessState is ready, not-ready, or unknown. Empty is treated as
+	// ready for source compatibility with projections created before the
+	// tri-state field was added.
+	ReadinessState      string `json:"readinessState,omitempty"`
+	ReadinessReason     string `json:"readinessReason,omitempty"`
+	ReadinessObservedAt string `json:"readinessObservedAt,omitempty"`
 
 	// SessionShimCarrierProofV2Readiness stays flat on the existing sessionShim
 	// object so the five live facts are covered by the same organization-scoped
@@ -228,7 +234,17 @@ func (p SessionShimHeartbeatProjection) validateReady() error {
 	if p.WorkerHostID == "" || p.ControllerID == "" || p.AdoptionRevision == "" {
 		return errors.New("session shim heartbeat projection is missing host, controller, or adoption revision")
 	}
-	if err := p.SessionShimCarrierProofV2Readiness.validate(); err != nil {
+	state := p.ReadinessState
+	if state == "" {
+		state = "ready"
+	}
+	if state == "unknown" {
+		if p.ReadinessReason == "" || p.ReadinessObservedAt == "" {
+			return errors.New("session shim heartbeat projection unknown readiness is missing reason or observed-at")
+		}
+	} else if state != "ready" {
+		return fmt.Errorf("session shim heartbeat projection has invalid readiness state %q", state)
+	} else if err := p.SessionShimCarrierProofV2Readiness.validate(); err != nil {
 		return fmt.Errorf("session shim heartbeat projection: %w", err)
 	}
 	for i, q := range p.QuarantinedSessions {
@@ -250,6 +266,8 @@ func (p SessionShimHeartbeatProjection) exactEqual(other SessionShimHeartbeatPro
 	if p.Enabled != other.Enabled || p.AdoptionComplete != other.AdoptionComplete ||
 		p.WorkerHostID != other.WorkerHostID || p.ControllerID != other.ControllerID ||
 		p.AdoptionRevision != other.AdoptionRevision ||
+		p.ReadinessState != other.ReadinessState || p.ReadinessReason != other.ReadinessReason ||
+		p.ReadinessObservedAt != other.ReadinessObservedAt ||
 		p.SessionShimCarrierProofV2Readiness != other.SessionShimCarrierProofV2Readiness ||
 		len(p.QuarantinedSessions) != len(other.QuarantinedSessions) {
 		return false

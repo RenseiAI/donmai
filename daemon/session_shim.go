@@ -3648,10 +3648,10 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 	if !d.sessionShimEnabled() {
 		return SessionShimHeartbeatProjection{}, nil
 	}
-	readiness, err := d.resolveSessionShimCarrierProofV2Readiness()
-	if err != nil {
+	readiness, readinessErr := d.resolveSessionShimCarrierProofV2Readiness()
+	if readinessErr != nil && isDefiniteSessionShimReadinessFailure(readinessErr) {
 		d.withdrawSessionShimProofV2Readiness()
-		return SessionShimHeartbeatProjection{}, err
+		return SessionShimHeartbeatProjection{}, readinessErr
 	}
 	d.reconcileQuarantinedTombstones()
 	d.shims.mu.RLock()
@@ -3661,13 +3661,23 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		return SessionShimHeartbeatProjection{}, fmt.Errorf("session shim: no heartbeat authority receipt for organization %q", orgID)
 	}
 	projection := SessionShimHeartbeatProjection{
-		Enabled:                            true,
-		AdoptionComplete:                   d.shims.adoptionComplete,
-		WorkerHostID:                       receipt.WorkerHostID,
-		ControllerID:                       d.controllerID(),
-		AdoptionRevision:                   receipt.AdoptionRevision,
-		SessionShimCarrierProofV2Readiness: readiness,
-		QuarantinedSessions:                []SessionShimQuarantinedSession{},
+		Enabled:             true,
+		AdoptionComplete:    d.shims.adoptionComplete,
+		WorkerHostID:        receipt.WorkerHostID,
+		ControllerID:        d.controllerID(),
+		AdoptionRevision:    receipt.AdoptionRevision,
+		ReadinessState:      "ready",
+		ReadinessObservedAt: time.Now().UTC().Format(time.RFC3339Nano),
+		QuarantinedSessions: []SessionShimQuarantinedSession{},
+	}
+	if readinessErr != nil {
+		projection.ReadinessState = "unknown"
+		projection.ReadinessReason = boundedSessionShimReadinessReason(readinessErr)
+		if projection.ReadinessObservedAt == "" {
+			projection.ReadinessObservedAt = time.Now().UTC().Format(time.RFC3339Nano)
+		}
+	} else {
+		projection.SessionShimCarrierProofV2Readiness = readiness
 	}
 	if !d.shims.carrierActivationComplete {
 		d.shims.mu.RUnlock()
@@ -3704,6 +3714,21 @@ func (d *Daemon) SessionShimHeartbeatProjection(orgID string) (SessionShimHeartb
 		return SessionShimHeartbeatProjection{}, err
 	}
 	return projection, nil
+}
+
+func isDefiniteSessionShimReadinessFailure(err error) bool {
+	reason := err.Error()
+	return strings.Contains(reason, "readiness acknowledgement is required") ||
+		strings.Contains(reason, "composition support is incomplete")
+}
+
+func boundedSessionShimReadinessReason(err error) string {
+	reason := strings.TrimSpace(err.Error())
+	const maxReasonLength = 256
+	if len(reason) > maxReasonLength {
+		return reason[:maxReasonLength]
+	}
+	return reason
 }
 
 // SessionShimDiagnostics returns the bounded secret-free ownership projection
