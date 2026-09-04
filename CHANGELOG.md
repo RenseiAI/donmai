@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+---
+
+## v0.72.20 — 2026-09-04
+
 ### Fixes
 
 - A durable acknowledgement that is merely SLOW no longer costs a live session
