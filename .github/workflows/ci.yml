@@ -10,6 +10,10 @@ on:
   # PR stalls until the queue's 30-minute check timeout.
   merge_group:
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
 permissions:
   contents: read
 
