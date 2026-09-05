@@ -10,6 +10,93 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.21 — 2026-09-05
+
+### Features
+
+- **The `stub` harness gains a second spawn mode: a real PTY child running a
+  deterministic script instead of a model.** `Spec.Interactive != nil` now
+  routes through the shared `provider/harness/ptycli` driver that `claude`,
+  `codex`, `pi` and `shell` already use, so a stub session is indistinguishable
+  from a real one to everything upstream of the child — same `ptyhost` plumbing
+  and geometry, same session-shim adoption, same ring/recorder/attach surface,
+  same `SIGTERM` → grace → `SIGKILL` escalation, same coarse `Init`/`Result`
+  mapping. Nothing new was written to spawn a PTY; that was the point. The
+  child is `provider/harness/stub/stubagent`, shipped as the hidden
+  `stub-agent` subcommand of this binary rather than a separate artifact, so an
+  integration environment cannot end up running a fake agent from one build
+  against a daemon from another. `Spawn` reads `SupportsInteractivePTY` off the
+  live manifest rather than branching on a hardcoded `true`, so flipping the
+  declaration back off returns the provider to headless-only instead of leaving
+  a PTY spawn the manifest no longer claims. Headless mode is unchanged. (#550)
+
+- **The interactive stub session's behaviour is a deterministic scenario
+  script.** `DONMAI_STUB_SCENARIO` (inline JSON) or `DONMAI_STUB_SCENARIO_FILE`
+  (a path) supplies it; with neither set the child runs a real but uneventful
+  session — announce, idle, exit 0. A step is one of `print`, `idle`, `a2a`,
+  `awaitInput`, `exit` or `hang` and must set **exactly one** action: setting
+  none or several, an unknown field, or a duration written as a JSON number
+  (which would silently read as nanoseconds) is refused at parse time, because
+  a step that silently picks one of two requested actions is a scenario that
+  does not mean what it says. `DONMAI_STUB_EXIT_CODE`, `DONMAI_STUB_HANG_FOR`,
+  `DONMAI_STUB_STOP_MODE`, `DONMAI_STUB_OUTPUT_RATE` and `DONMAI_STUB_SEED`
+  override whichever source supplied the base, so one file covers a family of
+  fault cases without being rewritten, and the result is revalidated — an
+  override is not a second chance to be invalid. Callers holding a `Spec` can
+  pass the scenario through the typed `ProviderConfig` (`stub.scenario`,
+  `stub.scenarioFile`) instead of composing `Env` themselves, and it is then
+  validated in the parent at spawn rather than forwarded to the child on trust:
+  a child that exits because its scenario was garbage is otherwise
+  indistinguishable, at the session layer, from one that was asked to exit. An
+  `a2a` step writes one marked line carrying a real `a2a.Message`, so a
+  consumer asserts against the protocol type rather than a shape invented here,
+  and its message id is derived from (scenario name, seed, step index) rather
+  than from a clock or a random source — which is what makes two runs of one
+  scenario byte-identical. (#550)
+
+- **`stop.mode` makes a refused stop a first-class fault control.** `respond`
+  acknowledges and exits with `stop.exitCode`, `slow` acknowledges, waits, then
+  exits, and `ignore` acknowledges and **keeps running**, so the parent's grace
+  window expires and escalates to `SIGKILL`. `ignore` is the RED control for
+  any assertion that a cooperative stop succeeded. Every mode, `ignore`
+  included, prints its notice when the signal is observed, so a transcript can
+  tell "refused the stop" apart from "never received the stop" — without that
+  line, a stop assertion also passes against a stop path that does nothing at
+  all. (#550)
+
+- **A scenario file is read under a bound, in the parent.** The path must be a
+  regular file — `os.ReadFile` on a FIFO blocks until a writer appears, which
+  for a pipe nobody opens is forever, and an unbounded read inside `Spawn` is
+  an unbounded `Spawn` — and it must be at most `MaxScenarioFileBytes` (1 MiB),
+  enforced both by the stat and by the read itself, since a file can grow
+  between the two. An inline scenario wins, and when one is present the file is
+  never opened. Every refusal names the path it refused. (#550)
+
+### Fixes
+
+- **`golang.org/x/crypto` moves to v0.56.0, closing two SSH denial-of-service
+  advisories that were reachable from the Git kit fetcher.** `GO-2026-6355`
+  (a deadlocked established channel) and `GO-2026-6354` (a deadlocked undecided
+  channel) both trace through `daemon.gitKitFetcher.Fetch` →
+  `git.PlainCloneContext` → `ssh.NewClientConn`, so installing a kit from a Git
+  remote over SSH ran through the affected code. Both are fixed in
+  `golang.org/x/crypto` v0.56.0 (from v0.54.0); `golang.org/x/text` moves
+  v0.40.0 → v0.41.0 because the new `x/crypto` requires it, and nothing else in
+  the module graph changes. `govulncheck` now reports no reachable
+  vulnerabilities. (#551)
+
+### Chores
+
+- **A new push to an open pull request now cancels that workflow's superseded
+  run.** `ci.yml` and `security-scan.yml` gain a `concurrency` group keyed by
+  workflow name and ref, so stacked pushes on one branch stop burning duplicate
+  CI minutes on runs that are already obsolete. Pushes to the default branch
+  are deliberately unaffected: the group still queues and coalesces them rather
+  than cancelling, since a cancelled run reports as `cancelled` rather than a
+  real pass or fail. (#549)
+
+---
+
 ## v0.72.20 — 2026-09-04
 
 ### Fixes
