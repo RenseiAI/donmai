@@ -6,8 +6,8 @@
 // It plays the same role for the interactive spawn mode that
 // provider/harness/clijsonl plays for the headless CLI-JSONL loop: one
 // shared Spawn + Handle so every harness that declares
-// agent.HarnessCaps.SupportsInteractivePTY (today: claude, codex, shell, pi —
-// tomorrow, whichever P8 harness flips the flag) drives the exact same
+// agent.HarnessCaps.SupportsInteractivePTY (today: claude, codex, shell, pi,
+// stub — tomorrow, whichever P8 harness flips the flag) drives the exact same
 // ptyhost.Spawn plumbing and the exact same coarse agent.Handle event
 // mapping, instead of re-implementing it per harness.
 //

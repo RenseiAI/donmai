@@ -53,6 +53,17 @@ func WithDefaultBehavior(b Behavior) Option {
 	return func(p *provider) { p.defaultBehavior = b }
 }
 
+// WithStubAgentCommand overrides the program the INTERACTIVE spawn mode runs
+// under the PTY. Production leaves it unset (the default is this executable
+// re-invoked on StubAgentSubcommand); a test that must not re-invoke its own
+// test binary points it at a fixture instead.
+func WithStubAgentCommand(binary string, argv ...string) Option {
+	return func(p *provider) {
+		p.agentBinary = binary
+		p.agentArgv = append([]string(nil), argv...)
+	}
+}
+
 // WithSessionIDFunc overrides the session id generator. The default
 // emits "stub-session-<8 hex bytes>". Tests use this to make session
 // ids deterministic.
@@ -60,13 +71,29 @@ func WithSessionIDFunc(fn func() string) Option {
 	return func(p *provider) { p.sessionIDFn = fn }
 }
 
-// provider is the concrete agent.Provider implementation backed by
-// scripted event sequences. It holds no per-session state — that
-// lives on the returned *handle.
+// provider is the concrete agent.Provider implementation. It has two
+// spawn modes and holds no per-session state.
+//
+// Headless (Spec.Interactive == nil) is the original one: a scripted,
+// in-process event sequence with no child process at all — the right shape
+// for unit-testing the runner's event handling.
+//
+// Interactive (Spec.Interactive != nil) is the deterministic fake AGENT:
+// a real PTY child running provider/harness/stub/stubagent through the shared
+// ptycli driver. See interactive.go for why the difference matters.
 type provider struct {
 	caps            agent.Capabilities
 	defaultBehavior Behavior
 	sessionIDFn     func() string
+
+	// agentBinary/agentArgv override the interactive child. Empty means the
+	// default: this executable, re-invoked on StubAgentSubcommand.
+	agentBinary string
+	agentArgv   []string
+
+	// deliverSeed is the PTY seed writer, injectable for tests. Nil uses
+	// ptycli.DeliverSeed.
+	deliverSeed func(context.Context, agent.Handle, agent.InteractiveSession, string) error
 }
 
 // New constructs a stub agent.Provider. The returned Provider has no
@@ -94,12 +121,21 @@ func (p *provider) Name() agent.ProviderName { return agent.ProviderStub }
 // Capabilities returns the configured capability matrix.
 func (p *provider) Capabilities() agent.Capabilities { return p.caps }
 
-// Spawn returns a Handle whose Events channel will emit the scripted
-// sequence selected by the Spec's behavior knob. If ctx is already
-// canceled Spawn returns a wrapped agent.ErrSpawnFailed.
+// Spawn selects one of the two modes. With Spec.Interactive set it runs the
+// deterministic fake agent under a PTY (interactive.go). Otherwise it returns
+// a Handle whose Events channel emits the scripted sequence selected by the
+// Spec's behavior knob. If ctx is already canceled Spawn returns a wrapped
+// agent.ErrSpawnFailed.
 func (p *provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	if err := ctx.Err(); err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	// Read the LIVE manifest rather than branching on a hardcoded true: an
+	// edit that flips SupportsInteractivePTY back to false must fall through
+	// to the scripted in-process mode, not keep spawning a PTY the manifest
+	// no longer declares. Same guard claude.go, codex.go and pi.go use.
+	if spec.Interactive != nil && p.Manifest().Caps.SupportsInteractivePTY {
+		return p.spawnInteractive(ctx, spec)
 	}
 	b := p.resolveBehavior(spec)
 	h := newHandle(p.sessionIDFn(), b, spec, false)
@@ -120,6 +156,16 @@ func (p *provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 // (e.g. runner/steering.go's attemptSteeringResume) distinctly from the
 // soft-fail ErrUnsupported path.
 func (p *provider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
+	// The interactive child is a process, and a dead process has no state to
+	// resume. Falling through would hand the caller a scripted in-process
+	// handle for a session it asked to continue as a terminal — a silent mode
+	// switch, which is worse than a refusal.
+	if spec.Interactive != nil {
+		return nil, fmt.Errorf(
+			"provider/harness/stub: Resume: %w (the interactive spawn mode has no resumable session state; spawn a new one)",
+			agent.ErrUnsupported,
+		)
+	}
 	if !p.caps.SupportsSessionResume {
 		return nil, agent.ErrUnsupported
 	}

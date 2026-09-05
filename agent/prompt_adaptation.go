@@ -116,6 +116,13 @@ const (
 	PromptDeliveryPiPTYSeed PromptDeliveryKind = "pi_cli_pty_seed"
 	// PromptDeliveryShellPTYSeed uses the shell PTY seed.
 	PromptDeliveryShellPTYSeed PromptDeliveryKind = "shell_pty_seed"
+	// PromptDeliveryStubPTYSeed seeds the deterministic fake agent's
+	// interactive PTY (provider/harness/stub, interactive spawn mode). It is
+	// its own kind rather than a reuse of shell_pty_seed because the two carry
+	// different authority: shell's sink is a command interpreter and is
+	// therefore user-authority-only, while the stub's sink is a scripted agent
+	// that accepts the same authorized downgrades codex and pi accept.
+	PromptDeliveryStubPTYSeed PromptDeliveryKind = "stub_pty_seed"
 	// PromptDeliveryAuthorizedUserDowngrade records explicit user fallback.
 	PromptDeliveryAuthorizedUserDowngrade PromptDeliveryKind = "authorized_user_prompt_downgrade"
 )
@@ -432,7 +439,7 @@ func AdaptPrompt(spec Spec, profile PromptDeliveryProfile) (Spec, PromptDelivery
 		case PromptDeliveryCodexTurnInput:
 			contextParts = append(contextParts, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
-		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed:
+		case PromptDeliveryCodexPTYSeed, PromptDeliveryPiPTYSeed, PromptDeliveryStubPTYSeed:
 			downgradedPrepend = append(downgradedPrepend, content.Text)
 			receipt.Entries = append(receipt.Entries, deliveredEntry(content, PromptChannelInitialContext, profile.ContextDelivery))
 		case PromptDeliveryUnsupported:
@@ -576,6 +583,7 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryPiRPCPrompt,
 		PromptDeliveryPiPTYSeed,
 		PromptDeliveryShellPTYSeed,
+		PromptDeliveryStubPTYSeed,
 		PromptDeliveryAuthorizedUserDowngrade:
 		return true
 	default:

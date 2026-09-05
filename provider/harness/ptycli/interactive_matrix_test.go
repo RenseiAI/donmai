@@ -1,7 +1,7 @@
 // Package ptycli_test is the registry-driven cross-harness interactive
 // spawn-mode test (W4 deliverable 5). It lives here — outside package
 // ptycli, as an external test package — because it needs to import every
-// interactive-capable harness (claude, codex, shell, pi) to exercise their own
+// interactive-capable harness (claude, codex, shell, pi, stub) to exercise their own
 // production Spawn/SpawnInteractive call sites, while ptycli itself (the
 // shared driver those harnesses route through) never imports any of them.
 // This creates no import cycle: matrix and the harness packages already
@@ -26,6 +26,7 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
+	"github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // shimScript is the fake-CLI PATH shim: it prints the env/geometry signals
@@ -137,6 +138,17 @@ func spawnTable() map[agent.HarnessName]spawnFn {
 			p, err := shell.New()
 			if err != nil {
 				t.Fatalf("shell.New: %v", err)
+			}
+			return p.Spawn(context.Background(), spec)
+		},
+		agent.HarnessStub: func(t *testing.T, bin string, spec agent.Spec) (agent.Handle, error) {
+			// The stub's interactive child defaults to THIS executable
+			// re-invoked on its hidden subcommand; under `go test` that is the
+			// test binary, which answers no such subcommand. Point it at the
+			// shim instead — the same substitution every other row makes.
+			p, err := stub.New(stub.WithStubAgentCommand(bin))
+			if err != nil {
+				t.Fatalf("stub.New(fake): %v", err)
 			}
 			return p.Spawn(context.Background(), spec)
 		},
