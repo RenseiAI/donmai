@@ -258,33 +258,38 @@ func TestRunCooperativeStop(t *testing.T) {
 			defer cancel()
 
 			sigCh := make(chan os.Signal, 1)
-			done := make(chan struct{})
-			var code int
-			var runErr error
+			// The outcome travels on a channel rather than through shared
+			// variables the test reads after a t.Fatal: a goroutine writing
+			// them after the test has finished is a data race on a dead test.
+			type outcome struct {
+				code int
+				err  error
+			}
+			done := make(chan outcome, 1)
 			go func() {
-				defer close(done)
-				code, runErr = Run(ctx, mustParse(t, tc.scenario), Options{
+				code, err := Run(ctx, mustParse(t, tc.scenario), Options{
 					Stdout: &out,
 					Stop:   sigCh,
 					// hangFor forever ignores Sleep, and the stop's own delay
 					// must not cost the test three seconds.
 					Sleep: func(ctx context.Context, _ time.Duration) error { return ctx.Err() },
 				})
+				done <- outcome{code: code, err: err}
 			}()
 
 			sigCh <- syscall.SIGTERM
 
 			if tc.wantExit {
 				select {
-				case <-done:
+				case got := <-done:
+					if got.err != nil {
+						t.Fatalf("Run: %v", got.err)
+					}
+					if got.code != tc.wantCode {
+						t.Errorf("exit code = %d, want %d", got.code, tc.wantCode)
+					}
 				case <-time.After(5 * time.Second):
 					t.Fatal("Run did not return after a stop it declared it would answer")
-				}
-				if runErr != nil {
-					t.Fatalf("Run: %v", runErr)
-				}
-				if code != tc.wantCode {
-					t.Errorf("exit code = %d, want %d", code, tc.wantCode)
 				}
 			} else {
 				select {
@@ -322,20 +327,28 @@ func TestRunReturnsWithAStopChannelThatNeverFires(t *testing.T) {
 
 	var out syncBuffer
 	signals := make(chan os.Signal, 1) // never written to
-	done := make(chan int, 1)
+
+	// The outcome is passed out rather than asserted in the goroutine: if the
+	// deadline below fires, the test has already finished, and a t.Errorf from
+	// a goroutine after that is a use-after-finish, not a report.
+	type outcome struct {
+		code int
+		err  error
+	}
+	done := make(chan outcome, 1)
 	go func() {
 		code, err := Run(context.Background(), mustParse(t, `{"version":1,"steps":[{"print":"and done"}]}`),
 			Options{Stdout: &out, Stop: signals})
-		if err != nil {
-			t.Errorf("Run: %v", err)
-		}
-		done <- code
+		done <- outcome{code: code, err: err}
 	}()
 
 	select {
-	case code := <-done:
-		if code != 0 {
-			t.Errorf("exit code = %d, want 0", code)
+	case got := <-done:
+		if got.err != nil {
+			t.Fatalf("Run: %v", got.err)
+		}
+		if got.code != 0 {
+			t.Errorf("exit code = %d, want 0", got.code)
 		}
 	case <-time.After(5 * time.Second):
 		t.Fatal("Run did not return after its script finished while a stop channel was wired")
@@ -345,7 +358,7 @@ func TestRunReturnsWithAStopChannelThatNeverFires(t *testing.T) {
 	}
 }
 
-func TestRunOutputRateChunksAndPaces(t *testing.T) {
+func TestRunOutputRatePacesWithoutChangingTheBytes(t *testing.T) {
 	t.Parallel()
 
 	var out syncBuffer
@@ -359,16 +372,72 @@ func TestRunOutputRateChunksAndPaces(t *testing.T) {
 		t.Errorf("output = %q, want %q — throttling must not change the bytes", got, want)
 	}
 	waits := sleeper.durations()
-	if len(waits) < 2 {
-		t.Fatalf("throttled write produced %d waits (%v); an unthrottled write is the bug this asserts against", len(waits), waits)
+	if len(waits) != 1 {
+		t.Fatalf("throttled write produced %d waits (%v), want exactly 1 — the debt is paid once, after the line is out", len(waits), waits)
 	}
-	var total time.Duration
-	for _, w := range waits {
-		total += w
+	// 11 bytes at 20 bytes/second is 550ms.
+	if want := 550 * time.Millisecond; waits[0] != want {
+		t.Errorf("pacing = %s, want %s", waits[0], want)
 	}
-	// 11 bytes at 20 bytes/s is 550ms, however the chunking divides it.
-	if want := 550 * time.Millisecond; total != want {
-		t.Errorf("total pacing = %s, want %s", total, want)
+}
+
+// TestRunOutputRateDoesNotStarveTheStopNotice is the regression for the
+// deadlock-shaped bug that pacing inside the write lock would create.
+//
+// A 100-byte line at 20 bytes/second is five seconds of pacing — the whole
+// cooperative-stop grace window. If the throttle held the writer's lock while
+// it waited, the stop notice would be written only AFTER the parent had given
+// up and escalated, and the transcript would be indistinguishable from a child
+// that never received the signal. That silently disarms the ignore mode, which
+// exists precisely to make that distinction.
+//
+// The sleeper here is real, not instant: a fake clock cannot exhibit lock
+// starvation, so the assertion is that the notice lands promptly in wall-clock
+// terms while a long throttled line is still being paced.
+func TestRunOutputRateDoesNotStarveTheStopNotice(t *testing.T) {
+	t.Parallel()
+
+	var out syncBuffer
+	signals := make(chan os.Signal, 1)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	// 100 characters at 20 bytes/second: ~5s of pacing debt after the line.
+	long := strings.Repeat("x", 100)
+	scenario := mustParse(t, `{"version":1,"outputRate":20,"hangFor":"forever",`+
+		`"steps":[{"print":"`+long+`"}],"stop":{"mode":"ignore"}}`)
+
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		_, _ = Run(ctx, scenario, Options{Stdout: &out, Stop: signals})
+	}()
+
+	// Wait for the line itself to be out, so the run is inside its pacing debt
+	// when the signal arrives — the exact window the bug lived in.
+	deadline := time.Now().Add(5 * time.Second)
+	for !strings.Contains(out.String(), long) {
+		if time.Now().After(deadline) {
+			t.Fatalf("throttled line never reached the buffer; got:\n%s", out.String())
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	signals <- syscall.SIGTERM
+
+	noticeBy := time.Now().Add(2 * time.Second)
+	for !strings.Contains(out.String(), "mode=ignore") {
+		if time.Now().After(noticeBy) {
+			t.Fatalf("stop notice did not appear within 2s while a %d-byte line was pacing at 20 B/s; "+
+				"the throttle is holding the write lock across its wait", len(long))
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+
+	cancel()
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("Run did not return after its context ended")
 	}
 }
 

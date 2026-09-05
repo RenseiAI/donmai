@@ -13,10 +13,21 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 )
 
-// EnvStubAgentBin names an explicit path to the program the interactive spawn
-// mode runs under the PTY. It exists for an operator running a stub session
-// from a tree whose binary is not the one on $PATH; ordinary use needs no
-// override, because the default is this very process (see stubAgentCommand).
+// EnvStubAgentBin names the binary the interactive spawn mode runs under the
+// PTY, overriding the default of "this very process". It exists for an
+// operator driving a stub session from a build other than the running one.
+//
+// It is read ONCE, at New(), exactly as codex reads $CODEX_BIN and pi reads
+// $PI_BIN — never per Spec. A binary chosen per session is a different
+// provider, not a different request, and letting a Spec pick one would give
+// every caller of a shared registry-held provider a way to change what the
+// host executes.
+//
+// The value is passed to exec as-is, so a bare name resolves through the
+// child's $PATH and a path does not; either way the stub-agent subcommand is
+// appended, because the override names a DONMAI BINARY, not an arbitrary
+// program. A test that must run something else uses WithStubAgentCommand,
+// which supplies its own argv.
 const EnvStubAgentBin = "DONMAI_STUB_AGENT_BIN"
 
 // StubAgentSubcommand is the argv this binary answers the fake agent on. The
@@ -59,7 +70,7 @@ func (p *provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	binary, argv, err := p.stubAgentCommand(prepared)
+	binary, argv, err := p.stubAgentCommand()
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
@@ -80,39 +91,61 @@ func (p *provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), interactiveStopGrace)
 		_ = handle.Stop(stopCtx)
 		stopCancel()
+		// PreparePrompt already persisted a READY receipt for these bytes.
+		// The write failed and the session is being abandoned, so leaving that
+		// record standing would claim a prompt reached an agent that never
+		// existed. Retract it before returning the error.
+		if receiptErr := ptycli.DenyPromptReceiptAfterSeedFailure(prepared); receiptErr != nil {
+			return nil, fmt.Errorf(
+				"%w: stub PTY seed delivery: %w; persist denial receipt: %w",
+				agent.ErrSpawnFailed, err, receiptErr,
+			)
+		}
 		return nil, fmt.Errorf("%w: stub PTY seed delivery: %w", agent.ErrSpawnFailed, err)
 	}
 	return handle, nil
 }
 
-// stubAgentCommand resolves the program to run under the PTY.
-//
-// The default is os.Executable() re-invoked on StubAgentSubcommand. That is
-// deliberate: the fake agent ships INSIDE the binary that spawns it, so there
-// is no separate artifact to install, to find on a $PATH, or to accidentally
-// leave at a different version than the daemon driving it.
-func (p *provider) stubAgentCommand(spec agent.Spec) (string, []string, error) {
-	if p.agentBinary != "" {
-		return p.agentBinary, append([]string(nil), p.agentArgv...), nil
-	}
-	if override := specEnv(spec, EnvStubAgentBin); override != "" {
-		return override, nil, nil
+// resolveStubAgentCommand applies WithStubAgentCommand -> $DONMAI_STUB_AGENT_BIN,
+// the same option-then-environment order codex and pi use for their binaries.
+// It runs at New() so the choice belongs to the provider, and returns empty to
+// mean "no override" — the default is deferred to spawn time (see
+// stubAgentCommand).
+func resolveStubAgentCommand(binary string, argv []string) (string, []string) {
+	if binary != "" {
+		return binary, argv
 	}
 	if override := strings.TrimSpace(os.Getenv(EnvStubAgentBin)); override != "" {
-		return override, nil, nil
+		// The override names a donmai binary, so it still needs the
+		// subcommand. Without it the child runs a bare `donmai`, prints help
+		// and exits 0 — which every layer above reads as a clean session that
+		// ran no scenario at all.
+		return override, []string{StubAgentSubcommand}
+	}
+	return "", nil
+}
+
+// stubAgentCommand resolves the program to run under the PTY.
+//
+// With no override the answer is os.Executable() re-invoked on
+// StubAgentSubcommand. That is deliberate: the fake agent ships INSIDE the
+// binary that spawns it, so there is no separate artifact to install, to find,
+// or to accidentally leave at a different version than the daemon driving it.
+//
+// This one step is resolved per spawn rather than at New() because New() is
+// infallible and is called for EVERY registry build, including hosts that only
+// ever use the headless mode. A failure to identify our own executable must
+// deny the one interactive spawn that needs it, not remove the stub provider
+// from the registry entirely.
+func (p *provider) stubAgentCommand() (string, []string, error) {
+	if p.agentBinary != "" {
+		return p.agentBinary, append([]string(nil), p.agentArgv...), nil
 	}
 	self, err := os.Executable()
 	if err != nil {
 		return "", nil, fmt.Errorf("resolve own executable for the %s child: %w", StubAgentSubcommand, err)
 	}
 	return self, []string{StubAgentSubcommand}, nil
-}
-
-func specEnv(spec agent.Spec, key string) string {
-	if spec.Env == nil {
-		return ""
-	}
-	return strings.TrimSpace(spec.Env[key])
 }
 
 // withScenarioEnv projects the typed ProviderConfig scenario knobs onto the
@@ -141,7 +174,42 @@ func withScenarioEnv(env map[string]string, config map[string]any) (map[string]s
 	}
 	set(stubagent.EnvScenario, inline)
 	set(stubagent.EnvScenarioFile, strings.TrimSpace(file))
+
+	if err := validateScenarioFile(out); err != nil {
+		return nil, err
+	}
 	return out, nil
+}
+
+// validateScenarioFile reads and parses the scenario file the child is about
+// to be pointed at.
+//
+// Validating the inline form and forwarding the file form unchecked would be
+// the worse half of both: the inline path refuses a malformed scenario at
+// spawn precisely so a child that exits on garbage is never mistaken for a
+// child that was ASKED to exit — and a missing or malformed file produces
+// exactly that same indistinguishable exit. The file is read here, in the
+// parent, because for every environment this harness serves the parent and the
+// child share a filesystem.
+//
+// The inline form wins when both are set, and is already validated, so this
+// only runs when the file is what the child will actually read.
+func validateScenarioFile(env map[string]string) error {
+	if env[stubagent.EnvScenario] != "" {
+		return nil
+	}
+	path := env[stubagent.EnvScenarioFile]
+	if path == "" {
+		return nil
+	}
+	data, err := os.ReadFile(path) //nolint:gosec // the path is the caller's own scenario file
+	if err != nil {
+		return fmt.Errorf("%s: %w", ScenarioFileConfigKey, err)
+	}
+	if _, err := stubagent.Parse(data); err != nil {
+		return fmt.Errorf("%s %s: %w", ScenarioFileConfigKey, path, err)
+	}
+	return nil
 }
 
 // scenarioConfigJSON accepts the scenario either as a JSON string or as an

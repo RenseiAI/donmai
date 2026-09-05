@@ -215,10 +215,10 @@ func watchStop(
 	if notice == "" {
 		notice = DefaultStopNotice
 	}
-	// The notice is best-effort: a stop often arrives precisely because the
-	// far end is going away, and failing the run because the goodbye could
-	// not be delivered would misreport a stop that did work.
-	_ = out.line(ctx, notice+" mode="+string(scenario.StopModeOrDefault()))
+	// Unthrottled, and best-effort: a stop often arrives precisely because the
+	// far end is going away, and failing the run because the goodbye could not
+	// be delivered would misreport a stop that did work.
+	_ = out.lineNow(notice + " mode=" + string(scenario.StopModeOrDefault()))
 
 	switch scenario.StopModeOrDefault() {
 	case StopIgnore:
@@ -276,6 +276,15 @@ func realSleep(ctx context.Context, d time.Duration) error {
 // startLineReader drains r in the background so an AwaitInput step reads from
 // a channel rather than blocking on a file descriptor it cannot abandon. A
 // nil reader yields an immediately-closed channel.
+//
+// The goroutine is deliberately NOT joined before Run returns, and the reason
+// is the same one that makes this helper necessary: in production r is the
+// PTY's stdin, a read on it is not interruptible, and it never reaches EOF
+// while the terminal is open. Waiting for it would make Run's return depend on
+// the far end closing the terminal — the process would outlive its own
+// scenario. It exits with the process, and on every non-terminal reader (every
+// test) it exits on EOF; ctx bounds the send so it can never block forever on
+// a channel nobody is draining.
 func startLineReader(ctx context.Context, r io.Reader) <-chan string {
 	out := make(chan string, 16)
 	if r == nil {
@@ -298,10 +307,24 @@ func startLineReader(ctx context.Context, r io.Reader) <-chan string {
 	return out
 }
 
-// syncWriter serializes the script's writes against the stop watcher's, and
-// applies the scenario's output-rate throttle. Without the mutex two
-// goroutines could interleave inside one line and the transcript would stop
-// being line-addressable, which is the one property every consumer relies on.
+// syncWriter serializes the script's writes against the stop watcher's and
+// applies the scenario's output-rate throttle.
+//
+// Two rules decide its shape, and they pull against each other:
+//
+//  1. A line is written under the mutex, whole. Two goroutines interleaving
+//     inside one line would end the transcript's line-addressability, which is
+//     the one property every consumer relies on.
+//  2. The throttle's wait happens OUTSIDE the mutex, after the bytes are out.
+//
+// Rule 2 is the non-obvious one. Pacing inside the lock is the natural way to
+// write this and it is wrong: a 100-byte line at 20 bytes/second holds the
+// lock for five seconds, which is the whole cooperative-stop grace window. The
+// stop notice would then be starved past the deadline and the session would
+// look like one that never received the signal — silently disarming the exact
+// control the ignore mode exists to provide. The throttle therefore paces the
+// stream BETWEEN writes; it never fragments a line and never holds the lock
+// while it waits.
 type syncWriter struct {
 	mu    sync.Mutex
 	w     io.Writer
@@ -309,35 +332,43 @@ type syncWriter struct {
 	sleep sleepFunc
 }
 
+// line writes one throttled line: bytes out under the lock, pacing debt paid
+// after it is released.
 func (s *syncWriter) line(ctx context.Context, text string) error {
-	s.mu.Lock()
-	defer s.mu.Unlock()
-	return s.write(ctx, []byte(text+"\n"))
-}
-
-func (s *syncWriter) write(ctx context.Context, data []byte) error {
-	if s.rate <= 0 {
-		if _, err := s.w.Write(data); err != nil {
-			return fmt.Errorf("stubagent: write: %w", err)
-		}
+	debt, err := s.emit(text)
+	if err != nil {
+		return err
+	}
+	if debt <= 0 {
 		return nil
 	}
-	// Chunk small enough that the pacing is visible to a reader watching the
-	// stream, large enough that a long line does not become a syscall per byte.
-	chunk := s.rate / 20
-	if chunk < 1 {
-		chunk = 1
-	}
-	for len(data) > 0 {
-		n := min(chunk, len(data))
-		if _, err := s.w.Write(data[:n]); err != nil {
-			return fmt.Errorf("stubagent: write: %w", err)
-		}
-		data = data[n:]
-		delay := time.Duration(float64(n) / float64(s.rate) * float64(time.Second))
-		if err := s.sleep(ctx, delay); err != nil {
-			return fmt.Errorf("stubagent: throttled write: %w", err)
-		}
+	if err := s.sleep(ctx, debt); err != nil {
+		return fmt.Errorf("stubagent: throttled write: %w", err)
 	}
 	return nil
+}
+
+// lineNow writes one line and pays no pacing debt. The cooperative-stop notice
+// uses it: throttling the one message whose whole value is arriving before a
+// deadline would defeat its purpose, and it is a control line rather than
+// scripted output, so it is not what the rate knob is modelling.
+func (s *syncWriter) lineNow(text string) error {
+	_, err := s.emit(text)
+	return err
+}
+
+// emit writes the line under the lock and returns the pacing debt its bytes
+// incurred.
+func (s *syncWriter) emit(text string) (time.Duration, error) {
+	data := []byte(text + "\n")
+	s.mu.Lock()
+	_, err := s.w.Write(data)
+	s.mu.Unlock()
+	if err != nil {
+		return 0, fmt.Errorf("stubagent: write: %w", err)
+	}
+	if s.rate <= 0 {
+		return 0, nil
+	}
+	return time.Duration(float64(len(data)) / float64(s.rate) * float64(time.Second)), nil
 }

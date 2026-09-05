@@ -75,24 +75,12 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	return handle, nil
 }
 
+// emitShellSeedFailure retracts the ready prompt receipt after a failed PTY
+// write. The correction itself is the shared one — every PTY-seed harness owes
+// the same retraction, so it lives in the shared driver rather than being
+// re-derived here.
 func emitShellSeedFailure(spec agent.Spec) error {
-	if spec.OnPromptAdapted == nil || spec.PromptReceipt == nil {
-		return nil
-	}
-	receipt := *spec.PromptReceipt
-	receipt.Decision = "denied"
-	receipt.Entries = append([]agent.PromptDeliveryEntry(nil), receipt.Entries...)
-	for i := range receipt.Entries {
-		entry := &receipt.Entries[i]
-		if entry.Outcome != agent.PromptOutcomeDelivered && entry.Outcome != agent.PromptOutcomeDowngraded {
-			continue
-		}
-		entry.Outcome = agent.PromptOutcomeDenied
-		entry.Delivery = ""
-		entry.DowngradeAuthID = ""
-		entry.DenialCode = agent.PromptDenialApplicationFailed
-	}
-	return spec.OnPromptAdapted(receipt)
+	return ptycli.DenyPromptReceiptAfterSeedFailure(spec)
 }
 
 // Resume returns agent.ErrUnsupported: a bare shell has no session identity

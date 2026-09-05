@@ -112,6 +112,11 @@ func New(opts ...Option) (agent.Provider, error) {
 	for _, opt := range opts {
 		opt(p)
 	}
+	// Resolve the interactive child's binary ONCE, here — the option, then the
+	// environment, the same order codex uses for $CODEX_BIN and pi for
+	// $PI_BIN. Reading it per Spec instead would let any caller of a shared,
+	// registry-held provider change what this host executes.
+	p.agentBinary, p.agentArgv = resolveStubAgentCommand(p.agentBinary, p.agentArgv)
 	return p, nil
 }
 

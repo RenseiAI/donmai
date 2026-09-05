@@ -4,6 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
+	"path/filepath"
+	"runtime"
 	"strings"
 	"testing"
 
@@ -67,7 +70,6 @@ func TestStubAgentCommandResolution(t *testing.T) {
 	tests := []struct {
 		name     string
 		opts     []Option
-		specEnv  map[string]string
 		procEnv  string
 		wantBin  string
 		wantArgv []string
@@ -78,31 +80,27 @@ func TestStubAgentCommandResolution(t *testing.T) {
 			wantArgv: []string{StubAgentSubcommand},
 		},
 		{
-			name:     "spec env overrides the default",
-			specEnv:  map[string]string{EnvStubAgentBin: "/opt/fake-agent"},
-			wantBin:  "/opt/fake-agent",
-			wantArgv: nil,
+			// The override names a donmai binary, so the subcommand rides
+			// along. Without it the child runs a bare `donmai`, prints help
+			// and exits 0 — which every layer above reads as a clean session
+			// that ran no scenario at all.
+			name:     "the environment override still gets the subcommand",
+			procEnv:  "/opt/other-build/donmai",
+			wantBin:  "/opt/other-build/donmai",
+			wantArgv: []string{StubAgentSubcommand},
 		},
 		{
-			name:     "process env overrides the default",
-			procEnv:  "/opt/from-process",
-			wantBin:  "/opt/from-process",
-			wantArgv: nil,
-		},
-		{
-			name:     "spec env wins over process env",
-			specEnv:  map[string]string{EnvStubAgentBin: "/opt/from-spec"},
-			procEnv:  "/opt/from-process",
-			wantBin:  "/opt/from-spec",
-			wantArgv: nil,
-		},
-		{
-			name:     "explicit option wins over everything",
+			name:     "an explicit option wins over the environment and keeps its own argv",
 			opts:     []Option{WithStubAgentCommand("/opt/from-option", "run")},
-			specEnv:  map[string]string{EnvStubAgentBin: "/opt/from-spec"},
 			procEnv:  "/opt/from-process",
 			wantBin:  "/opt/from-option",
 			wantArgv: []string{"run"},
+		},
+		{
+			name:     "an option with no argv runs the binary bare",
+			opts:     []Option{WithStubAgentCommand("/opt/fake-agent")},
+			wantBin:  "/opt/fake-agent",
+			wantArgv: nil,
 		},
 	}
 
@@ -110,12 +108,8 @@ func TestStubAgentCommandResolution(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			// t.Setenv forbids parallel subtests, which is correct here: the
 			// process environment is shared state.
-			if tc.procEnv != "" {
-				t.Setenv(EnvStubAgentBin, tc.procEnv)
-			} else {
-				t.Setenv(EnvStubAgentBin, "")
-			}
-			bin, argv, err := newTestProvider(t, tc.opts...).stubAgentCommand(agent.Spec{Env: tc.specEnv})
+			t.Setenv(EnvStubAgentBin, tc.procEnv)
+			bin, argv, err := newTestProvider(t, tc.opts...).stubAgentCommand()
 			if err != nil {
 				t.Fatalf("stubAgentCommand: %v", err)
 			}
@@ -129,8 +123,41 @@ func TestStubAgentCommandResolution(t *testing.T) {
 	}
 }
 
+// TestStubAgentBinaryIsResolvedAtConstruction pins the property that separates
+// this from a per-Spec lookup: the environment is read ONCE, by New, exactly as
+// codex reads $CODEX_BIN and pi reads $PI_BIN. A provider handed out by a
+// shared registry must execute the same program for every caller, so a later
+// change to the environment cannot move it.
+//
+// The Spec half of that property is enforced by the signature rather than by a
+// test: stubAgentCommand takes no arguments, so a caller-supplied Spec has no
+// channel through which to name the binary this host executes.
+func TestStubAgentBinaryIsResolvedAtConstruction(t *testing.T) {
+	t.Setenv(EnvStubAgentBin, "/opt/at-construction")
+	built := newTestProvider(t)
+
+	t.Setenv(EnvStubAgentBin, "/opt/changed-afterwards")
+	bin, argv, err := built.stubAgentCommand()
+	if err != nil {
+		t.Fatalf("stubAgentCommand: %v", err)
+	}
+	if bin != "/opt/at-construction" {
+		t.Errorf("binary = %q, want the value present at New (%q)", bin, "/opt/at-construction")
+	}
+	if strings.Join(argv, " ") != StubAgentSubcommand {
+		t.Errorf("argv = %v, want [%s]", argv, StubAgentSubcommand)
+	}
+}
+
 func TestWithScenarioEnv(t *testing.T) {
 	t.Parallel()
+
+	// A real file, because withScenarioEnv now reads the one it is about to
+	// forward rather than passing the path along on trust.
+	scenarioFile := filepath.Join(t.TempDir(), "scenario.json")
+	if err := os.WriteFile(scenarioFile, []byte(`{"version":1,"name":"on-disk"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
 
 	tests := []struct {
 		name    string
@@ -155,9 +182,9 @@ func TestWithScenarioEnv(t *testing.T) {
 			want:   map[string]string{stubagent.EnvScenario: `{"name":"object","version":1}`},
 		},
 		{
-			name:   "a scenario file path is projected",
-			config: map[string]any{ScenarioFileConfigKey: " /tmp/scenario.json "},
-			want:   map[string]string{stubagent.EnvScenarioFile: "/tmp/scenario.json"},
+			name:   "a scenario file path is projected, trimmed",
+			config: map[string]any{ScenarioFileConfigKey: " " + scenarioFile + " "},
+			want:   map[string]string{stubagent.EnvScenarioFile: scenarioFile},
 		},
 		{
 			// The operator who set the variable by hand is the more specific
@@ -275,4 +302,162 @@ func TestSpawnWithoutInteractiveStaysHeadless(t *testing.T) {
 	if handle.SessionID() == "" {
 		t.Error("headless Spawn returned a handle with no session id")
 	}
+}
+
+// TestSpawnInteractiveSeedFailureRetractsTheReadyReceipt is the failure branch
+// the deliverSeed seam exists to reach.
+//
+// The order that makes this matter: PrepareHarness adapts the prompt and
+// persists a READY receipt, and only then are the bytes written into the
+// terminal. When that write fails the spawn is abandoned — so without a
+// retraction the durable record says a prompt was delivered to a session that
+// never existed. Mirrors shell's own coverage of the same window.
+func TestSpawnInteractiveSeedFailureRetractsTheReadyReceipt(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	bin := writeNoopBinary(t)
+
+	tests := []struct {
+		name string
+		err  error
+	}{
+		{name: "partial write", err: errors.New("partial PTY seed")},
+		{name: "write error", err: errors.New("PTY closed")},
+		{name: "cancelled", err: context.Canceled},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			plan := agent.PromptPlan{
+				ContractVersion:  agent.PromptContractVersion,
+				BaseInstructions: agent.BaseInstructionPlan{Strategy: agent.BaseInstructionsPreserve},
+				UserPrompt:       agent.PromptContent{ID: "interactive-user-task", Text: "seed", Required: true},
+			}
+			var receipts []agent.PromptDeliveryReceipt
+
+			built := newTestProvider(t, WithStubAgentCommand(bin))
+			built.deliverSeed = func(context.Context, agent.Handle, agent.InteractiveSession, string) error {
+				return tc.err
+			}
+
+			handle, err := built.Spawn(context.Background(), agent.Spec{
+				Cwd:         t.TempDir(),
+				Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+				PromptPlan:  &plan,
+				OnPromptAdapted: func(receipt agent.PromptDeliveryReceipt) error {
+					receipts = append(receipts, receipt)
+					return nil
+				},
+			})
+			if handle != nil {
+				t.Fatal("Spawn returned a usable session after a failed seed")
+			}
+			if !errors.Is(err, agent.ErrSpawnFailed) || !strings.Contains(err.Error(), tc.err.Error()) {
+				t.Fatalf("Spawn error = %v, want ErrSpawnFailed containing %q", err, tc.err)
+			}
+			if len(receipts) < 2 {
+				t.Fatalf("receipts = %+v, want the ready decision followed by an application denial", receipts)
+			}
+			final := receipts[len(receipts)-1]
+			if final.Decision != "denied" {
+				t.Fatalf("final receipt decision = %q, want denied", final.Decision)
+			}
+			for _, entry := range final.Entries {
+				if entry.ID != "interactive-user-task" {
+					continue
+				}
+				if entry.Outcome != agent.PromptOutcomeDenied || entry.DenialCode != agent.PromptDenialApplicationFailed {
+					t.Fatalf("final user-task receipt = %+v, want an application_failed denial", entry)
+				}
+			}
+		})
+	}
+}
+
+// TestSpawnInteractiveValidatesTheScenarioFile closes the gap between the two
+// scenario forms. The inline form is refused at spawn precisely so a child that
+// exits on garbage is never mistaken for one that was ASKED to exit; a missing
+// or malformed file produces that same indistinguishable exit, so it is checked
+// on the same path.
+func TestSpawnInteractiveValidatesTheScenarioFile(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	good := filepath.Join(dir, "good.json")
+	if err := os.WriteFile(good, []byte(`{"version":1,"name":"from-file"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	bad := filepath.Join(dir, "bad.json")
+	if err := os.WriteFile(bad, []byte(`{"version":1,"steps":[{}]}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name    string
+		config  map[string]any
+		env     map[string]string
+		wantErr string
+	}{
+		{
+			name:   "a valid file passes through",
+			config: map[string]any{ScenarioFileConfigKey: good},
+		},
+		{
+			name:    "a missing file is refused",
+			config:  map[string]any{ScenarioFileConfigKey: filepath.Join(dir, "absent.json")},
+			wantErr: "no such file",
+		},
+		{
+			name:    "a malformed file is refused",
+			config:  map[string]any{ScenarioFileConfigKey: bad},
+			wantErr: "no action set",
+		},
+		{
+			name:    "a file named through the environment is checked too",
+			env:     map[string]string{stubagent.EnvScenarioFile: bad},
+			wantErr: "no action set",
+		},
+		{
+			// The child reads the inline form and never opens the file, so
+			// checking the file here would refuse a spawn that would have
+			// worked.
+			name:   "an inline scenario makes the file irrelevant",
+			config: map[string]any{ScenarioConfigKey: `{"version":1,"name":"inline"}`, ScenarioFileConfigKey: bad},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			_, err := withScenarioEnv(tc.env, tc.config)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("withScenarioEnv err = %v, want one containing %q", err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("withScenarioEnv: %v", err)
+			}
+		})
+	}
+}
+
+// writeNoopBinary materializes a do-nothing executable to stand in for the
+// interactive child. The seed tests never want it to produce output — the
+// assertion is about what happens when the write INTO it fails.
+func writeNoopBinary(t *testing.T) string {
+	t.Helper()
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	bin := filepath.Join(t.TempDir(), "noop-agent")
+	if err := os.WriteFile(bin, []byte("#!/bin/bash\nsleep 30\n"), 0o600); err != nil { //nolint:gosec // test fixture
+		t.Fatal(err)
+	}
+	if err := os.Chmod(bin, 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+		t.Fatal(err)
+	}
+	return bin
 }

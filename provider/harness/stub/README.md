@@ -65,7 +65,7 @@ The child reads its scenario from the environment:
 | `DONMAI_STUB_STOP_MODE` | override the stop policy (`respond` / `ignore` / `slow`) |
 | `DONMAI_STUB_OUTPUT_RATE` | throttle stdout, in bytes per second |
 | `DONMAI_STUB_SEED` | override the scenario seed |
-| `DONMAI_STUB_AGENT_BIN` | run a different program as the child |
+| `DONMAI_STUB_AGENT_BIN` | run a different donmai build as the child |
 
 With none of them set the child runs the default scenario: announce, idle
 briefly, exit 0. The override variables apply on top of whichever source
@@ -73,12 +73,26 @@ supplied the base, so one scenario file covers a family of fault cases without
 being rewritten, and the result is revalidated — an override is not a second
 chance to be invalid.
 
+Unlike the scenario variables, `DONMAI_STUB_AGENT_BIN` is read **once, at
+`New()`** — the same place codex reads `$CODEX_BIN` and pi reads `$PI_BIN` — and
+never from a `Spec`. A provider handed out by a shared registry must execute the
+same program for every caller. Because the override names a *donmai binary*, the
+`stub-agent` subcommand is appended to it; without that the child would run a
+bare `donmai`, print help and exit 0, which every layer above reads as a clean
+session that ran no scenario at all. A test that must run something else uses
+the `WithStubAgentCommand` option, which supplies its own argv. The value is
+handed to exec as-is, so a bare name resolves through `$PATH` and a path does
+not.
+
 Callers holding a `Spec` can pass the scenario through the typed
 `ProviderConfig` instead of composing `Env` themselves:
 `stub.scenario` (a JSON string or a decoded object) and `stub.scenarioFile`.
-Both are validated at spawn: a malformed scenario is refused rather than
-becoming a child that exits for reasons the session layer cannot distinguish
-from a scenario that asked to exit. An explicit `Spec.Env` entry always wins.
+Both are validated at spawn — the file is read and parsed in the parent, not
+forwarded on trust — because a child that exits on a malformed or missing
+scenario is indistinguishable, at the session layer, from one that was asked to
+exit. The check applies to whichever form the child will actually read: an
+inline scenario wins, and when one is present the file is never opened. An
+explicit `Spec.Env` entry always wins over the `ProviderConfig` form.
 
 ```json
 {
@@ -111,7 +125,14 @@ same reason.
 | `a2a` | emit one agent-to-agent line (see below) |
 | `awaitInput` | block until a line arrives on stdin; `echo` prints it back. A wait that expires fails the scenario |
 | `exit` | exit now with this code, skipping every later step |
-| `hang` | idle until stopped |
+| `hang` | a boolean; `true` idles until stopped, `false` is a deliberate no-op step |
+
+The throttle paces the stream **between** lines: it never fragments one, and
+never holds the writer's lock while it waits. Pacing inside the lock is the
+natural way to write it and it is wrong — a 100-byte line at 20 bytes/second
+would hold the lock for the whole five-second stop grace window, starving the
+notice below past the deadline and making a refused stop look like one that was
+never delivered.
 
 ### Cooperative stop
 
