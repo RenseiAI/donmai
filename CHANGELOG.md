@@ -72,6 +72,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   between the two. An inline scenario wins, and when one is present the file is
   never opened. Every refusal names the path it refused. (#550)
 
+### Fixes
+
+- **`golang.org/x/crypto` moves to v0.56.0, closing two SSH denial-of-service
+  advisories that were reachable from the Git kit fetcher.** `GO-2026-6355`
+  (a deadlocked established channel) and `GO-2026-6354` (a deadlocked undecided
+  channel) both trace through `daemon.gitKitFetcher.Fetch` →
+  `git.PlainCloneContext` → `ssh.NewClientConn`, so installing a kit from a Git
+  remote over SSH ran through the affected code. Both are fixed in
+  `golang.org/x/crypto` v0.56.0 (from v0.54.0); `golang.org/x/text` moves
+  v0.40.0 → v0.41.0 because the new `x/crypto` requires it, and nothing else in
+  the module graph changes. `govulncheck` now reports no reachable
+  vulnerabilities. (#551)
+
 ### Chores
 
 - **A new push to an open pull request now cancels that workflow's superseded
