@@ -1,9 +1,32 @@
-// Package stub provides a deterministic, in-process implementation of
-// agent.Provider for tests, the F.4 smoke harness, and any caller that
-// needs a real Provider with no external runtime dependencies.
+// Package stub is the deterministic fake harness. It has two spawn modes,
+// and the difference between them is the point.
 //
-// The stub provider does not call out to any binary, network endpoint,
-// or filesystem. Each Spawn returns a Handle that emits a pre-scripted
+// # Headless mode (Spec.Interactive == nil)
+//
+// The original mode: a fully in-process implementation of agent.Provider for
+// tests, the F.4 smoke harness, and any caller that needs a real Provider
+// with no external runtime dependencies. It calls out to no binary, network
+// endpoint, or filesystem, and fabricates a pre-scripted agent.Event
+// sequence. That is the right shape for unit-testing the runner's event
+// handling and the wrong shape for exercising the daemon, because nothing
+// about it is a real session — no PTY, no process group, no signal delivery,
+// no shim adoption, no exit status.
+//
+// # Interactive mode (Spec.Interactive != nil)
+//
+// The other half: a real PTY child running the deterministic fake AGENT
+// (provider/harness/stub/stubagent), spawned through the SHARED
+// provider/harness/ptycli driver — the same call claude, codex, pi and shell
+// make. Same ptyhost plumbing, same session-shim adoption, same
+// SIGTERM -> grace -> SIGKILL stop escalation, same coarse Init/Result event
+// mapping. What it lacks is a model: its behaviour is a scenario script, so
+// an integration environment can drive every session-lifecycle branch with no
+// provider credential and no network. See interactive.go and the package
+// README for the scenario format and the fault knobs.
+//
+// The remainder of this comment describes the headless mode.
+//
+// Each Spawn returns a Handle that emits a pre-scripted
 // sequence of agent.Event values driven by a behavior name read from
 // either Spec.Env["DONMAI_STUB_MODE"] (the legacy F.1.1 §3.3 knob) or
 // Spec.ProviderConfig["stub.behavior"] (the v0.5.0 typed-config knob).

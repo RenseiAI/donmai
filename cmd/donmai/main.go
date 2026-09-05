@@ -211,6 +211,12 @@ func main() {
 
 	cmd, _ := newRootCmd()
 	if err := cmd.Execute(); err != nil {
+		// The hidden stub-agent command's whole purpose is to exit with a
+		// SCRIPTED status. Flattening that to 1 here would erase the one
+		// signal its caller reads.
+		if code, ok := afcli.StubAgentExitCode(err); ok {
+			os.Exit(code)
+		}
 		os.Exit(1)
 	}
 }

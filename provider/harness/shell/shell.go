@@ -67,32 +67,12 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		// PreparePrompt already persisted a ready adaptation decision. Replace
 		// it with an application-failed denial so a failed PTY write never
 		// leaves a success receipt or usable session behind.
-		if receiptErr := emitShellSeedFailure(spec); receiptErr != nil {
+		if receiptErr := ptycli.DenyPromptReceiptAfterSeedFailure(spec); receiptErr != nil {
 			return nil, fmt.Errorf("%w: shell PTY seed delivery: %w; persist denial receipt: %w", agent.ErrSpawnFailed, err, receiptErr)
 		}
 		return nil, fmt.Errorf("%w: shell PTY seed delivery: %w", agent.ErrSpawnFailed, err)
 	}
 	return handle, nil
-}
-
-func emitShellSeedFailure(spec agent.Spec) error {
-	if spec.OnPromptAdapted == nil || spec.PromptReceipt == nil {
-		return nil
-	}
-	receipt := *spec.PromptReceipt
-	receipt.Decision = "denied"
-	receipt.Entries = append([]agent.PromptDeliveryEntry(nil), receipt.Entries...)
-	for i := range receipt.Entries {
-		entry := &receipt.Entries[i]
-		if entry.Outcome != agent.PromptOutcomeDelivered && entry.Outcome != agent.PromptOutcomeDowngraded {
-			continue
-		}
-		entry.Outcome = agent.PromptOutcomeDenied
-		entry.Delivery = ""
-		entry.DowngradeAuthID = ""
-		entry.DenialCode = agent.PromptDenialApplicationFailed
-	}
-	return spec.OnPromptAdapted(receipt)
 }
 
 // Resume returns agent.ErrUnsupported: a bare shell has no session identity

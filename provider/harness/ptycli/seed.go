@@ -69,3 +69,40 @@ func stopAfterSeedFailure(handle agent.Handle, cause error) error {
 	}
 	return cause
 }
+
+// DenyPromptReceiptAfterSeedFailure replaces the ready prompt receipt that
+// PreparePrompt already persisted with an application-failed denial.
+//
+// It exists because a PTY seed is delivered AFTER the prompt has been adapted
+// and its "ready" receipt emitted. If the write into the terminal then fails,
+// the spawn is abandoned — but the durable record still says the prompt was
+// delivered. That is the worst of both: no session, and a receipt claiming
+// bytes reached an agent that never saw them. Every harness whose prompt
+// delivery is a PTY seed must therefore correct the record on the failure
+// path, so the correction lives here rather than being re-derived per harness.
+//
+// spec must be the ADAPTED spec returned by PrepareHarness/PreparePrompt — the
+// one carrying PromptReceipt — not the caller's original. A spec with no
+// receipt hook or no receipt is a no-op: there is nothing to correct.
+func DenyPromptReceiptAfterSeedFailure(spec agent.Spec) error {
+	if spec.OnPromptAdapted == nil || spec.PromptReceipt == nil {
+		return nil
+	}
+	receipt := *spec.PromptReceipt
+	receipt.Decision = "denied"
+	receipt.Entries = append([]agent.PromptDeliveryEntry(nil), receipt.Entries...)
+	for i := range receipt.Entries {
+		entry := &receipt.Entries[i]
+		// Only what this seed claimed to carry is retracted. An entry already
+		// denied at adaptation time was never in flight, and rewriting it here
+		// would blame the seed for a decision made before it ran.
+		if entry.Outcome != agent.PromptOutcomeDelivered && entry.Outcome != agent.PromptOutcomeDowngraded {
+			continue
+		}
+		entry.Outcome = agent.PromptOutcomeDenied
+		entry.Delivery = ""
+		entry.DowngradeAuthID = ""
+		entry.DenialCode = agent.PromptDenialApplicationFailed
+	}
+	return spec.OnPromptAdapted(receipt)
+}

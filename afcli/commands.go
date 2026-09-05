@@ -205,6 +205,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 		root.AddCommand(newA2ACmd(cfg))
 	}
 	root.AddCommand(newEvalCmd(cfg))
+	root.AddCommand(newStubAgentCmd())
 	root.AddCommand(newArchCmd(cfg))
 	root.AddCommand(linearcmd.New(ds, binaryName(cfg)))
 	root.AddCommand(newGitHubCmd(ds, cfg))

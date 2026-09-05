@@ -907,7 +907,7 @@
         "nativeJsonMode": true,
         "toolPermissionFormat": "claude",
         "streamingTransport": "none",
-        "interactivePty": false,
+        "interactivePty": true,
         "noticeDelivery": "in-box-loop",
         "drives": [
           "stub"
@@ -923,8 +923,48 @@
       "drivesHosts": [
         "local"
       ],
-      "promptDelivery": null,
+      "promptDelivery": [
+        {
+          "id": "stub/interactive/pty-seed-v1",
+          "mode": "human_controlled",
+          "systemDelivery": "unsupported",
+          "baseAppendDelivery": "unsupported",
+          "baseReplaceDelivery": "unsupported",
+          "contextDelivery": "stub_pty_seed",
+          "userDelivery": "stub_pty_seed",
+          "amendmentDelivery": "stub_pty_seed"
+        }
+      ],
       "toolLifecycle": [
+        {
+          "id": "stub/interactive/tool-lifecycle-v1",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "unsupported",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "unit_verified",
+          "productionEligible": false
+        },
         {
           "id": "stub/tool-lifecycle-v1",
           "mode": "autonomous",

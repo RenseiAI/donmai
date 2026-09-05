@@ -119,3 +119,131 @@ func TestDeliverSeed_CancellationStopsBlockedWrite(t *testing.T) {
 		t.Fatalf("Stop calls = %d, want 1", got)
 	}
 }
+
+// TestDenyPromptReceiptAfterSeedFailure covers the shared retraction directly,
+// now that more than one harness depends on it.
+func TestDenyPromptReceiptAfterSeedFailure(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name     string
+		spec     func(*[]agent.PromptDeliveryReceipt) agent.Spec
+		wantEmit bool
+		check    func(*testing.T, agent.PromptDeliveryReceipt)
+	}{
+		{
+			name: "no hook is a no-op",
+			spec: func(*[]agent.PromptDeliveryReceipt) agent.Spec {
+				return agent.Spec{PromptReceipt: &agent.PromptDeliveryReceipt{Decision: "ready"}}
+			},
+		},
+		{
+			name: "no receipt is a no-op",
+			spec: func(got *[]agent.PromptDeliveryReceipt) agent.Spec {
+				return agent.Spec{OnPromptAdapted: func(r agent.PromptDeliveryReceipt) error {
+					*got = append(*got, r)
+					return nil
+				}}
+			},
+		},
+		{
+			name: "delivered and downgraded entries are retracted",
+			spec: func(got *[]agent.PromptDeliveryReceipt) agent.Spec {
+				return agent.Spec{
+					PromptReceipt: &agent.PromptDeliveryReceipt{
+						Decision: "ready",
+						Entries: []agent.PromptDeliveryEntry{
+							{ID: "user", Outcome: agent.PromptOutcomeDelivered, Delivery: agent.PromptDeliveryShellPTYSeed},
+							{ID: "protocol", Outcome: agent.PromptOutcomeDowngraded, DowngradeAuthID: "auth-1"},
+						},
+					},
+					OnPromptAdapted: func(r agent.PromptDeliveryReceipt) error {
+						*got = append(*got, r)
+						return nil
+					},
+				}
+			},
+			wantEmit: true,
+			check: func(t *testing.T, r agent.PromptDeliveryReceipt) {
+				if r.Decision != "denied" {
+					t.Errorf("Decision = %q, want denied", r.Decision)
+				}
+				for _, entry := range r.Entries {
+					if entry.Outcome != agent.PromptOutcomeDenied ||
+						entry.DenialCode != agent.PromptDenialApplicationFailed {
+						t.Errorf("entry %q = %+v, want an application_failed denial", entry.ID, entry)
+					}
+					if entry.Delivery != "" || entry.DowngradeAuthID != "" {
+						t.Errorf("entry %q still names a delivery/authorization: %+v", entry.ID, entry)
+					}
+				}
+			},
+		},
+		{
+			// An entry already denied at adaptation time was never in flight;
+			// rewriting it would blame the seed for a decision made before it ran.
+			name: "an already-denied entry keeps its original denial code",
+			spec: func(got *[]agent.PromptDeliveryReceipt) agent.Spec {
+				return agent.Spec{
+					PromptReceipt: &agent.PromptDeliveryReceipt{
+						Decision: "ready",
+						Entries: []agent.PromptDeliveryEntry{
+							{ID: "ctx", Outcome: agent.PromptOutcomeDenied, DenialCode: agent.PromptDenialDeliveryUnsupported},
+						},
+					},
+					OnPromptAdapted: func(r agent.PromptDeliveryReceipt) error {
+						*got = append(*got, r)
+						return nil
+					},
+				}
+			},
+			wantEmit: true,
+			check: func(t *testing.T, r agent.PromptDeliveryReceipt) {
+				if got := r.Entries[0].DenialCode; got != agent.PromptDenialDeliveryUnsupported {
+					t.Errorf("DenialCode = %q, want the original %q", got, agent.PromptDenialDeliveryUnsupported)
+				}
+			},
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var got []agent.PromptDeliveryReceipt
+			if err := DenyPromptReceiptAfterSeedFailure(tc.spec(&got)); err != nil {
+				t.Fatalf("DenyPromptReceiptAfterSeedFailure: %v", err)
+			}
+			if !tc.wantEmit {
+				if len(got) != 0 {
+					t.Fatalf("emitted %d receipts, want none", len(got))
+				}
+				return
+			}
+			if len(got) != 1 {
+				t.Fatalf("emitted %d receipts, want 1", len(got))
+			}
+			tc.check(t, got[0])
+		})
+	}
+}
+
+// TestDenyPromptReceiptAfterSeedFailureDoesNotMutateTheOriginal pins the copy:
+// the retraction must not rewrite the receipt the adapted Spec still points at.
+func TestDenyPromptReceiptAfterSeedFailureDoesNotMutateTheOriginal(t *testing.T) {
+	t.Parallel()
+
+	original := agent.PromptDeliveryReceipt{
+		Decision: "ready",
+		Entries:  []agent.PromptDeliveryEntry{{ID: "user", Outcome: agent.PromptOutcomeDelivered}},
+	}
+	spec := agent.Spec{
+		PromptReceipt:   &original,
+		OnPromptAdapted: func(agent.PromptDeliveryReceipt) error { return nil },
+	}
+	if err := DenyPromptReceiptAfterSeedFailure(spec); err != nil {
+		t.Fatalf("DenyPromptReceiptAfterSeedFailure: %v", err)
+	}
+	if original.Decision != "ready" || original.Entries[0].Outcome != agent.PromptOutcomeDelivered {
+		t.Errorf("the original receipt was mutated: %+v", original)
+	}
+}
