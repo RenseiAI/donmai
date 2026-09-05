@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"runtime"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -392,6 +393,16 @@ func TestSpawnInteractiveValidatesTheScenarioFile(t *testing.T) {
 	if err := os.WriteFile(bad, []byte(`{"version":1,"steps":[{}]}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	oversize := filepath.Join(dir, "oversize.json")
+	if err := os.WriteFile(oversize, make([]byte, MaxScenarioFileBytes+1), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// A FIFO is the case that matters most: os.ReadFile on one blocks until a
+	// writer appears, and nothing here will ever open it for writing. Without
+	// the regular-file check this entry hangs the test — which is exactly what
+	// it would do to a Spawn.
+	fifo := filepath.Join(dir, "scenario.fifo")
+	mkfifo(t, fifo)
 
 	tests := []struct {
 		name    string
@@ -414,6 +425,21 @@ func TestSpawnInteractiveValidatesTheScenarioFile(t *testing.T) {
 			wantErr: "no action set",
 		},
 		{
+			name:    "a directory is refused",
+			config:  map[string]any{ScenarioFileConfigKey: dir},
+			wantErr: "not a regular file",
+		},
+		{
+			name:    "a FIFO is refused rather than blocking the spawn",
+			config:  map[string]any{ScenarioFileConfigKey: fifo},
+			wantErr: "not a regular file",
+		},
+		{
+			name:    "a file over the ceiling is refused",
+			config:  map[string]any{ScenarioFileConfigKey: oversize},
+			wantErr: "exceeds the",
+		},
+		{
 			name:    "a file named through the environment is checked too",
 			env:     map[string]string{stubagent.EnvScenarioFile: bad},
 			wantErr: "no action set",
@@ -434,6 +460,11 @@ func TestSpawnInteractiveValidatesTheScenarioFile(t *testing.T) {
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 					t.Fatalf("withScenarioEnv err = %v, want one containing %q", err, tc.wantErr)
+				}
+				// A refusal that does not name the file it refused sends the
+				// operator looking through every path in the Spec.
+				if path := scenarioPathOf(tc.config, tc.env); path != "" && !strings.Contains(err.Error(), path) {
+					t.Errorf("withScenarioEnv err = %v, want it to name %q", err, path)
 				}
 				return
 			}
@@ -460,4 +491,25 @@ func writeNoopBinary(t *testing.T) string {
 		t.Fatal(err)
 	}
 	return bin
+}
+
+// scenarioPathOf returns the file path a case pointed the validator at, so the
+// assertions can insist every refusal names it.
+func scenarioPathOf(config map[string]any, env map[string]string) string {
+	if path, ok := config[ScenarioFileConfigKey].(string); ok {
+		return strings.TrimSpace(path)
+	}
+	return env[stubagent.EnvScenarioFile]
+}
+
+// mkfifo creates a named pipe, skipping on platforms or filesystems that
+// cannot. The refusal it exercises is real on every unix the daemon runs on.
+func mkfifo(t *testing.T, path string) {
+	t.Helper()
+	if runtime.GOOS == "windows" {
+		t.Skip("named pipes are created differently on windows")
+	}
+	if err := syscall.Mkfifo(path, 0o600); err != nil {
+		t.Skipf("mkfifo %s: %v", path, err)
+	}
 }

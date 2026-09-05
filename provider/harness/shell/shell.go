@@ -67,20 +67,12 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		// PreparePrompt already persisted a ready adaptation decision. Replace
 		// it with an application-failed denial so a failed PTY write never
 		// leaves a success receipt or usable session behind.
-		if receiptErr := emitShellSeedFailure(spec); receiptErr != nil {
+		if receiptErr := ptycli.DenyPromptReceiptAfterSeedFailure(spec); receiptErr != nil {
 			return nil, fmt.Errorf("%w: shell PTY seed delivery: %w; persist denial receipt: %w", agent.ErrSpawnFailed, err, receiptErr)
 		}
 		return nil, fmt.Errorf("%w: shell PTY seed delivery: %w", agent.ErrSpawnFailed, err)
 	}
 	return handle, nil
-}
-
-// emitShellSeedFailure retracts the ready prompt receipt after a failed PTY
-// write. The correction itself is the shared one — every PTY-seed harness owes
-// the same retraction, so it lives in the shared driver rather than being
-// re-derived here.
-func emitShellSeedFailure(spec agent.Spec) error {
-	return ptycli.DenyPromptReceiptAfterSeedFailure(spec)
 }
 
 // Resume returns agent.ErrUnsupported: a bare shell has no session identity

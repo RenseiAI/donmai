@@ -4,6 +4,7 @@ import (
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"strings"
 	"time"
@@ -23,11 +24,14 @@ import (
 // every caller of a shared registry-held provider a way to change what the
 // host executes.
 //
-// The value is passed to exec as-is, so a bare name resolves through the
-// child's $PATH and a path does not; either way the stub-agent subcommand is
-// appended, because the override names a DONMAI BINARY, not an arbitrary
-// program. A test that must run something else uses WithStubAgentCommand,
-// which supplies its own argv.
+// The value is passed to exec as-is, so a bare name is resolved by LookPath
+// and a path is not. That lookup uses the SPAWNING process's $PATH, not the
+// child's: ptyhost.Spawn calls exec.Command, which resolves the name at
+// construction, and only afterwards assigns the composed cmd.Env — so a $PATH
+// placed in Spec.Env has no bearing on which binary is found. Either way the
+// stub-agent subcommand is appended, because the override names a DONMAI
+// BINARY, not an arbitrary program. A test that must run something else uses
+// WithStubAgentCommand, which supplies its own argv.
 const EnvStubAgentBin = "DONMAI_STUB_AGENT_BIN"
 
 // StubAgentSubcommand is the argv this binary answers the fake agent on. The
@@ -52,6 +56,13 @@ const (
 // interactiveStopGrace bounds the Stop issued when PTY seed delivery fails.
 // It matches the window shell uses for the same failure.
 const interactiveStopGrace = 10 * time.Second
+
+// MaxScenarioFileBytes caps the scenario file the parent will read while
+// validating a spawn. A scenario is a short script — the largest this repo
+// ships is a few hundred bytes — so the ceiling is generous by orders of
+// magnitude and exists only to keep a validation step from becoming a way to
+// make Spawn read something enormous.
+const MaxScenarioFileBytes = 1 << 20 // 1 MiB
 
 // spawnInteractive runs the deterministic fake agent under a PTY through the
 // SHARED interactive driver (provider/harness/ptycli) — the same call the
@@ -202,9 +213,47 @@ func validateScenarioFile(env map[string]string) error {
 	if path == "" {
 		return nil
 	}
-	data, err := os.ReadFile(path) //nolint:gosec // the path is the caller's own scenario file
+	// Stat before reading, and insist on a REGULAR file. os.ReadFile on a
+	// FIFO blocks until a writer appears, which for a named pipe nobody opens
+	// is forever — and this runs inside Spawn, so an unbounded read here is an
+	// unbounded Spawn. A device or directory is refused for the same reason:
+	// validation must not be a way to make the parent read something whose
+	// length it cannot know in advance.
+	info, err := os.Stat(path)
 	if err != nil {
-		return fmt.Errorf("%s: %w", ScenarioFileConfigKey, err)
+		return fmt.Errorf("%s %s: %w", ScenarioFileConfigKey, path, err)
+	}
+	if !info.Mode().IsRegular() {
+		return fmt.Errorf(
+			"%s %s: not a regular file (%s); a scenario must be readable without blocking on a writer",
+			ScenarioFileConfigKey, path, info.Mode().Type(),
+		)
+	}
+	if info.Size() > MaxScenarioFileBytes {
+		return fmt.Errorf(
+			"%s %s: %d bytes exceeds the %d-byte scenario ceiling",
+			ScenarioFileConfigKey, path, info.Size(), MaxScenarioFileBytes,
+		)
+	}
+
+	// Read through a bounded reader rather than trusting the size just
+	// stat'ed: the file can grow between the two calls, and the ceiling is
+	// only a ceiling if the read enforces it too.
+	handle, err := os.Open(path) //nolint:gosec // the path is the caller's own scenario file
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", ScenarioFileConfigKey, path, err)
+	}
+	defer func() { _ = handle.Close() }()
+
+	data, err := io.ReadAll(io.LimitReader(handle, MaxScenarioFileBytes+1))
+	if err != nil {
+		return fmt.Errorf("%s %s: %w", ScenarioFileConfigKey, path, err)
+	}
+	if len(data) > MaxScenarioFileBytes {
+		return fmt.Errorf(
+			"%s %s: exceeds the %d-byte scenario ceiling",
+			ScenarioFileConfigKey, path, MaxScenarioFileBytes,
+		)
 	}
 	if _, err := stubagent.Parse(data); err != nil {
 		return fmt.Errorf("%s %s: %w", ScenarioFileConfigKey, path, err)

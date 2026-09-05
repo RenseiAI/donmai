@@ -81,8 +81,11 @@ same program for every caller. Because the override names a *donmai binary*, the
 bare `donmai`, print help and exit 0, which every layer above reads as a clean
 session that ran no scenario at all. A test that must run something else uses
 the `WithStubAgentCommand` option, which supplies its own argv. The value is
-handed to exec as-is, so a bare name resolves through `$PATH` and a path does
-not.
+handed to exec as-is, so a bare name is resolved by `LookPath` and a path is
+not — and that lookup uses the **spawning process's** `$PATH`, not the child's:
+`ptyhost.Spawn` calls `exec.Command`, which resolves the name at construction
+and only afterwards assigns the composed `cmd.Env`, so a `$PATH` placed in
+`Spec.Env` has no bearing on which binary is found.
 
 Callers holding a `Spec` can pass the scenario through the typed
 `ProviderConfig` instead of composing `Env` themselves:
@@ -93,6 +96,13 @@ scenario is indistinguishable, at the session layer, from one that was asked to
 exit. The check applies to whichever form the child will actually read: an
 inline scenario wins, and when one is present the file is never opened. An
 explicit `Spec.Env` entry always wins over the `ProviderConfig` form.
+
+That read is bounded, because it happens inside `Spawn`. The path must be a
+**regular file** — `os.ReadFile` on a FIFO blocks until a writer appears, which
+for a pipe nobody opens is forever, and an unbounded read there is an unbounded
+`Spawn` — and it must be at most `MaxScenarioFileBytes` (1 MiB), enforced both
+by the stat and by the read itself, since a file can grow between the two.
+Every refusal names the path it refused.
 
 ```json
 {
