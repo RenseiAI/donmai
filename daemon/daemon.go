@@ -1244,6 +1244,12 @@ func (d *Daemon) Start(ctx context.Context) error {
 					return d.handlePollWorkItem(item, cfg.Orchestrator.URL)
 				},
 				OnReregister: reregister,
+				OnSessionShimAdoptionNotReady: func() {
+					// Force a fresh sample before the repair pass republishes the
+					// projection; this is the recovery edge for a claims-disabled host.
+					_ = d.sessionShimReadinessGate(sessionShimReadinessResolveNow)
+					d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), "poll-session-shim-adoption-not-ready")
+				},
 				// Honour the host-status signal the heartbeat already
 				// receives: when the bound capacity pool is deleted,
 				// draining, or disabled, stop claiming new work while

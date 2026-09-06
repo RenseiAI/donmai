@@ -337,7 +337,8 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	// The publication gets its own bound, derived from the per-callback bound
 	// times the pipeline depth (see adoptionPublicationTimeout).
 	pubCtx, cancelPublication := context.WithTimeout(
-		context.WithoutCancel(ctx), cfg.adoptionPublicationTimeout())
+		context.WithoutCancel(ctx), cfg.adoptionPublicationTimeout(),
+	)
 	defer cancelPublication()
 	// ringPostActivationHeartbeat is set only on the path that raised the
 	// recovery heartbeat barrier for THIS launch AND completed carrier
@@ -370,7 +371,8 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		// The publication budget may be the very thing that just expired, so
 		// the correcting beat rides one fresh callback-sized bound of its own.
 		beatCtx, cancelBeat := context.WithTimeout(
-			context.WithoutCancel(pubCtx), cfg.callbackTimeout())
+			context.WithoutCancel(pubCtx), cfg.callbackTimeout(),
+		)
 		defer cancelBeat()
 		d.ringSessionShimPostActivationHeartbeat(beatCtx)
 	}()
@@ -883,7 +885,8 @@ func (d *Daemon) redriveAmbiguousLaunchSessionShimBatchCommit(
 	causeErr error,
 ) (SessionShimAdoptionBatchReceipt, error) {
 	redriveCtx, cancel := context.WithTimeout(
-		context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout())
+		context.WithoutCancel(ctx), d.sessionShimConfig().callbackTimeout(),
+	)
 	defer cancel()
 	batchReceipt, err := d.completeLaunchedSessionShimAdoptionBatch(redriveCtx, evidence, receipt)
 	switch {
@@ -1381,13 +1384,15 @@ func guardShimChildLogOnce(logPath string) bool {
 		// daemon-owned path already does; see e.g.
 		// kit_registry.go's "kit registry: read scan path" for the same
 		// precedent.
-		slog.Warn("session shim: redact child log", //nolint:gosec // structured slog handler escapes values
+		slog.Warn(
+			"session shim: redact child log", //nolint:gosec // structured slog handler escapes values
 			"path", logPath,
 			"error", err,
 		)
 	}
 	if err := capShimChildLog(f, size); err != nil {
-		slog.Warn("session shim: cap child log", //nolint:gosec // structured slog handler escapes values
+		slog.Warn(
+			"session shim: cap child log", //nolint:gosec // structured slog handler escapes values
 			"path", logPath,
 			"error", err,
 		)
@@ -2058,14 +2063,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// A later frame must never advance the cursor past this
 							// unacknowledged one. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable output acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
@@ -2082,7 +2087,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						slog.Warn("session shim: durable carrier rejected output gap",
 							"session", id.String(), "fromSeq", ev.Gap.FromSeq,
 							"toSeq", ev.Gap.ToSeq, "error", err)
-						cause = shimStreamCarrierLost
+						cause = classifySessionShimCarrierLoss(err)
 						_ = ctrl.Close()
 						break consume
 					}
@@ -2105,7 +2110,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					if err := durable(id, ev); err != nil {
 						slog.Warn("session shim: durable carrier rejected staged Snapshot",
 							"session", id.String(), "seq", ev.Seq, "error", err)
-						cause = shimStreamCarrierLost
+						cause = classifySessionShimCarrierLoss(err)
 						_ = ctrl.Close()
 						break consume
 					}
@@ -2119,7 +2124,7 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 					if err := durable(id, ev); err != nil {
 						slog.Warn("session shim: durable carrier rejected host frame",
 							"session", id.String(), "seq", ev.Seq, "type", ev.FrameType, "error", err)
-						cause = shimStreamCarrierLost
+						cause = classifySessionShimCarrierLoss(err)
 						_ = ctrl.Close()
 						break consume
 					}
@@ -2180,14 +2185,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 							// A later frame must never advance the cursor past this
 							// unacknowledged snapshot. Close the controller and let the
 							// normal disconnect/quarantine path retain ownership.
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Snapshot.AtSeq); err != nil {
 							slog.Warn("session shim: durable Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Snapshot.AtSeq, "error", err)
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
@@ -2202,14 +2207,14 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						if err := durable(id, ev); err != nil {
 							slog.Warn("session shim: durable carrier rejected emitted snapshot",
 								"session", id.String(), "seq", ev.Seq, "error", err)
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
 						if err := d.recordShimForwardedSeqForController(id, ctrl, ev.Seq); err != nil {
 							slog.Warn("session shim: durable emitted Snapshot acknowledgement was not persisted",
 								"session", id.String(), "seq", ev.Seq, "error", err)
-							cause = shimStreamCarrierLost
+							cause = classifySessionShimCarrierLoss(err)
 							_ = ctrl.Close()
 							break consume
 						}
@@ -2259,6 +2264,8 @@ func (d *Daemon) sessionShimLaunchControllerOptions(
 // shimStreamEndCause says why an adopted session's controller stream ended.
 type shimStreamEndCause uint8
 
+var ErrSessionShimCarrierLostPlatform = errors.New("session shim carrier lost at platform persistence")
+
 const (
 	// shimStreamEnded: the shim, or its socket, ended the stream — or this
 	// daemon closed it because the shim broke the sequence contract.
@@ -2267,6 +2274,10 @@ const (
 	// durable carrier refused an append or an acknowledgement. The shim and
 	// its harness are alive and untouched.
 	shimStreamCarrierLost
+	// shimStreamCarrierLostPlatform is a durable carrier failure whose evidence
+	// names the control plane persistence path. It is recoverable carrier loss,
+	// not a second shim-side fault for quarantine-window accounting.
+	shimStreamCarrierLostPlatform
 	// shimStreamDurableAckAmbiguous: the controller's own back-pressure gave up
 	// while a durable acknowledgement it had sent was still outstanding. The
 	// socket was reachable throughout and the shim never went away — the
@@ -2276,6 +2287,21 @@ const (
 	// statement about the socket.
 	shimStreamDurableAckAmbiguous
 )
+
+func classifySessionShimCarrierLoss(err error) shimStreamEndCause {
+	if errors.Is(err, ErrSessionShimCarrierLostPlatform) {
+		return shimStreamCarrierLostPlatform
+	}
+	if err != nil {
+		text := strings.ToLower(err.Error())
+		if strings.Contains(text, "persist durable hostframe") ||
+			strings.Contains(text, "persist durable host frame") ||
+			strings.Contains(text, "durable hostframe deadline") {
+			return shimStreamCarrierLostPlatform
+		}
+	}
+	return shimStreamCarrierLost
+}
 
 // classifyShimStreamEnd refines why an adopted session's stream ended, using
 // the fail-closed decision the controller recorded about its own connection.
@@ -2776,7 +2802,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// projection built meanwhile must keep saying so. Removing it first would
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
-	if cause != shimStreamCarrierLost && cause != shimStreamDurableAckAmbiguous {
+	if cause != shimStreamCarrierLost && cause != shimStreamCarrierLostPlatform && cause != shimStreamDurableAckAmbiguous {
 		d.quarantineLostSessionShim(id, entry, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 		return
 	}
@@ -2789,7 +2815,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// takes at a lineage — see maxConsecutiveDurableAckAmbiguityCycles.
 	attemptBudget := 0
 	spentDetail := ""
-	if cause == shimStreamDurableAckAmbiguous {
+	if cause == shimStreamDurableAckAmbiguous || cause == shimStreamCarrierLostPlatform {
 		lostReason = sessionshim.QuarantineDurableAckTimeout
 		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
 		// un-anchored ambiguity bound, so against a durable side that is
@@ -2821,7 +2847,14 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	if cause == shimStreamCarrierLost && d.noteSessionShimCarrierBindLost(id, ctrl) {
 		d.raiseSessionShimCarrierBindLost(cfg, id)
 	}
-	switch d.readoptSessionShimAfterControllerLoss(id, entry, attemptBudget) {
+	if cause == shimStreamCarrierLostPlatform {
+		slog.Warn("session shim: carrier-lost-platform; re-adopting without spending the quarantine window", "session", id.String())
+	}
+	readopt := d.readoptSessionShimAfterControllerLoss
+	if cause == shimStreamCarrierLostPlatform {
+		readopt = d.readoptSessionShimAfterPlatformCarrierLoss
+	}
+	switch readopt(id, entry, attemptBudget) {
 	case readoptionSucceeded:
 		return
 	case readoptionWindowExhausted:

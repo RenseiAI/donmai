@@ -329,7 +329,8 @@ func RepresentRuntimeToken(
 	if err != nil {
 		return nil, fmt.Errorf("re-present runtime token: %w", err)
 	}
-	slog.Default().Info("[runtime-token]",
+	slog.Default().Info(
+		"[runtime-token]",
 		"event", "represent",
 		"workerId", currentWorkerID,
 		"reason", reason,
@@ -365,7 +366,8 @@ func (r *runtimeTokenRefresher) refresh(
 	// the very identity we are complaining about. Hand them straight back
 	// instead of doing the work twice.
 	if adopted := r.lastResultFor(currentWorkerID, r.now()); adopted != nil {
-		logger.Info("[runtime-token]",
+		logger.Info(
+			"[runtime-token]",
 			"event", "refresh.coalesced",
 			"workerId", adopted.WorkerID,
 			"staleWorkerId", currentWorkerID,
@@ -380,7 +382,8 @@ func (r *runtimeTokenRefresher) refresh(
 	// One line per refresh attempt. The reason carries the trigger:
 	// reactive ("runtime-token-expired", "worker-not-found", ...) or the
 	// scheduled "proactive-expiry" path.
-	logger.Info("[runtime-token]",
+	logger.Info(
+		"[runtime-token]",
 		"event", "refresh-requested",
 		"workerId", currentWorkerID,
 		"reason", reason,
@@ -392,7 +395,8 @@ func (r *runtimeTokenRefresher) refresh(
 	if currentWorkerID != "" && probeUsable {
 		fresh, err := callRefreshEndpoint(ctx, regOpts, currentWorkerID)
 		if err == nil {
-			logger.Info("[runtime-token]",
+			logger.Info(
+				"[runtime-token]",
 				"event", "refresh",
 				"workerId", currentWorkerID,
 				"reason", reason,
@@ -414,7 +418,8 @@ func (r *runtimeTokenRefresher) refresh(
 		// identity — a 5xx or a network blip is never evidence that a
 		// registration has been retired.
 		if !isMissingEndpointOrWorker(err) {
-			logger.Warn("[runtime-token]",
+			logger.Warn(
+				"[runtime-token]",
 				"event", "refresh.error",
 				"workerId", currentWorkerID,
 				"reason", reason,
@@ -422,7 +427,8 @@ func (r *runtimeTokenRefresher) refresh(
 			)
 			return nil, fmt.Errorf("refresh probe failed: %w", err)
 		}
-		logger.Info("[runtime-token]",
+		logger.Info(
+			"[runtime-token]",
 			"event", "refresh.unavailable",
 			"workerId", currentWorkerID,
 			"reason", reason,
@@ -442,7 +448,8 @@ func (r *runtimeTokenRefresher) refresh(
 	// 3. Full re-register — mints a NEW worker identity. Rate-limited: see
 	// DefaultMinReregisterInterval.
 	if wait := r.reregisterCooldown(regOpts); wait > 0 {
-		logger.Warn("[runtime-token]",
+		logger.Warn(
+			"[runtime-token]",
 			"event", "reregister.throttled",
 			"workerId", currentWorkerID,
 			"reason", reason,
@@ -455,7 +462,8 @@ func (r *runtimeTokenRefresher) refresh(
 		)
 	}
 
-	logger.Info("[runtime-token]",
+	logger.Info(
+		"[runtime-token]",
 		"event", "reregister.registration-gone",
 		"workerId", currentWorkerID,
 		"reason", reason,
@@ -465,7 +473,8 @@ func (r *runtimeTokenRefresher) refresh(
 	regOpts.ForceReregister = true
 	rr, rerr := Register(ctx, regOpts)
 	if rerr != nil {
-		logger.Warn("[runtime-token]",
+		logger.Warn(
+			"[runtime-token]",
 			"event", "reregister.error",
 			"workerId", currentWorkerID,
 			"reason", reason,
@@ -475,7 +484,8 @@ func (r *runtimeTokenRefresher) refresh(
 	}
 	r.markReregistered()
 	swapped := rr.WorkerID != "" && rr.WorkerID != currentWorkerID
-	logger.Info("[runtime-token]",
+	logger.Info(
+		"[runtime-token]",
 		"event", "reregister",
 		"workerId", rr.WorkerID,
 		"oldWorkerId", currentWorkerID,
@@ -533,7 +543,8 @@ func (r *runtimeTokenRefresher) adoptCachedRegistration(
 	if probeErr != nil {
 		return nil
 	}
-	slog.Default().Info("[runtime-token]",
+	slog.Default().Info(
+		"[runtime-token]",
 		"event", "refresh.adopted-sibling",
 		"workerId", candidate,
 		"staleWorkerId", currentWorkerID,

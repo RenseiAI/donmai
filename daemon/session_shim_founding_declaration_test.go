@@ -167,11 +167,10 @@ func TestAcquireRecoveryScopesReceivesTheDeclarationsPrimaryReceipt(t *testing.T
 	}
 }
 
-// TestPostInstallRefreshStillChecksReadinessBeforeAdoptingTheReceipt guards
-// the deferral from over-reaching. Only the founding refresh may skip the
-// readiness check; an ordinary refresh after the install still runs it first,
-// and a refusal there refuses the credential before any lane sees it.
-func TestPostInstallRefreshStillChecksReadinessBeforeAdoptingTheReceipt(t *testing.T) {
+// TestPostInstallRefreshDoesNotGateRecoveryCredentialsOnReadiness proves that
+// an ordinary refresh can install the credentials required to repair degraded
+// readiness; claims and adoption preparation retain their separate gates.
+func TestPostInstallRefreshDoesNotGateRecoveryCredentialsOnReadiness(t *testing.T) {
 	h := newCompositionHarness(t)
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
@@ -192,18 +191,12 @@ func TestPostInstallRefreshStillChecksReadinessBeforeAdoptingTheReceipt(t *testi
 		t.Fatalf("control: post-install refresh with readiness intact: %v", err)
 	}
 	_, jwtBefore := h.daemon.credentials.Current()
-	callsBefore := embedder.readinessCalls.Load()
-
 	embedder.refuseReadiness.Store(true)
-	_, err := h.daemon.credentials.Refresh(ctx, "proactive-expiry")
-	if !errors.Is(err, ErrSessionShimReadinessRejected) {
-		t.Fatalf("post-install refresh with readiness refused: err = %v, want the resolver's refusal", err)
+	if _, err := h.daemon.credentials.Refresh(ctx, "proactive-expiry"); err != nil {
+		t.Fatalf("post-install refresh with readiness refused: %v", err)
 	}
-	if embedder.readinessCalls.Load() == callsBefore {
-		t.Fatal("the post-install refresh never consulted the readiness resolver")
-	}
-	if _, jwtAfter := h.daemon.credentials.Current(); jwtAfter != jwtBefore {
-		t.Fatalf("a refresh refused for readiness still adopted its credential: %q -> %q", jwtBefore, jwtAfter)
+	if _, jwtAfter := h.daemon.credentials.Current(); jwtAfter == jwtBefore {
+		t.Fatal("refresh with readiness refused did not install fresh credentials")
 	}
 }
 
