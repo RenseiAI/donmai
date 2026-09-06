@@ -80,8 +80,8 @@ func (d *Daemon) applyPendingMutations(_ context.Context, mutations []PendingMut
 }
 
 func (d *Daemon) applyOneMutation(m PendingMutation) error {
-	if m.Op == "session.kill" {
-		return d.applySessionKill(m)
+	if isSessionMutationOp(m.Op) {
+		return d.applySessionMutation(m)
 	}
 	// pool.deleted is handled before the config lock is taken: it touches no
 	// yaml and it writes the host-status snapshot through setLastHostStatus,
@@ -124,16 +124,52 @@ func (d *Daemon) ApplySessionMutations(_ context.Context, mutations []PendingMut
 	failures []HeartbeatMutationFailure,
 ) {
 	for _, m := range mutations {
-		if m.Op != "session.kill" {
+		if !isSessionMutationOp(m.Op) {
 			continue
 		}
-		if err := d.applySessionKill(m); err != nil {
+		if err := d.applySessionMutation(m); err != nil {
 			failures = append(failures, HeartbeatMutationFailure{ID: m.ID, Error: err.Error()})
 			continue
 		}
 		applied = append(applied, m.ID)
 	}
 	return applied, failures
+}
+
+// isSessionMutationOp reports whether op is a runtime SESSION mutation — one
+// that acts on a live session rather than on daemon config.
+//
+// Single-sourcing the set matters because it is consumed twice, by
+// applyOneMutation and by ApplySessionMutations, and those two had already
+// drifted apart once by construction: a new session verb added to the first
+// would have been silently ignored by the second, leaving embedders that own
+// their own config pipeline unable to remediate a session at all.
+func isSessionMutationOp(op string) bool {
+	switch op {
+	case "session.kill", "session.wake", "session.restart-harness":
+		return true
+	default:
+		return false
+	}
+}
+
+// applySessionMutation dispatches the runtime session verbs.
+//
+// session.kill terminates. session.wake and session.restart-harness are the
+// bounded, escalating remediation for a wedged seat and are the opposite of a
+// kill: they retain the shim, the identity and the worktree, and write only
+// content-free keystrokes (mutation_session_wake.go).
+func (d *Daemon) applySessionMutation(m PendingMutation) error {
+	switch m.Op {
+	case "session.kill":
+		return d.applySessionKill(m)
+	case "session.wake":
+		return d.applySessionWake(m)
+	case "session.restart-harness":
+		return d.applySessionRestartHarness(m)
+	default:
+		return fmt.Errorf("unsupported session mutation op %q", m.Op)
+	}
 }
 
 func (d *Daemon) applySessionKill(m PendingMutation) error {
@@ -399,7 +435,7 @@ func knownWorkloadKeys() []string {
 // POLICY ONLY: only the AccessPolicy ({matrix, authOrder?}) crosses this
 // channel — never credentials (keys ride the separate snapshot socket,
 // §4.4). This step is pure plumbing: it STORES the block; enforcement
-// (ResolveMachineCell) stays in the rensei-tui S3 gate. Idempotent: a
+// (ResolveMachineCell) stays in the downstream gate. Idempotent: a
 // repeated set with the same params overwrites to the same value.
 // Caller must hold d.mu (applyOneMutation acquires it).
 func (d *Daemon) applyModelAccessSetLocked(m PendingMutation) error {
