@@ -41,9 +41,13 @@ import (
 // reaching below a production floor is visible rather than smuggled through the
 // public seam.
 func newAmbiguityTestBacklog(budget int, stall, bound time.Duration, ambiguous func() bool) *eventBacklog {
-	b := newEventBacklog(budget, 0, nil, ambiguous, 0)
+	b := newEventBacklog(budget, 0, nil, ambiguous, 0, 0)
 	b.stall = stall
 	b.ambiguityBound = bound
+	// The flow-control hold sits between the stall deadline and the drop, so a
+	// bound the ambiguity tests can actually reach has to be set too; twice the
+	// deadline keeps these tests about ambiguity rather than about waiting.
+	b.dropBound = 2 * stall
 	return b
 }
 
@@ -143,7 +147,7 @@ func TestDurableAckAmbiguityBoundIsClampedToItsFloor(t *testing.T) {
 			// configure a shorter bound by any route.
 			opts := ControllerOptions{DurableAckAmbiguityBound: tc.configured, EventBacklogStallDeadline: tc.stall}
 			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil,
-				func() bool { return true }, opts.durableAckAmbiguityBound()).ambiguityBound; got != tc.want {
+				func() bool { return true }, opts.durableAckAmbiguityBound(), 0).ambiguityBound; got != tc.want {
 				t.Fatalf("backlog built through the option seam has ambiguityBound = %s, want %s", got, tc.want)
 			}
 		})

@@ -145,6 +145,17 @@ type ControllerOptions struct {
 	// this zero gets a ten-minute bound, which is the silent drift the ADR's
 	// Risks section names. Zero uses DurableAckAmbiguityBound.
 	DurableAckAmbiguityBound time.Duration
+	// EventBacklogDropBound is the absolute time a stalled reader is held open
+	// after the stall deadline has been crossed, before the carrier is finally
+	// dropped. Zero uses EventBacklogDropBound. It is clamped up to the
+	// resolved stall deadline, below which it would delete the hold entirely.
+	//
+	// A composing daemon SHOULD set this from the same resolved lineage-live
+	// re-adoption window it sets DurableAckAmbiguityBound from: both answer
+	// "how long may a peer that is visibly still here fail to make progress",
+	// and letting them drift apart is the silent misconfiguration
+	// ADR-2026-09-03's Risks section names.
+	EventBacklogDropBound time.Duration
 
 	// DialTimeout bounds the connect + handshake. Zero uses 5s.
 	DialTimeout time.Duration
@@ -196,6 +207,21 @@ func (o ControllerOptions) durableAckAmbiguityBound() time.Duration {
 		return o.DurableAckAmbiguityBound
 	}
 	return DurableAckAmbiguityBound
+}
+
+func (o ControllerOptions) eventBacklogDropBound() time.Duration {
+	if o.EventBacklogDropBound > 0 {
+		return o.EventBacklogDropBound
+	}
+	return EventBacklogDropBound
+}
+
+// ResolvedEventBacklogDropBound reports the bound a controller built from these
+// options would actually hold for, after the default and the floor. Exported
+// for the same reason as ResolvedDurableAckAmbiguityBound: a composing daemon
+// has to be able to assert its configured window REACHES the controller.
+func (o ControllerOptions) ResolvedEventBacklogDropBound() time.Duration {
+	return clampEventBacklogDropBound(o.eventBacklogDropBound(), clampEventBacklogStall(o.eventBacklogStallDeadline()))
 }
 
 // ResolvedDurableAckAmbiguityBound reports the bound a controller built from
@@ -326,15 +352,26 @@ const (
 // socket reader will hold for a consumer before it stops reading and applies
 // back-pressure to the shim.
 //
-// It is deliberately EQUAL to the shim's own output ring budget
-// (ptyhost.DefaultRingBytes), and that equality is the point. Both numbers
-// answer the same question — how much host output may be in flight before this
-// system admits it has lost some — and they must answer it in the same currency
-// at the same magnitude. When the daemon-side bound was a frame count (192) it
-// was orders of magnitude tighter than the shim's 8 MiB, so the controller
-// collapsed long before the ring, which is the component actually DESIGNED to
-// evict and declare a Gap (ADR-2026-08-17 §D5). A burst the shim absorbs by
-// design must never be the thing that kills the connection carrying it.
+// It is expressed as a MULTIPLE of the shim's own output ring budget
+// (ptyhost.DefaultRingBytes), and the direction of that relation is the point:
+// the controller must never be TIGHTER than the ring. Both numbers answer the
+// same question — how much host output may be in flight before this system
+// admits it has lost some — and when the daemon-side bound was a frame count
+// (192) it was orders of magnitude tighter than the shim's 8 MiB, so the
+// controller collapsed long before the ring, which is the component actually
+// DESIGNED to evict and declare a Gap (ADR-2026-08-17 §D5). A burst the shim
+// absorbs by design must never be the thing that kills the connection carrying
+// it.
+//
+// The multiple, rather than exact equality, is the measured lesson from a
+// second incident. Seven seats were lost in one day on hosts whose durable
+// consumer stalled for tens of seconds: at gate-output rates an ordinary build
+// log fills 8 MiB in seconds, so the equality left no headroom at all between
+// "briefly behind" and "at the bound". Raising the headroom does not change any
+// decision this file makes — it changes how often a transient persistence stall
+// has to reach for one. The memory ceiling it buys is per adopted session, and
+// only while a consumer is behind; a host that wants a tighter one sets the
+// override, which is bounded below by the shim ring it must not undercut.
 //
 // Reaching this budget is NOT a fail-closed decision. It used to be, and that
 // cost healthy seats: a re-adopted lineage whose consumer was momentarily
@@ -353,7 +390,14 @@ const (
 // closed. "Stopped" there means measured in bytes taken, not in queue depth: a
 // consumer keeping up at volume against a saturating producer never empties the
 // queue and must never be mistaken for one that has stopped.
-const EventBacklogBudget = ptyhost.DefaultRingBytes
+const EventBacklogBudget = eventBacklogBudgetRingMultiple * ptyhost.DefaultRingBytes
+
+// eventBacklogBudgetRingMultiple is how many shim ring budgets of headroom the
+// controller holds. One (exact equality) was the released value and left no
+// room between a burst the ring absorbs by design and the bound; four is the
+// smallest multiple that covers a full gate-output burst at the measured rates
+// without changing any decision in this file.
+const eventBacklogBudgetRingMultiple = 4
 
 // eventBacklogStallDeadline bounds how long the consumer may fail to make
 // PROGRESS — cumulatively, across every push — before the controller fails
@@ -381,15 +425,72 @@ const EventBacklogBudget = ptyhost.DefaultRingBytes
 //
 // This is a THROUGHPUT bound, not a latency one: the consumer must sustain at
 // least budget/deadline to keep resetting the clock, about 273 KiB/s at the
-// 8 MiB EventBacklogBudget / 30s defaults. Shortening the deadline RAISES the
-// required drain rate — it does not make the mechanism more lenient. Because
-// the clock is anchored when the consumer first falls behind rather than
-// re-armed per push, worst-case wall time from "first fell behind" to
-// fail-closed is about 2x this deadline (a consumer can fall behind, coast
-// just above the required rate for nearly a full deadline without resetting
-// the anchor, then stop); time-to-refusal measured from the moment the
-// consumer actually STOPS making progress stays <= 1x the deadline.
-const eventBacklogStallDeadline = 30 * time.Second
+// 32 MiB EventBacklogBudget / 120s defaults — the same required drain rate the
+// released 8 MiB / 30s pair asked for, over four times the window. Shortening
+// the deadline RAISES the required drain rate; it does not make the mechanism
+// more lenient. Because the clock is anchored when the consumer first falls
+// behind rather than re-armed per push, worst-case wall time from "first fell
+// behind" to DEGRADED is about 2x this deadline (a consumer can fall behind,
+// coast just above the required rate for nearly a full deadline without
+// resetting the anchor, then stop).
+//
+// Crossing it is no longer the fail-closed decision. It is where the stall
+// becomes VISIBLE — reported with bytes in flight and stall duration — while
+// the reader keeps stalling; only EventBacklogDropBound still fails closed.
+const eventBacklogStallDeadline = 120 * time.Second
+
+// EventBacklogDropBound is how long a stalled reader is held open BEFORE it
+// finally drops the carrier, once the stall deadline has already been crossed.
+//
+// # THE KILL SWITCH THIS REPLACES
+//
+// Measured on production hosts, seven interactive seats in one day: the durable
+// consumer — a control plane persisting every host frame — stalled for tens of
+// seconds while its database path was slow. Every one of the seats was
+// OUTPUT-HEAVY (a build gate, a race-detector test run) so the in-flight budget
+// filled in seconds, the stall deadline elapsed with no progress, and the
+// controller dropped the shim connection over it. The connection was fine. The
+// harness was fine. The persistence was slow, and the seat died anyway.
+//
+// "The consumer made no progress for 30s" was being read as "the consumer is
+// gone". Over a durable path with a shared datastore behind it that inference
+// is simply wrong: minutes of no progress is a slow write, not a dead peer, and
+// ADR-2026-08-30 D2 puts an acknowledgement without its durable post-condition
+// on the closed list of ALWAYS-AMBIGUOUS evidence — "preserve; recheck and
+// retry; then degrade visibly", never a terminal verdict off the ambiguity
+// alone.
+//
+// So the stall deadline now degrades visibly and keeps stalling, and this is
+// the bound that finally fails closed. It is not infinite, because a controller
+// process that has genuinely gone away without closing its socket would
+// otherwise hold a shim's output pump forever, and the shim would never arm the
+// orphan clock that is its own protection. Crossing it is still NOT loss: the
+// carrier drops with the harness RETAINED (carrierLost=false), the shim keeps
+// the process group, and re-adoption restores the stream from the shim's own
+// sequence. That is the same disposition a daemon restart produces, and it is
+// survivable; the thing that was not survivable was reaching it in 30 seconds.
+//
+// It takes the same ten minutes as DurableAckAmbiguityBound and for the same
+// reason: it is the longest bound the corpus names for a peer that is visibly
+// still here — the lineage-live re-adoption window of the 2026-09-03 amendment.
+// A composition that configures a different window MUST configure this from it
+// too, exactly as it must for the ambiguity bound.
+const EventBacklogDropBound = 10 * time.Minute
+
+// clampEventBacklogDropBound applies the resolved stall deadline as this
+// bound's floor. Zero means "use the default".
+//
+// A drop bound BELOW the stall deadline does not tune the hold, it deletes it:
+// the first crossing of the deadline would already be past the bound, and the
+// reader would fail closed at exactly the moment this bound exists to carry it
+// through — the released 30-second kill switch, reintroduced through the knob
+// added to remove it.
+func clampEventBacklogDropBound(bound, stall time.Duration) time.Duration {
+	if bound <= 0 {
+		bound = EventBacklogDropBound
+	}
+	return max(bound, stall)
+}
 
 // DurableAckAmbiguityBound is how long a stalled reader is held open while a
 // durable acknowledgement THIS controller sent is still outstanding.
@@ -576,8 +677,9 @@ func Dial(ctx context.Context, rec Record, opts ControllerOptions) (*Controller,
 	if c.selected >= shimwire.V3 {
 		c.backlog = newEventBacklog(
 			opts.eventBacklogBudget(), opts.eventBacklogStallDeadline(), c.closing,
-			c.durableAckOutstanding, opts.durableAckAmbiguityBound(),
+			c.durableAckOutstanding, opts.durableAckAmbiguityBound(), opts.eventBacklogDropBound(),
 		)
+		c.backlog.report = c.reportBacklogFlow
 		go c.dispatchEvents()
 	}
 	go c.readLoop()
@@ -1137,6 +1239,30 @@ func (c *Controller) log() *slog.Logger {
 	return c.logger
 }
 
+// BacklogFlowState reports this controller's back-pressure state.
+//
+// A daemon publishes it so an operator can see "this carrier is degraded
+// because nothing is draining it" while the session is still alive, instead of
+// learning it from the drop. Pre-v3 controllers have no backlog and report the
+// zero value.
+func (c *Controller) BacklogFlowState() BacklogFlowState { return c.backlog.flowState() }
+
+// reportBacklogFlow is the backlog's report hook: one operator-visible line per
+// degrade tick and one per recovery, carrying the numbers the decision was made
+// on. It runs on the reader and consumer goroutines, so it does nothing but log.
+func (c *Controller) reportBacklogFlow(state BacklogFlowState) {
+	if !state.Degraded {
+		c.log().Info("sessionshim: durable consumer resumed draining; carrier back-pressure released",
+			"session", c.id.String(), "queuedBytes", state.QueuedBytes, "budgetBytes", state.Budget)
+		return
+	}
+	c.log().Warn("sessionshim: durable consumer is not draining; holding the carrier under back-pressure",
+		"session", c.id.String(), "queuedBytes", state.QueuedBytes, "budgetBytes", state.Budget,
+		"drainedBytes", state.DrainedBytes,
+		"stalledFor", time.Since(state.StalledSince).Round(time.Second),
+		"dropBound", state.DropBound)
+}
+
 // closeStream drops the connection after a fail-closed stream decision and says
 // why it did.
 //
@@ -1509,12 +1635,17 @@ func (c *Controller) dispatchEvents() {
 }
 
 // ErrEventBacklogExceeded reports a consumer that made NO progress for the
-// whole of eventBacklogStallDeadline while the backlog sat at its budget. It is
-// a fail-closed decision, not a transport error: the connection is dropped, the
-// shim keeps the harness.
+// whole of EventBacklogDropBound while the backlog sat at its budget. It is a
+// fail-closed decision, not a transport error: the connection is dropped, the
+// shim KEEPS the harness (carrierLost=false) and re-adoption restores the
+// stream from the shim's own sequence.
 //
-// Merely reaching the budget no longer produces this. A consumer that is behind
-// gets back-pressure; only a consumer that has stopped gets this.
+// Two earlier meanings have been retired from it, each after a measured
+// incident. Merely reaching the budget does not produce it — a consumer that is
+// behind gets back-pressure. And crossing the STALL DEADLINE no longer produces
+// it either: that is where the stall is reported as degraded and the reader is
+// held, which is the whole of EventBacklogDropBound's story. Only a consumer
+// that has made no progress for the whole drop bound gets this.
 var ErrEventBacklogExceeded = errors.New("sessionshim: event backlog exceeded the in-flight budget")
 
 // ErrDurableAckAmbiguityBound reports the OTHER way a stalled reader gives up:
@@ -1584,10 +1715,27 @@ type eventBacklog struct {
 	// forever.
 	ambiguousSince time.Time
 
-	// budget, stall, ambiguityBound, ambiguous and abort are immutable after
-	// construction; push reads them without the lock.
+	// degradedSince is when this stall FIRST crossed the stall deadline without
+	// the durable side answering for it — the anchor of dropBound, and the
+	// instant from which the stall is reported as degraded. It is cleared with
+	// the stall it belongs to, in pop, so a later unrelated stall never
+	// inherits a bound that has already been spent.
+	degradedSince time.Time
+	// reported is whether the current degradation has already been announced,
+	// so recovery is announced exactly once against exactly one announcement.
+	reported bool
+
+	// budget, stall, dropBound, ambiguityBound, ambiguous, report and abort are
+	// immutable after construction; push reads them without the lock.
 	budget int
 	stall  time.Duration
+	// dropBound is the absolute time from degradedSince that the reader is held
+	// before it fails closed. See EventBacklogDropBound.
+	dropBound time.Duration
+	// report, when set, observes every degrade/recover transition. It is called
+	// off the lock, from whichever goroutine crossed the boundary, and must not
+	// block: the reader is one of those goroutines.
+	report func(BacklogFlowState)
 	// ambiguous reports whether a durable acknowledgement this controller sent
 	// is still outstanding — the one condition under which a stalled consumer
 	// is provably present rather than gone. Nil means "never ambiguous", which
@@ -1614,23 +1762,118 @@ func newEventBacklog(
 	abort <-chan struct{},
 	ambiguous func() bool,
 	ambiguityBound time.Duration,
+	dropBound time.Duration,
 ) *eventBacklog {
 	if budget <= 0 {
 		budget = EventBacklogBudget
 	}
 	// Clamped HERE rather than at the option seam, because this is the one
 	// place every controller passes through: an embedder cannot reach a
-	// deadline below eventBacklogStallFloor, or a bound below
-	// durableAckAmbiguityFloor, by any route.
+	// deadline below eventBacklogStallFloor, a bound below
+	// durableAckAmbiguityFloor, or a drop bound under the stall deadline it
+	// carries, by any route.
 	resolvedStall := clampEventBacklogStall(stall)
 	return &eventBacklog{
 		budget:         budget,
 		stall:          resolvedStall,
+		dropBound:      clampEventBacklogDropBound(dropBound, resolvedStall),
 		abort:          abort,
 		ambiguous:      ambiguous,
 		ambiguityBound: clampDurableAckAmbiguityBound(ambiguityBound, resolvedStall),
 		arrived:        make(chan struct{}),
 		drained:        make(chan struct{}),
+	}
+}
+
+// BacklogFlowState is the observable back-pressure state of one controller's
+// event backlog: what a stalled carrier looks like from outside it.
+//
+// It exists because "degraded" has to be a published FACT, not an inference. A
+// carrier whose consumer has stalled is indistinguishable, in every other field
+// a daemon publishes, from one attached to an idle terminal — which is how a
+// host serving nothing kept looking healthy right up to the moment it dropped
+// seven sessions.
+type BacklogFlowState struct {
+	// Degraded reports that the consumer has been at the budget without a
+	// budget's worth of progress for at least one whole stall deadline, and the
+	// reader is being HELD rather than failed closed.
+	Degraded bool
+	// StalledSince is when this stall first crossed the deadline, or the zero
+	// time when the carrier is not degraded.
+	StalledSince time.Time
+	// QueuedBytes is how much undelivered stream the backlog is holding.
+	QueuedBytes int
+	// DrainedBytes is how much the consumer has taken since the stall clock was
+	// last anchored. Short of Budget for a whole deadline is what "no progress"
+	// means here.
+	DrainedBytes int
+	// Budget is the in-flight budget this backlog was built with.
+	Budget int
+	// DropBound is when the hold gives up and the carrier is dropped, measured
+	// from StalledSince.
+	DropBound time.Duration
+}
+
+// flowStateLocked samples the state under b.mu.
+func (b *eventBacklog) flowStateLocked() BacklogFlowState {
+	return BacklogFlowState{
+		Degraded:     !b.degradedSince.IsZero(),
+		StalledSince: b.degradedSince,
+		QueuedBytes:  b.bytes,
+		DrainedBytes: b.drainedSinceStall,
+		Budget:       b.budget,
+		DropBound:    b.dropBound,
+	}
+}
+
+// flowState samples the state for diagnostics. Safe on a nil backlog: a
+// pre-v3 controller has none, and asking it is not an error.
+func (b *eventBacklog) flowState() BacklogFlowState {
+	if b == nil {
+		return BacklogFlowState{}
+	}
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	return b.flowStateLocked()
+}
+
+// holdForFlowControl decides what an elapsed stall deadline with nothing
+// outstanding may do, and returns the state to report with it.
+//
+// The answer used to be "fail closed", and that was the kill switch. It is now
+// "degrade visibly and keep stalling", up to dropBound measured from the first
+// crossing. Keeping the reader stalled is not passive: the stall propagates
+// back through the socket to the shim's output pump, and from there to the
+// shim's own PTY reader, which stops reading the master so the harness blocks
+// in write(2). Nothing is lost, nothing is reordered, and the seat lives.
+func (b *eventBacklog) holdForFlowControl(now time.Time) (BacklogFlowState, bool) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.degradedSince.IsZero() {
+		// Anchored on when the consumer first fell BEHIND, not on the crossing,
+		// so the bound means "ten minutes of a stalled carrier" rather than
+		// "ten minutes plus however long the deadline happened to be".
+		b.degradedSince = b.stalledSince
+		if b.degradedSince.IsZero() {
+			b.degradedSince = now
+		}
+	}
+	state := b.flowStateLocked()
+	if now.Sub(b.degradedSince) >= b.dropBound {
+		return state, false
+	}
+	b.reported = true
+	// Re-anchor the stall clock so the NEXT deadline produces the next report:
+	// a stall that lasts minutes has to keep saying so, with current numbers,
+	// rather than announce itself once and go quiet.
+	b.stalledSince, b.drainedSinceStall = now, 0
+	return state, true
+}
+
+// notify hands one transition to the report hook. It is called off the lock.
+func (b *eventBacklog) notify(state BacklogFlowState) {
+	if b.report != nil {
+		b.report(state)
 	}
 }
 
@@ -1775,6 +2018,14 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond), drained, b.progressBytes())
 			case ambiguityHoldNotAmbiguous:
 			}
+			// Reported only while the hold is GRANTED. The crossing that gives
+			// up is announced by the drop itself, and a "holding the carrier"
+			// line immediately before "dropped the carrier" reads as two
+			// contradictory decisions rather than one.
+			if state, held := b.holdForFlowControl(time.Now()); held {
+				b.notify(state)
+				continue
+			}
 			return fmt.Errorf("%w of %d bytes: the consumer took %d bytes in %s, short of the %d it owed",
 				ErrEventBacklogExceeded, b.budget, drained,
 				time.Since(stalled).Round(time.Millisecond), b.progressBytes())
@@ -1803,8 +2054,12 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond))
 			case ambiguityHoldNotAmbiguous:
 			}
+			if state, keep := b.holdForFlowControl(time.Now()); keep {
+				b.notify(state)
+				continue
+			}
 			return fmt.Errorf("%w of %d bytes: the consumer made no budget's worth of progress in %s",
-				ErrEventBacklogExceeded, b.budget, b.stall)
+				ErrEventBacklogExceeded, b.budget, b.dropBound)
 		}
 	}
 }
@@ -1812,6 +2067,7 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 // pop blocks until an event is available or the backlog is closed and drained.
 func (b *eventBacklog) pop() (ControllerEvent, bool) {
 	for {
+		recovered := false
 		b.mu.Lock()
 		if len(b.queue) > 0 {
 			event := b.queue[0]
@@ -1825,17 +2081,26 @@ func (b *eventBacklog) pop() (ControllerEvent, bool) {
 				// is the dribble this bound exists to catch.
 				b.drainedSinceStall += eventBacklogCost(event)
 				if len(b.queue) == 0 || b.drainedSinceStall >= b.progressBytes() {
-					// The ambiguity anchor clears with the stall it belongs to.
-					// A consumer that made a budget's worth of progress is not
-					// the one the bound was ever measuring, and carrying the
-					// anchor into an unrelated later stall would spend a bound
-					// that had already been answered.
+					// The ambiguity and degradation anchors clear with the stall
+					// they belong to. A consumer that made a budget's worth of
+					// progress is not the one either bound was ever measuring,
+					// and carrying an anchor into an unrelated later stall would
+					// spend a bound that had already been answered.
 					b.stalledSince, b.drainedSinceStall = time.Time{}, 0
 					b.ambiguousSince = time.Time{}
+					b.degradedSince = time.Time{}
+					if b.reported {
+						b.reported = false
+						recovered = true
+					}
 				}
 			}
 			releaseLatch(&b.drained)
+			state := b.flowStateLocked()
 			b.mu.Unlock()
+			if recovered {
+				b.notify(state)
+			}
 			return event, true
 		}
 		if b.closed {

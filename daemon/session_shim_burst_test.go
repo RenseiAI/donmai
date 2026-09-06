@@ -38,6 +38,21 @@ func newReadoptedBurstFixture(
 	observe func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent),
 ) *readoptedBurstFixture {
 	t.Helper()
+	// Crossing the stall deadline no longer drops anything, so a fixture that
+	// wants a drop has to reach the bound the hold is measured against. Twice
+	// the deadline keeps the wait proportional to whatever the caller chose.
+	return newReadoptedBurstFixtureWithDropBound(t, backlogBudget, backlogStall, 2*backlogStall, ringBytes, observe)
+}
+
+func newReadoptedBurstFixtureWithDropBound(
+	t *testing.T,
+	backlogBudget int,
+	backlogStall time.Duration,
+	backlogDropBound time.Duration,
+	ringBytes int,
+	observe func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent),
+) *readoptedBurstFixture {
+	t.Helper()
 	// A Unix socket path has a short platform limit; keep the registry short.
 	dir, err := os.MkdirTemp("/tmp", "dsb")
 	if err != nil {
@@ -99,6 +114,7 @@ func newReadoptedBurstFixture(
 		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
 		EventBacklogBudget:         backlogBudget,
 		EventBacklogStallDeadline:  backlogStall,
+		EventBacklogDropBound:      backlogDropBound,
 		GetCarrierProofV2Readiness: testSessionShimProofV2Readiness,
 		AttestationCapabilities:    RequiredSessionShimHostCapabilities(),
 		PrepareAdoption: func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
@@ -256,36 +272,41 @@ func TestStartupReadoptedSessionDrainsAheadOfItsDurableCursor(t *testing.T) {
 // TestBacklogBudgetOverrunFailsClosedHonestly covers the other side of the same
 // guarantee: what happens when a consumer STOPS.
 //
-// Reaching the budget is no longer that decision — a consumer that is merely
-// behind now gets back-pressure, which is what
-// TestBackPressureKeepsTheCarrierWhenTheConsumerIsBehind covers. But the reader
-// still may not stall forever: it is the only goroutine that can receive a
-// durable heartbeat receipt. So past the STALL DEADLINE the controller fails
-// closed and drops the connection. That is deliberate and stays. What the daemon
-// owes is honesty about it: release the session rather than keep publishing it
-// as adopted against a socket nobody can write to. Before the fix it kept the
-// dead entry, so `host status` showed a running session and every later call
-// returned "use of closed network connection" forever.
+// Reaching the budget is not that decision — a consumer that is merely behind
+// gets back-pressure, which is what
+// TestBackPressureKeepsTheCarrierWhenTheConsumerIsBehind covers. Crossing the
+// stall deadline is not that decision either, any more: that publishes the
+// carrier as degraded and keeps stalling, which is what
+// TestSlowDurableConsumerKeepsItsCarrierAndIsPublishedDegraded covers. But the
+// reader still may not stall forever — it is the only goroutine that can
+// receive a durable heartbeat receipt — so past the DROP BOUND the controller
+// fails closed and drops the connection. That is deliberate and stays. What the
+// daemon owes is honesty about it: release the session rather than keep
+// publishing it as adopted against a socket nobody can write to. Before the fix
+// it kept the dead entry, so `host status` showed a running session and every
+// later call returned "use of closed network connection" forever.
 //
 // Three things make this deterministic rather than a race with the scheduler:
 // the carrier's own callback is held for the whole decision, so the consumer
 // genuinely never drains; the budget is set small through the public config
 // seam, so the bound is reached by construction instead of by generating
-// megabytes through a PTY; and the stall deadline is set short through the same
-// seam, so the test does not wait out the production half-minute.
+// megabytes through a PTY; and the stall deadline and drop bound are set short
+// through the same seam, so the test does not wait out the production ten
+// minutes.
 func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 	var holding atomic.Bool
 	release := make(chan struct{})
 	var releaseOnce sync.Once
-	fixture := newReadoptedBurstFixture(t, 8<<10, 500*time.Millisecond, 0, func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
-		// Adoption itself runs through this callback (the mandatory Snapshot is
-		// staged on the consumer), so the hold only arms once the session is
-		// published and activated.
-		if !holding.Load() {
-			return
-		}
-		<-release
-	})
+	fixture := newReadoptedBurstFixtureWithDropBound(t, 8<<10, 500*time.Millisecond, 500*time.Millisecond, 0,
+		func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+			// Adoption itself runs through this callback (the mandatory Snapshot
+			// is staged on the consumer), so the hold only arms once the session
+			// is published and activated.
+			if !holding.Load() {
+				return
+			}
+			<-release
+		})
 	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
 	id := fixture.identity
 	daemon := fixture.daemon
@@ -426,4 +447,107 @@ func TestConsumerDropReleasesShimOwnershipInsteadOfStrandingIt(t *testing.T) {
 	if err == nil || !strings.Contains(err.Error(), "is not adopted by this daemon") {
 		t.Fatalf("write after release = %v, want an honest not-adopted refusal", err)
 	}
+}
+
+// TestSlowDurableConsumerKeepsItsCarrierAndIsPublishedDegraded is the daemon-level
+// pin for the kill switch this change removes.
+//
+// Field shape, seven interactive seats in one day on production hosts: the
+// durable consumer — a control plane persisting every host frame — stalled for
+// tens of seconds on a slow datastore path. Every lost seat was output-heavy, so
+// the in-flight budget filled in seconds; the no-progress window then elapsed,
+// the controller dropped the shim connection, the session was failed, and the
+// harness was signalled. Nothing was wrong with the socket, the shim, or the
+// harness. Persistence was slow.
+//
+// So a stall past the deadline is now a published DEGRADATION with the carrier
+// held, and the seat survives its consumer coming back. This drives exactly
+// that: the consumer is held for longer than the whole stall deadline while the
+// producer saturates the budget, and the assertions are that the session is
+// still adopted, still unquarantined, published as degraded with the bytes it is
+// holding, and — once the consumer returns — usable on the SAME carrier with the
+// degradation withdrawn.
+//
+// Restoring the fail-closed decision at the stall deadline turns this RED at the
+// first assertion: the session is gone from the adopted set and sitting in
+// quarantine.
+func TestSlowDurableConsumerKeepsItsCarrierAndIsPublishedDegraded(t *testing.T) {
+	var holding atomic.Bool
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	// A stall deadline the package clamps up to its floor, against a drop bound
+	// far beyond it: the window under test is the one BETWEEN the two, which is
+	// where every one of those seats died.
+	fixture := newReadoptedBurstFixtureWithDropBound(t, 8<<10, time.Millisecond, 10*time.Minute, 0,
+		func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+			if !holding.Load() {
+				return
+			}
+			<-release
+		})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	id := fixture.identity
+	daemon := fixture.daemon
+	holding.Store(true)
+
+	// Saturate the budget behind a consumer that is not draining. Every one of
+	// these used to be the frame that severed the carrier.
+	go func() {
+		for cycle := range 4096 {
+			//nolint:gosec // G115: the alternation is 0 or 1 on a small literal
+			if err := daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, uint32(99+(cycle&1)), 29, 0, 0); err != nil {
+				return
+			}
+		}
+	}()
+
+	// The degradation has to become VISIBLE, not merely survivable: an operator
+	// looking at this host must be able to see that the session is alive and
+	// that nothing is draining it.
+	var degraded bool
+	waitFor(t, 120*time.Second, "the stalled carrier to be published as degraded", func() bool {
+		status := daemon.SessionShimDiagnostics()
+		for _, adopted := range status.Adopted {
+			if adopted.SessionID != id.SessionID || adopted.StreamBackPressure != "degraded" {
+				continue
+			}
+			if adopted.StreamQueuedBytes <= 0 || adopted.StreamBudgetBytes <= 0 {
+				t.Errorf("degraded carrier published %+v, want the bytes it holds and the budget it holds them against", adopted)
+			}
+			if adopted.StreamStalledSince <= 0 {
+				t.Errorf("degraded carrier published no stall start: %+v", adopted)
+			}
+			degraded = true
+			return true
+		}
+		return false
+	})
+	if !degraded {
+		t.Fatal("the carrier was never published as degraded")
+	}
+
+	// The carrier is still this daemon's, and the session is still supervised.
+	if adopted := daemon.AdoptedSessionShims(); len(adopted) != 1 || adopted[0] != id {
+		t.Fatalf("adopted sessions during the stall = %+v, want exactly [%s]; quarantined %+v",
+			adopted, id, daemon.QuarantinedSessions())
+	}
+	if quarantined := daemon.QuarantinedSessions(); len(quarantined) != 0 {
+		t.Fatalf("quarantined over a consumer that was slow, not gone: %+v", quarantined)
+	}
+
+	// The consumer comes back. The stream continues on the same carrier, and
+	// the degradation is withdrawn rather than left standing.
+	holding.Store(false)
+	releaseOnce.Do(func() { close(release) })
+	if err := daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("after-stall\r")); err != nil {
+		t.Fatalf("write to the session after the stall: %v", err)
+	}
+	waitFor(t, 60*time.Second, "the published degradation to be withdrawn", func() bool {
+		for _, adopted := range daemon.SessionShimDiagnostics().Adopted {
+			if adopted.SessionID == id.SessionID {
+				return adopted.StreamBackPressure == ""
+			}
+		}
+		return false
+	})
 }

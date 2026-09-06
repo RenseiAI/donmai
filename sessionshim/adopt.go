@@ -81,6 +81,11 @@ type AdoptOptions struct {
 	// this from its resolved policy rather than letting two defaults agree by
 	// coincidence. See ControllerOptions.DurableAckAmbiguityBound.
 	DurableAckAmbiguityBound time.Duration
+	// EventBacklogDropBound overrides how long a stalled reader is held after
+	// the stall deadline before the carrier is dropped. Zero uses
+	// EventBacklogDropBound; a value under the resolved stall deadline is
+	// clamped up rather than honoured. See ControllerOptions.EventBacklogDropBound.
+	EventBacklogDropBound time.Duration
 
 	// DialTimeout bounds one shim handshake.
 	DialTimeout time.Duration
@@ -607,6 +612,15 @@ func (o AdoptOptions) ResolvedDurableAckAmbiguityBound() time.Duration {
 	}.ResolvedDurableAckAmbiguityBound()
 }
 
+// ResolvedEventBacklogDropBound reports the drop bound a controller dialled by
+// this adoption pass would actually hold for, for the same reason.
+func (o AdoptOptions) ResolvedEventBacklogDropBound() time.Duration {
+	return ControllerOptions{
+		EventBacklogDropBound:     o.EventBacklogDropBound,
+		EventBacklogStallDeadline: o.EventBacklogStallDeadline,
+	}.ResolvedEventBacklogDropBound()
+}
+
 func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Controller, error) {
 	id := rec.Identity()
 	probe := ControllerOptions{
@@ -676,6 +690,7 @@ func dialForAdoption(ctx context.Context, rec Record, opts AdoptOptions) (*Contr
 		EventBacklogBudget:         opts.EventBacklogBudget,
 		EventBacklogStallDeadline:  opts.EventBacklogStallDeadline,
 		DurableAckAmbiguityBound:   opts.DurableAckAmbiguityBound,
+		EventBacklogDropBound:      opts.EventBacklogDropBound,
 		ExpectedWorkarea:           expected,
 		ExpectedWorkareaRoot:       expectedRoot,
 		DialTimeout:                opts.DialTimeout,

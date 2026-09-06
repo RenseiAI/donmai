@@ -62,6 +62,16 @@ type Spec struct {
 	// falls back to DefaultScrollback.
 	Scrollback int
 
+	// OutputFlowControl, when non-nil, stops the PTY reader while a subscriber
+	// is saturated instead of queueing without bound behind it.
+	//
+	// Nil is the released behaviour and stays the default: a subscriber that
+	// stops draining is absorbed by an unbounded per-subscription queue. That
+	// is correct for a short-lived local attach and wrong for a durable owner
+	// whose consumer may stall for minutes, which is why the choice is the
+	// spawning owner's rather than this package's.
+	OutputFlowControl *OutputFlowControl
+
 	// RecordPath is the asciinema-v2 cast destination (§16). Empty disables
 	// recording. The cast shares the process-spawn rel_time anchor with the
 	// wire, but is NOT a byte-exact copy of it: output events pass through

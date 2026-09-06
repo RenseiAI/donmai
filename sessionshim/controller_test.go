@@ -27,9 +27,22 @@ import (
 // pins that). Tests still need sub-second deadlines to exercise the stall
 // semantics in bounded time, so they write the field directly, in-package,
 // where the intent is visible rather than smuggled through the public seam.
+// newTestBacklog builds a backlog with a sub-floor stall deadline and a drop
+// bound at twice that deadline.
+//
+// Both are written directly, in-package, because newEventBacklog clamps them
+// unbypassably (TestEventBacklogStallDeadlineIsClampedToTheFloor and
+// TestEventBacklogDropBoundIsClampedToTheStallDeadline pin that) and a test
+// reaching below a production floor should be visible rather than smuggled
+// through the public seam.
+//
+// The 2x is the point of the pairing: a stall deadline that elapses no longer
+// drops anything, so a test that wants the drop has to wait out the bound the
+// hold is measured against.
 func newTestBacklog(budget int, stall time.Duration, abort <-chan struct{}) *eventBacklog {
-	b := newEventBacklog(budget, 0, abort, nil, 0)
+	b := newEventBacklog(budget, 0, abort, nil, 0, 0)
 	b.stall = stall
+	b.dropBound = 2 * stall
 	return b
 }
 
@@ -87,7 +100,7 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.dispatchEvents()
@@ -173,12 +186,95 @@ func TestSelectedV3HeartbeatReceiptBypassesFullPublicEventBuffer(t *testing.T) {
 // unreachable. Sourcing one from the other is what makes that impossible.
 func TestEventBacklogBudgetMatchesTheShimRing(t *testing.T) {
 	t.Parallel()
-	if EventBacklogBudget != ptyhost.DefaultRingBytes {
-		t.Fatalf("event backlog budget = %d, want the shim ring budget %d",
+	// The relation, not the equality: the controller must never be TIGHTER than
+	// the ring the shim absorbs a burst with, or it becomes the first component
+	// to give up on volume that was never a problem. Above the ring is headroom;
+	// below it is the released frame-count bug in a new unit.
+	if EventBacklogBudget < ptyhost.DefaultRingBytes {
+		t.Fatalf("event backlog budget = %d, below the shim ring budget %d",
 			EventBacklogBudget, ptyhost.DefaultRingBytes)
+	}
+	if EventBacklogBudget != eventBacklogBudgetRingMultiple*ptyhost.DefaultRingBytes {
+		t.Fatalf("event backlog budget = %d, want %d ring budgets of %d",
+			EventBacklogBudget, eventBacklogBudgetRingMultiple, ptyhost.DefaultRingBytes)
 	}
 	if publicEventBufferLimit != 64 {
 		t.Fatalf("public event buffer = %d, want 64", publicEventBufferLimit)
+	}
+}
+
+// TestProductionBacklogDefaultsAreAboveTheKillSwitch pins the interim safety
+// numbers against the incident that set them.
+//
+// Seven interactive seats were lost in one day to an 8 MiB budget paired with a
+// 30-second no-progress window: at gate-output rates a build log fills 8 MiB in
+// seconds, so a persistence stall that lasted half a minute was arithmetically
+// certain to drop any seat that was actually producing output. Both numbers had
+// to move, and the required drain rate had to NOT move with them — shortening
+// the window or shrinking the budget raises the rate a consumer must sustain,
+// which is the opposite of the fix.
+func TestProductionBacklogDefaultsAreAboveTheKillSwitch(t *testing.T) {
+	t.Parallel()
+	const releasedBudget = 8 << 20
+	const releasedStall = 30 * time.Second
+	if EventBacklogBudget <= releasedBudget {
+		t.Fatalf("in-flight budget = %d, want more than the %d that dropped seven seats",
+			EventBacklogBudget, releasedBudget)
+	}
+	if eventBacklogStallDeadline <= releasedStall {
+		t.Fatalf("no-progress window = %s, want longer than the %s that dropped seven seats",
+			eventBacklogStallDeadline, releasedStall)
+	}
+	// The required drain rate is budget/window. Raising the budget alone would
+	// have LOWERED it and raising the window alone would have too; the pairing
+	// is what keeps the mechanism measuring the same thing it always did.
+	released := float64(releasedBudget) / releasedStall.Seconds()
+	current := float64(EventBacklogBudget) / eventBacklogStallDeadline.Seconds()
+	if current != released {
+		t.Fatalf("required drain rate = %.0f B/s, want the released %.0f B/s: "+
+			"the budget and the window must move together", current, released)
+	}
+	if EventBacklogDropBound <= eventBacklogStallDeadline {
+		t.Fatalf("drop bound %s does not outlive the %s window it holds open",
+			EventBacklogDropBound, eventBacklogStallDeadline)
+	}
+}
+
+// TestEventBacklogDropBoundIsClampedToTheStallDeadline pins the guard on the
+// new knob, for the same reason the stall deadline has one.
+//
+// A drop bound BELOW the stall deadline does not tune the hold, it deletes it:
+// the first crossing of the deadline is already past the bound, so the reader
+// fails closed at exactly the moment the hold exists to carry it through — the
+// 30-second kill switch, reintroduced through the knob added to remove it.
+func TestEventBacklogDropBoundIsClampedToTheStallDeadline(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name       string
+		configured time.Duration
+		stall      time.Duration
+		want       time.Duration
+	}{
+		{name: "zero takes the default", want: EventBacklogDropBound},
+		{name: "negative takes the default", configured: -time.Second, want: EventBacklogDropBound},
+		{name: "under the stall deadline is raised", configured: time.Second, want: eventBacklogStallDeadline},
+		{name: "raised to a configured long deadline", configured: time.Minute, stall: 30 * time.Minute, want: 30 * time.Minute},
+		{name: "above the deadline is honoured", configured: 20 * time.Minute, want: 20 * time.Minute},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := ControllerOptions{EventBacklogDropBound: tc.configured, EventBacklogStallDeadline: tc.stall}
+			if got := opts.ResolvedEventBacklogDropBound(); got != tc.want {
+				t.Fatalf("resolved drop bound = %s, want %s", got, tc.want)
+			}
+			// And on the backlog the controller really builds, not on a struct
+			// a test reassembled by hand.
+			built := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil, nil, 0, opts.eventBacklogDropBound())
+			if built.dropBound != tc.want {
+				t.Fatalf("built backlog dropBound = %s, want %s", built.dropBound, tc.want)
+			}
+		})
 	}
 }
 
@@ -246,24 +342,131 @@ func TestEventBacklogAtBudgetStallsInsteadOfDropping(t *testing.T) {
 	}
 }
 
-// TestEventBacklogFailsClosedOnlyOnAStuckConsumer keeps the other half of the
-// guarantee: a consumer that produces NO progress for the whole stall deadline
-// is not behind, it has stopped, and the reader must not be parked behind it
-// forever — it is the only goroutine that can deliver a durable heartbeat
-// receipt. Removing the deadline turns this RED by hanging.
-func TestEventBacklogFailsClosedOnlyOnAStuckConsumer(t *testing.T) {
+// TestStalledConsumerIsNoLongerDroppedAtTheStallDeadline is the INVERTED
+// control: the assertion this file used to make, turned around.
+//
+// It was TestEventBacklogFailsClosedOnlyOnAStuckConsumer, and it required that
+// a consumer which made no progress for one whole stall deadline lose its
+// carrier there and then. On production hosts that requirement was the kill
+// switch: a control plane persisting every host frame stalled for tens of
+// seconds on a slow database path, seven output-heavy seats filled the in-flight
+// budget in that window, and every one of them was dropped at the deadline. The
+// socket was reachable throughout and the harnesses were all alive.
+//
+// The deadline still exists and still means something — it is where the stall
+// becomes visible — but it is no longer a verdict on the carrier. What the
+// reader does at the deadline now is degrade and keep stalling, which pushes
+// back through the socket to the shim, which stops reading the harness's
+// terminal. Restoring the old fail-closed-at-the-deadline turns this RED at the
+// first assertion.
+func TestStalledConsumerIsNoLongerDroppedAtTheStallDeadline(t *testing.T) {
 	t.Parallel()
-	backlog := newTestBacklog(64, 50*time.Millisecond, nil)
+	const stall = 60 * time.Millisecond
+	backlog := newTestBacklog(64, stall, nil) // dropBound = 2 * stall
+	var degraded atomic.Int64
+	backlog.report = func(state BacklogFlowState) {
+		if state.Degraded {
+			degraded.Add(1)
+		}
+	}
 	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
 		t.Fatalf("oversized first event refused: %v", err)
 	}
+
 	start := time.Now()
-	err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2})
-	if !errors.Is(err, ErrEventBacklogExceeded) {
-		t.Fatalf("push against a stuck consumer = %v, want ErrEventBacklogExceeded", err)
+	pushed := make(chan error, 1)
+	go func() { pushed <- backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2}) }()
+
+	// Well past the deadline the old behaviour dropped at, and short of the
+	// drop bound. The carrier must still be here.
+	select {
+	case err := <-pushed:
+		t.Fatalf("push returned %v after %s: the stall deadline is still dropping the carrier",
+			err, time.Since(start))
+	case <-time.After(3 * stall / 2):
 	}
-	if waited := time.Since(start); waited < 50*time.Millisecond {
-		t.Fatalf("push failed closed after %s, want it to stall the whole deadline first", waited)
+	if degraded.Load() == 0 {
+		t.Fatal("the stall crossed its deadline without ever being reported degraded: " +
+			"a held carrier that says nothing is indistinguishable from an idle one")
+	}
+
+	// The bound still exists: a consumer that never comes back is not held
+	// forever, because the reader is the only goroutine that can deliver a
+	// durable heartbeat receipt.
+	select {
+	case err := <-pushed:
+		if !errors.Is(err, ErrEventBacklogExceeded) {
+			t.Fatalf("push past the drop bound = %v, want ErrEventBacklogExceeded", err)
+		}
+		if waited := time.Since(start); waited < 2*stall {
+			t.Fatalf("push failed closed after %s, want it held for the whole %s drop bound",
+				waited, 2*stall)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a consumer that never drained was never refused: the drop bound is unreachable")
+	}
+}
+
+// TestStallDeadlineDegradationRecoversWhenTheConsumerReturns is the other half:
+// a stall that ends must be published as ended, or an operator reading the
+// status of a healthy host sees a degradation that is over.
+func TestStallDeadlineDegradationRecoversWhenTheConsumerReturns(t *testing.T) {
+	t.Parallel()
+	const stall = 60 * time.Millisecond
+	backlog := newTestBacklog(64, stall, nil)
+	states := make(chan BacklogFlowState, 8)
+	backlog.report = func(state BacklogFlowState) {
+		select {
+		case states <- state:
+		default:
+		}
+	}
+	if err := backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 1, FrameBytes: make([]byte, 4096)}); err != nil {
+		t.Fatalf("oversized first event refused: %v", err)
+	}
+	pushed := make(chan error, 1)
+	go func() { pushed <- backlog.push(ControllerEvent{Kind: EventHostFrame, Seq: 2}) }()
+
+	select {
+	case state := <-states:
+		if !state.Degraded {
+			t.Fatalf("first reported state = %+v, want a degradation", state)
+		}
+		if state.QueuedBytes <= 0 || state.Budget <= 0 {
+			t.Fatalf("degraded state = %+v, want the bytes in flight and the budget they are held against", state)
+		}
+		if state.StalledSince.IsZero() {
+			t.Fatalf("degraded state = %+v, want the instant the stall began", state)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stall past its deadline was never reported")
+	}
+
+	// The consumer comes back. The held push lands on the SAME carrier.
+	if _, ok := backlog.pop(); !ok {
+		t.Fatal("backlog closed while a push was held")
+	}
+	select {
+	case err := <-pushed:
+		if err != nil {
+			t.Fatalf("held push after the consumer returned = %v, want it to land", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("draining did not release the held push")
+	}
+	deadline := time.After(5 * time.Second)
+	for {
+		select {
+		case state := <-states:
+			if !state.Degraded {
+				if backlog.flowState().Degraded {
+					t.Fatal("recovery was reported while the backlog still reads degraded")
+				}
+				return
+			}
+		case <-deadline:
+			t.Fatal("the degradation was never reported as recovered")
+		}
 	}
 }
 
@@ -500,13 +703,13 @@ func TestEventBacklogStallDeadlineIsClampedToTheFloor(t *testing.T) {
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			if got := newEventBacklog(1024, tc.configured, nil, nil, 0).stall; got != tc.want {
+			if got := newEventBacklog(1024, tc.configured, nil, nil, 0, 0).stall; got != tc.want {
 				t.Fatalf("newEventBacklog(stall=%s).stall = %s, want %s", tc.configured, got, tc.want)
 			}
 			// And through the public option seam an embedder actually uses, which
 			// is the route the clamp has to close.
 			opts := ControllerOptions{EventBacklogStallDeadline: tc.configured}
-			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil, nil, 0).stall; got != tc.want {
+			if got := newEventBacklog(1024, opts.eventBacklogStallDeadline(), nil, nil, 0, 0).stall; got != tc.want {
 				t.Fatalf("through ControllerOptions(stall=%s) = %s, want %s", tc.configured, got, tc.want)
 			}
 		})
@@ -595,7 +798,7 @@ func TestSelectedV3HeartbeatReceiptTimeoutKeepsTheController(t *testing.T) {
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 11, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0, 0, nil, nil, 0),
+		events: make(chan ControllerEvent, 1), backlog: newEventBacklog(0, 0, nil, nil, 0, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: make(map[uint64]*snapshotCall),
 	}
 	go controller.readLoop()
@@ -682,7 +885,7 @@ func TestSelectedV3RejectsHeartbeatInterposedInsideLiveSnapshotPair(t *testing.T
 	controller := &Controller{
 		w: shimwire.NewWriter(clientConn), r: shimwire.NewReader(clientConn),
 		gen: 7, selected: shimwire.V3, adopted: shimwire.Adopted{ReplayFrom: 1},
-		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0),
+		events: make(chan ControllerEvent, 64), backlog: newEventBacklog(0, 0, nil, nil, 0, 0),
 		done: make(chan struct{}), closing: make(chan struct{}), snapshotCalls: map[uint64]*snapshotCall{77: call},
 	}
 	go controller.dispatchEvents()

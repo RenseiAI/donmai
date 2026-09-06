@@ -209,7 +209,13 @@ func (r *Registry) PutTombstone(t Tombstone) error {
 	if err := r.RemoveIncarnation(t.Identity(), t.ShimID, t.ProcessEpoch); err != nil {
 		return err
 	}
-	return r.removeDurableAck(t.Identity(), t.ShimID, t.ProcessEpoch)
+	if err := r.removeDurableAck(t.Identity(), t.ShimID, t.ProcessEpoch); err != nil {
+		return err
+	}
+	// The back-pressure sidecar describes a LIVE reader that stopped reading.
+	// Leaving it beside a tombstone would report a degradation for a harness
+	// that is provably gone.
+	return r.RemoveStreamFlow(t.Identity(), t.ShimID, t.ProcessEpoch)
 }
 
 func tombstoneIncarnationName(t Tombstone) string {

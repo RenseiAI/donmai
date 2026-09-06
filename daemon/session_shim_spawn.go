@@ -2267,6 +2267,7 @@ func (d *Daemon) sessionShimLaunchControllerOptions(
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
 		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
+		EventBacklogDropBound:     cfg.EventBacklogDropBound,
 		ExpectedWorkarea:          workarea,
 		ExpectedWorkareaRoot:      workareaRoot,
 		DialTimeout:               cfg.launchTimeout(),
