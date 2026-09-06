@@ -409,3 +409,77 @@ func TestDurableAckOutstandingTracksBothWaitingAndRetriedReceipts(t *testing.T) 
 		t.Fatal("an answered receipt still reports outstanding; the hold would never end")
 	}
 }
+
+// TestOutstandingDurableAckStillPublishesTheDegradation pins the fact that the
+// two holds are not alternatives.
+//
+// Whether a durable acknowledgement happens to be outstanding when a deadline
+// elapses decides WHOSE bound governs the eventual give-up. It says nothing
+// about whether the carrier is degraded — it is, either way. Anchoring the
+// degradation only inside the flow-control branch left Degraded false,
+// streamBackPressure empty in the daemon's status projection, and the
+// "holding the carrier under back-pressure" line unlogged for exactly the shape
+// the field incident had: a heartbeat receipt outstanding for the whole stall.
+//
+// And that shape is self-reinforcing — only the parked reader can consume a
+// receipt, so once one has timed out during a stall it stays outstanding for
+// the rest of it. The blind spot was therefore not a corner case; it was the
+// common case.
+//
+// Moving noteFlowControlStall back below the ambiguity switch turns this RED.
+func TestOutstandingDurableAckStillPublishesTheDegradation(t *testing.T) {
+	t.Parallel()
+	const stall = 30 * time.Millisecond
+	b := fillAmbiguityTestBacklog(t, 100, stall, time.Minute, func() bool { return true })
+	reports := make(chan BacklogFlowState, 8)
+	b.report = func(state BacklogFlowState) {
+		select {
+		case reports <- state:
+		default:
+		}
+	}
+
+	pushed := make(chan error, 1)
+	go func() { pushed <- b.push(ambiguityTestEvent()) }()
+
+	select {
+	case state := <-reports:
+		if !state.Degraded {
+			t.Fatalf("reported state = %+v, want a degradation", state)
+		}
+		if state.StalledSince.IsZero() || state.Budget <= 0 {
+			t.Fatalf("degraded state = %+v, want the stall anchor and the budget it is held against", state)
+		}
+	case err := <-pushed:
+		t.Fatalf("the push gave up (%v) instead of holding a carrier with an outstanding acknowledgement", err)
+	case <-time.After(5 * time.Second):
+		t.Fatal("a stall held open by an outstanding durable acknowledgement was never published as degraded")
+	}
+
+	// The sampled state a daemon status projection reads must agree.
+	if got := b.flowState(); !got.Degraded {
+		t.Fatalf("sampled flow state = %+v, want Degraded while the ambiguity hold is running", got)
+	}
+	// The ambiguity hold still owns the VERDICT: the carrier is still here.
+	select {
+	case err := <-pushed:
+		t.Fatalf("the push returned %v; the ambiguity hold no longer governs", err)
+	default:
+	}
+
+	// And it recovers the same way: the consumer coming back clears it.
+	if _, ok := b.pop(); !ok {
+		t.Fatal("the backlog closed while a push was held")
+	}
+	select {
+	case err := <-pushed:
+		if err != nil {
+			t.Fatalf("held push after the consumer drained = %v, want it to land", err)
+		}
+	case <-time.After(5 * time.Second):
+		t.Fatal("draining did not release the held push")
+	}
+	if got := b.flowState(); got.Degraded {
+		t.Fatalf("sampled flow state after recovery = %+v, want the degradation withdrawn", got)
+	}
+}

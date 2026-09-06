@@ -436,12 +436,18 @@ and is retried, by design).
 DEGRADED — a `streamBackPressure: "degraded"` entry on that session in
 `/api/daemon/status`, plus a repeating log line carrying bytes in flight and
 stall duration — and keeps stalling. Only `SessionShimConfig.EventBacklogDropBound`
-(10 minutes by default, clamped up to the stall deadline) still fails closed,
-after which the session is released to quarantine rather than published as
-adopted against a socket nobody can write to. Even then the harness is RETAINED
-(`carrierLost=false`): the shim keeps the process group and re-adoption restores
-the stream from the shim's own sequence, which is the same disposition a daemon
-restart produces.
+(10 minutes by default, clamped up to the stall deadline) still fails closed.
+
+Even then the harness is RETAINED (`carrierLost=false`) and the drop is
+classified as a DAEMON-SIDE ending (`shimStreamConsumerStalled`), so it takes the
+re-adoption path first — the same one a carrier loss takes — and a re-adopted
+controller arrives with an empty backlog, which is also the recovery. Only if
+every attempt fails does the lineage withdraw, and then under
+`durable_ack_timeout`. It never publishes `socket_unreachable`: that is a claim
+about a socket, this ending observed nothing about the socket at all, and it is
+the reason a control plane terminalizes on. Both refinements in
+`classifyShimStreamEnd` are selected by typed sentinel (`errors.Is`), never by
+matching error text.
 
 That ordering is the fix for a measured incident. Seven interactive seats were
 lost in one day on hosts whose durable consumer stalled for tens of seconds on a

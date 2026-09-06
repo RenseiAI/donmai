@@ -1162,3 +1162,56 @@ func TestFailClosedStreamDropNamesItsReason(t *testing.T) {
 		t.Fatalf("fail-closed drop log = %q, want the session and the exact reason", line)
 	}
 }
+
+// TestEventBacklogBudgetOverrideIsHonouredVerbatim pins a claim that used to be
+// made and not kept.
+//
+// The budget's doc block asserted the override was "bounded below by the shim
+// ring it must not undercut". It never was — only the two DURATION knobs are
+// clamped — and shipping a comment that asserts a safety property the code does
+// not enforce is worse than either enforcing it or not claiming it.
+//
+// Not claiming it is the right answer here, and the reason is the change this
+// file just made. A budget under the ring used to be a live hazard: reaching it
+// was a fail-closed decision, so the controller collapsed on a burst the ring
+// was designed to absorb. Reaching it is back-pressure now — the reader stalls,
+// the shim stops reading the PTY, the harness blocks in write(2) — so a tight
+// budget costs throughput and cannot cost a frame or a carrier. It stays a
+// sizing choice a host is allowed to make, and the daemon-level back-pressure
+// tests reach it through this very seam.
+//
+// This test exists so the comment and the code cannot drift apart again: if a
+// clamp is ever added, this goes RED and the doc has to be revisited with it.
+func TestEventBacklogBudgetOverrideIsHonouredVerbatim(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name       string
+		configured int
+		want       int
+	}{
+		{name: "zero takes the default", want: EventBacklogBudget},
+		{name: "negative takes the default", configured: -1, want: EventBacklogBudget},
+		{name: "far below the ring is honoured", configured: 8 << 10, want: 8 << 10},
+		{name: "one byte under the ring is honoured", configured: ptyhost.DefaultRingBytes - 1, want: ptyhost.DefaultRingBytes - 1},
+		{name: "above the default is honoured", configured: 64 << 20, want: 64 << 20},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			opts := ControllerOptions{EventBacklogBudget: tc.configured}
+			if got := opts.eventBacklogBudget(); got != tc.want {
+				t.Fatalf("resolved budget = %d, want %d", got, tc.want)
+			}
+			// And on the backlog a controller really builds, which is the only
+			// place a clamp could hide.
+			built := newEventBacklog(opts.eventBacklogBudget(), 0, nil, nil, 0, 0)
+			if built.budget != tc.want {
+				t.Fatalf("built backlog budget = %d, want %d", built.budget, tc.want)
+			}
+		})
+	}
+	// The default itself still follows the sizing advice the comment gives.
+	if EventBacklogBudget < ptyhost.DefaultRingBytes {
+		t.Fatalf("the DEFAULT budget %d is under the ring %d; the advice has to hold where it is ours to keep",
+			EventBacklogBudget, ptyhost.DefaultRingBytes)
+	}
+}

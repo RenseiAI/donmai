@@ -112,6 +112,14 @@ func newReadoptedBurstFixtureWithDropBound(
 		EnableAdoption: true, RegistryDir: registryDir, HostID: "host-burst", OrgID: id.OrgID,
 		AdoptionBatchOrgIDs:          []string{id.OrgID},
 		RequireAuthoritativeSnapshot: true, RequireCredentialAttestation: true,
+		// One bounded attempt with a token backoff. Every assertion in this
+		// file is about the DISPOSITION a lost carrier reaches, never about how
+		// many times it was retried, and the default policy's three attempts
+		// with a doubling backoff add tens of seconds of wall clock to the
+		// slowest package in the module — which is how a throughput assertion
+		// in an unrelated package starts failing on a loaded runner.
+		Readoption: SessionShimReadoptionPolicy{Attempts: 1, Backoff: 5 * time.Millisecond},
+
 		EventBacklogBudget:         backlogBudget,
 		EventBacklogStallDeadline:  backlogStall,
 		EventBacklogDropBound:      backlogDropBound,
@@ -339,9 +347,23 @@ func TestBacklogBudgetOverrunFailsClosedHonestly(t *testing.T) {
 		t.Fatalf("occupancy after failing closed = %d, want 1 while the harness is live", got)
 	}
 	quarantined := daemon.QuarantinedSessions()
-	if quarantined[0].Identity() != id ||
-		quarantined[0].Reason != sessionshim.QuarantineSocketUnreachable || !quarantined[0].ConsumesCapacity {
+	// The REASON moved with the classification, and that is the point of it: a
+	// reader that gave up on this daemon's own consumer observed nothing about
+	// the socket, so it may not publish `socket_unreachable` — the reason a
+	// control plane terminalizes on. It reaches quarantine only after the
+	// re-adoption attempts are spent, which the detail records.
+	if quarantined[0].Identity() != id || !quarantined[0].ConsumesCapacity {
 		t.Fatalf("quarantine after failing closed = %+v", quarantined[0])
+	}
+	if quarantined[0].Reason == sessionshim.QuarantineSocketUnreachable {
+		t.Fatalf("quarantine reason = %q for a shim that answered throughout", quarantined[0].Reason)
+	}
+	if quarantined[0].Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("quarantine reason = %q, want %q", quarantined[0].Reason, sessionshim.QuarantineDurableAckTimeout)
+	}
+	if quarantined[0].Detail != sessionShimReadoptionAttemptsSpentDetail {
+		t.Fatalf("quarantine detail = %q, want %q — the re-adoption path was never taken",
+			quarantined[0].Detail, sessionShimReadoptionAttemptsSpentDetail)
 	}
 	err := daemon.WriteAdoptedSessionShimInput(id.OrgID, id.SessionID, []byte("refused\r"))
 	if err == nil || !strings.Contains(err.Error(), "is not adopted by this daemon") {
@@ -550,4 +572,91 @@ func TestSlowDurableConsumerKeepsItsCarrierAndIsPublishedDegraded(t *testing.T) 
 		}
 		return false
 	})
+}
+
+// TestDropBoundReadoptsAndNeverPublishesSocketUnreachable drives the drop bound
+// end to end and pins what happens on the other side of it.
+//
+// This is the half the first cut of this change missed. Holding the carrier for
+// ten minutes instead of thirty seconds is a very large improvement, but the
+// drop that eventually happens was still classified as an ordinary ending: the
+// lineage went straight to `socket_unreachable` quarantine with NO re-dial at
+// all, and that reason is the one the control plane terminalizes ninety-five
+// seconds later. The kill window had moved, not closed.
+//
+// At the drop the shim is alive — its harness is retained, its socket answers,
+// and the closing controller releases the shim's PTY gate on the way out — so
+// the drop must take the re-adoption path first, and a re-adopted controller
+// arrives with an empty backlog, which is also the recovery.
+//
+// The two facts asserted here are the two the disposition turns on, and they
+// are read from the published quarantine because that is what a control plane
+// sees: the REASON is not a claim about a socket nobody observed, and the
+// DETAIL says the re-adoption attempts were spent — which only a lineage that
+// took the re-dial path can produce. (This fixture's re-adoption cannot
+// actually land: it has no acknowledged proof-v2 recovery heartbeat. That is
+// what makes the detail the right assertion here; a re-adoption that SUCCEEDS
+// keeping the lineage adopted is pinned by TestConsumerStallKeepsTheLineageAdopted.)
+//
+// Reverting classifyShimStreamEnd's ErrEventBacklogExceeded case turns this RED
+// twice over: the reason becomes `socket_unreachable` and the detail becomes the
+// plain controller-lost one, because no re-adoption was ever attempted.
+func TestDropBoundReadoptsAndNeverPublishesSocketUnreachable(t *testing.T) {
+	var holding atomic.Bool
+	release := make(chan struct{})
+	var releaseOnce sync.Once
+	// Both durations clamp up to the package floor, so the drop lands one whole
+	// floor after the consumer first falls behind — reachable in a test without
+	// waiting out the production ten minutes.
+	fixture := newReadoptedBurstFixtureWithDropBound(t, 8<<10, time.Millisecond, time.Millisecond, 0,
+		func(*Daemon, sessionshim.Identity, sessionshim.ControllerEvent) {
+			if !holding.Load() {
+				return
+			}
+			<-release
+		})
+	t.Cleanup(func() { releaseOnce.Do(func() { close(release) }) })
+	id := fixture.identity
+	daemon := fixture.daemon
+
+	holding.Store(true)
+	// Long enough to cross the drop, then out of the way: the re-adoption
+	// attempts that follow must not additionally queue behind this hold.
+	timer := time.AfterFunc(15*time.Second, func() {
+		holding.Store(false)
+		releaseOnce.Do(func() { close(release) })
+	})
+	t.Cleanup(func() { timer.Stop() })
+
+	go func() {
+		for cycle := range 8192 {
+			//nolint:gosec // G115: the alternation is 0 or 1 on a small literal
+			if err := daemon.ResizeAdoptedSessionShim(id.OrgID, id.SessionID, uint32(99+(cycle&1)), 29, 0, 0); err != nil {
+				return
+			}
+		}
+	}()
+
+	waitFor(t, 180*time.Second, "the drop bound to run the re-adoption path out", func() bool {
+		return len(daemon.QuarantinedSessions()) == 1
+	})
+
+	quarantined := daemon.QuarantinedSessions()[0]
+	if quarantined.Identity() != id {
+		t.Fatalf("quarantined the wrong lineage: %+v", quarantined)
+	}
+	if quarantined.Reason == sessionshim.QuarantineSocketUnreachable {
+		t.Fatal("the drop bound published `socket_unreachable` for a shim that answered throughout; " +
+			"that is the reason the control plane terminalizes on")
+	}
+	if quarantined.Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("quarantine reason = %q, want %q", quarantined.Reason, sessionshim.QuarantineDurableAckTimeout)
+	}
+	if quarantined.Detail != sessionShimReadoptionAttemptsSpentDetail {
+		t.Fatalf("quarantine detail = %q, want %q — the re-adoption path was never taken",
+			quarantined.Detail, sessionShimReadoptionAttemptsSpentDetail)
+	}
+	if !quarantined.ConsumesCapacity {
+		t.Fatal("the withdrawn lineage stopped consuming capacity; its harness is still held")
+	}
 }

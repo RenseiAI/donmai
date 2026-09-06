@@ -243,6 +243,7 @@ func (r *Registry) Remove(id Identity) error {
 // correlation matches the expected incarnation. It is the terminal path's safe
 // alternative to legacy identity-only Remove when duplicate records coexist.
 func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch uint64) error {
+	removed := false
 	entries, err := r.Scan()
 	if err != nil {
 		return err
@@ -259,8 +260,16 @@ func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch ui
 		if err := root.Remove(entry.Name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("sessionshim: remove exact discovery record: %w", err)
 		}
+		removed = true
 	}
-	return nil
+	if !removed {
+		return nil
+	}
+	// The back-pressure sidecar describes a live reader for THIS incarnation.
+	// Withdrawing the record without it leaves a ~1 KiB file per incarnation
+	// behind for the life of the host, and — worse — leaves a degradation
+	// published for a lineage this daemon has stopped owning.
+	return r.RemoveStreamFlow(id, shimID, processEpoch)
 }
 
 // HasIncarnation reports whether an exact live discovery record remains.

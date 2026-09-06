@@ -309,3 +309,56 @@ func waitForShimFlow(t *testing.T, what string, pred func() bool) {
 	}
 	t.Fatalf("timed out waiting for %s", what)
 }
+
+// TestStartNeverMutatesTheCallersFlowControl pins ownership of the caller's
+// configuration.
+//
+// Start installs its own OnChange hook, and it used to do so by writing through
+// the pointer the caller supplied. Two shims started from one shared
+// *OutputFlowControl would then share one hook: the second would overwrite the
+// first's, and the FIRST shim would silently stop publishing its degradations —
+// a bug whose only symptom is a shim that has stopped reading and says nothing
+// about it, which is the exact silence this state exists to break.
+//
+// Restoring the write-through (`opts.Spec.OutputFlowControl.OnChange = ...`)
+// turns this RED at the first assertion.
+func TestStartNeverMutatesTheCallersFlowControl(t *testing.T) {
+	registry, dir := flowTestRegistry(t)
+	shared := &ptyhost.OutputFlowControl{HighWaterBytes: 4096, LowWaterBytes: 1024, PauseBound: time.Minute}
+	idle := []string{"/bin/sh", "-c", "stty -echo; while IFS= read -r line; do printf 'ack:%s\n' \"$line\"; done"}
+
+	shims := make([]*Shim, 0, 2)
+	for i, session := range []string{"session-one", "session-two"} {
+		id := Identity{OrgID: "org-flow", SessionID: session}
+		shim, err := Start(Options{
+			Identity: id, Registry: registry, ProcessEpoch: uint64(i + 1),
+			WorkareaPath: filepath.Join(dir, "workarea"),
+			Spec:         ptyhost.Spec{Command: idle, OutputFlowControl: shared},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() {
+			ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+			defer cancel()
+			_ = shim.Terminate(ctx)
+			_ = shim.Close()
+		})
+		shims = append(shims, shim)
+	}
+
+	if shared.OnChange != nil {
+		t.Fatal("Start wrote its hook into the caller's configuration: a second shim started from the " +
+			"same struct would steal the first's callback and the first would stop publishing")
+	}
+	// The caller's own marks are still what the caller set, and still reached
+	// both sessions.
+	if shared.HighWaterBytes != 4096 || shared.LowWaterBytes != 1024 || shared.PauseBound != time.Minute {
+		t.Fatalf("the caller's configuration was modified: %+v", *shared)
+	}
+	for i, shim := range shims {
+		if state := shim.OutputFlowState(); state.Paused {
+			t.Fatalf("shim %d reports paused on an idle session: %+v", i, state)
+		}
+	}
+}

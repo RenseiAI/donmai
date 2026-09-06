@@ -117,10 +117,12 @@ type ControllerOptions struct {
 	// reject a released max-2 shim, which must still be adopted conservatively.
 	RequireFullHostFrames bool
 	// EventBacklogBudget overrides EventBacklogBudget for this controller, in
-	// payload bytes. Zero uses the default. A host running many sessions at once
-	// may want a smaller per-session budget; it must never be set BELOW what the
-	// shim's ring will hold, or the controller becomes the first thing to give
-	// up again.
+	// payload bytes. Zero uses the default, and any positive value is honoured
+	// verbatim — see EventBacklogBudget for why this one is not clamped while
+	// the two duration knobs are. A host running many sessions at once may want
+	// a smaller per-session budget; below the shim's ring it buys back memory
+	// by throttling the harness sooner, which is a throughput choice rather
+	// than the correctness hazard it used to be.
 	EventBacklogBudget int
 	// EventBacklogStallDeadline overrides eventBacklogStallDeadline for this
 	// controller: how long the consumer may go without taking a whole budget's
@@ -369,9 +371,22 @@ const (
 // log fills 8 MiB in seconds, so the equality left no headroom at all between
 // "briefly behind" and "at the bound". Raising the headroom does not change any
 // decision this file makes — it changes how often a transient persistence stall
-// has to reach for one. The memory ceiling it buys is per adopted session, and
-// only while a consumer is behind; a host that wants a tighter one sets the
-// override, which is bounded below by the shim ring it must not undercut.
+// has to reach for one. The memory ceiling it buys is per adopted session in
+// the DAEMON process, and only while a consumer is behind; because the durable
+// consumer is shared, a stall that reaches it reaches every session at once, so
+// the number to size a host against is the budget times its occupied slots.
+//
+// The override is deliberately NOT floored at the ring, and that is a change of
+// meaning worth stating rather than a gap. While reaching the budget was a
+// fail-closed decision, a budget under the ring was a live hazard: the
+// controller collapsed on a burst the ring was designed to absorb, and the
+// clamp would have been a safety property. It is not one any more. Past the
+// budget the reader now stalls, the stall reaches the shim's PTY reader, and
+// the harness blocks in write(2) — so a tight budget costs THROUGHPUT (the
+// harness is throttled sooner) and cannot cost a frame or a carrier. Keeping
+// the budget at or above the ring is still the right sizing advice, and the
+// default follows it; it is advice, not an invariant, and claiming a clamp that
+// does not exist would be worse than either.
 //
 // Reaching this budget is NOT a fail-closed decision. It used to be, and that
 // cost healthy seats: a re-adopted lineage whose consumer was momentarily
@@ -1837,6 +1852,38 @@ func (b *eventBacklog) flowState() BacklogFlowState {
 	return b.flowStateLocked()
 }
 
+// noteFlowControlStall anchors the DEGRADATION on a stall deadline that has
+// just elapsed, and returns the state to report with it.
+//
+// It runs before the ambiguity verdict, and that ordering is a fix for a real
+// blind spot rather than tidiness. The two holds are not alternatives: whether
+// a durable acknowledgement happens to be outstanding at the instant a deadline
+// elapses decides WHOSE bound governs the eventual give-up, but it says nothing
+// about whether this carrier is degraded — it is, either way, and an operator
+// needs to see that. Anchoring only inside the flow-control branch left
+// Degraded false, streamBackPressure empty, and the log silent for exactly the
+// shape the field incident had, where a heartbeat receipt was outstanding for
+// the whole stall (and, because only the parked reader can consume a receipt,
+// stayed outstanding once the first one had timed out).
+//
+// It reaches no verdict. Anchoring is not giving up.
+func (b *eventBacklog) noteFlowControlStall(now time.Time) BacklogFlowState {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.degradedSince.IsZero() {
+		// Anchored on when the consumer first fell BEHIND, not on the crossing,
+		// so a bound measured from here means "ten minutes of a stalled
+		// carrier" rather than "ten minutes plus however long the deadline
+		// happened to be".
+		b.degradedSince = b.stalledSince
+		if b.degradedSince.IsZero() {
+			b.degradedSince = now
+		}
+	}
+	b.reported = true
+	return b.flowStateLocked()
+}
+
 // holdForFlowControl decides what an elapsed stall deadline with nothing
 // outstanding may do, and returns the state to report with it.
 //
@@ -1850,13 +1897,9 @@ func (b *eventBacklog) holdForFlowControl(now time.Time) (BacklogFlowState, bool
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.degradedSince.IsZero() {
-		// Anchored on when the consumer first fell BEHIND, not on the crossing,
-		// so the bound means "ten minutes of a stalled carrier" rather than
-		// "ten minutes plus however long the deadline happened to be".
-		b.degradedSince = b.stalledSince
-		if b.degradedSince.IsZero() {
-			b.degradedSince = now
-		}
+		// noteFlowControlStall has always run first on the live paths; this is
+		// the belt for a caller that has not.
+		b.degradedSince = cmp.Or(b.stalledSince, now)
 	}
 	state := b.flowStateLocked()
 	if now.Sub(b.degradedSince) >= b.dropBound {
@@ -2010,19 +2053,24 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		room := b.drained
 		b.mu.Unlock()
 		if remaining <= 0 {
-			switch outcome, held := b.holdForDurableAckAmbiguity(time.Now()); outcome {
+			// The degradation is anchored FIRST, before either verdict, so it
+			// is a fact about the carrier rather than a property of whichever
+			// branch happens to hold it. Reported only where the hold is
+			// GRANTED, though: the crossing that gives up is announced by the
+			// drop itself, and a "holding the carrier" line immediately before
+			// "dropped the carrier" reads as two contradictory decisions.
+			now := time.Now()
+			degraded := b.noteFlowControlStall(now)
+			switch outcome, held := b.holdForDurableAckAmbiguity(now); outcome {
 			case ambiguityHoldGranted:
+				b.notify(degraded)
 				continue
 			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer took %d bytes, short of the %d it owed",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond), drained, b.progressBytes())
 			case ambiguityHoldNotAmbiguous:
 			}
-			// Reported only while the hold is GRANTED. The crossing that gives
-			// up is announced by the drop itself, and a "holding the carrier"
-			// line immediately before "dropped the carrier" reads as two
-			// contradictory decisions rather than one.
-			if state, held := b.holdForFlowControl(time.Now()); held {
+			if state, held := b.holdForFlowControl(now); held {
 				b.notify(state)
 				continue
 			}
@@ -2046,15 +2094,18 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 		case <-b.abort:
 			return io.EOF
 		case <-timer.C:
-			switch outcome, held := b.holdForDurableAckAmbiguity(time.Now()); outcome {
+			now := time.Now()
+			degraded := b.noteFlowControlStall(now)
+			switch outcome, held := b.holdForDurableAckAmbiguity(now); outcome {
 			case ambiguityHoldGranted:
+				b.notify(degraded)
 				continue
 			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer made no budget's worth of progress",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond))
 			case ambiguityHoldNotAmbiguous:
 			}
-			if state, keep := b.holdForFlowControl(time.Now()); keep {
+			if state, keep := b.holdForFlowControl(now); keep {
 				b.notify(state)
 				continue
 			}

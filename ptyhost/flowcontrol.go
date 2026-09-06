@@ -33,12 +33,27 @@ const (
 	// it. So the pause is bounded, and crossing the bound resumes reading and
 	// says so rather than holding a live harness hostage to a dead reader.
 	//
-	// It is deliberately LONGER than any consumer-side drop bound composed on
-	// top of this package, so the ordinary resolution of a genuinely stopped
-	// consumer is that consumer dropping its own connection — which closes the
-	// subscription, frees the queue, and resumes the reader with no loss — and
-	// this bound is only ever reached by a consumer that neither drains nor
-	// disconnects.
+	// The ordinary resolution of a genuinely stopped consumer is that consumer
+	// dropping its own connection — which closes the subscription, frees the
+	// queue, and resumes the reader with no loss — and this bound is only ever
+	// reached by a consumer that neither drains nor disconnects.
+	//
+	// What makes that ordering hold is NOT simple arithmetic against a
+	// consumer's own give-up bound. A composed consumer's worst case is longer
+	// than its headline number (an ambiguity hold, say, anchors when the
+	// ambiguity begins rather than when the stall did, so the composed hold can
+	// exceed the give-up bound by most of a no-progress window). The ordering
+	// holds because of WHERE the two clocks start: this one cannot start until
+	// the consumer's own in-flight budget has filled AND the socket between
+	// them has filled AND this subscriber's queue has filled behind it, all of
+	// which happen after the consumer first fell behind. The consumer's clock
+	// starts at that first moment; this one starts several buffers later.
+	//
+	// The consumer this does not foreclose is one whose timers are frozen — a
+	// stopped process, a suspended host, a very long stop-the-world — which
+	// neither drains, nor disconnects, nor reaches its own bound. That consumer
+	// is exactly what this bound is for, and it is why the bound exists at all
+	// rather than being left to the layer above.
 	DefaultOutputPauseBound = 15 * time.Minute
 
 	// outputFrameOverheadBytes charges a fixed cost per queued frame so a flood
@@ -258,9 +273,15 @@ func (g *outputGate) await(stop <-chan struct{}) {
 }
 
 // forceRelease ends a pause that ran the whole bound out. The subscriber stays
-// saturated — nothing about it improved — so the queue grows again from here;
-// what changes is that the harness is no longer blocked on a reader that may
-// never come back.
+// saturated — nothing about it improved — so the queue grows again from here,
+// unbounded, exactly as it did before this gate existed; what changes is that
+// the harness is no longer blocked on a reader that may never come back.
+//
+// That is the deliberate trade and it is worth being plain about: past this
+// point the memory bound is gone and only the liveness one is kept. The gate
+// will not re-pause for the same unrelieved subscriber (a loop of 15-minute
+// wedges is not an improvement on one), so the state persists until that
+// subscriber drains or goes away.
 func (g *outputGate) forceRelease() {
 	g.mu.Lock()
 	held := time.Since(g.since)

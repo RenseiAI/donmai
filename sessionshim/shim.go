@@ -370,12 +370,20 @@ func Start(opts Options) (*Shim, error) {
 	// stall for minutes, and an unbounded queue behind that consumer is how a
 	// slow durable path turns into an evicted ring, a Gap, and a viewer replay.
 	// A caller that has its own marks keeps them; only the hook is ours.
+	//
+	// The configuration is COPIED before the hook is installed. Writing through
+	// the caller's pointer would make two shims started from one shared
+	// *OutputFlowControl silently share a callback, so the second would steal
+	// the first's and the first would stop publishing its degradations — a
+	// bug whose only symptom is a shim that has stopped reading and says
+	// nothing about it, which is the exact silence this state exists to break.
 	flow := &shimFlowPublisher{}
-	if opts.Spec.OutputFlowControl == nil {
-		configured := DefaultOutputFlowControl()
-		opts.Spec.OutputFlowControl = &configured
+	configured := DefaultOutputFlowControl()
+	if opts.Spec.OutputFlowControl != nil {
+		configured = *opts.Spec.OutputFlowControl
 	}
-	opts.Spec.OutputFlowControl.OnChange = flow.publish
+	configured.OnChange = flow.publish
+	opts.Spec.OutputFlowControl = &configured
 
 	sess, err := ptyhost.Spawn(opts.Spec)
 	if err != nil {

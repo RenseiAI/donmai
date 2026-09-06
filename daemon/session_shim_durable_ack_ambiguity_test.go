@@ -425,6 +425,9 @@ func TestAmbiguityDoesNotRaiseCarrierBindLost(t *testing.T) {
 		wantRaise bool
 	}{
 		{name: "the ambiguity path never raises it", cause: shimStreamDurableAckAmbiguous},
+		// Same reasoning, reached by the other sentinel: a reader that gave up
+		// on its own consumer observed nothing about the carrier either.
+		{name: "a stalled consumer never raises it", cause: shimStreamConsumerStalled},
 		{name: "a real carrier loss still raises it", cause: shimStreamCarrierLost, wantRaise: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -447,11 +450,12 @@ func TestAmbiguityDoesNotRaiseCarrierBindLost(t *testing.T) {
 	}
 }
 
-// TestClassifyShimStreamEndOnlyRefinesTheAmbiguitySentinel pins the seam
-// between the two packages. This is the single decision that decides which
-// reason a lineage is published under, and it must turn on exact evidence
-// rather than on any drop the controller happened to make.
-func TestClassifyShimStreamEndOnlyRefinesTheAmbiguitySentinel(t *testing.T) {
+// TestClassifyShimStreamEndRefinesOnlyItsOwnSentinels pins the seam between the
+// two packages. This is the single decision that decides which reason a lineage
+// is published under, and it must turn on exact TYPED evidence — errors.Is on a
+// sentinel — rather than on any drop the controller happened to make or on the
+// text of an error message.
+func TestClassifyShimStreamEndRefinesOnlyItsOwnSentinels(t *testing.T) {
 	t.Parallel()
 	for _, tc := range []struct {
 		name   string
@@ -474,10 +478,30 @@ func TestClassifyShimStreamEndOnlyRefinesTheAmbiguitySentinel(t *testing.T) {
 			want:   shimStreamDurableAckAmbiguous,
 		},
 		{
-			// A consumer that genuinely stopped, with nothing outstanding to
-			// prove otherwise, is not ambiguity and keeps its disposition.
-			name:   "a stopped consumer exceeded the backlog budget",
+			// INVERTED. This used to pin `shimStreamEnded`, on the reading that
+			// a consumer with nothing outstanding "has stopped" and keeps the
+			// dead-shim disposition. It does not: the sentinel is produced by
+			// THIS daemon's reader giving up on THIS daemon's consumer, and it
+			// observed nothing whatsoever about the socket. Publishing
+			// `socket_unreachable` for it with no re-dial is what the control
+			// plane terminalized ninety-five seconds later — the same shape as
+			// the ambiguity case above, reached by a different sentinel.
+			name:   "this daemon's reader gave up on its own consumer",
 			endErr: sessionshim.ErrEventBacklogExceeded,
+			want:   shimStreamConsumerStalled,
+		},
+		{
+			name: "the backlog sentinel arrives wrapped",
+			endErr: errors.Join(
+				errors.New("controller dropped its shim connection"), sessionshim.ErrEventBacklogExceeded,
+			),
+			want: shimStreamConsumerStalled,
+		},
+		{
+			// The two refinements are disjoint and each is selected by its own
+			// typed sentinel, never by the text of an error message.
+			name:   "an unrelated ending is not refined by either sentinel",
+			endErr: errors.New("use of closed network connection"),
 			want:   shimStreamEnded,
 		},
 		{
@@ -495,5 +519,85 @@ func TestClassifyShimStreamEndOnlyRefinesTheAmbiguitySentinel(t *testing.T) {
 				t.Fatalf("classifyShimStreamEnd(%d, %v) = %d, want %d", tc.cause, tc.endErr, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestConsumerStallKeepsTheLineageAdopted is the RED control for the second
+// half of the kill path.
+//
+// Removing the 30-second deadline stopped the carrier being dropped over a slow
+// durable consumer. It did not, on its own, stop the DROP that does eventually
+// happen from being fatal: `ErrEventBacklogExceeded` still classified as an
+// ordinary ending, which quarantines `socket_unreachable` with no re-dial at
+// all, and the control plane terminalizes off that reason ninety-five seconds
+// later. That moved the kill window from thirty seconds to ten minutes; it did
+// not remove it.
+//
+// The shim is alive at the drop — its harness is retained and its socket
+// answers — so the lineage must be re-adopted, and a re-adopted controller
+// starts with an empty backlog, which is exactly the recovery the situation
+// calls for. Reverting classifyShimStreamEnd's backlog case turns this RED at
+// the first assertion: the lineage is in quarantine instead of adopted.
+func TestConsumerStallKeepsTheLineageAdopted(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 10 * time.Millisecond}, func(attempt int) error {
+		if attempt == 1 {
+			return errors.New("durable consumer still catching up")
+		}
+		return nil
+	})
+	d := f.daemon
+	previousGeneration := f.controller.Generation()
+
+	d.releaseShimIfLive(f.id, f.controller, classifyShimStreamEnd(shimStreamEnded, sessionshim.ErrEventBacklogExceeded))
+
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("a stalled consumer left %d lineages quarantined: %+v — the shim was answering throughout",
+			len(projected), projected)
+	}
+	entry, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	if err != nil {
+		t.Fatalf("the lineage left the adopted set over this daemon's own stalled consumer: %v", err)
+	}
+	if entry.controller == f.controller || entry.controller.Generation() <= previousGeneration {
+		t.Fatalf("adopted entry still names the lost controller (generation %d); no re-adoption happened",
+			entry.controller.Generation())
+	}
+}
+
+// TestExhaustedConsumerStallQuarantinesUnderItsOwnReason pins the
+// degrade-visibly half: when even re-adoption cannot recover the lineage the
+// daemon does withdraw, but never under a claim about a socket it never
+// observed.
+func TestExhaustedConsumerStallQuarantinesUnderItsOwnReason(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return errors.New("durable consumer never came back")
+	})
+	d := f.daemon
+
+	d.releaseShimIfLive(f.id, f.controller, shimStreamConsumerStalled)
+
+	projected := d.QuarantinedSessions()
+	if len(projected) != 1 {
+		t.Fatalf("quarantine projection = %+v, want exactly the withdrawn lineage", projected)
+	}
+	if projected[0].Reason == sessionshim.QuarantineSocketUnreachable {
+		t.Fatal("a reachable socket was published as unreachable over this daemon's own stalled consumer; " +
+			"that reason is what the control plane terminalized")
+	}
+	if projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("quarantine reason = %q, want %q — the durable side could not keep up, the socket was fine",
+			projected[0].Reason, sessionshim.QuarantineDurableAckTimeout)
+	}
+	if !projected[0].ConsumesCapacity {
+		t.Fatal("the withdrawn lineage stopped consuming capacity; its harness is still held")
+	}
+	if !projected[0].Reason.Known() {
+		t.Fatalf("reason %q is outside the closed registry; a consumer branching on it would fall through", projected[0].Reason)
+	}
+	// NOT TERMINAL: the shim is alive, so nothing about this lineage may close.
+	if published := d.reconcileQuarantinedTombstones(); len(published) != 0 {
+		t.Fatalf("the reconciler terminalized a stalled-consumer lineage with no tombstone: %+v", published)
 	}
 }
