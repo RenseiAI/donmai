@@ -10,21 +10,32 @@ import (
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
-// TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine pins F1: a launch that
-// never reaches trackLaunchedShim (never entering d.shims.adopted) must not
-// leak its digest-named log file or leave runShimChildLogGuard ticking for
-// the rest of the daemon's life. launchSessionShim's launchAdopted defer
-// runs removeShimChildLog on every such early-return path — this drives the
-// exact same "launch never announced itself" shape
-// TestShimChildStdoutStderrLandInThePerSessionLogFile drives (proving
-// capture works), but this test's concern is the opposite: that nothing
-// survives once the accept has definitively failed.
-func TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine(t *testing.T) {
+// TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard is the inverted F1.
+//
+// It USED to assert the opposite — that a launch which never reaches
+// trackLaunchedShim leaves no log file behind — and that assertion pinned the
+// defect: the one artifact that explains a spawn-failed seat was deleted at
+// the exact moment it became the answer, so the failure was only ever
+// diagnosable by racing a copy loop against the daemon.
+//
+// The two properties the original test was really protecting are unchanged and
+// still asserted here: the LIVE digest-named path is gone (so nothing
+// accumulates under the name a future launch would reuse), and the guard
+// goroutine self-terminates instead of ticking for the rest of the daemon's
+// life. What changed is where the bytes went: to a `.failed` sibling, and out
+// on the launch error itself.
+func TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard(t *testing.T) {
 	t.Parallel()
 
 	dir := t.TempDir()
 	registryDir := dir + "/registry"
-	const sessionID = "sess-failed-launch-no-leak"
+	const sessionID = "sess-failed-launch-keeps-log"
+	// Short, space-separated words on purpose: shimChildLogSecretPatterns
+	// carries a deliberately broad catch-all for any 32+ character opaque run,
+	// so a long hyphenated marker would be masked as a suspected credential —
+	// which is correct behaviour, and is pinned by
+	// TestPreservedShimChildLogTailIsRedacted below.
+	const childOutput = "the child said why it died"
 
 	d := New(Options{
 		SkipRegistration: true,
@@ -42,39 +53,78 @@ func TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine(t *testing.T) {
 		// A worker that writes some output and exits immediately without
 		// ever publishing a shim discovery record — awaitShimRecord times
 		// out and launchSessionShim returns an error without ever calling
-		// trackLaunchedShim.
-		WorkerCommand:     []string{"/bin/sh", "-c", "echo some-output; exit 0"},
+		// trackLaunchedShim. This is the shape the live stack fails in.
+		WorkerCommand:     []string{"/bin/sh", "-c", "echo " + childOutput + "; exit 0"},
 		WorktreeParentDir: dir,
 	})
 	d.spawner.opts.ShimSpawn = d.launchSessionShim
 	d.spawner.Resume()
 
-	if _, err := d.spawner.AcceptWork(SessionSpec{
+	// Plant an expired failure log from an imaginary earlier session. The
+	// retention sweep is wired into the LAUNCH path (a preserved log outlives
+	// the launch that produced it, so nothing in that session's own lifecycle
+	// can reclaim it) — asserting it here is what pins the wiring rather than
+	// only the function.
+	stale := shimFailedChildLogPath(registryDir, sessionshim.Identity{OrgID: "test-org", SessionID: "an-earlier-failure"})
+	if err := os.MkdirAll(registryDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(stale, []byte("older than the window\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	expired := time.Now().Add(-shimFailedChildLogRetention - time.Hour)
+	if err := os.Chtimes(stale, expired, expired); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := d.spawner.AcceptWork(SessionSpec{
 		SessionID: sessionID, ProjectID: "p1",
 		Repository: "https://example.invalid/x/y", Mode: interactiveRunMode,
-	}); err == nil {
+	})
+	if err == nil {
 		t.Fatal("AcceptWork = nil error; a shim launch that never announced itself must fail the accept (see TestLaunchFailureFailsTheAcceptClosed)")
+	}
+
+	// The whole point: the reason reaches a caller who cannot read this
+	// host's filesystem. Without the tail on the error, all the operator
+	// ever sees is "never published a discovery record".
+	if !strings.Contains(err.Error(), childOutput) {
+		t.Errorf("accept error does not carry the child's own output:\n%v", err)
+	}
+	if !strings.Contains(err.Error(), "child log") {
+		t.Errorf("accept error does not say where the retained log is:\n%v", err)
 	}
 
 	// launchSessionShim's cleanup defer runs synchronously as part of its
 	// own return, before AcceptWork above ever returns to this test — no
 	// polling or sleeping needed to observe it.
-	logPath := shimChildLogPath(registryDir, sessionshim.Identity{OrgID: "test-org", SessionID: sessionID})
-	if _, err := os.Stat(logPath); err == nil {
-		t.Fatalf("log file %s survived a failed launch; launchSessionShim's launchAdopted defer must remove it", logPath)
-	} else if !os.IsNotExist(err) {
-		t.Fatalf("unexpected error stat'ing %s: %v", logPath, err)
+	id := sessionshim.Identity{OrgID: "test-org", SessionID: sessionID}
+	logPath := shimChildLogPath(registryDir, id)
+	if _, statErr := os.Stat(logPath); statErr == nil {
+		t.Fatalf("the live log path %s still exists; the failed log must be renamed to its .failed sibling", logPath)
+	} else if !os.IsNotExist(statErr) {
+		t.Fatalf("unexpected error stat'ing %s: %v", logPath, statErr)
 	}
 
-	// The guard goroutine started in launchSessionShim self-terminates the
-	// FIRST time it finds the file gone (guardShimChildLogOnce returns
-	// false) — proving that directly, rather than sleeping past
-	// shimChildLogGuardInterval and hoping the real goroutine already
-	// ticked, is what actually pins "no ticking goroutine": if the file is
-	// gone, EVERY goroutine racing to check it — including the one this
-	// launch actually started — observes the same false and returns.
+	failedPath := shimFailedChildLogPath(registryDir, id)
+	kept, readErr := os.ReadFile(failedPath) //nolint:gosec // test-owned temp path
+	if readErr != nil {
+		t.Fatalf("the failed launch's child log was not kept at %s: %v", failedPath, readErr)
+	}
+	if !strings.Contains(string(kept), childOutput) {
+		t.Fatalf("retained log does not hold the child's output:\n%s", kept)
+	}
+
+	if _, statErr := os.Stat(stale); !os.IsNotExist(statErr) {
+		t.Errorf("the launch did not sweep an expired failure log (stat err %v); retained logs would accumulate forever", statErr)
+	}
+
+	// Unchanged from the original F1 assertion: the guard goroutine started
+	// in launchSessionShim self-terminates the FIRST time it finds the live
+	// path gone (guardShimChildLogOnce returns false). A rename satisfies
+	// that exactly as a removal did.
 	if guardShimChildLogOnce(logPath) {
-		t.Fatal("guardShimChildLogOnce = true after a failed launch removed the log; the guard goroutine started in launchSessionShim would keep ticking for the rest of the daemon's life")
+		t.Fatal("guardShimChildLogOnce = true after a failed launch; the guard goroutine started in launchSessionShim would keep ticking for the rest of the daemon's life")
 	}
 }
 
@@ -96,7 +146,7 @@ func TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine(t *testing.T) {
 // guarding the file regardless of what adoptSessionShims does). This test
 // neutralizes it deliberately, in order: remove the log file and wait past
 // shimChildLogGuardInterval so the launch's own guard observes the file is
-// gone and self-terminates (exactly TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine's
+// gone and self-terminates (exactly TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard's
 // mechanism), THEN recreate a fresh file at the same digest-named path —
 // simulating "a new capture file exists post-restart" — before ever
 // touching adoption. Only then does re-adoption run; only a guard STARTED

@@ -24,14 +24,15 @@ import (
 //
 // This calls startShimProcess directly rather than driving a full
 // AcceptWork/launchSessionShim launch: launchSessionShim's own cleanup (F1
-// — see TestFailedShimLaunchLeavesNoLogFileOrGuardGoroutine) removes this
-// exact log file the moment a launch fails to ever announce itself, which
-// is unavoidably true of a bare "echo and exit" worker with no real shim
-// protocol behind it — so asserting on the file's content through that
-// full path would be racing the very cleanup that neighbor test pins.
-// Calling startShimProcess directly isolates the concern this test
-// actually has (does the child's stdio reach the file at all) from
-// launchSessionShim's separate adoption-outcome-dependent lifecycle.
+// — see TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard) RENAMES this
+// exact log file to its `.failed` sibling the moment a launch fails to ever
+// announce itself, which is unavoidably true of a bare "echo and exit"
+// worker with no real shim protocol behind it — so asserting on this path's
+// content through that full path would be racing the very cleanup that
+// neighbor test pins. Calling startShimProcess directly isolates the
+// concern this test actually has (does the child's stdio reach the file at
+// all) from launchSessionShim's separate adoption-outcome-dependent
+// lifecycle.
 func TestShimChildStdoutStderrLandInThePerSessionLogFile(t *testing.T) {
 	t.Parallel()
 

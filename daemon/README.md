@@ -386,6 +386,19 @@ When a session appears wedged in the dashboard:
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
 
+7. **A session-shim launch that failed before adoption** — a shim child's
+   stdout/stderr is captured to a digest-named `<hash>.log` beside its
+   discovery record in the shim registry directory. When the launch fails
+   before the session is ever adopted, that file is **kept**, renamed to
+   `<hash>.log.failed`, rather than unlinked — it is usually the only record
+   of why the child died (a tool/lifecycle adaptation refusal, a provider
+   that could not start, a credential the runner refused). A bounded,
+   redacted tail of it also rides out on the launch error itself, so it
+   reaches the control plane's failure reason without filesystem access to
+   the host. Retained logs are swept after 24 hours, at the start of a later
+   launch. A launch that IS adopted keeps no `.failed` file; its live log is
+   unlinked by the ordinary terminal cleanup.
+
 ### Adopted session-shim carriers — back-pressure and the control-plane wedge
 
 When a session-shim carrier's consumer falls behind, the controller's socket
