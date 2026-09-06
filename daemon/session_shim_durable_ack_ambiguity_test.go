@@ -348,7 +348,7 @@ func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
 	}
 
 	terminal := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
-		return nil
+		return errors.New("platform persistence remains unavailable")
 	})
 	seedAmbiguityStreakToItsBudget(t, terminal.daemon, terminal.id)
 	terminal.daemon.releaseShimIfLive(terminal.id, terminal.controller, shimStreamCarrierLostPlatform)

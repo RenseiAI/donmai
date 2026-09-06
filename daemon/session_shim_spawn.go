@@ -2264,6 +2264,8 @@ func (d *Daemon) sessionShimLaunchControllerOptions(
 // shimStreamEndCause says why an adopted session's controller stream ended.
 type shimStreamEndCause uint8
 
+// ErrSessionShimCarrierLostPlatform marks a durable-event persistence failure
+// reported by an embedder as a platform-carrier loss rather than a shim fault.
 var ErrSessionShimCarrierLostPlatform = errors.New("session shim carrier lost at platform persistence")
 
 const (
@@ -2828,10 +2830,6 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// still re-adopted, however many cycles it has cost; only the pipeline
 		// settles the lineage.
 		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
-			if cause == shimStreamCarrierLostPlatform {
-				d.quarantineLostSessionShim(id, entry, lostReason, sessionShimDurableAckCyclesSpentDetail)
-				return
-			}
 			attemptBudget = 1
 			spentDetail = sessionShimDurableAckCyclesSpentDetail
 		}
