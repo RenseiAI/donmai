@@ -10,6 +10,45 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.22 — 2026-09-06
+
+### Features
+
+- **The stub harness's interactive profile now declares the tool-policy
+  RESTRICTION channels satisfied by construction, instead of denying every
+  launch that carries an allow/deny-list.** The interactive child is a
+  scripted fake agent with no tool registry, no MCP client, and no shell — an
+  agent that can invoke nothing has already honoured a deny-list, and the
+  empty set of invocable tools is also a subset of every allow-list. A new
+  `no_tool_surface` delivery marks this: not a synonym for `unsupported` and
+  not a downgrade, the restriction is honoured in full by construction, and it
+  applies only to the two restriction channels (allowed tools, disallowed
+  tools / permission config) on a harness whose child has no tool-invocation
+  surface at all — the grant channels (tool plugins, MCP servers, MCP tool
+  names, tool hooks) stay `unsupported` and keep denying, since "the child has
+  no tools" is a reason a mount request cannot be honoured, never a reason to
+  claim it was. The received policy rides to the child and is printed as the
+  first line of its own transcript, before the scenario's own output, so a
+  session that received no policy sets nothing and prints nothing — the
+  presence of the line is the evidence. (#552)
+
+### Fixes
+
+- **A failed shim launch now keeps its child's captured log instead of
+  deleting the one artifact that explains the failure.** A launched shim's
+  stdout/stderr is captured to a digest-named file beside its discovery
+  record; previously every pre-adoption failure path unlinked it, so the file
+  that would explain a spawn-failed seat was gone at the exact moment it
+  became the answer. The file is now renamed to a `.log.failed` sibling
+  instead, redacted once more before being retained, and a bounded tail (last
+  12 lines, at most 2 KiB) — also redacted — rides out on the launch error so
+  the diagnosis reaches an operator with no filesystem access to the host.
+  Retained `.failed` logs are swept 24 hours after creation. A launch that
+  succeeds and is adopted is unaffected: no `.failed` file is left behind, and
+  its live log is still unlinked by ordinary terminal cleanup. (#553)
+
+---
+
 ## v0.72.21 — 2026-09-05
 
 ### Features
