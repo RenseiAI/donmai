@@ -1385,15 +1385,15 @@ func guardShimChildLogOnce(logPath string) bool {
 		// daemon-owned path already does; see e.g.
 		// kit_registry.go's "kit registry: read scan path" for the same
 		// precedent.
-			slog.Warn( //nolint:gosec // structured slog handler escapes values; path and error are bounded
-				"session shim: redact child log",
+		slog.Warn( //nolint:gosec // structured slog handler escapes values; path and error are bounded
+			"session shim: redact child log",
 			"path", logPath,
 			"error", strconv.Quote(err.Error()),
 		)
 	}
 	if err := capShimChildLog(f, size); err != nil {
-			slog.Warn( //nolint:gosec // structured slog handler escapes values; path and error are bounded
-				"session shim: cap child log",
+		slog.Warn( //nolint:gosec // structured slog handler escapes values; path and error are bounded
+			"session shim: cap child log",
 			"path", logPath,
 			"error", strconv.Quote(err.Error()),
 		)
