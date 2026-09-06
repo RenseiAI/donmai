@@ -227,6 +227,12 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 	// so an operator reading `status`/doctor sees a host stuck re-converging
 	// rather than a host that is merely quiet.
 	defer d.clearSessionShimReconvergence(scope)
+	// A claims-disabled poll response is also a readiness recovery signal. This
+	// goroutine deliberately owns the fresh resolve: a resolver is embedder code
+	// and may wait on I/O, whereas the poll loop must return at its cadence.
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
+		slog.Warn("session shim: reconciliation readiness resolve did not establish admission", "scope", scope, "cause", cause, "error", err)
+	}
 	for rearms := 0; ; rearms++ {
 		d.publishSessionShimReconvergence(scope, cause, rearms, "")
 		lastErr := d.runBoundedSessionShimReconciliationPass(scope, cause)

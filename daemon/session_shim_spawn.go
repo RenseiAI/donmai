@@ -2610,25 +2610,24 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// `durable_ack_timeout`, because the socket was reachable for the whole of
 	// it and no projection of this lineage may say otherwise.
 	lostReason := sessionshim.QuarantineSocketUnreachable
-	// attemptBudget and spentDetail are set only on the last look this path
-	// takes at a lineage — see maxConsecutiveDurableAckAmbiguityCycles.
+	// A platform persistence failure is not evidence that the shim socket is
+	// unhealthy, so the ordinary re-adoption window does not count it. Its own
+	// consecutive ambiguity bound still makes a persistent platform outage
+	// terminal rather than allowing an endless local re-adoption loop.
 	attemptBudget := 0
 	spentDetail := ""
 	if cause == shimStreamDurableAckAmbiguous || cause == shimStreamCarrierLostPlatform {
 		lostReason = sessionshim.QuarantineDurableAckTimeout
-		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
-		// un-anchored ambiguity bound, so against a durable side that is
-		// persistently slow this path re-enters itself. What the streak buys is
-		// NOT a shortcut past re-adoption — ADR-2026-09-03 rejects that by
-		// name: "it must not shortcut past the re-adoption check that would
-		// otherwise catch a shim that is, in fact, still live and reachable."
-		// It buys a cheaper last look: one attempt instead of the full budget
-		// or a second whole lineage-live window. A shim that is still there is
-		// still re-adopted, however many cycles it has cost; only the pipeline
-		// settles the lineage.
+		// A successful re-adoption installs a fresh controller, so this failure
+		// path can otherwise start a new window forever against a persistently
+		// slow durable side. Count consecutive ambiguity exits independently.
 		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
-			attemptBudget = 1
-			spentDetail = sessionShimDurableAckCyclesSpentDetail
+			// Platform persistence failures do not spend the ordinary
+			// re-adoption window, but they cannot exempt a lineage forever. Once
+			// the independent ambiguity bound is spent, terminalize visibly
+			// instead of re-adopting a reachable local socket forever.
+			d.quarantineLostSessionShim(id, entry, lostReason, sessionShimDurableAckCyclesSpentDetail)
+			return
 		}
 	} else {
 		// Any other ending ends the streak: "consecutive" is the whole claim.

@@ -1245,9 +1245,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 				},
 				OnReregister: reregister,
 				OnSessionShimAdoptionNotReady: func() {
-					// Force a fresh sample before the repair pass republishes the
-					// projection; this is the recovery edge for a claims-disabled host.
-					_ = d.sessionShimReadinessGate(sessionShimReadinessResolveNow)
+					// The reconciliation pass resolves readiness before it republishes
+					// the projection. Keep that potentially slow embedder callback off
+					// the poll loop: poll must remain cadence-bound while claims are
+					// disabled.
 					d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), "poll-session-shim-adoption-not-ready")
 				},
 				// Honour the host-status signal the heartbeat already

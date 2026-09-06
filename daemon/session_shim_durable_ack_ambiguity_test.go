@@ -258,43 +258,28 @@ func seedAmbiguityStreakToItsBudget(t *testing.T, d *Daemon, id sessionshim.Iden
 	}
 }
 
-// TestTheBudgetedAmbiguityCycleStillReadoptsALiveShim is the pin the contract
-// asks for by name. ADR-2026-09-03: exhausting the bound "does not quarantine
-// directly, it re-enters the ordinary re-adoption pipeline first … it must not
-// shortcut past the re-adoption check that would otherwise catch a shim that
-// is, in fact, still live and reachable." A live, reachable shim on the
-// budgeted cycle is re-adopted, not withdrawn.
-func TestTheBudgetedAmbiguityCycleStillReadoptsALiveShim(t *testing.T) {
+// TestTheBudgetedPlatformPersistCycleQuarantinesALiveShim proves that platform
+// persistence losses do not spend the ordinary window, but cannot cause an
+// unbounded successful local readoption loop.
+func TestTheBudgetedPlatformPersistCycleQuarantinesALiveShim(t *testing.T) {
 	t.Parallel()
 	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
 		return nil // the shim is there; the durable side is merely slow
 	})
 	d := f.daemon
 	seedAmbiguityStreakToItsBudget(t, d, f.id)
-	previousGeneration := f.controller.Generation()
-
-	d.releaseShimIfLive(f.id, f.controller, shimStreamDurableAckAmbiguous)
-
-	if projected := d.QuarantinedSessions(); len(projected) != 0 {
-		t.Fatalf("the budgeted cycle withdrew a live, reachable shim: %+v — the ADR rejects exactly this shortcut", projected)
+	d.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLostPlatform)
+	if projected := d.QuarantinedSessions(); len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("budgeted platform-persist cycle quarantine = %+v, want one durable-ack timeout", projected)
 	}
-	entry, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
-	if err != nil {
-		t.Fatalf("the budgeted cycle left a re-adoptable lineage un-adopted: %v", err)
-	}
-	if entry.controller == f.controller || entry.controller.Generation() <= previousGeneration {
-		t.Fatalf("adopted entry still names the lost controller (generation %d)", entry.controller.Generation())
-	}
-	// The look is cheaper, not skipped: one attempt, not the policy's three.
-	if adoptions, _ := f.snapshot(); adoptions != 1 {
-		t.Fatalf("the budgeted cycle ran %d durable adoption(s), want exactly the one reduced attempt", adoptions)
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("the bound ran %d further adoption(s), want terminal quarantine", adoptions)
 	}
 }
 
-// TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails pins the other
-// outcome of that same pipeline run: the shim really is gone, so the reduced
-// attempt fails and the lineage withdraws under its own reason and detail.
-func TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails(t *testing.T) {
+// TestTheBudgetedAmbiguityCycleWithdrawsAfterPriorReadoptionsFail pins the
+// terminal outcome after the earlier re-adoption cycles did not converge.
+func TestTheBudgetedAmbiguityCycleWithdrawsAfterPriorReadoptionsFail(t *testing.T) {
 	t.Parallel()
 	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
 		return errors.New("durable acknowledgement never landed")
@@ -304,10 +289,8 @@ func TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails(t *testing.T)
 
 	d.releaseShimIfLive(f.id, f.controller, shimStreamDurableAckAmbiguous)
 
-	// The pipeline ran — and ran REDUCED. Three attempts here is the livelock
-	// the budget exists to shrink; zero is the shortcut the ADR rejects.
-	if adoptions, _ := f.snapshot(); adoptions != 1 {
-		t.Fatalf("the budgeted cycle ran %d durable adoption(s), want exactly the one reduced attempt", adoptions)
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("the budgeted cycle ran %d further adoption(s), want terminal quarantine", adoptions)
 	}
 	projected := d.QuarantinedSessions()
 	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {

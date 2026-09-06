@@ -690,6 +690,28 @@ func TestLineageMayNotReenterAWindowBeforeThePreviousDeadline(t *testing.T) {
 	}
 }
 
+// TestPlatformPersistLossDoesNotSpendTheReadoptionWindow keeps the recovery
+// exception narrow: a platform durable-persist failure may re-adopt inside the
+// ordinary window, while its separate ambiguity streak remains terminally
+// bounded by TestTheBudgetedPlatformPersistCycleQuarantinesALiveShim.
+func TestPlatformPersistLossDoesNotSpendTheReadoptionWindow(t *testing.T) {
+	t.Parallel()
+	policy := SessionShimReadoptionPolicy{
+		Mode: ReadoptionLineageLive, Backoff: time.Millisecond,
+		BackoffCap: time.Millisecond, Window: 10 * time.Minute,
+	}
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: policy})
+	lost := f.lostEntry(t)
+	lost.readoptedAtUnixNano = f.daemon.shimNow().Add(-90 * time.Second).UnixNano()
+
+	if got := f.daemon.readoptSessionShimAfterPlatformCarrierLoss(f.id, lost, 0); got != readoptionSucceeded {
+		t.Fatalf("platform persist disposition = %d, want readoptionSucceeded (%d) inside the ordinary window", got, readoptionSucceeded)
+	}
+	if adoptions, _ := f.snapshot(); adoptions != 1 {
+		t.Fatalf("durable adoption attempted %d times, want one platform-persist recovery attempt", adoptions)
+	}
+}
+
 // TestReadoptionPolicyValidateRejectsContradictoryFields pins the refusal at
 // CONFIG LOAD. {Fixed + Window} used to run a windowed loop, report a
 // fixed-attempt WorstCaseWindow, and admit a fresh window every sixty seconds —

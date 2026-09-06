@@ -1575,22 +1575,6 @@ func (s *sessionShimState) setDeclaringComposition(declaring bool) {
 	s.declaringComposition = declaring
 }
 
-// sessionShimFoundingDeclaration reports whether the refresh receipt about to
-// be validated for scope is the FOUNDING one: a deferred composition is in its
-// declaring window and nothing has been retained for the scope yet. Both halves
-// matter — the window alone would also match an unrelated lane refresh that
-// happens to land after retention, and an empty retention alone would match a
-// refresh on a daemon that never declared at all.
-func (d *Daemon) sessionShimFoundingDeclaration(scope string) bool {
-	if d.shims == nil {
-		return false
-	}
-	d.shims.mu.RLock()
-	defer d.shims.mu.RUnlock()
-	_, retained := d.shims.credentialReceipts[scope]
-	return d.shims.declaringComposition && !retained
-}
-
 func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
 	return shimIncarnation{
 		identity:     evidence.Identity,
