@@ -177,6 +177,23 @@ type SessionShimAdoptionPreparation struct {
 	// earlier reservation for this lineage is admitted, pre-active, and now
 	// stale — the authority is expected to abandon it before reserving above
 	// the carrier-epoch floor, or to answer a typed conflict.
+	//
+	// An Attempt above 1 under SessionShimPrepareCauseInitial is the other
+	// re-ask this daemon makes: the PREVIOUS ask was never answered (see
+	// ErrSessionShimAdoptionPrepareUnavailable), so whether it minted anything
+	// is unknown to this side. The lineage is still being adopted for the first
+	// time — that is why the cause stays "initial".
+	//
+	// Correctness does NOT rest on an authority reading this number, and it is
+	// deliberately not stated as an obligation on one. A re-ask carries the same
+	// organization, session, shim, process epoch, controller AND controller
+	// generation as the ask before it — the generation because no Welcome is
+	// written when a preparation fails, so nothing the shim committed moved. An
+	// authority that keys a reservation on that content therefore resolves a
+	// re-ask as the SAME preparation and replays the reservation it already
+	// holds, rather than minting a second one. The number is here so an
+	// authority that wants to tell a re-ask from a first ask can, and so its
+	// logs can say which; one that ignores it is still correct.
 	Cause   SessionShimAdoptionPrepareCause
 	Attempt int
 }
@@ -2980,8 +2997,18 @@ func (d *Daemon) prepareSessionShimAdoptionForCause(
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return SessionShimAdoptionPreparationResult{}, errors.New("session shim: proof-v2 recovery heartbeat is not acknowledged")
 	}
+	// Refuse THIS preparation, and nothing wider. A per-lineage seam is not
+	// where the host's admission fence belongs: the fence answers "may this host
+	// serve", that question is settled by the host's own carrier proof, and the
+	// beat resolves that proof live on every beat and withdraws on a definite
+	// not-ready (sessionShimHeartbeatProjection). Withdrawing here as well made
+	// a single lineage's failed round trip look like a host-wide verdict — and
+	// because the fence only reopens on an ACKNOWLEDGED beat, a host that had
+	// merely been unlucky could not get back on its own. Nothing is loosened:
+	// the gate's refusal is still returned, so this launch is still refused, and
+	// every other new-work seam (claim, admission, activation) consults the same
+	// gate for itself.
 	if err := d.sessionShimReadinessGate(sessionShimReadinessCadence); err != nil {
-		d.withdrawSessionShimProofV2Readiness()
 		return SessionShimAdoptionPreparationResult{}, err
 	}
 	if d.sessionShimConfig().RequireAuthoritativeSnapshot && evidence.SelectedVersion < shimwire.V3 {
@@ -3022,7 +3049,10 @@ func (d *Daemon) prepareSessionShimAdoptionForCause(
 		}
 	}
 	if err != nil {
-		return SessionShimAdoptionPreparationResult{}, err
+		// Classified on the way out, so every caller can tell an authority that
+		// REFUSED from one that did not answer. See
+		// ErrSessionShimAdoptionPrepareUnavailable.
+		return SessionShimAdoptionPreparationResult{}, classifySessionShimPrepareFailure(err)
 	}
 	if err := validateSessionShimAdoptionPreparationResult(result, evidence.ProcessEpoch, d.shimNow()); err != nil {
 		return SessionShimAdoptionPreparationResult{}, err

@@ -370,16 +370,5 @@ func shimExtensionValueOrAbsent(value string, present bool) string {
 // waitSessionShimDriftBackoff spends the doubling delay before attempt n
 // without outliving the pass's context.
 func (d *Daemon) waitSessionShimDriftBackoff(ctx context.Context, attempt int) error {
-	delay := sessionShimDriftRedialBackoff
-	for i := 2; i < attempt; i++ {
-		delay *= 2
-	}
-	timer := time.NewTimer(delay)
-	defer timer.Stop()
-	select {
-	case <-timer.C:
-		return nil
-	case <-ctx.Done():
-		return ctx.Err()
-	}
+	return waitSessionShimRetryBackoff(ctx, attempt, sessionShimDriftRedialBackoff)
 }
