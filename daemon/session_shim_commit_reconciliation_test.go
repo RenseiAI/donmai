@@ -115,6 +115,19 @@ func TestReconciliationWithdrawsReadinessWhenResolveNowRefuses(t *testing.T) {
 	}
 }
 
+func TestRefusalReconciliationArmsPacingBound(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, _ := newReconciliationFixture(ctx, t)
+	h.daemon.scheduleSessionShimReconciliation(h.orgID, sessionShimReconcileCausePollRefused)
+	h.daemon.shims.mu.RLock()
+	next := h.daemon.shims.reconcileRefusalNext[h.orgID]
+	h.daemon.shims.mu.RUnlock()
+	if !next.After(h.daemon.shimNow()) {
+		t.Fatalf("refusal pacing deadline = %v, want future bound", next)
+	}
+}
+
 // stageReconciliationQuarantine plants one quarantined lineage plus the
 // acceptance bookkeeping a later clear needs (a recorded process identity
 // provably not running, and no registry record).

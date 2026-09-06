@@ -347,6 +347,13 @@ func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
 		t.Fatalf("first platform loss quarantined instead of re-adopting: %+v", projected)
 	}
 
+	reachable := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error { return nil })
+	seedAmbiguityStreakToItsBudget(t, reachable.daemon, reachable.id)
+	reachable.daemon.releaseShimIfLive(reachable.id, reachable.controller, shimStreamCarrierLostPlatform)
+	if projected := reachable.daemon.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("spent platform-loss streak quarantined a reachable shim: %+v", projected)
+	}
+
 	terminal := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
 		return errors.New("platform persistence remains unavailable")
 	})
