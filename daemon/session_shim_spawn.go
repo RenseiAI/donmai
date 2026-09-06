@@ -2858,6 +2858,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	}
 	switch readopt(id, entry, attemptBudget) {
 	case readoptionSucceeded:
+		d.clearDurableAckAmbiguityCycles(id)
 		return
 	case readoptionWindowExhausted:
 		// The window ended with the shim still observable — an outcome the

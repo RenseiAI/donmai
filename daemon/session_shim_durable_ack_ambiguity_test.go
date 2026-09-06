@@ -353,6 +353,9 @@ func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
 	if projected := reachable.daemon.QuarantinedSessions(); len(projected) != 0 {
 		t.Fatalf("spent platform-loss streak quarantined a reachable shim: %+v", projected)
 	}
+	if got := reachable.daemon.durableAckAmbiguityCycles(reachable.id); got != 0 {
+		t.Fatalf("successful spent-streak re-adoption retained %d ambiguity cycles", got)
+	}
 
 	terminal := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
 		return errors.New("platform persistence remains unavailable")

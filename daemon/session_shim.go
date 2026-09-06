@@ -887,7 +887,9 @@ type SessionShimConfig struct {
 	// only after it has durably accepted the event. Output and snapshot sequence
 	// state advances, and the shim heartbeat acknowledgement is sent, only after
 	// that successful return. It MUST be bounded for the same reason as
-	// OnSessionEvent.
+	// OnSessionEvent. An embedder that recognizes a platform durable-persistence
+	// failure must wrap ErrSessionShimCarrierLostPlatform so re-adoption classifies
+	// it as a carrier fault rather than a shim-side failure.
 	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
 	// ResumeFrom returns the first output sequence the composing durable store
