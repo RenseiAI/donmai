@@ -81,10 +81,17 @@ func (e *RelayRestartingError) Error() string {
 	case e.CloseCode != 0:
 		where = fmt.Sprintf("the relay closed this leg with %d for a planned restart", e.CloseCode)
 	}
-	if e.RedialAfter > 0 {
-		return fmt.Sprintf("attachclient: %s: %s (redial after %s)", where, e.Message, e.RedialAfter)
+	switch {
+	case e.Message != "":
+		// The message IS the announcement, in the frozen grammar or the whole
+		// close reason. Restating the parsed floor after it only prints the same
+		// number twice into an operator's quarantine detail.
+		return fmt.Sprintf("attachclient: %s: %s", where, e.Message)
+	case e.RedialAfter > 0:
+		return fmt.Sprintf("attachclient: %s: redial after %s", where, e.RedialAfter)
+	default:
+		return fmt.Sprintf("attachclient: %s: no redial hint", where)
 	}
-	return fmt.Sprintf("attachclient: %s: %s (no redial hint)", where, e.Message)
 }
 
 // Unwrap makes errors.Is(err, ErrRelayUnavailable) true through any composing
@@ -185,26 +192,41 @@ func parseRetryAfterSeconds(value string) time.Duration {
 	return time.Duration(seconds) * time.Second
 }
 
-// RelayRestartRefusal classifies one pre-upgrade HTTP answer to an attach dial.
+// RelayRestartRefusal classifies one pre-upgrade HTTP answer to an attach dial
+// as the drain-window refusal the planned-restart contract defines: **503
+// Service Unavailable carrying a Retry-After the contract's delta-seconds form
+// can be read from**. It returns nil for anything else, including a bare 503.
 //
-// It returns nil unless the answer is the drain-window refusal the contract
-// defines — 503 Service Unavailable — in which case Retry-After supplies the
-// redial floor. Every attach lane runs its dial answer through this, so the
-// drain window produces exactly one classification no matter which lane hit it,
-// and a composing daemon can build the same signal from a response it holds
-// itself.
+// The Retry-After is a REQUIREMENT here, not merely the source of the floor,
+// and that is the whole discrimination this function exists to make. 503 on its
+// own is not an announcement: a relay answers one for conditions that ARE a
+// verdict about this candidate — a durable rail that cannot take its journal
+// lock, for instance — and an intermediary answers one for having no capacity
+// at all. Reading those as "the relay is restarting" would print an
+// announcement nobody made, and on the host lane it would suppress the §14
+// degraded fallback indefinitely for a condition the degraded lane might not
+// share.
+//
+// A bare 503 is still not a verdict on the LINEAGE, so every caller wraps it as
+// a RelayDialError, which carries the same ErrRelayUnavailable sentinel: a
+// composing daemon's re-dial budget is unchanged, only the announcement is not
+// asserted.
+//
+// The response body is deliberately not consulted. The contract puts the
+// announcement in the header, and reading an arbitrary server's body on a dial
+// path would make a refusal's classification depend on how fast that body
+// arrives.
 func RelayRestartRefusal(resp *http.Response) *RelayRestartingError {
 	if resp == nil || resp.StatusCode != http.StatusServiceUnavailable {
 		return nil
 	}
 	after := parseRetryAfterSeconds(resp.Header.Get("Retry-After"))
-	message := "no redial hint"
-	if after > 0 {
-		message = fmt.Sprintf("redial after %ds", int(after/time.Second))
+	if after <= 0 {
+		return nil
 	}
 	return &RelayRestartingError{
 		Code:        attachwire.CodeRelayRestarting,
-		Message:     message,
+		Message:     fmt.Sprintf("redial after %ds", int(after/time.Second)),
 		RedialAfter: after,
 		StatusCode:  resp.StatusCode,
 	}

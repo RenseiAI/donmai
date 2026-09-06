@@ -427,10 +427,15 @@ func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder
 		case http.StatusServiceUnavailable:
 			// The drain window refuses every attach lane, this one included.
 			// Without the classification the fallback lane would read a planned
-			// restart as an unexplained 5xx and burn its budget on it.
+			// restart as an unexplained 5xx and burn its budget on it. A 503
+			// that carries no Retry-After is NOT the announcement (see
+			// RelayRestartRefusal) and falls through to the ordinary transient.
 			restart := RelayRestartRefusal(resp)
 			_ = resp.Body.Close()
-			return nil, restart
+			if restart != nil {
+				return nil, restart
+			}
+			return nil, fmt.Errorf("attachclient: host SSE GET status %d", resp.StatusCode)
 		default:
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("attachclient: host SSE GET status %d", resp.StatusCode)

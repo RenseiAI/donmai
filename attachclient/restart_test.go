@@ -62,11 +62,19 @@ func TestClassifiesEveryPlaceTheRestartIsAnnounced(t *testing.T) {
 			classified bool
 		}{
 			{name: "503 with a floor", status: http.StatusServiceUnavailable, retryAfter: "5", want: 5 * time.Second, classified: true},
-			{name: "503 without one", status: http.StatusServiceUnavailable, classified: true},
+			// A BARE 503 is the relay's OTHER 503: a durable rail that cannot
+			// take its journal lock, or an intermediary with no capacity. Both
+			// are answers about this candidate or this hop, not an announcement
+			// nobody made — and on the host lane, classifying them as a restart
+			// would suppress the §14 fallback for a condition the fallback lane
+			// may not share.
+			{name: "a bare 503 is not an announcement", status: http.StatusServiceUnavailable},
 			{
 				name: "503 with an HTTP-date this client does not read", status: http.StatusServiceUnavailable,
-				retryAfter: "Wed, 02 Sep 2026 10:41:53 GMT", classified: true,
+				retryAfter: "Wed, 02 Sep 2026 10:41:53 GMT",
 			},
+			{name: "503 with an unreadable Retry-After", status: http.StatusServiceUnavailable, retryAfter: "soon"},
+			{name: "503 asking for zero seconds is no floor at all", status: http.StatusServiceUnavailable, retryAfter: "0"},
 			{name: "429 is rate limiting, not a restart", status: http.StatusTooManyRequests, retryAfter: "5"},
 			{name: "500 is not an announcement", status: http.StatusInternalServerError},
 		} {
@@ -459,5 +467,83 @@ func TestV2DialRefusedWhileDrainingRetriesWithTheRelaysFloor(t *testing.T) {
 	}
 	if err := <-serverErr; err != nil {
 		t.Fatalf("relay: %v", err)
+	}
+}
+
+// TestBare503IsADialFailureNotAnAnnouncement is the other side of the
+// discrimination: the classification must be narrow, but the DISPOSITION must
+// not be. A 503 with no Retry-After is not the planned-restart announcement —
+// so nothing logs one and the host lane keeps counting it toward the §14
+// fallback — yet it is still not a verdict about the lineage, so it keeps
+// carrying ErrRelayUnavailable and a composing daemon's re-dial budget is
+// untouched.
+func TestBare503IsADialFailureNotAnAnnouncement(t *testing.T) {
+	t.Parallel()
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		// The relay's own non-drain 503: its durable rail is not healthy. That
+		// is an answer about this candidate, not "come back in five seconds".
+		http.Error(w, "attach-v2 takeover unavailable", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+	defer cancel()
+	_, err := DialV2HostCandidate(ctx, V2HostConfig{
+		AttachURL:        strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource:      func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		DurableHighWater: 4,
+	})
+	if err == nil {
+		t.Fatal("a bare 503 completed the dial")
+	}
+	if IsRelayRestarting(err) {
+		t.Fatalf("err = %v asserts a planned restart the relay never announced", err)
+	}
+	var dial *RelayDialError
+	if !errors.As(err, &dial) {
+		t.Fatalf("err = %v (%T), want *RelayDialError", err, err)
+	}
+	if !IsRelayUnavailable(err) {
+		t.Fatalf("err = %v lost ErrRelayUnavailable — a bare 503 still learned nothing about the lineage, "+
+			"so a composing daemon's re-dial budget must still apply", err)
+	}
+	if isRelayStop(err) {
+		t.Fatalf("err = %v classified as terminal", err)
+	}
+}
+
+// TestBare503StillEarnsTheDegradedFallback is the behavioural half of the same
+// discrimination, on the lane where it is not merely cosmetic.
+//
+// RunHost's planned-restart case deliberately never calls maybeFallback: the
+// drain refuses BOTH lanes, so falling back would move a healthy carrier onto
+// the slow lane for a condition the slow lane shares. A bare 503 has no such
+// guarantee behind it — it may be one hop, or one lane's dependency — so it
+// must keep reaching the ordinary path and, after FallbackAfterN, the §14
+// degraded lane. Classifying every 503 as a restart suppressed that fallback
+// permanently.
+func TestBare503StillEarnsTheDegradedFallback(t *testing.T) {
+	// Every WSS dial answers a bare 503; the degraded lane is healthy.
+	h := startHost(t, attachtest.Config{
+		RefuseWSS: true, RefuseWSSStatus: http.StatusServiceUnavailable,
+	}, func(c *HostConfig) {
+		c.FallbackAfterN = 2
+	})
+	h.sess.PushOutput([]byte("boot"))
+
+	if !waitFor(func() bool { return h.relay.HostBound() }, 10*time.Second) {
+		t.Fatal("the host never reached the §14 degraded lane after repeated bare 503s — " +
+			"a 503 with no announcement behind it must not suppress the fallback")
+	}
+	if !waitFor(func() bool {
+		h.sess.PushOutput([]byte("after-bare-503"))
+		return h.relay.HostAckSeq() > 0
+	}, 10*time.Second) {
+		t.Fatalf("the degraded lane bound but never acknowledged a batch (ack=%d)", h.relay.HostAckSeq())
+	}
+	select {
+	case err := <-h.done:
+		t.Fatalf("RunHost returned %v while falling back", err)
+	default:
 	}
 }
