@@ -100,6 +100,21 @@ func newReconciliationFixture(ctx context.Context, t *testing.T) (*compositionHa
 	return h, f
 }
 
+func TestReconciliationWithdrawsReadinessWhenResolveNowRefuses(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, _ := newReconciliationFixture(ctx, t)
+	h.daemon.shimIdentity().config.GetCarrierProofV2Readiness = func() (SessionShimCarrierProofV2Readiness, error) {
+		return SessionShimCarrierProofV2Readiness{}, nil
+	}
+	h.daemon.sessionShimReadinessWithdrawn.Store(false)
+	h.daemon.shims.wg.Add(1)
+	h.daemon.runSessionShimReconciliation(h.orgID, sessionShimReconcileCausePollRefused)
+	if !h.daemon.sessionShimReadinessWithdrawn.Load() {
+		t.Fatal("reconciliation left proof-v2 readiness open after ResolveNow refused it")
+	}
+}
+
 // stageReconciliationQuarantine plants one quarantined lineage plus the
 // acceptance bookkeeping a later clear needs (a recorded process identity
 // provably not running, and no registry record).

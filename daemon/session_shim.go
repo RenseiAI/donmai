@@ -1490,10 +1490,10 @@ type sessionShimState struct {
 	// reconcileStop is closed when the daemon releases its shims; a
 	// reconciliation loop parked in backoff exits on it instead of outliving
 	// the daemon. Protected by mu; the channel itself is assigned once.
-	reconciling      map[string]bool
-	reconcileNext    map[string]time.Time
-	reconcileStop    chan struct{}
-	reconcileStopped bool
+	reconciling          map[string]bool
+	reconcileRefusalNext map[string]time.Time
+	reconcileStop        chan struct{}
+	reconcileStopped     bool
 	// reconverging is the live, operator-visible condition for a scope whose
 	// reconciliation keeps re-arming against a control plane that reports a
 	// further advanced revision. A host stuck here is serving correctly but is
@@ -1540,7 +1540,7 @@ func newSessionShimState() *sessionShimState {
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
 		ambiguityCycles:      make(map[sessionshim.Identity]int),
 		reconciling:          make(map[string]bool),
-		reconcileNext:        make(map[string]time.Time),
+		reconcileRefusalNext: make(map[string]time.Time),
 		reconcileStop:        make(chan struct{}),
 	}
 }

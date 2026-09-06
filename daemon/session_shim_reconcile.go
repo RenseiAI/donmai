@@ -87,6 +87,8 @@ const (
 	sessionShimReconcileCauseAmbiguous        = "ambiguous-batch-commit"
 	sessionShimReconcileCauseAmbiguousLaunch  = "ambiguous-launch-batch-commit"
 	sessionShimReconcileCauseRevisionAdvanced = "adoption-revision-advanced"
+	sessionShimReconcileCauseHeartbeatRefused = "heartbeat-revision-stale"
+	sessionShimReconcileCausePollRefused      = "poll-session-shim-adoption-not-ready"
 )
 
 // sessionShimCommitOutcomeUnknown classifies one batch-commit error.
@@ -174,15 +176,19 @@ func (d *Daemon) scheduleSessionShimReconciliation(scope, cause string) {
 		return
 	}
 	d.shims.mu.Lock()
-	if d.shims.reconcileStopped || d.shims.reconciling[scope] || time.Now().Before(d.shims.reconcileNext[scope]) {
+	if d.shims.reconcileStopped || d.shims.reconciling[scope] {
 		d.shims.mu.Unlock()
 		return
 	}
+	if cause == sessionShimReconcileCauseHeartbeatRefused || cause == sessionShimReconcileCausePollRefused {
+		if d.shimNow().Before(d.shims.reconcileRefusalNext[scope]) {
+			d.shims.mu.Unlock()
+			slog.Info("session shim: reconciliation refusal trigger paced", "scope", scope, "cause", cause)
+			return
+		}
+		d.shims.reconcileRefusalNext[scope] = d.shimNow().Add(d.sessionShimConfig().callbackTimeout())
+	}
 	d.shims.reconciling[scope] = true
-	// A refused heartbeat or poll can recur faster than a bounded pass finishes.
-	// Pace sequential passes by the existing callback unit as well, so a host
-	// cannot spin reconciliation after each completed refusal.
-	d.shims.reconcileNext[scope] = time.Now().Add(d.sessionShimConfig().callbackTimeout())
 	d.shims.wg.Add(1)
 	d.shims.mu.Unlock()
 	slog.Warn("session shim: commit-outcome reconciliation armed (shim-commit-reconciliation-2026-08-27)",
