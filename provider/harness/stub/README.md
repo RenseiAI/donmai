@@ -66,6 +66,7 @@ The child reads its scenario from the environment:
 | `DONMAI_STUB_OUTPUT_RATE` | throttle stdout, in bytes per second |
 | `DONMAI_STUB_SEED` | override the scenario seed |
 | `DONMAI_STUB_AGENT_BIN` | run a different donmai build as the child |
+| `DONMAI_STUB_TOOL_POLICY` | the tool-permission policy the harness received (recorded, not applied) |
 
 With none of them set the child runs the default scenario: announce, idle
 briefly, exit 0. The override variables apply on top of whichever source
@@ -143,6 +144,33 @@ natural way to write it and it is wrong — a 100-byte line at 20 bytes/second
 would hold the lock for the whole five-second stop grace window, starving the
 notice below past the deadline and making a refused stop look like one that was
 never delivered.
+
+### The tool policy is recorded, not applied
+
+The interactive child registers no tools: no tool registry, no MCP client, no
+shell. So the interactive tool/lifecycle profile declares the two RESTRICTION
+channels — `allowed_tools`/`disallowed_tools` and `permission_config` — as
+`no_tool_surface`: satisfied **by construction**. An agent that can invoke
+nothing has already honoured every deny-list, and the empty set of invocable
+tools is a subset of every allow-list.
+
+That is a claim, so it is made auditable. When a `Spec` carries an
+allow/deny-list, the harness projects it onto `DONMAI_STUB_TOOL_POLICY` and the
+child prints one line before the scenario's own first output:
+
+```
+stub agent: tool policy received allowed=[Read] disallowed=[Bash,Write]; honoured by construction (this agent registers no tools)
+```
+
+A session that received no policy sets no variable and prints nothing, so the
+**presence** of that line is the evidence that a policy arrived. A malformed
+value is refused (exit `70`) rather than skipped: this record exists to make the
+claim checkable, and a child that discarded it while still printing "honoured by
+construction" would be asserting exactly the thing it had lost.
+
+The GRANT channels — tool plugins, MCP servers, tool hooks — stay `unsupported`
+and still deny. "The child has no tools" is a reason a MOUNT request cannot be
+honoured, never a reason to claim it was.
 
 ### Cooperative stop
 

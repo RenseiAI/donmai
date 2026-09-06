@@ -83,7 +83,29 @@ func (p *provider) Manifest() agent.HarnessManifest {
 			// harnesses declare, not the structured oracle above.
 			ID: "stub/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
 			ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryUnsupported,
-			NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+			// The two RESTRICTION channels are satisfied by construction, and
+			// the two lines below are the whole reason ToolDeliveryNoToolSurface
+			// exists. The interactive child is the deterministic fake agent
+			// (stubagent): it prints a scripted transcript and exits. It has no
+			// tool registry, no MCP client and no shell, so there is no call
+			// site a deny-list could fail to reach and no capability an
+			// allow-list could fail to withhold. Declaring Unsupported here
+			// instead was not conservative, it was WRONG in the direction that
+			// costs a session: any caller carrying a platform-composed
+			// disallowedTools baseline — which is every interactive launch —
+			// was denied at the pre-spawn compiler with "cannot apply required
+			// entry", for a policy this child could not have violated.
+			//
+			// The claim is made auditable rather than merely asserted: the
+			// received lists are carried to the child on
+			// stubagent.EnvToolPolicy and printed as the first line of its own
+			// transcript (interactive.go's withToolPolicyEnv).
+			//
+			// The GRANT channels above and below stay Unsupported and keep
+			// denying. "The child has no tools" is a reason a MOUNT request
+			// (tool plugins, MCP servers, tool hooks) cannot be honoured — not
+			// a reason to claim it was.
+			NativeToolPolicyDelivery: agent.ToolDeliveryNoToolSurface, PermissionConfigDelivery: agent.ToolDeliveryNoToolSurface,
 			MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
 			LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
 			ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,

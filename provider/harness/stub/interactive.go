@@ -89,6 +89,13 @@ func (p *provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	if err != nil {
 		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	// PREPARED, not spec: what the child records must be what the adaptation
+	// compiler actually admitted for this session, not what the caller asked
+	// for before it ran.
+	prepared.Env, err = withToolPolicyEnv(prepared.Env, prepared)
+	if err != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 
 	handle, err := ptycli.Spawn(ctx, binary, argv, prepared, manifest)
 	if err != nil {
@@ -189,6 +196,41 @@ func withScenarioEnv(env map[string]string, config map[string]any) (map[string]s
 	if err := validateScenarioFile(out); err != nil {
 		return nil, err
 	}
+	return out, nil
+}
+
+// withToolPolicyEnv projects the tool-permission policy this session received
+// onto the child's environment, so the child can record it in its own
+// transcript (stubagent.EnvToolPolicy).
+//
+// This is the observable half of the manifest's claim. The stub's interactive
+// tool/lifecycle profile declares the native tool-policy channel satisfied by
+// construction (agent.ToolDeliveryNoToolSurface) — the child registers no
+// tools, so a deny-list has nothing left to forbid and an allow-list nothing
+// left to withhold. That claim is only auditable if the policy that arrived is
+// written down somewhere a caller can read, and the session transcript is the
+// one artifact that reaches every layer above this one.
+//
+// A session that received no policy sets nothing, so the PRESENCE of the
+// variable — and of the child's line — is itself the evidence that a policy
+// arrived. As everywhere else in this file, an explicit Spec.Env entry wins:
+// the operator who set the variable by hand is the more specific authority.
+func withToolPolicyEnv(env map[string]string, spec agent.Spec) (map[string]string, error) {
+	policy := stubagent.ToolPolicy{AllowedTools: spec.AllowedTools, DisallowedTools: spec.DisallowedTools}
+	if policy.Empty() || env[stubagent.EnvToolPolicy] != "" {
+		return env, nil
+	}
+	encoded, err := stubagent.EncodeToolPolicy(policy)
+	if err != nil {
+		return nil, err
+	}
+	// Copy rather than mutate, for the same reason withScenarioEnv does: the
+	// map may still be shared with the Spec it was built from.
+	out := make(map[string]string, len(env)+1)
+	for key, value := range env {
+		out[key] = value
+	}
+	out[stubagent.EnvToolPolicy] = encoded
 	return out, nil
 }
 

@@ -16,6 +16,7 @@ import (
 	"github.com/RenseiAI/donmai/provider/harness/opencode"
 	"github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/provider/harness/shell"
+	stubprov "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 func TestToolLifecycleAdapterMatrix(t *testing.T) {
@@ -1161,6 +1162,111 @@ func TestToolLifecycleOptionalToolSurfaceDropsWithReceiptInsteadOfDenying(t *tes
 			t.Fatalf("error = %v, want typed allowed-tools denial (an absent wire flag must not change the default)", err)
 		}
 	})
+}
+
+// --- ToolDeliveryNoToolSurface: a restriction satisfied by construction ---
+//
+// A harness whose child registers no tools at all has already honoured every
+// deny-list handed to it, so the compiler must ADMIT the entry rather than
+// take the Unsupported lane. The stub harness's interactive profile is the
+// one declaring profile, and it is the fixture here for the same reason
+// codex is the fixture for the denial cases: it is the real shipped
+// declaration, so this test breaks if the declaration is quietly withdrawn.
+//
+// The discriminating half is the second subtest: a profile that declares
+// Unsupported on the SAME channel, with the SAME spec, must still deny. A
+// test that only asserted the admission would keep passing if the compiler
+// stopped denying anything at all.
+func TestToolLifecycleNoToolSurfaceAdmitsRestrictionChannels(t *testing.T) {
+	t.Parallel()
+	profile := mustProfile(t, stubInteractiveManifest(t), agent.PromptModeHumanControlled)
+
+	t.Run("declared by construction: admitted, not denied", func(t *testing.T) {
+		t.Parallel()
+		spec := agent.Spec{
+			Interactive:     &agent.InteractiveSpec{},
+			AllowedTools:    []string{"Read"},
+			DisallowedTools: []string{"Bash", "Write"},
+		}
+		_, receipt, err := agent.AdaptToolLifecycle(spec, profile)
+		if err != nil {
+			t.Fatalf("AdaptToolLifecycle: %v", err)
+		}
+		if receipt.Decision != "ready" {
+			t.Fatalf("receipt decision = %q, want ready", receipt.Decision)
+		}
+		seen := map[agent.ToolLifecycleChannel]bool{
+			agent.ToolChannelAllowedTools:    false,
+			agent.ToolChannelDisallowedTools: false,
+		}
+		for _, entry := range receipt.Entries {
+			if _, want := seen[entry.Channel]; !want {
+				continue
+			}
+			seen[entry.Channel] = true
+			if entry.Outcome != agent.ToolOutcomeAdmitted {
+				t.Errorf("%s outcome = %q, want admitted", entry.Channel, entry.Outcome)
+			}
+			if entry.Delivery != agent.ToolDeliveryNoToolSurface {
+				t.Errorf("%s delivery = %q, want %q", entry.Channel, entry.Delivery, agent.ToolDeliveryNoToolSurface)
+			}
+			if entry.DenialCode != "" {
+				t.Errorf("%s denial code = %q, want none", entry.Channel, entry.DenialCode)
+			}
+		}
+		for channel, found := range seen {
+			if !found {
+				t.Errorf("receipt missing channel %q; entries=%+v", channel, receipt.Entries)
+			}
+		}
+	})
+
+	t.Run("the same spec on an Unsupported profile still denies", func(t *testing.T) {
+		t.Parallel()
+		unsupported := profile
+		unsupported.NativeToolPolicyDelivery = agent.ToolDeliveryUnsupported
+		spec := agent.Spec{
+			Interactive:     &agent.InteractiveSpec{},
+			DisallowedTools: []string{"Bash"},
+		}
+		_, receipt, err := agent.AdaptToolLifecycle(spec, unsupported)
+		var adaptationErr *agent.ToolAdaptationError
+		if !errors.As(err, &adaptationErr) ||
+			adaptationErr.Code != agent.ToolDenialDeliveryUnsupported ||
+			adaptationErr.Channel != agent.ToolChannelDisallowedTools {
+			t.Fatalf("error = %v, want a typed disallowed-tools delivery_unsupported denial", err)
+		}
+		if receipt.Decision != "denied" {
+			t.Fatalf("receipt decision = %q, want denied", receipt.Decision)
+		}
+	})
+
+	t.Run("the kind is a known delivery, so a profile declaring it is well formed", func(t *testing.T) {
+		t.Parallel()
+		// validateToolLifecycleProfile runs before any requirement is answered;
+		// an unregistered kind would deny as a MALFORMED PLAN, which reads as a
+		// contract bug rather than as the admission this change is about.
+		_, _, err := agent.AdaptToolLifecycle(agent.Spec{Interactive: &agent.InteractiveSpec{}}, profile)
+		if err != nil {
+			t.Fatalf("AdaptToolLifecycle on a bare interactive spec: %v", err)
+		}
+	})
+}
+
+// stubInteractiveManifest returns the stub harness's live manifest through the
+// same New() the matrix generator harvests, so this test reads the shipped
+// declaration rather than a copy of it.
+func stubInteractiveManifest(t *testing.T) agent.HarnessManifest {
+	t.Helper()
+	built, err := stubprov.New()
+	if err != nil {
+		t.Fatalf("stub New: %v", err)
+	}
+	provider, ok := built.(agent.HarnessProvider)
+	if !ok {
+		t.Fatalf("stub provider %T does not expose a manifest", built)
+	}
+	return provider.Manifest()
 }
 
 func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.PromptSessionMode) agent.ToolLifecycleProfile {

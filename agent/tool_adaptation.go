@@ -88,11 +88,41 @@ const (
 	// interactive profile, because the richer regex/containment/default-
 	// decision behavior still needs the Go round trip this lane does not run.
 	ToolDeliveryPiInteractiveLocalToolPolicy ToolDeliveryKind = "pi_interactive_local_tool_policy"
-	ToolDeliveryStructuredProviderEvents     ToolDeliveryKind = "structured_provider_events"
-	ToolDeliveryCoarsePTYEvents              ToolDeliveryKind = "coarse_pty_events"
-	ToolDeliveryStructuredEventReplay        ToolDeliveryKind = "structured_event_replay"
-	ToolDeliveryTerminalCastReplay           ToolDeliveryKind = "terminal_cast_replay"
-	ToolDeliveryHandleCleanup                ToolDeliveryKind = "handle_stop_and_resource_cleanup"
+	// ToolDeliveryNoToolSurface is the answer of a harness whose child
+	// REGISTERS NO TOOLS AT ALL on a channel that only ever RESTRICTS tool
+	// use. It is not a synonym for Unsupported and it is not a downgrade: the
+	// restriction is honoured, in full, by construction — an agent that can
+	// invoke nothing has already satisfied every deny-list, and the empty set
+	// of invocable tools is a subset of every allow-list.
+	//
+	// It is deliberately narrow, and the narrowing is what keeps it honest:
+	//
+	//   - It is only ever a truthful answer on the RESTRICTION channels
+	//     (allowed_tools, disallowed_tools, permission_config). On a GRANT
+	//     channel — mcp_server, tool_plugin, tool_hook — the caller is asking
+	//     for a capability to be MOUNTED, and "the child has no tools" is a
+	//     reason those requests are undeliverable, not a reason they are
+	//     satisfied. A profile declaring this kind on a grant channel would be
+	//     claiming a mount it never performed.
+	//   - It is a claim about the CHILD, not about the adapter. A harness may
+	//     only declare it when its child process has no tool-invocation
+	//     surface whatsoever, so there is nothing a policy could fail to be
+	//     applied to. A harness that runs tools and merely cannot configure
+	//     them still declares Unsupported and still denies — that is the
+	//     spawn-killing denial this contract exists to produce.
+	//
+	// The one declaring profile today is the stub harness's interactive
+	// (human_controlled) mode: its child is a scripted fake agent that prints
+	// a transcript and exits, with no tool registry, no MCP client and no
+	// shell. See provider/harness/stub/manifest.go, which also records the
+	// received policy in the child's own scenario transcript so the claim is
+	// observable rather than merely asserted.
+	ToolDeliveryNoToolSurface            ToolDeliveryKind = "no_tool_surface"
+	ToolDeliveryStructuredProviderEvents ToolDeliveryKind = "structured_provider_events"
+	ToolDeliveryCoarsePTYEvents          ToolDeliveryKind = "coarse_pty_events"
+	ToolDeliveryStructuredEventReplay    ToolDeliveryKind = "structured_event_replay"
+	ToolDeliveryTerminalCastReplay       ToolDeliveryKind = "terminal_cast_replay"
+	ToolDeliveryHandleCleanup            ToolDeliveryKind = "handle_stop_and_resource_cleanup"
 )
 
 // EvidenceFidelity makes headless structured events and PTY byte/coarse
@@ -820,6 +850,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge, ToolDeliveryAmpMCPConfig,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
+		ToolDeliveryNoToolSurface,
 		ToolDeliveryStructuredProviderEvents, ToolDeliveryCoarsePTYEvents, ToolDeliveryStructuredEventReplay,
 		ToolDeliveryTerminalCastReplay, ToolDeliveryHandleCleanup:
 		return true
