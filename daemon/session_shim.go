@@ -2388,6 +2388,21 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		}
 	}()
 
+	// A record whose shim process is gone with no tombstone is DECLARED, not
+	// dropped. The batch is a complete snapshot of the host, so omitting a
+	// lineage the control plane still holds is refused — and that refusal used
+	// to abort the whole composition on every start, permanently, for one dead
+	// seat. See session_shim_boot_tolerance.go for why the declaration is a
+	// quarantine rather than a tombstone.
+	staleDeclarations := sessionShimStaleLineageDeclarations(
+		result.Stale, sessionShimServedScopes(cfg), d.shimNow())
+	// declaredQuarantines collects entries a re-composition published for a
+	// lineage this boot does NOT hold at that incarnation. They belong in the
+	// live projection — the batch already carries them — but they evict
+	// nothing, because the adopted entry under the same session id, if there is
+	// one, is a DIFFERENT incarnation and is healthy.
+	var declaredQuarantines []sessionshim.QuarantinedSession
+
 	// The local generation is committed, but startup is still NOT ready. Give
 	// the composing carrier each exact fact and require its durable handoff
 	// before publishing adoptionComplete or starting registration.
@@ -2448,6 +2463,14 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			// quarantined lineage before that deadline has something to read.
 			slog.Error("session shim: durable adoption failed for one lineage; quarantining it and composing the rest of the host",
 				"session", id.String(), "error", callbackErr)
+			// Release what this lineage staged during its adoption. A mandatory
+			// carrier Snapshot staged by a lineage that is now quarantined has
+			// nothing left to resolve it — the entry never reaches the adopted
+			// set the activation pass walks — and carrier activation refuses
+			// the whole publication when ANY staged Snapshot is left over. That
+			// is how one refused lineage took durable sessions away from every
+			// other seat on the host.
+			d.cancelStagedSessionShimSnapshot(id)
 			hello := c.Hello()
 			adoptionFailures[id] = sessionshim.QuarantinedSession{
 				OrgID: id.OrgID, SessionID: id.SessionID,
@@ -2515,6 +2538,9 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		for _, quarantined := range result.Quarantined {
 			scopeSet[quarantined.OrgID] = struct{}{}
 		}
+		for _, stale := range staleDeclarations {
+			scopeSet[stale.OrgID] = struct{}{}
+		}
 		for _, terminal := range terminalOutcomes {
 			scopeSet[terminal.Identity.OrgID] = struct{}{}
 		}
@@ -2571,6 +2597,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 					batch.Quarantined = append(batch.Quarantined, quarantined)
 				}
 			}
+			for _, stale := range staleDeclarations {
+				if stale.OrgID == orgID {
+					batch.Quarantined = append(batch.Quarantined, stale)
+				}
+			}
 			for _, terminal := range terminalOutcomes {
 				if terminal.Identity.OrgID == orgID {
 					batch.Tombstoned = append(batch.Tombstoned, terminal)
@@ -2589,7 +2620,28 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 					ctx, batch, batchErr, entries, adoptionFailures)
 			}
 			if batchErr != nil {
+				// The other half of the completeness rule: the control plane
+				// still holds lineages this daemon has no adoption of at that
+				// exact incarnation. Declaring them is the only move that can
+				// satisfy a rule the daemon cannot argue with, and it is
+				// strictly narrower than withdrawing the host's durable
+				// sessions.
+				var declaredOmitted []sessionshim.QuarantinedSession
+				receipt, declaredOmitted, batchErr = d.commitBootBatchDeclaringOmittedLineages(
+					ctx, batch, batchErr, entries, adoptionFailures)
+				declaredQuarantines = append(declaredQuarantines, declaredOmitted...)
+			}
+			if batchErr != nil {
 				result.Close()
+				// Every bounded recovery is spent. ONLY a refusal whose shape
+				// says re-asking cannot help becomes the degraded posture; a
+				// transport failure, a deadline, an expired credential, an
+				// opaque status refusal or an ambiguous commit keeps its
+				// ordinary error and its ordinary consequence, because those
+				// are the failures the supervised restart path recovers from.
+				if refused := newSessionShimDurabilityRefused(orgID, batchErr); refused != nil {
+					return refused
+				}
 				return fmt.Errorf("session shim: durable adoption batch for organization %q: %w", orgID, batchErr)
 			}
 			heartbeatAckPending := d.sessionShimEnabled() && cfg.OnAdoptionPublished != nil &&
@@ -2635,6 +2687,19 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		}
 	}
 	d.shims.quarantined = result.QuarantinedProjection()
+	for _, stale := range staleDeclarations {
+		// The batch above published these; the live projection has to agree
+		// with it beat for beat, because the receiver compares every heartbeat
+		// against the snapshot the last committed batch stored and demotes a
+		// host that disagrees.
+		d.upsertShimQuarantineLocked(stale)
+	}
+	for _, declared := range declaredQuarantines {
+		// Published by a re-composition for an incarnation this boot holds no
+		// adoption of. Upserting is keyed by the full incarnation, so a live
+		// adoption of the same session at a different one is untouched.
+		d.upsertShimQuarantineLocked(declared)
+	}
 	for _, failed := range adoptionFailures {
 		// upsertShimQuarantineLocked keeps this daemon's live-state
 		// projection (§D7: visible, capacity-honest) in sync with what the
@@ -2700,11 +2765,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 
 	slog.Info("session shim: startup adoption complete",
 		"adopted", len(entries),
-		"quarantined", len(result.Quarantined)+len(adoptionFailures),
+		"quarantined", len(result.Quarantined)+len(adoptionFailures)+len(staleDeclarations),
 		"failedDurableAdoption", len(adoptionFailures),
 		"tombstoned", len(result.Tombstoned),
-		"stale", len(result.Stale),
-		"occupiedSlots", result.OccupiedSlots())
+		"staleDeclared", len(staleDeclarations),
+		"occupiedSlots", result.OccupiedSlots()+len(staleDeclarations))
 	return nil
 }
 
@@ -4395,6 +4460,7 @@ func (d *Daemon) sessionShimHeartbeatProjection(
 func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 	cfg := d.sessionShimConfig()
 	status := afclient.DaemonSessionShimStatus{OwnershipMode: sessionShimOwnershipMode(cfg), ControllerID: d.controllerID()}
+	status.DurabilityRefusal = d.sessionShimDurabilityRefusalStatus()
 	if d.shims == nil {
 		status.AdoptionComplete = !cfg.EnableAdoption
 		return status

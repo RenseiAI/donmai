@@ -354,6 +354,12 @@ type Daemon struct {
 	// the lifecycle state/spawner are closed and clears only after a newly
 	// acknowledged exact recovery heartbeat.
 	sessionShimReadinessWithdrawn atomic.Bool
+	// sessionShimDurabilityRefusal retains WHY this host's durable sessions are
+	// off when a boot adoption batch was refused unresolvably. A boolean
+	// posture with no reason on any operator surface is what sent an operator
+	// to the process log of a host that had already lost the feature — see
+	// session_shim_boot_tolerance.go.
+	sessionShimDurabilityRefusal atomic.Pointer[SessionShimDurabilityRefusal]
 
 	// readinessMu guards readinessCache; readinessResolveMu single-flights the
 	// resolution itself. The resolver is embedder code and is called under
