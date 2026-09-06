@@ -2,7 +2,9 @@ package daemon
 
 import (
 	"context"
+	"encoding/hex"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -25,7 +27,40 @@ import (
 //     into a signal that kills the fixture. That is also the honest model of
 //     the seats that wedge: a terminal UI in raw mode has signal generation
 //     off, so rung 2's interrupt reaches it as bytes.
-const wakeFixtureHarness = `stty -echo -isig; while IFS= read -r line; do printf 'ack\n'; done`
+//
+// It reports back the EXACT BYTES of each line it read, hex-encoded. Asserting
+// on "the harness produced something" would pass for rung 1 and rung 2 alike
+// and prove nothing about the difference between them, which is the property
+// rung 2 exists for.
+//
+// This fixture is CANONICAL mode: the kernel line discipline holds the pending
+// line and honours its own kill character. That is the mode in which the draft
+// assertion is meaningful, because there is a real buffer to clear.
+const wakeFixtureHarness = wakeFixtureCanonicalStty + wakeFixtureReportLoop
+
+// wakeFixtureRawHarness is NON-CANONICAL: every byte arrives as data and
+// nothing is interpreted on the way in.
+//
+// It is the fixture for the DELIVERY assertions, for two reasons. It is the
+// only mode in which the exact bytes a rung sent can be observed at all — in
+// canonical mode the kill character is consumed by the kernel, taking the
+// interrupt with it, so the two rungs become indistinguishable to the reader.
+// And it is the closer model of the seats this class actually occurs on: raw
+// full-screen terminal UIs.
+//
+// LIMIT, stated here rather than only in prose: a shell reading bytes is not a
+// TUI. Neither fixture has a line editor, so neither can prove what Ctrl-A /
+// Ctrl-K do inside one. What they prove is what this code controls — the exact
+// bytes delivered, and that a kernel-held draft is killed.
+const wakeFixtureRawHarness = wakeFixtureRawStty + wakeFixtureReportLoop
+
+const (
+	wakeFixtureCanonicalStty = `stty -echo -isig; `
+	wakeFixtureRawStty       = `stty -echo -isig -icanon min 1 time 0; `
+)
+
+const wakeFixtureReportLoop = `while IFS= read -r line; do ` +
+	`printf 'ack:'; printf '%s' "$line" | od -An -tx1 | tr -d ' \n'; printf '\n'; done`
 
 // wakeFixtureFrozenHarness never reads its terminal. It is the wedge itself:
 // alive, holding the PTY, consuming no input, emitting nothing. Writes to it
@@ -37,6 +72,10 @@ type wakeFixture struct {
 	daemon *Daemon
 	id     sessionshim.Identity
 	output <-chan []byte
+	// ctrl is the adopted controller, exposed so a test can plant ORDINARY
+	// (non-system) input in the line editor — the draft a stalled seat is
+	// likely to be sitting on.
+	ctrl *sessionshim.Controller
 }
 
 func newWakeFixture(t *testing.T, harness string) *wakeFixture {
@@ -103,12 +142,22 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	d.shims.adopted[id] = adoptedShim{shimID: "shim-wake", controller: ctrl}
 	d.shims.mu.Unlock()
 
-	return &wakeFixture{daemon: d, id: id, output: output}
+	return &wakeFixture{daemon: d, id: id, output: output, ctrl: ctrl}
 }
 
-// awaitAck waits for the fake harness to answer. A wedged harness never does,
-// so the timeout is the assertion, not a flake guard.
+// awaitAck reports whether the fake harness answered at all. A wedged harness
+// never does, so the timeout is the assertion, not a flake guard.
 func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
+	t.Helper()
+	_, ok := f.awaitLine(t, within)
+	return ok
+}
+
+// awaitLine returns the hex-encoded bytes of the next line the harness read.
+//
+// "ack:" with nothing after it means it read an EMPTY line — which is what a
+// cleared line editor submits, and the whole point of the D1 assertions.
+func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, bool) {
 	t.Helper()
 	deadline := time.After(within)
 	var seen strings.Builder
@@ -116,15 +165,32 @@ func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
 		select {
 		case data, ok := <-f.output:
 			if !ok {
-				return false
+				return seen.String(), false
 			}
 			seen.Write(data)
-			if strings.Contains(seen.String(), "ack") {
-				return true
+			text := seen.String()
+			idx := strings.Index(text, "ack:")
+			if idx < 0 {
+				continue
+			}
+			rest := text[idx+len("ack:"):]
+			// The harness terminates each report with a newline; the tty turns
+			// that into CRLF on the way out.
+			if end := strings.IndexAny(rest, "\r\n"); end >= 0 {
+				return strings.TrimSpace(rest[:end]), true
 			}
 		case <-deadline:
-			return false
+			return seen.String(), false
 		}
+	}
+}
+
+// primeWakeLedger gives a fixture the rung-1 history the ladder guarantees, so
+// a rung-2 test exercises rung 2 rather than the ordering refusal.
+func (f *wakeFixture) primeWakeLedger(t *testing.T) {
+	t.Helper()
+	if _, err := f.daemon.noteWakeMutation(f.id, "", "session.wake"); err != nil {
+		t.Fatalf("prime wake ledger: %v", err)
 	}
 }
 
@@ -291,25 +357,86 @@ func TestResolveWakeControllerUnknownSession(t *testing.T) {
 // Delivery against a live fake harness
 // ---------------------------------------------------------------------------
 
-func TestSessionWakeVerbsReachAResponsiveHarness(t *testing.T) {
+// Each rung must deliver ITS OWN byte sequence, and the fixture reports the
+// exact bytes so the two rungs cannot pass each other's assertion.
+//
+// The fixture runs with `-isig`, so the interrupt arrives as DATA and is
+// therefore observable — which is the only reason rung 2's distinguishing
+// mechanism can be pinned at all.
+func TestSessionWakeVerbsDeliverTheirOwnByteSequence(t *testing.T) {
 	tests := []struct {
-		name string
-		op   string
+		name    string
+		op      string
+		wantHex string
 	}{
-		{"wake delivers a keystroke", "session.wake"},
-		{"restart-harness delivers interrupt then keystroke", "session.restart-harness"},
+		{
+			// Ctrl-A, Ctrl-K, then the submit. No interrupt.
+			name: "wake clears the line and submits", op: "session.wake", wantHex: "15010b",
+		},
+		{
+			// The interrupt FIRST, then the same clear-and-submit.
+			name: "restart-harness interrupts, then clears and submits",
+			op:   "session.restart-harness", wantHex: "0315010b",
+		},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			f := newWakeFixture(t, wakeFixtureHarness)
+			f := newWakeFixture(t, wakeFixtureRawHarness)
+			// Rung 2 refuses to precede a wake, so give it the rung-1 history
+			// the ladder guarantees. Rung 1 gets no such preamble.
+			if tc.op == "session.restart-harness" {
+				f.primeWakeLedger(t)
+			}
 			m := wakeMutation(t, tc.op, "m-1", sessionWakeParams{
 				SessionID: f.id.SessionID, OrgID: f.id.OrgID, Reason: "wedge",
 			})
 			if err := f.daemon.applyOneMutation(m); err != nil {
 				t.Fatalf("applyOneMutation(%s) = %v, want applied", tc.op, err)
 			}
-			if !f.awaitAck(t, 10*time.Second) {
-				t.Fatalf("%s: harness produced no output; the keystroke never reached the terminal", tc.op)
+			got, ok := f.awaitLine(t, 10*time.Second)
+			if !ok {
+				t.Fatalf("%s: harness produced no line; the keystrokes never reached the terminal", tc.op)
+			}
+			if got != tc.wantHex {
+				t.Fatalf("%s delivered %q, want %q", tc.op, got, tc.wantHex)
+			}
+		})
+	}
+}
+
+// Neither rung may submit a draft the seat never finished.
+//
+// A bare Enter carries no content of its own but SUBMITS whatever the terminal
+// already holds, and a stalled seat is the seat most likely to be holding a
+// half-typed line. Both rungs therefore clear the line editor first; this
+// plants a real draft as ordinary input and proves it is never read back.
+func TestSessionWakeVerbsNeverSubmitAnUnsentDraft(t *testing.T) {
+	for _, op := range []string{"session.wake", "session.restart-harness"} {
+		t.Run(op, func(t *testing.T) {
+			f := newWakeFixture(t, wakeFixtureHarness)
+			if op == "session.restart-harness" {
+				f.primeWakeLedger(t)
+			}
+
+			// A half-composed line: ordinary (human) input, deliberately with
+			// no terminating CR, exactly as an abandoned draft would sit.
+			const draft = "half typed draft"
+			if err := f.ctrl.WriteInput([]byte(draft)); err != nil {
+				t.Fatalf("plant draft: %v", err)
+			}
+
+			m := wakeMutation(t, op, "m-1", sessionWakeParams{
+				SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+			})
+			if err := f.daemon.applyOneMutation(m); err != nil {
+				t.Fatalf("applyOneMutation(%s) = %v", op, err)
+			}
+			got, ok := f.awaitLine(t, 10*time.Second)
+			if !ok {
+				t.Fatalf("%s: harness produced no line", op)
+			}
+			if strings.Contains(got, hex.EncodeToString([]byte(draft))) {
+				t.Fatalf("%s submitted the unsent draft: harness read %q", op, got)
 			}
 		})
 	}
@@ -327,6 +454,9 @@ func TestSessionWakeVerbsDeliverToAFrozenHarnessWithoutRecovery(t *testing.T) {
 	for _, op := range []string{"session.wake", "session.restart-harness"} {
 		t.Run(op, func(t *testing.T) {
 			f := newWakeFixture(t, wakeFixtureFrozenHarness)
+			if op == "session.restart-harness" {
+				f.primeWakeLedger(t)
+			}
 			m := wakeMutation(t, op, "m-1", sessionWakeParams{
 				SessionID: f.id.SessionID, OrgID: f.id.OrgID, Reason: "wedge",
 			})
@@ -340,6 +470,88 @@ func TestSessionWakeVerbsDeliverToAFrozenHarnessWithoutRecovery(t *testing.T) {
 	}
 }
 
+// Rung 2 may not be the first thing a seat ever receives.
+//
+// The control plane decides which rung to send, but the mutation channel can
+// lose an ack or reorder a delivery, and an interrupt arriving as a seat's
+// first contact is the escalation the ladder exists to prevent. The ordering
+// is therefore enforced where the write happens, not only where it is decided.
+func TestSessionRestartHarnessRefusesBeforeAWake(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+	m := wakeMutation(t, "session.restart-harness", "m-1", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	err := f.daemon.applyOneMutation(m)
+	if err == nil {
+		t.Fatal("restart-harness on an unwoken seat = nil error, want refusal")
+	}
+	if !errors.Is(err, errRestartBeforeWake) {
+		t.Fatalf("err = %v, want errRestartBeforeWake", err)
+	}
+	// A refusal must not have written anything into the terminal.
+	if got, ok := f.awaitLine(t, 2*time.Second); ok {
+		t.Fatalf("refused rung 2 still delivered %q", got)
+	}
+
+	// After a wake, the same rung is accepted.
+	if err := f.daemon.applyOneMutation(wakeMutation(t, "session.wake", "m-2", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})); err != nil {
+		t.Fatalf("wake = %v", err)
+	}
+	if _, ok := f.awaitLine(t, 10*time.Second); !ok {
+		t.Fatal("wake produced no line")
+	}
+	if err := f.daemon.applyOneMutation(wakeMutation(t, "session.restart-harness", "m-3", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})); err != nil {
+		t.Fatalf("restart-harness after a wake = %v, want applied", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b" {
+		t.Fatalf("restart-harness after a wake delivered %q (ok=%v), want 0315010b", got, ok)
+	}
+}
+
+// The mutation channel is at-least-once, so the SAME mutation can arrive twice.
+//
+// Re-applying a kill is harmless. Re-applying an interrupt is not: the second
+// one lands on a seat that may by then have recovered and started a real turn.
+// A redelivery must therefore be a successful no-op, not a second write.
+func TestSessionWakeVerbsAreIdempotentUnderRedelivery(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+
+	wake := wakeMutation(t, "session.wake", "m-wake", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(wake); err != nil {
+		t.Fatalf("wake = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
+		t.Fatalf("wake delivered %q (ok=%v), want 15010b", got, ok)
+	}
+
+	restart := wakeMutation(t, "session.restart-harness", "m-restart", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(restart); err != nil {
+		t.Fatalf("restart = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "0315010b" {
+		t.Fatalf("restart delivered %q (ok=%v), want 0315010b", got, ok)
+	}
+
+	// Both re-presented, byte-identical, as a lost ack would re-present them.
+	// Each must ACK applied — the mutation did take effect, on an earlier beat.
+	for _, m := range []PendingMutation{wake, restart} {
+		if err := f.daemon.applyOneMutation(m); err != nil {
+			t.Fatalf("redelivery of %s = %v, want a successful no-op", m.Op, err)
+		}
+	}
+	if got, ok := f.awaitLine(t, 2*time.Second); ok {
+		t.Fatalf("redelivery wrote to the terminal again: %q", got)
+	}
+}
+
 // Neither verb may end the session. A wedged seat still holds a worktree and an
 // identity worth keeping, and the whole point of putting these rungs BELOW the
 // stop rail is that they are recoverable attempts, not terminations.
@@ -347,6 +559,9 @@ func TestSessionWakeVerbsRetainTheShim(t *testing.T) {
 	for _, op := range []string{"session.wake", "session.restart-harness"} {
 		t.Run(op, func(t *testing.T) {
 			f := newWakeFixture(t, wakeFixtureHarness)
+			if op == "session.restart-harness" {
+				f.primeWakeLedger(t)
+			}
 			m := wakeMutation(t, op, "m-1", sessionWakeParams{
 				SessionID: f.id.SessionID, OrgID: f.id.OrgID,
 			})

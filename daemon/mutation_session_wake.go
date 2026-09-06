@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"log/slog"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/attachwire"
@@ -31,16 +32,27 @@ import (
 //	session.restart-harness  rung 2 — an interrupt first, to unwind whatever
 //	                         turn the harness is stalled inside, then a wake.
 //
-// BOTH CARRY ZERO CONTENT. They are keystrokes, not messages: a bare Enter and
-// an interrupt byte. Nothing here can inject text into a terminal, which keeps
-// the remediation rail incapable by construction of the thing the input rail
-// is carefully restricted from doing.
+// BOTH CARRY ZERO CONTENT. They are keystrokes, not messages: a line clear, a
+// bare Enter, and an interrupt byte. Nothing here can inject text into a
+// terminal, which keeps the remediation rail incapable by construction of the
+// thing the input rail is carefully restricted from doing.
+//
+// And zero content is not by itself enough, because an Enter SUBMITS what is
+// already there. Both rungs therefore clear the line editor before they submit
+// (clearKeystroke), so neither can send a draft the seat never finished. That
+// is a property of the sequence, not of the bytes, and it is tested directly.
 //
 // BOTH RETAIN THE SHIM. Neither verb stops, terminates or respawns anything.
 // They write through the adopted shim's existing controller, so the session
 // keeps its identity, its PTY, its adoption generation and its worktree. A
 // stop remains a separate, later decision made by the control plane, never an
 // escalation this file performs on its own.
+//
+// THE ORDER IS ENFORCED HERE, NOT ONLY DECIDED UPSTREAM. The control plane
+// chooses the rung, but the mutation channel is at-least-once and can reorder
+// or replay a delivery. A per-session ledger (wakeLedger) refuses rung 2 on a
+// seat that was never woken, and dedupes a replayed mutation id so a second
+// interrupt is never written into a terminal that may since have recovered.
 //
 // WHAT IS DELIBERATELY NOT HERE. Rung 2 does not re-exec the harness child
 // under the retained shim. That primitive does not exist: the shim owns its
@@ -52,16 +64,44 @@ import (
 // is judged where it must be, at the consumer, by watching terminal output
 // resume. If it does not, the control plane's ladder escalates on its own.
 
-// wakeKeystroke is a bare Enter — one carriage return, no content.
+// clearKeystroke empties whatever holds the pending line, before anything is
+// submitted: Ctrl-U, then Ctrl-A, then Ctrl-K.
+//
+// THIS IS NOT OPTIONAL, AND IT IS THE WHOLE POINT OF THE RUNG. A bare Enter is
+// a SUBMIT. It carries no content of its own, but its EFFECT is to send
+// whatever the terminal is already holding — and the seat this verb is aimed
+// at is exactly the seat most likely to be holding a half-composed line or an
+// abandoned paste. Enter alone would take content this rail never wrote and
+// cause it to be sent, which is the harm the input rail is carefully
+// restricted from doing, reached sideways.
+//
+// WHY THREE BYTES AND NOT THE OPERATOR RAIL'S TWO. The established nudge rail
+// sends Ctrl-A + Ctrl-K, which are LINE-EDITOR commands: they are interpreted
+// by a full-screen application's own editor, and that is the right choice for
+// the terminal UIs this class occurs in. But when the pending line is held by
+// the KERNEL line discipline instead — a seat in canonical mode — Ctrl-A and
+// Ctrl-K are not commands at all, they are ordinary data. A test with a real
+// draft planted in a canonical-mode fixture proved the consequence: the two
+// bytes were APPENDED to the draft and the whole thing was then submitted,
+// which is strictly worse than sending nothing.
+//
+// Ctrl-U is the line discipline's own kill character (VKILL), so it clears the
+// case the editor commands cannot reach, and readline-style editors bind it to
+// kill-line as well. The sequence is therefore a superset of the nudge rail's:
+// it clears a cooked-mode buffer AND a TUI's editor, and each byte is inert
+// where the other applies.
+var clearKeystroke = []byte{0x15, 0x01, 0x0b}
+
+// submitKeystroke is a bare Enter — one carriage return, no content.
 //
 // The shim's last hop recognises a SYSTEM-authority bare Enter and gives it
 // the treatment it needs: a dangling bracketed-paste region is closed first so
 // the byte cannot be swallowed as literal pasted text, and the write is paced
 // away from any immediately preceding input so a terminal UI's paste-detection
-// heuristic does not coalesce and eat it. Sending a bare Enter is therefore
-// strictly better than sending our own richer sequence — it is the one shape
-// that path is built to protect.
-var wakeKeystroke = []byte{'\r'}
+// heuristic does not coalesce and eat it. Keeping the submit a BARE Enter — a
+// separate write from the clear that precedes it — is what earns that pacing:
+// the last hop only paces a write that is exactly one CR.
+var submitKeystroke = []byte{'\r'}
 
 // interruptKeystroke is the terminal interrupt character (ETX, ^C).
 //
@@ -83,6 +123,12 @@ var interruptKeystroke = []byte{0x03}
 //
 // A package var, not a const, so tests exercise the real two-write path
 // without spending wall-clock time on it.
+//
+// It sleeps inside the mutation apply loop. That is safe today — the session
+// branch returns before the config lock is taken — but it is per-mutation
+// latency in the heartbeat handler, so a batch carrying several rungs pays it
+// serially. The ladder makes that unlikely (one rung per freeze per beat)
+// rather than impossible.
 var interruptSettleGap = 250 * time.Millisecond
 
 // errShimAmbiguous reports a bare session id that names shim-backed sessions
@@ -157,11 +203,127 @@ func writeWakeKeystroke(ctrl *sessionshim.Controller, data []byte) error {
 	return ctrl.WriteAttributedInput([]byte(attachwire.SystemNudgeUserID), data)
 }
 
-// applySessionWake is rung 1: deliver exactly one wake keystroke.
+// writeClearThenSubmit empties the line editor and only then submits.
 //
-// Bounded by construction — one keystroke per mutation, no retry loop, no
-// escalation. Re-poking a seat that stayed frozen is the control plane's
-// decision to make by enqueueing the next rung, not this handler's to take.
+// Two writes, never one concatenated buffer: the last hop paces a write that
+// is exactly one CR, and a clear glued onto the front of it would forfeit that
+// pacing for the byte that needs it most.
+func writeClearThenSubmit(ctrl *sessionshim.Controller) error {
+	if err := writeWakeKeystroke(ctrl, clearKeystroke); err != nil {
+		return fmt.Errorf("deliver line clear: %w", err)
+	}
+	if err := writeWakeKeystroke(ctrl, submitKeystroke); err != nil {
+		return fmt.Errorf("deliver submit: %w", err)
+	}
+	return nil
+}
+
+// ---------------------------------------------------------------------------
+// The per-session rung ledger.
+//
+// The mutation channel is AT-LEAST-ONCE: an ack lost between the heartbeat
+// response and the next poll re-presents the same mutation. That is harmless
+// for a kill, which is idempotent, and NOT harmless for an interrupt — a second
+// ^C lands on a seat that may by then have recovered and started a real turn,
+// abandoning it. So redelivery is deduped here, by mutation id, rather than
+// assumed away.
+//
+// The ledger also enforces the one ordering property the ladder depends on: a
+// seat must have been WOKEN before it is interrupted. The control plane decides
+// which rung to send; this refuses to let a lost or reordered delivery turn
+// rung 2 into the first thing a seat ever receives.
+// ---------------------------------------------------------------------------
+
+// wakeLedgerMaxSessions bounds the ledger. It is remediation state for seats
+// currently believed wedged, which is a handful at most; the cap exists so a
+// pathological mutation stream cannot grow it without limit.
+const wakeLedgerMaxSessions = 256
+
+// wakeLedgerMaxMutationIDs is how many recent mutation ids are remembered per
+// session for dedupe. Redelivery arrives within a beat or two of the original,
+// so a short memory is sufficient and a long one only delays reclamation.
+const wakeLedgerMaxMutationIDs = 8
+
+// wakeLedger is the per-daemon rung ledger. Its zero value is ready to use;
+// the map is created on first write.
+type wakeLedger struct {
+	mu      sync.Mutex
+	entries map[sessionshim.Identity]*wakeLedgerEntry
+}
+
+type wakeLedgerEntry struct {
+	woken       bool
+	appliedIDs  []string
+	lastTouched time.Time
+}
+
+// errRestartBeforeWake refuses rung 2 on a seat that has not been woken.
+var errRestartBeforeWake = errors.New("no wake has been delivered to this session; rung 1 must precede rung 2")
+
+// noteWakeMutation records a rung against a session and reports whether this
+// exact mutation was already applied.
+//
+// Returns (alreadyApplied, error). An ordering violation is an error; a
+// redelivery is not — it is a successful no-op, because the mutation DID take
+// effect, just on an earlier beat.
+func (d *Daemon) noteWakeMutation(id sessionshim.Identity, mutationID, op string) (bool, error) {
+	d.wakeLedger.mu.Lock()
+	defer d.wakeLedger.mu.Unlock()
+	if d.wakeLedger.entries == nil {
+		d.wakeLedger.entries = make(map[sessionshim.Identity]*wakeLedgerEntry)
+	}
+	entry := d.wakeLedger.entries[id]
+	if entry == nil {
+		entry = &wakeLedgerEntry{}
+		d.wakeLedger.evictLocked()
+		d.wakeLedger.entries[id] = entry
+	}
+	if mutationID != "" {
+		for _, applied := range entry.appliedIDs {
+			if applied == mutationID {
+				return true, nil
+			}
+		}
+	}
+	if op == "session.restart-harness" && !entry.woken {
+		return false, errRestartBeforeWake
+	}
+	if op == "session.wake" {
+		entry.woken = true
+	}
+	if mutationID != "" {
+		entry.appliedIDs = append(entry.appliedIDs, mutationID)
+		if len(entry.appliedIDs) > wakeLedgerMaxMutationIDs {
+			entry.appliedIDs = entry.appliedIDs[len(entry.appliedIDs)-wakeLedgerMaxMutationIDs:]
+		}
+	}
+	entry.lastTouched = time.Now()
+	return false, nil
+}
+
+// evictLocked drops the least recently touched entry once the cap is reached.
+func (l *wakeLedger) evictLocked() {
+	if len(l.entries) < wakeLedgerMaxSessions {
+		return
+	}
+	var oldestID sessionshim.Identity
+	var oldest time.Time
+	first := true
+	for id, entry := range l.entries {
+		if first || entry.lastTouched.Before(oldest) {
+			oldestID, oldest, first = id, entry.lastTouched, false
+		}
+	}
+	if !first {
+		delete(l.entries, oldestID)
+	}
+}
+
+// applySessionWake is rung 1: clear the line editor, then submit.
+//
+// Bounded PER MUTATION — one clear and one submit, no retry loop, no
+// escalation to another rung. The ladder itself is the control plane's to
+// climb; this handler only ever performs the rung it was handed.
 func (d *Daemon) applySessionWake(m PendingMutation) error {
 	params, err := decodeSessionWakeParams("session.wake", m.Params)
 	if err != nil {
@@ -171,8 +333,17 @@ func (d *Daemon) applySessionWake(m PendingMutation) error {
 	if err != nil {
 		return fmt.Errorf("session.wake: %w", err)
 	}
-	if err := writeWakeKeystroke(ctrl, wakeKeystroke); err != nil {
-		return fmt.Errorf("session.wake: deliver wake keystroke: %w", err)
+	already, err := d.noteWakeMutation(ctrl.Identity(), m.ID, "session.wake")
+	if err != nil {
+		return fmt.Errorf("session.wake: %w", err)
+	}
+	if already {
+		slog.Info("[daemon-sync] session wake already applied (redelivery)",
+			"session", params.SessionID, "mutation", m.ID)
+		return nil
+	}
+	if err := writeClearThenSubmit(ctrl); err != nil {
+		return fmt.Errorf("session.wake: %w", err)
 	}
 	slog.Info("[daemon-sync] session wake delivered",
 		"session", params.SessionID, "reason", params.Reason)
@@ -181,7 +352,7 @@ func (d *Daemon) applySessionWake(m PendingMutation) error {
 
 // applySessionRestartHarness is rung 2: interrupt the stalled turn, then wake.
 //
-// It reports applied when both keystrokes reached the shim. That is a receipt
+// It reports applied when every keystroke reached the shim. That is a receipt
 // for DELIVERY, never a claim that the seat recovered — recovery is only ever
 // provable by terminal output resuming, which the control plane observes
 // directly and which is what advances or escalates the ladder.
@@ -194,12 +365,21 @@ func (d *Daemon) applySessionRestartHarness(m PendingMutation) error {
 	if err != nil {
 		return fmt.Errorf("session.restart-harness: %w", err)
 	}
+	already, err := d.noteWakeMutation(ctrl.Identity(), m.ID, "session.restart-harness")
+	if err != nil {
+		return fmt.Errorf("session.restart-harness: %w", err)
+	}
+	if already {
+		slog.Info("[daemon-sync] session harness restart already applied (redelivery)",
+			"session", params.SessionID, "mutation", m.ID)
+		return nil
+	}
 	if err := writeWakeKeystroke(ctrl, interruptKeystroke); err != nil {
 		return fmt.Errorf("session.restart-harness: deliver interrupt: %w", err)
 	}
 	time.Sleep(interruptSettleGap)
-	if err := writeWakeKeystroke(ctrl, wakeKeystroke); err != nil {
-		return fmt.Errorf("session.restart-harness: deliver wake keystroke: %w", err)
+	if err := writeClearThenSubmit(ctrl); err != nil {
+		return fmt.Errorf("session.restart-harness: %w", err)
 	}
 	slog.Info("[daemon-sync] session harness interrupt+wake delivered",
 		"session", params.SessionID, "reason", params.Reason)
