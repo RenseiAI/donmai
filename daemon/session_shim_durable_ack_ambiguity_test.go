@@ -333,6 +333,11 @@ func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
 		return nil
 	})
 	d := f.daemon
+	d.shims.mu.Lock()
+	entry := d.shims.adopted[f.id]
+	entry.readoptedAtUnixNano = d.shimNow().UnixNano()
+	d.shims.adopted[f.id] = entry
+	d.shims.mu.Unlock()
 
 	// The first platform-originated loss retries successfully. The real shim
 	// controller owns a goroutine, so seed the preceding completed cycles below

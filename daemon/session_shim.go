@@ -1491,6 +1491,7 @@ type sessionShimState struct {
 	// reconciliation loop parked in backoff exits on it instead of outliving
 	// the daemon. Protected by mu; the channel itself is assigned once.
 	reconciling      map[string]bool
+	reconcileNext    map[string]time.Time
 	reconcileStop    chan struct{}
 	reconcileStopped bool
 	// reconverging is the live, operator-visible condition for a scope whose
@@ -1539,6 +1540,7 @@ func newSessionShimState() *sessionShimState {
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
 		ambiguityCycles:      make(map[sessionshim.Identity]int),
 		reconciling:          make(map[string]bool),
+		reconcileNext:        make(map[string]time.Time),
 		reconcileStop:        make(chan struct{}),
 	}
 }

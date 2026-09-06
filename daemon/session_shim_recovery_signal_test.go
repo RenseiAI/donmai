@@ -1,8 +1,11 @@
 package daemon
 
 import (
+	"context"
 	"errors"
 	"net/http"
+	"net/http/httptest"
+	"sync/atomic"
 	"testing"
 )
 
@@ -22,8 +25,26 @@ func TestSessionShimRecoverySignals(t *testing.T) {
 			}
 		})
 	}
-	if !isSessionShimAdoptionNotReady(&PollHTTPError{Status: http.StatusServiceUnavailable, Body: "SESSION_SHIM_ADOPTION_NOT_READY"}) {
-		t.Fatal("session-shim adoption-not-ready poll response did not request reconciliation")
+	var heartbeatCalls atomic.Int32
+	heartbeat := &HeartbeatService{opts: HeartbeatOptions{OnSessionShimRevisionStale: func() { heartbeatCalls.Add(1) }}}
+	heartbeat.noteSessionShimRevisionStaleBeat(&heartbeatHTTPError{status: http.StatusBadRequest, body: "sessionShim projection rejected"})
+	if got := heartbeatCalls.Load(); got != 1 {
+		t.Fatalf("heartbeat reconciliation calls = %d, want 1", got)
+	}
+
+	var pollCalls atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "SESSION_SHIM_ADOPTION_NOT_READY", http.StatusServiceUnavailable)
+	}))
+	defer srv.Close()
+	poll := NewPollService(PollOptions{
+		WorkerID: "worker", RuntimeJWT: "jwt", OrchestratorURL: srv.URL,
+		OnWork:                        func(PollWorkItem) error { return nil },
+		OnSessionShimAdoptionNotReady: func() { pollCalls.Add(1) },
+	})
+	poll.pollOnce(context.Background())
+	if got := pollCalls.Load(); got != 1 {
+		t.Fatalf("poll reconciliation calls = %d, want 1", got)
 	}
 }
 

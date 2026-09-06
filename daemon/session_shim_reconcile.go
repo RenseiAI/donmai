@@ -174,11 +174,15 @@ func (d *Daemon) scheduleSessionShimReconciliation(scope, cause string) {
 		return
 	}
 	d.shims.mu.Lock()
-	if d.shims.reconcileStopped || d.shims.reconciling[scope] {
+	if d.shims.reconcileStopped || d.shims.reconciling[scope] || time.Now().Before(d.shims.reconcileNext[scope]) {
 		d.shims.mu.Unlock()
 		return
 	}
 	d.shims.reconciling[scope] = true
+	// A refused heartbeat or poll can recur faster than a bounded pass finishes.
+	// Pace sequential passes by the existing callback unit as well, so a host
+	// cannot spin reconciliation after each completed refusal.
+	d.shims.reconcileNext[scope] = time.Now().Add(d.sessionShimConfig().callbackTimeout())
 	d.shims.wg.Add(1)
 	d.shims.mu.Unlock()
 	slog.Warn("session shim: commit-outcome reconciliation armed (shim-commit-reconciliation-2026-08-27)",
@@ -215,7 +219,9 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 	// ResolveNow intentionally bypasses the cache and can serialize behind a
 	// slow resolver. Resolve on this bounded repair goroutine instead, before
 	// its refresh and republish make the next heartbeat eligible to recover.
-	_ = d.sessionShimReadinessGate(sessionShimReadinessResolveNow)
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+	}
 	// A pass that ends because the CONTROL PLANE ITSELF reported a revision it
 	// has moved to is not an exhausted pass — it is a pass that learned a new
 	// fact and has to be spent against it. Measured on an installed host: four
