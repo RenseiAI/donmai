@@ -462,6 +462,17 @@ output pump; the shim's PTY host then stops reading the master (`ptyhost`
 `write(2)` exactly as it would against any terminal whose reader fell behind.
 Nothing is dropped, nothing is reordered, and the shim's ring is not driven to
 evict — which is what used to force a Gap and a large replay on the next resume.
+
+That last clause is true **while the consumer recovers inside the bound**, which
+is the case this is built for. It is not true at the drop. By the time the gate
+engages, roughly `budget + socket buffers + subscriber queue` (~40 MiB at
+defaults) has flowed through the shim's 8 MiB ring, so the ring floor is well
+ahead of the durable cursor; if the drop bound is crossed, the re-adoption
+resumes from the composing carrier's cursor, which the ring can no longer serve,
+and the stream continues with an explicit ATTRIBUTED Gap (§D5). That is a
+transcript hole, and it is the correct disposition — vastly better than a dead
+seat — but anyone tuning the drop bound should know the hold is lossless and the
+drop is not.
 The shim's own pause is bounded too (`ptyhost.DefaultOutputPauseBound`, 15
 minutes, deliberately longer than the controller's drop bound) so a consumer that
 neither drains nor disconnects cannot hold a live harness forever; while it is

@@ -73,6 +73,14 @@ const (
 // write, which is exactly what a real terminal does to a program that outruns
 // its reader. Nothing is lost and nothing is reordered.
 //
+// The losslessness is a property of the PAUSE, not of everything downstream of
+// it. A subscriber that goes away — because a consumer above it finally gave up
+// — resumes this reader with its own queue discarded and the ring already
+// turned over by whatever flowed through it before the gate engaged, so the
+// NEXT subscription may well be a ring miss and take an attributed Gap. That is
+// §D5 working as designed; it is worth stating because "nothing is lost" is
+// otherwise easy to read as a promise about the whole lifetime.
+//
 // The zero value of each field takes the documented default.
 type OutputFlowControl struct {
 	// HighWaterBytes is the per-subscriber queue depth that pauses reading.

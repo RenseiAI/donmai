@@ -243,7 +243,6 @@ func (r *Registry) Remove(id Identity) error {
 // correlation matches the expected incarnation. It is the terminal path's safe
 // alternative to legacy identity-only Remove when duplicate records coexist.
 func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch uint64) error {
-	removed := false
 	entries, err := r.Scan()
 	if err != nil {
 		return err
@@ -260,15 +259,22 @@ func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch ui
 		if err := root.Remove(entry.Name); err != nil && !errors.Is(err, fs.ErrNotExist) {
 			return fmt.Errorf("sessionshim: remove exact discovery record: %w", err)
 		}
-		removed = true
-	}
-	if !removed {
-		return nil
 	}
 	// The back-pressure sidecar describes a live reader for THIS incarnation.
 	// Withdrawing the record without it leaves a ~1 KiB file per incarnation
 	// behind for the life of the host, and — worse — leaves a degradation
 	// published for a lineage this daemon has stopped owning.
+	//
+	// Unconditional, deliberately: a shim that withdrew its own record first
+	// makes the scan above match nothing, and gating the sidecar on that match
+	// would leak it in exactly the ordering where nobody else cleans it up.
+	// Removal is idempotent, so the ordinary no-op case costs one unlink
+	// attempt.
+	//
+	// It does not stop a LIVE shim republishing the file afterwards: the
+	// publisher is driven by that shim's own gate and knows nothing about a
+	// daemon-side withdrawal. Nothing reads the sidecar, so that is cosmetic
+	// today; a reader would have to check the record beside it.
 	return r.RemoveStreamFlow(id, shimID, processEpoch)
 }
 

@@ -362,3 +362,85 @@ func TestStartNeverMutatesTheCallersFlowControl(t *testing.T) {
 		}
 	}
 }
+
+// TestWithdrawingARecordWithdrawsItsBackPressureState pins the janitor.
+//
+// The sidecar describes a LIVE reader that has stopped reading. Leaving it
+// beside a withdrawn record leaks a file per incarnation for the life of the
+// host and — the part that actually matters — leaves a degradation published for
+// a lineage the daemon has stopped owning, which is a fact that is no longer
+// true of anything.
+//
+// The withdrawal is unconditional on the record scan matching, and the second
+// case is why: a shim that withdrew its own record first makes the scan match
+// nothing, and gating the sidecar on that match leaks it in exactly the
+// ordering where nobody else cleans up. Restoring the `if !removed { return }`
+// guard turns that case RED.
+func TestWithdrawingARecordWithdrawsItsBackPressureState(t *testing.T) {
+	t.Parallel()
+	id := Identity{OrgID: "org-flow", SessionID: "session-flow"}
+	const shimID = "shim-withdraw"
+	const epoch = uint64(3)
+
+	newState := func() StreamFlowControl {
+		return StreamFlowControl{
+			SchemaVersion: streamFlowSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID: shimID, ProcessEpoch: epoch,
+			Paused: true, PendingBytes: 4242, ObservedAtUnixNano: time.Now().UnixNano(),
+		}
+	}
+	newRecord := func() Record {
+		return Record{
+			SchemaVersion: RecordSchemaVersion,
+			OrgID:         id.OrgID, SessionID: id.SessionID,
+			ShimID: shimID, ProcessEpoch: epoch,
+			PID: os.Getpid(), ProcessStartedAt: time.Now().UnixNano(),
+			SocketPath:  filepath.Join("/tmp", id.SocketName()),
+			ProtocolMin: 1, ProtocolMax: 3, Phase: "running",
+			CreatedAtUnixNano: time.Now().UnixNano(),
+		}
+	}
+
+	for _, tc := range []struct {
+		name       string
+		withRecord bool
+	}{
+		{name: "the record is still there", withRecord: true},
+		{name: "the shim already withdrew its own record", withRecord: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			registry, _ := flowTestRegistry(t)
+			if tc.withRecord {
+				if err := registry.Put(newRecord()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := registry.PutStreamFlow(newState()); err != nil {
+				t.Fatal(err)
+			}
+			published, err := registry.StreamFlow(id, shimID, epoch)
+			if err != nil || !published.Degraded() {
+				t.Fatalf("published state = %+v err=%v, want a live degradation to withdraw", published, err)
+			}
+
+			if err := registry.RemoveIncarnation(id, shimID, epoch); err != nil {
+				t.Fatalf("withdraw the incarnation: %v", err)
+			}
+
+			after, err := registry.StreamFlow(id, shimID, epoch)
+			if err != nil {
+				t.Fatalf("read the sidecar after withdrawal: %v", err)
+			}
+			if after != (StreamFlowControl{}) {
+				t.Fatalf("the back-pressure state outlived the record it belonged to: %+v — "+
+					"a lineage this daemon no longer owns is still published as degraded", after)
+			}
+			// Idempotent: both the shim's teardown and a daemon janitor reach it.
+			if err := registry.RemoveIncarnation(id, shimID, epoch); err != nil {
+				t.Fatalf("withdrawal is not idempotent: %v", err)
+			}
+		})
+	}
+}
