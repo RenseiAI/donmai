@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1387,14 +1388,14 @@ func guardShimChildLogOnce(logPath string) bool {
 		slog.Warn(
 			"session shim: redact child log", //nolint:gosec // structured slog handler escapes values
 			"path", logPath,
-			"error", err,
+			"error", strconv.Quote(err.Error()),
 		)
 	}
 	if err := capShimChildLog(f, size); err != nil {
 		slog.Warn(
 			"session shim: cap child log", //nolint:gosec // structured slog handler escapes values
 			"path", logPath,
-			"error", err,
+			"error", strconv.Quote(err.Error()),
 		)
 	}
 	return true
