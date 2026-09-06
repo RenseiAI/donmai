@@ -211,6 +211,11 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 		delete(d.shims.reconciling, scope)
 		d.shims.mu.Unlock()
 	}()
+	// A poll refusal must not synchronously wait on the readiness resolver:
+	// ResolveNow intentionally bypasses the cache and can serialize behind a
+	// slow resolver. Resolve on this bounded repair goroutine instead, before
+	// its refresh and republish make the next heartbeat eligible to recover.
+	_ = d.sessionShimReadinessGate(sessionShimReadinessResolveNow)
 	// A pass that ends because the CONTROL PLANE ITSELF reported a revision it
 	// has moved to is not an exhausted pass — it is a pass that learned a new
 	// fact and has to be spent against it. Measured on an installed host: four

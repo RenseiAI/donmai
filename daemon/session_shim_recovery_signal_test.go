@@ -29,8 +29,11 @@ func TestSessionShimRecoverySignals(t *testing.T) {
 
 func TestClassifySessionShimCarrierLoss(t *testing.T) {
 	t.Parallel()
-	if got := classifySessionShimCarrierLoss(errors.Join(errors.New("persist durable HostFrame: context deadline exceeded"), ErrSessionShimCarrierLostPlatform)); got != shimStreamCarrierLostPlatform {
-		t.Fatalf("platform persist error cause = %d, want platform carrier loss", got)
+	if got := classifySessionShimCarrierLoss(ErrSessionShimCarrierLostPlatform); got != shimStreamCarrierLostPlatform {
+		t.Fatalf("platform sentinel cause = %d, want platform carrier loss", got)
+	}
+	if got := classifySessionShimCarrierLoss(errors.New("persist durable HostFrame: context deadline exceeded")); got != shimStreamCarrierLostPlatform {
+		t.Fatalf("platform persistence literal cause = %d, want platform carrier loss", got)
 	}
 	if got := classifySessionShimCarrierLoss(errors.New("carrier refused output")); got != shimStreamCarrierLost {
 		t.Fatalf("ordinary carrier error cause = %d, want ordinary carrier loss", got)

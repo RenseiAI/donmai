@@ -2828,6 +2828,10 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// still re-adopted, however many cycles it has cost; only the pipeline
 		// settles the lineage.
 		if d.noteDurableAckAmbiguityCycle(id) >= maxConsecutiveDurableAckAmbiguityCycles {
+			if cause == shimStreamCarrierLostPlatform {
+				d.quarantineLostSessionShim(id, entry, lostReason, sessionShimDurableAckCyclesSpentDetail)
+				return
+			}
 			attemptBudget = 1
 			spentDetail = sessionShimDurableAckCyclesSpentDetail
 		}
