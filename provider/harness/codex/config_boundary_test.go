@@ -63,6 +63,38 @@ func TestCodexConfigBoundaryRemovalPinsParentIdentityAndPersistsFailure(t *testi
 	}
 }
 
+func TestCodexConfigBoundaryRemovalRetainsHomesWithRollouts(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		rolloutName string
+		wantHome    bool
+	}{
+		{name: "ordinary cleanup", rolloutName: "other.jsonl", wantHome: false},
+		{name: "resumable rollout", rolloutName: "rollout-2026-09-06T12-00-00-thread-live.jsonl", wantHome: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			boundary, err := newCodexConfigBoundary(t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("new boundary: %v", err)
+			}
+			stateDir := filepath.Join(boundary.home, codexSessionStateSubdir, "2026", "09", "06")
+			if err := os.MkdirAll(stateDir, 0o700); err != nil {
+				t.Fatalf("create state directory: %v", err)
+			}
+			if err := os.WriteFile(filepath.Join(stateDir, tc.rolloutName), []byte(`{"type":"session_meta"}`), 0o600); err != nil {
+				t.Fatalf("write session state: %v", err)
+			}
+			if err := boundary.remove(); err != nil {
+				t.Fatalf("boundary remove: %v", err)
+			}
+			_, statErr := os.Stat(boundary.home)
+			if got := statErr == nil; got != tc.wantHome {
+				t.Fatalf("home exists after cleanup = %t, want %t (err=%v)", got, tc.wantHome, statErr)
+			}
+		})
+	}
+}
+
 func TestCodexConfigBoundaryHardLinksHostSessionAuth(t *testing.T) {
 	root := t.TempDir()
 	hostHome := filepath.Join(root, "host")

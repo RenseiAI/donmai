@@ -99,6 +99,23 @@ func (r *Registry) Put(rec Record) error {
 	return r.publish(rec.Identity().RecordName(), data)
 }
 
+// PutResumeKey records the first durable Codex rollout for a live shim. The
+// record remains the source of truth through adoption and quarantine.
+func (r *Registry) PutResumeKey(id Identity, key ResumeKey) error {
+	if err := key.Validate(); err != nil {
+		return err
+	}
+	rec, err := r.Get(id)
+	if err != nil {
+		return fmt.Errorf("sessionshim: get record for resume key: %w", err)
+	}
+	if rec.ResumeKey != nil {
+		return nil
+	}
+	rec.ResumeKey = &key
+	return r.Put(rec)
+}
+
 // PutTombstone durably publishes a per-incarnation terminal tombstone AND
 // removes only the matching live discovery record, in that order.
 //
@@ -108,6 +125,13 @@ func (r *Registry) Put(rec Record) error {
 // and tombstone correlation, while a different live incarnation under the same
 // lifecycle identity remains visible rather than being erased.
 func (r *Registry) PutTombstone(t Tombstone) error {
+	// The terminal record replaces the live record. Preserve the resume key
+	// before withdrawing that record, so an exited session remains resumable.
+	if t.ResumeKey == nil {
+		if rec, err := r.Get(t.Identity()); err == nil && rec.ShimID == t.ShimID && rec.ProcessEpoch == t.ProcessEpoch {
+			t.ResumeKey = rec.ResumeKey
+		}
+	}
 	data, err := t.encode()
 	if err != nil {
 		return err

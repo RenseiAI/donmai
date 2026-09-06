@@ -235,6 +235,9 @@ func spawnNamedInteractivePTY(
 		}
 		return nil, errors.Join(wrapped, stopErr)
 	}
+	// finishNamingLiveInteractiveThread waits through Codex's rollout-flush
+	// race, so the resume key is recorded only after the native state exists.
+	recordResumeKey(spec.Env["CODEX_HOME"], spec.SessionName, spec.Env)
 	return handle, nil
 }
 

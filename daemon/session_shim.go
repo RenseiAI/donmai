@@ -1677,6 +1677,28 @@ func (c SessionShimConfig) orgIDForSession(spec SessionSpec) string {
 	return c.orgID()
 }
 
+// sessionResumeKey reads the non-secret native resume locator for the local
+// status endpoint. A missing record simply has no resumable live session.
+func (d *Daemon) sessionResumeKey(sessionID, organizationID string) (*sessionshim.ResumeKey, bool) {
+	if sessionID == "" {
+		return nil, false
+	}
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		return nil, false
+	}
+	orgID := organizationID
+	if orgID == "" {
+		orgID = d.sessionShimConfig().orgID()
+	}
+	record, err := registry.Get(sessionshim.Identity{OrgID: orgID, SessionID: sessionID})
+	if err != nil || record.ResumeKey == nil {
+		return nil, false
+	}
+	key := *record.ResumeKey
+	return &key, true
+}
+
 // SessionShimReadoptionPolicy bounds how a daemon re-adopts a live shim whose
 // controller stream ended without a terminal observation.
 //

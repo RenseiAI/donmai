@@ -663,7 +663,11 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, detail)
+	copy := *detail
+	if key, found := s.daemon.sessionResumeKey(copy.SessionID, copy.OrganizationID); found {
+		copy.ResumeKey = key
+	}
+	writeJSON(w, http.StatusOK, &copy)
 }
 
 // handleSessionStop handles POST /api/daemon/sessions/<id>/stop — the

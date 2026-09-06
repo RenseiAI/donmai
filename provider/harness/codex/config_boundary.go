@@ -320,6 +320,13 @@ func (b *codexConfigBoundary) remove() error {
 			b.cleanupErr = fmt.Errorf("refusing to remove Codex home: %w", err)
 			return
 		}
+		// A rollout is Codex's resume key. This cleanup path is the normal
+		// lifecycle owner, so it must enforce the same retention rule as the
+		// post-crash orphan sweep: process termination is never authority to
+		// delete resumable conversation state.
+		if hasCodexRollout(clean) {
+			return
+		}
 		// Harvest whatever this session's own cache/ subtree fetched that the
 		// host-level cache did not already have, so the NEXT session skips
 		// that fetch too. Best-effort and skipped entirely when
@@ -333,6 +340,25 @@ func (b *codexConfigBoundary) remove() error {
 		}
 	})
 	return b.cleanupErr
+}
+
+// hasCodexRollout reports whether home contains a persisted Codex rollout.
+// Only a rollout grants retention: an empty sessions directory is ordinary
+// scratch state and remains eligible for the boundary's normal cleanup.
+func hasCodexRollout(home string) bool {
+	root := filepath.Join(home, codexSessionStateSubdir)
+	found := false
+	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
+		if err != nil || entry.IsDir() {
+			return nil
+		}
+		if strings.HasPrefix(entry.Name(), "rollout-") && strings.HasSuffix(entry.Name(), ".jsonl") {
+			found = true
+			return filepath.SkipAll
+		}
+		return nil
+	})
+	return found
 }
 
 func sameResolvedPath(a, b string) bool {

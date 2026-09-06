@@ -298,6 +298,34 @@ func TestPutTombstoneWithdrawsTheLiveRecord(t *testing.T) {
 	}
 }
 
+func TestRegistryResumeKeySurvivesTerminalPublication(t *testing.T) {
+	t.Parallel()
+
+	reg := newTestRegistry(t)
+	id := testIdentity()
+	if err := reg.Put(testRecord(t, id, reg)); err != nil {
+		t.Fatalf("Put: %v", err)
+	}
+	key := ResumeKey{CodexHome: "/tmp/donmai-codex-home-test", ThreadID: "thread-live"}
+	if err := reg.PutResumeKey(id, key); err != nil {
+		t.Fatalf("PutResumeKey: %v", err)
+	}
+	live, err := reg.Get(id)
+	if err != nil || live.ResumeKey == nil || *live.ResumeKey != key {
+		t.Fatalf("live resume key = %+v, err=%v", live.ResumeKey, err)
+	}
+	if err := reg.PutTombstone(Tombstone{
+		SchemaVersion: RecordSchemaVersion, OrgID: id.OrgID, SessionID: id.SessionID,
+		ShimID: "shim-1", ProcessEpoch: 1, GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}); err != nil {
+		t.Fatalf("PutTombstone: %v", err)
+	}
+	tombstone, err := reg.GetTombstone(id)
+	if err != nil || tombstone.ResumeKey == nil || *tombstone.ResumeKey != key {
+		t.Fatalf("terminal resume key = %+v, err=%v", tombstone.ResumeKey, err)
+	}
+}
+
 func TestTombstonesPersistPerIncarnationAndLegacyAPIsRefuseAmbiguity(t *testing.T) {
 	t.Parallel()
 
