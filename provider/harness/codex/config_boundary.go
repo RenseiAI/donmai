@@ -342,23 +342,11 @@ func (b *codexConfigBoundary) remove() error {
 	return b.cleanupErr
 }
 
-// hasCodexRollout reports whether home contains a persisted Codex rollout.
-// Only a rollout grants retention: an empty sessions directory is ordinary
-// scratch state and remains eligible for the boundary's normal cleanup.
+// hasCodexRollout shares the orphan sweep's conservative session-state
+// predicate. A lifecycle cleanup must never be less protective than a sweep.
 func hasCodexRollout(home string) bool {
-	root := filepath.Join(home, codexSessionStateSubdir)
-	found := false
-	_ = filepath.WalkDir(root, func(path string, entry os.DirEntry, err error) error {
-		if err != nil || entry.IsDir() {
-			return nil
-		}
-		if strings.HasPrefix(entry.Name(), "rollout-") && strings.HasSuffix(entry.Name(), ".jsonl") {
-			found = true
-			return filepath.SkipAll
-		}
-		return nil
-	})
-	return found
+	hasState, err := dirHasEntries(filepath.Join(home, codexSessionStateSubdir))
+	return err != nil || hasState
 }
 
 func sameResolvedPath(a, b string) bool {

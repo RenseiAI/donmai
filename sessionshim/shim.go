@@ -720,6 +720,10 @@ func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
 	if tombstoned {
 		return nil
 	}
+	var resumeKey *ResumeKey
+	if previous, err := s.registry.Get(s.id); err == nil && previous.ShimID == s.shimID && previous.ProcessEpoch == s.epoch {
+		resumeKey = previous.ResumeKey
+	}
 	rec := Record{
 		SchemaVersion:     RecordSchemaVersion,
 		OrgID:             s.id.OrgID,
@@ -736,6 +740,7 @@ func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
 		Phase:             phase,
 		WorkareaPath:      s.workarea,
 		WorkareaRoot:      s.workareaRoot,
+		ResumeKey:         resumeKey,
 		CreatedAtUnixNano: s.now().UnixNano(),
 	}
 	if !deadline.IsZero() {

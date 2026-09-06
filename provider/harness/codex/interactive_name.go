@@ -274,16 +274,17 @@ func startNamedInteractiveAppServer(
 // verify. Called by the caller ONLY for the fresh (non-attach) path, after
 // the PTY has been spawned — see startNamedInteractiveAppServer's doc
 // comment for why the sequencing must be this way around.
-func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, server *namedInteractiveAppServer, timeout time.Duration) error {
+func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, server *namedInteractiveAppServer, timeout time.Duration) (string, error) {
 	if server == nil {
-		return errors.New("codex interactive name bootstrap connection is not open")
+		return "", errors.New("codex interactive name bootstrap connection is not open")
 	}
 	client := server.getClient()
 	if client == nil {
-		return errors.New("codex interactive name bootstrap connection is not open")
+		return "", errors.New("codex interactive name bootstrap connection is not open")
 	}
-	if err := awaitAndNameLiveThreadWithRequest(ctx, spec, client.awaitNotification, client.request, timeout); err != nil {
-		return err
+	threadID, err := awaitAndNameLiveThreadWithRequestAndRetryThreadID(ctx, spec, client.awaitNotification, client.request, timeout, defaultRolloutReadRetryPolicy)
+	if err != nil {
+		return "", err
 	}
 	// Naming succeeded and the PTY already has its own independent
 	// connection to the app-server (the one that created the thread just
@@ -291,7 +292,7 @@ func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, ser
 	// peer is still fully alive, instead of leaving it open for the life of
 	// the session — see namedInteractiveAppServer.closeClient's doc comment.
 	_ = server.closeClient()
-	return nil
+	return threadID, nil
 }
 
 type namedThreadRequest func(context.Context, string, map[string]any, time.Duration) (json.RawMessage, error)
@@ -410,12 +411,20 @@ func awaitAndNameLiveThreadWithRequestAndRetry(
 	timeout time.Duration,
 	retry rolloutReadRetryPolicy,
 ) error {
+	_, err := awaitAndNameLiveThreadWithRequestAndRetryThreadID(ctx, spec, awaitNotification, request, timeout, retry)
+	return err
+}
+
+func awaitAndNameLiveThreadWithRequestAndRetryThreadID(
+	ctx context.Context, spec agent.Spec, awaitNotification notificationWaiter, request namedThreadRequest,
+	timeout time.Duration, retry rolloutReadRetryPolicy,
+) (string, error) {
 	if spec.SessionName == "" {
-		return errors.New("codex interactive live-thread naming requires a session name")
+		return "", errors.New("codex interactive live-thread naming requires a session name")
 	}
 	raw, err := awaitNotification(ctx, "thread/started", timeout)
 	if err != nil {
-		return fmt.Errorf("thread/started: %w", err)
+		return "", fmt.Errorf("thread/started: %w", err)
 	}
 	var started struct {
 		Thread struct {
@@ -423,20 +432,20 @@ func awaitAndNameLiveThreadWithRequestAndRetry(
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(raw, &started); err != nil {
-		return fmt.Errorf("thread/started: decode notification: %w", err)
+		return "", fmt.Errorf("thread/started: decode notification: %w", err)
 	}
 	if started.Thread.ID == "" {
-		return errors.New("thread/started: empty thread id in notification")
+		return "", errors.New("thread/started: empty thread id in notification")
 	}
 	if _, err := request(ctx, "thread/name/set", map[string]any{
 		"threadId": started.Thread.ID,
 		"name":     spec.SessionName,
 	}, timeout); err != nil {
-		return fmt.Errorf("thread/name/set: %w", err)
+		return "", fmt.Errorf("thread/name/set: %w", err)
 	}
 	readRaw, err := requestThreadReadTolerant(ctx, request, started.Thread.ID, timeout, retry)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var readback struct {
 		Thread struct {
@@ -445,15 +454,15 @@ func awaitAndNameLiveThreadWithRequestAndRetry(
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(readRaw, &readback); err != nil {
-		return fmt.Errorf("thread/read after name set: decode response: %w", err)
+		return "", fmt.Errorf("thread/read after name set: decode response: %w", err)
 	}
 	if readback.Thread.ID != started.Thread.ID || readback.Thread.Name != spec.SessionName {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"thread/read after name set: got id %q name %q, want id %q name %q",
 			readback.Thread.ID, readback.Thread.Name, started.Thread.ID, spec.SessionName,
 		)
 	}
-	return nil
+	return started.Thread.ID, nil
 }
 
 // codexThreadIDPattern matches the shape of a codex-native thread id (the
