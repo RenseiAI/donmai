@@ -226,7 +226,13 @@ func withToolPolicyEnv(env map[string]string, spec agent.Spec) (map[string]strin
 	}
 	// Copy rather than mutate, for the same reason withScenarioEnv does: the
 	// map may still be shared with the Spec it was built from.
-	out := make(map[string]string, len(env)+1)
+	//
+	// The capacity hint is a bare len(env), not len(env)+1: a hint is only a
+	// hint (the map grows on its own for the one extra key), and arithmetic on
+	// a caller-supplied length inside make() is an allocation-size-overflow
+	// shape a static analyser flags — correctly in general, even though no
+	// Spec.Env can approach the bound here.
+	out := make(map[string]string, len(env))
 	for key, value := range env {
 		out[key] = value
 	}
