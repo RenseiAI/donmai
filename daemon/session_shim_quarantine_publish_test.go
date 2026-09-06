@@ -131,7 +131,15 @@ func TestEveryQuarantineMutationPublishes(t *testing.T) {
 	// quarantined lineage was tombstoned then beat `quarantined=[]` against a
 	// row still holding `[X]` at the same revision — refused, and demoted to
 	// draining, on every beat until a restart republished.
-	mutators := []string{"upsertShimQuarantineLocked", "withdrawQuarantinedLineageAfterDurableHandoff"}
+	// The absent-attestation withdrawal is the third: it removes a lineage the
+	// composer has discharged as unobservable, and a beat that stopped naming
+	// it without a republish disagrees with the last committed batch exactly
+	// the way the tombstone withdrawal used to.
+	mutators := []string{
+		"upsertShimQuarantineLocked",
+		"withdrawQuarantinedLineageAfterDurableHandoff",
+		"withdrawAttestedSessionShimLineage",
+	}
 	const (
 		publishes = "publishSessionShimProjection"
 		assembles = "completeSessionShimAdoptionBatch"

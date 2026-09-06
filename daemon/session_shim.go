@@ -1430,6 +1430,28 @@ type sessionShimState struct {
 	// reconcile's many call sites cannot double-report one tombstone and a
 	// polling caller cannot amplify one refusal into a burst of commits.
 	reportingTerminal map[shimIncarnation]sessionShimTerminalReport
+	// absenceProofs retains the unobservability observation this daemon already
+	// made for an incarnation whose discovery record it has since withdrawn, so
+	// a refused report retries without re-probing. The DURABLE copy of the same
+	// fact is the registry's absence sidecar, which is what makes the retry
+	// survive a restart — see session_shim_absent_attestation_producer.go.
+	absenceProofs map[shimIncarnation]sessionShimAbsenceProof
+	// afterFirstAbsenceObservation, when set, runs between the two separated
+	// readings the absence probe requires. Nil in every production daemon: it
+	// exists so a test can make a process come back, or its record change,
+	// inside the exact window the probe is there to catch. Set once, under mu,
+	// before the pass that reads it.
+	afterFirstAbsenceObservation func(shimIncarnation)
+	// absenceLiveness, when set, replaces the OS-backed reading of a recorded
+	// process identity in the absence probe. Nil in every production daemon: it
+	// exists so a test can script the misreads the probe is built to survive —
+	// a reading that ERRORS, and a live process that reads gone once and alive
+	// on the re-read — neither of which can be produced from the real process
+	// table (darwin folds four errnos onto "no such process" internally, and a
+	// hidepid/namespace ENOENT needs a host this test does not have). It is the
+	// same seam, for the same reason, as launchProcess above. Set once, under
+	// mu, before the pass that reads it.
+	absenceLiveness func(sessionshim.ProcessIdentity) (bool, error)
 	// afterTombstoneFetch, when set, runs in a reconcile pass between its
 	// tombstone read and its claim. Nil in every production daemon: it exists so
 	// a test can hold passes inside the exact window a loaded runner opens on
@@ -1547,6 +1569,7 @@ func newSessionShimState() *sessionShimState {
 		forwarded:            make(map[sessionshim.Identity]uint64),
 		correlations:         make(map[shimIncarnation]sessionShimAdoptionCorrelation),
 		reportingTerminal:    make(map[shimIncarnation]sessionShimTerminalReport),
+		absenceProofs:        make(map[shimIncarnation]sessionShimAbsenceProof),
 		fences:               make(map[string]sessionshim.Fence),
 		fenceRequests:        make(map[string]sessionshim.FenceRequest),
 		batchReceipts:        make(map[string]SessionShimAdoptionBatchReceipt),
@@ -2415,14 +2438,6 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		}
 	}()
 
-	// A record whose shim process is gone with no tombstone is DECLARED, not
-	// dropped. The batch is a complete snapshot of the host, so omitting a
-	// lineage the control plane still holds is refused — and that refusal used
-	// to abort the whole composition on every start, permanently, for one dead
-	// seat. See session_shim_boot_tolerance.go for why the declaration is a
-	// quarantine rather than a tombstone.
-	staleDeclarations := sessionShimStaleLineageDeclarations(
-		result.Stale, sessionShimServedScopes(cfg), d.shimNow())
 	// declaredQuarantines collects entries a re-composition published for a
 	// lineage this boot does NOT hold at that incarnation. They belong in the
 	// live projection — the batch already carries them — but they evict
@@ -2552,6 +2567,46 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		}
 		terminalOutcomes = append(terminalOutcomes, evidence)
 	}
+
+	// A stale record is the OTHER thing this pass can prove and could not
+	// report: sessionshim.Adopt files one only after proving the recorded
+	// process identity is not running and finding no tombstone, which is §D10's
+	// shim-absent case exactly. Discharging it here — before the batch is
+	// composed — is what lets that batch legitimately omit the lineage. Before
+	// this, the stale set was logged and dropped: the composer kept an active
+	// recovery obligation for a lineage this daemon had stopped reporting, and
+	// the restart fence it held had no discharge path at all.
+	//
+	// Whatever cannot be discharged comes back and is still owed to the
+	// composer; nothing here fails the boot.
+	result.Stale = d.attestAbsentStaleSessionShims(ctx, registry, result.Stale)
+	// And the discharges a PREVIOUS incarnation of this daemon withdrew but
+	// never got accepted. Their records are no longer discovery records, so
+	// Adopt cannot have classified them stale above and nothing else on this
+	// host can name them; without this pass the composer keeps an active
+	// obligation for each one and refuses every later complete batch that omits
+	// it. This is the half of the withdrawal that makes it survivable.
+	d.resubmitWithdrawnSessionShimAbsences(ctx, registry)
+
+	// AFTER the discharges above, never before them. What remains in
+	// result.Stale is exactly the set this daemon still OWES the composer: a
+	// record whose shim process is gone with no tombstone, which the absence
+	// producer could not attest away. Those are DECLARED rather than dropped,
+	// because the batch is a complete snapshot of the host and omitting a
+	// lineage the control plane still holds is refused — the refusal that used
+	// to abort the whole composition on every start, permanently, for one dead
+	// seat. See session_shim_boot_tolerance.go for why the declaration is a
+	// quarantine rather than a tombstone, and why it is made only for a scope
+	// this daemon actually composes a batch for.
+	//
+	// Reading result.Stale any earlier would re-declare, as a live quarantine,
+	// every lineage the discharge above had just retired — re-creating the
+	// recovery obligation it discharged and re-charging its capacity slot on
+	// the very same boot, in a batch that also carries the absent attestation
+	// which retired it. The two passes are one ordered pair: discharge what can
+	// be proven absent, declare only what is left.
+	staleDeclarations := sessionShimStaleLineageDeclarations(
+		result.Stale, sessionShimServedScopes(cfg), d.shimNow())
 
 	batchReceipts := make(map[string]SessionShimAdoptionBatchReceipt)
 	if cfg.OnAdoptionBatch != nil {
