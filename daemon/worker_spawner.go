@@ -50,6 +50,21 @@ type SpawnerOptions struct {
 	// BaseEnv is the environment injected into every worker process.
 	BaseEnv map[string]string
 
+	// DaemonControlURL returns the base URL of the control API the spawning
+	// daemon is serving. Its result is exported to every worker as
+	// EnvDaemonControlURL, overriding anything BaseEnv or the operator's own
+	// environment carries.
+	//
+	// It is a function, not a string, because the answer is not knowable when
+	// the spawner is constructed: the listener may still be binding, and an
+	// ephemeral port is only decided by the kernel. It is consulted once per
+	// spawn.
+	//
+	// Nil, or a func returning "", leaves the variable unset — the worker then
+	// falls back to its own default, which is right only for a daemon on the
+	// well-known port.
+	DaemonControlURL func() string
+
 	// OnPreSpawn is an optional hook invoked once per spawn, immediately
 	// before the child process is exec'd. It receives the final SessionSpec
 	// and the env slice that would otherwise be exec'd, and returns the env
@@ -829,13 +844,7 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	if s.opts.ShimSpawn == nil {
 		return nil, false, nil
 	}
-	env := composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
-		"DONMAI_SESSION_ID":    spec.SessionID,
-		"DONMAI_REPOSITORY":    spec.Repository,
-		"DONMAI_REPOSITORY_ID": spec.RepositoryID,
-		"DONMAI_REF":           spec.Ref,
-		"DONMAI_PROJECT_ID":    project.ID,
-	})
+	env := composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
 	// OnPreSpawn is the credential rail, and a shim-backed session needs it for
 	// exactly the same reason a direct one does: the harness cannot start without
 	// the credentials the hook resolves. Skipping it for shim sessions would make
@@ -1073,13 +1082,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
-	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, map[string]string{
-		"DONMAI_SESSION_ID":    spec.SessionID,
-		"DONMAI_REPOSITORY":    spec.Repository,
-		"DONMAI_REPOSITORY_ID": spec.RepositoryID,
-		"DONMAI_REF":           spec.Ref,
-		"DONMAI_PROJECT_ID":    project.ID,
-	})
+	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
 
 	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
 	// observe direct-child exit without closing a pump mid-buffer, while still
@@ -1737,6 +1740,41 @@ func (s *WorkerSpawner) DrainContext(ctx context.Context) error {
 		case <-ticker.C:
 		}
 	}
+}
+
+// daemonOwnedEnv is the set of variables the DAEMON states about a spawn, as
+// opposed to the ones it merely passes along. It is composed last, so it wins
+// over both SpawnerOptions.BaseEnv and SessionSpec.Env.
+//
+// The control URL belongs in exactly this set. A worker's fallback is the
+// well-known port, which is a correct guess for precisely one daemon on a host
+// and a silent, mute failure for every other: the child dials a port nothing is
+// listening on, fails preflight, and exits before it has anywhere to report
+// that. Inheriting the operator's own DONMAI_DAEMON_URL is not a fix either —
+// it makes the child's target depend on how the daemon happened to be launched.
+// The spawning daemon knows the answer; it states it.
+//
+// Embedders that genuinely need a different target (a cloud sandbox pointing
+// the worker at an authenticated remote endpoint) still override it in
+// OnPreSpawn, which runs after this composition.
+func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig) map[string]string {
+	projectID := ""
+	if project != nil {
+		projectID = project.ID
+	}
+	env := map[string]string{
+		"DONMAI_SESSION_ID":    spec.SessionID,
+		"DONMAI_REPOSITORY":    spec.Repository,
+		"DONMAI_REPOSITORY_ID": spec.RepositoryID,
+		"DONMAI_REF":           spec.Ref,
+		"DONMAI_PROJECT_ID":    projectID,
+	}
+	if s.opts.DaemonControlURL != nil {
+		if url := strings.TrimSpace(s.opts.DaemonControlURL()); url != "" {
+			env[EnvDaemonControlURL] = url
+		}
+	}
+	return env
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by
