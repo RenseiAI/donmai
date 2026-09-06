@@ -115,6 +115,14 @@ func (s *Server) Start() (<-chan error, error) {
 		return nil, fmt.Errorf("listen %q: %w", s.httpd.Addr, err)
 	}
 	s.addr = listener.Addr().String()
+	// Publish the address that was really bound, before anything can be
+	// spawned against it. Every worker this daemon starts is told this value,
+	// and it is the only place the truth exists when the configured port is
+	// ephemeral (0) or when this is a named instance deliberately not on the
+	// well-known port.
+	if s.daemon != nil {
+		s.daemon.PublishControlAddr(s.addr)
+	}
 	errCh := make(chan error, 1)
 	go func() {
 		if err := s.httpd.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {

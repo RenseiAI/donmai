@@ -420,6 +420,11 @@ type Daemon struct {
 	// HTTP API at /api/daemon/sessions/<id>.
 	sessionDetails *sessionDetailStore
 
+	// controlURL is the base URL of the local control API above, published by
+	// Server.Start once the listener has bound. Workers this daemon spawns are
+	// told this address explicitly — see control_url.go.
+	controlURL atomic.Pointer[string]
+
 	// routingTraces is the in-process record of cross-provider
 	// scheduler decisions. The /api/daemon/routing/* surface reads
 	// this; future wave wires the scheduler's RecordDecision hook
@@ -994,6 +999,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 		spawnerOpts.BaseEnv["DONMAI_WORKER_ID"] = d.workerID
 	}
 	spawnerOpts.BaseEnv["DONMAI_ORCHESTRATOR_URL"] = cfg.Orchestrator.URL
+	// Tell every worker this daemon spawns where this daemon actually lives.
+	// Resolved per spawn rather than snapshotted here: the control listener may
+	// still be binding an ephemeral port at this point, and ControlURL is the
+	// accessor that knows the difference between "bound" and "configured".
+	if spawnerOpts.DaemonControlURL == nil {
+		spawnerOpts.DaemonControlURL = d.ControlURL
+	}
 	// Default WorktreeParentDir to the same statepath-resolved worktrees
 	// directory the spawned `donmai agent run` worker uses when no
 	// --worktree-dir override is passed (afcli/agent_run.go). Keeping the

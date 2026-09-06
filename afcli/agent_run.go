@@ -42,9 +42,15 @@ import (
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-// DefaultAgentRunDaemonURL is the local control HTTP address the
+// DefaultAgentRunDaemonURL is the local control HTTP address the default
 // daemon binds to (127.0.0.1:7734). The `donmai agent run` subcommand
 // fetches its session detail from <DefaultAgentRunDaemonURL>/api/daemon/sessions/<id>.
+//
+// It is a LAST resort, for a worker started by hand against the default
+// daemon. A daemon-spawned worker is told its parent's real address in
+// daemon.EnvDaemonControlURL and never reaches this constant — which matters
+// because a named daemon instance binds a port that is deliberately not this
+// one, and a worker that falls back here would dial a port nothing serves.
 const DefaultAgentRunDaemonURL = "http://127.0.0.1:7734"
 
 // agentRunOpts collects the per-invocation flags the runner consumes.
@@ -149,7 +155,7 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 	cmd.Flags().StringVar(&opts.sessionID, "session-id", "",
 		"Session ID to run (default: $DONMAI_SESSION_ID)")
 	cmd.Flags().StringVar(&opts.daemonURL, "daemon-url", "",
-		"Daemon control URL (default: $DONMAI_DAEMON_URL or http://127.0.0.1:7734)")
+		"Daemon control URL (default: $DONMAI_DAEMON_URL, which the spawning daemon sets, or http://127.0.0.1:7734)")
 	cmd.Flags().StringVar(&opts.worktree, "worktree-dir", "",
 		"Per-session worktree parent directory (default: ~/.donmai/worktrees)")
 	cmd.Flags().BoolVar(&opts.preserveWT, "preserve-worktree", true,
@@ -173,6 +179,39 @@ func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
 	return 0
 }
 
+// Daemon-URL provenance strings. They are part of the preflight error a
+// failed worker leaves behind, so they name the SOURCE, not the value: an
+// address printed on its own cannot tell whoever reads the log whether this
+// process was pointed at it or fell back to it.
+const (
+	daemonURLSourceFlag           = "from --daemon-url"
+	daemonURLSourceEnv            = "from $" + daemon.EnvDaemonControlURL
+	daemonURLSourceBuiltinDefault = "built-in default; the spawning daemon set no $" +
+		daemon.EnvDaemonControlURL + ", so a daemon on any other port is unreachable from here"
+)
+
+// resolveAgentRunDaemonURL picks the control address this worker dials and
+// reports where it came from.
+//
+// Precedence is unchanged — flag, then environment, then the well-known
+// default. What is new is the third answer being labelled as the guess it is.
+// A worker spawned by a daemon should never reach it: the daemon states its own
+// address (daemon.EnvDaemonControlURL). When it does reach it, the fallback is
+// only ever right for a daemon on the well-known port, and the failure that
+// follows on any other one is a connection refused with no hint as to why —
+// which is exactly the silence this label exists to break.
+func resolveAgentRunDaemonURL(flagValue string, lookupEnv func(string) string) (url, source string) {
+	if v := strings.TrimSpace(flagValue); v != "" {
+		return v, daemonURLSourceFlag
+	}
+	if lookupEnv != nil {
+		if v := strings.TrimSpace(lookupEnv(daemon.EnvDaemonControlURL)); v != "" {
+			return v, daemonURLSourceEnv
+		}
+	}
+	return DefaultAgentRunDaemonURL, daemonURLSourceBuiltinDefault
+}
+
 // runAgentRun is the testable entry point for the `agent run` command.
 // Cobra-free; takes opts directly so tests can drive it with a fake
 // daemon HTTP server.
@@ -186,14 +225,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return preflightErr("missing session id: pass --session-id or set DONMAI_SESSION_ID (the daemon spawner sets this automatically)")
 	}
 
-	// 2. Resolve the daemon URL.
-	daemonURL := strings.TrimSpace(opts.daemonURL)
-	if daemonURL == "" {
-		daemonURL = strings.TrimSpace(os.Getenv("DONMAI_DAEMON_URL"))
-	}
-	if daemonURL == "" {
-		daemonURL = DefaultAgentRunDaemonURL
-	}
+	// 2. Resolve the daemon URL, keeping the provenance: which of the three
+	// sources answered decides whether a connection failure below is an
+	// operator mistake or this process guessing at an address nobody gave it.
+	daemonURL, daemonURLSource := resolveAgentRunDaemonURL(opts.daemonURL, os.Getenv)
 
 	// 2b. Resolve the optional daemon-control bearer token. In a cloud
 	// sandbox the provisioner points DONMAI_DAEMON_URL at an authenticated
@@ -214,12 +249,14 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		"agent run: starting",
 		"sessionId", sessionID,
 		"daemonUrl", daemonURL,
+		"daemonUrlSource", daemonURLSource,
 	)
 
 	// 4. Fetch session detail from the daemon (3-attempt exp backoff).
 	detail, err := fetchSessionDetail(runCtx, &http.Client{Timeout: 10 * time.Second}, daemonURL, sessionID, daemonToken)
 	if err != nil {
-		return preflightErr(fmt.Sprintf("fetch session detail: %v", err))
+		return preflightErr(fmt.Sprintf(
+			"fetch session detail from %s (%s): %v", daemonURL, daemonURLSource, err))
 	}
 	logger.Info(
 		"agent run: session detail fetched",
@@ -525,7 +562,7 @@ func fetchSessionDetail(ctx context.Context, client *http.Client, baseURL, sessi
 			}
 		}
 	}
-	return nil, fmt.Errorf("fetch session detail: after %d attempts: %w", maxAttempts, lastErr)
+	return nil, fmt.Errorf("after %d attempts: %w", maxAttempts, lastErr)
 }
 
 // permanentFetchError signals a 4xx response from the daemon — no
