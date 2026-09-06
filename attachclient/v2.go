@@ -341,14 +341,22 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 		return nil, errors.New("attachclient: v2 resume disposition does not match the authenticated carrier")
 	}
 	dialCtx, cancelDial := context.WithTimeout(ctx, cfg.DialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, cfg.AttachURL, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(dialCtx, cfg.AttachURL, &websocket.DialOptions{
 		HTTPClient:   cfg.HTTPClient,
 		HTTPHeader:   http.Header{"Authorization": {"Bearer " + token}},
 		Subprotocols: []string{attachwirev2.SubprotocolVersion},
 	})
 	cancelDial()
 	if err != nil {
-		return nil, fmt.Errorf("attachclient: v2 wss dial: %w", err)
+		// A drain-window refusal is answered before the upgrade and before token
+		// verification, so it is the whole answer this dial gets. Typing it here
+		// is what lets a composing daemon tell "the relay is restarting" apart
+		// from "this candidate was rejected" — the difference between a re-dial
+		// and a quarantined lineage.
+		if restart := RelayRestartRefusal(resp); restart != nil {
+			return nil, restart
+		}
+		return nil, newRelayDialError("attachclient: v2 wss dial", err)
 	}
 	if conn.Subprotocol() != attachwirev2.SubprotocolVersion {
 		got := conn.Subprotocol()
@@ -825,6 +833,14 @@ func (c *V2HostCandidate) readLoop(ctx context.Context) {
 	for {
 		kind, raw, err := c.conn.Read(ctx)
 		if err != nil {
+			// A 1012 close carrying the planned-restart reason is the only half
+			// of the announcement an attach-v2 leg is sent today, so reading it
+			// here is what gives this lane the same non-terminal answer the
+			// control frame gives the other one.
+			if restart := relayRestartClose(err); restart != nil {
+				c.fail(restart)
+				return
+			}
 			c.fail(err)
 			return
 		}
@@ -905,6 +921,14 @@ func (c *V2HostCandidate) handleV2Inbound(ctx context.Context, frame attachwire.
 			}
 			return nil
 		case attachwire.ControlError:
+			if typed.Code == attachwire.CodeRelayRestarting {
+				// The one error control that is NOT a verdict. Mapping every
+				// code to a terminal stop is what made a deliberate relay
+				// redeploy end this lane's dial loop outright — strictly worse
+				// than the bare EOF the announcement replaces. Non-terminal,
+				// carrying the relay's own redial floor for the next dial.
+				return relayRestartControl(typed)
+			}
 			return &RelayStopError{Code: typed.Code, Message: typed.Message}
 		default:
 			return nil

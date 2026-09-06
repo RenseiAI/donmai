@@ -55,6 +55,16 @@ type StubRelay struct {
 	refuseWSS   atomic.Bool
 	droppedPOST atomic.Bool
 
+	// restartMu guards the planned-restart drain: the signal live host legs
+	// select on, and the redial floor the refusals and the announcement share.
+	restartMu    sync.Mutex
+	restart      chan struct{}
+	restartAfter time.Duration
+	// refusedDials counts the dials the drain window turned away. It is the
+	// observable that separates a client honouring the announced floor from one
+	// hammering the drain on its own backoff.
+	refusedDials atomic.Int64
+
 	mu      sync.Mutex
 	started bool
 }
@@ -71,7 +81,7 @@ func New(cfg Config) *StubRelay {
 	if log == nil {
 		log = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	s := &StubRelay{cfg: cfg, log: log, room: newRoom(cfg.RingSize)}
+	s := &StubRelay{cfg: cfg, log: log, room: newRoom(cfg.RingSize), restart: make(chan struct{})}
 	s.refuseWSS.Store(cfg.RefuseWSS)
 	return s
 }
@@ -202,9 +212,102 @@ func (s *StubRelay) SimulateRestart() {
 	}
 }
 
+// AnnounceRestart puts the relay into the drain a PLANNED restart runs, which
+// is the opposite of SimulateRestart's "the box died" shape: the restart is
+// announced, not merely suffered.
+//
+// While draining it does all three things the planned-restart contract
+// specifies, so a client can be tested against the whole signal rather than
+// against one convenient half:
+//
+//   - refuses every new attach dial (WSS and the degraded lane) with
+//     503 Service Unavailable + Retry-After: <N>, before any upgrade;
+//   - sends every bound host leg the §7 relay-restarting error control whose
+//     message is the frozen "redial after <N>s" grammar;
+//   - closes those legs with 1012 Service Restart, reason
+//     "relay-restarting: redial after <N>s".
+//
+// Room state is deliberately KEPT: a planned restart of a relay that hands its
+// rooms over is not a ring miss, and conflating the two hides which signal a
+// client actually reacted to. Call EndRestart to finish the drain and let the
+// fleet back in.
+func (s *StubRelay) AnnounceRestart(redialAfter time.Duration) {
+	if redialAfter < time.Second {
+		redialAfter = time.Second
+	}
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	if s.restartAfter != 0 {
+		return
+	}
+	// The floor is published BEFORE the signal, so a leg that wakes on the
+	// signal cannot read a zero floor and announce a number the refusals are
+	// not using.
+	s.restartAfter = redialAfter
+	close(s.restart)
+}
+
+// EndRestart ends the drain: new dials are admitted again, exactly as the
+// replacement process would admit them.
+func (s *StubRelay) EndRestart() {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	if s.restartAfter == 0 {
+		return
+	}
+	s.restartAfter = 0
+	s.restart = make(chan struct{})
+}
+
+// restartSignal is the channel a live host leg selects on. It exists from
+// construction and is CLOSED to announce, so a leg bound long before the
+// announcement still observes it — capturing it at leg start is enough.
+func (s *StubRelay) restartSignal() <-chan struct{} {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	return s.restart
+}
+
+// restartRedial reports the floor the current drain named, zero when no
+// restart is announced.
+func (s *StubRelay) restartRedial() time.Duration {
+	s.restartMu.Lock()
+	defer s.restartMu.Unlock()
+	return s.restartAfter
+}
+
+// refuseWhileDraining answers one dial during the drain window and reports
+// whether it did. The refusal is written BEFORE the upgrade and before any
+// token check, because a client that is told to come back later should not have
+// to hold a valid credential to be told.
+func (s *StubRelay) refuseWhileDraining(w http.ResponseWriter) bool {
+	after := s.restartRedial()
+	if after == 0 {
+		return false
+	}
+	s.refusedDials.Add(1)
+	w.Header().Set("Retry-After", strconv.Itoa(int(after/time.Second)))
+	http.Error(w, "relay-restarting", http.StatusServiceUnavailable)
+	return true
+}
+
+// RefusedDials reports how many dials the drain window has turned away since
+// this relay was built.
+func (s *StubRelay) RefusedDials() int { return int(s.refusedDials.Load()) }
+
+// restartAnnouncement renders both halves of the announcement from one floor,
+// so the control message and the close reason can never disagree.
+func restartAnnouncement(after time.Duration) (message, closeReason string) {
+	message = fmt.Sprintf("redial after %ds", int(after/time.Second))
+	return message, string(attachwire.CodeRelayRestarting) + ": " + message
+}
+
 // ---- WSS lane ---------------------------------------------------------------
 
 func (s *StubRelay) handleWS(w http.ResponseWriter, r *http.Request) {
+	if s.refuseWhileDraining(w) {
+		return
+	}
 	if s.refuseWSS.Load() {
 		http.Error(w, "wss upgrade refused", http.StatusNotFound)
 		return
@@ -259,11 +362,24 @@ func (s *StubRelay) serveHostWSS(ctx context.Context, conn *websocket.Conn, clai
 	}
 	defer s.room.unbindHost(out)
 
-	// Writer: relay→host frames → the connection.
+	// Writer: relay→host frames → the connection, plus the planned-restart
+	// announcement, which is the one thing this side originates.
+	restart := s.restartSignal()
 	go func() {
 		for {
 			select {
 			case <-legCtx.Done():
+				return
+			case <-restart:
+				// Announce, put it on the wire, THEN close — a close that races
+				// its own announcement is the bare EOF the contract exists to
+				// replace. The floor is read HERE, not when the leg started: a
+				// leg bound before the announcement must carry the same number
+				// as the refusals the announcement is issuing.
+				message, closeReason := restartAnnouncement(s.restartRedial())
+				_ = writeFrame(legCtx, conn, errorControlFrame(attachwire.CodeRelayRestarting, message, true))
+				_ = conn.Close(websocket.StatusServiceRestart, closeReason)
+				cancel()
 				return
 			case f := <-out:
 				if err := writeFrame(legCtx, conn, f); err != nil {
@@ -504,6 +620,9 @@ func (s *StubRelay) membersList() []attachwire.PresenceMember {
 // ---- degraded host lane -----------------------------------------------------
 
 func (s *StubRelay) handleHostSSE(w http.ResponseWriter, r *http.Request) {
+	if s.refuseWhileDraining(w) {
+		return
+	}
 	claims, err := parseClaims(bearer(r))
 	if err != nil || claims.Aud != "relay" {
 		http.Error(w, "unauthorized", http.StatusUnauthorized)
