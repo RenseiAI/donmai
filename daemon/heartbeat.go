@@ -575,7 +575,8 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		// expected to log the resolution event ("refresh" or
 		// "reregister") via RefreshRuntimeToken.
 		reason := authFailureReason(err)
-		slog.Info("[runtime-token]",
+		slog.Info(
+			"[runtime-token]",
 			"event", "auth-failure-detected",
 			"path", "heartbeat",
 			"reason", reason,
@@ -618,13 +619,19 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 	return err
 }
 
-// noteSessionShimRevisionStaleBeat turns the server's revision-stale heartbeat
-// conflict into the configured reconciliation trigger.
+// noteSessionShimRevisionStaleBeat turns a server refusal that says the
+// session-shim projection cannot be used into the configured reconciliation
+// trigger. A revision-stale conflict and a closed projection rejection both
+// mean this daemon must republish its authoritative projection.
 func (h *HeartbeatService) noteSessionShimRevisionStaleBeat(err error) {
-	if h.opts.OnSessionShimRevisionStale == nil || !isSessionShimRevisionStale(err) {
+	if h.opts.OnSessionShimRevisionStale == nil || !isSessionShimReconciliationRequired(err) {
 		return
 	}
 	h.opts.OnSessionShimRevisionStale()
+}
+
+func isSessionShimReconciliationRequired(err error) bool {
+	return isSessionShimRevisionStale(err) || isSessionShimProjectionRejected(err)
 }
 
 // isSessionShimRevisionStale reports whether a heartbeat error is the control
@@ -633,6 +640,12 @@ func isSessionShimRevisionStale(err error) bool {
 	var hErr *heartbeatHTTPError
 	return errors.As(err, &hErr) && hErr.status == http.StatusConflict &&
 		strings.Contains(hErr.body, sessionShimRevisionStaleCode)
+}
+
+func isSessionShimProjectionRejected(err error) bool {
+	var hErr *heartbeatHTTPError
+	return errors.As(err, &hErr) && hErr.status == http.StatusBadRequest &&
+		strings.Contains(strings.ToLower(hErr.body), "sessionshim")
 }
 
 // workerIDLocked returns the current worker id under the lock.

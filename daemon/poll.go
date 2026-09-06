@@ -490,6 +490,11 @@ type PollOptions struct {
 	// re-register on every tick.
 	OnReregister func(ctx context.Context, reason string) (workerID, runtimeJWT string, err error)
 
+	// OnSessionShimAdoptionNotReady runs when polling is refused because the
+	// control plane has temporarily disabled claims pending session-shim
+	// adoption. It must not block; the daemon wires it to reconciliation.
+	OnSessionShimAdoptionNotReady func()
+
 	// ClaimSuspended reports whether this host must currently stop claiming
 	// NEW work, plus a short human-readable reason for the transition log.
 	// It is consulted once per tick, immediately before the poll request —
@@ -851,7 +856,16 @@ func (p *PollService) pollOnce(ctx context.Context) {
 		p.mu.Unlock()
 		return
 	}
+	if isSessionShimAdoptionNotReady(err) && p.opts.OnSessionShimAdoptionNotReady != nil {
+		p.opts.OnSessionShimAdoptionNotReady()
+	}
 	p.opts.LogWarn("daemon poll failed: %v", err)
+}
+
+func isSessionShimAdoptionNotReady(err error) bool {
+	var pollErr *PollHTTPError
+	return errors.As(err, &pollErr) && pollErr.Status == http.StatusServiceUnavailable &&
+		strings.Contains(pollErr.Body, "SESSION_SHIM_ADOPTION_NOT_READY")
 }
 
 // dispatchKgExtract executes one claimed kg-extraction item off the poll

@@ -3739,27 +3739,10 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 		return nil
 	}
 	scope := d.sessionShimConfig().orgID()
-	// Readiness is checked before a refreshed receipt is adopted — except for
-	// the ONE receipt that founds the scope's host authority. An embedder's
-	// readiness resolver answers for the primary host, and the primary host id
-	// is what this very receipt carries: asking before it is retained asks for a
-	// fact this round trip is producing. That is what drove an embedder to
-	// present the attestation early, outside the refresher's lock, to learn the
-	// id some other way — and the control plane answered the resulting posture
-	// flip-flop with an attestation conflict. The check is deferred, not
-	// dropped: declareSessionShimComposition runs it once the receipt is
-	// retained and the embedder has been handed it. Every other refresh keeps
-	// the check exactly here.
-	if !d.sessionShimFoundingDeclaration(scope) {
-		// Resolved, not read from the cache: this seam is about to install new
-		// credential authority, and a cached answer predates the thing being
-		// installed. The cadence exists to keep the resolver off the per-tick
-		// lanes, not off the lane that changes what it answers about.
-		if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
-			d.withdrawSessionShimProofV2Readiness()
-			return err
-		}
-	}
+	// A refresh installs recovery credentials. Readiness is deliberately not a
+	// precondition here: a degraded heartbeat is the evidence that starts the
+	// reconciliation this credential is required to perform. Claims and
+	// adoption preparation retain their readiness gates.
 	if result == nil || result.SessionShim == nil {
 		return errors.New("session shim: refresh omitted credential receipt")
 	}
