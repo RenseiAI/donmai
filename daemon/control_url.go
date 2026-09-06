@@ -40,22 +40,28 @@ func (d *Daemon) PublishControlAddr(addr string) {
 // address a worker this daemon spawns must dial.
 //
 // It prefers the address the listener really bound (PublishControlAddr) and
-// falls back to the configured host:port. It returns "" rather than naming a
-// default when neither is known (no listener yet and Options.HTTPPort == 0):
-// an empty answer leaves the worker's own resolution untouched, while a
-// confidently wrong one would send it at a port this daemon is not serving.
+// falls back to the configured address. The fallback goes through the same
+// ResolveControlBind the listener itself uses (server.go), because the two must
+// not disagree about what an address IS: that function accepts a host carrying
+// its own port ("localhost:7735") and a bracketed IPv6 literal ("[::1]"), and
+// refuses any non-loopback bind. Hand-joining host and port instead would render
+// the first as "[localhost:7735]:7735", answer "" for the second — silently
+// turning this fix back into a no-op for exactly the named instance it was
+// written for — and confidently name an address the listener would have refused.
+//
+// It returns "" when the address is not knowable (no listener yet and no
+// resolvable configured port). An empty answer leaves the worker's own
+// resolution and its provenance label untouched; a confidently wrong one would
+// point it at a port this daemon is not serving.
 func (d *Daemon) ControlURL() string {
 	if published := d.controlURL.Load(); published != nil && *published != "" {
 		return *published
 	}
-	if d.opts.HTTPPort <= 0 {
+	host, port, err := ResolveControlBind(d.opts.HTTPHost, d.opts.HTTPPort, d.opts.HTTPPort != 0)
+	if err != nil || port <= 0 {
 		return ""
 	}
-	host := strings.TrimSpace(d.opts.HTTPHost)
-	if host == "" {
-		host = DefaultHTTPHost
-	}
-	return controlURLFromAddr(net.JoinHostPort(host, strconv.Itoa(d.opts.HTTPPort)))
+	return controlURLFromAddr(net.JoinHostPort(host, strconv.Itoa(port)))
 }
 
 // controlURLFromAddr renders a listener address as the http:// base URL a

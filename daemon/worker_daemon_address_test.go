@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"net/http"
+	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -29,6 +30,45 @@ func lastEnvValue(env []string, key string) (string, bool) {
 	return value, found
 }
 
+// pinProcessDaemonURL makes the PROCESS environment these rows observe
+// deterministic, because composeEnv prepends os.Environ() and lastEnvValue —
+// correctly, for exec's last-wins semantics — would otherwise report whatever
+// the developer's own shell exports.
+//
+// That is not a hypothetical shell: exporting DONMAI_DAEMON_URL at the daemon's
+// exec boundary is the operator workaround this change exists to retire, so the
+// people most likely to run this suite are the ones still carrying it. Left
+// unpinned, the two "must stay unset" rows go red on their machines and green
+// on CI.
+//
+// t.Setenv(key, "") is NOT enough: an empty assignment still lands in
+// os.Environ(), so the helper would report the key as set. The variable has to
+// be genuinely removed, hence os.Unsetenv plus an explicit restore.
+func pinProcessDaemonURL(t *testing.T, value string) {
+	t.Helper()
+	previous, had := os.LookupEnv(EnvDaemonControlURL)
+	t.Cleanup(func() {
+		if had {
+			if err := os.Setenv(EnvDaemonControlURL, previous); err != nil {
+				t.Errorf("restoring %s: %v", EnvDaemonControlURL, err)
+			}
+			return
+		}
+		if err := os.Unsetenv(EnvDaemonControlURL); err != nil {
+			t.Errorf("clearing %s: %v", EnvDaemonControlURL, err)
+		}
+	})
+	if value == "" {
+		if err := os.Unsetenv(EnvDaemonControlURL); err != nil {
+			t.Fatalf("clearing %s: %v", EnvDaemonControlURL, err)
+		}
+		return
+	}
+	if err := os.Setenv(EnvDaemonControlURL, value); err != nil {
+		t.Fatalf("setting %s: %v", EnvDaemonControlURL, err)
+	}
+}
+
 // TestSpawner_DaemonControlURLReachesWorkerEnv is the core of the fix: a
 // daemon that is NOT on the well-known port must still be findable by the
 // workers it spawns.
@@ -45,8 +85,12 @@ func TestSpawner_DaemonControlURLReachesWorkerEnv(t *testing.T) {
 		baseEnv map[string]string
 		// specEnv is what the platform stamped on the work item.
 		specEnv map[string]string
-		want    string
-		wantSet bool
+		// processEnv is what the DAEMON'S OWN process environment carries —
+		// the operator's export, inherited through composeEnv's os.Environ().
+		// Empty means the variable is removed for the row.
+		processEnv string
+		want       string
+		wantSet    bool
 	}{
 		{
 			name:     "named instance on a non-default port",
@@ -74,6 +118,16 @@ func TestSpawner_DaemonControlURLReachesWorkerEnv(t *testing.T) {
 			wantSet:  true,
 		},
 		{
+			// The shape that actually bites in the field: the operator (or the
+			// downstream binary's own named-instance workaround) exports the
+			// variable on the daemon process, and every worker inherits it.
+			name:       "the daemon's address beats an inherited process-environment value",
+			resolver:   func() string { return "http://127.0.0.1:18382" },
+			processEnv: "http://127.0.0.1:7734",
+			want:       "http://127.0.0.1:18382",
+			wantSet:    true,
+		},
+		{
 			name:     "the daemon's address beats a stamped session value",
 			resolver: func() string { return "http://127.0.0.1:18382" },
 			specEnv:  map[string]string{EnvDaemonControlURL: "http://127.0.0.1:9999"},
@@ -96,6 +150,7 @@ func TestSpawner_DaemonControlURLReachesWorkerEnv(t *testing.T) {
 		t.Run(tt.name, func(t *testing.T) {
 			for _, path := range []string{"direct", "shim"} {
 				t.Run(path, func(t *testing.T) {
+					pinProcessDaemonURL(t, tt.processEnv)
 					var (
 						mu     sync.Mutex
 						gotEnv []string
@@ -188,6 +243,49 @@ func TestDaemonControlURL(t *testing.T) {
 			name: "unbound ephemeral port has no answer to give",
 			host: "127.0.0.1",
 			port: 0,
+			want: "",
+		},
+		{
+			// ResolveControlBind accepts a host that carries its own port.
+			// Joining host and port again would produce "[localhost:7735]:7735".
+			name: "a host carrying its own port is resolved, not joined again",
+			host: "localhost:7735",
+			port: 7735,
+			want: "http://localhost:7735",
+		},
+		{
+			name: "a host-embedded port answers even with no explicit port set",
+			host: "localhost:7735",
+			port: 0,
+			want: "http://localhost:7735",
+		},
+		{
+			// The worse of the two mis-renderings: an empty answer omits the
+			// variable, the worker falls back to the built-in default, and the
+			// fix becomes a no-op for exactly the instance it was written for.
+			name: "a bracketed IPv6 literal host keeps its address",
+			host: "[::1]",
+			port: 7735,
+			want: "http://[::1]:7735",
+		},
+		{
+			name: "a bare IPv6 literal host keeps its address",
+			host: "::1",
+			port: 7735,
+			want: "http://[::1]:7735",
+		},
+		{
+			// The listener would refuse this bind outright (the control API is
+			// unauthenticated), so the accessor must not name it either.
+			name: "a non-loopback configured host has no control address to give",
+			host: "0.0.0.0",
+			port: 7735,
+			want: "",
+		},
+		{
+			name: "a configured host:port that contradicts the explicit port is no address",
+			host: "localhost:7735",
+			port: 7734,
 			want: "",
 		},
 		{
