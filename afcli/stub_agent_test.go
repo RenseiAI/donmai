@@ -48,7 +48,11 @@ func runStubAgentChild() int {
 // spawnStubSession spawns the fake agent through the stub harness's real
 // interactive Spawn — the same call the runner makes — pointed at this test
 // binary's child entry point.
-func spawnStubSession(t *testing.T, scenario, prompt string) (agent.Handle, agent.InteractiveSession) {
+//
+// The variadic mutators run on the composed Spec just before Spawn, so a test
+// that needs one more field (a tool policy, say) gets it without a second copy
+// of this function drifting away from the first.
+func spawnStubSession(t *testing.T, scenario, prompt string, mutators ...func(*agent.Spec)) (agent.Handle, agent.InteractiveSession) {
 	t.Helper()
 	if runtime.GOOS == "windows" {
 		t.Skip("pty spawn tests are unix-only")
@@ -67,6 +71,10 @@ func spawnStubSession(t *testing.T, scenario, prompt string) (agent.Handle, agen
 			"DONMAI_STATE_HOME":   t.TempDir(),
 		},
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	}
+
+	for _, mutate := range mutators {
+		mutate(&spec)
 	}
 
 	handle, err := provider.Spawn(context.Background(), spec)
@@ -369,5 +377,73 @@ func TestStubAgentDefaultsWithoutAScenario(t *testing.T) {
 
 	if result := awaitResult(t, handle, 30*time.Second); !result.Success {
 		t.Errorf("default scenario did not end cleanly: %v", result.Errors)
+	}
+}
+
+// TestStubAgentRecordsTheReceivedToolPolicyInItsTranscript is the observable
+// half of the manifest's "satisfied by construction" claim, proved end to end:
+// a real interactive Spawn through the real harness, a real PTY, and the real
+// stub-agent command reading the environment it was actually given.
+//
+// The assertion that matters is the ORDER. The notice must land before the
+// scenario's own first line, because a scenario whose first act is to exit
+// would otherwise take the record with it — and a spawn-failed seat is exactly
+// the case this evidence exists for.
+func TestStubAgentRecordsTheReceivedToolPolicyInItsTranscript(t *testing.T) {
+	scenario := `{"version":1,"name":"policy","steps":[{"print":"scenario ran"}],"hangFor":"forever"}`
+	_, session := spawnStubSession(t, scenario, "", func(spec *agent.Spec) {
+		spec.AllowedTools = []string{"Read"}
+		spec.DisallowedTools = []string{"Bash", "Write"}
+	})
+	reader := newPTYReader(t, session)
+	reader.waitFor(t, "scenario ran", 10*time.Second)
+
+	transcript := reader.text()
+	notice := strings.Index(transcript, stubagent.ToolPolicyNoticePrefix)
+	if notice < 0 {
+		t.Fatalf("transcript carries no tool-policy record:\n%s", transcript)
+	}
+	if scenarioLine := strings.Index(transcript, "scenario ran"); scenarioLine < notice {
+		t.Errorf("the tool-policy record must precede the scenario's own output:\n%s", transcript)
+	}
+	for _, want := range []string{"allowed=[Read]", "disallowed=[Bash,Write]", "honoured by construction"} {
+		if !strings.Contains(transcript, want) {
+			t.Errorf("transcript is missing %q:\n%s", want, transcript)
+		}
+	}
+}
+
+// TestStubAgentPrintsNoToolPolicyLineWithoutAPolicy is the discriminating
+// control for the test above: with no policy on the Spec the parent sets
+// nothing and the child prints nothing, so the PRESENCE of the line is what
+// proves a policy arrived rather than being a banner every session carries.
+func TestStubAgentPrintsNoToolPolicyLineWithoutAPolicy(t *testing.T) {
+	scenario := `{"version":1,"name":"no-policy","steps":[{"print":"scenario ran"}],"hangFor":"forever"}`
+	_, session := spawnStubSession(t, scenario, "")
+	reader := newPTYReader(t, session)
+	reader.waitFor(t, "scenario ran", 10*time.Second)
+
+	if transcript := reader.text(); strings.Contains(transcript, stubagent.ToolPolicyNoticePrefix) {
+		t.Errorf("a session that received no policy still printed a policy record:\n%s", transcript)
+	}
+}
+
+// TestStubAgentRefusesAMalformedToolPolicy pins the fail-closed edge. This
+// record exists to make a claim auditable, so a child that silently discarded
+// it and ran anyway would be asserting exactly the thing it had just lost.
+func TestStubAgentRefusesAMalformedToolPolicy(t *testing.T) {
+	t.Setenv(stubagent.EnvToolPolicy, `{"allowedTools":"Read"}`)
+	cmd := newStubAgentCmd()
+	cmd.SetArgs([]string{})
+	cmd.SetOut(&strings.Builder{})
+	cmd.SetErr(&strings.Builder{})
+
+	err := cmd.ExecuteContext(context.Background())
+	code, ok := StubAgentExitCode(err)
+	if !ok || code != stubagent.ExitScenarioFailure {
+		t.Fatalf("exit = (%d, %v) for err %v, want the scenario-failure status", code, ok, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), stubagent.EnvToolPolicy) {
+		t.Fatalf("error = %v, want one naming %s", err, stubagent.EnvToolPolicy)
 	}
 }

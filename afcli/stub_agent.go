@@ -59,7 +59,9 @@ func newStubAgentCmd() *cobra.Command {
 		Long: "Run the deterministic fake agent used by the stub harness's interactive spawn mode.\n\n" +
 			"The scenario is read from " + stubagent.EnvScenario + " (inline JSON) or " +
 			stubagent.EnvScenarioFile + " (a path to a JSON file). With neither set it runs the\n" +
-			"default scenario: announce, idle briefly, exit 0.",
+			"default scenario: announce, idle briefly, exit 0.\n\n" +
+			"When " + stubagent.EnvToolPolicy + " is set, the tool-permission policy it carries is\n" +
+			"recorded as the first line of the transcript before the scenario runs.",
 		Hidden: true,
 		Args:   cobra.NoArgs,
 		// A scripted non-zero exit is a correct outcome, not operator error:
@@ -76,6 +78,28 @@ func runStubAgent(cmd *cobra.Command) error {
 	if err != nil {
 		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "stub agent:", err)
 		return &StubAgentExit{Code: stubagent.ExitScenarioFailure, Err: err}
+	}
+
+	// Record the received tool policy FIRST, before a single scripted line, so
+	// the transcript proves what this session was handed even when the
+	// scenario's own first act is to exit. The stub harness declares the
+	// native tool-policy channel satisfied by construction (it registers no
+	// tools); this line is the evidence behind that claim, and its absence
+	// means no policy arrived.
+	//
+	// A malformed value is refused rather than skipped: the variable exists to
+	// make the claim auditable, so a child that discarded the record and ran
+	// anyway would be asserting exactly the thing it had just lost.
+	policy, err := stubagent.LoadToolPolicy(os.Getenv)
+	if err != nil {
+		_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "stub agent:", err)
+		return &StubAgentExit{Code: stubagent.ExitScenarioFailure, Err: err}
+	}
+	if os.Getenv(stubagent.EnvToolPolicy) != "" {
+		if _, err := fmt.Fprintln(cmd.OutOrStdout(), policy.Notice()); err != nil {
+			_, _ = fmt.Fprintln(cmd.ErrOrStderr(), "stub agent: write tool policy notice:", err)
+			return &StubAgentExit{Code: stubagent.ExitScenarioFailure, Err: err}
+		}
 	}
 
 	// signal.Notify rather than the default disposition: SIGTERM must become
