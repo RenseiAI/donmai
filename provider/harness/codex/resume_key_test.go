@@ -31,11 +31,10 @@ func TestRecordResumeKeyAfterRolloutFlush(t *testing.T) {
 	if err := os.WriteFile(rollout, []byte(`{"type":"session_meta"}`), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	recordResumeKey(home, "thread-live", map[string]string{
-		sessionshim.EnvCodexResumeRegistry: registry.Dir(),
-		sessionshim.EnvCodexResumeOrg:      id.OrgID,
-		sessionshim.EnvCodexResumeSession:  id.SessionID,
-	})
+	t.Setenv(sessionshim.EnvCodexResumeRegistry, registry.Dir())
+	t.Setenv(sessionshim.EnvCodexResumeOrg, id.OrgID)
+	t.Setenv(sessionshim.EnvCodexResumeSession, id.SessionID)
+	recordResumeKey(home, "thread-live")
 	record, err := registry.Get(id)
 	if err != nil || record.ResumeKey == nil || record.ResumeKey.CodexHome != home || record.ResumeKey.ThreadID != "thread-live" {
 		t.Fatalf("resume key = %+v, err=%v", record.ResumeKey, err)

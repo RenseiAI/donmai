@@ -1208,14 +1208,6 @@ func (d *Daemon) startShimProcess(spec SessionSpec, launch sessionshim.Launch, e
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec // G204: operator-configured worker command, same source as the direct-spawn path
 	configureShimProcess(cmd)
 	cmd.Env = append(append([]string(nil), env...), envPairs(launch.Env())...)
-	// This narrow publication rail reaches only the Codex harness through the
-	// runner. It is intentionally outside the session-shim launch prefix: the
-	// latter is supervisor-only and the runtime strips it from workload env.
-	cmd.Env = append(cmd.Env, envPairs(map[string]string{
-		sessionshim.EnvCodexResumeRegistry: launch.RegistryDir,
-		sessionshim.EnvCodexResumeOrg:      launch.Identity.OrgID,
-		sessionshim.EnvCodexResumeSession:  launch.Identity.SessionID,
-	})...)
 
 	// A shim outlives this daemon, so it cannot inherit this daemon's stdio
 	// via a pipe THIS process reads: a closed pipe after the daemon exits

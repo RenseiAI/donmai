@@ -325,6 +325,7 @@ func (b *codexConfigBoundary) remove() error {
 		// post-crash orphan sweep: process termination is never authority to
 		// delete resumable conversation state.
 		if hasCodexRollout(clean) {
+			b.harvestPluginCache()
 			return
 		}
 		// Harvest whatever this session's own cache/ subtree fetched that the

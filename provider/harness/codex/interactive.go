@@ -170,7 +170,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			)
 		}
 		if attachToExistingNamedSession(spec) {
-			recordResumeKey(config.home, spec.SessionName, spec.Env)
+			recordResumeKey(config.home, spec.SessionName)
 		}
 		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
 		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
@@ -241,7 +241,7 @@ func spawnNamedInteractivePTY(
 	}
 	// finishNamingLiveInteractiveThread waits through Codex's rollout-flush
 	// race, so the resume key is recorded only after the native state exists.
-	recordResumeKey(spec.Env["CODEX_HOME"], threadID, spec.Env)
+	recordResumeKey(spec.Env["CODEX_HOME"], threadID)
 	return handle, nil
 }
 
