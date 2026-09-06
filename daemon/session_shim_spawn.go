@@ -299,26 +299,39 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 		prepared       SessionShimAdoptionPreparationResult
 		preparedHostID string
 	)
-	controllerOpts := d.sessionShimLaunchControllerOptions(cfg, workarea, layout.Root.String())
-	controllerOpts.PrepareAdoption = func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
-		hostID, hostErr := d.sessionShimHostID(ctx, evidence.Identity.OrgID)
-		if hostErr != nil {
-			return sessionshim.PreparedAdoption{}, hostErr
-		}
-		resolved, prepareErr := d.prepareSessionShimAdoption(ctx, hostID, evidence)
-		if prepareErr != nil {
-			return sessionshim.PreparedAdoption{}, prepareErr
-		}
-		preparedHostID = hostID
-		prepared = resolved
-		return resolved.PreparedAdoption, nil
-	}
-	ctrl, err := sessionshim.Dial(ctx, rec, controllerOpts)
+	baseControllerOpts := d.sessionShimLaunchControllerOptions(cfg, workarea, layout.Root.String())
+	// One options value per dial attempt: the preparation carries the attempt
+	// number, and it runs on that attempt's own context rather than on a launch
+	// clock an earlier unanswered ask may already have spent. See
+	// dialLaunchedSessionShim for why a second ask is a second dial.
+	ctrl, adoptCtx, releaseAdopt, err := d.dialLaunchedSessionShim(ctx, rec,
+		func(attemptCtx context.Context, attempt int) sessionshim.ControllerOptions {
+			opts := baseControllerOpts
+			opts.PrepareAdoption = func(evidence sessionshim.AdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+				hostID, hostErr := d.sessionShimHostID(attemptCtx, evidence.Identity.OrgID)
+				if hostErr != nil {
+					return sessionshim.PreparedAdoption{}, hostErr
+				}
+				resolved, prepareErr := d.prepareSessionShimAdoptionForCause(
+					attemptCtx, hostID, evidence, SessionShimPrepareCauseInitial, attempt,
+				)
+				if prepareErr != nil {
+					return sessionshim.PreparedAdoption{}, prepareErr
+				}
+				preparedHostID = hostID
+				prepared = resolved
+				return resolved.PreparedAdoption, nil
+			}
+			return opts
+		})
+	defer releaseAdopt()
 	if err != nil {
 		slog.Error("session shim: could not adopt the shim it just launched",
 			"session", id.String(), "error", err)
 		return nil, fmt.Errorf("session shim: adopt %s: %w", id, err)
 	}
+	// Everything left of the handshake belongs to the attempt that won it.
+	ctx = adoptCtx
 	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared, preparedHostID)
 	if err != nil {
 		_ = ctrl.Close()
