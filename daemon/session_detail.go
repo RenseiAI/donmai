@@ -7,6 +7,7 @@ import (
 	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/runner/access"
 	"github.com/RenseiAI/donmai/runtime/workarea"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // CredentialEnvRequirement describes one non-secret credential requirement
@@ -35,7 +36,8 @@ type SessionDetail struct {
 
 	// SessionName is the canonical user-facing name projected onto the native
 	// harness session. It remains unchanged across daemon and runner hops.
-	SessionName string `json:"sessionName,omitempty"`
+	SessionName string                 `json:"sessionName,omitempty"`
+	ResumeKey   *sessionshim.ResumeKey `json:"resumeKey,omitempty"`
 
 	// AdmissionReceipt is the opaque, immutable execution-cell admission
 	// evidence produced before enqueue. The runner owns strict decoding.

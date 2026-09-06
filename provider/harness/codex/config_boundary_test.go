@@ -63,6 +63,65 @@ func TestCodexConfigBoundaryRemovalPinsParentIdentityAndPersistsFailure(t *testi
 	}
 }
 
+func TestCodexConfigBoundaryRemovalRetainsHomesWithRollouts(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		stateName string
+		wantHome  bool
+	}{
+		{name: "ordinary cleanup", wantHome: false},
+		{name: "resumable rollout", stateName: "rollout-2026-09-06T12-00-00-thread-live.jsonl", wantHome: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			boundary, err := newCodexConfigBoundary(t.TempDir(), false)
+			if err != nil {
+				t.Fatalf("new boundary: %v", err)
+			}
+			if tc.stateName != "" {
+				stateDir := filepath.Join(boundary.home, codexSessionStateSubdir, "2026", "09", "06")
+				if err := os.MkdirAll(stateDir, 0o700); err != nil {
+					t.Fatalf("create state directory: %v", err)
+				}
+				if err := os.WriteFile(filepath.Join(stateDir, tc.stateName), []byte(`{"type":"session_meta"}`), 0o600); err != nil {
+					t.Fatalf("write session state: %v", err)
+				}
+			}
+			// cache/ is donmai's own staging subtree. The orphan sweep
+			// harvests it and then removes it even from a home it retains
+			// (declaredDeletableEntries), so this cleanup must do the same.
+			cacheDir := filepath.Join(boundary.home, codexPluginCacheSubdir)
+			if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+				t.Fatalf("create plugin cache: %v", err)
+			}
+			if err := boundary.remove(); err != nil {
+				t.Fatalf("boundary remove: %v", err)
+			}
+			_, statErr := os.Stat(boundary.home)
+			if got := statErr == nil; got != tc.wantHome {
+				t.Fatalf("home exists after cleanup = %t, want %t (err=%v)", got, tc.wantHome, statErr)
+			}
+			if !tc.wantHome {
+				return
+			}
+			// A retained home keeps everything a resume needs — the session
+			// state AND the config.toml that names the store it was written
+			// under — and gives up only the one entry the sweep declares
+			// deletable.
+			for _, keep := range []string{
+				filepath.Join(codexSessionStateSubdir, "2026", "09", "06", tc.stateName),
+				codexConfigFileName,
+			} {
+				if _, err := os.Stat(filepath.Join(boundary.home, keep)); err != nil {
+					t.Fatalf("retained home lost %s: %v", keep, err)
+				}
+			}
+			if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+				t.Fatalf("retained home kept the reclaimable plugin cache: err=%v", err)
+			}
+		})
+	}
+}
+
 func TestCodexConfigBoundaryHardLinksHostSessionAuth(t *testing.T) {
 	root := t.TempDir()
 	hostHome := filepath.Join(root, "host")

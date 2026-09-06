@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strconv"
 	"strings"
+	"sync"
 	"syscall"
 )
 
@@ -99,6 +100,70 @@ func (r *Registry) Put(rec Record) error {
 	return r.publish(rec.Identity().RecordName(), data)
 }
 
+// recordWriteMu serializes every read-modify-write of a live discovery record.
+//
+// Two such writers run concurrently inside one process. The Codex harness
+// records its resume key through its OWN Registry handle (PutResumeKey) while
+// the shim that supervises it republishes the record on each phase transition
+// (PutRetainingResumeKey) — and the naming window those two overlap in is tens
+// of seconds wide. Both do Get → mutate → Put, so without a shared lock the
+// interleaving Get/Get/Put/Put drops whichever field the loser carried, which
+// is precisely the resume key this package was taught to keep. The two handles
+// are distinct values over the same directory, so the serialization point has
+// to be package-level rather than per-Registry. It costs nothing: a record is
+// published only on phase transitions, never per frame, and one mutex cannot
+// grow unbounded the way a per-identity lock table would.
+var recordWriteMu sync.Mutex
+
+// PutResumeKey records the first durable Codex rollout for a live shim. The
+// record remains the source of truth through adoption and quarantine.
+//
+// The first key wins: a session has exactly one native conversation, and a
+// later writer that disagreed would be describing a different one.
+func (r *Registry) PutResumeKey(id Identity, key ResumeKey) error {
+	if err := key.Validate(); err != nil {
+		return err
+	}
+	recordWriteMu.Lock()
+	defer recordWriteMu.Unlock()
+	rec, err := r.Get(id)
+	if err != nil {
+		return fmt.Errorf("sessionshim: get record for resume key: %w", err)
+	}
+	if rec.ResumeKey != nil {
+		return nil
+	}
+	rec.ResumeKey = &key
+	return r.Put(rec)
+}
+
+// PutRetainingResumeKey publishes rec while carrying forward the resume key the
+// SAME incarnation already recorded, and returns the key the published record
+// carries so a caller can hold it in memory.
+//
+// This is the republishing half of the pair above: the shim rebuilds its record
+// from its own in-memory state on every phase transition, and that state has
+// never held the harness's resume key. Reading the previous record inside the
+// same critical section as the write is what makes a republish incapable of
+// erasing a key recorded microseconds earlier.
+//
+// A previous record from a DIFFERENT shim or epoch is ignored: its key
+// describes another incarnation's conversation.
+func (r *Registry) PutRetainingResumeKey(rec Record) (*ResumeKey, error) {
+	recordWriteMu.Lock()
+	defer recordWriteMu.Unlock()
+	if rec.ResumeKey == nil {
+		if previous, err := r.Get(rec.Identity()); err == nil &&
+			previous.ShimID == rec.ShimID && previous.ProcessEpoch == rec.ProcessEpoch {
+			rec.ResumeKey = previous.ResumeKey
+		}
+	}
+	if err := r.Put(rec); err != nil {
+		return nil, err
+	}
+	return rec.ResumeKey, nil
+}
+
 // PutTombstone durably publishes a per-incarnation terminal tombstone AND
 // removes only the matching live discovery record, in that order.
 //
@@ -108,6 +173,18 @@ func (r *Registry) Put(rec Record) error {
 // and tombstone correlation, while a different live incarnation under the same
 // lifecycle identity remains visible rather than being erased.
 func (r *Registry) PutTombstone(t Tombstone) error {
+	// The terminal record replaces the live record. Preserve the resume key
+	// before withdrawing that record, so an exited session remains resumable —
+	// under the same lock the live writers hold, because this read-then-remove
+	// is the third read-modify-write over the same file and a key published
+	// between its two halves would be withdrawn without ever being carried.
+	recordWriteMu.Lock()
+	defer recordWriteMu.Unlock()
+	if t.ResumeKey == nil {
+		if rec, err := r.Get(t.Identity()); err == nil && rec.ShimID == t.ShimID && rec.ProcessEpoch == t.ProcessEpoch {
+			t.ResumeKey = rec.ResumeKey
+		}
+	}
 	data, err := t.encode()
 	if err != nil {
 		return err

@@ -54,6 +54,12 @@ const (
 	// only controller path that sets it is gated on the acceptance-control
 	// token file. A launch without it is byte-for-byte the released contract.
 	EnvRingBytes = "DONMAI_SESSION_SHIM_RING_BYTES"
+	// EnvCodexResumeRegistry deliberately reaches the Codex harness. It grants
+	// only publication of its non-secret resume key into this shim's registry;
+	// it is not part of the supervisor launch contract.
+	EnvCodexResumeRegistry = "DONMAI_SESSION_SHIM_CODEX_RESUME_REGISTRY_DIR"
+	EnvCodexResumeOrg      = "DONMAI_SESSION_SHIM_CODEX_RESUME_ORG_ID"
+	EnvCodexResumeSession  = "DONMAI_SESSION_SHIM_CODEX_RESUME_SESSION_ID"
 )
 
 // ErrNoLaunch reports that the environment does not select shim ownership.
@@ -94,6 +100,9 @@ func (l Launch) Env() map[string]string {
 	if l.RingBytes > 0 {
 		env[EnvRingBytes] = strconv.Itoa(l.RingBytes)
 	}
+	env[EnvCodexResumeRegistry] = l.RegistryDir
+	env[EnvCodexResumeOrg] = l.Identity.OrgID
+	env[EnvCodexResumeSession] = l.Identity.SessionID
 	return env
 }
 
@@ -111,6 +120,7 @@ func EnvKeys() []string {
 		EnvOwnership, EnvOrgID, EnvSessionID, EnvRegistryDir, EnvProcessEpoch,
 		EnvOrphanDeadlineMS, EnvTerminationGraceMS, EnvPropagationMarginMS,
 		EnvExternalReleaseMS,
+		EnvCodexResumeRegistry, EnvCodexResumeOrg, EnvCodexResumeSession,
 	}
 }
 

@@ -72,9 +72,31 @@ type Record struct {
 	// WorkareaRoot is the optional session-owned lifecycle root. It is a
 	// secret-free integrity cross-check; old records omit it and remain valid.
 	WorkareaRoot string `json:"workarea_root,omitempty"`
+	// ResumeKey identifies a persisted Codex conversation without carrying any
+	// credential or conversation bytes. It survives quarantine and is copied to
+	// the terminal tombstone so a later operator can resume the same thread.
+	ResumeKey *ResumeKey `json:"resumeKey,omitempty"`
 
 	CreatedAtUnixNano      int64 `json:"createdAt"`
 	OrphanDeadlineUnixNano int64 `json:"orphanDeadlineAt,omitempty"`
+}
+
+// ResumeKey is the durable location and native thread identifier needed by
+// Codex's resume command.
+type ResumeKey struct {
+	CodexHome string `json:"codexHome"`
+	ThreadID  string `json:"threadId"`
+}
+
+// Validate refuses a locator that could not drive a resume: the home must be an
+// absolute path, because it is consumed by a later process with a different
+// working directory, and the thread id is the only thing the native resume verb
+// accepts.
+func (k ResumeKey) Validate() error {
+	if !filepath.IsAbs(k.CodexHome) || k.ThreadID == "" {
+		return fmt.Errorf("%w: invalid resume key", ErrRecordInvalid)
+	}
+	return nil
 }
 
 // Identity returns the record's lifecycle identity.
@@ -132,6 +154,11 @@ func (r Record) Validate() error {
 		rel, err := filepath.Rel(filepath.Clean(r.WorkareaRoot), filepath.Clean(r.WorkareaPath))
 		if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 			return fmt.Errorf("%w: workareaPath is outside workareaRoot", ErrRecordInvalid)
+		}
+	}
+	if r.ResumeKey != nil {
+		if err := r.ResumeKey.Validate(); err != nil {
+			return err
 		}
 	}
 	return nil
@@ -204,7 +231,8 @@ type Tombstone struct {
 	// GroupReaped records whether the shim PROVED the harness process group was
 	// gone. False means the terminal observation exists but death is not proven,
 	// and the session stays in reconciliation rather than releasing a claim.
-	GroupReaped bool `json:"groupReaped"`
+	GroupReaped bool       `json:"groupReaped"`
+	ResumeKey   *ResumeKey `json:"resumeKey,omitempty"`
 
 	ObservedAtUnixNano int64 `json:"observedAt"`
 }
@@ -230,6 +258,11 @@ func (t Tombstone) Validate() error {
 	}
 	if t.ObservedAtUnixNano <= 0 {
 		return fmt.Errorf("%w: tombstone observedAt is missing", ErrRecordInvalid)
+	}
+	if t.ResumeKey != nil {
+		if err := t.ResumeKey.Validate(); err != nil {
+			return err
+		}
 	}
 	return nil
 }

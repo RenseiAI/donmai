@@ -320,6 +320,24 @@ func (b *codexConfigBoundary) remove() error {
 			b.cleanupErr = fmt.Errorf("refusing to remove Codex home: %w", err)
 			return
 		}
+		// A persisted rollout is Codex's resume key. This cleanup path is the
+		// normal lifecycle owner, so it must enforce the same retention rule as
+		// the post-crash orphan sweep: process termination is never authority to
+		// delete resumable conversation state.
+		//
+		// Retention takes the sweep's ACTION as well as its predicate. For a
+		// home holding session state, declaredDeletableEntries names exactly one
+		// deletable entry — cache/, donmai's own staging copy — and the sweep
+		// harvests it and then removes it. Doing anything else here would leave
+		// a resumable home in a shape no sweep ever produces, and would strand
+		// the one subtree that is reclaimable by construction.
+		if hasResumableSessionState(clean) {
+			b.harvestPluginCache()
+			if err := os.RemoveAll(filepath.Join(clean, codexPluginCacheSubdir)); err != nil {
+				b.cleanupErr = fmt.Errorf("remove isolated Codex plugin cache: %w", err)
+			}
+			return
+		}
 		// Harvest whatever this session's own cache/ subtree fetched that the
 		// host-level cache did not already have, so the NEXT session skips
 		// that fetch too. Best-effort and skipped entirely when
@@ -333,6 +351,21 @@ func (b *codexConfigBoundary) remove() error {
 		}
 	})
 	return b.cleanupErr
+}
+
+// hasResumableSessionState reports whether home holds native Codex session
+// state — the sessions/ subtree that carries rollout files, and with them the
+// only thing a `codex resume` can be pointed at.
+//
+// It is deliberately the orphan sweep's own predicate rather than a narrower
+// "is there a rollout-*.jsonl" test: a lifecycle cleanup must never be less
+// protective than a post-crash sweep, and the sweep is conservative on purpose
+// (see declaredDeletableEntries). An unreadable directory answers TRUE for the
+// same reason: "I could not tell" and "there is nothing to keep" are different
+// facts, and only one of them may authorize a delete.
+func hasResumableSessionState(home string) bool {
+	hasState, err := dirHasEntries(filepath.Join(home, codexSessionStateSubdir))
+	return err != nil || hasState
 }
 
 func sameResolvedPath(a, b string) bool {

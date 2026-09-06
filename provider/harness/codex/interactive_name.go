@@ -72,7 +72,7 @@ type namedInteractiveAppServer struct {
 	// path, the existence check for the attach path) — required so the
 	// fresh-session path can observe a thread/started notification emitted
 	// after startNamedInteractiveAppServer returns (see
-	// awaitAndNameLiveThreadWithRequest).
+	// awaitAndNameLiveThreadWithRequestAndRetry).
 	//
 	// clientMu guards it: the eager close in finishNamingLiveInteractiveThread
 	// (or the attach-path close in startNamedInteractiveAppServer) runs on
@@ -125,7 +125,7 @@ func (s *namedInteractiveAppServer) setClient(c *interactiveWebSocketClient) {
 //     subcommand) and lets the TUI create its own thread, then names that
 //     thread POST-HOC once it observes the thread's own thread/started
 //     notification on the connection this function leaves open — see
-//     awaitAndNameLiveThreadWithRequest. This mirrors the proven headless
+//     awaitAndNameLiveThreadWithRequestAndRetry. This mirrors the proven headless
 //     pattern in handle.go (create, then thread/name/set the same live
 //     thread) rather than #480's original design of creating+naming a
 //     thread here and reattaching to it later from the PTY's own process.
@@ -274,16 +274,17 @@ func startNamedInteractiveAppServer(
 // verify. Called by the caller ONLY for the fresh (non-attach) path, after
 // the PTY has been spawned — see startNamedInteractiveAppServer's doc
 // comment for why the sequencing must be this way around.
-func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, server *namedInteractiveAppServer, timeout time.Duration) error {
+func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, server *namedInteractiveAppServer, timeout time.Duration) (string, error) {
 	if server == nil {
-		return errors.New("codex interactive name bootstrap connection is not open")
+		return "", errors.New("codex interactive name bootstrap connection is not open")
 	}
 	client := server.getClient()
 	if client == nil {
-		return errors.New("codex interactive name bootstrap connection is not open")
+		return "", errors.New("codex interactive name bootstrap connection is not open")
 	}
-	if err := awaitAndNameLiveThreadWithRequest(ctx, spec, client.awaitNotification, client.request, timeout); err != nil {
-		return err
+	threadID, err := awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, client.awaitNotification, client.request, timeout, defaultRolloutReadRetryPolicy)
+	if err != nil {
+		return "", err
 	}
 	// Naming succeeded and the PTY already has its own independent
 	// connection to the app-server (the one that created the thread just
@@ -291,7 +292,7 @@ func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, ser
 	// peer is still fully alive, instead of leaving it open for the life of
 	// the session — see namedInteractiveAppServer.closeClient's doc comment.
 	_ = server.closeClient()
-	return nil
+	return threadID, nil
 }
 
 type namedThreadRequest func(context.Context, string, map[string]any, time.Duration) (json.RawMessage, error)
@@ -383,39 +384,28 @@ func requestThreadReadTolerant(
 	}
 }
 
-// awaitAndNameLiveThreadWithRequest waits for the method/thread that the PTY
-// itself created (a thread/started notification), then names that exact
-// live thread and verifies the readback — the fresh-session sequence. The
-// notification and request dependencies are injected so this logic is unit
-// testable without a real websocket/PTY.
-func awaitAndNameLiveThreadWithRequest(
-	ctx context.Context,
-	spec agent.Spec,
-	awaitNotification notificationWaiter,
-	request namedThreadRequest,
-	timeout time.Duration,
-) error {
-	return awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, awaitNotification, request, timeout, defaultRolloutReadRetryPolicy)
-}
-
-// awaitAndNameLiveThreadWithRequestAndRetry is awaitAndNameLiveThreadWithRequest
-// with the thread/read retry policy injected, so tests can exercise the
-// rollout-flush-race tolerance (both the transient and exhausted-retries
-// paths) with a fast backoff schedule instead of the production one.
+// awaitAndNameLiveThreadWithRequestAndRetry waits for the method/thread that
+// the PTY itself created (a thread/started notification), then names that exact
+// live thread and verifies the readback — the fresh-session sequence. It
+// returns the codex-native thread id from that notification, which is the
+// locator a later `codex resume` needs; the session NAME is not one (see
+// resumeExistingNamedThreadWithRequest, which refuses a non-UUID name).
+//
+// The notification and request dependencies are injected so this logic is unit
+// testable without a real websocket/PTY, and the thread/read retry policy is
+// injected with them so a test can exercise the rollout-flush-race tolerance
+// (both the transient and exhausted-retries paths) on a fast backoff schedule
+// instead of the production one.
 func awaitAndNameLiveThreadWithRequestAndRetry(
-	ctx context.Context,
-	spec agent.Spec,
-	awaitNotification notificationWaiter,
-	request namedThreadRequest,
-	timeout time.Duration,
-	retry rolloutReadRetryPolicy,
-) error {
+	ctx context.Context, spec agent.Spec, awaitNotification notificationWaiter, request namedThreadRequest,
+	timeout time.Duration, retry rolloutReadRetryPolicy,
+) (string, error) {
 	if spec.SessionName == "" {
-		return errors.New("codex interactive live-thread naming requires a session name")
+		return "", errors.New("codex interactive live-thread naming requires a session name")
 	}
 	raw, err := awaitNotification(ctx, "thread/started", timeout)
 	if err != nil {
-		return fmt.Errorf("thread/started: %w", err)
+		return "", fmt.Errorf("thread/started: %w", err)
 	}
 	var started struct {
 		Thread struct {
@@ -423,20 +413,20 @@ func awaitAndNameLiveThreadWithRequestAndRetry(
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(raw, &started); err != nil {
-		return fmt.Errorf("thread/started: decode notification: %w", err)
+		return "", fmt.Errorf("thread/started: decode notification: %w", err)
 	}
 	if started.Thread.ID == "" {
-		return errors.New("thread/started: empty thread id in notification")
+		return "", errors.New("thread/started: empty thread id in notification")
 	}
 	if _, err := request(ctx, "thread/name/set", map[string]any{
 		"threadId": started.Thread.ID,
 		"name":     spec.SessionName,
 	}, timeout); err != nil {
-		return fmt.Errorf("thread/name/set: %w", err)
+		return "", fmt.Errorf("thread/name/set: %w", err)
 	}
 	readRaw, err := requestThreadReadTolerant(ctx, request, started.Thread.ID, timeout, retry)
 	if err != nil {
-		return err
+		return "", err
 	}
 	var readback struct {
 		Thread struct {
@@ -445,15 +435,15 @@ func awaitAndNameLiveThreadWithRequestAndRetry(
 		} `json:"thread"`
 	}
 	if err := json.Unmarshal(readRaw, &readback); err != nil {
-		return fmt.Errorf("thread/read after name set: decode response: %w", err)
+		return "", fmt.Errorf("thread/read after name set: decode response: %w", err)
 	}
 	if readback.Thread.ID != started.Thread.ID || readback.Thread.Name != spec.SessionName {
-		return fmt.Errorf(
+		return "", fmt.Errorf(
 			"thread/read after name set: got id %q name %q, want id %q name %q",
 			readback.Thread.ID, readback.Thread.Name, started.Thread.ID, spec.SessionName,
 		)
 	}
-	return nil
+	return started.Thread.ID, nil
 }
 
 // codexThreadIDPattern matches the shape of a codex-native thread id (the

@@ -18,6 +18,16 @@ import (
 	"github.com/coder/websocket"
 )
 
+// nameLiveThread is the error-only shape of the naming sequence. The tests
+// below assert on the failure modes rather than the thread id, and the
+// production caller is the only place that consumes the id.
+func nameLiveThread(
+	ctx context.Context, spec agent.Spec, await notificationWaiter, request namedThreadRequest, timeout time.Duration,
+) error {
+	_, err := awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, await, request, timeout, defaultRolloutReadRetryPolicy)
+	return err
+}
+
 // TestAwaitAndNameLiveThreadWithRequest_NamesTheObservedThread pins the
 // fresh-session sequence: the PTY creates its own thread (observed via a
 // thread/started notification), and this function names THAT exact thread
@@ -56,8 +66,16 @@ func TestAwaitAndNameLiveThreadWithRequest_NamesTheObservedThread(t *testing.T) 
 		}
 	}
 
-	if err := awaitAndNameLiveThreadWithRequest(context.Background(), spec, await, request, time.Second); err != nil {
-		t.Fatalf("awaitAndNameLiveThreadWithRequest: %v", err)
+	threadID, err := awaitAndNameLiveThreadWithRequestAndRetry(
+		context.Background(), spec, await, request, time.Second, defaultRolloutReadRetryPolicy,
+	)
+	if err != nil {
+		t.Fatalf("awaitAndNameLiveThreadWithRequestAndRetry: %v", err)
+	}
+	// The codex-native id from thread/started — NOT the session name — is what
+	// a later resume is pointed at, so the naming sequence has to hand it back.
+	if threadID != "thread-live" {
+		t.Fatalf("thread id = %q, want %q", threadID, "thread-live")
 	}
 	if len(calls) != 2 || calls[0] != "thread/name/set" || calls[1] != "thread/read" {
 		t.Fatalf("request call order = %v, want [thread/name/set thread/read]", calls)
@@ -112,7 +130,7 @@ func TestAwaitAndNameLiveThreadWithRequest_TransientRolloutFlushRaceRetries(t *t
 	}
 
 	retry := rolloutReadRetryPolicy{initialBackoff: time.Millisecond, capTotal: 200 * time.Millisecond}
-	err := awaitAndNameLiveThreadWithRequestAndRetry(
+	_, err := awaitAndNameLiveThreadWithRequestAndRetry(
 		context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second, retry,
 	)
 	if err != nil {
@@ -152,7 +170,7 @@ func TestAwaitAndNameLiveThreadWithRequest_PersistentRolloutFlushRaceFailsAfterE
 	}
 
 	retry := rolloutReadRetryPolicy{initialBackoff: time.Millisecond, capTotal: 10 * time.Millisecond}
-	err := awaitAndNameLiveThreadWithRequestAndRetry(
+	_, err := awaitAndNameLiveThreadWithRequestAndRetry(
 		context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second, retry,
 	)
 	if err == nil {
@@ -212,7 +230,7 @@ func TestAwaitAndNameLiveThreadWithRequest_NotificationTimeoutFails(t *testing.T
 		t.Fatal("request must not be called when the thread/started wait fails")
 		return nil, nil
 	}
-	err := awaitAndNameLiveThreadWithRequest(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second)
+	err := nameLiveThread(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second)
 	if err == nil {
 		t.Fatal("expected an error")
 	}
@@ -231,7 +249,7 @@ func TestAwaitAndNameLiveThreadWithRequest_ReadbackMismatchFails(t *testing.T) {
 		// closed rather than report success on an unverified rename.
 		return json.RawMessage(`{"thread":{"id":"thread-live","name":"someone-else"}}`), nil
 	}
-	err := awaitAndNameLiveThreadWithRequest(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second)
+	err := nameLiveThread(context.Background(), agent.Spec{SessionName: "chief-of-staff"}, await, request, time.Second)
 	if err == nil {
 		t.Fatal("expected a readback-mismatch error")
 	}
@@ -247,7 +265,7 @@ func TestAwaitAndNameLiveThreadWithRequest_EmptyNameFailsClosed(t *testing.T) {
 		t.Fatal("must not issue any RPC with no session name to apply")
 		return nil, nil
 	}
-	if err := awaitAndNameLiveThreadWithRequest(context.Background(), agent.Spec{}, await, request, time.Second); err == nil {
+	if err := nameLiveThread(context.Background(), agent.Spec{}, await, request, time.Second); err == nil {
 		t.Fatal("expected an error")
 	}
 }

@@ -118,6 +118,13 @@ type Shim struct {
 	// handshakeMu serializes Hello-time output barriers. Two same-UID controller
 	// dials cannot each freeze a different LastSeq and then race Welcome commits.
 	handshakeMu sync.Mutex
+	// resumeKey is the harness's native resume locator as this shim last saw it
+	// on disk. It is protected by recordMu because it is read and written only
+	// while composing a record. The shim never produces it — the Codex harness
+	// publishes it into the registry from its own goroutine — so this field is a
+	// cache whose only job is to keep a republish from being the write that
+	// erases it.
+	resumeKey *ResumeKey
 	// ackedSeq is protected by recordMu because advancing it and publishing its
 	// sidecar are one durability transition.
 	ackedSeq          uint64
@@ -540,6 +547,11 @@ func (s *Shim) finalizeTerminal() error {
 	// between its two halves would undo it. s.tombstoned is already set above, so
 	// any republish that queues behind this lock is refused rather than reordered.
 	s.recordMu.Lock()
+	// The key this shim last saw published is the fallback for PutTombstone's
+	// own read of the live record: if that record has become unreadable, the
+	// cached locator is still better evidence than withdrawing the session with
+	// none. A nil cache leaves the registry read as the sole source.
+	t.ResumeKey = s.resumeKey
 	err := s.registry.PutTombstone(t)
 	if err == nil {
 		s.terminalPublished = true
@@ -736,12 +748,25 @@ func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
 		Phase:             phase,
 		WorkareaPath:      s.workarea,
 		WorkareaRoot:      s.workareaRoot,
+		ResumeKey:         s.resumeKey,
 		CreatedAtUnixNano: s.now().UnixNano(),
 	}
 	if !deadline.IsZero() {
 		rec.OrphanDeadlineUnixNano = deadline.UnixNano()
 	}
-	return s.registry.Put(rec)
+	// The record is rebuilt from this shim's own state, and the harness's resume
+	// key was never part of that state: the Codex harness publishes it into the
+	// registry directly, from another goroutine, at whatever moment its native
+	// rollout lands. PutRetainingResumeKey carries the recorded key across this
+	// write inside one critical section, and returns it so the next republish
+	// re-emits it even if the record is unreadable by then. Held under recordMu,
+	// which is the only reader and writer of s.resumeKey.
+	key, err := s.registry.PutRetainingResumeKey(rec)
+	if err != nil {
+		return err
+	}
+	s.resumeKey = key
+	return nil
 }
 
 // ---- serving ---------------------------------------------------------------

@@ -671,7 +671,13 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 		})
 		return
 	}
-	writeJSON(w, http.StatusOK, detail)
+	// The resume locator is projected onto a copy: detail is the session's own
+	// stored value, and the endpoint must not mutate it.
+	projected := *detail
+	if key, found := s.daemon.sessionResumeKey(projected.SessionID, projected.OrganizationID); found {
+		projected.ResumeKey = key
+	}
+	writeJSON(w, http.StatusOK, &projected)
 }
 
 // handleSessionStop handles POST /api/daemon/sessions/<id>/stop — the

@@ -169,6 +169,9 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 				config.remove(),
 			)
 		}
+		if attachToExistingNamedSession(spec) {
+			recordResumeKey(config.home, spec.SessionName)
+		}
 		cleanup := func() error { return errors.Join(server.close(), config.remove()) }
 		return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, cleanup)
 	}
@@ -216,7 +219,8 @@ func spawnNamedInteractivePTY(
 	if nameTimeout <= 0 {
 		nameTimeout = 30 * time.Second
 	}
-	if err := finishNamingLiveInteractiveThread(ctx, spec, server, nameTimeout); err != nil {
+	threadID, err := finishNamingLiveInteractiveThread(ctx, spec, server, nameTimeout)
+	if err != nil {
 		// Stop below can take up to the shim finalize grace window (see
 		// ptycli.Handle.awaitShimTerminal); log the reason now so a slow
 		// teardown is not silent about why it started. The bootstrap
@@ -235,6 +239,9 @@ func spawnNamedInteractivePTY(
 		}
 		return nil, errors.Join(wrapped, stopErr)
 	}
+	// finishNamingLiveInteractiveThread waits through Codex's rollout-flush
+	// race, so the resume key is recorded only after the native state exists.
+	recordResumeKey(spec.Env["CODEX_HOME"], threadID)
 	return handle, nil
 }
 
