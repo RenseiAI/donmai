@@ -12,6 +12,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -144,7 +145,7 @@ func (d *Daemon) SessionShimOwnsSession(spec SessionSpec) bool { return d.shimOw
 // holds the exec.Cmd, the PTY fd, or a *ptyhost.Session (§D1) — after this
 // function returns, everything it knows about the session travels over a socket
 // it can drop and re-dial.
-func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env []string) (*SessionHandle, error) {
+func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env []string) (_ *SessionHandle, err error) {
 	if !d.shimOwnsSession(spec) {
 		return nil, nil
 	}
@@ -205,11 +206,32 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	logPath := shimChildLogPath(launch.RegistryDir, launch.Identity)
 	launchAdopted := false
 	defer func() {
-		if !launchAdopted {
-			removeShimChildLog(launch.RegistryDir, launch.Identity)
+		if launchAdopted {
+			return
 		}
+		// KEEP it, do not unlink it. This log is the only record of why the
+		// child died, and every path that reaches here is a spawn the
+		// operator now has to explain. Deleting it at the exact moment it
+		// became the answer is what made spawn-failed seats undiagnosable.
+		kept, tail := preserveShimChildLog(launch.RegistryDir, launch.Identity)
+		if err == nil || tail == "" {
+			return
+		}
+		// Carry the tail out on the error itself. This return value becomes
+		// the spawner's abort reason and, through it, the NACK reason the
+		// control plane records — so the diagnosis reaches an operator who
+		// has no access to this host's filesystem, which is the whole point.
+		// %w, so every errors.Is/As check upstream still sees what it saw.
+		err = fmt.Errorf("%w; child log %s tail: %s", err, filepath.Base(kept), tail)
 	}()
 	go runShimChildLogGuard(logPath)
+
+	// Terminal artifacts are swept on the way IN, not on the way out: a
+	// preserved log outlives the launch that produced it by design, so
+	// nothing later in this session's own lifecycle is in a position to
+	// reclaim it. One bounded directory read per launch, against a directory
+	// that already holds one record and one socket per live session.
+	sweepFailedShimChildLogs(launch.RegistryDir, time.Now())
 
 	ctx, cancel := context.WithTimeout(context.Background(), cfg.launchTimeout())
 	defer cancel()
@@ -1389,6 +1411,22 @@ func redactShimChildLog(f *os.File, size int64) error {
 	if _, err := f.ReadAt(buf, 0); err != nil && !errors.Is(err, io.EOF) {
 		return err
 	}
+	if !redactShimChildLogBytes(buf) {
+		return nil
+	}
+	_, err := f.WriteAt(buf, 0)
+	return err
+}
+
+// redactShimChildLogBytes masks every shimChildLogSecretPatterns match in buf
+// with the ASCII byte 'x', in place and span-for-span, and reports whether it
+// changed anything.
+//
+// Split out of redactShimChildLog so the on-disk pass and the failure tail
+// carried out on an error share ONE definition of what a secret looks like. A
+// second copy of this loop is how a tail ends up quoting a credential the file
+// beside it had already masked.
+func redactShimChildLogBytes(buf []byte) bool {
 	changed := false
 	for _, pattern := range shimChildLogSecretPatterns {
 		for _, loc := range pattern.FindAllIndex(buf, -1) {
@@ -1400,11 +1438,7 @@ func redactShimChildLog(f *os.File, size int64) error {
 			}
 		}
 	}
-	if !changed {
-		return nil
-	}
-	_, err := f.WriteAt(buf, 0)
-	return err
+	return changed
 }
 
 // capShimChildLog truncates f back to shimChildLogCapBytes and appends one
@@ -1438,6 +1472,174 @@ func capShimChildLog(f *os.File, size int64) error {
 	defer func() { _ = appendFile.Close() }()
 	_, err = appendFile.Write([]byte(fmt.Sprintf(shimChildLogTruncationMarkerFormat, size, shimChildLogCapBytes)))
 	return err
+}
+
+// shimFailedChildLogSuffix names the sibling a pre-adoption failure's child
+// log is kept under. It is appended to the SAME digest filename the live log
+// used (shimChildLogPath), so the failed log sits beside this session's own
+// record, socket and tombstone and is recognizable as belonging to it.
+const shimFailedChildLogSuffix = ".failed"
+
+// shimFailedChildLogRetention bounds how long a preserved failure log is kept.
+//
+// A day, chosen to be longer than the interval between a seat dying and
+// somebody asking why, and short enough that a host stuck in a launch-failure
+// loop cannot accumulate them indefinitely. It is stated here as its own named
+// window rather than derived from something else because there is nothing else
+// on this path with a retention policy to inherit: the registry's live
+// artifacts are withdrawn by the sessions that own them, and a failed launch
+// has no owner left to do that.
+const shimFailedChildLogRetention = 24 * time.Hour
+
+// shimFailedChildLogTailBytes and shimFailedChildLogTailLines bound the excerpt
+// carried out on the launch error.
+//
+// The TAIL is what is kept, for the same reason codex's app-server excerpt
+// keeps the tail: a fatal error is almost always the last thing a dying process
+// prints. The two bounds are both applied — bytes first, then lines — so a
+// child that writes one enormous line cannot turn a NACK reason into a
+// multi-kilobyte blob, and a chatty one cannot bury the fatal line under fifty
+// progress updates.
+const (
+	shimFailedChildLogTailBytes = 2 << 10 // 2 KiB
+	shimFailedChildLogTailLines = 12
+)
+
+// shimFailedChildLogPath returns the retained sibling of shimChildLogPath.
+func shimFailedChildLogPath(registryDir string, id sessionshim.Identity) string {
+	return shimChildLogPath(registryDir, id) + shimFailedChildLogSuffix
+}
+
+// preserveShimChildLog keeps a failed launch's captured stdout/stderr instead
+// of unlinking it, and returns the retained path together with a bounded,
+// redacted tail of its content.
+//
+// The order is load-bearing:
+//
+//  1. REDACT THE WHOLE FILE FIRST. The guard goroutine only sweeps every
+//     shimChildLogGuardInterval, so up to one interval of the child's output
+//     has never been masked — and unlike the old behaviour, this file is about
+//     to survive for a day rather than be deleted in the next instruction. A
+//     final full pass is what makes retention safe to add at all.
+//  2. Read the tail back AFTER that pass, so what rides out on the error is
+//     the masked bytes and not a second, unredacted view of the same content.
+//  3. Rename, not copy. Rename is atomic and cheap, and the child — which on
+//     the abandoned-live-process path may still be running — keeps writing
+//     through its own fd into the same inode, so nothing it prints after this
+//     moment is lost.
+//
+// Best-effort throughout: a missing file (the ordinary case for a launch that
+// failed before startShimProcess ever ran) is not an error, and a failure to
+// preserve is logged and swallowed. This runs on a path that is already
+// returning a failure; it must not manufacture a second one.
+func preserveShimChildLog(registryDir string, id sessionshim.Identity) (string, string) {
+	livePath := shimChildLogPath(registryDir, id)
+	failedPath := shimFailedChildLogPath(registryDir, id)
+
+	tail := redactAndReadShimChildLogTail(livePath)
+	if err := os.Rename(livePath, failedPath); err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return "", ""
+		}
+		// The file is still there under its live name, un-renamed. That is a
+		// worse outcome than a clean rename but a far better one than the
+		// removal this replaced: the diagnosis still exists on disk.
+		slog.Warn("session shim: retain the failed launch's child log", //nolint:gosec // structured slog handler escapes values
+			"session", id.String(), "path", livePath, "error", err)
+		return livePath, tail
+	}
+	slog.Info("session shim: kept the failed launch's child log", //nolint:gosec // structured slog handler escapes values
+		"session", id.String(), "path", failedPath)
+	return failedPath, tail
+}
+
+// redactAndReadShimChildLogTail runs one final redaction pass over the whole
+// file and returns its last shimFailedChildLogTailLines lines (at most
+// shimFailedChildLogTailBytes of them), joined with " | " so the excerpt stays
+// one line in a log record and one field in a NACK reason.
+func redactAndReadShimChildLogTail(logPath string) string {
+	f, err := os.OpenFile(logPath, os.O_RDWR, 0o600) //nolint:gosec // G304: logPath is this daemon's own registry directory plus a digest filename, never external input
+	if err != nil {
+		return ""
+	}
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return ""
+	}
+	size := info.Size()
+	if err := redactShimChildLog(f, size); err != nil {
+		slog.Warn("session shim: redact the failed launch's child log", //nolint:gosec // structured slog handler escapes values
+			"path", logPath, "error", err)
+		// Fall through WITHOUT a tail. An excerpt whose redaction pass failed
+		// is exactly the excerpt that must not be forwarded to a control
+		// plane; the file itself is still kept for a local operator.
+		return ""
+	}
+	if size <= 0 {
+		return ""
+	}
+	offset := int64(0)
+	if size > shimFailedChildLogTailBytes {
+		offset = size - shimFailedChildLogTailBytes
+	}
+	buf := make([]byte, size-offset)
+	if _, err := f.ReadAt(buf, offset); err != nil && !errors.Is(err, io.EOF) {
+		return ""
+	}
+	return shimChildLogTailExcerpt(buf, offset > 0)
+}
+
+// shimChildLogTailExcerpt reduces raw tail bytes to the excerpt an error
+// carries. partial says the read started mid-file, in which case the first
+// (necessarily truncated) line is dropped rather than quoted as if it were
+// whole.
+func shimChildLogTailExcerpt(buf []byte, partial bool) string {
+	lines := strings.Split(strings.ReplaceAll(string(buf), "\r\n", "\n"), "\n")
+	if partial && len(lines) > 0 {
+		lines = lines[1:]
+	}
+	kept := make([]string, 0, shimFailedChildLogTailLines)
+	for _, line := range lines {
+		if trimmed := strings.TrimSpace(line); trimmed != "" {
+			kept = append(kept, trimmed)
+		}
+	}
+	if len(kept) > shimFailedChildLogTailLines {
+		kept = kept[len(kept)-shimFailedChildLogTailLines:]
+	}
+	return strings.Join(kept, " | ")
+}
+
+// sweepFailedShimChildLogs removes preserved failure logs older than
+// shimFailedChildLogRetention.
+//
+// Best-effort and silent about the ordinary cases: an unreadable directory
+// (the very first launch on a fresh host creates it) and an entry that
+// disappears mid-sweep are both expected. Only a removal that fails for a
+// reason other than the file already being gone is worth a line.
+func sweepFailedShimChildLogs(registryDir string, now time.Time) {
+	entries, err := os.ReadDir(registryDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() || !strings.HasSuffix(entry.Name(), shimFailedChildLogSuffix) {
+			continue
+		}
+		info, err := entry.Info()
+		if err != nil {
+			continue
+		}
+		if now.Sub(info.ModTime()) < shimFailedChildLogRetention {
+			continue
+		}
+		path := filepath.Join(registryDir, entry.Name())
+		if err := os.Remove(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+			slog.Warn("session shim: sweep a retained failure log", //nolint:gosec // structured slog handler escapes values
+				"path", path, "error", err)
+		}
+	}
 }
 
 // removeShimChildLog disposes of the per-session stdout/stderr capture file
