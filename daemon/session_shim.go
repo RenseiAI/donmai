@@ -2468,13 +2468,16 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		// A refusal that is carrier cursor drift is AMBIGUOUS evidence — a stale
-		// proof, not a verdict on the lineage — so it gets the bounded
-		// re-prepared re-dial the recovery corpus requires before any terminal
-		// consequence. Every other refusal keeps its single attempt. The final
-		// evidence and preparation come back because a re-prepare mints new
-		// ones and the receipt below belongs to that pair, not to the first.
-		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithDriftRedial(
+		// Two refusals are AMBIGUOUS evidence rather than a verdict on the
+		// lineage, and each gets the bounded re-dial the recovery corpus
+		// requires before any terminal consequence: carrier cursor drift (a
+		// stale proof — re-prepared, then re-dialled) and a relay that declined
+		// to be reached at all (a planned restart's drain, or a dial that never
+		// got through — the same proof, re-dialled after the floor it named).
+		// Every other refusal keeps its single attempt. The final evidence and
+		// preparation come back because a re-prepare mints new ones and the
+		// receipt below belongs to that pair, not to the first.
+		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithBoundedRedial(
 			ctx, c, preparations, hostByID[id], evidence, preparation,
 		)
 		delete(preparedByID, id)

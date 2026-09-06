@@ -21,6 +21,9 @@ import (
 //   - *RelayStopError → terminal, RunHost stops;
 //   - *RelayRingMissError → RESET-AND-RETRY: never terminal (§13), the
 //     reconnect loop drops the local resume position and re-attaches fresh;
+//   - *RelayRestartingError → the relay announced a PLANNED restart: never
+//     terminal, the reconnect loop waits out the named redial floor and dials
+//     the replacement;
 //   - any other error → transient, the caller reconnects.
 //
 // It does NOT dedup Input — the WSS lane is exactly-once. The degraded lane's
@@ -125,6 +128,13 @@ func (h *host) handleControl(ctx context.Context, msg attachwire.ControlMessage)
 		switch {
 		case m.Code == attachwire.CodeEpochStale:
 			return nil, ErrEpochStale
+		case m.Code == attachwire.CodeRelayRestarting:
+			// The planned-restart contract: the relay is going away ON PURPOSE
+			// and will be back in seconds. This is the announcement half; the
+			// 1012 close follows it. Never terminal — the reconnect loop waits
+			// out the named floor and dials the replacement (see the
+			// isRelayRestarting case in host.run).
+			return nil, relayRestartControl(m)
 		case m.Code == attachwire.CodeRingMiss:
 			// §13: the relay lost its ring/room history (the designed relay-
 			// restart repair path is always safe) — RESET-AND-RETRY regardless

@@ -424,6 +424,13 @@ func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder
 		case http.StatusConflict:
 			_ = resp.Body.Close()
 			return nil, ErrEpochStale
+		case http.StatusServiceUnavailable:
+			// The drain window refuses every attach lane, this one included.
+			// Without the classification the fallback lane would read a planned
+			// restart as an unexplained 5xx and burn its budget on it.
+			restart := RelayRestartRefusal(resp)
+			_ = resp.Body.Close()
+			return nil, restart
 		default:
 			_ = resp.Body.Close()
 			return nil, fmt.Errorf("attachclient: host SSE GET status %d", resp.StatusCode)

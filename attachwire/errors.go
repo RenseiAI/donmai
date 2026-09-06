@@ -53,6 +53,26 @@ const (
 	// tell a repeat notice apart from a newly-observed loss without
 	// re-deriving it.
 	CodeHostStillAbsent ErrorCode = "host-still-absent"
+
+	// CodeRelayRestarting is a host-leg §7 error.code (v1-draft registry
+	// extension) a relay sends immediately before it closes that leg for a
+	// PLANNED restart. It is the one signal that separates a deliberate
+	// redeploy from the box dying: without it a host reads a bare mid-frame
+	// EOF and cannot tell the two apart, so it classifies a carrier that is
+	// seconds from returning as unreachable.
+	//
+	// message grammar (frozen): "redial after <N>s", N a decimal integer of
+	// seconds >= 1 — the floor the relay asks this host to wait before
+	// dialling its replacement, so a whole fleet does not arrive back before
+	// the replacement has booted. The same number rides Retry-After on the
+	// 503 every attach dial receives during the drain window, and the
+	// WebSocket close that follows the announcement carries status 1012
+	// (Service Restart) with reason "relay-restarting: redial after <N>s".
+	//
+	// It is ALWAYS retryable and NEVER terminal, on either attach lane: the
+	// host still owns the authoritative PTY, so the only correct response is
+	// to wait out the hint and re-dial. See attachclient.RelayRestartingError.
+	CodeRelayRestarting ErrorCode = "relay-restarting"
 )
 
 // FramingError classifies a wire-format violation that §2.1/§3 mandate be

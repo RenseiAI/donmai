@@ -27,6 +27,12 @@ import (
 // reacquires its view whenever the relay returns however late. See the
 // isRelayRingMiss case in run.
 //
+// A PLANNED relay restart — announced as a relay-restarting error control, as a
+// 1012 Service Restart close, or as a 503 with Retry-After on the dial itself —
+// is likewise never terminal and never a fallback trigger. The relay is telling
+// this host that it is going away deliberately and will be back; RunHost waits
+// out the redial floor it named and dials the replacement.
+//
 // It dials OUT only (WSS, with degraded HTTPS fallback per § 14); it never opens
 // an inbound listener. Reconnect uses cancel-aware exponential backoff, reset on
 // success, with TokenSource re-resolution before each top-level carrier attempt;
@@ -268,6 +274,28 @@ func (h *host) run(ctx context.Context) error {
 			epochRetry.reset()
 			h.hasStreamed = false
 			if err := sleepCtx(ctx, ringBo.next()); err != nil {
+				return err
+			}
+			continue
+		case IsRelayRestarting(rerr):
+			// A PLANNED restart. The relay said so — as a control, as a 1012
+			// close, or as a 503 on the dial — so this is the one disconnect
+			// that is known in advance to be transient. Never terminal, and
+			// never a fallback trigger either: the drain refuses BOTH lanes, so
+			// counting it toward the § 14 degraded fallback would move a healthy
+			// carrier onto the slow lane for a condition the slow lane shares.
+			//
+			// The relay's own hint is a FLOOR, not a replacement for backoff:
+			// arriving back before the replacement process has booted is how a
+			// whole fleet turns one restart into a thundering herd.
+			ringBo.reset()
+			delay := bo.next()
+			if hint, _ := RelayRedialAfter(rerr); hint > delay {
+				delay = hint
+			}
+			h.log.Warn("attachclient: the relay announced a planned restart — waiting out its redial floor",
+				"delay", delay, "err", rerr)
+			if err := sleepCtx(ctx, delay); err != nil {
 				return err
 			}
 			continue
