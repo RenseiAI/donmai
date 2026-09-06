@@ -72,7 +72,7 @@ type namedInteractiveAppServer struct {
 	// path, the existence check for the attach path) — required so the
 	// fresh-session path can observe a thread/started notification emitted
 	// after startNamedInteractiveAppServer returns (see
-	// awaitAndNameLiveThreadWithRequest).
+	// awaitAndNameLiveThreadWithRequestAndRetry).
 	//
 	// clientMu guards it: the eager close in finishNamingLiveInteractiveThread
 	// (or the attach-path close in startNamedInteractiveAppServer) runs on
@@ -125,7 +125,7 @@ func (s *namedInteractiveAppServer) setClient(c *interactiveWebSocketClient) {
 //     subcommand) and lets the TUI create its own thread, then names that
 //     thread POST-HOC once it observes the thread's own thread/started
 //     notification on the connection this function leaves open — see
-//     awaitAndNameLiveThreadWithRequest. This mirrors the proven headless
+//     awaitAndNameLiveThreadWithRequestAndRetry. This mirrors the proven headless
 //     pattern in handle.go (create, then thread/name/set the same live
 //     thread) rather than #480's original design of creating+naming a
 //     thread here and reattaching to it later from the PTY's own process.
@@ -282,7 +282,7 @@ func finishNamingLiveInteractiveThread(ctx context.Context, spec agent.Spec, ser
 	if client == nil {
 		return "", errors.New("codex interactive name bootstrap connection is not open")
 	}
-	threadID, err := awaitAndNameLiveThreadWithRequestAndRetryThreadID(ctx, spec, client.awaitNotification, client.request, timeout, defaultRolloutReadRetryPolicy)
+	threadID, err := awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, client.awaitNotification, client.request, timeout, defaultRolloutReadRetryPolicy)
 	if err != nil {
 		return "", err
 	}
@@ -384,38 +384,19 @@ func requestThreadReadTolerant(
 	}
 }
 
-// awaitAndNameLiveThreadWithRequest waits for the method/thread that the PTY
-// itself created (a thread/started notification), then names that exact
-// live thread and verifies the readback — the fresh-session sequence. The
-// notification and request dependencies are injected so this logic is unit
-// testable without a real websocket/PTY.
-func awaitAndNameLiveThreadWithRequest(
-	ctx context.Context,
-	spec agent.Spec,
-	awaitNotification notificationWaiter,
-	request namedThreadRequest,
-	timeout time.Duration,
-) error {
-	return awaitAndNameLiveThreadWithRequestAndRetry(ctx, spec, awaitNotification, request, timeout, defaultRolloutReadRetryPolicy)
-}
-
-// awaitAndNameLiveThreadWithRequestAndRetry is awaitAndNameLiveThreadWithRequest
-// with the thread/read retry policy injected, so tests can exercise the
-// rollout-flush-race tolerance (both the transient and exhausted-retries
-// paths) with a fast backoff schedule instead of the production one.
+// awaitAndNameLiveThreadWithRequestAndRetry waits for the method/thread that
+// the PTY itself created (a thread/started notification), then names that exact
+// live thread and verifies the readback — the fresh-session sequence. It
+// returns the codex-native thread id from that notification, which is the
+// locator a later `codex resume` needs; the session NAME is not one (see
+// resumeExistingNamedThreadWithRequest, which refuses a non-UUID name).
+//
+// The notification and request dependencies are injected so this logic is unit
+// testable without a real websocket/PTY, and the thread/read retry policy is
+// injected with them so a test can exercise the rollout-flush-race tolerance
+// (both the transient and exhausted-retries paths) on a fast backoff schedule
+// instead of the production one.
 func awaitAndNameLiveThreadWithRequestAndRetry(
-	ctx context.Context,
-	spec agent.Spec,
-	awaitNotification notificationWaiter,
-	request namedThreadRequest,
-	timeout time.Duration,
-	retry rolloutReadRetryPolicy,
-) error {
-	_, err := awaitAndNameLiveThreadWithRequestAndRetryThreadID(ctx, spec, awaitNotification, request, timeout, retry)
-	return err
-}
-
-func awaitAndNameLiveThreadWithRequestAndRetryThreadID(
 	ctx context.Context, spec agent.Spec, awaitNotification notificationWaiter, request namedThreadRequest,
 	timeout time.Duration, retry rolloutReadRetryPolicy,
 ) (string, error) {

@@ -7,6 +7,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -323,6 +324,162 @@ func TestRegistryResumeKeySurvivesTerminalPublication(t *testing.T) {
 	tombstone, err := reg.GetTombstone(id)
 	if err != nil || tombstone.ResumeKey == nil || *tombstone.ResumeKey != key {
 		t.Fatalf("terminal resume key = %+v, err=%v", tombstone.ResumeKey, err)
+	}
+}
+
+// TestResumeKeySurvivesEveryRepublishOfALiveShim closes the gap the test above
+// leaves: it publishes the key onto a LIVE shim and then drives every writer
+// that rebuilds that shim's record from in-memory state, in the order the
+// incident produced them.
+//
+// The record a shim republishes is composed from its own fields, and the resume
+// key is not one of them — the harness writes it into the registry from its own
+// goroutine. So a controller drop (armOrphan), a re-adoption (disarmOrphan) and
+// a bare publishRecordWithDeadline each used to be a write that silently
+// replaced the key with nothing, and PutTombstone's preserve-read then found
+// nothing to carry.
+func TestResumeKeySurvivesEveryRepublishOfALiveShim(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := Identity{OrgID: "org-resume-live", SessionID: "sess-resume-live"}
+	sh := startInProcessShim(t, reg, dir, id, 1)
+
+	key := ResumeKey{CodexHome: filepath.Join(dir, "codex-home"), ThreadID: "01a0548d-9a06-7a30-a72c-f7c94b8c899c"}
+	if err := reg.PutResumeKey(id, key); err != nil {
+		t.Fatalf("PutResumeKey: %v", err)
+	}
+
+	for _, step := range []struct {
+		name string
+		run  func()
+	}{
+		{name: "controller loss arms the orphan clock", run: sh.armOrphan},
+		{name: "a controller returns", run: sh.disarmOrphan},
+		{name: "a bare deadline republish", run: func() {
+			if err := sh.publishRecordWithDeadline(time.Now().Add(time.Hour)); err != nil {
+				t.Fatalf("publishRecordWithDeadline: %v", err)
+			}
+		}},
+		{name: "a bare republish", run: func() {
+			if err := sh.publishRecord(); err != nil {
+				t.Fatalf("publishRecord: %v", err)
+			}
+		}},
+	} {
+		step.run()
+		rec, err := reg.Get(id)
+		if err != nil {
+			t.Fatalf("Get after %s: %v", step.name, err)
+		}
+		if rec.ResumeKey == nil || *rec.ResumeKey != key {
+			t.Fatalf("resume key after %s = %+v, want %+v", step.name, rec.ResumeKey, key)
+		}
+	}
+
+	// A second key never displaces the first: one session, one native
+	// conversation.
+	if err := reg.PutResumeKey(id, ResumeKey{CodexHome: dir, ThreadID: "some-other-thread"}); err != nil {
+		t.Fatalf("second PutResumeKey: %v", err)
+	}
+	rec, err := reg.Get(id)
+	if err != nil || rec.ResumeKey == nil || *rec.ResumeKey != key {
+		t.Fatalf("resume key after a second publication = %+v, err=%v", rec.ResumeKey, err)
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := sh.Terminate(ctx); err != nil {
+		t.Fatalf("Terminate: %v", err)
+	}
+	tombstone, err := reg.GetTombstone(id)
+	if err != nil {
+		t.Fatalf("GetTombstone: %v", err)
+	}
+	if tombstone.ResumeKey == nil || *tombstone.ResumeKey != key {
+		t.Fatalf("terminal resume key = %+v, want %+v", tombstone.ResumeKey, key)
+	}
+}
+
+// TestResumeKeyWritersSerializeOnOneLock pins the fix for the lost update the
+// read-back alone cannot close.
+//
+// Both writers do Get → mutate → Put over the same file from different Registry
+// handles in one process: the harness's PutResumeKey and the shim's republish.
+// A read-back that is not inside the writer's own critical section still loses
+// the interleaving Get/Get/Put(key)/Put(no key), and the naming window those two
+// overlap in is tens of seconds wide. Holding the lock here proves each writer
+// waits for it rather than merely reading before writing.
+func TestResumeKeyWritersSerializeOnOneLock(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatalf("NewRegistry: %v", err)
+	}
+	id := Identity{OrgID: "org-resume-lock", SessionID: "sess-resume-lock"}
+	sh := startInProcessShim(t, reg, dir, id, 1)
+	key := ResumeKey{CodexHome: filepath.Join(dir, "codex-home"), ThreadID: "01a0548d-9a06-7a30-a72c-f7c94b8c899c"}
+
+	for _, tc := range []struct {
+		name string
+		call func() error
+	}{
+		{name: "the harness recording its key", call: func() error { return reg.PutResumeKey(id, key) }},
+		{name: "the shim republishing its record", call: sh.publishRecord},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			started, done := make(chan struct{}), make(chan error, 1)
+			recordWriteMu.Lock()
+			go func() {
+				close(started)
+				done <- tc.call()
+			}()
+			<-started
+			select {
+			case err := <-done:
+				recordWriteMu.Unlock()
+				t.Fatalf("%s completed while the record write lock was held (err=%v); "+
+					"the two read-modify-write publishers do not share a lock", tc.name, err)
+			case <-time.After(100 * time.Millisecond):
+			}
+			recordWriteMu.Unlock()
+			if err := <-done; err != nil {
+				t.Fatalf("%s: %v", tc.name, err)
+			}
+		})
+	}
+
+	// And the property that serialization buys, under -race: whichever order the
+	// two writers land in, the key is still there afterwards.
+	var wg sync.WaitGroup
+	wg.Add(2)
+	go func() {
+		defer wg.Done()
+		for i := 0; i < 50; i++ {
+			if err := sh.publishRecord(); err != nil {
+				t.Errorf("publishRecord: %v", err)
+				return
+			}
+		}
+	}()
+	go func() {
+		defer wg.Done()
+		if err := reg.PutResumeKey(id, key); err != nil {
+			t.Errorf("PutResumeKey: %v", err)
+		}
+	}()
+	wg.Wait()
+	rec, err := reg.Get(id)
+	if err != nil || rec.ResumeKey == nil || *rec.ResumeKey != key {
+		t.Fatalf("resume key after concurrent publication = %+v, err=%v", rec.ResumeKey, err)
 	}
 }
 

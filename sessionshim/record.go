@@ -88,6 +88,10 @@ type ResumeKey struct {
 	ThreadID  string `json:"threadId"`
 }
 
+// Validate refuses a locator that could not drive a resume: the home must be an
+// absolute path, because it is consumed by a later process with a different
+// working directory, and the thread id is the only thing the native resume verb
+// accepts.
 func (k ResumeKey) Validate() error {
 	if !filepath.IsAbs(k.CodexHome) || k.ThreadID == "" {
 		return fmt.Errorf("%w: invalid resume key", ErrRecordInvalid)

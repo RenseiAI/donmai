@@ -13,7 +13,7 @@ import (
 // only by a shim-owned launch; ordinary and standalone sessions retain their
 // existing behavior.
 func recordResumeKey(home, threadID string) {
-	if home == "" || threadID == "" || !hasCodexRollout(home) {
+	if home == "" || threadID == "" || !hasResumableSessionState(home) {
 		return
 	}
 	registryDir := strings.TrimSpace(os.Getenv(sessionshim.EnvCodexResumeRegistry))

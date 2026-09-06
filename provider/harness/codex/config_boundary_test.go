@@ -86,12 +86,37 @@ func TestCodexConfigBoundaryRemovalRetainsHomesWithRollouts(t *testing.T) {
 					t.Fatalf("write session state: %v", err)
 				}
 			}
+			// cache/ is donmai's own staging subtree. The orphan sweep
+			// harvests it and then removes it even from a home it retains
+			// (declaredDeletableEntries), so this cleanup must do the same.
+			cacheDir := filepath.Join(boundary.home, codexPluginCacheSubdir)
+			if err := os.MkdirAll(cacheDir, 0o700); err != nil {
+				t.Fatalf("create plugin cache: %v", err)
+			}
 			if err := boundary.remove(); err != nil {
 				t.Fatalf("boundary remove: %v", err)
 			}
 			_, statErr := os.Stat(boundary.home)
 			if got := statErr == nil; got != tc.wantHome {
 				t.Fatalf("home exists after cleanup = %t, want %t (err=%v)", got, tc.wantHome, statErr)
+			}
+			if !tc.wantHome {
+				return
+			}
+			// A retained home keeps everything a resume needs — the session
+			// state AND the config.toml that names the store it was written
+			// under — and gives up only the one entry the sweep declares
+			// deletable.
+			for _, keep := range []string{
+				filepath.Join(codexSessionStateSubdir, "2026", "09", "06", tc.stateName),
+				codexConfigFileName,
+			} {
+				if _, err := os.Stat(filepath.Join(boundary.home, keep)); err != nil {
+					t.Fatalf("retained home lost %s: %v", keep, err)
+				}
+			}
+			if _, err := os.Stat(cacheDir); !os.IsNotExist(err) {
+				t.Fatalf("retained home kept the reclaimable plugin cache: err=%v", err)
 			}
 		})
 	}

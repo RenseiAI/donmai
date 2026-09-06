@@ -136,7 +136,7 @@ func runCodexFakeNamedAppServer() {
 				// the PTY's OWN connection sends this once it attaches with bare
 				// --remote; the response goes back to IT, and the notification
 				// broadcasts to every open connection (the diagnostic one is what
-				// awaitAndNameLiveThreadWithRequest is waiting on).
+				// awaitAndNameLiveThreadWithRequestAndRetry is waiting on).
 				threadID := fakeNamedAppServerThreadID
 				result, _ := json.Marshal(map[string]any{"thread": map[string]any{"id": threadID}})
 				body, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: result})
