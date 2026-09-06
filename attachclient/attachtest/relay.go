@@ -31,6 +31,9 @@ type Config struct {
 	// simulation) so the client falls back to the degraded lane (§ 14). Toggle at
 	// runtime with SetRefuseWSS to exercise upgrade-back.
 	RefuseWSS bool
+	// RefuseWSSStatus replaces the 404 that refusal answers with. Zero keeps
+	// 404; see SetRefuseWSSStatus for the one distinction it exists for.
+	RefuseWSSStatus int
 	// DropHostPOSTOnce returns 503 to the FIRST host POST that is newly applied,
 	// simulating a lost 200 so the client retries the same batchId (§ 14
 	// idempotency). The batch is still applied; the retry is a de-duplicated
@@ -52,8 +55,9 @@ type StubRelay struct {
 	server *http.Server
 	ln     net.Listener
 
-	refuseWSS   atomic.Bool
-	droppedPOST atomic.Bool
+	refuseWSS       atomic.Bool
+	refuseWSSStatus atomic.Int64
+	droppedPOST     atomic.Bool
 
 	// restartMu guards the planned-restart drain: the signal live host legs
 	// select on, and the redial floor the refusals and the announcement share.
@@ -83,6 +87,7 @@ func New(cfg Config) *StubRelay {
 	}
 	s := &StubRelay{cfg: cfg, log: log, room: newRoom(cfg.RingSize), restart: make(chan struct{})}
 	s.refuseWSS.Store(cfg.RefuseWSS)
+	s.refuseWSSStatus.Store(int64(cfg.RefuseWSSStatus))
 	return s
 }
 
@@ -130,6 +135,14 @@ func (s *StubRelay) BaseWSURL() string {
 
 // SetRefuseWSS toggles WSS-upgrade refusal at runtime (upgrade-back testing).
 func (s *StubRelay) SetRefuseWSS(v bool) { s.refuseWSS.Store(v) }
+
+// SetRefuseWSSStatus chooses the status the WSS-upgrade refusal answers with,
+// replacing the default 404. It exists for the one distinction the
+// planned-restart contract turns on: a BARE 503 — no Retry-After, so no
+// announcement — is not a planned restart, and a client must keep treating it
+// as an ordinary dial failure that eventually earns the §14 degraded fallback.
+// Zero restores the default.
+func (s *StubRelay) SetRefuseWSSStatus(code int) { s.refuseWSSStatus.Store(int64(code)) }
 
 // Close stops the server.
 func (s *StubRelay) Close() error {
@@ -309,7 +322,11 @@ func (s *StubRelay) handleWS(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if s.refuseWSS.Load() {
-		http.Error(w, "wss upgrade refused", http.StatusNotFound)
+		status := int(s.refuseWSSStatus.Load())
+		if status == 0 {
+			status = http.StatusNotFound
+		}
+		http.Error(w, "wss upgrade refused", status)
 		return
 	}
 	claims, err := parseClaims(bearer(r))
