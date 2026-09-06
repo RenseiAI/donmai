@@ -92,6 +92,18 @@ var ErrSessionShimAdoptionPrepareUnavailable = errors.New("session shim: adoptio
 // BEFORE the authority is asked (the readiness gate, the configuration checks)
 // and local validation of what it answered never reach here: both are this
 // daemon's own definite verdicts, and re-asking would only repeat them.
+//
+// THE CONFLICT EXEMPTION IS CURRENTLY LATENT, ON PURPOSE. No composing
+// authority in the field constructs ErrSessionShimAdoptionPrepareConflict yet,
+// so today a definite refusal is classified as unanswered and re-asked to the
+// bound. That is wasteful rather than wrong: a conforming authority resolves a
+// re-ask as the same content-addressed preparation and refuses it again before
+// any durable write, so the extra asks cost read-only round trips and are
+// spent, at most, once per launch. Defaulting the other way would be the
+// dangerous direction — it would make an unanswered ask terminal, which is the
+// exact bug this file exists to remove — so the classification stays
+// conservative and the exemption waits for an authority that maps its typed
+// refusal codes onto the sentinel.
 func classifySessionShimPrepareFailure(err error) error {
 	if err == nil ||
 		errors.Is(err, ErrSessionShimAdoptionPrepareConflict) ||

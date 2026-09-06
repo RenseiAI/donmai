@@ -96,20 +96,50 @@ func TestAdoptionPreparationRefusesItselfWithoutWithdrawingHostReadiness(t *test
 	if d.sessionShimReadinessWithdrawn.Load() {
 		t.Fatal("one lineage's preparation withdrew the host's published readiness")
 	}
-	// No loosening: every new-work seam consults the same gate for itself, so
-	// the host refuses work through the gate whether or not the fence is up.
-	if suspended, _ := d.claimSuspended(); !suspended {
-		t.Fatal("the claim gate stayed open under a definite not-ready")
-	}
-	if _, err := d.AcceptWork(SessionSpec{SessionID: "must-be-refused"}); err == nil {
-		t.Fatal("admission stayed open under a definite not-ready")
-	}
-	// The beat is the seam that owns the fence, and it still raises it.
+	// The beat is the seam that owns the fence, and it is the one that raises it.
+	//
+	// Asserted HERE, before the host-level seams below, and the order is the
+	// whole assertion. This change removes exactly ONE of the five withdrawal
+	// sites — the per-lineage preparation — and the claim gate and admission
+	// still withdraw for themselves on a refusal. Consulting either of them
+	// first would raise the fence, and this assertion would then pass whatever
+	// the beat did.
 	if _, err := d.SessionShimHeartbeatProjection(scope); err != nil {
 		t.Fatalf("beat under a definite not-ready: %v", err)
 	}
 	if !d.sessionShimReadinessWithdrawn.Load() {
 		t.Fatal("the beat did not withdraw on the host's own definite not-ready")
+	}
+
+	// And nothing is loosened. Each host-level seam is checked on a daemon that
+	// has raised no fence at all, so what refuses the work is demonstrably the
+	// readiness gate itself and not a fence some earlier seam left behind.
+	for name, seam := range map[string]func(*Daemon) error{
+		"claim-gate": func(d *Daemon) error {
+			if suspended, reason := d.claimSuspended(); !suspended {
+				return fmt.Errorf("the claim gate stayed open (%q)", reason)
+			}
+			return nil
+		},
+		"admission": func(d *Daemon) error {
+			if _, err := d.AcceptWork(SessionSpec{SessionID: "must-be-refused"}); err == nil {
+				return errors.New("admission stayed open")
+			}
+			return nil
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			fresh, _ := readinessTestDaemon(t, SessionShimConfig{}, func() (SessionShimCarrierProofV2Readiness, error) {
+				return incomplete, nil
+			})
+			if fresh.sessionShimReadinessWithdrawn.Load() {
+				t.Fatal("the fixture started with the fence already raised; this seam proves nothing")
+			}
+			if err := seam(fresh); err != nil {
+				t.Fatalf("under a definite not-ready: %v", err)
+			}
+		})
 	}
 }
 

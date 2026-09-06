@@ -182,10 +182,18 @@ type SessionShimAdoptionPreparation struct {
 	// re-ask this daemon makes: the PREVIOUS ask was never answered (see
 	// ErrSessionShimAdoptionPrepareUnavailable), so whether it minted anything
 	// is unknown to this side. The lineage is still being adopted for the first
-	// time — that is why the cause stays "initial" — but the authority is being
-	// told not to treat this as a first ask, because a reservation it minted
-	// for the ask whose answer was lost is outstanding and must be superseded
-	// or answered with a typed conflict rather than duplicated.
+	// time — that is why the cause stays "initial".
+	//
+	// Correctness does NOT rest on an authority reading this number, and it is
+	// deliberately not stated as an obligation on one. A re-ask carries the same
+	// organization, session, shim, process epoch, controller AND controller
+	// generation as the ask before it — the generation because no Welcome is
+	// written when a preparation fails, so nothing the shim committed moved. An
+	// authority that keys a reservation on that content therefore resolves a
+	// re-ask as the SAME preparation and replays the reservation it already
+	// holds, rather than minting a second one. The number is here so an
+	// authority that wants to tell a re-ask from a first ask can, and so its
+	// logs can say which; one that ignores it is still correct.
 	Cause   SessionShimAdoptionPrepareCause
 	Attempt int
 }
