@@ -2342,16 +2342,19 @@ func classifySessionShimCarrierLoss(err error) shimStreamEndCause {
 // connection this daemon closed. Quarantining one of them without a re-dial is
 // the mistake that cost seven live seats, twice over — once at the 30-second
 // backlog deadline, once at the ambiguity bound before it was refined.
+//
+// It is written as a NEGATIVE test on the one ending that is genuinely about
+// the shim, rather than as a list of the endings that are not, and that choice
+// is deliberate. An enumeration has to be extended by every change that adds a
+// cause, and a cause left out of it does not fail visibly — it falls through to
+// `socket_unreachable` with no re-dial, which is exactly the bug this predicate
+// exists to prevent, on a lineage nobody was thinking about. Two independent
+// changes widened this condition in the same week; the third should not have to
+// remember. So a new cause defaults to RECOVERING, and a cause that really is a
+// statement about the shim has to say so by being classified as
+// shimStreamEnded.
 func shimStreamEndRecovers(cause shimStreamEndCause) bool {
-	switch cause {
-	case shimStreamCarrierLost, shimStreamCarrierLostPlatform,
-		shimStreamDurableAckAmbiguous, shimStreamConsumerStalled:
-		return true
-	case shimStreamEnded:
-		return false
-	default:
-		return false
-	}
+	return cause != shimStreamEnded
 }
 
 // shimStreamEndIsDurableConsumerSlow reports the two endings that mean "the
@@ -2938,6 +2941,17 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	}
 	switch readopt(id, entry, attemptBudget) {
 	case readoptionSucceeded:
+		// The streak counts CONSECUTIVE endings that never recovered. A
+		// re-adoption that lands is a recovery, so leaving the counter standing
+		// makes it monotone across successes: a long-lived seat on a durable
+		// side that is occasionally slow reaches the one-attempt last look and
+		// stays there for the daemon's lifetime, having recovered every time.
+		//
+		// It matters more now than it did. The intake used to be one condition;
+		// it is now every ending that reaches this branch, and the newest of
+		// them is fleet-wide correlated by construction — a shared durable
+		// consumer stalls every adopted session at once, so every lineage's
+		// streak advances together.
 		d.clearDurableAckAmbiguityCycles(id)
 		return
 	case readoptionWindowExhausted:

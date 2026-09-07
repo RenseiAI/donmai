@@ -601,3 +601,120 @@ func TestExhaustedConsumerStallQuarantinesUnderItsOwnReason(t *testing.T) {
 		t.Fatalf("the reconciler terminalized a stalled-consumer lineage with no tombstone: %+v", published)
 	}
 }
+
+// TestEveryDaemonSideEndingRedialsBeforeItWithdraws is the guard on the
+// predicate two independent changes widened in the same week.
+//
+// `releaseShimIfLive` branches once on "is this ending about the shim, or about
+// me?", and the wrong answer is not a small one: an ending that falls to the
+// shim side is quarantined `socket_unreachable` with NO re-dial, which is the
+// reason a control plane terminalizes on. Both of the changes that widened this
+// condition did so by extending an enumeration, and an enumeration is the shape
+// that fails silently — a cause left out of it does not break a build, it kills
+// a live seat.
+//
+// So the predicate is a negative test on the ONE cause that is genuinely about
+// the shim, and this asserts that property over the whole value space rather
+// than over a list a future change would have to remember to update. A new
+// cause defaults to recovering; a cause that really is a statement about the
+// shim has to be classified as shimStreamEnded to get there.
+//
+// Rewriting shimStreamEndRecovers as a positive enumeration turns this RED for
+// whichever cause the enumeration forgets.
+func TestEveryDaemonSideEndingRedialsBeforeItWithdraws(t *testing.T) {
+	t.Parallel()
+	for value := range 8 {
+		//nolint:gosec // G115: a small literal range over the cause's own type
+		cause := shimStreamEndCause(value)
+		want := cause != shimStreamEnded
+		if got := shimStreamEndRecovers(cause); got != want {
+			t.Fatalf("shimStreamEndRecovers(%d) = %v, want %v: an ending this daemon reached about "+
+				"itself must re-dial before it withdraws, and only a statement about the shim may skip it",
+				cause, got, want)
+		}
+	}
+	// Every named cause, spelled out, so the intent survives a refactor of the
+	// loop above — and so the two that were added by separate changes in the
+	// same week are each asserted by name rather than by having been swept up.
+	if !shimStreamEndRecovers(shimStreamConsumerStalled) || !shimStreamEndRecovers(shimStreamDurableAckAmbiguous) {
+		t.Fatal("a reader-side ending was routed to the no-redial branch")
+	}
+	if !shimStreamEndRecovers(shimStreamCarrierLost) || !shimStreamEndRecovers(shimStreamCarrierLostPlatform) {
+		t.Fatal("a carrier loss was routed to the no-redial branch")
+	}
+	if shimStreamEndRecovers(shimStreamEnded) {
+		t.Fatal("an ending the shim or its socket reached was given a re-dial it has no peer for")
+	}
+}
+
+// TestDurableConsumerSlowEndingsShareOneReasonAndOneStreak names the OTHER
+// widened predicate. This one is a positive set by necessity — it selects the
+// endings that mean "the durable side could not keep up", which share a
+// withdrawal reason and a consecutive-cycle streak because they are one
+// condition observed from different sides — so it cannot be made fail-safe by
+// construction and needs its members pinned instead. It has three intakes now:
+// an outstanding acknowledgement, a reader that gave up on its own consumer,
+// and a durable append whose evidence named the persistence path.
+//
+// A carrier that explicitly REFUSED is not in the set: that one loses its
+// binding and gets the socket reason when its re-adoptions fail.
+func TestDurableConsumerSlowEndingsShareOneReasonAndOneStreak(t *testing.T) {
+	t.Parallel()
+	for _, tc := range []struct {
+		name string
+		//nolint:govet // field order here is readability, not layout
+		cause shimStreamEndCause
+		want  bool
+	}{
+		{name: "a durable acknowledgement stayed outstanding", cause: shimStreamDurableAckAmbiguous, want: true},
+		{name: "this daemon's reader gave up on its own consumer", cause: shimStreamConsumerStalled, want: true},
+		{name: "the durable append named the persistence path", cause: shimStreamCarrierLostPlatform, want: true},
+		{name: "an explicit carrier refusal is not the same fact", cause: shimStreamCarrierLost},
+		{name: "an ending about the shim is not the same fact", cause: shimStreamEnded},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := shimStreamEndIsDurableConsumerSlow(tc.cause); got != tc.want {
+				t.Fatalf("shimStreamEndIsDurableConsumerSlow(%d) = %v, want %v", tc.cause, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestARecoveredConsumerStallClearsTheStreak pins what "consecutive" has to
+// mean once this counter has more than one intake.
+//
+// The streak buys a cheaper LAST LOOK — one attempt instead of the full budget —
+// after three endings in a row that each ran their bound out. A recovery in the
+// middle of that sequence breaks the run, so leaving the counter standing makes
+// it monotone across successes: a long-lived seat on a durable side that is
+// occasionally slow arrives at the one-attempt budget and stays there for the
+// daemon's lifetime, having recovered every single time.
+//
+// It matters more with this PR's cause than it did with the first: a shared
+// durable consumer stalls every adopted session at once, so every lineage's
+// streak advances together and the whole host reaches the reduced budget in
+// lock-step.
+//
+// Deleting the clearDurableAckAmbiguityCycles call from the readoptionSucceeded
+// arm turns this RED.
+func TestARecoveredConsumerStallClearsTheStreak(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return nil
+	})
+	d := f.daemon
+	seedAmbiguityStreakToItsBudget(t, d, f.id)
+
+	d.releaseShimIfLive(f.id, f.controller, shimStreamConsumerStalled)
+
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("a recovered consumer stall quarantined the lineage: %+v", projected)
+	}
+	if _, err := d.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+		t.Fatalf("the lineage left the adopted set after a successful re-adoption: %v", err)
+	}
+	if got := d.durableAckAmbiguityCycles(f.id); got != 0 {
+		t.Fatalf("a successful re-adoption retained %d consecutive cycles; the run was broken by a recovery", got)
+	}
+}
