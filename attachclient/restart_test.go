@@ -166,7 +166,12 @@ func TestClassifiesEveryPlaceTheRestartIsAnnounced(t *testing.T) {
 // hammers the drain window on its own 5–50ms backoff. This asserts the refusal
 // count the relay actually saw.
 func TestPlannedRelayRestartNeverTerminatesTheHostLeg(t *testing.T) {
-	h := startHost(t, attachtest.Config{}, nil)
+	// BackoffMax is the ceiling the honoured floor is clamped to (see
+	// TestAnAbsurdRetryAfterCannotParkTheCarrier), so it must be above the floor
+	// this test asserts is honoured.
+	h := startHost(t, attachtest.Config{}, func(c *HostConfig) {
+		c.BackoffMax = 5 * time.Second
+	})
 	h.sess.PushOutput([]byte("boot"))
 	waitBound(t, h.relay)
 	if !waitFor(func() bool { return h.relay.Head() >= 1 }, 3*time.Second) {
@@ -545,5 +550,50 @@ func TestBare503StillEarnsTheDegradedFallback(t *testing.T) {
 	case err := <-h.done:
 		t.Fatalf("RunHost returned %v while falling back", err)
 	default:
+	}
+}
+
+// TestAnAbsurdRetryAfterCannotParkTheCarrier pins the ceiling on the floor.
+//
+// The planned-restart arm deliberately never falls back to the § 14 lane, so
+// every second it honours is a second a LIVE seat's carrier spends parked with
+// no alternative — and the number comes from whoever answered the dial. This
+// relay clamps its own hint, but that hint is a free-form configured duration
+// and an intermediary answering 503 is bound by nothing at all. A Retry-After
+// of an hour must not park the carrier for an hour: past BackoffMax the dial
+// goes out again and is refused again, which costs one refusal instead of an
+// unbounded silence.
+func TestAnAbsurdRetryAfterCannotParkTheCarrier(t *testing.T) {
+	h := startHost(t, attachtest.Config{}, func(c *HostConfig) {
+		c.BackoffMax = 40 * time.Millisecond
+	})
+	h.sess.PushOutput([]byte("boot"))
+	waitBound(t, h.relay)
+	if !waitFor(func() bool { return h.relay.Head() >= 1 }, 3*time.Second) {
+		t.Fatalf("initial WSS frame never delivered (head=%d)", h.relay.Head())
+	}
+
+	h.relay.AnnounceRestart(time.Hour)
+
+	// Unclamped this parks the carrier until the heat death of the test suite:
+	// exactly one refusal would ever be recorded.
+	if !waitFor(func() bool { return h.relay.RefusedDials() >= 4 }, 5*time.Second) {
+		t.Fatalf("the drain window saw only %d dials in 5s against an hour-long Retry-After — "+
+			"the honoured floor is not clamped to BackoffMax, so one 503 parked a live carrier",
+			h.relay.RefusedDials())
+	}
+	select {
+	case err := <-h.done:
+		t.Fatalf("RunHost terminated while clamping an absurd floor: %v", err)
+	default:
+	}
+
+	h.relay.EndRestart()
+	if !waitFor(func() bool {
+		h.sess.PushOutput([]byte("after-absurd-floor"))
+		return h.relay.HostBound() && h.relay.Head() >= 2
+	}, 10*time.Second) {
+		t.Fatalf("the host never came back after the restart ended (bound=%v head=%d)",
+			h.relay.HostBound(), h.relay.Head())
 	}
 }
