@@ -122,6 +122,7 @@ func TestBootDeclaresADeadLineageInsteadOfOmittingIt(t *testing.T) {
 			return SessionShimAdoptionBatchReceipt{}, &SessionShimAdoptionBatchLineagesOmitted{
 				Lineages: []SessionShimOmittedLineage{{
 					Identity:             sessionshim.Identity{OrgID: h.orgID, SessionID: deadSession},
+					Kind:                 SessionShimOmittedLineageQuarantined,
 					ShimID:               deadShim,
 					ProcessEpoch:         deadEpoch,
 					ControllerGeneration: 1,
@@ -281,10 +282,12 @@ func TestBackoffCancellationKeepsItsUntypedError(t *testing.T) {
 	held := []SessionShimOmittedLineage{
 		{
 			Identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "held-first"},
+			Kind:     SessionShimOmittedLineageQuarantined,
 			ShimID:   "shim-first", ProcessEpoch: 1, ControllerGeneration: 1,
 		},
 		{
 			Identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "held-second"},
+			Kind:     SessionShimOmittedLineageQuarantined,
 			ShimID:   "shim-second", ProcessEpoch: 2, ControllerGeneration: 1,
 		},
 	}
@@ -371,6 +374,7 @@ func TestLineageWithNoReportedGenerationIsNotDeclared(t *testing.T) {
 		return SessionShimAdoptionBatchReceipt{}, &SessionShimAdoptionBatchLineagesOmitted{
 			Lineages: []SessionShimOmittedLineage{{
 				Identity:     sessionshim.Identity{OrgID: h.orgID, SessionID: ungenerated},
+				Kind:         SessionShimOmittedLineageAdopted,
 				ShimID:       "shim-generation-dropped",
 				ProcessEpoch: 5,
 			}},
@@ -422,6 +426,7 @@ func TestBootRecomposesAroundALineageTheControlPlaneStillHolds(t *testing.T) {
 			return SessionShimAdoptionBatchReceipt{}, &SessionShimAdoptionBatchLineagesOmitted{
 				Lineages: []SessionShimOmittedLineage{{
 					Identity:             sessionshim.Identity{OrgID: h.orgID, SessionID: unknownSession},
+					Kind:                 SessionShimOmittedLineageAdopted,
 					ShimID:               unknownShim,
 					ProcessEpoch:         unknownEpoch,
 					ControllerGeneration: 4,
@@ -477,14 +482,17 @@ func TestRecompositionAnswersMoreOmissionsThanTheBatchItStartedFrom(t *testing.T
 	held := []SessionShimOmittedLineage{
 		{
 			Identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "held-one"},
+			Kind:     SessionShimOmittedLineageQuarantined,
 			ShimID:   "shim-one", ProcessEpoch: 1, ControllerGeneration: 1,
 		},
 		{
 			Identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "held-two"},
+			Kind:     SessionShimOmittedLineageQuarantined,
 			ShimID:   "shim-two", ProcessEpoch: 2, ControllerGeneration: 1,
 		},
 		{
 			Identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "held-three"},
+			Kind:     SessionShimOmittedLineageQuarantined,
 			ShimID:   "shim-three", ProcessEpoch: 3, ControllerGeneration: 1,
 		},
 	}
@@ -896,6 +904,7 @@ func TestRecomposedDeclarationDoesNotEvictALiveIncarnation(t *testing.T) {
 					return SessionShimAdoptionBatchReceipt{}, &SessionShimAdoptionBatchLineagesOmitted{
 						Lineages: []SessionShimOmittedLineage{{
 							Identity:             sessionshim.Identity{OrgID: orgID, SessionID: live.SessionID},
+							Kind:                 SessionShimOmittedLineageAdopted,
 							ShimID:               olderShim,
 							ProcessEpoch:         olderEpoch,
 							ControllerGeneration: 1,

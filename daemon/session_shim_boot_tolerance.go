@@ -175,6 +175,67 @@ func sessionShimServedScopes(cfg SessionShimConfig) map[string]struct{} {
 	return served
 }
 
+// SessionShimOmittedLineageKind names WHICH obligation a control plane's
+// completeness refusal is about.
+//
+// It is not decoration. A refusal enumerates lineages from three different
+// arms, and what the daemon may do about one depends entirely on which: the
+// arms disagree about whether a missing controller generation is possible, and
+// they disagree about whether presenting the lineage can satisfy the rule at
+// all. A daemon that cannot tell them apart has to guess, and both guesses are
+// wrong in a different direction — see the declaration guard below.
+type SessionShimOmittedLineageKind string
+
+const (
+	// SessionShimOmittedLineageAdopted is an unterminated adoption the control
+	// plane still holds. Its reported controller generation is NULLABLE, and a
+	// null arrives here as a zero.
+	SessionShimOmittedLineageAdopted SessionShimOmittedLineageKind = "adopted"
+	// SessionShimOmittedLineageQuarantined is a prior active quarantine
+	// obligation. Its reported controller generation is always present, and it
+	// is legitimately ZERO for exactly the rows this daemon's own stale-lineage
+	// declarations create — a frozen v1 discovery record carries no
+	// authenticated generation, so the projection's conservative zero is what
+	// was published and what comes back.
+	SessionShimOmittedLineageQuarantined SessionShimOmittedLineageKind = "quarantined"
+	// SessionShimOmittedLineagePreparing is a prepared live recovery
+	// obligation — a handoff the control plane admitted but has not yet seen
+	// committed. Its reported controller generation is always present, and it
+	// is answerable exactly like the quarantined arm: presenting the lineage
+	// quarantined at its exact incarnation converts the obligation rather than
+	// adding a second one, and the completeness check that refused the batch
+	// then finds nothing left to refuse.
+	//
+	// That is worth stating plainly because the opposite reading is easy to
+	// reach and expensive to hold. The refusal's own check looks like it asks
+	// "does such a row exist", which sounds unanswerable from here — but the
+	// batch is processed BEFORE that check runs, and processing it is what
+	// changes the answer. A daemon that declined to declare this arm would
+	// stand its durable sessions down over a refusal it could have settled, on
+	// a lineage the prepare path normally records with a full incarnation.
+	SessionShimOmittedLineagePreparing SessionShimOmittedLineageKind = "preparing"
+)
+
+// Declarable reports whether a refusal about this arm can be answered by
+// declaring the lineage in the next batch.
+//
+// All three assigned arms are. The distinction this method really draws is
+// against an arm this daemon does not recognise — including the zero value,
+// which is what an embedder that has not been taught to report one sends.
+// Declaring on that would mean applying a generation rule chosen for the wrong
+// arm, so it is refused instead; the refusal then degrades visibly rather than
+// adding rows the receiver cannot match.
+func (k SessionShimOmittedLineageKind) Declarable() bool {
+	switch k {
+	case SessionShimOmittedLineageAdopted,
+		SessionShimOmittedLineageQuarantined,
+		SessionShimOmittedLineagePreparing:
+		return true
+	default:
+		return false
+	}
+}
+
 // SessionShimOmittedLineage is one lineage a composing control plane reports as
 // omitted from a complete adoption batch.
 //
@@ -182,8 +243,15 @@ func sessionShimServedScopes(cfg SessionShimConfig) map[string]struct{} {
 // still holds. ShimID and ProcessEpoch are what make a declaration composable:
 // a completeness rule matches on the exact shim incarnation, so a report that
 // names only the session id can be logged but never answered.
+//
+// Kind must be set from the arm the refusal reported the lineage under. It is
+// required rather than optional because the guard below cannot be decided
+// without it: an unset Kind is treated as not declarable, so a composer that
+// omits it degrades visibly instead of silently declaring rows the receiver
+// cannot match.
 type SessionShimOmittedLineage struct {
 	Identity             sessionshim.Identity
+	Kind                 SessionShimOmittedLineageKind
 	ShimID               string
 	ProcessEpoch         uint64
 	ControllerGeneration uint64
@@ -292,21 +360,39 @@ func sessionShimBatchDeclaringOmittedLineages(
 		if lineage.Identity.OrgID != batch.OrgID {
 			continue
 		}
-		if lineage.Identity.SessionID == "" || lineage.ShimID == "" ||
-			lineage.ProcessEpoch == 0 || lineage.ControllerGeneration == 0 {
-			// The generation is guarded for the same reason as the shim id and
-			// the epoch, and it needs saying because it is the one that looks
-			// optional. The control plane's report renders it NULLABLE, and a
-			// null arrives here as a zero — so declaring on it would present
-			// the lineage at a generation the receiver's exact-key lookup
-			// cannot match, leaving the refusal unanswered while adding a row
-			// that answers nothing.
+		if lineage.Identity.SessionID == "" || lineage.ShimID == "" || lineage.ProcessEpoch == 0 {
+			// No exact incarnation, no declaration: the completeness rule
+			// matches on one, so a row that cannot be matched answers nothing
+			// and adds an obligation of its own.
+			continue
+		}
+		if !lineage.Kind.Declarable() {
+			// The composer did not say which arm reported this lineage, or
+			// named one this daemon does not know. The generation rule below
+			// cannot be decided without the arm, and guessing it is wrong in
+			// one direction or the other — either declining a row the receiver
+			// would have matched, or adding one it cannot. Degrading visibly is
+			// the honest third answer.
+			continue
+		}
+		if lineage.Kind == SessionShimOmittedLineageAdopted && lineage.ControllerGeneration == 0 {
+			// THE GENERATION GUARD IS ARM-SPECIFIC, AND THAT IS THE WHOLE
+			// POINT. Only the adopted arm reports a nullable generation, and a
+			// null arrives here as a zero — declaring on it would present the
+			// lineage at a generation the receiver's exact-key lookup cannot
+			// match, leaving the refusal unanswered while adding a row that
+			// answers nothing.
 			//
-			// A locally-discovered stale record is the deliberate exception and
-			// does not come through here: a frozen v1 record carries no
-			// authenticated generation at all, so zero there is the honest
-			// conservative value the quarantine projection already defines,
-			// not a field the reporter dropped.
+			// Applying the same guard to the QUARANTINED or PREPARING arms
+			// would be worse than useless: both always report a generation, and
+			// for the quarantined arm it is legitimately zero for exactly the
+			// rows this daemon's own stale-lineage declarations create — a
+			// frozen v1 discovery record carries no authenticated generation,
+			// so the projection publishes the conservative zero and the refusal
+			// reports it back. Guarding on zero there would make this daemon
+			// permanently unable to answer a refusal about a lineage it
+			// declared itself: the composition would stand down, on every
+			// start, over its own bookkeeping.
 			continue
 		}
 		key := sessionShimLineageKey{lineage.Identity, lineage.ShimID, lineage.ProcessEpoch}
@@ -710,4 +796,19 @@ func (d *Daemon) sessionShimDurabilityRefusalStatus() *afclient.DaemonSessionShi
 		out.RefusedAt = time.Unix(0, retained.AtUnixNano).UTC().Format(time.RFC3339)
 	}
 	return out
+}
+
+// sessionShimQuarantineNamesALineage reports whether a quarantine entry
+// identifies a lifecycle it can be published about.
+//
+// The startup scan quarantines a registry entry it cannot even decode, on the
+// correct principle that something is running out there and the slot is
+// occupied — but such an entry has no organization and no session id, because
+// there was nothing readable to take them from. It is a capacity fact, not a
+// lineage fact, and every consumer that turns a quarantine entry into a SCOPE
+// or into a batch row needs to know the difference: the receiver's batch schema
+// requires both identifiers, and resolving a host identity for the empty
+// organization fails the whole composition.
+func sessionShimQuarantineNamesALineage(entry sessionshim.QuarantinedSession) bool {
+	return entry.OrgID != "" && entry.SessionID != ""
 }
