@@ -209,7 +209,13 @@ func (r *Registry) PutTombstone(t Tombstone) error {
 	if err := r.RemoveIncarnation(t.Identity(), t.ShimID, t.ProcessEpoch); err != nil {
 		return err
 	}
-	return r.removeDurableAck(t.Identity(), t.ShimID, t.ProcessEpoch)
+	if err := r.removeDurableAck(t.Identity(), t.ShimID, t.ProcessEpoch); err != nil {
+		return err
+	}
+	// The back-pressure sidecar describes a LIVE reader that stopped reading.
+	// Leaving it beside a tombstone would report a degradation for a harness
+	// that is provably gone.
+	return r.RemoveStreamFlow(t.Identity(), t.ShimID, t.ProcessEpoch)
 }
 
 func tombstoneIncarnationName(t Tombstone) string {
@@ -254,7 +260,22 @@ func (r *Registry) RemoveIncarnation(id Identity, shimID string, processEpoch ui
 			return fmt.Errorf("sessionshim: remove exact discovery record: %w", err)
 		}
 	}
-	return nil
+	// The back-pressure sidecar describes a live reader for THIS incarnation.
+	// Withdrawing the record without it leaves a ~1 KiB file per incarnation
+	// behind for the life of the host, and — worse — leaves a degradation
+	// published for a lineage this daemon has stopped owning.
+	//
+	// Unconditional, deliberately: a shim that withdrew its own record first
+	// makes the scan above match nothing, and gating the sidecar on that match
+	// would leak it in exactly the ordering where nobody else cleans it up.
+	// Removal is idempotent, so the ordinary no-op case costs one unlink
+	// attempt.
+	//
+	// It does not stop a LIVE shim republishing the file afterwards: the
+	// publisher is driven by that shim's own gate and knows nothing about a
+	// daemon-side withdrawal. Nothing reads the sidecar, so that is cosmetic
+	// today; a reader would have to check the record beside it.
+	return r.RemoveStreamFlow(id, shimID, processEpoch)
 }
 
 // HasIncarnation reports whether an exact live discovery record remains.

@@ -2267,6 +2267,7 @@ func (d *Daemon) sessionShimLaunchControllerOptions(
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
 		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
+		EventBacklogDropBound:     cfg.EventBacklogDropBound,
 		ExpectedWorkarea:          workarea,
 		ExpectedWorkareaRoot:      workareaRoot,
 		DialTimeout:               cfg.launchTimeout(),
@@ -2302,6 +2303,19 @@ const (
 	// get the dead-shim REASON, because nothing about this ending is a
 	// statement about the socket.
 	shimStreamDurableAckAmbiguous
+	// shimStreamConsumerStalled: the controller's own back-pressure gave up
+	// because THIS daemon's consumer made no progress for the whole drop bound
+	// — the reader-side half of the same fact the carrier-loss and ambiguity
+	// causes describe from the writer side. The socket answered throughout, the
+	// shim never went away, and its harness is retained; what ran out was this
+	// daemon's patience with its own durable consumer.
+	//
+	// It is a SEPARATE cause from the ambiguity one because the two say
+	// different things about the evidence — ambiguity means an acknowledgement
+	// was provably outstanding, this means nothing was — but they reach the
+	// same disposition, and must: re-adopt first, and withdraw (if at all)
+	// under a reason that is not a claim about the socket.
+	shimStreamConsumerStalled
 )
 
 func classifySessionShimCarrierLoss(err error) shimStreamEndCause {
@@ -2319,6 +2333,40 @@ func classifySessionShimCarrierLoss(err error) shimStreamEndCause {
 	return shimStreamCarrierLost
 }
 
+// shimStreamEndRecovers reports whether an ending is one the daemon reached
+// about ITSELF — its carrier, its durable side, its own consumer — rather than
+// one the shim or the socket reached.
+//
+// Every ending on this side of the line re-adopts before it withdraws, because
+// the shim is still there to re-adopt: the only thing that ended is a
+// connection this daemon closed. Quarantining one of them without a re-dial is
+// the mistake that cost seven live seats, twice over — once at the 30-second
+// backlog deadline, once at the ambiguity bound before it was refined.
+//
+// It is written as a NEGATIVE test on the one ending that is genuinely about
+// the shim, rather than as a list of the endings that are not, and that choice
+// is deliberate. An enumeration has to be extended by every change that adds a
+// cause, and a cause left out of it does not fail visibly — it falls through to
+// `socket_unreachable` with no re-dial, which is exactly the bug this predicate
+// exists to prevent, on a lineage nobody was thinking about. Two independent
+// changes widened this condition in the same week; the third should not have to
+// remember. So a new cause defaults to RECOVERING, and a cause that really is a
+// statement about the shim has to say so by being classified as
+// shimStreamEnded.
+func shimStreamEndRecovers(cause shimStreamEndCause) bool {
+	return cause != shimStreamEnded
+}
+
+// shimStreamEndIsDurableConsumerSlow reports the two endings that mean "the
+// durable side could not keep up", which share a withdrawal reason and a
+// consecutive-cycle streak because they are one condition observed from two
+// sides.
+func shimStreamEndIsDurableConsumerSlow(cause shimStreamEndCause) bool {
+	return cause == shimStreamDurableAckAmbiguous ||
+		cause == shimStreamConsumerStalled ||
+		cause == shimStreamCarrierLostPlatform
+}
+
 // classifyShimStreamEnd refines why an adopted session's stream ended, using
 // the fail-closed decision the controller recorded about its own connection.
 //
@@ -2330,15 +2378,30 @@ func classifySessionShimCarrierLoss(err error) shimStreamEndCause {
 // transport-level acknowledgement without the durable post-condition" as
 // ambiguous, and ambiguous evidence may not emit a terminal outcome.
 //
-// Only the ambiguity sentinel is refined. A plain ErrEventBacklogExceeded is a
-// consumer that stopped with nothing outstanding to prove otherwise, and keeps
-// exactly the disposition it had.
+// The backlog sentinel is refined for the same reason, and it took a second
+// incident to see it. ErrEventBacklogExceeded is produced by the READER — this
+// daemon's own socket reader, giving up on this daemon's own consumer — so it
+// is never a statement about the shim either. It used to fire after thirty
+// seconds and take exactly the path above; it now fires only after the whole
+// drop bound, but a drop that publishes `socket_unreachable` with no re-dial
+// would still terminalize a live lineage, just later. The window is not the
+// bug; the classification is.
+//
+// Both refinements are selected by TYPED SENTINEL through errors.Is, never by
+// matching the text of an error message. The two sentinels are disjoint and
+// each names a different observer: ErrDurableAckAmbiguityBound says a durable
+// acknowledgement was provably outstanding, ErrEventBacklogExceeded says the
+// consumer took nothing at all. A separate refinement selects the writer-side
+// durable-append failures on their own branch.
 func classifyShimStreamEnd(cause shimStreamEndCause, endErr error) shimStreamEndCause {
 	if cause != shimStreamEnded {
 		return cause
 	}
-	if errors.Is(endErr, sessionshim.ErrDurableAckAmbiguityBound) {
+	switch {
+	case errors.Is(endErr, sessionshim.ErrDurableAckAmbiguityBound):
 		return shimStreamDurableAckAmbiguous
+	case errors.Is(endErr, sessionshim.ErrEventBacklogExceeded):
+		return shimStreamConsumerStalled
 	}
 	return cause
 }
@@ -2811,27 +2874,33 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	if entry.controller != nil {
 		_ = entry.controller.Close()
 		slog.Info("session shim: controller connection ended without a terminal observation; the shim retains its harness",
-			"session", id.String(), "carrierLost", cause == shimStreamCarrierLost)
+			"session", id.String(), "carrierLost", cause == shimStreamCarrierLost,
+			"consumerStalled", cause == shimStreamConsumerStalled,
+			"readopts", shimStreamEndRecovers(cause))
 	}
 	// The adopted entry stays in place while re-adoption runs: the receiver
 	// holds this lineage adopted at exactly this generation, and every
 	// projection built meanwhile must keep saying so. Removing it first would
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
-	if cause != shimStreamCarrierLost && cause != shimStreamCarrierLostPlatform && cause != shimStreamDurableAckAmbiguous {
+	if !shimStreamEndRecovers(cause) {
 		d.quarantineLostSessionShim(id, entry, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 		return
 	}
-	// An ending this daemon reached on an outstanding durable acknowledgement
-	// carries its own reason all the way through: every withdrawal below is
-	// `durable_ack_timeout`, because the socket was reachable for the whole of
-	// it and no projection of this lineage may say otherwise.
+	// An ending this daemon reached on its own durable side — an outstanding
+	// acknowledgement that never landed, or a consumer that took nothing for
+	// the whole drop bound — carries its own reason all the way through: every
+	// withdrawal below is `durable_ack_timeout`, because the socket was
+	// reachable for the whole of it and no projection of this lineage may say
+	// otherwise. `socket_unreachable` is a claim about the socket, and the
+	// control plane terminalizes off it; neither of these endings observed
+	// anything about the socket at all.
 	lostReason := sessionshim.QuarantineSocketUnreachable
 	// attemptBudget and spentDetail are set only on the last look this path
 	// takes at a lineage — see maxConsecutiveDurableAckAmbiguityCycles.
 	attemptBudget := 0
 	spentDetail := ""
-	if cause == shimStreamDurableAckAmbiguous || cause == shimStreamCarrierLostPlatform {
+	if shimStreamEndIsDurableConsumerSlow(cause) {
 		lostReason = sessionshim.QuarantineDurableAckTimeout
 		// A re-adoption that SUCCEEDS returns a fresh controller with a fresh,
 		// un-anchored ambiguity bound, so against a durable side that is
@@ -2872,6 +2941,17 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	}
 	switch readopt(id, entry, attemptBudget) {
 	case readoptionSucceeded:
+		// The streak counts CONSECUTIVE endings that never recovered. A
+		// re-adoption that lands is a recovery, so leaving the counter standing
+		// makes it monotone across successes: a long-lived seat on a durable
+		// side that is occasionally slow reaches the one-attempt last look and
+		// stays there for the daemon's lifetime, having recovered every time.
+		//
+		// It matters more now than it did. The intake used to be one condition;
+		// it is now every ending that reaches this branch, and the newest of
+		// them is fleet-wide correlated by construction — a shared durable
+		// consumer stalls every adopted session at once, so every lineage's
+		// streak advances together.
 		d.clearDurableAckAmbiguityCycles(id)
 		return
 	case readoptionWindowExhausted:

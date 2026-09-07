@@ -143,6 +143,18 @@ type DaemonSessionShimAdoptedCorrelation struct {
 	// that predates the keepalive contract looks like from outside the daemon.
 	KeepaliveExtensions int   `json:"keepaliveExtensions,omitempty"`
 	LastOrphanDeadline  int64 `json:"lastOrphanDeadline,omitempty"`
+	// StreamBackPressure is "degraded" while this carrier's consumer has been
+	// at the in-flight budget without progress for at least one whole stall
+	// deadline, and empty otherwise. It is the operator-visible form of "this
+	// session is alive but nothing is draining it" — a state that used to be
+	// invisible right up to the moment the carrier was dropped over it.
+	StreamBackPressure string `json:"streamBackPressure,omitempty"`
+	// StreamStalledSince is the Unix-nanosecond instant the current degradation
+	// began, and StreamQueuedBytes/StreamBudgetBytes are how much undelivered
+	// stream is held against how much may be.
+	StreamStalledSince int64 `json:"streamStalledSince,omitempty"`
+	StreamQueuedBytes  int   `json:"streamQueuedBytes,omitempty"`
+	StreamBudgetBytes  int   `json:"streamBudgetBytes,omitempty"`
 }
 
 // DaemonSessionShimStatus is shared byte-for-byte by status and doctor.

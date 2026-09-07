@@ -109,6 +109,14 @@ type Shim struct {
 	socketDev  uint64
 	socketIno  uint64
 
+	// flowMu serializes publication of the back-pressure sidecar. It is
+	// deliberately NOT recordMu: the sidecar is a different file with a
+	// different lifetime, and a flow transition must never queue behind a
+	// discovery-record write (or the other way round) on a session whose
+	// consumer is already stalled.
+	flowMu   sync.Mutex
+	flowLast ptyhost.OutputFlowState
+
 	// recordMu serializes every write to this session's registry entry against
 	// every other one. s.mu alone is not enough: it guards the fields, while the
 	// hazard is two DISK writes interleaving — a controller-loss republish and
@@ -357,6 +365,26 @@ func Start(opts Options) (*Shim, error) {
 		return nil, err
 	}
 
+	// Back-pressure is installed HERE rather than left to the caller: a shim is
+	// the one ptyhost owner whose consumer is a replaceable controller that may
+	// stall for minutes, and an unbounded queue behind that consumer is how a
+	// slow durable path turns into an evicted ring, a Gap, and a viewer replay.
+	// A caller that has its own marks keeps them; only the hook is ours.
+	//
+	// The configuration is COPIED before the hook is installed. Writing through
+	// the caller's pointer would make two shims started from one shared
+	// *OutputFlowControl silently share a callback, so the second would steal
+	// the first's and the first would stop publishing its degradations — a
+	// bug whose only symptom is a shim that has stopped reading and says
+	// nothing about it, which is the exact silence this state exists to break.
+	flow := &shimFlowPublisher{}
+	configured := DefaultOutputFlowControl()
+	if opts.Spec.OutputFlowControl != nil {
+		configured = *opts.Spec.OutputFlowControl
+	}
+	configured.OnChange = flow.publish
+	opts.Spec.OutputFlowControl = &configured
+
 	sess, err := ptyhost.Spawn(opts.Spec)
 	if err != nil {
 		_ = ln.Close()
@@ -404,6 +432,8 @@ func Start(opts Options) (*Shim, error) {
 
 		onTerminalCourtesy: opts.onTerminalCourtesy,
 	}
+
+	flow.bind(s)
 
 	if err := s.publishRecord(); err != nil {
 		_ = s.Close()
@@ -483,6 +513,7 @@ func (s *Shim) Close() error {
 		// cannot observe a half-torn-down one.
 		<-s.acceptDone
 		_ = os.Remove(s.socketPath)
+		s.withdrawStreamFlow()
 	})
 	return nil
 }
@@ -1761,4 +1792,112 @@ func statSocket(path string) (dev, ino uint64, err error) {
 		return 0, 0, nil // platform without stat details: identity check degrades to path
 	}
 	return uint64(st.Dev), uint64(st.Ino), nil //nolint:gosec,unconvert // Dev/Ino widths are platform-dependent; both are non-negative identifiers
+}
+
+// ---- back-pressure state ---------------------------------------------------
+
+// shimFlowPublisher bridges the ptyhost gate's callback, which must be supplied
+// to Spawn, to the Shim, which does not exist until Spawn has returned.
+//
+// The window between the two is a few microseconds during which the harness
+// cannot possibly have filled a multi-megabyte high-water mark, but "cannot
+// possibly" is not a reason to drop an observation: an unbound publisher keeps
+// the last state it saw and bind replays it.
+type shimFlowPublisher struct {
+	mu     sync.Mutex
+	shim   *Shim
+	buffer *ptyhost.OutputFlowState
+}
+
+func (p *shimFlowPublisher) publish(state ptyhost.OutputFlowState) {
+	p.mu.Lock()
+	shim := p.shim
+	if shim == nil {
+		buffered := state
+		p.buffer = &buffered
+	}
+	p.mu.Unlock()
+	if shim != nil {
+		shim.onOutputFlow(state)
+	}
+}
+
+func (p *shimFlowPublisher) bind(s *Shim) {
+	p.mu.Lock()
+	p.shim = s
+	buffered := p.buffer
+	p.buffer = nil
+	p.mu.Unlock()
+	if buffered != nil {
+		s.onOutputFlow(*buffered)
+	}
+}
+
+// OutputFlowState reports whether this shim has stopped reading its harness's
+// terminal because a consumer is not draining it.
+func (s *Shim) OutputFlowState() ptyhost.OutputFlowState {
+	s.flowMu.Lock()
+	defer s.flowMu.Unlock()
+	return s.flowLast
+}
+
+// onOutputFlow records one back-pressure transition: an operator-visible log
+// line, and a published sidecar for as long as the condition lasts.
+//
+// The line matters as much as the state. A shim that has stopped reading looks
+// EXACTLY like an idle terminal from every other surface — no frames, no error,
+// no drop — which is how an hour of a wedged consumer can pass without anything
+// naming it.
+func (s *Shim) onOutputFlow(state ptyhost.OutputFlowState) {
+	s.flowMu.Lock()
+	defer s.flowMu.Unlock()
+	s.flowLast = state
+	switch {
+	case state.PauseBoundReached:
+		s.logger.Warn("sessionshim: output pause bound reached; reading the harness again with a consumer that never drained",
+			"session", s.id.String(), "pendingBytes", state.PendingBytes)
+	case state.Paused:
+		s.logger.Warn("sessionshim: consumer is not draining; paused reading the harness terminal",
+			"session", s.id.String(), "pendingBytes", state.PendingBytes,
+			"saturatedConsumers", state.SaturatedSubscribers)
+	default:
+		s.logger.Info("sessionshim: consumer resumed draining; reading the harness terminal again",
+			"session", s.id.String(), "pendingBytes", state.PendingBytes)
+	}
+
+	if !state.Paused && !state.PauseBoundReached {
+		if err := s.registry.RemoveStreamFlow(s.id, s.shimID, s.epoch); err != nil {
+			s.logger.Warn("sessionshim: withdraw stream flow state", "session", s.id.String(), "error", err)
+		}
+		return
+	}
+	published := StreamFlowControl{
+		SchemaVersion:      streamFlowSchemaVersion,
+		OrgID:              s.id.OrgID,
+		SessionID:          s.id.SessionID,
+		ShimID:             s.shimID,
+		ProcessEpoch:       s.epoch,
+		Paused:             state.Paused,
+		PendingBytes:       state.PendingBytes,
+		PauseBoundReached:  state.PauseBoundReached,
+		ObservedAtUnixNano: s.now().UnixNano(),
+	}
+	if !state.Since.IsZero() {
+		published.PausedSinceUnixNano = state.Since.UnixNano()
+	}
+	if err := s.registry.PutStreamFlow(published); err != nil {
+		s.logger.Warn("sessionshim: publish stream flow state", "session", s.id.String(), "error", err)
+	}
+}
+
+// withdrawStreamFlow removes the sidecar on teardown. A back-pressure state
+// that outlived the shim that published it would be read as a live degradation
+// by the next daemon to look.
+func (s *Shim) withdrawStreamFlow() {
+	s.flowMu.Lock()
+	defer s.flowMu.Unlock()
+	s.flowLast = ptyhost.OutputFlowState{}
+	if err := s.registry.RemoveStreamFlow(s.id, s.shimID, s.epoch); err != nil {
+		s.logger.Warn("sessionshim: withdraw stream flow state", "session", s.id.String(), "error", err)
+	}
 }

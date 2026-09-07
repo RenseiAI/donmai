@@ -414,37 +414,80 @@ keeps reading and keeps ACTING immediately — input reaches the PTY, a `Resize`
 is applied, a `Stop` starts terminating the harness — but anything it has to
 WRITE back queues behind the blocked pump: durable heartbeat receipts, snapshot
 results, error frames, and the terminal `Exit` frame itself. Each of those can
-wait up to `sessionshim`'s stall deadline (30s by default,
+wait up to `sessionshim`'s stall deadline (120s by default,
 `SessionShimConfig.EventBacklogStallDeadline`, clamped to a 7s floor —
 `eventBacklogStallFloor = heartbeatReceiptWaitBound + 2s` — so an override
 cannot be tuned back into the drop this mechanism replaced).
 
 The deadline is a THROUGHPUT bound, not a latency one: to keep resetting its
 own clock, the consumer must sustain at least `budget / deadline`, about
-273 KiB/s at the 8 MiB budget / 30s deadline defaults — a TIGHTER deadline
+273 KiB/s at the 32 MiB budget / 120s deadline defaults — a TIGHTER deadline
 RAISES the drain rate a consumer must sustain, it does not make the carrier
 more forgiving. Because the clock anchors on the backlog when the consumer
 first falls behind rather than resetting per call, worst-case wall time from
-"first fell behind" to fail-closed is about 2x the deadline; time-to-refusal
-measured from the moment the consumer actually STOPS making progress stays
-<= 1x the deadline.
+"first fell behind" to DEGRADED is about 2x the deadline.
 
 Concretely, a `Stop` into a stalled carrier takes effect at once but its exit
 observation may not surface for up to that deadline, and `Controller.Heartbeat`
 returns `ErrHeartbeatReceiptPending` in the meantime (which keeps the connection
 and is retried, by design).
 
-That is deliberately preferred to the alternative it replaced: dropping the shim
-connection outright, which loses the durable carrier, leaves the harness
-unsupervised, and quarantines a healthy seat. A delayed acknowledgement is
-recoverable; a severed carrier is not. Past the stall deadline the controller
-fails closed as before, and the session is released to quarantine rather than
-published as adopted against a socket nobody can write to.
+**Crossing the stall deadline is not a drop.** It publishes the carrier as
+DEGRADED — a `streamBackPressure: "degraded"` entry on that session in
+`/api/daemon/status`, plus a repeating log line carrying bytes in flight and
+stall duration — and keeps stalling. Only `SessionShimConfig.EventBacklogDropBound`
+(10 minutes by default, clamped up to the stall deadline) still fails closed.
+
+Even then the harness is RETAINED (`carrierLost=false`) and the drop is
+classified as a DAEMON-SIDE ending (`shimStreamConsumerStalled`), so it takes the
+re-adoption path first — the same one a carrier loss takes — and a re-adopted
+controller arrives with an empty backlog, which is also the recovery. Only if
+every attempt fails does the lineage withdraw, and then under
+`durable_ack_timeout`. It never publishes `socket_unreachable`: that is a claim
+about a socket, this ending observed nothing about the socket at all, and it is
+the reason a control plane terminalizes on. Both refinements in
+`classifyShimStreamEnd` are selected by typed sentinel (`errors.Is`), never by
+matching error text.
+
+That ordering is the fix for a measured incident. Seven interactive seats were
+lost in one day on hosts whose durable consumer stalled for tens of seconds on a
+slow datastore path: every lost seat was output-heavy, so the in-flight budget
+filled in seconds and a 30-second no-progress rule dropped a carrier whose socket
+was reachable and whose harness was alive throughout. Minutes of no progress over
+a durable path is a slow write, not a dead peer.
+
+The stall reaches the harness. A controller that stops reading stalls the shim's
+output pump; the shim's PTY host then stops reading the master (`ptyhost`
+`OutputFlowControl`, installed by `sessionshim.Start`), so the harness blocks in
+`write(2)` exactly as it would against any terminal whose reader fell behind.
+Nothing is dropped, nothing is reordered, and the shim's ring is not driven to
+evict — which is what used to force a Gap and a large replay on the next resume.
+
+That last clause is true **while the consumer recovers inside the bound**, which
+is the case this is built for. It is not true at the drop. By the time the gate
+engages, roughly `budget + socket buffers + subscriber queue` (~40 MiB at
+defaults) has flowed through the shim's 8 MiB ring, so the ring floor is well
+ahead of the durable cursor; if the drop bound is crossed, the re-adoption
+resumes from the composing carrier's cursor, which the ring can no longer serve,
+and the stream continues with an explicit ATTRIBUTED Gap (§D5). That is a
+transcript hole, and it is the correct disposition — vastly better than a dead
+seat — but anyone tuning the drop bound should know the hold is lossless and the
+drop is not.
+The shim's own pause is bounded too (`ptyhost.DefaultOutputPauseBound`, 15
+minutes, deliberately longer than the controller's drop bound) so a consumer that
+neither drains nor disconnects cannot hold a live harness forever; while it is
+paused the shim publishes a `<digest>.flow` sidecar beside its discovery record.
+The sidecar is a separate file rather than a record field on purpose: the §D6
+record is decoded with `DisallowUnknownFields`, so a new field in it would make
+every older daemon quarantine a healthy live shim.
 
 Symptom to recognise in the log: repeated
 `durable heartbeat persistence receipt is still pending` on one session with no
 `controller dropped its shim connection` line — that is a consumer that is behind,
-being absorbed, not a broken socket.
+being absorbed, not a broken socket. Its escalation is
+`durable consumer is not draining; holding the carrier under back-pressure`,
+repeating once per stall deadline with current numbers, and its resolution is
+`durable consumer resumed draining; carrier back-pressure released`.
 
 What separates "behind" from "stopped" is **bytes taken, not queue depth**. The
 deadline's clock is anchored when the carrier first falls behind and is cleared
