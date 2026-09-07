@@ -288,10 +288,21 @@ func (h *host) run(ctx context.Context) error {
 			// The relay's own hint is a FLOOR, not a replacement for backoff:
 			// arriving back before the replacement process has booted is how a
 			// whole fleet turns one restart into a thundering herd.
+			//
+			// It is also not a blank cheque. This arm deliberately never falls
+			// back to the § 14 lane, so the honoured floor is time a LIVE seat's
+			// carrier spends parked with no alternative — and the number comes
+			// from whoever answered the dial, which during a drain is the relay
+			// but through a proxy or a hostile intermediary is anyone. A
+			// Retry-After of an hour would park the carrier for an hour. So it
+			// is clamped to BackoffMax, the ceiling this lane already applies to
+			// every other transient: past that the dial simply goes out again
+			// and is refused again, which costs one refusal instead of an
+			// unbounded silence.
 			ringBo.reset()
 			delay := bo.next()
 			if hint, _ := RelayRedialAfter(rerr); hint > delay {
-				delay = hint
+				delay = min(hint, h.cfg.BackoffMax)
 			}
 			h.log.Warn("attachclient: the relay announced a planned restart — waiting out its redial floor",
 				"delay", delay, "err", rerr)

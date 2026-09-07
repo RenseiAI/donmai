@@ -39,11 +39,19 @@ type drainingRelay struct {
 func newDrainingRelay(t *testing.T, drains, redialAfter int) *drainingRelay {
 	t.Helper()
 	relay := &drainingRelay{drains: drains, redialAfter: redialAfter}
-	relay.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+	relay.server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		relay.mu.Lock()
 		relay.dials++
 		draining := relay.drains == 0 || relay.dials <= relay.drains
 		relay.mu.Unlock()
+		// /refuse and /admit let a fixture drive a pattern the dial COUNT
+		// cannot express — a relay that flaps per lineage rather than per dial.
+		switch r.URL.Path {
+		case "/refuse":
+			draining = true
+		case "/admit":
+			draining = false
+		}
 		if !draining {
 			w.WriteHeader(http.StatusOK)
 			return
@@ -57,8 +65,10 @@ func newDrainingRelay(t *testing.T, drains, redialAfter int) *drainingRelay {
 
 // dial performs one attach dial and returns the refusal a composing carrier
 // would hand back, or nil once the replacement admits it.
-func (r *drainingRelay) dial() error {
-	resp, err := http.Get(r.server.URL) //nolint:noctx // loopback fixture
+func (r *drainingRelay) dial() error { return r.dialPath("") }
+
+func (r *drainingRelay) dialPath(path string) error {
+	resp, err := http.Get(r.server.URL + path) //nolint:noctx // loopback fixture
 	if err != nil {
 		return fmt.Errorf("dial the carrier: %w", err)
 	}
@@ -81,10 +91,16 @@ func (r *drainingRelay) dialCount() int {
 // dials the draining relay each time it is asked.
 type restartingAdoption struct {
 	relay *drainingRelay
+	// perLineageRefusals, when positive, makes the relay refuse the first N
+	// dials of EVERY lineage and admit the next — a relay that flaps rather
+	// than one that drains once. The dial count cannot express that pattern,
+	// so the fixture drives it per identity.
+	perLineageRefusals int
 
-	mu    sync.Mutex
-	asks  []preparedAsk
-	dials int
+	mu      sync.Mutex
+	asks    []preparedAsk
+	dials   int
+	perShim map[sessionshim.Identity]int
 }
 
 func (a *restartingAdoption) prepare(_ context.Context, in SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
@@ -94,11 +110,22 @@ func (a *restartingAdoption) prepare(_ context.Context, in SessionShimAdoptionPr
 	return sessionshim.PreparedAdoption{Correlation: []byte("candidate-1")}, nil
 }
 
-func (a *restartingAdoption) adopt(_ context.Context, _ SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
+func (a *restartingAdoption) adopt(_ context.Context, evidence SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error) {
 	a.mu.Lock()
 	a.dials++
+	path := ""
+	if a.perLineageRefusals > 0 {
+		if a.perShim == nil {
+			a.perShim = map[sessionshim.Identity]int{}
+		}
+		a.perShim[evidence.Identity]++
+		path = "/admit"
+		if a.perShim[evidence.Identity] <= a.perLineageRefusals {
+			path = "/refuse"
+		}
+	}
 	a.mu.Unlock()
-	if err := a.relay.dial(); err != nil {
+	if err := a.relay.dialPath(path); err != nil {
 		return SessionShimAdoptionReceipt{}, err
 	}
 	return SessionShimAdoptionReceipt{DurableCorrelation: []byte("committed-after-the-restart")}, nil
@@ -129,11 +156,15 @@ func newRestartRedialDaemon(
 			OnAdoption:      adoption.adopt,
 			// The bound this pass spends is the CONFIGURED re-adoption policy's,
 			// so a fixture sets it here rather than reaching for a constant the
-			// production path does not read. The local backoff is small; the
-			// waits these tests actually spend are the relay's own 1s floor,
-			// which is the point — the floor is honoured, not undercut.
+			// production path does not read. These numbers make the shared
+			// window exactly 1.5s (3 x 400ms attempt timeout + the 100ms/200ms
+			// ladder) against the relay fixtures' 1s announced floor, which
+			// buys two waits — one full floor, then the remainder of the window
+			// — and makes every dial count below exact arithmetic rather than a
+			// race with the clock.
 			Readoption: SessionShimReadoptionPolicy{
-				Mode: ReadoptionFixedAttempts, Attempts: 3, Backoff: 5 * time.Millisecond,
+				Mode: ReadoptionFixedAttempts, Attempts: 3,
+				Backoff: 100 * time.Millisecond, AttemptTimeout: 400 * time.Millisecond,
 			},
 			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error { return nil },
 			OnAdoptionBatch: func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
@@ -358,6 +389,161 @@ func TestCompositionReachesOneVerdictWhenTheRelayNeverReturns(t *testing.T) {
 	}
 }
 
+// TestRelayDrainBoundComesFromAValidatedPolicy pins that the bound is read from
+// the deployment's own re-adoption policy in the shape that policy's OWN
+// VALIDATOR accepts.
+//
+// Every case runs Validate() first, and that is the point: the validator
+// refuses BackoffCap in fixed-attempts mode and Attempts in lineage-live mode,
+// so a bound assembled from all four fields would pin a configuration no daemon
+// can boot with — the "third policy nobody can tune" this is supposed to avoid.
+func TestRelayDrainBoundComesFromAValidatedPolicy(t *testing.T) {
+	t.Parallel()
+	fixedWorstCase := func(attempts int, backoff, attemptTimeout time.Duration) time.Duration {
+		return SessionShimReadoptionPolicy{
+			Mode: ReadoptionFixedAttempts, Attempts: attempts,
+			Backoff: backoff, AttemptTimeout: attemptTimeout,
+		}.WorstCaseWindow()
+	}
+	defaultWorstCase := fixedWorstCase(
+		defaultSessionShimReadoptionAttempts,
+		defaultSessionShimReadoptionBackoff,
+		defaultSessionShimReadoptionAttemptTimeout,
+	)
+	for _, test := range []struct {
+		name   string
+		policy SessionShimReadoptionPolicy
+		want   sessionShimRelayDrainBound
+	}{
+		{
+			// Default fixed-attempts. Its own worst case is the window; the
+			// attempt count shapes that number and is NOT a second bound that
+			// stops the pass earlier than its own window.
+			name: "the default policy",
+			want: sessionShimRelayDrainBound{
+				base: defaultSessionShimReadoptionBackoff,
+				// The policy expresses no per-wait cap in this mode, so the
+				// window caps a single wait too.
+				ceiling:   defaultWorstCase,
+				window:    defaultWorstCase,
+				passTotal: 2 * defaultWorstCase,
+			},
+		},
+		{
+			// A deployment's own numbers, in the fixed-attempts vocabulary the
+			// validator accepts — no BackoffCap, which it would reject.
+			name: "a deployment's own fixed-attempt numbers",
+			policy: SessionShimReadoptionPolicy{
+				Mode: ReadoptionFixedAttempts, Attempts: 4,
+				Backoff: 2 * time.Second, AttemptTimeout: time.Second,
+			},
+			want: sessionShimRelayDrainBound{
+				base:      2 * time.Second,
+				ceiling:   fixedWorstCase(4, 2*time.Second, time.Second),
+				window:    fixedWorstCase(4, 2*time.Second, time.Second),
+				passTotal: 2 * fixedWorstCase(4, 2*time.Second, time.Second),
+			},
+		},
+		{
+			// Lineage-live expresses no attempt count — the window is its bound,
+			// and BackoffCap is the per-wait cap it does express. Its ten-minute
+			// window is a legitimate answer to "how patient about a live carrier
+			// fault" and never to "how long may boot block", so the startup cap
+			// trims it.
+			name:   "lineage-live is read in its own vocabulary",
+			policy: DefaultLineageLiveSessionShimReadoptionPolicy(),
+			want: sessionShimRelayDrainBound{
+				base:      defaultSessionShimReadoptionBackoff,
+				ceiling:   defaultSessionShimReadoptionBackoffCap,
+				window:    sessionShimStartupRelayDrainCap,
+				passTotal: 2 * sessionShimStartupRelayDrainCap,
+			},
+		},
+		{
+			// Disabling controller-loss re-adoption answers a different
+			// question, and must not quarantine every lineage on the host the
+			// next time a deploy lands mid-composition.
+			name:   "a disabled re-adoption policy still re-dials a restarting relay",
+			policy: SessionShimReadoptionPolicy{Disabled: true},
+			want: sessionShimRelayDrainBound{
+				base:      defaultSessionShimReadoptionBackoff,
+				ceiling:   defaultWorstCase,
+				window:    defaultWorstCase,
+				passTotal: 2 * defaultWorstCase,
+			},
+		},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			// The shape must be one a daemon can actually boot with.
+			if err := test.policy.Validate(); err != nil {
+				t.Fatalf("the policy this case pins is not one any daemon can boot with: %v", err)
+			}
+			d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{Readoption: test.policy}})
+			if got := d.sessionShimRelayDrainBound(); got != test.want {
+				t.Fatalf("bound = %+v, want %+v", got, test.want)
+			}
+		})
+	}
+}
+
+// TestTheShippedDefaultOutlastsARelayRestart is the bound that matters, stated
+// as the question an operator actually has: does a host booting into a relay's
+// planned restart still have a lineage when the replacement comes up?
+//
+// A relay's planned restart is its drain timeout (15s by that contract's
+// default), then shutdown, then a journal flush, then a single-machine
+// replacement boot — comfortably longer than the drain alone. A startup pass
+// that stops waiting first quarantines the lineage, closes its controller, and
+// leaves it with NO recovery path: the controller-loss re-adoption path only
+// fires for a lineage that was adopted, and this one never was. The shim keeps
+// its harness and reaps it on its own orphan deadline.
+//
+// This walks the real barrier with a synthetic clock — no sleeping — and
+// requires the shipped default to still be granting dials well past the drain.
+func TestTheShippedDefaultOutlastsARelayRestart(t *testing.T) {
+	t.Parallel()
+	// What the pass must survive: the relay's own default drain, plus the
+	// shutdown, flush and replacement boot that follow it.
+	const observedRestart = 45 * time.Second
+	// The floor the relay announces is a re-dial SPACING, deliberately much
+	// shorter than the restart it announces — it can never extend the ladder to
+	// cover one.
+	const announcedFloor = 5 * time.Second
+
+	d := New(Options{SkipRegistration: true})
+	bound := d.sessionShimRelayDrainBound()
+	if bound.window <= observedRestart {
+		t.Fatalf("the shipped default gives the pass a %s window, which does not outlast a %s relay restart",
+			bound.window, observedRestart)
+	}
+
+	var barrier sessionShimRelayDrainBarrier
+	start := time.Now()
+	now := start
+	dials := 1 // the refusal that opens the window
+	for {
+		wait, stop := barrier.reserve(announcedFloor, bound, now)
+		if stop != sessionShimDrainLive {
+			break
+		}
+		now = now.Add(wait)
+		dials++
+		if now.Sub(start) > 10*time.Minute {
+			t.Fatal("the barrier never stopped granting waits")
+		}
+	}
+	if now.Sub(start) <= observedRestart {
+		t.Fatalf("the pass stopped re-dialling at %s, inside a %s relay restart — "+
+			"a lineage refused for the whole restart is quarantined with no recovery path",
+			now.Sub(start), observedRestart)
+	}
+	if dials < 4 {
+		t.Fatalf("the pass spent only %d dials across %s; the ladder is not re-dialling through the drain",
+			dials, now.Sub(start))
+	}
+}
+
 // TestRelayDrainDelayHonoursTheRelaysFloor pins the schedule exactly, rather
 // than inferring it from a clock: the relay's own floor is a MINIMUM the local
 // backoff cannot undercut, the local schedule still doubles when the relay
@@ -415,93 +601,72 @@ func TestRelayDrainDelayHonoursTheRelaysFloor(t *testing.T) {
 	}
 }
 
-// TestRelayDrainBoundComesFromAValidatedPolicy pins that the bound is read from
-// the deployment's own re-adoption policy in the shape that policy's OWN
-// VALIDATOR accepts.
+// TestAFlappingRelayCannotSpendOneWindowPerLineage pins the ceiling that holds
+// however the relay behaves.
 //
-// Every case runs Validate() first, and that is the point: the validator
-// refuses BackoffCap in fixed-attempts mode and Attempts in lineage-live mode,
-// so a bound assembled from all four fields would pin a configuration no daemon
-// can boot with — the "third policy nobody can tune" this is supposed to avoid.
-func TestRelayDrainBoundComesFromAValidatedPolicy(t *testing.T) {
-	t.Parallel()
-	fixedWorstCase := func(attempts int, backoff, attemptTimeout time.Duration) time.Duration {
-		return SessionShimReadoptionPolicy{
-			Mode: ReadoptionFixedAttempts, Attempts: attempts,
-			Backoff: backoff, AttemptTimeout: attemptTimeout,
-		}.WorstCaseWindow()
+// Clearing the window on a dial that gets through is deliberate — it is what
+// lets a later, unrelated outage be waited out properly — but on its own it
+// hands a relay that ALTERNATES a whole fresh window per lineage, which is the
+// lineage-count multiplication the shared window exists to remove, re-entering
+// through the success door. The pass-total budget is not refunded by a
+// successful dial, so the waiting has one ceiling regardless.
+//
+// Eight lineages against a relay that refuses the first two dials of every one
+// of them. Each spends a whole 1.5s window of the pass's 3s budget, so two
+// lineages exhaust it and the rest get their free re-dial and no waiting. The
+// trade is explicit: a host that cannot compose inside twice its drain window
+// boots with what it could adopt rather than never booting at all.
+func TestAFlappingRelayCannotSpendOneWindowPerLineage(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	const orgID = "org-flapping-relay"
+	specs := make([]SessionSpec, 0, 8)
+	for i := range 8 {
+		specs = append(specs, launchOneAdoptableLineage(t, f, orgID, fmt.Sprintf("lineage-flap-%d", i)))
 	}
-	for _, test := range []struct {
-		name   string
-		policy SessionShimReadoptionPolicy
-		want   sessionShimRelayDrainBound
-	}{
-		{
-			// Default fixed-attempts: 3 dials, so 2 waits, on a 5s ladder. Its
-			// own worst case is 60s, which the startup cap trims to 30s.
-			name: "the default policy",
-			want: sessionShimRelayDrainBound{
-				waits: defaultSessionShimReadoptionAttempts - 1,
-				base:  defaultSessionShimReadoptionBackoff,
-				// The policy expresses no per-wait cap in this mode, so the
-				// window caps a single wait too.
-				ceiling: sessionShimStartupRelayDrainCap,
-				window:  sessionShimStartupRelayDrainCap,
-			},
-		},
-		{
-			// A deployment's own numbers, in the fixed-attempts vocabulary the
-			// validator accepts — no BackoffCap, which it would reject.
-			name: "a deployment's own fixed-attempt numbers",
-			policy: SessionShimReadoptionPolicy{
-				Mode: ReadoptionFixedAttempts, Attempts: 4,
-				Backoff: 2 * time.Second, AttemptTimeout: time.Second,
-			},
-			want: sessionShimRelayDrainBound{
-				waits: 3, base: 2 * time.Second,
-				ceiling: fixedWorstCase(4, 2*time.Second, time.Second),
-				window:  fixedWorstCase(4, 2*time.Second, time.Second),
-			},
-		},
-		{
-			// Lineage-live expresses no attempt count — the window is its bound,
-			// and BackoffCap is the per-wait cap it does express. Its ten-minute
-			// window is a legitimate answer to "how patient about a live carrier
-			// fault" and never to "how long may boot block", so the startup cap
-			// trims it.
-			name:   "lineage-live is read in its own vocabulary",
-			policy: DefaultLineageLiveSessionShimReadoptionPolicy(),
-			want: sessionShimRelayDrainBound{
-				waits: 0, base: defaultSessionShimReadoptionBackoff,
-				ceiling: defaultSessionShimReadoptionBackoffCap,
-				window:  sessionShimStartupRelayDrainCap,
-			},
-		},
-		{
-			// Disabling controller-loss re-adoption answers a different
-			// question, and must not quarantine every lineage on the host the
-			// next time a deploy lands mid-composition.
-			name:   "a disabled re-adoption policy still re-dials a restarting relay",
-			policy: SessionShimReadoptionPolicy{Disabled: true},
-			want: sessionShimRelayDrainBound{
-				waits:   defaultSessionShimReadoptionAttempts - 1,
-				base:    defaultSessionShimReadoptionBackoff,
-				ceiling: sessionShimStartupRelayDrainCap,
-				window:  sessionShimStartupRelayDrainCap,
-			},
-		},
-	} {
-		t.Run(test.name, func(t *testing.T) {
-			t.Parallel()
-			// The shape must be one a daemon can actually boot with.
-			if err := test.policy.Validate(); err != nil {
-				t.Fatalf("the policy this case pins is not one any daemon can boot with: %v", err)
-			}
-			d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{Readoption: test.policy}})
-			if got := d.sessionShimRelayDrainBound(); got != test.want {
-				t.Fatalf("bound = %+v, want %+v", got, test.want)
-			}
-		})
+
+	var (
+		batchMu sync.Mutex
+		batches []SessionShimAdoptionBatch
+	)
+	adoption := &restartingAdoption{
+		relay: newDrainingRelay(t, 0, 1), perLineageRefusals: 2,
+	}
+	replacement := newRestartRedialDaemon(t, f.registry, orgID, adoption, &batches, &batchMu)
+
+	started := time.Now()
+	if err := replacement.adoptSessionShims(context.Background()); err != nil {
+		t.Fatalf("a flapping relay failed the whole composition: %v", err)
+	}
+	elapsed := time.Since(started)
+
+	bound := replacement.sessionShimRelayDrainBound()
+	adopted := 0
+	for _, spec := range specs {
+		if _, err := replacement.adoptedShimEntry(orgID, spec.SessionID); err == nil {
+			adopted++
+		}
+	}
+	// Two lineages fit inside the pass budget (a whole 1.5s window of waiting
+	// each against 3s); an unbounded pass would adopt all eight and spend eight
+	// windows — 12s — doing it.
+	if adopted != 2 {
+		t.Fatalf("adopted %d of %d lineages; want exactly 2 — a flapping relay must not buy "+
+			"a fresh window per lineage", adopted, len(specs))
+	}
+	if elapsed > 4*bound.window {
+		t.Fatalf("the composition blocked for %s against a %s window — the pass-total budget did not hold",
+			elapsed, bound.window)
+	}
+	budgetSpent := 0
+	for _, q := range replacement.QuarantinedSessions() {
+		if strings.Contains(q.Detail, "waiting budget") {
+			budgetSpent++
+		}
+	}
+	if budgetSpent != len(specs)-adopted {
+		t.Fatalf("%d quarantine details name the exhausted pass budget, want %d — "+
+			"an operator reading one must learn which bound actually stopped the pass",
+			budgetSpent, len(specs)-adopted)
 	}
 }
 

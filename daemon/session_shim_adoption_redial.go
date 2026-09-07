@@ -187,7 +187,10 @@ const (
 	// lineage-live window of ten minutes is a reasonable answer to the first and
 	// never to the second, and a relay's own planned drain is bounded well
 	// inside this.
-	sessionShimStartupRelayDrainCap = 30 * time.Second
+	// The derivation, from the planned-restart contract's own defaults: a 15s
+	// drain, plus the 30s kill-timeout headroom a drain that overruns is
+	// allowed, plus a single-machine replacement boot and its first accept.
+	sessionShimStartupRelayDrainCap = 90 * time.Second
 )
 
 // isSessionShimCarrierCursorDrift reports whether a durable-adoption refusal is
@@ -276,6 +279,7 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 		ctx, ctrl, preparations, hostID, evidence, preparation,
 	)
 	redials := 0
+	lastStop := sessionShimDrainWindowSpent
 	for {
 		if err == nil {
 			drain.admitted()
@@ -285,21 +289,22 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 		if !unavailable {
 			return evidence, preparation, receipt, err
 		}
-		wait, windowLive := drain.reserve(hint, bound, time.Now())
-		if !windowLive {
+		wait, stop := drain.reserve(hint, bound, time.Now())
+		if stop != sessionShimDrainLive {
+			lastStop = stop
 			if redials > 0 {
 				break
 			}
-			// The window is spent, but this lineage has not dialled since. It
-			// gets the one free re-dial the guarantee above promises: no wait,
-			// because the pass already spent the waiting, and a dial is how the
-			// relay's return is discovered at all.
+			// The pass has stopped waiting, but this lineage has not dialled
+			// since. It gets the one free re-dial the guarantee above promises:
+			// no wait, because the pass already spent the waiting, and a dial is
+			// how the relay's return is discovered at all.
 			wait = 0
 		}
 		redials++
 		slog.Warn("session shim: the relay refused durable adoption without reading the proof; re-dialling before quarantine",
 			"session", id.String(), "redial", redials, "wait", wait,
-			"relayRedialFloor", hint, "passWindowLive", windowLive, "error", err)
+			"relayRedialFloor", hint, "passStillWaiting", stop == sessionShimDrainLive, "error", err)
 		// Clear only what a refused dial can have staged locally. The proof and
 		// its Snapshot authority are re-presented unchanged: the relay never
 		// looked at them, so there is nothing about them to repair.
@@ -316,14 +321,16 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 	// the quarantine detail says the relay never answered, how many times this
 	// lineage re-dialled, and that the window it exhausted belonged to the whole
 	// composition rather than to this lineage alone.
-	err = fmt.Errorf("%w; the relay was still unavailable after %d re-dial(s) and the composition's %s drain window",
-		err, redials, bound.window)
+	err = fmt.Errorf("%w; the relay was still unavailable after %d re-dial(s), and the composition stopped waiting on %s",
+		err, redials, lastStop.describe(bound))
 	return evidence, preparation, receipt, err
 }
 
 // sessionShimRelayDrainBarrier is one composition pass's shared view of ONE
 // relay outage: when the pass stops waiting on it, the instant the next dial
-// may go out, and how far along the shared ladder that instant was set.
+// may go out, how far along the shared ladder that instant was set, and — the
+// one field a successful dial does NOT refund — how much waiting the whole pass
+// has spent.
 //
 // Its zero value is "no drain open", so a pass that never meets one costs
 // nothing. It is guarded because nothing in the contract promises the pass
@@ -332,24 +339,59 @@ type sessionShimRelayDrainBarrier struct {
 	mu        sync.Mutex
 	deadline  time.Time
 	notBefore time.Time
-	waits     int
+	// spent is the pass's cumulative reserved waiting. admitted() deliberately
+	// does not clear it: clearing the WINDOW is what lets a later, unrelated
+	// drain be waited out properly, but a relay that alternates — admits one
+	// lineage, refuses the next — would then hand every lineage a whole fresh
+	// window and reintroduce the lineage-count multiplication the shared window
+	// exists to remove. This is the ceiling that holds however the relay flaps.
+	spent time.Duration
+	// stepCount is how many waits have been served inside the CURRENT window;
+	// it selects the position on the shared doubling ladder and is reset with
+	// the window.
+	stepCount int
 }
 
-// sessionShimRelayDrainBound is the schedule and the bound one pass will spend
-// on a relay that is not answering. Every field but the window's cap is
-// resolved from the deployment's own re-adoption policy — see
+// sessionShimRelayDrainStop says why the barrier stopped granting waits, so a
+// quarantine detail can name the constraint that actually bound rather than
+// the first bound in the struct.
+type sessionShimRelayDrainStop uint8
+
+const (
+	// sessionShimDrainLive: the pass is still willing to wait.
+	sessionShimDrainLive sessionShimRelayDrainStop = iota
+	// sessionShimDrainWindowSpent: this outage's window elapsed.
+	sessionShimDrainWindowSpent
+	// sessionShimDrainPassBudgetSpent: the whole composition's waiting budget
+	// is gone, across every outage it met.
+	sessionShimDrainPassBudgetSpent
+)
+
+func (s sessionShimRelayDrainStop) describe(bound sessionShimRelayDrainBound) string {
+	if s == sessionShimDrainPassBudgetSpent {
+		return fmt.Sprintf("the composition's whole %s waiting budget", bound.passTotal)
+	}
+	return fmt.Sprintf("the composition's %s drain window", bound.window)
+}
+
+// sessionShimRelayDrainBound is the schedule and the bounds one pass will spend
+// on a relay that is not answering. Every field is resolved from the
+// deployment's own re-adoption policy except the window's cap — see
 // (*Daemon).sessionShimRelayDrainBound for why that one is deliberately not.
 type sessionShimRelayDrainBound struct {
-	// waits caps how many times the pass will sleep before it stops waiting.
-	// Zero means the window is the only bound — the lineage-live shape, whose
-	// policy expresses no attempt count at all.
-	waits int
 	// base is the first delay; it doubles along the shared ladder.
 	base time.Duration
 	// ceiling caps ONE wait, including a floor the relay itself named.
 	ceiling time.Duration
-	// window caps the whole pass's waiting.
+	// window caps the waiting on ONE outage. It is the ONLY bound on how many
+	// times the pass re-dials into that outage: an attempt count that stopped
+	// the pass earlier than its own window would be a second, unstated bound,
+	// and under the shipped default it stopped it at 15s against a relay whose
+	// planned restart is longer than that.
 	window time.Duration
+	// passTotal caps the pass's waiting across every outage it meets, and is
+	// never refunded by a dial that gets through.
+	passTotal time.Duration
 }
 
 // reserve advances the shared ladder for one refusal and reports how long the
@@ -362,22 +404,22 @@ type sessionShimRelayDrainBound struct {
 // a fresh one.
 func (b *sessionShimRelayDrainBarrier) reserve(
 	hint time.Duration, bound sessionShimRelayDrainBound, now time.Time,
-) (time.Duration, bool) {
+) (time.Duration, sessionShimRelayDrainStop) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.deadline.IsZero() {
 		b.deadline = now.Add(bound.window)
 		b.notBefore = now
-		b.waits = 0
 	}
 	if !now.Before(b.deadline) {
-		return 0, false
+		return 0, sessionShimDrainWindowSpent
 	}
-	if bound.waits > 0 && b.waits >= bound.waits {
-		return 0, false
+	remaining := bound.passTotal - b.spent
+	if remaining <= 0 {
+		return 0, sessionShimDrainPassBudgetSpent
 	}
-	b.waits++
-	next := b.notBefore.Add(sessionShimRelayDrainDelay(b.waits+1, hint, bound))
+	b.stepCount++
+	next := b.notBefore.Add(sessionShimRelayDrainDelay(b.stepCount+1, hint, bound))
 	switch {
 	case next.Before(now):
 		// The pass served this delay while another lineage was dialling; the
@@ -386,33 +428,50 @@ func (b *sessionShimRelayDrainBarrier) reserve(
 	case next.After(b.deadline):
 		next = b.deadline
 	}
+	wait := next.Sub(now)
+	if wait > remaining {
+		// The pass's own budget is the shorter of the two constraints. Serve
+		// what is left of it rather than refusing outright: a shortened wait
+		// still spaces the dial, and the dial is what discovers a returned
+		// relay.
+		wait = remaining
+		next = now.Add(wait)
+	}
 	b.notBefore = next
-	return next.Sub(now), true
+	b.spent += wait
+	return wait, sessionShimDrainLive
 }
 
-// admitted clears the window: a dial got through, so whatever the relay was
-// doing is over and the next drain is a new one.
+// admitted clears the WINDOW: a dial got through, so whatever the relay was
+// doing is over and the next drain is a new one. It does not clear spent — see
+// that field.
 func (b *sessionShimRelayDrainBarrier) admitted() {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	b.deadline = time.Time{}
 	b.notBefore = time.Time{}
-	b.waits = 0
+	b.stepCount = 0
 }
 
 // sessionShimRelayDrainBound resolves what one composition pass will spend on a
-// relay that is not answering, from the deployment's own re-adoption policy —
-// in the shape that policy's OWN VALIDATOR accepts.
+// relay that is not answering, from the deployment's own re-adoption policy in
+// the shape that policy's OWN VALIDATOR accepts.
 //
 // The validator refuses BackoffCap in fixed-attempts mode and refuses Attempts
 // in lineage-live mode, so reading all four fields in both modes would resolve
 // numbers no deployment can express: a private third policy wearing the
 // configuration's name. Each mode is read in its own vocabulary instead:
 //
-//   - fixed attempts: Attempts is the dial budget and Backoff is the ladder.
-//     The policy expresses no per-wait cap in this mode, so its own
-//     WorstCaseWindow — the thing it DOES say about how long this bound may
-//     take — caps both a single wait and the whole window;
+//   - fixed attempts: Backoff is the ladder, and the policy's own
+//     WorstCaseWindow — which is derived from Attempts, AttemptTimeout and that
+//     same ladder — is the window. Attempts therefore still shapes the bound;
+//     what it must NOT do is truncate it independently. Taking Attempts-1 as a
+//     separate wait budget stopped the shipped default at 15s, which is shorter
+//     than a relay's own planned restart (its drain timeout alone is 15s,
+//     before shutdown, journal flush and a replacement boot), and a lineage
+//     that runs out on the startup path has no second chance anywhere: it is
+//     quarantined, its controller closed, and the controller-loss re-adoption
+//     path never sees it;
 //   - lineage live: the window is the bound, exactly as that mode's doc says,
 //     and BackoffCap is the per-wait cap it expresses.
 //
@@ -421,7 +480,13 @@ func (b *sessionShimRelayDrainBarrier) admitted() {
 // live carrier fault, with the host already up". The startup pass asks a
 // different question — "how long may boot block before this host can advertise
 // capacity at all" — and a ten-minute lineage-live window is a legitimate answer
-// to the first and never to the second.
+// to the first and never to the second. It is sized against a relay's real
+// worst case rather than at a round number: a planned drain (15s by that
+// contract's default), plus the platform kill-timeout headroom a drain that
+// overruns is allowed (30s), plus a single-machine replacement boot and its
+// first accept. Erring long is the cheap direction — the pass WITHHOLDS
+// readiness rather than withdrawing it, so the cost is boot latency, while the
+// cost of erring short is a live lineage condemned with no recovery path.
 //
 // It deliberately does not read the policy's Disabled switch either: "may this
 // daemon re-adopt a lineage whose controller it lost" is not "may it dial twice
@@ -439,8 +504,6 @@ func (d *Daemon) sessionShimRelayDrainBound() sessionShimRelayDrainBound {
 		bound.window = policy.Window
 		bound.ceiling = policy.BackoffCap
 	default:
-		// Attempts counts DIALS; the waits between them are one fewer.
-		bound.waits = policy.Attempts - 1
 		bound.window = policy.WorstCaseWindow()
 		bound.ceiling = bound.window
 	}
@@ -453,9 +516,10 @@ func (d *Daemon) sessionShimRelayDrainBound() sessionShimRelayDrainBound {
 	if bound.ceiling <= 0 || bound.ceiling > bound.window {
 		bound.ceiling = bound.window
 	}
-	if bound.waits < 0 {
-		bound.waits = 0
-	}
+	// Two windows: enough for a relay that restarts twice during one boot, and
+	// a hard ceiling on a relay that alternates so the pass can never spend one
+	// window per lineage.
+	bound.passTotal = 2 * bound.window
 	return bound
 }
 
