@@ -658,6 +658,60 @@ func TestRedeliveryAfterASuccessfulWriteIsDeduped(t *testing.T) {
 	}
 }
 
+// J1: a half-applied rung 2 must NOT be recorded.
+//
+// The file claims that when the interrupt lands and the submit does not, the
+// mutation is left uncommitted so a redelivery re-writes the interrupt — the
+// one case where retrying beats recording a delivery that did not finish.
+// Nothing pinned that claim, so committing rung 2 before its first write would
+// have gone unnoticed.
+func TestHalfAppliedRestartHarnessIsNotRecorded(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+	f.primeWakeLedger(t)
+
+	// Take the harness away so rung 2's writes cannot land at all.
+	f.terminateShim(t)
+
+	m := wakeMutation(t, "session.restart-harness", "m-1", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(m); err == nil {
+		t.Fatal("restart-harness against a dead shim = nil error, want a write failure")
+	}
+
+	already, err := f.daemon.checkWakeMutation(f.id, "m-1", "session.restart-harness")
+	if err != nil {
+		t.Fatalf("checkWakeMutation = %v", err)
+	}
+	if already {
+		t.Fatal("a rung 2 whose write did not complete was recorded; a redelivery would skip the interrupt entirely")
+	}
+}
+
+// J2: the ordering guard must still refuse a seat whose only ledger entry came
+// from a rung 2 — an entry exists, but nothing ever woke it.
+//
+// Today no ordinary path reaches that state, because a rung 2 cannot commit
+// without a prior wake. The guard is defence against that invariant changing,
+// and this reaches it directly so the branch is exercised rather than assumed
+// unreachable.
+func TestOrderingGuardRefusesAnEntryThatWasNeverWoken(t *testing.T) {
+	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{RegistryDir: t.TempDir()}})
+	id := sessionshim.Identity{OrgID: "org-a", SessionID: "sess-a"}
+
+	// An entry that exists but carries no wake.
+	d.commitWakeMutation(id, "m-restart", "session.restart-harness")
+
+	if _, err := d.checkWakeMutation(id, "m-other", "session.restart-harness"); !errors.Is(err, errRestartBeforeWake) {
+		t.Fatalf("check on a never-woken entry = %v, want errRestartBeforeWake", err)
+	}
+	// And a wake on the same entry opens the ladder as usual.
+	d.commitWakeMutation(id, "m-wake", "session.wake")
+	if _, err := d.checkWakeMutation(id, "m-other", "session.restart-harness"); err != nil {
+		t.Fatalf("check after a wake = %v, want admitted", err)
+	}
+}
+
 // Neither verb may end the session. A wedged seat still holds a worktree and an
 // identity worth keeping, and the whole point of putting these rungs BELOW the
 // stop rail is that they are recoverable attempts, not terminations.
