@@ -472,6 +472,11 @@ type Daemon struct {
 	landingStopping bool
 	landingActive   int
 	landingDone     chan struct{}
+
+	// wakeLedger records which wedge-remediation rungs a session has already
+	// received, so an at-least-once redelivery is not replayed into a live
+	// terminal and rung 2 cannot precede rung 1. See mutation_session_wake.go.
+	wakeLedger wakeLedger
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
