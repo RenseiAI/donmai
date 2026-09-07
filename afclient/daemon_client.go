@@ -163,6 +163,29 @@ type DaemonSessionShimStatus struct {
 	// state. A host that is serving correctly but not converging looks healthy
 	// in every other field here, which is exactly how one stayed unnoticed.
 	Reconverging []DaemonSessionShimReconvergence `json:"reconverging,omitempty"`
+	// DurabilityRefusal is why this host's durable sessions are off, when they
+	// are off because a boot adoption batch was refused. Nil in every other
+	// case, including a host that simply does not compose durable sessions.
+	//
+	// It exists because `ownershipMode: disabled` is a boolean and an operator
+	// looking at a host that lost the feature needs the reason without going
+	// to the process log — which is on the host whose durable sessions are
+	// already gone.
+	DurabilityRefusal *DaemonSessionShimDurabilityRefusal `json:"durabilityRefusal,omitempty"`
+}
+
+// DaemonSessionShimDurabilityRefusal is the retained, non-secret reason a boot
+// adoption batch was refused and durable sessions were stood down.
+type DaemonSessionShimDurabilityRefusal struct {
+	// Scope is the organization whose batch was refused.
+	Scope string `json:"scope"`
+	// Lineages are the lifecycle identities the refusal named, rendered
+	// org/session. Empty when the refusal named none.
+	Lineages []string `json:"lineages,omitempty"`
+	// Reason is the refusal's own bounded text.
+	Reason string `json:"reason,omitempty"`
+	// RefusedAt is when this daemon recorded it, RFC 3339.
+	RefusedAt string `json:"refusedAt,omitempty"`
 }
 
 // DaemonSessionShimReconvergence is one scope's live re-convergence condition.

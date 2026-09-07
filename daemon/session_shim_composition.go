@@ -180,6 +180,24 @@ func (d *Daemon) SessionShimCompositionPending() bool {
 // not die, and it does not leave the control plane believing in a composition
 // that is not there.
 //
+// ONE failure is CLASSIFIED for the caller rather than left opaque: a boot
+// adoption batch the control plane refused for a reason no bounded recovery
+// can settle comes back as *SessionShimDurabilityRefused, wrapped, so
+// errors.As reaches it. It is still an error and it still means nothing was
+// installed — but it is the one failure whose honest handling is "warn, do not
+// announce durable sessions, keep serving direct-owned ones" rather than
+// "exit". An embedder that exits on any error from this call keeps a working
+// host by classifying it; an embedder that does not classify it behaves
+// exactly as it did before. Every other failure is untyped exactly as it was,
+// because a transport blip or an expired credential is recovered by the
+// supervised restart that an error triggers, and disabling durable sessions
+// for the life of the process over one would trade a transient outage for a
+// permanent one.
+//
+// The refusal's scope, lineages, and reason are retained and readable from
+// SessionShimDurabilityRefusal() and the diagnostics surface, so an operator
+// who sees `off` can see why without the process log.
+//
 // It is safe to call from a goroutine started after Start returned. It admits
 // one install at a time and refuses a second composition outright.
 func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionShimConfig) error {
@@ -243,8 +261,37 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 	}
 
 	if err := d.adoptSessionShims(ctx); err != nil {
+		var refused *SessionShimDurabilityRefused
+		if errors.As(err, &refused) {
+			// DEGRADED, NOT TERMINAL — and said so in a way a caller can act
+			// on. The control plane refused this scope's boot batch and every
+			// bounded recovery for it is spent. The deferred rollback above has
+			// already put this daemon back in the stand-down posture it was
+			// serving in, which is a posture it serves correctly: direct-owned
+			// sessions, no shim projection on the beat, a control plane that
+			// expects none.
+			//
+			// The typed error is RETURNED rather than swallowed. An embedder
+			// that exits on any error from this call keeps a working host by
+			// classifying this one — `errors.As(err, &daemon.SessionShimDurabilityRefused{})`
+			// — and an embedder that does not classify it behaves exactly as it
+			// did before this change. Returning nil would instead make every
+			// embedder announce a durable-session composition that is not
+			// there, which is worse than the failure it was meant to fix.
+			//
+			// ONE loud line, because it is the line an operator greps for, and
+			// the reason is retained on the diagnostics surface so `off` comes
+			// with a why.
+			slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+				"boot adoption batch and every bounded recovery is spent; the daemon keeps serving direct-owned "+
+				"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+				"scope", refused.Scope, "lineages", refused.LineageIDs(), "refusal", refused.Err)
+			d.retainSessionShimDurabilityRefusal(refused)
+			return fmt.Errorf("session shim: composition adoption: %w", err)
+		}
 		return fmt.Errorf("session shim: composition adoption: %w", err)
 	}
+	d.clearSessionShimDurabilityRefusal()
 
 	// Adoption is complete and durable. Publishing the configuration without
 	// the pending flag is what opens ownership of new sessions.
