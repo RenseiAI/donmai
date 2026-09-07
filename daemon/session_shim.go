@@ -736,6 +736,24 @@ type SessionShimConfig struct {
 	// standalone daemon.
 	Orphan sessionshim.OrphanPolicy
 
+	// StartupRelayDrainWindow is how long the STARTUP composition pass will keep
+	// re-dialling one carrier outage — a relay draining for a planned restart,
+	// or one that cannot be reached at all — before it treats a lineage's
+	// refusal as terminal. Zero uses a default derived from the planned-restart
+	// contract's own worst case; see sessionShimStartupRelayDrainWindow.
+	//
+	// It is its own field, and not a reading of Readoption, because it answers
+	// its own question. Readoption bounds patience about a live carrier fault on
+	// a host that is already up and already advertising capacity. This bounds
+	// how long boot may block before the host can advertise any capacity at all,
+	// and the thing it is waiting out is a property of the RELAY, not of this
+	// daemon's re-adoption appetite. Erring long is the cheap direction: the
+	// pass withholds readiness rather than withdrawing it, while a lineage this
+	// pass gives up on is quarantined with no recovery path anywhere.
+	//
+	// It is bounded above by sessionShimStartupRelayDrainCap however it is set.
+	StartupRelayDrainWindow time.Duration
+
 	// Readoption bounds the re-adoption this daemon attempts when an adopted
 	// shim's controller stream ends without a terminal observation while the
 	// shim's discovery record is still live (§D10: the shim and its harness are

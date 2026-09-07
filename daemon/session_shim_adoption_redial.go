@@ -134,10 +134,26 @@ package daemon
 //
 // The waiting itself belongs to the PASS, not to the lineage: one relay is one
 // process, so the second lineage to meet a drain must not restart the ladder
-// from zero and pay for a fact the first one already established. The shared
-// window, what each mode of the re-adoption policy contributes to it, and the
-// one number that is deliberately NOT from that policy are all in
+// from zero and pay for a fact the first one already established. Where each
+// number in that shared bound comes from is in
 // (*Daemon).sessionShimRelayDrainBound.
+//
+// One rule governs which of those shared bounds may end a lineage:
+//
+//	A bound whose expiry CONDEMNS a live lineage may only be derived from that
+//	lineage's own evidence, or from the outage it is actually waiting on. A
+//	pass-global budget is neither — it is a fairness and boot-latency device —
+//	so it may shorten waits, and it must never be the stop that quarantines.
+//
+// The window satisfies that rule (it is the outage's own bound) and terminalizes.
+// The pass total does not, so a lineage that meets an exhausted one still gets a
+// dial spaced by the relay's own floor, served outside the budget, and is
+// condemned only if the relay refuses THAT. The alternative — condemning on the
+// budget — trades a bounded cost for an unbounded one: this pass runs before
+// registration and capacity publication, so waiting longer costs boot latency on
+// a host that is not yet advertising anything, while giving up costs a live
+// lineage that has no recovery path anywhere and a healthy harness reaped at the
+// shim's orphan deadline.
 //
 // SCOPE — STARTUP ONLY
 //
@@ -176,21 +192,34 @@ const (
 	// authority that mints it settle, not to wait out a local condition.
 	sessionShimDriftRedialBackoff = 200 * time.Millisecond
 
-	// sessionShimStartupRelayDrainCap bounds what the STARTUP composition pass
-	// will spend waiting on a relay that is not answering, whatever the
-	// re-adoption policy says.
+	// sessionShimStartupRelayDrainWindow is how long the STARTUP composition
+	// pass waits out ONE carrier outage when the deployment names no window of
+	// its own, and it is derived from the thing it is actually waiting for
+	// rather than from this daemon's re-adoption appetite.
 	//
-	// It is a separate number BECAUSE it answers a separate question. The
-	// re-adoption policy bounds patience about a live carrier fault on a host
-	// that is already up and already advertising capacity; this bounds how long
-	// boot may block before the host can advertise any capacity at all. A
-	// lineage-live window of ten minutes is a reasonable answer to the first and
-	// never to the second, and a relay's own planned drain is bounded well
-	// inside this.
-	// The derivation, from the planned-restart contract's own defaults: a 15s
-	// drain, plus the 30s kill-timeout headroom a drain that overruns is
-	// allowed, plus a single-machine replacement boot and its first accept.
-	sessionShimStartupRelayDrainCap = 90 * time.Second
+	// The derivation, from the planned-restart contract's own defaults: the
+	// platform kill timeout is the hard bound from the start of a drain to the
+	// process's death (45s, and it already contains the 15s drain itself), and
+	// after that the replacement must boot and reach its first accept. That is
+	// roughly 65-75s in the worst case and 35-45s for an ordinary in-place
+	// restart, so 90s covers the worst case with margin.
+	//
+	// Sizing it from the re-adoption policy instead — attempts times the attempt
+	// timeout, plus the ladder — produced 60s, a number with no relationship to
+	// how long a relay restart takes, and one that did NOT cover the worst case.
+	sessionShimStartupRelayDrainWindow = 90 * time.Second
+	// sessionShimStartupRelayDrainCap is the most boot may block on a relay,
+	// however the deployment configures the window above. A lineage-live
+	// deployment's ten-minute appetite is a legitimate answer to "how patient
+	// about a live carrier fault" and never to "how long before this host can
+	// advertise capacity".
+	sessionShimStartupRelayDrainCap = 3 * time.Minute
+	// sessionShimStartupRelayDrainWaitDivisor bounds ONE wait as a fraction of
+	// the window, so a single large floor cannot collapse the ladder. Without
+	// it the fixed-mode per-wait ceiling was the window itself, and one
+	// Retry-After at or above the window reduced a whole outage to two dials:
+	// the refusal that opened it and one at the deadline.
+	sessionShimStartupRelayDrainWaitDivisor = 4
 )
 
 // isSessionShimCarrierCursorDrift reports whether a durable-adoption refusal is
@@ -295,11 +324,27 @@ func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
 			if redials > 0 {
 				break
 			}
-			// The pass has stopped waiting, but this lineage has not dialled
-			// since. It gets the one free re-dial the guarantee above promises:
-			// no wait, because the pass already spent the waiting, and a dial is
-			// how the relay's return is discovered at all.
+			// This lineage has not dialled since the pass stopped waiting, and
+			// it is never condemned without a second dial. WHAT that dial is
+			// spaced by depends on WHICH bound stopped the pass, because only
+			// one of the two is allowed to condemn anything:
+			//
+			//   - the WINDOW is derived from the outage this lineage is actually
+			//     waiting on, so it may terminalize. Its free re-dial needs no
+			//     spacing: the window it would be spaced within has elapsed;
+			//   - the PASS TOTAL is a fairness and boot-latency device shared
+			//     with every other lineage. A lineage arriving after some other
+			//     lineage spent it has evidence of nothing. It gets a genuinely
+			//     spaced dial — the floor the relay itself asked for, or one rung
+			//     of the local ladder when it named none — served OUTSIDE the
+			//     budget, so the budget shortens waiting without ever being the
+			//     reason a live lineage is condemned. Worst case is the budget
+			//     plus one floor per lineage: bounded, and still free of the
+			//     per-lineage window multiplication the shared window removes.
 			wait = 0
+			if stop == sessionShimDrainPassBudgetSpent {
+				wait = sessionShimRelayDrainDelay(2, hint, bound)
+			}
 		}
 		redials++
 		slog.Warn("session shim: the relay refused durable adoption without reading the proof; re-dialling before quarantine",
@@ -369,7 +414,12 @@ const (
 
 func (s sessionShimRelayDrainStop) describe(bound sessionShimRelayDrainBound) string {
 	if s == sessionShimDrainPassBudgetSpent {
-		return fmt.Sprintf("the composition's whole %s waiting budget", bound.passTotal)
+		// Said this way on purpose: the budget stopped the SHARING, and this
+		// lineage was still given a spaced dial of its own that the relay
+		// refused. An operator must not read the detail as "a global budget
+		// condemned a live lineage", because that is not what happened.
+		return fmt.Sprintf("the composition's whole %s waiting budget, after a further "+
+			"re-dial spaced by the relay's own floor was refused too", bound.passTotal)
 	}
 	return fmt.Sprintf("the composition's %s drain window", bound.window)
 }
@@ -430,12 +480,14 @@ func (b *sessionShimRelayDrainBarrier) reserve(
 	}
 	wait := next.Sub(now)
 	if wait > remaining {
-		// The pass's own budget is the shorter of the two constraints. Serve
-		// what is left of it rather than refusing outright: a shortened wait
-		// still spaces the dial, and the dial is what discovers a returned
-		// relay.
-		wait = remaining
-		next = now.Add(wait)
+		// The budget cannot fund this wait whole, and a STUB wait is worse than
+		// none: it spaces the dial by an amount neither the relay nor the ladder
+		// asked for, so the dial lands back inside the outage and the lineage is
+		// then condemned by a wait the budget truncated. Report the budget spent
+		// instead and let the caller serve the floor-spaced dial it owes every
+		// lineage — the same reason the budget is not allowed to be a stop.
+		b.stepCount--
+		return 0, sessionShimDrainPassBudgetSpent
 	}
 	b.notBefore = next
 	b.spent += wait
@@ -454,71 +506,66 @@ func (b *sessionShimRelayDrainBarrier) admitted() {
 }
 
 // sessionShimRelayDrainBound resolves what one composition pass will spend on a
-// relay that is not answering, from the deployment's own re-adoption policy in
-// the shape that policy's OWN VALIDATOR accepts.
+// relay that is not answering.
 //
-// The validator refuses BackoffCap in fixed-attempts mode and refuses Attempts
-// in lineage-live mode, so reading all four fields in both modes would resolve
-// numbers no deployment can express: a private third policy wearing the
-// configuration's name. Each mode is read in its own vocabulary instead:
+// Each number comes from whichever party actually knows it:
 //
-//   - fixed attempts: Backoff is the ladder, and the policy's own
-//     WorstCaseWindow — which is derived from Attempts, AttemptTimeout and that
-//     same ladder — is the window. Attempts therefore still shapes the bound;
-//     what it must NOT do is truncate it independently. Taking Attempts-1 as a
-//     separate wait budget stopped the shipped default at 15s, which is shorter
-//     than a relay's own planned restart (its drain timeout alone is 15s,
-//     before shutdown, journal flush and a replacement boot), and a lineage
-//     that runs out on the startup path has no second chance anywhere: it is
-//     quarantined, its controller closed, and the controller-loss re-adoption
-//     path never sees it;
-//   - lineage live: the window is the bound, exactly as that mode's doc says,
-//     and BackoffCap is the per-wait cap it expresses.
+//   - the WINDOW — how long one carrier outage is worth waiting out — is the
+//     deployment's StartupRelayDrainWindow, or a default derived from the
+//     planned-restart contract's own worst case. Reading it off the re-adoption
+//     policy, as two earlier rounds of this change did, resolved a number about
+//     re-adoption appetite (attempts times attempt timeout, plus the ladder) and
+//     applied it to a question about how long a relay takes to come back. It
+//     produced 60s, which does not cover that worst case, while the derivation
+//     written on the constant said 90s. A number the code derives and then does
+//     not use is worse than no derivation;
+//   - the LADDER is the re-adoption policy's Backoff. Retry cadence genuinely is
+//     that policy's question, and it is read in the shape its own validator
+//     accepts, so no case here can pin a configuration no daemon can boot with;
+//   - the per-wait CEILING is that policy's BackoffCap where the mode expresses
+//     one, bounded in every mode by a fraction of the window so one large
+//     announced floor cannot collapse a whole outage to two dials;
+//   - the PASS TOTAL bounds waiting across every outage the pass meets. It is
+//     deliberately NOT a stop that condemns anything — see the loop above.
 //
-// What is NOT from the policy, and is named rather than hidden, is the startup
-// cap. The re-adoption policy answers "how patient may this daemon be about a
-// live carrier fault, with the host already up". The startup pass asks a
-// different question — "how long may boot block before this host can advertise
-// capacity at all" — and a ten-minute lineage-live window is a legitimate answer
-// to the first and never to the second. It is sized against a relay's real
-// worst case rather than at a round number: a planned drain (15s by that
-// contract's default), plus the platform kill-timeout headroom a drain that
-// overruns is allowed (30s), plus a single-machine replacement boot and its
-// first accept. Erring long is the cheap direction — the pass WITHHOLDS
-// readiness rather than withdrawing it, so the cost is boot latency, while the
-// cost of erring short is a live lineage condemned with no recovery path.
-//
-// It deliberately does not read the policy's Disabled switch either: "may this
-// daemon re-adopt a lineage whose controller it lost" is not "may it dial twice
-// while the relay restarts", and a deployment that turned the first off did not
-// ask to quarantine every lineage on the host the next time a deploy lands
+// It does not read the policy's Disabled switch: "may this daemon re-adopt a
+// lineage whose controller it lost" is not "may it dial twice while the relay
+// restarts", and a deployment that turned the first off did not ask to
+// quarantine every lineage on the host the next time a deploy lands
 // mid-composition.
 func (d *Daemon) sessionShimRelayDrainBound() sessionShimRelayDrainBound {
-	policy := d.sessionShimConfig().readoption()
-	bound := sessionShimRelayDrainBound{base: policy.Backoff}
+	cfg := d.sessionShimConfig()
+	policy := cfg.readoption()
+	bound := sessionShimRelayDrainBound{base: policy.Backoff, window: cfg.StartupRelayDrainWindow}
 	if bound.base <= 0 {
 		bound.base = defaultSessionShimReadoptionBackoff
 	}
-	switch policy.Mode {
-	case ReadoptionLineageLive:
-		bound.window = policy.Window
-		bound.ceiling = policy.BackoffCap
-	default:
-		bound.window = policy.WorstCaseWindow()
-		bound.ceiling = bound.window
-	}
 	if bound.window <= 0 {
-		bound.window = defaultSessionShimReadoptionWindow
+		bound.window = sessionShimStartupRelayDrainWindow
 	}
 	if bound.window > sessionShimStartupRelayDrainCap {
 		bound.window = sessionShimStartupRelayDrainCap
 	}
-	if bound.ceiling <= 0 || bound.ceiling > bound.window {
-		bound.ceiling = bound.window
+	// Lineage-live is the one mode whose policy expresses a per-wait cap; every
+	// mode gets the fraction-of-window bound on top, so no configuration can
+	// spend a whole outage on one wait.
+	if policy.Mode == ReadoptionLineageLive {
+		bound.ceiling = policy.BackoffCap
+	}
+	perWait := bound.window / sessionShimStartupRelayDrainWaitDivisor
+	if bound.ceiling <= 0 || bound.ceiling > perWait {
+		bound.ceiling = perWait
+	}
+	if bound.ceiling < bound.base {
+		// A ladder rung the ceiling would clip to nothing is worse than a
+		// slightly wider ceiling: the base is the deployment's own floor on how
+		// fast this daemon may re-dial anything.
+		bound.ceiling = bound.base
 	}
 	// Two windows: enough for a relay that restarts twice during one boot, and
-	// a hard ceiling on a relay that alternates so the pass can never spend one
-	// window per lineage.
+	// a ceiling on a relay that alternates so the pass can never spend one
+	// window per lineage. It bounds WAITING only — see the loop above for why a
+	// pass-global budget is never allowed to be the stop that quarantines.
 	bound.passTotal = 2 * bound.window
 	return bound
 }
