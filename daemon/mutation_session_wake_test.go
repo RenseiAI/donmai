@@ -72,6 +72,9 @@ type wakeFixture struct {
 	daemon *Daemon
 	id     sessionshim.Identity
 	output <-chan []byte
+	// shim is the live harness host, so a test can take it away and make the
+	// controller's next write fail for real rather than through a stub.
+	shim *sessionshim.Shim
 	// ctrl is the adopted controller, exposed so a test can plant ORDINARY
 	// (non-system) input in the line editor — the draft a stalled seat is
 	// likely to be sitting on.
@@ -142,7 +145,7 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	d.shims.adopted[id] = adoptedShim{shimID: "shim-wake", controller: ctrl}
 	d.shims.mu.Unlock()
 
-	return &wakeFixture{daemon: d, id: id, output: output, ctrl: ctrl}
+	return &wakeFixture{daemon: d, id: id, output: output, ctrl: ctrl, shim: shim}
 }
 
 // awaitAck reports whether the fake harness answered at all. A wedged harness
@@ -155,8 +158,13 @@ func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
 
 // awaitLine returns the hex-encoded bytes of the next line the harness read.
 //
-// "ack:" with nothing after it means it read an EMPTY line — which is what a
-// cleared line editor submits, and the whole point of the D1 assertions.
+// Note what these fixtures CAN and cannot show. Neither has a line editor, so
+// the clear bytes are never interpreted: on the canonical fixture Ctrl-U is
+// eaten by the line discipline and Ctrl-A/Ctrl-K arrive as data, so the line
+// read back is "010b", not empty. An empty line is what a seat whose editor
+// interprets the pair submits, and no fixture here can produce one. What these
+// assertions do prove is the part this code controls — the exact bytes
+// delivered, and that a kernel-held draft is killed rather than submitted.
 func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, bool) {
 	t.Helper()
 	deadline := time.After(within)
@@ -189,9 +197,27 @@ func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, boo
 // a rung-2 test exercises rung 2 rather than the ordering refusal.
 func (f *wakeFixture) primeWakeLedger(t *testing.T) {
 	t.Helper()
-	if _, err := f.daemon.noteWakeMutation(f.id, "", "session.wake"); err != nil {
-		t.Fatalf("prime wake ledger: %v", err)
+	f.daemon.commitWakeMutation(f.id, "", "session.wake")
+}
+
+// terminateShim tears the harness host down so the adopted controller's next
+// write fails the way a dead socket would in production.
+func (f *wakeFixture) terminateShim(t *testing.T) {
+	t.Helper()
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.shim.Terminate(ctx); err != nil {
+		t.Fatalf("terminate shim: %v", err)
 	}
+	// Let the controller observe the closed transport.
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		if err := f.ctrl.WriteAttributedInput([]byte("probe"), []byte{0x00}); err != nil {
+			return
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	t.Fatal("controller still accepts writes after the shim terminated")
 }
 
 func wakeMutation(t *testing.T, op, id string, params any) PendingMutation {
@@ -370,7 +396,7 @@ func TestSessionWakeVerbsDeliverTheirOwnByteSequence(t *testing.T) {
 		wantHex string
 	}{
 		{
-			// Ctrl-A, Ctrl-K, then the submit. No interrupt.
+			// Ctrl-U, Ctrl-A, Ctrl-K, then the submit. No interrupt.
 			name: "wake clears the line and submits", op: "session.wake", wantHex: "15010b",
 		},
 		{
@@ -549,6 +575,86 @@ func TestSessionWakeVerbsAreIdempotentUnderRedelivery(t *testing.T) {
 	}
 	if got, ok := f.awaitLine(t, 2*time.Second); ok {
 		t.Fatalf("redelivery wrote to the terminal again: %q", got)
+	}
+}
+
+// A rung 1 whose write FAILED must not satisfy the ordering guard.
+//
+// This is the case the guard exists for, and the one the happy path hides. The
+// seats this rail targets are the ones whose transport is least healthy, so a
+// failed write is ordinary — and if the ledger recorded the rung on the way in,
+// the next interrupt would genuinely be the first byte the seat ever received.
+func TestFailedWakeDoesNotAdmitRestartHarness(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+
+	// Take the shim away so the controller's write cannot land.
+	f.terminateShim(t)
+
+	err := f.daemon.applyOneMutation(wakeMutation(t, "session.wake", "m-1", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	}))
+	if err == nil {
+		t.Fatal("wake against a dead shim = nil error, want a write failure")
+	}
+
+	// The ladder must still be closed: nothing was delivered, so nothing was
+	// woken.
+	restartErr := f.daemon.applyOneMutation(wakeMutation(t, "session.restart-harness", "m-2", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	}))
+	if !errors.Is(restartErr, errRestartBeforeWake) {
+		t.Fatalf("restart-harness after a FAILED wake = %v, want errRestartBeforeWake", restartErr)
+	}
+}
+
+// A mutation whose write failed must not be deduped into a false receipt.
+//
+// The id is only recorded once the keystrokes actually landed, so a redelivery
+// after a failure re-applies rather than ACKing "already applied" for a
+// delivery that never happened.
+func TestRedeliveryAfterAFailedWriteReapplies(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+	m := wakeMutation(t, "session.wake", "m-1", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+
+	// Fail the write by making the controller unusable, then restore a live
+	// fixture and re-present the SAME mutation id.
+	f.terminateShim(t)
+	if err := f.daemon.applyOneMutation(m); err == nil {
+		t.Fatal("wake against a dead shim = nil error, want a write failure")
+	}
+
+	// The SAME daemon's ledger must not remember it. Asked directly, because
+	// that is the fact: a redelivery is only deduped when the write landed.
+	already, err := f.daemon.checkWakeMutation(f.id, "m-1", "session.wake")
+	if err != nil {
+		t.Fatalf("checkWakeMutation = %v", err)
+	}
+	if already {
+		t.Fatal("a mutation whose write FAILED was recorded as applied; a redelivery would ACK a delivery that never happened")
+	}
+}
+
+// The committed path is still deduped — the split must not lose the property
+// it was added for.
+func TestRedeliveryAfterASuccessfulWriteIsDeduped(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureRawHarness)
+	m := wakeMutation(t, "session.wake", "m-1", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(m); err != nil {
+		t.Fatalf("wake = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
+		t.Fatalf("wake delivered %q (ok=%v), want 15010b", got, ok)
+	}
+	already, err := f.daemon.checkWakeMutation(f.id, "m-1", "session.wake")
+	if err != nil {
+		t.Fatalf("checkWakeMutation = %v", err)
+	}
+	if !already {
+		t.Fatal("a delivered mutation was not recorded; a redelivery would write into the terminal twice")
 	}
 }
 

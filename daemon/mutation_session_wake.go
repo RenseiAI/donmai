@@ -42,6 +42,14 @@ import (
 // (clearKeystroke), so neither can send a draft the seat never finished. That
 // is a property of the sequence, not of the bytes, and it is tested directly.
 //
+// Scoped precisely, since this file argues the point harder than any other:
+// the rungs write only CONTROL bytes and never text. On a seat whose editor
+// interprets them the submitted line is empty. On a seat whose editor does NOT
+// — a canonical-mode reader, where Ctrl-U is eaten by the line discipline and
+// Ctrl-A/Ctrl-K arrive as data — the submitted line is those two control bytes
+// rather than nothing. Still not text, still not the seat's draft, but not
+// literally empty either.
+//
 // BOTH RETAIN THE SHIM. Neither verb stops, terminates or respawns anything.
 // They write through the adopted shim's existing controller, so the session
 // keeps its identity, its PTY, its adoption generation and its worktree. A
@@ -53,6 +61,14 @@ import (
 // or replay a delivery. A per-session ledger (wakeLedger) refuses rung 2 on a
 // seat that was never woken, and dedupes a replayed mutation id so a second
 // interrupt is never written into a terminal that may since have recovered.
+//
+// THE LEDGER IS PROCESS-LOCAL and is forgotten on a daemon restart, which
+// moves the two properties in opposite directions. Ordering gets SAFER: the
+// woken flag is gone, so a redelivered rung 2 hard-refuses. Dedupe is LOST: a
+// rung whose ack was in flight across the restart is written again — harmless
+// for a wake, and for a restart it is the second interrupt the ledger exists
+// to prevent. So the ordering guarantee ultimately still lives in the control
+// plane; this is a second line of defence, not the only one.
 //
 // WHAT IS DELIBERATELY NOT HERE. Rung 2 does not re-exec the harness child
 // under the retained shim. That primitive does not exist: the shim owns its
@@ -86,10 +102,15 @@ import (
 // which is strictly worse than sending nothing.
 //
 // Ctrl-U is the line discipline's own kill character (VKILL), so it clears the
-// case the editor commands cannot reach, and readline-style editors bind it to
-// kill-line as well. The sequence is therefore a superset of the nudge rail's:
-// it clears a cooked-mode buffer AND a TUI's editor, and each byte is inert
-// where the other applies.
+// case the editor commands cannot reach.
+//
+// THE SAFETY ARGUMENT IS THE ORDER, not that Ctrl-U is universally a line
+// kill — it is not. A full-screen application binds it to whatever it likes;
+// this repo's own terminal UI binds ctrl+u to page-up. What makes the sequence
+// safe anyway is that Ctrl-U goes FIRST: wherever it scrolls, is swallowed, or
+// inserts a stray byte, the Ctrl-A + Ctrl-K that follow still move to the start
+// of the line and kill to the end. The line is cleared either way, and the
+// worst case is a scroll nobody sees.
 var clearKeystroke = []byte{0x15, 0x01, 0x0b}
 
 // submitKeystroke is a bare Enter — one carriage return, no content.
@@ -263,20 +284,34 @@ var errRestartBeforeWake = errors.New("no wake has been delivered to this sessio
 // noteWakeMutation records a rung against a session and reports whether this
 // exact mutation was already applied.
 //
+// CHECK AND COMMIT ARE SEPARATE, and the split is the point. Recording a rung
+// on the way IN would mean a rung 1 whose write FAILED still satisfied the
+// ordering guard — and the seats this rail targets are precisely the ones
+// whose transport is least healthy, so a failed write is not the exotic case.
+// The next interrupt would then genuinely be the first byte the seat ever
+// received, which is the one thing the guard exists to prevent. The same
+// mistake would ACK a redelivered failed mutation as "already applied": a
+// false receipt on a rail whose entire value is that delivered and answered
+// are different facts.
+//
+// So: check, write, and only then commit.
+
+// checkWakeMutation reports whether this mutation was already applied, and
+// refuses a rung that is out of order. It MUTATES NOTHING.
+//
 // Returns (alreadyApplied, error). An ordering violation is an error; a
 // redelivery is not — it is a successful no-op, because the mutation DID take
 // effect, just on an earlier beat.
-func (d *Daemon) noteWakeMutation(id sessionshim.Identity, mutationID, op string) (bool, error) {
+func (d *Daemon) checkWakeMutation(id sessionshim.Identity, mutationID, op string) (bool, error) {
 	d.wakeLedger.mu.Lock()
 	defer d.wakeLedger.mu.Unlock()
-	if d.wakeLedger.entries == nil {
-		d.wakeLedger.entries = make(map[sessionshim.Identity]*wakeLedgerEntry)
-	}
 	entry := d.wakeLedger.entries[id]
 	if entry == nil {
-		entry = &wakeLedgerEntry{}
-		d.wakeLedger.evictLocked()
-		d.wakeLedger.entries[id] = entry
+		// Nothing recorded for this seat. Only rung 1 may open the ladder.
+		if op == "session.restart-harness" {
+			return false, errRestartBeforeWake
+		}
+		return false, nil
 	}
 	if mutationID != "" {
 		for _, applied := range entry.appliedIDs {
@@ -288,6 +323,26 @@ func (d *Daemon) noteWakeMutation(id sessionshim.Identity, mutationID, op string
 	if op == "session.restart-harness" && !entry.woken {
 		return false, errRestartBeforeWake
 	}
+	return false, nil
+}
+
+// commitWakeMutation records a rung that has ACTUALLY been written.
+//
+// Called only after every keystroke of the verb reached the shim, so a failed
+// write leaves the ledger untouched: the ordering guard still refuses rung 2,
+// and a redelivery re-applies rather than being deduped into a false receipt.
+func (d *Daemon) commitWakeMutation(id sessionshim.Identity, mutationID, op string) {
+	d.wakeLedger.mu.Lock()
+	defer d.wakeLedger.mu.Unlock()
+	if d.wakeLedger.entries == nil {
+		d.wakeLedger.entries = make(map[sessionshim.Identity]*wakeLedgerEntry)
+	}
+	entry := d.wakeLedger.entries[id]
+	if entry == nil {
+		entry = &wakeLedgerEntry{}
+		d.wakeLedger.evictLocked()
+		d.wakeLedger.entries[id] = entry
+	}
 	if op == "session.wake" {
 		entry.woken = true
 	}
@@ -298,7 +353,6 @@ func (d *Daemon) noteWakeMutation(id sessionshim.Identity, mutationID, op string
 		}
 	}
 	entry.lastTouched = time.Now()
-	return false, nil
 }
 
 // evictLocked drops the least recently touched entry once the cap is reached.
@@ -333,7 +387,7 @@ func (d *Daemon) applySessionWake(m PendingMutation) error {
 	if err != nil {
 		return fmt.Errorf("session.wake: %w", err)
 	}
-	already, err := d.noteWakeMutation(ctrl.Identity(), m.ID, "session.wake")
+	already, err := d.checkWakeMutation(ctrl.Identity(), m.ID, "session.wake")
 	if err != nil {
 		return fmt.Errorf("session.wake: %w", err)
 	}
@@ -345,6 +399,7 @@ func (d *Daemon) applySessionWake(m PendingMutation) error {
 	if err := writeClearThenSubmit(ctrl); err != nil {
 		return fmt.Errorf("session.wake: %w", err)
 	}
+	d.commitWakeMutation(ctrl.Identity(), m.ID, "session.wake")
 	slog.Info("[daemon-sync] session wake delivered",
 		"session", params.SessionID, "reason", params.Reason)
 	return nil
@@ -365,7 +420,7 @@ func (d *Daemon) applySessionRestartHarness(m PendingMutation) error {
 	if err != nil {
 		return fmt.Errorf("session.restart-harness: %w", err)
 	}
-	already, err := d.noteWakeMutation(ctrl.Identity(), m.ID, "session.restart-harness")
+	already, err := d.checkWakeMutation(ctrl.Identity(), m.ID, "session.restart-harness")
 	if err != nil {
 		return fmt.Errorf("session.restart-harness: %w", err)
 	}
@@ -379,8 +434,13 @@ func (d *Daemon) applySessionRestartHarness(m PendingMutation) error {
 	}
 	time.Sleep(interruptSettleGap)
 	if err := writeClearThenSubmit(ctrl); err != nil {
+		// Deliberately NOT committed: the interrupt landed but the verb did
+		// not complete, and a redelivery re-writing the interrupt is exactly
+		// what the dedupe is for — a half-applied rung 2 is the case where
+		// retrying is safer than recording a delivery that did not finish.
 		return fmt.Errorf("session.restart-harness: %w", err)
 	}
+	d.commitWakeMutation(ctrl.Identity(), m.ID, "session.restart-harness")
 	slog.Info("[daemon-sync] session harness interrupt+wake delivered",
 		"session", params.SessionID, "reason", params.Reason)
 	return nil
