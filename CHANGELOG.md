@@ -10,6 +10,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.23 — 2026-09-07
+
+### Fixes
+
+- Slow durable persistence now pauses the PTY reader instead of dropping the carrier: the controller degrades and holds under a 32 MiB / 120 s budget, the 10-minute drop bound re-adopts the lineage under its own typed cause instead of quarantining it as socket-unreachable, every daemon-side ending re-dials before it withdraws, and the recovered-carrier streak is cleared. Back-pressure is visible on the daemon status surface and a `.flow` sidecar. (#559)
+- Heartbeat recovery no longer depends on shim readiness; platform persistence stalls are bounded (streak, then one re-adoption look, then quarantine only if unreachable) instead of quarantined outright; reconciliation pacing is narrowed to the two refusal causes. (#557)
+- Boot tolerates dead lineages and refused commits: a stale record is declared at its exact incarnation instead of dropped, a completeness refusal naming lineages only the control plane knows is answered by declaring them, a quarantined lineage releases its staged Snapshot so carrier activation never fails host-wide, records for scopes this host no longer serves are skipped, and the installer returns a typed durability refusal instead of exiting. (#558)
+- Omitted-lineage refusals carry the reported arm; the generation guard applies to the adopted arm only, so quarantined and preparing lineages this daemon declared are answerable, and a corrupt registry file no longer seeds an empty organization scope. (#565)
+- A prepare timeout for one new lineage no longer withdraws the host's published readiness; the launch retries the preparation on a fresh dial, bounded, and a later success restores readiness without a daemon restart. (#562)
+- Spawned workers learn the daemon's real control address for default and named instances, and a failed preflight names the address it dialled. (#560)
+- Lifecycle teardown honours rollout retention so a resumable harness home is never deleted; the resume key is recorded with the shim and survives republish, controller loss and terminal publication. (#555)
+- `session.wake` and `session.restart-harness` mutations for a wedged seat: a clear-line prefix that is safe on canonical and raw-mode seats, a per-session rung ledger (check, write, commit) that re-writes a half-applied interrupt on redelivery, and an ordering guard. (#563)
+- A shim that vanished without a tombstone (SIGKILL, OOM, power loss) is attested absent from two separated readings plus a socket dial re-taken immediately before the destructive step, and its recovery obligation is discharged; the record is kept as a `.absent` sidecar until the control plane accepts, so a refusal or daemon restart never strands the lineage; discharges are capped per pass. (#561)
+- A relay's planned restart (`relay-restarting` control, 1012 close with a redial hint, or a 503 carrying `Retry-After`) re-dials instead of ending the leg, on attach v1, v2 and the degraded lane; a bare 503 stays an ordinary dial failure. Startup re-adoption waits out one relay drain window (`StartupRelayDrainWindow`, default 90 s) with floor-spaced dials before any quarantine, a pass-wide waiting budget shortens waits but never itself condemns a lineage, and an announced floor cannot collapse the ladder. (#564)
+
+### Notes
+
+- Rolling back to v0.72.22 after resume keys are recorded quarantines every live session carrying one (closed-field record decode). A refused absent discharge followed by a rollback needs `<digest>.absent` renamed back to `<digest>.json` before starting the old daemon.
+
 ## v0.72.22 — 2026-09-06
 
 ### Features
