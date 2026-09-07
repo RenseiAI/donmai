@@ -46,6 +46,11 @@ type Session struct {
 	vt  terminal
 	rec *recorder
 
+	// flow is the optional PTY-read gate (OutputFlowControl). Nil disables it,
+	// and every gate method tolerates a nil receiver, so the read loop carries
+	// no branch for the disabled case.
+	flow *outputGate
+
 	// writeMu serializes EVERY author of PTY-master input and guards
 	// compose. Deliberately NOT s.mu: mu guards seq/ring/subscription/
 	// VT/recorder state fed from run(), and the input path must not contend
@@ -155,6 +160,7 @@ func Spawn(spec Spec) (*Session, error) {
 		vt:       newVTHost(int(cols), int(rows), spec.scrollback(), replyW, spec.logger()),
 		rec:      rec,
 		nextSeq:  attachwire.HostSeqStart,
+		flow:     newOutputGate(spec.OutputFlowControl, spec.logger()),
 		ring:     newRing(spec.ringBytes()),
 		subs:     make(map[*subscription]struct{}),
 		shutdown: make(chan struct{}),
@@ -178,6 +184,12 @@ func (s *Session) run() {
 
 	buf := make([]byte, readBufSize)
 	for {
+		// Back-pressure before the read, not after it: once bytes are off the
+		// master they are this session's problem, and the only place the
+		// harness can be told to slow down is the one where we decline to take
+		// them. A paused reader lets the kernel PTY buffer fill and the child
+		// block in write(2) — ordinary terminal behaviour, no loss, no reorder.
+		s.flow.await(s.shutdown)
 		n, err := s.ptmx.Read(buf)
 		if n > 0 {
 			s.onOutput(buf[:n])
@@ -254,6 +266,7 @@ func (s *Session) finalize() {
 			sub.finish()
 		}
 		s.rec.close()
+		s.flow.close()
 		close(s.done)
 	})
 }
@@ -753,7 +766,7 @@ func (s *Session) Subscribe(fromSeq attachwire.HostSeq) (agent.InteractiveSubscr
 	if !hit {
 		return nil, agent.ErrRingMiss
 	}
-	sub := newSubscription(s, replay)
+	sub := newSubscription(s, replay, s.flow)
 	if s.exited {
 		sub.finish() // no live frames will follow; close after the replay drains
 	} else {
@@ -795,6 +808,14 @@ func (s *Session) FirstBufferedSeq() attachwire.HostSeq {
 	defer s.mu.Unlock()
 	return s.ring.firstSeq()
 }
+
+// OutputFlowState reports the session's PTY-read back-pressure state. It is the
+// zero value when Spec.OutputFlowControl was not configured.
+//
+// It exists so an out-of-process owner can publish "this session is degraded
+// because nothing is draining it" as a FACT rather than inferring it from a
+// silence that looks identical to an idle terminal.
+func (s *Session) OutputFlowState() OutputFlowState { return s.flow.state() }
 
 // Done is closed after the child has exited AND the master has been drained to
 // EOF with every pending Output emitted (§12.2).

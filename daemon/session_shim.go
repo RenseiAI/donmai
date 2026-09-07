@@ -686,6 +686,18 @@ type SessionShimConfig struct {
 	// very knob meant to tune the back-pressure.
 	EventBacklogStallDeadline time.Duration
 
+	// EventBacklogDropBound overrides how long a stalled carrier is HELD after
+	// the stall deadline has been crossed, before it is finally dropped and the
+	// session released to quarantine with its harness retained. Zero uses the
+	// sessionshim default; a value under the resolved stall deadline is clamped
+	// up rather than honoured, because a drop bound below the deadline deletes
+	// the hold instead of tuning it.
+	//
+	// Crossing the stall deadline is NOT a drop: it publishes the carrier as
+	// degraded and keeps stalling, which is what makes a slow durable path cost
+	// throughput instead of costing seats.
+	EventBacklogDropBound time.Duration
+
 	// OrgID is the organization half of the lifecycle identity (§D2). A
 	// standalone OSS daemon has no organization boundary, so it defaults to
 	// "local" — a real value rather than an empty one, because the identity is
@@ -2273,6 +2285,7 @@ func (d *Daemon) sessionShimAdoptOptions(
 		EventBacklogBudget:        cfg.EventBacklogBudget,
 		EventBacklogStallDeadline: cfg.EventBacklogStallDeadline,
 		DurableAckAmbiguityBound:  cfg.durableAckAmbiguityBound(),
+		EventBacklogDropBound:     cfg.EventBacklogDropBound,
 		RequireFullHostFrames:     cfg.RequireAuthoritativeSnapshot && d.sessionShimEnabled(),
 		Logger:                    slog.Default(),
 	}
@@ -4524,6 +4537,12 @@ func (d *Daemon) SessionShimDiagnostics() afclient.DaemonSessionShimStatus {
 				correlation.CarrierIncompatibility = string(entry.adoption.CarrierIncompatibility)
 			}
 			correlation.Phase = string(hello.Phase)
+			if flow := entry.controller.BacklogFlowState(); flow.Degraded {
+				correlation.StreamBackPressure = "degraded"
+				correlation.StreamStalledSince = flow.StalledSince.UnixNano()
+				correlation.StreamQueuedBytes = flow.QueuedBytes
+				correlation.StreamBudgetBytes = flow.Budget
+			}
 		}
 		status.Adopted = append(status.Adopted, correlation)
 	}

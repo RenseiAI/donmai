@@ -61,12 +61,17 @@
 //     the connection carrying it — on the resume Snapshot, at adoption, which is
 //     the least survivable moment there is.
 //   - A consumer at the controller's in-flight budget gets BACK-PRESSURE: the
-//     socket reader stalls, which stalls the shim's output pump, and the shim's
-//     ring does the job it exists for — evict and declare an explicit Gap (§D5).
-//     Reaching the budget used to drop the connection outright. It still fails
-//     closed past a bounded stall deadline, because the reader is the only
-//     goroutine that can deliver a durable heartbeat receipt and a consumer that
-//     has STOPPED must not park it forever. Behind is not stopped.
+//     socket reader stalls, which stalls the shim's output pump, which stalls
+//     the shim's own PTY reader — so the harness blocks in write(2), the way any
+//     program does against a terminal whose reader fell behind. Nothing is lost
+//     and nothing is reordered. Reaching the budget used to drop the connection
+//     outright; crossing the no-progress deadline used to as well, and that cost
+//     seven live seats in one day to a slow durable path. Now the deadline
+//     DEGRADES VISIBLY and keeps stalling, and only a much longer drop bound
+//     still fails closed — because the reader is the only goroutine that can
+//     deliver a durable heartbeat receipt and a consumer that has genuinely
+//     stopped must not park it forever. Behind is not stopped, and slow is not
+//     gone.
 //
 // # Boundary
 //
