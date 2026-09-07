@@ -84,11 +84,15 @@ func batchQuarantine(batch SessionShimAdoptionBatch, sessionID string) (sessions
 	return sessionshim.QuarantinedSession{}, false
 }
 
-// TestBootDeclaresADeadLineageInsteadOfOmittingIt is strand (A).
+// TestBootDeclaresADeadLineageInsteadOfOmittingIt is strand (A), for the half
+// of the stale set the absence producer could NOT discharge.
 //
-// The fake control plane enforces the completeness rule the real one does: a
-// batch that does not account for a lineage it holds is refused. The stale
-// record IS that lineage, so pre-fix the composition could not produce a
+// The two passes are an ordered pair. The producer runs first and attests away
+// every vanished shim it can prove absent AND get the composer to accept; what
+// comes back is what this host still OWES — here, a lineage whose absent
+// attestation the composer refused. The fake control plane then enforces the
+// completeness rule the real one does: a batch that does not account for a
+// lineage it holds is refused. Pre-fix the composition could not produce a
 // committable batch at all — the only batch it could compose omitted the one
 // thing the rule demanded.
 //
@@ -131,6 +135,13 @@ func TestBootDeclaresADeadLineageInsteadOfOmittingIt(t *testing.T) {
 		}
 		return confirmedReceipt(batch, "revision-dead-lineage"), nil
 	})
+	// The composer refuses the absent attestation, so the obligation is NOT
+	// discharged and the lineage is still owed. That is the state this
+	// declaration exists for; a lineage the producer did discharge is covered
+	// by TestDischargedStaleLineageIsNotDeclared below.
+	cfg.OnTerminalEvidence = func(context.Context, SessionShimTerminalEvidence) error {
+		return errors.New("the control plane refused this absent attestation")
+	}
 	if err := h.daemon.InstallSessionShimComposition(ctx, cfg); err != nil {
 		t.Fatalf("one dead lineage failed the whole composition: %v", err)
 	}
@@ -187,6 +198,89 @@ func TestBootDeclaresADeadLineageInsteadOfOmittingIt(t *testing.T) {
 	}
 }
 
+// TestDischargedStaleLineageIsNotDeclared is the ordering pin between the two
+// passes that both read the stale set.
+//
+// The absence producer attests a vanished shim away and the composer converts
+// that lineage's recovery obligation to abandoned, dropping it from its
+// completeness set. From that moment the batch may legitimately OMIT it — and
+// must, because declaring it quarantined re-creates the very obligation the
+// attestation just discharged and re-charges the capacity slot it just
+// released, in the same batch that carries the attestation.
+//
+// The two passes read the same field, so the only thing keeping them honest is
+// that the declaration is computed AFTER the discharge narrows it. Reading it
+// earlier — even one statement earlier, which is where it sat — snapshots the
+// pre-discharge set and undoes the discharge silently: the batch still commits,
+// the host still boots, and nothing says the obligation came back.
+//
+// The assertions are deliberately chosen to hold whatever the producer does
+// with the on-disk record: they are about what this daemon DECLARES, not about
+// what the registry still contains.
+func TestDischargedStaleLineageIsNotDeclared(t *testing.T) {
+	ctx := context.Background()
+	h := newCompositionHarness(t)
+	h.start(ctx)
+
+	const (
+		goneSession = "sess-discharged-lineage"
+		goneShim    = "shim-discharged-lineage"
+		goneEpoch   = uint64(11)
+	)
+	deadLineageRecord(t, h.registryDir, h.orgID, goneSession, goneShim, goneEpoch)
+
+	var (
+		mu       sync.Mutex
+		batches  []SessionShimAdoptionBatch
+		attested []SessionShimTerminalEvidence
+	)
+	cfg := h.composedConfig(func(_ context.Context, batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		mu.Lock()
+		batches = append(batches, cloneSessionShimAdoptionBatch(batch))
+		mu.Unlock()
+		return confirmedReceipt(batch, "revision-discharged"), nil
+	})
+	// The composer ACCEPTS the absent attestation, which is what makes the
+	// obligation discharged rather than merely observed.
+	cfg.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+		mu.Lock()
+		attested = append(attested, evidence)
+		mu.Unlock()
+		return nil
+	}
+	if err := h.daemon.InstallSessionShimComposition(ctx, cfg); err != nil {
+		t.Fatalf("composition install: %v", err)
+	}
+
+	mu.Lock()
+	committed := append([]SessionShimAdoptionBatch(nil), batches...)
+	discharged := append([]SessionShimTerminalEvidence(nil), attested...)
+	mu.Unlock()
+
+	if len(discharged) != 1 {
+		t.Fatalf("absent attestations = %d, want exactly the one vanished lineage; the fixture did not reach the "+
+			"discharge this test is about", len(discharged))
+	}
+	if discharged[0].Absent == nil || !discharged[0].Absent.Complete() {
+		t.Fatalf("the discharge did not carry a complete absent attestation: %+v", discharged[0])
+	}
+	if len(committed) != 1 {
+		t.Fatalf("batch commit attempts = %d, want 1", len(committed))
+	}
+	if entry, ok := batchQuarantine(committed[0], goneSession); ok {
+		t.Fatalf("a lineage the absence producer had already discharged was re-declared as a live quarantine, "+
+			"re-creating the obligation and re-charging its capacity slot: %+v", entry)
+	}
+	for _, q := range h.daemon.QuarantinedSessions() {
+		if q.SessionID == goneSession {
+			t.Fatalf("the discharged lineage is back in the live quarantine projection: %+v", q)
+		}
+	}
+	if occupied := h.daemon.SessionShimOccupancy(); occupied != 0 {
+		t.Fatalf("occupied slots = %d, want 0 — the discharged lineage is still charging capacity", occupied)
+	}
+}
+
 // TestStaleRecordForAnUnservedScopeDoesNotFailTheComposition is the guard on
 // the declaration's own blast radius, and it exists because the first version
 // of this change reintroduced exactly the bug it was written to remove.
@@ -225,10 +319,15 @@ func TestStaleRecordForAnUnservedScopeDoesNotFailTheComposition(t *testing.T) {
 		mu.Unlock()
 		return confirmedReceipt(batch, "revision-unserved-scope"), nil
 	})
-	// The stranded record's organization has no retained credential receipt —
-	// which is what makes resolving a host identity for it fatal — so the
-	// declaration must never reach for one.
-	cfg.OnTerminalEvidence = func(context.Context, SessionShimTerminalEvidence) error { return nil }
+	// Two things at once. The stranded record's organization has no retained
+	// credential receipt — which is what makes resolving a host identity for it
+	// fatal — so the declaration must never reach for one. And refusing the
+	// attestation keeps the SERVED record owed rather than discharged, so the
+	// second half of this test (the served scope still declares) is testing the
+	// declaration and not the absence producer.
+	cfg.OnTerminalEvidence = func(context.Context, SessionShimTerminalEvidence) error {
+		return errors.New("the control plane refused this absent attestation")
+	}
 	if err := h.daemon.InstallSessionShimComposition(ctx, cfg); err != nil {
 		t.Fatalf("one leftover record for an organization this host no longer serves failed the whole composition: %v", err)
 	}
