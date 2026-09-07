@@ -736,6 +736,24 @@ type SessionShimConfig struct {
 	// standalone daemon.
 	Orphan sessionshim.OrphanPolicy
 
+	// StartupRelayDrainWindow is how long the STARTUP composition pass will keep
+	// re-dialling one carrier outage — a relay draining for a planned restart,
+	// or one that cannot be reached at all — before it treats a lineage's
+	// refusal as terminal. Zero uses a default derived from the planned-restart
+	// contract's own worst case; see sessionShimStartupRelayDrainWindow.
+	//
+	// It is its own field, and not a reading of Readoption, because it answers
+	// its own question. Readoption bounds patience about a live carrier fault on
+	// a host that is already up and already advertising capacity. This bounds
+	// how long boot may block before the host can advertise any capacity at all,
+	// and the thing it is waiting out is a property of the RELAY, not of this
+	// daemon's re-adoption appetite. Erring long is the cheap direction: the
+	// pass withholds readiness rather than withdrawing it, while a lineage this
+	// pass gives up on is quarantined with no recovery path anywhere.
+	//
+	// It is bounded above by sessionShimStartupRelayDrainCap however it is set.
+	StartupRelayDrainWindow time.Duration
+
 	// Readoption bounds the re-adoption this daemon attempts when an adopted
 	// shim's controller stream ends without a terminal observation while the
 	// shim's discovery record is still live (§D10: the shim and its harness are
@@ -817,11 +835,28 @@ type SessionShimConfig struct {
 	// layer has durably rehydrated its external carrier and, when applicable,
 	// posted adoption evidence. Its opaque receipt is retained for terminal
 	// correlation. An error aborts the launch/startup pass fail-closed.
+	//
+	// WRAPPING CONTRACT — an implementor MUST return a transport refusal with
+	// its TYPE intact, i.e. wrapped with %w (or returned unchanged), all the way
+	// up. IsSessionShimRelayUnavailable must keep answering true for it. That
+	// predicate is what tells the startup pass "the carrier was never reached,
+	// nothing was learned about this lineage" from "this lineage was refused",
+	// and it is the difference between a bounded re-dial and a quarantined
+	// lineage whose harness then reaps itself on the shim's orphan deadline. An
+	// implementation that renders such a refusal with %v, or rebuilds it with
+	// errors.New(err.Error()), silently reverts this daemon to condemning a
+	// live lineage over a relay that was restarting.
 	OnAdoption func(context.Context, SessionShimAdoptionEvidence) (SessionShimAdoptionReceipt, error)
 
 	// OnAdoptionV2 consumes the additive typed proof-v2 preparation outcome. It
 	// is mutually exclusive with OnAdoption and is required with
 	// PrepareAdoptionV2, keeping the original callback and evidence shape frozen.
+	//
+	// The same WRAPPING CONTRACT as OnAdoption applies, and it matters more
+	// here: this is the seam a composing daemon dials attach-v2 through, so a
+	// planned relay restart reaches this daemon as an attachclient refusal or
+	// not at all. Return it with %w; IsSessionShimRelayUnavailable is the
+	// predicate that must keep answering true.
 	OnAdoptionV2 func(context.Context, SessionShimAdoptionEvidenceV2) (SessionShimAdoptionReceipt, error)
 
 	// OnTerminalEvidence runs after exact process-group reap proof exists and
@@ -2291,6 +2326,12 @@ type sessionShimAdoptionPreparations struct {
 	// resolved against — without it the pass has no way to re-ask and the only
 	// remaining move is to condemn a lineage over a recoverable disagreement.
 	inputs map[sessionshim.Identity]sessionshim.AdoptionPreparation
+	// relayDrain is this pass's shared view of a relay that is not answering.
+	// It is on the PASS and not on a lineage because a relay outage is one fact
+	// about one process, and a serial composition that re-learned it per
+	// lineage would multiply the outage by the lineage count and let the
+	// composition ORDER decide which lineages survived it.
+	relayDrain sessionShimRelayDrainBarrier
 }
 
 // sessionShimAdoptOptions assembles the ONE adoption pass this daemon runs —
@@ -2496,13 +2537,16 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 		gate := newShimAdoptionGate()
 		gates[c] = gate
 		d.consumeShimEventsGated(c, gate)
-		// A refusal that is carrier cursor drift is AMBIGUOUS evidence — a stale
-		// proof, not a verdict on the lineage — so it gets the bounded
-		// re-prepared re-dial the recovery corpus requires before any terminal
-		// consequence. Every other refusal keeps its single attempt. The final
-		// evidence and preparation come back because a re-prepare mints new
-		// ones and the receipt below belongs to that pair, not to the first.
-		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithDriftRedial(
+		// Two refusals are AMBIGUOUS evidence rather than a verdict on the
+		// lineage, and each gets the bounded re-dial the recovery corpus
+		// requires before any terminal consequence: carrier cursor drift (a
+		// stale proof — re-prepared, then re-dialled) and a relay that declined
+		// to be reached at all (a planned restart's drain, or a dial that never
+		// got through — the same proof, re-dialled after the floor it named).
+		// Every other refusal keeps its single attempt. The final evidence and
+		// preparation come back because a re-prepare mints new ones and the
+		// receipt below belongs to that pair, not to the first.
+		evidence, preparation, receipt, callbackErr := d.completeSessionShimAdoptionWithBoundedRedial(
 			ctx, c, preparations, hostByID[id], evidence, preparation,
 		)
 		delete(preparedByID, id)

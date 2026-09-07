@@ -143,13 +143,13 @@ func TestBuildControlFrame(t *testing.T) {
 }
 
 func TestErrorCodeRegistryComplete(t *testing.T) {
-	// The §7 v1 code registry must be exactly these eleven values.
+	// The §7 code registry must be exactly these twelve values.
 	want := []ErrorCode{
 		CodeFraming, CodeAuth, CodeRoomMismatch, CodePenDenied, CodeRingMiss,
 		CodeBackpressure, CodeRateLimited, CodeEpochStale, CodeInternal,
-		CodeHostLost, CodeHostStillAbsent,
+		CodeHostLost, CodeHostStillAbsent, CodeRelayRestarting,
 	}
-	wantStr := []string{"framing", "auth", "room-mismatch", "pen-denied", "ring-miss", "backpressure", "rate-limited", "epoch-stale", "internal", "host-lost", "host-still-absent"}
+	wantStr := []string{"framing", "auth", "room-mismatch", "pen-denied", "ring-miss", "backpressure", "rate-limited", "epoch-stale", "internal", "host-lost", "host-still-absent", "relay-restarting"}
 	for i, c := range want {
 		if string(c) != wantStr[i] {
 			t.Fatalf("code[%d] = %q, want %q", i, c, wantStr[i])

@@ -970,7 +970,13 @@ func enableHostedFullHostFramesForTest(t *testing.T, d *Daemon, scopes ...string
 	}
 }
 
-func newShimSpawnFixture(t *testing.T) *shimSpawnFixture {
+// newShimSpawnFixture builds the shared launch fixture. The variadic mutators
+// run over the launching daemon's session-shim config before it is built, which
+// is how a test whose adoption pass deliberately spends seconds keeps its shims
+// alive long enough to be adopted: the default orphan deadline here is two
+// seconds, and a shim reaped before the pass reaches it is tombstoned rather
+// than adopted or quarantined.
+func newShimSpawnFixture(t *testing.T, mutators ...func(*SessionShimConfig)) *shimSpawnFixture {
 	t.Helper()
 	// A Unix socket path has a short platform limit (as low as 104 bytes), and
 	// t.TempDir() bakes the test name into the path. Keep the registry short.
@@ -981,25 +987,26 @@ func newShimSpawnFixture(t *testing.T) *shimSpawnFixture {
 	t.Cleanup(func() { _ = os.RemoveAll(dir) })
 
 	events := newShimEventRecorder()
-	d := New(Options{
-		SkipRegistration: true,
-		SessionShim: SessionShimConfig{
-			EnableAdoption:  true,
-			EnableOwnership: true,
-			OrgID:           "test-org",
-			RegistryDir:     dir + "/registry",
-			LaunchTimeout:   60 * time.Second,
-			OnSessionEvent:  events.record,
-			OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
-				return nil
-			},
-			Orphan: sessionshim.OrphanPolicy{
-				Deadline:          2 * time.Second,
-				TerminationGrace:  500 * time.Millisecond,
-				PropagationMargin: 0,
-			},
+	shimCfg := SessionShimConfig{
+		EnableAdoption:  true,
+		EnableOwnership: true,
+		OrgID:           "test-org",
+		RegistryDir:     dir + "/registry",
+		LaunchTimeout:   60 * time.Second,
+		OnSessionEvent:  events.record,
+		OnSessionEventDurable: func(sessionshim.Identity, sessionshim.ControllerEvent) error {
+			return nil
 		},
-	})
+		Orphan: sessionshim.OrphanPolicy{
+			Deadline:          2 * time.Second,
+			TerminationGrace:  500 * time.Millisecond,
+			PropagationMargin: 0,
+		},
+	}
+	for _, mutate := range mutators {
+		mutate(&shimCfg)
+	}
+	d := New(Options{SkipRegistration: true, SessionShim: shimCfg})
 	d.spawner = NewWorkerSpawner(SpawnerOptions{
 		Projects:              []ProjectConfig{{ID: "p1", Repository: "https://example.invalid/x/y"}},
 		EnabledProjectIDs:     []string{"p1"},
