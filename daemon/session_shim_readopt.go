@@ -81,6 +81,27 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(
 	lost adoptedShim,
 	attemptBudget int,
 ) sessionShimReadoptionDisposition {
+	return d.readoptSessionShimAfterCarrierLoss(id, lost, attemptBudget, false)
+}
+
+// readoptSessionShimAfterPlatformCarrierLoss handles a carrier loss caused by
+// the platform's own durable persistence path. It preserves the harness and
+// re-adopts with the ordinary bounded policy, but does not count the platform
+// outage as a second shim-side loss inside the quarantine window.
+func (d *Daemon) readoptSessionShimAfterPlatformCarrierLoss(
+	id sessionshim.Identity,
+	lost adoptedShim,
+	attemptBudget int,
+) sessionShimReadoptionDisposition {
+	return d.readoptSessionShimAfterCarrierLoss(id, lost, attemptBudget, true)
+}
+
+func (d *Daemon) readoptSessionShimAfterCarrierLoss(
+	id sessionshim.Identity,
+	lost adoptedShim,
+	attemptBudget int,
+	platformPersistLoss bool,
+) sessionShimReadoptionDisposition {
 	cfg := d.sessionShimConfig()
 	policy := cfg.readoption()
 	if policy.Disabled || lost.controller == nil {
@@ -94,7 +115,7 @@ func (d *Daemon) readoptSessionShimAfterControllerLoss(
 		return readoptionRefused
 	}
 	window := policy.WorstCaseWindow()
-	if lost.readoptedAtUnixNano != 0 {
+	if !platformPersistLoss && lost.readoptedAtUnixNano != 0 {
 		if since := d.shimNow().Sub(time.Unix(0, lost.readoptedAtUnixNano)); since < window {
 			// Re-adopted inside the window and lost again: this carrier is not
 			// one a bounded retry can restore, and every further cycle costs an

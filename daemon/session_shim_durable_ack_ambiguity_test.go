@@ -323,6 +323,54 @@ func TestTheBudgetedAmbiguityCycleWithdrawsOnlyWhenReadoptionFails(t *testing.T)
 	}
 }
 
+// TestPlatformCarrierLossesAreBoundedBeforeQuarantine proves that a control
+// plane persistence outage gets recovery attempts without permanently
+// bypassing the re-adoption window. Two recoveries preserve the live harness;
+// the bounded third loss withdraws it visibly instead of cycling forever.
+func TestPlatformCarrierLossesAreBoundedBeforeQuarantine(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return nil
+	})
+	d := f.daemon
+	d.shims.mu.Lock()
+	entry := d.shims.adopted[f.id]
+	entry.readoptedAtUnixNano = d.shimNow().UnixNano()
+	d.shims.adopted[f.id] = entry
+	d.shims.mu.Unlock()
+
+	// The first platform-originated loss retries successfully. The real shim
+	// controller owns a goroutine, so seed the preceding completed cycles below
+	// rather than racing its asynchronous close path to simulate later losses.
+	d.releaseShimIfLive(f.id, f.controller, shimStreamCarrierLostPlatform)
+	if projected := d.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("first platform loss quarantined instead of re-adopting: %+v", projected)
+	}
+
+	reachable := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error { return nil })
+	seedAmbiguityStreakToItsBudget(t, reachable.daemon, reachable.id)
+	reachable.daemon.releaseShimIfLive(reachable.id, reachable.controller, shimStreamCarrierLostPlatform)
+	if projected := reachable.daemon.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("spent platform-loss streak quarantined a reachable shim: %+v", projected)
+	}
+	if got := reachable.daemon.durableAckAmbiguityCycles(reachable.id); got != 0 {
+		t.Fatalf("successful spent-streak re-adoption retained %d ambiguity cycles", got)
+	}
+
+	terminal := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 3, Backoff: 5 * time.Millisecond}, func(int) error {
+		return errors.New("platform persistence remains unavailable")
+	})
+	seedAmbiguityStreakToItsBudget(t, terminal.daemon, terminal.id)
+	terminal.daemon.releaseShimIfLive(terminal.id, terminal.controller, shimStreamCarrierLostPlatform)
+	projected := terminal.daemon.QuarantinedSessions()
+	if len(projected) != 1 || projected[0].Reason != sessionshim.QuarantineDurableAckTimeout {
+		t.Fatalf("platform-loss streak quarantine = %+v, want one durable-ack timeout", projected)
+	}
+	if projected[0].Detail != sessionShimDurableAckCyclesSpentDetail {
+		t.Fatalf("platform-loss streak detail = %q, want %q", projected[0].Detail, sessionShimDurableAckCyclesSpentDetail)
+	}
+}
+
 // TestATerminalExitClearsTheAmbiguityStreak pins the path that returns EARLY.
 // finishAdoptedShim removes the adopted entry without going through the
 // withdrawal, so a streak left behind there would be inherited by a RE-LAUNCHED

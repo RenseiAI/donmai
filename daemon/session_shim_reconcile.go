@@ -87,6 +87,8 @@ const (
 	sessionShimReconcileCauseAmbiguous        = "ambiguous-batch-commit"
 	sessionShimReconcileCauseAmbiguousLaunch  = "ambiguous-launch-batch-commit"
 	sessionShimReconcileCauseRevisionAdvanced = "adoption-revision-advanced"
+	sessionShimReconcileCauseHeartbeatRefused = "heartbeat-revision-stale"
+	sessionShimReconcileCausePollRefused      = "poll-session-shim-adoption-not-ready"
 )
 
 // sessionShimCommitOutcomeUnknown classifies one batch-commit error.
@@ -178,6 +180,14 @@ func (d *Daemon) scheduleSessionShimReconciliation(scope, cause string) {
 		d.shims.mu.Unlock()
 		return
 	}
+	if cause == sessionShimReconcileCauseHeartbeatRefused || cause == sessionShimReconcileCausePollRefused {
+		if d.shimNow().Before(d.shims.reconcileRefusalNext[scope]) {
+			d.shims.mu.Unlock()
+			slog.Info("session shim: reconciliation refusal trigger paced", "scope", scope, "cause", cause)
+			return
+		}
+		d.shims.reconcileRefusalNext[scope] = d.shimNow().Add(d.sessionShimConfig().callbackTimeout())
+	}
 	d.shims.reconciling[scope] = true
 	d.shims.wg.Add(1)
 	d.shims.mu.Unlock()
@@ -211,6 +221,13 @@ func (d *Daemon) runSessionShimReconciliation(scope, cause string) {
 		delete(d.shims.reconciling, scope)
 		d.shims.mu.Unlock()
 	}()
+	// A poll refusal must not synchronously wait on the readiness resolver:
+	// ResolveNow intentionally bypasses the cache and can serialize behind a
+	// slow resolver. Resolve on this bounded repair goroutine instead, before
+	// its refresh and republish make the next heartbeat eligible to recover.
+	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
+		d.withdrawSessionShimProofV2Readiness()
+	}
 	// A pass that ends because the CONTROL PLANE ITSELF reported a revision it
 	// has moved to is not an exhausted pass — it is a pass that learned a new
 	// fact and has to be spent against it. Measured on an installed host: four

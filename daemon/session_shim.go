@@ -904,7 +904,9 @@ type SessionShimConfig struct {
 	// only after it has durably accepted the event. Output and snapshot sequence
 	// state advances, and the shim heartbeat acknowledgement is sent, only after
 	// that successful return. It MUST be bounded for the same reason as
-	// OnSessionEvent.
+	// OnSessionEvent. An embedder that recognizes a platform durable-persistence
+	// failure must wrap ErrSessionShimCarrierLostPlatform so re-adoption classifies
+	// it as a carrier fault rather than a shim-side failure.
 	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
 	// ResumeFrom returns the first output sequence the composing durable store
@@ -1507,9 +1509,10 @@ type sessionShimState struct {
 	// reconcileStop is closed when the daemon releases its shims; a
 	// reconciliation loop parked in backoff exits on it instead of outliving
 	// the daemon. Protected by mu; the channel itself is assigned once.
-	reconciling      map[string]bool
-	reconcileStop    chan struct{}
-	reconcileStopped bool
+	reconciling          map[string]bool
+	reconcileRefusalNext map[string]time.Time
+	reconcileStop        chan struct{}
+	reconcileStopped     bool
 	// reconverging is the live, operator-visible condition for a scope whose
 	// reconciliation keeps re-arming against a control plane that reports a
 	// further advanced revision. A host stuck here is serving correctly but is
@@ -1556,6 +1559,7 @@ func newSessionShimState() *sessionShimState {
 		acceptanceQuarantine: make(map[shimIncarnation]sessionshim.ProcessIdentity),
 		ambiguityCycles:      make(map[sessionshim.Identity]int),
 		reconciling:          make(map[string]bool),
+		reconcileRefusalNext: make(map[string]time.Time),
 		reconcileStop:        make(chan struct{}),
 	}
 }
@@ -1590,22 +1594,6 @@ func (s *sessionShimState) setDeclaringComposition(declaring bool) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
 	s.declaringComposition = declaring
-}
-
-// sessionShimFoundingDeclaration reports whether the refresh receipt about to
-// be validated for scope is the FOUNDING one: a deferred composition is in its
-// declaring window and nothing has been retained for the scope yet. Both halves
-// matter — the window alone would also match an unrelated lane refresh that
-// happens to land after retention, and an empty retention alone would match a
-// refresh on a daemon that never declared at all.
-func (d *Daemon) sessionShimFoundingDeclaration(scope string) bool {
-	if d.shims == nil {
-		return false
-	}
-	d.shims.mu.RLock()
-	defer d.shims.mu.RUnlock()
-	_, retained := d.shims.credentialReceipts[scope]
-	return d.shims.declaringComposition && !retained
 }
 
 func shimIncarnationFor(evidence SessionShimAdoptionEvidence) shimIncarnation {
@@ -3856,27 +3844,10 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 		return nil
 	}
 	scope := d.sessionShimConfig().orgID()
-	// Readiness is checked before a refreshed receipt is adopted — except for
-	// the ONE receipt that founds the scope's host authority. An embedder's
-	// readiness resolver answers for the primary host, and the primary host id
-	// is what this very receipt carries: asking before it is retained asks for a
-	// fact this round trip is producing. That is what drove an embedder to
-	// present the attestation early, outside the refresher's lock, to learn the
-	// id some other way — and the control plane answered the resulting posture
-	// flip-flop with an attestation conflict. The check is deferred, not
-	// dropped: declareSessionShimComposition runs it once the receipt is
-	// retained and the embedder has been handed it. Every other refresh keeps
-	// the check exactly here.
-	if !d.sessionShimFoundingDeclaration(scope) {
-		// Resolved, not read from the cache: this seam is about to install new
-		// credential authority, and a cached answer predates the thing being
-		// installed. The cadence exists to keep the resolver off the per-tick
-		// lanes, not off the lane that changes what it answers about.
-		if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
-			d.withdrawSessionShimProofV2Readiness()
-			return err
-		}
-	}
+	// A refresh installs recovery credentials. Readiness is deliberately not a
+	// precondition here: a degraded heartbeat is the evidence that starts the
+	// reconciliation this credential is required to perform. Claims and
+	// adoption preparation retain their readiness gates.
 	if result == nil || result.SessionShim == nil {
 		return errors.New("session shim: refresh omitted credential receipt")
 	}

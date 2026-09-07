@@ -1211,7 +1211,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// trigger time for the same reason; the schedule refuses on a daemon
 		// with no composed attestation.
 		heartbeatOpts.OnSessionShimRevisionStale = func() {
-			d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), "heartbeat-revision-stale")
+			d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), sessionShimReconcileCauseHeartbeatRefused)
 		}
 		d.heartbeat = NewHeartbeatService(heartbeatOpts)
 		credentials.Attach(d.heartbeat)
@@ -1262,6 +1262,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 					return d.handlePollWorkItem(item, cfg.Orchestrator.URL)
 				},
 				OnReregister: reregister,
+				OnSessionShimAdoptionNotReady: func() {
+					// Reconciliation resolves readiness before it republishes. Keep
+					// that potentially blocking resolver call off the poll loop.
+					d.scheduleSessionShimReconciliation(d.sessionShimConfig().orgID(), sessionShimReconcileCausePollRefused)
+				},
 				// Honour the host-status signal the heartbeat already
 				// receives: when the bound capacity pool is deleted,
 				// draining, or disabled, stop claiming new work while
