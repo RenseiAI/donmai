@@ -2884,6 +2884,17 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 	// have a concurrent republish omit a live lineage, which the receiver
 	// refuses as an incomplete snapshot.
 	if !shimStreamEndRecovers(cause) {
+		// THIS is the exit a SIGKILLed shim takes — `shimStreamEnded` is the
+		// default classification, "the shim, or its socket, ended the stream" —
+		// and it is where an absent lineage gets discharged. Not by a call
+		// here: quarantineLostSessionShim publishes through
+		// publishQuarantineAfterConsumingTerminalProof, which drives
+		// reconcileQuarantinedTombstones synchronously with the row already in
+		// the projection, and the sweep's absence branch reaches it there. A
+		// second explicit call would always lose the handoff claim to that one.
+		// The ordering that matters is preserved either way: the lineage is
+		// quarantined BEFORE anything discharges it, because the obligation an
+		// attestation clears is quarantined-kind.
 		d.quarantineLostSessionShim(id, entry, sessionshim.QuarantineSocketUnreachable, sessionShimControllerLostDetail)
 		return
 	}
@@ -3133,10 +3144,30 @@ func (d *Daemon) reconcileQuarantinedTombstones() map[string]bool {
 		return published
 	}
 
+	// Discharges are capped per pass; tombstone handoffs are not. A tombstone
+	// handoff is a round trip on evidence already on disk, while a discharge
+	// spends two separated readings, two dials and several scans inline on
+	// whichever occupancy or heartbeat surface called this. See
+	// maxAbsenceDischargesPerPass.
+	discharges := 0
 	for _, q := range quarantined {
 		id := q.Identity()
 		tombstone, err := registry.GetTombstoneIncarnation(id, q.ShimID, q.ProcessEpoch)
 		if err != nil || tombstone.ShimID != q.ShimID || tombstone.ProcessEpoch != q.ProcessEpoch {
+			// No tombstone for this exact incarnation, so ordinary terminal
+			// evidence is not coming from the shim. That is fine for a shim
+			// that is still running — it is quarantined, not finished — but a
+			// shim that has ALSO vanished leaves a lineage nothing can ever
+			// close, and this loop used to skip it on every pass for the life
+			// of the host. The probe inside says nothing about a live one.
+			if discharges >= maxAbsenceDischargesPerPass {
+				continue
+			}
+			discharges++
+			if d.attestAbsentQuarantinedIncarnation(registry,
+				shimIncarnation{identity: id, shimID: q.ShimID, processEpoch: q.ProcessEpoch}) {
+				published[id.OrgID] = true
+			}
 			continue
 		}
 		// The question here is per-INCARNATION — "is this lineage's terminal

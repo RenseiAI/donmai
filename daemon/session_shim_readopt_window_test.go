@@ -35,6 +35,10 @@ type readoptFixtureOptions struct {
 	onWindowExhausted func(context.Context, sessionshim.Identity)
 	onBindLost        func(context.Context, sessionshim.Identity)
 	onRebind          func(context.Context, sessionshim.Identity) error
+	// onTerminalEvidence receives every terminal fact the daemon hands its
+	// composer. Nil leaves the seam unconfigured, which is what every test that
+	// is not about terminal evidence wants.
+	onTerminalEvidence func(context.Context, SessionShimTerminalEvidence) error
 	// clock, when set, replaces the daemon's session-shim clock. The window's
 	// instants and its waits then both come from it.
 	clock *virtualShimClock
@@ -118,6 +122,7 @@ func newReadoptFixtureWithOptions(t *testing.T, opts readoptFixtureOptions) *rea
 			f.batches = append(f.batches, cloneSessionShimAdoptionBatch(batch))
 			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-readopt"), AdoptionRevision: "readopt-revision"}, nil
 		},
+		OnTerminalEvidence:           opts.onTerminalEvidence,
 		Readoption:                   opts.policy,
 		LineageLive:                  opts.lineageLive,
 		OnReadoptionWindowExhausted:  opts.onWindowExhausted,
