@@ -35,14 +35,19 @@ func (h *host) runWSS(ctx context.Context, tok string, cl hostClaims, exitDeadli
 	var res attemptResult
 
 	dialCtx, cancel := context.WithTimeout(ctx, h.cfg.DialTimeout)
-	conn, _, err := websocket.Dial(dialCtx, h.cfg.AttachURL, &websocket.DialOptions{
+	conn, resp, err := websocket.Dial(dialCtx, h.cfg.AttachURL, &websocket.DialOptions{
 		HTTPClient:   h.cfg.HTTPClient,
 		HTTPHeader:   http.Header{"Authorization": {"Bearer " + tok}},
 		Subprotocols: []string{attachwire.SubprotocolVersion},
 	})
 	cancel()
 	if err != nil {
-		return res, fmt.Errorf("attachclient: wss dial: %w", err)
+		// The drain window refuses BEFORE the upgrade, so this refusal is the
+		// only announcement a dial made mid-restart ever sees.
+		if restart := RelayRestartRefusal(resp); restart != nil {
+			return res, restart
+		}
+		return res, newRelayDialError("attachclient: wss dial", err)
 	}
 	conn.SetReadLimit(h.cfg.ReadLimitBytes)
 
@@ -156,6 +161,13 @@ func (h *host) wssReadLoop(ctx context.Context, leg *wssLeg, authorityAt chan<- 
 	for {
 		typ, data, err := leg.conn.Read(ctx)
 		if err != nil {
+			// The close half of the planned-restart announcement reaches this
+			// lane too, and it arrives whether or not the control frame did.
+			// Reading it here is what makes a v1 leg behave identically when
+			// the relay sends only the close.
+			if restart := relayRestartClose(err); restart != nil {
+				return restart
+			}
 			return err // ws close / io error / ctx
 		}
 		if typ != websocket.MessageBinary {

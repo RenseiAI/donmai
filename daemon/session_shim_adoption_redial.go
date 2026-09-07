@@ -84,6 +84,67 @@ package daemon
 // A daemon that asked without saying why would leave the authority unable to
 // tell a re-prepare from a first ask, which is how an admitted candidate
 // becomes an undisposed one.
+//
+// THE SECOND STRAND: A RELAY THAT SAID "NOT NOW"
+//
+// Drift was the first refusal this pass learned to read. It was never the only
+// ambiguous one. A relay that runs as a single always-on process restarts every
+// host carrier on the fleet at once on each deploy, and while it drains it
+// answers every attach dial with 503 + Retry-After and closes every live leg
+// with 1012 and a "redial after <N>s" reason. A dial that never reached the
+// relay at all says the same thing more crudely.
+//
+// None of those is evidence about the lineage. The harness is alive, its
+// carrier proof is valid, and the replacement relay is seconds away — but a
+// pass that quarantines on a single refusal turns that into a lineage with a
+// harness and no controller, which renews no orphan clock and tears itself down
+// at the shim's deadline. That is precisely the roomless, unwakeable seat shape
+// a relay deploy produced on 2026-09-02, and nothing the relay can send makes a
+// single-attempt policy retry: the second half of the planned-restart contract
+// is this side's.
+//
+// So a refusal that wraps attachclient.ErrRelayUnavailable gets its own bounded
+// budget of plain re-dials before any terminal consequence, honouring the floor
+// the relay named (Retry-After, or the "redial after <N>s" hint) so the fleet
+// does not arrive back before the replacement has booted.
+//
+// It is a re-DIAL, not a re-prepare, and that difference is the whole reason it
+// is a separate budget:
+//
+//   - drift means the proof is stale, so the repair is a NEW proof and the
+//     re-dial is worthless without one;
+//   - unavailable means the proof was never examined. The relay refused before
+//     the upgrade, or closed the leg it had just accepted. Re-preparing here
+//     would burn a reservation and hand the authority a supersession to dispose
+//     of for a dial nobody read, so the SAME evidence and the SAME preparation
+//     are presented again.
+//
+// The one piece of local state a refused dial can leave behind is a staged
+// mandatory Snapshot — a leg that died after the Snapshot request but before
+// the receipt — so that is cleared between attempts for the same reason the
+// drift path clears it: the next dial must refuse on what the relay says, never
+// on this daemon's own leftovers. The Snapshot PROXY is deliberately kept: it
+// belongs to the proof being re-presented, and deactivating it would leave the
+// re-dial holding evidence it can no longer answer a Snapshot request for.
+//
+// The two budgets compose without a third counter: each round of re-dials runs
+// the whole drift-repairing pass, so a lineage whose refusals alternate is
+// still bounded by their product, and every wait is spent inside the startup
+// pass's own context.
+//
+// The waiting itself belongs to the PASS, not to the lineage: one relay is one
+// process, so the second lineage to meet a drain must not restart the ladder
+// from zero and pay for a fact the first one already established. The shared
+// window, what each mode of the re-adoption policy contributes to it, and the
+// one number that is deliberately NOT from that policy are all in
+// (*Daemon).sessionShimRelayDrainBound.
+//
+// SCOPE — STARTUP ONLY
+//
+// The controller-loss re-adoption path already retries every failed attempt
+// with backoff inside its own bound, so it never had this gap and gains no
+// second loop here. Startup composition is the one place a single refusal was
+// terminal.
 
 import (
 	"context"
@@ -93,6 +154,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/attachclient"
@@ -113,6 +175,22 @@ const (
 	// reservation against the control plane, so the delay exists to let the
 	// authority that mints it settle, not to wait out a local condition.
 	sessionShimDriftRedialBackoff = 200 * time.Millisecond
+
+	// sessionShimStartupRelayDrainCap bounds what the STARTUP composition pass
+	// will spend waiting on a relay that is not answering, whatever the
+	// re-adoption policy says.
+	//
+	// It is a separate number BECAUSE it answers a separate question. The
+	// re-adoption policy bounds patience about a live carrier fault on a host
+	// that is already up and already advertising capacity; this bounds how long
+	// boot may block before the host can advertise any capacity at all. A
+	// lineage-live window of ten minutes is a reasonable answer to the first and
+	// never to the second, and a relay's own planned drain is bounded well
+	// inside this.
+	// The derivation, from the planned-restart contract's own defaults: a 15s
+	// drain, plus the 30s kill-timeout headroom a drain that overruns is
+	// allowed, plus a single-machine replacement boot and its first accept.
+	sessionShimStartupRelayDrainCap = 90 * time.Second
 )
 
 // isSessionShimCarrierCursorDrift reports whether a durable-adoption refusal is
@@ -125,16 +203,353 @@ func isSessionShimCarrierCursorDrift(err error) bool {
 	return errors.Is(err, attachclient.ErrV2CarrierCursorDrift)
 }
 
-// completeSessionShimAdoptionWithDriftRedial runs the durable-adoption callback
-// and, while it refuses with carrier cursor drift, re-prepares the lineage's
-// carrier proof and dials again inside the bound above.
+// sessionShimRelayUnavailable reports whether a durable-adoption refusal is the
+// second shape the pass may retry: the relay declined to be reached at all —
+// the drain-window 503, the 1012 planned-restart close, or a dial that never
+// got through — so nothing was learned about the lineage behind it. It also
+// returns the redial floor the relay named, zero when it named none.
+//
+// Composing callers wrap the attach client's typed refusal with %w, so this
+// reads through their wrapping. Every refusal that is neither this nor carrier
+// cursor drift keeps its existing single-attempt disposition.
+func sessionShimRelayUnavailable(err error) (time.Duration, bool) {
+	if !IsSessionShimRelayUnavailable(err) {
+		return 0, false
+	}
+	hint, _ := attachclient.RelayRedialAfter(err)
+	return hint, true
+}
+
+// IsSessionShimRelayUnavailable reports whether a durable-adoption refusal says
+// the relay was never reached — a planned restart's drain window, or a dial
+// that did not get through — rather than saying anything about the lineage
+// behind it.
+//
+// It is EXPORTED for the composing layer, not because this package needs it
+// exported. The whole classification rests on the OnAdoption/OnAdoptionV2 hook
+// returning a transport refusal with its type intact, and there is no
+// implementor of those hooks in this repo: an embedder that renders one with %v
+// silently returns this daemon to quarantining a live lineage on a single
+// refusal, and nothing here would go red. This is the predicate an embedder
+// asserts in its OWN test to prove its wrapping still satisfies the contract
+// documented on those two fields.
+func IsSessionShimRelayUnavailable(err error) bool {
+	return err != nil && attachclient.IsRelayUnavailable(err)
+}
+
+// completeSessionShimAdoptionWithBoundedRedial is the startup pass's single
+// entry point into durable adoption for one lineage. It runs the
+// drift-repairing pass and, while the answer is the relay declining to be
+// reached, waits on the PASS-WIDE drain window and runs it again.
+//
+// A quarantine decision is only ever reached after both budgets — the ADR's
+// "the re-adoption check must not be shortcut" rule applies to every ambiguous
+// refusal, not only to the first one this pass learned to read.
+//
+// The waiting is pass-wide, not per-lineage, on purpose. A relay that is not
+// answering is not answering ANY lineage on this host — it is one process, and
+// composition is serial — so a ladder restarted from zero for each lineage
+// would make every lineage independently re-learn one fleet-wide fact, spend
+// its own quarantine budget re-learning it, and multiply a 15s outage by the
+// lineage count while the ORDER of composition decided who survived it. The
+// shared window makes the outage cost one window, and makes the verdict the
+// same for everyone who meets it.
+//
+// Two guarantees survive that sharing:
+//
+//   - no lineage is ever quarantined on a single unavailable refusal, which is
+//     the whole point of this path. A lineage that meets an already-spent
+//     window still re-dials once, immediately — the waiting was already done on
+//     its behalf, and a dial is what discovers that the relay came back;
+//   - a dial that gets through CLEARS the window. That is the only positive
+//     evidence available that the relay is back, so a later, unrelated drain
+//     gets a whole window of its own rather than inheriting a spent one.
+func (d *Daemon) completeSessionShimAdoptionWithBoundedRedial(
+	ctx context.Context,
+	ctrl *sessionshim.Controller,
+	preparations *sessionShimAdoptionPreparations,
+	hostID string,
+	evidence SessionShimAdoptionEvidence,
+	preparation SessionShimAdoptionPreparationResult,
+) (SessionShimAdoptionEvidence, SessionShimAdoptionPreparationResult, SessionShimAdoptionReceipt, error) {
+	id := ctrl.Identity()
+	bound := d.sessionShimRelayDrainBound()
+	drain := &preparations.relayDrain
+	evidence, preparation, receipt, err := d.completeSessionShimAdoptionRepreparingDrift(
+		ctx, ctrl, preparations, hostID, evidence, preparation,
+	)
+	redials := 0
+	lastStop := sessionShimDrainWindowSpent
+	for {
+		if err == nil {
+			drain.admitted()
+			return evidence, preparation, receipt, nil
+		}
+		hint, unavailable := sessionShimRelayUnavailable(err)
+		if !unavailable {
+			return evidence, preparation, receipt, err
+		}
+		wait, stop := drain.reserve(hint, bound, time.Now())
+		if stop != sessionShimDrainLive {
+			lastStop = stop
+			if redials > 0 {
+				break
+			}
+			// The pass has stopped waiting, but this lineage has not dialled
+			// since. It gets the one free re-dial the guarantee above promises:
+			// no wait, because the pass already spent the waiting, and a dial is
+			// how the relay's return is discovered at all.
+			wait = 0
+		}
+		redials++
+		slog.Warn("session shim: the relay refused durable adoption without reading the proof; re-dialling before quarantine",
+			"session", id.String(), "redial", redials, "wait", wait,
+			"relayRedialFloor", hint, "passStillWaiting", stop == sessionShimDrainLive, "error", err)
+		// Clear only what a refused dial can have staged locally. The proof and
+		// its Snapshot authority are re-presented unchanged: the relay never
+		// looked at them, so there is nothing about them to repair.
+		d.cancelStagedSessionShimSnapshot(id)
+		if waitErr := waitSessionShimRetryDelay(ctx, wait); waitErr != nil {
+			return evidence, preparation, SessionShimAdoptionReceipt{},
+				fmt.Errorf("%w; re-dial %d abandoned: %v", err, redials, waitErr)
+		}
+		evidence, preparation, receipt, err = d.completeSessionShimAdoptionRepreparingDrift(
+			ctx, ctrl, preparations, hostID, evidence, preparation,
+		)
+	}
+	// Still the operator-facing fact, so it stays wrapped rather than replaced —
+	// the quarantine detail says the relay never answered, how many times this
+	// lineage re-dialled, and that the window it exhausted belonged to the whole
+	// composition rather than to this lineage alone.
+	err = fmt.Errorf("%w; the relay was still unavailable after %d re-dial(s), and the composition stopped waiting on %s",
+		err, redials, lastStop.describe(bound))
+	return evidence, preparation, receipt, err
+}
+
+// sessionShimRelayDrainBarrier is one composition pass's shared view of ONE
+// relay outage: when the pass stops waiting on it, the instant the next dial
+// may go out, how far along the shared ladder that instant was set, and — the
+// one field a successful dial does NOT refund — how much waiting the whole pass
+// has spent.
+//
+// Its zero value is "no drain open", so a pass that never meets one costs
+// nothing. It is guarded because nothing in the contract promises the pass
+// stays on one goroutine.
+type sessionShimRelayDrainBarrier struct {
+	mu        sync.Mutex
+	deadline  time.Time
+	notBefore time.Time
+	// spent is the pass's cumulative reserved waiting. admitted() deliberately
+	// does not clear it: clearing the WINDOW is what lets a later, unrelated
+	// drain be waited out properly, but a relay that alternates — admits one
+	// lineage, refuses the next — would then hand every lineage a whole fresh
+	// window and reintroduce the lineage-count multiplication the shared window
+	// exists to remove. This is the ceiling that holds however the relay flaps.
+	spent time.Duration
+	// stepCount is how many waits have been served inside the CURRENT window;
+	// it selects the position on the shared doubling ladder and is reset with
+	// the window.
+	stepCount int
+}
+
+// sessionShimRelayDrainStop says why the barrier stopped granting waits, so a
+// quarantine detail can name the constraint that actually bound rather than
+// the first bound in the struct.
+type sessionShimRelayDrainStop uint8
+
+const (
+	// sessionShimDrainLive: the pass is still willing to wait.
+	sessionShimDrainLive sessionShimRelayDrainStop = iota
+	// sessionShimDrainWindowSpent: this outage's window elapsed.
+	sessionShimDrainWindowSpent
+	// sessionShimDrainPassBudgetSpent: the whole composition's waiting budget
+	// is gone, across every outage it met.
+	sessionShimDrainPassBudgetSpent
+)
+
+func (s sessionShimRelayDrainStop) describe(bound sessionShimRelayDrainBound) string {
+	if s == sessionShimDrainPassBudgetSpent {
+		return fmt.Sprintf("the composition's whole %s waiting budget", bound.passTotal)
+	}
+	return fmt.Sprintf("the composition's %s drain window", bound.window)
+}
+
+// sessionShimRelayDrainBound is the schedule and the bounds one pass will spend
+// on a relay that is not answering. Every field is resolved from the
+// deployment's own re-adoption policy except the window's cap — see
+// (*Daemon).sessionShimRelayDrainBound for why that one is deliberately not.
+type sessionShimRelayDrainBound struct {
+	// base is the first delay; it doubles along the shared ladder.
+	base time.Duration
+	// ceiling caps ONE wait, including a floor the relay itself named.
+	ceiling time.Duration
+	// window caps the waiting on ONE outage. It is the ONLY bound on how many
+	// times the pass re-dials into that outage: an attempt count that stopped
+	// the pass earlier than its own window would be a second, unstated bound,
+	// and under the shipped default it stopped it at 15s against a relay whose
+	// planned restart is longer than that.
+	window time.Duration
+	// passTotal caps the pass's waiting across every outage it meets, and is
+	// never refunded by a dial that gets through.
+	passTotal time.Duration
+}
+
+// reserve advances the shared ladder for one refusal and reports how long the
+// caller must wait before its next dial, and whether the pass is still willing
+// to wait at all.
+//
+// The first refusal opens the window. Every refusal after it advances
+// notBefore along the shared ladder, so a lineage that arrives late waits only
+// for the REMAINDER of a delay the pass is already serving instead of starting
+// a fresh one.
+func (b *sessionShimRelayDrainBarrier) reserve(
+	hint time.Duration, bound sessionShimRelayDrainBound, now time.Time,
+) (time.Duration, sessionShimRelayDrainStop) {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	if b.deadline.IsZero() {
+		b.deadline = now.Add(bound.window)
+		b.notBefore = now
+	}
+	if !now.Before(b.deadline) {
+		return 0, sessionShimDrainWindowSpent
+	}
+	remaining := bound.passTotal - b.spent
+	if remaining <= 0 {
+		return 0, sessionShimDrainPassBudgetSpent
+	}
+	b.stepCount++
+	next := b.notBefore.Add(sessionShimRelayDrainDelay(b.stepCount+1, hint, bound))
+	switch {
+	case next.Before(now):
+		// The pass served this delay while another lineage was dialling; the
+		// caller owes only what is left of it, which is nothing.
+		next = now
+	case next.After(b.deadline):
+		next = b.deadline
+	}
+	wait := next.Sub(now)
+	if wait > remaining {
+		// The pass's own budget is the shorter of the two constraints. Serve
+		// what is left of it rather than refusing outright: a shortened wait
+		// still spaces the dial, and the dial is what discovers a returned
+		// relay.
+		wait = remaining
+		next = now.Add(wait)
+	}
+	b.notBefore = next
+	b.spent += wait
+	return wait, sessionShimDrainLive
+}
+
+// admitted clears the WINDOW: a dial got through, so whatever the relay was
+// doing is over and the next drain is a new one. It does not clear spent — see
+// that field.
+func (b *sessionShimRelayDrainBarrier) admitted() {
+	b.mu.Lock()
+	defer b.mu.Unlock()
+	b.deadline = time.Time{}
+	b.notBefore = time.Time{}
+	b.stepCount = 0
+}
+
+// sessionShimRelayDrainBound resolves what one composition pass will spend on a
+// relay that is not answering, from the deployment's own re-adoption policy in
+// the shape that policy's OWN VALIDATOR accepts.
+//
+// The validator refuses BackoffCap in fixed-attempts mode and refuses Attempts
+// in lineage-live mode, so reading all four fields in both modes would resolve
+// numbers no deployment can express: a private third policy wearing the
+// configuration's name. Each mode is read in its own vocabulary instead:
+//
+//   - fixed attempts: Backoff is the ladder, and the policy's own
+//     WorstCaseWindow — which is derived from Attempts, AttemptTimeout and that
+//     same ladder — is the window. Attempts therefore still shapes the bound;
+//     what it must NOT do is truncate it independently. Taking Attempts-1 as a
+//     separate wait budget stopped the shipped default at 15s, which is shorter
+//     than a relay's own planned restart (its drain timeout alone is 15s,
+//     before shutdown, journal flush and a replacement boot), and a lineage
+//     that runs out on the startup path has no second chance anywhere: it is
+//     quarantined, its controller closed, and the controller-loss re-adoption
+//     path never sees it;
+//   - lineage live: the window is the bound, exactly as that mode's doc says,
+//     and BackoffCap is the per-wait cap it expresses.
+//
+// What is NOT from the policy, and is named rather than hidden, is the startup
+// cap. The re-adoption policy answers "how patient may this daemon be about a
+// live carrier fault, with the host already up". The startup pass asks a
+// different question — "how long may boot block before this host can advertise
+// capacity at all" — and a ten-minute lineage-live window is a legitimate answer
+// to the first and never to the second. It is sized against a relay's real
+// worst case rather than at a round number: a planned drain (15s by that
+// contract's default), plus the platform kill-timeout headroom a drain that
+// overruns is allowed (30s), plus a single-machine replacement boot and its
+// first accept. Erring long is the cheap direction — the pass WITHHOLDS
+// readiness rather than withdrawing it, so the cost is boot latency, while the
+// cost of erring short is a live lineage condemned with no recovery path.
+//
+// It deliberately does not read the policy's Disabled switch either: "may this
+// daemon re-adopt a lineage whose controller it lost" is not "may it dial twice
+// while the relay restarts", and a deployment that turned the first off did not
+// ask to quarantine every lineage on the host the next time a deploy lands
+// mid-composition.
+func (d *Daemon) sessionShimRelayDrainBound() sessionShimRelayDrainBound {
+	policy := d.sessionShimConfig().readoption()
+	bound := sessionShimRelayDrainBound{base: policy.Backoff}
+	if bound.base <= 0 {
+		bound.base = defaultSessionShimReadoptionBackoff
+	}
+	switch policy.Mode {
+	case ReadoptionLineageLive:
+		bound.window = policy.Window
+		bound.ceiling = policy.BackoffCap
+	default:
+		bound.window = policy.WorstCaseWindow()
+		bound.ceiling = bound.window
+	}
+	if bound.window <= 0 {
+		bound.window = defaultSessionShimReadoptionWindow
+	}
+	if bound.window > sessionShimStartupRelayDrainCap {
+		bound.window = sessionShimStartupRelayDrainCap
+	}
+	if bound.ceiling <= 0 || bound.ceiling > bound.window {
+		bound.ceiling = bound.window
+	}
+	// Two windows: enough for a relay that restarts twice during one boot, and
+	// a hard ceiling on a relay that alternates so the pass can never spend one
+	// window per lineage.
+	bound.passTotal = 2 * bound.window
+	return bound
+}
+
+// sessionShimRelayDrainDelay is the package's shared doubling schedule with the
+// relay's own floor applied. The floor is a MINIMUM the local backoff cannot
+// undercut — arriving back before the replacement has booted is how a fleet
+// turns one restart into a thundering herd — and the ceiling bounds both, so a
+// relay that asks for longer than a boot can wait gets dialled anyway and
+// refused again, which spends a bounded wait instead of an unbounded one.
+func sessionShimRelayDrainDelay(wait int, hint time.Duration, bound sessionShimRelayDrainBound) time.Duration {
+	delay := sessionShimRetryBackoffDelay(wait, bound.base)
+	if hint > delay {
+		delay = hint
+	}
+	if delay > bound.ceiling {
+		delay = bound.ceiling
+	}
+	return delay
+}
+
+// completeSessionShimAdoptionRepreparingDrift runs the durable-adoption
+// callback and, while it refuses with carrier cursor drift, re-prepares the
+// lineage's carrier proof and dials again inside the bound above.
 //
 // It returns the evidence and preparation the FINAL attempt used: a re-prepare
 // mints a new proof and a new Snapshot authority, so the caller must retain the
 // pair the receipt actually belongs to. On exhaustion it returns the last
 // refusal, which the caller quarantines — visibly degraded, after the bound,
 // never on the first ambiguous answer.
-func (d *Daemon) completeSessionShimAdoptionWithDriftRedial(
+func (d *Daemon) completeSessionShimAdoptionRepreparingDrift(
 	ctx context.Context,
 	ctrl *sessionshim.Controller,
 	preparations *sessionShimAdoptionPreparations,

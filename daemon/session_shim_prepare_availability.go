@@ -204,13 +204,32 @@ func (d *Daemon) dialLaunchedSessionShim(
 	)
 }
 
-// waitSessionShimRetryBackoff spends the doubling delay before attempt n
-// without outliving ctx. attempt counts from 1, so the first delay this can be
+// sessionShimRetryBackoffDelay is the doubling schedule every bounded retry in
+// this package shares. attempt counts from 1, so the first delay it can be
 // asked for is the one before attempt 2, and that one is base.
-func waitSessionShimRetryBackoff(ctx context.Context, attempt int, base time.Duration) error {
+//
+// It is separate from the wait so a caller that must adjust the delay — the
+// relay drain honours a floor the relay itself named — layers on this schedule
+// instead of keeping a second copy of the arithmetic.
+func sessionShimRetryBackoffDelay(attempt int, base time.Duration) time.Duration {
 	delay := base
 	for i := 2; i < attempt; i++ {
 		delay *= 2
+	}
+	return delay
+}
+
+// waitSessionShimRetryBackoff spends the doubling delay before attempt n
+// without outliving ctx.
+func waitSessionShimRetryBackoff(ctx context.Context, attempt int, base time.Duration) error {
+	return waitSessionShimRetryDelay(ctx, sessionShimRetryBackoffDelay(attempt, base))
+}
+
+// waitSessionShimRetryDelay spends one already-resolved delay without
+// outliving ctx.
+func waitSessionShimRetryDelay(ctx context.Context, delay time.Duration) error {
+	if delay <= 0 {
+		return ctx.Err()
 	}
 	timer := time.NewTimer(delay)
 	defer timer.Stop()
