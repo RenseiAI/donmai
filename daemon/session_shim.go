@@ -2563,6 +2563,27 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 			scopeSet[controller.Identity().OrgID] = struct{}{}
 		}
 		for _, quarantined := range result.Quarantined {
+			if !sessionShimQuarantineNamesALineage(quarantined) {
+				// A registry entry too malformed to decode is quarantined with
+				// whatever identity we have, which for a corrupt file is NONE.
+				// Seeding the scope set from it asks for a batch scoped to the
+				// empty organization, and the first thing that scope's loop
+				// does is resolve a host identity for it — a hard failure of
+				// the whole composition, on every start, for one corrupt file
+				// on disk. The entry keeps its capacity charge and its place in
+				// this daemon's LOCAL projection — host status and doctor still
+				// show it, because something may still be running out there —
+				// while naming no scope to compose for. The published heartbeat
+				// projection is per-organization, so it never carried the entry
+				// either: the charge is local, and only an operator removing
+				// the file reclaims it.
+				//
+				// This is also the ONLY identity guard on this path. Filtering
+				// again where the batch is composed would be unreachable by
+				// construction, because an entry with no organization matches
+				// no real scope there.
+				continue
+			}
 			scopeSet[quarantined.OrgID] = struct{}{}
 		}
 		for _, stale := range staleDeclarations {
@@ -2620,6 +2641,11 @@ func (d *Daemon) adoptSessionShims(ctx context.Context) error {
 				}
 			}
 			for _, quarantined := range result.Quarantined {
+				// No identity guard here on purpose: an entry with no
+				// organization matches no real scope, so the scope filter above
+				// is what keeps it out of every batch. A second check would be
+				// unreachable by construction — untestable defensive code that
+				// reads like a live invariant.
 				if quarantined.OrgID == orgID {
 					batch.Quarantined = append(batch.Quarantined, quarantined)
 				}
