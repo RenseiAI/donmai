@@ -4003,13 +4003,13 @@ func (d *Daemon) validateAndRetainSessionShimRefreshReceipt(result *RefreshToken
 		return errors.New("session shim: refresh omitted credential receipt")
 	}
 	receipt := result.SessionShim
-	wantState := SessionShimCredentialStateRecovering
-	if !d.sessionShimReadinessWithdrawn.Load() && d.State() == StateRunning &&
-		d.SessionShimAdoptionComplete() && d.SessionShimCarrierActivationComplete() {
-		wantState = SessionShimCredentialStateReady
-	}
-	if receipt.State != wantState {
-		return fmt.Errorf("session shim: refresh receipt state %q, want %q", receipt.State, wantState)
+	// The receiver's readiness may lag this process after a degraded beat.
+	// Requiring the two states to agree would prevent installing the very
+	// credentials needed to publish recovery. This receipt renews credentials;
+	// it neither grants adoption nor changes the local readiness fence. The
+	// refresher has already checked the exact controller/protocol attestation.
+	if receipt.State != SessionShimCredentialStateRecovering && receipt.State != SessionShimCredentialStateReady {
+		return fmt.Errorf("session shim: refresh receipt has invalid state %q", receipt.State)
 	}
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
