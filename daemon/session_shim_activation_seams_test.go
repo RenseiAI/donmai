@@ -1334,11 +1334,16 @@ func TestDaemonStartAuthOnlyOrderingBeforeAdoptionHeartbeatAndPoll(t *testing.T)
 			withdrawalBeat.SessionShim)
 	}
 	assertClosed(t, "false", priorHeartbeats, priorPolls)
-	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: &SessionShimCredentialReceipt{
-		State: SessionShimCredentialStateReady, WorkerHostID: "stable-host-order", AdoptionRevision: "revision-refresh",
-	}}); err == nil {
-		t.Fatal("refresh remained eligible after durable proof-v2 readiness became false")
+	authority, ok := d.SessionShimScopeAuthority("org-order")
+	if !ok {
+		t.Fatal("ready fixture has no retained scope authority")
 	}
+	if err := d.validateAndRetainSessionShimRefreshReceipt(&RefreshTokenResult{SessionShim: activationTestCredentialReceipt(
+		d.SessionShimHostAttestation(), SessionShimCredentialStateReady, authority.WorkerHostID, authority.AdoptionRevision,
+	)}); err != nil {
+		t.Fatalf("withdrawn readiness blocked the credentials required to recover it: %v", err)
+	}
+	assertClosed(t, "false-after-credential-renewal", priorHeartbeats, priorPolls)
 	reopenAfterAcknowledgedHeartbeat(t, "false")
 
 	// A TRANSIENT resolver failure. Nothing withdraws: this host was serving
