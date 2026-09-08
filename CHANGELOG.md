@@ -10,6 +10,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.24 — 2026-09-08
+
+### Fixes
+
+- **Recover expired runtime credentials.** Credential renewal continues when the receiver reports recovery while the daemon still holds an adopted session. A renewed credential reaches heartbeat, polling, and the on-disk cache without granting new-work admission or bypassing adoption checks.
+
+---
+
 ## v0.72.23 — 2026-09-07
 
 ### Fixes
