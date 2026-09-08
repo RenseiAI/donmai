@@ -279,7 +279,19 @@ func serveAcceptedV2Candidate(ctx context.Context, conn *websocket.Conn, snapsho
 	if err != nil {
 		return err
 	}
-	return conn.Write(ctx, websocket.MessageBinary, active.Encode())
+	if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
+		return err
+	}
+	// An accepted carrier is a live leg. Keep the fixture alive until the client
+	// has consumed carrier_active and closes it after activation; returning here
+	// would run the handler's CloseNow before that final control is necessarily
+	// visible to the client's read loop.
+	if _, _, err := readV2TestFrame(ctx, conn); err == nil {
+		return errors.New("accepted candidate sent a frame after activation")
+	} else if errors.Is(err, context.DeadlineExceeded) {
+		return err
+	}
+	return nil
 }
 
 // dialV2UntilTerminal is the composing daemon's discipline in miniature: dial,
