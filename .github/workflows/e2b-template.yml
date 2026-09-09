@@ -65,6 +65,8 @@ jobs:
         run: |
           install -m 0755 scripts/verify-release-tag.sh "${RUNNER_TEMP}/verify-release-tag.sh"
           install -m 0644 scripts/build-e2b-template.cjs "${RUNNER_TEMP}/build-e2b-template.cjs"
+          install -m 0755 scripts/verify-e2b-template.cjs "${RUNNER_TEMP}/verify-e2b-template.cjs"
+          install -m 0644 scripts/verify-e2b-template.test.cjs "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
 
       - name: Checkout release tag
         uses: actions/checkout@v7
@@ -112,6 +114,9 @@ jobs:
           e2b --version
           printf 'NODE_PATH=%s\n' "$(npm root --global)" >> "${GITHUB_ENV}"
 
+      - name: Test E2B version assertion
+        run: node --test "${RUNNER_TEMP}/verify-e2b-template.test.cjs"
+
       - name: Cross-compile donmai binary (linux/amd64)
         env:
           VERSION: ${{ steps.release.outputs.tag }}
@@ -133,6 +138,13 @@ jobs:
           E2B_TEMPLATE_REF: ${{ steps.release.outputs.e2b_template_ref }}
           E2B_ADDITIONAL_TAGS: ${{ steps.release.outputs.e2b_additional_tags }}
         run: node "${RUNNER_TEMP}/build-e2b-template.cjs"
+
+      - name: Assert published E2B template binary version
+        env:
+          E2B_API_KEY: ${{ secrets.E2B_API_KEY }}
+          E2B_TEMPLATE_REF: ${{ steps.template.outputs.template_ref }}
+          DONMAI_VERSION: ${{ steps.release.outputs.tag }}
+        run: node "${RUNNER_TEMP}/verify-e2b-template.cjs"
 
       - name: Summarize E2B template build
         env:
