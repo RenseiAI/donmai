@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.25 — 2026-09-09
+
+### Fixes
+
+- **Keep durable terminal output moving under network latency.** Optional bounded output batches send consecutive frames before waiting for their contiguous durable acknowledgement. Exact-byte replay, partial-failure recovery, and non-output ordering barriers remain enforced; existing single-frame consumers remain supported. Embedders must enable the batch callback to use this path.
+- **Apply repository sandbox authority before admission comparison.** Autonomous work with a repository declaration now reconciles its workspace-write sandbox before the early prepared-harness equality check. Work without a declaration retains autonomous full access, and genuine authority drift still refuses the spawn.
+
+---
+
 ## v0.72.24 — 2026-09-08
 
 ### Fixes
