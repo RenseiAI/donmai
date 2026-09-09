@@ -2188,8 +2188,22 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 						break consume
 					}
 					activationGate, retained := d.retainStagedSessionShimSnapshot(id, ev)
-					if !retained || !activationGate.await() {
+					if !retained {
 						return
+					}
+					if !activationGate.await() {
+						// A false gate before adoption commits grants no ownership and
+						// keeps the historical early return. Once the exact controller is
+						// present in adopted, the durable batch is real and this consumer
+						// owns its loss path. Treat the refusal as carrier loss so bounded
+						// re-adoption runs before exact quarantine; socket_unreachable
+						// would assert a fact this path did not observe.
+						if !d.noteFailedSessionShimActivation(id, ctrl) {
+							return
+						}
+						cause = shimStreamCarrierLost
+						_ = ctrl.Close()
+						break consume
 					}
 					continue
 				}
@@ -2304,6 +2318,23 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 			d.releaseShimIfLive(id, ctrl, classifyShimStreamEnd(cause, ctrl.StreamEndCause()))
 		}
 	}()
+}
+
+// noteFailedSessionShimActivation records only an exact controller this daemon
+// already owns. A pre-commit activation gate can therefore fail without
+// manufacturing an obligation, while a post-commit failure remains attached to
+// its precise shim incarnation until re-activation or terminal proof resolves
+// it.
+func (d *Daemon) noteFailedSessionShimActivation(id sessionshim.Identity, ctrl *sessionshim.Controller) bool {
+	d.shims.mu.Lock()
+	defer d.shims.mu.Unlock()
+	entry, adopted := d.shims.adopted[id]
+	if !adopted || ctrl == nil || entry.controller != ctrl {
+		return false
+	}
+	d.shims.failedActivations[shimIncarnationFor(entry.adoption)] = struct{}{}
+	d.shims.activationFailureRecoveryArmed = true
+	return true
 }
 
 // A short fixed gather deadline bounds interactive latency and guarantees a

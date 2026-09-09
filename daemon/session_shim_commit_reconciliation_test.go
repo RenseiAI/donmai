@@ -271,6 +271,55 @@ func TestAmbiguousArmCommitReconcilesToTheCommittedRevision(t *testing.T) {
 	}
 }
 
+// TestReconciledScopeRevisionSurvivesAnotherScopePublication pins the complete
+// batch-receipt set used by the later carrier-activation callback. A successful
+// reconciliation advances both the retained scope authority and this published
+// receipt: keeping only the first lets a later launch in another scope present
+// the reconciled scope's stale revision and fail the exact activation fence.
+func TestReconciledScopeRevisionSurvivesAnotherScopePublication(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, f := newReconciliationFixture(ctx, t)
+	d := h.daemon
+	const otherScope = "org-other"
+	d.shims.mu.Lock()
+	d.shims.batchReceipts[otherScope] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("other-revision-1"), AdoptionRevision: "other-revision-1",
+	}
+	d.shims.mu.Unlock()
+
+	h.setRefreshReceiptRevision("revision-2")
+	f.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return confirmedReceipt(batch, "revision-3"), nil
+	})
+	if err := d.reconcileSessionShimScope(h.orgID, time.Second); err != nil {
+		t.Fatalf("reconcile first scope: %v", err)
+	}
+
+	// A different scope publishes afterwards. The next carrier activation reads
+	// the full map, so both independently committed revisions must survive.
+	d.shims.mu.Lock()
+	d.shims.batchReceipts[otherScope] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("other-revision-2"), AdoptionRevision: "other-revision-2",
+	}
+	d.shims.mu.Unlock()
+	receipts := d.sessionShimPublishedBatchReceipts()
+	if len(receipts) != 2 {
+		t.Fatalf("published batch receipts = %+v, want both served scopes", receipts)
+	}
+	want := map[string]string{h.orgID: "revision-3", otherScope: "other-revision-2"}
+	for _, receipt := range receipts {
+		if receipt.AdoptionRevision != want[receipt.Scope] {
+			t.Fatalf("published batch receipt for %q = %q, want %q; another scope would activate against stale authority",
+				receipt.Scope, receipt.AdoptionRevision, want[receipt.Scope])
+		}
+		delete(want, receipt.Scope)
+	}
+	if len(want) != 0 {
+		t.Fatalf("published batch receipts omitted scopes: %v", want)
+	}
+}
+
 // TestBeatRevisionStaleTriggersReconciliation covers the trigger's other side:
 // a daemon that lands revision-behind with NO ambiguity flag (the divergence
 // observed only from the heartbeat refusal) reconciles off the 409 instead of
