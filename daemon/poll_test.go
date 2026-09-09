@@ -1287,6 +1287,109 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 	}
 }
 
+func TestNackRejectedWork_ForwardsCallerIdentityOriginalWorkAndTypedReason(t *testing.T) {
+	typed := &runner.HarnessAdmissionError{
+		Code:    executioncell.DenialFallbackNotAllowed,
+		Harness: "codex",
+		Detail:  "the receipt forbids fallback",
+	}
+	tests := []struct {
+		name       string
+		acceptErr  error
+		wantReason map[string]any
+	}{
+		{
+			name:      "wrapped typed denial",
+			acceptErr: fmt.Errorf("pre-spawn hook: %w", typed),
+			wantReason: map[string]any{
+				"contractVersion": receiptPreflightNackReasonContractVersion,
+				"code":            string(executioncell.DenialFallbackNotAllowed),
+			},
+		},
+		{
+			name:      "identical generic prose",
+			acceptErr: errors.New(fmt.Errorf("pre-spawn hook: %w", typed).Error()),
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			item := &PollWorkItem{
+				SessionID:       "session-1",
+				ProjectID:       "project-1",
+				RepositoryID:    "repository-1",
+				Repository:      "example.invalid/org/repo",
+				IssueID:         "issue-1",
+				IssueIdentifier: "ISSUE-1",
+				Priority:        3,
+				QueuedAt:        1700000000000,
+				WorkType:        "agent",
+			}
+			wantWork, err := json.Marshal(item)
+			if err != nil {
+				t.Fatalf("marshal expected work: %v", err)
+			}
+
+			var calls atomic.Int32
+			var body struct {
+				WorkerID               string          `json:"workerId"`
+				Reason                 string          `json:"reason"`
+				ReceiptPreflightReason map[string]any  `json:"receiptPreflightReason"`
+				Work                   json.RawMessage `json:"work"`
+			}
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				calls.Add(1)
+				if r.Method != http.MethodPost {
+					t.Errorf("method = %q, want POST", r.Method)
+				}
+				if r.URL.Path != "/api/sessions/session-1/nack" {
+					t.Errorf("path = %q, want /api/sessions/session-1/nack", r.URL.Path)
+				}
+				if got := r.Header.Get("Authorization"); got != "Bearer caller-runtime-jwt" {
+					t.Errorf("Authorization = %q, want caller runtime JWT", got)
+				}
+				if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+					t.Fatalf("decode NACK body: %v", err)
+				}
+				w.WriteHeader(http.StatusNoContent)
+			}))
+			t.Cleanup(srv.Close)
+
+			if err := NackRejectedWork(
+				context.Background(), srv.Client(), srv.URL, "caller-worker", "caller-runtime-jwt", item, tt.acceptErr,
+			); err != nil {
+				t.Fatalf("NackRejectedWork: %v", err)
+			}
+			if got := calls.Load(); got != 1 {
+				t.Fatalf("NACK requests = %d, want exactly 1", got)
+			}
+			if body.WorkerID != "caller-worker" {
+				t.Fatalf("workerId = %q, want caller-worker", body.WorkerID)
+			}
+			if body.Reason != "accept work failed: "+tt.acceptErr.Error() {
+				t.Fatalf("reason = %q, want compatibility prose", body.Reason)
+			}
+			if !bytes.Equal(body.Work, wantWork) {
+				t.Fatalf("work = %s, want exact original fields %s", body.Work, wantWork)
+			}
+			if tt.wantReason == nil {
+				if body.ReceiptPreflightReason != nil {
+					t.Fatalf("receiptPreflightReason = %#v, want omitted", body.ReceiptPreflightReason)
+				}
+			} else if !mapsEqual(body.ReceiptPreflightReason, tt.wantReason) {
+				t.Fatalf("receiptPreflightReason = %#v, want %#v", body.ReceiptPreflightReason, tt.wantReason)
+			}
+		})
+	}
+}
+
+func TestNackRejectedWork_RejectsNilItem(t *testing.T) {
+	err := NackRejectedWork(context.Background(), nil, "http://example.invalid", "worker", "jwt", nil, errors.New("rejected"))
+	if err == nil || !strings.Contains(err.Error(), "original work item") {
+		t.Fatalf("NackRejectedWork nil item error = %v, want original work item error", err)
+	}
+}
+
 // TestCallNackEndpoint_ReceiptPreflightReasonWire pins the additive typed NACK
 // reason contract. It is deliberately derived from the wrapped typed admission
 // error rather than matching its prose: an identical generic message must not
