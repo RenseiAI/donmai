@@ -10,6 +10,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.26 — 2026-09-09
+
+### Features
+
+- **Share rejected-work reporting with embedders.** `daemon.NackRejectedWork` sends the original poll item with the caller's worker credentials through the same NACK transport and typed rejection mapping used by the primary daemon. Embedded poll loops can report admission failures without duplicating the wire contract.
+
+---
+
 ## v0.72.25 — 2026-09-09
 
 ### Fixes
