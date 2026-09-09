@@ -956,6 +956,16 @@ type SessionShimConfig struct {
 	// it as a carrier fault rather than a shim-side failure.
 	OnSessionEventDurable func(sessionshim.Identity, sessionshim.ControllerEvent) error
 
+	// OnSessionEventDurableBatch optionally hands adjacent selected-v3 Output
+	// HostFrames to a bounded durable window. It preserves exact FrameBytes and
+	// returns the highest contiguous carrier ACK, including a confirmed prefix
+	// on error. A nil error requires the entire batch to be acknowledged. A zero
+	// high-water means no acknowledged member. The daemon persists only that
+	// prefix and closes/re-adopts on error or an invalid receipt. Callbacks must
+	// honor the supplied deadline. Gap, Snapshot, Exit and other barriers still
+	// use OnSessionEventDurable synchronously; that callback remains required.
+	OnSessionEventDurableBatch func(context.Context, sessionshim.Identity, []sessionshim.ControllerEvent) (ackedThrough uint64, err error)
+
 	// ResumeFrom returns the first output sequence the composing durable store
 	// still needs (its last_forwarded_seq + 1). Nil delegates to the shim's
 	// fsync-backed ACK sidecar, or the start of the stream when none exists. An
