@@ -18,6 +18,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -2057,8 +2058,66 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 		// the socket went away, the shim broke the sequence contract) keeps the
 		// pre-existing disposition.
 		cause := shimStreamEnded
+		var pending *sessionshim.ControllerEvent
 	consume:
-		for ev := range ctrl.Events() {
+		for {
+			var ev sessionshim.ControllerEvent
+			if pending != nil {
+				ev, pending = *pending, nil
+			} else {
+				var ok bool
+				ev, ok = <-ctrl.Events()
+				if !ok {
+					break
+				}
+			}
+			if cfg.OnSessionEventDurableBatch != nil && durable != nil && fullHostFrames &&
+				isShimBatchOutput(ev) && len(ev.FrameBytes) <= attachclient.DurableOutputBatchMaxBytes {
+				batch, next := collectShimOutputBatch(ctrl.Events(), ev)
+				pending = next
+				valid := ev.Seq > lastSeq
+				for i, event := range batch {
+					if event.Seq == 0 || (i > 0 && event.Seq != batch[i-1].Seq+1) {
+						valid = false
+					}
+				}
+				if !valid {
+					_ = ctrl.Close()
+					break consume
+				}
+				for _, event := range batch {
+					if observe != nil {
+						observe(id, event)
+					}
+				}
+				ctx, cancel := d.sessionShimCallbackContext(context.Background())
+				acked, err := cfg.OnSessionEventDurableBatch(ctx, id, batch)
+				cancel()
+				end := batch[len(batch)-1].Seq
+				// Only a receipt within the exact submitted contiguous range can
+				// advance either cursor. The predecessor is a valid empty prefix.
+				if acked > end || (acked != 0 && acked < ev.Seq-1) || (err == nil && acked != end) {
+					err = errors.New("session shim: invalid durable output batch acknowledgement")
+					acked = 0
+				}
+				if acked >= ev.Seq {
+					if err != nil {
+						if persistErr := cursor.persist(acked); persistErr != nil {
+							err = errors.Join(err, persistErr)
+						}
+					} else {
+						cursor.record(acked)
+					}
+				}
+				if err != nil {
+					slog.Warn("session shim: durable carrier rejected output batch", "session", id.String(), "ackedThrough", acked, "error", err)
+					cause = classifySessionShimCarrierLoss(err)
+					_ = ctrl.Close()
+					break consume
+				}
+				lastSeq = end
+				continue
+			}
 			if observe != nil {
 				// Forward first, bookkeep second: a carrier must see output in the
 				// order the shim produced it, and acknowledging a sequence this
@@ -2245,6 +2304,37 @@ func (d *Daemon) consumeShimEventsGated(ctrl *sessionshim.Controller, gate *shim
 			d.releaseShimIfLive(id, ctrl, classifyShimStreamEnd(cause, ctrl.StreamEndCause()))
 		}
 	}()
+}
+
+// A short fixed gather deadline bounds interactive latency and guarantees a
+// continuously ready output source cannot starve a queued control barrier.
+const shimOutputBatchFlushDelay = 5 * time.Millisecond
+
+func isShimBatchOutput(ev sessionshim.ControllerEvent) bool {
+	return ev.Kind == sessionshim.EventHostFrame && ev.FrameType == attachwire.TypeOutput
+}
+
+func collectShimOutputBatch(events <-chan sessionshim.ControllerEvent, first sessionshim.ControllerEvent) ([]sessionshim.ControllerEvent, *sessionshim.ControllerEvent) {
+	batch := []sessionshim.ControllerEvent{first}
+	size := len(first.FrameBytes)
+	timer := time.NewTimer(shimOutputBatchFlushDelay)
+	defer timer.Stop()
+	for len(batch) < attachclient.DurableOutputBatchMaxFrames && size < attachclient.DurableOutputBatchMaxBytes {
+		select {
+		case <-timer.C:
+			return batch, nil
+		case event, ok := <-events:
+			if !ok {
+				return batch, nil
+			}
+			if !isShimBatchOutput(event) || len(event.FrameBytes) > attachclient.DurableOutputBatchMaxBytes-size {
+				return batch, &event
+			}
+			batch = append(batch, event)
+			size += len(event.FrameBytes)
+		}
+	}
+	return batch, nil
 }
 
 // sessionShimLaunchControllerOptions assembles everything a launch's controller
