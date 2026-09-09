@@ -1495,6 +1495,26 @@ func TestFailedDynamicActivationRetiresOnlyAfterExactTerminalProof(t *testing.T)
 	if err != nil {
 		t.Fatalf("terminal projection heartbeat: %v", err)
 	}
+	stale := projection
+	stale.AdoptionRevision = "stale-terminal-revision"
+	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, stale)
+	if d.State() != StateRecovering || d.spawner.IsAccepting() {
+		t.Fatalf("stale terminal heartbeat reopened recovery: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+	// A launch already admitted across the old spawner edge reaches the inner
+	// serialized-publication branch at session_shim_spawn.go before it may commit.
+	// Pin that exact gate after the stale acknowledgement: dropping it here lets
+	// the already-admitted launch publish while recovery remains unacknowledged.
+	d.shims.publicationMu.Lock()
+	queuedPublicationRefused := d.shims.dynamicPublicationFailed
+	d.shims.publicationMu.Unlock()
+	if !queuedPublicationRefused {
+		t.Fatal("stale acknowledgement dropped the inner latch that refuses an already-admitted queued publication")
+	}
+	projection, err = d.SessionShimHeartbeatProjection(id.OrgID)
+	if err != nil {
+		t.Fatalf("current terminal projection heartbeat: %v", err)
+	}
 	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, projection)
 	if d.State() != StateRunning || !d.spawner.IsAccepting() {
 		t.Fatalf("exact terminal projection heartbeat did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
@@ -1509,7 +1529,10 @@ func TestRecoveryHeartbeatKeepsUnclassifiedPublicationFailureLatched(t *testing.
 	d.shims.mu.Lock()
 	d.shims.adoptionComplete = true
 	d.shims.carrierActivationComplete = true
+	d.shims.activationFailureRecoveryArmed = true
 	d.shims.mu.Unlock()
+	d.setState(StateRecovering)
+	d.spawner.Pause()
 	d.sessionShimReadinessWithdrawn.Store(true)
 	d.shims.publicationMu.Lock()
 	d.shims.dynamicPublicationFailed = true
@@ -1519,11 +1542,35 @@ func TestRecoveryHeartbeatKeepsUnclassifiedPublicationFailureLatched(t *testing.
 	if err != nil {
 		t.Fatalf("heartbeat projection: %v", err)
 	}
+	// First consume one legitimate activation recovery and prove its authority
+	// marker is one-shot rather than ambient permission for a later failure.
 	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, projection)
 	d.shims.publicationMu.Lock()
-	latched := d.shims.dynamicPublicationFailed
+	firstLatched := d.shims.dynamicPublicationFailed
 	d.shims.publicationMu.Unlock()
-	if !latched {
+	d.shims.mu.RLock()
+	armSurvived := d.shims.activationFailureRecoveryArmed
+	d.shims.mu.RUnlock()
+	if firstLatched || armSurvived || d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("activation recovery was not consumed exactly once: latched=%v armed=%v state=%s accepting=%v",
+			firstLatched, armSurvived, d.State(), d.spawner.IsAccepting())
+	}
+
+	d.setState(StateRecovering)
+	d.spawner.Pause()
+	d.sessionShimReadinessWithdrawn.Store(true)
+	d.shims.publicationMu.Lock()
+	d.shims.dynamicPublicationFailed = true
+	d.shims.publicationMu.Unlock()
+	projection, err = d.SessionShimHeartbeatProjection(f.orgID)
+	if err != nil {
+		t.Fatalf("unclassified heartbeat projection: %v", err)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, projection)
+	d.shims.publicationMu.Lock()
+	secondLatched := d.shims.dynamicPublicationFailed
+	d.shims.publicationMu.Unlock()
+	if !secondLatched {
 		t.Fatal("an unclassified post-commit publication failure was cleared without recovery proof")
 	}
 }

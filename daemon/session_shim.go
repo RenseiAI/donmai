@@ -1202,23 +1202,6 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 	if !d.sessionShimReadinessWithdrawn.Load() {
 		return
 	}
-	if d.shims.dynamicPublicationFailed {
-		// A committed carrier-activation failure is recoverable only after every
-		// exact affected incarnation has either activated under a later adoption,
-		// or left through durable terminal evidence and a confirmed republish.
-		// Other post-commit failures have no such proof and keep the original
-		// fail-closed latch.
-		d.shims.mu.Lock()
-		activationRecovered := d.shims.activationFailureRecoveryArmed && len(d.shims.failedActivations) == 0
-		if activationRecovered {
-			d.shims.activationFailureRecoveryArmed = false
-		}
-		d.shims.mu.Unlock()
-		if !activationRecovered {
-			return
-		}
-		d.shims.dynamicPublicationFailed = false
-	}
 	// Cached, not re-resolved: this re-sample verifies that the authority the
 	// server just echoed is still the authority this host holds. Resolving
 	// again would ask the embedder twice per beat and would compare the beat
@@ -1229,6 +1212,11 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 	}
 	var activationAcknowledgement *SessionShimPublishedBatchReceipt
 	d.shims.mu.Lock()
+	if d.shims.dynamicPublicationFailed &&
+		(!d.shims.activationFailureRecoveryArmed || len(d.shims.failedActivations) != 0) {
+		d.shims.mu.Unlock()
+		return
+	}
 	if len(d.shims.pendingHeartbeatAcks) > 0 {
 		pendingRevision, pending := d.shims.pendingHeartbeatAcks[orgID]
 		if !pending || pendingRevision != acknowledged.AdoptionRevision {
@@ -1257,6 +1245,22 @@ func (d *Daemon) AcknowledgeSessionShimRecoveryHeartbeat(
 	defer d.lifecycleMu.Unlock()
 	if d.stopGen != nil || !d.sessionShimReadinessWithdrawn.Load() {
 		return
+	}
+	if d.shims.dynamicPublicationFailed {
+		// Re-check at the final reopening edge. A consumer can record a failed
+		// activation after this acknowledgement's first snapshot, and the inner
+		// publication latch must remain closed unless the exact recovered set is
+		// still empty after every heartbeat and lifecycle check passed.
+		d.shims.mu.Lock()
+		activationRecovered := d.shims.activationFailureRecoveryArmed && len(d.shims.failedActivations) == 0
+		if activationRecovered {
+			d.shims.activationFailureRecoveryArmed = false
+		}
+		d.shims.mu.Unlock()
+		if !activationRecovered {
+			return
+		}
+		d.shims.dynamicPublicationFailed = false
 	}
 	switch d.State() {
 	case StateRecovering:
@@ -3823,7 +3827,7 @@ func (d *Daemon) republishSessionShimProjection(ctx context.Context, orgID strin
 	// This batch activates no new carrier, so it creates no new heartbeat fence.
 	// If an older carrier activation is already waiting, the republish advances
 	// that pending cursor to the confirmed revision in the same atomic retention.
-	if revisionErr := d.retainRepublishedSessionShimReceipt(orgID, receipt); revisionErr != nil {
+	if revisionErr := d.retainRepublishedSessionShimReceipt(orgID, batch, receipt); revisionErr != nil {
 		slog.Warn("session shim: adoption revision not retained after republishing the projection",
 			"org", orgID, "error", revisionErr)
 		return revisionErr
@@ -4040,7 +4044,11 @@ func (d *Daemon) updateSessionShimAdoptionRevisionLocked(scope, revision string,
 // scope receipt under the same lock. Carrier activation publishes the complete
 // batch-receipt set, so exposing a new credential revision beside an older batch
 // receipt would let another scope activate against a half-updated view.
-func (d *Daemon) retainRepublishedSessionShimReceipt(scope string, receipt SessionShimAdoptionBatchReceipt) error {
+func (d *Daemon) retainRepublishedSessionShimReceipt(
+	scope string,
+	batch SessionShimAdoptionBatch,
+	receipt SessionShimAdoptionBatchReceipt,
+) error {
 	if !d.sessionShimEnabled() {
 		return nil
 	}
@@ -4060,15 +4068,17 @@ func (d *Daemon) retainRepublishedSessionShimReceipt(scope string, receipt Sessi
 	if _, pending := d.shims.pendingHeartbeatAcks[scope]; pending {
 		d.shims.pendingHeartbeatAcks[scope] = receipt.AdoptionRevision
 	}
-	// A terminal handoff moves its exact proof into tombstoned before this
-	// complete projection is published. Only a confirmed republish may resolve
-	// the corresponding activation failure; a sibling incarnation never does.
+	// Resolve only from terminal evidence in the exact batch that this receipt
+	// confirms. Live tombstoned state can advance while the callback is in
+	// flight; consulting it here would let an older receipt authorize a newer
+	// terminal disposition it never carried.
 	for failed := range d.shims.failedActivations {
 		if failed.identity.OrgID != scope {
 			continue
 		}
-		for _, terminal := range d.shims.tombstoned {
-			if terminal.Identity() == failed.identity && terminal.ShimID == failed.shimID &&
+		for _, evidence := range batch.Tombstoned {
+			terminal := evidence.Tombstone
+			if terminal.GroupReaped && terminal.Identity() == failed.identity && terminal.ShimID == failed.shimID &&
 				terminal.ProcessEpoch == failed.processEpoch {
 				delete(d.shims.failedActivations, failed)
 				break
