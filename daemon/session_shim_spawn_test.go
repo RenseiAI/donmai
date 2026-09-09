@@ -1386,6 +1386,195 @@ func TestQueuedDynamicPublicationStopsAfterPriorActivationFailure(t *testing.T) 
 	}
 }
 
+// TestFailedDynamicActivationRetiresOnlyAfterExactTerminalProof exercises the
+// committed-publication failure that used to strand an adopted entry after its
+// activation gate returned false. The failed carrier must first become visible,
+// capacity-charged quarantine. Only the real shim's exact group-reaped
+// tombstone may then drive durable terminal evidence, projection withdrawal,
+// and the exact heartbeat edge that reopens admission.
+func TestFailedDynamicActivationRetiresOnlyAfterExactTerminalProof(t *testing.T) {
+	var terminalMu sync.Mutex
+	var terminals []SessionShimTerminalEvidence
+	f := newShimSpawnFixture(t, func(cfg *SessionShimConfig) {
+		cfg.Readoption = SessionShimReadoptionPolicy{Disabled: true}
+		cfg.OnTerminalEvidence = func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+			terminalMu.Lock()
+			defer terminalMu.Unlock()
+			terminals = append(terminals, evidence)
+			return nil
+		}
+	})
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.opts.SessionShim.HostID = "host-failed-activation-terminal"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	probe := &dynamicPublicationProbe{}
+	probe.carrierEpoch.Store(120)
+	configureDynamicPublicationProbe(t, d, probe)
+	d.opts.SessionShim.OnAdoptionPublished = func(context.Context, SessionShimAdoptionPublication) ([]SessionShimCarrierActivationReceipt, error) {
+		return nil, errors.New("injected post-publication activation refusal")
+	}
+
+	spec := f.interactiveSpec("failed-activation-terminal")
+	if _, err := d.spawner.AcceptWork(spec); err != nil {
+		t.Fatalf("committed launch returned an error that could invite duplicate execution: %v", err)
+	}
+	id := f.identity(spec.SessionID)
+	var quarantined sessionshim.QuarantinedSession
+	waitFor(t, 5*time.Second, "failed activation to enter exact quarantine", func() bool {
+		d.shims.mu.RLock()
+		defer d.shims.mu.RUnlock()
+		if len(d.shims.adopted) != 0 || len(d.shims.quarantined) != 1 {
+			return false
+		}
+		quarantined = d.shims.quarantined[0]
+		return quarantined.Identity() == id && quarantined.ConsumesCapacity
+	})
+	terminalMu.Lock()
+	reportedBeforeProof := len(terminals)
+	terminalMu.Unlock()
+	if reportedBeforeProof != 0 {
+		t.Fatalf("terminal evidence reports before proof = %d, want 0", reportedBeforeProof)
+	}
+	if d.State() != StateRecovering || d.spawner.IsAccepting() {
+		t.Fatalf("failed activation reopened before proof: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+
+	registry, err := sessionshim.NewRegistry(f.registry)
+	if err != nil {
+		t.Fatalf("registry: %v", err)
+	}
+	sibling := sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         id.OrgID, SessionID: id.SessionID,
+		ShimID: quarantined.ShimID + "-sibling", ProcessEpoch: quarantined.ProcessEpoch + 1,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		ExitCode: 0, GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	}
+	if err := registry.PutTombstone(sibling); err != nil {
+		t.Fatalf("put sibling tombstone: %v", err)
+	}
+	d.reconcileQuarantinedTombstones()
+	d.shims.mu.RLock()
+	heldAfterSibling := len(d.shims.quarantined) == 1 && len(d.shims.adopted) == 0
+	d.shims.mu.RUnlock()
+	if !heldAfterSibling {
+		t.Fatal("a sibling incarnation tombstone released the failed activation")
+	}
+
+	var exact sessionshim.Tombstone
+	waitFor(t, 10*time.Second, "the failed shim's exact group-reaped tombstone", func() bool {
+		var getErr error
+		exact, getErr = registry.GetTombstoneIncarnation(id, quarantined.ShimID, quarantined.ProcessEpoch)
+		return getErr == nil && exact.GroupReaped
+	})
+	d.shims.mu.RLock()
+	stillHeldBeforeHandoff := len(d.shims.quarantined) == 1 && len(d.shims.adopted) == 0
+	d.shims.mu.RUnlock()
+	if !stillHeldBeforeHandoff {
+		t.Fatal("capacity was released before the exact terminal proof was durably handed off")
+	}
+
+	d.reconcileQuarantinedTombstones()
+	terminalMu.Lock()
+	reported := append([]SessionShimTerminalEvidence(nil), terminals...)
+	terminalMu.Unlock()
+	if len(reported) != 1 || reported[0].Tombstone != exact || !reported[0].Tombstone.GroupReaped {
+		t.Fatalf("durable terminal reports = %+v, want the exact group-reaped proof once", reported)
+	}
+	d.shims.mu.RLock()
+	remaining := len(d.shims.adopted) + len(d.shims.quarantined)
+	d.shims.mu.RUnlock()
+	if remaining != 0 {
+		t.Fatalf("occupied shim entries after durable terminal handoff = %d, want 0", remaining)
+	}
+	projection, err := d.SessionShimHeartbeatProjection(id.OrgID)
+	if err != nil {
+		t.Fatalf("terminal projection heartbeat: %v", err)
+	}
+	stale := projection
+	stale.AdoptionRevision = "stale-terminal-revision"
+	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, stale)
+	if d.State() != StateRecovering || d.spawner.IsAccepting() {
+		t.Fatalf("stale terminal heartbeat reopened recovery: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+	// A launch already admitted across the old spawner edge reaches the inner
+	// serialized-publication branch at session_shim_spawn.go before it may commit.
+	// Pin that exact gate after the stale acknowledgement: dropping it here lets
+	// the already-admitted launch publish while recovery remains unacknowledged.
+	d.shims.publicationMu.Lock()
+	queuedPublicationRefused := d.shims.dynamicPublicationFailed
+	d.shims.publicationMu.Unlock()
+	if !queuedPublicationRefused {
+		t.Fatal("stale acknowledgement dropped the inner latch that refuses an already-admitted queued publication")
+	}
+	projection, err = d.SessionShimHeartbeatProjection(id.OrgID)
+	if err != nil {
+		t.Fatalf("current terminal projection heartbeat: %v", err)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(id.OrgID, projection)
+	if d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("exact terminal projection heartbeat did not reopen: state=%s accepting=%v", d.State(), d.spawner.IsAccepting())
+	}
+}
+
+func TestRecoveryHeartbeatKeepsUnclassifiedPublicationFailureLatched(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.opts.SessionShim.HostID = "host-unclassified-publication-failure"
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	d.shims.mu.Lock()
+	d.shims.adoptionComplete = true
+	d.shims.carrierActivationComplete = true
+	d.shims.activationFailureRecoveryArmed = true
+	d.shims.mu.Unlock()
+	d.setState(StateRecovering)
+	d.spawner.Pause()
+	d.sessionShimReadinessWithdrawn.Store(true)
+	d.shims.publicationMu.Lock()
+	d.shims.dynamicPublicationFailed = true
+	d.shims.publicationMu.Unlock()
+
+	projection, err := d.SessionShimHeartbeatProjection(f.orgID)
+	if err != nil {
+		t.Fatalf("heartbeat projection: %v", err)
+	}
+	// First consume one legitimate activation recovery and prove its authority
+	// marker is one-shot rather than ambient permission for a later failure.
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, projection)
+	d.shims.publicationMu.Lock()
+	firstLatched := d.shims.dynamicPublicationFailed
+	d.shims.publicationMu.Unlock()
+	d.shims.mu.RLock()
+	armSurvived := d.shims.activationFailureRecoveryArmed
+	d.shims.mu.RUnlock()
+	if firstLatched || armSurvived || d.State() != StateRunning || !d.spawner.IsAccepting() {
+		t.Fatalf("activation recovery was not consumed exactly once: latched=%v armed=%v state=%s accepting=%v",
+			firstLatched, armSurvived, d.State(), d.spawner.IsAccepting())
+	}
+
+	d.setState(StateRecovering)
+	d.spawner.Pause()
+	d.sessionShimReadinessWithdrawn.Store(true)
+	d.shims.publicationMu.Lock()
+	d.shims.dynamicPublicationFailed = true
+	d.shims.publicationMu.Unlock()
+	projection, err = d.SessionShimHeartbeatProjection(f.orgID)
+	if err != nil {
+		t.Fatalf("unclassified heartbeat projection: %v", err)
+	}
+	d.AcknowledgeSessionShimRecoveryHeartbeat(f.orgID, projection)
+	d.shims.publicationMu.Lock()
+	secondLatched := d.shims.dynamicPublicationFailed
+	d.shims.publicationMu.Unlock()
+	if !secondLatched {
+		t.Fatal("an unclassified post-commit publication failure was cleared without recovery proof")
+	}
+}
+
 func TestDynamicLaunchWithoutPublicationHookDoesNotPoisonLaterSessions(t *testing.T) {
 	f := newShimSpawnFixture(t)
 	d := f.daemon

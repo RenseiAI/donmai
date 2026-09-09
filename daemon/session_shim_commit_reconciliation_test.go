@@ -271,6 +271,110 @@ func TestAmbiguousArmCommitReconcilesToTheCommittedRevision(t *testing.T) {
 	}
 }
 
+// TestReconciledScopeRevisionSurvivesAnotherScopePublication pins the complete
+// batch-receipt set used by the later carrier-activation callback. A successful
+// reconciliation advances both the retained scope authority and this published
+// receipt: keeping only the first lets a later launch in another scope present
+// the reconciled scope's stale revision and fail the exact activation fence.
+func TestReconciledScopeRevisionSurvivesAnotherScopePublication(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, f := newReconciliationFixture(ctx, t)
+	d := h.daemon
+	const otherScope = "org-other"
+	d.shims.mu.Lock()
+	d.shims.batchReceipts[otherScope] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("other-revision-1"), AdoptionRevision: "other-revision-1",
+	}
+	d.shims.mu.Unlock()
+
+	h.setRefreshReceiptRevision("revision-2")
+	f.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		return confirmedReceipt(batch, "revision-3"), nil
+	})
+	if err := d.reconcileSessionShimScope(h.orgID, time.Second); err != nil {
+		t.Fatalf("reconcile first scope: %v", err)
+	}
+
+	// A different scope publishes afterwards. The next carrier activation reads
+	// the full map, so both independently committed revisions must survive.
+	d.shims.mu.Lock()
+	d.shims.batchReceipts[otherScope] = SessionShimAdoptionBatchReceipt{
+		DurableCorrelation: []byte("other-revision-2"), AdoptionRevision: "other-revision-2",
+	}
+	d.shims.mu.Unlock()
+	receipts := d.sessionShimPublishedBatchReceipts()
+	if len(receipts) != 2 {
+		t.Fatalf("published batch receipts = %+v, want both served scopes", receipts)
+	}
+	want := map[string]string{h.orgID: "revision-3", otherScope: "other-revision-2"}
+	for _, receipt := range receipts {
+		if receipt.AdoptionRevision != want[receipt.Scope] {
+			t.Fatalf("published batch receipt for %q = %q, want %q; another scope would activate against stale authority",
+				receipt.Scope, receipt.AdoptionRevision, want[receipt.Scope])
+		}
+		delete(want, receipt.Scope)
+	}
+	if len(want) != 0 {
+		t.Fatalf("published batch receipts omitted scopes: %v", want)
+	}
+}
+
+// TestOlderRepublishCannotResolveNewerTerminalActivationFailure holds a
+// republish after it captured an empty terminal set, then records a newer exact
+// terminal disposition before the old commit returns. Only the tombstones in
+// the batch that actually committed may resolve activation failures; consulting
+// newer live state would attribute proof to a receipt that never carried it.
+func TestOlderRepublishCannotResolveNewerTerminalActivationFailure(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h, f := newReconciliationFixture(ctx, t)
+	d := h.daemon
+	key := shimIncarnation{
+		identity: sessionshim.Identity{OrgID: h.orgID, SessionID: "session-newer-terminal"},
+		shimID:   "shim-newer-terminal", processEpoch: 8,
+	}
+	d.shims.mu.Lock()
+	d.shims.failedActivations[key] = struct{}{}
+	d.shims.activationFailureRecoveryArmed = true
+	d.shims.mu.Unlock()
+
+	commitEntered := make(chan struct{})
+	releaseCommit := make(chan struct{})
+	f.setCommit(func(batch SessionShimAdoptionBatch) (SessionShimAdoptionBatchReceipt, error) {
+		if len(batch.Tombstoned) != 0 {
+			t.Fatalf("older republish unexpectedly captured terminal state: %+v", batch.Tombstoned)
+		}
+		close(commitEntered)
+		<-releaseCommit
+		return confirmedReceipt(batch, "revision-2"), nil
+	})
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- d.republishSessionShimProjection(context.Background(), h.orgID)
+	}()
+	<-commitEntered
+	d.shims.mu.Lock()
+	d.shims.tombstoned = append(d.shims.tombstoned, sessionshim.Tombstone{
+		SchemaVersion: sessionshim.RecordSchemaVersion,
+		OrgID:         key.identity.OrgID, SessionID: key.identity.SessionID,
+		ShimID: key.shimID, ProcessEpoch: key.processEpoch,
+		HarnessPID: os.Getpid(), HarnessStartedAt: 1,
+		ExitCode: 0, GroupReaped: true, ObservedAtUnixNano: time.Now().UnixNano(),
+	})
+	d.shims.mu.Unlock()
+	close(releaseCommit)
+	if err := <-errCh; err != nil {
+		t.Fatalf("older republish: %v", err)
+	}
+	d.shims.mu.RLock()
+	_, retained := d.shims.failedActivations[key]
+	d.shims.mu.RUnlock()
+	if !retained {
+		t.Fatal("an older committed batch resolved an activation failure using newer terminal state it did not carry")
+	}
+}
+
 // TestBeatRevisionStaleTriggersReconciliation covers the trigger's other side:
 // a daemon that lands revision-behind with NO ambiguity flag (the divergence
 // observed only from the heartbeat refusal) reconciles off the 409 instead of
