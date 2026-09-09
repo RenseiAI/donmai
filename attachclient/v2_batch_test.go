@@ -32,6 +32,22 @@ func batchTestCandidate(t *testing.T, serve func(context.Context, *websocket.Con
 			result <- err
 			return
 		}
+		request, _ := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonResync})
+		if err := conn.Write(ctx, websocket.MessageBinary, request.Encode()); err != nil {
+			result <- err
+			return
+		}
+		if _, raw, err := readV2TestFrame(ctx, conn); err != nil || !bytes.Equal(raw, v2ResumeSnapshot(5).Encode()) {
+			result <- fmt.Errorf("candidate snapshot differs: %v", err)
+			return
+		}
+		if frame, _, err := readV2TestFrame(ctx, conn); err != nil {
+			result <- err
+			return
+		} else if message, err := v2ControlFromFrame(frame); err != nil || message.ControlType() != attachwirev2.CtrlCarrierActivate {
+			result <- fmt.Errorf("candidate did not activate: %v", err)
+			return
+		}
 		active, _ := attachwirev2.BuildControlFrame(attachwirev2.CarrierActive{PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 5})
 		if err := conn.Write(ctx, websocket.MessageBinary, active.Encode()); err != nil {
 			result <- err
@@ -41,14 +57,20 @@ func batchTestCandidate(t *testing.T, serve func(context.Context, *websocket.Con
 	}))
 	t.Cleanup(server.Close)
 	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{
-		AttachURL:         strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
-		TokenSource:       func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
-		ResumeDisposition: &V2ResumeDisposition{ProofSchemaVersion: V2ProofSchemaV2, Authority: V2ResumeSameHandoff, State: V2ResumeActive, PTYEpoch: 3, CarrierEpoch: 9, AckSeq: 5},
+		AttachURL:        strings.Replace(server.URL, "http://", "ws://", 1) + "/v2/rooms/session-v2",
+		TokenSource:      func(context.Context) (string, error) { return v2TestToken(t, nil), nil },
+		DurableHighWater: 4,
 	})
 	if err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = candidate.Close() })
+	if _, err := candidate.WaitMandatorySnapshotRequest(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if err := candidate.SendCandidateSnapshot(ctx, v2ResumeSnapshot(5).Encode()); err != nil {
+		t.Fatal(err)
+	}
 	if _, err := candidate.Activate(ctx); err != nil {
 		t.Fatal(err)
 	}
