@@ -1000,6 +1000,37 @@ func receiptPreflightNackReasonForError(err error) *receiptPreflightNackReason {
 	}
 }
 
+// NackRejectedWork reports work that an embedder claimed but could not accept.
+// The caller supplies the worker identity and runtime credential that own the
+// claim; the original work item supplies the session identity and is forwarded
+// unchanged on the NACK wire.
+//
+// The compatibility reason remains prose. Only a canonical typed admission
+// denial gains the additive receipt-preflight projection; matching error text
+// alone never grants that authority.
+func NackRejectedWork(
+	ctx context.Context,
+	client *http.Client,
+	orchestratorURL, workerID, runtimeJWT string,
+	item *PollWorkItem,
+	acceptErr error,
+) error {
+	if item == nil {
+		return errors.New("nack: original work item required")
+	}
+	return callNackEndpoint(
+		ctx,
+		client,
+		orchestratorURL,
+		item.SessionID,
+		workerID,
+		runtimeJWT,
+		fmt.Sprintf("accept work failed: %v", acceptErr),
+		receiptPreflightNackReasonForError(acceptErr),
+		item,
+	)
+}
+
 // `work` must carry the five fields the orchestrator validates as
 // `QueuedWork` (sessionId, issueId, issueIdentifier, priority,
 // queuedAt). PollWorkItem already JSON-marshals to a superset of that

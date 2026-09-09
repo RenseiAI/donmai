@@ -1713,16 +1713,14 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		item := item
 		nackCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		nackErr := callNackEndpoint(
+		nackErr := NackRejectedWork(
 			nackCtx,
 			nil, // default 10s-timeout client
 			orchestratorURL,
-			item.SessionID,
 			d.WorkerID(),
 			d.runtimeJWT(),
-			fmt.Sprintf("accept work failed: %v", err),
-			receiptPreflightNackReasonForError(err),
 			&item,
+			err,
 		)
 		if nackErr != nil {
 			slog.Warn(
