@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ---
 
+## v0.72.27 — 2026-09-09
+
+### Fixes
+
+- Keep reconciled adoption receipts synchronized across organizations so a later session launch uses the verified revision for every served scope.
+- Reconcile failed session activation through the existing ownership-loss and terminal-evidence paths. Retain capacity until the exact process incarnation is durably resolved, and reopen admission only after the matching recovery heartbeat is acknowledged.
+
+---
+
 ## v0.72.26 — 2026-09-09
 
 ### Features
