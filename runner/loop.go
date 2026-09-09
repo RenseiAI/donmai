@@ -107,6 +107,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
+	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
+	if workareaErr != nil {
+		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
+		return res, workareaErr
+	}
 	var preparedPlan *agent.PreparedHarness
 	var preparedSource agent.Spec
 	if len(selection.receipt.Bytes()) > 0 {
@@ -120,6 +125,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
+		preparedSource = ReconcileRepositorySandbox(preparedSource, repositoryDeclaration)
 		preparedSource.PreparedHarness = preparedPlan
 		harness, ok := provider.(agent.HarnessProvider)
 		if !ok {
@@ -172,11 +178,6 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	res.HarnessRef = &harnessRef
 	res.ResolverDecisions = append(res.ResolverDecisions, selection.Decisions...)
 	caps := provider.Capabilities()
-	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
-	if workareaErr != nil {
-		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
-		return res, workareaErr
-	}
 	// The DECLARED notice-delivery mechanism for this harness, read off the
 	// live manifest — never inferred from the harness's name, and never
 	// assumed. A provider with no manifest leaves it empty, which every
