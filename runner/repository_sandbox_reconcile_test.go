@@ -1,10 +1,13 @@
 package runner
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -361,5 +364,162 @@ func TestPreflightAndSpawnAgreeForHumanControlledCodexWithDeclaredRepository(t *
 	}
 	if provider.spawnCalls.Load() != 0 {
 		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
+	}
+}
+
+type repositoryAuthorityRunProvider struct {
+	mu         sync.Mutex
+	spawnCalls int
+	spawnSpec  agent.Spec
+}
+
+func (*repositoryAuthorityRunProvider) Name() agent.ProviderName { return agent.ProviderCodex }
+func (*repositoryAuthorityRunProvider) Capabilities() agent.Capabilities {
+	return codexCapabilitiesForTest()
+}
+
+func (*repositoryAuthorityRunProvider) Manifest() agent.HarnessManifest {
+	return codexManifestForTest()
+}
+
+func (p *repositoryAuthorityRunProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	applied, err := agent.PrepareHarness(spec, p.Manifest())
+	if err != nil {
+		return nil, err
+	}
+	p.mu.Lock()
+	p.spawnCalls++
+	p.spawnSpec = applied
+	p.mu.Unlock()
+	events := make(chan agent.Event, 3)
+	events <- agent.InitEvent{SessionID: "repository-authority-run"}
+	if applied.RepositoryAuthority == nil {
+		events <- agent.AssistantTextEvent{Text: "WORK_RESULT:passed"}
+	} else {
+		repositories := []agent.TurnManifestRepository{{
+			Name: "primary", Verdict: "passed", PullRequestURL: "https://github.com/example/repository/pull/1",
+		}}
+		manifest, marshalErr := json.Marshal(agent.TurnManifest{
+			SchemaVersion: ManifestSchemaVersion,
+			Verdict:       "passed",
+			Repositories:  &repositories,
+		})
+		if marshalErr != nil {
+			return nil, marshalErr
+		}
+		events <- agent.AssistantTextEvent{Text: "Intended manifest: " + string(manifest) + "\nWORK_RESULT:passed"}
+	}
+	events <- agent.ResultEvent{Success: true, Message: "controlled repository authority run completed"}
+	close(events)
+	return &repositoryAuthorityRunHandle{events: events}, nil
+}
+
+func (p *repositoryAuthorityRunProvider) Resume(ctx context.Context, _ string, spec agent.Spec) (agent.Handle, error) {
+	return p.Spawn(ctx, spec)
+}
+func (*repositoryAuthorityRunProvider) Shutdown(context.Context) error { return nil }
+
+func (p *repositoryAuthorityRunProvider) observation() (int, agent.Spec) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	return p.spawnCalls, p.spawnSpec
+}
+
+type repositoryAuthorityRunHandle struct {
+	events <-chan agent.Event
+}
+
+func (*repositoryAuthorityRunHandle) SessionID() string            { return "repository-authority-run" }
+func (h *repositoryAuthorityRunHandle) Events() <-chan agent.Event { return h.events }
+func (*repositoryAuthorityRunHandle) Inject(context.Context, string) error {
+	return agent.ErrUnsupported
+}
+func (*repositoryAuthorityRunHandle) Stop(context.Context) error { return nil }
+
+func compileRepositoryAuthorityHostReceipt(t *testing.T, registry *Registry, qw QueuedWork) json.RawMessage {
+	t.Helper()
+	detail := map[string]any{
+		"sessionId":               qw.SessionID,
+		"workerId":                qw.WorkerID,
+		"admissionReceipt":        qw.AdmissionReceipt,
+		"effectiveCell":           qw.EffectiveCell,
+		"executionRuntimeBinding": qw.ExecutionRuntimeBinding,
+		"operationalPayload":      qw.OperationalPayload,
+		"resolvedProfile":         qw.ResolvedProfile,
+	}
+	receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+	if err != nil {
+		t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
+	}
+	return receipt
+}
+
+func TestRunAdmittedReconcilesAutonomousRepositoryAuthorityBeforeEarlyApply(t *testing.T) {
+	tests := []struct {
+		name     string
+		declared bool
+	}{
+		{name: "declared repository overrides autonomous full access", declared: true},
+		{name: "no declaration retains autonomous full access", declared: false},
+	}
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			h := newRunnerHarness(t)
+			provider := &repositoryAuthorityRunProvider{}
+			if err := h.runner.registry.Register(provider); err != nil {
+				t.Fatalf("register exact provider: %v", err)
+			}
+
+			qw := h.queuedWork("AUTONOMOUS-REPOSITORY-AUTHORITY")
+			qw.ResolvedProfile = exactReceiptQueuedWork(qw.SessionID).ResolvedProfile
+			qw.PermissionProfile = PermissionProfileAutonomous
+			if test.declared {
+				qw.RepositoryDeclaration = &workarea.RepositoryDeclarationV1{
+					Protocol: workarea.ProtocolSessionRootV1,
+					Repositories: []workarea.DeclaredRepositoryV1{{
+						Source: workarea.RepositorySource{Repository: h.bareRepo}, Name: "primary",
+						Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryMutable,
+					}},
+				}
+			}
+			qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, nil))
+			operational, err := CanonicalOperationalPayload(qw)
+			if err != nil {
+				t.Fatalf("CanonicalOperationalPayload: %v", err)
+			}
+			qw.OperationalPayload = operational
+			qw.HostAdaptationReceipt = compileRepositoryAuthorityHostReceipt(t, h.runner.registry, qw)
+			admission, err := h.runner.registry.PreflightHarness(qw)
+			if err != nil {
+				t.Fatalf("PreflightHarness: %v", err)
+			}
+
+			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+			defer cancel()
+			result, err := h.runner.RunAdmitted(ctx, qw, admission)
+			spawnCalls, applied := provider.observation()
+			if err != nil {
+				t.Fatalf("RunAdmitted: %v (spawnCalls=%d)", err, spawnCalls)
+			}
+			if result.Status != "completed" || spawnCalls != 1 {
+				t.Fatalf("RunAdmitted result=%#v spawnCalls=%d, want completed/1", result, spawnCalls)
+			}
+
+			if !test.declared {
+				if applied.SandboxLevel != agent.SandboxFullAccess || applied.RepositoryAuthority != nil {
+					t.Fatalf("undeclared autonomous spec sandbox=%q authority=%#v, want full-access/nil", applied.SandboxLevel, applied.RepositoryAuthority)
+				}
+				return
+			}
+
+			authority := applied.RepositoryAuthority
+			if authority == nil || !applied.SandboxEnabled || applied.SandboxLevel != agent.SandboxWorkspaceWrite ||
+				authority.Protocol != string(workarea.ProtocolSessionRootV1) || authority.WorkareaRoot != result.WorkareaRoot ||
+				authority.SelectedPath != result.WorktreePath || len(authority.MutablePaths) != 1 || authority.MutablePaths[0] != result.WorktreePath ||
+				len(authority.ReadOnlyPaths) != 0 || authority.Enforcement != string(workarea.RepositoryAuthorityIsolatedReadOnlyV1) ||
+				applied.Cwd != result.WorktreePath {
+				t.Fatalf("declared autonomous spec=%#v result=%#v", applied, result)
+			}
+		})
 	}
 }
