@@ -310,6 +310,7 @@ type V2HostCandidate struct {
 	snapshotRequestSeen bool
 	pendingSeq          uint64
 	pendingRaw          []byte
+	pendingBatch        [][]byte
 	resumeDisposition   *V2ResumeDisposition
 	notify              chan struct{}
 	closedCh            chan struct{}
@@ -614,7 +615,7 @@ func (c *V2HostCandidate) declareHostGapWithReasonLocked(
 		return errors.New("attachclient: invalid v2 host gap")
 	}
 	c.mu.Lock()
-	if c.closed || c.resumeDisposition != nil || c.pendingSeq != 0 || c.gapPending || fromSeq != c.ackSeq+1 {
+	if c.closed || c.resumeDisposition != nil || c.pendingSeq != 0 || len(c.pendingBatch) != 0 || c.gapPending || fromSeq != c.ackSeq+1 {
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 host gap does not begin at the contiguous durable cursor")
 	}
@@ -767,6 +768,10 @@ func (c *V2HostCandidate) SendRawFrameDurable(ctx context.Context, raw []byte) e
 		c.mu.Unlock()
 		return errors.New("attachclient: v2 carrier is not active")
 	}
+	if len(c.pendingBatch) != 0 {
+		c.mu.Unlock()
+		return errors.New("attachclient: pending output batch requires exact suffix replay")
+	}
 	retryPending := c.pendingSeq != 0
 	switch {
 	case retryPending:
@@ -799,6 +804,80 @@ func (c *V2HostCandidate) SendRawFrameDurable(ctx context.Context, raw []byte) e
 	}
 	c.mu.Unlock()
 	return c.waitForAck(ctx, frame.Seq, ackVersion)
+}
+
+// DurableOutputBatchMaxFrames and DurableOutputBatchMaxBytes bound one output
+// window, including its retained exact bytes when acknowledgement is ambiguous.
+const (
+	DurableOutputBatchMaxFrames = 32
+	DurableOutputBatchMaxBytes  = 256 * 1024
+)
+
+// SendRawFramesDurable writes adjacent Output frames serially, then waits for a
+// contiguous host_ack covering the whole window. The returned high-water is
+// confirmed even on error; an unacknowledged suffix must be replayed byte-exactly
+// before any new frame or control barrier. Other frame types use the single API.
+func (c *V2HostCandidate) SendRawFramesDurable(ctx context.Context, raws [][]byte) (uint64, error) {
+	c.durableMu.Lock()
+	defer c.durableMu.Unlock()
+	c.mu.Lock()
+	floor := c.ackSeq
+	if c.closed || !c.active || c.gapPending || c.pendingSeq != 0 {
+		c.mu.Unlock()
+		return floor, errors.New("attachclient: output batch requires active carrier without a pending barrier")
+	}
+	if len(raws) == 0 || len(raws) > DurableOutputBatchMaxFrames {
+		c.mu.Unlock()
+		return floor, errors.New("attachclient: output batch exceeds frame bounds")
+	}
+	var total int
+	last := floor
+	for _, raw := range raws {
+		total += len(raw)
+		frame, err := attachwire.DecodeFrame(raw)
+		if total > DurableOutputBatchMaxBytes || err != nil || frame.Type != attachwire.TypeOutput ||
+			frame.Seq == 0 || last == ^uint64(0) || frame.Seq != last+1 {
+			c.mu.Unlock()
+			return floor, errors.New("attachclient: output batch requires bounded contiguous Output frames")
+		}
+		last = frame.Seq
+	}
+	if len(c.pendingBatch) != 0 {
+		if len(raws) != len(c.pendingBatch) {
+			c.mu.Unlock()
+			return floor, errors.New("attachclient: pending output batch replay changed suffix length")
+		}
+		for i, raw := range raws {
+			if !bytes.Equal(raw, c.pendingBatch[i]) {
+				c.mu.Unlock()
+				return floor, errors.New("attachclient: pending output batch replay changed raw bytes")
+			}
+		}
+	} else {
+		c.pendingBatch = make([][]byte, len(raws))
+		for i, raw := range raws {
+			c.pendingBatch[i] = append([]byte(nil), raw...)
+		}
+	}
+	ackVersion := c.ackVersion
+	for i, raw := range c.pendingBatch {
+		if err := c.writeRaw(ctx, raw); err != nil {
+			c.mu.Unlock()
+			// A failed write is ambiguous. Close this leg so it cannot admit a
+			// guessed suffix; re-adoption resolves the carrier-owned cursor.
+			c.fail(err)
+			return floor, fmt.Errorf("attachclient: write v2 durable output batch: %w", err)
+		}
+		if seq := floor + uint64(i) + 1; seq > c.highestSent {
+			c.highestSent = seq
+		}
+	}
+	c.mu.Unlock()
+	err := c.waitForAck(ctx, last, ackVersion)
+	c.mu.Lock()
+	acked := c.ackSeq
+	c.mu.Unlock()
+	return acked, err
 }
 
 // OnSessionEventDurable is a named alias for SendRawFrameDurable so composing
@@ -1006,6 +1085,10 @@ func (c *V2HostCandidate) acceptHostAck(message attachwirev2.HostAck) error {
 	ack := uint64(message.AckSeq)
 	if !c.active || ack < c.ackSeq || ack > c.highestSent {
 		return errors.New("attachclient: host_ack is stale, early, or beyond the exact sent stream")
+	}
+	for floor := c.ackSeq; len(c.pendingBatch) != 0 && floor < ack; floor++ {
+		c.pendingBatch[0] = nil
+		c.pendingBatch = c.pendingBatch[1:]
 	}
 	c.ackSeq = ack
 	c.ackVersion++
