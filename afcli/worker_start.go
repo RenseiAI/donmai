@@ -154,18 +154,8 @@ func runWorkerStart(flags *workerStartFlags) error {
 	// the claim POPS the item off the org queue — so advertising a lane this
 	// process does not run would drop the work outright. Merge with any
 	// operator-supplied --capabilities, deduped.
-	capabilities := worker.MergeCapabilities(flags.capabilities,
-		codesurvival.WorkTypeCodeSurvivalScan,
-		kgLane.Capability,
-	)
-
-	resp, err := c.Register(ctx, worker.RegisterRequest{
-		Hostname:     hostname,
-		PID:          os.Getpid(),
-		Version:      version,
-		Capabilities: capabilities,
-		MaxAgents:    flags.maxAgents,
-	})
+	registerRequest := workerStartRegisterRequest(flags, hostname, os.Getpid(), version, kgLane.Capability)
+	resp, err := c.Register(ctx, registerRequest)
 	if err != nil {
 		return fmt.Errorf("worker start: %w", err)
 	}
@@ -263,6 +253,21 @@ func runWorkerStart(flags *workerStartFlags) error {
 		return fmt.Errorf("worker start: %w", err)
 	}
 	return nil
+}
+
+func workerStartRegisterRequest(flags *workerStartFlags, hostname string, pid int, version, kgCapability string) worker.RegisterRequest {
+	capabilities := worker.MergeCapabilities(flags.capabilities,
+		codesurvival.WorkTypeCodeSurvivalScan,
+		kgCapability,
+	)
+	request := worker.RegisterRequest{
+		Hostname:  hostname,
+		PID:       pid,
+		Version:   version,
+		MaxAgents: flags.maxAgents,
+	}
+	request.SetCapabilityTags(capabilities)
+	return request
 }
 
 // batchHandlerMux fans a single worker.BatchHandler out to the per-work-type

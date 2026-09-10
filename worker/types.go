@@ -71,6 +71,18 @@ type RegisterRequest struct {
 	MaxAgents int `json:"max_agents,omitempty"`
 }
 
+// SetCapabilityTags sets the exact work-claim and operator-extension tags sent
+// on the established capabilities wire. These tags are a separate authority
+// axis from CapabilitiesTyped, which describes agent-runtime provider features
+// and cannot represent batch work types or arbitrary operator tags.
+//
+// The input is copied so later caller mutation cannot change a request that is
+// being registered. The deprecated exported field remains for source and wire
+// compatibility with older embedders and coordinators.
+func (r *RegisterRequest) SetCapabilityTags(tags []string) {
+	r.Capabilities = append([]string(nil), tags...)
+}
+
 // ResolveCapabilities returns a summary of the effective capability tags for
 // this registration request, implementing the "prefer typed when present"
 // migration path (ADR-002).
