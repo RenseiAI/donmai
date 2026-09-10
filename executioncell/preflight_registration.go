@@ -11,6 +11,8 @@ import (
 	"io"
 	"reflect"
 	"strings"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // MaxPreflightRegistrationReceiptBytes bounds the exact host receipt carried
@@ -109,6 +111,59 @@ func NewPreflightRegistrationRequest(binding RuntimeBinding, receipt []byte, ope
 	return request, nil
 }
 
+// ValidateHostAdaptationForRegistration applies the v2-only deep receipt
+// floor. Historical host-adaptation/v1 decoding remains unchanged for v1
+// callers; a registration request additionally requires the actual closed
+// PreparedHarness and its two exact ready receipt projections.
+func ValidateHostAdaptationForRegistration(binding RuntimeBinding, receipt []byte, operationalPayloadDigest string) error {
+	if binding.ContractVersion != RuntimeBindingV2ContractVersion || !isHex64(operationalPayloadDigest) {
+		return errors.New("executioncell: registered host adaptation requires runtime binding v2 and operational digest")
+	}
+	host, err := DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		return err
+	}
+	if host.RequestID != binding.RequestID || host.WorkerID != binding.WorkerID || host.PlacementID != binding.PlacementID || host.ClaimID != binding.ClaimID {
+		return errors.New("executioncell: registered host adaptation does not match the active binding")
+	}
+	if host.Decision == "denied" {
+		return nil
+	}
+	var plan agent.PreparedHarness
+	if err := decodeClosed(host.Plan, &plan, "prepared harness"); err != nil {
+		return err
+	}
+	if err := agent.ValidatePreparedHarness(&plan, operationalPayloadDigest); err != nil {
+		return fmt.Errorf("executioncell: registered prepared harness: %w", err)
+	}
+	if agent.DigestPreparedHarness(&plan) != host.PlanDigest {
+		return errors.New("executioncell: registered prepared harness digest mismatch")
+	}
+	var prompt agent.PromptDeliveryReceipt
+	if err := decodeClosed(host.PromptReceipt, &prompt, "prompt delivery receipt"); err != nil {
+		return err
+	}
+	if prompt.ContractVersion != agent.PromptContractVersion || strings.TrimSpace(prompt.ProfileID) == "" || prompt.Decision != "ready" {
+		return errors.New("executioncell: registered prompt delivery receipt is not ready")
+	}
+	var tool agent.ToolLifecycleReceipt
+	if err := decodeClosed(host.ToolLifecycleReceipt, &tool, "tool lifecycle receipt"); err != nil {
+		return err
+	}
+	if tool.ContractVersion != agent.ToolLifecycleContractVersion || strings.TrimSpace(tool.ProfileID) == "" || tool.Decision != "ready" || tool.OperationalPayloadDigest != operationalPayloadDigest || strings.TrimSpace(tool.AdmissionReceiptID) == "" {
+		return errors.New("executioncell: registered tool lifecycle receipt is not ready or bound")
+	}
+	if (binding.ClaimID == "" && tool.ClaimReceiptID != "") || (binding.ClaimID != "" && strings.TrimSpace(tool.ClaimReceiptID) == "") {
+		return errors.New("executioncell: registered tool lifecycle claim binding mismatch")
+	}
+	promptRaw, promptErr := json.Marshal(plan.PromptReceipt)
+	toolRaw, toolErr := json.Marshal(plan.ToolLifecycleReceipt)
+	if promptErr != nil || toolErr != nil || !bytes.Equal(promptRaw, host.PromptReceipt) || !bytes.Equal(toolRaw, host.ToolLifecycleReceipt) {
+		return errors.New("executioncell: registered nested receipts differ from the prepared harness")
+	}
+	return nil
+}
+
 // ValidatePreflightRegistrationRequest validates the complete closed request.
 func ValidatePreflightRegistrationRequest(value PreflightRegistrationRequest) error {
 	if value.ContractVersion != PreflightRegistrationContractVersion {
@@ -138,6 +193,9 @@ func ValidatePreflightRegistrationRequest(value PreflightRegistrationRequest) er
 	binding := value.RuntimeBinding
 	if host.RequestID != binding.RequestID || host.WorkerID != binding.WorkerID || host.PlacementID != binding.PlacementID || host.ClaimID != binding.ClaimID {
 		return errors.New("executioncell: preflight registration receipt binding mismatch")
+	}
+	if err := ValidateHostAdaptationForRegistration(binding, receipt, value.OperationalPayloadDigest); err != nil {
+		return err
 	}
 	return nil
 }
