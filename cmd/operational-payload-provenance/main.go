@@ -462,9 +462,13 @@ func runCommand(dir string, extraEnv []string, kind commandKind, args ...string)
 	if err != nil {
 		return nil, err
 	}
-	output, err := command.CombinedOutput()
+	// Successful stdout is structured data; toolchain diagnostics on stderr
+	// must not become part of a JSON payload or a pinned version string.
+	var diagnostics bytes.Buffer
+	command.Stderr = &diagnostics
+	output, err := command.Output()
 	if err != nil {
-		return nil, fmt.Errorf("%s %s: %w\n%s", command.Path, strings.Join(args, " "), err, output)
+		return nil, fmt.Errorf("%s %s: %w\n%s%s", command.Path, strings.Join(args, " "), err, output, diagnostics.Bytes())
 	}
 	return output, nil
 }
