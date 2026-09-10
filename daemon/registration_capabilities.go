@@ -24,6 +24,10 @@ var laneCapabilities = []string{kgextract.WorkTypeKGExtraction}
 // can truthfully advertise its closed typed reason projection.
 const receiptPreflightNackReasonCapability = "donmai.receipt-preflight-nack:reason-v1"
 
+// ExecutionPreflightRegistrationCapability is advertised only by a daemon
+// that has both a registrar and an exact-replay receipt store wired.
+const ExecutionPreflightRegistrationCapability = "execution-preflight-registration/v1"
+
 var producerCapabilities = []string{receiptPreflightNackReasonCapability}
 
 // effectiveRegistrationCapabilities computes the flat capability-tag list this
@@ -45,4 +49,21 @@ func effectiveRegistrationCapabilities(embedder []string) []string {
 		base = baseSubstrateCapabilities
 	}
 	return worker.MergeCapabilities(base, append(laneCapabilities, producerCapabilities...)...)
+}
+
+func mergePreflightRegistrationCapability(capabilities []string) []string {
+	return worker.MergeCapabilities(capabilities, ExecutionPreflightRegistrationCapability)
+}
+
+func preflightRegistrationCapabilities(capabilities []string, registrar ExecutionPreflightRegistrar, store ExecutionPreflightStore, provider ProviderRegistry) []string {
+	if registrar == nil {
+		return capabilities
+	}
+	if _, replayable := store.(ExecutionPreflightReplayStore); !replayable {
+		return capabilities
+	}
+	if _, compiles := provider.(ExecutionPreflightProvider); !compiles {
+		return capabilities
+	}
+	return mergePreflightRegistrationCapability(capabilities)
 }

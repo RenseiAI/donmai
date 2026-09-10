@@ -91,6 +91,11 @@ type Options struct {
 	// credential hooks or worker spawn. Receipt-bearing work fails closed when
 	// either the compiler or this store is absent.
 	ExecutionPreflightStore ExecutionPreflightStore
+	// ExecutionPreflightRegistrar registers an execution-runtime-binding/v2
+	// receipt with the controller after local fsync and before credentials or
+	// spawn. Nil preserves the exact v1 path and truthfully advertises no v2
+	// capability.
+	ExecutionPreflightRegistrar ExecutionPreflightRegistrar
 
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
@@ -915,6 +920,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			provides[i] = ProvideCapability{Kind: string(c.Kind)}
 		}
 		regCaps := effectiveRegistrationCapabilities(d.opts.RegistrationCapabilities)
+		regCaps = preflightRegistrationCapabilities(regCaps, d.opts.ExecutionPreflightRegistrar, d.opts.ExecutionPreflightStore, d.opts.ProviderRegistry)
 		var workareaExecutors []workarea.ExecutorCapabilityAttestation
 		if provider, ok := d.opts.ProviderRegistry.(WorkareaCapabilityProvider); ok {
 			workareaExecutors = provider.WorkareaExecutorCapabilities()
@@ -1985,7 +1991,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if (err == nil && hostReceipt.Decision != "ready") || (err != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
 			}
-			if persistErr := d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt); persistErr != nil {
+			persistedReceipt := receipt
+			var persistErr error
+			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+				persistedReceipt, persistErr = persistExecutionPreflightV2(d.opts.ExecutionPreflightStore, spec.SessionID, receipt)
+			} else {
+				persistErr = d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt)
+			}
+			if persistErr != nil {
 				persistFailure := fmt.Errorf("persist execution adaptation receipt: %w", persistErr)
 				if err != nil {
 					// A denied preflight receipt is still authoritative when its
@@ -1999,10 +2012,34 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				}
 				return nil, persistFailure
 			}
+			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+				if d.opts.ExecutionPreflightRegistrar == nil {
+					return nil, errors.New("runtime binding v2 requires a configured execution preflight registrar")
+				}
+				operationalDigest, digestErr := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+				if digestErr != nil {
+					return nil, fmt.Errorf("digest execution preflight operational payload: %w", digestErr)
+				}
+				registrationRequest, requestErr := executioncell.NewPreflightRegistrationRequest(binding, persistedReceipt, operationalDigest)
+				if requestErr != nil {
+					return nil, fmt.Errorf("build execution preflight registration: %w", requestErr)
+				}
+				registrationContext := d.landingCtx
+				if registrationContext == nil {
+					registrationContext = context.Background()
+				}
+				registrationResponse, registrationErr := d.opts.ExecutionPreflightRegistrar.RegisterExecutionPreflight(registrationContext, registrationRequest)
+				if registrationErr != nil {
+					return nil, fmt.Errorf("register execution preflight: %w", registrationErr)
+				}
+				if registrationErr = executioncell.ValidateAuthorizedPreflightRegistration(registrationRequest, registrationResponse); registrationErr != nil {
+					return nil, fmt.Errorf("execution preflight acknowledgement: %w", registrationErr)
+				}
+			}
 			if err != nil {
 				return nil, fmt.Errorf("execution adaptation preflight: %w", err)
 			}
-			detail.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
+			detail.HostAdaptationReceipt = append(json.RawMessage(nil), persistedReceipt...)
 		}
 	}
 	var detailLease sessionDetailLease

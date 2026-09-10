@@ -8,14 +8,25 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"regexp"
 	"strings"
 )
+
+var stableRuntimeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$`)
+
+func validRuntimeRef(value string) bool { return stableRuntimeRef.MatchString(value) }
 
 // RuntimeBindingContractVersion identifies the authenticated poll-to-host
 // execution target. The binding is deliberately separate from receipt and
 // effective-cell evidence: the authenticated poll claim owns these values.
 const (
 	RuntimeBindingContractVersion = "execution-runtime-binding/v1"
+	// RuntimeBindingV2ContractVersion requires controller registration of the
+	// exact fsynced host receipt before credentials or spawn.
+	RuntimeBindingV2ContractVersion = "execution-runtime-binding/v2"
+	// PreflightRegistrationContractVersion identifies both the exact receipt
+	// registration request and its authenticated acknowledgement.
+	PreflightRegistrationContractVersion = "execution-preflight-registration/v1"
 	// HostAdaptationContractVersion identifies the daemon's durable pre-credential receipt.
 	HostAdaptationContractVersion = "host-adaptation/v1"
 )
@@ -23,11 +34,20 @@ const (
 // RuntimeBinding binds receipt-bearing work to the request, current worker,
 // effective placement, and (for claim-bound work) active claim that owns it.
 type RuntimeBinding struct {
+	ContractVersion       string                    `json:"contractVersion"`
+	RequestID             string                    `json:"requestId"`
+	WorkerID              string                    `json:"workerId"`
+	PlacementID           string                    `json:"placementId"`
+	ClaimID               string                    `json:"claimId,omitempty"`
+	PreflightRegistration *PreflightRegistrationRef `json:"preflightRegistration,omitempty"`
+}
+
+// PreflightRegistrationRef is public correlation minted by the admission
+// owner. It is not a bearer capability or an independent authorization.
+type PreflightRegistrationRef struct {
 	ContractVersion string `json:"contractVersion"`
-	RequestID       string `json:"requestId"`
-	WorkerID        string `json:"workerId"`
-	PlacementID     string `json:"placementId"`
-	ClaimID         string `json:"claimId,omitempty"`
+	Required        bool   `json:"required"`
+	ChallengeID     string `json:"challengeId"`
 }
 
 // HostAdaptationReceipt is the secret-free ready-or-denied envelope produced
@@ -101,11 +121,23 @@ func DecodeRuntimeBinding(raw []byte) (RuntimeBinding, error) {
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return RuntimeBinding{}, errors.New("executioncell: runtime binding has trailing JSON")
 	}
-	if value.ContractVersion != RuntimeBindingContractVersion {
+	if value.ContractVersion != RuntimeBindingContractVersion && value.ContractVersion != RuntimeBindingV2ContractVersion {
 		return RuntimeBinding{}, fmt.Errorf("executioncell: unsupported runtime binding version %q", value.ContractVersion)
 	}
 	if strings.TrimSpace(value.RequestID) == "" || strings.TrimSpace(value.WorkerID) == "" || strings.TrimSpace(value.PlacementID) == "" {
 		return RuntimeBinding{}, errors.New("executioncell: runtime binding requestId, workerId, and placementId are required")
+	}
+	if value.ContractVersion == RuntimeBindingContractVersion {
+		if value.PreflightRegistration != nil {
+			return RuntimeBinding{}, errors.New("executioncell: runtime binding v1 cannot require preflight registration")
+		}
+		return value, nil
+	}
+	registration := value.PreflightRegistration
+	if registration == nil || registration.ContractVersion != PreflightRegistrationContractVersion || !registration.Required ||
+		!validRuntimeRef(value.RequestID) || !validRuntimeRef(value.WorkerID) || !validRuntimeRef(value.PlacementID) ||
+		(value.ClaimID != "" && !validRuntimeRef(value.ClaimID)) || !validRuntimeRef(registration.ChallengeID) {
+		return RuntimeBinding{}, errors.New("executioncell: runtime binding v2 requires exact preflight registration")
 	}
 	return value, nil
 }
