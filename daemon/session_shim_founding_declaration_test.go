@@ -14,10 +14,14 @@ package daemon
 import (
 	"context"
 	"errors"
+	"fmt"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
+	"time"
 )
 
 var errHostAuthorityUnknown = errors.New("host authority unknown: no primary receipt has been delivered")
@@ -128,6 +132,80 @@ func TestFoundingDeclarationResolvesHostAuthorityBeforeReadinessIsAsked(t *testi
 	if state := h.daemon.State(); state != StateRunning {
 		t.Fatalf("daemon state after the install = %q, want %q", state, StateRunning)
 	}
+}
+
+// TestPollRefusalDoesNotReconcileDuringFoundingDeclaration pins the real
+// daemon poll callback while a deferred composition is still founding its
+// authority. The control plane correctly refuses claims until adoption is
+// published; that refusal is not evidence of a stale committed projection.
+//
+// Before the founding receipt is retained, reconciliation cannot resolve the
+// primary host and its ResolveNow readiness check asks the embedder a question
+// the declaration itself is still answering. The poll callback must therefore
+// defer this one trigger. Once the composition is installed, the same callback
+// remains the ordinary fail-closed recovery path.
+func TestPollRefusalDoesNotReconcileDuringFoundingDeclaration(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	embedder := &foundingEmbedder{}
+	pollRefusal := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		http.Error(w, "SESSION_SHIM_ADOPTION_NOT_READY", http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(pollRefusal.Close)
+	cfg := h.composedConfig(acceptingBatch)
+	cfg.GetCarrierProofV2Readiness = embedder.readiness
+	cfg.AcquireRecoveryScopes = func(
+		cbCtx context.Context, attestation SessionShimHostAttestation, primary SessionShimScopeCredentialReceipt,
+	) ([]SessionShimScopeCredentialReceipt, error) {
+		if h.daemon.poller == nil || h.daemon.poller.opts.OnSessionShimAdoptionNotReady == nil {
+			return nil, errors.New("daemon poll refusal callback is not wired")
+		}
+		// Drive the actual 503 classifier and the daemon callback it wires,
+		// while the primary receipt is still being founded and before this
+		// wrapper delivers it to the embedder below.
+		poll := NewPollService(PollOptions{
+			WorkerID:                      "founding-poll",
+			RuntimeJWT:                    "founding-poll-jwt",
+			OrchestratorURL:               pollRefusal.URL,
+			OnWork:                        func(PollWorkItem) error { return nil },
+			OnSessionShimAdoptionNotReady: h.daemon.poller.opts.OnSessionShimAdoptionNotReady,
+		})
+		poll.pollOnce(cbCtx)
+		if got := h.daemon.reconcilingScopes(); got != 0 {
+			return nil, fmt.Errorf("poll refusal armed %d reconciliation pass(es) before founding authority installed", got)
+		}
+		if h.daemon.sessionShimReadinessWithdrawn.Load() {
+			return nil, errors.New("poll refusal withdrew proof-v2 readiness before founding authority installed")
+		}
+		return embedder.acquireRecoveryScopes(cbCtx, attestation, primary)
+	}
+
+	if err := h.daemon.InstallSessionShimComposition(ctx, cfg); err != nil {
+		t.Fatalf("composition install after founding poll refusal: %v", err)
+	}
+	if h.daemon.SessionShimCompositionPending() || !h.daemon.SessionShimAdoptionComplete() {
+		t.Fatalf("composition after founding poll refusal: pending=%v adoptionComplete=%v",
+			h.daemon.SessionShimCompositionPending(), h.daemon.SessionShimAdoptionComplete())
+	}
+	if h.daemon.sessionShimReadinessWithdrawn.Load() {
+		t.Fatal("founding poll refusal left proof-v2 readiness withdrawn")
+	}
+	if embedder.readinessCalls.Load() == 0 {
+		t.Fatal("founding install never performed its deferred readiness check")
+	}
+
+	// Control: after founding authority and adoption are installed, the exact
+	// same poll callback must still reconcile and withdraw on a definite
+	// readiness refusal. Deferring the founding trigger must not mask ordinary
+	// post-install revocation.
+	embedder.refuseReadiness.Store(true)
+	h.daemon.poller.opts.OnSessionShimAdoptionNotReady()
+	waitForCondition(t, 5*time.Second, "post-install poll refusal to withdraw readiness", func() bool {
+		return h.daemon.sessionShimReadinessWithdrawn.Load()
+	})
 }
 
 // TestAcquireRecoveryScopesReceivesTheDeclarationsPrimaryReceipt pins what the
