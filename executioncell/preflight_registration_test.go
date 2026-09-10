@@ -43,13 +43,16 @@ func TestDecodeRuntimeBindingVersions(t *testing.T) {
 		t.Fatalf("v1 changed: %v", err)
 	}
 	for name, raw := range map[string][]byte{
-		"v1 with registration":    mustJSON(t, RuntimeBinding{ContractVersion: RuntimeBindingContractVersion, RequestID: "r", WorkerID: "w", PlacementID: "p", PreflightRegistration: runtimeBindingV2().PreflightRegistration}),
-		"v2 missing registration": []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c"}`),
-		"v2 required false":       []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":false,"challengeId":"x"}}`),
-		"v2 nested unknown":       []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x","extra":1}}`),
-		"v2 duplicate challenge":  []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x","challengeId":"y"}}`),
-		"v2 unstable request":     []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"../r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x"}}`),
-		"v2 whitespace challenge": []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":" "}}`),
+		"v1 with registration":      mustJSON(t, RuntimeBinding{ContractVersion: RuntimeBindingContractVersion, RequestID: "r", WorkerID: "w", PlacementID: "p", PreflightRegistration: runtimeBindingV2().PreflightRegistration}),
+		"v1 with null registration": []byte(`{"contractVersion":"execution-runtime-binding/v1","requestId":"r","workerId":"w","placementId":"p","preflightRegistration":null}`),
+		"v1 with null claim":        []byte(`{"contractVersion":"execution-runtime-binding/v1","requestId":"r","workerId":"w","placementId":"p","claimId":null}`),
+		"v2 missing registration":   []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c"}`),
+		"v2 null claim":             []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":null,"preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x"}}`),
+		"v2 required false":         []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":false,"challengeId":"x"}}`),
+		"v2 nested unknown":         []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x","extra":1}}`),
+		"v2 duplicate challenge":    []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x","challengeId":"y"}}`),
+		"v2 unstable request":       []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"../r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"x"}}`),
+		"v2 whitespace challenge":   []byte(`{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","claimId":"c","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":" "}}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := DecodeRuntimeBinding(raw); err == nil {
@@ -125,9 +128,11 @@ func TestPreflightRegistrationResponseClosedAndExact(t *testing.T) {
 		t.Fatalf("response decode = %+v, %v", decoded, err)
 	}
 	for name, raw := range map[string][]byte{
-		"unknown":   append(mustJSON(t, response)[:len(mustJSON(t, response))-1], []byte(`,"extra":true}`)...),
-		"duplicate": []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"refused","decision":"authorized","code":"claim_retired"}`),
-		"missing":   []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"authorized"}`),
+		"unknown":                           append(mustJSON(t, response)[:len(mustJSON(t, response))-1], []byte(`,"extra":true}`)...),
+		"duplicate":                         []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"refused","decision":"authorized","code":"claim_retired"}`),
+		"missing":                           []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"authorized"}`),
+		"authorized null code":              []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"authorized","registrationId":"reg","receiptSha256":"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa","runtimeBinding":{"contractVersion":"execution-runtime-binding/v2","requestId":"r","workerId":"w","placementId":"p","preflightRegistration":{"contractVersion":"execution-preflight-registration/v1","required":true,"challengeId":"c"}},"authorizationRevision":1,"code":null}`),
+		"refused null authorization fields": []byte(`{"contractVersion":"execution-preflight-registration/v1","decision":"refused","code":"claim_retired","registrationId":null,"receiptSha256":null,"runtimeBinding":null,"authorizationRevision":null}`),
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := DecodePreflightRegistrationResponse(raw); err == nil {
