@@ -242,7 +242,11 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 				AuthDelivery: string(executioncell.DeliveryEnvironment), Mechanism: agent.AuthAPIKey,
 			},
 		}
-		qw = attachAdmittedExecutionCellForTest(t, qw, fakeDecoratorReceiptCell())
+		cell := fakeDecoratorReceiptCell()
+		if cfg.CapabilityRealizations != nil {
+			cell.GrantedCapabilities = []executioncell.CapabilityRequirement{{Name: "example.workflow-authoring/v1", ParametersDigest: strings.Repeat("9", 64)}}
+		}
+		qw = attachAdmittedExecutionCellForTest(t, qw, cell)
 		operational, err := runner.CanonicalOperationalPayload(qw)
 		if err != nil {
 			t.Fatal(err)
@@ -296,6 +300,21 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 		plan := compile(t, Config{AgentSpecExtensionDecorator: decorate})
 		if !hasAdditionalExtensionsEntry(plan) {
 			t.Fatalf("Config.AgentSpecExtensionDecorator did not reach daemonProviderView's compiled receipt: entries=%+v", plan.ToolLifecycleReceipt.Entries)
+		}
+	})
+
+	t.Run("realization registry reaches daemon preflight", func(t *testing.T) {
+		declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.workflow-authoring/v1", HarnessID: testFakeDecoratorHarnessName, AdapterVersion: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous, RecipeID: "example/session-mcp/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true}}, DeclaredSurface: agent.CapabilityDeclaredSurface{MCPServerNames: []string{"donmai-platform"}, MCPToolNames: []string{"draft_create"}}, Evidence: agent.CapabilityRealizationEvidence{FixtureID: "real-binary", FixtureDigest: strings.Repeat("a", 64), Tier: agent.RealizationEvidenceRealBinary}})
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry, err := agent.NewCapabilityRealizationRegistry([]agent.CapabilityRealizationDeclaration{declaration})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := compile(t, Config{CapabilityRealizations: registry})
+		if len(plan.ToolLifecycleReceipt.CapabilityRealizations) != 1 || plan.ToolLifecycleReceipt.CapabilityRealizations[0].Decision != "ready" {
+			t.Fatalf("Config.CapabilityRealizations did not reach daemon preflight: %+v", plan.ToolLifecycleReceipt.CapabilityRealizations)
 		}
 	})
 }

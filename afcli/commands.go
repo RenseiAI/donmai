@@ -109,6 +109,11 @@ type Config struct {
 	// no behavior change).
 	AgentSpecExtensionDecorator agent.ExtensionDecorator
 
+	// CapabilityRealizations is the immutable downstream realization snapshot
+	// shared by daemon preflight and the spawned child runner. Nil preserves the
+	// historical capability set and wire bytes.
+	CapabilityRealizations *agent.CapabilityRealizationRegistry
+
 	// EnableA2AClient registers the formal A2A v1 client command group. It is
 	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
 	// command using the same noun before enabling the public surface.
