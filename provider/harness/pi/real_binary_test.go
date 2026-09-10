@@ -464,9 +464,47 @@ func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	}
 }
 
+func TestWaitRealPiQueueFiltersUnrelatedSnapshots(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		updates   []map[string]any
+		wantError bool
+	}{
+		{name: "empty and unrelated before accepted nonce", updates: []map[string]any{
+			{"steering": []string{}, "followUp": []string{}},
+			{"steering": []string{"another message"}, "followUp": []string{"unrelated"}},
+			{"steering": []string{steerNonce}, "followUp": []string{}},
+		}},
+		{name: "wrong queue before later correct queue", wantError: true, updates: []map[string]any{
+			{"steering": []string{}, "followUp": []string{steerNonce}},
+			{"steering": []string{steerNonce}, "followUp": []string{}},
+		}},
+		{name: "nonce in both queues", wantError: true, updates: []map[string]any{
+			{"steering": []string{steerNonce}, "followUp": []string{steerNonce}},
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			body := getStateResponse("queue-observation")
+			for _, update := range tc.updates {
+				update["type"] = "queue_update"
+				body += event(update)
+			}
+			_, h, err := spawnScripted(t, agent.Spec{Prompt: "queue observation"}, handshakeEvent("queue-handshake"), body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = h.Stop(context.Background()) })
+			err = waitRealPiQueue(context.Background(), h, "steering", steerNonce)
+			if (err != nil) != tc.wantError {
+				t.Fatalf("queue observation error=%v, wantError=%v", err, tc.wantError)
+			}
+		})
+	}
+}
+
 // waitRealPiSystem observes native events from the real child. A command write
 // alone does not prove the child has accepted it before the endpoint settles.
-func waitRealPiSystem(ctx context.Context, h agent.Handle, subtype string, check func(agent.SystemEvent) error) error {
+func waitRealPiSystem(ctx context.Context, h agent.Handle, subtype string, check func(agent.SystemEvent) (bool, error)) error {
 	timer := time.NewTimer(20 * time.Second)
 	defer timer.Stop()
 	for {
@@ -483,7 +521,13 @@ func waitRealPiSystem(ctx context.Context, h agent.Handle, subtype string, check
 			}
 			if system, ok := event.(agent.SystemEvent); ok && system.Subtype == subtype {
 				if check != nil {
-					return check(system)
+					matched, err := check(system)
+					if err != nil {
+						return err
+					}
+					if !matched {
+						continue
+					}
 				}
 				return nil
 			}
@@ -496,28 +540,38 @@ func waitRealPiSystem(ctx context.Context, h agent.Handle, subtype string, check
 }
 
 func waitRealPiQueue(ctx context.Context, h agent.Handle, queue, nonce string) error {
-	return waitRealPiSystem(ctx, h, "queue_update", func(event agent.SystemEvent) error {
+	if queue != "steering" && queue != "followUp" {
+		return fmt.Errorf("unknown native queue %q", queue)
+	}
+	return waitRealPiSystem(ctx, h, "queue_update", func(event agent.SystemEvent) (bool, error) {
 		raw, ok := event.Raw.(string)
 		if !ok {
-			return fmt.Errorf("queue_update has no native JSON payload")
+			return false, fmt.Errorf("queue_update has no native JSON payload")
 		}
 		var update struct {
 			Steering []string `json:"steering"`
 			FollowUp []string `json:"followUp"`
 		}
 		if err := json.Unmarshal([]byte(raw), &update); err != nil {
-			return fmt.Errorf("decode native queue_update: %w", err)
+			return false, fmt.Errorf("decode native queue_update: %w", err)
 		}
-		messages := update.Steering
+		messages, other := update.Steering, update.FollowUp
 		if queue == "followUp" {
-			messages = update.FollowUp
+			messages, other = update.FollowUp, update.Steering
+		}
+		for _, message := range other {
+			if strings.Contains(message, nonce) {
+				return false, fmt.Errorf("injected nonce entered the wrong native queue (wanted %s): %+v", queue, update)
+			}
 		}
 		for _, message := range messages {
 			if strings.Contains(message, nonce) {
-				return nil
+				return true, nil
 			}
 		}
-		return fmt.Errorf("native %s queue did not accept injected nonce: %+v", queue, update)
+		// Pi also emits snapshots on consumption; an earlier empty/unrelated
+		// update is not an acknowledgement of this injected message.
+		return false, nil
 	})
 }
 
