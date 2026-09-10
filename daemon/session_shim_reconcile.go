@@ -175,6 +175,18 @@ func (d *Daemon) scheduleSessionShimReconciliation(scope, cause string) {
 		d.sessionShimConfig().OnAdoptionBatch == nil {
 		return
 	}
+	// A poll refusal while a deferred composition is founding authority means
+	// exactly that: claims stay closed until the initial adoption publishes.
+	// It is not a refusal of an already-committed projection. Reconciliation's
+	// ResolveNow check would ask the embedder for proof before the founding
+	// receipt exists and withdraw readiness, stranding the very adoption that
+	// would make the host eligible. Once installation completes the pending flag
+	// clears, so ordinary poll refusals keep their fail-closed reconciliation.
+	if cause == sessionShimReconcileCausePollRefused && d.SessionShimCompositionPending() {
+		slog.Info("session shim: deferring poll-refusal reconciliation until founding composition completes",
+			"scope", scope)
+		return
+	}
 	d.shims.mu.Lock()
 	if d.shims.reconcileStopped || d.shims.reconciling[scope] {
 		d.shims.mu.Unlock()
