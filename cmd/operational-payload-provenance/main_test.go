@@ -225,3 +225,53 @@ func signedArtifact(t *testing.T, value artifact) []byte {
 	}
 	return encoded
 }
+
+func TestRunCommandSeparatesStructuredStdoutFromDiagnostics(t *testing.T) {
+	for _, tc := range []struct {
+		name    string
+		failure bool
+	}{{"success", false}, {"failure", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := t.TempDir()
+			probeDir := filepath.Join(dir, "cmd", "pinned-operational-payload-probe")
+			if err := os.MkdirAll(probeDir, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module probecontrol\n\ngo 1.26\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			source := `package main
+import ("fmt"; "os")
+func main() {
+ fmt.Fprintln(os.Stdout, "{\"ok\":true}")
+ fmt.Fprintln(os.Stderr, "build diagnostic control")
+`
+			if tc.failure {
+				source += "os.Exit(3)\n"
+			}
+			source += "}\n"
+			if err := os.WriteFile(filepath.Join(probeDir, "main.go"), []byte(source), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			output, err := runCommand(dir, []string{"GOWORK=off"}, commandGo, "run", "./cmd/pinned-operational-payload-probe", filepath.Join(dir, "pinned-poll-item.json"), filepath.Join(dir, "pinned-forged-poll-item.json"))
+			if tc.failure {
+				if err == nil || !strings.Contains(err.Error(), "build diagnostic control") || !strings.Contains(err.Error(), "exit status") {
+					t.Fatalf("missing command failure diagnostic: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			var result struct {
+				OK bool `json:"ok"`
+			}
+			if err := json.Unmarshal(output, &result); err != nil {
+				t.Fatalf("stdout contaminated by diagnostics: %q: %v", output, err)
+			}
+			if !result.OK {
+				t.Fatalf("lost structured output: %q", output)
+			}
+		})
+	}
+}

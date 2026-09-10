@@ -3,6 +3,9 @@ package afcli
 import (
 	"bytes"
 	"context"
+	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 	"time"
@@ -218,6 +221,43 @@ func TestWorkerStartCapabilities(t *testing.T) {
 				t.Fatalf("capabilities(%v) = %v, want %v", tc.operator, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestWorkerStartRegistrationCarriesExactCapabilityTags(t *testing.T) {
+	t.Parallel()
+
+	var captured struct {
+		Capabilities      []string                                 `json:"capabilities"`
+		CapabilitiesTyped *worker.AgentRuntimeProviderCapabilities `json:"capabilities_typed"`
+	}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != "/api/workers/register" {
+			http.NotFound(w, request)
+			return
+		}
+		if err := json.NewDecoder(request.Body).Decode(&captured); err != nil {
+			t.Errorf("decode register request: %v", err)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"worker_id":"worker-capability-test","runtime_jwt":"runtime-test","heartbeat_interval_seconds":30}`))
+	}))
+	t.Cleanup(server.Close)
+
+	request := workerStartRegisterRequest(&workerStartFlags{
+		capabilities: []string{"gpu", kgextract.WorkTypeKGExtraction},
+		maxAgents:    3,
+	}, "worker-capability-test", 42, "test", kgextract.WorkTypeKGExtraction)
+	client := worker.NewClient(server.URL, "rsp_test_capability_tags")
+	if _, err := client.Register(context.Background(), request); err != nil {
+		t.Fatalf("register: %v", err)
+	}
+
+	if got, want := strings.Join(captured.Capabilities, ","), "gpu,kg-extraction,code-survival-scan"; got != want {
+		t.Fatalf("registered capabilities = %q, want %q", got, want)
+	}
+	if captured.CapabilitiesTyped != nil {
+		t.Fatalf("registered capabilities_typed = %+v, want absent", captured.CapabilitiesTyped)
 	}
 }
 
