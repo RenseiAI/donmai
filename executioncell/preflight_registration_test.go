@@ -154,6 +154,30 @@ func TestPreflightRegistrationRequestRejectsMalformedNestedHostAuthority(t *test
 			prompt.ProfileID = "different-profile"
 			receipt.PromptReceipt = mustJSON(t, prompt)
 		},
+		"invalid authority digest": func(receipt *HostAdaptationReceipt) {
+			var plan agent.PreparedHarness
+			if err := json.Unmarshal(receipt.Plan, &plan); err != nil {
+				t.Fatal(err)
+			}
+			plan.AuthorityDigest = "not-a-digest"
+			receipt.Plan = mustJSON(t, plan)
+			digest := sha256.Sum256(receipt.Plan)
+			receipt.PlanDigest = hex.EncodeToString(digest[:])
+		},
+		"ready prompt hides required denial": func(receipt *HostAdaptationReceipt) {
+			var plan agent.PreparedHarness
+			if err := json.Unmarshal(receipt.Plan, &plan); err != nil {
+				t.Fatal(err)
+			}
+			plan.PromptReceipt.Entries = []agent.PromptDeliveryEntry{{
+				ID: "required-role", Channel: agent.PromptChannelRoleIntent, Required: true,
+				Outcome: agent.PromptOutcomeDenied, DenialCode: agent.PromptDenialDeliveryUnsupported,
+			}}
+			receipt.Plan = mustJSON(t, plan)
+			digest := sha256.Sum256(receipt.Plan)
+			receipt.PlanDigest = hex.EncodeToString(digest[:])
+			receipt.PromptReceipt = mustJSON(t, plan.PromptReceipt)
+		},
 	}
 	for name, mutate := range cases {
 		t.Run(name, func(t *testing.T) {

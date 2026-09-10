@@ -454,3 +454,142 @@ func ValidatePreparedHarness(plan *PreparedHarness, operationalDigest string) er
 	}
 	return nil
 }
+
+// ValidatePreparedHarnessRegistration adds the strict semantic floor required
+// when a v2 controller registration turns persisted host evidence into start
+// authority. The historical v1 materialization validator above is unchanged.
+func ValidatePreparedHarnessRegistration(plan *PreparedHarness, operationalDigest string) error {
+	if err := ValidatePreparedHarness(plan, operationalDigest); err != nil {
+		return err
+	}
+	if !sha256HexPattern.MatchString(plan.AuthorityDigest) {
+		return errors.New("agent: prepared harness authority digest is invalid")
+	}
+	for field, digest := range plan.AuthorityFieldDigests {
+		if strings.TrimSpace(field) == "" || !sha256HexPattern.MatchString(digest) {
+			return errors.New("agent: prepared harness field digest is invalid")
+		}
+	}
+	if err := validatePromptReceiptForRegistration(plan.PromptReceipt); err != nil {
+		return err
+	}
+	if err := validateToolReceiptForRegistration(plan.ToolLifecycleReceipt); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validatePromptReceiptForRegistration(receipt PromptDeliveryReceipt) error {
+	if receipt.ContractVersion != PromptContractVersion || strings.TrimSpace(receipt.ProfileID) == "" || receipt.Decision != "ready" {
+		return errors.New("agent: registered prompt receipt is not ready")
+	}
+	seen := map[string]bool{}
+	for _, entry := range receipt.Entries {
+		if strings.TrimSpace(entry.ID) == "" || seen[entry.ID] || !knownPromptReceiptChannel(entry.Channel) ||
+			!knownPromptReceiptOutcome(entry.Outcome) ||
+			(entry.Delivery != "" && !knownPromptDelivery(entry.Delivery)) ||
+			(entry.BaseInstructionStrategy != "" && entry.BaseInstructionStrategy != BaseInstructionsPreserve && entry.BaseInstructionStrategy != BaseInstructionsAppend && entry.BaseInstructionStrategy != BaseInstructionsReplace) ||
+			(entry.ContentDigest != "" && !validPromptReceiptDigest(entry.ContentDigest)) ||
+			(entry.DenialCode != "" && !knownPromptReceiptDenial(entry.DenialCode)) {
+			return errors.New("agent: registered prompt receipt entry is invalid")
+		}
+		seen[entry.ID] = true
+		if entry.Outcome == PromptOutcomeDenied {
+			if entry.Required || entry.DenialCode == "" || entry.Delivery != "" {
+				return errors.New("agent: registered ready prompt receipt hides a required denial")
+			}
+			continue
+		}
+		if entry.DenialCode != "" || entry.Delivery == "" || entry.Delivery == PromptDeliveryUnsupported {
+			return errors.New("agent: registered prompt receipt outcome is incomplete")
+		}
+		if entry.Outcome == PromptOutcomeDowngraded && strings.TrimSpace(entry.DowngradeAuthID) == "" {
+			return errors.New("agent: registered prompt downgrade lacks authority")
+		}
+	}
+	return nil
+}
+
+func validPromptReceiptDigest(digest string) bool {
+	return strings.HasPrefix(digest, "sha256:") && sha256HexPattern.MatchString(strings.TrimPrefix(digest, "sha256:"))
+}
+
+func knownPromptReceiptChannel(channel PromptChannel) bool {
+	switch channel {
+	case PromptChannelHarnessProtocol, PromptChannelBaseInstructions, PromptChannelRoleIntent,
+		PromptChannelInitialContext, PromptChannelUserPrompt, PromptChannelUserAmendment:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownPromptReceiptOutcome(outcome PromptDeliveryOutcome) bool {
+	switch outcome {
+	case PromptOutcomePreserved, PromptOutcomeDelivered, PromptOutcomeDowngraded, PromptOutcomeDenied:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownPromptReceiptDenial(code PromptDenialCode) bool {
+	switch code {
+	case PromptDenialUnsupportedContract, PromptDenialMalformedPlan, PromptDenialUnsupportedStrategy,
+		PromptDenialReplacementAuth, PromptDenialDeliveryUnsupported, PromptDenialDowngradeUnauthorized,
+		PromptDenialApplicationFailed:
+		return true
+	default:
+		return false
+	}
+}
+
+func validateToolReceiptForRegistration(receipt ToolLifecycleReceipt) error {
+	if receipt.ContractVersion != ToolLifecycleContractVersion || strings.TrimSpace(receipt.ProfileID) == "" ||
+		receipt.Decision != "ready" || strings.TrimSpace(receipt.EvidenceTier) == "" {
+		return errors.New("agent: registered tool lifecycle receipt is not ready")
+	}
+	seen := map[string]bool{}
+	for _, entry := range receipt.Entries {
+		if strings.TrimSpace(entry.ID) == "" || seen[entry.ID] || !isKnownToolLifecycleChannel(entry.Channel) ||
+			!knownToolReceiptOutcome(entry.Outcome) ||
+			(entry.Delivery != "" && !isKnownToolDelivery(entry.Delivery)) ||
+			(entry.InputDigest != "" && !sha256DigestPattern.MatchString(entry.InputDigest)) ||
+			(entry.DenialCode != "" && !knownToolReceiptDenial(entry.DenialCode)) {
+			return errors.New("agent: registered tool lifecycle receipt entry is invalid")
+		}
+		seen[entry.ID] = true
+		if entry.Outcome == ToolOutcomeDenied {
+			if entry.Required || entry.DenialCode == "" || entry.Delivery != "" {
+				return errors.New("agent: registered ready tool lifecycle receipt hides a required denial")
+			}
+			continue
+		}
+		if entry.DenialCode != "" || entry.Delivery == "" || entry.Delivery == ToolDeliveryUnsupported {
+			return errors.New("agent: registered tool lifecycle receipt outcome is incomplete")
+		}
+		if entry.Outcome == ToolOutcomeDowngraded && strings.TrimSpace(entry.FallbackAuthID) == "" {
+			return errors.New("agent: registered tool lifecycle downgrade lacks authority")
+		}
+	}
+	return nil
+}
+
+func knownToolReceiptOutcome(outcome ToolAdaptationOutcome) bool {
+	switch outcome {
+	case ToolOutcomeAdmitted, ToolOutcomePendingRuntime, ToolOutcomePendingCleanup, ToolOutcomeDenied, ToolOutcomeDowngraded:
+		return true
+	default:
+		return false
+	}
+}
+
+func knownToolReceiptDenial(code ToolAdaptationDenialCode) bool {
+	switch code {
+	case ToolDenialUnsupportedContract, ToolDenialMalformedPlan, ToolDenialDeliveryUnsupported,
+		ToolDenialDowngradeUnauthorized, ToolDenialApplicationFailed:
+		return true
+	default:
+		return false
+	}
+}
