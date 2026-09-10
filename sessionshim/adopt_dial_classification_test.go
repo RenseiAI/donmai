@@ -162,90 +162,221 @@ func startPostHelloStallProxy(t *testing.T, path, target string, stallThrough in
 	return proxy
 }
 
-// postWelcomeAdoptedLossProxy forwards the first Hello and Welcome to a real
-// shim, consumes its Adopted commit, and withholds that commit from the first
-// controller. The first controller therefore times out after the shim has
-// already advanced its all-time generation. A later connection must prepare
-// against the new authenticated Hello floor; replaying the old Welcome is
-// correctly stale.
-type postWelcomeAdoptedLossProxy struct {
-	connections atomic.Int32
-
-	mu       sync.Mutex
-	previous func()
+// postWelcomeAdoptedLossProxy observes a real committed Adopted frame before
+// dropping it. The controller receives EOF, not a clock-driven stall. The
+// first exchange finishes before the proxy accepts the healthy retry.
+type postWelcomeExchange struct {
+	Hello   shimwire.Hello
+	Welcome shimwire.Welcome
+	Adopted shimwire.Adopted
+	Dropped bool
 }
 
-func (p *postWelcomeAdoptedLossProxy) releasePrevious() {
+type postWelcomeAdoptedLossProxy struct {
+	connections atomic.Int32
+	mu          sync.Mutex
+	conns       []net.Conn
+	closed      bool
+	exchanges   []postWelcomeExchange
+	err         error
+	wg          sync.WaitGroup
+}
+
+func (p *postWelcomeAdoptedLossProxy) track(conn net.Conn) {
 	p.mu.Lock()
-	release := p.previous
-	p.previous = nil
-	p.mu.Unlock()
-	if release != nil {
-		release()
+	defer p.mu.Unlock()
+	if p.closed {
+		_ = conn.Close()
+		return
+	}
+	p.conns = append(p.conns, conn)
+}
+
+func (p *postWelcomeAdoptedLossProxy) observe(exchange postWelcomeExchange) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	p.exchanges = append(p.exchanges, exchange)
+}
+
+func (p *postWelcomeAdoptedLossProxy) fail(err error) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	if p.err == nil {
+		p.err = err
 	}
 }
 
-func (p *postWelcomeAdoptedLossProxy) retainPrevious(release func()) {
+func (p *postWelcomeAdoptedLossProxy) observations() ([]postWelcomeExchange, error) {
 	p.mu.Lock()
-	p.previous = release
-	p.mu.Unlock()
+	defer p.mu.Unlock()
+	return append([]postWelcomeExchange(nil), p.exchanges...), p.err
 }
 
-func startPostWelcomeAdoptedLossProxy(t *testing.T, path, target string) *postWelcomeAdoptedLossProxy {
+func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, target string, dropFirst bool) *postWelcomeAdoptedLossProxy {
 	t.Helper()
 	listener, err := net.Listen("unix", path)
 	if err != nil {
-		t.Fatalf("listen on the interposing socket: %v", err)
+		t.Fatalf("listen on interposing socket: %v", err)
 	}
 	proxy := &postWelcomeAdoptedLossProxy{}
 	t.Cleanup(func() {
 		_ = listener.Close()
-		proxy.releasePrevious()
+		proxy.mu.Lock()
+		proxy.closed = true
+		for _, conn := range proxy.conns {
+			_ = conn.Close()
+		}
+		proxy.mu.Unlock()
+		proxy.wg.Wait()
 	})
+	dial := func() (net.Conn, error) {
+		conn, dialErr := (&net.Dialer{}).DialContext(ctx, "unix", target)
+		if dialErr == nil {
+			proxy.track(conn)
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = conn.SetDeadline(deadline)
+			}
+		}
+		return conn, dialErr
+	}
+	// Actual Hello is the setup readiness barrier. It is never synthesized or
+	// re-encoded, and the tested controller retains its unchanged dial budget.
+	firstUpstream, err := dial()
+	if err != nil {
+		t.Fatalf("connect first real shim: %v", err)
+	}
+	firstReader := shimwire.NewReader(firstUpstream)
+	firstHello, err := firstReader.Read()
+	if err != nil || firstHello.Type != shimwire.TypeHello {
+		t.Fatalf("first real Hello: type=%s error=%v", firstHello.Type, err)
+	}
+	proxy.wg.Add(1)
 	go func() {
+		defer proxy.wg.Done()
 		for {
 			client, acceptErr := listener.Accept()
 			if acceptErr != nil {
 				return
 			}
-			proxy.releasePrevious()
-			if proxy.connections.Add(1) > 1 {
-				go proxyConnection(client, target)
-				continue
+			proxy.track(client)
+			if deadline, ok := ctx.Deadline(); ok {
+				_ = client.SetDeadline(deadline)
 			}
-			upstream, dialErr := net.Dial("unix", target)
-			if dialErr != nil {
-				_ = client.Close()
-				continue
-			}
-			go func() {
-				upstreamReader := shimwire.NewReader(upstream)
-				clientWriter := shimwire.NewWriter(client)
-				hello, readErr := upstreamReader.Read()
-				if readErr != nil || hello.Type != shimwire.TypeHello || clientWriter.WriteMessage(hello) != nil {
+			number := proxy.connections.Add(1)
+			upstream, reader, hello := firstUpstream, firstReader, firstHello
+			if number > 1 {
+				var dialErr error
+				upstream, dialErr = dial()
+				if dialErr != nil {
+					proxy.fail(fmt.Errorf("retry upstream dial: %w", dialErr))
+					_ = client.Close()
+					return
+				}
+				reader = shimwire.NewReader(upstream)
+				hello, dialErr = reader.Read()
+				if dialErr != nil {
+					proxy.fail(fmt.Errorf("retry Hello: %w", dialErr))
 					_ = client.Close()
 					_ = upstream.Close()
 					return
 				}
-				clientReader := shimwire.NewReader(client)
-				upstreamWriter := shimwire.NewWriter(upstream)
-				welcome, readErr := clientReader.Read()
-				if readErr != nil || welcome.Type != shimwire.TypeWelcome || upstreamWriter.WriteMessage(welcome) != nil {
-					_ = client.Close()
-					_ = upstream.Close()
-					return
-				}
-				// The shim has now committed the Welcome generation. Consume its
-				// Adopted response but never deliver it to the controller.
-				_, _ = upstreamReader.Read()
-			}()
-			proxy.retainPrevious(func() {
+			}
+			clientReader := shimwire.NewReader(client)
+			if exchangeErr := proxy.exchange(client, upstream, clientReader, reader, hello, number == 1 && dropFirst); exchangeErr != nil {
+				proxy.fail(fmt.Errorf("exchange %d: %w", number, exchangeErr))
 				_ = client.Close()
 				_ = upstream.Close()
-			})
+				return
+			}
+			if number == 1 && dropFirst {
+				// Close the committed first pair before accepting the retry. EOF
+				// conveys the lost ACK; no timeout or later Accept triggers it.
+				_ = upstream.Close()
+				_ = client.Close()
+				continue
+			}
+			proxy.wg.Add(1)
+			go func(client, upstream net.Conn, clientReader, upstreamReader *shimwire.Reader) {
+				defer proxy.wg.Done()
+				defer client.Close()   //nolint:errcheck
+				defer upstream.Close() //nolint:errcheck
+				copied := make(chan struct{})
+				go func() { defer close(copied); forwardObservedShimMessages(upstream, clientReader) }()
+				forwardObservedShimMessages(client, upstreamReader)
+				_ = client.Close()
+				_ = upstream.Close()
+				<-copied
+			}(client, upstream, clientReader, reader)
 		}
 	}()
 	return proxy
+}
+
+func (p *postWelcomeAdoptedLossProxy) exchange(client, upstream net.Conn, clientReader, reader *shimwire.Reader, hello shimwire.Message, drop bool) error {
+	if hello.Type != shimwire.TypeHello {
+		return fmt.Errorf("expected Hello, got %s", hello.Type)
+	}
+	decodedHello, err := shimwire.DecodeHello(hello.Body)
+	if err != nil {
+		return fmt.Errorf("decode real Hello: %w", err)
+	}
+	clientWriter := shimwire.NewWriter(client)
+	if err := clientWriter.WriteMessage(hello); err != nil {
+		return fmt.Errorf("forward Hello: %w", err)
+	}
+	welcome, err := clientReader.Read()
+	if err != nil {
+		return fmt.Errorf("read Welcome after actual Hello generation %d: %w", decodedHello.Generation, err)
+	}
+	if welcome.Type != shimwire.TypeWelcome {
+		return fmt.Errorf("expected Welcome, got %s", welcome.Type)
+	}
+	decodedWelcome, err := shimwire.DecodeWelcome(welcome.Body)
+	if err != nil {
+		return fmt.Errorf("decode real Welcome: %w", err)
+	}
+	if err := shimwire.NewWriter(upstream).WriteMessage(welcome); err != nil {
+		return fmt.Errorf("forward Welcome: %w", err)
+	}
+	adopted, err := reader.Read()
+	if err != nil {
+		return fmt.Errorf("read committed Adopted: %w", err)
+	}
+	if adopted.Type != shimwire.TypeAdopted {
+		// Preserve the real shim refusal for the controller, including the old
+		// candidate's stale-generation negative control.
+		_ = clientWriter.WriteMessage(adopted)
+		return fmt.Errorf("expected committed Adopted, got %s: %s", adopted.Type, adopted.Body)
+	}
+	decodedAdopted, err := shimwire.DecodeAdopted(adopted.Body)
+	if err != nil {
+		return fmt.Errorf("decode committed Adopted: %w", err)
+	}
+	if decodedAdopted.Generation != decodedWelcome.ProposedGeneration || decodedAdopted.Generation <= decodedHello.Generation {
+		return fmt.Errorf("real generation chain did not advance: Hello=%d Welcome=%d Adopted=%d", decodedHello.Generation, decodedWelcome.ProposedGeneration, decodedAdopted.Generation)
+	}
+	p.observe(postWelcomeExchange{Hello: decodedHello, Welcome: decodedWelcome, Adopted: decodedAdopted, Dropped: drop})
+	if !drop {
+		if err := clientWriter.WriteMessage(adopted); err != nil {
+			return fmt.Errorf("forward Adopted: %w", err)
+		}
+	}
+	return nil
+}
+
+// Continue with the same buffered readers used for the observed handshake;
+// copying the raw sockets here could discard an already-buffered host frame.
+func forwardObservedShimMessages(dst net.Conn, src *shimwire.Reader) {
+	writer := shimwire.NewWriter(dst)
+	for {
+		message, err := src.Read()
+		if err != nil {
+			return
+		}
+		if err := writer.WriteMessage(message); err != nil {
+			return
+		}
+	}
 }
 
 // repointRecordAtSocket republishes id's record against an interposing socket,
@@ -508,6 +639,8 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 	if !peerCredSupported() {
 		t.Skip("session shim adoption is unsupported on this platform")
 	}
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	dir := shortTempDir(t)
 	reg, err := NewRegistry(dir)
 	if err != nil {
@@ -521,15 +654,13 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 		t.Fatalf("read the published record: %v", err)
 	}
 	proxyPath := dir + "/adopted-loss.sock"
-	proxy := startPostWelcomeAdoptedLossProxy(t, proxyPath, record.SocketPath)
+	proxy := startPostWelcomeAdoptedLossProxy(ctx, t, proxyPath, record.SocketPath, true)
 	repointRecordAtSocket(t, reg, id, proxyPath)
 
 	var (
 		prepareMu sync.Mutex
 		floors    []shimwire.Generation
 	)
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-	defer cancel()
 	result, err := Adopt(ctx, AdoptOptions{
 		Registry:     reg,
 		ControllerID: "controller-post-welcome-loss",
@@ -550,6 +681,16 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 	}
 	defer result.Close()
 
+	exchanges, proxyErr := proxy.observations()
+	if proxyErr != nil {
+		t.Fatalf("proxy phase failed: %v; exchanges=%+v; quarantined=%+v", proxyErr, exchanges, result.Quarantined)
+	}
+	if len(exchanges) != 2 || !exchanges[0].Dropped || exchanges[1].Dropped {
+		t.Fatalf("expected one observed lost ACK and one delivered ACK: %+v", exchanges)
+	}
+	if exchanges[1].Hello.Generation != exchanges[0].Adopted.Generation {
+		t.Fatalf("retry Hello did not report committed first generation: %+v", exchanges)
+	}
 	if len(result.Quarantined) != 0 {
 		q := result.Quarantined[0]
 		t.Fatalf("a shim whose first Welcome committed was quarantined %q: %s", q.Reason, q.Detail)
@@ -557,14 +698,18 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 	if len(result.Adopted) != 1 {
 		t.Fatalf("adopted = %d controller(s), want the retried lineage", len(result.Adopted))
 	}
-	if got := proxy.connections.Load(); got < 2 {
-		t.Fatalf("adoption made %d connection(s), want a retry after the lost Adopted reply", got)
+	if got := proxy.connections.Load(); got != 2 {
+		t.Fatalf("adoption made %d connection(s), want exactly one retry after the observed lost Adopted reply", got)
 	}
 	prepareMu.Lock()
 	gotFloors := append([]shimwire.Generation(nil), floors...)
 	prepareMu.Unlock()
 	if len(gotFloors) != 2 {
 		t.Fatalf("preparation floors = %v, want exactly the first and advanced Hello floors", gotFloors)
+	}
+	t.Logf("observed lost ACK generation=%d; retry Hello=%d; preparations=%v; final generation=%d", exchanges[0].Adopted.Generation, exchanges[1].Hello.Generation, gotFloors, result.Adopted[0].Generation())
+	if gotFloors[0] != exchanges[0].Hello.Generation || gotFloors[1] != exchanges[1].Hello.Generation {
+		t.Fatalf("Prepare floors %v disagree with real Hello exchanges %+v", gotFloors, exchanges)
 	}
 	if gotFloors[1] != gotFloors[0]+1 {
 		t.Fatalf("second preparation floor = %d, want the committed first candidate floor %d", gotFloors[1], gotFloors[0]+1)

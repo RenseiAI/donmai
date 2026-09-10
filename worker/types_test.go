@@ -52,6 +52,31 @@ func TestRegisterRequest_OmitEmpty(t *testing.T) {
 	}
 }
 
+func TestRegisterRequest_SetCapabilityTagsCopiesEstablishedWire(t *testing.T) {
+	tags := []string{"gpu", "code-survival-scan", "kg-extraction"}
+	request := RegisterRequest{Hostname: "h", PID: 1, Version: "v"}
+	request.SetCapabilityTags(tags)
+	tags[0] = "mutated-after-set"
+
+	data, err := json.Marshal(request)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	var wire struct {
+		Capabilities      []string                          `json:"capabilities"`
+		CapabilitiesTyped *AgentRuntimeProviderCapabilities `json:"capabilities_typed"`
+	}
+	if err := json.Unmarshal(data, &wire); err != nil {
+		t.Fatalf("decode wire: %v", err)
+	}
+	if got, want := strings.Join(wire.Capabilities, ","), "gpu,code-survival-scan,kg-extraction"; got != want {
+		t.Fatalf("capabilities wire = %q, want %q", got, want)
+	}
+	if wire.CapabilitiesTyped != nil {
+		t.Fatalf("capabilities_typed = %+v, want absent", wire.CapabilitiesTyped)
+	}
+}
+
 func TestRegisterResponse_JSONRoundTripAndInterval(t *testing.T) {
 	raw := `{"worker_id":"w1","runtime_jwt":"jwt","heartbeat_interval_seconds":30}`
 	var r RegisterResponse
