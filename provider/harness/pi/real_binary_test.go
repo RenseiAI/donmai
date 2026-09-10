@@ -119,6 +119,8 @@ type realBinaryStub struct {
 	mu        sync.Mutex
 	turns     []stubTurn
 	responses []stubResponse
+	// Optional fixture barrier after recording a real request, before replying.
+	beforeResponse func(*http.Request, int)
 }
 
 // stubResponse lets a focused conformance test make the real pi binary drive
@@ -166,7 +168,12 @@ func (s *realBinaryStub) handle(w http.ResponseWriter, r *http.Request) {
 	if n <= len(s.responses) {
 		response = s.responses[n-1]
 	}
+	beforeResponse := s.beforeResponse
 	s.mu.Unlock()
+
+	if beforeResponse != nil {
+		beforeResponse(r, n)
+	}
 
 	w.Header().Set("Content-Type", "text/event-stream")
 	w.WriteHeader(http.StatusOK)
@@ -342,35 +349,54 @@ func TestRealBinary_Endpoint_CompletedTurn(t *testing.T) {
 // against a fake replay; this test proves the REAL pi binary actually
 // delivers both kinds of injected text into a subsequent model turn.
 //
-// Two real-binary findings shaped this test (both load-bearing, not
-// incidental):
-//
-//  1. "Idle" has a reachable window BEFORE the turn Spawn() already kicked
-//     off produces its first streaming event — turnInFlight is a zero-value
-//     (false) atomic.Bool at Handle construction, and Spawn's final step
-//     writes the initial `prompt` command to the child but returns to the
-//     caller before any RPC event has come back. Injecting THEN is genuinely
-//     idle and pi queues it as `follow_up`, exactly the design's intent
-//     ("Inject while idle").
-//  2. Injecting AFTER a terminal ResultEvent is ALSO an idle window: the
-//     Handle's event pump (run in handle.go) keeps consuming the RPC stream
-//     past a non-fatal agent_settled terminal specifically so a later Inject
-//     has somewhere to land — see TestRealBinary_Inject_AfterTerminal_DeliversFollowUp,
-//     which proves the post-terminal follow_up actually reaches the model.
-//     Only a FATAL terminal (a policy-bypass abort, an extension_error) ends
-//     the pump for good; Inject after one still fails closed.
+// The first prompt is held behind a private test barrier until the REAL pi
+// queue_update confirms idle follow_up acceptance. Spawn's return cannot
+// establish an idle window: the child may already have emitted turn_start.
+// The loopback endpoint then holds its first response until turn_start and
+// the REAL steering queue update have both arrived. No sleeps or fabricated
+// Handle state stand in for those protocol facts. Post-terminal injection is
+// separately exercised below by TestRealBinary_Inject_AfterTerminal_DeliversFollowUp.
 func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	realBinaryAvailable(t)
 
 	stub := newRealBinaryStub(t, realBinaryModel)
 	spec := realBinarySpec(t.TempDir(), "reply with a short greeting and nothing else", stub.baseURL())
 
-	p, err := New(Options{HandshakeTimeout: 30 * time.Second})
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	firstRequest := make(chan struct{})
+	releaseResponse := make(chan struct{})
+	var releaseOnce sync.Once
+	release := func() { releaseOnce.Do(func() { close(releaseResponse) }) }
+	t.Cleanup(release)
+	stub.mu.Lock()
+	stub.beforeResponse = func(r *http.Request, turn int) {
+		if turn != 1 {
+			return
+		}
+		close(firstRequest)
+		select {
+		case <-releaseResponse:
+		case <-r.Context().Done():
+		}
+	}
+	stub.mu.Unlock()
+
+	p, err := New(Options{
+		HandshakeTimeout: 30 * time.Second,
+		beforeInitialPrompt: func(ph *Handle) error {
+			if ph.turnInFlight.Load() {
+				return fmt.Errorf("turn started before the initial prompt command")
+			}
+			if err := ph.Inject(ctx, followUpNonce); err != nil {
+				return fmt.Errorf("idle Inject: %w", err)
+			}
+			return waitRealPiQueue(ctx, ph, "followUp", followUpNonce)
+		},
+	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
-	defer cancel()
 	h, err := p.Spawn(ctx, spec)
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -380,30 +406,24 @@ func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	if !ok {
 		t.Fatalf("Spawn returned %T; want *Handle", h)
 	}
-
-	// Idle window: immediately after Spawn, before the first streaming event
-	// has been observed. turnInFlight is still its zero value.
-	if ph.turnInFlight.Load() {
-		t.Fatal("turnInFlight already true immediately after Spawn — the idle window this test depends on does not exist; the test design assumption is stale, not the harness")
+	select {
+	case <-firstRequest:
+	case <-ctx.Done():
+		t.Fatalf("initial model request did not arrive: %v", ctx.Err())
 	}
-	if err := h.Inject(ctx, followUpNonce); err != nil {
-		t.Fatalf("Inject (idle, immediately after Spawn): %v", err)
-	}
-
-	// Mid-turn window: poll for the RPC stream to report the turn in flight,
-	// then steer. Bounded so a genuine regression (turnInFlight never flips,
-	// or flips and settles faster than any poll interval could observe) fails
-	// the test instead of hanging.
-	deadline := time.Now().Add(20 * time.Second)
-	for !ph.turnInFlight.Load() && time.Now().Before(deadline) {
-		time.Sleep(25 * time.Millisecond)
+	if err := waitRealPiSystem(ctx, h, "turn_start", nil); err != nil {
+		t.Fatal(err)
 	}
 	if !ph.turnInFlight.Load() {
-		t.Fatal("never observed turnInFlight=true before the deadline — steer has no window to prove")
+		t.Fatal("turn_start did not establish in-flight state while response is held")
 	}
 	if err := h.Inject(ctx, steerNonce); err != nil {
 		t.Fatalf("Inject (mid-turn, steer): %v", err)
 	}
+	if err := waitRealPiQueue(ctx, h, "steering", steerNonce); err != nil {
+		t.Fatal(err)
+	}
+	release()
 
 	evs := drainToResult(t, h, 45*time.Second)
 	for _, ev := range evs {
@@ -415,6 +435,14 @@ func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	turns := stub.recordedTurns()
 	if len(turns) < 3 {
 		t.Fatalf("got %d model turn(s); want at least 3 (initial prompt, steer delivery, follow_up delivery) — recorded: %+v", len(turns), turns)
+	}
+	initial := strings.Join(turns[0].stubUserTexts(), "\n")
+	steered := strings.Join(turns[1].stubUserTexts(), "\n")
+	followedUp := strings.Join(turns[2].stubUserTexts(), "\n")
+	if strings.Contains(initial, steerNonce) || strings.Contains(initial, followUpNonce) ||
+		!strings.Contains(steered, steerNonce) || strings.Contains(steered, followUpNonce) ||
+		!strings.Contains(followedUp, followUpNonce) {
+		t.Fatal("model requests did not preserve initial -> steer -> follow_up delivery order")
 	}
 
 	var sawSteer, sawFollowUp bool
@@ -434,6 +462,63 @@ func TestRealBinary_Inject_SteerMidTurn_FollowUpIdle(t *testing.T) {
 	if !sawFollowUp {
 		t.Errorf("the follow_up nonce %q never reached the stub as conversation content — the idle-inject queued at Spawn was never delivered", followUpNonce)
 	}
+}
+
+// waitRealPiSystem observes native events from the real child. A command write
+// alone does not prove the child has accepted it before the endpoint settles.
+func waitRealPiSystem(ctx context.Context, h agent.Handle, subtype string, check func(agent.SystemEvent) error) error {
+	timer := time.NewTimer(20 * time.Second)
+	defer timer.Stop()
+	for {
+		select {
+		case event, ok := <-h.Events():
+			if !ok {
+				return fmt.Errorf("pi event stream closed before %s", subtype)
+			}
+			if failure, ok := event.(agent.ErrorEvent); ok {
+				return fmt.Errorf("pi error before %s: %+v", subtype, failure)
+			}
+			if _, ok := event.(agent.ResultEvent); ok {
+				return fmt.Errorf("pi settled before %s", subtype)
+			}
+			if system, ok := event.(agent.SystemEvent); ok && system.Subtype == subtype {
+				if check != nil {
+					return check(system)
+				}
+				return nil
+			}
+		case <-timer.C:
+			return fmt.Errorf("pi did not emit %s before the deadline", subtype)
+		case <-ctx.Done():
+			return ctx.Err()
+		}
+	}
+}
+
+func waitRealPiQueue(ctx context.Context, h agent.Handle, queue, nonce string) error {
+	return waitRealPiSystem(ctx, h, "queue_update", func(event agent.SystemEvent) error {
+		raw, ok := event.Raw.(string)
+		if !ok {
+			return fmt.Errorf("queue_update has no native JSON payload")
+		}
+		var update struct {
+			Steering []string `json:"steering"`
+			FollowUp []string `json:"followUp"`
+		}
+		if err := json.Unmarshal([]byte(raw), &update); err != nil {
+			return fmt.Errorf("decode native queue_update: %w", err)
+		}
+		messages := update.Steering
+		if queue == "followUp" {
+			messages = update.FollowUp
+		}
+		for _, message := range messages {
+			if strings.Contains(message, nonce) {
+				return nil
+			}
+		}
+		return fmt.Errorf("native %s queue did not accept injected nonce: %+v", queue, update)
+	})
 }
 
 const (
