@@ -549,11 +549,20 @@ func writeFakeCodexScript(t *testing.T, script string) string {
 // all — the whole point of SpawnInteractive being a package-level function).
 func TestSpawnInteractive_RunsFakeCLIUnderPTY(t *testing.T) {
 	t.Parallel()
-	bin := writeFakeCodexScript(t, `echo "argv: $@"`)
+	// Re-exec the package test binary in its existing fake-PTY-client role
+	// instead of launching a just-written shell script. Linux can reject an
+	// executable fixture transiently while its filesystem still considers the
+	// inode writable (ETXTBSY); this still exercises the real PTY and child
+	// process path without that fixture race.
+	bin, err := os.Executable()
+	if err != nil {
+		t.Fatalf("resolve test binary: %v", err)
+	}
 
 	h, err := SpawnInteractive(context.Background(), Options{CodexBin: bin}, agent.Spec{
 		Prompt:      "hello",
 		Cwd:         t.TempDir(),
+		Env:         map[string]string{codexFakePTYClientEnv: "1"},
 		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
 	})
 	if err != nil {
