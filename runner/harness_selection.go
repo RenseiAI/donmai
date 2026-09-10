@@ -93,9 +93,9 @@ func (a *HarnessAdmission) CanonicalHarnessRef() (executioncell.HarnessRef, bool
 // admission with nil error means the request omitted Harness and must follow
 // the named legacy adapter inside Run. Explicit denials carry a canonical
 // immutable denied receipt on HarnessAdmissionError.
-func (r *Registry) PreflightHarness(qw QueuedWork) (*HarnessAdmission, error) {
+func (r *Registry) PreflightHarness(qw QueuedWork, realizations ...*agent.CapabilityRealizationRegistry) (*HarnessAdmission, error) {
 	if len(qw.AdmissionReceipt) > 0 {
-		return r.preflightAdmissionReceipt(qw, true)
+		return r.preflightAdmissionReceipt(qw, true, realizations...)
 	}
 	if qw.ResolvedProfile.Harness == "" {
 		return nil, nil
@@ -116,7 +116,7 @@ func (r *Registry) PreflightHarness(qw QueuedWork) (*HarnessAdmission, error) {
 	}, nil
 }
 
-func (r *Registry) preflightAdmissionReceipt(qw QueuedWork, requireHostAdaptation bool) (*HarnessAdmission, error) {
+func (r *Registry) preflightAdmissionReceipt(qw QueuedWork, requireHostAdaptation bool, realizations ...*agent.CapabilityRealizationRegistry) (*HarnessAdmission, error) {
 	immutable, err := executioncell.DecodeAdmissionReceipt(qw.AdmissionReceipt)
 	if err != nil {
 		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, err), err
@@ -153,7 +153,7 @@ func (r *Registry) preflightAdmissionReceipt(qw QueuedWork, requireHostAdaptatio
 		cellErr = attachDeniedHarnessReceipt(qw, cellErr, time.Now())
 		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, cellErr), cellErr
 	}
-	selection, selectionErr := r.selectReceiptHarness(qw, receipt, effectiveCell)
+	selection, selectionErr := r.selectReceiptHarness(qw, receipt, effectiveCell, realizations...)
 	if selectionErr != nil {
 		selectionErr = attachDeniedHarnessReceipt(qw, selectionErr, time.Now())
 		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, selectionErr), selectionErr
@@ -341,7 +341,7 @@ func preparedHarnessFromWork(qw QueuedWork) (*agent.PreparedHarness, error) {
 	return &prepared, nil
 }
 
-func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.AdmissionReceipt, cell executioncell.ResolvedExecutionCell) (harnessSelection, error) {
+func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.AdmissionReceipt, cell executioncell.ResolvedExecutionCell, realizations ...*agent.CapabilityRealizationRegistry) (harnessSelection, error) {
 	if receipt.Cell == nil {
 		return harnessSelection{}, receiptHarnessDenial(receipt, executioncell.DenialHarnessUnavailable,
 			"admitted receipt does not contain a resolved execution cell")
@@ -363,7 +363,7 @@ func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.Adm
 		return harnessSelection{}, receiptHarnessDenial(receipt, executioncell.DenialUnsupportedHarnessVersion,
 			fmt.Sprintf("registered harness %q has version %q but admission receipt pins %q", selection.Harness.ID, selection.Harness.Version, cell.Harness.Version))
 	}
-	if err := validateReceiptCell(qw, receipt, selection, cell); err != nil {
+	if err := validateReceiptCell(qw, receipt, selection, cell, realizations...); err != nil {
 		return harnessSelection{}, err
 	}
 	selection.Decisions = append([]executioncell.ResolverDecision(nil), receipt.ResolverDecisions...)
@@ -371,7 +371,7 @@ func (r *Registry) selectReceiptHarness(qw QueuedWork, receipt executioncell.Adm
 	return selection, nil
 }
 
-func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, selection harnessSelection, cell executioncell.ResolvedExecutionCell) error {
+func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, selection harnessSelection, cell executioncell.ResolvedExecutionCell, realizations ...*agent.CapabilityRealizationRegistry) error {
 	if strings.TrimSpace(qw.ResolvedProfile.Model) != cell.Model.ID {
 		return receiptHarnessDenial(receipt, executioncell.DenialUnknownModel,
 			fmt.Sprintf("queued model %q does not match admitted model %q", strings.TrimSpace(qw.ResolvedProfile.Model), cell.Model.ID))
@@ -434,6 +434,19 @@ func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, 
 			// These capabilities are projected onto the existing exact
 			// tool/lifecycle plan immediately before provider spawn.
 		default:
+			mode := agent.PromptModeAutonomous
+			if cell.SessionMode == executioncell.SessionHumanControlled {
+				mode = agent.PromptModeHumanControlled
+			}
+			profile, profileOK := manifest.ToolLifecycleProfile(mode)
+			var realizationOK bool
+			if len(realizations) > 0 && realizations[0] != nil && profileOK {
+				declaration, found := realizations[0].Resolve(capability.Name, manifest.Name, profile.ID, mode)
+				realizationOK = found && declaration.ProductionEligible()
+			}
+			if realizationOK {
+				continue
+			}
 			return receiptHarnessDenial(receipt, executioncell.DenialCapabilityUnsupported,
 				fmt.Sprintf("admitted capability %q has no current exact pre-spawn adapter", capability.Name))
 		}
@@ -757,7 +770,7 @@ func legacyUnresolvedDecision(source legacyHarnessSource) executioncell.Resolver
 // handed once to the explicit legacy adapter.
 func (r *Runner) resolveHarnessSelection(ctx context.Context, qw QueuedWork) (harnessSelection, error) {
 	if len(qw.AdmissionReceipt) > 0 {
-		admission, err := r.registry.PreflightHarness(qw)
+		admission, err := r.registry.PreflightHarness(qw, r.capabilityRealizations)
 		if err != nil {
 			return harnessSelection{}, err
 		}
@@ -810,7 +823,7 @@ func (r *Runner) admittedHarnessSelection(ctx context.Context, qw QueuedWork, ad
 				!bytes.Equal(claimReceipt.Bytes(), admission.selection.claimReceipt.Bytes()) {
 				return harnessSelection{}, errors.New("runner: claim receipt or effective cell changed after preflight")
 			}
-			if err := validateReceiptCell(qw, currentReceipt.Value(), admission.selection, effectiveCell); err != nil {
+			if err := validateReceiptCell(qw, currentReceipt.Value(), admission.selection, effectiveCell, r.capabilityRealizations); err != nil {
 				return harnessSelection{}, err
 			}
 		}

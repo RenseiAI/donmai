@@ -191,17 +191,18 @@ type ToolLifecycleFallback struct {
 // fields. Legacy non-empty fields are projected as required entries and cannot
 // be made optional through this plan.
 type ToolLifecyclePlan struct {
-	ContractVersion          string                  `json:"contractVersion"`
-	AdmissionReceiptID       string                  `json:"admissionReceiptId,omitempty"`
-	ClaimReceiptID           string                  `json:"claimReceiptId,omitempty"`
-	OperationalPayloadDigest string                  `json:"operationalPayloadDigest,omitempty"`
-	RequireToolPlugins       bool                    `json:"requireToolPlugins,omitempty"`
-	ToolHooks                []ToolHookRequirement   `json:"toolHooks,omitempty"`
-	Lifecycle                []LifecycleRequirement  `json:"lifecycle,omitempty"`
-	Replay                   *LifecycleRequirement   `json:"replay,omitempty"`
-	RequireCleanup           bool                    `json:"requireCleanup,omitempty"`
-	CleanupParametersDigest  string                  `json:"cleanupParametersDigest,omitempty"`
-	AuthorizedFallbacks      []ToolLifecycleFallback `json:"authorizedFallbacks,omitempty"`
+	ContractVersion          string                         `json:"contractVersion"`
+	AdmissionReceiptID       string                         `json:"admissionReceiptId,omitempty"`
+	ClaimReceiptID           string                         `json:"claimReceiptId,omitempty"`
+	OperationalPayloadDigest string                         `json:"operationalPayloadDigest,omitempty"`
+	RequireToolPlugins       bool                           `json:"requireToolPlugins,omitempty"`
+	ToolHooks                []ToolHookRequirement          `json:"toolHooks,omitempty"`
+	Lifecycle                []LifecycleRequirement         `json:"lifecycle,omitempty"`
+	Replay                   *LifecycleRequirement          `json:"replay,omitempty"`
+	RequireCleanup           bool                           `json:"requireCleanup,omitempty"`
+	CleanupParametersDigest  string                         `json:"cleanupParametersDigest,omitempty"`
+	AuthorizedFallbacks      []ToolLifecycleFallback        `json:"authorizedFallbacks,omitempty"`
+	CapabilityRealizations   []CapabilityRealizationBinding `json:"capabilityRealizations,omitempty"`
 }
 
 // ToolAdaptationOutcome is the immutable pre-spawn result for one entry.
@@ -248,15 +249,16 @@ type ToolLifecycleEntry struct {
 // ToolLifecycleReceipt is persisted before provider side effects. Evidence
 // tier and production eligibility are separate from declared capability.
 type ToolLifecycleReceipt struct {
-	ContractVersion          string               `json:"contractVersion"`
-	AdmissionReceiptID       string               `json:"admissionReceiptId,omitempty"`
-	ClaimReceiptID           string               `json:"claimReceiptId,omitempty"`
-	OperationalPayloadDigest string               `json:"operationalPayloadDigest,omitempty"`
-	ProfileID                string               `json:"profileId"`
-	Decision                 string               `json:"decision"`
-	EvidenceTier             string               `json:"evidenceTier"`
-	ProductionEligible       bool                 `json:"productionEligible"`
-	Entries                  []ToolLifecycleEntry `json:"entries"`
+	ContractVersion          string                        `json:"contractVersion"`
+	AdmissionReceiptID       string                        `json:"admissionReceiptId,omitempty"`
+	ClaimReceiptID           string                        `json:"claimReceiptId,omitempty"`
+	OperationalPayloadDigest string                        `json:"operationalPayloadDigest,omitempty"`
+	ProfileID                string                        `json:"profileId"`
+	Decision                 string                        `json:"decision"`
+	EvidenceTier             string                        `json:"evidenceTier"`
+	ProductionEligible       bool                          `json:"productionEligible"`
+	Entries                  []ToolLifecycleEntry          `json:"entries"`
+	CapabilityRealizations   []CapabilityRealizationResult `json:"capabilityRealizations,omitempty"`
 }
 
 // ToolAdaptationError is returned before any provider process starts.
@@ -499,6 +501,12 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 	}
 
 	receipt.Decision = "ready"
+	results, realizationErr := ResolveCapabilityRealizationResults(plan.CapabilityRealizations, receipt.Entries)
+	receipt.CapabilityRealizations = results
+	if realizationErr != nil {
+		receipt.Decision = "denied"
+		return spec, receipt, &ToolAdaptationError{Code: ToolDenialApplicationFailed, Detail: realizationErr.Error()}
+	}
 	return dropDeniedAdvisoryExtensions(spec, receipt.Entries), receipt, nil
 }
 
@@ -827,6 +835,13 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 		if fallback.ID == "" || !isKnownToolLifecycleChannel(fallback.Channel) || !isKnownToolDelivery(fallback.To) || fallback.To == ToolDeliveryUnsupported {
 			return "fallbacks require id, a known channel, and a known non-unsupported delivery"
 		}
+	}
+	seenCapabilities := map[string]bool{}
+	for _, binding := range plan.CapabilityRealizations {
+		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] {
+			return "capability realizations require unique canonical bindings"
+		}
+		seenCapabilities[binding.CapabilityID] = true
 	}
 	return ""
 }

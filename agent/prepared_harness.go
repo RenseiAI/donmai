@@ -110,6 +110,7 @@ func toolLifecycleReceiptFieldDigests(r ToolLifecycleReceipt) map[string]string 
 		"evidenceTier":             digestValue(r.EvidenceTier),
 		"productionEligible":       digestValue(r.ProductionEligible),
 		"entries":                  digestValue(r.Entries),
+		"capabilityRealizations":   digestValue(r.CapabilityRealizations),
 	}
 }
 

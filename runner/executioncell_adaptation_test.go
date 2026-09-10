@@ -839,7 +839,24 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	qw.Mode = interactiveRunMode
 	qw.InitialPrompt = "actual human-controlled initial turn"
 	qw.McpServers = []agent.MCPServerConfig{{Name: "card-server", Command: "card-mcp", Args: []string{"--stdio"}}}
-	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil))
+	const faculty = "example.workflow-authoring/v1"
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: faculty, HarnessID: agent.HarnessCodex,
+		AdapterVersion: "codex/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+		RecipeID:        "example/session-mcp/v1",
+		Entries:         []agent.CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true}},
+		DeclaredSurface: agent.CapabilityDeclaredSurface{MCPServerNames: []string{"card-server"}, MCPToolNames: []string{"draft_create"}},
+		Evidence:        agent.CapabilityRealizationEvidence{FixtureID: "real-binary", FixtureDigest: strings.Repeat("a", 64), Tier: agent.RealizationEvidenceRealBinary},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CapabilityRealizationDeclaration{declaration})
+	if err != nil {
+		t.Fatal(err)
+	}
+	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, []executioncell.CapabilityRequirement{{Name: faculty, ParametersDigest: strings.Repeat("b", 64)}})
+	qw = attachAdmittedExecutionCell(t, qw, cell)
 	operational, err := CanonicalOperationalPayload(qw)
 	if err != nil {
 		t.Fatal(err)
@@ -850,7 +867,7 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 		"effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding,
 		"operationalPayload": qw.OperationalPayload,
 	}
-	receipt, err := NewProviderView(registry).PreflightExecution(rawJSONForRunner(t, detail))
+	receipt, err := NewProviderViewWithDecoratorAndRealizations(registry, nil, realizations).PreflightExecution(rawJSONForRunner(t, detail))
 	if err != nil {
 		t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
 	}
@@ -867,13 +884,16 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	}
 	source, _, err := buildPreparedSourceSpec(qw, harnessSelection{
 		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt),
-		effectiveCell: exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil),
-	}, nil)
+		effectiveCell: cell,
+	}, nil, realizations)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if source.Prompt != qw.InitialPrompt || source.Autonomous || source.Interactive == nil || len(source.MCPServers) != 2 {
 		t.Fatalf("host source was not actual human input: prompt=%q autonomous=%v interactive=%v mcp=%+v", source.Prompt, source.Autonomous, source.Interactive != nil, source.MCPServers)
+	}
+	if len(source.ToolLifecyclePlan.CapabilityRealizations) != 1 || len(plan.ToolLifecycleReceipt.CapabilityRealizations) != 1 || plan.ToolLifecycleReceipt.CapabilityRealizations[0].Decision != "ready" {
+		t.Fatalf("realization binding did not survive preflight: source=%+v receipt=%+v", source.ToolLifecyclePlan.CapabilityRealizations, plan.ToolLifecycleReceipt.CapabilityRealizations)
 	}
 	source.PreparedHarness = &plan
 	if _, err := agent.PrepareHarness(source, providerWithManifest.Manifest()); err != nil {
@@ -881,6 +901,26 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	}
 	if provider.spawnCalls.Load() != 0 {
 		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
+	}
+	wrong, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: declaration.CapabilityID, HarnessID: declaration.HarnessID, AdapterVersion: "codex/interactive/wrong-v1", Mode: declaration.Mode, RecipeID: declaration.Recipe.RecipeID, Entries: declaration.Recipe.Entries, DeclaredSurface: declaration.Recipe.DeclaredSurface, Evidence: declaration.Evidence})
+	if err != nil {
+		t.Fatal(err)
+	}
+	wrongRegistry, err := agent.NewCapabilityRealizationRegistry([]agent.CapabilityRealizationDeclaration{wrong})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := NewProviderViewWithDecoratorAndRealizations(registry, nil, wrongRegistry).PreflightExecution(rawJSONForRunner(t, detail)); err == nil || !strings.Contains(err.Error(), "no current exact pre-spawn adapter") {
+		t.Fatalf("wrong adapter realization error = %v", err)
+	}
+}
+
+func TestAdmissionRejectsCallerSuppliedRealizationBinding(t *testing.T) {
+	qw := attachAdmittedExecutionCell(t, exactReceiptQueuedWork("caller-realization"), exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, nil))
+	plan := agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{{ContractVersion: agent.CapabilityRealizationContractVersion, CapabilityID: "forged"}}}
+	_, err := bindAdmissionToolLifecyclePlan(agent.Spec{ToolLifecyclePlan: &plan}, mustAdmissionReceipt(t, qw.AdmissionReceipt), executioncell.ImmutableClaimReceipt{})
+	if err == nil || !strings.Contains(err.Error(), "caller-supplied capability realization") {
+		t.Fatalf("caller binding error = %v", err)
 	}
 }
 

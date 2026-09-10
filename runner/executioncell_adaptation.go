@@ -34,7 +34,7 @@ var watchLifecycleEvents = []struct {
 // bindAdmissionToolLifecyclePlan links the upstream execution-cell admission
 // to the existing exact-harness tool/lifecycle compiler. Receipt-bearing work
 // is additive: legacy work without a receipt keeps the pre-existing plan.
-func bindAdmissionToolLifecyclePlan(spec agent.Spec, receipt executioncell.ImmutableAdmissionReceipt, claim executioncell.ImmutableClaimReceipt) (agent.Spec, error) {
+func bindAdmissionToolLifecyclePlan(spec agent.Spec, receipt executioncell.ImmutableAdmissionReceipt, claim executioncell.ImmutableClaimReceipt, registries ...*agent.CapabilityRealizationRegistry) (agent.Spec, error) {
 	if len(receipt.Bytes()) == 0 {
 		return spec, nil
 	}
@@ -47,6 +47,9 @@ func bindAdmissionToolLifecyclePlan(spec agent.Spec, receipt executioncell.Immut
 	}
 
 	plan := agent.EnsureToolLifecyclePlan(spec)
+	if len(plan.CapabilityRealizations) > 0 {
+		return spec, &agent.ToolAdaptationError{Code: agent.ToolDenialMalformedPlan, Detail: "caller-supplied capability realization bindings are not authority"}
+	}
 	if plan.AdmissionReceiptID != "" && plan.AdmissionReceiptID != value.ReceiptID {
 		return spec, &agent.ToolAdaptationError{
 			Code:   agent.ToolDenialMalformedPlan,
@@ -106,6 +109,9 @@ func bindAdmissionToolLifecyclePlan(spec agent.Spec, receipt executioncell.Immut
 			plan.RequireCleanup = true
 			plan.CleanupParametersDigest = capability.ParametersDigest
 		default:
+			if len(registries) > 0 && registries[0] != nil && registries[0].Knows(capability.Name) {
+				continue
+			}
 			// Preflight rejects unknown capability names. Keep a defensive
 			// denial here so no alternate caller can silently strip one.
 			return spec, &agent.ToolAdaptationError{

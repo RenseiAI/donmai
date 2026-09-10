@@ -31,7 +31,8 @@ type ProviderView struct {
 	// to the spawn lane surfaces as an undiagnosable
 	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
 	// preserves the historical undecorated behavior.
-	decorate agent.ExtensionDecorator
+	decorate     agent.ExtensionDecorator
+	realizations *agent.CapabilityRealizationRegistry
 }
 
 type hostAdaptationReceipt struct {
@@ -111,7 +112,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 		}
 		return raw, cause
 	}
-	admission, err := v.reg.preflightAdmissionReceipt(qw, false)
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
 	if err != nil {
 		return encode(err)
 	}
@@ -131,7 +132,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate)
+	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate, v.realizations)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
@@ -176,6 +177,11 @@ func NewProviderView(reg *Registry) *ProviderView {
 // equivalent to NewProviderView.
 func NewProviderViewWithDecorator(reg *Registry, decorate agent.ExtensionDecorator) *ProviderView {
 	return &ProviderView{reg: reg, decorate: decorate}
+}
+
+// NewProviderViewWithDecoratorAndRealizations binds the same immutable realization snapshot used by child recomputation.
+func NewProviderViewWithDecoratorAndRealizations(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry) *ProviderView {
+	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations}
 }
 
 // Names returns the sorted list of registered provider names as plain
