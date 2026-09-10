@@ -133,7 +133,7 @@ func ValidateHostAdaptationForRegistration(binding RuntimeBinding, receipt []byt
 	if err := decodeClosed(host.Plan, &plan, "prepared harness"); err != nil {
 		return err
 	}
-	if err := agent.ValidatePreparedHarness(&plan, operationalPayloadDigest); err != nil {
+	if err := agent.ValidatePreparedHarnessRegistration(&plan, operationalPayloadDigest); err != nil {
 		return fmt.Errorf("executioncell: registered prepared harness: %w", err)
 	}
 	if agent.DigestPreparedHarness(&plan) != host.PlanDigest {

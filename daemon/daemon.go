@@ -285,6 +285,13 @@ type ExecutionPreflightProvider interface {
 	PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error)
 }
 
+// ExecutionPreflightReplayValidator re-applies canonical sibling/profile
+// reconciliation to retained receipt bytes without compiling or replacing the
+// original plan.
+type ExecutionPreflightReplayValidator interface {
+	ValidateRetainedExecution(detailJSON json.RawMessage, receipt json.RawMessage) error
+}
+
 // ClaimGateProvider is optionally implemented by ProviderRegistry. It lets the
 // daemon re-run the execution-cell narrow-only claim gate
 // (ADR-2026-08-05-versioned-execution-cell-and-session-reference.md D4)
@@ -2006,6 +2013,42 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				}
 			}
 
+			modelProfileJSON, err := marshalOptional(detail.ModelProfile)
+			if err != nil {
+				return nil, fmt.Errorf("marshal model profile: %w", err)
+			}
+			resolvedProfileJSON, err := marshalOptional(detail.ResolvedProfile)
+			if err != nil {
+				return nil, fmt.Errorf("marshal resolved profile: %w", err)
+			}
+			stageBudgetJSON, err := marshalOptional(detail.StageBudget)
+			if err != nil {
+				return nil, fmt.Errorf("marshal stage budget: %w", err)
+			}
+			preflightInput := struct {
+				SessionID               string          `json:"sessionId"`
+				WorkerID                string          `json:"workerId"`
+				AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+				ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
+				EffectiveCell           json.RawMessage `json:"effectiveCell"`
+				ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+				OperationalPayload      json.RawMessage `json:"operationalPayload"`
+				ModelProfile            json.RawMessage `json:"modelProfile,omitempty"`
+				ResolvedProfile         json.RawMessage `json:"resolvedProfile,omitempty"`
+				StageBudget             json.RawMessage `json:"stageBudget,omitempty"`
+			}{
+				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
+				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
+				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
+				OperationalPayload: detail.OperationalPayload,
+				ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
+				StageBudget: stageBudgetJSON,
+			}
+			detailJSON, err := json.Marshal(preflightInput)
+			if err != nil {
+				return nil, fmt.Errorf("marshal execution preflight detail: %w", err)
+			}
+
 			var receipt json.RawMessage
 			var persistedReceipt json.RawMessage
 			var preflightErr error
@@ -2025,58 +2068,19 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 					return nil, fmt.Errorf("recover execution adaptation receipt: %w", loadErr)
 				}
 			}
+			if replayedReceipt {
+				validator, ok := d.opts.ProviderRegistry.(ExecutionPreflightReplayValidator)
+				if !ok {
+					return nil, errors.New("runtime binding v2 retained receipt requires canonical replay validation")
+				}
+				if validationErr := validator.ValidateRetainedExecution(detailJSON, receipt); validationErr != nil {
+					return nil, fmt.Errorf("validate retained execution adaptation: %w", validationErr)
+				}
+			}
 			if !replayedReceipt {
 				compiler, ok := d.opts.ProviderRegistry.(ExecutionPreflightProvider)
 				if !ok {
 					return nil, errors.New("receipt-bearing work requires daemon execution preflight")
-				}
-				modelProfileJSON, err := marshalOptional(detail.ModelProfile)
-				if err != nil {
-					return nil, fmt.Errorf("marshal model profile: %w", err)
-				}
-				resolvedProfileJSON, err := marshalOptional(detail.ResolvedProfile)
-				if err != nil {
-					return nil, fmt.Errorf("marshal resolved profile: %w", err)
-				}
-				stageBudgetJSON, err := marshalOptional(detail.StageBudget)
-				if err != nil {
-					return nil, fmt.Errorf("marshal stage budget: %w", err)
-				}
-				preflightInput := struct {
-					SessionID               string          `json:"sessionId"`
-					WorkerID                string          `json:"workerId"`
-					AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
-					ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
-					EffectiveCell           json.RawMessage `json:"effectiveCell"`
-					ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
-					OperationalPayload      json.RawMessage `json:"operationalPayload"`
-					// ModelProfile and ResolvedProfile are SessionDetail's sibling
-					// profile fields — never embedded in OperationalPayload itself
-					// (see the doc comment on each in session_detail.go). Forwarded
-					// here so ProviderView.PreflightExecution can apply the exact
-					// same runner.ReconcileResolvedProfile reconciliation the
-					// spawned child applies (afcli.detailToQueuedWork) BEFORE
-					// compiling the PreparedHarness plan: without this, preflight
-					// and spawn could derive Model/Effort/ProviderConfig/Endpoint
-					// from different inputs and ApplyPreparedHarness's authority
-					// digest could never agree.
-					ModelProfile    json.RawMessage `json:"modelProfile,omitempty"`
-					ResolvedProfile json.RawMessage `json:"resolvedProfile,omitempty"`
-					// StageBudget is also a SessionDetail sibling. It contributes to
-					// autonomous prompt authority, so preflight and spawn must apply
-					// the same shared reconciliation over this exact value.
-					StageBudget json.RawMessage `json:"stageBudget,omitempty"`
-				}{
-					SessionID: detail.SessionID, WorkerID: detail.WorkerID,
-					AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
-					EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
-					OperationalPayload: detail.OperationalPayload,
-					ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
-					StageBudget: stageBudgetJSON,
-				}
-				detailJSON, err := json.Marshal(preflightInput)
-				if err != nil {
-					return nil, fmt.Errorf("marshal execution preflight detail: %w", err)
 				}
 				receipt, preflightErr = compiler.PreflightExecution(detailJSON)
 			}

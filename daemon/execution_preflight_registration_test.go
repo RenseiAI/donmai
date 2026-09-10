@@ -22,11 +22,13 @@ import (
 )
 
 type orderedPreflightProvider struct {
-	mu         *sync.Mutex
-	order      *[]string
-	receipt    json.RawMessage
-	calls      atomic.Int32
-	failReplay bool
+	mu              *sync.Mutex
+	order           *[]string
+	receipt         json.RawMessage
+	calls           atomic.Int32
+	failReplay      bool
+	validationCalls atomic.Int32
+	validationErr   error
 }
 
 func (p *orderedPreflightProvider) Names() []string { return []string{"stub"} }
@@ -43,6 +45,11 @@ func (p *orderedPreflightProvider) PreflightExecution(json.RawMessage) (json.Raw
 		return nil, errors.New("compiler changed after retained receipt")
 	}
 	return slices.Clone(p.receipt), nil
+}
+
+func (p *orderedPreflightProvider) ValidateRetainedExecution(json.RawMessage, json.RawMessage) error {
+	p.validationCalls.Add(1)
+	return p.validationErr
 }
 
 type orderedReplayStore struct {
@@ -409,6 +416,30 @@ func TestRuntimeBindingV2LostAcknowledgementReplaysRetainedReceiptWithoutCompila
 	}
 }
 
+func TestRuntimeBindingV2RetainedReceiptRequiresCanonicalReplayValidation(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	provider := &orderedPreflightProvider{
+		mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail)),
+		validationErr: errors.New("canonical sibling reconciliation changed"),
+	}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	if err := store.store.Persist(binding.RequestID, provider.receipt); err != nil {
+		t.Fatal(err)
+	}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err == nil {
+		t.Fatal("retained receipt bypassed canonical replay validation")
+	}
+	if provider.calls.Load() != 0 || provider.validationCalls.Load() != 1 || registrar.calls.Load() != 0 || credentials.Load() != 0 {
+		t.Fatalf("compile=%d validate=%d register=%d credential=%d", provider.calls.Load(), provider.validationCalls.Load(), registrar.calls.Load(), credentials.Load())
+	}
+}
+
 func TestRuntimeBindingV2LostLocalAcknowledgementReplaysAfterDaemonRestart(t *testing.T) {
 	var mu sync.Mutex
 	order := []string{}
@@ -762,6 +793,9 @@ func TestPreflightRegistrationCapabilityOnlyWhenGateConfigured(t *testing.T) {
 	}
 	if slices.Contains(preflightRegistrationCapabilities(base, registrar, replayable, nil), ExecutionPreflightRegistrationCapability) {
 		t.Fatal("daemon without execution compiler advertised preflight registration")
+	}
+	if slices.Contains(preflightRegistrationCapabilities(base, registrar, replayable, &countingExecutionPreflight{}), ExecutionPreflightRegistrationCapability) {
+		t.Fatal("daemon without canonical retained-receipt validation advertised preflight registration")
 	}
 	configured := preflightRegistrationCapabilities(base, registrar, replayable, provider)
 	if !slices.Contains(configured, ExecutionPreflightRegistrationCapability) {

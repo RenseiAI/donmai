@@ -65,5 +65,8 @@ func preflightRegistrationCapabilities(capabilities []string, registrar Executio
 	if _, compiles := provider.(ExecutionPreflightProvider); !compiles {
 		return capabilities
 	}
+	if _, validatesReplay := provider.(ExecutionPreflightReplayValidator); !validatesReplay {
+		return capabilities
+	}
 	return mergePreflightRegistrationCapability(capabilities)
 }
