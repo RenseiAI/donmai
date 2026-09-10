@@ -17,6 +17,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 )
 
@@ -131,18 +132,39 @@ func localAdmissionFor(request executioncell.PreflightRegistrationRequest) local
 	}
 }
 
-func readyPreflightReceipt(t *testing.T, binding executioncell.RuntimeBinding) json.RawMessage {
+func readyPreflightReceipt(t *testing.T, binding executioncell.RuntimeBinding, operationalDigest string) json.RawMessage {
 	t.Helper()
-	plan := json.RawMessage(`{}`)
+	claimReceiptID := ""
+	if binding.ClaimID != "" {
+		claimReceiptID = "claim-receipt"
+	}
+	promptReceipt := agent.PromptDeliveryReceipt{ContractVersion: agent.PromptContractVersion, ProfileID: "test-prompt", Decision: "ready", Entries: []agent.PromptDeliveryEntry{}}
+	toolReceipt := agent.ToolLifecycleReceipt{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: "admission-v2", ClaimReceiptID: claimReceiptID, OperationalPayloadDigest: operationalDigest, ProfileID: "test-tools", Decision: "ready", EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true, Entries: []agent.ToolLifecycleEntry{}}
+	channels := []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"}
+	materializations := make([]agent.HarnessMaterialization, 0, len(channels))
+	for _, channel := range channels {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	prepared := agent.PreparedHarness{ContractVersion: agent.HarnessAdaptationContractVersion, Harness: "codex", Mode: agent.PromptModeAutonomous, OperationalPayloadDigest: operationalDigest, AuthorityDigest: strings.Repeat("f", 64), RuntimeMCPNames: []string{}, Materializations: materializations, PromptReceipt: promptReceipt, ToolLifecycleReceipt: toolReceipt}
+	plan := rawJSON(t, prepared)
 	digest := sha256.Sum256(plan)
 	return rawJSON(t, executioncell.HostAdaptationReceipt{
 		ContractVersion: executioncell.HostAdaptationContractVersion,
 		RequestID:       binding.RequestID, WorkerID: binding.WorkerID,
 		PlacementID: binding.PlacementID, ClaimID: binding.ClaimID,
 		Decision: "ready", Plan: plan, PlanDigest: hex.EncodeToString(digest[:]),
-		PromptReceipt:        json.RawMessage(`{"decision":"ready"}`),
-		ToolLifecycleReceipt: json.RawMessage(`{"decision":"ready"}`),
+		PromptReceipt:        rawJSON(t, promptReceipt),
+		ToolLifecycleReceipt: rawJSON(t, toolReceipt),
 	})
+}
+
+func operationalDigestFor(t *testing.T, detail *SessionDetail) string {
+	t.Helper()
+	digest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return digest
 }
 
 func v2Detail(t *testing.T) (*SessionDetail, executioncell.RuntimeBinding) {
@@ -213,7 +235,7 @@ func TestRuntimeBindingV2RegistersAfterFsyncBeforeCredentialAndSpawn(t *testing.
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
 	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
 	var credentials atomic.Int32
@@ -245,7 +267,7 @@ func TestRuntimeBindingV2TwoContendersStartAtMostOnce(t *testing.T) {
 	order := []string{}
 	firstDetail, binding := v2Detail(t)
 	secondDetail, _ := v2Detail(t)
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, firstDetail))}
 	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
 	var credentials atomic.Int32
@@ -274,7 +296,7 @@ func TestRuntimeBindingV2FileRegistrarConsumesCurrentLocalAuthority(t *testing.T
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
 	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 	dir := t.TempDir()
 	registrar := NewFileExecutionPreflightRegistrar(dir)
@@ -312,7 +334,7 @@ func TestRuntimeBindingV2RefusalStopsCredentialAndSpawn(t *testing.T) {
 			var mu sync.Mutex
 			order := []string{}
 			detail, binding := v2Detail(t)
-			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
 			store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 			registrar := &orderedRegistrar{mu: &mu, order: &order, response: response}
 			var credentials atomic.Int32
@@ -331,11 +353,39 @@ func TestRuntimeBindingV2RefusalStopsCredentialAndSpawn(t *testing.T) {
 	}
 }
 
+func TestRuntimeBindingV2MalformedNestedReceiptStopsRegistrationCredentialAndSpawn(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	var malformed executioncell.HostAdaptationReceipt
+	if err := json.Unmarshal(readyPreflightReceipt(t, binding, operationalDigestFor(t, detail)), &malformed); err != nil {
+		t.Fatal(err)
+	}
+	malformed.Plan = json.RawMessage(`{"decision":"denied","unexpected":true}`)
+	planDigest := sha256.Sum256(malformed.Plan)
+	malformed.PlanDigest = hex.EncodeToString(planDigest[:])
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: rawJSON(t, malformed)}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err == nil {
+		t.Fatal("malformed nested receipt was accepted")
+	}
+	if registrar.calls.Load() != 0 || credentials.Load() != 0 {
+		t.Fatalf("registrar calls=%d credential calls=%d", registrar.calls.Load(), credentials.Load())
+	}
+	if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+		t.Fatalf("spawn marker exists: %v", err)
+	}
+}
+
 func TestRuntimeBindingV2LostAcknowledgementReplaysRetainedReceiptWithoutCompilation(t *testing.T) {
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding), failReplay: true}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail)), failReplay: true}
 	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 	var registrations atomic.Int32
 	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
@@ -363,7 +413,7 @@ func TestRuntimeBindingV2LostLocalAcknowledgementReplaysAfterDaemonRestart(t *te
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding), failReplay: true}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail)), failReplay: true}
 	receiptDir, registrationDir := t.TempDir(), t.TempDir()
 	firstStore := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(receiptDir)}
 	firstRegistrar := &losingFileRegistrar{registrar: NewFileExecutionPreflightRegistrar(registrationDir)}
@@ -405,7 +455,7 @@ func TestRuntimeBindingV2RequiresRegistrarAndReplayStore(t *testing.T) {
 			var mu sync.Mutex
 			order := []string{}
 			detail, binding := v2Detail(t)
-			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
 			store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 			registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
 			var credentials atomic.Int32
@@ -445,7 +495,7 @@ func TestRuntimeBindingV1DoesNotInvokeV2Registrar(t *testing.T) {
 	order := []string{}
 	cell := daemonExecutionCell()
 	binding := executioncell.RuntimeBinding{ContractVersion: executioncell.RuntimeBindingContractVersion, RequestID: "request-v1", WorkerID: "worker-local", PlacementID: cell.Placement.ID}
-	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, strings.Repeat("a", 64))}
 	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
 	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
 		return executioncell.PreflightRegistrationResponse{}, errors.New("v1 must not call registrar")
@@ -465,7 +515,7 @@ func TestRuntimeBindingV1DoesNotInvokeV2Registrar(t *testing.T) {
 func TestPersistExecutionPreflightV2ReaffirmsExactBytes(t *testing.T) {
 	store := NewFileExecutionPreflightStore(t.TempDir())
 	binding := executioncell.RuntimeBinding{ContractVersion: executioncell.RuntimeBindingContractVersion, RequestID: "session-1", WorkerID: "worker", PlacementID: "host"}
-	receipt := readyPreflightReceipt(t, binding)
+	receipt := readyPreflightReceipt(t, binding, strings.Repeat("a", 64))
 	if _, err := persistExecutionPreflightV2(store, "session-1", receipt); err != nil {
 		t.Fatal(err)
 	}
@@ -490,7 +540,7 @@ func TestPersistExecutionPreflightV2ReaffirmsDirectoryAfterPublishedSyncFailure(
 		return syncExecutionPreflightRoot(root)
 	}
 	binding := executioncell.RuntimeBinding{ContractVersion: executioncell.RuntimeBindingV2ContractVersion, RequestID: "session-sync-retry", WorkerID: "worker", PlacementID: "host", PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"}}
-	receipt := readyPreflightReceipt(t, binding)
+	receipt := readyPreflightReceipt(t, binding, strings.Repeat("a", 64))
 	if _, err := persistExecutionPreflightV2(store, binding.RequestID, receipt); err == nil {
 		t.Fatal("published receipt with failed directory sync was accepted")
 	}
@@ -509,7 +559,7 @@ func TestFileExecutionPreflightRegistrarPersistsAndReplaysExactRequest(t *testin
 		RequestID:       "request-local", WorkerID: "worker", PlacementID: "host",
 		PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"},
 	}
-	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding), strings.Repeat("a", 64))
+	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding, strings.Repeat("a", 64)), strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -532,7 +582,7 @@ func TestFileExecutionPreflightRegistrarPersistsAndReplaysExactRequest(t *testin
 
 	changedBinding := binding
 	changedBinding.PreflightRegistration = &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"}
-	changedReceipt := readyPreflightReceipt(t, changedBinding)
+	changedReceipt := readyPreflightReceipt(t, changedBinding, strings.Repeat("a", 64))
 	changedReceipt = append(changedReceipt[:len(changedReceipt)-1], ' ', '}')
 	changed, err := executioncell.NewPreflightRegistrationRequest(changedBinding, changedReceipt, strings.Repeat("a", 64))
 	if err != nil {
@@ -568,7 +618,7 @@ func TestFileExecutionPreflightRegistrarRefusesConsumedAndRetiredAuthority(t *te
 		RequestID:       "request-lifecycle", WorkerID: "worker", PlacementID: "host", ClaimID: "claim",
 		PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"},
 	}
-	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding), strings.Repeat("a", 64))
+	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding, strings.Repeat("a", 64)), strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -632,7 +682,7 @@ func TestHTTPExecutionPreflightRegistrarUsesFixedOriginAndRotatingToken(t *testi
 		RequestID:       "request-http", WorkerID: "worker", PlacementID: "host",
 		PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"},
 	}
-	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding), strings.Repeat("a", 64))
+	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding, strings.Repeat("a", 64)), strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -671,7 +721,7 @@ func TestHTTPExecutionPreflightRegistrarRefusesRedirectAndUntrustedOrigin(t *tes
 		RequestID:       "request-http", WorkerID: "worker", PlacementID: "host",
 		PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"},
 	}
-	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding), strings.Repeat("a", 64))
+	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding, strings.Repeat("a", 64)), strings.Repeat("a", 64))
 	if err != nil {
 		t.Fatal(err)
 	}

@@ -2097,6 +2097,11 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if (preflightErr == nil && hostReceipt.Decision != "ready") || (preflightErr != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
 			}
+			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion && preflightErr == nil {
+				if validationErr := validateExecutionPreflightReceiptAuthority(detail, binding, receipt, operationalDigest); validationErr != nil {
+					return nil, fmt.Errorf("validate registered host adaptation receipt: %w", validationErr)
+				}
+			}
 			if !replayedReceipt {
 				persistedReceipt = receipt
 				var persistErr error

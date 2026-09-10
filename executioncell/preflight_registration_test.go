@@ -6,19 +6,33 @@ import (
 	"encoding/json"
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func readyHostReceipt(t *testing.T, binding RuntimeBinding) []byte {
 	t.Helper()
-	plan := json.RawMessage(`{}`)
+	operationalDigest := strings.Repeat("a", 64)
+	prompt := agent.PromptDeliveryReceipt{ContractVersion: agent.PromptContractVersion, ProfileID: "test-prompt", Decision: "ready", Entries: []agent.PromptDeliveryEntry{}}
+	claimReceiptID := ""
+	if binding.ClaimID != "" {
+		claimReceiptID = "claim-receipt"
+	}
+	tool := agent.ToolLifecycleReceipt{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: "admission", ClaimReceiptID: claimReceiptID, OperationalPayloadDigest: operationalDigest, ProfileID: "test-tools", Decision: "ready", EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true, Entries: []agent.ToolLifecycleEntry{}}
+	channels := []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"}
+	materializations := make([]agent.HarnessMaterialization, 0, len(channels))
+	for _, channel := range channels {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	plan := mustJSON(t, agent.PreparedHarness{ContractVersion: agent.HarnessAdaptationContractVersion, Harness: "stub", Mode: agent.PromptModeAutonomous, OperationalPayloadDigest: operationalDigest, AuthorityDigest: strings.Repeat("f", 64), RuntimeMCPNames: []string{}, Materializations: materializations, PromptReceipt: prompt, ToolLifecycleReceipt: tool})
 	digest := sha256.Sum256(plan)
 	raw, err := json.Marshal(HostAdaptationReceipt{
 		ContractVersion: HostAdaptationContractVersion,
 		RequestID:       binding.RequestID, WorkerID: binding.WorkerID,
 		PlacementID: binding.PlacementID, ClaimID: binding.ClaimID,
 		Decision: "ready", Plan: plan, PlanDigest: hex.EncodeToString(digest[:]),
-		PromptReceipt:        json.RawMessage(`{"decision":"ready"}`),
-		ToolLifecycleReceipt: json.RawMessage(`{"decision":"ready"}`),
+		PromptReceipt:        mustJSON(t, prompt),
+		ToolLifecycleReceipt: mustJSON(t, tool),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -105,6 +119,50 @@ func TestPreflightRegistrationRequestClosedAndBound(t *testing.T) {
 	withUnknown := []byte(string(raw[:len(raw)-1]) + `,"extra":true}`)
 	if _, err := DecodePreflightRegistrationRequest(withUnknown); err == nil {
 		t.Fatal("unknown request field accepted")
+	}
+}
+
+func TestPreflightRegistrationRequestRejectsMalformedNestedHostAuthority(t *testing.T) {
+	binding := runtimeBindingV2()
+	valid := readyHostReceipt(t, binding)
+	var base HostAdaptationReceipt
+	if err := json.Unmarshal(valid, &base); err != nil {
+		t.Fatal(err)
+	}
+	cases := map[string]func(*HostAdaptationReceipt){
+		"denied unknown plan": func(receipt *HostAdaptationReceipt) {
+			receipt.Plan = json.RawMessage(`{"decision":"denied","unexpected":true}`)
+			digest := sha256.Sum256(receipt.Plan)
+			receipt.PlanDigest = hex.EncodeToString(digest[:])
+		},
+		"unknown prompt receipt member": func(receipt *HostAdaptationReceipt) {
+			receipt.PromptReceipt = json.RawMessage(`{"contractVersion":"donmai.prompt-delivery/v1alpha1","profileId":"test-prompt","decision":"ready","entries":[],"unexpected":true}`)
+		},
+		"denied tool receipt": func(receipt *HostAdaptationReceipt) {
+			var tool agent.ToolLifecycleReceipt
+			if err := json.Unmarshal(receipt.ToolLifecycleReceipt, &tool); err != nil {
+				t.Fatal(err)
+			}
+			tool.Decision = "denied"
+			receipt.ToolLifecycleReceipt = mustJSON(t, tool)
+		},
+		"nested receipt differs from plan": func(receipt *HostAdaptationReceipt) {
+			var prompt agent.PromptDeliveryReceipt
+			if err := json.Unmarshal(receipt.PromptReceipt, &prompt); err != nil {
+				t.Fatal(err)
+			}
+			prompt.ProfileID = "different-profile"
+			receipt.PromptReceipt = mustJSON(t, prompt)
+		},
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			candidate := base
+			mutate(&candidate)
+			if _, err := NewPreflightRegistrationRequest(binding, mustJSON(t, candidate), strings.Repeat("a", 64)); err == nil {
+				t.Fatal("malformed nested host authority was accepted")
+			}
+		})
 	}
 }
 
