@@ -21,9 +21,11 @@ import (
 )
 
 type orderedPreflightProvider struct {
-	mu      *sync.Mutex
-	order   *[]string
-	receipt json.RawMessage
+	mu         *sync.Mutex
+	order      *[]string
+	receipt    json.RawMessage
+	calls      atomic.Int32
+	failReplay bool
 }
 
 func (p *orderedPreflightProvider) Names() []string { return []string{"stub"} }
@@ -32,9 +34,13 @@ func (p *orderedPreflightProvider) Capabilities(string) (map[string]any, bool) {
 }
 
 func (p *orderedPreflightProvider) PreflightExecution(json.RawMessage) (json.RawMessage, error) {
+	call := p.calls.Add(1)
 	p.mu.Lock()
 	*p.order = append(*p.order, "compile")
 	p.mu.Unlock()
+	if p.failReplay && call > 1 {
+		return nil, errors.New("compiler changed after retained receipt")
+	}
 	return slices.Clone(p.receipt), nil
 }
 
@@ -58,11 +64,44 @@ func (s *orderedReplayStore) Load(sessionID string) (json.RawMessage, error) {
 	return s.store.Load(sessionID)
 }
 
+func (s *orderedReplayStore) BeginExecutionPreflightStart(ctx context.Context, request executioncell.PreflightRegistrationRequest, response executioncell.PreflightRegistrationResponse) error {
+	return s.store.BeginExecutionPreflightStart(ctx, request, response)
+}
+
+func (s *orderedReplayStore) RetireExecutionPreflight(ctx context.Context, requestID string) error {
+	return s.store.RetireExecutionPreflight(ctx, requestID)
+}
+
 type orderedRegistrar struct {
 	mu       *sync.Mutex
 	order    *[]string
 	calls    atomic.Int32
 	response func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error)
+}
+
+type losingFileRegistrar struct {
+	registrar *FileExecutionPreflightRegistrar
+	lost      atomic.Bool
+}
+
+func (r *losingFileRegistrar) RegisterExecutionPreflight(ctx context.Context, request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+	response, err := r.registrar.RegisterExecutionPreflight(ctx, request)
+	if err == nil && response.Decision == "authorized" && !r.lost.Swap(true) {
+		return executioncell.PreflightRegistrationResponse{}, errors.New("simulated lost local acknowledgement")
+	}
+	return response, err
+}
+
+func (r *losingFileRegistrar) admitExecutionPreflight(ctx context.Context, admission localExecutionPreflightAdmission) error {
+	return r.registrar.admitExecutionPreflight(ctx, admission)
+}
+
+func (r *losingFileRegistrar) beginExecutionPreflightStart(ctx context.Context, request executioncell.PreflightRegistrationRequest, response executioncell.PreflightRegistrationResponse) error {
+	return r.registrar.beginExecutionPreflightStart(ctx, request, response)
+}
+
+func (r *losingFileRegistrar) retireExecutionPreflight(ctx context.Context, requestID string) error {
+	return r.registrar.retireExecutionPreflight(ctx, requestID)
 }
 
 func (r *orderedRegistrar) RegisterExecutionPreflight(_ context.Context, request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
@@ -83,6 +122,15 @@ func authorizedRegistration(request executioncell.PreflightRegistrationRequest) 
 	}, nil
 }
 
+func localAdmissionFor(request executioncell.PreflightRegistrationRequest) localExecutionPreflightAdmission {
+	return localExecutionPreflightAdmission{
+		ContractVersion: localExecutionPreflightAuthorityVersion, RuntimeBinding: request.RuntimeBinding,
+		OperationalPayloadDigest: request.OperationalPayloadDigest,
+		AdmissionReceiptSHA256:   strings.Repeat("b", 64), EffectiveCellSHA256: strings.Repeat("c", 64),
+		AuthorizationRevision: 1,
+	}
+}
+
 func readyPreflightReceipt(t *testing.T, binding executioncell.RuntimeBinding) json.RawMessage {
 	t.Helper()
 	plan := json.RawMessage(`{}`)
@@ -100,6 +148,11 @@ func readyPreflightReceipt(t *testing.T, binding executioncell.RuntimeBinding) j
 func v2Detail(t *testing.T) (*SessionDetail, executioncell.RuntimeBinding) {
 	t.Helper()
 	cell := daemonExecutionCell()
+	operationalPayload := json.RawMessage(`{"empty":false,"items":[]}`)
+	operationalDigest, err := executioncell.DigestOperationalPayload(operationalPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
 	binding := executioncell.RuntimeBinding{
 		ContractVersion: executioncell.RuntimeBindingV2ContractVersion,
 		RequestID:       "request-v2", WorkerID: "worker-local", PlacementID: cell.Placement.ID,
@@ -108,11 +161,16 @@ func v2Detail(t *testing.T) (*SessionDetail, executioncell.RuntimeBinding) {
 			Required:        true, ChallengeID: "challenge-v2",
 		},
 	}
+	admission := executioncell.AdmissionReceipt{
+		ContractVersion: executioncell.ContractVersion, ReceiptID: "admission-v2", RequestID: binding.RequestID,
+		Decision: executioncell.AdmissionAdmitted, Cell: &cell, IntentDigest: strings.Repeat("e", 64),
+		OperationalPayloadDigest: operationalDigest, ResolverDecisions: []executioncell.ResolverDecision{}, RecordedAt: "2026-09-09T12:00:00Z",
+	}
 	return &SessionDetail{
 		SessionID: binding.RequestID, WorkerID: binding.WorkerID,
-		AdmissionReceipt: json.RawMessage(`{"valid":"admission"}`),
+		AdmissionReceipt: rawJSON(t, admission),
 		EffectiveCell:    rawJSON(t, cell), ExecutionRuntimeBinding: rawJSON(t, binding),
-		OperationalPayload: json.RawMessage(`{"empty":false,"items":[]}`),
+		OperationalPayload: operationalPayload,
 	}, binding
 }
 
@@ -212,6 +270,29 @@ func TestRuntimeBindingV2TwoContendersStartAtMostOnce(t *testing.T) {
 	}
 }
 
+func TestRuntimeBindingV2FileRegistrarConsumesCurrentLocalAuthority(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding)}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	dir := t.TempDir()
+	registrar := NewFileExecutionPreflightRegistrar(dir)
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err != nil {
+		t.Fatal(err)
+	}
+	retry, _ := v2Detail(t)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: retry.SessionID, ProjectID: "project-v2"}, retry); err == nil {
+		t.Fatal("consumed local start authority was reused")
+	}
+	if provider.calls.Load() != 1 || credentials.Load() != 1 {
+		t.Fatalf("compiler calls=%d credential calls=%d, want one admitted start", provider.calls.Load(), credentials.Load())
+	}
+}
+
 func TestRuntimeBindingV2RefusalStopsCredentialAndSpawn(t *testing.T) {
 	cases := map[string]func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error){
 		"transport error": func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
@@ -247,6 +328,67 @@ func TestRuntimeBindingV2RefusalStopsCredentialAndSpawn(t *testing.T) {
 				t.Fatalf("spawn marker exists: %v", err)
 			}
 		})
+	}
+}
+
+func TestRuntimeBindingV2LostAcknowledgementReplaysRetainedReceiptWithoutCompilation(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding), failReplay: true}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	var registrations atomic.Int32
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+		if registrations.Add(1) == 1 {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("ack lost")
+		}
+		return authorizedRegistration(request)
+	}}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err == nil {
+		t.Fatal("lost acknowledgement was accepted")
+	}
+	retry, _ := v2Detail(t)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: retry.SessionID, ProjectID: "project-v2"}, retry); err != nil {
+		t.Fatalf("retained-receipt retry: %v", err)
+	}
+	if provider.calls.Load() != 1 {
+		t.Fatalf("compiler calls = %d, want retained receipt replay without recompilation", provider.calls.Load())
+	}
+}
+
+func TestRuntimeBindingV2LostLocalAcknowledgementReplaysAfterDaemonRestart(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding), failReplay: true}
+	receiptDir, registrationDir := t.TempDir(), t.TempDir()
+	firstStore := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(receiptDir)}
+	firstRegistrar := &losingFileRegistrar{registrar: NewFileExecutionPreflightRegistrar(registrationDir)}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	firstDaemon := startV2Daemon(t, provider, firstStore, firstRegistrar, &order, &mu, &credentials, marker)
+	if _, err := firstDaemon.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err == nil {
+		t.Fatal("lost local acknowledgement was accepted")
+	}
+	if credentials.Load() != 0 {
+		t.Fatalf("credential hook calls before restart = %d", credentials.Load())
+	}
+	if err := firstDaemon.Stop(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+
+	secondStore := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(receiptDir)}
+	secondRegistrar := NewFileExecutionPreflightRegistrar(registrationDir)
+	secondDaemon := startV2Daemon(t, provider, secondStore, secondRegistrar, &order, &mu, &credentials, marker)
+	retry, _ := v2Detail(t)
+	if _, err := secondDaemon.AcceptWorkWithDetail(SessionSpec{SessionID: retry.SessionID, ProjectID: "project-v2"}, retry); err != nil {
+		t.Fatalf("restart retained-receipt retry: %v", err)
+	}
+	if provider.calls.Load() != 1 || credentials.Load() != 1 {
+		t.Fatalf("compiler calls=%d credential calls=%d after restart", provider.calls.Load(), credentials.Load())
 	}
 }
 
@@ -338,6 +480,29 @@ func TestPersistExecutionPreflightV2ReaffirmsExactBytes(t *testing.T) {
 	}
 }
 
+func TestPersistExecutionPreflightV2ReaffirmsDirectoryAfterPublishedSyncFailure(t *testing.T) {
+	store := NewFileExecutionPreflightStore(t.TempDir())
+	var syncCalls atomic.Int32
+	store.syncRoot = func(root *os.Root) error {
+		if syncCalls.Add(1) == 1 {
+			return errors.New("simulated directory sync failure after publish")
+		}
+		return syncExecutionPreflightRoot(root)
+	}
+	binding := executioncell.RuntimeBinding{ContractVersion: executioncell.RuntimeBindingV2ContractVersion, RequestID: "session-sync-retry", WorkerID: "worker", PlacementID: "host", PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"}}
+	receipt := readyPreflightReceipt(t, binding)
+	if _, err := persistExecutionPreflightV2(store, binding.RequestID, receipt); err == nil {
+		t.Fatal("published receipt with failed directory sync was accepted")
+	}
+	got, err := persistExecutionPreflightV2(store, binding.RequestID, receipt)
+	if err != nil || !slices.Equal(got, receipt) {
+		t.Fatalf("reaffirmed receipt = %s, %v", got, err)
+	}
+	if syncCalls.Load() != 2 {
+		t.Fatalf("directory sync calls = %d, want publish failure plus replay reaffirmation", syncCalls.Load())
+	}
+}
+
 func TestFileExecutionPreflightRegistrarPersistsAndReplaysExactRequest(t *testing.T) {
 	binding := executioncell.RuntimeBinding{
 		ContractVersion: executioncell.RuntimeBindingV2ContractVersion,
@@ -349,6 +514,13 @@ func TestFileExecutionPreflightRegistrarPersistsAndReplaysExactRequest(t *testin
 		t.Fatal(err)
 	}
 	registrar := NewFileExecutionPreflightRegistrar(t.TempDir())
+	unauthorized, err := registrar.RegisterExecutionPreflight(context.Background(), request)
+	if err != nil || unauthorized.Decision != "refused" || unauthorized.Code != executioncell.PreflightAuthorizationUnavailable {
+		t.Fatalf("unadmitted request = %+v, %v", unauthorized, err)
+	}
+	if err := registrar.admitExecutionPreflight(context.Background(), localAdmissionFor(request)); err != nil {
+		t.Fatal(err)
+	}
 	first, err := registrar.RegisterExecutionPreflight(context.Background(), request)
 	if err != nil {
 		t.Fatal(err)
@@ -390,6 +562,44 @@ func TestFileExecutionPreflightRegistrarPersistsAndReplaysExactRequest(t *testin
 	}
 }
 
+func TestFileExecutionPreflightRegistrarRefusesConsumedAndRetiredAuthority(t *testing.T) {
+	binding := executioncell.RuntimeBinding{
+		ContractVersion: executioncell.RuntimeBindingV2ContractVersion,
+		RequestID:       "request-lifecycle", WorkerID: "worker", PlacementID: "host", ClaimID: "claim",
+		PreflightRegistration: &executioncell.PreflightRegistrationRef{ContractVersion: executioncell.PreflightRegistrationContractVersion, Required: true, ChallengeID: "challenge"},
+	}
+	request, err := executioncell.NewPreflightRegistrationRequest(binding, readyPreflightReceipt(t, binding), strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := localAdmissionFor(request)
+	admission.ClaimReceiptSHA256 = strings.Repeat("d", 64)
+	dir := t.TempDir()
+	registrar := NewFileExecutionPreflightRegistrar(dir)
+	if err := registrar.admitExecutionPreflight(context.Background(), admission); err != nil {
+		t.Fatal(err)
+	}
+	response, err := registrar.RegisterExecutionPreflight(context.Background(), request)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := registrar.beginExecutionPreflightStart(context.Background(), request, response); err != nil {
+		t.Fatal(err)
+	}
+	started, err := registrar.RegisterExecutionPreflight(context.Background(), request)
+	if err != nil || started.Decision != "refused" || started.Code != executioncell.PreflightAlreadyStarted {
+		t.Fatalf("started response = %+v, %v", started, err)
+	}
+	if err := registrar.retireExecutionPreflight(context.Background(), binding.RequestID); err != nil {
+		t.Fatal(err)
+	}
+	registrar = NewFileExecutionPreflightRegistrar(dir)
+	retired, err := registrar.RegisterExecutionPreflight(context.Background(), request)
+	if err != nil || retired.Decision != "refused" || retired.Code != executioncell.PreflightClaimRetired {
+		t.Fatalf("retired response = %+v, %v", retired, err)
+	}
+}
+
 func TestFileExecutionPreflightRegistrarRefusesDeniedReceiptAndCancellation(t *testing.T) {
 	binding := executioncell.RuntimeBinding{
 		ContractVersion: executioncell.RuntimeBindingV2ContractVersion,
@@ -402,6 +612,9 @@ func TestFileExecutionPreflightRegistrarRefusesDeniedReceiptAndCancellation(t *t
 		t.Fatal(err)
 	}
 	registrar := NewFileExecutionPreflightRegistrar(t.TempDir())
+	if err := registrar.admitExecutionPreflight(context.Background(), localAdmissionFor(request)); err != nil {
+		t.Fatal(err)
+	}
 	response, err := registrar.RegisterExecutionPreflight(context.Background(), request)
 	if err != nil || response.Decision != "refused" || response.Code != executioncell.PreflightReceiptDenied {
 		t.Fatalf("denied response = %+v, %v", response, err)

@@ -8,6 +8,7 @@ import (
 	"log/slog"
 	"net/http"
 	"os"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -1084,6 +1085,24 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
 		if ev.Kind == SessionEventEnded && d.sessionDetails != nil {
+			if store, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightReplayStore); ok {
+				if detail, found := d.sessionDetails.Get(ev.Spec.SessionID); found {
+					if binding, decodeErr := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding); decodeErr == nil && binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+						if retireErr := store.RetireExecutionPreflight(context.Background(), ev.Spec.SessionID); retireErr != nil {
+							slog.Warn("retire host execution preflight start", "session_id", ev.Spec.SessionID, "error", retireErr)
+						}
+					}
+				}
+			}
+			if authority, ok := d.opts.ExecutionPreflightRegistrar.(localExecutionPreflightAuthority); ok {
+				if detail, found := d.sessionDetails.Get(ev.Spec.SessionID); found {
+					if binding, decodeErr := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding); decodeErr == nil && binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+						if retireErr := authority.retireExecutionPreflight(context.Background(), ev.Spec.SessionID); retireErr != nil {
+							slog.Warn("retire local execution preflight authority", "session_id", ev.Spec.SessionID, "error", retireErr)
+						}
+					}
+				}
+			}
 			d.sessionDetails.Delete(ev.Spec.SessionID)
 		}
 	})
@@ -1870,6 +1889,10 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // corresponding SessionEventEnded event, so stale credentials never linger in
 // memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
+	var localPreflight localExecutionPreflightAuthority
+	var preflightReplay ExecutionPreflightReplayStore
+	var localPreflightRequest *executioncell.PreflightRegistrationRequest
+	var localPreflightResponse *executioncell.PreflightRegistrationResponse
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
 	}
@@ -1920,62 +1943,146 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if err := d.validateExecutionRuntimeBinding(detail); err != nil {
 				return nil, err
 			}
-			compiler, ok := d.opts.ProviderRegistry.(ExecutionPreflightProvider)
-			if !ok || d.opts.ExecutionPreflightStore == nil {
-				return nil, errors.New("receipt-bearing work requires daemon execution preflight and durable receipt store")
+			if d.opts.ExecutionPreflightStore == nil {
+				return nil, errors.New("receipt-bearing work requires a durable execution preflight receipt store")
 			}
-			modelProfileJSON, err := marshalOptional(detail.ModelProfile)
-			if err != nil {
-				return nil, fmt.Errorf("marshal model profile: %w", err)
+			binding, _ := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+			var operationalDigest string
+			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+				if d.opts.ExecutionPreflightRegistrar == nil {
+					return nil, errors.New("runtime binding v2 requires a configured execution preflight registrar")
+				}
+				var digestErr error
+				operationalDigest, digestErr = executioncell.DigestOperationalPayload(detail.OperationalPayload)
+				if digestErr != nil {
+					return nil, fmt.Errorf("digest execution preflight operational payload: %w", digestErr)
+				}
+				if authority, ok := d.opts.ExecutionPreflightRegistrar.(localExecutionPreflightAuthority); ok {
+					admitted, admissionErr := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+					if admissionErr != nil {
+						return nil, fmt.Errorf("validate local execution preflight admission: %w", admissionErr)
+					}
+					admittedValue := admitted.Value()
+					if admittedValue.Decision != executioncell.AdmissionAdmitted || admittedValue.Cell == nil || admittedValue.RequestID != binding.RequestID || admittedValue.OperationalPayloadDigest != operationalDigest {
+						return nil, errors.New("local execution preflight authority requires the exact admitted operational request")
+					}
+					effective, effectiveErr := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)
+					if effectiveErr != nil {
+						return nil, fmt.Errorf("validate local execution preflight effective cell: %w", effectiveErr)
+					}
+					if len(detail.ClaimReceipt) == 0 {
+						if !reflect.DeepEqual(*admittedValue.Cell, effective) {
+							return nil, errors.New("local execution preflight effective cell changed the exact admission")
+						}
+					} else {
+						claim, claimErr := executioncell.DecodeClaimReceipt(detail.ClaimReceipt)
+						if claimErr != nil {
+							return nil, fmt.Errorf("validate local execution preflight claim: %w", claimErr)
+						}
+						if claimErr = executioncell.AssertNarrowClaim(admitted, claim); claimErr != nil {
+							return nil, fmt.Errorf("validate local execution preflight claim authority: %w", claimErr)
+						}
+						claimValue := claim.Value()
+						if claimValue.Decision != executioncell.ClaimClaimed || claimValue.EffectiveCell == nil || !reflect.DeepEqual(*claimValue.EffectiveCell, effective) {
+							return nil, errors.New("local execution preflight effective cell does not match the active claim")
+						}
+					}
+					admission := localExecutionPreflightAdmission{
+						ContractVersion: localExecutionPreflightAuthorityVersion, RuntimeBinding: binding,
+						OperationalPayloadDigest: operationalDigest, AdmissionReceiptSHA256: digestPreflightBytes(detail.AdmissionReceipt),
+						EffectiveCellSHA256: digestPreflightBytes(detail.EffectiveCell), AuthorizationRevision: 1,
+					}
+					if len(detail.ClaimReceipt) > 0 {
+						admission.ClaimReceiptSHA256 = digestPreflightBytes(detail.ClaimReceipt)
+					}
+					registrationContext := d.landingCtx
+					if registrationContext == nil {
+						registrationContext = context.Background()
+					}
+					if err := authority.admitExecutionPreflight(registrationContext, admission); err != nil {
+						return nil, fmt.Errorf("establish local execution preflight authority: %w", err)
+					}
+					localPreflight = authority
+				}
 			}
-			resolvedProfileJSON, err := marshalOptional(detail.ResolvedProfile)
-			if err != nil {
-				return nil, fmt.Errorf("marshal resolved profile: %w", err)
+
+			var receipt json.RawMessage
+			var persistedReceipt json.RawMessage
+			var preflightErr error
+			replayedReceipt := false
+			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+				replayable, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightReplayStore)
+				if !ok {
+					return nil, errors.New("runtime binding v2 requires an exact-replay execution preflight store")
+				}
+				preflightReplay = replayable
+				existing, loadErr := replayable.Load(spec.SessionID)
+				if loadErr == nil {
+					receipt = existing
+					persistedReceipt = existing
+					replayedReceipt = true
+				} else if !errors.Is(loadErr, os.ErrNotExist) {
+					return nil, fmt.Errorf("recover execution adaptation receipt: %w", loadErr)
+				}
 			}
-			stageBudgetJSON, err := marshalOptional(detail.StageBudget)
-			if err != nil {
-				return nil, fmt.Errorf("marshal stage budget: %w", err)
-			}
-			preflightInput := struct {
-				SessionID               string          `json:"sessionId"`
-				WorkerID                string          `json:"workerId"`
-				AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
-				ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
-				EffectiveCell           json.RawMessage `json:"effectiveCell"`
-				ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
-				OperationalPayload      json.RawMessage `json:"operationalPayload"`
-				// ModelProfile and ResolvedProfile are SessionDetail's sibling
-				// profile fields — never embedded in OperationalPayload itself
-				// (see the doc comment on each in session_detail.go). Forwarded
-				// here so ProviderView.PreflightExecution can apply the exact
-				// same runner.ReconcileResolvedProfile reconciliation the
-				// spawned child applies (afcli.detailToQueuedWork) BEFORE
-				// compiling the PreparedHarness plan: without this, preflight
-				// and spawn could derive Model/Effort/ProviderConfig/Endpoint
-				// from different inputs and ApplyPreparedHarness's authority
-				// digest could never agree.
-				ModelProfile    json.RawMessage `json:"modelProfile,omitempty"`
-				ResolvedProfile json.RawMessage `json:"resolvedProfile,omitempty"`
-				// StageBudget is also a SessionDetail sibling. It contributes to
-				// autonomous prompt authority, so preflight and spawn must apply
-				// the same shared reconciliation over this exact value.
-				StageBudget json.RawMessage `json:"stageBudget,omitempty"`
-			}{
-				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
-				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
-				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
-				OperationalPayload: detail.OperationalPayload,
-				ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
-				StageBudget: stageBudgetJSON,
-			}
-			detailJSON, err := json.Marshal(preflightInput)
-			if err != nil {
-				return nil, fmt.Errorf("marshal execution preflight detail: %w", err)
-			}
-			receipt, err := compiler.PreflightExecution(detailJSON)
-			if len(receipt) == 0 {
+			if !replayedReceipt {
+				compiler, ok := d.opts.ProviderRegistry.(ExecutionPreflightProvider)
+				if !ok {
+					return nil, errors.New("receipt-bearing work requires daemon execution preflight")
+				}
+				modelProfileJSON, err := marshalOptional(detail.ModelProfile)
 				if err != nil {
-					return nil, fmt.Errorf("execution adaptation preflight returned no receipt: %w", err)
+					return nil, fmt.Errorf("marshal model profile: %w", err)
+				}
+				resolvedProfileJSON, err := marshalOptional(detail.ResolvedProfile)
+				if err != nil {
+					return nil, fmt.Errorf("marshal resolved profile: %w", err)
+				}
+				stageBudgetJSON, err := marshalOptional(detail.StageBudget)
+				if err != nil {
+					return nil, fmt.Errorf("marshal stage budget: %w", err)
+				}
+				preflightInput := struct {
+					SessionID               string          `json:"sessionId"`
+					WorkerID                string          `json:"workerId"`
+					AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+					ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
+					EffectiveCell           json.RawMessage `json:"effectiveCell"`
+					ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+					OperationalPayload      json.RawMessage `json:"operationalPayload"`
+					// ModelProfile and ResolvedProfile are SessionDetail's sibling
+					// profile fields — never embedded in OperationalPayload itself
+					// (see the doc comment on each in session_detail.go). Forwarded
+					// here so ProviderView.PreflightExecution can apply the exact
+					// same runner.ReconcileResolvedProfile reconciliation the
+					// spawned child applies (afcli.detailToQueuedWork) BEFORE
+					// compiling the PreparedHarness plan: without this, preflight
+					// and spawn could derive Model/Effort/ProviderConfig/Endpoint
+					// from different inputs and ApplyPreparedHarness's authority
+					// digest could never agree.
+					ModelProfile    json.RawMessage `json:"modelProfile,omitempty"`
+					ResolvedProfile json.RawMessage `json:"resolvedProfile,omitempty"`
+					// StageBudget is also a SessionDetail sibling. It contributes to
+					// autonomous prompt authority, so preflight and spawn must apply
+					// the same shared reconciliation over this exact value.
+					StageBudget json.RawMessage `json:"stageBudget,omitempty"`
+				}{
+					SessionID: detail.SessionID, WorkerID: detail.WorkerID,
+					AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
+					EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
+					OperationalPayload: detail.OperationalPayload,
+					ModelProfile:       modelProfileJSON, ResolvedProfile: resolvedProfileJSON,
+					StageBudget: stageBudgetJSON,
+				}
+				detailJSON, err := json.Marshal(preflightInput)
+				if err != nil {
+					return nil, fmt.Errorf("marshal execution preflight detail: %w", err)
+				}
+				receipt, preflightErr = compiler.PreflightExecution(detailJSON)
+			}
+			if len(receipt) == 0 {
+				if preflightErr != nil {
+					return nil, fmt.Errorf("execution adaptation preflight returned no receipt: %w", preflightErr)
 				}
 				return nil, errors.New("execution adaptation preflight returned no receipt")
 			}
@@ -1983,43 +2090,37 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if decodeErr != nil {
 				return nil, fmt.Errorf("execution adaptation receipt: %w", decodeErr)
 			}
-			binding, _ := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
 			if hostReceipt.RequestID != binding.RequestID || hostReceipt.WorkerID != binding.WorkerID ||
 				hostReceipt.PlacementID != binding.PlacementID || hostReceipt.ClaimID != binding.ClaimID {
 				return nil, errors.New("execution adaptation receipt does not match daemon runtime binding")
 			}
-			if (err == nil && hostReceipt.Decision != "ready") || (err != nil && hostReceipt.Decision != "denied") {
+			if (preflightErr == nil && hostReceipt.Decision != "ready") || (preflightErr != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
 			}
-			persistedReceipt := receipt
-			var persistErr error
-			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
-				persistedReceipt, persistErr = persistExecutionPreflightV2(d.opts.ExecutionPreflightStore, spec.SessionID, receipt)
-			} else {
-				persistErr = d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt)
+			if !replayedReceipt {
+				persistedReceipt = receipt
+				var persistErr error
+				if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
+					persistedReceipt, persistErr = persistExecutionPreflightV2(d.opts.ExecutionPreflightStore, spec.SessionID, receipt)
+				} else {
+					persistErr = d.opts.ExecutionPreflightStore.Persist(spec.SessionID, receipt)
+				}
+				if persistErr != nil {
+					persistFailure := fmt.Errorf("persist execution adaptation receipt: %w", persistErr)
+					if preflightErr != nil {
+						// A denied preflight receipt is still authoritative when its
+						// durable audit write fails. Keep both independently observable:
+						// callers project typed denials into the NACK contract, while
+						// operators must also see the persistence failure.
+						return nil, errors.Join(
+							persistFailure,
+							fmt.Errorf("execution adaptation preflight: %w", preflightErr),
+						)
+					}
+					return nil, persistFailure
+				}
 			}
-			if persistErr != nil {
-				persistFailure := fmt.Errorf("persist execution adaptation receipt: %w", persistErr)
-				if err != nil {
-					// A denied preflight receipt is still authoritative when its
-					// durable audit write fails. Keep both independently observable:
-					// callers project typed denials into the NACK contract, while
-					// operators must also see the persistence failure.
-					return nil, errors.Join(
-						persistFailure,
-						fmt.Errorf("execution adaptation preflight: %w", err),
-					)
-				}
-				return nil, persistFailure
-			}
 			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
-				if d.opts.ExecutionPreflightRegistrar == nil {
-					return nil, errors.New("runtime binding v2 requires a configured execution preflight registrar")
-				}
-				operationalDigest, digestErr := executioncell.DigestOperationalPayload(detail.OperationalPayload)
-				if digestErr != nil {
-					return nil, fmt.Errorf("digest execution preflight operational payload: %w", digestErr)
-				}
 				registrationRequest, requestErr := executioncell.NewPreflightRegistrationRequest(binding, persistedReceipt, operationalDigest)
 				if requestErr != nil {
 					return nil, fmt.Errorf("build execution preflight registration: %w", requestErr)
@@ -2035,9 +2136,11 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if registrationErr = executioncell.ValidateAuthorizedPreflightRegistration(registrationRequest, registrationResponse); registrationErr != nil {
 					return nil, fmt.Errorf("execution preflight acknowledgement: %w", registrationErr)
 				}
+				localPreflightRequest = &registrationRequest
+				localPreflightResponse = &registrationResponse
 			}
-			if err != nil {
-				return nil, fmt.Errorf("execution adaptation preflight: %w", err)
+			if preflightErr != nil {
+				return nil, fmt.Errorf("execution adaptation preflight: %w", preflightErr)
 			}
 			detail.HostAdaptationReceipt = append(json.RawMessage(nil), persistedReceipt...)
 		}
@@ -2050,10 +2153,40 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
 		}
 	}
+	if localPreflightRequest != nil && localPreflightResponse != nil && preflightReplay != nil {
+		if err := preflightReplay.BeginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
+			if detailLease.generation != 0 {
+				d.sessionDetails.DeleteIfOwner(detailLease)
+			}
+			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
+		}
+		if localPreflight != nil {
+			if err := localPreflight.beginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
+				if detailLease.generation != 0 {
+					d.sessionDetails.DeleteIfOwner(detailLease)
+				}
+				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
+				if retireErr != nil {
+					return nil, errors.Join(fmt.Errorf("consume local execution preflight start authority: %w", err), fmt.Errorf("retire host execution preflight start: %w", retireErr))
+				}
+				return nil, fmt.Errorf("consume local execution preflight start authority: %w", err)
+			}
+		}
+	}
 	handle, err := d.spawner.AcceptWork(spec)
 	if err != nil {
 		if detailLease.generation != 0 {
 			d.sessionDetails.DeleteIfOwner(detailLease)
+		}
+		if localPreflight != nil {
+			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("retire failed local execution preflight start: %w", retireErr))
+			}
+		}
+		if preflightReplay != nil {
+			if retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
+				return nil, errors.Join(err, fmt.Errorf("retire failed host execution preflight start: %w", retireErr))
+			}
 		}
 		return nil, err
 	}

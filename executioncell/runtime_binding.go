@@ -16,6 +16,26 @@ var stableRuntimeRef = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:-]{0,255}$`)
 
 func validRuntimeRef(value string) bool { return stableRuntimeRef.MatchString(value) }
 
+func rawObjectMembers(raw []byte, label string) (map[string]json.RawMessage, error) {
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+		return nil, fmt.Errorf("executioncell: %s must be an object", label)
+	}
+	return members, nil
+}
+
+func presentJSONString(members map[string]json.RawMessage, key string) (string, bool) {
+	raw, present := members[key]
+	if !present {
+		return "", false
+	}
+	var value string
+	if err := json.Unmarshal(raw, &value); err != nil {
+		return "", false
+	}
+	return value, true
+}
+
 // RuntimeBindingContractVersion identifies the authenticated poll-to-host
 // execution target. The binding is deliberately separate from receipt and
 // effective-cell evidence: the authenticated poll claim owns these values.
@@ -111,6 +131,10 @@ func DecodeRuntimeBinding(raw []byte) (RuntimeBinding, error) {
 	if err := rejectDuplicateFields(raw); err != nil {
 		return RuntimeBinding{}, err
 	}
+	members, err := rawObjectMembers(raw, "runtime binding")
+	if err != nil {
+		return RuntimeBinding{}, err
+	}
 	var value RuntimeBinding
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
@@ -128,9 +152,16 @@ func DecodeRuntimeBinding(raw []byte) (RuntimeBinding, error) {
 		return RuntimeBinding{}, errors.New("executioncell: runtime binding requestId, workerId, and placementId are required")
 	}
 	if value.ContractVersion == RuntimeBindingContractVersion {
-		if value.PreflightRegistration != nil {
+		if _, present := members["preflightRegistration"]; present {
 			return RuntimeBinding{}, errors.New("executioncell: runtime binding v1 cannot require preflight registration")
 		}
+	}
+	if _, present := members["claimId"]; present {
+		if decoded, ok := presentJSONString(members, "claimId"); !ok || decoded == "" || decoded != value.ClaimID {
+			return RuntimeBinding{}, errors.New("executioncell: runtime binding claimId must be an omitted or nonempty string")
+		}
+	}
+	if value.ContractVersion == RuntimeBindingContractVersion {
 		return value, nil
 	}
 	registration := value.PreflightRegistration

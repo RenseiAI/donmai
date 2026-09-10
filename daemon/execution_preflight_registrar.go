@@ -15,6 +15,7 @@ import (
 	"net/url"
 	"os"
 	"strings"
+	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/executioncell"
@@ -25,6 +26,40 @@ import (
 type ExecutionPreflightRegistrar interface {
 	RegisterExecutionPreflight(context.Context, executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error)
 }
+
+// localExecutionPreflightAuthority is the OSS controller-side authority used
+// by the daemon. The admission is recorded only after the daemon validates the
+// actual admission/claim/runtime binding. Registration consumes that durable
+// pre-start fact; it cannot mint permission from a host receipt alone.
+type localExecutionPreflightAuthority interface {
+	admitExecutionPreflight(context.Context, localExecutionPreflightAdmission) error
+	beginExecutionPreflightStart(context.Context, executioncell.PreflightRegistrationRequest, executioncell.PreflightRegistrationResponse) error
+	retireExecutionPreflight(context.Context, string) error
+}
+
+type localExecutionPreflightAdmission struct {
+	ContractVersion          string                       `json:"contractVersion"`
+	RuntimeBinding           executioncell.RuntimeBinding `json:"runtimeBinding"`
+	OperationalPayloadDigest string                       `json:"operationalPayloadDigest"`
+	AdmissionReceiptSHA256   string                       `json:"admissionReceiptSha256"`
+	ClaimReceiptSHA256       string                       `json:"claimReceiptSha256,omitempty"`
+	EffectiveCellSHA256      string                       `json:"effectiveCellSha256"`
+	AuthorizationRevision    uint64                       `json:"authorizationRevision"`
+}
+
+type localExecutionPreflightStart struct {
+	ContractVersion string                       `json:"contractVersion"`
+	RegistrationID  string                       `json:"registrationId"`
+	ReceiptSHA256   string                       `json:"receiptSha256"`
+	RuntimeBinding  executioncell.RuntimeBinding `json:"runtimeBinding"`
+}
+
+type localExecutionPreflightRetirement struct {
+	ContractVersion string `json:"contractVersion"`
+	RequestID       string `json:"requestId"`
+}
+
+const localExecutionPreflightAuthorityVersion = "execution-preflight-local-authority/v1"
 
 func persistExecutionPreflightV2(store ExecutionPreflightStore, sessionID string, receipt json.RawMessage) (json.RawMessage, error) {
 	if len(receipt) == 0 || len(receipt) > executioncell.MaxPreflightRegistrationReceiptBytes {
@@ -147,7 +182,10 @@ func (r *HTTPExecutionPreflightRegistrar) RegisterExecutionPreflight(ctx context
 // The daemon calls it only after authenticating/validating the admitted detail;
 // it durably binds that exact request and returns the same acknowledgement on
 // replay. It contains no hosted control-plane assumptions.
-type FileExecutionPreflightRegistrar struct{ dir string }
+type FileExecutionPreflightRegistrar struct {
+	dir string
+	mu  sync.Mutex
+}
 
 // NewFileExecutionPreflightRegistrar constructs the OSS local-controller
 // registrar rooted at an append-only directory.
@@ -160,17 +198,13 @@ type filePreflightRegistrationRecord struct {
 	Response executioncell.PreflightRegistrationResponse `json:"response"`
 }
 
+func localExecutionPreflightRecordBase(requestID string) string {
+	digest := sha256.Sum256([]byte(requestID))
+	return hex.EncodeToString(digest[:])
+}
+
 func registrationRecordName(request executioncell.PreflightRegistrationRequest) string {
-	ref := request.RuntimeBinding.PreflightRegistration
-	identity := strings.Join([]string{
-		request.RuntimeBinding.RequestID,
-		request.RuntimeBinding.WorkerID,
-		request.RuntimeBinding.PlacementID,
-		request.RuntimeBinding.ClaimID,
-		ref.ChallengeID,
-	}, "\x00")
-	digest := sha256.Sum256([]byte(identity))
-	return hex.EncodeToString(digest[:]) + ".json"
+	return localExecutionPreflightRecordBase(request.RuntimeBinding.RequestID) + ".registration.json"
 }
 
 func localRegistrationResponse(request executioncell.PreflightRegistrationRequest) executioncell.PreflightRegistrationResponse {
@@ -178,13 +212,164 @@ func localRegistrationResponse(request executioncell.PreflightRegistrationReques
 	digest := sha256.Sum256(raw)
 	binding := request.RuntimeBinding
 	return executioncell.PreflightRegistrationResponse{
-		ContractVersion:       executioncell.PreflightRegistrationContractVersion,
-		Decision:              "authorized",
-		RegistrationID:        "preflight_registration_" + hex.EncodeToString(digest[:16]),
-		ReceiptSHA256:         request.ReceiptSHA256,
-		RuntimeBinding:        &binding,
-		AuthorizationRevision: 1,
+		ContractVersion: executioncell.PreflightRegistrationContractVersion,
+		Decision:        "authorized",
+		RegistrationID:  "preflight_registration_" + hex.EncodeToString(digest[:16]),
+		ReceiptSHA256:   request.ReceiptSHA256,
+		RuntimeBinding:  &binding,
+		// Revision 1 is the durable admitted-session authority; revision 2 is
+		// the exact registration transition committed before this response.
+		AuthorizationRevision: 2,
 	}
+}
+
+func localAdmissionRecordName(requestID string) string {
+	return localExecutionPreflightRecordBase(requestID) + ".admission.json"
+}
+
+func localStartRecordName(requestID string) string {
+	return localExecutionPreflightRecordBase(requestID) + ".started.json"
+}
+
+func localRetirementRecordName(requestID string) string {
+	return localExecutionPreflightRecordBase(requestID) + ".retired.json"
+}
+
+func digestPreflightBytes(raw []byte) string {
+	digest := sha256.Sum256(raw)
+	return hex.EncodeToString(digest[:])
+}
+
+func validPreflightDigest(value string) bool {
+	if len(value) != sha256.Size*2 || value != strings.ToLower(value) {
+		return false
+	}
+	_, err := hex.DecodeString(value)
+	return err == nil
+}
+
+func durableLocalPreflightRecord(root *os.Root, name string, raw []byte) error {
+	var nonce [16]byte
+	if _, err := rand.Read(nonce[:]); err != nil {
+		return fmt.Errorf("generate local execution preflight nonce: %w", err)
+	}
+	pending := "." + name + fmt.Sprintf(".%x.pending", nonce)
+	file, err := root.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Remove(pending) }()
+	if _, err = file.Write(raw); err == nil {
+		err = file.Sync()
+	}
+	if closeErr := file.Close(); err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	if err = root.Link(pending, name); err != nil {
+		return err
+	}
+	return syncRegistrationRoot(root)
+}
+
+func readLocalPreflightRecord(root *os.Root, name string) ([]byte, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = file.Close() }()
+	raw, err := io.ReadAll(io.LimitReader(file, 512*1024+1))
+	if err != nil {
+		return nil, err
+	}
+	if len(raw) == 0 || len(raw) > 512*1024 {
+		return nil, errors.New("local execution preflight record size is invalid")
+	}
+	return raw, nil
+}
+
+func localPreflightRecordExists(root *os.Root, name string) (bool, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		if errors.Is(err, os.ErrNotExist) {
+			return false, nil
+		}
+		return false, err
+	}
+	if err := file.Close(); err != nil {
+		return false, err
+	}
+	return true, nil
+}
+
+func openLocalPreflightRoot(dir string) (*os.Root, error) {
+	if strings.TrimSpace(dir) == "" {
+		return nil, errors.New("execution preflight registration directory is required")
+	}
+	if err := os.MkdirAll(dir, 0o700); err != nil {
+		return nil, fmt.Errorf("create execution preflight registration directory: %w", err)
+	}
+	return os.OpenRoot(dir)
+}
+
+// admitExecutionPreflight durably records the local controller's actual
+// admitted, pre-start authority. Exact retries are allowed; changed authority,
+// a consumed start, or a retired lifecycle refuse before compilation.
+func (r *FileExecutionPreflightRegistrar) admitExecutionPreflight(ctx context.Context, admission localExecutionPreflightAdmission) error {
+	if r == nil {
+		return errors.New("execution preflight local authority is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if admission.ContractVersion != localExecutionPreflightAuthorityVersion || admission.AuthorizationRevision != 1 ||
+		!validPreflightDigest(admission.OperationalPayloadDigest) || !validPreflightDigest(admission.AdmissionReceiptSHA256) ||
+		!validPreflightDigest(admission.EffectiveCellSHA256) ||
+		(admission.RuntimeBinding.ClaimID == "" && admission.ClaimReceiptSHA256 != "") ||
+		(admission.RuntimeBinding.ClaimID != "" && !validPreflightDigest(admission.ClaimReceiptSHA256)) {
+		return errors.New("execution preflight local admission is invalid")
+	}
+	bindingRaw, err := json.Marshal(admission.RuntimeBinding)
+	if err != nil {
+		return err
+	}
+	if _, err := executioncell.DecodeRuntimeBinding(bindingRaw); err != nil || admission.RuntimeBinding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
+		return errors.New("execution preflight local admission requires runtime binding v2")
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	root, err := openLocalPreflightRoot(r.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	requestID := admission.RuntimeBinding.RequestID
+	if retired, checkErr := localPreflightRecordExists(root, localRetirementRecordName(requestID)); checkErr != nil {
+		return checkErr
+	} else if retired {
+		return errors.New("execution preflight claim is retired")
+	}
+	if started, checkErr := localPreflightRecordExists(root, localStartRecordName(requestID)); checkErr != nil {
+		return checkErr
+	} else if started {
+		return errors.New("execution preflight already started")
+	}
+	raw, err := json.Marshal(admission)
+	if err != nil {
+		return err
+	}
+	name := localAdmissionRecordName(requestID)
+	if existing, readErr := readLocalPreflightRecord(root, name); readErr == nil {
+		if !bytes.Equal(existing, raw) {
+			return errors.New("execution preflight local admission changed")
+		}
+		return syncRegistrationRoot(root)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	return durableLocalPreflightRecord(root, name, raw)
 }
 
 // RegisterExecutionPreflight stores one exact local authority preimage and
@@ -210,22 +395,57 @@ func (r *FileExecutionPreflightRegistrar) RegisterExecutionPreflight(ctx context
 	if hostReceipt.Decision != "ready" {
 		return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightReceiptDenied}, nil
 	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	root, err := openLocalPreflightRoot(r.dir)
+	if err != nil {
+		return executioncell.PreflightRegistrationResponse{}, err
+	}
+	defer func() { _ = root.Close() }()
+	requestID := request.RuntimeBinding.RequestID
+	if retired, checkErr := localPreflightRecordExists(root, localRetirementRecordName(requestID)); checkErr != nil {
+		return executioncell.PreflightRegistrationResponse{}, checkErr
+	} else if retired {
+		return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightClaimRetired}, nil
+	}
+	if started, checkErr := localPreflightRecordExists(root, localStartRecordName(requestID)); checkErr != nil {
+		return executioncell.PreflightRegistrationResponse{}, checkErr
+	} else if started {
+		return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightAlreadyStarted}, nil
+	}
+	admissionRaw, readErr := readLocalPreflightRecord(root, localAdmissionRecordName(requestID))
+	if errors.Is(readErr, os.ErrNotExist) {
+		return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightAuthorizationUnavailable}, nil
+	}
+	if readErr != nil {
+		return executioncell.PreflightRegistrationResponse{}, readErr
+	}
+	var admission localExecutionPreflightAdmission
+	if err := json.Unmarshal(admissionRaw, &admission); err != nil {
+		return executioncell.PreflightRegistrationResponse{}, errors.New("execution preflight local admission is corrupt")
+	}
+	canonicalAdmission, err := json.Marshal(admission)
+	if err != nil || !bytes.Equal(canonicalAdmission, admissionRaw) || admission.ContractVersion != localExecutionPreflightAuthorityVersion || admission.AuthorizationRevision != 1 {
+		return executioncell.PreflightRegistrationResponse{}, errors.New("execution preflight local admission is corrupt")
+	}
+	admittedBinding, _ := json.Marshal(admission.RuntimeBinding)
+	requestBinding, _ := json.Marshal(request.RuntimeBinding)
+	if !bytes.Equal(admittedBinding, requestBinding) || admission.OperationalPayloadDigest != request.OperationalPayloadDigest {
+		return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightBindingMismatch}, nil
+	}
+	// Reaffirm the admission directory entry before consuming it as current
+	// authorization, including crash recovery after link-before-dirsync.
+	if err := syncRegistrationRoot(root); err != nil {
+		return executioncell.PreflightRegistrationResponse{}, err
+	}
 	response := localRegistrationResponse(request)
 	record := filePreflightRegistrationRecord{Request: request, Response: response}
 	raw, err := json.Marshal(record)
 	if err != nil {
 		return executioncell.PreflightRegistrationResponse{}, err
 	}
-	if err := os.MkdirAll(r.dir, 0o700); err != nil {
-		return executioncell.PreflightRegistrationResponse{}, fmt.Errorf("create execution preflight registration directory: %w", err)
-	}
-	root, err := os.OpenRoot(r.dir)
-	if err != nil {
-		return executioncell.PreflightRegistrationResponse{}, err
-	}
-	defer func() { _ = root.Close() }()
 	name := registrationRecordName(request)
-	if existing, readErr := readRegistrationRecord(root, name); readErr == nil {
+	if existing, readErr := readLocalPreflightRecord(root, name); readErr == nil {
 		if !bytes.Equal(existing, raw) {
 			return executioncell.PreflightRegistrationResponse{ContractVersion: executioncell.PreflightRegistrationContractVersion, Decision: "refused", Code: executioncell.PreflightBindingMismatch}, nil
 		}
@@ -236,28 +456,9 @@ func (r *FileExecutionPreflightRegistrar) RegisterExecutionPreflight(ctx context
 	} else if !errors.Is(readErr, os.ErrNotExist) {
 		return executioncell.PreflightRegistrationResponse{}, readErr
 	}
-	var nonce [16]byte
-	if _, err := rand.Read(nonce[:]); err != nil {
-		return executioncell.PreflightRegistrationResponse{}, fmt.Errorf("generate preflight registration nonce: %w", err)
-	}
-	pending := "." + name + fmt.Sprintf(".%x.pending", nonce)
-	file, err := root.OpenFile(pending, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0o600)
-	if err != nil {
-		return executioncell.PreflightRegistrationResponse{}, err
-	}
-	defer func() { _ = root.Remove(pending) }()
-	if _, err = file.Write(raw); err == nil {
-		err = file.Sync()
-	}
-	if closeErr := file.Close(); err == nil {
-		err = closeErr
-	}
-	if err != nil {
-		return executioncell.PreflightRegistrationResponse{}, err
-	}
-	if err = root.Link(pending, name); err != nil {
+	if err = durableLocalPreflightRecord(root, name, raw); err != nil {
 		if errors.Is(err, os.ErrExist) {
-			existing, readErr := readRegistrationRecord(root, name)
+			existing, readErr := readLocalPreflightRecord(root, name)
 			if readErr == nil && bytes.Equal(existing, raw) {
 				if syncErr := syncRegistrationRoot(root); syncErr != nil {
 					return executioncell.PreflightRegistrationResponse{}, syncErr
@@ -268,10 +469,91 @@ func (r *FileExecutionPreflightRegistrar) RegisterExecutionPreflight(ctx context
 		}
 		return executioncell.PreflightRegistrationResponse{}, err
 	}
-	if err = syncRegistrationRoot(root); err != nil {
-		return executioncell.PreflightRegistrationResponse{}, err
-	}
 	return response, nil
+}
+
+// beginExecutionPreflightStart consumes one registered pre-start authority
+// before any credential hook or process spawn. The marker is append-only, so a
+// crash cannot reopen the start permission.
+func (r *FileExecutionPreflightRegistrar) beginExecutionPreflightStart(ctx context.Context, request executioncell.PreflightRegistrationRequest, response executioncell.PreflightRegistrationResponse) error {
+	if r == nil {
+		return errors.New("execution preflight local authority is not configured")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	if err := executioncell.ValidateAuthorizedPreflightRegistration(request, response); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	root, err := openLocalPreflightRoot(r.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	requestID := request.RuntimeBinding.RequestID
+	if retired, checkErr := localPreflightRecordExists(root, localRetirementRecordName(requestID)); checkErr != nil {
+		return checkErr
+	} else if retired {
+		return errors.New("execution preflight claim is retired")
+	}
+	if started, checkErr := localPreflightRecordExists(root, localStartRecordName(requestID)); checkErr != nil {
+		return checkErr
+	} else if started {
+		return errors.New("execution preflight already started")
+	}
+	recordRaw, err := readLocalPreflightRecord(root, registrationRecordName(request))
+	if err != nil {
+		return fmt.Errorf("read execution preflight registration before start: %w", err)
+	}
+	expectedRaw, err := json.Marshal(filePreflightRegistrationRecord{Request: request, Response: response})
+	if err != nil || !bytes.Equal(recordRaw, expectedRaw) {
+		return errors.New("execution preflight registration changed before start")
+	}
+	start := localExecutionPreflightStart{ContractVersion: localExecutionPreflightAuthorityVersion, RegistrationID: response.RegistrationID, ReceiptSHA256: response.ReceiptSHA256, RuntimeBinding: request.RuntimeBinding}
+	raw, err := json.Marshal(start)
+	if err != nil {
+		return err
+	}
+	return durableLocalPreflightRecord(root, localStartRecordName(requestID), raw)
+}
+
+// retireExecutionPreflight appends the local terminal/failed-start fact. A
+// retained start marker remains visible, but retirement takes precedence on
+// every future registration attempt.
+func (r *FileExecutionPreflightRegistrar) retireExecutionPreflight(ctx context.Context, requestID string) error {
+	if r == nil || strings.TrimSpace(requestID) == "" {
+		return errors.New("execution preflight local retirement is invalid")
+	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	root, err := openLocalPreflightRoot(r.dir)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	if _, err := readLocalPreflightRecord(root, localAdmissionRecordName(requestID)); err != nil {
+		return fmt.Errorf("retire unknown execution preflight admission: %w", err)
+	}
+	name := localRetirementRecordName(requestID)
+	record := localExecutionPreflightRetirement{ContractVersion: localExecutionPreflightAuthorityVersion, RequestID: requestID}
+	raw, err := json.Marshal(record)
+	if err != nil {
+		return err
+	}
+	if existing, readErr := readLocalPreflightRecord(root, name); readErr == nil {
+		if !bytes.Equal(existing, raw) {
+			return errors.New("execution preflight retirement changed")
+		}
+		return syncRegistrationRoot(root)
+	} else if !errors.Is(readErr, os.ErrNotExist) {
+		return readErr
+	}
+	return durableLocalPreflightRecord(root, name, raw)
 }
 
 func syncRegistrationRoot(root *os.Root) error {
@@ -287,13 +569,4 @@ func syncRegistrationRoot(root *os.Root) error {
 		return err
 	}
 	return nil
-}
-
-func readRegistrationRecord(root *os.Root, name string) ([]byte, error) {
-	file, err := root.Open(name)
-	if err != nil {
-		return nil, err
-	}
-	defer func() { _ = file.Close() }()
-	return io.ReadAll(io.LimitReader(file, 512*1024))
 }

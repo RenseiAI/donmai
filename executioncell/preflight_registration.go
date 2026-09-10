@@ -145,6 +145,17 @@ func ValidatePreflightRegistrationRequest(value PreflightRegistrationRequest) er
 // DecodePreflightRegistrationRequest rejects unknown, duplicate, trailing and
 // semantically invalid input.
 func DecodePreflightRegistrationRequest(raw []byte) (PreflightRegistrationRequest, error) {
+	members, err := rawObjectMembers(raw, "preflight registration request")
+	if err != nil {
+		return PreflightRegistrationRequest{}, err
+	}
+	bindingRaw, present := members["runtimeBinding"]
+	if !present {
+		return PreflightRegistrationRequest{}, errors.New("executioncell: preflight registration runtimeBinding is required")
+	}
+	if _, err := DecodeRuntimeBinding(bindingRaw); err != nil {
+		return PreflightRegistrationRequest{}, err
+	}
 	var value PreflightRegistrationRequest
 	if err := decodeClosed(raw, &value, "preflight registration request"); err != nil {
 		return PreflightRegistrationRequest{}, err
@@ -200,9 +211,32 @@ func ValidatePreflightRegistrationResponse(value PreflightRegistrationResponse) 
 // DecodePreflightRegistrationResponse rejects unknown, duplicate, trailing and
 // semantically invalid input.
 func DecodePreflightRegistrationResponse(raw []byte) (PreflightRegistrationResponse, error) {
+	members, err := rawObjectMembers(raw, "preflight registration response")
+	if err != nil {
+		return PreflightRegistrationResponse{}, err
+	}
 	var value PreflightRegistrationResponse
 	if err := decodeClosed(raw, &value, "preflight registration response"); err != nil {
 		return PreflightRegistrationResponse{}, err
+	}
+	switch value.Decision {
+	case "authorized":
+		if _, present := members["code"]; present {
+			return PreflightRegistrationResponse{}, errors.New("executioncell: authorized preflight registration response cannot contain refusal fields")
+		}
+		bindingRaw, present := members["runtimeBinding"]
+		if !present {
+			return PreflightRegistrationResponse{}, errors.New("executioncell: authorized preflight registration runtimeBinding is required")
+		}
+		if _, err := DecodeRuntimeBinding(bindingRaw); err != nil {
+			return PreflightRegistrationResponse{}, err
+		}
+	case "refused":
+		for _, key := range []string{"registrationId", "receiptSha256", "runtimeBinding", "authorizationRevision"} {
+			if _, present := members[key]; present {
+				return PreflightRegistrationResponse{}, errors.New("executioncell: refused preflight registration response cannot contain authorization fields")
+			}
+		}
 	}
 	if err := ValidatePreflightRegistrationResponse(value); err != nil {
 		return PreflightRegistrationResponse{}, err
