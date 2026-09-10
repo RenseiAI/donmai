@@ -89,6 +89,11 @@ type Options struct {
 	skipProcess    bool
 	stdinOverride  io.Writer
 	stdoutOverride io.Reader
+	// beforeInitialPrompt is a private test barrier after the real handshake,
+	// before the first prompt command. Observing events after Spawn cannot
+	// establish this ordering: the child may already have started its turn.
+	// Nil leaves the production launch sequence unchanged.
+	beforeInitialPrompt func(*Handle) error
 	// handshakeToken pins the per-session token in skipProcess tests so a
 	// scripted handshake fixture can echo it. Empty ⇒ a random token per Spawn.
 	handshakeToken string
@@ -344,6 +349,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			return nil, fmt.Errorf("%w: pi resume get_entries: %v", agent.ErrSpawnFailed, err)
 		}
 	default:
+		if p.opts.beforeInitialPrompt != nil {
+			if err := p.opts.beforeInitialPrompt(h); err != nil {
+				_ = h.Stop(context.Background())
+				return nil, fmt.Errorf("%w: pi initial prompt barrier: %v", agent.ErrSpawnFailed, err)
+			}
+		}
 		if err := client.WriteCommand(map[string]any{"type": "prompt", "message": spec.Prompt}); err != nil {
 			_ = h.Stop(context.Background())
 			return nil, fmt.Errorf("%w: pi prompt: %v", agent.ErrSpawnFailed, err)
