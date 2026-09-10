@@ -519,14 +519,19 @@ func adoptionAttemptDialTimeout(configured time.Duration, attempt int) time.Dura
 // a composing authority again for something it already refused is not recovery.
 // Everything else non-transient returns on the first answer, exactly as before.
 //
-// A retry re-dials the ALREADY-PREPARED candidate. Preparation runs inside the
-// handshake, after Hello authentication and before the Welcome write, so the
-// measured failure shape this retry exists for — a write timeout on an
-// established socket — happens AFTER preparation has already succeeded. Asking
-// again would mint a second control-plane reservation for a lineage whose first
-// one is admitted and undisposed, on a path that has no abandonment verb and no
-// drift to repair. The first answer is retained and replayed instead, so a hung
-// lineage costs extra dials and never extra reservations.
+// A retry re-dials the prepared candidate only while the next authenticated
+// Hello reports the same controller-generation floor it was prepared against.
+// Preparation runs after Hello and before Welcome. A failure before Welcome
+// reaches the shim therefore cannot have committed the candidate, and replay
+// avoids minting another reservation for the same lineage.
+//
+// A failed read of Adopted is different: Welcome may already have committed at
+// the shim even though the controller never received its acknowledgement. When
+// the retry's Hello reports a higher floor, replaying the cached Welcome would
+// violate the shim's split-brain fence. The composing authority must prepare a
+// fresh candidate from that authenticated live floor; this wrapper never
+// invents a generation locally and the handshake still refuses an answer that
+// does not advance it.
 func dialForAdoptionWithRetry(
 	ctx context.Context,
 	rec Record,
@@ -538,16 +543,19 @@ func dialForAdoptionWithRetry(
 	if opts.Prepare != nil {
 		prepare := opts.Prepare
 		var retained PreparedAdoption
+		var retainedAgainst shimwire.Generation
 		var retainedOK bool
 		attemptOpts.Prepare = func(prepareCtx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error) {
-			if retainedOK {
+			if retainedOK && evidence.CurrentControllerGeneration == retainedAgainst {
 				return clonePreparedAdoption(retained), nil
 			}
 			prepared, err := prepare(prepareCtx, evidence)
 			if err != nil {
 				return PreparedAdoption{}, err
 			}
-			retained, retainedOK = clonePreparedAdoption(prepared), true
+			retained = clonePreparedAdoption(prepared)
+			retainedAgainst = evidence.CurrentControllerGeneration
+			retainedOK = true
 			return prepared, nil
 		}
 	}
@@ -557,7 +565,7 @@ func dialForAdoptionWithRetry(
 		if !isTransientDialFailure(err) || errors.Is(err, ErrAdoptionPreparation) {
 			return ctrl, err
 		}
-		log.Warn("sessionshim: adoption dial failed transiently; retrying the prepared candidate before classifying",
+		log.Warn("sessionshim: adoption dial failed transiently; retrying from the authenticated shim generation floor before classifying",
 			"session", rec.Identity().String(), "attempt", attempt, "of", adoptionDialAttempts, "error", err)
 		delay := adoptionDialBackoff
 		for i := 2; i < attempt; i++ {
