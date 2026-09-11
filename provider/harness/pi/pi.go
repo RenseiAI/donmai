@@ -156,18 +156,21 @@ func New(opts Options) (*Provider, error) {
 	}
 	p.binary = full
 	p.realBinary = true
+	p.artifact, err = measureArtifactProfile(full)
+	if err != nil {
+		return nil, fmt.Errorf("%w: measure pi artifact profile: %v", agent.ErrProviderUnavailable, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.VersionProbeTimeout)
 	defer cancel()
 	unverified, perr := checkVersionPin(ctx, opts.VersionProbe, full)
 	if perr != nil {
+		if p.artifact != nil {
+			_ = p.artifact.close()
+		}
 		return nil, perr // already wraps ErrProviderUnavailable
 	}
 	p.unverified = unverified
-	p.artifact, err = measureArtifactProfile(full)
-	if err != nil {
-		return nil, fmt.Errorf("%w: measure pi artifact profile: %v", agent.ErrProviderUnavailable, err)
-	}
 	if p.artifact != nil {
 		// Exact compiled bytes are stronger authority than the generic semantic
 		// version window. A different binary with the same version remains on
@@ -313,17 +316,20 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	for i, delivery := range spec.AdditionalExtensions {
 		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i]}
 	}
-	var receipt *receiptAdmission
-	if spec.Autonomous {
-		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions)
-		if err != nil {
-			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
-		}
-	}
-
 	token := p.opts.handshakeToken
 	if token == "" {
 		token = newHandshakeToken()
+	}
+	// Compose once. Receipt admission inspects this exact final environment,
+	// and spawnChild assigns the same immutable slice to exec.Cmd.Env.
+	childEnv := composeChildEnv(spec, layout, token)
+	var receipt *receiptAdmission
+	if spec.Autonomous {
+		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
+		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
+		if err != nil {
+			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
+		}
 	}
 
 	var (
@@ -335,7 +341,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, token, mode, sessionID, p.artifact, receipt)
+		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt)
 		if serr != nil {
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
@@ -344,7 +350,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			p.opts.afterChildStart()
 		}
 		if p.artifact != nil {
-			if err := revalidateLaunchTrust(p.artifact, receipt); err != nil {
+			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
 				stopStartedChild(cmd)
 				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
 			}
@@ -432,12 +438,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 // its own process group. extensionPaths is the boundary extension followed by
 // every materialized+verified spec.AdditionalExtensions entry, in order
 // (ADR-2026-08-12 D1).
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, token string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
 	// nolint:gosec // G204: binary resolved from Options/env; args are a fixed
 	// set plus paths/ids/model this package controls.
 	cmd := exec.Command(p.binary, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...)
 	cmd.Dir = spec.Cwd
-	cmd.Env = composeChildEnv(spec, layout, token)
+	cmd.Env = childEnv
 	configureProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
@@ -456,7 +462,7 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 		if p.opts.beforeChildStart != nil {
 			p.opts.beforeChildStart()
 		}
-		if err := revalidateLaunchTrust(artifact, receipt); err != nil {
+		if err := revalidateLaunchTrust(artifact, receipt, childEnv); err != nil {
 			return nil, nil, nil, fmt.Errorf("pi artifact changed before spawn: %w", err)
 		}
 	}
@@ -467,8 +473,11 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 	return cmd, stdin, stdout, nil
 }
 
-func revalidateLaunchTrust(artifact *artifactLease, receipt *receiptAdmission) error {
+func revalidateLaunchTrust(artifact *artifactLease, receipt *receiptAdmission, childEnv []string) error {
 	if receipt != nil {
+		if !receipt.startup.matchesEnv(childEnv) {
+			return fmt.Errorf("pi receipt child environment changed")
+		}
 		return receipt.revalidate()
 	}
 	return artifact.revalidate()

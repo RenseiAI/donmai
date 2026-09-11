@@ -88,9 +88,128 @@ type extensionFileLease struct {
 type receiptAdmission struct {
 	artifact   *artifactLease
 	extensions []extensionFileLease // policy boundary first, then trusted additions
+	startup    *startupLease
 }
 
 type agentExtensionIdentity struct{ id, digest, path string }
+
+var receiptUnsafeStartupEnv = map[string]bool{
+	"BUN_OPTIONS":                  true,
+	"BUN_BE_BUN":                   true,
+	"NODE_OPTIONS":                 true,
+	"DYLD_INSERT_LIBRARIES":        true,
+	"DYLD_LIBRARY_PATH":            true,
+	"DYLD_FRAMEWORK_PATH":          true,
+	"DYLD_FALLBACK_LIBRARY_PATH":   true,
+	"DYLD_FALLBACK_FRAMEWORK_PATH": true,
+	"LD_PRELOAD":                   true,
+	"LD_LIBRARY_PATH":              true,
+}
+
+var receiptAutoloadConfigNames = []string{
+	"bunfig.toml",
+	".env",
+	".env.local",
+	".env.production",
+	".env.development",
+	".env.test",
+}
+
+// startupLease binds receipt trust to the exact exec.Cmd environment and to
+// the absence of workarea files Bun standalone executables autoload. Any such
+// input leaves the session available on the legacy path but withholds the new
+// receipt exception.
+type startupLease struct {
+	cwd         string
+	cwdInfo     os.FileInfo
+	env         []string
+	configNames []string
+}
+
+func measureReceiptStartupContext(cwd string, env []string) *startupLease {
+	for _, entry := range env {
+		if receiptUnsafeStartupEnv[startupEnvKey(entry)] {
+			return nil
+		}
+	}
+	cwdInfo, err := os.Lstat(cwd)
+	if err != nil || !cwdInfo.IsDir() || cwdInfo.Mode()&os.ModeSymlink != 0 {
+		return nil
+	}
+	configNames, ok := receiptStartupConfigNames(env)
+	if !ok {
+		return nil
+	}
+	for _, name := range configNames {
+		if _, err := os.Lstat(filepath.Join(cwd, name)); !os.IsNotExist(err) {
+			return nil
+		}
+	}
+	return &startupLease{
+		cwd: cwd, cwdInfo: cwdInfo,
+		env: append([]string(nil), env...), configNames: configNames,
+	}
+}
+
+func receiptStartupConfigNames(env []string) ([]string, bool) {
+	names := append([]string(nil), receiptAutoloadConfigNames...)
+	nodeEnv := ""
+	for _, entry := range env {
+		if startupEnvKey(entry) == "NODE_ENV" {
+			_, nodeEnv, _ = strings.Cut(entry, "=")
+		}
+	}
+	if nodeEnv == "" {
+		return names, true
+	}
+	if filepath.Base(nodeEnv) != nodeEnv || nodeEnv == "." || nodeEnv == ".." || strings.Contains(nodeEnv, "\\") {
+		return nil, false
+	}
+	name := ".env." + nodeEnv
+	for _, existing := range names {
+		if existing == name {
+			return names, true
+		}
+	}
+	return append(names, name), true
+}
+
+func startupEnvKey(entry string) string {
+	if index := strings.IndexByte(entry, '='); index >= 0 {
+		return entry[:index]
+	}
+	return entry
+}
+
+func withoutUnsafeStartupEnv(env []string) []string {
+	filtered := make([]string, 0, len(env))
+	for _, entry := range env {
+		if !receiptUnsafeStartupEnv[startupEnvKey(entry)] {
+			filtered = append(filtered, entry)
+		}
+	}
+	return filtered
+}
+
+func (l *startupLease) revalidate() error {
+	if l == nil {
+		return fmt.Errorf("pi receipt startup context unavailable")
+	}
+	cwdInfo, err := os.Lstat(l.cwd)
+	if err != nil || !cwdInfo.IsDir() || !os.SameFile(l.cwdInfo, cwdInfo) {
+		return fmt.Errorf("pi receipt workarea changed")
+	}
+	for _, name := range l.configNames {
+		if _, err := os.Lstat(filepath.Join(l.cwd, name)); !os.IsNotExist(err) {
+			return fmt.Errorf("pi receipt startup config %q appeared", name)
+		}
+	}
+	return nil
+}
+
+func (l *startupLease) matchesEnv(env []string) bool {
+	return l != nil && reflect.DeepEqual(l.env, env)
+}
 
 func sha256Reader(r io.Reader) (string, error) {
 	h := sha256.New()
@@ -430,8 +549,8 @@ func measureExtensionFile(id, path, digest string) (extensionFileLease, error) {
 	return extensionFileLease{id: id, path: path, digest: digest, info: before, size: before.Size(), mode: before.Mode()}, nil
 }
 
-func newReceiptAdmission(artifact *artifactLease, layout sessionLayout, actual []agentExtensionIdentity, trusted []TrustedExtensionIdentity) (*receiptAdmission, error) {
-	if artifact == nil || !trustedExtensionsMatch(trusted, actual) {
+func newReceiptAdmission(artifact *artifactLease, layout sessionLayout, actual []agentExtensionIdentity, trusted []TrustedExtensionIdentity, startup *startupLease) (*receiptAdmission, error) {
+	if artifact == nil || startup == nil || !trustedExtensionsMatch(trusted, actual) {
 		return nil, nil
 	}
 	policy, err := measureExtensionFile("donmai-policy", layout.extension, extensionSHA())
@@ -446,12 +565,15 @@ func newReceiptAdmission(artifact *artifactLease, layout sessionLayout, actual [
 		}
 		extensions = append(extensions, lease)
 	}
-	return &receiptAdmission{artifact: artifact, extensions: extensions}, nil
+	return &receiptAdmission{artifact: artifact, extensions: extensions, startup: startup}, nil
 }
 
 func (a *receiptAdmission) revalidate() error {
 	if a == nil || a.artifact == nil {
 		return fmt.Errorf("pi receipt admission unavailable")
+	}
+	if err := a.startup.revalidate(); err != nil {
+		return err
 	}
 	if err := a.artifact.revalidate(); err != nil {
 		return err

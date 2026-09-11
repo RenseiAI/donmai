@@ -32,12 +32,19 @@ func TestSameVersionAndCopiedSidecarCannotSelectProfile(t *testing.T) {
 	if err := os.Chmod(sidecarPath, 0o444); err != nil { //nolint:gosec // G302: reproduce the frozen descriptor's compiled mode.
 		t.Fatal(err)
 	}
+	probeCalled := false
 	_, err = New(Options{
-		PiBin:        binary,
-		VersionProbe: func(context.Context, string) (string, error) { return "0.85.1", nil },
+		PiBin: binary,
+		VersionProbe: func(context.Context, string) (string, error) {
+			probeCalled = true
+			return "0.85.1", nil
+		},
 	})
 	if err == nil || !errors.Is(err, agent.ErrProviderUnavailable) {
 		t.Fatalf("metadata-only same-version artifact error=%v, want provider unavailable", err)
+	}
+	if probeCalled {
+		t.Fatal("mismatched profiled artifact executed the version probe before measurement refused it")
 	}
 
 	if err := os.Remove(filepath.Join(root, artifactSidecarName)); err != nil {

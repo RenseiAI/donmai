@@ -49,7 +49,11 @@ func testReceiptAdmission(t *testing.T) (*receiptAdmission, string, string) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return &receiptAdmission{artifact: artifact, extensions: []extensionFileLease{extension}}, binaryPath, extensionPath
+	startup := measureReceiptStartupContext(t.TempDir(), []string{"PATH=/usr/bin"})
+	if startup == nil {
+		t.Fatal("safe test startup context was not admitted")
+	}
+	return &receiptAdmission{artifact: artifact, extensions: []extensionFileLease{extension}, startup: startup}, binaryPath, extensionPath
 }
 
 func mustTestSHA(t *testing.T, path string) string {
@@ -188,7 +192,7 @@ func TestReceiptAdmissionRequiresExactOrderedMaterializedExtensionClosure(t *tes
 		{id: "two", digest: mustTestSHA(t, paths[1]), path: paths[1]},
 	}
 	trusted := []TrustedExtensionIdentity{{ID: "one", Digest: actual[0].digest}, {ID: "two", Digest: actual[1].digest}}
-	admission, err := newReceiptAdmission(base.artifact, layout, actual, trusted)
+	admission, err := newReceiptAdmission(base.artifact, layout, actual, trusted, base.startup)
 	if err != nil || admission == nil {
 		t.Fatalf("exact extension closure admission = %v, %v", admission, err)
 	}
@@ -206,7 +210,7 @@ func TestReceiptAdmissionRequiresExactOrderedMaterializedExtensionClosure(t *tes
 		{name: "untrusted id", trusted: []TrustedExtensionIdentity{{ID: "other", Digest: actual[0].digest}, trusted[1]}},
 	} {
 		t.Run(test.name, func(t *testing.T) {
-			got, err := newReceiptAdmission(base.artifact, layout, actual, test.trusted)
+			got, err := newReceiptAdmission(base.artifact, layout, actual, test.trusted, base.startup)
 			if err != nil {
 				t.Fatalf("mismatch should retain legacy session behavior, got error: %v", err)
 			}
@@ -219,7 +223,7 @@ func TestReceiptAdmissionRequiresExactOrderedMaterializedExtensionClosure(t *tes
 	if err := os.WriteFile(paths[0], []byte("tampered"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if _, err := newReceiptAdmission(base.artifact, layout, actual, trusted); err == nil {
+	if _, err := newReceiptAdmission(base.artifact, layout, actual, trusted, base.startup); err == nil {
 		t.Fatal("materialized extension byte drift retained receipt admission")
 	}
 }
