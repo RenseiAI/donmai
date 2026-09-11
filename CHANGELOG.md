@@ -16,9 +16,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   exact registration evidence through the worker boundary.** (#585)
 - **Worker registration now preserves capability tags and structured probe
   output across the registration boundary.** (#583)
-- **The Pi interactive adapter profile advances from v3 to v4. Old v3 receipts
-  refuse and require a newly admitted realization. When no realization is
-  present, the registry preserves the existing v1 behavior.** (#577)
+- **The Pi interactive tool-lifecycle profile advances to v4; exact-profile v3
+  receipts are rejected. Omitted realization metadata preserves the existing
+  v1 serialization.** (#585)
 
 ### Fixes
 
