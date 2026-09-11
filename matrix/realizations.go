@@ -29,7 +29,23 @@ func CompileCapabilityRealizations(sources []CapabilityRealizationSource) ([]Cap
 		rows = append(rows, CapabilityRealizationRow{Compiled: c})
 	}
 	sort.Slice(rows, func(i, j int) bool {
-		return rows[i].Compiled.Declaration.CapabilityID < rows[j].Compiled.Declaration.CapabilityID
+		a, b := rows[i].Compiled.Declaration, rows[j].Compiled.Declaration
+		if a.CapabilityID != b.CapabilityID {
+			return a.CapabilityID < b.CapabilityID
+		}
+		if a.HarnessID != b.HarnessID {
+			return a.HarnessID < b.HarnessID
+		}
+		if a.AdapterVersion != b.AdapterVersion {
+			return a.AdapterVersion < b.AdapterVersion
+		}
+		return a.Mode < b.Mode
 	})
+	for i := 1; i < len(rows); i++ {
+		a, b := rows[i-1].Compiled.Declaration, rows[i].Compiled.Declaration
+		if a.CapabilityID == b.CapabilityID && a.HarnessID == b.HarnessID && a.AdapterVersion == b.AdapterVersion && a.Mode == b.Mode {
+			return nil, fmt.Errorf("duplicate capability realization tuple")
+		}
+	}
 	return rows, nil
 }

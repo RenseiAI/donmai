@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"regexp"
 	"sort"
 	"sync"
@@ -131,14 +132,17 @@ var (
 	realizationDigest = regexp.MustCompile(`^[0-9a-f]{64}$`)
 )
 
-func domainDigest(domain string, value any) string {
-	raw, _ := json.Marshal(value)
+func domainDigest(domain string, value any) (string, error) {
+	raw, err := json.Marshal(value)
+	if err != nil {
+		return "", fmt.Errorf("capability realization digest input: %w", err)
+	}
 	sum := sha256.Sum256(append([]byte(domain+"\x00"), raw...))
-	return hex.EncodeToString(sum[:])
+	return hex.EncodeToString(sum[:]), nil
 }
 
 // CapabilityRecipeInputDigest is the versioned capability-realization contract surface.
-func CapabilityRecipeInputDigest(value any) string {
+func CapabilityRecipeInputDigest(value any) (string, error) {
 	return domainDigest("donmai.capability-realization.entry-input/v1", value)
 }
 func surfaceKey(v CapabilitySurfaceIdentity) string { return string(v.Kind) + "\x00" + v.ID }
@@ -206,7 +210,15 @@ func NewCapabilityRealization(input CapabilityRealizationInput) (CapabilityReali
 		Entries         []CapabilityRecipeEntry     `json:"entries"`
 		DeclaredSurface []CapabilitySurfaceIdentity `json:"declaredSurface"`
 	}{input.RecipeID, entries, surface}
-	recipe := CapabilityRealizationRecipe{RecipeID: input.RecipeID, Entries: entries, DeclaredSurface: surface, RecipeDigest: domainDigest("donmai.capability-realization.recipe/v1", core), DeclaredSurfaceDigest: domainDigest("donmai.capability-realization.surface/v1", surface)}
+	recipeDigest, err := domainDigest("donmai.capability-realization.recipe/v1", core)
+	if err != nil {
+		return CapabilityRealizationDeclaration{}, err
+	}
+	surfaceDigest, err := domainDigest("donmai.capability-realization.surface/v1", surface)
+	if err != nil {
+		return CapabilityRealizationDeclaration{}, err
+	}
+	recipe := CapabilityRealizationRecipe{RecipeID: input.RecipeID, Entries: entries, DeclaredSurface: surface, RecipeDigest: recipeDigest, DeclaredSurfaceDigest: surfaceDigest}
 	return CapabilityRealizationDeclaration{ContractVersion: CapabilityRealizationContractVersion, CapabilityID: input.CapabilityID, HarnessID: input.HarnessID, AdapterVersion: input.AdapterVersion, Mode: input.Mode, Recipe: recipe}, nil
 }
 
@@ -223,20 +235,53 @@ func NewCapabilityFixtureObservation(input CapabilityFixtureObservationInput) (C
 	artifacts := append([]CapabilityAppliedArtifact(nil), input.AppliedArtifacts...)
 	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].EntryID < artifacts[j].EntryID })
 	o := CapabilityFixtureObservation{ContractVersion: CapabilityRealizationContractVersion, CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode, RecipeDigest: d.Recipe.RecipeDigest, FixtureID: input.FixtureID, BinaryDigest: input.BinaryDigest, AppliedArtifacts: artifacts, ObservedSurface: observed}
-	o.ObservationDigest = domainDigest("donmai.capability-realization.observation/v1", o)
+	digest, err := observationDigest(o)
+	if err != nil {
+		return CapabilityFixtureObservation{}, err
+	}
+	o.ObservationDigest = digest
 	return o, nil
+}
+
+func observationDigest(o CapabilityFixtureObservation) (string, error) {
+	o.ObservationDigest = ""
+	return domainDigest("donmai.capability-realization.observation/v1", o)
+}
+
+func rebuildObservation(o CapabilityFixtureObservation) (CapabilityFixtureObservation, error) {
+	if o.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(o.CapabilityID) || o.HarnessID == "" || !realizationRef.MatchString(o.AdapterVersion) || o.Mode == "" || !realizationDigest.MatchString(o.RecipeDigest) || !realizationRef.MatchString(o.FixtureID) || !realizationDigest.MatchString(o.BinaryDigest) || !realizationDigest.MatchString(o.ObservationDigest) {
+		return CapabilityFixtureObservation{}, fmt.Errorf("capability observation identity is malformed")
+	}
+	surface, err := canonicalSurface(o.ObservedSurface)
+	if err != nil || len(surface) == 0 {
+		return CapabilityFixtureObservation{}, fmt.Errorf("capability observation surface is malformed")
+	}
+	artifacts := append([]CapabilityAppliedArtifact(nil), o.AppliedArtifacts...)
+	sort.Slice(artifacts, func(i, j int) bool { return artifacts[i].EntryID < artifacts[j].EntryID })
+	for i, artifact := range artifacts {
+		if !realizationRef.MatchString(artifact.EntryID) || !isKnownToolLifecycleChannel(artifact.Channel) || !realizationDigest.MatchString(artifact.InputDigest) || (i > 0 && artifact.EntryID == artifacts[i-1].EntryID) {
+			return CapabilityFixtureObservation{}, fmt.Errorf("capability observation artifacts are malformed")
+		}
+	}
+	canonical := o
+	canonical.AppliedArtifacts = artifacts
+	canonical.ObservedSurface = surface
+	digest, err := observationDigest(canonical)
+	if err != nil {
+		return CapabilityFixtureObservation{}, err
+	}
+	canonical.ObservationDigest = digest
+	return canonical, nil
 }
 
 // CompileCapabilityRealization is the versioned capability-realization contract surface.
 func CompileCapabilityRealization(d CapabilityRealizationDeclaration, o CapabilityFixtureObservation) (CompiledCapabilityRealization, error) {
 	rebuilt, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode, RecipeID: d.Recipe.RecipeID, Entries: d.Recipe.Entries, DeclaredSurface: d.Recipe.DeclaredSurface})
-	if err != nil || rebuilt.Recipe.RecipeDigest != d.Recipe.RecipeDigest || rebuilt.Recipe.DeclaredSurfaceDigest != d.Recipe.DeclaredSurfaceDigest {
+	if err != nil || !reflect.DeepEqual(rebuilt, d) {
 		return CompiledCapabilityRealization{}, fmt.Errorf("capability declaration is not canonical")
 	}
-	core := o
-	core.ObservationDigest = ""
-	core.ObservationDigest = domainDigest("donmai.capability-realization.observation/v1", core)
-	if core.ObservationDigest != o.ObservationDigest || o.CapabilityID != d.CapabilityID || o.HarnessID != d.HarnessID || o.AdapterVersion != d.AdapterVersion || o.Mode != d.Mode || o.RecipeDigest != d.Recipe.RecipeDigest {
+	canonicalObservation, err := rebuildObservation(o)
+	if err != nil || canonicalObservation.ObservationDigest != o.ObservationDigest || o.CapabilityID != d.CapabilityID || o.HarnessID != d.HarnessID || o.AdapterVersion != d.AdapterVersion || o.Mode != d.Mode || o.RecipeDigest != d.Recipe.RecipeDigest {
 		return CompiledCapabilityRealization{}, fmt.Errorf("capability observation binding is invalid")
 	}
 	artifacts := map[string]CapabilityAppliedArtifact{}
@@ -261,7 +306,7 @@ func CompileCapabilityRealization(d CapabilityRealizationDeclaration, o Capabili
 			return CompiledCapabilityRealization{}, fmt.Errorf("capability observation surface is incomplete")
 		}
 	}
-	return CompiledCapabilityRealization{Declaration: rebuilt, Observation: o}, nil
+	return CompiledCapabilityRealization{Declaration: rebuilt, Observation: canonicalObservation}, nil
 }
 
 // CapabilityRealizationRegistry is the versioned capability-realization contract surface.
@@ -269,6 +314,18 @@ type CapabilityRealizationRegistry struct {
 	mu           sync.RWMutex
 	rows         map[string]CompiledCapabilityRealization
 	capabilities map[string]bool
+}
+
+func cloneCompiled(in CompiledCapabilityRealization) CompiledCapabilityRealization {
+	out := in
+	out.Declaration.Recipe.Entries = append([]CapabilityRecipeEntry(nil), in.Declaration.Recipe.Entries...)
+	for i := range out.Declaration.Recipe.Entries {
+		out.Declaration.Recipe.Entries[i].SurfaceRefs = append([]CapabilitySurfaceIdentity(nil), in.Declaration.Recipe.Entries[i].SurfaceRefs...)
+	}
+	out.Declaration.Recipe.DeclaredSurface = append([]CapabilitySurfaceIdentity(nil), in.Declaration.Recipe.DeclaredSurface...)
+	out.Observation.AppliedArtifacts = append([]CapabilityAppliedArtifact(nil), in.Observation.AppliedArtifacts...)
+	out.Observation.ObservedSurface = append([]CapabilitySurfaceIdentity(nil), in.Observation.ObservedSurface...)
+	return out
 }
 
 func realizationKey(c string, h HarnessName, a string, m PromptSessionMode) string {
@@ -287,7 +344,7 @@ func NewCapabilityRealizationRegistry(rows []CompiledCapabilityRealization) (*Ca
 		if _, ok := r.rows[k]; ok {
 			return nil, fmt.Errorf("duplicate capability realization")
 		}
-		r.rows[k] = compiled
+		r.rows[k] = cloneCompiled(compiled)
 		r.capabilities[compiled.Declaration.CapabilityID] = true
 	}
 	return r, nil
@@ -311,13 +368,17 @@ func (r *CapabilityRealizationRegistry) Resolve(c string, h HarnessName, a strin
 	r.mu.RLock()
 	defer r.mu.RUnlock()
 	v, ok := r.rows[realizationKey(c, h, a, m)]
-	return v, ok
+	return cloneCompiled(v), ok
 }
 
 // BindCapabilityRealization is the versioned capability-realization contract surface.
 func BindCapabilityRealization(c CompiledCapabilityRealization) CapabilityRealizationBinding {
 	d := c.Declaration
-	return CapabilityRealizationBinding{ContractVersion: CapabilityRealizationContractVersion, CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode, RecipeID: d.Recipe.RecipeID, RecipeDigest: d.Recipe.RecipeDigest, DeclaredSurfaceDigest: d.Recipe.DeclaredSurfaceDigest, Entries: append([]CapabilityRecipeEntry(nil), d.Recipe.Entries...), ObservationDigest: c.Observation.ObservationDigest}
+	entries := append([]CapabilityRecipeEntry(nil), d.Recipe.Entries...)
+	for i := range entries {
+		entries[i].SurfaceRefs = append([]CapabilitySurfaceIdentity(nil), d.Recipe.Entries[i].SurfaceRefs...)
+	}
+	return CapabilityRealizationBinding{ContractVersion: CapabilityRealizationContractVersion, CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode, RecipeID: d.Recipe.RecipeID, RecipeDigest: d.Recipe.RecipeDigest, DeclaredSurfaceDigest: d.Recipe.DeclaredSurfaceDigest, Entries: entries, ObservationDigest: c.Observation.ObservationDigest}
 }
 
 // ResolveCapabilityRealizationResults is the versioned capability-realization contract surface.

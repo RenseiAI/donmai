@@ -27,3 +27,21 @@ func TestCompileCapabilityRealizationsConsumesObservation(t *testing.T) {
 		t.Fatal("missing fixture surface compiled")
 	}
 }
+
+func TestCompileCapabilityRealizationsOrdersFullTupleAndRejectsDuplicates(t *testing.T) {
+	base := func(capability string, h agent.HarnessName, adapter string, mode agent.PromptSessionMode) CapabilityRealizationSource {
+		surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "one"}}
+		d, _ := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: capability, HarnessID: h, AdapterVersion: adapter, Mode: mode, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
+		o, _ := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: d, FixtureID: "real", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: strings.Repeat("b", 64)}}, ObservedSurface: surface})
+		return CapabilityRealizationSource{Declaration: d, Observation: o}
+	}
+	a := base("same/v1", agent.HarnessPi, "z/v1", agent.PromptModeHumanControlled)
+	b := base("same/v1", agent.HarnessCodex, "a/v1", agent.PromptModeAutonomous)
+	rows, err := CompileCapabilityRealizations([]CapabilityRealizationSource{a, b})
+	if err != nil || rows[0].Compiled.Declaration.HarnessID != agent.HarnessCodex {
+		t.Fatalf("order=%+v err=%v", rows, err)
+	}
+	if _, err := CompileCapabilityRealizations([]CapabilityRealizationSource{a, a}); err == nil {
+		t.Fatal("duplicate tuple compiled")
+	}
+}

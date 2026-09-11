@@ -9,7 +9,10 @@ import (
 func realizationFixture(t *testing.T) CompiledCapabilityRealization {
 	t.Helper()
 	surface := []CapabilitySurfaceIdentity{{Kind: CapabilitySurfaceMCPServer, ID: "example"}, {Kind: CapabilitySurfaceMCPTool, ID: "draft_create"}}
-	inputDigest := CapabilityRecipeInputDigest([]string{"example"})
+	inputDigest, err := CapabilityRecipeInputDigest([]string{"example"})
+	if err != nil {
+		t.Fatal(err)
+	}
 	d, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: "example.workflow-authoring/v1", HarnessID: HarnessCodex, AdapterVersion: "codex/interactive/tool-lifecycle-v1", Mode: PromptModeHumanControlled, RecipeID: "example/http-mcp/v1", Entries: []CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface})
 	if err != nil {
 		t.Fatal(err)
@@ -30,7 +33,7 @@ func TestCapabilityRealizationRequiresFixtureObservedSurface(t *testing.T) {
 	short := c.Observation
 	short.ObservedSurface = short.ObservedSurface[:1]
 	short.ObservationDigest = ""
-	short.ObservationDigest = domainDigest("donmai.capability-realization.observation/v1", short)
+	short.ObservationDigest, _ = observationDigest(short)
 	if _, err := CompileCapabilityRealization(c.Declaration, short); err == nil {
 		t.Fatal("short surface compiled")
 	}
@@ -77,5 +80,49 @@ func TestCapabilityRealizationAbsentPreservesV1JSON(t *testing.T) {
 	r, _ := json.Marshal(ToolLifecycleReceipt{ContractVersion: ToolLifecycleContractVersion, Decision: "ready", Entries: []ToolLifecycleEntry{}})
 	if string(r) != `{"contractVersion":"donmai.tool-lifecycle/v1alpha1","profileId":"","decision":"ready","evidenceTier":"","productionEligible":false,"entries":[]}` {
 		t.Fatalf("%s", r)
+	}
+}
+
+func TestCapabilityRealizationRegistryDeepCopiesNestedAuthority(t *testing.T) {
+	c := realizationFixture(t)
+	r, err := NewCapabilityRealizationRegistry([]CompiledCapabilityRealization{c})
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Declaration.Recipe.Entries[0].InputDigest = strings.Repeat("0", 64)
+	got, _ := r.Resolve("example.workflow-authoring/v1", HarnessCodex, "codex/interactive/tool-lifecycle-v1", PromptModeHumanControlled)
+	got.Declaration.Recipe.Entries[0].SurfaceRefs[0].ID = "mutated"
+	again, _ := r.Resolve("example.workflow-authoring/v1", HarnessCodex, "codex/interactive/tool-lifecycle-v1", PromptModeHumanControlled)
+	if again.Declaration.Recipe.Entries[0].InputDigest == strings.Repeat("0", 64) || again.Declaration.Recipe.Entries[0].SurfaceRefs[0].ID == "mutated" {
+		t.Fatal("registry authority aliases caller memory")
+	}
+	b := BindCapabilityRealization(again)
+	b.Entries[0].SurfaceRefs[0].ID = "bound-mutated"
+	final, _ := r.Resolve(again.Declaration.CapabilityID, again.Declaration.HarnessID, again.Declaration.AdapterVersion, again.Declaration.Mode)
+	if final.Declaration.Recipe.Entries[0].SurfaceRefs[0].ID == "bound-mutated" {
+		t.Fatal("binding aliases registry")
+	}
+}
+
+func TestCapabilityObservationRejectsMalformedRecomputedFields(t *testing.T) {
+	c := realizationFixture(t)
+	for _, mutate := range []func(*CapabilityFixtureObservation){func(o *CapabilityFixtureObservation) { o.ContractVersion = "invalid" }, func(o *CapabilityFixtureObservation) { o.BinaryDigest = "" }, func(o *CapabilityFixtureObservation) { o.FixtureID = "" }, func(o *CapabilityFixtureObservation) {
+		o.AppliedArtifacts = append(o.AppliedArtifacts, o.AppliedArtifacts[0])
+	}} {
+		o := c.Observation
+		mutate(&o)
+		o.ObservationDigest, _ = observationDigest(o)
+		if _, err := CompileCapabilityRealization(c.Declaration, o); err == nil {
+			t.Fatal("malformed recomputed observation compiled")
+		}
+	}
+}
+
+func TestCapabilityRecipeInputDigestPropagatesMarshalErrors(t *testing.T) {
+	if _, err := CapabilityRecipeInputDigest(func() {}); err == nil {
+		t.Fatal("function digest succeeded")
+	}
+	if _, err := CapabilityRecipeInputDigest(make(chan int)); err == nil {
+		t.Fatal("channel digest succeeded")
 	}
 }
