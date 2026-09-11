@@ -10,6 +10,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 )
 
 const (
@@ -29,8 +30,21 @@ type artifactProfile struct {
 	Files                             []artifactProfileFile
 }
 type artifactLease struct {
-	root, binary string
-	files        []artifactProfileFile
+	root, binary                           string
+	files                                  []artifactProfileFile
+	rootDev, rootIno, binaryDev, binaryIno uint64
+}
+
+func artifactIdentity(path string) (uint64, uint64, error) {
+	info, err := os.Stat(path)
+	if err != nil {
+		return 0, 0, err
+	}
+	stat, ok := info.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, 0, fmt.Errorf("pi artifact identity unavailable")
+	}
+	return uint64(stat.Dev), uint64(stat.Ino), nil
 }
 
 func sha256File(path string) (string, error) {
@@ -81,10 +95,41 @@ func measureArtifactProfile(binary string) (*artifactLease, error) {
 			return nil, fmt.Errorf("pi artifact file digest mismatch")
 		}
 	}
+	rootDev, rootIno, err := artifactIdentity(root)
+	if err != nil {
+		return nil, err
+	}
+	binaryDev, binaryIno, err := artifactIdentity(binary)
+	if err != nil {
+		return nil, err
+	}
 	got, err := sha256File(binary)
 	if err != nil || got != preExecutionBinarySHA256 {
 		return nil, fmt.Errorf("pi artifact binary mismatch")
 	}
 	sort.Slice(p.Files, func(i, j int) bool { return p.Files[i].Path < p.Files[j].Path })
-	return &artifactLease{root: root, binary: binary, files: p.Files}, nil
+	return &artifactLease{root: root, binary: binary, files: p.Files, rootDev: rootDev, rootIno: rootIno, binaryDev: binaryDev, binaryIno: binaryIno}, nil
+}
+
+func (l *artifactLease) revalidate() error {
+	rootDev, rootIno, err := artifactIdentity(l.root)
+	if err != nil || rootDev != l.rootDev || rootIno != l.rootIno {
+		return fmt.Errorf("pi artifact root changed")
+	}
+	binaryDev, binaryIno, err := artifactIdentity(l.binary)
+	if err != nil || binaryDev != l.binaryDev || binaryIno != l.binaryIno {
+		return fmt.Errorf("pi artifact binary changed")
+	}
+	for _, entry := range l.files {
+		path := filepath.Join(l.root, entry.Path)
+		info, err := os.Lstat(path)
+		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
+			return fmt.Errorf("pi artifact file changed")
+		}
+		got, err := sha256File(path)
+		if err != nil || got != entry.SHA256 {
+			return fmt.Errorf("pi artifact file digest changed")
+		}
+	}
+	return nil
 }
