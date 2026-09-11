@@ -33,6 +33,7 @@ func (p *followupFailureProvider) Spawn(ctx context.Context, _ agent.Spec) (agen
 	child, cancel := context.WithCancel(ctx)
 	h := &followupFailureHandle{events: make(chan agent.Event, 8), cancel: cancel, initialDone: make(chan struct{}), fatal: p.fatal}
 	go func() {
+		defer cancel()
 		defer close(h.initialDone)
 		h.events <- agent.AssistantTextEvent{Text: "complete brief <!-- WORK_RESULT:passed -->"}
 		select {
