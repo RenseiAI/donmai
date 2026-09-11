@@ -1680,6 +1680,12 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	case o.lastAssistantText != "" && (o.terminalEvent != nil || res.Summary == ""):
 		res.Summary = o.lastAssistantText
 	}
+	// ErrorEvent is a non-recoverable provider terminal, unlike a tool result
+	// with IsError. A follow-up failure must survive the initial turn's success
+	// when runLoop later finalizes the one session envelope.
+	if o.errorEvent != nil && (res.Status == "" || res.Status == "completed") {
+		res.Status = "failed"
+	}
 	if o.errorEvent != nil && res.Error == "" {
 		res.Error = o.errorEvent.Message
 		if res.FailureMode == "" {
