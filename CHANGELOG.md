@@ -8,6 +8,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.30 — 2026-09-11
+
+### Features
+
+- **Pi can recover from authenticated SDK pre-execution refusals under an exact
+  measured runtime and startup closure.** Receipt admission requires the
+  reviewed no-autoload artifact, exact same-process extensions and child
+  environment, and a closed schema/origin/tool identity; legacy, tampered, or
+  startup-injected sessions retain the existing fatal unadjudicated path.
+  (#589)
+
+---
+
+## v0.72.29 — 2026-09-11
+
+### Fixes
+
+- **Fatal provider failures after successful turns are preserved.** A
+  non-recoverable provider error during a memory follow-up now latches failed
+  status through finalization, while recoverable tool-result errors still
+  complete normally. (#588)
+
+---
+
 ## v0.72.28 — 2026-09-11
 
 ### Features
