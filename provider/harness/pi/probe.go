@@ -3,7 +3,9 @@ package pi
 import (
 	"context"
 	"fmt"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
@@ -68,11 +70,25 @@ type versionProbeFunc func(ctx context.Context, binary string) (string, error)
 func defaultVersionProbe(ctx context.Context, binary string) (string, error) {
 	// nolint:gosec // G204: binary is the resolved-from-PATH path New() also
 	// uses to exec `pi --mode rpc`; --version is a read-only query.
-	out, err := exec.CommandContext(ctx, binary, "--version").Output()
+	cmd := versionProbeCommand(ctx, binary)
+	out, err := cmd.Output()
 	if err != nil {
 		return "", err
 	}
 	return strings.TrimSpace(string(out)), nil
+}
+
+func versionProbeCommand(ctx context.Context, binary string) *exec.Cmd {
+	cmd := exec.CommandContext(ctx, binary, "--version") //nolint:gosec // G204: resolved provider binary; caller executes only the fixed --version probe.
+	// Standalone Bun binaries honor BUN_OPTIONS and autoload config from their
+	// working directory even for --version. Probe in the selected binary's own
+	// directory and strip every runtime/native-loader injection variable before
+	// any candidate binary executes. The later session path preserves legacy
+	// environment behavior but withholds receipt admission when these inputs are
+	// present; construction itself must never execute them.
+	cmd.Dir = filepath.Dir(binary)
+	cmd.Env = withoutUnsafeStartupEnv(os.Environ())
+	return cmd
 }
 
 // versionRe extracts a dotted X.Y.Z... version from free-form --version

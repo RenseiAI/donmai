@@ -8,6 +8,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path/filepath"
+	"syscall"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -55,6 +57,13 @@ type Provider struct {
 	// bare-struct-literal Provider probe-free by construction, exactly like
 	// skipProcess:true.
 	realBinary bool
+	// artifact is non-nil only when binary is the exact closed runtime tree
+	// compiled into artifact_profile.go. It is never selected from a Spec,
+	// environment profile claim, or semantic version.
+	artifact *artifactLease
+	// trustedExtensions is the immutable ordered same-process extension set
+	// supplied by the compiled embedder at provider construction.
+	trustedExtensions []TrustedExtensionIdentity
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -84,6 +93,12 @@ type Options struct {
 	// to DefaultCatalogProbeTimeout.
 	CatalogProbeTimeout time.Duration
 
+	// TrustedExtensions is the complete ordered list of reviewed additional Pi
+	// extensions this compiled embedder trusts to share receipt authority. The
+	// public default is empty. A session Spec can match this list but cannot
+	// extend it.
+	TrustedExtensions []TrustedExtensionIdentity
+
 	// Test seams. skipProcess wires stdin/stdout overrides instead of execing
 	// a real child; used by the pipe-stub tests that replay pi RPC shapes.
 	skipProcess    bool
@@ -94,6 +109,10 @@ type Options struct {
 	// establish this ordering: the child may already have started its turn.
 	// Nil leaves the production launch sequence unchanged.
 	beforeInitialPrompt func(*Handle) error
+	// beforeChildStart and afterChildStart are deterministic mutation barriers
+	// around the two artifact-lease checks. Nil leaves production unchanged.
+	beforeChildStart func()
+	afterChildStart  func()
 	// handshakeToken pins the per-session token in skipProcess tests so a
 	// scripted handshake fixture can echo it. Empty ⇒ a random token per Spawn.
 	handshakeToken string
@@ -104,6 +123,9 @@ type Options struct {
 // construction with agent.ErrProviderUnavailable; an unverifiable/above
 // version proceeds but marks the Provider so every session is labeled.
 func New(opts Options) (*Provider, error) {
+	if err := validateTrustedExtensionIdentities(opts.TrustedExtensions); err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
+	}
 	if opts.HandshakeTimeout == 0 {
 		opts.HandshakeTimeout = 10 * time.Second
 	}
@@ -113,7 +135,7 @@ func New(opts Options) (*Provider, error) {
 	if opts.VersionProbe == nil {
 		opts.VersionProbe = defaultVersionProbe
 	}
-	p := &Provider{opts: opts}
+	p := &Provider{opts: opts, trustedExtensions: append([]TrustedExtensionIdentity(nil), opts.TrustedExtensions...)}
 
 	if opts.skipProcess {
 		p.binary = "pi"
@@ -124,16 +146,37 @@ func New(opts Options) (*Provider, error) {
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrProviderUnavailable, err)
 	}
+	full, err = filepath.Abs(full)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve pi binary absolute path: %v", agent.ErrProviderUnavailable, err)
+	}
+	full, err = filepath.EvalSymlinks(full)
+	if err != nil {
+		return nil, fmt.Errorf("%w: resolve pi binary symlinks: %v", agent.ErrProviderUnavailable, err)
+	}
 	p.binary = full
 	p.realBinary = true
+	p.artifact, err = measureArtifactProfile(full)
+	if err != nil {
+		return nil, fmt.Errorf("%w: measure pi artifact profile: %v", agent.ErrProviderUnavailable, err)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), opts.VersionProbeTimeout)
 	defer cancel()
 	unverified, perr := checkVersionPin(ctx, opts.VersionProbe, full)
 	if perr != nil {
+		if p.artifact != nil {
+			_ = p.artifact.close()
+		}
 		return nil, perr // already wraps ErrProviderUnavailable
 	}
 	p.unverified = unverified
+	if p.artifact != nil {
+		// Exact compiled bytes are stronger authority than the generic semantic
+		// version window. A different binary with the same version remains on
+		// the legacy, possibly-unverified path above.
+		p.unverified = false
+	}
 	return p, nil
 }
 
@@ -269,10 +312,24 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// The boundary extension always loads first and is never displaced,
 	// reordered, or disabled by a delivery (D1).
 	extensionPaths := append([]string{layout.extension}, extraExtensionPaths...)
-
+	actualExtensions := make([]agentExtensionIdentity, len(spec.AdditionalExtensions))
+	for i, delivery := range spec.AdditionalExtensions {
+		actualExtensions[i] = agentExtensionIdentity{id: delivery.ID, digest: delivery.Digest, path: extraExtensionPaths[i]}
+	}
 	token := p.opts.handshakeToken
 	if token == "" {
 		token = newHandshakeToken()
+	}
+	// Compose once. Receipt admission inspects this exact final environment,
+	// and spawnChild assigns the same immutable slice to exec.Cmd.Env.
+	childEnv := composeChildEnv(spec, layout, token)
+	var receipt *receiptAdmission
+	if spec.Autonomous {
+		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
+		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
+		if err != nil {
+			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
+		}
 	}
 
 	var (
@@ -284,15 +341,24 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		stdin = p.opts.stdinOverride
 		stdout = p.opts.stdoutOverride
 	} else {
-		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, token, mode, sessionID)
+		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt)
 		if serr != nil {
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
 		cmd, stdin, stdout = c, in, out
+		if p.opts.afterChildStart != nil {
+			p.opts.afterChildStart()
+		}
+		if p.artifact != nil {
+			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
+				stopStartedChild(cmd)
+				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
+			}
+		}
 	}
 
 	client := newRPCClient(stdin, stdout)
-	h := newHandle(client, cmd, spec, token)
+	h := newHandle(client, cmd, spec, token, receipt)
 	go h.run()
 
 	// Fail-closed handshake gate.
@@ -372,12 +438,12 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 // its own process group. extensionPaths is the boundary extension followed by
 // every materialized+verified spec.AdditionalExtensions entry, in order
 // (ADR-2026-08-12 D1).
-func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, token string, mode launchMode, sessionID string) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
+func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
 	// nolint:gosec // G204: binary resolved from Options/env; args are a fixed
 	// set plus paths/ids/model this package controls.
 	cmd := exec.Command(p.binary, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...)
 	cmd.Dir = spec.Cwd
-	cmd.Env = composeChildEnv(spec, layout, token)
+	cmd.Env = childEnv
 	configureProcessGroup(cmd)
 
 	stdin, err := cmd.StdinPipe()
@@ -392,6 +458,14 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 	if err != nil {
 		return nil, nil, nil, fmt.Errorf("pi stderr pipe: %w", err)
 	}
+	if artifact != nil {
+		if p.opts.beforeChildStart != nil {
+			p.opts.beforeChildStart()
+		}
+		if err := revalidateLaunchTrust(artifact, receipt, childEnv); err != nil {
+			return nil, nil, nil, fmt.Errorf("pi artifact changed before spawn: %w", err)
+		}
+	}
 	if err := cmd.Start(); err != nil {
 		return nil, nil, nil, fmt.Errorf("pi spawn: %w", err)
 	}
@@ -399,10 +473,33 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 	return cmd, stdin, stdout, nil
 }
 
+func revalidateLaunchTrust(artifact *artifactLease, receipt *receiptAdmission, childEnv []string) error {
+	if receipt != nil {
+		if !receipt.startup.matchesEnv(childEnv) {
+			return fmt.Errorf("pi receipt child environment changed")
+		}
+		return receipt.revalidate()
+	}
+	return artifact.revalidate()
+}
+
 // Shutdown implements agent.Provider. pi is one-child-per-session, so the
 // Provider owns no long-lived process — Shutdown is a no-op (each Handle owns
 // and reaps its own child via Stop). Idempotent.
-func (p *Provider) Shutdown(_ context.Context) error { return nil }
+func (p *Provider) Shutdown(_ context.Context) error {
+	if p.artifact != nil {
+		return p.artifact.close()
+	}
+	return nil
+}
+
+func stopStartedChild(cmd *exec.Cmd) {
+	if cmd == nil || cmd.Process == nil {
+		return
+	}
+	signalProcessGroup(cmd, syscall.SIGKILL)
+	_, _ = cmd.Process.Wait()
+}
 
 // resolvePiBinary applies PiBin → $PI_BIN → "pi" and resolves via LookPath.
 func resolvePiBinary(bin string) (string, error) {

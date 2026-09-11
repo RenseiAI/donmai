@@ -12,6 +12,7 @@ import (
 	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
+	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/runtime/codeintelhost"
 	"github.com/spf13/cobra"
 )
@@ -108,6 +109,12 @@ type Config struct {
 	// Optional; nil registers every provider exactly as before (no wrapping,
 	// no behavior change).
 	AgentSpecExtensionDecorator agent.ExtensionDecorator
+
+	// PiTrustedExtensions is the complete ordered list of reviewed
+	// same-process Pi extensions compiled into this embedder. It is passed only
+	// to the Pi constructor; session or control-plane data cannot add entries.
+	// The public default is empty.
+	PiTrustedExtensions []providerpi.TrustedExtensionIdentity
 
 	// CapabilityRealizations is the immutable downstream realization snapshot
 	// shared by daemon preflight and the spawned child runner. Nil preserves the
