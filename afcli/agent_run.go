@@ -76,6 +76,7 @@ type agentRunOpts struct {
 	// behavior (no provider wrapping).
 	specDecorator          agent.ExtensionDecorator
 	capabilityRealizations *agent.CapabilityRealizationRegistry
+	piTrustedExtensions    []providerpi.TrustedExtensionIdentity
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -129,7 +130,7 @@ func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.Harn
 // (F.2.8 — daemon wire-up.)
 func newAgentRunCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
-	opts := &agentRunOpts{bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator, capabilityRealizations: cfg.CapabilityRealizations}
+	opts := agentRunOptions(cfg, bin)
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run a single agent session (invoked by the daemon spawner).",
@@ -166,6 +167,14 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 	cmd.Flags().BoolVar(&opts.keepRecording, "keep-recording", false,
 		"Keep the interactive session's on-disk asciinema-v2 cast after the session ends (default: deleted)")
 	return cmd
+}
+
+func agentRunOptions(cfg Config, bin string) *agentRunOpts {
+	return &agentRunOpts{
+		bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator,
+		capabilityRealizations: cfg.CapabilityRealizations,
+		piTrustedExtensions:    append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
+	}
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
@@ -286,7 +295,9 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	if agentBin == "" {
 		agentBin = "donmai"
 	}
-	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(agentRunHints(detail)), agentBin)
+	hints := agentRunHints(detail)
+	hints.PiTrustedExtensions = append([]providerpi.TrustedExtensionIdentity(nil), opts.piTrustedExtensions...)
+	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
 	if opts.specDecorator != nil {
 		decorateRegistryProviders(reg, opts.specDecorator)
@@ -762,6 +773,10 @@ type agentRunCtorHints struct {
 	// CLI login into its isolated config home. It is true only when this exact
 	// session selected the codex provider and resolved authMode=host-session.
 	CodexHostSessionAuth bool
+
+	// PiTrustedExtensions comes only from afcli.Config in the compiled
+	// embedder. It is never derived from SessionDetail or ProviderConfig.
+	PiTrustedExtensions []providerpi.TrustedExtensionIdentity
 }
 
 // agentRunHints collects every per-session constructor signal in one pass.
@@ -842,6 +857,10 @@ func codexCtorOptions(h agentRunCtorHints) providercodex.Options {
 	return providercodex.Options{HostSessionAuth: h.CodexHostSessionAuth}
 }
 
+func piCtorOptions(h agentRunCtorHints) providerpi.Options {
+	return providerpi.Options{TrustedExtensions: append([]providerpi.TrustedExtensionIdentity(nil), h.PiTrustedExtensions...)}
+}
+
 // agentRunProviderCtors returns the single hand-authored ctor list — the SoT
 // for the agent-run provider set. Pulled into its own function (returning a
 // fresh slice on each call) so [BuildAgentRunRegistry] and the no-behavior-
@@ -908,7 +927,7 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// itself change matrix-level tier gating (cells stay
 		// experimental/untested/smoked:false until step20 proves a real
 		// run, DEC-2/DEC-3).
-		{name: "pi", new: func() (agent.Provider, error) { return providerpi.New(providerpi.Options{}) }},
+		{name: "pi", new: func() (agent.Provider, error) { return providerpi.New(piCtorOptions(h)) }},
 		// shell is the interactive-only PTY harness (W4 interactive
 		// sessions): spawns ${SHELL:-/bin/sh} under ptyhost. Headless
 		// Spawn (Spec.Interactive == nil) fails loudly by design.

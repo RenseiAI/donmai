@@ -1,16 +1,19 @@
 package pi
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"io/fs"
 	"os"
 	"path/filepath"
-	"sort"
+	"reflect"
+	"runtime"
 	"strings"
-	"syscall"
+	"sync"
 )
 
 const (
@@ -18,117 +21,445 @@ const (
 	preExecutionSidecarSHA256 = "b7978021217df3d3d5edc915072dc1fb69ad075e99ccdbd25d2c9bbf82cf9a5f"
 	preExecutionTreeSHA256    = "a7aa27a451b47bc95d3981f21f6d45630cf29df29aff277a29fd6a15486eb003"
 	preExecutionBinarySHA256  = "6a7668b2059b65851e2a7a94b9b3acdb942ee3e4ebef0a7833c0544b090397f2"
+	artifactSidecarName       = "artifact-profile.json"
+	artifactSidecarMode       = "0444"
+	artifactSidecarSize       = 34961
 )
 
+// TrustedExtensionIdentity is one exact same-process Pi extension identity
+// reviewed and compiled into an embedding binary. Options.TrustedExtensions is
+// the complete ordered list; a session Spec cannot add trust at runtime.
+type TrustedExtensionIdentity struct {
+	ID     string
+	Digest string
+}
+
 type artifactProfileFile struct {
-	Path, SHA256 string
-	Size         int64
-	Mode         string
+	Mode   string `json:"mode"`
+	Path   string `json:"path"`
+	SHA256 string `json:"sha256"`
+	Size   int64  `json:"size"`
 }
+
 type artifactProfile struct {
-	ProfileID, TreeSHA256, BinaryPath string
-	Files                             []artifactProfileFile
+	BinaryPath      string                `json:"binaryPath"`
+	Files           []artifactProfileFile `json:"files"`
+	ProfileID       string                `json:"profileId"`
+	ReceiptContract struct {
+		Mode          string   `json:"mode"`
+		Origins       []string `json:"origins"`
+		SchemaVersion int      `json:"schemaVersion"`
+		Transport     string   `json:"transport"`
+	} `json:"receiptContract"`
+	SameProcessExtensionPolicy string `json:"sameProcessExtensionPolicy"`
+	SchemaVersion              int    `json:"schemaVersion"`
+	Target                     struct {
+		Arch string `json:"arch"`
+		OS   string `json:"os"`
+	} `json:"target"`
+	TreeSHA256 string `json:"treeSha256"`
 }
+
+type artifactFileLease struct {
+	entry artifactProfileFile
+	info  os.FileInfo
+}
+
+// artifactLease retains the opened artifact root and every measured file
+// identity. Revalidation reads through that root and also checks the canonical
+// path still names the same root, closing ordinary path/root replacement.
 type artifactLease struct {
-	root, binary                           string
-	files                                  []artifactProfileFile
-	rootDev, rootIno, binaryDev, binaryIno uint64
+	root      *os.Root
+	rootPath  string
+	rootInfo  os.FileInfo
+	sidecar   artifactFileLease
+	files     []artifactFileLease
+	closeOnce sync.Once
+	closeErr  error
 }
 
-func artifactIdentity(path string) (uint64, uint64, error) {
-	info, err := os.Stat(path)
-	if err != nil {
-		return 0, 0, err
-	}
-	stat, ok := info.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, 0, fmt.Errorf("pi artifact identity unavailable")
-	}
-	return uint64(stat.Dev), uint64(stat.Ino), nil
+type extensionFileLease struct {
+	id, path, digest string
+	info             os.FileInfo
+	size             int64
+	mode             os.FileMode
 }
 
-func sha256File(path string) (string, error) {
-	f, err := os.Open(path)
-	if err != nil {
-		return "", err
-	}
-	defer f.Close()
+type receiptAdmission struct {
+	artifact   *artifactLease
+	extensions []extensionFileLease // policy boundary first, then trusted additions
+}
+
+type agentExtensionIdentity struct{ id, digest, path string }
+
+func sha256Reader(r io.Reader) (string, error) {
 	h := sha256.New()
-	if _, err = io.Copy(h, f); err != nil {
+	if _, err := io.Copy(h, r); err != nil {
 		return "", err
 	}
 	return hex.EncodeToString(h.Sum(nil)), nil
 }
 
-// measureArtifactProfile returns nil for legacy Pi without a sidecar. A claimed
-// sidecar that is not the compiled descriptor is a construction failure.
+func sha256File(path string) (string, error) {
+	f, err := os.Open(path) //nolint:gosec // G304: path is the already-resolved artifact or compiled-embedder extension path; callers hash it before trust.
+	if err != nil {
+		return "", err
+	}
+	digest, hashErr := sha256Reader(f)
+	closeErr := f.Close()
+	if hashErr != nil {
+		return "", hashErr
+	}
+	if closeErr != nil {
+		return "", closeErr
+	}
+	return digest, nil
+}
+
+func fileLinkCount(info os.FileInfo) (uint64, bool) {
+	v := reflect.ValueOf(info.Sys())
+	if !v.IsValid() {
+		return 0, false
+	}
+	if v.Kind() == reflect.Pointer {
+		v = v.Elem()
+	}
+	if !v.IsValid() || v.Kind() != reflect.Struct {
+		return 0, false
+	}
+	n := v.FieldByName("Nlink")
+	if !n.IsValid() {
+		return 0, false
+	}
+	switch n.Kind() {
+	case reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32, reflect.Uint64:
+		return n.Uint(), true
+	case reflect.Int, reflect.Int8, reflect.Int16, reflect.Int32, reflect.Int64:
+		if n.Int() < 0 {
+			return 0, false
+		}
+		return uint64(n.Int()), true //nolint:gosec // G115: negative values are rejected immediately above.
+	default:
+		return 0, false
+	}
+}
+
+func validateArtifactPath(path string) bool {
+	if path == "" || strings.Contains(path, "\\") || filepath.IsAbs(path) {
+		return false
+	}
+	for _, part := range strings.Split(path, "/") {
+		if part == "" || part == "." || part == ".." {
+			return false
+		}
+	}
+	return filepath.ToSlash(filepath.Clean(filepath.FromSlash(path))) == path
+}
+
+func canonicalJSON(raw []byte) bool {
+	var value any
+	if json.Unmarshal(raw, &value) != nil {
+		return false
+	}
+	canonical, err := json.Marshal(value)
+	if err != nil {
+		return false
+	}
+	return bytes.Equal(raw, append(canonical, '\n'))
+}
+
+func readMeasuredRootFile(root *os.Root, entry artifactProfileFile, prior os.FileInfo) (os.FileInfo, string, error) {
+	before, err := root.Lstat(entry.Path)
+	if err != nil || !before.Mode().IsRegular() {
+		return nil, "", fmt.Errorf("pi artifact file %q is not regular", entry.Path)
+	}
+	if links, ok := fileLinkCount(before); !ok || links != 1 {
+		return nil, "", fmt.Errorf("pi artifact file %q is multiply linked", entry.Path)
+	}
+	if before.Size() != entry.Size || fmt.Sprintf("%04o", before.Mode().Perm()) != entry.Mode {
+		return nil, "", fmt.Errorf("pi artifact file %q metadata mismatch", entry.Path)
+	}
+	if prior != nil && !os.SameFile(prior, before) {
+		return nil, "", fmt.Errorf("pi artifact file %q identity changed", entry.Path)
+	}
+	f, err := root.Open(entry.Path)
+	if err != nil {
+		return nil, "", fmt.Errorf("pi artifact file %q open: %w", entry.Path, err)
+	}
+	opened, err := f.Stat()
+	if err != nil || !os.SameFile(before, opened) {
+		_ = f.Close()
+		return nil, "", fmt.Errorf("pi artifact file %q changed while opening", entry.Path)
+	}
+	digest, err := sha256Reader(f)
+	if err != nil {
+		_ = f.Close()
+		return nil, "", fmt.Errorf("pi artifact file %q hash: %w", entry.Path, err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, "", fmt.Errorf("pi artifact file %q close: %w", entry.Path, err)
+	}
+	after, err := root.Lstat(entry.Path)
+	if err != nil || !os.SameFile(opened, after) {
+		return nil, "", fmt.Errorf("pi artifact file %q changed while hashing", entry.Path)
+	}
+	return before, digest, nil
+}
+
+func verifyClosedArtifactSet(root *os.Root, expected map[string]bool) error {
+	seen := make(map[string]bool, len(expected))
+	err := fs.WalkDir(root.FS(), ".", func(path string, d fs.DirEntry, walkErr error) error {
+		if walkErr != nil {
+			return walkErr
+		}
+		if path == "." {
+			return nil
+		}
+		rel := strings.TrimPrefix(filepath.ToSlash(path), "./")
+		info, err := d.Info()
+		if err != nil {
+			return err
+		}
+		if info.IsDir() {
+			if info.Mode()&os.ModeSymlink != 0 {
+				return fmt.Errorf("pi artifact directory %q is a symlink", rel)
+			}
+			return nil
+		}
+		if rel == artifactSidecarName {
+			return nil
+		}
+		if !info.Mode().IsRegular() || !expected[rel] || seen[rel] {
+			return fmt.Errorf("pi artifact contains unexpected entry %q", rel)
+		}
+		seen[rel] = true
+		return nil
+	})
+	if err != nil {
+		return err
+	}
+	if len(seen) != len(expected) {
+		return fmt.Errorf("pi artifact closed file set mismatch")
+	}
+	return nil
+}
+
+// measureArtifactProfile returns nil for legacy Pi without a sidecar. Once an
+// adjacent sidecar exists, every mismatch is a hard construction failure.
 func measureArtifactProfile(binary string) (*artifactLease, error) {
-	root := filepath.Dir(binary)
-	sidecar := filepath.Join(root, "artifact-profile.json")
-	if _, err := os.Lstat(sidecar); os.IsNotExist(err) {
+	rootPath := filepath.Dir(binary)
+	sidecarPath := filepath.Join(rootPath, artifactSidecarName)
+	sideInfo, err := os.Lstat(sidecarPath)
+	if os.IsNotExist(err) {
 		return nil, nil
 	}
-	if got, err := sha256File(sidecar); err != nil || got != preExecutionSidecarSHA256 {
+	if err != nil || !sideInfo.Mode().IsRegular() || sideInfo.Size() != artifactSidecarSize || fmt.Sprintf("%04o", sideInfo.Mode().Perm()) != artifactSidecarMode {
+		return nil, fmt.Errorf("pi artifact profile sidecar is not a regular file")
+	}
+	if links, ok := fileLinkCount(sideInfo); !ok || links != 1 {
+		return nil, fmt.Errorf("pi artifact profile sidecar is multiply linked")
+	}
+	raw, err := os.ReadFile(sidecarPath) //nolint:gosec // G304: adjacent to the canonical resolved Pi binary; exact bytes are digest-pinned below.
+	if err != nil {
+		return nil, fmt.Errorf("pi artifact profile sidecar read: %w", err)
+	}
+	sum := sha256.Sum256(raw)
+	if hex.EncodeToString(sum[:]) != preExecutionSidecarSHA256 || !canonicalJSON(raw) {
 		return nil, fmt.Errorf("pi artifact profile sidecar mismatch")
 	}
-	raw, err := os.ReadFile(sidecar)
-	if err != nil {
-		return nil, err
+	var profile artifactProfile
+	if err := json.Unmarshal(raw, &profile); err != nil {
+		return nil, fmt.Errorf("pi artifact profile decode: %w", err)
 	}
-	var p artifactProfile
-	if err = json.Unmarshal(raw, &p); err != nil || p.ProfileID != preExecutionProfileID || p.TreeSHA256 != preExecutionTreeSHA256 || p.BinaryPath != "pi" {
-		return nil, fmt.Errorf("pi artifact profile malformed")
+	if profile.SchemaVersion != 1 || profile.ProfileID != preExecutionProfileID ||
+		profile.TreeSHA256 != preExecutionTreeSHA256 || profile.BinaryPath != "pi" ||
+		profile.Target.OS != "darwin" || profile.Target.Arch != "arm64" ||
+		profile.ReceiptContract.SchemaVersion != 1 || profile.ReceiptContract.Mode != "rpc" ||
+		profile.ReceiptContract.Transport != "tool_execution_end.preExecutionRefusal" ||
+		!reflect.DeepEqual(profile.ReceiptContract.Origins, []string{"invalid_arguments", "unknown_tool"}) ||
+		profile.SameProcessExtensionPolicy != "consumer-bound-exact-set" {
+		return nil, fmt.Errorf("pi artifact profile closed fields mismatch")
 	}
-	seen := map[string]bool{}
-	for _, entry := range p.Files {
-		if entry.Path == "" || filepath.Clean(entry.Path) != entry.Path || strings.HasPrefix(entry.Path, "..") || seen[entry.Path] {
+	if runtime.GOOS != profile.Target.OS || runtime.GOARCH != profile.Target.Arch {
+		return nil, fmt.Errorf("pi artifact profile target mismatch")
+	}
+	if filepath.Clean(filepath.Join(rootPath, filepath.FromSlash(profile.BinaryPath))) != binary {
+		return nil, fmt.Errorf("pi artifact profile binary path mismatch")
+	}
+	expected := make(map[string]bool, len(profile.Files))
+	for i, entry := range profile.Files {
+		if !validateArtifactPath(entry.Path) || expected[entry.Path] || (i > 0 && profile.Files[i-1].Path >= entry.Path) {
 			return nil, fmt.Errorf("pi artifact profile file set malformed")
 		}
-		seen[entry.Path] = true
-		path := filepath.Join(root, entry.Path)
-		info, e := os.Lstat(path)
-		if e != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
-			return nil, fmt.Errorf("pi artifact file mismatch")
-		}
-		got, e := sha256File(path)
-		if e != nil || got != entry.SHA256 {
-			return nil, fmt.Errorf("pi artifact file digest mismatch")
-		}
+		expected[entry.Path] = true
 	}
-	rootDev, rootIno, err := artifactIdentity(root)
+	treeJSON, err := json.Marshal(profile.Files)
 	if err != nil {
+		return nil, fmt.Errorf("pi artifact profile tree encode: %w", err)
+	}
+	treeSum := sha256.Sum256(append(treeJSON, '\n'))
+	if hex.EncodeToString(treeSum[:]) != preExecutionTreeSHA256 {
+		return nil, fmt.Errorf("pi artifact profile tree digest mismatch")
+	}
+
+	root, err := os.OpenRoot(rootPath)
+	if err != nil {
+		return nil, fmt.Errorf("pi artifact root open: %w", err)
+	}
+	closeOnError := true
+	defer func() {
+		if closeOnError {
+			_ = root.Close()
+		}
+	}()
+	rootInfo, err := root.Stat(".")
+	pathRootInfo, pathErr := os.Lstat(rootPath)
+	if err != nil || pathErr != nil || !rootInfo.IsDir() || !pathRootInfo.IsDir() || !os.SameFile(rootInfo, pathRootInfo) {
+		return nil, fmt.Errorf("pi artifact root identity mismatch")
+	}
+	if err := verifyClosedArtifactSet(root, expected); err != nil {
 		return nil, err
 	}
-	binaryDev, binaryIno, err := artifactIdentity(binary)
-	if err != nil {
-		return nil, err
+	files := make([]artifactFileLease, 0, len(profile.Files))
+	for _, entry := range profile.Files {
+		info, digest, err := readMeasuredRootFile(root, entry, nil)
+		if err != nil || digest != entry.SHA256 {
+			return nil, fmt.Errorf("pi artifact file digest mismatch: %s", entry.Path)
+		}
+		files = append(files, artifactFileLease{entry: entry, info: info})
 	}
-	got, err := sha256File(binary)
-	if err != nil || got != preExecutionBinarySHA256 {
-		return nil, fmt.Errorf("pi artifact binary mismatch")
+	if !expected[profile.BinaryPath] {
+		return nil, fmt.Errorf("pi artifact binary missing from closed file set")
 	}
-	sort.Slice(p.Files, func(i, j int) bool { return p.Files[i].Path < p.Files[j].Path })
-	return &artifactLease{root: root, binary: binary, files: p.Files, rootDev: rootDev, rootIno: rootIno, binaryDev: binaryDev, binaryIno: binaryIno}, nil
+	for _, file := range files {
+		if file.entry.Path == profile.BinaryPath && file.entry.SHA256 != preExecutionBinarySHA256 {
+			return nil, fmt.Errorf("pi artifact binary mismatch")
+		}
+	}
+	sideEntry := artifactProfileFile{Mode: artifactSidecarMode, Path: artifactSidecarName, SHA256: preExecutionSidecarSHA256, Size: artifactSidecarSize}
+	sideMeasured, digest, err := readMeasuredRootFile(root, sideEntry, nil)
+	if err != nil || digest != preExecutionSidecarSHA256 {
+		return nil, fmt.Errorf("pi artifact profile sidecar changed during measurement")
+	}
+	lease := &artifactLease{
+		root: root, rootPath: rootPath, rootInfo: rootInfo,
+		sidecar: artifactFileLease{entry: sideEntry, info: sideMeasured}, files: files,
+	}
+	closeOnError = false
+	return lease, nil
+}
+
+func (l *artifactLease) expectedSet() map[string]bool {
+	expected := make(map[string]bool, len(l.files))
+	for _, file := range l.files {
+		expected[file.entry.Path] = true
+	}
+	return expected
 }
 
 func (l *artifactLease) revalidate() error {
-	rootDev, rootIno, err := artifactIdentity(l.root)
-	if err != nil || rootDev != l.rootDev || rootIno != l.rootIno {
+	pathInfo, err := os.Lstat(l.rootPath)
+	handleInfo, handleErr := l.root.Stat(".")
+	if err != nil || handleErr != nil || !os.SameFile(l.rootInfo, pathInfo) || !os.SameFile(l.rootInfo, handleInfo) {
 		return fmt.Errorf("pi artifact root changed")
 	}
-	binaryDev, binaryIno, err := artifactIdentity(l.binary)
-	if err != nil || binaryDev != l.binaryDev || binaryIno != l.binaryIno {
-		return fmt.Errorf("pi artifact binary changed")
+	if err := verifyClosedArtifactSet(l.root, l.expectedSet()); err != nil {
+		return err
 	}
-	for _, entry := range l.files {
-		path := filepath.Join(l.root, entry.Path)
-		info, err := os.Lstat(path)
-		if err != nil || !info.Mode().IsRegular() || info.Size() != entry.Size {
-			return fmt.Errorf("pi artifact file changed")
+	if _, digest, err := readMeasuredRootFile(l.root, l.sidecar.entry, l.sidecar.info); err != nil || digest != l.sidecar.entry.SHA256 {
+		return fmt.Errorf("pi artifact profile sidecar changed")
+	}
+	for _, file := range l.files {
+		_, digest, err := readMeasuredRootFile(l.root, file.entry, file.info)
+		if err != nil || digest != file.entry.SHA256 {
+			return fmt.Errorf("pi artifact file changed: %s", file.entry.Path)
 		}
-		got, err := sha256File(path)
-		if err != nil || got != entry.SHA256 {
-			return fmt.Errorf("pi artifact file digest changed")
+	}
+	return nil
+}
+
+func (l *artifactLease) close() error {
+	l.closeOnce.Do(func() { l.closeErr = l.root.Close() })
+	return l.closeErr
+}
+
+func validateTrustedExtensionIdentities(ids []TrustedExtensionIdentity) error {
+	seen := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		if id.ID == "" || seen[id.ID] {
+			return fmt.Errorf("pi trusted extension identity has empty or duplicate id")
+		}
+		decoded, err := hex.DecodeString(id.Digest)
+		if err != nil || len(decoded) != sha256.Size || strings.ToLower(id.Digest) != id.Digest {
+			return fmt.Errorf("pi trusted extension %q has malformed digest", id.ID)
+		}
+		seen[id.ID] = true
+	}
+	return nil
+}
+
+func trustedExtensionsMatch(trusted []TrustedExtensionIdentity, actual []agentExtensionIdentity) bool {
+	if len(trusted) != len(actual) {
+		return false
+	}
+	for i := range trusted {
+		if trusted[i].ID != actual[i].id || trusted[i].Digest != actual[i].digest {
+			return false
+		}
+	}
+	return true
+}
+
+func measureExtensionFile(id, path, digest string) (extensionFileLease, error) {
+	before, err := os.Lstat(path)
+	if err != nil || !before.Mode().IsRegular() {
+		return extensionFileLease{}, fmt.Errorf("pi extension %q is not a regular file", id)
+	}
+	f, err := os.Open(path) //nolint:gosec // G304: compiled embedder delivery path; opened bytes are identity- and digest-checked before trust.
+	if err != nil {
+		return extensionFileLease{}, fmt.Errorf("pi extension %q open: %w", id, err)
+	}
+	opened, statErr := f.Stat()
+	got, hashErr := sha256Reader(f)
+	closeErr := f.Close()
+	after, afterErr := os.Lstat(path)
+	if statErr != nil || hashErr != nil || closeErr != nil || afterErr != nil ||
+		!os.SameFile(before, opened) || !os.SameFile(opened, after) || got != digest {
+		return extensionFileLease{}, fmt.Errorf("pi extension %q measurement mismatch", id)
+	}
+	return extensionFileLease{id: id, path: path, digest: digest, info: before, size: before.Size(), mode: before.Mode()}, nil
+}
+
+func newReceiptAdmission(artifact *artifactLease, layout sessionLayout, actual []agentExtensionIdentity, trusted []TrustedExtensionIdentity) (*receiptAdmission, error) {
+	if artifact == nil || !trustedExtensionsMatch(trusted, actual) {
+		return nil, nil
+	}
+	policy, err := measureExtensionFile("donmai-policy", layout.extension, extensionSHA())
+	if err != nil {
+		return nil, err
+	}
+	extensions := []extensionFileLease{policy}
+	for _, id := range actual {
+		lease, err := measureExtensionFile(id.id, id.path, id.digest)
+		if err != nil {
+			return nil, err
+		}
+		extensions = append(extensions, lease)
+	}
+	return &receiptAdmission{artifact: artifact, extensions: extensions}, nil
+}
+
+func (a *receiptAdmission) revalidate() error {
+	if a == nil || a.artifact == nil {
+		return fmt.Errorf("pi receipt admission unavailable")
+	}
+	if err := a.artifact.revalidate(); err != nil {
+		return err
+	}
+	for _, ext := range a.extensions {
+		measured, err := measureExtensionFile(ext.id, ext.path, ext.digest)
+		if err != nil || !os.SameFile(ext.info, measured.info) || measured.size != ext.size || measured.mode != ext.mode {
+			return fmt.Errorf("pi extension %q changed", ext.id)
 		}
 	}
 	return nil

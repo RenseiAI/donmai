@@ -45,6 +45,10 @@ type Handle struct {
 	policy *PolicyEngine
 	spec   agent.Spec
 	state  *mapperState
+	// receipt is an immutable, session-scoped binding to the measured runtime
+	// and complete ordered same-process extension closure. Nil preserves the
+	// historical fatal bypass behavior.
+	receipt *receiptAdmission
 
 	// token is the per-session handshake secret the harness set in the child
 	// env (piHandshakeEnvVar). The policy extension echoes it on every
@@ -97,7 +101,11 @@ type Handle struct {
 	eventsClosed atomic.Bool
 }
 
-func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string) *Handle {
+func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, admissions ...*receiptAdmission) *Handle {
+	var receipt *receiptAdmission
+	if len(admissions) > 0 {
+		receipt = admissions[0]
+	}
 	return &Handle{
 		client:          client,
 		cmd:             cmd,
@@ -105,6 +113,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string) 
 		spec:            spec,
 		state:           &mapperState{},
 		token:           token,
+		receipt:         receipt,
 		handshakeResult: make(chan error, 1),
 		adjudicated:     make(map[string]bool),
 		events:          make(chan agent.Event, 256),
@@ -291,7 +300,9 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	}
 
 	// Bypass monitor: a built-in tool_execution_END MUST have completed a policy
-	// round-trip for its call id (design §5.3). This is belt-and-braces — it
+	// round-trip for its call id. A non-built-in end that claims the narrow SDK
+	// refusal is also checked here so a forged/unsupported claim cannot fall
+	// through the legacy unknown-tool mapping. This is belt-and-braces — it
 	// should be impossible when the policy extension is loaded — but it is the
 	// fail-closed catch if the extension is subverted. tool_execution_start is
 	// NOT the check point (the real lifecycle emits it before the tool_call hook
@@ -299,7 +310,8 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	if ev.Type == "tool_execution_end" {
 		tool := stringField(ev.Fields, "toolName", "tool", "name")
 		callID := stringField(ev.Fields, "toolCallId", "callId", "call_id", "id")
-		if isBuiltInTool(tool) && !h.wasAdjudicated(callID) {
+		_, claimsRefusal := ev.Fields["preExecutionRefusal"]
+		if !h.wasAdjudicated(callID) && (isBuiltInTool(tool) || claimsRefusal) && !h.acceptsPreExecutionRefusal(ev) {
 			// signalClosed BEFORE emit: a caller that observes this event on
 			// h.Events() and immediately calls Inject must find h.closed
 			// already closed. Go's memory model only guarantees the SEND
@@ -313,7 +325,7 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 			// lead the fatal event, not the channel close itself).
 			h.signalClosed()
 			h.emit(agent.ErrorEvent{
-				Message: fmt.Sprintf("policy bypass: built-in tool %q (call %q) executed without a policy adjudication round-trip", tool, callID),
+				Message: fmt.Sprintf("policy bypass: tool %q (call %q) ended without a policy adjudication or verified pre-execution refusal", tool, callID),
 				Code:    "policy_extension_failed",
 				Raw:     raw(ev),
 			})
@@ -355,6 +367,32 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.emit(e)
 	}
 	return fatal
+}
+
+// acceptsPreExecutionRefusal recognizes the sole no-adjudication exception.
+// It deliberately reads only SDK-owned top-level fields from the exact RPC
+// event. Tool result details, error strings, semantic versions, and generic
+// isError values never establish origin.
+func (h *Handle) acceptsPreExecutionRefusal(ev rawEvent) bool {
+	if h.receipt == nil || !h.spec.Autonomous || ev.Type != "tool_execution_end" {
+		return false
+	}
+	outerID, idOK := ev.Fields["toolCallId"].(string)
+	outerName, nameOK := ev.Fields["toolName"].(string)
+	isError, errorOK := ev.Fields["isError"].(bool)
+	refusal, refusalOK := ev.Fields["preExecutionRefusal"].(map[string]any)
+	if !idOK || outerID == "" || !nameOK || outerName == "" || !errorOK || !isError || !refusalOK || len(refusal) != 4 {
+		return false
+	}
+	schema, schemaOK := refusal["schemaVersion"].(float64)
+	origin, originOK := refusal["origin"].(string)
+	innerID, innerIDOK := refusal["toolCallId"].(string)
+	innerName, innerNameOK := refusal["toolName"].(string)
+	if !schemaOK || schema != 1 || !originOK || (origin != "invalid_arguments" && origin != "unknown_tool") ||
+		!innerIDOK || innerID != outerID || !innerNameOK || innerName != outerName {
+		return false
+	}
+	return h.receipt.revalidate() == nil
 }
 
 // handleExtensionRequest verifies the handshake or adjudicates a tool call,

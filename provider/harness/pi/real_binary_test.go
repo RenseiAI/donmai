@@ -51,7 +51,9 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"os"
 	"os/exec"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -242,6 +244,149 @@ func realBinarySpec(cwd, prompt, baseURL string) agent.Spec {
 			// Endpoint.Env, mirroring applyEndpoint's own pickAPIKey contract.
 			Env: map[string]string{"OPENAI_API_KEY": "real-binary-stub-key"}, //nolint:gosec // G101: fixture placeholder, not a credential.
 		},
+	}
+}
+
+func frozenProfiledProvider(t *testing.T, beforePrompt func(*Handle) error) *Provider {
+	t.Helper()
+	binary := filepath.Join(frozenArtifactRoot(t), "pi")
+	if info, err := os.Stat(binary); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("required frozen profiled Pi artifact is unavailable at %s: %v", binary, err)
+	}
+	p, err := New(Options{
+		PiBin:               binary,
+		HandshakeTimeout:    30 * time.Second,
+		beforeInitialPrompt: beforePrompt,
+	})
+	if err != nil {
+		t.Fatalf("construct frozen profiled provider: %v", err)
+	}
+	t.Cleanup(func() { _ = p.Shutdown(context.Background()) })
+	if p.artifact == nil {
+		t.Fatal("frozen artifact did not select the compiled receipt profile")
+	}
+	if p.unverified {
+		t.Fatal("exact measured artifact retained the generic unverified-version label")
+	}
+	return p
+}
+
+func TestFrozenProfiledRealBinaryMalformedWriteRetriesThenAdjudicatesValidWrite(t *testing.T) {
+	workdir := t.TempDir()
+	permitted := filepath.Join(workdir, "permitted.txt")
+	stub := newRealBinaryStub(t, realBinaryModel)
+	validArgs, _ := json.Marshal(map[string]any{"path": permitted, "content": "permitted\n"})
+	stub.mu.Lock()
+	stub.responses = []stubResponse{
+		{ToolCall: &stubToolCall{ID: "call-malformed", Name: "write", Arguments: `{"content":"missing path"}`}},
+		{ToolCall: &stubToolCall{ID: "call-valid", Name: "write", Arguments: string(validArgs)}},
+		{Text: "complete"},
+	}
+	stub.mu.Unlock()
+
+	var argv []string
+	p := frozenProfiledProvider(t, func(h *Handle) error {
+		argv = append([]string(nil), h.cmd.Args...)
+		return nil
+	})
+	spec := realBinarySpec(workdir, "perform the requested write", stub.baseURL())
+	spec.Autonomous = true
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	events := drainToResult(t, h, 60*time.Second)
+
+	if !argvContains(argv, "--mode") || !argvContains(argv, "rpc") || !argvContains(argv, "--no-extensions") {
+		t.Fatalf("profiled child argv did not use the actual headless --mode rpc --no-extensions path: %q", argv)
+	}
+	decisions := 0
+	malformedResult := false
+	for _, event := range events {
+		switch value := event.(type) {
+		case agent.ErrorEvent:
+			t.Fatalf("profiled retry became fatal: %+v", value)
+		case agent.SystemEvent:
+			if value.Subtype == "permission_decision" {
+				decisions++
+			}
+		case agent.ToolResultEvent:
+			if value.ToolUseID == "call-malformed" && value.IsError {
+				malformedResult = true
+			}
+		}
+	}
+	if !malformedResult {
+		t.Fatal("malformed write did not surface as a recoverable error ToolResultEvent")
+	}
+	if decisions != 1 {
+		t.Fatalf("Go policy adjudications=%d, want exactly one for the valid retry", decisions)
+	}
+	ph := h.(*Handle)
+	if ph.wasAdjudicated("call-malformed") || !ph.wasAdjudicated("call-valid") {
+		t.Fatalf("adjudication identities malformed=%v valid=%v, want false/true", ph.wasAdjudicated("call-malformed"), ph.wasAdjudicated("call-valid"))
+	}
+	content, err := os.ReadFile(permitted)
+	if err != nil || string(content) != "permitted\n" {
+		t.Fatalf("permitted retry file content=%q error=%v", content, err)
+	}
+}
+
+func TestFrozenProfiledRealBinaryUnknownAndDeniedCallsHaveZeroEffects(t *testing.T) {
+	workdir := t.TempDir()
+	outside := filepath.Join(t.TempDir(), "must-not-exist.txt")
+	outsideArgs, _ := json.Marshal(map[string]any{"path": outside, "content": "forbidden"})
+	stub := newRealBinaryStub(t, realBinaryModel)
+	stub.mu.Lock()
+	stub.responses = []stubResponse{
+		{ToolCall: &stubToolCall{ID: "call-unknown", Name: "definitely_unknown_tool", Arguments: `{}`}},
+		{ToolCall: &stubToolCall{ID: "call-outside", Name: "write", Arguments: string(outsideArgs)}},
+		{Text: "complete"},
+	}
+	stub.mu.Unlock()
+
+	p := frozenProfiledProvider(t, nil)
+	spec := realBinarySpec(workdir, "exercise refusal controls", stub.baseURL())
+	spec.Autonomous = true
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	events := drainToResult(t, h, 60*time.Second)
+	unknownResult := false
+	decisions := 0
+	for _, event := range events {
+		switch value := event.(type) {
+		case agent.ErrorEvent:
+			t.Fatalf("known refusal became fatal: %+v", value)
+		case agent.SystemEvent:
+			if value.Subtype == "permission_decision" {
+				decisions++
+			}
+		case agent.ToolResultEvent:
+			if value.ToolUseID == "call-unknown" && value.IsError {
+				unknownResult = true
+			}
+		}
+	}
+	if !unknownResult {
+		t.Fatal("unknown tool refusal did not surface as a recoverable error ToolResultEvent")
+	}
+	if decisions != 1 {
+		t.Fatalf("Go policy adjudications=%d, want only the denied out-of-workarea write", decisions)
+	}
+	if _, err := os.Stat(outside); !os.IsNotExist(err) {
+		t.Fatalf("out-of-workarea write had an effect: %v", err)
+	}
+	ph := h.(*Handle)
+	if ph.wasAdjudicated("call-unknown") || !ph.wasAdjudicated("call-outside") {
+		t.Fatalf("adjudication identities unknown=%v outside=%v, want false/true", ph.wasAdjudicated("call-unknown"), ph.wasAdjudicated("call-outside"))
 	}
 }
 
