@@ -56,7 +56,7 @@ func TestCapabilityRealizationRefusesOptionalAndPartial(t *testing.T) {
 	}
 	b := BindCapabilityRealization(c)
 	for _, out := range []ToolAdaptationOutcome{ToolOutcomeDenied, ToolOutcomeDowngraded, ToolOutcomePendingRuntime} {
-		r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, InputDigest: b.Entries[0].InputDigest, Outcome: out}})
+		r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: b.Entries[0].InputDigest, Outcome: out}})
 		if err == nil || r[0].Decision != "denied" {
 			t.Fatalf("outcome %s became %+v", out, r)
 		}
@@ -66,9 +66,18 @@ func TestCapabilityRealizationRefusesOptionalAndPartial(t *testing.T) {
 func TestCapabilityRealizationArtifactBoundNotReady(t *testing.T) {
 	c := realizationFixture(t)
 	b := BindCapabilityRealization(c)
-	r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, InputDigest: b.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}})
+	r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: b.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}})
 	if err != nil || r[0].Decision != "artifact_bound" {
 		t.Fatalf("result=%+v err=%v", r, err)
+	}
+}
+
+func TestCapabilityRealizationRefusesAdvisoryAppliedEntry(t *testing.T) {
+	c := realizationFixture(t)
+	b := BindCapabilityRealization(c)
+	r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: b.Entries[0].EntryID, Channel: b.Entries[0].Channel, Required: false, InputDigest: b.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}})
+	if err == nil || r[0].Decision != "denied" {
+		t.Fatalf("advisory entry=%+v err=%v", r, err)
 	}
 }
 

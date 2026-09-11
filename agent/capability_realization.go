@@ -397,7 +397,7 @@ func ResolveCapabilityRealizationResults(bindings []CapabilityRealizationBinding
 		r := CapabilityRealizationResult{CapabilityRealizationBinding: b, Decision: "artifact_bound"}
 		for _, want := range b.Entries {
 			got, ok := byID[want.EntryID]
-			if !ok || got.Channel != want.Channel || got.InputDigest != want.InputDigest || got.Outcome != ToolOutcomeAdmitted {
+			if !ok || got.Channel != want.Channel || got.Required != want.Required || got.InputDigest != want.InputDigest || got.Outcome != ToolOutcomeAdmitted {
 				r.Decision = "denied"
 				results = append(results, r)
 				return results, fmt.Errorf("capability realization %q is partially applied", b.CapabilityID)
