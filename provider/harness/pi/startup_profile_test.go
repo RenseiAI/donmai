@@ -13,6 +13,9 @@ func TestVersionProbeCommandStripsStartupInjectionWithoutExecutingCandidate(t *t
 	for key := range receiptUnsafeStartupEnv {
 		t.Setenv(key, "benign-control-value")
 	}
+	for _, key := range []string{"DYLD_FUTURE_LOADER_CONTROL", "LD_FUTURE_LOADER_CONTROL"} {
+		t.Setenv(key, "benign-control-value")
+	}
 	t.Setenv("DONMAI_HARMLESS_VAR", "preserved")
 	cmd := versionProbeCommand(context.Background(), "/artifact/pi")
 	if cmd.Dir != "/artifact" {
@@ -26,6 +29,11 @@ func TestVersionProbeCommandStripsStartupInjectionWithoutExecutingCandidate(t *t
 			t.Fatalf("version probe retained startup injection environment %s", key)
 		}
 	}
+	for _, key := range []string{"DYLD_FUTURE_LOADER_CONTROL", "LD_FUTURE_LOADER_CONTROL"} {
+		if hasEnvKey(cmd.Env, key) {
+			t.Fatalf("version probe retained loader namespace environment %s", key)
+		}
+	}
 	if !hasEnvVal(cmd.Env, "DONMAI_HARMLESS_VAR", "preserved") {
 		t.Fatal("version probe dropped an unrelated host environment entry")
 	}
@@ -36,19 +44,18 @@ func TestReceiptStartupContextRejectsRuntimeAndNativeLoaderEnvironment(t *testin
 		"BUN_OPTIONS",
 		"BUN_BE_BUN",
 		"NODE_OPTIONS",
-		"DYLD_INSERT_LIBRARIES",
-		"DYLD_LIBRARY_PATH",
-		"DYLD_FRAMEWORK_PATH",
-		"DYLD_FALLBACK_LIBRARY_PATH",
-		"DYLD_FALLBACK_FRAMEWORK_PATH",
-		"LD_PRELOAD",
-		"LD_LIBRARY_PATH",
+		"NODE_PATH",
+		"DYLD_FUTURE_LOADER_CONTROL",
+		"LD_FUTURE_LOADER_CONTROL",
 	} {
 		t.Run(key, func(t *testing.T) {
 			if got := measureReceiptStartupContext(t.TempDir(), []string{key + "=benign-control-value"}); got != nil {
 				t.Fatalf("startup environment %s retained receipt admission", key)
 			}
 		})
+	}
+	if got := measureReceiptStartupContext(t.TempDir(), []string{"NODE_ENV=staging"}); got == nil {
+		t.Fatal("ordinary NODE_ENV was misclassified as Node startup resolution configuration")
 	}
 }
 
@@ -161,7 +168,10 @@ func TestUnsafeStartupEnvironmentPreservesScriptedLegacySpawn(t *testing.T) {
 			Prompt:     "legacy session",
 			Cwd:        t.TempDir(),
 			Autonomous: true,
-			Env:        map[string]string{"BUN_OPTIONS": "--smol"},
+			Env: map[string]string{
+				"BUN_OPTIONS":                "--smol",
+				"DYLD_FUTURE_LOADER_CONTROL": "benign-control-value",
+			},
 		},
 		handshakeEvent("startup-handshake"),
 		getStateResponse("legacy-startup")+event(map[string]any{"type": "agent_settled"}),

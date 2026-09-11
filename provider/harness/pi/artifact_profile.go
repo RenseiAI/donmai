@@ -103,16 +103,10 @@ type receiptAdmission struct {
 type agentExtensionIdentity struct{ id, digest, path string }
 
 var receiptUnsafeStartupEnv = map[string]bool{
-	"BUN_OPTIONS":                  true,
-	"BUN_BE_BUN":                   true,
-	"NODE_OPTIONS":                 true,
-	"DYLD_INSERT_LIBRARIES":        true,
-	"DYLD_LIBRARY_PATH":            true,
-	"DYLD_FRAMEWORK_PATH":          true,
-	"DYLD_FALLBACK_LIBRARY_PATH":   true,
-	"DYLD_FALLBACK_FRAMEWORK_PATH": true,
-	"LD_PRELOAD":                   true,
-	"LD_LIBRARY_PATH":              true,
+	"BUN_OPTIONS":  true,
+	"BUN_BE_BUN":   true,
+	"NODE_OPTIONS": true,
+	"NODE_PATH":    true,
 }
 
 var preExecutionCompileAutoloadFlags = []string{
@@ -134,7 +128,7 @@ type startupLease struct {
 
 func measureReceiptStartupContext(cwd string, env []string) *startupLease {
 	for _, entry := range env {
-		if receiptUnsafeStartupEnv[startupEnvKey(entry)] {
+		if isUnsafeStartupEnvKey(startupEnvKey(entry)) {
 			return nil
 		}
 	}
@@ -155,10 +149,14 @@ func startupEnvKey(entry string) string {
 	return entry
 }
 
+func isUnsafeStartupEnvKey(key string) bool {
+	return receiptUnsafeStartupEnv[key] || strings.HasPrefix(key, "DYLD_") || strings.HasPrefix(key, "LD_")
+}
+
 func withoutUnsafeStartupEnv(env []string) []string {
 	filtered := make([]string, 0, len(env))
 	for _, entry := range env {
-		if !receiptUnsafeStartupEnv[startupEnvKey(entry)] {
+		if !isUnsafeStartupEnvKey(startupEnvKey(entry)) {
 			filtered = append(filtered, entry)
 		}
 	}
