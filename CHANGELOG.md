@@ -8,6 +8,37 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.28 — 2026-09-10
+
+### Features
+
+- **Capability realizations now bind to observed tool artifacts, preserving
+  exact registration evidence through the worker boundary.** (#585)
+- **Worker registration now preserves capability tags and structured probe
+  output across the registration boundary.** (#583)
+- **The Pi interactive adapter profile advances from v3 to v4. Old v3 receipts
+  refuse and require a newly admitted realization. When no realization is
+  present, the registry preserves the existing v1 behavior.** (#577)
+
+### Fixes
+
+- **Session-shim adoption retries now reprepare when the authenticated
+  controller generation floor advances, preserving the existing fence and
+  preventing stale handoff replay.** (#580)
+- **Founding poll reconciliation now defers until the session shim has a
+  durable founding declaration, avoiding premature recovery claims.** (#579)
+
+### Chores
+
+- **Recovery fixtures now exercise real Pi injection and Codex PTY clients.**
+  (#577, #578)
+- **Recovery regression handshakes and operational-payload provenance fixtures
+  are synchronized with the current protocol.** (#582)
+- **The E2B release workflow now verifies the embedded worker binary version.**
+  (#513)
+- **The session directory dump is ignored and worktree-root resolution is
+  robust when scripts are invoked through a symlink.** (#514, #515)
+
 ---
 
 ## v0.72.27 — 2026-09-09
