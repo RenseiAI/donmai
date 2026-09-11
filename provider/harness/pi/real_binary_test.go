@@ -273,6 +273,12 @@ func frozenProfiledProvider(t *testing.T, beforePrompt func(*Handle) error) *Pro
 
 func TestFrozenProfiledRealBinaryMalformedWriteRetriesThenAdjudicatesValidWrite(t *testing.T) {
 	workdir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(workdir, ".env.local"), []byte("E2E_PORT=4310\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(workdir, "bunfig.toml"), []byte("preload = []\nlogLevel = \"error\"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
 	permitted := filepath.Join(workdir, "permitted.txt")
 	stub := newRealBinaryStub(t, realBinaryModel)
 	validArgs, _ := json.Marshal(map[string]any{"path": permitted, "content": "permitted\n"})
@@ -298,6 +304,9 @@ func TestFrozenProfiledRealBinaryMalformedWriteRetriesThenAdjudicatesValidWrite(
 		t.Fatalf("Spawn: %v", err)
 	}
 	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	if h.(*Handle).receipt == nil {
+		t.Fatal("authenticated no-autoload artifact withheld receipt admission for benign workarea config")
+	}
 	events := drainToResult(t, h, 60*time.Second)
 
 	if !argvContains(argv, "--mode") || !argvContains(argv, "rpc") || !argvContains(argv, "--no-extensions") {

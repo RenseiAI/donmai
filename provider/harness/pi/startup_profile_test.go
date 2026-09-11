@@ -77,42 +77,39 @@ func TestReceiptStartupContextUsesExactComposedHostAndSpecEnvironment(t *testing
 	}
 }
 
-func TestReceiptStartupContextRejectsBunAutoloadFiles(t *testing.T) {
-	for _, name := range receiptAutoloadConfigNames {
+func TestReceiptStartupContextAllowsConfigFilesForAuthenticatedNoAutoloadBuild(t *testing.T) {
+	for _, name := range []string{
+		"bunfig.toml",
+		".env",
+		".env.local",
+		".env.production",
+		".env.development",
+		".env.test",
+		".env.staging",
+	} {
 		t.Run(name, func(t *testing.T) {
 			cwd := t.TempDir()
 			if err := os.WriteFile(filepath.Join(cwd, name), nil, 0o600); err != nil {
 				t.Fatal(err)
 			}
-			if got := measureReceiptStartupContext(cwd, []string{"PATH=/usr/bin"}); got != nil {
-				t.Fatalf("autoload file %s retained receipt admission", name)
+			if got := measureReceiptStartupContext(cwd, []string{"PATH=/usr/bin", "NODE_ENV=staging"}); got == nil {
+				t.Fatalf("inert config file %s withheld receipt admission from the authenticated no-autoload build", name)
 			}
 		})
 	}
-
-	cwd := t.TempDir()
-	if err := os.WriteFile(filepath.Join(cwd, ".env.staging"), nil, 0o600); err != nil {
-		t.Fatal(err)
-	}
-	if got := measureReceiptStartupContext(cwd, []string{"NODE_ENV=staging"}); got != nil {
-		t.Fatal("NODE_ENV-selected dotenv file retained receipt admission")
-	}
-	if got := measureReceiptStartupContext(t.TempDir(), []string{"NODE_ENV=../outside"}); got != nil {
-		t.Fatal("path-shaped NODE_ENV retained receipt admission")
-	}
 }
 
-func TestReceiptStartupContextWithholdsForBenignPlatformWorktreeDotEnv(t *testing.T) {
+func TestReceiptStartupContextAllowsBenignPlatformWorktreeDotEnv(t *testing.T) {
 	cwd := t.TempDir()
 	if err := os.WriteFile(filepath.Join(cwd, ".env.local"), []byte("E2E_PORT=4310\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if got := measureReceiptStartupContext(cwd, []string{"PATH=/usr/bin"}); got != nil {
-		t.Fatal("benign E2E_PORT-only .env.local unexpectedly retained receipt admission")
+	if got := measureReceiptStartupContext(cwd, []string{"PATH=/usr/bin"}); got == nil {
+		t.Fatal("benign E2E_PORT-only .env.local withheld the authenticated no-autoload profile")
 	}
 }
 
-func TestReceiptStartupLeaseDetectsConfigAppearanceAndEnvironmentChange(t *testing.T) {
+func TestReceiptStartupLeaseAllowsConfigAppearanceButDetectsEnvironmentAndCwdChange(t *testing.T) {
 	cwd := t.TempDir()
 	env := []string{"PATH=/usr/bin", "SAFE=value"}
 	lease := measureReceiptStartupContext(cwd, env)
@@ -125,20 +122,18 @@ func TestReceiptStartupLeaseDetectsConfigAppearanceAndEnvironmentChange(t *testi
 	if err := os.WriteFile(filepath.Join(cwd, "bunfig.toml"), nil, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if err := lease.revalidate(); err == nil {
-		t.Fatal("bunfig.toml appearing after startup measurement was accepted")
+	if err := lease.revalidate(); err != nil {
+		t.Fatalf("authenticated no-autoload build treated inert bunfig.toml appearance as startup code: %v", err)
 	}
-
-	customCwd := t.TempDir()
-	custom := measureReceiptStartupContext(customCwd, []string{"NODE_ENV=staging"})
-	if custom == nil {
-		t.Fatal("safe custom NODE_ENV startup context was not retained")
-	}
-	if err := os.WriteFile(filepath.Join(customCwd, ".env.staging"), nil, 0o600); err != nil {
+	moved := cwd + ".moved"
+	if err := os.Rename(cwd, moved); err != nil {
 		t.Fatal(err)
 	}
-	if err := custom.revalidate(); err == nil {
-		t.Fatal("NODE_ENV-selected dotenv appearing after measurement was accepted")
+	if err := os.Mkdir(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := lease.revalidate(); err == nil {
+		t.Fatal("replacement workarea directory retained startup admission")
 	}
 }
 

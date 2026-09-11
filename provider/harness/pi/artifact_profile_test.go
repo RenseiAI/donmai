@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"encoding/json"
 	"io"
 	"os"
 	"path/filepath"
@@ -62,6 +63,26 @@ func copyArtifact(t *testing.T) string {
 	return root
 }
 
+func oldFrozenArtifactRoot(t *testing.T) string {
+	t.Helper()
+	candidateArtifactDir := filepath.Dir(filepath.Dir(filepath.Dir(frozenArtifactRoot(t))))
+	return filepath.Join(
+		filepath.Dir(candidateArtifactDir),
+		"artifact-profile-prototype", "runtime", "profiled-darwin-arm64", "pi",
+	)
+}
+
+func TestOldFrozenArtifactNoLongerSelectsReceiptProfile(t *testing.T) {
+	oldRoot := oldFrozenArtifactRoot(t)
+	if _, err := os.Stat(filepath.Join(oldRoot, "pi")); err != nil {
+		t.Fatalf("old frozen control is unavailable: %v", err)
+	}
+	lease, err := measureArtifactProfile(filepath.Join(oldRoot, "pi"))
+	if err == nil || lease != nil {
+		t.Fatalf("old artifact selected replacement receipt profile: lease=%v err=%v", lease, err)
+	}
+}
+
 func TestArtifactProfileFrozenTreeAndTamperControls(t *testing.T) {
 	root := copyArtifact(t)
 	binary := filepath.Join(root, "pi")
@@ -112,11 +133,25 @@ func TestArtifactProfileFrozenTreeAndTamperControls(t *testing.T) {
 			}
 			return os.Symlink("CHANGELOG.md", old)
 		}},
-		{"sidecar", func(r string) error {
-			if err := os.Chmod(filepath.Join(r, "artifact-profile.json"), 0o600); err != nil {
+		{"unknown-profile", func(r string) error {
+			path := filepath.Join(r, "artifact-profile.json")
+			if err := os.Chmod(path, 0o600); err != nil {
 				return err
 			}
-			return os.WriteFile(filepath.Join(r, "artifact-profile.json"), []byte("{}"), 0o600)
+			raw, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			var profile map[string]any
+			if err := json.Unmarshal(raw, &profile); err != nil {
+				return err
+			}
+			profile["profileId"] = "pi/unknown/v1"
+			updated, err := json.Marshal(profile)
+			if err != nil {
+				return err
+			}
+			return os.WriteFile(path, append(updated, '\n'), 0o600)
 		}},
 		{"sidecar-symlink", func(r string) error {
 			path := filepath.Join(r, "artifact-profile.json")

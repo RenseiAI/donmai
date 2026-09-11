@@ -18,12 +18,12 @@ import (
 
 const (
 	preExecutionProfileID     = "pi/preexecution-refusal-origin/v1"
-	preExecutionSidecarSHA256 = "b7978021217df3d3d5edc915072dc1fb69ad075e99ccdbd25d2c9bbf82cf9a5f"
-	preExecutionTreeSHA256    = "a7aa27a451b47bc95d3981f21f6d45630cf29df29aff277a29fd6a15486eb003"
-	preExecutionBinarySHA256  = "6a7668b2059b65851e2a7a94b9b3acdb942ee3e4ebef0a7833c0544b090397f2"
+	preExecutionSidecarSHA256 = "d6927c50dedd6283bbba7009eddff80cc4cf3b0d9df5b172cb82ca39ba9b8082"
+	preExecutionTreeSHA256    = "0f6dcf512b6ce0e50135b3bfb8795e5c71d5548fd38118a0d40376cda8ebf928"
+	preExecutionBinarySHA256  = "73cab7d9cc76535c5d9035a9e9eb68544cb6271b8171329396150785509605fd"
 	artifactSidecarName       = "artifact-profile.json"
 	artifactSidecarMode       = "0444"
-	artifactSidecarSize       = 34961
+	artifactSidecarSize       = 35480
 )
 
 // TrustedExtensionIdentity is one exact same-process Pi extension identity
@@ -42,7 +42,16 @@ type artifactProfileFile struct {
 }
 
 type artifactProfile struct {
-	BinaryPath      string                `json:"binaryPath"`
+	BinaryPath string `json:"binaryPath"`
+	Build      struct {
+		CompileAutoload struct {
+			Bunfig      bool     `json:"bunfig"`
+			Dotenv      bool     `json:"dotenv"`
+			Flags       []string `json:"flags"`
+			PackageJSON bool     `json:"packageJson"`
+			TSConfig    bool     `json:"tsconfig"`
+		} `json:"compileAutoload"`
+	} `json:"build"`
 	Files           []artifactProfileFile `json:"files"`
 	ProfileID       string                `json:"profileId"`
 	ReceiptContract struct {
@@ -106,24 +115,21 @@ var receiptUnsafeStartupEnv = map[string]bool{
 	"LD_LIBRARY_PATH":              true,
 }
 
-var receiptAutoloadConfigNames = []string{
-	"bunfig.toml",
-	".env",
-	".env.local",
-	".env.production",
-	".env.development",
-	".env.test",
+var preExecutionCompileAutoloadFlags = []string{
+	"--no-compile-autoload-dotenv",
+	"--no-compile-autoload-bunfig",
+	"--no-compile-autoload-tsconfig",
+	"--no-compile-autoload-package-json",
 }
 
-// startupLease binds receipt trust to the exact exec.Cmd environment and to
-// the absence of workarea files Bun standalone executables autoload. Any such
-// input leaves the session available on the legacy path but withholds the new
-// receipt exception.
+// startupLease binds receipt trust to the exact exec.Cmd environment and
+// workarea identity. The compiled artifact descriptor separately proves all
+// Bun config autoload classes are disabled, so ordinary workarea dotenv and
+// bunfig files are inert and do not need to be absent.
 type startupLease struct {
-	cwd         string
-	cwdInfo     os.FileInfo
-	env         []string
-	configNames []string
+	cwd     string
+	cwdInfo os.FileInfo
+	env     []string
 }
 
 func measureReceiptStartupContext(cwd string, env []string) *startupLease {
@@ -136,42 +142,10 @@ func measureReceiptStartupContext(cwd string, env []string) *startupLease {
 	if err != nil || !cwdInfo.IsDir() || cwdInfo.Mode()&os.ModeSymlink != 0 {
 		return nil
 	}
-	configNames, ok := receiptStartupConfigNames(env)
-	if !ok {
-		return nil
-	}
-	for _, name := range configNames {
-		if _, err := os.Lstat(filepath.Join(cwd, name)); !os.IsNotExist(err) {
-			return nil
-		}
-	}
 	return &startupLease{
 		cwd: cwd, cwdInfo: cwdInfo,
-		env: append([]string(nil), env...), configNames: configNames,
+		env: append([]string(nil), env...),
 	}
-}
-
-func receiptStartupConfigNames(env []string) ([]string, bool) {
-	names := append([]string(nil), receiptAutoloadConfigNames...)
-	nodeEnv := ""
-	for _, entry := range env {
-		if startupEnvKey(entry) == "NODE_ENV" {
-			_, nodeEnv, _ = strings.Cut(entry, "=")
-		}
-	}
-	if nodeEnv == "" {
-		return names, true
-	}
-	if filepath.Base(nodeEnv) != nodeEnv || nodeEnv == "." || nodeEnv == ".." || strings.Contains(nodeEnv, "\\") {
-		return nil, false
-	}
-	name := ".env." + nodeEnv
-	for _, existing := range names {
-		if existing == name {
-			return names, true
-		}
-	}
-	return append(names, name), true
 }
 
 func startupEnvKey(entry string) string {
@@ -198,11 +172,6 @@ func (l *startupLease) revalidate() error {
 	cwdInfo, err := os.Lstat(l.cwd)
 	if err != nil || !cwdInfo.IsDir() || !os.SameFile(l.cwdInfo, cwdInfo) {
 		return fmt.Errorf("pi receipt workarea changed")
-	}
-	for _, name := range l.configNames {
-		if _, err := os.Lstat(filepath.Join(l.cwd, name)); !os.IsNotExist(err) {
-			return fmt.Errorf("pi receipt startup config %q appeared", name)
-		}
 	}
 	return nil
 }
@@ -398,6 +367,11 @@ func measureArtifactProfile(binary string) (*artifactLease, error) {
 		!reflect.DeepEqual(profile.ReceiptContract.Origins, []string{"invalid_arguments", "unknown_tool"}) ||
 		profile.SameProcessExtensionPolicy != "consumer-bound-exact-set" {
 		return nil, fmt.Errorf("pi artifact profile closed fields mismatch")
+	}
+	compileAutoload := profile.Build.CompileAutoload
+	if compileAutoload.Bunfig || compileAutoload.Dotenv || compileAutoload.PackageJSON || compileAutoload.TSConfig ||
+		!reflect.DeepEqual(compileAutoload.Flags, preExecutionCompileAutoloadFlags) {
+		return nil, fmt.Errorf("pi artifact profile compile autoload mismatch")
 	}
 	if runtime.GOOS != profile.Target.OS || runtime.GOARCH != profile.Target.Arch {
 		return nil, fmt.Errorf("pi artifact profile target mismatch")
