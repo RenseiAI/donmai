@@ -27,7 +27,7 @@ import "github.com/RenseiAI/donmai/agent"
 // entry, while the real spawn's Provider — resolved from a registry a
 // decorator DID wrap — recomputed one WITH it whenever the exact harness
 // profile admits ToolPluginDelivery rather than denying it (pi's
-// pi/interactive/tool-lifecycle-v3 and pi/headless/tool-lifecycle-v2 profiles
+// pi/interactive/tool-lifecycle-v4 and pi/headless/tool-lifecycle-v2 profiles
 // both do). agent.ApplyPreparedHarness then found the recomputed
 // ToolLifecycleReceipt disagreed with the host-persisted one even though the
 // harnessAuthorityProjection digest still matched (AdditionalExtensions is

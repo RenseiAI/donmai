@@ -97,7 +97,7 @@ var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 // (e.g. ollama not running) emit WARN logs but do not block daemon start.
 func daemonProviderView(cfg Config, logger *slog.Logger) *runner.ProviderView {
 	providerReg := daemonRegistryBuilder(logger, cfg.AgentSpecExtensionDecorator)
-	return runner.NewProviderViewWithDecorator(providerReg, cfg.AgentSpecExtensionDecorator)
+	return runner.NewProviderViewWithDecoratorAndRealizations(providerReg, cfg.AgentSpecExtensionDecorator, cfg.CapabilityRealizations)
 }
 
 // newDaemonRunCmd constructs the `host run` subcommand. This is the

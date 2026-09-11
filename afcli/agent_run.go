@@ -74,7 +74,8 @@ type agentRunOpts struct {
 	// specDecorator is cfg.AgentSpecExtensionDecorator, threaded through from
 	// newAgentRunCmd exactly like bin above. nil preserves historical
 	// behavior (no provider wrapping).
-	specDecorator agent.ExtensionDecorator
+	specDecorator          agent.ExtensionDecorator
+	capabilityRealizations *agent.CapabilityRealizationRegistry
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -128,7 +129,7 @@ func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.Harn
 // (F.2.8 — daemon wire-up.)
 func newAgentRunCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
-	opts := &agentRunOpts{bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator}
+	opts := &agentRunOpts{bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator, capabilityRealizations: cfg.CapabilityRealizations}
 	cmd := &cobra.Command{
 		Use:   "run",
 		Short: "Run a single agent session (invoked by the daemon spawner).",
@@ -393,6 +394,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// each other and with the daemon's preflight compiler (see
 		// runner.ReconcileAdditionalExtensions).
 		AdditionalExtensionDecorator: opts.specDecorator,
+		CapabilityRealizations:       opts.capabilityRealizations,
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory

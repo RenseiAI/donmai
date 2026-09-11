@@ -266,6 +266,7 @@ type Options struct {
 	// — see runner.ReconcileAdditionalExtensions's doc comment. nil
 	// preserves the historical undecorated behavior.
 	AdditionalExtensionDecorator agent.ExtensionDecorator
+	CapabilityRealizations       *agent.CapabilityRealizationRegistry
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -323,6 +324,7 @@ type Runner struct {
 	kitComposer                  KitComposer
 	kitTargetOS                  string
 	additionalExtensionDecorator agent.ExtensionDecorator
+	capabilityRealizations       *agent.CapabilityRealizationRegistry
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -383,6 +385,7 @@ func New(opts Options) (*Runner, error) {
 		kitComposer:                  opts.KitComposer,
 		kitTargetOS:                  opts.KitTargetOS,
 		additionalExtensionDecorator: opts.AdditionalExtensionDecorator,
+		capabilityRealizations:       opts.CapabilityRealizations,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

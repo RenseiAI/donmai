@@ -36,7 +36,7 @@ func additionalExtensionDeliveryForTest(id, content string) agent.ExtensionDeliv
 // admitted a ToolLifecycleReceipt with exactly ONE entry (id
 // "disallowed-tools", channel "disallowed_tools", delivery
 // "pi_interactive_local_tool_policy", profile
-// "pi/interactive/tool-lifecycle-v3", decision "ready"); at spawn, the
+// "pi/interactive/tool-lifecycle-v4", decision "ready"); at spawn, the
 // recomputed entries differed.
 //
 // Root cause: an embedder's additional-extension decorator
@@ -182,6 +182,12 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithAdditionalExtensionDecora
 		}
 		if provider.spawnCalls.Load() != 0 {
 			t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
+		}
+		old := plan
+		old.ToolLifecycleReceipt.ProfileID = "pi/interactive/tool-lifecycle-v3"
+		oldSource := simulateSpawnSpec(t, old)
+		if _, err := agent.PrepareHarness(oldSource, providerWithManifest.Manifest()); err == nil {
+			t.Fatal("old v3 realization receipt silently widened into v4")
 		}
 	})
 

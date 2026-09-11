@@ -791,7 +791,7 @@
           "productionEligible": false
         },
         {
-          "id": "pi/interactive/tool-lifecycle-v3",
+          "id": "pi/interactive/tool-lifecycle-v4",
           "mode": "human_controlled",
           "toolPluginDelivery": "pi_additional_extension_registration",
           "mcpDelivery": "unsupported",

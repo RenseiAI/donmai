@@ -2,8 +2,10 @@ package runner
 
 import (
 	"errors"
+	"fmt"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -40,7 +42,7 @@ func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
 // the real spawn's decorated Provider will apply. nil is a legitimate value:
 // a session with no registered decorator never had this mutation to
 // reconcile.
-func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator) (agent.Spec, []string, error) {
+func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, registries ...*agent.CapabilityRealizationRegistry) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
@@ -106,9 +108,36 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if working.isInterview() {
 		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")
 	}
-	spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt)
+	var realizations *agent.CapabilityRealizationRegistry
+	if len(registries) > 0 {
+		realizations = registries[0]
+	}
+	spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt, realizations)
 	if err != nil {
 		return agent.Spec{}, nil, err
+	}
+	harness, ok := provider.(agent.HarnessProvider)
+	if !ok {
+		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact harness manifest")
+	}
+	manifest := harness.Manifest()
+	profile, ok := manifest.ToolLifecycleProfile(mode)
+	if !ok {
+		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact tool lifecycle profile")
+	}
+	var granted []executioncell.CapabilityRequirement
+	if len(selection.receipt.Bytes()) > 0 && selection.receipt.Value().Cell != nil {
+		granted = selection.receipt.Value().Cell.GrantedCapabilities
+	}
+	for _, capability := range granted {
+		if realizations == nil || !realizations.Knows(capability.Name) {
+			continue
+		}
+		compiled, found := realizations.Resolve(capability.Name, manifest.Name, profile.ID, mode)
+		if !found {
+			return agent.Spec{}, nil, fmt.Errorf("runner: capability %q has no production-eligible exact realization", capability.Name)
+		}
+		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, agent.BindCapabilityRealization(compiled))
 	}
 	spec = ReconcileAdditionalExtensions(spec, decorate)
 	return spec, runtimeNames, nil
@@ -127,8 +156,8 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 // ReconcileAdditionalExtensions for why the daemon's preflight compiler
 // (ProviderView.PreflightExecution, the sole caller of this function) must
 // supply the SAME embedder decorator the real spawn's Provider will apply.
-func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator) (*agent.PreparedHarness, agent.Spec, error) {
-	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, decorate)
+func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, registries ...*agent.CapabilityRealizationRegistry) (*agent.PreparedHarness, agent.Spec, error) {
+	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, decorate, registries...)
 	if err != nil {
 		return nil, agent.Spec{}, err
 	}

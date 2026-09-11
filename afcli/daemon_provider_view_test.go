@@ -242,7 +242,11 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 				AuthDelivery: string(executioncell.DeliveryEnvironment), Mechanism: agent.AuthAPIKey,
 			},
 		}
-		qw = attachAdmittedExecutionCellForTest(t, qw, fakeDecoratorReceiptCell())
+		cell := fakeDecoratorReceiptCell()
+		if cfg.CapabilityRealizations != nil {
+			cell.GrantedCapabilities = []executioncell.CapabilityRequirement{{Name: "example.workflow-authoring/v1", ParametersDigest: strings.Repeat("9", 64)}}
+		}
+		qw = attachAdmittedExecutionCellForTest(t, qw, cell)
 		operational, err := runner.CanonicalOperationalPayload(qw)
 		if err != nil {
 			t.Fatal(err)
@@ -296,6 +300,31 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 		plan := compile(t, Config{AgentSpecExtensionDecorator: decorate})
 		if !hasAdditionalExtensionsEntry(plan) {
 			t.Fatalf("Config.AgentSpecExtensionDecorator did not reach daemonProviderView's compiled receipt: entries=%+v", plan.ToolLifecycleReceipt.Entries)
+		}
+	})
+
+	t.Run("realization registry reaches daemon preflight", func(t *testing.T) {
+		surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "draft_create"}}
+		inputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery})
+		declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.workflow-authoring/v1", HarnessID: testFakeDecoratorHarnessName, AdapterVersion: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous, RecipeID: "example/native-extension/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "real-binary", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: inputDigest}}, ObservedSurface: surface})
+		if err != nil {
+			t.Fatal(err)
+		}
+		compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		registry, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+		if err != nil {
+			t.Fatal(err)
+		}
+		plan := compile(t, Config{AgentSpecExtensionDecorator: decorate, CapabilityRealizations: registry})
+		if len(plan.ToolLifecycleReceipt.CapabilityRealizations) != 1 || plan.ToolLifecycleReceipt.CapabilityRealizations[0].Decision != "artifact_bound" {
+			t.Fatalf("registry did not reach daemon preflight: %+v", plan.ToolLifecycleReceipt.CapabilityRealizations)
 		}
 	})
 }

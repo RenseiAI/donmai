@@ -188,7 +188,10 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// interactive-local-tool-policy fixtures (the extension's actual
 				// enforcement, against the real production source, no pi binary
 				// needed).
-				ID: "pi/interactive/tool-lifecycle-v3", Mode: agent.PromptModeHumanControlled,
+				// Bumped v3 -> v4: the registered capability-realization set now
+				// includes downstream native workflow-authoring tools. Old v3 receipts
+				// must refuse rather than silently acquiring the wider surface.
+				ID: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryPiAdditionalExtension, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryPiInteractiveLocalToolPolicy, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
