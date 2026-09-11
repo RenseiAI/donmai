@@ -742,6 +742,12 @@ func additionalExtensionDigestInput(deliveries []ExtensionDelivery) any {
 	return out
 }
 
+// CapabilityExtensionInputDigest returns the canonical lifecycle input digest
+// for an exact extension batch so a downstream fixture can bind the artifact.
+func CapabilityExtensionInputDigest(deliveries []ExtensionDelivery) string {
+	return digestToolInput(additionalExtensionDigestInput(deliveries))
+}
+
 func validateToolLifecycleProfile(profile ToolLifecycleProfile) string {
 	if profile.ID == "" || profile.Mode == "" || profile.EvidenceTier == "" {
 		return "profile requires id, mode, and evidence tier"

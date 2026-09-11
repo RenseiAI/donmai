@@ -441,8 +441,7 @@ func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, 
 			profile, profileOK := manifest.ToolLifecycleProfile(mode)
 			var realizationOK bool
 			if len(realizations) > 0 && realizations[0] != nil && profileOK {
-				declaration, found := realizations[0].Resolve(capability.Name, manifest.Name, profile.ID, mode)
-				realizationOK = found && declaration.ProductionEligible()
+				_, realizationOK = realizations[0].Resolve(capability.Name, manifest.Name, profile.ID, mode)
 			}
 			if realizationOK {
 				continue

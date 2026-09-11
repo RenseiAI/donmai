@@ -133,14 +133,11 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		if realizations == nil || !realizations.Knows(capability.Name) {
 			continue
 		}
-		declaration, found := realizations.Resolve(capability.Name, manifest.Name, profile.ID, mode)
-		if !found || !declaration.ProductionEligible() {
+		compiled, found := realizations.Resolve(capability.Name, manifest.Name, profile.ID, mode)
+		if !found {
 			return agent.Spec{}, nil, fmt.Errorf("runner: capability %q has no production-eligible exact realization", capability.Name)
 		}
-		if !agent.CapabilityRealizationSupportsSpec(declaration, spec) {
-			return agent.Spec{}, nil, fmt.Errorf("runner: capability %q declared MCP surface is not present", capability.Name)
-		}
-		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, agent.BindCapabilityRealization(declaration))
+		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, agent.BindCapabilityRealization(compiled))
 	}
 	spec = ReconcileAdditionalExtensions(spec, decorate)
 	return spec, runtimeNames, nil

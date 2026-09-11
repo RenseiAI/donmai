@@ -7,21 +7,23 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-func matrixRealization(t *testing.T, tier agent.CapabilityRealizationEvidenceTier) agent.CapabilityRealizationDeclaration {
-	t.Helper()
-	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.capability/v1", HarnessID: agent.HarnessCodex, AdapterVersion: "codex/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled, RecipeID: "example.recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true}}, DeclaredSurface: agent.CapabilityDeclaredSurface{MCPServerNames: []string{"example"}, MCPToolNames: []string{"one"}}, Evidence: agent.CapabilityRealizationEvidence{FixtureID: "real", FixtureDigest: strings.Repeat("a", 64), Tier: tier}})
+func TestCompileCapabilityRealizationsConsumesObservation(t *testing.T) {
+	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "one"}}
+	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
 	if err != nil {
 		t.Fatal(err)
 	}
-	return d
-}
-
-func TestCompileCapabilityRealizationsDerivesEligibility(t *testing.T) {
-	rows, err := CompileCapabilityRealizations([]agent.CapabilityRealizationDeclaration{matrixRealization(t, agent.RealizationEvidenceRealBinary)})
-	if err != nil || len(rows) != 1 || !rows[0].ProductionEligible {
+	o, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: d, FixtureID: "real", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: strings.Repeat("b", 64)}}, ObservedSurface: surface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	rows, err := CompileCapabilityRealizations([]CapabilityRealizationSource{{Declaration: d, Observation: o}})
+	if err != nil || len(rows) != 1 {
 		t.Fatalf("rows=%+v err=%v", rows, err)
 	}
-	if _, err := CompileCapabilityRealizations([]agent.CapabilityRealizationDeclaration{matrixRealization(t, agent.RealizationEvidenceFixture)}); err == nil {
-		t.Fatal("fixture-only registration compiled")
+	o.ObservedSurface = nil
+	o.ObservationDigest = ""
+	if _, err := CompileCapabilityRealizations([]CapabilityRealizationSource{{Declaration: d, Observation: o}}); err == nil {
+		t.Fatal("missing fixture surface compiled")
 	}
 }
