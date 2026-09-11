@@ -22,6 +22,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- **Typed startup adoption conflicts are retained as per-lineage quarantine
+  records, allowing unrelated lineages to continue composing.** (#587)
 - **Session-shim adoption retries now reprepare when the authenticated
   controller generation floor advances, preserving the existing fence and
   preventing stale handoff replay.** (#580)
