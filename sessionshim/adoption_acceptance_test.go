@@ -858,6 +858,38 @@ func TestPrepareAdoptionRunsAfterHelloAndFailureDoesNotAdvanceGeneration(t *test
 	}
 }
 
+func TestAdoptCanQuarantineOneTypedPreparationConflict(t *testing.T) {
+	id := Identity{OrgID: "org-prepare-quarantine", SessionID: "session-prepare-quarantine"}
+	f := startShimHelper(t, id, 10_000)
+	initial := f.adoptAs(t, "controller-initial")
+	initial.Close()
+	decisive := errors.New("decisive authority conflict")
+	result, err := Adopt(context.Background(), AdoptOptions{
+		Registry:     f.registry,
+		ControllerID: "controller-conflicted",
+		Prepare: func(_ context.Context, _ AdoptionPreparation) (PreparedAdoption, error) {
+			return PreparedAdoption{}, decisive
+		},
+		QuarantinePreparationFailure: func(err error) bool { return errors.Is(err, decisive) },
+	})
+	if err != nil {
+		t.Fatalf("typed preparation conflict aborted the pass: %v", err)
+	}
+	if len(result.Adopted) != 0 || len(result.Quarantined) != 1 || result.OccupiedSlots() != 1 {
+		t.Fatalf("result=%+v, want one capacity-consuming quarantine", result)
+	}
+	q := result.Quarantined[0]
+	if q.Identity() != id || q.ShimID == "" || q.ProcessEpoch != 1 ||
+		q.ControllerGeneration != 1 || q.Reason != QuarantineAdoptionFailed {
+		t.Fatalf("quarantine lost authenticated lineage: %+v", q)
+	}
+	// No Welcome was sent, so the exact next ordinary adoption advances 1 -> 2.
+	retry := f.adoptAs(t, "controller-retry")
+	if len(retry.Adopted) != 1 || retry.Adopted[0].Generation() != 2 {
+		t.Fatalf("retry=%+v, want generation 2", retry.Adopted)
+	}
+}
+
 func TestAdoptRequiresARegistry(t *testing.T) {
 	t.Parallel()
 

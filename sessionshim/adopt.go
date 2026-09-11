@@ -37,6 +37,13 @@ type AdoptOptions struct {
 	// external carrier (ADR-2026-08-17 §D4).
 	Prepare func(ctx context.Context, evidence AdoptionPreparation) (PreparedAdoption, error)
 
+	// QuarantinePreparationFailure may classify one authenticated preparation
+	// refusal as a per-lineage quarantine instead of aborting the whole pass.
+	// Nil preserves the fail-closed default. The callback receives the original
+	// error chain and must match a typed, decisive authority conflict; transport,
+	// auth, malformed-response, and availability failures must remain fatal.
+	QuarantinePreparationFailure func(error) bool
+
 	// ResumeFrom returns the first sequence this daemon still needs for a
 	// session — its durable last_forwarded_seq + 1. Nil uses this shim
 	// incarnation's fsync-backed ACK sidecar + 1 when present, otherwise the
@@ -445,6 +452,16 @@ func Adopt(ctx context.Context, opts AdoptOptions) (AdoptionResult, error) {
 		ctrl, adoptErr := dialForAdoptionWithRetry(ctx, rec, opts, log)
 		if adoptErr != nil {
 			if errors.Is(adoptErr, ErrAdoptionPreparation) {
+				if opts.QuarantinePreparationFailure != nil && opts.QuarantinePreparationFailure(adoptErr) {
+					quarantined := NewQuarantinedSession(rec, QuarantineAdoptionFailed, adoptErr.Error(), now)
+					if generation, ok := authenticatedHelloGeneration(adoptErr); ok {
+						quarantined.ControllerGeneration = uint64(generation)
+					}
+					result.Quarantined = append(result.Quarantined, quarantined)
+					log.Warn("sessionshim: quarantined shim after decisive adoption preparation conflict",
+						"session", id.String(), "error", adoptErr)
+					continue
+				}
 				result.Close()
 				return result, adoptErr
 			}

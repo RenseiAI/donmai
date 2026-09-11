@@ -68,6 +68,39 @@ func TestSessionShimPrepareFailureClassification(t *testing.T) {
 	}
 }
 
+func TestSessionShimAdoptOptionsQuarantinesOnlyTypedPreparationConflict(t *testing.T) {
+	t.Parallel()
+	d := New(Options{SessionShim: SessionShimConfig{
+		PrepareAdoption: func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			return sessionshim.PreparedAdoption{}, nil
+		},
+	}})
+	opts, _, err := d.sessionShimAdoptOptions(&sessionshim.Registry{}, d.sessionShimConfig())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if opts.QuarantinePreparationFailure == nil {
+		t.Fatal("typed preparation classifier is absent")
+	}
+	conflict := fmt.Errorf("platform refusal: %w", ErrSessionShimAdoptionPrepareConflict)
+	for name, tc := range map[string]struct {
+		err  error
+		want bool
+	}{
+		"typed conflict":       {err: conflict, want: true},
+		"unavailable":          {err: ErrSessionShimAdoptionPrepareUnavailable},
+		"deadline":             {err: context.DeadlineExceeded},
+		"untyped refusal text": {err: errors.New("conflict")},
+	} {
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			if got := opts.QuarantinePreparationFailure(tc.err); got != tc.want {
+				t.Fatalf("classifier(%v)=%v want %v", tc.err, got, tc.want)
+			}
+		})
+	}
+}
+
 // TestAdoptionPreparationRefusesItselfWithoutWithdrawingHostReadiness is the
 // readiness half of the rule. A definite not-ready still refuses the
 // preparation — nothing is loosened — but the host-wide admission fence belongs

@@ -2415,6 +2415,13 @@ func (d *Daemon) sessionShimAdoptOptions(
 			preparations.inputs[evidence.Identity] = evidence
 			return prepared.PreparedAdoption, nil
 		}
+		// A composing authority's typed 409 is a decisive fact about this exact
+		// authenticated lineage. Keep it visible and capacity-consuming so the
+		// complete quarantine batch and restart fence can reconcile it. Every
+		// unanswered or malformed preparation remains host-wide fatal.
+		opts.QuarantinePreparationFailure = func(err error) bool {
+			return errors.Is(err, ErrSessionShimAdoptionPrepareConflict)
+		}
 	}
 	if cfg.ResumeFrom != nil {
 		resume := cfg.ResumeFrom
