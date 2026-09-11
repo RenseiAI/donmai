@@ -259,7 +259,7 @@
 // declarations. ToolPluginDelivery uses the same explicit -e registration
 // mechanism as headless. NativeToolPolicyDelivery is also REAL
 // (agent.ToolDeliveryPiInteractiveLocalToolPolicy, manifest.go's
-// pi/interactive/tool-lifecycle-v3; v2 introduced this local channel and v3
+// pi/interactive/tool-lifecycle-v4; v2 introduced this local channel and v3
 // added tool-plugin delivery per the adapter-version rule,
 // ADR-2026-08-12 D1.3a/D6). The SAME embedded extension
 // this lane loads also matches a stamped Spec.AllowedTools/DisallowedTools
