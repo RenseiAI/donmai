@@ -14,7 +14,7 @@ require (
 	github.com/charmbracelet/x/ansi v0.11.7
 	github.com/charmbracelet/x/vt v0.0.0-20260712004152-b16d026a9d2e
 	github.com/coder/websocket v1.8.15
-	github.com/creack/pty v1.1.24
+	github.com/creack/pty v1.1.25-0.20260601142114-9246436fffe8
 	github.com/cyberphone/json-canonicalization v0.0.0-20241213102144-19d51d7fe467
 	github.com/fsnotify/fsnotify v1.10.1
 	github.com/go-git/go-git/v5 v5.19.2
