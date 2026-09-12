@@ -8,6 +8,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.31 — 2026-09-11
+
+### Fixes
+
+- **Public stop clients now recognize durable pre-session dispatch
+  reconciliation receipts without inventing runtime lifecycle identity.**
+  Safe conflict responses that omit retry guidance retain their bounded code
+  and refusal while remaining conservatively non-retryable. (#591)
+
+---
+
 ## v0.72.30 — 2026-09-11
 
 ### Features
