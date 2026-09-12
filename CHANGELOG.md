@@ -8,6 +8,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.35 — 2026-09-12
+
+### Fixes
+
+- **Read-only reviews now preserve their terminal verdict.** Review work that
+  owes a verdict rather than repository changes no longer receives a tail
+  commit-and-pull-request prompt or automatic publication recovery. Development
+  and inflight work retain their existing publication obligations.
+
 ## v0.72.34 — 2026-09-12
 
 ### Fixes
