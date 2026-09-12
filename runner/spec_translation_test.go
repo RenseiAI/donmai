@@ -7,6 +7,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	piprovider "github.com/RenseiAI/donmai/provider/harness/pi"
 )
 
 func TestTranslateSpec_ProjectsSessionName(t *testing.T) {
@@ -278,6 +279,33 @@ func TestTranslateSpec_CardAllowedTools_ReplacesDefault(t *testing.T) {
 			t.Errorf("AllowedTools = %v, want default %v", spec.AllowedTools, defaultAllowedTools())
 		}
 	})
+}
+
+func TestTranslateSpec_AutonomousDefaultsRemainUsableByPi(t *testing.T) {
+	t.Parallel()
+	provider := &piprovider.Provider{}
+	spec := translateSpec(
+		QueuedWork{QueuedWork: prompt.QueuedWork{}},
+		provider.Capabilities(),
+		SpecInputs{Cwd: "/work", Autonomous: true},
+	)
+	if !slices.Contains(spec.DisallowedTools, "AskUserQuestion") || !slices.Contains(spec.AllowedTools, "Task") {
+		t.Fatalf("test no longer exercises foreign default tool names: allowed=%v disallowed=%v", spec.AllowedTools, spec.DisallowedTools)
+	}
+	engine := piprovider.NewPolicyEngine(spec)
+
+	for _, call := range []piprovider.ToolCall{
+		{Kind: piprovider.ToolRead, Path: "/work/README.md", Cwd: "/work"},
+		{Kind: piprovider.ToolWrite, Path: "/work/result.txt", Cwd: "/work"},
+		{Kind: piprovider.ToolBash, Command: "git status", Cwd: "/work"},
+	} {
+		if decision := engine.Evaluate(call); !decision.Allow {
+			t.Errorf("translated autonomous defaults denied Pi %s: %q", call.Kind, decision.Reason)
+		}
+	}
+	if decision := engine.Evaluate(piprovider.ToolCall{Kind: piprovider.ToolBash, Command: "printf outside-list", Cwd: "/work"}); decision.Allow {
+		t.Error("translated autonomous defaults granted an out-of-allowlist shell command")
+	}
 }
 
 // TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig verifies the
