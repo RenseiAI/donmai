@@ -8,6 +8,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.34 — 2026-09-12
+
+### Fixes
+
+- **Authored workflows now own optional post-session tracker mutations.** The
+  production agent runner no longer performs its legacy implicit status or
+  diagnostic-comment writes after a session ends, while terminal result,
+  verdict, failure, and evidence publication remain intact. (#598)
+
 ## v0.72.33 — 2026-09-12
 
 ### Fixes
