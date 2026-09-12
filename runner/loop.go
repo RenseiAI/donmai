@@ -1296,16 +1296,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// declined (FailureAgentBlocked): there is nothing to steer toward and
 	// no work to backstop into an empty branch.
 	//
-	// Belt-and-suspenders bypass on top of the contract gate inside
-	// shouldSteer/shouldBackstop: a non-result-sensitive work type that
-	// already produced a passing WorkResult (marker or manifest verdict,
-	// resolved into res.WorkResult above) has demonstrably completed — it
-	// must not be steered toward a commit nor backstopped into an empty
-	// PR. The contract check alone would already skip these, but the
-	// explicit success marker makes the intent unambiguous and survives a
-	// future contract-table edit.
-	nonVCPassed := !isResultSensitive(qw.WorkType) && res.WorkResult == "passed"
-	if selectedRepositoryMutable && !r.skipSteering && !streamRes.blocked && !nonVCPassed && shouldSteer(streamRes, caps, qw.WorkType) {
+	// Belt-and-suspenders bypass on top of the publication gate inside
+	// shouldSteer/shouldBackstop: a passing result whose completion contract
+	// requires no PR has demonstrably completed its verdict-only obligation.
+	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
+	if selectedRepositoryMutable && !r.skipSteering && !streamRes.blocked && !publicationComplete && shouldSteer(streamRes, caps, qw.WorkType) {
 		res.SteeringTriggered = true
 		newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, streamRes, res)
 		if err != nil {
@@ -1326,7 +1321,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Amend-existing-branch contract: on ref-bearing runs, skip gh pr create — the
 	// fix lands on the existing branch/PR, not a new one.
 	backstopEligible := !repositoryFree && shouldBackstop(res, qw.WorkType)
-	if repositoryDeclaration != nil && isResultSensitive(qw.WorkType) {
+	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
 		switch res.FailureMode {
 		case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
 			backstopEligible = false
@@ -1334,7 +1329,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			backstopEligible = true
 		}
 	}
-	if !r.skipBackstop && !nonVCPassed && backstopEligible {
+	if !r.skipBackstop && !publicationComplete && backstopEligible {
 		switch {
 		case trimRef(qw.Ref) != "":
 			r.logger.Info("skipping backstop gh pr create on ref-bearing run", "branch", branch, "ref", qw.Ref)
@@ -1355,8 +1350,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	// 11c-b. Pushed-but-no-PR terminal classification. The backstop only
-	// runs for a result-sensitive work type that reached teardown without a
-	// PR (shouldBackstop gates on both). If it ran but still could not open
+	// runs for a PR-requiring work type that reached teardown without a PR
+	// (shouldBackstop gates on both). If it ran but still could not open
 	// one — e.g. a 403 on `gh pr create`, a push failure, or a main/master
 	// push refusal — AND the work type's completion contract actually owes a
 	// PR, the contract is UNSATISFIED: there is no PR for the v2 exit handler

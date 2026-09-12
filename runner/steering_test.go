@@ -66,12 +66,10 @@ func TestShouldSteer_Table(t *testing.T) {
 	}
 }
 
-// TestShouldSteer_ContractGate asserts the work-type gate: a work
-// type whose completion is NOT result-sensitive (backlog-groomer,
-// refinement, research) is NEVER steered toward a commit/PR — even
-// with full provider capability and a successful terminal.
-// Result-sensitive types (development, qa, acceptance) keep their
-// existing steering flow and are UNCHANGED by this gate.
+// TestShouldSteer_ContractGate asserts the publication-contract gate: only a
+// work type whose completion contract requires a PR may enter commit/PR
+// steering. Result-sensitive review and acceptance work still needs a verdict,
+// but that verdict does not create a repository-publication obligation.
 func TestShouldSteer_ContractGate(t *testing.T) {
 	// A fully steer-eligible observation: succeeded, no PR, provider
 	// supports injection. Only the work-type gate should decide.
@@ -82,17 +80,20 @@ func TestShouldSteer_ContractGate(t *testing.T) {
 		workType string
 		want     bool
 	}{
-		// Non-result-sensitive (no PR/branch artifact) → never steered.
+		// No PR obligation → never steered.
 		{WorkTypeBacklogGroomer, false},
 		{WorkTypeResearch, false},
 		{WorkTypeRefinement, false},
 		{WorkTypeBacklogCreation, false},
-		{"imaginary-future-type", false}, // unknown → not result-sensitive → no steering
-		// Result-sensitive → behaviour preserved (still steerable).
+		{WorkTypeQAStr, false},
+		{WorkTypeAcceptance, false},
+		{WorkTypeMerge, false},
+		{WorkTypeCoordination, false},
+		{WorkTypeInflightCoordination, false},
+		{"imaginary-future-type", false},
+		// Implementation contracts still require repository publication.
 		{WorkTypeDevelopmentStr, true},
 		{WorkTypeInflight, true},
-		{WorkTypeQAStr, true},
-		{WorkTypeAcceptance, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.workType, func(t *testing.T) {
@@ -100,6 +101,60 @@ func TestShouldSteer_ContractGate(t *testing.T) {
 				t.Fatalf("shouldSteer(workType=%q) = %v; want %v", tc.workType, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestReadOnlyReviewResultSkipsVersionControlRecoveryAndPreservesTerminalResult(t *testing.T) {
+	const review = "## Summary\nRead-only review complete.\n\n## Findings\nNo significant findings.\n\n## Verdict\nApprove.\n<!-- WORK_RESULT:passed -->"
+	obs := streamObservation{
+		terminalSuccess:   true,
+		terminalEvent:     &agent.ResultEvent{Success: true},
+		lastAssistantText: review,
+		workResult:        "passed",
+	}
+	res := &Result{}
+	obs.applyTo(res, agent.ProviderStub)
+
+	if shouldSteer(obs, agent.Capabilities{SupportsMessageInjection: true, SupportsSessionResume: true}, WorkTypeQAStr) {
+		t.Fatal("read-only review result entered commit/PR steering")
+	}
+	if shouldBackstop(res, WorkTypeQAStr) {
+		t.Fatal("read-only review result entered the deterministic git backstop")
+	}
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
+	}
+	if res.Summary != review {
+		t.Fatalf("Summary changed during finalization:\n%s", res.Summary)
+	}
+}
+
+func TestAttemptSteeringReadOnlyReviewDoesNotInjectOrResume(t *testing.T) {
+	r := minimalRunner(t)
+	p, err := stub.New(stub.WithCapabilities(agent.Capabilities{
+		SupportsMessageInjection: true,
+		SupportsSessionResume:    true,
+	}))
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
+	}
+	handle := &fakeNoSessionHandle{events: make(chan agent.Event)}
+	close(handle.events)
+	qw := QueuedWork{QueuedWork: queuedWorkBase("READ-ONLY-REVIEW")}
+	qw.WorkType = WorkTypeQAStr
+
+	got, err := r.attemptSteering(
+		context.Background(), p, handle, agent.Spec{}, p.Capabilities(), qw,
+		streamObservation{terminalSuccess: true, workResult: "passed"}, &Result{},
+	)
+	if err != nil {
+		t.Fatalf("attemptSteering: %v", err)
+	}
+	if got != handle {
+		t.Fatal("read-only review replaced its completed handle")
+	}
+	if handle.injectCalls != 0 {
+		t.Fatalf("read-only review injection calls = %d; want 0", handle.injectCalls)
 	}
 }
 
@@ -440,12 +495,14 @@ func TestAttemptSteering_ResumeFallbackHardError(t *testing.T) {
 // lets the test exercise attemptSteeringResume's "no session id captured"
 // guard directly.
 type fakeNoSessionHandle struct {
-	events chan agent.Event
+	events      chan agent.Event
+	injectCalls int
 }
 
 func (h *fakeNoSessionHandle) SessionID() string          { return "" }
 func (h *fakeNoSessionHandle) Events() <-chan agent.Event { return h.events }
 func (h *fakeNoSessionHandle) Inject(context.Context, string) error {
+	h.injectCalls++
 	return agent.ErrUnsupported
 }
 func (h *fakeNoSessionHandle) Stop(context.Context) error { return nil }

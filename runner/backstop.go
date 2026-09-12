@@ -168,21 +168,16 @@ func shouldExcludeFromBackstop(path string) bool {
 // because the daemon has already lost the right to push from this
 // worker.
 //
-// workType gates the chain on result-sensitivity (isResultSensitive,
-// sdlc.go): a work type whose completion requires no PR/branch
-// artifact (e.g. WorkTypeBacklogGroomer / research / refinement) is
-// never backstopped into an empty marker PR. This is the root-cause
-// fix for the empty-commit bug: a backlog groomer that posts a comment
-// and exits has nothing to commit, so the deterministic git backstop
-// must not run. Development / qa / acceptance are result-sensitive and
-// keep their existing backstop flow.
+// workType gates the chain on the completion contract's PR obligation.
+// Result sensitivity is independent: QA/review work needs a verdict to drive
+// its transition but legitimately owes no commit, branch, or PR.
 func shouldBackstop(res *Result, workType string) bool {
 	if res == nil {
 		return false
 	}
-	// Contract gate: non-result-sensitive work types never enter the
-	// deterministic git backstop — there is no code to commit/push.
-	if !isResultSensitive(workType) {
+	// Contract gate: only work that explicitly owes a PR may enter the
+	// deterministic git backstop.
+	if !RequiresPRURL(workType) {
 		return false
 	}
 	switch res.FailureMode {
@@ -226,6 +221,12 @@ func shouldBackstop(res *Result, workType string) bool {
 //
 //nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
 func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
+	// Keep the completion contract at the mutation boundary too. Normal callers
+	// use shouldBackstop, but a future direct caller must not turn verdict-only
+	// review output into a commit, push, or PR.
+	if !RequiresPRURL(qw.WorkType) {
+		return agent.BackstopReport{}
+	}
 	report := agent.BackstopReport{Triggered: true}
 	worktreePath := res.WorktreePath
 	if worktreePath == "" {

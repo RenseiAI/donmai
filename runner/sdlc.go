@@ -184,10 +184,10 @@ var resultSensitiveWorkTypes = map[string]bool{
 	WorkTypeInflightCoordination: true,
 }
 
-// isResultSensitive reports whether a work type's auto-transition is
-// gated on the WORK_RESULT marker. Result-sensitive types fall through
-// to the diagnostic-comment path when no marker is present; non-
-// result-sensitive types promote on completion.
+// isResultSensitive reports whether a work type's auto-transition is gated on
+// the WORK_RESULT marker. It does not grant repository mutation or imply that a
+// commit, branch, or PR is required; publication recovery must use
+// RequiresPRURL from the completion contract.
 func isResultSensitive(workType string) bool {
 	return resultSensitiveWorkTypes[workType]
 }
