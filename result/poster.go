@@ -26,7 +26,7 @@ const DefaultMaxAttempts = 3
 // 1s / 2s / 4s sequence.
 const DefaultBaseDelay = time.Second
 
-// Poster posts an [agent.Result] back to the Rensei platform. The zero
+// Poster posts an [agent.Result] back to the configured control-plane API. The zero
 // value is not usable — use [NewPoster].
 //
 // Posters are safe for concurrent use; all fields are read-only after
@@ -182,11 +182,13 @@ func validReceiverKey(value string) bool {
 }
 
 // completionRequest is the wire body for POST /api/sessions/<id>/completion.
-// Field set matches the platform handler at
-// platform/src/app/api/sessions/[id]/completion/route.ts (Phase 2a port).
 type completionRequest struct {
 	WorkerID string `json:"workerId,omitempty"`
 	Summary  string `json:"summary"`
+	// Result carries the typed terminal outcome alongside the human summary.
+	// Consumers use it to distinguish unsuccessful work even when the summary
+	// is synthesized or otherwise contains no machine-readable verdict.
+	Result string `json:"result"`
 }
 
 // statusRequest is the wire body for POST /api/sessions/<id>/status.
@@ -448,8 +450,19 @@ func (p *Poster) postCompletion(ctx context.Context, sessionID string, r agent.R
 		return completionRequest{
 			WorkerID: creds.WorkerID,
 			Summary:  summary,
+			Result:   completionOutcome(r.Status),
 		}
 	})
+}
+
+// completionOutcome maps the runner's typed terminal status onto the
+// completion wire vocabulary. Unknown non-completed statuses fail closed so
+// they cannot be reported as successful work.
+func completionOutcome(status string) string {
+	if status == "completed" {
+		return "success"
+	}
+	return "failure"
 }
 
 func (p *Poster) postStatus(ctx context.Context, sessionID string, r agent.Result, opts PostOptions) error {

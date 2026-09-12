@@ -8,6 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- Preserve the typed terminal outcome on completion requests so unsuccessful
+  work cannot be mistaken for a successful completion when summaries are
+  synthesized.
+
 ## v0.72.31 — 2026-09-11
 
 ### Fixes
