@@ -8,6 +8,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.32 — 2026-09-11
+
 ### Fixes
 
 - Preserve the typed terminal outcome on completion requests so unsuccessful
