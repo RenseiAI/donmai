@@ -401,6 +401,7 @@ func decodeStopSessionError(resp *http.Response, fallback error) error {
 	if err := json.Unmarshal(raw, &wire); err != nil || !validStopSessionError(wire) {
 		return fallback
 	}
+	retryable := wire.Retryable != nil && *wire.Retryable
 	receipt := &StopSessionError{
 		HTTPStatus:     resp.StatusCode,
 		Stopped:        *wire.Stopped,
@@ -408,20 +409,20 @@ func decodeStopSessionError(resp *http.Response, fallback error) error {
 		PreviousStatus: wire.PreviousStatus,
 		Code:           wire.Code,
 		Refusal:        wire.Refusal,
-		Retryable:      *wire.Retryable,
+		Retryable:      retryable,
 		Disposition:    wire.Disposition,
 		OwnerLiveness:  wire.OwnerLiveness,
 		PreparedAgeMs:  wire.PreparedAgeMs,
 		MutationID:     wire.MutationID,
 	}
-	if seconds, ok := parseBoundedRetryAfter(resp.Header.Get("Retry-After")); ok {
+	if seconds, ok := parseBoundedRetryAfter(resp.Header.Get("Retry-After")); retryable && ok {
 		receipt.RetryAfterSeconds = &seconds
 	}
 	return receipt
 }
 
 func validStopSessionError(wire stopSessionErrorWire) bool {
-	return wire.Stopped != nil && !*wire.Stopped && wire.Retryable != nil &&
+	return wire.Stopped != nil && !*wire.Stopped &&
 		safeReceiptAtom(wire.SessionID, 256) &&
 		safeReceiptAtom(string(wire.PreviousStatus), 64) &&
 		safeReceiptAtom(wire.Code, 128) &&

@@ -63,6 +63,46 @@ func TestClientStopSessionSuccess(t *testing.T) {
 	}
 }
 
+func TestClientStopSessionPreSessionReconciliationSuccess(t *testing.T) {
+	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/public/sessions/public-session/stop" {
+			t.Errorf("request = %s %s, want POST stop path", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"public-session","previousStatus":"pending","newStatus":"stopped","receipt":{"version":1,"kind":"pre_session_dispatch_reconciliation","orgId":"org-example","projectId":"project-example","sessionId":"storage-session","workflowInstanceId":"workflow-instance","previousStatus":"pending","terminalDisposition":"stopped","reason":"Explicit stop reconciled a terminal pre-session dispatch artifact.","actorId":"public:user","intentDigest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","recordedAt":"2026-09-11T00:42:01Z","idempotentReplay":false}}`))
+	})
+
+	resp, err := c.StopSession("public-session")
+	if err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+	if !resp.Stopped || resp.NewStatus != StatusStopped || resp.Receipt == nil {
+		t.Fatalf("unexpected response: %+v", resp)
+	}
+	if resp.Receipt.Kind != "pre_session_dispatch_reconciliation" ||
+		resp.Receipt.SessionID != "storage-session" || resp.Receipt.IdempotentReplay {
+		t.Fatalf("reconciliation identity lost: %+v", resp.Receipt)
+	}
+	receiptJSON, err := json.Marshal(resp.Receipt)
+	if err != nil {
+		t.Fatalf("marshal receipt: %v", err)
+	}
+	var fields map[string]any
+	if err := json.Unmarshal(receiptJSON, &fields); err != nil {
+		t.Fatalf("decode marshalled receipt: %v", err)
+	}
+	for key, want := range map[string]any{
+		"orgId": "org-example", "projectId": "project-example",
+		"workflowInstanceId": "workflow-instance", "previousStatus": "pending",
+		"terminalDisposition": "stopped", "actorId": "public:user",
+		"recordedAt": "2026-09-11T00:42:01Z",
+	} {
+		if got := fields[key]; got != want {
+			t.Errorf("receipt[%q] = %#v, want %#v", key, got, want)
+		}
+	}
+}
+
 func TestClientStopSessionRejectsMalformedSuccessReceipt(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
@@ -99,6 +139,13 @@ func TestClientStopSessionTypedConflictReceipts(t *testing.T) {
 			wantDisposition:   "retryable_busy",
 			wantRetryable:     true,
 			wantRetryAfterSec: intPtr(1),
+		},
+		{
+			name:          "pre-session refusal without retryable is conservatively typed",
+			body:          `{"stopped":false,"sessionId":"sess-1","previousStatus":"pending","code":"PRE_SESSION_RECONCILIATION_REQUIRED","refusal":"pre_session_scope_incomplete"}`,
+			retryAfter:    "5",
+			wantCode:      "PRE_SESSION_RECONCILIATION_REQUIRED",
+			wantRetryable: false,
 		},
 	}
 	for _, tc := range tests {

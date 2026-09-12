@@ -241,6 +241,46 @@ func TestAgentStopJSONPreservesDurableSuccessReceipt(t *testing.T) {
 	}
 }
 
+func TestAgentStopJSONPreservesPreSessionReconciliationReceipt(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || !strings.HasSuffix(r.URL.Path, "/stop") {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"public-session","previousStatus":"pending","newStatus":"stopped","receipt":{"version":1,"kind":"pre_session_dispatch_reconciliation","orgId":"org-example","projectId":"project-example","sessionId":"storage-session","workflowInstanceId":"workflow-instance","previousStatus":"pending","terminalDisposition":"stopped","reason":"Explicit stop reconciled a terminal pre-session dispatch artifact.","actorId":"public:user","intentDigest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","recordedAt":"2026-09-11T00:42:01Z","idempotentReplay":false}}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	cmd := newAgentStopCmd(func() afclient.DataSource { return client })
+	var stdout strings.Builder
+	cmd.SetOut(&stdout)
+	cmd.SetArgs([]string{"public-session", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var output map[string]any
+	if err := json.Unmarshal([]byte(stdout.String()), &output); err != nil {
+		t.Fatalf("decode output: %v", err)
+	}
+	receipt, ok := output["receipt"].(map[string]any)
+	if !ok {
+		t.Fatalf("reconciliation receipt was dropped: %#v", output)
+	}
+	if receipt["kind"] != "pre_session_dispatch_reconciliation" ||
+		receipt["sessionId"] != "storage-session" ||
+		receipt["workflowInstanceId"] != "workflow-instance" ||
+		receipt["terminalDisposition"] != "stopped" || receipt["idempotentReplay"] != false {
+		t.Fatalf("reconciliation receipt identity changed: %#v", receipt)
+	}
+	if _, present := receipt["mutationId"]; present {
+		t.Fatalf("reconciliation receipt invented runtime mutation identity: %#v", receipt)
+	}
+}
+
 func TestAgentStopJSONRejectsSecretBearingSuccessReceiptWithoutEcho(t *testing.T) {
 	t.Parallel()
 	const secret = "rsk_do_not_echo"
