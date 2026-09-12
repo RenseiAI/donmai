@@ -296,11 +296,12 @@ func (e *PolicyEngine) matchesAllowTool(call ToolCall) bool {
 // The constraint is a prefix match: "git:*" allows bash commands whose text
 // begins with "git"; "src/**" allows file paths under "src/".
 type toolPattern struct {
-	raw        string
-	kind       ToolKind // the tool family this pattern gates
-	anyKind    bool     // true when the pattern names no known built-in family
-	constraint string   // stripped of a trailing ":*" / "*"
-	hasConstr  bool
+	raw         string
+	kind        ToolKind // the tool family this pattern gates
+	anyKind     bool     // true only for the explicit "*" tool wildcard
+	unsupported bool     // foreign or malformed names match no pi built-in
+	constraint  string   // stripped of a trailing ":*" / "*"
+	hasConstr   bool
 }
 
 // parseToolPatterns parses a Claude tool-pattern list into toolPatterns.
@@ -311,30 +312,43 @@ func parseToolPatterns(patterns []string) []toolPattern {
 		if p == "" {
 			continue
 		}
+		pattern := toolPattern{raw: p}
 		name := p
-		constraint := ""
-		hasConstr := false
-		if i := strings.IndexByte(p, '('); i >= 0 && strings.HasSuffix(p, ")") {
+		if i := strings.IndexByte(p, '('); i >= 0 {
+			pattern.hasConstr = true
+			if i == 0 || !strings.HasSuffix(p, ")") {
+				pattern.unsupported = true
+				out = append(out, pattern)
+				continue
+			}
 			name = p[:i]
-			constraint = p[i+1 : len(p)-1]
-			hasConstr = true
-			constraint = strings.TrimSuffix(constraint, "*")
-			constraint = strings.TrimSuffix(constraint, ":")
+			pattern.constraint = p[i+1 : len(p)-1]
+			pattern.constraint = strings.TrimSuffix(pattern.constraint, "*")
+			pattern.constraint = strings.TrimSuffix(pattern.constraint, ":")
+		} else if strings.Contains(p, ")") {
+			pattern.unsupported = true
 		}
-		kind, known := builtInToolNames[strings.ToLower(strings.TrimSpace(name))]
-		out = append(out, toolPattern{
-			raw:        p,
-			kind:       kind,
-			anyKind:    !known,
-			constraint: constraint,
-			hasConstr:  hasConstr,
-		})
+
+		normalizedName := strings.ToLower(strings.TrimSpace(name))
+		kind, known := builtInToolNames[normalizedName]
+		switch {
+		case normalizedName == "*":
+			pattern.anyKind = true
+		case known:
+			pattern.kind = kind
+		default:
+			pattern.unsupported = true
+		}
+		out = append(out, pattern)
 	}
 	return out
 }
 
 // matches reports whether the pattern applies to the given call.
 func (tp toolPattern) matches(call ToolCall) bool {
+	if tp.unsupported {
+		return false
+	}
 	if !tp.anyKind && tp.kind != call.Kind {
 		return false
 	}

@@ -8,6 +8,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **Pi tool policies now treat unsupported tool names as non-matching instead
+  of implicit wildcards.** Foreign disallow entries no longer block Pi's
+  built-ins, while foreign-only allowlists remain closed and explicit
+  wildcards and known Pi patterns retain their intended behavior.
+
 ## v0.72.32 — 2026-09-11
 
 ### Fixes

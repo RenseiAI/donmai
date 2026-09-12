@@ -2,6 +2,7 @@ package pi
 
 import (
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -136,7 +137,7 @@ func TestPolicy_DisallowedToolsPattern(t *testing.T) {
 	t.Parallel()
 	e := NewPolicyEngine(agent.Spec{
 		Cwd:             "/work",
-		DisallowedTools: []string{"Bash(git push:*)", "Write"},
+		DisallowedTools: []string{"Bash(git push:*)", "Write", "Read"},
 	})
 	if d := e.Evaluate(ToolCall{Kind: ToolBash, Command: "git push origin main", Cwd: "/work"}); d.Allow {
 		t.Errorf("Bash(git push:*) disallow pattern failed to block")
@@ -144,8 +145,107 @@ func TestPolicy_DisallowedToolsPattern(t *testing.T) {
 	if d := e.Evaluate(ToolCall{Kind: ToolWrite, Path: "/work/a.txt", Cwd: "/work"}); d.Allow {
 		t.Errorf("Write disallow pattern failed to block all writes")
 	}
+	if d := e.Evaluate(ToolCall{Kind: ToolRead, Path: "/work/a.txt", Cwd: "/work"}); d.Allow {
+		t.Errorf("Read disallow pattern failed to block all reads")
+	}
 	// A bash command NOT matching the git-push prefix is unaffected.
 	if d := e.Evaluate(ToolCall{Kind: ToolBash, Command: "git status", Cwd: "/work"}); !d.Allow {
 		t.Errorf("unrelated bash denied by git-push pattern: %q", d.Reason)
+	}
+}
+
+func TestPolicy_ForeignToolPatternsDoNotMatchBuiltins(t *testing.T) {
+	t.Parallel()
+	foreign := []string{"AskUserQuestion", "Task", "mcp__foreign_tracker__*"}
+
+	disallowed := NewPolicyEngine(agent.Spec{Cwd: "/work", DisallowedTools: foreign})
+	for _, call := range []ToolCall{
+		{Kind: ToolBash, Command: "git status", Cwd: "/work"},
+		{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"},
+		{Kind: ToolWrite, Path: "/work/result.txt", Cwd: "/work"},
+	} {
+		if decision := disallowed.Evaluate(call); !decision.Allow {
+			t.Errorf("foreign disallow pattern denied %s: %q", call.Kind, decision.Reason)
+		}
+	}
+
+	allowed := NewPolicyEngine(agent.Spec{Cwd: "/work", AllowedTools: foreign})
+	for _, call := range []ToolCall{
+		{Kind: ToolBash, Command: "git status", Cwd: "/work"},
+		{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"},
+	} {
+		decision := allowed.Evaluate(call)
+		if decision.Allow || !strings.Contains(decision.Reason, "allow-list is configured") {
+			t.Errorf("foreign-only allowlist granted %s: %+v", call.Kind, decision)
+		}
+	}
+}
+
+func TestPolicy_ExplicitWildcardAndMalformedToolPatterns(t *testing.T) {
+	t.Parallel()
+
+	allowAll := NewPolicyEngine(agent.Spec{Cwd: "/work", AllowedTools: []string{"*"}})
+	for _, call := range []ToolCall{
+		{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"},
+		{Kind: ToolBash, Command: "printf ok", Cwd: "/work"},
+	} {
+		if decision := allowAll.Evaluate(call); !decision.Allow {
+			t.Errorf("explicit wildcard denied %s: %q", call.Kind, decision.Reason)
+		}
+	}
+	if decision := allowAll.Evaluate(ToolCall{Kind: ToolBash, Command: "rm -rf /", Cwd: "/work"}); decision.Allow {
+		t.Error("explicit wildcard overrode the built-in safety deny")
+	}
+
+	denyAll := NewPolicyEngine(agent.Spec{Cwd: "/work", DisallowedTools: []string{"*"}})
+	if decision := denyAll.Evaluate(ToolCall{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"}); decision.Allow {
+		t.Error("explicit disallow wildcard did not block a built-in")
+	}
+
+	for _, knownAll := range []string{"Bash", "Bash()", "Bash(*)", "Bash(:*)"} {
+		allowBash := NewPolicyEngine(agent.Spec{Cwd: "/work", AllowedTools: []string{knownAll}})
+		if decision := allowBash.Evaluate(ToolCall{Kind: ToolBash, Command: "printf ok", Cwd: "/work"}); !decision.Allow {
+			t.Errorf("recognized all-Bash pattern %q denied: %q", knownAll, decision.Reason)
+		}
+		if decision := allowBash.Evaluate(ToolCall{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"}); decision.Allow {
+			t.Errorf("recognized all-Bash pattern %q granted Read", knownAll)
+		}
+		denyBash := NewPolicyEngine(agent.Spec{Cwd: "/work", DisallowedTools: []string{knownAll}})
+		if decision := denyBash.Evaluate(ToolCall{Kind: ToolBash, Command: "printf ok", Cwd: "/work"}); decision.Allow {
+			t.Errorf("recognized all-Bash disallow pattern %q did not deny", knownAll)
+		}
+	}
+
+	for _, malformed := range []string{"Bash(", "Bash)", "(git:*)"} {
+		disallowed := NewPolicyEngine(agent.Spec{Cwd: "/work", DisallowedTools: []string{malformed}})
+		if decision := disallowed.Evaluate(ToolCall{Kind: ToolBash, Command: "git status", Cwd: "/work"}); !decision.Allow {
+			t.Errorf("malformed disallow pattern %q matched Bash: %q", malformed, decision.Reason)
+		}
+		allowed := NewPolicyEngine(agent.Spec{Cwd: "/work", AllowedTools: []string{malformed}})
+		if decision := allowed.Evaluate(ToolCall{Kind: ToolBash, Command: "git status", Cwd: "/work"}); decision.Allow {
+			t.Errorf("malformed-only allowlist %q granted Bash", malformed)
+		}
+	}
+}
+
+func TestPolicy_KnownAllowPatternsRemainNarrow(t *testing.T) {
+	t.Parallel()
+	engine := NewPolicyEngine(agent.Spec{
+		Cwd: "/work",
+		AllowedTools: []string{
+			"Read", "Write", "Bash(git:*)",
+		},
+	})
+	for _, call := range []ToolCall{
+		{Kind: ToolRead, Path: "/work/README.md", Cwd: "/work"},
+		{Kind: ToolWrite, Path: "/work/result.txt", Cwd: "/work"},
+		{Kind: ToolBash, Command: "git status", Cwd: "/work"},
+	} {
+		if decision := engine.Evaluate(call); !decision.Allow {
+			t.Errorf("known allow pattern denied %s: %q", call.Kind, decision.Reason)
+		}
+	}
+	if decision := engine.Evaluate(ToolCall{Kind: ToolBash, Command: "printf outside-list", Cwd: "/work"}); decision.Allow {
+		t.Error("out-of-allowlist shell command was granted")
 	}
 }
