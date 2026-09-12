@@ -1643,6 +1643,116 @@ func TestRunAgentRun_HappyPath_StubProvider(t *testing.T) {
 	}
 }
 
+// TestRunAgentRun_AuthoredWorkflowOwnsPostSessionTrackerWrites drives the
+// production agent-run construction path through a real successful stub run.
+// The runner must still publish its terminal result and parsed work result,
+// while tracker mutations remain the authored workflow's responsibility.
+func TestRunAgentRun_AuthoredWorkflowOwnsPostSessionTrackerWrites(t *testing.T) {
+	gitPath, err := exec.LookPath("git")
+	if err != nil {
+		t.Skip("git not on PATH")
+	}
+	tests := []struct {
+		name           string
+		behavior       providerstub.Behavior
+		wantStatus     string
+		wantWorkResult string
+		wantRunError   bool
+	}{
+		{name: "passed result", behavior: providerstub.BehaviorSucceedWithPR, wantStatus: "completed", wantWorkResult: "passed"},
+		{name: "missing result marker", behavior: providerstub.BehaviorSlowTool, wantStatus: "completed"},
+		{name: "failed result publication", behavior: providerstub.BehaviorMidStreamError, wantStatus: "failed", wantRunError: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			repo := makeSpecDecoratorBareRepo(t)
+			binDir := t.TempDir()
+			if err := os.Symlink(gitPath, filepath.Join(binDir, "git")); err != nil {
+				t.Fatalf("symlink git into isolated PATH: %v", err)
+			}
+			// Keep production registry construction deterministic: git remains
+			// available for the real worktree, while optional local harness binaries do
+			// not enter this test's registry or introduce unrelated shutdown behavior.
+			t.Setenv("PATH", binDir)
+
+			var trackerCalls, completionPosts, terminalStatusPosts atomic.Int32
+			platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case r.URL.Path == "/api/issue-tracker-proxy":
+					trackerCalls.Add(1)
+				case strings.HasSuffix(r.URL.Path, "/completion"):
+					completionPosts.Add(1)
+				case strings.HasSuffix(r.URL.Path, "/status"):
+					var body struct {
+						Status string `json:"status"`
+					}
+					if err := json.NewDecoder(r.Body).Decode(&body); err == nil && body.Status == tc.wantStatus {
+						terminalStatusPosts.Add(1)
+					}
+				}
+				w.Header().Set("Content-Type", "application/json")
+				_, _ = w.Write([]byte(`{"refreshed":true,"ok":true,"success":true}`))
+			}))
+			t.Cleanup(platform.Close)
+
+			detail := &daemon.SessionDetail{
+				SessionID:       "session-workflow-owned-tracker-write",
+				IssueID:         "issue-workflow-owned-tracker-write",
+				IssueIdentifier: "EXAMPLE-1",
+				Repository:      repo,
+				Ref:             "main",
+				WorkType:        "development",
+				Body:            "Exercise production post-session ownership.",
+				WorkerID:        "worker-test",
+				AuthToken:       "token-test",
+				PlatformURL:     platform.URL,
+				ResolvedProfile: &daemon.SessionResolvedProfile{
+					Provider:       string(agent.ProviderStub),
+					ProviderConfig: map[string]any{"stub.behavior": string(tc.behavior)},
+				},
+			}
+			daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // fixed test-only credentials
+			}))
+			t.Cleanup(daemonServer.Close)
+
+			cmd := &cobra.Command{}
+			var stdout bytes.Buffer
+			cmd.SetOut(&stdout)
+			cmd.SetErr(&stdout)
+			runErr := runAgentRun(t.Context(), cmd, &agentRunOpts{
+				sessionID: detail.SessionID,
+				daemonURL: daemonServer.URL,
+				worktree:  t.TempDir(),
+				jsonOut:   true,
+			})
+			if (runErr != nil) != tc.wantRunError {
+				t.Fatalf("runAgentRun error = %v, want error=%v\n%s", runErr, tc.wantRunError, stdout.String())
+			}
+
+			var got runner.Result
+			if err := json.Unmarshal(stdout.Bytes(), &got); err != nil {
+				t.Fatalf("decode terminal result: %v\n%s", err, stdout.String())
+			}
+			if got.Status != tc.wantStatus || got.WorkResult != tc.wantWorkResult {
+				t.Fatalf("terminal status/workResult = %q/%q, want %q/%q",
+					got.Status, got.WorkResult, tc.wantStatus, tc.wantWorkResult)
+			}
+			if trackerCalls.Load() != 0 {
+				t.Fatalf("post-session tracker calls = %d, want 0", trackerCalls.Load())
+			}
+			if completionPosts.Load() != 1 || terminalStatusPosts.Load() != 1 {
+				t.Fatalf("terminal result publication = completion:%d %s-status:%d, want 1/1",
+					completionPosts.Load(), tc.wantStatus, terminalStatusPosts.Load())
+			}
+		})
+	}
+}
+
 // TestPostSessionRunning_PostsRunningWithBearer verifies the eager pre-spawn
 // status nudge hits POST /api/sessions/<id>/status with the running body,
 // workerId, and bearer token — the wire shape maybePostRunning also uses, so
