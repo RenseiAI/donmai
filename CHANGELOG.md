@@ -8,12 +8,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.33 — 2026-09-12
+
 ### Fixes
 
+- **Daemon heartbeats now preserve an explicit empty project-admission set.**
+  Disabling the final project sends `enabledProjectIds: []`, allowing the
+  remote admission mirror to clear instead of treating the update as omitted.
+  (#595)
 - **Pi tool policies now treat unsupported tool names as non-matching instead
   of implicit wildcards.** Foreign disallow entries no longer block Pi's
   built-ins, while foreign-only allowlists remain closed and explicit
-  wildcards and known Pi patterns retain their intended behavior.
+  wildcards and known Pi patterns retain their intended behavior. (#596)
 
 ## v0.72.32 — 2026-09-11
 
