@@ -1541,6 +1541,12 @@ func (s *LeaseStore) sampleClockLocked() (int64, error) {
 	}
 	raw := s.now().UnixNano() / int64(time.Millisecond)
 	nowMS := max(raw, persisted)
+	if nowMS == persisted {
+		// The durable high-water mark already covers this sample: the
+		// persisted value is the authority and rewriting identical bytes
+		// would add a full atomic write/fsync cycle without advancing time.
+		return nowMS, nil
+	}
 	if err := writeFileAtomic(s.dir, s.clockPath, ".clock-*.tmp", []byte(strconv.FormatInt(nowMS, 10))); err != nil {
 		return 0, err
 	}
