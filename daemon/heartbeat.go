@@ -489,7 +489,16 @@ func (h *HeartbeatService) sendOneSerialized(ctx context.Context) error {
 		h.mu.Lock()
 		if hash != h.lastAllowlistHash {
 			payload.Allowlist = report.Entries
-			payload.EnabledProjectIDs = report.EnabledProjectIDs
+			// A complete admission report distinguishes an explicit empty set
+			// from an unchanged/omitted report. Preserve that distinction through
+			// the payload so a final project disable clears the remote mirror.
+			// The legacy allowlist callback does not make an admission claim, so
+			// its nil ids must remain omitted for byte compatibility.
+			if h.opts.GetProjectAdmission != nil {
+				payload.EnabledProjectIDs = append([]string{}, report.EnabledProjectIDs...)
+			} else {
+				payload.EnabledProjectIDs = report.EnabledProjectIDs
+			}
 			payload.ProjectAdmissionMode = normalizeProjectAdmissionMode(report.Mode)
 			h.lastAllowlistHash = hash
 		}
@@ -722,10 +731,12 @@ type heartbeatRequestBody struct {
 	LoadAverage            *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
 	AllowlistHash          string                      `json:"allowlistHash,omitempty"`
 	Allowlist              []ProjectAllowlistEntry     `json:"allowlist,omitempty"`
-	EnabledProjectIDs      []string                    `json:"enabledProjectIds,omitempty"`
-	ProjectAdmissionMode   string                      `json:"projectAdmissionMode,omitempty"`
-	AppliedMutations       []string                    `json:"appliedMutations,omitempty"`
-	MutationFailures       []HeartbeatMutationFailure  `json:"mutationFailures,omitempty"`
+	// A non-nil pointer carries the complete admission report's explicit empty
+	// set as `enabledProjectIds:[]`; nil preserves the unchanged-beat omission.
+	EnabledProjectIDs    *[]string                  `json:"enabledProjectIds,omitempty"`
+	ProjectAdmissionMode string                     `json:"projectAdmissionMode,omitempty"`
+	AppliedMutations     []string                   `json:"appliedMutations,omitempty"`
+	MutationFailures     []HeartbeatMutationFailure `json:"mutationFailures,omitempty"`
 	// QuarantinedSessions is the §D7 projection: every live per-session shim
 	// this daemon refused to adopt, each carrying consumesCapacity:true.
 	QuarantinedSessions []sessionshim.QuarantinedSession `json:"quarantinedSessions,omitempty"`
@@ -836,6 +847,11 @@ func (h *HeartbeatService) callEndpoint(
 	}
 	url := strings.TrimRight(h.opts.OrchestratorURL, "/") + "/api/workers/" + workerID + "/heartbeat"
 
+	var enabledProjectIDs *[]string
+	if payload.EnabledProjectIDs != nil {
+		ids := payload.EnabledProjectIDs
+		enabledProjectIDs = &ids
+	}
 	body := heartbeatRequestBody{
 		Status:                 strings.TrimSpace(string(payload.Status)),
 		ActiveCount:            payload.ActiveSessions,
@@ -845,7 +861,7 @@ func (h *HeartbeatService) callEndpoint(
 		LoadAverage:            payload.LoadAverage,
 		AllowlistHash:          payload.AllowlistHash,
 		Allowlist:              payload.Allowlist,
-		EnabledProjectIDs:      payload.EnabledProjectIDs,
+		EnabledProjectIDs:      enabledProjectIDs,
 		ProjectAdmissionMode:   payload.ProjectAdmissionMode,
 		AppliedMutations:       ackApplied,
 		MutationFailures:       ackFailures,

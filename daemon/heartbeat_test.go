@@ -131,6 +131,94 @@ func TestHeartbeatService_HitsPlatformEndpoint(t *testing.T) {
 	}
 }
 
+func TestHeartbeatService_ReportsExplicitEmptyAdmissionAfterFinalDisable(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+
+	var (
+		mu       sync.Mutex
+		requests []map[string]any
+		report   = ProjectAdmissionReport{
+			Mode:              ProjectAdmissionModeEnumerated,
+			EnabledProjectIDs: []string{"proj-last"},
+			Entries: []ProjectAllowlistEntry{{
+				ID: "proj-last", Repository: "https://example.test/last.git",
+			}},
+		}
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		var body map[string]any
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode heartbeat: %v", err)
+			http.Error(w, "bad body", http.StatusBadRequest)
+			return
+		}
+		mu.Lock()
+		requests = append(requests, body)
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(srv.Close)
+
+	hs := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "wkr_empty_admission", Hostname: "h", OrchestratorURL: srv.URL,
+		RuntimeJWT: "runtime.jwt.value", IntervalSeconds: 3600,
+		GetActiveCount: func() int { return 0 },
+		GetMaxCount:    func() int { return 1 },
+		GetStatus:      func() RegistrationStatus { return RegistrationIdle },
+		GetProjectAdmission: func() ProjectAdmissionReport {
+			mu.Lock()
+			defer mu.Unlock()
+			return ProjectAdmissionReport{
+				Mode:              report.Mode,
+				EnabledProjectIDs: append([]string(nil), report.EnabledProjectIDs...),
+				Entries:           append([]ProjectAllowlistEntry(nil), report.Entries...),
+			}
+		},
+	})
+	if err := hs.StartSynchronized(context.Background()); err != nil {
+		t.Fatalf("initial heartbeat: %v", err)
+	}
+	t.Cleanup(hs.Stop)
+
+	mu.Lock()
+	report.EnabledProjectIDs = []string{}
+	mu.Unlock()
+	if err := hs.SendNow(context.Background()); err != nil {
+		t.Fatalf("final-disable heartbeat: %v", err)
+	}
+	if err := hs.SendNow(context.Background()); err != nil {
+		t.Fatalf("unchanged heartbeat: %v", err)
+	}
+
+	mu.Lock()
+	if len(requests) != 3 {
+		mu.Unlock()
+		t.Fatalf("heartbeats = %d, want 3", len(requests))
+	}
+	first, disabled, unchanged := requests[0], requests[1], requests[2]
+	mu.Unlock()
+
+	if got, ok := first["enabledProjectIds"].([]any); !ok || len(got) != 1 || got[0] != "proj-last" {
+		t.Fatalf("initial enabledProjectIds = %#v, want [proj-last]", first["enabledProjectIds"])
+	}
+	if first["allowlistHash"] == disabled["allowlistHash"] {
+		t.Fatal("final disable did not change the folded admission hash")
+	}
+	ids, present := disabled["enabledProjectIds"]
+	if !present {
+		t.Fatal("final-disable heartbeat omitted enabledProjectIds; want explicit []")
+	}
+	if got, ok := ids.([]any); !ok || len(got) != 0 {
+		t.Fatalf("final-disable enabledProjectIds = %#v, want []", ids)
+	}
+	if _, present := unchanged["enabledProjectIds"]; present {
+		t.Fatalf("unchanged heartbeat re-sent enabledProjectIds: %#v", unchanged["enabledProjectIds"])
+	}
+	if _, present := unchanged["allowlist"]; present {
+		t.Fatalf("unchanged heartbeat re-sent repository entries: %#v", unchanged["allowlist"])
+	}
+}
+
 // TestHeartbeatService_ReregisterOn401 covers the runtime-token refresh
 // path: when the server returns 401 (token expired), the service invokes
 // OnReregister, swaps in the fresh credentials, and retries the heartbeat
