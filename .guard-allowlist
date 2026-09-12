@@ -45,6 +45,18 @@ BRAND_NAME :: ^daemon/kit_registry\.go :: Rens[e]i :: (toml:"rens[e]i"|m\.Requir
 BRAND_NAME :: ^afcli/commands\.go :: Rens[e]i :: (`X-Rens[e]i-Project` header on every request|sent as `X-Rens[e]i-Org` on every|`X-Rens[e]i-Org` per invocation makes the scope authoritative|org/project scope as `X-Rens[e]i-Org` . `X-Rens[e]i-Project` headers)
 CLOSED_TUI_REPO :: ^afcli/commands\.go :: rens[e]i-tui :: Embedders \(e\.g\. rens[e]i-tui\) set this to "rensei"
 
+# afclient/client.go, afclient/client_test.go, and afclient/types.go carry the
+# exact hosted scope-header and whoami wire spellings used by the existing
+# public client. They predate guard-b and are unrelated to the stop-receipt
+# decoder now staging these files; changing them would alter a shipped client
+# contract. Curated file-by-file with line constraints so another occurrence
+# in any of these files remains blocking.
+BRAND_NAME :: ^afclient/client\.go :: Rens[e]i :: (`X-Rens[e]i-(Org|Project)`|req\.Header\.Set\("X-Rens[e]i-(Org|Project)")
+BRAND_NAME :: ^afclient/client_test\.go :: Rens[e]i :: (`X-Rens[e]i-(Org|Project)`|r\.Header\.Get\("X-Rens[e]i-(Org|Project)"\)|r\.Header\["X-Rens[e]i-(Org|Project)"\]|X-Rens[e]i-(Org|Project) (should|=))
+CLOSED_CLI_ENDPOINT :: ^afclient/client\.go :: /api/cl[i]/ :: (`afcli/linear\.go` routes GraphQL through `/api/cl[i]/linear/graphql`|c\.get\("/api/cl[i]/whoami")
+CLOSED_CLI_ENDPOINT :: ^afclient/client_test\.go :: /api/cl[i]/ :: r\.URL\.Path == "/api/cl[i]/whoami"
+CLOSED_CLI_ENDPOINT :: ^afclient/types\.go :: /api/cl[i]/ :: WhoAmIResponse matches GET /api/cl[i]/whoami
+
 # runner/README.md: the package Status header and lifecycle-diagram ASCII art
 # name the closed downstream TUI repo (`rens[e]i-tui`) that embeds this
 # package as a library — both pre-existing, unrelated to the change that

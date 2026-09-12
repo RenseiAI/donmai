@@ -15,6 +15,7 @@ func TestSessionStatusWireValues(t *testing.T) {
 		status SessionStatus
 		want   string
 	}{
+		{StatusPending, "pending"},
 		{StatusQueued, "queued"},
 		{StatusParked, "parked"},
 		{StatusStarting, "starting"},
@@ -134,6 +135,68 @@ func TestStopSessionReceiptRejectsUnsafeFields(t *testing.T) {
 			err := json.Unmarshal([]byte(tc.json), &receipt)
 			if err == nil {
 				t.Fatalf("unsafe receipt decoded: %+v", receipt)
+			}
+			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
+				t.Fatalf("decode error leaked secret %q: %v", tc.forbidden, err)
+			}
+		})
+	}
+}
+
+func TestStopSessionReceiptPreSessionReconciliationFamily(t *testing.T) {
+	t.Parallel()
+
+	const valid = `{"version":1,"kind":"pre_session_dispatch_reconciliation","orgId":"org-example","projectId":"project-example","sessionId":"storage-session","workflowInstanceId":"workflow-instance","previousStatus":"pending","terminalDisposition":"stopped","reason":"Explicit stop reconciled a terminal pre-session dispatch artifact.","actorId":"public:user","intentDigest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","recordedAt":"2026-09-11T00:42:01Z","idempotentReplay":true}`
+	var receipt StopSessionReceipt
+	if err := json.Unmarshal([]byte(valid), &receipt); err != nil {
+		t.Fatalf("unmarshal reconciliation receipt: %v", err)
+	}
+	if receipt.OrganizationID != "org-example" || receipt.ProjectID != "project-example" ||
+		receipt.WorkflowInstanceID != "workflow-instance" ||
+		receipt.ReconciliationPreviousStatus != StatusPending ||
+		receipt.TerminalDisposition != StatusStopped || !receipt.IdempotentReplay {
+		t.Fatalf("reconciliation receipt fields lost: %+v", receipt)
+	}
+	encoded, err := json.Marshal(receipt)
+	if err != nil {
+		t.Fatalf("marshal reconciliation receipt: %v", err)
+	}
+	var roundTrip StopSessionReceipt
+	if err := json.Unmarshal(encoded, &roundTrip); err != nil {
+		t.Fatalf("round-trip reconciliation receipt: %v", err)
+	}
+	if !reflect.DeepEqual(roundTrip, receipt) {
+		t.Fatalf("round-trip mismatch: got %+v, want %+v", roundTrip, receipt)
+	}
+}
+
+func TestStopSessionReceiptRejectsInvalidPreSessionReconciliationFields(t *testing.T) {
+	t.Parallel()
+
+	const valid = `{"version":1,"kind":"pre_session_dispatch_reconciliation","orgId":"org-example","projectId":"project-example","sessionId":"storage-session","workflowInstanceId":"workflow-instance","previousStatus":"pending","terminalDisposition":"stopped","reason":"Explicit stop reconciled a terminal pre-session dispatch artifact.","actorId":"public:user","intentDigest":"0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef","recordedAt":"2026-09-11T00:42:01Z","idempotentReplay":false}`
+	tests := []struct {
+		name      string
+		json      string
+		forbidden string
+	}{
+		{"missing replay field", strings.Replace(valid, `,"idempotentReplay":false`, "", 1), ""},
+		{"null replay field", strings.Replace(valid, `"idempotentReplay":false`, `"idempotentReplay":null`, 1), ""},
+		{"runtime field hybrid", strings.TrimSuffix(valid, "}") + `,"mutationId":"stop:storage-session"}`, ""},
+		{"missing organization", strings.Replace(valid, `"orgId":"org-example"`, `"orgId":""`, 1), ""},
+		{"invalid previous status", strings.Replace(valid, `"previousStatus":"pending"`, `"previousStatus":"working"`, 1), ""},
+		{"invalid terminal disposition", strings.Replace(valid, `"terminalDisposition":"stopped"`, `"terminalDisposition":"completed"`, 1), ""},
+		{"control character in reason", strings.Replace(valid, `terminal pre-session`, `terminal\npre-session`, 1), ""},
+		{"invalid digest", strings.Replace(valid, `0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef`, strings.Repeat("f", 63), 1), ""},
+		{"invalid recorded time", strings.Replace(valid, `2026-09-11T00:42:01Z`, `yesterday`, 1), ""},
+		{"secret unknown key", strings.TrimSuffix(valid, "}") + `,"apiToken":"rsk_do_not_echo"}`, "rsk_do_not_echo"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var receipt StopSessionReceipt
+			err := json.Unmarshal([]byte(tc.json), &receipt)
+			if err == nil {
+				t.Fatalf("invalid receipt decoded: %+v", receipt)
 			}
 			if tc.forbidden != "" && strings.Contains(err.Error(), tc.forbidden) {
 				t.Fatalf("decode error leaked secret %q: %v", tc.forbidden, err)

@@ -3,6 +3,7 @@ package afclient
 import (
 	"encoding/json"
 	"fmt"
+	"time"
 )
 
 // SessionStatus matches the public API status union type.
@@ -10,6 +11,7 @@ type SessionStatus string
 
 // Session status values matching the public API status union type.
 const (
+	StatusPending   SessionStatus = "pending"
 	StatusQueued    SessionStatus = "queued"
 	StatusParked    SessionStatus = "parked"
 	StatusWorking   SessionStatus = "working"
@@ -118,17 +120,37 @@ type StopSessionResponse struct {
 	Receipt        *StopSessionReceipt `json:"receipt,omitempty"`
 }
 
-// StopSessionReceipt is the durable lifecycle identity returned by a
-// successful public stop. SessionID is the storage identity; the response's
-// top-level SessionID remains the public identifier supplied by the caller.
+// Stop receipt family discriminants returned by the public stop endpoint.
+const (
+	StopReceiptKindSessionStop                      = "session_stop"
+	StopReceiptKindPreSessionDispatchReconciliation = "pre_session_dispatch_reconciliation"
+)
+
+// StopSessionReceipt is the durable identity returned by a successful public
+// stop. Kind discriminates a canonical runtime stop from reconciliation of a
+// dispatch that ended before a runtime session existed. SessionID is the
+// storage identity; the response's top-level SessionID remains the public
+// identifier supplied by the caller.
 type StopSessionReceipt struct {
 	Version          int           `json:"version"`
 	Kind             string        `json:"kind"`
 	SessionID        string        `json:"sessionId"`
-	MutationID       string        `json:"mutationId"`
-	IntentRevision   string        `json:"intentRevision"`
-	Disposition      SessionStatus `json:"disposition"`
+	MutationID       string        `json:"mutationId,omitempty"`
+	IntentRevision   string        `json:"intentRevision,omitempty"`
+	Disposition      SessionStatus `json:"disposition,omitempty"`
 	IdempotentReplay bool          `json:"idempotentReplay"`
+
+	// Pre-session dispatch reconciliation fields
+	// (kind=pre_session_dispatch_reconciliation).
+	OrganizationID               string        `json:"orgId,omitempty"`
+	ProjectID                    string        `json:"projectId,omitempty"`
+	WorkflowInstanceID           string        `json:"workflowInstanceId,omitempty"`
+	ReconciliationPreviousStatus SessionStatus `json:"previousStatus,omitempty"`
+	TerminalDisposition          SessionStatus `json:"terminalDisposition,omitempty"`
+	Reason                       string        `json:"reason,omitempty"`
+	ActorID                      string        `json:"actorId,omitempty"`
+	IntentDigest                 string        `json:"intentDigest,omitempty"`
+	RecordedAt                   string        `json:"recordedAt,omitempty"`
 }
 
 // UnmarshalJSON keeps successful stop receipts on the same bounded policy as
@@ -138,20 +160,94 @@ func (r *StopSessionReceipt) UnmarshalJSON(data []byte) error {
 	if err := json.Unmarshal(data, &untrusted); err != nil || containsSecretMaterial(untrusted) {
 		return fmt.Errorf("decode stop receipt: malformed or unsafe receipt")
 	}
+	object, ok := untrusted.(map[string]any)
+	if !ok {
+		return fmt.Errorf("decode stop receipt: invalid field type")
+	}
 	type receiptWire StopSessionReceipt
 	var decoded receiptWire
 	if err := json.Unmarshal(data, &decoded); err != nil {
 		return fmt.Errorf("decode stop receipt: invalid field type")
 	}
-	if decoded.Version != 1 || decoded.Kind != "session_stop" ||
-		!safeReceiptAtom(decoded.SessionID, 256) ||
-		!safeReceiptAtom(decoded.MutationID, 256) ||
-		!safeReceiptAtom(decoded.IntentRevision, 64) ||
-		!validStopDisposition(decoded.Disposition) {
+	if decoded.Version != 1 || !safeReceiptAtom(decoded.SessionID, 256) {
+		return fmt.Errorf("decode stop receipt: invalid receipt fields")
+	}
+	switch decoded.Kind {
+	case StopReceiptKindSessionStop:
+		if !validRuntimeStopReceipt(StopSessionReceipt(decoded)) {
+			return fmt.Errorf("decode stop receipt: invalid receipt fields")
+		}
+	case StopReceiptKindPreSessionDispatchReconciliation:
+		_, replayIsBool := object["idempotentReplay"].(bool)
+		if !replayIsBool || !validPreSessionStopReceipt(StopSessionReceipt(decoded)) {
+			return fmt.Errorf("decode stop receipt: invalid receipt fields")
+		}
+	default:
 		return fmt.Errorf("decode stop receipt: invalid receipt fields")
 	}
 	*r = StopSessionReceipt(decoded)
 	return nil
+}
+
+func validRuntimeStopReceipt(receipt StopSessionReceipt) bool {
+	return safeReceiptAtom(receipt.MutationID, 256) &&
+		safeReceiptAtom(receipt.IntentRevision, 64) &&
+		validStopDisposition(receipt.Disposition) &&
+		receipt.OrganizationID == "" && receipt.ProjectID == "" &&
+		receipt.WorkflowInstanceID == "" && receipt.ReconciliationPreviousStatus == "" &&
+		receipt.TerminalDisposition == "" && receipt.Reason == "" &&
+		receipt.ActorID == "" && receipt.IntentDigest == "" && receipt.RecordedAt == ""
+}
+
+func validPreSessionStopReceipt(receipt StopSessionReceipt) bool {
+	return receipt.MutationID == "" && receipt.IntentRevision == "" && receipt.Disposition == "" &&
+		safeReceiptAtom(receipt.OrganizationID, 256) &&
+		safeReceiptAtom(receipt.ProjectID, 256) &&
+		safeReceiptAtom(receipt.WorkflowInstanceID, 256) &&
+		validPreSessionPreviousStatus(receipt.ReconciliationPreviousStatus) &&
+		(receipt.TerminalDisposition == StatusStopped || receipt.TerminalDisposition == StatusFailed) &&
+		safeReceiptText(receipt.Reason, 1024) &&
+		safeReceiptAtom(receipt.ActorID, 256) &&
+		validSHA256Hex(receipt.IntentDigest) &&
+		validRFC3339(receipt.RecordedAt)
+}
+
+func validPreSessionPreviousStatus(status SessionStatus) bool {
+	switch status {
+	case StatusPending, StatusQueued, StatusParked:
+		return true
+	default:
+		return false
+	}
+}
+
+func safeReceiptText(value string, maxLen int) bool {
+	if value == "" || len(value) > maxLen {
+		return false
+	}
+	for _, r := range value {
+		if r < 0x20 || r == 0x7f {
+			return false
+		}
+	}
+	return true
+}
+
+func validSHA256Hex(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, r := range value {
+		if !((r >= '0' && r <= '9') || (r >= 'a' && r <= 'f')) {
+			return false
+		}
+	}
+	return true
+}
+
+func validRFC3339(value string) bool {
+	_, err := time.Parse(time.RFC3339Nano, value)
+	return err == nil
 }
 
 func validStopDisposition(status SessionStatus) bool {
