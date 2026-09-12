@@ -127,6 +127,109 @@ func TestPosterPost_Happy(t *testing.T) {
 	}
 }
 
+// TestPosterPost_CompletionOutcomePrecedesStatus proves that the ancillary
+// completion request carries the same typed terminal outcome as the status
+// request. The recording server also pins the wire order: a failed completion
+// outcome is published before the later failed status transition.
+func TestPosterPost_CompletionOutcomePrecedesStatus(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name              string
+		status            string
+		wantCompletion    string
+		wantStatus        string
+		wantSummaryPrefix string
+	}{
+		{
+			name:              "failed",
+			status:            "failed",
+			wantCompletion:    "failure",
+			wantStatus:        "failed",
+			wantSummaryPrefix: "Session failed:",
+		},
+		{
+			name:              "completed",
+			status:            "completed",
+			wantCompletion:    "success",
+			wantStatus:        "completed",
+			wantSummaryPrefix: "Implemented X",
+		},
+		{
+			name:              "stopped",
+			status:            "stopped",
+			wantCompletion:    "failure",
+			wantStatus:        "stopped",
+			wantSummaryPrefix: "Session stopped.",
+		},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var (
+				mu             sync.Mutex
+				paths          []string
+				completionBody map[string]any
+				statusBody     map[string]any
+			)
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, err := io.ReadAll(r.Body)
+				if err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				var decoded map[string]any
+				if err := json.Unmarshal(body, &decoded); err != nil {
+					http.Error(w, err.Error(), http.StatusBadRequest)
+					return
+				}
+				mu.Lock()
+				paths = append(paths, r.URL.Path)
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/completion"):
+					completionBody = decoded
+				case strings.HasSuffix(r.URL.Path, "/status"):
+					statusBody = decoded
+				}
+				mu.Unlock()
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+
+			r := goodResult()
+			r.Status = tc.status
+			if tc.status != "completed" {
+				r.Summary = ""
+			}
+			if tc.status == "failed" {
+				r.Error = "policy bypass"
+			}
+			if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-outcome", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+
+			mu.Lock()
+			gotPaths := append([]string(nil), paths...)
+			gotCompletion := completionBody
+			gotStatus := statusBody
+			mu.Unlock()
+			if len(gotPaths) != 2 || !strings.HasSuffix(gotPaths[0], "/completion") || !strings.HasSuffix(gotPaths[1], "/status") {
+				t.Fatalf("request order = %v, want completion then status", gotPaths)
+			}
+			if gotCompletion["result"] != tc.wantCompletion {
+				t.Errorf("completion result = %v, want %q", gotCompletion["result"], tc.wantCompletion)
+			}
+			if gotStatus["status"] != tc.wantStatus {
+				t.Errorf("status = %v, want %q", gotStatus["status"], tc.wantStatus)
+			}
+			if summary, _ := gotCompletion["summary"].(string); !strings.HasPrefix(summary, tc.wantSummaryPrefix) {
+				t.Errorf("completion summary = %q, want prefix %q", summary, tc.wantSummaryPrefix)
+			}
+		})
+	}
+}
+
 func TestPosterPost_RetryThenSucceed(t *testing.T) {
 	t.Parallel()
 	flaky := func(attempt int) (int, string) {
