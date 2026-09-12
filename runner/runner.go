@@ -178,11 +178,11 @@ type Options struct {
 	// Used by tests that need a deterministic recovery flow.
 	SkipSteering bool
 
-	// SkipPostSession disables the post-session Linear state-transition
-	// block (loop.go step 11b). Tests that don't have a
-	// platform mock with /api/issue-tracker-proxy support, or that
-	// want to assert on the pre-transition Result envelope, set this
-	// to skip the block entirely. Production daemons leave it false.
+	// SkipPostSession disables the legacy post-session tracker mutation block
+	// (loop.go step 11b). The production agent-run command sets this true so
+	// visible, authored workflow nodes own optional status and comment writes.
+	// Direct Runner embedders may leave it false while migrating legacy flows.
+	// Tests without /api/issue-tracker-proxy support also set it true.
 	SkipPostSession bool
 
 	// HeartbeatInterval overrides the per-session heartbeat cadence.

@@ -379,6 +379,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		Logger:                    logger,
 		MaxSessionDuration:        agentRunMaxSessionDuration(detail),
 		PreserveWorktreeOnFailure: opts.preserveWT,
+		// Tracker transitions and diagnostic comments are workflow actions. The
+		// production worker publishes the terminal result and leaves those
+		// optional mutations to visible, authored post-session nodes.
+		SkipPostSession: true,
 		// The library stays env-free; this binary is the operator boundary.
 		// Dispatch capability `llm-span-ingest` can also enable the pipeline
 		// per session once a compatible server advertises it.
