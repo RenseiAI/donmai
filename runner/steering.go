@@ -28,18 +28,14 @@ import (
 // straight to the deterministic backstop. The decision is encoded
 // here so backstop.go and the loop don't have to re-derive it.
 //
-// workType gates the whole chain on the completion contract: a work
-// type whose completion is NOT result-sensitive (isResultSensitive,
-// sdlc.go — the contract requires no PR/branch artifact, e.g.
-// WorkTypeBacklogGroomer / research / refinement which produce only a
-// comment or issue update) NEVER enters the commit/PR steering chain.
-// This exempts non-version-controlled PM work from PR pressure WITHOUT
-// changing behaviour for development / qa / acceptance, all of which
-// are result-sensitive and keep their existing steering flow.
+// workType gates the whole chain on the publication obligation in the
+// completion contract. Result sensitivity answers a different question: whether
+// a verdict controls the post-session transition. QA/review work is
+// result-sensitive but does not owe a new PR, so it must never enter this chain.
 func shouldSteer(obs streamObservation, caps agent.Capabilities, workType string) bool {
-	// Contract gate: non-result-sensitive work types are never steered
-	// toward a commit/PR — they produce comments/issue updates, not code.
-	if !isResultSensitive(workType) {
+	// Contract gate: only work that explicitly owes a PR may be steered toward
+	// commit/push/publication. Today that is development and inflight.
+	if !RequiresPRURL(workType) {
 		return false
 	}
 	// Provider must support some form of post-completion steering.
@@ -89,6 +85,12 @@ func (r *Runner) attemptSteering(
 	obs streamObservation,
 	res *Result,
 ) (agent.Handle, error) {
+	// Keep the completion contract at the mutation boundary too. The normal
+	// caller checks shouldSteer first, but a future direct caller must not turn a
+	// verdict-only review into repository publication.
+	if !RequiresPRURL(qw.WorkType) {
+		return handle, nil
+	}
 	if obs.terminalSuccess && obs.pullRequestURL != "" {
 		// Sanity guard — shouldSteer already returned false in this
 		// case but keep the post-condition explicit so future calls

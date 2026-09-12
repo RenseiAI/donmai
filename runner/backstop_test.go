@@ -318,14 +318,11 @@ func TestShouldBackstop_FailureModes(t *testing.T) {
 	}
 }
 
-// TestShouldBackstop_ContractGate asserts the work-type gate: a
-// non-result-sensitive work type (backlog-groomer, research,
-// refinement) is NEVER backstopped — even on a completed, PR-less
-// result that would otherwise trigger the deterministic git backstop.
-// This is the root-cause fix for the empty marker PR. Result-sensitive
-// types (development, qa, acceptance) are unchanged.
+// TestShouldBackstop_ContractGate asserts the publication-contract gate: only
+// work whose completion contract requires a PR may enter the deterministic git
+// backstop. A result-sensitive review still owes a verdict, not a new PR.
 func TestShouldBackstop_ContractGate(t *testing.T) {
-	// A result that WOULD backstop under a result-sensitive type:
+	// A result that WOULD backstop under an implementation contract:
 	// completed, no PR, no skip-worthy failure mode.
 	completedNoPR := &Result{}
 
@@ -333,11 +330,16 @@ func TestShouldBackstop_ContractGate(t *testing.T) {
 		workType string
 		want     bool
 	}{
-		// Non-result-sensitive → never backstopped (empty-commit fix).
+		// No PR obligation → never backstopped.
 		{WorkTypeBacklogGroomer, false},
 		{WorkTypeResearch, false},
 		{WorkTypeRefinement, false},
 		{WorkTypeBacklogCreation, false},
+		{WorkTypeQAStr, false},
+		{WorkTypeAcceptance, false},
+		{WorkTypeMerge, false},
+		{WorkTypeCoordination, false},
+		{WorkTypeInflightCoordination, false},
 		{"imaginary-future-type", false},
 		// Interactive work items ("interactive" is the platform's work type for
 		// a PTY-hosted session) are not result-sensitive, so the whole backstop
@@ -345,11 +347,9 @@ func TestShouldBackstop_ContractGate(t *testing.T) {
 		// unreachable for them. A ref on an interactive item only pins the
 		// checkout; it never changes what the runner does at teardown.
 		{"interactive", false},
-		// Result-sensitive → behaviour preserved (still backstops).
+		// Implementation contracts still require repository publication.
 		{WorkTypeDevelopmentStr, true},
 		{WorkTypeInflight, true},
-		{WorkTypeQAStr, true},
-		{WorkTypeAcceptance, true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.workType, func(t *testing.T) {
@@ -357,6 +357,39 @@ func TestShouldBackstop_ContractGate(t *testing.T) {
 				t.Fatalf("shouldBackstop(workType=%q) = %v; want %v", tc.workType, got, tc.want)
 			}
 		})
+	}
+}
+
+func TestRunBackstopReadOnlyReviewDoesNotRunGitRecovery(t *testing.T) {
+	repo := t.TempDir()
+	gitInit(t, repo)
+	writeFile(t, repo, "review-notes.txt", "read-only review output\n")
+	before, err := runGit(context.Background(), repo, gitIdentity{}, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse before: %v", err)
+	}
+
+	qw := QueuedWork{QueuedWork: queuedWorkBase("READ-ONLY-REVIEW")}
+	qw.WorkType = WorkTypeQAStr
+	report := minimalRunner(t).runBackstop(
+		context.Background(), qw, "review/read-only", &Result{Result: agent.Result{WorktreePath: repo}}, nil,
+	)
+	if report.Triggered {
+		t.Fatalf("read-only review triggered git backstop: %+v", report)
+	}
+	after, err := runGit(context.Background(), repo, gitIdentity{}, "rev-parse", "HEAD")
+	if err != nil {
+		t.Fatalf("rev-parse after: %v", err)
+	}
+	if after != before {
+		t.Fatalf("read-only review changed HEAD from %q to %q", before, after)
+	}
+	status, err := runGit(context.Background(), repo, gitIdentity{}, "status", "--porcelain")
+	if err != nil {
+		t.Fatalf("git status: %v", err)
+	}
+	if !strings.Contains(status, "review-notes.txt") {
+		t.Fatalf("read-only review output was committed or removed; status=%q", status)
 	}
 }
 
