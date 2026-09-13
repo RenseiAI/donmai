@@ -104,6 +104,87 @@ func TestCompletedInteractiveDirtyWorkareaArchivesThroughRestartAndCleanPublishe
 		assertInteractiveRetentionDeletion(t, restored.Path)
 	})
 
+	t.Run("clean current head with local stash retains", func(t *testing.T) {
+		remote := interactiveRetentionBareRemote(t)
+		parent := t.TempDir()
+		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: filepath.Join(t.TempDir(), "archives")})
+		current := time.Date(2026, 9, 13, 6, 30, 0, 0, time.UTC)
+		manager := interactiveRetentionManager(t, parent, registry, func() time.Time { return current })
+		script := interactiveRetentionShell(t, strings.Join([]string{
+			"printf 'stashed-only bytes\\n' > tracked.txt",
+			"git -c user.name=test -c user.email=test@example.invalid stash push --quiet -m local-unpublished",
+			"test -n \"$(git stash list)\"",
+		}, "\n")+"\n")
+		t.Setenv("SHELL", script)
+		platform := interactiveRetentionPlatform(t)
+		res, err := interactiveRetentionRunner(t, manager, platform.server).Run(
+			t.Context(),
+			interactiveRetentionWork(remote, "bbbbbbbb-bbbb-4bbb-8bbb-bbbbbbbbbbbb", platform.server.URL),
+		)
+		assertInteractiveRetentionLease(t, manager, res, err, worktree.PublicationReasonUnpublished)
+		lease, err := manager.TerminalLease(res.TerminalWorkareaLease.LeaseID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		current = lease.ExpiresAt.Add(time.Millisecond)
+		recovered := interactiveRetentionManager(t, parent, registry, func() time.Time { return current })
+		if considered, err := recovered.ReapExpiredTerminalLeases(t.Context(), 1, time.Second); err != nil || considered != 1 {
+			t.Fatalf("stash restart reaper considered=%d err=%v", considered, err)
+		}
+		restored, _, err := registry.RestoreV1(lease.WorkareaID, afclient.WorkareaRestoreRequest{
+			IntoSessionID: "eeeeeeee-eeee-4eee-8eee-eeeeeeeeeeee",
+			Reason:        "stash-loss-prevention-control",
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		stash := interactiveRetentionGitOutput(t, restored.Path, "stash", "show", "--format=fuller", "--patch", "refs/stash")
+		if !strings.Contains(stash, "stashed-only bytes") {
+			t.Fatalf("restored archive lost local stash:\n%s", stash)
+		}
+	})
+
+	t.Run("clean current head with another local branch retains", func(t *testing.T) {
+		remote := interactiveRetentionBareRemote(t)
+		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		script := interactiveRetentionShell(t, strings.Join([]string{
+			"current=$(git symbolic-ref --short HEAD)",
+			"git checkout --quiet -b local-only",
+			"printf 'local-branch-only bytes\\n' > tracked.txt",
+			"git add tracked.txt",
+			"git -c user.name=test -c user.email=test@example.invalid commit --quiet -m local-only",
+			"git checkout --quiet \"$current\"",
+		}, "\n")+"\n")
+		t.Setenv("SHELL", script)
+		platform := interactiveRetentionPlatform(t)
+		res, err := interactiveRetentionRunner(t, manager, platform.server).Run(
+			t.Context(),
+			interactiveRetentionWork(remote, "cccccccc-cccc-4ccc-8ccc-cccccccccccc", platform.server.URL),
+		)
+		assertInteractiveRetentionLease(t, manager, res, err, worktree.PublicationReasonUnpublished)
+	})
+
+	t.Run("ignored source bytes retain", func(t *testing.T) {
+		remote := interactiveRetentionBareRemote(t)
+		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SHELL", interactiveRetentionShell(t,
+			"printf 'ignored-only.txt\\n' >> .git/info/exclude\n"+
+				"printf 'ignored-only bytes\\n' > ignored-only.txt\n"+
+				"test -f ignored-only.txt\n"))
+		platform := interactiveRetentionPlatform(t)
+		res, err := interactiveRetentionRunner(t, manager, platform.server).Run(
+			t.Context(),
+			interactiveRetentionWork(remote, "dddddddd-dddd-4ddd-8ddd-dddddddddddd", platform.server.URL),
+		)
+		assertInteractiveRetentionLease(t, manager, res, err, worktree.PublicationReasonDirty)
+	})
+
 	t.Run("clean exact published source keeps ordinary teardown", func(t *testing.T) {
 		remote := interactiveRetentionBareRemote(t)
 		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
@@ -447,6 +528,26 @@ func assertInteractiveRetentionDeletion(t *testing.T, root string) {
 	t.Helper()
 	if _, err := os.Stat(filepath.Join(root, "deleted.txt")); !os.IsNotExist(err) {
 		t.Fatalf("deleted tracked file was restored: %v", err)
+	}
+}
+
+func assertInteractiveRetentionLease(
+	t *testing.T,
+	manager *worktree.Manager,
+	res *runner.Result,
+	runErr error,
+	wantReason string,
+) {
+	t.Helper()
+	if runErr != nil || res.Status != "completed" || res.TerminalWorkareaLease == nil {
+		t.Fatalf("Run result=%+v err=%v", res, runErr)
+	}
+	lease, err := manager.TerminalLease(res.TerminalWorkareaLease.LeaseID)
+	if err != nil || lease.ReleaseDisposition != "archive" || lease.ReleaseMetadata["publicationAssessment"] != wantReason {
+		t.Fatalf("retention lease=%+v err=%v, want archive/%s", lease, err, wantReason)
+	}
+	if _, err := os.Stat(res.WorktreePath); err != nil {
+		t.Fatalf("retained source root was removed: %v", err)
 	}
 }
 

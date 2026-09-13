@@ -18,19 +18,23 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 		t.Skip("git unavailable")
 	}
 	remote := publicationBareRemote(t)
-	statusStarted := make(chan struct{})
-	allowStatus := make(chan struct{})
+	refsStarted := make(chan struct{})
+	allowRefs := make(chan struct{})
 	var once sync.Once
 	var observedStatusArgs []string
+	var observedRefArgs []string
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		for _, arg := range args {
 			if arg == "status" {
+				observedStatusArgs = append([]string(nil), args...)
+			}
+			if arg == "for-each-ref" {
 				once.Do(func() {
-					observedStatusArgs = append([]string(nil), args...)
-					close(statusStarted)
+					observedRefArgs = append([]string(nil), args...)
+					close(refsStarted)
 				})
 				select {
-				case <-allowStatus:
+				case <-allowRefs:
 				case <-ctx.Done():
 					return nil, ctx.Err()
 				}
@@ -57,9 +61,10 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 	}
 	branch := "agent/" + sessionID
 	publicationGit(t, path, "checkout", "-b", branch)
-	if err := os.WriteFile(filepath.Join(path, "dirty.go"), []byte("package dirty\n"), 0o600); err != nil {
+	if err := os.WriteFile(filepath.Join(path, "local-only.txt"), []byte("retained\n"), 0o600); err != nil {
 		t.Fatal(err)
 	}
+	publicationGit(t, path, "-c", "user.name=test", "-c", "user.email=test@example.invalid", "stash", "push", "--quiet", "--include-untracked", "-m", "local-only")
 
 	type leaseResult struct {
 		lease      *workarea.TerminalLease
@@ -84,13 +89,13 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 		)
 		leaseDone <- leaseResult{lease: lease, assessment: assessment, err: err}
 	}()
-	<-statusStarted
+	<-refsStarted
 	teardownDone := make(chan error, 1)
 	go func() { teardownDone <- manager.Teardown(context.Background(), sessionID) }()
-	close(allowStatus)
+	close(allowRefs)
 
 	retained := <-leaseDone
-	if retained.err != nil || retained.lease == nil || !retained.assessment.Retain || retained.assessment.Reason != worktree.PublicationReasonDirty {
+	if retained.err != nil || retained.lease == nil || !retained.assessment.Retain || retained.assessment.Reason != worktree.PublicationReasonUnpublished {
 		t.Fatalf("lease result=%+v", retained)
 	}
 	if err := <-teardownDone; err != nil {
@@ -107,6 +112,9 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 		if !strings.Contains(statusCommand, required) {
 			t.Errorf("publication status command omitted %q: %s", required, statusCommand)
 		}
+	}
+	if refCommand := strings.Join(observedRefArgs, " "); !strings.Contains(refCommand, "for-each-ref") || !strings.Contains(refCommand, "%(objectname)%09%(refname)%09%(symref)") {
+		t.Fatalf("publication local-ref command was not the bounded literal inventory: %s", refCommand)
 	}
 }
 

@@ -4,9 +4,11 @@ import (
 	"context"
 	"fmt"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -14,8 +16,8 @@ const (
 	// PublicationReasonPublished means every exact clean HEAD is present at its
 	// admitted remote branch or unchanged admitted remote HEAD.
 	PublicationReasonPublished = "published"
-	// PublicationReasonDirty means tracked, deleted, or eligible untracked
-	// checkout bytes remain.
+	// PublicationReasonDirty means tracked, deleted, untracked, or ignored
+	// non-harness checkout bytes remain.
 	PublicationReasonDirty = "dirty"
 	// PublicationReasonUnpublished means a clean local HEAD differs from the
 	// admitted remote authority.
@@ -25,7 +27,11 @@ const (
 	PublicationReasonUncertain = "uncertain"
 )
 
-const publicationGitTimeout = 5 * time.Second
+const (
+	publicationGitTimeout       = 5 * time.Second
+	publicationMaxGitOutput     = 1 << 20
+	publicationMaxLocalRefCount = 1024
+)
 
 // PublicationTarget is one admitted mutable repository whose exact current
 // bytes must either be published or retained before interactive teardown.
@@ -146,51 +152,175 @@ func (m *Manager) assessRepositoryPublication(
 	}
 	statusArgs := append(append([]string{}, config...), "-C", path, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
 	status, err := m.runPublicationGit(ctx, target.Repository, statusArgs...)
-	if err != nil {
+	if err != nil || len(status) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
 	if strings.TrimSpace(string(status)) != "" {
 		return retain(PublicationReasonDirty)
 	}
+	ignoredArgs := append(append([]string{}, config...), "-C", path, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+	ignored, err := m.runPublicationGit(ctx, target.Repository, ignoredArgs...)
+	if err != nil || len(ignored) > publicationMaxGitOutput {
+		return retain(PublicationReasonUncertain)
+	}
+	if hasMeaningfulIgnoredFiles(ignored) {
+		return retain(PublicationReasonDirty)
+	}
 	branchArgs := append(append([]string{}, config...), "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
 	currentBranch, err := m.runPublicationGit(ctx, target.Repository, branchArgs...)
-	if err != nil || strings.TrimSpace(string(currentBranch)) != branch {
+	if err != nil || len(currentBranch) > publicationMaxGitOutput || strings.TrimSpace(string(currentBranch)) != branch {
 		return retain(PublicationReasonUncertain)
 	}
 	headArgs := append(append([]string{}, config...), "-C", path, "rev-parse", "--verify", "HEAD^{commit}")
 	head, err := m.runPublicationGit(ctx, target.Repository, headArgs...)
-	if err != nil || !validGitObjectID(strings.TrimSpace(string(head))) {
+	if err != nil || len(head) > publicationMaxGitOutput || !validGitObjectID(strings.TrimSpace(string(head))) {
 		return retain(PublicationReasonUncertain)
 	}
 	localHead := strings.TrimSpace(string(head))
-	remoteArgs := append(append([]string{}, config...), "ls-remote", "--exit-code", "--heads", target.Repository, "refs/heads/"+branch)
-	remote, remoteErr := m.runPublicationGit(ctx, target.Repository, remoteArgs...)
-	if remoteErr == nil {
-		remoteHead, ok := exactRemoteHead(remote, "refs/heads/"+branch)
-		if !ok {
-			return retain(PublicationReasonUncertain)
-		}
-		if remoteHead == localHead {
-			return PublicationAssessment{Reason: PublicationReasonPublished}
-		}
-		return retain(PublicationReasonUnpublished)
-	}
-	if !target.AllowRemoteHEAD {
+	localRefsArgs := append(append([]string{}, config...), "-C", path, "for-each-ref", "--format=%(objectname)%09%(refname)%09%(symref)", "refs")
+	localRefsOutput, err := m.runPublicationGit(ctx, target.Repository, localRefsArgs...)
+	if err != nil || len(localRefsOutput) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
-	headRemoteArgs := append(append([]string{}, config...), "ls-remote", "--exit-code", "--symref", target.Repository, "HEAD")
-	remoteHEAD, headErr := m.runPublicationGit(ctx, target.Repository, headRemoteArgs...)
-	if headErr != nil {
+	localRefs, ok := parseLocalPublicationRefs(localRefsOutput)
+	if !ok || len(localRefs) > publicationMaxLocalRefCount {
 		return retain(PublicationReasonUncertain)
 	}
-	remoteHead, ok := exactRemoteHead(remoteHEAD, "HEAD")
+
+	currentRef := "refs/heads/" + branch
+	patterns := make(map[string]struct{}, len(localRefs)+1)
+	remoteObligations := make(map[string]string, len(localRefs))
+	patterns[currentRef] = struct{}{}
+	currentLocal := false
+	for _, ref := range localRefs {
+		if ref.Name == currentRef {
+			currentLocal = ref.ObjectID == localHead && ref.Symbolic == ""
+		}
+		remoteRef := ref.Name
+		switch {
+		case strings.HasPrefix(ref.Name, "refs/heads/"), strings.HasPrefix(ref.Name, "refs/tags/"):
+			if ref.Symbolic != "" {
+				return retain(PublicationReasonUncertain)
+			}
+		case ref.Name == "refs/remotes/origin/HEAD":
+			if !strings.HasPrefix(ref.Symbolic, "refs/remotes/origin/") {
+				return retain(PublicationReasonUncertain)
+			}
+			continue
+		case strings.HasPrefix(ref.Name, "refs/remotes/origin/"):
+			if ref.Symbolic != "" {
+				return retain(PublicationReasonUncertain)
+			}
+			remoteRef = "refs/heads/" + strings.TrimPrefix(ref.Name, "refs/remotes/origin/")
+		default:
+			// Stashes, notes, replace refs, non-admitted remote-tracking refs,
+			// and every other local-only namespace carry repository state that
+			// ordinary admitted heads/tags publication does not.
+			return retain(PublicationReasonUnpublished)
+		}
+		remoteObligations[ref.Name] = remoteRef
+		patterns[remoteRef] = struct{}{}
+	}
+	if !currentLocal {
+		return retain(PublicationReasonUncertain)
+	}
+	remotePatterns := make([]string, 0, len(patterns))
+	for pattern := range patterns {
+		remotePatterns = append(remotePatterns, pattern)
+	}
+	sort.Strings(remotePatterns)
+	remoteArgs := append(append([]string{}, config...), "ls-remote", "--refs", "--heads", "--tags", target.Repository)
+	remoteArgs = append(remoteArgs, remotePatterns...)
+	remoteOutput, err := m.runPublicationGit(ctx, target.Repository, remoteArgs...)
+	if err != nil || len(remoteOutput) > publicationMaxGitOutput {
+		return retain(PublicationReasonUncertain)
+	}
+	remoteRefs, ok := parseRemotePublicationRefs(remoteOutput)
 	if !ok {
 		return retain(PublicationReasonUncertain)
 	}
-	if remoteHead != localHead {
+	currentPublished := remoteRefs[currentRef] == localHead
+	if !currentPublished && target.AllowRemoteHEAD {
+		headRemoteArgs := append(append([]string{}, config...), "ls-remote", "--exit-code", "--symref", target.Repository, "HEAD")
+		remoteHEAD, headErr := m.runPublicationGit(ctx, target.Repository, headRemoteArgs...)
+		if headErr != nil || len(remoteHEAD) > publicationMaxGitOutput {
+			return retain(PublicationReasonUncertain)
+		}
+		remoteHead, found := exactRemoteHead(remoteHEAD, "HEAD")
+		if !found {
+			return retain(PublicationReasonUncertain)
+		}
+		currentPublished = remoteHead == localHead
+	}
+	if !currentPublished {
 		return retain(PublicationReasonUnpublished)
 	}
+	for _, ref := range localRefs {
+		if ref.Name == currentRef || ref.Name == "refs/remotes/origin/HEAD" {
+			continue
+		}
+		if remoteRefs[remoteObligations[ref.Name]] != ref.ObjectID {
+			return retain(PublicationReasonUnpublished)
+		}
+	}
 	return PublicationAssessment{Reason: PublicationReasonPublished}
+}
+
+type publicationRef struct {
+	ObjectID string
+	Name     string
+	Symbolic string
+}
+
+func parseLocalPublicationRefs(output []byte) ([]publicationRef, bool) {
+	trimmed := strings.TrimSuffix(string(output), "\n")
+	if trimmed == "" {
+		return nil, true
+	}
+	lines := strings.Split(trimmed, "\n")
+	refs := make([]publicationRef, 0, len(lines))
+	for _, line := range lines {
+		fields := strings.Split(line, "\t")
+		if len(fields) != 3 || !validGitObjectID(fields[0]) || !strings.HasPrefix(fields[1], "refs/") {
+			return nil, false
+		}
+		refs = append(refs, publicationRef{ObjectID: fields[0], Name: fields[1], Symbolic: fields[2]})
+	}
+	return refs, true
+}
+
+func parseRemotePublicationRefs(output []byte) (map[string]string, bool) {
+	refs := make(map[string]string)
+	trimmed := strings.TrimSpace(string(output))
+	if trimmed == "" {
+		return refs, true
+	}
+	for _, line := range strings.Split(trimmed, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 2 || !validGitObjectID(fields[0]) ||
+			(!strings.HasPrefix(fields[1], "refs/heads/") && !strings.HasPrefix(fields[1], "refs/tags/")) {
+			return nil, false
+		}
+		if prior := refs[fields[1]]; prior != "" && prior != fields[0] {
+			return nil, false
+		}
+		refs[fields[1]] = fields[0]
+	}
+	return refs, true
+}
+
+func hasMeaningfulIgnoredFiles(output []byte) bool {
+	for _, rawPath := range strings.Split(string(output), "\x00") {
+		path := filepath.ToSlash(strings.TrimPrefix(rawPath, "./"))
+		if path == "" {
+			continue
+		}
+		top, _, _ := strings.Cut(path, "/")
+		if !harnessstate.IsStateDir(top) {
+			return true
+		}
+	}
+	return false
 }
 
 func safePublicationRepository(repository string) bool {
