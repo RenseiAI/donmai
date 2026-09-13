@@ -3,12 +3,14 @@ package workarea
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -644,4 +646,346 @@ func TestAcquisitionRestoreCrashRecoveryAndNoReplace(t *testing.T) {
 			t.Fatalf("colliding restore classification = %+v, %v", quarantined, err)
 		}
 	})
+}
+
+// Slice two RED: the read-only existing-store ready-record reader. The
+// existing OpenExistingAcquisitionStore path mutates (identity repair,
+// MkdirAll transactions, Recover) and must never run under list/show, so
+// this reader is the only list/show path.
+
+func snapshotAcquisitionParent(t *testing.T, parent string) map[string]string {
+	t.Helper()
+	out := make(map[string]string)
+	// Test-only content snapshot of a TempDir-owned tree; paths come from
+	// WalkDir itself, not external input.
+	err := filepath.WalkDir(parent, func(path string, entry os.DirEntry, walkErr error) error { //nolint:gosec
+		if walkErr != nil {
+			return walkErr
+		}
+		rel, err := filepath.Rel(parent, path)
+		if err != nil {
+			return err
+		}
+		if rel == "." {
+			return nil
+		}
+		info, err := entry.Info()
+		if err != nil {
+			return err
+		}
+		out[rel] = info.Mode().String()
+		if !info.IsDir() && info.Mode().IsRegular() {
+			//nolint:gosec // test-only TempDir snapshot; path comes from WalkDir itself.
+			body, err := os.ReadFile(path)
+			if err != nil {
+				return err
+			}
+			out[rel] += "\x00" + string(body)
+		} else if info.Mode()&os.ModeSymlink != 0 {
+			target, err := os.Readlink(path)
+			if err != nil {
+				return err
+			}
+			out[rel] += "\x00->" + target
+		}
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return out
+}
+
+func assertAcquisitionParentUnchanged(t *testing.T, parent string, before map[string]string) {
+	t.Helper()
+	after := snapshotAcquisitionParent(t, parent)
+	if len(after) != len(before) {
+		t.Fatalf("durable tree changed: %d entries before, %d after", len(before), len(after))
+	}
+	for name, mode := range before {
+		if after[name] != mode {
+			t.Fatalf("durable entry %q changed: %q -> %q", name, mode, after[name])
+		}
+	}
+}
+
+func committedReadyForReadback(t *testing.T, parent string) AcquisitionRecord {
+	t.Helper()
+	store, err := NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := store.Begin("readback-session", "wa_readback", RootPath(filepath.Join(parent, "wa-readback")), "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return commitAcquisitionForTest(t, store, acquisition)
+}
+
+func TestReadExistingReadyRecordsReturnsReadyWithoutMutating(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	before := snapshotAcquisitionParent(t, parent)
+
+	records, err := ReadExistingReadyRecords(parent)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(records) != 1 {
+		t.Fatalf("records = %d, want 1", len(records))
+	}
+	got := records[0]
+	if got.AcquisitionID != committed.AcquisitionID || got.StoreID != committed.StoreID ||
+		got.WorkareaID != "wa_readback" || got.SessionID != "readback-session" ||
+		got.State != AcquisitionReady || got.FinalRoot != committed.FinalRoot ||
+		got.RootIdentity != committed.RootIdentity {
+		t.Fatalf("readback drifted: %+v", got)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+func TestReadExistingReadyRecordsSkipsUnreadyWithoutRecovering(t *testing.T) {
+	parent := t.TempDir()
+	store, err := NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ready := committedReadyForReadback(t, parent)
+	released, err := store.RecordForAcquisitionID(ready.AcquisitionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.BindArchive(released.AcquisitionID, released.WorkareaID, released.SessionID, "archive", "sha256:digest"); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.RemovePublishedRoot(released.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	claiming, err := store.Begin("claiming-session", "wa_claiming", RootPath(filepath.Join(parent, "wa-claiming")), "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	restoring, err := store.BeginRestore(released.AcquisitionID, released.WorkareaID, released.SessionID, "archive", "sha256:digest")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Abandon(claiming.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	if err := store.Abandon(restoring.Record.AcquisitionID); err != nil {
+		t.Fatal(err)
+	}
+	claimingState, err := store.RecordForAcquisitionID(claiming.Record.AcquisitionID)
+	if err != nil || claimingState.State != AcquisitionProvisioning {
+		t.Fatalf("claiming setup = %+v, %v", claimingState, err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+
+	records, err := ReadExistingReadyRecords(parent)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("readback auto-recovered unready rows: %+v", records)
+	}
+	afterClaiming, err := store.RecordForAcquisitionID(claiming.Record.AcquisitionID)
+	if err != nil || afterClaiming.State != claimingState.State {
+		t.Fatalf("readback mutated claiming row: %+v, %v", afterClaiming, err)
+	}
+	afterRestoring, err := store.RecordForAcquisitionID(restoring.Record.AcquisitionID)
+	if err != nil || afterRestoring.State != AcquisitionRestoring {
+		t.Fatalf("readback mutated restoring row: %+v, %v", afterRestoring, err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+func TestReadExistingReadyRecordsKeepsLegacyHostDormant(t *testing.T) {
+	parent := t.TempDir()
+	before := snapshotAcquisitionParent(t, parent)
+	records, found, err := ReadExistingReadyRecordsFound(parent)
+	if err != nil || found || len(records) != 0 {
+		t.Fatalf("legacy-only host = (%d, %v, %v), want (0, false, nil)", len(records), found, err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+	if _, statErr := os.Lstat(filepath.Join(parent, acquisitionStoreDirName)); !os.IsNotExist(statErr) {
+		t.Fatalf("readback created store metadata: %v", statErr)
+	}
+}
+
+func TestReadExistingReadyRecordsRefusesHalfPresentIdentity(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	if err := os.Remove(filepath.Join(parent, acquisitionStoreAnchorName)); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadExistingReadyRecords(parent); err == nil {
+		t.Fatal("half-present identity must fail closed")
+	}
+	mismatched := t.TempDir()
+	committedReadyForReadback(t, mismatched)
+	anchorPath := filepath.Join(mismatched, acquisitionStoreAnchorName)
+	anchorBody, err := os.ReadFile(anchorPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var anchorDoc map[string]any
+	if err := json.Unmarshal(anchorBody, &anchorDoc); err != nil {
+		t.Fatal(err)
+	}
+	anchorDoc["storeId"] = "wstore_00000000000000000000000000000000"
+	forged, err := json.Marshal(anchorDoc)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(anchorPath, forged, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := ReadExistingReadyRecords(mismatched); err == nil {
+		t.Fatal("mismatched identity must fail closed")
+	}
+}
+
+func TestReadExistingReadyRecordsSkipsQuarantinedWithoutRecovering(t *testing.T) {
+	parent := t.TempDir()
+	store, err := NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	acquisition, err := store.Begin("quarantine-session", "wa_quarantine", RootPath(filepath.Join(parent, "wa-quarantine")), "repo", "")
+	if err != nil {
+		t.Fatal(err)
+	}
+	committed := commitAcquisitionForTest(t, store, acquisition)
+	if err := os.RemoveAll(committed.FinalRoot); err != nil {
+		t.Fatal(err)
+	}
+	// Reopening runs Recover, which quarantines the ready record whose
+	// published root vanished. The readback must then skip it, not recover it.
+	recovered, err := NewAcquisitionStore(parent, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	quarantined, err := recovered.RecordForAcquisitionID(committed.AcquisitionID)
+	if err != nil || quarantined.State != AcquisitionQuarantined {
+		t.Fatalf("quarantine setup = %+v, %v", quarantined, err)
+	}
+	before := snapshotAcquisitionParent(t, parent)
+	records, err := ReadExistingReadyRecords(parent)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(records) != 0 {
+		t.Fatalf("readback recovered quarantined row: %+v", records)
+	}
+	still, err := recovered.RecordForAcquisitionID(committed.AcquisitionID)
+	if err != nil || still.State != AcquisitionQuarantined {
+		t.Fatalf("readback mutated quarantined row: %+v, %v", still, err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
+
+func TestReadExistingReadyRecordsSharesLockWithExclusiveWriter(t *testing.T) {
+	parent := t.TempDir()
+	committedReadyForReadback(t, parent)
+	lockPath := filepath.Join(parent, acquisitionStoreDirName, acquisitionStoreLockName)
+	lock, err := os.OpenFile(lockPath, os.O_RDWR, 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = lock.Close() }()
+	fd, err := intFileDescriptor(lock.Fd())
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Hold the exclusive writer lock: a lockless reader would sail through,
+	// a shared-flock reader must wait.
+	if err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		t.Fatal(err)
+	}
+	done := make(chan struct{})
+	var records []AcquisitionRecord
+	var readErr error
+	go func() {
+		defer close(done)
+		records, readErr = ReadExistingReadyRecords(parent)
+	}()
+	select {
+	case <-done:
+		t.Fatal("readback returned while the exclusive writer lock was held")
+	case <-time.After(200 * time.Millisecond):
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_UN); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("readback did not return after the writer lock released")
+	}
+	if readErr != nil || len(records) != 1 {
+		t.Fatalf("readback = (%d, %v), want (1, nil)", len(records), readErr)
+	}
+}
+
+func TestReadExistingReadyRecordsIgnoresPathSwapAfterPin(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	before := snapshotAcquisitionParent(t, parent)
+
+	// Swap the path-visible store directory after the reader pins and locks
+	// the original root: rename the verified store aside and plant a forged
+	// store at the same path. The scan must still return the pinned
+	// original, never the replacement.
+	readExistingReadyRecordsSwapHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		if err := os.Rename(storeDir, storeDir+".orig"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Mkdir(storeDir, 0o700); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.MkdirAll(filepath.Join(storeDir, "wac_forged"), 0o700); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() {
+		readExistingReadyRecordsSwapHook = nil
+		// Restore the verified store so TempDir cleanup and later reads see
+		// the original state; the assertion below runs before this.
+		_ = os.RemoveAll(filepath.Join(parent, acquisitionStoreDirName))
+		_ = os.Rename(filepath.Join(parent, acquisitionStoreDirName+".orig"), filepath.Join(parent, acquisitionStoreDirName))
+	})
+
+	records, err := ReadExistingReadyRecords(parent)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(records) != 1 || records[0].AcquisitionID != committed.AcquisitionID {
+		t.Fatalf("readback consumed the swapped store: %+v", records)
+	}
+	// The first read returned the pinned original while the path showed
+	// only the forgery, so a path re-acquisition would have returned zero
+	// rows or the forged row instead. The second read below runs while the
+	// forgery is still swapped in: it re-pins through the path and must
+	// fail closed (incomplete forged identity), proving the first result
+	// came from the pinned root rather than the path.
+	if _, err := ReadExistingReadyRecords(parent); err == nil {
+		t.Fatal("second read through the swapped path should fail closed")
+	}
+	// The forged directory is still swapped in at this point (cleanup
+	// restores the original afterwards). Restore the original store now
+	// and prove a fresh read still finds the same row byte-identical to
+	// the pre-read snapshot.
+	readExistingReadyRecordsSwapHook = nil
+	_ = os.RemoveAll(filepath.Join(parent, acquisitionStoreDirName))
+	if err := os.Rename(filepath.Join(parent, acquisitionStoreDirName+".orig"), filepath.Join(parent, acquisitionStoreDirName)); err != nil {
+		t.Fatal(err)
+	}
+	reread, err := ReadExistingReadyRecords(parent)
+	if err != nil || len(reread) != 1 || reread[0].AcquisitionID != committed.AcquisitionID {
+		t.Fatalf("reread after swap restore = (%v, %v)", reread, err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
 }
