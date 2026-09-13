@@ -163,7 +163,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 		return err
 	}
 	qw.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
-	admission, err := v.reg.preflightAdmissionReceipt(qw, true)
+	admission, err := v.reg.preflightAdmissionReceipt(qw, true, v.realizations)
 	if err != nil {
 		return err
 	}
@@ -174,7 +174,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
-	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate)
+	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate, v.realizations)
 	if err != nil {
 		return err
 	}

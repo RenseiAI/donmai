@@ -131,8 +131,12 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if receipt, compileErr := view.PreflightExecution(preflightInput); compileErr != nil {
+	receipt, compileErr := view.PreflightExecution(preflightInput)
+	if compileErr != nil {
 		t.Fatalf("actual ProviderView preflight: %v receipt=%s", compileErr, receipt)
+	}
+	if replayErr := view.ValidateRetainedExecution(preflightInput, receipt); replayErr != nil {
+		t.Fatalf("identical realization replay refused: %v", replayErr)
 	}
 	tmp := t.TempDir()
 	configPath := filepath.Join(tmp, "daemon.yaml")
