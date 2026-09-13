@@ -307,7 +307,7 @@ func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSp
 	}
 	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
 		raw, readErr := os.ReadFile(marker)
-		if readErr == nil {
+		if readErr == nil && len(raw) > 0 {
 			if string(raw) != "session-bearer" {
 				t.Fatalf("spawned child read bearer = %q", raw)
 			}
