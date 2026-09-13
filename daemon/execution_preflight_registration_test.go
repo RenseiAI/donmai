@@ -235,7 +235,7 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 		ExecutionPreflightStore: store, ExecutionPreflightRegistrar: registrar,
 		ExecutionPreflightConfigDir: filepath.Join(tmp, "preflight-config"),
 		SpawnerOptions: SpawnerOptions{
-			WorkerCommand: []string{"/bin/sh", "-c", "printf spawned > " + marker},
+			WorkerCommand: []string{"/bin/sh", "-c", `if [ -n "$MCP_GATEWAY_TOKEN_FILE" ]; then cat -- "$MCP_GATEWAY_TOKEN_FILE" > ` + marker + `; else printf spawned > ` + marker + `; fi`},
 			OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
 				credentials.Add(1)
 				mu.Lock()
@@ -304,6 +304,18 @@ func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSp
 	mu.Unlock()
 	if strings.Join(gotOrder, ",") != "compile,requirements,fsync,register,credential" {
 		t.Fatalf("effect order = %v", gotOrder)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		raw, readErr := os.ReadFile(marker)
+		if readErr == nil {
+			if string(raw) != "session-bearer" {
+				t.Fatalf("spawned child read bearer = %q", raw)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spawned child did not read applied bearer: %v", readErr)
+		}
 	}
 }
 

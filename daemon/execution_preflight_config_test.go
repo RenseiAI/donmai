@@ -103,16 +103,17 @@ func TestPreflightConfigCleanupIsGenerationSafe(t *testing.T) {
 	}
 	registry := newPreflightConfigRegistry()
 	lease := preflightConfigLease{sessionID: "session-generation", files: []preflightOwnedFile{{path: path, info: info, owned: true}}}
-	if !registry.install(2, lease) {
+	generation, reserved := registry.reserve("session-generation")
+	if !reserved || !registry.complete("session-generation", generation, lease) {
 		t.Fatal("install failed")
 	}
-	if registry.cleanupIfOwner("session-generation", 1) {
+	if registry.cleanupIfOwner("session-generation", generation+1) {
 		t.Fatal("stale generation cleaned current file")
 	}
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("stale cleanup removed file: %v", err)
 	}
-	if !registry.cleanupIfOwner("session-generation", 2) {
+	if !registry.cleanupIfOwner("session-generation", generation) {
 		t.Fatal("owning generation did not clean")
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {

@@ -46,8 +46,9 @@ func (l preflightConfigLease) cleanup() {
 }
 
 type preflightConfigOwnership struct {
-	mu     sync.Mutex
-	leases map[string]struct {
+	mu             sync.Mutex
+	nextGeneration uint64
+	leases         map[string]struct {
 		generation uint64
 		lease      preflightConfigLease
 	}
@@ -63,20 +64,56 @@ func newPreflightConfigRegistry() *preflightConfigOwnership {
 // Alias keeps the daemon field terse without exposing lifecycle internals.
 type preflightConfigRegistry = preflightConfigOwnership
 
-func (r *preflightConfigOwnership) install(generation uint64, lease preflightConfigLease) bool {
-	if r == nil || generation == 0 || lease.sessionID == "" {
+func (r *preflightConfigOwnership) reserve(sessionID string) (uint64, bool) {
+	if r == nil || sessionID == "" {
+		return 0, false
+	}
+	r.mu.Lock()
+	defer r.mu.Unlock()
+	if _, exists := r.leases[sessionID]; exists {
+		return 0, false
+	}
+	r.nextGeneration++
+	if r.nextGeneration == 0 {
+		r.nextGeneration++
+	}
+	generation := r.nextGeneration
+	r.leases[sessionID] = struct {
+		generation uint64
+		lease      preflightConfigLease
+	}{generation: generation, lease: preflightConfigLease{sessionID: sessionID}}
+	return generation, true
+}
+
+func (r *preflightConfigOwnership) complete(sessionID string, generation uint64, lease preflightConfigLease) bool {
+	if r == nil || sessionID == "" || generation == 0 || lease.sessionID != sessionID {
 		return false
 	}
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if _, exists := r.leases[lease.sessionID]; exists {
+	entry, exists := r.leases[sessionID]
+	if !exists || entry.generation != generation || len(entry.lease.files) != 0 {
 		return false
 	}
-	r.leases[lease.sessionID] = struct {
-		generation uint64
-		lease      preflightConfigLease
-	}{generation: generation, lease: lease}
+	entry.lease = lease
+	r.leases[sessionID] = entry
 	return true
+}
+
+func (r *preflightConfigOwnership) cleanupCurrent(sessionID string) bool {
+	if r == nil || sessionID == "" {
+		return false
+	}
+	r.mu.Lock()
+	entry, exists := r.leases[sessionID]
+	if exists {
+		delete(r.leases, sessionID)
+	}
+	r.mu.Unlock()
+	if exists {
+		entry.lease.cleanup()
+	}
+	return exists
 }
 
 func (r *preflightConfigOwnership) cleanupIfOwner(sessionID string, generation uint64) bool {
@@ -273,7 +310,11 @@ func materializeExecutionPreflightConfig(spec *SessionSpec, detail *SessionDetai
 					return fail(errors.New("preflight config session MCP bearer is unavailable"))
 				}
 				var owned preflightOwnedFile
-				if existing := strings.TrimSpace(spec.Env[binding.TargetEnv]); existing != "" {
+				existing := strings.TrimSpace(spec.Env[binding.TargetEnv])
+				if existing == "" {
+					existing = strings.TrimSpace(os.Getenv(binding.TargetEnv))
+				}
+				if existing != "" {
 					info, err := verifyConfigFile(existing, bearer)
 					if err != nil {
 						return fail(fmt.Errorf("verify existing preflight config bearer file: %w", err))

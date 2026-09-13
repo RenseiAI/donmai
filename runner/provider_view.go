@@ -38,7 +38,7 @@ type ProviderView struct {
 
 type ExecutionPreflightConfigRequirementContext struct {
 	SessionID                string
-	OperationalPayload       json.RawMessage
+	OperationalEnvironment   map[string]string
 	OperationalPayloadDigest string
 	RuntimeBinding           executioncell.RuntimeBinding
 	AdmissionReceipt         executioncell.AdmissionReceipt
@@ -190,8 +190,18 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 		return nil, fmt.Errorf("runner: config requirements require exact admission: %w", err)
 	}
 	admitted := admission.receipt.Value()
+	var operational struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(qw.OperationalPayload, &operational); err != nil {
+		return nil, fmt.Errorf("runner: decode config requirement operational environment: %w", err)
+	}
+	environment := make(map[string]string, len(operational.Env))
+	for name, value := range operational.Env {
+		environment[name] = value
+	}
 	context := ExecutionPreflightConfigRequirementContext{
-		SessionID: qw.SessionID, OperationalPayload: append(json.RawMessage(nil), qw.OperationalPayload...),
+		SessionID: qw.SessionID, OperationalEnvironment: environment,
 		OperationalPayloadDigest: admitted.OperationalPayloadDigest, RuntimeBinding: binding,
 		AdmissionReceipt: admitted, EffectiveCell: admission.selection.effectiveCell, CompiledReceipt: host,
 	}

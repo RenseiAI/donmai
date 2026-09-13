@@ -1107,7 +1107,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
 		if ev.Kind == SessionEventEnded && d.sessionDetails != nil {
-			generation, generationFound := d.sessionDetails.Generation(ev.Spec.SessionID)
 			if store, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightReplayStore); ok {
 				if detail, found := d.sessionDetails.Get(ev.Spec.SessionID); found {
 					if binding, decodeErr := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding); decodeErr == nil && binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
@@ -1127,8 +1126,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 				}
 			}
 			d.sessionDetails.Delete(ev.Spec.SessionID)
-			if generationFound && d.preflightConfigs != nil {
-				d.preflightConfigs.cleanupIfOwner(ev.Spec.SessionID, generation)
+			if d.preflightConfigs != nil {
+				d.preflightConfigs.cleanupCurrent(ev.Spec.SessionID)
 			}
 		}
 	})
@@ -1919,11 +1918,12 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	var preflightReplay ExecutionPreflightReplayStore
 	var localPreflightRequest *executioncell.PreflightRegistrationRequest
 	var localPreflightResponse *executioncell.PreflightRegistrationResponse
-	var configLease preflightConfigLease
+	var configGeneration uint64
+	configReserved := false
 	configLeaseTransferred := false
 	defer func() {
-		if !configLeaseTransferred {
-			configLease.cleanup()
+		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
+			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 		}
 	}()
 	if d.sessionShimReadinessWithdrawn.Load() {
@@ -2139,11 +2139,23 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 					if binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
 						return nil, errors.New("execution preflight config requires registered runtime binding v2")
 					}
+					if d.preflightConfigs == nil {
+						return nil, errors.New("execution preflight config ownership is unavailable")
+					}
+					var reserved bool
+					configGeneration, reserved = d.preflightConfigs.reserve(spec.SessionID)
+					if !reserved {
+						return nil, errors.New("execution preflight config generation is already owned")
+					}
+					configReserved = true
 					materializations, lease, materializeErr := materializeExecutionPreflightConfig(&spec, detail, requirements, d.opts.ExecutionPreflightConfigDir)
 					if materializeErr != nil {
 						return nil, fmt.Errorf("materialize execution preflight config: %w", materializeErr)
 					}
-					configLease = lease
+					if !d.preflightConfigs.complete(spec.SessionID, configGeneration, lease) {
+						lease.cleanup()
+						return nil, errors.New("complete execution preflight config ownership")
+					}
 					if replayedReceipt {
 						if hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, materializations) {
 							return nil, errors.New("retained execution preflight config materialization changed")
@@ -2219,21 +2231,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		if !stored {
 			return nil, fmt.Errorf("session %q already has an active detail", spec.SessionID)
 		}
-		if len(configLease.files) > 0 {
-			if d.preflightConfigs == nil || !d.preflightConfigs.install(detailLease.generation, configLease) {
-				d.sessionDetails.DeleteIfOwner(detailLease)
-				return nil, errors.New("install execution preflight config ownership")
-			}
-			configLeaseTransferred = true
-		}
 	}
 	if localPreflightRequest != nil && localPreflightResponse != nil && preflightReplay != nil {
 		if err := preflightReplay.BeginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
 			if detailLease.generation != 0 {
 				d.sessionDetails.DeleteIfOwner(detailLease)
 			}
-			if configLeaseTransferred {
-				d.preflightConfigs.cleanupIfOwner(detailLease.sessionID, detailLease.generation)
+			if configReserved {
+				d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 			}
 			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
 		}
@@ -2242,8 +2247,8 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if detailLease.generation != 0 {
 					d.sessionDetails.DeleteIfOwner(detailLease)
 				}
-				if configLeaseTransferred {
-					d.preflightConfigs.cleanupIfOwner(detailLease.sessionID, detailLease.generation)
+				if configReserved {
+					d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 				}
 				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
 				if retireErr != nil {
@@ -2258,8 +2263,8 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		if detailLease.generation != 0 {
 			d.sessionDetails.DeleteIfOwner(detailLease)
 		}
-		if configLeaseTransferred {
-			d.preflightConfigs.cleanupIfOwner(detailLease.sessionID, detailLease.generation)
+		if configReserved {
+			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 		}
 		if localPreflight != nil {
 			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
@@ -2272,6 +2277,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			}
 		}
 		return nil, err
+	}
+	if configReserved {
+		configLeaseTransferred = true
 	}
 	return handle, nil
 }
