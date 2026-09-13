@@ -31,9 +31,26 @@ type ProviderView struct {
 	// to the spawn lane surfaces as an undiagnosable
 	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
 	// preserves the historical undecorated behavior.
-	decorate     agent.ExtensionDecorator
-	realizations *agent.CapabilityRealizationRegistry
+	decorate           agent.ExtensionDecorator
+	realizations       *agent.CapabilityRealizationRegistry
+	configRequirements ExecutionPreflightConfigRequirementResolver
 }
+
+// ExecutionPreflightConfigRequirementContext is the secret-free, fully
+// admitted context passed to a trusted process-registered resolver.
+type ExecutionPreflightConfigRequirementContext struct {
+	SessionID                string
+	OperationalEnvironment   map[string]string
+	OperationalPayloadDigest string
+	RuntimeBinding           executioncell.RuntimeBinding
+	AdmissionReceipt         executioncell.AdmissionReceipt
+	ClaimReceipt             *executioncell.ClaimReceipt
+	EffectiveCell            executioncell.ResolvedExecutionCell
+	CompiledReceipt          executioncell.HostAdaptationReceipt
+}
+
+// ExecutionPreflightConfigRequirementResolver returns closed common-config requirements.
+type ExecutionPreflightConfigRequirementResolver func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error)
 
 type hostAdaptationReceipt struct {
 	ContractVersion string                       `json:"contractVersion"`
@@ -150,6 +167,68 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	return encode(nil)
 }
 
+// ResolveExecutionPreflightConfigRequirements invokes one process-registered,
+// trusted resolver only after revalidating the exact admission, claim,
+// effective cell, and compiled receipt. A nil resolver preserves host-v1.
+func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.PreflightConfigRequirementV1, error) {
+	if v == nil || v.reg == nil || v.configRequirements == nil {
+		return nil, nil
+	}
+	qw, binding, err := decodeProviderViewPreflightWork(detailJSON)
+	if err != nil {
+		return nil, err
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
+	if err != nil {
+		return nil, err
+	}
+	if (host.ContractVersion != executioncell.HostAdaptationContractVersion && host.ContractVersion != executioncell.HostAdaptationV2ContractVersion) || host.Decision != "ready" {
+		return nil, fmt.Errorf("runner: config requirements require a ready host adaptation receipt")
+	}
+	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
+		return nil, err
+	}
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
+	if err != nil || admission == nil {
+		return nil, fmt.Errorf("runner: config requirements require exact admission: %w", err)
+	}
+	admitted := admission.receipt.Value()
+	var operational struct {
+		Env map[string]string `json:"env"`
+	}
+	if err := json.Unmarshal(qw.OperationalPayload, &operational); err != nil {
+		return nil, fmt.Errorf("runner: decode config requirement operational environment: %w", err)
+	}
+	environment := make(map[string]string, len(operational.Env))
+	for name, value := range operational.Env {
+		environment[name] = value
+	}
+	context := ExecutionPreflightConfigRequirementContext{
+		SessionID: qw.SessionID, OperationalEnvironment: environment,
+		OperationalPayloadDigest: admitted.OperationalPayloadDigest, RuntimeBinding: binding,
+		AdmissionReceipt: admitted, EffectiveCell: admission.selection.effectiveCell, CompiledReceipt: host,
+	}
+	if claim := admission.selection.claimReceipt.Value(); claim.ContractVersion != "" {
+		context.ClaimReceipt = &claim
+	}
+	resolved, err := v.configRequirements(context)
+	if err != nil {
+		return nil, err
+	}
+	for i := range resolved {
+		if err := executioncell.ValidatePreflightConfigRequirement(resolved[i]); err != nil {
+			return nil, err
+		}
+		if resolved[i].OperationalPayloadDigest != admitted.OperationalPayloadDigest {
+			return nil, fmt.Errorf("runner: config requirement operational payload changed")
+		}
+		if i > 0 && resolved[i-1].RequirementID >= resolved[i].RequirementID {
+			return nil, fmt.Errorf("runner: config requirements must be unique and sorted")
+		}
+	}
+	return append([]executioncell.PreflightConfigRequirementV1(nil), resolved...), nil
+}
+
 // ValidateRetainedExecution verifies current sibling mirrors against the exact
 // retained plan through the same reconciliation, selection and preparation
 // path used by fresh preflight. It never calls CompilePreparedHarness and never
@@ -225,6 +304,12 @@ func NewProviderViewWithDecorator(reg *Registry, decorate agent.ExtensionDecorat
 // NewProviderViewWithDecoratorAndRealizations binds the same immutable realization snapshot used by child recomputation.
 func NewProviderViewWithDecoratorAndRealizations(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry) *ProviderView {
 	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations}
+}
+
+// NewProviderViewWithDecoratorRealizationsAndConfigRequirements adds the
+// trusted common-config requirement resolver while preserving older constructors.
+func NewProviderViewWithDecoratorRealizationsAndConfigRequirements(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry, resolver ExecutionPreflightConfigRequirementResolver) *ProviderView {
+	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations, configRequirements: resolver}
 }
 
 // Names returns the sorted list of registered provider names as plain

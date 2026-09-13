@@ -3,6 +3,7 @@ package daemon
 import (
 	"context"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -29,6 +30,18 @@ type orderedPreflightProvider struct {
 	failReplay      bool
 	validationCalls atomic.Int32
 	validationErr   error
+}
+
+type orderedConfigPreflightProvider struct {
+	*orderedPreflightProvider
+	requirements []executioncell.PreflightConfigRequirementV1
+}
+
+func (p *orderedConfigPreflightProvider) ResolveExecutionPreflightConfigRequirements(_ json.RawMessage, _ json.RawMessage) ([]executioncell.PreflightConfigRequirementV1, error) {
+	p.mu.Lock()
+	*p.order = append(*p.order, "requirements")
+	p.mu.Unlock()
+	return append([]executioncell.PreflightConfigRequirementV1(nil), p.requirements...), nil
 }
 
 func (p *orderedPreflightProvider) Names() []string { return []string{"stub"} }
@@ -220,8 +233,9 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 		ConfigPath: configPath, JWTPath: filepath.Join(tmp, "daemon.jwt"),
 		SkipWizard: true, SkipRegistration: true, ProviderRegistry: provider,
 		ExecutionPreflightStore: store, ExecutionPreflightRegistrar: registrar,
+		ExecutionPreflightConfigDir: filepath.Join(tmp, "preflight-config"),
 		SpawnerOptions: SpawnerOptions{
-			WorkerCommand: []string{"/bin/sh", "-c", "printf spawned > " + marker},
+			WorkerCommand: []string{"/bin/sh", "-c", `if [ -n "$MCP_GATEWAY_TOKEN_FILE" ]; then cat -- "$MCP_GATEWAY_TOKEN_FILE" > ` + marker + `; else printf spawned > ` + marker + `; fi`},
 			OnPreSpawn: func(_ SessionSpec, env []string) ([]string, error) {
 				credentials.Add(1)
 				mu.Lock()
@@ -236,6 +250,73 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 	}
 	t.Cleanup(func() { _ = d.Stop(context.Background()) })
 	return d
+}
+
+func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSpawn(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	detail.OperationalPayload = json.RawMessage(`{"env":{"EXAMPLE_CONFIG":"enabled"},"mcpAuthToken":"session-bearer"}`)
+	detail.McpAuthToken = "session-bearer"
+	operationalDigest := operationalDigestFor(t, detail)
+	admission, err := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := admission.Value()
+	admitted.OperationalPayloadDigest = operationalDigest
+	detail.AdmissionReceipt = rawJSON(t, admitted)
+	requirement := executioncell.PreflightConfigRequirementV1{
+		ContractVersion: executioncell.PreflightConfigRequirementContractVersion,
+		RequirementID:   "example.applied-config/v1", AuthorityBindingDigest: strings.Repeat("d", 64),
+		OperationalPayloadDigest: operationalDigest,
+		Bindings: []executioncell.PreflightConfigBindingV1{
+			{TargetEnv: "DONMAI_SESSION_ID", Source: executioncell.PreflightConfigBindingSourceV1{Kind: executioncell.PreflightConfigSourceDaemonSessionID}},
+			{TargetEnv: "EXAMPLE_CONFIG", Source: executioncell.PreflightConfigBindingSourceV1{Kind: executioncell.PreflightConfigSourceOperationalEnvironment, EnvironmentName: "EXAMPLE_CONFIG"}},
+			{TargetEnv: "MCP_GATEWAY_TOKEN_FILE", Source: executioncell.PreflightConfigBindingSourceV1{Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, Mode: "0600"}},
+		},
+	}
+	base := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigest)}
+	provider := &orderedConfigPreflightProvider{orderedPreflightProvider: base, requirements: []executioncell.PreflightConfigRequirementV1{requirement}}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+		receipt, decodeErr := base64.StdEncoding.DecodeString(request.ReceiptBytesBase64)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		host, decodeErr := executioncell.DecodeHostAdaptationReceipt(receipt)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		if host.ContractVersion != executioncell.HostAdaptationV2ContractVersion || len(host.ConfigMaterializations) != 1 {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("registration did not receive applied config v2")
+		}
+		return authorizedRegistration(request)
+	}}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2", Env: map[string]string{"EXAMPLE_CONFIG": "enabled"}}, detail); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotOrder := slices.Clone(order)
+	mu.Unlock()
+	if strings.Join(gotOrder, ",") != "compile,requirements,fsync,register,credential" {
+		t.Fatalf("effect order = %v", gotOrder)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		raw, readErr := os.ReadFile(marker)
+		if readErr == nil && len(raw) > 0 {
+			if string(raw) != "session-bearer" {
+				t.Fatalf("spawned child read bearer = %q", raw)
+			}
+			break
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("spawned child did not read applied bearer: %v", readErr)
+		}
+	}
 }
 
 func TestRuntimeBindingV2RegistersAfterFsyncBeforeCredentialAndSpawn(t *testing.T) {

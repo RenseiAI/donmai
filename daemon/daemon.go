@@ -97,6 +97,9 @@ type Options struct {
 	// spawn. Nil preserves the exact v1 path and truthfully advertises no v2
 	// capability.
 	ExecutionPreflightRegistrar ExecutionPreflightRegistrar
+	// ExecutionPreflightConfigDir owns generic pre-registration config files.
+	// Empty selects the daemon state root. Existing callers remain source-compatible.
+	ExecutionPreflightConfigDir string
 
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
@@ -283,6 +286,13 @@ type WorkareaCapabilityProvider interface {
 // operational bytes without introducing a daemon -> runner dependency.
 type ExecutionPreflightProvider interface {
 	PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error)
+}
+
+// ExecutionPreflightConfigRequirementProvider optionally resolves trusted,
+// closed common-config requirements after host compilation and before the same
+// receipt registration. Nil/empty preserves host-adaptation/v1 exactly.
+type ExecutionPreflightConfigRequirementProvider interface {
+	ResolveExecutionPreflightConfigRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.PreflightConfigRequirementV1, error)
 }
 
 // ExecutionPreflightReplayValidator re-applies canonical sibling/profile
@@ -489,7 +499,8 @@ type Daemon struct {
 	// wakeLedger records which wedge-remediation rungs a session has already
 	// received, so an at-least-once redelivery is not replayed into a live
 	// terminal and rung 2 cannot precede rung 1. See mutation_session_wake.go.
-	wakeLedger wakeLedger
+	wakeLedger       wakeLedger
+	preflightConfigs *preflightConfigRegistry
 }
 
 // New constructs a Daemon. Call Start() to bring it online.
@@ -508,6 +519,9 @@ func New(opts Options) *Daemon {
 			statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts"),
 		)
 	}
+	if opts.ExecutionPreflightConfigDir == "" {
+		opts.ExecutionPreflightConfigDir = statepath.Resolve("preflight-config", "/tmp/.donmai/preflight-config")
+	}
 	// Note: HTTPPort=0 is intentionally NOT auto-filled to
 	// DefaultHTTPPort here — callers that want the well-known 7734
 	// port (the cobra `donmai daemon run` entry point) substitute it
@@ -519,14 +533,15 @@ func New(opts Options) *Daemon {
 	landingDone := make(chan struct{})
 	close(landingDone)
 	d := &Daemon{
-		opts:           opts,
-		doneCh:         make(chan struct{}),
-		landingCtx:     landingCtx,
-		landingCancel:  landingCancel,
-		landingDone:    landingDone,
-		sessionDetails: newSessionDetailStore(),
-		routingTraces:  NewRoutingTraceStore(DefaultRoutingRingBufferSize),
-		shims:          newSessionShimState(),
+		opts:             opts,
+		doneCh:           make(chan struct{}),
+		landingCtx:       landingCtx,
+		landingCancel:    landingCancel,
+		preflightConfigs: newPreflightConfigRegistry(),
+		landingDone:      landingDone,
+		sessionDetails:   newSessionDetailStore(),
+		routingTraces:    NewRoutingTraceStore(DefaultRoutingRingBufferSize),
+		shims:            newSessionShimState(),
 	}
 	d.shimIdentityRef.Store(newSessionShimIdentity(&d.opts.SessionShim, opts.SessionShimStandDown))
 	if opts.RulesetSnapshot != nil {
@@ -1111,6 +1126,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 				}
 			}
 			d.sessionDetails.Delete(ev.Spec.SessionID)
+			if d.preflightConfigs != nil {
+				d.preflightConfigs.cleanupCurrent(ev.Spec.SessionID)
+			}
 		}
 	})
 	// Record a routing decision for every session-start so the
@@ -1900,6 +1918,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 	var preflightReplay ExecutionPreflightReplayStore
 	var localPreflightRequest *executioncell.PreflightRegistrationRequest
 	var localPreflightResponse *executioncell.PreflightRegistrationResponse
+	var configGeneration uint64
+	configReserved := false
+	configLeaseTransferred := false
+	defer func() {
+		if configReserved && !configLeaseTransferred && d.preflightConfigs != nil {
+			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
+		}
+	}()
 	if d.sessionShimReadinessWithdrawn.Load() {
 		return nil, errors.New("session-shim proof-v2 readiness is withdrawn")
 	}
@@ -2101,6 +2127,50 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if (preflightErr == nil && hostReceipt.Decision != "ready") || (preflightErr != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
 			}
+			if preflightErr == nil {
+				var requirements []executioncell.PreflightConfigRequirementV1
+				if provider, ok := d.opts.ProviderRegistry.(ExecutionPreflightConfigRequirementProvider); ok {
+					requirements, err = provider.ResolveExecutionPreflightConfigRequirements(detailJSON, receipt)
+					if err != nil {
+						return nil, fmt.Errorf("resolve execution preflight config requirements: %w", err)
+					}
+				}
+				if len(requirements) > 0 {
+					if binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
+						return nil, errors.New("execution preflight config requires registered runtime binding v2")
+					}
+					if d.preflightConfigs == nil {
+						return nil, errors.New("execution preflight config ownership is unavailable")
+					}
+					var reserved bool
+					configGeneration, reserved = d.preflightConfigs.reserve(spec.SessionID)
+					if !reserved {
+						return nil, errors.New("execution preflight config generation is already owned")
+					}
+					configReserved = true
+					materializations, lease, materializeErr := materializeExecutionPreflightConfig(&spec, detail, requirements, d.opts.ExecutionPreflightConfigDir)
+					if materializeErr != nil {
+						return nil, fmt.Errorf("materialize execution preflight config: %w", materializeErr)
+					}
+					if !d.preflightConfigs.complete(spec.SessionID, configGeneration, lease) {
+						lease.cleanup()
+						return nil, errors.New("complete execution preflight config ownership")
+					}
+					if replayedReceipt {
+						if hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, materializations) {
+							return nil, errors.New("retained execution preflight config materialization changed")
+						}
+					} else {
+						receipt, err = hostReceiptWithConfigMaterializations(receipt, materializations)
+						if err != nil {
+							return nil, fmt.Errorf("attach execution preflight config materializations: %w", err)
+						}
+						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
+					}
+				} else if hostReceipt.ContractVersion != executioncell.HostAdaptationContractVersion {
+					return nil, errors.New("host adaptation v2 requires resolved config requirements")
+				}
+			}
 			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion && preflightErr == nil {
 				if validationErr := validateExecutionPreflightReceiptAuthority(detail, binding, receipt, operationalDigest); validationErr != nil {
 					return nil, fmt.Errorf("validate registered host adaptation receipt: %w", validationErr)
@@ -2167,12 +2237,18 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if detailLease.generation != 0 {
 				d.sessionDetails.DeleteIfOwner(detailLease)
 			}
+			if configReserved {
+				d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
+			}
 			return nil, fmt.Errorf("consume host execution preflight start authority: %w", err)
 		}
 		if localPreflight != nil {
 			if err := localPreflight.beginExecutionPreflightStart(context.Background(), *localPreflightRequest, *localPreflightResponse); err != nil {
 				if detailLease.generation != 0 {
 					d.sessionDetails.DeleteIfOwner(detailLease)
+				}
+				if configReserved {
+					d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
 				}
 				retireErr := preflightReplay.RetireExecutionPreflight(context.Background(), spec.SessionID)
 				if retireErr != nil {
@@ -2187,6 +2263,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		if detailLease.generation != 0 {
 			d.sessionDetails.DeleteIfOwner(detailLease)
 		}
+		if configReserved {
+			d.preflightConfigs.cleanupIfOwner(spec.SessionID, configGeneration)
+		}
 		if localPreflight != nil {
 			if retireErr := localPreflight.retireExecutionPreflight(context.Background(), spec.SessionID); retireErr != nil {
 				return nil, errors.Join(err, fmt.Errorf("retire failed local execution preflight start: %w", retireErr))
@@ -2198,6 +2277,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			}
 		}
 		return nil, err
+	}
+	if configReserved {
+		configLeaseTransferred = true
 	}
 	return handle, nil
 }

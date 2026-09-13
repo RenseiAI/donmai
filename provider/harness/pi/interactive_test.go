@@ -352,12 +352,12 @@ func TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary(t *testing.T) {
 	if !ok {
 		t.Fatal("pi manifest declares no interactive tool-lifecycle profile")
 	}
-	if tl.ID != "pi/interactive/tool-lifecycle-v5" {
-		t.Fatalf("interactive tool-lifecycle profile=%q, want exact v5 re-registration", tl.ID)
+	if tl.ID != "pi/interactive/tool-lifecycle-v6" {
+		t.Fatalf("interactive tool-lifecycle profile=%q, want exact v6 re-registration", tl.ID)
 	}
 	for _, profile := range m.ToolLifecycle {
-		if profile.ID == "pi/interactive/tool-lifecycle-v4" {
-			t.Fatal("old v4 interactive profile remained registered")
+		if profile.ID == "pi/interactive/tool-lifecycle-v5" {
+			t.Fatal("old v5 interactive profile remained registered")
 		}
 	}
 	if tl.LifecycleDelivery != agent.ToolDeliveryCoarsePTYEvents || tl.LifecycleFidelity != agent.EvidenceCoarse {
