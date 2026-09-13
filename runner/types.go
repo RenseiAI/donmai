@@ -118,7 +118,9 @@ type QueuedWork struct {
 	PlatformURL string `json:"-"`
 
 	// TerminalWorkareaLease requests bounded retention of a successful workarea.
-	// Nil preserves the legacy immediate-teardown behavior.
+	// Nil keeps ordinary teardown except when a completed interactive session's
+	// exact source publication cannot be proved; that path acquires the same
+	// fixed lease locally before teardown can erase unpublished work.
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest `json:"terminalWorkareaLease,omitempty"`
 
 	// Capabilities carries the daemon-advertised worker capability flags for

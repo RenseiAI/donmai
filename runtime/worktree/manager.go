@@ -1075,7 +1075,10 @@ func (m *Manager) releaseNestedSessionLocked(acquisitions *workarea.AcquisitionS
 func (m *Manager) AcquireTerminalLease(ctx context.Context, spec workarea.AcquireSpec) (*workarea.TerminalLease, error) {
 	unlock := m.lockSession(spec.SessionID)
 	defer unlock()
+	return m.acquireTerminalLeaseLocked(ctx, spec)
+}
 
+func (m *Manager) acquireTerminalLeaseLocked(ctx context.Context, spec workarea.AcquireSpec) (*workarea.TerminalLease, error) {
 	m.mu.Lock()
 	res := m.sessions[spec.SessionID]
 	m.mu.Unlock()

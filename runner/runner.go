@@ -487,15 +487,23 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
 	leaseAcquired := false
 	leasePrepared := false
+	interactiveDisposition := qw.isInteractive() && res.Status == "completed" && teardownRequired
+	leaseRequested := qw.TerminalWorkareaLease != nil
 	var terminalResultID string
 	var leaseProjection *workarea.TerminalLeaseProjection
 	var preparedStatusBody []byte
 
-	// A requested successful hold is established before every terminal HTTP
-	// exchange, including PreserveWorktreeAlways. Preservation selects the final
-	// disposition; it cannot suppress the descriptor or durable state machine.
-	if qw.TerminalWorkareaLease != nil && res.Status == "completed" {
-		policy, policyErr := qw.TerminalWorkareaLease.Policy()
+	// A requested successful hold, or the local loss-prevention hold for an
+	// unpublished interactive result, is established before every terminal HTTP
+	// exchange. Preservation selects the final disposition; it cannot suppress
+	// the descriptor or durable state machine.
+	if (leaseRequested || interactiveDisposition) && res.Status == "completed" {
+		leaseRequest := qw.TerminalWorkareaLease
+		if leaseRequest == nil {
+			request := workarea.DefaultTerminalLeaseRequest()
+			leaseRequest = &request
+		}
+		policy, policyErr := leaseRequest.Policy()
 		if policyErr != nil {
 			leaseErr := fmt.Errorf("runner: terminal workarea lease policy: %w", policyErr)
 			markTerminalLeaseFailure(res, leaseErr)
@@ -512,15 +520,30 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 				if r.preserveAlways {
 					disposition = "archive"
 				}
-				lease, acquireErr := r.wt.AcquireTerminalLease(context.Background(), workarea.AcquireSpec{
+				acquireSpec := workarea.AcquireSpec{
 					SessionID: qw.SessionID, TerminalResultID: terminalResultID, Policy: policy,
 					ReleaseRequested: true, ReleaseDisposition: disposition,
-				})
+				}
+				var lease *workarea.TerminalLease
+				var acquireErr error
+				if interactiveDisposition {
+					inspectionCtx, inspectionCancel := context.WithTimeout(context.Background(), 30*time.Second)
+					var assessment worktree.PublicationAssessment
+					lease, assessment, acquireErr = r.wt.AcquireInteractiveTerminalLease(
+						inspectionCtx, interactivePublicationSpec(qw), acquireSpec, leaseRequested,
+					)
+					inspectionCancel()
+					r.logger.Info("interactive workarea publication disposition",
+						"sessionId", qw.SessionID, "retain", assessment.Retain,
+						"reason", assessment.Reason, "repository", assessment.RepositoryName)
+				} else {
+					lease, acquireErr = r.wt.AcquireTerminalLease(context.Background(), acquireSpec)
+				}
 				if acquireErr != nil {
 					leaseErr := fmt.Errorf("runner: acquire terminal workarea lease and defer teardown: %w", acquireErr)
 					markTerminalLeaseFailure(res, leaseErr)
 					runErr = errors.Join(runErr, leaseErr)
-				} else {
+				} else if lease != nil {
 					leaseAcquired = true
 					projection := lease.Descriptor().Projection()
 					leaseProjection = &projection
