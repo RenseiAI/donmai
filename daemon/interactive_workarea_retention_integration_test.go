@@ -185,6 +185,25 @@ func TestCompletedInteractiveDirtyWorkareaArchivesThroughRestartAndCleanPublishe
 		assertInteractiveRetentionLease(t, manager, res, err, worktree.PublicationReasonDirty)
 	})
 
+	t.Run("ignored regular file named like harness state retains", func(t *testing.T) {
+		remote := interactiveRetentionBareRemote(t)
+		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Setenv("SHELL", interactiveRetentionShell(t,
+			"test ! -e .pi\n"+
+				"printf '.pi\\n' >> .git/info/exclude\n"+
+				"printf 'same-name regular source bytes\\n' > .pi\n"+
+				"test -f .pi\n"))
+		platform := interactiveRetentionPlatform(t)
+		res, err := interactiveRetentionRunner(t, manager, platform.server).Run(
+			t.Context(),
+			interactiveRetentionWork(remote, "ffffffff-ffff-4fff-8fff-ffffffffffff", platform.server.URL),
+		)
+		assertInteractiveRetentionLease(t, manager, res, err, worktree.PublicationReasonDirty)
+	})
+
 	t.Run("clean exact published source keeps ordinary teardown", func(t *testing.T) {
 		remote := interactiveRetentionBareRemote(t)
 		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})

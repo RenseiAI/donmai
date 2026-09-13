@@ -315,8 +315,8 @@ func hasMeaningfulIgnoredFiles(output []byte) bool {
 		if path == "" {
 			continue
 		}
-		top, _, _ := strings.Cut(path, "/")
-		if !harnessstate.IsStateDir(top) {
+		top, _, descendant := strings.Cut(path, "/")
+		if !descendant || !harnessstate.IsStateDir(top) {
 			return true
 		}
 	}
