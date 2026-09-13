@@ -109,16 +109,20 @@ type CompiledCapabilityRealization struct {
 
 // CapabilityRealizationBinding is the versioned capability-realization contract surface.
 type CapabilityRealizationBinding struct {
-	ContractVersion       string                  `json:"contractVersion"`
-	CapabilityID          string                  `json:"capabilityId"`
-	HarnessID             HarnessName             `json:"harnessId"`
-	AdapterVersion        string                  `json:"adapterVersion"`
-	Mode                  PromptSessionMode       `json:"mode"`
-	RecipeID              string                  `json:"recipeId"`
-	RecipeDigest          string                  `json:"recipeDigest"`
-	DeclaredSurfaceDigest string                  `json:"declaredSurfaceDigest"`
-	Entries               []CapabilityRecipeEntry `json:"entries"`
-	ObservationDigest     string                  `json:"observationDigest"`
+	ContractVersion       string                      `json:"contractVersion"`
+	CapabilityID          string                      `json:"capabilityId"`
+	HarnessID             HarnessName                 `json:"harnessId"`
+	AdapterVersion        string                      `json:"adapterVersion"`
+	Mode                  PromptSessionMode           `json:"mode"`
+	RecipeID              string                      `json:"recipeId"`
+	RecipeDigest          string                      `json:"recipeDigest"`
+	DeclaredSurfaceDigest string                      `json:"declaredSurfaceDigest"`
+	Entries               []CapabilityRecipeEntry     `json:"entries"`
+	FixtureID             string                      `json:"fixtureId"`
+	BinaryDigest          string                      `json:"binaryDigest"`
+	AppliedArtifacts      []CapabilityAppliedArtifact `json:"appliedArtifacts"`
+	ObservedSurface       []CapabilitySurfaceIdentity `json:"observedSurface"`
+	ObservationDigest     string                      `json:"observationDigest"`
 }
 
 // CapabilityRealizationResult is the versioned capability-realization contract surface.
@@ -374,11 +378,61 @@ func (r *CapabilityRealizationRegistry) Resolve(c string, h HarnessName, a strin
 // BindCapabilityRealization is the versioned capability-realization contract surface.
 func BindCapabilityRealization(c CompiledCapabilityRealization) CapabilityRealizationBinding {
 	d := c.Declaration
+	o := c.Observation
 	entries := append([]CapabilityRecipeEntry(nil), d.Recipe.Entries...)
 	for i := range entries {
 		entries[i].SurfaceRefs = append([]CapabilitySurfaceIdentity(nil), d.Recipe.Entries[i].SurfaceRefs...)
 	}
-	return CapabilityRealizationBinding{ContractVersion: CapabilityRealizationContractVersion, CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode, RecipeID: d.Recipe.RecipeID, RecipeDigest: d.Recipe.RecipeDigest, DeclaredSurfaceDigest: d.Recipe.DeclaredSurfaceDigest, Entries: entries, ObservationDigest: c.Observation.ObservationDigest}
+	return CapabilityRealizationBinding{
+		ContractVersion: CapabilityRealizationContractVersion,
+		CapabilityID:    d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode,
+		RecipeID: d.Recipe.RecipeID, RecipeDigest: d.Recipe.RecipeDigest,
+		DeclaredSurfaceDigest: d.Recipe.DeclaredSurfaceDigest, Entries: entries,
+		FixtureID: o.FixtureID, BinaryDigest: o.BinaryDigest,
+		AppliedArtifacts:  append([]CapabilityAppliedArtifact(nil), o.AppliedArtifacts...),
+		ObservedSurface:   append([]CapabilitySurfaceIdentity(nil), o.ObservedSurface...),
+		ObservationDigest: o.ObservationDigest,
+	}
+}
+
+func validateCapabilityRealizationBinding(b CapabilityRealizationBinding) error {
+	if b.ContractVersion != CapabilityRealizationContractVersion || len(b.Entries) == 0 {
+		return fmt.Errorf("capability realization binding is malformed")
+	}
+	declared := make([]CapabilitySurfaceIdentity, 0)
+	declaredSeen := map[string]bool{}
+	for _, entry := range b.Entries {
+		for _, surface := range entry.SurfaceRefs {
+			if key := surfaceKey(surface); !declaredSeen[key] {
+				declaredSeen[key] = true
+				declared = append(declared, surface)
+			}
+		}
+	}
+	canonicalDeclared, err := canonicalSurface(declared)
+	if err != nil {
+		return fmt.Errorf("capability realization binding is malformed")
+	}
+	declaration, err := NewCapabilityRealization(CapabilityRealizationInput{
+		CapabilityID: b.CapabilityID, HarnessID: b.HarnessID, AdapterVersion: b.AdapterVersion,
+		Mode: b.Mode, RecipeID: b.RecipeID, Entries: b.Entries, DeclaredSurface: canonicalDeclared,
+	})
+	if err != nil || declaration.Recipe.RecipeDigest != b.RecipeDigest || declaration.Recipe.DeclaredSurfaceDigest != b.DeclaredSurfaceDigest {
+		return fmt.Errorf("capability realization binding recipe is invalid")
+	}
+	observation := CapabilityFixtureObservation{
+		ContractVersion: CapabilityRealizationContractVersion,
+		CapabilityID:    b.CapabilityID, HarnessID: b.HarnessID, AdapterVersion: b.AdapterVersion,
+		Mode: b.Mode, RecipeDigest: b.RecipeDigest, FixtureID: b.FixtureID, BinaryDigest: b.BinaryDigest,
+		AppliedArtifacts:  append([]CapabilityAppliedArtifact(nil), b.AppliedArtifacts...),
+		ObservedSurface:   append([]CapabilitySurfaceIdentity(nil), b.ObservedSurface...),
+		ObservationDigest: b.ObservationDigest,
+	}
+	compiled, err := CompileCapabilityRealization(declaration, observation)
+	if err != nil || !reflect.DeepEqual(BindCapabilityRealization(compiled), b) {
+		return fmt.Errorf("capability realization binding observation is invalid")
+	}
+	return nil
 }
 
 // ResolveCapabilityRealizationResults is the versioned capability-realization contract surface.
@@ -390,7 +444,7 @@ func ResolveCapabilityRealizationResults(bindings []CapabilityRealizationBinding
 	results := make([]CapabilityRealizationResult, 0, len(bindings))
 	seen := map[string]bool{}
 	for _, b := range bindings {
-		if b.ContractVersion != CapabilityRealizationContractVersion || len(b.Entries) == 0 || seen[b.CapabilityID] || !realizationDigest.MatchString(b.ObservationDigest) {
+		if seen[b.CapabilityID] || validateCapabilityRealizationBinding(b) != nil {
 			return nil, fmt.Errorf("capability realization binding is malformed")
 		}
 		seen[b.CapabilityID] = true

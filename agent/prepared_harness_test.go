@@ -42,6 +42,22 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 	if plan.Mode != agent.PromptModeHumanControlled || plan.PromptReceipt.Decision != "ready" || plan.ToolLifecycleReceipt.Decision != "ready" {
 		t.Fatalf("prepared plan = %+v", plan)
 	}
+	if err := agent.ValidatePreparedHarnessRegistration(plan, operationalDigest); err != nil {
+		t.Fatalf("actual compiled plan failed registration validation: %v prompt=%+v tools=%+v", err, plan.PromptReceipt, plan.ToolLifecycleReceipt)
+	}
+	legitimate := *plan
+	legitimate.PromptReceipt.Entries = append([]agent.PromptDeliveryEntry(nil), plan.PromptReceipt.Entries...)
+	legitimate.ToolLifecycleReceipt.Entries = append([]agent.ToolLifecycleEntry(nil), plan.ToolLifecycleReceipt.Entries...)
+	legitimate.PromptReceipt.Entries = append(legitimate.PromptReceipt.Entries,
+		agent.PromptDeliveryEntry{ID: "optional-context", Channel: agent.PromptChannelInitialContext, Outcome: agent.PromptOutcomeDenied, DenialCode: agent.PromptDenialDeliveryUnsupported, ContentDigest: "sha256:" + strings.Repeat("a", 64)},
+		agent.PromptDeliveryEntry{ID: "authorized-context", Channel: agent.PromptChannelInitialContext, Required: true, Outcome: agent.PromptOutcomeDowngraded, Delivery: agent.PromptDeliveryAuthorizedUserDowngrade, DowngradeAuthID: "downgrade-1", ContentDigest: "sha256:" + strings.Repeat("b", 64)},
+	)
+	legitimate.ToolLifecycleReceipt.Entries = append(legitimate.ToolLifecycleReceipt.Entries,
+		agent.ToolLifecycleEntry{ID: "runtime-result", Channel: agent.ToolChannelLifecycle, Required: true, Outcome: agent.ToolOutcomePendingRuntime, Delivery: agent.ToolDeliveryStructuredProviderEvents, InputDigest: strings.Repeat("c", 64)},
+	)
+	if err := agent.ValidatePreparedHarnessRegistration(&legitimate, operationalDigest); err != nil {
+		t.Fatalf("legitimate optional/downgraded/pending receipts were refused: %v", err)
+	}
 
 	promptCallbacks, toolCallbacks := 0, 0
 	materialized := source
