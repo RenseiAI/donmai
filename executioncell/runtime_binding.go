@@ -110,6 +110,13 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	if receipt.Decision != "ready" && receipt.Decision != "denied" {
 		return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation decision must be ready or denied")
 	}
+	_, configsPresent := members["configMaterializations"]
+	if receipt.ContractVersion == HostAdaptationContractVersion && configsPresent {
+		return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v1 cannot carry config materializations")
+	}
+	if receipt.ContractVersion == HostAdaptationV2ContractVersion && receipt.Decision != "ready" {
+		return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v2 requires a ready decision with config materializations")
+	}
 	if receipt.Decision == "ready" && (len(receipt.Plan) == 0 || receipt.PlanDigest == "" || len(receipt.PromptReceipt) == 0 || len(receipt.ToolLifecycleReceipt) == 0 || receipt.Denial != "") {
 		return HostAdaptationReceipt{}, errors.New("executioncell: ready host adaptation requires complete receipts and no denial")
 	}
@@ -126,7 +133,6 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 				return HostAdaptationReceipt{}, fmt.Errorf("executioncell: ready host adaptation has non-ready %s", name)
 			}
 		}
-		_, configsPresent := members["configMaterializations"]
 		if receipt.ContractVersion == HostAdaptationV2ContractVersion {
 			if !configsPresent {
 				return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v2 requires config materializations")
@@ -145,8 +151,6 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 					return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation config operational digest mismatch")
 				}
 			}
-		} else if configsPresent {
-			return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v1 cannot carry config materializations")
 		}
 	}
 	return receipt, nil
