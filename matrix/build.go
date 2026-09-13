@@ -1,6 +1,7 @@
 package matrix
 
 import (
+	"context"
 	"fmt"
 	"sort"
 
@@ -61,6 +62,10 @@ type CapabilityMatrix struct {
 	// of donmai releases. Sorted by Harness; empty (never omitted) when
 	// no harness declares a pin.
 	BinaryPins []BinaryPinRow `json:"binaryPins"`
+	// Realizations and Capabilities form the fixture-derived capability axis.
+	// Both remain independent from HarnessRow.Caps and ToolLifecycle fields.
+	Realizations []CapabilityRealizationEvidenceRow `json:"realizations"`
+	Capabilities []CapabilityEligibilityRow         `json:"capabilities"`
 }
 
 // LegacyAlias is one (ProviderName → CellKey) row of the back-compat map,
@@ -85,6 +90,11 @@ type Built struct {
 	// AliasMap is the legacy ProviderName → CellKey map (also embedded in
 	// Matrix.LegacyAliases as a sorted slice for stable JSON).
 	AliasMap []LegacyAlias
+	// Realizations and Capabilities are derived only by executing caller-owned
+	// fixtures through BuildWithCapabilityRealizations. Plain Build keeps both
+	// deterministic and empty for the downstream-neutral OSS catalog.
+	Realizations []CapabilityRealizationEvidenceRow
+	Capabilities []CapabilityEligibilityRow
 }
 
 // Build harvests the manifests, validates every hand-authored cell against
@@ -93,6 +103,17 @@ type Built struct {
 // Returns an error for any invalid hand-authored cell so `go generate` fails
 // loudly.
 func Build() (*Built, error) {
+	return BuildWithCapabilityRealizations(context.Background(), nil)
+}
+
+// BuildWithCapabilityRealizations builds the ordinary matrix and executes the
+// supplied downstream fixtures to derive the separate capability axis. It is a
+// generation/release-parity API; CLI and daemon startup decode already
+// generated rows and never call it.
+func BuildWithCapabilityRealizations(
+	ctx context.Context,
+	realizationSources []CapabilityRealizationEvidenceSource,
+) (*Built, error) {
 	harnesses, harnessByName, err := buildHarnesses()
 	if err != nil {
 		return nil, err
@@ -116,6 +137,11 @@ func Build() (*Built, error) {
 	if err != nil {
 		return nil, err
 	}
+	realizations, err := CompileCapabilityRealizationEvidence(ctx, realizationSources)
+	if err != nil {
+		return nil, err
+	}
+	capabilities := capabilityEligibilityRows(realizations)
 
 	m := CapabilityMatrix{
 		SchemaVersion: SchemaVersion,
@@ -131,14 +157,14 @@ func Build() (*Built, error) {
 			IssueTracker:   []any{},
 			VersionControl: []any{},
 		},
-		BinaryPins: pins,
+		BinaryPins: pins, Realizations: realizations, Capabilities: capabilities,
 	}
 
 	return &Built{
 		Matrix:    m,
 		Harnesses: harnesses,
 		Endpoints: endpoints,
-		AliasMap:  aliases,
+		AliasMap:  aliases, Realizations: realizations, Capabilities: capabilities,
 	}, nil
 }
 

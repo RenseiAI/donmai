@@ -8,14 +8,15 @@ import (
 )
 
 // Artifact filenames (committed at the matrix/ package root, NOT under
-// testdata/ — testdata/ is excluded from go build and platform/rensei-tui
+// testdata/ — testdata/ is excluded from go build and downstream embedders
 // must be able to read these files).
 const (
-	FileCapabilityMatrix = "capability-matrix.json"
-	FileHarnesses        = "harnesses.json"
-	FileEndpoints        = "endpoints.json"
-	FileMatrix           = "matrix.json"
-	FileRegistryGen      = "registry_gen.go"
+	FileCapabilityMatrix       = "capability-matrix.json"
+	FileHarnesses              = "harnesses.json"
+	FileEndpoints              = "endpoints.json"
+	FileMatrix                 = "matrix.json"
+	FileRegistryGen            = "registry_gen.go"
+	FileCapabilityRealizations = "capability-realizations.json"
 )
 
 // Artifacts is the rendered byte content for every generated file, keyed by
@@ -82,12 +83,25 @@ func (b *Built) Render() (*Artifacts, error) {
 		return nil, fmt.Errorf("render registry: %w", err)
 	}
 
+	realizationsDoc := struct {
+		SchemaVersion string                             `json:"schemaVersion"`
+		ContractABI   string                             `json:"contractAbi"`
+		GeneratedFrom string                             `json:"generatedFrom"`
+		Realizations  []CapabilityRealizationEvidenceRow `json:"realizations"`
+		Capabilities  []CapabilityEligibilityRow         `json:"capabilities"`
+	}{SchemaVersion, ContractABI, GeneratedFrom, b.Realizations, b.Capabilities}
+	realizations, err := marshalJSON(realizationsDoc)
+	if err != nil {
+		return nil, fmt.Errorf("marshal capability realizations: %w", err)
+	}
+
 	return &Artifacts{Files: map[string][]byte{
-		FileCapabilityMatrix: capabilityMatrix,
-		FileHarnesses:        harnesses,
-		FileEndpoints:        endpoints,
-		FileMatrix:           matrixJSON,
-		FileRegistryGen:      registry,
+		FileCapabilityMatrix:       capabilityMatrix,
+		FileHarnesses:              harnesses,
+		FileEndpoints:              endpoints,
+		FileMatrix:                 matrixJSON,
+		FileRegistryGen:            registry,
+		FileCapabilityRealizations: realizations,
 	}}, nil
 }
 
@@ -118,7 +132,7 @@ func renderRegistry(aliases []LegacyAlias) ([]byte, error) {
 	buf.WriteString("import \"github.com/RenseiAI/donmai/agent\"\n\n")
 	buf.WriteString("// LegacyAliasMap maps each back-compat ProviderName to its canonical\n")
 	buf.WriteString("// (harness, endpoint, host) cell. Introduced in P1 but NOT YET consumed —\n")
-	buf.WriteString("// buildAgentRunRegistry (donmai) and the rensei-tui fork keep routing by\n")
+	buf.WriteString("// buildAgentRunRegistry and downstream embedders keep routing by\n")
 	buf.WriteString("// ProviderName until P1b swaps them to this map. Generated from the\n")
 	buf.WriteString("// hand-authored validCells' legacyProviderId anchors.\n")
 	buf.WriteString("var LegacyAliasMap = map[agent.ProviderName]CellKey{\n")

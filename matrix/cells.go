@@ -1,7 +1,7 @@
 // Package matrix is the single source of truth for the two-axis capability
 // matrix: which (harness × model-endpoint × serving-host) cells are valid,
 // which legacy ProviderName each maps to, and the generated artifacts that
-// platform / rensei-tui consume. The matrix is grounded in the live
+// downstream embedders consume. The matrix is grounded in the live
 // provider/endpoint Manifest() declarations (harvested by the generator), not
 // a re-typed copy — keeping the manifests the single SoT.
 //
@@ -30,7 +30,11 @@ import (
 // with no consumer break; it exists purely so a future schema reader can
 // tell "binaryPins may be absent" (p1.0) from "binaryPins is present when
 // non-empty" (p1.1) apart.
-const SchemaVersion = "p1.1"
+//
+// p1.1 -> p1.2: additive fixture-derived `realizations` and `capabilities`
+// arrays. The OSS catalog emits stable empty arrays; downstream generators
+// supply executed fixture sources without hand-authoring capability bits.
+const SchemaVersion = "p1.2"
 
 // ContractABI pins the matrix-document contract version (distinct from the
 // per-manifest harness/v2 and model-endpoint/v1 ABIs).

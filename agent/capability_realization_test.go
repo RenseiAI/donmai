@@ -1,6 +1,8 @@
 package agent
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"reflect"
 	"strings"
@@ -161,5 +163,91 @@ func TestCapabilityRecipeInputDigestPropagatesMarshalErrors(t *testing.T) {
 	}
 	if _, err := CapabilityRecipeInputDigest(make(chan int)); err == nil {
 		t.Fatal("channel digest succeeded")
+	}
+}
+
+func TestCapabilityRealizationEvidenceDerivesSmokedEligibility(t *testing.T) {
+	compiled := realizationFixture(t)
+	execution := CapabilityFixtureExecution{
+		Producer: CapabilityFixtureProducer{
+			ID:          "example.real-binary-fixture/v1",
+			Source:      []byte("actual fixture producer source"),
+			ReleaseGate: "real-binary-no-skip",
+		},
+		Observation: compiled.Observation,
+	}
+	evidenced, err := CompileCapabilityRealizationEvidence(compiled.Declaration, execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidenced.EvidenceTier != CapabilityEvidenceSmoked || !evidenced.ProductionEligible {
+		t.Fatalf("derived eligibility=%+v", evidenced)
+	}
+	producerDigest := sha256.Sum256(execution.Producer.Source)
+	if evidenced.Evidence.ProducerID != execution.Producer.ID ||
+		evidenced.Evidence.ProducerSourceDigest != hex.EncodeToString(producerDigest[:]) ||
+		evidenced.Evidence.ReleaseGate != execution.Producer.ReleaseGate ||
+		evidenced.Evidence.ObservationDigest != compiled.Observation.ObservationDigest ||
+		!realizationDigest.MatchString(evidenced.Evidence.EvidenceDigest) {
+		t.Fatalf("evidence omitted fixture provenance: %+v", evidenced.Evidence)
+	}
+	if err := ValidateCompiledCapabilityRealizationEvidence(evidenced); err != nil {
+		t.Fatalf("validate compiled evidence: %v", err)
+	}
+	registry, err := NewCapabilityRealizationRegistryFromEvidence([]CompiledCapabilityRealizationEvidence{evidenced})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := registry.Resolve(compiled.Declaration.CapabilityID, compiled.Declaration.HarnessID, compiled.Declaration.AdapterVersion, compiled.Declaration.Mode); !ok {
+		t.Fatal("validated generated row did not reach runtime registry")
+	}
+}
+
+func TestCapabilityRealizationEvidenceRejectsAuthoredOrChangedProvenance(t *testing.T) {
+	compiled := realizationFixture(t)
+	valid := CapabilityFixtureExecution{
+		Producer:    CapabilityFixtureProducer{ID: "example.real-binary-fixture/v1", Source: []byte("actual fixture producer source"), ReleaseGate: "real-binary-no-skip"},
+		Observation: compiled.Observation,
+	}
+	tests := map[string]func(*CapabilityFixtureExecution){
+		"missing producer":         func(v *CapabilityFixtureExecution) { v.Producer.ID = "" },
+		"missing source":           func(v *CapabilityFixtureExecution) { v.Producer.Source = nil },
+		"missing release gate":     func(v *CapabilityFixtureExecution) { v.Producer.ReleaseGate = "" },
+		"wrong adapter":            func(v *CapabilityFixtureExecution) { v.Observation.AdapterVersion = "other/v1" },
+		"wrong binary":             func(v *CapabilityFixtureExecution) { v.Observation.BinaryDigest = strings.Repeat("c", 64) },
+		"wrong observation digest": func(v *CapabilityFixtureExecution) { v.Observation.ObservationDigest = strings.Repeat("d", 64) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			mutate(&candidate)
+			if _, err := CompileCapabilityRealizationEvidence(compiled.Declaration, candidate); err == nil {
+				t.Fatal("changed fixture execution compiled")
+			}
+		})
+	}
+
+	evidenced, err := CompileCapabilityRealizationEvidence(compiled.Declaration, valid)
+	if err != nil {
+		t.Fatal(err)
+	}
+	generatedMutations := map[string]func(*CompiledCapabilityRealizationEvidence){
+		"eligibility":   func(v *CompiledCapabilityRealizationEvidence) { v.ProductionEligible = false },
+		"evidence tier": func(v *CompiledCapabilityRealizationEvidence) { v.EvidenceTier = "production_eligible" },
+		"producer digest": func(v *CompiledCapabilityRealizationEvidence) {
+			v.Evidence.ProducerSourceDigest = strings.Repeat("e", 64)
+		},
+		"release gate":      func(v *CompiledCapabilityRealizationEvidence) { v.Evidence.ReleaseGate = "other-gate" },
+		"evidence digest":   func(v *CompiledCapabilityRealizationEvidence) { v.Evidence.EvidenceDigest = strings.Repeat("f", 64) },
+		"observation tuple": func(v *CompiledCapabilityRealizationEvidence) { v.Evidence.ObservationDigest = strings.Repeat("0", 64) },
+	}
+	for name, mutate := range generatedMutations {
+		t.Run("generated "+name, func(t *testing.T) {
+			candidate := evidenced
+			mutate(&candidate)
+			if err := ValidateCompiledCapabilityRealizationEvidence(candidate); err == nil {
+				t.Fatal("changed generated evidence validated")
+			}
+		})
 	}
 }

@@ -10,6 +10,7 @@
 // The generator (matrix/gen) writes the committed artifacts:
 //
 //	capability-matrix.json   — the full document
+//	capability-realizations.json — fixture-derived realization and capability axes
 //	harnesses.json           — the harness rows
 //	endpoints.json           — the model-endpoint rows
 //	matrix.json              — cells + denylist + legacy aliases
@@ -17,7 +18,7 @@
 //
 // These are committed artifacts gated by the CI parity test (parity_test.go),
 // which regenerates into buffers and byte-compares against the committed files.
-// platform and rensei-tui read the JSON; keep it at the package root (NOT under
+// Downstream embedders read the JSON; keep it at the package root (NOT under
 // testdata/, which go build excludes).
 //
 //go:generate go run ./gen

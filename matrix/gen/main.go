@@ -4,7 +4,7 @@
 // the matrix/ package directory:
 //
 //	capability-matrix.json, harnesses.json, endpoints.json, matrix.json,
-//	registry_gen.go
+//	capability-realizations.json, registry_gen.go
 //
 // Output is deterministic (sorted everywhere, no timestamps) so the CI parity
 // test (matrix/parity_test.go) can byte-compare a fresh regenerate against the

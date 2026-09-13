@@ -1,0 +1,7 @@
+{
+  "schemaVersion": "p1.2",
+  "contractAbi": "capability-matrix/v1",
+  "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
+  "realizations": [],
+  "capabilities": []
+}

@@ -14,6 +14,19 @@ import (
 // CapabilityRealizationContractVersion is the versioned capability-realization contract surface.
 const CapabilityRealizationContractVersion = "donmai.capability-realization/v1"
 
+// CapabilityFixtureEvidenceContractVersion identifies executed-fixture evidence.
+const CapabilityFixtureEvidenceContractVersion = "donmai.capability-fixture-evidence/v1"
+
+// CapabilityEvidenceTier names what an executed fixture actually measured.
+type CapabilityEvidenceTier string
+
+const (
+	// CapabilityEvidenceSmoked means the exact integration was exercised against
+	// its pinned real harness binary. It does not attest a hosted deployment,
+	// session grant, or live consumer acceptance.
+	CapabilityEvidenceSmoked CapabilityEvidenceTier = "smoked"
+)
+
 // CapabilitySurfaceKind is the versioned capability-realization contract surface.
 type CapabilitySurfaceKind string
 
@@ -105,6 +118,53 @@ type CapabilityFixtureObservationInput struct {
 type CompiledCapabilityRealization struct {
 	Declaration CapabilityRealizationDeclaration `json:"declaration"`
 	Observation CapabilityFixtureObservation     `json:"observation"`
+}
+
+// CapabilityFixtureProducer identifies the executable fixture and mandatory
+// release gate that produced an observation. The compiler hashes Source to bind
+// the reviewed producer implementation; validation of that digest does not
+// itself prove the fixture ran, so consumers must also trust the generated
+// artifact's source and release provenance.
+type CapabilityFixtureProducer struct {
+	ID          string
+	Source      []byte
+	ReleaseGate string
+}
+
+// CapabilityFixtureExecution is the direct output of one fixture execution.
+// Success is represented by returning an observation; skipped and failed runs
+// return an error through the matrix executor and cannot produce evidence.
+type CapabilityFixtureExecution struct {
+	Producer    CapabilityFixtureProducer
+	Observation CapabilityFixtureObservation
+}
+
+// CapabilityRealizationEvidence binds a canonical compiled realization to the
+// executed fixture producer that observed it.
+type CapabilityRealizationEvidence struct {
+	ContractVersion      string            `json:"contractVersion"`
+	ProducerID           string            `json:"producerId"`
+	ProducerSourceDigest string            `json:"producerSourceDigest"`
+	ReleaseGate          string            `json:"releaseGate"`
+	CapabilityID         string            `json:"capabilityId"`
+	HarnessID            HarnessName       `json:"harnessId"`
+	AdapterVersion       string            `json:"adapterVersion"`
+	Mode                 PromptSessionMode `json:"mode"`
+	RecipeDigest         string            `json:"recipeDigest"`
+	FixtureID            string            `json:"fixtureId"`
+	BinaryDigest         string            `json:"binaryDigest"`
+	ObservationDigest    string            `json:"observationDigest"`
+	EvidenceDigest       string            `json:"evidenceDigest"`
+}
+
+// CompiledCapabilityRealizationEvidence is the validated generated-row shape.
+// EvidenceTier and ProductionEligible are derived outputs: callers never pass
+// either value to the compiler.
+type CompiledCapabilityRealizationEvidence struct {
+	Compiled           CompiledCapabilityRealization `json:"compiled"`
+	Evidence           CapabilityRealizationEvidence `json:"evidence"`
+	EvidenceTier       CapabilityEvidenceTier        `json:"evidenceTier"`
+	ProductionEligible bool                          `json:"productionEligible"`
 }
 
 // CapabilityRealizationBinding is the versioned capability-realization contract surface.
@@ -311,6 +371,82 @@ func CompileCapabilityRealization(d CapabilityRealizationDeclaration, o Capabili
 		}
 	}
 	return CompiledCapabilityRealization{Declaration: rebuilt, Observation: canonicalObservation}, nil
+}
+
+// CompileCapabilityRealizationEvidence derives eligibility from one executed
+// fixture observation. The trusted generator invokes the fixture; this codec
+// validates and binds its output without accepting a pass or eligibility flag.
+func CompileCapabilityRealizationEvidence(
+	d CapabilityRealizationDeclaration,
+	execution CapabilityFixtureExecution,
+) (CompiledCapabilityRealizationEvidence, error) {
+	producer := execution.Producer
+	if !realizationRef.MatchString(producer.ID) || len(producer.Source) == 0 || !realizationRef.MatchString(producer.ReleaseGate) {
+		return CompiledCapabilityRealizationEvidence{}, fmt.Errorf("capability fixture producer identity is malformed")
+	}
+	compiled, err := CompileCapabilityRealization(d, execution.Observation)
+	if err != nil {
+		return CompiledCapabilityRealizationEvidence{}, fmt.Errorf("compile capability fixture observation: %w", err)
+	}
+	producerSourceDigest := sha256.Sum256(producer.Source)
+	evidence := CapabilityRealizationEvidence{
+		ContractVersion: CapabilityFixtureEvidenceContractVersion,
+		ProducerID:      producer.ID, ProducerSourceDigest: hex.EncodeToString(producerSourceDigest[:]), ReleaseGate: producer.ReleaseGate,
+		CapabilityID: d.CapabilityID, HarnessID: d.HarnessID, AdapterVersion: d.AdapterVersion, Mode: d.Mode,
+		RecipeDigest: d.Recipe.RecipeDigest, FixtureID: compiled.Observation.FixtureID,
+		BinaryDigest: compiled.Observation.BinaryDigest, ObservationDigest: compiled.Observation.ObservationDigest,
+	}
+	evidence.EvidenceDigest, err = capabilityEvidenceDigest(evidence)
+	if err != nil {
+		return CompiledCapabilityRealizationEvidence{}, err
+	}
+	return CompiledCapabilityRealizationEvidence{
+		Compiled: compiled, Evidence: evidence,
+		EvidenceTier: CapabilityEvidenceSmoked, ProductionEligible: true,
+	}, nil
+}
+
+func capabilityEvidenceDigest(evidence CapabilityRealizationEvidence) (string, error) {
+	evidence.EvidenceDigest = ""
+	return domainDigest("donmai.capability-fixture-evidence/v1", evidence)
+}
+
+// ValidateCompiledCapabilityRealizationEvidence validates generated artifact
+// bytes without executing their fixture. A valid hash proves internal
+// consistency only; the caller must trust the artifact source and the named
+// non-skipped release gate before treating it as empirical evidence.
+func ValidateCompiledCapabilityRealizationEvidence(row CompiledCapabilityRealizationEvidence) error {
+	if row.EvidenceTier != CapabilityEvidenceSmoked || !row.ProductionEligible {
+		return fmt.Errorf("capability eligibility is not compiler-derived")
+	}
+	compiled, err := CompileCapabilityRealization(row.Compiled.Declaration, row.Compiled.Observation)
+	if err != nil || !reflect.DeepEqual(compiled, row.Compiled) || row.Evidence.ContractVersion != CapabilityFixtureEvidenceContractVersion ||
+		!realizationRef.MatchString(row.Evidence.ProducerID) || !realizationDigest.MatchString(row.Evidence.ProducerSourceDigest) || !realizationRef.MatchString(row.Evidence.ReleaseGate) ||
+		row.Evidence.CapabilityID != row.Compiled.Declaration.CapabilityID || row.Evidence.HarnessID != row.Compiled.Declaration.HarnessID ||
+		row.Evidence.AdapterVersion != row.Compiled.Declaration.AdapterVersion || row.Evidence.Mode != row.Compiled.Declaration.Mode ||
+		row.Evidence.RecipeDigest != row.Compiled.Declaration.Recipe.RecipeDigest || row.Evidence.FixtureID != row.Compiled.Observation.FixtureID ||
+		row.Evidence.BinaryDigest != row.Compiled.Observation.BinaryDigest || row.Evidence.ObservationDigest != row.Compiled.Observation.ObservationDigest {
+		return fmt.Errorf("compiled capability realization evidence is invalid")
+	}
+	digest, err := capabilityEvidenceDigest(row.Evidence)
+	if err != nil || digest != row.Evidence.EvidenceDigest {
+		return fmt.Errorf("compiled capability realization evidence is invalid")
+	}
+	return nil
+}
+
+// NewCapabilityRealizationRegistryFromEvidence validates generated rows and
+// constructs the existing runtime registry without executing fixtures. Trusted
+// source and release provenance remain a caller responsibility.
+func NewCapabilityRealizationRegistryFromEvidence(rows []CompiledCapabilityRealizationEvidence) (*CapabilityRealizationRegistry, error) {
+	compiled := make([]CompiledCapabilityRealization, len(rows))
+	for i, row := range rows {
+		if err := ValidateCompiledCapabilityRealizationEvidence(row); err != nil {
+			return nil, err
+		}
+		compiled[i] = row.Compiled
+	}
+	return NewCapabilityRealizationRegistry(compiled)
 }
 
 // CapabilityRealizationRegistry is the versioned capability-realization contract surface.
