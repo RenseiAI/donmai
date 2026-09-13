@@ -40,6 +40,61 @@ func readyHostReceipt(t *testing.T, binding RuntimeBinding) []byte {
 	return raw
 }
 
+func capabilityHostReceipt(t *testing.T, binding RuntimeBinding) []byte {
+	t.Helper()
+	operationalDigest := strings.Repeat("a", 64)
+	surface := []agent.CapabilitySurfaceIdentity{
+		{Kind: agent.CapabilitySurfaceMCPServer, ID: "example"},
+		{Kind: agent.CapabilitySurfaceMCPTool, ID: "draft_create"},
+	}
+	inputDigest, err := agent.CapabilityRecipeInputDigest([]string{"example"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: "example.draft/v1", HarnessID: agent.HarnessCodex,
+		AdapterVersion: "codex/interactive/tool-lifecycle-v1", Mode: agent.PromptModeHumanControlled,
+		RecipeID:        "example/http-mcp/v1",
+		Entries:         []agent.CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}},
+		DeclaredSurface: surface,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+		Declaration: declaration, FixtureID: "actual-runtime", BinaryDigest: strings.Repeat("b", 64),
+		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "mcp-servers", Channel: agent.ToolChannelMCPServer, InputDigest: inputDigest}},
+		ObservedSurface:  surface,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entry := agent.ToolLifecycleEntry{ID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true, Outcome: agent.ToolOutcomeAdmitted, Delivery: agent.ToolDeliveryCodexAppServerMCP, InputDigest: inputDigest}
+	results, err := agent.ResolveCapabilityRealizationResults([]agent.CapabilityRealizationBinding{agent.BindCapabilityRealization(compiled)}, []agent.ToolLifecycleEntry{entry})
+	if err != nil {
+		t.Fatal(err)
+	}
+	prompt := agent.PromptDeliveryReceipt{ContractVersion: agent.PromptContractVersion, ProfileID: "test-prompt", Decision: "ready", Entries: []agent.PromptDeliveryEntry{}}
+	tool := agent.ToolLifecycleReceipt{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: "admission", ClaimReceiptID: binding.ClaimID, OperationalPayloadDigest: operationalDigest, ProfileID: "test-tools", Decision: "ready", EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true, Entries: []agent.ToolLifecycleEntry{entry}, CapabilityRealizations: results}
+	channels := []string{"worktree", "environment", "credentials", "config", "endpoint_delivery", "services", "child_process", "runtime", "cleanup"}
+	materializations := make([]agent.HarnessMaterialization, 0, len(channels))
+	for _, channel := range channels {
+		materializations = append(materializations, agent.HarnessMaterialization{Channel: channel, SourceDigest: operationalDigest, Required: true})
+	}
+	plan := mustJSON(t, agent.PreparedHarness{ContractVersion: agent.HarnessAdaptationContractVersion, Harness: "codex", Mode: agent.PromptModeHumanControlled, OperationalPayloadDigest: operationalDigest, AuthorityDigest: strings.Repeat("f", 64), RuntimeMCPNames: []string{}, Materializations: materializations, PromptReceipt: prompt, ToolLifecycleReceipt: tool})
+	digest := sha256.Sum256(plan)
+	return mustJSON(t, HostAdaptationReceipt{
+		ContractVersion: HostAdaptationContractVersion,
+		RequestID:       binding.RequestID, WorkerID: binding.WorkerID, PlacementID: binding.PlacementID, ClaimID: binding.ClaimID,
+		Decision: "ready", Plan: plan, PlanDigest: hex.EncodeToString(digest[:]),
+		PromptReceipt: mustJSON(t, prompt), ToolLifecycleReceipt: mustJSON(t, tool),
+	})
+}
+
 func runtimeBindingV2() RuntimeBinding {
 	return RuntimeBinding{
 		ContractVersion: RuntimeBindingV2ContractVersion,
@@ -188,6 +243,64 @@ func TestPreflightRegistrationRequestRejectsMalformedNestedHostAuthority(t *test
 			}
 		})
 	}
+}
+
+func TestPreflightRegistrationCarriesAndValidatesCapabilityArtifact(t *testing.T) {
+	binding := runtimeBindingV2()
+	valid := capabilityHostReceipt(t, binding)
+	request, err := NewPreflightRegistrationRequest(binding, valid, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	var host HostAdaptationReceipt
+	if err := json.Unmarshal(valid, &host); err != nil {
+		t.Fatal(err)
+	}
+	var plan agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	result := plan.ToolLifecycleReceipt.CapabilityRealizations[0]
+	if result.Decision != "artifact_bound" || result.BinaryDigest == "" || len(result.AppliedArtifacts) != 1 || len(result.ObservedSurface) != 2 {
+		t.Fatalf("raw receipt omitted applied artifact provenance: %+v", result)
+	}
+	if request.ReceiptSHA256 == "" || request.RuntimeBinding.RequestID != binding.RequestID {
+		t.Fatalf("registration omitted receipt/runtime binding: %+v", request)
+	}
+
+	mutateReceipt := func(t *testing.T, mutate func(*agent.CapabilityRealizationResult)) []byte {
+		t.Helper()
+		candidate := host
+		var candidatePlan agent.PreparedHarness
+		if err := json.Unmarshal(candidate.Plan, &candidatePlan); err != nil {
+			t.Fatal(err)
+		}
+		mutate(&candidatePlan.ToolLifecycleReceipt.CapabilityRealizations[0])
+		candidate.Plan = mustJSON(t, candidatePlan)
+		planDigest := sha256.Sum256(candidate.Plan)
+		candidate.PlanDigest = hex.EncodeToString(planDigest[:])
+		candidate.ToolLifecycleReceipt = mustJSON(t, candidatePlan.ToolLifecycleReceipt)
+		return mustJSON(t, candidate)
+	}
+	for name, mutate := range map[string]func(*agent.CapabilityRealizationResult){
+		"missing observed tool": func(v *agent.CapabilityRealizationResult) { v.ObservedSurface = v.ObservedSurface[:1] },
+		"wrong adapter":         func(v *agent.CapabilityRealizationResult) { v.AdapterVersion = "codex/interactive/tool-lifecycle-v2" },
+		"wrong recipe":          func(v *agent.CapabilityRealizationResult) { v.RecipeDigest = strings.Repeat("c", 64) },
+		"wrong entry":           func(v *agent.CapabilityRealizationResult) { v.Entries[0].InputDigest = strings.Repeat("d", 64) },
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := NewPreflightRegistrationRequest(binding, mutateReceipt(t, mutate), strings.Repeat("a", 64)); err == nil {
+				t.Fatal("changed applied artifact provenance was registered")
+			}
+		})
+	}
+	t.Run("wrong runtime", func(t *testing.T) {
+		wrong := binding
+		wrong.WorkerID = "worker-2"
+		if _, err := NewPreflightRegistrationRequest(wrong, valid, strings.Repeat("a", 64)); err == nil {
+			t.Fatal("receipt from another runtime binding was registered")
+		}
+	})
 }
 
 func TestPreflightRegistrationResponseClosedAndExact(t *testing.T) {

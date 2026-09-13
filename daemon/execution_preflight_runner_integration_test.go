@@ -1,7 +1,10 @@
 package daemon_test
 
 import (
+	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"os"
 	"path/filepath"
@@ -14,33 +17,63 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
-	stub "github.com/RenseiAI/donmai/provider/harness/stub"
+	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
 	"github.com/RenseiAI/donmai/runner"
 )
 
 func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testing.T) {
-	provider, err := stub.New()
+	registry := runner.NewRegistry()
+	if err := registry.Register(&providerpi.Provider{}); err != nil {
+		t.Fatal(err)
+	}
+	extensionSource := []byte("register an example native tool")
+	extensionDigest := sha256.Sum256(extensionSource)
+	delivery := agent.ExtensionDelivery{ID: "example-extension", Kind: agent.ExtensionDeliveryInline, Source: extensionSource, Basename: "example.js", Digest: hex.EncodeToString(extensionDigest[:]), Required: true}
+	capabilitySurface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "example_tool"}}
+	capabilityInputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery})
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: "example.native/v1", HarnessID: agent.HarnessPi,
+		AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled,
+		RecipeID:        "example/inline-extension/v1",
+		Entries:         []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: capabilityInputDigest, SurfaceRefs: capabilitySurface}},
+		DeclaredSurface: capabilitySurface,
+	})
 	if err != nil {
 		t.Fatal(err)
 	}
-	registry := runner.NewRegistry()
-	if err := registry.Register(provider); err != nil {
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+		Declaration: declaration, FixtureID: "actual-provider-view", BinaryDigest: strings.Repeat("b", 64),
+		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: capabilityInputDigest}},
+		ObservedSurface:  capabilitySurface,
+	})
+	if err != nil {
 		t.Fatal(err)
 	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	decorate := func(agent.Spec) []agent.ExtensionDelivery { return []agent.ExtensionDelivery{delivery} }
 	const requestID = "actual-v2-provider-view"
 	cell := executioncell.ResolvedExecutionCell{
 		ContractVersion: executioncell.ContractVersion,
-		Harness:         executioncell.HarnessRef{ID: string(agent.HarnessStub), Version: "harness/v2"},
-		Model:           executioncell.ModelRef{ID: "stub-model", Author: "local"},
+		Harness:         executioncell.HarnessRef{ID: string(agent.HarnessPi), Version: "harness/v2"},
+		Model:           executioncell.ModelRef{ID: "test-model", Author: "local"},
 		Endpoint: executioncell.ServingEndpointRef{
-			ID: "stub-local", Protocol: string(agent.ProtoStub), Operator: "local", Revision: "r1",
+			ID: "test-local", Protocol: string(agent.ProtoOpenAIResponses), Operator: "local", Revision: "r1",
 		},
 		AuthBinding: executioncell.AuthBindingRef{
 			ID: "stub-auth", Mechanism: executioncell.AuthNone, CommercialMode: executioncell.CommercialSelfHosted,
 			Authority: "local", BindingScope: executioncell.ScopeProcess, Portability: executioncell.Portable, Delivery: executioncell.DeliveryNone,
 		},
-		Placement:   executioncell.PlacementRef{ID: "host-local", Kind: executioncell.PlacementHost, Resolution: executioncell.PlacementExact},
-		SessionMode: executioncell.SessionHumanControlled, GrantedCapabilities: []executioncell.CapabilityRequirement{}, EvidenceTier: executioncell.EvidenceUnitVerified,
+		Placement:           executioncell.PlacementRef{ID: "host-local", Kind: executioncell.PlacementHost, Resolution: executioncell.PlacementExact},
+		SessionMode:         executioncell.SessionHumanControlled,
+		GrantedCapabilities: []executioncell.CapabilityRequirement{{Name: "example.native/v1", ParametersDigest: strings.Repeat("5", 64)}},
+		EvidenceTier:        executioncell.EvidenceUnitVerified,
 		CompatibilityDigest: strings.Repeat("3", 64), RuntimeInventoryDigest: strings.Repeat("4", 64),
 	}
 	work := runner.QueuedWork{}
@@ -49,9 +82,9 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	work.Body = "compile the actual provider-view authority"
 	work.Mode = prompt.InteractiveRunMode
 	work.InitialPrompt = "compile the actual provider-view authority"
-	work.ResolvedProfile = runner.ResolvedProfile{Harness: string(agent.HarnessStub), Model: "stub-model", Endpoint: &agent.EndpointBinding{
-		Company: agent.CompanyStub, Model: "stub-model", Protocol: agent.ProtoStub, Host: agent.HostLocal,
-		EndpointID: "stub-local", EndpointOperator: "local", EndpointRevision: "r1", ModelAuthor: "local",
+	work.ResolvedProfile = runner.ResolvedProfile{Harness: string(agent.HarnessPi), Model: "test-model", Endpoint: &agent.EndpointBinding{
+		Company: "test", Model: "test-model", Protocol: agent.ProtoOpenAIResponses, Host: agent.HostDirect,
+		EndpointID: "test-local", EndpointOperator: "local", EndpointRevision: "r1", ModelAuthor: "local",
 		AuthBindingID: "stub-auth", AuthAuthority: "local", AuthCommercialMode: string(executioncell.CommercialSelfHosted),
 		AuthBindingScope: string(executioncell.ScopeProcess), AuthPortability: string(executioncell.Portable),
 		AuthDelivery: string(executioncell.DeliveryNone), Mechanism: agent.AuthNone, Auth: agent.AuthLocal, CostModel: agent.CostLocalFree,
@@ -90,7 +123,7 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	view := runner.NewProviderView(registry)
+	view := runner.NewProviderViewWithDecoratorAndRealizations(registry, decorate, realizations)
 	preflightInput, err := json.Marshal(map[string]any{
 		"sessionId": requestID, "workerId": work.WorkerID, "admissionReceipt": json.RawMessage(immutableAdmission.Bytes()),
 		"effectiveCell": json.RawMessage(effective), "executionRuntimeBinding": json.RawMessage(bindingRaw), "operationalPayload": json.RawMessage(operational),
@@ -112,10 +145,11 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	}
 	var credentials atomic.Int32
 	marker := filepath.Join(tmp, "spawned")
+	receiptStore := daemon.NewFileExecutionPreflightStore(filepath.Join(tmp, "receipts"))
 	d := daemon.New(daemon.Options{
 		ConfigPath: configPath, JWTPath: filepath.Join(tmp, "daemon.jwt"), SkipWizard: true, SkipRegistration: true,
 		ProviderRegistry:            view,
-		ExecutionPreflightStore:     daemon.NewFileExecutionPreflightStore(filepath.Join(tmp, "receipts")),
+		ExecutionPreflightStore:     receiptStore,
 		ExecutionPreflightRegistrar: daemon.NewFileExecutionPreflightRegistrar(filepath.Join(tmp, "registrations")),
 		SpawnerOptions: daemon.SpawnerOptions{WorkerCommand: []string{"/bin/sh", "-c", "printf spawned > " + marker}, OnPreSpawn: func(_ daemon.SessionSpec, env []string) ([]string, error) {
 			credentials.Add(1)
@@ -146,6 +180,24 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	}
 	if err := agent.ValidatePreparedHarness(&prepared, operationalDigest); err != nil {
 		t.Fatal(err)
+	}
+	if err := agent.ValidatePreparedHarnessRegistration(&prepared, operationalDigest); err != nil {
+		t.Fatal(err)
+	}
+	if len(prepared.ToolLifecycleReceipt.CapabilityRealizations) != 1 {
+		t.Fatalf("fsynced receipt realizations = %+v", prepared.ToolLifecycleReceipt.CapabilityRealizations)
+	}
+	result := prepared.ToolLifecycleReceipt.CapabilityRealizations[0]
+	if result.Decision != "artifact_bound" || result.AdapterVersion != declaration.AdapterVersion ||
+		result.BinaryDigest != observation.BinaryDigest || len(result.ObservedSurface) != 1 || result.ObservedSurface[0].ID != "example_tool" {
+		t.Fatalf("fsynced receipt omitted consumed realization: %+v", result)
+	}
+	fsynced, err := receiptStore.Load(requestID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(fsynced, detail.HostAdaptationReceipt) {
+		t.Fatal("registered receipt differs from the exact fsynced bytes")
 	}
 	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
 		if _, err := os.Stat(marker); err == nil {

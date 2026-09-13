@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 	"strings"
 )
@@ -572,6 +573,20 @@ func validateToolReceiptForRegistration(receipt ToolLifecycleReceipt) error {
 		if entry.Outcome == ToolOutcomeDowngraded && strings.TrimSpace(entry.FallbackAuthID) == "" {
 			return errors.New("agent: registered tool lifecycle downgrade lacks authority")
 		}
+	}
+	if len(receipt.CapabilityRealizations) == 0 {
+		return nil
+	}
+	bindings := make([]CapabilityRealizationBinding, len(receipt.CapabilityRealizations))
+	for i, result := range receipt.CapabilityRealizations {
+		if result.Decision != "artifact_bound" {
+			return errors.New("agent: registered capability realization is not artifact-bound")
+		}
+		bindings[i] = result.CapabilityRealizationBinding
+	}
+	expected, err := ResolveCapabilityRealizationResults(bindings, receipt.Entries)
+	if err != nil || !reflect.DeepEqual(expected, receipt.CapabilityRealizations) {
+		return errors.New("agent: registered capability realization evidence is invalid")
 	}
 	return nil
 }

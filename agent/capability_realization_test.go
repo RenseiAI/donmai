@@ -2,6 +2,7 @@ package agent
 
 import (
 	"encoding/json"
+	"reflect"
 	"strings"
 	"testing"
 )
@@ -66,9 +67,36 @@ func TestCapabilityRealizationRefusesOptionalAndPartial(t *testing.T) {
 func TestCapabilityRealizationArtifactBoundNotReady(t *testing.T) {
 	c := realizationFixture(t)
 	b := BindCapabilityRealization(c)
+	if b.FixtureID != c.Observation.FixtureID || b.BinaryDigest != c.Observation.BinaryDigest ||
+		!reflect.DeepEqual(b.AppliedArtifacts, c.Observation.AppliedArtifacts) ||
+		!reflect.DeepEqual(b.ObservedSurface, c.Observation.ObservedSurface) {
+		t.Fatalf("binding omitted executable observation provenance: %+v", b)
+	}
 	r, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{b}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: b.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}})
 	if err != nil || r[0].Decision != "artifact_bound" {
 		t.Fatalf("result=%+v err=%v", r, err)
+	}
+}
+
+func TestCapabilityRealizationResultRejectsChangedProvenance(t *testing.T) {
+	c := realizationFixture(t)
+	base := BindCapabilityRealization(c)
+	entry := ToolLifecycleEntry{ID: base.Entries[0].EntryID, Channel: base.Entries[0].Channel, Required: true, InputDigest: base.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}
+	tests := map[string]func(*CapabilityRealizationBinding){
+		"adapter":          func(v *CapabilityRealizationBinding) { v.AdapterVersion = "codex/interactive/tool-lifecycle-v2" },
+		"recipe":           func(v *CapabilityRealizationBinding) { v.RecipeDigest = strings.Repeat("b", 64) },
+		"entry":            func(v *CapabilityRealizationBinding) { v.Entries[0].InputDigest = strings.Repeat("c", 64) },
+		"observed surface": func(v *CapabilityRealizationBinding) { v.ObservedSurface = v.ObservedSurface[:1] },
+		"binary":           func(v *CapabilityRealizationBinding) { v.BinaryDigest = strings.Repeat("d", 64) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := BindCapabilityRealization(c)
+			mutate(&candidate)
+			if _, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{candidate}, []ToolLifecycleEntry{entry}); err == nil {
+				t.Fatal("changed realization provenance was accepted")
+			}
+		})
 	}
 }
 
