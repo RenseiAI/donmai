@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"reflect"
 	"sort"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -110,6 +111,9 @@ func CompileCapabilityRealizationEvidence(
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	if err := preflightCapabilityRealizationEvidenceSources(sources); err != nil {
+		return nil, err
+	}
 	rows := make([]CapabilityRealizationEvidenceRow, 0, len(sources))
 	for _, source := range sources {
 		if source.Executor == nil {
@@ -132,6 +136,40 @@ func CompileCapabilityRealizationEvidence(
 		return nil, err
 	}
 	return rows, nil
+}
+
+func preflightCapabilityRealizationEvidenceSources(sources []CapabilityRealizationEvidenceSource) error {
+	seen := make(map[string]struct{}, len(sources))
+	for i, source := range sources {
+		if source.Executor == nil {
+			return fmt.Errorf("execute capability fixture: executor is required")
+		}
+		canonical, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+			CapabilityID:    source.Declaration.CapabilityID,
+			HarnessID:       source.Declaration.HarnessID,
+			AdapterVersion:  source.Declaration.AdapterVersion,
+			Mode:            source.Declaration.Mode,
+			RecipeID:        source.Declaration.Recipe.RecipeID,
+			Entries:         source.Declaration.Recipe.Entries,
+			DeclaredSurface: source.Declaration.Recipe.DeclaredSurface,
+		})
+		if err != nil {
+			return fmt.Errorf("compile capability realization evidence source %d: %w", i, err)
+		}
+		if !reflect.DeepEqual(canonical, source.Declaration) {
+			return fmt.Errorf("compile capability realization evidence source %d: capability declaration is not canonical", i)
+		}
+		key := capabilityRealizationTupleKey(canonical)
+		if _, ok := seen[key]; ok {
+			return fmt.Errorf("duplicate capability realization evidence tuple")
+		}
+		seen[key] = struct{}{}
+	}
+	return nil
+}
+
+func capabilityRealizationTupleKey(d agent.CapabilityRealizationDeclaration) string {
+	return d.CapabilityID + "\x00" + string(d.HarnessID) + "\x00" + d.AdapterVersion + "\x00" + string(d.Mode)
 }
 
 func capabilityEligibilityRows(realizations []CapabilityRealizationEvidenceRow) []CapabilityEligibilityRow {
