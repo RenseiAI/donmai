@@ -284,7 +284,7 @@ func TestPreflightRegistrationCarriesAndValidatesCapabilityArtifact(t *testing.T
 	}
 	for name, mutate := range map[string]func(*agent.CapabilityRealizationResult){
 		"missing observed tool": func(v *agent.CapabilityRealizationResult) { v.ObservedSurface = v.ObservedSurface[:1] },
-		"wrong adapter":         func(v *agent.CapabilityRealizationResult) { v.AdapterVersion = "codex/interactive/tool-lifecycle-v2" },
+		"wrong adapter":         func(v *agent.CapabilityRealizationResult) { v.AdapterVersion = "pi/interactive/tool-lifecycle-v3" },
 		"wrong recipe":          func(v *agent.CapabilityRealizationResult) { v.RecipeDigest = strings.Repeat("c", 64) },
 		"wrong entry":           func(v *agent.CapabilityRealizationResult) { v.Entries[0].InputDigest = strings.Repeat("d", 64) },
 	} {

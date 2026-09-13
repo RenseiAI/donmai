@@ -83,7 +83,7 @@ func TestCapabilityRealizationResultRejectsChangedProvenance(t *testing.T) {
 	base := BindCapabilityRealization(c)
 	entry := ToolLifecycleEntry{ID: base.Entries[0].EntryID, Channel: base.Entries[0].Channel, Required: true, InputDigest: base.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}
 	tests := map[string]func(*CapabilityRealizationBinding){
-		"adapter":          func(v *CapabilityRealizationBinding) { v.AdapterVersion = "codex/interactive/tool-lifecycle-v2" },
+		"adapter":          func(v *CapabilityRealizationBinding) { v.AdapterVersion = "pi/interactive/tool-lifecycle-v3" },
 		"recipe":           func(v *CapabilityRealizationBinding) { v.RecipeDigest = strings.Repeat("b", 64) },
 		"entry":            func(v *CapabilityRealizationBinding) { v.Entries[0].InputDigest = strings.Repeat("c", 64) },
 		"observed surface": func(v *CapabilityRealizationBinding) { v.ObservedSurface = v.ObservedSurface[:1] },
