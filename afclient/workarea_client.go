@@ -12,12 +12,16 @@ package afclient
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"strings"
+	"time"
 )
+
+const defaultWorkareaRestoreTimeout = 2 * time.Minute
 
 // ListWorkareas fetches the daemon's active pool members and on-disk
 // archives from GET /api/daemon/workareas. The response splits the two
@@ -77,11 +81,20 @@ func (c *DaemonClient) GetWorkareaV1(id string) (*WorkareaV1Envelope, error) {
 //   - 503: pool saturation — Retry-After header names the wait → ErrUnavailable.
 //   - 400: archive corrupted or unreadable → ErrBadRequest.
 func (c *DaemonClient) RestoreWorkarea(archiveID string, req WorkareaRestoreRequest) (*WorkareaRestoreResult, error) {
+	return c.RestoreWorkareaContext(context.Background(), archiveID, req)
+}
+
+// RestoreWorkareaContext is RestoreWorkarea with caller cancellation. Restore
+// can legitimately outlive the daemon client's ordinary 10-second timeout
+// while it copies a whole archive, so this method clones the client and lets a
+// restore-only two-minute context own the bound. A stricter caller deadline or
+// cancellation still wins.
+func (c *DaemonClient) RestoreWorkareaContext(ctx context.Context, archiveID string, req WorkareaRestoreRequest) (*WorkareaRestoreResult, error) {
 	if archiveID == "" {
 		return nil, fmt.Errorf("restore workarea: archiveID is required")
 	}
 	var resp WorkareaRestoreResult
-	if err := c.post("/api/daemon/workareas/"+archiveID+"/restore", req, &resp); err != nil {
+	if err := c.restoreWorkareaContext(ctx, archiveID, req, &resp); err != nil {
 		return nil, fmt.Errorf("restore workarea: %w", err)
 	}
 	return &resp, nil
@@ -90,14 +103,31 @@ func (c *DaemonClient) RestoreWorkarea(archiveID string, req WorkareaRestoreRequ
 // RestoreWorkareaV1 restores an archive and decodes additive session-root-v1
 // layout metadata.
 func (c *DaemonClient) RestoreWorkareaV1(archiveID string, req WorkareaRestoreRequest) (*WorkareaRestoreV1Result, error) {
+	return c.RestoreWorkareaV1Context(context.Background(), archiveID, req)
+}
+
+// RestoreWorkareaV1Context is the versioned restore projection with the same
+// method-specific bound and caller-cancellation contract as RestoreWorkareaContext.
+func (c *DaemonClient) RestoreWorkareaV1Context(ctx context.Context, archiveID string, req WorkareaRestoreRequest) (*WorkareaRestoreV1Result, error) {
 	if archiveID == "" {
 		return nil, fmt.Errorf("restore workarea v1: archiveID is required")
 	}
 	var resp WorkareaRestoreV1Result
-	if err := c.post("/api/daemon/workareas/"+archiveID+"/restore", req, &resp); err != nil {
+	if err := c.restoreWorkareaContext(ctx, archiveID, req, &resp); err != nil {
 		return nil, fmt.Errorf("restore workarea v1: %w", err)
 	}
 	return &resp, nil
+}
+
+func (c *DaemonClient) restoreWorkareaContext(ctx context.Context, archiveID string, req WorkareaRestoreRequest, target any) error {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	restoreCtx, cancel := context.WithTimeout(ctx, defaultWorkareaRestoreTimeout)
+	defer cancel()
+	httpClient := *c.httpClient
+	httpClient.Timeout = 0
+	return c.postContext(restoreCtx, &httpClient, "/api/daemon/workareas/"+archiveID+"/restore", req, target)
 }
 
 // DiffWorkareas returns a structured per-path delta between two archived

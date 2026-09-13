@@ -1,6 +1,7 @@
 package afcli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -32,6 +33,7 @@ type fakeWorkareaClient struct {
 	listCalls    int
 	getCalls     int
 	restoreCalls int
+	restoreCtx   context.Context
 	diffCalls    int
 }
 
@@ -46,8 +48,9 @@ func (f *fakeWorkareaClient) GetWorkarea(id string) (*afclient.WorkareaEnvelope,
 	return f.getResp, f.getErr
 }
 
-func (f *fakeWorkareaClient) RestoreWorkarea(archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error) {
+func (f *fakeWorkareaClient) RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error) {
 	f.restoreCalls++
+	f.restoreCtx = ctx
 	f.gotArchive = archiveID
 	f.gotRestore = req
 	return f.restoreResp, f.restoreErr
@@ -234,6 +237,21 @@ func TestWorkareaCmd_Restore_JSON(t *testing.T) {
 	}
 	if got.Workarea.ID != "wa-jr" {
 		t.Errorf("id = %q", got.Workarea.ID)
+	}
+}
+
+func TestWorkareaCmd_Restore_ThreadsCommandContext(t *testing.T) {
+	type contextKey struct{}
+	client := &fakeWorkareaClient{restoreResp: &afclient.WorkareaRestoreResult{
+		Workarea: afclient.Workarea{ID: "wa-context", Kind: afclient.WorkareaKindActive},
+	}}
+	root := newWorkareaRootForTest(client)
+	root.SetContext(context.WithValue(context.Background(), contextKey{}, "restore-context"))
+	if _, err := runRootCmd(t, root, "workarea", "restore", "wa-x"); err != nil {
+		t.Fatalf("restore: %v", err)
+	}
+	if client.restoreCtx == nil || client.restoreCtx.Value(contextKey{}) != "restore-context" {
+		t.Fatalf("restore context = %#v, want command context", client.restoreCtx)
 	}
 }
 

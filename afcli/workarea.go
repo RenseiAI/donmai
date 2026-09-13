@@ -6,6 +6,7 @@
 package afcli
 
 import (
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -25,7 +26,7 @@ import (
 type workareaDaemonClient interface {
 	ListWorkareas() (*afclient.ListWorkareasResponse, error)
 	GetWorkarea(id string) (*afclient.WorkareaEnvelope, error)
-	RestoreWorkarea(archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error)
+	RestoreWorkareaContext(ctx context.Context, archiveID string, req afclient.WorkareaRestoreRequest) (*afclient.WorkareaRestoreResult, error)
 	DiffWorkareas(idA, idB string) (*afclient.WorkareaDiffResult, error)
 }
 
@@ -190,7 +191,7 @@ Pool saturation returns 503 + Retry-After.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			client := factory(resolveWorkareaDaemonConfig())
-			return runWorkareaRestore(cmd.OutOrStdout(), client, args[0],
+			return runWorkareaRestore(cmd.Context(), cmd.OutOrStdout(), client, args[0],
 				afclient.WorkareaRestoreRequest{
 					Reason:        reason,
 					IntoSessionID: intoSessionID,
@@ -203,10 +204,10 @@ Pool saturation returns 503 + Retry-After.`,
 	return cmd
 }
 
-func runWorkareaRestore(out io.Writer, client workareaDaemonClient, archiveID string,
+func runWorkareaRestore(ctx context.Context, out io.Writer, client workareaDaemonClient, archiveID string,
 	req afclient.WorkareaRestoreRequest, jsonOut bool,
 ) error {
-	res, err := client.RestoreWorkarea(archiveID, req)
+	res, err := client.RestoreWorkareaContext(ctx, archiveID, req)
 	if err != nil {
 		switch {
 		case errors.Is(err, afclient.ErrNotFound):
