@@ -22,9 +22,11 @@ type operationalPreflightConfigSource struct {
 }
 
 type preflightOwnedFile struct {
-	path  string
-	info  os.FileInfo
-	owned bool
+	path    string
+	rootDir string
+	name    string
+	info    os.FileInfo
+	owned   bool
 }
 
 type preflightConfigLease struct {
@@ -37,11 +39,17 @@ func (l preflightConfigLease) cleanup() {
 		if !file.owned {
 			continue
 		}
-		current, err := os.Lstat(file.path)
-		if err != nil || !os.SameFile(file.info, current) {
+		root, err := os.OpenRoot(file.rootDir)
+		if err != nil {
 			continue
 		}
-		_ = os.Remove(file.path)
+		current, err := root.Lstat(file.name)
+		if err != nil || !os.SameFile(file.info, current) {
+			_ = root.Close()
+			continue
+		}
+		_ = root.Remove(file.name)
+		_ = root.Close()
 	}
 }
 
@@ -231,7 +239,7 @@ func materializeOwnedBearerFile(dir, sessionID, requirementID, target, bearer st
 		}
 		return preflightOwnedFile{}, err
 	}
-	return preflightOwnedFile{path: path, info: info, owned: true}, nil
+	return preflightOwnedFile{path: path, rootDir: dir, name: name, info: info, owned: true}, nil
 }
 
 func hostReceiptWithConfigMaterializations(receipt json.RawMessage, materializations []executioncell.PreflightConfigMaterializationV1) (json.RawMessage, error) {

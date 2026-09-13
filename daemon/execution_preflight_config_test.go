@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -102,7 +103,7 @@ func TestPreflightConfigCleanupIsGenerationSafe(t *testing.T) {
 		t.Fatal(err)
 	}
 	registry := newPreflightConfigRegistry()
-	lease := preflightConfigLease{sessionID: "session-generation", files: []preflightOwnedFile{{path: path, info: info, owned: true}}}
+	lease := preflightConfigLease{sessionID: "session-generation", files: []preflightOwnedFile{{path: path, rootDir: filepath.Dir(path), name: filepath.Base(path), info: info, owned: true}}}
 	generation, reserved := registry.reserve("session-generation")
 	if !reserved || !registry.complete("session-generation", generation, lease) {
 		t.Fatal("install failed")
@@ -118,6 +119,34 @@ func TestPreflightConfigCleanupIsGenerationSafe(t *testing.T) {
 	}
 	if _, err := os.Stat(path); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("owned file survived cleanup: %v", err)
+	}
+}
+
+func TestPreflightConfigCleanupCannotEscapeOwnedRoot(t *testing.T) {
+	t.Parallel()
+	dir := t.TempDir()
+	rootDir := filepath.Join(dir, "owned")
+	if err := os.Mkdir(rootDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	outside := filepath.Join(dir, "outside-token")
+	if err := os.WriteFile(outside, []byte("bearer"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	info, err := os.Stat(outside)
+	if err != nil {
+		t.Fatal(err)
+	}
+	lease := preflightConfigLease{sessionID: "session-escape", files: []preflightOwnedFile{{
+		path:    outside,
+		rootDir: rootDir,
+		name:    filepath.Join("..", filepath.Base(outside)),
+		info:    info,
+		owned:   true,
+	}}}
+	lease.cleanup()
+	if raw, err := os.ReadFile(outside); err != nil || string(raw) != "bearer" {
+		t.Fatalf("cleanup escaped its owned root: content=%q err=%v", raw, err)
 	}
 }
 
