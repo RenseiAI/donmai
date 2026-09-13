@@ -825,8 +825,16 @@ func (r *WorkareaArchiveRegistry) restoredLegacyV1(restoreID string) (afclient.W
 	if !validArchiveID(restoreID) {
 		return afclient.WorkareaV1{}, nil, false, nil
 	}
-	sidecarPath := filepath.Join(r.restoredDir(), restoreID+".json")
-	data, err := os.ReadFile(sidecarPath) //nolint:gosec
+	sidecarName := restoreID + ".json"
+	restoredRoot, err := os.OpenRoot(r.restoredDir())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return afclient.WorkareaV1{}, nil, false, nil
+		}
+		return afclient.WorkareaV1{}, nil, false, fmt.Errorf("read restore sidecar %q: %w", restoreID, err)
+	}
+	defer func() { _ = restoredRoot.Close() }()
+	data, err := restoredRoot.ReadFile(sidecarName)
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return afclient.WorkareaV1{}, nil, false, nil
