@@ -9,31 +9,38 @@ import (
 	"sort"
 )
 
+// Applied preflight config contract versions, source discriminators, and the
+// two fixed Donmai-owned environment targets.
 const (
 	PreflightConfigRequirementContractVersion     = "execution-preflight-config-requirement/v1"
 	PreflightConfigMaterializationContractVersion = "execution-preflight-config-materialization/v1"
 	PreflightConfigSourceOperationalEnvironment   = "operational_environment"
 	PreflightConfigSourceDaemonSessionID          = "daemon_session_id"
-	PreflightConfigSourceSessionMCPBearerFile     = "session_mcp_bearer_file"
+	PreflightConfigSourceSessionMCPBearerFile     = "session_mcp_bearer_file" //nolint:gosec // G101: public discriminator, never credential bytes.
 	PreflightConfigSessionIDTarget                = "DONMAI_SESSION_ID"
-	PreflightConfigSessionMCPBearerFileTarget     = "MCP_GATEWAY_TOKEN_FILE"
+	PreflightConfigSessionMCPBearerFileTarget     = "MCP_GATEWAY_TOKEN_FILE" //nolint:gosec // G101: public environment name, never credential bytes.
 	PreflightConfigPrivateFileMode                = "0600"
 )
 
-var preflightEnvironmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
-var preflightRequirementID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$`)
+var (
+	preflightEnvironmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
+	preflightRequirementID   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$`)
+)
 
+// PreflightConfigBindingSourceV1 selects one daemon-owned common-config source.
 type PreflightConfigBindingSourceV1 struct {
 	Kind            string `json:"kind"`
 	EnvironmentName string `json:"environmentName,omitempty"`
 	Mode            string `json:"mode,omitempty"`
 }
 
+// PreflightConfigBindingV1 maps one closed source onto an environment target.
 type PreflightConfigBindingV1 struct {
 	TargetEnv string                         `json:"targetEnv"`
 	Source    PreflightConfigBindingSourceV1 `json:"source"`
 }
 
+// PreflightConfigRequirementV1 is a trusted post-compilation config request.
 type PreflightConfigRequirementV1 struct {
 	ContractVersion          string                     `json:"contractVersion"`
 	RequirementID            string                     `json:"requirementId"`
@@ -42,6 +49,7 @@ type PreflightConfigRequirementV1 struct {
 	Bindings                 []PreflightConfigBindingV1 `json:"bindings"`
 }
 
+// PreflightConfigBindingMaterializationV1 is digest-only applied binding evidence.
 type PreflightConfigBindingMaterializationV1 struct {
 	TargetEnv           string                         `json:"targetEnv"`
 	Source              PreflightConfigBindingSourceV1 `json:"source"`
@@ -51,6 +59,7 @@ type PreflightConfigBindingMaterializationV1 struct {
 	Mode                string                         `json:"mode,omitempty"`
 }
 
+// PreflightConfigMaterializationV1 binds all applied config for one requirement.
 type PreflightConfigMaterializationV1 struct {
 	ContractVersion          string                                    `json:"contractVersion"`
 	RequirementID            string                                    `json:"requirementId"`
@@ -91,6 +100,7 @@ func validatePreflightConfigSource(target string, source PreflightConfigBindingS
 	return nil
 }
 
+// ValidatePreflightConfigRequirement enforces the closed source/target grammar.
 func ValidatePreflightConfigRequirement(value PreflightConfigRequirementV1) error {
 	if value.ContractVersion != PreflightConfigRequirementContractVersion || !preflightRequirementID.MatchString(value.RequirementID) {
 		return errors.New("executioncell: invalid preflight config requirement identity")
@@ -109,6 +119,7 @@ func ValidatePreflightConfigRequirement(value PreflightConfigRequirementV1) erro
 	return nil
 }
 
+// DigestPreflightConfigReference hashes every materialization field except itself.
 func DigestPreflightConfigReference(value PreflightConfigMaterializationV1) (string, error) {
 	projection := value
 	projection.ConfigReferenceDigest = ""
@@ -120,6 +131,7 @@ func DigestPreflightConfigReference(value PreflightConfigMaterializationV1) (str
 	return hex.EncodeToString(sum[:]), nil
 }
 
+// ValidatePreflightConfigMaterialization verifies digest-only applied evidence.
 func ValidatePreflightConfigMaterialization(value PreflightConfigMaterializationV1) error {
 	if value.ContractVersion != PreflightConfigMaterializationContractVersion || !preflightRequirementID.MatchString(value.RequirementID) {
 		return errors.New("executioncell: invalid preflight config materialization identity")
@@ -152,6 +164,7 @@ func ValidatePreflightConfigMaterialization(value PreflightConfigMaterialization
 	return nil
 }
 
+// ValidatePreflightConfigMaterializations verifies unique requirement ordering.
 func ValidatePreflightConfigMaterializations(values []PreflightConfigMaterializationV1) error {
 	if len(values) == 0 {
 		return errors.New("executioncell: preflight config materializations are required")

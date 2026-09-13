@@ -124,14 +124,14 @@ func TestPreflightConfigCleanupIsGenerationSafe(t *testing.T) {
 func TestMaterializeExecutionPreflightConfigRefusesDivergentArtifact(t *testing.T) {
 	t.Parallel()
 	for name, prepare := range map[string]func(*testing.T) (SessionSpec, *SessionDetail, executioncell.PreflightConfigRequirementV1){
-		"bearer content": func(t *testing.T) (SessionSpec, *SessionDetail, executioncell.PreflightConfigRequirementV1) {
+		"bearer content": func(_ *testing.T) (SessionSpec, *SessionDetail, executioncell.PreflightConfigRequirementV1) {
 			raw := json.RawMessage(`{"mcpAuthToken":"source-bearer"}`)
 			digest, _ := executioncell.DigestOperationalPayload(raw)
 			return SessionSpec{SessionID: "session-divergent"}, &SessionDetail{SessionID: "session-divergent", OperationalPayload: raw, McpAuthToken: "different-bearer"}, executioncell.PreflightConfigRequirementV1{ContractVersion: executioncell.PreflightConfigRequirementContractVersion, RequirementID: "example.file/v1", AuthorityBindingDigest: strings.Repeat("a", 64), OperationalPayloadDigest: digest, Bindings: []executioncell.PreflightConfigBindingV1{{TargetEnv: "MCP_GATEWAY_TOKEN_FILE", Source: executioncell.PreflightConfigBindingSourceV1{Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, Mode: "0600"}}}}
 		},
 		"existing file mode": func(t *testing.T) (SessionSpec, *SessionDetail, executioncell.PreflightConfigRequirementV1) {
 			path := t.TempDir() + "/wide"
-			if err := os.WriteFile(path, []byte("bearer"), 0o644); err != nil {
+			if err := os.WriteFile(path, []byte("bearer"), 0o644); err != nil { //nolint:gosec // Intentional overbroad-mode refusal fixture.
 				t.Fatal(err)
 			}
 			raw := json.RawMessage(`{"mcpAuthToken":"bearer"}`)

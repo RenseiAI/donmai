@@ -36,6 +36,8 @@ type ProviderView struct {
 	configRequirements ExecutionPreflightConfigRequirementResolver
 }
 
+// ExecutionPreflightConfigRequirementContext is the secret-free, fully
+// admitted context passed to a trusted process-registered resolver.
 type ExecutionPreflightConfigRequirementContext struct {
 	SessionID                string
 	OperationalEnvironment   map[string]string
@@ -47,6 +49,7 @@ type ExecutionPreflightConfigRequirementContext struct {
 	CompiledReceipt          executioncell.HostAdaptationReceipt
 }
 
+// ExecutionPreflightConfigRequirementResolver returns closed common-config requirements.
 type ExecutionPreflightConfigRequirementResolver func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error)
 
 type hostAdaptationReceipt struct {

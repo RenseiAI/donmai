@@ -149,14 +149,21 @@ func applySpecEnvironment(spec *SessionSpec, name, value string) error {
 }
 
 func verifyConfigFile(path, bearer string) (os.FileInfo, error) {
-	info, err := os.Lstat(path)
+	clean := filepath.Clean(path)
+	root, err := os.OpenRoot(filepath.Dir(clean))
+	if err != nil {
+		return nil, err
+	}
+	defer func() { _ = root.Close() }()
+	name := filepath.Base(clean)
+	info, err := root.Stat(name)
 	if err != nil {
 		return nil, err
 	}
 	if !info.Mode().IsRegular() || info.Mode().Perm() != 0o600 {
 		return nil, errors.New("preflight config bearer file must be regular mode 0600")
 	}
-	file, err := os.Open(path)
+	file, err := root.Open(name)
 	if err != nil {
 		return nil, err
 	}
