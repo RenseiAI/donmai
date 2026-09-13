@@ -745,6 +745,11 @@ func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error)
 	}
 	restored, _, ok, rerr := r.restoredLegacyV1(id)
 	if rerr != nil {
+		// An unreadable per-entry sidecar is a skip in list, but exact
+		// show by that id stays NotFound rather than surfacing I/O.
+		if isRestoredSidecarUnreadable(rerr) {
+			return nil, err
+		}
 		return nil, rerr
 	}
 	if ok {
@@ -777,7 +782,9 @@ type restoreLedgerSidecar struct {
 // admission, cleanup, or execution authority, and it never touches the
 // acquisition store (session-root restores re-enter through that authority
 // and are not flattened here). Unreadable or untrusted state is skipped —
-// a missing restored dir is empty, not an error.
+// a missing restored dir is empty, not an error. Only an unreadable
+// restored directory itself (not per-entry state) surfaces as an error, so
+// one bad sidecar cannot hide the rest of the ledger.
 func (r *WorkareaArchiveRegistry) listRestoredLegacyV1() ([]afclient.WorkareaSummaryV1, error) {
 	entries, err := os.ReadDir(r.restoredDir())
 	if err != nil {
@@ -794,6 +801,9 @@ func (r *WorkareaArchiveRegistry) listRestoredLegacyV1() ([]afclient.WorkareaSum
 		restoreID := strings.TrimSuffix(ent.Name(), ".json")
 		restored, manifest, ok, err := r.restoredLegacyV1(restoreID)
 		if err != nil {
+			if isRestoredSidecarUnreadable(err) {
+				continue
+			}
 			return nil, err
 		}
 		if !ok {
@@ -868,6 +878,19 @@ func (r *WorkareaArchiveRegistry) restoredLegacyV1(restoreID string) (afclient.W
 	}
 	fillRestoredRootV1(&wa, dest)
 	return wa, manifest, true, nil
+}
+
+// isRestoredSidecarUnreadable reports whether a per-entry restore-ledger
+// read failure is a filesystem readability problem (permission, I/O) as
+// opposed to a fail-closed trust decision. Trust decisions already return
+// (zero, nil, false, nil); only the hard ReadFile error path reaches here,
+// and it must not abort the whole list.
+func isRestoredSidecarUnreadable(err error) bool {
+	if err == nil {
+		return false
+	}
+	text := err.Error()
+	return strings.Contains(text, "read restore sidecar")
 }
 
 // fillRestoredRootV1 pins the committed restored root on projections whose

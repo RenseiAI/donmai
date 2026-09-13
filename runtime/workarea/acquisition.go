@@ -42,6 +42,12 @@ var ErrAcquisitionNotFound = errors.New("runtime/workarea: acquisition not found
 
 var errAcquisitionStoreDormant = errors.New("runtime/workarea: acquisition store is dormant")
 
+// readExistingReadyRecordsSwapHook is a test-only seam invoked after the
+// readback pins and shared-locks the store root, before it scans records.
+// Tests use it to swap the path-visible store directory and prove the scan
+// still consumes the pinned root rather than a replacement.
+var readExistingReadyRecordsSwapHook func()
+
 // AcquisitionState is the durable generation lifecycle.
 type AcquisitionState string
 
@@ -1106,7 +1112,17 @@ func ReadExistingReadyRecordsFound(parent string) ([]AcquisitionRecord, bool, er
 	if err != nil || !exists || anchor != storeRecord {
 		return nil, false, fmt.Errorf("runtime/workarea: acquisition store parent anchor changed")
 	}
+	// The scan below reuses the already-open identity-verified shared-locked
+	// root only. It must never reopen the store directory by path: a
+	// concurrent replacement mounted at the same path after validation
+	// would otherwise be consumed. readExistingReadyRecordsSwapHook is a
+	// test-only seam exercising exactly that swap.
+	if readExistingReadyRecordsSwapHook != nil {
+		readExistingReadyRecordsSwapHook()
+	}
 	reader := &AcquisitionStore{parent: abs, dir: filepath.Join(abs, acquisitionStoreDirName), storeID: storeRecord.StoreID}
+	reader.root = root
+	reader.parentRoot = parentRoot
 	directory, err := root.Open(".")
 	if err != nil {
 		return nil, false, err
@@ -1118,13 +1134,6 @@ func ReadExistingReadyRecordsFound(parent string) ([]AcquisitionRecord, bool, er
 	if readErr != nil {
 		return nil, false, readErr
 	}
-	storeRoot, err := parentRoot.OpenRoot(acquisitionStoreDirName)
-	if err != nil {
-		return nil, false, fmt.Errorf("runtime/workarea: open acquisition store root: %w", err)
-	}
-	defer func() { _ = storeRoot.Close() }()
-	reader.root = storeRoot
-	reader.parentRoot = parentRoot
 	var records []AcquisitionRecord
 	for _, entry := range entries {
 		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "wac_") {

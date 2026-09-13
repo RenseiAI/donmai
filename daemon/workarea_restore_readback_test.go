@@ -375,3 +375,51 @@ func TestRestoreSessionRoot_ReadbackPreservesCanonicalIdentity(t *testing.T) {
 		t.Errorf("session-root manifest was flattened to legacy-flat")
 	}
 }
+
+// TestRestoreLegacy_UnreadableSidecarSkipsEntryKeepsValidRows is the list
+// availability control: one I/O-unreadable per-entry sidecar must not abort
+// ListV1 — the valid archive row and the valid restore row still list,
+// and the bad id stays NotFound on exact show.
+func TestRestoreLegacy_UnreadableSidecarSkipsEntryKeepsValidRows(t *testing.T) {
+	root := t.TempDir()
+	writeFixtureArchive(t, root, fixtureArchive{
+		id: "wa-list-avail", tree: map[string]string{"hello.txt": "world"},
+	})
+	reg := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	restored, _, err := reg.RestoreV1("wa-list-avail", afclient.WorkareaRestoreRequest{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	// Plant an I/O-invalid per-entry sidecar: a directory at the .json path
+	// makes ReadFile fail for every user (no chmod/root ambiguity).
+	badPath := filepath.Join(reg.restoredDir(), "wa-list-avail-restore-zzz.json")
+	if err := os.MkdirAll(badPath, 0o700); err != nil {
+		t.Fatal(err)
+	}
+
+	active, archived, err := reg.ListV1()
+	if err != nil {
+		t.Fatalf("list: %v", err)
+	}
+	seenRestore := false
+	for _, entry := range active {
+		if entry.ID == restored.ID {
+			seenRestore = true
+		}
+	}
+	if !seenRestore {
+		t.Fatalf("valid restore row %q hidden by bad sidecar (active=%d)", restored.ID, len(active))
+	}
+	seenArchive := false
+	for _, entry := range archived {
+		if entry.ID == "wa-list-avail" {
+			seenArchive = true
+		}
+	}
+	if !seenArchive {
+		t.Fatalf("valid archive row hidden by bad sidecar (archived=%d)", len(archived))
+	}
+	if _, err := reg.GetV1("wa-list-avail-restore-zzz"); !errors.Is(err, ErrArchiveNotFound) {
+		t.Fatalf("bad sidecar GetV1 = %v, want ErrArchiveNotFound", err)
+	}
+}

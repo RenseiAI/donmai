@@ -926,3 +926,66 @@ func TestReadExistingReadyRecordsSharesLockWithExclusiveWriter(t *testing.T) {
 		t.Fatalf("readback = (%d, %v), want (1, nil)", len(records), readErr)
 	}
 }
+
+func TestReadExistingReadyRecordsIgnoresPathSwapAfterPin(t *testing.T) {
+	parent := t.TempDir()
+	committed := committedReadyForReadback(t, parent)
+	before := snapshotAcquisitionParent(t, parent)
+
+	// Swap the path-visible store directory after the reader pins and locks
+	// the original root: rename the verified store aside and plant a forged
+	// store at the same path. The scan must still return the pinned
+	// original, never the replacement.
+	readExistingReadyRecordsSwapHook = func() {
+		storeDir := filepath.Join(parent, acquisitionStoreDirName)
+		if err := os.Rename(storeDir, storeDir+".orig"); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.Mkdir(storeDir, 0o700); err != nil {
+			t.Error(err)
+			return
+		}
+		if err := os.MkdirAll(filepath.Join(storeDir, "wac_forged"), 0o700); err != nil {
+			t.Error(err)
+		}
+	}
+	t.Cleanup(func() {
+		readExistingReadyRecordsSwapHook = nil
+		// Restore the verified store so TempDir cleanup and later reads see
+		// the original state; the assertion below runs before this.
+		_ = os.RemoveAll(filepath.Join(parent, acquisitionStoreDirName))
+		_ = os.Rename(filepath.Join(parent, acquisitionStoreDirName+".orig"), filepath.Join(parent, acquisitionStoreDirName))
+	})
+
+	records, err := ReadExistingReadyRecords(parent)
+	if err != nil {
+		t.Fatalf("read: %v", err)
+	}
+	if len(records) != 1 || records[0].AcquisitionID != committed.AcquisitionID {
+		t.Fatalf("readback consumed the swapped store: %+v", records)
+	}
+	// The first read returned the pinned original while the path showed
+	// only the forgery, so a path re-acquisition would have returned zero
+	// rows or the forged row instead. The second read below runs while the
+	// forgery is still swapped in: it re-pins through the path and must
+	// fail closed (incomplete forged identity), proving the first result
+	// came from the pinned root rather than the path.
+	if _, err := ReadExistingReadyRecords(parent); err == nil {
+		t.Fatal("second read through the swapped path should fail closed")
+	}
+	// The forged directory is still swapped in at this point (cleanup
+	// restores the original afterwards). Restore the original store now
+	// and prove a fresh read still finds the same row byte-identical to
+	// the pre-read snapshot.
+	readExistingReadyRecordsSwapHook = nil
+	_ = os.RemoveAll(filepath.Join(parent, acquisitionStoreDirName))
+	if err := os.Rename(filepath.Join(parent, acquisitionStoreDirName+".orig"), filepath.Join(parent, acquisitionStoreDirName)); err != nil {
+		t.Fatal(err)
+	}
+	reread, err := ReadExistingReadyRecords(parent)
+	if err != nil || len(reread) != 1 || reread[0].AcquisitionID != committed.AcquisitionID {
+		t.Fatalf("reread after swap restore = (%v, %v)", reread, err)
+	}
+	assertAcquisitionParentUnchanged(t, parent, before)
+}
