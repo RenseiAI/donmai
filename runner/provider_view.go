@@ -49,51 +49,52 @@ type hostAdaptationReceipt struct {
 	Denial          string                       `json:"denial,omitempty"`
 }
 
-// PreflightExecution is the host-process compiler used by daemon before its
-// credential hook. It consumes the same raw operational projection and closed
-// execution-cell contracts as the child runner.
-func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error) {
-	var wire struct {
-		SessionID               string          `json:"sessionId"`
-		WorkerID                string          `json:"workerId"`
-		AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
-		ClaimReceipt            json.RawMessage `json:"claimReceipt"`
-		EffectiveCell           json.RawMessage `json:"effectiveCell"`
-		ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
-		OperationalPayload      json.RawMessage `json:"operationalPayload"`
-		// ModelProfile and ResolvedProfile are the daemon SessionDetail's
-		// sibling profile fields (never embedded in OperationalPayload — see
-		// daemon.go's preflightInput). Reconciled into qw.ResolvedProfile
-		// below via the SAME logic the spawned child applies
-		// (afcli.detailToQueuedWork → runner.ReconcileResolvedProfile), so
-		// the plan this function compiles is over the identical Model/
-		// Effort/ProviderConfig/Endpoint the child will materialize.
-		ModelProfile    json.RawMessage `json:"modelProfile"`
-		ResolvedProfile json.RawMessage `json:"resolvedProfile"`
-		// StageBudget is another SessionDetail sibling. Autonomous stage
-		// dispatch renders it into prompt authority, so preflight must apply
-		// the same reconciliation as the spawned child.
-		StageBudget json.RawMessage `json:"stageBudget"`
-	}
+type providerViewPreflightWire struct {
+	SessionID               string          `json:"sessionId"`
+	WorkerID                string          `json:"workerId"`
+	AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
+	ClaimReceipt            json.RawMessage `json:"claimReceipt"`
+	EffectiveCell           json.RawMessage `json:"effectiveCell"`
+	ExecutionRuntimeBinding json.RawMessage `json:"executionRuntimeBinding"`
+	OperationalPayload      json.RawMessage `json:"operationalPayload"`
+	ModelProfile            json.RawMessage `json:"modelProfile"`
+	ResolvedProfile         json.RawMessage `json:"resolvedProfile"`
+	StageBudget             json.RawMessage `json:"stageBudget"`
+}
+
+func decodeProviderViewPreflightWork(detailJSON json.RawMessage) (QueuedWork, executioncell.RuntimeBinding, error) {
+	var wire providerViewPreflightWire
 	if err := json.Unmarshal(detailJSON, &wire); err != nil {
-		return nil, err
+		return QueuedWork{}, executioncell.RuntimeBinding{}, err
 	}
 	var qw QueuedWork
 	if err := json.Unmarshal(wire.OperationalPayload, &qw); err != nil {
-		return nil, fmt.Errorf("decode host operational payload: %w", err)
+		return QueuedWork{}, executioncell.RuntimeBinding{}, fmt.Errorf("decode host operational payload: %w", err)
 	}
 	qw.SessionID, qw.WorkerID = wire.SessionID, wire.WorkerID
 	qw.AdmissionReceipt, qw.ClaimReceipt, qw.EffectiveCell = wire.AdmissionReceipt, wire.ClaimReceipt, wire.EffectiveCell
 	qw.ExecutionRuntimeBinding, qw.OperationalPayload = wire.ExecutionRuntimeBinding, wire.OperationalPayload
-	qw, err := ReconcileResolvedProfile(qw, wire.ModelProfile, wire.ResolvedProfile)
+	var err error
+	qw, err = ReconcileResolvedProfile(qw, wire.ModelProfile, wire.ResolvedProfile)
 	if err != nil {
-		return nil, fmt.Errorf("decode host resolved profile: %w", err)
+		return QueuedWork{}, executioncell.RuntimeBinding{}, fmt.Errorf("decode host resolved profile: %w", err)
 	}
 	qw, err = ReconcileStageBudget(qw, wire.StageBudget)
 	if err != nil {
-		return nil, fmt.Errorf("decode host stage budget: %w", err)
+		return QueuedWork{}, executioncell.RuntimeBinding{}, fmt.Errorf("decode host stage budget: %w", err)
 	}
 	binding, err := executioncell.DecodeRuntimeBinding(wire.ExecutionRuntimeBinding)
+	if err != nil {
+		return QueuedWork{}, executioncell.RuntimeBinding{}, err
+	}
+	return qw, binding, nil
+}
+
+// PreflightExecution is the host-process compiler used by daemon before its
+// credential hook. It consumes the same raw operational projection and closed
+// execution-cell contracts as the child runner.
+func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawMessage, error) {
+	qw, binding, err := decodeProviderViewPreflightWork(detailJSON)
 	if err != nil {
 		return nil, err
 	}
@@ -147,6 +148,48 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	}
 	receipt.Decision = "ready"
 	return encode(nil)
+}
+
+// ValidateRetainedExecution verifies current sibling mirrors against the exact
+// retained plan through the same reconciliation, selection and preparation
+// path used by fresh preflight. It never calls CompilePreparedHarness and never
+// returns replacement receipt bytes.
+func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, receipt json.RawMessage) error {
+	if v == nil || v.reg == nil {
+		return fmt.Errorf("runner: retained execution validator is unavailable")
+	}
+	qw, _, err := decodeProviderViewPreflightWork(detailJSON)
+	if err != nil {
+		return err
+	}
+	qw.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
+	admission, err := v.reg.preflightAdmissionReceipt(qw, true)
+	if err != nil {
+		return err
+	}
+	if admission == nil || admission.selection.Provider == nil {
+		return fmt.Errorf("runner: retained execution requires explicit receipt admission")
+	}
+	repositoryDeclaration, _, err := resolveRepositoryWorkarea(qw, admission.selection.Provider)
+	if err != nil {
+		return err
+	}
+	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate)
+	if err != nil {
+		return err
+	}
+	source = ReconcileRepositorySandbox(source, repositoryDeclaration)
+	plan, err := preparedHarnessFromWork(qw)
+	if err != nil {
+		return err
+	}
+	source.PreparedHarness = plan
+	harness, ok := admission.selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return fmt.Errorf("runner: selected provider has no exact harness manifest")
+	}
+	_, err = agent.ApplyPreparedHarness(source, harness.Manifest())
+	return err
 }
 
 // NewProviderView returns a ProviderView backed by reg, with no additional-

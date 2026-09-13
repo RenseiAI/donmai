@@ -207,6 +207,24 @@ func TestPreflightAndSpawnAgreeForAutonomousStageDispatchWithMatchingSiblingBudg
 				}
 			})
 
+			t.Run("retained receipt revalidates current sibling without recompiling", func(t *testing.T) {
+				view := NewProviderView(registry)
+				matching := rawJSONForRunner(t, detail(&tt.budget, true))
+				receipt, err := view.PreflightExecution(matching)
+				if err != nil {
+					t.Fatalf("fresh PreflightExecution: %v receipt=%s", err, receipt)
+				}
+				if err := view.ValidateRetainedExecution(matching, receipt); err != nil {
+					t.Fatalf("unchanged retained execution: %v", err)
+				}
+				different := tt.budget
+				different.MaxTokens++
+				changed := rawJSONForRunner(t, detail(&different, true))
+				if err := view.ValidateRetainedExecution(changed, receipt); err == nil {
+					t.Fatal("changed sibling mirror reused retained receipt")
+				}
+			})
+
 			if provider.spawnCalls.Load() != 0 {
 				t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
 			}
