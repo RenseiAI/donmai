@@ -7,7 +7,7 @@ import "github.com/RenseiAI/donmai/agent"
 
 // LegacyAliasMap maps each back-compat ProviderName to its canonical
 // (harness, endpoint, host) cell. Introduced in P1 but NOT YET consumed —
-// buildAgentRunRegistry (donmai) and the rensei-tui fork keep routing by
+// buildAgentRunRegistry and downstream embedders keep routing by
 // ProviderName until P1b swaps them to this map. Generated from the
 // hand-authored validCells' legacyProviderId anchors.
 var LegacyAliasMap = map[agent.ProviderName]CellKey{

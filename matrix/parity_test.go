@@ -19,7 +19,7 @@ import (
 //
 // Treat the generated files as committed artifacts: rule 1 regenerates into
 // buffers and byte-compares against the committed capability-matrix.json /
-// harnesses.json / endpoints.json / matrix.json.
+// harnesses.json / endpoints.json / matrix.json / capability-realizations.json.
 
 // buildArtifacts is the shared regenerate helper for the byte-identical rule.
 func buildArtifacts(t *testing.T) *Artifacts {
@@ -39,7 +39,7 @@ func buildArtifacts(t *testing.T) *Artifacts {
 // byte-identical to the committed artifacts. If this fails, run `make generate`.
 func TestParity_ByteIdenticalToFreshGenerate(t *testing.T) {
 	arts := buildArtifacts(t)
-	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen} {
+	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen, FileCapabilityRealizations} {
 		want, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read committed %s: %v (did you run `make generate`?)", name, err)
@@ -54,6 +54,9 @@ func TestParity_ByteIdenticalToFreshGenerate(t *testing.T) {
 	// generator writes.
 	if _, err := os.Stat(filepath.Join(".", FileRegistryGen)); err != nil {
 		t.Fatalf("registry artifact missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".", FileCapabilityRealizations)); err != nil {
+		t.Fatalf("capability realization artifact missing: %v", err)
 	}
 }
 

@@ -1,6 +1,9 @@
 package matrix
 
 import (
+	"context"
+	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 
@@ -9,7 +12,7 @@ import (
 
 func TestCompileCapabilityRealizationsConsumesObservation(t *testing.T) {
 	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "one"}}
-	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
+	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v5", Mode: agent.PromptModeHumanControlled, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -25,6 +28,159 @@ func TestCompileCapabilityRealizationsConsumesObservation(t *testing.T) {
 	o.ObservationDigest = ""
 	if _, err := CompileCapabilityRealizations([]CapabilityRealizationSource{{Declaration: d, Observation: o}}); err == nil {
 		t.Fatal("missing fixture surface compiled")
+	}
+}
+
+func TestCompileCapabilityRealizationEvidenceExecutesFixture(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	calls := 0
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		calls++
+		if declaration.AdapterVersion != "pi/interactive/tool-lifecycle-v5" {
+			t.Fatalf("executor declaration=%+v", declaration)
+		}
+		return sourceExecution(t, declaration), nil
+	})
+	rows, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source})
+	if err != nil || calls != 1 || len(rows) != 1 {
+		t.Fatalf("rows=%+v calls=%d err=%v", rows, calls, err)
+	}
+	if !rows[0].ProductionEligible || rows[0].EvidenceTier != agent.CapabilityEvidenceSmoked {
+		t.Fatalf("eligibility=%+v", rows[0])
+	}
+}
+
+func TestCompileCapabilityRealizationEvidenceRefusesMissingSkippedAndWrongEvidence(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source}); err == nil {
+		t.Fatal("missing fixture executor compiled")
+	}
+	source.Executor = CapabilityFixtureExecutorFunc(func(context.Context, agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		return agent.CapabilityFixtureExecution{}, ErrCapabilityFixtureSkipped
+	})
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source}); !errors.Is(err, ErrCapabilityFixtureSkipped) {
+		t.Fatalf("skipped fixture error=%v", err)
+	}
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		execution := sourceExecution(t, declaration)
+		execution.Observation.AdapterVersion = "pi/interactive/tool-lifecycle-v4"
+		return execution, nil
+	})
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source}); err == nil {
+		t.Fatal("wrong-adapter evidence compiled")
+	}
+}
+
+func TestBuildWithCapabilityRealizationsKeepsCapabilityAndChannelAxesIndependent(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		return sourceExecution(t, declaration), nil
+	})
+	built, err := BuildWithCapabilityRealizations(context.Background(), []CapabilityRealizationEvidenceSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(built.Capabilities) != 1 || !built.Capabilities[0].ProductionEligible {
+		t.Fatalf("derived capabilities=%+v", built.Capabilities)
+	}
+	var pi HarnessRow
+	for _, harness := range built.Harnesses {
+		if harness.Name == agent.HarnessPi {
+			pi = harness
+		}
+	}
+	var interactiveProfile agent.ToolLifecycleProfile
+	for _, profile := range pi.ToolLifecycle {
+		if profile.ID == "pi/interactive/tool-lifecycle-v5" {
+			interactiveProfile = profile
+		}
+	}
+	if interactiveProfile.ID != "pi/interactive/tool-lifecycle-v5" {
+		t.Fatalf("current Pi interactive profile=%q, want v5", interactiveProfile.ID)
+	}
+	if pi.Caps.AcceptsMcpServerSpec || interactiveProfile.ProductionEligible {
+		t.Fatalf("coarse channel/profile unexpectedly changed: %+v", pi)
+	}
+	if len(built.Matrix.Realizations) != 1 || len(built.Matrix.Capabilities) != 1 {
+		t.Fatalf("full matrix omitted derived axes: %+v", built.Matrix)
+	}
+}
+
+func TestRenderedCapabilityEvidenceBuildsRuntimeRegistryWithoutExecutingFixture(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	executions := 0
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		executions++
+		return sourceExecution(t, declaration), nil
+	})
+	built, err := BuildWithCapabilityRealizations(context.Background(), []CapabilityRealizationEvidenceSource{source})
+	if err != nil {
+		t.Fatal(err)
+	}
+	artifacts, err := built.Render()
+	if err != nil {
+		t.Fatal(err)
+	}
+	var document struct {
+		Realizations []agent.CompiledCapabilityRealizationEvidence `json:"realizations"`
+		Capabilities []CapabilityEligibilityRow                    `json:"capabilities"`
+	}
+	if err := json.Unmarshal(artifacts.Files[FileCapabilityRealizations], &document); err != nil {
+		t.Fatal(err)
+	}
+	if executions != 1 || len(document.Realizations) != 1 || len(document.Capabilities) != 1 {
+		t.Fatalf("executions=%d document=%+v", executions, document)
+	}
+	registry, err := agent.NewCapabilityRealizationRegistryFromEvidence(document.Realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if executions != 1 {
+		t.Fatal("runtime artifact validation re-executed the fixture")
+	}
+	declaration := source.Declaration
+	if _, ok := registry.Resolve(declaration.CapabilityID, declaration.HarnessID, declaration.AdapterVersion, declaration.Mode); !ok {
+		t.Fatal("generated row did not reach runtime registry")
+	}
+}
+
+func TestCompileCapabilityRealizationEvidenceRejectsDuplicateTuple(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		return sourceExecution(t, declaration), nil
+	})
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source, source}); err == nil {
+		t.Fatal("duplicate evidence tuple compiled")
+	}
+}
+
+func realizationEvidenceFixture(t *testing.T, capability string, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) CapabilityRealizationEvidenceSource {
+	t.Helper()
+	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "one"}}
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: capability, HarnessID: harness, AdapterVersion: adapter, Mode: mode, RecipeID: "recipe/v1",
+		Entries:         []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}},
+		DeclaredSurface: surface,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return CapabilityRealizationEvidenceSource{Declaration: declaration}
+}
+
+func sourceExecution(t *testing.T, declaration agent.CapabilityRealizationDeclaration) agent.CapabilityFixtureExecution {
+	t.Helper()
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+		Declaration: declaration, FixtureID: "real-binary", BinaryDigest: strings.Repeat("a", 64),
+		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: strings.Repeat("b", 64)}},
+		ObservedSurface:  declaration.Recipe.DeclaredSurface,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return agent.CapabilityFixtureExecution{
+		Producer:    agent.CapabilityFixtureProducer{ID: "example.real-binary-fixture/v1", Source: []byte("actual fixture producer source"), ReleaseGate: "real-binary-no-skip"},
+		Observation: observation,
 	}
 }
 

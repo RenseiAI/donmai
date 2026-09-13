@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.1",
+  "schemaVersion": "p1.2",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
@@ -791,7 +791,7 @@
           "productionEligible": false
         },
         {
-          "id": "pi/interactive/tool-lifecycle-v4",
+          "id": "pi/interactive/tool-lifecycle-v5",
           "mode": "human_controlled",
           "toolPluginDelivery": "pi_additional_extension_registration",
           "mcpDelivery": "unsupported",
@@ -1779,5 +1779,7 @@
       "pinnedVersion": "0.80.10",
       "verifiedAgainst": "0.80.10"
     }
-  ]
+  ],
+  "realizations": [],
+  "capabilities": []
 }
