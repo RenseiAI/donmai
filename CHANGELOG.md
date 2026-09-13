@@ -14,10 +14,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - **Safe capability fixture preflight.** Duplicate or malformed capability
   declarations are rejected before any fixture runs; unique inputs execute
-  once in canonical order while retaining evidence validation.
+  once and evidence retains canonical ordering.
 - **Cancelable long-running workarea restores.** Large restores can run for up
-  to two minutes while honoring caller cancellation, and ordinary client
-  requests retain their existing ten-second timeout.
+  to two minutes while honoring caller cancellation and shorter caller
+  deadlines; ordinary client requests retain their existing ten-second timeout.
 
 ## v0.72.38 — 2026-09-13
 
