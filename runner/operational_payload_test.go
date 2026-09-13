@@ -47,6 +47,7 @@ func fullOperationalFixture() QueuedWork {
 	qw.ResolvedProfile.Effort = agent.EffortHigh
 	qw.ResolvedProfile.CredentialID = "credential-ref"
 	qw.ResolvedProfile.ProviderConfig = map[string]any{"policy": "strict", "temperature": 0.25}
+	qw.Env = map[string]string{"PUBLIC_SESSION_FEATURE": "enabled"}
 	qw.Branch = "agent/ren-2034"
 	lease := workarea.DefaultTerminalLeaseRequest()
 	qw.TerminalWorkareaLease = &lease
@@ -69,7 +70,7 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 	}
 	sort.Strings(actualKeys)
 	expectedKeys := []string{
-		"allowedTools", "body", "branch", "codeIntel", "disallowedTools", "initialPrompt", "interviewBudget",
+		"allowedTools", "body", "branch", "codeIntel", "disallowedTools", "env", "initialPrompt", "interviewBudget",
 		"interviewDefinition", "issueId", "issueIdentifier", "kits", "linearSessionId", "mcpServers", "memoryBlock",
 		"mentionContext", "mode", "organizationId", "parentContext", "projectName", "promptContext", "providerSessionId",
 		"ref", "repository", "resolvedProfile", "sessionId", "sessionName", "skills", "stageBudget", "stageId", "stageLifecycle",
@@ -82,9 +83,53 @@ func TestOperationalPayloadArchitectureFixture(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	const architectureDigest = "897ad0e2769f774d75cd941ad15274536841ac19174fd0d0fad9342c09cbfd07"
+	const architectureDigest = "be9627f0f0e80240961ca18b1c48684291e90542a91058b62ac734976f035f4e"
 	if digest != architectureDigest {
 		t.Fatalf("architecture digest = %q, want %q; canonical=%s", digest, architectureDigest, canonical)
+	}
+}
+
+func TestOperationalEnvironmentIsDigestBoundAndDefensivelyProjected(t *testing.T) {
+	base := exactReceiptQueuedWork("operational-env-binding")
+	absent, err := CanonicalOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(absent), `"env"`) {
+		t.Fatalf("absent environment changed the legacy operational shape: %s", absent)
+	}
+	withoutEnvironment, err := DigestOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	base.Env = map[string]string{
+		"PUBLIC_SERVICE_ORIGIN": "https://service.example.invalid",
+		"SESSION_FEATURES":      `["draft"]`,
+	}
+	base.AuthToken = "worker-runtime-bearer"
+	base.McpAuthToken = "session-runtime-bearer"
+	withEnvironment, err := DigestOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if withEnvironment == withoutEnvironment {
+		t.Fatal("operational environment did not change the admission digest")
+	}
+	projected := ProjectOperationalPayload(base)
+	if !reflect.DeepEqual(projected.Env, base.Env) {
+		t.Fatalf("projected env = %#v, want %#v", projected.Env, base.Env)
+	}
+	projected.Env["SESSION_FEATURES"] = "changed"
+	if base.Env["SESSION_FEATURES"] != `["draft"]` {
+		t.Fatal("projected environment aliases queued work")
+	}
+	canonical, err := CanonicalOperationalPayload(base)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(canonical), base.AuthToken) ||
+		strings.Contains(string(canonical), base.McpAuthToken) {
+		t.Fatal("runtime bearer entered canonical operational environment")
 	}
 }
 
@@ -92,8 +137,8 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 	classifications := map[string]string{
 		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
 		"WorkareaMode": "projected", "ParentWorkareaID": "projected", "RepositoryFilter": "projected", "CacheSeedID": "projected",
-		"PermissionProfile": "projected",
-		"AdmissionReceipt":  "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
+		"PermissionProfile": "projected", "Env": "projected",
+		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
 		"WorkerID": "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",
 		// The session-scoped MCP bearer and its advisory expiry are runtime

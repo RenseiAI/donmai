@@ -5,6 +5,7 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"maps"
 	"reflect"
 	"strings"
 
@@ -28,6 +29,7 @@ type OperationalPayload struct {
 	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
+	Env                   map[string]string                 `json:"env,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
@@ -45,6 +47,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		ParentWorkareaID:      qw.ParentWorkareaID,
 		RepositoryFilter:      qw.RepositoryFilter,
 		CacheSeedID:           qw.CacheSeedID,
+		Env:                   maps.Clone(qw.Env),
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,

@@ -3,6 +3,7 @@ package runner
 import (
 	"errors"
 	"fmt"
+	"maps"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -92,7 +93,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	mcpServers := mergeMCPServers(defaults, working.McpServers)
 	spec := translateSpec(working, provider.Capabilities(), SpecInputs{
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
-		InitialContext: composition.InitialContext, MCPServers: mcpServers,
+		InitialContext: composition.InitialContext, MCPServers: mcpServers, Env: maps.Clone(working.Env),
 		Autonomous: mode == agent.PromptModeAutonomous, ProviderName: string(provider.Name()),
 	})
 	spec.PromptMode = mode

@@ -29,6 +29,10 @@ type QueuedWork struct {
 	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
+	// Env is the session-scoped operational environment carried by the trusted
+	// work source. It is part of admission digest authority and is distinct from
+	// daemon-local runtime bearers, which remain json:"-" below.
+	Env map[string]string `json:"env,omitempty"`
 
 	// AdmissionReceipt is the platform-produced, immutable execution-cell
 	// admission evidence. The daemon forwards it opaquely; the runner's closed
