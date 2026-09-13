@@ -144,6 +144,62 @@ func TestRenderedCapabilityEvidenceBuildsRuntimeRegistryWithoutExecutingFixture(
 	}
 }
 
+func TestCompileCapabilityRealizationEvidencePreflightRejectsDuplicateTupleWithoutExecuting(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	calls := 0
+	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		calls++
+		return sourceExecution(t, declaration), nil
+	})
+	_, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source, source})
+	if err == nil || !strings.Contains(err.Error(), "duplicate capability realization evidence tuple") {
+		t.Fatalf("duplicate preflight error=%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("duplicate preflight executed %d fixtures, want 0", calls)
+	}
+}
+
+func TestCompileCapabilityRealizationEvidencePreflightRejectsMalformedDeclarationWithoutExecuting(t *testing.T) {
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	calls := 0
+	source.Executor = CapabilityFixtureExecutorFunc(func(context.Context, agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		calls++
+		return agent.CapabilityFixtureExecution{}, nil
+	})
+	source.Declaration = agent.CapabilityRealizationDeclaration{}
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source}); err == nil {
+		t.Fatal("malformed preflight declaration compiled")
+	}
+	if calls != 0 {
+		t.Fatalf("malformed preflight executed %d fixtures, want 0", calls)
+	}
+}
+
+func TestCompileCapabilityRealizationEvidencePreflightKeepsUniqueExecutionOrder(t *testing.T) {
+	first := realizationEvidenceFixture(t, "example.workflow/b", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	second := realizationEvidenceFixture(t, "example.workflow/a", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
+	firstCalls, secondCalls := 0, 0
+	first.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		firstCalls++
+		return sourceExecution(t, declaration), nil
+	})
+	second.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		secondCalls++
+		return sourceExecution(t, declaration), nil
+	})
+	rows, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if firstCalls != 1 || secondCalls != 1 || len(rows) != 2 {
+		t.Fatalf("calls=%d/%d rows=%d", firstCalls, secondCalls, len(rows))
+	}
+	if rows[0].Compiled.Declaration.CapabilityID != "example.workflow/a" || rows[1].Compiled.Declaration.CapabilityID != "example.workflow/b" {
+		t.Fatalf("order=%+v", rows)
+	}
+}
+
 func TestCompileCapabilityRealizationEvidenceRejectsDuplicateTuple(t *testing.T) {
 	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
 	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
