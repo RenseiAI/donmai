@@ -33,7 +33,7 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	capabilityInputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery})
 	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
 		CapabilityID: "example.native/v1", HarnessID: agent.HarnessPi,
-		AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled,
+		AdapterVersion: "pi/interactive/tool-lifecycle-v5", Mode: agent.PromptModeHumanControlled,
 		RecipeID:        "example/inline-extension/v1",
 		Entries:         []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: capabilityInputDigest, SurfaceRefs: capabilitySurface}},
 		DeclaredSurface: capabilitySurface,

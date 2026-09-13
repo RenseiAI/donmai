@@ -191,7 +191,10 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// Bumped v3 -> v4: the registered capability-realization set now
 				// includes downstream native workflow-authoring tools. Old v3 receipts
 				// must refuse rather than silently acquiring the wider surface.
-				ID: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled,
+				// Bumped v4 -> v5: the downstream realization now binds its complete
+				// server/transport identity alongside the native tool surface. Old v4
+				// receipts must refuse rather than silently acquiring that identity.
+				ID: "pi/interactive/tool-lifecycle-v5", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryPiAdditionalExtension, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryPiInteractiveLocalToolPolicy, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,

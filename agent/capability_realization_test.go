@@ -44,7 +44,7 @@ func TestCapabilityRealizationRequiresFixtureObservedSurface(t *testing.T) {
 
 func TestCapabilityRealizationPiNativeSurfaceNeedsNoMCPServer(t *testing.T) {
 	surface := []CapabilitySurfaceIdentity{{Kind: CapabilitySurfaceNativeTool, ID: "draft_create"}}
-	_, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: "example.native/v1", HarnessID: HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: PromptModeHumanControlled, RecipeID: "example/pi/v1", Entries: []CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
+	_, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: "example.native/v1", HarnessID: HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v5", Mode: PromptModeHumanControlled, RecipeID: "example/pi/v1", Entries: []CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
 	if err != nil {
 		t.Fatal(err)
 	}

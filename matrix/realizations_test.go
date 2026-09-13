@@ -12,7 +12,7 @@ import (
 
 func TestCompileCapabilityRealizationsConsumesObservation(t *testing.T) {
 	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "one"}}
-	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v4", Mode: agent.PromptModeHumanControlled, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
+	d, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v5", Mode: agent.PromptModeHumanControlled, RecipeID: "recipe/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -72,7 +72,7 @@ func TestCompileCapabilityRealizationEvidenceRefusesMissingSkippedAndWrongEviden
 }
 
 func TestBuildWithCapabilityRealizationsKeepsCapabilityAndChannelAxesIndependent(t *testing.T) {
-	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v4", agent.PromptModeHumanControlled)
+	source := realizationEvidenceFixture(t, "example.workflow/v1", agent.HarnessPi, "pi/interactive/tool-lifecycle-v5", agent.PromptModeHumanControlled)
 	source.Executor = CapabilityFixtureExecutorFunc(func(_ context.Context, declaration agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
 		return sourceExecution(t, declaration), nil
 	})
@@ -91,9 +91,12 @@ func TestBuildWithCapabilityRealizationsKeepsCapabilityAndChannelAxesIndependent
 	}
 	var interactiveProfile agent.ToolLifecycleProfile
 	for _, profile := range pi.ToolLifecycle {
-		if profile.ID == "pi/interactive/tool-lifecycle-v4" {
+		if profile.ID == "pi/interactive/tool-lifecycle-v5" {
 			interactiveProfile = profile
 		}
+	}
+	if interactiveProfile.ID != "pi/interactive/tool-lifecycle-v5" {
+		t.Fatalf("current Pi interactive profile=%q, want v5", interactiveProfile.ID)
 	}
 	if pi.Caps.AcceptsMcpServerSpec || interactiveProfile.ProductionEligible {
 		t.Fatalf("coarse channel/profile unexpectedly changed: %+v", pi)
