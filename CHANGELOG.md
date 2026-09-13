@@ -8,6 +8,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.37 — 2026-09-13
+
+### Fixes
+
+- **Interactive cleanup now preserves unpublished project work.** Completed
+  sessions retain their workarea when project files, ignored source, stashes,
+  local branches or tags, notes, or other local-only references have not been
+  published. Clean workareas whose project state is exactly published still
+  release normally. (#604)
+
 ## v0.72.36 — 2026-09-13
 
 ### Features
