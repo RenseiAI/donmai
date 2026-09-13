@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"go/format"
+	"reflect"
 )
 
 // Artifact filenames (committed at the matrix/ package root, NOT under
@@ -31,7 +32,24 @@ type Artifacts struct {
 // friendly and stable). The registry source is the legacy-alias map only (the
 // P1b ctor list is out of scope for P1).
 func (b *Built) Render() (*Artifacts, error) {
-	capabilityMatrix, err := marshalJSON(b.Matrix)
+	if b == nil {
+		return nil, fmt.Errorf("render matrix: built matrix is nil")
+	}
+	capabilities, err := deriveCapabilityEligibilityRows(b.Realizations)
+	if err != nil {
+		return nil, fmt.Errorf("render matrix: %w", err)
+	}
+	if !reflect.DeepEqual(b.Realizations, b.canonicalRealizations) ||
+		!reflect.DeepEqual(b.Capabilities, b.canonicalCapabilities) ||
+		!reflect.DeepEqual(b.Matrix.Realizations, b.canonicalRealizations) ||
+		!reflect.DeepEqual(b.Capabilities, capabilities) ||
+		!reflect.DeepEqual(b.Matrix.Capabilities, capabilities) {
+		return nil, fmt.Errorf("render matrix: capability realization mirrors do not match canonical evidence")
+	}
+	canonicalMatrix := b.Matrix
+	canonicalMatrix.Realizations = cloneCapabilityRealizationEvidenceRows(b.canonicalRealizations)
+	canonicalMatrix.Capabilities = cloneCapabilityEligibilityRows(capabilities)
+	capabilityMatrix, err := marshalJSON(canonicalMatrix)
 	if err != nil {
 		return nil, fmt.Errorf("marshal capability-matrix: %w", err)
 	}
@@ -89,7 +107,7 @@ func (b *Built) Render() (*Artifacts, error) {
 		GeneratedFrom string                             `json:"generatedFrom"`
 		Realizations  []CapabilityRealizationEvidenceRow `json:"realizations"`
 		Capabilities  []CapabilityEligibilityRow         `json:"capabilities"`
-	}{SchemaVersion, ContractABI, GeneratedFrom, b.Realizations, b.Capabilities}
+	}{SchemaVersion, ContractABI, GeneratedFrom, canonicalMatrix.Realizations, canonicalMatrix.Capabilities}
 	realizations, err := marshalJSON(realizationsDoc)
 	if err != nil {
 		return nil, fmt.Errorf("marshal capability realizations: %w", err)

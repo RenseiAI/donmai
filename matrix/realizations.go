@@ -128,10 +128,8 @@ func CompileCapabilityRealizationEvidence(
 	sort.Slice(rows, func(i, j int) bool {
 		return realizationDeclarationLess(rows[i].Compiled.Declaration, rows[j].Compiled.Declaration)
 	})
-	for i := 1; i < len(rows); i++ {
-		if sameRealizationTuple(rows[i-1].Compiled.Declaration, rows[i].Compiled.Declaration) {
-			return nil, fmt.Errorf("duplicate capability realization evidence tuple")
-		}
+	if err := validateCapabilityRealizationEvidenceRows(rows); err != nil {
+		return nil, err
 	}
 	return rows, nil
 }
@@ -148,6 +146,56 @@ func capabilityEligibilityRows(realizations []CapabilityRealizationEvidenceRow) 
 		}
 	}
 	return rows
+}
+
+func validateCapabilityRealizationEvidenceRows(rows []CapabilityRealizationEvidenceRow) error {
+	for i, row := range rows {
+		if err := agent.ValidateCompiledCapabilityRealizationEvidence(row); err != nil {
+			return fmt.Errorf("validate capability realization evidence row %d: %w", i, err)
+		}
+		if i == 0 {
+			continue
+		}
+		previous := rows[i-1].Compiled.Declaration
+		current := row.Compiled.Declaration
+		if sameRealizationTuple(previous, current) {
+			return fmt.Errorf("duplicate capability realization evidence tuple")
+		}
+		if !realizationDeclarationLess(previous, current) {
+			return fmt.Errorf("capability realization evidence rows are not canonically ordered")
+		}
+	}
+	return nil
+}
+
+func deriveCapabilityEligibilityRows(realizations []CapabilityRealizationEvidenceRow) ([]CapabilityEligibilityRow, error) {
+	if err := validateCapabilityRealizationEvidenceRows(realizations); err != nil {
+		return nil, err
+	}
+	return capabilityEligibilityRows(realizations), nil
+}
+
+func cloneCapabilityRealizationEvidenceRows(rows []CapabilityRealizationEvidenceRow) []CapabilityRealizationEvidenceRow {
+	cloned := make([]CapabilityRealizationEvidenceRow, len(rows))
+	copy(cloned, rows)
+	for i := range cloned {
+		compiled := &cloned[i].Compiled
+		compiled.Declaration.Recipe.Entries = append([]agent.CapabilityRecipeEntry(nil), compiled.Declaration.Recipe.Entries...)
+		for entryIndex := range compiled.Declaration.Recipe.Entries {
+			entry := &compiled.Declaration.Recipe.Entries[entryIndex]
+			entry.SurfaceRefs = append([]agent.CapabilitySurfaceIdentity(nil), entry.SurfaceRefs...)
+		}
+		compiled.Declaration.Recipe.DeclaredSurface = append([]agent.CapabilitySurfaceIdentity(nil), compiled.Declaration.Recipe.DeclaredSurface...)
+		compiled.Observation.AppliedArtifacts = append([]agent.CapabilityAppliedArtifact(nil), compiled.Observation.AppliedArtifacts...)
+		compiled.Observation.ObservedSurface = append([]agent.CapabilitySurfaceIdentity(nil), compiled.Observation.ObservedSurface...)
+	}
+	return cloned
+}
+
+func cloneCapabilityEligibilityRows(rows []CapabilityEligibilityRow) []CapabilityEligibilityRow {
+	cloned := make([]CapabilityEligibilityRow, len(rows))
+	copy(cloned, rows)
+	return cloned
 }
 
 func realizationDeclarationLess(a, b agent.CapabilityRealizationDeclaration) bool {

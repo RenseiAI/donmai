@@ -95,6 +95,11 @@ type Built struct {
 	// deterministic and empty for the downstream-neutral OSS catalog.
 	Realizations []CapabilityRealizationEvidenceRow
 	Capabilities []CapabilityEligibilityRow
+	// canonicalRealizations and canonicalCapabilities bind Render to the rows
+	// produced by this Build invocation. Exported mirrors are inspectable but
+	// cannot be replaced, even with independently valid authored rows.
+	canonicalRealizations []CapabilityRealizationEvidenceRow
+	canonicalCapabilities []CapabilityEligibilityRow
 }
 
 // Build harvests the manifests, validates every hand-authored cell against
@@ -141,8 +146,13 @@ func BuildWithCapabilityRealizations(
 	if err != nil {
 		return nil, err
 	}
-	capabilities := capabilityEligibilityRows(realizations)
+	capabilities, err := deriveCapabilityEligibilityRows(realizations)
+	if err != nil {
+		return nil, err
+	}
 
+	canonicalRealizations := cloneCapabilityRealizationEvidenceRows(realizations)
+	canonicalCapabilities := cloneCapabilityEligibilityRows(capabilities)
 	m := CapabilityMatrix{
 		SchemaVersion: SchemaVersion,
 		ContractABI:   ContractABI,
@@ -157,14 +167,20 @@ func BuildWithCapabilityRealizations(
 			IssueTracker:   []any{},
 			VersionControl: []any{},
 		},
-		BinaryPins: pins, Realizations: realizations, Capabilities: capabilities,
+		BinaryPins:   pins,
+		Realizations: cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
+		Capabilities: cloneCapabilityEligibilityRows(canonicalCapabilities),
 	}
 
 	return &Built{
-		Matrix:    m,
-		Harnesses: harnesses,
-		Endpoints: endpoints,
-		AliasMap:  aliases, Realizations: realizations, Capabilities: capabilities,
+		Matrix:                m,
+		Harnesses:             harnesses,
+		Endpoints:             endpoints,
+		AliasMap:              aliases,
+		Realizations:          cloneCapabilityRealizationEvidenceRows(canonicalRealizations),
+		Capabilities:          cloneCapabilityEligibilityRows(canonicalCapabilities),
+		canonicalRealizations: canonicalRealizations,
+		canonicalCapabilities: canonicalCapabilities,
 	}, nil
 }
 
