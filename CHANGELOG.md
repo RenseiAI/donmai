@@ -8,6 +8,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.41 — 2026-09-13
+
+### Fixes
+
+- **Restored workareas remain visible through archive inspection.** Archive list
+  and show read restored source from its durable manifest after the original
+  worktree has moved, while incomplete or divergent recovery evidence remains
+  unavailable.
+- **Prepared host specs retain admitted session environment.** The canonical
+  operational projection now carries a defensively copied environment into
+  trusted preflight decorators, keeping host compilation aligned with spawn
+  without exposing runtime bearer fields or changing payloads that omit env.
+
 ## v0.72.40 — 2026-09-13
 
 ### Features
