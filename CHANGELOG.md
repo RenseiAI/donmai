@@ -8,6 +8,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.40 — 2026-09-13
+
+### Features
+
+- **Applied runtime configuration now participates in host preflight
+  acknowledgement.** Admission-bound requirements are materialized, read back,
+  and registered in the same receipt before credentials or process spawn.
+  Generation-fenced, root-confined cleanup protects newer artifacts, and the
+  closed host v2 contract plus Pi v6 profile distinguish applied configuration
+  from historical receipts.
+
 ## v0.72.39 — 2026-09-13
 
 ### Fixes
