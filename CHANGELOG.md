@@ -8,6 +8,16 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.36 — 2026-09-13
+
+### Features
+
+- **Pre-spawn receipts now bind registered authority to applied runtime
+  evidence.** Exact fixture, binary, artifact, tool-surface, adapter, recipe,
+  entry, runtime, and plan identities survive durable registration and
+  byte-identical replay, while changed or incomplete evidence is refused before
+  credentials or execution begin. (#602)
+
 ## v0.72.35 — 2026-09-12
 
 ### Fixes
