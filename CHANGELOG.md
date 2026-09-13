@@ -8,6 +8,21 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.38 — 2026-09-13
+
+### Features
+
+- **Capability realization catalogs now derive eligibility from executed
+  fixture evidence.** Generation binds the exact declaration, observation,
+  fixture producer source, release gate, and measured evidence tier into a
+  canonical realization row and separate capability axis. Artifact rendering
+  revalidates those rows and refuses caller-authored or contradictory
+  eligibility, while runtime decoding performs no fixture execution. (#606)
+- **Pi's interactive realization profile advances to v5.** Complete downstream
+  realizations can bind a server/transport identity alongside native tools;
+  old v4 receipts refuse instead of silently inheriting the wider surface, and
+  the coarse delivery and evidence claims remain unchanged. (#606)
+
 ## v0.72.37 — 2026-09-13
 
 ### Fixes
