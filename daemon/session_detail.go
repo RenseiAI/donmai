@@ -551,6 +551,13 @@ func (s *sessionDetailStore) Get(id string) (*SessionDetail, bool) {
 	return detail, ok
 }
 
+func (s *sessionDetailStore) Generation(id string) (uint64, bool) {
+	s.mu.RLock()
+	defer s.mu.RUnlock()
+	generation, ok := s.generations[id]
+	return generation, ok
+}
+
 // UpdateRuntimeCredentials refreshes the worker credentials exposed to the
 // active child processes of ONE worker identity via /api/daemon/sessions/<id>.
 // The daemon calls this after a runtime-token refresh so long-running children

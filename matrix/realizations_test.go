@@ -91,12 +91,12 @@ func TestBuildWithCapabilityRealizationsKeepsCapabilityAndChannelAxesIndependent
 	}
 	var interactiveProfile agent.ToolLifecycleProfile
 	for _, profile := range pi.ToolLifecycle {
-		if profile.ID == "pi/interactive/tool-lifecycle-v5" {
+		if profile.ID == "pi/interactive/tool-lifecycle-v6" {
 			interactiveProfile = profile
 		}
 	}
-	if interactiveProfile.ID != "pi/interactive/tool-lifecycle-v5" {
-		t.Fatalf("current Pi interactive profile=%q, want v5", interactiveProfile.ID)
+	if interactiveProfile.ID != "pi/interactive/tool-lifecycle-v6" {
+		t.Fatalf("current Pi interactive profile=%q, want v6", interactiveProfile.ID)
 	}
 	if pi.Caps.AcceptsMcpServerSpec || interactiveProfile.ProductionEligible {
 		t.Fatalf("coarse channel/profile unexpectedly changed: %+v", pi)

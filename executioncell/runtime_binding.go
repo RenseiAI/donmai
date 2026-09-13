@@ -134,6 +134,17 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 			if err := ValidatePreflightConfigMaterializations(receipt.ConfigMaterializations); err != nil {
 				return HostAdaptationReceipt{}, err
 			}
+			var planIdentity struct {
+				OperationalPayloadDigest string `json:"operationalPayloadDigest"`
+			}
+			if err := json.Unmarshal(receipt.Plan, &planIdentity); err != nil || !validSHA256(planIdentity.OperationalPayloadDigest) {
+				return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v2 plan operational digest is invalid")
+			}
+			for _, materialization := range receipt.ConfigMaterializations {
+				if materialization.OperationalPayloadDigest != planIdentity.OperationalPayloadDigest {
+					return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation config operational digest mismatch")
+				}
+			}
 		} else if configsPresent {
 			return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v1 cannot carry config materializations")
 		}

@@ -36,7 +36,7 @@ func additionalExtensionDeliveryForTest(id, content string) agent.ExtensionDeliv
 // admitted a ToolLifecycleReceipt with exactly ONE entry (id
 // "disallowed-tools", channel "disallowed_tools", delivery
 // "pi_interactive_local_tool_policy", profile
-// "pi/interactive/tool-lifecycle-v5", decision "ready"); at spawn, the
+// "pi/interactive/tool-lifecycle-v6", decision "ready"); at spawn, the
 // recomputed entries differed.
 //
 // Root cause: an embedder's additional-extension decorator

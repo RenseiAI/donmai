@@ -179,8 +179,8 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 	if err != nil {
 		return nil, err
 	}
-	if host.ContractVersion != executioncell.HostAdaptationContractVersion || host.Decision != "ready" {
-		return nil, fmt.Errorf("runner: config requirements require a ready host-adaptation/v1 receipt")
+	if (host.ContractVersion != executioncell.HostAdaptationContractVersion && host.ContractVersion != executioncell.HostAdaptationV2ContractVersion) || host.Decision != "ready" {
+		return nil, fmt.Errorf("runner: config requirements require a ready host adaptation receipt")
 	}
 	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
 		return nil, err

@@ -194,7 +194,10 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				// Bumped v4 -> v5: the downstream realization now binds its complete
 				// server/transport identity alongside the native tool surface. Old v4
 				// receipts must refuse rather than silently acquiring that identity.
-				ID: "pi/interactive/tool-lifecycle-v5", Mode: agent.PromptModeHumanControlled,
+				// Bumped v5 -> v6: applied common-config evidence is now part of the
+				// pre-registration runtime realization. Old v5 receipts remain historical
+				// evidence and cannot silently acquire that stronger claim.
+				ID: "pi/interactive/tool-lifecycle-v6", Mode: agent.PromptModeHumanControlled,
 				ToolPluginDelivery: agent.ToolDeliveryPiAdditionalExtension, MCPDelivery: agent.ToolDeliveryUnsupported,
 				NativeToolPolicyDelivery: agent.ToolDeliveryPiInteractiveLocalToolPolicy, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
 				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,

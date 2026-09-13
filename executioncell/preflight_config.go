@@ -21,6 +21,7 @@ const (
 )
 
 var preflightEnvironmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
+var preflightRequirementID = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$`)
 
 type PreflightConfigBindingSourceV1 struct {
 	Kind            string `json:"kind"`
@@ -91,7 +92,7 @@ func validatePreflightConfigSource(target string, source PreflightConfigBindingS
 }
 
 func ValidatePreflightConfigRequirement(value PreflightConfigRequirementV1) error {
-	if value.ContractVersion != PreflightConfigRequirementContractVersion || !validRuntimeRef(value.RequirementID) {
+	if value.ContractVersion != PreflightConfigRequirementContractVersion || !preflightRequirementID.MatchString(value.RequirementID) {
 		return errors.New("executioncell: invalid preflight config requirement identity")
 	}
 	if !validSHA256(value.AuthorityBindingDigest) || !validSHA256(value.OperationalPayloadDigest) || len(value.Bindings) == 0 {
@@ -120,7 +121,7 @@ func DigestPreflightConfigReference(value PreflightConfigMaterializationV1) (str
 }
 
 func ValidatePreflightConfigMaterialization(value PreflightConfigMaterializationV1) error {
-	if value.ContractVersion != PreflightConfigMaterializationContractVersion || !validRuntimeRef(value.RequirementID) {
+	if value.ContractVersion != PreflightConfigMaterializationContractVersion || !preflightRequirementID.MatchString(value.RequirementID) {
 		return errors.New("executioncell: invalid preflight config materialization identity")
 	}
 	if !validSHA256(value.AuthorityBindingDigest) || !validSHA256(value.OperationalPayloadDigest) || len(value.Bindings) == 0 {
