@@ -467,13 +467,33 @@ func (r *WorkareaArchiveRegistry) List() (active, archived []afclient.WorkareaSu
 	return active, archived, nil
 }
 
-// ListV1 returns additive session-root-v1 layout metadata.
+// ListV1 returns additive session-root-v1 layout metadata. The active set
+// unions the live pool provider (when configured) with committed
+// legacy-flat restores projected from their durable sidecars, so a restore
+// remains discoverable after registry recreation with no in-memory state.
+// A live provider entry wins on ID collision — restored rows never
+// double-count a live pool member and never confer pool authority.
 func (r *WorkareaArchiveRegistry) ListV1() (active, archived []afclient.WorkareaSummaryV1, err error) {
 	if r.activeProvider != nil {
 		active, err = r.activeWorkareasV1()
 		if err != nil {
 			return nil, nil, err
 		}
+	}
+	restored, err := r.listRestoredLegacyV1()
+	if err != nil {
+		return active, nil, err
+	}
+	seen := make(map[string]struct{}, len(active)+len(restored))
+	for _, entry := range active {
+		seen[entry.ID] = struct{}{}
+	}
+	for _, entry := range restored {
+		if _, duplicate := seen[entry.ID]; duplicate {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+		active = append(active, entry)
 	}
 	archived, err = r.listArchivesV1()
 	if err != nil {
@@ -562,17 +582,178 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 	return &legacy, nil
 }
 
-// GetV1 returns additive session-root-v1 layout metadata.
+// GetV1 returns additive session-root-v1 layout metadata. On-disk archives
+// resolve first; when the id names no archive, a committed legacy-flat
+// restore sidecar projects the restored entry. Archive corruption is never
+// masked by the restore fallback — only a clean not-found falls through.
 func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error) {
 	if err := requireValidArchiveID("get archive", id); err != nil {
 		return nil, err
 	}
 	manifest, err := r.readManifest(id)
-	if err != nil {
+	if err == nil {
+		wa := manifestToWorkareaV1(id, manifest, r.treeDir(id))
+		return &wa, nil
+	}
+	if !errors.Is(err, ErrArchiveNotFound) {
 		return nil, err
 	}
-	wa := manifestToWorkareaV1(id, manifest, r.treeDir(id))
-	return &wa, nil
+	restored, _, ok, rerr := r.restoredLegacyV1(id)
+	if rerr != nil {
+		return nil, rerr
+	}
+	if !ok {
+		return nil, err
+	}
+	return &restored, nil
+}
+
+// restoreLedgerSidecar is the durable shape RestoreV1 commits beside each
+// legacy-flat restore at <restoredDir>/<restoreID>.json. The reader below
+// consumes exactly this shape; the writer stays inline in RestoreV1 so the
+// commit path is unchanged.
+type restoreLedgerSidecar struct {
+	RestoreID     string    `json:"restoreId"`
+	ArchiveID     string    `json:"archiveId"`
+	IntoSessionID string    `json:"intoSessionId,omitempty"`
+	Reason        string    `json:"reason,omitempty"`
+	RestoredAt    time.Time `json:"restoredAt"`
+}
+
+// listRestoredLegacyV1 projects committed legacy-flat restores from their
+// durable sidecars. This is a pure read projection: it confers no pool
+// admission, cleanup, or execution authority, and it never touches the
+// acquisition store (session-root restores re-enter through that authority
+// and are not flattened here). Unreadable or untrusted state is skipped —
+// a missing restored dir is empty, not an error.
+func (r *WorkareaArchiveRegistry) listRestoredLegacyV1() ([]afclient.WorkareaSummaryV1, error) {
+	entries, err := os.ReadDir(r.restoredDir())
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, nil
+		}
+		return nil, fmt.Errorf("read restored dir %q: %w", r.restoredDir(), err)
+	}
+	out := make([]afclient.WorkareaSummaryV1, 0, len(entries))
+	for _, ent := range entries {
+		if ent.IsDir() || !strings.HasSuffix(ent.Name(), ".json") {
+			continue
+		}
+		restoreID := strings.TrimSuffix(ent.Name(), ".json")
+		restored, manifest, ok, err := r.restoredLegacyV1(restoreID)
+		if err != nil {
+			return nil, err
+		}
+		if !ok {
+			continue
+		}
+		out = append(out, restoredSummaryV1(restored, manifest))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// restoredLegacyV1 resolves one committed legacy-flat restore by its fresh
+// restore ID. It returns (zero, nil, false, nil) whenever the sidecar or root is
+// absent or untrusted — corrupt sidecars, wrong identities, missing roots,
+// and symlink-escaped roots never manufacture a valid ready entry. Only an
+// unreadable restored directory itself (not per-entry state) surfaces as an
+// error, so one bad sidecar cannot hide the rest of the ledger.
+func (r *WorkareaArchiveRegistry) restoredLegacyV1(restoreID string) (afclient.WorkareaV1, *archiveManifest, bool, error) {
+	if !validArchiveID(restoreID) {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	sidecarPath := filepath.Join(r.restoredDir(), restoreID+".json")
+	data, err := os.ReadFile(sidecarPath) //nolint:gosec
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return afclient.WorkareaV1{}, nil, false, nil
+		}
+		return afclient.WorkareaV1{}, nil, false, fmt.Errorf("read restore sidecar %q: %w", restoreID, err)
+	}
+	var sidecar restoreLedgerSidecar
+	if err := json.Unmarshal(data, &sidecar); err != nil {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	if sidecar.RestoreID != restoreID || sidecar.RestoreID == "" || !validArchiveID(sidecar.ArchiveID) {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	// The restored root must be a real directory directly under the
+	// restored dir: no symlinks (escaped roots resolve outside the
+	// configured parent), no traversal (restoreID is already validated
+	// single-component, and Clean equality pins it).
+	dest := filepath.Join(r.restoredDir(), sidecar.RestoreID)
+	if filepath.Clean(dest) != dest {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	info, err := os.Lstat(dest)
+	if err != nil {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	if filepath.Dir(filepath.Clean(dest)) != filepath.Clean(r.restoredDir()) {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	// The source archive must still exist with a readable manifest — the
+	// projection describes committed lineage, not orphaned bytes.
+	manifest, err := r.readManifest(sidecar.ArchiveID)
+	if err != nil {
+		return afclient.WorkareaV1{}, nil, false, nil
+	}
+	wa := manifestToWorkareaV1(sidecar.ArchiveID, manifest, dest)
+	wa.ID = sidecar.RestoreID
+	wa.Kind = afclient.WorkareaKindActive
+	wa.Status = afclient.WorkareaStatusReady
+	if sidecar.IntoSessionID != "" {
+		wa.SessionID = sidecar.IntoSessionID
+	}
+	wa.ArchiveLocation = r.archiveDir(sidecar.ArchiveID)
+	restoredAt := sidecar.RestoredAt
+	if !restoredAt.IsZero() {
+		wa.AcquiredAt = &restoredAt
+	}
+	fillRestoredRootV1(&wa, dest)
+	return wa, manifest, true, nil
+}
+
+// fillRestoredRootV1 pins the committed restored root on projections whose
+// source manifest carries no layout schema (schemaless fixtures and pre-schema
+// archives leave WorkareaRoot empty). Schema'd manifests already project
+// their layout via manifestToWorkareaV1 and are untouched. Archive
+// list/show projections never pass through here, so on-disk archive rows are
+// byte-identical to before.
+func fillRestoredRootV1(wa *afclient.WorkareaV1, dest string) {
+	if wa.WorkareaRoot == "" {
+		wa.WorkareaRoot = dest
+	}
+	if wa.RepositoryWorktreePath == "" {
+		wa.RepositoryWorktreePath = dest
+	}
+	if wa.Path == "" {
+		wa.Path = dest
+	}
+}
+
+// the active-only fields lookupActiveByID serves for live pool members.
+// Size and source-provider come from the source archive manifest — the
+// inspect projection (WorkareaV1) carries neither field.
+func restoredSummaryV1(wa afclient.WorkareaV1, manifest *archiveManifest) afclient.WorkareaSummaryV1 {
+	var sizeBytes int64
+	var sourceProvider string
+	if manifest != nil {
+		sizeBytes = manifest.SizeBytes
+		sourceProvider = manifest.SourceProvider
+	}
+	return afclient.WorkareaSummaryV1{
+		ID: wa.ID, Kind: afclient.WorkareaKindActive, ProviderID: wa.ProviderID,
+		SessionID: wa.SessionID, ProjectID: wa.ProjectID, Status: afclient.WorkareaStatusReady,
+		Ref: wa.Ref, Repository: wa.Repository, WorkareaRoot: wa.WorkareaRoot,
+		RepositoryWorktreePath: wa.RepositoryWorktreePath, Repositories: append([]afclient.WorkareaRepository(nil), wa.Repositories...),
+		SizeBytes: sizeBytes, SourceProvider: sourceProvider,
+		AcquiredAt: wa.AcquiredAt, ReleasedAt: wa.ReleasedAt,
+	}
 }
 
 // Diff returns the structured per-path delta between two archives.
@@ -834,6 +1015,7 @@ func (r *WorkareaArchiveRegistry) RestoreV1(
 	wa.ArchiveLocation = r.archiveDir(archiveID)
 	now2 := now
 	wa.AcquiredAt = &now2
+	fillRestoredRootV1(&wa, dest)
 
 	return &wa, 0, nil
 }
