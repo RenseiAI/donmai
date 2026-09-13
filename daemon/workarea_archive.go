@@ -469,8 +469,10 @@ func (r *WorkareaArchiveRegistry) List() (active, archived []afclient.WorkareaSu
 
 // ListV1 returns additive session-root-v1 layout metadata. The active set
 // unions the live pool provider (when configured) with committed
-// legacy-flat restores projected from their durable sidecars, so a restore
-// remains discoverable after registry recreation with no in-memory state.
+// legacy-flat restores projected from their durable sidecars and with
+// verified archive-bound ready session-root generations read through the
+// read-only acquisition reader, so a restore remains discoverable after
+// registry recreation with no in-memory state.
 // A live provider entry wins on ID collision — restored rows never
 // double-count a live pool member and never confer pool authority.
 func (r *WorkareaArchiveRegistry) ListV1() (active, archived []afclient.WorkareaSummaryV1, err error) {
@@ -495,11 +497,133 @@ func (r *WorkareaArchiveRegistry) ListV1() (active, archived []afclient.Workarea
 		seen[entry.ID] = struct{}{}
 		active = append(active, entry)
 	}
+	ready, err := r.listReadySessionRootsV1()
+	if err != nil {
+		return active, nil, err
+	}
+	for _, entry := range ready {
+		if _, duplicate := seen[entry.ID]; duplicate {
+			continue
+		}
+		seen[entry.ID] = struct{}{}
+		active = append(active, entry)
+	}
 	archived, err = r.listArchivesV1()
 	if err != nil {
 		return active, nil, err
 	}
 	return active, archived, nil
+}
+
+// listReadySessionRootsV1 projects verified archive-bound ready
+// session-root generations through the read-only acquisition reader. This
+// is a pure read projection: it confers no pool admission, cleanup, or
+// execution authority, never opens a writable store, and never repairs or
+// recovers records. A legacy-flat-only host has no acquisition store and
+// yields no rows. Only ready records bound to an archive whose manifest is
+// present and agrees on every identity project an active row, under the
+// SAME owning workarea/session identity.
+func (r *WorkareaArchiveRegistry) listReadySessionRootsV1() ([]afclient.WorkareaSummaryV1, error) {
+	if r.worktreeParent == "" {
+		return nil, nil
+	}
+	records, found, err := workarea.ReadExistingReadyRecordsFound(r.worktreeParent)
+	if err != nil || !found {
+		if err != nil {
+			return nil, fmt.Errorf("read ready session roots: %w", err)
+		}
+		return nil, nil
+	}
+	out := make([]afclient.WorkareaSummaryV1, 0, len(records))
+	for _, record := range records {
+		if record.ArchiveID == "" || record.ArchiveDigest == "" {
+			continue
+		}
+		manifest, err := r.readManifest(record.ArchiveID)
+		if err != nil {
+			continue
+		}
+		if manifest.SchemaVersion != workareaArchiveSchemaV1 ||
+			manifest.AcquisitionID != record.AcquisitionID ||
+			manifest.WorkareaID != record.WorkareaID ||
+			manifest.SessionID != record.SessionID ||
+			manifest.StoreID != record.StoreID ||
+			manifest.TreeDigest != record.ArchiveDigest {
+			continue
+		}
+		wa := manifestToWorkareaV1(record.ArchiveID, manifest, record.FinalRoot)
+		wa.ID = record.WorkareaID
+		wa.Kind = afclient.WorkareaKindActive
+		wa.Status = afclient.WorkareaStatusReady
+		wa.SessionID = record.SessionID
+		wa.ArchiveLocation = r.archiveDir(record.ArchiveID)
+		if !record.UpdatedAt.IsZero() {
+			acquiredAt := record.UpdatedAt.UTC()
+			wa.AcquiredAt = &acquiredAt
+		}
+		out = append(out, restoredSummaryV1(wa, manifest))
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].ID < out[j].ID })
+	return out, nil
+}
+
+// liveReadyV1 resolves a verified archive-bound ready session-root
+// generation by its owning workarea identity before any archive lookup.
+// A live verified row wins over the on-disk archive record for the same
+// identity; absence yields (nil, false, nil) so archive reads fall
+// through untouched.
+func (r *WorkareaArchiveRegistry) liveReadyV1(id string) (*afclient.WorkareaV1, bool, error) {
+	ready, ok, err := r.readySessionRootV1(id)
+	if err != nil || !ok {
+		return nil, false, err
+	}
+	return &ready, true, nil
+}
+
+// readySessionRootV1 resolves one verified archive-bound ready session-root
+// generation by its owning workarea identity. It returns
+// (zero, false, nil) whenever no such verified row exists — never a
+// fallback that masks archive corruption.
+func (r *WorkareaArchiveRegistry) readySessionRootV1(id string) (afclient.WorkareaV1, bool, error) {
+	if r.worktreeParent == "" || !validArchiveID(id) {
+		return afclient.WorkareaV1{}, false, nil
+	}
+	records, found, err := workarea.ReadExistingReadyRecordsFound(r.worktreeParent)
+	if err != nil || !found {
+		if err != nil {
+			return afclient.WorkareaV1{}, false, fmt.Errorf("read ready session roots: %w", err)
+		}
+		return afclient.WorkareaV1{}, false, nil
+	}
+	for _, record := range records {
+		if record.WorkareaID != id || record.ArchiveID == "" || record.ArchiveDigest == "" {
+			continue
+		}
+		manifest, err := r.readManifest(record.ArchiveID)
+		if err != nil {
+			continue
+		}
+		if manifest.SchemaVersion != workareaArchiveSchemaV1 ||
+			manifest.AcquisitionID != record.AcquisitionID ||
+			manifest.WorkareaID != record.WorkareaID ||
+			manifest.SessionID != record.SessionID ||
+			manifest.StoreID != record.StoreID ||
+			manifest.TreeDigest != record.ArchiveDigest {
+			continue
+		}
+		wa := manifestToWorkareaV1(record.ArchiveID, manifest, record.FinalRoot)
+		wa.ID = record.WorkareaID
+		wa.Kind = afclient.WorkareaKindActive
+		wa.Status = afclient.WorkareaStatusReady
+		wa.SessionID = record.SessionID
+		wa.ArchiveLocation = r.archiveDir(record.ArchiveID)
+		if !record.UpdatedAt.IsZero() {
+			acquiredAt := record.UpdatedAt.UTC()
+			wa.AcquiredAt = &acquiredAt
+		}
+		return wa, true, nil
+	}
+	return afclient.WorkareaV1{}, false, nil
 }
 
 func (r *WorkareaArchiveRegistry) activeWorkareasV1() ([]afclient.WorkareaSummaryV1, error) {
@@ -582,12 +706,33 @@ func (r *WorkareaArchiveRegistry) Get(id string) (*afclient.Workarea, error) {
 	return &legacy, nil
 }
 
-// GetV1 returns additive session-root-v1 layout metadata. On-disk archives
-// resolve first; when the id names no archive, a committed legacy-flat
-// restore sidecar projects the restored entry. Archive corruption is never
-// masked by the restore fallback — only a clean not-found falls through.
+// ArchiveV1 returns the on-disk archive record for id without consulting
+// the restore/readback projections. It reports ErrArchiveNotFound when the
+// id names no archive and surfaces corruption instead of falling through.
+func (r *WorkareaArchiveRegistry) ArchiveV1(id string) (*afclient.WorkareaV1, error) {
+	if err := requireValidArchiveID("get archive", id); err != nil {
+		return nil, err
+	}
+	manifest, err := r.readManifest(id)
+	if err != nil {
+		return nil, err
+	}
+	wa := manifestToWorkareaV1(id, manifest, r.treeDir(id))
+	return &wa, nil
+}
+
+// GetV1 returns additive session-root-v1 layout metadata: a verified
+// archive-bound ready row wins, then the on-disk archive record, then the
+// committed legacy-flat restore projection. Archive corruption is never
+// masked by a fallback — only a clean not-found falls through.
 func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error) {
 	if err := requireValidArchiveID("get archive", id); err != nil {
+		return nil, err
+	}
+	if ready, ok, err := r.liveReadyV1(id); err != nil || ok {
+		if err == nil {
+			return ready, nil
+		}
 		return nil, err
 	}
 	manifest, err := r.readManifest(id)
@@ -602,10 +747,17 @@ func (r *WorkareaArchiveRegistry) GetV1(id string) (*afclient.WorkareaV1, error)
 	if rerr != nil {
 		return nil, rerr
 	}
+	if ok {
+		return &restored, nil
+	}
+	ready, ok, rerr := r.readySessionRootV1(id)
+	if rerr != nil {
+		return nil, rerr
+	}
 	if !ok {
 		return nil, err
 	}
-	return &restored, nil
+	return &ready, nil
 }
 
 // restoreLedgerSidecar is the durable shape RestoreV1 commits beside each

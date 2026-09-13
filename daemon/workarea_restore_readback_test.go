@@ -307,9 +307,12 @@ func TestRestoreLegacy_LiveProviderWinsWithoutDuplicating(t *testing.T) {
 }
 
 // TestRestoreSessionRoot_ReadbackPreservesCanonicalIdentity locks the
-// session-root contract slice one must not change: the restore re-enters the
-// SAME owning workarea/session identity, mints no replacement, registers no
-// fake live session, and never flattens into a legacy sidecar entry.
+// session-root contract: the restore re-enters the SAME owning
+// workarea/session identity, mints no replacement, registers no fake live
+// session, and never flattens into a legacy sidecar entry. The verified
+// ready row is discoverable through ListV1 and GetV1 under that same
+// identity; the on-disk archive record still reads as archived through
+// ArchiveV1.
 func TestRestoreSessionRoot_ReadbackPreservesCanonicalIdentity(t *testing.T) {
 	registry, _ := sessionRootArchiveFixture(t, "docs")
 	restored, _, err := registry.RestoreV1("wa_archive_metadata", afclient.WorkareaRestoreRequest{IntoSessionID: "archive-session"})
@@ -323,23 +326,37 @@ func TestRestoreSessionRoot_ReadbackPreservesCanonicalIdentity(t *testing.T) {
 		t.Fatalf("session-root restore kind/status = %q/%q, want active/ready", restored.Kind, restored.Status)
 	}
 
-	// No legacy sidecar may exist for the session-root identity, and list must
-	// not manufacture an active row for it without a live provider.
-	sidecarPath := filepath.Join(registry.restoredDir(), "wa_archive_metadata.json")
-	if _, err := os.Lstat(sidecarPath); !errors.Is(err, os.ErrNotExist) {
-		t.Fatalf("session-root restore must not write a legacy sidecar: %v", err)
-	}
+	// The verified ready row is discoverable under the same identity — no
+	// legacy sidecar, no fake live session, no replacement id.
 	active, _, err := registry.ListV1()
 	if err != nil {
 		t.Fatalf("list: %v", err)
 	}
+	seen := 0
 	for _, entry := range active {
 		if entry.ID == "wa_archive_metadata" {
-			t.Fatalf("list manufactures a fake live session for session-root identity: %+v", entry)
+			seen++
+			if entry.Kind != afclient.WorkareaKindActive || entry.Status != afclient.WorkareaStatusReady {
+				t.Fatalf("list entry kind/status = %q/%q, want active/ready", entry.Kind, entry.Status)
+			}
+			if entry.SessionID != "archive-session" {
+				t.Fatalf("list entry session = %q, want archive-session", entry.SessionID)
+			}
 		}
 	}
-	// The canonical archived record still reads as archived.
-	archived, err := registry.GetV1("wa_archive_metadata")
+	if seen != 1 {
+		t.Fatalf("list shows same-identity ready row %d times, want exactly 1", seen)
+	}
+	got, err := registry.GetV1("wa_archive_metadata")
+	if err != nil {
+		t.Fatalf("GetV1: %v", err)
+	}
+	if got.ID != "wa_archive_metadata" || got.Kind != afclient.WorkareaKindActive || got.Status != afclient.WorkareaStatusReady || got.SessionID != "archive-session" {
+		t.Fatalf("show drifted from canonical identity: %+v", got)
+	}
+	// The canonical archived record still reads as archived through the
+	// archive-only path.
+	archived, err := registry.ArchiveV1("wa_archive_metadata")
 	if err != nil {
 		t.Fatalf("GetV1 archive: %v", err)
 	}

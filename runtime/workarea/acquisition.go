@@ -1009,6 +1009,150 @@ func (s *AcquisitionStore) finishPrivateDisposal(record *AcquisitionRecord) erro
 	return s.writeRecord(*record)
 }
 
+// ReadExistingReadyRecordsFound opens the existing acquisition store for
+// consistent readback only and returns its verified ready generations in
+// stable order. It never repairs identity, creates directories or files,
+// acquires owner locks, runs recovery, or returns a writable authority:
+// the canonical .store.lock must already exist (opened without O_CREATE)
+// and is held shared for the scan, the store directory must be a private
+// real directory whose physical identity both existing identity documents
+// pin, and each ready record is verified against its exact published root
+// through the same rooted readRecord/verifyFinal path as ReadyRecords.
+// A missing store directory or missing identities is absence
+// (nil, false, nil); a half-present, replaced, or mismatched identity set
+// fails closed. Non-ready rows are skipped without recovery.
+func ReadExistingReadyRecordsFound(parent string) ([]AcquisitionRecord, bool, error) {
+	abs, err := filepath.Abs(parent)
+	if err != nil {
+		return nil, false, fmt.Errorf("runtime/workarea: resolve acquisition parent: %w", err)
+	}
+	parentRoot, err := os.OpenRoot(abs)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("runtime/workarea: open acquisition parent: %w", err)
+	}
+	defer func() { _ = parentRoot.Close() }()
+	info, err := parentRoot.Lstat(acquisitionStoreDirName)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm() != 0o700 {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store is not a private real directory")
+	}
+	root, err := parentRoot.OpenRoot(acquisitionStoreDirName)
+	if err != nil {
+		return nil, false, fmt.Errorf("runtime/workarea: open acquisition store root: %w", err)
+	}
+	defer func() { _ = root.Close() }()
+	openedInfo, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, openedInfo) {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store identity changed while opening")
+	}
+	physical, err := fileIdentity(openedInfo)
+	if err != nil {
+		return nil, false, err
+	}
+	storeRecord, storeExists, err := readAcquisitionStoreIdentity(root, acquisitionStoreIdentityName)
+	if err != nil {
+		return nil, false, err
+	}
+	anchorRecord, anchorExists, err := readAcquisitionStoreIdentity(parentRoot, acquisitionStoreAnchorName)
+	if err != nil {
+		return nil, false, err
+	}
+	if !storeExists && !anchorExists {
+		return nil, false, nil
+	}
+	if !storeExists || !anchorExists {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store identity is incomplete")
+	}
+	if storeRecord.Identity != physical || anchorRecord.Identity != physical {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store replacement differs from durable parent anchor")
+	}
+	if storeRecord != anchorRecord {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store and parent anchor disagree")
+	}
+	lock, err := root.OpenFile(acquisitionStoreLockName, os.O_RDWR, 0)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, false, fmt.Errorf("runtime/workarea: acquisition store lock is missing")
+		}
+		return nil, false, fmt.Errorf("runtime/workarea: open acquisition store lock: %w", err)
+	}
+	fd, err := intFileDescriptor(lock.Fd())
+	if err != nil {
+		_ = lock.Close()
+		return nil, false, err
+	}
+	if err := syscall.Flock(fd, syscall.LOCK_SH); err != nil {
+		_ = lock.Close()
+		return nil, false, fmt.Errorf("runtime/workarea: lock acquisition store for read: %w", err)
+	}
+	defer func() {
+		if fd, err := intFileDescriptor(lock.Fd()); err == nil {
+			_ = syscall.Flock(fd, syscall.LOCK_UN)
+		}
+		_ = lock.Close()
+	}()
+	// Re-assert the pinned identities while holding the shared lock so a
+	// concurrent replacement cannot slip between the check and the scan.
+	current, err := parentRoot.Lstat(acquisitionStoreDirName)
+	if err != nil || current.Mode()&os.ModeSymlink != 0 || !os.SameFile(current, openedInfo) {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store directory identity changed")
+	}
+	anchor, exists, err := readAcquisitionStoreIdentity(parentRoot, acquisitionStoreAnchorName)
+	if err != nil || !exists || anchor != storeRecord {
+		return nil, false, fmt.Errorf("runtime/workarea: acquisition store parent anchor changed")
+	}
+	reader := &AcquisitionStore{parent: abs, dir: filepath.Join(abs, acquisitionStoreDirName), storeID: storeRecord.StoreID}
+	directory, err := root.Open(".")
+	if err != nil {
+		return nil, false, err
+	}
+	entries, readErr := directory.ReadDir(-1)
+	if closeErr := directory.Close(); readErr == nil {
+		readErr = closeErr
+	}
+	if readErr != nil {
+		return nil, false, readErr
+	}
+	storeRoot, err := parentRoot.OpenRoot(acquisitionStoreDirName)
+	if err != nil {
+		return nil, false, fmt.Errorf("runtime/workarea: open acquisition store root: %w", err)
+	}
+	defer func() { _ = storeRoot.Close() }()
+	reader.root = storeRoot
+	reader.parentRoot = parentRoot
+	var records []AcquisitionRecord
+	for _, entry := range entries {
+		if !entry.IsDir() || !strings.HasPrefix(entry.Name(), "wac_") {
+			continue
+		}
+		record, err := reader.readRecord(entry.Name())
+		if err != nil {
+			return nil, false, err
+		}
+		if record.State != AcquisitionReady {
+			continue
+		}
+		if err := reader.verifyFinal(record); err != nil {
+			return nil, false, err
+		}
+		records = append(records, record)
+	}
+	sort.Slice(records, func(i, j int) bool { return records[i].AcquisitionID < records[j].AcquisitionID })
+	return records, true, nil
+}
+
+// ReadExistingReadyRecords is ReadExistingReadyRecordsFound without the
+// presence flag: a legacy-flat-only host yields no records and no error.
+func ReadExistingReadyRecords(parent string) ([]AcquisitionRecord, error) {
+	records, _, err := ReadExistingReadyRecordsFound(parent)
+	return records, err
+}
+
 // ReadyRecords returns verified published generations in stable order.
 func (s *AcquisitionStore) ReadyRecords() ([]AcquisitionRecord, error) {
 	s.mu.Lock()

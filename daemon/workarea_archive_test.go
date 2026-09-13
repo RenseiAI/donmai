@@ -926,6 +926,11 @@ func sessionRootArchiveFixture(t *testing.T, selected string) (*WorkareaArchiveR
 	if err := acquisitions.RemovePublishedRoot(acquisition.Record.AcquisitionID); err != nil {
 		t.Fatal(err)
 	}
+	worktreeParentForReadback, err := filepath.EvalSymlinks(worktreeParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry = NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: archiveRoot, AcquisitionStore: acquisitions, WorktreeParent: worktreeParentForReadback})
 	return registry, filepath.Join(archiveRoot, "wa_archive_metadata", "manifest.json")
 }
 
