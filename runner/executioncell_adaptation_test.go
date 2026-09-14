@@ -838,6 +838,8 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	qw := exactReceiptQueuedWork("host-preflight-human")
 	qw.Mode = interactiveRunMode
 	qw.InitialPrompt = "actual human-controlled initial turn"
+	qw.SystemPromptOverride = interactiveSeamRoleNonce
+	qw.MemoryBlock = interactiveSeamMemoryNonce
 	qw.McpServers = []agent.MCPServerConfig{{Name: "card-server", Command: "card-mcp", Args: []string{"--stdio"}}}
 	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil))
 	operational, err := CanonicalOperationalPayload(qw)
@@ -865,6 +867,10 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	if plan.Mode != agent.PromptModeHumanControlled || plan.Harness != string(agent.HarnessCodex) {
 		t.Fatalf("host compiled wrong identity: %+v", plan)
 	}
+	// The prepared-source lane renders the same real interactive SYSTEM:
+	// the host receipt must carry the required conversational protocol on
+	// its own authority, with role/memory as separate required entries.
+	assertInteractivePreparedReceipt(t, &plan.PromptReceipt, agent.PromptDeliveryCodexCLIInstructions)
 	source, _, err := buildPreparedSourceSpec(qw, harnessSelection{
 		Provider: providerWithManifest, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt),
 		effectiveCell: exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionHumanControlled, nil),
@@ -875,13 +881,75 @@ func TestHostProviderViewCompilesActualHumanControlledInput(t *testing.T) {
 	if source.Prompt != qw.InitialPrompt || source.Autonomous || source.Interactive == nil || len(source.MCPServers) != 2 {
 		t.Fatalf("host source was not actual human input: prompt=%q autonomous=%v interactive=%v mcp=%+v", source.Prompt, source.Autonomous, source.Interactive != nil, source.MCPServers)
 	}
+	// The duplicated prepared-source builder lane carries the same real
+	// rendered SYSTEM: required conversational protocol plus separately
+	// required role/memory authorities — never batch markers.
+	assertInteractiveSourcePlan(t, source)
 	source.PreparedHarness = &plan
-	if _, err := agent.PrepareHarness(source, providerWithManifest.Manifest()); err != nil {
+	adapted, err := agent.PrepareHarness(source, providerWithManifest.Manifest())
+	if err != nil {
 		t.Fatalf("host plan cannot be consumed as sole provider authority: %v", err)
 	}
+	// Post-adaptation, the exact Codex profile owns native delivery: the
+	// protocol and role ride developer_instructions, memory seeds the PTY
+	// user prompt alongside the untouched human input, and the receipt
+	// records every channel as delivered.
+	for _, nonce := range []string{interactiveSeamRoleNonce, "working with a human at a live terminal"} {
+		if !strings.Contains(adapted.SystemPromptAppend, nonce) {
+			t.Fatalf("prepared-lane SystemPromptAppend omitted %q", nonce)
+		}
+	}
+	if !strings.Contains(adapted.Prompt, interactiveSeamMemoryNonce) || !strings.Contains(adapted.Prompt, qw.InitialPrompt) {
+		t.Fatalf("prepared-lane user prompt lost memory seed or human input: %q", adapted.Prompt)
+	}
+	assertInteractivePreparedReceipt(t, adapted.PromptReceipt, agent.PromptDeliveryCodexCLIInstructions)
 	if provider.spawnCalls.Load() != 0 {
 		t.Fatalf("provider spawned during host compile: %d", provider.spawnCalls.Load())
 	}
+}
+
+// assertInteractiveSourcePlan requires the prepared-source Spec to carry
+// the real rendered interactive SYSTEM: a required conversational protocol
+// (conversational markers present, batch markers absent, common safety
+// present) plus separately required role/memory authorities.
+func assertInteractiveSourcePlan(t *testing.T, source agent.Spec) {
+	t.Helper()
+	if source.PromptPlan == nil || source.PromptPlan.HarnessProtocol == nil {
+		t.Fatalf("prepared source omitted harness protocol: %+v", source.PromptPlan)
+	}
+	if !source.PromptPlan.HarnessProtocol.Required {
+		t.Fatalf("prepared source protocol not required: %+v", source.PromptPlan.HarnessProtocol)
+	}
+	for _, marker := range interactiveSeamBatchMarkers {
+		if strings.Contains(source.PromptPlan.HarnessProtocol.Text, marker) {
+			t.Fatalf("prepared source protocol contains batch marker %q", marker)
+		}
+	}
+	for _, marker := range interactiveSeamConversationalMarkers {
+		if !strings.Contains(source.PromptPlan.HarnessProtocol.Text, marker) {
+			t.Fatalf("prepared source protocol missing conversational marker %q", marker)
+		}
+	}
+	for _, marker := range interactiveSeamCommonSafetyMarkers {
+		if !strings.Contains(source.PromptPlan.HarnessProtocol.Text, marker) {
+			t.Fatalf("prepared source protocol dropped common safety rule %q", marker)
+		}
+	}
+	if source.PromptPlan.RoleIntent == nil || source.PromptPlan.RoleIntent.Text != interactiveSeamRoleNonce || !source.PromptPlan.RoleIntent.Required {
+		t.Fatalf("prepared source role intent = %+v, want required %q", source.PromptPlan.RoleIntent, interactiveSeamRoleNonce)
+	}
+	if len(source.PromptPlan.InitialContext) != 1 || source.PromptPlan.InitialContext[0].Text != interactiveSeamMemoryNonce || !source.PromptPlan.InitialContext[0].Required {
+		t.Fatalf("prepared source initial context = %+v, want required %q", source.PromptPlan.InitialContext, interactiveSeamMemoryNonce)
+	}
+}
+
+// assertInteractivePreparedReceipt requires the host-compiled (or
+// re-applied) prompt receipt to record the conversational protocol, role,
+// and memory entries as delivered through the exact native surfaces — the
+// same bar the live lane clears in assertInteractiveProtocolReceipt.
+func assertInteractivePreparedReceipt(t *testing.T, receipt *agent.PromptDeliveryReceipt, wantSystem agent.PromptDeliveryKind) {
+	t.Helper()
+	assertInteractiveProtocolReceipt(t, receipt, wantSystem)
 }
 
 func mustAdmissionReceipt(t *testing.T, raw json.RawMessage) executioncell.ImmutableAdmissionReceipt {
