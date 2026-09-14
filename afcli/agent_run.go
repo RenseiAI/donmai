@@ -178,15 +178,46 @@ func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
-// daemon-spawned agent session. Interactive sessions are human-driven and may
-// remain attached beyond the runner's two-hour default, so a negative duration
-// disables that runner-side cap. All other modes leave the option at zero and
-// retain runner.DefaultMaxSessionDuration.
+// daemon-spawned agent session. Three answers, in precedence order:
+//
+//   - Interactive sessions are human-driven and may remain attached beyond any
+//     budget the dispatcher sized, so a negative duration disables the
+//     runner-side cap entirely. Unchanged.
+//   - A dispatched stage budget carrying a positive maxDurationSeconds IS the
+//     session's maximum duration. The platform sized the stage; the runner's
+//     two-hour default must not silently truncate it. It would: the value
+//     returned here becomes runner.Options.MaxSessionDuration, which is the
+//     timeout the runner wraps around the whole run, and the budget enforcer's
+//     own duration cap is a context.WithDeadline derived FROM that ctx — it can
+//     only ever pull the deadline in, never push it out. Before this, a
+//     four-hour budget therefore died at two hours with the session classified
+//     as a timeout.
+//   - Everything else leaves the option at zero and retains
+//     runner.DefaultMaxSessionDuration — the fallback for work dispatched with
+//     no duration of its own.
+//
+// The dispatched value is clamped to runner.MaxSessionDurationCeiling. It
+// arrives over the wire, and the comparison is made in SECONDS on purpose: a
+// nonsense maxDurationSeconds large enough to overflow time.Duration would
+// wrap to a negative value, and a negative return here does not mean "very
+// long", it means "no runner-side cap at all". Clamping first is what keeps a
+// malformed budget from producing an unbounded session.
 func agentRunMaxSessionDuration(detail *daemon.SessionDetail) time.Duration {
-	if detail != nil && detail.Mode == prompt.InteractiveRunMode {
+	if detail == nil {
+		return 0
+	}
+	if detail.Mode == prompt.InteractiveRunMode {
 		return -1
 	}
-	return 0
+	budget := detail.StageBudget
+	if budget == nil || budget.MaxDurationSeconds <= 0 {
+		return 0
+	}
+	const ceilingSeconds = int64(runner.MaxSessionDurationCeiling / time.Second)
+	if int64(budget.MaxDurationSeconds) >= ceilingSeconds {
+		return runner.MaxSessionDurationCeiling
+	}
+	return time.Duration(budget.MaxDurationSeconds) * time.Second
 }
 
 // Daemon-URL provenance strings. They are part of the preflight error a
