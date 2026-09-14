@@ -33,6 +33,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   operation is the git fetch performed by the provisioning process, and what
   the agent gets is commits. Sessions without the record — every branch
   dispatch — provision byte-identically to before.
+### Fixes
+
+- **A tool call that ends without a recorded policy ruling no longer kills the
+  session.** The Pi harness fence now asks what outcome the trust boundary
+  recorded for a call, not merely whether a round-trip happened: every refusal
+  is registered before it is delivered, both sides read the call id through one
+  shared rule (numeric ids included), and a call with no record is reported as
+  a non-fatal `policy_adjudication_missing` error while the session runs on to
+  its own terminal. A session still aborts for the one case the event stream
+  can actually demonstrate — a denied call the runtime executed successfully
+  anyway. Only a round-trip that passes the session handshake check may write
+  that record, so an unverified request can neither vouch for a call nor
+  overwrite a real ruling; unverified requests are answered and reported as
+  their own observation.
+- **A dispatched stage budget is now the session's maximum duration.** The
+  worker capped every non-interactive session at the runner's two-hour default
+  regardless of the budget it was dispatched, because the budget enforcer's
+  duration cap is derived from the run context and `context.WithDeadline` can
+  only pull a deadline in, never push it out — so a four-hour budget still died
+  at two hours, classified as a timeout. The budget now sets the run context's
+  bound directly; the two-hour default remains for work dispatched without one,
+  interactive sessions are unchanged, and a dispatched duration is clamped to a
+  24-hour ceiling so a malformed budget cannot produce an unbounded session.
 
 ## v0.72.41 — 2026-09-13
 

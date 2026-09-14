@@ -79,15 +79,16 @@
 //     "pi loaded a stale/different extension" hole and the "session ran with no
 //     policy at all" hole.
 //
-//  3. Integrity monitors (handle.go, fail-closed at runtime): an
-//     extension_error referencing the donmai extension aborts the session
+//  3. Integrity monitors (handle.go, at runtime): an extension_error
+//     referencing the donmai extension aborts the session
 //     (ErrorEvent{Code:"policy_extension_failed"}) rather than continuing
-//     unguarded; a built-in tool_execution_END WITHOUT a completed adjudication
-//     round-trip for its call id is a policy bypass ⇒ session aborted (the real
-//     pi lifecycle emits tool_execution_start before the tool_call hook, so the
-//     bypass check point is the END, not the start); the child env is
-//     allowlist-composed so a fleet box's personal ~/.pi credentials and
-//     blocklisted host secrets are never visible to fleet sessions.
+//     unguarded; every guarded tool_execution_END is matched against the
+//     outcome the boundary RECORDED for its call id (the real pi lifecycle
+//     emits tool_execution_start before the tool_call hook, so the check point
+//     is the END, not the start). See "The fail-safe fence" below for what
+//     each answer means; the child env is allowlist-composed so a fleet box's
+//     personal ~/.pi credentials and blocklisted host secrets are never
+//     visible to fleet sessions.
 //
 // What this deliberately does NOT claim: OS-level sandboxing. The policy
 // extension is an in-process boundary — a hostile MODEL OUTPUT is contained
@@ -95,6 +96,124 @@
 // runs as the user. OS/sandbox-family enforcement stays the sandbox provider
 // family's job (E2B/container cells), unchanged. Do not mistake this
 // extension for a sandbox.
+//
+// # The fail-safe fence
+//
+// The monitor's question on a guarded tool_execution_end is "what outcome did
+// the boundary record for this call id", not "did a round-trip happen". The
+// distinction is the whole design, because the two are not the same thing and
+// treating them as one killed live sessions: a call whose ruling never got
+// recorded looks exactly like a call that was never ruled on.
+//
+// Runtime facts this rests on, verified against the pinned binary (its agent
+// loop's prepareToolCall/emitToolExecutionEnd, plus a live probe):
+//
+//   - tool_execution_start is emitted BEFORE the tool_call hook our
+//     adjudication rides. A call short-circuited before the hook (unknown
+//     tool, invalid arguments, an aborted turn) therefore reaches its END
+//     having never been offered for adjudication.
+//   - A call the tool_call hook BLOCKS still gets a tool_execution_end. pi
+//     finalizes it without executing and emits isError:true with the block
+//     reason as the result text. A refusal is therefore indistinguishable
+//     from an execution unless the refusal itself was recorded.
+//
+// So every path that refuses a call records the refusal as that call's
+// outcome BEFORE the refusal is delivered: the policy engine's own deny
+// (handle.go adjudicateKind), and a refusal the extension reached alone
+// (refusalKind — the extension raises it for an unverified boundary or a
+// failed adjudication round-trip before returning its block). Both sides read
+// the call id through ONE rule (policy.go callIDFieldNames ↔ the extension's
+// toolCallIdOf, numeric ids included), so a writer/reader spelling asymmetry
+// cannot silently unregister an honoured ruling.
+//
+// The registry that holds those outcomes is written ONLY behind the
+// handshake-token check. A round-trip whose token does not match is answered
+// on the wire and noted as an untrusted frame that nothing in the fence reads
+// (handle.go refuseUnverifiedFrame). This is load-bearing in BOTH directions:
+// an unverified payload naming a call id must not be able to vouch for that
+// call — which would suppress the record below — nor to overwrite a real
+// ruling, which would disarm the fatal. Anything else would hand an
+// unauthenticated caller on the same channel the power to erase the very
+// evidence this design rests on.
+//
+// The monitor then splits three ways, and only the first ends the session:
+//
+//  1. A trusted DENY for this call id, and the end event says the call ran and
+//     SUCCEEDED (top-level isError present and false). The refusal was not
+//     honoured; the tool ran anyway. That is a demonstrated bypass — the only
+//     one this event stream can demonstrate — and it stays fatal
+//     (ErrorEvent{Code:"policy_extension_failed"}).
+//  2. Any other recorded outcome, or a verified SDK pre-execution refusal
+//     receipt (acceptsPreExecutionRefusal). Ordinary; nothing is reported.
+//  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
+//     that could not be registered, or a call id that could not be correlated
+//     all land here. The call is recorded as unproven and surfaced as a
+//     NON-fatal ErrorEvent{Code:"policy_adjudication_missing"} naming the tool
+//     and the call id, and the session runs on to its own terminal. Downstream
+//     the run is still classified a provider failure (runner/loop.go), so the
+//     miss is loud — but the session's work, and its cost accounting, survive.
+//
+// Why case 3 only records: there is no refusal left to deliver. The end event
+// is emitted after pi has already finalized the call's result, and the only
+// pre-execution hook (tool_call) returned long before. Refusing "this single
+// call" is possible in exactly one place — the hook — and by the END the
+// window has closed.
+//
+// # What case 1 cannot see, and why it is not widened
+//
+// A denial followed by an end event that reports an ERROR result is NOT
+// treated as a bypass, because that is exactly what an HONOURED block looks
+// like: pi finalizes a blocked call with isError:true and the refusal's own
+// reason as its result text. The two are indistinguishable on the fields the
+// monitor is willing to trust, so the residual is real and worth stating
+// plainly: a call that executes, has its effects, and THEN returns an error
+// result never trips the fatal. Neither does one whose end event omits the
+// error flag entirely (executionSucceeded requires a present bool).
+//
+// The block's result text does in fact carry the deny reason verbatim on the
+// pinned runtime, so a text comparison could narrow this. It is deliberately
+// not used. Tool result text is the one part of the event a hostile TOOL
+// EXECUTION can write, and arming a session kill from it would reintroduce
+// precisely the false-positive class this design exists to remove — a session
+// destroyed on evidence the session's own output can forge, in either
+// direction. The fatal stays anchored on a field the runtime owns.
+//
+// # Posture change (deliberate, and what compensates for it)
+//
+// Before this design a guarded end with no recorded outcome aborted the
+// session. For a genuinely subverted extension that capped the blast radius at
+// ONE unadjudicated call; now every subsequent call runs, each producing one
+// non-fatal record. That is a real reduction in containment and is accepted
+// knowingly, for three reasons. The fence never PREVENTED the first call —
+// its check point is the END event, after the runtime has finalized the
+// result — so the old abort was damage limitation, not prevention, and it
+// bought that limitation at the price of destroying sessions whose only fault
+// was a ruling lost in transit. The compensating control is that the miss is
+// now durable and machine-readable rather than a session obituary: it is an
+// agent.ErrorEvent carrying its own code, so it lands in the session's
+// event-log audit trail, reaches the activity sink, is inspectable on the
+// handle, and classifies the whole run as a provider failure downstream — a
+// subverted extension cannot run quietly, it can only run loudly. And that
+// record is itself unforgeable from the channel an attacker has: only a
+// token-verified round-trip can write the registry that would silence it.
+//
+// Two residual gaps, both deliberate and both bounded to "recorded, not
+// fatal":
+//
+//   - An extension-side refusal raised with NO UI channel, or one whose own
+//     registration round-trip fails, cannot be registered — the channel it
+//     would ride is the thing that is broken. The tool is still blocked; the
+//     call lands in case 3.
+//   - The registry is per-Handle and in memory. A new Handle over the same pi
+//     session (Resume, any re-adoption) starts empty, so a call ruled on by
+//     the previous handle lands in case 3. It is NOT seeded from the prior
+//     session's permission_decision events: those events are the runner's
+//     audit trail (<worktree>/.agent/events.jsonl), not provider state, and
+//     pi's own get_entries replay carries conversation messages, not our
+//     boundary round-trips — there is nothing authoritative to seed FROM
+//     inside this package. Rebuilding it would mean trusting a re-read of an
+//     audit file to decide a security outcome, which is worse than recording
+//     the calls as unproven.
 //
 // # D8 fixture family
 //

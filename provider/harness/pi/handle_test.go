@@ -434,15 +434,19 @@ func TestSpawn_PermissionDenialRoundTrip(t *testing.T) {
 	}
 }
 
-// --- Smoke 5: bypass monitor ---
+// --- Smoke 5: the integrity monitor aborts on a DEMONSTRATED bypass ---
 
-func TestSpawn_BypassMonitorAborts(t *testing.T) {
+// TestSpawn_DeniedCallExecutedAnywayAborts is the one shape that still ends
+// the session: the boundary denied a call, and the runtime reported that same
+// call ran and succeeded. Every other shape the monitor sees — including a
+// built-in end with no recorded ruling at all — is recorded and non-fatal;
+// policy_fence_test.go carries that whole table.
+func TestSpawn_DeniedCallExecutedAnywayAborts(t *testing.T) {
 	t.Parallel()
-	// A built-in tool_execution_END with NO preceding adjudication round-trip.
-	// (tool_execution_end — not _start — is the real bypass check point.)
 	body := getStateResponse("ses_bypass") +
 		event(map[string]any{"type": "agent_start"}) +
-		event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-unadjudicated", "isError": false}) +
+		adjudicateEvent("a1", "bash", "c-denied", map[string]any{"command": "rm -rf /"}, "") +
+		event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-denied", "isError": false}) +
 		event(map[string]any{"type": "agent_settled"})
 
 	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi", Cwd: t.TempDir(), Autonomous: true}, handshakeEvent("h1"), body)
@@ -461,7 +465,7 @@ func TestSpawn_BypassMonitorAborts(t *testing.T) {
 		}
 	}
 	if !sawBypass {
-		t.Errorf("bypass monitor did not abort on an unadjudicated built-in tool execution")
+		t.Errorf("integrity monitor did not abort on a denied call the runtime executed anyway")
 	}
 	if err := checkTerminalLast(evs); err != nil {
 		t.Error(err)
@@ -593,7 +597,8 @@ func TestInject_AfterFatalTerminal_FailsClosed(t *testing.T) {
 			name: "policy bypass abort",
 			body: getStateResponse("ses_fatal_bypass") +
 				event(map[string]any{"type": "agent_start"}) +
-				event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-unadjudicated", "isError": false}),
+				adjudicateEvent("a1", "bash", "c-denied", map[string]any{"command": "rm -rf /"}, "") +
+				event(map[string]any{"type": "tool_execution_end", "toolName": "bash", "toolCallId": "c-denied", "isError": false}),
 		},
 		{
 			name: "extension_error abort",

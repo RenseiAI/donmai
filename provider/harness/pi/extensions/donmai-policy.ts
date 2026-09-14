@@ -31,6 +31,16 @@
 //     handler returns { block: true, reason } so pi blocks the tool and the
 //     model sees WHY.
 //
+//   - Refusal registration: pi emits a tool_execution_end for a BLOCKED call
+//     exactly as it does for an executed one, so a refusal this extension
+//     reached on its own — an unverified boundary, or an adjudication
+//     round-trip that threw — would reach the Go monitor as a call with no
+//     recorded outcome, indistinguishable from a bypass. Each such refusal is
+//     therefore registered first, over a bounded best-effort round-trip
+//     (KIND_REFUSAL), and blocked afterwards. The block never depends on the
+//     registration landing; a Go side that cannot answer must not be able to
+//     wedge a blocking hook.
+//
 //   - Interactive-lane local tool policy (allowed/disallowed-tools channel,
 //     agent.ToolDeliveryPiInteractiveLocalToolPolicy): the PTY lane runs no
 //     RPC round trip at all (see activate() below), so it cannot ask the Go
@@ -68,11 +78,73 @@ const DONMAI_UI_MARKER = "donmai-policy-v1";
 // `title`.
 const KIND_HANDSHAKE = "handshake";
 const KIND_ADJUDICATE = "adjudicate";
+// KIND_REFUSAL carries a refusal this extension reached ON ITS OWN — before a
+// verdict could be asked for, or because asking failed. The tool is blocked
+// either way; the round-trip exists so the Go side records the refusal as that
+// call's outcome instead of meeting the tool_execution_end with no record at
+// all (policy.go / handle.go, doc.go "The fail-safe fence").
+const KIND_REFUSAL = "refusal";
+
+// REFUSAL_REGISTER_TIMEOUT_MS bounds the best-effort refusal round-trip. The
+// refusal itself never depends on it: the tool is blocked whether or not the
+// Go side answers, and a Go side that is gone (or was never listening) must
+// not be able to wedge a blocking tool_call hook forever.
+const REFUSAL_REGISTER_TIMEOUT_MS = 2000;
 
 // Built-in tools this extension guards. Every one routes through the Go-side
 // policy engine before it may execute (RPC mode) or the local matcher below
 // (interactive PTY mode, allowed/disallowed-tools channel only).
 const GUARDED_TOOLS = new Set(["read", "write", "edit", "bash", "grep", "find", "ls"]);
+
+// toolCallIdOf reads a tool call's id from a pi event. It accepts the SAME
+// spellings, in the same order, that the Go side accepts when it reads the id
+// back off tool_execution_end (policy.go callIDFieldNames). Keeping one rule
+// on both sides is load-bearing: a writer that only ever serialized
+// `toolCallId` while the reader also accepted `callId`/`call_id`/`id` would
+// leave an honoured ruling unrecorded the moment the runtime spelled the
+// field any other way.
+function toolCallIdOf(event: any): string {
+  const candidates = [event?.toolCallId, event?.callId, event?.call_id, event?.id];
+  for (const candidate of candidates) {
+    if (typeof candidate === "string" && candidate !== "") return candidate;
+    if (typeof candidate === "number") return String(candidate);
+  }
+  return "";
+}
+
+// registerRefusal tells the Go side that this extension refused one call, so
+// the refusal is recorded as that call's adjudication outcome. Best effort by
+// construction: it is used exactly on the paths where the normal adjudication
+// round-trip is unavailable or has already failed, so it must never throw and
+// never block past REFUSAL_REGISTER_TIMEOUT_MS. The caller blocks the tool
+// regardless of whether this lands.
+async function registerRefusal(ctx: any, token: string, tool: string, callId: string, reason: string): Promise<void> {
+  if (!ctx?.hasUI || typeof ctx?.ui?.input !== "function") return;
+  let timer: any;
+  try {
+    const payload = JSON.stringify({
+      donmai: KIND_REFUSAL,
+      token,
+      toolName: tool,
+      toolCallId: callId,
+      reason,
+      cwd: ctx?.cwd ?? "",
+    });
+    await Promise.race([
+      ctx.ui.input(payload, DONMAI_UI_MARKER),
+      new Promise((resolve) => {
+        timer = setTimeout(resolve, REFUSAL_REGISTER_TIMEOUT_MS);
+        timer?.unref?.();
+      }),
+    ]);
+  } catch {
+    // Unreachable Go side, no UI channel, a rejected round-trip: the refusal
+    // stands either way. The Go side records the call as unproven instead,
+    // which is non-fatal there.
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
 
 // selfSHA256 hashes this extension's own on-disk source so the Go side can
 // verify the exact bytes it materialized are the bytes that loaded.
@@ -477,23 +549,36 @@ export default function activate(pi: ExtensionAPI) {
   });
 
   // Tool adjudication. tool_call can block; we await the Go verdict.
+  //
+  // Every refusal below is REGISTERED before it is returned. pi emits a
+  // tool_execution_end for a blocked call exactly as it does for an executed
+  // one (verified against the pinned binary: a blocked call is finalized with
+  // isError:true and the reason as its result text), so a refusal this
+  // extension reached alone used to arrive at the Go monitor as a call with no
+  // record — indistinguishable from a bypass. Registering it first closes
+  // that gap on the three paths that never reach the adjudication round-trip.
   pi.on("tool_call", async (event: any, ctx: any) => {
     const tool = String(event?.toolName ?? "");
     if (!GUARDED_TOOLS.has(tool)) return;
+    const callId = toolCallIdOf(event);
 
     // Fail closed: an unverified boundary blocks every guarded tool. If the
     // handshake has not even settled yet, block too — the Go side gates the
     // prompt on the handshake, so this only guards against races.
     if (!verified) {
-      return {
-        block: true,
-        reason: handshakeSettled
-          ? "donmai policy boundary not verified"
-          : "donmai policy boundary still initializing",
-      };
+      const reason = handshakeSettled
+        ? "donmai policy boundary not verified"
+        : "donmai policy boundary still initializing";
+      await registerRefusal(ctx, token, tool, callId, reason);
+      return { block: true, reason };
     }
     if (!ctx?.hasUI) {
-      return { block: true, reason: "donmai policy boundary requires a UI channel" };
+      // No UI channel means no round-trip at all, so this refusal cannot be
+      // registered; registerRefusal returns immediately and the Go monitor
+      // records the call as unproven instead.
+      const reason = "donmai policy boundary requires a UI channel";
+      await registerRefusal(ctx, token, tool, callId, reason);
+      return { block: true, reason };
     }
 
     try {
@@ -501,7 +586,7 @@ export default function activate(pi: ExtensionAPI) {
         donmai: KIND_ADJUDICATE,
         token,
         toolName: tool,
-        toolCallId: String(event?.toolCallId ?? ""),
+        toolCallId: callId,
         input: event?.input ?? {},
         cwd: ctx?.cwd ?? "",
       });
@@ -516,7 +601,9 @@ export default function activate(pi: ExtensionAPI) {
       // allow: returning undefined lets the tool execute.
       return;
     } catch (err) {
-      return { block: true, reason: "donmai policy adjudication failed: " + String(err) };
+      const reason = "donmai policy adjudication failed: " + String(err);
+      await registerRefusal(ctx, token, tool, callId, reason);
+      return { block: true, reason };
     }
   });
 }
