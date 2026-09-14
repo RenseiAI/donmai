@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.42 — 2026-09-14
+
 ### Features
 
 - **A dispatched pull request's head is fetched and verified before the agent
