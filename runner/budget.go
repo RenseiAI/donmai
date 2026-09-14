@@ -121,6 +121,13 @@ func (e *BudgetEnforcer) Enabled() bool { return e.enabled }
 // cancels when the wall-clock budget elapses. Returns the input ctx
 // unchanged when no duration cap is configured. The returned cancel
 // is always non-nil and safe to defer.
+//
+// It can only ever TIGHTEN parent: context.WithDeadline never extends a
+// parent's deadline, so the effective cap is min(parent, budget). A budget
+// longer than the run context's own bound is therefore silently truncated to
+// it — which is why a caller holding a dispatched budget must also size
+// [Options.MaxSessionDuration] from that budget rather than relying on this
+// enforcer to widen anything.
 func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Context, context.CancelFunc) {
 	if !e.enabled || e.limits.MaxDurationSeconds <= 0 {
 		// Use a noop cancel so callers can defer unconditionally.

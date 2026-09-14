@@ -64,7 +64,33 @@ const (
 	// DefaultMaxSessionDuration is the upper-bound timeout the runner
 	// applies to ctx when [Options.MaxSessionDuration] is zero. Two
 	// hours matches the legacy TS MAX_SESSION_DURATION constant.
+	//
+	// It is the fallback for work that arrives with NO dispatched
+	// duration: a session whose stage budget carries a positive
+	// maxDurationSeconds is run with that budget as its
+	// [Options.MaxSessionDuration] instead (the derivation lives in the
+	// `agent run` worker, which is the process that reads the dispatched
+	// session detail). The budget cannot be honoured by the enforcer
+	// alone — [BudgetEnforcer.WithDurationCap] derives its deadline from
+	// this ctx via context.WithDeadline, which only ever moves a deadline
+	// EARLIER, so any budget longer than the cap set here would be
+	// silently truncated to it.
 	DefaultMaxSessionDuration = 2 * time.Hour
+
+	// MaxSessionDurationCeiling is the absolute upper bound on a session
+	// duration derived from dispatched (i.e. remote) input. A stage
+	// budget's maxDurationSeconds arrives over the wire, so the worker
+	// clamps it to this value before it reaches
+	// [Options.MaxSessionDuration]: a malformed, mis-scaled, or hostile
+	// budget can make a session longer than DefaultMaxSessionDuration but
+	// never unbounded, and a wedged session still frees its host slot
+	// within a day.
+	//
+	// It deliberately does NOT bound a duration an embedder sets on
+	// [Options] directly — in-process configuration is trusted, the wire
+	// is not — and it is not a default: work with no dispatched budget
+	// still gets DefaultMaxSessionDuration.
+	MaxSessionDurationCeiling = 24 * time.Hour
 
 	// DefaultEventBufferSize is the buffered-channel size used to
 	// decouple event mirroring from the provider goroutine. A small
@@ -78,7 +104,9 @@ const (
 	// runner cancels the stream and classifies the session as
 	// FailureNoProgress. Twelve minutes is comfortably longer than a
 	// normal think/tool-call gap but short enough to free a wedged slot
-	// well before the 2h MaxSessionDuration. A NEGATIVE
+	// well before the session's MaxSessionDuration (which is the
+	// dispatched stage budget when there is one, and
+	// DefaultMaxSessionDuration otherwise). A NEGATIVE
 	// Options.IdleTimeout disables the watchdog.
 	DefaultIdleTimeout = 12 * time.Minute
 
@@ -144,6 +172,14 @@ type Options struct {
 	// MaxSessionDuration is the per-Run upper-bound on ctx. Zero
 	// falls back to DefaultMaxSessionDuration. Negative disables the
 	// runner-side timeout (caller is responsible for ctx expiry).
+	//
+	// This is the OUTER bound on a session: every other duration the run
+	// observes — the stage budget's duration cap included — is derived
+	// from the ctx this value produces, and context.WithDeadline cannot
+	// push a derived deadline past its parent. A caller holding a
+	// dispatched stage budget must therefore set this FROM that budget;
+	// leaving it at zero caps the session at DefaultMaxSessionDuration no
+	// matter how long the budget is.
 	MaxSessionDuration time.Duration
 
 	// IdleTimeout is the no-progress watchdog window applied to the
