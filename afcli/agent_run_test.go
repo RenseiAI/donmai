@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -345,8 +346,20 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 			want:   -1,
 		},
 		{
+			name: "interactive session ignores a dispatched budget",
+			detail: &daemon.SessionDetail{
+				Mode:        prompt.InteractiveRunMode,
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 14400},
+			},
+			want: -1,
+		},
+		{
 			name:   "headless session keeps runner default",
 			detail: &daemon.SessionDetail{},
+		},
+		{
+			name:   "absent detail keeps runner default",
+			detail: nil,
 		},
 		{
 			name:   "interview session keeps runner default",
@@ -355,6 +368,71 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 		{
 			name:   "unknown mode keeps runner default",
 			detail: &daemon.SessionDetail{Mode: "interactive-preview"},
+		},
+		{
+			name: "four-hour budget becomes the session maximum",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 14400},
+			},
+			want: 4 * time.Hour,
+		},
+		{
+			name: "eight-hour budget becomes the session maximum",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 28800},
+			},
+			want: 8 * time.Hour,
+		},
+		{
+			name: "budget shorter than the default still wins",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 900},
+			},
+			want: 15 * time.Minute,
+		},
+		{
+			name: "non-interactive mode honours the budget",
+			detail: &daemon.SessionDetail{
+				Mode:        "interview",
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 3600},
+			},
+			want: time.Hour,
+		},
+		{
+			name: "budget exactly at the ceiling is the ceiling",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 86400},
+			},
+			want: runner.MaxSessionDurationCeiling,
+		},
+		{
+			name: "budget above the ceiling is clamped",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: 90000},
+			},
+			want: runner.MaxSessionDurationCeiling,
+		},
+		{
+			// A seconds value this large overflows time.Duration. Clamping in
+			// seconds first is what stops the multiplication wrapping to a
+			// NEGATIVE duration, which the runner reads as "no cap at all".
+			name: "overflowing budget is clamped, never unbounded",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: math.MaxInt64},
+			},
+			want: runner.MaxSessionDurationCeiling,
+		},
+		{
+			name: "zero-duration budget keeps runner default",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxSubAgents: 4},
+			},
+		},
+		{
+			name: "negative-duration budget keeps runner default",
+			detail: &daemon.SessionDetail{
+				StageBudget: &daemon.PollStageBudget{MaxDurationSeconds: -60},
+			},
 		},
 	}
 
