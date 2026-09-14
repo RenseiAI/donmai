@@ -173,13 +173,14 @@ type postWelcomeExchange struct {
 }
 
 type postWelcomeAdoptedLossProxy struct {
-	connections atomic.Int32
-	mu          sync.Mutex
-	conns       []net.Conn
-	closed      bool
-	exchanges   []postWelcomeExchange
-	err         error
-	wg          sync.WaitGroup
+	connections                 atomic.Int32
+	retryHelloPreparedBeforeEOF atomic.Bool
+	mu                          sync.Mutex
+	conns                       []net.Conn
+	closed                      bool
+	exchanges                   []postWelcomeExchange
+	err                         error
+	wg                          sync.WaitGroup
 }
 
 func (p *postWelcomeAdoptedLossProxy) track(conn net.Conn) {
@@ -253,6 +254,7 @@ func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, t
 	proxy.wg.Add(1)
 	go func() {
 		defer proxy.wg.Done()
+		readyUpstream, readyReader, readyHello := firstUpstream, firstReader, firstHello
 		for {
 			client, acceptErr := listener.Accept()
 			if acceptErr != nil {
@@ -263,8 +265,9 @@ func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, t
 				_ = client.SetDeadline(deadline)
 			}
 			number := proxy.connections.Add(1)
-			upstream, reader, hello := firstUpstream, firstReader, firstHello
-			if number > 1 {
+			upstream, reader, hello := readyUpstream, readyReader, readyHello
+			readyUpstream, readyReader, readyHello = nil, nil, shimwire.Message{}
+			if upstream == nil {
 				var dialErr error
 				upstream, dialErr = dial()
 				if dialErr != nil {
@@ -289,6 +292,27 @@ func startPostWelcomeAdoptedLossProxy(ctx context.Context, t *testing.T, path, t
 				return
 			}
 			if number == 1 && dropFirst {
+				// Prepare the authentic retry Hello before delivering the first
+				// controller's EOF. The retry's unchanged dial budget must measure
+				// its own handshake, not wait for this interposer to dial the shim.
+				var dialErr error
+				readyUpstream, dialErr = dial()
+				if dialErr != nil {
+					proxy.fail(fmt.Errorf("prepare retry upstream: %w", dialErr))
+					_ = upstream.Close()
+					_ = client.Close()
+					return
+				}
+				readyReader = shimwire.NewReader(readyUpstream)
+				readyHello, dialErr = readyReader.Read()
+				if dialErr != nil {
+					proxy.fail(fmt.Errorf("prepare retry Hello: %w", dialErr))
+					_ = readyUpstream.Close()
+					_ = upstream.Close()
+					_ = client.Close()
+					return
+				}
+				proxy.retryHelloPreparedBeforeEOF.Store(proxy.connections.Load() == 1)
 				// Close the committed first pair before accepting the retry. EOF
 				// conveys the lost ACK; no timeout or later Accept triggers it.
 				_ = upstream.Close()
@@ -681,6 +705,9 @@ func TestPostWelcomeTransientRetryRepreparesAgainstAdvancedGeneration(t *testing
 	}
 	defer result.Close()
 
+	if !proxy.retryHelloPreparedBeforeEOF.Load() {
+		t.Fatal("retry Hello was not prepared before the first controller received EOF")
+	}
 	exchanges, proxyErr := proxy.observations()
 	if proxyErr != nil {
 		t.Fatalf("proxy phase failed: %v; exchanges=%+v; quarantined=%+v", proxyErr, exchanges, result.Quarantined)
