@@ -18,7 +18,7 @@ func TestNew_LoadsBuiltins(t *testing.T) {
 		t.Fatalf("New() returned unexpected error: %v", err)
 	}
 
-	want := []string{"system_base", "user_development", "user_qa", "user_research"}
+	want := []string{"system_base", "system_interactive", "user_development", "user_qa", "user_research"}
 	for _, name := range want {
 		if !reg.Has(name) {
 			t.Errorf("registry missing expected template %q; registered: %v", name, reg.Names())

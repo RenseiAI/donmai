@@ -175,7 +175,12 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 
 	// The base operating protocol is always rendered. Role intent is a
 	// separate authority and cannot select a replacement path.
-	systemBuf, err := renderTemplate(tmpls, "system_base.tmpl", systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
+	// Interactive sessions render the conversational operating protocol
+	// (system_interactive.tmpl): the batch completion contract
+	// (turn-result manifest, WORK_RESULT markers, task-end behavior) never
+	// applied to a live terminal session. The common safety, authority,
+	// worktree, and read-before-edit rules are shared by both templates.
+	systemBuf, err := renderTemplate(tmpls, systemTemplateName(qw), systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
 	if err != nil {
 		return "", "", fmt.Errorf("render system prompt: %w", err)
 	}
@@ -236,9 +241,10 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 		"append":         strings.TrimSpace(b.SystemAppend),
 		"skillAppend":    strings.TrimSpace(b.SkillAppend),
 	}
-	systemBuf, err := b.Registry.Render("system_base", sysCTX)
+	systemTmplName := systemTemplateNameRaymond(qw)
+	systemBuf, err := b.Registry.Render(systemTmplName, sysCTX)
 	if err != nil {
-		return "", "", fmt.Errorf("raymond: render system prompt: %w", err)
+		return "", "", fmt.Errorf("raymond: render system prompt %q: %w", systemTmplName, err)
 	}
 
 	// Mirror the legacy path: caller-supplied overrides and custom registry
@@ -277,6 +283,17 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 	}
 
 	return systemBuf, userBuf, nil
+}
+
+// systemTemplateNameRaymond maps a QueuedWork to the raymond registry
+// template name. Interactive sessions render the conversational protocol;
+// every other mode renders the batch contract, mirroring
+// [systemTemplateName] on the legacy path.
+func systemTemplateNameRaymond(qw QueuedWork) string {
+	if qw.isInteractiveMode() {
+		return "system_interactive"
+	}
+	return "system_base"
 }
 
 // userTemplateNameRaymond maps a WorkType to the raymond registry template
@@ -452,6 +469,13 @@ func prependContentSafetyPreamble(systemBuf string) string {
 		return contentSafetyPreamble
 	}
 	return contentSafetyPreamble + "\n\n" + systemBuf
+}
+
+func systemTemplateName(qw QueuedWork) string {
+	if qw.isInteractiveMode() {
+		return "system_interactive.tmpl"
+	}
+	return "system_base.tmpl"
 }
 
 func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTmplData {
