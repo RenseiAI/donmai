@@ -1,8 +1,10 @@
 package pi
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -26,8 +28,10 @@ const (
 )
 
 // builtInToolNames is the set of pi built-in tools the extension overrides.
-// A tool_execution_start naming one of these WITHOUT a preceding adjudication
-// round-trip is a policy bypass (handle.go integrity monitor, design §5.3).
+// A tool_execution_end naming one of these WITHOUT a recorded adjudication
+// outcome is an UNPROVEN call: the monitor records it and surfaces a
+// non-fatal error, because "no record" cannot tell a real bypass apart from a
+// lost ruling (handle.go integrity monitor, doc.go "The fail-safe fence").
 var builtInToolNames = map[string]ToolKind{
 	"read":  ToolRead,
 	"write": ToolWrite,
@@ -42,6 +46,49 @@ var builtInToolNames = map[string]ToolKind{
 func isBuiltInTool(name string) bool {
 	_, ok := builtInToolNames[strings.ToLower(strings.TrimSpace(name))]
 	return ok
+}
+
+// callIDFieldNames is the ONE rule for reading a tool call's id, in priority
+// order. Every site that has to correlate a single call across the trust
+// boundary reads it through toolCallID below: the bypass monitor consuming a
+// tool_execution_end, the adjudication/refusal payload reader, and the event
+// mapper's ToolResultEvent (handle.go, event_mapping.go). The embedded
+// extension's own toolCallIdOf() accepts the same spellings in the same order
+// (extensions/donmai-policy.ts).
+//
+// The symmetry is load-bearing, not cosmetic. A writer that serialized only
+// `toolCallId` while the reader also accepted `callId`/`call_id`/`id` would
+// leave an HONOURED ruling unrecorded whenever the runtime spelled the field
+// any other way — and an unrecorded ruling used to be read as a bypass and
+// killed the session (doc.go, "The fail-safe fence").
+var callIDFieldNames = []string{"toolCallId", "callId", "call_id", "id"}
+
+// toolCallID reads a tool call id from any accepted spelling. It returns ""
+// when the id is absent or empty — a call that cannot be correlated, which
+// the monitor records as an unproven call rather than treating as a bypass.
+//
+// A NUMERIC id is accepted and rendered the same way the extension's
+// toolCallIdOf renders it (JavaScript String(n)), because the symmetry has to
+// hold in both directions: if a runtime ever spelled ids numerically, a writer
+// that serialized "123" against a reader that saw float64(123) and gave up
+// would turn every honoured ruling into an unproven call. Integral values
+// render identically on both sides; values large enough that JavaScript
+// switches to exponent notation (>= 1e21) are out of scope — no runtime mints
+// call ids there.
+func toolCallID(fields map[string]any) string {
+	for _, key := range callIDFieldNames {
+		switch value := fields[key].(type) {
+		case string:
+			if value != "" {
+				return value
+			}
+		case float64:
+			return strconv.FormatFloat(value, 'f', -1, 64)
+		case json.Number:
+			return value.String()
+		}
+	}
+	return ""
 }
 
 // isMutatingKind reports whether k mutates the filesystem (write/edit).
@@ -66,6 +113,17 @@ type ToolCall struct {
 // Decision is the adjudicator verdict for one tool call. Reason is filled on
 // deny so the model (which receives the deny string) sees WHY — mirroring
 // codex ApprovalDecision.Reason.
+//
+// What a deny is worth downstream: it is recorded against the call id before
+// it is delivered, and the integrity monitor later treats an end event for
+// that call as a bypass ONLY if the runtime reports the call ran and
+// succeeded. A denied call that ends with an error result is indistinguishable
+// from an honoured block — pi finalizes a blocked call with exactly that
+// shape, carrying this Reason as the result text — so a bypass whose tool
+// errors after its side effects is not caught. The reason text is not used to
+// tell those apart: tool output is the one part of the event a hostile
+// execution can write, and the monitor's session-fatal path must not rest on
+// it (doc.go, "What case 1 cannot see, and why it is not widened").
 type Decision struct {
 	Allow  bool
 	Reason string
