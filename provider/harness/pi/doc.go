@@ -119,14 +119,22 @@
 //
 // So every path that refuses a call records the refusal as that call's
 // outcome BEFORE the refusal is delivered: the policy engine's own deny
-// (handle.go adjudicateKind), a refusal the extension reached alone
+// (handle.go adjudicateKind), and a refusal the extension reached alone
 // (refusalKind — the extension raises it for an unverified boundary or a
-// failed adjudication round-trip before returning its block), and the
-// token-mismatch reply (recorded untrusted, so an unauthenticated payload
-// cannot arm the fatal path below for a call id it names). Both sides read
+// failed adjudication round-trip before returning its block). Both sides read
 // the call id through ONE rule (policy.go callIDFieldNames ↔ the extension's
-// toolCallIdOf), so a writer/reader spelling asymmetry cannot silently
-// unregister an honoured ruling.
+// toolCallIdOf, numeric ids included), so a writer/reader spelling asymmetry
+// cannot silently unregister an honoured ruling.
+//
+// The registry that holds those outcomes is written ONLY behind the
+// handshake-token check. A round-trip whose token does not match is answered
+// on the wire and noted as an untrusted frame that nothing in the fence reads
+// (handle.go refuseUnverifiedFrame). This is load-bearing in BOTH directions:
+// an unverified payload naming a call id must not be able to vouch for that
+// call — which would suppress the record below — nor to overwrite a real
+// ruling, which would disarm the fatal. Anything else would hand an
+// unauthenticated caller on the same channel the power to erase the very
+// evidence this design rests on.
 //
 // The monitor then splits three ways, and only the first ends the session:
 //
@@ -150,6 +158,44 @@
 // pre-execution hook (tool_call) returned long before. Refusing "this single
 // call" is possible in exactly one place — the hook — and by the END the
 // window has closed.
+//
+// # What case 1 cannot see, and why it is not widened
+//
+// A denial followed by an end event that reports an ERROR result is NOT
+// treated as a bypass, because that is exactly what an HONOURED block looks
+// like: pi finalizes a blocked call with isError:true and the refusal's own
+// reason as its result text. The two are indistinguishable on the fields the
+// monitor is willing to trust, so the residual is real and worth stating
+// plainly: a call that executes, has its effects, and THEN returns an error
+// result never trips the fatal. Neither does one whose end event omits the
+// error flag entirely (executionSucceeded requires a present bool).
+//
+// The block's result text does in fact carry the deny reason verbatim on the
+// pinned runtime, so a text comparison could narrow this. It is deliberately
+// not used. Tool result text is the one part of the event a hostile TOOL
+// EXECUTION can write, and arming a session kill from it would reintroduce
+// precisely the false-positive class this design exists to remove — a session
+// destroyed on evidence the session's own output can forge, in either
+// direction. The fatal stays anchored on a field the runtime owns.
+//
+// # Posture change (deliberate, and what compensates for it)
+//
+// Before this design a guarded end with no recorded outcome aborted the
+// session. For a genuinely subverted extension that capped the blast radius at
+// ONE unadjudicated call; now every subsequent call runs, each producing one
+// non-fatal record. That is a real reduction in containment and is accepted
+// knowingly, for three reasons. The fence never PREVENTED the first call —
+// its check point is the END event, after the runtime has finalized the
+// result — so the old abort was damage limitation, not prevention, and it
+// bought that limitation at the price of destroying sessions whose only fault
+// was a ruling lost in transit. The compensating control is that the miss is
+// now durable and machine-readable rather than a session obituary: it is an
+// agent.ErrorEvent carrying its own code, so it lands in the session's
+// event-log audit trail, reaches the activity sink, is inspectable on the
+// handle, and classifies the whole run as a provider failure downstream — a
+// subverted extension cannot run quietly, it can only run loudly. And that
+// record is itself unforgeable from the channel an attacker has: only a
+// token-verified round-trip can write the registry that would silence it.
 //
 // Two residual gaps, both deliberate and both bounded to "recorded, not
 // fatal":

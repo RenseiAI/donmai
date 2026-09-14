@@ -24,22 +24,35 @@ var _ agent.Handle = (*Handle)(nil)
 // on tool_execution_end: an honoured ruling, a refusal, and a call the
 // boundary never got to rule on.
 //
-// trusted marks an outcome that arrived over a round-trip carrying the
-// per-session handshake token. Only a trusted DENY can arm the one remaining
-// session-fatal path (an execution that succeeded anyway); an untrusted
-// refusal — the token-mismatch reply, whose payload is by definition
-// unauthenticated — records the refusal without granting an unauthenticated
-// caller the power to make a later call fatal.
+// THE REGISTRY INVARIANT: an outcome is written ONLY after the round-trip that
+// carried it passed the per-session handshake-token check. The registry is
+// what silences the missing-adjudication record and what arms the one
+// session-fatal path, so a payload that cannot prove it came from the verified
+// extension must not be able to write it — otherwise an unauthenticated frame
+// could erase the very record that justifies continuing, or overwrite a real
+// denial and disarm the fatal. Every caller of recordAdjudication sits behind
+// verifyHandshakeToken; an unverified frame goes to recordUntrustedFrame
+// instead, which nothing in the fence reads.
 type adjudicationOutcome struct {
-	allow   bool
-	reason  string
-	trusted bool
+	allow  bool
+	reason string
 }
 
 // adjudicationMiss is one guarded call that ended with no recorded outcome.
 // It is kept so the miss is inspectable on the handle, not only in the
 // emitted event stream.
 type adjudicationMiss struct {
+	tool   string
+	callID string
+}
+
+// untrustedFrame is one boundary round-trip that failed the handshake-token
+// check. It is an OBSERVATION only — deliberately held apart from the
+// adjudication registry, so an unauthenticated payload can say nothing about
+// any call's outcome. Kept so the attempt is visible on the handle and in the
+// event stream rather than silently dropped.
+type untrustedFrame struct {
+	kind   string
 	tool   string
 	callID string
 }
@@ -94,11 +107,13 @@ type Handle struct {
 	handshakeOnce   sync.Once
 
 	// adjudications records, per pi tool call id, the outcome the trust
-	// boundary reached for that call — an allow, or a refusal from ANY path
-	// (policy deny, extension-side refusal, token mismatch). misses records
-	// the calls that ended with no outcome at all. Together they are what the
-	// integrity monitor reads on tool_execution_end; see doc.go's "The
-	// fail-safe fence" for the three-way split they encode.
+	// boundary reached for that call — an allow, or a refusal from either
+	// token-verified path (policy deny, extension-side refusal). misses
+	// records the calls that ended with no outcome at all, and untrusted
+	// records the unverified frames that were refused without being allowed
+	// to say anything about a call. The first two are what the integrity
+	// monitor reads on tool_execution_end; see doc.go's "The fail-safe fence"
+	// for the three-way split they encode.
 	//
 	// This registry is per-Handle and in memory only: a new Handle (Resume,
 	// or any re-adoption of a live pi session) starts empty, so calls ruled on
@@ -108,6 +123,7 @@ type Handle struct {
 	adjMu         sync.Mutex
 	adjudications map[string]adjudicationOutcome
 	misses        []adjudicationMiss
+	untrusted     []untrustedFrame
 
 	// turnInFlight is true between the first streaming event of a turn and its
 	// turn_end/agent_end — Inject routes to steer while in flight, follow_up
@@ -374,7 +390,7 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		if isBuiltInTool(tool) || claimsRefusal {
 			outcome, ruled := h.adjudication(callID)
 			switch {
-			case ruled && !outcome.allow && outcome.trusted && executionSucceeded(ev):
+			case ruled && !outcome.allow && executionSucceeded(ev):
 				// signalClosed BEFORE emit: a caller that observes this event
 				// on h.Events() and immediately calls Inject must find
 				// h.closed already closed. Go's memory model only guarantees
@@ -444,19 +460,27 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 }
 
 // executionSucceeded reports whether a tool_execution_end says the call ran
-// and produced a NON-error result. It reads only the SDK-owned top-level
-// isError field and REQUIRES it to be present as a bool: an absent or
-// non-boolean field is unknown, and unknown is never "succeeded" — the one
-// session-fatal path left must rest on a positive statement from the runtime,
-// not on a missing field.
+// and produced a NON-error result. It reads the SDK-owned top-level error flag
+// under the same spellings the event mapper accepts (event_mapping.go's
+// ToolResultEvent) — one field, one rule, so the fatal path cannot go quietly
+// dead on a spelling the mapper still understands — and REQUIRES it to be
+// present as a bool: an absent or non-boolean field is unknown, and unknown is
+// never "succeeded". The one session-fatal path left must rest on a positive
+// statement from the runtime, not on a missing field.
 //
 // Verified against the pinned binary: a tool whose tool_call hook returned
 // {block:true} is finalized without executing and its tool_execution_end
 // carries isError:true with the block reason as the result text, so a deny
-// followed by isError:false means the block did not take effect.
+// followed by isError:false means the block did not take effect. The converse
+// does NOT hold — see doc.go's "The fail-safe fence" for the residual this
+// leaves.
 func executionSucceeded(ev rawEvent) bool {
-	isError, ok := ev.Fields["isError"].(bool)
-	return ok && !isError
+	for _, key := range []string{"isError", "error"} {
+		if isError, ok := ev.Fields[key].(bool); ok {
+			return !isError
+		}
+	}
+	return false
 }
 
 // acceptsPreExecutionRefusal recognizes the sole no-adjudication exception.
@@ -531,21 +555,22 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 
 	case adjudicateKind:
 		// The token must match the handshake's — a request without the session
-		// token is not from our verified extension. The refusal is still
-		// RECORDED before it is replied, so the call ends with an outcome
-		// rather than a hole; it is recorded untrusted, so an unauthenticated
-		// payload can never arm the fatal path for a call id it names.
+		// token is not from our verified extension. It is refused on the wire
+		// and noted as an untrusted frame, and it writes NOTHING the fence
+		// reads. An unverified payload naming a call id must not be able to
+		// vouch for that call (which would suppress the missing-adjudication
+		// record) or to overwrite a real ruling (which would disarm the one
+		// session-fatal path) — see adjudicationOutcome's registry invariant.
 		if !verifyHandshakeToken(stringField(payload, "token"), h.token) {
-			decision := Decision{Allow: false, Reason: "token mismatch"}
-			h.recordAdjudication(toolCallID(payload), decision, false)
-			_ = h.replyExtensionValue(reqID, mustDecisionJSON(decision))
+			h.refuseUnverifiedFrame(reqID, adjudicateKind, payload, ev,
+				mustDecisionJSON(Decision{Allow: false, Reason: "token mismatch"}))
 			return
 		}
 		call := parseAdjudicateCall(payload, h.spec.Cwd)
 		decision := h.policy.Evaluate(call)
 		// Record BEFORE the reply: the verdict must never lose a race with
 		// the tool_execution_end it governs.
-		h.recordAdjudication(toolCallID(payload), decision, true)
+		h.recordAdjudication(toolCallID(payload), decision)
 		_ = h.replyExtensionValue(reqID, mustDecisionJSON(decision))
 		h.emit(agent.SystemEvent{
 			Subtype: "permission_decision",
@@ -560,9 +585,9 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 		// tool is blocked either way; this round-trip exists so the refusal is
 		// recorded as the call's outcome instead of arriving at the monitor as
 		// a hole. Token-gated like adjudication: an unauthenticated refusal
-		// claim records nothing.
+		// claim records nothing the fence reads.
 		if !verifyHandshakeToken(stringField(payload, "token"), h.token) {
-			_ = h.replyExtensionValue(reqID, "reject")
+			h.refuseUnverifiedFrame(reqID, refusalKind, payload, ev, "reject")
 			return
 		}
 		reason := stringField(payload, "reason")
@@ -570,7 +595,7 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 			reason = "refused by the policy boundary before execution"
 		}
 		decision := Decision{Allow: false, Reason: reason}
-		h.recordAdjudication(toolCallID(payload), decision, true)
+		h.recordAdjudication(toolCallID(payload), decision)
 		_ = h.replyExtensionValue(reqID, "ok")
 		h.emit(agent.SystemEvent{
 			Subtype: "permission_decision",
@@ -582,6 +607,25 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 		_ = h.replyExtensionCancelled(reqID)
 		h.emit(agent.SystemEvent{Subtype: "unhandled_extension_request", Message: stringField(payload, "donmai"), Raw: raw(ev)})
 	}
+}
+
+// refuseUnverifiedFrame answers a boundary round-trip whose token did not
+// match, and notes the attempt WITHOUT letting it touch the adjudication
+// registry. The extension still gets a prompt answer so it never hangs, and
+// the operator still sees that an unverified frame was raised — but the
+// payload's claims about any call id are discarded, which is what keeps an
+// unauthenticated caller from suppressing a missing-adjudication record or
+// disarming the session-fatal path for a call it names.
+func (h *Handle) refuseUnverifiedFrame(reqID, kind string, payload map[string]any, ev rawEvent, reply string) {
+	tool := stringField(payload, "toolName")
+	callID := toolCallID(payload)
+	h.recordUntrustedFrame(kind, tool, callID)
+	_ = h.replyExtensionValue(reqID, reply)
+	h.emit(agent.SystemEvent{
+		Subtype: "unverified_extension_request",
+		Message: fmt.Sprintf("refused an unverified %s request naming tool %q (call %q) — it was not recorded as any call's outcome", kind, tool, callID),
+		Raw:     raw(ev),
+	})
 }
 
 // replyExtensionValue writes an extension_ui_response carrying a top-level
@@ -618,21 +662,43 @@ func (h *Handle) resolveHandshake(err error) {
 	h.handshakeOnce.Do(func() { h.handshakeResult <- err })
 }
 
-// recordAdjudication registers the outcome for one call id. Callers MUST call
-// it before delivering the verdict (allow or refusal) to the extension, so the
-// record can never lose a race with the tool_execution_end that follows.
+// recordAdjudication registers the outcome for one call id. Two rules bind
+// every caller:
+//
+//  1. Call it ONLY after verifyHandshakeToken has passed for that round-trip.
+//     The registry is the fence's memory — see adjudicationOutcome's registry
+//     invariant for why an unverified payload must never reach it.
+//  2. Call it BEFORE delivering the verdict (allow or refusal) to the
+//     extension, so the record can never lose a race with the
+//     tool_execution_end that follows.
 //
 // An empty call id records nothing: there is no key to correlate the later end
 // event against, and inventing one ("" for every such call) would let one
 // uncorrelatable call vouch for the next. Such a call is recorded as a miss by
 // the monitor instead of being read as a bypass.
-func (h *Handle) recordAdjudication(callID string, d Decision, trusted bool) {
+func (h *Handle) recordAdjudication(callID string, d Decision) {
 	if callID == "" {
 		return
 	}
 	h.adjMu.Lock()
-	h.adjudications[callID] = adjudicationOutcome{allow: d.Allow, reason: d.Reason, trusted: trusted}
+	h.adjudications[callID] = adjudicationOutcome{allow: d.Allow, reason: d.Reason}
 	h.adjMu.Unlock()
+}
+
+// recordUntrustedFrame notes a boundary round-trip that failed the token
+// check. It deliberately writes NOWHERE the fence reads: an unverified frame
+// can neither vouch for a call nor incriminate one.
+func (h *Handle) recordUntrustedFrame(kind, tool, callID string) {
+	h.adjMu.Lock()
+	h.untrusted = append(h.untrusted, untrustedFrame{kind: kind, tool: tool, callID: callID})
+	h.adjMu.Unlock()
+}
+
+// untrustedFrames returns a copy of the refused unverified frames.
+func (h *Handle) untrustedFrames() []untrustedFrame {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	return append([]untrustedFrame(nil), h.untrusted...)
 }
 
 // adjudication returns the recorded outcome for callID, if any.

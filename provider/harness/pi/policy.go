@@ -1,8 +1,10 @@
 package pi
 
 import (
+	"encoding/json"
 	"path/filepath"
 	"regexp"
+	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -64,8 +66,29 @@ var callIDFieldNames = []string{"toolCallId", "callId", "call_id", "id"}
 // toolCallID reads a tool call id from any accepted spelling. It returns ""
 // when the id is absent or empty — a call that cannot be correlated, which
 // the monitor records as an unproven call rather than treating as a bypass.
+//
+// A NUMERIC id is accepted and rendered the same way the extension's
+// toolCallIdOf renders it (JavaScript String(n)), because the symmetry has to
+// hold in both directions: if a runtime ever spelled ids numerically, a writer
+// that serialized "123" against a reader that saw float64(123) and gave up
+// would turn every honoured ruling into an unproven call. Integral values
+// render identically on both sides; values large enough that JavaScript
+// switches to exponent notation (>= 1e21) are out of scope — no runtime mints
+// call ids there.
 func toolCallID(fields map[string]any) string {
-	return stringField(fields, callIDFieldNames...)
+	for _, key := range callIDFieldNames {
+		switch value := fields[key].(type) {
+		case string:
+			if value != "" {
+				return value
+			}
+		case float64:
+			return strconv.FormatFloat(value, 'f', -1, 64)
+		case json.Number:
+			return value.String()
+		}
+	}
+	return ""
 }
 
 // isMutatingKind reports whether k mutates the filesystem (write/edit).
@@ -90,6 +113,17 @@ type ToolCall struct {
 // Decision is the adjudicator verdict for one tool call. Reason is filled on
 // deny so the model (which receives the deny string) sees WHY — mirroring
 // codex ApprovalDecision.Reason.
+//
+// What a deny is worth downstream: it is recorded against the call id before
+// it is delivered, and the integrity monitor later treats an end event for
+// that call as a bypass ONLY if the runtime reports the call ran and
+// succeeded. A denied call that ends with an error result is indistinguishable
+// from an honoured block — pi finalizes a blocked call with exactly that
+// shape, carrying this Reason as the result text — so a bypass whose tool
+// errors after its side effects is not caught. The reason text is not used to
+// tell those apart: tool output is the one part of the event a hostile
+// execution can write, and the monitor's session-fatal path must not rest on
+// it (doc.go, "What case 1 cannot see, and why it is not widened").
 type Decision struct {
 	Allow  bool
 	Reason string

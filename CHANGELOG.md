@@ -14,11 +14,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   session.** The Pi harness fence now asks what outcome the trust boundary
   recorded for a call, not merely whether a round-trip happened: every refusal
   is registered before it is delivered, both sides read the call id through one
-  shared rule, and a call with no record is reported as a non-fatal
-  `policy_adjudication_missing` error while the session runs on to its own
-  terminal. A session still aborts for the one case the event stream can
-  actually demonstrate — a denied call the runtime executed successfully
-  anyway.
+  shared rule (numeric ids included), and a call with no record is reported as
+  a non-fatal `policy_adjudication_missing` error while the session runs on to
+  its own terminal. A session still aborts for the one case the event stream
+  can actually demonstrate — a denied call the runtime executed successfully
+  anyway. Only a round-trip that passes the session handshake check may write
+  that record, so an unverified request can neither vouch for a call nor
+  overwrite a real ruling; unverified requests are answered and reported as
+  their own observation.
 
 ## v0.72.41 — 2026-09-13
 
