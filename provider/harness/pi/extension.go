@@ -40,11 +40,14 @@ const (
 	// only requests carrying it (extensions/donmai-policy.ts DONMAI_UI_MARKER).
 	donmaiUIMarker = "donmai-policy-v1"
 
-	// handshakeKind / adjudicateKind are the discriminators inside the JSON
-	// payload the extension puts in the extension_ui_request `title`
-	// (extensions/donmai-policy.ts KIND_*).
+	// handshakeKind / adjudicateKind / refusalKind are the discriminators
+	// inside the JSON payload the extension puts in the extension_ui_request
+	// `title` (extensions/donmai-policy.ts KIND_*). refusalKind carries a
+	// refusal the extension reached on its own, so a call the Go side never
+	// got to rule on still ends with a recorded outcome.
 	handshakeKind  = "handshake"
 	adjudicateKind = "adjudicate"
+	refusalKind    = "refusal"
 
 	// Provider-pin env vars the child extension reads to register the single
 	// "donmai" provider (extensions/donmai-policy.ts). The API key rides

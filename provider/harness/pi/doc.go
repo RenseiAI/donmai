@@ -79,15 +79,16 @@
 //     "pi loaded a stale/different extension" hole and the "session ran with no
 //     policy at all" hole.
 //
-//  3. Integrity monitors (handle.go, fail-closed at runtime): an
-//     extension_error referencing the donmai extension aborts the session
+//  3. Integrity monitors (handle.go, at runtime): an extension_error
+//     referencing the donmai extension aborts the session
 //     (ErrorEvent{Code:"policy_extension_failed"}) rather than continuing
-//     unguarded; a built-in tool_execution_END WITHOUT a completed adjudication
-//     round-trip for its call id is a policy bypass ⇒ session aborted (the real
-//     pi lifecycle emits tool_execution_start before the tool_call hook, so the
-//     bypass check point is the END, not the start); the child env is
-//     allowlist-composed so a fleet box's personal ~/.pi credentials and
-//     blocklisted host secrets are never visible to fleet sessions.
+//     unguarded; every guarded tool_execution_END is matched against the
+//     outcome the boundary RECORDED for its call id (the real pi lifecycle
+//     emits tool_execution_start before the tool_call hook, so the check point
+//     is the END, not the start). See "The fail-safe fence" below for what
+//     each answer means; the child env is allowlist-composed so a fleet box's
+//     personal ~/.pi credentials and blocklisted host secrets are never
+//     visible to fleet sessions.
 //
 // What this deliberately does NOT claim: OS-level sandboxing. The policy
 // extension is an in-process boundary — a hostile MODEL OUTPUT is contained
@@ -95,6 +96,78 @@
 // runs as the user. OS/sandbox-family enforcement stays the sandbox provider
 // family's job (E2B/container cells), unchanged. Do not mistake this
 // extension for a sandbox.
+//
+// # The fail-safe fence
+//
+// The monitor's question on a guarded tool_execution_end is "what outcome did
+// the boundary record for this call id", not "did a round-trip happen". The
+// distinction is the whole design, because the two are not the same thing and
+// treating them as one killed live sessions: a call whose ruling never got
+// recorded looks exactly like a call that was never ruled on.
+//
+// Runtime facts this rests on, verified against the pinned binary (its agent
+// loop's prepareToolCall/emitToolExecutionEnd, plus a live probe):
+//
+//   - tool_execution_start is emitted BEFORE the tool_call hook our
+//     adjudication rides. A call short-circuited before the hook (unknown
+//     tool, invalid arguments, an aborted turn) therefore reaches its END
+//     having never been offered for adjudication.
+//   - A call the tool_call hook BLOCKS still gets a tool_execution_end. pi
+//     finalizes it without executing and emits isError:true with the block
+//     reason as the result text. A refusal is therefore indistinguishable
+//     from an execution unless the refusal itself was recorded.
+//
+// So every path that refuses a call records the refusal as that call's
+// outcome BEFORE the refusal is delivered: the policy engine's own deny
+// (handle.go adjudicateKind), a refusal the extension reached alone
+// (refusalKind — the extension raises it for an unverified boundary or a
+// failed adjudication round-trip before returning its block), and the
+// token-mismatch reply (recorded untrusted, so an unauthenticated payload
+// cannot arm the fatal path below for a call id it names). Both sides read
+// the call id through ONE rule (policy.go callIDFieldNames ↔ the extension's
+// toolCallIdOf), so a writer/reader spelling asymmetry cannot silently
+// unregister an honoured ruling.
+//
+// The monitor then splits three ways, and only the first ends the session:
+//
+//  1. A trusted DENY for this call id, and the end event says the call ran and
+//     SUCCEEDED (top-level isError present and false). The refusal was not
+//     honoured; the tool ran anyway. That is a demonstrated bypass — the only
+//     one this event stream can demonstrate — and it stays fatal
+//     (ErrorEvent{Code:"policy_extension_failed"}).
+//  2. Any other recorded outcome, or a verified SDK pre-execution refusal
+//     receipt (acceptsPreExecutionRefusal). Ordinary; nothing is reported.
+//  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
+//     that could not be registered, or a call id that could not be correlated
+//     all land here. The call is recorded as unproven and surfaced as a
+//     NON-fatal ErrorEvent{Code:"policy_adjudication_missing"} naming the tool
+//     and the call id, and the session runs on to its own terminal. Downstream
+//     the run is still classified a provider failure (runner/loop.go), so the
+//     miss is loud — but the session's work, and its cost accounting, survive.
+//
+// Why case 3 only records: there is no refusal left to deliver. The end event
+// is emitted after pi has already finalized the call's result, and the only
+// pre-execution hook (tool_call) returned long before. Refusing "this single
+// call" is possible in exactly one place — the hook — and by the END the
+// window has closed.
+//
+// Two residual gaps, both deliberate and both bounded to "recorded, not
+// fatal":
+//
+//   - An extension-side refusal raised with NO UI channel, or one whose own
+//     registration round-trip fails, cannot be registered — the channel it
+//     would ride is the thing that is broken. The tool is still blocked; the
+//     call lands in case 3.
+//   - The registry is per-Handle and in memory. A new Handle over the same pi
+//     session (Resume, any re-adoption) starts empty, so a call ruled on by
+//     the previous handle lands in case 3. It is NOT seeded from the prior
+//     session's permission_decision events: those events are the runner's
+//     audit trail (<worktree>/.agent/events.jsonl), not provider state, and
+//     pi's own get_entries replay carries conversation messages, not our
+//     boundary round-trips — there is nothing authoritative to seed FROM
+//     inside this package. Rebuilding it would mean trusting a re-read of an
+//     audit file to decide a security outcome, which is worse than recording
+//     the calls as unproven.
 //
 // # D8 fixture family
 //

@@ -26,8 +26,10 @@ const (
 )
 
 // builtInToolNames is the set of pi built-in tools the extension overrides.
-// A tool_execution_start naming one of these WITHOUT a preceding adjudication
-// round-trip is a policy bypass (handle.go integrity monitor, design §5.3).
+// A tool_execution_end naming one of these WITHOUT a recorded adjudication
+// outcome is an UNPROVEN call: the monitor records it and surfaces a
+// non-fatal error, because "no record" cannot tell a real bypass apart from a
+// lost ruling (handle.go integrity monitor, doc.go "The fail-safe fence").
 var builtInToolNames = map[string]ToolKind{
 	"read":  ToolRead,
 	"write": ToolWrite,
@@ -42,6 +44,28 @@ var builtInToolNames = map[string]ToolKind{
 func isBuiltInTool(name string) bool {
 	_, ok := builtInToolNames[strings.ToLower(strings.TrimSpace(name))]
 	return ok
+}
+
+// callIDFieldNames is the ONE rule for reading a tool call's id, in priority
+// order. Every site that has to correlate a single call across the trust
+// boundary reads it through toolCallID below: the bypass monitor consuming a
+// tool_execution_end, the adjudication/refusal payload reader, and the event
+// mapper's ToolResultEvent (handle.go, event_mapping.go). The embedded
+// extension's own toolCallIdOf() accepts the same spellings in the same order
+// (extensions/donmai-policy.ts).
+//
+// The symmetry is load-bearing, not cosmetic. A writer that serialized only
+// `toolCallId` while the reader also accepted `callId`/`call_id`/`id` would
+// leave an HONOURED ruling unrecorded whenever the runtime spelled the field
+// any other way — and an unrecorded ruling used to be read as a bypass and
+// killed the session (doc.go, "The fail-safe fence").
+var callIDFieldNames = []string{"toolCallId", "callId", "call_id", "id"}
+
+// toolCallID reads a tool call id from any accepted spelling. It returns ""
+// when the id is absent or empty — a call that cannot be correlated, which
+// the monitor records as an unproven call rather than treating as a bypass.
+func toolCallID(fields map[string]any) string {
+	return stringField(fields, callIDFieldNames...)
 }
 
 // isMutatingKind reports whether k mutates the filesystem (write/edit).

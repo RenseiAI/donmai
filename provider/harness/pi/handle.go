@@ -18,6 +18,38 @@ import (
 // Compile-time assertion: Handle satisfies agent.Handle.
 var _ agent.Handle = (*Handle)(nil)
 
+// adjudicationOutcome is the recorded verdict for one tool call id. EVERY
+// path that ends a guarded call with a refusal records one (allow=false)
+// BEFORE the refusal is delivered, so the monitor can tell three cases apart
+// on tool_execution_end: an honoured ruling, a refusal, and a call the
+// boundary never got to rule on.
+//
+// trusted marks an outcome that arrived over a round-trip carrying the
+// per-session handshake token. Only a trusted DENY can arm the one remaining
+// session-fatal path (an execution that succeeded anyway); an untrusted
+// refusal — the token-mismatch reply, whose payload is by definition
+// unauthenticated — records the refusal without granting an unauthenticated
+// caller the power to make a later call fatal.
+type adjudicationOutcome struct {
+	allow   bool
+	reason  string
+	trusted bool
+}
+
+// adjudicationMiss is one guarded call that ended with no recorded outcome.
+// It is kept so the miss is inspectable on the handle, not only in the
+// emitted event stream.
+type adjudicationMiss struct {
+	tool   string
+	callID string
+}
+
+// adjudicationMissingCode is the non-fatal error code the monitor emits for a
+// guarded tool call that ended without a recorded outcome. Distinct from
+// policy_extension_failed on purpose: that code means the session must stop,
+// this one means one call could not be proven and the session continues.
+const adjudicationMissingCode = "policy_adjudication_missing"
+
 const (
 	// abortGrace is how long Stop waits for a clean agent_settled after sending
 	// abort before escalating to signals (design §2).
@@ -31,14 +63,15 @@ const (
 // PolicyEngine. It implements agent.Handle.
 //
 // The event pump (run) is the runtime half of the trust boundary: it
-// intercepts extension_ui_request events for handshake verification and tool
-// adjudication BEFORE they reach the event mapper, and runs the bypass monitor
-// on every built-in tool_execution_end (design §5.3). tool_execution_end — not
-// _start — is the bypass point because the real pi lifecycle emits
-// tool_execution_start BEFORE the tool_call hook that our adjudication rides,
-// then executes the tool, then emits tool_execution_end; by then a legitimate
-// call has completed its adjudication round-trip (verified against the real
-// binary).
+// intercepts extension_ui_request events for handshake verification, tool
+// adjudication and extension-side refusals BEFORE they reach the event mapper,
+// and runs the integrity monitor on every guarded tool_execution_end (design
+// §5.3). tool_execution_end — not _start — is the check point because the real
+// pi lifecycle emits tool_execution_start BEFORE the tool_call hook that our
+// adjudication rides, then finalizes the call, then emits tool_execution_end;
+// by then a legitimate call has recorded its outcome (verified against the
+// real binary). What the monitor does with each answer — and why only one of
+// them ends the session — is doc.go's "The fail-safe fence".
 type Handle struct {
 	client *rpcClient
 	cmd    *exec.Cmd
@@ -60,11 +93,21 @@ type Handle struct {
 	handshakeResult chan error
 	handshakeOnce   sync.Once
 
-	// adjudicated records the pi tool call ids that completed a policy
-	// round-trip, so the bypass monitor can flag a built-in tool_execution_end
-	// that arrived without one.
-	adjMu       sync.Mutex
-	adjudicated map[string]bool
+	// adjudications records, per pi tool call id, the outcome the trust
+	// boundary reached for that call — an allow, or a refusal from ANY path
+	// (policy deny, extension-side refusal, token mismatch). misses records
+	// the calls that ended with no outcome at all. Together they are what the
+	// integrity monitor reads on tool_execution_end; see doc.go's "The
+	// fail-safe fence" for the three-way split they encode.
+	//
+	// This registry is per-Handle and in memory only: a new Handle (Resume,
+	// or any re-adoption of a live pi session) starts empty, so calls ruled on
+	// by the previous handle read as unproven. That is bounded by design —
+	// unproven is recorded, never fatal — and doc.go states why no seeding
+	// path exists.
+	adjMu         sync.Mutex
+	adjudications map[string]adjudicationOutcome
+	misses        []adjudicationMiss
 
 	// turnInFlight is true between the first streaming event of a turn and its
 	// turn_end/agent_end — Inject routes to steer while in flight, follow_up
@@ -115,7 +158,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		token:           token,
 		receipt:         receipt,
 		handshakeResult: make(chan error, 1),
-		adjudicated:     make(map[string]bool),
+		adjudications:   make(map[string]adjudicationOutcome),
 		events:          make(chan agent.Event, 256),
 		closed:          make(chan struct{}),
 	}
@@ -299,37 +342,68 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		return false
 	}
 
-	// Bypass monitor: a built-in tool_execution_END MUST have completed a policy
-	// round-trip for its call id. A non-built-in end that claims the narrow SDK
-	// refusal is also checked here so a forged/unsupported claim cannot fall
-	// through the legacy unknown-tool mapping. This is belt-and-braces — it
-	// should be impossible when the policy extension is loaded — but it is the
-	// fail-closed catch if the extension is subverted. tool_execution_start is
-	// NOT the check point (the real lifecycle emits it before the tool_call hook
-	// our adjudication rides).
+	// Integrity monitor: every guarded tool_execution_END is matched against
+	// the outcome the boundary recorded for its call id. A non-built-in end
+	// that claims the narrow SDK refusal is checked here too, so a forged or
+	// unsupported claim cannot fall through the legacy unknown-tool mapping.
+	// tool_execution_start is NOT the check point: the real lifecycle emits it
+	// BEFORE the tool_call hook our adjudication rides (verified against the
+	// pinned binary — see doc.go).
+	//
+	// The split is three-way, and only the first case ends the session:
+	//
+	//  1. A trusted DENY for this call id, yet the call ended as a SUCCESSFUL
+	//     execution — the refusal was not honoured and the tool ran anyway.
+	//     That is a demonstrated bypass, and the only one this event stream
+	//     can demonstrate. Fatal.
+	//  2. Any other recorded outcome (an allow, or a refusal that ended as an
+	//     error result, which is exactly what pi emits for a blocked call) —
+	//     or a verified pre-execution refusal receipt. Nothing to report.
+	//  3. NO recorded outcome. This cannot distinguish a real bypass from a
+	//     ruling that was lost in transit, an extension-side refusal that
+	//     never reached us, or a call id we could not correlate — so it is
+	//     recorded and surfaced as a NON-fatal error, and the session
+	//     continues. There is no refusal left to deliver at this point: the
+	//     end event is emitted after pi has already finalized the call's
+	//     result, and the only pre-execution hook (tool_call) has long
+	//     returned. Record only is all that is available here.
 	if ev.Type == "tool_execution_end" {
 		tool := stringField(ev.Fields, "toolName", "tool", "name")
-		callID := stringField(ev.Fields, "toolCallId", "callId", "call_id", "id")
+		callID := toolCallID(ev.Fields)
 		_, claimsRefusal := ev.Fields["preExecutionRefusal"]
-		if !h.wasAdjudicated(callID) && (isBuiltInTool(tool) || claimsRefusal) && !h.acceptsPreExecutionRefusal(ev) {
-			// signalClosed BEFORE emit: a caller that observes this event on
-			// h.Events() and immediately calls Inject must find h.closed
-			// already closed. Go's memory model only guarantees the SEND
-			// half of a channel op happens-before the corresponding RECEIVE
-			// completes — nothing about what the sender does afterward is
-			// ordered against what the receiver does next. Closing h.closed
-			// here, strictly before the emit() that makes this event
-			// observable, puts the close on the happens-before side of that
-			// edge instead of racing it (closeEvents() still runs later, in
-			// run()'s deferred teardown — only the closed-signal needs to
-			// lead the fatal event, not the channel close itself).
-			h.signalClosed()
-			h.emit(agent.ErrorEvent{
-				Message: fmt.Sprintf("policy bypass: tool %q (call %q) ended without a policy adjudication or verified pre-execution refusal", tool, callID),
-				Code:    "policy_extension_failed",
-				Raw:     raw(ev),
-			})
-			return true // fatal: the trust boundary was violated, abort now.
+		if isBuiltInTool(tool) || claimsRefusal {
+			outcome, ruled := h.adjudication(callID)
+			switch {
+			case ruled && !outcome.allow && outcome.trusted && executionSucceeded(ev):
+				// signalClosed BEFORE emit: a caller that observes this event
+				// on h.Events() and immediately calls Inject must find
+				// h.closed already closed. Go's memory model only guarantees
+				// the SEND half of a channel op happens-before the
+				// corresponding RECEIVE completes — nothing about what the
+				// sender does afterward is ordered against what the receiver
+				// does next. Closing h.closed here, strictly before the
+				// emit() that makes this event observable, puts the close on
+				// the happens-before side of that edge instead of racing it
+				// (closeEvents() still runs later, in run()'s deferred
+				// teardown — only the closed-signal needs to lead the fatal
+				// event, not the channel close itself).
+				h.signalClosed()
+				h.emit(agent.ErrorEvent{
+					Message: fmt.Sprintf("policy bypass: tool %q (call %q) executed successfully after the policy boundary denied it (%s)", tool, callID, outcome.reason),
+					Code:    "policy_extension_failed",
+					Raw:     raw(ev),
+				})
+				return true // fatal: the denial was not honoured, abort now.
+			case ruled:
+			case h.acceptsPreExecutionRefusal(ev):
+			default:
+				h.recordMiss(tool, callID)
+				h.emit(agent.ErrorEvent{
+					Message: fmt.Sprintf("policy adjudication missing: tool %q (call %q) ended without a recorded policy ruling — the call is unproven and the session continues", tool, callID),
+					Code:    adjudicationMissingCode,
+					Raw:     raw(ev),
+				})
+			}
 		}
 	}
 
@@ -367,6 +441,22 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.emit(e)
 	}
 	return fatal
+}
+
+// executionSucceeded reports whether a tool_execution_end says the call ran
+// and produced a NON-error result. It reads only the SDK-owned top-level
+// isError field and REQUIRES it to be present as a bool: an absent or
+// non-boolean field is unknown, and unknown is never "succeeded" — the one
+// session-fatal path left must rest on a positive statement from the runtime,
+// not on a missing field.
+//
+// Verified against the pinned binary: a tool whose tool_call hook returned
+// {block:true} is finalized without executing and its tool_execution_end
+// carries isError:true with the block reason as the result text, so a deny
+// followed by isError:false means the block did not take effect.
+func executionSucceeded(ev rawEvent) bool {
+	isError, ok := ev.Fields["isError"].(bool)
+	return ok && !isError
 }
 
 // acceptsPreExecutionRefusal recognizes the sole no-adjudication exception.
@@ -441,20 +531,50 @@ func (h *Handle) handleExtensionRequest(ev rawEvent) {
 
 	case adjudicateKind:
 		// The token must match the handshake's — a request without the session
-		// token is not from our verified extension.
+		// token is not from our verified extension. The refusal is still
+		// RECORDED before it is replied, so the call ends with an outcome
+		// rather than a hole; it is recorded untrusted, so an unauthenticated
+		// payload can never arm the fatal path for a call id it names.
 		if !verifyHandshakeToken(stringField(payload, "token"), h.token) {
-			_ = h.replyExtensionValue(reqID, mustDecisionJSON(Decision{Allow: false, Reason: "token mismatch"}))
+			decision := Decision{Allow: false, Reason: "token mismatch"}
+			h.recordAdjudication(toolCallID(payload), decision, false)
+			_ = h.replyExtensionValue(reqID, mustDecisionJSON(decision))
 			return
 		}
 		call := parseAdjudicateCall(payload, h.spec.Cwd)
 		decision := h.policy.Evaluate(call)
-		if callID := stringField(payload, "toolCallId"); callID != "" {
-			h.markAdjudicated(callID)
-		}
+		// Record BEFORE the reply: the verdict must never lose a race with
+		// the tool_execution_end it governs.
+		h.recordAdjudication(toolCallID(payload), decision, true)
 		_ = h.replyExtensionValue(reqID, mustDecisionJSON(decision))
 		h.emit(agent.SystemEvent{
 			Subtype: "permission_decision",
 			Message: permissionMessage(call, decision),
+			Raw:     raw(ev),
+		})
+
+	case refusalKind:
+		// A refusal the EXTENSION reached on its own, before any verdict could
+		// be asked for — an unverified boundary, a missing UI channel, or a
+		// failed adjudication round-trip (extensions/donmai-policy.ts). The
+		// tool is blocked either way; this round-trip exists so the refusal is
+		// recorded as the call's outcome instead of arriving at the monitor as
+		// a hole. Token-gated like adjudication: an unauthenticated refusal
+		// claim records nothing.
+		if !verifyHandshakeToken(stringField(payload, "token"), h.token) {
+			_ = h.replyExtensionValue(reqID, "reject")
+			return
+		}
+		reason := stringField(payload, "reason")
+		if reason == "" {
+			reason = "refused by the policy boundary before execution"
+		}
+		decision := Decision{Allow: false, Reason: reason}
+		h.recordAdjudication(toolCallID(payload), decision, true)
+		_ = h.replyExtensionValue(reqID, "ok")
+		h.emit(agent.SystemEvent{
+			Subtype: "permission_decision",
+			Message: permissionMessage(parseAdjudicateCall(payload, h.spec.Cwd), decision),
 			Raw:     raw(ev),
 		})
 
@@ -498,21 +618,56 @@ func (h *Handle) resolveHandshake(err error) {
 	h.handshakeOnce.Do(func() { h.handshakeResult <- err })
 }
 
-func (h *Handle) markAdjudicated(callID string) {
+// recordAdjudication registers the outcome for one call id. Callers MUST call
+// it before delivering the verdict (allow or refusal) to the extension, so the
+// record can never lose a race with the tool_execution_end that follows.
+//
+// An empty call id records nothing: there is no key to correlate the later end
+// event against, and inventing one ("" for every such call) would let one
+// uncorrelatable call vouch for the next. Such a call is recorded as a miss by
+// the monitor instead of being read as a bypass.
+func (h *Handle) recordAdjudication(callID string, d Decision, trusted bool) {
+	if callID == "" {
+		return
+	}
 	h.adjMu.Lock()
-	h.adjudicated[callID] = true
+	h.adjudications[callID] = adjudicationOutcome{allow: d.Allow, reason: d.Reason, trusted: trusted}
 	h.adjMu.Unlock()
 }
 
-func (h *Handle) wasAdjudicated(callID string) bool {
+// adjudication returns the recorded outcome for callID, if any.
+func (h *Handle) adjudication(callID string) (adjudicationOutcome, bool) {
 	if callID == "" {
-		// Fail closed: a built-in call with no correlatable id cannot be
-		// proven to have been adjudicated.
-		return false
+		return adjudicationOutcome{}, false
 	}
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
-	return h.adjudicated[callID]
+	out, ok := h.adjudications[callID]
+	return out, ok
+}
+
+// wasAdjudicated reports whether the boundary reached ANY outcome for callID
+// (allow or refusal). It is the coarse question the real-binary fixtures ask;
+// the monitor itself needs the outcome, not just its existence.
+func (h *Handle) wasAdjudicated(callID string) bool {
+	_, ok := h.adjudication(callID)
+	return ok
+}
+
+// recordMiss registers a guarded call that ended with no recorded outcome.
+// Misses are never deduplicated: an empty call id is not an identity, so two
+// uncorrelatable calls must count as two.
+func (h *Handle) recordMiss(tool, callID string) {
+	h.adjMu.Lock()
+	h.misses = append(h.misses, adjudicationMiss{tool: tool, callID: callID})
+	h.adjMu.Unlock()
+}
+
+// adjudicationMisses returns a copy of the recorded misses.
+func (h *Handle) adjudicationMisses() []adjudicationMiss {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	return append([]adjudicationMiss(nil), h.misses...)
 }
 
 // signalClosed closes h.closed exactly once (teardown broadcast).

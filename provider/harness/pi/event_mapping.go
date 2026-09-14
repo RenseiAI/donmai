@@ -120,7 +120,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	case "tool_execution_start":
 		return []agent.Event{agent.ToolUseEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
-			ToolUseID: stringField(f, "toolCallId", "callId", "call_id", "id"),
+			ToolUseID: toolCallID(f),
 			Input:     mapField(f, "args", "input"),
 			Raw:       raw(ev),
 		}}, false
@@ -135,7 +135,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	case "tool_execution_end":
 		return []agent.Event{agent.ToolResultEvent{
 			ToolName:  stringField(f, "toolName", "tool", "name"),
-			ToolUseID: stringField(f, "toolCallId", "callId", "call_id", "id"),
+			ToolUseID: toolCallID(f),
 			Content:   toolResultContent(f),
 			IsError:   boolField(f, "isError", "error"),
 			Raw:       raw(ev),

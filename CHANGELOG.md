@@ -8,6 +8,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Fixes
+
+- **A tool call that ends without a recorded policy ruling no longer kills the
+  session.** The Pi harness fence now asks what outcome the trust boundary
+  recorded for a call, not merely whether a round-trip happened: every refusal
+  is registered before it is delivered, both sides read the call id through one
+  shared rule, and a call with no record is reported as a non-fatal
+  `policy_adjudication_missing` error while the session runs on to its own
+  terminal. A session still aborts for the one case the event stream can
+  actually demonstrate — a denied call the runtime executed successfully
+  anyway.
+
 ## v0.72.41 — 2026-09-13
 
 ### Fixes
