@@ -1,5 +1,7 @@
 package worktree
 
+import "context"
+
 // This file is compiled only into the package's test binary. It exposes the
 // process-wide coordination registries so the external test package can assert
 // on them directly — otherwise the lock registry's pruning and the base-fetch
@@ -29,4 +31,14 @@ func BaseFetchFlightRegistered(parent, ref string) bool {
 // registry's acquire/release accounting can be exercised without a filesystem.
 func AcquireParentLock(parent string) func() {
 	return acquireParentWorktreeLock(parent)
+}
+
+// FetchPullRequestHead exposes the clone step's dispatched-pull-request
+// materialization so the external test package can drive it against a clone
+// whose exact contents the test controls. That is the only way to observe the
+// base-commit-absent branch: a plain `git clone` fetches every head, so a
+// provisioned workarea always already has the base and the fetch would never
+// fire.
+func (m *Manager) FetchPullRequestHead(ctx context.Context, dst string, spec ProvisionSpec) error {
+	return m.fetchPullRequestHead(ctx, dst, spec)
 }

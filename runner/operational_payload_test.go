@@ -137,6 +137,11 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 	classifications := map[string]string{
 		"QueuedWork": "projected", "RepositoryDeclaration": "projected", "ResolvedProfile": "projected", "Branch": "projected", "TerminalWorkareaLease": "projected",
 		"WorkareaMode": "projected", "ParentWorkareaID": "projected", "RepositoryFilter": "projected", "CacheSeedID": "projected",
+		// The dispatched pull request decides which commits the workarea
+		// materializes, so it is admission-bound like every other workarea
+		// intent: a mirror that could name a different head than the receipted
+		// payload would defeat the head verification entirely.
+		"PullRequest":       "projected",
 		"PermissionProfile": "projected", "Env": "projected",
 		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",

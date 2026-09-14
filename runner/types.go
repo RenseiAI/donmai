@@ -29,6 +29,10 @@ type QueuedWork struct {
 	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
+	// PullRequest is the optional dispatched-pull-request record. Nil is
+	// ordinary branch work; non-nil makes workarea provisioning fetch and
+	// verify that pull request's head before the agent starts.
+	PullRequest *workarea.PullRequestV1 `json:"pullRequest,omitempty"`
 	// Env is the session-scoped operational environment carried by the trusted
 	// work source. It is part of admission digest authority and is distinct from
 	// daemon-local runtime bearers, which remain json:"-" below.

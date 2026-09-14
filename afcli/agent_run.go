@@ -1068,6 +1068,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		ParentWorkareaID:        d.ParentWorkareaID,
 		RepositoryFilter:        d.RepositoryFilter,
 		CacheSeedID:             d.CacheSeedID,
+		PullRequest:             d.PullRequest,
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			SessionName:          d.SessionName,
@@ -1122,9 +1123,16 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		if err := json.Unmarshal(d.OperationalPayload, &admitted); err != nil {
 			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)
 		}
+		// The dispatched pull request joins this guard because it decides
+		// WHICH COMMITS the workarea materializes — exactly the class of
+		// intent the receipted payload is authoritative for. A mirror that
+		// disagreed would otherwise silently lose the record and provision a
+		// plain branch clone, which is the failure this change exists to
+		// prevent.
 		if !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
-			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID {
+			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
+			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
 		if err := applyResolvedRepositoryCompatibility(d, &admitted); err != nil {
