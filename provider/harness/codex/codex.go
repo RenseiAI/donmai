@@ -47,6 +47,8 @@ type Provider struct {
 	config       *codexConfigBoundary
 	hostAuthFile string
 	processDone  chan error
+	stopOnce     sync.Once
+	stopErr      error
 	startMu      sync.Mutex
 	startErr     error
 	started      bool
@@ -264,6 +266,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 	} else {
 		// nolint:gosec // bin is sourced from explicit Options/env, not user input.
 		cmd := exec.Command(p.codexBin, p.opts.Args...)
+		configureOwnedProcessGroup(cmd)
 		cmd.Dir = p.opts.Cwd
 		cmd.Env = mergeEnv(p.opts.Env, sessionEnv, p.config.home)
 		stdin, err := cmd.StdinPipe()
@@ -303,6 +306,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		// watchExit / onClientClose / checkAlive below, which are what
 		// actually surface it.
 		p.processDone = make(chan error, 1)
+		p.config.stopWriter = func() error { return p.stopProcess(context.Background()) }
 		p.appServerStderr = captureAppServerStderr(stderr)
 	}
 
@@ -819,6 +823,7 @@ func (p *Provider) watchExit() {
 	err := p.cmd.Wait()
 	if p.processDone != nil {
 		p.processDone <- err
+		close(p.processDone)
 	}
 	p.logAppServerExit(err)
 	cause := err
@@ -865,27 +870,11 @@ func (p *Provider) terminateLocked(ctx context.Context) error {
 	p.closeOnce.Do(func() {
 		close(p.shutdown)
 
+		rerr = errors.Join(rerr, p.stopProcess(ctx))
 		if p.client != nil {
 			p.client.Stop(errors.New("codex provider shutting down"))
 		}
 
-		if p.cmd != nil && p.cmd.Process != nil {
-			// SIGTERM first, then force-kill after a grace
-			// period. Mirrors the legacy TS performShutdown.
-			_ = p.cmd.Process.Signal(syscallSIGTERM())
-			grace := 5 * time.Second
-			if dl, ok := ctx.Deadline(); ok {
-				if remaining := time.Until(dl); remaining < grace && remaining > 0 {
-					grace = remaining
-				}
-			}
-			select {
-			case <-p.processDone:
-			case <-time.After(grace):
-				_ = p.cmd.Process.Kill()
-				<-p.processDone
-			}
-		}
 		if p.stdin != nil {
 			_ = p.stdin.Close()
 		}
@@ -900,6 +889,26 @@ func (p *Provider) terminateLocked(ctx context.Context) error {
 		}
 	})
 	return rerr
+}
+
+// stopProcess joins the writer independently of Client.Stop. Failure and EOF
+// callbacks can remove the boundary too, and must use the same join before
+// its once-only cleanup. watchExit publishes Wait before invoking callbacks,
+// so joining here cannot wait on the callback that called us.
+func (p *Provider) stopProcess(ctx context.Context) error {
+	p.stopOnce.Do(func() {
+		if p.cmd == nil || p.cmd.Process == nil {
+			return
+		}
+		grace := 5 * time.Second
+		if dl, ok := ctx.Deadline(); ok {
+			if remaining := time.Until(dl); remaining < grace && remaining > 0 {
+				grace = remaining
+			}
+		}
+		p.stopErr = stopOwnedProcessGroup(p.cmd, p.processDone, grace)
+	})
+	return p.stopErr
 }
 
 // checkAlive returns ErrProviderUnavailable if the app-server has

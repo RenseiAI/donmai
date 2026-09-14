@@ -41,8 +41,11 @@ type codexConfigBoundary struct {
 	// boundary, and remove() skips the harvest step entirely — the default
 	// for every construction path and test that predates this field.
 	pluginCacheDir string
-	cleanup        sync.Once
-	cleanupErr     error
+	// stopWriter joins the headless app-server before retention is decided or
+	// any files are removed. Stream closure alone does not imply process exit.
+	stopWriter func() error
+	cleanup    sync.Once
+	cleanupErr error
 }
 
 func newCodexConfigBoundary(tempDir string, fileAuth bool) (*codexConfigBoundary, error) {
@@ -319,6 +322,12 @@ func (b *codexConfigBoundary) remove() error {
 		if err := b.validateParent(); err != nil {
 			b.cleanupErr = fmt.Errorf("refusing to remove Codex home: %w", err)
 			return
+		}
+		if b.stopWriter != nil {
+			if err := b.stopWriter(); err != nil {
+				b.cleanupErr = fmt.Errorf("stop isolated Codex writers: %w", err)
+				return
+			}
 		}
 		// A persisted rollout is Codex's resume key. This cleanup path is the
 		// normal lifecycle owner, so it must enforce the same retention rule as
