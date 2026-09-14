@@ -143,6 +143,17 @@ restart the daemon" step, and it no longer exists.
 `SessionDetail.repository` is resolved from normalized repository resources by
 `PollItemToSessionDetail` (in `poll.go`). The runner uses this URL for `git clone`.
 
+`SessionDetail.pullRequest` is the optional record for a session dispatched
+against an existing pull request rather than a bare branch:
+`{owner, repo, number, url, headSha, headRef, baseSha, baseRef, title, state,
+localRef}`, forwarded opaquely. The runner's workarea provisioning checks
+`owner`/`repo` against the cloned repository before issuing any git command,
+then fetches `refs/pull/<number>/head` into `localRef` over the clone's own
+remote and refuses the session — naming both commits — unless the fetched tip
+is `headSha`. `PollItemToSessionDetail` rebuilds the detail field by field
+rather than forwarding the poll item verbatim, so a new optional field reaches
+the runner only once it is mirrored into that literal too.
+
 The platform's QueuedWork wire shape historically carries a
 `projectName` slug (e.g. `"smoke-alpha"`) with no separate repository
 URL — slugs are not clonable. When the poll item arrives the daemon

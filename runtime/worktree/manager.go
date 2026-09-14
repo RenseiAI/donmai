@@ -623,6 +623,14 @@ type ProvisionSpec struct {
 	BaseRef string
 	// SkipBaseFetch explicitly preserves offline/test behaviour.
 	SkipBaseFetch bool
+	// PullRequest is the optional dispatched-pull-request record. When set,
+	// StrategyClone fetches that pull request's head into the clone and proves
+	// the fetched tip is the exact commit the dispatch recorded, before the
+	// agent starts. Nil keeps every clone byte-identical to a manager that
+	// never knew about pull requests. Only the singular in-box clone path
+	// carries it: the multi-repository declaration path builds its own
+	// per-repository specs, which deliberately name no pull request.
+	PullRequest *workarea.PullRequestV1
 }
 
 // Provision creates a worktree for the session, retrying up to
@@ -1833,7 +1841,10 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 				return fmt.Errorf("git sparse-checkout: %w (%s)", err, strings.TrimSpace(string(out)))
 			}
 		}
-		return nil
+		// The dispatched pull request's head is materialized here, inside the
+		// clone step and before Provision returns, so the agent never observes
+		// a workarea that is missing the commit it was dispatched against.
+		return m.fetchPullRequestHead(ctx, dst, spec)
 	case StrategyWorktreeAdd:
 		parent := spec.ParentRepoPath
 		if parent == "" {

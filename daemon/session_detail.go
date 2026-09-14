@@ -93,6 +93,15 @@ type SessionDetail struct {
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 
+	// PullRequest is the optional dispatched-pull-request record. Present only
+	// when the work source dispatched this session against an existing pull
+	// request; absent for ordinary branch work, and forwarded opaquely by the
+	// daemon. The runner's workarea provisioning fetches the named head into
+	// the clone and refuses the session if it is not the commit recorded here
+	// — see workarea.PullRequestV1 for the contract, including why no token
+	// and no forge API access accompanies it.
+	PullRequest *workarea.PullRequestV1 `json:"pullRequest,omitempty"`
+
 	// Ref is the base branch / ref to check out from.
 	Ref string `json:"ref,omitempty"`
 

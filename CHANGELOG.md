@@ -8,6 +8,31 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- **A dispatched pull request's head is fetched and verified before the agent
+  starts.** A work item may now carry an optional `pullRequest` record
+  (`{owner, repo, number, url, headSha, headRef, baseSha, baseRef, title,
+  state, localRef}`) alongside the repository. When present, workarea
+  provisioning first checks `owner`/`repo` against the repository the session
+  clones — a record naming any other repository fails the session before a
+  single git command runs, so nothing is ever fetched from another remote or
+  with another credential. It then fetches `refs/pull/<number>/head` into
+  `localRef` after the clone, over the same remote — and therefore the same
+  credential — the clone used, and compares the fetched tip with `headSha`: a
+  difference fails the session with a reason naming BOTH commits, because a
+  pull request's head moves on every push and a fetch without that check would
+  silently run the session against a head nobody chose. `baseSha`, when
+  recorded, must then be reachable; it is NOT fetched and there is no fallback
+  to `baseRef`, since repairing an unreachable base by pulling the base
+  branch's current tip would quietly change what the change is compared
+  against. A missing ref or a refused fetch fails the session the same way,
+  with the step named. All of these failures are deterministic and are not
+  retried. The agent receives no token and no forge
+  API access from this: the record is inert data, the one credentialed
+  operation is the git fetch performed by the provisioning process, and what
+  the agent gets is commits. Sessions without the record — every branch
+  dispatch — provision byte-identically to before.
 ### Fixes
 
 - **A tool call that ends without a recorded policy ruling no longer kills the

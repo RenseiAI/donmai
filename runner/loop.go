@@ -273,6 +273,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		ParentWorkareaID:      qw.ParentWorkareaID,
 		RepositoryFilter:      qw.RepositoryFilter,
 		CacheSeedID:           qw.CacheSeedID,
+		PullRequest:           qw.PullRequest,
 	})
 	if err != nil {
 		res.Status = "failed"

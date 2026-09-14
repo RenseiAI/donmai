@@ -71,6 +71,7 @@ type PollWorkItem struct {
 	ParentWorkareaID      string                            `json:"parentWorkareaId,omitempty"`
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
+	PullRequest           *workarea.PullRequestV1           `json:"pullRequest,omitempty"`
 	RequiresRepository    bool                              `json:"requiresRepository,omitempty"`
 	Ref                   string                            `json:"ref,omitempty"`
 	Priority              int                               `json:"priority,omitempty"`
@@ -1386,6 +1387,12 @@ func WithMergeQueueLanding(flag *bool) SessionDetailOption {
 // allowlist `id` when a match is found, so downstream code that uses
 // the project id (env vars, dashboards) sees a stable value.
 //
+// The detail is rebuilt field by field here, NOT forwarded verbatim: a new
+// optional field on PollWorkItem — PullRequest, say — reaches the runner only
+// once it is also mirrored into the literal below. Forgetting that mirror is
+// silent, and for a workarea-shaping field it degrades to "the agent worked on
+// the wrong commits" rather than to an error.
+//
 // Exported so embedders can drive multi-identity poll loops (e.g. a
 // downstream embedder that builds a SessionDetail from its own poll
 // loop before calling a shared daemon's AcceptWorkWithDetail). Optional
@@ -1442,6 +1449,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		ParentWorkareaID:        item.ParentWorkareaID,
 		RepositoryFilter:        item.RepositoryFilter,
 		CacheSeedID:             item.CacheSeedID,
+		PullRequest:             item.PullRequest,
 		Ref:                     item.Ref,
 		WorkType:                item.WorkType,
 		PromptContext:           item.PromptContext,
