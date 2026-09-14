@@ -1206,24 +1206,49 @@ func (c *Controller) SnapshotWithID(ctx context.Context, requestID uint64, mode 
 			close(call.done)
 		}
 	}
-	done := call.done
 	c.snapshotMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return c.awaitSnapshotCall(ctx, requestID, call)
+}
+
+func (c *Controller) awaitSnapshotCall(
+	ctx context.Context,
+	requestID uint64,
+	call *snapshotCall,
+) (shimwire.SnapshotResult, error) {
+	done := call.done
 	select {
 	case <-done:
-		c.snapshotMu.Lock()
-		defer c.snapshotMu.Unlock()
-		if call.result == nil {
-			return shimwire.SnapshotResult{}, call.err
-		}
-		return cloneSnapshotResult(*call.result), call.err
+		return c.snapshotCallOutcome(call)
+	default:
+	}
+	select {
+	case <-done:
+		return c.snapshotCallOutcome(call)
 	case <-ctx.Done():
 		return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: snapshot request %d: %w", requestID, ctx.Err())
 	case <-c.done:
+		// A fail-closed protocol decision completes the affected call before
+		// closing the stream. Preserve that authoritative disposition when both
+		// channels become ready before this goroutine is scheduled.
+		select {
+		case <-done:
+			return c.snapshotCallOutcome(call)
+		default:
+		}
 		return shimwire.SnapshotResult{}, io.EOF
 	}
+}
+
+func (c *Controller) snapshotCallOutcome(call *snapshotCall) (shimwire.SnapshotResult, error) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if call.result == nil {
+		return shimwire.SnapshotResult{}, call.err
+	}
+	return cloneSnapshotResult(*call.result), call.err
 }
 
 func (c *Controller) allocateSnapshotRequestID() uint64 {
