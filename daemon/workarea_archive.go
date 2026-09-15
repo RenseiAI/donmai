@@ -344,11 +344,28 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err != nil {
 		return fmt.Errorf("archive root: physical accounting: %w", err)
 	}
+	archiveRoot, err := r.openArchiveRoot(true)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = archiveRoot.Close() }()
+
+	// Keep the archive root open across the test seam. This pins the exact
+	// directory we inspected so a replacement after source authorization cannot
+	// redirect the archive to a different path-visible object.
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-open-archive-root"); err != nil {
+			return err
+		}
+	}
+	if err := r.assertArchiveRoot(archiveRoot); err != nil {
+		return err
+	}
 
 	r.mu.Lock()
 	defer r.mu.Unlock()
-	if err := os.MkdirAll(r.root, 0o700); err != nil {
-		return fmt.Errorf("archive root: create archive registry: %w", err)
+	if err := r.assertArchiveRoot(archiveRoot); err != nil {
+		return err
 	}
 	final := r.archiveDir(spec.WorkareaID)
 	if _, err := os.Lstat(final); err == nil {
@@ -476,6 +493,13 @@ func (r *WorkareaArchiveRegistry) List() (active, archived []afclient.WorkareaSu
 // A live provider entry wins on ID collision — restored rows never
 // double-count a live pool member and never confer pool authority.
 func (r *WorkareaArchiveRegistry) ListV1() (active, archived []afclient.WorkareaSummaryV1, err error) {
+	archiveRoot, exists, err := r.openExistingArchiveRoot()
+	if err != nil {
+		return nil, nil, err
+	}
+	if exists {
+		defer func() { _ = archiveRoot.Close() }()
+	}
 	if r.activeProvider != nil {
 		active, err = r.activeWorkareasV1()
 		if err != nil {
@@ -660,11 +684,24 @@ func (r *WorkareaArchiveRegistry) activeWorkareasV1() ([]afclient.WorkareaSummar
 // a manifest are skipped (not errored) so future-proofing scratch
 // directories don't break the listing.
 func (r *WorkareaArchiveRegistry) listArchivesV1() ([]afclient.WorkareaSummaryV1, error) {
-	entries, err := os.ReadDir(r.root)
+	archiveRoot, exists, err := r.openExistingArchiveRoot()
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
-			return []afclient.WorkareaSummaryV1{}, nil
-		}
+		return nil, err
+	}
+	if !exists {
+		return []afclient.WorkareaSummaryV1{}, nil
+	}
+	defer func() { _ = archiveRoot.Close() }()
+	directory, err := archiveRoot.Open(".")
+	if err != nil {
+		return nil, fmt.Errorf("open archive root %q: %w", r.root, err)
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
 		return nil, fmt.Errorf("read archive root %q: %w", r.root, err)
 	}
 	out := make([]afclient.WorkareaSummaryV1, 0, len(entries))
@@ -1422,8 +1459,15 @@ func (r *WorkareaArchiveRegistry) restoredDir() string {
 // summary. Returns (zero, false, nil) when the directory exists but
 // lacks a manifest — that's a normal "skip me" signal, not an error.
 func (r *WorkareaArchiveRegistry) summaryForV1(id string) (afclient.WorkareaSummaryV1, bool, error) {
-	manifestPath := filepath.Join(r.archiveDir(id), "manifest.json")
-	info, err := os.Stat(manifestPath)
+	archiveRoot, exists, err := r.openExistingArchiveRoot()
+	if err != nil {
+		return afclient.WorkareaSummaryV1{}, false, err
+	}
+	if !exists {
+		return afclient.WorkareaSummaryV1{}, false, nil
+	}
+	defer func() { _ = archiveRoot.Close() }()
+	info, err := archiveRoot.Stat(filepath.Join(id, "manifest.json"))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return afclient.WorkareaSummaryV1{}, false, nil
@@ -1470,13 +1514,28 @@ func (r *WorkareaArchiveRegistry) summaryForV1(id string) (afclient.WorkareaSumm
 }
 
 func (r *WorkareaArchiveRegistry) readManifest(id string) (*archiveManifest, error) {
-	manifestPath := filepath.Join(r.archiveDir(id), "manifest.json")
-	data, err := os.ReadFile(manifestPath) //nolint:gosec
+	archiveRoot, exists, err := r.openExistingArchiveRoot()
+	if err != nil {
+		return nil, err
+	}
+	if !exists {
+		return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
+	}
+	defer func() { _ = archiveRoot.Close() }()
+	file, err := archiveRoot.Open(filepath.Join(id, "manifest.json"))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
 		}
 		return nil, fmt.Errorf("read manifest %q: %w: %w", id, err, ErrArchiveCorrupted)
+	}
+	data, readErr := io.ReadAll(file)
+	closeErr := file.Close()
+	if readErr != nil {
+		return nil, fmt.Errorf("read manifest %q: %w: %w", id, readErr, ErrArchiveCorrupted)
+	}
+	if closeErr != nil {
+		return nil, fmt.Errorf("close manifest %q: %w: %w", id, closeErr, ErrArchiveCorrupted)
 	}
 	var m archiveManifest
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -1490,6 +1549,103 @@ func (r *WorkareaArchiveRegistry) readManifest(id string) (*archiveManifest, err
 		m.Extra = extra
 	}
 	return &m, nil
+}
+
+// openExistingArchiveRoot opens and validates an existing archive root. A
+// missing root remains an empty archive registry for listing callers.
+func (r *WorkareaArchiveRegistry) openExistingArchiveRoot() (*os.Root, bool, error) {
+	info, err := os.Lstat(r.root)
+	if errors.Is(err, fs.ErrNotExist) {
+		return nil, false, nil
+	}
+	if err != nil {
+		return nil, false, fmt.Errorf("archive root: inspect archive registry: %w", err)
+	}
+	return r.openArchiveRootFromInfo(info)
+}
+
+// openArchiveRoot creates the root when necessary, then pins the exact real
+// directory it found. os.MkdirAll alone only applies its mode to newly-created
+// components, so every pre-existing root is verified and tightened here too.
+func (r *WorkareaArchiveRegistry) openArchiveRoot(create bool) (*os.Root, error) {
+	if create {
+		if err := os.MkdirAll(r.root, 0o700); err != nil {
+			return nil, fmt.Errorf("archive root: create archive registry: %w", err)
+		}
+	}
+	info, err := os.Lstat(r.root)
+	if err != nil {
+		return nil, fmt.Errorf("archive root: inspect archive registry: %w", err)
+	}
+	root, _, err := r.openArchiveRootFromInfo(info)
+	return root, err
+}
+
+func (r *WorkareaArchiveRegistry) openArchiveRootFromInfo(info os.FileInfo) (*os.Root, bool, error) {
+	if err := validateArchiveRootInfo(info); err != nil {
+		return nil, false, err
+	}
+	root, err := os.OpenRoot(r.root)
+	if err != nil {
+		return nil, false, fmt.Errorf("archive root: open archive registry: %w", err)
+	}
+	opened, err := root.Stat(".")
+	if err != nil || !os.SameFile(info, opened) {
+		_ = root.Close()
+		return nil, false, fmt.Errorf("archive root: archive registry identity changed while opening")
+	}
+	if err := validateArchiveRootInfo(opened); err != nil {
+		_ = root.Close()
+		return nil, false, err
+	}
+	if opened.Mode().Perm()&0o077 != 0 {
+		if err := root.Chmod(".", 0o700); err != nil {
+			_ = root.Close()
+			return nil, false, fmt.Errorf("archive root: tighten archive registry mode: %w", err)
+		}
+		opened, err = root.Stat(".")
+		if err != nil {
+			_ = root.Close()
+			return nil, false, fmt.Errorf("archive root: inspect tightened archive registry: %w", err)
+		}
+		if err := validateArchiveRootInfo(opened); err != nil {
+			_ = root.Close()
+			return nil, false, err
+		}
+		if opened.Mode().Perm()&0o077 != 0 {
+			_ = root.Close()
+			return nil, false, fmt.Errorf("archive root: archive registry mode is broader than 0700")
+		}
+	}
+	return root, true, nil
+}
+
+func (r *WorkareaArchiveRegistry) assertArchiveRoot(root *os.Root) error {
+	opened, err := root.Stat(".")
+	if err != nil {
+		return fmt.Errorf("archive root: inspect pinned archive registry: %w", err)
+	}
+	if err := validateArchiveRootInfo(opened); err != nil {
+		return err
+	}
+	pathInfo, err := os.Lstat(r.root)
+	if err != nil || !os.SameFile(pathInfo, opened) {
+		return fmt.Errorf("archive root: archive registry identity changed after opening")
+	}
+	if err := validateArchiveRootInfo(pathInfo); err != nil {
+		return err
+	}
+	return nil
+}
+
+func validateArchiveRootInfo(info os.FileInfo) error {
+	if info == nil || !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("archive root: archive registry is not a real directory")
+	}
+	if !archiveRootOwnedByCurrentUser(info) {
+		return fmt.Errorf("archive root: archive registry is not owned by the current user")
+	}
+	return nil
 }
 
 // intoSessionIDInUse scans previously-recorded restores for a sidecar

@@ -83,6 +83,123 @@ func TestWorkareaArchiveRegistry_List_EmptyRoot(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_ArchiveRootSecuresConfiguredRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		precreate bool
+	}{
+		{name: "fresh root"},
+		{name: "pre-existing broad root", precreate: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "archives")
+			if tc.precreate {
+				if err := os.Mkdir(root, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+			if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+				WorkareaID: "wa-root-mode", SessionID: "session-root-mode", WorkareaRoot: source, SelectedPath: source,
+			}); err != nil {
+				t.Fatalf("archive: %v", err)
+			}
+			info, err := os.Lstat(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !archiveRootOwnedByCurrentUser(info) {
+				t.Fatalf("secured root info=%v", info.Mode())
+			}
+			_, archived, err := registry.List()
+			if err != nil || len(archived) != 1 || archived[0].ID != "wa-root-mode" {
+				t.Fatalf("list archive=%+v err=%v", archived, err)
+			}
+			restored, _, err := registry.Restore("wa-root-mode", afclient.WorkareaRestoreRequest{})
+			if err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			if body, err := os.ReadFile(filepath.Join(restored.Path, "retained.txt")); err != nil || string(body) != "retained" {
+				t.Fatalf("restored archive body=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestWorkareaArchiveRegistry_RefusesArchiveRootLinkAndReplacement(t *testing.T) {
+	t.Run("link on list", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "archives")
+		if err := os.Symlink(t.TempDir(), root); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root}).List(); err == nil {
+			t.Fatal("list through archive-root symlink succeeded")
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		replace func(t *testing.T, root string) string
+	}{
+		{name: "real directory replacement", replace: func(t *testing.T, root string) string {
+			t.Helper()
+			if err := os.Remove(root); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return root
+		}},
+		{name: "symlink replacement", replace: func(t *testing.T, root string) string {
+			t.Helper()
+			target := t.TempDir()
+			if err := os.Remove(root); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, root); err != nil {
+				t.Fatal(err)
+			}
+			return target
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "archives")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var replacement string
+			registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+				Root: root,
+				ArchiveHook: func(stage string) error {
+					if stage == "after-open-archive-root" {
+						replacement = tc.replace(t, root)
+					}
+					return nil
+				},
+			})
+			err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+				WorkareaID: "wa-root-race", SessionID: "session-root-race", WorkareaRoot: source, SelectedPath: source,
+			})
+			if err == nil || !strings.Contains(err.Error(), "identity changed after opening") {
+				t.Fatalf("replacement archive error=%v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(replacement, "wa-root-race")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replacement contains published archive: %v", err)
+			}
+		})
+	}
+}
+
 func TestWorkareaArchiveRegistry_List_DeterministicOrder(t *testing.T) {
 	root := t.TempDir()
 	for _, id := range []string{"zeta-1", "alpha-1", "mike-1"} {
