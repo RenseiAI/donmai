@@ -1640,6 +1640,13 @@ type sessionShimState struct {
 	// wg joins the per-session event consumers so shutdown cannot race one that
 	// is still writing bookkeeping.
 	wg sync.WaitGroup
+	// Recovery has a shorter lifetime than terminal reconciliation: Stop cancels
+	// it at drain admission, while terminal reconciliation runs until release.
+	recoveryCtx    context.Context
+	recoveryCancel context.CancelFunc
+	// test-only barriers for exact controller-consumer/recovery ordering.
+	afterReleaseShimIfLive       func()
+	transportRecoveryAttemptHook func()
 	// adoptionComplete records that the §D4 pass ran to completion. Capacity and
 	// readiness read it: a daemon that has NOT finished adopting must not
 	// advertise, because it does not yet know what is occupied.
@@ -1655,6 +1662,7 @@ type sessionShimState struct {
 }
 
 func newSessionShimState() *sessionShimState {
+	recoveryCtx, recoveryCancel := context.WithCancel(context.Background())
 	return &sessionShimState{
 		adopted:              make(map[sessionshim.Identity]adoptedShim),
 		keepalives:           make(map[sessionshim.Identity]sessionShimKeepaliveState),
@@ -1677,6 +1685,8 @@ func newSessionShimState() *sessionShimState {
 		reconciling:          make(map[string]bool),
 		reconcileRefusalNext: make(map[string]time.Time),
 		reconcileStop:        make(chan struct{}),
+		recoveryCtx:          recoveryCtx,
+		recoveryCancel:       recoveryCancel,
 	}
 }
 
@@ -5261,6 +5271,7 @@ func (d *Daemon) ReleaseAdoptedSessionShims() {
 		return
 	}
 	d.shims.mu.Lock()
+	d.shims.recoveryCancel()
 	adopted := d.shims.adopted
 	d.shims.adopted = make(map[sessionshim.Identity]adoptedShim)
 	d.shims.adoptionComplete = false

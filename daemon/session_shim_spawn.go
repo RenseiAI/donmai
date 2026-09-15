@@ -2982,6 +2982,15 @@ func awaitTombstone(
 // into visible, capacity-consuming quarantine.
 func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Controller, cause shimStreamEndCause) {
 	d.shims.mu.RLock()
+	hook := d.shims.afterReleaseShimIfLive
+	d.shims.mu.RUnlock()
+	if hook != nil {
+		defer hook()
+	}
+	if d.shims.recoveryCtx.Err() != nil {
+		return
+	}
+	d.shims.mu.RLock()
 	entry, ok := d.shims.adopted[id]
 	if ok && ctrl != nil && entry.controller != ctrl {
 		// A replacement controller already owns this identity. A consumer whose
@@ -3082,6 +3091,10 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		readopt = d.readoptSessionShimAfterPlatformCarrierLoss
 	}
 	switch readopt(id, entry, attemptBudget) {
+	case readoptionShutdown:
+		// Intentional drain cancellation is not evidence of a dead socket.
+		// Final release owns the adopted map and controller disposal.
+		return
 	case readoptionSucceeded:
 		// The streak counts CONSECUTIVE endings that never recovered. A
 		// re-adoption that lands is a recovery, so leaving the counter standing

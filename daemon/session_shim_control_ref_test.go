@@ -7,6 +7,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/attachwire"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
 )
@@ -167,6 +168,8 @@ func TestRebindKeepsLiveShimWhileReplacementGenerationIsStaged(t *testing.T) {
 		},
 	})
 	old := f.controller
+	consumed := make(chan struct{}, 1)
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
 	f.daemon.consumeShimEvents(old)
 	oldHarness := old.HarnessIdentity()
 	loseTheCarrierBinding(t, f)
@@ -187,7 +190,7 @@ func TestRebindKeepsLiveShimWhileReplacementGenerationIsStaged(t *testing.T) {
 	}
 	// The old consumer has now observed EOF while the old entry still owns the
 	// active rebind claim. It must not quarantine the live harness.
-	time.Sleep(25 * time.Millisecond)
+	awaitRecoverySignal(t, consumed, "old consumer EOF disposition")
 	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
 		t.Fatalf("old EOF quarantined a live shim during staged replacement: %+v", projected)
 	}
@@ -218,7 +221,7 @@ func TestTransportCarrierLossUsesExistingBoundedRecovery(t *testing.T) {
 	t.Parallel()
 	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond}, func(attempt int) error {
 		if attempt == 1 {
-			return errors.New("transient prepare refusal")
+			return errors.New("transient adoption callback refusal")
 		}
 		return nil
 	})
@@ -272,5 +275,280 @@ func TestTransportCarrierLossRefusesShutdownAndTerminalPrecedence(t *testing.T) 
 	f.daemon.finishAdoptedShim(f.id, shimwire.ExitMsg{})
 	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("transport after exit")); err == nil || changed {
 		t.Fatalf("post-Exit report = %v, %v, want terminal precedence refusal", changed, err)
+	}
+}
+
+// awaitRecoverySignal observes completion, never elapsed time as evidence.
+func awaitRecoverySignal(t *testing.T, ch <-chan struct{}, what string) {
+	t.Helper()
+	select {
+	case <-ch:
+	case <-time.After(5 * time.Second):
+		t.Fatalf("timed out waiting for %s", what)
+	}
+}
+
+// holdRecoveryDrain holds a real Stop before final controller release. The
+// landing cancellation proves Stop crossed its synchronized drain boundary.
+func holdRecoveryDrain(t *testing.T, d *Daemon) (<-chan error, func()) {
+	t.Helper()
+	release := make(chan struct{})
+	d.landingMu.Lock()
+	d.landingDone = release
+	d.landingMu.Unlock()
+	done := make(chan error, 1)
+	go func() { done <- d.Stop(context.Background()) }()
+	awaitRecoverySignal(t, d.landingCtx.Done(), "Stop drain admission")
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(release) }) }
+	t.Cleanup(unblock)
+	return done, unblock
+}
+
+func TestTransportRecoveryStopBeforeReportLeavesControllerOpen(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond}})
+	ref := controlRefFor(t, f.daemon, f.id)
+	done, release := holdRecoveryDrain(t, f.daemon)
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("late transport close")); changed || err == nil {
+		t.Fatalf("late report = %v, %v", changed, err)
+	}
+	select {
+	case <-f.controller.Done():
+		t.Fatal("Stop-before-report closed controller during drain")
+	default:
+	}
+	if n, _ := f.snapshot(); n != 0 {
+		t.Fatalf("late report prepared %d adoptions", n)
+	}
+	if f.daemon.sessionShimReconcileStopped() {
+		t.Fatal("Stop drain suppressed terminal reconciliation before release")
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportRecoveryStopBeforeAttemptAdmission(t *testing.T) {
+	t.Parallel()
+	entered, resume, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond}})
+	f.daemon.shims.transportRecoveryAttemptHook = func() { close(entered); <-resume }
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	t.Cleanup(unblock)
+	f.daemon.consumeShimEvents(f.controller)
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(controlRefFor(t, f.daemon, f.id), errors.New("transport close")); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, entered, "attempt admission barrier")
+	done, release := holdRecoveryDrain(t, f.daemon)
+	unblock()
+	awaitRecoverySignal(t, consumed, "cancelled consumer disposition")
+	if n, _ := f.snapshot(); n != 0 {
+		t.Fatalf("Stop-before-attempt ran %d adoptions", n)
+	}
+	if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+		t.Fatalf("shutdown quarantined live lineage: %+v", q)
+	}
+	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+		t.Fatalf("shutdown removed lineage before final release: %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportRecoveryStopCancelsAdmittedPrepareAndJoins(t *testing.T) {
+	t.Parallel()
+	entered, cancelled, resume, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	var calls struct {
+		sync.Mutex
+		n int
+	}
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond},
+		prepare: func(ctx context.Context, _ SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+			calls.Lock()
+			calls.n++
+			n := calls.n
+			calls.Unlock()
+			if n == 1 {
+				close(entered)
+				<-ctx.Done()
+				close(cancelled)
+				<-resume
+			}
+			return sessionshim.PreparedAdoption{}, ctx.Err()
+		},
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	t.Cleanup(unblock)
+	joined := make(chan struct{})
+	var joinOnce sync.Once
+	finishConsumer := func() { joinOnce.Do(func() { close(joined) }) }
+	t.Cleanup(finishConsumer)
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{}; <-joined }
+	f.daemon.consumeShimEvents(f.controller)
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(controlRefFor(t, f.daemon, f.id), errors.New("transport close")); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, entered, "actual PrepareAdoption callback")
+	done, release := holdRecoveryDrain(t, f.daemon)
+	awaitRecoverySignal(t, cancelled, "prepare context cancellation")
+	select {
+	case err := <-done:
+		t.Fatalf("Stop returned before recovery joined: %v", err)
+	default:
+	}
+	unblock()
+	awaitRecoverySignal(t, consumed, "cancelled prepare consumer completion")
+	calls.Lock()
+	n := calls.n
+	calls.Unlock()
+	if n != 1 {
+		t.Fatalf("shutdown started another prepare: calls=%d", n)
+	}
+	if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+		t.Fatalf("shutdown cancellation quarantined lineage: %+v", q)
+	}
+	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+		t.Fatalf("shutdown removed lineage before final release: %v", err)
+	}
+	release()
+	awaitRecoverySignal(t, f.daemon.shims.reconcileStop, "final release before consumer join")
+	select {
+	case err := <-done:
+		t.Fatalf("Stop returned while consumer still owned bookkeeping: %v", err)
+	default:
+	}
+	finishConsumer()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportReportActualExitWinsInConsumer(t *testing.T) {
+	t.Parallel()
+	entered, resume, terminal, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1), make(chan struct{}, 1)
+	var terminalOnce, exitOnce sync.Once
+	proof := make(chan SessionShimTerminalEvidence, 1)
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond},
+		onTerminalEvidence: func(_ context.Context, evidence SessionShimTerminalEvidence) error {
+			terminalOnce.Do(func() { proof <- evidence; terminal <- struct{}{} })
+			return nil
+		},
+	})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	t.Cleanup(unblock)
+	f.daemon.opts.SessionShim.OnSessionEvent = func(_ sessionshim.Identity, ev sessionshim.ControllerEvent) {
+		if ev.Kind == sessionshim.EventExit || (ev.Kind == sessionshim.EventHostFrame && ev.FrameType == attachwire.TypeExit) {
+			exitOnce.Do(func() { close(entered); <-resume })
+		}
+	}
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+	ref := controlRefFor(t, f.daemon, f.id)
+	f.daemon.consumeShimEvents(f.controller)
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	if err := f.shim.Terminate(ctx); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, entered, "actual Exit delivered to consumer")
+	// The consumer has received a genuine Exit but has not yet committed its
+	// terminal bookkeeping. A transport report must not make EOF own recovery.
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("Done raced Exit")); err != nil {
+		t.Fatal(err)
+	}
+	unblock()
+	awaitRecoverySignal(t, terminal, "terminal evidence publication")
+	if evidence := <-proof; evidence.Adoption == nil || len(evidence.DurableAdoptionCorrelation) == 0 {
+		t.Fatal("Exit was published by quarantine reconciliation instead of the adopted terminal consumer")
+	}
+	awaitRecoverySignal(t, consumed, "terminal consumer completion")
+	if n, _ := f.snapshot(); n != 0 {
+		t.Fatalf("actual Exit started %d recoveries", n)
+	}
+	if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+		t.Fatalf("actual Exit quarantined: %+v", q)
+	}
+}
+
+func TestTransportReportAndFailedFrameShareConsumerRecovery(t *testing.T) {
+	t.Parallel()
+	for _, watcherFirst := range []bool{true, false} {
+		name := "frame_first"
+		if watcherFirst {
+			name = "watcher_first"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			entered, resume, consumed, prepareEntered, prepareResume := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1), make(chan struct{}), make(chan struct{})
+			var outputOnce, adoptionOnce, resumeOnce, prepareOnce sync.Once
+			f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+				policy: SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond},
+				adoption: func(ctx context.Context, _ int) error {
+					adoptionOnce.Do(func() { close(prepareEntered) })
+					select {
+					case <-prepareResume:
+						return nil
+					case <-ctx.Done():
+						return ctx.Err()
+					}
+				},
+			})
+			unblock := func() { resumeOnce.Do(func() { close(resume) }); prepareOnce.Do(func() { close(prepareResume) }) }
+			t.Cleanup(unblock)
+			f.daemon.opts.SessionShim.OnSessionEventDurable = func(_ sessionshim.Identity, ev sessionshim.ControllerEvent) error {
+				isOutput := ev.Kind == sessionshim.EventOutput || (ev.Kind == sessionshim.EventHostFrame && ev.FrameType == attachwire.TypeOutput)
+				first := false
+				if isOutput {
+					outputOnce.Do(func() { first = true; close(entered) })
+				}
+				if first {
+					<-resume
+					return errors.New("carrier transport closed")
+				}
+				return nil
+			}
+			f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+			ref := controlRefFor(t, f.daemon, f.id)
+			oldHarness := f.controller.HarnessIdentity()
+			f.daemon.consumeShimEvents(f.controller)
+			if err := f.controller.WriteInput([]byte("competition\n")); err != nil {
+				t.Fatal(err)
+			}
+			awaitRecoverySignal(t, entered, "real output durable callback")
+			if !watcherFirst {
+				resumeOnce.Do(func() { close(resume) })
+				awaitRecoverySignal(t, prepareEntered, "consumer recovery adoption")
+			}
+			if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("watcher observed Done")); err != nil {
+				t.Fatal(err)
+			}
+			resumeOnce.Do(func() { close(resume) })
+			awaitRecoverySignal(t, prepareEntered, "single recovery adoption")
+			prepareOnce.Do(func() { close(prepareResume) })
+			awaitRecoverySignal(t, consumed, "recovery consumer completion")
+			if n, _ := f.snapshot(); n != 1 {
+				t.Fatalf("frame/Done competition ran %d adoption owners", n)
+			}
+			entry, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if entry.controller == f.controller || entry.controller.HarnessIdentity() != oldHarness {
+				t.Fatal("recovery did not preserve exact harness")
+			}
+			if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+				t.Fatalf("competing notifications quarantined lineage: %+v", q)
+			}
+		})
 	}
 }

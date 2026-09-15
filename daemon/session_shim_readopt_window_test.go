@@ -22,7 +22,8 @@ import (
 // used.
 type readoptFixtureOptions struct {
 	// policy is the re-adoption policy the daemon runs under.
-	policy SessionShimReadoptionPolicy
+	policy  SessionShimReadoptionPolicy
+	prepare func(context.Context, SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error)
 	// adoption answers the n-th durable-adoption call (1-based). Nil accepts
 	// every one.
 	adoption func(ctx context.Context, attempt int) error
@@ -122,6 +123,7 @@ func newReadoptFixtureWithOptions(t *testing.T, opts readoptFixtureOptions) *rea
 			f.batches = append(f.batches, cloneSessionShimAdoptionBatch(batch))
 			return SessionShimAdoptionBatchReceipt{DurableCorrelation: []byte("rev-readopt"), AdoptionRevision: "readopt-revision"}, nil
 		},
+		PrepareAdoption:              opts.prepare,
 		OnTerminalEvidence:           opts.onTerminalEvidence,
 		Readoption:                   opts.policy,
 		LineageLive:                  opts.lineageLive,
