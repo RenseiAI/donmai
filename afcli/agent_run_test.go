@@ -1745,9 +1745,13 @@ func receiptCapabilityDecoratorForTest() agent.ExtensionDecorator {
 
 func receiptCapabilityPiBinaryForTest(t *testing.T) string {
 	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary for disposable pi probe fixture: %v", err)
+	}
 	path := filepath.Join(t.TempDir(), "pi")
-	if err := os.WriteFile(path, []byte("#!/bin/sh\necho 'pi 0.80.10'\n"), 0o755); err != nil {
-		t.Fatalf("write disposable pi probe fixture: %v", err)
+	if err := os.Symlink(testBinary, path); err != nil {
+		t.Fatalf("link disposable pi probe fixture: %v", err)
 	}
 	return path
 }
