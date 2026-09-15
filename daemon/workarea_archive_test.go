@@ -83,6 +83,225 @@ func TestWorkareaArchiveRegistry_List_EmptyRoot(t *testing.T) {
 	}
 }
 
+func TestWorkareaArchiveRegistry_ArchiveRootSecuresConfiguredRoot(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		mode os.FileMode
+	}{
+		{name: "fresh root"},
+		{name: "pre-existing broad root", mode: 0o755},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "archives")
+			if tc.mode != 0 {
+				if err := os.Mkdir(root, tc.mode); err != nil {
+					t.Fatal(err)
+				}
+			}
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+			if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+				WorkareaID: "wa-root-mode", SessionID: "session-root-mode", WorkareaRoot: source, SelectedPath: source,
+			}); err != nil {
+				t.Fatalf("archive: %v", err)
+			}
+			info, err := os.Lstat(root)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 || info.Mode().Perm()&0o077 != 0 || !archiveRootOwnedByCurrentUser(info) {
+				t.Fatalf("secured root info=%v", info.Mode())
+			}
+			_, archived, err := registry.List()
+			if err != nil || len(archived) != 1 || archived[0].ID != "wa-root-mode" {
+				t.Fatalf("list archive=%+v err=%v", archived, err)
+			}
+			restored, _, err := registry.Restore("wa-root-mode", afclient.WorkareaRestoreRequest{})
+			if err != nil {
+				t.Fatalf("restore: %v", err)
+			}
+			if body, err := os.ReadFile(filepath.Join(restored.Path, "retained.txt")); err != nil || string(body) != "retained" {
+				t.Fatalf("restored archive body=%q err=%v", body, err)
+			}
+		})
+	}
+}
+
+func TestWorkareaArchiveRegistry_RefusesArchiveRootLinkAndReplacement(t *testing.T) {
+	t.Run("link on list", func(t *testing.T) {
+		parent := t.TempDir()
+		root := filepath.Join(parent, "archives")
+		if err := os.Symlink(t.TempDir(), root); err != nil {
+			t.Fatal(err)
+		}
+		if _, _, err := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root}).List(); err == nil {
+			t.Fatal("list through archive-root symlink succeeded")
+		}
+	})
+
+	for _, tc := range []struct {
+		name    string
+		replace func(t *testing.T, root string) string
+	}{
+		{name: "real directory replacement", replace: func(t *testing.T, root string) string {
+			t.Helper()
+			if err := os.Remove(root); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			return root
+		}},
+		{name: "symlink replacement", replace: func(t *testing.T, root string) string {
+			t.Helper()
+			target := t.TempDir()
+			if err := os.Remove(root); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, root); err != nil {
+				t.Fatal(err)
+			}
+			return target
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			root := filepath.Join(t.TempDir(), "archives")
+			if err := os.Mkdir(root, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			source := t.TempDir()
+			if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var replacement string
+			registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+				Root: root,
+				ArchiveHook: func(stage string) error {
+					if stage == "after-open-archive-root" {
+						replacement = tc.replace(t, root)
+					}
+					return nil
+				},
+			})
+			err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+				WorkareaID: "wa-root-race", SessionID: "session-root-race", WorkareaRoot: source, SelectedPath: source,
+			})
+			if err == nil || !strings.Contains(err.Error(), "identity changed after opening") {
+				t.Fatalf("replacement archive error=%v", err)
+			}
+			if _, err := os.Lstat(filepath.Join(replacement, "wa-root-race")); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("replacement contains published archive: %v", err)
+			}
+		})
+	}
+
+	t.Run("late replacement after descriptor-rooted stage", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "archives")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		source := t.TempDir()
+		if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		replacement := t.TempDir()
+		hookFired := false
+		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+			Root: root,
+			ArchiveHook: func(stage string) error {
+				if stage != "after-create-archive-stage" {
+					return nil
+				}
+				hookFired = true
+				if err := os.Rename(root, root+"-moved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(replacement, root); err != nil {
+					t.Fatal(err)
+				}
+				return nil
+			},
+		})
+		err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+			WorkareaID: "wa-late-root-race", SessionID: "session-late-root-race", WorkareaRoot: source, SelectedPath: source,
+		})
+		if err == nil || !strings.Contains(err.Error(), "identity changed after opening") {
+			t.Fatalf("late replacement archive error=%v", err)
+		}
+		if !hookFired {
+			t.Fatal("late replacement hook did not run after archive-stage creation")
+		}
+		if _, err := os.Lstat(filepath.Join(replacement, "wa-late-root-race")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("late replacement contains published archive: %v", err)
+		}
+	})
+
+	t.Run("same inode broad mode is tightened after open", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "archives")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		source := t.TempDir()
+		if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		broaderMode := os.FileMode(0o755)
+		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+			Root: root,
+			ArchiveHook: func(stage string) error {
+				if stage == "after-open-archive-root" {
+					return os.Chmod(root, broaderMode)
+				}
+				return nil
+			},
+		})
+		if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+			WorkareaID: "wa-root-chmod", SessionID: "session-root-chmod", WorkareaRoot: source, SelectedPath: source,
+		}); err != nil {
+			t.Fatalf("archive after same-inode chmod: %v", err)
+		}
+		info, err := os.Lstat(root)
+		if err != nil || info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("same-inode chmod root mode=%v err=%v", info.Mode(), err)
+		}
+	})
+}
+
+func TestWorkareaArchiveRegistry_ArchivesBesideUnrelatedUnreadableRootEntries(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "archives")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restoreMode := os.FileMode(0o700)
+	for _, name := range []string{"crash-leftover", "wa-unrelated"} {
+		path := filepath.Join(root, name)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, restoreMode) })
+	}
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa-new", SessionID: "session-new", WorkareaRoot: source, SelectedPath: source,
+	}); err != nil {
+		t.Fatalf("archive beside unreadable root entries: %v", err)
+	}
+	if info, err := os.Lstat(filepath.Join(root, "wa-new", "manifest.json")); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("published archive manifest info=%v err=%v", info, err)
+	}
+}
+
 func TestWorkareaArchiveRegistry_List_DeterministicOrder(t *testing.T) {
 	root := t.TempDir()
 	for _, id := range []string{"zeta-1", "alpha-1", "mike-1"} {
