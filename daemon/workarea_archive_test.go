@@ -198,6 +198,77 @@ func TestWorkareaArchiveRegistry_RefusesArchiveRootLinkAndReplacement(t *testing
 			}
 		})
 	}
+
+	t.Run("late replacement after descriptor-rooted stage", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "archives")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		source := t.TempDir()
+		if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		replacement := t.TempDir()
+		hookFired := false
+		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+			Root: root,
+			ArchiveHook: func(stage string) error {
+				if stage != "after-create-archive-stage" {
+					return nil
+				}
+				hookFired = true
+				if err := os.Rename(root, root+"-moved"); err != nil {
+					t.Fatal(err)
+				}
+				if err := os.Symlink(replacement, root); err != nil {
+					t.Fatal(err)
+				}
+				return nil
+			},
+		})
+		err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+			WorkareaID: "wa-late-root-race", SessionID: "session-late-root-race", WorkareaRoot: source, SelectedPath: source,
+		})
+		if err == nil || !strings.Contains(err.Error(), "identity changed after opening") {
+			t.Fatalf("late replacement archive error=%v", err)
+		}
+		if !hookFired {
+			t.Fatal("late replacement hook did not run after archive-stage creation")
+		}
+		if _, err := os.Lstat(filepath.Join(replacement, "wa-late-root-race")); !errors.Is(err, os.ErrNotExist) {
+			t.Fatalf("late replacement contains published archive: %v", err)
+		}
+	})
+
+	t.Run("same inode broad mode is tightened after open", func(t *testing.T) {
+		root := filepath.Join(t.TempDir(), "archives")
+		if err := os.Mkdir(root, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		source := t.TempDir()
+		if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		broaderMode := os.FileMode(0o755)
+		registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{
+			Root: root,
+			ArchiveHook: func(stage string) error {
+				if stage == "after-open-archive-root" {
+					return os.Chmod(root, broaderMode)
+				}
+				return nil
+			},
+		})
+		if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+			WorkareaID: "wa-root-chmod", SessionID: "session-root-chmod", WorkareaRoot: source, SelectedPath: source,
+		}); err != nil {
+			t.Fatalf("archive after same-inode chmod: %v", err)
+		}
+		info, err := os.Lstat(root)
+		if err != nil || info.Mode().Perm()&0o077 != 0 {
+			t.Fatalf("same-inode chmod root mode=%v err=%v", info.Mode(), err)
+		}
+	})
 }
 
 func TestWorkareaArchiveRegistry_List_DeterministicOrder(t *testing.T) {

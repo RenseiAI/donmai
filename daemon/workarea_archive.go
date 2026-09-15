@@ -25,6 +25,7 @@ package daemon
 import (
 	"bufio"
 	"context"
+	"crypto/rand"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
@@ -367,57 +368,95 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := r.assertArchiveRoot(archiveRoot); err != nil {
 		return err
 	}
-	final := r.archiveDir(spec.WorkareaID)
-	if _, err := os.Lstat(final); err == nil {
-		existing, readErr := r.readManifest(spec.WorkareaID)
+	final := spec.WorkareaID
+	if _, err := archiveRoot.Lstat(final); err == nil {
+		existing, readErr := readArchiveManifestRoot(archiveRoot, spec.WorkareaID)
 		if readErr == nil && existing.SchemaVersion == schemaVersion && existing.AcquisitionID == spec.AcquisitionID && existing.WorkareaID == spec.WorkareaID && existing.SessionID == spec.SessionID {
-			archivedRoot := workarea.RootPath(r.treeDir(spec.WorkareaID))
-			digest, digestErr := archiveTreeDigest(archivedRoot.String())
-			physical, physicalErr := workarea.PhysicalUsage(archivedRoot)
+			archivedRoot, openErr := archiveRoot.OpenRoot(filepath.Join(spec.WorkareaID, "tree"))
+			if openErr != nil {
+				return fmt.Errorf("archive root: open existing archive tree: %w", openErr)
+			}
+			digest, digestErr := archiveTreeDigestRoot(archivedRoot)
+			physical, physicalErr := workarea.PhysicalUsageRoot(archivedRoot)
 			if existing.SchemaVersion == workareaArchiveLegacyFlatV1 && spec.AcquisitionID == "" && existing.SelectedLeaf == "" {
-				if info, treeErr := os.Lstat(archivedRoot.String()); treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes {
+				info, treeErr := archivedRoot.Stat(".")
+				_ = archivedRoot.Close()
+				if treeErr == nil && info.IsDir() && info.Mode()&os.ModeSymlink == 0 && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes {
 					return nil
 				}
-			}
-			archivedDeclaration, declarationErr := workarea.ReadDeclaration(archivedRoot)
-			if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && workarea.ValidateDeclaredRoot(archivedRoot, archivedDeclaration) == nil && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
-				if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
-					return fmt.Errorf("archive root: bind existing immutable archive: %w", err)
+			} else {
+				archivedDeclaration, declarationErr := workarea.ReadDeclarationRoot(archivedRoot)
+				validErr := declarationErr
+				if declarationErr == nil {
+					validErr = workarea.ValidateDeclaredRootHandle(archivedRoot, archivedDeclaration)
 				}
-				return nil
+				_ = archivedRoot.Close()
+				if declarationErr == nil && archivedDeclaration.AcquisitionID == spec.AcquisitionID && archivedDeclaration.WorkareaID == spec.WorkareaID && archivedDeclaration.SessionID == spec.SessionID && validErr == nil && digestErr == nil && digest == existing.TreeDigest && physicalErr == nil && physical == existing.SizeBytes && existing.StoreID == acquisition.StoreID && existing.RootIdentity == acquisition.RootIdentity {
+					if err := acquisitions.BindArchive(spec.AcquisitionID, spec.WorkareaID, spec.SessionID, spec.WorkareaID, digest); err != nil {
+						return fmt.Errorf("archive root: bind existing immutable archive: %w", err)
+					}
+					return nil
+				}
 			}
 		}
 		return fmt.Errorf("archive root: identity collision: %w", ErrArchiveExists)
 	} else if !errors.Is(err, fs.ErrNotExist) {
 		return fmt.Errorf("archive root: inspect archive destination: %w", err)
 	}
-	stage, err := os.MkdirTemp(r.root, ".archive-"+spec.WorkareaID+"-")
+	if r.archiveHook != nil {
+		if err := r.archiveHook("before-create-archive-stage"); err != nil {
+			return err
+		}
+	}
+	if err := r.assertArchiveRoot(archiveRoot); err != nil {
+		return err
+	}
+	stage, err := createArchiveStage(archiveRoot, spec.WorkareaID)
 	if err != nil {
 		return fmt.Errorf("archive root: create stage: %w", err)
 	}
 	committed := false
 	defer func() {
 		if !committed {
-			_ = os.RemoveAll(stage)
+			_ = archiveRoot.RemoveAll(stage)
 		}
 	}()
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-create-archive-stage"); err != nil {
+			return err
+		}
+	}
 	if err := ctx.Err(); err != nil {
 		return err
 	}
-	if err := copyTreeRoot(rootHandle, filepath.Join(stage, "tree")); err != nil {
-		return fmt.Errorf("archive root: copy complete tree: %w", err)
+	stageRoot, err := archiveRoot.OpenRoot(stage)
+	if err != nil {
+		return fmt.Errorf("archive root: open stage: %w", err)
 	}
-	archiveTree := workarea.RootPath(filepath.Join(stage, "tree"))
-	archiveHandle, err := workarea.OpenRootExact(archiveTree, workarea.FileIdentity{})
+	defer func() { _ = stageRoot.Close() }()
+	sourceInfo, err := rootHandle.Stat(".")
+	if err != nil || !sourceInfo.IsDir() {
+		return fmt.Errorf("archive root: source root unavailable")
+	}
+	if err := stageRoot.Mkdir("tree", sourceInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("archive root: create archive tree: %w", err)
+	}
+	archiveHandle, err := stageRoot.OpenRoot("tree")
 	if err != nil {
 		return fmt.Errorf("archive root: open copied tree: %w", err)
 	}
+	defer func() { _ = archiveHandle.Close() }()
+	if err := archiveHandle.Chmod(".", sourceInfo.Mode().Perm()); err != nil {
+		return fmt.Errorf("archive root: set copied tree mode: %w", err)
+	}
+	if err := copyRootContents(rootHandle, archiveHandle); err != nil {
+		return fmt.Errorf("archive root: copy complete tree: %w", err)
+	}
 	manifest.SizeBytes, err = workarea.PhysicalUsageRoot(archiveHandle)
-	_ = archiveHandle.Close()
 	if err != nil {
 		return fmt.Errorf("archive root: account copied tree: %w", err)
 	}
-	manifest.TreeDigest, err = archiveTreeDigest(archiveTree.String())
+	manifest.TreeDigest, err = archiveTreeDigestRoot(archiveHandle)
 	if err != nil {
 		return fmt.Errorf("archive root: digest copied tree: %w", err)
 	}
@@ -425,11 +464,6 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err != nil {
 		return fmt.Errorf("archive root: encode manifest: %w", err)
 	}
-	stageRoot, err := os.OpenRoot(stage)
-	if err != nil {
-		return fmt.Errorf("archive root: open archive stage: %w", err)
-	}
-	defer func() { _ = stageRoot.Close() }()
 	manifestFile, err := stageRoot.OpenFile("manifest.json", os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
 	if err != nil {
 		return fmt.Errorf("archive root: create manifest: %w", err)
@@ -445,13 +479,16 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := manifestFile.Close(); err != nil {
 		return fmt.Errorf("archive root: close manifest: %w", err)
 	}
-	if err := syncArchiveTree(stage); err != nil {
+	if err := syncArchiveRoot(stageRoot); err != nil {
 		return err
 	}
-	if err := workarea.RenameNoReplace(stage, final); err != nil {
+	if err := archiveRootRenameNoReplace(archiveRoot, stage, final); err != nil {
 		return fmt.Errorf("archive root: publish archive: %w", err)
 	}
-	if err := archiveSyncDir(r.root); err != nil {
+	if err := syncArchiveRoot(archiveRoot); err != nil {
+		return err
+	}
+	if err := r.assertArchiveRoot(archiveRoot); err != nil {
 		return err
 	}
 	committed = true
@@ -1522,6 +1559,10 @@ func (r *WorkareaArchiveRegistry) readManifest(id string) (*archiveManifest, err
 		return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
 	}
 	defer func() { _ = archiveRoot.Close() }()
+	return readArchiveManifestRoot(archiveRoot, id)
+}
+
+func readArchiveManifestRoot(archiveRoot *os.Root, id string) (*archiveManifest, error) {
 	file, err := archiveRoot.Open(filepath.Join(id, "manifest.json"))
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
@@ -1627,6 +1668,21 @@ func (r *WorkareaArchiveRegistry) assertArchiveRoot(root *os.Root) error {
 	}
 	if err := validateArchiveRootInfo(opened); err != nil {
 		return err
+	}
+	if opened.Mode().Perm()&0o077 != 0 {
+		if err := root.Chmod(".", 0o700); err != nil {
+			return fmt.Errorf("archive root: tighten pinned archive registry mode: %w", err)
+		}
+		opened, err = root.Stat(".")
+		if err != nil {
+			return fmt.Errorf("archive root: inspect tightened pinned archive registry: %w", err)
+		}
+		if err := validateArchiveRootInfo(opened); err != nil {
+			return err
+		}
+		if opened.Mode().Perm()&0o077 != 0 {
+			return fmt.Errorf("archive root: archive registry mode is broader than 0700")
+		}
 	}
 	pathInfo, err := os.Lstat(r.root)
 	if err != nil || !os.SameFile(pathInfo, opened) {
@@ -1896,6 +1952,18 @@ func archiveTreeDigest(root string) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	return archiveTreeDigestEntries(entries)
+}
+
+func archiveTreeDigestRoot(root *os.Root) (string, error) {
+	entries, err := walkArchiveRoot(root)
+	if err != nil {
+		return "", err
+	}
+	return archiveTreeDigestEntries(entries)
+}
+
+func archiveTreeDigestEntries(entries []archiveEntry) (string, error) {
 	hash := sha256.New()
 	encoder := json.NewEncoder(hash)
 	encoder.SetEscapeHTML(false)
@@ -1915,6 +1983,121 @@ func archiveTreeDigest(root string) (string, error) {
 		}
 	}
 	return "sha256:" + hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func walkArchiveRoot(root *os.Root) ([]archiveEntry, error) {
+	entries := make([]archiveEntry, 0, 64)
+	hardlinks := make(map[workarea.FileIdentity]string)
+	if err := walkArchiveRootDirectory(root, "", &entries, hardlinks); err != nil {
+		return nil, err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Path < entries[j].Path })
+	return entries, nil
+}
+
+func walkArchiveRootDirectory(root *os.Root, prefix string, out *[]archiveEntry, hardlinks map[workarea.FileIdentity]string) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return err
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return err
+	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
+	for _, entry := range entries {
+		name := entry.Name()
+		info, err := root.Lstat(name)
+		if err != nil {
+			return err
+		}
+		relative := name
+		if prefix != "" {
+			relative = filepath.Join(prefix, name)
+		}
+		relative = filepath.ToSlash(relative)
+		archiveEntry := archiveEntry{Path: relative, IsDir: info.IsDir(), Size: info.Size(), ModeStr: info.Mode().String()}
+		switch {
+		case info.Mode()&os.ModeSymlink != 0:
+			target, err := root.Readlink(name)
+			if err != nil {
+				return err
+			}
+			archiveEntry.IsSymlink = true
+			archiveEntry.SymlinkTo = target
+		case info.IsDir():
+			child, err := root.OpenRoot(name)
+			if err != nil {
+				return err
+			}
+			opened, openErr := child.Stat(".")
+			if openErr != nil || !os.SameFile(info, opened) {
+				_ = child.Close()
+				return fmt.Errorf("archive digest directory identity changed")
+			}
+			walkErr := walkArchiveRootDirectory(child, relative, out, hardlinks)
+			_ = child.Close()
+			if walkErr != nil {
+				return walkErr
+			}
+		case info.Mode().IsRegular():
+			identity, err := workarea.IdentityOf(info)
+			if err != nil {
+				return err
+			}
+			if first := hardlinks[identity]; first != "" {
+				archiveEntry.HardlinkTo = first
+			} else {
+				hardlinks[identity] = relative
+			}
+			hash, err := hashRootFile(root, name, info)
+			if err != nil {
+				return err
+			}
+			archiveEntry.Hash = hash
+		default:
+			return fmt.Errorf("archive digest refuses special file %q", relative)
+		}
+		*out = append(*out, archiveEntry)
+	}
+	return nil
+}
+
+func hashRootFile(root *os.Root, name string, expected os.FileInfo) (string, error) {
+	file, err := root.Open(name)
+	if err != nil {
+		return "", err
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(expected, opened) {
+		return "", fmt.Errorf("archive digest file identity changed")
+	}
+	hash := sha256.New()
+	if _, err := io.Copy(hash, bufio.NewReader(file)); err != nil {
+		return "", err
+	}
+	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+func createArchiveStage(root *os.Root, archiveID string) (string, error) {
+	for range 128 {
+		random := make([]byte, 12)
+		if _, err := rand.Read(random); err != nil {
+			return "", err
+		}
+		name := ".archive-" + archiveID + "-" + hex.EncodeToString(random)
+		if err := root.Mkdir(name, 0o700); err == nil {
+			return name, nil
+		} else if !errors.Is(err, fs.ErrExist) {
+			return "", err
+		}
+	}
+	return "", fmt.Errorf("exhausted unique archive stage names")
 }
 
 // copyTree copies the source directory tree to dst, preserving symlinks
@@ -1993,6 +2176,7 @@ func copyRootDirectory(source, destination *os.Root, relativeDir string, hardlin
 	if err != nil {
 		return err
 	}
+	sort.Slice(entries, func(i, j int) bool { return entries[i].Name() < entries[j].Name() })
 	for _, entry := range entries {
 		name := filepath.Join(relativeDir, entry.Name())
 		info, err := source.Lstat(name)
@@ -2099,6 +2283,56 @@ func syncArchiveTree(root string) error {
 		if err := archiveSyncDir(directory); err != nil {
 			return err
 		}
+	}
+	return nil
+}
+
+func syncArchiveRoot(root *os.Root) error {
+	directory, err := root.Open(".")
+	if err != nil {
+		return fmt.Errorf("archive root: open directory for sync: %w", err)
+	}
+	entries, err := directory.ReadDir(-1)
+	closeErr := directory.Close()
+	if err == nil {
+		err = closeErr
+	}
+	if err != nil {
+		return fmt.Errorf("archive root: enumerate directories for sync: %w", err)
+	}
+	for _, entry := range entries {
+		info, err := root.Lstat(entry.Name())
+		if err != nil {
+			return fmt.Errorf("archive root: inspect directory for sync: %w", err)
+		}
+		if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
+			continue
+		}
+		child, err := root.OpenRoot(entry.Name())
+		if err != nil {
+			return fmt.Errorf("archive root: open child directory for sync: %w", err)
+		}
+		opened, openErr := child.Stat(".")
+		if openErr != nil || !os.SameFile(info, opened) {
+			_ = child.Close()
+			return fmt.Errorf("archive root: sync directory identity changed")
+		}
+		syncErr := syncArchiveRoot(child)
+		_ = child.Close()
+		if syncErr != nil {
+			return syncErr
+		}
+	}
+	directory, err = root.Open(".")
+	if err != nil {
+		return fmt.Errorf("archive root: reopen directory for sync: %w", err)
+	}
+	if err := directory.Sync(); err != nil {
+		_ = directory.Close()
+		return fmt.Errorf("archive root: sync directory: %w", err)
+	}
+	if err := directory.Close(); err != nil {
+		return fmt.Errorf("archive root: close synced directory: %w", err)
 	}
 	return nil
 }
