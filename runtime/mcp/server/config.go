@@ -40,9 +40,9 @@ type Config struct {
 // non-empty, must be RELATIVE and lexically under Root; its physical target
 // must also remain under Root's physical target. This permits aliases that
 // resolve within the configured worktree while refusing direct and chained
-// links into a sibling. These are the same rules the afcli `code` group
-// enforces (indexRoot in afcli/code.go), re-implemented here because that root
-// is discovered from cwd whereas ours is always explicit.
+// links into a sibling. The afcli `code` group shares the lexical constraints;
+// this server additionally requires physical containment. The CLI discovers
+// its root from cwd, whereas this server's root is always explicit.
 func resolveIndexRoot(root, repoPath string) (string, error) {
 	if root == "" {
 		return "", errors.New("--root is required (absolute path to the repo root)")
