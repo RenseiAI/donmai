@@ -132,27 +132,6 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 	return d.rebindAdoptedSessionShim(ctx, id, entry)
 }
 
-// RebindAdoptedSessionShimFor re-adopts only the exact controller incarnation
-// named by ref. A stale carrier callback cannot claim a replacement controller.
-func (d *Daemon) RebindAdoptedSessionShimFor(ctx context.Context, ref SessionShimControlRef) (SessionShimRebindResult, error) {
-	entry, claimed, refusal, err := d.claimSessionShimRebindFor(ref)
-	if err != nil {
-		return SessionShimNotAdopted, fmt.Errorf("session shim: rebind %s: %w", ref.Identity, err)
-	}
-	if !claimed {
-		switch refusal {
-		case SessionShimAlreadyBound:
-			return SessionShimAlreadyBound, nil
-		case SessionShimRebindInProgress:
-			return SessionShimRebindInProgress, fmt.Errorf("session shim: rebind %s: %w", ref.Identity, ErrSessionShimRebindInProgress)
-		default:
-			return SessionShimNotAdopted, fmt.Errorf("session shim: rebind %s: %w", ref.Identity, ErrSessionShimNotAdopted)
-		}
-	}
-	defer d.releaseSessionShimRebindClaim(ref.Identity, entry.controller)
-	return d.rebindAdoptedSessionShim(ctx, ref.Identity, entry)
-}
-
 func (d *Daemon) rebindAdoptedSessionShim(ctx context.Context, id sessionshim.Identity, entry adoptedShim) (SessionShimRebindResult, error) {
 	registry, err := d.sessionShimRegistry()
 	if err != nil {
@@ -185,17 +164,43 @@ func (d *Daemon) rebindAdoptedSessionShim(ctx context.Context, id sessionshim.Id
 	return SessionShimRebound, nil
 }
 
-// ReportAdoptedSessionShimCarrierLostFor records one carrier-loss transition
-// only when ref still names the current adopted controller. It does not stop a
-// harness or close the controller; it reports the loss and notifies the
-// existing callback after releasing the mutation lock.
-func (d *Daemon) ReportAdoptedSessionShimCarrierLostFor(ref SessionShimControlRef) (bool, error) {
-	changed, err := d.noteSessionShimCarrierBindLostFor(ref)
-	if err != nil || !changed {
-		return changed, err
+// ReportAdoptedSessionShimCarrierTransportLostFor hands one exact, non-nil
+// transport loss to the current controller consumer. It records the cause
+// before closing the controller; consumeShimEvents remains the single owner of
+// bounded recovery and quarantine disposition.
+func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShimControlRef, cause error) (bool, error) {
+	if cause == nil {
+		return false, errors.New("session shim: carrier transport loss cause is required")
 	}
-	d.raiseSessionShimCarrierBindLost(d.sessionShimConfig(), ref.Identity)
-	return true, nil
+	if err := validateSessionShimControlRef(ref); err != nil {
+		return false, err
+	}
+	if d.shims == nil {
+		return false, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
+	}
+	d.shims.mu.Lock()
+	entry, err := d.adoptedSessionShimEntryForLocked(ref)
+	if err != nil {
+		d.shims.mu.Unlock()
+		return false, err
+	}
+	if entry.terminal || entry.carrierTransportLoss != nil {
+		d.shims.mu.Unlock()
+		return false, nil
+	}
+	entry.carrierTransportLoss = cause
+	changed := entry.carrierBound
+	if changed {
+		entry.carrierBound = false
+		entry.carrierLostAtUnixNano = d.shimNow().UnixNano()
+	}
+	d.shims.adopted[ref.Identity] = entry
+	d.shims.mu.Unlock()
+	if changed {
+		d.raiseSessionShimCarrierBindLost(d.sessionShimConfig(), ref.Identity)
+	}
+	_ = entry.controller.Close()
+	return changed, nil
 }
 
 // claimSessionShimRebind takes the one in-flight rebind slot for a lineage, or
@@ -251,54 +256,6 @@ func (d *Daemon) noteSessionShimCarrierBindLost(id sessionshim.Identity, ctrl *s
 	d.shims.adopted[id] = current
 	d.shims.mu.Unlock()
 	return true
-}
-
-func (d *Daemon) noteSessionShimCarrierBindLostFor(ref SessionShimControlRef) (bool, error) {
-	if err := validateSessionShimControlRef(ref); err != nil {
-		return false, err
-	}
-	if d.shims == nil {
-		return false, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
-	}
-	d.shims.mu.Lock()
-	entry, err := d.adoptedSessionShimEntryForLocked(ref)
-	if err != nil {
-		d.shims.mu.Unlock()
-		return false, err
-	}
-	if !entry.carrierBound {
-		d.shims.mu.Unlock()
-		return false, nil
-	}
-	entry.carrierBound = false
-	entry.carrierLostAtUnixNano = d.shimNow().UnixNano()
-	d.shims.adopted[ref.Identity] = entry
-	d.shims.mu.Unlock()
-	return true, nil
-}
-
-func (d *Daemon) claimSessionShimRebindFor(ref SessionShimControlRef) (adoptedShim, bool, SessionShimRebindResult, error) {
-	if err := validateSessionShimControlRef(ref); err != nil {
-		return adoptedShim{}, false, SessionShimNotAdopted, err
-	}
-	if d.shims == nil {
-		return adoptedShim{}, false, SessionShimNotAdopted, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
-	}
-	d.shims.mu.Lock()
-	defer d.shims.mu.Unlock()
-	current, err := d.adoptedSessionShimEntryForLocked(ref)
-	if err != nil {
-		return adoptedShim{}, false, SessionShimNotAdopted, err
-	}
-	if current.rebinding {
-		return adoptedShim{}, false, SessionShimRebindInProgress, nil
-	}
-	if current.carrierBound {
-		return adoptedShim{}, false, SessionShimAlreadyBound, nil
-	}
-	current.rebinding = true
-	d.shims.adopted[ref.Identity] = current
-	return current, true, SessionShimRebindUnknown, nil
 }
 
 // raiseSessionShimCarrierBindLost delivers the bind-lost notification under the

@@ -2988,6 +2988,16 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		// own connection ended must never evict the live one.
 		ok = false
 	}
+	if ok && ctrl != nil && entry.controller == ctrl && entry.rebinding {
+		// sessionshim.Adopt commits the new generation and closes this old
+		// controller before the daemon installs its replacement. The old
+		// consumer's EOF belongs to the active rebind claim, not to a dead
+		// harness; the rebind pipeline will settle the adopted entry.
+		ok = false
+	}
+	if ok && ctrl != nil && entry.controller == ctrl && !entry.terminal && entry.carrierTransportLoss != nil && ctrl.StreamEndCause() == nil {
+		cause = shimStreamCarrierLostPlatform
+	}
 	d.shims.mu.RUnlock()
 	if !ok {
 		return

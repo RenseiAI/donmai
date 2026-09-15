@@ -2,8 +2,10 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
 )
@@ -22,7 +24,7 @@ func controlRefFor(t *testing.T, d *Daemon, id sessionshim.Identity) SessionShim
 	}
 }
 
-func TestReportAdoptedSessionShimCarrierLostForExactRefIsOnceOnly(t *testing.T) {
+func TestReportAdoptedSessionShimCarrierTransportLostForExactRefIsOnceOnly(t *testing.T) {
 	t.Parallel()
 	var callbacks struct {
 		sync.Mutex
@@ -37,15 +39,15 @@ func TestReportAdoptedSessionShimCarrierLostForExactRefIsOnceOnly(t *testing.T) 
 		},
 	})
 	ref := controlRefFor(t, f.daemon, f.id)
-	changed, err := f.daemon.ReportAdoptedSessionShimCarrierLostFor(ref)
+	changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("carrier transport closed"))
 	if err != nil || !changed {
-		t.Fatalf("ReportAdoptedSessionShimCarrierLostFor = %v, %v, want true, nil", changed, err)
+		t.Fatalf("ReportAdoptedSessionShimCarrierTransportLostFor = %v, %v, want true, nil", changed, err)
 	}
 	first := bindingFor(t, f.daemon, f.id)
 	if first.CarrierBound || first.LastCarrierLossAt.IsZero() {
 		t.Fatalf("binding after loss = %+v, want unbound with one loss instant", first)
 	}
-	changed, err = f.daemon.ReportAdoptedSessionShimCarrierLostFor(ref)
+	changed, err = f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("duplicate carrier transport close"))
 	if err != nil || changed {
 		t.Fatalf("duplicate report = %v, %v, want false, nil", changed, err)
 	}
@@ -70,7 +72,7 @@ func TestCarrierLossAndRebindForRefuseStaleOrReplacementAuthority(t *testing.T) 
 		"stale generation": func(in SessionShimControlRef) SessionShimControlRef { in.ControllerGeneration++; return in },
 	} {
 		t.Run(name, func(t *testing.T) {
-			changed, err := f.daemon.ReportAdoptedSessionShimCarrierLostFor(mutate(ref))
+			changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(mutate(ref), errors.New("stale carrier transport close"))
 			if err == nil || changed {
 				t.Fatalf("stale report = %v, %v, want false and refusal", changed, err)
 			}
@@ -80,21 +82,18 @@ func TestCarrierLossAndRebindForRefuseStaleOrReplacementAuthority(t *testing.T) 
 		})
 	}
 
-	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierLostFor(ref); err != nil || !changed {
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("carrier transport closed")); err != nil || !changed {
 		t.Fatalf("exact loss report = %v, %v", changed, err)
 	}
-	if result, err := f.daemon.RebindAdoptedSessionShimFor(context.Background(), ref); err != nil || result != SessionShimRebound {
-		t.Fatalf("RebindAdoptedSessionShimFor = %s, %v, want rebound", result, err)
+	if result, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID); err != nil || result != SessionShimRebound {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v, want rebound", result, err)
 	}
 	adoptions, _ := f.snapshot()
-	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierLostFor(ref); err == nil || changed {
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("old carrier transport close")); err == nil || changed {
 		t.Fatalf("old ref after replacement = %v, %v, want stale refusal", changed, err)
 	}
-	if result, err := f.daemon.RebindAdoptedSessionShimFor(context.Background(), ref); err == nil || result != SessionShimNotAdopted {
-		t.Fatalf("old ref rebind = %s, %v, want stale refusal", result, err)
-	}
 	if got, _ := f.snapshot(); got != adoptions {
-		t.Fatalf("stale rebind drove %d adoptions, want unchanged at %d", got, adoptions)
+		t.Fatalf("stale report drove %d adoptions, want unchanged at %d", got, adoptions)
 	}
 	if binding := bindingFor(t, f.daemon, f.id); !binding.CarrierBound {
 		t.Fatalf("stale callback unbound replacement: %+v", binding)
@@ -147,4 +146,107 @@ func TestFailedRebindReleasesItsOwnControllerClaim(t *testing.T) {
 	if stillClaimed {
 		t.Fatal("failed rebind left its own controller claim set")
 	}
+}
+
+func TestRebindKeepsLiveShimWhileReplacementGenerationIsStaged(t *testing.T) {
+	t.Parallel()
+	entered := make(chan struct{})
+	release := make(chan struct{})
+	var once sync.Once
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy: SessionShimReadoptionPolicy{Disabled: true},
+		adoption: func(ctx context.Context, _ int) error {
+			once.Do(func() { close(entered) })
+			select {
+			case <-release:
+				return nil
+			case <-ctx.Done():
+				return ctx.Err()
+			}
+		},
+	})
+	old := f.controller
+	f.daemon.consumeShimEvents(old)
+	oldHarness := old.HarnessIdentity()
+	loseTheCarrierBinding(t, f)
+	result := make(chan error, 1)
+	go func() {
+		_, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID)
+		result <- err
+	}()
+	select {
+	case <-entered:
+	case <-time.After(5 * time.Second):
+		t.Fatal("rebind never reached paused adoption after the shim accepted its new generation")
+	}
+	select {
+	case <-old.Done():
+	case <-time.After(5 * time.Second):
+		t.Fatal("old controller did not receive the shim's generation-replacement EOF")
+	}
+	// The old consumer has now observed EOF while the old entry still owns the
+	// active rebind claim. It must not quarantine the live harness.
+	time.Sleep(25 * time.Millisecond)
+	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("old EOF quarantined a live shim during staged replacement: %+v", projected)
+	}
+	f.daemon.shims.mu.RLock()
+	staged := f.daemon.shims.adopted[f.id]
+	f.daemon.shims.mu.RUnlock()
+	if staged.controller != old || !staged.rebinding {
+		t.Fatalf("staged entry = %+v, want old controller with active rebind claim", staged)
+	}
+
+	close(release)
+	if err := <-result; err != nil {
+		t.Fatalf("paused rebind: %v", err)
+	}
+	entry, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	if err != nil {
+		t.Fatalf("replacement entry missing: %v", err)
+	}
+	if entry.controller == old || entry.controller.HarnessIdentity() != oldHarness {
+		t.Fatalf("replacement did not retain the same live harness: old=%+v new=%+v", oldHarness, entry.controller.HarnessIdentity())
+	}
+	if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
+		t.Fatalf("successful staged rebind left quarantine: %+v", projected)
+	}
+}
+
+func TestTransportCarrierLossUsesExistingBoundedRecovery(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixture(t, SessionShimReadoptionPolicy{Attempts: 2, Backoff: time.Millisecond}, func(attempt int) error {
+		if attempt == 1 {
+			return errors.New("transient prepare refusal")
+		}
+		return nil
+	})
+	ref := controlRefFor(t, f.daemon, f.id)
+	old := f.controller
+	f.daemon.consumeShimEvents(old)
+	harness := old.HarnessIdentity()
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("typed transport loss")); err != nil || !changed {
+		t.Fatalf("ReportAdoptedSessionShimCarrierTransportLostFor = %v, %v", changed, err)
+	}
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		entry, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+		if err == nil && entry.controller != old {
+			if entry.controller.HarnessIdentity() != harness {
+				t.Fatalf("bounded recovery changed harness identity: old=%+v new=%+v", harness, entry.controller.HarnessIdentity())
+			}
+			if projected := f.daemon.QuarantinedSessions(); len(projected) != 0 {
+				t.Fatalf("bounded recovery quarantined live shim: %+v", projected)
+			}
+			adoptions, _ := f.snapshot()
+			if adoptions != 2 {
+				t.Fatalf("bounded recovery attempts = %d, want transient refusal then success", adoptions)
+			}
+			return
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	entry, entryErr := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	adoptions, _ := f.snapshot()
+	t.Fatalf("transport loss did not converge through the existing bounded recovery owner: entry=%+v err=%v adoptions=%d quarantined=%+v", entry, entryErr, adoptions, f.daemon.QuarantinedSessions())
 }

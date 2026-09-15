@@ -1414,6 +1414,10 @@ type adoptedShim struct {
 	// was last BOUND, an answer wrong in sign.
 	carrierBoundAtUnixNano int64
 	carrierLostAtUnixNano  int64
+	// carrierTransportLoss is the exact non-nil cause reported by an embedding
+	// carrier watcher before it closes this controller. The existing controller
+	// consumer reads it to enter the bounded platform-carrier recovery path.
+	carrierTransportLoss error
 	// rebinding marks a RebindAdoptedSessionShim whose daemon-side re-adoption
 	// is in flight. It is set and cleared under d.shims.mu and never held
 	// across the network work, so a second caller observes it and answers
