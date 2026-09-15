@@ -25,6 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/prompt"
+	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
 	providerstub "github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
@@ -1586,6 +1587,255 @@ func TestRunAgentRun_UnknownExplicitHarnessPrecedesGatewayAndRunningPost(t *test
 	}
 	if !strings.Contains(stdout.String(), `"denialCode": "unknown_harness"`) {
 		t.Fatalf("result JSON missing canonical denial receipt: %s", stdout.String())
+	}
+}
+
+// TestRunAgentRun_ReceiptCapabilityRealizationReachesPreSpawnGateway proves
+// that the immutable capability realization snapshot used to compile a ready
+// host receipt is also used by the child-side admission that consumes it. The
+// controlled gateway error is the production pre-provider-spawn checkpoint.
+func TestRunAgentRun_ReceiptCapabilityRealizationReachesPreSpawnGateway(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("PI_BIN", receiptCapabilityPiBinaryForTest(t))
+
+	const capability = "example.workflow-authoring/v1"
+	realizations := receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeHumanControlled)
+	decorate := receiptCapabilityDecoratorForTest()
+	detail := receiptBackedPiDetailForTest(t, capability, realizations, decorate)
+
+	var gatewayCalls atomic.Int32
+	originalBind := bindWorkerGatewayForAgentRun
+	bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork, string) (*workerGateway, error) {
+		gatewayCalls.Add(1)
+		return nil, errors.New("stop at the pre-provider-spawn gateway checkpoint")
+	}
+	t.Cleanup(func() { bindWorkerGatewayForAgentRun = originalBind })
+
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(platform.Close)
+	detail.PlatformURL = platform.URL
+
+	daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+			http.NotFound(w, r)
+			return
+		}
+		_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // test fixture has no credential values
+	}))
+	t.Cleanup(daemonServer.Close)
+
+	err := runAgentRun(t.Context(), &cobra.Command{}, &agentRunOpts{
+		sessionID: detail.SessionID, daemonURL: daemonServer.URL, worktree: t.TempDir(),
+		capabilityRealizations: realizations, specDecorator: decorate,
+	})
+	if err == nil || !strings.Contains(err.Error(), "pre-provider-spawn gateway checkpoint") {
+		t.Fatalf("runAgentRun error = %v, want controlled pre-spawn gateway checkpoint", err)
+	}
+	if gatewayCalls.Load() != 1 {
+		t.Fatalf("gateway checkpoint calls = %d, want 1", gatewayCalls.Load())
+	}
+}
+
+// TestRunAgentRun_ReceiptCapabilityRealizationRefusalPrecedesSpawn keeps the
+// fail-closed half of the contract: absent or differently keyed realizations
+// cannot reach the gateway, which is the final agent-run seam before provider
+// spawn.
+func TestRunAgentRun_ReceiptCapabilityRealizationRefusalPrecedesSpawn(t *testing.T) {
+	t.Setenv("PATH", t.TempDir())
+	t.Setenv("PI_BIN", receiptCapabilityPiBinaryForTest(t))
+
+	const capability = "example.workflow-authoring/v1"
+	ready := receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeHumanControlled)
+	decorate := receiptCapabilityDecoratorForTest()
+	detail := receiptBackedPiDetailForTest(t, capability, ready, decorate)
+	platform := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusOK)
+		_, _ = w.Write([]byte(`{}`))
+	}))
+	t.Cleanup(platform.Close)
+	detail.PlatformURL = platform.URL
+
+	for _, tc := range []struct {
+		name         string
+		realizations *agent.CapabilityRealizationRegistry
+	}{
+		{name: "nil registry"},
+		{name: "mismatched mode", realizations: receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeAutonomous)},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var gatewayCalls atomic.Int32
+			originalBind := bindWorkerGatewayForAgentRun
+			bindWorkerGatewayForAgentRun = func(context.Context, *slog.Logger, *daemon.SessionDetail, *runner.QueuedWork, string) (*workerGateway, error) {
+				gatewayCalls.Add(1)
+				return nil, errors.New("gateway must not run after capability refusal")
+			}
+			t.Cleanup(func() { bindWorkerGatewayForAgentRun = originalBind })
+
+			daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
+					http.NotFound(w, r)
+					return
+				}
+				_ = json.NewEncoder(w).Encode(detail) //nolint:gosec // test fixture has no credential values
+			}))
+			t.Cleanup(daemonServer.Close)
+
+			err := runAgentRun(t.Context(), &cobra.Command{}, &agentRunOpts{
+				sessionID: detail.SessionID, daemonURL: daemonServer.URL, worktree: t.TempDir(),
+				capabilityRealizations: tc.realizations, specDecorator: decorate,
+			})
+			var denial *runner.HarnessAdmissionError
+			if !errors.As(err, &denial) || denial.Code != executioncell.DenialCapabilityUnsupported {
+				t.Fatalf("runAgentRun error = %v, want typed capability_unsupported denial", err)
+			}
+			if gatewayCalls.Load() != 0 {
+				t.Fatalf("gateway checkpoint calls = %d, want 0 before provider spawn", gatewayCalls.Load())
+			}
+		})
+	}
+}
+
+func receiptCapabilityRealizationsForTest(t *testing.T, capability string, harness agent.HarnessName, mode agent.PromptSessionMode) *agent.CapabilityRealizationRegistry {
+	t.Helper()
+	adapterVersion := "pi/headless/tool-lifecycle-v2"
+	if mode == agent.PromptModeHumanControlled {
+		adapterVersion = "pi/interactive/tool-lifecycle-v6"
+	}
+	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "draft_create"}}
+	inputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{
+		stubAdditionalExtensionDeliveryForTest("draft-create", "test capability realization extension"),
+	})
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: capability, HarnessID: harness, AdapterVersion: adapterVersion, Mode: mode,
+		RecipeID: "test/native-extension-v1", DeclaredSurface: surface,
+		Entries: []agent.CapabilityRecipeEntry{{
+			EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, Required: true,
+			InputDigest: inputDigest, SurfaceRefs: surface,
+		}},
+	})
+	if err != nil {
+		t.Fatalf("new capability realization: %v", err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+		Declaration: declaration, FixtureID: "test-fixture", BinaryDigest: strings.Repeat("b", 64),
+		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: "additional-extensions", Channel: agent.ToolChannelToolPlugin, InputDigest: inputDigest}},
+		ObservedSurface:  surface,
+	})
+	if err != nil {
+		t.Fatalf("new capability observation: %v", err)
+	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatalf("compile capability realization: %v", err)
+	}
+	registry, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatalf("new capability realization registry: %v", err)
+	}
+	return registry
+}
+
+func receiptCapabilityDecoratorForTest() agent.ExtensionDecorator {
+	delivery := stubAdditionalExtensionDeliveryForTest("draft-create", "test capability realization extension")
+	return func(agent.Spec) []agent.ExtensionDelivery { return []agent.ExtensionDelivery{delivery} }
+}
+
+func receiptCapabilityPiBinaryForTest(t *testing.T) string {
+	t.Helper()
+	testBinary, err := os.Executable()
+	if err != nil {
+		t.Fatalf("locate test binary for disposable pi probe fixture: %v", err)
+	}
+	path := filepath.Join(t.TempDir(), "pi")
+	if err := os.Symlink(testBinary, path); err != nil {
+		t.Fatalf("link disposable pi probe fixture: %v", err)
+	}
+	return path
+}
+
+func receiptBackedPiDetailForTest(t *testing.T, capability string, realizations *agent.CapabilityRealizationRegistry, decorate agent.ExtensionDecorator) daemon.SessionDetail {
+	t.Helper()
+	const (
+		sessionID = "receipt-capability-realization"
+		workerID  = "worker-receipt-capability"
+	)
+	endpoint := &agent.EndpointBinding{
+		Company: agent.CompanyOpenAI, Model: "gpt-test", Protocol: agent.ProtoOpenAIChat, Host: agent.HostDirect,
+		EndpointID: "openai-direct", EndpointOperator: "openai", EndpointRevision: "2026-09-15", ModelAuthor: "openai",
+		AuthBindingID: "openai-auth", AuthAuthority: "openai", AuthCommercialMode: string(executioncell.CommercialUsageBilled),
+		AuthBindingScope: string(executioncell.ScopeProcess), AuthPortability: string(executioncell.Portable),
+		AuthDelivery: string(executioncell.DeliveryEnvironment), Mechanism: agent.AuthAPIKey,
+	}
+	qw := runner.QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: sessionID, Body: "receipt capability fixture", Mode: prompt.InteractiveRunMode}, ResolvedProfile: runner.ResolvedProfile{
+		Harness: string(agent.HarnessPi), Provider: agent.ProviderPi, Model: endpoint.Model, Endpoint: endpoint,
+	}}
+	cell := executioncell.ResolvedExecutionCell{
+		ContractVersion: executioncell.ContractVersion,
+		Harness:         executioncell.HarnessRef{ID: string(agent.HarnessPi), Version: "harness/v2"},
+		Model:           executioncell.ModelRef{ID: endpoint.Model, Author: endpoint.ModelAuthor},
+		Endpoint:        executioncell.ServingEndpointRef{ID: endpoint.EndpointID, Protocol: string(endpoint.Protocol), Operator: endpoint.EndpointOperator, Revision: endpoint.EndpointRevision},
+		AuthBinding: executioncell.AuthBindingRef{
+			ID: endpoint.AuthBindingID, Mechanism: executioncell.AuthAPIKey, CommercialMode: executioncell.CommercialUsageBilled,
+			Authority: endpoint.AuthAuthority, BindingScope: executioncell.ScopeProcess, Portability: executioncell.Portable, Delivery: executioncell.DeliveryEnvironment,
+		},
+		Placement:           executioncell.PlacementRef{ID: "host-test", Kind: executioncell.PlacementHost, Resolution: executioncell.PlacementExact},
+		SessionMode:         executioncell.SessionHumanControlled,
+		GrantedCapabilities: []executioncell.CapabilityRequirement{{Name: capability}},
+		EvidenceTier:        executioncell.EvidenceUnitVerified,
+		CompatibilityDigest: strings.Repeat("3", 64), RuntimeInventoryDigest: strings.Repeat("4", 64),
+	}
+	qw = attachAdmittedExecutionCellForTest(t, qw, cell)
+	qw.WorkerID = workerID
+	binding, err := json.Marshal(executioncell.RuntimeBinding{
+		ContractVersion: executioncell.RuntimeBindingContractVersion, RequestID: sessionID, WorkerID: workerID, PlacementID: cell.Placement.ID,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.ExecutionRuntimeBinding = binding
+	operational, err := runner.CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatalf("canonical operational payload: %v", err)
+	}
+	qw.OperationalPayload = operational
+
+	piProvider, err := providerpi.New(providerpi.Options{})
+	if err != nil {
+		t.Fatalf("new disposable pi provider: %v", err)
+	}
+	hostRegistry := runner.NewRegistry()
+	if err := hostRegistry.Register(piProvider); err != nil {
+		t.Fatalf("register disposable pi provider: %v", err)
+	}
+	hostInput, err := json.Marshal(map[string]any{
+		"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt,
+		"effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding,
+		"operationalPayload": qw.OperationalPayload,
+	})
+	if err != nil {
+		t.Fatalf("marshal host preflight input: %v", err)
+	}
+	hostReceipt, err := runner.NewProviderViewWithDecoratorAndRealizations(hostRegistry, decorate, realizations).PreflightExecution(hostInput)
+	if err != nil {
+		t.Fatalf("host preflight must accept exact capability realization: %v", err)
+	}
+
+	return daemon.SessionDetail{
+		SessionID: sessionID, WorkerID: workerID, AdmissionReceipt: qw.AdmissionReceipt,
+		EffectiveCell: qw.EffectiveCell, ExecutionRuntimeBinding: qw.ExecutionRuntimeBinding,
+		OperationalPayload: qw.OperationalPayload, HostAdaptationReceipt: hostReceipt,
+		ResolvedProfile: &daemon.SessionResolvedProfile{
+			Harness: string(agent.HarnessPi), Provider: string(agent.ProviderPi), Model: endpoint.Model,
+			Endpoint: &daemon.SessionEndpointBinding{
+				Company: string(endpoint.Company), Model: endpoint.Model, Protocol: string(endpoint.Protocol), Host: string(endpoint.Host),
+				EndpointID: endpoint.EndpointID, EndpointOperator: endpoint.EndpointOperator, EndpointRevision: endpoint.EndpointRevision, ModelAuthor: endpoint.ModelAuthor,
+				AuthBindingID: endpoint.AuthBindingID, AuthAuthority: endpoint.AuthAuthority, AuthCommercialMode: endpoint.AuthCommercialMode,
+				AuthBindingScope: endpoint.AuthBindingScope, AuthPortability: endpoint.AuthPortability, AuthDelivery: endpoint.AuthDelivery, Mechanism: string(endpoint.Mechanism),
+			},
+		},
 	}
 }
 
