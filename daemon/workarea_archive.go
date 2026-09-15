@@ -485,7 +485,7 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := archiveRootRenameNoReplace(archiveRoot, stage, final); err != nil {
 		return fmt.Errorf("archive root: publish archive: %w", err)
 	}
-	if err := syncArchiveRoot(archiveRoot); err != nil {
+	if err := syncArchiveDirectory(archiveRoot); err != nil {
 		return err
 	}
 	if err := r.assertArchiveRoot(archiveRoot); err != nil {
@@ -2323,9 +2323,13 @@ func syncArchiveRoot(root *os.Root) error {
 			return syncErr
 		}
 	}
-	directory, err = root.Open(".")
+	return syncArchiveDirectory(root)
+}
+
+func syncArchiveDirectory(root *os.Root) error {
+	directory, err := root.Open(".")
 	if err != nil {
-		return fmt.Errorf("archive root: reopen directory for sync: %w", err)
+		return fmt.Errorf("archive root: open directory for sync: %w", err)
 	}
 	if err := directory.Sync(); err != nil {
 		_ = directory.Close()

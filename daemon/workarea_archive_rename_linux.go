@@ -3,6 +3,8 @@
 package daemon
 
 import (
+	"fmt"
+	"math"
 	"os"
 
 	"golang.org/x/sys/unix"
@@ -14,5 +16,9 @@ func archiveRootRenameNoReplace(root *os.Root, source, destination string) error
 		return err
 	}
 	defer func() { _ = directory.Close() }()
-	return unix.Renameat2(int(directory.Fd()), source, int(directory.Fd()), destination, unix.RENAME_NOREPLACE)
+	fd := directory.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("archive root: directory descriptor overflows int")
+	}
+	return unix.Renameat2(int(fd), source, int(fd), destination, unix.RENAME_NOREPLACE)
 }

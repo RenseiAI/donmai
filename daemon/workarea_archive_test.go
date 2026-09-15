@@ -271,6 +271,37 @@ func TestWorkareaArchiveRegistry_RefusesArchiveRootLinkAndReplacement(t *testing
 	})
 }
 
+func TestWorkareaArchiveRegistry_ArchivesBesideUnrelatedUnreadableRootEntries(t *testing.T) {
+	root := filepath.Join(t.TempDir(), "archives")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	restoreMode := os.FileMode(0o700)
+	for _, name := range []string{"crash-leftover", "wa-unrelated"} {
+		path := filepath.Join(root, name)
+		if err := os.Mkdir(path, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		if err := os.Chmod(path, 0); err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = os.Chmod(path, restoreMode) })
+	}
+	source := t.TempDir()
+	if err := os.WriteFile(filepath.Join(source, "retained.txt"), []byte("retained"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	registry := NewWorkareaArchiveRegistry(WorkareaArchiveOptions{Root: root})
+	if err := registry.ArchiveRoot(t.Context(), WorkareaRootArchiveSpec{
+		WorkareaID: "wa-new", SessionID: "session-new", WorkareaRoot: source, SelectedPath: source,
+	}); err != nil {
+		t.Fatalf("archive beside unreadable root entries: %v", err)
+	}
+	if info, err := os.Lstat(filepath.Join(root, "wa-new", "manifest.json")); err != nil || !info.Mode().IsRegular() {
+		t.Fatalf("published archive manifest info=%v err=%v", info, err)
+	}
+}
+
 func TestWorkareaArchiveRegistry_List_DeterministicOrder(t *testing.T) {
 	root := t.TempDir()
 	for _, id := range []string{"zeta-1", "alpha-1", "mike-1"} {
