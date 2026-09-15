@@ -3,6 +3,7 @@ package sessionshim
 import (
 	"context"
 	"errors"
+	"io"
 	"net"
 	"os"
 	"testing"
@@ -102,6 +103,33 @@ func TestControllerRejectsRawPeerSnapshotResultWithoutAuthoritativeDisposition(t
 				t.Fatalf("EmitSnapshot = %v, want ErrSnapshotMismatch", err)
 			}
 		})
+	}
+}
+
+func TestCompletedSnapshotCallKeepsItsDispositionWhenControllerIsDone(t *testing.T) {
+	t.Parallel()
+	callDone := make(chan struct{})
+	close(callDone)
+	controllerDone := make(chan struct{})
+	close(controllerDone)
+	controller := &Controller{done: controllerDone}
+	call := &snapshotCall{done: callDone, err: shimwire.ErrSnapshotMismatch}
+
+	if _, err := controller.awaitSnapshotCall(context.Background(), 1, call); !errors.Is(err, shimwire.ErrSnapshotMismatch) {
+		t.Fatalf("awaitSnapshotCall = %v, want ErrSnapshotMismatch", err)
+	}
+}
+
+func TestIncompleteSnapshotCallReportsControllerEOF(t *testing.T) {
+	t.Parallel()
+	callDone := make(chan struct{})
+	controllerDone := make(chan struct{})
+	close(controllerDone)
+	controller := &Controller{done: controllerDone}
+	call := &snapshotCall{done: callDone}
+
+	if _, err := controller.awaitSnapshotCall(context.Background(), 1, call); !errors.Is(err, io.EOF) {
+		t.Fatalf("awaitSnapshotCall = %v, want EOF", err)
 	}
 }
 

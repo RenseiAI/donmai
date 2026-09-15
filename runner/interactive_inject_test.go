@@ -1158,7 +1158,11 @@ func TestInteractive_PullChannelAcksOnlyOnConsumption(t *testing.T) {
 		d.clock.fire(t)
 	}
 
+	// Prove the last false-consumption poll completed and re-armed before
+	// changing the channel. A buffered fake-clock fire only proves enqueue.
+	d.clock.waitArmed(t)
 	nch.setConsumed(true)
+	d.clock.fire(t)
 	d.pulser.waitAcked(t, "dlv-pull")
 
 	if got := d.session.recordedWrites(); len(got) != 0 {
@@ -1228,12 +1232,16 @@ func TestInteractive_PullChannelWaitsPastTheRefusalCap(t *testing.T) {
 		d.clock.waitArmed(t)
 		d.clock.fire(t)
 	}
+	// The final fire above is buffered; wait until the supervisor has consumed
+	// it and re-armed so every one of these polls definitively observed false.
+	d.clock.waitArmed(t)
 	if got := d.pulser.deadLettered(); len(got) != 0 {
 		t.Fatalf("a notice awaiting collection was dead-lettered at the REFUSAL cap: %+v — "+
 			"waiting for a turn to end is not a refusal", got)
 	}
 
 	nch.setConsumed(true)
+	d.clock.fire(t)
 	d.pulser.waitAcked(t, "dlv-patient")
 }
 
