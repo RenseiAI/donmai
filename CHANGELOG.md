@@ -8,54 +8,41 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.42 — 2026-09-15
+
 ### Features
 
-- **A dispatched pull request's head is fetched and verified before the agent
-  starts.** A work item may now carry an optional `pullRequest` record
-  (`{owner, repo, number, url, headSha, headRef, baseSha, baseRef, title,
-  state, localRef}`) alongside the repository. When present, workarea
-  provisioning first checks `owner`/`repo` against the repository the session
-  clones — a record naming any other repository fails the session before a
-  single git command runs, so nothing is ever fetched from another remote or
-  with another credential. It then fetches `refs/pull/<number>/head` into
-  `localRef` after the clone, over the same remote — and therefore the same
-  credential — the clone used, and compares the fetched tip with `headSha`: a
-  difference fails the session with a reason naming BOTH commits, because a
-  pull request's head moves on every push and a fetch without that check would
-  silently run the session against a head nobody chose. `baseSha`, when
-  recorded, must then be reachable; it is NOT fetched and there is no fallback
-  to `baseRef`, since repairing an unreachable base by pulling the base
-  branch's current tip would quietly change what the change is compared
-  against. A missing ref or a refused fetch fails the session the same way,
-  with the step named. All of these failures are deterministic and are not
-  retried. The agent receives no token and no forge
-  API access from this: the record is inert data, the one credentialed
-  operation is the git fetch performed by the provisioning process, and what
-  the agent gets is commits. Sessions without the record — every branch
-  dispatch — provision byte-identically to before.
+- Create native Linear documents from Markdown with `linear create-document`.
+  The command exposes all sixteen native creation fields and six parent types,
+  returns the native URL and persisted parent, and provides an optional typed
+  creation hook for embedders. File content becomes a native document body.
+- Interactive sessions receive a conversational operating protocol. Dispatched
+  work retains its structured result and delivery obligations.
+- Fetch and verify a dispatched pull request head before starting its workarea.
+  Repository identity, exact head and recorded base are checked before execution.
+
 ### Fixes
 
-- **A tool call that ends without a recorded policy ruling no longer kills the
-  session.** The Pi harness fence now asks what outcome the trust boundary
-  recorded for a call, not merely whether a round-trip happened: every refusal
-  is registered before it is delivered, both sides read the call id through one
-  shared rule (numeric ids included), and a call with no record is reported as
-  a non-fatal `policy_adjudication_missing` error while the session runs on to
-  its own terminal. A session still aborts for the one case the event stream
-  can actually demonstrate — a denied call the runtime executed successfully
-  anyway. Only a round-trip that passes the session handshake check may write
-  that record, so an unverified request can neither vouch for a call nor
-  overwrite a real ruling; unverified requests are answered and reported as
-  their own observation.
-- **A dispatched stage budget is now the session's maximum duration.** The
-  worker capped every non-interactive session at the runner's two-hour default
-  regardless of the budget it was dispatched, because the budget enforcer's
-  duration cap is derived from the run context and `context.WithDeadline` can
-  only pull a deadline in, never push it out — so a four-hour budget still died
-  at two hours, classified as a timeout. The budget now sets the run context's
-  bound directly; the two-hour default remains for work dispatched without one,
-  interactive sessions are unchanged, and a dispatched duration is clamped to a
-  24-hour ceiling so a malformed budget cannot produce an unbounded session.
+- Document creation refuses redirects and ambiguous automatic retries. Issue
+  lookup must match the requested identifier or UUID before mutation, and a
+  successful acknowledgement must include the native sync identifier.
+- Daemon embedders can authorize runtime workers through an organization-bound
+  ownership callback. Missing or refused ownership fails before registration.
+- Session shim adoption preserves typed snapshot errors, synchronizes teardown,
+  and ignores expired stall timers after the corresponding input was answered.
+- Codex shutdown waits for owned processes and handles exited Linux children
+  without treating zombies as running agents.
+- A tool call missing its recorded policy ruling reports a nonfatal error;
+  verified execution of an explicitly denied call still aborts the session.
+- A dispatched stage budget sets the non-interactive session duration, bounded
+  to twenty-four hours; work without a budget retains the existing default.
+
+### Chores
+
+- Make parallel race tests and lost-acknowledgement delivery checks deterministic
+  while retaining completion-before-status assertions and retry coverage.
 
 ## v0.72.41 — 2026-09-13
 
