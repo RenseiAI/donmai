@@ -85,16 +85,16 @@ func TestWorkareaArchiveRegistry_List_EmptyRoot(t *testing.T) {
 
 func TestWorkareaArchiveRegistry_ArchiveRootSecuresConfiguredRoot(t *testing.T) {
 	for _, tc := range []struct {
-		name      string
-		precreate bool
+		name string
+		mode os.FileMode
 	}{
 		{name: "fresh root"},
-		{name: "pre-existing broad root", precreate: true},
+		{name: "pre-existing broad root", mode: 0o755},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			root := filepath.Join(t.TempDir(), "archives")
-			if tc.precreate {
-				if err := os.Mkdir(root, 0o755); err != nil {
+			if tc.mode != 0 {
+				if err := os.Mkdir(root, tc.mode); err != nil {
 					t.Fatal(err)
 				}
 			}
