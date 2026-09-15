@@ -54,6 +54,8 @@ const wakeFixtureHarness = wakeFixtureCanonicalStty + wakeFixtureReportLoop
 // bytes delivered, and that a kernel-held draft is killed.
 const wakeFixtureRawHarness = wakeFixtureRawStty + wakeFixtureReportLoop
 
+const wakeFixtureReadyProbe = "wake-fixture-ready"
+
 const (
 	wakeFixtureCanonicalStty = `stty -echo -isig; `
 	wakeFixtureRawStty       = `stty -echo -isig -icanon min 1 time 0; `
@@ -139,6 +141,18 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 			}
 		}
 	}()
+	// The fixture shell changes terminal mode asynchronously after exec. Before
+	// control-byte assertions, prove it has completed that setup by sending an
+	// ordinary probe and reading the harness's exact acknowledgement. The frozen
+	// fixture intentionally never reads, so it is the sole no-handshake case.
+	if harness != wakeFixtureFrozenHarness {
+		if err := ctrl.WriteInput([]byte(wakeFixtureReadyProbe + "\r")); err != nil {
+			t.Fatalf("send fixture readiness probe: %v", err)
+		}
+		if got, ok := awaitWakeLine(output, 10*time.Second); !ok || got != hex.EncodeToString([]byte(wakeFixtureReadyProbe)) {
+			t.Fatalf("fixture raw-mode readiness acknowledgement=%q (ok=%v), want %q", got, ok, hex.EncodeToString([]byte(wakeFixtureReadyProbe)))
+		}
+	}
 
 	d := New(Options{SkipRegistration: true, SessionShim: SessionShimConfig{RegistryDir: registryDir}})
 	d.shims.mu.Lock()
@@ -167,11 +181,15 @@ func (f *wakeFixture) awaitAck(t *testing.T, within time.Duration) bool {
 // delivered, and that a kernel-held draft is killed rather than submitted.
 func (f *wakeFixture) awaitLine(t *testing.T, within time.Duration) (string, bool) {
 	t.Helper()
+	return awaitWakeLine(f.output, within)
+}
+
+func awaitWakeLine(output <-chan []byte, within time.Duration) (string, bool) {
 	deadline := time.After(within)
 	var seen strings.Builder
 	for {
 		select {
-		case data, ok := <-f.output:
+		case data, ok := <-output:
 			if !ok {
 				return seen.String(), false
 			}
@@ -655,6 +673,23 @@ func TestRedeliveryAfterASuccessfulWriteIsDeduped(t *testing.T) {
 	}
 	if !already {
 		t.Fatal("a delivered mutation was not recorded; a redelivery would write into the terminal twice")
+	}
+}
+
+// The forced canonical control proves the historical CI byte shape is possible
+// when the wake arrives before raw mode: Ctrl-U is consumed by the canonical
+// line discipline, leaving Ctrl-A/Ctrl-K for the harness to read. The fixture
+// readiness handshake makes this mode choice explicit rather than timing it.
+func TestWakeFixtureCanonicalModeConsumesCtrlU(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureHarness)
+	m := wakeMutation(t, "session.wake", "m-canonical", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(m); err != nil {
+		t.Fatalf("canonical wake = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "010b" {
+		t.Fatalf("canonical wake delivered %q (ok=%v), want 010b", got, ok)
 	}
 }
 
