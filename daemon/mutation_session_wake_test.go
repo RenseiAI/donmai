@@ -54,6 +54,15 @@ const wakeFixtureHarness = wakeFixtureCanonicalStty + wakeFixtureReportLoop
 // bytes delivered, and that a kernel-held draft is killed.
 const wakeFixtureRawHarness = wakeFixtureRawStty + wakeFixtureReportLoop
 
+// wakeFixtureTransitionHarness begins in canonical mode and switches to raw
+// only after the first ordinary line. The constructor's readiness probe must
+// own that first line; otherwise the wake's Ctrl-U is consumed canonically and
+// the exact delivery assertion goes red.
+const wakeFixtureTransitionHarness = wakeFixtureCanonicalStty +
+	`IFS= read -r line; ` + wakeFixtureRawStty +
+	`printf 'ack:'; printf '%s' "$line" | od -An -tx1 | tr -d ' \n'; printf '\n'; ` +
+	wakeFixtureReportLoop
+
 const wakeFixtureReadyProbe = "wake-fixture-ready"
 
 const (
@@ -690,6 +699,29 @@ func TestWakeFixtureCanonicalModeConsumesCtrlU(t *testing.T) {
 	}
 	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "010b" {
 		t.Fatalf("canonical wake delivered %q (ok=%v), want 010b", got, ok)
+	}
+}
+
+func TestWakeFixtureReadinessHandshakePrecedesControlBytes(t *testing.T) {
+	f := newWakeFixture(t, wakeFixtureTransitionHarness)
+	m := wakeMutation(t, "session.wake", "m-transition", sessionWakeParams{
+		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
+	})
+	if err := f.daemon.applyOneMutation(m); err != nil {
+		t.Fatalf("transition wake = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 10*time.Second); !ok || got != "15010b" {
+		t.Fatalf("transition wake delivered %q (ok=%v), want 15010b", got, ok)
+	}
+	already, err := f.daemon.checkWakeMutation(f.id, m.ID, m.Op)
+	if err != nil || !already {
+		t.Fatalf("transition delivered mutation ledger=%v err=%v, want recorded", already, err)
+	}
+	if err := f.daemon.applyOneMutation(m); err != nil {
+		t.Fatalf("transition wake redelivery = %v", err)
+	}
+	if got, ok := f.awaitLine(t, 2*time.Second); ok {
+		t.Fatalf("transition redelivery wrote %q", got)
 	}
 }
 
