@@ -25,9 +25,38 @@
 package afcli
 
 import (
+	"github.com/RenseiAI/donmai/afcli/linearcmd"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/spf13/cobra"
 )
+
+// LinearDocumentCreateInput is the native document creation contract exposed
+// to embedders. Its optional fields preserve omitted/null/value semantics.
+type LinearDocumentCreateInput = linearcmd.DocumentCreateInput
+
+// LinearDocumentCreateResult is the normalized successful native result.
+type LinearDocumentCreateResult = linearcmd.DocumentCreateResult
+
+// LinearDocument is the native document nested in a creation result.
+type LinearDocument = linearcmd.Document
+
+// LinearDocumentParent identifies the persisted native parent relationship.
+type LinearDocumentParent = linearcmd.DocumentParent
+
+// LinearDocumentCreator is the optional scoped create-document operation.
+type LinearDocumentCreator = linearcmd.DocumentCreator
+
+// LinearDocumentCreateFunc adapts a function to LinearDocumentCreator.
+type LinearDocumentCreateFunc = linearcmd.CreateDocumentFunc
+
+// LinearOptionalString preserves omitted, explicit null, and string values.
+type LinearOptionalString = linearcmd.OptionalString
+
+// LinearOptionalFloat preserves omitted, explicit null, and float values.
+type LinearOptionalFloat = linearcmd.OptionalFloat
+
+// LinearOptionalStringSlice preserves omitted, explicit null, and list values.
+type LinearOptionalStringSlice = linearcmd.OptionalStringSlice
 
 // NewHostCmd returns a fresh `host` Cobra command tree — the noun for
 // *this machine*. It owns the daemon lifecycle (install, uninstall,

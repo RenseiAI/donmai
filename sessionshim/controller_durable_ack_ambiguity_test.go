@@ -25,6 +25,7 @@ package sessionshim
 
 import (
 	"errors"
+	"fmt"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -100,6 +101,52 @@ func TestOutstandingDurableAckHoldsTheStallOpenInsteadOfFailingClosed(t *testing
 	}
 	if b.ambiguityAnchored() {
 		t.Fatal("the ambiguity anchor outlived the stall it belonged to; an unrelated later stall would inherit a spent bound")
+	}
+}
+
+// TestAnsweredStallCannotBeReanchoredByItsExpiredTimer forces the production
+// push/pop interleaving that a loaded race run exposed. The producer has
+// selected an expired stall timer and is evaluating durable ambiguity while
+// the consumer drains the queue. That drain ends this stall; the old timer may
+// not attach either stall or ambiguity state to the next queued event.
+func TestAnsweredStallCannotBeReanchoredByItsExpiredTimer(t *testing.T) {
+	for _, ambiguous := range []bool{false, true} {
+		t.Run(fmt.Sprintf("durable-ambiguity=%t", ambiguous), func(t *testing.T) {
+			const stall = 20 * time.Millisecond
+			ambiguityCheck := make(chan struct{}, 1)
+			releaseAmbiguityCheck := make(chan struct{})
+			b := fillAmbiguityTestBacklog(t, 100, stall, time.Minute, func() bool {
+				ambiguityCheck <- struct{}{}
+				<-releaseAmbiguityCheck
+				return ambiguous
+			})
+
+			pushed := make(chan error, 1)
+			go func() { pushed <- b.push(ambiguityTestEvent()) }()
+
+			select {
+			case <-ambiguityCheck:
+			case <-time.After(time.Second):
+				t.Fatal("the stalled producer never reached the expired-timer ambiguity check")
+			}
+			if _, ok := b.pop(); !ok {
+				t.Fatal("the consumer could not drain the stall while its expired timer was being evaluated")
+			}
+			close(releaseAmbiguityCheck)
+			select {
+			case err := <-pushed:
+				if err != nil {
+					t.Fatalf("the producer failed after the consumer answered its stall: %v", err)
+				}
+			case <-time.After(time.Second):
+				t.Fatal("the producer did not observe the consumer's drain")
+			}
+
+			state := b.flowState()
+			if b.ambiguityAnchored() || state.Degraded || !state.StalledSince.IsZero() {
+				t.Fatalf("the answered stall was re-anchored by its expired timer: %+v", state)
+			}
+		})
 	}
 }
 

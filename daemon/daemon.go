@@ -97,6 +97,11 @@ type Options struct {
 	// spawn. Nil preserves the exact v1 path and truthfully advertises no v2
 	// capability.
 	ExecutionPreflightRegistrar ExecutionPreflightRegistrar
+	// ExecutionRuntimeWorkerOwner, when non-nil, authoritatively decides whether
+	// the exact organization and worker pair carried by receipt-bearing work is
+	// a current registration owned by this daemon. A refusal never falls back to
+	// the daemon's primary worker identity. Nil preserves the primary-only check.
+	ExecutionRuntimeWorkerOwner func(organizationID, workerID string) bool
 	// ExecutionPreflightConfigDir owns generic pre-registration config files.
 	// Empty selects the daemon state root. Existing callers remain source-compatible.
 	ExecutionPreflightConfigDir string
@@ -2304,7 +2309,11 @@ func (d *Daemon) validateExecutionRuntimeBinding(detail *SessionDetail) error {
 	if binding.RequestID != detail.SessionID || binding.WorkerID != detail.WorkerID {
 		return errors.New("execution runtime binding is not owned by this request and worker")
 	}
-	if currentWorkerID := strings.TrimSpace(d.WorkerID()); currentWorkerID != "" && binding.WorkerID != currentWorkerID {
+	if owner := d.opts.ExecutionRuntimeWorkerOwner; owner != nil {
+		if strings.TrimSpace(detail.OrganizationID) == "" || strings.TrimSpace(binding.WorkerID) == "" || !owner(detail.OrganizationID, binding.WorkerID) {
+			return errors.New("execution runtime binding is not owned by the daemon's current worker registration")
+		}
+	} else if currentWorkerID := strings.TrimSpace(d.WorkerID()); currentWorkerID != "" && binding.WorkerID != currentWorkerID {
 		return errors.New("execution runtime binding is not owned by the daemon's current worker registration")
 	}
 	effective, err := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)

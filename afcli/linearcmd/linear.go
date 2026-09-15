@@ -41,14 +41,53 @@ import (
 	"os"
 	"os/exec"
 	"sort"
+	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/donmai/afcli/internal/cli"
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/linear"
 )
+
+// DocumentCreateInput and DocumentCreateResult are public aliases so command
+// embedders can implement DocumentCreator without importing internal/linear.
+type DocumentCreateInput = linear.CreateDocumentInput
+
+// DocumentCreateResult is the normalized successful native create result.
+type DocumentCreateResult = linear.DocumentCreateResult
+
+// Document is the native document nested in a create result.
+type Document = linear.Document
+
+// DocumentParent identifies the persisted native resource parent.
+type DocumentParent = linear.DocumentParent
+
+// OptionalString preserves omitted, null, and string input values.
+type OptionalString = linear.OptionalString
+
+// OptionalFloat preserves omitted, null, and numeric input values.
+type OptionalFloat = linear.OptionalFloat
+
+// OptionalStringSlice preserves omitted, null, and list input values.
+type OptionalStringSlice = linear.OptionalStringSlice
+
+// DocumentCreator provides an embedder-owned, scoped native-document
+// operation. When supplied, create-document uses it exclusively and never
+// constructs or falls back to the raw direct/proxied Linear transport.
+type DocumentCreator interface {
+	CreateDocument(context.Context, DocumentCreateInput) (*DocumentCreateResult, error)
+}
+
+// CreateDocumentFunc adapts a function to DocumentCreator.
+type CreateDocumentFunc func(context.Context, DocumentCreateInput) (*DocumentCreateResult, error)
+
+// CreateDocument calls f.
+func (f CreateDocumentFunc) CreateDocument(ctx context.Context, input DocumentCreateInput) (*DocumentCreateResult, error) {
+	return f(ctx, input)
+}
 
 // ─── top-level command factory ────────────────────────────────────────────────
 
@@ -60,7 +99,11 @@ import (
 // pick up rsk_ credentials when running embedded under rensei. The factory
 // may be nil (e.g. minimal test embedders) — subcommands degrade to the
 // LINEAR_API_KEY env path.
-func New(ds func() afclient.DataSource, bin string) *cobra.Command {
+func New(ds func() afclient.DataSource, bin string, creators ...DocumentCreator) *cobra.Command {
+	var creator DocumentCreator
+	if len(creators) > 0 {
+		creator = creators[0]
+	}
 	cmd := &cobra.Command{
 		Use:   "linear",
 		Short: "Linear issue-tracker operations",
@@ -81,6 +124,7 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 
 	cmd.AddCommand(newLinearGetIssueCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateIssueCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateDocumentCmd(ds, bin, creator))
 	cmd.AddCommand(newLinearUpdateIssueCmd(ds, bin))
 	cmd.AddCommand(newLinearListCommentsCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateCommentCmd(ds, bin))
@@ -401,6 +445,195 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 }
 
 // ─── create-issue ─────────────────────────────────────────────────────────────
+
+// newLinearCreateDocumentCmd creates a native Linear document. `creator` is
+// intentionally checked before any raw-client construction or lookup: an
+// admitted embedder owns authorization and reference resolution on that path.
+func newLinearCreateDocumentCmd(ds func() afclient.DataSource, bin string, creator DocumentCreator) *cobra.Command {
+	var (
+		title          string
+		content        string
+		contentFile    string
+		fileAlias      string
+		issue          string
+		project        string
+		team           string
+		cycle          string
+		initiative     string
+		release        string
+		clientID       string
+		icon           string
+		color          string
+		owner          string
+		noOwner        bool
+		template       string
+		resourceFolder string
+		sortOrder      string
+		subscribers    []string
+	)
+
+	cmd := &cobra.Command{
+		Use:   "create-document [issue]",
+		Short: "Create a native Linear document",
+		Long: `Create a native Linear document with Markdown content.
+
+Exactly one native parent is required: --issue, --project, --team, --cycle,
+--initiative, or --release. The optional positional issue is an alias for
+--issue. --project sets the document's native Linear parent; it does not set
+CLI project context.`,
+		Args:         cobra.MaximumNArgs(1),
+		SilenceUsage: true,
+		RunE: func(cmd *cobra.Command, args []string) error {
+			if strings.TrimSpace(title) == "" {
+				return cli.UserError("--title is required", "Usage: "+cmd.UseLine()+" --title \"Title\" --issue ISSUE")
+			}
+			if len(args) == 1 {
+				if issue != "" {
+					return cli.UserError("positional issue and --issue cannot be used together", "Choose one issue parent reference")
+				}
+				issue = args[0]
+			}
+
+			fileCount := 0
+			if cmd.Flags().Changed("content") {
+				fileCount++
+			}
+			if contentFile != "" {
+				fileCount++
+			}
+			if fileAlias != "" {
+				fileCount++
+			}
+			if fileCount > 1 {
+				return cli.UserError("use at most one of --content, --content-file, or --file", "Markdown is native document content, never an attachment upload")
+			}
+
+			input := linear.CreateDocumentInput{Title: title}
+			if cmd.Flags().Changed("content") {
+				input.Content = linear.StringValue(content)
+			} else if contentFile != "" || fileAlias != "" {
+				path := contentFile
+				if path == "" {
+					path = fileAlias
+				}
+				markdown, err := readFile(path)
+				if err != nil {
+					return fmt.Errorf("read document content: %w", err)
+				}
+				input.Content = linear.StringValue(string(markdown))
+			}
+
+			set := func(value string) linear.OptionalString {
+				if value == "" {
+					return linear.OptionalString{}
+				}
+				return linear.StringValue(value)
+			}
+			input.ID = set(clientID)
+			input.Icon = set(icon)
+			input.Color = set(color)
+			input.IssueID = set(issue)
+			input.ProjectID = set(project)
+			input.TeamID = set(team)
+			input.CycleID = set(cycle)
+			input.InitiativeID = set(initiative)
+			input.ReleaseID = set(release)
+			input.ResourceFolderID = set(resourceFolder)
+			input.LastAppliedTemplateID = set(template)
+			if owner != "" && noOwner {
+				return cli.UserError("--owner and --no-owner cannot be used together", "Choose an owner value or an explicit owner null")
+			}
+			if noOwner {
+				input.OwnerID = linear.NullString()
+			} else {
+				input.OwnerID = set(owner)
+			}
+			if cmd.Flags().Changed("subscriber") {
+				filtered := make([]string, 0, len(subscribers))
+				for _, subscriber := range subscribers {
+					if subscriber != "" {
+						filtered = append(filtered, subscriber)
+					}
+				}
+				input.SubscriberIDs = linear.StringSliceValue(filtered)
+			}
+			if cmd.Flags().Changed("sort-order") {
+				parsed, err := strconv.ParseFloat(sortOrder, 64)
+				if err != nil || parsed != parsed || parsed > 1.7976931348623157e+308 || parsed < -1.7976931348623157e+308 {
+					return cli.UserError("--sort-order must be a finite number", "Use a decimal number such as --sort-order 1.5")
+				}
+				input.SortOrder = linear.FloatValue(parsed)
+			}
+			if err := linear.ValidateDocumentInput(input); err != nil {
+				return cli.UserError(err.Error(), "Select exactly one native document parent")
+			}
+			if creator != nil {
+				result, err := creator.CreateDocument(cmd.Context(), input)
+				if err != nil {
+					return fmt.Errorf("create document: %w", err)
+				}
+				if err := linear.ValidateDocumentCreateResultForInput(input, result); err != nil {
+					return fmt.Errorf("create document: %w", err)
+				}
+				return cli.WriteJSON(cmd.OutOrStdout(), result)
+			}
+
+			client, err := newLinearClient(ds, bin)
+			if err != nil {
+				return err
+			}
+			// Linear accepts an issue identifier on documentCreate, but resolving it
+			// in the raw transport path pins the stored relationship to its UUID.
+			if input.IssueID.Set && input.IssueID.Value != nil {
+				requestedIssue := *input.IssueID.Value
+				resolved, err := client.GetIssue(cmd.Context(), requestedIssue)
+				if err != nil {
+					return fmt.Errorf("resolve document issue: %w", err)
+				}
+				if !documentIssueReferenceMatches(requestedIssue, resolved) {
+					return fmt.Errorf("resolve document issue: returned issue does not match requested reference %q", requestedIssue)
+				}
+				input.IssueID = linear.StringValue(resolved.ID)
+			}
+			result, err := client.CreateDocument(cmd.Context(), input)
+			if err != nil {
+				return fmt.Errorf("create document: %w", err)
+			}
+			return cli.WriteJSON(cmd.OutOrStdout(), result)
+		},
+	}
+
+	cmd.Flags().StringVar(&title, "title", "", "Document title (required)")
+	cmd.Flags().StringVar(&content, "content", "", "Inline Markdown content")
+	cmd.Flags().StringVar(&contentFile, "content-file", "", "Path to UTF-8 Markdown content")
+	cmd.Flags().StringVar(&fileAlias, "file", "", "Alias for --content-file")
+	cmd.Flags().StringVar(&issue, "issue", "", "Native Linear issue ID or identifier parent")
+	cmd.Flags().StringVar(&project, "project", "", "Native Linear project ID parent (not CLI context)")
+	cmd.Flags().StringVar(&team, "team", "", "Native Linear team ID parent")
+	cmd.Flags().StringVar(&cycle, "cycle", "", "Native Linear cycle ID parent")
+	cmd.Flags().StringVar(&initiative, "initiative", "", "Native Linear initiative ID parent")
+	cmd.Flags().StringVar(&release, "release", "", "Native Linear release ID parent")
+	cmd.Flags().StringVar(&clientID, "id", "", "Client-supplied UUID v4")
+	cmd.Flags().StringVar(&icon, "icon", "", "Document icon")
+	cmd.Flags().StringVar(&color, "color", "", "Document icon color")
+	cmd.Flags().StringVar(&owner, "owner", "", "Native Linear owner ID")
+	cmd.Flags().BoolVar(&noOwner, "no-owner", false, "Explicitly create without an owner")
+	cmd.Flags().StringVar(&template, "template", "", "Last applied native Linear template ID")
+	cmd.Flags().StringVar(&resourceFolder, "resource-folder", "", "Native Linear resource folder ID")
+	cmd.Flags().StringVar(&sortOrder, "sort-order", "", "Native resource list order")
+	cmd.Flags().StringSliceVar(&subscribers, "subscriber", nil, "Native Linear subscriber ID (repeat or comma-separate; empty gives an explicit empty list)")
+	return cmd
+}
+
+func documentIssueReferenceMatches(requested string, resolved *linear.Issue) bool {
+	if resolved == nil || strings.TrimSpace(resolved.ID) == "" {
+		return false
+	}
+	if _, err := uuid.Parse(requested); err == nil {
+		return strings.EqualFold(resolved.ID, requested)
+	}
+	return strings.EqualFold(resolved.Identifier, requested)
+}
 
 func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (

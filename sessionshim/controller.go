@@ -1206,24 +1206,49 @@ func (c *Controller) SnapshotWithID(ctx context.Context, requestID uint64, mode 
 			close(call.done)
 		}
 	}
-	done := call.done
 	c.snapshotMu.Unlock()
 	if ctx == nil {
 		ctx = context.Background()
 	}
+	return c.awaitSnapshotCall(ctx, requestID, call)
+}
+
+func (c *Controller) awaitSnapshotCall(
+	ctx context.Context,
+	requestID uint64,
+	call *snapshotCall,
+) (shimwire.SnapshotResult, error) {
+	done := call.done
 	select {
 	case <-done:
-		c.snapshotMu.Lock()
-		defer c.snapshotMu.Unlock()
-		if call.result == nil {
-			return shimwire.SnapshotResult{}, call.err
-		}
-		return cloneSnapshotResult(*call.result), call.err
+		return c.snapshotCallOutcome(call)
+	default:
+	}
+	select {
+	case <-done:
+		return c.snapshotCallOutcome(call)
 	case <-ctx.Done():
 		return shimwire.SnapshotResult{}, fmt.Errorf("sessionshim: snapshot request %d: %w", requestID, ctx.Err())
 	case <-c.done:
+		// A fail-closed protocol decision completes the affected call before
+		// closing the stream. Preserve that authoritative disposition when both
+		// channels become ready before this goroutine is scheduled.
+		select {
+		case <-done:
+			return c.snapshotCallOutcome(call)
+		default:
+		}
 		return shimwire.SnapshotResult{}, io.EOF
 	}
+}
+
+func (c *Controller) snapshotCallOutcome(call *snapshotCall) (shimwire.SnapshotResult, error) {
+	c.snapshotMu.Lock()
+	defer c.snapshotMu.Unlock()
+	if call.result == nil {
+		return shimwire.SnapshotResult{}, call.err
+	}
+	return cloneSnapshotResult(*call.result), call.err
 }
 
 func (c *Controller) allocateSnapshotRequestID() uint64 {
@@ -1867,9 +1892,12 @@ func (b *eventBacklog) flowState() BacklogFlowState {
 // stayed outstanding once the first one had timed out).
 //
 // It reaches no verdict. Anchoring is not giving up.
-func (b *eventBacklog) noteFlowControlStall(now time.Time) BacklogFlowState {
+func (b *eventBacklog) noteFlowControlStall(now, expectedStall time.Time) (BacklogFlowState, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if expectedStall.IsZero() || b.stalledSince != expectedStall {
+		return b.flowStateLocked(), false
+	}
 	if b.degradedSince.IsZero() {
 		// Anchored on when the consumer first fell BEHIND, not on the crossing,
 		// so a bound measured from here means "ten minutes of a stalled
@@ -1881,7 +1909,7 @@ func (b *eventBacklog) noteFlowControlStall(now time.Time) BacklogFlowState {
 		}
 	}
 	b.reported = true
-	return b.flowStateLocked()
+	return b.flowStateLocked(), true
 }
 
 // holdForFlowControl decides what an elapsed stall deadline with nothing
@@ -1893,9 +1921,12 @@ func (b *eventBacklog) noteFlowControlStall(now time.Time) BacklogFlowState {
 // back through the socket to the shim's output pump, and from there to the
 // shim's own PTY reader, which stops reading the master so the harness blocks
 // in write(2). Nothing is lost, nothing is reordered, and the seat lives.
-func (b *eventBacklog) holdForFlowControl(now time.Time) (BacklogFlowState, bool) {
+func (b *eventBacklog) holdForFlowControl(now, expectedStall time.Time) (BacklogFlowState, bool, bool) {
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if expectedStall.IsZero() || b.stalledSince != expectedStall {
+		return b.flowStateLocked(), false, false
+	}
 	if b.degradedSince.IsZero() {
 		// noteFlowControlStall has always run first on the live paths; this is
 		// the belt for a caller that has not.
@@ -1903,14 +1934,14 @@ func (b *eventBacklog) holdForFlowControl(now time.Time) (BacklogFlowState, bool
 	}
 	state := b.flowStateLocked()
 	if now.Sub(b.degradedSince) >= b.dropBound {
-		return state, false
+		return state, false, true
 	}
 	b.reported = true
 	// Re-anchor the stall clock so the NEXT deadline produces the next report:
 	// a stall that lasts minutes has to keep saying so, with current numbers,
 	// rather than announce itself once and go quiet.
 	b.stalledSince, b.drainedSinceStall = now, 0
-	return state, true
+	return state, true, true
 }
 
 // notify hands one transition to the report hook. It is called off the lock.
@@ -1934,6 +1965,10 @@ const (
 	// ambiguityHoldBoundReached: the hold ran the whole bound out. Degrade
 	// visibly, under the sentinel that says so.
 	ambiguityHoldBoundReached
+	// ambiguityHoldStallAnswered: the consumer answered or replaced this exact
+	// stall while its expired timer was being evaluated. The old timer may not
+	// mutate the new queue state.
+	ambiguityHoldStallAnswered
 )
 
 // holdForDurableAckAmbiguity reports what a stall deadline that has just
@@ -1951,9 +1986,20 @@ const (
 //
 // See DurableAckAmbiguityBound for the measured incident and the contract clause.
 func (b *eventBacklog) holdForDurableAckAmbiguity(now time.Time) (ambiguityHoldOutcome, time.Duration) {
+	return b.holdForDurableAckAmbiguityAt(now, time.Time{}, false)
+}
+
+func (b *eventBacklog) holdForDurableAckAmbiguityForStall(now, expectedStall time.Time) (ambiguityHoldOutcome, time.Duration) {
+	return b.holdForDurableAckAmbiguityAt(now, expectedStall, true)
+}
+
+func (b *eventBacklog) holdForDurableAckAmbiguityAt(now, expectedStall time.Time, requireCurrent bool) (ambiguityHoldOutcome, time.Duration) {
 	ambiguous := b.ambiguous != nil && b.ambiguous()
 	b.mu.Lock()
 	defer b.mu.Unlock()
+	if requireCurrent && (expectedStall.IsZero() || b.stalledSince != expectedStall) {
+		return ambiguityHoldStallAnswered, 0
+	}
 	if !ambiguous {
 		b.ambiguousSince = time.Time{}
 		return ambiguityHoldNotAmbiguous, 0
@@ -2060,17 +2106,24 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 			// drop itself, and a "holding the carrier" line immediately before
 			// "dropped the carrier" reads as two contradictory decisions.
 			now := time.Now()
-			degraded := b.noteFlowControlStall(now)
-			switch outcome, held := b.holdForDurableAckAmbiguity(now); outcome {
+			degraded, current := b.noteFlowControlStall(now, stalled)
+			if !current {
+				continue
+			}
+			switch outcome, held := b.holdForDurableAckAmbiguityForStall(now, stalled); outcome {
 			case ambiguityHoldGranted:
 				b.notify(degraded)
 				continue
 			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer took %d bytes, short of the %d it owed",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond), drained, b.progressBytes())
+			case ambiguityHoldStallAnswered:
+				continue
 			case ambiguityHoldNotAmbiguous:
 			}
-			if state, held := b.holdForFlowControl(now); held {
+			if state, held, current := b.holdForFlowControl(now, stalled); !current {
+				continue
+			} else if held {
 				b.notify(state)
 				continue
 			}
@@ -2095,17 +2148,24 @@ func (b *eventBacklog) push(event ControllerEvent) error {
 			return io.EOF
 		case <-timer.C:
 			now := time.Now()
-			degraded := b.noteFlowControlStall(now)
-			switch outcome, held := b.holdForDurableAckAmbiguity(now); outcome {
+			degraded, current := b.noteFlowControlStall(now, stalled)
+			if !current {
+				continue
+			}
+			switch outcome, held := b.holdForDurableAckAmbiguityForStall(now, stalled); outcome {
 			case ambiguityHoldGranted:
 				b.notify(degraded)
 				continue
 			case ambiguityHoldBoundReached:
 				return fmt.Errorf("%w after %s: the consumer made no budget's worth of progress",
 					ErrDurableAckAmbiguityBound, held.Round(time.Millisecond))
+			case ambiguityHoldStallAnswered:
+				continue
 			case ambiguityHoldNotAmbiguous:
 			}
-			if state, keep := b.holdForFlowControl(now); keep {
+			if state, keep, current := b.holdForFlowControl(now, stalled); !current {
+				continue
+			} else if keep {
 				b.notify(state)
 				continue
 			}

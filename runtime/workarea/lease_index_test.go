@@ -156,14 +156,63 @@ func TestActionableIndexReapBatchScalesWithActionableRecords(t *testing.T) {
 			t.Fatal(err)
 		}
 	}
-	started := time.Now()
-	considered, err := store.ReapExpired(context.Background(), 32, 3*time.Second, func(context.Context, TerminalLease) error { return nil })
-	elapsed := time.Since(started)
+	var attempts atomic.Int32
+	considered, err := store.ReapExpired(context.Background(), 32, 3*time.Second, func(context.Context, TerminalLease) error {
+		attempts.Add(1)
+		return nil
+	})
 	if err != nil || considered != 32 {
-		t.Fatalf("ReapExpired considered=%d err=%v elapsed=%s", considered, err, elapsed)
+		t.Fatalf("ReapExpired considered=%d err=%v", considered, err)
 	}
-	if elapsed >= 3*time.Second {
-		t.Fatalf("ReapExpired elapsed=%s, exceeded provider-attempt timeout", elapsed)
+	// The provider-attempt timeout bounds one provider release attempt (pinned
+	// separately by TestReleaseAttemptTimeoutStartsAtProviderInvocation); it
+	// cannot bound total durable batch time, which covers list, clock, and two
+	// lock-guarded durable writes per lease across the whole batch. Assert the
+	// deterministic work bound instead: exactly one batch attempted, each
+	// attempt recorded durably exactly once.
+	if got := attempts.Load(); got != 32 {
+		t.Fatalf("provider release attempts=%d, want one batch of %d", got, 32)
+	}
+	released, retained := 0, 0
+	for i := 0; i < actionableCount; i++ {
+		leaseID := leaseIDFor(fmt.Sprintf("tr_%032x", i+1))
+		lease, err := store.load(leaseID)
+		if err != nil {
+			t.Fatalf("load lease %s: %v", leaseID, err)
+		}
+		switch lease.State {
+		case LeaseReleased:
+			released++
+			if lease.ReleaseAttempts != 1 {
+				t.Fatalf("released lease %s attempts=%d, want exactly 1", leaseID, lease.ReleaseAttempts)
+			}
+			if lease.ReleasedAt == nil {
+				t.Fatalf("released lease %s missing release timestamp", leaseID)
+			}
+			if _, err := os.Stat(store.actionablePath(leaseID)); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("released lease %s actionable marker survived: %v", leaseID, err)
+			}
+		case LeaseReleasePending:
+			retained++
+			if lease.ReleaseAttempts != 0 {
+				t.Fatalf("unreaped lease %s attempts=%d, want 0", leaseID, lease.ReleaseAttempts)
+			}
+			if _, err := os.Stat(store.actionablePath(leaseID)); err != nil {
+				t.Fatalf("unreaped lease %s lost actionable marker: %v", leaseID, err)
+			}
+		default:
+			t.Fatalf("lease %s state=%q, want released or release-pending", leaseID, lease.State)
+		}
+	}
+	if released != 32 || retained != actionableCount-32 {
+		t.Fatalf("released=%d retained=%d, want 32 released and %d retained", released, retained, actionableCount-32)
+	}
+	remaining, err := store.listActionable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(remaining) != actionableCount-32 {
+		t.Fatalf("actionable index holds %d leases, want %d unreaped", len(remaining), actionableCount-32)
 	}
 }
 

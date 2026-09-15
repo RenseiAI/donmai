@@ -79,9 +79,10 @@ func TestNew_HTTPMode_LiveServer_Succeeds(t *testing.T) {
 	}))
 	defer srv.Close()
 	p, err := New(Options{
-		Endpoint: srv.URL,
-		Getenv:   fakeEnv(nil),
-		LookPath: fakeLookPath(nil), // no binary
+		Endpoint:   srv.URL,
+		Getenv:     fakeEnv(nil),
+		LookPath:   fakeLookPath(nil), // no binary
+		HTTPClient: srv.Client(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -149,8 +150,9 @@ func TestNew_HTTPMode_EnvEndpointFallback(t *testing.T) {
 	}))
 	defer srv.Close()
 	p, err := New(Options{
-		Getenv:   fakeEnv(map[string]string{EnvEndpoint: srv.URL}),
-		LookPath: fakeLookPath(nil),
+		Getenv:     fakeEnv(map[string]string{EnvEndpoint: srv.URL}),
+		LookPath:   fakeLookPath(nil),
+		HTTPClient: srv.Client(),
 	})
 	if err != nil {
 		t.Fatalf("New: %v", err)
@@ -169,10 +171,11 @@ func TestNew_HTTPMode_APIKeyForwardedAsBearer(t *testing.T) {
 	}))
 	defer srv.Close()
 	if _, err := New(Options{
-		Endpoint: srv.URL,
-		APIKey:   "secret-token",
-		Getenv:   fakeEnv(nil),
-		LookPath: fakeLookPath(nil),
+		Endpoint:   srv.URL,
+		APIKey:     "secret-token",
+		Getenv:     fakeEnv(nil),
+		LookPath:   fakeLookPath(nil),
+		HTTPClient: srv.Client(),
 	}); err != nil {
 		t.Fatalf("New: %v", err)
 	}
