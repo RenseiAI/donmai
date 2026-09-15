@@ -252,9 +252,9 @@ func TestPosterPost_CompletionOutcomePrecedesStatus(t *testing.T) {
 	}
 }
 
-// TestPosterPost_CompletionRetryPrecedesStatus proves that a completion whose
-// acknowledgement is lost may be delivered again, but status still cannot
-// overtake any completion attempt.
+// TestPosterPost_CompletionRetryPrecedesStatus proves that lost completion and
+// status acknowledgements may cause either request to be delivered again, but
+// status still cannot overtake any completion attempt.
 func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 	t.Parallel()
 
@@ -263,8 +263,9 @@ func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 		mu                     sync.Mutex
 		paths                  []string
 		completionBodies       []map[string]any
-		statusBody             map[string]any
+		statusBodies           []map[string]any
 		statusBeforeDeliveries bool
+		completionAfterStatus  bool
 	)
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		body, err := io.ReadAll(r.Body)
@@ -281,15 +282,20 @@ func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 		mu.Lock()
 		paths = append(paths, r.URL.Path)
 		completionAttempt := 0
+		statusAttempt := 0
 		statusArrivedEarly := false
 		switch {
 		case strings.HasSuffix(r.URL.Path, "/completion"):
 			completionBodies = append(completionBodies, decoded)
 			completionAttempt = len(completionBodies)
+			completionAfterStatus = completionAfterStatus || len(statusBodies) > 0
 		case strings.HasSuffix(r.URL.Path, "/status"):
-			statusBody = decoded
+			statusBodies = append(statusBodies, decoded)
+			statusAttempt = len(statusBodies)
 			statusArrivedEarly = len(completionBodies) < minCompletionDeliveries
-			statusBeforeDeliveries = statusArrivedEarly
+			// Keep an ordering violation sticky: a later valid status retry
+			// must not erase an earlier status that overtook completion.
+			statusBeforeDeliveries = statusBeforeDeliveries || statusArrivedEarly
 		}
 		mu.Unlock()
 
@@ -314,6 +320,23 @@ func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 			http.Error(w, "status arrived before all required completion deliveries", http.StatusConflict)
 			return
 		}
+		if strings.HasSuffix(r.URL.Path, "/status") && statusAttempt == 1 {
+			// Completion was acknowledged before this point. Lose only this
+			// status acknowledgement to prove its valid retry does not alter
+			// the completion-before-status ordering contract.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("ResponseWriter does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
 		w.WriteHeader(http.StatusOK)
 	}))
 	t.Cleanup(srv.Close)
@@ -328,17 +351,27 @@ func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 	mu.Lock()
 	gotPaths := append([]string(nil), paths...)
 	gotCompletions := append([]map[string]any(nil), completionBodies...)
-	gotStatus := statusBody
+	gotStatuses := append([]map[string]any(nil), statusBodies...)
 	gotStatusBeforeDeliveries := statusBeforeDeliveries
+	gotCompletionAfterStatus := completionAfterStatus
 	mu.Unlock()
 	if gotStatusBeforeDeliveries {
 		t.Fatalf("status arrived before required completion deliveries: paths = %v", gotPaths)
 	}
+	if gotCompletionAfterStatus {
+		t.Fatalf("completion arrived after status: paths = %v", gotPaths)
+	}
 	if got := len(gotCompletions); got < minCompletionDeliveries || got > result.DefaultMaxAttempts {
 		t.Fatalf("completion deliveries = %d, want %d through %d", got, minCompletionDeliveries, result.DefaultMaxAttempts)
 	}
-	if got, want := len(gotPaths), len(gotCompletions)+1; got != want {
-		t.Fatalf("requests = %d, want %d completion deliveries plus status (paths %v)", got, want, gotPaths)
+	if got := len(gotStatuses); got < 1 || got > result.DefaultMaxAttempts {
+		t.Fatalf("status deliveries = %d, want 1 through %d", got, result.DefaultMaxAttempts)
+	}
+	if got := len(gotStatuses); got < 2 {
+		t.Fatalf("status deliveries = %d, want at least 2 after lost acknowledgement", got)
+	}
+	if got, want := len(gotPaths), len(gotCompletions)+len(gotStatuses); got != want {
+		t.Fatalf("requests = %d, want completion and status deliveries (paths %v)", got, gotPaths)
 	}
 	for i, body := range gotCompletions {
 		if !strings.HasSuffix(gotPaths[i], "/completion") {
@@ -351,11 +384,17 @@ func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
 			t.Errorf("completion attempt %d summary = %q, want Session stopped prefix", i+1, summary)
 		}
 	}
-	if !strings.HasSuffix(gotPaths[len(gotPaths)-1], "/status") {
-		t.Fatalf("last request = %q, want status after completions (paths %v)", gotPaths[len(gotPaths)-1], gotPaths)
-	}
-	if gotStatus["status"] != "stopped" {
-		t.Errorf("status = %v, want stopped", gotStatus["status"])
+	for i := range gotStatuses {
+		pathIndex := len(gotCompletions) + i
+		if !strings.HasSuffix(gotPaths[pathIndex], "/status") {
+			t.Fatalf("request %d = %q, want status after completions (paths %v)", pathIndex, gotPaths[pathIndex], gotPaths)
+		}
+		if gotStatuses[i]["status"] != "stopped" {
+			t.Errorf("status attempt %d = %v, want stopped", i+1, gotStatuses[i]["status"])
+		}
+		if gotStatuses[i]["workerId"] != "wkr_test" {
+			t.Errorf("status attempt %d workerId = %v, want wkr_test", i+1, gotStatuses[i]["workerId"])
+		}
 	}
 }
 
