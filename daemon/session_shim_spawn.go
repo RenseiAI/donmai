@@ -2982,11 +2982,30 @@ func awaitTombstone(
 // into visible, capacity-consuming quarantine.
 func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Controller, cause shimStreamEndCause) {
 	d.shims.mu.RLock()
+	hook := d.shims.afterReleaseShimIfLive
+	d.shims.mu.RUnlock()
+	if hook != nil {
+		defer hook()
+	}
+	if d.shims.recoveryCtx.Err() != nil {
+		return
+	}
+	d.shims.mu.RLock()
 	entry, ok := d.shims.adopted[id]
 	if ok && ctrl != nil && entry.controller != ctrl {
 		// A replacement controller already owns this identity. A consumer whose
 		// own connection ended must never evict the live one.
 		ok = false
+	}
+	if ok && ctrl != nil && entry.controller == ctrl && entry.rebinding {
+		// sessionshim.Adopt commits the new generation and closes this old
+		// controller before the daemon installs its replacement. The old
+		// consumer's EOF belongs to the active rebind claim, not to a dead
+		// harness; the rebind pipeline will settle the adopted entry.
+		ok = false
+	}
+	if ok && ctrl != nil && entry.controller == ctrl && !entry.terminal && entry.carrierTransportLoss != nil && ctrl.StreamEndCause() == nil {
+		cause = shimStreamCarrierLost
 	}
 	d.shims.mu.RUnlock()
 	if !ok {
@@ -3072,6 +3091,10 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		readopt = d.readoptSessionShimAfterPlatformCarrierLoss
 	}
 	switch readopt(id, entry, attemptBudget) {
+	case readoptionShutdown:
+		// Intentional drain cancellation is not evidence of a dead socket.
+		// Final release owns the adopted map and controller disposal.
+		return
 	case readoptionSucceeded:
 		// The streak counts CONSECUTIVE endings that never recovered. A
 		// re-adoption that lands is a recovery, so leaving the counter standing
@@ -3124,6 +3147,20 @@ func (d *Daemon) quarantineLostSessionShim(
 	reason sessionshim.QuarantineReason,
 	detail string,
 ) {
+	d.shims.mu.RLock()
+	hook := d.shims.beforeQuarantineShim
+	d.shims.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+	// Quarantine and Stop share one admission boundary. An outcome computed
+	// before Stop is not permission to mutate after Stop has won; publication
+	// for a quarantine already admitted may finish outside both locks.
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.shims.recoveryCtx.Err() != nil {
+		d.lifecycleMu.Unlock()
+		return
+	}
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
@@ -3151,6 +3188,7 @@ func (d *Daemon) quarantineLostSessionShim(
 		d.upsertShimQuarantineLocked(q)
 	}
 	d.shims.mu.Unlock()
+	d.lifecycleMu.Unlock()
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}
@@ -3709,17 +3747,35 @@ func (d *Daemon) StopAdoptedSessionShimFor(ref SessionShimControlRef, reason shi
 }
 
 func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*sessionshim.Controller, error) {
-	if err := ref.Identity.Validate(); err != nil || ref.ShimID == "" || ref.ProcessEpoch == 0 || ref.ControllerGeneration == 0 {
-		return nil, errors.New("session shim: control reference is incomplete")
+	if err := validateSessionShimControlRef(ref); err != nil {
+		return nil, err
 	}
 	if d.shims == nil {
 		return nil, errors.New("session shim: adoption is not configured")
 	}
 	d.shims.mu.RLock()
-	entry, ok := d.shims.adopted[ref.Identity]
+	entry, err := d.adoptedSessionShimEntryForLocked(ref)
 	d.shims.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	return entry.controller, nil
+}
+
+func validateSessionShimControlRef(ref SessionShimControlRef) error {
+	if err := ref.Identity.Validate(); err != nil || ref.ShimID == "" || ref.ProcessEpoch == 0 || ref.ControllerGeneration == 0 {
+		return errors.New("session shim: control reference is incomplete")
+	}
+	return nil
+}
+
+// adoptedSessionShimEntryForLocked resolves ref under d.shims.mu. Callers that
+// mutate carrier/rebind state keep that lock through the comparison so a stale
+// callback cannot act on a replacement controller.
+func (d *Daemon) adoptedSessionShimEntryForLocked(ref SessionShimControlRef) (adoptedShim, error) {
+	entry, ok := d.shims.adopted[ref.Identity]
 	if !ok || entry.controller == nil {
-		return nil, fmt.Errorf("session shim: control reference is not current for %s", ref.Identity)
+		return adoptedShim{}, fmt.Errorf("session shim: control reference is not current for %s", ref.Identity)
 	}
 	hello := entry.controller.Hello()
 	if entry.adoption.Identity != ref.Identity || entry.controller.Identity() != ref.Identity ||
@@ -3727,9 +3783,9 @@ func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*se
 		entry.adoption.ProcessEpoch != ref.ProcessEpoch || hello.ProcessEpoch != ref.ProcessEpoch ||
 		entry.adoption.ControllerGeneration != ref.ControllerGeneration ||
 		uint64(entry.controller.Generation()) != ref.ControllerGeneration {
-		return nil, fmt.Errorf("session shim: control reference is stale for %s", ref.Identity)
+		return adoptedShim{}, fmt.Errorf("session shim: control reference is stale for %s", ref.Identity)
 	}
-	return entry.controller, nil
+	return entry, nil
 }
 
 // adoptedShimEntry resolves one adopted session with a live controller.

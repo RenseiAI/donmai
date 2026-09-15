@@ -1520,6 +1520,9 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	// Reassert draining on retries. Nothing may reopen admission once this
 	// generation exists, even if a previous attempt was incomplete.
 	d.setState(StateDraining)
+	// Recovery attempts are daemon-owned work. Stop cancels them at drain start
+	// rather than leaving an admitted network prepare to outlive the daemon.
+	d.shims.stopRecovery()
 	poller := d.poller
 	spawner := d.spawner
 	heartbeat := d.heartbeat

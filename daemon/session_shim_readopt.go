@@ -40,6 +40,8 @@ const (
 	// things, and an enum member whose name says the second while meaning the
 	// first is documentation that lies.
 	readoptionAttemptsSpent
+	// readoptionShutdown leaves the live lineage to final daemon release.
+	readoptionShutdown
 )
 
 // readoptSessionShimAfterControllerLoss re-adopts ONE live shim whose
@@ -102,6 +104,9 @@ func (d *Daemon) readoptSessionShimAfterCarrierLoss(
 	attemptBudget int,
 	platformPersistLoss bool,
 ) sessionShimReadoptionDisposition {
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown
+	}
 	cfg := d.sessionShimConfig()
 	policy := cfg.readoption()
 	if policy.Disabled || lost.controller == nil {
@@ -161,8 +166,8 @@ func (d *Daemon) readoptSessionShimWithinFixedAttempts(
 	backoff := policy.Backoff
 	for attempt := 1; attempt <= policy.Attempts; attempt++ {
 		if attempt > 1 {
-			if !d.sleepSessionShimReconcileBackoff(backoff) {
-				return readoptionRefused
+			if !d.sleepSessionShimRecoveryBackoff(backoff) {
+				return readoptionShutdown
 			}
 			backoff *= 2
 		}
@@ -208,7 +213,7 @@ func (d *Daemon) readoptSessionShimWithinLivenessWindow(
 				return d.sessionShimWindowExhausted(registry, cfg, id, hello, deadline)
 			}
 			if !d.sleepSessionShimWindowBackoff(backoff) {
-				return readoptionRefused
+				return readoptionShutdown
 			}
 			if backoff *= 2; backoff > policy.BackoffCap {
 				backoff = policy.BackoffCap
@@ -236,25 +241,48 @@ func (d *Daemon) readoptSessionShimAttempt(
 	attempt int,
 	attempts int,
 ) (sessionShimReadoptionDisposition, bool) {
-	if d.sessionShimReconcileStopped() {
-		return readoptionRefused, true
+	d.shims.mu.RLock()
+	hook := d.shims.transportRecoveryAttemptHook
+	d.shims.mu.RUnlock()
+	if hook != nil && lost.carrierTransportLoss != nil {
+		hook()
 	}
+	// This is the admission fence shared with Stop. A child of the lifetime
+	// context is cancelled synchronously, including when Stop wins immediately
+	// after admission; no scheduled channel watcher grants permission to start.
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.shims.recoveryCtx.Err() != nil {
+		d.lifecycleMu.Unlock()
+		return readoptionShutdown, true
+	}
+	attemptCtx, cancel := context.WithCancel(d.shims.recoveryCtx)
+	d.lifecycleMu.Unlock()
+	defer cancel()
 	if !sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
 		// The record is gone or the shim already left its proof on disk:
 		// there is nothing to re-adopt, and the caller's path consumes the
 		// tombstone before it publishes anything.
 		return readoptionLineageGone, true
 	}
-	if !d.sessionShimLineageHeld(cfg, id) {
+	if !d.sessionShimLineageHeldContext(attemptCtx, cfg, id) {
 		// The composing layer no longer holds this lineage. Retrying would
 		// re-adopt something nobody upstream wants, and every further keepalive
 		// would extend the clock of a harness that should be reaped on the
 		// ordinary deadline.
 		slog.Warn("session shim: the composing layer no longer holds this lineage; stopping re-adoption",
 			"session", id.String(), "attempt", attempt)
+		if d.shims.recoveryCtx.Err() != nil {
+			return readoptionShutdown, true
+		}
 		return readoptionLineageGone, true
 	}
-	err := d.readoptSessionShimOnce(context.Background(), registry, cfg, id, lost, hello, d.shimNow().UnixNano())
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown, true
+	}
+	err := d.readoptSessionShimOnce(attemptCtx, registry, cfg, id, lost, hello, d.shimNow().UnixNano())
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown, true
+	}
 	if err == nil {
 		slog.Info("session shim: re-adopted a live shim after controller loss",
 			"session", id.String(), "attempt", attempt)
@@ -278,11 +306,11 @@ func (d *Daemon) readoptSessionShimAttempt(
 // lineage. A nil predicate means yes: a standalone daemon has nothing above it
 // to ask, and the discovery record it checked already is then the whole
 // observation.
-func (d *Daemon) sessionShimLineageHeld(cfg SessionShimConfig, id sessionshim.Identity) bool {
+func (d *Daemon) sessionShimLineageHeldContext(parent context.Context, cfg SessionShimConfig, id sessionshim.Identity) bool {
 	if cfg.LineageLive == nil {
 		return true
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), cfg.callbackTimeout())
+	ctx, cancel := context.WithTimeout(parent, cfg.callbackTimeout())
 	defer cancel()
 	return cfg.LineageLive(ctx, id)
 }
@@ -305,27 +333,43 @@ func (d *Daemon) sessionShimWindowExhausted(
 	hello shimwire.Hello,
 	deadline time.Time,
 ) sessionShimReadoptionDisposition {
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown
+	}
 	if !sessionShimIncarnationStillLive(registry, id, hello.ShimID, hello.ProcessEpoch) {
 		return readoptionLineageGone
 	}
 	slog.Warn("session shim: the re-adoption window ended with the shim still observable",
 		"session", id.String(), "deadline", deadline)
 	if cfg.OnReadoptionWindowExhausted != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.callbackTimeout())
+		ctx, cancel := context.WithTimeout(d.shims.recoveryCtx, cfg.callbackTimeout())
 		cfg.OnReadoptionWindowExhausted(ctx, id)
 		cancel()
+	}
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown
 	}
 	return readoptionWindowExhausted
 }
 
-// sleepSessionShimWindowBackoff waits one re-adoption backoff, or returns false
-// when the daemon released its shims first. It is the ONE loop the injectable
-// session-shim clock governs.
+// sleepSessionShimRecoveryBackoff uses the fixed policy clock and recovery lifetime.
+func (d *Daemon) sleepSessionShimRecoveryBackoff(backoff time.Duration) bool {
+	timer := time.NewTimer(backoff)
+	defer timer.Stop()
+	select {
+	case <-timer.C:
+		return d.shims.recoveryCtx.Err() == nil
+	case <-d.shims.recoveryCtx.Done():
+		return false
+	}
+}
+
+// sleepSessionShimWindowBackoff uses the injectable window clock and recovery lifetime.
 func (d *Daemon) sleepSessionShimWindowBackoff(backoff time.Duration) bool {
 	select {
 	case <-d.shimAfter(backoff):
 		return true
-	case <-d.shims.reconcileStop:
+	case <-d.shims.recoveryCtx.Done():
 		return false
 	}
 }
@@ -387,6 +431,9 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 		retry := min(sessionShimKeepaliveRetryInterval, interval)
 		paced := true
 		for {
+			if d.shims.recoveryCtx.Err() != nil {
+				return
+			}
 			if paced {
 				// The predicate is consulted on PACED ticks only. It is the
 				// composing layer's answer, which in a composed deployment is a
@@ -394,7 +441,7 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 				// millisecond-scale fallback comes to drive a network call at
 				// the same rate. A fast probe cannot extend anything the paced
 				// tick before it was not already allowed to extend.
-				if !d.sessionShimLineageHeld(cfg, id) {
+				if !d.sessionShimLineageHeldContext(d.shims.recoveryCtx, cfg, id) {
 					// The composing layer let this lineage go. Stop extending
 					// at once: from here the shim's own deadline governs,
 					// unextended, which is what keeps the §D8 inequality true.
@@ -437,7 +484,7 @@ func (d *Daemon) startSessionShimOrphanKeepalive(
 			case <-d.shimKeepaliveAfter(wait):
 			case <-stop:
 				return
-			case <-d.shims.reconcileStop:
+			case <-d.shims.recoveryCtx.Done():
 				return
 			}
 		}
@@ -466,7 +513,7 @@ func (d *Daemon) extendSessionShimOrphanDeadline(
 		d.noteSessionShimKeepaliveRefused(id, "session shim: orphan keepalive found no discovery record", err)
 		return false
 	}
-	ctx, cancel := context.WithTimeout(context.Background(), sessionshim.DefaultKeepAliveTimeout)
+	ctx, cancel := context.WithTimeout(d.shims.recoveryCtx, sessionshim.DefaultKeepAliveTimeout)
 	defer cancel()
 	deadline, err := sessionshim.KeepAlive(ctx, record, sessionshim.KeepAliveOptions{
 		ExpectedShimID:       hello.ShimID,

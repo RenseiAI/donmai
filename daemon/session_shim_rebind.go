@@ -128,8 +128,11 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 			return SessionShimNotAdopted, fmt.Errorf("session shim: rebind %s: %w", id, ErrSessionShimNotAdopted)
 		}
 	}
-	defer d.releaseSessionShimRebindClaim(id)
+	defer d.releaseSessionShimRebindClaim(id, entry.controller)
+	return d.rebindAdoptedSessionShim(ctx, id, entry)
+}
 
+func (d *Daemon) rebindAdoptedSessionShim(ctx context.Context, id sessionshim.Identity, entry adoptedShim) (SessionShimRebindResult, error) {
 	registry, err := d.sessionShimRegistry()
 	if err != nil {
 		return SessionShimRebindUnknown, fmt.Errorf("session shim: rebind %s: %w", id, err)
@@ -161,6 +164,55 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 	return SessionShimRebound, nil
 }
 
+// ReportAdoptedSessionShimCarrierTransportLostFor hands one exact, non-nil
+// transport loss to the current controller consumer. It records the cause
+// before closing the controller; consumeShimEvents remains the single owner of
+// bounded recovery and quarantine disposition.
+func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShimControlRef, cause error) (bool, error) {
+	if cause == nil {
+		return false, errors.New("session shim: carrier transport loss cause is required")
+	}
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil {
+		d.lifecycleMu.Unlock()
+		return false, errors.New("session shim: carrier transport loss refused while daemon shutdown is in progress")
+	}
+	if err := validateSessionShimControlRef(ref); err != nil {
+		d.lifecycleMu.Unlock()
+		return false, err
+	}
+	if d.shims == nil {
+		d.lifecycleMu.Unlock()
+		return false, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
+	}
+	d.shims.mu.Lock()
+	entry, err := d.adoptedSessionShimEntryForLocked(ref)
+	if err != nil {
+		d.shims.mu.Unlock()
+		d.lifecycleMu.Unlock()
+		return false, err
+	}
+	if entry.terminal || entry.carrierTransportLoss != nil {
+		d.shims.mu.Unlock()
+		d.lifecycleMu.Unlock()
+		return false, nil
+	}
+	entry.carrierTransportLoss = cause
+	changed := entry.carrierBound
+	if changed {
+		entry.carrierBound = false
+		entry.carrierLostAtUnixNano = d.shimNow().UnixNano()
+	}
+	d.shims.adopted[ref.Identity] = entry
+	d.shims.mu.Unlock()
+	d.lifecycleMu.Unlock()
+	if changed {
+		d.raiseSessionShimCarrierBindLost(d.sessionShimConfig(), ref.Identity)
+	}
+	_ = entry.controller.Close()
+	return changed, nil
+}
+
 // claimSessionShimRebind takes the one in-flight rebind slot for a lineage, or
 // reports why it did not.
 //
@@ -186,15 +238,13 @@ func (d *Daemon) claimSessionShimRebind(id sessionshim.Identity, expected adopte
 	return true, SessionShimRebindUnknown
 }
 
-// releaseSessionShimRebindClaim clears the in-flight mark, whatever the
-// re-adoption did. It is deliberately tolerant of the entry having been
-// replaced meanwhile — the re-adoption itself swaps the entry — and clears the
-// mark on whatever is there now, because a mark left behind would refuse every
-// later repair of this lineage.
-func (d *Daemon) releaseSessionShimRebindClaim(id sessionshim.Identity) {
+// releaseSessionShimRebindClaim clears only the in-flight mark owned by the
+// controller that took it. A completed stale rebind must never clear a
+// replacement controller's claim.
+func (d *Daemon) releaseSessionShimRebindClaim(id sessionshim.Identity, claimed *sessionshim.Controller) {
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
-	if current, ok := d.shims.adopted[id]; ok && current.rebinding {
+	if current, ok := d.shims.adopted[id]; ok && current.controller == claimed && current.rebinding {
 		current.rebinding = false
 		d.shims.adopted[id] = current
 	}
