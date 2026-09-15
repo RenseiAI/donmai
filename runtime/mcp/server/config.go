@@ -37,11 +37,12 @@ type Config struct {
 //
 // Root must be a non-empty ABSOLUTE path that exists and is a directory — the
 // server refuses to serve otherwise (fail-loud startup). RepoPath, when
-// non-empty, must be RELATIVE and must resolve (after filepath.Clean) to a
-// location inside Root; absolute paths and ../ escapes are rejected. These are
-// the same rules the afcli `code` group enforces (indexRoot in afcli/code.go),
-// re-implemented here because that root is discovered from cwd whereas ours is
-// always explicit.
+// non-empty, must be RELATIVE and lexically under Root; its physical target
+// must also remain under Root's physical target. This permits aliases that
+// resolve within the configured worktree while refusing direct and chained
+// links into a sibling. These are the same rules the afcli `code` group
+// enforces (indexRoot in afcli/code.go), re-implemented here because that root
+// is discovered from cwd whereas ours is always explicit.
 func resolveIndexRoot(root, repoPath string) (string, error) {
 	if root == "" {
 		return "", errors.New("--root is required (absolute path to the repo root)")
@@ -57,9 +58,21 @@ func resolveIndexRoot(root, repoPath string) (string, error) {
 		return "", fmt.Errorf("--root %q is not a directory", root)
 	}
 	root = filepath.Clean(root)
+	physicalRoot, err := filepath.EvalSymlinks(root)
+	if err != nil {
+		return "", fmt.Errorf("--root %q: resolve physical path: %w", root, err)
+	}
+	physicalRoot = filepath.Clean(physicalRoot)
+	physicalInfo, err := os.Stat(physicalRoot)
+	if err != nil {
+		return "", fmt.Errorf("--root %q: inspect physical path: %w", root, err)
+	}
+	if !physicalInfo.IsDir() {
+		return "", fmt.Errorf("--root %q physical target is not a directory", root)
+	}
 
 	if repoPath == "" {
-		return root, nil
+		return physicalRoot, nil
 	}
 	if filepath.IsAbs(repoPath) {
 		return "", fmt.Errorf("--repo-path must be a relative path under the root, got absolute path %q", repoPath)
@@ -69,14 +82,22 @@ func resolveIndexRoot(root, repoPath string) (string, error) {
 	if err != nil || rel == ".." || strings.HasPrefix(rel, ".."+string(filepath.Separator)) {
 		return "", fmt.Errorf("--repo-path %q escapes the root %q", repoPath, root)
 	}
-	sInfo, err := os.Stat(cleaned)
+	physicalSubtree, err := filepath.EvalSymlinks(cleaned)
+	if err != nil {
+		return "", fmt.Errorf("--repo-path %q: %w", repoPath, err)
+	}
+	physicalSubtree = filepath.Clean(physicalSubtree)
+	if !withinRoot(physicalRoot, physicalSubtree) {
+		return "", fmt.Errorf("--repo-path %q resolves outside the root %q", repoPath, root)
+	}
+	sInfo, err := os.Stat(physicalSubtree)
 	if err != nil {
 		return "", fmt.Errorf("--repo-path %q: %w", repoPath, err)
 	}
 	if !sInfo.IsDir() {
 		return "", fmt.Errorf("--repo-path %q is not a directory", repoPath)
 	}
-	return cleaned, nil
+	return physicalSubtree, nil
 }
 
 // validateTools resolves the enabled tool subset. An empty subset expands to

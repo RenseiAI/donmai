@@ -34,8 +34,9 @@ func TestResolveIndexRoot_RootValidation(t *testing.T) {
 				if err != nil {
 					t.Fatalf("resolveIndexRoot(%q) unexpected error: %v", tc.root, err)
 				}
-				if got != filepath.Clean(tc.root) {
-					t.Fatalf("resolveIndexRoot(%q) = %q, want %q", tc.root, got, filepath.Clean(tc.root))
+				want := canonicalTestPath(t, tc.root)
+				if got != want {
+					t.Fatalf("resolveIndexRoot(%q) = %q, want %q", tc.root, got, want)
 				}
 				return
 			}
@@ -62,8 +63,8 @@ func TestResolveIndexRoot_RepoPathScoping(t *testing.T) {
 	if err != nil {
 		t.Fatalf("valid repo-path: %v", err)
 	}
-	if got != sub {
-		t.Fatalf("repo-path root = %q, want %q", got, sub)
+	if want := canonicalTestPath(t, sub); got != want {
+		t.Fatalf("repo-path root = %q, want %q", got, want)
 	}
 
 	// Absolute repo-path is rejected.
@@ -81,6 +82,94 @@ func TestResolveIndexRoot_RepoPathScoping(t *testing.T) {
 	if _, err := resolveIndexRoot(root, "nope"); err == nil {
 		t.Fatalf("non-existent repo-path should be rejected, got nil")
 	}
+}
+
+func TestResolveIndexRoot_PhysicalSubtreeContainment(t *testing.T) {
+	parent := t.TempDir()
+	root := filepath.Join(parent, "root")
+	sibling := filepath.Join(parent, "root-sibling")
+	if err := os.Mkdir(root, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Mkdir(sibling, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	ordinary := filepath.Join(root, "pkg")
+	if err := os.Mkdir(ordinary, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	internal := filepath.Join(root, "internal-target")
+	if err := os.Mkdir(internal, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(internal, filepath.Join(root, "internal-alias")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sibling, filepath.Join(root, "sibling-prefix")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(sibling, filepath.Join(root, "escape")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("escape", filepath.Join(root, "escape-chain")); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("missing-target", filepath.Join(root, "dangling")); err != nil {
+		t.Fatal(err)
+	}
+	file := filepath.Join(root, "file.go")
+	if err := os.WriteFile(file, []byte("package p"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	rootAlias := filepath.Join(parent, "root-alias")
+	if err := os.Symlink(root, rootAlias); err != nil {
+		t.Fatal(err)
+	}
+
+	tests := []struct {
+		name     string
+		root     string
+		repoPath string
+		want     string
+		wantErr  string
+	}{
+		{name: "ordinary subtree", root: root, repoPath: "pkg", want: ordinary},
+		{name: "internal alias", root: root, repoPath: "internal-alias", want: internal},
+		{name: "root alias", root: rootAlias, repoPath: ".", want: root},
+		{name: "sibling prefix trap", root: root, repoPath: "sibling-prefix", wantErr: "outside"},
+		{name: "direct escape", root: root, repoPath: "escape", wantErr: "outside"},
+		{name: "chained escape", root: root, repoPath: "escape-chain", wantErr: "outside"},
+		{name: "dangling alias", root: root, repoPath: "dangling", wantErr: "no such file"},
+		{name: "non-directory", root: root, repoPath: "file.go", wantErr: "not a directory"},
+		{name: "no repo path uses physical root", root: rootAlias, want: root},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			got, err := resolveIndexRoot(tc.root, tc.repoPath)
+			if tc.wantErr != "" {
+				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
+					t.Fatalf("resolveIndexRoot(%q, %q) error=%v, want %q", tc.root, tc.repoPath, err, tc.wantErr)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("resolveIndexRoot(%q, %q): %v", tc.root, tc.repoPath, err)
+			}
+			want := canonicalTestPath(t, tc.want)
+			if got != want {
+				t.Fatalf("resolveIndexRoot(%q, %q)=%q, want %q", tc.root, tc.repoPath, got, want)
+			}
+		})
+	}
+}
+
+func canonicalTestPath(t *testing.T, path string) string {
+	t.Helper()
+	resolved, err := filepath.EvalSymlinks(path)
+	if err != nil {
+		t.Fatalf("resolve test path %q: %v", path, err)
+	}
+	return filepath.Clean(resolved)
 }
 
 func TestValidateTools(t *testing.T) {
