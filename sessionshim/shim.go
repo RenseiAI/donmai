@@ -172,7 +172,9 @@ type Shim struct {
 type controllerConn struct {
 	conn           *net.UnixConn
 	w              *shimwire.Writer
+	lifecycleMu    sync.Mutex
 	sub            agent.InteractiveSubscription
+	closed         bool
 	selected       uint32
 	snapshotLedger map[uint64]*snapshotLedgerEntry
 	emissionMu     sync.Mutex
@@ -206,11 +208,44 @@ type snapshotLedgerEntry struct {
 func (c *controllerConn) close() {
 	c.closeOnce.Do(func() {
 		c.failOutputBarrier()
-		if c.sub != nil {
-			_ = c.sub.Close()
+		c.lifecycleMu.Lock()
+		c.closed = true
+		sub := c.sub
+		c.lifecycleMu.Unlock()
+		if sub != nil {
+			_ = sub.Close()
 		}
 		_ = c.conn.Close()
 	})
+}
+
+// installSubscription transfers one handshake-owned subscription to this
+// controller, or closes it when controller teardown already won the race.
+func (c *controllerConn) installSubscription(sub agent.InteractiveSubscription) bool {
+	c.lifecycleMu.Lock()
+	if c.closed {
+		c.lifecycleMu.Unlock()
+		if sub != nil {
+			_ = sub.Close()
+		}
+		return false
+	}
+	c.sub = sub
+	c.lifecycleMu.Unlock()
+	return true
+}
+
+// startControllerLoops linearizes the two known live loops against controller
+// close without invoking an arbitrary callback while lifecycleMu is held.
+func (s *Shim) startControllerLoops(ctrl *controllerConn, r *shimwire.Reader) bool {
+	ctrl.lifecycleMu.Lock()
+	defer ctrl.lifecycleMu.Unlock()
+	if ctrl.closed {
+		return false
+	}
+	go s.pumpOutput(ctrl)
+	go s.readControl(ctrl, r)
+	return true
 }
 
 func (c *controllerConn) installOutputBarrier(barrier *ptyhost.OutputBarrier) {
@@ -976,7 +1011,9 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		return err
 	}
 	adopted.Extensions = welcome.Extensions
-	ctrl.sub = sub
+	if !ctrl.installSubscription(sub) {
+		return net.ErrClosed
+	}
 
 	if err := writeTyped(w, shimwire.TypeAdopted, func() ([]byte, error) { return shimwire.EncodeAdopted(adopted) }); err != nil {
 		ctrl.close()
@@ -1005,8 +1042,9 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		}
 	}
 
-	go s.pumpOutput(ctrl)
-	go s.readControl(ctrl, r)
+	if !s.startControllerLoops(ctrl, r) {
+		return net.ErrClosed
+	}
 	return nil
 }
 
