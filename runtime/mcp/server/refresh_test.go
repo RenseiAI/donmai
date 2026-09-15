@@ -79,10 +79,9 @@ func TestServerRefreshReturnsRunnerFailure(t *testing.T) {
 	t.Parallel()
 	root := t.TempDir()
 	writeRefreshSource(t, filepath.Join(root, "refresh.go"), "CannotPersistRefresh")
-	if err := os.Chmod(root, 0o500); err != nil {
-		t.Fatalf("make root read-only: %v", err)
+	if err := os.WriteFile(filepath.Join(root, ".donmai"), []byte("not a directory\n"), 0o600); err != nil {
+		t.Fatalf("write blocked index root: %v", err)
 	}
-	t.Cleanup(func() { _ = os.Chmod(root, 0o700) })
 	warmDone := make(chan struct{})
 	close(warmDone)
 	s := &Server{runner: codeintel.NewNativeRunner(root), warmDone: warmDone}
