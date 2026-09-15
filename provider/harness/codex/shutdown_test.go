@@ -7,6 +7,7 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"os/signal"
@@ -216,6 +217,11 @@ func TestProvider_ShutdownWaitsForFinalWrites(t *testing.T) {
 					if err != nil || !strings.HasPrefix(state, "Z") {
 						t.Errorf("launcher reaped before writer quiescence: state=%q err=%v", state, err)
 					}
+					// The descendant is still handling TERM and can write. The same
+					// predicate used after Shutdown must reject this live state.
+					if running, err := shutdownWriterRunning(writer); err != nil || !running {
+						t.Fatalf("held final writer: running=%v err=%v", running, err)
+					}
 					if err := os.WriteFile(filepath.Join(root, "release-writer"), nil, 0o600); err != nil {
 						t.Fatal(err)
 					}
@@ -239,9 +245,12 @@ func TestProvider_ShutdownWaitsForFinalWrites(t *testing.T) {
 				if err != nil || alive {
 					t.Fatalf("owned child after Shutdown: alive=%v err=%v", alive, err)
 				}
-				alive, err = writer.Alive()
-				if err != nil || alive {
-					t.Errorf("owned native writer after Shutdown: alive=%v err=%v", alive, err)
+				// A launcher descendant may remain as an orphaned zombie until
+				// its adopting parent reaps it. Its retained start identity is not
+				// a running writer; the provider can reap only its direct child.
+				running, err := shutdownWriterRunning(writer)
+				if err != nil || running {
+					t.Errorf("owned native writer after Shutdown: running=%v err=%v", running, err)
 				}
 				result, err := os.ReadFile(resultPath)
 				if err != nil {
@@ -298,4 +307,40 @@ func TestProvider_ShutdownLeavesOtherProviderAlive(t *testing.T) {
 	if _, err := other.client.Request(t.Context(), "config/read", map[string]any{}, other.opts.RPCTimeout); err != nil {
 		t.Fatalf("other provider stopped serving requests: %v", err)
 	}
+}
+
+// shutdownWriterRunning checks execution state as well as start identity.
+// Linux retains the start time of an unreaped zombie, so Alive alone cannot
+// establish whether a descendant can still write. Unknown state fails closed.
+func shutdownWriterRunning(writer sessionshim.ProcessIdentity) (bool, error) {
+	alive, err := writer.Alive()
+	if err != nil || !alive {
+		return false, err
+	}
+	state, err := shutdownProcessState(writer.PID)
+	if err != nil {
+		return false, err
+	}
+	return state != "" && !strings.HasPrefix(state, "Z"), nil
+}
+
+// Read only process IDs and execution state, never arguments or environment.
+func shutdownProcessState(pid int) (string, error) {
+	out, err := exec.Command("ps", "-axo", "pid=,stat=").Output()
+	if err != nil {
+		return "", fmt.Errorf("inspect test writer state: %w", err)
+	}
+	for _, line := range strings.Split(string(out), "\n") {
+		fields := strings.Fields(line)
+		if len(fields) == 0 {
+			continue
+		}
+		if len(fields) != 2 {
+			return "", errors.New("malformed test writer state")
+		}
+		if fields[0] == strconv.Itoa(pid) {
+			return fields[1], nil
+		}
+	}
+	return "", nil // Reaped between the identity and execution-state observations.
 }
