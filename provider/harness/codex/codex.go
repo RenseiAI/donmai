@@ -47,6 +47,7 @@ type Provider struct {
 	config       *codexConfigBoundary
 	hostAuthFile string
 	processDone  chan error
+	ownedProcess *ownedProcess
 	stopOnce     sync.Once
 	stopErr      error
 	startMu      sync.Mutex
@@ -306,6 +307,7 @@ func (p *Provider) startLocked(sessionEnv map[string]string) error {
 		// watchExit / onClientClose / checkAlive below, which are what
 		// actually surface it.
 		p.processDone = make(chan error, 1)
+		p.ownedProcess = newOwnedProcess(cmd)
 		p.config.stopWriter = func() error { return p.stopProcess(context.Background()) }
 		p.appServerStderr = captureAppServerStderr(stderr)
 	}
@@ -820,7 +822,7 @@ func (p *Provider) watchExit() {
 	if p.cmd == nil {
 		return
 	}
-	err := p.cmd.Wait()
+	err := p.ownedProcess.wait()
 	if p.processDone != nil {
 		p.processDone <- err
 		close(p.processDone)
@@ -893,8 +895,8 @@ func (p *Provider) terminateLocked(ctx context.Context) error {
 
 // stopProcess joins the writer independently of Client.Stop. Failure and EOF
 // callbacks can remove the boundary too, and must use the same join before
-// its once-only cleanup. watchExit publishes Wait before invoking callbacks,
-// so joining here cannot wait on the callback that called us.
+// its once-only cleanup. The lifecycle owner stops writers before reaping
+// the leader, then publishes completion before invoking client callbacks.
 func (p *Provider) stopProcess(ctx context.Context) error {
 	p.stopOnce.Do(func() {
 		if p.cmd == nil || p.cmd.Process == nil {
@@ -906,7 +908,7 @@ func (p *Provider) stopProcess(ctx context.Context) error {
 				grace = remaining
 			}
 		}
-		p.stopErr = stopOwnedProcessGroup(p.cmd, p.processDone, grace)
+		p.stopErr = p.ownedProcess.stop(grace)
 	})
 	return p.stopErr
 }

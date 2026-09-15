@@ -8,8 +8,12 @@ import (
 	"encoding/json"
 	"errors"
 	"os"
+	"os/exec"
 	"os/signal"
 	"path/filepath"
+	"strconv"
+	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -72,6 +76,10 @@ func TestCodexShutdownChild(_ *testing.T) {
 			if json.Unmarshal(scanner.Bytes(), &request) != nil {
 				continue
 			}
+			if request.Method == "test/exitLauncher" {
+				_ = syscall.Kill(os.Getppid(), syscall.SIGTERM)
+				continue
+			}
 			if request.Method == "test/closeStdout" {
 				_ = os.Stdout.Close()
 				return
@@ -84,6 +92,21 @@ func TestCodexShutdownChild(_ *testing.T) {
 		}
 	}()
 	<-signals
+	if os.Getenv("DONMAI_CODEX_SHUTDOWN_TEST_HOLD") == "1" {
+		if err := root.WriteFile("writer-stopping", nil, 0o600); err != nil {
+			os.Exit(11)
+		}
+		deadline := time.Now().Add(15 * time.Second)
+		for {
+			if _, err := root.Stat("release-writer"); err == nil {
+				break
+			}
+			if time.Now().After(deadline) {
+				os.Exit(12)
+			}
+			time.Sleep(time.Millisecond)
+		}
+	}
 	home := filepath.Base(os.Getenv("CODEX_HOME"))
 	_, statErr := root.Stat(filepath.Join(home, codexConfigFileName))
 	result := "config-present-at-SIGTERM"
@@ -112,7 +135,7 @@ func TestCodexShutdownChild(_ *testing.T) {
 }
 
 func TestProvider_ShutdownWaitsForFinalWrites(t *testing.T) {
-	for _, path := range []string{"shutdown", "EOF", "launcher"} {
+	for _, path := range []string{"shutdown", "EOF", "launcher", "launcher-exit"} {
 		for _, rollout := range []bool{false, true} {
 			name := "ephemeral"
 			if rollout {
@@ -126,8 +149,11 @@ func TestProvider_ShutdownWaitsForFinalWrites(t *testing.T) {
 					shutdownChildEnv:                  "1",
 					"DONMAI_CODEX_SHUTDOWN_TEST_ROOT": root,
 				}
-				if path == "launcher" {
+				if path == "launcher" || path == "launcher-exit" {
 					env[shutdownChildEnv] = "launcher"
+				}
+				if path == "launcher-exit" {
+					env["DONMAI_CODEX_SHUTDOWN_TEST_HOLD"] = "1"
 				}
 				if rollout {
 					env["DONMAI_CODEX_SHUTDOWN_TEST_ROLLOUT"] = "1"
@@ -162,6 +188,37 @@ func TestProvider_ShutdownWaitsForFinalWrites(t *testing.T) {
 				identity, err := sessionshim.ProcessIdentityFor(p.cmd.Process.Pid)
 				if err != nil {
 					t.Fatal(err)
+				}
+				if path == "launcher-exit" {
+					// Release before provider cleanup even if an assertion fails.
+					t.Cleanup(func() { _ = os.WriteFile(filepath.Join(root, "release-writer"), nil, 0o600) })
+					if err := p.client.Notify("test/exitLauncher", nil); err != nil {
+						t.Fatal(err)
+					}
+					deadline := time.Now().Add(p.opts.HandshakeTimeout)
+					for {
+						if _, err := os.Stat(filepath.Join(root, "writer-stopping")); err == nil {
+							break
+						}
+						if time.Now().After(deadline) {
+							t.Fatal("natural launcher exit did not stop its writer")
+						}
+						time.Sleep(time.Millisecond)
+					}
+					out, err := exec.Command("ps", "-axo", "pid=,stat=").Output()
+					state := ""
+					for _, row := range strings.Split(string(out), "\n") {
+						fields := strings.Fields(row)
+						if len(fields) == 2 && fields[0] == strconv.Itoa(p.cmd.Process.Pid) {
+							state = fields[1]
+						}
+					}
+					if err != nil || !strings.HasPrefix(state, "Z") {
+						t.Errorf("launcher reaped before writer quiescence: state=%q err=%v", state, err)
+					}
+					if err := os.WriteFile(filepath.Join(root, "release-writer"), nil, 0o600); err != nil {
+						t.Fatal(err)
+					}
 				}
 				if path == "EOF" {
 					closed := make(chan struct{})

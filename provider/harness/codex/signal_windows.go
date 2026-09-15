@@ -8,21 +8,43 @@ import (
 	"time"
 )
 
-// syscallSIGTERM returns os.Interrupt on windows since windows has no
-// SIGTERM. Out-of-scope for Phase F (deferred), but the build
-// constraint keeps the package buildable on windows for downstream
-// consumers.
-func syscallSIGTERM() os.Signal { return os.Interrupt }
-
+func syscallSIGTERM() os.Signal              { return os.Interrupt }
 func configureOwnedProcessGroup(_ *exec.Cmd) {}
 
-func stopOwnedProcessGroup(cmd *exec.Cmd, done <-chan error, grace time.Duration) error {
-	_ = cmd.Process.Signal(syscallSIGTERM())
+type ownedProcess struct {
+	cmd     *exec.Cmd
+	request chan time.Duration
+	stopped chan struct{}
+}
+
+func newOwnedProcess(cmd *exec.Cmd) *ownedProcess {
+	return &ownedProcess{cmd: cmd, request: make(chan time.Duration, 1), stopped: make(chan struct{})}
+}
+
+func (p *ownedProcess) stop(grace time.Duration) error {
 	select {
-	case <-done:
-	case <-time.After(grace):
-		_ = cmd.Process.Kill()
-		<-done
+	case p.request <- grace:
+	default:
 	}
+	<-p.stopped
 	return nil
+}
+
+func (p *ownedProcess) wait() error {
+	done := make(chan error, 1)
+	go func() { done <- p.cmd.Wait() }()
+	var err error
+	select {
+	case err = <-done:
+	case grace := <-p.request:
+		_ = p.cmd.Process.Signal(syscallSIGTERM())
+		select {
+		case err = <-done:
+		case <-time.After(grace):
+			_ = p.cmd.Process.Kill()
+			err = <-done
+		}
+	}
+	close(p.stopped)
+	return err
 }
