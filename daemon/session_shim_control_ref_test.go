@@ -8,6 +8,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 func controlRefFor(t *testing.T, d *Daemon, id sessionshim.Identity) SessionShimControlRef {
@@ -249,4 +250,27 @@ func TestTransportCarrierLossUsesExistingBoundedRecovery(t *testing.T) {
 	entry, entryErr := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
 	adoptions, _ := f.snapshot()
 	t.Fatalf("transport loss did not converge through the existing bounded recovery owner: entry=%+v err=%v adoptions=%d quarantined=%+v", entry, entryErr, adoptions, f.daemon.QuarantinedSessions())
+}
+
+func TestTransportCarrierLossRefusesShutdownAndTerminalPrecedence(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Disabled: true}})
+	ref := controlRefFor(t, f.daemon, f.id)
+	f.daemon.lifecycleMu.Lock()
+	f.daemon.stopGen = &stopGeneration{id: 1}
+	f.daemon.lifecycleMu.Unlock()
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("transport during shutdown")); err == nil || changed {
+		t.Fatalf("shutdown report = %v, %v, want refusal without mutation", changed, err)
+	}
+	f.daemon.lifecycleMu.Lock()
+	f.daemon.stopGen = nil
+	f.daemon.lifecycleMu.Unlock()
+
+	// finishAdoptedShim is the same production terminal owner the real Exit
+	// event reaches. Once it has consumed terminality, a later transport report
+	// cannot re-open recovery for that lineage.
+	f.daemon.finishAdoptedShim(f.id, shimwire.ExitMsg{})
+	if changed, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(ref, errors.New("transport after exit")); err == nil || changed {
+		t.Fatalf("post-Exit report = %v, %v, want terminal precedence refusal", changed, err)
+	}
 }

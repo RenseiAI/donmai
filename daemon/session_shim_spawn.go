@@ -2996,7 +2996,7 @@ func (d *Daemon) releaseShimIfLive(id sessionshim.Identity, ctrl *sessionshim.Co
 		ok = false
 	}
 	if ok && ctrl != nil && entry.controller == ctrl && !entry.terminal && entry.carrierTransportLoss != nil && ctrl.StreamEndCause() == nil {
-		cause = shimStreamCarrierLostPlatform
+		cause = shimStreamCarrierLost
 	}
 	d.shims.mu.RUnlock()
 	if !ok {

@@ -172,6 +172,12 @@ func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShim
 	if cause == nil {
 		return false, errors.New("session shim: carrier transport loss cause is required")
 	}
+	d.lifecycleMu.Lock()
+	stopping := d.stopGen != nil
+	d.lifecycleMu.Unlock()
+	if stopping {
+		return false, errors.New("session shim: carrier transport loss refused while daemon shutdown is in progress")
+	}
 	if err := validateSessionShimControlRef(ref); err != nil {
 		return false, err
 	}
