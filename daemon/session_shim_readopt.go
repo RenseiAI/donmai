@@ -254,7 +254,18 @@ func (d *Daemon) readoptSessionShimAttempt(
 			"session", id.String(), "attempt", attempt)
 		return readoptionLineageGone, true
 	}
-	err := d.readoptSessionShimOnce(context.Background(), registry, cfg, id, lost, hello, d.shimNow().UnixNano())
+	attemptCtx, cancel := context.WithCancel(context.Background())
+	done := make(chan struct{})
+	go func() {
+		select {
+		case <-d.shims.reconcileStop:
+			cancel()
+		case <-done:
+		}
+	}()
+	err := d.readoptSessionShimOnce(attemptCtx, registry, cfg, id, lost, hello, d.shimNow().UnixNano())
+	close(done)
+	cancel()
 	if err == nil {
 		slog.Info("session shim: re-adopted a live shim after controller loss",
 			"session", id.String(), "attempt", attempt)

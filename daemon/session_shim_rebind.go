@@ -173,25 +173,28 @@ func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShim
 		return false, errors.New("session shim: carrier transport loss cause is required")
 	}
 	d.lifecycleMu.Lock()
-	stopping := d.stopGen != nil
-	d.lifecycleMu.Unlock()
-	if stopping {
+	if d.stopGen != nil {
+		d.lifecycleMu.Unlock()
 		return false, errors.New("session shim: carrier transport loss refused while daemon shutdown is in progress")
 	}
 	if err := validateSessionShimControlRef(ref); err != nil {
+		d.lifecycleMu.Unlock()
 		return false, err
 	}
 	if d.shims == nil {
+		d.lifecycleMu.Unlock()
 		return false, fmt.Errorf("session shim: %w", ErrSessionShimAdoptionNotConfigured)
 	}
 	d.shims.mu.Lock()
 	entry, err := d.adoptedSessionShimEntryForLocked(ref)
 	if err != nil {
 		d.shims.mu.Unlock()
+		d.lifecycleMu.Unlock()
 		return false, err
 	}
 	if entry.terminal || entry.carrierTransportLoss != nil {
 		d.shims.mu.Unlock()
+		d.lifecycleMu.Unlock()
 		return false, nil
 	}
 	entry.carrierTransportLoss = cause
@@ -202,6 +205,7 @@ func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShim
 	}
 	d.shims.adopted[ref.Identity] = entry
 	d.shims.mu.Unlock()
+	d.lifecycleMu.Unlock()
 	if changed {
 		d.raiseSessionShimCarrierBindLost(d.sessionShimConfig(), ref.Identity)
 	}
