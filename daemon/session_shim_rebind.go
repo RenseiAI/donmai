@@ -154,7 +154,6 @@ func (d *Daemon) RebindAdoptedSessionShimFor(ctx context.Context, ref SessionShi
 }
 
 func (d *Daemon) rebindAdoptedSessionShim(ctx context.Context, id sessionshim.Identity, entry adoptedShim) (SessionShimRebindResult, error) {
-
 	registry, err := d.sessionShimRegistry()
 	if err != nil {
 		return SessionShimRebindUnknown, fmt.Errorf("session shim: rebind %s: %w", id, err)
