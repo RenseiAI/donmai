@@ -412,7 +412,7 @@ type documentNode struct {
 type createDocumentData struct {
 	DocumentCreate struct {
 		Success    bool          `json:"success"`
-		LastSyncID float64       `json:"lastSyncId"`
+		LastSyncID *float64      `json:"lastSyncId"`
 		Document   *documentNode `json:"document"`
 	} `json:"documentCreate"`
 }

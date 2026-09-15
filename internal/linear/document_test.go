@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
@@ -122,6 +123,7 @@ func TestCreateDocumentRejectsFalseOrMalformedPayload(t *testing.T) {
 		want string
 	}{
 		{"false", documentPayloadJSON("issue", "issue-1", false), "not successful"},
+		{"missing last sync", strings.Replace(documentPayloadJSON("issue", "issue-1", true), `"lastSyncId":12,`, "", 1), "no lastSyncId"},
 		{"missing URL", `{"documentCreate":{"success":true,"lastSyncId":1,"document":{"id":"doc","title":"x"}}}`, "required document fields"},
 	}
 	for _, tc := range tests {
@@ -132,6 +134,19 @@ func TestCreateDocumentRejectsFalseOrMalformedPayload(t *testing.T) {
 				t.Fatalf("CreateDocument error = %v, want %q", err, tc.want)
 			}
 		})
+	}
+}
+
+func TestCreateDocumentPreservesZeroLastSyncID(t *testing.T) {
+	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeGQLData(w, strings.Replace(documentPayloadJSON("issue", "issue-1", true), `"lastSyncId":12`, `"lastSyncId":0`, 1))
+	})
+	result, err := c.CreateDocument(context.Background(), CreateDocumentInput{Title: "x", IssueID: StringValue("issue-1")})
+	if err != nil {
+		t.Fatalf("CreateDocument: %v", err)
+	}
+	if result.LastSyncID != 0 {
+		t.Fatalf("LastSyncID = %v, want 0", result.LastSyncID)
 	}
 }
 
@@ -217,6 +232,50 @@ func TestCreateDocumentProxiedDoesNotRetryAmbiguousResponse(t *testing.T) {
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one proxied write attempt", requests)
+	}
+}
+
+func TestCreateDocumentRefusesRedirectsWithDefaultClients(t *testing.T) {
+	redirects := []int{http.StatusMovedPermanently, http.StatusFound, http.StatusSeeOther, http.StatusTemporaryRedirect, http.StatusPermanentRedirect}
+	for _, proxied := range []bool{false, true} {
+		for _, status := range redirects {
+			name := http.StatusText(status)
+			if proxied {
+				name = "proxied_" + name
+			}
+			t.Run(name, func(t *testing.T) {
+				var originRequests, targetRequests int
+				target := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+					targetRequests++
+					writeGQLData(w, documentPayloadJSON("issue", "issue-1", true))
+				}))
+				t.Cleanup(target.Close)
+				origin := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+					originRequests++
+					http.Redirect(w, r, target.URL, status)
+				}))
+				t.Cleanup(origin.Close)
+
+				var client *Client
+				var err error
+				if proxied {
+					client, err = NewProxiedClient(origin.URL, "fixture-token")
+				} else {
+					client, err = NewClient("fixture-token")
+					client.BaseURL = origin.URL
+				}
+				if err != nil {
+					t.Fatal(err)
+				}
+				_, err = client.CreateDocument(context.Background(), CreateDocumentInput{Title: "x", IssueID: StringValue("issue-1")})
+				if err == nil {
+					t.Fatal("CreateDocument unexpectedly accepted redirect payload")
+				}
+				if originRequests != 1 || targetRequests != 0 {
+					t.Fatalf("origin=%d target=%d, want one origin POST and no redirect request", originRequests, targetRequests)
+				}
+			})
+		}
 	}
 }
 

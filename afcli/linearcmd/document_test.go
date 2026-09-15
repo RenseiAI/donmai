@@ -90,6 +90,56 @@ func TestCreateDocumentDirectUsesNativeMutationAndIssueResolution(t *testing.T) 
 	}
 }
 
+func TestCreateDocumentDirectRejectsUnrelatedIssueLookupBeforeMutation(t *testing.T) {
+	mutationCalls := 0
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var request struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Fatal(err)
+		}
+		switch {
+		case strings.Contains(request.Query, "GetIssue"):
+			writeLinearGQLData(w, `{"issue":`+issueNodeJSON("foreign-uuid", "ENG-999", "Foreign", "Backlog", "team", "ENG", "Engineering")+`}`)
+		case strings.Contains(request.Query, "documentCreate"):
+			mutationCalls++
+			writeLinearGQLData(w, cliDocumentPayload("issue", "foreign-uuid"))
+		default:
+			t.Fatalf("unexpected query: %s", request.Query)
+		}
+	})
+	_, err := runLinearCmd(t, "", "create-document", "--title", "Native", "--issue", "ENG-1")
+	if err == nil || !strings.Contains(err.Error(), "does not match requested reference") {
+		t.Fatalf("error = %v", err)
+	}
+	if mutationCalls != 0 {
+		t.Fatalf("documentCreate calls = %d, want 0", mutationCalls)
+	}
+}
+
+func TestDocumentIssueReferenceMatches(t *testing.T) {
+	tests := []struct {
+		name      string
+		requested string
+		resolved  linear.Issue
+		want      bool
+	}{
+		{"identifier matches identifier", "ENG-1", linear.Issue{ID: "uuid-1", Identifier: "ENG-1"}, true},
+		{"identifier rejects different identifier", "ENG-1", linear.Issue{ID: "uuid-1", Identifier: "ENG-999"}, false},
+		{"UUID matches ID", "123e4567-e89b-42d3-a456-426614174000", linear.Issue{ID: "123e4567-e89b-42d3-a456-426614174000", Identifier: "ENG-1"}, true},
+		{"UUID rejects different ID", "123e4567-e89b-42d3-a456-426614174000", linear.Issue{ID: "123e4567-e89b-42d3-a456-426614174001", Identifier: "ENG-1"}, false},
+		{"empty resolved ID rejects", "ENG-1", linear.Issue{Identifier: "ENG-1"}, false},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := documentIssueReferenceMatches(tc.requested, &tc.resolved); got != tc.want {
+				t.Fatalf("documentIssueReferenceMatches(%q, %#v) = %t, want %t", tc.requested, tc.resolved, got, tc.want)
+			}
+		})
+	}
+}
+
 func TestCreateDocumentHookBypassesRawFactoryAndPreservesInput(t *testing.T) {
 	factoryCalls := 0
 	var got linear.CreateDocumentInput

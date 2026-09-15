@@ -44,6 +44,7 @@ import (
 	"strconv"
 	"strings"
 
+	"github.com/google/uuid"
 	"github.com/spf13/cobra"
 
 	"github.com/RenseiAI/donmai/afcli/internal/cli"
@@ -584,9 +585,13 @@ CLI project context.`,
 			// Linear accepts an issue identifier on documentCreate, but resolving it
 			// in the raw transport path pins the stored relationship to its UUID.
 			if input.IssueID.Set && input.IssueID.Value != nil {
-				resolved, err := client.GetIssue(cmd.Context(), *input.IssueID.Value)
+				requestedIssue := *input.IssueID.Value
+				resolved, err := client.GetIssue(cmd.Context(), requestedIssue)
 				if err != nil {
 					return fmt.Errorf("resolve document issue: %w", err)
+				}
+				if !documentIssueReferenceMatches(requestedIssue, resolved) {
+					return fmt.Errorf("resolve document issue: returned issue does not match requested reference %q", requestedIssue)
 				}
 				input.IssueID = linear.StringValue(resolved.ID)
 			}
@@ -618,6 +623,16 @@ CLI project context.`,
 	cmd.Flags().StringVar(&sortOrder, "sort-order", "", "Native resource list order")
 	cmd.Flags().StringSliceVar(&subscribers, "subscriber", nil, "Native Linear subscriber ID (repeat or comma-separate; empty gives an explicit empty list)")
 	return cmd
+}
+
+func documentIssueReferenceMatches(requested string, resolved *linear.Issue) bool {
+	if resolved == nil || strings.TrimSpace(resolved.ID) == "" {
+		return false
+	}
+	if _, err := uuid.Parse(requested); err == nil {
+		return strings.EqualFold(resolved.ID, requested)
+	}
+	return strings.EqualFold(resolved.Identifier, requested)
 }
 
 func newLinearCreateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Command {

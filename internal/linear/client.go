@@ -381,7 +381,18 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 		req.Header.Set("Authorization", c.APIKey)
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	httpClient := c.HTTPClient
+	if writeOnce {
+		// Never mutate an embedder's shared client. A shallow copy retains its
+		// timeout and transport while refusing every redirect response at the
+		// original POST, including 301/302/303 method-changing redirects.
+		clientCopy := *c.HTTPClient
+		clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &clientCopy
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("linear: request failed: %w", err)
 	}
@@ -525,6 +536,9 @@ func (c *Client) CreateDocument(ctx context.Context, input CreateDocumentInput) 
 	if !data.DocumentCreate.Success {
 		return nil, fmt.Errorf("document creation was not successful")
 	}
+	if data.DocumentCreate.LastSyncID == nil {
+		return nil, fmt.Errorf("document creation returned no lastSyncId")
+	}
 	if data.DocumentCreate.Document == nil {
 		return nil, fmt.Errorf("document creation returned no document")
 	}
@@ -534,7 +548,7 @@ func (c *Client) CreateDocument(ctx context.Context, input CreateDocumentInput) 
 	}
 	result := &DocumentCreateResult{
 		Success:    true,
-		LastSyncID: data.DocumentCreate.LastSyncID,
+		LastSyncID: *data.DocumentCreate.LastSyncID,
 		Document:   document,
 	}
 	if err := ValidateDocumentCreateResultForInput(input, result); err != nil {
