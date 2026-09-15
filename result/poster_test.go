@@ -39,6 +39,14 @@ func goodResult() agent.Result {
 	}
 }
 
+// roundTripFunc adapts a function for use as an http.RoundTripper. It matches
+// the injected-transport pattern used by gateway/gateway_test.go.
+type roundTripFunc func(*http.Request) (*http.Response, error)
+
+func (f roundTripFunc) RoundTrip(r *http.Request) (*http.Response, error) {
+	return f(r)
+}
+
 // captureServer returns an httptest server that records every request
 // hit to /completion + /status and replies per the per-path scripts.
 func captureServer(t *testing.T,
@@ -127,10 +135,9 @@ func TestPosterPost_Happy(t *testing.T) {
 	}
 }
 
-// TestPosterPost_CompletionOutcomePrecedesStatus proves that the ancillary
-// completion request carries the same typed terminal outcome as the status
-// request. The recording server also pins the wire order: a failed completion
-// outcome is published before the later failed status transition.
+// TestPosterPost_CompletionOutcomePrecedesStatus proves the ordinary no-retry
+// exchange through an injected transport, so its exact one completion then one
+// status assertion cannot be affected by TCP acknowledgement ambiguity.
 func TestPosterPost_CompletionOutcomePrecedesStatus(t *testing.T) {
 	t.Parallel()
 
@@ -168,34 +175,36 @@ func TestPosterPost_CompletionOutcomePrecedesStatus(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			var (
-				mu             sync.Mutex
-				paths          []string
-				completionBody map[string]any
-				statusBody     map[string]any
+				mu               sync.Mutex
+				paths            []string
+				completionBodies []map[string]any
+				statusBody       map[string]any
 			)
-			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			client := &http.Client{Transport: roundTripFunc(func(r *http.Request) (*http.Response, error) {
 				body, err := io.ReadAll(r.Body)
 				if err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
+					return nil, err
 				}
 				var decoded map[string]any
 				if err := json.Unmarshal(body, &decoded); err != nil {
-					http.Error(w, err.Error(), http.StatusBadRequest)
-					return
+					return nil, err
 				}
 				mu.Lock()
+				defer mu.Unlock()
 				paths = append(paths, r.URL.Path)
 				switch {
 				case strings.HasSuffix(r.URL.Path, "/completion"):
-					completionBody = decoded
+					completionBodies = append(completionBodies, decoded)
 				case strings.HasSuffix(r.URL.Path, "/status"):
 					statusBody = decoded
 				}
-				mu.Unlock()
-				w.WriteHeader(http.StatusOK)
-			}))
-			t.Cleanup(srv.Close)
+				return &http.Response{
+					StatusCode: http.StatusOK,
+					Header:     make(http.Header),
+					Body:       io.NopCloser(strings.NewReader(`{"ok":true}`)),
+					Request:    r,
+				}, nil
+			})}
 
 			r := goodResult()
 			r.Status = tc.status
@@ -205,28 +214,187 @@ func TestPosterPost_CompletionOutcomePrecedesStatus(t *testing.T) {
 			if tc.status == "failed" {
 				r.Error = "policy bypass"
 			}
-			if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-outcome", r); err != nil {
+			p, err := result.NewPoster(result.Options{
+				PlatformURL: "https://receiver.invalid",
+				AuthToken:   "test-token",
+				WorkerID:    "wkr_test",
+				HTTPClient:  client,
+				BaseDelay:   0,
+			})
+			if err != nil {
+				t.Fatalf("NewPoster: %v", err)
+			}
+			if err := p.Post(context.Background(), "sess-outcome", r); err != nil {
 				t.Fatalf("Post: %v", err)
 			}
 
 			mu.Lock()
 			gotPaths := append([]string(nil), paths...)
-			gotCompletion := completionBody
+			gotCompletions := append([]map[string]any(nil), completionBodies...)
 			gotStatus := statusBody
 			mu.Unlock()
-			if len(gotPaths) != 2 || !strings.HasSuffix(gotPaths[0], "/completion") || !strings.HasSuffix(gotPaths[1], "/status") {
+			if got, want := len(gotPaths), 2; got != want {
+				t.Fatalf("requests = %d, want %d (paths %v)", got, want, gotPaths)
+			}
+			if len(gotCompletions) != 1 || !strings.HasSuffix(gotPaths[0], "/completion") || !strings.HasSuffix(gotPaths[1], "/status") {
 				t.Fatalf("request order = %v, want completion then status", gotPaths)
 			}
-			if gotCompletion["result"] != tc.wantCompletion {
-				t.Errorf("completion result = %v, want %q", gotCompletion["result"], tc.wantCompletion)
+			if gotCompletions[0]["result"] != tc.wantCompletion {
+				t.Errorf("completion result = %v, want %q", gotCompletions[0]["result"], tc.wantCompletion)
+			}
+			if summary, _ := gotCompletions[0]["summary"].(string); !strings.HasPrefix(summary, tc.wantSummaryPrefix) {
+				t.Errorf("completion summary = %q, want prefix %q", summary, tc.wantSummaryPrefix)
 			}
 			if gotStatus["status"] != tc.wantStatus {
 				t.Errorf("status = %v, want %q", gotStatus["status"], tc.wantStatus)
 			}
-			if summary, _ := gotCompletion["summary"].(string); !strings.HasPrefix(summary, tc.wantSummaryPrefix) {
-				t.Errorf("completion summary = %q, want prefix %q", summary, tc.wantSummaryPrefix)
-			}
 		})
+	}
+}
+
+// TestPosterPost_CompletionRetryPrecedesStatus proves that lost completion and
+// status acknowledgements may cause either request to be delivered again, but
+// status still cannot overtake any completion attempt.
+func TestPosterPost_CompletionRetryPrecedesStatus(t *testing.T) {
+	t.Parallel()
+
+	const minCompletionDeliveries = 2
+	var (
+		mu                     sync.Mutex
+		paths                  []string
+		completionBodies       []map[string]any
+		statusBodies           []map[string]any
+		statusBeforeDeliveries bool
+		completionAfterStatus  bool
+	)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, err := io.ReadAll(r.Body)
+		if err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+		var decoded map[string]any
+		if err := json.Unmarshal(body, &decoded); err != nil {
+			http.Error(w, err.Error(), http.StatusBadRequest)
+			return
+		}
+
+		mu.Lock()
+		paths = append(paths, r.URL.Path)
+		completionAttempt := 0
+		statusAttempt := 0
+		statusArrivedEarly := false
+		switch {
+		case strings.HasSuffix(r.URL.Path, "/completion"):
+			completionBodies = append(completionBodies, decoded)
+			completionAttempt = len(completionBodies)
+			completionAfterStatus = completionAfterStatus || len(statusBodies) > 0
+		case strings.HasSuffix(r.URL.Path, "/status"):
+			statusBodies = append(statusBodies, decoded)
+			statusAttempt = len(statusBodies)
+			statusArrivedEarly = len(completionBodies) < minCompletionDeliveries
+			// Keep an ordering violation sticky: a later valid status retry
+			// must not erase an earlier status that overtook completion.
+			statusBeforeDeliveries = statusBeforeDeliveries || statusArrivedEarly
+		}
+		mu.Unlock()
+
+		if strings.HasSuffix(r.URL.Path, "/completion") && completionAttempt == 1 {
+			// The receiver accepted this completion, but its acknowledgement
+			// is lost before it can reach the caller. Closing the connection
+			// exercises the real transient retry path.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("ResponseWriter does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/status") && statusArrivedEarly {
+			http.Error(w, "status arrived before all required completion deliveries", http.StatusConflict)
+			return
+		}
+		if strings.HasSuffix(r.URL.Path, "/status") && statusAttempt == 1 {
+			// Completion was acknowledged before this point. Lose only this
+			// status acknowledgement to prove its valid retry does not alter
+			// the completion-before-status ordering contract.
+			hijacker, ok := w.(http.Hijacker)
+			if !ok {
+				t.Errorf("ResponseWriter does not support hijacking")
+				return
+			}
+			conn, _, err := hijacker.Hijack()
+			if err != nil {
+				t.Errorf("Hijack: %v", err)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+
+	r := goodResult()
+	r.Status = "stopped"
+	r.Summary = ""
+	if err := newPoster(t, srv.URL, 0).Post(context.Background(), "sess-retry-order", r); err != nil {
+		t.Fatalf("Post: %v", err)
+	}
+
+	mu.Lock()
+	gotPaths := append([]string(nil), paths...)
+	gotCompletions := append([]map[string]any(nil), completionBodies...)
+	gotStatuses := append([]map[string]any(nil), statusBodies...)
+	gotStatusBeforeDeliveries := statusBeforeDeliveries
+	gotCompletionAfterStatus := completionAfterStatus
+	mu.Unlock()
+	if gotStatusBeforeDeliveries {
+		t.Fatalf("status arrived before required completion deliveries: paths = %v", gotPaths)
+	}
+	if gotCompletionAfterStatus {
+		t.Fatalf("completion arrived after status: paths = %v", gotPaths)
+	}
+	if got := len(gotCompletions); got < minCompletionDeliveries || got > result.DefaultMaxAttempts {
+		t.Fatalf("completion deliveries = %d, want %d through %d", got, minCompletionDeliveries, result.DefaultMaxAttempts)
+	}
+	if got := len(gotStatuses); got < 1 || got > result.DefaultMaxAttempts {
+		t.Fatalf("status deliveries = %d, want 1 through %d", got, result.DefaultMaxAttempts)
+	}
+	if got := len(gotStatuses); got < 2 {
+		t.Fatalf("status deliveries = %d, want at least 2 after lost acknowledgement", got)
+	}
+	if got, want := len(gotPaths), len(gotCompletions)+len(gotStatuses); got != want {
+		t.Fatalf("requests = %d, want completion and status deliveries (paths %v)", got, gotPaths)
+	}
+	for i, body := range gotCompletions {
+		if !strings.HasSuffix(gotPaths[i], "/completion") {
+			t.Fatalf("request %d = %q, want completion before status (paths %v)", i, gotPaths[i], gotPaths)
+		}
+		if body["result"] != "failure" {
+			t.Errorf("completion attempt %d result = %v, want failure", i+1, body["result"])
+		}
+		if summary, _ := body["summary"].(string); !strings.HasPrefix(summary, "Session stopped.") {
+			t.Errorf("completion attempt %d summary = %q, want Session stopped prefix", i+1, summary)
+		}
+	}
+	for i := range gotStatuses {
+		pathIndex := len(gotCompletions) + i
+		if !strings.HasSuffix(gotPaths[pathIndex], "/status") {
+			t.Fatalf("request %d = %q, want status after completions (paths %v)", pathIndex, gotPaths[pathIndex], gotPaths)
+		}
+		if gotStatuses[i]["status"] != "stopped" {
+			t.Errorf("status attempt %d = %v, want stopped", i+1, gotStatuses[i]["status"])
+		}
+		if gotStatuses[i]["workerId"] != "wkr_test" {
+			t.Errorf("status attempt %d workerId = %v, want wkr_test", i+1, gotStatuses[i]["workerId"])
+		}
 	}
 }
 
