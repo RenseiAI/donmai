@@ -137,6 +137,15 @@ for distinct worktrees. The initial index warms at server startup and stays
 warm only for the lifetime of that server process; subsequent tool calls reuse
 that process-local index.
 
+### In-process refresh
+
+An embedding Go host that knows its served working tree changed may call
+`(*server.Server).Refresh()`. It waits for the server's initial warm-up, then
+refreshes that same server's existing native runner and returns the current
+refresh result. This is an explicit in-process lifecycle boundary: it does not
+add a JSON-RPC method or MCP tool, and ordinary `tools/call` requests do not
+refresh automatically.
+
 The `contentFile` argument accepted by `af_code_check_duplicate` is also
 relative to the effective root. Absolute paths, traversal outside the root, and
 symlinks that resolve outside the root are rejected. Indexing and type/dependency

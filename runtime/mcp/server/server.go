@@ -142,6 +142,19 @@ func (s *Server) WaitReady(ctx context.Context) error {
 	}
 }
 
+// Refresh synchronously waits for the initial warm-up to finish, then rebuilds
+// the existing runner's in-process index from its current root. It returns the
+// current refresh result; an earlier warm-up error remains recorded on
+// WaitReady and is not rewritten by this explicit refresh boundary.
+//
+// Refresh is an in-process API for hosts that know their working tree changed.
+// It does not add an MCP method or tool, and ordinary tools/call requests keep
+// their existing warm-cache behavior.
+func (s *Server) Refresh() error {
+	<-s.warmDone
+	return s.runner.Refresh()
+}
+
 // ── JSON-RPC framing ─────────────────────────────────────────────────────────
 
 // rpcRequest is one inbound newline-delimited JSON-RPC message. ID is captured
