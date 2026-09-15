@@ -39,12 +39,8 @@ func TestControllerConnCloseRejectsLateSubscriptionAndLoopStart(t *testing.T) {
 	if got := sub.closes.Load(); got != 1 {
 		t.Fatalf("late subscription closes = %d, want exactly 1", got)
 	}
-	var started atomic.Bool
-	if ctrl.startLiveLoops(func() { started.Store(true) }) {
+	if (&Shim{}).startControllerLoops(ctrl, nil) {
 		t.Fatal("live loops accepted after controller close")
-	}
-	if started.Load() {
-		t.Fatal("live loops started after controller close")
 	}
 	ctrl.close()
 	if got := sub.closes.Load(); got != 1 {
@@ -59,21 +55,14 @@ func TestControllerConnInstallAndCloseOwnSubscriptionExactlyOnce(t *testing.T) {
 	if !ctrl.installSubscription(sub) {
 		t.Fatal("open controller refused subscription")
 	}
-	var starts atomic.Int32
-	if !ctrl.startLiveLoops(func() { starts.Add(1) }) {
-		t.Fatal("open controller refused live-loop start")
-	}
 
 	ctrl.close()
 	ctrl.close()
 	if got := sub.closes.Load(); got != 1 {
 		t.Fatalf("installed subscription closes = %d, want exactly 1", got)
 	}
-	if ctrl.startLiveLoops(func() { starts.Add(1) }) {
+	if (&Shim{}).startControllerLoops(ctrl, nil) {
 		t.Fatal("closed controller accepted another live-loop start")
-	}
-	if got := starts.Load(); got != 1 {
-		t.Fatalf("live-loop starts = %d, want exactly 1 before close", got)
 	}
 }
 
@@ -100,7 +89,7 @@ func TestControllerConnInstallCloseRaceOwnsSubscriptionExactlyOnce(t *testing.T)
 	if got := sub.closes.Load(); got != 1 {
 		t.Fatalf("racing subscription closes = %d, want exactly 1", got)
 	}
-	if ctrl.startLiveLoops(func() { t.Error("live loops started after close") }) {
+	if (&Shim{}).startControllerLoops(ctrl, nil) {
 		t.Fatal("closed controller accepted live-loop start after install race")
 	}
 }

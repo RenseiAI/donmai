@@ -235,15 +235,16 @@ func (c *controllerConn) installSubscription(sub agent.InteractiveSubscription) 
 	return true
 }
 
-// startLiveLoops linearizes live-loop startup against close. The callback must
-// only launch goroutines; close may proceed as soon as it returns.
-func (c *controllerConn) startLiveLoops(start func()) bool {
-	c.lifecycleMu.Lock()
-	defer c.lifecycleMu.Unlock()
-	if c.closed {
+// startControllerLoops linearizes the two known live loops against controller
+// close without invoking an arbitrary callback while lifecycleMu is held.
+func (s *Shim) startControllerLoops(ctrl *controllerConn, r *shimwire.Reader) bool {
+	ctrl.lifecycleMu.Lock()
+	defer ctrl.lifecycleMu.Unlock()
+	if ctrl.closed {
 		return false
 	}
-	start()
+	go s.pumpOutput(ctrl)
+	go s.readControl(ctrl, r)
 	return true
 }
 
@@ -1041,10 +1042,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		}
 	}
 
-	if !ctrl.startLiveLoops(func() {
-		go s.pumpOutput(ctrl)
-		go s.readControl(ctrl, r)
-	}) {
+	if !s.startControllerLoops(ctrl, r) {
 		return net.ErrClosed
 	}
 	return nil
