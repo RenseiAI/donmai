@@ -3709,17 +3709,35 @@ func (d *Daemon) StopAdoptedSessionShimFor(ref SessionShimControlRef, reason shi
 }
 
 func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*sessionshim.Controller, error) {
-	if err := ref.Identity.Validate(); err != nil || ref.ShimID == "" || ref.ProcessEpoch == 0 || ref.ControllerGeneration == 0 {
-		return nil, errors.New("session shim: control reference is incomplete")
+	if err := validateSessionShimControlRef(ref); err != nil {
+		return nil, err
 	}
 	if d.shims == nil {
 		return nil, errors.New("session shim: adoption is not configured")
 	}
 	d.shims.mu.RLock()
-	entry, ok := d.shims.adopted[ref.Identity]
+	entry, err := d.adoptedSessionShimEntryForLocked(ref)
 	d.shims.mu.RUnlock()
+	if err != nil {
+		return nil, err
+	}
+	return entry.controller, nil
+}
+
+func validateSessionShimControlRef(ref SessionShimControlRef) error {
+	if err := ref.Identity.Validate(); err != nil || ref.ShimID == "" || ref.ProcessEpoch == 0 || ref.ControllerGeneration == 0 {
+		return errors.New("session shim: control reference is incomplete")
+	}
+	return nil
+}
+
+// adoptedSessionShimEntryForLocked resolves ref under d.shims.mu. Callers that
+// mutate carrier/rebind state keep that lock through the comparison so a stale
+// callback cannot act on a replacement controller.
+func (d *Daemon) adoptedSessionShimEntryForLocked(ref SessionShimControlRef) (adoptedShim, error) {
+	entry, ok := d.shims.adopted[ref.Identity]
 	if !ok || entry.controller == nil {
-		return nil, fmt.Errorf("session shim: control reference is not current for %s", ref.Identity)
+		return adoptedShim{}, fmt.Errorf("session shim: control reference is not current for %s", ref.Identity)
 	}
 	hello := entry.controller.Hello()
 	if entry.adoption.Identity != ref.Identity || entry.controller.Identity() != ref.Identity ||
@@ -3727,9 +3745,9 @@ func (d *Daemon) adoptedSessionShimControllerFor(ref SessionShimControlRef) (*se
 		entry.adoption.ProcessEpoch != ref.ProcessEpoch || hello.ProcessEpoch != ref.ProcessEpoch ||
 		entry.adoption.ControllerGeneration != ref.ControllerGeneration ||
 		uint64(entry.controller.Generation()) != ref.ControllerGeneration {
-		return nil, fmt.Errorf("session shim: control reference is stale for %s", ref.Identity)
+		return adoptedShim{}, fmt.Errorf("session shim: control reference is stale for %s", ref.Identity)
 	}
-	return entry.controller, nil
+	return entry, nil
 }
 
 // adoptedShimEntry resolves one adopted session with a live controller.

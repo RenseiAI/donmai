@@ -1157,6 +1157,20 @@ func (c *V2HostCandidate) done() <-chan struct{} {
 	return c.closedCh
 }
 
+// Done closes once this candidate reaches its terminal connection state. That
+// includes an idle read-loop failure with no inbound HostFrame and explicit
+// Close. It is an observation boundary only; it does not alter activation or
+// durable-output semantics.
+func (c *V2HostCandidate) Done() <-chan struct{} { return c.done() }
+
+// Err returns the retained first terminal connection cause, or nil while the
+// candidate remains open.
+func (c *V2HostCandidate) Err() error {
+	c.mu.Lock()
+	defer c.mu.Unlock()
+	return c.err
+}
+
 func (c *V2HostCandidate) terminalError() error {
 	c.mu.Lock()
 	defer c.mu.Unlock()
