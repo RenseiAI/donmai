@@ -216,7 +216,7 @@ func v2Detail(t *testing.T) (*SessionDetail, executioncell.RuntimeBinding) {
 	}, binding
 }
 
-func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPreflightStore, registrar ExecutionPreflightRegistrar, order *[]string, mu *sync.Mutex, credentials *atomic.Int32, marker string) *Daemon {
+func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPreflightStore, registrar ExecutionPreflightRegistrar, order *[]string, mu *sync.Mutex, credentials *atomic.Int32, marker string, configure ...func(*Options)) *Daemon {
 	t.Helper()
 	tmp := t.TempDir()
 	configPath := filepath.Join(tmp, "daemon.yaml")
@@ -229,7 +229,7 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 	}); err != nil {
 		t.Fatal(err)
 	}
-	d := New(Options{
+	options := Options{
 		ConfigPath: configPath, JWTPath: filepath.Join(tmp, "daemon.jwt"),
 		SkipWizard: true, SkipRegistration: true, ProviderRegistry: provider,
 		ExecutionPreflightStore: store, ExecutionPreflightRegistrar: registrar,
@@ -244,12 +244,175 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 				return env, nil
 			},
 		},
-	})
+	}
+	for _, apply := range configure {
+		apply(&options)
+	}
+	d := New(options)
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { _ = d.Stop(context.Background()) })
 	return d
+}
+
+func setDaemonWorkerIDForTest(d *Daemon, workerID string) {
+	d.mu.Lock()
+	d.workerID = workerID
+	d.mu.Unlock()
+}
+
+func runtimeBindingDetailForWorker(t *testing.T, organizationID, workerID string) (*SessionDetail, executioncell.RuntimeBinding) {
+	t.Helper()
+	detail, binding := v2Detail(t)
+	detail.OrganizationID = organizationID
+	detail.WorkerID = workerID
+	binding.WorkerID = workerID
+	detail.ExecutionRuntimeBinding = rawJSON(t, binding)
+	return detail, binding
+}
+
+func TestRuntimeBindingWorkerOwnerAdmitsCurrentHostedIdentity(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := runtimeBindingDetailForWorker(t, "organization-hosted", "worker-hosted")
+	provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+	var credentials atomic.Int32
+	var ownerCalls atomic.Int32
+	var gotOrganizationID, gotWorkerID string
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker, func(options *Options) {
+		options.ExecutionRuntimeWorkerOwner = func(organizationID, workerID string) bool {
+			ownerCalls.Add(1)
+			gotOrganizationID, gotWorkerID = organizationID, workerID
+			return organizationID == "organization-hosted" && workerID == "worker-hosted"
+		}
+	})
+	setDaemonWorkerIDForTest(d, "worker-primary")
+
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, OrganizationID: detail.OrganizationID, ProjectID: "project-v2"}, detail); err != nil {
+		t.Fatal(err)
+	}
+	if ownerCalls.Load() != 1 || gotOrganizationID != detail.OrganizationID || gotWorkerID != detail.WorkerID {
+		t.Fatalf("owner calls=%d pair=(%q,%q), want one exact (%q,%q)", ownerCalls.Load(), gotOrganizationID, gotWorkerID, detail.OrganizationID, detail.WorkerID)
+	}
+	mu.Lock()
+	gotOrder := slices.Clone(order)
+	mu.Unlock()
+	if strings.Join(gotOrder, ",") != "compile,fsync,register,credential" {
+		t.Fatalf("effect order = %v", gotOrder)
+	}
+	for deadline := time.Now().Add(time.Second); ; time.Sleep(10 * time.Millisecond) {
+		if _, err := os.Stat(marker); err == nil {
+			break
+		} else if time.Now().After(deadline) {
+			t.Fatalf("spawn marker was not written: %v", err)
+		}
+	}
+}
+
+func TestRuntimeBindingWorkerOwnerRefusesInvalidHostedIdentityBeforeEffects(t *testing.T) {
+	tests := []struct {
+		name           string
+		organizationID string
+		workerID       string
+		owner          func(string, string) bool
+		mutateBinding  func(*executioncell.RuntimeBinding)
+		wantOwnerCalls int32
+		wantError      string
+	}{
+		{name: "stale rotated worker", organizationID: "organization-hosted", workerID: "worker-stale", owner: func(organizationID, workerID string) bool {
+			return organizationID == "organization-hosted" && workerID == "worker-current"
+		}, wantOwnerCalls: 1, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "worker under wrong organization", organizationID: "organization-foreign", workerID: "worker-current", owner: func(organizationID, workerID string) bool {
+			return organizationID == "organization-hosted" && workerID == "worker-current"
+		}, wantOwnerCalls: 1, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "foreign worker", organizationID: "organization-hosted", workerID: "worker-foreign", owner: func(organizationID, workerID string) bool {
+			return organizationID == "organization-hosted" && workerID == "worker-current"
+		}, wantOwnerCalls: 1, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "empty organization", workerID: "worker-current", owner: func(string, string) bool { return true }, wantOwnerCalls: 0, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "authoritative refusal", organizationID: "organization-hosted", workerID: "worker-current", owner: func(string, string) bool { return false }, wantOwnerCalls: 1, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "authoritative refusal does not fall back to primary", organizationID: "organization-hosted", workerID: "worker-primary", owner: func(string, string) bool { return false }, wantOwnerCalls: 1, wantError: "execution runtime binding is not owned by the daemon's current worker registration"},
+		{name: "request mismatch precedes owner", organizationID: "organization-hosted", workerID: "worker-current", owner: func(string, string) bool { return true }, mutateBinding: func(binding *executioncell.RuntimeBinding) { binding.RequestID = "request-foreign" }, wantOwnerCalls: 0, wantError: "execution runtime binding is not owned by this request and worker"},
+		{name: "detail worker mismatch precedes owner", organizationID: "organization-hosted", workerID: "worker-current", owner: func(string, string) bool { return true }, mutateBinding: func(binding *executioncell.RuntimeBinding) { binding.WorkerID = "worker-foreign" }, wantOwnerCalls: 0, wantError: "execution runtime binding is not owned by this request and worker"},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			order := []string{}
+			detail, binding := runtimeBindingDetailForWorker(t, tc.organizationID, tc.workerID)
+			if tc.mutateBinding != nil {
+				tc.mutateBinding(&binding)
+				detail.ExecutionRuntimeBinding = rawJSON(t, binding)
+			}
+			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
+			store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+			registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+			var credentials, ownerCalls atomic.Int32
+			marker := filepath.Join(t.TempDir(), "spawned")
+			d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker, func(options *Options) {
+				options.ExecutionRuntimeWorkerOwner = func(organizationID, workerID string) bool {
+					ownerCalls.Add(1)
+					return tc.owner(organizationID, workerID)
+				}
+			})
+			setDaemonWorkerIDForTest(d, "worker-primary")
+
+			if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, OrganizationID: detail.OrganizationID, ProjectID: "project-v2"}, detail); err == nil || err.Error() != tc.wantError {
+				t.Fatalf("invalid hosted runtime-binding owner error = %v, want %q", err, tc.wantError)
+			}
+			if ownerCalls.Load() != tc.wantOwnerCalls {
+				t.Fatalf("owner calls = %d, want %d", ownerCalls.Load(), tc.wantOwnerCalls)
+			}
+			mu.Lock()
+			gotOrder := slices.Clone(order)
+			mu.Unlock()
+			if len(gotOrder) != 0 || provider.calls.Load() != 0 || registrar.calls.Load() != 0 || credentials.Load() != 0 {
+				t.Fatalf("effects after refusal: order=%v compiler=%d registrar=%d credential=%d", gotOrder, provider.calls.Load(), registrar.calls.Load(), credentials.Load())
+			}
+			if _, err := os.Stat(marker); !errors.Is(err, os.ErrNotExist) {
+				t.Fatalf("spawn marker exists after refusal: %v", err)
+			}
+		})
+	}
+}
+
+func TestRuntimeBindingWorkerOwnerNilPreservesPrimaryOnlyBehavior(t *testing.T) {
+	for _, tc := range []struct {
+		name        string
+		workerID    string
+		wantSuccess bool
+	}{
+		{name: "current primary", workerID: "worker-primary", wantSuccess: true},
+		{name: "foreign worker", workerID: "worker-foreign", wantSuccess: false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			var mu sync.Mutex
+			order := []string{}
+			detail, binding := runtimeBindingDetailForWorker(t, "organization-primary", tc.workerID)
+			provider := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigestFor(t, detail))}
+			store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+			registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+			var credentials atomic.Int32
+			marker := filepath.Join(t.TempDir(), "spawned")
+			d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+			setDaemonWorkerIDForTest(d, "worker-primary")
+
+			_, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, OrganizationID: detail.OrganizationID, ProjectID: "project-v2"}, detail)
+			if tc.wantSuccess && err != nil {
+				t.Fatal(err)
+			}
+			if !tc.wantSuccess && (err == nil || err.Error() != "execution runtime binding is not owned by the daemon's current worker registration") {
+				t.Fatalf("foreign worker error = %v", err)
+			}
+			if !tc.wantSuccess && (len(order) != 0 || provider.calls.Load() != 0 || registrar.calls.Load() != 0 || credentials.Load() != 0) {
+				t.Fatalf("effects after primary-only refusal: order=%v compiler=%d registrar=%d credential=%d", order, provider.calls.Load(), registrar.calls.Load(), credentials.Load())
+			}
+		})
+	}
 }
 
 func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSpawn(t *testing.T) {
