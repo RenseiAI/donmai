@@ -1646,6 +1646,7 @@ type sessionShimState struct {
 	recoveryCancel context.CancelFunc
 	// test-only barriers for exact controller-consumer/recovery ordering.
 	afterReleaseShimIfLive       func()
+	beforeQuarantineShim         func()
 	transportRecoveryAttemptHook func()
 	// adoptionComplete records that the §D4 pass ran to completion. Capacity and
 	// readiness read it: a daemon that has NOT finished adopting must not

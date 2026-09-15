@@ -552,3 +552,113 @@ func TestTransportReportAndFailedFrameShareConsumerRecovery(t *testing.T) {
 		})
 	}
 }
+
+func TestTransportRecoveryStopWhileWindowExhaustionSettles(t *testing.T) {
+	t.Parallel()
+	entered, resume, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	cancelled := make(chan struct{})
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:   SessionShimReadoptionPolicy{Mode: ReadoptionLineageLive, Backoff: time.Millisecond, BackoffCap: time.Millisecond, Window: 50 * time.Millisecond},
+		adoption: refusingCarrier(),
+		onWindowExhausted: func(ctx context.Context, _ sessionshim.Identity) {
+			close(entered)
+			<-ctx.Done()
+			close(cancelled)
+			<-resume
+		},
+	})
+	t.Cleanup(unblock)
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+	f.daemon.consumeShimEvents(f.controller)
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(controlRefFor(t, f.daemon, f.id), errors.New("transport close")); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, entered, "window exhaustion callback")
+	done, release := holdRecoveryDrain(t, f.daemon)
+	awaitRecoverySignal(t, cancelled, "exhaustion callback context cancellation")
+	unblock()
+	awaitRecoverySignal(t, consumed, "window exhaustion consumer completion")
+	if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+		t.Fatalf("Stop during final disposition quarantined lineage: %+v", q)
+	}
+	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+		t.Fatalf("Stop during final disposition removed lineage: %v", err)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportRecoveryStopBeforeQuarantineAdmission(t *testing.T) {
+	t.Parallel()
+	entered, resume, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	var once sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:   SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+		adoption: refusingCarrier(),
+	})
+	t.Cleanup(unblock)
+	f.daemon.shims.beforeQuarantineShim = func() { close(entered); <-resume }
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+	f.daemon.consumeShimEvents(f.controller)
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(controlRefFor(t, f.daemon, f.id), errors.New("transport close")); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, entered, "final quarantine admission")
+	done, release := holdRecoveryDrain(t, f.daemon)
+	unblock()
+	awaitRecoverySignal(t, consumed, "final quarantine consumer disposition")
+	if q := f.daemon.QuarantinedSessions(); len(q) != 0 {
+		t.Fatalf("Stop won quarantine admission but lineage was quarantined: %+v", q)
+	}
+	if _, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID); err != nil {
+		t.Fatalf("Stop won quarantine admission but removed lineage: %v", err)
+	}
+	if _, batches := f.snapshot(); len(batches) != 0 {
+		t.Fatalf("Stop won quarantine admission but published %d batches", len(batches))
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestTransportRecoveryQuarantineAdmittedBeforeStopMayPublish(t *testing.T) {
+	t.Parallel()
+	publishing, resume, consumed := make(chan struct{}), make(chan struct{}), make(chan struct{}, 1)
+	var once, enteredOnce sync.Once
+	unblock := func() { once.Do(func() { close(resume) }) }
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{
+		policy:   SessionShimReadoptionPolicy{Attempts: 1, Backoff: time.Millisecond},
+		adoption: refusingCarrier(),
+	})
+	t.Cleanup(unblock)
+	f.refuseBatches(func(SessionShimAdoptionBatch) error {
+		enteredOnce.Do(func() { close(publishing) })
+		<-resume
+		return nil
+	})
+	f.daemon.shims.afterReleaseShimIfLive = func() { consumed <- struct{}{} }
+	f.daemon.consumeShimEvents(f.controller)
+	if _, err := f.daemon.ReportAdoptedSessionShimCarrierTransportLostFor(controlRefFor(t, f.daemon, f.id), errors.New("transport close")); err != nil {
+		t.Fatal(err)
+	}
+	awaitRecoverySignal(t, publishing, "admitted quarantine publication")
+	if q := f.daemon.QuarantinedSessions(); len(q) != 1 {
+		t.Fatalf("quarantine did not win admission: %+v", q)
+	}
+	done, release := holdRecoveryDrain(t, f.daemon)
+	unblock()
+	awaitRecoverySignal(t, consumed, "admitted quarantine publication completion")
+	if _, batches := f.snapshot(); len(batches) != 1 || len(batches[0].Quarantined) != 1 {
+		t.Fatalf("admitted quarantine publication lost: %+v", batches)
+	}
+	release()
+	if err := <-done; err != nil {
+		t.Fatal(err)
+	}
+}

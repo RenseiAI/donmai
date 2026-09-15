@@ -3147,6 +3147,20 @@ func (d *Daemon) quarantineLostSessionShim(
 	reason sessionshim.QuarantineReason,
 	detail string,
 ) {
+	d.shims.mu.RLock()
+	hook := d.shims.beforeQuarantineShim
+	d.shims.mu.RUnlock()
+	if hook != nil {
+		hook()
+	}
+	// Quarantine and Stop share one admission boundary. An outcome computed
+	// before Stop is not permission to mutate after Stop has won; publication
+	// for a quarantine already admitted may finish outside both locks.
+	d.lifecycleMu.Lock()
+	if d.stopGen != nil || d.shims.recoveryCtx.Err() != nil {
+		d.lifecycleMu.Unlock()
+		return
+	}
 	now := d.shimNow()
 	d.shims.mu.Lock()
 	current, ok := d.shims.adopted[id]
@@ -3174,6 +3188,7 @@ func (d *Daemon) quarantineLostSessionShim(
 		d.upsertShimQuarantineLocked(q)
 	}
 	d.shims.mu.Unlock()
+	d.lifecycleMu.Unlock()
 	if ok {
 		d.publishQuarantineAfterConsumingTerminalProof(id.OrgID)
 	}

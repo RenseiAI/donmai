@@ -342,9 +342,12 @@ func (d *Daemon) sessionShimWindowExhausted(
 	slog.Warn("session shim: the re-adoption window ended with the shim still observable",
 		"session", id.String(), "deadline", deadline)
 	if cfg.OnReadoptionWindowExhausted != nil {
-		ctx, cancel := context.WithTimeout(context.Background(), cfg.callbackTimeout())
+		ctx, cancel := context.WithTimeout(d.shims.recoveryCtx, cfg.callbackTimeout())
 		cfg.OnReadoptionWindowExhausted(ctx, id)
 		cancel()
+	}
+	if d.shims.recoveryCtx.Err() != nil {
+		return readoptionShutdown
 	}
 	return readoptionWindowExhausted
 }
