@@ -6,10 +6,13 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"math"
 	"net/http"
 	"regexp"
 	"strings"
 	"time"
+
+	"github.com/google/uuid"
 )
 
 // uuidRE matches a canonical UUID (the shape Linear uses for entity
@@ -195,6 +198,27 @@ const (
   }
 }`
 
+	mutationCreateDocument = `mutation CreateDocument($input: DocumentCreateInput!) {
+  documentCreate(input: $input) {
+    success
+    lastSyncId
+    document {
+      id title url slugId content icon color sortOrder documentContentId
+      createdAt updatedAt archivedAt hiddenAt trashed
+      creator { id }
+      updatedBy { id }
+      owner { id }
+      issue { id identifier }
+      project { id }
+      team { id }
+      cycle { id }
+      initiative { id }
+      release { id }
+      lastAppliedTemplate { id }
+    }
+  }
+}`
+
 	mutationCreateRelation = `mutation CreateRelation($issueId: String!, $relatedIssueId: String!, $type: IssueRelationType!) {
   issueRelationCreate(input: { issueId: $issueId, relatedIssueId: $relatedIssueId, type: $type }) {
     success
@@ -318,6 +342,18 @@ func NewProxiedClient(platformBaseURL, rskToken string) (*Client, error) {
 
 // do executes a GraphQL request and decodes the response into out.
 func (c *Client) do(ctx context.Context, query string, vars map[string]any, out any) error {
+	return c.doRequest(ctx, query, vars, out, false)
+}
+
+// doMutationOnce sends a GraphQL mutation exactly once. Clearing GetBody keeps
+// the standard HTTP transport from treating this request as replayable after a
+// connection failure; callers must surface ambiguous outcomes for explicit
+// reconciliation rather than retrying a create blindly.
+func (c *Client) doMutationOnce(ctx context.Context, query string, vars map[string]any, out any) error {
+	return c.doRequest(ctx, query, vars, out, true)
+}
+
+func (c *Client) doRequest(ctx context.Context, query string, vars map[string]any, out any, writeOnce bool) error {
 	payload := graphqlRequest{Query: query, Variables: vars}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -327,6 +363,12 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.BaseURL, bytes.NewReader(data))
 	if err != nil {
 		return fmt.Errorf("linear: create request: %w", err)
+	}
+	if writeOnce {
+		// http.NewRequest records a replay body for bytes.Reader. A native
+		// document create has no proven idempotency contract, so do not expose a
+		// body that a transport can reuse after an ambiguous failure.
+		req.GetBody = nil
 	}
 	req.Header.Set("Content-Type", "application/json")
 	if c.ProxyMode {
@@ -339,7 +381,18 @@ func (c *Client) do(ctx context.Context, query string, vars map[string]any, out 
 		req.Header.Set("Authorization", c.APIKey)
 	}
 
-	resp, err := c.HTTPClient.Do(req)
+	httpClient := c.HTTPClient
+	if writeOnce {
+		// Never mutate an embedder's shared client. A shallow copy retains its
+		// timeout and transport while refusing every redirect response at the
+		// original POST, including 301/302/303 method-changing redirects.
+		clientCopy := *c.HTTPClient
+		clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error {
+			return http.ErrUseLastResponse
+		}
+		httpClient = &clientCopy
+	}
+	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("linear: request failed: %w", err)
 	}
@@ -462,6 +515,220 @@ func (c *Client) GetIssue(ctx context.Context, id string) (*Issue, error) {
 	}
 	iss := nodeToIssue(*data.Issue)
 	return &iss, nil
+}
+
+// CreateDocument creates a native Linear Document. It sends only fields that
+// the caller explicitly supplied, including explicit GraphQL nulls, and
+// rejects unsuccessful or malformed payloads rather than returning a partial
+// result.
+func (c *Client) CreateDocument(ctx context.Context, input CreateDocumentInput) (*DocumentCreateResult, error) {
+	if strings.TrimSpace(input.Title) == "" {
+		return nil, fmt.Errorf("document title is required")
+	}
+	if err := ValidateDocumentInput(input); err != nil {
+		return nil, err
+	}
+
+	var data createDocumentData
+	if err := c.doMutationOnce(ctx, mutationCreateDocument, map[string]any{"input": documentInputVariables(input)}, &data); err != nil {
+		return nil, err
+	}
+	if !data.DocumentCreate.Success {
+		return nil, fmt.Errorf("document creation was not successful")
+	}
+	if data.DocumentCreate.LastSyncID == nil {
+		return nil, fmt.Errorf("document creation returned no lastSyncId")
+	}
+	if data.DocumentCreate.Document == nil {
+		return nil, fmt.Errorf("document creation returned no document")
+	}
+	document, err := nodeToDocument(*data.DocumentCreate.Document)
+	if err != nil {
+		return nil, fmt.Errorf("document creation returned malformed document: %w", err)
+	}
+	result := &DocumentCreateResult{
+		Success:    true,
+		LastSyncID: *data.DocumentCreate.LastSyncID,
+		Document:   document,
+	}
+	if err := ValidateDocumentCreateResultForInput(input, result); err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// ValidateDocumentCreateResult rejects a false or incomplete native creation
+// result. Scoped embedders use this after their own operation so command output
+// never represents an unverified mutation as a created document.
+func ValidateDocumentCreateResult(result *DocumentCreateResult) error {
+	if result == nil {
+		return fmt.Errorf("document creation returned no result")
+	}
+	if !result.Success {
+		return fmt.Errorf("document creation was not successful")
+	}
+	document := result.Document
+	if document.ID == "" || document.Title == "" || document.URL == "" || document.SlugID == "" || document.CreatedAt.IsZero() || document.UpdatedAt.IsZero() {
+		return fmt.Errorf("document creation returned malformed document")
+	}
+	switch document.Parent.Type {
+	case "issue", "project", "team", "cycle", "initiative", "release":
+	default:
+		return fmt.Errorf("document creation returned malformed parent")
+	}
+	if document.Parent.ID == "" {
+		return fmt.Errorf("document creation returned malformed parent")
+	}
+	return nil
+}
+
+// ValidateDocumentCreateResultForInput verifies that Linear persisted the
+// requested client ID and parent. Issue parents may be supplied as a human
+// identifier, so their returned identifier is also accepted as the identity
+// match; all other parent inputs are native IDs.
+func ValidateDocumentCreateResultForInput(input CreateDocumentInput, result *DocumentCreateResult) error {
+	if err := ValidateDocumentCreateResult(result); err != nil {
+		return err
+	}
+	if input.ID.Set && input.ID.Value != nil && result.Document.ID != *input.ID.Value {
+		return fmt.Errorf("document id %q does not match requested %q", result.Document.ID, *input.ID.Value)
+	}
+	expectedType, expectedID := documentInputParent(input)
+	if result.Document.Parent.Type != expectedType {
+		return fmt.Errorf("document parent type %q does not match requested %q", result.Document.Parent.Type, expectedType)
+	}
+	if result.Document.Parent.ID == expectedID {
+		return nil
+	}
+	if expectedType == "issue" && result.Document.Parent.Identifier != nil && *result.Document.Parent.Identifier == expectedID {
+		return nil
+	}
+	return fmt.Errorf("document parent id %q does not match requested %q", result.Document.Parent.ID, expectedID)
+}
+
+func documentInputParent(input CreateDocumentInput) (string, string) {
+	for _, candidate := range []struct {
+		kind  string
+		value OptionalString
+	}{
+		{"issue", input.IssueID},
+		{"project", input.ProjectID},
+		{"team", input.TeamID},
+		{"cycle", input.CycleID},
+		{"initiative", input.InitiativeID},
+		{"release", input.ReleaseID},
+	} {
+		if candidate.value.Set && candidate.value.Value != nil && *candidate.value.Value != "" {
+			return candidate.kind, *candidate.value.Value
+		}
+	}
+	return "", ""
+}
+
+func documentInputVariables(input CreateDocumentInput) map[string]any {
+	variables := map[string]any{"title": input.Title}
+	putString := func(name string, value OptionalString) {
+		if value.Set {
+			variables[name] = value.Value
+		}
+	}
+	putString("content", input.Content)
+	putString("id", input.ID)
+	putString("icon", input.Icon)
+	putString("color", input.Color)
+	if input.SortOrder.Set {
+		variables["sortOrder"] = input.SortOrder.Value
+	}
+	putString("issueId", input.IssueID)
+	putString("projectId", input.ProjectID)
+	putString("teamId", input.TeamID)
+	putString("cycleId", input.CycleID)
+	putString("initiativeId", input.InitiativeID)
+	putString("releaseId", input.ReleaseID)
+	putString("resourceFolderId", input.ResourceFolderID)
+	putString("lastAppliedTemplateId", input.LastAppliedTemplateID)
+	putString("ownerId", input.OwnerID)
+	if input.SubscriberIDs.Set {
+		variables["subscriberIds"] = input.SubscriberIDs.Value
+	}
+	return variables
+}
+
+// ValidateDocumentInput verifies the native creation invariant before any
+// transport call. Embedders use the same check before invoking a scoped hook.
+func ValidateDocumentInput(input CreateDocumentInput) error {
+	parents := []OptionalString{input.IssueID, input.ProjectID, input.TeamID, input.CycleID, input.InitiativeID, input.ReleaseID}
+	count := 0
+	for _, parent := range parents {
+		if parent.Set && parent.Value != nil && strings.TrimSpace(*parent.Value) != "" {
+			count++
+		}
+	}
+	if count != 1 {
+		return fmt.Errorf("exactly one document parent is required")
+	}
+	if input.ID.Set && input.ID.Value != nil {
+		id, err := uuid.Parse(*input.ID.Value)
+		if err != nil || id.Version() != 4 {
+			return fmt.Errorf("document id must be a UUID v4")
+		}
+	}
+	if input.SortOrder.Set && input.SortOrder.Value != nil && (math.IsNaN(*input.SortOrder.Value) || math.IsInf(*input.SortOrder.Value, 0)) {
+		return fmt.Errorf("document sort order must be finite")
+	}
+	return nil
+}
+
+func nodeToDocument(node documentNode) (Document, error) {
+	if node.ID == "" || node.Title == "" || node.URL == "" || node.SlugID == "" || node.CreatedAt == nil || node.UpdatedAt == nil || node.SortOrder == nil {
+		return Document{}, fmt.Errorf("required document fields are missing")
+	}
+	parents := []struct {
+		kind       string
+		id         *string
+		identifier *string
+	}{
+		{"issue", node.Issue.ID, node.Issue.Identifier},
+		{"project", node.Project.ID, nil},
+		{"team", node.Team.ID, nil},
+		{"cycle", node.Cycle.ID, nil},
+		{"initiative", node.Initiative.ID, nil},
+		{"release", node.Release.ID, nil},
+	}
+	var parent DocumentParent
+	for _, candidate := range parents {
+		if candidate.id == nil || *candidate.id == "" {
+			continue
+		}
+		if parent.ID != "" {
+			return Document{}, fmt.Errorf("more than one parent was returned")
+		}
+		parent = DocumentParent{Type: candidate.kind, ID: *candidate.id, Identifier: candidate.identifier}
+	}
+	if parent.ID == "" {
+		return Document{}, fmt.Errorf("document parent is missing")
+	}
+	return Document{
+		ID:                    node.ID,
+		Title:                 node.Title,
+		URL:                   node.URL,
+		SlugID:                node.SlugID,
+		Content:               node.Content,
+		Icon:                  node.Icon,
+		Color:                 node.Color,
+		SortOrder:             *node.SortOrder,
+		DocumentContentID:     node.DocumentContentID,
+		CreatedAt:             *node.CreatedAt,
+		UpdatedAt:             *node.UpdatedAt,
+		ArchivedAt:            node.ArchivedAt,
+		HiddenAt:              node.HiddenAt,
+		Trashed:               node.Trashed,
+		Parent:                parent,
+		CreatorID:             node.Creator.ID,
+		UpdatedByID:           node.UpdatedBy.ID,
+		OwnerID:               node.Owner.ID,
+		LastAppliedTemplateID: node.LastAppliedTemplate.ID,
+	}, nil
 }
 
 // ListIssuesByProject returns issues belonging to the named project, optionally

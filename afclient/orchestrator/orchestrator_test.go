@@ -131,6 +131,10 @@ func (m *mockLinear) CreateRelation(_ context.Context, _, _, _ string) (string, 
 	return "", false, nil
 }
 
+func (m *mockLinear) CreateDocument(_ context.Context, _ linear.CreateDocumentInput) (*linear.DocumentCreateResult, error) {
+	return nil, nil
+}
+
 func (m *mockLinear) DeleteRelation(_ context.Context, _ string) error {
 	return nil
 }

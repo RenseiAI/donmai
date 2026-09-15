@@ -29,6 +29,7 @@ type Linear interface {
 	CreateIssueLabel(ctx context.Context, name, teamID string) (*Label, error)
 	AddIssueLabel(ctx context.Context, issueID, labelID string) (*Issue, error)
 	CreateComment(ctx context.Context, issueID, body string) (*Comment, error)
+	CreateDocument(ctx context.Context, input CreateDocumentInput) (*DocumentCreateResult, error)
 	CreateRelation(ctx context.Context, issueID, relatedIssueID, relationType string) (string, bool, error)
 	DeleteRelation(ctx context.Context, relationID string) error
 }

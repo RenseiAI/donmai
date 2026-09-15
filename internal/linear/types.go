@@ -2,6 +2,49 @@ package linear
 
 import "time"
 
+// OptionalString preserves Linear's three nullable-input states: omitted,
+// explicit null, and a string value. Use StringValue or NullString when
+// constructing a DocumentCreateInput.
+type OptionalString struct {
+	Set   bool
+	Value *string
+}
+
+// StringValue returns an explicitly supplied string value.
+func StringValue(value string) OptionalString { return OptionalString{Set: true, Value: &value} }
+
+// NullString returns an explicitly supplied GraphQL null.
+func NullString() OptionalString { return OptionalString{Set: true} }
+
+// OptionalFloat preserves omitted, explicit null, and finite numeric input.
+type OptionalFloat struct {
+	Set   bool
+	Value *float64
+}
+
+// FloatValue returns an explicitly supplied numeric value.
+func FloatValue(value float64) OptionalFloat { return OptionalFloat{Set: true, Value: &value} }
+
+// NullFloat returns an explicitly supplied GraphQL null.
+func NullFloat() OptionalFloat { return OptionalFloat{Set: true} }
+
+// OptionalStringSlice preserves omitted, explicit null, and explicit lists
+// (including an empty list) for GraphQL list fields.
+type OptionalStringSlice struct {
+	Set   bool
+	Value []string
+}
+
+// StringSliceValue returns an explicitly supplied string list.
+func StringSliceValue(value []string) OptionalStringSlice {
+	copyValue := make([]string, len(value))
+	copy(copyValue, value)
+	return OptionalStringSlice{Set: true, Value: copyValue}
+}
+
+// NullStringSlice returns an explicitly supplied GraphQL null.
+func NullStringSlice() OptionalStringSlice { return OptionalStringSlice{Set: true} }
+
 // IssueState is a type alias for a Linear issue state name (e.g. "In Progress").
 type IssueState = string
 
@@ -112,6 +155,68 @@ type UpdateIssueInput struct {
 	AssigneeID  string   `json:"assigneeId,omitempty"`
 	Priority    *int     `json:"priority,omitempty"` // 0=no priority,1=urgent,2=high,3=medium,4=low
 	Estimate    *int     `json:"estimate,omitempty"` // story points / t-shirt size value
+}
+
+// CreateDocumentInput is the current native Linear DocumentCreateInput. The
+// optional fields deliberately retain omitted/null/value semantics; callers
+// must set exactly one entity parent (IssueID, ProjectID, TeamID, CycleID,
+// InitiativeID, or ReleaseID).
+type CreateDocumentInput struct {
+	Title                 string              `json:"title"`
+	Content               OptionalString      `json:"content"`
+	ID                    OptionalString      `json:"id"`
+	Icon                  OptionalString      `json:"icon"`
+	Color                 OptionalString      `json:"color"`
+	SortOrder             OptionalFloat       `json:"sortOrder"`
+	IssueID               OptionalString      `json:"issueId"`
+	ProjectID             OptionalString      `json:"projectId"`
+	TeamID                OptionalString      `json:"teamId"`
+	CycleID               OptionalString      `json:"cycleId"`
+	InitiativeID          OptionalString      `json:"initiativeId"`
+	ReleaseID             OptionalString      `json:"releaseId"`
+	ResourceFolderID      OptionalString      `json:"resourceFolderId"`
+	LastAppliedTemplateID OptionalString      `json:"lastAppliedTemplateId"`
+	SubscriberIDs         OptionalStringSlice `json:"subscriberIds"`
+	OwnerID               OptionalString      `json:"ownerId"`
+}
+
+// DocumentParent is the one persisted native resource association.
+type DocumentParent struct {
+	Type       string  `json:"type"`
+	ID         string  `json:"id"`
+	Identifier *string `json:"identifier,omitempty"`
+}
+
+// Document is the normalized native Document result returned from creation.
+// It excludes server-internal collaboration state and collection fields.
+type Document struct {
+	ID                    string         `json:"id"`
+	Title                 string         `json:"title"`
+	URL                   string         `json:"url"`
+	SlugID                string         `json:"slugId"`
+	Content               *string        `json:"content"`
+	Icon                  *string        `json:"icon"`
+	Color                 *string        `json:"color"`
+	SortOrder             float64        `json:"sortOrder"`
+	DocumentContentID     *string        `json:"documentContentId"`
+	CreatedAt             time.Time      `json:"createdAt"`
+	UpdatedAt             time.Time      `json:"updatedAt"`
+	ArchivedAt            *time.Time     `json:"archivedAt"`
+	HiddenAt              *time.Time     `json:"hiddenAt"`
+	Trashed               *bool          `json:"trashed"`
+	Parent                DocumentParent `json:"parent"`
+	CreatorID             *string        `json:"creatorId"`
+	UpdatedByID           *string        `json:"updatedById"`
+	OwnerID               *string        `json:"ownerId"`
+	LastAppliedTemplateID *string        `json:"lastAppliedTemplateId"`
+}
+
+// DocumentCreateResult is Linear's successful DocumentPayload normalized for
+// callers. A false success or malformed payload is returned as an error.
+type DocumentCreateResult struct {
+	Success    bool     `json:"success"`
+	LastSyncID float64  `json:"lastSyncId"`
+	Document   Document `json:"document"`
 }
 
 // ─── internal GraphQL wire types ────────────────────────────────────────────
@@ -270,6 +375,46 @@ type createIssueData struct {
 		Success bool      `json:"success"`
 		Issue   issueNode `json:"issue"`
 	} `json:"issueCreate"`
+}
+
+type documentRelationNode struct {
+	ID         *string `json:"id"`
+	Identifier *string `json:"identifier"`
+}
+
+type documentNode struct {
+	ID                  string               `json:"id"`
+	Title               string               `json:"title"`
+	URL                 string               `json:"url"`
+	SlugID              string               `json:"slugId"`
+	Content             *string              `json:"content"`
+	Icon                *string              `json:"icon"`
+	Color               *string              `json:"color"`
+	SortOrder           *float64             `json:"sortOrder"`
+	DocumentContentID   *string              `json:"documentContentId"`
+	CreatedAt           *time.Time           `json:"createdAt"`
+	UpdatedAt           *time.Time           `json:"updatedAt"`
+	ArchivedAt          *time.Time           `json:"archivedAt"`
+	HiddenAt            *time.Time           `json:"hiddenAt"`
+	Trashed             *bool                `json:"trashed"`
+	Creator             documentRelationNode `json:"creator"`
+	UpdatedBy           documentRelationNode `json:"updatedBy"`
+	Owner               documentRelationNode `json:"owner"`
+	Issue               documentRelationNode `json:"issue"`
+	Project             documentRelationNode `json:"project"`
+	Team                documentRelationNode `json:"team"`
+	Cycle               documentRelationNode `json:"cycle"`
+	Initiative          documentRelationNode `json:"initiative"`
+	Release             documentRelationNode `json:"release"`
+	LastAppliedTemplate documentRelationNode `json:"lastAppliedTemplate"`
+}
+
+type createDocumentData struct {
+	DocumentCreate struct {
+		Success    bool          `json:"success"`
+		LastSyncID *float64      `json:"lastSyncId"`
+		Document   *documentNode `json:"document"`
+	} `json:"documentCreate"`
 }
 
 type updateIssueData struct {
