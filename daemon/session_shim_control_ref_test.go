@@ -100,3 +100,51 @@ func TestCarrierLossAndRebindForRefuseStaleOrReplacementAuthority(t *testing.T) 
 		t.Fatalf("stale callback unbound replacement: %+v", binding)
 	}
 }
+
+func TestReleaseSessionShimRebindClaimIsFencedToItsClaimedController(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Disabled: true}})
+	old, err := f.daemon.adoptedShimEntry(f.id.OrgID, f.id.SessionID)
+	if err != nil {
+		t.Fatalf("adoptedShimEntry: %v", err)
+	}
+	loseTheCarrierBinding(t, f)
+	if result, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID); err != nil || result != SessionShimRebound {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v, want rebound", result, err)
+	}
+
+	f.daemon.shims.mu.Lock()
+	replacement := f.daemon.shims.adopted[f.id]
+	if replacement.controller == old.controller {
+		f.daemon.shims.mu.Unlock()
+		t.Fatal("rebind did not install a replacement controller")
+	}
+	replacement.rebinding = true
+	f.daemon.shims.adopted[f.id] = replacement
+	f.daemon.shims.mu.Unlock()
+
+	f.daemon.releaseSessionShimRebindClaim(f.id, old.controller)
+	f.daemon.shims.mu.RLock()
+	stillClaimed := f.daemon.shims.adopted[f.id].rebinding
+	f.daemon.shims.mu.RUnlock()
+	if !stillClaimed {
+		t.Fatal("old completion cleared the replacement controller's active rebind claim")
+	}
+}
+
+func TestFailedRebindReleasesItsOwnControllerClaim(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithAdoption(t, SessionShimReadoptionPolicy{Disabled: true}, func(context.Context, int) error {
+		return context.DeadlineExceeded
+	})
+	loseTheCarrierBinding(t, f)
+	if _, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID); err == nil {
+		t.Fatal("rebind with refused adoption unexpectedly succeeded")
+	}
+	f.daemon.shims.mu.RLock()
+	stillClaimed := f.daemon.shims.adopted[f.id].rebinding
+	f.daemon.shims.mu.RUnlock()
+	if stillClaimed {
+		t.Fatal("failed rebind left its own controller claim set")
+	}
+}

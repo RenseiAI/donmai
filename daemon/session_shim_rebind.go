@@ -128,7 +128,7 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 			return SessionShimNotAdopted, fmt.Errorf("session shim: rebind %s: %w", id, ErrSessionShimNotAdopted)
 		}
 	}
-	defer d.releaseSessionShimRebindClaim(id)
+	defer d.releaseSessionShimRebindClaim(id, entry.controller)
 	return d.rebindAdoptedSessionShim(ctx, id, entry)
 }
 
@@ -149,7 +149,7 @@ func (d *Daemon) RebindAdoptedSessionShimFor(ctx context.Context, ref SessionShi
 			return SessionShimNotAdopted, fmt.Errorf("session shim: rebind %s: %w", ref.Identity, ErrSessionShimNotAdopted)
 		}
 	}
-	defer d.releaseSessionShimRebindClaim(ref.Identity)
+	defer d.releaseSessionShimRebindClaim(ref.Identity, entry.controller)
 	return d.rebindAdoptedSessionShim(ctx, ref.Identity, entry)
 }
 
@@ -223,15 +223,13 @@ func (d *Daemon) claimSessionShimRebind(id sessionshim.Identity, expected adopte
 	return true, SessionShimRebindUnknown
 }
 
-// releaseSessionShimRebindClaim clears the in-flight mark, whatever the
-// re-adoption did. It is deliberately tolerant of the entry having been
-// replaced meanwhile — the re-adoption itself swaps the entry — and clears the
-// mark on whatever is there now, because a mark left behind would refuse every
-// later repair of this lineage.
-func (d *Daemon) releaseSessionShimRebindClaim(id sessionshim.Identity) {
+// releaseSessionShimRebindClaim clears only the in-flight mark owned by the
+// controller that took it. A completed stale rebind must never clear a
+// replacement controller's claim.
+func (d *Daemon) releaseSessionShimRebindClaim(id sessionshim.Identity, claimed *sessionshim.Controller) {
 	d.shims.mu.Lock()
 	defer d.shims.mu.Unlock()
-	if current, ok := d.shims.adopted[id]; ok && current.rebinding {
+	if current, ok := d.shims.adopted[id]; ok && current.controller == claimed && current.rebinding {
 		current.rebinding = false
 		d.shims.adopted[id] = current
 	}
