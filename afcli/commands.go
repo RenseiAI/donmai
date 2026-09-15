@@ -140,6 +140,11 @@ type Config struct {
 	// registry-backed embedder preserve a human peer selector without teaching
 	// OSS Donmai any proprietary directory semantics.
 	A2ACardURL func(context.Context, string) (string, error)
+
+	// LinearDocumentCreator optionally routes native Linear document creation
+	// through an embedder-owned scoped operation. When set, the command never
+	// constructs or falls back to the raw direct/proxied Linear transport.
+	LinearDocumentCreator LinearDocumentCreator
 }
 
 // scopedClientFactory wraps cfg.ClientFactory so every produced Client
@@ -219,7 +224,7 @@ func RegisterCommands(root *cobra.Command, cfg Config) {
 	root.AddCommand(newEvalCmd(cfg))
 	root.AddCommand(newStubAgentCmd())
 	root.AddCommand(newArchCmd(cfg))
-	root.AddCommand(linearcmd.New(ds, binaryName(cfg)))
+	root.AddCommand(linearcmd.New(ds, binaryName(cfg), cfg.LinearDocumentCreator))
 	root.AddCommand(newGitHubCmd(ds, cfg))
 	root.AddCommand(newLogsCmd(cfg))
 	root.AddCommand(newAdminCmd())
