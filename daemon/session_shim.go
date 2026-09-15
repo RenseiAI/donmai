@@ -1691,6 +1691,12 @@ func newSessionShimState() *sessionShimState {
 	}
 }
 
+// stopRecovery ends this state's automatic recovery lifetime. Terminal
+// reconciliation retains its separate lifetime until final shim release.
+func (s *sessionShimState) stopRecovery() {
+	s.recoveryCancel()
+}
+
 // sessionShimKeepaliveState is one lineage's keepalive bookkeeping for the
 // current re-adoption window: how many extensions the shim honoured, how many
 // consecutive refusals have followed the last honoured one, and the deadline
@@ -5272,7 +5278,7 @@ func (d *Daemon) ReleaseAdoptedSessionShims() {
 		return
 	}
 	d.shims.mu.Lock()
-	d.shims.recoveryCancel()
+	d.shims.stopRecovery()
 	adopted := d.shims.adopted
 	d.shims.adopted = make(map[sessionshim.Identity]adoptedShim)
 	d.shims.adoptionComplete = false

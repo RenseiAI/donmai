@@ -1522,7 +1522,7 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	d.setState(StateDraining)
 	// Recovery attempts are daemon-owned work. Stop cancels them at drain start
 	// rather than leaving an admitted network prepare to outlive the daemon.
-	d.shims.recoveryCancel()
+	d.shims.stopRecovery()
 	poller := d.poller
 	spawner := d.spawner
 	heartbeat := d.heartbeat
