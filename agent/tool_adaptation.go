@@ -452,6 +452,11 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 	}
 
 	requirements := legacyToolRequirements(spec, profile)
+	namedMCPRequirements, namedMCPDetail := namedMCPServerRequirements(spec, profile, plan.CapabilityRealizations)
+	if namedMCPDetail != "" {
+		return deny(ToolDenialMalformedPlan, ToolChannelMCPServer, "named-mcp-server", "", namedMCPDetail)
+	}
+	requirements = append(requirements, namedMCPRequirements...)
 	if plan.RequireToolPlugins {
 		requirements = append(requirements, toolRequirement{id: "tool-plugins", channel: ToolChannelToolPlugin, required: true, delivery: profile.ToolPluginDelivery, digest: digestToolInput(true)})
 	}
@@ -475,6 +480,11 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 		// Cleanup carries no event or fidelity axis: the profile either declares
 		// a teardown boundary for its handles and resources or it does not.
 		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: profile.CleanupDelivery, digest: requirementInputDigest(plan.CleanupParametersDigest, true), pendingOutcome: ToolOutcomePendingCleanup})
+	}
+	if len(namedMCPRequirements) > 0 {
+		if detail := validateNamedMCPRequirementCollisions(requirements); detail != "" {
+			return deny(ToolDenialMalformedPlan, ToolChannelMCPServer, "named-mcp-server", "", detail)
+		}
 	}
 
 	for _, requirement := range requirements {
@@ -679,6 +689,105 @@ func legacyToolRequirements(spec Spec, profile ToolLifecycleProfile) []toolRequi
 	return out
 }
 
+// MCPServerCapabilityEntryPrefix identifies an opt-in, per-server MCP
+// capability receipt entry. Aggregate mcp-servers evidence remains the
+// compatibility surface for callers that do not request this prefix.
+const MCPServerCapabilityEntryPrefix = "mcp-server:"
+
+// MCPServerCapabilityEntryID returns the canonical receipt id for one exact
+// MCP server name. It deliberately does not trim or otherwise normalize name:
+// capability surface ids and configured server names must agree byte-for-byte.
+func MCPServerCapabilityEntryID(name string) (string, error) {
+	id := MCPServerCapabilityEntryPrefix + name
+	if name == "" || !realizationRef.MatchString(id) {
+		return "", fmt.Errorf("MCP server capability entry name is malformed")
+	}
+	return id, nil
+}
+
+// MCPServerCapabilityInputDigest returns the canonical lifecycle input digest
+// for one normalized MCP server config. Recipes use this helper rather than a
+// second digest domain so receipt matching is defined by the compiler.
+func MCPServerCapabilityInputDigest(server MCPServerConfig) string {
+	return digestToolInput(server)
+}
+
+// namedMCPServerRequirements derives supplemental receipt entries from
+// validated capability realizations. It never selects authority from callers:
+// the exact server name is anchored by the bound recipe and looked up in the
+// already-validated, normalized Spec.
+func namedMCPServerRequirements(spec Spec, profile ToolLifecycleProfile, bindings []CapabilityRealizationBinding) ([]toolRequirement, string) {
+	byID := map[string]toolRequirement{}
+	for _, binding := range bindings {
+		for _, entry := range binding.Entries {
+			if entry.Channel != ToolChannelMCPServer || !strings.HasPrefix(entry.EntryID, MCPServerCapabilityEntryPrefix) {
+				continue
+			}
+			name := strings.TrimPrefix(entry.EntryID, MCPServerCapabilityEntryPrefix)
+			canonicalID, err := MCPServerCapabilityEntryID(name)
+			if err != nil || canonicalID != entry.EntryID {
+				return nil, "named MCP capability entry id is malformed"
+			}
+			anchors := 0
+			for _, ref := range entry.SurfaceRefs {
+				if ref.Kind == CapabilitySurfaceMCPServer {
+					anchors++
+					if ref.ID != name {
+						return nil, "named MCP capability server anchor does not match its entry id"
+					}
+				}
+			}
+			if anchors != 1 {
+				return nil, "named MCP capability entry requires exactly one matching server anchor"
+			}
+			var selected MCPServerConfig
+			matches := 0
+			for _, server := range spec.MCPServers {
+				if server.Name == name {
+					selected = server
+					matches++
+				}
+			}
+			if matches != 1 {
+				return nil, "named MCP capability server must match exactly one configured server"
+			}
+			requirement := toolRequirement{id: entry.EntryID, channel: ToolChannelMCPServer, required: true, delivery: profile.MCPDelivery, digest: MCPServerCapabilityInputDigest(selected), fallbackDenied: true}
+			if existing, ok := byID[requirement.id]; ok {
+				if existing.channel != requirement.channel || existing.required != requirement.required || existing.delivery != requirement.delivery || existing.digest != requirement.digest {
+					return nil, "named MCP capability entries conflict"
+				}
+				continue
+			}
+			byID[requirement.id] = requirement
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]toolRequirement, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out, ""
+}
+
+// validateNamedMCPRequirementCollisions closes the opt-in named entry space
+// against every receipt id the compiler will emit. It is intentionally called
+// only for named recipes so legacy aggregate-only receipts retain their exact
+// historical behavior.
+func validateNamedMCPRequirementCollisions(requirements []toolRequirement) string {
+	seen := map[string]bool{}
+	for _, requirement := range requirements {
+		if seen[requirement.id] {
+			return "named MCP capability entry collides with another produced receipt entry"
+		}
+		seen[requirement.id] = true
+	}
+	return ""
+}
+
 // additionalExtensionsEntryID is the plan/receipt entry id under which a
 // populated Spec.AdditionalExtensions batch is projected onto the tool_plugin
 // channel. Shared between the compiler (legacyToolRequirements) and the
@@ -844,7 +953,7 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 	}
 	seenCapabilities := map[string]bool{}
 	for _, binding := range plan.CapabilityRealizations {
-		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] {
+		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] || validateCapabilityRealizationBinding(binding) != nil {
 			return "capability realizations require unique canonical bindings"
 		}
 		seenCapabilities[binding.CapabilityID] = true

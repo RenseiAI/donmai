@@ -92,6 +92,44 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 	}
 }
 
+// TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues
+// exercises the production compiler path. The named binding is for the
+// normalized runtime placeholder, so rotating URL and headers cannot change
+// it while static server identity remains authority-bound elsewhere.
+func TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	normalized := agent.MCPServerConfig{Name: "session-gateway", Type: "http", Command: "<runtime>", URL: "https://runtime.invalid"}
+	binding := namedMCPBinding(t, "example.named-runtime-mcp/v1", normalized.Name, normalized)
+	compile := func(url, token string) *agent.PreparedHarness {
+		spec := agent.Spec{
+			Autonomous: true,
+			MCPServers: []agent.MCPServerConfig{{
+				Name: normalized.Name, Type: "http", URL: url,
+				Headers: map[string]string{"Authorization": token},
+			}},
+			ToolLifecyclePlan: &agent.ToolLifecyclePlan{
+				ContractVersion:        agent.ToolLifecycleContractVersion,
+				CapabilityRealizations: []agent.CapabilityRealizationBinding{binding},
+			},
+		}
+		plan, err := agent.CompilePreparedHarness(spec, manifest, strings.Repeat("a", 64), []string{normalized.Name}, nil)
+		if err != nil {
+			t.Fatalf("CompilePreparedHarness: %v", err)
+		}
+		return plan
+	}
+	first := compile("https://session.example/first", "Bearer first")
+	second := compile("https://session.example/second", "Bearer second")
+	entryID, _ := agent.MCPServerCapabilityEntryID(normalized.Name)
+	if got, want := namedMCPEntry(t, second.ToolLifecycleReceipt, entryID).InputDigest, namedMCPEntry(t, first.ToolLifecycleReceipt, entryID).InputDigest; got != want {
+		t.Fatalf("runtime rotation changed named MCP digest: got %s want %s", got, want)
+	}
+	if first.AuthorityDigest != second.AuthorityDigest {
+		t.Fatalf("runtime rotation changed normalized prepared authority: first=%s second=%s", first.AuthorityDigest, second.AuthorityDigest)
+	}
+}
+
 // TestApplyPreparedHarnessNamesDriftingFields covers: on a
 // materialized-Spec-differs-from-authority mismatch, ApplyPreparedHarness
 // must return a *agent.AuthorityDriftError naming exactly which
