@@ -273,6 +273,10 @@ type PollWorkItem struct {
 	// PollResponse envelope after work decoding and is deliberately unexported so
 	// it cannot enter work JSON, OperationalPayload, SessionDetail, or the runner.
 	claimAttempt *workClaimAttemptProof `json:"-"`
+	// preSpawnPermanentDenialV1 is response-scoped NACK negotiation. It is bound
+	// beside claimAttempt from the same authenticated poll envelope and is never
+	// serialized into work, detail, operational payload, receipts, or logs.
+	preSpawnPermanentDenialV1 bool `json:"-"`
 }
 
 // UnmarshalJSON captures the operational projection at the authenticated poll
@@ -1020,9 +1024,10 @@ func receiptPreflightNackReasonForError(err error) *receiptPreflightNackReason {
 // claim; the original work item supplies the session identity and is forwarded
 // unchanged on the NACK wire.
 //
-// The compatibility reason remains prose. Only a canonical typed admission
-// denial gains the additive receipt-preflight projection; matching error text
-// alone never grants that authority.
+// Legacy compatibility reason behavior is unchanged. A negotiated durable
+// permanent-denial report uses one fixed value-free reason and additionally
+// requires the original item's claim proof; matching error text alone never
+// grants either typed authority.
 func NackRejectedWork(
 	ctx context.Context,
 	client *http.Client,
@@ -1033,6 +1038,14 @@ func NackRejectedWork(
 	if item == nil {
 		return errors.New("nack: original work item required")
 	}
+	permanentDenial := durablePermanentDenialReport(acceptErr)
+	if permanentDenial != nil && (!item.preSpawnPermanentDenialV1 || item.claimAttempt == nil) {
+		permanentDenial = nil
+	}
+	reason := fmt.Sprintf("accept work failed: %v", acceptErr)
+	if permanentDenial != nil {
+		reason = preSpawnPermanentDenialReason
+	}
 	return callNackEndpoint(
 		ctx,
 		client,
@@ -1040,8 +1053,9 @@ func NackRejectedWork(
 		item.SessionID,
 		workerID,
 		runtimeJWT,
-		fmt.Sprintf("accept work failed: %v", acceptErr),
+		reason,
 		receiptPreflightNackReasonForError(acceptErr),
+		permanentDenial,
 		item,
 	)
 }
@@ -1051,14 +1065,15 @@ func NackRejectedWork(
 // queuedAt). PollWorkItem already JSON-marshals to a superset of that
 // shape, so we can pass it through verbatim.
 //
-// NACK errors are best-effort: returning an error here lets the caller
-// log it, but the local rejection has already happened so a NACK
-// failure is not fatal.
+// Legacy NACK errors remain best-effort. A negotiated permanent-denial request
+// additionally requires the exact closed terminal acknowledgement; every other
+// response is an error and callers never retry it as a legacy requeue.
 func callNackEndpoint(
 	ctx context.Context,
 	client *http.Client,
 	orchestratorURL, sessionID, workerID, runtimeJWT, reason string,
 	receiptPreflightReason *receiptPreflightNackReason,
+	permanentDenial *preSpawnPermanentDenialReport,
 	work *PollWorkItem,
 ) error {
 	if sessionID == "" {
@@ -1070,21 +1085,29 @@ func callNackEndpoint(
 	if work == nil {
 		return errors.New("nack: original work item required")
 	}
+	if permanentDenial != nil && (work.claimAttempt == nil ||
+		work.claimAttempt.ContractVersion != workClaimAttemptContractVersion ||
+		work.claimAttempt.SessionID != sessionID || work.claimAttempt.SessionID != work.SessionID ||
+		!canonicalUUIDv4.MatchString(work.claimAttempt.AttemptToken)) {
+		return errors.New("permanent denial report requires valid original claim attempt proof")
+	}
 	if client == nil {
 		client = &http.Client{Timeout: 10 * time.Second}
 	}
 	body := struct {
-		WorkerID               string                      `json:"workerId"`
-		Reason                 string                      `json:"reason,omitempty"`
-		ReceiptPreflightReason *receiptPreflightNackReason `json:"receiptPreflightReason,omitempty"`
-		ClaimAttempt           *workClaimAttemptProof      `json:"claimAttempt,omitempty"`
-		Work                   *PollWorkItem               `json:"work"`
+		WorkerID                string                         `json:"workerId"`
+		Reason                  string                         `json:"reason,omitempty"`
+		ReceiptPreflightReason  *receiptPreflightNackReason    `json:"receiptPreflightReason,omitempty"`
+		ClaimAttempt            *workClaimAttemptProof         `json:"claimAttempt,omitempty"`
+		PreSpawnPermanentDenial *preSpawnPermanentDenialReport `json:"preSpawnPermanentDenial,omitempty"`
+		Work                    *PollWorkItem                  `json:"work"`
 	}{
-		WorkerID:               workerID,
-		Reason:                 reason,
-		ReceiptPreflightReason: receiptPreflightReason,
-		ClaimAttempt:           work.claimAttempt,
-		Work:                   work,
+		WorkerID:                workerID,
+		Reason:                  reason,
+		ReceiptPreflightReason:  receiptPreflightReason,
+		ClaimAttempt:            work.claimAttempt,
+		PreSpawnPermanentDenial: permanentDenial,
+		Work:                    work,
 	}
 	buf, err := json.Marshal(body)
 	if err != nil {
@@ -1103,9 +1126,36 @@ func callNackEndpoint(
 		return fmt.Errorf("nack: %w", err)
 	}
 	defer func() { _ = res.Body.Close() }()
-	if res.StatusCode >= 400 {
+	if permanentDenial == nil && res.StatusCode >= 400 {
 		errBuf, _ := io.ReadAll(io.LimitReader(res.Body, 1024))
 		return fmt.Errorf("nack rejected: HTTP %d: %s", res.StatusCode, strings.TrimSpace(string(errBuf)))
+	}
+	if permanentDenial == nil {
+		return nil
+	}
+	if res.StatusCode != http.StatusOK {
+		_, _ = io.Copy(io.Discard, io.LimitReader(res.Body, 1024))
+		return fmt.Errorf("permanent denial report response: HTTP %d", res.StatusCode)
+	}
+	responseRaw, err := io.ReadAll(io.LimitReader(res.Body, 4097))
+	if err != nil || len(responseRaw) == 0 || len(responseRaw) > 4096 {
+		return errors.New("permanent denial report response is invalid")
+	}
+	var acknowledgement struct {
+		ContractVersion   string `json:"contractVersion"`
+		Outcome           string `json:"outcome"`
+		SessionID         string `json:"sessionId"`
+		AttemptToken      string `json:"attemptToken"`
+		HostReceiptSHA256 string `json:"hostReceiptSha256"`
+	}
+	if err := decodeClosedPermanentDenialJSON(responseRaw, &acknowledgement); err != nil {
+		return errors.New("permanent denial report response is invalid")
+	}
+	if acknowledgement.ContractVersion != preSpawnPermanentDenialContractVersion ||
+		acknowledgement.Outcome != "terminal" || acknowledgement.SessionID != sessionID ||
+		acknowledgement.AttemptToken != work.claimAttempt.AttemptToken ||
+		acknowledgement.HostReceiptSHA256 != permanentDenial.HostReceiptSHA256 {
+		return errors.New("permanent denial report acknowledgement does not match request")
 	}
 	return nil
 }

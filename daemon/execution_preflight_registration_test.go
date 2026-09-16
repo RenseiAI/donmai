@@ -11,6 +11,7 @@ import (
 	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"reflect"
 	"slices"
 	"strings"
 	"sync"
@@ -26,6 +27,7 @@ type orderedPreflightProvider struct {
 	mu              *sync.Mutex
 	order           *[]string
 	receipt         json.RawMessage
+	preflightErr    error
 	calls           atomic.Int32
 	failReplay      bool
 	validationCalls atomic.Int32
@@ -69,7 +71,7 @@ func (p *orderedPreflightProvider) PreflightExecution(json.RawMessage) (json.Raw
 	if p.failReplay && call > 1 {
 		return nil, errors.New("compiler changed after retained receipt")
 	}
-	return slices.Clone(p.receipt), nil
+	return slices.Clone(p.receipt), p.preflightErr
 }
 
 func (p *orderedPreflightProvider) ValidateRetainedExecution(json.RawMessage, json.RawMessage) error {
@@ -188,6 +190,51 @@ func readyPreflightReceipt(t *testing.T, binding executioncell.RuntimeBinding, o
 		PromptReceipt:        rawJSON(t, promptReceipt),
 		ToolLifecycleReceipt: rawJSON(t, toolReceipt),
 	})
+}
+
+func deniedPreflightReceipt(
+	t *testing.T,
+	binding executioncell.RuntimeBinding,
+	operationalDigest string,
+) (json.RawMessage, *agent.ToolAdaptationError) {
+	t.Helper()
+	promptReceipt := agent.PromptDeliveryReceipt{
+		ContractVersion: agent.PromptContractVersion,
+		ProfileID:       "test-prompt", Decision: "ready", Entries: []agent.PromptDeliveryEntry{},
+	}
+	toolReceipt := agent.ToolLifecycleReceipt{
+		ContractVersion:    agent.ToolLifecycleContractVersion,
+		AdmissionReceiptID: "admission-v2", OperationalPayloadDigest: operationalDigest,
+		ProfileID: "test-tools", Decision: "denied",
+		EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true,
+		Entries: []agent.ToolLifecycleEntry{{
+			ID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true,
+			Outcome: agent.ToolOutcomeDenied, InputDigest: strings.Repeat("d", 64),
+			DenialCode: agent.ToolDenialDeliveryUnsupported,
+		}},
+	}
+	prepared := agent.PreparedHarness{
+		ContractVersion: agent.HarnessAdaptationContractVersion,
+		Harness:         "codex", Mode: agent.PromptModeAutonomous,
+		OperationalPayloadDigest: operationalDigest,
+		AuthorityDigest:          strings.Repeat("f", 64), RuntimeMCPNames: []string{},
+		Materializations: []agent.HarnessMaterialization{},
+		PromptReceipt:    promptReceipt, ToolLifecycleReceipt: toolReceipt,
+	}
+	plan := rawJSON(t, prepared)
+	digest := sha256.Sum256(plan)
+	receipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       binding.RequestID, WorkerID: binding.WorkerID,
+		PlacementID: binding.PlacementID, ClaimID: binding.ClaimID,
+		Decision: "denied", Plan: plan, PlanDigest: hex.EncodeToString(digest[:]),
+		PromptReceipt: rawJSON(t, promptReceipt), ToolLifecycleReceipt: rawJSON(t, toolReceipt),
+		Denial: "V2_PROFILE_SECRET_DO_NOT_LEAK",
+	})
+	return receipt, &agent.ToolAdaptationError{
+		Code: agent.ToolDenialDeliveryUnsupported, Channel: agent.ToolChannelMCPServer,
+		Detail: "V2_PROFILE_SECRET_DO_NOT_LEAK",
+	}
 }
 
 func operationalDigestFor(t *testing.T, detail *SessionDetail) string {
@@ -672,6 +719,110 @@ func TestRuntimeBindingV2RefusalStopsCredentialAndSpawn(t *testing.T) {
 				t.Fatalf("spawn marker exists: %v", err)
 			}
 		})
+	}
+}
+
+func TestRuntimeBindingV2PermanentDenialSurvivesRegistrationFailures(t *testing.T) {
+	cases := map[string]func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error){
+		"transport error": func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("ack lost")
+		},
+		"explicit refusal": func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+			return executioncell.PreflightRegistrationResponse{
+				ContractVersion: executioncell.PreflightRegistrationContractVersion,
+				Decision:        "refused", Code: executioncell.PreflightReceiptDenied,
+			}, nil
+		},
+		"forged acknowledgement": func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+			response, _ := authorizedRegistration(request)
+			response.ReceiptSHA256 = strings.Repeat("0", 64)
+			return response, nil
+		},
+	}
+	for name, response := range cases {
+		t.Run(name, func(t *testing.T) {
+			var mu sync.Mutex
+			order := []string{}
+			detail, binding := v2Detail(t)
+			receipt, typed := deniedPreflightReceipt(t, binding, operationalDigestFor(t, detail))
+			provider := &orderedPreflightProvider{
+				mu: &mu, order: &order, receipt: receipt, preflightErr: typed,
+			}
+			store := &orderedReplayStore{
+				mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir()),
+			}
+			registrar := &orderedRegistrar{mu: &mu, order: &order, response: response}
+			var credentials atomic.Int32
+			marker := filepath.Join(t.TempDir(), "spawned")
+			d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+			_, err := d.AcceptWorkWithDetail(
+				SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail,
+			)
+			if err == nil {
+				t.Fatal("denied preflight registration was accepted")
+			}
+			var got *agent.ToolAdaptationError
+			if !errors.As(err, &got) || got != typed {
+				t.Fatalf("registration failure lost typed cause: %v", err)
+			}
+			report := durablePermanentDenialReport(err)
+			if report == nil || report.HostReceiptSHA256 == "" || report.Code != agent.ToolDenialDeliveryUnsupported {
+				t.Fatalf("registration failure report = %+v error=%v", report, err)
+			}
+			if strings.Contains(err.Error(), "V2_PROFILE_SECRET_DO_NOT_LEAK") {
+				t.Fatalf("registration failure rendered typed detail: %v", err)
+			}
+			if registrar.calls.Load() != 1 || credentials.Load() != 0 {
+				t.Fatalf("register=%d credential=%d", registrar.calls.Load(), credentials.Load())
+			}
+			if _, statErr := os.Stat(marker); !errors.Is(statErr, os.ErrNotExist) {
+				t.Fatalf("spawn marker exists: %v", statErr)
+			}
+		})
+	}
+}
+
+func TestRuntimeBindingV2PermanentDenialExactRetainedReplayDoesNotRecompile(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	receipt, typed := deniedPreflightReceipt(t, binding, operationalDigestFor(t, detail))
+	provider := &orderedPreflightProvider{
+		mu: &mu, order: &order, receipt: receipt, preflightErr: typed, failReplay: true,
+	}
+	store := &orderedReplayStore{
+		mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir()),
+	}
+	registrar := &orderedRegistrar{
+		mu: &mu, order: &order,
+		response: func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("ack unavailable")
+		},
+	}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+
+	_, firstErr := d.AcceptWorkWithDetail(
+		SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail,
+	)
+	firstReport := durablePermanentDenialReport(firstErr)
+	if firstReport == nil {
+		t.Fatalf("first denial report missing: %v", firstErr)
+	}
+	retry, _ := v2Detail(t)
+	_, replayErr := d.AcceptWorkWithDetail(
+		SessionSpec{SessionID: retry.SessionID, ProjectID: "project-v2"}, retry,
+	)
+	replayReport := durablePermanentDenialReport(replayErr)
+	if replayReport == nil || !reflect.DeepEqual(replayReport, firstReport) {
+		t.Fatalf("replay report = %+v, want %+v; error=%v", replayReport, firstReport, replayErr)
+	}
+	if provider.calls.Load() != 1 || provider.validationCalls.Load() != 0 {
+		t.Fatalf("compile=%d ready-validator=%d, want exact denied replay without either", provider.calls.Load(), provider.validationCalls.Load())
+	}
+	if registrar.calls.Load() != 2 || credentials.Load() != 0 {
+		t.Fatalf("register=%d credential=%d", registrar.calls.Load(), credentials.Load())
 	}
 }
 

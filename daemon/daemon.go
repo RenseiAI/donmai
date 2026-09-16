@@ -2111,15 +2111,6 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 					return nil, fmt.Errorf("recover execution adaptation receipt: %w", loadErr)
 				}
 			}
-			if replayedReceipt {
-				validator, ok := d.opts.ProviderRegistry.(ExecutionPreflightReplayValidator)
-				if !ok {
-					return nil, errors.New("runtime binding v2 retained receipt requires canonical replay validation")
-				}
-				if validationErr := validator.ValidateRetainedExecution(detailJSON, receipt); validationErr != nil {
-					return nil, fmt.Errorf("validate retained execution adaptation: %w", validationErr)
-				}
-			}
 			if !replayedReceipt {
 				compiler, ok := d.opts.ProviderRegistry.(ExecutionPreflightProvider)
 				if !ok {
@@ -2140,6 +2131,21 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			if hostReceipt.RequestID != binding.RequestID || hostReceipt.WorkerID != binding.WorkerID ||
 				hostReceipt.PlacementID != binding.PlacementID || hostReceipt.ClaimID != binding.ClaimID {
 				return nil, errors.New("execution adaptation receipt does not match daemon runtime binding")
+			}
+			if replayedReceipt && hostReceipt.Decision == "denied" {
+				preflightErr = retainedPermanentDenial(detail, binding, receipt, operationalDigest)
+			} else if replayedReceipt {
+				validator, ok := d.opts.ProviderRegistry.(ExecutionPreflightReplayValidator)
+				if !ok {
+					return nil, errors.New("runtime binding v2 retained receipt requires canonical replay validation")
+				}
+				if validationErr := validator.ValidateRetainedExecution(detailJSON, receipt); validationErr != nil {
+					return nil, fmt.Errorf("validate retained execution adaptation: %w", validationErr)
+				}
+			} else if preflightErr != nil {
+				if candidate := freshPermanentDenialCandidate(detail, binding, receipt, operationalDigest, preflightErr); candidate != nil {
+					preflightErr = candidate
+				}
 			}
 			if (preflightErr == nil && hostReceipt.Decision != "ready") || (preflightErr != nil && hostReceipt.Decision != "denied") {
 				return nil, errors.New("execution adaptation result and receipt decision disagree")
@@ -2233,10 +2239,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if persistErr != nil {
 					persistFailure := fmt.Errorf("persist execution adaptation receipt: %w", persistErr)
 					if preflightErr != nil {
-						// A denied preflight receipt is still authoritative when its
-						// durable audit write fails. Keep both independently observable:
-						// callers project typed denials into the NACK contract, while
-						// operators must also see the persistence failure.
+						// Keep the typed cause observable without granting terminal-report
+						// authority: only an exact persisted or reaffirmed receipt can make
+						// the permanent-denial projection durable.
 						return nil, errors.Join(
 							persistFailure,
 							fmt.Errorf("execution adaptation preflight: %w", preflightErr),
@@ -2244,11 +2249,18 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 					}
 					return nil, persistFailure
 				}
+				if denial := permanentDenialWrapper(preflightErr); denial != nil {
+					denial.markDurable()
+				}
 			}
 			if binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
 				registrationRequest, requestErr := executioncell.NewPreflightRegistrationRequest(binding, persistedReceipt, operationalDigest)
 				if requestErr != nil {
-					return nil, fmt.Errorf("build execution preflight registration: %w", requestErr)
+					registrationFailure := fmt.Errorf("build execution preflight registration: %w", requestErr)
+					if permanentDenialWrapper(preflightErr) != nil {
+						return nil, errors.Join(registrationFailure, preflightErr)
+					}
+					return nil, registrationFailure
 				}
 				registrationContext := d.landingCtx
 				if registrationContext == nil {
@@ -2256,10 +2268,18 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				}
 				registrationResponse, registrationErr := d.opts.ExecutionPreflightRegistrar.RegisterExecutionPreflight(registrationContext, registrationRequest)
 				if registrationErr != nil {
-					return nil, fmt.Errorf("register execution preflight: %w", registrationErr)
+					registrationFailure := fmt.Errorf("register execution preflight: %w", registrationErr)
+					if permanentDenialWrapper(preflightErr) != nil {
+						return nil, errors.Join(registrationFailure, preflightErr)
+					}
+					return nil, registrationFailure
 				}
 				if registrationErr = executioncell.ValidateAuthorizedPreflightRegistration(registrationRequest, registrationResponse); registrationErr != nil {
-					return nil, fmt.Errorf("execution preflight acknowledgement: %w", registrationErr)
+					registrationFailure := fmt.Errorf("execution preflight acknowledgement: %w", registrationErr)
+					if permanentDenialWrapper(preflightErr) != nil {
+						return nil, errors.Join(registrationFailure, preflightErr)
+					}
+					return nil, registrationFailure
 				}
 				localPreflightRequest = &registrationRequest
 				localPreflightResponse = &registrationResponse

@@ -1194,6 +1194,7 @@ func TestCallNackEndpoint_PostsExpectedShape(t *testing.T) {
 		"jwt-token",
 		"accept work failed: allowlist mismatch",
 		nil,
+		nil,
 		item,
 	)
 	if err != nil {
@@ -1249,6 +1250,7 @@ func TestCallNackEndpoint_PropagatesServerError(t *testing.T) {
 		"jwt",
 		"reason",
 		nil,
+		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "i", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err == nil {
@@ -1277,7 +1279,7 @@ func TestCallNackEndpoint_RejectsMissingArgs(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			err := callNackEndpoint(
-				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, tc.work,
+				context.Background(), nil, "http://x", tc.sessionID, tc.workerID, "j", "r", nil, nil, tc.work,
 			)
 			if err == nil {
 				t.Fatalf("expected error")
@@ -1461,6 +1463,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonWire(t *testing.T) {
 			err := callNackEndpoint(
 				context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 				"accept work failed: "+tc.err.Error(), receiptPreflightNackReasonForError(tc.err),
+				nil,
 				&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 			)
 			if err != nil {
@@ -1495,6 +1498,7 @@ func TestCallNackEndpoint_ReceiptPreflightReasonLegacyWireCompatibility(t *testi
 	err := callNackEndpoint(
 		context.Background(), nil, srv.URL, "s1", "wkr-1", "jwt-token",
 		"accept work failed: fallback_not_allowed", receiptPreflightNackReasonForError(errors.New("accept work failed: fallback_not_allowed")),
+		nil,
 		&PollWorkItem{SessionID: "s1", IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1},
 	)
 	if err != nil {

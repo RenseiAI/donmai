@@ -6,6 +6,7 @@ import (
 	"io"
 	"regexp"
 	"strings"
+	"unicode/utf8"
 )
 
 const (
@@ -39,7 +40,83 @@ func (response *PollResponse) UnmarshalJSON(raw []byte) error {
 	}
 	*response = PollResponse(decoded)
 	response.bindClaimAttemptProofs(raw)
+	response.bindNackContracts(raw)
 	return nil
+}
+
+func (response *PollResponse) bindNackContracts(raw []byte) {
+	contractsRaw, present, ok := rawPollEnvelopeMember(raw, "nackContracts")
+	if !present || !ok {
+		return
+	}
+	if !utf8.Valid(contractsRaw) {
+		return
+	}
+	var contracts []string
+	if err := json.Unmarshal(contractsRaw, &contracts); err != nil || contracts == nil || len(contracts) > 8 {
+		return
+	}
+	known := 0
+	for _, contract := range contracts {
+		if contract == "" || len(contract) > 128 || !utf8.ValidString(contract) {
+			return
+		}
+		if contract == preSpawnPermanentDenialContractVersion {
+			known++
+		}
+	}
+	if known != 1 {
+		return
+	}
+	for index := range response.Work {
+		response.Work[index].preSpawnPermanentDenialV1 = true
+	}
+}
+
+// rawPollEnvelopeMember returns one exact top-level member without making the
+// otherwise permissive PollResponse decoder reject unrelated future members.
+// Duplicate exact members make only this optional negotiation unavailable.
+func rawPollEnvelopeMember(raw []byte, want string) (json.RawMessage, bool, bool) {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	opening, err := decoder.Token()
+	if err != nil {
+		return nil, false, false
+	}
+	if delim, ok := opening.(json.Delim); !ok || delim != '{' {
+		return nil, false, false
+	}
+	var found json.RawMessage
+	present := false
+	for decoder.More() {
+		keyToken, err := decoder.Token()
+		if err != nil {
+			return nil, false, false
+		}
+		key, ok := keyToken.(string)
+		if !ok {
+			return nil, false, false
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, false, false
+		}
+		if key != want {
+			continue
+		}
+		if present {
+			return nil, true, false
+		}
+		present = true
+		found = append(json.RawMessage(nil), value...)
+	}
+	if _, err := decoder.Token(); err != nil {
+		return nil, false, false
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
+		return nil, false, false
+	}
+	return found, present, true
 }
 
 func (response *PollResponse) bindClaimAttemptProofs(raw []byte) {
