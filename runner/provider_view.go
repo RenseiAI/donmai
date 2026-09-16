@@ -86,14 +86,19 @@ func validateProtectedRuntimeMCPSelector(selector ProtectedRuntimeMCPSelector, r
 	return nil
 }
 
-func protectedRuntimeMCPApplies(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) (bool, error) {
+func protectedRuntimeMCPTargetsSession(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) bool {
 	if !selector.configured() {
-		return false, nil
+		return false
 	}
 	mode := sessionPromptMode(qw, selection.effectiveCell)
-	if agent.HarnessName(selection.Harness.ID) != selector.HarnessID || mode != selector.Mode {
+	return agent.HarnessName(selection.Harness.ID) == selector.HarnessID && mode == selector.Mode
+}
+
+func protectedRuntimeMCPApplies(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) (bool, error) {
+	if !protectedRuntimeMCPTargetsSession(qw, selection, selector) {
 		return false, nil
 	}
+	mode := selector.Mode
 	harness, ok := selection.Provider.(agent.HarnessProvider)
 	if !ok {
 		return false, fmt.Errorf("runner: protected runtime MCP target has no exact harness manifest")
@@ -131,14 +136,10 @@ func resolveProtectedRuntimeMCPRequirement(
 	if err := validateProtectedRuntimeMCPSelector(selector, realizations); err != nil {
 		return nil, err
 	}
-	count := 0
-	applies, err := protectedRuntimeMCPApplies(qw, selection, selector)
-	if err != nil {
-		return nil, err
-	}
-	if !applies {
+	if !protectedRuntimeMCPTargetsSession(qw, selection, selector) {
 		return nil, nil
 	}
+	count := 0
 	for _, capability := range selection.effectiveCell.GrantedCapabilities {
 		if capability.Name == selector.CapabilityID {
 			count++
@@ -149,6 +150,13 @@ func resolveProtectedRuntimeMCPRequirement(
 	}
 	if count != 1 {
 		return nil, fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector.CapabilityID)
+	}
+	applies, err := protectedRuntimeMCPApplies(qw, selection, selector)
+	if err != nil {
+		return nil, err
+	}
+	if !applies {
+		return nil, nil
 	}
 	harness, ok := selection.Provider.(agent.HarnessProvider)
 	if !ok {

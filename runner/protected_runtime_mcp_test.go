@@ -174,6 +174,42 @@ func newProtectedRuntimeMCPMixedFixture(t *testing.T) protectedRuntimeMCPMixedFi
 	}
 }
 
+func newProtectedRuntimeMCPProfileDriftFixture(t *testing.T) (protectedRuntimeMCPMixedFixture, *ProviderView) {
+	t.Helper()
+	fixture := newProtectedRuntimeMCPMixedFixture(t)
+	driftManifest := codexManifestForTest()
+	for i := range driftManifest.ToolLifecycle {
+		if driftManifest.ToolLifecycle[i].Mode == agent.PromptModeHumanControlled {
+			driftManifest.ToolLifecycle[i].ID = "codex/interactive/tool-lifecycle-drift"
+		}
+	}
+	driftBase := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
+	driftProvider := &manifestSelectorProvider{selectorFakeProvider: driftBase, manifest: driftManifest, capabilities: codexCapabilitiesForTest()}
+	registry := NewRegistry()
+	for _, provider := range []agent.Provider{fixture.piProvider, driftProvider} {
+		if err := registry.Register(provider); err != nil {
+			t.Fatal(err)
+		}
+	}
+	seed := QueuedWork{PlatformURL: "https://platform.example", McpAuthToken: "session-bearer"}
+	seed.SessionID = "profile-drift-seed"
+	driftRow := protectedRuntimeMCPCompiled(t, fixture.selector.CapabilityID, driftProvider, seed, agent.PromptModeHumanControlled)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{
+		fixture.piRow, fixture.codexHumanRow, fixture.codexAutonomousRow, driftRow,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	fixture.registry = registry
+	fixture.realizations = realizations
+	fixture.codexProvider = driftProvider
+	view, err := NewProviderViewWithProtectedRuntimeMCP(registry, fixture.decorate, realizations, nil, fixture.selector)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return fixture, view
+}
+
 func protectedRuntimeMCPMixedPiWork(t *testing.T, capability string) QueuedWork {
 	t.Helper()
 	const model = "gpt-pi-mixed-selector"
@@ -209,7 +245,11 @@ func protectedRuntimeMCPMixedCodexWork(t *testing.T, capability string, mode exe
 		qw.Mode = interactiveRunMode
 		qw.InitialPrompt = "codex interactive fixture"
 	}
-	return attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", mode, []executioncell.CapabilityRequirement{{Name: capability}}))
+	var capabilities []executioncell.CapabilityRequirement
+	if capability != "" {
+		capabilities = []executioncell.CapabilityRequirement{{Name: capability}}
+	}
+	return attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", mode, capabilities))
 }
 
 func protectedRuntimeMCPPreflightInput(t *testing.T, qw QueuedWork) (QueuedWork, json.RawMessage) {
@@ -438,34 +478,7 @@ func TestProtectedRuntimeMCPExactSelectorPreservesPiAndEnforcesCodexChild(t *tes
 
 func TestProtectedRuntimeMCPExactSelectorRefusesProfileDriftAndUnselectedV3(t *testing.T) {
 	t.Run("target adapter profile drift", func(t *testing.T) {
-		fixture := newProtectedRuntimeMCPMixedFixture(t)
-		driftManifest := codexManifestForTest()
-		for i := range driftManifest.ToolLifecycle {
-			if driftManifest.ToolLifecycle[i].Mode == agent.PromptModeHumanControlled {
-				driftManifest.ToolLifecycle[i].ID = "codex/interactive/tool-lifecycle-drift"
-			}
-		}
-		driftBase := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
-		driftProvider := &manifestSelectorProvider{selectorFakeProvider: driftBase, manifest: driftManifest, capabilities: codexCapabilitiesForTest()}
-		registry := NewRegistry()
-		for _, provider := range []agent.Provider{fixture.piProvider, driftProvider} {
-			if err := registry.Register(provider); err != nil {
-				t.Fatal(err)
-			}
-		}
-		seed := QueuedWork{PlatformURL: "https://platform.example", McpAuthToken: "session-bearer"}
-		seed.SessionID = "profile-drift-seed"
-		driftRow := protectedRuntimeMCPCompiled(t, fixture.selector.CapabilityID, driftProvider, seed, agent.PromptModeHumanControlled)
-		realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{
-			fixture.piRow, fixture.codexHumanRow, fixture.codexAutonomousRow, driftRow,
-		})
-		if err != nil {
-			t.Fatal(err)
-		}
-		view, err := NewProviderViewWithProtectedRuntimeMCP(registry, fixture.decorate, realizations, nil, fixture.selector)
-		if err != nil {
-			t.Fatal(err)
-		}
+		fixture, view := newProtectedRuntimeMCPProfileDriftFixture(t)
 		_, detail := protectedRuntimeMCPPreflightInput(t, protectedRuntimeMCPMixedCodexWork(t, fixture.selector.CapabilityID, executioncell.SessionHumanControlled))
 		receipt, err := view.PreflightExecution(detail)
 		if err != nil {
@@ -473,6 +486,32 @@ func TestProtectedRuntimeMCPExactSelectorRefusesProfileDriftAndUnselectedV3(t *t
 		}
 		if _, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt); err == nil || !strings.Contains(err.Error(), "target adapter profile changed") {
 			t.Fatalf("profile drift requirement error = %v", err)
+		}
+	})
+
+	t.Run("profile drift without granted capability remains legacy", func(t *testing.T) {
+		fixture, view := newProtectedRuntimeMCPProfileDriftFixture(t)
+		baseline := NewProviderViewWithDecoratorAndRealizations(fixture.registry, fixture.decorate, fixture.realizations)
+		qw, detail := protectedRuntimeMCPPreflightInput(t, protectedRuntimeMCPMixedCodexWork(t, "", executioncell.SessionHumanControlled))
+		baselineReceipt, err := baseline.PreflightExecution(detail)
+		if err != nil {
+			t.Fatal(err)
+		}
+		receipt, err := view.PreflightExecution(detail)
+		if err != nil {
+			t.Fatalf("capability-absent drift preflight: %v", err)
+		}
+		if string(receipt) != string(baselineReceipt) {
+			t.Fatal("capability-absent profile drift changed legacy receipt bytes")
+		}
+		requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+		if err != nil || requirements != nil {
+			t.Fatalf("capability-absent profile drift requirements=%+v err=%v", requirements, err)
+		}
+		qw.HostAdaptationReceipt = receipt
+		got, runErr := runProtectedRuntimeMCPMixedChild(t, fixture, qw)
+		if runErr == nil || got.Status != "failed" || fixture.codexProvider.spawnCalls.Load() != 1 {
+			t.Fatalf("capability-absent drift child result=%+v err=%v spawnCalls=%d", got, runErr, fixture.codexProvider.spawnCalls.Load())
 		}
 	})
 
