@@ -135,26 +135,38 @@ func TestHostAdaptationV3RequiresProtectedRuntimeMCPAndOlderVersionsRejectIt(t *
 		t.Fatal(err)
 	}
 	protected := validProtectedRuntimeMCPMaterialization(strings.Repeat("a", 64))
+	var baseDocument map[string]any
+	if err := json.Unmarshal(readyHostReceipt(t, binding), &baseDocument); err != nil {
+		t.Fatal(err)
+	}
 	for _, version := range []string{HostAdaptationContractVersion, HostAdaptationV2ContractVersion} {
-		candidate := base
-		candidate.ContractVersion = version
-		candidate.ProtectedRuntimeMCPConfigs = []ProtectedRuntimeMCPConfigMaterializationV1{protected}
-		if version == HostAdaptationV2ContractVersion {
-			candidate.ConfigMaterializations = []PreflightConfigMaterializationV1{validConfigMaterialization(strings.Repeat("a", 64))}
-		}
-		if _, err := DecodeHostAdaptationReceipt(mustJSON(t, candidate)); err == nil {
-			t.Fatalf("%s accepted protected runtime MCP configs", version)
+		for name, value := range map[string]any{"null": nil, "empty": []any{}, "nonempty": []any{protected}} {
+			t.Run(version+" "+name, func(t *testing.T) {
+				candidate := maps.Clone(baseDocument)
+				candidate["contractVersion"] = version
+				candidate["protectedRuntimeMcpConfigs"] = value
+				if version == HostAdaptationV2ContractVersion {
+					candidate["configMaterializations"] = []PreflightConfigMaterializationV1{validConfigMaterialization(strings.Repeat("a", 64))}
+				}
+				if _, err := DecodeHostAdaptationReceipt(mustJSON(t, candidate)); err == nil {
+					t.Fatalf("%s accepted present protected runtime MCP configs", version)
+				}
+			})
 		}
 	}
 
 	base.ContractVersion = HostAdaptationV3ContractVersion
-	for name, values := range map[string][]ProtectedRuntimeMCPConfigMaterializationV1{
+	for name, value := range map[string]any{
 		"missing": nil,
-		"empty":   {},
+		"null":    nil,
+		"empty":   []any{},
 	} {
 		t.Run(name, func(t *testing.T) {
-			candidate := base
-			candidate.ProtectedRuntimeMCPConfigs = values
+			candidate := maps.Clone(baseDocument)
+			candidate["contractVersion"] = HostAdaptationV3ContractVersion
+			if name != "missing" {
+				candidate["protectedRuntimeMcpConfigs"] = value
+			}
 			if _, err := DecodeHostAdaptationReceipt(mustJSON(t, candidate)); err == nil {
 				t.Fatal("host-adaptation/v3 accepted missing protected runtime MCP materialization")
 			}
@@ -273,5 +285,26 @@ func TestProtectedRuntimeMCPConfigClosesShapeAndBindsEveryField(t *testing.T) {
 	materialization.Headers[0].ValueDigest = strings.Repeat("e", 64)
 	if err := ValidateProtectedRuntimeMCPConfigMaterialization(materialization); err == nil {
 		t.Fatal("mutated protected runtime MCP materialization accepted with stale reference digest")
+	}
+}
+
+func TestPreflightRegistrationAcceptsValidProtectedRuntimeMCPV3(t *testing.T) {
+	t.Parallel()
+	binding := runtimeBindingV2()
+	var host HostAdaptationReceipt
+	if err := json.Unmarshal(readyHostReceipt(t, binding), &host); err != nil {
+		t.Fatal(err)
+	}
+	host.ContractVersion = HostAdaptationV3ContractVersion
+	host.ProtectedRuntimeMCPConfigs = []ProtectedRuntimeMCPConfigMaterializationV1{
+		validProtectedRuntimeMCPMaterialization(strings.Repeat("a", 64)),
+	}
+	receipt := mustJSON(t, host)
+	request, err := NewPreflightRegistrationRequest(binding, receipt, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidatePreflightRegistrationRequest(request); err != nil {
+		t.Fatal(err)
 	}
 }

@@ -2198,7 +2198,8 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if materializeErr != nil {
 					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP config: %w", materializeErr)
 				}
-				if len(protectedRequirements) > 0 {
+				switch {
+				case len(protectedRequirements) > 0:
 					if replayedReceipt {
 						if hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion || !reflect.DeepEqual(hostReceipt.ProtectedRuntimeMCPConfigs, protectedMaterializations) {
 							return nil, errors.New("retained protected runtime MCP materialization changed")
@@ -2210,9 +2211,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						}
 						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
 					}
-				} else if hostReceipt.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
+				case hostReceipt.ContractVersion == executioncell.HostAdaptationV3ContractVersion:
 					return nil, errors.New("host adaptation v3 requires resolved protected runtime MCP requirements")
-				} else if hostReceipt.ContractVersion == executioncell.HostAdaptationV2ContractVersion && len(requirements) == 0 {
+				case hostReceipt.ContractVersion == executioncell.HostAdaptationV2ContractVersion && len(requirements) == 0:
 					return nil, errors.New("host adaptation v2 requires resolved config requirements")
 				}
 			}

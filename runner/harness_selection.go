@@ -332,6 +332,31 @@ func validateProtectedRuntimeMCPMaterialization(
 	selector string,
 	servers []agent.MCPServerConfig,
 ) error {
+	if selector == "" {
+		return nil
+	}
+	selected := 0
+	for _, capability := range selection.effectiveCell.GrantedCapabilities {
+		if capability.Name == selector {
+			selected++
+		}
+	}
+	if selected == 0 {
+		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
+			return nil
+		}
+		host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+		if err != nil {
+			return err
+		}
+		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
+			return errors.New("runner: unexpected protected runtime MCP materialization")
+		}
+		return nil
+	}
+	if selected != 1 {
+		return fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector)
+	}
 	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
 	if err != nil {
 		return err
@@ -341,10 +366,7 @@ func validateProtectedRuntimeMCPMaterialization(
 		return err
 	}
 	if requirement == nil {
-		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
-			return errors.New("runner: unexpected protected runtime MCP materialization")
-		}
-		return nil
+		return errors.New("runner: selected protected runtime MCP capability has no runtime requirement")
 	}
 	if host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ProtectedRuntimeMCPConfigs) != 1 {
 		return errors.New("runner: selected protected runtime MCP capability requires one v3 materialization")
