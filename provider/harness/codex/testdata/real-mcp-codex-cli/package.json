@@ -1,0 +1,8 @@
+{
+  "name": "donmai-codex-real-mcp-fixture",
+  "private": true,
+  "version": "1.0.0",
+  "dependencies": {
+    "@openai/codex": "0.154.0"
+  }
+}
