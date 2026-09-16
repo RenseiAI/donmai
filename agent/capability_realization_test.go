@@ -359,6 +359,35 @@ func TestCapabilityRealizationRawV1RejectsV2MemberPresence(t *testing.T) {
 	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
 		t.Fatal("v1 evidence decoder erased template member presence")
 	}
+	for _, tc := range []struct {
+		name   string
+		value  any
+		alias  string
+		target func() any
+	}{
+		{"declaration mixed-case alias", compiled.Declaration, "ParameterContract", func() any { return &CapabilityRealizationDeclaration{} }},
+		{"declaration uppercase alias", compiled.Declaration, "PARAMETERCONTRACT", func() any { return &CapabilityRealizationDeclaration{} }},
+		{"observation alias", compiled.Observation, "TemplateDigest", func() any { return &CapabilityFixtureObservation{} }},
+		{"binding alias", binding, "ParameterBinding", func() any { return &CapabilityRealizationBinding{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(tc.value)
+			mutated := append([]byte(`{"`+tc.alias+`":null,`), raw[1:]...)
+			if err := json.Unmarshal(mutated, tc.target()); err == nil {
+				t.Fatal("v1 decoder accepted case-insensitive v2 member alias")
+			}
+		})
+	}
+	evidenceRaw, _ := json.Marshal(evidence.Evidence)
+	aliasedEvidence := append([]byte(`{"TemplateDigest":null,`), evidenceRaw[1:]...)
+	row = map[string]json.RawMessage{}
+	fullRaw, _ := json.Marshal(evidence)
+	_ = json.Unmarshal(fullRaw, &row)
+	row["evidence"] = aliasedEvidence
+	mutated, _ = json.Marshal(row)
+	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v1 nested evidence accepted case-insensitive template alias")
+	}
 }
 
 func TestCapabilityRealizationRawV2RequiresEveryVersionedMember(t *testing.T) {
@@ -404,6 +433,30 @@ func TestCapabilityRealizationRawV2RequiresEveryVersionedMember(t *testing.T) {
 	mutated, _ := json.Marshal(row)
 	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
 		t.Fatal("v2 evidence decoder accepted missing template digest")
+	}
+	declarationRaw, _ := json.Marshal(compiled.Declaration)
+	aliased := strings.Replace(string(declarationRaw), `"parameterContract":`, `"ParameterContract":`, 1)
+	if err := json.Unmarshal([]byte(aliased), &CapabilityRealizationDeclaration{}); err == nil {
+		t.Fatal("v2 declaration accepted case-insensitive parameter contract alias")
+	}
+	duplicated := append([]byte(`{"parameterContract":null,`), declarationRaw[1:]...)
+	if err := json.Unmarshal(duplicated, &CapabilityRealizationDeclaration{}); err == nil {
+		t.Fatal("v2 declaration accepted duplicate parameter contract member")
+	}
+	bindingRaw, _ := json.Marshal(binding)
+	bindingAlias := strings.Replace(string(bindingRaw), `"parameterBinding":`, `"PARAMETERBINDING":`, 1)
+	if err := json.Unmarshal([]byte(bindingAlias), &CapabilityRealizationBinding{}); err == nil {
+		t.Fatal("v2 binding accepted case-insensitive parameter binding alias")
+	}
+	evidenceRaw, _ := json.Marshal(evidence.Evidence)
+	evidenceAlias := strings.Replace(string(evidenceRaw), `"templateDigest":`, `"TemplateDigest":`, 1)
+	var rowMembers map[string]json.RawMessage
+	fullRaw, _ := json.Marshal(evidence)
+	_ = json.Unmarshal(fullRaw, &rowMembers)
+	rowMembers["evidence"] = json.RawMessage(evidenceAlias)
+	fullRaw, _ = json.Marshal(rowMembers)
+	if err := json.Unmarshal(fullRaw, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v2 nested evidence accepted case-insensitive template alias")
 	}
 }
 

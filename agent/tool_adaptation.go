@@ -1092,6 +1092,9 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 		if (requestsNamedMCPServerEvidence(binding) || requestsNamedAdditionalExtensionEvidence(binding)) && validateCapabilityRealizationBinding(binding) != nil {
 			return "named capability realizations require canonical bindings"
 		}
+		if binding.ContractVersion == CapabilityRealizationContractVersionV2 && (binding.ParameterBinding == nil || plan.OperationalPayloadDigest == "" || binding.ParameterBinding.OperationalPayloadDigest != plan.OperationalPayloadDigest) {
+			return "parameterized capability realization must match the plan operational payload"
+		}
 		seenCapabilities[binding.CapabilityID] = true
 	}
 	return ""

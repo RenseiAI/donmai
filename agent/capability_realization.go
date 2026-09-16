@@ -1,13 +1,16 @@
 package agent
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
+	"io"
 	"reflect"
 	"regexp"
 	"sort"
+	"strings"
 	"sync"
 )
 
@@ -235,9 +238,16 @@ func (r *CompiledCapabilityRealizationEvidence) UnmarshalJSON(data []byte) error
 	if err != nil {
 		return err
 	}
-	var evidenceMembers map[string]json.RawMessage
-	if raw, ok := members["evidence"]; !ok || json.Unmarshal(raw, &evidenceMembers) != nil || evidenceMembers == nil {
-		return fmt.Errorf("capability realization evidence wire is malformed")
+	if _, err := exactWireMember(members, "compiled"); err != nil {
+		return err
+	}
+	rawEvidence, err := exactWireMember(members, "evidence")
+	if err != nil {
+		return err
+	}
+	evidenceMembers, err := rawMembers(rawEvidence)
+	if err != nil {
+		return err
 	}
 	if err := requireVersionedMembers(decoded.Compiled.Declaration.ContractVersion, evidenceMembers, "templateDigest"); err != nil {
 		return err
@@ -292,25 +302,73 @@ func (r *CapabilityRealizationResult) UnmarshalJSON(data []byte) error {
 	return nil
 }
 
-func rawMembers(data []byte) (map[string]json.RawMessage, error) {
-	var members map[string]json.RawMessage
-	if err := json.Unmarshal(data, &members); err != nil || members == nil {
+type rawWireMember struct {
+	name  string
+	value json.RawMessage
+}
+
+func rawMembers(data []byte) ([]rawWireMember, error) {
+	decoder := json.NewDecoder(bytes.NewReader(data))
+	token, err := decoder.Token()
+	if err != nil || token != json.Delim('{') {
+		return nil, fmt.Errorf("capability realization wire is malformed")
+	}
+	members := make([]rawWireMember, 0)
+	for decoder.More() {
+		key, err := decoder.Token()
+		name, ok := key.(string)
+		if err != nil || !ok {
+			return nil, fmt.Errorf("capability realization wire is malformed")
+		}
+		var value json.RawMessage
+		if err := decoder.Decode(&value); err != nil {
+			return nil, fmt.Errorf("capability realization wire is malformed")
+		}
+		members = append(members, rawWireMember{name: name, value: value})
+	}
+	if token, err := decoder.Token(); err != nil || token != json.Delim('}') {
+		return nil, fmt.Errorf("capability realization wire is malformed")
+	}
+	var trailing any
+	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, fmt.Errorf("capability realization wire is malformed")
 	}
 	return members, nil
 }
 
-func requireVersionedMembers(version string, members map[string]json.RawMessage, v2Names ...string) error {
+func exactWireMember(members []rawWireMember, name string) (json.RawMessage, error) {
+	var found json.RawMessage
+	count := 0
+	for _, member := range members {
+		if !strings.EqualFold(member.name, name) {
+			continue
+		}
+		if member.name != name {
+			return nil, fmt.Errorf("capability realization wire member %q uses a non-canonical alias", name)
+		}
+		count++
+		found = member.value
+	}
+	if count != 1 {
+		return nil, fmt.Errorf("capability realization wire member %q must appear exactly once", name)
+	}
+	return found, nil
+}
+
+func requireVersionedMembers(version string, members []rawWireMember, v2Names ...string) error {
 	switch version {
 	case CapabilityRealizationContractVersionV1:
 		for _, name := range v2Names {
-			if _, present := members[name]; present {
-				return fmt.Errorf("v1 capability realization contains v2 member %q", name)
+			for _, member := range members {
+				if strings.EqualFold(member.name, name) {
+					return fmt.Errorf("v1 capability realization contains v2 member %q", name)
+				}
 			}
 		}
 	case CapabilityRealizationContractVersionV2:
 		for _, name := range v2Names {
-			if raw, present := members[name]; !present || string(raw) == "null" {
+			raw, err := exactWireMember(members, name)
+			if err != nil || string(raw) == "null" {
 				return fmt.Errorf("v2 capability realization omits member %q", name)
 			}
 		}
@@ -332,6 +390,9 @@ func (d *CapabilityRealizationDeclaration) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if _, err := exactWireMember(members, "contractVersion"); err != nil {
+		return err
+	}
 	if err := requireVersionedMembers(decoded.ContractVersion, members, "parameterContract", "parameterContractDigest", "templateDigest"); err != nil {
 		return err
 	}
@@ -350,6 +411,9 @@ func (o *CapabilityFixtureObservation) UnmarshalJSON(data []byte) error {
 	if err != nil {
 		return err
 	}
+	if _, err := exactWireMember(members, "contractVersion"); err != nil {
+		return err
+	}
 	if err := requireVersionedMembers(decoded.ContractVersion, members, "templateDigest"); err != nil {
 		return err
 	}
@@ -362,6 +426,13 @@ func (e *CapabilityRealizationEvidence) UnmarshalJSON(data []byte) error {
 	type wire CapabilityRealizationEvidence
 	var decoded wire
 	if err := json.Unmarshal(data, &decoded); err != nil {
+		return err
+	}
+	members, err := rawMembers(data)
+	if err != nil {
+		return err
+	}
+	if _, err := exactWireMember(members, "contractVersion"); err != nil {
 		return err
 	}
 	// Evidence carries its own v1 contract version. Its template member is
@@ -381,6 +452,9 @@ func (b *CapabilityRealizationBinding) UnmarshalJSON(data []byte) error {
 	}
 	members, err := rawMembers(data)
 	if err != nil {
+		return err
+	}
+	if _, err := exactWireMember(members, "contractVersion"); err != nil {
 		return err
 	}
 	if err := requireVersionedMembers(decoded.ContractVersion, members, "parameterContract", "parameterContractDigest", "templateDigest", "parameterBinding"); err != nil {

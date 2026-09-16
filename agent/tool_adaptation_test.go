@@ -1640,13 +1640,21 @@ func TestNamedAdditionalExtensionsRequireProfileOptInAndPreserveAggregate(t *tes
 	advisory := advisoryExtensionDelivery("advisory-pack")
 	required := extensionDelivery("required-pack")
 	bindings := []agent.CapabilityRealizationBinding{namedExtensionBinding(t, advisory, "none"), namedExtensionBinding(t, required, "before_first_turn")}
-	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{advisory, required}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: bindings}}
+	operationalDigest := bindings[0].ParameterBinding.OperationalPayloadDigest
+	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{advisory, required}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: "synthetic-admission", OperationalPayloadDigest: operationalDigest, CapabilityRealizations: bindings}}
 	profile := mustProfile(t, (&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled)
 	profile.ID = "pi/test/named-extension-v1"
 	if _, receipt, err := agent.AdaptToolLifecycle(spec, profile); err == nil || receipt.Decision != "denied" {
 		t.Fatalf("old profile accepted binding-only opt-in: receipt=%+v err=%v", receipt, err)
 	}
 	profile.NamedExtensionEntries = true
+	wrongPayload := spec
+	wrongPlan := *spec.ToolLifecyclePlan
+	wrongPlan.OperationalPayloadDigest = strings.Repeat("e", 64)
+	wrongPayload.ToolLifecyclePlan = &wrongPlan
+	if _, _, err := agent.AdaptToolLifecycle(wrongPayload, profile); err == nil {
+		t.Fatal("cross-session parameter binding matched a different plan payload")
+	}
 	wrongProfile := profile
 	wrongProfile.ID = "pi/test/other-named-extension-v1"
 	if _, _, err := agent.AdaptToolLifecycle(spec, wrongProfile); err == nil {
@@ -1686,7 +1694,7 @@ func TestNamedAdditionalExtensionsRejectConflictAndNoncanonicalEntry(t *testing.
 	wrong := binding
 	wrong.Entries = append([]agent.CapabilityRecipeEntry(nil), binding.Entries...)
 	wrong.Entries[0].InputDigest = strings.Repeat("0", 64)
-	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{delivery}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{wrong}}}
+	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{delivery}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, AdmissionReceiptID: "synthetic-admission", OperationalPayloadDigest: wrong.ParameterBinding.OperationalPayloadDigest, CapabilityRealizations: []agent.CapabilityRealizationBinding{wrong}}}
 	if _, _, err := agent.AdaptToolLifecycle(spec, profile); err == nil {
 		t.Fatal("conflicting named delivery digest accepted")
 	}
