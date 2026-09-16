@@ -92,6 +92,47 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 	}
 }
 
+// TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues
+// exercises the production compiler path. The named binding is for the
+// normalized runtime placeholder, so rotating URL and headers cannot change
+// it while static server identity remains authority-bound elsewhere.
+func TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	runtime := agent.MCPServerConfig{Name: "session-gateway", Type: "http", URL: "https://session.example/first", Headers: map[string]string{"Authorization": "Bearer first"}}
+	compile := func(mode agent.PromptSessionMode, url, token string) *agent.PreparedHarness {
+		server := runtime
+		server.URL = url
+		server.Headers = map[string]string{"Authorization": token}
+		binding := namedMCPBindingWithDigest(t, "example.named-runtime-mcp/"+string(mode), server.Name, agent.MCPRuntimeServerCapabilityInputDigest(server), mode)
+		spec := agent.Spec{
+			PromptMode: mode,
+			Autonomous: mode == agent.PromptModeAutonomous,
+			MCPServers: []agent.MCPServerConfig{server},
+			ToolLifecyclePlan: &agent.ToolLifecyclePlan{
+				ContractVersion:        agent.ToolLifecycleContractVersion,
+				CapabilityRealizations: []agent.CapabilityRealizationBinding{binding},
+			},
+		}
+		plan, err := agent.CompilePreparedHarness(spec, manifest, strings.Repeat("a", 64), []string{server.Name}, nil)
+		if err != nil {
+			t.Fatalf("CompilePreparedHarness: %v", err)
+		}
+		return plan
+	}
+	for _, mode := range []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled} {
+		first := compile(mode, "https://session.example/first", "Bearer first")
+		second := compile(mode, "https://session.example/second", "Bearer second")
+		entryID, _ := agent.MCPServerCapabilityEntryID(runtime.Name)
+		if got, want := namedMCPEntry(t, second.ToolLifecycleReceipt, entryID).InputDigest, namedMCPEntry(t, first.ToolLifecycleReceipt, entryID).InputDigest; got != want {
+			t.Fatalf("%s runtime rotation changed named MCP digest: got %s want %s", mode, got, want)
+		}
+		if first.AuthorityDigest != second.AuthorityDigest {
+			t.Fatalf("%s runtime rotation changed normalized prepared authority: first=%s second=%s", mode, first.AuthorityDigest, second.AuthorityDigest)
+		}
+	}
+}
+
 // TestApplyPreparedHarnessNamesDriftingFields covers: on a
 // materialized-Spec-differs-from-authority mismatch, ApplyPreparedHarness
 // must return a *agent.AuthorityDriftError naming exactly which

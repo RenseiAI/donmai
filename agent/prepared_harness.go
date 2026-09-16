@@ -372,11 +372,7 @@ func normalizeHarnessAuthoritySpec(spec Spec, plan *PreparedHarness) Spec {
 	out.MCPServers = append([]MCPServerConfig(nil), spec.MCPServers...)
 	for i := range out.MCPServers {
 		if runtimeNames[out.MCPServers[i].Name] {
-			out.MCPServers[i].Command = "<runtime>"
-			out.MCPServers[i].Args = nil
-			out.MCPServers[i].Env = nil
-			out.MCPServers[i].URL = "https://runtime.invalid"
-			out.MCPServers[i].Headers = nil
+			out.MCPServers[i] = normalizeRuntimeMCPServer(out.MCPServers[i])
 		}
 	}
 	if out.Interactive != nil {
@@ -385,6 +381,26 @@ func normalizeHarnessAuthoritySpec(spec Spec, plan *PreparedHarness) Spec {
 		out.Interactive = &interactiveCopy
 	}
 	return out
+}
+
+// normalizeRuntimeMCPServer removes values materialized only at spawn time.
+// It is shared by prepared authority projection and named capability evidence
+// so both commit to one exact runtime placeholder shape.
+func normalizeRuntimeMCPServer(server MCPServerConfig) MCPServerConfig {
+	server.Command = "<runtime>"
+	server.Args = nil
+	server.Env = nil
+	server.URL = "https://runtime.invalid"
+	server.Headers = nil
+	return server
+}
+
+// MCPRuntimeServerCapabilityInputDigest returns the canonical lifecycle input
+// digest for a server whose command, arguments, environment, URL, and headers
+// are supplied only at runtime. It does not identify runtime-owned servers;
+// callers still derive that membership from the runner's RuntimeMCPNames.
+func MCPRuntimeServerCapabilityInputDigest(server MCPServerConfig) string {
+	return MCPServerCapabilityInputDigest(normalizeRuntimeMCPServer(server))
 }
 
 func stableEndpointAuthority(endpoint *EndpointBinding) any {
