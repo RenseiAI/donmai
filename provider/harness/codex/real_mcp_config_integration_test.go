@@ -381,28 +381,69 @@ func runDirectMCPFixture(
 		<-done
 		t.Fatal("app-server did not exit after owned stdin closed")
 	}
-	if strings.TrimSpace(stderr.String()) != "" {
+	if !allowedRealMCPFixtureStderr(stderr.String()) {
 		t.Fatalf("app-server stderr = %q", stderr.String())
 	}
 	methodSummary, _ := json.Marshal(methods)
 	t.Logf("real MCP method summary sha256=%s", func() string { sum := sha256.Sum256(methodSummary); return hex.EncodeToString(sum[:]) }())
 }
 
+func allowedRealMCPFixtureStderr(raw string) bool {
+	trimmed := strings.TrimSpace(raw)
+	if trimmed == "" {
+		return true
+	}
+	const temporaryHomeWarning = "WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir"
+	for _, line := range strings.Split(trimmed, "\n") {
+		if !strings.HasPrefix(line, temporaryHomeWarning) || !strings.Contains(line, "(codex_home:") {
+			return false
+		}
+	}
+	return true
+}
+
+func TestAllowedRealMCPFixtureStderrIsNarrow(t *testing.T) {
+	t.Parallel()
+	warning := `WARNING: proceeding, even though we could not create PATH aliases: Refusing to create helper binaries under temporary dir "/tmp/example" (codex_home: AbsolutePathBuf("/tmp/example/home"))`
+	for _, test := range []struct {
+		name string
+		raw  string
+		want bool
+	}{
+		{name: "empty", want: true},
+		{name: "temporary home warning", raw: warning, want: true},
+		{name: "unrelated warning", raw: "WARNING: MCP startup failed", want: false},
+		{name: "extra line", raw: warning + "\nother", want: false},
+	} {
+		test := test
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			if got := allowedRealMCPFixtureStderr(test.raw); got != test.want {
+				t.Fatalf("allowedRealMCPFixtureStderr(%q) = %v, want %v", test.raw, got, test.want)
+			}
+		})
+	}
+}
+
 func TestIntegration_RealCodexInteractiveMCPDirectCalls(t *testing.T) {
 	launcher, native := requireCodexFixtureBinaries(t)
+	parentHome := os.Getenv("HOME")
 	for _, key := range codexEnvironmentAuthKeys {
 		t.Setenv(key, "")
 	}
 	root := t.TempDir()
 	ambientHome := filepath.Join(root, "ambient-home")
 	boundaryRoot := filepath.Join(root, "boundaries")
+	fixtureHome := filepath.Join(root, "fixture-home")
 	workdir := filepath.Join(root, "work")
-	for _, dir := range []string{ambientHome, boundaryRoot, workdir} {
+	for _, dir := range []string{ambientHome, boundaryRoot, fixtureHome, workdir} {
 		if err := os.MkdirAll(dir, 0o700); err != nil {
 			t.Fatal(err)
 		}
 	}
-	if err := os.WriteFile(filepath.Join(ambientHome, "config.toml"), []byte("[mcp_servers.ambient]\ncommand=\"/usr/bin/false\"\n"), 0o600); err != nil {
+	ambientConfig := []byte("[mcp_servers.ambient]\ncommand=\"/usr/bin/false\"\n")
+	ambientConfigPath := filepath.Join(ambientHome, "config.toml")
+	if err := os.WriteFile(ambientConfigPath, ambientConfig, 0o600); err != nil {
 		t.Fatal(err)
 	}
 	t.Setenv("CODEX_HOME", ambientHome)
@@ -428,6 +469,21 @@ func TestIntegration_RealCodexInteractiveMCPDirectCalls(t *testing.T) {
 					t.Fatal("interactive args exposed a bearer or ambient MCP config")
 				}
 			}
+			effectiveEnv := make(map[string]string)
+			for _, entry := range mergeEnv(nil, launch.env, ownedHome) {
+				name, value, ok := strings.Cut(entry, "=")
+				if ok {
+					effectiveEnv[name] = value
+				}
+			}
+			if effectiveEnv["HOME"] != fixtureHome || !sameResolvedPath(effectiveEnv["CODEX_HOME"], ownedHome) {
+				t.Fatalf("native boundary HOME/CODEX_HOME are not isolated")
+			}
+			for _, key := range codexEnvironmentAuthKeys {
+				if effectiveEnv[key] != "" {
+					t.Fatalf("native boundary retained %s authentication", key)
+				}
+			}
 			runDirectMCPFixture(t, ctx, native, spec, launch, ownedHome, tools)
 			return errRealMCPFixtureComplete
 		},
@@ -435,6 +491,7 @@ func TestIntegration_RealCodexInteractiveMCPDirectCalls(t *testing.T) {
 		Cwd: workdir,
 		Env: map[string]string{
 			"OPENAI_API_KEY": "fixture-model-auth-not-a-real-credential",
+			"HOME":           fixtureHome,
 		},
 		MCPServers: []agent.MCPServerConfig{{
 			Name: "fixture-platform", Type: "http", URL: fixture.server.URL + "/api/mcp/fixture-session",
@@ -447,6 +504,12 @@ func TestIntegration_RealCodexInteractiveMCPDirectCalls(t *testing.T) {
 	}
 	if _, err := os.Stat(unexpectedPTYMarker); !errors.Is(err, os.ErrNotExist) {
 		t.Fatalf("interactive PTY path ran: %v", err)
+	}
+	if os.Getenv("HOME") != parentHome {
+		t.Fatal("fixture changed the parent HOME")
+	}
+	if body, err := os.ReadFile(ambientConfigPath); err != nil || !bytes.Equal(body, ambientConfig) {
+		t.Fatalf("fixture changed ambient Codex config: %v", err)
 	}
 	fixture.mu.Lock()
 	defer fixture.mu.Unlock()
