@@ -27,12 +27,14 @@ type CapabilityParameterBinder interface {
 	Bind(CapabilityParameterBindingContext) (CapabilityParameterBindResult, error)
 }
 
+// CapabilityParameterBindResult is one atomic untrusted binder return value.
 type CapabilityParameterBindResult struct {
 	Binding              agent.CapabilityParameterBindingV1
 	Materialization      agent.CapabilityRuntimeMaterializationV1
 	AdditionalExtensions []agent.ExtensionDelivery
 }
 
+// ResolvedCapabilityParameterBinding is the validated process-owned result.
 type ResolvedCapabilityParameterBinding struct {
 	Realization          agent.CapabilityRealizationBinding
 	Materialization      agent.CapabilityRuntimeMaterializationV1

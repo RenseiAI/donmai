@@ -475,17 +475,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	return err
 }
 
-// NewProviderView returns a ProviderView backed by reg, with no additional-
-// extension decorator applied — the historical, source-compatible
-// constructor. Pass the result to daemon.Options.ProviderRegistry to expose
-// the runner's registered AgentRuntime providers via the daemon's HTTP
-// control API.
-//
-// This signature is part of the OSS embed surface and stays exactly as it
-// was: an embedder building a ProviderView with no
-// Config.AgentSpecExtensionDecorator registered keeps compiling unchanged.
-// An embedder that DOES register a decorator must call
-// NewProviderViewWithDecorator instead — see its doc comment for why.
+// ProviderViewOptions is the complete immutable construction surface.
 type ProviderViewOptions struct {
 	Decorator                   agent.ExtensionDecorator
 	CapabilityRealizations      *agent.CapabilityRealizationRegistry
@@ -494,6 +484,7 @@ type ProviderViewOptions struct {
 	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
 }
 
+// NewProviderViewWithOptions constructs a complete read-only provider view.
 func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*ProviderView, error) {
 	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
 		return nil, err
@@ -505,6 +496,7 @@ func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*Provi
 	return &ProviderView{reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations, preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements, protectedRuntimeMCPSelector: opts.ProtectedRuntimeMCPSelector}, nil
 }
 
+// NewProviderView returns the historical default provider view.
 func NewProviderView(reg *Registry) *ProviderView {
 	view, _ := NewProviderViewWithOptions(reg, ProviderViewOptions{})
 	return view

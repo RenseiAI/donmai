@@ -10,6 +10,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// Shared bridge contract identities.
 const (
 	ParameterContractID      = "donmai.code-intelligence-work/v1"
 	RuntimeConfigVersion     = "donmai.code-intelligence-runtime-config/v1"
@@ -22,12 +23,14 @@ const (
 	KindCall                 = "call"
 )
 
+// RuntimeConfigV1 is the closed process-only code-intelligence configuration.
 type RuntimeConfigV1 struct {
 	ContractVersion string   `json:"contractVersion"`
 	RepoPath        string   `json:"repoPath"`
 	Tools           []string `json:"tools"`
 }
 
+// CanonicalRuntimeConfig validates, canonicalizes, and digests config.
 func CanonicalRuntimeConfig(config RuntimeConfigV1) (json.RawMessage, string, error) {
 	if config.ContractVersion != RuntimeConfigVersion || len(config.Tools) == 0 {
 		return nil, "", fmt.Errorf("code-intelligence runtime config is malformed")
@@ -46,6 +49,7 @@ func CanonicalRuntimeConfig(config RuntimeConfigV1) (json.RawMessage, string, er
 	return agent.CanonicalCapabilityRuntimeConfig(raw)
 }
 
+// DecodeRuntimeConfig decodes only canonical closed runtime config bytes.
 func DecodeRuntimeConfig(raw json.RawMessage) (RuntimeConfigV1, string, error) {
 	var config RuntimeConfigV1
 	decoder := json.NewDecoder(strings.NewReader(string(raw)))

@@ -110,6 +110,7 @@ type CapabilityRuntimeMaterializationV1 struct {
 	Config              json.RawMessage `json:"-"`
 }
 
+// CapabilityRuntimeMaterializationContractVersionV1 identifies process-only runtime config.
 const CapabilityRuntimeMaterializationContractVersionV1 = "donmai.capability-runtime-materialization/v1"
 
 // CanonicalCapabilityRuntimeConfig returns detached RFC-8785 bytes and the

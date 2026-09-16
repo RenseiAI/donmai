@@ -18,6 +18,7 @@ var windowsPathPrefix = regexp.MustCompile(`^[A-Za-z]:`)
 
 type codeIntelParameterBinder struct{ sourceDigest string }
 
+// NewCodeIntelParameterBinder constructs the strict process-owned binder.
 func NewCodeIntelParameterBinder(sourceDigest string) (CapabilityParameterBinder, error) {
 	if !validLowerHexDigest(sourceDigest) {
 		return nil, fmt.Errorf("code-intelligence binder source digest is malformed")

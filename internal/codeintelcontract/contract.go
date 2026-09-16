@@ -4,6 +4,7 @@ package codeintelcontract
 
 import "encoding/json"
 
+// Canonical server and tool identities.
 const (
 	ServerName            = "af-code-intelligence"
 	ToolGetRepoMap        = "af_code_get_repo_map"

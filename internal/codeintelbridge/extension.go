@@ -62,6 +62,7 @@ export default function activate(pi: ExtensionAPI) {
 `, ExtensionMarker, raw, ExtensionContractVersion, KindBind, DeliveryID, BindResponseVersion, ExtensionContractVersion, KindCall, ExtensionContractVersion, KindInventory))
 }
 
+// Delivery returns an independent copy of the fixed required Pi extension.
 func Delivery() agent.ExtensionDelivery {
 	source := extensionSource()
 	sum := sha256.Sum256(source)
