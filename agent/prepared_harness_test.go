@@ -99,34 +99,37 @@ func TestPreparedHarnessIsSoleCallbackFreeProviderAuthority(t *testing.T) {
 func TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues(t *testing.T) {
 	t.Parallel()
 	manifest := (&codex.Provider{}).Manifest()
-	normalized := agent.MCPServerConfig{Name: "session-gateway", Type: "http", Command: "<runtime>", URL: "https://runtime.invalid"}
-	binding := namedMCPBinding(t, "example.named-runtime-mcp/v1", normalized.Name, normalized)
-	compile := func(url, token string) *agent.PreparedHarness {
+	runtime := agent.MCPServerConfig{Name: "session-gateway", Type: "http", URL: "https://session.example/first", Headers: map[string]string{"Authorization": "Bearer first"}}
+	compile := func(mode agent.PromptSessionMode, url, token string) *agent.PreparedHarness {
+		server := runtime
+		server.URL = url
+		server.Headers = map[string]string{"Authorization": token}
+		binding := namedMCPBindingWithDigest(t, "example.named-runtime-mcp/"+string(mode), server.Name, server, agent.MCPRuntimeServerCapabilityInputDigest(server), mode)
 		spec := agent.Spec{
-			Autonomous: true,
-			MCPServers: []agent.MCPServerConfig{{
-				Name: normalized.Name, Type: "http", URL: url,
-				Headers: map[string]string{"Authorization": token},
-			}},
+			PromptMode: mode,
+			Autonomous: mode == agent.PromptModeAutonomous,
+			MCPServers: []agent.MCPServerConfig{server},
 			ToolLifecyclePlan: &agent.ToolLifecyclePlan{
 				ContractVersion:        agent.ToolLifecycleContractVersion,
 				CapabilityRealizations: []agent.CapabilityRealizationBinding{binding},
 			},
 		}
-		plan, err := agent.CompilePreparedHarness(spec, manifest, strings.Repeat("a", 64), []string{normalized.Name}, nil)
+		plan, err := agent.CompilePreparedHarness(spec, manifest, strings.Repeat("a", 64), []string{server.Name}, nil)
 		if err != nil {
 			t.Fatalf("CompilePreparedHarness: %v", err)
 		}
 		return plan
 	}
-	first := compile("https://session.example/first", "Bearer first")
-	second := compile("https://session.example/second", "Bearer second")
-	entryID, _ := agent.MCPServerCapabilityEntryID(normalized.Name)
-	if got, want := namedMCPEntry(t, second.ToolLifecycleReceipt, entryID).InputDigest, namedMCPEntry(t, first.ToolLifecycleReceipt, entryID).InputDigest; got != want {
-		t.Fatalf("runtime rotation changed named MCP digest: got %s want %s", got, want)
-	}
-	if first.AuthorityDigest != second.AuthorityDigest {
-		t.Fatalf("runtime rotation changed normalized prepared authority: first=%s second=%s", first.AuthorityDigest, second.AuthorityDigest)
+	for _, mode := range []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled} {
+		first := compile(mode, "https://session.example/first", "Bearer first")
+		second := compile(mode, "https://session.example/second", "Bearer second")
+		entryID, _ := agent.MCPServerCapabilityEntryID(runtime.Name)
+		if got, want := namedMCPEntry(t, second.ToolLifecycleReceipt, entryID).InputDigest, namedMCPEntry(t, first.ToolLifecycleReceipt, entryID).InputDigest; got != want {
+			t.Fatalf("%s runtime rotation changed named MCP digest: got %s want %s", mode, got, want)
+		}
+		if first.AuthorityDigest != second.AuthorityDigest {
+			t.Fatalf("%s runtime rotation changed normalized prepared authority: first=%s second=%s", mode, first.AuthorityDigest, second.AuthorityDigest)
+		}
 	}
 }
 

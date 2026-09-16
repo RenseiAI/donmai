@@ -639,6 +639,10 @@ func TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal(t *testing.T) 
 }
 
 func namedMCPBinding(t *testing.T, capabilityID, name string, server agent.MCPServerConfig) agent.CapabilityRealizationBinding {
+	return namedMCPBindingWithDigest(t, capabilityID, name, server, agent.MCPServerCapabilityInputDigest(server), agent.PromptModeAutonomous)
+}
+
+func namedMCPBindingWithDigest(t *testing.T, capabilityID, name string, server agent.MCPServerConfig, inputDigest string, mode agent.PromptSessionMode) agent.CapabilityRealizationBinding {
 	t.Helper()
 	entryID, err := agent.MCPServerCapabilityEntryID(name)
 	if err != nil {
@@ -652,13 +656,13 @@ func namedMCPBinding(t *testing.T, capabilityID, name string, server agent.MCPSe
 		CapabilityID:   capabilityID,
 		HarnessID:      agent.HarnessCodex,
 		AdapterVersion: "codex/interactive/tool-lifecycle-v1",
-		Mode:           agent.PromptModeAutonomous,
+		Mode:           mode,
 		RecipeID:       "example/named-mcp/v1",
 		Entries: []agent.CapabilityRecipeEntry{{
 			EntryID:     entryID,
 			Channel:     agent.ToolChannelMCPServer,
 			Required:    true,
-			InputDigest: agent.MCPServerCapabilityInputDigest(server),
+			InputDigest: inputDigest,
 			SurfaceRefs: surface,
 		}},
 		DeclaredSurface: surface,
@@ -673,7 +677,7 @@ func namedMCPBinding(t *testing.T, capabilityID, name string, server agent.MCPSe
 		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{
 			EntryID:     entryID,
 			Channel:     agent.ToolChannelMCPServer,
-			InputDigest: agent.MCPServerCapabilityInputDigest(server),
+			InputDigest: inputDigest,
 		}},
 		ObservedSurface: surface,
 	})
@@ -696,6 +700,37 @@ func namedMCPEntry(t *testing.T, receipt agent.ToolLifecycleReceipt, id string) 
 	}
 	t.Fatalf("receipt has no %q entry: %+v", id, receipt.Entries)
 	return agent.ToolLifecycleEntry{}
+}
+
+// TestToolLifecycleAggregateMCPReceiptBytesRemainLegacyWithoutNamedBinding
+// is the compatibility control: merely carrying an otherwise empty plan must
+// not change the aggregate-only receipt bytes existing callers persist.
+func TestToolLifecycleAggregateMCPReceiptBytesRemainLegacyWithoutNamedBinding(t *testing.T) {
+	t.Parallel()
+	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
+	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
+	legacy := agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}}
+	_, before, err := agent.AdaptToolLifecycle(legacy, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withPlan := legacy
+	withPlan.ToolLifecyclePlan = &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion}
+	_, after, err := agent.AdaptToolLifecycle(withPlan, profile)
+	if err != nil {
+		t.Fatal(err)
+	}
+	beforeBytes, err := json.Marshal(before)
+	if err != nil {
+		t.Fatal(err)
+	}
+	afterBytes, err := json.Marshal(after)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if string(afterBytes) != string(beforeBytes) {
+		t.Fatalf("aggregate-only receipt drifted: before=%s after=%s", beforeBytes, afterBytes)
+	}
 }
 
 // TestToolLifecycleNamedMCPBindingAddsSupplementalEvidence proves the opt-in
@@ -850,6 +885,33 @@ func TestToolLifecycleNamedMCPBindingCannotUseDowngradedMCPDelivery(t *testing.T
 	named := namedMCPEntry(t, receipt, entryID)
 	if named.Outcome != agent.ToolOutcomeDenied || named.DenialCode != agent.ToolDenialDeliveryUnsupported {
 		t.Fatalf("named entry = %+v, want refused instead of downgraded", named)
+	}
+}
+
+func TestToolLifecycleNamedMCPBindingRefusesMismatchedAnchorAndTrimmedAlias(t *testing.T) {
+	t.Parallel()
+	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
+	binding := namedMCPBinding(t, "example.named-mcp/v1", server.Name, server)
+	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
+	mismatchedAnchor := binding
+	mismatchedAnchor.Entries = append([]agent.CapabilityRecipeEntry(nil), binding.Entries...)
+	mismatchedAnchor.Entries[0].SurfaceRefs = append([]agent.CapabilitySurfaceIdentity(nil), binding.Entries[0].SurfaceRefs...)
+	mismatchedAnchor.Entries[0].SurfaceRefs[0].ID = "other"
+	tests := []struct {
+		name string
+		spec agent.Spec
+	}{
+		{"mismatched bound anchor", agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{mismatchedAnchor}}}},
+		{"trimmed alias", agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{{Name: " workflow", Type: "http", URL: server.URL}}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{binding}}}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			_, _, err := agent.AdaptToolLifecycle(tc.spec, profile)
+			var denial *agent.ToolAdaptationError
+			if !errors.As(err, &denial) || denial.Code != agent.ToolDenialMalformedPlan {
+				t.Fatalf("error = %v, want malformed-plan denial", err)
+			}
+		})
 	}
 }
 
