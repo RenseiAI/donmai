@@ -12,6 +12,8 @@ import (
 	"sort"
 	"strings"
 	"sync"
+
+	jsoncanonicalizer "github.com/cyberphone/json-canonicalization/go/src/webpki.org/jsoncanonicalizer"
 )
 
 // Capability realization contract versions distinguish immutable static rows
@@ -91,8 +93,35 @@ type CapabilityParameterBindingV1 struct {
 	StaticRecipeDigest       string                      `json:"staticRecipeDigest"`
 	SelectedSurface          []CapabilitySurfaceIdentity `json:"selectedSurface"`
 	SelectedSurfaceDigest    string                      `json:"selectedSurfaceDigest"`
+	RuntimeConfigDigest      string                      `json:"runtimeConfigDigest"`
 	Entries                  []CapabilityBoundEntryV1    `json:"entries"`
 	BindingDigest            string                      `json:"bindingDigest"`
+}
+
+// CapabilityRuntimeMaterializationV1 is a process-only runtime configuration
+// rebuilt independently by host and child preparation. It is consistency data,
+// not proof that the process-owned binder ran.
+type CapabilityRuntimeMaterializationV1 struct {
+	ContractVersion     string          `json:"-"`
+	CapabilityID        string          `json:"-"`
+	ParameterContractID string          `json:"-"`
+	BindingDigest       string          `json:"-"`
+	ConfigDigest        string          `json:"-"`
+	Config              json.RawMessage `json:"-"`
+}
+
+// CapabilityRuntimeMaterializationContractVersionV1 identifies process-only runtime config.
+const CapabilityRuntimeMaterializationContractVersionV1 = "donmai.capability-runtime-materialization/v1"
+
+// CanonicalCapabilityRuntimeConfig returns detached RFC-8785 bytes and the
+// domain-separated digest used by process-only materializations.
+func CanonicalCapabilityRuntimeConfig(raw json.RawMessage) (json.RawMessage, string, error) {
+	canonical, err := jsoncanonicalizer.Transform(raw)
+	if err != nil {
+		return nil, "", fmt.Errorf("canonicalize capability runtime config: %w", err)
+	}
+	sum := sha256.Sum256(append([]byte("donmai.capability-runtime-materialization.config/v1\x00"), canonical...))
+	return append(json.RawMessage(nil), canonical...), hex.EncodeToString(sum[:]), nil
 }
 
 // CapabilityRecipeEntry is the versioned capability-realization contract surface.
@@ -957,7 +986,7 @@ func ValidateCapabilityParameterBinding(binding CapabilityParameterBindingV1, de
 		binding.ContractVersion != CapabilityParameterBindingVersionV1 || binding.CapabilityID != declaration.CapabilityID ||
 		binding.ParameterContractID != declaration.ParameterContract.ID || binding.ParametersDigest != requirement.ParametersDigest ||
 		binding.OperationalPayloadDigest != requirement.OperationalPayloadDigest || binding.StaticRecipeDigest != declaration.Recipe.RecipeDigest ||
-		requirement.CapabilityID != declaration.CapabilityID || !realizationDigest.MatchString(binding.BindingDigest) {
+		requirement.CapabilityID != declaration.CapabilityID || !realizationDigest.MatchString(binding.RuntimeConfigDigest) || !realizationDigest.MatchString(binding.BindingDigest) {
 		return fmt.Errorf("capability parameter binding identity is invalid")
 	}
 	selected, err := canonicalSurface(binding.SelectedSurface)

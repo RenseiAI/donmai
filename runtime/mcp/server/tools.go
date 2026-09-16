@@ -5,6 +5,7 @@ import (
 	"errors"
 
 	"github.com/RenseiAI/donmai/afclient/codeintel"
+	"github.com/RenseiAI/donmai/internal/codeintelcontract"
 )
 
 // buildTools constructs the full six-tool set bound to this server's warm
@@ -19,12 +20,16 @@ import (
 func (s *Server) buildTools() []*toolDef {
 	r := s.runner
 	root := s.root
+	descriptors := make(map[string]codeintelcontract.Descriptor, 6)
+	for _, descriptor := range codeintelcontract.Descriptors() {
+		descriptors[descriptor.Name] = descriptor
+	}
 
 	return []*toolDef{
 		{
 			name:        ToolGetRepoMap,
-			description: "Repo map ranked by import centrality: most important files + their symbols. Call FIRST to orient.",
-			inputSchema: schemaGetRepoMap,
+			description: descriptors[ToolGetRepoMap].Description,
+			inputSchema: descriptors[ToolGetRepoMap].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					MaxFiles     int      `json:"maxFiles"`
@@ -41,8 +46,8 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name:        ToolSearchSymbols,
-			description: "Search symbols by name (functions, methods, types, ...); exact names return only the exact hits.",
-			inputSchema: schemaSearchSymbols,
+			description: descriptors[ToolSearchSymbols].Description,
+			inputSchema: descriptors[ToolSearchSymbols].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					Query       string   `json:"query"`
@@ -65,8 +70,8 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name:        ToolSearchCode,
-			description: "Keyword search over code content with code-aware tokenization (camelCase/snake_case).",
-			inputSchema: schemaSearchCode,
+			description: descriptors[ToolSearchCode].Description,
+			inputSchema: descriptors[ToolSearchCode].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					Query      string `json:"query"`
@@ -87,8 +92,8 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name:        ToolCheckDuplicate,
-			description: "Check whether code already exists (exact or near duplicate). Pass content OR contentFile.",
-			inputSchema: schemaCheckDuplicate,
+			description: descriptors[ToolCheckDuplicate].Description,
+			inputSchema: descriptors[ToolCheckDuplicate].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					Content     string `json:"content"`
@@ -118,8 +123,8 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name:        ToolFindTypeUsages,
-			description: "Find every usage site of a named type. Call BEFORE a cross-file rename/refactor to list all sites.",
-			inputSchema: schemaFindTypeUsages,
+			description: descriptors[ToolFindTypeUsages].Description,
+			inputSchema: descriptors[ToolFindTypeUsages].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					TypeName   string `json:"typeName"`
@@ -136,8 +141,8 @@ func (s *Server) buildTools() []*toolDef {
 		},
 		{
 			name:        ToolValidateCrossDeps,
-			description: "Validate monorepo cross-package imports against package.json dependency declarations.",
-			inputSchema: schemaValidateCrossDeps,
+			description: descriptors[ToolValidateCrossDeps].Description,
+			inputSchema: descriptors[ToolValidateCrossDeps].InputSchema,
 			invoke: func(args json.RawMessage) (any, error) {
 				var in struct {
 					Path string `json:"path"`
@@ -150,75 +155,3 @@ func (s *Server) buildTools() []*toolDef {
 		},
 	}
 }
-
-// ── inputSchema definitions (JSON Schema, mirroring the CLI flags) ────────────
-//
-// WS11: these schemas + the tool descriptions above are injected into the
-// model context on every tool load, so they are a fixed per-session token tax.
-// Keep every property description one line, drop schema boilerplate (e.g.
-// "minimum": 0 — the engine already treats <= 0 as "use the default"), and
-// never remove or rename a property: the plumbing executor, the CLI, and the
-// conformance tests pass these names. TestToolSurfaceWeight_Budget enforces
-// the character budget.
-
-var schemaGetRepoMap = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "maxFiles": {"type": "integer", "description": "Max files (0 = default 50)"},
-    "filePatterns": {"type": "array", "items": {"type": "string"}, "description": "Glob filters"}
-  },
-  "additionalProperties": false
-}`)
-
-var schemaSearchSymbols = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "query": {"type": "string"},
-    "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
-    "kinds": {"type": "array", "items": {"type": "string"}, "description": "Symbol kind filter"},
-    "filePattern": {"type": "string", "description": "Glob filter"},
-    "includeDoc": {"type": "boolean", "description": "Full docs (default one-line)"}
-  },
-  "required": ["query"],
-  "additionalProperties": false
-}`)
-
-var schemaSearchCode = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "query": {"type": "string"},
-    "maxResults": {"type": "integer", "description": "Max results (0 = default)"},
-    "language": {"type": "string", "description": "Language filter (go, typescript, ...)"},
-    "includeDoc": {"type": "boolean", "description": "Full docs (default one-line)"}
-  },
-  "required": ["query"],
-  "additionalProperties": false
-}`)
-
-var schemaCheckDuplicate = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "content": {"type": "string", "description": "Inline content"},
-    "contentFile": {"type": "string", "description": "Repo-relative path"},
-    "maxResults": {"type": "integer", "description": "Duplicate sites (0 = top match only)"}
-  },
-  "additionalProperties": false
-}`)
-
-var schemaFindTypeUsages = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "typeName": {"type": "string"},
-    "maxResults": {"type": "integer", "description": "Max results (0 = default)"}
-  },
-  "required": ["typeName"],
-  "additionalProperties": false
-}`)
-
-var schemaValidateCrossDeps = json.RawMessage(`{
-  "type": "object",
-  "properties": {
-    "path": {"type": "string", "description": "Relative path scope"}
-  },
-  "additionalProperties": false
-}`)

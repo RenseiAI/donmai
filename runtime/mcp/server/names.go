@@ -18,12 +18,14 @@
 // outside --root.
 package server
 
+import "github.com/RenseiAI/donmai/internal/codeintelcontract"
+
 // ServerName is the MCP serverInfo.name this server advertises in the
 // initialize handshake. It is frozen: the fully-qualified tool prefix
 // mcp__af-code-intelligence__af_code_* that autonomous agents call (and the
 // agent/types.go MCPToolNames example) is derived from it, so it MUST NOT
 // change without updating every consumer.
-const ServerName = "af-code-intelligence"
+const ServerName = codeintelcontract.ServerName
 
 // serverVersion is the serverInfo.version reported in initialize. The in-repo
 // client ignores it; other consumers (claude/amp CLIs) surface it for
@@ -34,23 +36,16 @@ const serverVersion = "0.1.0"
 // backed 1:1 by a codeintel.NativeRunner method and mirrors the corresponding
 // `donmai code <subcommand>` handler in afcli/code.go.
 const (
-	ToolGetRepoMap        = "af_code_get_repo_map"
-	ToolSearchSymbols     = "af_code_search_symbols"
-	ToolSearchCode        = "af_code_search_code"
-	ToolCheckDuplicate    = "af_code_check_duplicate"
-	ToolFindTypeUsages    = "af_code_find_type_usages"
-	ToolValidateCrossDeps = "af_code_validate_cross_deps"
+	ToolGetRepoMap        = codeintelcontract.ToolGetRepoMap
+	ToolSearchSymbols     = codeintelcontract.ToolSearchSymbols
+	ToolSearchCode        = codeintelcontract.ToolSearchCode
+	ToolCheckDuplicate    = codeintelcontract.ToolCheckDuplicate
+	ToolFindTypeUsages    = codeintelcontract.ToolFindTypeUsages
+	ToolValidateCrossDeps = codeintelcontract.ToolValidateCrossDeps
 )
 
 // allToolNames returns the six tool names in canonical (contract) order. The
 // order is authoritative for tools/list determinism.
 func allToolNames() []string {
-	return []string{
-		ToolGetRepoMap,
-		ToolSearchSymbols,
-		ToolSearchCode,
-		ToolCheckDuplicate,
-		ToolFindTypeUsages,
-		ToolValidateCrossDeps,
-	}
+	return codeintelcontract.Names()
 }

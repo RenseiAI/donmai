@@ -21,27 +21,34 @@ type syntheticParameterBinder struct {
 
 func (b *syntheticParameterBinder) ContractID() string   { return b.contractID }
 func (b *syntheticParameterBinder) SourceDigest() string { return b.sourceDigest }
-func (b *syntheticParameterBinder) Bind(context CapabilityParameterBindingContext) (agent.CapabilityParameterBindingV1, error) {
+func (b *syntheticParameterBinder) Bind(context CapabilityParameterBindingContext) (CapabilityParameterBindResult, error) {
 	b.calls++
+	config, configDigest, err := agent.CanonicalCapabilityRuntimeConfig(json.RawMessage(`{}`))
+	if err != nil {
+		return CapabilityParameterBindResult{}, err
+	}
 	selected := append([]agent.CapabilitySurfaceIdentity(nil), context.Realization.Declaration.Recipe.DeclaredSurface[:1]...)
 	selectedDigest, err := agent.CapabilitySelectedSurfaceDigest(selected)
 	if err != nil {
-		return agent.CapabilityParameterBindingV1{}, err
+		return CapabilityParameterBindResult{}, err
 	}
 	entries := make([]agent.CapabilityBoundEntryV1, len(context.Realization.Declaration.Recipe.Entries))
 	for i, recipeEntry := range context.Realization.Declaration.Recipe.Entries {
 		entryDigest, err := agent.CapabilityEntryParametersDigest(recipeEntry.EntryID, recipeEntry.InputDigest, context.Requirement.ParametersDigest, selectedDigest, context.Requirement.OperationalPayloadDigest)
 		if err != nil {
-			return agent.CapabilityParameterBindingV1{}, err
+			return CapabilityParameterBindResult{}, err
 		}
 		entries[i] = agent.CapabilityBoundEntryV1{EntryID: recipeEntry.EntryID, StaticInputDigest: recipeEntry.InputDigest, EntryParametersDigest: entryDigest}
 	}
-	binding := agent.CapabilityParameterBindingV1{ContractVersion: agent.CapabilityParameterBindingVersionV1, CapabilityID: context.Requirement.CapabilityID, ParameterContractID: b.contractID, ParametersDigest: context.Requirement.ParametersDigest, OperationalPayloadDigest: context.Requirement.OperationalPayloadDigest, StaticRecipeDigest: context.Realization.Declaration.Recipe.RecipeDigest, SelectedSurface: selected, SelectedSurfaceDigest: selectedDigest, Entries: entries}
+	binding := agent.CapabilityParameterBindingV1{ContractVersion: agent.CapabilityParameterBindingVersionV1, CapabilityID: context.Requirement.CapabilityID, ParameterContractID: b.contractID, ParametersDigest: context.Requirement.ParametersDigest, OperationalPayloadDigest: context.Requirement.OperationalPayloadDigest, StaticRecipeDigest: context.Realization.Declaration.Recipe.RecipeDigest, RuntimeConfigDigest: configDigest, SelectedSurface: selected, SelectedSurfaceDigest: selectedDigest, Entries: entries}
 	if b.mutate != nil {
 		b.mutate(&binding)
 	}
 	binding.BindingDigest, err = agent.CapabilityParameterBindingDigest(binding)
-	return binding, err
+	if err != nil {
+		return CapabilityParameterBindResult{}, err
+	}
+	return CapabilityParameterBindResult{Binding: binding, Materialization: agent.CapabilityRuntimeMaterializationV1{ContractVersion: agent.CapabilityRuntimeMaterializationContractVersionV1, CapabilityID: binding.CapabilityID, ParameterContractID: binding.ParameterContractID, BindingDigest: binding.BindingDigest, ConfigDigest: configDigest, Config: config}}, nil
 }
 
 func syntheticParameterizedRegistry(t *testing.T, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) (*agent.CapabilityRealizationRegistry, *syntheticParameterBinder) {
@@ -87,12 +94,12 @@ func TestCapabilityParameterBinderRegistryValidatesBeforeAndAfterBinder(t *testi
 	}
 	requirement := agent.CapabilityParameterRequirementFacts{CapabilityID: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64), OperationalPayloadDigest: operationalDigest}
 	first, err := registry.ResolveAndBind(realizations, requirement, payload, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
-	if err != nil || first.ParameterBinding == nil || binder.calls != 1 {
+	if err != nil || first.Realization.ParameterBinding == nil || binder.calls != 1 {
 		t.Fatalf("first binding=%+v calls=%d err=%v", first, binder.calls, err)
 	}
-	first.ParameterBinding.SelectedSurface[0].ID = "caller-mutated"
+	first.Realization.ParameterBinding.SelectedSurface[0].ID = "caller-mutated"
 	second, err := registry.ResolveAndBind(realizations, requirement, payload, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
-	if err != nil || second.ParameterBinding.SelectedSurface[0].ID != "tool_a" || binder.calls != 2 {
+	if err != nil || second.Realization.ParameterBinding.SelectedSurface[0].ID != "tool_a" || binder.calls != 2 {
 		t.Fatalf("independent binding=%+v calls=%d err=%v", second, binder.calls, err)
 	}
 
@@ -165,7 +172,10 @@ func TestPreparedHarnessUsesProcessOwnedParameterBinder(t *testing.T) {
 	qw.OperationalPayload = operational
 	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
 	selection := harnessSelection{Provider: provider, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt), effectiveCell: exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64)}})}
-	resolver := newParameterBoundCapabilityResolver(realizations, binders)
+	resolver, err := newPreparedCapabilityResolver(realizations, binders)
+	if err != nil {
+		t.Fatal(err)
+	}
 	spec, _, err := buildPreparedSourceSpec(qw, selection, nil, resolver)
 	if err != nil {
 		t.Fatal(err)
@@ -190,7 +200,7 @@ func TestCallerAuthoredParameterBindingIsNotAdmissionAuthority(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	raw, _ := json.Marshal(bound)
+	raw, _ := json.Marshal(bound.Realization)
 	var clone agent.CapabilityRealizationBinding
 	if err := json.Unmarshal(raw, &clone); err != nil {
 		t.Fatal(err)

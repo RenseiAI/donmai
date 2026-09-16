@@ -1612,7 +1612,7 @@ func namedExtensionBinding(t *testing.T, delivery agent.ExtensionDelivery, obser
 	if err != nil {
 		t.Fatal(err)
 	}
-	parameterBinding := agent.CapabilityParameterBindingV1{ContractVersion: agent.CapabilityParameterBindingVersionV1, CapabilityID: declaration.CapabilityID, ParameterContractID: contract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: declaration.Recipe.RecipeDigest, SelectedSurface: surface, SelectedSurfaceDigest: selectedDigest, Entries: []agent.CapabilityBoundEntryV1{{EntryID: entryID, StaticInputDigest: inputDigest, EntryParametersDigest: entryParametersDigest}}}
+	parameterBinding := agent.CapabilityParameterBindingV1{ContractVersion: agent.CapabilityParameterBindingVersionV1, CapabilityID: declaration.CapabilityID, ParameterContractID: contract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: declaration.Recipe.RecipeDigest, RuntimeConfigDigest: strings.Repeat("9", 64), SelectedSurface: surface, SelectedSurfaceDigest: selectedDigest, Entries: []agent.CapabilityBoundEntryV1{{EntryID: entryID, StaticInputDigest: inputDigest, EntryParametersDigest: entryParametersDigest}}}
 	parameterBinding.BindingDigest, err = agent.CapabilityParameterBindingDigest(parameterBinding)
 	if err != nil {
 		t.Fatal(err)

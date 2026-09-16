@@ -13,6 +13,7 @@ import (
 // these out keeps spec_translation pure (no I/O, no platform calls)
 // and makes the loop easy to test in isolation.
 type SpecInputs struct {
+	CodeIntelDeliveryRoute codeIntelDeliveryRoute
 	// Cwd is the worktree path the worktree manager just provisioned.
 	Cwd string
 
@@ -163,7 +164,7 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// autonomous agents may call them without a permission prompt. Gated on the
 	// The exact harness adapter, not a coupled boolean pair, now decides whether
 	// these names can be enforced. Unsupported names remain present and deny.
-	if qw.CodeIntel != nil {
+	if qw.CodeIntel != nil && in.CodeIntelDeliveryRoute != codeIntelDeliveryNative {
 		spec.MCPToolNames = codeIntelFQToolNames(qw.CodeIntel)
 	}
 

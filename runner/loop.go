@@ -114,19 +114,25 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 	var preparedPlan *agent.PreparedHarness
 	var preparedSource agent.Spec
+	codeIntelDelivery := codeIntelDeliverySelection{Route: codeIntelDeliveryLegacy}
 	if len(selection.receipt.Bytes()) > 0 {
 		preparedPlan, err = preparedHarnessFromWork(qw)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
-		preparedSource, _, err = buildPreparedSourceSpec(qw, selection, r.additionalExtensionDecorator, r.capabilityRealizations)
+		preparedSource, _, err = buildPreparedSourceSpec(qw, selection, r.additionalExtensionDecorator, r.preparedCapabilities)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
 		preparedSource = ReconcileRepositorySandbox(preparedSource, repositoryDeclaration)
 		preparedSource.PreparedHarness = preparedPlan
+		codeIntelDelivery, err = codeIntelRouteFromSpec(qw.CodeIntel, preparedSource)
+		if err != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+			return res, err
+		}
 		harness, ok := provider.(agent.HarnessProvider)
 		if !ok {
 			err = errors.New("runner: selected provider has no exact harness manifest")
@@ -480,7 +486,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
-	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell))
+	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), codeIntelDelivery.Route)
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
@@ -612,7 +618,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// composed system prompt — FQ MCP tool names for MCP-capable providers,
 	// Bash-CLI fallback guidance for providers that ignore MCP specs. Strict
 	// no-op when the block is absent (byte-identical prompt to today).
-	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, caps, qw.CodeIntel)
+	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
@@ -663,16 +669,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// 6. Translate to agent.Spec.
 	composedEnv := envToMap(r.envc.Compose(hostEnv(), agent.Spec{Env: specEnv}))
 	spec := translateSpec(qw, caps, SpecInputs{
-		Cwd:                wpath,
-		Prompt:             userPrompt,
-		SystemPromptAppend: systemPrompt,
-		PromptPlan:         promptPlan,
-		InitialContext:     composition.InitialContext,
-		MCPServers:         mcpServers,
-		Env:                composedEnv,
-		Autonomous:         true,
-		Logger:             r.logger,
-		ProviderName:       string(provider.Name()),
+		CodeIntelDeliveryRoute: codeIntelDelivery.Route,
+		Cwd:                    wpath,
+		Prompt:                 userPrompt,
+		SystemPromptAppend:     systemPrompt,
+		PromptPlan:             promptPlan,
+		InitialContext:         composition.InitialContext,
+		MCPServers:             mcpServers,
+		Env:                    composedEnv,
+		Autonomous:             true,
+		Logger:                 r.logger,
+		ProviderName:           string(provider.Name()),
 	})
 	// Apply Kit skill + agent-card inline-skill tool disallow rules
 	// (subtractive: skills may only narrow the tool surface, never widen
@@ -2363,7 +2370,7 @@ func logMCPGatewayBearerExpiry(logger *slog.Logger, qw QueuedWork, servers []age
 // (loop.go step 2) and MUST be passed explicitly — the caller builds this list
 // AFTER Provision so wpath exists. This function is the single place the runner
 // extends MCP defaults.
-func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode) []agent.MCPServerConfig {
+func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode, routes ...codeIntelDeliveryRoute) []agent.MCPServerConfig {
 	var servers []agent.MCPServerConfig
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
@@ -2379,7 +2386,11 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 	// coupling — so it is emitted whenever the capability block is present,
 	// including standalone-mode sessions. When the block is nil this is a no-op
 	// and the output is byte-identical to the pre-code-intel path.
-	if qw.CodeIntel != nil {
+	route := codeIntelDeliveryLegacy
+	if len(routes) > 0 {
+		route = routes[0]
+	}
+	if qw.CodeIntel != nil && route != codeIntelDeliveryNative {
 		servers = append(servers, codeIntelMCPEntry(wpath, qw.CodeIntel))
 	}
 

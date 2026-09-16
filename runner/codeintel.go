@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/codeintelcontract"
 	"github.com/RenseiAI/donmai/prompt"
 )
 
@@ -61,32 +62,32 @@ type codeIntelToolMeta struct {
 // type", "Record<") that told non-TS agents a tool was inapplicable.
 var codeIntelTools = []codeIntelToolMeta{
 	{
-		tool:       "af_code_get_repo_map",
+		tool:       codeintelcontract.ToolGetRepoMap,
 		subcommand: "get-repo-map",
 		guidance:   "when orienting in an unfamiliar repo or subsystem, call this FIRST: it ranks files by import centrality with their key symbols",
 	},
 	{
-		tool:       "af_code_search_symbols",
+		tool:       codeintelcontract.ToolSearchSymbols,
 		subcommand: "search-symbols <query>",
 		guidance:   "find where a function, method, or type is defined when you only know (part of) its name",
 	},
 	{
-		tool:       "af_code_search_code",
+		tool:       codeintelcontract.ToolSearchCode,
 		subcommand: "search-code <query>",
 		guidance:   "search code content by keyword or concept when the exact identifier is unknown",
 	},
 	{
-		tool:       "af_code_check_duplicate",
+		tool:       codeintelcontract.ToolCheckDuplicate,
 		subcommand: "check-duplicate --content <snippet>",
 		guidance:   "before writing new code, check whether an equivalent snippet already exists (exact or near-duplicate)",
 	},
 	{
-		tool:       "af_code_find_type_usages",
+		tool:       codeintelcontract.ToolFindTypeUsages,
 		subcommand: "find-type-usages <TypeName>",
 		guidance:   "before any cross-file rename or refactor, enumerate every usage site of the type and work from that list",
 	},
 	{
-		tool:       "af_code_validate_cross_deps",
+		tool:       codeintelcontract.ToolValidateCrossDeps,
 		subcommand: "validate-cross-deps",
 		guidance:   "check that cross-package imports have matching package.json dependency declarations",
 	},
@@ -224,12 +225,21 @@ func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerCon
 //
 // No enforcement/lockout (deferred per Q7): the partial only advertises the
 // tools; it never redirects Grep/Glob.
-func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork) string {
+func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, routes ...codeIntelDeliveryRoute) string {
 	if ci == nil {
 		return systemPrompt
 	}
-	mcpCapable := caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec
-	partial := codeIntelUsagePartial(mcpCapable, ci)
+	route := codeIntelDeliveryLegacy
+	if len(routes) > 0 {
+		route = routes[0]
+	}
+	var partial string
+	if route == codeIntelDeliveryNative {
+		partial = codeIntelNativeUsagePartial(ci)
+	} else {
+		mcpCapable := route == codeIntelDeliveryMCP || caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec
+		partial = codeIntelUsagePartial(mcpCapable, ci)
+	}
 	if partial == "" {
 		return systemPrompt
 	}
@@ -237,6 +247,50 @@ func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *pr
 		return partial
 	}
 	return systemPrompt + "\n\n" + partial
+}
+
+func injectCodeIntelPartialForDelivery(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, selection codeIntelDeliverySelection) string {
+	if selection.Route != codeIntelDeliveryNative {
+		return injectCodeIntelPartial(systemPrompt, caps, ci, selection.Route)
+	}
+	partial := codeIntelNativeUsagePartial(ci, selection.Tools)
+	if partial == "" {
+		return systemPrompt
+	}
+	if strings.TrimSpace(systemPrompt) == "" {
+		return partial
+	}
+	return systemPrompt + "\n\n" + partial
+}
+
+func codeIntelNativeUsagePartial(ci *prompt.CodeIntelWork, selected ...[]string) string {
+	tools := effectiveCodeIntelTools(ci)
+	if len(selected) > 0 {
+		allowed := map[string]bool{}
+		for _, name := range selected[0] {
+			allowed[name] = true
+		}
+		filtered := tools[:0]
+		for _, tool := range codeIntelTools {
+			if allowed[tool.tool] {
+				filtered = append(filtered, tool)
+			}
+		}
+		tools = filtered
+	}
+	if len(tools) == 0 {
+		return ""
+	}
+	var b strings.Builder
+	b.WriteString("# Code Intelligence\n\nThis session has native code-intelligence tools available. Each is built for a job where grep+read is weak; use them in exactly these situations:\n")
+	for _, tm := range tools {
+		b.WriteString("\n- ")
+		b.WriteString(tm.tool)
+		b.WriteString(" — ")
+		b.WriteString(tm.guidance)
+	}
+	b.WriteString("\n\nFor an exact single-identifier lookup, plain grep is fine — do not add a tool call.")
+	return b.String()
 }
 
 // codeIntelUsagePartial renders the code-intel usage block for the resolved

@@ -67,13 +67,18 @@ func TestSpecFieldCoverage(t *testing.T) {
 		"CodeIntelEnforcement",
 		"ProviderConfig",
 		"SubAgentProvider",
-		"OnProcessSpawned",       // documented as honored at spawn time
-		"PromptMode",             // selects the exact profile before NewSpawnPlan
-		"PreparedHarness",        // consumed as sole authority by agent.PrepareHarness
-		"PromptPlan",             // consumed by agent.PreparePrompt before NewSpawnPlan
-		"PromptReceipt",          // populated by agent.PreparePrompt; not a JSON-RPC param
-		"OnPromptAdapted",        // invoked by agent.PreparePrompt before NewSpawnPlan
-		"ToolLifecyclePlan",      // consumed by agent.PrepareHarness before NewSpawnPlan
+		"OnProcessSpawned",  // documented as honored at spawn time
+		"PromptMode",        // selects the exact profile before NewSpawnPlan
+		"PreparedHarness",   // consumed as sole authority by agent.PrepareHarness
+		"PromptPlan",        // consumed by agent.PreparePrompt before NewSpawnPlan
+		"PromptReceipt",     // populated by agent.PreparePrompt; not a JSON-RPC param
+		"OnPromptAdapted",   // invoked by agent.PreparePrompt before NewSpawnPlan
+		"ToolLifecyclePlan", // consumed by agent.PrepareHarness before NewSpawnPlan
+		// CapabilityRuntimeMaterializations are process-only runner authority.
+		// The runner validates and consumes them while selecting the exact
+		// delivery route before provider translation; Codex must not project
+		// their private runtime configuration onto app-server JSON-RPC params.
+		"CapabilityRuntimeMaterializations",
 		"ToolLifecycleReceipt",   // populated by agent.PrepareHarness; not a JSON-RPC param
 		"OnToolLifecycleAdapted", // invoked before provider side effects
 		// Endpoint is the additive two-axis model-endpoint binding. The claude
@@ -131,6 +136,32 @@ func TestSpecFieldCoverage(t *testing.T) {
 
 	if !reflect.DeepEqual(all, allFields) {
 		t.Fatalf("spec field coverage mismatch:\nall=%v\nrecorded=%v", allFields, all)
+	}
+}
+
+func TestNewSpawnPlan_CapabilityRuntimeMaterializationsStayProcessOnly(t *testing.T) {
+	t.Parallel()
+
+	base := agent.Spec{Prompt: "do work", Cwd: "/tmp/wt"}
+	withMaterialization := base
+	withMaterialization.CapabilityRuntimeMaterializations = []agent.CapabilityRuntimeMaterializationV1{{
+		ContractVersion: agent.CapabilityRuntimeMaterializationContractVersionV1,
+		CapabilityID:    "example/runtime/v1",
+		Config:          json.RawMessage(`{"private":"runtime-config"}`),
+	}}
+
+	want := NewSpawnPlan(base)
+	got := NewSpawnPlan(withMaterialization)
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("process-only materialization changed codex JSON-RPC spawn plan:\nwant=%#v\ngot=%#v", want, got)
+	}
+
+	wire, err := json.Marshal(got)
+	if err != nil {
+		t.Fatalf("marshal spawn plan: %v", err)
+	}
+	if strings.Contains(string(wire), "runtime-config") || strings.Contains(string(wire), "example/runtime/v1") {
+		t.Fatalf("process-only materialization leaked into codex spawn plan: %s", wire)
 	}
 }
 

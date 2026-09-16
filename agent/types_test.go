@@ -7,6 +7,35 @@ import (
 	"testing"
 )
 
+func TestSpecCarriesProcessOnlyCapabilityMaterializations(t *testing.T) {
+	field, ok := reflect.TypeOf(Spec{}).FieldByName("CapabilityRuntimeMaterializations")
+	if !ok {
+		t.Fatal("Spec omits process-only capability materializations")
+	}
+	if got := field.Tag.Get("json"); got != "-" {
+		t.Fatalf("CapabilityRuntimeMaterializations json tag = %q, want -", got)
+	}
+	bindingField, ok := reflect.TypeOf(CapabilityParameterBindingV1{}).FieldByName("RuntimeConfigDigest")
+	if !ok || bindingField.Tag.Get("json") != "runtimeConfigDigest" {
+		t.Fatalf("parameter binding runtime config digest field = %+v, present=%v", bindingField, ok)
+	}
+	spec := Spec{CapabilityRuntimeMaterializations: []CapabilityRuntimeMaterializationV1{{ContractVersion: CapabilityRuntimeMaterializationContractVersionV1, CapabilityID: "example/v1", Config: json.RawMessage(`{}`)}}}
+	raw, err := json.Marshal(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), "CapabilityRuntime") || strings.Contains(string(raw), "capabilityRuntime") || strings.Contains(string(raw), "example/v1") {
+		t.Fatalf("process-only materialization reached Spec JSON: %s", raw)
+	}
+	var decoded Spec
+	if err := json.Unmarshal([]byte(`{"capabilityRuntimeMaterializations":[{"capabilityId":"forged"}]}`), &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if len(decoded.CapabilityRuntimeMaterializations) != 0 {
+		t.Fatal("JSON populated process-only materialization")
+	}
+}
+
 // TestSpec_RoundTrip verifies a Spec round-trips through JSON without
 // data loss and that camelCase JSON tags are preserved on the wire.
 func TestSpec_RoundTrip(t *testing.T) {
