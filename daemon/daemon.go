@@ -2132,9 +2132,10 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				hostReceipt.PlacementID != binding.PlacementID || hostReceipt.ClaimID != binding.ClaimID {
 				return nil, errors.New("execution adaptation receipt does not match daemon runtime binding")
 			}
-			if replayedReceipt && hostReceipt.Decision == "denied" {
+			switch {
+			case replayedReceipt && hostReceipt.Decision == "denied":
 				preflightErr = retainedPermanentDenial(detail, binding, receipt, operationalDigest)
-			} else if replayedReceipt {
+			case replayedReceipt:
 				validator, ok := d.opts.ProviderRegistry.(ExecutionPreflightReplayValidator)
 				if !ok {
 					return nil, errors.New("runtime binding v2 retained receipt requires canonical replay validation")
@@ -2142,7 +2143,7 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if validationErr := validator.ValidateRetainedExecution(detailJSON, receipt); validationErr != nil {
 					return nil, fmt.Errorf("validate retained execution adaptation: %w", validationErr)
 				}
-			} else if preflightErr != nil {
+			case preflightErr != nil:
 				if candidate := freshPermanentDenialCandidate(detail, binding, receipt, operationalDigest, preflightErr); candidate != nil {
 					preflightErr = candidate
 				}
