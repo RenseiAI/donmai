@@ -453,13 +453,13 @@ func newNativeCodeIntelPolicy(spec agent.Spec, selected []string) (*nativeCodeIn
 		allowed:      make(map[string]bool),
 		disallowed:   make(map[string]bool),
 		hasAllowGate: len(spec.AllowedTools) > 0 || spec.PermissionConfig != nil && len(spec.PermissionConfig.AllowPatterns) > 0,
-		defaultAllow: spec.PermissionConfig != nil && strings.EqualFold(strings.TrimSpace(spec.PermissionConfig.DefaultDecision), "allow"),
+		defaultAllow: spec.PermissionConfig != nil && strings.EqualFold(spec.PermissionConfig.DefaultDecision, "allow"),
 	}
 	if len(selected) == 0 {
 		return nil, fmt.Errorf("native code-intelligence selected set is empty")
 	}
 	if spec.PermissionConfig != nil {
-		switch strings.ToLower(strings.TrimSpace(spec.PermissionConfig.DefaultDecision)) {
+		switch strings.ToLower(spec.PermissionConfig.DefaultDecision) {
 		case "", "allow", "deny", "prompt", "ask":
 		default:
 			return nil, fmt.Errorf("native code-intelligence default decision is invalid")

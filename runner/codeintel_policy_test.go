@@ -37,6 +37,14 @@ func TestTranslateSpecForCodeIntelDeliveryProjectsDefaultOrExplicitAuthority(t *
 	}
 }
 
+func TestTranslateSpecForCodeIntelDeliveryRejectsNoncanonicalSelectionOrder(t *testing.T) {
+	t.Parallel()
+	selection := codeIntelDeliverySelection{Route: codeIntelDeliveryNative, Tools: []string{codeintelcontract.ToolSearchSymbols, codeintelcontract.ToolGetRepoMap}}
+	if _, err := translateSpecForCodeIntelDelivery(QueuedWork{}, agent.Capabilities{AcceptsAllowedToolsList: true}, SpecInputs{Autonomous: true}, selection, nil); err == nil {
+		t.Fatal("reversed selected surface was silently reordered")
+	}
+}
+
 func TestTranslateSpecForCodeIntelDeliveryNormalizesAliasesAndRejectsTypos(t *testing.T) {
 	t.Parallel()
 	caps := agent.Capabilities{AcceptsAllowedToolsList: true}

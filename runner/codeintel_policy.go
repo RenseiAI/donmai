@@ -44,12 +44,14 @@ func selectedNativePolicyTools(tools []string) ([]string, error) {
 		return nil, fmt.Errorf("selected native tool set is empty")
 	}
 	selected := make(map[string]bool, len(tools))
+	previous := ""
 	for _, tool := range tools {
 		match, err := codeintelcontract.NormalizePolicyIdentity(tool)
-		if err != nil || !match.Related || match.Canonical != tool || selected[tool] {
+		if err != nil || !match.Related || match.Canonical != tool || selected[tool] || tool <= previous {
 			return nil, fmt.Errorf("selected native tool set is invalid")
 		}
 		selected[tool] = true
+		previous = tool
 	}
 	out := make([]string, 0, len(selected))
 	for _, name := range codeintelcontract.Names() {

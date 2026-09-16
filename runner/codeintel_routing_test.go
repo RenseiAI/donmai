@@ -304,6 +304,43 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	}
 }
 
+func TestPreparedSourceRejectsMalformedNativePolicyBeforeSpec(t *testing.T) {
+	manifest := codexManifestForTest()
+	for i := range manifest.ToolLifecycle {
+		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
+			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
+			manifest.ToolLifecycle[i].NamedExtensionEntries = true
+		}
+	}
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{codeintelcontract.ToolGetRepoMap})
+	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	binders, _ := NewCapabilityParameterBinderRegistry(binder)
+	resolver, err := newPreparedCapabilityResolver(realizations, binders)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw := exactReceiptQueuedWork("native-malformed-policy")
+	qw.Body = "exercise malformed native policy"
+	qw.CodeIntel = &prompt.CodeIntelWork{Tools: []string{codeintelcontract.ToolGetRepoMap}}
+	qw.AllowedTools = []string{"mcp__wrong-server__" + codeintelcontract.ToolGetRepoMap}
+	operational, _ := CanonicalOperationalPayload(qw)
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(operational, &fields)
+	parametersDigest, _ := executioncell.DigestCapabilityParameters(fields["codeIntel"])
+	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.code-intelligence/v1", ParametersDigest: parametersDigest}})
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+	qw.OperationalPayload = operational
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
+	selection := harnessSelection{Provider: provider, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt), effectiveCell: cell}
+	if _, _, err := buildPreparedSourceSpec(qw, selection, nil, resolver); err == nil || !strings.Contains(err.Error(), "project native code-intelligence") {
+		t.Fatalf("malformed native policy error=%v", err)
+	}
+}
+
 func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	manifest := codexManifestForTest()
 	for i := range manifest.ToolLifecycle {

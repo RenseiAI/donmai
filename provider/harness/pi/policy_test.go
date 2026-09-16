@@ -323,4 +323,11 @@ func TestNativeCodeIntelPolicyAliasesDenyPrecedenceAndRegexValidation(t *testing
 			t.Errorf("default decision %q granted native call", defaultDecision)
 		}
 	}
+	if _, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: " allow "}}, selected); err == nil {
+		t.Fatal("whitespace-padded default allow was accepted")
+	}
+	upper, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "ALLOW"}}, selected)
+	if err != nil || !upper.Evaluate("af_code_get_repo_map").Allow {
+		t.Fatalf("case-insensitive exact default allow failed: policy=%v err=%v", upper, err)
+	}
 }
