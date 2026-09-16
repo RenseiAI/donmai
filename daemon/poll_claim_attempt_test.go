@@ -108,6 +108,99 @@ func decodeClaimAttemptBody(t *testing.T, raw json.RawMessage) map[string]any {
 	return value
 }
 
+func TestPollNackContracts_BindsOnlyOriginalItemsAndNeverSerializes(t *testing.T) {
+	body := strings.TrimSuffix(claimAttemptPollBody("session-proof", claimAttemptTokenOne), "}") +
+		`,"nackContracts":["pre-spawn-permanent-denial/v1"]}`
+	var response PollResponse
+	if err := json.Unmarshal([]byte(body), &response); err != nil {
+		t.Fatal(err)
+	}
+	if len(response.Work) != 1 || !response.Work[0].preSpawnPermanentDenialV1 {
+		t.Fatalf("work negotiation = %+v, want exact response item enabled", response.Work)
+	}
+	copyOfItem := response.Work[0]
+	if !copyOfItem.preSpawnPermanentDenialV1 {
+		t.Fatal("copied original item lost process-local negotiation")
+	}
+	marshaled, err := json.Marshal(copyOfItem)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(marshaled), "nackContracts") ||
+		strings.Contains(string(marshaled), "pre-spawn-permanent-denial") {
+		t.Fatalf("negotiation leaked into work JSON: %s", marshaled)
+	}
+	detail := PollItemToSessionDetail(copyOfItem, nil, "https://example.test", "runtime", "worker")
+	if strings.Contains(string(detail.OperationalPayload), "nackContracts") ||
+		strings.Contains(string(detail.OperationalPayload), "pre-spawn-permanent-denial") {
+		t.Fatalf("negotiation leaked into operational payload: %s", detail.OperationalPayload)
+	}
+
+	var later PollResponse
+	if err := json.Unmarshal([]byte(claimAttemptPollBody("later", claimAttemptTokenTwo)), &later); err != nil {
+		t.Fatal(err)
+	}
+	if len(later.Work) != 1 || later.Work[0].preSpawnPermanentDenialV1 {
+		t.Fatal("negotiation leaked globally into a later response")
+	}
+	var siblings PollResponse
+	if err := json.Unmarshal([]byte(`{
+		"work":[
+			{"sessionId":"a","issueId":"i-a","issueIdentifier":"T-1","priority":1,"queuedAt":1},
+			{"sessionId":"b","issueId":"i-b","issueIdentifier":"T-2","priority":1,"queuedAt":2}
+		],
+		"nackContracts":["pre-spawn-permanent-denial/v1"]
+	}`), &siblings); err != nil {
+		t.Fatal(err)
+	}
+	if len(siblings.Work) != 2 || !siblings.Work[0].preSpawnPermanentDenialV1 ||
+		!siblings.Work[1].preSpawnPermanentDenialV1 {
+		t.Fatalf("per-item sibling negotiation = %+v", siblings.Work)
+	}
+}
+
+func TestPollNackContracts_InvalidNegotiationNeverBindsOrBlocksWork(t *testing.T) {
+	known := `"pre-spawn-permanent-denial/v1"`
+	unknowns := make([]string, 9)
+	for index := range unknowns {
+		unknowns[index] = fmt.Sprintf(`"unknown-%d"`, index)
+	}
+	tests := []struct {
+		name      string
+		contracts string
+		extra     string
+	}{
+		{name: "missing"},
+		{name: "null", contracts: `null`},
+		{name: "wrong type", contracts: `{}`},
+		{name: "unknown only", contracts: `["unknown/v1"]`},
+		{name: "duplicate known", contracts: `[` + known + `,` + known + `]`},
+		{name: "too many", contracts: `[` + strings.Join(unknowns, ",") + `]`},
+		{name: "empty", contracts: `[""]`},
+		{name: "oversized", contracts: `["` + strings.Repeat("a", 129) + `"]`},
+		{name: "duplicate member", contracts: `[` + known + `]`, extra: `,"nackContracts":[` + known + `]`},
+	}
+	work := `{"sessionId":"s","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1}`
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			member := ""
+			if tc.contracts != "" {
+				member = `,"nackContracts":` + tc.contracts
+			}
+			var response PollResponse
+			if err := json.Unmarshal([]byte(`{"work":[`+work+`]`+member+tc.extra+`}`), &response); err != nil {
+				t.Fatalf("ordinary work was blocked: %v", err)
+			}
+			if len(response.Work) != 1 {
+				t.Fatalf("work len = %d, want 1", len(response.Work))
+			}
+			if response.Work[0].preSpawnPermanentDenialV1 {
+				t.Fatal("invalid negotiation enabled permanent report")
+			}
+		})
+	}
+}
+
 func TestPollClaimAttempt_ActualHTTPRoundTripOutsideWork(t *testing.T) {
 	fixture := newClaimAttemptHTTPFixture(t, claimAttemptPollBody("session-proof", claimAttemptTokenOne))
 	var marshaledItem []byte
