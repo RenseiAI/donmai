@@ -30,7 +30,7 @@ import { fileURLToPath } from "node:url";
 
 const MARKER = %q;
 const TOKEN = process.env.DONMAI_PI_HANDSHAKE ?? "";
-const DESCRIPTORS = %s;
+const DESCRIPTORS = JSON.parse(%q);
 const byName = new Map(DESCRIPTORS.map((d) => [d.name, d]));
 const canonical = (v) => Array.isArray(v) ? "[" + v.map(canonical).join(",") + "]" : v && typeof v === "object" ? "{" + Object.keys(v).sort().map((k) => JSON.stringify(k) + ":" + canonical(v[k])).join(",") + "}" : JSON.stringify(v);
 const digest = (v) => createHash("sha256").update(canonical(v)).digest("hex");
@@ -59,7 +59,7 @@ export default function activate(pi: ExtensionAPI) {
     await ctx.ui.input(JSON.stringify(inventory), MARKER);
   })(); });
 }
-`, ExtensionMarker, raw, ExtensionContractVersion, KindBind, DeliveryID, BindResponseVersion, ExtensionContractVersion, KindCall, ExtensionContractVersion, KindInventory))
+`, ExtensionMarker, string(raw), ExtensionContractVersion, KindBind, DeliveryID, BindResponseVersion, ExtensionContractVersion, KindCall, ExtensionContractVersion, KindInventory))
 }
 
 // Delivery returns an independent copy of the fixed required Pi extension.
