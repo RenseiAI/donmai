@@ -9,11 +9,13 @@ import (
 	"io"
 	"os"
 	"path/filepath"
+	"reflect"
 	"sort"
 	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 type operationalPreflightConfigSource struct {
@@ -260,6 +262,76 @@ func hostReceiptWithConfigMaterializations(receipt json.RawMessage, materializat
 		return nil, err
 	}
 	return raw, nil
+}
+
+func hostReceiptWithProtectedRuntimeMCPConfigs(receipt json.RawMessage, materializations []executioncell.ProtectedRuntimeMCPConfigMaterializationV1) (json.RawMessage, error) {
+	decoded, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		return nil, err
+	}
+	if (decoded.ContractVersion != executioncell.HostAdaptationContractVersion && decoded.ContractVersion != executioncell.HostAdaptationV2ContractVersion) || decoded.Decision != "ready" {
+		return nil, errors.New("protected runtime MCP config requires one ready host-adaptation/v1 or v2 source")
+	}
+	decoded.ContractVersion = executioncell.HostAdaptationV3ContractVersion
+	decoded.ProtectedRuntimeMCPConfigs = materializations
+	raw, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := executioncell.DecodeHostAdaptationReceipt(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
+func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, error) {
+	if len(requirements) == 0 {
+		return nil, nil
+	}
+	if detail == nil || !sort.SliceIsSorted(requirements, func(i, j int) bool { return requirements[i].RequirementID < requirements[j].RequirementID }) {
+		return nil, errors.New("protected runtime MCP config requirements are invalid")
+	}
+	operationalDigest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		return nil, fmt.Errorf("digest protected runtime MCP operational source: %w", err)
+	}
+	if detail.SessionID == "" || detail.PlatformURL == "" || detail.McpAuthToken == "" || strings.TrimSpace(detail.McpAuthToken) != detail.McpAuthToken {
+		return nil, errors.New("protected runtime MCP gateway configuration is unavailable")
+	}
+	endpointDigest := digestConfigValue(strings.TrimRight(detail.PlatformURL, "/") + "/api/mcp/" + detail.SessionID)
+	headers := []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken)}}
+	serverName := statehome.Brand() + "-platform"
+	materializations := make([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, 0, len(requirements))
+	for i, requirement := range requirements {
+		if i > 0 && requirements[i-1].RequirementID == requirement.RequirementID {
+			return nil, errors.New("duplicate protected runtime MCP config requirement")
+		}
+		if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirement(requirement); err != nil {
+			return nil, err
+		}
+		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != serverName ||
+			requirement.Transport != executioncell.ProtectedRuntimeMCPTransportHTTP || requirement.EndpointDigest != endpointDigest ||
+			!reflect.DeepEqual(requirement.Headers, headers) {
+			return nil, errors.New("protected runtime MCP config requirement differs from current runtime authority")
+		}
+		materialization := executioncell.ProtectedRuntimeMCPConfigMaterializationV1{
+			ContractVersion: requirement.ContractVersion, RequirementID: requirement.RequirementID,
+			AuthorityBindingDigest:   requirement.AuthorityBindingDigest,
+			OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+			ServerName:               requirement.ServerName, Transport: requirement.Transport,
+			EndpointDigest: requirement.EndpointDigest,
+			Headers:        append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...),
+		}
+		materialization.ConfigReferenceDigest, err = executioncell.DigestProtectedRuntimeMCPConfigReference(materialization)
+		if err != nil {
+			return nil, err
+		}
+		if err := executioncell.ValidateProtectedRuntimeMCPConfigMaterialization(materialization); err != nil {
+			return nil, err
+		}
+		materializations = append(materializations, materialization)
+	}
+	return materializations, nil
 }
 
 func materializeExecutionPreflightConfig(spec *SessionSpec, detail *SessionDetail, requirements []executioncell.PreflightConfigRequirementV1, dir string) ([]executioncell.PreflightConfigMaterializationV1, preflightConfigLease, error) {

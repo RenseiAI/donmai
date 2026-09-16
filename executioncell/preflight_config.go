@@ -20,11 +20,50 @@ const (
 	PreflightConfigSessionIDTarget                = "DONMAI_SESSION_ID"
 	PreflightConfigSessionMCPBearerFileTarget     = "MCP_GATEWAY_TOKEN_FILE" //nolint:gosec // G101: public environment name, never credential bytes.
 	PreflightConfigPrivateFileMode                = "0600"
+	// ProtectedRuntimeMCPConfigContractVersion identifies both the requirement
+	// and the digest-only materialization for one protected HTTP MCP server.
+	ProtectedRuntimeMCPConfigContractVersion = "execution-preflight-protected-mcp-config/v1"
+	ProtectedRuntimeMCPTransportHTTP         = "http"
 )
+
+// ProtectedRuntimeMCPHeaderV1 binds one HTTP header name to the digest of its
+// exact runtime value. The value itself never enters the receipt.
+type ProtectedRuntimeMCPHeaderV1 struct {
+	Name        string `json:"name"`
+	ValueDigest string `json:"valueDigest"`
+}
+
+// ProtectedRuntimeMCPConfigRequirementV1 commits the protected server that a
+// selected capability expects the daemon to materialize for the child.
+type ProtectedRuntimeMCPConfigRequirementV1 struct {
+	ContractVersion          string                        `json:"contractVersion"`
+	RequirementID            string                        `json:"requirementId"`
+	AuthorityBindingDigest   string                        `json:"authorityBindingDigest"`
+	OperationalPayloadDigest string                        `json:"operationalPayloadDigest"`
+	ServerName               string                        `json:"serverName"`
+	Transport                string                        `json:"transport"`
+	EndpointDigest           string                        `json:"endpointDigest"`
+	Headers                  []ProtectedRuntimeMCPHeaderV1 `json:"headers"`
+}
+
+// ProtectedRuntimeMCPConfigMaterializationV1 is the daemon's digest-only
+// evidence that it re-derived the exact required runtime server configuration.
+type ProtectedRuntimeMCPConfigMaterializationV1 struct {
+	ContractVersion          string                        `json:"contractVersion"`
+	RequirementID            string                        `json:"requirementId"`
+	AuthorityBindingDigest   string                        `json:"authorityBindingDigest"`
+	OperationalPayloadDigest string                        `json:"operationalPayloadDigest"`
+	ServerName               string                        `json:"serverName"`
+	Transport                string                        `json:"transport"`
+	EndpointDigest           string                        `json:"endpointDigest"`
+	Headers                  []ProtectedRuntimeMCPHeaderV1 `json:"headers"`
+	ConfigReferenceDigest    string                        `json:"configReferenceDigest"`
+}
 
 var (
 	preflightEnvironmentName = regexp.MustCompile(`^[A-Z_][A-Z0-9_]{0,127}$`)
 	preflightRequirementID   = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9_.:/-]{0,255}$`)
+	protectedMCPHeaderName   = regexp.MustCompile(`^[A-Za-z][A-Za-z0-9-]{0,127}$`)
 )
 
 // PreflightConfigBindingSourceV1 selects one daemon-owned common-config source.
@@ -177,6 +216,90 @@ func ValidatePreflightConfigMaterializations(values []PreflightConfigMaterializa
 			return errors.New("executioncell: duplicate preflight config materialization")
 		}
 		if err := ValidatePreflightConfigMaterialization(values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
+func validateProtectedRuntimeMCPConfig(
+	contractVersion, requirementID, authorityDigest, operationalDigest, serverName, transport, endpointDigest string,
+	headers []ProtectedRuntimeMCPHeaderV1,
+) error {
+	if contractVersion != ProtectedRuntimeMCPConfigContractVersion || !preflightRequirementID.MatchString(requirementID) {
+		return errors.New("executioncell: invalid protected runtime MCP config identity")
+	}
+	if !validSHA256(authorityDigest) || !validSHA256(operationalDigest) || !validSHA256(endpointDigest) {
+		return errors.New("executioncell: protected runtime MCP config digests are required")
+	}
+	if !validRuntimeRef(serverName) || transport != ProtectedRuntimeMCPTransportHTTP || len(headers) == 0 {
+		return errors.New("executioncell: protected runtime MCP server is invalid")
+	}
+	for i, header := range headers {
+		if !protectedMCPHeaderName.MatchString(header.Name) || !validSHA256(header.ValueDigest) {
+			return errors.New("executioncell: protected runtime MCP header is invalid")
+		}
+		if i > 0 && headers[i-1].Name >= header.Name {
+			return errors.New("executioncell: protected runtime MCP headers must be unique and sorted")
+		}
+	}
+	return nil
+}
+
+// ValidateProtectedRuntimeMCPConfigRequirement validates the closed protected
+// HTTP MCP requirement without accepting raw endpoint or header values.
+func ValidateProtectedRuntimeMCPConfigRequirement(value ProtectedRuntimeMCPConfigRequirementV1) error {
+	return validateProtectedRuntimeMCPConfig(
+		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
+		value.OperationalPayloadDigest, value.ServerName, value.Transport,
+		value.EndpointDigest, value.Headers,
+	)
+}
+
+// DigestProtectedRuntimeMCPConfigReference binds every materialization field
+// except the digest itself.
+func DigestProtectedRuntimeMCPConfigReference(value ProtectedRuntimeMCPConfigMaterializationV1) (string, error) {
+	projection := value
+	projection.ConfigReferenceDigest = ""
+	raw, err := CanonicalJSON(projection)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ValidateProtectedRuntimeMCPConfigMaterialization validates one digest-only
+// protected server materialization.
+func ValidateProtectedRuntimeMCPConfigMaterialization(value ProtectedRuntimeMCPConfigMaterializationV1) error {
+	if err := validateProtectedRuntimeMCPConfig(
+		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
+		value.OperationalPayloadDigest, value.ServerName, value.Transport,
+		value.EndpointDigest, value.Headers,
+	); err != nil {
+		return err
+	}
+	expected, err := DigestProtectedRuntimeMCPConfigReference(value)
+	if err != nil || value.ConfigReferenceDigest != expected {
+		return errors.New("executioncell: protected runtime MCP config reference digest mismatch")
+	}
+	return nil
+}
+
+// ValidateProtectedRuntimeMCPConfigMaterializations validates non-empty,
+// unique requirement ordering.
+func ValidateProtectedRuntimeMCPConfigMaterializations(values []ProtectedRuntimeMCPConfigMaterializationV1) error {
+	if len(values) == 0 {
+		return errors.New("executioncell: protected runtime MCP config materializations are required")
+	}
+	if !sort.SliceIsSorted(values, func(i, j int) bool { return values[i].RequirementID < values[j].RequirementID }) {
+		return errors.New("executioncell: protected runtime MCP config materializations must be sorted")
+	}
+	for i := range values {
+		if i > 0 && values[i-1].RequirementID == values[i].RequirementID {
+			return errors.New("executioncell: duplicate protected runtime MCP config materialization")
+		}
+		if err := ValidateProtectedRuntimeMCPConfigMaterialization(values[i]); err != nil {
 			return err
 		}
 	}

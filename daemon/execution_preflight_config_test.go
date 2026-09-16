@@ -5,10 +5,12 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 func TestMaterializeExecutionPreflightConfigAppliesAndReadsBackCommonConfig(t *testing.T) {
@@ -89,6 +91,71 @@ func TestMaterializeExecutionPreflightConfigPreservesExistingFileOwnership(t *te
 	lease.cleanup()
 	if _, err := os.Stat(path); err != nil {
 		t.Fatalf("existing refreshed file was removed: %v", err)
+	}
+}
+
+func TestMaterializeProtectedRuntimeMCPConfigBindsExactRuntimeWithoutSecrets(t *testing.T) {
+	t.Parallel()
+	detail := &SessionDetail{
+		SessionID: "session-protected-mcp", PlatformURL: "https://platform.example/", McpAuthToken: "session-bearer",
+		OperationalPayload: json.RawMessage(`{"issueIdentifier":"TEST-1"}`),
+	}
+	operationalDigest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV1{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersion,
+		RequirementID:   "protected-runtime-mcp/v1", AuthorityBindingDigest: strings.Repeat("a", 64),
+		OperationalPayloadDigest: operationalDigest,
+		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
+		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
+			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
+		}},
+	}
+	materialized, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(materialized) != 1 || executioncell.ValidateProtectedRuntimeMCPConfigMaterialization(materialized[0]) != nil {
+		t.Fatalf("materialization = %+v", materialized)
+	}
+	raw, err := json.Marshal(materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), detail.McpAuthToken) || strings.Contains(string(raw), "https://platform.example/api/mcp/") {
+		t.Fatalf("protected materialization leaked runtime values: %s", raw)
+	}
+
+	binding := executioncell.RuntimeBinding{RequestID: detail.SessionID, WorkerID: "worker", PlacementID: "host"}
+	source := readyPreflightReceipt(t, binding, operationalDigest)
+	v3, err := hostReceiptWithProtectedRuntimeMCPConfigs(source, materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := executioncell.DecodeHostAdaptationReceipt(v3)
+	if err != nil || decoded.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(decoded.ProtectedRuntimeMCPConfigs) != 1 {
+		t.Fatalf("v3 receipt = %+v err=%v", decoded, err)
+	}
+	replayed, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement})
+	if err != nil || !reflect.DeepEqual(replayed, materialized) {
+		t.Fatalf("unchanged replay = %+v err=%v", replayed, err)
+	}
+
+	for name, mutate := range map[string]func(*SessionDetail){
+		"rotated bearer":   func(v *SessionDetail) { v.McpAuthToken = "rotated" },
+		"changed endpoint": func(v *SessionDetail) { v.PlatformURL = "https://other.example" },
+		"changed session":  func(v *SessionDetail) { v.SessionID = "other-session" },
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := *detail
+			mutate(&candidate)
+			if _, err := materializeProtectedRuntimeMCPConfigs(&candidate, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}); err == nil {
+				t.Fatal("changed runtime authority accepted")
+			}
+		})
 	}
 }
 
