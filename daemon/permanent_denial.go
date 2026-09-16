@@ -135,7 +135,8 @@ func projectPermanentDenialReport(
 		return zero, false
 	}
 	decodedBinding, err := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
-	if err != nil || !reflect.DeepEqual(decodedBinding, binding) {
+	if err != nil || !reflect.DeepEqual(decodedBinding, binding) ||
+		detail.SessionID != binding.RequestID || detail.WorkerID != binding.WorkerID {
 		return zero, false
 	}
 	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
@@ -163,7 +164,7 @@ func projectPermanentDenialReport(
 		return zero, false
 	}
 	effective, err := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)
-	if err != nil {
+	if err != nil || effective.Placement.ID != binding.PlacementID {
 		return zero, false
 	}
 	wantClaimReceiptID := ""
@@ -191,7 +192,8 @@ func projectPermanentDenialReport(
 	}
 	if plan.ContractVersion != agent.HarnessAdaptationContractVersion ||
 		plan.Harness != admission.Cell.Harness.ID ||
-		plan.OperationalPayloadDigest != operationalDigest {
+		plan.OperationalPayloadDigest != operationalDigest ||
+		!lowerHex64(plan.AuthorityDigest) {
 		return zero, false
 	}
 	wantMode := agent.PromptModeAutonomous
@@ -206,7 +208,22 @@ func projectPermanentDenialReport(
 		return zero, false
 	}
 	planToolRaw := planMembers["toolLifecycleReceipt"]
-	if len(planToolRaw) == 0 {
+	planPromptRaw := planMembers["promptReceipt"]
+	if len(planToolRaw) == 0 || len(planPromptRaw) == 0 || len(host.PromptReceipt) == 0 {
+		return zero, false
+	}
+	planPromptCanonical, err := executioncell.CanonicalJSON(json.RawMessage(planPromptRaw))
+	if err != nil {
+		return zero, false
+	}
+	outerPromptCanonical, err := executioncell.CanonicalJSON(json.RawMessage(host.PromptReceipt))
+	if err != nil || !bytes.Equal(planPromptCanonical, outerPromptCanonical) {
+		return zero, false
+	}
+	var prompt agent.PromptDeliveryReceipt
+	if err := decodeClosedPermanentDenialJSON(host.PromptReceipt, &prompt); err != nil ||
+		prompt.ContractVersion != agent.PromptContractVersion ||
+		strings.TrimSpace(prompt.ProfileID) == "" || prompt.Decision != "ready" {
 		return zero, false
 	}
 	planToolCanonical, err := executioncell.CanonicalJSON(json.RawMessage(planToolRaw))
@@ -233,7 +250,8 @@ func projectPermanentDenialReport(
 	matchedChannel := agent.ToolLifecycleChannel("")
 	seenEntries := make(map[string]struct{}, len(tools.Entries))
 	for _, entry := range tools.Entries {
-		if strings.TrimSpace(entry.ID) == "" {
+		if strings.TrimSpace(entry.ID) == "" || !knownPermanentDenialChannel(entry.Channel) ||
+			!knownToolOutcome(entry.Outcome) {
 			return zero, false
 		}
 		if _, duplicate := seenEntries[entry.ID]; duplicate {
@@ -242,7 +260,7 @@ func projectPermanentDenialReport(
 		seenEntries[entry.ID] = struct{}{}
 		if entry.Required && entry.Outcome == agent.ToolOutcomeDenied &&
 			entry.DenialCode == agent.ToolDenialDeliveryUnsupported &&
-			knownPermanentDenialChannel(entry.Channel) {
+			lowerHex64(entry.InputDigest) {
 			matching++
 			matchedChannel = entry.Channel
 		}
@@ -267,6 +285,31 @@ func projectPermanentDenialReport(
 		RuntimeBindingCanonicalSHA256: hex.EncodeToString(bindingSum[:]),
 		HostReceiptSHA256:             hex.EncodeToString(hostSum[:]),
 	}, true
+}
+
+func knownToolOutcome(outcome agent.ToolAdaptationOutcome) bool {
+	switch outcome {
+	case agent.ToolOutcomeAdmitted,
+		agent.ToolOutcomePendingRuntime,
+		agent.ToolOutcomePendingCleanup,
+		agent.ToolOutcomeDenied,
+		agent.ToolOutcomeDowngraded:
+		return true
+	default:
+		return false
+	}
+}
+
+func lowerHex64(value string) bool {
+	if len(value) != 64 {
+		return false
+	}
+	for _, character := range value {
+		if (character < '0' || character > '9') && (character < 'a' || character > 'f') {
+			return false
+		}
+	}
+	return true
 }
 
 func knownPermanentDenialChannel(channel agent.ToolLifecycleChannel) bool {

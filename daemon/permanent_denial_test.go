@@ -250,6 +250,30 @@ func TestPermanentDenialClosedDecoderRejectsUnknownDuplicateAndTrailing(t *testi
 	}
 }
 
+func TestPermanentDenialProjection_RefusesDetailIdentityAndPlacementDrift(t *testing.T) {
+	item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-drift", "wkr-test")
+	detail, binding := permanentDenialDetail(t, item)
+	for _, mutate := range []func(*SessionDetail){
+		func(candidate *SessionDetail) { candidate.SessionID = "other-session" },
+		func(candidate *SessionDetail) { candidate.WorkerID = "other-worker" },
+		func(candidate *SessionDetail) {
+			var effective executioncell.ResolvedExecutionCell
+			if err := json.Unmarshal(candidate.EffectiveCell, &effective); err != nil {
+				t.Fatal(err)
+			}
+			effective.Placement.ID = "other-placement"
+			candidate.EffectiveCell = rawJSON(t, effective)
+		},
+	} {
+		candidateDetail := *detail
+		mutate(&candidateDetail)
+		candidate := freshPermanentDenialCandidate(&candidateDetail, binding, hostReceipt, "", typed)
+		if candidate != nil && candidate.report != nil {
+			t.Fatalf("drifted detail produced report: %+v", candidate.report)
+		}
+	}
+}
+
 func TestPermanentDenialPersistenceFailurePreservesCauseWithoutReport(t *testing.T) {
 	item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-persist-failure", "wkr-test")
 	provider := &countingExecutionPreflight{receipt: hostReceipt, err: typed}
