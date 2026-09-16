@@ -3,6 +3,8 @@ package daemon
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -1653,6 +1655,174 @@ func TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersisten
 	}
 	if !truthful {
 		t.Fatalf("registration capabilities = %v, missing implemented NACK producer %q", effectiveRegistrationCapabilities(nil), receiptPreflightNackReasonCapability)
+	}
+}
+
+func deniedToolDeliveryFixture(
+	t *testing.T,
+	sessionID, workerID string,
+) (PollWorkItem, json.RawMessage, *agent.ToolAdaptationError) {
+	t.Helper()
+	cell := daemonExecutionCell()
+	item := PollWorkItem{
+		SessionID: sessionID, ProjectID: "project", Repository: "github.com/acme/repo",
+		IssueID: "iss-1", IssueIdentifier: "OPS-1", Priority: 1, QueuedAt: 1,
+	}
+	baseRaw := rawJSON(t, item)
+	operationalPayload, err := executioncell.ProjectOperationalPayload(baseRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	operationalDigest, err := executioncell.DigestOperationalPayload(operationalPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission := executioncell.AdmissionReceipt{
+		ContractVersion:          executioncell.ContractVersion,
+		ReceiptID:                "admission-permanent-denial",
+		RequestID:                sessionID,
+		Decision:                 executioncell.AdmissionAdmitted,
+		IntentDigest:             strings.Repeat("a", 64),
+		OperationalPayloadDigest: operationalDigest,
+		Cell:                     &cell,
+		ResolverDecisions:        []executioncell.ResolverDecision{},
+		RecordedAt:               "2026-09-16T12:00:00Z",
+	}
+	binding := executioncell.RuntimeBinding{
+		ContractVersion: executioncell.RuntimeBindingContractVersion,
+		RequestID:       sessionID, WorkerID: workerID, PlacementID: cell.Placement.ID,
+	}
+	item.AdmissionReceipt = rawJSON(t, admission)
+	item.EffectiveCell = rawJSON(t, cell)
+	item.ExecutionRuntimeBinding = rawJSON(t, binding)
+
+	promptReceipt := agent.PromptDeliveryReceipt{
+		ContractVersion: agent.PromptContractVersion,
+		ProfileID:       "prompt-profile", Decision: "ready", Entries: []agent.PromptDeliveryEntry{},
+	}
+	toolReceipt := agent.ToolLifecycleReceipt{
+		ContractVersion:          agent.ToolLifecycleContractVersion,
+		AdmissionReceiptID:       admission.ReceiptID,
+		OperationalPayloadDigest: operationalDigest,
+		ProfileID:                "tool-profile", Decision: "denied",
+		EvidenceTier: string(agent.EvidenceStructured), ProductionEligible: true,
+		Entries: []agent.ToolLifecycleEntry{{
+			ID: "mcp-servers", Channel: agent.ToolChannelMCPServer, Required: true,
+			Outcome: agent.ToolOutcomeDenied, InputDigest: strings.Repeat("b", 64),
+			DenialCode: agent.ToolDenialDeliveryUnsupported,
+		}},
+	}
+	plan := agent.PreparedHarness{
+		ContractVersion: agent.HarnessAdaptationContractVersion,
+		Harness:         cell.Harness.ID, Mode: agent.PromptModeAutonomous,
+		OperationalPayloadDigest: operationalDigest,
+		AuthorityDigest:          strings.Repeat("c", 64), RuntimeMCPNames: []string{},
+		Materializations: []agent.HarnessMaterialization{},
+		PromptReceipt:    promptReceipt, ToolLifecycleReceipt: toolReceipt,
+	}
+	planRaw := rawJSON(t, plan)
+	planDigest := sha256.Sum256(planRaw)
+	hostReceipt := rawJSON(t, executioncell.HostAdaptationReceipt{
+		ContractVersion: executioncell.HostAdaptationContractVersion,
+		RequestID:       sessionID, WorkerID: workerID, PlacementID: cell.Placement.ID,
+		Decision: "denied", Plan: planRaw, PlanDigest: hex.EncodeToString(planDigest[:]),
+		PromptReceipt: rawJSON(t, promptReceipt), ToolLifecycleReceipt: rawJSON(t, toolReceipt),
+		Denial: "PROFILE_SECRET_DO_NOT_LEAK cannot apply MCP_SECRET_DO_NOT_LEAK",
+	})
+	denial := &agent.ToolAdaptationError{
+		Code: agent.ToolDenialDeliveryUnsupported, Channel: agent.ToolChannelMCPServer,
+		Detail: "PROFILE_SECRET_DO_NOT_LEAK cannot apply MCP_SECRET_DO_NOT_LEAK",
+	}
+	return item, hostReceipt, denial
+}
+
+func TestDaemonPollPermanentDenial_ActualHTTPReportIsClosedAndAcknowledged(t *testing.T) {
+	item, hostReceipt, denial := deniedToolDeliveryFixture(t, "session-permanent", "wkr-test")
+	itemRaw := rawJSON(t, item)
+	hostDigest := sha256.Sum256(hostReceipt)
+	hostSHA := hex.EncodeToString(hostDigest[:])
+	pollBody := fmt.Sprintf(
+		`{"work":[%s],"claimAttempts":{"session-permanent":{"contractVersion":"work-claim-attempt/v1","sessionId":"session-permanent","attemptToken":%q}},"nackContracts":["pre-spawn-permanent-denial/v1"]}`,
+		itemRaw, claimAttemptTokenOne,
+	)
+
+	var requestBody map[string]json.RawMessage
+	var requestCount atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		switch {
+		case r.Method == http.MethodGet && strings.HasSuffix(r.URL.Path, "/poll"):
+			_, _ = io.WriteString(w, pollBody)
+		case r.Method == http.MethodPost && strings.HasSuffix(r.URL.Path, "/nack"):
+			requestCount.Add(1)
+			if err := json.NewDecoder(r.Body).Decode(&requestBody); err != nil {
+				t.Fatalf("decode NACK body: %v", err)
+			}
+			w.Header().Set("Content-Type", "application/json")
+			_ = json.NewEncoder(w).Encode(map[string]any{
+				"contractVersion": "pre-spawn-permanent-denial/v1",
+				"outcome":         "terminal", "sessionId": item.SessionID,
+				"attemptToken": claimAttemptTokenOne, "hostReceiptSha256": hostSHA,
+			})
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(srv.Close)
+
+	provider := &countingExecutionPreflight{receipt: hostReceipt, err: denial}
+	d := newRunningTestDaemon(t, Options{
+		ProviderRegistry:        provider,
+		ExecutionPreflightStore: NewFileExecutionPreflightStore(t.TempDir()),
+	}, []ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}}, nil)
+	d.mu.Lock()
+	d.jwt = "runtime-token"
+	d.mu.Unlock()
+
+	slogBuffer, restoreSlog := withCapturedSlog(t)
+	defer restoreSlog()
+	var pollLogs strings.Builder
+	poller := NewPollService(PollOptions{
+		WorkerID: "wkr-test", RuntimeJWT: "runtime-token",
+		OrchestratorURL: srv.URL, HTTPClient: srv.Client(),
+		LogWarn: func(format string, args ...any) { _, _ = fmt.Fprintf(&pollLogs, format, args...) },
+		OnWork:  func(got PollWorkItem) error { return d.handlePollWorkItem(got, srv.URL) },
+	})
+	poller.pollOnce(context.Background())
+
+	if requestCount.Load() != 1 {
+		t.Fatalf("NACK requests = %d, want 1", requestCount.Load())
+	}
+	var reason string
+	if err := json.Unmarshal(requestBody["reason"], &reason); err != nil {
+		t.Fatalf("decode reason: %v", err)
+	}
+	if reason != "Required pre-spawn tool delivery is unsupported." {
+		t.Fatalf("reason = %q, want fixed value-free reason", reason)
+	}
+	var report map[string]any
+	if err := json.Unmarshal(requestBody["preSpawnPermanentDenial"], &report); err != nil {
+		t.Fatalf("decode permanent report: %v; body=%s", err, rawJSON(t, requestBody))
+	}
+	if report["contractVersion"] != "pre-spawn-permanent-denial/v1" ||
+		report["code"] != "delivery_unsupported" || report["channel"] != "mcp_server" ||
+		report["admissionReceiptId"] != "admission-permanent-denial" ||
+		report["operationalPayloadDigest"] == "" ||
+		report["runtimeBindingCanonicalSha256"] == "" ||
+		report["hostReceiptSha256"] != hostSHA {
+		t.Fatalf("permanent report = %#v", report)
+	}
+	if _, present := report["claimReceiptId"]; present {
+		t.Fatalf("claimless report included claimReceiptId: %#v", report)
+	}
+	var proof map[string]any
+	if err := json.Unmarshal(requestBody["claimAttempt"], &proof); err != nil || proof["attemptToken"] != claimAttemptTokenOne {
+		t.Fatalf("claimAttempt = %#v err=%v", proof, err)
+	}
+	serialized := string(rawJSON(t, requestBody)) + pollLogs.String() + slogBuffer.String()
+	for _, marker := range []string{"PROFILE_SECRET_DO_NOT_LEAK", "MCP_SECRET_DO_NOT_LEAK", "mcp-servers", "tool-profile"} {
+		if strings.Contains(serialized, marker) {
+			t.Fatalf("permanent report/logs leaked %q: %s", marker, serialized)
+		}
 	}
 }
 
