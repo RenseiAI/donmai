@@ -161,7 +161,7 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 		}
 	}
 	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
-	realizations, _ := codeIntelRealizationFixture(t, agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true)
+	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{"af_code_get_repo_map", "af_code_search_symbols"})
 	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	binders, _ := NewCapabilityParameterBinderRegistry(binder)
 	resolver, err := newPreparedCapabilityResolver(realizations, binders)
@@ -170,7 +170,7 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	}
 	qw := exactReceiptQueuedWork("native-prepared-source")
 	qw.Body = "exercise native capability routing"
-	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "example/repo", Tools: []string{"af_code_search_symbols", "af_code_get_repo_map"}}
+	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "example/repo"}
 	operational, err := CanonicalOperationalPayload(qw)
 	if err != nil {
 		t.Fatal(err)
@@ -194,6 +194,9 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	}
 	if len(spec.MCPToolNames) != 0 || strings.Contains(spec.SystemPromptAppend, "mcp__") || !strings.Contains(spec.SystemPromptAppend, "native code-intelligence") {
 		t.Fatalf("native prepared source retained MCP producer: servers=%+v names=%v runtime=%v prompt=%q", spec.MCPServers, spec.MCPToolNames, runtimeNames, spec.SystemPromptAppend)
+	}
+	if !strings.Contains(spec.SystemPromptAppend, "af_code_get_repo_map") || !strings.Contains(spec.SystemPromptAppend, "af_code_search_symbols") || strings.Contains(spec.SystemPromptAppend, "af_code_search_code") {
+		t.Fatalf("prepared native prompt did not use exact declared default surface: %q", spec.SystemPromptAppend)
 	}
 	if len(spec.AdditionalExtensions) != 1 || len(spec.CapabilityRuntimeMaterializations) != 1 || spec.ToolLifecyclePlan == nil || len(spec.ToolLifecyclePlan.CapabilityRealizations) != 1 {
 		t.Fatalf("native prepared authority incomplete: %+v", spec)
