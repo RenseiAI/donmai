@@ -268,6 +268,11 @@ type PollWorkItem struct {
 	SessionStorageID string `json:"sessionStorageId,omitempty"`
 	SessionPublicID  string `json:"sessionPublicId,omitempty"`
 	TrackerSessionID string `json:"trackerSessionId,omitempty"`
+
+	// claimAttempt is poll/NACK transport correlation only. It is bound from the
+	// PollResponse envelope after work decoding and is deliberately unexported so
+	// it cannot enter work JSON, OperationalPayload, SessionDetail, or the runner.
+	claimAttempt *workClaimAttemptProof `json:"-"`
 }
 
 // UnmarshalJSON captures the operational projection at the authenticated poll
@@ -412,6 +417,9 @@ type PollResponse struct {
 	// That is why NewPollService fills a nil OnKgExtractWork with the default
 	// executor lane: no poll path can decode an item it is unable to run.
 	KgExtractWork []worker.BatchWorkItem `json:"kgExtractWork,omitempty"`
+
+	// Bounded validation diagnostic only. Never include proof bytes or tokens.
+	claimAttemptBindingRefusal string `json:"-"`
 }
 
 // InboxMessage is one queued message for a running session, delivered in
@@ -777,6 +785,12 @@ func (p *PollService) pollOnce(ctx context.Context) {
 	}
 	resp, err := callPollEndpoint(ctx, p.opts.HTTPClient, p.opts.OrchestratorURL, workerID, jwt)
 	if err == nil {
+		if resp.claimAttemptBindingRefusal != "" {
+			p.opts.LogWarn(
+				"daemon poll: claim-attempt proof binding refused (%s)",
+				resp.claimAttemptBindingRefusal,
+			)
+		}
 		if len(resp.Work) > 0 {
 			p.opts.LogInfo("daemon poll: %d work item(s) received", len(resp.Work))
 		}
@@ -1063,11 +1077,13 @@ func callNackEndpoint(
 		WorkerID               string                      `json:"workerId"`
 		Reason                 string                      `json:"reason,omitempty"`
 		ReceiptPreflightReason *receiptPreflightNackReason `json:"receiptPreflightReason,omitempty"`
+		ClaimAttempt           *workClaimAttemptProof      `json:"claimAttempt,omitempty"`
 		Work                   *PollWorkItem               `json:"work"`
 	}{
 		WorkerID:               workerID,
 		Reason:                 reason,
 		ReceiptPreflightReason: receiptPreflightReason,
+		ClaimAttempt:           work.claimAttempt,
 		Work:                   work,
 	}
 	buf, err := json.Marshal(body)
