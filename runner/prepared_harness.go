@@ -114,24 +114,17 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		runtimeNames = append(runtimeNames, server.Name)
 	}
 	mcpServers := mergeMCPServers(defaults, working.McpServers)
-	spec := translateSpec(working, provider.Capabilities(), SpecInputs{
+	spec, err := translateSpecForCodeIntelDelivery(working, provider.Capabilities(), SpecInputs{
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
 		InitialContext: composition.InitialContext, MCPServers: mcpServers, Env: maps.Clone(working.Env),
 		Autonomous: mode == agent.PromptModeAutonomous, ProviderName: string(provider.Name()),
-		CodeIntelDeliveryRoute: codeIntelDelivery.Route,
-	})
+	}, codeIntelDelivery, inlineDisallow)
+	if err != nil {
+		return agent.Spec{}, nil, err
+	}
 	spec.PromptMode = mode
 	if working.isInteractive() {
 		spec.Interactive = &agent.InteractiveSpec{}
-	}
-	if len(inlineDisallow) > 0 {
-		spec.DisallowedTools = append(spec.DisallowedTools, inlineDisallow...)
-		if spec.PermissionConfig != nil {
-			spec.PermissionConfig.DisallowPatterns = append(spec.PermissionConfig.DisallowPatterns, inlineDisallow...)
-		}
-	}
-	if working.isInterview() {
-		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")
 	}
 	var admissionRegistry *agent.CapabilityRealizationRegistry
 	switch registry := realizations.(type) {

@@ -668,66 +668,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// 6. Translate to agent.Spec.
 	composedEnv := envToMap(r.envc.Compose(hostEnv(), agent.Spec{Env: specEnv}))
-	spec := translateSpec(qw, caps, SpecInputs{
-		CodeIntelDeliveryRoute: codeIntelDelivery.Route,
-		Cwd:                    wpath,
-		Prompt:                 userPrompt,
-		SystemPromptAppend:     systemPrompt,
-		PromptPlan:             promptPlan,
-		InitialContext:         composition.InitialContext,
-		MCPServers:             mcpServers,
-		Env:                    composedEnv,
-		Autonomous:             true,
-		Logger:                 r.logger,
-		ProviderName:           string(provider.Name()),
-	})
-	// Apply Kit skill + agent-card inline-skill tool disallow rules
-	// (subtractive: skills may only narrow the tool surface, never widen
-	// it). Appended after the defaults produced by translateSpec so the
-	// declared restrictions are visible and auditable in the Spec. For
-	// providers that route per-tool permission through PermissionConfig
-	// (codex), also mirror these patterns into the approval bridge's
-	// DisallowPatterns so the narrowing reaches the agent — translateSpec
-	// only saw the platform DisallowedTools floor, not the kit/skill set
-	// computed here.
-	if len(kitDisallowedTools) > 0 {
-		spec.DisallowedTools = append(spec.DisallowedTools, kitDisallowedTools...)
-		if caps.NeedsPermissionConfig && !caps.AcceptsAllowedToolsList {
-			if spec.PermissionConfig == nil {
-				spec.PermissionConfig = &agent.PermissionConfig{}
-			}
-			spec.PermissionConfig.DisallowPatterns = append(
-				spec.PermissionConfig.DisallowPatterns, kitDisallowedTools...)
-		}
-	}
-
-	// Interview mode: lock down the tool surface at
-	// the Spec level for interview sessions. Two categories:
-	//
-	//   1. AskUserQuestion — turn-taking happens via claude --resume (the
-	//      runner injects the user's reply between turns), NOT via the tool.
-	//      Leaving it enabled would let the agent block on its own tool prompt
-	//      inside a single turn instead of ending its turn and parking for the
-	//      next inject.
-	//
-	//   2. Code-authoring tools (Write, Edit, Task, Bash) — an interview
-	//      session is thinking-only.  The hardened persona already instructs
-	//      the agent to avoid these, but a hostile cloned-repo .claude/CLAUDE.md
-	//      can drag the agent back into developer behaviour via worked examples
-	//      (feedback_claudemd_overrides_system_prompt_directive precedent).
-	//      Belt-and-suspenders: disallow them structurally at the Spec level so
-	//      the provider rejects any attempt to invoke them regardless of what
-	//      the persona or CLAUDE.md says.  The structural proof is in
-	//      runner/interview_persona_hostile_test.go; the behavioural
-	//      proof against a live hostile-repo sandbox is deferred to follow-up work.
-	if qw.isInterview() {
-		spec.DisallowedTools = append(spec.DisallowedTools,
-			"AskUserQuestion",
-			"Write",
-			"Edit",
-			"Task",
-			"Bash",
-		)
+	spec, err := translateSpecForCodeIntelDelivery(qw, caps, SpecInputs{
+		Cwd:                wpath,
+		Prompt:             userPrompt,
+		SystemPromptAppend: systemPrompt,
+		PromptPlan:         promptPlan,
+		InitialContext:     composition.InitialContext,
+		MCPServers:         mcpServers,
+		Env:                composedEnv,
+		Autonomous:         true,
+		Logger:             r.logger,
+		ProviderName:       string(provider.Name()),
+	}, codeIntelDelivery, kitDisallowedTools)
+	if err != nil {
+		res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+		return res, err
 	}
 
 	// Interactive mode: request spawn-under-PTY with a live interactive
@@ -760,6 +715,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 	if len(selection.receipt.Bytes()) > 0 {
+		if codeIntelDelivery.Route == codeIntelDeliveryNative {
+			if err := requirePreparedNativeCodeIntelPolicy(spec, preparedSource); err != nil {
+				res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+				return res, err
+			}
+		}
 		spec = applyPreparedSourceAuthority(spec, preparedSource, preparedPlan)
 	} else {
 		spec.OnPromptAdapted = func(receipt agent.PromptDeliveryReceipt) error {

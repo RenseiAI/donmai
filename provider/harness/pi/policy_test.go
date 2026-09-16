@@ -249,3 +249,85 @@ func TestPolicy_KnownAllowPatternsRemainNarrow(t *testing.T) {
 		t.Error("out-of-allowlist shell command was granted")
 	}
 }
+
+func TestNativeCodeIntelPolicyCeilingDenyAndRawAllowGate(t *testing.T) {
+	t.Parallel()
+	selected := []string{"af_code_get_repo_map", "af_code_search_symbols"}
+	wildcard, err := newNativeCodeIntelPolicy(agent.Spec{AllowedTools: []string{"*"}}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := wildcard.Evaluate("af_code_search_code"); decision.Allow {
+		t.Fatal("wildcard exceeded selected capability surface")
+	}
+	foreignGate, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{"Read"}, DefaultDecision: "allow"}}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := foreignGate.Evaluate("af_code_search_symbols"); decision.Allow {
+		t.Fatal("unrelated raw allow gate fell through to default allow")
+	}
+	defaultAllow, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "allow"}}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if decision := defaultAllow.Evaluate("af_code_search_symbols"); !decision.Allow {
+		t.Fatalf("explicit default allow denied selected native name: %q", decision.Reason)
+	}
+}
+
+func TestNativeCodeIntelPolicyAliasesDenyPrecedenceAndRegexValidation(t *testing.T) {
+	t.Parallel()
+	selected := []string{"af_code_get_repo_map", "af_code_search_symbols"}
+	fq := "mcp__af-code-intelligence__af_code_search_symbols"
+	policy, err := newNativeCodeIntelPolicy(agent.Spec{AllowedTools: []string{fq, "Read"}, DisallowedTools: []string{"af_code_search_symbols"}, PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{"^af_code_search_symbols$"}, DefaultDecision: "allow"}}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"af_code_search_symbols", fq} {
+		if decision := policy.Evaluate(name); decision.Allow {
+			t.Fatalf("deny did not beat allow for %q", name)
+		}
+	}
+	for _, pattern := range []string{"[", "af_code_unknown", " af_code_search_symbols", "af_code_search_symbols(*)"} {
+		if _, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{pattern}}}, selected); err == nil {
+			t.Errorf("invalid native/regex pattern %q accepted", pattern)
+		}
+	}
+
+	for _, allowed := range []string{"af_code_get_repo_map", "mcp__af-code-intelligence__af_code_get_repo_map"} {
+		exact, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{allowed}}}, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision := exact.Evaluate("af_code_get_repo_map"); !decision.Allow {
+			t.Errorf("exact permission entry %q denied: %q", allowed, decision.Reason)
+		}
+		if decision := exact.Evaluate("af_code_search_symbols"); decision.Allow {
+			t.Errorf("exact permission entry %q granted another selected member", allowed)
+		}
+	}
+
+	for _, invalidSelected := range [][]string{nil, {}, {"af_code_get_repo_map", "af_code_get_repo_map"}, {"af_code_unknown"}, {"AF_CODE_GET_REPO_MAP"}} {
+		if _, err := newNativeCodeIntelPolicy(agent.Spec{}, invalidSelected); err == nil {
+			t.Errorf("invalid selected set %v accepted", invalidSelected)
+		}
+	}
+
+	for _, defaultDecision := range []string{"", "deny", "prompt", "ask"} {
+		denied, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: defaultDecision}}, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision := denied.Evaluate("af_code_get_repo_map"); decision.Allow {
+			t.Errorf("default decision %q granted native call", defaultDecision)
+		}
+	}
+	if _, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: " allow "}}, selected); err == nil {
+		t.Fatal("whitespace-padded default allow was accepted")
+	}
+	upper, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "ALLOW"}}, selected)
+	if err != nil || !upper.Evaluate("af_code_get_repo_map").Allow {
+		t.Fatalf("case-insensitive exact default allow failed: policy=%v err=%v", upper, err)
+	}
+}

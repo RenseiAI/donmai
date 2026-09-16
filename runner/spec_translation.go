@@ -66,6 +66,15 @@ type SpecInputs struct {
 // fields are never zeroed: the exact harness adaptation profile either applies
 // them or returns a typed pre-spawn denial.
 func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.Spec {
+	return translateSpecWithToolPolicy(qw, caps, in, legacySpecToolPolicy(qw))
+}
+
+type specToolPolicy struct {
+	AllowedTools    []string
+	DisallowedTools []string
+}
+
+func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
 	// AllowedTools resolution: the agent card is AUTHORITATIVE when it
 	// supplies an explicit allowlist (WS5) — the runner uses it verbatim in
 	// place of its curated default. When the card sends none, the runner
@@ -82,7 +91,13 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	if !qw.isInteractive() {
 		disallowedTools = defaultDisallowedTools()
 	}
+	if len(qw.DisallowedTools) > 0 {
+		disallowedTools = append(disallowedTools, qw.DisallowedTools...)
+	}
+	return specToolPolicy{AllowedTools: allowedTools, DisallowedTools: disallowedTools}
+}
 
+func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in SpecInputs, policy specToolPolicy) agent.Spec {
 	spec := agent.Spec{
 		SessionName:        strings.TrimSpace(qw.SessionName),
 		Prompt:             in.Prompt,
@@ -91,8 +106,8 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 		Autonomous:         in.Autonomous,
 		SandboxEnabled:     true,
 		SandboxLevel:       resolveSandboxLevel(qw, in.Logger),
-		AllowedTools:       allowedTools,
-		DisallowedTools:    disallowedTools,
+		AllowedTools:       cloneStringSliceShape(policy.AllowedTools),
+		DisallowedTools:    cloneStringSliceShape(policy.DisallowedTools),
 		MCPServers:         in.MCPServers,
 		Model:              strings.TrimSpace(qw.ResolvedProfile.Model),
 		Effort:             qw.ResolvedProfile.Effort,
@@ -109,17 +124,6 @@ func translateSpec(qw QueuedWork, caps agent.Capabilities, in SpecInputs) agent.
 	// rejects each context item before spawn.
 	if !caps.SupportsTurnInputContext {
 		spec.InitialContext = ""
-	}
-
-	// Platform-supplied disallowed-tool patterns (Option B).
-	// Appended AFTER the runner's own defaultDisallowedTools() baseline
-	// so the static floor is never replaced, only extended.
-	// qw.DisallowedTools is the embedded prompt.QueuedWork field stamped
-	// by the platform's stampDisallowedTools() helper (platform PR #196).
-	// Applied BEFORE the AllowedTools gate below so the codex
-	// PermissionConfig bridge sees the full disallowed set.
-	if len(qw.DisallowedTools) > 0 {
-		spec.DisallowedTools = append(spec.DisallowedTools, qw.DisallowedTools...)
 	}
 
 	// AllowedTools: only forward as a flat allowlist when the provider
