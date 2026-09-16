@@ -1,12 +1,13 @@
 package runner
 
 import (
+	"encoding/json"
 	"errors"
 	"fmt"
 	"maps"
+	"sort"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
@@ -52,6 +53,28 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if working.isInterview() {
 		working.SystemPromptOverride = buildInterviewSystemPrompt(working.SystemPromptOverride, interview.InterviewCompleteSentinel)
 	}
+	mode := sessionPromptMode(working, selection.effectiveCell)
+	harness, ok := provider.(agent.HarnessProvider)
+	if !ok {
+		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact harness manifest")
+	}
+	manifest := harness.Manifest()
+	profile, ok := manifest.ToolLifecycleProfile(mode)
+	if !ok {
+		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact tool lifecycle profile")
+	}
+	var realizations capabilityRealizationResolver
+	if len(registries) > 0 {
+		realizations = registries[0]
+	}
+	resolvedCapabilities, err := resolvePreparedCapabilities(working, selection, realizations, manifest.Name, profile.ID, mode)
+	if err != nil {
+		return agent.Spec{}, nil, err
+	}
+	codeIntelRoute, err := resolveCodeIntelDeliveryRoute(working.CodeIntel, resolvedCapabilities)
+	if err != nil {
+		return agent.Spec{}, nil, err
+	}
 	builder := prompt.NewBuilder()
 	inlineAppend, inlineDisallow, _ := foldInlineSkills("", working.Skills)
 	builder.SkillAppend = inlineAppend
@@ -59,7 +82,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel)
+	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelRoute)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, working.RepositoryDeclaration != nil)
 	userPrompt := composition.UserPrompt
 	if working.isInteractive() {
@@ -84,8 +107,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
 		}
 	}
-	mode := sessionPromptMode(working, selection.effectiveCell)
-	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode)
+	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, codeIntelRoute)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
@@ -95,6 +117,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
 		InitialContext: composition.InitialContext, MCPServers: mcpServers, Env: maps.Clone(working.Env),
 		Autonomous: mode == agent.PromptModeAutonomous, ProviderName: string(provider.Name()),
+		CodeIntelDeliveryRoute: codeIntelRoute,
 	})
 	spec.PromptMode = mode
 	if working.isInteractive() {
@@ -109,10 +132,6 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if working.isInterview() {
 		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")
 	}
-	var realizations capabilityRealizationResolver
-	if len(registries) > 0 {
-		realizations = registries[0]
-	}
 	var admissionRegistry *agent.CapabilityRealizationRegistry
 	switch registry := realizations.(type) {
 	case *agent.CapabilityRealizationRegistry:
@@ -124,50 +143,92 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	harness, ok := provider.(agent.HarnessProvider)
-	if !ok {
-		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact harness manifest")
+	for _, resolved := range resolvedCapabilities {
+		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, resolved.Realization)
+		if resolved.Realization.ContractVersion == agent.CapabilityRealizationContractVersionV2 {
+			spec.CapabilityRuntimeMaterializations = append(spec.CapabilityRuntimeMaterializations, cloneCapabilityRuntimeMaterialization(resolved.Materialization))
+			spec.AdditionalExtensions = append(spec.AdditionalExtensions, cloneExtensionDeliveries(resolved.AdditionalExtensions)...)
+		}
 	}
-	manifest := harness.Manifest()
-	profile, ok := manifest.ToolLifecycleProfile(mode)
-	if !ok {
-		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact tool lifecycle profile")
+	sort.Slice(spec.AdditionalExtensions, func(i, j int) bool { return spec.AdditionalExtensions[i].ID < spec.AdditionalExtensions[j].ID })
+	spec = ReconcileAdditionalExtensions(spec, decorate)
+	if err := validateCapabilityRuntimeMaterializations(spec); err != nil {
+		return agent.Spec{}, nil, err
 	}
-	var granted []executioncell.CapabilityRequirement
-	if len(selection.receipt.Bytes()) > 0 && selection.receipt.Value().Cell != nil {
-		granted = selection.receipt.Value().Cell.GrantedCapabilities
+	return spec, runtimeNames, nil
+}
+
+func resolvePreparedCapabilities(working QueuedWork, selection harnessSelection, realizations capabilityRealizationResolver, harness agent.HarnessName, profileID string, mode agent.PromptSessionMode) ([]ResolvedCapabilityParameterBinding, error) {
+	if realizations == nil || len(selection.receipt.Bytes()) == 0 || selection.receipt.Value().Cell == nil {
+		return nil, nil
 	}
-	for _, capability := range granted {
-		if realizations == nil || !realizations.Knows(capability.Name) {
+	operationalPayload, err := CanonicalOperationalPayload(working)
+	if err != nil {
+		return nil, err
+	}
+	out := make([]ResolvedCapabilityParameterBinding, 0)
+	for _, capability := range selection.receipt.Value().Cell.GrantedCapabilities {
+		if !realizations.Knows(capability.Name) {
 			continue
 		}
-		compiled, found := realizations.Resolve(capability.Name, manifest.Name, profile.ID, mode)
+		compiled, found := realizations.Resolve(capability.Name, harness, profileID, mode)
 		if !found {
-			return agent.Spec{}, nil, fmt.Errorf("runner: capability %q has no production-eligible exact realization", capability.Name)
+			return nil, fmt.Errorf("runner: capability %q has no production-eligible exact realization", capability.Name)
 		}
-		binding := agent.BindCapabilityRealization(compiled)
-		if compiled.Declaration.ContractVersion == agent.CapabilityRealizationContractVersionV2 {
-			parameterResolver, ok := realizations.(*parameterBoundCapabilityResolver)
-			if !ok {
-				return agent.Spec{}, nil, fmt.Errorf("runner: parameterized capability %q has no process-owned binder", capability.Name)
-			}
-			operationalPayload, payloadErr := CanonicalOperationalPayload(working)
-			if payloadErr != nil {
-				return agent.Spec{}, nil, payloadErr
-			}
-			facts := agent.CapabilityParameterRequirementFacts{
-				CapabilityID: capability.Name, ParametersDigest: capability.ParametersDigest,
-				OperationalPayloadDigest: selection.receipt.Value().OperationalPayloadDigest,
-			}
-			binding, payloadErr = parameterResolver.resolveAndBind(facts, operationalPayload, manifest.Name, profile.ID, mode)
-			if payloadErr != nil {
-				return agent.Spec{}, nil, fmt.Errorf("runner: bind parameterized capability %q: %w", capability.Name, payloadErr)
-			}
+		if compiled.Declaration.ContractVersion == agent.CapabilityRealizationContractVersionV1 {
+			out = append(out, ResolvedCapabilityParameterBinding{Realization: agent.BindCapabilityRealization(compiled)})
+			continue
 		}
-		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, binding)
+		parameterResolver, ok := realizations.(*parameterBoundCapabilityResolver)
+		if !ok {
+			return nil, fmt.Errorf("runner: parameterized capability %q has no process-owned binder", capability.Name)
+		}
+		facts := agent.CapabilityParameterRequirementFacts{CapabilityID: capability.Name, ParametersDigest: capability.ParametersDigest, OperationalPayloadDigest: selection.receipt.Value().OperationalPayloadDigest}
+		resolved, err := parameterResolver.resolveAndBind(facts, operationalPayload, harness, profileID, mode)
+		if err != nil {
+			return nil, fmt.Errorf("runner: bind parameterized capability %q: %w", capability.Name, err)
+		}
+		out = append(out, resolved)
 	}
-	spec = ReconcileAdditionalExtensions(spec, decorate)
-	return spec, runtimeNames, nil
+	return out, nil
+}
+
+func cloneCapabilityRuntimeMaterialization(in agent.CapabilityRuntimeMaterializationV1) agent.CapabilityRuntimeMaterializationV1 {
+	out := in
+	out.Config = append(json.RawMessage(nil), in.Config...)
+	return out
+}
+
+func validateCapabilityRuntimeMaterializations(spec agent.Spec) error {
+	bindings := map[string]agent.CapabilityRealizationBinding{}
+	if spec.ToolLifecyclePlan != nil {
+		for _, binding := range spec.ToolLifecyclePlan.CapabilityRealizations {
+			if binding.ContractVersion == agent.CapabilityRealizationContractVersionV2 && binding.ParameterBinding != nil {
+				bindings[binding.CapabilityID+"\x00"+binding.ParameterBinding.BindingDigest] = binding
+			}
+		}
+	}
+	seenCapabilities := map[string]bool{}
+	seenBindings := map[string]bool{}
+	for _, materialization := range spec.CapabilityRuntimeMaterializations {
+		key := materialization.CapabilityID + "\x00" + materialization.BindingDigest
+		binding, ok := bindings[key]
+		if !ok || seenCapabilities[materialization.CapabilityID] || seenBindings[materialization.BindingDigest] || binding.ParameterBinding == nil ||
+			materialization.ContractVersion != agent.CapabilityRuntimeMaterializationContractVersionV1 || materialization.ParameterContractID != binding.ParameterBinding.ParameterContractID || materialization.ConfigDigest != binding.ParameterBinding.RuntimeConfigDigest {
+			return fmt.Errorf("runner: capability runtime materialization does not match exact binding")
+		}
+		canonical, digest, err := agent.CanonicalCapabilityRuntimeConfig(materialization.Config)
+		if err != nil || string(canonical) != string(materialization.Config) || digest != materialization.ConfigDigest {
+			return fmt.Errorf("runner: capability runtime materialization config is invalid")
+		}
+		seenCapabilities[materialization.CapabilityID] = true
+		seenBindings[materialization.BindingDigest] = true
+		delete(bindings, key)
+	}
+	if len(bindings) != 0 {
+		return fmt.Errorf("runner: capability runtime materialization coverage is incomplete")
+	}
+	return nil
 }
 
 // compilePreparedHarness compiles the receipt-bearing host authority for qw.
@@ -220,6 +281,11 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 	target.ProviderConfig = source.ProviderConfig
 	target.PromptPlan = source.PromptPlan
 	target.ToolLifecyclePlan = source.ToolLifecyclePlan
+	target.AdditionalExtensions = cloneExtensionDeliveries(source.AdditionalExtensions)
+	target.CapabilityRuntimeMaterializations = make([]agent.CapabilityRuntimeMaterializationV1, len(source.CapabilityRuntimeMaterializations))
+	for i := range source.CapabilityRuntimeMaterializations {
+		target.CapabilityRuntimeMaterializations[i] = cloneCapabilityRuntimeMaterialization(source.CapabilityRuntimeMaterializations[i])
+	}
 	target.PromptMode = source.PromptMode
 	target.PreparedHarness = plan
 	if source.Interactive != nil {

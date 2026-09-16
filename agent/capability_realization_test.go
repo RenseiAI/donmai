@@ -204,7 +204,7 @@ func parameterBindingFixture(t *testing.T, compiled CompiledCapabilityRealizatio
 		}
 		entries[i] = CapabilityBoundEntryV1{EntryID: recipeEntry.EntryID, StaticInputDigest: recipeEntry.InputDigest, EntryParametersDigest: entryDigest}
 	}
-	binding := CapabilityParameterBindingV1{ContractVersion: CapabilityParameterBindingVersionV1, CapabilityID: compiled.Declaration.CapabilityID, ParameterContractID: compiled.Declaration.ParameterContract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: compiled.Declaration.Recipe.RecipeDigest, SelectedSurface: append([]CapabilitySurfaceIdentity(nil), selected...), SelectedSurfaceDigest: selectedDigest, Entries: entries}
+	binding := CapabilityParameterBindingV1{ContractVersion: CapabilityParameterBindingVersionV1, CapabilityID: compiled.Declaration.CapabilityID, ParameterContractID: compiled.Declaration.ParameterContract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: compiled.Declaration.Recipe.RecipeDigest, RuntimeConfigDigest: strings.Repeat("9", 64), SelectedSurface: append([]CapabilitySurfaceIdentity(nil), selected...), SelectedSurfaceDigest: selectedDigest, Entries: entries}
 	binding.BindingDigest, err = CapabilityParameterBindingDigest(binding)
 	if err != nil {
 		t.Fatal(err)

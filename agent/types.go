@@ -564,6 +564,10 @@ type Spec struct {
 	// them before spawn.
 	ToolLifecyclePlan *ToolLifecyclePlan `json:"toolLifecyclePlan,omitempty"`
 
+	// CapabilityRuntimeMaterializations are process-only configurations
+	// reconstructed from verified operational bytes. They never enter Spec JSON.
+	CapabilityRuntimeMaterializations []CapabilityRuntimeMaterializationV1 `json:"-"`
+
 	// ToolLifecycleReceipt is the immutable, digest-only result of pre-spawn
 	// tool/MCP/lifecycle admission. Runtime and cleanup requirements are denied
 	// until a durable runtime-evidence promotion path can prove them; it is

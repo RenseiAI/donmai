@@ -303,6 +303,7 @@ type Options struct {
 	// preserves the historical undecorated behavior.
 	AdditionalExtensionDecorator agent.ExtensionDecorator
 	CapabilityRealizations       *agent.CapabilityRealizationRegistry
+	CapabilityParameterBinders   *CapabilityParameterBinderRegistry
 	// ProtectedRuntimeMCPSelector is the exact optional realization whose
 	// selected runtime requires protected MCP acknowledgement.
 	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
@@ -364,6 +365,8 @@ type Runner struct {
 	kitTargetOS                  string
 	additionalExtensionDecorator agent.ExtensionDecorator
 	capabilityRealizations       *agent.CapabilityRealizationRegistry
+	capabilityParameterBinders   *CapabilityParameterBinderRegistry
+	preparedCapabilities         capabilityRealizationResolver
 	protectedRuntimeMCPSelector  ProtectedRuntimeMCPSelector
 
 	// interactiveNoticeClock overrides the interactive supervisor's
@@ -399,6 +402,10 @@ func New(opts Options) (*Runner, error) {
 	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
 		return nil, err
 	}
+	preparedCapabilities, err := newPreparedCapabilityResolver(opts.CapabilityRealizations, opts.CapabilityParameterBinders)
+	if err != nil {
+		return nil, err
+	}
 	r := &Runner{
 		registry:                     opts.Registry,
 		wt:                           opts.WorktreeManager,
@@ -429,6 +436,8 @@ func New(opts Options) (*Runner, error) {
 		kitTargetOS:                  opts.KitTargetOS,
 		additionalExtensionDecorator: opts.AdditionalExtensionDecorator,
 		capabilityRealizations:       opts.CapabilityRealizations,
+		capabilityParameterBinders:   opts.CapabilityParameterBinders,
+		preparedCapabilities:         preparedCapabilities,
 		protectedRuntimeMCPSelector:  opts.ProtectedRuntimeMCPSelector,
 	}
 	if r.envc == nil {

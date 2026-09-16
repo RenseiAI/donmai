@@ -34,6 +34,7 @@ type ProviderView struct {
 	// preserves the historical undecorated behavior.
 	decorate                    agent.ExtensionDecorator
 	realizations                *agent.CapabilityRealizationRegistry
+	preparedCapabilities        capabilityRealizationResolver
 	configRequirements          ExecutionPreflightConfigRequirementResolver
 	protectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
 }
@@ -318,7 +319,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate, v.realizations)
+	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate, v.preparedCapabilities)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
@@ -456,7 +457,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
-	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate, v.realizations)
+	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate, v.preparedCapabilities)
 	if err != nil {
 		return err
 	}
@@ -485,8 +486,28 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 // Config.AgentSpecExtensionDecorator registered keeps compiling unchanged.
 // An embedder that DOES register a decorator must call
 // NewProviderViewWithDecorator instead — see its doc comment for why.
+type ProviderViewOptions struct {
+	Decorator                   agent.ExtensionDecorator
+	CapabilityRealizations      *agent.CapabilityRealizationRegistry
+	CapabilityParameterBinders  *CapabilityParameterBinderRegistry
+	ConfigRequirements          ExecutionPreflightConfigRequirementResolver
+	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
+}
+
+func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*ProviderView, error) {
+	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
+		return nil, err
+	}
+	prepared, err := newPreparedCapabilityResolver(opts.CapabilityRealizations, opts.CapabilityParameterBinders)
+	if err != nil {
+		return nil, err
+	}
+	return &ProviderView{reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations, preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements, protectedRuntimeMCPSelector: opts.ProtectedRuntimeMCPSelector}, nil
+}
+
 func NewProviderView(reg *Registry) *ProviderView {
-	return &ProviderView{reg: reg}
+	view, _ := NewProviderViewWithOptions(reg, ProviderViewOptions{})
+	return view
 }
 
 // NewProviderViewWithDecorator is NewProviderView plus one more step: decorate
@@ -501,18 +522,21 @@ func NewProviderView(reg *Registry) *ProviderView {
 // (daemonProviderView) is the reference wiring. nil is a legitimate value,
 // equivalent to NewProviderView.
 func NewProviderViewWithDecorator(reg *Registry, decorate agent.ExtensionDecorator) *ProviderView {
-	return &ProviderView{reg: reg, decorate: decorate}
+	view, _ := NewProviderViewWithOptions(reg, ProviderViewOptions{Decorator: decorate})
+	return view
 }
 
 // NewProviderViewWithDecoratorAndRealizations binds the same immutable realization snapshot used by child recomputation.
 func NewProviderViewWithDecoratorAndRealizations(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry) *ProviderView {
-	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations}
+	view, _ := NewProviderViewWithOptions(reg, ProviderViewOptions{Decorator: decorate, CapabilityRealizations: realizations})
+	return view
 }
 
 // NewProviderViewWithDecoratorRealizationsAndConfigRequirements adds the
 // trusted common-config requirement resolver while preserving older constructors.
 func NewProviderViewWithDecoratorRealizationsAndConfigRequirements(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry, resolver ExecutionPreflightConfigRequirementResolver) *ProviderView {
-	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations, configRequirements: resolver}
+	view, _ := NewProviderViewWithOptions(reg, ProviderViewOptions{Decorator: decorate, CapabilityRealizations: realizations, ConfigRequirements: resolver})
+	return view
 }
 
 // NewProviderViewWithProtectedRuntimeMCP adds one immutable process-owned
@@ -525,13 +549,7 @@ func NewProviderViewWithProtectedRuntimeMCP(
 	resolver ExecutionPreflightConfigRequirementResolver,
 	selector ProtectedRuntimeMCPSelector,
 ) (*ProviderView, error) {
-	if err := validateProtectedRuntimeMCPSelector(selector, realizations); err != nil {
-		return nil, err
-	}
-	return &ProviderView{
-		reg: reg, decorate: decorate, realizations: realizations,
-		configRequirements: resolver, protectedRuntimeMCPSelector: selector,
-	}, nil
+	return NewProviderViewWithOptions(reg, ProviderViewOptions{Decorator: decorate, CapabilityRealizations: realizations, ConfigRequirements: resolver, ProtectedRuntimeMCPSelector: selector})
 }
 
 // Names returns the sorted list of registered provider names as plain

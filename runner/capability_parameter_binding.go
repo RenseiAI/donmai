@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"strings"
 	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -23,7 +24,19 @@ type CapabilityParameterBindingContext struct {
 type CapabilityParameterBinder interface {
 	ContractID() string
 	SourceDigest() string
-	Bind(CapabilityParameterBindingContext) (agent.CapabilityParameterBindingV1, error)
+	Bind(CapabilityParameterBindingContext) (CapabilityParameterBindResult, error)
+}
+
+type CapabilityParameterBindResult struct {
+	Binding              agent.CapabilityParameterBindingV1
+	Materialization      agent.CapabilityRuntimeMaterializationV1
+	AdditionalExtensions []agent.ExtensionDelivery
+}
+
+type ResolvedCapabilityParameterBinding struct {
+	Realization          agent.CapabilityRealizationBinding
+	Materialization      agent.CapabilityRuntimeMaterializationV1
+	AdditionalExtensions []agent.ExtensionDelivery
 }
 
 type capabilityParameterBinderDescriptor struct {
@@ -79,51 +92,92 @@ func (r *CapabilityParameterBinderRegistry) ResolveAndBind(
 	harness agent.HarnessName,
 	adapterVersion string,
 	mode agent.PromptSessionMode,
-) (agent.CapabilityRealizationBinding, error) {
+) (ResolvedCapabilityParameterBinding, error) {
 	if realizations == nil {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("capability realization registry is required")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability realization registry is required")
 	}
 	compiled, ok := realizations.Resolve(requirement.CapabilityID, harness, adapterVersion, mode)
 	if !ok {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("capability has no exact realization")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability has no exact realization")
 	}
 	if compiled.Declaration.ContractVersion == agent.CapabilityRealizationContractVersionV1 {
-		return agent.BindCapabilityRealization(compiled), nil
+		return ResolvedCapabilityParameterBinding{Realization: agent.BindCapabilityRealization(compiled)}, nil
 	}
 	if compiled.Declaration.ContractVersion != agent.CapabilityRealizationContractVersionV2 || compiled.Declaration.ParameterContract == nil || r == nil {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("parameterized capability realization has no binder registry")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("parameterized capability realization has no binder registry")
 	}
 	if requirement.CapabilityID == "" || !validLowerHexDigest(requirement.ParametersDigest) || !validLowerHexDigest(requirement.OperationalPayloadDigest) || len(bytes.TrimSpace(operationalPayload)) == 0 {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("capability parameter requirement facts are malformed")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability parameter requirement facts are malformed")
 	}
 	payloadDigest, err := executioncell.DigestOperationalPayload(operationalPayload)
 	if err != nil || payloadDigest != requirement.OperationalPayloadDigest {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("capability parameter operational payload digest mismatch")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability parameter operational payload digest mismatch")
 	}
 	r.mu.RLock()
 	descriptor, found := r.binders[compiled.Declaration.ParameterContract.ID]
 	r.mu.RUnlock()
 	if !found || descriptor.sourceDigest != compiled.Declaration.ParameterContract.BinderSourceDigest ||
 		descriptor.binder.ContractID() != descriptor.contractID || descriptor.binder.SourceDigest() != descriptor.sourceDigest {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("capability parameter binder does not match trusted catalog authority")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability parameter binder does not match trusted catalog authority")
 	}
 	context := CapabilityParameterBindingContext{
 		Requirement:        requirement,
 		OperationalPayload: bytes.Clone(operationalPayload),
 		Realization:        compiled,
 	}
-	parameterBinding, err := descriptor.binder.Bind(context)
+	bound, err := descriptor.binder.Bind(context)
 	if err != nil {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("bind capability parameters: %w", err)
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("bind capability parameters: %w", err)
 	}
-	if err := agent.ValidateCapabilityParameterBinding(parameterBinding, compiled.Declaration, requirement); err != nil {
-		return agent.CapabilityRealizationBinding{}, err
+	if err := agent.ValidateCapabilityParameterBinding(bound.Binding, compiled.Declaration, requirement); err != nil {
+		return ResolvedCapabilityParameterBinding{}, err
 	}
+	canonicalConfig, configDigest, err := agent.CanonicalCapabilityRuntimeConfig(bound.Materialization.Config)
+	if err != nil || string(canonicalConfig) != string(bound.Materialization.Config) || configDigest != bound.Materialization.ConfigDigest ||
+		bound.Materialization.ContractVersion != agent.CapabilityRuntimeMaterializationContractVersionV1 ||
+		bound.Materialization.CapabilityID != bound.Binding.CapabilityID || bound.Materialization.ParameterContractID != bound.Binding.ParameterContractID ||
+		bound.Materialization.BindingDigest != bound.Binding.BindingDigest || bound.Materialization.ConfigDigest != bound.Binding.RuntimeConfigDigest {
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability runtime materialization is invalid")
+	}
+	namedEntries := map[string]agent.CapabilityRecipeEntry{}
+	for _, entry := range compiled.Declaration.Recipe.Entries {
+		if entry.Channel == agent.ToolChannelToolPlugin && strings.HasPrefix(entry.EntryID, agent.AdditionalExtensionCapabilityEntryPrefix) {
+			namedEntries[entry.EntryID] = entry
+		}
+	}
+	seenDeliveries := map[string]bool{}
+	for _, delivery := range bound.AdditionalExtensions {
+		if err := agent.ValidateExtensionDelivery(delivery); err != nil || seenDeliveries[delivery.ID] {
+			return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability runtime extension delivery is invalid")
+		}
+		seenDeliveries[delivery.ID] = true
+		entryID, err := agent.AdditionalExtensionCapabilityEntryID(delivery.ID)
+		entry, ok := namedEntries[entryID]
+		if err != nil || !ok || entry.Required != delivery.Required || entry.InputDigest != agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery}) {
+			return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability runtime extension delivery does not match recipe")
+		}
+		delete(namedEntries, entryID)
+	}
+	if len(namedEntries) != 0 {
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("capability runtime extension delivery coverage is incomplete")
+	}
+	parameterBinding := bound.Binding
 	parameterBinding.SelectedSurface = append([]agent.CapabilitySurfaceIdentity(nil), parameterBinding.SelectedSurface...)
 	parameterBinding.Entries = append([]agent.CapabilityBoundEntryV1(nil), parameterBinding.Entries...)
 	binding := agent.BindCapabilityRealization(compiled)
 	binding.ParameterBinding = &parameterBinding
-	return binding, nil
+	result := ResolvedCapabilityParameterBinding{Realization: binding, Materialization: bound.Materialization}
+	result.Materialization.Config = append(json.RawMessage(nil), canonicalConfig...)
+	result.AdditionalExtensions = cloneExtensionDeliveries(bound.AdditionalExtensions)
+	return result, nil
+}
+
+func cloneExtensionDeliveries(in []agent.ExtensionDelivery) []agent.ExtensionDelivery {
+	out := append([]agent.ExtensionDelivery(nil), in...)
+	for i := range out {
+		out[i].Source = append([]byte(nil), in[i].Source...)
+	}
+	return out
 }
 
 type capabilityRealizationResolver interface {
@@ -147,13 +201,19 @@ func (r *parameterBoundCapabilityResolver) Resolve(capability string, harness ag
 	return r.realizations.Resolve(capability, harness, adapter, mode)
 }
 
-func (r *parameterBoundCapabilityResolver) resolveAndBind(requirement agent.CapabilityParameterRequirementFacts, payload json.RawMessage, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) (agent.CapabilityRealizationBinding, error) {
+func (r *parameterBoundCapabilityResolver) resolveAndBind(requirement agent.CapabilityParameterRequirementFacts, payload json.RawMessage, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) (ResolvedCapabilityParameterBinding, error) {
 	if r == nil || r.binders == nil {
-		return agent.CapabilityRealizationBinding{}, fmt.Errorf("parameterized capability realization has no binder registry")
+		return ResolvedCapabilityParameterBinding{}, fmt.Errorf("parameterized capability realization has no binder registry")
 	}
 	return r.binders.ResolveAndBind(r.realizations, requirement, payload, harness, adapter, mode)
 }
 
-func newParameterBoundCapabilityResolver(realizations *agent.CapabilityRealizationRegistry, binders *CapabilityParameterBinderRegistry) capabilityRealizationResolver {
-	return &parameterBoundCapabilityResolver{realizations: realizations, binders: binders}
+func newPreparedCapabilityResolver(realizations *agent.CapabilityRealizationRegistry, binders *CapabilityParameterBinderRegistry) (capabilityRealizationResolver, error) {
+	if binders == nil {
+		return realizations, nil
+	}
+	if realizations == nil {
+		return nil, fmt.Errorf("capability parameter binders require a realization registry")
+	}
+	return &parameterBoundCapabilityResolver{realizations: realizations, binders: binders}, nil
 }
