@@ -390,8 +390,8 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 }
 
 // ResolveExecutionPreflightProtectedRuntimeMCPRequirements resolves the sole
-// process-configured capability only after exact admission and retained-plan
-// validation. An unselected capability returns no requirements.
+// process-configured realization only after exact admission and retained-plan
+// validation. An unselected harness, mode, or capability returns no requirements.
 func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
 	if v == nil || v.reg == nil || !v.protectedRuntimeMCPSelector.configured() {
 		return nil, nil
@@ -508,8 +508,8 @@ func NewProviderViewWithDecoratorRealizationsAndConfigRequirements(reg *Registry
 }
 
 // NewProviderViewWithProtectedRuntimeMCP adds one immutable process-owned
-// capability selector to the complete preflight view. The child Runner must be
-// built with the same selector and realization registry.
+// exact-realization selector to the complete preflight view. The child Runner
+// must be built with the same selector and realization registry.
 func NewProviderViewWithProtectedRuntimeMCP(
 	reg *Registry,
 	decorate agent.ExtensionDecorator,
