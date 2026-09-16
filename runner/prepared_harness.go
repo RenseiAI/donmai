@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"maps"
 	"sort"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/interview"
@@ -281,7 +282,7 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 	target.ProviderConfig = source.ProviderConfig
 	target.PromptPlan = source.PromptPlan
 	target.ToolLifecyclePlan = source.ToolLifecyclePlan
-	target.AdditionalExtensions = cloneExtensionDeliveries(source.AdditionalExtensions)
+	target.AdditionalExtensions = boundRuntimeExtensionDeliveries(source)
 	target.CapabilityRuntimeMaterializations = make([]agent.CapabilityRuntimeMaterializationV1, len(source.CapabilityRuntimeMaterializations))
 	for i := range source.CapabilityRuntimeMaterializations {
 		target.CapabilityRuntimeMaterializations[i] = cloneCapabilityRuntimeMaterialization(source.CapabilityRuntimeMaterializations[i])
@@ -296,4 +297,28 @@ func applyPreparedSourceAuthority(target, source agent.Spec, plan *agent.Prepare
 		target.Interactive = nil
 	}
 	return target
+}
+
+func boundRuntimeExtensionDeliveries(source agent.Spec) []agent.ExtensionDelivery {
+	named := map[string]bool{}
+	if source.ToolLifecyclePlan != nil {
+		for _, binding := range source.ToolLifecyclePlan.CapabilityRealizations {
+			if binding.ContractVersion != agent.CapabilityRealizationContractVersionV2 {
+				continue
+			}
+			for _, entry := range binding.Entries {
+				if entry.Channel == agent.ToolChannelToolPlugin && strings.HasPrefix(entry.EntryID, agent.AdditionalExtensionCapabilityEntryPrefix) {
+					named[entry.EntryID] = true
+				}
+			}
+		}
+	}
+	out := make([]agent.ExtensionDelivery, 0, len(named))
+	for _, delivery := range source.AdditionalExtensions {
+		entryID, err := agent.AdditionalExtensionCapabilityEntryID(delivery.ID)
+		if err == nil && named[entryID] {
+			out = append(out, delivery)
+		}
+	}
+	return cloneExtensionDeliveries(out)
 }

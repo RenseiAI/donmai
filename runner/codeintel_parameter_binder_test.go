@@ -14,6 +14,10 @@ import (
 const testCodeIntelBinderDigest = "abababababababababababababababababababababababababababababababab"
 
 func codeIntelRealizationFixture(t *testing.T, harness agent.HarnessName, profile string, mode agent.PromptSessionMode, native bool) (*agent.CapabilityRealizationRegistry, agent.CompiledCapabilityRealization) {
+	return codeIntelRealizationFixtureForCapability(t, "example.code-intelligence/v1", harness, profile, mode, native)
+}
+
+func codeIntelRealizationFixtureForCapability(t *testing.T, capabilityID string, harness agent.HarnessName, profile string, mode agent.PromptSessionMode, native bool) (*agent.CapabilityRealizationRegistry, agent.CompiledCapabilityRealization) {
 	t.Helper()
 	surface := make([]agent.CapabilitySurfaceIdentity, 0, 7)
 	toolKind := agent.CapabilitySurfaceMCPTool
@@ -35,7 +39,7 @@ func codeIntelRealizationFixture(t *testing.T, harness agent.HarnessName, profil
 		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: toolKind, ID: descriptor.Name})
 	}
 	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: codeintelbridge.ParameterContractID, BinderSourceDigest: testCodeIntelBinderDigest, SurfaceProjection: "subset", RuntimeObservation: "none"}
-	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.code-intelligence/v1", HarnessID: harness, AdapterVersion: profile, Mode: mode, RecipeID: "example/code-intelligence/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: channel, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: capabilityID, HarnessID: harness, AdapterVersion: profile, Mode: mode, RecipeID: "example/code-intelligence/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: channel, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -129,5 +133,40 @@ func TestCodeIntelParameterBinderRejectsStrictToolAndPathInputs(t *testing.T) {
 				t.Fatal("malformed parameter input bound")
 			}
 		})
+	}
+}
+
+func TestSameBinderContractSupportsDistinctCapabilityMaterializations(t *testing.T) {
+	_, first := codeIntelRealizationFixtureForCapability(t, "example.code-intelligence/a", agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous, false)
+	_, second := codeIntelRealizationFixtureForCapability(t, "example.code-intelligence/b", agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous, false)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{first, second})
+	if err != nil {
+		t.Fatal(err)
+	}
+	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	binders, _ := NewCapabilityParameterBinderRegistry(binder)
+	payload := json.RawMessage(`{"codeIntel":{"tools":["af_code_get_repo_map"]}}`)
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(payload, &fields)
+	parametersDigest, _ := executioncell.DigestCapabilityParameters(fields["codeIntel"])
+	operationalDigest, _ := executioncell.DigestOperationalPayload(payload)
+	resolved := make([]ResolvedCapabilityParameterBinding, 0, 2)
+	for _, capability := range []string{"example.code-intelligence/a", "example.code-intelligence/b"} {
+		value, err := binders.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: capability, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}, payload, agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous)
+		if err != nil {
+			t.Fatal(err)
+		}
+		resolved = append(resolved, value)
+	}
+	if resolved[0].Materialization.ParameterContractID != resolved[1].Materialization.ParameterContractID || resolved[0].Materialization.BindingDigest == resolved[1].Materialization.BindingDigest {
+		t.Fatalf("materializations=%+v", resolved)
+	}
+	spec := agent.Spec{ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion}}
+	for _, value := range resolved {
+		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, value.Realization)
+		spec.CapabilityRuntimeMaterializations = append(spec.CapabilityRuntimeMaterializations, value.Materialization)
+	}
+	if err := validateCapabilityRuntimeMaterializations(spec); err != nil {
+		t.Fatalf("shared binder contract rejected distinct capability bindings: %v", err)
 	}
 }

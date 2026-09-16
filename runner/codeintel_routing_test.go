@@ -2,6 +2,8 @@ package runner
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -9,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/internal/codeintelbridge"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -142,7 +145,7 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 		}
 	}
 	if len(provider.spawned.MCPToolNames) != 0 || len(provider.spawned.AdditionalExtensions) != 1 || len(provider.spawned.CapabilityRuntimeMaterializations) != 1 || !strings.Contains(provider.spawned.SystemPromptAppend, "native code-intelligence") {
-		t.Fatalf("actual run loop route drift: %+v", provider.spawned)
+		t.Fatalf("actual run loop route drift: mcpNames=%d extensions=%d materializations=%d nativePrompt=%v", len(provider.spawned.MCPToolNames), len(provider.spawned.AdditionalExtensions), len(provider.spawned.CapabilityRuntimeMaterializations), strings.Contains(provider.spawned.SystemPromptAppend, "native code-intelligence"))
 	}
 }
 
@@ -195,6 +198,19 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	plan, _, err := compilePreparedHarness(qw, selection, nil, nil, resolver)
 	if err != nil || plan.ToolLifecycleReceipt.Decision != "ready" {
 		t.Fatalf("compiled native plan=%+v err=%v", plan, err)
+	}
+	extraSource := []byte("export default function activate() {}\n")
+	extraDigest := sha256.Sum256(extraSource)
+	decorator := func(agent.Spec) []agent.ExtensionDelivery {
+		return []agent.ExtensionDelivery{{ID: "downstream-advisory", Kind: agent.ExtensionDeliveryInline, Source: extraSource, Basename: "downstream.ts", Digest: hex.EncodeToString(extraDigest[:])}}
+	}
+	decorated, _, err := buildPreparedSourceSpec(qw, selection, decorator, resolver)
+	if err != nil || len(decorated.AdditionalExtensions) != 2 {
+		t.Fatalf("decorated prepared source extensions=%d err=%v", len(decorated.AdditionalExtensions), err)
+	}
+	applied := applyPreparedSourceAuthority(agent.Spec{}, decorated, plan)
+	if len(applied.AdditionalExtensions) != 1 || applied.AdditionalExtensions[0].ID != codeintelbridge.DeliveryID {
+		t.Fatalf("prepared authority copied downstream decorator delivery: %+v", applied.AdditionalExtensions)
 	}
 }
 
