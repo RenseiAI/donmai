@@ -121,6 +121,12 @@ type Config struct {
 	// historical capability set and wire bytes.
 	CapabilityRealizations *agent.CapabilityRealizationRegistry
 
+	// ProtectedRuntimeMCPCapability selects one exact registered realization
+	// whose runtime MCP server must carry the protected pre-spawn acknowledgement.
+	// Empty preserves historical child behavior. The embedder must pass the same
+	// selector to its daemon preflight ProviderView.
+	ProtectedRuntimeMCPCapability string
+
 	// EnableA2AClient registers the formal A2A v1 client command group. It is
 	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
 	// command using the same noun before enabling the public surface.

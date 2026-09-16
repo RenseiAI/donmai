@@ -486,6 +486,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// warning an operator gets that the session's tools have a horizon.
 	logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
 	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
+	if err := validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPCapability, mcpServers); err != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureSpawn
+		res.Error = err.Error()
+		return res, err
+	}
 	mcpResult, err := buildMCPConfigPath(r.mcpb, mcpServers)
 	if err != nil {
 		res.Status = "failed"
@@ -2273,6 +2279,26 @@ func mcpGatewayBearer(qw QueuedWork) string {
 	return strings.TrimSpace(qw.AuthToken)
 }
 
+// protectedRuntimeMCPServer derives the exact session-scoped HTTP server used
+// by the protected ACK contract. Unlike the legacy default path it never falls
+// back to the worker bearer.
+func protectedRuntimeMCPServer(qw QueuedWork, provider agent.Provider, mode agent.PromptSessionMode) (agent.MCPServerConfig, error) {
+	if !harnessDeliversMCP(provider, mode) {
+		return agent.MCPServerConfig{}, errors.New("runner: protected runtime MCP is unsupported by the selected harness profile")
+	}
+	if qw.PlatformURL == "" || qw.SessionID == "" || qw.McpAuthToken == "" || strings.TrimSpace(qw.McpAuthToken) != qw.McpAuthToken {
+		return agent.MCPServerConfig{}, errors.New("runner: protected runtime MCP gateway configuration is unavailable")
+	}
+	return agent.MCPServerConfig{
+		Name: platformMCPServerName(),
+		Type: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		URL:  strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID,
+		Headers: map[string]string{
+			"Authorization": "Bearer " + qw.McpAuthToken,
+		},
+	}, nil
+}
+
 // logMCPGatewayBearerExpiry emits one advisory INFO line naming when the
 // gateway's bearer dies, so the one case this design does not close — a session
 // that outlives its bearer still loses its tools silently — is at least visible
@@ -2343,15 +2369,10 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
 	// creds). Always leads the list so it is never shadowed by a later entry.
 	if bearer := mcpGatewayBearer(qw); harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && bearer != "" && qw.SessionID != "" {
-		url := strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID
-		servers = append(servers, agent.MCPServerConfig{
-			Name: platformMCPServerName(),
-			Type: "http",
-			URL:  url,
-			Headers: map[string]string{
-				"Authorization": "Bearer " + bearer,
-			},
-		})
+		protected := QueuedWork{PlatformURL: qw.PlatformURL, McpAuthToken: bearer}
+		protected.SessionID = qw.SessionID
+		server, _ := protectedRuntimeMCPServer(protected, provider, mode)
+		servers = append(servers, server)
 	}
 
 	// In-box code-intelligence stdio plugin. Purely in-box — no platform

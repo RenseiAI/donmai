@@ -74,9 +74,10 @@ type agentRunOpts struct {
 	// specDecorator is cfg.AgentSpecExtensionDecorator, threaded through from
 	// newAgentRunCmd exactly like bin above. nil preserves historical
 	// behavior (no provider wrapping).
-	specDecorator          agent.ExtensionDecorator
-	capabilityRealizations *agent.CapabilityRealizationRegistry
-	piTrustedExtensions    []providerpi.TrustedExtensionIdentity
+	specDecorator                 agent.ExtensionDecorator
+	capabilityRealizations        *agent.CapabilityRealizationRegistry
+	protectedRuntimeMCPCapability string
+	piTrustedExtensions           []providerpi.TrustedExtensionIdentity
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -89,6 +90,10 @@ var bindWorkerGatewayForAgentRun = func(
 	harnessID string,
 ) (*workerGateway, error) {
 	return bindWorkerGateway(ctx, logger, detail, work, harnessID)
+}
+
+var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints, agentBin string) *runner.Registry {
+	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
 }
 
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
@@ -172,9 +177,15 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 	return &agentRunOpts{
 		bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator,
-		capabilityRealizations: cfg.CapabilityRealizations,
-		piTrustedExtensions:    append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
+		capabilityRealizations:        cfg.CapabilityRealizations,
+		protectedRuntimeMCPCapability: cfg.ProtectedRuntimeMCPCapability,
+		piTrustedExtensions:           append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
 	}
+}
+
+func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
+	dst.CapabilityRealizations = src.capabilityRealizations
+	dst.ProtectedRuntimeMCPCapability = src.protectedRuntimeMCPCapability
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
@@ -328,7 +339,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 	hints := agentRunHints(detail)
 	hints.PiTrustedExtensions = append([]providerpi.TrustedExtensionIdentity(nil), opts.piTrustedExtensions...)
-	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
+	reg := buildRegistryForAgentRun(logger, hints, agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
 	if opts.specDecorator != nil {
 		decorateRegistryProviders(reg, opts.specDecorator)
@@ -402,7 +413,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		kitTargetOS = kit.OSLinux
 	}
 
-	r, err := runner.New(runner.Options{
+	runnerOptions := runner.Options{
 		Registry:                  reg,
 		WorktreeManager:           wm,
 		Poster:                    poster,
@@ -440,7 +451,6 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// each other and with the daemon's preflight compiler (see
 		// runner.ReconcileAdditionalExtensions).
 		AdditionalExtensionDecorator: opts.specDecorator,
-		CapabilityRealizations:       opts.capabilityRealizations,
 		// Runtime memory-inject (v2) needs NO worker config: the runner always
 		// wires the inject handler when the provider supports injection, and the
 		// PLATFORM decides per-session whether to deliver (per-project memory
@@ -448,7 +458,9 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// the dispatch-time fold (v1).
 		// Backstop runs by default — the daemon-spawned worker is
 		// the production code path; tests use the in-process entry.
-	})
+	}
+	applyAgentRunCapabilityOptions(&runnerOptions, opts)
+	r, err := runner.New(runnerOptions)
 	if err != nil {
 		return preflightErr(fmt.Sprintf("runner: %v", err))
 	}

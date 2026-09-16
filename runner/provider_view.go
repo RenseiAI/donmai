@@ -11,7 +11,9 @@ import (
 	"crypto/sha256"
 	"encoding/json"
 	"fmt"
+	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -31,9 +33,10 @@ type ProviderView struct {
 	// to the spawn lane surfaces as an undiagnosable
 	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
 	// preserves the historical undecorated behavior.
-	decorate           agent.ExtensionDecorator
-	realizations       *agent.CapabilityRealizationRegistry
-	configRequirements ExecutionPreflightConfigRequirementResolver
+	decorate                      agent.ExtensionDecorator
+	realizations                  *agent.CapabilityRealizationRegistry
+	configRequirements            ExecutionPreflightConfigRequirementResolver
+	protectedRuntimeMCPCapability string
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -52,6 +55,114 @@ type ExecutionPreflightConfigRequirementContext struct {
 // ExecutionPreflightConfigRequirementResolver returns closed common-config requirements.
 type ExecutionPreflightConfigRequirementResolver func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error)
 
+const protectedRuntimeMCPRequirementID = "protected-runtime-mcp/v1"
+
+func validateProtectedRuntimeMCPSelector(selector string, realizations *agent.CapabilityRealizationRegistry) error {
+	if selector == "" {
+		return nil
+	}
+	if strings.TrimSpace(selector) != selector {
+		return fmt.Errorf("runner: protected runtime MCP capability selector is malformed")
+	}
+	if realizations == nil || !realizations.Knows(selector) {
+		return fmt.Errorf("runner: protected runtime MCP capability %q is not registered", selector)
+	}
+	return nil
+}
+
+func digestProtectedRuntimeMCPAuthority(binding agent.CapabilityRealizationBinding) (string, error) {
+	raw, err := executioncell.CanonicalJSON(binding)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return fmt.Sprintf("%x", sum[:]), nil
+}
+
+func resolveProtectedRuntimeMCPRequirement(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector string,
+	host executioncell.HostAdaptationReceipt,
+) (*executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
+	if selector == "" {
+		return nil, nil
+	}
+	if err := validateProtectedRuntimeMCPSelector(selector, realizations); err != nil {
+		return nil, err
+	}
+	count := 0
+	for _, capability := range selection.effectiveCell.GrantedCapabilities {
+		if capability.Name == selector {
+			count++
+		}
+	}
+	if count == 0 {
+		return nil, nil
+	}
+	if count != 1 {
+		return nil, fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector)
+	}
+	harness, ok := selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return nil, fmt.Errorf("runner: protected runtime MCP capability requires an exact harness manifest")
+	}
+	mode := sessionPromptMode(qw, selection.effectiveCell)
+	manifest := harness.Manifest()
+	profile, ok := manifest.ToolLifecycleProfile(mode)
+	if !ok {
+		return nil, fmt.Errorf("runner: protected runtime MCP capability has no exact tool lifecycle profile")
+	}
+	compiled, ok := realizations.Resolve(selector, manifest.Name, profile.ID, mode)
+	if !ok {
+		return nil, fmt.Errorf("runner: protected runtime MCP capability %q has no exact registered realization", selector)
+	}
+	expectedBinding := agent.BindCapabilityRealization(compiled)
+	var toolReceipt agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &toolReceipt); err != nil {
+		return nil, fmt.Errorf("runner: decode protected runtime MCP tool receipt: %w", err)
+	}
+	matches := 0
+	for _, result := range toolReceipt.CapabilityRealizations {
+		if result.CapabilityID != selector {
+			continue
+		}
+		matches++
+		if result.Decision != "artifact_bound" || !reflect.DeepEqual(result.CapabilityRealizationBinding, expectedBinding) {
+			return nil, fmt.Errorf("runner: protected runtime MCP capability evidence does not match the registered realization")
+		}
+	}
+	if matches != 1 {
+		return nil, fmt.Errorf("runner: protected runtime MCP capability requires one artifact-bound receipt result")
+	}
+	server, err := protectedRuntimeMCPServer(qw, selection.Provider, mode)
+	if err != nil {
+		return nil, err
+	}
+	authorityDigest, err := digestProtectedRuntimeMCPAuthority(expectedBinding)
+	if err != nil {
+		return nil, err
+	}
+	endpoint := sha256.Sum256([]byte(server.URL))
+	headers := make([]executioncell.ProtectedRuntimeMCPHeaderV1, 0, len(server.Headers))
+	for name, value := range server.Headers {
+		digest := sha256.Sum256([]byte(value))
+		headers = append(headers, executioncell.ProtectedRuntimeMCPHeaderV1{Name: name, ValueDigest: fmt.Sprintf("%x", digest[:])})
+	}
+	sort.Slice(headers, func(i, j int) bool { return headers[i].Name < headers[j].Name })
+	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV1{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersion,
+		RequirementID:   protectedRuntimeMCPRequirementID, AuthorityBindingDigest: authorityDigest,
+		OperationalPayloadDigest: selection.receipt.Value().OperationalPayloadDigest,
+		ServerName:               server.Name, Transport: server.Type, EndpointDigest: fmt.Sprintf("%x", endpoint[:]), Headers: headers,
+	}
+	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirement(requirement); err != nil {
+		return nil, err
+	}
+	return &requirement, nil
+}
+
 type hostAdaptationReceipt struct {
 	ContractVersion string                       `json:"contractVersion"`
 	RequestID       string                       `json:"requestId"`
@@ -69,6 +180,8 @@ type hostAdaptationReceipt struct {
 type providerViewPreflightWire struct {
 	SessionID               string          `json:"sessionId"`
 	WorkerID                string          `json:"workerId"`
+	PlatformURL             string          `json:"platformUrl"`
+	MCPAuthToken            string          `json:"mcpAuthToken"`
 	AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
 	ClaimReceipt            json.RawMessage `json:"claimReceipt"`
 	EffectiveCell           json.RawMessage `json:"effectiveCell"`
@@ -89,6 +202,7 @@ func decodeProviderViewPreflightWork(detailJSON json.RawMessage) (QueuedWork, ex
 		return QueuedWork{}, executioncell.RuntimeBinding{}, fmt.Errorf("decode host operational payload: %w", err)
 	}
 	qw.SessionID, qw.WorkerID = wire.SessionID, wire.WorkerID
+	qw.PlatformURL, qw.McpAuthToken = wire.PlatformURL, wire.MCPAuthToken
 	qw.AdmissionReceipt, qw.ClaimReceipt, qw.EffectiveCell = wire.AdmissionReceipt, wire.ClaimReceipt, wire.EffectiveCell
 	qw.ExecutionRuntimeBinding, qw.OperationalPayload = wire.ExecutionRuntimeBinding, wire.OperationalPayload
 	var err error
@@ -182,7 +296,7 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 	if err != nil {
 		return nil, err
 	}
-	if (host.ContractVersion != executioncell.HostAdaptationContractVersion && host.ContractVersion != executioncell.HostAdaptationV2ContractVersion) || host.Decision != "ready" {
+	if (host.ContractVersion != executioncell.HostAdaptationContractVersion && host.ContractVersion != executioncell.HostAdaptationV2ContractVersion && host.ContractVersion != executioncell.HostAdaptationV3ContractVersion) || host.Decision != "ready" {
 		return nil, fmt.Errorf("runner: config requirements require a ready host adaptation receipt")
 	}
 	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
@@ -227,6 +341,41 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 		}
 	}
 	return append([]executioncell.PreflightConfigRequirementV1(nil), resolved...), nil
+}
+
+// ResolveExecutionPreflightProtectedRuntimeMCPRequirements resolves the sole
+// process-configured capability only after exact admission and retained-plan
+// validation. An unselected capability returns no requirements.
+func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
+	if v == nil || v.reg == nil || v.protectedRuntimeMCPCapability == "" {
+		return nil, nil
+	}
+	qw, _, err := decodeProviderViewPreflightWork(detailJSON)
+	if err != nil {
+		return nil, err
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
+	if err != nil {
+		return nil, err
+	}
+	if host.Decision != "ready" {
+		return nil, fmt.Errorf("runner: protected runtime MCP requirements require a ready host adaptation receipt")
+	}
+	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
+		return nil, err
+	}
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
+	if err != nil || admission == nil {
+		return nil, fmt.Errorf("runner: protected runtime MCP requirements require exact admission: %w", err)
+	}
+	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, admission.selection, v.realizations, v.protectedRuntimeMCPCapability, host)
+	if err != nil {
+		return nil, err
+	}
+	if requirement == nil {
+		return nil, nil
+	}
+	return []executioncell.ProtectedRuntimeMCPConfigRequirementV1{*requirement}, nil
 }
 
 // ValidateRetainedExecution verifies current sibling mirrors against the exact
@@ -310,6 +459,25 @@ func NewProviderViewWithDecoratorAndRealizations(reg *Registry, decorate agent.E
 // trusted common-config requirement resolver while preserving older constructors.
 func NewProviderViewWithDecoratorRealizationsAndConfigRequirements(reg *Registry, decorate agent.ExtensionDecorator, realizations *agent.CapabilityRealizationRegistry, resolver ExecutionPreflightConfigRequirementResolver) *ProviderView {
 	return &ProviderView{reg: reg, decorate: decorate, realizations: realizations, configRequirements: resolver}
+}
+
+// NewProviderViewWithProtectedRuntimeMCP adds one immutable process-owned
+// capability selector to the complete preflight view. The child Runner must be
+// built with the same selector and realization registry.
+func NewProviderViewWithProtectedRuntimeMCP(
+	reg *Registry,
+	decorate agent.ExtensionDecorator,
+	realizations *agent.CapabilityRealizationRegistry,
+	resolver ExecutionPreflightConfigRequirementResolver,
+	capability string,
+) (*ProviderView, error) {
+	if err := validateProtectedRuntimeMCPSelector(capability, realizations); err != nil {
+		return nil, err
+	}
+	return &ProviderView{
+		reg: reg, decorate: decorate, realizations: realizations,
+		configRequirements: resolver, protectedRuntimeMCPCapability: capability,
+	}, nil
 }
 
 // Names returns the sorted list of registered provider names as plain

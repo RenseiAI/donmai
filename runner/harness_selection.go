@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"reflect"
 	"strings"
 	"sync/atomic"
 	"time"
@@ -320,6 +321,94 @@ func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.Admiss
 	}
 	if !bytes.Equal(host.PromptReceipt, mustJSON(prepared.PromptReceipt)) || !bytes.Equal(host.ToolLifecycleReceipt, mustJSON(prepared.ToolLifecycleReceipt)) {
 		return errors.New("daemon receipt projections differ from sole prepared harness authority")
+	}
+	return nil
+}
+
+func validateProtectedRuntimeMCPMaterialization(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector string,
+	servers []agent.MCPServerConfig,
+) error {
+	if selector == "" {
+		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
+			return nil
+		}
+		host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+		if err != nil {
+			return err
+		}
+		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
+			return errors.New("runner: protected runtime MCP materialization has no configured child selector")
+		}
+		return nil
+	}
+	selected := 0
+	for _, capability := range selection.effectiveCell.GrantedCapabilities {
+		if capability.Name == selector {
+			selected++
+		}
+	}
+	if selected == 0 {
+		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
+			return nil
+		}
+		host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+		if err != nil {
+			return err
+		}
+		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
+			return errors.New("runner: unexpected protected runtime MCP materialization")
+		}
+		return nil
+	}
+	if selected != 1 {
+		return fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+	if err != nil {
+		return err
+	}
+	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, selection, realizations, selector, host)
+	if err != nil {
+		return err
+	}
+	if requirement == nil {
+		return errors.New("runner: selected protected runtime MCP capability has no runtime requirement")
+	}
+	if host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ProtectedRuntimeMCPConfigs) != 1 {
+		return errors.New("runner: selected protected runtime MCP capability requires one v3 materialization")
+	}
+	expected := executioncell.ProtectedRuntimeMCPConfigMaterializationV1{
+		ContractVersion: requirement.ContractVersion, RequirementID: requirement.RequirementID,
+		AuthorityBindingDigest:   requirement.AuthorityBindingDigest,
+		OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+		ServerName:               requirement.ServerName, Transport: requirement.Transport,
+		EndpointDigest: requirement.EndpointDigest,
+		Headers:        append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...),
+	}
+	expected.ConfigReferenceDigest, err = executioncell.DigestProtectedRuntimeMCPConfigReference(expected)
+	if err != nil || !reflect.DeepEqual(host.ProtectedRuntimeMCPConfigs[0], expected) {
+		return errors.New("runner: protected runtime MCP materialization differs from current runtime authority")
+	}
+	wantServer, err := protectedRuntimeMCPServer(qw, selection.Provider, sessionPromptMode(qw, selection.effectiveCell))
+	if err != nil {
+		return err
+	}
+	matches := 0
+	for _, server := range servers {
+		if server.Name != wantServer.Name {
+			continue
+		}
+		matches++
+		if !reflect.DeepEqual(server, wantServer) {
+			return errors.New("runner: protected runtime MCP server differs from acknowledged materialization")
+		}
+	}
+	if matches != 1 {
+		return errors.New("runner: protected runtime MCP server is missing or duplicated")
 	}
 	return nil
 }

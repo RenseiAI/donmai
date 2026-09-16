@@ -127,6 +127,57 @@ func TestHostAdaptationDeniedConfigVersionClosure(t *testing.T) {
 	}
 }
 
+func TestHostAdaptationV3RequiresProtectedRuntimeMCPAndOlderVersionsRejectIt(t *testing.T) {
+	t.Parallel()
+	binding := runtimeBindingV2()
+	var base HostAdaptationReceipt
+	if err := json.Unmarshal(readyHostReceipt(t, binding), &base); err != nil {
+		t.Fatal(err)
+	}
+	protected := validProtectedRuntimeMCPMaterialization(strings.Repeat("a", 64))
+	var baseDocument map[string]any
+	if err := json.Unmarshal(readyHostReceipt(t, binding), &baseDocument); err != nil {
+		t.Fatal(err)
+	}
+	for _, version := range []string{HostAdaptationContractVersion, HostAdaptationV2ContractVersion} {
+		for name, value := range map[string]any{"null": nil, "empty": []any{}, "nonempty": []any{protected}} {
+			t.Run(version+" "+name, func(t *testing.T) {
+				candidate := maps.Clone(baseDocument)
+				candidate["contractVersion"] = version
+				candidate["protectedRuntimeMcpConfigs"] = value
+				if version == HostAdaptationV2ContractVersion {
+					candidate["configMaterializations"] = []PreflightConfigMaterializationV1{validConfigMaterialization(strings.Repeat("a", 64))}
+				}
+				if _, err := DecodeHostAdaptationReceipt(mustJSON(t, candidate)); err == nil {
+					t.Fatalf("%s accepted present protected runtime MCP configs", version)
+				}
+			})
+		}
+	}
+
+	base.ContractVersion = HostAdaptationV3ContractVersion
+	for name, value := range map[string]any{
+		"missing": nil,
+		"null":    nil,
+		"empty":   []any{},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := maps.Clone(baseDocument)
+			candidate["contractVersion"] = HostAdaptationV3ContractVersion
+			if name != "missing" {
+				candidate["protectedRuntimeMcpConfigs"] = value
+			}
+			if _, err := DecodeHostAdaptationReceipt(mustJSON(t, candidate)); err == nil {
+				t.Fatal("host-adaptation/v3 accepted missing protected runtime MCP materialization")
+			}
+		})
+	}
+	base.ProtectedRuntimeMCPConfigs = []ProtectedRuntimeMCPConfigMaterializationV1{protected}
+	if _, err := DecodeHostAdaptationReceipt(mustJSON(t, base)); err != nil {
+		t.Fatalf("valid host-adaptation/v3 rejected: %v", err)
+	}
+}
+
 func TestPreflightConfigRequirementClosesSourcesAndOrdering(t *testing.T) {
 	t.Parallel()
 	valid := validConfigRequirement()
@@ -178,4 +229,82 @@ func validConfigMaterialization(operationalDigest string) PreflightConfigMateria
 	}
 	value.ConfigReferenceDigest = digest
 	return value
+}
+
+func validProtectedRuntimeMCPRequirement(operationalDigest string) ProtectedRuntimeMCPConfigRequirementV1 {
+	return ProtectedRuntimeMCPConfigRequirementV1{
+		ContractVersion: ProtectedRuntimeMCPConfigContractVersion,
+		RequirementID:   "protected-runtime-mcp/v1", AuthorityBindingDigest: strings.Repeat("a", 64),
+		OperationalPayloadDigest: operationalDigest,
+		ServerName:               "donmai-platform", Transport: ProtectedRuntimeMCPTransportHTTP,
+		EndpointDigest: strings.Repeat("c", 64),
+		Headers:        []ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: strings.Repeat("d", 64)}},
+	}
+}
+
+func validProtectedRuntimeMCPMaterialization(operationalDigest string) ProtectedRuntimeMCPConfigMaterializationV1 {
+	requirement := validProtectedRuntimeMCPRequirement(operationalDigest)
+	value := ProtectedRuntimeMCPConfigMaterializationV1{
+		ContractVersion: requirement.ContractVersion, RequirementID: requirement.RequirementID,
+		AuthorityBindingDigest: requirement.AuthorityBindingDigest, OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+		ServerName: requirement.ServerName, Transport: requirement.Transport, EndpointDigest: requirement.EndpointDigest,
+		Headers: append([]ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...),
+	}
+	digest, err := DigestProtectedRuntimeMCPConfigReference(value)
+	if err != nil {
+		panic(err)
+	}
+	value.ConfigReferenceDigest = digest
+	return value
+}
+
+func TestProtectedRuntimeMCPConfigClosesShapeAndBindsEveryField(t *testing.T) {
+	t.Parallel()
+	requirement := validProtectedRuntimeMCPRequirement(strings.Repeat("b", 64))
+	if err := ValidateProtectedRuntimeMCPConfigRequirement(requirement); err != nil {
+		t.Fatal(err)
+	}
+	for name, mutate := range map[string]func(*ProtectedRuntimeMCPConfigRequirementV1){
+		"transport":        func(v *ProtectedRuntimeMCPConfigRequirementV1) { v.Transport = "stdio" },
+		"empty headers":    func(v *ProtectedRuntimeMCPConfigRequirementV1) { v.Headers = nil },
+		"duplicate header": func(v *ProtectedRuntimeMCPConfigRequirementV1) { v.Headers = append(v.Headers, v.Headers[0]) },
+		"raw endpoint": func(v *ProtectedRuntimeMCPConfigRequirementV1) {
+			v.EndpointDigest = "https://example.invalid/api/mcp/session"
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			candidate := requirement
+			candidate.Headers = append([]ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...)
+			mutate(&candidate)
+			if err := ValidateProtectedRuntimeMCPConfigRequirement(candidate); err == nil {
+				t.Fatal("invalid protected runtime MCP requirement accepted")
+			}
+		})
+	}
+	materialization := validProtectedRuntimeMCPMaterialization(strings.Repeat("b", 64))
+	materialization.Headers[0].ValueDigest = strings.Repeat("e", 64)
+	if err := ValidateProtectedRuntimeMCPConfigMaterialization(materialization); err == nil {
+		t.Fatal("mutated protected runtime MCP materialization accepted with stale reference digest")
+	}
+}
+
+func TestPreflightRegistrationAcceptsValidProtectedRuntimeMCPV3(t *testing.T) {
+	t.Parallel()
+	binding := runtimeBindingV2()
+	var host HostAdaptationReceipt
+	if err := json.Unmarshal(readyHostReceipt(t, binding), &host); err != nil {
+		t.Fatal(err)
+	}
+	host.ContractVersion = HostAdaptationV3ContractVersion
+	host.ProtectedRuntimeMCPConfigs = []ProtectedRuntimeMCPConfigMaterializationV1{
+		validProtectedRuntimeMCPMaterialization(strings.Repeat("a", 64)),
+	}
+	receipt := mustJSON(t, host)
+	request, err := NewPreflightRegistrationRequest(binding, receipt, strings.Repeat("a", 64))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := ValidatePreflightRegistrationRequest(request); err != nil {
+		t.Fatal(err)
+	}
 }

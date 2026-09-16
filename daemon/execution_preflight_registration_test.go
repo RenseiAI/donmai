@@ -37,6 +37,18 @@ type orderedConfigPreflightProvider struct {
 	requirements []executioncell.PreflightConfigRequirementV1
 }
 
+type orderedProtectedMCPPreflightProvider struct {
+	*orderedPreflightProvider
+	requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1
+}
+
+func (p *orderedProtectedMCPPreflightProvider) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(_ json.RawMessage, _ json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
+	p.mu.Lock()
+	*p.order = append(*p.order, "protected-requirements")
+	p.mu.Unlock()
+	return append([]executioncell.ProtectedRuntimeMCPConfigRequirementV1(nil), p.requirements...), nil
+}
+
 func (p *orderedConfigPreflightProvider) ResolveExecutionPreflightConfigRequirements(_ json.RawMessage, _ json.RawMessage) ([]executioncell.PreflightConfigRequirementV1, error) {
 	p.mu.Lock()
 	*p.order = append(*p.order, "requirements")
@@ -479,6 +491,65 @@ func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSp
 		if time.Now().After(deadline) {
 			t.Fatalf("spawned child did not read applied bearer: %v", readErr)
 		}
+	}
+}
+
+func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredentialAndSpawn(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	detail.PlatformURL = "https://platform.example/"
+	detail.McpAuthToken = "session-bearer"
+	operationalDigest := operationalDigestFor(t, detail)
+	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV1{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersion,
+		RequirementID:   "protected-runtime-mcp/v1", AuthorityBindingDigest: strings.Repeat("d", 64),
+		OperationalPayloadDigest: operationalDigest,
+		ServerName:               "donmai-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
+		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
+			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
+		}},
+	}
+	base := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigest)}
+	provider := &orderedProtectedMCPPreflightProvider{orderedPreflightProvider: base, requirements: []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+		receipt, decodeErr := base64.StdEncoding.DecodeString(request.ReceiptBytesBase64)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		host, decodeErr := executioncell.DecodeHostAdaptationReceipt(receipt)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		if host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ProtectedRuntimeMCPConfigs) != 1 {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("registration did not receive protected runtime MCP v3")
+		}
+		if strings.Contains(string(receipt), detail.McpAuthToken) || strings.Contains(string(receipt), "https://platform.example/api/mcp/") {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("registered protected runtime MCP receipt leaked runtime values")
+		}
+		return authorizedRegistration(request)
+	}}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotOrder := slices.Clone(order)
+	mu.Unlock()
+	if strings.Join(gotOrder, ",") != "compile,protected-requirements,fsync,register,credential" {
+		t.Fatalf("effect order = %v", gotOrder)
+	}
+	persisted, err := store.Load(detail.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(persisted)
+	if err != nil || host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ProtectedRuntimeMCPConfigs) != 1 {
+		t.Fatalf("persisted host receipt = %+v err=%v", host, err)
 	}
 }
 

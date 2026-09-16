@@ -300,6 +300,12 @@ type ExecutionPreflightConfigRequirementProvider interface {
 	ResolveExecutionPreflightConfigRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.PreflightConfigRequirementV1, error)
 }
 
+// ExecutionPreflightProtectedRuntimeMCPRequirementProvider optionally resolves
+// one exact protected HTTP MCP configuration after host compilation.
+type ExecutionPreflightProtectedRuntimeMCPRequirementProvider interface {
+	ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error)
+}
+
 // ExecutionPreflightReplayValidator re-applies canonical sibling/profile
 // reconciliation to retained receipt bytes without compiling or replacing the
 // original plan.
@@ -2062,6 +2068,8 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 			preflightInput := struct {
 				SessionID               string          `json:"sessionId"`
 				WorkerID                string          `json:"workerId"`
+				PlatformURL             string          `json:"platformUrl"`
+				MCPAuthToken            string          `json:"mcpAuthToken"`
 				AdmissionReceipt        json.RawMessage `json:"admissionReceipt"`
 				ClaimReceipt            json.RawMessage `json:"claimReceipt,omitempty"`
 				EffectiveCell           json.RawMessage `json:"effectiveCell"`
@@ -2072,6 +2080,7 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				StageBudget             json.RawMessage `json:"stageBudget,omitempty"`
 			}{
 				SessionID: detail.SessionID, WorkerID: detail.WorkerID,
+				PlatformURL: detail.PlatformURL, MCPAuthToken: detail.McpAuthToken,
 				AdmissionReceipt: detail.AdmissionReceipt, ClaimReceipt: detail.ClaimReceipt,
 				EffectiveCell: detail.EffectiveCell, ExecutionRuntimeBinding: detail.ExecutionRuntimeBinding,
 				OperationalPayload: detail.OperationalPayload,
@@ -2143,10 +2152,17 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						return nil, fmt.Errorf("resolve execution preflight config requirements: %w", err)
 					}
 				}
-				if len(requirements) > 0 {
-					if binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
-						return nil, errors.New("execution preflight config requires registered runtime binding v2")
+				var protectedRequirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1
+				if provider, ok := d.opts.ProviderRegistry.(ExecutionPreflightProtectedRuntimeMCPRequirementProvider); ok {
+					protectedRequirements, err = provider.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON, receipt)
+					if err != nil {
+						return nil, fmt.Errorf("resolve execution preflight protected runtime MCP requirements: %w", err)
 					}
+				}
+				if (len(requirements) > 0 || len(protectedRequirements) > 0) && binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
+					return nil, errors.New("execution preflight materialization requires registered runtime binding v2")
+				}
+				if len(requirements) > 0 {
 					if d.preflightConfigs == nil {
 						return nil, errors.New("execution preflight config ownership is unavailable")
 					}
@@ -2165,7 +2181,7 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						return nil, errors.New("complete execution preflight config ownership")
 					}
 					if replayedReceipt {
-						if hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, materializations) {
+						if (hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion && hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion) || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, materializations) {
 							return nil, errors.New("retained execution preflight config materialization changed")
 						}
 					} else {
@@ -2175,7 +2191,29 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						}
 						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
 					}
-				} else if hostReceipt.ContractVersion != executioncell.HostAdaptationContractVersion {
+				} else if len(hostReceipt.ConfigMaterializations) > 0 {
+					return nil, errors.New("host adaptation config materializations require resolved config requirements")
+				}
+				protectedMaterializations, materializeErr := materializeProtectedRuntimeMCPConfigs(detail, protectedRequirements)
+				if materializeErr != nil {
+					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP config: %w", materializeErr)
+				}
+				switch {
+				case len(protectedRequirements) > 0:
+					if replayedReceipt {
+						if hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion || !reflect.DeepEqual(hostReceipt.ProtectedRuntimeMCPConfigs, protectedMaterializations) {
+							return nil, errors.New("retained protected runtime MCP materialization changed")
+						}
+					} else {
+						receipt, err = hostReceiptWithProtectedRuntimeMCPConfigs(receipt, protectedMaterializations)
+						if err != nil {
+							return nil, fmt.Errorf("attach execution preflight protected runtime MCP materializations: %w", err)
+						}
+						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
+					}
+				case hostReceipt.ContractVersion == executioncell.HostAdaptationV3ContractVersion:
+					return nil, errors.New("host adaptation v3 requires resolved protected runtime MCP requirements")
+				case hostReceipt.ContractVersion == executioncell.HostAdaptationV2ContractVersion && len(requirements) == 0:
 					return nil, errors.New("host adaptation v2 requires resolved config requirements")
 				}
 			}
