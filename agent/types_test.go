@@ -7,6 +7,20 @@ import (
 	"testing"
 )
 
+func TestSpecCarriesProcessOnlyCapabilityMaterializations(t *testing.T) {
+	field, ok := reflect.TypeOf(Spec{}).FieldByName("CapabilityRuntimeMaterializations")
+	if !ok {
+		t.Fatal("Spec omits process-only capability materializations")
+	}
+	if got := field.Tag.Get("json"); got != "-" {
+		t.Fatalf("CapabilityRuntimeMaterializations json tag = %q, want -", got)
+	}
+	bindingField, ok := reflect.TypeOf(CapabilityParameterBindingV1{}).FieldByName("RuntimeConfigDigest")
+	if !ok || bindingField.Tag.Get("json") != "runtimeConfigDigest" {
+		t.Fatalf("parameter binding runtime config digest field = %+v, present=%v", bindingField, ok)
+	}
+}
+
 // TestSpec_RoundTrip verifies a Spec round-trips through JSON without
 // data loss and that camelCase JSON tags are preserved on the wire.
 func TestSpec_RoundTrip(t *testing.T) {
