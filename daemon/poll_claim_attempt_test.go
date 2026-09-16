@@ -8,6 +8,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"reflect"
 	"strings"
 	"sync"
 	"testing"
@@ -83,6 +84,20 @@ func claimAttemptPollBody(sessionID, token string) string {
 	}`, sessionID, sessionID, sessionID, token)
 }
 
+func tooManyClaimAttemptsBody() string {
+	var proofs strings.Builder
+	for index := 0; index <= maxPollClaimAttemptProofs; index++ {
+		if index > 0 {
+			proofs.WriteByte(',')
+		}
+		sessionID := fmt.Sprintf("proof-%d", index)
+		_, _ = fmt.Fprintf(&proofs,
+			`%q:{"contractVersion":"work-claim-attempt/v1","sessionId":%q,"attemptToken":%q}`,
+			sessionID, sessionID, claimAttemptTokenOne)
+	}
+	return `{"work":[{"sessionId":"proof-0","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1}],"claimAttempts":{` + proofs.String() + `}}`
+}
+
 func decodeClaimAttemptBody(t *testing.T, raw json.RawMessage) map[string]any {
 	t.Helper()
 	var value map[string]any
@@ -95,7 +110,7 @@ func decodeClaimAttemptBody(t *testing.T, raw json.RawMessage) map[string]any {
 func TestPollClaimAttempt_ActualHTTPRoundTripOutsideWork(t *testing.T) {
 	fixture := newClaimAttemptHTTPFixture(t, claimAttemptPollBody("session-proof", claimAttemptTokenOne))
 	var marshaledItem []byte
-	var detailJSON []byte
+	var detail *SessionDetail
 	poller := NewPollService(PollOptions{
 		WorkerID:        "worker-proof",
 		RuntimeJWT:      "runtime-proof",
@@ -107,12 +122,9 @@ func TestPollClaimAttempt_ActualHTTPRoundTripOutsideWork(t *testing.T) {
 			if err != nil {
 				return err
 			}
-			detailJSON, err = json.Marshal(PollItemToSessionDetail(
+			detail = PollItemToSessionDetail(
 				item, nil, fixture.server.URL, "runtime-proof", "worker-proof",
-			))
-			if err != nil {
-				return err
-			}
+			)
 			return NackRejectedWork(
 				context.Background(), fixture.server.Client(), fixture.server.URL,
 				"worker-proof", "runtime-proof", &item, errors.New("synthetic rejection"),
@@ -138,12 +150,25 @@ func TestPollClaimAttempt_ActualHTTPRoundTripOutsideWork(t *testing.T) {
 	if _, ok := nacks[0]["work"]; !ok {
 		t.Fatal("legacy NACK work member disappeared")
 	}
-	for name, raw := range map[string][]byte{"item": marshaledItem, "detail": detailJSON} {
-		if strings.Contains(string(raw), "work-claim-attempt") ||
-			strings.Contains(string(raw), claimAttemptTokenOne) ||
-			strings.Contains(string(raw), "claimAttempt") {
-			t.Fatalf("%s leaked proof: %s", name, raw)
+	if strings.Contains(string(marshaledItem), "work-claim-attempt") ||
+		strings.Contains(string(marshaledItem), claimAttemptTokenOne) ||
+		strings.Contains(string(marshaledItem), "claimAttempt") {
+		t.Fatalf("item leaked proof: %s", marshaledItem)
+	}
+	if detail == nil {
+		t.Fatal("session detail was not built")
+	}
+	detailType := reflect.TypeOf(*detail)
+	for index := 0; index < detailType.NumField(); index++ {
+		field := detailType.Field(index)
+		if strings.Contains(strings.ToLower(field.Name), "claimattempt") ||
+			strings.Contains(field.Tag.Get("json"), "claimAttempt") {
+			t.Fatalf("SessionDetail gained proof field %s", field.Name)
 		}
+	}
+	if strings.Contains(string(detail.OperationalPayload), claimAttemptTokenOne) ||
+		strings.Contains(string(detail.OperationalPayload), "claimAttempt") {
+		t.Fatalf("detail operational payload leaked proof: %s", detail.OperationalPayload)
 	}
 	var work map[string]json.RawMessage
 	if err := json.Unmarshal(nacks[0]["work"], &work); err != nil {
@@ -209,6 +234,7 @@ func TestPollClaimAttempt_InvalidEnvelopeNeverBindsOrBlocksWork(t *testing.T) {
 		{"duplicate proof member", `{"work":[{"sessionId":"s","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1}],"claimAttempts":{"s":{"contractVersion":"work-claim-attempt/v1","sessionId":"s","attemptToken":"` + claimAttemptTokenOne + `","attemptToken":"` + claimAttemptTokenTwo + `"}}}`},
 		{"duplicate envelope member", `{"work":[{"sessionId":"s","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1}],"claimAttempts":{"s":` + validProof + `},"claimAttempts":{"s":` + validProof + `}}`},
 		{"duplicate work identity", `{"work":[{"sessionId":"s","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1},{"sessionId":"s","issueId":"i2","issueIdentifier":"T-2","priority":1,"queuedAt":2}],"claimAttempts":{"s":` + validProof + `}}`},
+		{"too many proofs", tooManyClaimAttemptsBody()},
 	}
 
 	for _, tt := range tests {
@@ -281,6 +307,104 @@ func TestPollClaimAttempt_SuccessiveSameSessionProofsDoNotAlias(t *testing.T) {
 	want := []any{claimAttemptTokenOne, claimAttemptTokenTwo}
 	if fmt.Sprint(got) != fmt.Sprint(want) {
 		t.Fatalf("successive tokens = %v, want %v", got, want)
+	}
+}
+
+func TestPollClaimAttempt_MultipleSessionsBindByIdentity(t *testing.T) {
+	body := `{
+		"work":[
+			{"sessionId":"session-a","issueId":"a","issueIdentifier":"T-A","priority":1,"queuedAt":1},
+			{"sessionId":"session-b","issueId":"b","issueIdentifier":"T-B","priority":1,"queuedAt":2},
+			{"sessionId":"session-legacy","issueId":"legacy","issueIdentifier":"T-L","priority":1,"queuedAt":3}
+		],
+		"claimAttempts":{
+			"session-b":{"contractVersion":"work-claim-attempt/v1","sessionId":"session-b","attemptToken":"` + claimAttemptTokenTwo + `"},
+			"session-a":{"contractVersion":"work-claim-attempt/v1","sessionId":"session-a","attemptToken":"` + claimAttemptTokenOne + `"}
+		}
+	}`
+	fixture := newClaimAttemptHTTPFixture(t, body)
+	poller := NewPollService(PollOptions{
+		WorkerID: "worker-multiple", RuntimeJWT: "runtime-multiple",
+		OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+		OnWork: func(item PollWorkItem) error {
+			return NackRejectedWork(context.Background(), fixture.server.Client(), fixture.server.URL,
+				"worker-multiple", "runtime-multiple", &item, errors.New("multiple rejection"))
+		},
+	})
+	poller.pollOnce(context.Background())
+	nacks := fixture.nackBodies()
+	if len(nacks) != 3 {
+		t.Fatalf("NACK count = %d, want 3", len(nacks))
+	}
+	got := make(map[string]string)
+	for _, nack := range nacks {
+		var work struct {
+			SessionID string `json:"sessionId"`
+		}
+		if err := json.Unmarshal(nack["work"], &work); err != nil {
+			t.Fatal(err)
+		}
+		if proofRaw, ok := nack["claimAttempt"]; ok {
+			proof := decodeClaimAttemptBody(t, proofRaw)
+			got[work.SessionID], _ = proof["attemptToken"].(string)
+		} else {
+			got[work.SessionID] = ""
+		}
+	}
+	want := map[string]string{
+		"session-a":      claimAttemptTokenOne,
+		"session-b":      claimAttemptTokenTwo,
+		"session-legacy": "",
+	}
+	if fmt.Sprint(got) != fmt.Sprint(want) {
+		t.Fatalf("proof bindings = %v, want %v", got, want)
+	}
+}
+
+func TestPollClaimAttempt_ConcurrentPollersDoNotAlias(t *testing.T) {
+	tests := []struct {
+		name      string
+		sessionID string
+		workerID  string
+		token     string
+		fixture   *claimAttemptHTTPFixture
+		poller    *PollService
+	}{
+		{name: "one", sessionID: "concurrent-one", workerID: "worker-one", token: claimAttemptTokenOne},
+		{name: "two", sessionID: "concurrent-two", workerID: "worker-two", token: claimAttemptTokenTwo},
+	}
+	for index := range tests {
+		tc := &tests[index]
+		tc.fixture = newClaimAttemptHTTPFixture(t, claimAttemptPollBody(tc.sessionID, tc.token))
+		tc.poller = NewPollService(PollOptions{
+			WorkerID: tc.workerID, RuntimeJWT: "runtime-" + tc.name,
+			OrchestratorURL: tc.fixture.server.URL, HTTPClient: tc.fixture.server.Client(),
+			OnWork: func(item PollWorkItem) error {
+				return NackRejectedWork(context.Background(), tc.fixture.server.Client(), tc.fixture.server.URL,
+					tc.workerID, "runtime-"+tc.name, &item, errors.New("concurrent rejection"))
+			},
+		})
+	}
+	var wait sync.WaitGroup
+	for index := range tests {
+		poller := tests[index].poller
+		wait.Add(1)
+		go func() {
+			defer wait.Done()
+			poller.pollOnce(context.Background())
+		}()
+	}
+	wait.Wait()
+	for _, tc := range tests {
+		nacks := tc.fixture.nackBodies()
+		if len(nacks) != 1 {
+			t.Errorf("%s NACK count = %d, want 1", tc.name, len(nacks))
+			continue
+		}
+		proof := decodeClaimAttemptBody(t, nacks[0]["claimAttempt"])
+		if proof["sessionId"] != tc.sessionID || proof["attemptToken"] != tc.token {
+			t.Errorf("%s proof = %#v", tc.name, proof)
+		}
 	}
 }
 
