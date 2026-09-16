@@ -2243,10 +2243,13 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						// Keep the typed cause observable without granting terminal-report
 						// authority: only an exact persisted or reaffirmed receipt can make
 						// the permanent-denial projection durable.
-						return nil, errors.Join(
-							persistFailure,
-							fmt.Errorf("execution adaptation preflight: %w", preflightErr),
-						)
+						preflightFailure := fmt.Errorf("execution adaptation preflight: %w", preflightErr)
+						if permanentDenialWrapper(preflightErr) != nil {
+							return nil, protectPermanentDenialBoundaryFailure(
+								"receipt persistence", persistFailure, preflightFailure,
+							)
+						}
+						return nil, errors.Join(persistFailure, preflightFailure)
 					}
 					return nil, persistFailure
 				}
@@ -2258,10 +2261,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				registrationRequest, requestErr := executioncell.NewPreflightRegistrationRequest(binding, persistedReceipt, operationalDigest)
 				if requestErr != nil {
 					registrationFailure := fmt.Errorf("build execution preflight registration: %w", requestErr)
-					if permanentDenialWrapper(preflightErr) != nil {
-						return nil, errors.Join(registrationFailure, preflightErr)
-					}
-					return nil, registrationFailure
+					return nil, protectPermanentDenialBoundaryFailure(
+						"registration request", registrationFailure, preflightErr,
+					)
 				}
 				registrationContext := d.landingCtx
 				if registrationContext == nil {
@@ -2270,17 +2272,15 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				registrationResponse, registrationErr := d.opts.ExecutionPreflightRegistrar.RegisterExecutionPreflight(registrationContext, registrationRequest)
 				if registrationErr != nil {
 					registrationFailure := fmt.Errorf("register execution preflight: %w", registrationErr)
-					if permanentDenialWrapper(preflightErr) != nil {
-						return nil, errors.Join(registrationFailure, preflightErr)
-					}
-					return nil, registrationFailure
+					return nil, protectPermanentDenialBoundaryFailure(
+						"registration transport", registrationFailure, preflightErr,
+					)
 				}
 				if registrationErr = executioncell.ValidateAuthorizedPreflightRegistration(registrationRequest, registrationResponse); registrationErr != nil {
 					registrationFailure := fmt.Errorf("execution preflight acknowledgement: %w", registrationErr)
-					if permanentDenialWrapper(preflightErr) != nil {
-						return nil, errors.Join(registrationFailure, preflightErr)
-					}
-					return nil, registrationFailure
+					return nil, protectPermanentDenialBoundaryFailure(
+						"registration acknowledgement", registrationFailure, preflightErr,
+					)
 				}
 				localPreflightRequest = &registrationRequest
 				localPreflightResponse = &registrationResponse

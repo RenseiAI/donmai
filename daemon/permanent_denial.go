@@ -41,6 +41,28 @@ type preSpawnPermanentDenialError struct {
 	durable bool
 }
 
+type preSpawnPermanentDenialBoundaryError struct {
+	phase  string
+	causes []error
+}
+
+func (e *preSpawnPermanentDenialBoundaryError) Error() string {
+	return "permanent pre-spawn denial " + e.phase + " failed"
+}
+
+func (e *preSpawnPermanentDenialBoundaryError) Unwrap() []error {
+	return append([]error(nil), e.causes...)
+}
+
+func protectPermanentDenialBoundaryFailure(phase string, failure, preflightErr error) error {
+	if permanentDenialWrapper(preflightErr) == nil {
+		return failure
+	}
+	return &preSpawnPermanentDenialBoundaryError{
+		phase: phase, causes: []error{failure, preflightErr},
+	}
+}
+
 func (e *preSpawnPermanentDenialError) Error() string { return preSpawnPermanentDenialReason }
 func (e *preSpawnPermanentDenialError) Unwrap() error { return e.cause }
 
@@ -334,6 +356,9 @@ func decodeClosedPermanentDenialJSON(raw json.RawMessage, target any) error {
 	if err := rejectPermanentDenialDuplicateJSON(raw); err != nil {
 		return err
 	}
+	if err := validatePermanentDenialExactJSONNames(raw, reflect.TypeOf(target)); err != nil {
+		return err
+	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(target); err != nil {
@@ -342,6 +367,73 @@ func decodeClosedPermanentDenialJSON(raw json.RawMessage, target any) error {
 	var trailing any
 	if err := decoder.Decode(&trailing); !errors.Is(err, io.EOF) {
 		return errors.New("permanent denial evidence has trailing JSON")
+	}
+	return nil
+}
+
+var permanentDenialRawMessageType = reflect.TypeOf(json.RawMessage{})
+
+func validatePermanentDenialExactJSONNames(raw json.RawMessage, targetType reflect.Type) error {
+	for targetType.Kind() == reflect.Pointer {
+		targetType = targetType.Elem()
+	}
+	if targetType == permanentDenialRawMessageType || targetType.Kind() == reflect.Interface {
+		return nil
+	}
+	if bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
+		return nil
+	}
+	switch targetType.Kind() {
+	case reflect.Struct:
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+			return errors.New("permanent denial evidence must be an object")
+		}
+		fields := make(map[string]reflect.Type, targetType.NumField())
+		for index := 0; index < targetType.NumField(); index++ {
+			field := targetType.Field(index)
+			if !field.IsExported() {
+				continue
+			}
+			tag := field.Tag.Get("json")
+			name := strings.Split(tag, ",")[0]
+			if name == "-" {
+				continue
+			}
+			if name == "" {
+				name = field.Name
+			}
+			fields[name] = field.Type
+		}
+		for name, memberRaw := range members {
+			fieldType, ok := fields[name]
+			if !ok {
+				return errors.New("permanent denial evidence has unknown or aliased member")
+			}
+			if err := validatePermanentDenialExactJSONNames(memberRaw, fieldType); err != nil {
+				return err
+			}
+		}
+	case reflect.Map:
+		var members map[string]json.RawMessage
+		if err := json.Unmarshal(raw, &members); err != nil || members == nil {
+			return errors.New("permanent denial evidence has invalid dynamic map")
+		}
+		for _, memberRaw := range members {
+			if err := validatePermanentDenialExactJSONNames(memberRaw, targetType.Elem()); err != nil {
+				return err
+			}
+		}
+	case reflect.Slice, reflect.Array:
+		var elements []json.RawMessage
+		if err := json.Unmarshal(raw, &elements); err != nil {
+			return errors.New("permanent denial evidence has invalid array")
+		}
+		for _, elementRaw := range elements {
+			if err := validatePermanentDenialExactJSONNames(elementRaw, targetType.Elem()); err != nil {
+				return err
+			}
+		}
 	}
 	return nil
 }

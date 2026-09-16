@@ -1830,6 +1830,124 @@ func TestDaemonPollPermanentDenial_ActualHTTPReportIsClosedAndAcknowledged(t *te
 	}
 }
 
+func TestDaemonPollPermanentDenial_BoundaryFailuresDoNotLeakCauseDetails(t *testing.T) {
+	for _, testCase := range []struct {
+		name       string
+		configure  func(*testing.T, PollWorkItem, json.RawMessage, *agent.ToolAdaptationError) (PollWorkItem, Options)
+		wantReport bool
+		marker     string
+	}{
+		{
+			name:   "persistence",
+			marker: "STORE_SECRET_DO_NOT_LEAK",
+			configure: func(_ *testing.T, item PollWorkItem, receipt json.RawMessage, typed *agent.ToolAdaptationError) (PollWorkItem, Options) {
+				return item, Options{
+					ProviderRegistry: &countingExecutionPreflight{receipt: receipt, err: typed},
+					ExecutionPreflightStore: &failingExecutionPreflightStore{
+						err: errors.New("STORE_SECRET_DO_NOT_LEAK"),
+					},
+				}
+			},
+		},
+		{
+			name:       "registration",
+			marker:     "REGISTRAR_SECRET_DO_NOT_LEAK",
+			wantReport: true,
+			configure: func(t *testing.T, item PollWorkItem, receipt json.RawMessage, typed *agent.ToolAdaptationError) (PollWorkItem, Options) {
+				binding, err := executioncell.DecodeRuntimeBinding(item.ExecutionRuntimeBinding)
+				if err != nil {
+					t.Fatal(err)
+				}
+				binding.ContractVersion = executioncell.RuntimeBindingV2ContractVersion
+				binding.PreflightRegistration = &executioncell.PreflightRegistrationRef{
+					ContractVersion: executioncell.PreflightRegistrationContractVersion,
+					Required:        true, ChallengeID: "challenge-poll-secret",
+				}
+				item.ExecutionRuntimeBinding = rawJSON(t, binding)
+				mu := &sync.Mutex{}
+				order := []string{}
+				return item, Options{
+					ProviderRegistry:        &countingExecutionPreflight{receipt: receipt, err: typed},
+					ExecutionPreflightStore: NewFileExecutionPreflightStore(t.TempDir()),
+					ExecutionPreflightRegistrar: &orderedRegistrar{
+						mu: mu, order: &order,
+						response: func(executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+							return executioncell.PreflightRegistrationResponse{}, errors.New("REGISTRAR_SECRET_DO_NOT_LEAK")
+						},
+					},
+				}
+			},
+		},
+	} {
+		t.Run(testCase.name, func(t *testing.T) {
+			item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-boundary-"+testCase.name, "wkr-test")
+			item, options := testCase.configure(t, item, hostReceipt, typed)
+			itemRaw := rawJSON(t, item)
+			hostSum := sha256.Sum256(hostReceipt)
+			hostSHA := hex.EncodeToString(hostSum[:])
+			pollBody := fmt.Sprintf(
+				`{"work":[%s],"claimAttempts":{%q:{"contractVersion":"work-claim-attempt/v1","sessionId":%q,"attemptToken":%q}},"nackContracts":["pre-spawn-permanent-denial/v1"]}`,
+				itemRaw, item.SessionID, item.SessionID, claimAttemptTokenOne,
+			)
+			var requestBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				switch r.Method {
+				case http.MethodGet:
+					_, _ = io.WriteString(w, pollBody)
+				case http.MethodPost:
+					var err error
+					requestBody, err = io.ReadAll(r.Body)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if testCase.wantReport {
+						_ = json.NewEncoder(w).Encode(map[string]any{
+							"contractVersion": preSpawnPermanentDenialContractVersion,
+							"outcome":         "terminal", "sessionId": item.SessionID,
+							"attemptToken":      claimAttemptTokenOne,
+							"hostReceiptSha256": hostSHA,
+						})
+						return
+					}
+					w.WriteHeader(http.StatusNoContent)
+				default:
+					http.NotFound(w, r)
+				}
+			}))
+			t.Cleanup(srv.Close)
+			d := newRunningTestDaemon(t, options,
+				[]ProjectConfig{{ID: "project", Repository: "github.com/acme/repo"}}, nil)
+			d.mu.Lock()
+			d.jwt = "runtime-token"
+			d.mu.Unlock()
+			slogBuffer, restoreSlog := withCapturedSlog(t)
+			defer restoreSlog()
+			var pollLogs strings.Builder
+			poller := NewPollService(PollOptions{
+				WorkerID: "wkr-test", RuntimeJWT: "runtime-token",
+				OrchestratorURL: srv.URL, HTTPClient: srv.Client(),
+				LogWarn: func(format string, args ...any) { _, _ = fmt.Fprintf(&pollLogs, format, args...) },
+				OnWork:  func(got PollWorkItem) error { return d.handlePollWorkItem(got, srv.URL) },
+			})
+			poller.pollOnce(context.Background())
+			combined := pollLogs.String() + slogBuffer.String() + string(requestBody)
+			for _, marker := range []string{testCase.marker, typed.Detail} {
+				if strings.Contains(combined, marker) {
+					t.Fatalf("actual poll path leaked %q: %s", marker, combined)
+				}
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(requestBody, &body); err != nil {
+				t.Fatal(err)
+			}
+			_, gotReport := body["preSpawnPermanentDenial"]
+			if gotReport != testCase.wantReport {
+				t.Fatalf("report present=%v want=%v body=%s", gotReport, testCase.wantReport, requestBody)
+			}
+		})
+	}
+}
+
 func mapsEqual(got any, want map[string]any) bool {
 	gotMap, ok := got.(map[string]any)
 	if !ok || len(gotMap) != len(want) {

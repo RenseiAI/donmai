@@ -61,6 +61,31 @@ func mutateDeniedHostReceipt(
 	return rawJSON(t, host)
 }
 
+func mutateDeniedToolReceiptJSONName(
+	t *testing.T,
+	receipt json.RawMessage,
+	from, to string,
+) json.RawMessage {
+	t.Helper()
+	var host executioncell.HostAdaptationReceipt
+	if err := json.Unmarshal(receipt, &host); err != nil {
+		t.Fatal(err)
+	}
+	planRaw := json.RawMessage(strings.Replace(string(host.Plan), from, to, 1))
+	if bytes.Equal(planRaw, host.Plan) {
+		t.Fatalf("plan mutation %q -> %q did not apply", from, to)
+	}
+	toolRaw := json.RawMessage(strings.Replace(string(host.ToolLifecycleReceipt), from, to, 1))
+	if bytes.Equal(toolRaw, host.ToolLifecycleReceipt) {
+		t.Fatalf("tool mutation %q -> %q did not apply", from, to)
+	}
+	planSum := sha256.Sum256(planRaw)
+	host.Plan = planRaw
+	host.PlanDigest = hex.EncodeToString(planSum[:])
+	host.ToolLifecycleReceipt = toolRaw
+	return rawJSON(t, host)
+}
+
 func TestPermanentDenialProjection_CanonicalBindingAndRawHostIdentity(t *testing.T) {
 	item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-hash", "wkr-test")
 	detail, binding := permanentDenialDetail(t, item)
@@ -143,6 +168,29 @@ func TestPermanentDenialProjection_PreservesTypedCauseWithoutRenderingDetail(t *
 	}
 }
 
+func TestPermanentDenialBoundaryErrorPreservesBothCausesWithoutRenderingEither(t *testing.T) {
+	typed := &agent.ToolAdaptationError{
+		Code: agent.ToolDenialDeliveryUnsupported, Channel: agent.ToolChannelMCPServer,
+		Detail: "TYPED_CAUSE_SECRET_DO_NOT_LEAK",
+	}
+	wrapped := &preSpawnPermanentDenialError{cause: typed}
+	boundaryCause := errors.New("BOUNDARY_CAUSE_SECRET_DO_NOT_LEAK")
+	err := protectPermanentDenialBoundaryFailure("registration transport", boundaryCause, wrapped)
+	if !errors.Is(err, boundaryCause) {
+		t.Fatal("boundary classification cause was not preserved")
+	}
+	var got *agent.ToolAdaptationError
+	if !errors.As(err, &got) || got != typed {
+		t.Fatal("typed denial cause was not preserved")
+	}
+	if err.Error() != "permanent pre-spawn denial registration transport failed" {
+		t.Fatalf("boundary error = %q", err.Error())
+	}
+	if strings.Contains(err.Error(), typed.Detail) || strings.Contains(err.Error(), boundaryCause.Error()) {
+		t.Fatalf("boundary error rendered a cause: %s", err)
+	}
+}
+
 func TestPermanentDenialProjection_StrictNegativeMatrix(t *testing.T) {
 	item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-negative", "wkr-test")
 	detail, binding := permanentDenialDetail(t, item)
@@ -174,6 +222,12 @@ func TestPermanentDenialProjection_StrictNegativeMatrix(t *testing.T) {
 		{name: "outer projection mismatch", receipt: mutateDeniedHostReceipt(t, hostReceipt, nil, func(tools *agent.ToolLifecycleReceipt) {
 			tools.ProfileID = "different-profile"
 		}), err: typed},
+		{name: "case-folded nested alias", receipt: mutateDeniedToolReceiptJSONName(
+			t, hostReceipt, `"decision":"denied"`, `"Decision":"denied"`,
+		), err: typed},
+		{name: "case-folded nested collision", receipt: mutateDeniedToolReceiptJSONName(
+			t, hostReceipt, `"decision":"denied"`, `"decision":"denied","Decision":"denied"`,
+		), err: typed},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -247,6 +301,19 @@ func TestPermanentDenialClosedDecoderRejectsUnknownDuplicateAndTrailing(t *testi
 		if err := decodeClosedPermanentDenialJSON(json.RawMessage(raw), &receipt); err == nil {
 			t.Fatalf("closed decoder accepted %s", raw)
 		}
+	}
+}
+
+func TestPermanentDenialClosedDecoderAllowsLegitimateDynamicMapKeys(t *testing.T) {
+	var value struct {
+		Dynamic map[string]string `json:"dynamic"`
+	}
+	raw := json.RawMessage(`{"dynamic":{"Outcome":"terminal","Mixed-Case-Key":"value"}}`)
+	if err := decodeClosedPermanentDenialJSON(raw, &value); err != nil {
+		t.Fatalf("dynamic map key was treated as struct alias: %v", err)
+	}
+	if value.Dynamic["Outcome"] != "terminal" || value.Dynamic["Mixed-Case-Key"] != "value" {
+		t.Fatalf("dynamic values = %#v", value.Dynamic)
 	}
 }
 
@@ -328,6 +395,8 @@ func TestPermanentDenialNackResponseContract(t *testing.T) {
 		{name: "mismatched host hash", status: http.StatusOK, body: fmt.Sprintf(`{"contractVersion":"%s","outcome":"terminal","sessionId":"session-response","attemptToken":"%s","hostReceiptSha256":"%s"}`, preSpawnPermanentDenialContractVersion, claimAttemptTokenOne, strings.Repeat("d", 64)), wantError: true},
 		{name: "unknown member", status: http.StatusOK, body: fmt.Sprintf(`{"contractVersion":"%s","outcome":"terminal","sessionId":"session-response","attemptToken":"%s","hostReceiptSha256":"%s","extra":true}`, preSpawnPermanentDenialContractVersion, claimAttemptTokenOne, report.HostReceiptSHA256), wantError: true},
 		{name: "duplicate member", status: http.StatusOK, body: fmt.Sprintf(`{"contractVersion":"%s","outcome":"terminal","sessionId":"session-response","sessionId":"session-response","attemptToken":"%s","hostReceiptSha256":"%s"}`, preSpawnPermanentDenialContractVersion, claimAttemptTokenOne, report.HostReceiptSHA256), wantError: true},
+		{name: "case-folded alias", status: http.StatusOK, body: fmt.Sprintf(`{"contractVersion":"%s","Outcome":"terminal","sessionId":"session-response","attemptToken":"%s","hostReceiptSha256":"%s"}`, preSpawnPermanentDenialContractVersion, claimAttemptTokenOne, report.HostReceiptSHA256), wantError: true},
+		{name: "case-folded collision", status: http.StatusOK, body: fmt.Sprintf(`{"contractVersion":"%s","outcome":"terminal","Outcome":"terminal","sessionId":"session-response","attemptToken":"%s","hostReceiptSha256":"%s"}`, preSpawnPermanentDenialContractVersion, claimAttemptTokenOne, report.HostReceiptSHA256), wantError: true},
 		{name: "ambiguous", status: http.StatusConflict, body: `{"outcome":"ambiguous"}`, wantError: true},
 	}
 	for _, tc := range tests {
