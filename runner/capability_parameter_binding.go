@@ -137,11 +137,11 @@ type parameterBoundCapabilityResolver struct {
 }
 
 func (r *parameterBoundCapabilityResolver) Knows(capability string) bool {
-	return r != nil && r.realizations.Knows(capability)
+	return r != nil && r.realizations != nil && r.realizations.Knows(capability)
 }
 
 func (r *parameterBoundCapabilityResolver) Resolve(capability string, harness agent.HarnessName, adapter string, mode agent.PromptSessionMode) (agent.CompiledCapabilityRealization, bool) {
-	if r == nil {
+	if r == nil || r.realizations == nil {
 		return agent.CompiledCapabilityRealization{}, false
 	}
 	return r.realizations.Resolve(capability, harness, adapter, mode)

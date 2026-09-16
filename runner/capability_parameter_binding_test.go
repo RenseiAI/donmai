@@ -109,7 +109,7 @@ func TestCapabilityParameterBinderRegistryValidatesBeforeAndAfterBinder(t *testi
 }
 
 func TestCapabilityParameterBinderRegistryRefusesMalformedDuplicateAndDrift(t *testing.T) {
-	_, binder := syntheticParameterizedRegistry(t, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
+	realizations, binder := syntheticParameterizedRegistry(t, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
 	if _, err := NewCapabilityParameterBinderRegistry(nil); err == nil {
 		t.Fatal("nil binder registered")
 	}
@@ -121,14 +121,23 @@ func TestCapabilityParameterBinderRegistryRefusesMalformedDuplicateAndDrift(t *t
 	if _, err := NewCapabilityParameterBinderRegistry(&malformed); err == nil {
 		t.Fatal("malformed binder id registered")
 	}
+	wrongSource := *binder
+	wrongSource.sourceDigest = strings.Repeat("0", 64)
+	wrongRegistry, err := NewCapabilityParameterBinderRegistry(&wrongSource)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{}`)
+	digest, _ := executioncell.DigestOperationalPayload(payload)
+	requirement := agent.CapabilityParameterRequirementFacts{CapabilityID: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64), OperationalPayloadDigest: digest}
+	if _, err := wrongRegistry.ResolveAndBind(realizations, requirement, payload, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous); err == nil || wrongSource.calls != 0 {
+		t.Fatalf("wrong trusted source reached binder: calls=%d err=%v", wrongSource.calls, err)
+	}
 	registry, err := NewCapabilityParameterBinderRegistry(binder)
 	if err != nil {
 		t.Fatal(err)
 	}
 	binder.sourceDigest = strings.Repeat("0", 64)
-	payload := json.RawMessage(`{}`)
-	digest, _ := executioncell.DigestOperationalPayload(payload)
-	realizations, _ := syntheticParameterizedRegistry(t, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
 	_, err = registry.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64), OperationalPayloadDigest: digest}, payload, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
 	if err == nil {
 		t.Fatal("post-construction binder descriptor drift accepted")
@@ -166,5 +175,32 @@ func TestPreparedHarnessUsesProcessOwnedParameterBinder(t *testing.T) {
 	}
 	if _, _, err := buildPreparedSourceSpec(qw, selection, nil, realizations); err == nil {
 		t.Fatal("parameterized realization proceeded without process-owned binder registry")
+	}
+}
+
+func TestCallerAuthoredParameterBindingIsNotAdmissionAuthority(t *testing.T) {
+	realizations, binder := syntheticParameterizedRegistry(t, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
+	binders, err := NewCapabilityParameterBinderRegistry(binder)
+	if err != nil {
+		t.Fatal(err)
+	}
+	payload := json.RawMessage(`{}`)
+	digest, _ := executioncell.DigestOperationalPayload(payload)
+	bound, err := binders.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64), OperationalPayloadDigest: digest}, payload, agent.HarnessCodex, "codex/headless/tool-lifecycle-v1", agent.PromptModeAutonomous)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw, _ := json.Marshal(bound)
+	var clone agent.CapabilityRealizationBinding
+	if err := json.Unmarshal(raw, &clone); err != nil {
+		t.Fatal(err)
+	}
+	qw := exactReceiptQueuedWork("forged-parameter-binding")
+	qw.Body = "reject caller-authored binding"
+	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.parameterized/v1", ParametersDigest: strings.Repeat("b", 64)}}))
+	admission := mustAdmissionReceipt(t, qw.AdmissionReceipt)
+	spec := agent.Spec{Autonomous: true, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{clone}}}
+	if _, err := bindAdmissionToolLifecyclePlan(spec, admission, executioncell.ImmutableClaimReceipt{}, realizations); err == nil {
+		t.Fatal("caller-authored realization binding became admission authority")
 	}
 }

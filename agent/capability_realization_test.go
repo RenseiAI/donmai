@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"go/build"
 	"reflect"
 	"strings"
 	"testing"
@@ -274,6 +275,9 @@ func TestCapabilityParameterBindingRejectsMutationAndWidening(t *testing.T) {
 			candidate.SelectedSurface = append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...)
 			candidate.Entries = append([]CapabilityBoundEntryV1(nil), valid.Entries...)
 			mutate(&candidate)
+			for i := range candidate.Entries {
+				candidate.Entries[i].EntryParametersDigest, _ = CapabilityEntryParametersDigest(candidate.Entries[i].EntryID, candidate.Entries[i].StaticInputDigest, candidate.ParametersDigest, candidate.SelectedSurfaceDigest, candidate.OperationalPayloadDigest)
+			}
 			candidate.BindingDigest, _ = CapabilityParameterBindingDigest(candidate)
 			if err := ValidateCapabilityParameterBinding(candidate, compiled.Declaration, requirement); err == nil {
 				t.Fatal("mutated binding validated")
@@ -281,7 +285,7 @@ func TestCapabilityParameterBindingRejectsMutationAndWidening(t *testing.T) {
 		})
 	}
 	widened := valid
-	widened.SelectedSurface = append(append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...), CapabilitySurfaceIdentity{Kind: CapabilitySurfaceMCPTool, ID: "outside"})
+	widened.SelectedSurface = append(append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...), CapabilitySurfaceIdentity{Kind: CapabilitySurfaceMCPTool, ID: "zz_outside"})
 	widened.SelectedSurfaceDigest, _ = CapabilitySelectedSurfaceDigest(widened.SelectedSurface)
 	for i := range widened.Entries {
 		widened.Entries[i].EntryParametersDigest, _ = CapabilityEntryParametersDigest(widened.Entries[i].EntryID, widened.Entries[i].StaticInputDigest, widened.ParametersDigest, widened.SelectedSurfaceDigest, widened.OperationalPayloadDigest)
@@ -289,6 +293,20 @@ func TestCapabilityParameterBindingRejectsMutationAndWidening(t *testing.T) {
 	widened.BindingDigest, _ = CapabilityParameterBindingDigest(widened)
 	if err := ValidateCapabilityParameterBinding(widened, compiled.Declaration, requirement); err == nil {
 		t.Fatal("surface widening validated")
+	}
+	empty := valid
+	empty.SelectedSurface = nil
+	empty.SelectedSurfaceDigest = strings.Repeat("0", 64)
+	empty.BindingDigest, _ = CapabilityParameterBindingDigest(empty)
+	if err := ValidateCapabilityParameterBinding(empty, compiled.Declaration, requirement); err == nil {
+		t.Fatal("empty selected surface validated")
+	}
+	duplicate := valid
+	duplicate.SelectedSurface = append(append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...), valid.SelectedSurface[0])
+	duplicate.SelectedSurfaceDigest = strings.Repeat("0", 64)
+	duplicate.BindingDigest, _ = CapabilityParameterBindingDigest(duplicate)
+	if err := ValidateCapabilityParameterBinding(duplicate, compiled.Declaration, requirement); err == nil {
+		t.Fatal("duplicate selected surface validated")
 	}
 }
 
@@ -399,6 +417,18 @@ func TestComposeCapabilityRealizationRegistriesRefusesDuplicateTuple(t *testing.
 	composed, err := ComposeCapabilityRealizationRegistries(first, nil)
 	if err != nil || !composed.Knows(compiled.Declaration.CapabilityID) {
 		t.Fatalf("unique composition failed: %v", err)
+	}
+}
+
+func TestAgentPackageDoesNotImportExecutionCell(t *testing.T) {
+	pkg, err := build.Default.ImportDir(".", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, imported := range pkg.Imports {
+		if imported == "github.com/RenseiAI/donmai/executioncell" {
+			t.Fatal("agent package imports executioncell and creates an authority/package cycle")
+		}
 	}
 }
 
