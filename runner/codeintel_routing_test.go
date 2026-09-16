@@ -375,7 +375,7 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	}
 }
 
-func TestPreparedSourceRejectsMalformedNativePolicyBeforeSpec(t *testing.T) {
+func TestMalformedNativePolicyRefusesActualPreflightAndRunBeforeSpawn(t *testing.T) {
 	manifest := codexManifestForTest()
 	for i := range manifest.ToolLifecycle {
 		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
@@ -388,12 +388,12 @@ func TestPreparedSourceRejectsMalformedNativePolicyBeforeSpec(t *testing.T) {
 	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{codeintelcontract.ToolGetRepoMap})
 	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	binders, _ := NewCapabilityParameterBinderRegistry(binder)
-	resolver, err := newPreparedCapabilityResolver(realizations, binders)
-	if err != nil {
-		t.Fatal(err)
-	}
+	server := mockPlatformServer(t)
+	t.Cleanup(server.Close)
 	qw := exactReceiptQueuedWork("native-malformed-policy")
 	qw.Body = "exercise malformed native policy"
+	qw.PlatformURL = server.URL
+	qw.AuthToken = "token"
 	qw.CodeIntel = &prompt.CodeIntelWork{Tools: []string{codeintelcontract.ToolGetRepoMap}}
 	qw.AllowedTools = []string{"mcp__wrong-server__" + codeintelcontract.ToolGetRepoMap}
 	operational, _ := CanonicalOperationalPayload(qw)
@@ -405,10 +405,45 @@ func TestPreparedSourceRejectsMalformedNativePolicyBeforeSpec(t *testing.T) {
 	qw.OperationalPayload = operational
 	caps := codexCapabilitiesForTest()
 	caps.AcceptsAllowedToolsList = true
-	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
-	selection := harnessSelection{Provider: provider, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt), effectiveCell: cell}
-	if _, _, err := buildPreparedSourceSpec(qw, selection, nil, resolver); err == nil || !strings.Contains(err.Error(), "project native code-intelligence") {
-		t.Fatalf("malformed native policy error=%v", err)
+	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
+	provider := &capturingManifestProvider{manifestSelectorProvider: baseProvider}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	detail := map[string]any{"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload}
+	view, err := NewProviderViewWithOptions(registry, ProviderViewOptions{CapabilityRealizations: realizations, CapabilityParameterBinders: binders})
+	if err != nil {
+		t.Fatal(err)
+	}
+	hostRaw, preflightErr := view.PreflightExecution(rawJSONForRunner(t, detail))
+	if preflightErr == nil || !strings.Contains(preflightErr.Error(), "project native code-intelligence") {
+		t.Fatalf("actual preflight malformed policy error=%v receipt=%s", preflightErr, hostRaw)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(hostRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if host.Decision != "denied" || len(host.Plan) != 0 {
+		t.Fatalf("malformed preflight receipt=%+v", host)
+	}
+
+	qw.HostAdaptationReceipt = hostRaw
+	manager, _ := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	poster, _ := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: qw.WorkerID, AuthToken: "token", HTTPClient: server.Client(), BaseDelay: 1})
+	run, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), CapabilityRealizations: realizations, CapabilityParameterBinders: binders, SkipBackstop: true, SkipSteering: true, SkipPostSession: true, MaxSessionDuration: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, runErr := run.Run(context.Background(), qw)
+	if runErr == nil {
+		t.Fatalf("actual Runner accepted denied malformed-policy preflight: %+v", got)
+	}
+	if got.FailureMode != FailureProviderResolve {
+		t.Fatalf("failure mode=%q want=%q error=%v", got.FailureMode, FailureProviderResolve, runErr)
+	}
+	if provider.spawnCalls != 0 {
+		t.Fatalf("provider spawned %d times for malformed native policy", provider.spawnCalls)
 	}
 }
 
