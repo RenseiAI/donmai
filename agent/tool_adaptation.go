@@ -953,12 +953,28 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 	}
 	seenCapabilities := map[string]bool{}
 	for _, binding := range plan.CapabilityRealizations {
-		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] || validateCapabilityRealizationBinding(binding) != nil {
+		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] {
 			return "capability realizations require unique canonical bindings"
+		}
+		// Named MCP evidence derives an entry from the binding before ordinary
+		// realization resolution, so it needs the full immutable binding now.
+		// Aggregate-only bindings retain their established late validation and
+		// application-failed receipt semantics for compatibility.
+		if requestsNamedMCPServerEvidence(binding) && validateCapabilityRealizationBinding(binding) != nil {
+			return "named MCP capability realizations require canonical bindings"
 		}
 		seenCapabilities[binding.CapabilityID] = true
 	}
 	return ""
+}
+
+func requestsNamedMCPServerEvidence(binding CapabilityRealizationBinding) bool {
+	for _, entry := range binding.Entries {
+		if entry.Channel == ToolChannelMCPServer && strings.HasPrefix(entry.EntryID, MCPServerCapabilityEntryPrefix) {
+			return true
+		}
+	}
+	return false
 }
 
 func isKnownToolLifecycleChannel(channel ToolLifecycleChannel) bool {

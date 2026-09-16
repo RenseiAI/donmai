@@ -104,7 +104,7 @@ func TestCompilePreparedHarnessKeepsNamedMCPEvidenceStableForRuntimeValues(t *te
 		server := runtime
 		server.URL = url
 		server.Headers = map[string]string{"Authorization": token}
-		binding := namedMCPBindingWithDigest(t, "example.named-runtime-mcp/"+string(mode), server.Name, server, agent.MCPRuntimeServerCapabilityInputDigest(server), mode)
+		binding := namedMCPBindingWithDigest(t, "example.named-runtime-mcp/"+string(mode), server.Name, agent.MCPRuntimeServerCapabilityInputDigest(server), mode)
 		spec := agent.Spec{
 			PromptMode: mode,
 			Autonomous: mode == agent.PromptModeAutonomous,

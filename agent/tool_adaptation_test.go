@@ -639,17 +639,24 @@ func TestToolLifecycleMCPToolNamesUndeliverableIsRecordedNotFatal(t *testing.T) 
 }
 
 func namedMCPBinding(t *testing.T, capabilityID, name string, server agent.MCPServerConfig) agent.CapabilityRealizationBinding {
-	return namedMCPBindingWithDigest(t, capabilityID, name, server, agent.MCPServerCapabilityInputDigest(server), agent.PromptModeAutonomous)
+	return namedMCPBindingWithDigest(t, capabilityID, name, agent.MCPServerCapabilityInputDigest(server), agent.PromptModeAutonomous)
 }
 
-func namedMCPBindingWithDigest(t *testing.T, capabilityID, name string, server agent.MCPServerConfig, inputDigest string, mode agent.PromptSessionMode) agent.CapabilityRealizationBinding {
+func namedMCPBindingWithDigest(t *testing.T, capabilityID, name, inputDigest string, mode agent.PromptSessionMode) agent.CapabilityRealizationBinding {
+	return namedMCPBindingWithAnchor(t, capabilityID, name, name, inputDigest, mode)
+}
+
+// namedMCPBindingWithAnchor deliberately permits an entry-id/anchor mismatch
+// while retaining a fully recompiled declaration and observation. Production
+// must reject this at named receipt derivation, after generic binding checks.
+func namedMCPBindingWithAnchor(t *testing.T, capabilityID, name, anchor, inputDigest string, mode agent.PromptSessionMode) agent.CapabilityRealizationBinding {
 	t.Helper()
 	entryID, err := agent.MCPServerCapabilityEntryID(name)
 	if err != nil {
 		t.Fatalf("MCPServerCapabilityEntryID: %v", err)
 	}
 	surface := []agent.CapabilitySurfaceIdentity{
-		{Kind: agent.CapabilitySurfaceMCPServer, ID: name},
+		{Kind: agent.CapabilitySurfaceMCPServer, ID: anchor},
 		{Kind: agent.CapabilitySurfaceMCPTool, ID: "draft_create"},
 	}
 	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
@@ -703,33 +710,52 @@ func namedMCPEntry(t *testing.T, receipt agent.ToolLifecycleReceipt, id string) 
 }
 
 // TestToolLifecycleAggregateMCPReceiptBytesRemainLegacyWithoutNamedBinding
-// is the compatibility control: merely carrying an otherwise empty plan must
-// not change the aggregate-only receipt bytes existing callers persist.
+// compares against the immutable base-268 receipt fixture, rather than a
+// second call to this compiler, so a future aggregate drift cannot mask itself.
 func TestToolLifecycleAggregateMCPReceiptBytesRemainLegacyWithoutNamedBinding(t *testing.T) {
 	t.Parallel()
 	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
 	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
-	legacy := agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}}
-	_, before, err := agent.AdaptToolLifecycle(legacy, profile)
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}}, profile)
 	if err != nil {
 		t.Fatal(err)
 	}
-	withPlan := legacy
-	withPlan.ToolLifecyclePlan = &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion}
-	_, after, err := agent.AdaptToolLifecycle(withPlan, profile)
+	got, err := json.Marshal(receipt)
 	if err != nil {
 		t.Fatal(err)
 	}
-	beforeBytes, err := json.Marshal(before)
-	if err != nil {
-		t.Fatal(err)
+	const base268Receipt = `{"contractVersion":"donmai.tool-lifecycle/v1alpha1","profileId":"codex/headless/tool-lifecycle-v1","decision":"ready","evidenceTier":"unit_verified","productionEligible":false,"entries":[{"id":"mcp-servers","channel":"mcp_server","required":true,"outcome":"admitted","delivery":"codex_app_server_mcp","inputDigest":"8e4a811b3245336c931da3215224c71d0b52e5faba23a546646a809d1a2d38e3"}]}`
+	if string(got) != base268Receipt {
+		t.Fatalf("aggregate-only receipt drifted from base 268: got=%s want=%s", got, base268Receipt)
 	}
-	afterBytes, err := json.Marshal(after)
-	if err != nil {
-		t.Fatal(err)
+}
+
+func TestToolLifecycleAggregateMCPKeepsLegacyTamperedBindingDenial(t *testing.T) {
+	t.Parallel()
+	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
+	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{
+		Autonomous: true,
+		MCPServers: []agent.MCPServerConfig{server},
+		ToolLifecyclePlan: &agent.ToolLifecyclePlan{
+			ContractVersion: agent.ToolLifecycleContractVersion,
+			CapabilityRealizations: []agent.CapabilityRealizationBinding{{
+				ContractVersion: agent.CapabilityRealizationContractVersion,
+				CapabilityID:    "example.legacy-tampered/v1",
+			}},
+		},
+	}, profile)
+	var denial *agent.ToolAdaptationError
+	if !errors.As(err, &denial) || denial.Code != agent.ToolDenialApplicationFailed {
+		t.Fatalf("error = %v, want legacy application-failed denial", err)
 	}
-	if string(afterBytes) != string(beforeBytes) {
-		t.Fatalf("aggregate-only receipt drifted: before=%s after=%s", beforeBytes, afterBytes)
+	got, marshalErr := json.Marshal(receipt)
+	if marshalErr != nil {
+		t.Fatal(marshalErr)
+	}
+	const base268Receipt = `{"contractVersion":"donmai.tool-lifecycle/v1alpha1","profileId":"codex/headless/tool-lifecycle-v1","decision":"denied","evidenceTier":"unit_verified","productionEligible":false,"entries":[{"id":"mcp-servers","channel":"mcp_server","required":true,"outcome":"admitted","delivery":"codex_app_server_mcp","inputDigest":"8e4a811b3245336c931da3215224c71d0b52e5faba23a546646a809d1a2d38e3"}]}`
+	if string(got) != base268Receipt {
+		t.Fatalf("legacy tampered-binding receipt drifted from base 268: got=%s want=%s", got, base268Receipt)
 	}
 }
 
@@ -893,10 +919,7 @@ func TestToolLifecycleNamedMCPBindingRefusesMismatchedAnchorAndTrimmedAlias(t *t
 	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
 	binding := namedMCPBinding(t, "example.named-mcp/v1", server.Name, server)
 	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
-	mismatchedAnchor := binding
-	mismatchedAnchor.Entries = append([]agent.CapabilityRecipeEntry(nil), binding.Entries...)
-	mismatchedAnchor.Entries[0].SurfaceRefs = append([]agent.CapabilitySurfaceIdentity(nil), binding.Entries[0].SurfaceRefs...)
-	mismatchedAnchor.Entries[0].SurfaceRefs[0].ID = "other"
+	mismatchedAnchor := namedMCPBindingWithAnchor(t, "example.named-mcp-mismatched-anchor/v1", server.Name, "other", agent.MCPServerCapabilityInputDigest(server), agent.PromptModeAutonomous)
 	tests := []struct {
 		name string
 		spec agent.Spec
