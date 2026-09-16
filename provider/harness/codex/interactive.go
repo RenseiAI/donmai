@@ -161,6 +161,14 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			config.remove(),
 		)
 	}
+	if opts.interactiveBeforePTYSpawn != nil {
+		if err := opts.interactiveBeforePTYSpawn(ctx, bin, spec, launch, config.home); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: interactive pre-PTY fixture: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
+	}
 	if spec.SessionName != "" {
 		server, err := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, config.home)
 		if err != nil {

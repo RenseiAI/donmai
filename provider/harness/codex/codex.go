@@ -153,6 +153,11 @@ type Options struct {
 	// exists) — always before the PTY is spawned. Test-only; production
 	// leaves it nil.
 	interactiveNameServerStarted func(remoteURL string)
+	// interactiveBeforePTYSpawn observes the exact private configuration and
+	// child environment after production effective-config readback and before
+	// the interactive process starts. It is an in-package real-binary test seam;
+	// production leaves it nil and no secret-bearing state is exported.
+	interactiveBeforePTYSpawn func(context.Context, string, agent.Spec, interactiveLaunch, string) error
 }
 
 // New constructs the Provider WITHOUT starting the codex app-server.

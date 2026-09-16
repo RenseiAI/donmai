@@ -63,6 +63,11 @@ jobs:
         with:
           go-version-file: go.mod
 
+      - name: Set up Node for pinned Codex fixture
+        uses: actions/setup-node@v7
+        with:
+          node-version: "22"
+
       - name: Build
         run: make build
 
@@ -78,6 +83,44 @@ jobs:
       # is missing from this target's list, so registration cannot lapse.
       - name: Type-check build-tag-gated tests
         run: make test-tagged
+
+      - name: Real Codex direct MCP fixture
+        run: |
+          set -euo pipefail
+          fixture_dir="${RUNNER_TEMP}/codex-real-mcp-fixture"
+          mkdir -p "${fixture_dir}"
+          cp provider/harness/codex/testdata/real-mcp-codex-cli/package.json "${fixture_dir}/package.json"
+          cp provider/harness/codex/testdata/real-mcp-codex-cli/package-lock.json "${fixture_dir}/package-lock.json"
+          npm ci --prefix "${fixture_dir}" --ignore-scripts --no-audit --no-fund
+
+          launcher="${fixture_dir}/node_modules/.bin/codex"
+          native="$(find "${fixture_dir}/node_modules" -type f -path '*/vendor/*/bin/codex' -print -quit)"
+          test -x "${launcher}"
+          test -n "${native}"
+          test -x "${native}"
+          test "$("${launcher}" --version)" = "codex-cli 0.154.0"
+          test "$("${native}" --version)" = "codex-cli 0.154.0"
+          sha256sum "${launcher}" "${native}"
+
+          result_json="${RUNNER_TEMP}/codex-real-mcp-fixture.json"
+          CODEX_BIN="${launcher}" CODEX_NATIVE_BIN="${native}" GOWORK=off \
+            go test -race -tags codex_integration \
+              -run '^TestIntegration_RealCodexInteractiveMCPDirectCalls$' \
+              -count=1 -json ./provider/harness/codex \
+            | tee "${result_json}" \
+            | python3 scripts/test-summary.py
+          python3 - "${result_json}" <<'PY'
+          import json
+          import sys
+
+          target = "TestIntegration_RealCodexInteractiveMCPDirectCalls"
+          events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
+          passed = sum(event.get("Action") == "pass" and event.get("Test") == target for event in events)
+          skipped = sum(event.get("Action") == "skip" and event.get("Test") == target for event in events)
+          if passed != 1 or skipped != 0:
+              raise SystemExit(f"real Codex MCP fixture pass={passed} skip={skipped}; want pass=1 skip=0")
+          print("real Codex MCP fixture: PASS=1 SKIP=0")
+          PY
 
       # Piped through scripts/test-summary.py so the run reports how many
       # tests SKIPPED. `go test ./...` reports a skipped test the same way it
