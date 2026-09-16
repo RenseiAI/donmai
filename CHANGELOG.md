@@ -40,6 +40,10 @@ No unreleased changes.
 - Resolve code-index roots and selected subtrees physically before MCP server
   construction, rejecting direct and chained symlink escapes outside the
   configured repository root. (#632)
+- Update `google.golang.org/grpc` to v1.83.1 to address GO-2026-6348, an
+  HTTP/2 DATA-frame fragmentation heap-exhaustion advisory reachable through
+  Sigstore/Rekor verification, together with its required
+  `google.golang.org/genproto/googleapis/rpc` companion revision. (#642)
 
 ### Chores
 
