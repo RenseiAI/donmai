@@ -1,6 +1,8 @@
 package agent_test
 
 import (
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -1576,4 +1578,122 @@ func mustProfile(t *testing.T, manifest agent.HarnessManifest, mode agent.Prompt
 		t.Fatalf("manifest %s has no %s tool/lifecycle profile", manifest.Name, mode)
 	}
 	return profile
+}
+
+func namedExtensionBinding(t *testing.T, delivery agent.ExtensionDelivery, observationPolicy string) agent.CapabilityRealizationBinding {
+	t.Helper()
+	entryID, err := agent.AdditionalExtensionCapabilityEntryID(delivery.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binderSource := []byte("synthetic named-extension binder")
+	binderSourceDigest := sha256.Sum256(binderSource)
+	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: "example.named-extension-binder/v1", BinderSourceDigest: hex.EncodeToString(binderSourceDigest[:]), SurfaceProjection: "subset", RuntimeObservation: observationPolicy}
+	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "tool_" + delivery.ID}}
+	inputDigest := agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery})
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example." + delivery.ID + "/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/test/named-extension-v1", Mode: agent.PromptModeHumanControlled, RecipeID: "example/" + delivery.ID + "/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: agent.ToolChannelToolPlugin, Required: delivery.Required, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic-real-binary", BinaryDigest: strings.Repeat("b", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: entryID, Channel: agent.ToolChannelToolPlugin, InputDigest: inputDigest}}, ObservedSurface: surface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parametersDigest, operationalDigest := strings.Repeat("c", 64), strings.Repeat("d", 64)
+	selectedDigest, err := agent.CapabilitySelectedSurfaceDigest(surface)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entryParametersDigest, err := agent.CapabilityEntryParametersDigest(entryID, inputDigest, parametersDigest, selectedDigest, operationalDigest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	parameterBinding := agent.CapabilityParameterBindingV1{ContractVersion: agent.CapabilityParameterBindingVersionV1, CapabilityID: declaration.CapabilityID, ParameterContractID: contract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: declaration.Recipe.RecipeDigest, SelectedSurface: surface, SelectedSurfaceDigest: selectedDigest, Entries: []agent.CapabilityBoundEntryV1{{EntryID: entryID, StaticInputDigest: inputDigest, EntryParametersDigest: entryParametersDigest}}}
+	parameterBinding.BindingDigest, err = agent.CapabilityParameterBindingDigest(parameterBinding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := agent.BindCapabilityRealization(compiled)
+	binding.ParameterBinding = &parameterBinding
+	return binding
+}
+
+func TestAdditionalExtensionCapabilityEntryIDIsExactBoundedBase64URL(t *testing.T) {
+	for _, deliveryID := range []string{"simple", "with/slash", "π-extension", strings.Repeat("x", 176)} {
+		entryID, err := agent.AdditionalExtensionCapabilityEntryID(deliveryID)
+		if err != nil || !strings.HasPrefix(entryID, agent.AdditionalExtensionCapabilityEntryPrefix) || strings.Contains(entryID, "=") {
+			t.Fatalf("delivery %q entry=%q err=%v", deliveryID, entryID, err)
+		}
+	}
+	for _, deliveryID := range []string{"", strings.Repeat("x", 177), string([]byte{0xff})} {
+		if _, err := agent.AdditionalExtensionCapabilityEntryID(deliveryID); err == nil {
+			t.Fatalf("malformed delivery id %q encoded", deliveryID)
+		}
+	}
+}
+
+func TestNamedAdditionalExtensionsRequireProfileOptInAndPreserveAggregate(t *testing.T) {
+	advisory := advisoryExtensionDelivery("advisory-pack")
+	required := extensionDelivery("required-pack")
+	bindings := []agent.CapabilityRealizationBinding{namedExtensionBinding(t, advisory, "none"), namedExtensionBinding(t, required, "before_first_turn")}
+	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{advisory, required}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: bindings}}
+	profile := mustProfile(t, (&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled)
+	profile.ID = "pi/test/named-extension-v1"
+	if _, receipt, err := agent.AdaptToolLifecycle(spec, profile); err == nil || receipt.Decision != "denied" {
+		t.Fatalf("old profile accepted binding-only opt-in: receipt=%+v err=%v", receipt, err)
+	}
+	profile.NamedExtensionEntries = true
+	wrongProfile := profile
+	wrongProfile.ID = "pi/test/other-named-extension-v1"
+	if _, _, err := agent.AdaptToolLifecycle(spec, wrongProfile); err == nil {
+		t.Fatal("named binding activated on a different opted-in profile")
+	}
+	_, receipt, err := agent.AdaptToolLifecycle(spec, profile)
+	if err != nil {
+		t.Fatalf("named extension adaptation: %v receipt=%+v", err, receipt)
+	}
+	entries := map[string]agent.ToolLifecycleEntry{}
+	for _, entry := range receipt.Entries {
+		entries[entry.ID] = entry
+	}
+	aggregate := entries["additional-extensions"]
+	if !aggregate.Required || aggregate.Outcome != agent.ToolOutcomeAdmitted || aggregate.InputDigest != agent.CapabilityExtensionInputDigest(spec.AdditionalExtensions) {
+		t.Fatalf("aggregate entry=%+v", aggregate)
+	}
+	advisoryID, _ := agent.AdditionalExtensionCapabilityEntryID(advisory.ID)
+	requiredID, _ := agent.AdditionalExtensionCapabilityEntryID(required.ID)
+	if got := entries[advisoryID]; got.Required || got.Outcome != agent.ToolOutcomeAdmitted || got.InputDigest != agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{advisory}) {
+		t.Fatalf("advisory named entry=%+v", got)
+	}
+	if got := entries[requiredID]; !got.Required || got.Outcome != agent.ToolOutcomePendingRuntime || got.InputDigest != agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{required}) {
+		t.Fatalf("required named entry=%+v", got)
+	}
+	if len(receipt.CapabilityRealizations) != 2 || receipt.CapabilityRealizations[0].Decision != "artifact_bound" || receipt.CapabilityRealizations[1].Decision != "artifact_bound" {
+		t.Fatalf("realization results=%+v", receipt.CapabilityRealizations)
+	}
+}
+
+func TestNamedAdditionalExtensionsRejectConflictAndNoncanonicalEntry(t *testing.T) {
+	delivery := extensionDelivery("pack")
+	binding := namedExtensionBinding(t, delivery, "before_first_turn")
+	profile := mustProfile(t, (&pi.Provider{}).Manifest(), agent.PromptModeHumanControlled)
+	profile.ID = "pi/test/named-extension-v1"
+	profile.NamedExtensionEntries = true
+	wrong := binding
+	wrong.Entries = append([]agent.CapabilityRecipeEntry(nil), binding.Entries...)
+	wrong.Entries[0].InputDigest = strings.Repeat("0", 64)
+	spec := agent.Spec{Interactive: &agent.InteractiveSpec{}, AdditionalExtensions: []agent.ExtensionDelivery{delivery}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{wrong}}}
+	if _, _, err := agent.AdaptToolLifecycle(spec, profile); err == nil {
+		t.Fatal("conflicting named delivery digest accepted")
+	}
+	entryID, _ := agent.AdditionalExtensionCapabilityEntryID(delivery.ID)
+	binderSourceDigest := sha256.Sum256([]byte("binder"))
+	_, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.invalid/v1", HarnessID: agent.HarnessPi, AdapterVersion: profile.ID, Mode: profile.Mode, RecipeID: "example/invalid/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID + "=", Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: agent.CapabilityExtensionInputDigest([]agent.ExtensionDelivery{delivery}), SurfaceRefs: []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "tool"}}}}, DeclaredSurface: []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "tool"}}, ParameterContract: &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: "example.binder/v1", BinderSourceDigest: hex.EncodeToString(binderSourceDigest[:]), SurfaceProjection: "subset", RuntimeObservation: "before_first_turn"}})
+	if err == nil {
+		t.Fatal("noncanonical padded named entry compiled")
+	}
 }

@@ -2,6 +2,7 @@ package agent
 
 import (
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
@@ -9,6 +10,7 @@ import (
 	"regexp"
 	"sort"
 	"strings"
+	"unicode/utf8"
 )
 
 // ToolLifecycleContractVersion is the closed tool, MCP, policy, lifecycle,
@@ -159,6 +161,7 @@ type ToolLifecycleProfile struct {
 	FallbackDeliveries       []ToolDeliveryKind `json:"fallbackDeliveries,omitempty"`
 	EvidenceTier             string             `json:"evidenceTier"`
 	ProductionEligible       bool               `json:"productionEligible"`
+	NamedExtensionEntries    bool               `json:"namedExtensionEntries,omitempty"`
 }
 
 // ToolHookRequirement names a hook whose delivery must be proved before
@@ -457,6 +460,11 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 		return deny(ToolDenialMalformedPlan, ToolChannelMCPServer, "named-mcp-server", "", namedMCPDetail)
 	}
 	requirements = append(requirements, namedMCPRequirements...)
+	namedExtensionRequirements, namedExtensionDetail := namedAdditionalExtensionRequirements(spec, profile, plan.CapabilityRealizations)
+	if namedExtensionDetail != "" {
+		return deny(ToolDenialMalformedPlan, ToolChannelToolPlugin, "named-additional-extension", "", namedExtensionDetail)
+	}
+	requirements = append(requirements, namedExtensionRequirements...)
 	if plan.RequireToolPlugins {
 		requirements = append(requirements, toolRequirement{id: "tool-plugins", channel: ToolChannelToolPlugin, required: true, delivery: profile.ToolPluginDelivery, digest: digestToolInput(true)})
 	}
@@ -481,7 +489,7 @@ func AdaptToolLifecycle(spec Spec, profile ToolLifecycleProfile) (Spec, ToolLife
 		// a teardown boundary for its handles and resources or it does not.
 		requirements = append(requirements, toolRequirement{id: "cleanup", channel: ToolChannelCleanup, required: true, delivery: profile.CleanupDelivery, digest: requirementInputDigest(plan.CleanupParametersDigest, true), pendingOutcome: ToolOutcomePendingCleanup})
 	}
-	if len(namedMCPRequirements) > 0 {
+	if len(namedMCPRequirements) > 0 || len(namedExtensionRequirements) > 0 {
 		if detail := validateNamedMCPRequirementCollisions(requirements); detail != "" {
 			return deny(ToolDenialMalformedPlan, ToolChannelMCPServer, "named-mcp-server", "", detail)
 		}
@@ -788,6 +796,127 @@ func validateNamedMCPRequirementCollisions(requirements []toolRequirement) strin
 	return ""
 }
 
+// AdditionalExtensionCapabilityEntryPrefix identifies an opt-in, per-delivery
+// receipt entry on the existing tool_plugin channel.
+const AdditionalExtensionCapabilityEntryPrefix = "additional-extension:"
+
+// AdditionalExtensionCapabilityEntryID encodes exact UTF-8 delivery identity
+// without trimming or aliasing. The 176-byte ceiling keeps the full entry under
+// the existing 256-character realization reference bound.
+func AdditionalExtensionCapabilityEntryID(deliveryID string) (string, error) {
+	raw := []byte(deliveryID)
+	if len(raw) == 0 || len(raw) > 176 || !utf8.Valid(raw) {
+		return "", fmt.Errorf("additional extension delivery id is malformed")
+	}
+	id := AdditionalExtensionCapabilityEntryPrefix + base64.RawURLEncoding.EncodeToString(raw)
+	if !realizationRef.MatchString(id) {
+		return "", fmt.Errorf("additional extension capability entry id is malformed")
+	}
+	return id, nil
+}
+
+func additionalExtensionDeliveryID(entryID string) (string, error) {
+	if !strings.HasPrefix(entryID, AdditionalExtensionCapabilityEntryPrefix) {
+		return "", fmt.Errorf("additional extension capability entry id is malformed")
+	}
+	encoded := strings.TrimPrefix(entryID, AdditionalExtensionCapabilityEntryPrefix)
+	raw, err := base64.RawURLEncoding.DecodeString(encoded)
+	if err != nil || len(raw) == 0 || len(raw) > 176 || !utf8.Valid(raw) {
+		return "", fmt.Errorf("additional extension capability entry id is malformed")
+	}
+	deliveryID := string(raw)
+	canonical, err := AdditionalExtensionCapabilityEntryID(deliveryID)
+	if err != nil || canonical != entryID {
+		return "", fmt.Errorf("additional extension capability entry id is not canonical")
+	}
+	return deliveryID, nil
+}
+
+func requestsNamedAdditionalExtensionEvidence(binding CapabilityRealizationBinding) bool {
+	for _, entry := range binding.Entries {
+		if entry.Channel == ToolChannelToolPlugin && strings.HasPrefix(entry.EntryID, AdditionalExtensionCapabilityEntryPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+// namedAdditionalExtensionRequirements derives supplemental entries only when
+// both the exact selected profile opts in and a canonical bound recipe requests
+// them. A realization binding alone cannot activate old profiles.
+func namedAdditionalExtensionRequirements(spec Spec, profile ToolLifecycleProfile, bindings []CapabilityRealizationBinding) ([]toolRequirement, string) {
+	requested := false
+	for _, binding := range bindings {
+		if requestsNamedAdditionalExtensionEvidence(binding) {
+			requested = true
+			break
+		}
+	}
+	if !requested {
+		return nil, ""
+	}
+	if !profile.NamedExtensionEntries {
+		return nil, "selected tool lifecycle profile does not opt in to named additional-extension entries"
+	}
+	byDeliveryID := make(map[string]ExtensionDelivery, len(spec.AdditionalExtensions))
+	for _, delivery := range spec.AdditionalExtensions {
+		if _, duplicate := byDeliveryID[delivery.ID]; duplicate {
+			return nil, "named additional-extension delivery ids must be unique"
+		}
+		byDeliveryID[delivery.ID] = delivery
+	}
+	byID := map[string]toolRequirement{}
+	for _, binding := range bindings {
+		if !requestsNamedAdditionalExtensionEvidence(binding) {
+			continue
+		}
+		if binding.AdapterVersion != profile.ID || binding.Mode != profile.Mode {
+			return nil, "named additional-extension binding does not match selected profile and mode"
+		}
+		if err := validateCapabilityRealizationBinding(binding); err != nil {
+			return nil, "named additional-extension capability realizations require canonical bindings"
+		}
+		for _, entry := range binding.Entries {
+			if entry.Channel != ToolChannelToolPlugin || !strings.HasPrefix(entry.EntryID, AdditionalExtensionCapabilityEntryPrefix) {
+				continue
+			}
+			deliveryID, err := additionalExtensionDeliveryID(entry.EntryID)
+			if err != nil {
+				return nil, err.Error()
+			}
+			delivery, ok := byDeliveryID[deliveryID]
+			if !ok {
+				return nil, "named additional-extension entry has no exact delivery"
+			}
+			digest := CapabilityExtensionInputDigest([]ExtensionDelivery{delivery})
+			if entry.Required != delivery.Required || entry.InputDigest != digest {
+				return nil, "named additional-extension entry does not match its exact delivery"
+			}
+			requirement := toolRequirement{id: entry.EntryID, channel: ToolChannelToolPlugin, required: delivery.Required, delivery: profile.ToolPluginDelivery, digest: digest, fallbackDenied: true}
+			if binding.ContractVersion == CapabilityRealizationContractVersionV2 && binding.ParameterContract != nil && binding.ParameterContract.RuntimeObservation == "before_first_turn" {
+				requirement.pendingOutcome = ToolOutcomePendingRuntime
+			}
+			if existing, found := byID[requirement.id]; found {
+				if existing.channel != requirement.channel || existing.required != requirement.required || existing.delivery != requirement.delivery || existing.digest != requirement.digest || existing.pendingOutcome != requirement.pendingOutcome {
+					return nil, "named additional-extension entries conflict"
+				}
+				continue
+			}
+			byID[requirement.id] = requirement
+		}
+	}
+	ids := make([]string, 0, len(byID))
+	for id := range byID {
+		ids = append(ids, id)
+	}
+	sort.Strings(ids)
+	out := make([]toolRequirement, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, byID[id])
+	}
+	return out, ""
+}
+
 // additionalExtensionsEntryID is the plan/receipt entry id under which a
 // populated Spec.AdditionalExtensions batch is projected onto the tool_plugin
 // channel. Shared between the compiler (legacyToolRequirements) and the
@@ -953,15 +1082,15 @@ func validateToolLifecyclePlan(plan ToolLifecyclePlan) string {
 	}
 	seenCapabilities := map[string]bool{}
 	for _, binding := range plan.CapabilityRealizations {
-		if binding.ContractVersion != CapabilityRealizationContractVersion || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] {
+		if (binding.ContractVersion != CapabilityRealizationContractVersionV1 && binding.ContractVersion != CapabilityRealizationContractVersionV2) || !realizationRef.MatchString(binding.CapabilityID) || seenCapabilities[binding.CapabilityID] {
 			return "capability realizations require unique canonical bindings"
 		}
 		// Named MCP evidence derives an entry from the binding before ordinary
 		// realization resolution, so it needs the full immutable binding now.
 		// Aggregate-only bindings retain their established late validation and
 		// application-failed receipt semantics for compatibility.
-		if requestsNamedMCPServerEvidence(binding) && validateCapabilityRealizationBinding(binding) != nil {
-			return "named MCP capability realizations require canonical bindings"
+		if (requestsNamedMCPServerEvidence(binding) || requestsNamedAdditionalExtensionEvidence(binding)) && validateCapabilityRealizationBinding(binding) != nil {
+			return "named capability realizations require canonical bindings"
 		}
 		seenCapabilities[binding.CapabilityID] = true
 	}

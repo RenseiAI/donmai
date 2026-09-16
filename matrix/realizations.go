@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -69,8 +70,15 @@ type CapabilityEligibilityRow struct {
 
 // CompileCapabilityRealizations is the generated realization-catalog surface.
 func CompileCapabilityRealizations(sources []CapabilityRealizationSource) ([]CapabilityRealizationRow, error) {
+	_, harnessByName, err := buildHarnesses()
+	if err != nil {
+		return nil, err
+	}
 	rows := make([]CapabilityRealizationRow, 0, len(sources))
-	for _, s := range sources {
+	for i, s := range sources {
+		if err := validateNamedExtensionProfile(s.Declaration, harnessByName); err != nil {
+			return nil, fmt.Errorf("compile capability realization source %d: %w", i, err)
+		}
 		c, err := agent.CompileCapabilityRealization(s.Declaration, s.Observation)
 		if err != nil {
 			return nil, fmt.Errorf("compile capability realization: %w", err)
@@ -139,25 +147,33 @@ func CompileCapabilityRealizationEvidence(
 }
 
 func preflightCapabilityRealizationEvidenceSources(sources []CapabilityRealizationEvidenceSource) error {
+	_, harnessByName, err := buildHarnesses()
+	if err != nil {
+		return err
+	}
 	seen := make(map[string]struct{}, len(sources))
 	for i, source := range sources {
 		if source.Executor == nil {
 			return fmt.Errorf("execute capability fixture: executor is required")
 		}
 		canonical, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
-			CapabilityID:    source.Declaration.CapabilityID,
-			HarnessID:       source.Declaration.HarnessID,
-			AdapterVersion:  source.Declaration.AdapterVersion,
-			Mode:            source.Declaration.Mode,
-			RecipeID:        source.Declaration.Recipe.RecipeID,
-			Entries:         source.Declaration.Recipe.Entries,
-			DeclaredSurface: source.Declaration.Recipe.DeclaredSurface,
+			CapabilityID:      source.Declaration.CapabilityID,
+			HarnessID:         source.Declaration.HarnessID,
+			AdapterVersion:    source.Declaration.AdapterVersion,
+			Mode:              source.Declaration.Mode,
+			RecipeID:          source.Declaration.Recipe.RecipeID,
+			Entries:           source.Declaration.Recipe.Entries,
+			DeclaredSurface:   source.Declaration.Recipe.DeclaredSurface,
+			ParameterContract: source.Declaration.ParameterContract,
 		})
 		if err != nil {
 			return fmt.Errorf("compile capability realization evidence source %d: %w", i, err)
 		}
 		if !reflect.DeepEqual(canonical, source.Declaration) {
 			return fmt.Errorf("compile capability realization evidence source %d: capability declaration is not canonical", i)
+		}
+		if err := validateNamedExtensionProfile(canonical, harnessByName); err != nil {
+			return fmt.Errorf("compile capability realization evidence source %d: %w", i, err)
 		}
 		key := capabilityRealizationTupleKey(canonical)
 		if _, ok := seen[key]; ok {
@@ -166,6 +182,34 @@ func preflightCapabilityRealizationEvidenceSources(sources []CapabilityRealizati
 		seen[key] = struct{}{}
 	}
 	return nil
+}
+
+func declarationRequestsNamedExtensions(declaration agent.CapabilityRealizationDeclaration) bool {
+	for _, entry := range declaration.Recipe.Entries {
+		if entry.Channel == agent.ToolChannelToolPlugin && strings.HasPrefix(entry.EntryID, agent.AdditionalExtensionCapabilityEntryPrefix) {
+			return true
+		}
+	}
+	return false
+}
+
+func validateNamedExtensionProfile(declaration agent.CapabilityRealizationDeclaration, harnessByName map[agent.HarnessName]HarnessRow) error {
+	if !declarationRequestsNamedExtensions(declaration) {
+		return nil
+	}
+	harness, ok := harnessByName[declaration.HarnessID]
+	if !ok {
+		return fmt.Errorf("named extension harness is unknown")
+	}
+	for _, profile := range harness.ToolLifecycle {
+		if profile.ID == declaration.AdapterVersion && profile.Mode == declaration.Mode {
+			if !profile.NamedExtensionEntries {
+				return fmt.Errorf("selected profile does not opt in to named extension entries")
+			}
+			return nil
+		}
+	}
+	return fmt.Errorf("selected named extension profile is unknown")
 }
 
 func capabilityRealizationTupleKey(d agent.CapabilityRealizationDeclaration) string {
@@ -218,6 +262,10 @@ func cloneCapabilityRealizationEvidenceRows(rows []CapabilityRealizationEvidence
 	copy(cloned, rows)
 	for i := range cloned {
 		compiled := &cloned[i].Compiled
+		if compiled.Declaration.ParameterContract != nil {
+			contract := *compiled.Declaration.ParameterContract
+			compiled.Declaration.ParameterContract = &contract
+		}
 		compiled.Declaration.Recipe.Entries = append([]agent.CapabilityRecipeEntry(nil), compiled.Declaration.Recipe.Entries...)
 		for entryIndex := range compiled.Declaration.Recipe.Entries {
 			entry := &compiled.Declaration.Recipe.Entries[entryIndex]
