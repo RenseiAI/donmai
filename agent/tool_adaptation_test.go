@@ -811,6 +811,48 @@ func TestToolLifecycleNamedMCPBindingDeduplicatesIdenticalRequests(t *testing.T)
 	}
 }
 
+func TestToolLifecycleNamedMCPBindingConflictingRecipeDigestStaysARealizationFailure(t *testing.T) {
+	t.Parallel()
+	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
+	matching := namedMCPBinding(t, "example.matching/v1", server.Name, server)
+	otherConfig := server
+	otherConfig.URL = "https://other.example/mcp"
+	conflicting := namedMCPBinding(t, "example.conflicting/v1", server.Name, otherConfig)
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion, CapabilityRealizations: []agent.CapabilityRealizationBinding{matching, conflicting}}}, mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous))
+	var denial *agent.ToolAdaptationError
+	if !errors.As(err, &denial) || denial.Code != agent.ToolDenialApplicationFailed {
+		t.Fatalf("error = %v, want ordinary realization mismatch", err)
+	}
+	if len(receipt.CapabilityRealizations) != 2 || receipt.CapabilityRealizations[0].Decision != "artifact_bound" || receipt.CapabilityRealizations[1].Decision != "denied" {
+		t.Fatalf("realization results = %+v, want matching then denied conflicting recipe", receipt.CapabilityRealizations)
+	}
+}
+
+func TestToolLifecycleNamedMCPBindingCannotUseDowngradedMCPDelivery(t *testing.T) {
+	t.Parallel()
+	server := agent.MCPServerConfig{Name: "workflow", Type: "http", URL: "https://workflow.example/mcp"}
+	binding := namedMCPBinding(t, "example.named-mcp/v1", server.Name, server)
+	profile := mustProfile(t, (&codex.Provider{}).Manifest(), agent.PromptModeAutonomous)
+	profile.MCPDelivery = agent.ToolDeliveryUnsupported
+	profile.FallbackDeliveries = append(profile.FallbackDeliveries, agent.ToolDeliveryCodexAppServerMCP)
+	_, receipt, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, MCPServers: []agent.MCPServerConfig{server}, ToolLifecyclePlan: &agent.ToolLifecyclePlan{
+		ContractVersion:        agent.ToolLifecycleContractVersion,
+		CapabilityRealizations: []agent.CapabilityRealizationBinding{binding},
+		AuthorizedFallbacks: []agent.ToolLifecycleFallback{{
+			ID: "mcp-fallback", Channel: agent.ToolChannelMCPServer, To: agent.ToolDeliveryCodexAppServerMCP,
+		}},
+	}}, profile)
+	var denial *agent.ToolAdaptationError
+	if !errors.As(err, &denial) || denial.Code != agent.ToolDenialDeliveryUnsupported {
+		t.Fatalf("error = %v, want named MCP delivery refusal", err)
+	}
+	entryID, _ := agent.MCPServerCapabilityEntryID(server.Name)
+	named := namedMCPEntry(t, receipt, entryID)
+	if named.Outcome != agent.ToolOutcomeDenied || named.DenialCode != agent.ToolDenialDeliveryUnsupported {
+		t.Fatalf("named entry = %+v, want refused instead of downgraded", named)
+	}
+}
+
 // --- pi's "no-MCP truth" fixtures (ADR-2026-08-06 D8, pi row) ---
 //
 // pi ships no MCP by design (manifest.go: AcceptsMcpServerSpec is false,
