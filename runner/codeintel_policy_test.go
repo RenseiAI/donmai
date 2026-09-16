@@ -45,6 +45,23 @@ func TestTranslateSpecForCodeIntelDeliveryRejectsNoncanonicalSelectionOrder(t *t
 	}
 }
 
+func TestTranslateSpecForCodeIntelDeliveryKeepsCanonicalInputAndRendersDisplayOrder(t *testing.T) {
+	t.Parallel()
+	selection := codeIntelDeliverySelection{Route: codeIntelDeliveryNative, Tools: []string{codeintelcontract.ToolSearchCode, codeintelcontract.ToolSearchSymbols}}
+	wantInput := append([]string(nil), selection.Tools...)
+	spec, err := translateSpecForCodeIntelDelivery(QueuedWork{}, agent.Capabilities{AcceptsAllowedToolsList: true}, SpecInputs{Autonomous: true}, selection, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !reflect.DeepEqual(selection.Tools, wantInput) {
+		t.Fatalf("canonical authority input mutated: got=%v want=%v", selection.Tools, wantInput)
+	}
+	wantTail := []string{codeintelcontract.ToolSearchSymbols, codeintelcontract.ToolSearchCode}
+	if !reflect.DeepEqual(spec.AllowedTools[len(spec.AllowedTools)-2:], wantTail) {
+		t.Fatalf("projected display order=%v want tail=%v", spec.AllowedTools, wantTail)
+	}
+}
+
 func TestTranslateSpecForCodeIntelDeliveryNormalizesAliasesAndRejectsTypos(t *testing.T) {
 	t.Parallel()
 	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
