@@ -10,6 +10,49 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.43 — 2026-09-16
+
+### Features
+
+- Add exact named MCP capability evidence and optional protected runtime MCP
+  acknowledgement. Runtime endpoint and authorization digests are persisted in
+  a v3 host receipt and independently revalidated by the child before MCP
+  configuration or provider spawn, while unselected work retains its existing
+  receipt path. (#637, #638)
+- Expose synchronous code-intelligence server refresh so embedders can observe
+  local edits with the existing runner and six-tool MCP surface. (#633)
+- Expose fenced carrier-loss recovery for adopted session shims. Recovery is
+  bound to the current controller reference and reuses the existing bounded
+  re-adoption owner without eagerly stopping the harness. (#634)
+
+### Fixes
+
+- Scope protected runtime MCP selection to the exact capability, harness,
+  adapter profile, and prompt mode. Mixed registries may safely carry the same
+  provider-neutral capability for Pi and Codex without selecting the wrong
+  realization. (#640)
+- Forward the immutable capability-realization registry into receipt-bearing
+  child preflight so host compilation, runner construction, and early child
+  admission resolve the same evidence. (#636)
+- Harden local workarea archive roots before archive, list, restore, or manifest
+  access. Broad permissions are tightened, while symlinked, foreign-owned, or
+  replaced roots are refused. (#631)
+- Resolve code-index roots and selected subtrees physically before MCP server
+  construction, rejecting direct and chained symlink escapes outside the
+  configured repository root. (#632)
+- Update `google.golang.org/grpc` to v1.83.1 to address GO-2026-6348, an
+  HTTP/2 DATA-frame fragmentation heap-exhaustion advisory reachable through
+  Sigstore/Rekor verification, together with its required
+  `google.golang.org/genproto/googleapis/rpc` companion revision. (#642)
+
+### Chores
+
+- Add a mandatory real Codex 0.154.0 fixture that exercises production
+  interactive MCP configuration and five direct loopback tool calls without a
+  model turn; CI requires one pass and zero skips. (#639)
+- Make wake and redelivery fixtures wait for exact terminal raw-mode readiness
+  before sending control bytes. (#635)
+
 ## v0.72.42 — 2026-09-15
 
 ### Features
