@@ -294,4 +294,33 @@ func TestNativeCodeIntelPolicyAliasesDenyPrecedenceAndRegexValidation(t *testing
 			t.Errorf("invalid native/regex pattern %q accepted", pattern)
 		}
 	}
+
+	for _, allowed := range []string{"af_code_get_repo_map", "mcp__af-code-intelligence__af_code_get_repo_map"} {
+		exact, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{allowed}}}, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision := exact.Evaluate("af_code_get_repo_map"); !decision.Allow {
+			t.Errorf("exact permission entry %q denied: %q", allowed, decision.Reason)
+		}
+		if decision := exact.Evaluate("af_code_search_symbols"); decision.Allow {
+			t.Errorf("exact permission entry %q granted another selected member", allowed)
+		}
+	}
+
+	for _, invalidSelected := range [][]string{nil, {}, {"af_code_get_repo_map", "af_code_get_repo_map"}, {"af_code_unknown"}, {"AF_CODE_GET_REPO_MAP"}} {
+		if _, err := newNativeCodeIntelPolicy(agent.Spec{}, invalidSelected); err == nil {
+			t.Errorf("invalid selected set %v accepted", invalidSelected)
+		}
+	}
+
+	for _, defaultDecision := range []string{"", "deny", "prompt", "ask"} {
+		denied, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: defaultDecision}}, selected)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if decision := denied.Evaluate("af_code_get_repo_map"); decision.Allow {
+			t.Errorf("default decision %q granted native call", defaultDecision)
+		}
+	}
 }

@@ -6,12 +6,16 @@ import (
 	"encoding/hex"
 	"encoding/json"
 	"errors"
+	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/codeintelbridge"
+	"github.com/RenseiAI/donmai/internal/codeintelcontract"
+	"github.com/RenseiAI/donmai/internal/kit"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -19,11 +23,13 @@ import (
 
 type capturingManifestProvider struct {
 	*manifestSelectorProvider
-	spawned agent.Spec
+	spawned    agent.Spec
+	spawnCalls int
 }
 
 func (p *capturingManifestProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
 	p.spawned = spec
+	p.spawnCalls++
 	return nil, errors.New("capture provider stops before process spawn")
 }
 
@@ -95,6 +101,7 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	for i := range manifest.ToolLifecycle {
 		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
 			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
 			manifest.ToolLifecycle[i].NamedExtensionEntries = true
 		}
 	}
@@ -102,7 +109,9 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{"af_code_get_repo_map", "af_code_search_symbols"})
 	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	binders, _ := NewCapabilityParameterBinderRegistry(binder)
-	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
 	provider := &capturingManifestProvider{manifestSelectorProvider: baseProvider}
 	registry := NewRegistry()
 	if err := registry.Register(provider); err != nil {
@@ -115,6 +124,7 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	qw.PlatformURL = server.URL
 	qw.AuthToken = "token"
 	qw.CodeIntel = &prompt.CodeIntelWork{}
+	qw.Skills = []prompt.SkillSpec{{ID: "native-policy", Body: "policy", DisallowedTools: []string{"mcp__" + codeintelcontract.ServerName + "__" + codeintelcontract.ToolSearchSymbols}}}
 	operational, _ := CanonicalOperationalPayload(qw)
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(operational, &fields)
@@ -150,6 +160,77 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	if !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_get_repo_map") || !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_symbols") || strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_code") {
 		t.Fatalf("native prompt did not use exact declared default surface: %q", provider.spawned.SystemPromptAppend)
 	}
+	wantAllowed := append(defaultAllowedTools(), codeintelcontract.ToolGetRepoMap, codeintelcontract.ToolSearchSymbols)
+	if !slices.Equal(provider.spawned.AllowedTools, wantAllowed) {
+		t.Fatalf("actual run native allowlist=%v want=%v", provider.spawned.AllowedTools, wantAllowed)
+	}
+	if !slices.Contains(provider.spawned.DisallowedTools, codeintelcontract.ToolSearchSymbols) {
+		t.Fatalf("actual run omitted normalized inline-card deny: %v", provider.spawned.DisallowedTools)
+	}
+}
+
+func TestRunnerReceiptBoundNativePathDoesNotLoadPrecomputedKitSkills(t *testing.T) {
+	manifest := codexManifestForTest()
+	for i := range manifest.ToolLifecycle {
+		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
+			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
+			manifest.ToolLifecycle[i].NamedExtensionEntries = true
+		}
+	}
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{codeintelcontract.ToolGetRepoMap, codeintelcontract.ToolSearchSymbols})
+	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	binders, _ := NewCapabilityParameterBinderRegistry(binder)
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
+	provider := &capturingManifestProvider{manifestSelectorProvider: baseProvider}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	server := mockPlatformServer(t)
+	t.Cleanup(server.Close)
+	qw := exactReceiptQueuedWork("native-late-kit-policy")
+	qw.Body = "exercise late kit policy refusal"
+	qw.PlatformURL = server.URL
+	qw.AuthToken = "token"
+	qw.CodeIntel = &prompt.CodeIntelWork{}
+	operational, _ := CanonicalOperationalPayload(qw)
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(operational, &fields)
+	parametersDigest, _ := executioncell.DigestCapabilityParameters(fields["codeIntel"])
+	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.code-intelligence/v1", ParametersDigest: parametersDigest}})
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+	qw.OperationalPayload = operational
+	detail := map[string]any{"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload}
+	view, _ := NewProviderViewWithOptions(registry, ProviderViewOptions{CapabilityRealizations: realizations, CapabilityParameterBinders: binders})
+	host, err := view.PreflightExecution(rawJSONForRunner(t, detail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.HostAdaptationReceipt = host
+
+	kitDir := t.TempDir()
+	writeSkillMD(t, kitDir, "skills/native-policy/SKILL.md", "---\ntools:\n  disallow:\n    - shell: \"af_code_search_symbols\"\n---\n\n# Native policy\n")
+	kitSources := []kit.KitSkillSource{{ID: "fixture/native-policy", Priority: 10, ManifestPath: filepath.Join(kitDir, "fixture.kit.toml"), SkillFiles: []string{"skills/native-policy/SKILL.md"}}}
+	manager, _ := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	poster, _ := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: qw.WorkerID, AuthToken: "token", HTTPClient: server.Client(), BaseDelay: 1})
+	run, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), CapabilityRealizations: realizations, CapabilityParameterBinders: binders, KitSkillSources: kitSources, SkipBackstop: true, SkipSteering: true, SkipPostSession: true, MaxSessionDuration: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, runErr := run.Run(context.Background(), qw)
+	if runErr == nil || !strings.Contains(runErr.Error(), "capture provider stops") {
+		t.Fatalf("run error=%T %v result=%+v, want capture-provider sentinel", runErr, runErr, got)
+	}
+	if provider.spawnCalls != 1 {
+		t.Fatalf("provider spawn calls=%d want=1", provider.spawnCalls)
+	}
+	if slices.Contains(provider.spawned.DisallowedTools, codeintelcontract.ToolSearchSymbols) {
+		t.Fatalf("receipt-bound path unexpectedly loaded precomputed kit policy: %v", provider.spawned.DisallowedTools)
+	}
 }
 
 func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
@@ -157,6 +238,7 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	for i := range manifest.ToolLifecycle {
 		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
 			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
 			manifest.ToolLifecycle[i].NamedExtensionEntries = true
 		}
 	}
@@ -181,7 +263,9 @@ func TestPreparedSourceSelectsNativeBeforeAllProducers(t *testing.T) {
 	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.code-intelligence/v1", ParametersDigest: parametersDigest}})
 	qw = attachAdmittedExecutionCell(t, qw, cell)
 	qw.OperationalPayload = operational
-	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
 	selection := harnessSelection{Provider: provider, receipt: mustAdmissionReceipt(t, qw.AdmissionReceipt), effectiveCell: cell}
 	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, nil, resolver)
 	if err != nil {
@@ -225,6 +309,7 @@ func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	for i := range manifest.ToolLifecycle {
 		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
 			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
 			manifest.ToolLifecycle[i].NamedExtensionEntries = true
 		}
 	}
@@ -232,7 +317,9 @@ func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	realizations, _ := codeIntelRealizationFixture(t, agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true)
 	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	binders, _ := NewCapabilityParameterBinderRegistry(binder)
-	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	provider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
 	registry := NewRegistry()
 	if err := registry.Register(provider); err != nil {
 		t.Fatal(err)
@@ -240,6 +327,7 @@ func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	qw := exactReceiptQueuedWork("native-provider-view")
 	qw.Body = "exercise native preflight"
 	qw.CodeIntel = &prompt.CodeIntelWork{Tools: []string{"af_code_get_repo_map"}}
+	qw.Skills = []prompt.SkillSpec{{ID: "native-policy", Body: "policy", DisallowedTools: []string{"mcp__" + codeintelcontract.ServerName + "__" + codeintelcontract.ToolGetRepoMap}}}
 	operational, _ := CanonicalOperationalPayload(qw)
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(operational, &fields)
@@ -266,6 +354,18 @@ func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	}
 	if len(plan.ToolLifecycleReceipt.CapabilityRealizations) != 1 || plan.ToolLifecycleReceipt.CapabilityRealizations[0].ParameterBinding == nil {
 		t.Fatalf("preflight omitted parameterized realization: %+v", plan.ToolLifecycleReceipt)
+	}
+	wantAllowed := append(defaultAllowedTools(), codeintelcontract.ToolGetRepoMap)
+	rawAllowed, _ := json.Marshal(wantAllowed)
+	allowedSum := sha256.Sum256(rawAllowed)
+	if got, want := plan.AuthorityFieldDigests["allowedTools"], hex.EncodeToString(allowedSum[:]); got != want {
+		t.Fatalf("preflight allowedTools digest=%s want=%s", got, want)
+	}
+	wantDisallowed := append(defaultDisallowedTools(), codeintelcontract.ToolGetRepoMap)
+	rawDisallowed, _ := json.Marshal(wantDisallowed)
+	disallowedSum := sha256.Sum256(rawDisallowed)
+	if got, want := plan.AuthorityFieldDigests["disallowedTools"], hex.EncodeToString(disallowedSum[:]); got != want {
+		t.Fatalf("preflight disallowedTools digest=%s want=%s", got, want)
 	}
 	if _, err := NewProviderViewWithOptions(registry, ProviderViewOptions{CapabilityParameterBinders: binders}); err == nil {
 		t.Fatal("provider view accepted binders without static realizations")

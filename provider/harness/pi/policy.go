@@ -2,12 +2,14 @@ package pi
 
 import (
 	"encoding/json"
+	"fmt"
 	"path/filepath"
 	"regexp"
 	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/codeintelcontract"
 )
 
 // ToolKind classifies an intercepted built-in tool call. pi ships read /
@@ -429,4 +431,155 @@ func compilePatterns(patterns []string) []*regexp.Regexp {
 		out = append(out, re)
 	}
 	return out
+}
+
+type nativeCodeIntelPolicy struct {
+	selected      map[string]bool
+	allowed       map[string]bool
+	disallowed    map[string]bool
+	allowRegexes  []*regexp.Regexp
+	denyRegexes   []*regexp.Regexp
+	allowWildcard bool
+	denyWildcard  bool
+	hasAllowGate  bool
+	defaultAllow  bool
+}
+
+var nativePolicyToolDesignator = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_]*(\(.*\))?$`)
+
+func newNativeCodeIntelPolicy(spec agent.Spec, selected []string) (*nativeCodeIntelPolicy, error) {
+	policy := &nativeCodeIntelPolicy{
+		selected:     make(map[string]bool, len(selected)),
+		allowed:      make(map[string]bool),
+		disallowed:   make(map[string]bool),
+		hasAllowGate: len(spec.AllowedTools) > 0 || spec.PermissionConfig != nil && len(spec.PermissionConfig.AllowPatterns) > 0,
+		defaultAllow: spec.PermissionConfig != nil && strings.EqualFold(strings.TrimSpace(spec.PermissionConfig.DefaultDecision), "allow"),
+	}
+	if len(selected) == 0 {
+		return nil, fmt.Errorf("native code-intelligence selected set is empty")
+	}
+	if spec.PermissionConfig != nil {
+		switch strings.ToLower(strings.TrimSpace(spec.PermissionConfig.DefaultDecision)) {
+		case "", "allow", "deny", "prompt", "ask":
+		default:
+			return nil, fmt.Errorf("native code-intelligence default decision is invalid")
+		}
+	}
+	for _, name := range selected {
+		match, err := codeintelcontract.NormalizePolicyIdentity(name)
+		if err != nil || !match.Related || match.Canonical != name || policy.selected[name] {
+			return nil, fmt.Errorf("native code-intelligence selected set is invalid")
+		}
+		policy.selected[name] = true
+	}
+
+	var err error
+	policy.allowWildcard, err = collectNativeToolRules(spec.AllowedTools, policy.allowed)
+	if err != nil {
+		return nil, fmt.Errorf("native code-intelligence allowed tools: %w", err)
+	}
+	policy.denyWildcard, err = collectNativeToolRules(spec.DisallowedTools, policy.disallowed)
+	if err != nil {
+		return nil, fmt.Errorf("native code-intelligence disallowed tools: %w", err)
+	}
+	if spec.PermissionConfig != nil {
+		allowWildcard, regexes, err := collectNativePermissionRules(spec.PermissionConfig.AllowPatterns, policy.allowed)
+		if err != nil {
+			return nil, fmt.Errorf("native code-intelligence allow patterns: %w", err)
+		}
+		policy.allowWildcard = policy.allowWildcard || allowWildcard
+		policy.allowRegexes = regexes
+		denyWildcard, regexes, err := collectNativePermissionRules(spec.PermissionConfig.DisallowPatterns, policy.disallowed)
+		if err != nil {
+			return nil, fmt.Errorf("native code-intelligence disallow patterns: %w", err)
+		}
+		policy.denyWildcard = policy.denyWildcard || denyWildcard
+		policy.denyRegexes = regexes
+	}
+	return policy, nil
+}
+
+func collectNativeToolRules(values []string, exact map[string]bool) (bool, error) {
+	wildcard := false
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return false, fmt.Errorf("tool pattern is blank")
+		}
+		if value == "*" {
+			wildcard = true
+			continue
+		}
+		match, err := codeintelcontract.NormalizePolicyIdentity(value)
+		if err != nil {
+			return false, err
+		}
+		if match.Related {
+			exact[match.Canonical] = true
+		}
+	}
+	return wildcard, nil
+}
+
+func collectNativePermissionRules(values []string, exact map[string]bool) (bool, []*regexp.Regexp, error) {
+	wildcard := false
+	regexes := make([]*regexp.Regexp, 0, len(values))
+	for _, value := range values {
+		if strings.TrimSpace(value) == "" {
+			return false, nil, fmt.Errorf("permission pattern is blank")
+		}
+		if value == "*" {
+			wildcard = true
+			continue
+		}
+		match, err := codeintelcontract.NormalizePolicyIdentity(value)
+		if err != nil {
+			return false, nil, err
+		}
+		if match.Related {
+			exact[match.Canonical] = true
+			continue
+		}
+		if nativePolicyToolDesignator.MatchString(strings.TrimSpace(value)) {
+			continue
+		}
+		re, err := regexp.Compile(value)
+		if err != nil {
+			return false, nil, fmt.Errorf("permission regex is invalid")
+		}
+		regexes = append(regexes, re)
+	}
+	return wildcard, regexes, nil
+}
+
+func (p *nativeCodeIntelPolicy) Evaluate(name string) Decision {
+	match, err := codeintelcontract.NormalizePolicyIdentity(name)
+	if err != nil || !match.Related {
+		return Decision{Allow: false, Reason: "native code-intelligence tool identity is invalid"}
+	}
+	canonical := match.Canonical
+	if !p.selected[canonical] {
+		return Decision{Allow: false, Reason: "native code-intelligence tool is outside the selected capability surface"}
+	}
+	if p.denyWildcard || p.disallowed[canonical] || matchesNativeRegex(p.denyRegexes, canonical) {
+		return Decision{Allow: false, Reason: "native code-intelligence tool is explicitly denied"}
+	}
+	if p.hasAllowGate {
+		if p.allowWildcard || p.allowed[canonical] || matchesNativeRegex(p.allowRegexes, canonical) {
+			return Decision{Allow: true}
+		}
+		return Decision{Allow: false, Reason: "no native code-intelligence allow rule matched"}
+	}
+	if p.defaultAllow {
+		return Decision{Allow: true}
+	}
+	return Decision{Allow: false, Reason: "native code-intelligence defaults to deny"}
+}
+
+func matchesNativeRegex(regexes []*regexp.Regexp, subject string) bool {
+	for _, re := range regexes {
+		if re.MatchString(subject) {
+			return true
+		}
+	}
+	return false
 }

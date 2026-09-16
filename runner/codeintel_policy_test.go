@@ -62,6 +62,56 @@ func TestTranslateSpecForCodeIntelDeliveryNormalizesAliasesAndRejectsTypos(t *te
 	}
 }
 
+func TestTranslateSpecForCodeIntelDeliveryPreservesLegacyMCPAndInteractive(t *testing.T) {
+	t.Parallel()
+	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
+	ci := &prompt.CodeIntelWork{Tools: []string{codeintelcontract.ToolGetRepoMap}}
+	for _, test := range []struct {
+		name      string
+		qw        QueuedWork
+		in        SpecInputs
+		selection codeIntelDeliverySelection
+	}{
+		{name: "legacy", qw: QueuedWork{}, in: SpecInputs{Autonomous: true}, selection: codeIntelDeliverySelection{Route: codeIntelDeliveryLegacy}},
+		{name: "mcp", qw: QueuedWork{QueuedWork: prompt.QueuedWork{CodeIntel: ci}}, in: SpecInputs{Autonomous: true}, selection: codeIntelDeliverySelection{Route: codeIntelDeliveryMCP}},
+		{name: "interactive native remains fieldless", qw: QueuedWork{QueuedWork: prompt.QueuedWork{Mode: prompt.InteractiveRunMode, CodeIntel: ci}}, in: SpecInputs{}, selection: nativePolicySelection()},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			legacyInput := test.in
+			legacyInput.CodeIntelDeliveryRoute = test.selection.Route
+			want := translateSpec(test.qw, caps, legacyInput)
+			got, err := translateSpecForCodeIntelDelivery(test.qw, caps, test.in, test.selection, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if !reflect.DeepEqual(got, want) {
+				t.Fatalf("checked wrapper changed legacy Spec:\nwant=%+v\ngot=%+v", want, got)
+			}
+		})
+	}
+}
+
+func TestTranslateSpecForCodeIntelDeliveryDetachesInputs(t *testing.T) {
+	t.Parallel()
+	fq := "mcp__" + codeintelcontract.ServerName + "__" + codeintelcontract.ToolSearchSymbols
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{fq}}}
+	selection := nativePolicySelection()
+	spec, err := translateSpecForCodeIntelDelivery(qw, agent.Capabilities{AcceptsAllowedToolsList: true}, SpecInputs{Autonomous: true}, selection, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.AllowedTools[0] = "mutated"
+	selection.Tools[0] = "mutated"
+	if spec.AllowedTools[0] != codeintelcontract.ToolSearchSymbols {
+		t.Fatalf("Spec aliases queued work or selection: %v", spec.AllowedTools)
+	}
+	spec.AllowedTools[0] = "spec-mutated"
+	if qw.AllowedTools[0] != "mutated" {
+		t.Fatal("Spec mutation reached queued work")
+	}
+}
+
 func TestRequirePreparedNativeCodeIntelPolicyUsesExactValueFreeComparison(t *testing.T) {
 	t.Parallel()
 	base := agent.Spec{AllowedTools: []string{"Read", codeintelcontract.ToolSearchSymbols}, DisallowedTools: []string{"Bash(env)"}, PermissionConfig: &agent.PermissionConfig{AllowPatterns: []string{"^af_code_"}, DisallowPatterns: []string{"unknown$"}, DefaultDecision: "deny"}}
