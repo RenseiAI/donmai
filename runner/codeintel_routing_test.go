@@ -169,6 +169,77 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	}
 }
 
+func TestExplicitCardNativePolicyPreservedAcrossPreflightAndRun(t *testing.T) {
+	manifest := codexManifestForTest()
+	for i := range manifest.ToolLifecycle {
+		if manifest.ToolLifecycle[i].Mode == agent.PromptModeAutonomous {
+			manifest.ToolLifecycle[i].ToolPluginDelivery = agent.ToolDeliveryPiAdditionalExtension
+			manifest.ToolLifecycle[i].NativeToolPolicyDelivery = agent.ToolDeliveryPiInjectedBoundary
+			manifest.ToolLifecycle[i].NamedExtensionEntries = true
+		}
+	}
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{codeintelcontract.ToolGetRepoMap, codeintelcontract.ToolSearchSymbols})
+	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+	binders, _ := NewCapabilityParameterBinderRegistry(binder)
+	caps := codexCapabilitiesForTest()
+	caps.AcceptsAllowedToolsList = true
+	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: caps}
+	provider := &capturingManifestProvider{manifestSelectorProvider: baseProvider}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	server := mockPlatformServer(t)
+	t.Cleanup(server.Close)
+	qw := exactReceiptQueuedWork("native-explicit-policy")
+	qw.Body = "exercise explicit native policy"
+	qw.PlatformURL = server.URL
+	qw.AuthToken = "token"
+	qw.CodeIntel = &prompt.CodeIntelWork{}
+	qw.AllowedTools = []string{"Read", "Bash(git:*)"}
+	operational, _ := CanonicalOperationalPayload(qw)
+	var fields map[string]json.RawMessage
+	_ = json.Unmarshal(operational, &fields)
+	parametersDigest, _ := executioncell.DigestCapabilityParameters(fields["codeIntel"])
+	cell := exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: "example.code-intelligence/v1", ParametersDigest: parametersDigest}})
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+	qw.OperationalPayload = operational
+	detail := map[string]any{"sessionId": qw.SessionID, "workerId": qw.WorkerID, "admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell, "executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload}
+	view, _ := NewProviderViewWithOptions(registry, ProviderViewOptions{CapabilityRealizations: realizations, CapabilityParameterBinders: binders})
+	hostRaw, err := view.PreflightExecution(rawJSONForRunner(t, detail))
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(hostRaw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	rawAllowed, _ := json.Marshal(qw.AllowedTools)
+	allowedSum := sha256.Sum256(rawAllowed)
+	if got, want := plan.AuthorityFieldDigests["allowedTools"], hex.EncodeToString(allowedSum[:]); got != want {
+		t.Fatalf("explicit preflight allow digest=%s want=%s", got, want)
+	}
+	qw.HostAdaptationReceipt = hostRaw
+	manager, _ := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	poster, _ := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: qw.WorkerID, AuthToken: "token", HTTPClient: server.Client(), BaseDelay: 1})
+	run, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), CapabilityRealizations: realizations, CapabilityParameterBinders: binders, SkipBackstop: true, SkipSteering: true, SkipPostSession: true, MaxSessionDuration: -1})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, runErr := run.Run(context.Background(), qw)
+	if runErr == nil || !strings.Contains(runErr.Error(), "capture provider stops") {
+		t.Fatalf("run error=%v want capture sentinel", runErr)
+	}
+	if !slices.Equal(provider.spawned.AllowedTools, qw.AllowedTools) {
+		t.Fatalf("actual run widened explicit allowlist: got=%v want=%v", provider.spawned.AllowedTools, qw.AllowedTools)
+	}
+}
+
 func TestRunnerReceiptBoundNativePathDoesNotLoadPrecomputedKitSkills(t *testing.T) {
 	manifest := codexManifestForTest()
 	for i := range manifest.ToolLifecycle {
