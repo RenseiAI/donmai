@@ -114,7 +114,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 	var preparedPlan *agent.PreparedHarness
 	var preparedSource agent.Spec
-	codeIntelRoute := codeIntelDeliveryLegacy
+	codeIntelDelivery := codeIntelDeliverySelection{Route: codeIntelDeliveryLegacy}
 	if len(selection.receipt.Bytes()) > 0 {
 		preparedPlan, err = preparedHarnessFromWork(qw)
 		if err != nil {
@@ -128,7 +128,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		preparedSource = ReconcileRepositorySandbox(preparedSource, repositoryDeclaration)
 		preparedSource.PreparedHarness = preparedPlan
-		codeIntelRoute, err = codeIntelRouteFromSpec(qw.CodeIntel, preparedSource)
+		codeIntelDelivery, err = codeIntelRouteFromSpec(qw.CodeIntel, preparedSource)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
@@ -486,7 +486,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
-	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), codeIntelRoute)
+	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), codeIntelDelivery.Route)
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
@@ -618,7 +618,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// composed system prompt — FQ MCP tool names for MCP-capable providers,
 	// Bash-CLI fallback guidance for providers that ignore MCP specs. Strict
 	// no-op when the block is absent (byte-identical prompt to today).
-	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelRoute)
+	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
@@ -669,7 +669,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// 6. Translate to agent.Spec.
 	composedEnv := envToMap(r.envc.Compose(hostEnv(), agent.Spec{Env: specEnv}))
 	spec := translateSpec(qw, caps, SpecInputs{
-		CodeIntelDeliveryRoute: codeIntelRoute,
+		CodeIntelDeliveryRoute: codeIntelDelivery.Route,
 		Cwd:                    wpath,
 		Prompt:                 userPrompt,
 		SystemPromptAppend:     systemPrompt,

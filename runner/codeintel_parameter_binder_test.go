@@ -18,6 +18,10 @@ func codeIntelRealizationFixture(t *testing.T, harness agent.HarnessName, profil
 }
 
 func codeIntelRealizationFixtureForCapability(t *testing.T, capabilityID string, harness agent.HarnessName, profile string, mode agent.PromptSessionMode, native bool) (*agent.CapabilityRealizationRegistry, agent.CompiledCapabilityRealization) {
+	return codeIntelRealizationFixtureWithTools(t, capabilityID, harness, profile, mode, native, nil)
+}
+
+func codeIntelRealizationFixtureWithTools(t *testing.T, capabilityID string, harness agent.HarnessName, profile string, mode agent.PromptSessionMode, native bool, toolNames []string) (*agent.CapabilityRealizationRegistry, agent.CompiledCapabilityRealization) {
 	t.Helper()
 	surface := make([]agent.CapabilitySurfaceIdentity, 0, 7)
 	toolKind := agent.CapabilitySurfaceMCPTool
@@ -35,8 +39,14 @@ func codeIntelRealizationFixtureForCapability(t *testing.T, capabilityID string,
 	} else {
 		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: agent.CapabilitySurfaceMCPServer, ID: codeintelcontract.ServerName})
 	}
+	selected := map[string]bool{}
+	for _, name := range toolNames {
+		selected[name] = true
+	}
 	for _, descriptor := range codeintelcontract.Descriptors() {
-		surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: toolKind, ID: descriptor.Name})
+		if len(selected) == 0 || selected[descriptor.Name] {
+			surface = append(surface, agent.CapabilitySurfaceIdentity{Kind: toolKind, ID: descriptor.Name})
+		}
 	}
 	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: codeintelbridge.ParameterContractID, BinderSourceDigest: testCodeIntelBinderDigest, SurfaceProjection: "subset", RuntimeObservation: "none"}
 	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: capabilityID, HarnessID: harness, AdapterVersion: profile, Mode: mode, RecipeID: "example/code-intelligence/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: channel, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})

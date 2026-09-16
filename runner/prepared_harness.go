@@ -72,7 +72,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	codeIntelRoute, err := resolveCodeIntelDeliveryRoute(working.CodeIntel, resolvedCapabilities)
+	codeIntelDelivery, err := resolveCodeIntelDeliveryRoute(working.CodeIntel, resolvedCapabilities)
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
@@ -83,7 +83,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	composition.HarnessProtocol = injectCodeIntelPartial(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelRoute)
+	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelDelivery)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, working.RepositoryDeclaration != nil)
 	userPrompt := composition.UserPrompt
 	if working.isInteractive() {
@@ -108,7 +108,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
 		}
 	}
-	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, codeIntelRoute)
+	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, codeIntelDelivery.Route)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
@@ -118,7 +118,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		Prompt: userPrompt, SystemPromptAppend: composition.SystemPrompt(), PromptPlan: promptPlan,
 		InitialContext: composition.InitialContext, MCPServers: mcpServers, Env: maps.Clone(working.Env),
 		Autonomous: mode == agent.PromptModeAutonomous, ProviderName: string(provider.Name()),
-		CodeIntelDeliveryRoute: codeIntelRoute,
+		CodeIntelDeliveryRoute: codeIntelDelivery.Route,
 	})
 	spec.PromptMode = mode
 	if working.isInteractive() {

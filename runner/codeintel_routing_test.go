@@ -31,32 +31,32 @@ func TestCodeIntelDeliveryRouteControlsAllThreeProducers(t *testing.T) {
 	ci := &prompt.CodeIntelWork{Tools: []string{"af_code_search_symbols", "af_code_get_repo_map"}}
 	native := codeIntelBindingFixture(t, `{"codeIntel":{"tools":["af_code_search_symbols","af_code_get_repo_map"]}}`, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
 	route, err := resolveCodeIntelDeliveryRoute(ci, []ResolvedCapabilityParameterBinding{native})
-	if err != nil || route != codeIntelDeliveryNative {
+	if err != nil || route.Route != codeIntelDeliveryNative {
 		t.Fatalf("native route=%v err=%v", route, err)
 	}
-	partial := injectCodeIntelPartial("base", mcpCaps(), ci, route)
+	partial := injectCodeIntelPartialForDelivery("base", mcpCaps(), ci, route)
 	if strings.Contains(partial, "mcp__") || strings.Contains(partial, " code ") || !strings.Contains(partial, "af_code_get_repo_map") {
 		t.Fatalf("native partial=%q", partial)
 	}
 	qw := QueuedWork{}
 	qw.CodeIntel = ci
-	if servers := defaultMCPServersForHarness(qw, "/abs/worktree", mcpDeliveringHarness(), agent.PromptModeAutonomous, route); len(servers) != 0 {
+	if servers := defaultMCPServersForHarness(qw, "/abs/worktree", mcpDeliveringHarness(), agent.PromptModeAutonomous, route.Route); len(servers) != 0 {
 		t.Fatalf("native route retained code-intelligence MCP: %+v", servers)
 	}
-	spec := translateSpec(qw, mcpCaps(), SpecInputs{CodeIntelDeliveryRoute: route})
+	spec := translateSpec(qw, mcpCaps(), SpecInputs{CodeIntelDeliveryRoute: route.Route})
 	if len(spec.MCPToolNames) != 0 {
 		t.Fatalf("native route retained FQ names: %v", spec.MCPToolNames)
 	}
 
 	mcp := codeIntelBindingFixture(t, `{"codeIntel":{"tools":["af_code_search_symbols","af_code_get_repo_map"]}}`, agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous, false)
 	route, err = resolveCodeIntelDeliveryRoute(ci, []ResolvedCapabilityParameterBinding{mcp})
-	if err != nil || route != codeIntelDeliveryMCP {
+	if err != nil || route.Route != codeIntelDeliveryMCP {
 		t.Fatalf("MCP route=%v err=%v", route, err)
 	}
-	if servers := defaultMCPServersForHarness(qw, "/abs/worktree", mcpDeliveringHarness(), agent.PromptModeAutonomous, route); len(servers) != 1 || servers[0].Name != codeIntelServerName {
+	if servers := defaultMCPServersForHarness(qw, "/abs/worktree", mcpDeliveringHarness(), agent.PromptModeAutonomous, route.Route); len(servers) != 1 || servers[0].Name != codeIntelServerName {
 		t.Fatalf("MCP route servers=%+v", servers)
 	}
-	if got := translateSpec(qw, mcpCaps(), SpecInputs{CodeIntelDeliveryRoute: route}).MCPToolNames; len(got) != 2 || !strings.HasPrefix(got[0], codeIntelFQPrefix) {
+	if got := translateSpec(qw, mcpCaps(), SpecInputs{CodeIntelDeliveryRoute: route.Route}).MCPToolNames; len(got) != 2 || !strings.HasPrefix(got[0], codeIntelFQPrefix) {
 		t.Fatalf("MCP route names=%v", got)
 	}
 }
@@ -99,7 +99,7 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 		}
 	}
 	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
-	realizations, _ := codeIntelRealizationFixture(t, agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true)
+	realizations, _ := codeIntelRealizationFixtureWithTools(t, "example.code-intelligence/v1", agent.HarnessCodex, profile.ID, agent.PromptModeAutonomous, true, []string{"af_code_get_repo_map", "af_code_search_symbols"})
 	binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	binders, _ := NewCapabilityParameterBinderRegistry(binder)
 	baseProvider := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
@@ -114,7 +114,7 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	qw.Body = "exercise actual runner construction"
 	qw.PlatformURL = server.URL
 	qw.AuthToken = "token"
-	qw.CodeIntel = &prompt.CodeIntelWork{Tools: []string{"af_code_get_repo_map"}}
+	qw.CodeIntel = &prompt.CodeIntelWork{}
 	operational, _ := CanonicalOperationalPayload(qw)
 	var fields map[string]json.RawMessage
 	_ = json.Unmarshal(operational, &fields)
@@ -146,6 +146,9 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	}
 	if len(provider.spawned.MCPToolNames) != 0 || len(provider.spawned.AdditionalExtensions) != 1 || len(provider.spawned.CapabilityRuntimeMaterializations) != 1 || !strings.Contains(provider.spawned.SystemPromptAppend, "native code-intelligence") {
 		t.Fatalf("actual run loop route drift: mcpNames=%d extensions=%d materializations=%d nativePrompt=%v", len(provider.spawned.MCPToolNames), len(provider.spawned.AdditionalExtensions), len(provider.spawned.CapabilityRuntimeMaterializations), strings.Contains(provider.spawned.SystemPromptAppend, "native code-intelligence"))
+	}
+	if !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_get_repo_map") || !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_symbols") || strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_code") {
+		t.Fatalf("native prompt did not use exact declared default surface: %q", provider.spawned.SystemPromptAppend)
 	}
 }
 
@@ -274,5 +277,13 @@ func TestCodeIntelLegacyRoutePreservesExistingBytes(t *testing.T) {
 	explicitServers := defaultMCPServersForHarness(qw, "/abs/worktree", mcpDeliveringHarness(), agent.PromptModeAutonomous, codeIntelDeliveryLegacy)
 	if len(legacyServers) != len(explicitServers) || legacyServers[0].Name != explicitServers[0].Name || injectCodeIntelPartial("base", mcpCaps(), ci) != injectCodeIntelPartial("base", mcpCaps(), ci, codeIntelDeliveryLegacy) {
 		t.Fatal("explicit legacy route changed existing behavior")
+	}
+}
+
+func TestCodeIntelDeliveryRouteRejectsConflictingSelectedSets(t *testing.T) {
+	first := codeIntelBindingFixture(t, `{"codeIntel":{"tools":["af_code_get_repo_map"]}}`, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
+	second := codeIntelBindingFixture(t, `{"codeIntel":{"tools":["af_code_search_symbols"]}}`, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
+	if _, err := resolveCodeIntelDeliveryRoute(&prompt.CodeIntelWork{}, []ResolvedCapabilityParameterBinding{first, second}); err == nil {
+		t.Fatal("same-contract realizations with conflicting selected sets routed")
 	}
 }

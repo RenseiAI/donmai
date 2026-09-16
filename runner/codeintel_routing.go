@@ -18,41 +18,47 @@ const (
 	codeIntelDeliveryNative
 )
 
-func resolveCodeIntelDeliveryRoute(codeIntel *prompt.CodeIntelWork, resolved []ResolvedCapabilityParameterBinding) (codeIntelDeliveryRoute, error) {
+type codeIntelDeliverySelection struct {
+	Route codeIntelDeliveryRoute
+	Tools []string
+}
+
+func resolveCodeIntelDeliveryRoute(codeIntel *prompt.CodeIntelWork, resolved []ResolvedCapabilityParameterBinding) (codeIntelDeliverySelection, error) {
 	route := codeIntelDeliveryLegacy
 	found := false
+	var selectedTools []string
 	for _, item := range resolved {
 		binding := item.Realization
 		if binding.ParameterContract == nil || binding.ParameterContract.ID != codeintelbridge.ParameterContractID {
 			continue
 		}
 		if codeIntel == nil || binding.ParameterBinding == nil {
-			return 0, fmt.Errorf("runner: code-intelligence realization has no admitted parameters")
+			return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realization has no admitted parameters")
 		}
 		candidate := codeIntelDeliveryRoute(0)
 		for _, entry := range binding.Entries {
 			switch {
 			case entry.Channel == agent.ToolChannelMCPServer:
 				if candidate != 0 && candidate != codeIntelDeliveryMCP {
-					return 0, fmt.Errorf("runner: code-intelligence realization mixes delivery channels")
+					return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realization mixes delivery channels")
 				}
 				candidate = codeIntelDeliveryMCP
 			case entry.Channel == agent.ToolChannelToolPlugin && strings.HasPrefix(entry.EntryID, agent.AdditionalExtensionCapabilityEntryPrefix):
 				if candidate != 0 && candidate != codeIntelDeliveryNative {
-					return 0, fmt.Errorf("runner: code-intelligence realization mixes delivery channels")
+					return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realization mixes delivery channels")
 				}
 				candidate = codeIntelDeliveryNative
 			}
 		}
 		if candidate == 0 {
-			return 0, fmt.Errorf("runner: code-intelligence realization has no delivery channel")
+			return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realization has no delivery channel")
 		}
 		if found && route != candidate {
-			return 0, fmt.Errorf("runner: code-intelligence realizations conflict on delivery")
+			return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realizations conflict on delivery")
 		}
 		config, _, err := codeintelbridge.DecodeRuntimeConfig(item.Materialization.Config)
 		if err != nil {
-			return 0, err
+			return codeIntelDeliverySelection{}, err
 		}
 		selected := make([]string, 0)
 		for _, identity := range binding.ParameterBinding.SelectedSurface {
@@ -62,17 +68,21 @@ func resolveCodeIntelDeliveryRoute(codeIntel *prompt.CodeIntelWork, resolved []R
 		}
 		sort.Strings(selected)
 		if strings.Join(selected, "\x00") != strings.Join(config.Tools, "\x00") {
-			return 0, fmt.Errorf("runner: code-intelligence selected surface and runtime config differ")
+			return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence selected surface and runtime config differ")
 		}
+		if found && strings.Join(selectedTools, "\x00") != strings.Join(config.Tools, "\x00") {
+			return codeIntelDeliverySelection{}, fmt.Errorf("runner: code-intelligence realizations conflict on selected surface")
+		}
+		selectedTools = append([]string(nil), config.Tools...)
 		route, found = candidate, true
 	}
-	return route, nil
+	return codeIntelDeliverySelection{Route: route, Tools: selectedTools}, nil
 }
 
-func codeIntelRouteFromSpec(codeIntel *prompt.CodeIntelWork, spec agent.Spec) (codeIntelDeliveryRoute, error) {
+func codeIntelRouteFromSpec(codeIntel *prompt.CodeIntelWork, spec agent.Spec) (codeIntelDeliverySelection, error) {
 	resolved := make([]ResolvedCapabilityParameterBinding, 0)
 	if spec.ToolLifecyclePlan == nil {
-		return codeIntelDeliveryLegacy, nil
+		return codeIntelDeliverySelection{Route: codeIntelDeliveryLegacy}, nil
 	}
 	byKey := map[string]agent.CapabilityRuntimeMaterializationV1{}
 	for _, materialization := range spec.CapabilityRuntimeMaterializations {
