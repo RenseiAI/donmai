@@ -92,6 +92,10 @@ var bindWorkerGatewayForAgentRun = func(
 	return bindWorkerGateway(ctx, logger, detail, work, harnessID)
 }
 
+var buildRegistryForAgentRun = func(logger *slog.Logger, hints agentRunCtorHints, agentBin string) *runner.Registry {
+	return buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
+}
+
 // gatewayHarnessIdentity projects the canonical loop-driver identity already
 // fixed by successful explicit admission. Absent-harness work has no preflight
 // admission, so it projects the legacy provider through the generated matrix
@@ -335,7 +339,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 	hints := agentRunHints(detail)
 	hints.PiTrustedExtensions = append([]providerpi.TrustedExtensionIdentity(nil), opts.piTrustedExtensions...)
-	reg := buildRegistryFromCtors(logger, agentRunProviderCtors(hints), agentBin)
+	reg := buildRegistryForAgentRun(logger, hints, agentBin)
 	logger.Info("agent run: registry built", "providers", reg.Names())
 	if opts.specDecorator != nil {
 		decorateRegistryProviders(reg, opts.specDecorator)
