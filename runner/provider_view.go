@@ -13,7 +13,6 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
-	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -33,10 +32,10 @@ type ProviderView struct {
 	// to the spawn lane surfaces as an undiagnosable
 	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
 	// preserves the historical undecorated behavior.
-	decorate                      agent.ExtensionDecorator
-	realizations                  *agent.CapabilityRealizationRegistry
-	configRequirements            ExecutionPreflightConfigRequirementResolver
-	protectedRuntimeMCPCapability string
+	decorate                    agent.ExtensionDecorator
+	realizations                *agent.CapabilityRealizationRegistry
+	configRequirements          ExecutionPreflightConfigRequirementResolver
+	protectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -57,17 +56,62 @@ type ExecutionPreflightConfigRequirementResolver func(ExecutionPreflightConfigRe
 
 const protectedRuntimeMCPRequirementID = "protected-runtime-mcp/v1"
 
-func validateProtectedRuntimeMCPSelector(selector string, realizations *agent.CapabilityRealizationRegistry) error {
-	if selector == "" {
+// ProtectedRuntimeMCPSelector identifies one exact registered capability
+// realization. The zero value disables protected runtime MCP acknowledgement.
+// It is process configuration, never session or wire input.
+type ProtectedRuntimeMCPSelector struct {
+	CapabilityID     string
+	HarnessID        agent.HarnessName
+	AdapterProfileID string
+	Mode             agent.PromptSessionMode
+}
+
+func (s ProtectedRuntimeMCPSelector) configured() bool {
+	return s != (ProtectedRuntimeMCPSelector{})
+}
+
+func validateProtectedRuntimeMCPSelector(selector ProtectedRuntimeMCPSelector, realizations *agent.CapabilityRealizationRegistry) error {
+	if !selector.configured() {
 		return nil
 	}
-	if strings.TrimSpace(selector) != selector {
-		return fmt.Errorf("runner: protected runtime MCP capability selector is malformed")
+	if selector.CapabilityID == "" || selector.HarnessID == "" || selector.AdapterProfileID == "" || selector.Mode == "" {
+		return fmt.Errorf("runner: protected runtime MCP realization selector is incomplete")
 	}
-	if realizations == nil || !realizations.Knows(selector) {
-		return fmt.Errorf("runner: protected runtime MCP capability %q is not registered", selector)
+	if realizations == nil {
+		return fmt.Errorf("runner: protected runtime MCP realization registry is unavailable")
+	}
+	if _, ok := realizations.Resolve(selector.CapabilityID, selector.HarnessID, selector.AdapterProfileID, selector.Mode); !ok {
+		return fmt.Errorf("runner: protected runtime MCP realization is not registered exactly")
 	}
 	return nil
+}
+
+func protectedRuntimeMCPTargetsSession(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) bool {
+	if !selector.configured() {
+		return false
+	}
+	mode := sessionPromptMode(qw, selection.effectiveCell)
+	return agent.HarnessName(selection.Harness.ID) == selector.HarnessID && mode == selector.Mode
+}
+
+func protectedRuntimeMCPApplies(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) (bool, error) {
+	if !protectedRuntimeMCPTargetsSession(qw, selection, selector) {
+		return false, nil
+	}
+	mode := selector.Mode
+	harness, ok := selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return false, fmt.Errorf("runner: protected runtime MCP target has no exact harness manifest")
+	}
+	manifest := harness.Manifest()
+	if manifest.Name != selector.HarnessID {
+		return false, fmt.Errorf("runner: protected runtime MCP target harness identity changed")
+	}
+	profile, ok := manifest.ToolLifecycleProfile(mode)
+	if !ok || profile.ID != selector.AdapterProfileID {
+		return false, fmt.Errorf("runner: protected runtime MCP target adapter profile changed")
+	}
+	return true, nil
 }
 
 func digestProtectedRuntimeMCPAuthority(binding agent.CapabilityRealizationBinding) (string, error) {
@@ -83,18 +127,21 @@ func resolveProtectedRuntimeMCPRequirement(
 	qw QueuedWork,
 	selection harnessSelection,
 	realizations *agent.CapabilityRealizationRegistry,
-	selector string,
+	selector ProtectedRuntimeMCPSelector,
 	host executioncell.HostAdaptationReceipt,
 ) (*executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
-	if selector == "" {
+	if !selector.configured() {
 		return nil, nil
 	}
 	if err := validateProtectedRuntimeMCPSelector(selector, realizations); err != nil {
 		return nil, err
 	}
+	if !protectedRuntimeMCPTargetsSession(qw, selection, selector) {
+		return nil, nil
+	}
 	count := 0
 	for _, capability := range selection.effectiveCell.GrantedCapabilities {
-		if capability.Name == selector {
+		if capability.Name == selector.CapabilityID {
 			count++
 		}
 	}
@@ -102,21 +149,28 @@ func resolveProtectedRuntimeMCPRequirement(
 		return nil, nil
 	}
 	if count != 1 {
-		return nil, fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector)
+		return nil, fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector.CapabilityID)
+	}
+	applies, err := protectedRuntimeMCPApplies(qw, selection, selector)
+	if err != nil {
+		return nil, err
+	}
+	if !applies {
+		return nil, nil
 	}
 	harness, ok := selection.Provider.(agent.HarnessProvider)
 	if !ok {
 		return nil, fmt.Errorf("runner: protected runtime MCP capability requires an exact harness manifest")
 	}
-	mode := sessionPromptMode(qw, selection.effectiveCell)
+	mode := selector.Mode
 	manifest := harness.Manifest()
 	profile, ok := manifest.ToolLifecycleProfile(mode)
-	if !ok {
-		return nil, fmt.Errorf("runner: protected runtime MCP capability has no exact tool lifecycle profile")
+	if !ok || profile.ID != selector.AdapterProfileID {
+		return nil, fmt.Errorf("runner: protected runtime MCP target adapter profile changed")
 	}
-	compiled, ok := realizations.Resolve(selector, manifest.Name, profile.ID, mode)
+	compiled, ok := realizations.Resolve(selector.CapabilityID, selector.HarnessID, selector.AdapterProfileID, selector.Mode)
 	if !ok {
-		return nil, fmt.Errorf("runner: protected runtime MCP capability %q has no exact registered realization", selector)
+		return nil, fmt.Errorf("runner: protected runtime MCP capability %q has no exact registered realization", selector.CapabilityID)
 	}
 	expectedBinding := agent.BindCapabilityRealization(compiled)
 	var toolReceipt agent.ToolLifecycleReceipt
@@ -125,7 +179,7 @@ func resolveProtectedRuntimeMCPRequirement(
 	}
 	matches := 0
 	for _, result := range toolReceipt.CapabilityRealizations {
-		if result.CapabilityID != selector {
+		if result.CapabilityID != selector.CapabilityID {
 			continue
 		}
 		matches++
@@ -344,10 +398,10 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 }
 
 // ResolveExecutionPreflightProtectedRuntimeMCPRequirements resolves the sole
-// process-configured capability only after exact admission and retained-plan
-// validation. An unselected capability returns no requirements.
+// process-configured realization only after exact admission and retained-plan
+// validation. An unselected harness, mode, or capability returns no requirements.
 func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
-	if v == nil || v.reg == nil || v.protectedRuntimeMCPCapability == "" {
+	if v == nil || v.reg == nil || !v.protectedRuntimeMCPSelector.configured() {
 		return nil, nil
 	}
 	qw, _, err := decodeProviderViewPreflightWork(detailJSON)
@@ -368,7 +422,7 @@ func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(
 	if err != nil || admission == nil {
 		return nil, fmt.Errorf("runner: protected runtime MCP requirements require exact admission: %w", err)
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, admission.selection, v.realizations, v.protectedRuntimeMCPCapability, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, admission.selection, v.realizations, v.protectedRuntimeMCPSelector, host)
 	if err != nil {
 		return nil, err
 	}
@@ -462,21 +516,21 @@ func NewProviderViewWithDecoratorRealizationsAndConfigRequirements(reg *Registry
 }
 
 // NewProviderViewWithProtectedRuntimeMCP adds one immutable process-owned
-// capability selector to the complete preflight view. The child Runner must be
-// built with the same selector and realization registry.
+// exact-realization selector to the complete preflight view. The child Runner
+// must be built with the same selector and realization registry.
 func NewProviderViewWithProtectedRuntimeMCP(
 	reg *Registry,
 	decorate agent.ExtensionDecorator,
 	realizations *agent.CapabilityRealizationRegistry,
 	resolver ExecutionPreflightConfigRequirementResolver,
-	capability string,
+	selector ProtectedRuntimeMCPSelector,
 ) (*ProviderView, error) {
-	if err := validateProtectedRuntimeMCPSelector(capability, realizations); err != nil {
+	if err := validateProtectedRuntimeMCPSelector(selector, realizations); err != nil {
 		return nil, err
 	}
 	return &ProviderView{
 		reg: reg, decorate: decorate, realizations: realizations,
-		configRequirements: resolver, protectedRuntimeMCPCapability: capability,
+		configRequirements: resolver, protectedRuntimeMCPSelector: selector,
 	}, nil
 }
 

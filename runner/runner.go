@@ -303,9 +303,9 @@ type Options struct {
 	// preserves the historical undecorated behavior.
 	AdditionalExtensionDecorator agent.ExtensionDecorator
 	CapabilityRealizations       *agent.CapabilityRealizationRegistry
-	// ProtectedRuntimeMCPCapability is the exact optional capability whose
-	// selected realization requires protected runtime MCP acknowledgement.
-	ProtectedRuntimeMCPCapability string
+	// ProtectedRuntimeMCPSelector is the exact optional realization whose
+	// selected runtime requires protected MCP acknowledgement.
+	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -335,36 +335,36 @@ type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptF
 // WorktreeManager, etc.) are documented as concurrency-safe by their
 // own packages.
 type Runner struct {
-	registry                      *Registry
-	wt                            *worktree.Manager
-	poster                        *result.Poster
-	credentialProvider            CredentialProvider
-	envc                          *env.Composer
-	mcpb                          *mcp.Builder
-	store                         *state.Store
-	promptBuilder                 *prompt.Builder
-	httpClient                    *http.Client
-	logger                        *slog.Logger
-	now                           func() time.Time
-	maxDuration                   time.Duration
-	idleTimeout                   time.Duration
-	preserveOnFail                bool
-	preserveAlways                bool
-	skipBackstop                  bool
-	skipSteering                  bool
-	skipPostSession               bool
-	hbInterval                    time.Duration
-	spanEmissionEnabled           bool
-	spanEndpointPath              string
-	kitSkillSources               []kit.KitSkillSource
-	kitSkillDetector              KitSkillDetector
-	kitPromptFragDetector         KitPromptFragmentDetector
-	kitDetector                   KitDetector
-	kitComposer                   KitComposer
-	kitTargetOS                   string
-	additionalExtensionDecorator  agent.ExtensionDecorator
-	capabilityRealizations        *agent.CapabilityRealizationRegistry
-	protectedRuntimeMCPCapability string
+	registry                     *Registry
+	wt                           *worktree.Manager
+	poster                       *result.Poster
+	credentialProvider           CredentialProvider
+	envc                         *env.Composer
+	mcpb                         *mcp.Builder
+	store                        *state.Store
+	promptBuilder                *prompt.Builder
+	httpClient                   *http.Client
+	logger                       *slog.Logger
+	now                          func() time.Time
+	maxDuration                  time.Duration
+	idleTimeout                  time.Duration
+	preserveOnFail               bool
+	preserveAlways               bool
+	skipBackstop                 bool
+	skipSteering                 bool
+	skipPostSession              bool
+	hbInterval                   time.Duration
+	spanEmissionEnabled          bool
+	spanEndpointPath             string
+	kitSkillSources              []kit.KitSkillSource
+	kitSkillDetector             KitSkillDetector
+	kitPromptFragDetector        KitPromptFragmentDetector
+	kitDetector                  KitDetector
+	kitComposer                  KitComposer
+	kitTargetOS                  string
+	additionalExtensionDecorator agent.ExtensionDecorator
+	capabilityRealizations       *agent.CapabilityRealizationRegistry
+	protectedRuntimeMCPSelector  ProtectedRuntimeMCPSelector
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -396,40 +396,40 @@ func New(opts Options) (*Runner, error) {
 	if opts.Poster == nil {
 		return nil, errors.New("runner: Poster is required")
 	}
-	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPCapability, opts.CapabilityRealizations); err != nil {
+	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
 		return nil, err
 	}
 	r := &Runner{
-		registry:                      opts.Registry,
-		wt:                            opts.WorktreeManager,
-		poster:                        opts.Poster,
-		credentialProvider:            opts.CredentialProvider,
-		envc:                          opts.EnvComposer,
-		mcpb:                          opts.MCPBuilder,
-		store:                         opts.StateStore,
-		promptBuilder:                 opts.PromptBuilder,
-		httpClient:                    opts.HTTPClient,
-		logger:                        opts.Logger,
-		now:                           opts.Now,
-		maxDuration:                   opts.MaxSessionDuration,
-		idleTimeout:                   opts.IdleTimeout,
-		preserveOnFail:                opts.PreserveWorktreeOnFailure,
-		preserveAlways:                opts.PreserveWorktreeAlways,
-		skipBackstop:                  opts.SkipBackstop,
-		skipSteering:                  opts.SkipSteering,
-		skipPostSession:               opts.SkipPostSession,
-		hbInterval:                    opts.HeartbeatInterval,
-		spanEmissionEnabled:           opts.SpanEmissionEnabled,
-		spanEndpointPath:              opts.SpanEndpointPath,
-		kitSkillSources:               opts.KitSkillSources,
-		kitSkillDetector:              opts.KitSkillDetector,
-		kitPromptFragDetector:         opts.KitPromptFragmentDetector,
-		kitDetector:                   opts.KitDetector,
-		kitComposer:                   opts.KitComposer,
-		kitTargetOS:                   opts.KitTargetOS,
-		additionalExtensionDecorator:  opts.AdditionalExtensionDecorator,
-		capabilityRealizations:        opts.CapabilityRealizations,
-		protectedRuntimeMCPCapability: opts.ProtectedRuntimeMCPCapability,
+		registry:                     opts.Registry,
+		wt:                           opts.WorktreeManager,
+		poster:                       opts.Poster,
+		credentialProvider:           opts.CredentialProvider,
+		envc:                         opts.EnvComposer,
+		mcpb:                         opts.MCPBuilder,
+		store:                        opts.StateStore,
+		promptBuilder:                opts.PromptBuilder,
+		httpClient:                   opts.HTTPClient,
+		logger:                       opts.Logger,
+		now:                          opts.Now,
+		maxDuration:                  opts.MaxSessionDuration,
+		idleTimeout:                  opts.IdleTimeout,
+		preserveOnFail:               opts.PreserveWorktreeOnFailure,
+		preserveAlways:               opts.PreserveWorktreeAlways,
+		skipBackstop:                 opts.SkipBackstop,
+		skipSteering:                 opts.SkipSteering,
+		skipPostSession:              opts.SkipPostSession,
+		hbInterval:                   opts.HeartbeatInterval,
+		spanEmissionEnabled:          opts.SpanEmissionEnabled,
+		spanEndpointPath:             opts.SpanEndpointPath,
+		kitSkillSources:              opts.KitSkillSources,
+		kitSkillDetector:             opts.KitSkillDetector,
+		kitPromptFragDetector:        opts.KitPromptFragmentDetector,
+		kitDetector:                  opts.KitDetector,
+		kitComposer:                  opts.KitComposer,
+		kitTargetOS:                  opts.KitTargetOS,
+		additionalExtensionDecorator: opts.AdditionalExtensionDecorator,
+		capabilityRealizations:       opts.CapabilityRealizations,
+		protectedRuntimeMCPSelector:  opts.ProtectedRuntimeMCPSelector,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

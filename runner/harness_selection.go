@@ -329,10 +329,10 @@ func validateProtectedRuntimeMCPMaterialization(
 	qw QueuedWork,
 	selection harnessSelection,
 	realizations *agent.CapabilityRealizationRegistry,
-	selector string,
+	selector ProtectedRuntimeMCPSelector,
 	servers []agent.MCPServerConfig,
 ) error {
-	if selector == "" {
+	if !selector.configured() {
 		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
 			return nil
 		}
@@ -345,13 +345,7 @@ func validateProtectedRuntimeMCPMaterialization(
 		}
 		return nil
 	}
-	selected := 0
-	for _, capability := range selection.effectiveCell.GrantedCapabilities {
-		if capability.Name == selector {
-			selected++
-		}
-	}
-	if selected == 0 {
+	unselected := func() error {
 		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
 			return nil
 		}
@@ -360,12 +354,31 @@ func validateProtectedRuntimeMCPMaterialization(
 			return err
 		}
 		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
-			return errors.New("runner: unexpected protected runtime MCP materialization")
+			return errors.New("runner: unexpected protected runtime MCP materialization for an unselected realization")
 		}
 		return nil
 	}
+	if !protectedRuntimeMCPTargetsSession(qw, selection, selector) {
+		return unselected()
+	}
+	selected := 0
+	for _, capability := range selection.effectiveCell.GrantedCapabilities {
+		if capability.Name == selector.CapabilityID {
+			selected++
+		}
+	}
+	if selected == 0 {
+		return unselected()
+	}
 	if selected != 1 {
-		return fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector)
+		return fmt.Errorf("runner: protected runtime MCP capability %q must be granted exactly once", selector.CapabilityID)
+	}
+	applies, err := protectedRuntimeMCPApplies(qw, selection, selector)
+	if err != nil {
+		return err
+	}
+	if !applies {
+		return unselected()
 	}
 	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
 	if err != nil {

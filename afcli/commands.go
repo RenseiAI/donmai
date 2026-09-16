@@ -13,6 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	providerpi "github.com/RenseiAI/donmai/provider/harness/pi"
+	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/codeintelhost"
 	"github.com/spf13/cobra"
 )
@@ -121,11 +122,11 @@ type Config struct {
 	// historical capability set and wire bytes.
 	CapabilityRealizations *agent.CapabilityRealizationRegistry
 
-	// ProtectedRuntimeMCPCapability selects one exact registered realization
-	// whose runtime MCP server must carry the protected pre-spawn acknowledgement.
-	// Empty preserves historical child behavior. The embedder must pass the same
-	// selector to its daemon preflight ProviderView.
-	ProtectedRuntimeMCPCapability string
+	// ProtectedRuntimeMCPSelector selects one exact registered realization whose
+	// runtime MCP server must carry the protected pre-spawn acknowledgement. The
+	// zero value preserves historical child behavior. The embedder must pass the
+	// same selector to its daemon preflight ProviderView.
+	ProtectedRuntimeMCPSelector runner.ProtectedRuntimeMCPSelector
 
 	// EnableA2AClient registers the formal A2A v1 client command group. It is
 	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
