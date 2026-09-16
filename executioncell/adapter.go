@@ -229,15 +229,6 @@ func inferSessionMode(mode string) (SessionMode, ResolverDecision, error) {
 	}
 }
 
-func digestRawValue(raw json.RawMessage) (string, error) {
-	canonical, err := jsoncanonicalizer.Transform(raw)
-	if err != nil {
-		return "", contractError(ErrorInvalidReference, nil, "canonicalize operational payload value: %v", err)
-	}
-	digest := sha256.Sum256(canonical)
-	return hex.EncodeToString(digest[:]), nil
-}
-
 func deriveCapabilities(work prompt.QueuedWork, fields map[string]json.RawMessage, context LegacyAdapterContext) ([]CapabilityRequest, []CapabilityRequest, []ResolverDecision, error) {
 	required := slices.Clone(context.RequiredCapabilities)
 	optional := slices.Clone(context.OptionalCapabilities)
@@ -253,7 +244,7 @@ func deriveCapabilities(work prompt.QueuedWork, fields map[string]json.RawMessag
 		if !ok {
 			return nil
 		}
-		digest, err := digestRawValue(raw)
+		digest, err := DigestCapabilityParameters(raw)
 		if err != nil {
 			return err
 		}

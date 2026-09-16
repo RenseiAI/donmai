@@ -4,6 +4,7 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
+	"go/build"
 	"reflect"
 	"strings"
 	"testing"
@@ -119,6 +120,368 @@ func TestCapabilityRealizationAbsentPreservesV1JSON(t *testing.T) {
 	r, _ := json.Marshal(ToolLifecycleReceipt{ContractVersion: ToolLifecycleContractVersion, Decision: "ready", Entries: []ToolLifecycleEntry{}})
 	if string(r) != `{"contractVersion":"donmai.tool-lifecycle/v1alpha1","profileId":"","decision":"ready","evidenceTier":"","productionEligible":false,"entries":[]}` {
 		t.Fatalf("%s", r)
+	}
+}
+
+func TestCapabilityRealizationV1WireHashesRemainStable(t *testing.T) {
+	compiled := realizationFixture(t)
+	execution := CapabilityFixtureExecution{
+		Producer:    CapabilityFixtureProducer{ID: "example.real-binary-fixture/v1", Source: []byte("actual fixture producer source"), ReleaseGate: "real-binary-no-skip"},
+		Observation: compiled.Observation,
+	}
+	evidence, err := CompileCapabilityRealizationEvidence(compiled.Declaration, execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binding := BindCapabilityRealization(compiled)
+	results, err := ResolveCapabilityRealizationResults([]CapabilityRealizationBinding{binding}, []ToolLifecycleEntry{{ID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: binding.Entries[0].InputDigest, Outcome: ToolOutcomeAdmitted}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	profile := ToolLifecycleProfile{ID: "fixture/v1", Mode: PromptModeHumanControlled, ToolPluginDelivery: ToolDeliveryUnsupported, MCPDelivery: ToolDeliveryUnsupported, NativeToolPolicyDelivery: ToolDeliveryUnsupported, PermissionConfigDelivery: ToolDeliveryUnsupported, MCPToolPolicyDelivery: ToolDeliveryUnsupported, ToolHookDelivery: ToolDeliveryUnsupported, LifecycleDelivery: ToolDeliveryUnsupported, LifecycleFidelity: EvidenceUnsupported, ReplayDelivery: ToolDeliveryUnsupported, ReplayFidelity: EvidenceUnsupported, CleanupDelivery: ToolDeliveryUnsupported, EvidenceTier: "fixture"}
+	tests := []struct {
+		name  string
+		value any
+		want  string
+	}{
+		{"declaration", compiled.Declaration, "128da9e4d34bd773a6c54181f9daf3903effee570ed9f4d2ba01b21f68db2104"},
+		{"observation", compiled.Observation, "aa29fabde7b2a8337a7f6b9b8e5d538c6af9ceb06592d727955763a6da6e27b9"},
+		{"evidence", evidence, "90c395207ba8385e3197384d0000ff42ecf7de25730d06c344df114447d0af53"},
+		{"binding", binding, "2fd32839ad5a5f1dff5360427f0f82dd1c5979d7a78d40ab588e649af3d316eb"},
+		{"result", results[0], "cea6822945756aa24bd1416d90b911c8561fc279c45b078f5002665e54a43006"},
+		{"profile", profile, "509731818758b6de74c75c82677768fb18e5473fb0d6ba13da20318957a3dd42"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := json.Marshal(tc.value)
+			if err != nil {
+				t.Fatal(err)
+			}
+			digest := sha256.Sum256(raw)
+			if got := hex.EncodeToString(digest[:]); got != tc.want {
+				t.Fatalf("v1 wire hash=%s want=%s wire=%s", got, tc.want, raw)
+			}
+		})
+	}
+}
+
+func parameterizedRealizationFixture(t *testing.T, observationPolicy string) (CompiledCapabilityRealization, []byte) {
+	t.Helper()
+	binderSource := []byte("reviewed synthetic binder source")
+	binderDigest := sha256.Sum256(binderSource)
+	surface := []CapabilitySurfaceIdentity{{Kind: CapabilitySurfaceMCPTool, ID: "tool_a"}, {Kind: CapabilitySurfaceMCPTool, ID: "tool_b"}}
+	inputDigest, err := CapabilityRecipeInputDigest([]string{"fixture"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	contract := &CapabilityParameterContractV1{ContractVersion: CapabilityParameterContractVersionV1, ID: "example.parameter-binder/v1", BinderSourceDigest: hex.EncodeToString(binderDigest[:]), SurfaceProjection: "subset", RuntimeObservation: observationPolicy}
+	declaration, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: "example.parameterized/v1", HarnessID: HarnessCodex, AdapterVersion: "codex/interactive/tool-lifecycle-v1", Mode: PromptModeHumanControlled, RecipeID: "example/parameterized/v1", Entries: []CapabilityRecipeEntry{{EntryID: "mcp-servers", Channel: ToolChannelMCPServer, Required: true, InputDigest: inputDigest, SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := NewCapabilityFixtureObservation(CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic-real-binary", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []CapabilityAppliedArtifact{{EntryID: "mcp-servers", Channel: ToolChannelMCPServer, InputDigest: inputDigest}}, ObservedSurface: surface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return compiled, binderSource
+}
+
+func parameterBindingFixture(t *testing.T, compiled CompiledCapabilityRealization, selected []CapabilitySurfaceIdentity, parametersDigest, operationalDigest string) CapabilityParameterBindingV1 {
+	t.Helper()
+	selectedDigest, err := CapabilitySelectedSurfaceDigest(selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entries := make([]CapabilityBoundEntryV1, len(compiled.Declaration.Recipe.Entries))
+	for i, recipeEntry := range compiled.Declaration.Recipe.Entries {
+		entryDigest, err := CapabilityEntryParametersDigest(recipeEntry.EntryID, recipeEntry.InputDigest, parametersDigest, selectedDigest, operationalDigest)
+		if err != nil {
+			t.Fatal(err)
+		}
+		entries[i] = CapabilityBoundEntryV1{EntryID: recipeEntry.EntryID, StaticInputDigest: recipeEntry.InputDigest, EntryParametersDigest: entryDigest}
+	}
+	binding := CapabilityParameterBindingV1{ContractVersion: CapabilityParameterBindingVersionV1, CapabilityID: compiled.Declaration.CapabilityID, ParameterContractID: compiled.Declaration.ParameterContract.ID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest, StaticRecipeDigest: compiled.Declaration.Recipe.RecipeDigest, SelectedSurface: append([]CapabilitySurfaceIdentity(nil), selected...), SelectedSurfaceDigest: selectedDigest, Entries: entries}
+	binding.BindingDigest, err = CapabilityParameterBindingDigest(binding)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return binding
+}
+
+func TestCapabilityParameterizedRealizationBindsTrustedContractEvidence(t *testing.T) {
+	compiled, binderSource := parameterizedRealizationFixture(t, "none")
+	execution := CapabilityFixtureExecution{Producer: CapabilityFixtureProducer{ID: "example.parameter-fixture/v1", Source: []byte("trusted parameter fixture producer"), BinderSource: binderSource, ReleaseGate: "parameter-fixture-no-skip"}, Observation: compiled.Observation}
+	evidence, err := CompileCapabilityRealizationEvidence(compiled.Declaration, execution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if evidence.Evidence.TemplateDigest != compiled.Declaration.TemplateDigest || evidence.Compiled.Observation.TemplateDigest != compiled.Declaration.TemplateDigest {
+		t.Fatalf("template digest not carried through evidence: %+v", evidence)
+	}
+	if err := ValidateCompiledCapabilityRealizationEvidence(evidence); err != nil {
+		t.Fatal(err)
+	}
+
+	changedSource := []byte("changed synthetic binder source")
+	changedDigest := sha256.Sum256(changedSource)
+	changedContract := *compiled.Declaration.ParameterContract
+	changedContract.BinderSourceDigest = hex.EncodeToString(changedDigest[:])
+	changedDeclaration, err := NewCapabilityRealization(CapabilityRealizationInput{CapabilityID: compiled.Declaration.CapabilityID, HarnessID: compiled.Declaration.HarnessID, AdapterVersion: compiled.Declaration.AdapterVersion, Mode: compiled.Declaration.Mode, RecipeID: compiled.Declaration.Recipe.RecipeID, Entries: compiled.Declaration.Recipe.Entries, DeclaredSurface: compiled.Declaration.Recipe.DeclaredSurface, ParameterContract: &changedContract})
+	if err != nil {
+		t.Fatal(err)
+	}
+	changedObservation, err := NewCapabilityFixtureObservation(CapabilityFixtureObservationInput{Declaration: changedDeclaration, FixtureID: compiled.Observation.FixtureID, BinaryDigest: compiled.Observation.BinaryDigest, AppliedArtifacts: compiled.Observation.AppliedArtifacts, ObservedSurface: compiled.Observation.ObservedSurface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompileCapabilityRealizationEvidence(changedDeclaration, CapabilityFixtureExecution{Producer: execution.Producer, Observation: changedObservation}); err == nil {
+		t.Fatal("recomputed outer evidence inherited trusted binder source")
+	}
+	changedExecution := execution
+	changedExecution.Producer.BinderSource = changedSource
+	changedExecution.Observation = changedObservation
+	changedEvidence, err := CompileCapabilityRealizationEvidence(changedDeclaration, changedExecution)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if changedEvidence.Evidence.EvidenceDigest == evidence.Evidence.EvidenceDigest || changedDeclaration.TemplateDigest == compiled.Declaration.TemplateDigest {
+		t.Fatal("changed binder source inherited evidence identity")
+	}
+}
+
+func TestCapabilityParameterBindingRejectsMutationAndWidening(t *testing.T) {
+	compiled, _ := parameterizedRealizationFixture(t, "none")
+	parametersDigest, operationalDigest := strings.Repeat("b", 64), strings.Repeat("c", 64)
+	requirement := CapabilityParameterRequirementFacts{CapabilityID: compiled.Declaration.CapabilityID, ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}
+	valid := parameterBindingFixture(t, compiled, compiled.Declaration.Recipe.DeclaredSurface[:1], parametersDigest, operationalDigest)
+	if err := ValidateCapabilityParameterBinding(valid, compiled.Declaration, requirement); err != nil {
+		t.Fatal(err)
+	}
+	tests := map[string]func(*CapabilityParameterBindingV1){
+		"capability":     func(v *CapabilityParameterBindingV1) { v.CapabilityID = "other/v1" },
+		"parameters":     func(v *CapabilityParameterBindingV1) { v.ParametersDigest = strings.Repeat("d", 64) },
+		"payload":        func(v *CapabilityParameterBindingV1) { v.OperationalPayloadDigest = strings.Repeat("e", 64) },
+		"recipe":         func(v *CapabilityParameterBindingV1) { v.StaticRecipeDigest = strings.Repeat("f", 64) },
+		"surface digest": func(v *CapabilityParameterBindingV1) { v.SelectedSurfaceDigest = strings.Repeat("0", 64) },
+		"entry input":    func(v *CapabilityParameterBindingV1) { v.Entries[0].StaticInputDigest = strings.Repeat("1", 64) },
+	}
+	for name, mutate := range tests {
+		t.Run(name, func(t *testing.T) {
+			candidate := valid
+			candidate.SelectedSurface = append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...)
+			candidate.Entries = append([]CapabilityBoundEntryV1(nil), valid.Entries...)
+			mutate(&candidate)
+			for i := range candidate.Entries {
+				candidate.Entries[i].EntryParametersDigest, _ = CapabilityEntryParametersDigest(candidate.Entries[i].EntryID, candidate.Entries[i].StaticInputDigest, candidate.ParametersDigest, candidate.SelectedSurfaceDigest, candidate.OperationalPayloadDigest)
+			}
+			candidate.BindingDigest, _ = CapabilityParameterBindingDigest(candidate)
+			if err := ValidateCapabilityParameterBinding(candidate, compiled.Declaration, requirement); err == nil {
+				t.Fatal("mutated binding validated")
+			}
+		})
+	}
+	widened := valid
+	widened.SelectedSurface = append(append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...), CapabilitySurfaceIdentity{Kind: CapabilitySurfaceMCPTool, ID: "zz_outside"})
+	widened.SelectedSurfaceDigest, _ = CapabilitySelectedSurfaceDigest(widened.SelectedSurface)
+	for i := range widened.Entries {
+		widened.Entries[i].EntryParametersDigest, _ = CapabilityEntryParametersDigest(widened.Entries[i].EntryID, widened.Entries[i].StaticInputDigest, widened.ParametersDigest, widened.SelectedSurfaceDigest, widened.OperationalPayloadDigest)
+	}
+	widened.BindingDigest, _ = CapabilityParameterBindingDigest(widened)
+	if err := ValidateCapabilityParameterBinding(widened, compiled.Declaration, requirement); err == nil {
+		t.Fatal("surface widening validated")
+	}
+	empty := valid
+	empty.SelectedSurface = nil
+	empty.SelectedSurfaceDigest = strings.Repeat("0", 64)
+	empty.BindingDigest, _ = CapabilityParameterBindingDigest(empty)
+	if err := ValidateCapabilityParameterBinding(empty, compiled.Declaration, requirement); err == nil {
+		t.Fatal("empty selected surface validated")
+	}
+	duplicate := valid
+	duplicate.SelectedSurface = append(append([]CapabilitySurfaceIdentity(nil), valid.SelectedSurface...), valid.SelectedSurface[0])
+	duplicate.SelectedSurfaceDigest = strings.Repeat("0", 64)
+	duplicate.BindingDigest, _ = CapabilityParameterBindingDigest(duplicate)
+	if err := ValidateCapabilityParameterBinding(duplicate, compiled.Declaration, requirement); err == nil {
+		t.Fatal("duplicate selected surface validated")
+	}
+}
+
+func TestCapabilityRealizationRawV1RejectsV2MemberPresence(t *testing.T) {
+	compiled := realizationFixture(t)
+	binding := BindCapabilityRealization(compiled)
+	evidence, err := CompileCapabilityRealizationEvidence(compiled.Declaration, CapabilityFixtureExecution{Producer: CapabilityFixtureProducer{ID: "example.real-binary-fixture/v1", Source: []byte("actual fixture producer source"), ReleaseGate: "real-binary-no-skip"}, Observation: compiled.Observation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name   string
+		value  any
+		field  string
+		target any
+	}{
+		{"declaration null contract", compiled.Declaration, "parameterContract", &CapabilityRealizationDeclaration{}},
+		{"declaration empty contract digest", compiled.Declaration, "parameterContractDigest", &CapabilityRealizationDeclaration{}},
+		{"declaration empty template", compiled.Declaration, "templateDigest", &CapabilityRealizationDeclaration{}},
+		{"observation empty template", compiled.Observation, "templateDigest", &CapabilityFixtureObservation{}},
+		{"binding null contract", binding, "parameterContract", &CapabilityRealizationBinding{}},
+		{"binding empty contract digest", binding, "parameterContractDigest", &CapabilityRealizationBinding{}},
+		{"binding empty template", binding, "templateDigest", &CapabilityRealizationBinding{}},
+		{"binding null parameters", binding, "parameterBinding", &CapabilityRealizationBinding{}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(tc.value)
+			var members map[string]json.RawMessage
+			_ = json.Unmarshal(raw, &members)
+			if strings.Contains(tc.name, "empty") {
+				members[tc.field] = json.RawMessage(`""`)
+			} else {
+				members[tc.field] = json.RawMessage(`null`)
+			}
+			mutated, _ := json.Marshal(members)
+			if err := json.Unmarshal(mutated, tc.target); err == nil {
+				t.Fatal("v1 decoder erased v2-only member presence")
+			}
+		})
+	}
+	raw, _ := json.Marshal(evidence)
+	var row map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &row)
+	var evidenceMembers map[string]json.RawMessage
+	_ = json.Unmarshal(row["evidence"], &evidenceMembers)
+	evidenceMembers["templateDigest"] = json.RawMessage(`null`)
+	row["evidence"], _ = json.Marshal(evidenceMembers)
+	mutated, _ := json.Marshal(row)
+	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v1 evidence decoder erased template member presence")
+	}
+	for _, tc := range []struct {
+		name   string
+		value  any
+		alias  string
+		target func() any
+	}{
+		{"declaration mixed-case alias", compiled.Declaration, "ParameterContract", func() any { return &CapabilityRealizationDeclaration{} }},
+		{"declaration uppercase alias", compiled.Declaration, "PARAMETERCONTRACT", func() any { return &CapabilityRealizationDeclaration{} }},
+		{"observation alias", compiled.Observation, "TemplateDigest", func() any { return &CapabilityFixtureObservation{} }},
+		{"binding alias", binding, "ParameterBinding", func() any { return &CapabilityRealizationBinding{} }},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, _ := json.Marshal(tc.value)
+			mutated := append([]byte(`{"`+tc.alias+`":null,`), raw[1:]...)
+			if err := json.Unmarshal(mutated, tc.target()); err == nil {
+				t.Fatal("v1 decoder accepted case-insensitive v2 member alias")
+			}
+		})
+	}
+	evidenceRaw, _ := json.Marshal(evidence.Evidence)
+	aliasedEvidence := append([]byte(`{"TemplateDigest":null,`), evidenceRaw[1:]...)
+	row = map[string]json.RawMessage{}
+	fullRaw, _ := json.Marshal(evidence)
+	_ = json.Unmarshal(fullRaw, &row)
+	row["evidence"] = aliasedEvidence
+	mutated, _ = json.Marshal(row)
+	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v1 nested evidence accepted case-insensitive template alias")
+	}
+}
+
+func TestCapabilityRealizationRawV2RequiresEveryVersionedMember(t *testing.T) {
+	compiled, binderSource := parameterizedRealizationFixture(t, "none")
+	parameterBinding := parameterBindingFixture(t, compiled, compiled.Declaration.Recipe.DeclaredSurface[:1], strings.Repeat("b", 64), strings.Repeat("c", 64))
+	binding := BindCapabilityRealization(compiled)
+	binding.ParameterBinding = &parameterBinding
+	evidence, err := CompileCapabilityRealizationEvidence(compiled.Declaration, CapabilityFixtureExecution{Producer: CapabilityFixtureProducer{ID: "example.parameter-fixture/v1", Source: []byte("trusted parameter fixture producer"), BinderSource: binderSource, ReleaseGate: "parameter-fixture-no-skip"}, Observation: compiled.Observation})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tests := []struct {
+		name      string
+		value     any
+		fields    []string
+		newTarget func() any
+	}{
+		{"declaration", compiled.Declaration, []string{"parameterContract", "parameterContractDigest", "templateDigest"}, func() any { return &CapabilityRealizationDeclaration{} }},
+		{"observation", compiled.Observation, []string{"templateDigest"}, func() any { return &CapabilityFixtureObservation{} }},
+		{"binding", binding, []string{"parameterContract", "parameterContractDigest", "templateDigest", "parameterBinding"}, func() any { return &CapabilityRealizationBinding{} }},
+	}
+	for _, tc := range tests {
+		for _, field := range tc.fields {
+			t.Run(tc.name+" missing "+field, func(t *testing.T) {
+				raw, _ := json.Marshal(tc.value)
+				var members map[string]json.RawMessage
+				_ = json.Unmarshal(raw, &members)
+				delete(members, field)
+				mutated, _ := json.Marshal(members)
+				if err := json.Unmarshal(mutated, tc.newTarget()); err == nil {
+					t.Fatal("v2 decoder accepted missing versioned member")
+				}
+			})
+		}
+	}
+	raw, _ := json.Marshal(evidence)
+	var row map[string]json.RawMessage
+	_ = json.Unmarshal(raw, &row)
+	var evidenceMembers map[string]json.RawMessage
+	_ = json.Unmarshal(row["evidence"], &evidenceMembers)
+	delete(evidenceMembers, "templateDigest")
+	row["evidence"], _ = json.Marshal(evidenceMembers)
+	mutated, _ := json.Marshal(row)
+	if err := json.Unmarshal(mutated, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v2 evidence decoder accepted missing template digest")
+	}
+	declarationRaw, _ := json.Marshal(compiled.Declaration)
+	aliased := strings.Replace(string(declarationRaw), `"parameterContract":`, `"ParameterContract":`, 1)
+	if err := json.Unmarshal([]byte(aliased), &CapabilityRealizationDeclaration{}); err == nil {
+		t.Fatal("v2 declaration accepted case-insensitive parameter contract alias")
+	}
+	duplicated := append([]byte(`{"parameterContract":null,`), declarationRaw[1:]...)
+	if err := json.Unmarshal(duplicated, &CapabilityRealizationDeclaration{}); err == nil {
+		t.Fatal("v2 declaration accepted duplicate parameter contract member")
+	}
+	bindingRaw, _ := json.Marshal(binding)
+	bindingAlias := strings.Replace(string(bindingRaw), `"parameterBinding":`, `"PARAMETERBINDING":`, 1)
+	if err := json.Unmarshal([]byte(bindingAlias), &CapabilityRealizationBinding{}); err == nil {
+		t.Fatal("v2 binding accepted case-insensitive parameter binding alias")
+	}
+	evidenceRaw, _ := json.Marshal(evidence.Evidence)
+	evidenceAlias := strings.Replace(string(evidenceRaw), `"templateDigest":`, `"TemplateDigest":`, 1)
+	var rowMembers map[string]json.RawMessage
+	fullRaw, _ := json.Marshal(evidence)
+	_ = json.Unmarshal(fullRaw, &rowMembers)
+	rowMembers["evidence"] = json.RawMessage(evidenceAlias)
+	fullRaw, _ = json.Marshal(rowMembers)
+	if err := json.Unmarshal(fullRaw, &CompiledCapabilityRealizationEvidence{}); err == nil {
+		t.Fatal("v2 nested evidence accepted case-insensitive template alias")
+	}
+}
+
+func TestComposeCapabilityRealizationRegistriesRefusesDuplicateTuple(t *testing.T) {
+	compiled := realizationFixture(t)
+	first, _ := NewCapabilityRealizationRegistry([]CompiledCapabilityRealization{compiled})
+	second, _ := NewCapabilityRealizationRegistry([]CompiledCapabilityRealization{compiled})
+	if _, err := ComposeCapabilityRealizationRegistries(first, second); err == nil {
+		t.Fatal("duplicate exact tuple composed")
+	}
+	composed, err := ComposeCapabilityRealizationRegistries(first, nil)
+	if err != nil || !composed.Knows(compiled.Declaration.CapabilityID) {
+		t.Fatalf("unique composition failed: %v", err)
+	}
+}
+
+func TestAgentPackageDoesNotImportExecutionCell(t *testing.T) {
+	pkg, err := build.Default.ImportDir(".", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, imported := range pkg.Imports {
+		if imported == "github.com/RenseiAI/donmai/executioncell" {
+			t.Fatal("agent package imports executioncell and creates an authority/package cycle")
+		}
 	}
 }
 

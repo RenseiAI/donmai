@@ -43,7 +43,7 @@ func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
 // the real spawn's decorated Provider will apply. nil is a legitimate value:
 // a session with no registered decorator never had this mutation to
 // reconcile.
-func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, registries ...*agent.CapabilityRealizationRegistry) (agent.Spec, []string, error) {
+func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, registries ...capabilityRealizationResolver) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
@@ -109,11 +109,18 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 	if working.isInterview() {
 		spec.DisallowedTools = append(spec.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")
 	}
-	var realizations *agent.CapabilityRealizationRegistry
+	var realizations capabilityRealizationResolver
 	if len(registries) > 0 {
 		realizations = registries[0]
 	}
-	spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt, realizations)
+	var admissionRegistry *agent.CapabilityRealizationRegistry
+	switch registry := realizations.(type) {
+	case *agent.CapabilityRealizationRegistry:
+		admissionRegistry = registry
+	case *parameterBoundCapabilityResolver:
+		admissionRegistry = registry.realizations
+	}
+	spec, err = bindAdmissionToolLifecyclePlan(spec, selection.receipt, selection.claimReceipt, admissionRegistry)
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
@@ -138,7 +145,26 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		if !found {
 			return agent.Spec{}, nil, fmt.Errorf("runner: capability %q has no production-eligible exact realization", capability.Name)
 		}
-		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, agent.BindCapabilityRealization(compiled))
+		binding := agent.BindCapabilityRealization(compiled)
+		if compiled.Declaration.ContractVersion == agent.CapabilityRealizationContractVersionV2 {
+			parameterResolver, ok := realizations.(*parameterBoundCapabilityResolver)
+			if !ok {
+				return agent.Spec{}, nil, fmt.Errorf("runner: parameterized capability %q has no process-owned binder", capability.Name)
+			}
+			operationalPayload, payloadErr := CanonicalOperationalPayload(working)
+			if payloadErr != nil {
+				return agent.Spec{}, nil, payloadErr
+			}
+			facts := agent.CapabilityParameterRequirementFacts{
+				CapabilityID: capability.Name, ParametersDigest: capability.ParametersDigest,
+				OperationalPayloadDigest: selection.receipt.Value().OperationalPayloadDigest,
+			}
+			binding, payloadErr = parameterResolver.resolveAndBind(facts, operationalPayload, manifest.Name, profile.ID, mode)
+			if payloadErr != nil {
+				return agent.Spec{}, nil, fmt.Errorf("runner: bind parameterized capability %q: %w", capability.Name, payloadErr)
+			}
+		}
+		spec.ToolLifecyclePlan.CapabilityRealizations = append(spec.ToolLifecyclePlan.CapabilityRealizations, binding)
 	}
 	spec = ReconcileAdditionalExtensions(spec, decorate)
 	return spec, runtimeNames, nil
@@ -157,7 +183,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 // ReconcileAdditionalExtensions for why the daemon's preflight compiler
 // (ProviderView.PreflightExecution, the sole caller of this function) must
 // supply the SAME embedder decorator the real spawn's Provider will apply.
-func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, registries ...*agent.CapabilityRealizationRegistry) (*agent.PreparedHarness, agent.Spec, error) {
+func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, registries ...capabilityRealizationResolver) (*agent.PreparedHarness, agent.Spec, error) {
 	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, decorate, registries...)
 	if err != nil {
 		return nil, agent.Spec{}, err

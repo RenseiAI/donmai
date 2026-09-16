@@ -2,6 +2,8 @@ package matrix
 
 import (
 	"context"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"strings"
@@ -255,5 +257,39 @@ func TestCompileCapabilityRealizationsOrdersFullTupleAndRejectsDuplicates(t *tes
 	}
 	if _, err := CompileCapabilityRealizations([]CapabilityRealizationSource{a, a}); err == nil {
 		t.Fatal("duplicate tuple compiled")
+	}
+}
+
+func TestNamedExtensionRealizationRequiresExactProfileOptIn(t *testing.T) {
+	deliveryID := "synthetic-pack"
+	entryID, err := agent.AdditionalExtensionCapabilityEntryID(deliveryID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	binderSource := []byte("synthetic matrix binder")
+	binderDigest := sha256.Sum256(binderSource)
+	contract := &agent.CapabilityParameterContractV1{ContractVersion: agent.CapabilityParameterContractVersionV1, ID: "example.matrix-binder/v1", BinderSourceDigest: hex.EncodeToString(binderDigest[:]), SurfaceProjection: "subset", RuntimeObservation: "before_first_turn"}
+	surface := []agent.CapabilitySurfaceIdentity{{Kind: agent.CapabilitySurfaceNativeTool, ID: "tool"}}
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{CapabilityID: "example.named/v1", HarnessID: agent.HarnessPi, AdapterVersion: "pi/interactive/tool-lifecycle-v6", Mode: agent.PromptModeHumanControlled, RecipeID: "example/named/v1", Entries: []agent.CapabilityRecipeEntry{{EntryID: entryID, Channel: agent.ToolChannelToolPlugin, Required: true, InputDigest: strings.Repeat("b", 64), SurfaceRefs: surface}}, DeclaredSurface: surface, ParameterContract: contract})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{Declaration: declaration, FixtureID: "synthetic", BinaryDigest: strings.Repeat("a", 64), AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: entryID, Channel: agent.ToolChannelToolPlugin, InputDigest: strings.Repeat("b", 64)}}, ObservedSurface: surface})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := CompileCapabilityRealizations([]CapabilityRealizationSource{{Declaration: declaration, Observation: observation}}); err == nil || !strings.Contains(err.Error(), "does not opt in") {
+		t.Fatalf("named declaration parity error=%v", err)
+	}
+	calls := 0
+	source := CapabilityRealizationEvidenceSource{Declaration: declaration, Executor: CapabilityFixtureExecutorFunc(func(context.Context, agent.CapabilityRealizationDeclaration) (agent.CapabilityFixtureExecution, error) {
+		calls++
+		return agent.CapabilityFixtureExecution{}, nil
+	})}
+	if _, err := CompileCapabilityRealizationEvidence(context.Background(), []CapabilityRealizationEvidenceSource{source}); err == nil || !strings.Contains(err.Error(), "does not opt in") {
+		t.Fatalf("named evidence parity error=%v", err)
+	}
+	if calls != 0 {
+		t.Fatalf("profile parity executed %d fixtures before refusal", calls)
 	}
 }
