@@ -390,21 +390,7 @@ func validatePermanentDenialExactJSONNames(raw json.RawMessage, targetType refle
 			return errors.New("permanent denial evidence must be an object")
 		}
 		fields := make(map[string]reflect.Type, targetType.NumField())
-		for index := 0; index < targetType.NumField(); index++ {
-			field := targetType.Field(index)
-			if !field.IsExported() {
-				continue
-			}
-			tag := field.Tag.Get("json")
-			name := strings.Split(tag, ",")[0]
-			if name == "-" {
-				continue
-			}
-			if name == "" {
-				name = field.Name
-			}
-			fields[name] = field.Type
-		}
+		collectPermanentDenialStructJSONFields(targetType, fields, map[reflect.Type]bool{})
 		for name, memberRaw := range members {
 			fieldType, ok := fields[name]
 			if !ok {
@@ -436,6 +422,45 @@ func validatePermanentDenialExactJSONNames(raw json.RawMessage, targetType refle
 		}
 	}
 	return nil
+}
+
+func collectPermanentDenialStructJSONFields(
+	structType reflect.Type,
+	fields map[string]reflect.Type,
+	visiting map[reflect.Type]bool,
+) {
+	for structType.Kind() == reflect.Pointer {
+		structType = structType.Elem()
+	}
+	if structType.Kind() != reflect.Struct || visiting[structType] {
+		return
+	}
+	visiting[structType] = true
+	defer delete(visiting, structType)
+	for index := 0; index < structType.NumField(); index++ {
+		field := structType.Field(index)
+		if !field.IsExported() {
+			continue
+		}
+		tag := field.Tag.Get("json")
+		name := strings.Split(tag, ",")[0]
+		if name == "-" {
+			continue
+		}
+		fieldType := field.Type
+		unwrapped := fieldType
+		for unwrapped.Kind() == reflect.Pointer {
+			unwrapped = unwrapped.Elem()
+		}
+		if field.Anonymous && name == "" && unwrapped.Kind() == reflect.Struct {
+			collectPermanentDenialStructJSONFields(unwrapped, fields, visiting)
+			continue
+		}
+		if name == "" {
+			name = field.Name
+		}
+		fields[name] = fieldType
+	}
 }
 
 func rejectPermanentDenialDuplicateJSON(raw json.RawMessage) error {

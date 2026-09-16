@@ -317,6 +317,40 @@ func TestPermanentDenialClosedDecoderAllowsLegitimateDynamicMapKeys(t *testing.T
 	}
 }
 
+func TestPermanentDenialClosedDecoderFlattensCanonicalEmbeddedRealization(t *testing.T) {
+	receipt := agent.ToolLifecycleReceipt{
+		ContractVersion: agent.ToolLifecycleContractVersion,
+		ProfileID:       "profile", Decision: "denied", Entries: []agent.ToolLifecycleEntry{},
+		CapabilityRealizations: []agent.CapabilityRealizationResult{{
+			CapabilityRealizationBinding: agent.CapabilityRealizationBinding{
+				ContractVersion: agent.CapabilityRealizationContractVersionV1,
+			},
+			Decision: "artifact_bound",
+		}},
+	}
+	raw := rawJSON(t, receipt)
+	var decoded agent.ToolLifecycleReceipt
+	if err := decodeClosedPermanentDenialJSON(raw, &decoded); err != nil {
+		t.Fatalf("canonical embedded realization was refused: %v\n%s", err, raw)
+	}
+	if len(decoded.CapabilityRealizations) != 1 ||
+		decoded.CapabilityRealizations[0].ContractVersion != agent.CapabilityRealizationContractVersionV1 ||
+		decoded.CapabilityRealizations[0].Decision != "artifact_bound" {
+		t.Fatalf("decoded realization = %+v", decoded.CapabilityRealizations)
+	}
+	for _, mutation := range []string{
+		`"Decision":"artifact_bound"`,
+		`"decision":"artifact_bound","Decision":"artifact_bound"`,
+	} {
+		mutated := json.RawMessage(strings.Replace(
+			string(raw), `"decision":"artifact_bound"`, mutation, 1,
+		))
+		if err := decodeClosedPermanentDenialJSON(mutated, &decoded); err == nil {
+			t.Fatalf("embedded realization alias/collision was accepted: %s", mutated)
+		}
+	}
+}
+
 func TestPermanentDenialProjection_RefusesDetailIdentityAndPlacementDrift(t *testing.T) {
 	item, hostReceipt, typed := deniedToolDeliveryFixture(t, "session-drift", "wkr-test")
 	detail, binding := permanentDenialDetail(t, item)
