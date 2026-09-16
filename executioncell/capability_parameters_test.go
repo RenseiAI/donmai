@@ -22,7 +22,7 @@ func TestDigestCapabilityParametersCanonicalAndStrict(t *testing.T) {
 		"absent":       nil,
 		"duplicate":    json.RawMessage(`{"repo":"a","repo":"b"}`),
 		"trailing":     json.RawMessage(`{} {}`),
-		"invalid utf8": json.RawMessage{'"', 0xff, '"'},
+		"invalid utf8": {'"', 0xff, '"'},
 	} {
 		t.Run(name, func(t *testing.T) {
 			if _, err := DigestCapabilityParameters(raw); err == nil {
