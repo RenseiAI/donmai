@@ -74,10 +74,10 @@ type agentRunOpts struct {
 	// specDecorator is cfg.AgentSpecExtensionDecorator, threaded through from
 	// newAgentRunCmd exactly like bin above. nil preserves historical
 	// behavior (no provider wrapping).
-	specDecorator                 agent.ExtensionDecorator
-	capabilityRealizations        *agent.CapabilityRealizationRegistry
-	protectedRuntimeMCPCapability string
-	piTrustedExtensions           []providerpi.TrustedExtensionIdentity
+	specDecorator               agent.ExtensionDecorator
+	capabilityRealizations      *agent.CapabilityRealizationRegistry
+	protectedRuntimeMCPSelector runner.ProtectedRuntimeMCPSelector
+	piTrustedExtensions         []providerpi.TrustedExtensionIdentity
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -177,15 +177,15 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 	return &agentRunOpts{
 		bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator,
-		capabilityRealizations:        cfg.CapabilityRealizations,
-		protectedRuntimeMCPCapability: cfg.ProtectedRuntimeMCPCapability,
-		piTrustedExtensions:           append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
+		capabilityRealizations:      cfg.CapabilityRealizations,
+		protectedRuntimeMCPSelector: cfg.ProtectedRuntimeMCPSelector,
+		piTrustedExtensions:         append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
 	}
 }
 
 func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 	dst.CapabilityRealizations = src.capabilityRealizations
-	dst.ProtectedRuntimeMCPCapability = src.protectedRuntimeMCPCapability
+	dst.ProtectedRuntimeMCPSelector = src.protectedRuntimeMCPSelector
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a

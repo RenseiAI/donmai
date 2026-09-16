@@ -22,14 +22,18 @@ import (
 func TestAgentRunProtectedRuntimeMCPSelectorReachesChildOptions(t *testing.T) {
 	const capability = "example.protected-mcp/v1"
 	realizations := receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeHumanControlled)
+	selector := runner.ProtectedRuntimeMCPSelector{
+		CapabilityID: capability, HarnessID: agent.HarnessPi,
+		AdapterProfileID: "pi/interactive/tool-lifecycle-v6", Mode: agent.PromptModeHumanControlled,
+	}
 	commandOptions := agentRunOptions(Config{
-		CapabilityRealizations:        realizations,
-		ProtectedRuntimeMCPCapability: capability,
+		CapabilityRealizations:      realizations,
+		ProtectedRuntimeMCPSelector: selector,
 	}, "embedder")
 	var child runner.Options
 	applyAgentRunCapabilityOptions(&child, commandOptions)
-	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPCapability != capability {
-		t.Fatalf("child capability options = registry %p selector %q", child.CapabilityRealizations, child.ProtectedRuntimeMCPCapability)
+	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPSelector != selector {
+		t.Fatalf("child capability options = registry %p selector %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPSelector)
 	}
 }
 
@@ -39,14 +43,14 @@ func TestAgentRunProtectedRuntimeMCPDefaultStaysLegacyAndMalformedUsesRunnerVali
 		Registry: runner.NewRegistry(), WorktreeManager: &worktree.Manager{}, Poster: &result.Poster{},
 	}
 	applyAgentRunCapabilityOptions(&child, commandOptions)
-	if child.CapabilityRealizations != nil || child.ProtectedRuntimeMCPCapability != "" {
-		t.Fatalf("default child capability options = registry %p selector %q", child.CapabilityRealizations, child.ProtectedRuntimeMCPCapability)
+	if child.CapabilityRealizations != nil || child.ProtectedRuntimeMCPSelector != (runner.ProtectedRuntimeMCPSelector{}) {
+		t.Fatalf("default child capability options = registry %p selector %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPSelector)
 	}
 	if _, err := runner.New(child); err != nil {
 		t.Fatalf("legacy child options rejected: %v", err)
 	}
 
-	malformed := agentRunOptions(Config{ProtectedRuntimeMCPCapability: " malformed "}, "embedder")
+	malformed := agentRunOptions(Config{ProtectedRuntimeMCPSelector: runner.ProtectedRuntimeMCPSelector{CapabilityID: "incomplete"}}, "embedder")
 	applyAgentRunCapabilityOptions(&child, malformed)
 	if _, err := runner.New(child); err == nil {
 		t.Fatal("runner accepted malformed protected runtime MCP selector")
@@ -72,6 +76,10 @@ func TestRunAgentRunProtectedRuntimeMCPSelectorReachesChildValidation(t *testing
 
 	const capability = "example.protected-mcp/v1"
 	detail, realizations := protectedMCPStubDetailForTest(t, platform.URL, capability)
+	selector := runner.ProtectedRuntimeMCPSelector{
+		CapabilityID: capability, HarnessID: agent.HarnessStub,
+		AdapterProfileID: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous,
+	}
 	daemonServer := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if !strings.HasPrefix(r.URL.Path, "/api/daemon/sessions/") {
 			http.NotFound(w, r)
@@ -82,7 +90,7 @@ func TestRunAgentRunProtectedRuntimeMCPSelectorReachesChildValidation(t *testing
 	t.Cleanup(daemonServer.Close)
 
 	opts := agentRunOptions(Config{
-		CapabilityRealizations: realizations, ProtectedRuntimeMCPCapability: capability,
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector,
 	}, "embedder")
 	opts.sessionID, opts.daemonURL, opts.worktree = detail.SessionID, daemonServer.URL, t.TempDir()
 	if err := runAgentRun(t.Context(), &cobra.Command{}, opts); err == nil || !strings.Contains(err.Error(), "Spawn must never be called") {
@@ -168,7 +176,11 @@ func protectedMCPStubDetailForTest(t *testing.T, platformURL, capability string)
 	if err != nil {
 		t.Fatal(err)
 	}
-	view, err := runner.NewProviderViewWithProtectedRuntimeMCP(hostRegistry, nil, realizations, nil, capability)
+	selector := runner.ProtectedRuntimeMCPSelector{
+		CapabilityID: capability, HarnessID: agent.HarnessStub,
+		AdapterProfileID: profile.ID, Mode: agent.PromptModeAutonomous,
+	}
+	view, err := runner.NewProviderViewWithProtectedRuntimeMCP(hostRegistry, nil, realizations, nil, selector)
 	if err != nil {
 		t.Fatal(err)
 	}

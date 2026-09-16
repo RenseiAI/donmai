@@ -95,9 +95,15 @@ var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 // Startup use: the daemon builds this registry once so the local
 // /api/daemon/providers* HTTP surface can introspect it. Probes that fail
 // (e.g. ollama not running) emit WARN logs but do not block daemon start.
-func daemonProviderView(cfg Config, logger *slog.Logger) *runner.ProviderView {
+func daemonProviderView(cfg Config, logger *slog.Logger) (*runner.ProviderView, error) {
 	providerReg := daemonRegistryBuilder(logger, cfg.AgentSpecExtensionDecorator)
-	return runner.NewProviderViewWithDecoratorAndRealizations(providerReg, cfg.AgentSpecExtensionDecorator, cfg.CapabilityRealizations)
+	return runner.NewProviderViewWithProtectedRuntimeMCP(
+		providerReg,
+		cfg.AgentSpecExtensionDecorator,
+		cfg.CapabilityRealizations,
+		nil,
+		cfg.ProtectedRuntimeMCPSelector,
+	)
 }
 
 // newDaemonRunCmd constructs the `host run` subcommand. This is the
@@ -206,13 +212,17 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				)
 			}
 
+			providerView, err := daemonProviderView(cfg, slog.Default())
+			if err != nil {
+				return fmt.Errorf("construct daemon provider view: %w", err)
+			}
 			d := daemon.New(daemon.Options{
 				ConfigPath:       configPath,
 				JWTPath:          jwtPath,
 				HTTPHost:         host,
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
-				ProviderRegistry: daemonProviderView(cfg, slog.Default()),
+				ProviderRegistry: providerView,
 				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
 					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
 				SpawnerOptions: spawnerOpts,

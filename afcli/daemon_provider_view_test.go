@@ -13,6 +13,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 // testFakeDecoratorHarnessName/testFakeDecoratorProviderName reuse the
@@ -261,7 +262,10 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		view := daemonProviderView(cfg, quietLogger())
+		view, err := daemonProviderView(cfg, quietLogger())
+		if err != nil {
+			t.Fatal(err)
+		}
 		receipt, err := view.PreflightExecution(raw)
 		if err != nil {
 			t.Fatalf("PreflightExecution: %v receipt=%s", err, receipt)
@@ -327,4 +331,106 @@ func TestDaemonProviderViewAppliesConfiguredDecorator(t *testing.T) {
 			t.Fatalf("registry did not reach daemon preflight: %+v", plan.ToolLifecycleReceipt.CapabilityRealizations)
 		}
 	})
+}
+
+func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T) {
+	original := daemonRegistryBuilder
+	t.Cleanup(func() { daemonRegistryBuilder = original })
+	daemonRegistryBuilder = func(_ *slog.Logger, _ agent.ExtensionDecorator) *runner.Registry {
+		registry := runner.NewRegistry()
+		if err := registry.Register(daemonDecoratorFakeProvider{}); err != nil {
+			t.Fatal(err)
+		}
+		return registry
+	}
+
+	const capability = "example.protected-mcp/v1"
+	serverName := statehome.Brand() + "-platform"
+	entryID, err := agent.MCPServerCapabilityEntryID(serverName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	surface := []agent.CapabilitySurfaceIdentity{
+		{Kind: agent.CapabilitySurfaceMCPServer, ID: serverName},
+		{Kind: agent.CapabilitySurfaceMCPTool, ID: "fixture_call"},
+	}
+	inputDigest := agent.MCPRuntimeServerCapabilityInputDigest(agent.MCPServerConfig{Name: serverName, Type: "http"})
+	declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+		CapabilityID: capability, HarnessID: agent.HarnessStub,
+		AdapterVersion: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous,
+		RecipeID: "example/protected-mcp/v1", DeclaredSurface: surface,
+		Entries: []agent.CapabilityRecipeEntry{{
+			EntryID: entryID, Channel: agent.ToolChannelMCPServer, Required: true,
+			InputDigest: inputDigest, SurfaceRefs: surface,
+		}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+		Declaration: declaration, FixtureID: "protected-mcp-fixture", BinaryDigest: strings.Repeat("b", 64),
+		AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: entryID, Channel: agent.ToolChannelMCPServer, InputDigest: inputDigest}},
+		ObservedSurface:  surface,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+	if err != nil {
+		t.Fatal(err)
+	}
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := runner.ProtectedRuntimeMCPSelector{
+		CapabilityID: capability, HarnessID: agent.HarnessStub,
+		AdapterProfileID: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous,
+	}
+	view, err := daemonProviderView(Config{CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector}, quietLogger())
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	qw := runner.QueuedWork{}
+	qw.SessionID = "daemon-protected-mcp-selector"
+	qw.IssueIdentifier = "TEST-1"
+	qw.Body = "daemon selector forwarding"
+	qw.PlatformURL = "https://platform.example"
+	qw.McpAuthToken = "fixture-session-bearer"
+	qw.ResolvedProfile = runner.ResolvedProfile{
+		Harness: string(agent.HarnessStub), Model: "fake-model",
+		Endpoint: &agent.EndpointBinding{
+			Company: "fake", Model: "fake-model", Protocol: agent.ProtoStub, Host: agent.HostLocal,
+			EndpointID: "fake-endpoint", EndpointOperator: "fake", EndpointRevision: "2026-08-06", ModelAuthor: "fake",
+			AuthBindingID: "fake-auth", AuthAuthority: "fake", AuthCommercialMode: string(executioncell.CommercialUsageBilled),
+			AuthBindingScope: string(executioncell.ScopeProcess), AuthPortability: string(executioncell.Portable),
+			AuthDelivery: string(executioncell.DeliveryEnvironment), Mechanism: agent.AuthAPIKey,
+		},
+	}
+	cell := fakeDecoratorReceiptCell()
+	cell.GrantedCapabilities = []executioncell.CapabilityRequirement{{Name: capability}}
+	qw = attachAdmittedExecutionCellForTest(t, qw, cell)
+	operational, err := runner.CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.OperationalPayload = operational
+	detail, err := json.Marshal(map[string]any{
+		"sessionId": qw.SessionID, "workerId": qw.WorkerID,
+		"platformUrl": qw.PlatformURL, "mcpAuthToken": qw.McpAuthToken,
+		"admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell,
+		"executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+	if err != nil || len(requirements) != 1 {
+		t.Fatalf("daemon protected requirements = %+v err=%v", requirements, err)
+	}
 }

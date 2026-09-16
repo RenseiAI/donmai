@@ -486,7 +486,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// warning an operator gets that the session's tools have a horizon.
 	logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
 	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
-	if err := validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPCapability, mcpServers); err != nil {
+	if err := validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers); err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailureSpawn
 		res.Error = err.Error()
