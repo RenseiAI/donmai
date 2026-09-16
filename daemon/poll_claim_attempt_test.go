@@ -78,6 +78,7 @@ func claimAttemptPollBody(sessionID, token string) string {
 			"queuedAt":1,
 			"codeIntel":{"repo":"example/repo","tools":[]}
 		}],
+		"futureEnvelopeMember":{"ignored":true},
 		"claimAttempts":{
 			%q:{"contractVersion":"work-claim-attempt/v1","sessionId":%q,"attemptToken":%q}
 		}
@@ -268,6 +269,74 @@ func TestPollClaimAttempt_InvalidEnvelopeNeverBindsOrBlocksWork(t *testing.T) {
 				t.Fatalf("log leaked proof token: %s", logText.String())
 			}
 		})
+	}
+}
+
+func TestPollClaimAttempt_AmbiguousTopLevelWorkNeverBindsProof(t *testing.T) {
+	proof := `{"s":{"contractVersion":"work-claim-attempt/v1","sessionId":"s","attemptToken":"` + claimAttemptTokenOne + `"}}`
+	work := `[{"sessionId":"s","issueId":"i","issueIdentifier":"T-1","priority":1,"queuedAt":1}]`
+	tests := []struct {
+		name string
+		body string
+	}{
+		{
+			"duplicate canonical work member",
+			`{"work":` + work + `,"work":` + work + `,"claimAttempts":` + proof + `}`,
+		},
+		{
+			"canonical plus casefold alias",
+			`{"work":` + work + `,"Work":` + work + `,"claimAttempts":` + proof + `}`,
+		},
+		{
+			"casefold alias without canonical member",
+			`{"Work":` + work + `,"claimAttempts":` + proof + `}`,
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			fixture := newClaimAttemptHTTPFixture(t, tt.body)
+			var workCalls int
+			poller := NewPollService(PollOptions{
+				WorkerID: "worker-ambiguous", RuntimeJWT: "runtime-ambiguous",
+				OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+				OnWork: func(item PollWorkItem) error {
+					workCalls++
+					return NackRejectedWork(context.Background(), fixture.server.Client(), fixture.server.URL,
+						"worker-ambiguous", "runtime-ambiguous", &item, errors.New("ambiguous-work rejection"))
+				},
+			})
+			poller.pollOnce(context.Background())
+			if workCalls != 1 {
+				t.Fatalf("ordinary work calls = %d, want 1", workCalls)
+			}
+			nacks := fixture.nackBodies()
+			if len(nacks) != 1 {
+				t.Fatalf("NACK count = %d, want 1", len(nacks))
+			}
+			if _, ok := nacks[0]["claimAttempt"]; ok {
+				t.Fatalf("ambiguous work member gained trusted proof: %s", mustJSON(nacks[0]))
+			}
+		})
+	}
+}
+
+func TestPollClaimAttempt_AmbiguousWorkWithoutProofPreservesLegacyDecode(t *testing.T) {
+	first := `[{"sessionId":"first","issueId":"i1","issueIdentifier":"T-1","priority":1,"queuedAt":1}]`
+	last := `[{"sessionId":"last","issueId":"i2","issueIdentifier":"T-2","priority":1,"queuedAt":2}]`
+	fixture := newClaimAttemptHTTPFixture(t, `{"work":`+first+`,"Work":`+last+`}`)
+	var gotSession string
+	poller := NewPollService(PollOptions{
+		WorkerID: "worker-legacy-alias", RuntimeJWT: "runtime-legacy-alias",
+		OrchestratorURL: fixture.server.URL, HTTPClient: fixture.server.Client(),
+		OnWork: func(item PollWorkItem) error {
+			gotSession = item.SessionID
+			return nil
+		},
+	})
+	poller.pollOnce(context.Background())
+	if gotSession != "last" {
+		t.Fatalf("legacy casefold decode session = %q, want last", gotSession)
 	}
 }
 

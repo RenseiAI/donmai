@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"io"
 	"regexp"
+	"strings"
 )
 
 const (
@@ -100,6 +101,8 @@ func rawClaimAttemptMap(raw []byte) (json.RawMessage, bool, string) {
 	}
 	var found json.RawMessage
 	seen := false
+	workMembers := 0
+	canonicalWorkMembers := 0
 	for decoder.More() {
 		keyToken, err := decoder.Token()
 		if err != nil {
@@ -112,6 +115,12 @@ func rawClaimAttemptMap(raw []byte) (json.RawMessage, bool, string) {
 		var value json.RawMessage
 		if err := decoder.Decode(&value); err != nil {
 			return nil, false, "invalid_poll_envelope"
+		}
+		if strings.EqualFold(key, "work") {
+			workMembers++
+			if key == "work" {
+				canonicalWorkMembers++
+			}
 		}
 		if key != "claimAttempts" {
 			continue
@@ -128,6 +137,9 @@ func rawClaimAttemptMap(raw []byte) (json.RawMessage, bool, string) {
 	var trailing any
 	if err := decoder.Decode(&trailing); err != io.EOF {
 		return nil, false, "invalid_poll_envelope"
+	}
+	if seen && (workMembers != 1 || canonicalWorkMembers != 1) {
+		return nil, false, "ambiguous_work_member"
 	}
 	return found, seen, ""
 }
