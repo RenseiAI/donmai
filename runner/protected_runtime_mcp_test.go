@@ -238,6 +238,50 @@ func TestProtectedRuntimeMCPAbsentSelectorPreservesLegacyNonReceiptRun(t *testin
 	}
 }
 
+func TestProtectedRuntimeMCPCarriedV3RefusesMissingChildSelectorBeforeSpawn(t *testing.T) {
+	view, detail, qw, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+	if err != nil || len(requirements) != 1 {
+		t.Fatalf("requirements = %+v err=%v", requirements, err)
+	}
+	qw.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterialization(t, receipt, requirements[0])
+
+	server := mockPlatformServer(t)
+	defer server.Close()
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: qw.WorkerID, AuthToken: "worker-token", HTTPClient: server.Client(), BaseDelay: time.Millisecond})
+	if err != nil {
+		t.Fatal(err)
+	}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	run, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
+		CapabilityRealizations: realizations,
+		SkipBackstop:           true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	admission, err := registry.PreflightHarness(qw, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, runErr := run.runLoop(context.Background(), qw, time.Now().UnixMilli(), admission)
+	if runErr == nil || got.Status != "failed" || provider.spawnCalls.Load() != 0 {
+		t.Fatalf("run result=%+v err=%v spawnCalls=%d", got, runErr, provider.spawnCalls.Load())
+	}
+}
+
 func TestProtectedRuntimeMCPSelectorRefusesMalformedOrUnregisteredValues(t *testing.T) {
 	if _, err := NewProviderViewWithProtectedRuntimeMCP(NewRegistry(), nil, nil, nil, " malformed "); err == nil {
 		t.Fatal("malformed selector accepted")

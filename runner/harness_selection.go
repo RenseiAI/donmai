@@ -333,6 +333,16 @@ func validateProtectedRuntimeMCPMaterialization(
 	servers []agent.MCPServerConfig,
 ) error {
 	if selector == "" {
+		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
+			return nil
+		}
+		host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+		if err != nil {
+			return err
+		}
+		if host.ContractVersion == executioncell.HostAdaptationV3ContractVersion {
+			return errors.New("runner: protected runtime MCP materialization has no configured child selector")
+		}
 		return nil
 	}
 	selected := 0
