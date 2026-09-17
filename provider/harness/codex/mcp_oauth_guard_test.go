@@ -57,6 +57,12 @@ func TestCodexMCPOAuthCredentialKeyMatchesPinnedSerdeJSONBytes(t *testing.T) {
 	if _, err := codexMCPOAuthCredentialKey(server); err == nil {
 		t.Fatal("control-bearing URL was accepted")
 	}
+	for _, rawUnicode := range []string{"https://example.test/mcp?x=\u2028", "https://example.test/mcp?x=\u2029", "https://é.example/mcp"} {
+		server.URL = rawUnicode
+		if _, err := codexMCPOAuthCredentialKey(server); err == nil {
+			t.Fatalf("raw Unicode URL %q was accepted", rawUnicode)
+		}
+	}
 }
 
 func TestHeadlessProtectedMCPPinsFileStoreAndRefusesStoredOAuthBeforeStart(t *testing.T) {

@@ -56,8 +56,8 @@ func codexMCPOAuthCredentialKey(server agent.MCPServerConfig) (string, error) {
 		return "", errors.New("codex: protected MCP OAuth identity is incomplete")
 	}
 	for _, b := range []byte(server.URL) {
-		if b < 0x20 || b == 0x7f {
-			return "", errors.New("codex: protected MCP OAuth URL contains control bytes")
+		if b < 0x20 || b > 0x7e {
+			return "", errors.New("codex: protected MCP OAuth URL must use printable ASCII bytes")
 		}
 	}
 	var encoded bytes.Buffer
