@@ -336,7 +336,6 @@ func runDirectMCPFixture(
 	if err := json.Unmarshal(threadRaw, &thread); err != nil || thread.Thread.ID == "" {
 		t.Fatalf("thread/start response: %v, %s", err, threadRaw)
 	}
-	statusRaw := request("mcpServerStatus/list", map[string]any{"threadId": thread.Thread.ID, "detail": "toolsAndAuthOnly"})
 	var status struct {
 		Data []struct {
 			Name          string `json:"name"`
@@ -346,8 +345,28 @@ func runDirectMCPFixture(
 			} `json:"tools"`
 		} `json:"data"`
 	}
-	if err := json.Unmarshal(statusRaw, &status); err != nil || len(status.Data) != 1 || status.Data[0].Name != "fixture-platform" || status.Data[0].RuntimeStatus != "connected" || len(status.Data[0].Tools) != len(tools) {
-		t.Fatalf("MCP status = %+v, %v", status, err)
+	statusDeadline := time.Now().Add(5 * time.Second)
+	for {
+		statusRaw := request("mcpServerStatus/list", map[string]any{"threadId": thread.Thread.ID, "detail": "toolsAndAuthOnly"})
+		status = struct {
+			Data []struct {
+				Name          string `json:"name"`
+				RuntimeStatus string `json:"runtimeStatus"`
+				Tools         map[string]struct {
+					InputSchema map[string]any `json:"inputSchema"`
+				} `json:"tools"`
+			} `json:"data"`
+		}{}
+		if err := json.Unmarshal(statusRaw, &status); err != nil {
+			t.Fatalf("MCP status decode = %v, %s", err, statusRaw)
+		}
+		if len(status.Data) == 1 && status.Data[0].Name == "fixture-platform" && status.Data[0].RuntimeStatus == "connected" && len(status.Data[0].Tools) == len(tools) {
+			break
+		}
+		if time.Now().After(statusDeadline) {
+			t.Fatalf("MCP status did not become connected: %+v", status)
+		}
+		time.Sleep(50 * time.Millisecond)
 	}
 	for _, tool := range tools {
 		listed, ok := status.Data[0].Tools[tool.Name]

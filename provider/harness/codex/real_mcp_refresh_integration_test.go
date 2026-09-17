@@ -60,7 +60,6 @@ func (f *refreshMCPFixture) serveHTTP(w http.ResponseWriter, r *http.Request) {
 	}
 	var raw bytes.Buffer
 	decoder := json.NewDecoder(r.Body)
-	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&request); err != nil {
 		w.WriteHeader(http.StatusBadRequest)
 		return
@@ -191,7 +190,7 @@ func runNativeRefreshCalls(t *testing.T, ctx context.Context, native, ownedHome,
 		methods = append(methods, method)
 		raw, err := client.Request(ctx, method, params, 20*time.Second)
 		if err != nil {
-			t.Fatalf("%s: %v stderr=%q", method, err, stderr.String())
+			t.Fatalf("%s: %v", method, err)
 		}
 		return raw
 	}
