@@ -32,12 +32,21 @@ func BindProtectedRuntimeMCPV2ProfileIntent(qw QueuedWork, selector ProtectedRun
 	if !selector.configured() || agent.HarnessName(qw.ResolvedProfile.Harness) != selector.HarnessID {
 		return qw
 	}
-	mode := agent.PromptModeAutonomous
-	if cell, err := executioncell.DecodeResolvedExecutionCell(qw.EffectiveCell); err == nil {
-		if cell.SessionMode == executioncell.SessionHumanControlled {
-			mode = agent.PromptModeHumanControlled
+	cell, err := executioncell.DecodeResolvedExecutionCell(qw.EffectiveCell)
+	if err != nil {
+		return qw
+	}
+	grants := 0
+	for _, capability := range cell.GrantedCapabilities {
+		if capability.Name == selector.CapabilityID {
+			grants++
 		}
-	} else if qw.isInteractive() {
+	}
+	if grants != 1 {
+		return qw
+	}
+	mode := agent.PromptModeAutonomous
+	if cell.SessionMode == executioncell.SessionHumanControlled {
 		mode = agent.PromptModeHumanControlled
 	}
 	if mode == selector.Mode {

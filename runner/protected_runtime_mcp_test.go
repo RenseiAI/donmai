@@ -724,6 +724,10 @@ func TestProtectedRuntimeMCPSelectorRefusesMalformedOrUnregisteredValues(t *test
 
 func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) {
 	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, true)
+	retainedV1, err := legacyView.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
 	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
 	const profileID = "codex/headless/tool-lifecycle-v2-fixture"
 	manifest := provider.manifest
@@ -748,6 +752,9 @@ func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) 
 	})
 	if err != nil {
 		t.Fatal(err)
+	}
+	if err := view.ValidateRetainedExecution(detail, retainedV1); err == nil || !strings.Contains(err.Error(), "toolLifecyclePlan") {
+		t.Fatalf("targeted retained v1 receipt was not explicitly refused: %v", err)
 	}
 	receipt, err := view.PreflightExecution(detail)
 	if err != nil {
@@ -780,6 +787,50 @@ func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) 
 	}
 	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(requirement); err != nil {
 		t.Fatal(err)
+	}
+}
+
+func TestProtectedRuntimeMCPV2ProfileIntentLeavesUntargetedSessionOnV1(t *testing.T) {
+	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, false)
+	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	const profileID = "codex/headless/tool-lifecycle-v2-fixture"
+	manifest := provider.manifest
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	profile.ID, profile.EvidenceTier, profile.ProductionEligible = profileID, "native_verified", true
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, profile)
+	provider.manifest = manifest
+	compiled := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, qw, profileID, agent.PromptModeAutonomous)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := ProtectedRuntimeMCPV2Selector{
+		CapabilityID: protectedRuntimeMCPTestCapability, HarnessID: base.HarnessID,
+		AdapterProfileID: profileID, Mode: base.Mode, ConfigRequirementID: "example.session-config/v1",
+	}
+	if bound := BindProtectedRuntimeMCPV2ProfileIntent(qw, selector); bound.toolLifecycleProfileID != "" {
+		t.Fatalf("untargeted session selected profile %q", bound.toolLifecycleProfileID)
+	}
+	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolReceipt agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &toolReceipt); err != nil || toolReceipt.ProfileID != base.AdapterProfileID {
+		t.Fatalf("untargeted tool receipt=%+v err=%v", toolReceipt, err)
+	}
+	if requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt); err != nil || requirements != nil {
+		t.Fatalf("untargeted V2 requirements=%+v err=%v", requirements, err)
 	}
 }
 
