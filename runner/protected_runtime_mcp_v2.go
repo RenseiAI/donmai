@@ -26,6 +26,33 @@ func canonicalProtectedRuntimeMCPHelperCommand(tokenFilePath string) (string, er
 	return mcpheaders.BuildHelperCommand(executable, tokenFilePath)
 }
 
+// BindProtectedRuntimeMCPV2ProfileIntent applies only the exact process-owned
+// selector target. It adds no flag, environment, or queued-work surface.
+func BindProtectedRuntimeMCPV2ProfileIntent(qw QueuedWork, selector ProtectedRuntimeMCPV2Selector) QueuedWork {
+	if !selector.configured() || agent.HarnessName(qw.ResolvedProfile.Harness) != selector.HarnessID {
+		return qw
+	}
+	mode := agent.PromptModeAutonomous
+	if cell, err := executioncell.DecodeResolvedExecutionCell(qw.EffectiveCell); err == nil {
+		if cell.SessionMode == executioncell.SessionHumanControlled {
+			mode = agent.PromptModeHumanControlled
+		}
+	} else if qw.isInteractive() {
+		mode = agent.PromptModeHumanControlled
+	}
+	if mode == selector.Mode {
+		qw.toolLifecycleProfileID = selector.AdapterProfileID
+	}
+	return qw
+}
+
+func toolLifecycleProfileForWork(qw QueuedWork, manifest agent.HarnessManifest, mode agent.PromptSessionMode) (agent.ToolLifecycleProfile, bool) {
+	if qw.toolLifecycleProfileID != "" {
+		return manifest.ToolLifecycleProfileByID(qw.toolLifecycleProfileID, mode)
+	}
+	return manifest.ToolLifecycleProfile(mode)
+}
+
 // applyProtectedRuntimeMCPV2 joins the retained protected materialization to
 // the actual common file binding and only then replaces the launch header with
 // the process-private native helper.

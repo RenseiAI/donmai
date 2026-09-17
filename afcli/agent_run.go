@@ -363,6 +363,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// one — see the field's doc comment on runner.QueuedWork): it rides in
 	// from --keep-recording, not from the daemon's SessionDetail.
 	qw.RetainRecording = opts.keepRecording
+	qw = runner.BindProtectedRuntimeMCPV2ProfileIntent(qw, opts.protectedRuntimeMCPV2Selector)
 	admission, admissionErr := reg.PreflightHarness(qw, opts.capabilityRealizations)
 	if admissionErr != nil {
 		logger.Warn("donmai agent run: explicit harness denied before gateway/status side effects",

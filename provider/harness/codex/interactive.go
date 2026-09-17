@@ -627,11 +627,16 @@ func tomlStringArray(values []string) string {
 }
 
 func persistInteractiveMCPApplicationDenial(spec agent.Spec, applicationErr error) error {
+	profile, ok := agent.SelectedToolLifecycleProfile(spec, (&Provider{}).Manifest())
+	if !ok {
+		profile = agent.ToolLifecycleProfile{ID: "codex/interactive/tool-lifecycle-v1", EvidenceTier: "unit_verified"}
+	}
 	receipt := agent.ToolLifecycleReceipt{
-		ContractVersion: agent.ToolLifecycleContractVersion,
-		ProfileID:       "codex/interactive/tool-lifecycle-v1",
-		Decision:        "denied",
-		EvidenceTier:    "unit_verified",
+		ContractVersion:    agent.ToolLifecycleContractVersion,
+		ProfileID:          profile.ID,
+		Decision:           "denied",
+		EvidenceTier:       profile.EvidenceTier,
+		ProductionEligible: profile.ProductionEligible,
 		Entries: []agent.ToolLifecycleEntry{{
 			ID:         "mcp-servers",
 			Channel:    agent.ToolChannelMCPServer,

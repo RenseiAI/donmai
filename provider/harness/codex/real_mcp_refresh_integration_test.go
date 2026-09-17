@@ -148,6 +148,15 @@ type nativeRefreshRun struct {
 func runNativeRefreshCalls(t *testing.T, ctx context.Context, native, ownedHome, workdir string, server agent.MCPServerConfig, calls int) nativeRefreshRun {
 	t.Helper()
 	spec := agent.Spec{Cwd: workdir, Env: map[string]string{"OPENAI_API_KEY": "fixture-model-auth-not-a-real-credential"}, MCPServers: []agent.MCPServerConfig{server}}
+	spec.PromptMode = agent.PromptModeHumanControlled
+	spec = agent.WithToolLifecycleProfile(spec, InteractiveRefreshableToolLifecycleProfileID)
+	profile, ok := agent.SelectedToolLifecycleProfile(spec, (&Provider{}).Manifest())
+	if !ok {
+		t.Fatal("refreshable native profile is unavailable")
+	}
+	if _, receipt, err := agent.AdaptToolLifecycle(spec, profile); err != nil || receipt.Decision != "ready" || receipt.ProfileID != InteractiveRefreshableToolLifecycleProfileID {
+		t.Fatalf("refreshable native profile receipt=%+v err=%v", receipt, err)
+	}
 	launch, err := buildInteractiveLaunch(spec)
 	if err != nil {
 		t.Fatal(err)

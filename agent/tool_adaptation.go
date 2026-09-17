@@ -285,6 +285,26 @@ func (m HarnessManifest) ToolLifecycleProfile(mode PromptSessionMode) (ToolLifec
 	return ToolLifecycleProfile{}, false
 }
 
+// ToolLifecycleProfileByID returns one exact profile variant for a mode.
+func (m HarnessManifest) ToolLifecycleProfileByID(profileID string, mode PromptSessionMode) (ToolLifecycleProfile, bool) {
+	for _, profile := range m.ToolLifecycle {
+		if profile.ID == profileID && profile.Mode == mode {
+			return profile, true
+		}
+	}
+	return ToolLifecycleProfile{}, false
+}
+
+// SelectedToolLifecycleProfile resolves process selection or the historical
+// first profile for the Spec's mode when no variant was selected.
+func SelectedToolLifecycleProfile(spec Spec, manifest HarnessManifest) (ToolLifecycleProfile, bool) {
+	mode := PromptModeForSpec(spec)
+	if profileID := ToolLifecycleProfileID(spec); profileID != "" {
+		return manifest.ToolLifecycleProfileByID(profileID, mode)
+	}
+	return manifest.ToolLifecycleProfile(mode)
+}
+
 // EnsureToolLifecyclePlan projects an absent plan to the current contract.
 func EnsureToolLifecyclePlan(spec Spec) ToolLifecyclePlan {
 	if spec.ToolLifecyclePlan != nil {
@@ -311,7 +331,7 @@ func PrepareHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 
 // PrepareToolLifecycle compiles and persists the exact mode receipt.
 func PrepareToolLifecycle(spec Spec, manifest HarnessManifest) (Spec, error) {
-	profile, ok := manifest.ToolLifecycleProfile(PromptModeForSpec(spec))
+	profile, ok := SelectedToolLifecycleProfile(spec, manifest)
 	if !ok {
 		plan := EnsureToolLifecyclePlan(spec)
 		receipt := ToolLifecycleReceipt{

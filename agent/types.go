@@ -370,6 +370,11 @@ type CodeIntelEnforcement struct {
 // Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
+	// toolLifecycleProfileID is process-owned adapter selection. It never
+	// travels on the session wire; prepared receipts retain the selected public
+	// profile identity as ordinary digest-only authority.
+	toolLifecycleProfileID string
+
 	// PromptMode is the admitted session mode. Empty retains the legacy
 	// Interactive-derived mode for non-receipted callers.
 	PromptMode PromptSessionMode `json:"promptMode,omitempty"`
@@ -628,6 +633,17 @@ type Spec struct {
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
 }
+
+// WithToolLifecycleProfile returns a copy selecting one manifest-declared
+// tool lifecycle profile. Selection is process-only and fails later if the
+// exact profile is unavailable for the Spec's mode.
+func WithToolLifecycleProfile(spec Spec, profileID string) Spec {
+	spec.toolLifecycleProfileID = profileID
+	return spec
+}
+
+// ToolLifecycleProfileID reports the process-selected profile identity.
+func ToolLifecycleProfileID(spec Spec) string { return spec.toolLifecycleProfileID }
 
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.
 //

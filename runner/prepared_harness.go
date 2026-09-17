@@ -60,7 +60,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact harness manifest")
 	}
 	manifest := harness.Manifest()
-	profile, ok := manifest.ToolLifecycleProfile(mode)
+	profile, ok := toolLifecycleProfileForWork(working, manifest, mode)
 	if !ok {
 		return agent.Spec{}, nil, errors.New("runner: selected provider has no exact tool lifecycle profile")
 	}
@@ -123,6 +123,9 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		return agent.Spec{}, nil, err
 	}
 	spec.PromptMode = mode
+	if working.toolLifecycleProfileID != "" {
+		spec = agent.WithToolLifecycleProfile(spec, working.toolLifecycleProfileID)
+	}
 	if working.isInteractive() {
 		spec.Interactive = &agent.InteractiveSpec{}
 	}

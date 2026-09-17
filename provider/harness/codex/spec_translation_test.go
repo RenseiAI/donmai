@@ -53,6 +53,7 @@ func TestSpecFieldCoverage(t *testing.T) {
 	// whether the test Spec actually populates them — so the union
 	// coverage check works regardless of input.
 	ignoredFields := []string{
+		"toolLifecycleProfileID", // process-only selection consumed before provider translation
 		// SessionName is consumed by the spawn lifecycle rather than encoded in
 		// thread/start: fresh headless sessions issue thread/name/set after the
 		// thread id exists and before turn/start; named interactive sessions use

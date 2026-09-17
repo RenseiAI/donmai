@@ -37,6 +37,16 @@ func protectedRuntimeMCPCompiled(t *testing.T, capability string, provider agent
 	if !ok {
 		t.Fatal("test harness has no tool lifecycle profile")
 	}
+	return protectedRuntimeMCPCompiledForProfile(t, capability, provider, qw, profile.ID, mode)
+}
+
+func protectedRuntimeMCPCompiledForProfile(t *testing.T, capability string, provider agent.Provider, qw QueuedWork, profileID string, mode agent.PromptSessionMode) agent.CompiledCapabilityRealization {
+	t.Helper()
+	harness := provider.(agent.HarnessProvider)
+	profile, ok := harness.Manifest().ToolLifecycleProfileByID(profileID, mode)
+	if !ok {
+		t.Fatalf("test harness has no tool lifecycle profile %q", profileID)
+	}
 	server, err := protectedRuntimeMCPServer(materializeRuntimeAuthority(qw), provider, mode)
 	if err != nil {
 		t.Fatal(err)
@@ -713,11 +723,24 @@ func TestProtectedRuntimeMCPSelectorRefusesMalformedOrUnregisteredValues(t *test
 }
 
 func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) {
-	legacyView, detail, _, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, true)
 	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	const profileID = "codex/headless/tool-lifecycle-v2-fixture"
+	manifest := provider.manifest
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	profile.ID = profileID
+	profile.EvidenceTier = "native_verified"
+	profile.ProductionEligible = true
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, profile)
+	provider.manifest = manifest
+	compiled := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, qw, profileID, agent.PromptModeAutonomous)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
 	selector := ProtectedRuntimeMCPV2Selector{
 		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
-		AdapterProfileID: base.AdapterProfileID, Mode: base.Mode,
+		AdapterProfileID: profileID, Mode: base.Mode,
 		ConfigRequirementID: "example.session-config/v1",
 	}
 	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
@@ -729,6 +752,14 @@ func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) 
 	receipt, err := view.PreflightExecution(detail)
 	if err != nil {
 		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolReceipt agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &toolReceipt); err != nil || toolReceipt.ProfileID != profileID {
+		t.Fatalf("tool receipt=%+v err=%v", toolReceipt, err)
 	}
 	v1, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
 	if err != nil || v1 != nil {
@@ -773,12 +804,46 @@ func TestProtectedRuntimeMCPV2SelectorRefusesAmbiguousOrInvalidConfiguration(t *
 	}
 }
 
-func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *testing.T) {
-	legacyView, detail, qw, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+func TestProtectedRuntimeMCPV2RefusesLegacyToolLifecycleProfile(t *testing.T) {
+	legacyView, detail, _, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
 	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
 	selector := ProtectedRuntimeMCPV2Selector{
 		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
 		AdapterProfileID: base.AdapterProfileID, Mode: base.Mode,
+		ConfigRequirementID: "example.session-config/v1",
+	}
+	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt); err == nil || !strings.Contains(err.Error(), "native-verified") {
+		t.Fatalf("legacy profile V2 resolution err=%v", err)
+	}
+}
+
+func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *testing.T) {
+	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, true)
+	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	const profileID = "codex/headless/tool-lifecycle-v2-fixture"
+	manifest := provider.manifest
+	profile, _ := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	profile.ID, profile.EvidenceTier, profile.ProductionEligible = profileID, "native_verified", true
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, profile)
+	provider.manifest = manifest
+	compiled := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, qw, profileID, agent.PromptModeAutonomous)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selector := ProtectedRuntimeMCPV2Selector{
+		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
+		AdapterProfileID: profileID, Mode: base.Mode,
 		ConfigRequirementID: "example.session-config/v1",
 	}
 	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
@@ -843,6 +908,7 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 	host.ConfigMaterializations = []executioncell.PreflightConfigMaterializationV1{common}
 	host.ProtectedRuntimeMCPConfigsV2 = []executioncell.ProtectedRuntimeMCPConfigMaterializationV2{materialization}
 	qw.HostAdaptationReceipt = rawJSONForRunner(t, host)
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, selector)
 	admission, err := legacyView.reg.PreflightHarness(qw, realizations)
 	if err != nil {
 		t.Fatal(err)

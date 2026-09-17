@@ -10,6 +10,7 @@ package runner
 import (
 	"crypto/sha256"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"reflect"
 	"sort"
@@ -158,7 +159,7 @@ func protectedRuntimeMCPApplies(qw QueuedWork, selection harnessSelection, selec
 	if manifest.Name != selector.HarnessID {
 		return false, fmt.Errorf("runner: protected runtime MCP target harness identity changed")
 	}
-	profile, ok := manifest.ToolLifecycleProfile(mode)
+	profile, ok := manifest.ToolLifecycleProfileByID(selector.AdapterProfileID, mode)
 	if !ok || profile.ID != selector.AdapterProfileID {
 		return false, fmt.Errorf("runner: protected runtime MCP target adapter profile changed")
 	}
@@ -215,7 +216,7 @@ func resolveProtectedRuntimeMCPRequirement(
 	}
 	mode := selector.Mode
 	manifest := harness.Manifest()
-	profile, ok := manifest.ToolLifecycleProfile(mode)
+	profile, ok := manifest.ToolLifecycleProfileByID(selector.AdapterProfileID, mode)
 	if !ok || profile.ID != selector.AdapterProfileID {
 		return nil, fmt.Errorf("runner: protected runtime MCP target adapter profile changed")
 	}
@@ -278,6 +279,14 @@ func resolveProtectedRuntimeMCPRequirementV2(
 	base, err := resolveProtectedRuntimeMCPRequirement(qw, selection, realizations, selector.realizationSelector(), host)
 	if err != nil || base == nil {
 		return nil, err
+	}
+	harness, ok := selection.Provider.(agent.HarnessProvider)
+	if !ok {
+		return nil, errors.New("runner: protected runtime MCP v2 requires an exact harness manifest")
+	}
+	profile, ok := harness.Manifest().ToolLifecycleProfileByID(selector.AdapterProfileID, selector.Mode)
+	if !ok || profile.EvidenceTier != "native_verified" || !profile.ProductionEligible {
+		return nil, errors.New("runner: protected runtime MCP v2 requires a native-verified production profile")
 	}
 	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV2{
 		ContractVersion:        executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
@@ -364,6 +373,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return nil, err
 	}
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	receipt := hostAdaptationReceipt{
 		ContractVersion: executioncell.HostAdaptationContractVersion, RequestID: binding.RequestID,
 		WorkerID: binding.WorkerID, PlacementID: binding.PlacementID,
@@ -427,6 +437,7 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 	if err != nil {
 		return nil, err
 	}
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
 	if err != nil {
 		return nil, err
@@ -486,6 +497,7 @@ func (v *ProviderView) protectedRuntimeMCPPreflightContext(detailJSON json.RawMe
 	if err != nil {
 		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
 	}
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
 	if err != nil {
 		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
@@ -557,6 +569,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	qw.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
 	admission, err := v.reg.preflightAdmissionReceipt(qw, true, v.realizations)
 	if err != nil {

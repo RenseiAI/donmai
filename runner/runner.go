@@ -514,6 +514,7 @@ func (r *Runner) RunAdmitted(ctx context.Context, qw QueuedWork, admission *Harn
 }
 
 func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
+	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, r.protectedRuntimeMCPV2Selector)
 	startedAt := r.now().UnixMilli()
 
 	// Apply the runner-side upper-bound timeout if requested.

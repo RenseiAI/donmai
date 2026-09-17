@@ -540,7 +540,7 @@ func validateReceiptCell(qw QueuedWork, receipt executioncell.AdmissionReceipt, 
 			if cell.SessionMode == executioncell.SessionHumanControlled {
 				mode = agent.PromptModeHumanControlled
 			}
-			profile, profileOK := manifest.ToolLifecycleProfile(mode)
+			profile, profileOK := toolLifecycleProfileForWork(qw, manifest, mode)
 			var realizationOK bool
 			if len(realizations) > 0 && realizations[0] != nil && profileOK {
 				_, realizationOK = realizations[0].Resolve(capability.Name, manifest.Name, profile.ID, mode)

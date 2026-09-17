@@ -55,11 +55,14 @@ func codexMCPOAuthCredentialKey(server agent.MCPServerConfig) (string, error) {
 	if server.Name == "" || server.Type != "http" || server.URL == "" {
 		return "", errors.New("codex: protected MCP OAuth identity is incomplete")
 	}
-	urlJSON, err := json.Marshal(server.URL)
+	payload, err := json.Marshal(struct {
+		Type    string            `json:"type"`
+		URL     string            `json:"url"`
+		Headers map[string]string `json:"headers"`
+	}{Type: "http", URL: server.URL, Headers: map[string]string{}})
 	if err != nil {
 		return "", err
 	}
-	payload := []byte("{\"type\":\"http\",\"url\":" + string(urlJSON) + ",\"headers\":{}}")
 	sum := sha256.Sum256(payload)
 	return server.Name + "|" + hex.EncodeToString(sum[:])[:16], nil
 }
