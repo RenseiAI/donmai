@@ -182,6 +182,18 @@ func decodeProtectedRuntimeMCPMaterializations(rawValues []json.RawMessage) ([]P
 	return v1, v2, nil
 }
 
+func rejectHostAdaptationMaterializationFieldAliases(members map[string]json.RawMessage) error {
+	for field := range members {
+		switch {
+		case strings.EqualFold(field, "configMaterializations") && field != "configMaterializations":
+			return fmt.Errorf("executioncell: host adaptation receipt has non-canonical field %q", field)
+		case strings.EqualFold(field, "protectedRuntimeMcpConfigs") && field != "protectedRuntimeMcpConfigs":
+			return fmt.Errorf("executioncell: host adaptation receipt has non-canonical field %q", field)
+		}
+	}
+	return nil
+}
+
 // DecodeHostAdaptationReceipt strictly decodes a closed host receipt.
 func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	if err := rejectDuplicateFields(raw); err != nil {
@@ -190,6 +202,9 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	var wire hostAdaptationReceiptDecodeWire
 	members, err := rawObjectMembers(raw, "host adaptation receipt")
 	if err != nil {
+		return HostAdaptationReceipt{}, err
+	}
+	if err := rejectHostAdaptationMaterializationFieldAliases(members); err != nil {
 		return HostAdaptationReceipt{}, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
@@ -215,6 +230,13 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	}
 	if receipt.Decision != "ready" && receipt.Decision != "denied" {
 		return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation decision must be ready or denied")
+	}
+	if len(receipt.ConfigMaterializations) > 0 && (receipt.ContractVersion == HostAdaptationContractVersion || receipt.Decision != "ready") {
+		return HostAdaptationReceipt{}, errors.New("executioncell: common config materializations require a ready host-adaptation/v2 or v3 receipt")
+	}
+	if (len(receipt.ProtectedRuntimeMCPConfigs) > 0 || len(receipt.ProtectedRuntimeMCPConfigsV2) > 0) &&
+		(receipt.ContractVersion != HostAdaptationV3ContractVersion || receipt.Decision != "ready") {
+		return HostAdaptationReceipt{}, errors.New("executioncell: protected runtime MCP configs require a ready host-adaptation/v3 receipt")
 	}
 	_, configsPresent := members["configMaterializations"]
 	_, protectedMCPPresent := members["protectedRuntimeMcpConfigs"]

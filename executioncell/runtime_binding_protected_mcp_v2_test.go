@@ -138,3 +138,62 @@ func TestProtectedRuntimeMCPConfigMaterializationsV2RequireUniqueOrdering(t *tes
 		t.Fatal("duplicate v2 materializations accepted")
 	}
 }
+
+func replaceHostWireKey(raw []byte, canonical, replacement string) []byte {
+	return bytes.Replace(raw, []byte(`"`+canonical+`":`), []byte(`"`+replacement+`":`), 1)
+}
+
+func TestHostAdaptationProtectedMCPV2RejectsEnvelopeCaseAliases(t *testing.T) {
+	t.Parallel()
+	v2Host := readyHostAdaptationForProtectedV2(t)
+	v2Host.ContractVersion = HostAdaptationV2ContractVersion
+	v2Host.ConfigMaterializations = []PreflightConfigMaterializationV1{validConfigMaterialization(strings.Repeat("a", 64))}
+	v2Raw, err := json.Marshal(v2Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v1Denied, err := json.Marshal(hostAdaptationReceiptV2Wire{
+		ContractVersion: HostAdaptationContractVersion, RequestID: "request", WorkerID: "worker", PlacementID: "host",
+		Decision: "denied", Denial: "example",
+		ProtectedRuntimeMCPConfigs: v2Host.ProtectedRuntimeMCPConfigsV2,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	v3Host := readyHostAdaptationForProtectedV2(t)
+	v3Raw, err := json.Marshal(v3Host)
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	for name, raw := range map[string][]byte{
+		"v1 denied protected alias": replaceHostWireKey(v1Denied, "protectedRuntimeMcpConfigs", "ProtectedRuntimeMcpConfigs"),
+		"v2 ready protected alias":  replaceHostWireKey(v2Raw, "protectedRuntimeMcpConfigs", "ProtectedRuntimeMcpConfigs"),
+		"v3 ready protected alias":  replaceHostWireKey(v3Raw, "protectedRuntimeMcpConfigs", "ProtectedRuntimeMcpConfigs"),
+		"v3 contradictory protected aliases": bytes.Replace(v3Raw,
+			[]byte(`"protectedRuntimeMcpConfigs":`),
+			[]byte(`"protectedRuntimeMcpConfigs":[],"ProtectedRuntimeMcpConfigs":`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeHostAdaptationReceipt(raw); err == nil {
+				t.Fatalf("case-aliased protected materialization decoded: %s", raw)
+			}
+		})
+	}
+}
+
+func TestHostAdaptationProtectedMCPV2RejectsConfigMaterializationAlias(t *testing.T) {
+	t.Parallel()
+	host := readyHostAdaptationForProtectedV2(t)
+	host.ConfigMaterializations = []PreflightConfigMaterializationV1{validConfigMaterialization(strings.Repeat("a", 64))}
+	raw, err := json.Marshal(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	raw = replaceHostWireKey(raw, "configMaterializations", "ConfigMaterializations")
+	if _, err := DecodeHostAdaptationReceipt(raw); err == nil {
+		t.Fatalf("case-aliased common materialization skipped host-v3 validation: %s", raw)
+	}
+}
