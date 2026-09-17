@@ -437,6 +437,27 @@ func ValidateProtectedRuntimeMCPConfigMaterializationV2(value ProtectedRuntimeMC
 	return nil
 }
 
+// ValidateProtectedRuntimeMCPConfigMaterializationsV2 validates a nonempty,
+// uniquely ordered structural v2 materialization set. Runtime authorization
+// additionally requires the exact common-materialization join.
+func ValidateProtectedRuntimeMCPConfigMaterializationsV2(values []ProtectedRuntimeMCPConfigMaterializationV2) error {
+	if len(values) == 0 {
+		return errors.New("executioncell: protected runtime MCP v2 config materializations are required")
+	}
+	if !sort.SliceIsSorted(values, func(i, j int) bool { return values[i].RequirementID < values[j].RequirementID }) {
+		return errors.New("executioncell: protected runtime MCP v2 config materializations must be sorted")
+	}
+	for i := range values {
+		if i > 0 && values[i-1].RequirementID == values[i].RequirementID {
+			return errors.New("executioncell: duplicate protected runtime MCP v2 config materialization")
+		}
+		if err := ValidateProtectedRuntimeMCPConfigMaterializationV2(values[i]); err != nil {
+			return err
+		}
+	}
+	return nil
+}
+
 // ValidateProtectedRuntimeMCPConfigMaterializations validates non-empty,
 // unique requirement ordering.
 func ValidateProtectedRuntimeMCPConfigMaterializations(values []ProtectedRuntimeMCPConfigMaterializationV1) error {

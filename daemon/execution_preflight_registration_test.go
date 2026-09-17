@@ -21,6 +21,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
 type orderedPreflightProvider struct {
@@ -42,6 +43,30 @@ type orderedConfigPreflightProvider struct {
 type orderedProtectedMCPPreflightProvider struct {
 	*orderedPreflightProvider
 	requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1
+}
+
+type orderedProtectedMCPV2PreflightProvider struct {
+	*orderedConfigPreflightProvider
+	requirementsV2 []executioncell.ProtectedRuntimeMCPConfigRequirementV2
+}
+
+type orderedAmbiguousProtectedMCPPreflightProvider struct {
+	*orderedProtectedMCPV2PreflightProvider
+	requirementsV1 []executioncell.ProtectedRuntimeMCPConfigRequirementV1
+}
+
+func (p *orderedAmbiguousProtectedMCPPreflightProvider) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(_ json.RawMessage, _ json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
+	p.mu.Lock()
+	*p.order = append(*p.order, "protected-requirements")
+	p.mu.Unlock()
+	return append([]executioncell.ProtectedRuntimeMCPConfigRequirementV1(nil), p.requirementsV1...), nil
+}
+
+func (p *orderedProtectedMCPV2PreflightProvider) ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(_ json.RawMessage, _ json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
+	p.mu.Lock()
+	*p.order = append(*p.order, "protected-v2-requirements")
+	p.mu.Unlock()
+	return append([]executioncell.ProtectedRuntimeMCPConfigRequirementV2(nil), p.requirementsV2...), nil
 }
 
 func (p *orderedProtectedMCPPreflightProvider) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(_ json.RawMessage, _ json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
@@ -597,6 +622,124 @@ func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredenti
 	host, err := executioncell.DecodeHostAdaptationReceipt(persisted)
 	if err != nil || host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ProtectedRuntimeMCPConfigs) != 1 {
 		t.Fatalf("persisted host receipt = %+v err=%v", host, err)
+	}
+}
+
+func TestRuntimeBindingV2PersistsJoinedProtectedRuntimeMCPV2BeforeRegistrationCredentialAndSpawn(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	detail.PlatformURL = "https://platform.example/"
+	detail.McpAuthToken = "session-bearer"
+	detail.OperationalPayload = json.RawMessage(`{"mcpAuthToken":"session-bearer"}`)
+	operationalDigest := operationalDigestFor(t, detail)
+	admission, err := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	admitted := admission.Value()
+	admitted.OperationalPayloadDigest = operationalDigest
+	detail.AdmissionReceipt = rawJSON(t, admitted)
+	commonRequirement := executioncell.PreflightConfigRequirementV1{
+		ContractVersion: executioncell.PreflightConfigRequirementContractVersion,
+		RequirementID:   "example.session-config/v1", AuthorityBindingDigest: strings.Repeat("c", 64),
+		OperationalPayloadDigest: operationalDigest,
+		Bindings: []executioncell.PreflightConfigBindingV1{{
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget,
+			Source: executioncell.PreflightConfigBindingSourceV1{
+				Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, Mode: executioncell.PreflightConfigPrivateFileMode,
+			},
+		}},
+	}
+	protectedRequirement := executioncell.ProtectedRuntimeMCPConfigRequirementV2{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
+		RequirementID:   "protected-runtime-mcp/v2", AuthorityBindingDigest: strings.Repeat("d", 64),
+		OperationalPayloadDigest: operationalDigest,
+		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
+		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
+			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
+		}},
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
+			Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, ConfigRequirementID: commonRequirement.RequirementID,
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget, Mode: executioncell.PreflightConfigPrivateFileMode,
+		},
+	}
+	base := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigest)}
+	provider := &orderedProtectedMCPV2PreflightProvider{
+		orderedConfigPreflightProvider: &orderedConfigPreflightProvider{
+			orderedPreflightProvider: base, requirements: []executioncell.PreflightConfigRequirementV1{commonRequirement},
+		},
+		requirementsV2: []executioncell.ProtectedRuntimeMCPConfigRequirementV2{protectedRequirement},
+	}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: func(request executioncell.PreflightRegistrationRequest) (executioncell.PreflightRegistrationResponse, error) {
+		receipt, decodeErr := base64.StdEncoding.DecodeString(request.ReceiptBytesBase64)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		host, decodeErr := executioncell.DecodeHostAdaptationReceipt(receipt)
+		if decodeErr != nil {
+			return executioncell.PreflightRegistrationResponse{}, decodeErr
+		}
+		if host.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(host.ConfigMaterializations) != 1 || len(host.ProtectedRuntimeMCPConfigs) != 0 || len(host.ProtectedRuntimeMCPConfigsV2) != 1 {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("registration did not receive joined protected runtime MCP v2")
+		}
+		joined := host.ProtectedRuntimeMCPConfigsV2[0].AuthorizationSource
+		if joined.ConfigReferenceDigest != host.ConfigMaterializations[0].ConfigReferenceDigest || joined.FileReferenceDigest != host.ConfigMaterializations[0].Bindings[0].FileReferenceDigest {
+			return executioncell.PreflightRegistrationResponse{}, errors.New("registered protected runtime MCP v2 did not bind actual common evidence")
+		}
+		return authorizedRegistration(request)
+	}}
+	var credentials atomic.Int32
+	marker := filepath.Join(t.TempDir(), "spawned")
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	d.opts.ProtectedRuntimeMCPHelperCommandBuilder = func(path string) (string, error) {
+		return "/example/donmai mcp gateway-headers --token-file " + path, nil
+	}
+	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err != nil {
+		t.Fatal(err)
+	}
+	mu.Lock()
+	gotOrder := slices.Clone(order)
+	mu.Unlock()
+	if strings.Join(gotOrder, ",") != "compile,requirements,protected-v2-requirements,fsync,register,credential" {
+		t.Fatalf("effect order = %v", gotOrder)
+	}
+	persisted, err := store.Load(detail.SessionID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(persisted)
+	if err != nil || len(host.ConfigMaterializations) != 1 || len(host.ProtectedRuntimeMCPConfigsV2) != 1 {
+		t.Fatalf("persisted v2 host receipt = %+v err=%v", host, err)
+	}
+}
+
+func TestRuntimeBindingV2RefusesAmbiguousProtectedMCPRequirementVersions(t *testing.T) {
+	var mu sync.Mutex
+	order := []string{}
+	detail, binding := v2Detail(t)
+	operationalDigest := operationalDigestFor(t, detail)
+	base := &orderedPreflightProvider{mu: &mu, order: &order, receipt: readyPreflightReceipt(t, binding, operationalDigest)}
+	v2Provider := &orderedProtectedMCPV2PreflightProvider{
+		orderedConfigPreflightProvider: &orderedConfigPreflightProvider{orderedPreflightProvider: base},
+		requirementsV2:                 []executioncell.ProtectedRuntimeMCPConfigRequirementV2{{RequirementID: "v2"}},
+	}
+	provider := &orderedAmbiguousProtectedMCPPreflightProvider{
+		orderedProtectedMCPV2PreflightProvider: v2Provider,
+		requirementsV1:                         []executioncell.ProtectedRuntimeMCPConfigRequirementV1{{RequirementID: "v1"}},
+	}
+	store := &orderedReplayStore{mu: &mu, order: &order, store: NewFileExecutionPreflightStore(t.TempDir())}
+	registrar := &orderedRegistrar{mu: &mu, order: &order, response: authorizedRegistration}
+	var credentials atomic.Int32
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, filepath.Join(t.TempDir(), "spawned"))
+	_, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail)
+	if err == nil || !strings.Contains(err.Error(), "requirement version is ambiguous") {
+		t.Fatalf("ambiguous version error = %v", err)
+	}
+	if registrar.calls.Load() != 0 || credentials.Load() != 0 {
+		t.Fatalf("effects after ambiguous version: registrar=%d credentials=%d", registrar.calls.Load(), credentials.Load())
 	}
 }
 

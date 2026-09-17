@@ -105,6 +105,10 @@ type Options struct {
 	// ExecutionPreflightConfigDir owns generic pre-registration config files.
 	// Empty selects the daemon state root. Existing callers remain source-compatible.
 	ExecutionPreflightConfigDir string
+	// ProtectedRuntimeMCPHelperCommandBuilder is a trusted process-owned seam
+	// that returns the exact helper command for an already-materialized token
+	// file. Nil refuses v2 protected materialization. It is never wire input.
+	ProtectedRuntimeMCPHelperCommandBuilder ProtectedRuntimeMCPHelperCommandBuilder
 
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
@@ -252,6 +256,11 @@ type Options struct {
 // only construct Options.
 type GitAuth func(ctx context.Context, repoURL string) (authHeader string, suppressHelper bool, err error)
 
+// ProtectedRuntimeMCPHelperCommandBuilder returns the exact UTF-8 helper
+// command for one absolute managed token-file path. Runtime wiring supplies the
+// real shared builder in a later unit; nil keeps v2 inactive.
+type ProtectedRuntimeMCPHelperCommandBuilder func(tokenFilePath string) (string, error)
+
 // PoolStatsProvider returns a workarea pool snapshot.
 type PoolStatsProvider interface {
 	Stats(ctx context.Context) (*afclient.WorkareaPoolStats, error)
@@ -304,6 +313,13 @@ type ExecutionPreflightConfigRequirementProvider interface {
 // one exact protected HTTP MCP configuration after host compilation.
 type ExecutionPreflightProtectedRuntimeMCPRequirementProvider interface {
 	ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error)
+}
+
+// ExecutionPreflightProtectedRuntimeMCPRequirementV2Provider additively
+// resolves the closed v2 requirement. A provider returning both revisions is
+// ambiguous and denied before materialization.
+type ExecutionPreflightProtectedRuntimeMCPRequirementV2Provider interface {
+	ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV2, error)
 }
 
 // ExecutionPreflightReplayValidator re-applies canonical sibling/profile
@@ -2166,9 +2182,20 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						return nil, fmt.Errorf("resolve execution preflight protected runtime MCP requirements: %w", err)
 					}
 				}
-				if (len(requirements) > 0 || len(protectedRequirements) > 0) && binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
+				var protectedRequirementsV2 []executioncell.ProtectedRuntimeMCPConfigRequirementV2
+				if provider, ok := d.opts.ProviderRegistry.(ExecutionPreflightProtectedRuntimeMCPRequirementV2Provider); ok {
+					protectedRequirementsV2, err = provider.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detailJSON, receipt)
+					if err != nil {
+						return nil, fmt.Errorf("resolve execution preflight protected runtime MCP v2 requirements: %w", err)
+					}
+				}
+				if len(protectedRequirements) > 0 && len(protectedRequirementsV2) > 0 {
+					return nil, errors.New("execution preflight protected runtime MCP requirement version is ambiguous")
+				}
+				if (len(requirements) > 0 || len(protectedRequirements) > 0 || len(protectedRequirementsV2) > 0) && binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion {
 					return nil, errors.New("execution preflight materialization requires registered runtime binding v2")
 				}
+				var configMaterializations []executioncell.PreflightConfigMaterializationV1
 				if len(requirements) > 0 {
 					if d.preflightConfigs == nil {
 						return nil, errors.New("execution preflight config ownership is unavailable")
@@ -2179,7 +2206,9 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						return nil, errors.New("execution preflight config generation is already owned")
 					}
 					configReserved = true
-					materializations, lease, materializeErr := materializeExecutionPreflightConfig(&spec, detail, requirements, d.opts.ExecutionPreflightConfigDir)
+					var lease preflightConfigLease
+					var materializeErr error
+					configMaterializations, lease, materializeErr = materializeExecutionPreflightConfig(&spec, detail, requirements, d.opts.ExecutionPreflightConfigDir)
 					if materializeErr != nil {
 						return nil, fmt.Errorf("materialize execution preflight config: %w", materializeErr)
 					}
@@ -2188,11 +2217,11 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						return nil, errors.New("complete execution preflight config ownership")
 					}
 					if replayedReceipt {
-						if (hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion && hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion) || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, materializations) {
+						if (hostReceipt.ContractVersion != executioncell.HostAdaptationV2ContractVersion && hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion) || !reflect.DeepEqual(hostReceipt.ConfigMaterializations, configMaterializations) {
 							return nil, errors.New("retained execution preflight config materialization changed")
 						}
 					} else {
-						receipt, err = hostReceiptWithConfigMaterializations(receipt, materializations)
+						receipt, err = hostReceiptWithConfigMaterializations(receipt, configMaterializations)
 						if err != nil {
 							return nil, fmt.Errorf("attach execution preflight config materializations: %w", err)
 						}
@@ -2205,6 +2234,13 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				if materializeErr != nil {
 					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP config: %w", materializeErr)
 				}
+				protectedMaterializationsV2, materializeErr := materializeProtectedRuntimeMCPConfigsV2(
+					detail, &spec, protectedRequirementsV2, configMaterializations,
+					d.opts.ProtectedRuntimeMCPHelperCommandBuilder,
+				)
+				if materializeErr != nil {
+					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP v2 config: %w", materializeErr)
+				}
 				switch {
 				case len(protectedRequirements) > 0:
 					if replayedReceipt {
@@ -2215,6 +2251,18 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 						receipt, err = hostReceiptWithProtectedRuntimeMCPConfigs(receipt, protectedMaterializations)
 						if err != nil {
 							return nil, fmt.Errorf("attach execution preflight protected runtime MCP materializations: %w", err)
+						}
+						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
+					}
+				case len(protectedRequirementsV2) > 0:
+					if replayedReceipt {
+						if hostReceipt.ContractVersion != executioncell.HostAdaptationV3ContractVersion || !reflect.DeepEqual(hostReceipt.ProtectedRuntimeMCPConfigsV2, protectedMaterializationsV2) {
+							return nil, errors.New("retained protected runtime MCP v2 materialization changed")
+						}
+					} else {
+						receipt, err = hostReceiptWithProtectedRuntimeMCPConfigsV2(receipt, protectedMaterializationsV2)
+						if err != nil {
+							return nil, fmt.Errorf("attach execution preflight protected runtime MCP v2 materializations: %w", err)
 						}
 						hostReceipt, _ = executioncell.DecodeHostAdaptationReceipt(receipt)
 					}

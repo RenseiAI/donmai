@@ -159,6 +159,158 @@ func TestMaterializeProtectedRuntimeMCPConfigBindsExactRuntimeWithoutSecrets(t *
 	}
 }
 
+func protectedRuntimeMCPV2MaterializationFixture(t *testing.T) (
+	*SessionDetail,
+	SessionSpec,
+	executioncell.ProtectedRuntimeMCPConfigRequirementV2,
+	[]executioncell.PreflightConfigMaterializationV1,
+	preflightConfigLease,
+) {
+	t.Helper()
+	token := "session-bearer-v2"
+	operational := json.RawMessage(`{"mcpAuthToken":"` + token + `"}`)
+	digest, err := executioncell.DigestOperationalPayload(operational)
+	if err != nil {
+		t.Fatal(err)
+	}
+	commonRequirement := executioncell.PreflightConfigRequirementV1{
+		ContractVersion: executioncell.PreflightConfigRequirementContractVersion,
+		RequirementID:   "example.session-config/v1", AuthorityBindingDigest: strings.Repeat("a", 64),
+		OperationalPayloadDigest: digest,
+		Bindings: []executioncell.PreflightConfigBindingV1{{
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget,
+			Source: executioncell.PreflightConfigBindingSourceV1{
+				Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, Mode: executioncell.PreflightConfigPrivateFileMode,
+			},
+		}},
+	}
+	detail := &SessionDetail{
+		SessionID: "session-protected-mcp-v2", PlatformURL: "https://platform.example/",
+		McpAuthToken: token, OperationalPayload: operational,
+	}
+	path := filepath.Join(t.TempDir(), "session-token")
+	if err := os.WriteFile(path, []byte(token), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	spec := SessionSpec{SessionID: detail.SessionID, Env: map[string]string{
+		executioncell.PreflightConfigSessionMCPBearerFileTarget: path,
+	}}
+	common, lease, err := materializeExecutionPreflightConfig(&spec, detail, []executioncell.PreflightConfigRequirementV1{commonRequirement}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV2{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
+		RequirementID:   "protected-runtime-mcp/v2", AuthorityBindingDigest: strings.Repeat("b", 64),
+		OperationalPayloadDigest: digest,
+		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
+		Headers:        []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + token)}},
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
+			Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, ConfigRequirementID: commonRequirement.RequirementID,
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget, Mode: executioncell.PreflightConfigPrivateFileMode,
+		},
+	}
+	return detail, spec, requirement, common, lease
+}
+
+func TestMaterializeProtectedRuntimeMCPV2JoinsActualCommonEvidence(t *testing.T) {
+	t.Parallel()
+	detail, spec, requirement, common, lease := protectedRuntimeMCPV2MaterializationFixture(t)
+	t.Cleanup(lease.cleanup)
+	build := func(path string) (string, error) {
+		return "/example/donmai mcp gateway-headers --token-file " + path, nil
+	}
+	materialized, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(materialized) != 1 || executioncell.ValidateProtectedRuntimeMCPConfigMaterializationV2(materialized[0]) != nil {
+		t.Fatalf("v2 materialization = %+v", materialized)
+	}
+	got := materialized[0].AuthorizationSource
+	wantBinding := common[0].Bindings[0]
+	if got.ConfigReferenceDigest != common[0].ConfigReferenceDigest || got.FileReferenceDigest != wantBinding.FileReferenceDigest || got.HelperCommandDigest != digestConfigValue(mustBuildHelperCommand(t, build, spec.Env[executioncell.PreflightConfigSessionMCPBearerFileTarget])) {
+		t.Fatalf("joined authorization source = %+v", got)
+	}
+	raw, err := json.Marshal(materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(raw), detail.McpAuthToken) || strings.Contains(string(raw), spec.Env[executioncell.PreflightConfigSessionMCPBearerFileTarget]) {
+		t.Fatalf("v2 materialization leaked bearer or path: %s", raw)
+	}
+	replayed, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build)
+	if err != nil || !reflect.DeepEqual(replayed, materialized) {
+		t.Fatalf("unchanged v2 replay = %+v err=%v", replayed, err)
+	}
+
+	binding := executioncell.RuntimeBinding{RequestID: detail.SessionID, WorkerID: "worker", PlacementID: "host"}
+	source := readyPreflightReceipt(t, binding, requirement.OperationalPayloadDigest)
+	v3, err := hostReceiptWithProtectedRuntimeMCPConfigsV2(source, materialized)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := executioncell.DecodeHostAdaptationReceipt(v3)
+	if err != nil || len(decoded.ProtectedRuntimeMCPConfigs) != 0 || len(decoded.ProtectedRuntimeMCPConfigsV2) != 1 {
+		t.Fatalf("v2 host receipt = %+v err=%v", decoded, err)
+	}
+}
+
+func mustBuildHelperCommand(t *testing.T, build ProtectedRuntimeMCPHelperCommandBuilder, path string) string {
+	t.Helper()
+	command, err := build(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return command
+}
+
+func TestMaterializeProtectedRuntimeMCPV2RefusesIncompleteOrChangedJoin(t *testing.T) {
+	t.Parallel()
+	detail, spec, requirement, common, lease := protectedRuntimeMCPV2MaterializationFixture(t)
+	t.Cleanup(lease.cleanup)
+	build := func(path string) (string, error) { return "helper --token-file " + path, nil }
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, nil); err == nil {
+		t.Fatal("nil trusted helper builder accepted")
+	}
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, nil, build); err == nil {
+		t.Fatal("missing actual common materialization accepted")
+	}
+	duplicate := append(append([]executioncell.PreflightConfigMaterializationV1(nil), common...), common...)
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicate, build); err == nil {
+		t.Fatal("duplicate common materialization accepted")
+	}
+	duplicateBindings := append([]executioncell.PreflightConfigMaterializationV1(nil), common...)
+	duplicateBindings[0].Bindings = append(append([]executioncell.PreflightConfigBindingMaterializationV1(nil), common[0].Bindings...), common[0].Bindings[0])
+	duplicateBindings[0].ConfigReferenceDigest, _ = executioncell.DigestPreflightConfigReference(duplicateBindings[0])
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicateBindings, build); err == nil {
+		t.Fatal("duplicate matching common file binding accepted")
+	}
+	changedSpec := spec
+	changedSpec.Env = map[string]string{}
+	for key, value := range spec.Env {
+		changedSpec.Env[key] = value
+	}
+	changedSpec.Env[executioncell.PreflightConfigSessionMCPBearerFileTarget] += ".changed"
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &changedSpec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build); err == nil {
+		t.Fatal("changed actual file reference accepted")
+	}
+	changedCommon := append([]executioncell.PreflightConfigMaterializationV1(nil), common...)
+	changedCommon[0].Bindings = append([]executioncell.PreflightConfigBindingMaterializationV1(nil), common[0].Bindings...)
+	changedCommon[0].Bindings[0].BearerContentDigest = strings.Repeat("9", 64)
+	changedCommon[0].ConfigReferenceDigest, _ = executioncell.DigestPreflightConfigReference(changedCommon[0])
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, changedCommon, build); err == nil {
+		t.Fatal("changed initial bearer evidence accepted")
+	}
+	changedRequirement := requirement
+	changedRequirement.Headers = append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...)
+	changedRequirement.Headers[0].ValueDigest = strings.Repeat("8", 64)
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{changedRequirement}, common, build); err == nil {
+		t.Fatal("changed initial Authorization evidence accepted")
+	}
+}
+
 func TestPreflightConfigCleanupIsGenerationSafe(t *testing.T) {
 	t.Parallel()
 	path := t.TempDir() + "/owned-token"
