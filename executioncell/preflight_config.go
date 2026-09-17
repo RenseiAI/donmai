@@ -20,10 +20,12 @@ const (
 	PreflightConfigSessionIDTarget                = "DONMAI_SESSION_ID"
 	PreflightConfigSessionMCPBearerFileTarget     = "MCP_GATEWAY_TOKEN_FILE" //nolint:gosec // G101: public environment name, never credential bytes.
 	PreflightConfigPrivateFileMode                = "0600"
-	// ProtectedRuntimeMCPConfigContractVersion identifies both the requirement
-	// and the digest-only materialization for one protected HTTP MCP server.
+	// ProtectedRuntimeMCPConfigContractVersion identifies the v1 requirement
+	// and digest-only materialization for one protected HTTP MCP server.
 	ProtectedRuntimeMCPConfigContractVersion = "execution-preflight-protected-mcp-config/v1"
-	ProtectedRuntimeMCPTransportHTTP         = "http"
+	// ProtectedRuntimeMCPConfigContractVersionV2 adds a closed authorization source.
+	ProtectedRuntimeMCPConfigContractVersionV2 = "execution-preflight-protected-mcp-config/v2"
+	ProtectedRuntimeMCPTransportHTTP           = "http"
 )
 
 // ProtectedRuntimeMCPHeaderV1 binds one HTTP header name to the digest of its
@@ -58,6 +60,57 @@ type ProtectedRuntimeMCPConfigMaterializationV1 struct {
 	EndpointDigest           string                        `json:"endpointDigest"`
 	Headers                  []ProtectedRuntimeMCPHeaderV1 `json:"headers"`
 	ConfigReferenceDigest    string                        `json:"configReferenceDigest"`
+}
+
+// ProtectedRuntimeMCPAuthorizationSourceV2 identifies the common private-file
+// requirement that a protected v2 configuration must join during materialization.
+type ProtectedRuntimeMCPAuthorizationSourceV2 struct {
+	Kind                string `json:"kind"`
+	ConfigRequirementID string `json:"configRequirementId"`
+	TargetEnv           string `json:"targetEnv"`
+	Mode                string `json:"mode"`
+}
+
+// ProtectedRuntimeMCPAuthorizationSourceMaterializationV2 is structural,
+// digest-only evidence. Its validity does not prove that the referenced common
+// materialization or file binding exists; the runtime join must prove that.
+type ProtectedRuntimeMCPAuthorizationSourceMaterializationV2 struct {
+	Kind                  string `json:"kind"`
+	ConfigRequirementID   string `json:"configRequirementId"`
+	TargetEnv             string `json:"targetEnv"`
+	Mode                  string `json:"mode"`
+	ConfigReferenceDigest string `json:"configReferenceDigest"`
+	FileReferenceDigest   string `json:"fileReferenceDigest"`
+	HelperCommandDigest   string `json:"helperCommandDigest"`
+}
+
+// ProtectedRuntimeMCPConfigRequirementV2 retains the v1 protected-server
+// projection and identifies its sole permitted authorization source.
+type ProtectedRuntimeMCPConfigRequirementV2 struct {
+	ContractVersion          string                                   `json:"contractVersion"`
+	RequirementID            string                                   `json:"requirementId"`
+	AuthorityBindingDigest   string                                   `json:"authorityBindingDigest"`
+	OperationalPayloadDigest string                                   `json:"operationalPayloadDigest"`
+	ServerName               string                                   `json:"serverName"`
+	Transport                string                                   `json:"transport"`
+	EndpointDigest           string                                   `json:"endpointDigest"`
+	Headers                  []ProtectedRuntimeMCPHeaderV1            `json:"headers"`
+	AuthorizationSource      ProtectedRuntimeMCPAuthorizationSourceV2 `json:"authorizationSource"`
+}
+
+// ProtectedRuntimeMCPConfigMaterializationV2 binds the complete protected
+// projection, including structural references to common config and helper evidence.
+type ProtectedRuntimeMCPConfigMaterializationV2 struct {
+	ContractVersion          string                                                  `json:"contractVersion"`
+	RequirementID            string                                                  `json:"requirementId"`
+	AuthorityBindingDigest   string                                                  `json:"authorityBindingDigest"`
+	OperationalPayloadDigest string                                                  `json:"operationalPayloadDigest"`
+	ServerName               string                                                  `json:"serverName"`
+	Transport                string                                                  `json:"transport"`
+	EndpointDigest           string                                                  `json:"endpointDigest"`
+	Headers                  []ProtectedRuntimeMCPHeaderV1                           `json:"headers"`
+	AuthorizationSource      ProtectedRuntimeMCPAuthorizationSourceMaterializationV2 `json:"authorizationSource"`
+	ConfigReferenceDigest    string                                                  `json:"configReferenceDigest"`
 }
 
 var (
@@ -223,10 +276,11 @@ func ValidatePreflightConfigMaterializations(values []PreflightConfigMaterializa
 }
 
 func validateProtectedRuntimeMCPConfig(
+	expectedContractVersion string,
 	contractVersion, requirementID, authorityDigest, operationalDigest, serverName, transport, endpointDigest string,
 	headers []ProtectedRuntimeMCPHeaderV1,
 ) error {
-	if contractVersion != ProtectedRuntimeMCPConfigContractVersion || !preflightRequirementID.MatchString(requirementID) {
+	if contractVersion != expectedContractVersion || !preflightRequirementID.MatchString(requirementID) {
 		return errors.New("executioncell: invalid protected runtime MCP config identity")
 	}
 	if !validSHA256(authorityDigest) || !validSHA256(operationalDigest) || !validSHA256(endpointDigest) {
@@ -250,6 +304,7 @@ func validateProtectedRuntimeMCPConfig(
 // HTTP MCP requirement without accepting raw endpoint or header values.
 func ValidateProtectedRuntimeMCPConfigRequirement(value ProtectedRuntimeMCPConfigRequirementV1) error {
 	return validateProtectedRuntimeMCPConfig(
+		ProtectedRuntimeMCPConfigContractVersion,
 		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
 		value.OperationalPayloadDigest, value.ServerName, value.Transport,
 		value.EndpointDigest, value.Headers,
@@ -273,6 +328,7 @@ func DigestProtectedRuntimeMCPConfigReference(value ProtectedRuntimeMCPConfigMat
 // protected server materialization.
 func ValidateProtectedRuntimeMCPConfigMaterialization(value ProtectedRuntimeMCPConfigMaterializationV1) error {
 	if err := validateProtectedRuntimeMCPConfig(
+		ProtectedRuntimeMCPConfigContractVersion,
 		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
 		value.OperationalPayloadDigest, value.ServerName, value.Transport,
 		value.EndpointDigest, value.Headers,
@@ -282,6 +338,72 @@ func ValidateProtectedRuntimeMCPConfigMaterialization(value ProtectedRuntimeMCPC
 	expected, err := DigestProtectedRuntimeMCPConfigReference(value)
 	if err != nil || value.ConfigReferenceDigest != expected {
 		return errors.New("executioncell: protected runtime MCP config reference digest mismatch")
+	}
+	return nil
+}
+
+func validateProtectedRuntimeMCPAuthorizationSourceV2(value ProtectedRuntimeMCPAuthorizationSourceV2) error {
+	if value.Kind != PreflightConfigSourceSessionMCPBearerFile ||
+		!preflightRequirementID.MatchString(value.ConfigRequirementID) ||
+		value.TargetEnv != PreflightConfigSessionMCPBearerFileTarget ||
+		value.Mode != PreflightConfigPrivateFileMode {
+		return errors.New("executioncell: protected runtime MCP v2 authorization source is invalid")
+	}
+	return nil
+}
+
+// ValidateProtectedRuntimeMCPConfigRequirementV2 validates the closed v2
+// requirement shape. It does not perform the runtime common-materialization join.
+func ValidateProtectedRuntimeMCPConfigRequirementV2(value ProtectedRuntimeMCPConfigRequirementV2) error {
+	if err := validateProtectedRuntimeMCPConfig(
+		ProtectedRuntimeMCPConfigContractVersionV2,
+		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
+		value.OperationalPayloadDigest, value.ServerName, value.Transport,
+		value.EndpointDigest, value.Headers,
+	); err != nil {
+		return err
+	}
+	return validateProtectedRuntimeMCPAuthorizationSourceV2(value.AuthorizationSource)
+}
+
+// DigestProtectedRuntimeMCPConfigReferenceV2 binds every v2 materialization
+// field except the outer self-digest. Nested reference digests remain bound.
+func DigestProtectedRuntimeMCPConfigReferenceV2(value ProtectedRuntimeMCPConfigMaterializationV2) (string, error) {
+	projection := value
+	projection.ConfigReferenceDigest = ""
+	raw, err := CanonicalJSON(projection)
+	if err != nil {
+		return "", err
+	}
+	sum := sha256.Sum256(raw)
+	return hex.EncodeToString(sum[:]), nil
+}
+
+// ValidateProtectedRuntimeMCPConfigMaterializationV2 validates structural v2
+// evidence and its self-digest. It does not establish runtime authorization;
+// callers must separately join and verify the actual common materialization.
+func ValidateProtectedRuntimeMCPConfigMaterializationV2(value ProtectedRuntimeMCPConfigMaterializationV2) error {
+	if err := validateProtectedRuntimeMCPConfig(
+		ProtectedRuntimeMCPConfigContractVersionV2,
+		value.ContractVersion, value.RequirementID, value.AuthorityBindingDigest,
+		value.OperationalPayloadDigest, value.ServerName, value.Transport,
+		value.EndpointDigest, value.Headers,
+	); err != nil {
+		return err
+	}
+	source := value.AuthorizationSource
+	if err := validateProtectedRuntimeMCPAuthorizationSourceV2(ProtectedRuntimeMCPAuthorizationSourceV2{
+		Kind: source.Kind, ConfigRequirementID: source.ConfigRequirementID,
+		TargetEnv: source.TargetEnv, Mode: source.Mode,
+	}); err != nil {
+		return err
+	}
+	if !validSHA256(source.ConfigReferenceDigest) || !validSHA256(source.FileReferenceDigest) || !validSHA256(source.HelperCommandDigest) {
+		return errors.New("executioncell: protected runtime MCP v2 authorization source digests are invalid")
+	}
+	expected, err := DigestProtectedRuntimeMCPConfigReferenceV2(value)
+	if err != nil || value.ConfigReferenceDigest != expected {
+		return errors.New("executioncell: protected runtime MCP v2 config reference digest mismatch")
 	}
 	return nil
 }

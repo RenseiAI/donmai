@@ -1,0 +1,146 @@
+{
+  "version": 1,
+  "description": "Canonical protected HTTP MCP v1 compatibility and v2 structural codec vectors. A structurally valid materialization does not prove that referenced common materialization or file evidence exists; runtime authorization requires the separate exact join.",
+  "vectors": [
+    {
+      "name": "v1-requirement-baseline",
+      "decoder": "requirement-v1",
+      "json": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v1\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": true,
+      "expectedCanonicalJson": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v1\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}"
+    },
+    {
+      "name": "v1-materialization-baseline",
+      "decoder": "materialization-v1",
+      "json": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configReferenceDigest\":\"50988e81f1db1904ee96b07c8d5bab3aa31e850c00854c7d42ae52e8342c4124\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v1\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": true,
+      "expectedCanonicalJson": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configReferenceDigest\":\"50988e81f1db1904ee96b07c8d5bab3aa31e850c00854c7d42ae52e8342c4124\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v1\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "expectedReferenceDigest": "50988e81f1db1904ee96b07c8d5bab3aa31e850c00854c7d42ae52e8342c4124"
+    },
+    {
+      "name": "v1-requirement-with-authorization-source",
+      "decoder": "requirement-v1",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"requirementId\":\"example.protected-runtime-mcp/v1\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement",
+      "decoder": "requirement-v2",
+      "json": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configRequirementId\":\"example.session-config/v1\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": true,
+      "expectedCanonicalJson": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configRequirementId\":\"example.session-config/v1\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}"
+    },
+    {
+      "name": "v2-materialization",
+      "decoder": "materialization-v2",
+      "json": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configReferenceDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"configRequirementId\":\"example.session-config/v1\",\"fileReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"helperCommandDigest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"configReferenceDigest\":\"143d5dfbdd70dba234ca336fb0f780ad84d471b5bbba473ce325138a3f8eef10\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": true,
+      "expectedCanonicalJson": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configReferenceDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"configRequirementId\":\"example.session-config/v1\",\"fileReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"helperCommandDigest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"configReferenceDigest\":\"143d5dfbdd70dba234ca336fb0f780ad84d471b5bbba473ce325138a3f8eef10\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "expectedReferenceDigest": "143d5dfbdd70dba234ca336fb0f780ad84d471b5bbba473ce325138a3f8eef10"
+    },
+    {
+      "name": "v2-materialization-fabricated-references-structurally-valid",
+      "decoder": "materialization-v2",
+      "json": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configReferenceDigest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"configRequirementId\":\"example.session-config/fabricated\",\"fileReferenceDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"helperCommandDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"configReferenceDigest\":\"f8150def1f523bdf9ed4174a4f01e9e275cd9b441448f6127ce723d933ac2acd\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/fabricated\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": true,
+      "expectedCanonicalJson": "{\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"authorizationSource\":{\"configReferenceDigest\":\"1111111111111111111111111111111111111111111111111111111111111111\",\"configRequirementId\":\"example.session-config/fabricated\",\"fileReferenceDigest\":\"2222222222222222222222222222222222222222222222222222222222222222\",\"helperCommandDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"configReferenceDigest\":\"f8150def1f523bdf9ed4174a4f01e9e275cd9b441448f6127ce723d933ac2acd\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/fabricated\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "expectedReferenceDigest": "f8150def1f523bdf9ed4174a4f01e9e275cd9b441448f6127ce723d933ac2acd"
+    },
+    {
+      "name": "v2-requirement-missing-authorization-source",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}]}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-unknown-outer-field",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"},\"unexpected\":true}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-unknown-source-field",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\",\"unexpected\":true}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-wrong-version",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v1\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-wrong-source-kind",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"operational_environment\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-wrong-target",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"OTHER_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-wrong-mode",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0644\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-duplicate-header",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"},{\"name\":\"Authorization\",\"valueDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-unsorted-headers",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"X-Trace\",\"valueDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\"},{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-materialization-missing-helper-digest",
+      "decoder": "materialization-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\",\"configReferenceDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"fileReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\"},\"configReferenceDigest\":\"2f4eb9a70d6f3e4fb6e4d81ec4c86f7f6ee279e04fd4462f0e5aa6895fe35b37\"}",
+      "valid": false
+    },
+    {
+      "name": "v2-materialization-stale-outer-after-helper-change",
+      "decoder": "materialization-v2",
+      "json": "{\"authorizationSource\":{\"configReferenceDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"configRequirementId\":\"example.session-config/v1\",\"fileReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"helperCommandDigest\":\"3333333333333333333333333333333333333333333333333333333333333333\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configReferenceDigest\":\"2f4eb9a70d6f3e4fb6e4d81ec4c86f7f6ee279e04fd4462f0e5aa6895fe35b37\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": false
+    },
+    {
+      "name": "v2-materialization-duplicate-field",
+      "decoder": "materialization-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\"}",
+      "valid": false
+    },
+    {
+      "name": "v2-materialization-trailing-json",
+      "decoder": "materialization-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\"}{}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-null-authorization-source",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":null}",
+      "valid": false
+    },
+    {
+      "name": "v2-requirement-invalid-authority-digest",
+      "decoder": "requirement-v2",
+      "json": "{\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"authorityBindingDigest\":\"not-a-digest\",\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"serverName\":\"example-gateway\",\"transport\":\"http\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"authorizationSource\":{\"kind\":\"session_mcp_bearer_file\",\"configRequirementId\":\"example.session-config/v1\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\",\"mode\":\"0600\"}}",
+      "valid": false
+    },
+    {
+      "name": "v2-materialization-invalid-outer-digest",
+      "decoder": "materialization-v2",
+      "json": "{\"authorizationSource\":{\"configReferenceDigest\":\"eeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeeee\",\"configRequirementId\":\"example.session-config/v1\",\"fileReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"helperCommandDigest\":\"0000000000000000000000000000000000000000000000000000000000000000\",\"kind\":\"session_mcp_bearer_file\",\"mode\":\"0600\",\"targetEnv\":\"MCP_GATEWAY_TOKEN_FILE\"},\"authorityBindingDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"configReferenceDigest\":\"ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff\",\"contractVersion\":\"execution-preflight-protected-mcp-config/v2\",\"endpointDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\",\"headers\":[{\"name\":\"Authorization\",\"valueDigest\":\"dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd\"}],\"operationalPayloadDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"requirementId\":\"example.protected-runtime-mcp/v2\",\"serverName\":\"example-gateway\",\"transport\":\"http\"}",
+      "valid": false
+    }
+  ]
+}
