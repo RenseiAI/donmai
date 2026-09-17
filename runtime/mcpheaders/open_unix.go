@@ -15,7 +15,7 @@ func openBearerFileNoFollow(path string) (*os.File, os.FileInfo, error) {
 	if err != nil {
 		return nil, nil, err
 	}
-	file := os.NewFile(uintptr(fd), path)
+	file := os.NewFile(uintptr(fd), path) //nolint:gosec // G115: successful unix.Open returns a nonnegative OS descriptor representable as uintptr.
 	info, err := file.Stat()
 	if err != nil {
 		_ = file.Close()
