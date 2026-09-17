@@ -122,6 +122,9 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// and the PTY itself both run under this same CODEX_HOME, so this one
 	// call covers the cold-fetch cost for both.
 	config.enablePluginCacheReuse(resolveCodexPluginCacheDir(""))
+	if err := pinProtectedMCPFileStore(config.configPath, spec.MCPServers); err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), config.remove())
+	}
 	if launch.env == nil {
 		launch.env = make(map[string]string)
 	}
@@ -142,6 +145,9 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
 			config.remove(),
 		)
+	}
+	if err := refuseProtectedMCPStoredOAuth(config.home, spec.MCPServers); err != nil {
+		return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), config.remove())
 	}
 	// The verified private store is now the sole child authority. Empty values
 	// deliberately override inherited parent credentials in both the effective
@@ -517,6 +523,16 @@ func codexCLIMCPOverride(servers []agent.MCPServerConfig, env map[string]string,
 		case "http":
 			body.WriteString("\"url\"=")
 			body.WriteString(tomlBasicString(server.URL))
+			helper, hasHelper := agent.ProtectedRuntimeMCPHeadersHelper(server)
+			if hasHelper {
+				for name := range server.Headers {
+					if strings.EqualFold(name, "Authorization") {
+						return "", nil, codexMCPApplicationError("MCP header helper conflicts with explicit Authorization")
+					}
+				}
+				body.WriteString(",\"http_headers_helper\"=")
+				body.WriteString(tomlBasicString(helper))
+			}
 			if len(server.Headers) > 0 {
 				headers := sortedStringKeys(server.Headers)
 				body.WriteString(",\"env_http_headers\"={")
@@ -611,11 +627,16 @@ func tomlStringArray(values []string) string {
 }
 
 func persistInteractiveMCPApplicationDenial(spec agent.Spec, applicationErr error) error {
+	profile, ok := agent.SelectedToolLifecycleProfile(spec, (&Provider{}).Manifest())
+	if !ok {
+		profile = agent.ToolLifecycleProfile{ID: "codex/interactive/tool-lifecycle-v1", EvidenceTier: "unit_verified"}
+	}
 	receipt := agent.ToolLifecycleReceipt{
-		ContractVersion: agent.ToolLifecycleContractVersion,
-		ProfileID:       "codex/interactive/tool-lifecycle-v1",
-		Decision:        "denied",
-		EvidenceTier:    "unit_verified",
+		ContractVersion:    agent.ToolLifecycleContractVersion,
+		ProfileID:          profile.ID,
+		Decision:           "denied",
+		EvidenceTier:       profile.EvidenceTier,
+		ProductionEligible: profile.ProductionEligible,
 		Entries: []agent.ToolLifecycleEntry{{
 			ID:         "mcp-servers",
 			Channel:    agent.ToolChannelMCPServer,

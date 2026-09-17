@@ -139,7 +139,7 @@ func CompilePreparedHarness(spec Spec, manifest HarnessManifest, operationalDige
 	if promptErr != nil {
 		return plan, promptErr
 	}
-	toolProfile, ok := manifest.ToolLifecycleProfile(mode)
+	toolProfile, ok := SelectedToolLifecycleProfile(spec, manifest)
 	if !ok {
 		return plan, &ToolAdaptationError{Code: ToolDenialDeliveryUnsupported, Detail: "manifest has no tool/lifecycle profile for admitted session mode"}
 	}
@@ -178,9 +178,12 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	if err != nil || !equalJSON(promptReceipt, plan.PromptReceipt) {
 		return spec, errors.New("agent: prompt application differs from host adaptation receipt")
 	}
-	toolProfile, ok := manifest.ToolLifecycleProfile(plan.Mode)
+	toolProfile, ok := manifest.ToolLifecycleProfileByID(plan.ToolLifecycleReceipt.ProfileID, plan.Mode)
 	if !ok {
 		return spec, errors.New("agent: prepared tool/lifecycle profile is no longer available")
+	}
+	if selected := ToolLifecycleProfileID(spec); selected != "" && selected != toolProfile.ID {
+		return spec, errors.New("agent: prepared tool/lifecycle profile differs from process selection")
 	}
 	normalized := normalizeHarnessAuthoritySpec(adapted, plan)
 	_, toolReceipt, err := AdaptToolLifecycle(normalized, toolProfile)
@@ -212,6 +215,7 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	// receipt refused (the recompute matching byte-for-byte proves the drop
 	// decision is the same one the host made).
 	adapted = dropDeniedAdvisoryExtensions(adapted, plan.ToolLifecycleReceipt.Entries)
+	adapted = WithToolLifecycleProfile(adapted, toolProfile.ID)
 	adapted.PromptReceipt = copyPromptReceipt(&plan.PromptReceipt)
 	adapted.ToolLifecycleReceipt = copyToolReceipt(&plan.ToolLifecycleReceipt)
 	return adapted, nil
@@ -392,6 +396,7 @@ func normalizeRuntimeMCPServer(server MCPServerConfig) MCPServerConfig {
 	server.Env = nil
 	server.URL = "https://runtime.invalid"
 	server.Headers = nil
+	server.protectedRuntimeMCPHeadersHelper = ""
 	return server
 }
 

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -48,15 +49,18 @@ func TestPrepareSessionMCPBearerEnv_MaterializesSessionTokenForChild(t *testing.
 
 	env := map[string]string{}
 	qw := QueuedWork{McpAuthToken: "  session-bearer-exact\n"}
-	cleanup, err := prepareSessionMCPBearerEnv(qw, env, "")
+	prepared, err := prepareSessionMCPBearerEnv(qw, env, "")
 	if err != nil {
 		t.Fatalf("prepareSessionMCPBearerEnv: %v", err)
 	}
-	t.Cleanup(cleanup)
+	t.Cleanup(prepared.Cleanup)
 
 	path := env[mcpGatewayTokenFileEnv]
 	if path == "" {
 		t.Fatalf("env missing %s", mcpGatewayTokenFileEnv)
+	}
+	if prepared.Path != path {
+		t.Fatalf("returned path = %q, env path = %q", prepared.Path, path)
 	}
 	raw, err := os.ReadFile(path)
 	if err != nil {
@@ -73,7 +77,7 @@ func TestPrepareSessionMCPBearerEnv_MaterializesSessionTokenForChild(t *testing.
 		t.Fatalf("bootstrap bearer mode = %o, want 600", got)
 	}
 
-	cleanup()
+	prepared.Cleanup()
 	if _, err := os.Stat(path); !os.IsNotExist(err) {
 		t.Fatalf("bootstrap bearer still exists after cleanup: %v", err)
 	}
@@ -83,17 +87,21 @@ func TestPrepareSessionMCPBearerEnv_ExistingRefreshFileWins(t *testing.T) {
 	t.Parallel()
 
 	env := map[string]string{"UNCHANGED": "yes"}
-	cleanup, err := prepareSessionMCPBearerEnv(
+	existing := filepath.Join(t.TempDir(), "mcp-token")
+	if err := os.WriteFile(existing, []byte("rotating-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	prepared, err := prepareSessionMCPBearerEnv(
 		QueuedWork{McpAuthToken: "session-bearer-must-not-be-projected"},
 		env,
-		" /daemon/session/mcp-token ",
+		existing,
 	)
 	if err != nil {
 		t.Fatalf("prepareSessionMCPBearerEnv: %v", err)
 	}
-	cleanup()
-	if _, ok := env[mcpGatewayTokenFileEnv]; ok {
-		t.Fatalf("runner overrode the daemon-owned %s path: %v", mcpGatewayTokenFileEnv, env)
+	prepared.Cleanup()
+	if got := env[mcpGatewayTokenFileEnv]; got != existing || prepared.Path != existing {
+		t.Fatalf("runner did not preserve daemon-owned %s path: prepared=%+v env=%v", mcpGatewayTokenFileEnv, prepared, env)
 	}
 	if env["UNCHANGED"] != "yes" {
 		t.Fatalf("unrelated env changed: %v", env)
@@ -104,7 +112,7 @@ func TestPrepareSessionMCPBearerEnv_DoesNotProjectWorkerBearer(t *testing.T) {
 	t.Parallel()
 
 	env := map[string]string{}
-	cleanup, err := prepareSessionMCPBearerEnv(
+	prepared, err := prepareSessionMCPBearerEnv(
 		QueuedWork{AuthToken: "worker-runtime-bearer", McpAuthToken: " \t"},
 		env,
 		"",
@@ -112,7 +120,7 @@ func TestPrepareSessionMCPBearerEnv_DoesNotProjectWorkerBearer(t *testing.T) {
 	if err != nil {
 		t.Fatalf("prepareSessionMCPBearerEnv: %v", err)
 	}
-	cleanup()
+	prepared.Cleanup()
 	if _, ok := env[mcpGatewayTokenFileEnv]; ok {
 		t.Fatalf("worker bearer was projected onto the session bearer rail: %v", env)
 	}

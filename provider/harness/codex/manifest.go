@@ -5,6 +5,11 @@ import "github.com/RenseiAI/donmai/agent"
 // Compile-time assertion: the codex provider satisfies HarnessProvider.
 var _ agent.HarnessProvider = (*Provider)(nil)
 
+// InteractiveRefreshableToolLifecycleProfileID is the additive native-proved
+// Codex profile for helper-backed HTTP MCP. The historical v1 profile remains
+// the default for human-controlled sessions.
+const InteractiveRefreshableToolLifecycleProfileID = "codex/interactive/tool-lifecycle-v2"
+
 // Manifest returns the harness-family declaration for the Codex loop-driver.
 // Additive alongside Capabilities(); the agent-loop bools project
 // Capabilities() (parity-tested). codex runs the `codex` app-server as a
@@ -90,6 +95,18 @@ func (*Provider) Manifest() agent.HarnessManifest {
 				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
 				FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
 				EvidenceTier:       "unit_verified",
+			},
+			{
+				ID: InteractiveRefreshableToolLifecycleProfileID, Mode: agent.PromptModeHumanControlled,
+				ToolPluginDelivery: agent.ToolDeliveryUnsupported, MCPDelivery: agent.ToolDeliveryCodexCLIMCPConfig,
+				NativeToolPolicyDelivery: agent.ToolDeliveryUnsupported, PermissionConfigDelivery: agent.ToolDeliveryUnsupported,
+				MCPToolPolicyDelivery: agent.ToolDeliveryUnsupported, ToolHookDelivery: agent.ToolDeliveryUnsupported,
+				LifecycleDelivery: agent.ToolDeliveryCoarsePTYEvents, LifecycleFidelity: agent.EvidenceCoarse, LifecycleEvents: ptyEvents,
+				ReplayDelivery: agent.ToolDeliveryTerminalCastReplay, ReplayFidelity: agent.EvidenceCoarse, ReplayEvents: ptyEvents,
+				CleanupDelivery:    agent.ToolDeliveryHandleCleanup,
+				FallbackDeliveries: []agent.ToolDeliveryKind{agent.ToolDeliveryCoarsePTYEvents, agent.ToolDeliveryTerminalCastReplay},
+				EvidenceTier:       "native_verified",
+				ProductionEligible: true,
 			},
 		},
 	}

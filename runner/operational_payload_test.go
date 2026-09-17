@@ -145,7 +145,8 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		"PermissionProfile": "projected", "Env": "projected",
 		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
-		"WorkerID": "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",
+		"toolLifecycleProfileID": "execution-sidecar",
+		"WorkerID":               "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",
 		// The session-scoped MCP bearer and its advisory expiry are runtime
 		// credentials, classified beside AuthToken: the daemon supplies them
 		// per spawn and they must stay OUT of the canonical projection, which

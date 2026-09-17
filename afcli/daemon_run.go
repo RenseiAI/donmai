@@ -19,10 +19,19 @@ import (
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
+	"github.com/RenseiAI/donmai/runtime/mcpheaders"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
+
+func protectedRuntimeMCPHelperCommand(tokenFilePath string) (string, error) {
+	executable, err := mcpheaders.ResolveExecutablePath()
+	if err != nil {
+		return "", err
+	}
+	return mcpheaders.BuildHelperCommand(executable, tokenFilePath)
+}
 
 // logRotateCheckInterval is how often a long-lived `host run` process
 // re-checks the launchd-managed log files for rotation.
@@ -97,13 +106,12 @@ var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 // (e.g. ollama not running) emit WARN logs but do not block daemon start.
 func daemonProviderView(cfg Config, logger *slog.Logger) (*runner.ProviderView, error) {
 	providerReg := daemonRegistryBuilder(logger, cfg.AgentSpecExtensionDecorator)
-	return runner.NewProviderViewWithProtectedRuntimeMCP(
-		providerReg,
-		cfg.AgentSpecExtensionDecorator,
-		cfg.CapabilityRealizations,
-		nil,
-		cfg.ProtectedRuntimeMCPSelector,
-	)
+	return runner.NewProviderViewWithOptions(providerReg, runner.ProviderViewOptions{
+		Decorator:                     cfg.AgentSpecExtensionDecorator,
+		CapabilityRealizations:        cfg.CapabilityRealizations,
+		ProtectedRuntimeMCPSelector:   cfg.ProtectedRuntimeMCPSelector,
+		ProtectedRuntimeMCPV2Selector: cfg.ProtectedRuntimeMCPV2Selector,
+	})
 }
 
 // newDaemonRunCmd constructs the `host run` subcommand. This is the
@@ -225,8 +233,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				ProviderRegistry: providerView,
 				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
 					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
-				SpawnerOptions: spawnerOpts,
-				Version:        hostVersion,
+				ProtectedRuntimeMCPHelperCommandBuilder: protectedRuntimeMCPHelperCommand,
+				SpawnerOptions:                          spawnerOpts,
+				Version:                                 hostVersion,
 			})
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()

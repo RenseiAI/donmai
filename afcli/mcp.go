@@ -11,6 +11,7 @@ import (
 	"github.com/spf13/cobra"
 
 	mcpserver "github.com/RenseiAI/donmai/runtime/mcp/server"
+	"github.com/RenseiAI/donmai/runtime/mcpheaders"
 )
 
 // newMCPCmd constructs the `donmai mcp` command group. It hosts the
@@ -28,6 +29,34 @@ repository or worktree rooted at an explicit absolute path. See
 client configuration guidance.`,
 	}
 	cmd.AddCommand(newMCPCodeIntelCmd(cfg))
+	cmd.AddCommand(newMCPGatewayHeadersCmd())
+	return cmd
+}
+
+func newMCPGatewayHeadersCmd() *cobra.Command {
+	var tokenFile string
+	cmd := &cobra.Command{
+		Use:    "gateway-headers",
+		Hidden: true,
+		// The embedding root may use persistent hooks for auth, config, or
+		// network-backed profile loading. This leaf is a pure local credential
+		// helper and must replace those inherited hooks without exempting the
+		// visible mcp group or any sibling command.
+		PersistentPreRunE:  func(*cobra.Command, []string) error { return nil },
+		PersistentPostRunE: func(*cobra.Command, []string) error { return nil },
+		Args:               cobra.NoArgs,
+		SilenceUsage:       true,
+		RunE: func(cmd *cobra.Command, _ []string) error {
+			raw, err := mcpheaders.ReadAuthorizationJSON(tokenFile)
+			if err != nil {
+				return err
+			}
+			_, err = fmt.Fprintln(cmd.OutOrStdout(), string(raw))
+			return err
+		},
+	}
+	cmd.Flags().StringVar(&tokenFile, "token-file", "", "absolute private bearer file")
+	_ = cmd.MarkFlagRequired("token-file")
 	return cmd
 }
 

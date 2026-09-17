@@ -9,6 +9,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -295,6 +296,34 @@ type MCPServerConfig struct {
 	// Headers are HTTP headers to send on every MCP request. Typically
 	// holds the Authorization bearer for the platform's MCP route.
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// protectedRuntimeMCPHeadersHelper is process-owned spawn authority. It is
+	// deliberately absent from every serialized representation.
+	protectedRuntimeMCPHeadersHelper string
+}
+
+// WithProtectedRuntimeMCPHeadersHelper returns a copied HTTP server carrying
+// one process-owned native header-helper command.
+func WithProtectedRuntimeMCPHeadersHelper(server MCPServerConfig, command string) (MCPServerConfig, error) {
+	if server.Type != "http" || strings.TrimSpace(server.URL) == "" {
+		return MCPServerConfig{}, errors.New("protected runtime MCP header helper requires an HTTP server")
+	}
+	if strings.TrimSpace(command) == "" {
+		return MCPServerConfig{}, errors.New("protected runtime MCP header helper command is empty")
+	}
+	for name := range server.Headers {
+		if strings.EqualFold(name, "Authorization") {
+			return MCPServerConfig{}, errors.New("protected runtime MCP header helper conflicts with Authorization")
+		}
+	}
+	server.protectedRuntimeMCPHeadersHelper = command
+	return server, nil
+}
+
+// ProtectedRuntimeMCPHeadersHelper reports process-owned helper authority.
+func ProtectedRuntimeMCPHeadersHelper(server MCPServerConfig) (string, bool) {
+	command := server.protectedRuntimeMCPHeadersHelper
+	return command, command != ""
 }
 
 // PermissionConfig is the runtime permission policy for the codex
@@ -341,6 +370,11 @@ type CodeIntelEnforcement struct {
 // Source: ../donmai-libraries/packages/core/src/providers/types.ts
 // (AgentSpawnConfig).
 type Spec struct {
+	// toolLifecycleProfileID is process-owned adapter selection. It never
+	// travels on the session wire; prepared receipts retain the selected public
+	// profile identity as ordinary digest-only authority.
+	toolLifecycleProfileID string
+
 	// PromptMode is the admitted session mode. Empty retains the legacy
 	// Interactive-derived mode for non-receipted callers.
 	PromptMode PromptSessionMode `json:"promptMode,omitempty"`
@@ -599,6 +633,17 @@ type Spec struct {
 	// only the exact profile's ToolPluginDelivery answers the question.
 	AdditionalExtensions []ExtensionDelivery `json:"additionalExtensions,omitempty"`
 }
+
+// WithToolLifecycleProfile returns a copy selecting one manifest-declared
+// tool lifecycle profile. Selection is process-only and fails later if the
+// exact profile is unavailable for the Spec's mode.
+func WithToolLifecycleProfile(spec Spec, profileID string) Spec {
+	spec.toolLifecycleProfileID = profileID
+	return spec
+}
+
+// ToolLifecycleProfileID reports the process-selected profile identity.
+func ToolLifecycleProfileID(spec Spec) string { return spec.toolLifecycleProfileID }
 
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.
 //

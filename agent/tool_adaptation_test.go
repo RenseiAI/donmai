@@ -43,7 +43,11 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
-			if got, want := len(tc.manifest.ToolLifecycle), len(tc.modes); got != want {
+			want := len(tc.modes)
+			if tc.name == "codex" {
+				want++ // additive native-proved refreshable interactive variant
+			}
+			if got := len(tc.manifest.ToolLifecycle); got != want {
 				t.Fatalf("profile count = %d, want %d", got, want)
 			}
 			for _, mode := range tc.modes {
