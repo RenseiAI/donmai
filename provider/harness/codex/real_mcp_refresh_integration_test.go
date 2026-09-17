@@ -291,8 +291,12 @@ func TestIntegration_RealCodexInteractiveMCPHeaderHelperRefreshControls(t *testi
 	wrapper, unexpectedPTYMarker := writeNoUIFixtureWrapper(t, launcher)
 	_, _, requestsBeforeGuard := oauthFixture.snapshot()
 	guardCallbackCalls := 0
+	guardBoundaryRoot := filepath.Join(root, "guard-boundaries")
+	if err := os.MkdirAll(guardBoundaryRoot, 0o700); err != nil {
+		t.Fatal(err)
+	}
 	_, guardErr := SpawnInteractive(t.Context(), Options{
-		CodexBin: wrapper, configTempDir: filepath.Join(root, "guard-boundaries"),
+		CodexBin: wrapper, configTempDir: guardBoundaryRoot,
 		interactiveAuthSeeder: func(_ context.Context, _ string, ownedHome string, _ interactiveCodexAuthProjection) error {
 			seedActualMCPOAuthStore(t, ownedHome, oauthServer, oauthSentinel)
 			return nil

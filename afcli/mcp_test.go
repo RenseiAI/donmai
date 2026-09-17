@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -74,6 +75,39 @@ func TestMCPGatewayHeaders_HiddenAndExecutesFromRegisteredRoot(t *testing.T) {
 	root.SetErr(&bytes.Buffer{})
 	if err := root.Execute(); err != nil {
 		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out.String()); got != `{"Authorization":"Bearer fixture-token"}` {
+		t.Fatalf("stdout=%q", got)
+	}
+}
+
+func TestMCPGatewayHeaders_ReplacesInheritedConfigAndAuthHooks(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("fixture-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	preCalls, postCalls := 0, 0
+	root := &cobra.Command{
+		Use: "embedding-root",
+		PersistentPreRunE: func(*cobra.Command, []string) error {
+			preCalls++
+			return errors.New("malformed ambient auth/config must not be loaded")
+		},
+		PersistentPostRunE: func(*cobra.Command, []string) error {
+			postCalls++
+			return errors.New("ambient post hook must not run")
+		},
+	}
+	RegisterCommands(root, Config{})
+	var out bytes.Buffer
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	root.SetArgs([]string{"mcp", "gateway-headers", "--token-file", path})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if preCalls != 0 || postCalls != 0 {
+		t.Fatalf("inherited hooks ran: pre=%d post=%d", preCalls, postCalls)
 	}
 	if got := strings.TrimSpace(out.String()); got != `{"Authorization":"Bearer fixture-token"}` {
 		t.Fatalf("stdout=%q", got)

@@ -36,10 +36,16 @@ client configuration guidance.`,
 func newMCPGatewayHeadersCmd() *cobra.Command {
 	var tokenFile string
 	cmd := &cobra.Command{
-		Use:          "gateway-headers",
-		Hidden:       true,
-		Args:         cobra.NoArgs,
-		SilenceUsage: true,
+		Use:    "gateway-headers",
+		Hidden: true,
+		// The embedding root may use persistent hooks for auth, config, or
+		// network-backed profile loading. This leaf is a pure local credential
+		// helper and must replace those inherited hooks without exempting the
+		// visible mcp group or any sibling command.
+		PersistentPreRunE:  func(*cobra.Command, []string) error { return nil },
+		PersistentPostRunE: func(*cobra.Command, []string) error { return nil },
+		Args:               cobra.NoArgs,
+		SilenceUsage:       true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			raw, err := mcpheaders.ReadAuthorizationJSON(tokenFile)
 			if err != nil {
