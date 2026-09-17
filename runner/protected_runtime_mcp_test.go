@@ -709,3 +709,64 @@ func TestProtectedRuntimeMCPSelectorRefusesMalformedOrUnregisteredValues(t *test
 		t.Fatal("unregistered selector accepted")
 	}
 }
+
+func TestProtectedRuntimeMCPV2ResolverBindsExactCommonRequirement(t *testing.T) {
+	legacyView, detail, _, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	selector := ProtectedRuntimeMCPV2Selector{
+		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
+		AdapterProfileID: base.AdapterProfileID, Mode: base.Mode,
+		ConfigRequirementID: "example.session-config/v1",
+	}
+	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	v1, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+	if err != nil || v1 != nil {
+		t.Fatalf("v1 requirements = %+v err=%v, want nil", v1, err)
+	}
+	v2, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt)
+	if err != nil || len(v2) != 1 {
+		t.Fatalf("v2 requirements = %+v err=%v", v2, err)
+	}
+	requirement := v2[0]
+	if requirement.ContractVersion != executioncell.ProtectedRuntimeMCPConfigContractVersionV2 ||
+		requirement.RequirementID != protectedRuntimeMCPRequirementIDV2 ||
+		requirement.AuthorizationSource != (executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
+			Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, ConfigRequirementID: selector.ConfigRequirementID,
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget, Mode: executioncell.PreflightConfigPrivateFileMode,
+		}) {
+		t.Fatalf("v2 requirement = %+v", requirement)
+	}
+	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(requirement); err != nil {
+		t.Fatal(err)
+	}
+}
+
+func TestProtectedRuntimeMCPV2SelectorRefusesAmbiguousOrInvalidConfiguration(t *testing.T) {
+	legacyView, _, _, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	v2 := ProtectedRuntimeMCPV2Selector{
+		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
+		AdapterProfileID: base.AdapterProfileID, Mode: base.Mode,
+		ConfigRequirementID: "example.session-config/v1",
+	}
+	if _, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: base, ProtectedRuntimeMCPV2Selector: v2,
+	}); err == nil {
+		t.Fatal("ambiguous v1/v2 selectors accepted")
+	}
+	v2.ConfigRequirementID = "bad requirement id"
+	if _, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: v2,
+	}); err == nil {
+		t.Fatal("invalid v2 config requirement ID accepted")
+	}
+}

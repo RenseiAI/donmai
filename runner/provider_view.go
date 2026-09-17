@@ -13,6 +13,7 @@ import (
 	"fmt"
 	"reflect"
 	"sort"
+	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
@@ -32,11 +33,12 @@ type ProviderView struct {
 	// to the spawn lane surfaces as an undiagnosable
 	// *agent.ToolLifecycleDriftError instead of an admission-time truth. nil
 	// preserves the historical undecorated behavior.
-	decorate                    agent.ExtensionDecorator
-	realizations                *agent.CapabilityRealizationRegistry
-	preparedCapabilities        capabilityRealizationResolver
-	configRequirements          ExecutionPreflightConfigRequirementResolver
-	protectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
+	decorate                      agent.ExtensionDecorator
+	realizations                  *agent.CapabilityRealizationRegistry
+	preparedCapabilities          capabilityRealizationResolver
+	configRequirements            ExecutionPreflightConfigRequirementResolver
+	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
+	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -57,6 +59,8 @@ type ExecutionPreflightConfigRequirementResolver func(ExecutionPreflightConfigRe
 
 const protectedRuntimeMCPRequirementID = "protected-runtime-mcp/v1"
 
+const protectedRuntimeMCPRequirementIDV2 = "protected-runtime-mcp/v2"
+
 // ProtectedRuntimeMCPSelector identifies one exact registered capability
 // realization. The zero value disables protected runtime MCP acknowledgement.
 // It is process configuration, never session or wire input.
@@ -65,6 +69,52 @@ type ProtectedRuntimeMCPSelector struct {
 	HarnessID        agent.HarnessName
 	AdapterProfileID string
 	Mode             agent.PromptSessionMode
+}
+
+// ProtectedRuntimeMCPV2Selector identifies one exact registered realization
+// and the common private-file requirement it must join. It is process-only;
+// no session, queue, or authored MCP input can configure it.
+type ProtectedRuntimeMCPV2Selector struct {
+	CapabilityID        string
+	HarnessID           agent.HarnessName
+	AdapterProfileID    string
+	Mode                agent.PromptSessionMode
+	ConfigRequirementID string
+}
+
+func (s ProtectedRuntimeMCPV2Selector) configured() bool {
+	return s != (ProtectedRuntimeMCPV2Selector{})
+}
+
+func (s ProtectedRuntimeMCPV2Selector) realizationSelector() ProtectedRuntimeMCPSelector {
+	return ProtectedRuntimeMCPSelector{
+		CapabilityID: s.CapabilityID, HarnessID: s.HarnessID,
+		AdapterProfileID: s.AdapterProfileID, Mode: s.Mode,
+	}
+}
+
+func validateProtectedRuntimeMCPV2Selector(selector ProtectedRuntimeMCPV2Selector, realizations *agent.CapabilityRealizationRegistry) error {
+	if !selector.configured() {
+		return nil
+	}
+	if err := validateProtectedRuntimeMCPSelector(selector.realizationSelector(), realizations); err != nil {
+		return err
+	}
+	probe := executioncell.ProtectedRuntimeMCPConfigRequirementV2{
+		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
+		RequirementID:   protectedRuntimeMCPRequirementIDV2, AuthorityBindingDigest: strings.Repeat("0", 64),
+		OperationalPayloadDigest: strings.Repeat("0", 64), ServerName: "protected-runtime-mcp",
+		Transport: executioncell.ProtectedRuntimeMCPTransportHTTP, EndpointDigest: strings.Repeat("0", 64),
+		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: strings.Repeat("0", 64)}},
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
+			Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, ConfigRequirementID: selector.ConfigRequirementID,
+			TargetEnv: executioncell.PreflightConfigSessionMCPBearerFileTarget, Mode: executioncell.PreflightConfigPrivateFileMode,
+		},
+	}
+	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(probe); err != nil {
+		return fmt.Errorf("runner: protected runtime MCP v2 selector config requirement: %w", err)
+	}
+	return nil
 }
 
 func (s ProtectedRuntimeMCPSelector) configured() bool {
@@ -213,6 +263,36 @@ func resolveProtectedRuntimeMCPRequirement(
 		ServerName:               server.Name, Transport: server.Type, EndpointDigest: fmt.Sprintf("%x", endpoint[:]), Headers: headers,
 	}
 	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirement(requirement); err != nil {
+		return nil, err
+	}
+	return &requirement, nil
+}
+
+func resolveProtectedRuntimeMCPRequirementV2(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector ProtectedRuntimeMCPV2Selector,
+	host executioncell.HostAdaptationReceipt,
+) (*executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
+	base, err := resolveProtectedRuntimeMCPRequirement(qw, selection, realizations, selector.realizationSelector(), host)
+	if err != nil || base == nil {
+		return nil, err
+	}
+	requirement := executioncell.ProtectedRuntimeMCPConfigRequirementV2{
+		ContractVersion:        executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
+		RequirementID:          protectedRuntimeMCPRequirementIDV2,
+		AuthorityBindingDigest: base.AuthorityBindingDigest, OperationalPayloadDigest: base.OperationalPayloadDigest,
+		ServerName: base.ServerName, Transport: base.Transport, EndpointDigest: base.EndpointDigest,
+		Headers: append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), base.Headers...),
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
+			Kind:                executioncell.PreflightConfigSourceSessionMCPBearerFile,
+			ConfigRequirementID: selector.ConfigRequirementID,
+			TargetEnv:           executioncell.PreflightConfigSessionMCPBearerFileTarget,
+			Mode:                executioncell.PreflightConfigPrivateFileMode,
+		},
+	}
+	if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(requirement); err != nil {
 		return nil, err
 	}
 	return &requirement, nil
@@ -398,32 +478,43 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 	return append([]executioncell.PreflightConfigRequirementV1(nil), resolved...), nil
 }
 
+func (v *ProviderView) protectedRuntimeMCPPreflightContext(detailJSON json.RawMessage, compiledReceipt json.RawMessage) (QueuedWork, harnessSelection, executioncell.HostAdaptationReceipt, error) {
+	if v == nil || v.reg == nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, fmt.Errorf("runner: protected runtime MCP provider view is unavailable")
+	}
+	qw, _, err := decodeProviderViewPreflightWork(detailJSON)
+	if err != nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
+	if err != nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
+	}
+	if host.Decision != "ready" {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, fmt.Errorf("runner: protected runtime MCP requirements require a ready host adaptation receipt")
+	}
+	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
+	}
+	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
+	if err != nil || admission == nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, fmt.Errorf("runner: protected runtime MCP requirements require exact admission: %w", err)
+	}
+	return qw, admission.selection, host, nil
+}
+
 // ResolveExecutionPreflightProtectedRuntimeMCPRequirements resolves the sole
-// process-configured realization only after exact admission and retained-plan
+// process-configured v1 realization only after exact admission and retained-plan
 // validation. An unselected harness, mode, or capability returns no requirements.
 func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
 	if v == nil || v.reg == nil || !v.protectedRuntimeMCPSelector.configured() {
 		return nil, nil
 	}
-	qw, _, err := decodeProviderViewPreflightWork(detailJSON)
+	qw, selection, host, err := v.protectedRuntimeMCPPreflightContext(detailJSON, compiledReceipt)
 	if err != nil {
 		return nil, err
 	}
-	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
-	if err != nil {
-		return nil, err
-	}
-	if host.Decision != "ready" {
-		return nil, fmt.Errorf("runner: protected runtime MCP requirements require a ready host adaptation receipt")
-	}
-	if err := v.ValidateRetainedExecution(detailJSON, compiledReceipt); err != nil {
-		return nil, err
-	}
-	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
-	if err != nil || admission == nil {
-		return nil, fmt.Errorf("runner: protected runtime MCP requirements require exact admission: %w", err)
-	}
-	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, admission.selection, v.realizations, v.protectedRuntimeMCPSelector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, selection, v.realizations, v.protectedRuntimeMCPSelector, host)
 	if err != nil {
 		return nil, err
 	}
@@ -431,6 +522,27 @@ func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(
 		return nil, nil
 	}
 	return []executioncell.ProtectedRuntimeMCPConfigRequirementV1{*requirement}, nil
+}
+
+// ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2 resolves the sole
+// process-configured v2 realization and its exact common-config requirement.
+// The selector is not wired into any default or child runtime in this unit.
+func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detailJSON json.RawMessage, compiledReceipt json.RawMessage) ([]executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
+	if v == nil || v.reg == nil || !v.protectedRuntimeMCPV2Selector.configured() {
+		return nil, nil
+	}
+	qw, selection, host, err := v.protectedRuntimeMCPPreflightContext(detailJSON, compiledReceipt)
+	if err != nil {
+		return nil, err
+	}
+	requirement, err := resolveProtectedRuntimeMCPRequirementV2(qw, selection, v.realizations, v.protectedRuntimeMCPV2Selector, host)
+	if err != nil {
+		return nil, err
+	}
+	if requirement == nil {
+		return nil, nil
+	}
+	return []executioncell.ProtectedRuntimeMCPConfigRequirementV2{*requirement}, nil
 }
 
 // ValidateRetainedExecution verifies current sibling mirrors against the exact
@@ -477,23 +589,35 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 
 // ProviderViewOptions is the complete immutable construction surface.
 type ProviderViewOptions struct {
-	Decorator                   agent.ExtensionDecorator
-	CapabilityRealizations      *agent.CapabilityRealizationRegistry
-	CapabilityParameterBinders  *CapabilityParameterBinderRegistry
-	ConfigRequirements          ExecutionPreflightConfigRequirementResolver
-	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
+	Decorator                     agent.ExtensionDecorator
+	CapabilityRealizations        *agent.CapabilityRealizationRegistry
+	CapabilityParameterBinders    *CapabilityParameterBinderRegistry
+	ConfigRequirements            ExecutionPreflightConfigRequirementResolver
+	ProtectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
+	ProtectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 }
 
 // NewProviderViewWithOptions constructs a complete read-only provider view.
 func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*ProviderView, error) {
+	if opts.ProtectedRuntimeMCPSelector.configured() && opts.ProtectedRuntimeMCPV2Selector.configured() {
+		return nil, fmt.Errorf("runner: protected runtime MCP selector version is ambiguous")
+	}
 	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
+		return nil, err
+	}
+	if err := validateProtectedRuntimeMCPV2Selector(opts.ProtectedRuntimeMCPV2Selector, opts.CapabilityRealizations); err != nil {
 		return nil, err
 	}
 	prepared, err := newPreparedCapabilityResolver(opts.CapabilityRealizations, opts.CapabilityParameterBinders)
 	if err != nil {
 		return nil, err
 	}
-	return &ProviderView{reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations, preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements, protectedRuntimeMCPSelector: opts.ProtectedRuntimeMCPSelector}, nil
+	return &ProviderView{
+		reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations,
+		preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements,
+		protectedRuntimeMCPSelector:   opts.ProtectedRuntimeMCPSelector,
+		protectedRuntimeMCPV2Selector: opts.ProtectedRuntimeMCPV2Selector,
+	}, nil
 }
 
 // NewProviderView returns the historical default provider view.

@@ -77,6 +77,25 @@ type PreflightRegistrationRef struct {
 // HostAdaptationReceipt is the secret-free ready-or-denied envelope produced
 // by the host compiler before credentials or child processes exist.
 type HostAdaptationReceipt struct {
+	ContractVersion              string                                       `json:"contractVersion"`
+	RequestID                    string                                       `json:"requestId"`
+	WorkerID                     string                                       `json:"workerId"`
+	PlacementID                  string                                       `json:"placementId"`
+	ClaimID                      string                                       `json:"claimId,omitempty"`
+	Decision                     string                                       `json:"decision"`
+	Plan                         json.RawMessage                              `json:"plan,omitempty"`
+	PlanDigest                   string                                       `json:"planDigest,omitempty"`
+	PromptReceipt                json.RawMessage                              `json:"promptReceipt,omitempty"`
+	ToolLifecycleReceipt         json.RawMessage                              `json:"toolLifecycleReceipt,omitempty"`
+	ConfigMaterializations       []PreflightConfigMaterializationV1           `json:"configMaterializations,omitempty"`
+	ProtectedRuntimeMCPConfigs   []ProtectedRuntimeMCPConfigMaterializationV1 `json:"protectedRuntimeMcpConfigs,omitempty"`
+	ProtectedRuntimeMCPConfigsV2 []ProtectedRuntimeMCPConfigMaterializationV2 `json:"-"`
+	Denial                       string                                       `json:"denial,omitempty"`
+}
+
+type hostAdaptationReceiptAlias HostAdaptationReceipt
+
+type hostAdaptationReceiptV2Wire struct {
 	ContractVersion            string                                       `json:"contractVersion"`
 	RequestID                  string                                       `json:"requestId"`
 	WorkerID                   string                                       `json:"workerId"`
@@ -88,8 +107,79 @@ type HostAdaptationReceipt struct {
 	PromptReceipt              json.RawMessage                              `json:"promptReceipt,omitempty"`
 	ToolLifecycleReceipt       json.RawMessage                              `json:"toolLifecycleReceipt,omitempty"`
 	ConfigMaterializations     []PreflightConfigMaterializationV1           `json:"configMaterializations,omitempty"`
-	ProtectedRuntimeMCPConfigs []ProtectedRuntimeMCPConfigMaterializationV1 `json:"protectedRuntimeMcpConfigs,omitempty"`
+	ProtectedRuntimeMCPConfigs []ProtectedRuntimeMCPConfigMaterializationV2 `json:"protectedRuntimeMcpConfigs"`
 	Denial                     string                                       `json:"denial,omitempty"`
+}
+
+// MarshalJSON preserves every v1 receipt's historical encoding while placing
+// the closed v2 variant under the same protectedRuntimeMcpConfigs wire key.
+func (value HostAdaptationReceipt) MarshalJSON() ([]byte, error) {
+	if len(value.ProtectedRuntimeMCPConfigsV2) == 0 {
+		return json.Marshal(hostAdaptationReceiptAlias(value))
+	}
+	if len(value.ProtectedRuntimeMCPConfigs) != 0 {
+		return nil, errors.New("executioncell: host adaptation cannot mix protected runtime MCP config versions")
+	}
+	return json.Marshal(hostAdaptationReceiptV2Wire{
+		ContractVersion: value.ContractVersion, RequestID: value.RequestID,
+		WorkerID: value.WorkerID, PlacementID: value.PlacementID, ClaimID: value.ClaimID,
+		Decision: value.Decision, Plan: value.Plan, PlanDigest: value.PlanDigest,
+		PromptReceipt: value.PromptReceipt, ToolLifecycleReceipt: value.ToolLifecycleReceipt,
+		ConfigMaterializations:     value.ConfigMaterializations,
+		ProtectedRuntimeMCPConfigs: value.ProtectedRuntimeMCPConfigsV2,
+		Denial:                     value.Denial,
+	})
+}
+
+type hostAdaptationReceiptDecodeWire struct {
+	ContractVersion            string                             `json:"contractVersion"`
+	RequestID                  string                             `json:"requestId"`
+	WorkerID                   string                             `json:"workerId"`
+	PlacementID                string                             `json:"placementId"`
+	ClaimID                    string                             `json:"claimId,omitempty"`
+	Decision                   string                             `json:"decision"`
+	Plan                       json.RawMessage                    `json:"plan,omitempty"`
+	PlanDigest                 string                             `json:"planDigest,omitempty"`
+	PromptReceipt              json.RawMessage                    `json:"promptReceipt,omitempty"`
+	ToolLifecycleReceipt       json.RawMessage                    `json:"toolLifecycleReceipt,omitempty"`
+	ConfigMaterializations     []PreflightConfigMaterializationV1 `json:"configMaterializations,omitempty"`
+	ProtectedRuntimeMCPConfigs []json.RawMessage                  `json:"protectedRuntimeMcpConfigs,omitempty"`
+	Denial                     string                             `json:"denial,omitempty"`
+}
+
+func decodeProtectedRuntimeMCPMaterializations(rawValues []json.RawMessage) ([]ProtectedRuntimeMCPConfigMaterializationV1, []ProtectedRuntimeMCPConfigMaterializationV2, error) {
+	var v1 []ProtectedRuntimeMCPConfigMaterializationV1
+	var v2 []ProtectedRuntimeMCPConfigMaterializationV2
+	for _, raw := range rawValues {
+		members, err := rawObjectMembers(raw, "protected runtime MCP config materialization")
+		if err != nil {
+			return nil, nil, err
+		}
+		version, ok := presentJSONString(members, "contractVersion")
+		if !ok {
+			return nil, nil, errors.New("executioncell: protected runtime MCP config materialization requires exact contractVersion")
+		}
+		switch version {
+		case ProtectedRuntimeMCPConfigContractVersion:
+			value, err := DecodeProtectedRuntimeMCPConfigMaterializationV1(raw)
+			if err != nil {
+				return nil, nil, err
+			}
+			v1 = append(v1, value)
+		case ProtectedRuntimeMCPConfigContractVersionV2:
+			value, err := DecodeProtectedRuntimeMCPConfigMaterializationV2(raw)
+			if err != nil {
+				return nil, nil, err
+			}
+			v2 = append(v2, value)
+		default:
+			return nil, nil, fmt.Errorf("executioncell: unsupported protected runtime MCP config version %q", version)
+		}
+	}
+	if len(v1) != 0 && len(v2) != 0 {
+		return nil, nil, errors.New("executioncell: host adaptation cannot mix protected runtime MCP config versions")
+	}
+	return v1, v2, nil
 }
 
 // DecodeHostAdaptationReceipt strictly decodes a closed host receipt.
@@ -97,15 +187,28 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 	if err := rejectDuplicateFields(raw); err != nil {
 		return HostAdaptationReceipt{}, err
 	}
-	var receipt HostAdaptationReceipt
+	var wire hostAdaptationReceiptDecodeWire
 	members, err := rawObjectMembers(raw, "host adaptation receipt")
 	if err != nil {
 		return HostAdaptationReceipt{}, err
 	}
 	decoder := json.NewDecoder(bytes.NewReader(raw))
 	decoder.DisallowUnknownFields()
-	if err := decoder.Decode(&receipt); err != nil {
+	if err := decoder.Decode(&wire); err != nil {
 		return HostAdaptationReceipt{}, fmt.Errorf("executioncell: decode host adaptation receipt: %w", err)
+	}
+	v1, v2, err := decodeProtectedRuntimeMCPMaterializations(wire.ProtectedRuntimeMCPConfigs)
+	if err != nil {
+		return HostAdaptationReceipt{}, err
+	}
+	receipt := HostAdaptationReceipt{
+		ContractVersion: wire.ContractVersion, RequestID: wire.RequestID,
+		WorkerID: wire.WorkerID, PlacementID: wire.PlacementID, ClaimID: wire.ClaimID,
+		Decision: wire.Decision, Plan: wire.Plan, PlanDigest: wire.PlanDigest,
+		PromptReceipt: wire.PromptReceipt, ToolLifecycleReceipt: wire.ToolLifecycleReceipt,
+		ConfigMaterializations:     wire.ConfigMaterializations,
+		ProtectedRuntimeMCPConfigs: v1, ProtectedRuntimeMCPConfigsV2: v2,
+		Denial: wire.Denial,
 	}
 	if (receipt.ContractVersion != HostAdaptationContractVersion && receipt.ContractVersion != HostAdaptationV2ContractVersion && receipt.ContractVersion != HostAdaptationV3ContractVersion) || strings.TrimSpace(receipt.RequestID) == "" || strings.TrimSpace(receipt.WorkerID) == "" || strings.TrimSpace(receipt.PlacementID) == "" {
 		return HostAdaptationReceipt{}, errors.New("executioncell: invalid host adaptation receipt identity")
@@ -166,8 +269,17 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 			if !protectedMCPPresent {
 				return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v3 requires protected runtime MCP configs")
 			}
-			if err := ValidateProtectedRuntimeMCPConfigMaterializations(receipt.ProtectedRuntimeMCPConfigs); err != nil {
-				return HostAdaptationReceipt{}, err
+			switch {
+			case len(receipt.ProtectedRuntimeMCPConfigs) > 0:
+				if err := ValidateProtectedRuntimeMCPConfigMaterializations(receipt.ProtectedRuntimeMCPConfigs); err != nil {
+					return HostAdaptationReceipt{}, err
+				}
+			case len(receipt.ProtectedRuntimeMCPConfigsV2) > 0:
+				if err := ValidateProtectedRuntimeMCPConfigMaterializationsV2(receipt.ProtectedRuntimeMCPConfigsV2); err != nil {
+					return HostAdaptationReceipt{}, err
+				}
+			default:
+				return HostAdaptationReceipt{}, errors.New("executioncell: host adaptation v3 requires protected runtime MCP configs")
 			}
 			var planIdentity struct {
 				OperationalPayloadDigest string `json:"operationalPayloadDigest"`
@@ -178,6 +290,11 @@ func DecodeHostAdaptationReceipt(raw []byte) (HostAdaptationReceipt, error) {
 			for _, materialization := range receipt.ProtectedRuntimeMCPConfigs {
 				if materialization.OperationalPayloadDigest != planIdentity.OperationalPayloadDigest {
 					return HostAdaptationReceipt{}, errors.New("executioncell: protected runtime MCP config operational digest mismatch")
+				}
+			}
+			for _, materialization := range receipt.ProtectedRuntimeMCPConfigsV2 {
+				if materialization.OperationalPayloadDigest != planIdentity.OperationalPayloadDigest {
+					return HostAdaptationReceipt{}, errors.New("executioncell: protected runtime MCP v2 config operational digest mismatch")
 				}
 			}
 		}

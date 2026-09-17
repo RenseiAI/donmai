@@ -13,6 +13,7 @@ import (
 	"sort"
 	"strings"
 	"sync"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -284,6 +285,26 @@ func hostReceiptWithProtectedRuntimeMCPConfigs(receipt json.RawMessage, material
 	return raw, nil
 }
 
+func hostReceiptWithProtectedRuntimeMCPConfigsV2(receipt json.RawMessage, materializations []executioncell.ProtectedRuntimeMCPConfigMaterializationV2) (json.RawMessage, error) {
+	decoded, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		return nil, err
+	}
+	if (decoded.ContractVersion != executioncell.HostAdaptationContractVersion && decoded.ContractVersion != executioncell.HostAdaptationV2ContractVersion) || decoded.Decision != "ready" {
+		return nil, errors.New("protected runtime MCP v2 config requires one ready host-adaptation/v1 or v2 source")
+	}
+	decoded.ContractVersion = executioncell.HostAdaptationV3ContractVersion
+	decoded.ProtectedRuntimeMCPConfigsV2 = materializations
+	raw, err := json.Marshal(decoded)
+	if err != nil {
+		return nil, err
+	}
+	if _, err := executioncell.DecodeHostAdaptationReceipt(raw); err != nil {
+		return nil, err
+	}
+	return raw, nil
+}
+
 func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, error) {
 	if len(requirements) == 0 {
 		return nil, nil
@@ -327,6 +348,117 @@ func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements [
 			return nil, err
 		}
 		if err := executioncell.ValidateProtectedRuntimeMCPConfigMaterialization(materialization); err != nil {
+			return nil, err
+		}
+		materializations = append(materializations, materialization)
+	}
+	return materializations, nil
+}
+
+func joinedProtectedRuntimeMCPCommonBinding(
+	requirement executioncell.ProtectedRuntimeMCPConfigRequirementV2,
+	common []executioncell.PreflightConfigMaterializationV1,
+) (executioncell.PreflightConfigMaterializationV1, executioncell.PreflightConfigBindingMaterializationV1, error) {
+	if err := executioncell.ValidatePreflightConfigMaterializations(common); err != nil {
+		return executioncell.PreflightConfigMaterializationV1{}, executioncell.PreflightConfigBindingMaterializationV1{}, err
+	}
+	var joined []executioncell.PreflightConfigMaterializationV1
+	for _, materialization := range common {
+		if materialization.RequirementID == requirement.AuthorizationSource.ConfigRequirementID {
+			joined = append(joined, materialization)
+		}
+	}
+	if len(joined) != 1 {
+		return executioncell.PreflightConfigMaterializationV1{}, executioncell.PreflightConfigBindingMaterializationV1{}, errors.New("protected runtime MCP v2 requires exactly one common config materialization")
+	}
+	var bindings []executioncell.PreflightConfigBindingMaterializationV1
+	for _, binding := range joined[0].Bindings {
+		if binding.TargetEnv == requirement.AuthorizationSource.TargetEnv &&
+			binding.Source.Kind == requirement.AuthorizationSource.Kind &&
+			binding.Source.Mode == requirement.AuthorizationSource.Mode &&
+			binding.Mode == requirement.AuthorizationSource.Mode {
+			bindings = append(bindings, binding)
+		}
+	}
+	if len(bindings) != 1 {
+		return executioncell.PreflightConfigMaterializationV1{}, executioncell.PreflightConfigBindingMaterializationV1{}, errors.New("protected runtime MCP v2 requires exactly one matching common file binding")
+	}
+	return joined[0], bindings[0], nil
+}
+
+func materializeProtectedRuntimeMCPConfigsV2(
+	detail *SessionDetail,
+	spec *SessionSpec,
+	requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV2,
+	common []executioncell.PreflightConfigMaterializationV1,
+	buildHelperCommand ProtectedRuntimeMCPHelperCommandBuilder,
+) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV2, error) {
+	if len(requirements) == 0 {
+		return nil, nil
+	}
+	if detail == nil || spec == nil || buildHelperCommand == nil ||
+		!sort.SliceIsSorted(requirements, func(i, j int) bool { return requirements[i].RequirementID < requirements[j].RequirementID }) {
+		return nil, errors.New("protected runtime MCP v2 config requirements or trusted helper builder are unavailable")
+	}
+	operationalDigest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		return nil, fmt.Errorf("digest protected runtime MCP v2 operational source: %w", err)
+	}
+	bearer := strings.TrimSpace(detail.McpAuthToken)
+	if detail.SessionID == "" || detail.PlatformURL == "" || bearer == "" || bearer != detail.McpAuthToken {
+		return nil, errors.New("protected runtime MCP v2 gateway configuration is unavailable")
+	}
+	endpointDigest := digestConfigValue(strings.TrimRight(detail.PlatformURL, "/") + "/api/mcp/" + detail.SessionID)
+	headers := []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + bearer)}}
+	serverName := statehome.Brand() + "-platform"
+	materializations := make([]executioncell.ProtectedRuntimeMCPConfigMaterializationV2, 0, len(requirements))
+	for i, requirement := range requirements {
+		if i > 0 && requirements[i-1].RequirementID == requirement.RequirementID {
+			return nil, errors.New("duplicate protected runtime MCP v2 config requirement")
+		}
+		if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(requirement); err != nil {
+			return nil, err
+		}
+		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != serverName ||
+			requirement.Transport != executioncell.ProtectedRuntimeMCPTransportHTTP || requirement.EndpointDigest != endpointDigest ||
+			!reflect.DeepEqual(requirement.Headers, headers) {
+			return nil, errors.New("protected runtime MCP v2 config requirement differs from current runtime authority")
+		}
+		joined, binding, err := joinedProtectedRuntimeMCPCommonBinding(requirement, common)
+		if err != nil {
+			return nil, err
+		}
+		if joined.OperationalPayloadDigest != operationalDigest || binding.BearerContentDigest != digestConfigValue(bearer) {
+			return nil, errors.New("protected runtime MCP v2 common materialization differs from initial authority")
+		}
+		path := spec.Env[requirement.AuthorizationSource.TargetEnv]
+		if strings.TrimSpace(path) == "" || binding.FileReferenceDigest != digestConfigValue(path) {
+			return nil, errors.New("protected runtime MCP v2 file reference differs from applied session config")
+		}
+		command, err := buildHelperCommand(path)
+		if err != nil {
+			return nil, fmt.Errorf("build protected runtime MCP v2 helper command: %w", err)
+		}
+		if strings.TrimSpace(command) == "" || !utf8.ValidString(command) {
+			return nil, errors.New("protected runtime MCP v2 helper command is invalid")
+		}
+		materialization := executioncell.ProtectedRuntimeMCPConfigMaterializationV2{
+			ContractVersion: requirement.ContractVersion, RequirementID: requirement.RequirementID,
+			AuthorityBindingDigest: requirement.AuthorityBindingDigest, OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+			ServerName: requirement.ServerName, Transport: requirement.Transport, EndpointDigest: requirement.EndpointDigest,
+			Headers: append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...),
+			AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceMaterializationV2{
+				Kind: requirement.AuthorizationSource.Kind, ConfigRequirementID: requirement.AuthorizationSource.ConfigRequirementID,
+				TargetEnv: requirement.AuthorizationSource.TargetEnv, Mode: requirement.AuthorizationSource.Mode,
+				ConfigReferenceDigest: joined.ConfigReferenceDigest, FileReferenceDigest: binding.FileReferenceDigest,
+				HelperCommandDigest: digestConfigValue(command),
+			},
+		}
+		materialization.ConfigReferenceDigest, err = executioncell.DigestProtectedRuntimeMCPConfigReferenceV2(materialization)
+		if err != nil {
+			return nil, err
+		}
+		if err := executioncell.ValidateProtectedRuntimeMCPConfigMaterializationV2(materialization); err != nil {
 			return nil, err
 		}
 		materializations = append(materializations, materialization)
