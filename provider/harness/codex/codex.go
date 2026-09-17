@@ -74,12 +74,13 @@ type Provider struct {
 	// live handles holding the current config digest: equal configs may share
 	// it, while an incompatible config is denied until all prior handles have
 	// closed so no session can observe another session's MCP set.
-	mcpMu           sync.Mutex
-	mcpConfigDigest [sha256.Size]byte
-	mcpConfigKnown  bool
-	mcpManagedNames map[string]struct{}
-	mcpUsers        int
-	mcpPoisoned     bool
+	mcpMu                       sync.Mutex
+	mcpConfigDigest             [sha256.Size]byte
+	mcpConfigKnown              bool
+	mcpManagedNames             map[string]struct{}
+	mcpUsers                    int
+	mcpPoisoned                 bool
+	protectedMCPFileStorePinned bool
 
 	// handlesMu / handles tracks live Handles so we can fail them
 	// all when the shared app-server crashes.
@@ -523,6 +524,9 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
 	if err := p.checkSessionEnvLocked(spec.Env); err != nil {
 		return err
 	}
+	if err := p.prepareHeadlessProtectedMCPAuthorityLocked(spec.MCPServers); err != nil {
+		return err
+	}
 	if p.hostAuthFile != "" {
 		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
 			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
@@ -530,6 +534,24 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
 	}
 	if err := p.startLocked(spec.Env); err != nil {
 		return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
+	return nil
+}
+
+func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {
+	if len(protectedMCPHelperServers(servers)) > 0 {
+		if !p.protectedMCPFileStorePinned {
+			if p.client != nil {
+				return fmt.Errorf("%w: codex protected MCP store cannot be changed after app-server start", agent.ErrSpawnFailed)
+			}
+			if err := pinProtectedMCPFileStore(p.config.configPath, servers); err != nil {
+				return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+			}
+			p.protectedMCPFileStorePinned = true
+		}
+		if err := refuseProtectedMCPStoredOAuth(p.config.home, servers); err != nil {
+			return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		}
 	}
 	return nil
 }

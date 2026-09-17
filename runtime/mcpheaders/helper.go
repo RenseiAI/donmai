@@ -16,6 +16,7 @@ import (
 	"unicode/utf8"
 )
 
+// MaxBearerFileBytes is the maximum credential file size accepted by the helper.
 const MaxBearerFileBytes = 64 * 1024
 
 // ResolveExecutablePath returns the canonical physical path of this process.
@@ -57,7 +58,11 @@ func buildHelperCommandForOS(goos, executablePath, tokenFilePath string) (string
 	}
 	quote := quoteUnix
 	if goos == "windows" {
-		quote = quoteWindows
+		// Pinned Codex 0.154 executes helpers through COMSPEC /Q /D /C and
+		// wraps this string with raw_arg. CommandLineToArgvW quoting does not
+		// protect cmd.exe expansion, and this repository has no required native
+		// Windows control yet. Refuse rather than sign unproved command bytes.
+		return "", errors.New("build MCP header helper command: Windows cmd.exe execution is unsupported without native quoting proof")
 	}
 	return strings.Join([]string{
 		quote(executablePath), "mcp", "gateway-headers", "--token-file", quote(tokenFilePath),
@@ -81,49 +86,19 @@ func quoteUnix(value string) string {
 	return "'" + strings.ReplaceAll(value, "'", "'\"'\"'") + "'"
 }
 
-// quoteWindows follows the CommandLineToArgvW escaping convention.
-func quoteWindows(value string) string {
-	var out strings.Builder
-	out.WriteByte('"')
-	slashes := 0
-	for _, r := range value {
-		switch r {
-		case '\\':
-			slashes++
-		case '"':
-			out.WriteString(strings.Repeat("\\", slashes*2+1))
-			out.WriteRune(r)
-			slashes = 0
-		default:
-			out.WriteString(strings.Repeat("\\", slashes))
-			slashes = 0
-			out.WriteRune(r)
-		}
-	}
-	out.WriteString(strings.Repeat("\\", slashes*2))
-	out.WriteByte('"')
-	return out.String()
-}
-
 // ReadAuthorizationJSON rereads one private bearer file and emits the native
 // helper protocol object. The credential is never cached.
 func ReadAuthorizationJSON(tokenFilePath string) ([]byte, error) {
 	if !filepath.IsAbs(tokenFilePath) || filepath.Clean(tokenFilePath) != tokenFilePath {
 		return nil, errors.New("read MCP bearer file: path must be absolute and clean")
 	}
-	info, err := os.Lstat(tokenFilePath)
+	file, info, err := openBearerFile(tokenFilePath)
 	if err != nil {
 		return nil, fmt.Errorf("read MCP bearer file: %w", err)
 	}
-	if info.Mode()&os.ModeSymlink != 0 || !info.Mode().IsRegular() {
-		return nil, errors.New("read MCP bearer file: path must be a regular non-symlink file")
-	}
-	if runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0 {
-		return nil, errors.New("read MCP bearer file: permissions must be private")
-	}
-	file, err := os.Open(tokenFilePath)
-	if err != nil {
-		return nil, fmt.Errorf("read MCP bearer file: %w", err)
+	if !info.Mode().IsRegular() || (runtime.GOOS != "windows" && info.Mode().Perm()&0o077 != 0) {
+		_ = file.Close()
+		return nil, errors.New("read MCP bearer file: opened file must be regular and private")
 	}
 	raw, readErr := io.ReadAll(io.LimitReader(file, MaxBearerFileBytes+1))
 	closeErr := file.Close()

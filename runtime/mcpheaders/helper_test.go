@@ -10,8 +10,7 @@ import (
 
 func TestBuildHelperCommandForOS(t *testing.T) {
 	tests := []struct{ goos, executable, tokenFile, want string }{
-		{"linux", "/opt/Rensei Agent/donmai's", "/tmp/session token", `'` + `/opt/Rensei Agent/donmai` + `'"'"'` + `s' mcp gateway-headers --token-file '/tmp/session token'`},
-		{"windows", `C:\Program Files\Rensei\rensei.exe`, `C:\Users\A B\token`, `"C:\Program Files\Rensei\rensei.exe" mcp gateway-headers --token-file "C:\Users\A B\token"`},
+		{"linux", "/opt/Donmai Agent/donmai's", "/tmp/session token", `'` + `/opt/Donmai Agent/donmai` + `'"'"'` + `s' mcp gateway-headers --token-file '/tmp/session token'`},
 	}
 	for _, tc := range tests {
 		got, err := buildHelperCommandForOS(tc.goos, tc.executable, tc.tokenFile)
@@ -24,6 +23,9 @@ func TestBuildHelperCommandForOS(t *testing.T) {
 		if strings.Contains(got, "Bearer") {
 			t.Fatalf("%s command contains credential syntax: %q", tc.goos, got)
 		}
+	}
+	if _, err := buildHelperCommandForOS("windows", `C:\Program Files\Donmai\donmai.exe`, `C:\Users\A B\token`); err == nil || !strings.Contains(err.Error(), "unsupported") {
+		t.Fatalf("Windows helper command was not refused: %v", err)
 	}
 }
 

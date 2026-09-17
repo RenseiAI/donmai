@@ -3,6 +3,8 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"os"
+	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -768,5 +770,120 @@ func TestProtectedRuntimeMCPV2SelectorRefusesAmbiguousOrInvalidConfiguration(t *
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: v2,
 	}); err == nil {
 		t.Fatal("invalid v2 config requirement ID accepted")
+	}
+}
+
+func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *testing.T) {
+	legacyView, detail, qw, provider, realizations := protectedRuntimeMCPPreflightFixture(t, true)
+	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	selector := ProtectedRuntimeMCPV2Selector{
+		CapabilityID: base.CapabilityID, HarnessID: base.HarnessID,
+		AdapterProfileID: base.AdapterProfileID, Mode: base.Mode,
+		ConfigRequirementID: "example.session-config/v1",
+	}
+	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt)
+	if err != nil || len(requirements) != 1 {
+		t.Fatalf("requirements=%+v err=%v", requirements, err)
+	}
+
+	path := filepath.Join(t.TempDir(), "mcp-token")
+	if err := os.WriteFile(path, []byte(qw.McpAuthToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	command, err := canonicalProtectedRuntimeMCPHelperCommand(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	common := executioncell.PreflightConfigMaterializationV1{
+		ContractVersion: executioncell.PreflightConfigMaterializationContractVersion,
+		RequirementID:   selector.ConfigRequirementID, AuthorityBindingDigest: strings.Repeat("a", 64),
+		OperationalPayloadDigest: requirements[0].OperationalPayloadDigest,
+		Bindings: []executioncell.PreflightConfigBindingMaterializationV1{{
+			TargetEnv:           executioncell.PreflightConfigSessionMCPBearerFileTarget,
+			Source:              executioncell.PreflightConfigBindingSourceV1{Kind: executioncell.PreflightConfigSourceSessionMCPBearerFile, Mode: executioncell.PreflightConfigPrivateFileMode},
+			BearerContentDigest: digestProtectedRuntimeValue(qw.McpAuthToken), FileReferenceDigest: digestProtectedRuntimeValue(path),
+			Mode: executioncell.PreflightConfigPrivateFileMode,
+		}},
+	}
+	common.ConfigReferenceDigest, err = executioncell.DigestPreflightConfigReference(common)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialization := executioncell.ProtectedRuntimeMCPConfigMaterializationV2{
+		ContractVersion: requirements[0].ContractVersion, RequirementID: requirements[0].RequirementID,
+		AuthorityBindingDigest: requirements[0].AuthorityBindingDigest, OperationalPayloadDigest: requirements[0].OperationalPayloadDigest,
+		ServerName: requirements[0].ServerName, Transport: requirements[0].Transport,
+		EndpointDigest: requirements[0].EndpointDigest, Headers: requirements[0].Headers,
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceMaterializationV2{
+			Kind: requirements[0].AuthorizationSource.Kind, ConfigRequirementID: selector.ConfigRequirementID,
+			TargetEnv: requirements[0].AuthorizationSource.TargetEnv, Mode: requirements[0].AuthorizationSource.Mode,
+			ConfigReferenceDigest: common.ConfigReferenceDigest, FileReferenceDigest: digestProtectedRuntimeValue(path),
+			HelperCommandDigest: digestProtectedRuntimeValue(command),
+		},
+	}
+	materialization.ConfigReferenceDigest, err = executioncell.DigestProtectedRuntimeMCPConfigReferenceV2(materialization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.ContractVersion = executioncell.HostAdaptationV3ContractVersion
+	host.ConfigMaterializations = []executioncell.PreflightConfigMaterializationV1{common}
+	host.ProtectedRuntimeMCPConfigsV2 = []executioncell.ProtectedRuntimeMCPConfigMaterializationV2{materialization}
+	qw.HostAdaptationReceipt = rawJSONForRunner(t, host)
+	admission, err := legacyView.reg.PreflightHarness(qw, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := defaultMCPServersForHarness(qw, "/tmp/worktree", provider, agent.PromptModeAutonomous)
+	got, err := applyProtectedRuntimeMCPV2(qw, admission.selection, realizations, selector, servers, path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(got) != 1 || len(got[0].Headers) != 0 {
+		t.Fatalf("servers=%+v", got)
+	}
+	if helper, ok := agent.ProtectedRuntimeMCPHeadersHelper(got[0]); !ok || helper != command {
+		t.Fatalf("helper=%q ok=%v", helper, ok)
+	}
+	if _, ok := agent.ProtectedRuntimeMCPHeadersHelper(servers[0]); ok || servers[0].Headers["Authorization"] == "" {
+		t.Fatal("input slice mutated")
+	}
+
+	for _, tc := range []struct {
+		name   string
+		mutate func(*executioncell.HostAdaptationReceipt, *[]agent.MCPServerConfig, *string)
+	}{
+		{"missing common", func(h *executioncell.HostAdaptationReceipt, _ *[]agent.MCPServerConfig, _ *string) {
+			h.ConfigMaterializations = nil
+		}},
+		{"changed file path", func(_ *executioncell.HostAdaptationReceipt, _ *[]agent.MCPServerConfig, p *string) { *p += ".changed" }},
+		{"duplicate server", func(_ *executioncell.HostAdaptationReceipt, s *[]agent.MCPServerConfig, _ *string) {
+			*s = append(*s, (*s)[0])
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			changedHost := host
+			changedServers := append([]agent.MCPServerConfig(nil), servers...)
+			changedPath := path
+			tc.mutate(&changedHost, &changedServers, &changedPath)
+			changedWork := qw
+			changedWork.HostAdaptationReceipt = rawJSONForRunner(t, changedHost)
+			if _, err := applyProtectedRuntimeMCPV2(changedWork, admission.selection, realizations, selector, changedServers, changedPath); err == nil {
+				t.Fatal("changed authority accepted")
+			}
+		})
 	}
 }

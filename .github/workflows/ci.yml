@@ -101,11 +101,15 @@ jobs:
           test "$("${launcher}" --version)" = "codex-cli 0.154.0"
           test "$("${native}" --version)" = "codex-cli 0.154.0"
           sha256sum "${launcher}" "${native}"
+          donmai_bin="${fixture_dir}/donmai"
+          GOWORK=off go build -o "${donmai_bin}" ./cmd/donmai
+          test -x "${donmai_bin}"
+          sha256sum "${donmai_bin}"
 
           result_json="${RUNNER_TEMP}/codex-real-mcp-fixture.json"
-          CODEX_BIN="${launcher}" CODEX_NATIVE_BIN="${native}" GOWORK=off \
+          CODEX_BIN="${launcher}" CODEX_NATIVE_BIN="${native}" DONMAI_BIN="${donmai_bin}" GOWORK=off \
             go test -race -tags codex_integration \
-              -run '^TestIntegration_RealCodexInteractiveMCPDirectCalls$' \
+              -run '^TestIntegration_RealCodexInteractiveMCP(DirectCalls|HeaderHelperRefreshControls)$' \
               -count=1 -json ./provider/harness/codex \
             | tee "${result_json}" \
             | python3 scripts/test-summary.py
@@ -113,13 +117,14 @@ jobs:
           import json
           import sys
 
-          target = "TestIntegration_RealCodexInteractiveMCPDirectCalls"
+          targets = ["TestIntegration_RealCodexInteractiveMCPDirectCalls", "TestIntegration_RealCodexInteractiveMCPHeaderHelperRefreshControls"]
           events = [json.loads(line) for line in open(sys.argv[1], encoding="utf-8")]
-          passed = sum(event.get("Action") == "pass" and event.get("Test") == target for event in events)
-          skipped = sum(event.get("Action") == "skip" and event.get("Test") == target for event in events)
-          if passed != 1 or skipped != 0:
-              raise SystemExit(f"real Codex MCP fixture pass={passed} skip={skipped}; want pass=1 skip=0")
-          print("real Codex MCP fixture: PASS=1 SKIP=0")
+          for target in targets:
+              passed = sum(event.get("Action") == "pass" and event.get("Test") == target for event in events)
+              skipped = sum(event.get("Action") == "skip" and event.get("Test") == target for event in events)
+              if passed != 1 or skipped != 0:
+                  raise SystemExit(f"real Codex MCP fixture {target} pass={passed} skip={skipped}; want pass=1 skip=0")
+          print("real Codex MCP fixtures: PASS=2 SKIP=0")
           PY
 
       # Piped through scripts/test-summary.py so the run reports how many

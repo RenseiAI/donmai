@@ -128,6 +128,10 @@ type Config struct {
 	// same selector to its daemon preflight ProviderView.
 	ProtectedRuntimeMCPSelector runner.ProtectedRuntimeMCPSelector
 
+	// ProtectedRuntimeMCPV2Selector is process-owned and selects the exact
+	// refreshable protected MCP realization. The zero value is inactive.
+	ProtectedRuntimeMCPV2Selector runner.ProtectedRuntimeMCPV2Selector
+
 	// EnableA2AClient registers the formal A2A v1 client command group. It is
 	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
 	// command using the same noun before enabling the public surface.

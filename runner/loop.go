@@ -462,7 +462,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// we forward whatever the caller set plus the standard session
 	// metadata.
 	specEnv := buildSessionEnv(qw)
-	bootstrapMCPBearerCleanup, err := prepareSessionMCPBearerEnv(
+	effectiveMCPBearerFile, err := prepareSessionMCPBearerEnv(
 		qw,
 		specEnv,
 		os.Getenv(mcpGatewayTokenFileEnv),
@@ -473,7 +473,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		res.Error = err.Error()
 		return res, err
 	}
-	defer bootstrapMCPBearerCleanup()
+	defer effectiveMCPBearerFile.Cleanup()
 
 	// 4. Build MCP config. The exact harness adapter applies or denies the
 	// resulting set before spawn; nothing here is silently dropped.
@@ -490,9 +490,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
-	logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
+	if !r.protectedRuntimeMCPV2Selector.configured() {
+		logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
+	}
 	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
-	if err := validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers); err != nil {
+	if r.protectedRuntimeMCPV2Selector.configured() {
+		mcpServers, err = applyProtectedRuntimeMCPV2(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPV2Selector, mcpServers, effectiveMCPBearerFile.Path)
+	} else {
+		err = validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers)
+	}
+	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailureSpawn
 		res.Error = err.Error()

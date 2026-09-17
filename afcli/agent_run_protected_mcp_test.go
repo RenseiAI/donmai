@@ -37,13 +37,29 @@ func TestAgentRunProtectedRuntimeMCPSelectorReachesChildOptions(t *testing.T) {
 	}
 }
 
+func TestAgentRunProtectedRuntimeMCPV2SelectorReachesChildOptions(t *testing.T) {
+	const capability = "example.protected-mcp/v2"
+	realizations := receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeHumanControlled)
+	selector := runner.ProtectedRuntimeMCPV2Selector{
+		CapabilityID: capability, HarnessID: agent.HarnessPi,
+		AdapterProfileID: "pi/interactive/tool-lifecycle-v6", Mode: agent.PromptModeHumanControlled,
+		ConfigRequirementID: "example.session-config/v1",
+	}
+	commandOptions := agentRunOptions(Config{CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector}, "embedder")
+	var child runner.Options
+	applyAgentRunCapabilityOptions(&child, commandOptions)
+	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPV2Selector != selector {
+		t.Fatalf("child capability options = registry %p selector %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPV2Selector)
+	}
+}
+
 func TestAgentRunProtectedRuntimeMCPDefaultStaysLegacyAndMalformedUsesRunnerValidation(t *testing.T) {
 	commandOptions := agentRunOptions(Config{}, "embedder")
 	child := runner.Options{
 		Registry: runner.NewRegistry(), WorktreeManager: &worktree.Manager{}, Poster: &result.Poster{},
 	}
 	applyAgentRunCapabilityOptions(&child, commandOptions)
-	if child.CapabilityRealizations != nil || child.ProtectedRuntimeMCPSelector != (runner.ProtectedRuntimeMCPSelector{}) {
+	if child.CapabilityRealizations != nil || child.ProtectedRuntimeMCPSelector != (runner.ProtectedRuntimeMCPSelector{}) || child.ProtectedRuntimeMCPV2Selector != (runner.ProtectedRuntimeMCPV2Selector{}) {
 		t.Fatalf("default child capability options = registry %p selector %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPSelector)
 	}
 	if _, err := runner.New(child); err != nil {
