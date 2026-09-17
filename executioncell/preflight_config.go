@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"regexp"
 	"sort"
+	"strings"
 )
 
 // Applied preflight config contract versions, source discriminators, and the
@@ -352,6 +353,28 @@ func validateProtectedRuntimeMCPAuthorizationSourceV2(value ProtectedRuntimeMCPA
 	return nil
 }
 
+func validateProtectedRuntimeMCPHeadersV2(headers []ProtectedRuntimeMCPHeaderV1) error {
+	seen := make(map[string]struct{}, len(headers))
+	foundAuthorization := false
+	for _, header := range headers {
+		canonical := strings.ToLower(header.Name)
+		if _, duplicate := seen[canonical]; duplicate {
+			return errors.New("executioncell: protected runtime MCP v2 header names must be HTTP-case unique")
+		}
+		seen[canonical] = struct{}{}
+		if strings.EqualFold(header.Name, "Authorization") {
+			if header.Name != "Authorization" {
+				return errors.New("executioncell: protected runtime MCP v2 Authorization header name is not canonical")
+			}
+			foundAuthorization = true
+		}
+	}
+	if !foundAuthorization {
+		return errors.New("executioncell: protected runtime MCP v2 Authorization header is required")
+	}
+	return nil
+}
+
 // ValidateProtectedRuntimeMCPConfigRequirementV2 validates the closed v2
 // requirement shape. It does not perform the runtime common-materialization join.
 func ValidateProtectedRuntimeMCPConfigRequirementV2(value ProtectedRuntimeMCPConfigRequirementV2) error {
@@ -361,6 +384,9 @@ func ValidateProtectedRuntimeMCPConfigRequirementV2(value ProtectedRuntimeMCPCon
 		value.OperationalPayloadDigest, value.ServerName, value.Transport,
 		value.EndpointDigest, value.Headers,
 	); err != nil {
+		return err
+	}
+	if err := validateProtectedRuntimeMCPHeadersV2(value.Headers); err != nil {
 		return err
 	}
 	return validateProtectedRuntimeMCPAuthorizationSourceV2(value.AuthorizationSource)
@@ -389,6 +415,9 @@ func ValidateProtectedRuntimeMCPConfigMaterializationV2(value ProtectedRuntimeMC
 		value.OperationalPayloadDigest, value.ServerName, value.Transport,
 		value.EndpointDigest, value.Headers,
 	); err != nil {
+		return err
+	}
+	if err := validateProtectedRuntimeMCPHeadersV2(value.Headers); err != nil {
 		return err
 	}
 	source := value.AuthorizationSource

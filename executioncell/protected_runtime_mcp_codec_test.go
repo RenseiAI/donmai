@@ -151,14 +151,14 @@ func TestProtectedRuntimeMCPConfigV1RejectsV2Fields(t *testing.T) {
 	vectors := loadProtectedRuntimeMCPVectors(t)
 	count := 0
 	for _, vector := range vectors.Vectors {
-		if vector.Name != "v1-requirement-with-authorization-source" {
+		if vector.Decoder != "requirement-v1" || vector.Valid {
 			continue
 		}
 		count++
-		assertProtectedRuntimeMCPVector(t, vector)
+		t.Run(vector.Name, func(t *testing.T) { assertProtectedRuntimeMCPVector(t, vector) })
 	}
-	if count != 1 {
-		t.Fatalf("v1 closure vector count = %d, want 1", count)
+	if count < 2 {
+		t.Fatalf("v1 closure vector count = %d, want at least 2", count)
 	}
 }
 
@@ -243,4 +243,25 @@ func TestProtectedRuntimeMCPConfigV2ValidationIsStructuralOnly(t *testing.T) {
 		return
 	}
 	t.Fatal("structural-only materialization vector is missing")
+}
+
+func TestProtectedRuntimeMCPConfigV2RequiresCanonicalAuthorization(t *testing.T) {
+	t.Parallel()
+	vectors := loadProtectedRuntimeMCPVectors(t)
+	names := map[string]bool{
+		"v2-requirement-without-authorization-header":        true,
+		"v2-requirement-lowercase-authorization-header":      true,
+		"v2-requirement-case-duplicate-authorization-header": true,
+	}
+	count := 0
+	for _, vector := range vectors.Vectors {
+		if !names[vector.Name] {
+			continue
+		}
+		count++
+		assertProtectedRuntimeMCPVector(t, vector)
+	}
+	if count != len(names) {
+		t.Fatalf("canonical Authorization vector count = %d, want %d", count, len(names))
+	}
 }
