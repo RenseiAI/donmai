@@ -57,6 +57,29 @@ func TestMCPCmd_DocumentedAndWired(t *testing.T) {
 	}
 }
 
+func TestMCPGatewayHeaders_HiddenAndExecutesFromRegisteredRoot(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "token")
+	if err := os.WriteFile(path, []byte("fixture-token"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	var out bytes.Buffer
+	root := &cobra.Command{Use: "donmai"}
+	RegisterCommands(root, Config{})
+	child, _, err := root.Find([]string{"mcp", "gateway-headers"})
+	if err != nil || child == nil || !child.Hidden {
+		t.Fatalf("hidden child: child=%v err=%v", child, err)
+	}
+	root.SetArgs([]string{"mcp", "gateway-headers", "--token-file", path})
+	root.SetOut(&out)
+	root.SetErr(&bytes.Buffer{})
+	if err := root.Execute(); err != nil {
+		t.Fatal(err)
+	}
+	if got := strings.TrimSpace(out.String()); got != `{"Authorization":"Bearer fixture-token"}` {
+		t.Fatalf("stdout=%q", got)
+	}
+}
+
 func TestMCPCodeIntel_Verify(t *testing.T) {
 	dir := t.TempDir()
 	if err := os.WriteFile(filepath.Join(dir, "x.go"), []byte("package x\n\ntype Widget struct{}\n"), 0o600); err != nil {

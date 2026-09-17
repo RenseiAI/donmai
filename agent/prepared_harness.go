@@ -392,6 +392,7 @@ func normalizeRuntimeMCPServer(server MCPServerConfig) MCPServerConfig {
 	server.Env = nil
 	server.URL = "https://runtime.invalid"
 	server.Headers = nil
+	server.protectedRuntimeMCPHeadersHelper = ""
 	return server
 }
 

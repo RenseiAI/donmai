@@ -9,6 +9,7 @@ package agent
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/url"
 	"strconv"
@@ -295,6 +296,34 @@ type MCPServerConfig struct {
 	// Headers are HTTP headers to send on every MCP request. Typically
 	// holds the Authorization bearer for the platform's MCP route.
 	Headers map[string]string `json:"headers,omitempty"`
+
+	// protectedRuntimeMCPHeadersHelper is process-owned spawn authority. It is
+	// deliberately absent from every serialized representation.
+	protectedRuntimeMCPHeadersHelper string
+}
+
+// WithProtectedRuntimeMCPHeadersHelper returns a copied HTTP server carrying
+// one process-owned native header-helper command.
+func WithProtectedRuntimeMCPHeadersHelper(server MCPServerConfig, command string) (MCPServerConfig, error) {
+	if server.Type != "http" || strings.TrimSpace(server.URL) == "" {
+		return MCPServerConfig{}, errors.New("protected runtime MCP header helper requires an HTTP server")
+	}
+	if strings.TrimSpace(command) == "" {
+		return MCPServerConfig{}, errors.New("protected runtime MCP header helper command is empty")
+	}
+	for name := range server.Headers {
+		if strings.EqualFold(name, "Authorization") {
+			return MCPServerConfig{}, errors.New("protected runtime MCP header helper conflicts with Authorization")
+		}
+	}
+	server.protectedRuntimeMCPHeadersHelper = command
+	return server, nil
+}
+
+// ProtectedRuntimeMCPHeadersHelper reports process-owned helper authority.
+func ProtectedRuntimeMCPHeadersHelper(server MCPServerConfig) (string, bool) {
+	command := server.protectedRuntimeMCPHeadersHelper
+	return command, command != ""
 }
 
 // PermissionConfig is the runtime permission policy for the codex
