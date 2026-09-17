@@ -55,7 +55,18 @@ func codexMCPOAuthCredentialKey(server agent.MCPServerConfig) (string, error) {
 	if server.Name == "" || server.Type != "http" || server.URL == "" {
 		return "", errors.New("codex: protected MCP OAuth identity is incomplete")
 	}
-	payload, err := json.Marshal(struct {
+	for _, b := range []byte(server.URL) {
+		if b < 0x20 || b == 0x7f {
+			return "", errors.New("codex: protected MCP OAuth URL contains control bytes")
+		}
+	}
+	var encoded bytes.Buffer
+	encoder := json.NewEncoder(&encoded)
+	// Rust serde_json writes '&', '<', and '>' literally. Go's package-level
+	// Marshal HTML-escapes them, which would produce a different native store
+	// key for the same exact URL.
+	encoder.SetEscapeHTML(false)
+	err := encoder.Encode(struct {
 		Type    string            `json:"type"`
 		URL     string            `json:"url"`
 		Headers map[string]string `json:"headers"`
@@ -63,6 +74,11 @@ func codexMCPOAuthCredentialKey(server agent.MCPServerConfig) (string, error) {
 	if err != nil {
 		return "", err
 	}
+	payload := encoded.Bytes()
+	if len(payload) == 0 || payload[len(payload)-1] != '\n' {
+		return "", errors.New("codex: protected MCP OAuth identity encoding is incomplete")
+	}
+	payload = payload[:len(payload)-1]
 	sum := sha256.Sum256(payload)
 	return server.Name + "|" + hex.EncodeToString(sum[:])[:16], nil
 }

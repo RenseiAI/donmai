@@ -39,6 +39,26 @@ func TestProtectedMCPStoredOAuthGuardUsesActualCredentialIdentity(t *testing.T) 
 	}
 }
 
+func TestCodexMCPOAuthCredentialKeyMatchesPinnedSerdeJSONBytes(t *testing.T) {
+	server := helperBackedServer(t)
+	tests := []struct{ url, suffix string }{
+		{"https://example.test/mcp?redirect=a&tag=<ready>&end=>", "d57666c23b5362ca"},
+		{"https://example.test/mcp?quote=%22&slash=%5C", "13bc8f0c55d14dcc"},
+		{"https://example.test/mcp?raw=\"\\&x=1", "88e01bb8a4da445e"},
+	}
+	for _, tc := range tests {
+		server.URL = tc.url
+		key, err := codexMCPOAuthCredentialKey(server)
+		if err != nil || key != server.Name+"|"+tc.suffix {
+			t.Fatalf("URL %q key=%q err=%v", tc.url, key, err)
+		}
+	}
+	server.URL = "https://example.test/mcp?line=bad\nvalue"
+	if _, err := codexMCPOAuthCredentialKey(server); err == nil {
+		t.Fatal("control-bearing URL was accepted")
+	}
+}
+
 func TestHeadlessProtectedMCPPinsFileStoreAndRefusesStoredOAuthBeforeStart(t *testing.T) {
 	server := helperBackedServer(t)
 	boundary, err := newCodexConfigBoundary(t.TempDir(), false)
