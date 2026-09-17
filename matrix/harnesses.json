@@ -427,6 +427,35 @@
           ],
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        },
+        {
+          "id": "codex/interactive/tool-lifecycle-v2",
+          "mode": "human_controlled",
+          "toolPluginDelivery": "unsupported",
+          "mcpDelivery": "codex_cli_mcp_config",
+          "nativeToolPolicyDelivery": "unsupported",
+          "permissionConfigDelivery": "unsupported",
+          "mcpToolPolicyDelivery": "unsupported",
+          "toolHookDelivery": "unsupported",
+          "lifecycleDelivery": "coarse_pty_events",
+          "lifecycleFidelity": "coarse",
+          "lifecycleEvents": [
+            "init",
+            "result"
+          ],
+          "replayDelivery": "terminal_cast_replay",
+          "replayFidelity": "coarse",
+          "replayEvents": [
+            "init",
+            "result"
+          ],
+          "cleanupDelivery": "handle_stop_and_resource_cleanup",
+          "fallbackDeliveries": [
+            "coarse_pty_events",
+            "terminal_cast_replay"
+          ],
+          "evidenceTier": "native_verified",
+          "productionEligible": true
         }
       ]
     },
