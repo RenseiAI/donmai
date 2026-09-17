@@ -281,6 +281,12 @@ func TestMaterializeProtectedRuntimeMCPV2RefusesIncompleteOrChangedJoin(t *testi
 	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicate, build); err == nil {
 		t.Fatal("duplicate common materialization accepted")
 	}
+	duplicateBindings := append([]executioncell.PreflightConfigMaterializationV1(nil), common...)
+	duplicateBindings[0].Bindings = append(append([]executioncell.PreflightConfigBindingMaterializationV1(nil), common[0].Bindings...), common[0].Bindings[0])
+	duplicateBindings[0].ConfigReferenceDigest, _ = executioncell.DigestPreflightConfigReference(duplicateBindings[0])
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicateBindings, build); err == nil {
+		t.Fatal("duplicate matching common file binding accepted")
+	}
 	changedSpec := spec
 	changedSpec.Env = map[string]string{}
 	for key, value := range spec.Env {
