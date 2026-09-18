@@ -208,14 +208,14 @@ func TestCapabilityRealizationSelectionV1RejectsLossyStringsAndKeepsCanonicalDom
 
 	for name, candidate := range map[string]CapabilityRealizationSelectionV1{
 		"invalid Go UTF-8": func() CapabilityRealizationSelectionV1 {
-			copy := value
-			copy.HarnessID = string([]byte{0xff})
-			return copy
+			mutated := value
+			mutated.HarnessID = string([]byte{0xff})
+			return mutated
 		}(),
 		"oversized canonical value": func() CapabilityRealizationSelectionV1 {
-			copy := value
-			copy.HarnessID = strings.Repeat("h", maxCapabilityRealizationSelectionBytes)
-			return copy
+			mutated := value
+			mutated.HarnessID = strings.Repeat("h", maxCapabilityRealizationSelectionBytes)
+			return mutated
 		}(),
 	} {
 		t.Run(name, func(t *testing.T) {
