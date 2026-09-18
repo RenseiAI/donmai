@@ -150,7 +150,13 @@ type Shim struct {
 	// adopting a new one closes this.
 	ctrl        *controllerConn
 	orphanTimer *time.Timer
-	tombstoned  bool
+	// orphanEpisode fences callbacks from timers that were cancelled by a later
+	// adoption or replaced by a later controller-loss episode. orphanExpiring
+	// records that a matching deadline already won the lifecycle race, before
+	// its bounded terminalization starts.
+	orphanEpisode  uint64
+	orphanExpiring bool
+	tombstoned     bool
 
 	closeOnce  sync.Once
 	stopOnce   sync.Once
@@ -538,6 +544,7 @@ func (s *Shim) Close() error {
 			s.orphanTimer.Stop()
 			s.orphanTimer = nil
 		}
+		s.orphanEpisode++
 		s.mu.Unlock()
 		if ctrl != nil {
 			ctrl.close()
@@ -730,26 +737,38 @@ func (s *Shim) watchHarness() {
 
 // armOrphan starts the bounded controller-loss deadline (§D8).
 func (s *Shim) armOrphan() {
-	deadline := s.now().Add(s.orphan.Deadline)
 	s.mu.Lock()
-	if s.phase == shimwire.PhaseExited {
-		s.mu.Unlock()
+	deadline, armed := s.armOrphanLocked()
+	s.mu.Unlock()
+	if !armed {
 		return
 	}
-	if s.orphanTimer != nil {
-		s.orphanTimer.Stop()
-	}
-	s.phase = shimwire.PhaseOrphaned
-	s.orphanTimer = time.AfterFunc(s.orphan.Deadline, s.onOrphanDeadline)
-	s.mu.Unlock()
 	if err := s.publishRecordWithDeadline(deadline); err != nil {
 		s.logger.Warn("sessionshim: republish record on orphan", "session", s.id.String(), "error", err)
 	}
 }
 
+// armOrphanLocked moves a live controllerless shim into one fresh orphan
+// episode. s.mu must be held by the caller.
+func (s *Shim) armOrphanLocked() (time.Time, bool) {
+	if s.phase == shimwire.PhaseExited || s.orphanExpiring {
+		return time.Time{}, false
+	}
+	if s.orphanTimer != nil {
+		s.orphanTimer.Stop()
+	}
+	s.orphanEpisode++
+	episode := s.orphanEpisode
+	deadline := s.now().Add(s.orphan.Deadline)
+	s.phase = shimwire.PhaseOrphaned
+	s.orphanTimer = time.AfterFunc(s.orphan.Deadline, func() { s.onOrphanDeadline(episode) })
+	return deadline, true
+}
+
 // disarmOrphan cancels the deadline because a controller adopted in time.
 func (s *Shim) disarmOrphan() {
 	s.mu.Lock()
+	s.orphanEpisode++
 	if s.orphanTimer != nil {
 		s.orphanTimer.Stop()
 		s.orphanTimer = nil
@@ -763,12 +782,44 @@ func (s *Shim) disarmOrphan() {
 	}
 }
 
+// loseController closes ctrl and applies controller loss only when that exact
+// connection is still current. The compare, clear, and orphan transition share
+// s.mu so an old failed handshake cannot orphan a newer controller.
+func (s *Shim) loseController(ctrl *controllerConn) {
+	ctrl.close()
+	s.mu.Lock()
+	if s.ctrl != ctrl {
+		s.mu.Unlock()
+		return
+	}
+	s.ctrl = nil
+	deadline, armed := s.armOrphanLocked()
+	s.mu.Unlock()
+	if !armed {
+		return
+	}
+	if err := s.publishRecordWithDeadline(deadline); err != nil {
+		s.logger.Warn("sessionshim: republish record on controller loss", "session", s.id.String(), "error", err)
+	}
+}
+
 // onOrphanDeadline fires when no controller returned in time.
 //
 // It terminates and reaps, then leaves a tombstone. It does NOT — and cannot —
 // authorize a claim release: that decision lives in ReleaseDecision and requires
 // this tombstone as evidence, which is the asymmetry §D8 insists on.
-func (s *Shim) onOrphanDeadline() {
+func (s *Shim) onOrphanDeadline(episode uint64) {
+	s.mu.Lock()
+	if episode != s.orphanEpisode || s.orphanTimer == nil || s.phase != shimwire.PhaseOrphaned {
+		s.mu.Unlock()
+		return
+	}
+	// A deadline that obtains this lock wins over a later adoption. Mark that
+	// decision before releasing the lock so a handshake cannot install a new
+	// controller while terminalization is underway.
+	s.orphanTimer = nil
+	s.orphanExpiring = true
+	s.mu.Unlock()
 	s.logger.Warn("sessionshim: orphan deadline reached; reaping harness process group",
 		"session", s.id.String(), "shim", s.shimID, "deadline", s.orphan.Deadline)
 	ctx, cancel := context.WithTimeout(context.Background(), s.orphan.TerminationGrace+5*time.Second)
@@ -972,6 +1023,12 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// loop. The retained Exit frame rides the ordinary replay path below.
 	s.recordMu.Lock()
 	s.mu.Lock()
+	if s.orphanExpiring {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodePhaseUnknown, "orphan deadline is terminating this shim")
+		return net.ErrClosed
+	}
 	if welcome.ProposedGeneration <= s.gen {
 		current := s.gen
 		s.mu.Unlock()
@@ -996,6 +1053,12 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	s.ctrl = ctrl
 	s.mu.Unlock()
 	s.recordMu.Unlock()
+	loopOwned := false
+	defer func() {
+		if !loopOwned {
+			s.loseController(ctrl)
+		}
+	}()
 
 	// §D4: the old controller's socket is closed the moment a new generation
 	// commits. A file lock would not be enough — an old daemon can hold an open
@@ -1016,7 +1079,6 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	}
 
 	if err := writeTyped(w, shimwire.TypeAdopted, func() ([]byte, error) { return shimwire.EncodeAdopted(adopted) }); err != nil {
-		ctrl.close()
 		return err
 	}
 	_ = conn.SetDeadline(time.Time{})
@@ -1025,19 +1087,16 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// carrier render the snapshot as if it were continuous.
 	if gap != nil {
 		if err := writeTyped(w, shimwire.TypeGap, func() ([]byte, error) { return shimwire.EncodeGap(*gap) }); err != nil {
-			ctrl.close()
 			return err
 		}
 	}
 	if snap != nil {
 		if err := s.writeSnapshotMsg(ctrl, *snap); err != nil {
-			ctrl.close()
 			return err
 		}
 	}
 	if rawSnapshot != nil {
 		if err := s.writeHostFrame(ctrl, 0, *rawSnapshot); err != nil {
-			ctrl.close()
 			return err
 		}
 	}
@@ -1045,6 +1104,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	if !s.startControllerLoops(ctrl, r) {
 		return net.ErrClosed
 	}
+	loopOwned = true
 	return nil
 }
 
@@ -1342,19 +1402,7 @@ func (s *Shim) writeHostFrameSnapshotPair(
 // fence on every mutating one.
 func (s *Shim) readControl(ctrl *controllerConn, r *shimwire.Reader) {
 	defer func() {
-		ctrl.close()
-		// Losing THIS controller only arms the orphan clock if it is still the
-		// current one. A connection superseded by a newer adoption must not
-		// restart a deadline the new controller already cancelled.
-		if s.currentController() == ctrl {
-			s.mu.Lock()
-			s.ctrl = nil
-			exited := s.phase == shimwire.PhaseExited
-			s.mu.Unlock()
-			if !exited {
-				s.armOrphan()
-			}
-		}
+		s.loseController(ctrl)
 	}()
 
 	for {
