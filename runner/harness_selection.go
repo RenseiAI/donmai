@@ -95,6 +95,16 @@ func (a *HarnessAdmission) CanonicalHarnessRef() (executioncell.HarnessRef, bool
 // the named legacy adapter inside Run. Explicit denials carry a canonical
 // immutable denied receipt on HarnessAdmissionError.
 func (r *Registry) PreflightHarness(qw QueuedWork, realizations ...*agent.CapabilityRealizationRegistry) (*HarnessAdmission, error) {
+	var realizationRegistry *agent.CapabilityRealizationRegistry
+	if len(realizations) > 0 {
+		realizationRegistry = realizations[0]
+	}
+	bound, bindErr := bindCapabilityRealizationSelection(qw, realizationRegistry, protectedRuntimeMCPSelectionPolicy{}, true)
+	if bindErr != nil {
+		denial := attachDeniedHarnessReceipt(qw, bindErr, time.Now())
+		return deniedHarnessAdmissionToken(r, qw, executioncell.ImmutableAdmissionReceipt{}, denial), denial
+	}
+	qw = bound
 	if len(qw.AdmissionReceipt) > 0 {
 		return r.preflightAdmissionReceipt(qw, true, realizations...)
 	}

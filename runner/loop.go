@@ -490,11 +490,12 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
-	if !r.protectedRuntimeMCPV2Selector.configured() {
+	v2Applies := r.protectedRuntimeMCPV2Applies(qw, selection)
+	if !v2Applies {
 		logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
 	}
 	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
-	if r.protectedRuntimeMCPV2Selector.configured() {
+	if v2Applies {
 		mcpServers, err = applyProtectedRuntimeMCPV2(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPV2Selector, mcpServers, effectiveMCPBearerFile.Path)
 	} else {
 		err = validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers)
@@ -530,9 +531,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// filtered by qw.WorkType, then their file bodies are appended AFTER
 	// the skill block. Fragments with an empty [when] list match all
 	// workTypes (no filter). Additive: nil sources = no fragment injection.
-	// Reset SkillAppend at the start of each Run so no session bleeds
-	// into the next (the Runner is long-lived; SkillAppend is per-Run).
-	r.promptBuilder.SkillAppend = ""
+	// SkillAppend is per-run scratch state. Keep it on a fresh builder so
+	// concurrent sessions on one long-lived Runner cannot overwrite each
+	// other's skill composition. SystemAppend and Registry are immutable
+	// construction inputs and remain shared by value/pointer respectively.
+	promptBuilder := &prompt.Builder{
+		SystemAppend: r.promptBuilder.SystemAppend,
+		Registry:     r.promptBuilder.Registry,
+	}
 
 	var kitDisallowedTools []string
 	if len(kitSkillSources) > 0 {
@@ -543,7 +549,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"err", skillErr,
 			)
 		}
-		r.promptBuilder.SkillAppend = loaded.SystemAppend
+		promptBuilder.SkillAppend = loaded.SystemAppend
 		kitDisallowedTools = loaded.DisallowedTools
 		if loaded.SystemAppend != "" {
 			r.logger.Info("kit skills injected into system prompt",
@@ -559,8 +565,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// kit-derived disallowed set. Inline skills carry their body verbatim on
 	// the wire (no SKILL.md on disk). Additive: no card skills → no change.
 	if len(qw.Skills) > 0 {
-		newAppend, inlineDisallow, injected := foldInlineSkills(r.promptBuilder.SkillAppend, qw.Skills)
-		r.promptBuilder.SkillAppend = newAppend
+		newAppend, inlineDisallow, injected := foldInlineSkills(promptBuilder.SkillAppend, qw.Skills)
+		promptBuilder.SkillAppend = newAppend
 		kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
 		if injected > 0 {
 			r.logger.Info("agent-card inline skills injected into system prompt",
@@ -583,11 +589,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		if loadedFrags.SystemAppend != "" {
 			// Append to any skill text already set above.
-			existing := r.promptBuilder.SkillAppend
+			existing := promptBuilder.SkillAppend
 			if existing != "" {
-				r.promptBuilder.SkillAppend = existing + "\n\n" + loadedFrags.SystemAppend
+				promptBuilder.SkillAppend = existing + "\n\n" + loadedFrags.SystemAppend
 			} else {
-				r.promptBuilder.SkillAppend = loadedFrags.SystemAppend
+				promptBuilder.SkillAppend = loadedFrags.SystemAppend
 			}
 			r.logger.Info("kit prompt fragments injected into system prompt",
 				"sessionId", qw.SessionID,
@@ -612,7 +618,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Render source-addressed prompt authorities. The exact harness profile,
 	// not a coarse provider capability, decides whether memory/context rides a
 	// native system surface or the first turn.
-	composition, err := r.promptBuilder.BuildComposition(qw.QueuedWork)
+	composition, err := promptBuilder.BuildComposition(qw.QueuedWork)
 	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailurePromptRender
@@ -1441,6 +1447,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	return res, nil
+}
+
+func (r *Runner) protectedRuntimeMCPV2Applies(qw QueuedWork, selection harnessSelection) bool {
+	if !r.protectedRuntimeMCPV2Selector.configured() || qw.toolLifecycleProfileID != r.protectedRuntimeMCPV2Selector.AdapterProfileID {
+		return false
+	}
+	return protectedRuntimeMCPTargetsSession(qw, selection, r.protectedRuntimeMCPV2Selector.realizationSelector())
 }
 
 // newInjectAcceptor builds the heartbeat's OnInject callback: the PRODUCTION

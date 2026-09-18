@@ -107,10 +107,11 @@ var daemonRegistryBuilder = BuildDecoratedAgentRunRegistry
 func daemonProviderView(cfg Config, logger *slog.Logger) (*runner.ProviderView, error) {
 	providerReg := daemonRegistryBuilder(logger, cfg.AgentSpecExtensionDecorator)
 	return runner.NewProviderViewWithOptions(providerReg, runner.ProviderViewOptions{
-		Decorator:                     cfg.AgentSpecExtensionDecorator,
-		CapabilityRealizations:        cfg.CapabilityRealizations,
-		ProtectedRuntimeMCPSelector:   cfg.ProtectedRuntimeMCPSelector,
-		ProtectedRuntimeMCPV2Selector: cfg.ProtectedRuntimeMCPV2Selector,
+		Decorator:                              cfg.AgentSpecExtensionDecorator,
+		CapabilityRealizations:                 cfg.CapabilityRealizations,
+		ProtectedRuntimeMCPSelector:            cfg.ProtectedRuntimeMCPSelector,
+		ProtectedRuntimeMCPV2Selector:          cfg.ProtectedRuntimeMCPV2Selector,
+		ProtectedRuntimeMCPDualSelectionPolicy: cfg.ProtectedRuntimeMCPDualSelectionPolicy,
 	})
 }
 

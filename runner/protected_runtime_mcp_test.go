@@ -3,19 +3,59 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
+	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
 const protectedRuntimeMCPTestCapability = "example.protected-mcp/v1"
+
+var errDualSelectionRuntimeSpawn = errors.New("dual selection runtime reached spawn")
+
+type dualSelectionRuntimeProvider struct {
+	mu       sync.Mutex
+	manifest agent.HarnessManifest
+	specs    map[string]agent.Spec
+}
+
+func (*dualSelectionRuntimeProvider) Name() agent.ProviderName { return agent.ProviderCodex }
+
+func (*dualSelectionRuntimeProvider) Capabilities() agent.Capabilities {
+	return codexCapabilitiesForTest()
+}
+
+func (p *dualSelectionRuntimeProvider) Manifest() agent.HarnessManifest { return p.manifest }
+
+func (p *dualSelectionRuntimeProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	p.mu.Lock()
+	p.specs[spec.Env["DONMAI_SESSION_ID"]] = spec
+	p.mu.Unlock()
+	return nil, errDualSelectionRuntimeSpawn
+}
+
+func (p *dualSelectionRuntimeProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
+	return nil, errors.New("dual selection runtime must not resume")
+}
+
+func (*dualSelectionRuntimeProvider) Shutdown(context.Context) error { return nil }
+
+func (p *dualSelectionRuntimeProvider) spawnedSpec(sessionID string) (agent.Spec, bool) {
+	p.mu.Lock()
+	defer p.mu.Unlock()
+	spec, ok := p.specs[sessionID]
+	return spec, ok
+}
 
 func protectedRuntimeMCPTestSelector(t *testing.T, provider agent.Provider, mode agent.PromptSessionMode) ProtectedRuntimeMCPSelector {
 	t.Helper()
@@ -425,7 +465,7 @@ func runProtectedRuntimeMCPMixedChild(t *testing.T, fixture protectedRuntimeMCPM
 	if err != nil {
 		return nil, err
 	}
-	return run.runLoop(context.Background(), qw, time.Now().UnixMilli(), admission)
+	return run.RunAdmitted(context.Background(), qw, admission)
 }
 
 func TestProtectedRuntimeMCPExactSelectorPreservesPiAndEnforcesCodexChild(t *testing.T) {
@@ -583,6 +623,511 @@ func attachProtectedRuntimeMCPMaterialization(t *testing.T, receipt json.RawMess
 	return raw
 }
 
+func attachProtectedRuntimeMCPMaterializationV2(
+	t *testing.T,
+	receipt json.RawMessage,
+	requirement executioncell.ProtectedRuntimeMCPConfigRequirementV2,
+	tokenPath string,
+	token string,
+) json.RawMessage {
+	t.Helper()
+	command, err := canonicalProtectedRuntimeMCPHelperCommand(tokenPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	common := executioncell.PreflightConfigMaterializationV1{
+		ContractVersion:          executioncell.PreflightConfigMaterializationContractVersion,
+		RequirementID:            requirement.AuthorizationSource.ConfigRequirementID,
+		AuthorityBindingDigest:   strings.Repeat("a", 64),
+		OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+		Bindings: []executioncell.PreflightConfigBindingMaterializationV1{{
+			TargetEnv: requirement.AuthorizationSource.TargetEnv,
+			Source: executioncell.PreflightConfigBindingSourceV1{
+				Kind: requirement.AuthorizationSource.Kind,
+				Mode: requirement.AuthorizationSource.Mode,
+			},
+			BearerContentDigest: digestProtectedRuntimeValue(token),
+			FileReferenceDigest: digestProtectedRuntimeValue(tokenPath),
+			Mode:                requirement.AuthorizationSource.Mode,
+		}},
+	}
+	common.ConfigReferenceDigest, err = executioncell.DigestPreflightConfigReference(common)
+	if err != nil {
+		t.Fatal(err)
+	}
+	materialization := executioncell.ProtectedRuntimeMCPConfigMaterializationV2{
+		ContractVersion: requirement.ContractVersion, RequirementID: requirement.RequirementID,
+		AuthorityBindingDigest: requirement.AuthorityBindingDigest, OperationalPayloadDigest: requirement.OperationalPayloadDigest,
+		ServerName: requirement.ServerName, Transport: requirement.Transport, EndpointDigest: requirement.EndpointDigest,
+		Headers: append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...),
+		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceMaterializationV2{
+			Kind: requirement.AuthorizationSource.Kind, ConfigRequirementID: requirement.AuthorizationSource.ConfigRequirementID,
+			TargetEnv: requirement.AuthorizationSource.TargetEnv, Mode: requirement.AuthorizationSource.Mode,
+			ConfigReferenceDigest: common.ConfigReferenceDigest, FileReferenceDigest: digestProtectedRuntimeValue(tokenPath),
+			HelperCommandDigest: digestProtectedRuntimeValue(command),
+		},
+	}
+	materialization.ConfigReferenceDigest, err = executioncell.DigestProtectedRuntimeMCPConfigReferenceV2(materialization)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.ContractVersion = executioncell.HostAdaptationV3ContractVersion
+	host.ConfigMaterializations = []executioncell.PreflightConfigMaterializationV1{common}
+	host.ProtectedRuntimeMCPConfigsV2 = []executioncell.ProtectedRuntimeMCPConfigMaterializationV2{materialization}
+	raw := rawJSONForRunner(t, host)
+	if _, err := executioncell.DecodeHostAdaptationReceipt(raw); err != nil {
+		t.Fatal(err)
+	}
+	return raw
+}
+
+type dualSelectionRuntimeWork struct {
+	work       QueuedWork
+	admission  *HarnessAdmission
+	profileID  string
+	serverName string
+	skillBody  string
+	v2         bool
+}
+
+func prepareDualSelectionRuntimeWork(
+	t *testing.T,
+	view *ProviderView,
+	registry *Registry,
+	realizations *agent.CapabilityRealizationRegistry,
+	policy ProtectedRuntimeMCPDualSelectionPolicy,
+	compiled agent.CompiledCapabilityRealization,
+	sessionID string,
+	tokenPath string,
+) dualSelectionRuntimeWork {
+	t.Helper()
+	qw := exactReceiptQueuedWork(sessionID)
+	qw.IssueIdentifier = "DUAL-RUNTIME"
+	qw.Body = "exercise one dual-configured protected runtime"
+	qw.PlatformURL = "https://platform.example/"
+	qw.McpAuthToken = "session-bearer"
+	qw.Skills = []prompt.SkillSpec{{ID: "dual-runtime-skill", Body: "per-run skill: " + sessionID}}
+	baseOperational, err := CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(baseOperational, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["capabilityRealizationSelection"] = selectionFromCompiled(compiled)
+	operational, err := executioncell.CanonicalJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.OperationalPayload = operational
+	qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell(
+		"harness/v2", "gpt-test", executioncell.SessionAutonomous,
+		[]executioncell.CapabilityRequirement{{Name: protectedRuntimeMCPTestCapability}},
+	))
+	qw, detail := protectedRuntimeMCPPreflightInput(t, qw)
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatalf("PreflightExecution(%s): %v", sessionID, err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(receipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var toolReceipt agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &toolReceipt); err != nil {
+		t.Fatal(err)
+	}
+	if toolReceipt.ProfileID != compiled.Declaration.AdapterVersion {
+		t.Fatalf("host profile for %s = %q, want %q", sessionID, toolReceipt.ProfileID, compiled.Declaration.AdapterVersion)
+	}
+
+	runtimeWork := dualSelectionRuntimeWork{
+		profileID: compiled.Declaration.AdapterVersion,
+		skillBody: qw.Skills[0].Body,
+	}
+	if compiled.Declaration.AdapterVersion == policy.V1.AdapterProfileID {
+		requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+		if err != nil || len(requirements) != 1 {
+			t.Fatalf("V1 requirements for %s = %+v err=%v", sessionID, requirements, err)
+		}
+		if v2, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt); err != nil || v2 != nil {
+			t.Fatalf("V2 requirements for selected V1 %s = %+v err=%v", sessionID, v2, err)
+		}
+		qw.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterialization(t, receipt, requirements[0])
+		runtimeWork.serverName = requirements[0].ServerName
+	} else {
+		requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(detail, receipt)
+		if err != nil || len(requirements) != 1 {
+			t.Fatalf("V2 requirements for %s = %+v err=%v", sessionID, requirements, err)
+		}
+		if v1, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt); err != nil || v1 != nil {
+			t.Fatalf("V1 requirements for selected V2 %s = %+v err=%v", sessionID, v1, err)
+		}
+		qw.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterializationV2(t, receipt, requirements[0], tokenPath, qw.McpAuthToken)
+		runtimeWork.serverName = requirements[0].ServerName
+		runtimeWork.v2 = true
+	}
+
+	bound, admission, err := registry.PreflightHarnessWithProtectedRuntimeMCPSelection(
+		qw, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy,
+	)
+	if err != nil {
+		t.Fatalf("child preflight for %s: %v", sessionID, err)
+	}
+	if bound.toolLifecycleProfileID != runtimeWork.profileID {
+		t.Fatalf("child profile for %s = %q, want %q", sessionID, bound.toolLifecycleProfileID, runtimeWork.profileID)
+	}
+	runtimeWork.work, runtimeWork.admission = bound, admission
+	return runtimeWork
+}
+
+func assertDualSelectionRuntimeSpawn(t *testing.T, provider *dualSelectionRuntimeProvider, runtimeWork dualSelectionRuntimeWork, tokenPath string) {
+	t.Helper()
+	spec, ok := provider.spawnedSpec(runtimeWork.work.SessionID)
+	if !ok {
+		t.Fatalf("session %s did not reach provider spawn", runtimeWork.work.SessionID)
+	}
+	if spec.PreparedHarness == nil || spec.PreparedHarness.ToolLifecycleReceipt.ProfileID != runtimeWork.profileID {
+		t.Fatalf("spawned session %s profile = %#v, want %q", runtimeWork.work.SessionID, spec.PreparedHarness, runtimeWork.profileID)
+	}
+	if spec.PromptPlan == nil || spec.PromptPlan.HarnessProtocol == nil ||
+		!strings.Contains(spec.PromptPlan.HarnessProtocol.Text, runtimeWork.skillBody) {
+		t.Fatalf("spawned session %s omitted its per-run skill %q", runtimeWork.work.SessionID, runtimeWork.skillBody)
+	}
+	var selected *agent.MCPServerConfig
+	for i := range spec.MCPServers {
+		if spec.MCPServers[i].Name == runtimeWork.serverName {
+			selected = &spec.MCPServers[i]
+			break
+		}
+	}
+	if selected == nil {
+		t.Fatalf("spawned session %s omitted protected server %q", runtimeWork.work.SessionID, runtimeWork.serverName)
+	}
+	helper, hasHelper := agent.ProtectedRuntimeMCPHeadersHelper(*selected)
+	if runtimeWork.v2 {
+		wantHelper, err := canonicalProtectedRuntimeMCPHelperCommand(tokenPath)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if !hasHelper || helper != wantHelper || selected.Headers["Authorization"] != "" {
+			t.Fatalf("spawned V2 session %s helper=%q headers=%v", runtimeWork.work.SessionID, helper, selected.Headers)
+		}
+		return
+	}
+	if hasHelper || selected.Headers["Authorization"] == "" {
+		t.Fatalf("spawned V1 session %s helper=%q headers=%v", runtimeWork.work.SessionID, helper, selected.Headers)
+	}
+}
+
+func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurrently(t *testing.T) {
+	manifest := codexManifestForTest()
+	v1Profile, ok := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
+	if !ok {
+		t.Fatal("missing autonomous profile")
+	}
+	v2Profile := v1Profile
+	v2Profile.ID += "-v2"
+	v2Profile.EvidenceTier = "native_verified"
+	v2Profile.ProductionEligible = true
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, v2Profile)
+	provider := &dualSelectionRuntimeProvider{manifest: manifest, specs: make(map[string]agent.Spec)}
+	registry := NewRegistry()
+	if err := registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	seed := exactReceiptQueuedWork("dual-runtime-seed")
+	seed.PlatformURL, seed.McpAuthToken = "https://platform.example/", "session-bearer"
+	v1 := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, seed, v1Profile.ID, agent.PromptModeAutonomous)
+	v2 := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, seed, v2Profile.ID, agent.PromptModeAutonomous)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{v1, v2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := ProtectedRuntimeMCPDualSelectionPolicy{
+		V1: ProtectedRuntimeMCPSelector{
+			CapabilityID: protectedRuntimeMCPTestCapability, HarnessID: agent.HarnessCodex,
+			AdapterProfileID: v1Profile.ID, Mode: agent.PromptModeAutonomous,
+		},
+		V2: ProtectedRuntimeMCPV2Selector{
+			CapabilityID: protectedRuntimeMCPTestCapability, HarnessID: agent.HarnessCodex,
+			AdapterProfileID: v2Profile.ID, Mode: agent.PromptModeAutonomous,
+			ConfigRequirementID: "example.session-config/v1",
+		},
+	}
+	view, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	tokenPath := filepath.Join(t.TempDir(), "mcp-token")
+	if err := os.WriteFile(tokenPath, []byte(seed.McpAuthToken), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv(mcpGatewayTokenFileEnv, tokenPath)
+
+	server := mockPlatformServer(t)
+	t.Cleanup(server.Close)
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: server.URL, WorkerID: "worker_test", AuthToken: "worker-token",
+		HTTPClient: server.Client(), BaseDelay: time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	run, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+
+	runOne := func(runtimeWork dualSelectionRuntimeWork) error {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		result, runErr := run.RunAdmitted(ctx, runtimeWork.work, runtimeWork.admission)
+		if !errors.Is(runErr, errDualSelectionRuntimeSpawn) || result == nil || result.Status != "failed" {
+			return errors.Join(errors.New("RunAdmitted did not reach the controlled spawn boundary"), runErr)
+		}
+		return nil
+	}
+
+	sequential := []dualSelectionRuntimeWork{
+		prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-sequential-v1", tokenPath),
+		prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v2, "dual-runtime-sequential-v2", tokenPath),
+	}
+	for _, runtimeWork := range sequential {
+		if err := runOne(runtimeWork); err != nil {
+			t.Fatalf("sequential %s: %v", runtimeWork.work.SessionID, err)
+		}
+		assertDualSelectionRuntimeSpawn(t, provider, runtimeWork, tokenPath)
+	}
+
+	concurrent := []dualSelectionRuntimeWork{
+		prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-concurrent-v1", tokenPath),
+		prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v2, "dual-runtime-concurrent-v2", tokenPath),
+	}
+	errs := make(chan error, len(concurrent))
+	var wg sync.WaitGroup
+	for _, runtimeWork := range concurrent {
+		wg.Add(1)
+		go func(runtimeWork dualSelectionRuntimeWork) {
+			defer wg.Done()
+			errs <- runOne(runtimeWork)
+		}(runtimeWork)
+	}
+	wg.Wait()
+	close(errs)
+	for err := range errs {
+		if err != nil {
+			t.Fatal(err)
+		}
+	}
+	for _, runtimeWork := range concurrent {
+		assertDualSelectionRuntimeSpawn(t, provider, runtimeWork, tokenPath)
+	}
+	for i, runtimeWork := range concurrent {
+		spec, _ := provider.spawnedSpec(runtimeWork.work.SessionID)
+		other := concurrent[1-i]
+		if strings.Contains(spec.PromptPlan.HarnessProtocol.Text, other.skillBody) {
+			t.Fatalf("spawned session %s inherited sibling skill %q", runtimeWork.work.SessionID, other.skillBody)
+		}
+	}
+
+	recomputed := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-recomputed-v1", tokenPath)
+	recomputed.work.toolLifecycleProfileID = v2Profile.ID
+	if err := runOne(recomputed); err != nil {
+		t.Fatalf("stale private profile was not recomputed from retained raw selection: %v", err)
+	}
+	assertDualSelectionRuntimeSpawn(t, provider, recomputed, tokenPath)
+
+	absent := exactReceiptQueuedWork("dual-runtime-historical-absence")
+	absent.IssueIdentifier = "DUAL-RUNTIME"
+	absent.Body = "exercise historical absence policy"
+	absent.PlatformURL, absent.McpAuthToken = seed.PlatformURL, seed.McpAuthToken
+	absent.OperationalPayload, err = CanonicalOperationalPayload(absent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absent = attachAdmittedExecutionCell(t, absent, exactReceiptCell(
+		"harness/v2", "gpt-test", executioncell.SessionAutonomous,
+		[]executioncell.CapabilityRequirement{{Name: protectedRuntimeMCPTestCapability}},
+	))
+	absent, absentDetail := protectedRuntimeMCPPreflightInput(t, absent)
+	if receipt, err := view.PreflightExecution(absentDetail); err == nil {
+		t.Fatalf("default dual absence policy produced ready host receipt: %s", receipt)
+	}
+	historicalPolicy := policy
+	historicalPolicy.HistoricalAbsence = ProtectedRuntimeMCPHistoricalAbsenceV1
+	historicalView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalReceipt, err := historicalView.PreflightExecution(absentDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalRequirements, err := historicalView.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(absentDetail, historicalReceipt)
+	if err != nil || len(historicalRequirements) != 1 {
+		t.Fatalf("historical V1 requirements=%+v err=%v", historicalRequirements, err)
+	}
+	absent.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterialization(t, historicalReceipt, historicalRequirements[0])
+	absent, historicalAdmission, err := registry.PreflightHarnessWithProtectedRuntimeMCPSelection(
+		absent, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, historicalPolicy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalRunner, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
+		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalResult, historicalErr := historicalRunner.RunAdmitted(t.Context(), absent, historicalAdmission)
+	if !errors.Is(historicalErr, errDualSelectionRuntimeSpawn) || historicalResult == nil || historicalResult.Status != "failed" {
+		t.Fatalf("historical V1 RunAdmitted result=%+v err=%v", historicalResult, historicalErr)
+	}
+	assertDualSelectionRuntimeSpawn(t, provider, dualSelectionRuntimeWork{
+		work: absent, profileID: v1Profile.ID, serverName: historicalRequirements[0].ServerName,
+	}, tokenPath)
+
+	entrypointWork := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-entrypoint-invalid", tokenPath)
+	detailForWork := func(qw QueuedWork) json.RawMessage {
+		return rawJSONForRunner(t, map[string]any{
+			"sessionId": qw.SessionID, "workerId": qw.WorkerID,
+			"platformUrl": qw.PlatformURL, "mcpAuthToken": qw.McpAuthToken,
+			"admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell,
+			"executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload,
+		})
+	}
+	validDetail := detailForWork(entrypointWork.work)
+	var resolverCalls atomic.Int32
+	resolverView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+		ConfigRequirements: func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error) {
+			resolverCalls.Add(1)
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolverView.ResolveExecutionPreflightConfigRequirements(validDetail, entrypointWork.work.HostAdaptationReceipt); err != nil || resolverCalls.Load() != 1 {
+		t.Fatalf("valid entrypoint resolver baseline = calls %d err=%v", resolverCalls.Load(), err)
+	}
+	resolverCalls.Store(0)
+	var invalidPayload map[string]any
+	if err := json.Unmarshal(entrypointWork.work.OperationalPayload, &invalidPayload); err != nil {
+		t.Fatal(err)
+	}
+	invalidPayload["capabilityRealizationSelection"].(map[string]any)["recipeDigest"] = strings.Repeat("0", 64)
+	entrypointWork.work.OperationalPayload, err = executioncell.CanonicalJSON(invalidPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entrypointCell, err := executioncell.DecodeResolvedExecutionCell(entrypointWork.work.EffectiveCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entrypointWork.work = attachAdmittedExecutionCell(t, entrypointWork.work, entrypointCell)
+	invalidDetail := detailForWork(entrypointWork.work)
+	entrypoints := map[string]func() error{
+		"fresh": func() error { _, err := view.PreflightExecution(invalidDetail); return err },
+		"retained": func() error {
+			return view.ValidateRetainedExecution(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+		},
+		"common resolver": func() error {
+			_, err := resolverView.ResolveExecutionPreflightConfigRequirements(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+		"protected v1": func() error {
+			_, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+		"protected v2": func() error {
+			_, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+	}
+	for name, invoke := range entrypoints {
+		t.Run("invalid selection "+name, func(t *testing.T) {
+			if err := invoke(); err == nil || !strings.Contains(err.Error(), "exact local registry evidence") {
+				t.Fatalf("entrypoint error = %v", err)
+			}
+		})
+	}
+	if resolverCalls.Load() != 0 {
+		t.Fatalf("invalid selection resolver calls = %d, want 0", resolverCalls.Load())
+	}
+	for name, invoke := range map[string]func() (*Result, error){
+		"Run": func() (*Result, error) { return run.Run(t.Context(), entrypointWork.work) },
+		"RunAdmitted": func() (*Result, error) {
+			return run.RunAdmitted(t.Context(), entrypointWork.work, entrypointWork.admission)
+		},
+	} {
+		t.Run("invalid selection "+name, func(t *testing.T) {
+			result, err := invoke()
+			if err == nil || result != nil || !strings.Contains(err.Error(), "exact local registry evidence") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+	if entrypointWork.admission.consumed.Load() {
+		t.Fatal("invalid selection consumed cached admission")
+	}
+	if _, spawned := provider.spawnedSpec(entrypointWork.work.SessionID); spawned {
+		t.Fatal("invalid selection reached provider spawn")
+	}
+
+	for _, field := range []string{"recipeDigest", "declaredSurfaceDigest", "observationDigest"} {
+		t.Run("cached admission changed "+field, func(t *testing.T) {
+			runtimeWork := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-tampered-"+field, tokenPath)
+			var payload map[string]any
+			if err := json.Unmarshal(runtimeWork.work.OperationalPayload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			payload["capabilityRealizationSelection"].(map[string]any)[field] = strings.Repeat("0", 64)
+			changed, err := executioncell.CanonicalJSON(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeWork.work.OperationalPayload = changed
+			cell, err := executioncell.DecodeResolvedExecutionCell(runtimeWork.work.EffectiveCell)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeWork.work = attachAdmittedExecutionCell(t, runtimeWork.work, cell)
+			result, runErr := run.RunAdmitted(t.Context(), runtimeWork.work, runtimeWork.admission)
+			if runErr == nil || result != nil || !strings.Contains(runErr.Error(), "exact local registry evidence") {
+				t.Fatalf("tampered %s result=%+v err=%v", field, result, runErr)
+			}
+			if runtimeWork.admission.consumed.Load() {
+				t.Fatal("cached admission was consumed before raw selection recomputation refused")
+			}
+			if _, spawned := provider.spawnedSpec(runtimeWork.work.SessionID); spawned {
+				t.Fatal("tampered retained selection reached provider spawn")
+			}
+		})
+	}
+}
+
 func TestProtectedRuntimeMCPChildRefusesDowngradeAndRotatedBearerBeforeSpawn(t *testing.T) {
 	for _, tc := range []struct {
 		name                string
@@ -665,6 +1210,40 @@ func TestProtectedRuntimeMCPAbsentSelectorPreservesLegacyNonReceiptRun(t *testin
 	}
 	if got == nil || got.Status != "completed" {
 		t.Fatalf("legacy non-receipt result = %+v", got)
+	}
+}
+
+func TestProtectedRuntimeMCPConfiguredSelectorPreservesOrdinaryLegacyRun(t *testing.T) {
+	harness := newRunnerHarness(t)
+	provider := &manifestSelectorProvider{
+		selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex},
+		manifest:             codexManifestForTest(), capabilities: codexCapabilitiesForTest(),
+	}
+	if err := harness.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	seed := exactReceiptQueuedWork("configured-selector-legacy-seed")
+	seed.PlatformURL, seed.McpAuthToken = "https://platform.example/", "session-bearer"
+	realizations := protectedRuntimeMCPRealizations(t, provider, seed, agent.PromptModeAutonomous)
+	run, err := New(Options{
+		Registry: harness.runner.registry, WorktreeManager: harness.runner.wt,
+		Poster: harness.runner.poster, HTTPClient: harness.runner.httpClient,
+		CapabilityRealizations:      realizations,
+		ProtectedRuntimeMCPSelector: protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous),
+		SkipBackstop:                true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw := harness.queuedWork("CONFIGURED-PROTECTED-ORDINARY-LEGACY")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := run.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("configured protected selector changed ordinary legacy run: %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("ordinary legacy result = %+v", got)
 	}
 }
 
