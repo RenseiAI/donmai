@@ -5,9 +5,11 @@ import (
 	"errors"
 	"io"
 	"net"
+	"sync"
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
@@ -175,6 +177,113 @@ func TestHandshakeAllowsFinalizedExitReplayAfterOrphanExpiry(t *testing.T) {
 	}
 	if got := shim.Generation(); got != hello.Generation+1 {
 		t.Fatalf("retained Exit replay generation = %d, want %d", got, hello.Generation+1)
+	}
+}
+
+func TestRetainedExitReplayDoesNotResurrectTerminalLiveness(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	id := Identity{OrgID: "org-cleanup", SessionID: "session-retained-exit"}
+	courtesyEntered := make(chan struct{})
+	releaseCourtesy := make(chan struct{})
+	var releaseOnce sync.Once
+	shim, err := Start(Options{
+		Identity: id, Registry: reg, ProcessEpoch: 1,
+		Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}},
+		WorkareaPath: dir + "/workarea",
+		Orphan:       OrphanPolicy{Deadline: time.Hour, TerminationGrace: 250 * time.Millisecond},
+		onTerminalCourtesy: func() {
+			close(courtesyEntered)
+			<-releaseCourtesy
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCourtesy) }) })
+	terminalDone := make(chan error, 1)
+	go func() {
+		terminalDone <- shim.Terminate(context.Background())
+	}()
+	select {
+	case <-courtesyEntered:
+	case <-time.After(2 * time.Second):
+		t.Fatal("terminal proof did not reach the courtesy boundary")
+	}
+	if _, err := reg.Get(id); err == nil {
+		t.Fatal("terminal proof left a live discovery record")
+	}
+	before, err := reg.GetTombstone(id)
+	if err != nil {
+		t.Fatalf("read durable terminal proof: %v", err)
+	}
+
+	server, client := cleanupTestUnixPair(t)
+	handshakeDone := make(chan error, 1)
+	go func() {
+		handshakeDone <- shim.handshake(server, shimwire.NewWriter(server), shimwire.NewReader(server))
+	}()
+	reader := shimwire.NewReader(client)
+	helloMessage, err := reader.Read()
+	if err != nil || helloMessage.Type != shimwire.TypeHello {
+		t.Fatalf("read retained Exit Hello = %s, %v", helloMessage.Type, err)
+	}
+	hello, err := shimwire.DecodeHello(helloMessage.Body)
+	if err != nil {
+		t.Fatalf("decode retained Exit Hello: %v", err)
+	}
+	if hello.Phase != shimwire.PhaseExited {
+		t.Fatalf("retained Exit Hello phase = %q, want exited", hello.Phase)
+	}
+	welcome := shimwire.Welcome{
+		Protocol: shimwire.ProtocolName, Selected: shimwire.V2,
+		ControllerID: "controller-retained-exit", ProposedGeneration: hello.Generation + 1,
+	}
+	if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
+		return shimwire.EncodeWelcome(welcome)
+	}); err != nil {
+		t.Fatalf("write retained Exit Welcome: %v", err)
+	}
+	adoptedMessage, err := reader.Read()
+	if err != nil || adoptedMessage.Type != shimwire.TypeAdopted {
+		t.Fatalf("read retained Exit Adopted = %s, %v", adoptedMessage.Type, err)
+	}
+	adopted, err := shimwire.DecodeAdopted(adoptedMessage.Body)
+	if err != nil {
+		t.Fatalf("decode retained Exit Adopted: %v", err)
+	}
+	if adopted.Phase != shimwire.PhaseExited {
+		t.Fatalf("retained Exit Adopted phase = %q, want exited", adopted.Phase)
+	}
+	exitMessage, err := reader.Read()
+	if err != nil || exitMessage.Type != shimwire.TypeExit {
+		t.Fatalf("read retained Exit frame = %s, %v", exitMessage.Type, err)
+	}
+	if _, err := shimwire.DecodeExit(exitMessage.Body); err != nil {
+		t.Fatalf("decode retained Exit frame: %v", err)
+	}
+	if err := <-handshakeDone; err != nil {
+		t.Fatalf("retained Exit handshake: %v", err)
+	}
+	if _, err := reg.Get(id); err == nil {
+		t.Fatal("retained Exit replay resurrected a live discovery record")
+	}
+	after, err := reg.GetTombstone(id)
+	if err != nil {
+		t.Fatalf("read terminal proof after replay: %v", err)
+	}
+	if after != before {
+		t.Fatalf("retained Exit replay changed terminal proof: before=%+v after=%+v", before, after)
+	}
+	releaseOnce.Do(func() { close(releaseCourtesy) })
+	if err := <-terminalDone; err != nil {
+		t.Fatalf("terminalization after retained replay: %v", err)
 	}
 }
 
