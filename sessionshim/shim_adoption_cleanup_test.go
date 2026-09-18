@@ -207,6 +207,12 @@ func TestRetainedExitReplayDoesNotResurrectTerminalLiveness(t *testing.T) {
 		t.Fatal(err)
 	}
 	t.Cleanup(func() { releaseOnce.Do(func() { close(releaseCourtesy) }) })
+	shim.mu.Lock()
+	episode := shim.orphanEpisode
+	shim.mu.Unlock()
+	if !shim.beginOrphanTermination(episode) {
+		t.Fatal("orphan deadline did not win before terminal finalization")
+	}
 	terminalDone := make(chan error, 1)
 	go func() {
 		terminalDone <- shim.Terminate(context.Background())
