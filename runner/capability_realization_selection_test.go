@@ -22,6 +22,36 @@ func selectionFromCompiled(compiled agent.CompiledCapabilityRealization) executi
 	}
 }
 
+func rewriteReadyHostToolProfile(t *testing.T, qw QueuedWork, profileID string) QueuedWork {
+	t.Helper()
+	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var plan agent.PreparedHarness
+	if err := json.Unmarshal(host.Plan, &plan); err != nil {
+		t.Fatal(err)
+	}
+	plan.ToolLifecycleReceipt.ProfileID = profileID
+	planRaw, err := json.Marshal(plan)
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolRaw, err := json.Marshal(plan.ToolLifecycleReceipt)
+	if err != nil {
+		t.Fatal(err)
+	}
+	host.Plan = planRaw
+	host.PlanDigest = agent.DigestPreparedHarness(&plan)
+	host.ToolLifecycleReceipt = toolRaw
+	raw, err := json.Marshal(host)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.HostAdaptationReceipt = raw
+	return qw
+}
+
 func admittedSelectionWork(t *testing.T) (QueuedWork, *agent.CapabilityRealizationRegistry, ProtectedRuntimeMCPSelector) {
 	t.Helper()
 	provider := &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}
@@ -145,6 +175,10 @@ func TestBindProtectedRuntimeMCPSelectionUsesExactV1AndV2PerSession(t *testing.T
 				}
 				if _, err := bindCapabilityRealizationSelection(qw, realizations, legacy, false); err == nil {
 					t.Fatal("modern V1-only consumer accepted explicit V2 selection")
+				}
+				mismatched := rewriteReadyHostToolProfile(t, qw, profile.ID)
+				if _, err := BindProtectedRuntimeMCPSelection(mismatched, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy); err == nil {
+					t.Fatal("child accepted V2 selection with self-consistent V1 host profile")
 				}
 			}
 		})

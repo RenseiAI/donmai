@@ -425,7 +425,7 @@ func runProtectedRuntimeMCPMixedChild(t *testing.T, fixture protectedRuntimeMCPM
 	if err != nil {
 		return nil, err
 	}
-	return run.runLoop(context.Background(), qw, time.Now().UnixMilli(), admission)
+	return run.RunAdmitted(context.Background(), qw, admission)
 }
 
 func TestProtectedRuntimeMCPExactSelectorPreservesPiAndEnforcesCodexChild(t *testing.T) {
