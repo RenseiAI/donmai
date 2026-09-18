@@ -64,6 +64,9 @@ type Options struct {
 	// is an unsynchronized cross-goroutine write with no happens-before edge —
 	// a data race whether or not a given run happens to lose it.
 	onTerminalCourtesy func()
+	// postInstallFailure is a nil-default same-package test seam. It is called
+	// only after controller installation and before loop ownership transfers.
+	postInstallFailure func(string) error
 }
 
 func (o Options) logger() *slog.Logger {
@@ -172,6 +175,7 @@ type Shim struct {
 	// goroutine that reads it. Assigning it on a returned Shim would be an
 	// unsynchronized cross-goroutine write.
 	onTerminalCourtesy func()
+	postInstallFailure func(string) error
 }
 
 // controllerConn is one attached controller.
@@ -472,6 +476,7 @@ func Start(opts Options) (*Shim, error) {
 		ackNotify:    make(chan struct{}),
 
 		onTerminalCourtesy: opts.onTerminalCourtesy,
+		postInstallFailure: opts.postInstallFailure,
 	}
 
 	flow.bind(s)
@@ -1122,12 +1127,19 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	if prev != nil {
 		prev.close()
 	}
+	if err := s.failPostInstall("resume"); err != nil {
+		return err
+	}
 	adopted, sub, gap, snap, rawSnapshot, err := s.resume(welcome.ResumeFrom, ctrl.selected)
 	if err != nil {
 		_ = sendError(w, shimwire.CodeInternal, "resume failed")
 		return err
 	}
 	adopted.Extensions = welcome.Extensions
+	if err := s.failPostInstall("subscription"); err != nil {
+		_ = sub.Close()
+		return err
+	}
 	if !ctrl.installSubscription(sub) {
 		return net.ErrClosed
 	}
@@ -1155,11 +1167,21 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		}
 	}
 
+	if err := s.failPostInstall("loopstart"); err != nil {
+		return err
+	}
 	if !s.startControllerLoops(ctrl, r) {
 		return net.ErrClosed
 	}
 	loopOwned = true
 	return nil
+}
+
+func (s *Shim) failPostInstall(stage string) error {
+	if s.postInstallFailure == nil {
+		return nil
+	}
+	return s.postInstallFailure(stage)
 }
 
 func (s *Shim) buildHello() (shimwire.Hello, error) {

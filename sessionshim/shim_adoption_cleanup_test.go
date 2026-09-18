@@ -3,6 +3,7 @@ package sessionshim
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"net"
 	"sync"
@@ -13,14 +14,24 @@ import (
 	"github.com/RenseiAI/donmai/shimwire"
 )
 
-// failAdoptedWriter preserves the real local Unix transport for every frame
-// except the committed Adopted header. It makes the post-install failure
-// boundary deterministic without relying on socket-close timing.
-type failAdoptedWriter struct{ io.Writer }
+var (
+	errInjectedPostInstall = errors.New("injected post-install failure")
+	errInjectedWireWrite   = errors.New("injected wire write failure")
+)
 
-func (w failAdoptedWriter) Write(p []byte) (int, error) {
-	if len(p) == 5 && p[4] == byte(shimwire.TypeAdopted) {
-		return 0, errors.New("injected Adopted header write failure")
+// failMessageWriter preserves the real local Unix transport for every frame
+// except the requested message header. It proves the actual write return path,
+// rather than simulating a later socket close.
+type failMessageWriter struct {
+	io.Writer
+	target shimwire.MessageType
+	seen   chan<- shimwire.MessageType
+}
+
+func (w failMessageWriter) Write(p []byte) (int, error) {
+	if len(p) == 5 && p[4] == byte(w.target) {
+		w.seen <- w.target
+		return 0, errInjectedWireWrite
 	}
 	return w.Writer.Write(p)
 }
@@ -50,80 +61,160 @@ func cleanupTestUnixPair(t *testing.T) (*net.UnixConn, *net.UnixConn) {
 	return server, client
 }
 
-func TestHandshakeAdoptedWriteFailureRearmsOrphanWithoutRewindingGeneration(t *testing.T) {
+func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 	if !peerCredSupported() {
 		t.Skip("session shim adoption is unsupported on this platform")
 	}
-	dir := shortTempDir(t)
-	reg, err := NewRegistry(dir)
-	if err != nil {
-		t.Fatal(err)
+	tests := []struct {
+		name       string
+		selected   uint32
+		resumeFrom uint64
+		fillRing   bool
+		seam       string
+		wire       shimwire.MessageType
+	}{
+		// The nil-default seam covers returns without a writer: resume, the
+		// subscription handoff, and loop ownership. The writer controls below
+		// cover every reachable post-commit wire write.
+		{name: "v1-resume", selected: shimwire.V1, seam: "resume"},
+		{name: "v2-subscription", selected: shimwire.V2, seam: "subscription"},
+		{name: "v4-adopted-write", selected: shimwire.V4, wire: shimwire.TypeAdopted},
+		{name: "v1-gap-write", selected: shimwire.V1, resumeFrom: 2, fillRing: true, wire: shimwire.TypeGap},
+		{name: "v2-snapshot-write", selected: shimwire.V2, resumeFrom: 2, fillRing: true, wire: shimwire.TypeSnapshot},
+		{name: "v3-host-frame-write", selected: shimwire.V3, resumeFrom: 2, fillRing: true, wire: shimwire.TypeHostFrame},
+		{name: "v4-host-frame-write", selected: shimwire.V4, resumeFrom: 2, fillRing: true, wire: shimwire.TypeHostFrame},
+		{name: "v4-loop-start", selected: shimwire.V4, seam: "loopstart"},
 	}
-	id := Identity{OrgID: "org-cleanup", SessionID: "session-adopted-write"}
-	shim := startInProcessShim(t, reg, dir, id, 1)
-	t.Cleanup(func() {
-		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
-		defer cancel()
-		_ = shim.Terminate(ctx)
-	})
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			dir := shortTempDir(t)
+			reg, err := NewRegistry(dir)
+			if err != nil {
+				t.Fatal(err)
+			}
+			id := Identity{OrgID: "org-cleanup", SessionID: "session-post-install-" + tc.name}
+			var failOnce sync.Once
+			shim, err := Start(Options{
+				Identity: id, Registry: reg, ProcessEpoch: 1,
+				Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}, RingBytes: 48},
+				WorkareaPath: dir + "/workarea",
+				Orphan:       OrphanPolicy{Deadline: time.Hour, TerminationGrace: 250 * time.Millisecond},
+				postInstallFailure: func(stage string) error {
+					if stage == tc.seam {
+						fail := false
+						failOnce.Do(func() { fail = true })
+						if fail {
+							return errInjectedPostInstall
+						}
+					}
+					return nil
+				},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+				defer cancel()
+				_ = shim.Terminate(ctx)
+			})
+			before, err := reg.Get(id)
+			if err != nil {
+				t.Fatalf("read initial record: %v", err)
+			}
+			if tc.fillRing {
+				for i := 0; i < 32; i++ {
+					if err := shim.Session().EmitMarker(fmt.Sprintf("evict-%02d", i)); err != nil {
+						t.Fatalf("emit ring marker: %v", err)
+					}
+				}
+			}
 
-	server, client := cleanupTestUnixPair(t)
-	errCh := make(chan error, 1)
-	go func() {
-		errCh <- shim.handshake(server, shimwire.NewWriter(failAdoptedWriter{Writer: server}), shimwire.NewReader(server))
-	}()
-	clientReader := shimwire.NewReader(client)
-	helloMessage, err := clientReader.Read()
-	if err != nil || helloMessage.Type != shimwire.TypeHello {
-		t.Fatalf("read Hello = %s, %v", helloMessage.Type, err)
-	}
-	hello, err := shimwire.DecodeHello(helloMessage.Body)
-	if err != nil {
-		t.Fatalf("decode Hello: %v", err)
-	}
-	welcome := shimwire.Welcome{
-		Protocol: shimwire.ProtocolName, Selected: shimwire.V2,
-		ControllerID: "controller-injected-loss", ProposedGeneration: hello.Generation + 1,
-	}
-	if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
-		return shimwire.EncodeWelcome(welcome)
-	}); err != nil {
-		t.Fatalf("write Welcome: %v", err)
-	}
-	if err := <-errCh; err == nil {
-		t.Fatal("handshake accepted an injected Adopted write failure")
-	}
+			server, client := cleanupTestUnixPair(t)
+			seen := make(chan shimwire.MessageType, 1)
+			writer := shimwire.NewWriter(server)
+			if tc.wire != 0 {
+				writer = shimwire.NewWriter(failMessageWriter{Writer: server, target: tc.wire, seen: seen})
+			}
+			errCh := make(chan error, 1)
+			go func() { errCh <- shim.handshake(server, writer, shimwire.NewReader(server)) }()
+			message, err := shimwire.NewReader(client).Read()
+			if err != nil || message.Type != shimwire.TypeHello {
+				t.Fatalf("read Hello = %s, %v", message.Type, err)
+			}
+			hello, err := shimwire.DecodeHello(message.Body)
+			if err != nil {
+				t.Fatalf("decode Hello: %v", err)
+			}
+			welcome := shimwire.Welcome{
+				Protocol: shimwire.ProtocolName, Selected: tc.selected,
+				ControllerID: "controller-post-install", ProposedGeneration: hello.Generation + 1,
+				ResumeFrom: tc.resumeFrom,
+			}
+			if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
+				return shimwire.EncodeWelcome(welcome)
+			}); err != nil {
+				t.Fatalf("write Welcome: %v", err)
+			}
+			err = <-errCh
+			want := errInjectedPostInstall
+			if tc.wire != 0 {
+				want = errInjectedWireWrite
+				if got := <-seen; got != tc.wire {
+					t.Fatalf("failed wire message = %s, want %s", got, tc.wire)
+				}
+			}
+			if !errors.Is(err, want) {
+				t.Fatalf("handshake error = %v, want %v", err, want)
+			}
 
-	shim.mu.Lock()
-	ctrl, generation, phase, timer := shim.ctrl, shim.gen, shim.phase, shim.orphanTimer
-	shim.mu.Unlock()
-	if ctrl != nil {
-		t.Fatal("failed pre-loop controller remained current")
-	}
-	if generation != hello.Generation+1 {
-		t.Fatalf("generation = %d, want committed %d", generation, hello.Generation+1)
-	}
-	if phase != shimwire.PhaseOrphaned || timer == nil {
-		t.Fatalf("post-failure lifecycle = phase %q timer %v, want orphaned with deadline", phase, timer != nil)
-	}
-	record, err := reg.Get(id)
-	if err != nil {
-		t.Fatalf("read orphan record: %v", err)
-	}
-	if record.Phase != shimwire.PhaseOrphaned || record.OrphanDeadlineUnixNano == 0 {
-		t.Fatalf("published record = %+v, want orphan deadline", record)
-	}
-	if alive, aliveErr := shim.harness.Alive(); aliveErr != nil || !alive {
-		t.Fatalf("harness after failed adoption = alive %t err %v, want live", alive, aliveErr)
-	}
+			shim.mu.Lock()
+			ctrl, generation, phase, timer := shim.ctrl, shim.gen, shim.phase, shim.orphanTimer
+			shim.mu.Unlock()
+			if ctrl != nil {
+				t.Fatal("failed pre-loop controller remained current")
+			}
+			if generation != hello.Generation+1 {
+				t.Fatalf("generation = %d, want committed %d", generation, hello.Generation+1)
+			}
+			if phase != shimwire.PhaseOrphaned || timer == nil {
+				t.Fatalf("post-failure lifecycle = phase %q timer %v, want orphaned with deadline", phase, timer != nil)
+			}
+			record, err := reg.Get(id)
+			if err != nil {
+				t.Fatalf("read orphan record: %v", err)
+			}
+			if record.Phase != shimwire.PhaseOrphaned || record.OrphanDeadlineUnixNano == 0 {
+				t.Fatalf("published record = %+v, want orphan deadline", record)
+			}
+			if record.PID != before.PID || record.ProcessStartedAt != before.ProcessStartedAt {
+				t.Fatalf("failed handshake changed child identity: before=%d/%d after=%d/%d", before.PID, before.ProcessStartedAt, record.PID, record.ProcessStartedAt)
+			}
+			if alive, aliveErr := shim.harness.Alive(); aliveErr != nil || !alive {
+				t.Fatalf("harness after failed adoption = alive %t err %v, want live", alive, aliveErr)
+			}
+			if tc.selected >= shimwire.V3 {
+				if err := shim.Session().EmitMarker("barrier-released"); err != nil {
+					t.Fatalf("post-failure output barrier remained held: %v", err)
+				}
+			}
 
-	result, err := Adopt(context.Background(), AdoptOptions{Registry: reg, ControllerID: "controller-retry"})
-	if err != nil || len(result.Adopted) != 1 {
-		t.Fatalf("re-adopt same harness = %+v, %v", result, err)
-	}
-	defer result.Close()
-	if got := result.Adopted[0].Generation(); got != generation+1 {
-		t.Fatalf("retry generation = %d, want %d", got, generation+1)
+			result, err := Adopt(context.Background(), AdoptOptions{Registry: reg, ControllerID: "controller-retry"})
+			if err != nil || len(result.Adopted) != 1 {
+				t.Fatalf("re-adopt same harness = %+v, %v", result, err)
+			}
+			t.Cleanup(result.Close)
+			if got := result.Adopted[0].Generation(); got != generation+1 {
+				t.Fatalf("retry generation = %d, want %d", got, generation+1)
+			}
+			recovered, err := reg.Get(id)
+			if err != nil {
+				t.Fatalf("read re-adopted record: %v", err)
+			}
+			if recovered.PID != before.PID || recovered.ProcessStartedAt != before.ProcessStartedAt || recovered.OrphanDeadlineUnixNano != 0 {
+				t.Fatalf("re-adoption changed child or retained orphan metadata: %+v", recovered)
+			}
+		})
 	}
 }
 
@@ -153,7 +244,9 @@ func TestHandshakeAllowsFinalizedExitReplayAfterOrphanExpiry(t *testing.T) {
 	server, client := cleanupTestUnixPair(t)
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- shim.handshake(server, shimwire.NewWriter(failAdoptedWriter{Writer: server}), shimwire.NewReader(server))
+		errCh <- shim.handshake(server, shimwire.NewWriter(failMessageWriter{
+			Writer: server, target: shimwire.TypeAdopted, seen: make(chan shimwire.MessageType, 1),
+		}), shimwire.NewReader(server))
 	}()
 	message, err := shimwire.NewReader(client).Read()
 	if err != nil || message.Type != shimwire.TypeHello {
