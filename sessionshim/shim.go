@@ -738,21 +738,21 @@ func (s *Shim) watchHarness() {
 // armOrphan starts the bounded controller-loss deadline (§D8).
 func (s *Shim) armOrphan() {
 	s.mu.Lock()
-	deadline, armed := s.armOrphanLocked()
+	deadline, episode, armed := s.armOrphanLocked()
 	s.mu.Unlock()
 	if !armed {
 		return
 	}
-	if err := s.publishRecordWithDeadline(deadline); err != nil {
+	if err := s.publishOrphanRecord(episode, deadline); err != nil {
 		s.logger.Warn("sessionshim: republish record on orphan", "session", s.id.String(), "error", err)
 	}
 }
 
 // armOrphanLocked moves a live controllerless shim into one fresh orphan
 // episode. s.mu must be held by the caller.
-func (s *Shim) armOrphanLocked() (time.Time, bool) {
+func (s *Shim) armOrphanLocked() (time.Time, uint64, bool) {
 	if s.phase == shimwire.PhaseExited || s.orphanExpiring {
-		return time.Time{}, false
+		return time.Time{}, 0, false
 	}
 	if s.orphanTimer != nil {
 		s.orphanTimer.Stop()
@@ -762,12 +762,22 @@ func (s *Shim) armOrphanLocked() (time.Time, bool) {
 	deadline := s.now().Add(s.orphan.Deadline)
 	s.phase = shimwire.PhaseOrphaned
 	s.orphanTimer = time.AfterFunc(s.orphan.Deadline, func() { s.onOrphanDeadline(episode) })
-	return deadline, true
+	return deadline, episode, true
 }
 
 // disarmOrphan cancels the deadline because a controller adopted in time.
 func (s *Shim) disarmOrphan() {
 	s.mu.Lock()
+	s.disarmOrphanLocked()
+	s.mu.Unlock()
+	if err := s.publishRecord(); err != nil {
+		s.logger.Warn("sessionshim: republish record on adoption", "session", s.id.String(), "error", err)
+	}
+}
+
+// disarmOrphanLocked revokes the currently armed timer before a controller is
+// exposed. s.mu must be held by the caller.
+func (s *Shim) disarmOrphanLocked() {
 	s.orphanEpisode++
 	if s.orphanTimer != nil {
 		s.orphanTimer.Stop()
@@ -776,10 +786,15 @@ func (s *Shim) disarmOrphan() {
 	if s.phase == shimwire.PhaseOrphaned {
 		s.phase = shimwire.PhaseRunning
 	}
-	s.mu.Unlock()
-	if err := s.publishRecord(); err != nil {
-		s.logger.Warn("sessionshim: republish record on adoption", "session", s.id.String(), "error", err)
-	}
+}
+
+// installControllerLocked makes one controller current only after revoking the
+// prior orphan episode. s.mu must be held by the caller.
+func (s *Shim) installControllerLocked(ctrl *controllerConn) *controllerConn {
+	prev := s.ctrl
+	s.ctrl = ctrl
+	s.disarmOrphanLocked()
+	return prev
 }
 
 // loseController closes ctrl and applies controller loss only when that exact
@@ -793,12 +808,12 @@ func (s *Shim) loseController(ctrl *controllerConn) {
 		return
 	}
 	s.ctrl = nil
-	deadline, armed := s.armOrphanLocked()
+	deadline, episode, armed := s.armOrphanLocked()
 	s.mu.Unlock()
 	if !armed {
 		return
 	}
-	if err := s.publishRecordWithDeadline(deadline); err != nil {
+	if err := s.publishOrphanRecord(episode, deadline); err != nil {
 		s.logger.Warn("sessionshim: republish record on controller loss", "session", s.id.String(), "error", err)
 	}
 }
@@ -834,8 +849,37 @@ func (s *Shim) onOrphanDeadline(episode uint64) {
 func (s *Shim) publishRecord() error { return s.publishRecordWithDeadline(time.Time{}) }
 
 func (s *Shim) publishRecordWithDeadline(deadline time.Time) error {
+	if !deadline.IsZero() {
+		s.mu.Lock()
+		episode := s.orphanEpisode
+		s.mu.Unlock()
+		return s.publishOrphanRecord(episode, deadline)
+	}
 	s.recordMu.Lock()
 	defer s.recordMu.Unlock()
+	return s.publishRecordWithDeadlineLocked(deadline)
+}
+
+// publishOrphanRecord writes a deadline only while its exact orphan episode is
+// still current and controllerless. recordMu serializes that check against an
+// adoption's running publication, so a delayed old writer cannot attach its
+// deadline to a newer controller or orphan episode.
+func (s *Shim) publishOrphanRecord(episode uint64, deadline time.Time) error {
+	s.recordMu.Lock()
+	defer s.recordMu.Unlock()
+	s.mu.Lock()
+	current := s.orphanEpisode == episode && s.ctrl == nil && s.orphanTimer != nil &&
+		s.phase == shimwire.PhaseOrphaned && !s.orphanExpiring
+	s.mu.Unlock()
+	if !current {
+		return nil
+	}
+	return s.publishRecordWithDeadlineLocked(deadline)
+}
+
+// publishRecordWithDeadlineLocked composes and writes a record while recordMu
+// is already held.
+func (s *Shim) publishRecordWithDeadlineLocked(deadline time.Time) error {
 	s.mu.Lock()
 	phase := s.phase
 	tombstoned := s.tombstoned
@@ -1023,7 +1067,7 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// loop. The retained Exit frame rides the ordinary replay path below.
 	s.recordMu.Lock()
 	s.mu.Lock()
-	if s.orphanExpiring {
+	if s.orphanExpiring && s.phase != shimwire.PhaseExited {
 		s.mu.Unlock()
 		s.recordMu.Unlock()
 		_ = sendError(w, shimwire.CodePhaseUnknown, "orphan deadline is terminating this shim")
@@ -1038,7 +1082,6 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		return fmt.Errorf("sessionshim: %w: proposed %d, current %d",
 			shimwire.ErrStaleGeneration, welcome.ProposedGeneration, current)
 	}
-	prev := s.ctrl
 	s.gen = welcome.ProposedGeneration
 	ctrl := &controllerConn{
 		conn: conn, w: w, selected: welcome.Selected,
@@ -1050,8 +1093,11 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 		ctrl.installOutputBarrier(outputBarrier)
 		outputBarrier = nil
 	}
-	s.ctrl = ctrl
+	prev := s.installControllerLocked(ctrl)
 	s.mu.Unlock()
+	if err := s.publishRecordWithDeadlineLocked(time.Time{}); err != nil {
+		s.logger.Warn("sessionshim: republish record on adoption", "session", s.id.String(), "error", err)
+	}
 	s.recordMu.Unlock()
 	loopOwned := false
 	defer func() {
@@ -1066,8 +1112,6 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	if prev != nil {
 		prev.close()
 	}
-	s.disarmOrphan()
-
 	adopted, sub, gap, snap, rawSnapshot, err := s.resume(welcome.ResumeFrom, ctrl.selected)
 	if err != nil {
 		_ = sendError(w, shimwire.CodeInternal, "resume failed")

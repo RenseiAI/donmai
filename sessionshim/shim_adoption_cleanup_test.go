@@ -160,14 +160,41 @@ func TestControllerLossAndOrphanCallbacksAreExactOwnerAndEpisodeBound(t *testing
 	shim.loseController(newer)
 	shim.mu.Lock()
 	episodeA := shim.orphanEpisode
-	shim.mu.Unlock()
 	replacement := lifecycleTestController(t)
-	shim.mu.Lock()
-	shim.ctrl = replacement
-	shim.phase = shimwire.PhaseRunning
+	callbackStarted := make(chan struct{})
+	callbackDone := make(chan struct{})
+	go func() {
+		close(callbackStarted)
+		shim.onOrphanDeadline(episodeA)
+		close(callbackDone)
+	}()
+	<-callbackStarted
+	// The adoption holds s.mu while it revokes episode A and makes replacement
+	// current. The pending callback must observe that completed transition after
+	// the lock is released; it cannot terminalize the replacement in between.
+	shim.installControllerLocked(replacement)
 	shim.mu.Unlock()
-	shim.disarmOrphan()
-	shim.onOrphanDeadline(episodeA)
+	select {
+	case <-callbackDone:
+	case <-time.After(2 * time.Second):
+		t.Fatal("old deadline callback did not return after adoption won the lock")
+	}
+	shim.recordMu.Lock()
+	if err := shim.publishRecordWithDeadlineLocked(time.Time{}); err != nil {
+		shim.recordMu.Unlock()
+		t.Fatalf("publish replacement record: %v", err)
+	}
+	shim.recordMu.Unlock()
+	if err := shim.publishOrphanRecord(episodeA, time.Unix(1, 0)); err != nil {
+		t.Fatalf("stale orphan publication: %v", err)
+	}
+	record, err := reg.Get(shim.id)
+	if err != nil {
+		t.Fatalf("read replacement record: %v", err)
+	}
+	if record.Phase != shimwire.PhaseRunning || record.OrphanDeadlineUnixNano != 0 {
+		t.Fatalf("stale orphan publication changed running record: %+v", record)
+	}
 	shim.mu.Lock()
 	staleAdoptionChanged := shim.ctrl != replacement || shim.phase != shimwire.PhaseRunning || shim.orphanExpiring
 	staleCtrl, stalePhase, staleExpiring := shim.ctrl, shim.phase, shim.orphanExpiring
@@ -183,12 +210,21 @@ func TestControllerLossAndOrphanCallbacksAreExactOwnerAndEpisodeBound(t *testing
 	if episodeB == episodeA || timerB == nil {
 		t.Fatalf("new orphan episode = %d timer=%v, want a distinct armed episode", episodeB, timerB != nil)
 	}
-	shim.onOrphanDeadline(episodeA)
+	if err := shim.publishOrphanRecord(episodeA, time.Unix(1, 0)); err != nil {
+		t.Fatalf("stale orphan publication after episode B: %v", err)
+	}
 	shim.mu.Lock()
 	staleEpisodeChanged := shim.orphanEpisode != episodeB || shim.orphanTimer != timerB || shim.orphanExpiring
 	gotEpisode, gotTimer, gotExpiring := shim.orphanEpisode, shim.orphanTimer, shim.orphanExpiring
 	shim.mu.Unlock()
 	if staleEpisodeChanged {
 		t.Fatalf("stale callback after later orphan changed episode: got=%d timer=%p expiring=%t", gotEpisode, gotTimer, gotExpiring)
+	}
+	record, err = reg.Get(shim.id)
+	if err != nil {
+		t.Fatalf("read episode B record: %v", err)
+	}
+	if record.Phase != shimwire.PhaseOrphaned || record.OrphanDeadlineUnixNano == time.Unix(1, 0).UnixNano() {
+		t.Fatalf("stale orphan publication changed episode B record: %+v", record)
 	}
 }
