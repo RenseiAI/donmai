@@ -213,10 +213,10 @@ func bindCapabilityRealizationSelection(qw QueuedWork, realizations *agent.Capab
 		if !policy.adapterAllowed(*selection) {
 			return QueuedWork{}, errors.New("runner: capability realization selection adapter is not permitted by this consumer")
 		}
-		qw.toolLifecycleProfileID = selection.AdapterVersion
-		if err := requireSelectedToolLifecycleProfile(qw, qw.toolLifecycleProfileID, requireHostAdaptation); err != nil {
-			return QueuedWork{}, err
-		}
+	}
+	qw.toolLifecycleProfileID = selection.AdapterVersion
+	if err := requireSelectedToolLifecycleProfile(qw, qw.toolLifecycleProfileID, requireHostAdaptation); err != nil {
+		return QueuedWork{}, err
 	}
 	return qw, nil
 }
@@ -230,4 +230,19 @@ func BindProtectedRuntimeMCPSelection(qw QueuedWork, realizations *agent.Capabil
 		return QueuedWork{}, err
 	}
 	return bindCapabilityRealizationSelection(qw, realizations, policy, true)
+}
+
+// PreflightHarnessWithProtectedRuntimeMCPSelection binds retained raw
+// selection authority before the existing explicit-harness admission path.
+// It returns the bound work so callers cannot discard the private profile.
+func (r *Registry) PreflightHarnessWithProtectedRuntimeMCPSelection(qw QueuedWork, realizations *agent.CapabilityRealizationRegistry, v1 ProtectedRuntimeMCPSelector, v2 ProtectedRuntimeMCPV2Selector, dual ProtectedRuntimeMCPDualSelectionPolicy) (QueuedWork, *HarnessAdmission, error) {
+	bound, err := BindProtectedRuntimeMCPSelection(qw, realizations, v1, v2, dual)
+	if err != nil {
+		return QueuedWork{}, nil, err
+	}
+	admission, err := r.PreflightHarness(bound, realizations)
+	if err != nil {
+		return bound, admission, err
+	}
+	return bound, admission, nil
 }

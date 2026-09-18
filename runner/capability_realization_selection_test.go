@@ -224,14 +224,16 @@ func TestDualSelectionLeavesExplicitPiTupleOutsideCodexMaterialization(t *testin
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := view.PreflightExecution(detail); err != nil {
+	hostReceipt, err := view.PreflightExecution(detail)
+	if err != nil {
 		t.Fatalf("host rejected explicit Pi tuple: %v", err)
 	}
+	qw.HostAdaptationReceipt = hostReceipt
 	bound, err := BindProtectedRuntimeMCPSelection(qw, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy)
 	if err != nil {
 		t.Fatalf("child rejected explicit Pi tuple: %v", err)
 	}
-	if bound.toolLifecycleProfileID != "" {
-		t.Fatalf("Pi tuple selected Codex private profile %q", bound.toolLifecycleProfileID)
+	if bound.toolLifecycleProfileID != fixture.piRow.Declaration.AdapterVersion {
+		t.Fatalf("Pi tuple profile = %q, want its exact adapter %q", bound.toolLifecycleProfileID, fixture.piRow.Declaration.AdapterVersion)
 	}
 }
