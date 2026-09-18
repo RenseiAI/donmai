@@ -1,7 +1,6 @@
 package runner
 
 import (
-	"bytes"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -135,13 +134,21 @@ func requireSelectedToolLifecycleProfile(qw QueuedWork, profileID string, requir
 	return nil
 }
 
+func hasCapabilitySelectionAuthorityCarrier(qw QueuedWork) bool {
+	return len(qw.AdmissionReceipt) != 0 || len(qw.ClaimReceipt) != 0 || len(qw.EffectiveCell) != 0 ||
+		len(qw.ExecutionRuntimeBinding) != 0 || len(qw.HostAdaptationReceipt) != 0
+}
+
 // bindCapabilityRealizationSelection independently establishes receipt, digest,
 // claim, runtime-binding and effective-cell authority before it reads the raw
 // selection. It returns a copied work item with only the private profile id
 // changed.
 func bindCapabilityRealizationSelection(qw QueuedWork, realizations *agent.CapabilityRealizationRegistry, policy protectedRuntimeMCPSelectionPolicy, requireHostAdaptation bool) (QueuedWork, error) {
-	if len(bytes.TrimSpace(qw.OperationalPayload)) == 0 && !policy.v1.configured() && !policy.v2.configured() {
-		return qw, nil
+	if len(qw.OperationalPayload) == 0 {
+		if (!policy.v1.configured() && !policy.v2.configured()) || !hasCapabilitySelectionAuthorityCarrier(qw) {
+			return qw, nil
+		}
+		return QueuedWork{}, errors.New("runner: retained operational payload is required for capability realization authority")
 	}
 	selection, err := executioncell.ExtractCapabilityRealizationSelectionV1(qw.OperationalPayload)
 	if err != nil {
@@ -153,6 +160,9 @@ func bindCapabilityRealizationSelection(qw QueuedWork, realizations *agent.Capab
 	if len(qw.AdmissionReceipt) == 0 {
 		if selection != nil {
 			return QueuedWork{}, errors.New("runner: explicit capability realization selection requires an admission receipt")
+		}
+		if (policy.v1.configured() || policy.v2.configured()) && hasCapabilitySelectionAuthorityCarrier(qw) {
+			return QueuedWork{}, errors.New("runner: partial capability realization authority requires an admission receipt")
 		}
 		return qw, nil
 	}

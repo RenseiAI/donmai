@@ -8,6 +8,7 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -944,6 +945,187 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 			t.Fatalf("spawned session %s inherited sibling skill %q", runtimeWork.work.SessionID, other.skillBody)
 		}
 	}
+
+	recomputed := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-recomputed-v1", tokenPath)
+	recomputed.work.toolLifecycleProfileID = v2Profile.ID
+	if err := runOne(recomputed); err != nil {
+		t.Fatalf("stale private profile was not recomputed from retained raw selection: %v", err)
+	}
+	assertDualSelectionRuntimeSpawn(t, provider, recomputed, tokenPath)
+
+	absent := exactReceiptQueuedWork("dual-runtime-historical-absence")
+	absent.IssueIdentifier = "DUAL-RUNTIME"
+	absent.Body = "exercise historical absence policy"
+	absent.PlatformURL, absent.McpAuthToken = seed.PlatformURL, seed.McpAuthToken
+	absent.OperationalPayload, err = CanonicalOperationalPayload(absent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	absent = attachAdmittedExecutionCell(t, absent, exactReceiptCell(
+		"harness/v2", "gpt-test", executioncell.SessionAutonomous,
+		[]executioncell.CapabilityRequirement{{Name: protectedRuntimeMCPTestCapability}},
+	))
+	absent, absentDetail := protectedRuntimeMCPPreflightInput(t, absent)
+	if receipt, err := view.PreflightExecution(absentDetail); err == nil {
+		t.Fatalf("default dual absence policy produced ready host receipt: %s", receipt)
+	}
+	historicalPolicy := policy
+	historicalPolicy.HistoricalAbsence = ProtectedRuntimeMCPHistoricalAbsenceV1
+	historicalView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalReceipt, err := historicalView.PreflightExecution(absentDetail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalRequirements, err := historicalView.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(absentDetail, historicalReceipt)
+	if err != nil || len(historicalRequirements) != 1 {
+		t.Fatalf("historical V1 requirements=%+v err=%v", historicalRequirements, err)
+	}
+	absent.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterialization(t, historicalReceipt, historicalRequirements[0])
+	absent, historicalAdmission, err := registry.PreflightHarnessWithProtectedRuntimeMCPSelection(
+		absent, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, historicalPolicy,
+	)
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalRunner, err := New(Options{
+		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
+		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	historicalResult, historicalErr := historicalRunner.RunAdmitted(t.Context(), absent, historicalAdmission)
+	if !errors.Is(historicalErr, errDualSelectionRuntimeSpawn) || historicalResult == nil || historicalResult.Status != "failed" {
+		t.Fatalf("historical V1 RunAdmitted result=%+v err=%v", historicalResult, historicalErr)
+	}
+	assertDualSelectionRuntimeSpawn(t, provider, dualSelectionRuntimeWork{
+		work: absent, profileID: v1Profile.ID, serverName: historicalRequirements[0].ServerName,
+	}, tokenPath)
+
+	entrypointWork := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-entrypoint-invalid", tokenPath)
+	detailForWork := func(qw QueuedWork) json.RawMessage {
+		return rawJSONForRunner(t, map[string]any{
+			"sessionId": qw.SessionID, "workerId": qw.WorkerID,
+			"platformUrl": qw.PlatformURL, "mcpAuthToken": qw.McpAuthToken,
+			"admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell,
+			"executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload,
+		})
+	}
+	validDetail := detailForWork(entrypointWork.work)
+	var resolverCalls atomic.Int32
+	resolverView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+		ConfigRequirements: func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error) {
+			resolverCalls.Add(1)
+			return nil, nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := resolverView.ResolveExecutionPreflightConfigRequirements(validDetail, entrypointWork.work.HostAdaptationReceipt); err != nil || resolverCalls.Load() != 1 {
+		t.Fatalf("valid entrypoint resolver baseline = calls %d err=%v", resolverCalls.Load(), err)
+	}
+	resolverCalls.Store(0)
+	var invalidPayload map[string]any
+	if err := json.Unmarshal(entrypointWork.work.OperationalPayload, &invalidPayload); err != nil {
+		t.Fatal(err)
+	}
+	invalidPayload["capabilityRealizationSelection"].(map[string]any)["recipeDigest"] = strings.Repeat("0", 64)
+	entrypointWork.work.OperationalPayload, err = executioncell.CanonicalJSON(invalidPayload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entrypointCell, err := executioncell.DecodeResolvedExecutionCell(entrypointWork.work.EffectiveCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	entrypointWork.work = attachAdmittedExecutionCell(t, entrypointWork.work, entrypointCell)
+	invalidDetail := detailForWork(entrypointWork.work)
+	entrypoints := map[string]func() error{
+		"fresh": func() error { _, err := view.PreflightExecution(invalidDetail); return err },
+		"retained": func() error {
+			return view.ValidateRetainedExecution(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+		},
+		"common resolver": func() error {
+			_, err := resolverView.ResolveExecutionPreflightConfigRequirements(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+		"protected v1": func() error {
+			_, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+		"protected v2": func() error {
+			_, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV2(invalidDetail, entrypointWork.work.HostAdaptationReceipt)
+			return err
+		},
+	}
+	for name, invoke := range entrypoints {
+		t.Run("invalid selection "+name, func(t *testing.T) {
+			if err := invoke(); err == nil || !strings.Contains(err.Error(), "exact local registry evidence") {
+				t.Fatalf("entrypoint error = %v", err)
+			}
+		})
+	}
+	if resolverCalls.Load() != 0 {
+		t.Fatalf("invalid selection resolver calls = %d, want 0", resolverCalls.Load())
+	}
+	for name, invoke := range map[string]func() (*Result, error){
+		"Run": func() (*Result, error) { return run.Run(t.Context(), entrypointWork.work) },
+		"RunAdmitted": func() (*Result, error) {
+			return run.RunAdmitted(t.Context(), entrypointWork.work, entrypointWork.admission)
+		},
+	} {
+		t.Run("invalid selection "+name, func(t *testing.T) {
+			result, err := invoke()
+			if err == nil || result != nil || !strings.Contains(err.Error(), "exact local registry evidence") {
+				t.Fatalf("result=%+v err=%v", result, err)
+			}
+		})
+	}
+	if entrypointWork.admission.consumed.Load() {
+		t.Fatal("invalid selection consumed cached admission")
+	}
+	if _, spawned := provider.spawnedSpec(entrypointWork.work.SessionID); spawned {
+		t.Fatal("invalid selection reached provider spawn")
+	}
+
+	for _, field := range []string{"recipeDigest", "declaredSurfaceDigest", "observationDigest"} {
+		t.Run("cached admission changed "+field, func(t *testing.T) {
+			runtimeWork := prepareDualSelectionRuntimeWork(t, view, registry, realizations, policy, v1, "dual-runtime-tampered-"+field, tokenPath)
+			var payload map[string]any
+			if err := json.Unmarshal(runtimeWork.work.OperationalPayload, &payload); err != nil {
+				t.Fatal(err)
+			}
+			payload["capabilityRealizationSelection"].(map[string]any)[field] = strings.Repeat("0", 64)
+			changed, err := executioncell.CanonicalJSON(payload)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeWork.work.OperationalPayload = changed
+			cell, err := executioncell.DecodeResolvedExecutionCell(runtimeWork.work.EffectiveCell)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runtimeWork.work = attachAdmittedExecutionCell(t, runtimeWork.work, cell)
+			result, runErr := run.RunAdmitted(t.Context(), runtimeWork.work, runtimeWork.admission)
+			if runErr == nil || result != nil || !strings.Contains(runErr.Error(), "exact local registry evidence") {
+				t.Fatalf("tampered %s result=%+v err=%v", field, result, runErr)
+			}
+			if runtimeWork.admission.consumed.Load() {
+				t.Fatal("cached admission was consumed before raw selection recomputation refused")
+			}
+			if _, spawned := provider.spawnedSpec(runtimeWork.work.SessionID); spawned {
+				t.Fatal("tampered retained selection reached provider spawn")
+			}
+		})
+	}
 }
 
 func TestProtectedRuntimeMCPChildRefusesDowngradeAndRotatedBearerBeforeSpawn(t *testing.T) {
@@ -1028,6 +1210,40 @@ func TestProtectedRuntimeMCPAbsentSelectorPreservesLegacyNonReceiptRun(t *testin
 	}
 	if got == nil || got.Status != "completed" {
 		t.Fatalf("legacy non-receipt result = %+v", got)
+	}
+}
+
+func TestProtectedRuntimeMCPConfiguredSelectorPreservesOrdinaryLegacyRun(t *testing.T) {
+	harness := newRunnerHarness(t)
+	provider := &manifestSelectorProvider{
+		selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex},
+		manifest:             codexManifestForTest(), capabilities: codexCapabilitiesForTest(),
+	}
+	if err := harness.runner.registry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	seed := exactReceiptQueuedWork("configured-selector-legacy-seed")
+	seed.PlatformURL, seed.McpAuthToken = "https://platform.example/", "session-bearer"
+	realizations := protectedRuntimeMCPRealizations(t, provider, seed, agent.PromptModeAutonomous)
+	run, err := New(Options{
+		Registry: harness.runner.registry, WorktreeManager: harness.runner.wt,
+		Poster: harness.runner.poster, HTTPClient: harness.runner.httpClient,
+		CapabilityRealizations:      realizations,
+		ProtectedRuntimeMCPSelector: protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous),
+		SkipBackstop:                true, SkipSteering: true, SkipPostSession: true,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw := harness.queuedWork("CONFIGURED-PROTECTED-ORDINARY-LEGACY")
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	got, err := run.Run(ctx, qw)
+	if err != nil {
+		t.Fatalf("configured protected selector changed ordinary legacy run: %v", err)
+	}
+	if got == nil || got.Status != "completed" {
+		t.Fatalf("ordinary legacy result = %+v", got)
 	}
 }
 

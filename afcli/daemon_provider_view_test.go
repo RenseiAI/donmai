@@ -39,6 +39,18 @@ const (
 // spawns) and error loudly if they ever are.
 type daemonDecoratorFakeProvider struct{}
 
+type dualDaemonSelectionProvider struct{ daemonDecoratorFakeProvider }
+
+func (dualDaemonSelectionProvider) Manifest() agent.HarnessManifest {
+	manifest := (daemonDecoratorFakeProvider{}).Manifest()
+	v2 := manifest.ToolLifecycle[0]
+	v2.ID += "-v2"
+	v2.EvidenceTier = "native_verified"
+	v2.ProductionEligible = true
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, v2)
+	return manifest
+}
+
 func (daemonDecoratorFakeProvider) Name() agent.ProviderName { return testFakeDecoratorProviderName }
 
 func (daemonDecoratorFakeProvider) Capabilities() agent.Capabilities { return agent.Capabilities{} }
@@ -432,5 +444,132 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
 	if err != nil || len(requirements) != 1 {
 		t.Fatalf("daemon protected requirements = %+v err=%v", requirements, err)
+	}
+}
+
+func TestDualSelectionPolicyThreadsThroughDaemonAndChildOptions(t *testing.T) {
+	original := daemonRegistryBuilder
+	t.Cleanup(func() { daemonRegistryBuilder = original })
+	provider := dualDaemonSelectionProvider{}
+	providerRegistry := runner.NewRegistry()
+	if err := providerRegistry.Register(provider); err != nil {
+		t.Fatal(err)
+	}
+	daemonRegistryBuilder = func(_ *slog.Logger, _ agent.ExtensionDecorator) *runner.Registry {
+		return providerRegistry
+	}
+
+	const capability = "example.dual-protected-mcp/v1"
+	serverName := statehome.Brand() + "-platform"
+	entryID, err := agent.MCPServerCapabilityEntryID(serverName)
+	if err != nil {
+		t.Fatal(err)
+	}
+	surface := []agent.CapabilitySurfaceIdentity{
+		{Kind: agent.CapabilitySurfaceMCPServer, ID: serverName},
+		{Kind: agent.CapabilitySurfaceMCPTool, ID: "fixture_call"},
+	}
+	inputDigest := agent.MCPRuntimeServerCapabilityInputDigest(agent.MCPServerConfig{Name: serverName, Type: "http"})
+	compile := func(profileID string) agent.CompiledCapabilityRealization {
+		declaration, err := agent.NewCapabilityRealization(agent.CapabilityRealizationInput{
+			CapabilityID: capability, HarnessID: agent.HarnessStub, AdapterVersion: profileID, Mode: agent.PromptModeAutonomous,
+			RecipeID: "example/dual-protected-mcp/v1", DeclaredSurface: surface,
+			Entries: []agent.CapabilityRecipeEntry{{
+				EntryID: entryID, Channel: agent.ToolChannelMCPServer, Required: true,
+				InputDigest: inputDigest, SurfaceRefs: surface,
+			}},
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		observation, err := agent.NewCapabilityFixtureObservation(agent.CapabilityFixtureObservationInput{
+			Declaration: declaration, FixtureID: "dual-protected-mcp-fixture", BinaryDigest: strings.Repeat("b", 64),
+			AppliedArtifacts: []agent.CapabilityAppliedArtifact{{EntryID: entryID, Channel: agent.ToolChannelMCPServer, InputDigest: inputDigest}},
+			ObservedSurface:  surface,
+		})
+		if err != nil {
+			t.Fatal(err)
+		}
+		compiled, err := agent.CompileCapabilityRealization(declaration, observation)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return compiled
+	}
+	manifest := provider.Manifest()
+	v1Profile := manifest.ToolLifecycle[0]
+	v2Profile := manifest.ToolLifecycle[1]
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{
+		compile(v1Profile.ID), compile(v2Profile.ID),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := runner.ProtectedRuntimeMCPDualSelectionPolicy{
+		V1: runner.ProtectedRuntimeMCPSelector{
+			CapabilityID: capability, HarnessID: agent.HarnessStub,
+			AdapterProfileID: v1Profile.ID, Mode: agent.PromptModeAutonomous,
+		},
+		V2: runner.ProtectedRuntimeMCPV2Selector{
+			CapabilityID: capability, HarnessID: agent.HarnessStub,
+			AdapterProfileID: v2Profile.ID, Mode: agent.PromptModeAutonomous,
+			ConfigRequirementID: "example.session-config/v1",
+		},
+	}
+	cfg := Config{CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy}
+	view, err := daemonProviderView(cfg, quietLogger())
+	if err != nil || view == nil {
+		t.Fatalf("daemon dual selection options = view %p err=%v", view, err)
+	}
+	commandOptions := agentRunOptions(cfg, "embedder")
+	var child runner.Options
+	applyAgentRunCapabilityOptions(&child, commandOptions)
+	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPDualSelectionPolicy != policy {
+		t.Fatalf("child dual selection options = registry %p policy %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPDualSelectionPolicy)
+	}
+
+	qw := runner.QueuedWork{}
+	qw.SessionID = "daemon-dual-selection-absence"
+	qw.IssueIdentifier = "TEST-DUAL"
+	qw.Body = "daemon dual policy forwarding"
+	qw.PlatformURL = "https://platform.example"
+	qw.McpAuthToken = "fixture-session-bearer"
+	qw.ResolvedProfile = runner.ResolvedProfile{
+		Harness: string(agent.HarnessStub), Model: "fake-model",
+		Endpoint: &agent.EndpointBinding{
+			Company: "fake", Model: "fake-model", Protocol: agent.ProtoStub, Host: agent.HostLocal,
+			EndpointID: "fake-endpoint", EndpointOperator: "fake", EndpointRevision: "2026-08-06", ModelAuthor: "fake",
+			AuthBindingID: "fake-auth", AuthAuthority: "fake", AuthCommercialMode: string(executioncell.CommercialUsageBilled),
+			AuthBindingScope: string(executioncell.ScopeProcess), AuthPortability: string(executioncell.Portable),
+			AuthDelivery: string(executioncell.DeliveryEnvironment), Mechanism: agent.AuthAPIKey,
+		},
+	}
+	cell := fakeDecoratorReceiptCell()
+	cell.GrantedCapabilities = []executioncell.CapabilityRequirement{{Name: capability}}
+	qw.OperationalPayload, err = runner.CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw = attachAdmittedExecutionCellForTest(t, qw, cell)
+	detail, err := json.Marshal(map[string]any{
+		"sessionId": qw.SessionID, "workerId": qw.WorkerID,
+		"platformUrl": qw.PlatformURL, "mcpAuthToken": qw.McpAuthToken,
+		"admissionReceipt": qw.AdmissionReceipt, "effectiveCell": qw.EffectiveCell,
+		"executionRuntimeBinding": qw.ExecutionRuntimeBinding, "operationalPayload": qw.OperationalPayload,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	zeroPolicyView, err := runner.NewProviderViewWithOptions(providerRegistry, runner.ProviderViewOptions{
+		CapabilityRealizations: realizations,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if receipt, err := zeroPolicyView.PreflightExecution(detail); err != nil {
+		t.Fatalf("zero-policy baseline receipt=%s err=%v", receipt, err)
+	}
+	if receipt, err := view.PreflightExecution(detail); err == nil || !strings.Contains(err.Error(), "selection is required") {
+		t.Fatalf("daemon dual policy did not refuse targeted absence: receipt=%s err=%v", receipt, err)
 	}
 }
