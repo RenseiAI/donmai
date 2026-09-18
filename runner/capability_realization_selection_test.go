@@ -271,3 +271,17 @@ func TestDualSelectionLeavesExplicitPiTupleOutsideCodexMaterialization(t *testin
 		t.Fatalf("Pi tuple profile = %q, want its exact adapter %q", bound.toolLifecycleProfileID, fixture.piRow.Declaration.AdapterVersion)
 	}
 }
+
+func TestProtectedRuntimeMCPV2MaterializationUsesPerWorkProfile(t *testing.T) {
+	v2 := ProtectedRuntimeMCPV2Selector{CapabilityID: "example.capability/v1", HarnessID: agent.HarnessCodex, AdapterProfileID: "codex/profile-v2", Mode: agent.PromptModeAutonomous, ConfigRequirementID: "example.session-config/v1"}
+	r := &Runner{protectedRuntimeMCPV2Selector: v2}
+	selection := harnessSelection{Harness: executioncell.HarnessRef{ID: string(agent.HarnessCodex)}, effectiveCell: executioncell.ResolvedExecutionCell{SessionMode: executioncell.SessionAutonomous}}
+	qw := QueuedWork{toolLifecycleProfileID: "codex/profile-v1"}
+	if r.protectedRuntimeMCPV2Applies(qw, selection) {
+		t.Fatal("V1 work selected V2 materialization from process-global configuration")
+	}
+	qw.toolLifecycleProfileID = v2.AdapterProfileID
+	if !r.protectedRuntimeMCPV2Applies(qw, selection) {
+		t.Fatal("V2 work did not select its V2 materialization")
+	}
+}
