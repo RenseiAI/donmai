@@ -125,6 +125,112 @@ func TestHandshakeAdoptedWriteFailureRearmsOrphanWithoutRewindingGeneration(t *t
 	}
 }
 
+func TestHandshakeAllowsFinalizedExitReplayAfterOrphanExpiry(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := startInProcessShim(t, reg, dir, Identity{OrgID: "org-cleanup", SessionID: "session-exit-replay"}, 1)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	// finalizeTerminal changes phase to exited after a timer has set this private
+	// flag. A retained terminal replay remains adoptable; only the interval while
+	// termination is still in progress is refused.
+	shim.mu.Lock()
+	shim.orphanExpiring = true
+	shim.phase = shimwire.PhaseExited
+	shim.mu.Unlock()
+
+	server, client := cleanupTestUnixPair(t)
+	errCh := make(chan error, 1)
+	go func() {
+		errCh <- shim.handshake(server, shimwire.NewWriter(failAdoptedWriter{Writer: server}), shimwire.NewReader(server))
+	}()
+	message, err := shimwire.NewReader(client).Read()
+	if err != nil || message.Type != shimwire.TypeHello {
+		t.Fatalf("read retained Exit Hello = %s, %v", message.Type, err)
+	}
+	hello, err := shimwire.DecodeHello(message.Body)
+	if err != nil {
+		t.Fatalf("decode retained Exit Hello: %v", err)
+	}
+	welcome := shimwire.Welcome{
+		Protocol: shimwire.ProtocolName, Selected: shimwire.V2,
+		ControllerID: "controller-exit-replay", ProposedGeneration: hello.Generation + 1,
+	}
+	if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
+		return shimwire.EncodeWelcome(welcome)
+	}); err != nil {
+		t.Fatalf("write retained Exit Welcome: %v", err)
+	}
+	if err := <-errCh; err == nil {
+		t.Fatal("retained Exit replay accepted injected Adopted write failure")
+	}
+	if got := shim.Generation(); got != hello.Generation+1 {
+		t.Fatalf("retained Exit replay generation = %d, want %d", got, hello.Generation+1)
+	}
+}
+
+func TestOrphanExpiryWinsBeforeLiveControllerInstallation(t *testing.T) {
+	if !peerCredSupported() {
+		t.Skip("session shim adoption is unsupported on this platform")
+	}
+	dir := shortTempDir(t)
+	reg, err := NewRegistry(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	shim := startInProcessShim(t, reg, dir, Identity{OrgID: "org-cleanup", SessionID: "session-expiry-wins"}, 1)
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+		defer cancel()
+		_ = shim.Terminate(ctx)
+	})
+	shim.mu.Lock()
+	episode := shim.orphanEpisode
+	shim.mu.Unlock()
+	if !shim.beginOrphanTermination(episode) {
+		t.Fatal("orphan deadline did not win its pre-adoption transition")
+	}
+
+	server, client := cleanupTestUnixPair(t)
+	errCh := make(chan error, 1)
+	go func() { errCh <- shim.handshake(server, shimwire.NewWriter(server), shimwire.NewReader(server)) }()
+	message, err := shimwire.NewReader(client).Read()
+	if err != nil || message.Type != shimwire.TypeHello {
+		t.Fatalf("read expiry-win Hello = %s, %v", message.Type, err)
+	}
+	hello, err := shimwire.DecodeHello(message.Body)
+	if err != nil {
+		t.Fatalf("decode expiry-win Hello: %v", err)
+	}
+	welcome := shimwire.Welcome{
+		Protocol: shimwire.ProtocolName, Selected: shimwire.V2,
+		ControllerID: "controller-after-expiry", ProposedGeneration: hello.Generation + 1,
+	}
+	if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
+		return shimwire.EncodeWelcome(welcome)
+	}); err != nil {
+		t.Fatalf("write expiry-win Welcome: %v", err)
+	}
+	if err := <-errCh; !errors.Is(err, net.ErrClosed) {
+		t.Fatalf("handshake after expiry win = %v, want net.ErrClosed", err)
+	}
+	shim.mu.Lock()
+	generation, ctrl, phase, expiring := shim.gen, shim.ctrl, shim.phase, shim.orphanExpiring
+	shim.mu.Unlock()
+	if generation != hello.Generation || ctrl != nil || phase != shimwire.PhaseOrphaned || !expiring {
+		t.Fatalf("expiry-win state changed by live adoption: generation=%d ctrl=%p phase=%q expiring=%t", generation, ctrl, phase, expiring)
+	}
+}
+
 func TestControllerLossAndOrphanCallbacksAreExactOwnerAndEpisodeBound(t *testing.T) {
 	if !peerCredSupported() {
 		t.Skip("session shim adoption is unsupported on this platform")
@@ -161,6 +267,7 @@ func TestControllerLossAndOrphanCallbacksAreExactOwnerAndEpisodeBound(t *testing
 	shim.mu.Lock()
 	episodeA := shim.orphanEpisode
 	replacement := lifecycleTestController(t)
+	replacement.selected = shimwire.V3
 	callbackStarted := make(chan struct{})
 	callbackDone := make(chan struct{})
 	go func() {
@@ -213,6 +320,7 @@ func TestControllerLossAndOrphanCallbacksAreExactOwnerAndEpisodeBound(t *testing
 	if err := shim.publishOrphanRecord(episodeA, time.Unix(1, 0)); err != nil {
 		t.Fatalf("stale orphan publication after episode B: %v", err)
 	}
+	shim.onOrphanDeadline(episodeA)
 	shim.mu.Lock()
 	staleEpisodeChanged := shim.orphanEpisode != episodeB || shim.orphanTimer != timerB || shim.orphanExpiring
 	gotEpisode, gotTimer, gotExpiring := shim.orphanEpisode, shim.orphanTimer, shim.orphanExpiring

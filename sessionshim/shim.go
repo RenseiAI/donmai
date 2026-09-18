@@ -824,17 +824,9 @@ func (s *Shim) loseController(ctrl *controllerConn) {
 // authorize a claim release: that decision lives in ReleaseDecision and requires
 // this tombstone as evidence, which is the asymmetry §D8 insists on.
 func (s *Shim) onOrphanDeadline(episode uint64) {
-	s.mu.Lock()
-	if episode != s.orphanEpisode || s.orphanTimer == nil || s.phase != shimwire.PhaseOrphaned {
-		s.mu.Unlock()
+	if !s.beginOrphanTermination(episode) {
 		return
 	}
-	// A deadline that obtains this lock wins over a later adoption. Mark that
-	// decision before releasing the lock so a handshake cannot install a new
-	// controller while terminalization is underway.
-	s.orphanTimer = nil
-	s.orphanExpiring = true
-	s.mu.Unlock()
 	s.logger.Warn("sessionshim: orphan deadline reached; reaping harness process group",
 		"session", s.id.String(), "shim", s.shimID, "deadline", s.orphan.Deadline)
 	ctx, cancel := context.WithTimeout(context.Background(), s.orphan.TerminationGrace+5*time.Second)
@@ -842,6 +834,24 @@ func (s *Shim) onOrphanDeadline(episode uint64) {
 	if err := s.Terminate(ctx); err != nil {
 		s.logger.Error("sessionshim: orphan termination", "session", s.id.String(), "error", err)
 	}
+}
+
+// beginOrphanTermination linearizes one timer callback against adoption. Once
+// it returns true, a later handshake must wait for the terminal observation;
+// it cannot install another live controller into this incarnation.
+func (s *Shim) beginOrphanTermination(episode uint64) bool {
+	s.mu.Lock()
+	if episode != s.orphanEpisode || s.orphanTimer == nil || s.phase != shimwire.PhaseOrphaned {
+		s.mu.Unlock()
+		return false
+	}
+	// A deadline that obtains this lock wins over a later adoption. Mark that
+	// decision before releasing the lock so a handshake cannot install a new
+	// controller while terminalization is underway.
+	s.orphanTimer = nil
+	s.orphanExpiring = true
+	s.mu.Unlock()
+	return true
 }
 
 // ---- discovery record ------------------------------------------------------
