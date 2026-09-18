@@ -531,9 +531,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// filtered by qw.WorkType, then their file bodies are appended AFTER
 	// the skill block. Fragments with an empty [when] list match all
 	// workTypes (no filter). Additive: nil sources = no fragment injection.
-	// Reset SkillAppend at the start of each Run so no session bleeds
-	// into the next (the Runner is long-lived; SkillAppend is per-Run).
-	r.promptBuilder.SkillAppend = ""
+	// SkillAppend is per-run scratch state. Keep it on a fresh builder so
+	// concurrent sessions on one long-lived Runner cannot overwrite each
+	// other's skill composition. SystemAppend and Registry are immutable
+	// construction inputs and remain shared by value/pointer respectively.
+	promptBuilder := &prompt.Builder{
+		SystemAppend: r.promptBuilder.SystemAppend,
+		Registry:     r.promptBuilder.Registry,
+	}
 
 	var kitDisallowedTools []string
 	if len(kitSkillSources) > 0 {
@@ -544,7 +549,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"err", skillErr,
 			)
 		}
-		r.promptBuilder.SkillAppend = loaded.SystemAppend
+		promptBuilder.SkillAppend = loaded.SystemAppend
 		kitDisallowedTools = loaded.DisallowedTools
 		if loaded.SystemAppend != "" {
 			r.logger.Info("kit skills injected into system prompt",
@@ -560,8 +565,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// kit-derived disallowed set. Inline skills carry their body verbatim on
 	// the wire (no SKILL.md on disk). Additive: no card skills → no change.
 	if len(qw.Skills) > 0 {
-		newAppend, inlineDisallow, injected := foldInlineSkills(r.promptBuilder.SkillAppend, qw.Skills)
-		r.promptBuilder.SkillAppend = newAppend
+		newAppend, inlineDisallow, injected := foldInlineSkills(promptBuilder.SkillAppend, qw.Skills)
+		promptBuilder.SkillAppend = newAppend
 		kitDisallowedTools = append(kitDisallowedTools, inlineDisallow...)
 		if injected > 0 {
 			r.logger.Info("agent-card inline skills injected into system prompt",
@@ -584,11 +589,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		if loadedFrags.SystemAppend != "" {
 			// Append to any skill text already set above.
-			existing := r.promptBuilder.SkillAppend
+			existing := promptBuilder.SkillAppend
 			if existing != "" {
-				r.promptBuilder.SkillAppend = existing + "\n\n" + loadedFrags.SystemAppend
+				promptBuilder.SkillAppend = existing + "\n\n" + loadedFrags.SystemAppend
 			} else {
-				r.promptBuilder.SkillAppend = loadedFrags.SystemAppend
+				promptBuilder.SkillAppend = loadedFrags.SystemAppend
 			}
 			r.logger.Info("kit prompt fragments injected into system prompt",
 				"sessionId", qw.SessionID,
@@ -613,7 +618,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Render source-addressed prompt authorities. The exact harness profile,
 	// not a coarse provider capability, decides whether memory/context rides a
 	// native system surface or the first turn.
-	composition, err := r.promptBuilder.BuildComposition(qw.QueuedWork)
+	composition, err := promptBuilder.BuildComposition(qw.QueuedWork)
 	if err != nil {
 		res.Status = "failed"
 		res.FailureMode = FailurePromptRender
