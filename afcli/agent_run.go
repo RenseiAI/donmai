@@ -74,11 +74,12 @@ type agentRunOpts struct {
 	// specDecorator is cfg.AgentSpecExtensionDecorator, threaded through from
 	// newAgentRunCmd exactly like bin above. nil preserves historical
 	// behavior (no provider wrapping).
-	specDecorator                 agent.ExtensionDecorator
-	capabilityRealizations        *agent.CapabilityRealizationRegistry
-	protectedRuntimeMCPSelector   runner.ProtectedRuntimeMCPSelector
-	protectedRuntimeMCPV2Selector runner.ProtectedRuntimeMCPV2Selector
-	piTrustedExtensions           []providerpi.TrustedExtensionIdentity
+	specDecorator                          agent.ExtensionDecorator
+	capabilityRealizations                 *agent.CapabilityRealizationRegistry
+	protectedRuntimeMCPSelector            runner.ProtectedRuntimeMCPSelector
+	protectedRuntimeMCPV2Selector          runner.ProtectedRuntimeMCPV2Selector
+	protectedRuntimeMCPDualSelectionPolicy runner.ProtectedRuntimeMCPDualSelectionPolicy
+	piTrustedExtensions                    []providerpi.TrustedExtensionIdentity
 }
 
 // bindWorkerGatewayForAgentRun is the production gateway-binding seam. Tests
@@ -178,10 +179,11 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 	return &agentRunOpts{
 		bin: bin, specDecorator: cfg.AgentSpecExtensionDecorator,
-		capabilityRealizations:        cfg.CapabilityRealizations,
-		protectedRuntimeMCPSelector:   cfg.ProtectedRuntimeMCPSelector,
-		protectedRuntimeMCPV2Selector: cfg.ProtectedRuntimeMCPV2Selector,
-		piTrustedExtensions:           append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
+		capabilityRealizations:                 cfg.CapabilityRealizations,
+		protectedRuntimeMCPSelector:            cfg.ProtectedRuntimeMCPSelector,
+		protectedRuntimeMCPV2Selector:          cfg.ProtectedRuntimeMCPV2Selector,
+		protectedRuntimeMCPDualSelectionPolicy: cfg.ProtectedRuntimeMCPDualSelectionPolicy,
+		piTrustedExtensions:                    append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
 	}
 }
 
@@ -189,6 +191,7 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 	dst.CapabilityRealizations = src.capabilityRealizations
 	dst.ProtectedRuntimeMCPSelector = src.protectedRuntimeMCPSelector
 	dst.ProtectedRuntimeMCPV2Selector = src.protectedRuntimeMCPV2Selector
+	dst.ProtectedRuntimeMCPDualSelectionPolicy = src.protectedRuntimeMCPDualSelectionPolicy
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
@@ -363,7 +366,10 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// one — see the field's doc comment on runner.QueuedWork): it rides in
 	// from --keep-recording, not from the daemon's SessionDetail.
 	qw.RetainRecording = opts.keepRecording
-	qw = runner.BindProtectedRuntimeMCPV2ProfileIntent(qw, opts.protectedRuntimeMCPV2Selector)
+	qw, err = runner.BindProtectedRuntimeMCPSelection(qw, opts.capabilityRealizations, opts.protectedRuntimeMCPSelector, opts.protectedRuntimeMCPV2Selector, opts.protectedRuntimeMCPDualSelectionPolicy)
+	if err != nil {
+		return preflightErr(fmt.Sprintf("capability realization selection: %v", err))
+	}
 	admission, admissionErr := reg.PreflightHarness(qw, opts.capabilityRealizations)
 	if admissionErr != nil {
 		logger.Warn("donmai agent run: explicit harness denied before gateway/status side effects",

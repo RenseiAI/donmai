@@ -309,6 +309,10 @@ type Options struct {
 	ProtectedRuntimeMCPSelector ProtectedRuntimeMCPSelector
 	// ProtectedRuntimeMCPV2Selector selects the exact refreshable variant.
 	ProtectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
+	// ProtectedRuntimeMCPDualSelectionPolicy selects exact V1/V2 rows from
+	// retained operational payload bytes. It is mutually exclusive with the
+	// legacy single selectors.
+	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -371,6 +375,7 @@ type Runner struct {
 	preparedCapabilities          capabilityRealizationResolver
 	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
+	selectionPolicy               protectedRuntimeMCPSelectionPolicy
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -402,13 +407,8 @@ func New(opts Options) (*Runner, error) {
 	if opts.Poster == nil {
 		return nil, errors.New("runner: Poster is required")
 	}
-	if opts.ProtectedRuntimeMCPSelector.configured() && opts.ProtectedRuntimeMCPV2Selector.configured() {
-		return nil, errors.New("runner: protected runtime MCP selector version is ambiguous")
-	}
-	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
-		return nil, err
-	}
-	if err := validateProtectedRuntimeMCPV2Selector(opts.ProtectedRuntimeMCPV2Selector, opts.CapabilityRealizations); err != nil {
+	selectionPolicy, err := newProtectedRuntimeMCPSelectionPolicy(opts.ProtectedRuntimeMCPSelector, opts.ProtectedRuntimeMCPV2Selector, opts.ProtectedRuntimeMCPDualSelectionPolicy, opts.CapabilityRealizations)
+	if err != nil {
 		return nil, err
 	}
 	preparedCapabilities, err := newPreparedCapabilityResolver(opts.CapabilityRealizations, opts.CapabilityParameterBinders)
@@ -447,8 +447,9 @@ func New(opts Options) (*Runner, error) {
 		capabilityRealizations:        opts.CapabilityRealizations,
 		capabilityParameterBinders:    opts.CapabilityParameterBinders,
 		preparedCapabilities:          preparedCapabilities,
-		protectedRuntimeMCPSelector:   opts.ProtectedRuntimeMCPSelector,
-		protectedRuntimeMCPV2Selector: opts.ProtectedRuntimeMCPV2Selector,
+		protectedRuntimeMCPSelector:   selectionPolicy.v1,
+		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
+		selectionPolicy:               selectionPolicy,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -514,7 +515,11 @@ func (r *Runner) RunAdmitted(ctx context.Context, qw QueuedWork, admission *Harn
 }
 
 func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmission) (*Result, error) {
-	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, r.protectedRuntimeMCPV2Selector)
+	bound, bindErr := bindCapabilityRealizationSelection(qw, r.capabilityRealizations, r.selectionPolicy, true)
+	if bindErr != nil {
+		return nil, fmt.Errorf("runner: bind capability realization selection: %w", bindErr)
+	}
+	qw = bound
 	startedAt := r.now().UnixMilli()
 
 	// Apply the runner-side upper-bound timeout if requested.

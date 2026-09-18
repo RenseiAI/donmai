@@ -40,6 +40,7 @@ type ProviderView struct {
 	configRequirements            ExecutionPreflightConfigRequirementResolver
 	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
+	selectionPolicy               protectedRuntimeMCPSelectionPolicy
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -140,6 +141,9 @@ func validateProtectedRuntimeMCPSelector(selector ProtectedRuntimeMCPSelector, r
 
 func protectedRuntimeMCPTargetsSession(qw QueuedWork, selection harnessSelection, selector ProtectedRuntimeMCPSelector) bool {
 	if !selector.configured() {
+		return false
+	}
+	if qw.toolLifecycleProfileID != "" && qw.toolLifecycleProfileID != selector.AdapterProfileID {
 		return false
 	}
 	mode := sessionPromptMode(qw, selection.effectiveCell)
@@ -373,7 +377,6 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return nil, err
 	}
-	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	receipt := hostAdaptationReceipt{
 		ContractVersion: executioncell.HostAdaptationContractVersion, RequestID: binding.RequestID,
 		WorkerID: binding.WorkerID, PlacementID: binding.PlacementID,
@@ -388,6 +391,10 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 			return nil, marshalErr
 		}
 		return raw, cause
+	}
+	qw, err = bindCapabilityRealizationSelection(qw, v.realizations, v.selectionPolicy, false)
+	if err != nil {
+		return encode(err)
 	}
 	admission, err := v.reg.preflightAdmissionReceipt(qw, false, v.realizations)
 	if err != nil {
@@ -437,7 +444,11 @@ func (v *ProviderView) ResolveExecutionPreflightConfigRequirements(detailJSON js
 	if err != nil {
 		return nil, err
 	}
-	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
+	qw.HostAdaptationReceipt = append(json.RawMessage(nil), compiledReceipt...)
+	qw, err = bindCapabilityRealizationSelection(qw, v.realizations, v.selectionPolicy, true)
+	if err != nil {
+		return nil, err
+	}
 	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
 	if err != nil {
 		return nil, err
@@ -497,7 +508,11 @@ func (v *ProviderView) protectedRuntimeMCPPreflightContext(detailJSON json.RawMe
 	if err != nil {
 		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
 	}
-	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
+	qw.HostAdaptationReceipt = append(json.RawMessage(nil), compiledReceipt...)
+	qw, err = bindCapabilityRealizationSelection(qw, v.realizations, v.selectionPolicy, true)
+	if err != nil {
+		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
+	}
 	host, err := executioncell.DecodeHostAdaptationReceipt(compiledReceipt)
 	if err != nil {
 		return QueuedWork{}, harnessSelection{}, executioncell.HostAdaptationReceipt{}, err
@@ -569,8 +584,11 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
-	qw = BindProtectedRuntimeMCPV2ProfileIntent(qw, v.protectedRuntimeMCPV2Selector)
 	qw.HostAdaptationReceipt = append(json.RawMessage(nil), receipt...)
+	qw, err = bindCapabilityRealizationSelection(qw, v.realizations, v.selectionPolicy, true)
+	if err != nil {
+		return err
+	}
 	admission, err := v.reg.preflightAdmissionReceipt(qw, true, v.realizations)
 	if err != nil {
 		return err
@@ -602,23 +620,19 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 
 // ProviderViewOptions is the complete immutable construction surface.
 type ProviderViewOptions struct {
-	Decorator                     agent.ExtensionDecorator
-	CapabilityRealizations        *agent.CapabilityRealizationRegistry
-	CapabilityParameterBinders    *CapabilityParameterBinderRegistry
-	ConfigRequirements            ExecutionPreflightConfigRequirementResolver
-	ProtectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
-	ProtectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
+	Decorator                              agent.ExtensionDecorator
+	CapabilityRealizations                 *agent.CapabilityRealizationRegistry
+	CapabilityParameterBinders             *CapabilityParameterBinderRegistry
+	ConfigRequirements                     ExecutionPreflightConfigRequirementResolver
+	ProtectedRuntimeMCPSelector            ProtectedRuntimeMCPSelector
+	ProtectedRuntimeMCPV2Selector          ProtectedRuntimeMCPV2Selector
+	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
 }
 
 // NewProviderViewWithOptions constructs a complete read-only provider view.
 func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*ProviderView, error) {
-	if opts.ProtectedRuntimeMCPSelector.configured() && opts.ProtectedRuntimeMCPV2Selector.configured() {
-		return nil, fmt.Errorf("runner: protected runtime MCP selector version is ambiguous")
-	}
-	if err := validateProtectedRuntimeMCPSelector(opts.ProtectedRuntimeMCPSelector, opts.CapabilityRealizations); err != nil {
-		return nil, err
-	}
-	if err := validateProtectedRuntimeMCPV2Selector(opts.ProtectedRuntimeMCPV2Selector, opts.CapabilityRealizations); err != nil {
+	selectionPolicy, err := newProtectedRuntimeMCPSelectionPolicy(opts.ProtectedRuntimeMCPSelector, opts.ProtectedRuntimeMCPV2Selector, opts.ProtectedRuntimeMCPDualSelectionPolicy, opts.CapabilityRealizations)
+	if err != nil {
 		return nil, err
 	}
 	prepared, err := newPreparedCapabilityResolver(opts.CapabilityRealizations, opts.CapabilityParameterBinders)
@@ -628,8 +642,9 @@ func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*Provi
 	return &ProviderView{
 		reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations,
 		preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements,
-		protectedRuntimeMCPSelector:   opts.ProtectedRuntimeMCPSelector,
-		protectedRuntimeMCPV2Selector: opts.ProtectedRuntimeMCPV2Selector,
+		protectedRuntimeMCPSelector:   selectionPolicy.v1,
+		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
+		selectionPolicy:               selectionPolicy,
 	}, nil
 }
 
