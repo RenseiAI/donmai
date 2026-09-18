@@ -49,7 +49,11 @@ func admittedSelectionWork(t *testing.T) (QueuedWork, *agent.CapabilityRealizati
 
 func TestBindProtectedRuntimeMCPSelectionUsesRetainedRegistryEvidence(t *testing.T) {
 	qw, realizations, selector := admittedSelectionWork(t)
-	bound, err := BindProtectedRuntimeMCPSelection(qw, realizations, selector, ProtectedRuntimeMCPV2Selector{}, ProtectedRuntimeMCPDualSelectionPolicy{})
+	policy, err := newProtectedRuntimeMCPSelectionPolicy(selector, ProtectedRuntimeMCPV2Selector{}, ProtectedRuntimeMCPDualSelectionPolicy{}, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := bindCapabilityRealizationSelection(qw, realizations, policy, false)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -57,8 +61,12 @@ func TestBindProtectedRuntimeMCPSelectionUsesRetainedRegistryEvidence(t *testing
 		t.Fatalf("profile = %q, want %q", bound.toolLifecycleProfileID, selector.AdapterProfileID)
 	}
 
+	basePayload, err := CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
 	var payload map[string]any
-	if err := json.Unmarshal(qw.OperationalPayload, &payload); err != nil {
+	if err := json.Unmarshal(basePayload, &payload); err != nil {
 		t.Fatal(err)
 	}
 	selection := payload["capabilityRealizationSelection"].(map[string]any)
@@ -73,7 +81,7 @@ func TestBindProtectedRuntimeMCPSelectionUsesRetainedRegistryEvidence(t *testing
 		t.Fatal(err)
 	}
 	qw = attachAdmittedExecutionCell(t, qw, cell)
-	if _, err := BindProtectedRuntimeMCPSelection(qw, realizations, selector, ProtectedRuntimeMCPV2Selector{}, ProtectedRuntimeMCPDualSelectionPolicy{}); err == nil {
+	if _, err := bindCapabilityRealizationSelection(qw, realizations, policy, false); err == nil {
 		t.Fatal("changed raw selection evidence was accepted")
 	}
 }
@@ -119,13 +127,111 @@ func TestBindProtectedRuntimeMCPSelectionUsesExactV1AndV2PerSession(t *testing.T
 			}
 			qw.OperationalPayload = raw
 			qw = attachAdmittedExecutionCell(t, qw, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: protectedRuntimeMCPTestCapability}}))
-			bound, err := BindProtectedRuntimeMCPSelection(qw, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy)
+			internal, err := newProtectedRuntimeMCPSelectionPolicy(ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy, realizations)
+			if err != nil {
+				t.Fatal(err)
+			}
+			bound, err := bindCapabilityRealizationSelection(qw, realizations, internal, false)
 			if err != nil {
 				t.Fatal(err)
 			}
 			if bound.toolLifecycleProfileID != compiled.Declaration.AdapterVersion {
 				t.Fatalf("profile = %q, want %q", bound.toolLifecycleProfileID, compiled.Declaration.AdapterVersion)
 			}
+			if name == "v2" {
+				legacy, err := newProtectedRuntimeMCPSelectionPolicy(policy.V1, ProtectedRuntimeMCPV2Selector{}, ProtectedRuntimeMCPDualSelectionPolicy{}, realizations)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if _, err := bindCapabilityRealizationSelection(qw, realizations, legacy, false); err == nil {
+					t.Fatal("modern V1-only consumer accepted explicit V2 selection")
+				}
+			}
 		})
+	}
+
+	absent := seed
+	absent.OperationalPayload = []byte(`{}`)
+	absent = attachAdmittedExecutionCell(t, absent, exactReceiptCell("harness/v2", "gpt-test", executioncell.SessionAutonomous, []executioncell.CapabilityRequirement{{Name: protectedRuntimeMCPTestCapability}}))
+	internal, err := newProtectedRuntimeMCPSelectionPolicy(ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := bindCapabilityRealizationSelection(absent, realizations, internal, false); err == nil {
+		t.Fatal("dual default accepted targeted absent selection")
+	}
+	policy.HistoricalAbsence = ProtectedRuntimeMCPHistoricalAbsenceV1
+	internal, err = newProtectedRuntimeMCPSelectionPolicy(ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	bound, err := bindCapabilityRealizationSelection(absent, realizations, internal, false)
+	if err != nil || bound.toolLifecycleProfileID != profile.ID {
+		t.Fatalf("historical V1 binding = profile %q err=%v, want %q nil", bound.toolLifecycleProfileID, err, profile.ID)
+	}
+}
+
+func TestDualSelectionLeavesExplicitPiTupleOutsideCodexMaterialization(t *testing.T) {
+	fixture := newProtectedRuntimeMCPMixedFixture(t)
+	manifest := fixture.codexProvider.manifest
+	v1Profile, ok := manifest.ToolLifecycleProfile(agent.PromptModeHumanControlled)
+	if !ok {
+		t.Fatal("missing Codex human profile")
+	}
+	v2Profile := v1Profile
+	v2Profile.ID += "-v2"
+	manifest.ToolLifecycle = append(manifest.ToolLifecycle, v2Profile)
+	codex := &manifestSelectorProvider{selectorFakeProvider: &selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex}, manifest: manifest, capabilities: codexCapabilitiesForTest()}
+	registry := NewRegistry()
+	if err := registry.Register(fixture.piProvider); err != nil {
+		t.Fatal(err)
+	}
+	if err := registry.Register(codex); err != nil {
+		t.Fatal(err)
+	}
+	seed := protectedRuntimeMCPMixedCodexWork(t, fixture.selector.CapabilityID, executioncell.SessionHumanControlled)
+	v2 := protectedRuntimeMCPCompiledForProfile(t, fixture.selector.CapabilityID, codex, seed, v2Profile.ID, agent.PromptModeHumanControlled)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{fixture.piRow, fixture.codexHumanRow, v2})
+	if err != nil {
+		t.Fatal(err)
+	}
+	policy := ProtectedRuntimeMCPDualSelectionPolicy{
+		V1: fixture.selector,
+		V2: ProtectedRuntimeMCPV2Selector{CapabilityID: fixture.selector.CapabilityID, HarnessID: fixture.selector.HarnessID, AdapterProfileID: v2Profile.ID, Mode: fixture.selector.Mode, ConfigRequirementID: "example.session-config/v1"},
+	}
+	qw := protectedRuntimeMCPMixedPiWork(t, fixture.selector.CapabilityID)
+	basePayload, err := CanonicalOperationalPayload(qw)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var payload map[string]any
+	if err := json.Unmarshal(basePayload, &payload); err != nil {
+		t.Fatal(err)
+	}
+	payload["capabilityRealizationSelection"] = selectionFromCompiled(fixture.piRow)
+	raw, err := executioncell.CanonicalJSON(payload)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw.OperationalPayload = raw
+	cell, err := executioncell.DecodeResolvedExecutionCell(qw.EffectiveCell)
+	if err != nil {
+		t.Fatal(err)
+	}
+	qw = attachAdmittedExecutionCell(t, qw, cell)
+	_, detail := protectedRuntimeMCPPreflightInput(t, qw)
+	view, err := NewProviderViewWithOptions(registry, ProviderViewOptions{Decorator: fixture.decorate, CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := view.PreflightExecution(detail); err != nil {
+		t.Fatalf("host rejected explicit Pi tuple: %v", err)
+	}
+	bound, err := BindProtectedRuntimeMCPSelection(qw, realizations, ProtectedRuntimeMCPSelector{}, ProtectedRuntimeMCPV2Selector{}, policy)
+	if err != nil {
+		t.Fatalf("child rejected explicit Pi tuple: %v", err)
+	}
+	if bound.toolLifecycleProfileID != "" {
+		t.Fatalf("Pi tuple selected Codex private profile %q", bound.toolLifecycleProfileID)
 	}
 }

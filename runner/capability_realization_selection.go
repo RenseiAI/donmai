@@ -2,6 +2,7 @@ package runner
 
 import (
 	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 
@@ -89,8 +90,9 @@ func newProtectedRuntimeMCPSelectionPolicy(v1 ProtectedRuntimeMCPSelector, v2 Pr
 	return protectedRuntimeMCPSelectionPolicy{v1: v1, v2: v2}, nil
 }
 
-func (p protectedRuntimeMCPSelectionPolicy) target(capability string) bool {
-	return (p.v1.configured() && p.v1.CapabilityID == capability) || (p.v2.configured() && p.v2.CapabilityID == capability)
+func (p protectedRuntimeMCPSelectionPolicy) target(selection executioncell.CapabilityRealizationSelectionV1) bool {
+	return (p.v1.configured() && selection.CapabilityID == p.v1.CapabilityID && selection.HarnessID == string(p.v1.HarnessID) && selection.Mode == string(p.v1.Mode)) ||
+		(p.v2.configured() && selection.CapabilityID == p.v2.CapabilityID && selection.HarnessID == string(p.v2.HarnessID) && selection.Mode == string(p.v2.Mode))
 }
 
 func (p protectedRuntimeMCPSelectionPolicy) adapterAllowed(selection executioncell.CapabilityRealizationSelectionV1) bool {
@@ -113,6 +115,24 @@ func capabilityGrantCount(cell executioncell.ResolvedExecutionCell, capability s
 		}
 	}
 	return count
+}
+
+func requireSelectedToolLifecycleProfile(qw QueuedWork, profileID string, requireHostAdaptation bool) error {
+	if !requireHostAdaptation {
+		return nil
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(qw.HostAdaptationReceipt)
+	if err != nil {
+		return err
+	}
+	var tool agent.ToolLifecycleReceipt
+	if err := json.Unmarshal(host.ToolLifecycleReceipt, &tool); err != nil {
+		return errors.New("runner: selected capability realization host tool receipt is malformed")
+	}
+	if tool.ProfileID != profileID {
+		return errors.New("runner: selected capability realization differs from host tool profile")
+	}
+	return nil
 }
 
 // bindCapabilityRealizationSelection independently establishes receipt, digest,
@@ -163,13 +183,23 @@ func bindCapabilityRealizationSelection(qw QueuedWork, realizations *agent.Capab
 		if !policy.v1.configured() && policy.v2.configured() {
 			return BindProtectedRuntimeMCPV2ProfileIntent(qw, policy.v2), nil
 		}
-		if !policy.v1.configured() || capabilityGrantCount(cell, policy.v1.CapabilityID) != 1 || cell.Harness.ID != string(policy.v1.HarnessID) || mode != policy.v1.Mode {
+		if !policy.v1.configured() {
 			return qw, nil
+		}
+		grants := capabilityGrantCount(cell, policy.v1.CapabilityID)
+		if grants == 0 || cell.Harness.ID != string(policy.v1.HarnessID) || mode != policy.v1.Mode {
+			return qw, nil
+		}
+		if grants != 1 {
+			return QueuedWork{}, errors.New("runner: protected target capability must be granted exactly once")
 		}
 		if policy.historical != ProtectedRuntimeMCPHistoricalAbsenceV1 {
 			return QueuedWork{}, errors.New("runner: targeted capability realization selection is required")
 		}
 		qw.toolLifecycleProfileID = policy.v1.AdapterProfileID
+		if err := requireSelectedToolLifecycleProfile(qw, qw.toolLifecycleProfileID, requireHostAdaptation); err != nil {
+			return QueuedWork{}, err
+		}
 		return qw, nil
 	}
 	if capabilityGrantCount(cell, selection.CapabilityID) != 1 || cell.Harness.ID != selection.HarnessID || string(mode) != selection.Mode {
@@ -179,11 +209,14 @@ func bindCapabilityRealizationSelection(qw QueuedWork, realizations *agent.Capab
 	if !ok || compiled.Declaration.Recipe.RecipeDigest != selection.RecipeDigest || compiled.Declaration.Recipe.DeclaredSurfaceDigest != selection.DeclaredSurfaceDigest || compiled.Observation.ObservationDigest != selection.ObservationDigest {
 		return QueuedWork{}, errors.New("runner: capability realization selection does not match exact local registry evidence")
 	}
-	if policy.target(selection.CapabilityID) {
+	if policy.target(*selection) {
 		if !policy.adapterAllowed(*selection) {
 			return QueuedWork{}, errors.New("runner: capability realization selection adapter is not permitted by this consumer")
 		}
 		qw.toolLifecycleProfileID = selection.AdapterVersion
+		if err := requireSelectedToolLifecycleProfile(qw, qw.toolLifecycleProfileID, requireHostAdaptation); err != nil {
+			return QueuedWork{}, err
+		}
 	}
 	return qw, nil
 }
