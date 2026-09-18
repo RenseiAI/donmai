@@ -113,7 +113,7 @@
     {
       "name": "duplicate-outer-key",
       "inputKind": "operational-payload",
-      "json": "{\"capabilityRealizationSelection\":null,\"capabilityRealizationSelection\":null}",
+      "json": "{\"capabilityRealizationSelection\":{\"contractVersion\":\"donmai.capability-realization-selection/v1\",\"capabilityId\":\"workflow.draft.authoring/v1\",\"harnessId\":\"codex\",\"adapterVersion\":\"codex/interactive/tool-lifecycle-v1\",\"mode\":\"human_controlled\",\"recipeDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"declaredSurfaceDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"observationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"},\"capabilityRealizationSelecti\\u006fn\":{\"contractVersion\":\"donmai.capability-realization-selection/v1\",\"capabilityId\":\"workflow.draft.authoring/v1\",\"harnessId\":\"codex\",\"adapterVersion\":\"codex/interactive/tool-lifecycle-v1\",\"mode\":\"human_controlled\",\"recipeDigest\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\"declaredSurfaceDigest\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\",\"observationDigest\":\"cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc\"}}",
       "valid": false
     },
     {

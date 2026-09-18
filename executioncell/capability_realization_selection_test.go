@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"os"
+	"strings"
 	"testing"
 )
 
@@ -177,5 +178,73 @@ func TestExtractCapabilityRealizationSelectionV1PreservesInputAndIndependence(t 
 	}
 	if values["operational-v1"].AdapterVersion == values["operational-v2"].AdapterVersion {
 		t.Fatalf("independent payloads collapsed to adapter %q", values["operational-v1"].AdapterVersion)
+	}
+}
+
+func TestCapabilityRealizationSelectionV1RejectsLossyStringsAndKeepsCanonicalDomainClosed(t *testing.T) {
+	t.Parallel()
+	vectors := loadCapabilityRealizationSelectionVectors(t)
+	var baseline capabilityRealizationSelectionVector
+	for _, vector := range vectors.Vectors {
+		if vector.Name == "explicit-v1" {
+			baseline = vector
+			break
+		}
+	}
+	if baseline.Name == "" {
+		t.Fatal("explicit-v1 vector is missing")
+	}
+	value, err := DecodeCapabilityRealizationSelectionV1([]byte(baseline.JSON))
+	if err != nil {
+		t.Fatalf("decode typed baseline: %v", err)
+	}
+	canonical, err := CanonicalCapabilityRealizationSelectionV1(value)
+	if err != nil {
+		t.Fatalf("canonicalize typed baseline: %v", err)
+	}
+	if _, err := DecodeCapabilityRealizationSelectionV1(canonical); err != nil {
+		t.Fatalf("decode successful typed canonical bytes: %v", err)
+	}
+
+	for name, candidate := range map[string]CapabilityRealizationSelectionV1{
+		"invalid Go UTF-8": func() CapabilityRealizationSelectionV1 {
+			copy := value
+			copy.HarnessID = string([]byte{0xff})
+			return copy
+		}(),
+		"oversized canonical value": func() CapabilityRealizationSelectionV1 {
+			copy := value
+			copy.HarnessID = strings.Repeat("h", maxCapabilityRealizationSelectionBytes)
+			return copy
+		}(),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if err := ValidateCapabilityRealizationSelectionV1(candidate); err == nil {
+				t.Fatal("invalid typed selection passed validation")
+			}
+			if _, err := CanonicalCapabilityRealizationSelectionV1(candidate); err == nil {
+				t.Fatal("invalid typed selection produced canonical bytes")
+			}
+		})
+	}
+
+	for name, raw := range map[string][]byte{
+		"invalid raw UTF-8":         bytes.Replace([]byte(baseline.JSON), []byte(`"harnessId":"codex"`), append([]byte(`"harnessId":"`), append([]byte{0xff}, []byte(`"`)...)...), 1),
+		"unpaired surrogate escape": bytes.Replace([]byte(baseline.JSON), []byte(`"harnessId":"codex"`), []byte(`"harnessId":"\ud800"`), 1),
+	} {
+		t.Run(name, func(t *testing.T) {
+			if _, err := DecodeCapabilityRealizationSelectionV1(raw); err == nil {
+				t.Fatal("lossy raw selection decoded successfully")
+			}
+		})
+	}
+
+	validPair := bytes.Replace([]byte(baseline.JSON), []byte(`"harnessId":"codex"`), []byte(`"harnessId":"codex-\ud83d\ude80"`), 1)
+	paired, err := DecodeCapabilityRealizationSelectionV1(validPair)
+	if err != nil {
+		t.Fatalf("decode valid surrogate pair: %v", err)
+	}
+	if paired.HarnessID != "codex-🚀" {
+		t.Fatalf("decoded surrogate pair harness = %q", paired.HarnessID)
 	}
 }

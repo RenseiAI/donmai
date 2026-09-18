@@ -68,10 +68,76 @@ func validateCapabilityRealizationSelectionBytes(raw []byte) error {
 	return nil
 }
 
+func selectionEscapeCodepoint(raw []byte, index int) (rune, bool) {
+	if index+6 > len(raw) || raw[index] != '\\' || raw[index+1] != 'u' {
+		return 0, false
+	}
+	var value rune
+	for _, digit := range raw[index+2 : index+6] {
+		value <<= 4
+		switch {
+		case digit >= '0' && digit <= '9':
+			value += rune(digit - '0')
+		case digit >= 'a' && digit <= 'f':
+			value += rune(digit-'a') + 10
+		case digit >= 'A' && digit <= 'F':
+			value += rune(digit-'A') + 10
+		default:
+			return 0, false
+		}
+	}
+	return value, true
+}
+
+func validateCapabilityRealizationSelectionEscapes(raw []byte) error {
+	for index := 0; index < len(raw); {
+		if raw[index] != '\\' || index+1 >= len(raw) || raw[index+1] != 'u' {
+			if raw[index] == '\\' {
+				index += 2
+			} else {
+				index++
+			}
+			continue
+		}
+		codepoint, ok := selectionEscapeCodepoint(raw, index)
+		if !ok {
+			index += 2
+			continue
+		}
+		switch {
+		case codepoint >= 0xD800 && codepoint <= 0xDBFF:
+			low, paired := selectionEscapeCodepoint(raw, index+6)
+			if !paired || low < 0xDC00 || low > 0xDFFF {
+				return errors.New("executioncell: capability realization selection contains an unpaired high surrogate escape")
+			}
+			index += 12
+		case codepoint >= 0xDC00 && codepoint <= 0xDFFF:
+			return errors.New("executioncell: capability realization selection contains an unpaired low surrogate escape")
+		default:
+			index += 6
+		}
+	}
+	return nil
+}
+
+func validCapabilityRealizationSelectionStrings(value CapabilityRealizationSelectionV1) bool {
+	return utf8.ValidString(value.ContractVersion) &&
+		utf8.ValidString(value.CapabilityID) &&
+		utf8.ValidString(value.HarnessID) &&
+		utf8.ValidString(value.AdapterVersion) &&
+		utf8.ValidString(value.Mode) &&
+		utf8.ValidString(value.RecipeDigest) &&
+		utf8.ValidString(value.DeclaredSurfaceDigest) &&
+		utf8.ValidString(value.ObservationDigest)
+}
+
 // ValidateCapabilityRealizationSelectionV1 validates only the closed wire
 // grammar. Exact registry membership and evidence-digest equality are later
 // authorization checks and are intentionally outside this codec.
 func ValidateCapabilityRealizationSelectionV1(value CapabilityRealizationSelectionV1) error {
+	if !validCapabilityRealizationSelectionStrings(value) {
+		return errors.New("executioncell: capability realization selection strings must be valid UTF-8")
+	}
 	if value.ContractVersion != CapabilityRealizationSelectionContractVersionV1 {
 		return fmt.Errorf("executioncell: unsupported capability realization selection version %q", value.ContractVersion)
 	}
@@ -86,7 +152,11 @@ func ValidateCapabilityRealizationSelectionV1(value CapabilityRealizationSelecti
 	if !isHex64(value.RecipeDigest) || !isHex64(value.DeclaredSurfaceDigest) || !isHex64(value.ObservationDigest) {
 		return errors.New("executioncell: capability realization selection digests must be lowercase SHA-256")
 	}
-	return nil
+	canonical, err := CanonicalJSON(value)
+	if err != nil {
+		return fmt.Errorf("executioncell: canonicalize capability realization selection: %w", err)
+	}
+	return validateCapabilityRealizationSelectionBytes(canonical)
 }
 
 // DecodeCapabilityRealizationSelectionV1 strictly decodes one selection. It
@@ -94,6 +164,9 @@ func ValidateCapabilityRealizationSelectionV1(value CapabilityRealizationSelecti
 // can normalize them.
 func DecodeCapabilityRealizationSelectionV1(raw []byte) (CapabilityRealizationSelectionV1, error) {
 	if err := validateCapabilityRealizationSelectionBytes(raw); err != nil {
+		return CapabilityRealizationSelectionV1{}, err
+	}
+	if err := validateCapabilityRealizationSelectionEscapes(raw); err != nil {
 		return CapabilityRealizationSelectionV1{}, err
 	}
 	if err := rejectDuplicateFields(raw); err != nil {
