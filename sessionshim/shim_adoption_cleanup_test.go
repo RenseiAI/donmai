@@ -104,6 +104,9 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			var failOnce sync.Once
 			failureEntered := make(chan struct{}, 1)
 			failureRelease := make(chan struct{})
+			var releaseFailureOnce sync.Once
+			releaseFailure := func() { releaseFailureOnce.Do(func() { close(failureRelease) }) }
+			t.Cleanup(releaseFailure)
 			shim, err := Start(Options{
 				Identity: id, Registry: reg, ProcessEpoch: 1,
 				Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}, RingBytes: 48},
@@ -179,25 +182,32 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			}
 			if tc.proofBound {
 				<-failureEntered
-				markerDone := make(chan error, 1)
-				go func() { markerDone <- shim.Session().EmitMarker("queued-behind-post-install-failure") }()
-				select {
-				case markerErr := <-markerDone:
-					t.Fatalf("proof-bound marker crossed controller-owned barrier before failure cleanup: %v", markerErr)
-				case <-time.After(50 * time.Millisecond):
+				shim.mu.Lock()
+				failureCtrl := shim.ctrl
+				shim.mu.Unlock()
+				if failureCtrl == nil {
+					t.Fatal("proof-bound failure reached without its installed controller")
 				}
-				close(failureRelease)
+				// This cleanup makes the literal barrier-release removal control
+				// teardown-safe: it frees a captured pending barrier even when the
+				// production close path under test does not.
+				t.Cleanup(failureCtrl.failOutputBarrier)
+				failureCtrl.barrierMu.Lock()
+				barrier, state := failureCtrl.outputBarrier, failureCtrl.barrierState
+				failureCtrl.barrierMu.Unlock()
+				if barrier == nil || state != outputBarrierPending {
+					t.Fatalf("proof-bound controller barrier before failure = %p/%d, want pending non-nil", barrier, state)
+				}
+				releaseFailure()
 				err = <-errCh
-				select {
-				case markerErr := <-markerDone:
-					if markerErr != nil {
-						t.Fatalf("failure cleanup did not release proof-bound output barrier: %v", markerErr)
-					}
-				case <-time.After(5 * time.Second):
-					t.Fatal("failure cleanup left proof-bound output barrier held")
+				failureCtrl.barrierMu.Lock()
+				barrier, state = failureCtrl.outputBarrier, failureCtrl.barrierState
+				failureCtrl.barrierMu.Unlock()
+				if barrier != nil || state != outputBarrierFailed {
+					t.Fatalf("failure cleanup barrier = %p/%d, want released failed", barrier, state)
 				}
 			} else {
-				close(failureRelease)
+				releaseFailure()
 				err = <-errCh
 			}
 			want := errInjectedPostInstall
