@@ -24,13 +24,19 @@ var (
 // rather than simulating a later socket close.
 type failMessageWriter struct {
 	io.Writer
-	target shimwire.MessageType
-	seen   chan<- shimwire.MessageType
+	target  shimwire.MessageType
+	seen    chan<- shimwire.MessageType
+	entered chan<- struct{}
+	release <-chan struct{}
 }
 
 func (w failMessageWriter) Write(p []byte) (int, error) {
 	if len(p) == 5 && p[4] == byte(w.target) {
 		w.seen <- w.target
+		if w.entered != nil {
+			w.entered <- struct{}{}
+			<-w.release
+		}
 		return 0, errInjectedWireWrite
 	}
 	return w.Writer.Write(p)
@@ -72,18 +78,20 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 		fillRing   bool
 		seam       string
 		wire       shimwire.MessageType
+		proofBound bool
 	}{
 		// The nil-default seam covers returns without a writer: resume, the
 		// subscription handoff, and loop ownership. The writer controls below
 		// cover every reachable post-commit wire write.
 		{name: "v1-resume", selected: shimwire.V1, seam: "resume"},
 		{name: "v2-subscription", selected: shimwire.V2, seam: "subscription"},
-		{name: "v4-adopted-write", selected: shimwire.V4, wire: shimwire.TypeAdopted},
+		{name: "v3-adopted-write", selected: shimwire.V3, wire: shimwire.TypeAdopted, proofBound: true},
+		{name: "v4-adopted-write", selected: shimwire.V4, wire: shimwire.TypeAdopted, proofBound: true},
 		{name: "v1-gap-write", selected: shimwire.V1, resumeFrom: 2, fillRing: true, wire: shimwire.TypeGap},
 		{name: "v2-snapshot-write", selected: shimwire.V2, resumeFrom: 2, fillRing: true, wire: shimwire.TypeSnapshot},
 		{name: "v3-host-frame-write", selected: shimwire.V3, resumeFrom: 2, fillRing: true, wire: shimwire.TypeHostFrame},
 		{name: "v4-host-frame-write", selected: shimwire.V4, resumeFrom: 2, fillRing: true, wire: shimwire.TypeHostFrame},
-		{name: "v4-loop-start", selected: shimwire.V4, seam: "loopstart"},
+		{name: "v4-loop-start", selected: shimwire.V4, seam: "loopstart", proofBound: true},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
@@ -94,6 +102,8 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			}
 			id := Identity{OrgID: "org-cleanup", SessionID: "session-post-install-" + tc.name}
 			var failOnce sync.Once
+			failureEntered := make(chan struct{}, 1)
+			failureRelease := make(chan struct{})
 			shim, err := Start(Options{
 				Identity: id, Registry: reg, ProcessEpoch: 1,
 				Spec:         ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}, RingBytes: 48},
@@ -104,6 +114,8 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 						fail := false
 						failOnce.Do(func() { fail = true })
 						if fail {
+							failureEntered <- struct{}{}
+							<-failureRelease
 							return errInjectedPostInstall
 						}
 					}
@@ -122,6 +134,7 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			if err != nil {
 				t.Fatalf("read initial record: %v", err)
 			}
+			beforeHarness := shim.HarnessIdentity()
 			if tc.fillRing {
 				for i := 0; i < 32; i++ {
 					if err := shim.Session().EmitMarker(fmt.Sprintf("evict-%02d", i)); err != nil {
@@ -134,7 +147,9 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			seen := make(chan shimwire.MessageType, 1)
 			writer := shimwire.NewWriter(server)
 			if tc.wire != 0 {
-				writer = shimwire.NewWriter(failMessageWriter{Writer: server, target: tc.wire, seen: seen})
+				writer = shimwire.NewWriter(failMessageWriter{
+					Writer: server, target: tc.wire, seen: seen, entered: failureEntered, release: failureRelease,
+				})
 			}
 			errCh := make(chan error, 1)
 			go func() { errCh <- shim.handshake(server, writer, shimwire.NewReader(server)) }()
@@ -151,12 +166,40 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 				ControllerID: "controller-post-install", ProposedGeneration: hello.Generation + 1,
 				ResumeFrom: tc.resumeFrom,
 			}
+			if tc.proofBound {
+				welcome.Extensions = shimwire.Extensions{
+					Values:   map[string]string{shimwire.ExtCarrierEpoch: "post-install-proof"},
+					Required: []string{shimwire.ExtCarrierEpoch},
+				}
+			}
 			if err := writeTyped(shimwire.NewWriter(client), shimwire.TypeWelcome, func() ([]byte, error) {
 				return shimwire.EncodeWelcome(welcome)
 			}); err != nil {
 				t.Fatalf("write Welcome: %v", err)
 			}
-			err = <-errCh
+			if tc.proofBound {
+				<-failureEntered
+				markerDone := make(chan error, 1)
+				go func() { markerDone <- shim.Session().EmitMarker("queued-behind-post-install-failure") }()
+				select {
+				case markerErr := <-markerDone:
+					t.Fatalf("proof-bound marker crossed controller-owned barrier before failure cleanup: %v", markerErr)
+				case <-time.After(50 * time.Millisecond):
+				}
+				close(failureRelease)
+				err = <-errCh
+				select {
+				case markerErr := <-markerDone:
+					if markerErr != nil {
+						t.Fatalf("failure cleanup did not release proof-bound output barrier: %v", markerErr)
+					}
+				case <-time.After(5 * time.Second):
+					t.Fatal("failure cleanup left proof-bound output barrier held")
+				}
+			} else {
+				close(failureRelease)
+				err = <-errCh
+			}
 			want := errInjectedPostInstall
 			if tc.wire != 0 {
 				want = errInjectedWireWrite
@@ -188,15 +231,13 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 				t.Fatalf("published record = %+v, want orphan deadline", record)
 			}
 			if record.PID != before.PID || record.ProcessStartedAt != before.ProcessStartedAt {
-				t.Fatalf("failed handshake changed child identity: before=%d/%d after=%d/%d", before.PID, before.ProcessStartedAt, record.PID, record.ProcessStartedAt)
+				t.Fatalf("failed handshake changed shim identity: before=%d/%d after=%d/%d", before.PID, before.ProcessStartedAt, record.PID, record.ProcessStartedAt)
 			}
-			if alive, aliveErr := shim.harness.Alive(); aliveErr != nil || !alive {
+			if got := shim.HarnessIdentity(); got != beforeHarness {
+				t.Fatalf("failed handshake changed harness identity: before=%+v after=%+v", beforeHarness, got)
+			}
+			if alive, aliveErr := beforeHarness.Alive(); aliveErr != nil || !alive {
 				t.Fatalf("harness after failed adoption = alive %t err %v, want live", alive, aliveErr)
-			}
-			if tc.selected >= shimwire.V3 {
-				if err := shim.Session().EmitMarker("barrier-released"); err != nil {
-					t.Fatalf("post-failure output barrier remained held: %v", err)
-				}
 			}
 
 			result, err := Adopt(context.Background(), AdoptOptions{Registry: reg, ControllerID: "controller-retry"})
@@ -206,6 +247,9 @@ func TestHandshakePostInstallFailureRestoresOrphanTracking(t *testing.T) {
 			t.Cleanup(result.Close)
 			if got := result.Adopted[0].Generation(); got != generation+1 {
 				t.Fatalf("retry generation = %d, want %d", got, generation+1)
+			}
+			if got := result.Adopted[0].HarnessIdentity(); got != beforeHarness {
+				t.Fatalf("re-adoption changed harness identity: before=%+v after=%+v", beforeHarness, got)
 			}
 			recovered, err := reg.Get(id)
 			if err != nil {
