@@ -2269,10 +2269,6 @@ func mcpGatewayBearer(qw QueuedWork) string {
 // protectedRuntimeMCPServer derives the exact session-scoped HTTP server used
 // by the protected ACK contract. Unlike the legacy default path it never falls
 // back to the worker bearer.
-func protectedRuntimeMCPServer(qw QueuedWork, provider agent.Provider, mode agent.PromptSessionMode) (agent.MCPServerConfig, error) {
-	return protectedRuntimeMCPServerWithName(qw, provider, mode, platformMCPServerName())
-}
-
 func protectedRuntimeMCPServerWithName(qw QueuedWork, provider agent.Provider, mode agent.PromptSessionMode, platformMCPServerName string) (agent.MCPServerConfig, error) {
 	if !harnessDeliversMCP(provider, mode) {
 		return agent.MCPServerConfig{}, errors.New("runner: protected runtime MCP is unsupported by the selected harness profile")

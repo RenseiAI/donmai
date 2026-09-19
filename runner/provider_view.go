@@ -180,16 +180,6 @@ func digestProtectedRuntimeMCPAuthority(binding agent.CapabilityRealizationBindi
 	return fmt.Sprintf("%x", sum[:]), nil
 }
 
-func resolveProtectedRuntimeMCPRequirement(
-	qw QueuedWork,
-	selection harnessSelection,
-	realizations *agent.CapabilityRealizationRegistry,
-	selector ProtectedRuntimeMCPSelector,
-	host executioncell.HostAdaptationReceipt,
-) (*executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
-	return resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName())
-}
-
 func resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(
 	qw QueuedWork,
 	selection harnessSelection,
@@ -283,16 +273,6 @@ func resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(
 		return nil, err
 	}
 	return &requirement, nil
-}
-
-func resolveProtectedRuntimeMCPRequirementV2(
-	qw QueuedWork,
-	selection harnessSelection,
-	realizations *agent.CapabilityRealizationRegistry,
-	selector ProtectedRuntimeMCPV2Selector,
-	host executioncell.HostAdaptationReceipt,
-) (*executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
-	return resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName())
 }
 
 func resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(

@@ -335,16 +335,6 @@ func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.Admiss
 	return nil
 }
 
-func validateProtectedRuntimeMCPMaterialization(
-	qw QueuedWork,
-	selection harnessSelection,
-	realizations *agent.CapabilityRealizationRegistry,
-	selector ProtectedRuntimeMCPSelector,
-	servers []agent.MCPServerConfig,
-) error {
-	return validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(qw, selection, realizations, selector, servers, platformMCPServerName())
-}
-
 func validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(
 	qw QueuedWork,
 	selection harnessSelection,
