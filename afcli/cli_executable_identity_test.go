@@ -44,12 +44,9 @@ func TestAgentRunConfiguredCLIExecutableNameReachesActualSpawn(t *testing.T) {
 	}
 
 	stdout, _ := runSpecDecoratorAgentRunCmd(t, Config{BinaryName: "sample-cli"})
-	spawned, err := json.Marshal(provider.spawnSpec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !strings.Contains(string(spawned), "sample-cli linear") || strings.Contains(string(spawned), "donmai linear") {
-		t.Fatalf("actual spawn has wrong executable identity (stdout=%q): %s", stdout, spawned)
+	spawnedPrompt := provider.spawnSpec.Prompt + "\n" + provider.spawnSpec.SystemPromptAppend
+	if !strings.Contains(spawnedPrompt, "sample-cli linear") || strings.Contains(spawnedPrompt, "donmai linear") {
+		t.Fatalf("actual spawn has wrong executable identity (stdout=%q)", stdout)
 	}
 }
 
