@@ -157,6 +157,10 @@ type Options struct {
 	// Defaults to &prompt.Builder{}.
 	PromptBuilder *prompt.Builder
 
+	// CLIExecutableName is the process-owned command basename rendered in
+	// instructions. Empty defaults to "donmai". New validates and captures it.
+	CLIExecutableName string
+
 	// HTTPClient is forwarded to the heartbeat pulser for
 	// /api/sessions/<id>/lock-refresh calls. Defaults to a 30s-timeout
 	// http.Client.
@@ -382,6 +386,7 @@ type Runner struct {
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 	selectionPolicy               protectedRuntimeMCPSelectionPolicy
 	platformMCPServerName         string
+	cliExecutableName             string
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -413,6 +418,18 @@ func New(opts Options) (*Runner, error) {
 	if opts.Poster == nil {
 		return nil, errors.New("runner: Poster is required")
 	}
+	cliExecutableName, err := resolveCLIExecutableName(opts.CLIExecutableName)
+	if err != nil {
+		return nil, err
+	}
+	basePromptBuilder := opts.PromptBuilder
+	if basePromptBuilder == nil {
+		basePromptBuilder = prompt.NewBuilder()
+	}
+	promptBuilder, err := basePromptBuilder.WithCLIExecutableName(cliExecutableName)
+	if err != nil {
+		return nil, fmt.Errorf("runner: CLI executable name is malformed: %w", err)
+	}
 	selectionPolicy, err := newProtectedRuntimeMCPSelectionPolicy(opts.ProtectedRuntimeMCPSelector, opts.ProtectedRuntimeMCPV2Selector, opts.ProtectedRuntimeMCPDualSelectionPolicy, opts.CapabilityRealizations)
 	if err != nil {
 		return nil, err
@@ -433,7 +450,7 @@ func New(opts Options) (*Runner, error) {
 		envc:                          opts.EnvComposer,
 		mcpb:                          opts.MCPBuilder,
 		store:                         opts.StateStore,
-		promptBuilder:                 opts.PromptBuilder,
+		promptBuilder:                 promptBuilder,
 		httpClient:                    opts.HTTPClient,
 		logger:                        opts.Logger,
 		now:                           opts.Now,
@@ -461,6 +478,7 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
 		platformMCPServerName:         platformMCPServerName,
+		cliExecutableName:             cliExecutableName,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -470,9 +488,6 @@ func New(opts Options) (*Runner, error) {
 	}
 	if r.store == nil {
 		r.store = state.NewStore()
-	}
-	if r.promptBuilder == nil {
-		r.promptBuilder = &prompt.Builder{}
 	}
 	if r.httpClient == nil {
 		r.httpClient = &http.Client{Timeout: 30 * time.Second}

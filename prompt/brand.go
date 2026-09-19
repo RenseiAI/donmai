@@ -1,10 +1,32 @@
 package prompt
 
 import (
+	"errors"
+	"regexp"
 	"strings"
 
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
+
+const defaultCLIExecutableName = "donmai"
+
+var (
+	cliExecutableNamePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]{0,127}$`)
+	errCLIExecutableName     = errors.New("must match [A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+)
+
+// ResolveCLIExecutableName validates one process-owned command basename.
+// Empty preserves the standalone Donmai default. Explicit values are exact:
+// they are never trimmed, normalized, or derived from filesystem identity.
+func ResolveCLIExecutableName(configured string) (string, error) {
+	if configured == "" {
+		return defaultCLIExecutableName, nil
+	}
+	if !cliExecutableNamePattern.MatchString(configured) {
+		return "", errCLIExecutableName
+	}
+	return configured, nil
+}
 
 // Brand carries the display and CLI tokens the prompt templates interpolate so
 // the rendered system/user prompts name the binary the agent is actually
@@ -25,22 +47,26 @@ type Brand struct {
 	BrandCLI string
 }
 
-// ResolveBrand derives the active [Brand] from the process-global statehome
-// seam. The CLI token is the statehome brand verbatim (it IS the binary name
-// — "donmai" / "rensei"); the display token title-cases its first rune.
-// Resolving at call time (rather than caching) keeps the builder's zero value
-// useful and honours an embedder that sets the brand before first dispatch.
+// ResolveBrand derives the display brand from the process-global statehome
+// seam. Its CLI token is the standalone literal "donmai"; embedders provide
+// their stable executable identity explicitly through [Builder.WithCLIExecutableName].
+// This keeps named filesystem instances out of command instructions.
 //
-// It is exported so other prompt-surface producers (e.g. the runner's
-// mid-session steering message) can name the active binary's CLI consistently
-// with the rendered templates, from a single source of truth.
+// It remains exported for callers that need the standalone display/CLI pair.
 func ResolveBrand() Brand {
-	cli := strings.TrimSpace(statehome.Brand())
+	return resolveBrandWithCLI(defaultCLIExecutableName)
+}
+
+func resolveBrandWithCLI(cli string) Brand {
+	display := strings.TrimSpace(statehome.Brand())
+	if display == "" {
+		display = statehome.DefaultBrand
+	}
 	if cli == "" {
-		cli = statehome.DefaultBrand
+		cli = defaultCLIExecutableName
 	}
 	return Brand{
-		BrandDisplay: titleBrand(cli),
+		BrandDisplay: titleBrand(display),
 		BrandCLI:     cli,
 	}
 }

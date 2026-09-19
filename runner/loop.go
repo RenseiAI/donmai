@@ -120,7 +120,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
-		preparedSource, _, err = buildPreparedSourceSpecWithPlatformMCPServerName(qw, selection, r.additionalExtensionDecorator, r.platformMCPServerName, r.preparedCapabilities)
+		preparedSource, _, err = buildPreparedSourceSpecWithProcessIdentity(qw, selection, r.additionalExtensionDecorator, r.platformMCPServerName, r.cliExecutableName, r.preparedCapabilities)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
@@ -485,7 +485,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
-	mcpDefaults := defaultMCPServersForHarnessWithPlatformMCPServerName(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), r.platformMCPServerName, codeIntelDelivery.Route)
+	mcpDefaults := defaultMCPServersForHarnessWithProcessIdentity(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), r.platformMCPServerName, r.cliExecutableName, codeIntelDelivery.Route)
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
@@ -530,14 +530,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// filtered by qw.WorkType, then their file bodies are appended AFTER
 	// the skill block. Fragments with an empty [when] list match all
 	// workTypes (no filter). Additive: nil sources = no fragment injection.
-	// SkillAppend is per-run scratch state. Keep it on a fresh builder so
-	// concurrent sessions on one long-lived Runner cannot overwrite each
-	// other's skill composition. SystemAppend and Registry are immutable
-	// construction inputs and remain shared by value/pointer respectively.
-	promptBuilder := &prompt.Builder{
-		SystemAppend: r.promptBuilder.SystemAppend,
-		Registry:     r.promptBuilder.Registry,
-	}
+	// Keep per-run additions on a fresh builder so concurrent sessions cannot
+	// overwrite each other's composition. Construction-time SkillAppend stays
+	// first; detected kit and inline contributions append to the copy.
+	promptBuilder := r.promptBuilder.Copy()
 
 	var kitDisallowedTools []string
 	if len(kitSkillSources) > 0 {
@@ -548,7 +544,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"err", skillErr,
 			)
 		}
-		promptBuilder.SkillAppend = loaded.SystemAppend
+		if promptBuilder.SkillAppend != "" && loaded.SystemAppend != "" {
+			promptBuilder.SkillAppend += "\n\n"
+		}
+		promptBuilder.SkillAppend += loaded.SystemAppend
 		kitDisallowedTools = loaded.DisallowedTools
 		if loaded.SystemAppend != "" {
 			r.logger.Info("kit skills injected into system prompt",
@@ -630,7 +629,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// composed system prompt — FQ MCP tool names for MCP-capable providers,
 	// Bash-CLI fallback guidance for providers that ignore MCP specs. Strict
 	// no-op when the block is absent (byte-identical prompt to today).
-	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery)
+	composition.HarnessProtocol = injectCodeIntelPartialForDeliveryWithCLI(composition.HarnessProtocol, caps, qw.CodeIntel, codeIntelDelivery, r.cliExecutableName)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, repositoryDeclaration != nil)
 	systemPrompt := composition.SystemPrompt()
 	userPrompt := composition.UserPrompt
@@ -2359,6 +2358,10 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 }
 
 func defaultMCPServersForHarnessWithPlatformMCPServerName(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode, platformMCPServerName string, routes ...codeIntelDeliveryRoute) []agent.MCPServerConfig {
+	return defaultMCPServersForHarnessWithProcessIdentity(qw, wpath, provider, mode, platformMCPServerName, "donmai", routes...)
+}
+
+func defaultMCPServersForHarnessWithProcessIdentity(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode, platformMCPServerName, cliExecutableName string, routes ...codeIntelDeliveryRoute) []agent.MCPServerConfig {
 	var servers []agent.MCPServerConfig
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
@@ -2379,7 +2382,7 @@ func defaultMCPServersForHarnessWithPlatformMCPServerName(qw QueuedWork, wpath s
 		route = routes[0]
 	}
 	if qw.CodeIntel != nil && route != codeIntelDeliveryNative {
-		servers = append(servers, codeIntelMCPEntry(wpath, qw.CodeIntel))
+		servers = append(servers, codeIntelMCPEntry(wpath, qw.CodeIntel, cliExecutableName))
 	}
 
 	return servers

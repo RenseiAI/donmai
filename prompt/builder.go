@@ -98,6 +98,10 @@ type Builder struct {
 	// Callers that do not set this field get the existing behavior.
 	Registry *templates.Registry
 
+	// cliExecutableName is the validated, process-owned command basename used
+	// in instructions. Empty is the standalone "donmai" default.
+	cliExecutableName string
+
 	// templates is lazily parsed on first use to keep the zero value
 	// useful. Accessed only via [Builder.set] under tmplOnce.
 	templates *template.Template
@@ -115,6 +119,37 @@ type Builder struct {
 // the literal `prompt.Builder{}` instead.
 func NewBuilder() *Builder {
 	return &Builder{}
+}
+
+// WithCLIExecutableName returns a fresh Builder with one validated executable
+// identity. It copies construction inputs but deliberately does not copy the
+// lazy template cache or sync.Once state.
+func (b *Builder) WithCLIExecutableName(configured string) (*Builder, error) {
+	name, err := ResolveCLIExecutableName(configured)
+	if err != nil {
+		return nil, err
+	}
+	copy := b.Copy()
+	copy.cliExecutableName = name
+	return copy, nil
+}
+
+// Copy returns a fresh Builder carrying immutable construction inputs. Lazy
+// template state is rebuilt by the copy on first use.
+func (b *Builder) Copy() *Builder {
+	if b == nil {
+		return &Builder{}
+	}
+	return &Builder{
+		SystemAppend:      b.SystemAppend,
+		SkillAppend:       b.SkillAppend,
+		Registry:          b.Registry,
+		cliExecutableName: b.cliExecutableName,
+	}
+}
+
+func (b *Builder) brand() Brand {
+	return resolveBrandWithCLI(b.cliExecutableName)
 }
 
 // Build renders the (system, user) prompt pair for qw.
@@ -180,7 +215,7 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	// (turn-result manifest, WORK_RESULT markers, task-end behavior) never
 	// applied to a live terminal session. The common safety, authority,
 	// worktree, and read-before-edit rules are shared by both templates.
-	systemBuf, err := renderTemplate(tmpls, systemTemplateName(qw), systemTemplateData(qw, b.SystemAppend, b.SkillAppend))
+	systemBuf, err := renderTemplate(tmpls, systemTemplateName(qw), systemTemplateData(qw, b.brand(), b.SystemAppend, b.SkillAppend))
 	if err != nil {
 		return "", "", fmt.Errorf("render system prompt: %w", err)
 	}
@@ -216,7 +251,7 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 	}
 
 	userTmpl := userTemplateName(WorkType(qw.WorkType))
-	userBuf, err := renderTemplate(tmpls, userTmpl, userTemplateData(qw))
+	userBuf, err := renderTemplate(tmpls, userTmpl, userTemplateData(qw, b.brand()))
 	if err != nil {
 		return "", "", fmt.Errorf("render user prompt %q: %w", userTmpl, err)
 	}
@@ -229,7 +264,7 @@ func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
 // (same inputs, same stage-prompt shortcircuit, same fallback for unknown
 // work types) while delegating template execution to raymond.
 func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user string, err error) {
-	brand := ResolveBrand()
+	brand := b.brand()
 	sysCTX := map[string]interface{}{
 		"brandDisplay":   brand.BrandDisplay,
 		"brandCLI":       brand.BrandCLI,
@@ -266,7 +301,7 @@ func (b *Builder) buildRaymond(qw QueuedWork, hasStagePrompt bool) (system, user
 	}
 
 	userTmplName := userTemplateNameRaymond(WorkType(qw.WorkType))
-	userBrand := ResolveBrand()
+	userBrand := b.brand()
 	userCTX := map[string]interface{}{
 		"brandDisplay":    userBrand.BrandDisplay,
 		"brandCLI":        userBrand.BrandCLI,
@@ -478,9 +513,9 @@ func systemTemplateName(qw QueuedWork) string {
 	return "system_base.tmpl"
 }
 
-func systemTemplateData(qw QueuedWork, appendBlock, skillAppend string) systemTmplData {
+func systemTemplateData(qw QueuedWork, brand Brand, appendBlock, skillAppend string) systemTmplData {
 	return systemTmplData{
-		Brand:          ResolveBrand(),
+		Brand:          brand,
 		SessionID:      strings.TrimSpace(qw.SessionID),
 		OrganizationID: strings.TrimSpace(qw.OrganizationID),
 		ProjectName:    strings.TrimSpace(qw.ProjectName),
@@ -505,9 +540,9 @@ type userTmplData struct {
 	ParentContext   string
 }
 
-func userTemplateData(qw QueuedWork) userTmplData {
+func userTemplateData(qw QueuedWork, brand Brand) userTmplData {
 	return userTmplData{
-		Brand:           ResolveBrand(),
+		Brand:           brand,
 		IssueIdentifier: strings.TrimSpace(qw.IssueIdentifier),
 		Repository:      strings.TrimSpace(qw.Repository),
 		Ref:             strings.TrimSpace(qw.Ref),

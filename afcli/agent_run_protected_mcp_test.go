@@ -198,7 +198,11 @@ func protectedMCPStubDetailForTest(t *testing.T, platformURL, capability string)
 		CapabilityID: capability, HarnessID: agent.HarnessStub,
 		AdapterProfileID: profile.ID, Mode: agent.PromptModeAutonomous,
 	}
-	view, err := runner.NewProviderViewWithProtectedRuntimeMCP(hostRegistry, nil, realizations, nil, selector)
+	view, err := runner.NewProviderViewWithOptions(hostRegistry, runner.ProviderViewOptions{
+		CapabilityRealizations:      realizations,
+		ProtectedRuntimeMCPSelector: selector,
+		CLIExecutableName:           "embedder",
+	})
 	if err != nil {
 		t.Fatal(err)
 	}

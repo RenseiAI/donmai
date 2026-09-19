@@ -177,12 +177,20 @@ func codeIntelToolsCSV(ci *prompt.CodeIntelWork) string {
 
 // codeIntelExecutable resolves the self-referential binary path used as the
 // stdio server Command. Mirrors daemon/worker_command.go: os.Executable(),
-// falling back to the brand CLI name (PATH lookup) when the executable cannot
-// be resolved.
-func codeIntelExecutable() string {
-	exe, err := os.Executable()
+// falling back to the captured process CLI name (PATH lookup) when the
+// executable cannot be resolved.
+func codeIntelExecutable(cliExecutableNames ...string) string {
+	cliExecutableName := "donmai"
+	if len(cliExecutableNames) > 0 && cliExecutableNames[0] != "" {
+		cliExecutableName = cliExecutableNames[0]
+	}
+	return codeIntelExecutableWithResolver(cliExecutableName, os.Executable)
+}
+
+func codeIntelExecutableWithResolver(cliExecutableName string, resolve func() (string, error)) string {
+	exe, err := resolve()
 	if err != nil || exe == "" {
-		return prompt.ResolveBrand().BrandCLI
+		return cliExecutableName
 	}
 	return exe
 }
@@ -192,7 +200,7 @@ func codeIntelExecutable() string {
 // session worktree path and is ALWAYS passed explicitly as --root (never
 // inferred from cwd). --repo-path and --tools are appended only when the block
 // supplies them. Pure aside from resolving os.Executable().
-func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerConfig {
+func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork, cliExecutableNames ...string) agent.MCPServerConfig {
 	args := []string{"mcp", "code-intel", "--root", root}
 	if ci != nil {
 		if rp := strings.TrimSpace(ci.RepoPath); rp != "" {
@@ -205,7 +213,7 @@ func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerCon
 	return agent.MCPServerConfig{
 		Name:    codeIntelServerName,
 		Type:    "stdio",
-		Command: codeIntelExecutable(),
+		Command: codeIntelExecutable(cliExecutableNames...),
 		Args:    args,
 	}
 }
@@ -226,6 +234,10 @@ func codeIntelMCPEntry(root string, ci *prompt.CodeIntelWork) agent.MCPServerCon
 // No enforcement/lockout (deferred per Q7): the partial only advertises the
 // tools; it never redirects Grep/Glob.
 func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, routes ...codeIntelDeliveryRoute) string {
+	return injectCodeIntelPartialWithCLI(systemPrompt, caps, ci, "donmai", routes...)
+}
+
+func injectCodeIntelPartialWithCLI(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, cliExecutableName string, routes ...codeIntelDeliveryRoute) string {
 	if ci == nil {
 		return systemPrompt
 	}
@@ -238,7 +250,7 @@ func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *pr
 		partial = codeIntelNativeUsagePartial(ci)
 	} else {
 		mcpCapable := route == codeIntelDeliveryMCP || caps.SupportsToolPlugins && caps.AcceptsMcpServerSpec
-		partial = codeIntelUsagePartial(mcpCapable, ci)
+		partial = codeIntelUsagePartial(mcpCapable, ci, cliExecutableName)
 	}
 	if partial == "" {
 		return systemPrompt
@@ -250,8 +262,12 @@ func injectCodeIntelPartial(systemPrompt string, caps agent.Capabilities, ci *pr
 }
 
 func injectCodeIntelPartialForDelivery(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, selection codeIntelDeliverySelection) string {
+	return injectCodeIntelPartialForDeliveryWithCLI(systemPrompt, caps, ci, selection, "donmai")
+}
+
+func injectCodeIntelPartialForDeliveryWithCLI(systemPrompt string, caps agent.Capabilities, ci *prompt.CodeIntelWork, selection codeIntelDeliverySelection, cliExecutableName string) string {
 	if selection.Route != codeIntelDeliveryNative {
-		return injectCodeIntelPartial(systemPrompt, caps, ci, selection.Route)
+		return injectCodeIntelPartialWithCLI(systemPrompt, caps, ci, cliExecutableName, selection.Route)
 	}
 	partial := codeIntelNativeUsagePartial(ci, selection.Tools)
 	if partial == "" {
@@ -295,9 +311,8 @@ func codeIntelNativeUsagePartial(ci *prompt.CodeIntelWork, selected ...[]string)
 
 // codeIntelUsagePartial renders the code-intel usage block for the resolved
 // provider family, scoped to the block's exposed tool subset. Returns "" when
-// the block exposes no tools (nothing to advertise). Pure aside from resolving
-// the active brand for the CLI-fallback command name.
-func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
+// the block exposes no tools (nothing to advertise).
+func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork, cliExecutableNames ...string) string {
 	tools := effectiveCodeIntelTools(ci)
 	if len(tools) == 0 {
 		return ""
@@ -315,7 +330,10 @@ func codeIntelUsagePartial(mcpCapable bool, ci *prompt.CodeIntelWork) string {
 			b.WriteString(tm.guidance)
 		}
 	} else {
-		cli := prompt.ResolveBrand().BrandCLI
+		cli := "donmai"
+		if len(cliExecutableNames) > 0 && cliExecutableNames[0] != "" {
+			cli = cliExecutableNames[0]
+		}
 		b.WriteString("This session has code-intelligence CLI commands available (run them with Bash). " +
 			"Each is built for a job where grep+read is weak; use them in exactly these situations:\n")
 		for _, tm := range tools {

@@ -190,6 +190,7 @@ func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 }
 
 func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
+	dst.CLIExecutableName = src.bin
 	dst.CapabilityRealizations = src.capabilityRealizations
 	dst.ProtectedRuntimeMCPSelector = src.protectedRuntimeMCPSelector
 	dst.ProtectedRuntimeMCPV2Selector = src.protectedRuntimeMCPV2Selector

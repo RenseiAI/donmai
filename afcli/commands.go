@@ -85,8 +85,9 @@ type Config struct {
 	// falls back to the daemon package's own Version var.
 	HostBinaryVersion string
 
-	// BinaryName is the user-facing binary name to embed in error messages,
-	// usage hints, and remediation instructions. Defaults to "donmai" when empty.
+	// BinaryName is the process executable name to embed in error messages,
+	// usage hints, prompt commands, and remediation instructions. It is separate
+	// from filesystem instance branding and defaults to "donmai" when empty.
 	// Embedders (e.g. rensei-tui) set this to "rensei".
 	BinaryName string
 

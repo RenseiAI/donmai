@@ -8,7 +8,6 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/clijsonl"
 )
 
@@ -97,7 +96,7 @@ func (r *Runner) attemptSteering(
 		// don't accidentally double-steer.
 		return handle, nil
 	}
-	steerText := buildSteeringPrompt(qw, obs)
+	steerText := buildSteeringPrompt(qw, obs, r.cliExecutableName)
 	r.logger.Info("steering: injecting follow-up prompt",
 		"sessionId", qw.SessionID,
 		"len", len(steerText),
@@ -256,7 +255,11 @@ func (r *Runner) injectDirective(ctx context.Context, handle agent.Handle, text 
 // missing fields and the exact CLI commands the agent should run.
 // Long prose makes the agent more likely to "explore" instead of
 // finishing the work.
-func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
+func buildSteeringPrompt(qw QueuedWork, obs streamObservation, cliExecutableNames ...string) string {
+	cliExecutableName := "donmai"
+	if len(cliExecutableNames) > 0 && cliExecutableNames[0] != "" {
+		cliExecutableName = cliExecutableNames[0]
+	}
 	var b strings.Builder
 	b.WriteString("Your previous turn finished without opening a pull request. ")
 	b.WriteString("Please commit your work and open a PR before stopping.\n\n")
@@ -268,7 +271,7 @@ func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 	b.WriteString("  gh pr create --fill\n\n")
 	if !obs.commentPosted {
 		b.WriteString("Also post a brief progress comment on the Linear issue ")
-		b.WriteString(fmt.Sprintf("via `%s linear create-comment`.\n\n", prompt.ResolveBrand().BrandCLI))
+		b.WriteString(fmt.Sprintf("via `%s linear create-comment`.\n\n", cliExecutableName))
 	}
 	b.WriteString("After the PR is open, output the PR URL on a single line ")
 	b.WriteString("and stop.\n")
