@@ -41,6 +41,7 @@ type ProviderView struct {
 	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 	selectionPolicy               protectedRuntimeMCPSelectionPolicy
+	platformMCPServerName         string
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -186,6 +187,17 @@ func resolveProtectedRuntimeMCPRequirement(
 	selector ProtectedRuntimeMCPSelector,
 	host executioncell.HostAdaptationReceipt,
 ) (*executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
+	return resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName())
+}
+
+func resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector ProtectedRuntimeMCPSelector,
+	host executioncell.HostAdaptationReceipt,
+	platformMCPServerName string,
+) (*executioncell.ProtectedRuntimeMCPConfigRequirementV1, error) {
 	if !selector.configured() {
 		return nil, nil
 	}
@@ -246,7 +258,7 @@ func resolveProtectedRuntimeMCPRequirement(
 	if matches != 1 {
 		return nil, fmt.Errorf("runner: protected runtime MCP capability requires one artifact-bound receipt result")
 	}
-	server, err := protectedRuntimeMCPServer(qw, selection.Provider, mode)
+	server, err := protectedRuntimeMCPServerWithName(qw, selection.Provider, mode, platformMCPServerName)
 	if err != nil {
 		return nil, err
 	}
@@ -280,7 +292,18 @@ func resolveProtectedRuntimeMCPRequirementV2(
 	selector ProtectedRuntimeMCPV2Selector,
 	host executioncell.HostAdaptationReceipt,
 ) (*executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
-	base, err := resolveProtectedRuntimeMCPRequirement(qw, selection, realizations, selector.realizationSelector(), host)
+	return resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName())
+}
+
+func resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector ProtectedRuntimeMCPV2Selector,
+	host executioncell.HostAdaptationReceipt,
+	platformMCPServerName string,
+) (*executioncell.ProtectedRuntimeMCPConfigRequirementV2, error) {
+	base, err := resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(qw, selection, realizations, selector.realizationSelector(), host, platformMCPServerName)
 	if err != nil || base == nil {
 		return nil, err
 	}
@@ -416,7 +439,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarness(qw, admission.selection, repositoryDeclaration, v.decorate, v.preparedCapabilities)
+	plan, _, err := compilePreparedHarnessWithPlatformMCPServerName(qw, admission.selection, repositoryDeclaration, v.decorate, v.platformMCPServerName, v.preparedCapabilities)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
@@ -541,7 +564,7 @@ func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirements(
 	if err != nil {
 		return nil, err
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, selection, v.realizations, v.protectedRuntimeMCPSelector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(qw, selection, v.realizations, v.protectedRuntimeMCPSelector, host, v.platformMCPServerName)
 	if err != nil {
 		return nil, err
 	}
@@ -562,7 +585,7 @@ func (v *ProviderView) ResolveExecutionPreflightProtectedRuntimeMCPRequirementsV
 	if err != nil {
 		return nil, err
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirementV2(qw, selection, v.realizations, v.protectedRuntimeMCPV2Selector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(qw, selection, v.realizations, v.protectedRuntimeMCPV2Selector, host, v.platformMCPServerName)
 	if err != nil {
 		return nil, err
 	}
@@ -600,7 +623,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
-	source, _, err := buildPreparedSourceSpec(qw, admission.selection, v.decorate, v.preparedCapabilities)
+	source, _, err := buildPreparedSourceSpecWithPlatformMCPServerName(qw, admission.selection, v.decorate, v.platformMCPServerName, v.preparedCapabilities)
 	if err != nil {
 		return err
 	}
@@ -627,6 +650,10 @@ type ProviderViewOptions struct {
 	ProtectedRuntimeMCPSelector            ProtectedRuntimeMCPSelector
 	ProtectedRuntimeMCPV2Selector          ProtectedRuntimeMCPV2Selector
 	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
+	// PlatformMCPServerName is the optional process-owned logical name for the
+	// implicit per-session MCP gateway. Empty preserves the historical
+	// brand-derived default. Construction captures and validates the value.
+	PlatformMCPServerName string
 }
 
 // NewProviderViewWithOptions constructs a complete read-only provider view.
@@ -639,12 +666,17 @@ func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*Provi
 	if err != nil {
 		return nil, err
 	}
+	platformMCPServerName, err := resolvePlatformMCPServerName(opts.PlatformMCPServerName)
+	if err != nil {
+		return nil, err
+	}
 	return &ProviderView{
 		reg: reg, decorate: opts.Decorator, realizations: opts.CapabilityRealizations,
 		preparedCapabilities: prepared, configRequirements: opts.ConfigRequirements,
 		protectedRuntimeMCPSelector:   selectionPolicy.v1,
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
+		platformMCPServerName:         platformMCPServerName,
 	}, nil
 }
 

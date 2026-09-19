@@ -357,7 +357,7 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	}
 
 	const capability = "example.protected-mcp/v1"
-	serverName := statehome.Brand() + "-platform"
+	const serverName = "example-platform"
 	entryID, err := agent.MCPServerCapabilityEntryID(serverName)
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +399,10 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 		CapabilityID: capability, HarnessID: agent.HarnessStub,
 		AdapterProfileID: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous,
 	}
-	view, err := daemonProviderView(Config{CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector}, quietLogger())
+	view, err := daemonProviderView(Config{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector,
+		PlatformMCPServerName: serverName,
+	}, quietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,6 +447,9 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
 	if err != nil || len(requirements) != 1 {
 		t.Fatalf("daemon protected requirements = %+v err=%v", requirements, err)
+	}
+	if requirements[0].ServerName != serverName {
+		t.Fatalf("daemon protected requirement server = %q, want %q", requirements[0].ServerName, serverName)
 	}
 }
 

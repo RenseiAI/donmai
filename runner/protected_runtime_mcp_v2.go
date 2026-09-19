@@ -73,6 +73,18 @@ func applyProtectedRuntimeMCPV2(
 	servers []agent.MCPServerConfig,
 	effectiveTokenFile string,
 ) ([]agent.MCPServerConfig, error) {
+	return applyProtectedRuntimeMCPV2WithPlatformMCPServerName(qw, selection, realizations, selector, servers, effectiveTokenFile, platformMCPServerName())
+}
+
+func applyProtectedRuntimeMCPV2WithPlatformMCPServerName(
+	qw QueuedWork,
+	selection harnessSelection,
+	realizations *agent.CapabilityRealizationRegistry,
+	selector ProtectedRuntimeMCPV2Selector,
+	servers []agent.MCPServerConfig,
+	effectiveTokenFile string,
+	platformMCPServerName string,
+) ([]agent.MCPServerConfig, error) {
 	for _, server := range servers {
 		if _, present := agent.ProtectedRuntimeMCPHeadersHelper(server); present {
 			return nil, errors.New("runner: protected runtime MCP helper was present before trusted transformation")
@@ -82,7 +94,7 @@ func applyProtectedRuntimeMCPV2(
 	if err != nil {
 		return nil, err
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirementV2(qw, selection, realizations, selector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName)
 	if err != nil {
 		return nil, err
 	}

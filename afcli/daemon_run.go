@@ -112,6 +112,7 @@ func daemonProviderView(cfg Config, logger *slog.Logger) (*runner.ProviderView, 
 		ProtectedRuntimeMCPSelector:            cfg.ProtectedRuntimeMCPSelector,
 		ProtectedRuntimeMCPV2Selector:          cfg.ProtectedRuntimeMCPV2Selector,
 		ProtectedRuntimeMCPDualSelectionPolicy: cfg.ProtectedRuntimeMCPDualSelectionPolicy,
+		PlatformMCPServerName:                  cfg.PlatformMCPServerName,
 	})
 }
 

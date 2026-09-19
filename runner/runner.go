@@ -313,6 +313,11 @@ type Options struct {
 	// retained operational payload bytes. It is mutually exclusive with the
 	// legacy single selectors.
 	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
+
+	// PlatformMCPServerName is the optional process-owned logical name for the
+	// implicit per-session MCP gateway. Empty preserves the historical
+	// brand-derived default. New captures and validates the resolved value.
+	PlatformMCPServerName string
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -376,6 +381,7 @@ type Runner struct {
 	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 	selectionPolicy               protectedRuntimeMCPSelectionPolicy
+	platformMCPServerName         string
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -415,6 +421,10 @@ func New(opts Options) (*Runner, error) {
 	if err != nil {
 		return nil, err
 	}
+	platformMCPServerName, err := resolvePlatformMCPServerName(opts.PlatformMCPServerName)
+	if err != nil {
+		return nil, err
+	}
 	r := &Runner{
 		registry:                      opts.Registry,
 		wt:                            opts.WorktreeManager,
@@ -450,6 +460,7 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPSelector:   selectionPolicy.v1,
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
+		platformMCPServerName:         platformMCPServerName,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

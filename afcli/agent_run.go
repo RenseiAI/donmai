@@ -79,6 +79,7 @@ type agentRunOpts struct {
 	protectedRuntimeMCPSelector            runner.ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector          runner.ProtectedRuntimeMCPV2Selector
 	protectedRuntimeMCPDualSelectionPolicy runner.ProtectedRuntimeMCPDualSelectionPolicy
+	platformMCPServerName                  string
 	piTrustedExtensions                    []providerpi.TrustedExtensionIdentity
 }
 
@@ -183,6 +184,7 @@ func agentRunOptions(cfg Config, bin string) *agentRunOpts {
 		protectedRuntimeMCPSelector:            cfg.ProtectedRuntimeMCPSelector,
 		protectedRuntimeMCPV2Selector:          cfg.ProtectedRuntimeMCPV2Selector,
 		protectedRuntimeMCPDualSelectionPolicy: cfg.ProtectedRuntimeMCPDualSelectionPolicy,
+		platformMCPServerName:                  cfg.PlatformMCPServerName,
 		piTrustedExtensions:                    append([]providerpi.TrustedExtensionIdentity(nil), cfg.PiTrustedExtensions...),
 	}
 }
@@ -192,6 +194,7 @@ func applyAgentRunCapabilityOptions(dst *runner.Options, src *agentRunOpts) {
 	dst.ProtectedRuntimeMCPSelector = src.protectedRuntimeMCPSelector
 	dst.ProtectedRuntimeMCPV2Selector = src.protectedRuntimeMCPV2Selector
 	dst.ProtectedRuntimeMCPDualSelectionPolicy = src.protectedRuntimeMCPDualSelectionPolicy
+	dst.PlatformMCPServerName = src.platformMCPServerName
 }
 
 // agentRunMaxSessionDuration returns the runner timeout override for a
