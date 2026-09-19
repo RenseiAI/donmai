@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -450,6 +451,18 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	}
 	if requirements[0].ServerName != serverName {
 		t.Fatalf("daemon protected requirement server = %q, want %q", requirements[0].ServerName, serverName)
+	}
+}
+
+func TestDaemonOptionsWithConfigForwardsPlatformMCPServerName(t *testing.T) {
+	const platformMCPServerName = "example-platform"
+	base := daemon.Options{Version: "example-version"}
+	got := daemonOptionsWithConfig(Config{PlatformMCPServerName: platformMCPServerName}, base)
+	if got.PlatformMCPServerName != platformMCPServerName || got.Version != base.Version {
+		t.Fatalf("daemon options = serverName %q version %q", got.PlatformMCPServerName, got.Version)
+	}
+	if empty := daemonOptionsWithConfig(Config{}, base); empty.PlatformMCPServerName != "" || empty.Version != base.Version {
+		t.Fatalf("default daemon options = serverName %q version %q", empty.PlatformMCPServerName, empty.Version)
 	}
 }
 

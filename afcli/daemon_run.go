@@ -116,6 +116,11 @@ func daemonProviderView(cfg Config, logger *slog.Logger) (*runner.ProviderView, 
 	})
 }
 
+func daemonOptionsWithConfig(cfg Config, opts daemon.Options) daemon.Options {
+	opts.PlatformMCPServerName = cfg.PlatformMCPServerName
+	return opts
+}
+
 // newDaemonRunCmd constructs the `host run` subcommand. This is the
 // long-running entry point registered by the launchd plist / systemd unit.
 //
@@ -226,7 +231,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("construct daemon provider view: %w", err)
 			}
-			d := daemon.New(daemon.Options{
+			d := daemon.New(daemonOptionsWithConfig(cfg, daemon.Options{
 				ConfigPath:       configPath,
 				JWTPath:          jwtPath,
 				HTTPHost:         host,
@@ -238,7 +243,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				ProtectedRuntimeMCPHelperCommandBuilder: protectedRuntimeMCPHelperCommand,
 				SpawnerOptions:                          spawnerOpts,
 				Version:                                 hostVersion,
-			})
+			}))
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 
