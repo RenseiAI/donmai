@@ -491,16 +491,16 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifierRefusesOversizeCon
 	pidFile := filepath.Join(wrapperDir, "app-server.pid")
 	wrapperBinary := filepath.Join(wrapperDir, "codex-wrapper")
 	wrapper := "#!/bin/sh\n" +
-		"printf '%s\\n' \"$$\" > \"$DONMAI_REN4097_PID_FILE\"\n" +
-		"exec \"$DONMAI_REN4097_REAL_CODEX\" \"$@\"\n"
+		"printf '%s\\n' \"$$\" > \"$DONMAI_CODEX_WRAPPER_PID_FILE\"\n" +
+		"exec \"$DONMAI_CODEX_WRAPPER_REAL_BINARY\" \"$@\"\n"
 	if err := os.WriteFile(wrapperBinary, []byte(wrapper), 0o700); err != nil {
 		t.Fatalf("write disposable Codex wrapper: %v", err)
 	}
 	spec := agent.Spec{
 		Cwd: project, MCPServers: []agent.MCPServerConfig{server},
 		Env: map[string]string{
-			"DONMAI_REN4097_PID_FILE":   pidFile,
-			"DONMAI_REN4097_REAL_CODEX": binary,
+			"DONMAI_CODEX_WRAPPER_PID_FILE":    pidFile,
+			"DONMAI_CODEX_WRAPPER_REAL_BINARY": binary,
 		},
 	}
 	launch, err := buildInteractiveLaunch(spec)
