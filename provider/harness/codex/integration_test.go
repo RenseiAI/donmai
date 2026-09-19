@@ -362,6 +362,92 @@ func TestIntegration_RealCodexPlatformMCPAndEnvironmentAuthIsolation(t *testing.
 	}
 }
 
+func TestIntegration_RealCodexProtectedHelperInventoryVerifier(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real protected-helper inventory proof requires codex on PATH: %v", err)
+	}
+	versionBody, err := exec.Command(binary, "--version").Output() //nolint:gosec // fixed executable resolved above
+	if err != nil {
+		t.Fatalf("read real Codex version: %v", err)
+	}
+	version := strings.TrimSpace(string(versionBody))
+	if !strings.Contains(version, "0.153.4") && !strings.Contains(version, "0.154.0") {
+		t.Fatalf("real protected-helper inventory proof requires observed 0.153.4 or pinned 0.154.0, got %q", version)
+	}
+	t.Logf("real Codex protected-helper inventory version=%s", version)
+
+	boundary, err := newCodexConfigBoundary(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = boundary.remove() })
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helperMarker := filepath.Join(t.TempDir(), "session-helper-ran")
+	server, err := agent.WithProtectedRuntimeMCPHeadersHelper(agent.MCPServerConfig{
+		Name: "protected", Type: "http", URL: "https://example.test/mcp",
+	}, fmt.Sprintf("printf invoked > %q", helperMarker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	server.Headers = map[string]string{"X-Declared": "fixture-value"}
+	lowerMarker := filepath.Join(t.TempDir(), "lower-helper-ran")
+	lowerConfig := fmt.Sprintf(
+		"[mcp_servers.protected]\nurl = %s\nhttp_headers_helper = %s\n",
+		tomlBasicString("https://lower-layer.example/mcp"),
+		tomlBasicString(fmt.Sprintf("printf invoked > %q", lowerMarker)),
+	)
+	if err := os.WriteFile(boundary.configPath, []byte(lowerConfig), codexConfigMode); err != nil {
+		t.Fatalf("write disposable conflicting lower layer: %v", err)
+	}
+	spec := agent.Spec{Cwd: project, MCPServers: []agent.MCPServerConfig{server}}
+	launch, err := buildInteractiveLaunch(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := verifyExclusiveInteractiveMCP(
+		t.Context(),
+		runCodexMCPInventory,
+		binary,
+		spec,
+		launch,
+		boundary.home,
+	); err != nil {
+		t.Fatalf("real Codex protected-helper list/get verifier: %v", err)
+	}
+	for label, marker := range map[string]string{"session": helperMarker, "lower-layer": lowerMarker} {
+		if _, err := os.Stat(marker); !os.IsNotExist(err) {
+			t.Fatalf("%s protected helper executed during inventory proof: %v", label, err)
+		}
+	}
+
+	mismatchMarker := filepath.Join(t.TempDir(), "mismatched-helper-ran")
+	mismatchServer, err := agent.WithProtectedRuntimeMCPHeadersHelper(agent.MCPServerConfig{
+		Name: server.Name, Type: server.Type, URL: server.URL, Headers: server.Headers,
+	}, fmt.Sprintf("printf invoked > %q", mismatchMarker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	mismatchLaunch, err := buildInteractiveLaunch(agent.Spec{
+		Cwd: project, MCPServers: []agent.MCPServerConfig{mismatchServer},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	err = verifyExclusiveInteractiveMCP(
+		t.Context(), runCodexMCPInventory, binary, spec, mismatchLaunch, boundary.home,
+	)
+	if !errors.Is(err, ErrInteractiveCodexMCPIsolation) {
+		t.Fatalf("mismatched effective protected helper error = %v", err)
+	}
+	if _, err := os.Stat(mismatchMarker); !os.IsNotExist(err) {
+		t.Fatalf("mismatched protected helper executed during refusal: %v", err)
+	}
+}
+
 func TestIntegration_RealCodexFileAuthProjectionStarts(t *testing.T) {
 	binary, err := exec.LookPath("codex")
 	if err != nil {
