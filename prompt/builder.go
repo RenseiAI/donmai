@@ -129,9 +129,9 @@ func (b *Builder) WithCLIExecutableName(configured string) (*Builder, error) {
 	if err != nil {
 		return nil, err
 	}
-	copy := b.Copy()
-	copy.cliExecutableName = name
-	return copy, nil
+	cloned := b.Copy()
+	cloned.cliExecutableName = name
+	return cloned, nil
 }
 
 // Copy returns a fresh Builder carrying immutable construction inputs. Lazy

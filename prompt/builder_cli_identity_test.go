@@ -54,8 +54,8 @@ func TestBuilderCLIExecutableNameLegacyRaymondCompositionAndCopy(t *testing.T) {
 			if _, _, err := configured.Build(work); err != nil {
 				t.Fatal(err)
 			}
-			copy := configured.Copy()
-			composition, err := copy.BuildComposition(work)
+			cloned := configured.Copy()
+			composition, err := cloned.BuildComposition(work)
 			if err != nil {
 				t.Fatal(err)
 			}
