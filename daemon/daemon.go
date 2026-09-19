@@ -88,6 +88,10 @@ type Options struct {
 	// behaviour for a daemon that has not yet wired its runtime registry.
 	// Wave 9 / ADR-2026-05-07-daemon-http-control-api.md §D4.
 	ProviderRegistry ProviderRegistry
+	// PlatformMCPServerName is the optional process-owned logical name used by
+	// the implicit per-session MCP gateway. Empty preserves the historical
+	// brand-derived default. New captures and validates the resolved value.
+	PlatformMCPServerName string
 	// ExecutionPreflightStore durably records the initial ready receipt before
 	// credential hooks or worker spawn. Receipt-bearing work fails closed when
 	// either the compiler or this store is absent.
@@ -381,7 +385,9 @@ type stopGeneration struct {
 // Daemon is the top-level supervisor. It owns the loaded Config, the
 // HeartbeatService, the WorkerSpawner, and (optionally) the AutoUpdater.
 type Daemon struct {
-	opts Options
+	opts                     Options
+	platformMCPServerName    string
+	platformMCPServerNameErr error
 
 	mu        sync.RWMutex
 	state     atomic.Value // State
@@ -532,6 +538,7 @@ type Daemon struct {
 
 // New constructs a Daemon. Call Start() to bring it online.
 func New(opts Options) *Daemon {
+	platformMCPServerName, platformMCPServerNameErr := resolvePlatformMCPServerName(opts.PlatformMCPServerName)
 	if opts.ConfigPath == "" {
 		opts.ConfigPath = DefaultConfigPath()
 	}
@@ -560,15 +567,17 @@ func New(opts Options) *Daemon {
 	landingDone := make(chan struct{})
 	close(landingDone)
 	d := &Daemon{
-		opts:             opts,
-		doneCh:           make(chan struct{}),
-		landingCtx:       landingCtx,
-		landingCancel:    landingCancel,
-		preflightConfigs: newPreflightConfigRegistry(),
-		landingDone:      landingDone,
-		sessionDetails:   newSessionDetailStore(),
-		routingTraces:    NewRoutingTraceStore(DefaultRoutingRingBufferSize),
-		shims:            newSessionShimState(),
+		opts:                     opts,
+		platformMCPServerName:    platformMCPServerName,
+		platformMCPServerNameErr: platformMCPServerNameErr,
+		doneCh:                   make(chan struct{}),
+		landingCtx:               landingCtx,
+		landingCancel:            landingCancel,
+		preflightConfigs:         newPreflightConfigRegistry(),
+		landingDone:              landingDone,
+		sessionDetails:           newSessionDetailStore(),
+		routingTraces:            NewRoutingTraceStore(DefaultRoutingRingBufferSize),
+		shims:                    newSessionShimState(),
 	}
 	d.shimIdentityRef.Store(newSessionShimIdentity(&d.opts.SessionShim, opts.SessionShimStandDown))
 	if opts.RulesetSnapshot != nil {
@@ -896,6 +905,9 @@ func (d *Daemon) heartbeatMaxConcurrentSessions() int {
 func (d *Daemon) Start(ctx context.Context) error {
 	if ctx == nil {
 		ctx = context.Background()
+	}
+	if d.platformMCPServerNameErr != nil {
+		return d.platformMCPServerNameErr
 	}
 	if d.sessionShimControllerIDError() != nil {
 		return d.sessionShimControllerIDError()
@@ -1944,6 +1956,9 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // corresponding SessionEventEnded event, so stale credentials never linger in
 // memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
+	if d.platformMCPServerNameErr != nil {
+		return nil, d.platformMCPServerNameErr
+	}
 	var localPreflight localExecutionPreflightAuthority
 	var preflightReplay ExecutionPreflightReplayStore
 	var localPreflightRequest *executioncell.PreflightRegistrationRequest
@@ -2230,13 +2245,13 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 				} else if len(hostReceipt.ConfigMaterializations) > 0 {
 					return nil, errors.New("host adaptation config materializations require resolved config requirements")
 				}
-				protectedMaterializations, materializeErr := materializeProtectedRuntimeMCPConfigs(detail, protectedRequirements)
+				protectedMaterializations, materializeErr := materializeProtectedRuntimeMCPConfigs(detail, protectedRequirements, d.platformMCPServerName)
 				if materializeErr != nil {
 					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP config: %w", materializeErr)
 				}
 				protectedMaterializationsV2, materializeErr := materializeProtectedRuntimeMCPConfigsV2(
 					detail, &spec, protectedRequirementsV2, configMaterializations,
-					d.opts.ProtectedRuntimeMCPHelperCommandBuilder,
+					d.opts.ProtectedRuntimeMCPHelperCommandBuilder, d.platformMCPServerName,
 				)
 				if materializeErr != nil {
 					return nil, fmt.Errorf("materialize execution preflight protected runtime MCP v2 config: %w", materializeErr)

@@ -136,6 +136,12 @@ type Config struct {
 	// selections from retained admitted operational payload bytes.
 	ProtectedRuntimeMCPDualSelectionPolicy runner.ProtectedRuntimeMCPDualSelectionPolicy
 
+	// PlatformMCPServerName is the optional process-owned logical name used by
+	// the implicit per-session MCP gateway. Empty preserves Donmai's historical
+	// brand-derived default. The daemon preflight view and child runner receive
+	// the same value and capture it at construction.
+	PlatformMCPServerName string
+
 	// EnableA2AClient registers the formal A2A v1 client command group. It is
 	// opt-in for embedders so a downstream CLI can retire or re-home any legacy
 	// command using the same noun before enabling the public surface.

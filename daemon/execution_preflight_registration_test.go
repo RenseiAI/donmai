@@ -346,6 +346,25 @@ func setDaemonWorkerIDForTest(d *Daemon, workerID string) {
 	d.mu.Unlock()
 }
 
+func TestDaemonCapturesPlatformMCPServerNameAndRejectsMalformedConfiguration(t *testing.T) {
+	statehome.ResetForTest()
+	t.Cleanup(statehome.ResetForTest)
+	statehome.SetBrand("example-local-a")
+	captured := New(Options{})
+	statehome.SetBrand("example-local-b")
+	if captured.platformMCPServerName != "example-local-a-platform" || captured.platformMCPServerNameErr != nil {
+		t.Fatalf("captured daemon identity = %q err=%v", captured.platformMCPServerName, captured.platformMCPServerNameErr)
+	}
+
+	malformed := New(Options{PlatformMCPServerName: " example-platform"})
+	if err := malformed.Start(t.Context()); err == nil || !strings.Contains(err.Error(), "platform MCP server name is malformed") {
+		t.Fatalf("Start malformed identity error = %v", err)
+	}
+	if _, err := malformed.AcceptWorkWithDetail(SessionSpec{SessionID: "malformed"}, &SessionDetail{SessionID: "malformed"}); err == nil || !strings.Contains(err.Error(), "platform MCP server name is malformed") {
+		t.Fatalf("AcceptWorkWithDetail malformed identity error = %v", err)
+	}
+}
+
 func runtimeBindingDetailForWorker(t *testing.T, organizationID, workerID string) (*SessionDetail, executioncell.RuntimeBinding) {
 	t.Helper()
 	detail, binding := v2Detail(t)
@@ -567,6 +586,7 @@ func TestRuntimeBindingV2MaterializesConfigBeforeSameRegistrationCredentialAndSp
 }
 
 func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredentialAndSpawn(t *testing.T) {
+	const platformMCPServerName = "example-platform"
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
@@ -577,7 +597,7 @@ func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredenti
 		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersion,
 		RequirementID:   "protected-runtime-mcp/v1", AuthorityBindingDigest: strings.Repeat("d", 64),
 		OperationalPayloadDigest: operationalDigest,
-		ServerName:               "donmai-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		ServerName:               platformMCPServerName, Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
 		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
 		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
 			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
@@ -605,7 +625,9 @@ func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredenti
 	}}
 	var credentials atomic.Int32
 	marker := filepath.Join(t.TempDir(), "spawned")
-	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker, func(options *Options) {
+		options.PlatformMCPServerName = platformMCPServerName
+	})
 	if _, err := d.AcceptWorkWithDetail(SessionSpec{SessionID: detail.SessionID, ProjectID: "project-v2"}, detail); err != nil {
 		t.Fatal(err)
 	}
@@ -626,6 +648,7 @@ func TestRuntimeBindingV2PersistsProtectedRuntimeMCPV3BeforeRegistrationCredenti
 }
 
 func TestRuntimeBindingV2PersistsJoinedProtectedRuntimeMCPV2BeforeRegistrationCredentialAndSpawn(t *testing.T) {
+	const platformMCPServerName = "example-platform"
 	var mu sync.Mutex
 	order := []string{}
 	detail, binding := v2Detail(t)
@@ -655,7 +678,7 @@ func TestRuntimeBindingV2PersistsJoinedProtectedRuntimeMCPV2BeforeRegistrationCr
 		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
 		RequirementID:   "protected-runtime-mcp/v2", AuthorityBindingDigest: strings.Repeat("d", 64),
 		OperationalPayloadDigest: operationalDigest,
-		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		ServerName:               platformMCPServerName, Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
 		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
 		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
 			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
@@ -693,7 +716,9 @@ func TestRuntimeBindingV2PersistsJoinedProtectedRuntimeMCPV2BeforeRegistrationCr
 	}}
 	var credentials atomic.Int32
 	marker := filepath.Join(t.TempDir(), "spawned")
-	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker)
+	d := startV2Daemon(t, provider, store, registrar, &order, &mu, &credentials, marker, func(options *Options) {
+		options.PlatformMCPServerName = platformMCPServerName
+	})
 	d.opts.ProtectedRuntimeMCPHelperCommandBuilder = func(path string) (string, error) {
 		return "/example/donmai mcp gateway-headers --token-file " + path, nil
 	}

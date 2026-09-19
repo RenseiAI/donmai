@@ -24,7 +24,6 @@ import (
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 	"github.com/RenseiAI/donmai/runtime/state"
-	"github.com/RenseiAI/donmai/runtime/statehome"
 	"github.com/RenseiAI/donmai/runtime/stepheartbeat"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
@@ -121,7 +120,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
 		}
-		preparedSource, _, err = buildPreparedSourceSpec(qw, selection, r.additionalExtensionDecorator, r.preparedCapabilities)
+		preparedSource, _, err = buildPreparedSourceSpecWithPlatformMCPServerName(qw, selection, r.additionalExtensionDecorator, r.platformMCPServerName, r.preparedCapabilities)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
 			return res, err
@@ -486,19 +485,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// WS5) are APPENDED after it, unfiltered: they are caller-requested, so an
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
-	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), codeIntelDelivery.Route)
+	mcpDefaults := defaultMCPServersForHarnessWithPlatformMCPServerName(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), r.platformMCPServerName, codeIntelDelivery.Route)
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
 	v2Applies := r.protectedRuntimeMCPV2Applies(qw, selection)
 	if !v2Applies {
-		logMCPGatewayBearerExpiry(r.logger, qw, mcpDefaults, time.Now())
+		logMCPGatewayBearerExpiryWithPlatformMCPServerName(r.logger, qw, mcpDefaults, time.Now(), r.platformMCPServerName)
 	}
 	mcpServers := mergeMCPServers(mcpDefaults, qw.McpServers)
 	if v2Applies {
-		mcpServers, err = applyProtectedRuntimeMCPV2(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPV2Selector, mcpServers, effectiveMCPBearerFile.Path)
+		mcpServers, err = applyProtectedRuntimeMCPV2WithPlatformMCPServerName(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPV2Selector, mcpServers, effectiveMCPBearerFile.Path, r.platformMCPServerName)
 	} else {
-		err = validateProtectedRuntimeMCPMaterialization(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers)
+		err = validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(qw, selection, r.capabilityRealizations, r.protectedRuntimeMCPSelector, mcpServers, r.platformMCPServerName)
 	}
 	if err != nil {
 		res.Status = "failed"
@@ -2242,7 +2241,7 @@ func harnessDeliversMCP(provider agent.Provider, mode agent.PromptSessionMode) b
 // Brand-derived: a rebranded build of this same code renders its own brand's
 // label byte-identically. The platform reports its own serverInfo.name
 // independently; this is the client-side label only.
-func platformMCPServerName() string { return statehome.Brand() + "-platform" }
+func platformMCPServerName() string { return defaultPlatformMCPServerName() }
 
 // mcpGatewayBearer returns the bearer for the platform per-session MCP gateway.
 //
@@ -2270,7 +2269,7 @@ func mcpGatewayBearer(qw QueuedWork) string {
 // protectedRuntimeMCPServer derives the exact session-scoped HTTP server used
 // by the protected ACK contract. Unlike the legacy default path it never falls
 // back to the worker bearer.
-func protectedRuntimeMCPServer(qw QueuedWork, provider agent.Provider, mode agent.PromptSessionMode) (agent.MCPServerConfig, error) {
+func protectedRuntimeMCPServerWithName(qw QueuedWork, provider agent.Provider, mode agent.PromptSessionMode, platformMCPServerName string) (agent.MCPServerConfig, error) {
 	if !harnessDeliversMCP(provider, mode) {
 		return agent.MCPServerConfig{}, errors.New("runner: protected runtime MCP is unsupported by the selected harness profile")
 	}
@@ -2278,7 +2277,7 @@ func protectedRuntimeMCPServer(qw QueuedWork, provider agent.Provider, mode agen
 		return agent.MCPServerConfig{}, errors.New("runner: protected runtime MCP gateway configuration is unavailable")
 	}
 	return agent.MCPServerConfig{
-		Name: platformMCPServerName(),
+		Name: platformMCPServerName,
 		Type: executioncell.ProtectedRuntimeMCPTransportHTTP,
 		URL:  strings.TrimRight(qw.PlatformURL, "/") + "/api/mcp/" + qw.SessionID,
 		Headers: map[string]string{
@@ -2299,11 +2298,15 @@ func protectedRuntimeMCPServer(qw QueuedWork, provider agent.Provider, mode agen
 //
 // Logs WHEN the bearer dies, never WHAT it is.
 func logMCPGatewayBearerExpiry(logger *slog.Logger, qw QueuedWork, servers []agent.MCPServerConfig, now time.Time) {
+	logMCPGatewayBearerExpiryWithPlatformMCPServerName(logger, qw, servers, now, platformMCPServerName())
+}
+
+func logMCPGatewayBearerExpiryWithPlatformMCPServerName(logger *slog.Logger, qw QueuedWork, servers []agent.MCPServerConfig, now time.Time, platformMCPServerName string) {
 	expiresAt := strings.TrimSpace(qw.McpAuthTokenExpiresAt)
 	if logger == nil || expiresAt == "" {
 		return
 	}
-	gatewayName := platformMCPServerName()
+	gatewayName := platformMCPServerName
 	if !slices.ContainsFunc(servers, func(s agent.MCPServerConfig) bool { return s.Name == gatewayName }) {
 		return
 	}
@@ -2352,6 +2355,10 @@ func logMCPGatewayBearerExpiry(logger *slog.Logger, qw QueuedWork, servers []age
 // AFTER Provision so wpath exists. This function is the single place the runner
 // extends MCP defaults.
 func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode, routes ...codeIntelDeliveryRoute) []agent.MCPServerConfig {
+	return defaultMCPServersForHarnessWithPlatformMCPServerName(qw, wpath, provider, mode, platformMCPServerName(), routes...)
+}
+
+func defaultMCPServersForHarnessWithPlatformMCPServerName(qw QueuedWork, wpath string, provider agent.Provider, mode agent.PromptSessionMode, platformMCPServerName string, routes ...codeIntelDeliveryRoute) []agent.MCPServerConfig {
 	var servers []agent.MCPServerConfig
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
@@ -2359,7 +2366,7 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 	if bearer := mcpGatewayBearer(qw); harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && bearer != "" && qw.SessionID != "" {
 		protected := QueuedWork{PlatformURL: qw.PlatformURL, McpAuthToken: bearer}
 		protected.SessionID = qw.SessionID
-		server, _ := protectedRuntimeMCPServer(protected, provider, mode)
+		server, _ := protectedRuntimeMCPServerWithName(protected, provider, mode, platformMCPServerName)
 		servers = append(servers, server)
 	}
 

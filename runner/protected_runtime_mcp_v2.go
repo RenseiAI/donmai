@@ -65,13 +65,14 @@ func toolLifecycleProfileForWork(qw QueuedWork, manifest agent.HarnessManifest, 
 // applyProtectedRuntimeMCPV2 joins the retained protected materialization to
 // the actual common file binding and only then replaces the launch header with
 // the process-private native helper.
-func applyProtectedRuntimeMCPV2(
+func applyProtectedRuntimeMCPV2WithPlatformMCPServerName(
 	qw QueuedWork,
 	selection harnessSelection,
 	realizations *agent.CapabilityRealizationRegistry,
 	selector ProtectedRuntimeMCPV2Selector,
 	servers []agent.MCPServerConfig,
 	effectiveTokenFile string,
+	platformMCPServerName string,
 ) ([]agent.MCPServerConfig, error) {
 	for _, server := range servers {
 		if _, present := agent.ProtectedRuntimeMCPHeadersHelper(server); present {
@@ -82,7 +83,7 @@ func applyProtectedRuntimeMCPV2(
 	if err != nil {
 		return nil, err
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirementV2(qw, selection, realizations, selector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirementV2WithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName)
 	if err != nil {
 		return nil, err
 	}

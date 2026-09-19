@@ -15,9 +15,21 @@ import (
 	"sync"
 	"unicode/utf8"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
+
+func resolvePlatformMCPServerName(configured string) (string, error) {
+	name := configured
+	if name == "" {
+		name = statehome.Brand() + "-platform"
+	}
+	if _, err := agent.MCPServerCapabilityEntryID(name); err != nil {
+		return "", fmt.Errorf("daemon: platform MCP server name is malformed: %w", err)
+	}
+	return name, nil
+}
 
 type operationalPreflightConfigSource struct {
 	Env          map[string]string `json:"env"`
@@ -305,7 +317,7 @@ func hostReceiptWithProtectedRuntimeMCPConfigsV2(receipt json.RawMessage, materi
 	return raw, nil
 }
 
-func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, error) {
+func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV1, platformMCPServerName string) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, error) {
 	if len(requirements) == 0 {
 		return nil, nil
 	}
@@ -321,7 +333,6 @@ func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements [
 	}
 	endpointDigest := digestConfigValue(strings.TrimRight(detail.PlatformURL, "/") + "/api/mcp/" + detail.SessionID)
 	headers := []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken)}}
-	serverName := statehome.Brand() + "-platform"
 	materializations := make([]executioncell.ProtectedRuntimeMCPConfigMaterializationV1, 0, len(requirements))
 	for i, requirement := range requirements {
 		if i > 0 && requirements[i-1].RequirementID == requirement.RequirementID {
@@ -330,7 +341,7 @@ func materializeProtectedRuntimeMCPConfigs(detail *SessionDetail, requirements [
 		if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirement(requirement); err != nil {
 			return nil, err
 		}
-		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != serverName ||
+		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != platformMCPServerName ||
 			requirement.Transport != executioncell.ProtectedRuntimeMCPTransportHTTP || requirement.EndpointDigest != endpointDigest ||
 			!reflect.DeepEqual(requirement.Headers, headers) {
 			return nil, errors.New("protected runtime MCP config requirement differs from current runtime authority")
@@ -392,6 +403,7 @@ func materializeProtectedRuntimeMCPConfigsV2(
 	requirements []executioncell.ProtectedRuntimeMCPConfigRequirementV2,
 	common []executioncell.PreflightConfigMaterializationV1,
 	buildHelperCommand ProtectedRuntimeMCPHelperCommandBuilder,
+	platformMCPServerName string,
 ) ([]executioncell.ProtectedRuntimeMCPConfigMaterializationV2, error) {
 	if len(requirements) == 0 {
 		return nil, nil
@@ -410,7 +422,6 @@ func materializeProtectedRuntimeMCPConfigsV2(
 	}
 	endpointDigest := digestConfigValue(strings.TrimRight(detail.PlatformURL, "/") + "/api/mcp/" + detail.SessionID)
 	headers := []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + bearer)}}
-	serverName := statehome.Brand() + "-platform"
 	materializations := make([]executioncell.ProtectedRuntimeMCPConfigMaterializationV2, 0, len(requirements))
 	for i, requirement := range requirements {
 		if i > 0 && requirements[i-1].RequirementID == requirement.RequirementID {
@@ -419,7 +430,7 @@ func materializeProtectedRuntimeMCPConfigsV2(
 		if err := executioncell.ValidateProtectedRuntimeMCPConfigRequirementV2(requirement); err != nil {
 			return nil, err
 		}
-		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != serverName ||
+		if requirement.OperationalPayloadDigest != operationalDigest || requirement.ServerName != platformMCPServerName ||
 			requirement.Transport != executioncell.ProtectedRuntimeMCPTransportHTTP || requirement.EndpointDigest != endpointDigest ||
 			!reflect.DeepEqual(requirement.Headers, headers) {
 			return nil, errors.New("protected runtime MCP v2 config requirement differs from current runtime authority")
