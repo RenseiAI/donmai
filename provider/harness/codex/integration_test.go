@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -403,7 +404,11 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifier(t *testing.T) {
 	if err := os.WriteFile(boundary.configPath, []byte(lowerConfig), codexConfigMode); err != nil {
 		t.Fatalf("write disposable conflicting lower layer: %v", err)
 	}
-	spec := agent.Spec{Cwd: project, MCPServers: []agent.MCPServerConfig{server}}
+	spec := agent.Spec{
+		Cwd:                project,
+		MCPServers:         []agent.MCPServerConfig{server},
+		SystemPromptAppend: strings.Repeat("x", 48<<10),
+	}
 	launch, err := buildInteractiveLaunch(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -445,6 +450,95 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifier(t *testing.T) {
 	}
 	if _, err := os.Stat(mismatchMarker); !os.IsNotExist(err) {
 		t.Fatalf("mismatched protected helper executed during refusal: %v", err)
+	}
+}
+
+func TestIntegration_RealCodexProtectedHelperInventoryVerifierRefusesOversizeConfig(t *testing.T) {
+	binary, err := exec.LookPath("codex")
+	if err != nil {
+		t.Fatalf("real protected-helper inventory proof requires codex on PATH: %v", err)
+	}
+	versionBody, err := exec.Command(binary, "--version").Output() //nolint:gosec // fixed executable resolved above
+	if err != nil {
+		t.Fatalf("read real Codex version: %v", err)
+	}
+	version := strings.TrimSpace(string(versionBody))
+	if !strings.Contains(version, "0.153.4") && !strings.Contains(version, "0.154.0") {
+		t.Fatalf("real protected-helper inventory proof requires observed 0.153.4 or pinned 0.154.0, got %q", version)
+	}
+
+	boundary, err := newCodexConfigBoundary(t.TempDir(), false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = boundary.remove() })
+	project := t.TempDir()
+	if err := os.Mkdir(filepath.Join(project, ".git"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	helperMarker := filepath.Join(t.TempDir(), "oversize-helper-ran")
+	server, err := agent.WithProtectedRuntimeMCPHeadersHelper(agent.MCPServerConfig{
+		Name: "protected", Type: "http", URL: "https://example.test/mcp",
+	}, fmt.Sprintf("printf invoked > %q", helperMarker))
+	if err != nil {
+		t.Fatal(err)
+	}
+	oversizeConfig := "developer_instructions = " + tomlBasicString(strings.Repeat("x", (1<<20)+1)) + "\n"
+	if err := os.WriteFile(boundary.configPath, []byte(oversizeConfig), codexConfigMode); err != nil {
+		t.Fatalf("write disposable oversized config: %v", err)
+	}
+	wrapperDir := t.TempDir()
+	pidFile := filepath.Join(wrapperDir, "app-server.pid")
+	wrapperBinary := filepath.Join(wrapperDir, "codex-wrapper")
+	wrapper := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$$\" > \"$DONMAI_CODEX_WRAPPER_PID_FILE\"\n" +
+		"exec \"$DONMAI_CODEX_WRAPPER_REAL_BINARY\" \"$@\"\n"
+	if err := os.WriteFile(wrapperBinary, []byte(wrapper), 0o700); err != nil {
+		t.Fatalf("write disposable Codex wrapper: %v", err)
+	}
+	spec := agent.Spec{
+		Cwd: project, MCPServers: []agent.MCPServerConfig{server},
+		Env: map[string]string{
+			"DONMAI_CODEX_WRAPPER_PID_FILE":    pidFile,
+			"DONMAI_CODEX_WRAPPER_REAL_BINARY": binary,
+		},
+	}
+	launch, err := buildInteractiveLaunch(spec)
+	if err != nil {
+		t.Fatal(err)
+	}
+	socketParent, err := os.MkdirTemp("/tmp", "r4097")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(socketParent) })
+	t.Setenv("TMPDIR", socketParent)
+	err = verifyExclusiveInteractiveMCP(
+		t.Context(), runCodexMCPInventory, wrapperBinary, spec, launch, boundary.home,
+	)
+	if !errors.Is(err, ErrInteractiveCodexMCPIsolation) || !strings.Contains(err.Error(), "message too big") {
+		t.Fatalf("oversized effective config error = %v", err)
+	}
+	if _, err := os.Stat(helperMarker); !os.IsNotExist(err) {
+		t.Fatalf("protected helper executed during oversized refusal: %v", err)
+	}
+	entries, err := os.ReadDir(socketParent)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != 0 {
+		t.Fatalf("owned config probe socket survived oversized refusal: %v", entries)
+	}
+	pidBody, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read owned config probe PID: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil {
+		t.Fatalf("decode owned config probe PID: %v", err)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("owned config probe process %d survived oversized refusal: %v", pid, err)
 	}
 }
 

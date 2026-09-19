@@ -21,7 +21,10 @@ import (
 // The PTY is never started after this error.
 var ErrInteractiveCodexMCPIsolation = errors.New("codex interactive MCP configuration is not exclusive")
 
-const codexRedactedHTTPHeadersHelper = "<redacted>"
+const (
+	codexRedactedHTTPHeadersHelper      = "<redacted>"
+	interactiveMCPHelperConfigReadLimit = 1 << 20 // 1 MiB
+)
 
 type interactiveMCPInventoryRunner func(
 	ctx context.Context,
@@ -224,8 +227,9 @@ func verifyExactInteractiveMCPHelpers(
 	if client == nil {
 		return nil, errors.New("effective-config probe has no diagnostic client")
 	}
+	client.conn.SetReadLimit(interactiveMCPHelperConfigReadLimit)
 	raw, err := client.request(probeCtx, "config/read", map[string]any{
-		"cwd": spec.Cwd, "includeLayers": true,
+		"cwd": spec.Cwd,
 	}, 15*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("config/read: %w", err)
