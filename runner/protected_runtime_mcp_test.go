@@ -81,13 +81,17 @@ func protectedRuntimeMCPCompiled(t *testing.T, capability string, provider agent
 }
 
 func protectedRuntimeMCPCompiledForProfile(t *testing.T, capability string, provider agent.Provider, qw QueuedWork, profileID string, mode agent.PromptSessionMode) agent.CompiledCapabilityRealization {
+	return protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(t, capability, provider, qw, profileID, mode, platformMCPServerName())
+}
+
+func protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(t *testing.T, capability string, provider agent.Provider, qw QueuedWork, profileID string, mode agent.PromptSessionMode, platformMCPServerName string) agent.CompiledCapabilityRealization {
 	t.Helper()
 	harness := provider.(agent.HarnessProvider)
 	profile, ok := harness.Manifest().ToolLifecycleProfileByID(profileID, mode)
 	if !ok {
 		t.Fatalf("test harness has no tool lifecycle profile %q", profileID)
 	}
-	server, err := protectedRuntimeMCPServer(materializeRuntimeAuthority(qw), provider, mode)
+	server, err := protectedRuntimeMCPServerWithName(materializeRuntimeAuthority(qw), provider, mode, platformMCPServerName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -376,6 +380,53 @@ func TestProtectedRuntimeMCPResolverIsStrictlyCapabilitySelected(t *testing.T) {
 				t.Fatalf("ordinary session requirements = %+v, want nil", requirements)
 			}
 		})
+	}
+}
+
+func TestProtectedRuntimeMCPConfiguredIdentityMatchesPreflightAndRefusesDifferentChildName(t *testing.T) {
+	const preflightName = "example-platform"
+	const childName = "example-local-b-platform"
+	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, true)
+	selector := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
+	compiled := protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(
+		t, protectedRuntimeMCPTestCapability, provider, qw, selector.AdapterProfileID, selector.Mode, preflightName,
+	)
+	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
+	if err != nil {
+		t.Fatal(err)
+	}
+	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector,
+		PlatformMCPServerName: preflightName,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	receipt, err := view.PreflightExecution(detail)
+	if err != nil {
+		t.Fatal(err)
+	}
+	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
+	if err != nil || len(requirements) != 1 || requirements[0].ServerName != preflightName {
+		t.Fatalf("requirements=%+v err=%v", requirements, err)
+	}
+	qw.HostAdaptationReceipt = attachProtectedRuntimeMCPMaterialization(t, receipt, requirements[0])
+	admission, err := legacyView.reg.PreflightHarness(qw, realizations)
+	if err != nil {
+		t.Fatal(err)
+	}
+	servers := defaultMCPServersForHarnessWithPlatformMCPServerName(qw, "/tmp/worktree", provider, agent.PromptModeAutonomous, preflightName)
+	if err := validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(qw, admission.selection, realizations, selector, servers, preflightName); err != nil {
+		t.Fatalf("matching configured identity refused: %v", err)
+	}
+	if err := validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(qw, admission.selection, realizations, selector, servers, childName); err == nil || !strings.Contains(err.Error(), "current runtime authority") {
+		t.Fatalf("different child identity error = %v", err)
+	}
+
+	withoutBearer := qw
+	withoutBearer.McpAuthToken = ""
+	if _, err := protectedRuntimeMCPServerWithName(withoutBearer, provider, agent.PromptModeAutonomous, preflightName); err == nil {
+		t.Fatal("configured identity bypassed absent protected bearer refusal")
 	}
 }
 
@@ -826,6 +877,7 @@ func assertDualSelectionRuntimeSpawn(t *testing.T, provider *dualSelectionRuntim
 }
 
 func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurrently(t *testing.T) {
+	const platformMCPServerName = "example-platform"
 	manifest := codexManifestForTest()
 	v1Profile, ok := manifest.ToolLifecycleProfile(agent.PromptModeAutonomous)
 	if !ok {
@@ -843,8 +895,8 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	}
 	seed := exactReceiptQueuedWork("dual-runtime-seed")
 	seed.PlatformURL, seed.McpAuthToken = "https://platform.example/", "session-bearer"
-	v1 := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, seed, v1Profile.ID, agent.PromptModeAutonomous)
-	v2 := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, seed, v2Profile.ID, agent.PromptModeAutonomous)
+	v1 := protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(t, protectedRuntimeMCPTestCapability, provider, seed, v1Profile.ID, agent.PromptModeAutonomous, platformMCPServerName)
+	v2 := protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(t, protectedRuntimeMCPTestCapability, provider, seed, v2Profile.ID, agent.PromptModeAutonomous, platformMCPServerName)
 	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{v1, v2})
 	if err != nil {
 		t.Fatal(err)
@@ -862,6 +914,7 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	}
 	view, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+		PlatformMCPServerName: platformMCPServerName,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -888,7 +941,8 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	run, err := New(Options{
 		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
-		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		PlatformMCPServerName: platformMCPServerName,
+		SkipBackstop:          true, SkipSteering: true, SkipPostSession: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -973,6 +1027,7 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	historicalPolicy.HistoricalAbsence = ProtectedRuntimeMCPHistoricalAbsenceV1
 	historicalView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
+		PlatformMCPServerName: platformMCPServerName,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -995,7 +1050,8 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	historicalRunner, err := New(Options{
 		Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(),
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: historicalPolicy,
-		SkipBackstop: true, SkipSteering: true, SkipPostSession: true,
+		PlatformMCPServerName: platformMCPServerName,
+		SkipBackstop:          true, SkipSteering: true, SkipPostSession: true,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1021,6 +1077,7 @@ func TestProtectedRuntimeMCPDualSelectionRunsExactV1AndV2SequentiallyAndConcurre
 	var resolverCalls atomic.Int32
 	resolverView, err := NewProviderViewWithOptions(registry, ProviderViewOptions{
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPDualSelectionPolicy: policy,
+		PlatformMCPServerName: platformMCPServerName,
 		ConfigRequirements: func(ExecutionPreflightConfigRequirementContext) ([]executioncell.PreflightConfigRequirementV1, error) {
 			resolverCalls.Add(1)
 			return nil, nil
@@ -1458,6 +1515,7 @@ func TestProtectedRuntimeMCPV2RefusesLegacyToolLifecycleProfile(t *testing.T) {
 }
 
 func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *testing.T) {
+	const platformMCPServerName = "example-platform"
 	legacyView, detail, qw, provider, _ := protectedRuntimeMCPPreflightFixture(t, true)
 	base := protectedRuntimeMCPTestSelector(t, provider, agent.PromptModeAutonomous)
 	const profileID = "codex/headless/tool-lifecycle-v2-fixture"
@@ -1466,7 +1524,7 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 	profile.ID, profile.EvidenceTier, profile.ProductionEligible = profileID, "native_verified", true
 	manifest.ToolLifecycle = append(manifest.ToolLifecycle, profile)
 	provider.manifest = manifest
-	compiled := protectedRuntimeMCPCompiledForProfile(t, protectedRuntimeMCPTestCapability, provider, qw, profileID, agent.PromptModeAutonomous)
+	compiled := protectedRuntimeMCPCompiledForProfileWithPlatformMCPServerName(t, protectedRuntimeMCPTestCapability, provider, qw, profileID, agent.PromptModeAutonomous, platformMCPServerName)
 	realizations, err := agent.NewCapabilityRealizationRegistry([]agent.CompiledCapabilityRealization{compiled})
 	if err != nil {
 		t.Fatal(err)
@@ -1478,6 +1536,7 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 	}
 	view, err := NewProviderViewWithOptions(legacyView.reg, ProviderViewOptions{
 		CapabilityRealizations: realizations, ProtectedRuntimeMCPV2Selector: selector,
+		PlatformMCPServerName: platformMCPServerName,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1543,8 +1602,8 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 	if err != nil {
 		t.Fatal(err)
 	}
-	servers := defaultMCPServersForHarness(qw, "/tmp/worktree", provider, agent.PromptModeAutonomous)
-	got, err := applyProtectedRuntimeMCPV2(qw, admission.selection, realizations, selector, servers, path)
+	servers := defaultMCPServersForHarnessWithPlatformMCPServerName(qw, "/tmp/worktree", provider, agent.PromptModeAutonomous, platformMCPServerName)
+	got, err := applyProtectedRuntimeMCPV2WithPlatformMCPServerName(qw, admission.selection, realizations, selector, servers, path, platformMCPServerName)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -1556,6 +1615,9 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 	}
 	if _, ok := agent.ProtectedRuntimeMCPHeadersHelper(servers[0]); ok || servers[0].Headers["Authorization"] == "" {
 		t.Fatal("input slice mutated")
+	}
+	if _, err := applyProtectedRuntimeMCPV2WithPlatformMCPServerName(qw, admission.selection, realizations, selector, servers, path, "example-local-b-platform"); err == nil || !strings.Contains(err.Error(), "current runtime authority") {
+		t.Fatalf("different V2 child identity error = %v", err)
 	}
 
 	for _, tc := range []struct {
@@ -1577,7 +1639,7 @@ func TestApplyProtectedRuntimeMCPV2JoinsActualFileAndAttachesPrivateHelper(t *te
 			tc.mutate(&changedHost, &changedServers, &changedPath)
 			changedWork := qw
 			changedWork.HostAdaptationReceipt = rawJSONForRunner(t, changedHost)
-			if _, err := applyProtectedRuntimeMCPV2(changedWork, admission.selection, realizations, selector, changedServers, changedPath); err == nil {
+			if _, err := applyProtectedRuntimeMCPV2WithPlatformMCPServerName(changedWork, admission.selection, realizations, selector, changedServers, changedPath, platformMCPServerName); err == nil {
 				t.Fatal("changed authority accepted")
 			}
 		})

@@ -99,6 +99,16 @@ func TestPreparedSourceUsesConstructedPlatformMCPServerIdentity(t *testing.T) {
 	}
 }
 
+func TestConfiguredPlatformMCPServerIdentityWinsCallerCollision(t *testing.T) {
+	const serverName = "example-platform"
+	qw := platformGatewayWork("collision-session")
+	defaults := defaultMCPServersForHarnessWithPlatformMCPServerName(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous, serverName)
+	merged := mergeMCPServers(defaults, []agent.MCPServerConfig{{Name: serverName, Type: "stdio", Command: "caller-command"}})
+	if len(merged) != 1 || merged[0].Name != serverName || merged[0].Type != "http" || merged[0].Command != "" {
+		t.Fatalf("configured gateway did not win caller collision: %+v", merged)
+	}
+}
+
 func runnerRegistryForPlatformMCPIdentityTest(t *testing.T) *Registry {
 	t.Helper()
 	registry := NewRegistry()
