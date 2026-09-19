@@ -354,8 +354,10 @@ func runActualProtectedRuntimeMCPComposition(t *testing.T, version, daemonServer
 		Harness:         executioncell.HarnessRef{ID: string(agent.HarnessCodex), Version: "harness/v2"},
 		Model:           executioncell.ModelRef{ID: "test-model", Author: "local"},
 		Endpoint:        executioncell.ServingEndpointRef{ID: "test-local", Protocol: string(agent.ProtoOpenAIResponses), Operator: "local", Revision: "r1"},
-		AuthBinding: executioncell.AuthBindingRef{ID: "stub-auth", Mechanism: executioncell.AuthNone, CommercialMode: executioncell.CommercialSelfHosted,
-			Authority: "local", BindingScope: executioncell.ScopeProcess, Portability: executioncell.Portable, Delivery: executioncell.DeliveryNone},
+		AuthBinding: executioncell.AuthBindingRef{
+			ID: "stub-auth", Mechanism: executioncell.AuthNone, CommercialMode: executioncell.CommercialSelfHosted,
+			Authority: "local", BindingScope: executioncell.ScopeProcess, Portability: executioncell.Portable, Delivery: executioncell.DeliveryNone,
+		},
 		Placement:   executioncell.PlacementRef{ID: "host-local", Kind: executioncell.PlacementHost, Resolution: executioncell.PlacementExact},
 		SessionMode: sessionMode, GrantedCapabilities: []executioncell.CapabilityRequirement{{Name: capabilityID}},
 		EvidenceTier: executioncell.EvidenceUnitVerified, CompatibilityDigest: strings.Repeat("3", 64), RuntimeInventoryDigest: strings.Repeat("4", 64),
