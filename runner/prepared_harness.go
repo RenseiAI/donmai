@@ -50,6 +50,10 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 }
 
 func buildPreparedSourceSpecWithPlatformMCPServerName(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, platformMCPServerName string, registries ...capabilityRealizationResolver) (agent.Spec, []string, error) {
+	return buildPreparedSourceSpecWithProcessIdentity(qw, selection, decorate, platformMCPServerName, "donmai", registries...)
+}
+
+func buildPreparedSourceSpecWithProcessIdentity(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, platformMCPServerName, cliExecutableName string, registries ...capabilityRealizationResolver) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
@@ -80,14 +84,17 @@ func buildPreparedSourceSpecWithPlatformMCPServerName(qw QueuedWork, selection h
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	builder := prompt.NewBuilder()
+	builder, err := prompt.NewBuilder().WithCLIExecutableName(cliExecutableName)
+	if err != nil {
+		return agent.Spec{}, nil, fmt.Errorf("runner: CLI executable name is malformed: %w", err)
+	}
 	inlineAppend, inlineDisallow, _ := foldInlineSkills("", working.Skills)
 	builder.SkillAppend = inlineAppend
 	composition, err := builder.BuildComposition(working.QueuedWork)
 	if err != nil {
 		return agent.Spec{}, nil, err
 	}
-	composition.HarnessProtocol = injectCodeIntelPartialForDelivery(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelDelivery)
+	composition.HarnessProtocol = injectCodeIntelPartialForDeliveryWithCLI(composition.HarnessProtocol, provider.Capabilities(), working.CodeIntel, codeIntelDelivery, cliExecutableName)
 	composition.HarnessProtocol = injectWorkareaProtocolPartial(composition.HarnessProtocol, working.RepositoryDeclaration != nil)
 	userPrompt := composition.UserPrompt
 	if working.isInteractive() {
@@ -112,7 +119,7 @@ func buildPreparedSourceSpecWithPlatformMCPServerName(qw QueuedWork, selection h
 			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
 		}
 	}
-	defaults := defaultMCPServersForHarnessWithPlatformMCPServerName(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, platformMCPServerName, codeIntelDelivery.Route)
+	defaults := defaultMCPServersForHarnessWithProcessIdentity(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, platformMCPServerName, cliExecutableName, codeIntelDelivery.Route)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
@@ -250,7 +257,11 @@ func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositor
 }
 
 func compilePreparedHarnessWithPlatformMCPServerName(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, platformMCPServerName string, registries ...capabilityRealizationResolver) (*agent.PreparedHarness, agent.Spec, error) {
-	spec, runtimeNames, err := buildPreparedSourceSpecWithPlatformMCPServerName(qw, selection, decorate, platformMCPServerName, registries...)
+	return compilePreparedHarnessWithProcessIdentity(qw, selection, repositoryDeclaration, decorate, platformMCPServerName, "donmai", registries...)
+}
+
+func compilePreparedHarnessWithProcessIdentity(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, platformMCPServerName, cliExecutableName string, registries ...capabilityRealizationResolver) (*agent.PreparedHarness, agent.Spec, error) {
+	spec, runtimeNames, err := buildPreparedSourceSpecWithProcessIdentity(qw, selection, decorate, platformMCPServerName, cliExecutableName, registries...)
 	if err != nil {
 		return nil, agent.Spec{}, err
 	}

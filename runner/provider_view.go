@@ -42,6 +42,7 @@ type ProviderView struct {
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 	selectionPolicy               protectedRuntimeMCPSelectionPolicy
 	platformMCPServerName         string
+	cliExecutableName             string
 }
 
 // ExecutionPreflightConfigRequirementContext is the secret-free, fully
@@ -419,7 +420,7 @@ func (v *ProviderView) PreflightExecution(detailJSON json.RawMessage) (json.RawM
 	if err != nil {
 		return encode(err)
 	}
-	plan, _, err := compilePreparedHarnessWithPlatformMCPServerName(qw, admission.selection, repositoryDeclaration, v.decorate, v.platformMCPServerName, v.preparedCapabilities)
+	plan, _, err := compilePreparedHarnessWithProcessIdentity(qw, admission.selection, repositoryDeclaration, v.decorate, v.platformMCPServerName, v.cliExecutableName, v.preparedCapabilities)
 	if plan != nil {
 		receipt.Plan = plan
 		receipt.PlanDigest = agent.DigestPreparedHarness(plan)
@@ -603,7 +604,7 @@ func (v *ProviderView) ValidateRetainedExecution(detailJSON json.RawMessage, rec
 	if err != nil {
 		return err
 	}
-	source, _, err := buildPreparedSourceSpecWithPlatformMCPServerName(qw, admission.selection, v.decorate, v.platformMCPServerName, v.preparedCapabilities)
+	source, _, err := buildPreparedSourceSpecWithProcessIdentity(qw, admission.selection, v.decorate, v.platformMCPServerName, v.cliExecutableName, v.preparedCapabilities)
 	if err != nil {
 		return err
 	}
@@ -634,10 +635,17 @@ type ProviderViewOptions struct {
 	// implicit per-session MCP gateway. Empty preserves the historical
 	// brand-derived default. Construction captures and validates the value.
 	PlatformMCPServerName string
+	// CLIExecutableName is the process-owned command basename rendered in
+	// prepared prompt instructions. Empty defaults to "donmai".
+	CLIExecutableName string
 }
 
 // NewProviderViewWithOptions constructs a complete read-only provider view.
 func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*ProviderView, error) {
+	cliExecutableName, err := resolveCLIExecutableName(opts.CLIExecutableName)
+	if err != nil {
+		return nil, err
+	}
 	selectionPolicy, err := newProtectedRuntimeMCPSelectionPolicy(opts.ProtectedRuntimeMCPSelector, opts.ProtectedRuntimeMCPV2Selector, opts.ProtectedRuntimeMCPDualSelectionPolicy, opts.CapabilityRealizations)
 	if err != nil {
 		return nil, err
@@ -657,6 +665,7 @@ func NewProviderViewWithOptions(reg *Registry, opts ProviderViewOptions) (*Provi
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
 		platformMCPServerName:         platformMCPServerName,
+		cliExecutableName:             cliExecutableName,
 	}, nil
 }
 

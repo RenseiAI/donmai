@@ -68,10 +68,9 @@ func TestBuilderBuild_Brand_OSSDefault(t *testing.T) {
 }
 
 // TestBuilderBuild_Brand_PlatformContract is the load-bearing platform
-// invariant: when the closed rensei binary configures the statehome seam with
-// brand "rensei" (statehome.SetBrand("rensei")), the donmai runner's default
-// templates render byte-identically to the pre-brand-seam templates — i.e.
-// "autonomous Rensei agent" and "rensei linear". The platform's fallback prompt
+// invariant: statehome owns display identity while an explicit process-owned
+// executable name owns command text. A named filesystem instance can therefore
+// render "autonomous Rensei agent" and stable "rensei linear" commands. The platform's fallback prompt
 // path (system_base.tmpl when no SystemPromptOverride is set) and the
 // fail-loud guard depend on this exact wording, so the brand seam must be a
 // no-op in effect for the platform.
@@ -85,7 +84,10 @@ func TestBuilderBuild_Brand_PlatformContract(t *testing.T) {
 	statehome.SetBrand("rensei")
 
 	t.Run("legacy_path", func(t *testing.T) {
-		b := prompt.NewBuilder()
+		b, err := prompt.NewBuilder().WithCLIExecutableName("rensei")
+		if err != nil {
+			t.Fatalf("WithCLIExecutableName: %v", err)
+		}
 		system, user, err := b.Build(brandFixture(prompt.WorkTypeDevelopment))
 		if err != nil {
 			t.Fatalf("Build error: %v", err)
@@ -98,7 +100,10 @@ func TestBuilderBuild_Brand_PlatformContract(t *testing.T) {
 		if err != nil {
 			t.Fatalf("templates.New() error: %v", err)
 		}
-		b := &prompt.Builder{Registry: reg}
+		b, err := (&prompt.Builder{Registry: reg}).WithCLIExecutableName("rensei")
+		if err != nil {
+			t.Fatalf("WithCLIExecutableName: %v", err)
+		}
 		system, user, err := b.Build(brandFixture(prompt.WorkTypeDevelopment))
 		if err != nil {
 			t.Fatalf("raymond Build error: %v", err)
