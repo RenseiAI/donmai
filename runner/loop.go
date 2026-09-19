@@ -531,9 +531,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// the skill block. Fragments with an empty [when] list match all
 	// workTypes (no filter). Additive: nil sources = no fragment injection.
 	// Keep per-run additions on a fresh builder so concurrent sessions cannot
-	// overwrite each other's composition. Construction-time SkillAppend stays
-	// first; detected kit and inline contributions append to the copy.
+	// overwrite each other's composition. SkillAppend remains per-run scratch
+	// state; SystemAppend, Registry, and CLI identity are construction inputs.
 	promptBuilder := r.promptBuilder.Copy()
+	promptBuilder.SkillAppend = ""
 
 	var kitDisallowedTools []string
 	if len(kitSkillSources) > 0 {
@@ -544,10 +545,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				"err", skillErr,
 			)
 		}
-		if promptBuilder.SkillAppend != "" && loaded.SystemAppend != "" {
-			promptBuilder.SkillAppend += "\n\n"
-		}
-		promptBuilder.SkillAppend += loaded.SystemAppend
+		promptBuilder.SkillAppend = loaded.SystemAppend
 		kitDisallowedTools = loaded.DisallowedTools
 		if loaded.SystemAppend != "" {
 			r.logger.Info("kit skills injected into system prompt",

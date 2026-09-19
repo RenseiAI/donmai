@@ -32,11 +32,9 @@ func ResolveCLIExecutableName(configured string) (string, error) {
 // the rendered system/user prompts name the binary the agent is actually
 // running under — never a hardcoded vendor brand.
 //
-// The OSS default (statehome brand "donmai") renders BrandDisplay="Donmai" and
-// BrandCLI="donmai"; the closed rensei binary, which calls
-// statehome.SetBrand("rensei") at process init, renders BrandDisplay="Rensei"
-// and BrandCLI="rensei". The platform contract is therefore byte-identical to
-// the pre-brand-seam templates: "autonomous Rensei agent" / "rensei linear".
+// The OSS default renders BrandDisplay="Donmai" and BrandCLI="donmai".
+// Embedders may set a distinct display brand through statehome and supply the
+// stable process executable separately through [Builder.WithCLIExecutableName].
 type Brand struct {
 	// BrandDisplay is the human-facing brand name used in prose
 	// (e.g. "autonomous {Display} agent"). Title-cased.
