@@ -34,6 +34,7 @@ import (
 	"runtime"
 	"strconv"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -486,7 +487,22 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifierRefusesOversizeCon
 	if err := os.WriteFile(boundary.configPath, []byte(oversizeConfig), codexConfigMode); err != nil {
 		t.Fatalf("write disposable oversized config: %v", err)
 	}
-	spec := agent.Spec{Cwd: project, MCPServers: []agent.MCPServerConfig{server}}
+	wrapperDir := t.TempDir()
+	pidFile := filepath.Join(wrapperDir, "app-server.pid")
+	wrapperBinary := filepath.Join(wrapperDir, "codex-wrapper")
+	wrapper := "#!/bin/sh\n" +
+		"printf '%s\\n' \"$$\" > \"$DONMAI_REN4097_PID_FILE\"\n" +
+		"exec \"$DONMAI_REN4097_REAL_CODEX\" \"$@\"\n"
+	if err := os.WriteFile(wrapperBinary, []byte(wrapper), 0o700); err != nil {
+		t.Fatalf("write disposable Codex wrapper: %v", err)
+	}
+	spec := agent.Spec{
+		Cwd: project, MCPServers: []agent.MCPServerConfig{server},
+		Env: map[string]string{
+			"DONMAI_REN4097_PID_FILE":   pidFile,
+			"DONMAI_REN4097_REAL_CODEX": binary,
+		},
+	}
 	launch, err := buildInteractiveLaunch(spec)
 	if err != nil {
 		t.Fatal(err)
@@ -498,7 +514,7 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifierRefusesOversizeCon
 	t.Cleanup(func() { _ = os.RemoveAll(socketParent) })
 	t.Setenv("TMPDIR", socketParent)
 	err = verifyExclusiveInteractiveMCP(
-		t.Context(), runCodexMCPInventory, binary, spec, launch, boundary.home,
+		t.Context(), runCodexMCPInventory, wrapperBinary, spec, launch, boundary.home,
 	)
 	if !errors.Is(err, ErrInteractiveCodexMCPIsolation) || !strings.Contains(err.Error(), "message too big") {
 		t.Fatalf("oversized effective config error = %v", err)
@@ -512,6 +528,17 @@ func TestIntegration_RealCodexProtectedHelperInventoryVerifierRefusesOversizeCon
 	}
 	if len(entries) != 0 {
 		t.Fatalf("owned config probe socket survived oversized refusal: %v", entries)
+	}
+	pidBody, err := os.ReadFile(pidFile)
+	if err != nil {
+		t.Fatalf("read owned config probe PID: %v", err)
+	}
+	pid, err := strconv.Atoi(strings.TrimSpace(string(pidBody)))
+	if err != nil {
+		t.Fatalf("decode owned config probe PID: %v", err)
+	}
+	if err := syscall.Kill(pid, 0); !errors.Is(err, syscall.ESRCH) {
+		t.Fatalf("owned config probe process %d survived oversized refusal: %v", pid, err)
 	}
 }
 
