@@ -62,6 +62,101 @@ var AgentEnvBlocklist = []string{
 	"OPENAI_API_KEY",
 }
 
+// InjectedEnvKeysVar is the runner-only environment variable through which an
+// EMBEDDING DAEMON declares — by NAME ONLY, never by value — which
+// AgentEnvBlocklist names it placed in the worker process environment on
+// purpose.
+//
+// Two layers feed a harness child's environment, and until this declaration
+// existed they were distinguishable only by which argument they arrived on:
+//
+//   - The INHERITED layer (the worker process's own os.Environ()). It is
+//     filtered against AgentEnvBlocklist because its usual author is an
+//     operator's interactive shell, and a shell's ANTHROPIC_API_KEY must not
+//     silently become the agent's (see the package doc).
+//   - The EXPLICIT layers (agent.Spec.Env, the ComposeChildEnv override maps).
+//     They are runner-set and trusted, so they bypass the blocklist entirely —
+//     that is how a provider injects the credential it resolved for a session.
+//
+// A supervising daemon that resolves per-session credentials out of band and
+// merges them into the worker's environment writes into the INHERITED layer,
+// where the filter cannot tell a deliberate injection from a shell leak and
+// strips it: the worker's own provider probe sees the credential and the
+// harness child never does. Declaring the names here is how a supervisor says
+// "these inherited names are mine, not the operator's shell's".
+//
+// The value is a comma-separated list of variable NAMES and carries no secret.
+// It is parsed defensively: surrounding whitespace is trimmed, empty elements
+// are ignored, and matching is on the exact name — no globs, no prefixes.
+//
+// A declaration can only re-admit an AgentEnvBlocklist name. IsRunnerOnly names
+// are refused at every layer and a declaration that lists one changes nothing:
+// those variables address the SUPERVISOR of the process that would receive
+// them, so no supervisor may hand them down.
+//
+// The variable is itself runner-only, so it never reaches a child. A harness
+// cannot learn which names were injected for it, and cannot re-declare a set of
+// its own for whatever it spawns in turn.
+const InjectedEnvKeysVar = "DONMAI_INJECTED_ENV_KEYS"
+
+// InjectedEnvKeySet is a parsed InjectedEnvKeysVar declaration: a set of
+// environment variable NAMES. It never holds a value.
+type InjectedEnvKeySet map[string]struct{}
+
+// Allows reports whether key may cross the inherited-environment blocklist
+// because the embedding daemon declared it injected. Runner-only names are
+// refused no matter what the declaration says.
+func (s InjectedEnvKeySet) Allows(key string) bool {
+	if len(s) == 0 || IsRunnerOnly(key) {
+		return false
+	}
+	_, ok := s[key]
+	return ok
+}
+
+// ParseInjectedEnvKeys parses an InjectedEnvKeysVar value into a set. Malformed
+// input is tolerated rather than rejected — a declaration is an optimization of
+// the filter, not a security boundary, and a supervisor that spells it with
+// stray spaces or a trailing comma should still get the names it asked for.
+// An empty or all-empty value yields a nil set, which Allows treats as "nothing
+// declared".
+func ParseInjectedEnvKeys(value string) InjectedEnvKeySet {
+	if strings.TrimSpace(value) == "" {
+		return nil
+	}
+	out := make(InjectedEnvKeySet)
+	for _, name := range strings.Split(value, ",") {
+		name = strings.TrimSpace(name)
+		if name == "" {
+			continue
+		}
+		out[name] = struct{}{}
+	}
+	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// InjectedEnvKeysFrom reads the declaration out of a KEY=VALUE slice. A
+// duplicate wins last, matching exec.Cmd.Env's own semantics.
+func InjectedEnvKeysFrom(entries []string) InjectedEnvKeySet {
+	prefix := InjectedEnvKeysVar + "="
+	value := ""
+	for _, entry := range entries {
+		if strings.HasPrefix(entry, prefix) {
+			value = entry[len(prefix):]
+		}
+	}
+	return ParseInjectedEnvKeys(value)
+}
+
+// InjectedEnvKeysFromMap reads the declaration out of a KEY->VALUE map. It is
+// the map counterpart to InjectedEnvKeysFrom.
+func InjectedEnvKeysFromMap(entries map[string]string) InjectedEnvKeySet {
+	return ParseInjectedEnvKeys(entries[InjectedEnvKeysVar])
+}
+
 // IsRunnerOnly reports whether key is a host-side interactive attach control
 // that the runner consumes but must never expose to provider processes, PTY
 // children, or model-invoked tool subprocesses. Unlike AgentEnvBlocklist, this
@@ -78,6 +173,13 @@ var AgentEnvBlocklist = []string{
 func IsRunnerOnly(key string) bool {
 	switch key {
 	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL":
+		return true
+	case InjectedEnvKeysVar:
+		// The declaration addresses this package's own inherited-env filter,
+		// which is the supervisor's boundary and not the workload's. A child
+		// that could READ it would learn which credential names its supervisor
+		// injected; a child that could SET it would re-admit anything it liked
+		// into whatever it spawns next.
 		return true
 	default:
 		return strings.HasPrefix(key, sessionShimEnvPrefix)
@@ -126,13 +228,19 @@ func filterInheritedChildEnv(entries []string) []string {
 	if len(entries) == 0 {
 		return entries
 	}
+	// The declaration travels in the inherited layer itself: a supervisor that
+	// injected a blocklisted name into this process also named it here.
+	declared := InjectedEnvKeysFrom(entries)
 	out := make([]string, 0, len(entries))
 	for _, entry := range entries {
 		key := entry
 		if i := strings.IndexByte(entry, '='); i >= 0 {
 			key = entry[:i]
 		}
-		if IsRunnerOnly(key) || isAgentEnvBlocked(key) {
+		if IsRunnerOnly(key) {
+			continue
+		}
+		if isAgentEnvBlocked(key) && !declared.Allows(key) {
 			continue
 		}
 		out = append(out, entry)
@@ -215,7 +323,10 @@ func (c *Composer) effectiveBlocklist() []string {
 // Precedence (lowest to highest, last write wins):
 //
 //  1. base — typically os.Environ() parsed into a map. Entries whose
-//     key is in the agent-auth or runner-only blocklist are dropped.
+//     key is in the agent-auth or runner-only blocklist are dropped, unless
+//     base itself declares the name in InjectedEnvKeysVar (an embedding
+//     daemon saying "I put this here on purpose"). A runner-only name is
+//     dropped regardless of any declaration.
 //  2. spec.Env — the per-session env map carried on agent.Spec. Agent-auth
 //     entries are trusted here, but runner-only controls are still dropped.
 //
@@ -238,12 +349,14 @@ func (c *Composer) Compose(base map[string]string, spec agent.Spec) []string {
 	// No capacity hint: a Go map grows on demand, so pre-sizing buys nothing
 	// here, and summing len()s as an allocation size is exactly the shape a
 	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
+	declared := InjectedEnvKeysFromMap(base)
+
 	merged := make(map[string]string)
 	for k, v := range base {
 		if IsRunnerOnly(k) {
 			continue
 		}
-		if _, blocked := blockSet[k]; blocked {
+		if _, blocked := blockSet[k]; blocked && !declared.Allows(k) {
 			continue
 		}
 		merged[k] = v

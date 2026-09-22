@@ -44,6 +44,35 @@ Source: `../../../donmai-libraries/packages/core/src/orchestrator/orchestrator.t
 
 The blocklist applies **only to the `base` map** passed to `Compose`. `Spec.Env` is runner-set and intentionally trusted — that is how the daemon resolves `ANTHROPIC_API_KEY` from its credential store and injects it for the session.
 
+## `DONMAI_INJECTED_ENV_KEYS` — declared injections
+
+An embedding daemon that merges per-session credentials into the **worker process
+environment** (rather than into `Spec.Env`) writes into the inherited layer, where
+the blocklist strips them: the worker's own provider probe sees the key and the
+harness child never does.
+
+`DONMAI_INJECTED_ENV_KEYS` is the supervisor's declaration of which inherited
+names are its own. It is a comma-separated list of variable **NAMES** — never
+values — set on the worker process:
+
+```
+DONMAI_INJECTED_ENV_KEYS=GEMINI_API_KEY,OPENAI_API_KEY
+```
+
+- A declared name crosses the blocklist on the inherited layer
+  (`ComposeChildEnv`, `Compose`'s `base`, and the PTY parent env).
+- Everything else is unchanged: undeclared blocklisted names are still stripped,
+  and the explicit layers still bypass the blocklist outright.
+- The declaration re-admits `AGENT_ENV_BLOCKLIST` names **only**. `IsRunnerOnly`
+  names (`ATTACH_*`, the `DONMAI_SESSION_SHIM*` launch contract) stay stripped.
+- The variable is itself runner-only, so it never reaches a child: a harness
+  cannot read the injected set, and cannot re-declare one of its own.
+- Parsing is defensive — whitespace trimmed, empty elements ignored, exact-name
+  match, no globs.
+
+Helpers: `ParseInjectedEnvKeys(value)`, `InjectedEnvKeysFrom(entries []string)`,
+`InjectedEnvKeysFromMap(map[string]string)`, and `InjectedEnvKeySet.Allows(key)`.
+
 ## Heuristic helpers
 
 - `IsBlocked(key string) bool` — exact match against the effective blocklist.

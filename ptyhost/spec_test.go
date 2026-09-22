@@ -3,6 +3,8 @@ package ptyhost
 import (
 	"fmt"
 	"testing"
+
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
@@ -58,6 +60,72 @@ func TestComposeEnv_InteractiveDefaultsAndExplicitOverrides(t *testing.T) {
 				if _, ok := got[blocked]; ok {
 					t.Errorf("runner-only control %s reached PTY environment", blocked)
 				}
+			}
+		})
+	}
+}
+
+func TestComposeEnv_InheritedBlocklistHonoursTheInjectionDeclaration(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name    string
+		parent  []string
+		want    map[string]string
+		wantNot []string
+	}{
+		{
+			name:    "undeclared blocklisted parent value stays stripped",
+			parent:  []string{"PATH=/bin", "GEMINI_API_KEY=shell-leak"},
+			want:    map[string]string{"PATH": "/bin"},
+			wantNot: []string{"GEMINI_API_KEY"},
+		},
+		{
+			name: "declared blocklisted parent value is inherited",
+			parent: []string{
+				"PATH=/bin",
+				"GEMINI_API_KEY=daemon-injected",
+				runtimeenv.InjectedEnvKeysVar + "=GEMINI_API_KEY",
+			},
+			want: map[string]string{"PATH": "/bin", "GEMINI_API_KEY": "daemon-injected"},
+		},
+		{
+			name: "declaration admits only what it lists",
+			parent: []string{
+				"GEMINI_API_KEY=daemon-injected",
+				"OPENAI_API_KEY=shell-leak",
+				runtimeenv.InjectedEnvKeysVar + "=GEMINI_API_KEY",
+			},
+			want:    map[string]string{"GEMINI_API_KEY": "daemon-injected"},
+			wantNot: []string{"OPENAI_API_KEY"},
+		},
+		{
+			name: "declaring a runner-only control changes nothing",
+			parent: []string{
+				"ATTACH_TOKEN=host-token",
+				runtimeenv.InjectedEnvKeysVar + "=ATTACH_TOKEN",
+			},
+			wantNot: []string{"ATTACH_TOKEN"},
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+
+			got := envMap(composeEnv(tt.parent, nil))
+			for key, want := range tt.want {
+				if got[key] != want {
+					t.Errorf("%s = %q, want %q (full env: %v)", key, got[key], want, got)
+				}
+			}
+			for _, key := range tt.wantNot {
+				if _, ok := got[key]; ok {
+					t.Errorf("%s reached the PTY environment (full env: %v)", key, got)
+				}
+			}
+			if _, ok := got[runtimeenv.InjectedEnvKeysVar]; ok {
+				t.Errorf("the injection declaration reached the PTY environment: %v", got)
 			}
 		})
 	}
