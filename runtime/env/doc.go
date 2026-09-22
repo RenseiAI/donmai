@@ -9,6 +9,37 @@
 // operator's interactive shell credential cannot leak into the agent's
 // subprocess.
 //
+// # Two layers, and the declaration that tells them apart
+//
+// The distinction the blocklist enforces is between layers, not between
+// secrets:
+//
+//   - INHERITED — the host process env passed through. Filtered against
+//     AGENT_ENV_BLOCKLIST, because its usual author is an operator's shell.
+//   - EXPLICIT — Spec.Env and the ComposeChildEnv override maps. Runner-set
+//     and trusted, so the blocklist does not apply: this is how a provider
+//     delivers the credential it resolved for the session.
+//
+// A supervising daemon that resolves per-session credentials out of band and
+// merges them into the worker process environment writes into the INHERITED
+// layer, where the filter cannot tell its deliberate injection from a shell
+// leak. InjectedEnvKeysVar (DONMAI_INJECTED_ENV_KEYS) is how that supervisor
+// declares, by NAME only, which inherited names are its own; a declared name
+// crosses the blocklist, and everything else behaves exactly as before.
+//
+// The declaration re-admits SHELL-LEAK AGENT_ENV_BLOCKLIST names only. Three
+// classes are refused regardless of what it says: IsRunnerOnly names (the
+// attach controls, the session-shim launch contract, and the two declaration
+// variables themselves), AgentEnvIsolationInvariants (the gateway cell's
+// upstream credential and route), and whatever the gateway named for this
+// session through GatewayUpstreamEnvKeysVar. See InjectedEnvKeySet.Allows.
+//
+// Provenance matters as much as the refusals: the declaration is trusted from a
+// supervising PARENT PROCESS only. The daemon strips runner-owned names from
+// every caller-supplied env map before composing a worker environment, and the
+// CLI skips them when applying dotenv files, so neither an orchestrator work
+// item nor a repository .env can author one.
+//
 // Source: ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 // (AGENT_ENV_BLOCKLIST) — port verbatim per F.1.1 §1.
 package env

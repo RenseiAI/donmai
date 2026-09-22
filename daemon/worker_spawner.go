@@ -15,6 +15,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/internal/interview"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -1779,10 +1780,24 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 
 // composeEnv flattens the merged env into the os.Environ() form expected by
 // exec.Cmd.Env.
+//
+// Every caller-supplied map is filtered through runtimeenv.FilterRunnerOnlyMap
+// first, because SessionSpec.Env is copied VERBATIM from the orchestrator's
+// poll work item (poll.go, `Env: item.Env`) and runner-owned controls are not
+// the orchestrator's to set. The one that matters is
+// runtimeenv.InjectedEnvKeysVar: it re-admits blocklisted names from the
+// INHERITED environment, so a work item that could set it would re-admit the
+// DAEMON's own operator-exported provider key into a harness child — the exact
+// leak runtime/env's blocklist exists to prevent, and one no value of item.Env
+// could reach before that variable existed.
+//
+// Filtering here rather than at the poll boundary keeps the rule where the
+// composition happens, and leaves exactly one author: OnPreSpawn, which runs
+// AFTER this function and is by definition the embedding daemon.
 func composeEnv(parts ...map[string]string) []string {
 	merged := map[string]string{}
 	for _, p := range parts {
-		for k, v := range p {
+		for k, v := range runtimeenv.FilterRunnerOnlyMap(p) {
 			merged[k] = v
 		}
 	}

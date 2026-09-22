@@ -26,7 +26,13 @@ package afcli
 //     provider with it, while the harness child only ever sees the loopback
 //     bearer. Provider keys are in runtime/env's AgentEnvBlocklist, so the
 //     child cannot inherit one — the credential-isolation property that makes a
-//     gateway cell worth having.
+//     gateway cell worth having. A supervising daemon CAN re-admit a
+//     blocklisted name it injected itself (runtime/env.InjectedEnvKeysVar), so
+//     that property is no longer the blocklist's alone: the gateway names its
+//     own upstream variables through runtimeenv.DeclareGatewayUpstreamEnvKeys
+//     below, and no declaration can re-admit a name on that list. The fallback
+//     to OPENAI_API_KEY is exactly why the refusal is published per session
+//     rather than inferred from the name.
 //
 // M1 scope, matching the shipped module: the openai-chat inbound surface and an
 // OpenAI-compatible upstream (direct OpenAI or any compat URL — OpenRouter,
@@ -53,19 +59,27 @@ import (
 	"github.com/RenseiAI/donmai/gateway/upstream"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 const (
 	// EnvGatewayUpstreamBaseURL overrides the OpenAI-compatible upstream API
 	// root the worker-local gateway dials. Empty uses the direct OpenAI root.
 	// This is an OPERATOR knob (env, worker-side), never a dispatch payload
-	// field — see the file header.
-	EnvGatewayUpstreamBaseURL = "DONMAI_GATEWAY_UPSTREAM_BASE_URL"
+	// field — see the file header. Defined in runtime/env, which owns the
+	// blocklist entry and the never-declarable refusal that protect it.
+	EnvGatewayUpstreamBaseURL = runtimeenv.GatewayUpstreamBaseURLEnv
 
 	// EnvGatewayUpstreamAPIKey is the upstream credential the gateway dials
 	// with. Falls back to OPENAI_API_KEY (the conventional name for the same
 	// value) so an already-configured worker needs no new setting.
-	EnvGatewayUpstreamAPIKey = "DONMAI_GATEWAY_UPSTREAM_API_KEY" //nolint:gosec // G101: env-var NAME, not a credential.
+	EnvGatewayUpstreamAPIKey = runtimeenv.GatewayUpstreamAPIKeyEnv
+
+	// envOpenAIAPIKey is that fallback. Unlike the two names above it is an
+	// ORDINARY blocklist entry — a supervisor may legitimately declare it for a
+	// non-gateway session — so when the gateway dials with it, the refusal has
+	// to be published per session rather than inferred from the name.
+	envOpenAIAPIKey = "OPENAI_API_KEY" //nolint:gosec // G101: an env-var NAME, not a credential.
 
 	// defaultGatewayUpstreamBaseURL is the direct OpenAI Chat Completions root.
 	defaultGatewayUpstreamBaseURL = "https://api.openai.com/v1"
@@ -145,15 +159,28 @@ func bindWorkerGateway(ctx context.Context, logger *slog.Logger, d *daemon.Sessi
 		return nil, errors.New("gateway-served cell carries no valid admitted harness identity")
 	}
 
+	upstreamKeyEnv := EnvGatewayUpstreamAPIKey
 	key := strings.TrimSpace(os.Getenv(EnvGatewayUpstreamAPIKey))
 	if key == "" {
-		key = strings.TrimSpace(os.Getenv("OPENAI_API_KEY"))
+		upstreamKeyEnv = envOpenAIAPIKey
+		key = strings.TrimSpace(os.Getenv(envOpenAIAPIKey))
 	}
 	if key == "" {
 		return nil, fmt.Errorf(
-			"gateway-served cell needs an upstream credential in the worker env: set %s (or OPENAI_API_KEY). "+
+			"gateway-served cell needs an upstream credential in the worker env: set %s (or %s). "+
 				"The key stays in this process — the harness child receives only the gateway's per-session bearer",
-			EnvGatewayUpstreamAPIKey)
+			EnvGatewayUpstreamAPIKey, envOpenAIAPIKey)
+	}
+
+	// Name the variables holding this session's upstream credential and route
+	// BEFORE anything can spawn a child, so no supervisor declaration
+	// (runtime/env.InjectedEnvKeysVar) can re-admit them into one. The two
+	// gateway-spelled names are never declarable anyway; publishing the RESOLVED
+	// name is what closes the OPENAI_API_KEY fallback, where the upstream
+	// credential wears an ordinarily-declarable name. A failure here is fatal
+	// for the cell: proceeding would run it with its isolation unenforced.
+	if err := runtimeenv.DeclareGatewayUpstreamEnvKeys(upstreamKeyEnv, EnvGatewayUpstreamBaseURL); err != nil {
+		return nil, fmt.Errorf("declare gateway upstream env keys: %w", err)
 	}
 
 	upstreamBase, err := resolveGatewayUpstreamBaseURL(os.Getenv(EnvGatewayUpstreamBaseURL))

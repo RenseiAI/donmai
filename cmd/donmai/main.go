@@ -16,6 +16,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afcli"
 	"github.com/RenseiAI/donmai/afclient"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
@@ -127,6 +128,32 @@ func configureLogging(flags *rootFlags) {
 	slog.SetDefault(slog.New(slog.NewTextHandler(w, &slog.HandlerOptions{Level: level})))
 }
 
+// loadDotenv applies one optional dotenv file to the process environment,
+// skipping runner-owned controls. A missing or malformed file is non-fatal.
+//
+// The skip is the point. This runs in the process CWD, so the file is whatever
+// repository the operator happens to be standing in — and
+// runtimeenv.InjectedEnvKeysVar re-admits blocklisted names from the INHERITED
+// environment. Without the skip, one line committed to an untrusted repo
+// (`DONMAI_INJECTED_ENV_KEYS=ANTHROPIC_API_KEY`) would hand every harness and
+// PTY child of `donmai agent run` the key the operator exported in their login
+// shell — verbatim the leak runtime/env exists to prevent. The declaration is
+// trusted from a supervising PARENT PROCESS only, never from the filesystem.
+// The ATTACH_* and session-shim names are skipped for the same reason.
+func loadDotenv(path string) {
+	values, err := godotenv.Read(path)
+	if err != nil {
+		return
+	}
+	for key, value := range runtimeenv.FilterRunnerOnlyMap(values) {
+		// godotenv.Load semantics: an already-set variable always wins.
+		if _, set := os.LookupEnv(key); set {
+			continue
+		}
+		_ = os.Setenv(key, value)
+	}
+}
+
 // newRootCmd constructs the root `donmai` Cobra command with persistent
 // flags and dotenv-loading PersistentPreRunE. It is a factory so tests
 // can build fresh commands without global state.
@@ -147,8 +174,8 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 			// Load each separately because godotenv.Load aborts on the
 			// first missing file without loading the rest. Existing env
 			// vars always win (godotenv never overrides).
-			_ = godotenv.Load(".env.local")
-			_ = godotenv.Load(".env")
+			loadDotenv(".env.local")
+			loadDotenv(".env")
 
 			// Flag defaults resolve before PersistentPreRunE runs, so if
 			// the user did not explicitly pass --url, re-read WORKER_API_URL
