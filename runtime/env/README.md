@@ -63,8 +63,23 @@ DONMAI_INJECTED_ENV_KEYS=GEMINI_API_KEY,OPENAI_API_KEY
   (`ComposeChildEnv`, `Compose`'s `base`, and the PTY parent env).
 - Everything else is unchanged: undeclared blocklisted names are still stripped,
   and the explicit layers still bypass the blocklist outright.
-- The declaration re-admits `AGENT_ENV_BLOCKLIST` names **only**. `IsRunnerOnly`
-  names (`ATTACH_*`, the `DONMAI_SESSION_SHIM*` launch contract) stay stripped.
+- The declaration re-admits **shell-leak** `AGENT_ENV_BLOCKLIST` names only.
+  Three classes are refused regardless:
+  - `IsRunnerOnly` names (`ATTACH_*`, the `DONMAI_SESSION_SHIM*` launch
+    contract, and the two declaration variables themselves);
+  - `AgentEnvIsolationInvariants` — `DONMAI_GATEWAY_UPSTREAM_API_KEY` and
+    `DONMAI_GATEWAY_UPSTREAM_BASE_URL`, whose blocking is the gateway cell's
+    isolation invariant rather than a shell-leak heuristic;
+  - whatever the gateway named for **this session** through
+    `DONMAI_GATEWAY_UPSTREAM_ENV_KEYS`. The gateway falls back to
+    `OPENAI_API_KEY` as its upstream credential, and that name is ordinarily
+    declarable — so the refusal is published per session by
+    `DeclareGatewayUpstreamEnvKeys`, not inferred from the name.
+- **Provenance.** The declaration is trusted from a supervising parent process
+  only. `daemon.composeEnv` strips runner-owned names from every caller-supplied
+  map (`SessionSpec.Env` is copied verbatim from an orchestrator work item), and
+  the dotenv loader skips them, so a work item or a repository `.env` cannot
+  author one. The only writer left is the `OnPreSpawn` hook.
 - The variable is itself runner-only, so it never reaches a child: a harness
   cannot read the injected set, and cannot re-declare one of its own.
 - Parsing is defensive — whitespace trimmed, empty elements ignored, exact-name

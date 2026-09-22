@@ -2,10 +2,21 @@ package env
 
 import (
 	"fmt"
+	"os"
 	"sort"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+)
+
+// GatewayUpstreamAPIKeyEnv and GatewayUpstreamBaseURLEnv name the worker-local
+// translating gateway's upstream credential and route. They live here, not in
+// the gateway's own package, because this package owns both the blocklist they
+// belong to and the refusal that keeps them on it (see
+// AgentEnvIsolationInvariants); afcli/gateway_bind.go re-exports them.
+const (
+	GatewayUpstreamAPIKeyEnv  = "DONMAI_GATEWAY_UPSTREAM_API_KEY" //nolint:gosec // G101: an env-var NAME, not a credential.
+	GatewayUpstreamBaseURLEnv = "DONMAI_GATEWAY_UPSTREAM_BASE_URL"
 )
 
 // sessionShimEnvPrefix is the shared prefix of the session-shim launch contract
@@ -54,8 +65,8 @@ var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
-	"DONMAI_GATEWAY_UPSTREAM_API_KEY",
-	"DONMAI_GATEWAY_UPSTREAM_BASE_URL",
+	GatewayUpstreamAPIKeyEnv,
+	GatewayUpstreamBaseURLEnv,
 	"GEMINI_API_KEY",
 	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",
@@ -89,48 +100,152 @@ var AgentEnvBlocklist = []string{
 // It is parsed defensively: surrounding whitespace is trimmed, empty elements
 // are ignored, and matching is on the exact name — no globs, no prefixes.
 //
-// A declaration can only re-admit an AgentEnvBlocklist name. IsRunnerOnly names
-// are refused at every layer and a declaration that lists one changes nothing:
-// those variables address the SUPERVISOR of the process that would receive
-// them, so no supervisor may hand them down.
+// A declaration re-admits a SHELL-LEAK entry of AgentEnvBlocklist and nothing
+// else. Three classes are refused no matter what it says — see
+// InjectedEnvKeySet.Allows.
 //
 // The variable is itself runner-only, so it never reaches a child. A harness
 // cannot learn which names were injected for it, and cannot re-declare a set of
-// its own for whatever it spawns in turn.
+// its own for whatever it spawns in turn. It is also stripped from every
+// caller-supplied env map by the daemon's own spawn composition, so only a
+// genuine supervisor — an OnPreSpawn hook, which runs after that composition —
+// can author one.
 const InjectedEnvKeysVar = "DONMAI_INJECTED_ENV_KEYS"
 
-// InjectedEnvKeySet is a parsed InjectedEnvKeysVar declaration: a set of
-// environment variable NAMES. It never holds a value.
-type InjectedEnvKeySet map[string]struct{}
+// AgentEnvIsolationInvariants is the subset of AgentEnvBlocklist whose blocking
+// is an ISOLATION INVARIANT rather than the shell-leak heuristic the rest of
+// the list encodes. No InjectedEnvKeysVar declaration can re-admit these.
+//
+// The other entries answer "an operator's interactive shell key must not
+// silently become the agent's", and a supervisor that injected one on purpose
+// has standing to say so. These two answer something else: the entire point of
+// a gateway cell is that the harness child receives ONLY the gateway's
+// per-session loopback bearer while the upstream credential and route stay in
+// the worker process (afcli/gateway_bind.go). A declaration has no standing to
+// undo that, because the party that benefits from undoing it is the child.
+var AgentEnvIsolationInvariants = []string{
+	GatewayUpstreamAPIKeyEnv,
+	GatewayUpstreamBaseURLEnv,
+}
+
+// GatewayUpstreamEnvKeysVar is the runner-only variable through which the
+// worker-local gateway names, at bind time, the environment variables that hold
+// THIS session's upstream credential and route.
+//
+// It exists because the gateway's upstream credential is not always spelled
+// with a gateway name: afcli/gateway_bind.go falls back to OPENAI_API_KEY when
+// GatewayUpstreamAPIKeyEnv is unset, and OPENAI_API_KEY is an ordinary
+// shell-leak entry a supervisor may legitimately declare for a NON-gateway
+// session. Whether a given name holds a gateway upstream credential is
+// therefore a property of the SESSION, not of the name, and only the gateway
+// knows it. AgentEnvIsolationInvariants alone would miss exactly the path that
+// leaks the real upstream key.
+//
+// The gateway publishes the set into its own worker process with
+// DeclareGatewayUpstreamEnvKeys, before any child spawns; every inherited-env
+// filter reads it back out of the same environment. Like the declaration
+// itself the variable is runner-only, so a child can neither read it nor forge
+// one for what it spawns.
+const GatewayUpstreamEnvKeysVar = "DONMAI_GATEWAY_UPSTREAM_ENV_KEYS"
+
+// DeclareGatewayUpstreamEnvKeys records, in THIS process, the env-var NAMES
+// that hold the gateway cell's upstream credential and route, so no
+// InjectedEnvKeysVar declaration can re-admit them into a harness child.
+//
+// Called by the gateway bind in the worker process. It is process-wide on
+// purpose: a worker process runs exactly one session, so "this session is
+// gateway-served, dialling with the credential in <name>" is a property of the
+// process.
+func DeclareGatewayUpstreamEnvKeys(names ...string) error {
+	cleaned := make([]string, 0, len(names))
+	for _, name := range names {
+		if name = strings.TrimSpace(name); name != "" {
+			cleaned = append(cleaned, name)
+		}
+	}
+	return os.Setenv(GatewayUpstreamEnvKeysVar, strings.Join(cleaned, ","))
+}
+
+// InjectedEnvKeySet is a parsed InjectedEnvKeysVar declaration together with
+// the per-session refusals that outrank it. It holds NAMES, never values. The
+// zero value declares nothing, so it admits nothing.
+type InjectedEnvKeySet struct {
+	declared        map[string]struct{}
+	gatewayUpstream map[string]struct{}
+}
 
 // Allows reports whether key may cross the inherited-environment blocklist
-// because the embedding daemon declared it injected. Runner-only names are
-// refused no matter what the declaration says.
+// because the embedding daemon declared it injected.
+//
+// A declaration is the ONLY input in this package that widens a boundary, and
+// the party that benefits from widening it further is the child — so three
+// classes are refused regardless of what it says:
+//
+//  1. IsRunnerOnly names. They address the SUPERVISOR of the process that would
+//     receive them, so no supervisor hands them down.
+//  2. AgentEnvIsolationInvariants — the gateway cell's upstream credential and
+//     route, by name.
+//  3. Whatever the gateway named for THIS session through
+//     GatewayUpstreamEnvKeysVar. Same invariant, reached through a name that is
+//     ordinarily declarable.
 func (s InjectedEnvKeySet) Allows(key string) bool {
-	if len(s) == 0 || IsRunnerOnly(key) {
+	if len(s.declared) == 0 {
 		return false
 	}
-	_, ok := s[key]
+	if IsRunnerOnly(key) || isIsolationInvariant(key) {
+		return false
+	}
+	if _, refused := s.gatewayUpstream[key]; refused {
+		return false
+	}
+	_, ok := s.declared[key]
 	return ok
 }
 
-// ParseInjectedEnvKeys parses an InjectedEnvKeysVar value into a set. Malformed
-// input is tolerated rather than rejected — a declaration is an optimization of
-// the filter, not a security boundary, and a supervisor that spells it with
-// stray spaces or a trailing comma should still get the names it asked for.
-// An empty or all-empty value yields a nil set, which Allows treats as "nothing
-// declared".
-func ParseInjectedEnvKeys(value string) InjectedEnvKeySet {
+// isIsolationInvariant reports whether key is blocked by an isolation
+// invariant rather than the shell-leak heuristic, and is therefore never
+// declarable.
+func isIsolationInvariant(key string) bool {
+	for _, invariant := range AgentEnvIsolationInvariants {
+		if key == invariant {
+			return true
+		}
+	}
+	return false
+}
+
+// ParseInjectedEnvKeys parses an InjectedEnvKeysVar declaration and a
+// GatewayUpstreamEnvKeysVar refusal list into a set. Both are comma-separated
+// lists of exact variable NAMES.
+//
+// Malformed input is tolerated rather than rejected, and deliberately so:
+// tolerance here fails CLOSED. An element that does not parse to an exact name
+// admits nothing, so the worst a mangled declaration can do is leave a
+// credential stripped — while rejecting the whole value would turn one stray
+// comma into a hard spawn failure.
+//
+// Exact names only, always. A wildcard or prefix form is forbidden by design:
+// this is the one input in this package that widens a security filter, and a
+// pattern cannot be audited against the set of names it would admit tomorrow.
+func ParseInjectedEnvKeys(declaration, gatewayUpstream string) InjectedEnvKeySet {
+	return InjectedEnvKeySet{
+		declared:        parseEnvNameList(declaration),
+		gatewayUpstream: parseEnvNameList(gatewayUpstream),
+	}
+}
+
+// parseEnvNameList splits a comma-separated list of variable names into a set,
+// trimming each element and dropping empties. An empty or all-empty value
+// yields nil.
+func parseEnvNameList(value string) map[string]struct{} {
 	if strings.TrimSpace(value) == "" {
 		return nil
 	}
-	out := make(InjectedEnvKeySet)
+	out := make(map[string]struct{})
 	for _, name := range strings.Split(value, ",") {
-		name = strings.TrimSpace(name)
-		if name == "" {
-			continue
+		if name = strings.TrimSpace(name); name != "" {
+			out[name] = struct{}{}
 		}
-		out[name] = struct{}{}
 	}
 	if len(out) == 0 {
 		return nil
@@ -138,23 +253,31 @@ func ParseInjectedEnvKeys(value string) InjectedEnvKeySet {
 	return out
 }
 
-// InjectedEnvKeysFrom reads the declaration out of a KEY=VALUE slice. A
-// duplicate wins last, matching exec.Cmd.Env's own semantics.
+// InjectedEnvKeysFrom reads the declaration and the gateway refusal list out of
+// a KEY=VALUE slice. A duplicate wins last, matching exec.Cmd.Env's semantics.
 func InjectedEnvKeysFrom(entries []string) InjectedEnvKeySet {
-	prefix := InjectedEnvKeysVar + "="
+	return ParseInjectedEnvKeys(
+		lastEnvValue(entries, InjectedEnvKeysVar),
+		lastEnvValue(entries, GatewayUpstreamEnvKeysVar),
+	)
+}
+
+// InjectedEnvKeysFromMap is the map counterpart to InjectedEnvKeysFrom.
+func InjectedEnvKeysFromMap(entries map[string]string) InjectedEnvKeySet {
+	return ParseInjectedEnvKeys(entries[InjectedEnvKeysVar], entries[GatewayUpstreamEnvKeysVar])
+}
+
+// lastEnvValue returns the value of the last KEY=VALUE entry naming key, or ""
+// when key is absent. A bare key with no '=' is not a setting and is ignored.
+func lastEnvValue(entries []string, key string) string {
+	prefix := key + "="
 	value := ""
 	for _, entry := range entries {
 		if strings.HasPrefix(entry, prefix) {
 			value = entry[len(prefix):]
 		}
 	}
-	return ParseInjectedEnvKeys(value)
-}
-
-// InjectedEnvKeysFromMap reads the declaration out of a KEY->VALUE map. It is
-// the map counterpart to InjectedEnvKeysFrom.
-func InjectedEnvKeysFromMap(entries map[string]string) InjectedEnvKeySet {
-	return ParseInjectedEnvKeys(entries[InjectedEnvKeysVar])
+	return value
 }
 
 // IsRunnerOnly reports whether key is a host-side interactive attach control
@@ -174,12 +297,12 @@ func IsRunnerOnly(key string) bool {
 	switch key {
 	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL":
 		return true
-	case InjectedEnvKeysVar:
-		// The declaration addresses this package's own inherited-env filter,
-		// which is the supervisor's boundary and not the workload's. A child
-		// that could READ it would learn which credential names its supervisor
-		// injected; a child that could SET it would re-admit anything it liked
-		// into whatever it spawns next.
+	case InjectedEnvKeysVar, GatewayUpstreamEnvKeysVar:
+		// Both address this package's own inherited-env filter, which is the
+		// supervisor's boundary and not the workload's. A child that could READ
+		// the declaration would learn which credential names its supervisor
+		// injected; a child that could SET either one could re-admit anything it
+		// liked — or clear the gateway refusal — for whatever it spawns next.
 		return true
 	default:
 		return strings.HasPrefix(key, sessionShimEnvPrefix)

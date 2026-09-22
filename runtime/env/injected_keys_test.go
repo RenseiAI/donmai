@@ -1,6 +1,7 @@
 package env_test
 
 import (
+	"os"
 	"reflect"
 	"strings"
 	"testing"
@@ -113,6 +114,55 @@ func TestInheritedBlocklistHonoursTheDeclaration(t *testing.T) {
 				env.InjectedEnvKeysVar + "=*,GEMINI_,OPENAI_API_KEY_SUFFIX",
 			},
 			wantNot: []string{"GEMINI_API_KEY=shell-leak", "OPENAI_API_KEY=shell-leak"},
+		},
+		{
+			// The row that catches a future strings.EqualFold "fix". Env var
+			// names are case-sensitive on every platform donmai runs on, so a
+			// folded match would admit a name the supervisor never wrote.
+			name: "a name is matched case-sensitively",
+			parent: []string{
+				"GEMINI_API_KEY=shell-leak",
+				env.InjectedEnvKeysVar + "=gemini_api_key",
+			},
+			wantNot: []string{"GEMINI_API_KEY=shell-leak"},
+		},
+		{
+			name: "an isolation invariant is never declarable",
+			parent: []string{
+				"PATH=/usr/bin",
+				env.GatewayUpstreamAPIKeyEnv + "=upstream-secret",
+				env.GatewayUpstreamBaseURLEnv + "=https://upstream.invalid/v1",
+				env.InjectedEnvKeysVar + "=" + env.GatewayUpstreamAPIKeyEnv + "," + env.GatewayUpstreamBaseURLEnv,
+			},
+			want: []string{"PATH=/usr/bin"},
+			wantNot: []string{
+				env.GatewayUpstreamAPIKeyEnv + "=upstream-secret",
+				env.GatewayUpstreamBaseURLEnv + "=https://upstream.invalid/v1",
+			},
+		},
+		{
+			// The gateway's fallback path dials with OPENAI_API_KEY, which is
+			// an ordinarily-declarable name. Only the per-session refusal
+			// closes it.
+			name: "a gateway-named upstream credential is refused for this session",
+			parent: []string{
+				"PATH=/usr/bin",
+				"OPENAI_API_KEY=real-upstream-secret",
+				env.InjectedEnvKeysVar + "=OPENAI_API_KEY",
+				env.GatewayUpstreamEnvKeysVar + "=OPENAI_API_KEY," + env.GatewayUpstreamBaseURLEnv,
+			},
+			want:    []string{"PATH=/usr/bin"},
+			wantNot: []string{"OPENAI_API_KEY=real-upstream-secret"},
+		},
+		{
+			// ...and the same name stays declarable when no gateway named it,
+			// which is the case #529 exists to serve.
+			name: "the same name is admitted when no gateway named it",
+			parent: []string{
+				"OPENAI_API_KEY=daemon-injected",
+				env.InjectedEnvKeysVar + "=OPENAI_API_KEY",
+			},
+			want: []string{"OPENAI_API_KEY=daemon-injected"},
 		},
 	}
 
@@ -256,10 +306,7 @@ func TestParseInjectedEnvKeys(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 
-			set := env.ParseInjectedEnvKeys(tc.value)
-			if len(set) != len(tc.want) {
-				t.Fatalf("ParseInjectedEnvKeys(%q) has %d names, want %d", tc.value, len(set), len(tc.want))
-			}
+			set := env.ParseInjectedEnvKeys(tc.value, "")
 			for _, name := range tc.want {
 				if !set.Allows(name) {
 					t.Errorf("ParseInjectedEnvKeys(%q).Allows(%q) = false, want true", tc.value, name)
@@ -271,11 +318,11 @@ func TestParseInjectedEnvKeys(t *testing.T) {
 		})
 	}
 
-	if got := env.InjectedEnvKeysFrom(nil); got != nil {
-		t.Errorf("InjectedEnvKeysFrom(nil) = %v, want nil", got)
+	if env.InjectedEnvKeysFrom(nil).Allows("GEMINI_API_KEY") {
+		t.Error("InjectedEnvKeysFrom(nil) admitted a name")
 	}
-	if got := env.InjectedEnvKeysFromMap(nil); got != nil {
-		t.Errorf("InjectedEnvKeysFromMap(nil) = %v, want nil", got)
+	if env.InjectedEnvKeysFromMap(nil).Allows("GEMINI_API_KEY") {
+		t.Error("InjectedEnvKeysFromMap(nil) admitted a name")
 	}
 	// exec.Cmd.Env resolves a duplicate to the LAST entry; the declaration
 	// must be read the same way or the filter disagrees with the child's view.
@@ -286,11 +333,77 @@ func TestParseInjectedEnvKeys(t *testing.T) {
 	if last.Allows("GEMINI_API_KEY") || !last.Allows("OPENAI_API_KEY") {
 		t.Errorf("InjectedEnvKeysFrom did not take the last duplicate: %v", last)
 	}
-	// A nil set answers every question with "not declared".
+	// The zero value answers every question with "not declared".
 	var none env.InjectedEnvKeySet
 	if none.Allows("GEMINI_API_KEY") {
-		t.Error("a nil InjectedEnvKeySet admitted a name")
+		t.Error("the zero InjectedEnvKeySet admitted a name")
 	}
+	// The gateway refusal list is read from the same slice, last-wins too.
+	gw := env.InjectedEnvKeysFrom([]string{
+		env.InjectedEnvKeysVar + "=OPENAI_API_KEY",
+		env.GatewayUpstreamEnvKeysVar + "=SOMETHING_ELSE",
+		env.GatewayUpstreamEnvKeysVar + "=OPENAI_API_KEY",
+	})
+	if gw.Allows("OPENAI_API_KEY") {
+		t.Error("InjectedEnvKeysFrom did not apply the last gateway refusal list")
+	}
+}
+
+// TestIsolationInvariantsAreASubsetOfTheBlocklist keeps the two lists honest:
+// a never-declarable name that is not blocked in the first place would be a
+// refusal with nothing to refuse, and a blocked name silently dropped from the
+// invariants would become declarable.
+func TestIsolationInvariantsAreASubsetOfTheBlocklist(t *testing.T) {
+	t.Parallel()
+
+	blocked := make(map[string]struct{}, len(env.AgentEnvBlocklist))
+	for _, key := range env.AgentEnvBlocklist {
+		blocked[key] = struct{}{}
+	}
+	for _, key := range env.AgentEnvIsolationInvariants {
+		if _, ok := blocked[key]; !ok {
+			t.Errorf("%q is an isolation invariant but not in AgentEnvBlocklist", key)
+		}
+	}
+	// Written out literally rather than iterated from the source list, so
+	// deleting an entry fails here instead of passing vacuously.
+	want := []string{"DONMAI_GATEWAY_UPSTREAM_API_KEY", "DONMAI_GATEWAY_UPSTREAM_BASE_URL"}
+	if !reflect.DeepEqual(env.AgentEnvIsolationInvariants, want) {
+		t.Errorf("AgentEnvIsolationInvariants = %v, want %v", env.AgentEnvIsolationInvariants, want)
+	}
+	declared := env.ParseInjectedEnvKeys(strings.Join(want, ","), "")
+	for _, key := range want {
+		if declared.Allows(key) {
+			t.Errorf("a declaration re-admitted the isolation invariant %q", key)
+		}
+	}
+}
+
+// TestDeclareGatewayUpstreamEnvKeys covers the producer side: the gateway
+// publishes the names into its own process and every filter reads them back.
+func TestDeclareGatewayUpstreamEnvKeys(t *testing.T) {
+	// Not parallel: it mutates the process environment.
+	t.Setenv(env.GatewayUpstreamEnvKeysVar, "")
+	t.Setenv(env.InjectedEnvKeysVar, "OPENAI_API_KEY")
+	t.Setenv("OPENAI_API_KEY", "real-upstream-secret")
+
+	if !composedChildEnvContains("OPENAI_API_KEY=real-upstream-secret") {
+		t.Fatal("precondition: a declared name should be admitted before the gateway names it")
+	}
+	if err := env.DeclareGatewayUpstreamEnvKeys(" OPENAI_API_KEY ", "", env.GatewayUpstreamBaseURLEnv); err != nil {
+		t.Fatalf("DeclareGatewayUpstreamEnvKeys: %v", err)
+	}
+	if got := os.Getenv(env.GatewayUpstreamEnvKeysVar); got != "OPENAI_API_KEY,"+env.GatewayUpstreamBaseURLEnv {
+		t.Errorf("%s = %q, want the trimmed non-empty names", env.GatewayUpstreamEnvKeysVar, got)
+	}
+	if composedChildEnvContains("OPENAI_API_KEY=real-upstream-secret") {
+		t.Error("the gateway upstream credential reached the child after being named")
+	}
+	// The marker itself is runner-only and must not reach the child either.
+	if !env.IsRunnerOnly(env.GatewayUpstreamEnvKeysVar) {
+		t.Errorf("env.IsRunnerOnly(%q) = false, want true", env.GatewayUpstreamEnvKeysVar)
+	}
+	assertNoDeclaration(t, "ComposeChildEnv after DeclareGatewayUpstreamEnvKeys", env.ComposeChildEnv(os.Environ()))
 }
 
 func contains(entries []string, want string) bool {
@@ -302,11 +415,20 @@ func contains(entries []string, want string) bool {
 	return false
 }
 
+// composedChildEnvContains composes a child environment from the CURRENT
+// process environment and reports whether want survived it. It is how the
+// gateway producer test observes the filter the way a real spawn would.
+func composedChildEnvContains(want string) bool {
+	return contains(env.ComposeChildEnv(os.Environ()), want)
+}
+
 func assertNoDeclaration(t *testing.T, where string, entries []string) {
 	t.Helper()
 	for _, entry := range entries {
-		if strings.HasPrefix(entry, env.InjectedEnvKeysVar+"=") || entry == env.InjectedEnvKeysVar {
-			t.Errorf("%s leaked the declaration %q into the child environment", where, entry)
+		for _, runnerOnly := range []string{env.InjectedEnvKeysVar, env.GatewayUpstreamEnvKeysVar} {
+			if strings.HasPrefix(entry, runnerOnly+"=") || entry == runnerOnly {
+				t.Errorf("%s leaked the runner-only control %q into the child environment", where, entry)
+			}
 		}
 	}
 }

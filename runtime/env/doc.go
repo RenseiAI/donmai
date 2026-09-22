@@ -27,11 +27,18 @@
 // declares, by NAME only, which inherited names are its own; a declared name
 // crosses the blocklist, and everything else behaves exactly as before.
 //
-// The declaration re-admits AGENT_ENV_BLOCKLIST names ONLY. IsRunnerOnly names
-// (the attach controls, the session-shim launch contract, and the declaration
-// variable itself) are stripped from every layer regardless — they address the
-// supervisor of the process that would receive them, so no supervisor hands
-// them down.
+// The declaration re-admits SHELL-LEAK AGENT_ENV_BLOCKLIST names only. Three
+// classes are refused regardless of what it says: IsRunnerOnly names (the
+// attach controls, the session-shim launch contract, and the two declaration
+// variables themselves), AgentEnvIsolationInvariants (the gateway cell's
+// upstream credential and route), and whatever the gateway named for this
+// session through GatewayUpstreamEnvKeysVar. See InjectedEnvKeySet.Allows.
+//
+// Provenance matters as much as the refusals: the declaration is trusted from a
+// supervising PARENT PROCESS only. The daemon strips runner-owned names from
+// every caller-supplied env map before composing a worker environment, and the
+// CLI skips them when applying dotenv files, so neither an orchestrator work
+// item nor a repository .env can author one.
 //
 // Source: ../donmai-libraries/packages/core/src/orchestrator/orchestrator.ts
 // (AGENT_ENV_BLOCKLIST) — port verbatim per F.1.1 §1.
