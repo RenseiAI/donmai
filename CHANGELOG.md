@@ -10,6 +10,39 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.44 — 2026-09-23
+
+### Features
+
+- Let a supervising daemon declare injected environment variable names
+  (`DONMAI_INJECTED_ENV_KEYS`, names only) so per-session credentials cross the
+  inherited-env blocklist into the harness child. The declaration is
+  runner-only, stripped from work-item and dotenv input, and can never
+  re-admit runner-only names, isolation invariants, or a session's gateway
+  upstream credentials. (#662)
+- Add capability realization selection: a selection codec, a standalone
+  selection producer, and a dual realization selection consumer that verifies
+  the selected realization against the host receipt and isolates protected
+  materialization per work item. (#651, #653, #654, #655)
+- Add protected MCP v2 execution-cell codecs and carry v2 materializations
+  through preflight. (#648, #649)
+- Add a refreshable protected MCP header helper bound at spawn, with a
+  native-proved refreshable Codex MCP profile. (#650)
+- Add parameter-bound realization contracts and prepare parameter-bound native
+  capability delivery. (#644, #645)
+- Prepare the native code-intelligence policy projection. (#647)
+- Report durable pre-spawn denials as typed, correlated nacks. (#646)
+- Transport the poll claim-attempt proof and reject ambiguous work-proof
+  bindings. (#643)
+
+### Fixes
+
+- Fail closed when the CLI MCP config writer is given a protected header
+  helper it cannot realize, so a saved MCP OAuth token can no longer act as a
+  second authorization authority. (#663)
+- Restore orphan tracking after controller loss, serialize the adoption
+  handoff, and replay retained exits. (#652)
+
 ## v0.72.43 — 2026-09-16
 
 ### Features
