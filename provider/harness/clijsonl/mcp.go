@@ -71,6 +71,9 @@ func writeMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]strin
 	if len(servers) == 0 {
 		return "", nil
 	}
+	if err := refuseUnrealizedProtectedHeadersHelper(servers); err != nil {
+		return "", err
+	}
 
 	cfg, err := mcp.BuildConfigFile(servers)
 	if err != nil {
@@ -111,6 +114,25 @@ func writeMCPConfigWithEnv(servers []agent.MCPServerConfig, env map[string]strin
 		return "", fmt.Errorf("provider/claude: resolve MCP tmpfile path: %w", err)
 	}
 	return abs, nil
+}
+
+// refuseUnrealizedProtectedHeadersHelper fails closed when a server carries
+// process-owned protected header-helper authority. That authority lives in an
+// unserialized field, so mcp.BuildConfigFile would silently drop it and write an
+// HTTP entry with neither a static Authorization header nor a headersHelper.
+// Claude Code builds its OAuth provider for exactly that shape: with no
+// Authorization from config or helper it consults the saved MCP OAuth store
+// (keyed by server name plus a digest of type, URL and headers), so a token the
+// operator once saved for a same-named server would become a second
+// Authorization authority. Refusing here keeps the only admitted authority the
+// one the runner minted until this writer can realize the protected helper.
+func refuseUnrealizedProtectedHeadersHelper(servers []agent.MCPServerConfig) error {
+	for _, server := range servers {
+		if _, ok := agent.ProtectedRuntimeMCPHeadersHelper(server); ok {
+			return fmt.Errorf("provider/claude: MCP server %q carries a protected header helper this config writer cannot realize", server.Name)
+		}
+	}
+	return nil
 }
 
 // preferLiveGatewayHeader changes only the runner-authored gateway entry. The
