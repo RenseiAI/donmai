@@ -345,3 +345,51 @@ func TestWriteMCPConfig_DoesNotAliasInputs(t *testing.T) {
 		t.Errorf("on-disk body aliased caller mutations: %s", body)
 	}
 }
+
+// A protected header helper is unserialized authority. Dropping it would write
+// an HTTP entry with no Authorization source, which the Claude CLI answers by
+// consulting its saved MCP OAuth store. The writer must refuse instead, and
+// must write nothing.
+func TestWriteMCPConfig_RefusesUnrealizedProtectedHeadersHelper(t *testing.T) {
+	plain := agent.MCPServerConfig{Name: "gateway-platform", Type: "http", URL: "https://example.test/mcp/s1"}
+	protected, err := agent.WithProtectedRuntimeMCPHeadersHelper(plain, "/usr/local/bin/helper mcp gateway-headers")
+	if err != nil {
+		t.Fatalf("WithProtectedRuntimeMCPHeadersHelper: %v", err)
+	}
+	stdio := agent.MCPServerConfig{Name: "local", Command: "/bin/true"}
+
+	tests := []struct {
+		name    string
+		servers []agent.MCPServerConfig
+		env     map[string]string
+		wantErr bool
+	}{
+		{name: "plain http server is written", servers: []agent.MCPServerConfig{plain}},
+		{name: "protected helper alone is refused", servers: []agent.MCPServerConfig{protected}, wantErr: true},
+		{name: "protected helper among others is refused", servers: []agent.MCPServerConfig{stdio, protected}, wantErr: true},
+		{name: "protected helper refused with live token file", servers: []agent.MCPServerConfig{protected}, env: map[string]string{mcpGatewayFileEnv: "/tmp/token"}, wantErr: true},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("TMPDIR", t.TempDir())
+			path, err := WriteMCPConfigWithEnv(tc.servers, tc.env)
+			t.Cleanup(func() { _ = RemoveMCPConfig(path) })
+			if tc.wantErr {
+				if err == nil || !strings.Contains(err.Error(), "protected header helper") {
+					t.Fatalf("err = %v, want protected header helper refusal", err)
+				}
+				if path != "" {
+					t.Fatalf("path = %q, want no file on refusal", path)
+				}
+				matches, _ := filepath.Glob(filepath.Join(os.TempDir(), "donmai-claude-mcp-*.json"))
+				if len(matches) != 0 {
+					t.Fatalf("refusal left config files behind: %v", matches)
+				}
+				return
+			}
+			if err != nil || path == "" {
+				t.Fatalf("WriteMCPConfigWithEnv = (%q, %v), want a written file", path, err)
+			}
+		})
+	}
+}
