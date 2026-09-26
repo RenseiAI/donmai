@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.45 — 2026-09-26
+
 ### Features
 
 - Add `arch assess --require-diff` for automated native assessments. Missing
@@ -22,6 +26,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - Preserve bounded, redacted Codex app-server diagnostics by joining stderr
   capture before announcing process exit and collecting setup errors after
   cleanup finishes.
+
+### Chores
+
+- Add private security reporting guidance, a code of conduct, bug/feature/harness
+  issue forms, a pull-request template, and public contributor-credit guidance.
+- Synchronize the OpenCode permission fixture on observable decision events
+  before injecting the terminal result.
 
 ## v0.72.44 — 2026-09-23
 
