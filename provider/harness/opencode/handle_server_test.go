@@ -174,18 +174,31 @@ func TestServerHandle_PermissionRoundTrip(t *testing.T) {
 		t.Fatalf("start: %v", err)
 	}
 
-	// Wait for the pump to adjudicate both requests.
-	deadline := time.Now().Add(3 * time.Second)
-	for {
-		_, denyDone := fc.replyOf("p-deny")
-		_, allowDone := fc.replyOf("p-allow")
-		if denyDone && allowDone {
-			break
+	// A recorded HTTP reply precedes the pump's observable decision event.
+	// Wait on the public event stream before injecting the terminal event:
+	// drainHandle deliberately stops there, just as a real consumer does.
+	var events []agent.Event
+	observed := make(map[string]bool)
+	permissionCtx, permissionCancel := context.WithTimeout(ctx, 3*time.Second)
+	defer permissionCancel()
+	defer func() { _ = h.Stop(context.Background()) }()
+	for !observed["p-deny"] || !observed["p-allow"] {
+		select {
+		case ev, ok := <-h.Events():
+			if !ok {
+				t.Fatal("event stream closed before both permission decisions")
+			}
+			events = append(events, ev)
+			if decision, ok := ev.(agent.SystemEvent); ok && decision.Subtype == "permission_decision" {
+				request, ok := decision.Raw.(permissionRequest)
+				if !ok {
+					t.Fatalf("permission decision has no request identity: %#v", decision.Raw)
+				}
+				observed[request.ID] = true
+			}
+		case <-permissionCtx.Done():
+			t.Fatalf("permission decisions not observed within deadline: %v", observed)
 		}
-		if time.Now().After(deadline) {
-			t.Fatal("permissions not adjudicated within deadline")
-		}
-		time.Sleep(10 * time.Millisecond)
 	}
 	if r, _ := fc.replyOf("p-deny"); r.Reply != replyReject {
 		t.Errorf("p-deny reply = %q, want reject (safety deny)", r.Reply)
@@ -196,7 +209,7 @@ func TestServerHandle_PermissionRoundTrip(t *testing.T) {
 
 	// End the session and confirm the pump surfaced observability SystemEvents.
 	fc.push(evt("t", evStepEnded, map[string]any{"sessionID": fc.sessionID, "finish": "stop"}))
-	events := drainHandle(ctx, h)
+	events = append(events, drainHandle(ctx, h)...)
 	var decisions int
 	for _, ev := range events {
 		if se, ok := ev.(agent.SystemEvent); ok && se.Subtype == "permission_decision" {
