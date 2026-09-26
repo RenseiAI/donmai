@@ -179,3 +179,63 @@ func (p *Provider) preflightCatalogCheck(ctx context.Context, probe catalogProbe
 	return fmt.Errorf("%w: pi has no built-in model %q for provider %q in its catalog (checked with `pi --list-models %s/%s`); the resolved pin would 400 on its first turn",
 		agent.ErrSpawnFailed, model, provider, provider, model)
 }
+
+// promoteAggregatorPin selects pi's own built-in aggregator provider for an
+// aggregator-bound session when, and only when, pi's catalog lists the exact
+// slug. spec.Model must be the aggregator's whole "<author>/<model>" slug on
+// a non-loopback binding whose BaseURL is the aggregator's own https host
+// (builtinAggregatorForBaseURL). On a confirmed match the pin is rewritten to
+// "<aggregator>/<slug>" — which nativeProviderPin then routes natively — and
+// the cell key is mirrored onto the aggregator's own credential env var.
+//
+// Every other outcome leaves spec unchanged, so the session stays on the
+// injected provider with the whole slug against the bound BaseURL: a slug
+// newer than pi's bundled catalog, an unprefixed model id, no probe (no real
+// binary), or a probe error. The injected route works for any model the
+// aggregator serves; the native route only adds pi's own model metadata.
+func (p *Provider) promoteAggregatorPin(ctx context.Context, spec agent.Spec) (agent.Spec, bool) {
+	ep := spec.Endpoint
+	if ep == nil || ep.Host == agent.HostGateway || spec.Model == "" {
+		return spec, false
+	}
+	agg, ok := builtinAggregatorForBaseURL(ep.BaseURL)
+	if !ok || strings.HasPrefix(spec.Model, agg+"/") {
+		return spec, false
+	}
+	probe := p.resolveCatalogProbe()
+	if probe == nil {
+		return spec, false
+	}
+	credEnvVar := builtinProviderCredentialEnv[agg]
+	key := spec.Env[credEnvVar]
+	if key == "" {
+		key = pickAPIKey(ep.Env)
+	}
+	if key == "" {
+		key = spec.Env[PiKeyEnvVar]
+	}
+	timeout := p.opts.CatalogProbeTimeout
+	if timeout == 0 {
+		timeout = DefaultCatalogProbeTimeout
+	}
+	pctx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	raw, err := probe(pctx, p.binary, agg, spec.Model, credEnvVar, key)
+	if err != nil {
+		slog.Warn("pi aggregator catalog probe failed; using the injected provider", "provider", agg, "model", spec.Model, "error", err)
+		return spec, false
+	}
+	if !catalogHasModel(raw, agg, spec.Model) {
+		return spec, false
+	}
+	env := make(map[string]string)
+	for k, v := range spec.Env {
+		env[k] = v
+	}
+	if _, already := env[credEnvVar]; !already && key != "" {
+		env[credEnvVar] = key
+	}
+	spec.Env = env
+	spec.Model = agg + "/" + spec.Model
+	return spec, true
+}
