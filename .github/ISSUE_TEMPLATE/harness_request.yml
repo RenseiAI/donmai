@@ -1,0 +1,31 @@
+name: Harness request
+description: Request support for an agent harness or a missing harness capability.
+title: "harness: "
+body:
+  - type: input
+    id: harness
+    attributes:
+      label: Harness name and public documentation
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: Harness version
+      description: Include an exact version and your operating system.
+    validations:
+      required: true
+  - type: textarea
+    id: needs
+    attributes:
+      label: What it needs to do
+      description: Describe the desired session mode, tools, authentication method, and other required capabilities. Never include credentials.
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How to verify support
+      description: Provide a minimal task and the observable result you expect.
+    validations:
+      required: true

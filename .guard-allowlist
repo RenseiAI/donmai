@@ -23,6 +23,12 @@
 # `/api/cl[i]/`) — the same convention scripts/guard-b-lint.sh and its own
 # .guard-allowlist use.
 
+# SECURITY.md: maintainer-confirmed, monitored private disclosure mailbox.
+# This exact public contact is parent-company attribution, not a runtime
+# dependency or a reference to a private implementation.
+BRAND_NAME :: ^SECURITY\.md: :: rens[e]i :: ^Email \[security@rens[e]i\.ai\]\(mailto:security@rens[e]i\.ai\) with suspected security$
+PARENT_DOMAIN :: ^SECURITY\.md: :: rens[e]i\.ai :: ^Email \[security@rens[e]i\.ai\]\(mailto:security@rens[e]i\.ai\) with suspected security$
+
 # daemon/kit_registry.go: the parsed-manifest `Requires` struct carries a
 # `[requires].rens[e]i` version-compatibility field, pre-existing and
 # unrelated to any change that touches this file incidentally (e.g. adding
