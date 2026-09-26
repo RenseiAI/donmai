@@ -227,6 +227,14 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 	// pin routes NATIVELY through one of pi's built-in providers (see
 	// nativeProviderPin) but that exact (provider, model) pair is not in
 	// pi's own catalog — instead of finding out on the first turn's 400.
+	//
+	// An aggregator endpoint is first given the chance to route through pi's
+	// own aggregator provider (promoteAggregatorPin); that promotion already
+	// ran the same catalog query, so the preflight below is skipped for it.
+	spec, promoted := p.promoteAggregatorPin(ctx, spec)
+	if promoted {
+		return spec, nil
+	}
 	if provider, bareModel, useNative := nativeProviderPin(spec.Model, spec.Endpoint); useNative {
 		if probe := p.resolveCatalogProbe(); probe != nil {
 			credEnvVar := builtinProviderCredentialEnv[provider]

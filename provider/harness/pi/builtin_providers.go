@@ -97,44 +97,98 @@ func splitBuiltinProviderPin(pin string) (provider, model string, ok bool) {
 	return provider, model, true
 }
 
-// builtinAggregatorProviderByHost maps the serving hostname of each of pi's
-// built-in AGGREGATOR providers to that provider's slug. An aggregator is a
-// built-in provider whose own catalog ids are themselves "<author>/<model>"
-// slugs (e.g. pi's vercel-ai-gateway catalog lists
-// "anthropic/claude-sonnet-4.6", served from https://ai-gateway.vercel.sh
-// over the anthropic-messages API; openrouter lists "anthropic/…" ids served
-// from https://openrouter.ai/api/v1). Transcribed from the bundled
-// @earendil-works/pi-ai providers/vercel-ai-gateway.js and openrouter.js of
-// the pinned-adjacent binary.
+// builtinProviderServingHost maps each built-in provider that pi serves from
+// one fixed https endpoint to that endpoint's hostname, transcribed from the
+// baseUrl each bundled @earendil-works/pi-ai providers/<name>.js of the
+// pinned-adjacent binary registers. Providers whose endpoint is templated per
+// account or region (amazon-bedrock, azure-openai-responses, the cloudflare
+// pair) or not shipped as a fixed URL (the qwen token plans) are absent.
 //
-// It exists because a control plane that binds an aggregator endpoint sends
-// the aggregator's own model slug verbatim (Endpoint.Model
-// "anthropic/claude-sonnet-4.6", Endpoint.BaseURL
-// "https://ai-gateway.vercel.sh/v1"). Read as a pi pin, that slug's first
-// segment names pi's DIRECT "anthropic" provider — whose catalog spells the
-// same model "claude-sonnet-4-6" and whose endpoint is api.anthropic.com —
-// so routing on the prefix alone would both fail the catalog preflight and,
-// were it to pass, send the aggregator key to the wrong vendor. The binding's
-// serving host, not the model slug's author segment, decides which built-in
-// provider serves the session.
-var builtinAggregatorProviderByHost = map[string]string{
-	"ai-gateway.vercel.sh": "vercel-ai-gateway",
-	"openrouter.ai":        "openrouter",
+// It decides whether a bound endpoint IS the built-in provider's own
+// endpoint (nativeProviderPin). pi's native route talks to the provider's
+// own endpoint and ignores the binding's BaseURL, so it is only correct when
+// the two agree; any other BaseURL must go through the injected provider,
+// which is registered against the BaseURL itself.
+var builtinProviderServingHost = map[string]string{ //nolint:gosec // G101: map values are public API hostnames, never credential bytes.
+	"anthropic":             "api.anthropic.com",
+	"ant-ling":              "api.ant-ling.com",
+	"openai":                "api.openai.com",
+	"deepseek":              "api.deepseek.com",
+	"nvidia":                "integrate.api.nvidia.com",
+	"google":                "generativelanguage.googleapis.com",
+	"mistral":               "api.mistral.ai",
+	"groq":                  "api.groq.com",
+	"cerebras":              "api.cerebras.ai",
+	"xai":                   "api.x.ai",
+	"openrouter":            "openrouter.ai",
+	"vercel-ai-gateway":     "ai-gateway.vercel.sh",
+	"zai":                   "api.z.ai",
+	"zai-coding-cn":         "open.bigmodel.cn",
+	"opencode":              "opencode.ai",
+	"opencode-go":           "opencode.ai",
+	"huggingface":           "router.huggingface.co",
+	"fireworks":             "api.fireworks.ai",
+	"together":              "api.together.ai",
+	"kimi-coding":           "api.kimi.com",
+	"minimax":               "api.minimax.io",
+	"minimax-cn":            "api.minimaxi.com",
+	"xiaomi":                "api.xiaomimimo.com",
+	"xiaomi-token-plan-cn":  "token-plan-cn.xiaomimimo.com",
+	"xiaomi-token-plan-ams": "token-plan-ams.xiaomimimo.com",
+	"xiaomi-token-plan-sgp": "token-plan-sgp.xiaomimimo.com",
 }
 
-// builtinAggregatorForBaseURL reports the built-in aggregator provider whose
-// serving host baseURL names, or ok=false for an empty, unparseable, or
-// non-aggregator URL. Only https URLs match: every aggregator above is served
-// over TLS, and a plain-http URL naming one of these hosts is not the
-// provider's own endpoint.
-func builtinAggregatorForBaseURL(baseURL string) (provider string, ok bool) {
+// builtinAggregatorProviders is the subset of built-in providers that are
+// AGGREGATORS: their own catalog ids are themselves "<author>/<model>" slugs
+// (pi's vercel-ai-gateway catalog lists "anthropic/claude-sonnet-4.6", served
+// over the anthropic-messages API; openrouter lists "anthropic/…" ids too).
+//
+// A control plane that binds an aggregator endpoint sends the aggregator's
+// own slug verbatim (Endpoint.Model "anthropic/claude-sonnet-4.6",
+// Endpoint.BaseURL "https://ai-gateway.vercel.sh/v1"). Read as a pi pin, that
+// slug's first segment names pi's DIRECT "anthropic" provider, whose catalog
+// spells the model "claude-sonnet-4-6" and whose endpoint is
+// api.anthropic.com. The slug must therefore stay whole on an aggregator
+// endpoint, and the aggregator itself is only selected natively once pi's
+// catalog confirms it carries the exact slug (Provider.promoteAggregatorPin).
+var builtinAggregatorProviders = map[string]bool{
+	"vercel-ai-gateway": true,
+	"openrouter":        true,
+}
+
+// httpsHostname returns the lower-cased hostname of an absolute https URL, or
+// ok=false for anything else. Plain http never matches a built-in provider:
+// every fixed endpoint above is served over TLS.
+func httpsHostname(baseURL string) (string, bool) {
 	if baseURL == "" {
 		return "", false
 	}
 	u, err := url.Parse(baseURL)
-	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
 		return "", false
 	}
-	provider, ok = builtinAggregatorProviderByHost[strings.ToLower(u.Hostname())]
-	return provider, ok
+	return strings.ToLower(u.Hostname()), true
+}
+
+// baseURLIsProviderHost reports whether baseURL is an https URL on provider's
+// own serving host (exact hostname match; no suffix or subdomain matching).
+func baseURLIsProviderHost(baseURL, provider string) bool {
+	want, known := builtinProviderServingHost[provider]
+	if !known {
+		return false
+	}
+	host, ok := httpsHostname(baseURL)
+	return ok && host == want
+}
+
+// builtinAggregatorForBaseURL reports the built-in aggregator provider whose
+// own serving host baseURL names, or ok=false for an empty, unparseable,
+// non-https, or non-aggregator URL.
+func builtinAggregatorForBaseURL(baseURL string) (provider string, ok bool) {
+	for agg := range builtinAggregatorProviders {
+		if baseURLIsProviderHost(baseURL, agg) {
+			return agg, true
+		}
+	}
+	return "", false
 }

@@ -57,7 +57,8 @@ func TestBuiltinAggregatorForBaseURL(t *testing.T) {
 		{name: "host match is case-insensitive", baseURL: "https://AI-Gateway.Vercel.sh/v1", want: "vercel-ai-gateway", wantOK: true},
 		{name: "openrouter", baseURL: "https://openrouter.ai/api/v1", want: "openrouter", wantOK: true},
 		{name: "plain http is not the provider's endpoint", baseURL: "http://ai-gateway.vercel.sh/v1", wantOK: false},
-		{name: "look-alike subdomain", baseURL: "https://ai-gateway.vercel.sh.example.invalid/v1", wantOK: false},
+		{name: "look-alike suffix host", baseURL: "https://ai-gateway.vercel.sh.evil.example/v1", wantOK: false},
+		{name: "look-alike subdomain", baseURL: "https://x.ai-gateway.vercel.sh/v1", wantOK: false},
 		{name: "direct vendor endpoint", baseURL: "https://api.z.ai/api/coding/paas/v4", wantOK: false},
 		{name: "loopback gateway", baseURL: "http://127.0.0.1:7734/v1", wantOK: false},
 		{name: "empty", baseURL: "", wantOK: false},
@@ -74,208 +75,231 @@ func TestBuiltinAggregatorForBaseURL(t *testing.T) {
 	}
 }
 
-// TestNativeProviderPin_AggregatorEndpoint proves the serving host, not the
-// model slug's author segment, selects the built-in provider: the gateway
-// slug "anthropic/claude-sonnet-4.6" on the gateway's base URL routes to
-// pi's vercel-ai-gateway provider with the slug kept whole, never to pi's
-// direct anthropic provider with "claude-sonnet-4.6".
-func TestNativeProviderPin_AggregatorEndpoint(t *testing.T) {
+// TestModelRouting_BoundEndpoint pins the whole routing rule for a pin on a
+// bound (non-loopback) endpoint, through all three consumers: the argv both
+// spawn modes share (modelPinArgs), the injected provider's registered model
+// id (providerPinEnv), and the credential mirror (applyEndpoint). The key
+// arrives in the dispatch-wire shape: DONMAI_PI_KEY on Spec.Env, no binding
+// Env. Native routing, and a vendor env var carrying the key, happen only on
+// the provider's own https host; every other BaseURL stays on the injected
+// provider and no vendor env var is set.
+func TestModelRouting_BoundEndpoint(t *testing.T) {
 	t.Parallel()
+	vendorVars := []string{"ANTHROPIC_API_KEY", "OPENAI_API_KEY", "AI_GATEWAY_API_KEY", "OPENROUTER_API_KEY", "ZAI_API_KEY"}
 	cases := []struct {
-		name         string
-		model        string
-		ep           *agent.EndpointBinding
-		wantProvider string
-		wantModel    string
-		wantNative   bool
+		name          string
+		model         string
+		baseURL       string
+		wantArgs      []string
+		wantPinModel  string
+		wantVendorVar string // "" = no vendor var may be set
 	}{
 		{
-			name: "vercel gateway anthropic slug", model: aggregatorGatewayModel, ep: aggregatorGatewayBinding(),
-			wantProvider: "vercel-ai-gateway", wantModel: aggregatorGatewayModel, wantNative: true,
+			name:  "gateway slug before catalog promotion stays on the injected provider, whole",
+			model: aggregatorGatewayModel, baseURL: aggregatorGatewayBaseURL,
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", aggregatorGatewayModel}, wantPinModel: aggregatorGatewayModel,
 		},
 		{
-			name: "vercel gateway openai slug", model: "openai/gpt-5.4", ep: aggregatorGatewayBinding(),
-			wantProvider: "vercel-ai-gateway", wantModel: "openai/gpt-5.4", wantNative: true,
+			name:  "promoted gateway pin routes natively with the gateway key",
+			model: "vercel-ai-gateway/" + aggregatorGatewayModel, baseURL: aggregatorGatewayBaseURL,
+			wantArgs: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel}, wantPinModel: aggregatorGatewayModel,
+			wantVendorVar: "AI_GATEWAY_API_KEY",
 		},
 		{
-			name: "pin already carrying the aggregator's own prefix", model: "vercel-ai-gateway/" + aggregatorGatewayModel, ep: aggregatorGatewayBinding(),
-			wantProvider: "vercel-ai-gateway", wantModel: aggregatorGatewayModel, wantNative: true,
+			name:  "gateway model newer than pi's catalog (non-builtin author) stays injected, whole",
+			model: "meta/muse-spark-1.3-contributor", baseURL: aggregatorGatewayBaseURL,
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "meta/muse-spark-1.3-contributor"}, wantPinModel: "meta/muse-spark-1.3-contributor",
 		},
 		{
-			name: "openrouter slug", model: "anthropic/claude-sonnet-4.6",
-			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://openrouter.ai/api/v1"},
-			wantProvider: "openrouter", wantModel: "anthropic/claude-sonnet-4.6", wantNative: true,
+			name:  "unprefixed model on the gateway stays injected",
+			model: "gpt-5.4", baseURL: aggregatorGatewayBaseURL,
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "gpt-5.4"}, wantPinModel: "gpt-5.4",
 		},
 		{
-			name: "same slug with no endpoint keeps the prefix-split behavior", model: aggregatorGatewayModel, ep: nil,
-			wantProvider: "anthropic", wantModel: "claude-sonnet-4.6", wantNative: true,
+			name:  "promoted openrouter pin routes natively with the openrouter key",
+			model: "openrouter/anthropic/claude-sonnet-4.6", baseURL: "https://openrouter.ai/api/v1",
+			wantArgs: []string{"--provider", "openrouter", "--model", "anthropic/claude-sonnet-4.6"}, wantPinModel: "anthropic/claude-sonnet-4.6",
+			wantVendorVar: "OPENROUTER_API_KEY",
 		},
 		{
-			name: "loopback gateway host is never treated as an aggregator", model: aggregatorGatewayModel,
-			ep:           &agent.EndpointBinding{Host: agent.HostGateway, BaseURL: "http://127.0.0.1:7734/v1"},
-			wantProvider: "anthropic", wantModel: "claude-sonnet-4.6", wantNative: false,
+			name:  "direct vendor on its own host routes natively (unchanged)",
+			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/coding/paas/v4",
+			wantArgs: []string{"--provider", "zai", "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
+			wantVendorVar: "ZAI_API_KEY",
 		},
 		{
-			name: "direct vendor endpoint keeps the prefix-split behavior", model: "zai/glm-5.3",
-			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://api.z.ai/api/coding/paas/v4"},
-			wantProvider: "zai", wantModel: "glm-5.3", wantNative: true,
+			name:  "vendor-prefixed model on an unknown https proxy stays injected",
+			model: "anthropic/claude-sonnet-4-6", baseURL: "https://my-proxy.example.com/v1",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "claude-sonnet-4-6"}, wantPinModel: "claude-sonnet-4-6",
+		},
+		{
+			name:  "vendor-prefixed model on a look-alike gateway host stays injected",
+			model: "openai/gpt-5.4", baseURL: "https://ai-gateway.vercel.sh.evil.example/v1",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "gpt-5.4"}, wantPinModel: "gpt-5.4",
+		},
+		{
+			name:  "vendor-prefixed model on plain http gateway host stays injected",
+			model: "anthropic/claude-sonnet-4-6", baseURL: "http://ai-gateway.vercel.sh/v1",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "claude-sonnet-4-6"}, wantPinModel: "claude-sonnet-4-6",
+		},
+		{
+			name:  "vendor-prefixed model on plain http vendor host stays injected",
+			model: "anthropic/claude-sonnet-4-6", baseURL: "http://api.anthropic.com",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "claude-sonnet-4-6"}, wantPinModel: "claude-sonnet-4-6",
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			provider, model, native := nativeProviderPin(tc.model, tc.ep)
-			if provider != tc.wantProvider || model != tc.wantModel || native != tc.wantNative {
-				t.Errorf("nativeProviderPin(%q) = (%q, %q, %v), want (%q, %q, %v)",
-					tc.model, provider, model, native, tc.wantProvider, tc.wantModel, tc.wantNative)
+			ep := &agent.EndpointBinding{
+				Company: agent.CompanyOpenAI, BaseURL: tc.baseURL, Protocol: agent.ProtoOpenAIChat,
+				Host: agent.HostDirect, Auth: agent.AuthBYOK,
 			}
-		})
-	}
-}
-
-// TestModelPinArgs_AggregatorEndpoint pins the argv both spawn modes share
-// (rpcArgs and interactiveArgs call modelPinArgs).
-func TestModelPinArgs_AggregatorEndpoint(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name   string
-		effort agent.EffortLevel
-		want   []string
-	}{
-		{name: "no effort", want: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel}},
-		{name: "effort suffix applies to the whole slug", effort: agent.EffortHigh, want: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel + ":high"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			got := modelPinArgs(agent.Spec{Model: aggregatorGatewayModel, Effort: tc.effort, Endpoint: aggregatorGatewayBinding()})
-			if !reflect.DeepEqual(got, tc.want) {
-				t.Errorf("modelPinArgs = %q, want %q", got, tc.want)
-			}
-		})
-	}
-}
-
-// TestApplyEndpoint_AggregatorCredentialRouting covers both key-delivery
-// shapes. Over the dispatch wire the binding's Env is empty (json:"-") and
-// the resolved key arrives on Spec.Env, as DONMAI_PI_KEY alone or alongside
-// AI_GATEWAY_API_KEY; either way the aggregator's own env var must carry it
-// and the direct vendor's env var must not.
-func TestApplyEndpoint_AggregatorCredentialRouting(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name    string
-		specEnv map[string]string
-		epEnv   map[string]string
-	}{
-		{name: "wire shape, pi key only", specEnv: map[string]string{PiKeyEnvVar: "gw-key"}},
-		{name: "wire shape, both vars", specEnv: map[string]string{PiKeyEnvVar: "gw-key", "AI_GATEWAY_API_KEY": "gw-key"}},
-		{name: "in-process binding env", epEnv: map[string]string{"OPENAI_API_KEY": "gw-key"}},
-	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			ep := aggregatorGatewayBinding()
-			ep.Env = tc.epEnv
-			spec, err := applyEndpoint(agent.Spec{Model: aggregatorGatewayModel, Env: tc.specEnv, Endpoint: ep})
+			spec, err := applyEndpoint(agent.Spec{Model: tc.model, Env: map[string]string{PiKeyEnvVar: "wire-key"}, Endpoint: ep})
 			if err != nil {
 				t.Fatalf("applyEndpoint: %v", err)
 			}
-			if got := spec.Env["AI_GATEWAY_API_KEY"]; got != "gw-key" {
-				t.Errorf("AI_GATEWAY_API_KEY = %q, want the resolved gateway key", got)
+			if got := modelPinArgs(spec); !reflect.DeepEqual(got, tc.wantArgs) {
+				t.Errorf("modelPinArgs = %q, want %q", got, tc.wantArgs)
 			}
-			if _, leaked := spec.Env["ANTHROPIC_API_KEY"]; leaked {
-				t.Errorf("gateway key mirrored onto the direct vendor's ANTHROPIC_API_KEY: %v", spec.Env)
+			if env, want := providerPinEnv(spec), piModelEnvVar+"="+tc.wantPinModel; !slices.Contains(env, want) {
+				t.Errorf("providerPinEnv = %v, want it to contain %q", env, want)
 			}
-			if spec.Model != aggregatorGatewayModel {
-				t.Errorf("spec.Model = %q, want %q", spec.Model, aggregatorGatewayModel)
+			for _, v := range vendorVars {
+				got, set := spec.Env[v]
+				switch {
+				case v == tc.wantVendorVar && got != "wire-key":
+					t.Errorf("%s = %q, want the wire key", v, got)
+				case v != tc.wantVendorVar && set:
+					t.Errorf("%s must not be set on this route, got %q", v, got)
+				}
 			}
 		})
 	}
 }
 
-// TestProviderPinEnv_AggregatorKeepsWholeSlug proves the injected provider's
-// registered model id is the aggregator's wire model code, unstripped.
-func TestProviderPinEnv_AggregatorKeepsWholeSlug(t *testing.T) {
-	t.Parallel()
-	env := providerPinEnv(agent.Spec{Model: aggregatorGatewayModel, Endpoint: aggregatorGatewayBinding()})
-	want := piModelEnvVar + "=" + aggregatorGatewayModel
-	if !slices.Contains(env, want) {
-		t.Errorf("providerPinEnv = %v, want it to contain %q", env, want)
-	}
-}
-
-// TestSpawn_AggregatorEndpoint_CatalogPreflight drives Spawn end to end with
-// the gateway binding: the preflight must query pi's vercel-ai-gateway
-// catalog for the whole slug with the gateway credential, pass on the real
-// 0.80.10 listing, and deny when the aggregator catalog lacks the model.
-// Before the fix the probe was asked for anthropic/claude-sonnet-4.6 under
-// the direct anthropic provider and spawn failed with "pi has no built-in
-// model".
-func TestSpawn_AggregatorEndpoint_CatalogPreflight(t *testing.T) {
+// TestSpawn_AggregatorEndpoint_CatalogPromotion drives Spawn end to end with
+// the gateway binding. The catalog query is made for the whole slug under
+// the aggregator with the resolved key; a confirmed slug routes natively
+// through pi's aggregator provider, and a slug pi's catalog lacks (or a
+// failed probe) falls back to the injected provider instead of denying spawn.
+func TestSpawn_AggregatorEndpoint_CatalogPromotion(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name      string
-		listing   string
-		wantAllow bool
+		name     string
+		model    string
+		baseURL  string // "" = the Vercel gateway binding
+		listing  string
+		probeErr error
+		wantArgs []string
+		wantEnv  map[string]string
 	}{
-		{name: "model present in the aggregator catalog", listing: realVercelGatewayCatalogListing, wantAllow: true},
-		{name: "model absent from the aggregator catalog", listing: `No models matching "vercel-ai-gateway/anthropic/claude-sonnet-4.6"` + "\n", wantAllow: false},
+		{
+			name: "openrouter slug present in pi's catalog routes natively with the openrouter key", model: "anthropic/claude-sonnet-4.6",
+			baseURL:  "https://openrouter.ai/api/v1",
+			listing:  "provider    model                        context\nopenrouter  anthropic/claude-sonnet-4.6  1M\n",
+			wantArgs: []string{"--provider", "openrouter", "--model", "anthropic/claude-sonnet-4.6"},
+			wantEnv:  map[string]string{"OPENROUTER_API_KEY": "gw-key", PiKeyEnvVar: "gw-key"},
+		},
+		{
+			name: "slug present in pi's catalog routes natively", model: aggregatorGatewayModel, listing: realVercelGatewayCatalogListing,
+			wantArgs: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel},
+			wantEnv:  map[string]string{"AI_GATEWAY_API_KEY": "gw-key", PiKeyEnvVar: "gw-key"},
+		},
+		{
+			name: "slug newer than pi's catalog uses the injected provider", model: "meta/muse-spark-1.3-contributor",
+			listing:  `No models matching "vercel-ai-gateway/meta/muse-spark-1.3-contributor"` + "\n",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "meta/muse-spark-1.3-contributor"},
+			wantEnv:  map[string]string{PiKeyEnvVar: "gw-key"},
+		},
+		{
+			name: "probe error uses the injected provider", model: aggregatorGatewayModel, probeErr: errors.New("probe unavailable"),
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", aggregatorGatewayModel},
+			wantEnv:  map[string]string{PiKeyEnvVar: "gw-key"},
+		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
-			pr, pw := io.Pipe()
-			t.Cleanup(func() { _ = pw.Close() })
 			type probeCall struct{ provider, model, credVar, credValue string }
-			calls := make(chan probeCall, 1)
-			p, err := New(Options{
-				skipProcess:      true,
-				stdinOverride:    &syncBuffer{},
-				stdoutOverride:   pr,
-				handshakeToken:   testHandshakeToken,
-				HandshakeTimeout: 2 * time.Second,
+			calls := make(chan probeCall, 4)
+			p := &Provider{binary: "pi", opts: Options{
 				CatalogProbe: func(_ context.Context, _, provider, model, credVar, credValue string) (string, error) {
 					calls <- probeCall{provider, model, credVar, credValue}
-					return tc.listing, nil
+					return tc.listing, tc.probeErr
 				},
-			})
-			if err != nil {
-				t.Fatalf("New: %v", err)
+			}}
+			ep := aggregatorGatewayBinding()
+			ep.Model = tc.model
+			wantProvider, wantVar := "vercel-ai-gateway", "AI_GATEWAY_API_KEY"
+			if tc.baseURL != "" {
+				ep.BaseURL = tc.baseURL
+				wantProvider, wantVar = "openrouter", "OPENROUTER_API_KEY"
 			}
-			if tc.wantAllow {
-				body := handshakeEvent("h1") + getStateResponse("ses_gateway") +
-					event(map[string]any{"type": "agent_start"}) +
-					event(map[string]any{"type": "agent_settled"})
-				go func() { _, _ = io.WriteString(pw, body) }()
-			}
-			h, err := p.Spawn(context.Background(), agent.Spec{
+			spec, err := p.prepare(context.Background(), agent.Spec{
 				Prompt:   "hi",
 				Cwd:      t.TempDir(),
-				Model:    aggregatorGatewayModel,
-				Env:      map[string]string{PiKeyEnvVar: "gw-key", "AI_GATEWAY_API_KEY": "gw-key"},
-				Endpoint: aggregatorGatewayBinding(),
+				Model:    tc.model,
+				Env:      map[string]string{PiKeyEnvVar: "gw-key"},
+				Endpoint: ep,
 			})
-			got := <-calls
-			want := probeCall{"vercel-ai-gateway", aggregatorGatewayModel, "AI_GATEWAY_API_KEY", "gw-key"}
-			if got != want {
-				t.Errorf("catalog probe called with %+v, want %+v", got, want)
-			}
-			if !tc.wantAllow {
-				if err == nil {
-					_ = h.Stop(context.Background())
-					t.Fatal("Spawn succeeded for a model the aggregator catalog lacks")
-				}
-				if !errors.Is(err, agent.ErrSpawnFailed) {
-					t.Errorf("Spawn error does not wrap agent.ErrSpawnFailed: %v", err)
-				}
-				return
-			}
 			if err != nil {
-				t.Fatalf("Spawn: %v", err)
+				t.Fatalf("prepare: %v", err)
 			}
-			t.Cleanup(func() { _ = h.Stop(context.Background()) })
-			drain(t, h)
+			close(calls)
+			var got []probeCall
+			for c := range calls {
+				got = append(got, c)
+			}
+			want := []probeCall{{wantProvider, tc.model, wantVar, "gw-key"}}
+			if !reflect.DeepEqual(got, want) {
+				t.Errorf("catalog probe calls = %+v, want exactly %+v", got, want)
+			}
+			if args := modelPinArgs(spec); !reflect.DeepEqual(args, tc.wantArgs) {
+				t.Errorf("modelPinArgs = %q, want %q", args, tc.wantArgs)
+			}
+			for _, v := range []string{"AI_GATEWAY_API_KEY", "OPENROUTER_API_KEY", "ANTHROPIC_API_KEY", "OPENAI_API_KEY", PiKeyEnvVar} {
+				if spec.Env[v] != tc.wantEnv[v] {
+					t.Errorf("env %s = %q, want %q", v, spec.Env[v], tc.wantEnv[v])
+				}
+			}
 		})
 	}
+}
+
+// TestSpawn_AggregatorEndpoint_Native completes a full Spawn on the promoted
+// native route, proving prepare's promotion composes with the launch path.
+func TestSpawn_AggregatorEndpoint_Native(t *testing.T) {
+	t.Parallel()
+	pr, pw := io.Pipe()
+	t.Cleanup(func() { _ = pw.Close() })
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    &syncBuffer{},
+		stdoutOverride:   pr,
+		handshakeToken:   testHandshakeToken,
+		HandshakeTimeout: 2 * time.Second,
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			return realVercelGatewayCatalogListing, nil
+		},
+	})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	body := handshakeEvent("h1") + getStateResponse("ses_gateway") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	go func() { _, _ = io.WriteString(pw, body) }()
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:   "hi",
+		Cwd:      t.TempDir(),
+		Model:    aggregatorGatewayModel,
+		Env:      map[string]string{PiKeyEnvVar: "gw-key", "AI_GATEWAY_API_KEY": "gw-key"},
+		Endpoint: aggregatorGatewayBinding(),
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	drain(t, h)
 }

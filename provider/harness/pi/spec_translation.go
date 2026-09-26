@@ -172,28 +172,46 @@ const pinnedProviderName = "donmai"
 // is model unchanged — the unprefixed-pin behavior (e.g. "claude-opus-4-8",
 // "gpt-5.4") is byte-identical to before this function existed.
 //
-// One case precedes the prefix split: a non-loopback binding whose BaseURL is
-// the serving host of one of pi's built-in aggregator providers
-// (builtinAggregatorForBaseURL — e.g. https://ai-gateway.vercel.sh/v1) routes
-// natively through THAT aggregator with the model slug kept WHOLE
-// ("anthropic/claude-sonnet-4.6" is the aggregator's own catalog id, not a
-// "<provider>/<model>" pin for pi's direct anthropic provider). A pin that
-// already carries the aggregator's own prefix
-// ("vercel-ai-gateway/anthropic/claude-sonnet-4.6") has that prefix removed.
+// A bound endpoint narrows the native route. pi's native route talks to the
+// built-in provider's OWN endpoint and ignores Endpoint.BaseURL, so a pin
+// routes natively only when the binding carries no BaseURL (the
+// pre-existing unbound/direct behavior) or its BaseURL is an https URL on
+// that provider's own serving host (builtinProviderServingHost). Any other
+// BaseURL — an unknown proxy, a look-alike host, plain http, or an
+// aggregator such as https://ai-gateway.vercel.sh/v1 — stays on the injected
+// provider, which is registered against the BaseURL itself, so a proxy key
+// never reaches a vendor's own endpoint.
+//
+// On an aggregator endpoint (builtinAggregatorForBaseURL) the injected
+// provider's model is the WHOLE slug ("anthropic/claude-sonnet-4.6" is the
+// aggregator's wire model code, not a pin for pi's direct anthropic
+// provider). The aggregator's own built-in provider is used only once
+// Provider.promoteAggregatorPin has confirmed pi's catalog lists the slug and
+// rewritten the pin to "<aggregator>/<slug>", which this function then
+// routes natively because the BaseURL is that aggregator's own host.
 func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareModel string, useNative bool) {
-	gateway := ep != nil && ep.Host == agent.HostGateway
-	if ep != nil && !gateway {
-		if agg, ok := builtinAggregatorForBaseURL(ep.BaseURL); ok {
-			if slug := strings.TrimPrefix(model, agg+"/"); slug != "" {
-				return agg, slug, true
-			}
-		}
+	aggregatorHost := false
+	if ep != nil && ep.Host != agent.HostGateway {
+		_, aggregatorHost = builtinAggregatorForBaseURL(ep.BaseURL)
 	}
 	provider, bareModel, ok := splitBuiltinProviderPin(model)
 	if !ok {
 		return "", model, false
 	}
-	return provider, bareModel, !gateway
+	switch {
+	case ep == nil:
+		return provider, bareModel, true
+	case ep.Host == agent.HostGateway:
+		return provider, bareModel, false
+	case ep.BaseURL == "":
+		return provider, bareModel, true
+	case baseURLIsProviderHost(ep.BaseURL, provider):
+		return provider, bareModel, true
+	case aggregatorHost:
+		return provider, model, false
+	default:
+		return provider, bareModel, false
+	}
 }
 
 // composeChildEnv builds the child process env with the env-hygiene posture
@@ -380,25 +398,42 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	// through the injected "donmai" provider at all. Additive only:
 	// PiKeyEnvVar above still carries the same value for the injected
 	// provider, which stays registered (harmless if unused) either way.
-	//
-	// The key falls back to the PiKeyEnvVar value already on env: a binding
-	// that travelled over the dispatch wire carries no Env values (json:"-"),
-	// so on a runner the resolved cell key arrives on Spec.Env instead.
-	if provider, _, useNative := nativeProviderPin(spec.Model, ep); useNative {
-		if envVar, known := builtinProviderCredentialEnv[provider]; known {
-			if _, already := env[envVar]; !already {
-				key := pickAPIKey(ep.Env)
-				if key == "" {
-					key = env[PiKeyEnvVar]
-				}
-				if key != "" {
-					env[envVar] = key
-				}
-			}
-		}
-	}
+	mirrorNativeProviderCredential(env, spec.Model, ep)
 	spec.Env = env
 	return spec, nil
+}
+
+// mirrorNativeProviderCredential copies the resolved cell key onto the
+// built-in provider's own credential env var when model routes natively
+// (nativeProviderPin). The key is taken from the binding's in-process Env
+// first. Only when the binding names that provider's own serving host does
+// it fall back to the PiKeyEnvVar value on env: a binding that travelled over
+// the dispatch wire carries no Env values (json:"-"), so on a runner the key
+// arrives on Spec.Env, and it may only be handed to a provider whose own
+// endpoint the control plane actually bound. An existing value is never
+// overwritten.
+func mirrorNativeProviderCredential(env map[string]string, model string, ep *agent.EndpointBinding) {
+	provider, _, useNative := nativeProviderPin(model, ep)
+	if !useNative {
+		return
+	}
+	envVar, known := builtinProviderCredentialEnv[provider]
+	if !known {
+		return
+	}
+	if _, already := env[envVar]; already {
+		return
+	}
+	key := ""
+	if ep != nil {
+		key = pickAPIKey(ep.Env)
+		if key == "" && baseURLIsProviderHost(ep.BaseURL, provider) {
+			key = env[PiKeyEnvVar]
+		}
+	}
+	if key != "" {
+		env[envVar] = key
+	}
 }
 
 // isLoopbackHTTPURL reports whether rawURL is an absolute HTTP(S) URL whose
