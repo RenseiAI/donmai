@@ -1,0 +1,42 @@
+name: Bug report
+description: Report a reproducible problem in Donmai.
+title: "bug: "
+body:
+  - type: markdown
+    attributes:
+      value: |
+        For vulnerabilities, follow SECURITY.md instead of posting publicly.
+        Remove secrets, tokens, private repository contents, and personal data.
+  - type: input
+    id: version
+    attributes:
+      label: Donmai version
+      description: Paste the output of donmai --version.
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: Operating system and installation method
+      placeholder: macOS arm64, Homebrew
+    validations:
+      required: true
+  - type: textarea
+    id: reproduce
+    attributes:
+      label: Steps to reproduce
+      description: Include the command and a minimal example others can run.
+    validations:
+      required: true
+  - type: textarea
+    id: behavior
+    attributes:
+      label: Expected and actual behavior
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Relevant logs
+      description: Redact sensitive data before submitting.
+      render: text

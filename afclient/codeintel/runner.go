@@ -65,12 +65,12 @@ var ErrNotAvailable = errors.New(
 
 // ErrArchNotAvailable is returned by resolveArchBin when the DEPRECATED TS arch
 // shim is not opted into. Note: ArchAssess does NOT surface this sentinel to
-// callers - the native Go Layer-1+2 pipeline is the primary path, so this is the
+// callers - the native Go Layer-1 pipeline is the primary path, so this is the
 // expected (non-error) state. IsArchBinAvailable uses it to decide whether to
 // route through the legacy shim.
 var ErrArchNotAvailable = errors.New(
 	"DEPRECATED arch shim not configured - the native Go arch-intel pipeline " +
-		"(Layer 1+2) is the primary path; set DONMAI_ARCH_BIN only to force the " +
+		"(Layer 1) is the primary path; set DONMAI_ARCH_BIN only to force the " +
 		"legacy TS arch shim",
 )
 
@@ -91,7 +91,7 @@ func warnCodeShimDeprecated(via string) {
 				"code-intel implementation (get-repo-map, search-symbols, search-code, "+
 				"check-duplicate, find-type-usages, validate-cross-deps) is the primary "+
 				"path and requires no external binary; unset DONMAI_CODE_BIN to use it. "+
-				"The shim will be removed when donmai-libraries is archived.\n", via)
+				"The shim will be removed when the legacy libraries are retired.\n", via)
 	})
 }
 
@@ -106,7 +106,7 @@ func warnArchShimDeprecated(via string) {
 	archShimWarnOnce.Do(func() {
 		fmt.Fprintf(os.Stderr,
 			"warning: using the DEPRECATED TS arch shim (%s). The native Go "+
-				"arch-intel pipeline (Layer 1+2) is the primary path and requires "+
+				"arch-intel pipeline (Layer 1) is the primary path and requires "+
 				"no external binary; unset DONMAI_ARCH_BIN to use it. The shim will "+
 				"be removed in a future release.\n", via)
 	})
@@ -161,7 +161,7 @@ func (r *Runner) resolveCodeBin() ([]string, error) {
 
 // resolveArchBin resolves the DEPRECATED, opt-in TS arch shim.
 //
-// The native Go arch-intel pipeline (Layer 1+2) is the primary path and needs no
+// The native Go arch-intel pipeline (Layer 1) is the primary path and needs no
 // external binary - this resolver only fires when an operator explicitly opts
 // into the legacy TS arch shim. It is NOT a "binary not installed" failure path:
 // ErrArchNotAvailable just means the shim was not opted into, and ArchAssess
@@ -443,15 +443,17 @@ type ArchAssessOptions struct {
 
 	// Summary outputs human-readable text instead of JSON.
 	Summary bool
+
+	// RequireDiff refuses missing or incomplete native PR diffs rather than
+	// returning metadata-only analysis. Not supported by the legacy exec-shim.
+	RequireDiff bool
 }
 
 // ArchAssess assesses a PR/commit for architectural drift.
 //
-// The PRIMARY path is the native Go arch-intel pipeline (Layer 1+2): it fetches
-// the real PR diff, runs the lane-backed assess-against-baseline pipeline
-// ("mode":"native") when an arch ModelAdapter is wired and a baseline exists, or
-// the pure-regex diff/gate fallback ("mode":"native-diff-only") otherwise. No
-// external binary is required.
+// The PRIMARY path fetches a PR through the GitHub CLI and runs native Go
+// Layer-1 diff analysis ("mode":"native-diff-only"). RequireDiff refuses an
+// incomplete fetch; the default preserves the historical metadata fallback.
 //
 // The DEPRECATED exec-shim is an opt-in legacy fallback for byte-identical TS
 // output, taken ONLY when resolveArchBin succeeds:
@@ -495,6 +497,9 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 	if binErr != nil {
 		// Shim not opted into (the common case) — run the native Go pipeline.
 		return r.archAssessNative(opts)
+	}
+	if opts.RequireDiff {
+		return nil, errors.New("arch assess: --require-diff requires the native implementation; disable the legacy arch shim")
 	}
 
 	binArgs = append(binArgs, args...)
@@ -547,7 +552,7 @@ func (r *Runner) ArchAssess(opts ArchAssessOptions) (any, error) {
 // It fetches the REAL PR diff via the GitHub CLI and runs the pure-regex
 // diff/gate layer ("mode":"native-diff-only") over the actual changed files +
 // patches. A missing/failed `gh` degrades to a metadata-only PrDiff rather than
-// erroring, so the gate + JSON shape stay valid.
+// erroring, unless RequireDiff is selected.
 //
 // NOTE: the Layer-2 arch-intelligence pipeline (learned baseline + LLM deviation
 // detection against the SQLite observation graph) is intentionally NOT part of
@@ -579,7 +584,24 @@ func (r *Runner) archAssessNative(opts ArchAssessOptions) (any, error) {
 	// Fetch the real PR diff. A missing/failed `gh` is non-fatal: we degrade to
 	// a metadata-only PrDiff so the gate + JSON shape stay valid (mirrors the
 	// previous stub behaviour, but only on the failure path).
-	diff := r.fetchDiffOrMeta(ctx, repo, prNum, opts.PrURL)
+	var diff PrDiff
+	if opts.RequireDiff {
+		ref := opts.PrURL
+		if ref == "" {
+			ref = "https://github.com/" + strings.TrimPrefix(repo, "github.com/") + fmt.Sprintf("/pull/%d", prNum)
+		}
+		parsedRepo, parsedNumber, valid := parsePRURL(ref)
+		if !strings.HasPrefix(ref, "https://github.com/") || !valid || parsedNumber <= 0 || repo == "" {
+			return nil, errors.New("arch assess: --require-diff needs a GitHub PR URL or --repository with a positive --pr")
+		}
+		var err error
+		diff, err = fetchPRDiff(ctx, parsedRepo, parsedNumber, ref, true)
+		if err != nil {
+			return nil, fmt.Errorf("arch assess: required PR diff unavailable: %w", err)
+		}
+	} else {
+		diff = r.fetchDiffOrMeta(ctx, repo, prNum, opts.PrURL)
+	}
 
 	observations := ReadDiffObservations(diff, scopeLevel)
 	report := BuildNativeDriftReport(diff, observations, opts.GatePolicy)

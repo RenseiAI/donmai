@@ -5,10 +5,11 @@ fleets.
 
 Module: `github.com/RenseiAI/donmai`
 
-This repository is taking over command surfaces from the older TypeScript
-AgentFactory project. When an issue references a legacy path such as
-`packages/cli/src/governor.ts`, use the sibling `../donmai-libraries/` checkout
-as a read-only reference and port the behavior into this Go repo.
+Read our [code of conduct](CODE_OF_CONDUCT.md) before participating. To report
+a vulnerability privately, follow the [security policy](SECURITY.md).
+
+For repository settings, queue choices, and server URLs, see the
+[standalone configuration reference](docs/config.md).
 
 ## Source of Truth
 
@@ -217,6 +218,11 @@ necessary, explain why in the PR and keep its scope narrow.
 - Update relevant package READMEs when public behavior changes.
 - Update `CHANGELOG.md` for user-visible changes.
 - Ensure `make fmt`, `make test`, and `make lint` pass before requesting review.
+
+Every outside contributor must be named in the release notes for the release
+containing their contribution. Use their preferred public name or GitHub handle;
+do not infer or disclose a private identity. Include credit in the pull request
+so the release maintainer can carry it into the published notes.
 
 For release work, follow `RELEASING.md`.
 

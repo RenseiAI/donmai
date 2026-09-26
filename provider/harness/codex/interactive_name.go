@@ -181,13 +181,13 @@ func startNamedInteractiveAppServer(
 	cmd := exec.CommandContext(ctx, bin, args...) //nolint:gosec // binary and args use the provider's resolved harness configuration.
 	cmd.Dir = spec.Cwd
 	cmd.Env = mergeEnv(childEnv, nil, codexHome)
-	stderr, err := cmd.StderrPipe()
-	if err != nil {
-		_ = os.RemoveAll(socketDir)
-		return nil, fmt.Errorf("codex interactive name bootstrap stderr: %w", err)
-	}
+	// Let exec own the copy so Wait joins stderr capture before exitDone is
+	// published. An independent StderrPipe reader can still be writing after
+	// Wait returns (or lose unread bytes when Wait closes the pipe).
+	stderrBuf := newBoundedBuffer(appServerStderrRetentionBytes)
+	cmd.Stderr = stderrBuf
+	cmd.WaitDelay = interactiveNameBootstrapShutdownTimeout
 	if err := cmd.Start(); err != nil {
-		_ = stderr.Close()
 		_ = os.RemoveAll(socketDir)
 		return nil, fmt.Errorf("codex interactive name bootstrap spawn: %w", err)
 	}
@@ -198,7 +198,6 @@ func startNamedInteractiveAppServer(
 	// donmaiOwnerManifest's doc comment for why identity, not bare PID.
 	writeDonmaiOwnerManifest(socketDir)
 	pinDonmaiChildIdentity(socketDir, cmd.Process.Pid)
-	stderrBuf := captureAppServerStderr(stderr)
 	waitCh := make(chan error, 1)
 	server := &namedInteractiveAppServer{
 		remoteURL:   remoteURL,
@@ -218,12 +217,12 @@ func startNamedInteractiveAppServer(
 	go server.logAppServerExit() //nolint:gosec // G118: this exit-log line must outlive setupCtx, which is scoped to the handshake, not the process
 	probe, err := dialInteractiveAppServer(setupCtx, socketPath)
 	if err != nil {
-		return nil, errors.Join(withAppServerStderr(err, server), server.close())
+		return nil, failNamedInteractiveSetup(err, server)
 	}
 	_ = probe.Close()
 	client, err := dialInteractiveWebSocket(setupCtx, socketPath)
 	if err != nil {
-		return nil, errors.Join(withAppServerStderr(err, server), server.close())
+		return nil, failNamedInteractiveSetup(err, server)
 	}
 	server.setClient(client)
 
@@ -236,21 +235,21 @@ func startNamedInteractiveAppServer(
 		"capabilities": map[string]any{"experimentalApi": true},
 	}, timeout)
 	if err != nil {
-		return nil, errors.Join(withAppServerStderr(fmt.Errorf("codex interactive name bootstrap initialize: %w", err), server), server.close())
+		return nil, failNamedInteractiveSetup(fmt.Errorf("codex interactive name bootstrap initialize: %w", err), server)
 	}
 	var initResp struct {
 		CodexHome string `json:"codexHome"`
 	}
 	if err := json.Unmarshal(initRaw, &initResp); err != nil || initResp.CodexHome == "" ||
 		!sameResolvedPath(initResp.CodexHome, codexHome) {
-		return nil, errors.Join(withAppServerStderr(errors.New("codex interactive name bootstrap did not confirm the selected config home"), server), server.close())
+		return nil, failNamedInteractiveSetup(errors.New("codex interactive name bootstrap did not confirm the selected config home"), server)
 	}
 	if err := client.notify(setupCtx, "initialized", map[string]any{}); err != nil {
-		return nil, errors.Join(withAppServerStderr(fmt.Errorf("codex interactive name bootstrap initialized notification: %w", err), server), server.close())
+		return nil, failNamedInteractiveSetup(fmt.Errorf("codex interactive name bootstrap initialized notification: %w", err), server)
 	}
 	if attachToExistingNamedSession(spec) {
 		if err := resumeExistingNamedThreadWithRequest(setupCtx, spec, client.request, rpcTimeout); err != nil {
-			return nil, errors.Join(withAppServerStderr(err, server), server.close())
+			return nil, failNamedInteractiveSetup(err, server)
 		}
 		// The target is now proven to exist; the PTY opens its own
 		// independent --remote connection to attach (`codex resume --remote
@@ -812,6 +811,13 @@ func withAppServerStderr(err error, server *namedInteractiveAppServer) error {
 		return fmt.Errorf("%w (app-server stderr: %s)", err, excerpt)
 	}
 	return err
+}
+
+// Stop and join the owned process before snapshotting its diagnostic tail.
+// Cleanup failures remain visible alongside the original setup failure.
+func failNamedInteractiveSetup(err error, server *namedInteractiveAppServer) error {
+	closeErr := server.close()
+	return errors.Join(withAppServerStderr(err, server), closeErr)
 }
 
 // unexpectedAppServerExitError reports that the bootstrap app-server

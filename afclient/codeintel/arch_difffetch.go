@@ -105,6 +105,13 @@ func runGh(ctx context.Context, args ...string) ([]byte, error) {
 // When `gh` is unavailable the error is ErrDiffFetchUnavailable and the caller
 // falls back to a metadata-only PrDiff.
 func FetchPRDiff(ctx context.Context, repo string, prNum int, ref string) (PrDiff, error) {
+	return fetchPRDiff(ctx, repo, prNum, ref, false)
+}
+
+// fetchPRDiff retains the public fetcher's metadata fallback unless the caller
+// requires patches. Strict assessments must not turn a partial fetch into a
+// successful check of code that was never read.
+func fetchPRDiff(ctx context.Context, repo string, prNum int, ref string, requirePatches bool) (PrDiff, error) {
 	viewOut, err := runGhPRView(ctx, ref)
 	if err != nil {
 		return PrDiff{}, err
@@ -113,6 +120,9 @@ func FetchPRDiff(ctx context.Context, repo string, prNum int, ref string) (PrDif
 	var view ghPRFiles
 	if err := json.Unmarshal(viewOut, &view); err != nil {
 		return PrDiff{}, fmt.Errorf("arch diff-fetch: decode gh pr view: %w", err)
+	}
+	if requirePatches && view.Files == nil {
+		return PrDiff{}, errors.New("arch diff-fetch: PR metadata is missing the changed-file list")
 	}
 
 	diff := PrDiff{
@@ -128,9 +138,17 @@ func FetchPRDiff(ctx context.Context, repo string, prNum int, ref string) (PrDif
 	patchesByPath := map[string]string{}
 	if diffOut, derr := runGhPRDiff(ctx, ref); derr == nil {
 		patchesByPath = splitUnifiedDiff(string(diffOut))
+	} else if requirePatches {
+		return PrDiff{}, fmt.Errorf("arch diff-fetch: fetch patches: %w", derr)
+	}
+	if requirePatches && len(patchesByPath) != len(view.Files) {
+		return PrDiff{}, errors.New("arch diff-fetch: patch sections do not match the changed-file list")
 	}
 
 	for _, f := range view.Files {
+		if requirePatches && patchesByPath[f.Path] == "" {
+			return PrDiff{}, fmt.Errorf("arch diff-fetch: missing patch section for %q", f.Path)
+		}
 		diff.Files = append(diff.Files, PrFileDiff{
 			Path:  f.Path,
 			Patch: patchesByPath[f.Path],

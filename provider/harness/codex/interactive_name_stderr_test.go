@@ -4,12 +4,15 @@ import (
 	"context"
 	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"net"
 	"net/http"
 	"os"
 	"os/exec"
+	"os/signal"
 	"strings"
 	"sync"
+	"syscall"
 	"testing"
 	"time"
 
@@ -81,6 +84,15 @@ func runCodexFakeNamedAppServer() {
 		}
 	}
 	crashMode := os.Getenv(codexFakeNamedAppServerCrashModeEnv)
+	if crashMode == "shutdown_diagnostic" {
+		stopped := make(chan os.Signal, 1)
+		signal.Notify(stopped, syscall.SIGTERM)
+		go func() {
+			<-stopped
+			writeStderr()
+			os.Exit(0)
+		}()
+	}
 	if crashMode == "before_listen" {
 		writeStderr()
 		os.Exit(1)
@@ -120,8 +132,15 @@ func runCodexFakeNamedAppServer() {
 				continue
 			}
 			switch inbound.Method {
+			case "fixture/crash":
+				writeStderr()
+				os.Exit(1)
 			case "initialize":
-				result, _ := json.Marshal(map[string]any{"codexHome": os.Getenv("CODEX_HOME")})
+				configHome := os.Getenv("CODEX_HOME")
+				if crashMode == "shutdown_diagnostic" {
+					configHome = "deliberately-wrong-config-home"
+				}
+				result, _ := json.Marshal(map[string]any{"codexHome": configHome})
 				body, _ := json.Marshal(rpcResponse{JSONRPC: "2.0", ID: inbound.ID, Result: result})
 				if err := conn.Write(ctx, websocket.MessageText, body); err != nil {
 					return
@@ -269,6 +288,75 @@ func TestStartNamedInteractiveAppServer_CrashBeforeListenSurfacesExcerpt(t *test
 		t.Context(), self, codexFakeNamedAppServerOpts, spec, interactiveLaunch{}, childEnv, t.TempDir(),
 	)
 	codexAssertStderrExcerpt(t, spawnErr, codexFakeNamedAppServerDiagnostic)
+}
+
+func TestNamedInteractiveAppServerExitWaitsForStderrCapture(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	server, err := startNamedInteractiveAppServer(t.Context(), self, codexFakeNamedAppServerOpts,
+		agent.Spec{SessionName: "stderr-order", Cwd: t.TempDir()}, interactiveLaunch{},
+		map[string]string{
+			codexFakeNamedAppServerEnv:       "1",
+			codexFakeNamedAppServerStderrEnv: codexFakeNamedAppServerStderrEncoded(),
+		}, t.TempDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = server.close() }()
+
+	// Hold the real capture sink while the actual child writes its diagnostic
+	// and exits. Process completion must not publish an incomplete excerpt.
+	server.stderr.mu.Lock()
+	locked := true
+	defer func() {
+		if locked {
+			server.stderr.mu.Unlock()
+		}
+	}()
+	if err := server.getClient().notify(t.Context(), "fixture/crash", map[string]any{}); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for {
+		probeErr := server.cmd.Process.Signal(syscall.Signal(0))
+		if errors.Is(probeErr, os.ErrProcessDone) || errors.Is(probeErr, syscall.ESRCH) {
+			break
+		}
+		if probeErr != nil || time.Now().After(deadline) {
+			t.Fatalf("fixture process did not exit: %v", probeErr)
+		}
+		time.Sleep(time.Millisecond)
+	}
+	select {
+	case <-server.exitDone:
+		t.Fatal("process exit was published before stderr capture completed")
+	case <-time.After(100 * time.Millisecond):
+	}
+	server.stderr.mu.Unlock()
+	locked = false
+	select {
+	case <-server.exitDone:
+	case <-time.After(3 * time.Second):
+		t.Fatal("process exit was not published after stderr capture completed")
+	}
+	codexAssertStderrExcerpt(t, server.close(), codexFakeNamedAppServerDiagnostic)
+}
+
+func TestNamedInteractiveSetupFailureCapturesShutdownStderr(t *testing.T) {
+	self, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, setupErr := startNamedInteractiveAppServer(t.Context(), self, codexFakeNamedAppServerOpts,
+		agent.Spec{SessionName: "shutdown-diagnostic", Cwd: t.TempDir()}, interactiveLaunch{},
+		map[string]string{
+			codexFakeNamedAppServerEnv:          "1",
+			codexFakeNamedAppServerCrashModeEnv: "shutdown_diagnostic",
+			codexFakeNamedAppServerStderrEnv:    codexFakeNamedAppServerStderrEncoded(),
+		}, t.TempDir())
+	codexAssertStderrExcerpt(t, setupErr, "did not confirm the selected config home")
 }
 
 // TestNamedInteractiveAppServer_CloseSurfacesExcerptOnUnexpectedExit pins the

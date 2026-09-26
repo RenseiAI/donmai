@@ -34,7 +34,7 @@ func newArchCmd(cfg Config) *cobra.Command {
 
 Detects architectural drift in a PR/commit entirely in-process: it fetches the
 PR diff via the GitHub CLI (gh), indexes the change (Layer 1), and runs pure-Go
-regex diff/gate analysis. No external binary, LLM, or datastore is required. All
+regex diff/gate analysis. No LLM or datastore is required. All
 commands output JSON to stdout by default.
 
 Exit codes (assess subcommand):
@@ -67,19 +67,20 @@ the native pipeline is the sole supported path.`,
 // newArchAssessCmd constructs `donmai arch assess`.
 func newArchAssessCmd(bin string) *cobra.Command {
 	var (
-		repository string
-		prNumber   int
-		gatePolicy string
-		scopeLevel string
-		projectID  string
-		db         string
-		summary    bool
+		repository  string
+		prNumber    int
+		gatePolicy  string
+		scopeLevel  string
+		projectID   string
+		db          string
+		summary     bool
+		requireDiff bool
 	)
 
 	cmd := &cobra.Command{
 		Use:   "assess [pr-url]",
 		Short: "Assess a PR or commit for architectural drift",
-		Long: `Runs a drift assessment against the stored architectural baseline.
+		Long: `Assess native architectural signals in a pull request diff.
 
 Provide either a full GitHub PR URL as a positional argument, or use
 --repository + --pr to specify the PR explicitly.
@@ -90,7 +91,13 @@ Gate policy controls the exit code:
   zero-deviations    Block on any deviation
   max:N              Block when total deviations > N
 
-This runs natively in Go (no external binary): it fetches the PR diff via the
+Use --require-diff for automated checks. It returns exit code 2 if GitHub
+metadata or patches cannot be fetched, a changed file lacks a patch section,
+or a legacy arch shim is selected. Without this flag, the historical
+metadata-only fallback remains available; an empty result after a fetch
+warning does not mean the PR was checked.
+
+This runs native Go analysis: it fetches the PR diff via the
 GitHub CLI (gh) and performs pure-regex diff/gate analysis
 ("mode":"native-diff-only") — no LLM and no datastore. The legacy TS shim
 (DEPRECATED) can still be opted into via DONMAI_ARCH_BIN or af-arch on PATH.
@@ -106,13 +113,14 @@ Examples:
 			r := codeintel.New(cwd())
 
 			opts := codeintel.ArchAssessOptions{
-				Repository: repository,
-				PrNumber:   prNumber,
-				GatePolicy: gatePolicy,
-				ScopeLevel: scopeLevel,
-				ProjectID:  projectID,
-				DB:         db,
-				Summary:    summary,
+				Repository:  repository,
+				PrNumber:    prNumber,
+				GatePolicy:  gatePolicy,
+				ScopeLevel:  scopeLevel,
+				ProjectID:   projectID,
+				DB:          db,
+				Summary:     summary,
+				RequireDiff: requireDiff,
 			}
 			if len(args) == 1 {
 				opts.PrURL = args[0]
@@ -169,6 +177,7 @@ Examples:
 	cmd.Flags().StringVar(&projectID, "project-id", "", "Project ID for scope")
 	cmd.Flags().StringVar(&db, "db", "", "Path to SQLite DB (overrides DONMAI_ARCH_DB)")
 	cmd.Flags().BoolVar(&summary, "summary", false, "Output human-readable summary instead of JSON")
+	cmd.Flags().BoolVar(&requireDiff, "require-diff", false, "Require the complete native PR diff; return exit code 2 if unavailable")
 
 	return cmd
 }
