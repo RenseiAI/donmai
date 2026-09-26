@@ -30,7 +30,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get update && apt-get install -y --no-install-recommends gh \
     && rm -rf /var/lib/apt/lists/*
 
-# Node 20 + provider CLIs.
+# Node 22 + provider CLIs.
 #
 # Claude Code CLI: the 'claude' provider shells out to `claude` on PATH.
 # Without it donmai agent run fails "no provider registered for name claude"
@@ -42,6 +42,14 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # session dispatched to this sandbox with providerId='codex' fails the probe.
 # The org's OPENAI_API_KEY arrives at runtime via the credential snapshot.
 #
+# pi CLI (@earendil-works/pi-coding-agent): the 'pi' provider spawns `pi` on
+# PATH and drives it over its RPC protocol. The pi harness registers only when
+# a pi binary is on PATH; without it every session dispatched to this sandbox
+# with providerId='pi' is denied at harness admission (harness_unavailable).
+# The version is pinned to PinnedVersion in provider/harness/pi/probe.go —
+# bump both together. pi declares engines node >=22.19.0, hence Node 22. The
+# gateway/API key arrives at runtime via the credential snapshot.
+#
 # Gemini: NO CLI install needed. The donmai binary ships a native HTTP provider
 # (provider/gemini) that calls the Gemini REST API directly — no external
 # subprocess. The org's GEMINI_API_KEY / GOOGLE_API_KEY arrives at runtime via
@@ -49,9 +57,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # This is only the agent CLI layer — repo language toolchains are still
 # installed in-box by the kit after clone (the runner's shellExecer).
-RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
     && npm i -g @anthropic-ai/claude-code @openai/codex \
+         @earendil-works/pi-coding-agent@0.80.10 \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
 

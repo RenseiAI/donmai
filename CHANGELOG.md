@@ -10,6 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.46 — 2026-09-26
+
+### Fixes
+
+- e2b worker template and worker image now install pi 0.80.10 (Node 22) so pi
+  sessions on on-demand sandboxes are admitted.
+
 ## v0.72.45 — 2026-09-26
 
 ### Features
