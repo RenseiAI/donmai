@@ -171,12 +171,28 @@ const pinnedProviderName = "donmai"
 // have the "<builtin-provider>/" shape at all, provider is "" and bareModel
 // is model unchanged — the unprefixed-pin behavior (e.g. "claude-opus-4-8",
 // "gpt-5.4") is byte-identical to before this function existed.
+//
+// One case precedes the prefix split: a non-loopback binding whose BaseURL is
+// the serving host of one of pi's built-in aggregator providers
+// (builtinAggregatorForBaseURL — e.g. https://ai-gateway.vercel.sh/v1) routes
+// natively through THAT aggregator with the model slug kept WHOLE
+// ("anthropic/claude-sonnet-4.6" is the aggregator's own catalog id, not a
+// "<provider>/<model>" pin for pi's direct anthropic provider). A pin that
+// already carries the aggregator's own prefix
+// ("vercel-ai-gateway/anthropic/claude-sonnet-4.6") has that prefix removed.
 func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareModel string, useNative bool) {
+	gateway := ep != nil && ep.Host == agent.HostGateway
+	if ep != nil && !gateway {
+		if agg, ok := builtinAggregatorForBaseURL(ep.BaseURL); ok {
+			if slug := strings.TrimPrefix(model, agg+"/"); slug != "" {
+				return agg, slug, true
+			}
+		}
+	}
 	provider, bareModel, ok := splitBuiltinProviderPin(model)
 	if !ok {
 		return "", model, false
 	}
-	gateway := ep != nil && ep.Host == agent.HostGateway
 	return provider, bareModel, !gateway
 }
 
@@ -364,10 +380,18 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 	// through the injected "donmai" provider at all. Additive only:
 	// PiKeyEnvVar above still carries the same value for the injected
 	// provider, which stays registered (harmless if unused) either way.
+	//
+	// The key falls back to the PiKeyEnvVar value already on env: a binding
+	// that travelled over the dispatch wire carries no Env values (json:"-"),
+	// so on a runner the resolved cell key arrives on Spec.Env instead.
 	if provider, _, useNative := nativeProviderPin(spec.Model, ep); useNative {
 		if envVar, known := builtinProviderCredentialEnv[provider]; known {
 			if _, already := env[envVar]; !already {
-				if key := pickAPIKey(ep.Env); key != "" {
+				key := pickAPIKey(ep.Env)
+				if key == "" {
+					key = env[PiKeyEnvVar]
+				}
+				if key != "" {
 					env[envVar] = key
 				}
 			}

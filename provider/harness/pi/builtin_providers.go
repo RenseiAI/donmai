@@ -1,6 +1,9 @@
 package pi
 
-import "strings"
+import (
+	"net/url"
+	"strings"
+)
 
 // builtinProviderCredentialEnv is the explicit allowlist requirement 1 calls
 // for: pi's own BUILT-IN providers, mapped to the environment variable pi
@@ -92,4 +95,46 @@ func splitBuiltinProviderPin(pin string) (provider, model string, ok bool) {
 		return "", "", false
 	}
 	return provider, model, true
+}
+
+// builtinAggregatorProviderByHost maps the serving hostname of each of pi's
+// built-in AGGREGATOR providers to that provider's slug. An aggregator is a
+// built-in provider whose own catalog ids are themselves "<author>/<model>"
+// slugs (e.g. pi's vercel-ai-gateway catalog lists
+// "anthropic/claude-sonnet-4.6", served from https://ai-gateway.vercel.sh
+// over the anthropic-messages API; openrouter lists "anthropic/…" ids served
+// from https://openrouter.ai/api/v1). Transcribed from the bundled
+// @earendil-works/pi-ai providers/vercel-ai-gateway.js and openrouter.js of
+// the pinned-adjacent binary.
+//
+// It exists because a control plane that binds an aggregator endpoint sends
+// the aggregator's own model slug verbatim (Endpoint.Model
+// "anthropic/claude-sonnet-4.6", Endpoint.BaseURL
+// "https://ai-gateway.vercel.sh/v1"). Read as a pi pin, that slug's first
+// segment names pi's DIRECT "anthropic" provider — whose catalog spells the
+// same model "claude-sonnet-4-6" and whose endpoint is api.anthropic.com —
+// so routing on the prefix alone would both fail the catalog preflight and,
+// were it to pass, send the aggregator key to the wrong vendor. The binding's
+// serving host, not the model slug's author segment, decides which built-in
+// provider serves the session.
+var builtinAggregatorProviderByHost = map[string]string{
+	"ai-gateway.vercel.sh": "vercel-ai-gateway",
+	"openrouter.ai":        "openrouter",
+}
+
+// builtinAggregatorForBaseURL reports the built-in aggregator provider whose
+// serving host baseURL names, or ok=false for an empty, unparseable, or
+// non-aggregator URL. Only https URLs match: every aggregator above is served
+// over TLS, and a plain-http URL naming one of these hosts is not the
+// provider's own endpoint.
+func builtinAggregatorForBaseURL(baseURL string) (provider string, ok bool) {
+	if baseURL == "" {
+		return "", false
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") {
+		return "", false
+	}
+	provider, ok = builtinAggregatorProviderByHost[strings.ToLower(u.Hostname())]
+	return provider, ok
 }
