@@ -13,6 +13,11 @@ Mirrors the runtime stage of [`worker/Dockerfile`](../Dockerfile):
 - Base: `debian:bookworm-slim` (provides `apt`, `sh`/`bash` for kit toolchain
   installs that the in-box runner performs after cloning a repo).
 - `ca-certificates git curl` (via apt).
+- Node 22 plus the agent CLI layer, installed globally with npm: Claude Code
+  (`claude`), Codex (`codex`), and pi (`pi`, pinned to the harness's
+  `PinnedVersion` in `provider/harness/pi/probe.go`). Gemini needs no CLI; it
+  is a native provider compiled into `donmai`. Provider API keys arrive at
+  runtime via the credential snapshot.
 - Prebuilt **linux/amd64** `donmai` binary at `/usr/local/bin/donmai`
   (e2b sandboxes are x86_64 linux).
 
@@ -23,9 +28,8 @@ produced on demand by `build.sh` and copied into the e2b build context.
 
 `sleep infinity` — a long-lived keep-alive (set in `e2b.toml`).
 
-The platform's e2b execution provider
-(`platform/src/lib/providers/sandbox/e2b/index.ts`) supports two ways to launch
-the in-box runner; this template is authored for the **explicit / inline** one:
+The control plane's e2b execution provider supports two ways to launch the
+in-box runner; this template is authored for the **explicit / inline** one:
 
 1. **Inline launch (this template's model).** Keep the start command as a
    keep-alive (`sleep infinity`) and set the pool config

@@ -106,13 +106,23 @@ ENV GOTOOLCHAIN=local GOFLAGS=-mod=mod
 #                                on PATH; without it any session dispatched with
 #                                providerId='codex' fails the probe.
 #
+#   @earendil-works/pi-coding-agent
+#                              — the 'pi' provider spawns `pi` on PATH and
+#                                drives it over its RPC protocol; the pi harness
+#                                registers only when a pi binary is on PATH, so
+#                                without it providerId='pi' sessions are denied
+#                                at harness admission (harness_unavailable).
+#                                Pinned to PinnedVersion in
+#                                provider/harness/pi/probe.go; pi requires
+#                                node >=22.19.0 (satisfied by node:22 below).
+#
 # Gemini: NO CLI install needed. The donmai binary (built above in the 'build'
 # stage) ships a native HTTP provider (provider/gemini) compiled in — it calls
 # the Gemini REST API directly with no external subprocess. The build stage
 # always compiles from source, so the latest provider/gemini code ships with
 # every image rebuild triggered by a release tag.
 #
-# SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern): these two
+# SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern): these three
 # versions are pinned deliberately, not just for reproducibility. An unpinned
 # `npm i -g pkg` has instruction text that never changes, so BuildKit's cache
 # key for this RUN layer never changes either — whatever got resolved on the
@@ -125,11 +135,14 @@ ENV GOTOOLCHAIN=local GOFLAGS=-mod=mod
 # `latest` a stale cached layer can quietly stand in for.
 #
 # To bump: `npm view @anthropic-ai/claude-code version` /
-# `npm view @openai/codex version`, then update the versions below.
+# `npm view @openai/codex version`, then update the versions below. pi is the
+# exception: keep it EQUAL to PinnedVersion in provider/harness/pi/probe.go and
+# bump both together.
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
     && npm i -g @anthropic-ai/claude-code@2.1.232 @openai/codex@0.147.0 \
+         @earendil-works/pi-coding-agent@0.80.10 \
     && npm cache clean --force
 
 # Baked code-survival TS reachability script + its pre-installed node_modules.
