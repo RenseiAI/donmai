@@ -8,6 +8,9 @@ Module: `github.com/RenseiAI/donmai`
 Read our [code of conduct](CODE_OF_CONDUCT.md) before participating. To report
 a vulnerability privately, follow the [security policy](SECURITY.md).
 
+For repository settings, queue choices, and server URLs, see the
+[standalone configuration reference](docs/config.md).
+
 ## Source of Truth
 
 Read `AGENTS.md` before making architectural or command-surface changes. It

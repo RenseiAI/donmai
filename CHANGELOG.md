@@ -8,7 +8,20 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- Add `arch assess --require-diff` for automated native assessments. Missing
+  GitHub access, failed patch retrieval, missing per-file patch sections, and
+  unsupported legacy shims fail instead of yielding a metadata-only result.
+  Existing callers retain the default fallback behavior.
+- Document standalone repository configuration, queue limitations, and server
+  URL selection.
+
+### Fixes
+
+- Preserve bounded, redacted Codex app-server diagnostics by joining stderr
+  capture before announcing process exit and collecting setup errors after
+  cleanup finishes.
 
 ## v0.72.44 — 2026-09-23
 
