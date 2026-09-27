@@ -51,8 +51,9 @@ type BudgetReport struct {
 	ObservedSubAgents int `json:"observedSubAgents"`
 
 	// ObservedTokens is the cumulative input+output token count
-	// observed across all turns. Sourced from per-turn ResultEvent.Cost
-	// and the final terminal CostData.
+	// observed across all turns. Sourced from ResultEvent.Cost, counting
+	// each token once even when a harness reports a running total (see
+	// BudgetEnforcer.resultIncrement).
 	ObservedTokens int64 `json:"observedTokens"`
 
 	// ObservedDurationSeconds is the wall-clock the session ran for at
@@ -94,6 +95,14 @@ type BudgetEnforcer struct {
 
 	mu     sync.Mutex
 	breach *budgetBreach
+
+	// Token-accounting state for resultIncrement, guarded by mu.
+	// callTokens/calls sum the harness-reported per-call usage
+	// (non-aggregate LlmCallEvents) since the last ResultEvent that carried
+	// a cost; lastResultTotal is that ResultEvent's input+output total.
+	callTokens      int64
+	calls           int
+	lastResultTotal int64
 }
 
 type budgetBreach struct {
@@ -165,24 +174,64 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, limit))
 			}
 		}
+	case agent.LlmCallEvent:
+		// Per-call usage is not counted on its own — ResultEvent.Cost stays
+		// the source — but it is the evidence resultIncrement needs to
+		// recognize a running total. Aggregate/synthetic events are derived
+		// FROM a ResultEvent (runtime/span), so they prove nothing about it.
+		if !v.Synthetic && v.UsageSource != agent.LlmUsageAggregate {
+			e.mu.Lock()
+			e.callTokens += v.InputTokens + v.OutputTokens
+			e.calls++
+			e.mu.Unlock()
+		}
 	case agent.ResultEvent:
-		// Per-turn cost may arrive on intermediate ResultEvents (some
-		// providers emit one per turn) or on the terminal one. We sum
-		// whatever the provider gives us; the platform's roll-up is
-		// authoritative downstream.
-		if v.Cost != nil {
-			delta := v.Cost.InputTokens + v.Cost.OutputTokens
-			if delta > 0 {
-				n := e.tokens.Add(delta)
-				if limit := e.limits.MaxTokens; limit > 0 && n > limit {
-					return e.recordBreach(CapTokens,
-						fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, limit))
-				}
+		// A run can see several ResultEvents: a steering or memory-inject
+		// turn re-consumes the stream after the first terminal.
+		if delta := e.resultIncrement(v.Cost); delta > 0 {
+			n := e.tokens.Add(delta)
+			if limit := e.limits.MaxTokens; limit > 0 && n > limit {
+				return e.recordBreach(CapTokens,
+					fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, limit))
 			}
 		}
 	}
 
 	return nil
+}
+
+// resultIncrement returns how many NEW tokens a ResultEvent's cost adds to
+// the session. Harnesses differ in what that cost means once a run has more
+// than one ResultEvent: some report the usage since the previous one, others
+// (pi, codex, gemini) report the handle's running total, so a second
+// ResultEvent repeats every token of the first. Summing running totals
+// double-counted — a steered pi session that spent 1.46M tokens was measured
+// at 2.78M, recording a breach of a 1.5M cap it never reached.
+//
+// The two are told apart on evidence, not on the harness's name: when the
+// per-call usage the harness reported since the previous ResultEvent is
+// exactly the difference between this total and that one, the new total
+// provably repeats the earlier usage, and only the difference is new. In
+// every other case the whole cost is counted, exactly as before this rule
+// existed, so a harness without per-call usage — or with per-call usage that
+// does not reconcile — keeps its previous accounting and is never
+// under-counted. A counter that restarts (a resumed handle) reconciles
+// against zero, not against the previous handle, so it is counted whole too.
+func (e *BudgetEnforcer) resultIncrement(cost *agent.CostData) int64 {
+	if cost == nil {
+		// No cost to reconcile: keep the per-call evidence for the next
+		// ResultEvent that carries one.
+		return 0
+	}
+	total := cost.InputTokens + cost.OutputTokens
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	callTokens, calls, previous := e.callTokens, e.calls, e.lastResultTotal
+	e.callTokens, e.calls, e.lastResultTotal = 0, 0, total
+	if previous > 0 && calls > 0 && total == previous+callTokens {
+		return callTokens
+	}
+	return total
 }
 
 // CheckDuration returns a non-nil *BudgetExceededError when the
