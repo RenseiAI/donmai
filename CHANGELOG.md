@@ -10,6 +10,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.47 — 2026-09-26
+
+### Fixes
+
+- pi harness now routes a gateway-hosted model by the binding's serving host
+  rather than the model slug's author segment: for a gateway-hosted model
+  that pi's own built-in catalog lists, the session uses pi's built-in
+  gateway provider natively; every other gateway-hosted model stays on the
+  injected provider instead of failing the pre-spawn catalog check. A key is
+  mirrored onto a vendor's own environment variable only when the binding's
+  base URL is that vendor's own serving host, never a proxy or look-alike
+  host, so a gateway key can no longer reach a vendor's endpoint.
+
 ## v0.72.46 — 2026-09-26
 
 ### Fixes

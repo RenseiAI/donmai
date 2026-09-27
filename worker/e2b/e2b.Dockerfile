@@ -57,9 +57,19 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 #
 # This is only the agent CLI layer — repo language toolchains are still
 # installed in-box by the kit after clone (the runner's shellExecer).
+#
+# All three CLIs are version-pinned (matching worker/Dockerfile) rather than
+# left to float on `latest` — see worker/Dockerfile's CREEP-class cache
+# poisoning note for why an unpinned `npm i -g pkg` lets a stale cached layer
+# quietly stand in for a newer/patched package forever.
+#
+# To bump: `npm view @anthropic-ai/claude-code version` /
+# `npm view @openai/codex version`, then update the versions below. pi is the
+# exception: keep it EQUAL to PinnedVersion in provider/harness/pi/probe.go and
+# bump both together.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm i -g @anthropic-ai/claude-code @openai/codex \
+    && npm i -g @anthropic-ai/claude-code@2.1.232 @openai/codex@0.147.0 \
          @earendil-works/pi-coding-agent@0.80.10 \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*
