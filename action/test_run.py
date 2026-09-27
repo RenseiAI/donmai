@@ -3,6 +3,7 @@ import contextlib
 import io
 import json
 import os
+import shlex
 import subprocess
 import sys
 from pathlib import Path
@@ -29,7 +30,14 @@ class ActionTests(unittest.TestCase):
                 f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n")
             tools = root / "bin"
             tools.mkdir()
-            (tools / "python3").symlink_to(sys.executable)
+            invocation = root / "python-invocation.json"
+            recorder = "import json,pathlib,sys; pathlib.Path(sys.argv[1]).write_text(json.dumps(sys.argv[2:]))"
+            launcher = tools / "python3"
+            launcher.write_text(
+                "#!/bin/sh\n"
+                f"{shlex.quote(sys.executable)} -I -c {shlex.quote(recorder)} {shlex.quote(str(invocation))} \"$@\"\n"
+                f"exec {shlex.quote(sys.executable)} \"$@\"\n")
+            launcher.chmod(0o700)
             env = {"PATH": str(tools), "HOME": str(root), "PYTHONPATH": str(root),
                    "ACTION_DIRECTORY": str(action_directory), "GITHUB_EVENT_NAME": "unsupported",
                    "ACTION_TOKEN": "synthetic-fixture-token"}
@@ -37,6 +45,9 @@ class ActionTests(unittest.TestCase):
                                     cwd=root, env=env, text=True, capture_output=True, timeout=10, check=False)
             self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
             self.assertIn("Only pull_request events are supported", result.stdout)
+            self.assertTrue(invocation.is_file(), "Action metadata did not invoke the Python launcher")
+            self.assertEqual(json.loads(invocation.read_text()),
+                             ["-I", str(action_directory / "action" / "run.py")])
             self.assertFalse(marker.exists(), "Action startup executed a module from untrusted PYTHONPATH")
 
     def test_event_identity_and_unsafe_events(self):
