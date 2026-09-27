@@ -211,9 +211,10 @@ func shouldBackstop(res *Result, workType string) bool {
 //     [backstopMaxFiles].
 //  5. `git commit -m "Backstop: <session-id>"` (skipped when nothing
 //     remains staged).
-//  6. `git push -u origin <branch>` (with --force-with-lease retry on
-//     non-fast-forward).
-//  7. `gh pr create --fill` — return the URL.
+//  6. `git push -u origin <checked-out>:<checked-out>` (with
+//     --force-with-lease retry on non-fast-forward) — the branch the work
+//     was committed on, under its own name.
+//  7. `gh pr create --head <checked-out>` — return the URL.
 //
 // Errors at any step short-circuit and are recorded on
 // BackstopReport.Diagnostics; the caller decides whether to surface
@@ -320,18 +321,34 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		}
 	}
 
-	// 6. Push.
-	pushBranch := branch
+	// 6. Push the branch the work is actually on. The commit above landed on
+	// whatever branch is CHECKED OUT, which is not always the session branch
+	// the runner provisioned: an agent may create and switch to its own. Pushing
+	// the session branch by name then publishes a ref without the work, and
+	// `gh pr create` — which infers its head from the checked-out branch —
+	// refuses when that branch's upstream is missing or differently named
+	// ("you must first push the current branch to a remote, or use the --head
+	// flag"). The checked-out branch is published under ITS OWN name, with an
+	// explicit refspec, never onto a differently named upstream it merely
+	// tracks: `git checkout -b x-v2 origin/x` sets that upstream implicitly,
+	// and pushing (or force-pushing, below) onto it would overwrite a branch
+	// the agent only based its work on. The session branch is the fallback
+	// only on a detached HEAD, where nothing is checked out.
+	bOut, _ := runGit(ctx, worktreePath, id, "branch", "--show-current")
+	pushBranch := strings.TrimSpace(bOut)
 	if pushBranch == "" {
-		// Derive from current branch.
-		bOut, _ := runGit(ctx, worktreePath, id, "branch", "--show-current")
-		pushBranch = strings.TrimSpace(bOut)
+		pushBranch = branch
 	}
 	if pushBranch == "" || pushBranch == "main" || pushBranch == "master" {
 		report.Diagnostics = "backstop refused to push from main/master"
 		return report
 	}
-	pushArgs := []string{"push", "-u", "origin", pushBranch}
+	if branch != "" && pushBranch != branch && r.logger != nil {
+		r.logger.Info("backstop publishing the checked-out branch, not the session branch",
+			"sessionId", qw.SessionID, "sessionBranch", branch, "checkedOutBranch", pushBranch)
+	}
+	refspec := "refs/heads/" + pushBranch + ":refs/heads/" + pushBranch
+	pushArgs := []string{"push", "-u", "origin", refspec}
 	if _, err := runGit(ctx, worktreePath, id, pushArgs...); err != nil {
 		// Try force-with-lease on diverged history.
 		errMsg := err.Error()
@@ -339,7 +356,7 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			report.Diagnostics = fmt.Sprintf("git push failed: %v", err)
 			return report
 		}
-		forceArgs := []string{"push", "--force-with-lease", "-u", "origin", pushBranch}
+		forceArgs := []string{"push", "--force-with-lease", "-u", "origin", refspec}
 		if _, err := runGit(ctx, worktreePath, id, forceArgs...); err != nil {
 			report.Diagnostics = fmt.Sprintf("git push --force-with-lease failed: %v", err)
 			return report
@@ -359,7 +376,10 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			"this PR so the work is not lost.",
 		qw.SessionID,
 	)
+	// --head names the branch just pushed, so gh never has to infer it from
+	// the checked-out branch's tracking configuration.
 	prOut, err := runGh(ctx, worktreePath, "pr", "create",
+		"--head", pushBranch,
 		"--title", prTitle,
 		"--body", prBody,
 	)

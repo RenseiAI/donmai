@@ -723,6 +723,131 @@ func TestRunBackstop_RecoversExistingPR(t *testing.T) {
 	}
 }
 
+// TestRunBackstop_PublishesTheCheckedOutBranch pins which branch the backstop
+// publishes. The recorded failure: the runner provisioned a session branch,
+// the agent created and switched to its own branch (tracking a DIFFERENTLY
+// named remote branch, as `git checkout -b x-v2 origin/x` does), and the
+// backstop pushed the session branch by name — a ref without the work — then
+// `gh pr create` inferred its head from the checked-out branch and refused:
+// "you must first push the current branch to a remote, or use the --head
+// flag". The backstop must publish the checked-out branch under its own name
+// (never onto the differently named upstream it tracks) and name it to gh
+// with --head. The stub gh behaves like the real one when --head is absent.
+func TestRunBackstop_PublishesTheCheckedOutBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	cases := []struct {
+		name          string
+		sessionBranch string
+		// setup runs in the clone after origin/main and origin/feature exist,
+		// and leaves the branch the agent worked on checked out.
+		setup      func(t *testing.T, repo string)
+		wantBranch string
+	}{
+		{
+			name:          "agent branch tracking a differently named upstream",
+			sessionBranch: "agent/session-1",
+			setup: func(t *testing.T, repo string) {
+				gitRun(t, repo, "branch", "agent/session-1")
+				gitRun(t, repo, "checkout", "-b", "feature-v2", "--track", "origin/feature")
+			},
+			wantBranch: "feature-v2",
+		},
+		{
+			name:          "session branch still checked out",
+			sessionBranch: "agent/session-2",
+			setup: func(t *testing.T, repo string) {
+				gitRun(t, repo, "checkout", "-b", "agent/session-2")
+			},
+			wantBranch: "agent/session-2",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := t.TempDir()
+			//nolint:gosec // G204: test fixture, args are hard-coded literals.
+			if out, err := exec.Command("git", "init", "--bare", "-b", "main", remote).CombinedOutput(); err != nil {
+				t.Fatalf("git init --bare: %v\n%s", err, out)
+			}
+			repo := t.TempDir()
+			gitInit(t, repo)
+			gitRun(t, repo, "remote", "add", "origin", remote)
+			gitRun(t, repo, "push", "-q", "origin", "main", "main:refs/heads/feature")
+			gitRun(t, repo, "fetch", "-q", "origin")
+			featureBefore := gitRun(t, remote, "rev-parse", "refs/heads/feature")
+			tc.setup(t, repo)
+			writeFile(t, repo, "src/fix.go", "package fix\n")
+
+			const wantURL = "https://github.com/RenseiAI/donmai/pull/4343"
+			argsFile := stubGhRecordingArgs(t, wantURL)
+
+			res := &Result{}
+			res.WorktreePath = repo
+			report := minimalRunner(t).runBackstop(context.Background(), QueuedWork{
+				QueuedWork: queuedWorkBase("ENG-88"),
+			}, tc.sessionBranch, res, nil)
+
+			if report.Diagnostics != "" {
+				t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+			}
+			if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+				t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+			}
+			head := gitRun(t, repo, "rev-parse", "HEAD")
+			if published := gitRun(t, remote, "rev-parse", "refs/heads/"+tc.wantBranch); published != head {
+				t.Errorf("remote %s = %s, want the committed work %s", tc.wantBranch, published, head)
+			}
+			if after := gitRun(t, remote, "rev-parse", "refs/heads/feature"); after != featureBefore {
+				t.Errorf("remote feature moved from %s to %s: the tracked upstream must never be overwritten", featureBefore, after)
+			}
+			args, err := os.ReadFile(argsFile) //nolint:gosec // G304: path created by this test.
+			if err != nil {
+				t.Fatalf("read gh args: %v", err)
+			}
+			if !strings.Contains(string(args), "\n--head\n"+tc.wantBranch+"\n") {
+				t.Errorf("gh argv = %q, want --head %s", args, tc.wantBranch)
+			}
+		})
+	}
+}
+
+// gitRun runs git in dir, failing the test on error, and returns trimmed
+// combined output.
+func gitRun(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := runGit(context.Background(), dir, gitIdentity{}, args...)
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+// stubGhRecordingArgs shadows `gh` on PATH with a stub that records its argv
+// (one argument per line, after a leading blank line) and answers `pr create`
+// the way the real gh does: without --head it refuses exactly as the
+// recorded failure did; with it, it prints url.
+func stubGhRecordingArgs(t *testing.T, url string) string {
+	t.Helper()
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "gh-args.txt")
+	script := fmt.Sprintf(`#!/bin/sh
+{ echo; printf '%%s\n' "$@"; } > %[1]q
+for a in "$@"; do
+  if [ "$a" = "--head" ]; then echo %[2]q; exit 0; fi
+done
+echo "aborted: you must first push the current branch to a remote, or use the --head flag" 1>&2
+exit 1
+`, argsFile, url)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argsFile
+}
+
 // stubGhOnPath writes a fake `gh` executable that echoes output to stderr
 // and exits with exitCode, then prepends its directory to PATH for the
 // test's duration so runGh resolves the stub instead of a real gh. The
