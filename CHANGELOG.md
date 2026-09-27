@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.50 — 2026-09-27
+
 ### Features
 
 - Install kits from Git through the CLI with explicit source kind, URL and
