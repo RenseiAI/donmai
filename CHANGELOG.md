@@ -28,6 +28,8 @@ No unreleased changes.
 - Document a fortnightly themed-release-note cadence alongside ordinary
   releases, and add a thirty-day retrospective with verified contributor
   credit.
+- Reconcile README examples with the shipped host commands and distinguish
+  persistent daemon setup from the standalone issue orchestrator.
 
 ## v0.72.47 — 2026-09-26
 
