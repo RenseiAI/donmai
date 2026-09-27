@@ -847,7 +847,8 @@ type BackstopReport struct {
 	// unfilled fields).
 	Triggered bool `json:"triggered"`
 
-	// Pushed is true when the backstop ran git push -u origin <branch>.
+	// Pushed is true when the backstop published the work (HEAD) to the
+	// session's own branch on origin.
 	Pushed bool `json:"pushed,omitempty"`
 
 	// PRCreated is true when the backstop ran gh pr create.
