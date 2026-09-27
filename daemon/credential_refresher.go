@@ -197,7 +197,10 @@ func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResu
 
 // RequestReregister coalesces bursts into one in-flight registration and at
 // most one follow-up using the most recent project declaration. ctx belongs
-// to the daemon lifecycle; cancellation prevents queued or late adoption.
+// to the daemon lifecycle. Cancellation stops queued work and is checked
+// before adoption starts. If a validator already entered, it may complete
+// without observing ctx; Stop joins that operation before publishing terminal
+// state so receipt and credentials settle together.
 func (r *CredentialRefresher) RequestReregister(ctx context.Context) <-chan struct{} {
 	if ctx == nil || ctx.Err() != nil {
 		done := make(chan struct{})

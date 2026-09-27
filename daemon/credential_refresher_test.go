@@ -323,6 +323,117 @@ func TestCredentialRefresher_ProjectUpdatePreservesRegistrationAuthority(t *test
 	}
 }
 
+func TestDaemonStopJoinsValidationBeforePublishingTerminalState(t *testing.T) {
+	controlCtx, cancelControl := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancelControl()
+	enteredValidation := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseValidation:
+		default:
+			close(releaseValidation)
+		}
+	}()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != RegisterEndpoint {
+			http.NotFound(w, request)
+			return
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_new", "runtimeToken": "new.jwt"})
+	}))
+	defer srv.Close()
+	d := New(Options{ConfigPath: "/dev/null"})
+	d.setState(StateRunning)
+	var retainedReceiptWorker string
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.MachineID = "test-machine"
+	opts.ValidateRefresh = func(result *RefreshTokenResult) error {
+		close(enteredValidation)
+		<-releaseValidation
+		retainedReceiptWorker = result.WorkerID
+		return nil
+	}
+	opts.OnRefreshed = func(result *RefreshTokenResult) {
+		d.mu.Lock()
+		d.workerID = result.WorkerID
+		d.jwt = result.RuntimeToken
+		d.mu.Unlock()
+	}
+	credentials := NewCredentialRefresher(opts)
+	reloadCtx, cancelReload := context.WithCancel(context.Background())
+	stopReachedCancel := make(chan struct{})
+	var signalOnce sync.Once
+	d.mu.Lock()
+	d.credentials = credentials
+	d.workerID = "wkr_before"
+	d.jwt = "before.jwt"
+	d.registrationReloadCtx = reloadCtx
+	d.registrationReloadCancel = func() {
+		signalOnce.Do(func() { close(stopReachedCancel) })
+		cancelReload()
+	}
+	d.mu.Unlock()
+	reloadDone := credentials.RequestReregister(reloadCtx)
+	select {
+	case <-enteredValidation:
+	case <-controlCtx.Done():
+		t.Fatal("registration did not reach validation")
+	}
+	stopCtx, cancelStop := context.WithCancel(context.Background())
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- d.Stop(stopCtx) }()
+	select {
+	case <-stopReachedCancel:
+	case <-controlCtx.Done():
+		t.Fatal("Stop did not cancel project reload")
+	}
+	cancelStop()
+	select {
+	case err := <-stopDone:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("Stop while validation is held = %v, want context cancellation", err)
+		}
+	case <-controlCtx.Done():
+		t.Fatal("Stop did not return after caller cancellation")
+	}
+	if d.State() != StateDraining {
+		t.Fatalf("state after incomplete Stop = %q, want draining", d.State())
+	}
+	select {
+	case <-d.Done():
+		t.Fatal("Done closed before in-flight validation completed")
+	default:
+	}
+	close(releaseValidation)
+	select {
+	case <-reloadDone:
+	case <-controlCtx.Done():
+		t.Fatal("registration did not finish after validation release")
+	}
+	workerID, jwt := credentials.Current()
+	d.mu.RLock()
+	daemonWorkerID, daemonJWT := d.workerID, d.jwt
+	d.mu.RUnlock()
+	if retainedReceiptWorker != "wkr_new" || workerID != "wkr_new" || jwt != "new.jwt" ||
+		daemonWorkerID != "wkr_new" || daemonJWT != "new.jwt" {
+		t.Fatal("validated receipt, refresher, and daemon credentials did not finish on the same registration")
+	}
+	if err := d.Stop(context.Background()); err != nil {
+		t.Fatalf("retry Stop after joined registration: %v", err)
+	}
+	if d.State() != StateStopped {
+		t.Fatalf("state after completed Stop = %q, want stopped", d.State())
+	}
+	select {
+	case <-d.Done():
+	default:
+		t.Fatal("Done remained open after joined Stop")
+	}
+}
+
 func TestCredentialRefresher_DeclareSessionShimSerializesCanceledReload(t *testing.T) {
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
