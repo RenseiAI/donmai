@@ -39,11 +39,13 @@ agent sessions, and exposes code intelligence without a hosted control plane.
 
 ## Install
 
-### Homebrew (macOS / Linux, recommended)
+### Homebrew (macOS, recommended)
 
 ```bash
 brew install RenseiAI/homebrew-tap/donmai
 ```
+
+On Linux, use Go installation or a release archive below.
 
 ### go install (requires Go 1.26.6+)
 

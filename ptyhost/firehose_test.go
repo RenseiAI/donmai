@@ -2,6 +2,7 @@ package ptyhost
 
 import (
 	"context"
+	"fmt"
 	"math"
 	"runtime"
 	"strconv"
@@ -121,6 +122,50 @@ func calibratedFirehoseMiB(bytes int64, elapsed time.Duration, calibration fireh
 	return mib
 }
 
+// firehoseThroughputError keeps the absolute throughput gate unchanged while
+// naming whether the same-run warmup was already below it. That distinction
+// makes a resource-sensitive CI failure legible without declaring it harmless.
+func firehoseThroughputError(mainMBs, warmupMBs, floorMBs float64, race bool) string {
+	if mainMBs >= floorMBs {
+		return ""
+	}
+	base := fmt.Sprintf("measured throughput %.2f MB/s, want >=%.1f MB/s (race=%v)", mainMBs, floorMBs, race)
+	if warmupMBs < floorMBs {
+		return fmt.Sprintf("%s; warmup baseline %.2f MB/s was also below the floor (runner capacity or concurrent load may be limiting this run; failure remains)", base, warmupMBs)
+	}
+	return fmt.Sprintf("%s; warmup baseline %.2f MB/s met the floor (main run slowed after calibration; investigate runner load and PTY path)", base, warmupMBs)
+}
+
+func TestFirehoseThroughputDiagnostic(t *testing.T) {
+	tests := []struct {
+		name      string
+		mainMBs   float64
+		warmupMBs float64
+		floorMBs  float64
+		race      bool
+		want      string
+	}{
+		{
+			name:    "runner baseline below floor",
+			mainMBs: 1.28, warmupMBs: 1.35, floorMBs: 2.0, race: true,
+			want: "measured throughput 1.28 MB/s, want >=2.0 MB/s (race=true); warmup baseline 1.35 MB/s was also below the floor (runner capacity or concurrent load may be limiting this run; failure remains)",
+		},
+		{
+			name:    "main slows after adequate warmup",
+			mainMBs: 1.28, warmupMBs: 3.50, floorMBs: 2.0, race: true,
+			want: "measured throughput 1.28 MB/s, want >=2.0 MB/s (race=true); warmup baseline 3.50 MB/s met the floor (main run slowed after calibration; investigate runner load and PTY path)",
+		},
+		{name: "floor still passes", mainMBs: 2.0, warmupMBs: 1.35, floorMBs: 2.0, race: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			if got := firehoseThroughputError(tt.mainMBs, tt.warmupMBs, tt.floorMBs, tt.race); got != tt.want {
+				t.Errorf("diagnostic = %q, want %q", got, tt.want)
+			}
+		})
+	}
+}
+
 // firehoseWorkload sizes both normal and -race producers from the REAL
 // end-to-end pipeline throughput measured on this host. A fixed byte count is
 // host-speed-sensitive: 224 MiB now drains in roughly 4.0-4.9s on faster normal
@@ -132,7 +177,7 @@ func calibratedFirehoseMiB(bytes int64, elapsed time.Duration, calibration fireh
 // main test. The projected eight-second workload leaves headroom above the
 // five-second floor without sleeping or pausing I/O, and mode-specific caps
 // bound worst-case CI output and slow-subscriber queue growth.
-func firehoseWorkload(t *testing.T) (int, float64) {
+func firehoseWorkload(t *testing.T) (int, float64, float64) {
 	t.Helper()
 
 	calibration := firehoseCalibrationForMode(raceEnabled)
@@ -187,7 +232,7 @@ drain:
 	rateMBs := float64(bytes) / elapsed.Seconds() / 1e6
 	t.Logf("firehose warmup: %d bytes in %v = %.2f MB/s (race=%v); sizing main volume to %d MiB for %v target (clamped to [%d,%d])",
 		bytes, elapsed, rateMBs, raceEnabled, mib, calibration.targetDuration, calibration.minMiB, calibration.maxMiB)
-	return mib, calibration.floorMBs
+	return mib, calibration.floorMBs, rateMBs
 }
 
 func TestCalibratedFirehoseMiB(t *testing.T) {
@@ -252,7 +297,7 @@ func testFirehoseFastSubscriber(t *testing.T) {
 	// Both modes calibrate volume from this host's observed PTY pipeline rate.
 	// The throughput floor remains mode-specific and unchanged: >=10 MB/s in a
 	// plain build and >=2 MB/s under race-detector instrumentation.
-	mib, floorMBs := firehoseWorkload(t)
+	mib, floorMBs, warmupMBs := firehoseWorkload(t)
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -312,8 +357,8 @@ loop:
 	if elapsed < firehoseMinimumDuration {
 		t.Errorf("firehose ran for only %v, want >=5s of sustained production (increase volume)", elapsed)
 	}
-	if rateMBs < floorMBs {
-		t.Errorf("measured throughput %.2f MB/s, want >=%.1f MB/s (race=%v)", rateMBs, floorMBs, raceEnabled)
+	if diagnostic := firehoseThroughputError(rateMBs, warmupMBs, floorMBs, raceEnabled); diagnostic != "" {
+		t.Error(diagnostic)
 	}
 
 	runtime.GC()
@@ -339,7 +384,7 @@ func testFirehoseSlowVsFastSubscriber(t *testing.T) {
 	// subtests cannot inherit a stale rate. The configured minimum remains above
 	// the default ring so both bounded-ring and uncapped-queue assertions stay
 	// meaningful.
-	mib, floorMBs := firehoseWorkload(t)
+	mib, floorMBs, warmupMBs := firehoseWorkload(t)
 	s, err := Spawn(Spec{Command: firehoseCommand(mib)})
 	if err != nil {
 		t.Fatalf("Spawn: %v", err)
@@ -407,8 +452,8 @@ loop:
 	if elapsed < firehoseMinimumDuration {
 		t.Errorf("fast peer ran for only %v, want >=5s of sustained production (increase volume)", elapsed)
 	}
-	if rateMBs < floorMBs {
-		t.Errorf("fast peer measured %.2f MB/s despite a stalled peer, want >=%.1f MB/s (a slow subscriber must not throttle a fast one; race=%v)", rateMBs, floorMBs, raceEnabled)
+	if diagnostic := firehoseThroughputError(rateMBs, warmupMBs, floorMBs, raceEnabled); diagnostic != "" {
+		t.Errorf("fast peer %s (a slow subscriber must not throttle a fast one)", diagnostic)
 	}
 
 	// ---- ring.go: the shared ring stays byte-bounded regardless (hard

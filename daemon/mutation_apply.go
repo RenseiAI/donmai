@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"sync"
 	"time"
@@ -97,13 +98,13 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 
 	switch m.Op {
 	case "project.enable":
-		return d.applyProjectEnableLocked(m)
+		return d.applyProjectMutationLocked(m, d.applyProjectEnableLocked)
 	case "project.disable":
-		return d.applyProjectDisableLocked(m)
+		return d.applyProjectMutationLocked(m, d.applyProjectDisableLocked)
 	case "project.add":
-		return d.applyProjectAddLocked(m)
+		return d.applyProjectMutationLocked(m, d.applyProjectAddLocked)
 	case "project.remove":
-		return d.applyProjectRemoveLocked(m)
+		return d.applyProjectMutationLocked(m, d.applyProjectRemoveLocked)
 	case "modelAccess.set":
 		return d.applyModelAccessSetLocked(m)
 	case "modelAccess.clear":
@@ -113,6 +114,27 @@ func (d *Daemon) applyOneMutation(m PendingMutation) error {
 		// platform can stop re-queueing.
 		return fmt.Errorf("unsupported mutation op %q (upgrade daemon?)", m.Op)
 	}
+}
+
+// applyProjectMutationLocked retains the last committed project declaration
+// when backup or YAML persistence fails. The mutation helpers edit d.config
+// before writing, but neither the spawner nor registration projection moves
+// until WriteConfig succeeds. Caller holds d.mu.
+func (d *Daemon) applyProjectMutationLocked(m PendingMutation, apply func(PendingMutation) error) error {
+	previousVersion := d.config.ProjectAdmissionVersion
+	previousMode := d.config.ProjectAdmissionMode
+	previousIDs := slices.Clone(d.config.EnabledProjectIDs)
+	previousRepositories := slices.Clone(d.config.Repositories)
+	previousProjects := slices.Clone(d.config.Projects)
+	if err := apply(m); err != nil {
+		d.config.ProjectAdmissionVersion = previousVersion
+		d.config.ProjectAdmissionMode = previousMode
+		d.config.EnabledProjectIDs = previousIDs
+		d.config.Repositories = previousRepositories
+		d.config.Projects = previousProjects
+		return err
+	}
+	return nil
 }
 
 // ApplySessionMutations applies only runtime session mutations and ignores
@@ -513,7 +535,14 @@ func (d *Daemon) persistProjectAdmissionAndRefreshLocked(migrated bool) error {
 			return fmt.Errorf("back up legacy project config: %w", err)
 		}
 	}
-	return d.persistAndRefreshLocked()
+	if err := d.persistAndRefreshLocked(); err != nil {
+		return err
+	}
+	// The watcher sees this atomic write after d.config and the spawner have
+	// already advanced, so its equality check suppresses the echo. Refresh the
+	// registration projection here, only after persistence has succeeded.
+	d.refreshRegistrationProjectsLocked()
+	return nil
 }
 
 func backupLegacyProjectConfig(path string) error {

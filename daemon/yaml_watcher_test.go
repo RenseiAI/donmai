@@ -1,13 +1,210 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
+	"encoding/json"
+	"log/slog"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"sync"
 	"testing"
 	"time"
 )
+
+type invalidReloadSignalWriter struct {
+	once   sync.Once
+	failed chan struct{}
+}
+
+func (w *invalidReloadSignalWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("[yaml-watcher] reload failed")) {
+		w.once.Do(func() { close(w.failed) })
+	}
+	return len(p), nil
+}
+
+func TestStartYamlWatcher_InvalidReloadKeepsLastKnownGoodState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	initial := &Config{
+		APIVersion:   "v1",
+		Kind:         "DaemonConfig",
+		Machine:      MachineConfig{ID: "m1"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 1},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test", AuthToken: "stub"},
+		Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+	}
+	if err := WriteConfig(path, initial); err != nil {
+		t.Fatalf("seed yaml: %v", err)
+	}
+	d := &Daemon{config: initial}
+	signal := &invalidReloadSignalWriter{failed: make(chan struct{})}
+	priorLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(signal, nil)))
+	defer slog.SetDefault(priorLogger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	applied := make(chan struct{}, 1)
+	stop, err := startYamlWatcher(ctx, path, func(cfg *Config) {
+		d.onYamlChanged(cfg)
+		applied <- struct{}{}
+	})
+	if err != nil {
+		t.Fatalf("start watcher: %v", err)
+	}
+	defer stop()
+	if err := os.WriteFile(path, []byte("projects: [\n"), 0o600); err != nil {
+		t.Fatalf("write invalid yaml: %v", err)
+	}
+	select {
+	case <-signal.failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not report the invalid reload")
+	}
+	select {
+	case <-applied:
+		t.Fatal("invalid YAML reached the reload callback")
+	default:
+	}
+	if len(d.config.Projects) != 1 || d.config.Projects[0].ID != "alpha" {
+		t.Fatalf("last-good project config changed after invalid YAML: %+v", d.config.Projects)
+	}
+}
+
+func TestOnYamlChanged_ModeOnlyReload(t *testing.T) {
+	initial := &Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode:    ProjectAdmissionModeEnumerated,
+		EnabledProjectIDs:       []string{"alpha"},
+	}
+	d := &Daemon{
+		config: initial,
+		spawner: NewWorkerSpawner(SpawnerOptions{
+			EnabledProjectIDs:    []string{"alpha"},
+			ProjectAdmissionMode: ProjectAdmissionModeEnumerated,
+		}),
+	}
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode:    ProjectAdmissionModeAllRouted,
+		EnabledProjectIDs:       []string{"alpha"},
+	})
+	if got := d.config.EffectiveProjectAdmissionMode(); got != ProjectAdmissionModeAllRouted {
+		t.Errorf("config mode = %q, want all-routed", got)
+	}
+	if got := d.spawner.ProjectAdmissionMode(); got != ProjectAdmissionModeAllRouted {
+		t.Errorf("spawner mode = %q, want all-routed", got)
+	}
+}
+
+func TestOnYamlChanged_LaterFullRegistrationUsesReloadedProjects(t *testing.T) {
+	requests := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		requests <- request
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_reloaded", "runtimeToken": "reloaded.jwt"})
+	}))
+	defer srv.Close()
+
+	old := &Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		EnabledProjectIDs:       []string{"alpha"},
+		Projects:                []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+	}
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	opts.Registration.DaemonProjects = AllowlistEntriesFromConfig(old.EffectiveProjectConfigs())
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{config: old, credentials: credentials}
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode:    ProjectAdmissionModeAllRouted,
+		EnabledProjectIDs:       []string{"alpha", "beta"},
+		Projects:                []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+		Repositories:            []RepositoryConfig{{ID: "repo-beta", ProjectID: "beta", Source: "github.com/x/beta"}},
+	})
+	if _, err := credentials.Refresh(context.Background(), "worker-not-found"); err != nil {
+		t.Fatalf("later full registration: %v", err)
+	}
+	request := <-requests
+	if !slices.Equal(request.ProjectIDs, []string{"alpha", "beta"}) {
+		t.Errorf("registered project IDs = %v, want alpha,beta", request.ProjectIDs)
+	}
+	if len(request.DaemonProjects) != 2 ||
+		request.DaemonProjects[0].ID != "alpha" || request.DaemonProjects[1].ID != "beta" {
+		t.Errorf("registered project entries = %+v, want merged alpha,beta", request.DaemonProjects)
+	}
+	if request.ProjectAdmissionMode != ProjectAdmissionModeAllRouted {
+		t.Errorf("registered admission mode = %q, want all-routed", request.ProjectAdmissionMode)
+	}
+}
+
+func TestOnYamlChanged_ModeOnlyEditRegistersWithoutRestart(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	requests := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		requests <- request
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_mode", "runtimeToken": "mode.jwt"})
+	}))
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	opts.Registration.ProjectAdmissionMode = ProjectAdmissionModeEnumerated
+	credentials := NewCredentialRefresher(opts)
+	d := &Daemon{
+		config: &Config{
+			ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+			ProjectAdmissionMode:    ProjectAdmissionModeEnumerated,
+			EnabledProjectIDs:       []string{"alpha"},
+		},
+		credentials:           credentials,
+		registrationReloadCtx: ctx,
+	}
+	d.onYamlChanged(&Config{
+		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
+		ProjectAdmissionMode:    ProjectAdmissionModeAllRouted,
+		EnabledProjectIDs:       []string{"alpha"},
+	})
+	if err := credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("mode-only registration: %v", err)
+	}
+	select {
+	case request := <-requests:
+		if request.ProjectAdmissionMode != ProjectAdmissionModeAllRouted {
+			t.Errorf("registered mode = %q, want all-routed", request.ProjectAdmissionMode)
+		}
+	case <-ctx.Done():
+		t.Fatal("mode-only edit made no registration request")
+	}
+}
 
 func TestStartYamlWatcher_FiresOnWrite(t *testing.T) {
 	t.Parallel()

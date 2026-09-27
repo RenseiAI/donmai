@@ -67,7 +67,8 @@ type Server struct {
 	// no such ordering of its own. A handler that observes this flag set
 	// synchronizes-with DaemonStarted, and therefore with everything Start
 	// wrote before it.
-	daemonStarted atomic.Bool
+	daemonStarted  atomic.Bool
+	startupBarrier atomic.Pointer[controlStartupBarrier]
 }
 
 // NewServer builds an HTTP server for d. The handler is registered but the
@@ -102,6 +103,10 @@ func (s *Server) Addr() string {
 func (s *Server) Start() (<-chan error, error) {
 	s.mu.Lock()
 	defer s.mu.Unlock()
+	return s.startLocked()
+}
+
+func (s *Server) startLocked() (<-chan error, error) {
 	if s.started {
 		return nil, errors.New("server already started")
 	}
@@ -125,7 +130,15 @@ func (s *Server) Start() (<-chan error, error) {
 	}
 	errCh := make(chan error, 1)
 	go func() {
-		if err := s.httpd.Serve(listener); err != nil && !errors.Is(err, http.ErrServerClosed) {
+		err := s.httpd.Serve(listener)
+		if gate := s.startupBarrier.Load(); gate != nil {
+			if poller := s.daemon.fenceControlStartup(gate); poller != nil {
+				cancelCtx, cancel := context.WithCancel(context.Background())
+				cancel()
+				_ = poller.StopContext(cancelCtx)
+			}
+		}
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
 			errCh <- err
 			return
 		}
@@ -149,13 +162,21 @@ func (s *Server) Start() (<-chan error, error) {
 // It does not by itself make the daemon ready any sooner. What it does is stop
 // the wait from being indistinguishable from a failure.
 func (s *Server) StartBeforeDaemon() (<-chan error, error) {
-	s.daemonStarted.Store(false)
-	errCh, err := s.Start()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if s.started {
+		return nil, errors.New("server already started")
+	}
+	gate, err := s.daemon.registerControlStartup(&s.daemonStarted)
 	if err != nil {
-		// Nothing is listening, so nothing is gated: restore the ordinary
-		// posture rather than leaving a server that would refuse forever if the
-		// caller retried Start.
-		s.daemonStarted.Store(true)
+		return nil, err
+	}
+	s.startupBarrier.Store(gate)
+	s.daemonStarted.Store(false)
+	errCh, err := s.startLocked()
+	if err != nil {
+		// A failed listener cannot authorize a later poll activation.
+		s.daemon.fenceControlStartup(gate)
 		return nil, err
 	}
 	return errCh, nil
@@ -165,7 +186,13 @@ func (s *Server) StartBeforeDaemon() (<-chan error, error) {
 // Daemon.Start has RETURNED — not before, and not from another goroutine
 // racing it, because this is the edge that publishes everything Start built to
 // the handlers that read it.
-func (s *Server) DaemonStarted() { s.daemonStarted.Store(true) }
+func (s *Server) DaemonStarted() {
+	if gate := s.startupBarrier.Load(); gate != nil {
+		s.daemon.publishControlStartup(gate)
+		return
+	}
+	s.daemonStarted.Store(true)
+}
 
 // gateHandler wraps the endpoint mux so a listener bound ahead of the daemon
 // answers honestly instead of serving handlers against half-built state.
@@ -185,13 +212,20 @@ func (s *Server) gateHandler(mux http.Handler) http.Handler {
 
 // Shutdown gracefully shuts down the HTTP server.
 func (s *Server) Shutdown(ctx context.Context) error {
+	// Serialize gate registration/bind with shutdown, but never join a poll
+	// callback while holding either server or daemon lifecycle metadata locks.
 	s.mu.Lock()
+	poller := s.daemon.fenceControlStartup(s.startupBarrier.Load())
 	started := s.started
 	s.mu.Unlock()
-	if !started {
-		return nil
+	var pollErr error
+	if poller != nil {
+		pollErr = poller.StopContext(ctx)
 	}
-	return s.httpd.Shutdown(ctx)
+	if !started {
+		return pollErr
+	}
+	return errors.Join(pollErr, s.httpd.Shutdown(ctx))
 }
 
 // register wires endpoint handlers. The 14 endpoints from the acceptance

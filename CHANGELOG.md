@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.49 — 2026-09-27
+
 ### Fixes
 
 - pi sessions no longer run under a fixed 16384-token output cap. The output
@@ -46,6 +50,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   branch the session does not own, or unpublished work. The force retry,
   which never took effect, is removed; a session branch that moved on the
   remote now fails the backstop with git's reason instead.
+- Keep registration project IDs, repositories, and admission mode current after
+  configuration reloads and persisted project mutations. Serialize credential
+  operations, coalesce reloads, preserve the last good declaration on failed
+  writes, and join in-progress adoption before host shutdown completes.
+- Defer initial work polling until initialization completes and the control
+  HTTP server is ready for child session-detail requests. Preserve recovery
+  diagnostics and prevent canceled, closed, or stopped startup from starting
+  a late poller.
+
+### Chores
+
+- Include warmup and main-run rates in firehose throughput failures while
+  preserving the existing throughput and data-integrity requirements.
+- Synchronize the real PTY output-batch fixture on observed frames instead of
+  assuming that shell writes and PTY reads have identical boundaries.
+- Scope the Homebrew install instructions to macOS and direct Linux users to
+  Go installation or release archives.
+- Consume the published drift-check Action by immutable commit in this
+  repository's pull-request workflow.
 
 ## v0.72.48 — 2026-09-27
 

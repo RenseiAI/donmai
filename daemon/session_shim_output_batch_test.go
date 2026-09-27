@@ -388,9 +388,10 @@ func TestShimOutputBatchPersistsOnlyConfirmedPrefixAndReplaysSuffix(t *testing.T
 				t.Fatal(err)
 			}
 			id := sessionshim.Identity{OrgID: "batch-org", SessionID: "batch-session"}
+			sourceControl, sourceSpec := newBatchPTYSource(ctx, t, dir)
 			shim, err := sessionshim.Start(sessionshim.Options{
 				Identity: id, Registry: registry, ProcessEpoch: 1,
-				Spec:   ptyhost.Spec{Command: []string{"/bin/sh", "-c", "sleep 0.05; i=0; while [ $i -lt 6 ]; do printf 'frame-%d\\n' \"$i\"; i=$((i+1)); sleep 0.02; done; read finish"}},
+				Spec:   sourceSpec,
 				Orphan: sessionshim.OrphanPolicy{Deadline: 30 * time.Second, TerminationGrace: 100 * time.Millisecond},
 			})
 			if err != nil {
@@ -403,13 +404,10 @@ func TestShimOutputBatchPersistsOnlyConfirmedPrefixAndReplaysSuffix(t *testing.T
 			}
 			defer direct.Close() //nolint:errcheck // test subscription
 			var source [][]byte
-			for len(source) < 6 {
-				select {
-				case frame := <-direct.Frames():
-					source = append(source, frame.Encode())
-				case <-ctx.Done():
-					t.Fatal("source did not produce6 exact frames")
-				}
+			// Frame count is a property of real PTY reads, not printf calls.
+			// An out-of-band handshake gates each indivisible output byte.
+			for _, b := range []byte("abcdef") {
+				source = append(source, sourceControl.emit(ctx, t, direct.Frames(), b))
 			}
 			if err := shim.Session().EmitMarker("barrier"); err != nil {
 				t.Fatal(err)
