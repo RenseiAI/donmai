@@ -29,6 +29,8 @@ No unreleased changes.
   without delaying the business result. Owning CLI processes now retain their
   shim listeners until controller detach, explicit shutdown, or the bounded
   final-screen window; handshakes cannot reopen a closed listener.
+- Refuse wake and restart mutations after the daemon observes terminal exit,
+  while retaining final-screen snapshot reads during terminal listener delivery.
 
 ### Chores
 
