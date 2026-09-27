@@ -80,9 +80,10 @@ const wakeFixtureReportLoop = `while IFS= read -r line; do ` +
 const wakeFixtureFrozenHarness = `stty -echo -isig; while :; do sleep 30; done`
 
 type wakeFixture struct {
-	daemon *Daemon
-	id     sessionshim.Identity
-	output <-chan []byte
+	daemon   *Daemon
+	id       sessionshim.Identity
+	output   <-chan []byte
+	terminal <-chan sessionshim.ControllerEvent
 	// shim is the live harness host, so a test can take it away and make the
 	// controller's next write fail for real rather than through a stub.
 	shim *sessionshim.Shim
@@ -138,9 +139,14 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	// The controller stalls if nobody drains it, so the drain IS the fixture's
 	// observation point: terminal bytes the harness produced, and nothing else.
 	output := make(chan []byte, 64)
+	terminal := make(chan sessionshim.ControllerEvent, 1)
 	go func() {
 		defer close(output)
 		for ev := range ctrl.Events() {
+			if ev.Kind == sessionshim.EventExit {
+				terminal <- ev
+			}
+
 			if ev.Kind != sessionshim.EventOutput || len(ev.Data) == 0 {
 				continue
 			}
@@ -168,7 +174,7 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	d.shims.adopted[id] = adoptedShim{shimID: "shim-wake", controller: ctrl}
 	d.shims.mu.Unlock()
 
-	return &wakeFixture{daemon: d, id: id, output: output, ctrl: ctrl, shim: shim}
+	return &wakeFixture{daemon: d, id: id, output: output, terminal: terminal, ctrl: ctrl, shim: shim}
 }
 
 // awaitAck reports whether the fake harness answered at all. A wedged harness

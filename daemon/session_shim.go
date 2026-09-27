@@ -4882,6 +4882,17 @@ func (d *Daemon) EmitAdoptedSessionShimSnapshotFor(
 }
 
 func (d *Daemon) adoptedShimController(orgID, sessionID string) (*sessionshim.Controller, error) {
+	return d.lookupAdoptedShimController(orgID, sessionID, false)
+}
+
+// liveAdoptedShimController refuses mutations once the daemon has observed Exit.
+// The terminal entry may remain during listener delivery so its controller can
+// still serve final snapshots; retained transport does not imply a live target.
+func (d *Daemon) liveAdoptedShimController(orgID, sessionID string) (*sessionshim.Controller, error) {
+	return d.lookupAdoptedShimController(orgID, sessionID, true)
+}
+
+func (d *Daemon) lookupAdoptedShimController(orgID, sessionID string, requireLive bool) (*sessionshim.Controller, error) {
 	id := sessionshim.Identity{OrgID: orgID, SessionID: sessionID}
 	if err := id.Validate(); err != nil {
 		return nil, err
@@ -4891,6 +4902,9 @@ func (d *Daemon) adoptedShimController(orgID, sessionID string) (*sessionshim.Co
 	d.shims.mu.RUnlock()
 	if !ok || entry.controller == nil {
 		return nil, fmt.Errorf("session shim: %s is not adopted by this daemon", id)
+	}
+	if requireLive && entry.terminal {
+		return nil, fmt.Errorf("session shim: %s: %w", id, sessionshim.ErrShimExited)
 	}
 	return entry.controller, nil
 }
