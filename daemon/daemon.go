@@ -1361,7 +1361,6 @@ func (d *Daemon) Start(ctx context.Context) error {
 				ClaimSuspended: d.claimSuspended,
 			})
 			credentials.Attach(d.poller)
-			d.poller.Start()
 
 			// Proactive token refresh — re-mint the runtime JWT shortly
 			// BEFORE expiry so the steady state is one quiet scheduled
@@ -1408,8 +1407,18 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	d.lifecycleMu.Lock()
+	if err := ctx.Err(); err != nil {
+		d.lifecycleMu.Unlock()
+		return err
+	}
 	if d.ownsLifecycleLocked(lease) && d.stopGen == nil && !d.sessionShimReadinessWithdrawn.Load() {
 		d.setState(StateRunning)
+		// Poll performs an immediate claim. Publish readiness only after all
+		// setup, then start polling under the same lifecycle ownership so a
+		// concurrent Stop cannot finish before a late poller starts.
+		if d.poller != nil {
+			d.poller.Start()
+		}
 	}
 	d.lifecycleMu.Unlock()
 	return nil
