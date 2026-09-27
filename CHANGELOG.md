@@ -25,6 +25,8 @@ No unreleased changes.
   preserving the existing throughput and data-integrity requirements.
 - Synchronize the real PTY output-batch fixture on observed frames instead of
   assuming that shell writes and PTY reads have identical boundaries.
+- Scope the Homebrew install instructions to macOS and direct Linux users to
+  Go installation or release archives.
 
 ## v0.72.48 — 2026-09-27
 
