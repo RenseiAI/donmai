@@ -211,9 +211,10 @@ func shouldBackstop(res *Result, workType string) bool {
 //     [backstopMaxFiles].
 //  5. `git commit -m "Backstop: <session-id>"` (skipped when nothing
 //     remains staged).
-//  6. `git push -u origin <branch>` (with --force-with-lease retry on
-//     non-fast-forward).
-//  7. `gh pr create --fill` — return the URL.
+//  6. `git push origin HEAD:refs/heads/<session branch>` — the work,
+//     whatever is checked out, to the branch the session owns; never any
+//     other remote branch, and never forced.
+//  7. `gh pr create --head <session branch>` — return the URL.
 //
 // Errors at any step short-circuit and are recorded on
 // BackstopReport.Diagnostics; the caller decides whether to surface
@@ -320,30 +321,41 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		}
 	}
 
-	// 6. Push.
-	pushBranch := branch
-	if pushBranch == "" {
-		// Derive from current branch.
-		bOut, _ := runGit(ctx, worktreePath, id, "branch", "--show-current")
-		pushBranch = strings.TrimSpace(bOut)
+	// 6. Publish the work to the SESSION branch, and only there. `branch` is
+	// the branch the runner owns for this session (the dispatched branch, or
+	// agent/<session>). The commit above landed on whatever is CHECKED OUT,
+	// which an agent may have changed: its own new branch, a shared branch it
+	// checked out by name (`git checkout develop` tracks origin/develop), a
+	// branch that tracks a differently named remote branch, or a detached
+	// HEAD. Whatever it is, HEAD is what carries the work, so HEAD is pushed
+	// to refs/heads/<session branch> — never to the checked-out branch's own
+	// name or its upstream, either of which can be a branch this session does
+	// not own. No -u: the checked-out branch's tracking configuration is left
+	// alone, and a detached HEAD has none to set.
+	//
+	// There is deliberately no force retry. A session branch that moved on
+	// the remote (a branch name reused across attempts at the same work)
+	// holds work this session cannot vouch for; a non-fast-forward fails the
+	// backstop with git's own explanation instead of overwriting it.
+	if branch == "" {
+		report.Diagnostics = "backstop refused to push: no session branch to publish to"
+		return report
 	}
-	if pushBranch == "" || pushBranch == "main" || pushBranch == "master" {
+	if branch == "main" || branch == "master" {
 		report.Diagnostics = "backstop refused to push from main/master"
 		return report
 	}
-	pushArgs := []string{"push", "-u", "origin", pushBranch}
-	if _, err := runGit(ctx, worktreePath, id, pushArgs...); err != nil {
-		// Try force-with-lease on diverged history.
-		errMsg := err.Error()
-		if !strings.Contains(errMsg, "non-fast-forward") && !strings.Contains(errMsg, "rejected") {
-			report.Diagnostics = fmt.Sprintf("git push failed: %v", err)
-			return report
+	if cur, _ := runGit(ctx, worktreePath, id, "branch", "--show-current"); strings.TrimSpace(cur) != branch && r.logger != nil {
+		checkedOut := strings.TrimSpace(cur)
+		if checkedOut == "" {
+			checkedOut = "(detached HEAD)"
 		}
-		forceArgs := []string{"push", "--force-with-lease", "-u", "origin", pushBranch}
-		if _, err := runGit(ctx, worktreePath, id, forceArgs...); err != nil {
-			report.Diagnostics = fmt.Sprintf("git push --force-with-lease failed: %v", err)
-			return report
-		}
+		r.logger.Info("backstop publishing the checked-out work to the session branch",
+			"sessionId", qw.SessionID, "sessionBranch", branch, "checkedOut", checkedOut)
+	}
+	if out, err := runGit(ctx, worktreePath, id, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
+		report.Diagnostics = fmt.Sprintf("git push of the work to session branch %q failed: %v\noutput: %s", branch, err, out)
+		return report
 	}
 	report.Pushed = true
 
@@ -359,7 +371,12 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			"this PR so the work is not lost.",
 		qw.SessionID,
 	)
+	// --head names the session branch just pushed, so gh never infers the
+	// head from the checked-out branch — which may be one this session does
+	// not own. An "already exists" PR recovered below is therefore always the
+	// session branch's own PR.
 	prOut, err := runGh(ctx, worktreePath, "pr", "create",
+		"--head", branch,
 		"--title", prTitle,
 		"--body", prBody,
 	)

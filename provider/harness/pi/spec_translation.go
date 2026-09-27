@@ -139,11 +139,25 @@ func modelPinArgs(spec agent.Spec) []string {
 		// verbatim as a wire model code (the exact upstream 400 this
 		// package fixes).
 		return []string{"--provider", provider, "--model", modelArg}
-	case spec.Endpoint != nil && spec.Endpoint.BaseURL != "":
+	case injectedProviderSelected(spec):
 		return []string{"--provider", pinnedProviderName, "--model", modelArg}
 	default:
 		return []string{"--model", modelArg}
 	}
+}
+
+// injectedProviderSelected reports whether the session's model is served by
+// the injected "donmai" provider — the one the policy extension registers
+// from the provider-pin env (extension.go providerPinEnv) — rather than by one
+// of pi's built-in providers, whose own catalog supplies the model's limits.
+// modelPinArgs selects it on exactly this condition; requireOutputLimit
+// refuses on it, so the two can never disagree about which provider serves.
+func injectedProviderSelected(spec agent.Spec) bool {
+	if spec.Model == "" || spec.Endpoint == nil || spec.Endpoint.BaseURL == "" {
+		return false
+	}
+	_, _, useNative := nativeProviderPin(spec.Model, spec.Endpoint)
+	return !useNative
 }
 
 // pinnedProviderName is the provider name the policy extension registers from

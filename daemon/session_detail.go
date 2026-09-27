@@ -379,6 +379,21 @@ type SessionResolvedProfile struct {
 	// preserves the model-default behaviour.
 	ContextWindow int `json:"contextWindow,omitempty"`
 
+	// MaxOutputTokens is the per-response output-token limit the control
+	// plane resolved for this dispatch (the model catalog's max output),
+	// stamped as a top-level resolvedProfile field beside ContextWindow.
+	// Forwarded opaquely; detailToQueuedWork bridges it into the runner
+	// profile's ProviderConfig under the "maxOutputTokens" key
+	// runner.ResolvedModelProfile.ToResolvedProfile already produces, so a
+	// harness reads one key whichever wire field carried the value. When
+	// positive it wins over modelProfile.maxOutputTokens and over any
+	// providerConfig.maxOutputTokens (runner.ReconcileResolvedProfile). It is
+	// configuration, never a default: absent (zero) on every dispatch that
+	// does not carry it, and a harness then applies no output limit of its
+	// own — or, where the serving protocol cannot omit one, refuses the
+	// session with a configuration error.
+	MaxOutputTokens int `json:"maxOutputTokens,omitempty"`
+
 	// Endpoint is the complete secret-free serving/auth projection selected at
 	// admission. Receipt-bearing work must carry it explicitly; the runner does
 	// not reconstruct an endpoint identity from ambient CLI or host defaults.

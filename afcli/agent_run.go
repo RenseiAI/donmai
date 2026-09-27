@@ -1325,8 +1325,9 @@ func applyResolvedRepositoryCompatibility(d *daemon.SessionDetail, admitted *run
 	return nil
 }
 
-// providerConfigWithContextWindow and detailEndpointBinding used to live
-// here; both moved to runner.ReconcileResolvedProfile (runner/
+// The resolvedProfile limit folding (contextWindow, maxOutputTokens) and
+// detailEndpointBinding used to live here; both moved to
+// runner.ReconcileResolvedProfile (runner/
 // resolved_profile_reconcile.go) so the daemon's preflight compiler
 // (runner.ProviderView.PreflightExecution) applies the identical
 // reconciliation this function delegates to above — see that function's doc

@@ -76,6 +76,15 @@ type SystemEvent struct {
 func (SystemEvent) Kind() EventKind { return EventSystem }
 func (SystemEvent) isAgentEvent()   {}
 
+// SystemSubtypeToolCallRefusedOutputLimit is the SystemEvent subtype a
+// harness emits for a tool call the runtime refused BEFORE execution because
+// the model's response stopped on its output-token limit (the call's
+// arguments may be truncated). It is an observation, not an error: nothing
+// ran. The activity poster forwards it as a generic context marker so the
+// refusal — and a session repeatedly hitting the limit — is visible beyond
+// the local event log.
+const SystemSubtypeToolCallRefusedOutputLimit = "tool_call_refused_output_limit"
+
 // AssistantTextEvent carries an incremental assistant-text output chunk.
 // Verbatim port of AgentAssistantTextEvent. The runner accumulates Text
 // across multiple events to scan for the WORK_RESULT marker.
