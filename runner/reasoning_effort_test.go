@@ -72,17 +72,19 @@ func TestRun_PostsReasoningEffortActivity(t *testing.T) {
 		t.Skip("git not on PATH")
 	}
 	cases := []struct {
-		effort agent.EffortLevel
-		want   string
+		effort       agent.EffortLevel
+		want         string
+		wantCtxValue string
 	}{
-		{effort: agent.EffortMax, want: "reasoning effort: max (as configured)"},
-		{effort: "", want: "reasoning effort: not configured; none was requested, so the harness or model default applies"},
+		{effort: agent.EffortMax, want: "reasoning effort: max (as configured)", wantCtxValue: "max"},
+		{effort: "", want: "reasoning effort: not configured; none was requested, so the harness or model default applies", wantCtxValue: "not-configured"},
 	}
 	for _, tc := range cases {
 		t.Run("effort="+string(tc.effort), func(t *testing.T) {
 			var (
-				mu       sync.Mutex
-				contexts []string
+				mu        sync.Mutex
+				contexts  []string
+				ctxValues []string
 			)
 			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 				if strings.HasSuffix(r.URL.Path, "/activity") {
@@ -90,13 +92,18 @@ func TestRun_PostsReasoningEffortActivity(t *testing.T) {
 					_ = r.Body.Close()
 					var body struct {
 						Activity struct {
-							Type    string `json:"type"`
-							Content string `json:"content"`
+							Type         string `json:"type"`
+							Content      string `json:"content"`
+							ContextKey   string `json:"contextKey"`
+							ContextValue string `json:"contextValue"`
 						} `json:"activity"`
 					}
 					if json.Unmarshal(raw, &body) == nil && body.Activity.Type == "context" {
 						mu.Lock()
 						contexts = append(contexts, body.Activity.Content)
+						if body.Activity.ContextKey != "" {
+							ctxValues = append(ctxValues, body.Activity.ContextKey+"="+body.Activity.ContextValue)
+						}
 						mu.Unlock()
 					}
 					w.WriteHeader(http.StatusOK)
@@ -155,6 +162,12 @@ func TestRun_PostsReasoningEffortActivity(t *testing.T) {
 			}
 			if matches != 1 {
 				t.Errorf("effort activities = %d, want exactly 1 (context activities: %q)", matches, got)
+			}
+			mu.Lock()
+			gotCtx := append([]string(nil), ctxValues...)
+			mu.Unlock()
+			if want := "reasoningEffort=" + tc.wantCtxValue; len(gotCtx) != 1 || gotCtx[0] != want {
+				t.Errorf("structured effort context = %q, want exactly [%q]", gotCtx, want)
 			}
 		})
 	}

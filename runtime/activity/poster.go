@@ -521,6 +521,12 @@ type payload struct {
 	// ProviderRef.id for the Layer 6 event.
 	ProviderName string `json:"providerName,omitempty"`
 	Timestamp    string `json:"timestamp,omitempty"`
+	// ContextKey / ContextValue carry a structured session fact on a
+	// "context" activity, next to its human-readable Content. Set only for
+	// markers that report one (the reasoning-effort record); omitted
+	// otherwise.
+	ContextKey   string `json:"contextKey,omitempty"`
+	ContextValue string `json:"contextValue,omitempty"`
 }
 
 // postActivity issues one POST to /api/sessions/<id>/activity. Returns:
@@ -739,8 +745,11 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Content = outputLimitRefusalContent
 			return out, true
 		case agent.SystemSubtypeReasoningEffort:
+			effort := agent.EffortLevel(e.Message)
 			out.Type = "context"
-			out.Content = ReasoningEffortContent(agent.EffortLevel(e.Message))
+			out.Content = ReasoningEffortContent(effort)
+			out.ContextKey = ReasoningEffortContextKey
+			out.ContextValue = ReasoningEffortContextValue(effort)
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
@@ -752,6 +761,32 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		return payload{}, false
 	}
 	return payload{}, false
+}
+
+// ReasoningEffortContextKey is the contextKey a reasoning-effort marker
+// carries, so a control plane can read the effort a session ran at without
+// parsing Content.
+const ReasoningEffortContextKey = "reasoningEffort"
+
+// Reasoning-effort contextValue sentinels for a session with no configured
+// effort, and for a configured value that is not a known level.
+const (
+	ReasoningEffortNotConfigured = "not-configured"
+	ReasoningEffortUnrecognized  = "unrecognized"
+)
+
+// ReasoningEffortContextValue is the contextValue of a reasoning-effort
+// marker: the level name when it is a known agent.EffortLevel, else one of
+// the two sentinels. Like the Content, it never carries free-form text.
+func ReasoningEffortContextValue(effort agent.EffortLevel) string {
+	switch {
+	case effort == "":
+		return ReasoningEffortNotConfigured
+	case effort.Known():
+		return string(effort)
+	default:
+		return ReasoningEffortUnrecognized
+	}
 }
 
 // ReasoningEffortContent is the fixed-vocabulary activity content for a
