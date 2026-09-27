@@ -88,14 +88,16 @@ func TestDetailToQueuedWork_ContextWindow(t *testing.T) {
 }
 
 // TestDetailToQueuedWork_MaxOutputTokens pins the output-limit leg of the
-// dispatch bridge, mirroring the contextWindow leg above: a top-level
-// resolvedProfile.maxOutputTokens must decode onto
-// daemon.SessionResolvedProfile and reach the runner-visible ProviderConfig
-// under the "maxOutputTokens" key runner.ResolvedModelProfile.ToResolvedProfile
-// produces (the key the pi and gemini harnesses read). Absent means absent:
-// nothing invents a limit the dispatch did not carry. An explicit
-// providerConfig entry wins over the top-level field, and
-// modelProfile.maxOutputTokens wins over both.
+// dispatch bridge: a top-level resolvedProfile.maxOutputTokens must decode
+// onto daemon.SessionResolvedProfile and reach the runner-visible
+// ProviderConfig under the "maxOutputTokens" key
+// runner.ResolvedModelProfile.ToResolvedProfile produces (the key the pi and
+// gemini harnesses read). Absent means absent: nothing invents a limit the
+// dispatch did not carry. The precedence is explicit: a positive top-level
+// value wins; otherwise a positive modelProfile.maxOutputTokens (even when
+// the resolvedProfile's providerConfig replaces the model profile's provider
+// config); otherwise providerConfig's own value. A zero providerConfig value
+// never disables a configured limit.
 func TestDetailToQueuedWork_MaxOutputTokens(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
@@ -117,10 +119,10 @@ func TestDetailToQueuedWork_MaxOutputTokens(t *testing.T) {
 			want:        128_000,
 		},
 		{
-			name:        "explicit providerConfig.maxOutputTokens wins over top-level",
+			name:        "top-level wins over an explicit providerConfig value",
 			detailJSON:  `{"sessionId":"s3","resolvedProfile":{"provider":"stub","maxOutputTokens":64000,"providerConfig":{"maxOutputTokens":32000}}}`,
 			wantDecoded: 64_000,
-			want:        float64(32_000),
+			want:        64_000,
 		},
 		{
 			name:       "absent maxOutputTokens stays absent (no invented limit)",
@@ -134,10 +136,36 @@ func TestDetailToQueuedWork_MaxOutputTokens(t *testing.T) {
 			want:        64_000,
 		},
 		{
-			name:        "modelProfile.maxOutputTokens supersedes the top-level field",
+			name:        "top-level wins over modelProfile.maxOutputTokens",
 			detailJSON:  `{"sessionId":"s6","modelProfile":{"id":"mp_1","providerId":"stub","model":"m","maxOutputTokens":32000},"resolvedProfile":{"provider":"stub","maxOutputTokens":64000}}`,
 			wantDecoded: 64_000,
-			want:        32_000,
+			want:        64_000,
+		},
+		{
+			name:       "modelProfile applies without a top-level value, even beside a resolvedProfile providerConfig",
+			detailJSON: `{"sessionId":"s7","modelProfile":{"id":"mp_1","providerId":"stub","model":"m","maxOutputTokens":32000},"resolvedProfile":{"provider":"stub","providerConfig":{"foo":1}}}`,
+			want:       32_000,
+		},
+		{
+			name:       "modelProfile wins over an explicit providerConfig value",
+			detailJSON: `{"sessionId":"s8","modelProfile":{"id":"mp_1","providerId":"stub","model":"m","maxOutputTokens":32000},"resolvedProfile":{"provider":"stub","providerConfig":{"maxOutputTokens":16000}}}`,
+			want:       32_000,
+		},
+		{
+			name:        "a zero providerConfig value does not disable the top-level limit",
+			detailJSON:  `{"sessionId":"s9","resolvedProfile":{"provider":"stub","maxOutputTokens":64000,"providerConfig":{"maxOutputTokens":0}}}`,
+			wantDecoded: 64_000,
+			want:        64_000,
+		},
+		{
+			name:       "a zero providerConfig value does not disable the modelProfile limit",
+			detailJSON: `{"sessionId":"s10","modelProfile":{"id":"mp_1","providerId":"stub","model":"m","maxOutputTokens":32000},"resolvedProfile":{"provider":"stub","providerConfig":{"maxOutputTokens":0}}}`,
+			want:       32_000,
+		},
+		{
+			name:       "an explicit providerConfig value applies when nothing else sets one",
+			detailJSON: `{"sessionId":"s11","resolvedProfile":{"provider":"stub","providerConfig":{"maxOutputTokens":16000}}}`,
+			want:       float64(16_000),
 		},
 	}
 	for _, tc := range cases {

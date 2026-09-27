@@ -69,7 +69,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		if rp.ProviderConfig != nil {
 			qw.ResolvedProfile.ProviderConfig = rp.ProviderConfig
 		}
-		qw.ResolvedProfile.ProviderConfig = rp.foldLimits(qw.ResolvedProfile.ProviderConfig)
+		qw.ResolvedProfile.ProviderConfig = rp.foldLimits(qw.ResolvedProfile.ProviderConfig, mp.MaxOutputTokens)
 		endpoint, err := reconciledEndpointBinding(rp.Endpoint)
 		if err != nil {
 			return qw, err
@@ -95,7 +95,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		Model:          rp.Model,
 		Effort:         agent.EffortLevel(rp.Effort),
 		CredentialID:   rp.CredentialID,
-		ProviderConfig: rp.foldLimits(rp.ProviderConfig),
+		ProviderConfig: rp.foldLimits(rp.ProviderConfig, 0),
 		Endpoint:       endpoint,
 	}
 	return qw, nil
@@ -126,13 +126,36 @@ func reconciledEndpointBinding(in *agent.EndpointBinding) (*agent.EndpointBindin
 	return &out, nil
 }
 
-// foldLimits folds the resolvedProfile's top-level model limits
-// (contextWindow, maxOutputTokens) into pc under the keys
-// ResolvedModelProfile.ToResolvedProfile uses, so a provider reads one key
-// regardless of which wire field carried the value.
-func (rp resolvedProfileWire) foldLimits(pc map[string]any) map[string]any {
+// foldLimits folds the resolvedProfile's top-level model limits into pc under
+// the keys ResolvedModelProfile.ToResolvedProfile uses, so a provider reads
+// one key regardless of which wire field carried the value.
+//
+// contextWindow fills the key only when pc does not already carry it.
+//
+// The output limit has an explicit precedence, because it is run
+// configuration a session must not lose to an incidental provider-config
+// entry: a positive top-level maxOutputTokens wins; otherwise a positive
+// modelProfileMaxOutput (the model profile's maxOutputTokens — the
+// resolvedProfile's providerConfig replaces the model profile's whole
+// provider config, so the value is passed here rather than read back from
+// pc); otherwise pc's own value stands. A non-positive or non-numeric pc
+// value therefore never disables a configured limit, and on its own the
+// harnesses read it as "no limit".
+func (rp resolvedProfileWire) foldLimits(pc map[string]any, modelProfileMaxOutput int) map[string]any {
 	pc = providerConfigWithPositiveInt(pc, "contextWindow", rp.ContextWindow)
-	return providerConfigWithPositiveInt(pc, "maxOutputTokens", rp.MaxOutputTokens)
+	limit := rp.MaxOutputTokens
+	if limit <= 0 {
+		limit = modelProfileMaxOutput
+	}
+	if limit <= 0 {
+		return pc
+	}
+	out := make(map[string]any, len(pc))
+	for k, v := range pc {
+		out[k] = v
+	}
+	out["maxOutputTokens"] = limit
+	return out
 }
 
 // providerConfigWithPositiveInt folds a positive value into pc under key. A
