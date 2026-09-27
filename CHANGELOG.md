@@ -8,7 +8,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Keep registration project IDs, repositories, and admission mode current after
+  configuration reloads and persisted project mutations. Serialize credential
+  operations, coalesce reloads, preserve the last good declaration on failed
+  writes, and join in-progress adoption before host shutdown completes.
+
+### Chores
+
+- Include warmup and main-run rates in firehose throughput failures while
+  preserving the existing throughput and data-integrity requirements.
 
 ## v0.72.48 — 2026-09-27
 
