@@ -485,6 +485,11 @@ type Daemon struct {
 	// told this address explicitly — see control_url.go.
 	controlURL atomic.Pointer[string]
 
+	// Gated control startup is optional. Metadata is guarded by lifecycleMu;
+	// no-server embedders retain immediate polling after initialization.
+	controlStartup     *controlStartupBarrier
+	pollStartupContext context.Context
+
 	// routingTraces is the in-process record of cross-provider
 	// scheduler decisions. The /api/daemon/routing/* surface reads
 	// this; future wave wires the scheduler's RecordDecision hook
@@ -1330,7 +1335,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 			if interval <= 0 {
 				interval = 5
 			}
-			d.poller = NewPollService(PollOptions{
+			poller := NewPollService(PollOptions{
 				WorkerID:        regResp.WorkerID,
 				OrchestratorURL: cfg.Orchestrator.URL,
 				RuntimeJWT:      regResp.RuntimeToken,
@@ -1360,7 +1365,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 				// leaving in-flight sessions alone.
 				ClaimSuspended: d.claimSuspended,
 			})
-			credentials.Attach(d.poller)
+			credentials.Attach(poller)
+			d.lifecycleMu.Lock()
+			d.poller = poller
+			d.lifecycleMu.Unlock()
 
 			// Proactive token refresh — re-mint the runtime JWT shortly
 			// BEFORE expiry so the steady state is one quiet scheduled
@@ -1411,14 +1419,14 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.lifecycleMu.Unlock()
 		return err
 	}
-	if d.ownsLifecycleLocked(lease) && d.stopGen == nil && !d.sessionShimReadinessWithdrawn.Load() {
-		d.setState(StateRunning)
-		// Poll performs an immediate claim. Publish readiness only after all
-		// setup, then start polling under the same lifecycle ownership so a
-		// concurrent Stop cannot finish before a late poller starts.
-		if d.poller != nil {
-			d.poller.Start()
+	if d.ownsLifecycleLocked(lease) && d.stopGen == nil {
+		if !d.sessionShimReadinessWithdrawn.Load() {
+			d.setState(StateRunning)
 		}
+		// Initialization is complete even when shim claim readiness is still
+		// recovering. Diagnostics must remain available in that state.
+		d.pollStartupContext = ctx
+		d.activateStartupPollingLocked()
 	}
 	d.lifecycleMu.Unlock()
 	return nil
@@ -1973,6 +1981,7 @@ func (d *Daemon) ResumeContext(ctx context.Context) error {
 		return errors.New("cannot resume because lifecycle ownership changed")
 	}
 	d.setState(StateRunning)
+	d.activateStartupPollingLocked()
 	return nil
 }
 
@@ -2897,4 +2906,71 @@ func (d *Daemon) SubstrateCapabilities() []internaldaemon.SubstrateCapability {
 		return nil
 	}
 	return d.capabilitySet.Capabilities()
+}
+
+// controlStartupBarrier belongs to one explicitly gated Server. A late
+// notification from a failed/closed server cannot open another server's gate.
+type controlStartupBarrier struct {
+	requested bool
+	closed    bool
+	httpReady *atomic.Bool
+}
+
+func (d *Daemon) registerControlStartup(ready *atomic.Bool) (*controlStartupBarrier, error) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if d.stopGen != nil || (d.State() != StateStopped && d.State() != StateStarting) ||
+		(d.controlStartup != nil && !d.controlStartup.closed) ||
+		(d.poller != nil && d.poller.IsRunning()) {
+		return nil, errors.New("control startup cannot replace an active or stopped daemon gate")
+	}
+	gate := &controlStartupBarrier{httpReady: ready}
+	d.controlStartup = gate
+	return gate, nil
+}
+
+func (d *Daemon) publishControlStartup(gate *controlStartupBarrier) {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if gate != d.controlStartup || gate.closed {
+		return
+	}
+	gate.requested = true
+	d.activateStartupPollingLocked()
+}
+
+// activateStartupPollingLocked publishes initialized HTTP handlers before
+// starting the short poll-goroutine activation; network polling is asynchronous.
+func (d *Daemon) activateStartupPollingLocked() {
+	if d.stopGen != nil || d.pollStartupContext == nil || d.pollStartupContext.Err() != nil {
+		return
+	}
+	if gate := d.controlStartup; gate != nil {
+		if gate.closed || !gate.requested {
+			return
+		}
+		gate.httpReady.Store(true)
+	}
+	// A recovering shim's existing claim predicate blocks requests while the
+	// loop remains alive to observe recovery. A paused startup waits for Resume.
+	state := d.State()
+	if state != StateRunning && !(state == StateRecovering && d.sessionShimEnabled()) {
+		return
+	}
+	if d.poller != nil {
+		d.poller.Start()
+	}
+}
+
+// fenceControlStartup prevents late activation before its caller joins the
+// poller outside lifecycleMu. Shutdown must never wait while holding the lock.
+func (d *Daemon) fenceControlStartup(gate *controlStartupBarrier) *PollService {
+	d.lifecycleMu.Lock()
+	defer d.lifecycleMu.Unlock()
+	if gate == nil || gate != d.controlStartup {
+		return nil
+	}
+	gate.closed = true
+	gate.httpReady.Store(false)
+	return d.poller
 }
