@@ -122,8 +122,8 @@ jobs:
           test -x "${launcher}"
           test -n "${native}"
           test -x "${native}"
-          test "$("${launcher}" --version)" = "codex-cli 0.154.0"
-          test "$("${native}" --version)" = "codex-cli 0.154.0"
+          test "$("${launcher}" --version)" = "codex-cli 0.157.1"
+          test "$("${native}" --version)" = "codex-cli 0.157.1"
           sha256sum "${launcher}" "${native}"
           donmai_bin="${fixture_dir}/donmai"
           GOWORK=off go build -o "${donmai_bin}" ./cmd/donmai

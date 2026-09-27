@@ -141,7 +141,7 @@ ENV GOTOOLCHAIN=local GOFLAGS=-mod=mod
 COPY --from=node:22-bookworm-slim /usr/local/bin/node /usr/local/bin/node
 COPY --from=node:22-bookworm-slim /usr/local/lib/node_modules /usr/local/lib/node_modules
 RUN ln -sf /usr/local/lib/node_modules/npm/bin/npm-cli.js /usr/local/bin/npm \
-    && npm i -g @anthropic-ai/claude-code@2.1.232 @openai/codex@0.147.0 \
+    && npm i -g @anthropic-ai/claude-code@2.1.283 @openai/codex@0.157.1 \
          @earendil-works/pi-coding-agent@0.80.10 \
     && npm cache clean --force
 

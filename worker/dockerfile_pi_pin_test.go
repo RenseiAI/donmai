@@ -19,15 +19,7 @@ var piPinRe = regexp.MustCompile(`@earendil-works/pi-coding-agent@([0-9]+(?:\.[0
 // (checkVersionPin denies any binary below MinVersion). A worker image that
 // installs a pi release the harness itself would refuse to run boots broken.
 func TestPiPin_MatchesProbePinnedVersion(t *testing.T) {
-	cases := []struct {
-		name string
-		path string
-	}{
-		{name: "worker/Dockerfile", path: "Dockerfile"},
-		{name: "worker/e2b/e2b.Dockerfile", path: "e2b/e2b.Dockerfile"},
-	}
-
-	for _, tc := range cases {
+	for _, tc := range workerImageDockerfiles {
 		t.Run(tc.name, func(t *testing.T) {
 			raw, err := os.ReadFile(tc.path)
 			if err != nil {
