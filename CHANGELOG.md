@@ -8,7 +8,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- Install kits from Git through the CLI with explicit source kind, URL and
+  optional branch or fully qualified ref. Unsupported kinds and incomplete
+  source options fail before sending an install request.
+
+### Fixes
+
+- Constrain legacy signature-bundle reads to bounded regular files and reject
+  linked or special files before verification and persistence. Missing bundles
+  remain unsigned and valid released signatures retain their trust behavior.
 
 ## v0.72.49 — 2026-09-27
 
