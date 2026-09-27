@@ -5,16 +5,16 @@ The Action downloads Donmai **v0.72.47**, verifies the archive against a SHA-256
 embedded in the Action, and runs `donmai arch assess --require-diff`.
 It produces a job summary, a check annotation, and (when permitted) a PR comment.
 
-After this Action is published, save these three lines as
+Save these three lines as
 `.github/workflows/drift.yml`:
 
 ```yaml
 on: pull_request
 permissions: {contents: read, pull-requests: write}
-jobs: {drift: {runs-on: ubuntu-latest, steps: [{uses: RenseiAI/donmai@main}]}}
+jobs: {drift: {runs-on: ubuntu-latest, steps: [{uses: RenseiAI/donmai-drift-action@729b5d1fe1525eabf21517cf9c43be5f0a6fc7d6}]}}
 ```
 
-Replace `main` with the reviewed **full commit SHA of the Action** for a stable,
+The example uses the reviewed **full commit SHA of v1.0.0** for a stable,
 reviewable pin. The executable has its own independent version/checksum pin;
 changing the Action ref does not select an arbitrary executable version.
 No checkout step, model account, server, daemon, or additional credential is needed.
@@ -91,20 +91,16 @@ The test cases do not contact GitHub or post comments. The required read-only
 CI test job downloads the checksum-pinned analyzer and runs this suite. The fake transport is used only by
 tests; production always calls the runner's actual `gh` executable.
 
-The repository dogfood workflow uses **base-commit Action code**, never PR-head
-code, and disables checkout credentials. Its first introduction reports a
-bootstrap notice if the base predates the Action; this is not a completed
-assessment. The first PR after the Action lands exercises the installed workflow.
+The repository dogfood workflow uses the immutable published Action above.
+It requires no repository checkout and runs the same package other repositories
+can consume. The first introducing PR used an explicit bootstrap notice; normal
+pull requests now run a complete assessment.
 
-Marketplace publication remains a separate release task. GitHub's
-[publication requirements](https://docs.github.com/en/actions/how-tos/create-and-publish-actions/publish-in-github-marketplace)
-call for an action-focused public repository, unique name, root metadata and an
-organization owner who has accepted the Marketplace Developer Agreement. This
-package (`action.yml` plus `action/`) can be copied unchanged to that repository;
-update the workflow snippet to its approved repository and immutable release SHA.
-Do not claim Marketplace availability, outside-organization use or visible
-“Used by” dependents until each is observed on GitHub. No public test comment is
-needed for local development.
+The Action is [listed on GitHub Marketplace](https://github.com/marketplace/actions/donmai-native-drift-check)
+and released from the focused [Action repository](https://github.com/RenseiAI/donmai-drift-action).
+Outside-organization use and visible “Used by” dependents are separate adoption
+evidence; the listing alone does not establish them. Local tests do not post
+public comments.
 
 GitHub documents [fork workflow permissions](https://docs.github.com/en/actions/reference/workflows-and-actions/events-that-trigger-workflows#pull_request)
 and [composite metadata](https://docs.github.com/en/actions/reference/workflows-and-actions/metadata-syntax#runs-for-composite-actions).

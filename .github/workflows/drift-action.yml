@@ -13,28 +13,8 @@ jobs:
     runs-on: ubuntu-latest
     timeout-minutes: 8
     steps:
-      - name: Read trusted base Action only
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7
-        with:
-          ref: ${{ github.event.pull_request.base.sha }}
-          persist-credentials: false
-          sparse-checkout: |
-            action.yml
-            action
-          sparse-checkout-cone-mode: false
-      - name: Check bootstrap availability
-        id: bootstrap
-        shell: bash
-        run: |
-          if [[ -f action.yml && -f action/run.py ]]; then
-            echo 'ready=true' >> "$GITHUB_OUTPUT"
-          else
-            echo 'ready=false' >> "$GITHUB_OUTPUT"
-            echo '::notice::Base commit predates the Action. No assessment ran; dogfood starts after this Action lands.'
-          fi
       - name: Assess complete PR diff
-        if: steps.bootstrap.outputs.ready == 'true'
-        uses: ./
+        uses: RenseiAI/donmai-drift-action@729b5d1fe1525eabf21517cf9c43be5f0a6fc7d6 # v1.0.0
         with:
           token: ${{ github.token }}
           comment: auto

@@ -29,6 +29,8 @@ No unreleased changes.
   assuming that shell writes and PTY reads have identical boundaries.
 - Scope the Homebrew install instructions to macOS and direct Linux users to
   Go installation or release archives.
+- Consume the published drift-check Action by immutable commit in this
+  repository's pull-request workflow.
 
 ## v0.72.48 — 2026-09-27
 
