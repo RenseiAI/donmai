@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -230,6 +231,7 @@ func TestProviderPinEnvMaxTokens(t *testing.T) {
 		{name: "zero leaves env unset", pc: map[string]any{"maxOutputTokens": 0}, want: ""},
 		{name: "negative leaves env unset", pc: map[string]any{"maxOutputTokens": -1}, want: ""},
 		{name: "non-numeric leaves env unset", pc: map[string]any{"maxOutputTokens": "64000"}, want: ""},
+		{name: "fractional leaves env unset, never truncated", pc: map[string]any{"maxOutputTokens": 1.9}, want: ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -301,6 +303,114 @@ func TestExtensionRegistersOutputLimitOnlyWhenConfigured(t *testing.T) {
 			}
 		})
 	}
+}
+
+// injectedCell is an endpoint binding the injected provider serves (a
+// loopback gateway speaking protocol), with the output limit, when positive,
+// on the spec's provider config.
+func injectedCell(protocol agent.WireProtocol, maxOut any) agent.Spec {
+	spec := agent.Spec{
+		Prompt: "hi",
+		Model:  "claude-x",
+		Endpoint: &agent.EndpointBinding{
+			Company:  agent.CompanyAnthropic,
+			BaseURL:  "http://127.0.0.1:4000/v1",
+			Host:     agent.HostGateway,
+			Protocol: protocol,
+			Model:    "claude-x",
+			Env:      map[string]string{"ANTHROPIC_API_KEY": "k-test"},
+		},
+	}
+	if maxOut != nil {
+		spec.ProviderConfig = map[string]any{"maxOutputTokens": maxOut}
+	}
+	return spec
+}
+
+// TestRequireOutputLimit pins which cells are refused for want of a
+// configured output limit: exactly those the injected provider serves over a
+// protocol that cannot omit it (anthropic-messages, google-generative-ai)
+// with no positive, whole maxOutputTokens. A configured limit, an
+// OpenAI-style protocol, or a model pi serves natively (its own catalog
+// carries the limit) is never refused, and nothing supplies a default.
+func TestRequireOutputLimit(t *testing.T) {
+	t.Parallel()
+	native := injectedCell(agent.ProtoAnthropicMessages, nil)
+	native.Endpoint = nil
+	native.Model = "anthropic/claude-x"
+	cases := []struct {
+		name    string
+		spec    agent.Spec
+		wantAPI string // "" => not refused
+	}{
+		{name: "anthropic without a limit is refused", spec: injectedCell(agent.ProtoAnthropicMessages, nil), wantAPI: "anthropic-messages"},
+		{name: "gemini without a limit is refused", spec: injectedCell(agent.ProtoGeminiGenerate, nil), wantAPI: "google-generative-ai"},
+		{name: "anthropic with a zero limit is refused", spec: injectedCell(agent.ProtoAnthropicMessages, 0), wantAPI: "anthropic-messages"},
+		{name: "anthropic with a fractional limit is refused", spec: injectedCell(agent.ProtoAnthropicMessages, 1.5), wantAPI: "anthropic-messages"},
+		{name: "anthropic with a non-numeric limit is refused", spec: injectedCell(agent.ProtoAnthropicMessages, "64000"), wantAPI: "anthropic-messages"},
+		{name: "anthropic with a configured limit is admitted", spec: injectedCell(agent.ProtoAnthropicMessages, float64(64000))},
+		{name: "gemini with a configured limit is admitted", spec: injectedCell(agent.ProtoGeminiGenerate, 64000)},
+		{name: "openai chat without a limit is admitted", spec: injectedCell(agent.ProtoOpenAIChat, nil)},
+		{name: "openai responses without a limit is admitted", spec: injectedCell(agent.ProtoOpenAIResponses, nil)},
+		{name: "a model pi serves natively is admitted", spec: native},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			err := requireOutputLimit(tc.spec)
+			if tc.wantAPI == "" {
+				if err != nil {
+					t.Fatalf("requireOutputLimit = %v, want admitted", err)
+				}
+				return
+			}
+			var refused *OutputLimitRequiredError
+			if !errors.As(err, &refused) {
+				t.Fatalf("requireOutputLimit = %v, want *OutputLimitRequiredError", err)
+			}
+			if refused.API != tc.wantAPI || !strings.Contains(err.Error(), "maxOutputTokens") {
+				t.Errorf("refusal = %+v (%q), want API %s and a message naming maxOutputTokens", refused, err, tc.wantAPI)
+			}
+		})
+	}
+}
+
+// TestSpawn_RefusesMissingOutputLimitBeforeAnyChild drives the refusal
+// through Provider.Spawn in both spawn modes: the session fails with a typed
+// configuration error wrapped as a spawn failure, and not one command reaches
+// the child. The control spawns the same cell with a configured limit.
+func TestSpawn_RefusesMissingOutputLimitBeforeAnyChild(t *testing.T) {
+	t.Parallel()
+	for _, interactive := range []bool{false, true} {
+		name := "headless"
+		if interactive {
+			name = "interactive"
+		}
+		t.Run(name, func(t *testing.T) {
+			t.Parallel()
+			spec := injectedCell(agent.ProtoAnthropicMessages, nil)
+			if interactive {
+				spec.Interactive = &agent.InteractiveSpec{}
+			}
+			cmds, _, err := spawnScripted(t, spec, "", "")
+			var refused *OutputLimitRequiredError
+			if !errors.Is(err, agent.ErrSpawnFailed) || !errors.As(err, &refused) {
+				t.Fatalf("Spawn = %v, want agent.ErrSpawnFailed wrapping *OutputLimitRequiredError", err)
+			}
+			if got := cmds.commands(); len(got) != 0 {
+				t.Errorf("commands reached the child before the refusal: %v", got)
+			}
+		})
+	}
+	t.Run("configured limit spawns", func(t *testing.T) {
+		t.Parallel()
+		_, h, err := spawnScripted(t, injectedCell(agent.ProtoAnthropicMessages, float64(64000)),
+			handshakeEvent("h1"), getStateResponse("ses_limit")+event(map[string]any{"type": "agent_settled"}))
+		if err != nil {
+			t.Fatalf("Spawn with a configured limit: %v", err)
+		}
+		drain(t, h)
+	})
 }
 
 // registeredDonmaiModel returns the single model the extension registered

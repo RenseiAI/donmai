@@ -6,6 +6,7 @@ import (
 	"embed"
 	"encoding/hex"
 	"fmt"
+	"math"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -438,9 +439,8 @@ func writeViaCache(digest string, content []byte, destPath string, perm os.FileM
 // dispatch supplies, never a value this package invents: without it the
 // extension registers the model with no output limit at all, and the serving
 // endpoint's own limit applies. (pi then sends no cap on the OpenAI-style
-// protocols. The Anthropic Messages protocol has no server-side default and
-// requires one per request, so an anthropic-messages cell on the injected
-// provider must carry the limit.)
+// protocols. The protocols that cannot omit it are refused at spawn instead —
+// requireOutputLimit — never given a default.)
 func providerPinEnv(spec agent.Spec) []string {
 	ep := spec.Endpoint
 	model := spec.Model
@@ -479,8 +479,10 @@ func providerPinEnv(spec agent.Spec) []string {
 // positiveProviderConfigInt reads a token count (context window, output
 // limit) from Spec.ProviderConfig[key]. JSON decoding yields float64 for
 // numbers, so int/int64/float64 are all accepted (the gemini harness's
-// intFromProviderConfig idiom). Missing, non-numeric, or non-positive returns
-// 0: the caller omits the pin.
+// intFromProviderConfig idiom). Missing, non-numeric, fractional, or
+// non-positive returns 0: the caller omits the pin. A fractional count is
+// rejected rather than truncated — 1.9 must not become a 1-token limit — which
+// is the same rule the extension applies (Number.isInteger).
 func positiveProviderConfigInt(spec agent.Spec, key string) int {
 	var n int
 	switch v := spec.ProviderConfig[key].(type) {
@@ -489,12 +491,60 @@ func positiveProviderConfigInt(spec agent.Spec, key string) int {
 	case int64:
 		n = int(v)
 	case float64:
+		if v != math.Trunc(v) {
+			return 0
+		}
 		n = int(v)
 	}
 	if n < 0 {
 		return 0
 	}
 	return n
+}
+
+// OutputLimitRequiredError refuses a session before any child starts when its
+// model would be served by the injected provider over a protocol that cannot
+// express "no output limit", and no limit is configured. The extension then
+// registers the model without maxTokens (there is deliberately no default), and
+// pi's request builders for these protocols send the missing limit as null —
+// which the Anthropic Messages API rejects on every request, because it has no
+// server-side default. The Gemini API is refused on the same grounds: that it
+// accepts the null is unverified. The remedy is configuration, never a
+// fallback: a positive maxOutputTokens on the model's resolved profile.
+type OutputLimitRequiredError struct {
+	// Model is the model id the session pinned.
+	Model string
+	// API is the pi protocol the injected provider would speak.
+	API string
+}
+
+func (e *OutputLimitRequiredError) Error() string {
+	return fmt.Sprintf("pi: model %q is served over the %s protocol, which needs an explicit per-response output-token limit, and none is configured: set a positive maxOutputTokens on the model's resolved profile (no default is applied)", e.Model, e.API)
+}
+
+// outputLimitRequiredAPIs are the pi protocols whose requests cannot omit the
+// output limit (see OutputLimitRequiredError). openai-completions and
+// openai-responses simply send no limit, so the serving endpoint's own applies.
+var outputLimitRequiredAPIs = map[string]bool{
+	"anthropic-messages":   true,
+	"google-generative-ai": true,
+}
+
+// requireOutputLimit returns an *OutputLimitRequiredError when the spec's model
+// is served by the injected provider over a protocol that needs an explicit
+// output limit and the spec carries no positive ProviderConfig
+// ["maxOutputTokens"]. A model pi serves through one of its built-in
+// providers is never refused here: pi's own catalog carries that model's
+// limit.
+func requireOutputLimit(spec agent.Spec) error {
+	if !injectedProviderSelected(spec) {
+		return nil
+	}
+	api := piAPIForProtocol(spec.Endpoint.Protocol)
+	if !outputLimitRequiredAPIs[api] || positiveProviderConfigInt(spec, "maxOutputTokens") > 0 {
+		return nil
+	}
+	return &OutputLimitRequiredError{Model: spec.Model, API: api}
 }
 
 // piAPIForProtocol maps a donmai WireProtocol to pi's pi-ai api name.
