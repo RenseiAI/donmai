@@ -8,7 +8,30 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- pi sessions no longer run under a fixed 16384-token output cap. The output
+  limit is configuration: a dispatch carries it as the resolved profile's
+  top-level `maxOutputTokens` (or `providerConfig.maxOutputTokens`, or the
+  model profile's `maxOutputTokens`), the harness passes it to the policy
+  extension, and the extension registers it as the model's limit. With none
+  configured, the model is registered with no output limit and the serving
+  endpoint's own limit applies. An Anthropic-protocol endpoint on the
+  injected provider requires the limit to be configured.
+- A pi tool call that the runtime refused before execution, because its
+  assistant message stopped on the output-token limit, is recorded as that
+  refusal and surfaced as a `tool_call_refused_output_limit` event, instead
+  of as a missing policy ruling that failed the whole run. An unruled call
+  that is not explained that way still fails the run as before.
+- Stage token budgets count a harness's running-total usage once. A steered
+  session whose second result repeated the first result's tokens was measured
+  at nearly double its real spend and could fail a token cap it never
+  reached. Harnesses that report per-result usage keep their accounting.
+- The backstop publishes the branch the work was committed on, under its own
+  name, and names it to `gh pr create` with `--head`. When an agent switched
+  to its own branch that tracked a differently named remote branch, the
+  backstop used to push the session branch (without the work) and the PR step
+  failed.
 
 ## v0.72.48 — 2026-09-27
 
