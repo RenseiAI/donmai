@@ -374,6 +374,10 @@ func TestDaemonRestartPreservesLiveInteractiveSession(t *testing.T) {
 	if err := c2.Stop(shimwire.StopOperator); err != nil {
 		t.Fatalf("Stop: %v", err)
 	}
+	// Exit is business completion; detaching the final-screen consumer ends
+	// the separately retained owner lifetime before expecting process exit.
+	_ = awaitFinalScreenExit(t, c2)
+	res2.Close()
 	waitForProcessExit(t, f.cmd)
 
 	// The harness process group is really gone.
