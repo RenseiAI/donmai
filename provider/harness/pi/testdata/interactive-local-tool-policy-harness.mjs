@@ -36,6 +36,12 @@
 // verbatim (see checkStrippedSyntax below): a loud, diagnosable failure,
 // never a silent skip.
 //
+// The same activation also records every pi.registerProvider call and prints
+// it under "providers", so the provider pin the extension builds from env
+// (DONMAI_PI_BASE_URL / DONMAI_PI_MODEL / DONMAI_PI_CONTEXT_WINDOW /
+// DONMAI_PI_MAX_TOKENS) is asserted on the real extension too, not only on
+// the Go side that exports the env.
+//
 // Usage: node interactive-local-tool-policy-harness.mjs <extensionPath> <toolName> <inputJSON>
 // Env: DONMAI_PI_ALLOWED_TOOLS / DONMAI_PI_DISALLOWED_TOOLS (JSON arrays, may
 // be absent or "[]"); DONMAI_PI_HANDSHAKE must NOT be set by the caller.
@@ -336,8 +342,11 @@ checkStrippedSyntax(stripped);
 const dataURL = "data:text/javascript;base64," + Buffer.from(stripped, "utf8").toString("base64");
 
 const handlers = {};
+const providers = [];
 const stubPi = {
-  registerProvider() {},
+  registerProvider(name, config) {
+    providers.push({ name, config });
+  },
   registerTool() {},
   on(event, handler) {
     handlers[event] = handler;
@@ -349,7 +358,7 @@ mod.default(stubPi);
 
 const handler = handlers["tool_call"];
 if (!handler) {
-  console.log(JSON.stringify({ registered: false, verdict: null }));
+  console.log(JSON.stringify({ registered: false, verdict: null, providers }));
   process.exit(0);
 }
 
@@ -363,4 +372,4 @@ if (inputJSON) {
 }
 
 const verdict = await handler({ toolName, input }, {});
-console.log(JSON.stringify({ registered: true, verdict: verdict ?? null }));
+console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers }));

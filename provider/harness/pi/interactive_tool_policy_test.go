@@ -149,6 +149,19 @@ func nodeAvailable(t *testing.T) {
 // enforcement without spawning the real `pi` binary.
 func localToolPolicyFixtureVerdict(t *testing.T, allowedJSON, disallowedJSON, toolName, inputJSON string) map[string]any {
 	t.Helper()
+	return runExtensionFixture(t, []string{
+		"DONMAI_PI_ALLOWED_TOOLS=" + allowedJSON,
+		"DONMAI_PI_DISALLOWED_TOOLS=" + disallowedJSON,
+	}, toolName, inputJSON)
+}
+
+// runExtensionFixture activates the REAL production extension inside
+// testdata/interactive-local-tool-policy-harness.mjs with env appended to the
+// test process's environment, offers it one guarded tool_call, and returns
+// the harness's JSON report (the tool_call verdict plus every provider the
+// extension registered).
+func runExtensionFixture(t *testing.T, env []string, toolName, inputJSON string) map[string]any {
+	t.Helper()
 	nodeAvailable(t)
 
 	harness, err := filepath.Abs(filepath.Join("testdata", "interactive-local-tool-policy-harness.mjs"))
@@ -161,10 +174,7 @@ func localToolPolicyFixtureVerdict(t *testing.T, allowedJSON, disallowedJSON, to
 	}
 
 	cmd := exec.Command("node", harness, extPath, toolName, inputJSON) //nolint:gosec // G204: fixed test-only harness path + node binary resolved from PATH; args are constants and this test's own JSON literals.
-	cmd.Env = append(os.Environ(),
-		"DONMAI_PI_ALLOWED_TOOLS="+allowedJSON,
-		"DONMAI_PI_DISALLOWED_TOOLS="+disallowedJSON,
-	)
+	cmd.Env = append(os.Environ(), env...)
 	// DONMAI_PI_HANDSHAKE deliberately absent from cmd.Env beyond whatever the
 	// test process itself has (none, in CI) — the interactive lane never sets
 	// it, and this harness's job is to prove behavior under that exact

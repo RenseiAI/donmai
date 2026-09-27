@@ -467,6 +467,15 @@ export default function activate(pi: ExtensionAPI) {
   const contextWindowEnv = Number(process.env.DONMAI_PI_CONTEXT_WINDOW ?? "");
   const contextWindow =
     Number.isInteger(contextWindowEnv) && contextWindowEnv > 0 ? contextWindowEnv : 200000;
+  // Output-token pin: the harness exports the resolved profile's per-response
+  // output limit as DONMAI_PI_MAX_TOKENS only when the dispatch carried one
+  // (extension.go providerPinEnv). There is deliberately NO fallback value:
+  // an output limit is configuration, not something this extension invents.
+  // Unset (or invalid), the model is registered without maxTokens, so pi
+  // requests no output cap and the serving endpoint's own limit applies. A
+  // fixed cap here once cut long reasoning turns off mid tool call.
+  const maxTokensEnv = Number(process.env.DONMAI_PI_MAX_TOKENS ?? "");
+  const maxTokens = Number.isInteger(maxTokensEnv) && maxTokensEnv > 0 ? maxTokensEnv : undefined;
   if (baseUrl && model) {
     try {
       pi.registerProvider("donmai", {
@@ -481,7 +490,7 @@ export default function activate(pi: ExtensionAPI) {
             input: ["text"],
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow,
-            maxTokens: 16384,
+            ...(maxTokens === undefined ? {} : { maxTokens }),
           },
         ],
       });

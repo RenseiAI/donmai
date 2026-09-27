@@ -210,6 +210,123 @@ func TestExtensionReadsContextWindowEnv(t *testing.T) {
 	}
 }
 
+// TestProviderPinEnvMaxTokens pins the output-limit half of the pin: a
+// positive ProviderConfig["maxOutputTokens"] (whatever numeric type the JSON
+// decode produced) rides piOutputLimitEnvVar to the child extension, and a
+// missing/zero/invalid value leaves the var UNSET — the harness never invents
+// an output limit the dispatch did not carry.
+func TestProviderPinEnvMaxTokens(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name string
+		pc   map[string]any
+		want string // "" => piOutputLimitEnvVar must be absent
+	}{
+		{name: "int value exported", pc: map[string]any{"maxOutputTokens": 64000}, want: "64000"},
+		{name: "float64 from JSON decode exported", pc: map[string]any{"maxOutputTokens": float64(128000)}, want: "128000"},
+		{name: "int64 exported", pc: map[string]any{"maxOutputTokens": int64(32000)}, want: "32000"},
+		{name: "absent config leaves env unset", pc: nil, want: ""},
+		{name: "context window alone leaves env unset", pc: map[string]any{"contextWindow": 1_000_000}, want: ""},
+		{name: "zero leaves env unset", pc: map[string]any{"maxOutputTokens": 0}, want: ""},
+		{name: "negative leaves env unset", pc: map[string]any{"maxOutputTokens": -1}, want: ""},
+		{name: "non-numeric leaves env unset", pc: map[string]any{"maxOutputTokens": "64000"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			env := providerPinEnv(agent.Spec{Model: "claude-x", ProviderConfig: tc.pc})
+			if tc.want != "" {
+				if !containsEnv(env, piOutputLimitEnvVar, tc.want) {
+					t.Errorf("pin env missing %s=%s: %v", piOutputLimitEnvVar, tc.want, env)
+				}
+				return
+			}
+			for _, e := range env {
+				if strings.HasPrefix(e, piOutputLimitEnvVar+"=") {
+					t.Errorf("pin env must not carry %s for config %v: %v", piOutputLimitEnvVar, tc.pc, env)
+				}
+			}
+		})
+	}
+}
+
+// TestExtensionRegistersOutputLimitOnlyWhenConfigured activates the REAL
+// embedded extension (testdata harness, no pi binary) and reads back the
+// model it registers for the "donmai" provider. A configured output limit is
+// registered as the model's maxTokens; with none configured (or an invalid
+// value) the model carries NO maxTokens at all, so pi requests no output cap
+// and the serving endpoint's own limit applies. The removed fixed cap must
+// not come back as a literal either.
+func TestExtensionRegistersOutputLimitOnlyWhenConfigured(t *testing.T) {
+	t.Parallel()
+	if src := string(extensionSource()); strings.Contains(src, "maxTokens: 16384") {
+		t.Fatalf("embedded extension still hardcodes the output limit")
+	}
+	cases := []struct {
+		name     string
+		maxToken string
+		want     float64 // 0 => maxTokens must be absent
+	}{
+		{name: "configured limit is registered", maxToken: "64000", want: 64000},
+		{name: "unset registers no limit", maxToken: ""},
+		{name: "zero registers no limit", maxToken: "0"},
+		{name: "negative registers no limit", maxToken: "-5"},
+		{name: "fractional registers no limit", maxToken: "1.5"},
+		{name: "non-numeric registers no limit", maxToken: "lots"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out := runExtensionFixture(t, []string{
+				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+				piModelEnvVar + "=served-model",
+				piContextWindowEnvVar + "=262144",
+				// Always set, even when empty, so an inherited value in the
+				// test process's own environment can never leak in.
+				piOutputLimitEnvVar + "=" + tc.maxToken,
+			}, "read", `{"path":"README.md"}`)
+			model := registeredDonmaiModel(t, out)
+			if cw, _ := model["contextWindow"].(float64); cw != 262144 {
+				t.Errorf("registered contextWindow = %v, want 262144", model["contextWindow"])
+			}
+			got, present := model["maxTokens"]
+			if tc.want == 0 {
+				if present {
+					t.Errorf("registered maxTokens = %v, want the key absent", got)
+				}
+				return
+			}
+			if got != tc.want {
+				t.Errorf("registered maxTokens = %v (present=%t), want %v", got, present, tc.want)
+			}
+		})
+	}
+}
+
+// registeredDonmaiModel returns the single model the extension registered
+// under the "donmai" provider in a fixture report.
+func registeredDonmaiModel(t *testing.T, out map[string]any) map[string]any {
+	t.Helper()
+	providers, _ := out["providers"].([]any)
+	if len(providers) != 1 {
+		t.Fatalf("registered providers = %v, want exactly one", out["providers"])
+	}
+	p, _ := providers[0].(map[string]any)
+	if name, _ := p["name"].(string); name != pinnedProviderName {
+		t.Fatalf("registered provider name = %v, want %q", p["name"], pinnedProviderName)
+	}
+	config, _ := p["config"].(map[string]any)
+	models, _ := config["models"].([]any)
+	if len(models) != 1 {
+		t.Fatalf("registered models = %v, want exactly one", config["models"])
+	}
+	model, _ := models[0].(map[string]any)
+	if id, _ := model["id"].(string); id != "served-model" {
+		t.Fatalf("registered model id = %v, want served-model", model["id"])
+	}
+	return model
+}
+
 func containsEnv(env []string, key, val string) bool {
 	for _, e := range env {
 		if e == key+"="+val {

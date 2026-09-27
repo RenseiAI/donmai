@@ -54,11 +54,15 @@ const (
 	// PiKeyEnvVar; these carry the non-secret routing pin. The context-window
 	// pin is conditional: set only when the resolved profile carries a
 	// positive ProviderConfig["contextWindow"], so an unpinned session keeps
-	// the extension's built-in default.
+	// the extension's built-in default. The output-token pin is conditional
+	// the same way (ProviderConfig["maxOutputTokens"]), but it has NO
+	// fallback: unset, the extension registers the model without an output
+	// limit, so the serving endpoint's own limit applies.
 	piBaseURLEnvVar       = "DONMAI_PI_BASE_URL"
 	piAPIEnvVar           = "DONMAI_PI_API"
 	piModelEnvVar         = "DONMAI_PI_MODEL"
 	piContextWindowEnvVar = "DONMAI_PI_CONTEXT_WINDOW"
+	piOutputLimitEnvVar   = "DONMAI_PI_MAX_TOKENS"
 	piHandshakeEnvVar     = "DONMAI_PI_HANDSHAKE"
 
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
@@ -428,6 +432,15 @@ func writeViaCache(digest string, content []byte, destPath string, perm os.FileM
 // modelProfile wire shapes. Without it the extension keeps its built-in
 // default, so a control plane that resolved a 1M-context model is no longer
 // silently clamped to that default.
+//
+// The output-token pin (piOutputLimitEnvVar) follows the same rule from
+// ProviderConfig["maxOutputTokens"]. An output limit is configuration the
+// dispatch supplies, never a value this package invents: without it the
+// extension registers the model with no output limit at all, and the serving
+// endpoint's own limit applies. (pi then sends no cap on the OpenAI-style
+// protocols. The Anthropic Messages protocol has no server-side default and
+// requires one per request, so an anthropic-messages cell on the injected
+// provider must carry the limit.)
 func providerPinEnv(spec agent.Spec) []string {
 	ep := spec.Endpoint
 	model := spec.Model
@@ -454,28 +467,34 @@ func providerPinEnv(spec agent.Spec) []string {
 		piAPIEnvVar + "=" + api,
 		piModelEnvVar + "=" + model,
 	}
-	if cw := contextWindowFromSpec(spec); cw > 0 {
+	if cw := positiveProviderConfigInt(spec, "contextWindow"); cw > 0 {
 		out = append(out, piContextWindowEnvVar+"="+strconv.Itoa(cw))
+	}
+	if maxOut := positiveProviderConfigInt(spec, "maxOutputTokens"); maxOut > 0 {
+		out = append(out, piOutputLimitEnvVar+"="+strconv.Itoa(maxOut))
 	}
 	return out
 }
 
-// contextWindowFromSpec reads the resolved context-window size (tokens) from
-// Spec.ProviderConfig["contextWindow"]. JSON decoding yields float64 for
+// positiveProviderConfigInt reads a token count (context window, output
+// limit) from Spec.ProviderConfig[key]. JSON decoding yields float64 for
 // numbers, so int/int64/float64 are all accepted (the gemini harness's
-// intFromProviderConfig idiom). Missing or non-positive returns 0: the caller
-// omits the pin and the extension falls back to its default.
-func contextWindowFromSpec(spec agent.Spec) int {
-	switch v := spec.ProviderConfig["contextWindow"].(type) {
+// intFromProviderConfig idiom). Missing, non-numeric, or non-positive returns
+// 0: the caller omits the pin.
+func positiveProviderConfigInt(spec agent.Spec, key string) int {
+	var n int
+	switch v := spec.ProviderConfig[key].(type) {
 	case int:
-		return v
+		n = v
 	case int64:
-		return int(v)
+		n = int(v)
 	case float64:
-		return int(v)
-	default:
+		n = int(v)
+	}
+	if n < 0 {
 		return 0
 	}
+	return n
 }
 
 // piAPIForProtocol maps a donmai WireProtocol to pi's pi-ai api name.

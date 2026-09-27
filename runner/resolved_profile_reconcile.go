@@ -14,15 +14,16 @@ import (
 // mutation_apply.go); importing daemon back from runner would cycle. The
 // shared contract is the JSON field names, not the Go type.
 type resolvedProfileWire struct {
-	Harness        string                 `json:"harness,omitempty"`
-	Provider       string                 `json:"provider,omitempty"`
-	Runner         string                 `json:"runner,omitempty"`
-	Model          string                 `json:"model,omitempty"`
-	Effort         string                 `json:"effort,omitempty"`
-	CredentialID   string                 `json:"credentialId,omitempty"`
-	ProviderConfig map[string]any         `json:"providerConfig,omitempty"`
-	ContextWindow  int                    `json:"contextWindow,omitempty"`
-	Endpoint       *agent.EndpointBinding `json:"endpoint,omitempty"`
+	Harness         string                 `json:"harness,omitempty"`
+	Provider        string                 `json:"provider,omitempty"`
+	Runner          string                 `json:"runner,omitempty"`
+	Model           string                 `json:"model,omitempty"`
+	Effort          string                 `json:"effort,omitempty"`
+	CredentialID    string                 `json:"credentialId,omitempty"`
+	ProviderConfig  map[string]any         `json:"providerConfig,omitempty"`
+	ContextWindow   int                    `json:"contextWindow,omitempty"`
+	MaxOutputTokens int                    `json:"maxOutputTokens,omitempty"`
+	Endpoint        *agent.EndpointBinding `json:"endpoint,omitempty"`
 }
 
 // ReconcileResolvedProfile applies the platform's per-session model/provider
@@ -68,7 +69,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		if rp.ProviderConfig != nil {
 			qw.ResolvedProfile.ProviderConfig = rp.ProviderConfig
 		}
-		qw.ResolvedProfile.ProviderConfig = providerConfigWithContextWindow(qw.ResolvedProfile.ProviderConfig, rp.ContextWindow)
+		qw.ResolvedProfile.ProviderConfig = rp.foldLimits(qw.ResolvedProfile.ProviderConfig)
 		endpoint, err := reconciledEndpointBinding(rp.Endpoint)
 		if err != nil {
 			return qw, err
@@ -94,7 +95,7 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		Model:          rp.Model,
 		Effort:         agent.EffortLevel(rp.Effort),
 		CredentialID:   rp.CredentialID,
-		ProviderConfig: providerConfigWithContextWindow(rp.ProviderConfig, rp.ContextWindow),
+		ProviderConfig: rp.foldLimits(rp.ProviderConfig),
 		Endpoint:       endpoint,
 	}
 	return qw, nil
@@ -125,25 +126,34 @@ func reconciledEndpointBinding(in *agent.EndpointBinding) (*agent.EndpointBindin
 	return &out, nil
 }
 
-// providerConfigWithContextWindow folds a non-zero contextWindow into pc
-// under the "contextWindow" key, matching the key
+// foldLimits folds the resolvedProfile's top-level model limits
+// (contextWindow, maxOutputTokens) into pc under the keys
 // ResolvedModelProfile.ToResolvedProfile uses, so a provider reads one key
-// regardless of which wire field carried the value. A no-op when
-// contextWindow is zero or pc already carries the key.
-func providerConfigWithContextWindow(pc map[string]any, contextWindow int) map[string]any {
-	if contextWindow <= 0 {
+// regardless of which wire field carried the value.
+func (rp resolvedProfileWire) foldLimits(pc map[string]any) map[string]any {
+	pc = providerConfigWithPositiveInt(pc, "contextWindow", rp.ContextWindow)
+	return providerConfigWithPositiveInt(pc, "maxOutputTokens", rp.MaxOutputTokens)
+}
+
+// providerConfigWithPositiveInt folds a positive value into pc under key. A
+// no-op when value is not positive or pc already carries the key: an explicit
+// providerConfig entry (or a modelProfile-derived one) wins over the
+// top-level wire field. pc is never mutated; a copy is returned when the key
+// is added.
+func providerConfigWithPositiveInt(pc map[string]any, key string, value int) map[string]any {
+	if value <= 0 {
 		return pc
 	}
-	if _, ok := pc["contextWindow"]; ok {
+	if _, ok := pc[key]; ok {
 		return pc
 	}
 	// CodeQL (go/allocation-size-overflow) flags an unbounded +1 capacity hint
 	// as a possible allocation-size overflow; len(pc) alone is a safe hint and
-	// the map still grows correctly when the "contextWindow" key is inserted.
+	// the map still grows correctly when the key is inserted.
 	out := make(map[string]any, len(pc))
 	for k, v := range pc {
 		out[k] = v
 	}
-	out["contextWindow"] = contextWindow
+	out[key] = value
 	return out
 }
