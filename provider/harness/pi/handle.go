@@ -70,7 +70,7 @@ type outputLimitRefusal struct {
 
 // outputLimitRefusalSubtype is the SystemEvent subtype the monitor emits for
 // an outputLimitRefusal: an observation, never an error, because nothing ran.
-const outputLimitRefusalSubtype = "tool_call_refused_output_limit"
+const outputLimitRefusalSubtype = agent.SystemSubtypeToolCallRefusedOutputLimit
 
 // adjudicationMissingCode is the non-fatal error code the monitor emits for a
 // guarded tool call that ended without a recorded outcome. Distinct from
@@ -147,7 +147,8 @@ type Handle struct {
 	// ruling can exist for it. The runtime emits that message_end BEFORE the
 	// hook-less start/end pair, and dispatch is single-goroutine, so the entry
 	// is always in place when the end arrives. An entry is consumed by the
-	// end it explains. Guarded by adjMu; never read as a ruling.
+	// end it explains, and every entry is dropped at the turn's turn_end.
+	// Guarded by adjMu; never read as a ruling.
 	lengthStopped       map[string]string
 	outputLimitRefusals []outputLimitRefusal
 
@@ -384,8 +385,15 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.handleExtensionRequest(ev)
 		return false
 	}
-	if ev.Type == "message_end" {
+	switch ev.Type {
+	case "message_end":
 		h.noteLengthStoppedToolCalls(ev)
+	case "turn_end":
+		// pi emits the refused start/end pairs before the turn_end that
+		// closes their turn, so any note still standing here explains nothing
+		// that can legitimately follow — drop it rather than let it excuse a
+		// later end that reuses the id.
+		h.clearLengthStoppedToolCalls()
 	}
 
 	// Integrity monitor: every guarded tool_execution_END is matched against
@@ -562,6 +570,13 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 		}
 		h.lengthStopped[callID] = tool
 	}
+}
+
+// clearLengthStoppedToolCalls drops every length-stop note at a turn boundary.
+func (h *Handle) clearLengthStoppedToolCalls() {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	clear(h.lengthStopped)
 }
 
 // refusedForOutputLimit reports whether a guarded end with no ruling is the

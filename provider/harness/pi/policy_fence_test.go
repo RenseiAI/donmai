@@ -65,6 +65,11 @@ const (
 // reason whose content carries one toolCall part per {id, name} pair, in the
 // runtime's AssistantMessage shape.
 func assistantMessageEnd(stopReason string, calls ...[2]string) string {
+	return messageEnd("assistant", stopReason, calls...)
+}
+
+// messageEnd is assistantMessageEnd for any message role.
+func messageEnd(role, stopReason string, calls ...[2]string) string {
 	content := []any{map[string]any{"type": "thinking", "thinking": "planning the edit"}}
 	for _, c := range calls {
 		content = append(content, map[string]any{"type": "toolCall", "id": c[0], "name": c[1], "arguments": map[string]any{}})
@@ -72,7 +77,7 @@ func assistantMessageEnd(stopReason string, calls ...[2]string) string {
 	return event(map[string]any{
 		"type": "message_end",
 		"message": map[string]any{
-			"role":       "assistant",
+			"role":       role,
 			"content":    content,
 			"api":        "openai-completions",
 			"provider":   "donmai",
@@ -264,6 +269,34 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
 				truncatedCallPair("bash", "c-trunc"),
 			wantMissIDs: []string{"c-trunc"},
+		},
+		{
+			// Only an ASSISTANT message's stop reason says the runtime cut
+			// the response off; the same fields on any other role excuse
+			// nothing.
+			name: "a non-assistant message with a length stop excuses nothing",
+			body: messageEnd("toolResult", "length", [2]string{"c-trunc", "edit"}) +
+				truncatedCallPair("edit", "c-trunc"),
+			wantMissIDs: []string{"c-trunc"},
+		},
+		{
+			// A note does not outlive its turn: the refused pair always
+			// precedes turn_end, so a later end reusing the id is unexplained.
+			name: "a length-stop note does not survive turn_end",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				event(map[string]any{"type": "turn_end"}) +
+				truncatedCallPair("edit", "c-trunc"),
+			wantMissIDs: []string{"c-trunc"},
+		},
+		{
+			// A success-claiming end leaves its note unconsumed; turn_end
+			// still drops it, so it cannot excuse a later errored end.
+			name: "an unconsumed note is dropped at turn_end",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				endEvent("edit", "toolCallId", "c-trunc", false) +
+				event(map[string]any{"type": "turn_end"}) +
+				endEvent("edit", "toolCallId", "c-trunc", true),
+			wantMissIDs: []string{"c-trunc", "c-trunc"},
 		},
 		{
 			// One named call explains one end event, not a second one.

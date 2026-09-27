@@ -154,11 +154,13 @@
 //     receipt (acceptsPreExecutionRefusal). Ordinary; nothing is reported.
 //     A call the runtime refused on an output-limit stop is recorded as that
 //     refusal (refusedForOutputLimit) and surfaced as a SystemEvent
-//     ("tool_call_refused_output_limit"), not as a miss: its id was named by
+//     (agent.SystemSubtypeToolCallRefusedOutputLimit, which the activity
+//     poster forwards as a context marker), not as a miss: its id was named by
 //     a length-stopped assistant message, the end names the same tool, and
 //     the end positively reports an error result. The evidence is the
 //     runtime's own message_end, never result text; a length-stopped id whose
-//     end claims SUCCESS is not excused and falls to case 3.
+//     end claims SUCCESS is not excused and falls to case 3, and every note is
+//     dropped at its turn's turn_end.
 //  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
 //     that could not be registered, or a call id that could not be correlated
 //     all land here. The call is recorded as unproven and surfaced as a

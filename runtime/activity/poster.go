@@ -68,6 +68,13 @@ const (
 	// initialPromptDeliveredContent is intentionally generic: the activity
 	// marker confirms runner delivery without forwarding prompt content.
 	initialPromptDeliveredContent = "interactive initial prompt delivered"
+
+	// outputLimitRefusalContent is the fixed text forwarded for
+	// agent.SystemSubtypeToolCallRefusedOutputLimit. Fixed for the same
+	// reason: the marker states what happened without forwarding the
+	// event's free-form Message. The refused call itself is already visible
+	// as the adjacent errored tool result.
+	outputLimitRefusalContent = "tool call refused before execution: the model's response hit its output-token limit"
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -605,9 +612,11 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
 // (Init / most System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render. Two SystemEvent subtypes are forwarded:
-// "reasoning" becomes a thought, and "interactive-initial-prompt-delivered"
-// becomes a generic context marker that never carries prompt content.
+// signals the platform doesn't render. Three SystemEvent subtypes are
+// forwarded: "reasoning" becomes a thought, and
+// "interactive-initial-prompt-delivered" and
+// agent.SystemSubtypeToolCallRefusedOutputLimit become generic context
+// markers with fixed content (never the event's Message).
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -715,6 +724,10 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			// prompt itself.
 			out.Type = "context"
 			out.Content = initialPromptDeliveredContent
+			return out, true
+		case agent.SystemSubtypeToolCallRefusedOutputLimit:
+			out.Type = "context"
+			out.Content = outputLimitRefusalContent
 			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,

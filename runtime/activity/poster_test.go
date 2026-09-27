@@ -603,6 +603,14 @@ func TestEventMappingTable(t *testing.T) {
 			rejectContent: "private prompt text",
 		},
 		{
+			name:          "System output-limit refusal -> generic context",
+			event:         agent.SystemEvent{Subtype: agent.SystemSubtypeToolCallRefusedOutputLimit, Message: "free-form message must not cross the wire"},
+			wantSent:      true,
+			wantType:      "context",
+			wantContent:   "tool call refused before execution: the model's response hit its output-token limit",
+			rejectContent: "free-form message",
+		},
+		{
 			name:     "System interactive start -> skipped",
 			event:    agent.SystemEvent{Subtype: "interactive-session-started", Message: "started"},
 			wantSent: false,
