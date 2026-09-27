@@ -1154,6 +1154,14 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// loop. The retained Exit frame rides the ordinary replay path below.
 	s.recordMu.Lock()
 	s.mu.Lock()
+	// Close and controller installation linearize under the same lock. A
+	// previously accepted Hello cannot reopen serving after teardown won.
+	if s.closed {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodePhaseUnknown, "session shim is no longer serving")
+		return net.ErrClosed
+	}
 	if s.orphanExpiring && s.phase != shimwire.PhaseExited {
 		s.mu.Unlock()
 		s.recordMu.Unlock()

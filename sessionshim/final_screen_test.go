@@ -3,6 +3,7 @@ package sessionshim
 import (
 	"context"
 	"fmt"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -159,5 +160,72 @@ func TestFinalScreenDoneRequiresDurableTerminalProof(t *testing.T) {
 	case <-sh.Done():
 		t.Fatal("Done closed without durable proof")
 	default:
+	}
+}
+
+// A socket accepted before listener teardown must not become a controller after
+// full stop. The Hello/Welcome split is the barrier; no scheduling delay is used.
+func TestClosedShimRefusesPendingWelcome(t *testing.T) {
+	for _, version := range []uint32{shimwire.V2, shimwire.V3} {
+		t.Run(fmt.Sprintf("v%d", version), func(t *testing.T) {
+			reg, err := NewRegistry(shortTempDir(t))
+			if err != nil {
+				t.Fatal(err)
+			}
+			sh, err := Start(Options{Identity: Identity{OrgID: "org-late-welcome", SessionID: "session-late-welcome"}, Registry: reg, ProcessEpoch: 1, Spec: ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}}, ProtocolMin: shimwire.V1, ProtocolMax: version})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = sh.Terminate(context.Background()); _ = sh.Close() })
+			conn, err := net.DialUnix("unix", nil, &net.UnixAddr{Name: sh.SocketPath(), Net: "unix"})
+			if err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = conn.Close() })
+			if err := conn.SetDeadline(time.Now().Add(10 * time.Second)); err != nil {
+				t.Fatal(err)
+			}
+			reader := shimwire.NewReader(conn)
+			message, err := reader.Read()
+			if err != nil || message.Type != shimwire.TypeHello {
+				t.Fatalf("Hello=%+v err=%v", message, err)
+			}
+			hello, err := shimwire.DecodeHello(message.Body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if version == shimwire.V2 {
+				if err := sh.Terminate(context.Background()); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := sh.Close(); err != nil {
+				t.Fatal(err)
+			}
+			if version == shimwire.V2 {
+				awaitFinalScreenSignal(t, sh.Done(), "terminal owner did not fully stop")
+			}
+			welcome := shimwire.Welcome{Protocol: shimwire.ProtocolName, Selected: version, ControllerID: "late-controller", ProposedGeneration: hello.Generation + 1}
+			if version >= shimwire.V3 {
+				welcome.Extensions = shimwire.Extensions{Values: map[string]string{shimwire.ExtCarrierEpoch: "late-proof"}, Required: []string{shimwire.ExtCarrierEpoch}}
+			}
+			if err := writeTyped(shimwire.NewWriter(conn), shimwire.TypeWelcome, func() ([]byte, error) { return shimwire.EncodeWelcome(welcome) }); err != nil {
+				t.Fatal(err)
+			}
+			response, err := reader.Read()
+			if err != nil {
+				t.Fatalf("closed-owner refusal unreadable: %v", err)
+			}
+			if response.Type != shimwire.TypeError {
+				t.Fatalf("closed owner accepted pending Welcome: response=%s", response.Type)
+			}
+			refusal, err := shimwire.DecodeError(response.Body)
+			if err != nil || refusal.Code != shimwire.CodePhaseUnknown {
+				t.Fatalf("refusal=%+v err=%v", refusal, err)
+			}
+			if sh.currentController() != nil || sh.Generation() != hello.Generation {
+				t.Fatal("closed owner installed a controller or advanced generation")
+			}
+		})
 	}
 }
