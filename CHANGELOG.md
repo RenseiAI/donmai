@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.49 — 2026-09-27
+
 ### Fixes
 
 - Keep registration project IDs, repositories, and admission mode current after
@@ -19,6 +23,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 - Include warmup and main-run rates in firehose throughput failures while
   preserving the existing throughput and data-integrity requirements.
+- Synchronize the real PTY output-batch fixture on observed frames instead of
+  assuming that shell writes and PTY reads have identical boundaries.
 
 ## v0.72.48 — 2026-09-27
 
