@@ -85,8 +85,9 @@ Federation order for registry sources (lowest priority number = consulted first)
   4. agentskills   — agentskills.io (SKILL.md wrapped as kits)
   5. community     — tenant-declared registries
 
-Only the ` + "`local`" + ` source has a working backend in this wave;
-` + "`install`" + ` against remote sources currently returns 501.`,
+` + "`kit install`" + ` also supports a direct Git source. Use ` + "`--source-kind git --source-url <url>`" + `
+and optionally ` + "`--source-ref <ref>`" + `. Tessl, agentskills, and community install
+sources are not implemented and return HTTP 501.`,
 		SilenceUsage: true,
 	}
 	cmd.AddCommand(newKitListCmd(factory))
@@ -230,6 +231,9 @@ func runKitVerifySignature(out io.Writer, client kitDaemonClient, id string, jso
 func newKitInstallCmd(factory kitClientFactory) *cobra.Command {
 	var (
 		version       string
+		sourceKind    string
+		sourceURL     string
+		sourceRef     string
 		allowUnsigned bool
 		jsonOut       bool
 		plain         bool
@@ -245,22 +249,51 @@ listed in daemon.yaml's trust.issuerSet install. Unsigned or unverified
 kits are rejected; pass --allow-unsigned to bypass the gate for a single
 install (the bypass is audit-logged by the daemon).
 
-Wave 9 caveat: only locally-installed kits are supported (.kit.toml under
-~/.donmai/kits). Remote-registry fetch is deferred and currently returns
-HTTP 501. The command surface is finalised so the call is stable as the
-backend lands.`,
+For a Git source, pass --source-kind git and --source-url; --source-ref
+optionally selects a branch, tag, or commit (default: HEAD). A source URL
+requires an explicit source kind. A source is required to install; without
+source flags, the daemon returns HTTP 501. Git is currently the only install
+source kind; Tessl, agentskills, and community federation fetches return HTTP
+501. The daemon verifies the fetched kit against its configured trust policy.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			source, err := kitInstallSourceFromFlags(sourceKind, sourceURL, sourceRef)
+			if err != nil {
+				return err
+			}
 			client := factory(resolveKitDaemonConfig())
-			return runKitInstall(cmd.OutOrStdout(), client, args[0], version, allowUnsigned, jsonOut, plain)
+			return runKitInstall(cmd.OutOrStdout(), client, args[0], version, source, allowUnsigned, jsonOut, plain)
 		},
 	}
 	cmd.Flags().StringVar(&version, "version", "", "Install a specific version (default: latest compatible)")
+	cmd.Flags().StringVar(&sourceKind, "source-kind", "", "Kit source kind (currently: git)")
+	cmd.Flags().StringVar(&sourceURL, "source-url", "", "Git repository URL to install from")
+	cmd.Flags().StringVar(&sourceRef, "source-ref", "", "Git branch, tag, or commit (default: HEAD)")
 	cmd.Flags().BoolVar(&allowUnsigned, "allow-unsigned", false, "Bypass kit signature verification for this single install (audit-logged)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")
 	cmd.Flags().BoolVar(&plain, "plain", false, "Plain text (no ANSI / emoji)")
 	return cmd
+}
+
+func kitInstallSourceFromFlags(kind, sourceURL, ref string) (*afclient.KitInstallSource, error) {
+	kind = strings.TrimSpace(kind)
+	sourceURL = strings.TrimSpace(sourceURL)
+	ref = strings.TrimSpace(ref)
+
+	if kind == "" {
+		if sourceURL != "" || ref != "" {
+			return nil, fmt.Errorf("--source-kind is required when --source-url or --source-ref is supplied")
+		}
+		return nil, nil
+	}
+	if kind != "git" {
+		return nil, fmt.Errorf("unsupported --source-kind %q (supported source kind: git)", kind)
+	}
+	if sourceURL == "" {
+		return nil, fmt.Errorf("--source-url is required when --source-kind git is supplied")
+	}
+	return &afclient.KitInstallSource{Kind: kind, URL: sourceURL, Ref: ref}, nil
 }
 
 // kitTrustGateGuidance is appended to the install error when the daemon's
@@ -276,8 +309,8 @@ To proceed, either:
      or export DONMAI_KIT_TRUST_MODE=permissive (not recommended — unsigned
      kits can execute arbitrary shell commands)`
 
-func runKitInstall(out io.Writer, client kitDaemonClient, id, version string, allowUnsigned, jsonOut, plain bool) error {
-	req := afclient.KitInstallRequest{Version: version}
+func runKitInstall(out io.Writer, client kitDaemonClient, id, version string, source *afclient.KitInstallSource, allowUnsigned, jsonOut, plain bool) error {
+	req := afclient.KitInstallRequest{Version: version, Source: source}
 	if allowUnsigned {
 		req.TrustOverride = afclient.TrustOverrideAllowedThisOnce
 		_, _ = fmt.Fprintf(out, "WARNING: --allow-unsigned bypasses signature verification for %s. Unsigned kits can execute arbitrary shell commands; only proceed if you trust the source. The bypass is audit-logged by the daemon.\n", id)
