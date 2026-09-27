@@ -1251,6 +1251,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// streamRes.blocked signal the marker scan produces, so the blocked
 	// classification fork below treats both channels identically.
 	r.applyTurnManifest(runnerStatePath, qw, res, &streamRes)
+	// Stamp the manifest file before any follow-up turn so step 11·M can tell
+	// a manifest the follow-up wrote from one it merely left in place.
+	manifestBeforeFollowUp := stampManifest(runnerStatePath)
 
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
@@ -1313,15 +1316,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// 11·M. Re-resolve the turn-result manifest after a follow-up turn. The
-	// agent may write its manifest during the follow-up turn, and the
-	// follow-up's terminal message (often just the PR URL steering asked for)
-	// has replaced res.Summary. The manifest outranks both, exactly as it does
-	// at step 10·M, so a verdict other than "passed" is never reported as a
-	// clean pass. A blocked verdict recorded here takes the same 10a fork.
+	// 11·M. Re-resolve the turn verdict after a follow-up turn. The agent may
+	// write its manifest during the follow-up turn, and the follow-up's
+	// terminal message (often just the PR URL steering asked for) has replaced
+	// res.Summary. The newest signal wins: a manifest the follow-up produced,
+	// else the follow-up's own WORK_RESULT verdict over a stale earlier
+	// manifest, else the earlier manifest (see reapplyTurnManifest). A blocked
+	// verdict takes the 10a fork — but only when the runner has recorded no
+	// failure of its own: an agent-authored decline never relabels a crash.
 	if followUp != nil {
-		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, followUp.lastAssistantText)
-		if classifyBlocked(res, streamRes) {
+		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, *followUp, manifestBeforeFollowUp)
+		if res.FailureMode == "" && classifyBlocked(res, streamRes) {
 			r.logger.Info("agent blocked: deliberate decline detected after follow-up turn",
 				"sessionId", qw.SessionID,
 				"reason", streamRes.blockedReason,

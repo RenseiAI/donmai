@@ -2,181 +2,369 @@ package runner
 
 import (
 	"context"
+	"errors"
+	"net/http"
 	"os"
 	"path/filepath"
+	"sync"
 	"testing"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
+	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/state"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
-// manifestWritingProvider wraps the stub harness and plays the agent's part of
-// the turn-result contract: it writes `.agent/turn-result.json` into the
-// session worktree either while the FIRST turn runs (Spawn) or while the
-// steering follow-up turn runs (Resume — the stub's resume-steer script with
-// injection disabled forces the runner's stop-and-resume steering rail).
-type manifestWritingProvider struct {
-	agent.HarnessProvider
-	t        *testing.T
+// verdictScriptTurn is one agent turn played by verdictScriptProvider. The turn first
+// writes (or rewrites) the turn-result manifest when manifest is set, then
+// emits text as an assistant message, then ends with a clean terminal
+// ResultEvent — or, when crash is set, with a provider ErrorEvent and a closed
+// stream.
+type verdictScriptTurn struct {
 	manifest string
-	onSpawn  bool
-	onResume bool
+	text     string
+	crash    bool
 }
 
-func (p *manifestWritingProvider) write(cwd string) {
-	p.t.Helper()
-	dir := filepath.Join(cwd, state.AgentDirName)
-	if err := os.MkdirAll(dir, 0o750); err != nil {
-		p.t.Fatalf("mkdir %s: %v", dir, err)
+// verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
+// replaces its event script with a list of turns: turn 0 runs at Spawn, and
+// every Inject — steering or a memory inject — runs the next one. It plays the
+// agent's side of the turn-result contract with real files in the session
+// worktree, so the runner's own resolution code is what the tests observe.
+type verdictScriptProvider struct {
+	agent.HarnessProvider
+	t     *testing.T
+	turns []verdictScriptTurn
+}
+
+func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64)}
+	h.events <- agent.InitEvent{SessionID: "scripted-session"}
+	h.play()
+	return h, nil
+}
+
+func (p *verdictScriptProvider) Resume(context.Context, string, agent.Spec) (agent.Handle, error) {
+	return nil, agent.ErrUnsupported
+}
+
+type verdictScriptHandle struct {
+	t      *testing.T
+	cwd    string
+	turns  []verdictScriptTurn
+	next   int
+	mu     sync.Mutex
+	closed bool
+	events chan agent.Event
+}
+
+func (h *verdictScriptHandle) SessionID() string          { return "scripted-session" }
+func (h *verdictScriptHandle) Events() <-chan agent.Event { return h.events }
+func (h *verdictScriptHandle) Stop(context.Context) error { h.closeEvents(); return nil }
+func (h *verdictScriptHandle) Inject(context.Context, string) error {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if h.closed || h.next >= len(h.turns) {
+		return errors.New("scripted: no turn left to play")
 	}
-	if err := os.WriteFile(filepath.Join(dir, ManifestFileName), []byte(p.manifest), 0o600); err != nil {
-		p.t.Fatalf("write turn-result manifest: %v", err)
+	h.playLocked()
+	return nil
+}
+
+func (h *verdictScriptHandle) play() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.playLocked()
+}
+
+func (h *verdictScriptHandle) playLocked() {
+	turn := h.turns[h.next]
+	h.next++
+	if turn.manifest != "" {
+		dir := filepath.Join(h.cwd, state.AgentDirName)
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			h.t.Errorf("mkdir %s: %v", dir, err)
+		}
+		if err := os.WriteFile(filepath.Join(dir, ManifestFileName), []byte(turn.manifest), 0o600); err != nil {
+			h.t.Errorf("write turn-result manifest: %v", err)
+		}
+	}
+	if turn.text != "" {
+		h.events <- agent.AssistantTextEvent{Text: turn.text}
+	}
+	if turn.crash {
+		h.events <- agent.ErrorEvent{Message: "provider crashed mid turn"}
+		h.closed = true
+		close(h.events)
+		return
+	}
+	h.events <- agent.ResultEvent{Success: true, Message: turn.text}
+}
+
+func (h *verdictScriptHandle) closeEvents() {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	if !h.closed {
+		h.closed = true
+		close(h.events)
 	}
 }
 
-func (p *manifestWritingProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
-	if p.onSpawn {
-		p.write(spec.Cwd)
+const (
+	followUpPR      = "https://github.com/example/repo/pull/7"
+	manifestSummary = "round-two items not implemented; round-one work pushed"
+	passedManifest  = `{"schemaVersion":1,"verdict":"passed","summary":"all done"}`
+	failedManifest  = `{"schemaVersion":1,"verdict":"failed","summary":"` + manifestSummary + `"}`
+)
+
+// runScripted runs one development session against the scripted turns and
+// returns the terminal envelope. inject, when non-empty, arms a runtime memory
+// inject the heartbeat delivers so the runner drains it as a follow-up turn.
+func runScripted(t *testing.T, workType string, skipSteering bool, inject string, turns ...verdictScriptTurn) *Result {
+	t.Helper()
+	base, err := stub.New()
+	if err != nil {
+		t.Fatalf("stub.New: %v", err)
 	}
-	return p.HarnessProvider.Spawn(ctx, spec)
+	harness, ok := base.(agent.HarnessProvider)
+	if !ok {
+		t.Fatal("stub provider is not a HarnessProvider")
+	}
+	platform := newRecordingPlatformServer(t)
+	if inject != "" {
+		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: inject})
+	}
+	r := newFollowUpRunner(t, platform.URL, platform.Client(), &verdictScriptProvider{HarnessProvider: harness, t: t, turns: turns})
+	r.skipSteering = skipSteering
+	qw := QueuedWork{
+		QueuedWork:      queuedWorkBase("MANIFEST-FOLLOWUP"),
+		WorkerID:        "worker-1",
+		AuthToken:       "tok",
+		PlatformURL:     platform.URL,
+		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
+	}
+	qw.WorkType = workType
+	qw.Repository = makeBareRepo(t)
+
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
+	res, err := r.Run(ctx, qw)
+	if err != nil && res == nil {
+		t.Fatalf("Run: %v", err)
+	}
+	return res
 }
 
-func (p *manifestWritingProvider) Resume(ctx context.Context, sessionID string, spec agent.Spec) (agent.Handle, error) {
-	if p.onResume {
-		p.write(spec.Cwd)
-	}
-	return p.HarnessProvider.Resume(ctx, sessionID, spec)
+type verdictWant struct {
+	status       string
+	failureMode  string
+	workResult   string
+	summary      string
+	pr           string
+	manifest     string // expected res.Manifest.Verdict; "" = no manifest on the envelope
+	wantSteering bool
 }
 
-// TestRun_TurnManifestVerdictSurvivesSteeringFollowUp pins the verdict
-// resolution across a steering follow-up turn. The first turn finishes cleanly
-// without a PR, so steering fires; the follow-up turn opens the PR and ends
-// with a terminal message that carries only a PR pointer. When the agent's
-// turn-result manifest says anything other than "passed" — whether it was
-// written during the follow-up turn or before it — the envelope must carry
-// that verdict and the manifest's own summary, never the follow-up's bare
-// terminal text. With no manifest the envelope keeps today's behaviour.
-func TestRun_TurnManifestVerdictSurvivesSteeringFollowUp(t *testing.T) {
-	const (
-		prURL          = "https://github.com/example/repo/pull/7"
-		failedManifest = `{"schemaVersion":1,"verdict":"failed","summary":"round-two items not implemented; round-one work pushed","pullRequestUrl":"` + prURL + `"}`
-		failedSummary  = "round-two items not implemented; round-one work pushed"
-		steeredSummary = "Stub resumed run complete (PR: stub://pr/123)"
-	)
+func assertVerdict(t *testing.T, res *Result, want verdictWant) {
+	t.Helper()
+	if res.SteeringTriggered != want.wantSteering {
+		t.Fatalf("SteeringTriggered = %v; want %v", res.SteeringTriggered, want.wantSteering)
+	}
+	if res.Status != want.status {
+		t.Errorf("Status = %q; want %q (FailureMode=%q, Error=%q)", res.Status, want.status, res.FailureMode, res.Error)
+	}
+	if res.FailureMode != want.failureMode {
+		t.Errorf("FailureMode = %q; want %q", res.FailureMode, want.failureMode)
+	}
+	if res.WorkResult != want.workResult {
+		t.Errorf("WorkResult = %q; want %q", res.WorkResult, want.workResult)
+	}
+	if want.summary != "" && res.Summary != want.summary {
+		t.Errorf("Summary = %q; want %q", res.Summary, want.summary)
+	}
+	if want.pr != "" && res.PullRequestURL != want.pr {
+		t.Errorf("PullRequestURL = %q; want %q", res.PullRequestURL, want.pr)
+	}
+	got := ""
+	if res.Manifest != nil {
+		got = res.Manifest.Verdict
+	}
+	if got != want.manifest {
+		t.Errorf("Manifest verdict on the envelope = %q; want %q", got, want.manifest)
+	}
+}
+
+// TestRun_TurnVerdictAcrossSteeringFollowUp pins how the turn verdict is
+// resolved when tail steering runs a follow-up turn. The first turn always
+// ends cleanly without a PR, so steering fires. The newest signal must win:
+// a manifest the follow-up wrote, else the follow-up's own WORK_RESULT verdict
+// over a stale earlier manifest, else the earlier manifest over the
+// follow-up's bare terminal text. A runner-recorded failure is never cleared
+// or relabelled by an agent manifest.
+func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 	cases := []struct {
-		name           string
-		onSpawn        bool
-		onResume       bool
-		manifest       string
-		wantWorkResult string
-		wantSummary    string
-		wantPR         string
-		wantManifest   bool
+		name  string
+		turns []verdictScriptTurn
+		want  verdictWant
 	}{
 		{
-			name:           "manifest written during the steering follow-up turn is read",
-			onResume:       true,
-			manifest:       failedManifest,
-			wantWorkResult: "failed",
-			wantSummary:    failedSummary,
-			wantPR:         prURL,
-			wantManifest:   true,
+			name: "manifest written during the follow-up is read",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{manifest: `{"schemaVersion":1,"verdict":"failed","summary":"` + manifestSummary + `","pullRequestUrl":"` + followUpPR + `"}`, text: followUpPR},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
 		},
 		{
-			name:           "first-turn manifest outranks the follow-up terminal message",
-			onSpawn:        true,
-			manifest:       `{"schemaVersion":1,"verdict":"failed","summary":"` + failedSummary + `"}`,
-			wantWorkResult: "failed",
-			wantSummary:    failedSummary,
-			wantManifest:   true,
+			name: "earlier manifest outranks the follow-up's bare terminal text",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: followUpPR},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
 		},
 		{
-			name:        "no manifest keeps the follow-up terminal message",
-			wantSummary: steeredSummary,
+			name: "stale earlier passed manifest never upgrades the follow-up's failed verdict",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "Tests fail after rebase; could not open the PR.\nWORK_RESULT:failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "Tests fail after rebase; could not open the PR.\nWORK_RESULT:failed", wantSteering: true},
+		},
+		{
+			name: "stale earlier failed manifest yields to the follow-up's own passed verdict",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: "Fixed and opened " + followUpPR + "\nWORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", pr: followUpPR, wantSteering: true},
+		},
+		{
+			name: "rewritten manifest beats the follow-up's own marker",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{manifest: failedManifest, text: "WORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "inline manifest in the follow-up's final message is read",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"inline says failed"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "inline says failed", manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "blocked manifest written during the follow-up takes the blocked fork",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{manifest: `{"schemaVersion":1,"verdict":"blocked","blockedReason":"need a product decision"}`, text: "Need a decision."},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, manifest: "blocked", wantSteering: true},
+		},
+		{
+			name: "blocked manifest never relabels a follow-up provider crash",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{manifest: `{"schemaVersion":1,"verdict":"blocked","blockedReason":"need a decision"}`, crash: true},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureProviderError, manifest: "blocked", wantSteering: true},
+		},
+		{
+			name: "passed manifest never clears a follow-up provider crash",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{manifest: `{"schemaVersion":1,"verdict":"passed","summary":"all good","pullRequestUrl":"` + followUpPR + `"}`, crash: true},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureProviderError, workResult: "passed", manifest: "passed", wantSteering: true},
+		},
+		{
+			name: "no manifest keeps the follow-up's terminal text",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: followUpPR},
+			},
+			want: verdictWant{status: "completed", summary: followUpPR, pr: followUpPR, wantSteering: true},
 		},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			base, err := stub.New()
-			if err != nil {
-				t.Fatalf("stub.New: %v", err)
-			}
-			harness, ok := base.(agent.HarnessProvider)
-			if !ok {
-				t.Fatal("stub provider is not a HarnessProvider")
-			}
-			r, platformURL := newFollowUpRunner(t, &manifestWritingProvider{
-				HarnessProvider: harness,
-				t:               t,
-				manifest:        tc.manifest,
-				onSpawn:         tc.onSpawn,
-				onResume:        tc.onResume,
-			})
-			qw := QueuedWork{
-				QueuedWork:      queuedWorkBase("MANIFEST-FOLLOWUP"),
-				WorkerID:        "worker-1",
-				AuthToken:       "tok",
-				PlatformURL:     platformURL,
-				ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
-			}
-			qw.Repository = makeBareRepo(t)
-			qw.ResolvedProfile.ProviderConfig = map[string]any{
-				"stub.behavior":          string(stub.BehaviorResumeSteer),
-				"stub.injectUnsupported": true,
-			}
+			res := runScripted(t, "development", false, "", tc.turns...)
+			assertVerdict(t, res, tc.want)
+		})
+	}
+}
 
-			ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
-			defer cancel()
-			res, err := r.Run(ctx, qw)
-			if err != nil {
-				t.Fatalf("Run: %v", err)
-			}
-			if !res.SteeringTriggered || !res.SteeringResumeFallback {
-				t.Fatalf("steering follow-up did not run (triggered=%v resume=%v)", res.SteeringTriggered, res.SteeringResumeFallback)
-			}
-			if res.Status != "completed" {
-				t.Fatalf("Status = %q; want completed (FailureMode=%q, Error=%q)", res.Status, res.FailureMode, res.Error)
-			}
-			if res.WorkResult != tc.wantWorkResult {
-				t.Errorf("WorkResult = %q; want %q", res.WorkResult, tc.wantWorkResult)
-			}
-			if res.Summary != tc.wantSummary {
-				t.Errorf("Summary = %q; want %q", res.Summary, tc.wantSummary)
-			}
-			if tc.wantPR != "" && res.PullRequestURL != tc.wantPR {
-				t.Errorf("PullRequestURL = %q; want %q", res.PullRequestURL, tc.wantPR)
-			}
-			if got := res.Manifest != nil; got != tc.wantManifest {
-				t.Fatalf("Manifest present = %v; want %v", got, tc.wantManifest)
-			}
-			if tc.wantManifest && res.Manifest.Verdict != tc.wantWorkResult {
-				t.Errorf("Manifest.Verdict = %q; want %q", res.Manifest.Verdict, tc.wantWorkResult)
+// TestRun_TurnVerdictAcrossMemoryInjectFollowUp pins the same resolution for a
+// runtime memory-inject follow-up turn on result-sensitive work, where the
+// verdict drives the issue transition. Steering is off so the memory inject is
+// the only follow-up turn.
+func TestRun_TurnVerdictAcrossMemoryInjectFollowUp(t *testing.T) {
+	cases := []struct {
+		name  string
+		turns []verdictScriptTurn
+		want  verdictWant
+	}{
+		{
+			name: "manifest rewritten during the memory-inject follow-up is read",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All checks pass."},
+				{manifest: failedManifest, text: "Re-checked with the recalled context."},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed"},
+		},
+		{
+			name: "stale passed manifest never upgrades the memory-inject follow-up's failed verdict",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All checks pass."},
+				{text: "The recalled regression reproduces.\nWORK_RESULT:failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "The recalled regression reproduces.\nWORK_RESULT:failed"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runScripted(t, "qa", true, "recall: a regression in this area last week", tc.turns...)
+			assertVerdict(t, res, tc.want)
+		})
+	}
+}
+
+// TestFoldTurnManifest_NeverClearsRunnerFailure pins that folding an agent
+// manifest leaves every runner-observed failure field untouched, whatever the
+// manifest's verdict.
+func TestFoldTurnManifest_NeverClearsRunnerFailure(t *testing.T) {
+	for _, verdict := range []string{"passed", "failed", "blocked"} {
+		t.Run(verdict, func(t *testing.T) {
+			res := &Result{}
+			res.Status, res.FailureMode, res.Error = "failed", FailureProviderError, "provider crashed"
+			obs := &streamObservation{}
+			foldTurnManifest(&TurnManifest{SchemaVersion: 1, Verdict: verdict, Summary: "agent says " + verdict}, res, obs)
+			if res.Status != "failed" || res.FailureMode != FailureProviderError || res.Error != "provider crashed" {
+				t.Fatalf("fold changed the runner-recorded failure: Status=%q FailureMode=%q Error=%q", res.Status, res.FailureMode, res.Error)
 			}
 		})
 	}
 }
 
 // newFollowUpRunner builds a Runner with tail steering enabled around the
-// supplied provider. Backstop and post-session stay off so the test observes
-// exactly the manifest / steering interaction. Returns the runner and the mock
-// platform URL the QueuedWork must carry.
-func newFollowUpRunner(t *testing.T, p agent.Provider) (*Runner, string) {
+// supplied provider. Backstop and post-session stay off so the tests observe
+// exactly the manifest / follow-up interaction.
+func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p agent.Provider) *Runner {
 	t.Helper()
-	srv := mockPlatformServer(t)
-	t.Cleanup(srv.Close)
 	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
 	if err != nil {
 		t.Fatalf("worktree.NewManager: %v", err)
 	}
 	poster, err := result.NewPoster(result.Options{
-		PlatformURL: srv.URL,
+		PlatformURL: platformURL,
 		WorkerID:    "worker-1",
 		AuthToken:   "tok",
-		HTTPClient:  srv.Client(),
+		HTTPClient:  client,
 		BaseDelay:   1,
 	})
 	if err != nil {
@@ -190,7 +378,7 @@ func newFollowUpRunner(t *testing.T, p agent.Provider) (*Runner, string) {
 		Registry:               reg,
 		WorktreeManager:        wtm,
 		Poster:                 poster,
-		HTTPClient:             srv.Client(),
+		HTTPClient:             client,
 		SkipBackstop:           true,
 		SkipPostSession:        true,
 		PreserveWorktreeAlways: true,
@@ -198,5 +386,5 @@ func newFollowUpRunner(t *testing.T, p agent.Provider) (*Runner, string) {
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	return r, srv.URL
+	return r
 }

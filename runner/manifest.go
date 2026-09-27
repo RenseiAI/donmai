@@ -31,6 +31,7 @@ package runner
 
 import (
 	"bytes"
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -389,47 +390,122 @@ func validateManifestSchema(raw json.RawMessage) bool {
 // inline-parse degrade (ErrNoInlineManifest) is a silent no-op so a bad inline
 // block never fails the turn.
 func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation) {
-	m := r.resolveTurnManifest(worktreePath, qw, obs.lastAssistantText)
+	m := r.resolveTurnManifest(worktreePath, qw, obs.lastAssistantText, true)
 	if m == nil {
 		return
 	}
 	foldTurnManifest(m, res, obs)
 }
 
-// reapplyTurnManifest re-resolves the turn-result manifest after a follow-up
-// turn (memory inject or tail steering) and folds it onto the envelope again.
-//
-// A follow-up turn changes the picture in two ways the first resolution
-// cannot see. First, the agent may write (or rewrite) the manifest DURING the
-// follow-up turn — e.g. steering asks it to open a PR, and it records its
-// verdict as it finishes. Second, the follow-up turn's terminal message has
-// just replaced res.Summary (streamObservation.applyTo is last-wins), and that
-// message is often nothing more than the PR URL the steering prompt asked for.
-// The manifest outranks a follow-up turn's prose exactly as it outranks the
-// first turn's, so without this pass a "failed" verdict is either never read or
-// buried under a bare PR URL, and the session reports a clean pass.
-//
-// Resolution: the file on disk (or an inline manifest in the follow-up turn's
-// final message) FIRST; else the manifest the first resolution already
-// accepted (res.Manifest). No manifest at all leaves the envelope untouched,
-// preserving the marker-scrape behaviour.
-func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation, followUpText string) {
-	m := r.resolveTurnManifest(worktreePath, qw, followUpText)
-	if m == nil {
-		m = res.Manifest
+// manifestStamp identifies the manifest file's bytes at one moment so the runner
+// can tell whether a follow-up turn rewrote it. Content hash, size and mtime
+// together: an unchanged file keeps all three, and any rewrite — even one with
+// identical content — moves the mtime.
+type manifestStamp struct {
+	exists  bool
+	size    int64
+	modNano int64
+	sum     [sha256.Size]byte
+}
+
+// stampManifest returns the current manifestStamp of
+// `<worktreePath>/.agent/turn-result.json`. A missing or unreadable file stamps
+// as absent.
+func stampManifest(worktreePath string) manifestStamp {
+	if strings.TrimSpace(worktreePath) == "" {
+		return manifestStamp{}
 	}
-	if m == nil {
+	path := filepath.Join(worktreePath, state.AgentDirName, ManifestFileName)
+	info, err := os.Stat(path)
+	if err != nil {
+		return manifestStamp{}
+	}
+	//nolint:gosec // G304: path is owned by the runner via the worktree manager.
+	raw, err := os.ReadFile(path)
+	if err != nil {
+		return manifestStamp{}
+	}
+	return manifestStamp{
+		exists:  true,
+		size:    info.Size(),
+		modNano: info.ModTime().UnixNano(),
+		sum:     sha256.Sum256(raw),
+	}
+}
+
+// reapplyTurnManifest re-resolves the turn verdict after a follow-up turn
+// (memory inject or tail steering). before is the manifest file's stamp taken
+// before the first follow-up turn started.
+//
+// A follow-up turn changes the picture the first resolution saw, and the
+// verdict must follow whichever signal is NEWEST:
+//
+//  1. A manifest the follow-up turn produced — the file was (re)written during
+//     it, or its final message carries an inline `Intended manifest` block —
+//     is the agent's latest structured word. It is folded exactly like the
+//     first turn's, so its verdict and summary beat the follow-up's terminal
+//     prose (often just the PR URL the steering prompt asked for).
+//  2. Otherwise the earlier manifest (res.Manifest) is STALE. When the
+//     follow-up turn recorded its own verdict (a WORK_RESULT marker) that
+//     differs, that newer verdict stands: the stale manifest is dropped from
+//     the envelope so it is never posted as the turn's verdict. When the
+//     follow-up recorded no verdict of its own, or the same one, the earlier
+//     manifest still speaks for the turn and is folded again — its summary
+//     beats the follow-up's terminal prose.
+//
+// No manifest at all leaves the envelope untouched, preserving the
+// marker-scrape behaviour. The fold never touches Status, FailureMode or
+// Error: a failure the runner recorded is never cleared by an agent manifest.
+func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation, followUp streamObservation, before manifestStamp) {
+	rewritten := stampManifest(worktreePath) != before
+	if fresh := r.resolveTurnManifest(worktreePath, qw, followUp.lastAssistantText, rewritten); fresh != nil {
+		foldTurnManifest(fresh, res, obs)
 		return
 	}
-	foldTurnManifest(m, res, obs)
+	stale := res.Manifest
+	if stale == nil {
+		return
+	}
+	followUpVerdict := followUp.workResult
+	if followUp.blocked {
+		followUpVerdict = "blocked"
+	}
+	if followUpVerdict == "" || followUpVerdict == stale.Verdict {
+		foldTurnManifest(stale, res, obs)
+		return
+	}
+	r.logger.Info("turn-result manifest predates the follow-up turn's own verdict; keeping the follow-up verdict",
+		"sessionId", qw.SessionID,
+		"manifestVerdict", stale.Verdict,
+		"followUpVerdict", followUpVerdict,
+	)
+	res.Manifest = nil
+	if followUpVerdict == "blocked" {
+		// The stale manifest's passed/failed no longer describes the turn; the
+		// decline rides obs.blocked into the caller's blocked fork.
+		res.WorkResult = ""
+		obs.workResult = ""
+		obs.blocked = true
+		if followUp.blockedReason != "" {
+			obs.blockedReason = followUp.blockedReason
+		}
+		return
+	}
+	res.WorkResult = followUpVerdict
+	obs.workResult = followUpVerdict
 }
 
 // resolveTurnManifest returns the validated manifest for this turn — the
-// written file first, else an inline `Intended manifest` block recovered from
-// finalText — or nil when neither yields a usable manifest. Logs every
-// outcome except the common "no manifest at all" case.
-func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalText string) *TurnManifest {
-	m, err := ParseManifest(worktreePath)
+// written file first (only when readFile is set), else an inline `Intended
+// manifest` block recovered from finalText — or nil when neither yields a
+// usable manifest. Logs every outcome except the common "no manifest at all"
+// case.
+func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalText string, readFile bool) *TurnManifest {
+	var m *TurnManifest
+	err := ErrNoManifest
+	if readFile {
+		m, err = ParseManifest(worktreePath)
+	}
 	if err != nil {
 		if !errors.Is(err, ErrNoManifest) {
 			r.logger.Warn("turn-result manifest unusable; falling back to marker scrape",
@@ -467,6 +543,9 @@ func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalTe
 
 // foldTurnManifest merges a validated manifest onto the envelope and the
 // stream observation. See applyTurnManifest for the field-by-field contract.
+// It deliberately never touches res.Status, res.FailureMode or res.Error: those
+// are runner-observed facts, and an agent-authored manifest must not clear a
+// failure the runner recorded.
 func foldTurnManifest(m *TurnManifest, res *Result, obs *streamObservation) {
 	// Carry the validated manifest VERBATIM on the envelope so the poster can
 	// post the structured object to the platform's applyTurnManifest route
