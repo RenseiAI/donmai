@@ -44,6 +44,10 @@ type Options struct {
 	// DefaultOrphanPolicy.
 	Orphan OrphanPolicy
 
+	// FinalScreenWindow retains post-Exit snapshot service for an attached
+	// controller. Non-positive values use the same 60s default as attachclient.
+	FinalScreenWindow time.Duration
+
 	// ProcessEpoch is the monotonic per-session value for this shim incarnation.
 	ProcessEpoch uint64
 
@@ -91,13 +95,14 @@ func (o Options) now() func() time.Time {
 // socket and replaceable at any moment. That inversion is the entire point: a
 // daemon upgrade closes a socket, not a terminal.
 type Shim struct {
-	id       Identity
-	registry *Registry
-	sess     *ptyhost.Session
-	ln       *net.UnixListener
-	logger   *slog.Logger
-	now      func() time.Time
-	orphan   OrphanPolicy
+	id                Identity
+	registry          *Registry
+	sess              *ptyhost.Session
+	ln                *net.UnixListener
+	logger            *slog.Logger
+	now               func() time.Time
+	orphan            OrphanPolicy
+	finalScreenWindow time.Duration
 
 	shimID       string
 	epoch        uint64
@@ -157,14 +162,22 @@ type Shim struct {
 	// adoption or replaced by a later controller-loss episode. orphanExpiring
 	// records that a matching deadline already won the lifecycle race, before
 	// its bounded terminalization starts.
-	orphanEpisode  uint64
-	orphanExpiring bool
-	tombstoned     bool
+	orphanEpisode    uint64
+	orphanExpiring   bool
+	tombstoned       bool
+	closed           bool
+	stopped          bool
+	finalScreenTimer *time.Timer
 
-	closeOnce  sync.Once
-	stopOnce   sync.Once
-	done       chan struct{}
-	acceptDone chan struct{}
+	closeOnce                sync.Once
+	stopOnce                 sync.Once
+	done                     chan struct{}
+	acceptDone               chan struct{}
+	terminalDone             chan struct{}
+	terminalDoneOnce         sync.Once
+	doneOnce                 sync.Once
+	finalScreenWindowOnce    sync.Once
+	finalScreenWindowStarted chan struct{}
 	// onTerminalCourtesy runs at the boundary between the durable terminal
 	// proof and the best-effort delivery that follows it. It is nil in every
 	// production build; it exists so a test can observe WHICH side of that
@@ -207,6 +220,9 @@ const (
 const adoptionOutputBarrierTimeout = 30 * time.Second
 
 const snapshotRetryLedgerLimit = 1024
+
+// Matches attachclient's post-Exit service window (§12.2).
+const defaultFinalScreenWindow = 60 * time.Second
 
 type snapshotLedgerEntry struct {
 	request   shimwire.SnapshotRequest
@@ -375,6 +391,10 @@ func Start(opts Options) (*Shim, error) {
 	if err := orphan.Validate(); err != nil {
 		return nil, err
 	}
+	finalScreenWindow := opts.FinalScreenWindow
+	if finalScreenWindow <= 0 {
+		finalScreenWindow = defaultFinalScreenWindow
+	}
 	self, err := Self()
 	if err != nil {
 		return nil, err
@@ -452,28 +472,31 @@ func Start(opts Options) (*Shim, error) {
 	}
 
 	s := &Shim{
-		id:           opts.Identity,
-		registry:     opts.Registry,
-		sess:         sess,
-		ln:           ln,
-		logger:       opts.logger(),
-		now:          opts.now(),
-		orphan:       orphan,
-		shimID:       shimID,
-		epoch:        opts.ProcessEpoch,
-		self:         self,
-		harness:      ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
-		workarea:     opts.WorkareaPath,
-		workareaRoot: opts.WorkareaRoot,
-		protocolMin:  protocolMin,
-		protocolMax:  protocolMax,
-		socketPath:   socketPath,
-		socketDev:    dev,
-		socketIno:    ino,
-		phase:        shimwire.PhaseRunning,
-		done:         make(chan struct{}),
-		acceptDone:   make(chan struct{}),
-		ackNotify:    make(chan struct{}),
+		id:                       opts.Identity,
+		registry:                 opts.Registry,
+		sess:                     sess,
+		ln:                       ln,
+		logger:                   opts.logger(),
+		now:                      opts.now(),
+		finalScreenWindow:        finalScreenWindow,
+		terminalDone:             make(chan struct{}),
+		finalScreenWindowStarted: make(chan struct{}),
+		orphan:                   orphan,
+		shimID:                   shimID,
+		epoch:                    opts.ProcessEpoch,
+		self:                     self,
+		harness:                  ProcessIdentity{PID: harnessPID, StartedAt: harnessStart},
+		workarea:                 opts.WorkareaPath,
+		workareaRoot:             opts.WorkareaRoot,
+		protocolMin:              protocolMin,
+		protocolMax:              protocolMax,
+		socketPath:               socketPath,
+		socketDev:                dev,
+		socketIno:                ino,
+		phase:                    shimwire.PhaseRunning,
+		done:                     make(chan struct{}),
+		acceptDone:               make(chan struct{}),
+		ackNotify:                make(chan struct{}),
 
 		onTerminalCourtesy: opts.onTerminalCourtesy,
 		postInstallFailure: opts.postInstallFailure,
@@ -533,6 +556,11 @@ func (s *Shim) Session() *ptyhost.Session { return s.sess }
 // observation persisted, listener closed.
 func (s *Shim) Done() <-chan struct{} { return s.done }
 
+// TerminalDone closes after the immutable terminal observation is durable.
+// It is a durable observation, not permission to exit the owning process:
+// the final-screen service may remain active until Done closes.
+func (s *Shim) TerminalDone() <-chan struct{} { return s.terminalDone }
+
 // Close stops serving and releases the listener WITHOUT terminating the harness.
 //
 // The asymmetry is intentional. Close is the "this shim process is going away"
@@ -543,8 +571,13 @@ func (s *Shim) Close() error {
 	s.closeOnce.Do(func() {
 		_ = s.ln.Close()
 		s.mu.Lock()
+		s.closed = true
 		ctrl := s.ctrl
 		s.ctrl = nil
+		if s.finalScreenTimer != nil {
+			s.finalScreenTimer.Stop()
+			s.finalScreenTimer = nil
+		}
 		if s.orphanTimer != nil {
 			s.orphanTimer.Stop()
 			s.orphanTimer = nil
@@ -561,8 +594,37 @@ func (s *Shim) Close() error {
 		<-s.acceptDone
 		_ = os.Remove(s.socketPath)
 		s.withdrawStreamFlow()
+		s.mu.Lock()
+		s.stopped = true
+		s.mu.Unlock()
+		s.closeDoneWhenStopped()
 	})
 	return nil
+}
+
+// closeDoneWhenStopped requires both durable proof and completed listener
+// cleanup. Close may run before finalization, including a failed tombstone write.
+func (s *Shim) closeDoneWhenStopped() {
+	s.mu.Lock()
+	stopped := s.stopped
+	s.mu.Unlock()
+	s.recordMu.Lock()
+	published := s.terminalPublished
+	s.recordMu.Unlock()
+	if stopped && published {
+		s.doneOnce.Do(func() { close(s.done) })
+	}
+}
+
+func (s *Shim) beginFinalScreenWindow() {
+	s.finalScreenWindowOnce.Do(func() {
+		s.mu.Lock()
+		if !s.closed {
+			s.finalScreenTimer = time.AfterFunc(s.finalScreenWindow, func() { _ = s.Close() })
+		}
+		s.mu.Unlock()
+		close(s.finalScreenWindowStarted)
+	})
 }
 
 // Terminate runs the bounded teardown: SIGTERM→grace→SIGKILL on the harness
@@ -640,6 +702,8 @@ func (s *Shim) finalizeTerminal() error {
 		return fmt.Errorf("sessionshim: persist tombstone: %w", err)
 	}
 
+	s.terminalDoneOnce.Do(func() { close(s.terminalDone) })
+	s.closeDoneWhenStopped()
 	if s.onTerminalCourtesy != nil {
 		s.onTerminalCourtesy()
 	}
@@ -690,7 +754,6 @@ func (s *Shim) finalizeTerminal() error {
 		// already on disk before the wait begins.
 		s.waitForDurableAck(uint64(lastSeq), flushBound)
 	}
-	close(s.done)
 	return nil
 }
 
@@ -735,7 +798,11 @@ func (s *Shim) watchHarness() {
 			s.logger.Error("sessionshim: finalize terminal observation", "session", s.id.String(), "error", err)
 		}
 	})
-	_ = s.Close()
+	if s.currentController() == nil {
+		_ = s.Close()
+		return
+	}
+	s.beginFinalScreenWindow()
 }
 
 // ---- orphan rule -----------------------------------------------------------
@@ -813,8 +880,13 @@ func (s *Shim) loseController(ctrl *controllerConn) {
 		return
 	}
 	s.ctrl = nil
+	exited := s.phase == shimwire.PhaseExited
 	deadline, episode, armed := s.armOrphanLocked()
 	s.mu.Unlock()
+	if exited {
+		_ = s.Close()
+		return
+	}
 	if !armed {
 		return
 	}
@@ -1082,6 +1154,14 @@ func (s *Shim) handshake(conn *net.UnixConn, w *shimwire.Writer, r *shimwire.Rea
 	// loop. The retained Exit frame rides the ordinary replay path below.
 	s.recordMu.Lock()
 	s.mu.Lock()
+	// Close and controller installation linearize under the same lock. A
+	// previously accepted Hello cannot reopen serving after teardown won.
+	if s.closed {
+		s.mu.Unlock()
+		s.recordMu.Unlock()
+		_ = sendError(w, shimwire.CodePhaseUnknown, "session shim is no longer serving")
+		return net.ErrClosed
+	}
 	if s.orphanExpiring && s.phase != shimwire.PhaseExited {
 		s.mu.Unlock()
 		s.recordMu.Unlock()

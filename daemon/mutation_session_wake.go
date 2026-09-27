@@ -192,7 +192,7 @@ func decodeSessionWakeParams(op string, raw json.RawMessage) (sessionWakeParams,
 // bare session ids the local control API speaks.
 func (d *Daemon) resolveWakeController(params sessionWakeParams) (*sessionshim.Controller, error) {
 	if params.OrgID != "" {
-		return d.adoptedShimController(params.OrgID, params.SessionID)
+		return d.liveAdoptedShimController(params.OrgID, params.SessionID)
 	}
 	if d.shims == nil {
 		return nil, fmt.Errorf("session shim: %s is not adopted by this daemon", params.SessionID)
@@ -209,7 +209,7 @@ func (d *Daemon) resolveWakeController(params sessionWakeParams) (*sessionshim.C
 	case 0:
 		return nil, fmt.Errorf("session shim: %s is not adopted by this daemon", params.SessionID)
 	case 1:
-		return d.adoptedShimController(matches[0].OrgID, matches[0].SessionID)
+		return d.liveAdoptedShimController(matches[0].OrgID, matches[0].SessionID)
 	default:
 		return nil, fmt.Errorf("session shim: %s: %w", params.SessionID, errShimAmbiguous)
 	}

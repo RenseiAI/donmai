@@ -40,6 +40,7 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/worktree"
+	"github.com/RenseiAI/donmai/sessionshim"
 )
 
 // DefaultAgentRunDaemonURL is the local control HTTP address the default
@@ -123,14 +124,16 @@ func gatewayHarnessIdentity(detail *daemon.SessionDetail, admission *runner.Harn
 // The subcommand is intentionally headless — it expects DONMAI_SESSION_ID
 // in env (set by the spawner) or --session-id on the command line.
 // Stdout receives a single line of machine-readable JSON describing
-// the terminal Result; stderr receives slog output.
+// the terminal Result; stderr receives slog output. Shim-owned processes may
+// then remain alive for the bounded final-screen service window.
 //
 // Exit codes:
 //
 //   - 0  — runner.Run returned a Result with Status="completed" and
 //     poster.Post succeeded. Soft warnings (failed teardown,
 //     retried result post) do not change the exit code.
-//   - 1  — runner.Run failed; Result.Status != "completed".
+//   - 1  — runner.Run failed, Result.Status != "completed", or the owned
+//     shim could not durably finalize.
 //   - 2  — pre-flight failure (no session id, daemon unreachable,
 //     session not found, registry construction failed).
 //
@@ -152,6 +155,9 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 			"The session id is read from --session-id or the\n" +
 			"DONMAI_SESSION_ID environment variable (set automatically by\n" +
 			"the daemon spawner).\n\n" +
+			"Shim-owned workers can remain alive for the final-screen window\n" +
+			"(60 seconds by default) after posting the result. Controller detach\n" +
+			"or an explicit interrupt ends that transport lifetime.\n\n" +
 			"Operators rarely invoke this directly. `" + bin + " host run` spawns it\n" +
 			"on every accepted session. To debug a session locally, set\n" +
 			"DONMAI_SESSION_ID and invoke this command against a running\n" +
@@ -299,8 +305,16 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 
 	// 3. Set up signal handling so SIGTERM/SIGINT translates into a
 	// clean ctx cancellation through the runner.
-	runCtx, cancel := signal.NotifyContext(ctx, syscall.SIGTERM, syscall.SIGINT)
+	// Keep OS shutdown distinct from the caller/run deadline from the start.
+	// A signal arriving while terminal publication finishes must remain visible
+	// to the later owner drain even if the business deadline already expired.
+	ownerCtx, stopOwnerSignals := signal.NotifyContext(context.WithoutCancel(ctx), syscall.SIGTERM, syscall.SIGINT)
+	defer stopOwnerSignals()
+	runCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	stopShutdown := context.AfterFunc(ownerCtx, cancel)
+	defer stopShutdown()
+	runCtx, ownerLifetime := sessionshim.WithOwnerLifetime(runCtx)
 
 	logger := slog.Default()
 	logger.Info(
@@ -516,6 +530,13 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		}
 	}
 
+	// Business completion (including its terminal post/JSON) has already happened.
+	// Keep only this command's shim transport owners alive for the final screen;
+	// the runner's canceled stage context must not turn success into budget failure.
+	if ownerErr := ownerLifetime.Wait(ownerCtx); ownerErr != nil {
+		logger.Error("agent run: session shim owner drain failed", "err", ownerErr)
+		return errors.Join(runErr, fmt.Errorf("session shim owner drain: %w", ownerErr))
+	}
 	if runErr != nil {
 		return fmt.Errorf("runner.Run: %w", runErr)
 	}

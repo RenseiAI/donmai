@@ -56,6 +56,7 @@ type Issue struct {
 	Description string     `json:"description,omitempty"`
 	URL         string     `json:"url,omitempty"`
 	Priority    int        `json:"priority,omitempty"`
+	SortOrder   *float64   `json:"sortOrder"` // Native manual issue order; nil remains distinct from rank 0.
 	CreatedAt   *time.Time `json:"createdAt,omitempty"`
 	UpdatedAt   *time.Time `json:"updatedAt,omitempty"`
 	State       struct {
@@ -240,6 +241,7 @@ type issueNode struct {
 	Description string     `json:"description"`
 	URL         string     `json:"url"`
 	Priority    int        `json:"priority"`
+	SortOrder   *float64   `json:"sortOrder"`
 	CreatedAt   *time.Time `json:"createdAt"`
 	UpdatedAt   *time.Time `json:"updatedAt"`
 	State       struct {

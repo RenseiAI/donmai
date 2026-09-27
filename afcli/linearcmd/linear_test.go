@@ -210,6 +210,37 @@ func TestLinearGetIssue(t *testing.T) {
 	}
 }
 
+func TestLinearGetIssueExposesPriorityAndManualRank(t *testing.T) {
+	issueJSON := issueNodeJSON("issue-1", "ENG-1", "Ranked Issue", "Backlog", "team-1", "ENG", "Engineering")
+	issueJSON = strings.Replace(issueJSON, `"priority":2,`, `"priority":0,"sortOrder":0,`, 1)
+	queryHasRank := false
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query string `json:"query"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		queryHasRank = strings.Contains(req.Query, "sortOrder")
+		writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
+	})
+
+	out, err := runLinearCmd(t, "", "get-issue", "ENG-1")
+	if err != nil {
+		t.Fatalf("get-issue failed: %v\nout: %s", err, out)
+	}
+	result := decodeJSON(t, out)
+	if !queryHasRank {
+		t.Error("get-issue query did not request the native rank field")
+	}
+	if result["priority"] != float64(0) {
+		t.Errorf("priority = %#v, want numeric zero", result["priority"])
+	}
+	if result["sortOrder"] != float64(0) {
+		t.Errorf("sortOrder = %#v, want numeric zero distinct from priority", result["sortOrder"])
+	}
+}
+
 func TestLinearGetIssueParentFields(t *testing.T) {
 	tests := []struct {
 		name                 string
@@ -1164,6 +1195,116 @@ func TestLinearListIssues(t *testing.T) {
 	second := arr[1].(map[string]any)
 	if first["id"] != "ENG-1" || second["id"] != "ENG-2" {
 		t.Fatalf("equal-priority issue order changed: %#v", arr)
+	}
+}
+
+func TestLinearListIssuesManualOrderPreservesNativeOrder(t *testing.T) {
+	manualFirst := issueNodeJSON("issue-2", "ENG-2", "Manual First", "Backlog", "team-1", "ENG", "Engineering")
+	manualFirst = strings.Replace(manualFirst, `"priority":2,`, `"priority":4,"sortOrder":0,`, 1)
+	manualFirst = strings.Replace(manualFirst, `"createdAt":"2025-01-01T00:00:00Z"`, `"createdAt":"2025-01-02T00:00:00Z"`, 1)
+	manualSecond := issueNodeJSON("issue-1", "ENG-1", "Manual Second", "Backlog", "team-1", "ENG", "Engineering")
+	manualSecond = strings.Replace(manualSecond, `"priority":2,`, `"priority":1,"sortOrder":8.5,`, 1)
+	manualSecond = strings.Replace(manualSecond, `"createdAt":"2025-01-01T00:00:00Z"`, `"createdAt":"2024-01-01T00:00:00Z"`, 1)
+	var listVariables map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListIssues"):
+			listVariables = req.Variables
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, manualFirst, manualSecond))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-issues", "--project", "TestProject", "--limit", "2", "--order-by", "manual")
+	if err != nil {
+		t.Fatalf("list-issues manual failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 2 {
+		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	first := arr[0].(map[string]any)
+	second := arr[1].(map[string]any)
+	if first["id"] != "ENG-2" || second["id"] != "ENG-1" {
+		t.Fatalf("manual order changed by priority/timestamps: %#v", arr)
+	}
+	if first["priority"] != float64(4) || first["sortOrder"] != float64(0) || second["sortOrder"] != 8.5 {
+		t.Fatalf("priority/manual rank fields = %#v / %#v", first, second)
+	}
+	sorts, ok := listVariables["sort"].([]any)
+	if !ok || len(sorts) != 1 {
+		t.Fatalf("manual GraphQL sort = %#v", listVariables["sort"])
+	}
+	entry, _ := sorts[0].(map[string]any)
+	manual, _ := entry["manual"].(map[string]any)
+	if manual["order"] != "Ascending" || manual["nulls"] != "last" || listVariables["orderBy"] != nil {
+		t.Fatalf("manual GraphQL ordering = %#v", listVariables)
+	}
+	filter, _ := listVariables["filter"].(map[string]any)
+	project, _ := filter["project"].(map[string]any)
+	projectID, _ := project["id"].(map[string]any)
+	if projectID["eq"] != "proj-1" {
+		t.Fatalf("manual GraphQL filter = %#v, want resolved project filter", listVariables["filter"])
+	}
+}
+
+func TestLinearListIssuesKeepsLegacyPriorityOrderByDefault(t *testing.T) {
+	priorityLast := issueNodeJSON("issue-2", "ENG-2", "Low Priority", "Backlog", "team-1", "ENG", "Engineering")
+	priorityLast = strings.Replace(priorityLast, `"priority":2,`, `"priority":4,"sortOrder":0,`, 1)
+	priorityFirst := issueNodeJSON("issue-1", "ENG-1", "High Priority", "Backlog", "team-1", "ENG", "Engineering")
+	priorityFirst = strings.Replace(priorityFirst, `"priority":2,`, `"priority":1,"sortOrder":8.5,`, 1)
+	var listVariables map[string]any
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		switch {
+		case strings.Contains(req.Query, "ListProjects"):
+			writeLinearGQLData(w, `{"projects":{"nodes":[{"id":"proj-1","name":"TestProject"}]}}`)
+		case strings.Contains(req.Query, "ListIssues"):
+			listVariables = req.Variables
+			writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, priorityLast, priorityFirst))
+		default:
+			writeLinearGQLData(w, `{}`)
+		}
+	})
+
+	out, err := runLinearCmd(t, "", "list-issues", "--project", "TestProject", "--limit", "2")
+	if err != nil {
+		t.Fatalf("list-issues default failed: %v\nout: %s", err, out)
+	}
+	arr := decodeJSONArray(t, out)
+	if len(arr) != 2 || arr[0].(map[string]any)["id"] != "ENG-1" || arr[1].(map[string]any)["id"] != "ENG-2" {
+		t.Fatalf("default priority order = %#v", arr)
+	}
+	if listVariables["orderBy"] != "createdAt" || listVariables["sort"] != nil {
+		t.Fatalf("default GraphQL order = %#v, want createdAt without manual sort", listVariables)
+	}
+}
+
+func TestLinearListIssuesRejectsUnsupportedOrder(t *testing.T) {
+	requests := 0
+	setupLinearTest(t, func(http.ResponseWriter, *http.Request) { requests++ })
+	_, err := runLinearCmd(t, "", "list-issues", "--order-by", "priority")
+	if err == nil || !strings.Contains(err.Error(), "--order-by") {
+		t.Fatalf("error = %v, want unsupported --order-by error", err)
+	}
+	if requests != 0 {
+		t.Fatalf("requests = %d, want invalid order rejected before I/O", requests)
 	}
 }
 

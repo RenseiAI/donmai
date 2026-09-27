@@ -38,6 +38,52 @@ The version is derived from the tag and injected through
 `.goreleaser.yaml`'s `main.version` linker flag. There is no separate runtime
 version file to bump.
 
+## Named release notes
+
+Keep publishing versioned releases as changes become ready. Every two weeks,
+add one named, themed note to the **existing latest stable GitHub Release** to
+make the intervening releases readable as a group. This editorial cadence does
+not delay daily releases, create a new tag, rerun a publisher, or change signed
+tags and release assets. Continue maintaining a per-version `CHANGELOG.md`
+section for each ordinary release; the themed note is an additional summary.
+
+Draft the note in `release-notes/vX.Y.Z-<theme>.md`, where `vX.Y.Z` is the
+existing release object that will carry it. State the exact UTC date and tag
+range. Open with a short account of what changed for users, then group a few
+representative changes under the theme with links to their public pull requests.
+Link the full GitHub compare range so the summary never masquerades as an
+exhaustive list. Do not promote an unreleased change into the note.
+
+Check the public compare history before naming contributors: review merged
+pull-request authors, direct commit authors, and `Co-authored-by` trailers in
+the range. Name **every human outside contributor** whose work appears there,
+using a public name or handle supported by that history and a link to the
+contribution. Do not guess an account from a name or count repository bots as
+people. If there are none, say so plainly. Scan the exact draft with
+`bash scripts/guard-b-lint.sh <draft-path>` and run `make guard` before
+publication.
+
+After the tagged release and its assets are verified below, confirm the
+release object's `target_commitish` still names the intended immutable commit.
+Then update **that release object's title and body** from the reviewed note,
+without touching its tag or assets:
+
+```bash
+tag=vX.Y.Z
+note=release-notes/vX.Y.Z-<theme>.md
+gh release view "$tag" --repo RenseiAI/donmai \
+  --json tagName,targetCommitish,publishedAt,url
+gh release edit "$tag" --repo RenseiAI/donmai \
+  --title "vX.Y.Z: Theme name" --notes-file "$note"
+gh release view "$tag" --repo RenseiAI/donmai \
+  --json name,body,targetCommitish,url
+```
+
+Read back the rendered GitHub Release note, then add a linked entry to the
+curated `donmai.dev/changelog` ledger. Verify the deployed page shows the same
+story and contributor credit. A source change or a successful site build alone
+does not establish public acceptance.
+
 ## Prerequisites
 
 - A clean, current `main` checkout.

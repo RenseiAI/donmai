@@ -1,0 +1,41 @@
+name: Donmai native drift check
+author: RenseiAI
+description: Check a complete pull request diff with the checksum-pinned Donmai native analyzer.
+branding:
+  icon: git-pull-request
+  color: blue
+inputs:
+  token:
+    description: GitHub token; pull-requests read to assess, write to comment.
+    required: true
+    default: ${{ github.token }}
+  gate-policy:
+    description: none, no-severity-high, zero-deviations, or max:N.
+    default: no-severity-high
+  comment:
+    description: auto, required, or never. Auto reports read-only fork comment restrictions without failing an otherwise valid assessment.
+    default: auto
+outputs:
+  result:
+    description: clean, gated, or error. Clean means the selected observation policy did not trigger.
+    value: ${{ steps.assess.outputs.result }}
+  observations:
+    description: Number of native diff observations; absent on errors.
+    value: ${{ steps.assess.outputs.observations }}
+  comment-status:
+    description: posted, updated, disabled, or unavailable.
+    value: ${{ steps.assess.outputs.comment-status }}
+  head-sha:
+    description: Event head SHA; verified before and after successful assessment.
+    value: ${{ steps.assess.outputs.head-sha }}
+runs:
+  using: composite
+  steps:
+    - id: assess
+      shell: bash
+      env:
+        ACTION_TOKEN: ${{ inputs.token }}
+        ACTION_GATE_POLICY: ${{ inputs.gate-policy }}
+        ACTION_COMMENT: ${{ inputs.comment }}
+        ACTION_DIRECTORY: ${{ github.action_path }}
+      run: python3 -I "$ACTION_DIRECTORY/action/run.py"

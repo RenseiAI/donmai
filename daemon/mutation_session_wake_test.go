@@ -80,9 +80,10 @@ const wakeFixtureReportLoop = `while IFS= read -r line; do ` +
 const wakeFixtureFrozenHarness = `stty -echo -isig; while :; do sleep 30; done`
 
 type wakeFixture struct {
-	daemon *Daemon
-	id     sessionshim.Identity
-	output <-chan []byte
+	daemon   *Daemon
+	id       sessionshim.Identity
+	output   <-chan []byte
+	terminal <-chan sessionshim.ControllerEvent
 	// shim is the live harness host, so a test can take it away and make the
 	// controller's next write fail for real rather than through a stub.
 	shim *sessionshim.Shim
@@ -138,9 +139,14 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	// The controller stalls if nobody drains it, so the drain IS the fixture's
 	// observation point: terminal bytes the harness produced, and nothing else.
 	output := make(chan []byte, 64)
+	terminal := make(chan sessionshim.ControllerEvent, 1)
 	go func() {
 		defer close(output)
 		for ev := range ctrl.Events() {
+			if ev.Kind == sessionshim.EventExit {
+				terminal <- ev
+			}
+
 			if ev.Kind != sessionshim.EventOutput || len(ev.Data) == 0 {
 				continue
 			}
@@ -168,7 +174,7 @@ func newWakeFixture(t *testing.T, harness string) *wakeFixture {
 	d.shims.adopted[id] = adoptedShim{shimID: "shim-wake", controller: ctrl}
 	d.shims.mu.Unlock()
 
-	return &wakeFixture{daemon: d, id: id, output: output, ctrl: ctrl, shim: shim}
+	return &wakeFixture{daemon: d, id: id, output: output, terminal: terminal, ctrl: ctrl, shim: shim}
 }
 
 // awaitAck reports whether the fake harness answered at all. A wedged harness
@@ -227,24 +233,37 @@ func (f *wakeFixture) primeWakeLedger(t *testing.T) {
 	f.daemon.commitWakeMutation(f.id, "", "session.wake")
 }
 
-// terminateShim tears the harness host down so the adopted controller's next
-// write fails the way a dead socket would in production.
-func (f *wakeFixture) terminateShim(t *testing.T) {
+// closeShimHost tears the harness AND its serving host down so the adopted
+// controller's next write fails against a genuinely closed transport. Terminate
+// alone preserves the post-Exit final-screen service and is not this fault.
+func (f *wakeFixture) closeShimHost(t *testing.T) {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 	defer cancel()
 	if err := f.shim.Terminate(ctx); err != nil {
 		t.Fatalf("terminate shim: %v", err)
 	}
-	// Let the controller observe the closed transport.
-	deadline := time.Now().Add(5 * time.Second)
-	for time.Now().Before(deadline) {
-		if err := f.ctrl.WriteAttributedInput([]byte("probe"), []byte{0x00}); err != nil {
-			return
-		}
-		time.Sleep(20 * time.Millisecond)
+	select {
+	case <-f.shim.TerminalDone():
+	case <-ctx.Done():
+		t.Fatal("shim did not persist terminal proof before host shutdown")
 	}
-	t.Fatal("controller still accepts writes after the shim terminated")
+	if err := f.shim.Close(); err != nil {
+		t.Fatalf("close shim host: %v", err)
+	}
+	select {
+	case <-f.shim.Done():
+	case <-ctx.Done():
+		t.Fatal("shim host did not finish shutdown")
+	}
+	select {
+	case <-f.ctrl.Done():
+	case <-ctx.Done():
+		t.Fatal("controller did not observe closed host transport")
+	}
+	if err := f.ctrl.WriteAttributedInput([]byte("probe"), []byte{0x00}); err == nil {
+		t.Fatal("controller still accepts writes after the shim host closed")
+	}
 }
 
 func wakeMutation(t *testing.T, op, id string, params any) PendingMutation {
@@ -615,7 +634,7 @@ func TestFailedWakeDoesNotAdmitRestartHarness(t *testing.T) {
 	f := newWakeFixture(t, wakeFixtureRawHarness)
 
 	// Take the shim away so the controller's write cannot land.
-	f.terminateShim(t)
+	f.closeShimHost(t)
 
 	err := f.daemon.applyOneMutation(wakeMutation(t, "session.wake", "m-1", sessionWakeParams{
 		SessionID: f.id.SessionID, OrgID: f.id.OrgID,
@@ -647,7 +666,7 @@ func TestRedeliveryAfterAFailedWriteReapplies(t *testing.T) {
 
 	// Fail the write by making the controller unusable, then restore a live
 	// fixture and re-present the SAME mutation id.
-	f.terminateShim(t)
+	f.closeShimHost(t)
 	if err := f.daemon.applyOneMutation(m); err == nil {
 		t.Fatal("wake against a dead shim = nil error, want a write failure")
 	}
@@ -737,7 +756,7 @@ func TestHalfAppliedRestartHarnessIsNotRecorded(t *testing.T) {
 	f.primeWakeLedger(t)
 
 	// Take the harness away so rung 2's writes cannot land at all.
-	f.terminateShim(t)
+	f.closeShimHost(t)
 
 	m := wakeMutation(t, "session.restart-harness", "m-1", sessionWakeParams{
 		SessionID: f.id.SessionID, OrgID: f.id.OrgID,

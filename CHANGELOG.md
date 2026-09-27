@@ -10,6 +10,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.48 — 2026-09-27
+
+### Features
+
+- Linear issue reads expose native manual ranks separately from numeric
+  priority. `linear list-issues --order-by manual` uses native server-side
+  ordering across cursor pages, while existing default ordering remains
+  unchanged.
+- A checksum-pinned native drift-check Action assesses complete PR diffs,
+  emits a check annotation and summary, and posts a sanitized comment when
+  the workflow token permits it. Fork tokens retain truthful read-only
+  behavior; Marketplace publication is a separate step.
+
+### Fixes
+
+- Keep session-shim final-screen service alive after terminal completion,
+  without delaying the business result. Owning CLI processes now retain their
+  shim listeners until controller detach, explicit shutdown, or the bounded
+  final-screen window; handshakes cannot reopen a closed listener.
+- Refuse wake and restart mutations after the daemon observes terminal exit,
+  while retaining final-screen snapshot reads during terminal listener delivery.
+
+### Chores
+
+- Document a fortnightly themed-release-note cadence alongside ordinary
+  releases, and add a thirty-day retrospective with verified contributor
+  credit.
+- Reconcile README examples with the shipped host commands and distinguish
+  persistent daemon setup from the standalone issue orchestrator.
+
 ## v0.72.47 — 2026-09-26
 
 ### Fixes

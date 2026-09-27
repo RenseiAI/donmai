@@ -34,7 +34,7 @@ const defaultBaseURL = "https://api.linear.app/graphql"
 const (
 	// Fragments
 	issueFragment = `fragment IssueFields on Issue {
-  id identifier title description url priority createdAt updatedAt
+  id identifier title description url priority sortOrder createdAt updatedAt
   state { id name }
   team { id key name }
   project { id name }
@@ -57,6 +57,14 @@ const (
 
 	queryListIssues = `query ListIssues($filter: IssueFilter, $first: Int, $after: String, $orderBy: PaginationOrderBy) {
   issues(filter: $filter, first: $first, after: $after, orderBy: $orderBy) {
+    nodes { ...IssueFields }
+    pageInfo { hasNextPage endCursor }
+  }
+}
+` + issueFragment
+
+	queryListIssuesManual = `query ListIssuesManual($filter: IssueFilter, $first: Int, $after: String, $sort: [IssueSortInput!]) {
+  issues(filter: $filter, first: $first, after: $after, sort: $sort) {
     nodes { ...IssueFields }
     pageInfo { hasNextPage endCursor }
   }
@@ -456,6 +464,7 @@ func nodeToIssue(n issueNode) Issue {
 		Description: n.Description,
 		URL:         n.URL,
 		Priority:    n.Priority,
+		SortOrder:   n.SortOrder,
 		CreatedAt:   n.CreatedAt,
 		UpdatedAt:   n.UpdatedAt,
 	}
@@ -771,7 +780,9 @@ func ValidateIssueListLimit(limit int) error {
 // filter is sent verbatim as the GraphQL IssueFilter variable. Linear caps a
 // connection page at 250 nodes, so larger limits are fetched using cursors.
 // The page bound prevents a malformed or unexpectedly large connection from
-// causing unbounded network work.
+// causing unbounded network work. orderBy accepts createdAt or updatedAt for
+// timestamp ordering, or "manual" for Linear's native manual issue order. The
+// manual order and filters are evaluated by Linear before each cursor page.
 func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) ([]Issue, error) {
 	if err := ValidateIssueListLimit(limit); err != nil {
 		return nil, err
@@ -783,14 +794,22 @@ func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit in
 	seenCursors := make(map[string]struct{})
 	for page := 0; page < maxIssueListPages; page++ {
 		pageSize := min(limit-len(issues), maxIssueListPageSize)
+		query := queryListIssues
 		vars := map[string]any{
-			"filter":  filter,
-			"first":   pageSize,
-			"after":   after,
-			"orderBy": orderBy,
+			"filter": filter,
+			"first":  pageSize,
+			"after":  after,
+		}
+		if orderBy == "manual" {
+			query = queryListIssuesManual
+			vars["sort"] = []map[string]any{{
+				"manual": map[string]any{"order": "Ascending", "nulls": "last"},
+			}}
+		} else {
+			vars["orderBy"] = orderBy
 		}
 		var data paginatedListIssuesData
-		if err := c.do(ctx, queryListIssues, vars, &data); err != nil {
+		if err := c.do(ctx, query, vars, &data); err != nil {
 			return nil, err
 		}
 		if data.Issues == nil {

@@ -694,6 +694,210 @@ func TestListIssuesPaginatesAboveLinearPageLimit(t *testing.T) {
 	if requests[0]["orderBy"] != "updatedAt" {
 		t.Fatalf("orderBy = %#v, want updatedAt", requests[0]["orderBy"])
 	}
+	if requests[0]["sort"] != nil || strings.Contains(queryListIssues, "sort: $sort") {
+		t.Fatalf("timestamp list unexpectedly uses manual sort: variables=%#v query=%s", requests[0], queryListIssues)
+	}
+}
+
+func TestListIssuesManualOrderUsesNativeSortAcrossPages(t *testing.T) {
+	t.Parallel()
+
+	var requests []map[string]any
+	var nativeSorts []bool
+	var rankSelections []bool
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		requests = append(requests, req.Variables)
+		rankSelections = append(rankSelections, strings.Contains(req.Query, "sortOrder"))
+		filter, _ := req.Variables["filter"].(map[string]any)
+		state, _ := filter["state"].(map[string]any)
+		stateName, _ := state["name"].(map[string]any)
+		if stateName["eq"] != "Backlog" || !strings.Contains(req.Query, "filter: $filter") {
+			t.Fatalf("manual sort did not retain issue filter: %#v", req.Variables)
+		}
+		sorts, ok := req.Variables["sort"].([]any)
+		validSort := ok && len(sorts) == 1 && req.Variables["orderBy"] == nil
+		if validSort {
+			entry, _ := sorts[0].(map[string]any)
+			manual, _ := entry["manual"].(map[string]any)
+			validSort = manual["order"] == "Ascending" && manual["nulls"] == "last"
+		}
+		nativeSorts = append(nativeSorts, validSort)
+
+		start := 0
+		count := 250
+		hasNext := true
+		cursor := "manual-page-1"
+		if req.Variables["after"] != nil {
+			start = 250
+			count = 1
+			hasNext = false
+		}
+		if req.Variables["first"] != float64(count) {
+			t.Fatalf("page size = %#v, want %d", req.Variables["first"], count)
+		}
+		nodes := make([]map[string]any, count)
+		for i := range nodes {
+			index := start + i
+			rank := float64(index)
+			if index == 250 {
+				rank = 249 // Equal rank across the cursor boundary keeps provider order.
+			}
+			nodes[i] = map[string]any{
+				"id":         fmt.Sprintf("issue-%03d", index),
+				"identifier": fmt.Sprintf("ENG-%03d", index),
+				"title":      fmt.Sprintf("Issue %03d", index),
+				"priority":   4 - index%4,
+				"sortOrder":  rank,
+			}
+		}
+		var endCursor *string
+		if hasNext {
+			endCursor = &cursor
+		}
+		payload := map[string]any{"data": map[string]any{"issues": map[string]any{
+			"nodes":    nodes,
+			"pageInfo": map[string]any{"hasNextPage": hasNext, "endCursor": endCursor},
+		}}}
+		if err := json.NewEncoder(w).Encode(payload); err != nil {
+			t.Errorf("encode response: %v", err)
+		}
+	})
+
+	issues, err := c.ListIssues(context.Background(), map[string]any{"state": map[string]any{"name": map[string]any{"eq": "Backlog"}}}, 251, "manual")
+	if err != nil {
+		t.Fatalf("ListIssues manual: %v", err)
+	}
+	if len(issues) != 251 || issues[0].ID != "issue-000" || issues[249].ID != "issue-249" || issues[250].ID != "issue-250" {
+		t.Fatalf("manual page order = len %d, first=%q last two=%q,%q", len(issues), issues[0].ID, issues[249].ID, issues[250].ID)
+	}
+	if len(requests) != 2 || requests[1]["after"] != "manual-page-1" {
+		t.Fatalf("manual pagination variables = %#v", requests)
+	}
+	for i := range requests {
+		if !nativeSorts[i] || !rankSelections[i] {
+			t.Fatalf("page %d did not request native manual order and rank: variables=%#v selectedRank=%v", i+1, requests[i], rankSelections[i])
+		}
+	}
+	raw, err := json.Marshal(issues)
+	if err != nil {
+		t.Fatalf("marshal issues: %v", err)
+	}
+	var output []map[string]any
+	if err := json.Unmarshal(raw, &output); err != nil {
+		t.Fatalf("decode issue output: %v", err)
+	}
+	if output[0]["sortOrder"] != float64(0) || output[250]["sortOrder"] != float64(249) {
+		t.Fatalf("native ranks at zero/end = %#v, %#v", output[0]["sortOrder"], output[250]["sortOrder"])
+	}
+}
+
+func TestListIssuesManualOrderPreservesZeroAndMissingRanks(t *testing.T) {
+	t.Parallel()
+
+	manualRequested := false
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		manualRequested = req.Variables["sort"] != nil
+		writeGQLData(w, `{"issues":{"nodes":[{"id":"zero","identifier":"ENG-1","title":"Zero","priority":0,"sortOrder":0},{"id":"missing","identifier":"ENG-2","title":"Missing","priority":2,"sortOrder":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+	})
+
+	issues, err := c.ListIssues(context.Background(), nil, 2, "manual")
+	if err != nil {
+		t.Fatalf("ListIssues manual: %v", err)
+	}
+	raw, err := json.Marshal(issues)
+	if err != nil {
+		t.Fatalf("marshal issues: %v", err)
+	}
+	var output []map[string]any
+	if err := json.Unmarshal(raw, &output); err != nil {
+		t.Fatalf("decode issue output: %v", err)
+	}
+	if !manualRequested {
+		t.Fatalf("manual sort was not requested")
+	}
+	if output[0]["sortOrder"] != float64(0) {
+		t.Fatalf("zero rank = %#v, want numeric zero", output[0]["sortOrder"])
+	}
+	if got, ok := output[1]["sortOrder"]; !ok || got != nil {
+		t.Fatalf("missing/null rank = %#v (present %v), want explicit null", got, ok)
+	}
+}
+
+func TestListIssuesManualOrderUsesSameGraphQLOnDirectAndProxyClients(t *testing.T) {
+	t.Parallel()
+
+	for _, tc := range []struct {
+		name       string
+		proxy      bool
+		wantHeader string
+	}{
+		{name: "direct", wantHeader: "test-fixture-key-not-a-secret"},
+		{name: "proxy", proxy: true, wantHeader: "Bearer test-proxy-fixture"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			gotHeader := ""
+			sentManual := false
+			c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+				gotHeader = r.Header.Get("Authorization")
+				var req graphqlRequest
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Fatalf("decode request: %v", err)
+				}
+				sentManual = strings.Contains(req.Query, "sortOrder") && req.Variables["sort"] != nil
+				writeGQLData(w, `{"issues":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			})
+			c.ProxyMode = tc.proxy
+			if tc.proxy {
+				c.APIKey = "test-proxy-fixture"
+			}
+			if _, err := c.ListIssues(context.Background(), nil, 1, "manual"); err != nil {
+				t.Fatalf("ListIssues manual: %v", err)
+			}
+			if gotHeader != tc.wantHeader {
+				t.Errorf("authorization = %q, want %q", gotHeader, tc.wantHeader)
+			}
+			if !sentManual {
+				t.Errorf("manual sort was not sent on %s path", tc.name)
+			}
+		})
+	}
+}
+
+func TestListIssuesManualOrderSurfacesUnsupportedNativeSort(t *testing.T) {
+	t.Parallel()
+
+	requests := 0
+	c, _ := newTestClient(t, func(w http.ResponseWriter, r *http.Request) {
+		requests++
+		var req graphqlRequest
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "sort: $sort") || req.Variables["sort"] == nil {
+			t.Errorf("manual sort request was replaced: %#v", req)
+		}
+		writeGQLError(w, "Unknown argument sort")
+	})
+
+	issues, err := c.ListIssues(context.Background(), nil, 1, "manual")
+	if err == nil || !strings.Contains(err.Error(), "Unknown argument sort") {
+		t.Fatalf("ListIssues manual error = %v, want native sort error", err)
+	}
+	if issues != nil {
+		t.Fatalf("manual sort returned partial issues: %#v", issues)
+	}
+	if requests != 1 {
+		t.Fatalf("requests = %d, want one failed native-order request and no fallback", requests)
+	}
 }
 
 func TestListIssuesDeduplicatesAndPreservesFirstSeenOrder(t *testing.T) {

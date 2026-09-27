@@ -2,7 +2,9 @@
 
 > **Status: alpha.** APIs and command flags are stabilising. See [CHANGELOG.md](./CHANGELOG.md) for the change log and [RELEASING.md](./RELEASING.md) for the release process.
 
-`donmai` is the open-source CLI and terminal dashboard for local agent fleets. It is the single binary for every OSS operator task: running the three-process stack locally, managing agents and sessions, querying issue trackers, and inspecting fleet health.
+`donmai` is the open-source agent runtime CLI and terminal dashboard for local
+agent fleets. The single binary runs the local daemon, dispatches work, manages
+agent sessions, and exposes code intelligence without a hosted control plane.
 
 **Binary**: `donmai`
 **Module**: `github.com/RenseiAI/donmai`
@@ -13,15 +15,15 @@
 
 - [Install](#install)
 - [Quick start](#quick-start)
-- [Credentials in standalone mode (no daemon, no platform)](#credentials-in-standalone-mode-no-daemon-no-platform)
-- [Three-process model](#three-process-model)
+- [Standalone credentials](#standalone-credentials)
+- [Local execution model](#local-execution-model)
 - [Command catalog](#command-catalog)
   - [donmai status](#donmai-status)
   - [donmai agent](#donmai-agent)
   - [donmai session](#donmai-session)
-  - [donmai daemon](#donmai-daemon)
+  - [donmai host](#donmai-host)
   - [donmai governor](#donmai-governor)
-  - [donmai worker and donmai fleet](#donmai-worker-and-donmai-fleet)
+  - [Legacy worker and fleet aliases](#legacy-worker-and-fleet-aliases)
   - [donmai orchestrator](#donmai-orchestrator)
   - [donmai logs](#donmai-logs)
   - [donmai linear](#donmai-linear)
@@ -29,7 +31,6 @@
   - [donmai code](#donmai-code)
   - [donmai arch](#donmai-arch)
   - [donmai admin](#donmai-admin)
-- [Migration from the legacy TypeScript CLI](#migration-from-the-legacy-typescript-cli)
 - [Development](#development)
 - [Architecture](#architecture)
 - [Contribution and license](#contribution-and-license)
@@ -56,11 +57,14 @@ Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
 [releases page](https://github.com/RenseiAI/donmai/releases).
 
-Example for macOS arm64 (replace `0.9.4` with the version you want):
+Example for macOS arm64, pinned to v0.72.47. See the releases page for newer
+versions:
 
 ```bash
-curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.9.4/donmai_0.9.4_darwin_arm64.tar.gz \
-  | tar -xz -C /usr/local/bin donmai
+mkdir -p "$HOME/.local/bin"
+curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.47/donmai_0.72.47_darwin_arm64.tar.gz \
+  | tar -xz -C "$HOME/.local/bin" donmai
+"$HOME/.local/bin/donmai" --version
 ```
 
 ### Build from source
@@ -75,41 +79,44 @@ make build        # produces bin/donmai
 
 ## Quick start
 
-```bash
-# 1. Authenticate with Linear (set your API key)
-export LINEAR_API_KEY=lin_api_...
+For a persistent local host, use the setup wizard, install the service, and
+read its status through the loopback daemon API:
 
-# 2. Start the local daemon (persists across reboots via launchd / systemd)
+```bash
+donmai host setup
 donmai host install
 donmai host status
+donmai host doctor
+donmai host stats
+donmai host logs
+```
 
-# 3. Pick up Linear backlog issues and dispatch agents
+The standalone `orchestrator` is a separate path that starts an installed
+Claude or Codex CLI directly, without the daemon. In a Git checkout, set
+`LINEAR_API_KEY`, replace `MyProject` with your Linear project name, then
+preview before dispatching:
+
+```bash
+donmai orchestrator --project MyProject --dry-run
 donmai orchestrator --project MyProject
-
-# 4. Watch fleet activity
-donmai status
-donmai agent list
-
-# 5. Tail logs from the log analyzer
-donmai logs analyze --input ~/.donmai/logs/agent.log
 ```
 
 ---
 
-## Credentials in standalone mode (no daemon, no platform)
+## Standalone credentials
 
-When you run `donmai` standalone (OSS mode, outside any downstream
-embedder), agents inherit credentials from the donmai process. There are
-two sources, in this order:
+When `donmai` runs without an external credential pipeline, the local daemon
+can pass credentials to its agent children from two sources, in this order:
 
   1. Existing environment variables in the donmai process
-  2. .env.local at the root of the working directory
+  2. `.env.local` at the root of the current Git repository
 
 The first source that defines a variable wins. .env.local is read once
 at donmai startup and never copied into worktrees.
 
-Some variables (the daemon's own auth tokens) are blocked from forwarding
-regardless of source; see internal/credentials/blocklist.go.
+The daemon's own authentication variables are blocked from forwarding regardless
+of source. See [standalone credential handling](./docs/agents/CREDENTIALS-STANDALONE.md)
+for the exact precedence and blocklist.
 
 If you want secrets sourced from 1Password instead of a flat file, see
 the optional `op` CLI integration (run `donmai creds setup` for the
@@ -117,61 +124,26 @@ walkthrough).
 
 ---
 
-## Three-process model
+## Local execution model
 
-`donmai` manages three cooperating processes on your local machine. Each has a
-distinct role; together they form the complete OSS execution pipeline.
-
-```
-┌──────────────────────────────────────────────────────────────────┐
-│                        your machine                              │
-│                                                                  │
-│  ┌─────────────────┐    ┌─────────────────┐   ┌──────────────┐  │
-│  │   orchestrator  │───▶│    governor     │──▶│   worker(s)  │  │
-│  │  (donmai orche- │    │  (donmai govr.) │   │ (donmai wkr) │  │
-│  │   ator)         │    │                 │   │              │  │
-│  └─────────────────┘    └─────────────────┘   └──────────────┘  │
-│           │                      │                    │          │
-│     Linear API             Redis queue         coordinator HTTP  │
-└──────────────────────────────────────────────────────────────────┘
-```
-
-### Orchestrator (`donmai orchestrator`)
-
-Queries the Linear backlog, selects issues that satisfy the configured
-project/work-type filters, and dispatches agent tasks into the Redis work queue.
-It does not run agents itself — it schedules them. OSS users run the orchestrator
-on demand or via a cron job. SaaS users replace it with the platform's webhook-
-driven control plane.
-
-### Governor (`donmai governor`)
-
-Long-running scan loop. Watches the Redis queue for pending work, enforces
-concurrency limits, and starts workers to consume each item. The governor is
-the process that keeps workers running; it is the OSS equivalent of the SaaS
-coordinator service.
-
-### Worker (`donmai worker`)
-
-An agent process. Registers with the coordinator over HTTP, polls for work,
-executes the assigned session (calling the LLM runtime: Claude, Codex, etc.),
-and reports results back. Multiple workers can run in parallel; the governor
-controls the ceiling.
-
-### Daemon (`donmai daemon`)
-
-The local daemon (`rensei-daemon` subprocess) is the persistent service that
-ties the three processes together. It installs as a system service (launchd on
-macOS, systemd on Linux), survives reboots, manages the workarea pool, and
-handles auto-updates with drain semantics. For the full daemon operations manual
-see [011-local-daemon-fleet.md](https://github.com/RenseiAI/donmai-architecture/blob/main/011-local-daemon-fleet.md).
+`donmai host` manages the persistent daemon on this machine. It owns the local
+session pool, workarea cache, provider setup, and host health. The same binary
+offers a separate `donmai orchestrator` path that selects Linear backlog work
+and starts a Claude or Codex process directly, plus `donmai governor` for a
+configured scan loop. The old `worker` and `fleet` process-manager groups remain
+compatibility paths, not the normal host setup. See the
+[local daemon architecture](https://github.com/RenseiAI/donmai-architecture/blob/main/011-local-daemon-fleet.md)
+for the runtime model.
 
 ---
 
 ## Command catalog
 
-All commands output JSON when `--json` is passed. Destructive commands require
-interactive confirmation unless `--yes` is provided.
+Flags and output formats vary by command. Use `donmai <command> --help` before
+automating a mutation.
+
+`status`, `agent`, and `session` query the configured API URL. For the daemon on
+this machine, use `host status`, `host stats`, and `host watch`.
 
 ### `donmai status`
 
@@ -191,7 +163,7 @@ donmai agent list [--all] [--json] [--sandbox <id>]
 donmai agent status <session-id>
 donmai agent stop <session-id>
 donmai agent chat <session-id>          # forward a prompt to a running agent
-donmai agent reconnect <session-id>     # re-attach to a detached session
+donmai agent reconnect <session-id>     # reconnect to an orphaned session
 ```
 
 ### `donmai session`
@@ -199,10 +171,9 @@ donmai agent reconnect <session-id>     # re-attach to a detached session
 Low-level session management (lifecycle, streaming output).
 
 ```bash
-donmai session list [--status <status>] [--limit <n>]
-donmai session inspect <session-id>
+donmai session list [--all] [--json] [--sandbox <id>]
+donmai session show <session-id>
 donmai session stream <session-id>      # tail activity stream
-donmai session restore-workarea <session-id> --to <dir>
 ```
 
 ### `donmai host`
@@ -213,30 +184,33 @@ projects it admits work for, and the live dashboard of sessions running on it.
 The daemon installs as a launchd agent (macOS) or systemd user unit (Linux) and
 manages the workarea pool, auto-updates, and session lifecycle.
 
-`donmai daemon …` still works as a hidden deprecated alias of the lifecycle
-subcommands; it prints a notice on stderr and is removed in v0.58.0.
+`donmai daemon …` still resolves in v0.72.47 as a hidden deprecated lifecycle
+alias. It prints a notice on stderr when invoked; use `host` for new scripts.
 
 ```bash
-donmai host install [--user | --system]   # write and load the system service
+donmai host install                       # macOS launchd or Linux user service
 donmai host uninstall                     # remove the system service
 donmai host status                        # running / stopped / draining
 donmai host stop
 donmai host pause                         # stop accepting new work
 donmai host resume
 donmai host drain                         # wait for in-flight sessions, then stop
-donmai host update                        # force-pull latest release
+donmai host update                        # trigger a manual update check
 donmai host doctor                        # health check: config, credentials, disk
 donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
 donmai host stats [--pool]                # capacity, sessions, pool state
 donmai host setup                         # first-run interactive wizard
 donmai host set <key> <value>             # mutate a single config key
-donmai host evict --repo <repo> [--older-than <duration>]
+donmai host evict --repo <repo> --older-than <duration>
 donmai host watch [--all]                 # live dashboard of this host's sessions
 donmai host provider list                 # providers installed on this machine
 donmai host kit list                      # kits installed on this machine
 donmai host workarea list                 # this machine's workarea pool
 donmai host project list                  # projects this machine admits work for
 ```
+
+On Linux, `host install --system` selects a system-scoped unit and requires
+administrator privileges; `--user` selects the user-scoped unit.
 
 Supported capacity keys:
 
@@ -245,36 +219,24 @@ donmai host set capacity.maxConcurrentSessions <sessions>
 donmai host set capacity.poolMaxDiskGb <gb>
 ```
 
-Environment: `DONMAI_DAEMON_TOKEN` (optional — `donmai host install` provisions
-this automatically when `~/.config/rensei/config.json` contains a platform key).
+Use `donmai host setup` to configure local registration and credentials before
+installing the service.
 
 ### `donmai governor`
 
 Start, stop, and query the governor scan loop.
 
 ```bash
-donmai governor start [--max <n>] [--interval <seconds>]
+donmai governor start [--max-dispatches <n>] [--scan-interval <duration>]
 donmai governor stop
 donmai governor status
 ```
 
-### `donmai worker` and `donmai fleet` (deprecated)
+### Legacy worker and fleet aliases
 
-Legacy local process-manager commands for standalone OSS debugging. `donmai host`
-is the primary lifecycle surface for normal operation (a persistent local daemon);
-`worker`/`fleet` remain available in the `donmai` binary — never in an embedding
-binary — for users who need the older foreground worker process or PID-file fleet
-flow. Both are marked deprecated and are removed in v0.59.0.
-
-```bash
-donmai worker start [--base-url <url>] [--provisioning-token <token>]
-donmai fleet start --count <n>
-donmai fleet status
-donmai fleet stop
-```
-
-`fleet scale` has been removed outright (it only ever returned a
-not-yet-supported error): stop and restart the fleet with a new `--count`.
+`donmai worker` and `donmai fleet` still resolve in v0.72.47 for older local
+process-manager scripts. Both are deprecated and omitted from top-level help;
+new setups should use `donmai host`. The old `fleet scale` stub is absent.
 
 ### `donmai orchestrator`
 
@@ -302,12 +264,12 @@ cat agent.log | donmai logs analyze
 donmai logs analyze --input agent.log --dry-run
 donmai logs analyze --input agent.log --json
 donmai logs analyze --input agent.log --team Engineering --project Agent
-donmai logs analyze --input agent.log --config ~/.config/af/log-signatures.yaml
+donmai logs analyze --input agent.log --config ~/.config/donmai/log-signatures.yaml
 ```
 
 The built-in signature catalog covers: tool misuse, sandbox permission errors,
 approval-required blocks, rate-limit hits, and environment failures. Override or
-extend via a YAML catalog at `~/.config/af/log-signatures.yaml`.
+extend via a YAML catalog at `~/.config/donmai/log-signatures.yaml`.
 
 **Environment**: `LINEAR_API_KEY` required for issue creation (omit with `--dry-run`).
 
@@ -404,15 +366,14 @@ notice to stderr; will be removed once `donmai-libraries` is archived).
 
 ### `donmai arch`
 
-Architecture reference commands. Browse, show, and synthesize the
-`donmai-architecture` corpus.
+Assess a GitHub pull request or commit for architectural drift with the native
+Go pipeline. With `gh` available it reads the PR diff; otherwise the default
+degrades to metadata-only analysis. `--require-diff` returns an error when the
+complete diff cannot be read.
 
 ```bash
-donmai arch list
-donmai arch show <doc-id>                    # e.g. donmai arch show 001
-donmai arch browse                           # interactive TUI browser
-donmai arch synthesize --topic <topic>
-donmai arch assess --topic <topic>           # gap/consistency assessment
+donmai arch assess https://github.com/RenseiAI/donmai/pull/667 --summary
+donmai arch assess --repository github.com/RenseiAI/donmai --pr 667 --require-diff
 ```
 
 ### `donmai admin`
@@ -541,14 +502,6 @@ Example: `donmai admin merge-queue list --repo my-org/my-repo`:
 
 ---
 
-## Migration from the legacy TypeScript CLI
-
-If you are moving from the previous TypeScript-based `pnpm af-*` scripts, see
-[migration-from-legacy-cli.md](https://github.com/RenseiAI/donmai-libraries/blob/main/docs/migration-from-legacy-cli.md)
-(migration guide in flight).
-
----
-
 ## Development
 
 ```bash
@@ -569,8 +522,9 @@ make run-status-mock # Run status with mock data
 The public library surface (`afclient`, `afcli`, `worker`) is designed to be
 imported by downstream consumers. Embedders use `afcli.RegisterCommands` and
 extend the generic OSS command set with their own subcommands. The standalone
-`donmai` binary opts into legacy worker/fleet process-manager commands; embedders
-that want the daemon-only lifecycle surface can leave those commands disabled.
+`donmai` binary retains hidden, deprecated worker/fleet process-manager
+commands for older scripts. Embedders leave those optional commands disabled
+by default.
 
 See `AGENTS.md` for the full package layout and contributor guide. The
 authoritative architecture corpus lives in
