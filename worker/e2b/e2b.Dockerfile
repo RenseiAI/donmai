@@ -69,7 +69,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # bump both together.
 RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs \
-    && npm i -g @anthropic-ai/claude-code@2.1.232 @openai/codex@0.147.0 \
+    && npm i -g @anthropic-ai/claude-code@2.1.283 @openai/codex@0.157.1 \
          @earendil-works/pi-coding-agent@0.80.10 \
     && npm cache clean --force \
     && apt-get clean && rm -rf /var/lib/apt/lists/*

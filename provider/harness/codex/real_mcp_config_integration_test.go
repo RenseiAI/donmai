@@ -25,7 +25,7 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
-const realMCPFixtureVersion = "codex-cli 0.154.0"
+const realMCPFixtureVersion = "codex-cli 0.157.1"
 
 var errRealMCPFixtureComplete = errors.New("real MCP fixture completed before PTY")
 

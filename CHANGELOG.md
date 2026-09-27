@@ -14,6 +14,13 @@ No unreleased changes.
 
 ### Fixes
 
+- The worker image and the e2b sandbox template install Claude Code 2.1.283
+  (was 2.1.232) and Codex 0.157.1 (was 0.147.0). Current Claude models reject
+  Claude Code older than 2.1.280 with an HTTP 400, so claude sessions on those
+  models failed at their first model request on either substrate. CI's real Codex MCP
+  fixture moves to 0.157.1 with them, and a new worker test fails when the two
+  images pin different Claude Code or Codex versions, or when the images' Codex
+  pin differs from the version that fixture exercises.
 - pi sessions no longer run under a fixed 16384-token output cap. The output
   limit is configuration: a dispatch carries it as the resolved profile's
   top-level `maxOutputTokens`, the harness passes it to the policy extension,
