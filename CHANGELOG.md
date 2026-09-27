@@ -18,6 +18,8 @@ No unreleased changes.
   configuration reloads and persisted project mutations. Serialize credential
   operations, coalesce reloads, preserve the last good declaration on failed
   writes, and join in-progress adoption before host shutdown completes.
+- Start work polling only after daemon readiness is published, and keep a
+  canceled or stopped startup from starting a late poller.
 
 ### Chores
 
