@@ -1,8 +1,10 @@
 package daemon
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
+	"log/slog"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -12,6 +14,66 @@ import (
 	"testing"
 	"time"
 )
+
+type invalidReloadSignalWriter struct {
+	once   sync.Once
+	failed chan struct{}
+}
+
+func (w *invalidReloadSignalWriter) Write(p []byte) (int, error) {
+	if bytes.Contains(p, []byte("[yaml-watcher] reload failed")) {
+		w.once.Do(func() { close(w.failed) })
+	}
+	return len(p), nil
+}
+
+func TestStartYamlWatcher_InvalidReloadKeepsLastKnownGoodState(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	initial := &Config{
+		APIVersion:   "v1",
+		Kind:         "DaemonConfig",
+		Machine:      MachineConfig{ID: "m1"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 1},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test", AuthToken: "stub"},
+		Projects:     []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}},
+	}
+	if err := WriteConfig(path, initial); err != nil {
+		t.Fatalf("seed yaml: %v", err)
+	}
+	d := &Daemon{config: initial}
+	signal := &invalidReloadSignalWriter{failed: make(chan struct{})}
+	priorLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(signal, nil)))
+	defer slog.SetDefault(priorLogger)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	applied := make(chan struct{}, 1)
+	stop, err := startYamlWatcher(ctx, path, func(cfg *Config) {
+		d.onYamlChanged(cfg)
+		applied <- struct{}{}
+	})
+	if err != nil {
+		t.Fatalf("start watcher: %v", err)
+	}
+	defer stop()
+	if err := os.WriteFile(path, []byte("projects: [\n"), 0o600); err != nil {
+		t.Fatalf("write invalid yaml: %v", err)
+	}
+	select {
+	case <-signal.failed:
+	case <-time.After(2 * time.Second):
+		t.Fatal("watcher did not report the invalid reload")
+	}
+	select {
+	case <-applied:
+		t.Fatal("invalid YAML reached the reload callback")
+	default:
+	}
+	if len(d.config.Projects) != 1 || d.config.Projects[0].ID != "alpha" {
+		t.Fatalf("last-good project config changed after invalid YAML: %+v", d.config.Projects)
+	}
+}
 
 func TestOnYamlChanged_ModeOnlyReload(t *testing.T) {
 	initial := &Config{
