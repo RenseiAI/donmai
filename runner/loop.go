@@ -1628,8 +1628,14 @@ type streamObservation struct {
 	issueUpdated    bool
 	subIssuesMade   bool
 	workResult      string
-	cost            *agent.CostData
-	providerID      string
+	// lineVerdict is the latest verdict from a LINE-ANCHORED WORK_RESULT
+	// marker (passed|failed|blocked) — the same anchoring rule the platform's
+	// sentinel reader applies. workResult above is the historical unanchored
+	// scrape; lineVerdict is what may supersede a stale manifest (step 11·M),
+	// so a marker merely quoted mid-sentence can never override one.
+	lineVerdict string
+	cost        *agent.CostData
+	providerID  string
 	// lastAssistantText is the most recent non-empty assistant message
 	// observed on this stream. It is the summary fallback for providers
 	// whose terminal ResultEvent carries no Message (codex's
@@ -1864,6 +1870,9 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		}
 		if marker := scanWorkResult(e.Text); marker != "" {
 			obs.workResult = marker
+		}
+		if verdict := scanLineVerdict(e.Text); verdict != "" {
+			obs.lineVerdict = verdict
 		}
 		// Structural blocked-agent signal: a deliberate decline the agent
 		// announced via "WORK_RESULT:blocked" or "AGENT_BLOCKED: <reason>".
@@ -2482,6 +2491,19 @@ func scanWorkResult(text string) string {
 	return ""
 }
 
+// scanLineVerdict returns the verdict of the LAST line-anchored WORK_RESULT
+// marker in text ("passed", "failed" or "blocked"), or "" when none. A marker
+// counts only at the start of a line (modulo leading blanks and an optional
+// opening HTML-comment fence), so prose that merely mentions a marker is
+// ignored.
+func scanLineVerdict(text string) string {
+	matches := workResultLineRE.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.ToLower(matches[len(matches)-1][1])
+}
+
 // scanPRURL extracts a github.com/<owner>/<repo>/pull/<number> URL
 // from arbitrary text. Returns the empty string on no match.
 func scanPRURL(text string) string {
@@ -2548,7 +2570,12 @@ func scanBlocked(text string) (string, bool) {
 
 var (
 	workResultRE = regexp.MustCompile(`(?i)WORK_RESULT[:\s]+(passed|failed|unknown)`)
-	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
+	// workResultLineRE is the line-anchored verdict marker: start of a line,
+	// optional blanks and HTML-comment fence, then `WORK_RESULT:<verdict>`,
+	// `WORK_RESULT: <verdict>` or `WORK_RESULT <verdict>` on the SAME line
+	// (the separator never crosses a newline).
+	workResultLineRE = regexp.MustCompile(`(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)(passed|failed|blocked)`)
+	prURLRE          = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
 	// workResultBlockedRE matches the verdict-marker decline form. Kept
 	// separate from workResultRE so the existing passed/failed/unknown
 	// transition mapping is untouched (blocked is an outcome, not a QA

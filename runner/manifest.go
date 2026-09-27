@@ -35,6 +35,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"regexp"
@@ -415,22 +416,23 @@ func stampManifest(worktreePath string) manifestStamp {
 	if strings.TrimSpace(worktreePath) == "" {
 		return manifestStamp{}
 	}
-	path := filepath.Join(worktreePath, state.AgentDirName, ManifestFileName)
-	info, err := os.Stat(path)
-	if err != nil {
-		return manifestStamp{}
-	}
 	//nolint:gosec // G304: path is owned by the runner via the worktree manager.
-	raw, err := os.ReadFile(path)
+	f, err := os.Open(filepath.Join(worktreePath, state.AgentDirName, ManifestFileName))
 	if err != nil {
 		return manifestStamp{}
 	}
-	return manifestStamp{
-		exists:  true,
-		size:    info.Size(),
-		modNano: info.ModTime().UnixNano(),
-		sum:     sha256.Sum256(raw),
+	defer func() { _ = f.Close() }()
+	info, err := f.Stat()
+	if err != nil {
+		return manifestStamp{}
 	}
+	h := sha256.New()
+	if _, err := io.Copy(h, f); err != nil {
+		return manifestStamp{}
+	}
+	stamp := manifestStamp{exists: true, size: info.Size(), modNano: info.ModTime().UnixNano()}
+	copy(stamp.sum[:], h.Sum(nil))
+	return stamp
 }
 
 // reapplyTurnManifest re-resolves the turn verdict after a follow-up turn
@@ -445,13 +447,17 @@ func stampManifest(worktreePath string) manifestStamp {
 //     is the agent's latest structured word. It is folded exactly like the
 //     first turn's, so its verdict and summary beat the follow-up's terminal
 //     prose (often just the PR URL the steering prompt asked for).
-//  2. Otherwise the earlier manifest (res.Manifest) is STALE. When the
-//     follow-up turn recorded its own verdict (a WORK_RESULT marker) that
-//     differs, that newer verdict stands: the stale manifest is dropped from
-//     the envelope so it is never posted as the turn's verdict. When the
-//     follow-up recorded no verdict of its own, or the same one, the earlier
-//     manifest still speaks for the turn and is folded again — its summary
-//     beats the follow-up's terminal prose.
+//  2. Otherwise the earlier manifest (res.Manifest) is STALE, but it is still
+//     the agent's authoritative structured verdict (the prompts say the file
+//     wins and the marker is only the backstop). A follow-up marker may
+//     supersede it ONLY to DOWNGRADE it: a stale "passed" gives way to a
+//     line-anchored follow-up `WORK_RESULT: failed` / `WORK_RESULT: blocked`
+//     (or an anchored `AGENT_BLOCKED:` line). Then the stale manifest is
+//     dropped from the envelope so its "passed" is never posted. In every
+//     other case — no follow-up verdict, the same verdict, "unknown", an
+//     upgrade, or a marker quoted mid-sentence — the earlier manifest still
+//     speaks for the turn and is folded again (its summary beats the
+//     follow-up's terminal prose) and posted.
 //
 // No manifest at all leaves the envelope untouched, preserving the
 // marker-scrape behaviour. The fold never touches Status, FailureMode or
@@ -466,15 +472,16 @@ func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Re
 	if stale == nil {
 		return
 	}
-	followUpVerdict := followUp.workResult
-	if followUp.blocked {
+	followUpVerdict := followUp.lineVerdict
+	if followUpVerdict == "" && followUp.blocked {
 		followUpVerdict = "blocked"
 	}
-	if followUpVerdict == "" || followUpVerdict == stale.Verdict {
+	downgrade := stale.Verdict == "passed" && (followUpVerdict == "failed" || followUpVerdict == "blocked")
+	if !downgrade {
 		foldTurnManifest(stale, res, obs)
 		return
 	}
-	r.logger.Info("turn-result manifest predates the follow-up turn's own verdict; keeping the follow-up verdict",
+	r.logger.Info("turn-result manifest predates the follow-up turn's own lower verdict; keeping the follow-up verdict",
 		"sessionId", qw.SessionID,
 		"manifestVerdict", stale.Verdict,
 		"followUpVerdict", followUpVerdict,

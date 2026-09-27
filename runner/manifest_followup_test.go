@@ -27,6 +27,10 @@ type verdictScriptTurn struct {
 	manifest string
 	text     string
 	crash    bool
+	// laterMtime stamps the written manifest one minute ahead, so a rewrite
+	// with identical bytes still moves the mtime on filesystems whose
+	// timestamp tick is coarser than the gap between two turns.
+	laterMtime bool
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -88,8 +92,15 @@ func (h *verdictScriptHandle) playLocked() {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			h.t.Errorf("mkdir %s: %v", dir, err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, ManifestFileName), []byte(turn.manifest), 0o600); err != nil {
+		path := filepath.Join(dir, ManifestFileName)
+		if err := os.WriteFile(path, []byte(turn.manifest), 0o600); err != nil {
 			h.t.Errorf("write turn-result manifest: %v", err)
+		}
+		if turn.laterMtime {
+			later := time.Now().Add(time.Minute)
+			if err := os.Chtimes(path, later, later); err != nil {
+				h.t.Errorf("chtimes turn-result manifest: %v", err)
+			}
 		}
 	}
 	if turn.text != "" {
@@ -235,12 +246,52 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 			want: verdictWant{status: "completed", workResult: "failed", summary: "Tests fail after rebase; could not open the PR.\nWORK_RESULT:failed", wantSteering: true},
 		},
 		{
-			name: "stale earlier failed manifest yields to the follow-up's own passed verdict",
+			name: "stale earlier failed manifest is never upgraded by a follow-up passed marker",
 			turns: []verdictScriptTurn{
 				{manifest: failedManifest, text: "Stopping here."},
 				{text: "Fixed and opened " + followUpPR + "\nWORK_RESULT:passed"},
 			},
-			want: verdictWant{status: "completed", workResult: "passed", pr: followUpPR, wantSteering: true},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "follow-up unknown marker never drops a stale failed manifest",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: followUpPR + "\nWORK_RESULT:unknown"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "passed marker quoted in prose never upgrades a stale failed manifest",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: "I am not claiming WORK_RESULT: passed - round two is still missing. " + followUpPR},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "mid-line failed marker does not override a stale passed manifest",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "Pushed the branch but could not open the PR. WORK_RESULT:failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all done", manifest: "passed", wantSteering: true},
+		},
+		{
+			name: "line-anchored blocked marker downgrades a stale passed manifest",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "The rebase needs a product decision.\nWORK_RESULT: blocked"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+		},
+		{
+			name: "identical-content rewrite during the follow-up counts as the follow-up's manifest",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{manifest: passedManifest, laterMtime: true, text: "Re-confirmed.\nWORK_RESULT:failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all done", manifest: "passed", wantSteering: true},
 		},
 		{
 			name: "rewritten manifest beats the follow-up's own marker",
@@ -318,6 +369,14 @@ func TestRun_TurnVerdictAcrossMemoryInjectFollowUp(t *testing.T) {
 			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed"},
 		},
 		{
+			name: "stale failed manifest is never upgraded by a memory-inject follow-up passed marker",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "The regression reproduces."},
+				{text: "Looked again with the recalled context.\nWORK_RESULT:passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed"},
+		},
+		{
 			name: "stale passed manifest never upgrades the memory-inject follow-up's failed verdict",
 			turns: []verdictScriptTurn{
 				{manifest: passedManifest, text: "All checks pass."},
@@ -387,4 +446,90 @@ func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p 
 		t.Fatalf("New: %v", err)
 	}
 	return r
+}
+
+// TestStampManifest_DetectsEveryRewrite pins the follow-up rewrite detector:
+// an untouched file keeps its stamp, while new content, a same-size edit, an
+// identical-content rewrite (mtime only) and a deletion each change it.
+func TestStampManifest_DetectsEveryRewrite(t *testing.T) {
+	dir := t.TempDir()
+	agentDir := filepath.Join(dir, state.AgentDirName)
+	if err := os.MkdirAll(agentDir, 0o750); err != nil {
+		t.Fatalf("mkdir: %v", err)
+	}
+	path := filepath.Join(agentDir, ManifestFileName)
+	base := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	write := func(body string, mtime time.Time) {
+		t.Helper()
+		if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+			t.Fatalf("write: %v", err)
+		}
+		if err := os.Chtimes(path, mtime, mtime); err != nil {
+			t.Fatalf("chtimes: %v", err)
+		}
+	}
+
+	if got := stampManifest(dir); got.exists {
+		t.Fatalf("absent manifest stamped as existing: %+v", got)
+	}
+	write(passedManifest, base)
+	before := stampManifest(dir)
+	if !before.exists {
+		t.Fatal("written manifest stamped as absent")
+	}
+	if again := stampManifest(dir); again != before {
+		t.Fatal("untouched manifest changed its stamp")
+	}
+
+	cases := []struct {
+		name   string
+		mutate func()
+	}{
+		{"identical content rewritten later", func() { write(passedManifest, base.Add(time.Second)) }},
+		{"same size, different bytes, same mtime", func() {
+			write(`{"schemaVersion":1,"verdict":"passed","summary":"all dune"}`, base)
+		}},
+		{"different content", func() { write(failedManifest, base) }},
+		{"deleted", func() {
+			if err := os.Remove(path); err != nil {
+				t.Fatalf("remove: %v", err)
+			}
+		}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			write(passedManifest, base)
+			if got := stampManifest(dir); got != before {
+				t.Fatal("reset did not restore the original stamp")
+			}
+			tc.mutate()
+			if got := stampManifest(dir); got == before {
+				t.Fatalf("stamp unchanged after %s", tc.name)
+			}
+		})
+	}
+}
+
+// TestScanLineVerdict pins the anchoring rule a follow-up marker must meet
+// before it may supersede a stale manifest.
+func TestScanLineVerdict(t *testing.T) {
+	cases := []struct {
+		text string
+		want string
+	}{
+		{"WORK_RESULT:failed", "failed"},
+		{"done\n  WORK_RESULT: passed", "passed"},
+		{"done\n<!-- WORK_RESULT:blocked -->", "blocked"},
+		{"WORK_RESULT passed", "passed"},
+		{"first\nWORK_RESULT:passed\nthen\nWORK_RESULT:failed", "failed"},
+		{"I am not claiming WORK_RESULT: passed yet", ""},
+		{"could not open the PR. WORK_RESULT:failed", ""},
+		{"WORK_RESULT:\nfailed", ""},
+		{"WORK_RESULT:unknown", ""},
+	}
+	for _, tc := range cases {
+		if got := scanLineVerdict(tc.text); got != tc.want {
+			t.Errorf("scanLineVerdict(%q) = %q; want %q", tc.text, got, tc.want)
+		}
+	}
 }
