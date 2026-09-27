@@ -86,8 +86,8 @@ Federation order for registry sources (lowest priority number = consulted first)
   5. community     — tenant-declared registries
 
 ` + "`kit install`" + ` also supports a direct Git source. Use ` + "`--source-kind git --source-url <url>`" + `
-and optionally ` + "`--source-ref <ref>`" + `. Tessl, agentskills, and community install
-sources are not implemented and return HTTP 501.`,
+and optionally ` + "`--source-ref <ref>`" + `. The CLI rejects source kinds other than
+` + "`git`" + `; the daemon's registry-source list does not imply install support.`,
 		SilenceUsage: true,
 	}
 	cmd.AddCommand(newKitListCmd(factory))
@@ -240,7 +240,7 @@ func newKitInstallCmd(factory kitClientFactory) *cobra.Command {
 	)
 	cmd := &cobra.Command{
 		Use:   "install <id>",
-		Short: "Install a kit from a configured registry source",
+		Short: "Install a kit from a Git source",
 		Long: `Install a kit by id from one of the configured registry sources.
 
 The daemon's trust gate verifies kit signatures before installing. The
@@ -250,11 +250,12 @@ kits are rejected; pass --allow-unsigned to bypass the gate for a single
 install (the bypass is audit-logged by the daemon).
 
 For a Git source, pass --source-kind git and --source-url; --source-ref
-optionally selects a branch, tag, or commit (default: HEAD). A source URL
-requires an explicit source kind. A source is required to install; without
-source flags, the daemon returns HTTP 501. Git is currently the only install
-source kind; Tessl, agentskills, and community federation fetches return HTTP
-501. The daemon verifies the fetched kit against its configured trust policy.`,
+optionally selects a branch name or fully-qualified Git ref (default: HEAD). A
+source URL requires an explicit source kind. A source is required to install;
+without source flags, the daemon returns HTTP 501. Git is currently the only
+accepted source kind; other source kinds are rejected by the CLI before a
+request is sent. The daemon verifies the fetched kit against its configured
+trust policy.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -269,7 +270,7 @@ source kind; Tessl, agentskills, and community federation fetches return HTTP
 	cmd.Flags().StringVar(&version, "version", "", "Install a specific version (default: latest compatible)")
 	cmd.Flags().StringVar(&sourceKind, "source-kind", "", "Kit source kind (currently: git)")
 	cmd.Flags().StringVar(&sourceURL, "source-url", "", "Git repository URL to install from")
-	cmd.Flags().StringVar(&sourceRef, "source-ref", "", "Git branch, tag, or commit (default: HEAD)")
+	cmd.Flags().StringVar(&sourceRef, "source-ref", "", "Git branch name or fully-qualified ref (default: HEAD)")
 	cmd.Flags().BoolVar(&allowUnsigned, "allow-unsigned", false, "Bypass kit signature verification for this single install (audit-logged)")
 	cmd.Flags().BoolVar(&jsonOut, "json", false, "Output as JSON")
 	cmd.Flags().BoolVar(&plain, "plain", false, "Plain text (no ANSI / emoji)")

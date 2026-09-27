@@ -341,10 +341,13 @@ func TestKitCmd_Install_HelpExplainsSupportedGitSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kit install --help: %v", err)
 	}
-	for _, want := range []string{"--source-kind", "--source-url", "--source-ref", "git", "A source is required", "HTTP 501"} {
+	for _, want := range []string{"--source-kind", "--source-url", "--source-ref", "branch name or fully-qualified ref", "A source is required", "HTTP 501", "rejected by the CLI"} {
 		if !strings.Contains(installHelp, want) {
 			t.Errorf("install help missing %q:\n%s", want, installHelp)
 		}
+	}
+	if strings.Contains(installHelp, "commit") || strings.Contains(installHelp, "Tessl") {
+		t.Errorf("install help promises unsupported ref/kind semantics:\n%s", installHelp)
 	}
 	if strings.Contains(installHelp, "Wave 9 caveat") || strings.Contains(installHelp, "only locally-installed kits are supported") {
 		t.Errorf("install help retains the stale local-only caveat:\n%s", installHelp)
@@ -354,7 +357,7 @@ func TestKitCmd_Install_HelpExplainsSupportedGitSource(t *testing.T) {
 	if err != nil {
 		t.Fatalf("kit --help: %v", err)
 	}
-	if !strings.Contains(kitHelp, "Git") || strings.Contains(kitHelp, "Only the `local` source has a working backend") {
+	if !strings.Contains(kitHelp, "Install a kit from a Git source") || !strings.Contains(kitHelp, "rejects source kinds other than") || strings.Contains(kitHelp, "Only the `local` source has a working backend") {
 		t.Errorf("kit help does not describe the Git install source accurately:\n%s", kitHelp)
 	}
 }
