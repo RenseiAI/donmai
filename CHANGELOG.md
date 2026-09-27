@@ -23,6 +23,13 @@ No unreleased changes.
   the workflow token permits it. Fork tokens retain truthful read-only
   behavior; Marketplace publication is a separate step.
 
+### Fixes
+
+- Keep session-shim final-screen service alive after terminal completion,
+  without delaying the business result. Owning CLI processes now retain their
+  shim listeners until controller detach, explicit shutdown, or the bounded
+  final-screen window; handshakes cannot reopen a closed listener.
+
 ### Chores
 
 - Document a fortnightly themed-release-note cadence alongside ordinary
