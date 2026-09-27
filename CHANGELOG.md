@@ -10,6 +10,25 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.48 — 2026-09-27
+
+### Features
+
+- Linear issue reads expose native manual ranks separately from numeric
+  priority. `linear list-issues --order-by manual` uses native server-side
+  ordering across cursor pages, while existing default ordering remains
+  unchanged.
+- A checksum-pinned native drift-check Action assesses complete PR diffs,
+  emits a check annotation and summary, and posts a sanitized comment when
+  the workflow token permits it. Fork tokens retain truthful read-only
+  behavior; Marketplace publication is a separate step.
+
+### Chores
+
+- Document a fortnightly themed-release-note cadence alongside ordinary
+  releases, and add a thirty-day retrospective with verified contributor
+  credit.
+
 ## v0.72.47 — 2026-09-26
 
 ### Fixes
