@@ -116,6 +116,13 @@
 //     finalizes it without executing and emits isError:true with the block
 //     reason as the result text. A refusal is therefore indistinguishable
 //     from an execution unless the refusal itself was recorded.
+//   - An assistant message that ends with stopReason "length" (the response
+//     hit its output-token limit) has EVERY tool call in it failed without
+//     execution and without the tool_call hook (the agent loop's
+//     failToolCallsFromTruncatedMessage): each gets a start/end pair and an
+//     isError:true "was not executed" result, and no ruling can exist. The
+//     message_end carrying the stop reason and the calls' ids is emitted
+//     BEFORE those pairs.
 //
 // So every path that refuses a call records the refusal as that call's
 // outcome BEFORE the refusal is delivered: the policy engine's own deny
@@ -145,6 +152,13 @@
 //     (ErrorEvent{Code:"policy_extension_failed"}).
 //  2. Any other recorded outcome, or a verified SDK pre-execution refusal
 //     receipt (acceptsPreExecutionRefusal). Ordinary; nothing is reported.
+//     A call the runtime refused on an output-limit stop is recorded as that
+//     refusal (refusedForOutputLimit) and surfaced as a SystemEvent
+//     ("tool_call_refused_output_limit"), not as a miss: its id was named by
+//     a length-stopped assistant message, the end names the same tool, and
+//     the end positively reports an error result. The evidence is the
+//     runtime's own message_end, never result text; a length-stopped id whose
+//     end claims SUCCESS is not excused and falls to case 3.
 //  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
 //     that could not be registered, or a call id that could not be correlated
 //     all land here. The call is recorded as unproven and surfaced as a

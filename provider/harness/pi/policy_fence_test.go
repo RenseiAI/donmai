@@ -51,6 +51,56 @@ func endEvent(toolName, idKey, callID string, isError bool) string {
 	return event(fields)
 }
 
+// Recorded shapes: a live session whose assistant turn hit the registered
+// output-token limit. pi emitted the assistant message_end (stopReason
+// "length", the edit call's arguments salvaged to {}), then — without running
+// the tool_call hook — a tool_execution_start and this exact
+// tool_execution_end for the call.
+const (
+	recordedTruncatedCallID = "call_01a0e414ad3f70c880a43aa0ac2f0de8"
+	recordedTruncationText  = "Tool call \"edit\" was not executed: the response hit the output token limit, so its arguments may be truncated. Re-issue the tool call with complete arguments."
+)
+
+// assistantMessageEnd builds an assistant message_end with the given stop
+// reason whose content carries one toolCall part per {id, name} pair, in the
+// runtime's AssistantMessage shape.
+func assistantMessageEnd(stopReason string, calls ...[2]string) string {
+	content := []any{map[string]any{"type": "thinking", "thinking": "planning the edit"}}
+	for _, c := range calls {
+		content = append(content, map[string]any{"type": "toolCall", "id": c[0], "name": c[1], "arguments": map[string]any{}})
+	}
+	return event(map[string]any{
+		"type": "message_end",
+		"message": map[string]any{
+			"role":       "assistant",
+			"content":    content,
+			"api":        "openai-completions",
+			"provider":   "donmai",
+			"model":      "served-model",
+			"usage":      map[string]any{"input": 3649, "output": 16613, "cacheRead": 0, "cacheWrite": 0, "totalTokens": 20262},
+			"stopReason": stopReason,
+			"timestamp":  1790532782311,
+		},
+	})
+}
+
+// truncatedCallPair builds the hook-less start/end pair pi emits for a call it
+// refused on an output-limit stop (the recorded end shape, isError:true).
+func truncatedCallPair(toolName, callID string) string {
+	return event(map[string]any{
+		"type": "tool_execution_start", "toolCallId": callID, "toolName": toolName, "args": map[string]any{},
+	}) + event(map[string]any{
+		"type":       "tool_execution_end",
+		"toolCallId": callID,
+		"toolName":   toolName,
+		"result": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": recordedTruncationText}},
+			"details": map[string]any{},
+		},
+		"isError": true,
+	})
+}
+
 // drainToResultOrClose collects events until the session produces a
 // ResultEvent or closes its channel. Unlike drain it does NOT stop on an
 // ErrorEvent: a non-fatal fence event is exactly the case under test, and the
@@ -93,6 +143,10 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 		// wantDecisions is the number of permission_decision SystemEvents the
 		// boundary must surface.
 		wantDecisions int
+		// wantRefusedIDs are the call ids the monitor must record — and
+		// surface — as refused before execution on an output-limit stop, in
+		// order. nil means none.
+		wantRefusedIDs []string
 	}{
 		{
 			// A ruling that never reached the registry — the ordering failure
@@ -164,6 +218,62 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 			wantMissIDs:   nil,
 			wantDecisions: 1,
 		},
+		{
+			// The recorded failure: the turn hit the output-token limit, pi
+			// failed the edit call without running the hook, and the end
+			// arrived with no ruling. It never executed, so it is a refusal
+			// before execution — not an unproven call, and not a run failure.
+			name: "length-stopped call is refused before execution (recorded shape)",
+			body: assistantMessageEnd("length", [2]string{recordedTruncatedCallID, "edit"}) +
+				truncatedCallPair("edit", recordedTruncatedCallID),
+			wantRefusedIDs: []string{recordedTruncatedCallID},
+		},
+		{
+			// Every call in a length-stopped message is failed the same way.
+			name: "every call of a length-stopped message is refused",
+			body: assistantMessageEnd("length", [2]string{"c-t1", "edit"}, [2]string{"c-t2", "bash"}) +
+				truncatedCallPair("edit", "c-t1") + truncatedCallPair("bash", "c-t2"),
+			wantRefusedIDs: []string{"c-t1", "c-t2"},
+		},
+		{
+			// A length-stopped id whose end claims SUCCESS executed after all:
+			// that is an unruled execution, so it stays the miss.
+			name: "length-stopped call that reports success stays unproven",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				endEvent("edit", "toolCallId", "c-trunc", false),
+			wantMissIDs: []string{"c-trunc"},
+		},
+		{
+			// The control: a normally stopped message excuses nothing. An
+			// unruled error end is still unproven.
+			name: "unruled call from a normally stopped message stays unproven",
+			body: assistantMessageEnd("toolUse", [2]string{"c-normal", "edit"}) +
+				truncatedCallPair("edit", "c-normal"),
+			wantMissIDs: []string{"c-normal"},
+		},
+		{
+			// The stop excuses only the ids it named.
+			name: "length stop does not vouch for another call id",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				truncatedCallPair("edit", "c-other"),
+			wantMissIDs: []string{"c-other"},
+		},
+		{
+			// Same id, different tool: not the call the message named.
+			name: "length-stopped id ending under another tool stays unproven",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				truncatedCallPair("bash", "c-trunc"),
+			wantMissIDs: []string{"c-trunc"},
+		},
+		{
+			// One named call explains one end event, not a second one.
+			name: "a length-stopped id explains a single end",
+			body: assistantMessageEnd("length", [2]string{"c-trunc", "edit"}) +
+				truncatedCallPair("edit", "c-trunc") +
+				endEvent("edit", "toolCallId", "c-trunc", true),
+			wantMissIDs:    []string{"c-trunc"},
+			wantRefusedIDs: []string{"c-trunc"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -181,7 +291,7 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 			}
 			evs := drainToResultOrClose(t, h)
 
-			var fatal, completed, decisions int
+			var fatal, completed, decisions, refusedEvents int
 			var missEvents []agent.ErrorEvent
 			for _, e := range evs {
 				switch value := e.(type) {
@@ -197,9 +307,25 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 				case agent.ResultEvent:
 					completed++
 				case agent.SystemEvent:
-					if value.Subtype == "permission_decision" {
+					switch value.Subtype {
+					case "permission_decision":
 						decisions++
+					case outputLimitRefusalSubtype:
+						refusedEvents++
 					}
+				}
+			}
+
+			refused := h.(*Handle).recordedOutputLimitRefusals()
+			if refusedEvents != len(tc.wantRefusedIDs) {
+				t.Errorf("%s SystemEvents = %d, want %d: %+v", outputLimitRefusalSubtype, refusedEvents, len(tc.wantRefusedIDs), evs)
+			}
+			if len(refused) != len(tc.wantRefusedIDs) {
+				t.Fatalf("recorded output-limit refusals = %+v, want ids %q", refused, tc.wantRefusedIDs)
+			}
+			for i, want := range tc.wantRefusedIDs {
+				if refused[i].callID != want || refused[i].tool == "" {
+					t.Errorf("refusal[%d] = %+v, want call id %q with its tool", i, refused[i], want)
 				}
 			}
 
@@ -523,6 +649,35 @@ func TestExecutionSucceeded_RequiresAPositiveStatement(t *testing.T) {
 			ev := rawEvent{Type: "tool_execution_end", Fields: tc.fields}
 			if got := executionSucceeded(ev); got != tc.want {
 				t.Errorf("executionSucceeded(%v) = %v, want %v", tc.fields, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestExecutionErrored_RequiresAPositiveStatement pins the other half of the
+// same rule: the output-limit refusal path excuses an unruled end only on a
+// present boolean flag saying the call ERRORED. Absent or non-boolean is
+// unknown, and unknown excuses nothing.
+func TestExecutionErrored_RequiresAPositiveStatement(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name   string
+		fields map[string]any
+		want   bool
+	}{
+		{name: "isError true", fields: map[string]any{"isError": true}, want: true},
+		{name: "isError false", fields: map[string]any{"isError": false}},
+		{name: "error true", fields: map[string]any{"error": true}, want: true},
+		{name: "preferred spelling wins", fields: map[string]any{"isError": false, "error": true}},
+		{name: "absent is not an error", fields: map[string]any{"toolName": "edit"}},
+		{name: "non-boolean is not an error", fields: map[string]any{"isError": "true"}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			ev := rawEvent{Type: "tool_execution_end", Fields: tc.fields}
+			if got := executionErrored(ev); got != tc.want {
+				t.Errorf("executionErrored(%v) = %v, want %v", tc.fields, got, tc.want)
 			}
 		})
 	}
