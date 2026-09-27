@@ -1,7 +1,11 @@
 package daemon
 
 import (
+	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
+	"path/filepath"
 	"strings"
 	"testing"
 
@@ -132,17 +136,29 @@ func TestRegistrationExecutionSecurityEnforcement(t *testing.T) {
 	}
 }
 
-// TestRegisterRequestCarriesExecutionSecurityEnforcement pins the wire key
-// the attestation rides at registration.
-func TestRegisterRequestCarriesExecutionSecurityEnforcement(t *testing.T) {
+// TestRegisterCarriesExecutionSecurityEnforcement pins the wire key and value
+// the attestation rides through Register to the control plane.
+func TestRegisterCarriesExecutionSecurityEnforcement(t *testing.T) {
 	t.Parallel()
-	enforcement := agent.UncontainedHostEnforcement()
-	raw, err := json.Marshal(RegisterRequest{ExecutionSecurityEnforcement: &enforcement})
+	var body map[string]json.RawMessage
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			t.Errorf("decode request: %v", err)
+		}
+		_ = json.NewEncoder(w).Encode(RegisterResponse{
+			WorkerID: "worker-es", RuntimeToken: "runtime-es", HeartbeatInterval: 30_000, PollInterval: 5_000,
+		})
+	}))
+	t.Cleanup(server.Close)
+	enforcement, err := registrationExecutionSecurityEnforcement(nil)
 	if err != nil {
 		t.Fatal(err)
 	}
-	var body map[string]json.RawMessage
-	if err := json.Unmarshal(raw, &body); err != nil {
+	if _, err := Register(context.Background(), RegistrationOptions{
+		OrchestratorURL: server.URL, RegistrationToken: "rsp_live_fixture", Hostname: "host",
+		JWTPath: filepath.Join(t.TempDir(), "daemon.jwt"), HTTPClient: server.Client(),
+		ExecutionSecurityEnforcement: &enforcement,
+	}); err != nil {
 		t.Fatal(err)
 	}
 	want := `{"fileRead":"host","fileWrite":"host","network":"open","credentials":"ambient-host-login","isolation":"host-user"}`

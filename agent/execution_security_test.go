@@ -423,6 +423,18 @@ func TestCompilePreparedHarnessRecordsExecutionSecurityReport(t *testing.T) {
 		t.Fatalf("a plan whose report differs from the child's rendering err = %v, want execution_security_receipt_unmet", err)
 	}
 
+	// A report claiming more than the exact harness renders is refused too:
+	// the child re-derives the report and never trusts a stronger claim.
+	overclaimed := *legacy
+	inflated := *legacy.ExecutionSecurity
+	inflated.Network = agent.ExecutionSecurityDimensionReport{Required: "open", AchievedLevel: "none", EnforcingLayers: []agent.EnforcingLayer{agent.LayerEgressProxy}}
+	overclaimed.ExecutionSecurity = &inflated
+	overclaimedChild := codexAutonomousSource(nil)
+	overclaimedChild.PreparedHarness = &overclaimed
+	if _, err := agent.PrepareHarness(overclaimedChild, manifest); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+		t.Fatalf("an overclaiming plan report err = %v, want execution_security_receipt_unmet", err)
+	}
+
 	unrenderable := stampedLevels(map[agent.ExecutionSecurityDimension]agent.ExecutionSecurityLevel{agent.ExecutionSecurityNetwork: agent.NetworkNone})
 	if _, err := agent.CompilePreparedHarness(codexAutonomousSource(unrenderable), manifest, digest, nil, preparedMaterializations(digest)); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnrenderable {
 		t.Fatalf("network none compile err = %v, want execution_security_unrenderable", err)
