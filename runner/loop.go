@@ -2570,12 +2570,7 @@ func scanBlocked(text string) (string, bool) {
 
 var (
 	workResultRE = regexp.MustCompile(`(?i)WORK_RESULT[:\s]+(passed|failed|unknown)`)
-	// workResultLineRE is the line-anchored verdict marker: start of a line,
-	// optional blanks and HTML-comment fence, then `WORK_RESULT:<verdict>`,
-	// `WORK_RESULT: <verdict>` or `WORK_RESULT <verdict>` on the SAME line
-	// (the separator never crosses a newline).
-	workResultLineRE = regexp.MustCompile(`(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)(passed|failed|blocked)`)
-	prURLRE          = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
+	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
 	// workResultBlockedRE matches the verdict-marker decline form. Kept
 	// separate from workResultRE so the existing passed/failed/unknown
 	// transition mapping is untouched (blocked is an outcome, not a QA
@@ -2588,6 +2583,12 @@ var (
 	// workResultBlockedRE to avoid mid-sentence false positives.
 	agentBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?AGENT_BLOCKED[:\s]+([^\r\n]+)`)
 )
+
+// workResultLineRE is the line-anchored verdict marker: start of a line,
+// optional blanks and HTML-comment fence, then `WORK_RESULT:<verdict>`,
+// `WORK_RESULT: <verdict>` or `WORK_RESULT <verdict>` on the SAME line (the
+// separator never crosses a newline).
+var workResultLineRE = regexp.MustCompile(`(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)(passed|failed|blocked)`)
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.
