@@ -12,6 +12,12 @@ import (
 // asks the caller to execute tools, so this check must run immediately before
 // Bash/filesystem/MCP dispatch.
 type toolPolicy struct {
+	// gated is whether the allow list is a gate. It is, unless the session's
+	// toolApproval level is bypass and no allow list was configured: at
+	// bypass the runner imposes no allow list of its own
+	// (ADR-2026-09-27-execution-security-levels.md), and a declared MCP
+	// server or tool name only widens a gate that exists.
+	gated      bool
 	allowed    []geminiToolPattern
 	disallowed []geminiToolPattern
 }
@@ -23,7 +29,7 @@ type geminiToolPattern struct {
 }
 
 func newToolPolicy(spec agent.Spec) *toolPolicy {
-	policy := &toolPolicy{}
+	policy := &toolPolicy{gated: len(spec.AllowedTools) > 0 || !spec.ToolApprovalBypass()}
 	for _, raw := range spec.AllowedTools {
 		if pattern, ok := parseGeminiToolPattern(raw); ok {
 			policy.allowed = append(policy.allowed, pattern)
@@ -57,6 +63,9 @@ func (p *toolPolicy) allow(call candidateFuncCall) (bool, string) {
 		if pattern.matches(call) {
 			return false, "matches disallowed pattern " + pattern.raw
 		}
+	}
+	if !p.gated {
+		return true, ""
 	}
 	if len(p.allowed) == 0 {
 		return false, "no allowed tool boundary was configured"

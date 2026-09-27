@@ -88,6 +88,18 @@ type QueuedWork struct {
 	// identical workspace-write behavior every prior release shipped.
 	PermissionProfile PermissionProfile `json:"permissionProfile,omitempty"`
 
+	// ExecutionSecurity is the session's stamped execution-security levels
+	// (ADR-2026-09-27-execution-security-levels.md), read with the closed
+	// decoder agent.ExecutionSecurity.UnmarshalJSON: an unknown version,
+	// dimension or level fails the decode with execution_security_unresolvable
+	// rather than being guessed. Nil is a work item without the section, which
+	// reads as index 0 on every dimension. It is part of the operational
+	// payload (and so of the admission digest) and of the prepared-harness
+	// authority digest.
+	//
+	// Wire shape: "executionSecurity" (camelCase, omitempty).
+	ExecutionSecurity *agent.ExecutionSecurity `json:"executionSecurity,omitempty"`
+
 	// Branch is the working branch name the runner should use when
 	// provisioning the worktree. Empty falls back to "agent/<sessionID>".
 	Branch string `json:"branch,omitempty"`

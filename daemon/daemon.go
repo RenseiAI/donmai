@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/gateway"
 	"github.com/RenseiAI/donmai/gateway/costfeed"
@@ -197,6 +198,16 @@ type Options struct {
 	// neither forget them nor advertise them without the executor, because the
 	// executor is wired by the poll service, not by the embedder.
 	RegistrationCapabilities []string
+
+	// ExecutionSecurityEnforcement is this host's execution-security
+	// attestation (004-sandbox-capability-matrix.md
+	// executionSecurityEnforcement): per dimension, the strongest level the
+	// executor enforces around the harness, proven by a negative probe on
+	// its exact version. Nil means the daemon applies no containment and
+	// attests index 0 on every dimension. Only an attested isolation
+	// boundary (os-sandbox or stronger) makes the daemon advertise the
+	// "sandbox" registration capability.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement
 
 	// OnLandingWork handles a landing-run poll item (WorkType ==
 	// LandingWorkType) out-of-band from the session-spawn path. The whole
@@ -978,7 +989,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		for i, c := range detected {
 			provides[i] = ProvideCapability{Kind: string(c.Kind)}
 		}
-		regCaps := effectiveRegistrationCapabilities(d.opts.RegistrationCapabilities)
+		enforcement, err := registrationExecutionSecurityEnforcement(d.opts.ExecutionSecurityEnforcement)
+		if err != nil {
+			return fmt.Errorf("daemon: execution-security attestation: %w", err)
+		}
+		regCaps := effectiveRegistrationCapabilities(d.opts.RegistrationCapabilities, enforcement)
 		regCaps = preflightRegistrationCapabilities(regCaps, d.opts.ExecutionPreflightRegistrar, d.opts.ExecutionPreflightStore, d.opts.ProviderRegistry)
 		var workareaExecutors []workarea.ExecutorCapabilityAttestation
 		if provider, ok := d.opts.ProviderRegistry.(WorkareaCapabilityProvider); ok {
@@ -1014,6 +1029,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			SessionShim:         d.SessionShimHostAttestation(),
 			WorkareaExecutors:   workareaExecutors,
 			AuthOnly:            d.sessionShimEnabled(),
+
+			ExecutionSecurityEnforcement: &enforcement,
 		}
 	}
 
@@ -2050,6 +2067,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		}
 		if spec.OrganizationID == "" {
 			spec.OrganizationID = detail.OrganizationID
+		}
+		// Every lane — receipt-bearing or not — reads the stamped
+		// execution-security levels with the same closed decoder before a
+		// child exists. A malformed section is refused here
+		// (execution_security_unresolvable) instead of spawning a runner
+		// that would refuse it anyway.
+		if _, err := agent.ExecutionSecurityFromOperationalPayload(detail.OperationalPayload); err != nil {
+			return nil, fmt.Errorf("execution security: %w", err)
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound

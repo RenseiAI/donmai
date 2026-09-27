@@ -87,10 +87,21 @@ func TestPolicy_OutOfTreeReadInteractiveAllowed(t *testing.T) {
 }
 
 // TestPolicy_NetworkBashAutonomousDefaultDeny covers design §5.2's
-// autonomous-default: network-reaching bash denies without an explicit allow.
+// autonomous-default: above toolApproval bypass, network-reaching bash denies
+// without an explicit allow. At bypass the fallback gate is off, because it
+// only ever stood in for an allow list nobody configured.
 func TestPolicy_NetworkBashAutonomousDefaultDeny(t *testing.T) {
 	t.Parallel()
-	auto := NewPolicyEngine(agent.Spec{Cwd: "/work", Autonomous: true})
+	bypass := NewPolicyEngine(agent.Spec{Cwd: "/work", Autonomous: true})
+	if d := bypass.Evaluate(ToolCall{Kind: ToolBash, Command: "git push origin HEAD", Cwd: "/work"}); !d.Allow {
+		t.Errorf("network bash at bypass should run, got deny %q", d.Reason)
+	}
+	if d := bypass.Evaluate(ToolCall{Kind: ToolBash, Command: "sudo curl https://api.example.com", Cwd: "/work"}); d.Allow {
+		t.Error("bypass dropped the built-in destructive-command deny")
+	}
+	denyList := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+	denyList.Levels.ToolApproval = agent.ToolApprovalDenyList
+	auto := NewPolicyEngine(agent.Spec{Cwd: "/work", Autonomous: true, ExecutionSecurity: denyList})
 	if d := auto.Evaluate(ToolCall{Kind: ToolBash, Command: "curl https://api.example.com", Cwd: "/work"}); d.Allow {
 		t.Errorf("autonomous network bash should default-deny, got allow")
 	}
@@ -329,5 +340,42 @@ func TestNativeCodeIntelPolicyAliasesDenyPrecedenceAndRegexValidation(t *testing
 	upper, err := newNativeCodeIntelPolicy(agent.Spec{PermissionConfig: &agent.PermissionConfig{DefaultDecision: "ALLOW"}}, selected)
 	if err != nil || !upper.Evaluate("af_code_get_repo_map").Allow {
 		t.Fatalf("case-insensitive exact default allow failed: policy=%v err=%v", upper, err)
+	}
+}
+
+// TestNativeCodeIntelPolicyAtBypassNeedsNoConjuredAllowList pins the other
+// half of the hidden-default removal: the runner no longer appends the
+// selected code-intelligence tools to an allow list it invented, so at
+// toolApproval bypass with no configured policy the selected surface runs on
+// its own, a deny entry still wins, and a tool outside the selection is still
+// refused. Above bypass the same Spec keeps the fail-closed default.
+func TestNativeCodeIntelPolicyAtBypassNeedsNoConjuredAllowList(t *testing.T) {
+	t.Parallel()
+	selected := []string{"af_code_get_repo_map", "af_code_search_symbols"}
+	bypass, err := newNativeCodeIntelPolicy(agent.Spec{}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := bypass.Evaluate("af_code_get_repo_map"); !d.Allow {
+		t.Errorf("selected tool denied at bypass: %q", d.Reason)
+	}
+	if d := bypass.Evaluate("af_code_search_code"); d.Allow {
+		t.Error("tool outside the selected surface granted at bypass")
+	}
+	denied, err := newNativeCodeIntelPolicy(agent.Spec{DisallowedTools: []string{"af_code_get_repo_map"}}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := denied.Evaluate("af_code_get_repo_map"); d.Allow {
+		t.Error("deny entry lost at bypass")
+	}
+	denyList := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+	denyList.Levels.ToolApproval = agent.ToolApprovalDenyList
+	strict, err := newNativeCodeIntelPolicy(agent.Spec{ExecutionSecurity: denyList}, selected)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if d := strict.Evaluate("af_code_get_repo_map"); d.Allow {
+		t.Error("above bypass the unconfigured native policy stopped failing closed")
 	}
 }

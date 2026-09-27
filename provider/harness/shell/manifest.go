@@ -27,10 +27,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessShell,
-		HumanLabel:  "Shell",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessShell,
+		HumanLabel:        "Shell",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: shellExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: false,
 			SupportsSessionResume:    false,

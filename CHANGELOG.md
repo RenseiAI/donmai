@@ -8,7 +8,28 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- The runner reads the session's stamped execution-security levels
+  (`executionSecurity` on queued work) with a closed decoder on both the poll
+  and receipt lanes, binds them into the prepared-harness authority digest,
+  renders them per exact harness, and refuses before any side effect what a
+  harness cannot render (`execution_security_unrenderable`) or a malformed
+  stamp (`execution_security_unresolvable`). Every run reports, per dimension,
+  the level it achieved and the layers enforcing it; the prepared-harness
+  plan carries the report. Codex renders `fileWrite: workarea` natively on
+  the headless lane. Work without the section behaves as before.
+- Registration publishes the host's `executionSecurityEnforcement`
+  attestation (index 0 on every dimension unless an embedder attests more).
+
+### Fixes
+
+- The runner no longer imposes a hardcoded headless allow list when no allow
+  list is configured; configured lists and the always-on deny entries still
+  apply, as do the built-in destructive-command denies.
+- Hosts no longer advertise a `sandbox` registration capability unless an
+  isolation boundary is attested; an embedder-supplied `sandbox` tag is
+  dropped otherwise.
 
 ## v0.72.49 — 2026-09-27
 

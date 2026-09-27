@@ -143,7 +143,10 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// payload would defeat the head verification entirely.
 		"PullRequest":       "projected",
 		"PermissionProfile": "projected", "Env": "projected",
-		"AdmissionReceipt": "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
+		// The stamped execution-security levels decide how much the session
+		// may do; they are admission-bound like every other intent.
+		"ExecutionSecurity": "projected",
+		"AdmissionReceipt":  "execution-sidecar", "ClaimReceipt": "execution-sidecar", "EffectiveCell": "execution-sidecar",
 		"ExecutionRuntimeBinding": "execution-sidecar", "OperationalPayload": "execution-sidecar", "HostAdaptationReceipt": "execution-sidecar",
 		"toolLifecycleProfileID": "execution-sidecar",
 		"WorkerID":               "daemon-runtime", "AuthToken": "daemon-runtime", "PlatformURL": "daemon-runtime", "Capabilities": "daemon-runtime",

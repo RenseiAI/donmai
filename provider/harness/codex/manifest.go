@@ -32,10 +32,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 	headlessEvents := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessCodex,
-		HumanLabel:  "Codex",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessCodex,
+		HumanLabel:        "Codex",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: codexExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection:         false,
 			SupportsSessionResume:            true,

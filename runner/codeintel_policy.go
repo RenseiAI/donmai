@@ -16,8 +16,13 @@ func translateSpecForCodeIntelDelivery(qw QueuedWork, caps agent.Capabilities, i
 		return spec, nil
 	}
 
-	selected, err := selectedNativePolicyTools(selection.Tools)
-	if err != nil {
+	// The selected set is validated here, but it is not appended to the
+	// allow list: an explicitly configured allow list is authoritative and
+	// must name the selected tools itself, and without one there is no allow
+	// gate to widen — appending them would conjure an allow list out of
+	// nothing and gate every other tool behind it. The exact harness admits
+	// the selected surface at toolApproval bypass on its own.
+	if err := validateSelectedNativePolicyTools(selection.Tools); err != nil {
 		return agent.Spec{}, fmt.Errorf("runner: project native code-intelligence policy: %w", err)
 	}
 	policy := legacySpecToolPolicy(qw)
@@ -25,9 +30,7 @@ func translateSpecForCodeIntelDelivery(qw QueuedWork, caps agent.Capabilities, i
 	if qw.isInterview() {
 		policy.DisallowedTools = append(policy.DisallowedTools, "AskUserQuestion", "Write", "Edit", "Task", "Bash")
 	}
-	if len(qw.AllowedTools) == 0 {
-		policy.AllowedTools = append(policy.AllowedTools, selected...)
-	}
+	var err error
 	policy.AllowedTools, err = normalizeNativePolicyList(policy.AllowedTools)
 	if err != nil {
 		return agent.Spec{}, fmt.Errorf("runner: project native code-intelligence allowed tools: %w", err)
@@ -39,30 +42,33 @@ func translateSpecForCodeIntelDelivery(qw QueuedWork, caps agent.Capabilities, i
 	return translateSpecWithToolPolicy(qw, caps, in, policy), nil
 }
 
-func selectedNativePolicyTools(tools []string) ([]string, error) {
+// validateSelectedNativePolicyTools checks the admitted native code-intel
+// selection is canonical: non-empty, unique, in ascending order, and every
+// name a known code-intel tool.
+func validateSelectedNativePolicyTools(tools []string) error {
 	if len(tools) == 0 {
-		return nil, fmt.Errorf("selected native tool set is empty")
+		return fmt.Errorf("selected native tool set is empty")
 	}
 	selected := make(map[string]bool, len(tools))
 	previous := ""
 	for _, tool := range tools {
 		match, err := codeintelcontract.NormalizePolicyIdentity(tool)
 		if err != nil || !match.Related || match.Canonical != tool || selected[tool] || tool <= previous {
-			return nil, fmt.Errorf("selected native tool set is invalid")
+			return fmt.Errorf("selected native tool set is invalid")
 		}
 		selected[tool] = true
 		previous = tool
 	}
-	out := make([]string, 0, len(selected))
+	known := 0
 	for _, name := range codeintelcontract.Names() {
 		if selected[name] {
-			out = append(out, name)
+			known++
 		}
 	}
-	if len(out) != len(selected) {
-		return nil, fmt.Errorf("selected native tool set is invalid")
+	if known != len(selected) {
+		return fmt.Errorf("selected native tool set is invalid")
 	}
-	return out, nil
+	return nil
 }
 
 func normalizeNativePolicyList(values []string) ([]string, error) {

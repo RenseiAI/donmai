@@ -119,6 +119,11 @@ type HarnessManifest struct {
 	Caps           HarnessCaps             `json:"capabilities"`
 	PromptDelivery []PromptDeliveryProfile `json:"promptDelivery"`
 	ToolLifecycle  []ToolLifecycleProfile  `json:"toolLifecycle"`
+	// ExecutionSecurity declares, per dimension and session mode, the
+	// execution-security levels above index 0 this exact harness/version
+	// renders natively and the layer that enforces each, plus how its tool
+	// deny entries are carried at bypass. The zero value renders index 0 only.
+	ExecutionSecurity ExecutionSecurityRendering `json:"executionSecurity,omitzero"`
 }
 
 // SpecAdmissionDenialCode classifies a typed denial of a requested Spec

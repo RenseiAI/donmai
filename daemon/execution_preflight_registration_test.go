@@ -1390,7 +1390,7 @@ func TestHTTPExecutionPreflightRegistrarRefusesRedirectAndUntrustedOrigin(t *tes
 }
 
 func TestPreflightRegistrationCapabilityOnlyWhenGateConfigured(t *testing.T) {
-	base := effectiveRegistrationCapabilities(nil)
+	base := effectiveRegistrationCapabilities(nil, agent.UncontainedHostEnforcement())
 	registrar := NewFileExecutionPreflightRegistrar(t.TempDir())
 	replayable := NewFileExecutionPreflightStore(t.TempDir())
 	provider := &orderedPreflightProvider{mu: &sync.Mutex{}, order: &[]string{}}

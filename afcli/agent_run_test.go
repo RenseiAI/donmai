@@ -2216,3 +2216,47 @@ func TestSessionNameSurvivesDaemonWireIntoRunnerQueuedWork(t *testing.T) {
 		t.Fatalf("QueuedWork.SessionName = %q", work.SessionName)
 	}
 }
+
+// TestDetailToQueuedWork_ExecutionSecurity covers the poll lane's hop into
+// the runner: the stamped levels are read from the operational payload with
+// the closed decoder, so a valid section reaches QueuedWork, an absent one
+// stays absent (index 0), and a malformed one fails the translation with
+// execution_security_unresolvable instead of being guessed.
+func TestDetailToQueuedWork_ExecutionSecurity(t *testing.T) {
+	levels := `{"toolApproval":"bypass","fileRead":"host","fileWrite":"workarea","network":"open","credentials":"ambient-host-login","isolation":"host-user"}`
+	cases := []struct {
+		name      string
+		payload   string
+		wantWrite agent.ExecutionSecurityLevel
+		wantErr   bool
+	}{
+		{name: "absent", payload: `{"sessionId":"sess-es"}`},
+		{name: "present", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + levels + `}}`, wantWrite: agent.FileWriteWorkarea},
+		{name: "unknown level", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + strings.Replace(levels, `"workarea"`, `"anywhere"`, 1) + `}}`, wantErr: true},
+		{name: "unsupported version", payload: `{"sessionId":"sess-es","executionSecurity":{"version":9,"levels":` + levels + `}}`, wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			d := &daemon.SessionDetail{SessionID: "sess-es", OperationalPayload: json.RawMessage(tc.payload)}
+			qw, err := detailToQueuedWork(d)
+			if tc.wantErr {
+				if agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
+					t.Fatalf("err = %v, want execution_security_unresolvable", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatalf("detailToQueuedWork: %v", err)
+			}
+			if tc.wantWrite == "" {
+				if qw.ExecutionSecurity != nil {
+					t.Fatalf("absent section decoded as %+v", qw.ExecutionSecurity)
+				}
+				return
+			}
+			if qw.ExecutionSecurity == nil || qw.ExecutionSecurity.Levels.FileWrite != tc.wantWrite {
+				t.Fatalf("section = %+v", qw.ExecutionSecurity)
+			}
+		})
+	}
+}

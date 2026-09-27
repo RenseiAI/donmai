@@ -1651,14 +1651,14 @@ func TestDaemonHandlePollWorkItem_PreservesTypedDenialWhenDeniedReceiptPersisten
 	}
 
 	truthful := false
-	for _, capability := range effectiveRegistrationCapabilities(nil) {
+	for _, capability := range effectiveRegistrationCapabilities(nil, agent.UncontainedHostEnforcement()) {
 		if capability == receiptPreflightNackReasonCapability {
 			truthful = true
 			break
 		}
 	}
 	if !truthful {
-		t.Fatalf("registration capabilities = %v, missing implemented NACK producer %q", effectiveRegistrationCapabilities(nil), receiptPreflightNackReasonCapability)
+		t.Fatalf("registration capabilities = %v, missing implemented NACK producer %q", effectiveRegistrationCapabilities(nil, agent.UncontainedHostEnforcement()), receiptPreflightNackReasonCapability)
 	}
 }
 

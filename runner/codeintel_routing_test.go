@@ -160,9 +160,8 @@ func TestRunnerRunUsesSupportedBinderConstructionBeforeSpawn(t *testing.T) {
 	if !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_get_repo_map") || !strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_symbols") || strings.Contains(provider.spawned.SystemPromptAppend, "af_code_search_code") {
 		t.Fatalf("native prompt did not use exact declared default surface: %q", provider.spawned.SystemPromptAppend)
 	}
-	wantAllowed := append(defaultAllowedTools(), codeintelcontract.ToolGetRepoMap, codeintelcontract.ToolSearchSymbols)
-	if !slices.Equal(provider.spawned.AllowedTools, wantAllowed) {
-		t.Fatalf("actual run native allowlist=%v want=%v", provider.spawned.AllowedTools, wantAllowed)
+	if provider.spawned.AllowedTools != nil {
+		t.Fatalf("actual run conjured a native allow list without a configured one: %v", provider.spawned.AllowedTools)
 	}
 	if !slices.Contains(provider.spawned.DisallowedTools, codeintelcontract.ToolSearchSymbols) {
 		t.Fatalf("actual run omitted normalized inline-card deny: %v", provider.spawned.DisallowedTools)
@@ -498,7 +497,7 @@ func TestProviderViewOptionsDriveActualParameterizedPreflight(t *testing.T) {
 	if len(plan.ToolLifecycleReceipt.CapabilityRealizations) != 1 || plan.ToolLifecycleReceipt.CapabilityRealizations[0].ParameterBinding == nil {
 		t.Fatalf("preflight omitted parameterized realization: %+v", plan.ToolLifecycleReceipt)
 	}
-	wantAllowed := append(defaultAllowedTools(), codeintelcontract.ToolGetRepoMap)
+	var wantAllowed []string
 	rawAllowed, _ := json.Marshal(wantAllowed)
 	allowedSum := sha256.Sum256(rawAllowed)
 	if got, want := plan.AuthorityFieldDigests["allowedTools"], hex.EncodeToString(allowedSum[:]); got != want {

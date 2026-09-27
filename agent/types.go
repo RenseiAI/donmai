@@ -410,6 +410,14 @@ type Spec struct {
 	// true. Maps to provider-native policies.
 	SandboxLevel SandboxLevel `json:"sandboxLevel,omitempty"`
 
+	// ExecutionSecurity is the session's stamped execution-security levels
+	// (ADR-2026-09-27-execution-security-levels.md). Nil is a work item
+	// without the section, which reads as index 0 on every dimension.
+	// PrepareHarness refuses a stamped level the exact harness cannot render
+	// (RenderExecutionSecurity); the field is part of the prepared-harness
+	// authority digest.
+	ExecutionSecurity *ExecutionSecurity `json:"executionSecurity,omitempty"`
+
 	// RepositoryAuthority is the executor-owned per-repository filesystem
 	// policy. Nil is the legacy singular-worktree path. Providers that do not
 	// positively attest the named protocol/enforcement are denied before spawn.
@@ -695,6 +703,12 @@ type Result struct {
 
 	// Summary is a short human-readable summary of the work done.
 	Summary string `json:"summary,omitempty"`
+
+	// ExecutionSecurity is the per-dimension execution-security report the
+	// runner computed before spawn (ADR-2026-09-27-execution-security-levels.md
+	// D4): the stamped level, the level achieved and the layers enforcing it.
+	// Nil only for a run that never reached rendering.
+	ExecutionSecurity *ExecutionSecurityReport `json:"executionSecurity,omitempty"`
 
 	// WorkResult is the QA/acceptance verdict. Valid values:
 	// "passed" | "failed" | "unknown". Drives the acceptance gate on

@@ -42,11 +42,31 @@ func resolveModel(spec agent.Spec) string {
 	return DefaultCodexModel
 }
 
+// requiresWorkareaWrites reports whether the session's stamped
+// execution-security fileWrite level confines writes to the workarea. The
+// headless lane renders it natively (codexExecutionSecurity): the
+// workspace-write sandbox, never widened by SandboxLevel, and the approval
+// policy "never", so no escalation leaves the sandbox.
+func requiresWorkareaWrites(spec agent.Spec) bool {
+	return agent.EffectiveExecutionSecurityLevels(spec.ExecutionSecurity).FileWrite == agent.FileWriteWorkarea
+}
+
+// effectiveSandboxLevel is spec.SandboxLevel, narrowed to workspace-write
+// when the stamped fileWrite level is "workarea": a full-access grant is
+// rendered only where fileWrite is at index 0. A read-only level is already
+// narrower and is kept.
+func effectiveSandboxLevel(spec agent.Spec) agent.SandboxLevel {
+	if requiresWorkareaWrites(spec) && spec.SandboxLevel != agent.SandboxReadOnly {
+		return agent.SandboxWorkspaceWrite
+	}
+	return spec.SandboxLevel
+}
+
 // resolveSandboxMode maps agent.SandboxLevel to the kebab-case codex
 // thread/start sandbox parameter. Mirrors resolveSandboxMode in the
 // legacy TS.
 func resolveSandboxMode(spec agent.Spec) string {
-	switch spec.SandboxLevel {
+	switch effectiveSandboxLevel(spec) {
 	case agent.SandboxReadOnly:
 		return "read-only"
 	case agent.SandboxWorkspaceWrite:
@@ -68,7 +88,7 @@ func resolveSandboxPolicy(spec agent.Spec) map[string]any {
 	if spec.RepositoryAuthority != nil {
 		writableRoots = append([]string(nil), spec.RepositoryAuthority.MutablePaths...)
 	}
-	switch spec.SandboxLevel {
+	switch effectiveSandboxLevel(spec) {
 	case agent.SandboxReadOnly:
 		return map[string]any{"type": "readOnly", "networkAccess": true}
 	case agent.SandboxWorkspaceWrite:
@@ -92,7 +112,16 @@ func resolveSandboxPolicy(spec agent.Spec) map[string]any {
 
 // resolveApprovalPolicy mirrors resolveApprovalPolicy in the legacy TS.
 // Codex v0.117+ uses kebab-case approval policy strings.
+//
+// A stamped fileWrite level of "workarea" renders "never": the model can
+// neither request nor be granted an escalation out of the workspace-write
+// sandbox, so the sandbox is the boundary. That is also a no-prompt mode,
+// which the toolApproval "bypass" level every such session is rendered at
+// permits.
 func resolveApprovalPolicy(spec agent.Spec) string {
+	if requiresWorkareaWrites(spec) {
+		return "never"
+	}
 	if spec.Autonomous {
 		return "on-request"
 	}

@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -104,6 +105,10 @@ type RegistrationOptions struct {
 	// Nil/empty preserves legacy registration and means no positive protocol
 	// or repository-authority attestation.
 	WorkareaExecutors []workarea.ExecutorCapabilityAttestation
+
+	// ExecutionSecurityEnforcement is the host's execution-security
+	// attestation published at registration. Nil omits the field.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement
 
 	// AuthOnly suppresses registration-time capacity publication during hosted
 	// recovery. It is valid only with a supported SessionShim attestation; the
@@ -215,6 +220,12 @@ type RegisterRequest struct {
 	// WorkareaExecutors keeps protocol/enforcement attestations bound to the
 	// exact executor instead of widening them into a host-level bool.
 	WorkareaExecutors []workarea.ExecutorCapabilityAttestation `json:"workareaExecutors,omitempty"`
+
+	// ExecutionSecurityEnforcement is the host's per-dimension
+	// execution-security attestation, in the executionSecurityEnforcement
+	// shape of 004-sandbox-capability-matrix.md. Additive; omitted only by a
+	// caller that sets no RegistrationOptions value.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement `json:"executionSecurityEnforcement,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -477,6 +488,10 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		HostInfo:                   opts.HostInfo,
 		SessionShimHostAttestation: cloneSessionShimHostAttestation(opts.SessionShim),
 		WorkareaExecutors:          append([]workarea.ExecutorCapabilityAttestation(nil), opts.WorkareaExecutors...),
+	}
+	if opts.ExecutionSecurityEnforcement != nil {
+		enforcement := *opts.ExecutionSecurityEnforcement
+		req.ExecutionSecurityEnforcement = &enforcement
 	}
 	if req.MachineID == "" {
 		// The stable machine identity, NOT the hostname. Falling back to the

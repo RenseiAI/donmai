@@ -352,6 +352,9 @@ func (p *Provider) launchManifest() agent.HarnessManifest {
 		profile.PermissionConfigDelivery = agent.ToolDeliveryUnsupported
 		profile.MCPToolPolicyDelivery = agent.ToolDeliveryUnsupported
 	}
+	// Without the launched binary there is no permission map to carry the
+	// deny entries.
+	manifest.ExecutionSecurity.DenyBaseline = agent.DenyBaselineUnavailable
 	return manifest
 }
 

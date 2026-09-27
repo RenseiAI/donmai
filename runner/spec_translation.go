@@ -75,15 +75,16 @@ type specToolPolicy struct {
 }
 
 func legacySpecToolPolicy(qw QueuedWork) specToolPolicy {
-	// AllowedTools resolution: the agent card is AUTHORITATIVE when it
-	// supplies an explicit allowlist (WS5) — the runner uses it verbatim in
-	// place of its curated default. When the card sends none, the runner
-	// falls back to defaultAllowedTools() (backward-compatible). The
-	// DisallowedTools floor is applied below regardless.
+	// AllowedTools resolution: only an explicitly configured allow list — the
+	// agent card's or the queued work's — ever reaches the Spec, verbatim.
+	// The runner imposes no allow list of its own: an earlier hardcoded
+	// headless default was a hidden policy the session's stamped
+	// execution-security levels never named
+	// (ADR-2026-09-27-execution-security-levels.md, no compiled-in default).
+	// At toolApproval bypass, no configured list means no allow gate at all.
+	// The DisallowedTools floor below is the always-on deny baseline and
+	// applies regardless of level.
 	var allowedTools []string
-	if !qw.isInteractive() {
-		allowedTools = defaultAllowedTools()
-	}
 	if len(qw.AllowedTools) > 0 {
 		allowedTools = append([]string(nil), qw.AllowedTools...)
 	}
@@ -106,6 +107,7 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 		Autonomous:         in.Autonomous,
 		SandboxEnabled:     true,
 		SandboxLevel:       resolveSandboxLevel(qw, in.Logger),
+		ExecutionSecurity:  qw.ExecutionSecurity.Clone(),
 		AllowedTools:       cloneStringSliceShape(policy.AllowedTools),
 		DisallowedTools:    cloneStringSliceShape(policy.DisallowedTools),
 		MCPServers:         in.MCPServers,
@@ -192,7 +194,23 @@ func translateSpecWithToolPolicy(qw QueuedWork, caps agent.Capabilities, in Spec
 // An unrecognized value is fail-safe, never fail-closed: it logs a warning
 // naming the bad value and falls back to workspace-write rather than failing
 // the spawn. logger nil-safe (mirrors logMCPGatewayBearerExpiry).
+//
+// When the work item carries an executionSecurity section, that section
+// decides instead and permissionProfile is ignored
+// (ADR-2026-09-27-execution-security-levels.md D4): fileWrite "workarea"
+// pins the workspace-write sandbox whatever permissionProfile asks for, and
+// only fileWrite "host" — which with every other dimension the full grant
+// opens at index 0 is the only case a full-access sandbox may be rendered —
+// yields agent.SandboxFullAccess. permissionProfile keeps its exact legacy
+// meaning for work without the section.
 func resolveSandboxLevel(qw QueuedWork, logger *slog.Logger) agent.SandboxLevel {
+	if qw.ExecutionSecurity != nil {
+		levels := qw.ExecutionSecurity.Levels
+		if levels.FileWrite == agent.FileWriteHost && levels.FileRead == agent.FileReadHost && levels.Network == agent.NetworkOpen {
+			return agent.SandboxFullAccess
+		}
+		return agent.SandboxWorkspaceWrite
+	}
 	switch qw.PermissionProfile {
 	case "", PermissionProfileWorkspaceWrite:
 		return agent.SandboxWorkspaceWrite
@@ -206,32 +224,6 @@ func resolveSandboxLevel(qw QueuedWork, logger *slog.Logger) agent.SandboxLevel 
 			)
 		}
 		return agent.SandboxWorkspaceWrite
-	}
-}
-
-// defaultAllowedTools is the curated Bash + edit + read + grep
-// allowlist every Claude session ships with by default. The list
-// mirrors the legacy TS createAutonomousAllowedTools() output and is
-// kept short on purpose — operators expand it via repository config
-// when a project needs additional shell prefixes.
-//
-// Codex/stub providers ignore this list (they have their own
-// permission grammar via Spec.PermissionConfig); only Claude consumes
-// it, but the list lives here so spec translation stays pure.
-func defaultAllowedTools() []string {
-	return []string{
-		"Bash(pnpm:*)",
-		"Bash(git:*)",
-		"Bash(gh:*)",
-		"Bash(go:*)",
-		"Bash(make:*)",
-		"Bash(node:*)",
-		"Edit",
-		"Write",
-		"Read",
-		"Grep",
-		"Glob",
-		"Task",
 	}
 }
 

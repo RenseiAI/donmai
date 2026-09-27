@@ -22,10 +22,11 @@ func (p *provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventToolProgress, agent.EventResult, agent.EventError}
 	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessStub,
-		HumanLabel:  "Test Stub",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessStub,
+		HumanLabel:        "Test Stub",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: stubExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: c.SupportsMessageInjection,
 			SupportsSessionResume:    c.SupportsSessionResume,

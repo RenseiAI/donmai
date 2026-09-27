@@ -1,14 +1,21 @@
 package daemon
 
 import (
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/kgextract"
 	"github.com/RenseiAI/donmai/worker"
 )
 
-// baseSubstrateCapabilities are the capability tags a daemon has always
-// advertised at registration: a worker on this machine can run local, sandbox,
-// and workarea sessions.
-var baseSubstrateCapabilities = []string{"local", "sandbox", "workarea"}
+// baseSubstrateCapabilities are the capability tags every daemon can back: a
+// worker on this machine runs local and workarea sessions.
+var baseSubstrateCapabilities = []string{"local", "workarea"}
+
+// sandboxCapability is advertised only by a daemon whose execution-security
+// attestation proves an isolation boundary around the harness. A host must
+// not advertise a sandbox it does not have
+// (ADR-2026-09-27-execution-security-levels.md D3.5), and the tag is never a
+// level: the per-dimension levels ride executionSecurityEnforcement.
+const sandboxCapability = "sandbox"
 
 // laneCapabilities are the capability tags for the non-agent work lanes EVERY
 // PollService executes. They are appended unconditionally because the poll
@@ -43,12 +50,64 @@ var producerCapabilities = []string{receiptPreflightNackReasonCapability}
 // Appending is safe precisely because the lanes and producer contracts are
 // wired in the daemon rather than by each embedder: a capability tag reaching
 // the coordinator always has a matching implementation behind it on this host.
-func effectiveRegistrationCapabilities(embedder []string) []string {
+//
+// The sandbox tag is the one substrate tag the daemon decides itself: it is
+// removed from any list, the embedder's included, unless enforcement attests
+// an isolation boundary, and added when it does.
+func effectiveRegistrationCapabilities(embedder []string, enforcement agent.ExecutionSecurityEnforcement) []string {
 	base := embedder
 	if base == nil {
 		base = baseSubstrateCapabilities
 	}
-	return worker.MergeCapabilities(base, append(laneCapabilities, producerCapabilities...)...)
+	substrate := make([]string, 0, len(base)+1)
+	for _, tag := range base {
+		if tag != sandboxCapability {
+			substrate = append(substrate, tag)
+		}
+	}
+	if enforcement.AttestsSandbox() {
+		substrate = append(substrate, sandboxCapability)
+	}
+	return worker.MergeCapabilities(substrate, append(laneCapabilities, producerCapabilities...)...)
+}
+
+// registrationExecutionSecurityEnforcement is the attestation published at
+// registration. A daemon configured with no attestation applies no
+// containment around the harness, so it attests index 0 on every substrate
+// dimension — explicitly, so the control plane reads a statement rather than
+// an absence.
+func registrationExecutionSecurityEnforcement(configured *agent.ExecutionSecurityEnforcement) (agent.ExecutionSecurityEnforcement, error) {
+	if configured == nil {
+		return agent.UncontainedHostEnforcement(), nil
+	}
+	if err := configured.Validate(); err != nil {
+		return agent.ExecutionSecurityEnforcement{}, err
+	}
+	out := *configured
+	// Normalize absent substrate dimensions to their explicit index-0 value
+	// so the published attestation names every dimension it covers.
+	for _, dimension := range agent.ExecutionSecurityDimensions() {
+		if dimension == agent.ExecutionSecurityToolApproval {
+			continue
+		}
+		setEnforcementLevel(&out, dimension, out.Level(dimension))
+	}
+	return out, nil
+}
+
+func setEnforcementLevel(e *agent.ExecutionSecurityEnforcement, dimension agent.ExecutionSecurityDimension, level agent.ExecutionSecurityLevel) {
+	switch dimension {
+	case agent.ExecutionSecurityFileRead:
+		e.FileRead = level
+	case agent.ExecutionSecurityFileWrite:
+		e.FileWrite = level
+	case agent.ExecutionSecurityNetwork:
+		e.Network = level
+	case agent.ExecutionSecurityCredentials:
+		e.Credentials = level
+	case agent.ExecutionSecurityIsolation:
+		e.Isolation = level
+	}
 }
 
 func mergePreflightRegistrationCapability(capabilities []string) []string {
