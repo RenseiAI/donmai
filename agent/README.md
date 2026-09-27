@@ -37,13 +37,13 @@ This package is the verbatim Go translation of the legacy TS contract at:
 
 JSON tags on every struct use **camelCase** to match the TS wire format
 verbatim. Readers of `QueuedWork.resolvedProfile` JSON across the fleet
-(daemon, platform-side workflow nodes, rensei-tui) depend on this.
+(daemon, control-plane workflow nodes, downstream embedders) depend on this.
 
 ## Public package boundary
 
 This package is exported at the top level of the module
 (`github.com/RenseiAI/donmai/agent`). Downstream consumers
-including `rensei-tui` import it directly without depending on the rest
+such as embedding CLIs import it directly without depending on the rest
 of `donmai`. F.1.1 §1 ratifies this boundary. Do not move or
 rename without an ADR.
 
@@ -64,7 +64,7 @@ operations. The 9 named capabilities (each maps 1:1 to a flag on
 | `CapPermissionConfig` | `NeedsPermissionConfig` | Provider consumes `Spec.PermissionConfig` |
 | `CapCodeIntelEnforcement` | `SupportsCodeIntelligenceEnforcement` | Provider supports the Grep/Glob → af_code redirect |
 | `CapSubagentEvents` | `EmitsSubagentEvents` | Provider emits Anthropic-style subagent (Task) events |
-| `CapReasoningEffort` | `SupportsReasoningEffort` | Provider honors `Spec.Effort` (low/medium/high/xhigh) |
+| `CapReasoningEffort` | `SupportsReasoningEffort` | Provider honors `Spec.Effort` (low/medium/high/xhigh/max) |
 | `CapToolPermissionFormatClaude` | `ToolPermissionFormat == "claude"` | Provider uses Claude's `Bash(prefix:glob)` tool-permission grammar |
 
 ### v0.5.0 provider matrix (per F.1.1 §3 and locked coordinator decisions)

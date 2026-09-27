@@ -319,6 +319,35 @@ func TestIsSupported(t *testing.T) {
 	}
 }
 
+// TestEffortLevelKnown pins the effort ladder: every tier a model API
+// exposes — max included — is a known level, and the empty value (not
+// configured) or a foreign string is not.
+func TestEffortLevelKnown(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		level EffortLevel
+		want  bool
+	}{
+		{EffortLow, true},
+		{EffortMedium, true},
+		{EffortHigh, true},
+		{EffortXHigh, true},
+		{EffortMax, true},
+		{"", false},
+		{"minimal", false},
+		{"MAX", false},
+	}
+	for _, tc := range cases {
+		if got := tc.level.Known(); got != tc.want {
+			t.Errorf("EffortLevel(%q).Known() = %v, want %v", tc.level, got, tc.want)
+		}
+	}
+	levels := EffortLevels()
+	if len(levels) != 5 || levels[len(levels)-1] != EffortMax {
+		t.Errorf("EffortLevels() = %v, want low..max with max last", levels)
+	}
+}
+
 // TestEnumValues guards the wire shape of the public enums against
 // accidental rename.
 func TestEnumValues(t *testing.T) {
@@ -332,6 +361,7 @@ func TestEnumValues(t *testing.T) {
 		string(SandboxFullAccess):     "full-access",
 		string(EffortLow):             "low",
 		string(EffortXHigh):           "xhigh",
+		string(EffortMax):             "max",
 		string(EventInit):             "init",
 		string(EventAssistantText):    "assistant_text",
 		string(EventToolUse):          "tool_use",

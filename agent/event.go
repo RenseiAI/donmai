@@ -85,6 +85,21 @@ func (SystemEvent) isAgentEvent()   {}
 // the local event log.
 const SystemSubtypeToolCallRefusedOutputLimit = "tool_call_refused_output_limit"
 
+// SystemSubtypeReasoningEffort is the SystemEvent subtype the runner emits
+// once per session, after spawn and before any turn output, recording the
+// reasoning effort it requested from the harness. Message carries the
+// configured EffortLevel, or is empty when the session carried none — in
+// which case no level was requested and the harness or model default applies.
+// The activity poster forwards it as a context marker built from that fixed
+// vocabulary, so every session's record states the effort it ran at.
+const SystemSubtypeReasoningEffort = "reasoning_effort"
+
+// ReasoningEffortEvent builds the SystemSubtypeReasoningEffort event for the
+// effort a session was spawned with.
+func ReasoningEffortEvent(effort EffortLevel) SystemEvent {
+	return SystemEvent{Subtype: SystemSubtypeReasoningEffort, Message: string(effort)}
+}
+
 // AssistantTextEvent carries an incremental assistant-text output chunk.
 // Verbatim port of AgentAssistantTextEvent. The runner accumulates Text
 // across multiple events to scan for the WORK_RESULT marker.

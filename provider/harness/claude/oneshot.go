@@ -203,20 +203,24 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 // oneShotEnv projects a bound endpoint onto the child environment (serving-host
 // knobs + binding credentials), reusing the SAME applyEndpoint projection the
 // agent lane runs so a bedrock/vertex/direct binding routes identically on both
-// lanes. A request with no Endpoint contributes nothing and the child simply
+// lanes. A request with no Endpoint contributes no routing env and the child
 // inherits the parent environment — which is what carries host-session auth.
+//
+// The reasoning effort is fixed the same way the agent lane fixes it
+// (effort.go): the request's effort, or the model's own default when it
+// carries none — never a level saved in the operator's settings.
 func oneShotEnv(req agent.OneShotRequest) map[string]string {
 	if req.Endpoint == nil {
-		return nil
+		return withEffortEnv(nil, req.Effort)
 	}
 	spec, err := applyEndpoint(agent.Spec{Endpoint: req.Endpoint})
 	if err != nil {
 		// A mis-bound endpoint is reported by the CLI itself (unknown model /
 		// missing credentials) rather than silently routed to the default host;
-		// there is no env to add in that case.
-		return nil
+		// there is no endpoint env to add in that case.
+		return withEffortEnv(nil, req.Effort)
 	}
-	return spec.Env
+	return withEffortEnv(spec.Env, req.Effort)
 }
 
 // parseOneShotEnvelope decodes the single `--output-format json` document. It

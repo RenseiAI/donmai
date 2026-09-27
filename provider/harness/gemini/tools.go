@@ -159,9 +159,10 @@ func is3xModel(model string) bool {
 // knob. Returns nil when no effort is requested.
 //
 //   - 3.x models  → thinkingLevel: low → "low", medium → "medium",
-//     high/xhigh → "high". (3.x has no off switch; minimal is the floor.)
+//     high/xhigh/max → "high" (the family's highest level). (3.x has no off
+//     switch; minimal is the floor.)
 //   - 2.5 models  → thinkingBudget: low → 2048, medium → 8192,
-//     high/xhigh → 24576 tokens. (-1 dynamic, 0 off are also valid but we
+//     high/xhigh/max → 24576 tokens. (-1 dynamic, 0 off are also valid but we
 //     map effort tiers to concrete budgets.)
 //
 // ProviderConfig may override via the "thinkingLevel" (string) or
@@ -208,7 +209,7 @@ func thinkingLevelForEffort(e agent.EffortLevel) string {
 		return "low"
 	case agent.EffortMedium:
 		return "medium"
-	case agent.EffortHigh, agent.EffortXHigh:
+	case agent.EffortHigh, agent.EffortXHigh, agent.EffortMax:
 		return "high"
 	default:
 		return "medium"
@@ -223,7 +224,7 @@ func thinkingBudgetForEffort(e agent.EffortLevel) int {
 		return 2048
 	case agent.EffortMedium:
 		return 8192
-	case agent.EffortHigh, agent.EffortXHigh:
+	case agent.EffortHigh, agent.EffortXHigh, agent.EffortMax:
 		return 24576
 	default:
 		return 8192

@@ -29,8 +29,9 @@ type resolvedProfileWire struct {
 // ReconcileResolvedProfile applies the platform's per-session model/provider
 // resolution to qw.ResolvedProfile: a non-empty modelProfileJSON (the richer
 // ADR-2026-05-12 worktype+model-profile routing shape) supersedes
-// Provider/Model/Effort; otherwise a non-empty resolvedProfileJSON is applied
-// verbatim. Both are raw JSON — see resolvedProfileWire's doc comment for why
+// Provider/Model/Effort — except that a model profile with no mode leaves the
+// resolved profile's effort in force; otherwise a non-empty
+// resolvedProfileJSON is applied verbatim. Both are raw JSON — see resolvedProfileWire's doc comment for why
 // this package cannot decode the daemon's own typed
 // SessionModelProfile/SessionResolvedProfile.
 //
@@ -65,6 +66,13 @@ func ReconcileResolvedProfile(qw QueuedWork, modelProfileJSON, resolvedProfileJS
 		}
 		if rp.CredentialID != "" {
 			qw.ResolvedProfile.CredentialID = rp.CredentialID
+		}
+		// Effort: the model profile's mode is authoritative when it carries
+		// one. When it does not, the resolved profile's effort is the
+		// configured value — dropping it here would run the session at a
+		// harness default nobody chose.
+		if qw.ResolvedProfile.Effort == "" && rp.Effort != "" {
+			qw.ResolvedProfile.Effort = agent.EffortLevel(rp.Effort)
 		}
 		if rp.ProviderConfig != nil {
 			qw.ResolvedProfile.ProviderConfig = rp.ProviderConfig

@@ -50,9 +50,11 @@ type ResolvedModelProfile struct {
 	// the provider's built-in default model.
 	Model string `json:"model"`
 
-	// Mode is the reasoning-effort/speed tier string the platform
-	// resolved (e.g. "xhigh", "high", "medium", "low"). Maps onto
-	// agent.EffortLevel; empty falls back to the provider default.
+	// Mode is the reasoning-effort tier string the platform resolved
+	// (e.g. "max", "xhigh", "high", "medium", "low"). Maps onto
+	// agent.EffortLevel. Empty means the model profile carries no effort;
+	// ReconcileResolvedProfile then keeps the resolved profile's effort, and
+	// with neither set no level is requested from the harness.
 	Mode string `json:"mode,omitempty"`
 
 	// Context is the context-window size in tokens the platform requires

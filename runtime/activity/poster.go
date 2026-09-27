@@ -75,6 +75,13 @@ const (
 	// event's free-form Message. The refused call itself is already visible
 	// as the adjacent errored tool result.
 	outputLimitRefusalContent = "tool call refused before execution: the model's response hit its output-token limit"
+
+	// reasoningEffortContentPrefix and the two fixed sentences below are the
+	// only content an agent.SystemSubtypeReasoningEffort marker can produce
+	// (ReasoningEffortContent).
+	reasoningEffortContentPrefix        = "reasoning effort: "
+	reasoningEffortNotConfiguredContent = "reasoning effort: not configured; none was requested, so the harness or model default applies"
+	reasoningEffortUnknownContent       = "reasoning effort: the configured value is not a recognized level (low, medium, high, xhigh, max)"
 )
 
 // RuntimeCredentials are the bearer-token credentials needed for an
@@ -612,11 +619,13 @@ func (p *Poster) maybePostRunning(ctx context.Context) {
 // mapEvent translates an agent.Event into the platform activity shape.
 // Returns ok=false for events that should not be forwarded
 // (Init / most System / ToolProgress) — those are runner-internal lifecycle
-// signals the platform doesn't render. Three SystemEvent subtypes are
+// signals the platform doesn't render. Four SystemEvent subtypes are
 // forwarded: "reasoning" becomes a thought, and
-// "interactive-initial-prompt-delivered" and
-// agent.SystemSubtypeToolCallRefusedOutputLimit become generic context
-// markers with fixed content (never the event's Message).
+// "interactive-initial-prompt-delivered",
+// agent.SystemSubtypeToolCallRefusedOutputLimit, and
+// agent.SystemSubtypeReasoningEffort become context markers with fixed
+// content (never the event's free-form Message; the effort marker names a
+// level only when it is a known agent.EffortLevel).
 //
 // timestamp is the wall-clock time at which the event was observed; the
 // platform server defaults to "now" when omitted, but emitting it here
@@ -729,6 +738,10 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.Type = "context"
 			out.Content = outputLimitRefusalContent
 			return out, true
+		case agent.SystemSubtypeReasoningEffort:
+			out.Type = "context"
+			out.Content = ReasoningEffortContent(agent.EffortLevel(e.Message))
+			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, and unknown values) stays
@@ -739,6 +752,20 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 		return payload{}, false
 	}
 	return payload{}, false
+}
+
+// ReasoningEffortContent is the fixed-vocabulary activity content for a
+// agent.SystemSubtypeReasoningEffort marker. The level is named only when it
+// is a known agent.EffortLevel, so the content never carries free-form text.
+func ReasoningEffortContent(effort agent.EffortLevel) string {
+	switch {
+	case effort == "":
+		return reasoningEffortNotConfiguredContent
+	case effort.Known():
+		return reasoningEffortContentPrefix + string(effort) + " (as configured)"
+	default:
+		return reasoningEffortUnknownContent
+	}
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,

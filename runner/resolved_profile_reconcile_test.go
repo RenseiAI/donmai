@@ -244,3 +244,51 @@ func TestPreflightAndSpawnAgreeForHumanControlledPiWithSiblingResolvedProfile(t 
 		}
 	})
 }
+
+// TestReconcileResolvedProfile_Effort pins which wire field carries the
+// session's reasoning effort when the platform sends both shapes: the model
+// profile's mode wins when set, and a model profile without one keeps the
+// resolved profile's effort instead of dropping it to a harness default.
+func TestReconcileResolvedProfile_Effort(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name         string
+		modelProfile map[string]any
+		resolved     map[string]any
+		want         agent.EffortLevel
+	}{
+		{name: "resolved profile only", resolved: map[string]any{"provider": "pi", "model": "m", "effort": "max"}, want: agent.EffortMax},
+		{name: "model profile mode wins", modelProfile: map[string]any{"providerId": "pi", "model": "m", "mode": "xhigh"}, resolved: map[string]any{"effort": "low"}, want: agent.EffortXHigh},
+		{name: "model profile without mode keeps resolved effort", modelProfile: map[string]any{"providerId": "pi", "model": "m"}, resolved: map[string]any{"effort": "max"}, want: agent.EffortMax},
+		{name: "model profile alone without mode stays unconfigured", modelProfile: map[string]any{"providerId": "pi", "model": "m"}, want: ""},
+		{name: "neither carries an effort", modelProfile: map[string]any{"providerId": "pi", "model": "m"}, resolved: map[string]any{"provider": "pi"}, want: ""},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var mp, rp json.RawMessage
+			if tc.modelProfile != nil {
+				mp = marshalFixture(t, tc.modelProfile)
+			}
+			if tc.resolved != nil {
+				rp = marshalFixture(t, tc.resolved)
+			}
+			qw, err := ReconcileResolvedProfile(QueuedWork{}, mp, rp)
+			if err != nil {
+				t.Fatalf("ReconcileResolvedProfile: %v", err)
+			}
+			if qw.ResolvedProfile.Effort != tc.want {
+				t.Errorf("Effort = %q, want %q", qw.ResolvedProfile.Effort, tc.want)
+			}
+		})
+	}
+}
+
+func marshalFixture(t *testing.T, v any) json.RawMessage {
+	t.Helper()
+	raw, err := json.Marshal(v)
+	if err != nil {
+		t.Fatalf("marshal: %v", err)
+	}
+	return raw
+}
