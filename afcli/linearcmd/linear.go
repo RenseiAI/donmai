@@ -436,6 +436,8 @@ func newLinearGetIssueCmd(ds func() afclient.DataSource, bin string) *cobra.Comm
 				"labels":           labelNames(issue.Labels),
 				"parentId":         parentID,
 				"parentIdentifier": parentIdentifier,
+				"priority":         issue.Priority,
+				"sortOrder":        issue.SortOrder,
 				"createdAt":        issue.CreatedAt,
 				"updatedAt":        issue.UpdatedAt,
 			}
@@ -1148,6 +1150,7 @@ func newLinearListSubIssuesCmd(ds func() afclient.DataSource, bin string) *cobra
 					"status":     c.State.Name,
 					"parentId":   parent.ID,
 					"priority":   c.Priority,
+					"sortOrder":  c.SortOrder,
 					"labels":     labelNames(c.Labels),
 					"url":        c.URL,
 					"blockedBy":  []any{},
@@ -1325,6 +1328,11 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 			if err := linear.ValidateIssueListLimit(limit); err != nil {
 				return err
 			}
+			switch orderBy {
+			case "createdAt", "updatedAt", "manual":
+			default:
+				return fmt.Errorf("--order-by must be createdAt, updatedAt, or manual")
+			}
 			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
@@ -1395,28 +1403,26 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			gqlOrderBy := "createdAt"
-			if orderBy == "updatedAt" {
-				gqlOrderBy = "updatedAt"
-			}
-
-			issues, err := client.ListIssues(ctx, filter, limit, gqlOrderBy)
+			issues, err := client.ListIssues(ctx, filter, limit, orderBy)
 			if err != nil {
-				return fmt.Errorf("list issues: %w", err)
+				return fmt.Errorf("list issues using %s order: %w", orderBy, err)
 			}
 
-			// Sort by priority (0 = no priority → goes last, treated as 5)
-			sort.SliceStable(issues, func(i, j int) bool {
-				pi := issues[i].Priority
-				if pi == 0 {
-					pi = 5
-				}
-				pj := issues[j].Priority
-				if pj == 0 {
-					pj = 5
-				}
-				return pi < pj
-			})
+			if orderBy != "manual" {
+				// Preserve the existing numeric-priority grouping for timestamp modes.
+				// Manual mode is already ordered by Linear and must not be resorted.
+				sort.SliceStable(issues, func(i, j int) bool {
+					pi := issues[i].Priority
+					if pi == 0 {
+						pi = 5
+					}
+					pj := issues[j].Priority
+					if pj == 0 {
+						pj = 5
+					}
+					return pi < pj
+				})
+			}
 
 			out := make([]map[string]any, len(issues))
 			for i, iss := range issues {
@@ -1433,6 +1439,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 					"title":     iss.Title,
 					"status":    iss.State.Name,
 					"priority":  iss.Priority,
+					"sortOrder": iss.SortOrder,
 					"labels":    labelNames(iss.Labels),
 					"project":   projName,
 					"assignee":  assigneeName,
@@ -1452,7 +1459,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Filter by assignee name, email, or 'me'")
 	cmd.Flags().StringVar(&team, "team", "", "Filter by team name")
 	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d)", linear.MaxIssueListLimit))
-	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Sort order: createdAt or updatedAt")
+	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
 
 	return cmd
@@ -1562,6 +1569,7 @@ func newLinearListBacklogIssuesCmd(ds func() afclient.DataSource, bin string) *c
 					"description": iss.Description,
 					"url":         iss.URL,
 					"priority":    iss.Priority,
+					"sortOrder":   iss.SortOrder,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
@@ -1641,6 +1649,7 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 					"description": iss.Description,
 					"url":         iss.URL,
 					"priority":    iss.Priority,
+					"sortOrder":   iss.SortOrder,
 					"status":      iss.State.Name,
 					"labels":      labelNames(iss.Labels),
 					"parentID":    iss.ParentID,
