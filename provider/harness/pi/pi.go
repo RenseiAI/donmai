@@ -243,6 +243,13 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 			}
 		}
 	}
+	// A model the injected provider would serve over a protocol that cannot
+	// omit the output limit is refused here, before either spawn mode starts
+	// a child, when no limit is configured — a clear configuration error
+	// instead of an upstream rejection on the first request.
+	if err := requireOutputLimit(spec); err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	}
 	return spec, nil
 }
 

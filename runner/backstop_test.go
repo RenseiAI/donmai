@@ -723,6 +723,228 @@ func TestRunBackstop_RecoversExistingPR(t *testing.T) {
 	}
 }
 
+// backstopRemoteFixture builds a bare origin carrying main, a shared
+// long-lived branch "develop" with two commits of someone else's work, and
+// "feature" (at main), then clones it the way a session workarea is cloned —
+// so a later `git checkout develop` gets git's same-name tracking branch.
+// Returns the remote and the clone.
+func backstopRemoteFixture(t *testing.T) (remote, repo string) {
+	t.Helper()
+	remote = t.TempDir()
+	//nolint:gosec // G204: test fixture, args are hard-coded literals.
+	if out, err := exec.Command("git", "init", "--bare", "-b", "main", remote).CombinedOutput(); err != nil {
+		t.Fatalf("git init --bare: %v\n%s", err, out)
+	}
+	seed := t.TempDir()
+	gitInit(t, seed)
+	gitRun(t, seed, "remote", "add", "origin", remote)
+	gitRun(t, seed, "checkout", "-q", "-b", "develop")
+	for _, f := range []string{"d1.txt", "d2.txt"} {
+		writeFile(t, seed, f, f+"\n")
+		gitRun(t, seed, "add", "-A")
+		gitRun(t, seed, "commit", "-q", "-m", "someone else's "+f)
+	}
+	gitRun(t, seed, "push", "-q", "origin", "main", "develop", "main:refs/heads/feature")
+	repo = t.TempDir()
+	//nolint:gosec // G204: test fixture, paths come from t.TempDir.
+	if out, err := exec.Command("git", "clone", "-q", remote, repo).CombinedOutput(); err != nil {
+		t.Fatalf("git clone: %v\n%s", err, out)
+	}
+	gitRun(t, repo, "config", "user.email", "test@example.com")
+	gitRun(t, repo, "config", "user.name", "test")
+	gitRun(t, repo, "config", "commit.gpgsign", "false")
+	return remote, repo
+}
+
+// remoteRefs returns every branch ref on the remote mapped to its commit.
+func remoteRefs(t *testing.T, remote string) map[string]string {
+	t.Helper()
+	refs := map[string]string{}
+	for _, line := range strings.Split(gitRun(t, remote, "for-each-ref", "--format=%(refname) %(objectname)", "refs/heads"), "\n") {
+		if name, sha, ok := strings.Cut(line, " "); ok {
+			refs[name] = sha
+		}
+	}
+	return refs
+}
+
+// TestRunBackstop_PublishesToTheSessionBranchOnly pins where the backstop
+// publishes: the committed work (HEAD) goes to the session-owned branch, and
+// gh is named that branch with --head — whatever the agent left checked out.
+// No other remote branch may move or appear. Covered shapes:
+//
+//   - the recorded failure: the agent switched to its own branch tracking a
+//     DIFFERENTLY named remote branch, and the old backstop pushed the session
+//     branch without the work, then gh refused;
+//   - the agent checked out a shared branch by name (same-name tracking), and
+//     also rewrote its history — the review's reproduction, where publishing
+//     the checked-out branch fast-forwarded (or would have forced) someone
+//     else's branch and adopted their PR;
+//   - a detached HEAD, whose commit the old fallback never published.
+func TestRunBackstop_PublishesToTheSessionBranchOnly(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	cases := []struct {
+		name  string
+		setup func(t *testing.T, repo, session string)
+	}{
+		{
+			name: "session branch checked out",
+			setup: func(t *testing.T, repo, session string) {
+				gitRun(t, repo, "checkout", "-q", "-b", session)
+			},
+		},
+		{
+			name: "switched to a branch tracking a differently named upstream",
+			setup: func(t *testing.T, repo, session string) {
+				gitRun(t, repo, "branch", session)
+				gitRun(t, repo, "checkout", "-q", "-b", "feature-v2", "--track", "origin/feature")
+			},
+		},
+		{
+			name: "checked out a shared branch by name",
+			setup: func(t *testing.T, repo, session string) {
+				gitRun(t, repo, "branch", session)
+				gitRun(t, repo, "checkout", "-q", "develop")
+			},
+		},
+		{
+			name: "rewrote a shared branch's history",
+			setup: func(t *testing.T, repo, session string) {
+				gitRun(t, repo, "branch", session)
+				gitRun(t, repo, "checkout", "-q", "develop")
+				gitRun(t, repo, "reset", "-q", "--hard", "HEAD~1")
+			},
+		},
+		{
+			name: "detached HEAD",
+			setup: func(t *testing.T, repo, session string) {
+				gitRun(t, repo, "branch", session)
+				gitRun(t, repo, "checkout", "-q", "--detach", "HEAD")
+			},
+		},
+	}
+	for i, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			remote, repo := backstopRemoteFixture(t)
+			session := fmt.Sprintf("agent/session-%d", i)
+			before := remoteRefs(t, remote)
+			tc.setup(t, repo, session)
+			writeFile(t, repo, "src/fix.go", "package fix\n")
+
+			const wantURL = "https://github.com/RenseiAI/donmai/pull/4343"
+			argsFile := stubGhRecordingArgs(t, wantURL)
+
+			res := &Result{}
+			res.WorktreePath = repo
+			report := minimalRunner(t).runBackstop(context.Background(), QueuedWork{
+				QueuedWork: queuedWorkBase("ENG-88"),
+			}, session, res, nil)
+
+			if report.Diagnostics != "" {
+				t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+			}
+			if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+				t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+			}
+			head := gitRun(t, repo, "rev-parse", "HEAD")
+			after := remoteRefs(t, remote)
+			if got := after["refs/heads/"+session]; got != head {
+				t.Errorf("remote %s = %q, want the committed work %s", session, got, head)
+			}
+			for ref, sha := range after {
+				if ref == "refs/heads/"+session {
+					continue
+				}
+				if before[ref] != sha {
+					t.Errorf("remote %s changed or appeared (%q -> %q): only the session branch may be published", ref, before[ref], sha)
+				}
+			}
+			args, err := os.ReadFile(argsFile) //nolint:gosec // G304: path created by this test.
+			if err != nil {
+				t.Fatalf("read gh args: %v", err)
+			}
+			if !strings.Contains(string(args), "\n--head\n"+session+"\n") {
+				t.Errorf("gh argv = %q, want --head %s", args, session)
+			}
+		})
+	}
+}
+
+// TestRunBackstop_NeverForcesTheSessionBranch pins that a session branch that
+// moved on the remote (a branch name reused across attempts) is not
+// overwritten: the push is refused as a non-fast-forward, the backstop reports
+// git's reason, the remote branch keeps its commits, and no PR is attempted.
+func TestRunBackstop_NeverForcesTheSessionBranch(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	remote, repo := backstopRemoteFixture(t)
+	const session = "agent/session-reused"
+	// An earlier attempt's work already sits on the session branch.
+	gitRun(t, repo, "push", "-q", "origin", "origin/develop:refs/heads/"+session)
+	earlier := gitRun(t, remote, "rev-parse", "refs/heads/"+session)
+	gitRun(t, repo, "checkout", "-q", "-b", session, "origin/main")
+	writeFile(t, repo, "src/fix.go", "package fix\n")
+	argsFile := stubGhRecordingArgs(t, "https://github.com/RenseiAI/donmai/pull/4344")
+
+	res := &Result{}
+	res.WorktreePath = repo
+	report := minimalRunner(t).runBackstop(context.Background(), QueuedWork{
+		QueuedWork: queuedWorkBase("ENG-89"),
+	}, session, res, nil)
+
+	if report.Pushed || report.PRCreated {
+		t.Fatalf("report = %+v, want the non-fast-forward push refused", report)
+	}
+	if !strings.Contains(report.Diagnostics, session) || !strings.Contains(report.Diagnostics, "rejected") {
+		t.Errorf("diagnostics = %q, want the session branch and git's rejection", report.Diagnostics)
+	}
+	if got := gitRun(t, remote, "rev-parse", "refs/heads/"+session); got != earlier {
+		t.Errorf("remote %s moved from %s to %s: the backstop must never force it", session, earlier, got)
+	}
+	if _, err := os.Stat(argsFile); !os.IsNotExist(err) {
+		t.Errorf("gh was invoked after a failed push (stat err %v)", err)
+	}
+}
+
+// gitRun runs git in dir, failing the test on error, and returns trimmed
+// combined output.
+func gitRun(t *testing.T, dir string, args ...string) string {
+	t.Helper()
+	out, err := runGit(context.Background(), dir, gitIdentity{}, args...)
+	if err != nil {
+		t.Fatalf("git %v: %v\n%s", args, err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+// stubGhRecordingArgs shadows `gh` on PATH with a stub that records its argv
+// (one argument per line, after a leading blank line) and answers `pr create`
+// the way the real gh does: without --head it refuses exactly as the
+// recorded failure did; with it, it prints url.
+func stubGhRecordingArgs(t *testing.T, url string) string {
+	t.Helper()
+	dir := t.TempDir()
+	argsFile := filepath.Join(dir, "gh-args.txt")
+	script := fmt.Sprintf(`#!/bin/sh
+{ echo; printf '%%s\n' "$@"; } > %[1]q
+for a in "$@"; do
+  if [ "$a" = "--head" ]; then echo %[2]q; exit 0; fi
+done
+echo "aborted: you must first push the current branch to a remote, or use the --head flag" 1>&2
+exit 1
+`, argsFile, url)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return argsFile
+}
+
 // stubGhOnPath writes a fake `gh` executable that echoes output to stderr
 // and exits with exitCode, then prepends its directory to PATH for the
 // test's duration so runGh resolves the stub instead of a real gh. The

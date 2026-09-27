@@ -57,6 +57,21 @@ type untrustedFrame struct {
 	callID string
 }
 
+// outputLimitRefusal is one guarded call the RUNTIME refused before
+// execution, without ever offering it to the tool_call hook, because the
+// assistant message that carried it stopped on the output-token limit. Kept
+// apart from the adjudication registry (it is not a token-verified ruling)
+// and from the misses (it is not an unproven call), so it is inspectable on
+// the handle as what it is.
+type outputLimitRefusal struct {
+	tool   string
+	callID string
+}
+
+// outputLimitRefusalSubtype is the SystemEvent subtype the monitor emits for
+// an outputLimitRefusal: an observation, never an error, because nothing ran.
+const outputLimitRefusalSubtype = agent.SystemSubtypeToolCallRefusedOutputLimit
+
 // adjudicationMissingCode is the non-fatal error code the monitor emits for a
 // guarded tool call that ended without a recorded outcome. Distinct from
 // policy_extension_failed on purpose: that code means the session must stop,
@@ -125,6 +140,18 @@ type Handle struct {
 	misses        []adjudicationMiss
 	untrusted     []untrustedFrame
 
+	// lengthStopped maps the tool-call ids of every assistant message that
+	// ended with stopReason "length" to the tool each call named. pi never
+	// runs the tool_call hook for such a call — it finalizes it as an error
+	// ("was not executed") because its arguments may be truncated — so no
+	// ruling can exist for it. The runtime emits that message_end BEFORE the
+	// hook-less start/end pair, and dispatch is single-goroutine, so the entry
+	// is always in place when the end arrives. An entry is consumed by the
+	// end it explains, and every entry is dropped at the turn's turn_end.
+	// Guarded by adjMu; never read as a ruling.
+	lengthStopped       map[string]string
+	outputLimitRefusals []outputLimitRefusal
+
 	// turnInFlight is true between the first streaming event of a turn and its
 	// turn_end/agent_end — Inject routes to steer while in flight, follow_up
 	// while idle.
@@ -175,6 +202,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		receipt:         receipt,
 		handshakeResult: make(chan error, 1),
 		adjudications:   make(map[string]adjudicationOutcome),
+		lengthStopped:   make(map[string]string),
 		events:          make(chan agent.Event, 256),
 		closed:          make(chan struct{}),
 	}
@@ -357,6 +385,16 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 		h.handleExtensionRequest(ev)
 		return false
 	}
+	switch ev.Type {
+	case "message_end":
+		h.noteLengthStoppedToolCalls(ev)
+	case "turn_end":
+		// pi emits the refused start/end pairs before the turn_end that
+		// closes their turn, so any note still standing here explains nothing
+		// that can legitimately follow — drop it rather than let it excuse a
+		// later end that reuses the id.
+		h.clearLengthStoppedToolCalls()
+	}
 
 	// Integrity monitor: every guarded tool_execution_END is matched against
 	// the outcome the boundary recorded for its call id. A non-built-in end
@@ -375,6 +413,9 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	//  2. Any other recorded outcome (an allow, or a refusal that ended as an
 	//     error result, which is exactly what pi emits for a blocked call) —
 	//     or a verified pre-execution refusal receipt. Nothing to report.
+	//     Likewise a call the runtime refused before execution because its
+	//     assistant message stopped on the output-token limit
+	//     (refusedForOutputLimit): recorded as that refusal, never as a miss.
 	//  3. NO recorded outcome. This cannot distinguish a real bypass from a
 	//     ruling that was lost in transit, an extension-side refusal that
 	//     never reached us, or a call id we could not correlate — so it is
@@ -412,6 +453,12 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 				return true // fatal: the denial was not honoured, abort now.
 			case ruled:
 			case h.acceptsPreExecutionRefusal(ev):
+			case h.refusedForOutputLimit(tool, callID, ev):
+				h.emit(agent.SystemEvent{
+					Subtype: outputLimitRefusalSubtype,
+					Message: fmt.Sprintf("tool %q (call %q) was refused before execution: its assistant message stopped on the output-token limit, so the runtime did not run it", tool, callID),
+					Raw:     raw(ev),
+				})
 			default:
 				h.recordMiss(tool, callID)
 				h.emit(agent.ErrorEvent{
@@ -483,8 +530,97 @@ func executionSucceeded(ev rawEvent) bool {
 	return false
 }
 
-// acceptsPreExecutionRefusal recognizes the sole no-adjudication exception.
-// It deliberately reads only SDK-owned top-level fields from the exact RPC
+// executionErrored reports whether a tool_execution_end positively says the
+// call ended as an ERROR result: the mirror of executionSucceeded, reading the
+// same SDK-owned flag under the same spellings, and equally strict — an absent
+// or non-boolean flag is unknown, and unknown is never "errored".
+func executionErrored(ev rawEvent) bool {
+	for _, key := range []string{"isError", "error"} {
+		if isError, ok := ev.Fields[key].(bool); ok {
+			return isError
+		}
+	}
+	return false
+}
+
+// noteLengthStoppedToolCalls records the tool calls of an assistant
+// message_end whose stopReason is "length". pi's agent loop sends every tool
+// call in such a message to failToolCallsFromTruncatedMessage instead of
+// executing it: the call gets a tool_execution_start/end pair and an error
+// result, but the tool_call hook — where adjudication rides — never runs.
+// Only SDK-owned message fields are read (role, stopReason, the toolCall
+// parts' id and name); message text never establishes anything.
+func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
+	msg := mapField(ev.Fields, "message")
+	if stringField(msg, "role") != "assistant" || stringField(msg, "stopReason") != "length" {
+		return
+	}
+	parts, _ := msg["content"].([]any)
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	for _, p := range parts {
+		part, ok := p.(map[string]any)
+		if !ok || stringField(part, "type") != "toolCall" {
+			continue
+		}
+		callID := toolCallID(part)
+		tool := stringField(part, "name", "toolName")
+		if callID == "" || tool == "" {
+			continue
+		}
+		h.lengthStopped[callID] = tool
+	}
+}
+
+// clearLengthStoppedToolCalls drops every length-stop note at a turn boundary.
+func (h *Handle) clearLengthStoppedToolCalls() {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	clear(h.lengthStopped)
+}
+
+// refusedForOutputLimit reports whether a guarded end with no ruling is the
+// runtime's own pre-execution refusal of a call from a length-stopped
+// assistant message, and records it as such. All three must hold, or the call
+// stays unproven (the miss):
+//
+//   - the call id was named by a toolCall part of an assistant message that
+//     ended with stopReason "length" (noteLengthStoppedToolCalls);
+//   - that part named the SAME tool the end event reports;
+//   - the end event positively reports an error result. A length-stopped id
+//     whose end claims SUCCESS means something executed it after all — that
+//     is exactly the unruled execution the miss exists to surface, so it is
+//     never excused here.
+//
+// A matching entry is consumed, so one length-stopped call can explain one
+// end event and nothing else.
+func (h *Handle) refusedForOutputLimit(tool, callID string, ev rawEvent) bool {
+	if callID == "" || !executionErrored(ev) {
+		return false
+	}
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	stoppedTool, ok := h.lengthStopped[callID]
+	if !ok || stoppedTool != tool {
+		return false
+	}
+	delete(h.lengthStopped, callID)
+	h.outputLimitRefusals = append(h.outputLimitRefusals, outputLimitRefusal{tool: tool, callID: callID})
+	return true
+}
+
+// recordedOutputLimitRefusals returns a copy of the calls recorded as refused
+// before execution on an output-limit stop.
+func (h *Handle) recordedOutputLimitRefusals() []outputLimitRefusal {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	return append([]outputLimitRefusal(nil), h.outputLimitRefusals...)
+}
+
+// acceptsPreExecutionRefusal recognizes the receipted no-adjudication
+// exception (the other is refusedForOutputLimit, which needs no receipt
+// because it rests on the runtime's own length-stopped message_end). It
+// deliberately reads only SDK-owned top-level fields from the exact RPC
 // event. Tool result details, error strings, semantic versions, and generic
 // isError values never establish origin.
 func (h *Handle) acceptsPreExecutionRefusal(ev rawEvent) bool {

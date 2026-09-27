@@ -8,7 +8,44 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- pi sessions no longer run under a fixed 16384-token output cap. The output
+  limit is configuration: a dispatch carries it as the resolved profile's
+  top-level `maxOutputTokens`, the harness passes it to the policy extension,
+  and the extension registers it as the model's limit. Precedence is explicit:
+  a positive top-level value wins, then the model profile's
+  `maxOutputTokens`, then `providerConfig.maxOutputTokens`; a zero or
+  non-numeric provider-config value never disables a configured limit, and a
+  fractional one is ignored rather than truncated. With no limit configured,
+  the model is registered with none and the serving endpoint's own limit
+  applies on the OpenAI-style protocols. A cell the injected provider would
+  serve over the Anthropic Messages or Gemini protocol, which cannot omit the
+  limit, is refused at spawn with a typed configuration error naming
+  `maxOutputTokens`, instead of failing on its first request. No default is
+  ever applied.
+- The gemini harness reads the same `maxOutputTokens` provider-config key, so
+  once a dispatch carries the resolved profile's top-level limit, its
+  per-response output cap becomes that configured value instead of its
+  turns-based guard.
+- A pi tool call that the runtime refused before execution, because its
+  assistant message stopped on the output-token limit, is recorded as that
+  refusal and surfaced as a `tool_call_refused_output_limit` event, which the
+  activity stream forwards as a context marker, instead of as a missing policy
+  ruling that failed the whole run. An unruled call that is not explained that
+  way still fails the run as before.
+- Stage token budgets count a harness's running-total usage once. A steered
+  session whose second result repeated the first result's tokens was measured
+  at nearly double its real spend and could fail a token cap it never
+  reached. Harnesses that report per-result usage keep their accounting.
+- The backstop publishes the committed work (`HEAD`) to the session's own
+  branch, whatever the agent left checked out, and names that branch to
+  `gh pr create` with `--head`. It never pushes any other remote branch: an
+  agent that switched to its own branch, checked out a shared branch by name,
+  or left a detached HEAD no longer causes a failed PR step, a push onto a
+  branch the session does not own, or unpublished work. The force retry,
+  which never took effect, is removed; a session branch that moved on the
+  remote now fails the backstop with git's reason instead.
 
 ## v0.72.49 — 2026-09-27
 
