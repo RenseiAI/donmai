@@ -52,6 +52,8 @@ Use the `pull_request` event. The Action refuses `pull_request_target` and other
 events. It never checks out the PR head, runs repository scripts, loads project
 configuration, or evaluates text from a diff. It executes in an empty temporary
 directory with isolated HOME and only the required GitHub authentication.
+Python runs in isolated mode so inherited `PYTHONPATH` and user-site modules
+cannot execute during Action startup.
 
 GitHub normally gives fork PRs and Dependabot read-only tokens. With `comment:
 auto`, a denied comment write produces a warning and `comment-status:
@@ -85,7 +87,8 @@ The suite drives the real executable against a local fake `gh` transport: comple
 diff, gated diff, unavailable diff, missing patch, and hostile PR text. Separate
 controls exercise embedded checksum refusal, archive links/traversal, event and
 commit identity, comment ownership/permission errors, and annotation escaping.
-It does not contact GitHub or post comments. The fake transport is used only by
+The test cases do not contact GitHub or post comments. The existing read-only
+CI contract job downloads the checksum-pinned analyzer and runs this suite. The fake transport is used only by
 tests; production always calls the runner's actual `gh` executable.
 
 The repository dogfood workflow uses **base-commit Action code**, never PR-head

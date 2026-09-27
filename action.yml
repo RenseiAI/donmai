@@ -38,4 +38,4 @@ runs:
         ACTION_GATE_POLICY: ${{ inputs.gate-policy }}
         ACTION_COMMENT: ${{ inputs.comment }}
         ACTION_DIRECTORY: ${{ github.action_path }}
-      run: python3 "$ACTION_DIRECTORY/action/run.py"
+      run: python3 -I "$ACTION_DIRECTORY/action/run.py"

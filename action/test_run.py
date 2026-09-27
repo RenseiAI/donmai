@@ -3,6 +3,8 @@ import contextlib
 import io
 import json
 import os
+import subprocess
+import sys
 from pathlib import Path
 import tarfile
 import tempfile
@@ -16,6 +18,27 @@ HEAD, BASE = "a" * 40, "b" * 40
 
 
 class ActionTests(unittest.TestCase):
+    def test_metadata_launcher_ignores_untrusted_python_import_paths(self):
+        action_directory = Path(__file__).resolve().parent.parent
+        metadata = (action_directory / "action.yml").read_text()
+        command, = [line.strip()[5:] for line in metadata.splitlines() if line.strip().startswith("run: ")]
+        with tempfile.TemporaryDirectory() as temporary:
+            root = Path(temporary)
+            marker = root / "untrusted-import"
+            (root / "json.py").write_text(
+                f"from pathlib import Path\nPath({str(marker)!r}).write_text('executed')\n")
+            tools = root / "bin"
+            tools.mkdir()
+            (tools / "python3").symlink_to(sys.executable)
+            env = {"PATH": str(tools), "HOME": str(root), "PYTHONPATH": str(root),
+                   "ACTION_DIRECTORY": str(action_directory), "GITHUB_EVENT_NAME": "unsupported",
+                   "ACTION_TOKEN": "synthetic-fixture-token"}
+            result = subprocess.run(["/bin/bash", "--noprofile", "--norc", "-c", command],
+                                    cwd=root, env=env, text=True, capture_output=True, timeout=10, check=False)
+            self.assertEqual(result.returncode, 2, result.stdout + result.stderr)
+            self.assertIn("Only pull_request events are supported", result.stdout)
+            self.assertFalse(marker.exists(), "Action startup executed a module from untrusted PYTHONPATH")
+
     def test_event_identity_and_unsafe_events(self):
         with tempfile.TemporaryDirectory() as temporary:
             event = Path(temporary) / "event.json"

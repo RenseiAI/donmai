@@ -48,6 +48,29 @@ jobs:
       - name: Release workflow contract tests
         run: bash scripts/test-release-workflows.sh
 
+      - name: Native drift Action regression tests
+        run: |
+          python3 -I - <<'PYTEST'
+          import importlib.util
+          import os
+          from pathlib import Path
+          import subprocess
+          import sys
+          import tempfile
+
+          spec = importlib.util.spec_from_file_location("donmai_action", "action/run.py")
+          action = importlib.util.module_from_spec(spec)
+          spec.loader.exec_module(action)
+          with tempfile.TemporaryDirectory(prefix="donmai-action-") as temporary:
+              binary = action.install(Path(temporary))
+              environment = os.environ | {"DONMAI_ACTION_TEST_BINARY": str(binary)}
+              result = subprocess.run(
+                  [sys.executable, "-I", "-m", "unittest", "discover", "-s", "action", "-v"],
+                  env=environment, check=False,
+              )
+              raise SystemExit(result.returncode)
+          PYTEST
+
   test:
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
