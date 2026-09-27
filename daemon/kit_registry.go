@@ -703,7 +703,7 @@ func sanitizeKitFilename(id string) string {
 // then renames into place. Mirrors saveStateLocked's atomic write to
 // keep a partially-failed install from leaving a half-written manifest.
 func atomicCopyFile(src, dst string) error {
-	data, err := os.ReadFile(src) //nolint:gosec // operator-installed path inside fetcher temp dir
+	data, err := readLegacyKitFile(src, defaultKitPackageLimits().MaxFileBytes)
 	if err != nil {
 		return fmt.Errorf("read %q: %w", src, err)
 	}

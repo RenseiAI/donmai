@@ -30,7 +30,7 @@
 //
 // The embedded trust root is the public Sigstore production trust root
 // (https://raw.githubusercontent.com/sigstore/sigstore-go/main/examples/trusted-root-public-good.json).
-// It will be replaced with a Rensei-published trust root once the
+// It will be replaced with a vendor-published trust root once the
 // productionized signing CI emits a vendor-signed Fulcio +
 // Rekor cert chain (Wave 13+ work).
 //
@@ -53,7 +53,6 @@ import (
 	"strings"
 	"time"
 
-	"github.com/sigstore/sigstore-go/pkg/bundle"
 	"github.com/sigstore/sigstore-go/pkg/root"
 	"github.com/sigstore/sigstore-go/pkg/verify"
 
@@ -335,21 +334,22 @@ func newKitVerifierWithMaterial(cfg TrustConfig, material root.TrustedMaterial) 
 func (v *kitVerifier) VerifyManifest(kitID, manifestPath string) (afclient.KitSignatureResult, error) {
 	res := afclient.KitSignatureResult{KitID: kitID, Trust: afclient.KitTrustUnsigned, OK: true}
 
-	manifestBytes, err := os.ReadFile(manifestPath) //nolint:gosec // operator-installed manifests
+	manifestBytes, err := readLegacyKitFile(manifestPath, defaultKitPackageLimits().MaxFileBytes)
 	if err != nil {
 		return res, fmt.Errorf("read manifest %q: %w", manifestPath, err)
 	}
 
 	bundlePath := manifestPath + ".sigstore"
-	if _, err := os.Stat(bundlePath); err != nil { //nolint:gosec // sibling of operator-installed manifest path
+	bundleBytes, err := readLegacyKitFile(bundlePath, defaultKitPackageLimits().MaxSignatureBytes)
+	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			res.Details = "no sibling .sigstore file; manifest is unsigned"
 			return res, nil
 		}
-		return res, fmt.Errorf("stat bundle %q: %w", bundlePath, err)
+		return res, fmt.Errorf("read bundle %q: %w", bundlePath, err)
 	}
 
-	b, err := bundle.LoadJSONFromPath(bundlePath)
+	b, err := parseSigstoreBundle(bundleBytes)
 	if err != nil {
 		res.Trust = afclient.KitTrustSignedUnverified
 		res.Details = fmt.Sprintf("parse bundle: %v", err)
