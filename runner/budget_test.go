@@ -154,6 +154,14 @@ func TestBudgetEnforcer_RunningTotalResultCost(t *testing.T) {
 			wantTokens: 700,
 		},
 		{
+			// Equal totals with no per-call usage in between prove nothing
+			// about a running total: both results count.
+			name:       "equal results with no per-call usage both count",
+			limit:      10_000,
+			events:     []agent.Event{resultCost(100, 0), resultCost(100, 0)},
+			wantTokens: 200,
+		},
+		{
 			name:       "no per-call usage keeps summing results",
 			limit:      10_000,
 			events:     []agent.Event{resultCost(300, 100), resultCost(200, 100)},
