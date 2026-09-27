@@ -1275,9 +1275,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// provider capability; a no-op when nothing was buffered. Runs BEFORE
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
+	// followUp is the observation of the latest follow-up turn (memory inject
+	// or steering), when one ran; step 11·M re-resolves the manifest after it.
+	var followUp *streamObservation
 	if runtimeInjectEnabled && !streamRes.blocked {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
+		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
+			followUp = &injRes
+		}
 	}
 
 	// 11. Tail recovery. Skipped entirely when the agent deliberately
@@ -1303,6 +1309,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			// Re-consume any events the steering inject/resume produced.
 			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
+			followUp = &tailRes
+		}
+	}
+
+	// 11·M. Re-resolve the turn-result manifest after a follow-up turn. The
+	// agent may write its manifest during the follow-up turn, and the
+	// follow-up's terminal message (often just the PR URL steering asked for)
+	// has replaced res.Summary. The manifest outranks both, exactly as it does
+	// at step 10·M, so a verdict other than "passed" is never reported as a
+	// clean pass. A blocked verdict recorded here takes the same 10a fork.
+	if followUp != nil {
+		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, followUp.lastAssistantText)
+		if classifyBlocked(res, streamRes) {
+			r.logger.Info("agent blocked: deliberate decline detected after follow-up turn",
+				"sessionId", qw.SessionID,
+				"reason", streamRes.blockedReason,
+			)
 		}
 	}
 
