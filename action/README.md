@@ -87,8 +87,8 @@ The suite drives the real executable against a local fake `gh` transport: comple
 diff, gated diff, unavailable diff, missing patch, and hostile PR text. Separate
 controls exercise embedded checksum refusal, archive links/traversal, event and
 commit identity, comment ownership/permission errors, and annotation escaping.
-The test cases do not contact GitHub or post comments. The existing read-only
-CI contract job downloads the checksum-pinned analyzer and runs this suite. The fake transport is used only by
+The test cases do not contact GitHub or post comments. The required read-only
+CI test job downloads the checksum-pinned analyzer and runs this suite. The fake transport is used only by
 tests; production always calls the runner's actual `gh` executable.
 
 The repository dogfood workflow uses **base-commit Action code**, never PR-head
