@@ -442,6 +442,10 @@ type Daemon struct {
 	// on the identity the lanes are already presenting rather than minting a
 	// competing one.
 	credentials *CredentialRefresher
+	// registrationReloadCtx is canceled when draining starts. A queued YAML or
+	// mutation re-registration cannot publish credentials after Stop.
+	registrationReloadCtx    context.Context
+	registrationReloadCancel context.CancelFunc
 
 	// shims is the daemon's live view of per-session shim ownership: which
 	// shims it adopted at startup, which it quarantined, and the restart fence
@@ -1219,6 +1223,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// instead of registering a second one (session_shim_composition.go).
 		d.mu.Lock()
 		d.credentials = credentials
+		d.registrationReloadCtx, d.registrationReloadCancel = context.WithCancel(context.Background())
 		d.mu.Unlock()
 
 		// Heartbeat. OnReregister handles reactive credential rejection (the
@@ -1456,12 +1461,12 @@ func (d *Daemon) GatewayStatus() gateway.Status {
 
 // onYamlChanged is the fsnotify callback wired in Start(). Called whenever
 // daemon.yaml is rewritten on disk (operator edit or our own mutation-apply
-// path). Replaces the in-memory project list and pushes it into the
-// spawner; the heartbeat goroutine's next beat will detect the new hash
-// and report up to the platform.
+// path). Replaces the live project admission projection in config, spawner,
+// and the credential refresher. The heartbeat reports the live spawner state;
+// a subsequent full registration also presents the same current declaration.
 //
-// Defensive: only mutates state when projects[] actually differs from the
-// in-memory copy. Other fields (capacity, orchestrator URL) are NOT
+// Defensive: only mutates state when project entries, IDs, or admission mode
+// differ from the in-memory copy. Other fields (capacity, orchestrator URL) are NOT
 // hot-reloaded — those touch listeners we don't currently support
 // re-binding live.
 func (d *Daemon) onYamlChanged(cfg *Config) {
@@ -1477,21 +1482,42 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	after := AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs())
 	beforeIDs := strings.Join(d.config.EffectiveEnabledProjectIDs(), "\x00")
 	afterIDs := strings.Join(cfg.EffectiveEnabledProjectIDs(), "\x00")
-	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs {
+	beforeMode := d.config.EffectiveProjectAdmissionMode()
+	afterMode := cfg.EffectiveProjectAdmissionMode()
+	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs && beforeMode == afterMode {
 		d.mu.Unlock()
 		return
 	}
 	d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
 	d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
+	d.config.ProjectAdmissionMode = cfg.ProjectAdmissionMode
 	d.config.Repositories = cfg.Repositories
 	d.config.Projects = cfg.Projects
+	if d.spawner != nil {
+		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
+		d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
+	}
+	d.refreshRegistrationProjectsLocked()
 	d.mu.Unlock()
 
 	slog.Info("[yaml-watcher] reloaded projects",
 		"beforeCount", len(before), "afterCount", len(after))
-	if d.spawner != nil {
-		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
-		d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
+}
+
+// refreshRegistrationProjectsLocked follows a committed config/spawner
+// projection. Both the YAML watcher and platform mutation path call it with
+// d.mu held, so overlapping edits cannot publish an older projection last.
+func (d *Daemon) refreshRegistrationProjectsLocked() {
+	if d.credentials == nil || d.config == nil {
+		return
+	}
+	d.credentials.UpdateRegistrationProjects(
+		AllowlistEntriesFromConfig(d.config.EffectiveProjectConfigs()),
+		d.config.EffectiveEnabledProjectIDs(),
+		d.config.EffectiveProjectAdmissionMode(),
+	)
+	if d.registrationReloadCtx != nil {
+		d.credentials.RequestReregister(d.registrationReloadCtx)
 	}
 }
 
@@ -1550,6 +1576,13 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	heartbeat := d.heartbeat
 	refresher := d.tokenRefresher
 	d.lifecycleMu.Unlock()
+	d.mu.RLock()
+	reloadCancel := d.registrationReloadCancel
+	credentials := d.credentials
+	d.mu.RUnlock()
+	if reloadCancel != nil {
+		reloadCancel()
+	}
 
 	// Start every shutdown barrier before waiting for any of them. In particular,
 	// an unjoinable poll or landing callback must not suppress worker admission
@@ -1572,12 +1605,19 @@ func (d *Daemon) Stop(ctx context.Context) error {
 
 	pollErr := waitCompletionContext(ctx, pollDone)
 	landingErr := waitCompletionContext(ctx, landingDone)
+	var reloadErr error
+	if credentials != nil {
+		reloadErr = credentials.WaitReregister(ctx)
+	}
 	attemptErr := drainErr
 	if attemptErr == nil {
 		attemptErr = pollErr
 	}
 	if attemptErr == nil {
 		attemptErr = landingErr
+	}
+	if attemptErr == nil {
+		attemptErr = reloadErr
 	}
 	if attemptErr != nil {
 		if hook := d.stopAttemptBeforeRelease; hook != nil {

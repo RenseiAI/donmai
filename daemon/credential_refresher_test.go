@@ -97,6 +97,306 @@ func testRefresherOptions(t *testing.T, url, workerID, jwt string) CredentialRef
 	}
 }
 
+func TestCredentialRefresher_ReloadReregistrationKeepsNewestProjection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	entered := make(chan string, 2)
+	releaseAlpha := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseAlpha:
+		default:
+			close(releaseAlpha)
+		}
+	}()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != RegisterEndpoint {
+			http.NotFound(w, request)
+			return
+		}
+		var body RegisterRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || len(body.ProjectIDs) != 1 {
+			t.Errorf("decode registration: %v, project IDs %v", err, body.ProjectIDs)
+			return
+		}
+		id := body.ProjectIDs[0]
+		entered <- id
+		if id == "alpha" {
+			select {
+			case <-releaseAlpha:
+			case <-request.Context().Done():
+				return
+			}
+		}
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_" + id, "runtimeToken": id + ".jwt"})
+	}))
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	r := NewCredentialRefresher(opts)
+	lane := &recordingLane{}
+	r.Attach(lane)
+	r.UpdateRegistrationProjects(nil, []string{"alpha"}, ProjectAdmissionModeEnumerated)
+	done := r.RequestReregister(ctx)
+	select {
+	case id := <-entered:
+		if id != "alpha" {
+			t.Fatalf("first registration = %q, want alpha", id)
+		}
+	case <-ctx.Done():
+		t.Fatal("alpha registration did not enter")
+	}
+	r.UpdateRegistrationProjects(nil, []string{"beta"}, ProjectAdmissionModeAllRouted)
+	r.RequestReregister(ctx)
+	close(releaseAlpha)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("coalesced registration did not finish")
+	}
+	select {
+	case id := <-entered:
+		if id != "beta" {
+			t.Fatalf("second registration = %q, want beta", id)
+		}
+	default:
+		t.Fatal("no follow-up registration used the newest projection")
+	}
+	if workerID, _ := r.Current(); workerID != "wkr_beta" {
+		t.Errorf("final refresher worker = %q, want beta", workerID)
+	}
+	if workerID, _, _ := lane.current(); workerID != "wkr_beta" {
+		t.Errorf("final attached lane worker = %q, want beta", workerID)
+	}
+}
+
+func TestCredentialRefresher_CanceledReloadLeavesQueuedOperation(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	var registerMu sync.Mutex
+	registerCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == RegisterEndpoint {
+			registerMu.Lock()
+			registerCount++
+			registerMu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_late", "runtimeToken": "late.jwt"})
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+	enteredValidation := make(chan struct{})
+	releaseValidation := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseValidation:
+		default:
+			close(releaseValidation)
+		}
+	}()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.ValidateRefresh = func(*RefreshTokenResult) error {
+		close(enteredValidation)
+		<-releaseValidation
+		return nil
+	}
+	r := NewCredentialRefresher(opts)
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := r.Refresh(ctx, "worker-not-found")
+		refreshDone <- err
+	}()
+	select {
+	case <-enteredValidation:
+	case <-ctx.Done():
+		t.Fatal("refresh did not reach validation")
+	}
+	reloadCtx, cancelReload := context.WithCancel(ctx)
+	done := r.RequestReregister(reloadCtx)
+	cancelReload()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("canceled reload stayed queued behind refresh")
+	}
+	registerMu.Lock()
+	gotRegisters := registerCount
+	registerMu.Unlock()
+	if gotRegisters != 0 {
+		t.Errorf("registration calls after canceled queued reload = %d, want zero", gotRegisters)
+	}
+	close(releaseValidation)
+	select {
+	case err := <-refreshDone:
+		if err != nil {
+			t.Fatalf("original refresh: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("original refresh did not finish")
+	}
+	if workerID, _ := r.Current(); workerID != "wkr_before" {
+		t.Errorf("worker after canceled reload = %q, want original identity", workerID)
+	}
+}
+
+func TestCredentialRefresher_CallbackCanQueueNewerProjection(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	seen := make(chan string, 2)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != RegisterEndpoint {
+			http.NotFound(w, request)
+			return
+		}
+		var body RegisterRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil || len(body.ProjectIDs) != 1 {
+			t.Errorf("decode registration: %v, project IDs %v", err, body.ProjectIDs)
+			return
+		}
+		id := body.ProjectIDs[0]
+		seen <- id
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_" + id, "runtimeToken": id + ".jwt"})
+	}))
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	var refresher *CredentialRefresher
+	opts.OnRefreshed = func(result *RefreshTokenResult) {
+		if result.WorkerID == "wkr_alpha" {
+			refresher.UpdateRegistrationProjects(nil, []string{"beta"}, ProjectAdmissionModeAllRouted)
+			refresher.RequestReregister(ctx)
+		}
+	}
+	refresher = NewCredentialRefresher(opts)
+	refresher.UpdateRegistrationProjects(nil, []string{"alpha"}, ProjectAdmissionModeEnumerated)
+	done := refresher.RequestReregister(ctx)
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("callback-queued follow-up registration deadlocked")
+	}
+	for _, want := range []string{"alpha", "beta"} {
+		select {
+		case got := <-seen:
+			if got != want {
+				t.Errorf("registration order = %q, want %q", got, want)
+			}
+		default:
+			t.Fatalf("missing %s registration", want)
+		}
+	}
+	if workerID, _ := refresher.Current(); workerID != "wkr_beta" {
+		t.Errorf("final worker = %q, want beta", workerID)
+	}
+}
+
+func TestCredentialRefresher_ProjectUpdatePreservesRegistrationAuthority(t *testing.T) {
+	opts := testRefresherOptions(t, "http://127.0.0.1:1", "wkr_before", "before.jwt")
+	opts.Registration.SessionShim = SessionShimStandDownAttestation()
+	opts.Registration.AuthOnly = true
+	opts.Registration.ValidateCredentials = func(string, string) error { return nil }
+	r := NewCredentialRefresher(opts)
+	r.UpdateRegistrationProjects(
+		[]ProjectAllowlistEntry{{ID: "beta", Repository: "github.com/x/beta"}},
+		[]string{"beta"},
+		ProjectAdmissionModeAllRouted,
+	)
+	r.mu.Lock()
+	got := r.opts.Registration
+	r.mu.Unlock()
+	if got.RegistrationToken != opts.Registration.RegistrationToken ||
+		got.OrchestratorURL != opts.Registration.OrchestratorURL ||
+		got.JWTPath != opts.Registration.JWTPath ||
+		got.HTTPClient != opts.Registration.HTTPClient ||
+		got.ValidateCredentials == nil || !got.AuthOnly || !got.SessionShim.StandsDown() {
+		t.Fatal("project update replaced non-project registration authority")
+	}
+	if len(got.ProjectIDs) != 1 || got.ProjectIDs[0] != "beta" ||
+		len(got.DaemonProjects) != 1 || got.DaemonProjects[0].ID != "beta" ||
+		got.ProjectAdmissionMode != ProjectAdmissionModeAllRouted {
+		t.Fatalf("updated project declaration = IDs %v, entries %+v, mode %q", got.ProjectIDs, got.DaemonProjects, got.ProjectAdmissionMode)
+	}
+}
+
+func TestCredentialRefresher_DeclareSessionShimSerializesCanceledReload(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	enteredDeclaration := make(chan struct{})
+	releaseDeclaration := make(chan struct{})
+	defer func() {
+		select {
+		case <-releaseDeclaration:
+		default:
+			close(releaseDeclaration)
+		}
+	}()
+	var registerMu sync.Mutex
+	registerCount := 0
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path == RegisterEndpoint {
+			registerMu.Lock()
+			registerCount++
+			registerMu.Unlock()
+			w.WriteHeader(http.StatusCreated)
+			_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_late", "runtimeToken": "late.jwt"})
+			return
+		}
+		close(enteredDeclaration)
+		select {
+		case <-releaseDeclaration:
+		case <-request.Context().Done():
+			return
+		}
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "declared.jwt"})
+	}))
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.SessionShim = SessionShimStandDownAttestation()
+	r := NewCredentialRefresher(opts)
+	declarationDone := make(chan error, 1)
+	go func() {
+		_, err := r.DeclareSessionShim(ctx, SessionShimStandDownAttestation(), "declaration-test")
+		declarationDone <- err
+	}()
+	select {
+	case <-enteredDeclaration:
+	case <-ctx.Done():
+		t.Fatal("session-shim declaration did not reach refresh endpoint")
+	}
+	reloadCtx, cancelReload := context.WithCancel(ctx)
+	done := r.RequestReregister(reloadCtx)
+	cancelReload()
+	select {
+	case <-done:
+	case <-ctx.Done():
+		t.Fatal("canceled reload remained behind session-shim declaration")
+	}
+	registerMu.Lock()
+	gotRegisters := registerCount
+	registerMu.Unlock()
+	if gotRegisters != 0 {
+		t.Errorf("registration calls while declaration held = %d, want zero", gotRegisters)
+	}
+	close(releaseDeclaration)
+	select {
+	case err := <-declarationDone:
+		if err != nil {
+			t.Fatalf("session-shim declaration: %v", err)
+		}
+	case <-ctx.Done():
+		t.Fatal("session-shim declaration did not finish")
+	}
+	if workerID, _ := r.Current(); workerID != "wkr_before" {
+		t.Errorf("worker after canceled reload = %q, want original identity", workerID)
+	}
+}
+
 // TestCredentialRefresher_EveryLaneSurvivesAReregistration is the structural
 // regression test for the worker re-registration loop.
 //

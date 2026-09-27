@@ -3,13 +3,136 @@ package daemon
 import (
 	"context"
 	"encoding/json"
+	"net/http"
+	"net/http/httptest"
 	"os"
 	"path/filepath"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 )
+
+func TestProjectMutationLaterRegistrationUsesPersistedProjection(t *testing.T) {
+	requests := make(chan RegisterRequest, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != RegisterEndpoint {
+			http.NotFound(w, r)
+			return
+		}
+		var request RegisterRequest
+		if err := json.NewDecoder(r.Body).Decode(&request); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		requests <- request
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_mutated", "runtimeToken": "mutated.jwt"})
+	}))
+	defer srv.Close()
+
+	d, _ := newTestDaemonWithProjects(t, []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}})
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	d.credentials = NewCredentialRefresher(opts)
+	if err := d.applyOneMutation(PendingMutation{
+		ID:     "mutation-beta",
+		Op:     "project.add",
+		Params: mustParams(t, map[string]string{"id": "beta", "repository": "github.com/x/beta"}),
+	}); err != nil {
+		t.Fatalf("apply project mutation: %v", err)
+	}
+	if _, err := d.credentials.Refresh(context.Background(), "worker-not-found"); err != nil {
+		t.Fatalf("later full registration: %v", err)
+	}
+	request := <-requests
+	if !slices.Equal(request.ProjectIDs, []string{"alpha", "beta"}) {
+		t.Errorf("registered IDs = %v, want alpha,beta", request.ProjectIDs)
+	}
+}
+
+func TestProjectMutationFailedPersistenceRetainsLastGoodProjection(t *testing.T) {
+	d, _ := newTestDaemonWithProjects(t, []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}})
+	d.config.ProjectAdmissionVersion = ProjectAdmissionVersionV2
+	d.config.EnabledProjectIDs = []string{"alpha"}
+	d.opts.ConfigPath = filepath.Join(t.TempDir(), "daemon.yaml")
+	if err := os.Mkdir(d.opts.ConfigPath, 0o700); err != nil {
+		t.Fatalf("create destination directory: %v", err)
+	}
+	opts := testRefresherOptions(t, "http://127.0.0.1:1", "wkr_before", "before.jwt")
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	d.credentials = NewCredentialRefresher(opts)
+	if err := d.applyOneMutation(PendingMutation{
+		ID:     "mutation-beta",
+		Op:     "project.enable",
+		Params: mustParams(t, map[string]string{"id": "beta"}),
+	}); err == nil {
+		t.Fatal("project mutation with an unwritable destination succeeded")
+	}
+	if got := d.config.EffectiveEnabledProjectIDs(); !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("in-memory project IDs after failed write = %v, want last-good alpha", got)
+	}
+	if got := d.credentials.opts.Registration.ProjectIDs; !slices.Equal(got, []string{"alpha"}) {
+		t.Errorf("registration project IDs after failed write = %v, want last-good alpha", got)
+	}
+}
+
+func TestProjectMutationRegistersOnlyAfterConfigPersistence(t *testing.T) {
+	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
+	defer cancel()
+	d, path := newTestDaemonWithProjects(t, []ProjectConfig{{ID: "alpha", Repository: "github.com/x/alpha"}})
+	seen := make(chan []string, 1)
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, request *http.Request) {
+		if request.URL.Path != RegisterEndpoint {
+			http.NotFound(w, request)
+			return
+		}
+		var body RegisterRequest
+		if err := json.NewDecoder(request.Body).Decode(&body); err != nil {
+			t.Errorf("decode registration: %v", err)
+			return
+		}
+		persisted, err := LoadConfig(path)
+		if err != nil || persisted == nil {
+			t.Errorf("read persisted config: %v", err)
+			return
+		}
+		if !slices.Equal(body.ProjectIDs, persisted.EffectiveEnabledProjectIDs()) {
+			t.Errorf("registered IDs %v differ from persisted IDs %v", body.ProjectIDs, persisted.EffectiveEnabledProjectIDs())
+		}
+		seen <- body.ProjectIDs
+		w.WriteHeader(http.StatusCreated)
+		_ = json.NewEncoder(w).Encode(map[string]any{"workerId": "wkr_mutated", "runtimeToken": "mutated.jwt"})
+	}))
+	defer srv.Close()
+	opts := testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt")
+	opts.Registration.JWTPath = ""
+	opts.Registration.ProjectIDs = []string{"alpha"}
+	d.credentials = NewCredentialRefresher(opts)
+	d.registrationReloadCtx = ctx
+	if err := d.applyOneMutation(PendingMutation{
+		ID:     "mutation-beta",
+		Op:     "project.add",
+		Params: mustParams(t, map[string]string{"id": "beta", "repository": "github.com/x/beta"}),
+	}); err != nil {
+		t.Fatalf("apply project mutation: %v", err)
+	}
+	if err := d.credentials.WaitReregister(ctx); err != nil {
+		t.Fatalf("registration after persisted mutation: %v", err)
+	}
+	select {
+	case ids := <-seen:
+		if !slices.Equal(ids, []string{"alpha", "beta"}) {
+			t.Errorf("registered IDs = %v, want alpha,beta", ids)
+		}
+	case <-ctx.Done():
+		t.Fatal("project mutation made no registration request")
+	}
+}
 
 // newTestDaemonWithProjects builds a minimal Daemon backed by a real
 // daemon.yaml in a temp dir so applyOneMutation's WriteConfig path

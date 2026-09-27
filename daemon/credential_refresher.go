@@ -32,9 +32,11 @@ package daemon
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"sync"
+	"time"
 )
 
 // CredentialLane is a long-lived service that presents worker credentials and
@@ -70,6 +72,14 @@ type CredentialRefresherOptions struct {
 type CredentialRefresher struct {
 	opts CredentialRefresherOptions
 
+	// operationSlot serializes network credential operations and remains
+	// cancelable while a caller waits behind another operation.
+	operationSlot chan struct{}
+	reloadMu      sync.Mutex
+	reloadRunning bool
+	reloadNext    bool
+	reloadDone    chan struct{}
+
 	mu         sync.Mutex
 	workerID   string
 	runtimeJWT string
@@ -79,11 +89,14 @@ type CredentialRefresher struct {
 // NewCredentialRefresher constructs a refresher seeded with the credentials a
 // registration just produced.
 func NewCredentialRefresher(opts CredentialRefresherOptions) *CredentialRefresher {
-	return &CredentialRefresher{
-		opts:       opts,
-		workerID:   opts.WorkerID,
-		runtimeJWT: opts.RuntimeJWT,
+	r := &CredentialRefresher{
+		opts:          opts,
+		operationSlot: make(chan struct{}, 1),
+		workerID:      opts.WorkerID,
+		runtimeJWT:    opts.RuntimeJWT,
 	}
+	r.operationSlot <- struct{}{}
+	return r
 }
 
 // Attach registers lanes to receive every future refresh. Nil lanes are
@@ -116,6 +129,141 @@ func (r *CredentialRefresher) Current() (workerID, runtimeJWT string) {
 	return r.workerID, r.runtimeJWT
 }
 
+func (r *CredentialRefresher) claimOperation(ctx context.Context) error {
+	if ctx == nil {
+		return errors.New("credential operation context is nil")
+	}
+	select {
+	case <-ctx.Done():
+		return ctx.Err()
+	case <-r.operationSlot:
+		if err := ctx.Err(); err != nil {
+			r.releaseOperation()
+			return err
+		}
+		return nil
+	}
+}
+
+func (r *CredentialRefresher) releaseOperation() {
+	r.operationSlot <- struct{}{}
+}
+
+// UpdateRegistrationProjects replaces only the project-derived declaration.
+// The other registration fields, including credentials, session-shim posture,
+// executor capabilities, and controller validation, retain their current value.
+func (r *CredentialRefresher) UpdateRegistrationProjects(entries []ProjectAllowlistEntry, ids []string, mode string) {
+	r.mu.Lock()
+	r.opts.Registration.DaemonProjects = append([]ProjectAllowlistEntry(nil), entries...)
+	r.opts.Registration.ProjectIDs = append([]string(nil), ids...)
+	r.opts.Registration.ProjectAdmissionMode = mode
+	r.mu.Unlock()
+}
+
+// Reregister sends the latest project declaration and publishes the resulting
+// identity to every credential lane. It is serialized with both ordinary
+// refresh and session-shim declaration operations.
+func (r *CredentialRefresher) Reregister(ctx context.Context) (*RefreshTokenResult, error) {
+	if err := r.claimOperation(ctx); err != nil {
+		return nil, err
+	}
+	defer r.releaseOperation()
+
+	r.mu.Lock()
+	registration := r.opts.Registration
+	current := r.workerID
+	r.mu.Unlock()
+	registration.ForceReregister = true
+	response, err := Register(ctx, registration)
+	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	result := &RefreshTokenResult{
+		Mode:                     "reregister",
+		WorkerID:                 response.WorkerID,
+		RuntimeToken:             response.RuntimeToken,
+		RuntimeTokenExpiresAt:    response.RuntimeTokenExpiresAt,
+		HeartbeatInterval:        response.HeartbeatInterval,
+		PollInterval:             response.PollInterval,
+		SessionShim:              cloneSessionShimCredentialReceipt(response.SessionShim),
+		RegistrationTokenSwapped: response.WorkerID != current,
+		Reason:                   "project-reload",
+	}
+	return r.adopt(result, registration)
+}
+
+// RequestReregister coalesces bursts into one in-flight registration and at
+// most one follow-up using the most recent project declaration. ctx belongs
+// to the daemon lifecycle; cancellation prevents queued or late adoption.
+func (r *CredentialRefresher) RequestReregister(ctx context.Context) <-chan struct{} {
+	if ctx == nil || ctx.Err() != nil {
+		done := make(chan struct{})
+		close(done)
+		return done
+	}
+	r.reloadMu.Lock()
+	if r.reloadRunning {
+		r.reloadNext = true
+		done := r.reloadDone
+		r.reloadMu.Unlock()
+		return done
+	}
+	r.reloadRunning = true
+	r.reloadDone = make(chan struct{})
+	done := r.reloadDone
+	r.reloadMu.Unlock()
+
+	go func() {
+		for {
+			operationCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+			_, err := r.Reregister(operationCtx)
+			cancel()
+			if err != nil && ctx.Err() == nil {
+				// Registration errors may include an upstream response body. Keep
+				// credential-bearing bytes out of the daemon log.
+				slog.Warn("[runtime-token] project registration refresh failed", "errorType", fmt.Sprintf("%T", err))
+			}
+			r.reloadMu.Lock()
+			if r.reloadNext && ctx.Err() == nil {
+				r.reloadNext = false
+				r.reloadMu.Unlock()
+				continue
+			}
+			r.reloadRunning = false
+			r.reloadNext = false
+			close(done)
+			r.reloadMu.Unlock()
+			return
+		}
+	}()
+	return done
+}
+
+// WaitReregister joins any queued project reload before daemon shutdown
+// publishes a terminal state. A canceled ctx bounds the wait.
+func (r *CredentialRefresher) WaitReregister(ctx context.Context) error {
+	r.reloadMu.Lock()
+	done := r.reloadDone
+	r.reloadMu.Unlock()
+	if done == nil {
+		return nil
+	}
+	select {
+	case <-done:
+		return nil
+	default:
+	}
+	select {
+	case <-done:
+		return nil
+	case <-ctx.Done():
+		return ctx.Err()
+	}
+}
+
 // Refresh re-mints the runtime credentials and brings every attached lane onto
 // the result.
 //
@@ -124,6 +272,10 @@ func (r *CredentialRefresher) Current() (workerID, runtimeJWT string) {
 // the scheduled refresher. It is passed through to RefreshRuntimeToken, which
 // owns the decision of whether the existing registration can be re-presented.
 func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*RefreshTokenResult, error) {
+	if err := r.claimOperation(ctx); err != nil {
+		return nil, err
+	}
+	defer r.releaseOperation()
 	r.mu.Lock()
 	current := r.workerID
 	registration := r.opts.Registration
@@ -131,6 +283,9 @@ func (r *CredentialRefresher) Refresh(ctx context.Context, reason string) (*Refr
 
 	result, err := RefreshRuntimeToken(ctx, registration, current, reason)
 	if err != nil {
+		return nil, err
+	}
+	if err := ctx.Err(); err != nil {
 		return nil, err
 	}
 	return r.adopt(result, registration)
@@ -215,6 +370,10 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	attestation SessionShimHostAttestation,
 	reason string,
 ) (*RefreshTokenResult, error) {
+	if err := r.claimOperation(ctx); err != nil {
+		return nil, err
+	}
+	defer r.releaseOperation()
 	r.mu.Lock()
 	previous := cloneSessionShimHostAttestation(r.opts.Registration.SessionShim)
 	r.opts.Registration.SessionShim = cloneSessionShimHostAttestation(attestation)
@@ -233,7 +392,10 @@ func (r *CredentialRefresher) DeclareSessionShim(
 	// feature the caller was merely offering.
 	result, err := RepresentRuntimeToken(ctx, registration, current, reason)
 	if err == nil {
-		result, err = r.adopt(result, registration)
+		err = ctx.Err()
+		if err == nil {
+			result, err = r.adopt(result, registration)
+		}
 	}
 	if err != nil {
 		r.mu.Lock()
