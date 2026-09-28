@@ -14,7 +14,7 @@ func TestArchAssessRequireDiff(t *testing.T) {
 	t.Cleanup(func() { runGhPRView, runGhPRDiff = origView, origDiff })
 	t.Setenv("DONMAI_ARCH_BIN", "")
 	t.Setenv("PATH", t.TempDir())
-	const metadata = `{"title":"Change","body":"","files":[{"path":"src/auth/login.ts","additions":1,"deletions":0}]}`
+	const metadata = `{"title":"Change","body":"","changedFiles":1,"files":[{"path":"src/auth/login.ts","additions":1,"deletions":0}]}`
 	const patch = "diff --git a/src/auth/login.ts b/src/auth/login.ts\n@@ -0,0 +1 @@\n+const r: Result<User, Error> = ok(user)\n"
 	tests := []struct {
 		name    string
