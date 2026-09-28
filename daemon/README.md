@@ -328,9 +328,10 @@ commands):
 - **Per install** — `donmai kit install <id> --allow-unsigned` sends
   `trustOverride: "allowed-this-once"`; the bypass is audit-logged with the
   kit id, signer, and configured `trust.actor`.
-- **Globally** — set `trust.mode: permissive` in `daemon.yaml`, or export
-  `DONMAI_KIT_TRUST_MODE=permissive` before starting the daemon. Permissive
-  mode logs a prominent warning on every gated install.
+- **Globally** — set `trust.mode: permissive` in `daemon.yaml`. Permissive
+  mode logs a prominent warning on every gated install. Setting
+  `DONMAI_KIT_TRUST_MODE=permissive` alone leaves the signed-by-allowlist
+  default in force and logs a warning.
 
 `donmai kit verify <id>` shows one of `package-verified`,
 `package-signed-unverified`, `legacy-manifest-verified`,

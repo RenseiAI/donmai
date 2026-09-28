@@ -765,21 +765,38 @@ func TestKitRegistryOrEmpty_DefaultTrustBlocksInstall(t *testing.T) {
 	if !errors.Is(err, ErrKitTrustGateRejected) {
 		t.Fatalf("Install of unsigned kit: want ErrKitTrustGateRejected, got %v", err)
 	}
-	for _, want := range []string{"trust.issuerSet", envKitTrustMode} {
+	for _, want := range []string{"trust.issuerSet", "trust.mode: permissive"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("Install error: want substring %q, got: %s", want, err.Error())
 		}
 	}
 }
 
-// TestKitRegistryOrEmpty_EnvOptOutPermissive pins the operator opt-out:
-// DONMAI_KIT_TRUST_MODE=permissive restores a fully-working permissive
-// registry on an unconfigured daemon.
-func TestKitRegistryOrEmpty_EnvOptOutPermissive(t *testing.T) {
+// TestKitRegistryOrEmpty_EnvPermissiveCannotDowngrade pins the no-config
+// install path when the environment asks for permissive mode.
+func TestKitRegistryOrEmpty_EnvPermissiveCannotDowngrade(t *testing.T) {
 	t.Setenv(envKitTrustMode, string(TrustModePermissive))
 	s := &Server{}
-	if _, ok := s.kitRegistryOrEmpty().(*KitRegistry); !ok {
-		t.Fatalf("registry type = %T, want *KitRegistry under env opt-out", s.kitReg)
+	reg, ok := s.kitRegistryOrEmpty().(*KitRegistry)
+	if !ok {
+		t.Fatalf("registry type = %T, want *KitRegistry", s.kitReg)
+	}
+	if got := reg.TrustConfig().Mode; got != TrustModeSignedByAllowlist {
+		t.Fatalf("trust mode = %q, want %q", got, TrustModeSignedByAllowlist)
+	}
+	repoURL := newLocalGitFixture(t, fixtureFile{name: "rensei-example.kit.toml", body: minimalKitTOML})
+	_, err := reg.Install("rensei/example", afclient.KitInstallRequest{
+		Source: &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+	})
+	if !errors.Is(err, ErrKitTrustGateRejected) {
+		t.Fatalf("unsigned install: want ErrKitTrustGateRejected, got %v", err)
+	}
+	res, err := reg.Install("rensei/example", afclient.KitInstallRequest{
+		Source:        &afclient.KitInstallSource{Kind: "git", URL: repoURL},
+		TrustOverride: afclient.TrustOverrideAllowedThisOnce,
+	})
+	if err != nil || res.Kit.ID != "rensei/example" {
+		t.Fatalf("explicit per-install override: result %v, err %v", res, err)
 	}
 }
 

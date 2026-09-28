@@ -22,7 +22,7 @@
 //   - permissive            — verifier still runs and reports state, but
 //     never blocks Install. Was the OSS default per Q2 of WAVE12_PLAN;
 //     replaced by signed-by-allowlist as the compiled-in default (secfix).
-//     Opt in via DONMAI_KIT_TRUST_MODE=permissive or daemon.yaml trust.mode.
+//     Opt in via daemon.yaml trust.mode.
 //   - signed-by-allowlist   — Install rejects KitTrustUnsigned and
 //     KitTrustSignedUnverified. Compiled-in default (resolveDefaultTrustMode).
 //   - attested              — same as allowlist for Wave 12 (the SLSA
@@ -132,8 +132,7 @@ const (
 	// NOTE: permissive is no longer the compiled-in default. The daemon
 	// now defaults to TrustModeSignedByAllowlist. Operators who knowingly
 	// accept unsigned-kit risk can opt back to permissive by setting
-	// DONMAI_KIT_TRUST_MODE=permissive or by setting trust.mode in
-	// daemon.yaml explicitly.
+	// trust.mode in daemon.yaml explicitly.
 	TrustModePermissive TrustMode = "permissive"
 	// TrustModeSignedByAllowlist rejects unsigned and unverified kits at
 	// install time; verified-signed kits whose signer matches the
@@ -143,7 +142,7 @@ const (
 	// resolveDefaultTrustMode and kitRegistryOrEmpty). An empty IssuerSet
 	// under this mode is treated as a misconfiguration: the daemon refuses
 	// to install any kit until the operator either populates trust.issuerSet
-	// or explicitly sets DONMAI_KIT_TRUST_MODE=permissive.
+	// or explicitly sets trust.mode: permissive in daemon.yaml.
 	TrustModeSignedByAllowlist TrustMode = "signed-by-allowlist"
 	// TrustModeAttested is allowlist + (future) SLSA attestation-graph
 	// requirement. Wave 12 treats it as an alias for allowlist; the
@@ -152,18 +151,14 @@ const (
 	TrustModeAttested TrustMode = "attested"
 )
 
-// envKitTrustMode is the environment-variable name operators can set to
-// opt out of the secure default trust mode. Setting it to "permissive"
-// re-enables unsigned-kit installs; any other recognised TrustMode value
-// overrides the compiled-in default. This mirrors the
-// DONMAI_ORCHESTRATOR_URL / DONMAI_DAEMON_TOKEN env-override pattern
-// used by config.go.
+// envKitTrustMode can select a strict default when daemon.yaml has no
+// trust.mode. It cannot lower the compiled-in default to permissive.
 const envKitTrustMode = "DONMAI_KIT_TRUST_MODE"
 
 // resolveDefaultTrustMode returns the effective default TrustMode when
 // daemon.yaml has no explicit trust.mode set. The compiled-in default is
-// TrustModeSignedByAllowlist; operators may override it via the
-// DONMAI_KIT_TRUST_MODE environment variable.
+// TrustModeSignedByAllowlist; the environment may select a recognised
+// non-permissive mode, but permissive requires explicit daemon.yaml config.
 //
 // This function is used by kitRegistryOrEmpty (handle_kit.go) and by
 // applyDefaults (config.go) so that all code paths that fill in a missing
@@ -171,13 +166,12 @@ const envKitTrustMode = "DONMAI_KIT_TRUST_MODE"
 func resolveDefaultTrustMode() TrustMode {
 	if v := os.Getenv(envKitTrustMode); v != "" {
 		switch TrustMode(v) {
-		case TrustModePermissive, TrustModeSignedByAllowlist, TrustModeAttested:
+		case TrustModeSignedByAllowlist, TrustModeAttested:
 			return TrustMode(v)
+		case TrustModePermissive:
+			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE=permissive cannot lower the default; set trust.mode: permissive in daemon.yaml for a deliberate global policy")
 		default:
-			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE value unrecognised; falling back to signed-by-allowlist", //nolint:gosec // structured slog handler escapes values
-				"value", v,
-				"recognised", []string{string(TrustModePermissive), string(TrustModeSignedByAllowlist), string(TrustModeAttested)},
-			)
+			slog.Warn("kit trust: DONMAI_KIT_TRUST_MODE value unrecognised; falling back to signed-by-allowlist")
 		}
 	}
 	return TrustModeSignedByAllowlist
@@ -190,7 +184,7 @@ type TrustConfig struct {
 	// Mode is one of permissive | signed-by-allowlist | attested.
 	// Empty defaults to signed-by-allowlist (via resolveDefaultTrustMode).
 	// Operators who need unsigned-kit installs can set mode: permissive
-	// in daemon.yaml or export DONMAI_KIT_TRUST_MODE=permissive.
+	// in daemon.yaml.
 	Mode TrustMode `yaml:"mode,omitempty" json:"mode,omitempty"`
 
 	// IssuerSet is the allowlist of OIDC subject identities (Fulcio SAN)
@@ -271,9 +265,9 @@ func validateTrustConfig(cfg TrustConfig) error {
 			return fmt.Errorf(
 				"kit trust: mode %q requires a non-empty trust.issuerSet "+
 					"(an empty allowlist would accept any OIDC-signed kit); "+
-					"populate trust.issuerSet in daemon.yaml or set %s=permissive "+
+					"populate trust.issuerSet or set trust.mode: permissive in daemon.yaml "+
 					"to explicitly opt in to permissive mode",
-				cfg.Mode, envKitTrustMode,
+				cfg.Mode,
 			)
 		}
 	}
@@ -303,8 +297,8 @@ func trustGateRejectionError(id string, verifyResult afclient.KitSignatureResult
 		"%s: %v: kit is %s (signer: %s) and trust mode %q only installs signed kits from allowlisted signers. "+
 			"To proceed: add the kit's signer to trust.issuerSet in daemon.yaml, "+
 			"re-run the install with a one-time override (donmai kit install --allow-unsigned, audit-logged), "+
-			"or set %s=permissive / trust.mode: permissive to disable the gate entirely (not recommended)",
-		id, ErrKitTrustGateRejected, verifyResult.Trust, signer, mode, envKitTrustMode,
+			"or set trust.mode: permissive in daemon.yaml to disable the gate entirely (not recommended)",
+		id, ErrKitTrustGateRejected, verifyResult.Trust, signer, mode,
 	)
 	return &kitTrustGateError{message: message, result: verifyResult}
 }
@@ -551,7 +545,7 @@ func signerIDFromVerifyError(entity verify.SignedEntity) string {
 // guard.
 func (v *kitVerifier) trustGateAllows(trust afclient.KitTrustState) bool {
 	if v.config.Mode == TrustModePermissive {
-		slog.Warn("kit trust: PERMISSIVE mode is active — unsigned kits and kits from any OIDC issuer will be allowed to execute shell commands; set trust.mode: signed-by-allowlist or remove DONMAI_KIT_TRUST_MODE=permissive to enforce signature verification",
+		slog.Warn("kit trust: PERMISSIVE mode is active — unsigned kits and kits from any OIDC issuer will be allowed to execute shell commands; set trust.mode: signed-by-allowlist in daemon.yaml to enforce signature verification",
 			"trustState", string(trust),
 		)
 	}
