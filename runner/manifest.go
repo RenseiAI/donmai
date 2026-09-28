@@ -80,6 +80,21 @@ var ErrNoInlineManifest = errors.New("runner: no inline turn-result manifest")
 // `.agent/turn-result.json`. Case-insensitive with flexible internal/leading
 // whitespace; the balanced-brace scan that follows starts at the first `{`
 // after the label.
+//
+// Deliberately NOT line-anchored, unlike the WORK_RESULT verdict markers:
+//   - The platform recovers the same inline block from the posted summary
+//     with the same unanchored label when the runner posts no manifest.
+//     Anchoring only here would make the two disagree about the same text: a
+//     mid-line block the runner rejects would still be read downstream as the
+//     turn's structured result.
+//   - Stage prompts render the line in markdown (inline code, list items), so
+//     a strict line-start anchor would drop legitimate manifests.
+//   - A match alone is not a verdict. The label must be followed by a
+//     schema-valid JSON manifest (schemaVersion + an enumerated verdict), which
+//     prose that merely mentions the label does not supply.
+//
+// Anchoring it is a paired change with the platform-side reader, not a
+// runner-only one.
 var inlineManifestLabelRE = regexp.MustCompile(`(?i)intended\s+manifest\s*:`)
 
 // TurnManifest is the deterministic turn-outcome the agent writes to

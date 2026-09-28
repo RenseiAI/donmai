@@ -286,6 +286,38 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
 		},
 		{
+			name: "AGENT_BLOCKED line alone downgrades a stale passed manifest",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "Opening the PR needs a decision first.\nAGENT_BLOCKED: need a product decision on the migration"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+		},
+		{
+			name: "the follow-up's last anchored marker decides: a final blocked after a passed downgrades",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "WORK_RESULT: passed\nOn reflection the migration needs a product decision.\nWORK_RESULT: blocked"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+		},
+		{
+			name: "same-verdict follow-up marker keeps the stale manifest and its summary",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: followUpPR + "\nWORK_RESULT: failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "no manifest: a failed marker quoted in prose is not a verdict",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: "The last run reported WORK_RESULT: failed, so I re-ran it. " + followUpPR},
+			},
+			want: verdictWant{status: "completed", pr: followUpPR, wantSteering: true},
+		},
+		{
 			name: "identical-content rewrite during the follow-up counts as the follow-up's manifest",
 			turns: []verdictScriptTurn{
 				{manifest: passedManifest, text: "All done."},
@@ -375,6 +407,14 @@ func TestRun_TurnVerdictAcrossMemoryInjectFollowUp(t *testing.T) {
 				{text: "Looked again with the recalled context.\nWORK_RESULT:passed"},
 			},
 			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed"},
+		},
+		{
+			name: "no manifest: a passed marker quoted in the memory-inject follow-up never upgrades the anchored failed verdict",
+			turns: []verdictScriptTurn{
+				{text: "The regression reproduces.\nWORK_RESULT:failed"},
+				{text: "The recalled note says WORK_RESULT: passed only after the fix lands; it has not."},
+			},
+			want: verdictWant{status: "completed", workResult: "failed"},
 		},
 		{
 			name: "stale passed manifest never upgrades the memory-inject follow-up's failed verdict",

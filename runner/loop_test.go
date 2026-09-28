@@ -401,7 +401,8 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 }
 
 // TestObserveEvent_ScansWorkResultMarker confirms the loop's
-// AssistantText scanner reads the WORK_RESULT:passed/failed marker.
+// AssistantText scanner reads a line-anchored WORK_RESULT:passed/failed/
+// unknown marker (last one wins) and ignores one quoted in prose.
 func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	cases := []struct {
 		text string
@@ -409,7 +410,16 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	}{
 		{"WORK_RESULT:passed", "passed"},
 		{"<!-- WORK_RESULT:failed -->", "failed"},
-		{"some text WORK_RESULT: passed and more", "passed"},
+		{"Summary of the work.\n  WORK_RESULT: failed", "failed"},
+		{"WORK_RESULT unknown", "unknown"},
+		{"WORK_RESULT:passed\nre-checked\nWORK_RESULT:failed", "failed"},
+		// Line-anchored only (the platform sentinel's rule): a marker quoted
+		// in prose, or split across a line break, is not a verdict.
+		{"some text WORK_RESULT: passed and more", ""},
+		{"final message <!-- WORK_RESULT:passed -->", ""},
+		{"I am not claiming WORK_RESULT: passed yet", ""},
+		{"WORK_RESULT:\npassed", ""},
+		{"WORK_RESULT:blocked", ""},
 		{"no marker here", ""},
 	}
 	for _, tc := range cases {
@@ -576,10 +586,10 @@ func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
 	h := newRunnerHarness(t)
 	obs := &streamObservation{}
 	wt := t.TempDir()
-	for _, text := range []string{"first message", "  \n\t", "final message <!-- WORK_RESULT:passed -->"} {
+	for _, text := range []string{"first message", "  \n\t", "final message\n<!-- WORK_RESULT:passed -->"} {
 		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
 	}
-	if want := "final message <!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
+	if want := "final message\n<!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
 		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
 	}
 	if obs.workResult != "passed" {

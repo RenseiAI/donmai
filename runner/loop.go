@@ -2506,15 +2506,18 @@ func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPS
 
 // scanWorkResult scans the assistant text for the WORK_RESULT marker
 // the platform expects (per F.0.1 §1). Returns "passed" / "failed" /
-// "" matching the wire shape; whitespace and surrounding HTML comments
-// are tolerated.
+// "unknown" / "" matching the wire shape.
+//
+// The marker counts only when it is LINE-ANCHORED — at the start of a line,
+// modulo leading blanks and an optional opening HTML-comment fence
+// ("WORK_RESULT:passed", "  WORK_RESULT: failed", "<!-- WORK_RESULT:passed -->")
+// — the same rule the platform's sentinel reader applies. A marker merely
+// quoted in prose ("I am not claiming WORK_RESULT: passed") is ignored, so it
+// can never set the verdict that drives the post-session transition of
+// result-sensitive work. When a text carries several anchored markers the
+// LAST one wins (the agent's final word).
 func scanWorkResult(text string) string {
-	// Match "WORK_RESULT:passed", "WORK_RESULT:failed",
-	// "<!-- WORK_RESULT:passed -->" etc.
-	if loc := workResultRE.FindStringSubmatch(text); loc != nil {
-		return strings.ToLower(loc[1])
-	}
-	return ""
+	return lastAnchoredVerdict(workResultRE, text)
 }
 
 // scanLineVerdict returns the verdict of the LAST line-anchored WORK_RESULT
@@ -2523,7 +2526,13 @@ func scanWorkResult(text string) string {
 // opening HTML-comment fence), so prose that merely mentions a marker is
 // ignored.
 func scanLineVerdict(text string) string {
-	matches := workResultLineRE.FindAllStringSubmatch(text, -1)
+	return lastAnchoredVerdict(workResultLineRE, text)
+}
+
+// lastAnchoredVerdict returns the lower-cased verdict captured by the LAST
+// match of a line-anchored marker regex in text, or "" when none matches.
+func lastAnchoredVerdict(re *regexp.Regexp, text string) string {
+	matches := re.FindAllStringSubmatch(text, -1)
 	if len(matches) == 0 {
 		return ""
 	}
@@ -2595,7 +2604,7 @@ func scanBlocked(text string) (string, bool) {
 }
 
 var (
-	workResultRE = regexp.MustCompile(`(?i)WORK_RESULT[:\s]+(passed|failed|unknown)`)
+	workResultRE = regexp.MustCompile(workResultLinePrefix + `(passed|failed|unknown)`)
 	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
 	// workResultBlockedRE matches the verdict-marker decline form. Kept
 	// separate from workResultRE so the existing passed/failed/unknown
@@ -2610,11 +2619,17 @@ var (
 	agentBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?AGENT_BLOCKED[:\s]+([^\r\n]+)`)
 )
 
-// workResultLineRE is the line-anchored verdict marker: start of a line,
-// optional blanks and HTML-comment fence, then `WORK_RESULT:<verdict>`,
-// `WORK_RESULT: <verdict>` or `WORK_RESULT <verdict>` on the SAME line (the
-// separator never crosses a newline).
-var workResultLineRE = regexp.MustCompile(`(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)(passed|failed|blocked)`)
+// workResultLinePrefix is the single anchoring rule for every WORK_RESULT
+// verdict read: start of a line, optional blanks and HTML-comment fence, then
+// `WORK_RESULT:`, `WORK_RESULT: ` or `WORK_RESULT ` with the verdict on the
+// SAME line (the separator never crosses a newline). Both workResultRE (the
+// wire verdict: passed|failed|unknown) and workResultLineRE (the follow-up
+// override: passed|failed|blocked) are built from it.
+const workResultLinePrefix = `(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)`
+
+// workResultLineRE is the line-anchored verdict marker the step 11·M
+// override reads (passed|failed|blocked).
+var workResultLineRE = regexp.MustCompile(workResultLinePrefix + `(passed|failed|blocked)`)
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.
