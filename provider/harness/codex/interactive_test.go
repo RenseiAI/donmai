@@ -895,7 +895,14 @@ func TestProvider_Spawn_PreparedInteractiveConsumesSoleAuthorityBeforePTY(t *tes
 			go fs.run(t, "thread-prepared-interactive")
 			workdir := t.TempDir()
 			marker := filepath.Join(workdir, "spawned")
-			bin := writeFakeCodexScript(t, `touch "$PWD/spawned"; echo "tui up"; sleep 0.1`)
+			bin := writeFakeCodexScript(t, `echo "READY_SHELL_BEGIN"
+if touch "$PWD/spawned"; then
+  echo "READY_TOUCH_OK"
+else
+  echo "READY_TOUCH_FAILED:$?"
+fi
+echo "tui up"
+sleep 0.1`)
 			p, err := New(Options{skipProcess: true, stdinOverride: stdinW, stdoutOverride: stdoutR, CodexBin: bin})
 			if err != nil {
 				fs.close()
@@ -953,12 +960,61 @@ func TestProvider_Spawn_PreparedInteractiveConsumesSoleAuthorityBeforePTY(t *tes
 				}
 				t.Cleanup(func() { _ = h.Stop(context.Background()) })
 				deadline := time.Now().Add(5 * time.Second)
+				var terminal *agent.ResultEvent
+				events := h.Events()
 				for {
-					if _, statErr := os.Stat(marker); statErr == nil {
+					_, statErr := os.Stat(marker)
+					if statErr == nil {
 						break
 					}
+					// Observing events adds work to this poll, so it can change scheduling.
+					// The driver buffers both events; this read is only for the receipt,
+					// not to unblock terminal delivery or change the marker criterion.
+					select {
+					case ev, ok := <-events:
+						if !ok {
+							events = nil
+						} else if result, ok := ev.(agent.ResultEvent); ok {
+							terminal = &result
+						}
+					default:
+					}
 					if time.Now().After(deadline) {
-						t.Fatal("prepared interactive PTY marker was not created")
+						// The snapshot is read only after failure, so normal marker timing
+						// still follows the original poll and five-second bound.
+						var snapshotText string
+						interactive, ok := h.(agent.InteractiveCapable)
+						if !ok {
+							snapshotText = "interactive session unavailable"
+						} else {
+							screen, _, snapshotErr := interactive.InteractiveSession().Snapshot()
+							if snapshotErr != nil {
+								snapshotText = fmt.Sprintf("snapshot error: %v", snapshotErr)
+							} else {
+								var rendered strings.Builder
+								for _, row := range screen.Scrollback {
+									for _, cell := range row {
+										rendered.Write(cell.RuneBytes)
+									}
+									rendered.WriteByte('\n')
+								}
+								for _, cell := range screen.Primary {
+									rendered.Write(cell.RuneBytes)
+								}
+								snapshotText = strings.TrimSpace(rendered.String())
+							}
+						}
+						touch := "unobserved"
+						if strings.Contains(snapshotText, "READY_TOUCH_OK") {
+							touch = "ok"
+						} else if strings.Contains(snapshotText, "READY_TOUCH_FAILED:") {
+							touch = "failed"
+						}
+						shellBegin := strings.Contains(snapshotText, "READY_SHELL_BEGIN")
+						if len(snapshotText) > 2048 {
+							snapshotText = snapshotText[len(snapshotText)-2048:]
+						}
+						t.Fatalf("prepared interactive PTY marker was not created: stat=%v shell_begin=%t touch=%s terminal=%+v PTY snapshot=%q", statErr, shellBegin, touch, terminal, snapshotText)
 					}
 					time.Sleep(10 * time.Millisecond)
 				}
