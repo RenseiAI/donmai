@@ -351,6 +351,80 @@ not a proof: anyone with write access can post a commit status, so the trust
 anchor remains the credential that landed the commit. Turn the lane off by
 setting `FAST_LANE` to anything other than `on` or deleting it.
 
+### Fast-lane ship (`make ship`)
+
+While `FAST_LANE` is `on`, one command takes a change from a worktree to a
+published release, replacing the release-preparation pull request and the
+manual tag steps above. It is for an operator with admin rights on this
+repository, run from a linked worktree whose branch holds the change (or
+nothing, to release `main` as it is):
+
+```bash
+make ship DRY_RUN=1        # every read-only check, the composed CHANGELOG, the guard; changes nothing
+make ship                  # next patch version
+make ship VERSION=v0.73.0  # a minor release
+make ship FULL=1           # also make vuln and make release-dry-run
+```
+
+`scripts/fast-ship.sh` then:
+
+1. **Refuses** before anything changes (exit 3) unless:
+   - `FAST_LANE` is exactly `on`. A repository variable of the same name wins
+     over the organization one, as in the workflows.
+   - The `gh` login is a repository admin.
+   - It runs in a linked worktree on a branch, never the primary checkout or
+     `main`, and the branch name passes guard-b.
+   - The tree is clean, and HEAD contains fresh `origin/main`. The remote
+     branch holds nothing HEAD lacks.
+   - The version is the smallest increment from the latest `origin` tag, with
+     no tag and no GitHub release yet.
+   - The tag signer is ready.
+2. **Composes** the CHANGELOG section. An existing `## vX.Y.Z` section wins,
+   then the `## [Unreleased]` entries. Otherwise it composes one from the
+   subjects landed since the last tag plus this change's title. It runs
+   `guard-b-lint.sh --stdin` over the squashed commit message, the section,
+   and those subjects, which are what GoReleaser turns into the release
+   notes. A violation is a refusal.
+3. **Runs the gates**, stopping at the first red:
+   - the guard self-tests;
+   - `guard-b-lint.sh` over every file that differs from `origin/main`
+     (`--staged` would see only the index);
+   - the attach-path listener check;
+   - `make lint` (gofumpt included) and `make test-tagged`;
+   - `go test -race ./...` in a Linux podman container
+     (`scripts/podman-go-test.sh`, also `make test-podman`), so the daemon
+     install tests never touch the host's service;
+   - `make build`.
+
+   A red gate restores the files the script edited and lands nothing.
+4. **Lands** exactly the tested tree as one commit on `origin/main`:
+   - The branch's commits are squashed. The message is the open pull
+     request's title and body, the single commit's message, or `TITLE=`. It
+     carries `Local-Verify-Host`, `Local-Verify-Gates`, `Local-Verify-Duration`
+     and `Fast-Lane: on` trailers, and passes guard-b.
+   - The commit is pushed to the branch. The `local-verify` status is posted
+     on that SHA and read back, and the gate lines go in a comment on the open
+     pull request.
+   - `main` is fast-forwarded (`git push origin <sha>:refs/heads/main`, never
+     forced). If `main` moved during the gates, it stops without landing; run
+     it again.
+5. **Tags** `vX.Y.Z` at that SHA:
+   - Until the central tagging identity is live, the operator's registered
+     signing key signs it (`TAGGER=local`, the default while the pins are
+     unset), with the preflight and candidate verification above.
+   - Once the pins are set, an operator-signed tag is refused by
+     `release-authority`, so the script requires `TAGGER=central`. It
+     dispatches the central tagging workflow with the repository, SHA and
+     version, and waits for the tag at that SHA.
+   - Either way, GitHub must report the tag signature verified, or the script
+     stops. The tag is immutable, so the fix is the next patch.
+6. **Watches** the `release.yml` run to success, the published GitHub
+   release, and `Casks/donmai.rb` moving to the new version. The fast-lane job
+   skips `harness-smoke` because the SHA is attested. The worker-image and E2B
+   workflows run alongside, unchanged. `NO_WATCH=1` stops after the tag.
+
+Verify the release as below; roll back by publishing the next patch.
+
 ## Retry a release workflow
 
 Each publisher supports a manual retry only for an existing explicit release

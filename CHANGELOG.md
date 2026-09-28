@@ -19,6 +19,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   variable is `on` and the tagged commit carries a successful `local-verify`
   status, the remote smoke re-run is skipped; every signing, notarization,
   provenance, and publication step still runs.
+- `make ship` takes a change from a worktree to a published release while the
+  fast lane is on: local gates with the test suite in a Linux podman
+  container (`make test-podman`), a guard-b check of everything it publishes,
+  the `local-verify` attestation, a fast-forward of `main`, a signed tag at
+  that commit, and a watch of the release and cask. `DRY_RUN=1` previews it
+  without changing anything.
 
 ## v0.72.52 — 2026-09-28
 

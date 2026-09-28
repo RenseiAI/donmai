@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-podman ship test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -34,6 +34,28 @@ run-status-mock: build
 
 test:
 	go test -race ./...
+
+# test-podman runs the suite in a Linux podman container, the way CI runs it.
+# On a macOS host with a live daemon, prefer it to `make test`: the daemon
+# install/uninstall tests cannot reach the host's launchd service there.
+test-podman:
+	./scripts/podman-go-test.sh -race ./...
+
+# ship is the fast-lane ship command: local gates, the local-verify
+# attestation, a fast-forward of main, a signed tag at that SHA, and a watch of
+# the release and cask. It refuses unless the FAST_LANE Actions variable is on.
+# DRY_RUN=1 checks and previews without changing anything. See RELEASING.md
+# "Fast-lane ship".
+SHIP_FLAGS = $(strip \
+	$(if $(VERSION),--version "$(VERSION)") \
+	$(if $(TITLE),--title "$(TITLE)") \
+	$(if $(TAGGER),--tagger "$(TAGGER)") \
+	$(if $(filter 1 true yes,$(FULL)),--full) \
+	$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run) \
+	$(if $(filter 1 true yes,$(NO_WATCH)),--no-watch))
+
+ship:
+	./scripts/fast-ship.sh $(SHIP_FLAGS)
 
 # test-tagged type-checks every build-tag-gated test file in the repo.
 #
