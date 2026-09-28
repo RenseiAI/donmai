@@ -94,7 +94,8 @@ does not establish public acceptance.
 - GitHub CLI authenticated to `RenseiAI/donmai`.
 - A tag-signing key configured for Git (`user.signingkey` and the matching
   `gpg.format`), with its public key registered as a GitHub signing key.
-  Release tags must be signed, not merely annotated.
+  Release tags must be signed, not merely annotated. Once the tagging-identity
+  pins below are set, only the pinned identity's key can sign a release tag.
 - Repository release secrets:
   - `HOMEBREW_TAP_GITHUB_TOKEN`, with write access to
     `RenseiAI/homebrew-tap`.
@@ -156,7 +157,9 @@ least-privilege `github.token` requires exactly two independent active
 repository rulesets for `refs/tags/v*`, with exact include/exclude scopes and
 rule types:
 
-- a creation-only ruleset with one `OrganizationAdmin` `always` bypass; and
+- a creation-only ruleset whose single `always` bypass actor is the pinned
+  tag creator (`OrganizationAdmin` until a dedicated tagging identity is
+  pinned; see below); and
 - a no-bypass ruleset containing only deletion, update, and non-fast-forward
   protection.
 
@@ -231,13 +234,56 @@ GH_TOKEN="$(gh auth token)" \
   ./scripts/verify-release-authority.sh --audit-policy RenseiAI/donmai
 ```
 
-The audit must report exact no-bypass immutability and a sole
-`OrganizationAdmin(always)` creation actor. The transient local `GH_TOKEN`
-above must read `current_user_can_bypass=always` for creation and `never` for
-immutability. Never copy that administrator token into an Actions secret. CI
+The audit must report exact no-bypass immutability and a sole creation actor
+equal to the pinned creator (`OrganizationAdmin(always)` by default). With the
+default pin, the transient local `GH_TOKEN` above must read
+`current_user_can_bypass=always` for creation; with a dedicated creator team,
+the administrator is normally outside the team and reads `never`, and the exact
+visible actor is the proof. Immutability must always read `never`. Pass the
+same identity pins to the audit that the workflows use. Never copy that administrator token into an Actions secret. CI
 also performs a read-only same-token visibility control: structural fields must
 be visible, while actor field omission is recorded as the reason the
 administrator audit remains required.
+
+### Tagging identity pins
+
+Release tags can be pinned to one dedicated tagging identity: a machine account
+whose SSH signing key is held only by a central tagging workflow, so no
+operator host keeps release-signing material. `scripts/verify-release-authority.sh`
+reads three pins, which the release, worker-image, and E2B workflows pass from
+Actions variables of the same names:
+
+| Variable | Meaning | Unset |
+|---|---|---|
+| `RELEASE_TAG_CREATOR` | The creation ruleset's sole bypass actor: `OrganizationAdmin` or `Team:<numeric team id>` | `OrganizationAdmin` |
+| `RELEASE_TAGGER_EMAIL` | The tagger email every release tag must carry | no email pin |
+| `RELEASE_TAG_SIGNERS` | OpenSSH allowed-signers lines (public keys only) for the keys that may sign release tags | no signer pin |
+
+With the signer pins set, every publisher requires, in addition to GitHub's own
+verification of the tag signature:
+
+- the tag object's tagger email to equal `RELEASE_TAGGER_EMAIL`;
+- the signed payload GitHub returns to name this tag, its commit, and that
+  tagger, so a signature lifted from another tag cannot pass; and
+- `ssh-keygen -Y verify` of that payload in the `git` namespace against
+  `RELEASE_TAG_SIGNERS`, honoring each line's `valid-after`/`valid-before`.
+
+A tag signed by any other key, including a previously accepted operator host
+key, is refused before any build. When GitHub shows the creation ruleset's
+bypass actors to the workflow token, the actor must equal `RELEASE_TAG_CREATOR`;
+otherwise that check stays with the administrator audit above.
+
+With no pins set, the transitional policy is today's: an `OrganizationAdmin`
+creator and any signature GitHub verifies, so administrator-signed tags keep
+releasing. The pins fail closed when half-configured: `RELEASE_TAGGER_EMAIL`
+and `RELEASE_TAG_SIGNERS` must be set together, and a `Team:` creator requires
+both. A malformed creator value is refused. Switch over in one sitting: set the
+three variables and move the creation ruleset's bypass to the tagging team, then
+run `--audit-policy` with the same pins.
+
+When rotating the signing key, keep the previous key's allowed-signers line for
+one rotation so a manual retry of a tag signed with it still verifies, then
+drop it.
 
 Always create the tag at an explicit commit SHA, never from an implicit branch
 ref. Before creating it, run the read-only signing-key preflight. It resolves
@@ -276,6 +322,34 @@ prerelease tags publish their immutable version targets only.
 
 Do not move or reuse a published tag. If a release is bad, fix it and publish a
 new patch version.
+
+## Fast lane
+
+A switchable fast lane lets a commit that already passed the repository gates
+locally skip the release workflow's remote `harness-smoke` re-run. It needs two
+keys, and both must hold:
+
+1. The `FAST_LANE` Actions variable is exactly `on`.
+2. The tag's exact commit carries a `local-verify` commit status whose latest
+   state is `success`, recorded when that commit was verified locally before it
+   landed on `main`.
+
+The release workflow's `fast-lane` job reads both after `release-authority`
+passes and writes its decision and the attestation (description, poster, time)
+to the run summary. Only then is `harness-smoke` skipped. Everything else runs
+in every mode: the signed and immutable tag checks, the tagging-identity pins,
+Apple signing and notarization, Sigstore signatures, build provenance, the
+Homebrew cask policy, and the worker-image and E2B workflows. CI still runs on
+the push to `main`, and the `donmai-smokes` nightly run exercises the same smoke
+suite against `main`; both are the fix-forward signal.
+
+With the switch off, a missing or non-success attestation, or any readback
+error, `harness-smoke` runs and gates the publish exactly as before. A commit
+that landed through a reviewed pull request carries no attestation, so it keeps
+the full release gate even while the switch is on. The attestation is a record,
+not a proof: anyone with write access can post a commit status, so the trust
+anchor remains the credential that landed the commit. Turn the lane off by
+setting `FAST_LANE` to anything other than `on` or deleting it.
 
 ## Retry a release workflow
 

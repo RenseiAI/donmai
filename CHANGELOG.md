@@ -8,7 +8,17 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Chores
+
+- Release tags can be pinned to one dedicated tagging identity. With the
+  `RELEASE_TAG_CREATOR`, `RELEASE_TAGGER_EMAIL`, and `RELEASE_TAG_SIGNERS`
+  variables set, the release, worker-image, and E2B publishers accept only a
+  tag signed by a pinned SSH key under the pinned tagger email, in addition to
+  GitHub's own signature verification. Unset pins keep the current policy.
+- The release workflow has a switchable fast lane. When the `FAST_LANE`
+  variable is `on` and the tagged commit carries a successful `local-verify`
+  status, the remote smoke re-run is skipped; every signing, notarization,
+  provenance, and publication step still runs.
 
 ## v0.72.52 — 2026-09-28
 

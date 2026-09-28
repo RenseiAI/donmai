@@ -42,7 +42,49 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Verify live release authority
+        env:
+          # Tagging-identity pins; unset keeps the transitional policy. See
+          # scripts/verify-release-authority.sh and RELEASING.md.
+          RELEASE_TAG_CREATOR: ${{ vars.RELEASE_TAG_CREATOR }}
+          RELEASE_TAGGER_EMAIL: ${{ vars.RELEASE_TAGGER_EMAIL }}
+          RELEASE_TAG_SIGNERS: ${{ vars.RELEASE_TAG_SIGNERS }}
         run: ./scripts/verify-release-authority.sh "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"
+
+  # Switchable fast lane. Two keys, both required: the FAST_LANE Actions
+  # variable is exactly `on`, AND the tag's exact commit carries a successful
+  # `local-verify` commit status recorded when it was verified locally before
+  # landing. Only then does this job output skip_remote_gates=true, and only
+  # harness-smoke is skipped. Everything else is unchanged in every mode:
+  # release-authority (signed, immutable tag), codesign + notarization, cosign,
+  # provenance, and the cask here, plus the worker-image and e2b-template
+  # workflows. CI still runs on the push to main, and donmai-smokes' nightly
+  # run exercises the same suite against main. With the switch off, a missing
+  # or failed attestation, or any readback error, the output is false and the
+  # release path is exactly the gated one.
+  fast-lane:
+    needs: release-authority
+    name: fast-lane (switch + local-verify attestation)
+    runs-on: blacksmith-2vcpu-ubuntu-2404
+    timeout-minutes: 5
+    permissions:
+      contents: read
+      statuses: read
+    outputs:
+      skip_remote_gates: ${{ steps.decide.outputs.skip_remote_gates }}
+    env:
+      GH_TOKEN: ${{ github.token }}
+      FAST_LANE: ${{ vars.FAST_LANE }}
+      RELEASE_TAG: ${{ github.event_name == 'workflow_dispatch' && inputs.tag || github.ref_name }}
+    steps:
+      - name: Checkout release automation
+        uses: actions/checkout@v7
+        with:
+          persist-credentials: false
+          ref: ${{ github.sha }}
+
+      - name: Decide remote gates
+        id: decide
+        run: ./scripts/release-fast-lane.sh "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${GITHUB_OUTPUT}"
 
   # W0(release-gate): before this job existed, release.yml ran GoReleaser
   # only — nothing between a `v*` tag push and a published Homebrew cask
@@ -53,8 +95,11 @@ jobs:
   # .github/workflows/test.yml already runs on every PR/push/nightly —
   # against the EXACT tagged ref about to release (never against main), and
   # `release` below `needs:` it: a red harness-smoke blocks the publish.
+  # It is skipped only when the fast-lane job above says so; a failed or
+  # missing fast-lane decision runs it.
   harness-smoke:
-    needs: release-authority
+    needs: [release-authority, fast-lane]
+    if: ${{ !cancelled() && needs.release-authority.result == 'success' && needs.fast-lane.outputs.skip_remote_gates != 'true' }}
     name: harness-smoke (donmai-smokes @ main, tag under test)
     runs-on: blacksmith-4vcpu-ubuntu-2404
     timeout-minutes: 30
@@ -122,7 +167,7 @@ jobs:
         working-directory: donmai
         run: |
           set -euo pipefail
-          if ! GOWORK= go build -o "${RUNNER_TEMP}/donmai-prebuild" ./cmd/donmai; then
+          if ! GOWORK='' go build -o "${RUNNER_TEMP}/donmai-prebuild" ./cmd/donmai; then
             echo "::error::donmai@${DONMAI_SHA_UNDER_TEST} (the tag under test) failed to build — release blocked before the smoke suite even ran."
             exit 1
           fi
@@ -223,7 +268,10 @@ jobs:
           echo "Gate-liveness OK: pi harness real-binary lane executed against the tag under test (PASS observed for all 3 canaries, no SKIP)."
 
   release:
-    needs: harness-smoke
+    needs: [release-authority, fast-lane, harness-smoke]
+    # Publish only after release-authority passed, and either harness-smoke
+    # passed or the fast lane decided to skip it (and it was skipped).
+    if: ${{ !cancelled() && needs.release-authority.result == 'success' && (needs.harness-smoke.result == 'success' || (needs.fast-lane.result == 'success' && needs.fast-lane.outputs.skip_remote_gates == 'true' && needs.harness-smoke.result == 'skipped')) }}
     # macOS runner is required for codesign + xcrun notarytool.
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).

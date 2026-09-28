@@ -46,6 +46,12 @@ jobs:
           ref: ${{ github.sha }}
 
       - name: Verify live release authority
+        env:
+          # Tagging-identity pins; unset keeps the transitional policy. See
+          # scripts/verify-release-authority.sh and RELEASING.md.
+          RELEASE_TAG_CREATOR: ${{ vars.RELEASE_TAG_CREATOR }}
+          RELEASE_TAGGER_EMAIL: ${{ vars.RELEASE_TAGGER_EMAIL }}
+          RELEASE_TAG_SIGNERS: ${{ vars.RELEASE_TAG_SIGNERS }}
         run: ./scripts/verify-release-authority.sh "${GITHUB_REPOSITORY}" "${RELEASE_TAG}"
 
   build-template:
