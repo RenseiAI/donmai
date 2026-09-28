@@ -141,6 +141,10 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearListUnblockedBacklogCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateBlockerCmd(ds, bin))
 	cmd.AddCommand(newLinearListLabelsCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateLabelGroupCmd(ds, bin))
+	cmd.AddCommand(newLinearCreateGroupLabelCmd(ds, bin))
+	cmd.AddCommand(newLinearReparentLabelCmd(ds, bin))
+	cmd.AddCommand(newLinearSelectGroupLabelCmd(ds, bin))
 	cmd.AddCommand(newLinearListTeamsCmd(ds, bin))
 	cmd.AddCommand(newLinearListProjectsCmd(ds, bin))
 	cmd.AddCommand(newLinearApplyLabelCmd(ds, bin))
@@ -2016,7 +2020,7 @@ func newLinearListProjectsCmd(ds func() afclient.DataSource, bin string) *cobra.
 }
 
 // newLinearListLabelsCmd provides `list-labels [--team <key|id>]`.
-// Returns all issue labels as a JSON array of {id, name} objects.
+// Returns stable IDs, scope and native group membership for every label.
 // When --team is set, the result contains only labels that can be applied to
 // issues in that team, including workspace-level labels.
 func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
@@ -2025,6 +2029,7 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd := &cobra.Command{
 		Use:          "list-labels",
 		Short:        "List accessible issue labels",
+		Long:         "List native label IDs, workspace/team scope, group type and parent membership. A colon in a flat label name is not a native group.\n\nExample: " + bin + " linear list-labels --team ENG",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			client, err := newLinearClient(ds, bin)
@@ -2032,26 +2037,33 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				return err
 			}
 
-			var labels map[string]string
+			manager, err := requireNativeLabelManager(cmd.Context(), client)
+			if err != nil {
+				return err
+			}
+			var labels []linear.LabelInfo
 			if team == "" {
-				labels, err = client.ListLabels(cmd.Context())
+				labels, err = manager.ListLabelDetails(cmd.Context())
 			} else {
-				labels, err = client.ListLabelsForTeam(cmd.Context(), team)
+				labels, err = manager.ListLabelDetailsForTeam(cmd.Context(), team)
 			}
 			if err != nil {
 				return fmt.Errorf("list labels: %w", err)
 			}
 
-			// Sort by name for deterministic output.
-			type labelEntry struct {
-				ID   string `json:"id"`
-				Name string `json:"name"`
+			sort.Slice(labels, func(i, j int) bool {
+				if labels[i].Name != labels[j].Name {
+					return labels[i].Name < labels[j].Name
+				}
+				if labels[i].TeamID != labels[j].TeamID {
+					return labels[i].TeamID < labels[j].TeamID
+				}
+				return labels[i].ID < labels[j].ID
+			})
+			out := make([]map[string]any, 0, len(labels))
+			for _, label := range labels {
+				out = append(out, nativeLabelJSON(label))
 			}
-			out := make([]labelEntry, 0, len(labels))
-			for name, id := range labels {
-				out = append(out, labelEntry{ID: id, Name: name})
-			}
-			sort.Slice(out, func(i, j int) bool { return out[i].Name < out[j].Name })
 
 			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
@@ -2070,6 +2082,7 @@ func newLinearListLabelsCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		labelName  string
+		labelID    string
 		createFlag bool
 	)
 
@@ -2079,9 +2092,9 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
-			if labelName == "" {
+			if (strings.TrimSpace(labelName) == "") == (strings.TrimSpace(labelID) == "") || (createFlag && labelID != "") {
 				return cli.UserError(
-					"--label is required",
+					"choose exactly one of --label <name> or --label-id <uuid>; --create requires --label",
 					"Usage: "+cmd.UseLine()+" --label \"Bug\"",
 				)
 			}
@@ -2091,6 +2104,10 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				return err
 			}
 			ctx := cmd.Context()
+			manager, err := requireNativeLabelManager(ctx, client)
+			if err != nil {
+				return err
+			}
 
 			// Fetch the issue first: its team defines both the applicable label
 			// catalog and the ownership scope for any newly created label.
@@ -2102,15 +2119,43 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				return fmt.Errorf("get issue: team id and key are required to apply a label safely")
 			}
 
-			applicableLabels, err := client.ListLabelsForTeam(ctx, issue.Team.Key)
+			applicableLabels, err := manager.ListLabelDetailsForTeam(ctx, issue.Team.Key)
 			if err != nil {
-				return fmt.Errorf("list labels for team %q: %w", issue.Team.Key, err)
+				return fmt.Errorf("list native labels for team %q: %w", issue.Team.Key, err)
 			}
-
-			targetID := findLabelID(applicableLabels, labelName)
+			var matches []linear.LabelInfo
+			for _, label := range applicableLabels {
+				if label.TeamID != "" && label.TeamID != issue.Team.ID {
+					continue
+				}
+				matchesID := labelID != "" && label.ID == strings.TrimSpace(labelID)
+				matchesName := labelID == "" && strings.EqualFold(label.Name, strings.TrimSpace(labelName))
+				if matchesID || matchesName {
+					matches = append(matches, label)
+				}
+			}
+			if len(matches) > 1 {
+				return cli.UserError(
+					fmt.Sprintf("label %q is ambiguous across applicable scopes", labelName),
+					"Use `"+bin+" linear list-labels --team "+issue.Team.Key+"` and then --label-id for a flat label, or select-group-label for a grouped child",
+				)
+			}
+			var targetID string
+			if len(matches) == 1 {
+				if matches[0].IsGroup || matches[0].ParentID != "" {
+					return cli.UserError(
+						fmt.Sprintf("label %q (%s) is a native group or child, not a flat label", matches[0].Name, matches[0].ID),
+						"Use `"+bin+" linear select-group-label "+issue.Identifier+" --label-id "+matches[0].ID+"` for a group child",
+					)
+				}
+				targetID, labelName = matches[0].ID, matches[0].Name
+			}
 			createdLabel := false
 
 			if targetID == "" {
+				if labelID != "" {
+					return fmt.Errorf("flat label id %q is not applicable to team %s", labelID, issue.Team.Key)
+				}
 				if !createFlag {
 					return cli.UserError(
 						fmt.Sprintf("label %q is not applicable to team %q; use --create to create it for that team", labelName, issue.Team.Key),
@@ -2120,19 +2165,26 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 
 				created, createErr := client.CreateIssueLabel(ctx, labelName, issue.Team.ID)
 				if createErr != nil {
+					if errors.Is(createErr, linear.ErrUnauthorized) || errors.Is(createErr, linear.ErrForbidden) {
+						return cli.UserError(
+							fmt.Sprintf("not authorized to create label %q for team %q: %v", labelName, issue.Team.Key, createErr),
+							"Ask a Linear workspace admin to grant label creation access or create the label for this team",
+						)
+					}
 					// A concurrent invocation may have won the unique-name race. Re-read
 					// the applicable catalog before surfacing the original create error.
-					refreshed, refreshErr := client.ListLabelsForTeam(ctx, issue.Team.Key)
+					refreshed, refreshErr := manager.ListLabelDetailsForTeam(ctx, issue.Team.Key)
 					if refreshErr == nil {
-						targetID = findLabelID(refreshed, labelName)
+						for _, label := range refreshed {
+							if label.TeamID == issue.Team.ID && strings.EqualFold(label.Name, labelName) && !label.IsGroup && label.ParentID == "" {
+								if targetID != "" {
+									return fmt.Errorf("concurrent label %q is ambiguous in team %s", labelName, issue.Team.Key)
+								}
+								targetID = label.ID
+							}
+						}
 					}
 					if targetID == "" {
-						if errors.Is(createErr, linear.ErrUnauthorized) || errors.Is(createErr, linear.ErrForbidden) {
-							return cli.UserError(
-								fmt.Sprintf("not authorized to create label %q for team %q: %v", labelName, issue.Team.Key, createErr),
-								"Ask a Linear workspace admin to grant label creation access or create the label for this team",
-							)
-						}
 						if refreshErr != nil {
 							return fmt.Errorf("create label %q for team %q: %w (could not verify a concurrent creation: %v)", labelName, issue.Team.Key, createErr, refreshErr)
 						}
@@ -2141,6 +2193,14 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				} else {
 					targetID = created.ID
 					createdLabel = true
+					refreshed, readErr := manager.ListLabelDetailsForTeam(ctx, issue.Team.Key)
+					if readErr != nil {
+						return fmt.Errorf("read back created flat label: %w", readErr)
+					}
+					verified, found := nativeLabelByID(refreshed, targetID)
+					if !found || verified.TeamID != issue.Team.ID || verified.IsGroup || verified.ParentID != "" {
+						return fmt.Errorf("created flat label %s did not read back in team %s", targetID, issue.Team.Key)
+					}
 				}
 			}
 
@@ -2175,18 +2235,11 @@ func newLinearApplyLabelCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	}
 
 	cmd.Flags().StringVar(&labelName, "label", "", "Label name to apply (case-insensitive)")
+	cmd.Flags().StringVar(&labelID, "label-id", "", "Exact flat label UUID when names are ambiguous")
 	cmd.Flags().BoolVar(&createFlag, "create", false, "Allow creating the label if it does not exist (requires label-create scope)")
+	cmd.Long = "Apply a flat label by name. For a native single-select group, use `" + bin + " linear select-group-label <issue-id> --label-id <uuid>` so group membership is unambiguous."
 
 	return cmd
-}
-
-func findLabelID(labels map[string]string, name string) string {
-	for candidate, id := range labels {
-		if strings.EqualFold(candidate, name) {
-			return id
-		}
-	}
-	return ""
 }
 
 // ─── check-deployment (native Go via gh CLI) ─────────────────────────────────

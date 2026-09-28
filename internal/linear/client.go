@@ -29,6 +29,13 @@ func looksLikeID(s string) bool {
 
 const defaultBaseURL = "https://api.linear.app/graphql"
 
+const (
+	labelProxyPolicyHeader = "X-Donmai-Linear-Auth-Policy"
+	labelProxyPolicy       = "no-fallback-v1"
+	strictLabelProxyPath   = "/api/cli/linear/graphql/no-fallback-v1"
+	legacyLabelProxyPath   = "/api/cli/linear/graphql"
+)
+
 // ─── GraphQL queries and mutations ───────────────────────────────────────────
 
 const (
@@ -140,6 +147,23 @@ const (
   }
 }`
 
+	queryListLabelDetails = `query ListLabelDetails($filter: IssueLabelFilter, $after: String) {
+  issueLabels(filter: $filter, first: 100, after: $after) {
+    nodes { id name isGroup groupType team { id key } parent { id name } }
+    pageInfo { hasNextPage endCursor }
+  }
+}`
+
+	queryListIssueLabels = `query ListIssueLabels($id: String!, $after: String) {
+  issue(id: $id) {
+    id
+    labels(first: 100, after: $after, includeArchived: true) {
+      nodes { id name isGroup parent { id } }
+      pageInfo { hasNextPage endCursor }
+    }
+  }
+}`
+
 	queryListUsers = `query ListUsers($filter: UserFilter) {
   users(filter: $filter) { nodes { id name email } }
 }`
@@ -188,6 +212,20 @@ const (
   issueLabelCreate(input: $input) {
     success
     issueLabel { id name }
+  }
+}`
+
+	mutationCreateNativeLabel = `mutation CreateNativeLabel($input: IssueLabelCreateInput!) {
+  issueLabelCreate(input: $input) {
+    success
+    issueLabel { id name isGroup groupType team { id key } parent { id name } }
+  }
+}`
+
+	mutationReparentLabel = `mutation ReparentLabel($id: String!, $input: IssueLabelUpdateInput!) {
+  issueLabelUpdate(id: $id, input: $input) {
+    success
+    issueLabel { id name isGroup groupType team { id key } parent { id name } }
   }
 }`
 
@@ -302,6 +340,58 @@ type Client struct {
 	// BaseURL is the only other thing that changes between the two modes;
 	// every query/mutation string and response decoder is identical.
 	ProxyMode bool
+	// strictLabelProxy is set only after an authenticated OPTIONS capability
+	// acknowledgement. Every later GraphQL operation on this command's client
+	// carries the no-alternate-identity policy header.
+	strictLabelProxy bool
+}
+
+// EnableNoFallbackLabelProxy probes a separate versioned route BEFORE any
+// provider operation. An old or mixed-version server cannot process a strict
+// POST through the legacy route, even if it ignores an unfamiliar header.
+// Direct OSS Linear credentials need no probe.
+func (c *Client) EnableNoFallbackLabelProxy(ctx context.Context) error {
+	if !c.ProxyMode {
+		return nil
+	}
+	if c.strictLabelProxy {
+		return nil
+	}
+	if !strings.HasSuffix(c.BaseURL, legacyLabelProxyPath) {
+		return fmt.Errorf("linear: strict label proxy requires the canonical proxy route")
+	}
+	strictURL := strings.TrimSuffix(c.BaseURL, legacyLabelProxyPath) + strictLabelProxyPath
+	request, err := http.NewRequestWithContext(ctx, http.MethodOptions, strictURL, nil)
+	if err != nil {
+		return fmt.Errorf("linear: strict label proxy capability request: %w", err)
+	}
+	request.Header.Set("Authorization", "Bearer "+c.APIKey)
+	request.Header.Set(labelProxyPolicyHeader, labelProxyPolicy)
+	clientCopy := *c.HTTPClient
+	clientCopy.CheckRedirect = func(*http.Request, []*http.Request) error { return http.ErrUseLastResponse }
+	response, err := clientCopy.Do(request)
+	if err != nil {
+		return fmt.Errorf("linear: strict label proxy capability request: %w", err)
+	}
+	defer func() { _ = response.Body.Close() }()
+	if statusErr := statusToError(response.StatusCode); statusErr != nil {
+		return fmt.Errorf("linear: strict label proxy capability: %w", statusErr)
+	}
+	ack := response.Header.Values(labelProxyPolicyHeader)
+	if response.StatusCode != http.StatusNoContent || len(ack) != 1 || ack[0] != labelProxyPolicy ||
+		!strings.Contains(strings.ToLower(response.Header.Get("Cache-Control")), "no-store") {
+		return fmt.Errorf("linear: strict label proxy capability was not acknowledged")
+	}
+	c.BaseURL = strictURL
+	c.strictLabelProxy = true
+	return nil
+}
+
+func (c *Client) requireStrictLabelProxy() error {
+	if c.ProxyMode && !c.strictLabelProxy {
+		return fmt.Errorf("linear: native label-group proxy capability is required before provider operations")
+	}
+	return nil
 }
 
 // NewClient constructs a Client for direct Linear API calls.
@@ -382,6 +472,9 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 	if c.ProxyMode {
 		// Platform proxy expects an rsk_ token in Bearer-style.
 		req.Header.Set("Authorization", "Bearer "+c.APIKey)
+		if c.strictLabelProxy {
+			req.Header.Set(labelProxyPolicyHeader, labelProxyPolicy)
+		}
 	} else {
 		// Linear's own GraphQL API expects the token as the raw header
 		// value (no Bearer prefix). This is per Linear's docs and has
@@ -390,7 +483,7 @@ func (c *Client) doRequest(ctx context.Context, query string, vars map[string]an
 	}
 
 	httpClient := c.HTTPClient
-	if writeOnce {
+	if writeOnce || c.strictLabelProxy {
 		// Never mutate an embedder's shared client. A shallow copy retains its
 		// timeout and transport while refusing every redirect response at the
 		// original POST, including 301/302/303 method-changing redirects.
@@ -1163,6 +1256,247 @@ func (c *Client) listLabels(ctx context.Context, filter map[string]any) (map[str
 		after = next
 	}
 	return nil, fmt.Errorf("issue labels: exceeded %d pages", maxCatalogPages)
+}
+
+// ListLabelDetails returns one row per native label ID. Unlike the legacy
+// name→ID map it preserves equal names in different scopes and real parent
+// membership; colon punctuation is never parsed as a group relation.
+func (c *Client) ListLabelDetails(ctx context.Context) ([]LabelInfo, error) {
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
+	}
+	return c.listLabelDetails(ctx, nil)
+}
+
+// ListLabelDetailsForTeam includes that team's labels and workspace labels.
+func (c *Client) ListLabelDetailsForTeam(ctx context.Context, teamRef string) ([]LabelInfo, error) {
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
+	}
+	team, err := c.resolveCatalogTeamKeyOrID(ctx, teamRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve team for label scope: %w", err)
+	}
+	filter := map[string]any{"or": []map[string]any{
+		{"team": map[string]any{"id": map[string]any{"eq": team.ID}}},
+		{"team": map[string]any{"null": true}},
+	}}
+	return c.listLabelDetails(ctx, filter)
+}
+
+func (c *Client) listLabelDetails(ctx context.Context, filter map[string]any) ([]LabelInfo, error) {
+	var after *string
+	labels := make([]LabelInfo, 0)
+	seen := make(map[string]bool)
+	for page := 0; page < maxCatalogPages; page++ {
+		var data listLabelDetailsData
+		if err := c.do(ctx, queryListLabelDetails, map[string]any{"filter": filter, "after": after}, &data); err != nil {
+			return nil, err
+		}
+		if data.IssueLabels == nil || data.IssueLabels.Nodes == nil {
+			return nil, fmt.Errorf("native issue labels connection or nodes are missing")
+		}
+		for i, node := range *data.IssueLabels.Nodes {
+			if node == nil {
+				return nil, fmt.Errorf("native issue labels node %d is null", i)
+			}
+			label, err := decodeLabelInfo(node)
+			if err != nil {
+				return nil, fmt.Errorf("native issue labels node %d: %w", i, err)
+			}
+			if seen[label.ID] {
+				return nil, fmt.Errorf("native issue labels repeated id %q", label.ID)
+			}
+			seen[label.ID] = true
+			labels = append(labels, label)
+		}
+		next, complete, err := nextConnectionPage("native issue labels", data.IssueLabels.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return labels, nil
+		}
+		after = next
+	}
+	return nil, fmt.Errorf("native issue labels: exceeded %d pages", maxCatalogPages)
+}
+
+// ListIssueLabels reads the complete native issue-label connection. Group
+// replacement verifies both the prior and resulting sets from this read,
+// rather than treating GetIssue's first page as a complete membership proof.
+func (c *Client) ListIssueLabels(ctx context.Context, issueID string) ([]Label, error) {
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
+	}
+	if strings.TrimSpace(issueID) == "" {
+		return nil, fmt.Errorf("issue id is required for label listing")
+	}
+	var after *string
+	labels := make([]Label, 0)
+	seen := make(map[string]bool)
+	for page := 0; page < maxCatalogPages; page++ {
+		var data issueLabelsPageData
+		if err := c.do(ctx, queryListIssueLabels, map[string]any{"id": issueID, "after": after}, &data); err != nil {
+			return nil, err
+		}
+		if data.Issue == nil {
+			return nil, ErrNotFound
+		}
+		if data.Issue.ID != issueID || data.Issue.Labels == nil || data.Issue.Labels.Nodes == nil {
+			return nil, fmt.Errorf("issue labels connection is incomplete for %s", issueID)
+		}
+		for i, node := range *data.Issue.Labels.Nodes {
+			if node == nil {
+				return nil, fmt.Errorf("issue labels node %d is null", i)
+			}
+			id, err := requiredCatalogString(node.ID, fmt.Sprintf("issue labels node %d id", i))
+			if err != nil {
+				return nil, err
+			}
+			name, err := requiredCatalogString(node.Name, fmt.Sprintf("issue labels node %d name", i))
+			if err != nil {
+				return nil, err
+			}
+			if node.IsGroup == nil {
+				return nil, fmt.Errorf("issue labels node %d isGroup is missing", i)
+			}
+			var parentID string
+			if node.Parent != nil {
+				parentID, err = requiredCatalogString(node.Parent.ID, fmt.Sprintf("issue labels node %d parent id", i))
+				if err != nil {
+					return nil, err
+				}
+			}
+			if seen[id] {
+				return nil, fmt.Errorf("issue labels repeated id %q", id)
+			}
+			seen[id] = true
+			labels = append(labels, Label{ID: id, Name: name, IsGroup: *node.IsGroup, ParentID: parentID})
+		}
+		next, complete, err := nextConnectionPage("issue labels", data.Issue.Labels.PageInfo, after)
+		if err != nil {
+			return nil, err
+		}
+		if complete {
+			return labels, nil
+		}
+		after = next
+	}
+	return nil, fmt.Errorf("issue labels: exceeded %d pages", maxCatalogPages)
+}
+
+func decodeLabelInfo(node *labelInfoNode) (LabelInfo, error) {
+	id, err := requiredCatalogString(node.ID, "label id")
+	if err != nil {
+		return LabelInfo{}, err
+	}
+	name, err := requiredCatalogString(node.Name, "label name")
+	if err != nil {
+		return LabelInfo{}, err
+	}
+	if node.IsGroup == nil {
+		return LabelInfo{}, fmt.Errorf("label isGroup is missing")
+	}
+	label := LabelInfo{ID: id, Name: name, IsGroup: *node.IsGroup}
+	if node.GroupType != nil {
+		if *node.GroupType != "singleSelect" && *node.GroupType != "multiSelect" {
+			return LabelInfo{}, fmt.Errorf("label groupType %q is unknown", *node.GroupType)
+		}
+		label.GroupType = *node.GroupType
+	}
+	if node.Team != nil {
+		label.TeamID, err = requiredCatalogString(node.Team.ID, "label team id")
+		if err != nil {
+			return LabelInfo{}, err
+		}
+		label.TeamKey, err = requiredCatalogString(node.Team.Key, "label team key")
+		if err != nil {
+			return LabelInfo{}, err
+		}
+	}
+	if node.Parent != nil {
+		label.ParentID, err = requiredCatalogString(node.Parent.ID, "label parent id")
+		if err != nil {
+			return LabelInfo{}, err
+		}
+		label.ParentName, err = requiredCatalogString(node.Parent.Name, "label parent name")
+		if err != nil {
+			return LabelInfo{}, err
+		}
+	}
+	if label.IsGroup && label.ParentID != "" {
+		return LabelInfo{}, fmt.Errorf("group label cannot itself be a child")
+	}
+	if !label.IsGroup && label.GroupType != "" {
+		return LabelInfo{}, fmt.Errorf("regular label has groupType")
+	}
+	return label, nil
+}
+
+// CreateNativeLabel sends one group/child creation without automatic replay.
+// The caller reads back the catalog and reconciles ambiguous outcomes by ID.
+func (c *Client) CreateNativeLabel(ctx context.Context, input NativeLabelCreateInput) (*LabelInfo, error) {
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
+	}
+	input.Name = strings.TrimSpace(input.Name)
+	input.TeamID = strings.TrimSpace(input.TeamID)
+	input.ParentID = strings.TrimSpace(input.ParentID)
+	if input.Name == "" || (input.IsGroup && (input.ParentID != "" || input.GroupType != "singleSelect")) ||
+		(!input.IsGroup && (input.ParentID == "" || input.GroupType != "")) {
+		return nil, fmt.Errorf("native label creation requires a single-select group or a child with parent id")
+	}
+	payload := map[string]any{"name": input.Name}
+	if input.TeamID != "" {
+		payload["teamId"] = input.TeamID
+	}
+	if input.IsGroup {
+		payload["isGroup"] = true
+		payload["groupType"] = input.GroupType
+	} else {
+		payload["parentId"] = input.ParentID
+	}
+	var data nativeLabelMutationData
+	if err := c.doMutationOnce(ctx, mutationCreateNativeLabel, map[string]any{"input": payload}, &data); err != nil {
+		return nil, err
+	}
+	if !data.IssueLabelCreate.Success || data.IssueLabelCreate.IssueLabel == nil {
+		return nil, ErrMutationFailed
+	}
+	label, err := decodeLabelInfo(data.IssueLabelCreate.IssueLabel)
+	if err != nil {
+		return nil, fmt.Errorf("created native label: %w", err)
+	}
+	return &label, nil
+}
+
+// ReparentLabel changes only the native parent relation; Linear retains the
+// label ID. A caller must validate both scopes before this write and read back.
+func (c *Client) ReparentLabel(ctx context.Context, labelID, parentID string) (*LabelInfo, error) {
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
+	}
+	labelID, parentID = strings.TrimSpace(labelID), strings.TrimSpace(parentID)
+	if labelID == "" || parentID == "" || labelID == parentID {
+		return nil, fmt.Errorf("distinct label and parent ids are required")
+	}
+	var data nativeLabelMutationData
+	if err := c.doMutationOnce(ctx, mutationReparentLabel,
+		map[string]any{"id": labelID, "input": map[string]any{"parentId": parentID}}, &data); err != nil {
+		return nil, err
+	}
+	if !data.IssueLabelUpdate.Success || data.IssueLabelUpdate.IssueLabel == nil {
+		return nil, ErrMutationFailed
+	}
+	label, err := decodeLabelInfo(data.IssueLabelUpdate.IssueLabel)
+	if err != nil {
+		return nil, fmt.Errorf("reparented label: %w", err)
+	}
+	if label.ID != labelID || label.ParentID != parentID {
+		return nil, fmt.Errorf("reparented label response did not preserve identity and parent")
+	}
+	return &label, nil
 }
 
 const maxCatalogPages = 100

@@ -63,6 +63,13 @@ CLOSED_CLI_ENDPOINT :: ^afclient/client\.go :: /api/cl[i]/ :: (`afcli/linear\.go
 CLOSED_CLI_ENDPOINT :: ^afclient/client_test\.go :: /api/cl[i]/ :: r\.URL\.Path == "/api/cl[i]/whoami"
 CLOSED_CLI_ENDPOINT :: ^afclient/types\.go :: /api/cl[i]/ :: WhoAmIResponse matches GET /api/cl[i]/whoami
 
+# Native label-group commands require a versioned, acknowledged proxy path so
+# an older endpoint cannot silently use alternate provider credentials. The
+# two route constants and one exact-path fixture are the narrowly reviewed
+# public client contract; no backend implementation or credential is here.
+CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (strictLabelProxyPath|legacyLabelProxyPath)
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/label_groups_test\.go :: /api/cl[i]/ :: r\.URL\.Path != "/api/cl[i]/linear/graphql/no-fallback-v1"
+
 # runner/README.md: the package Status header and lifecycle-diagram ASCII art
 # name the closed downstream TUI repo (`rens[e]i-tui`) that embeds this
 # package as a library — both pre-existing, unrelated to the change that
