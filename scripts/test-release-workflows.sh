@@ -4,6 +4,7 @@ set -euo pipefail
 root_dir=$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)
 verify_script="${root_dir}/scripts/verify-release-tag.sh"
 authority_script="${root_dir}/scripts/verify-release-authority.sh"
+fast_lane_script="${root_dir}/scripts/release-fast-lane.sh"
 signing_key_test="${root_dir}/scripts/test-release-signing-key.sh"
 e2b_script="${root_dir}/scripts/build-e2b-template.cjs"
 temp_dir=$(mktemp -d)
@@ -68,6 +69,97 @@ RUBY
 }
 
 assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" release harness-smoke
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" release release-authority
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" release fast-lane
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" harness-smoke fast-lane
+assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" fast-lane release-authority
+
+# The switchable fast lane may skip harness-smoke and nothing else. Evaluate the
+# real job conditions over every outcome of the jobs they depend on, so a
+# reworded condition that opens a publish path without a passed authority check,
+# or without either a passed smoke or an attested skip, fails here.
+ruby -ryaml - "${root_dir}/.github/workflows/release.yml" <<'RUBY'
+release_file = ARGV.fetch(0)
+workflow = YAML.safe_load(File.read(release_file), permitted_classes: [], permitted_symbols: [], aliases: false)
+jobs = workflow.fetch('jobs')
+
+fast_lane = jobs.fetch('fast-lane')
+abort 'FAIL: fast-lane must only read contents and commit statuses' unless fast_lane['permissions'] == { 'contents' => 'read', 'statuses' => 'read' }
+abort 'FAIL: fast-lane must run unconditionally after release-authority' if fast_lane.key?('if')
+abort 'FAIL: fast-lane must read the FAST_LANE Actions variable' unless fast_lane.dig('env', 'FAST_LANE') == '${{ vars.FAST_LANE }}'
+abort 'FAIL: fast-lane output is not the decision step output' unless fast_lane['outputs'] == { 'skip_remote_gates' => '${{ steps.decide.outputs.skip_remote_gates }}' }
+decide = fast_lane.fetch('steps').find { |step| step['id'] == 'decide' }
+unless decide && decide['run'].to_s.strip == './scripts/release-fast-lane.sh "${GITHUB_REPOSITORY}" "${RELEASE_TAG}" "${GITHUB_OUTPUT}"'
+  abort 'FAIL: fast-lane decision does not use the shared release-fast-lane.sh'
+end
+
+# Only harness-smoke may consult the fast-lane decision to skip itself, and no
+# step anywhere may: signing, notarization, provenance, and publication steps
+# stay unconditional on the switch.
+jobs.each do |name, job|
+  next if %w[harness-smoke release].include?(name)
+  abort "FAIL: jobs.#{name} consults the fast-lane decision" if job['if'].to_s.include?('fast-lane')
+end
+jobs.each do |name, job|
+  (job['steps'] || []).each do |step|
+    if step['if'].to_s =~ /fast-lane|skip_remote_gates|FAST_LANE/
+      abort "FAIL: jobs.#{name} step '#{step['name']}' is conditional on the fast lane"
+    end
+  end
+end
+['Verify immutable release ref', 'Import Apple Developer ID cert to keychain', 'Install cosign', 'Attest build provenance'].each do |step_name|
+  abort "FAIL: release job lost step '#{step_name}'" unless jobs.fetch('release').fetch('steps').any? { |step| step['name'] == step_name }
+end
+
+# Evaluate a job-level condition with GitHub's semantics for the subset used
+# here, for a run that is not cancelled. A condition without a status function
+# gets GitHub's implicit success() over the job's needs. Anything outside that
+# subset aborts instead of being guessed at.
+def evaluate(job, results, outputs)
+  expression = job['if'].to_s
+  needs = Array(job['needs'])
+  text = expression.strip.sub(/\A\$\{\{\s*/, '').sub(/\s*\}\}\z/, '')
+  text = 'true' if text.empty?
+  unless text.match?(/\b(?:success|failure|always|cancelled)\(\)/)
+    text = "#{needs.all? { |need| results.fetch(need) == 'success' }} && (#{text})"
+  end
+  text = text.gsub('!cancelled()', 'true')
+  text = text.gsub(/needs\.([a-z0-9_-]+)\.result/) { results.fetch(Regexp.last_match(1)).inspect }
+  text = text.gsub(/needs\.([a-z0-9_-]+)\.outputs\.([a-z0-9_]+)/) do
+    outputs.fetch(Regexp.last_match(1), {}).fetch(Regexp.last_match(2), '').inspect
+  end
+  unless text.match?(/\A(?:true|false|"[a-z]*"|'[a-z]*'|==|!=|&&|\|\||[()]|\s)+\z/)
+    abort "FAIL: unsupported job condition: #{expression}"
+  end
+  eval(text) # only the whitelisted tokens above reach eval
+end
+
+# authority, fast-lane result, fast-lane output, smoke outcome when it runs,
+# then the expected [smoke runs, release runs].
+scenarios = [
+  ['success', 'success', 'false', 'success', [true, true]],
+  ['success', 'success', 'false', 'failure', [true, false]],
+  ['success', 'success', 'false', 'cancelled', [true, false]],
+  ['success', 'success', 'true', 'success', [false, true]],
+  ['success', 'success', '', 'success', [true, true]],
+  ['success', 'failure', '', 'success', [true, true]],
+  ['success', 'failure', '', 'failure', [true, false]],
+  ['success', 'failure', 'true', 'success', [false, false]],
+  ['failure', 'skipped', '', 'success', [false, false]],
+  ['cancelled', 'skipped', '', 'success', [false, false]],
+]
+scenarios.each do |authority, fast_lane_result, skip, smoke_outcome, (want_smoke, want_release)|
+  results = { 'release-authority' => authority, 'fast-lane' => fast_lane_result }
+  outputs = { 'fast-lane' => { 'skip_remote_gates' => skip } }
+  abort "FAIL: fast-lane scheduling differs for #{authority}" unless evaluate(fast_lane, results, {}) == (authority == 'success')
+  smoke_runs = evaluate(jobs.fetch('harness-smoke'), results, outputs)
+  results['harness-smoke'] = smoke_runs ? smoke_outcome : 'skipped'
+  release_runs = evaluate(jobs.fetch('release'), results, outputs)
+  label = "authority=#{authority} fast-lane=#{fast_lane_result}/#{skip.inspect} smoke=#{results['harness-smoke']}"
+  abort "FAIL: harness-smoke #{smoke_runs ? 'ran' : 'skipped'} for #{label}" unless smoke_runs == want_smoke
+  abort "FAIL: release #{release_runs ? 'ran' : 'was blocked'} for #{label}" unless release_runs == want_release
+end
+RUBY
 
 valid_tags=(
   v0.0.0
@@ -257,6 +349,8 @@ grep -Fq 'lightweight tag' "${temp_dir}/v1.2.7-error" || fail 'lightweight tag r
 
 [[ -x "${authority_script}" ]] || fail 'shared release-authority verifier is missing or not executable'
 "${authority_script}" --self-test
+[[ -x "${fast_lane_script}" ]] || fail 'release fast-lane decision script is missing or not executable'
+"${fast_lane_script}" --self-test
 [[ -x "${signing_key_test}" ]] || fail 'release signing-key preflight test is missing or not executable'
 "${signing_key_test}"
 
@@ -268,6 +362,16 @@ for workflow in release.yml e2b-template.yml worker-image.yml; do
   grep -Fq 'RUNNER_TEMP}/verify-release-tag.sh" --verify' "${workflow_path}" || fail "${workflow} bypasses the staged shared release verifier"
   grep -Fq 'scripts/verify-release-authority.sh' "${workflow_path}" || fail "${workflow} does not stage the authority verifier from the current workflow"
   grep -Fq "verify-release-authority.sh \"\${GITHUB_REPOSITORY}\" \"\${RELEASE_TAG}\"" "${workflow_path}" || fail "${workflow} does not verify live tag authority"
+  for pin in RELEASE_TAG_CREATOR RELEASE_TAGGER_EMAIL RELEASE_TAG_SIGNERS; do
+    assert_line "          ${pin}: \${{ vars.${pin} }}" "${workflow_path}"
+  done
+done
+# The fast lane is a release.yml concern only: the image and template
+# publishers never consult it.
+for workflow in e2b-template.yml worker-image.yml; do
+  if grep -Eq 'FAST_LANE|fast-lane|skip_remote_gates|local-verify' "${root_dir}/.github/workflows/${workflow}"; then
+    fail "${workflow} consults the fast lane"
+  fi
 done
 
 assert_workflow_job_needs "${root_dir}/.github/workflows/release.yml" harness-smoke release-authority
