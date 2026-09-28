@@ -775,11 +775,17 @@ func TestKitRegistryOrEmpty_DefaultTrustBlocksInstall(t *testing.T) {
 // TestKitRegistryOrEmpty_EnvPermissiveCannotDowngrade pins the no-config
 // install path when the environment asks for permissive mode.
 func TestKitRegistryOrEmpty_EnvPermissiveCannotDowngrade(t *testing.T) {
+	home := t.TempDir()
+	t.Setenv("HOME", home)
+	t.Setenv("DONMAI_STATE_HOME", home)
 	t.Setenv(envKitTrustMode, string(TrustModePermissive))
 	s := &Server{}
 	reg, ok := s.kitRegistryOrEmpty().(*KitRegistry)
 	if !ok {
 		t.Fatalf("registry type = %T, want *KitRegistry", s.kitReg)
+	}
+	if got, want := reg.ScanPaths(), filepath.Join(home, ".donmai", "kits"); len(got) != 1 || got[0] != want {
+		t.Fatalf("registry scan paths = %v, want isolated path %q", got, want)
 	}
 	if got := reg.TrustConfig().Mode; got != TrustModeSignedByAllowlist {
 		t.Fatalf("trust mode = %q, want %q", got, TrustModeSignedByAllowlist)
