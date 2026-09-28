@@ -71,6 +71,9 @@ type Hello struct {
 	OrphanDeadlineUnixNano int64 `json:"orphanDeadlineAt,omitempty"`
 
 	Extensions Extensions `json:"extensions,omitempty"`
+	// Continuation is advertised only by v5 producers; HostEpoch is the PTY
+	// stream epoch, not ProcessEpoch or a carrier generation.
+	Continuation *CheckpointCapability `json:"continuation,omitempty"`
 }
 
 // Welcome is the daemon's adoption proposal.

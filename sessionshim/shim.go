@@ -193,21 +193,23 @@ type Shim struct {
 
 // controllerConn is one attached controller.
 type controllerConn struct {
-	conn           *net.UnixConn
-	w              *shimwire.Writer
-	lifecycleMu    sync.Mutex
-	sub            agent.InteractiveSubscription
-	closed         bool
-	selected       uint32
-	snapshotLedger map[uint64]*snapshotLedgerEntry
-	emissionMu     sync.Mutex
-	emissionBySeq  map[uint64]*snapshotLedgerEntry
-	pumpDone       chan struct{}
-	barrierMu      sync.Mutex
-	outputBarrier  *ptyhost.OutputBarrier
-	barrierTimer   *time.Timer
-	barrierState   uint8
-	closeOnce      sync.Once
+	conn              *net.UnixConn
+	w                 *shimwire.Writer
+	lifecycleMu       sync.Mutex
+	sub               agent.InteractiveSubscription
+	closed            bool
+	selected          uint32
+	checkpointRequest shimwire.CheckpointRequest
+	checkpointResult  []shimwire.Message
+	snapshotLedger    map[uint64]*snapshotLedgerEntry
+	emissionMu        sync.Mutex
+	emissionBySeq     map[uint64]*snapshotLedgerEntry
+	pumpDone          chan struct{}
+	barrierMu         sync.Mutex
+	outputBarrier     *ptyhost.OutputBarrier
+	barrierTimer      *time.Timer
+	barrierState      uint8
+	closeOnce         sync.Once
 }
 
 const (
@@ -1265,14 +1267,19 @@ func (s *Shim) failPostInstall(stage string) error {
 }
 
 func (s *Shim) buildHello() (shimwire.Hello, error) {
-	_, lastSeq, err := s.sess.Snapshot()
+	screen, lastSeq, err := s.sess.Snapshot()
 	if err != nil {
 		return shimwire.Hello{}, fmt.Errorf("sessionshim: hello snapshot: %w", err)
 	}
 	s.mu.Lock()
 	gen, phase := s.gen, s.phase
 	s.mu.Unlock()
+	var continuation *shimwire.CheckpointCapability
+	if s.protocolMax >= shimwire.V5 {
+		continuation = &shimwire.CheckpointCapability{Schema: attachwire.ContinuationSchema, HostEpoch: screen.Epoch}
+	}
 	return shimwire.Hello{
+		Continuation:     continuation,
 		Protocol:         shimwire.ProtocolName,
 		Min:              s.protocolMin,
 		Max:              s.protocolMax,
@@ -1644,6 +1651,8 @@ func (s *Shim) dispatch(ctrl *controllerConn, msg shimwire.Message) error {
 		return s.persistHeartbeatAck(ctrl, heartbeat)
 	case shimwire.TypeError:
 		return nil // display-only from the controller; nothing to act on
+	case shimwire.TypeCheckpointRequest:
+		return s.dispatchContinuationRequest(ctrl, msg.Body)
 	case shimwire.TypeSnapshotRequest:
 		if ctrl.selected < shimwire.V2 {
 			return sendError(ctrl.w, shimwire.CodeMalformed, "SnapshotRequest is not legal in selected v1")
