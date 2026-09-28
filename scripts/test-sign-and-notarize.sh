@@ -141,6 +141,8 @@ if [[ "$run_goreleaser" == true ]]; then
     > "${fake_bin}/cosign"
   chmod 0755 "${fake_bin}/cosign"
 
+  # CI enables color even in captured output; keep exact phase-order checks
+  # independent of terminal styling without relaxing any phase assertion.
   pipeline_log="${temp_dir}/goreleaser.log"
   if ! (
     cd "$root_dir"
@@ -158,11 +160,25 @@ if [[ "$run_goreleaser" == true ]]; then
     fail 'GoReleaser signed snapshot failed'
   fi
 
+  # GoReleaser forces SGR styling in Actions, including redirected output.
+  # Normalize only those decoration bytes; retain the exact phase assertions.
+  python3 - "$pipeline_log" <<'PYLOG'
+import pathlib
+import re
+import sys
+
+path = pathlib.Path(sys.argv[1])
+path.write_bytes(re.sub(rb"\x1b\[[0-9;]*m", b"", path.read_bytes()))
+PYLOG
+
   binary_sign_line=$(grep -nF '• signing binaries' "$pipeline_log" | head -1 | cut -d: -f1 || true)
   archive_line=$(grep -nF '• archives' "$pipeline_log" | head -1 | cut -d: -f1 || true)
   checksum_line=$(grep -nF '• calculating checksums' "$pipeline_log" | head -1 | cut -d: -f1 || true)
   artifact_sign_line=$(grep -nF '• signing artifacts' "$pipeline_log" | head -1 | cut -d: -f1 || true)
-  [[ -n "$binary_sign_line" && -n "$archive_line" && -n "$checksum_line" && -n "$artifact_sign_line" ]] || fail 'GoReleaser omitted a required signing phase'
+  if [[ -z "$binary_sign_line" || -z "$archive_line" || -z "$checksum_line" || -z "$artifact_sign_line" ]]; then
+    cat "$pipeline_log" >&2
+    fail 'GoReleaser omitted a required signing phase'
+  fi
   (( binary_sign_line < archive_line )) || fail 'GoReleaser archived before Apple signing'
   (( archive_line < checksum_line )) || fail 'GoReleaser checksummed before final archive creation'
   (( checksum_line < artifact_sign_line )) || fail 'GoReleaser keyless-signed before final checksums'
