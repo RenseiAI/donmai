@@ -25,6 +25,9 @@ const (
 
 // These wire structs deliberately contain no interface-typed fields. Indexed
 // colors must retain their identity, rather than becoming resolved RGB colors.
+// Terminal-originated strings use []byte on the wire: OSC 7/8/title handlers
+// can retain invalid UTF-8 as raw Go string bytes, which JSON string encoding
+// would replace with U+FFFD and make a reachable checkpoint unrestorable.
 type checkpointColor struct {
 	Kind  uint8
 	Value uint32
@@ -36,6 +39,15 @@ type checkpointStyle struct {
 	Attrs                  uint8
 }
 type checkpointCell struct {
+	Content []byte
+	Style   checkpointStyle
+	Link    checkpointLink
+	Width   int
+}
+type checkpointLink struct {
+	URL, Params []byte
+}
+type checkpointCellKey struct {
 	Content string
 	Style   checkpointStyle
 	Link    uv.Link
@@ -43,7 +55,7 @@ type checkpointCell struct {
 }
 type checkpointCursor struct {
 	Pen            checkpointStyle
-	Link           uv.Link
+	Link           checkpointLink
 	Position       uv.Position
 	Style          CursorStyle
 	Steady, Hidden bool
@@ -76,7 +88,7 @@ type checkpointState struct {
 	Grapheme             []rune
 	Parser               checkpointparser.ParserCheckpoint
 	LastState            byte
-	IconName, Title, CWD string
+	IconName, Title, CWD []byte
 	Tabs                 []bool
 	GL, GR, GSingle      int
 	Phantom              bool
@@ -126,24 +138,32 @@ func (s checkpointStyle) valid() bool {
 }
 
 func encodeCheckpointCursor(c Cursor) checkpointCursor {
-	return checkpointCursor{encodeCheckpointStyle(c.Pen), c.Link, c.Position, c.Style, c.Steady, c.Hidden}
+	return checkpointCursor{encodeCheckpointStyle(c.Pen), encodeCheckpointLink(c.Link), c.Position, c.Style, c.Steady, c.Hidden}
 }
 
 func (c checkpointCursor) decode() Cursor {
-	return Cursor{Pen: c.Pen.decode(), Link: c.Link, Position: c.Position, Style: c.Style, Steady: c.Steady, Hidden: c.Hidden}
+	return Cursor{Pen: c.Pen.decode(), Link: c.Link.decode(), Position: c.Position, Style: c.Style, Steady: c.Steady, Hidden: c.Hidden}
 }
 
-func encodeCheckpointLines(lines []uv.Line, pool map[checkpointCell]uint32, cells *[]checkpointCell) [][]uint32 {
+func encodeCheckpointLink(link uv.Link) checkpointLink {
+	return checkpointLink{URL: []byte(link.URL), Params: []byte(link.Params)}
+}
+
+func (link checkpointLink) decode() uv.Link {
+	return uv.Link{URL: string(link.URL), Params: string(link.Params)}
+}
+
+func encodeCheckpointLines(lines []uv.Line, pool map[checkpointCellKey]uint32, cells *[]checkpointCell) [][]uint32 {
 	out := make([][]uint32, len(lines))
 	for y, line := range lines {
 		out[y] = make([]uint32, len(line))
 		for x, c := range line {
-			cell := checkpointCell{c.Content, encodeCheckpointStyle(c.Style), c.Link, c.Width}
-			index, ok := pool[cell]
+			key := checkpointCellKey{c.Content, encodeCheckpointStyle(c.Style), c.Link, c.Width}
+			index, ok := pool[key]
 			if !ok {
 				index = uint32(len(*cells) & (maxCheckpointCells - 1))
-				pool[cell] = index
-				*cells = append(*cells, cell)
+				pool[key] = index
+				*cells = append(*cells, checkpointCell{Content: []byte(c.Content), Style: key.Style, Link: encodeCheckpointLink(c.Link), Width: c.Width})
 			}
 			out[y][x] = index
 		}
@@ -157,7 +177,7 @@ func decodeCheckpointLines(lines [][]uint32, cells []checkpointCell) []uv.Line {
 		out[y] = make(uv.Line, len(line))
 		for x, index := range line {
 			c := cells[index]
-			out[y][x] = uv.Cell{Content: c.Content, Style: c.Style.decode(), Link: c.Link, Width: c.Width}
+			out[y][x] = uv.Cell{Content: string(c.Content), Style: c.Style.decode(), Link: c.Link.decode(), Width: c.Width}
 		}
 	}
 	return out
@@ -194,11 +214,11 @@ func (e *Emulator) ExportCheckpoint() ([]byte, error) {
 	if err != nil {
 		return nil, fmt.Errorf("checkpoint parser: %w", err)
 	}
-	c := checkpointState{Schema: CheckpointSchema, Width: e.Width(), Height: e.Height(), Charsets: e.charsets, LastChar: e.lastChar, Grapheme: e.grapheme, Parser: p, LastState: e.lastState, IconName: e.iconName, Title: e.title, CWD: e.cwd, GL: e.gl, GR: e.gr, GSingle: e.gsingle, Phantom: e.atPhantom}
+	c := checkpointState{Schema: CheckpointSchema, Width: e.Width(), Height: e.Height(), Charsets: e.charsets, LastChar: e.lastChar, Grapheme: e.grapheme, Parser: p, LastState: e.lastState, IconName: []byte(e.iconName), Title: []byte(e.title), CWD: []byte(e.cwd), GL: e.gl, GR: e.gr, GSingle: e.gsingle, Phantom: e.atPhantom}
 	if e.scr == &e.scrs[1] {
 		c.Active = 1
 	}
-	pool := make(map[checkpointCell]uint32)
+	pool := make(map[checkpointCellKey]uint32)
 	for i, s := range e.scrs {
 		c.Screens[i] = checkpointScreen{Lines: encodeCheckpointLines(s.buf.Lines, pool, &c.Cells), Touched: s.buf.Touched, Cursor: encodeCheckpointCursor(s.cur), Saved: encodeCheckpointCursor(s.saved), Scroll: s.scroll}
 		if s.scrollback != nil {
@@ -382,7 +402,7 @@ func (e *Emulator) RestoreCheckpoint(b []byte) error {
 		e.modes[mode] = m.Setting
 	}
 	e.lastChar, e.grapheme, e.lastState = c.LastChar, c.Grapheme, c.LastState
-	e.iconName, e.title, e.cwd = c.IconName, c.Title, c.CWD
+	e.iconName, e.title, e.cwd = string(c.IconName), string(c.Title), string(c.CWD)
 	e.tabstops = uv.DefaultTabStops(c.Width)
 	e.tabstops.Clear()
 	for i, on := range c.Tabs {

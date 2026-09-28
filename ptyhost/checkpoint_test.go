@@ -76,6 +76,59 @@ func TestContinuationCheckpointSuffix(t *testing.T) {
 	}
 }
 
+func TestContinuationCheckpointRetainsOSC8RawLinkThroughSameSuffix(t *testing.T) {
+	want := append([]byte("https://example.invalid/"), 0xff)
+	history := append([]byte("\x1b]8;;"), want...)
+	history = append(history, []byte("\x1b\\")...)
+	s := checkpointSession(t, string(history))
+	producer := s.vt.(*vtHost)
+	if got := []byte(producer.emu.PrimaryScreen().Cursor().Link.Params); !bytes.Equal(got, want) {
+		t.Fatalf("fixture did not reach raw OSC8 link: got=%x want=%x", got, want)
+	}
+	checkpoint, err := s.ContinuationCheckpoint(attachwire.ContinuationSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	wire, err := checkpoint.Encode(attachwire.ContinuationSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	decoded, err := attachwire.DecodeContinuationCheckpoint(wire, attachwire.ContinuationSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirror, err := RestoreContinuation(decoded)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = mirror.Close() })
+	if got := []byte(mirror.host.emu.PrimaryScreen().Cursor().Link.Params); !bytes.Equal(got, want) {
+		t.Fatalf("restored cursor link changed: got=%x want=%x", got, want)
+	}
+	producer.write([]byte("X"))
+	if err := mirror.ApplyRawFrame(attachwire.Frame{
+		Type: attachwire.TypeOutput,
+		Seq:  uint64(mirror.AtSeq()) + 1, Payload: attachwire.EncodeOutput([]byte("X")),
+	}); err != nil {
+		t.Fatal(err)
+	}
+	p, m := producer.emu.PrimaryScreen().CellAt(0, 0), mirror.host.emu.PrimaryScreen().CellAt(0, 0)
+	if p == nil || m == nil || !bytes.Equal([]byte(p.Link.Params), []byte(m.Link.Params)) || !bytes.Equal([]byte(p.Link.Params), want) {
+		t.Fatalf("same-suffix cell link diverged: producer=%+v mirror=%+v", p, m)
+	}
+	producerScreen, err := s.buildScreenLocked().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	mirrorScreen, err := mirror.Screen().Encode()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(producerScreen, mirrorScreen) {
+		t.Fatal("same-suffix safe Screen diverged")
+	}
+}
+
 func TestContinuationCheckpointFailClosed(t *testing.T) {
 	s := checkpointSession(t, "\x1b[31m")
 	if _, err := s.ContinuationCheckpoint(""); err == nil {
