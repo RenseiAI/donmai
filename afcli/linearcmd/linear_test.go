@@ -614,8 +614,10 @@ func TestLinearUpdateIssueReturnsResultingPriority(t *testing.T) {
 			var mutationInput map[string]any
 			var queryIncludesPriority bool
 			var proxyAuth string
+			var proxyPath string
 			handler := func(w http.ResponseWriter, r *http.Request) {
 				proxyAuth = r.Header.Get("Authorization")
+				proxyPath = r.URL.Path
 				var req struct {
 					Query     string         `json:"query"`
 					Variables map[string]any `json:"variables"`
@@ -669,6 +671,9 @@ func TestLinearUpdateIssueReturnsResultingPriority(t *testing.T) {
 			}
 			if tt.throughProxy && proxyAuth != "Bearer rsk_fixture" {
 				t.Errorf("proxy authorization = %q", proxyAuth)
+			}
+			if tt.throughProxy && proxyPath != "/api/cli/linear/graphql" {
+				t.Errorf("proxy path = %q, want %q", proxyPath, "/api/cli/linear/graphql")
 			}
 			if tt.wantInput == nil {
 				if _, ok := mutationInput["priority"]; ok {
