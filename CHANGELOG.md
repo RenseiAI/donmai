@@ -20,11 +20,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   (`execution_security_unrenderable`) or a malformed or null stamp
   (`execution_security_unresolvable`). Such a refusal is reported as a
   terminal failure (`failureMode: execution-security`) carrying a typed
-  `executionSecurityRefusal`, never NACKed back onto the queue. Stamped work
-  records, per dimension, the level achieved, its enforcing layers and the
-  tool and network deny-baseline status; work without the section produces
-  exactly the plans and receipts it did before. Every harness renders index 0
-  only for now.
+  `executionSecurityRefusal`; the work is NACKed back onto the queue only
+  when that terminal report cannot be delivered. Stamped work records, per
+  dimension, the level achieved, its enforcing layers and the tool and
+  network deny-baseline status; work without the section produces exactly
+  the plans and receipts it did before. Every harness renders index 0 only
+  for now.
 - Registration publishes the host's `executionSecurityEnforcement`
   attestation (index 0 on every substrate dimension unless the embedder
   attests more), on every registration path.
