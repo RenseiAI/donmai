@@ -137,6 +137,8 @@ func TestThinkingConfig_ModelFamilySelection(t *testing.T) {
 		{name: "2.5-flash medium → budget 8192", model: "gemini-2.5-flash", effort: agent.EffortMedium, wantBudget: intp(8192)},
 		{name: "2.5 low → budget 2048", model: "gemini-2.5-flash-lite", effort: agent.EffortLow, wantBudget: intp(2048)},
 		{name: "no effort → nil", model: "gemini-3.5-flash", effort: "", wantNilSet: true},
+		{name: "3.x max → level high, never below", model: "gemini-3.1-pro-preview", effort: agent.EffortMax, wantLevel: "high"},
+		{name: "2.5 max → budget 24576, never below", model: "gemini-2.5-pro", effort: agent.EffortMax, wantBudget: intp(24576)},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {

@@ -259,6 +259,64 @@ func TestBuildInteractiveLaunch_Model(t *testing.T) {
 	})
 }
 
+// TestBuildInteractiveLaunch_ReasoningEffort pins the interactive TUI's
+// reasoning effort to the headless lane's: a configured effort (max included)
+// rides a process-local model_reasoning_effort override carrying the same
+// value turn/start sends as reasoningEffort, and none emits no override.
+func TestBuildInteractiveLaunch_ReasoningEffort(t *testing.T) {
+	t.Parallel()
+	workspace := t.TempDir()
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string // "" => no override
+	}{
+		{effort: agent.EffortMax, want: "max"},
+		{effort: agent.EffortXHigh, want: "xhigh"},
+		{effort: agent.EffortLow, want: "low"},
+		{effort: ""},
+	}
+	for _, tc := range cases {
+		launch, err := buildInteractiveLaunch(agent.Spec{Cwd: workspace, Model: "gpt-5.6-sol", Effort: tc.effort})
+		if err != nil {
+			t.Fatalf("buildInteractiveLaunch(effort=%q): %v", tc.effort, err)
+		}
+		got, ok := decodeEffortOverride(t, launch.argv)
+		if tc.want == "" {
+			if ok {
+				t.Errorf("argv carries a reasoning-effort override with none configured: %q", launch.argv)
+			}
+			continue
+		}
+		if !ok || got != tc.want {
+			t.Errorf("effort %q: model_reasoning_effort override = %q (present=%t), want %q: %q", tc.effort, got, ok, tc.want, launch.argv)
+		}
+		headless := turnStartParams("t", agent.Spec{Effort: tc.effort}, nil)["reasoningEffort"]
+		if headless != tc.want {
+			t.Errorf("effort %q: headless reasoningEffort = %v, interactive override = %q", tc.effort, headless, got)
+		}
+	}
+}
+
+func decodeEffortOverride(t *testing.T, argv []string) (string, bool) {
+	t.Helper()
+	for i, arg := range argv {
+		if !strings.HasPrefix(arg, "model_reasoning_effort=") {
+			continue
+		}
+		if i == 0 || argv[i-1] != "--config" {
+			t.Fatalf("effort override is not introduced by --config: %q", argv)
+		}
+		var decoded struct {
+			Effort string `toml:"model_reasoning_effort"`
+		}
+		if err := toml.Unmarshal([]byte(arg), &decoded); err != nil {
+			t.Fatalf("effort override is not semantic TOML: %v\n%s", err, arg)
+		}
+		return decoded.Effort, true
+	}
+	return "", false
+}
+
 // decodeModelOverride parses the `model=…` value out of an argv slice as
 // real TOML, mirroring decodeTrustOverride (trust_test.go) and
 // mcpOverrideFromArgs above so the assertion is about the semantic value,

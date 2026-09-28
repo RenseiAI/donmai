@@ -430,6 +430,14 @@ func buildInteractiveLaunchEnv(spec agent.Spec, getenv func(string) string) (int
 	if model := strings.TrimSpace(spec.Model); model != "" {
 		args = append(args, "--config", "model="+tomlBasicString(model))
 	}
+	// Reasoning effort rides the same process-local override as model:
+	// model_reasoning_effort is codex's own config.toml key, and the headless
+	// lane already sends the identical value as turn/start reasoningEffort
+	// (spec_translation.go). Empty emits nothing — no level is chosen on the
+	// session's behalf.
+	if effort := strings.TrimSpace(string(spec.Effort)); effort != "" {
+		args = append(args, "--config", "model_reasoning_effort="+tomlBasicString(effort))
+	}
 	if spec.SystemPromptAppend != "" {
 		args = append(args, "--config", "developer_instructions="+strconv.Quote(spec.SystemPromptAppend))
 	}

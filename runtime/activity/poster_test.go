@@ -485,9 +485,12 @@ func TestEventMappingTable(t *testing.T) {
 		wantType      string
 		wantContent   string // substring assertion
 		rejectContent string
-		wantTool      string
-		hasInput      bool
-		hasOutput     bool
+		// wantContext is "<contextKey>=<contextValue>"; empty means the
+		// activity must carry no contextKey at all.
+		wantContext string
+		wantTool    string
+		hasInput    bool
+		hasOutput   bool
 	}{
 		{
 			name:        "AssistantText -> thought",
@@ -611,6 +614,39 @@ func TestEventMappingTable(t *testing.T) {
 			rejectContent: "free-form message",
 		},
 		{
+			name:        "System reasoning effort configured -> context naming the level",
+			event:       agent.ReasoningEffortEvent(agent.EffortMax),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "reasoning effort: max (as configured)",
+			wantContext: "reasoningEffort=max",
+		},
+		{
+			name:        "System reasoning effort xhigh -> context naming the level",
+			event:       agent.ReasoningEffortEvent(agent.EffortXHigh),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "reasoning effort: xhigh (as configured)",
+			wantContext: "reasoningEffort=xhigh",
+		},
+		{
+			name:        "System reasoning effort not configured -> context saying so",
+			event:       agent.ReasoningEffortEvent(""),
+			wantSent:    true,
+			wantType:    "context",
+			wantContent: "reasoning effort: not configured; none was requested, so the harness or model default applies",
+			wantContext: "reasoningEffort=not-configured",
+		},
+		{
+			name:          "System reasoning effort unknown value -> fixed context, never the value",
+			event:         agent.SystemEvent{Subtype: agent.SystemSubtypeReasoningEffort, Message: "free-form message must not cross the wire"},
+			wantSent:      true,
+			wantType:      "context",
+			wantContent:   "reasoning effort: the configured value is not a recognized level (low, medium, high, xhigh, max)",
+			rejectContent: "free-form message",
+			wantContext:   "reasoningEffort=unrecognized",
+		},
+		{
 			name:     "System interactive start -> skipped",
 			event:    agent.SystemEvent{Subtype: "interactive-session-started", Message: "started"},
 			wantSent: false,
@@ -732,6 +768,8 @@ func TestEventMappingTable(t *testing.T) {
 					ToolInput  map[string]any `json:"toolInput"`
 					ToolOutput string         `json:"toolOutput"`
 					Timestamp  string         `json:"timestamp"`
+					ContextKey string         `json:"contextKey"`
+					ContextVal string         `json:"contextValue"`
 				} `json:"activity"`
 			}
 			if err := json.Unmarshal([]byte(*body), &wire); err != nil {
@@ -748,6 +786,13 @@ func TestEventMappingTable(t *testing.T) {
 			}
 			if tc.rejectContent != "" && strings.Contains(wire.Activity.Content, tc.rejectContent) {
 				t.Errorf("content = %q; must not contain %q", wire.Activity.Content, tc.rejectContent)
+			}
+			gotContext := ""
+			if wire.Activity.ContextKey != "" {
+				gotContext = wire.Activity.ContextKey + "=" + wire.Activity.ContextVal
+			}
+			if gotContext != tc.wantContext {
+				t.Errorf("context = %q; want %q", gotContext, tc.wantContext)
 			}
 			if tc.wantTool != "" && wire.Activity.ToolName != tc.wantTool {
 				t.Errorf("toolName = %q; want %q", wire.Activity.ToolName, tc.wantTool)

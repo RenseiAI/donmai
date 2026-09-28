@@ -25,6 +25,11 @@ const AgentDirName = harnessstate.RunnerStateDir
 // StateFileName is the conventional file name for the state file.
 const StateFileName = "state.json"
 
+// ReasoningEffortNotConfigured is the State.ReasoningEffort value for a
+// session that carried no reasoning effort: none was requested from the
+// harness, so the harness or model default applied.
+const ReasoningEffortNotConfigured = "not-configured"
+
 // State is the persisted per-session state.json document. It mirrors
 // the legacy TS WorktreeState shape (state-types.ts) closely enough
 // that a worktree initialized by either runner can be inspected by
@@ -48,6 +53,12 @@ type State struct {
 	// ProviderName is the agent provider that ran (or is running) this
 	// session.
 	ProviderName agent.ProviderName `json:"providerName,omitempty"`
+
+	// ReasoningEffort records the reasoning effort the runner requested
+	// from the harness at spawn: an agent.EffortLevel name, or
+	// ReasoningEffortNotConfigured when the session carried none. Empty on
+	// a state file written before the field existed.
+	ReasoningEffort string `json:"reasoningEffort,omitempty"`
 
 	// ProviderSessionID is the provider-native session id captured
 	// from agent.InitEvent. Empty until the first init event fires.

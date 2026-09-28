@@ -1100,6 +1100,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		defer func() { _ = stepEmitter.Stop() }()
 	}
 
+	// 9e. Record the reasoning effort requested from the harness — once, on
+	// the platform activity stream and in state.json — before any turn
+	// output, for every run mode (headless, interview, interactive). A
+	// session's record then states the level it ran at, or that none was
+	// configured and the harness or model default applied.
+	r.recordReasoningEffort(ctx, runnerStatePath, qw.SessionID, spec.Effort, sink)
+
 	// ── Interview run-mode branch ─────────────────────────────
 	//
 	// When qw.Mode == "interview" the runner drives the non-terminating

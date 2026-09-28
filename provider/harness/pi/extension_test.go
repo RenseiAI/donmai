@@ -4,6 +4,7 @@ import (
 	"errors"
 	"os"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"testing"
 
@@ -454,5 +455,86 @@ func assertMode0600(t *testing.T, path string) {
 	}
 	if perm := fi.Mode().Perm(); perm != 0o600 {
 		t.Errorf("%s mode = %o, want 600", filepath.Base(path), perm)
+	}
+}
+
+// TestProviderPinEnvThinkingLevel pins the thinking-level half of the pin: the
+// configured effort rides piThinkingLevelEnvVar under its own name, and with
+// none configured the var is still exported, empty, so an inherited value can
+// never stand in for configuration.
+func TestProviderPinEnvThinkingLevel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string
+	}{
+		{"", ""},
+		{agent.EffortMedium, "medium"},
+		{agent.EffortXHigh, "xhigh"},
+		{agent.EffortMax, "max"},
+	}
+	for _, tc := range cases {
+		env := providerPinEnv(agent.Spec{Model: "claude-x", Effort: tc.effort})
+		if !containsEnv(env, piThinkingLevelEnvVar, tc.want) {
+			t.Errorf("effort %q: pin env missing %s=%s: %v", tc.effort, piThinkingLevelEnvVar, tc.want, env)
+		}
+	}
+}
+
+// TestExtensionRegistersConfiguredThinkingLevel activates the REAL embedded
+// extension and reads back the model it registers. pi clamps xhigh and max to
+// high unless the model's thinkingLevelMap lists them, so a session pinned to
+// either must register it, mapped to the provider's own value of the same
+// name. On the Anthropic Messages protocol those tiers exist only as the
+// adaptive-thinking effort, so the model is marked adaptive for them. Lower
+// levels register no map. With no configured effort nothing is invented: on
+// Chat Completions the model is registered without reasoning-effort support,
+// so pi omits the parameter instead of sending its own default level.
+func TestExtensionRegistersConfiguredThinkingLevel(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name       string
+		level      string
+		api        string
+		wantMap    map[string]any // nil => thinkingLevelMap must be absent
+		wantCompat map[string]any // nil => compat must be absent
+	}{
+		{name: "max on chat completions", level: "max", api: "openai-completions", wantMap: map[string]any{"max": "max"}},
+		{name: "xhigh on chat completions", level: "xhigh", api: "openai-completions", wantMap: map[string]any{"xhigh": "xhigh"}},
+		{name: "max on responses", level: "max", api: "openai-responses", wantMap: map[string]any{"max": "max"}},
+		{name: "max on anthropic messages is adaptive", level: "max", api: "anthropic-messages", wantMap: map[string]any{"max": "max"}, wantCompat: map[string]any{"forceAdaptiveThinking": true}},
+		{name: "high needs no map", level: "high", api: "openai-completions"},
+		{name: "high on anthropic stays budget-based", level: "high", api: "anthropic-messages"},
+		{name: "not configured on chat completions sends no effort", level: "", api: "openai-completions", wantCompat: map[string]any{"supportsReasoningEffort": false}},
+		{name: "not configured on anthropic registers nothing", level: "", api: "anthropic-messages"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			out := runExtensionFixture(t, []string{
+				piBaseURLEnvVar + "=http://127.0.0.1:9/v1",
+				piAPIEnvVar + "=" + tc.api,
+				piModelEnvVar + "=served-model",
+				piOutputLimitEnvVar + "=64000",
+				piThinkingLevelEnvVar + "=" + tc.level,
+			}, "read", `{"path":"README.md"}`)
+			model := registeredDonmaiModel(t, out)
+			got, present := model["thinkingLevelMap"]
+			if tc.wantMap == nil {
+				if present {
+					t.Errorf("registered thinkingLevelMap = %v, want the key absent", got)
+				}
+			} else if !reflect.DeepEqual(got, tc.wantMap) {
+				t.Errorf("registered thinkingLevelMap = %v (present=%t), want %v", got, present, tc.wantMap)
+			}
+			gotCompat, compatPresent := model["compat"]
+			if tc.wantCompat == nil {
+				if compatPresent {
+					t.Errorf("registered compat = %v, want the key absent", gotCompat)
+				}
+			} else if !reflect.DeepEqual(gotCompat, tc.wantCompat) {
+				t.Errorf("registered compat = %v (present=%t), want %v", gotCompat, compatPresent, tc.wantCompat)
+			}
+		})
 	}
 }

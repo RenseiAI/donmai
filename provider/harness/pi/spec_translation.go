@@ -323,21 +323,17 @@ func envSliceToMap(entries []string) map[string]string {
 }
 
 // thinkingLevelForEffort maps the normalized reasoning-effort tier to pi's
-// set_thinking_level argument (design §3: off…max). Empty effort returns ""
-// (no set_thinking_level command issued).
+// thinking level (design §3: off…max). pi's ladder carries every tier under
+// the same name — low, medium, high, xhigh, max — so the mapping is the
+// identity: a configured xhigh reaches pi as xhigh and max as max, never a
+// neighbouring tier. Empty (not configured) or an unknown value returns "":
+// no level is pinned, and the harness does not choose one on the session's
+// behalf.
 func thinkingLevelForEffort(e agent.EffortLevel) string {
-	switch e {
-	case agent.EffortLow:
-		return "low"
-	case agent.EffortMedium:
-		return "medium"
-	case agent.EffortHigh:
-		return "high"
-	case agent.EffortXHigh:
-		return "max"
-	default:
+	if !e.Known() {
 		return ""
 	}
+	return string(e)
 }
 
 // applyEndpoint projects a resolved Spec.Endpoint onto the spec the pi session

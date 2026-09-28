@@ -317,3 +317,53 @@ func TestSpawn_CodeIntelEnforcementDeniedPreTurn(t *testing.T) {
 		t.Fatalf("prompt command never sent; CodeIntelEnforcement must not block the session, only its own enforcement")
 	}
 }
+
+// TestThinkingLevelForEffort pins the effort → pi thinking-level mapping as
+// the identity over the whole ladder. pi names every tier the same way the
+// runner does, so a configured xhigh must reach pi as xhigh (not max) and a
+// configured max as max (not dropped); an unset or unknown value pins nothing
+// rather than a level of the harness's own choosing.
+func TestThinkingLevelForEffort(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string
+	}{
+		{agent.EffortLow, "low"},
+		{agent.EffortMedium, "medium"},
+		{agent.EffortHigh, "high"},
+		{agent.EffortXHigh, "xhigh"},
+		{agent.EffortMax, "max"},
+		{"", ""},
+		{"ultra", ""},
+	}
+	for _, tc := range cases {
+		if got := thinkingLevelForEffort(tc.effort); got != tc.want {
+			t.Errorf("thinkingLevelForEffort(%q) = %q, want %q", tc.effort, got, tc.want)
+		}
+	}
+}
+
+// TestModelPinArgs_EffortSuffix pins the --model <id>:<level> suffix for each
+// configured effort on the injected gateway provider, and its absence when no
+// effort is configured.
+func TestModelPinArgs_EffortSuffix(t *testing.T) {
+	t.Parallel()
+	gateway := &agent.EndpointBinding{Host: agent.HostGateway, BaseURL: "http://127.0.0.1:7734/v1"}
+	cases := []struct {
+		effort agent.EffortLevel
+		want   string
+	}{
+		{"", "served-model"},
+		{agent.EffortHigh, "served-model:high"},
+		{agent.EffortXHigh, "served-model:xhigh"},
+		{agent.EffortMax, "served-model:max"},
+	}
+	for _, tc := range cases {
+		got := modelPinArgs(agent.Spec{Model: "served-model", Effort: tc.effort, Endpoint: gateway})
+		want := []string{"--provider", pinnedProviderName, "--model", tc.want}
+		if !reflect.DeepEqual(got, want) {
+			t.Errorf("modelPinArgs(effort=%q) = %q, want %q", tc.effort, got, want)
+		}
+	}
+}

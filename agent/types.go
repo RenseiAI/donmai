@@ -143,7 +143,7 @@ type Capabilities struct {
 	EmitsSubagentEvents bool `json:"emitsSubagentEvents"`
 
 	// SupportsReasoningEffort reports whether the provider honors the
-	// per-step Spec.Effort (low | medium | high | xhigh). When false,
+	// per-step Spec.Effort (low | medium | high | xhigh | max). When false,
 	// the dispatch path drops the value and emits a capability-mismatch
 	// hook event so observers can flag silently-ignored cost-control
 	// hints. Optional for backwards compatibility — a zero value is
@@ -254,22 +254,44 @@ type RepositoryAuthorityPolicy struct {
 	Enforcement   string   `json:"enforcement"`
 }
 
-// EffortLevel mirrors EffortLevel from
-// ../donmai-libraries/packages/core/src/providers/index.ts. Providers map
-// this to their native reasoning-effort knob:
+// EffortLevel is the normalized reasoning-effort tier a session is
+// configured to run at. Providers map it to their native reasoning-effort
+// knob:
 //   - Claude  : --effort flag
 //   - Codex   : reasoningEffort / model_reasoning_effort
-//   - Gemini  : thinkingBudget
+//   - Gemini  : thinkingLevel / thinkingBudget
+//   - pi      : the --model <id>:<level> thinking level
+//
+// The empty value means "not configured": no harness may substitute a level
+// of its own choosing on the session's behalf.
 type EffortLevel string
 
-// EffortLevel constants. The xhigh tier matches Anthropic's
-// reasoning-effort scale.
+// EffortLevel constants. The ladder matches the reasoning-effort scale the
+// upstream model APIs expose (Anthropic effort, OpenAI reasoning_effort):
+// xhigh sits above high, and max is the highest tier a model offers.
 const (
 	EffortLow    EffortLevel = "low"
 	EffortMedium EffortLevel = "medium"
 	EffortHigh   EffortLevel = "high"
 	EffortXHigh  EffortLevel = "xhigh"
+	EffortMax    EffortLevel = "max"
 )
+
+// EffortLevels lists every known EffortLevel from lowest to highest.
+func EffortLevels() []EffortLevel {
+	return []EffortLevel{EffortLow, EffortMedium, EffortHigh, EffortXHigh, EffortMax}
+}
+
+// Known reports whether e is one of the EffortLevels constants. The empty
+// value (not configured) is not a known level.
+func (e EffortLevel) Known() bool {
+	for _, level := range EffortLevels() {
+		if e == level {
+			return true
+		}
+	}
+	return false
+}
 
 // MCPServerConfig is one MCP server the provider should configure on
 // session start. Providers that support MCP tool plugins inject these on

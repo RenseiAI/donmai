@@ -58,12 +58,16 @@ const (
 	// the extension's built-in default. The output-token pin is conditional
 	// the same way (ProviderConfig["maxOutputTokens"]), but it has NO
 	// fallback: unset, the extension registers the model without an output
-	// limit, so the serving endpoint's own limit applies.
+	// limit, so the serving endpoint's own limit applies. The thinking-level
+	// pin carries the configured reasoning effort (thinkingLevelForEffort)
+	// and is always exported, empty when none is configured, in which case
+	// the extension registers no thinking-level map.
 	piBaseURLEnvVar       = "DONMAI_PI_BASE_URL"
 	piAPIEnvVar           = "DONMAI_PI_API"
 	piModelEnvVar         = "DONMAI_PI_MODEL"
 	piContextWindowEnvVar = "DONMAI_PI_CONTEXT_WINDOW"
 	piOutputLimitEnvVar   = "DONMAI_PI_MAX_TOKENS"
+	piThinkingLevelEnvVar = "DONMAI_PI_THINKING_LEVEL"
 	piHandshakeEnvVar     = "DONMAI_PI_HANDSHAKE"
 
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
@@ -473,6 +477,14 @@ func providerPinEnv(spec agent.Spec) []string {
 	if maxOut := positiveProviderConfigInt(spec, "maxOutputTokens"); maxOut > 0 {
 		out = append(out, piOutputLimitEnvVar+"="+strconv.Itoa(maxOut))
 	}
+	// The thinking level rides to the extension as well as the --model
+	// suffix (modelPinArgs): pi treats xhigh and max as opt-in per model and
+	// clamps a request for either down to high unless the model's
+	// thinkingLevelMap lists it. The extension registers the configured
+	// level for the injected model so the provider receives it unchanged.
+	// Always exported — empty when no effort is configured — so a value
+	// inherited from the spawning environment can never stand in for one.
+	out = append(out, piThinkingLevelEnvVar+"="+thinkingLevelForEffort(spec.Effort))
 	return out
 }
 

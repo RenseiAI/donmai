@@ -38,6 +38,7 @@ func TestThinkingLevelForEffort_DocumentedEnumCasing(t *testing.T) {
 		agent.EffortMedium,
 		agent.EffortHigh,
 		agent.EffortXHigh,
+		agent.EffortMax,
 		agent.EffortLevel("unknown-tier"), // default branch
 	}
 	for _, e := range efforts {

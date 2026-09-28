@@ -476,6 +476,35 @@ export default function activate(pi: ExtensionAPI) {
   // fixed cap here once cut long reasoning turns off mid tool call.
   const maxTokensEnv = Number(process.env.DONMAI_PI_MAX_TOKENS ?? "");
   const maxTokens = Number.isInteger(maxTokensEnv) && maxTokensEnv > 0 ? maxTokensEnv : undefined;
+  // Thinking-level pin: the harness exports the session's configured
+  // reasoning effort as DONMAI_PI_THINKING_LEVEL (extension.go
+  // providerPinEnv) — the same level it pins with `--model <id>:<level>`.
+  // pi treats the xhigh and max levels as opt-in per model: without a
+  // thinkingLevelMap entry it clamps a request for either down to high. The
+  // configured level is the one this session runs at, so it is registered as
+  // supported and mapped to the provider's own value of the same name, which
+  // pi sends as the protocol's native effort parameter (reasoning_effort on
+  // Chat Completions, reasoning.effort on Responses). On the Anthropic
+  // Messages protocol those two tiers exist only as the adaptive-thinking
+  // effort parameter — a thinking token budget cannot express them — so the
+  // model is marked adaptive for them. Lower levels need no entry: pi passes
+  // them through under their own names.
+  //
+  // Unset means no effort is configured, and none may be invented: pi would
+  // otherwise request its own default level (medium) on the session's behalf.
+  // On Chat Completions the request can omit the parameter entirely, so the
+  // model is registered without reasoning-effort support and the serving
+  // endpoint's own default applies. The other protocols give pi no way to
+  // omit it; there the session record states that no effort was configured.
+  const thinkingLevel = process.env.DONMAI_PI_THINKING_LEVEL ?? "";
+  const extendedThinking = thinkingLevel === "xhigh" || thinkingLevel === "max";
+  const thinkingLevelMap = extendedThinking ? { [thinkingLevel]: thinkingLevel } : undefined;
+  const compat =
+    extendedThinking && api === "anthropic-messages"
+      ? { forceAdaptiveThinking: true }
+      : thinkingLevel === "" && api === "openai-completions"
+        ? { supportsReasoningEffort: false }
+        : undefined;
   if (baseUrl && model) {
     try {
       pi.registerProvider("donmai", {
@@ -491,6 +520,8 @@ export default function activate(pi: ExtensionAPI) {
             cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
             contextWindow,
             ...(maxTokens === undefined ? {} : { maxTokens }),
+            ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),
+            ...(compat === undefined ? {} : { compat }),
           },
         ],
       });

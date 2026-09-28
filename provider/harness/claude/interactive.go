@@ -98,6 +98,7 @@ func (h *interactiveHandle) NoticeChannel() agent.NoticeChannel { return h.notic
 //
 //	SessionName        → --name <name>
 //	Model              → --model <id>
+//	Effort             → --effort <level>
 //	Autonomous         → --permission-mode bypassPermissions
 //	SystemPromptAppend → --append-system-prompt <text>
 //	Prompt             → positional argument, ALWAYS LAST
@@ -169,6 +170,16 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// CLI's own default — no flag emitted.
 	if spec.Model != "" {
 		argv = append(argv, "--model", spec.Model)
+	}
+
+	// Effort: mirrors buildArgs' identical branch (cli_args.go) so a
+	// configured reasoning effort reaches the interactive REPL the same way
+	// it reaches a headless run. The REPL accepts --effort exactly as the
+	// headless CLI does. Spawn also fixes CLAUDE_CODE_EFFORT_LEVEL
+	// (effort.go), which outranks every settings file, so an unconfigured
+	// session runs at the model's own default rather than the operator's.
+	if spec.Effort != "" {
+		argv = append(argv, "--effort", string(spec.Effort))
 	}
 
 	// Permission mode: autonomous sessions get bypassPermissions so the
