@@ -401,7 +401,8 @@ func TestRunLoop_HeartbeatBodyIncludesIssueID(t *testing.T) {
 }
 
 // TestObserveEvent_ScansWorkResultMarker confirms the loop's
-// AssistantText scanner reads the WORK_RESULT:passed/failed marker.
+// AssistantText scanner reads a line-anchored WORK_RESULT:passed/failed/
+// unknown marker (last one wins) and ignores one quoted in prose.
 func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	cases := []struct {
 		text string
@@ -409,7 +410,26 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 	}{
 		{"WORK_RESULT:passed", "passed"},
 		{"<!-- WORK_RESULT:failed -->", "failed"},
-		{"some text WORK_RESULT: passed and more", "passed"},
+		{"Summary of the work.\n  WORK_RESULT: failed", "failed"},
+		{"WORK_RESULT unknown", "unknown"},
+		// FIRST anchored marker wins within one message (the platform
+		// sentinel reader's rule).
+		{"WORK_RESULT:passed\nre-checked\nWORK_RESULT:failed", "passed"},
+		// Case-insensitive over ASCII only.
+		{"work_result: PASSED", "passed"},
+		{"Work_Result: Failed", "failed"},
+		{"WORK_RESULT: pa\u017f\u017fed", ""},
+		{"WOR\u212a_RESULT: passed", ""},
+		// The verdict must end at a word boundary.
+		{"WORK_RESULT: passedly", ""},
+		{"WORK_RESULT: passed.", "passed"},
+		// Line-anchored only (the platform sentinel's rule): a marker quoted
+		// in prose, or split across a line break, is not a verdict.
+		{"some text WORK_RESULT: passed and more", ""},
+		{"final message <!-- WORK_RESULT:passed -->", ""},
+		{"I am not claiming WORK_RESULT: passed yet", ""},
+		{"WORK_RESULT:\npassed", ""},
+		{"WORK_RESULT:blocked", ""},
 		{"no marker here", ""},
 	}
 	for _, tc := range cases {
@@ -442,6 +462,13 @@ func TestScanBlocked_DetectsDeclineMarkers(t *testing.T) {
 		{"agent-blocked-reason-final-line", "Some narrative.\nAGENT_BLOCKED: spec ambiguous", true, "spec ambiguous"},
 		{"agent-blocked-reason-trailing-newline", "AGENT_BLOCKED: missing repo access\nmore output", true, "missing repo access"},
 		{"agent-blocked-reason-comment", "<!-- AGENT_BLOCKED: missing repo access -->", true, "missing repo access"},
+		{"agent-blocked-lowercase", "agent_blocked: no staging credentials", true, "no staging credentials"},
+		{"agent-blocked-reason-never-crosses-a-line", "AGENT_BLOCKED:\nnext line is prose", true, ""},
+		{"work-result-blocked-never-crosses-a-line", "WORK_RESULT:\nblocked", false, ""},
+		{"first-marker-wins-passed-then-blocked", "WORK_RESULT: passed\nAGENT_BLOCKED: second thoughts", false, ""},
+		{"first-marker-wins-blocked-then-passed", "AGENT_BLOCKED: need a decision\nWORK_RESULT: passed", true, "need a decision"},
+		{"work-result-blocked-then-agent-blocked-keeps-reason", "WORK_RESULT:blocked\nAGENT_BLOCKED: spec is ambiguous", true, "spec is ambiguous"},
+		{"agent-blocked-without-colon-is-prose", "AGENT_BLOCKED is how I would decline", false, ""},
 		{"passed-not-blocked", "WORK_RESULT:passed", false, ""},
 		{"failed-not-blocked", "WORK_RESULT:failed", false, ""},
 		{"no-marker", "I am working on the task now", false, ""},
@@ -567,6 +594,31 @@ func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
 	}
 }
 
+// TestObserveEvent_LaterVerdictClearsEarlierBlocked pins latest-message-wins
+// across messages: a later message's anchored passed verdict clears an
+// earlier message's decline, and a later decline clears an earlier verdict.
+func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	wt := t.TempDir()
+
+	obs := &streamObservation{}
+	for _, text := range []string{"AGENT_BLOCKED: waiting on a decision", "Decision arrived; done.\nWORK_RESULT: passed"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if obs.blocked || obs.blockedReason != "" || obs.workResult != "passed" {
+		t.Errorf("after blocked then passed: blocked=%v reason=%q workResult=%q; want false, \"\", passed", obs.blocked, obs.blockedReason, obs.workResult)
+	}
+
+	obs = &streamObservation{}
+	for _, text := range []string{"WORK_RESULT: passed", "Second thoughts.\nAGENT_BLOCKED: the spec contradicts itself"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if !obs.blocked || obs.blockedReason != "the spec contradicts itself" || obs.workResult != "" {
+		t.Errorf("after passed then blocked: blocked=%v reason=%q workResult=%q; want true, reason, \"\"", obs.blocked, obs.blockedReason, obs.workResult)
+	}
+}
+
 // TestObserveEvent_CapturesLastAssistantText confirms the
 // AssistantTextEvent branch tracks the most recent non-empty assistant
 // message (the codex-path summary fallback) and ignores whitespace-only
@@ -576,10 +628,10 @@ func TestObserveEvent_CapturesLastAssistantText(t *testing.T) {
 	h := newRunnerHarness(t)
 	obs := &streamObservation{}
 	wt := t.TempDir()
-	for _, text := range []string{"first message", "  \n\t", "final message <!-- WORK_RESULT:passed -->"} {
+	for _, text := range []string{"first message", "  \n\t", "final message\n<!-- WORK_RESULT:passed -->"} {
 		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
 	}
-	if want := "final message <!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
+	if want := "final message\n<!-- WORK_RESULT:passed -->"; obs.lastAssistantText != want {
 		t.Errorf("obs.lastAssistantText = %q; want %q", obs.lastAssistantText, want)
 	}
 	if obs.workResult != "passed" {

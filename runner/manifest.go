@@ -77,10 +77,25 @@ var ErrNoInlineManifest = errors.New("runner: no inline turn-result manifest")
 // inlineManifestLabelRE matches the `Intended manifest:` label some agents
 // print next to the WORK_RESULT marker as a backstop when their tool policy
 // removed the file-writing tool and they COULD NOT write
-// `.agent/turn-result.json`. Case-insensitive with flexible internal/leading
-// whitespace; the balanced-brace scan that follows starts at the first `{`
-// after the label.
-var inlineManifestLabelRE = regexp.MustCompile(`(?i)intended\s+manifest\s*:`)
+// `.agent/turn-result.json`. The balanced-brace scan that follows starts at
+// the first `{` after the label.
+//
+// The label is LINE-ANCHORED with the same lineStartPrefix as the verdict
+// markers (loop.go), so a label quoted mid-sentence is ignored. Between the
+// line start and the label it tolerates the markdown lead-ins stage prompts
+// render the line with: blockquote `>` markers, one list bullet (`-`, `*`,
+// `+`, `1.`, `1)`), and bold/italic/inline-code markers (`**`, `__`, `*`,
+// `_`, a backtick), also around the colon. Matched case-insensitively over
+// ASCII only (asciiLower). A match is not a verdict on its own: the block must
+// be a schema-valid manifest, and a printed block never RAISES a standing
+// verdict — whether a manifest file, an earlier turn's anchored marker or the
+// same turn's own first anchored marker set it (applyTurnManifest,
+// reapplyTurnManifest); it sets the verdict only when none exists yet.
+// Anchoring does not make prose harmless by itself — a line that starts with
+// the label and carries a valid manifest object is read as one.
+var inlineManifestLabelRE = regexp.MustCompile(lineStartPrefix +
+	`(?:>[ \t]*)*(?:(?:[-*+]|[0-9]+[.)])[ \t]+)?[*_` + "`" + `]*` +
+	`intended[ \t]+manifest[ \t]*[*_` + "`" + `]*[ \t]*:`)
 
 // TurnManifest is the deterministic turn-outcome the agent writes to
 // `.agent/turn-result.json`. It is the agent-owned half of the session
@@ -231,7 +246,7 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 // after the JSON object is tolerated — the balanced scan stops at the matching
 // close brace and ignores the remainder.
 func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
-	loc := inlineManifestLabelRE.FindStringIndex(finalMessage)
+	loc := inlineManifestLabelRE.FindStringIndex(asciiLower(finalMessage))
 	if loc == nil {
 		return nil, ErrNoInlineManifest
 	}
@@ -391,8 +406,16 @@ func validateManifestSchema(raw json.RawMessage) bool {
 // inline-parse degrade (ErrNoInlineManifest) is a silent no-op so a bad inline
 // block never fails the turn.
 func (r *Runner) applyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation) {
-	m := r.resolveTurnManifest(worktreePath, qw, obs.lastAssistantText, true)
+	m, fromFile := r.resolveTurnManifest(worktreePath, qw, obs.lastAssistantText, true)
 	if m == nil {
+		return
+	}
+	if !fromFile && raisesVerdict(obs.verdict(), m.Verdict) {
+		r.logger.Info("printed turn-result manifest would raise the turn's own marker verdict; ignored",
+			"sessionId", qw.SessionID,
+			"markerVerdict", obs.verdict(),
+			"printedVerdict", m.Verdict,
+		)
 		return
 	}
 	foldTurnManifest(m, res, obs)
@@ -435,49 +458,61 @@ func stampManifest(worktreePath string) manifestStamp {
 	return stamp
 }
 
-// reapplyTurnManifest re-resolves the turn verdict after a follow-up turn
+// reapplyTurnManifest re-resolves the turn verdict after ONE follow-up turn
 // (memory inject or tail steering). before is the manifest file's stamp taken
-// before the first follow-up turn started.
+// just before that follow-up turn started; followUp is its observation.
 //
-// A follow-up turn changes the picture the first resolution saw, and the
-// verdict must follow whichever signal is NEWEST:
+// A follow-up turn changes the picture the earlier resolution saw, and the
+// verdict follows the NEWEST signal, with one guard — an earlier manifest can
+// be lowered by the follow-up but never raised:
 //
-//  1. A manifest the follow-up turn produced — the file was (re)written during
-//     it, or its final message carries an inline `Intended manifest` block —
-//     is the agent's latest structured word. It is folded exactly like the
+//  1. The manifest FILE was (re)written during the follow-up and is present
+//     on disk: it is the agent's latest structured word and is folded like the
 //     first turn's, so its verdict and summary beat the follow-up's terminal
-//     prose (often just the PR URL the steering prompt asked for).
-//  2. Otherwise the earlier manifest (res.Manifest) is STALE, but it is still
-//     the agent's authoritative structured verdict (the prompts say the file
-//     wins and the marker is only the backstop). A follow-up marker may
-//     supersede it ONLY to DOWNGRADE it: a stale "passed" gives way to a
-//     line-anchored follow-up `WORK_RESULT: failed` / `WORK_RESULT: blocked`
-//     (or an anchored `AGENT_BLOCKED:` line). Then the stale manifest is
-//     dropped from the envelope so its "passed" is never posted. In every
-//     other case — no follow-up verdict, the same verdict, "unknown", an
-//     upgrade, or a marker quoted mid-sentence — the earlier manifest still
-//     speaks for the turn and is folded again (its summary beats the
-//     follow-up's terminal prose) and posted.
+//     prose (often just the PR URL the steering prompt asked for). A file the
+//     follow-up deleted is not a rewrite.
+//  2. The follow-up only PRINTED a line-anchored inline `Intended manifest`
+//     block: it is folded unless it would RAISE the standing verdict
+//     (standingVerdict) — whatever set it: an earlier manifest file, an
+//     earlier turn's anchored marker, or the follow-up's own first anchored
+//     marker. A printed block sets the verdict only when none exists yet.
+//  3. Otherwise any earlier manifest (res.Manifest) is STALE, but still the
+//     agent's authoritative structured verdict (the prompts say the file wins
+//     and the marker is only the backstop). The follow-up's own line-anchored
+//     marker may supersede it only to LOWER it — a stale "passed" gives way to
+//     a follow-up "failed" or "blocked" — and the stale manifest is then
+//     dropped so its "passed" is never posted. In every other case (no
+//     follow-up verdict, the same one, "unknown", an upgrade) the earlier
+//     manifest is folded again and posted.
+//  4. No manifest at all: the follow-up's marker verdict is the turn's newest.
+//     passed/failed/unknown already reached the envelope through applyTo; a
+//     blocked verdict is routed to the blocked fork here.
 //
-// No manifest at all leaves the envelope untouched, preserving the
-// marker-scrape behaviour. The fold never touches Status, FailureMode or
-// Error: a failure the runner recorded is never cleared by an agent manifest.
+// The fold never touches Status, FailureMode or Error: a failure the runner
+// recorded is never cleared by an agent manifest.
 func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Result, obs *streamObservation, followUp streamObservation, before manifestStamp) {
 	rewritten := stampManifest(worktreePath) != before
-	if fresh := r.resolveTurnManifest(worktreePath, qw, followUp.lastAssistantText, rewritten); fresh != nil {
-		foldTurnManifest(fresh, res, obs)
-		return
-	}
 	stale := res.Manifest
+	followUpVerdict := followUp.verdict()
+	if fresh, fromFile := r.resolveTurnManifest(worktreePath, qw, followUp.lastAssistantText, rewritten); fresh != nil {
+		standing := standingVerdict(res, obs, stale, followUpVerdict)
+		if fromFile || !raisesVerdict(standing, fresh.Verdict) {
+			foldTurnManifest(fresh, res, obs)
+			return
+		}
+		r.logger.Info("printed turn-result manifest in the follow-up would raise the standing verdict; ignored",
+			"sessionId", qw.SessionID,
+			"standingVerdict", standing,
+			"printedVerdict", fresh.Verdict,
+		)
+	}
 	if stale == nil {
+		if followUpVerdict == "blocked" {
+			markFollowUpBlocked(res, obs, followUp)
+		}
 		return
 	}
-	followUpVerdict := followUp.lineVerdict
-	if followUpVerdict == "" && followUp.blocked {
-		followUpVerdict = "blocked"
-	}
-	downgrade := stale.Verdict == "passed" && (followUpVerdict == "failed" || followUpVerdict == "blocked")
-	if !downgrade {
+	if !lowersVerdict(stale.Verdict, followUpVerdict) {
 		foldTurnManifest(stale, res, obs)
 		return
 	}
@@ -488,45 +523,85 @@ func (r *Runner) reapplyTurnManifest(worktreePath string, qw QueuedWork, res *Re
 	)
 	res.Manifest = nil
 	if followUpVerdict == "blocked" {
-		// The stale manifest's passed/failed no longer describes the turn; the
-		// decline rides obs.blocked into the caller's blocked fork.
-		res.WorkResult = ""
-		obs.workResult = ""
-		obs.blocked = true
-		if followUp.blockedReason != "" {
-			obs.blockedReason = followUp.blockedReason
-		}
+		markFollowUpBlocked(res, obs, followUp)
 		return
 	}
 	res.WorkResult = followUpVerdict
 	obs.workResult = followUpVerdict
 }
 
+// lowersVerdict reports whether moving from verdict from to verdict to lowers
+// it: only a "passed" can be lowered, to "failed" or "blocked".
+func lowersVerdict(from, to string) bool {
+	return from == "passed" && (to == "failed" || to == "blocked")
+}
+
+// raisesVerdict reports whether replacing the standing verdict with next would
+// raise it: a move to "passed" from any set, non-passing verdict. A printed
+// `Intended manifest` block may never do that; only an anchored marker in a
+// later turn or a manifest file rewritten on disk can raise a verdict.
+func raisesVerdict(standing, next string) bool {
+	return next == "passed" && standing != "" && standing != "passed"
+}
+
+// standingVerdict is the turn verdict that stands after a follow-up turn
+// WITHOUT any block the follow-up printed: an earlier manifest (lowered by the
+// follow-up's own anchored marker when that marker lowers it), else the
+// follow-up's own anchored marker, else the verdict earlier turns' markers
+// set.
+func standingVerdict(res *Result, obs *streamObservation, stale *TurnManifest, followUpVerdict string) string {
+	switch {
+	case stale != nil && lowersVerdict(stale.Verdict, followUpVerdict):
+		return followUpVerdict
+	case stale != nil:
+		return stale.Verdict
+	case followUpVerdict != "":
+		return followUpVerdict
+	case obs.blocked:
+		return "blocked"
+	default:
+		return res.WorkResult
+	}
+}
+
+// markFollowUpBlocked routes a follow-up turn's blocked verdict into the
+// caller's blocked fork: any earlier passed/failed no longer describes the
+// turn, and the decline rides obs.blocked (with the follow-up's reason).
+func markFollowUpBlocked(res *Result, obs *streamObservation, followUp streamObservation) {
+	res.WorkResult = ""
+	obs.workResult = ""
+	obs.blocked = true
+	if followUp.blockedReason != "" {
+		obs.blockedReason = followUp.blockedReason
+	}
+}
+
 // resolveTurnManifest returns the validated manifest for this turn — the
 // written file first (only when readFile is set), else an inline `Intended
 // manifest` block recovered from finalText — or nil when neither yields a
-// usable manifest. Logs every outcome except the common "no manifest at all"
-// case.
-func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalText string, readFile bool) *TurnManifest {
-	var m *TurnManifest
+// usable manifest. fromFile reports that the manifest was read from a file
+// present on disk (not a printed block). Logs every outcome except the common
+// "no manifest at all" case.
+func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalText string, readFile bool) (m *TurnManifest, fromFile bool) {
 	err := ErrNoManifest
 	if readFile {
 		m, err = ParseManifest(worktreePath)
 	}
+	fromFile = err == nil
 	if err != nil {
 		if !errors.Is(err, ErrNoManifest) {
 			r.logger.Warn("turn-result manifest unusable; falling back to marker scrape",
 				"sessionId", qw.SessionID,
 				"err", err,
 			)
-			return nil
+			return nil, false
 		}
 		// No file. Try to recover an inline manifest the agent printed in its
 		// final message (a backstop for tool-restricted stages that cannot write
 		// the file). On any degrade, fall through to the marker scrape.
 		m, err = ParseInlineManifest(finalText)
 		if err != nil {
-			return nil
+			return nil, false
 		}
 		r.logger.Info("inline turn-result manifest recovered from final message (no file written)",
 			"sessionId", qw.SessionID,
@@ -543,9 +618,9 @@ func (r *Runner) resolveTurnManifest(worktreePath string, qw QueuedWork, finalTe
 	if err := validateManifestDeclaration(qw, m); err != nil {
 		r.logger.Warn("turn-result manifest repository projection unusable; falling back to marker scrape",
 			"sessionId", qw.SessionID, "err", err)
-		return nil
+		return nil, false
 	}
-	return m
+	return m, fromFile
 }
 
 // foldTurnManifest merges a validated manifest onto the envelope and the
@@ -565,7 +640,7 @@ func foldTurnManifest(m *TurnManifest, res *Result, obs *streamObservation) {
 		// A manifest-declared decline drives the same signal the marker scan
 		// would. The verdict itself ("blocked") is NOT a QA work-result — leave
 		// res.WorkResult unset for it (mirrors scanWorkResult, which never
-		// returns "blocked" into obs.workResult; loop.go's workResultBlockedRE
+		// returns "blocked" into obs.workResult; loop.go's scanVerdict
 		// routes the decline through obs.blocked instead).
 		obs.blocked = true
 		if m.BlockedReason != "" && obs.blockedReason == "" {
