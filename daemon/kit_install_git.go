@@ -137,14 +137,15 @@ func (f *gitKitFetcher) Fetch(ctx context.Context, source afclient.KitInstallSou
 		return nil, func() {}, err
 	}
 
-	bundlePath := manifestPath + ".sigstore"
 	hasBundle := false
-	if _, err := os.Stat(bundlePath); err == nil {
-		hasBundle = true
-	} else if !errors.Is(err, fs.ErrNotExist) {
-		// Non-not-found stat error is unusual; surface it but don't fail
-		// the fetch — the verifier reports SignedUnverified in that case.
-		hasBundle = false
+	if descriptorPath == "" {
+		_, bundleErr := readLegacyKitFile(manifestPath+".sigstore", defaultKitPackageLimits().MaxSignatureBytes)
+		if bundleErr == nil {
+			hasBundle = true
+		} else if !errors.Is(bundleErr, fs.ErrNotExist) {
+			cleanup()
+			return nil, func() {}, fmt.Errorf("%w: unsafe legacy signature bundle: %w", ErrKitInstallSourceFetchFailed, bundleErr)
+		}
 	}
 
 	return &fetchedKit{

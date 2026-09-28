@@ -35,6 +35,8 @@ type fakeKitClient struct {
 
 	gotInstallID, gotInstallVersion string
 	gotInstallTrustOverride         string
+	gotInstallSource                *afclient.KitInstallSource
+	gotInstallCalls                 int
 	gotEnableID, gotDisableID       string
 	gotSrcEnable, gotSrcDisable     string
 }
@@ -52,9 +54,16 @@ func (f *fakeKitClient) VerifyKitSignature(_ string) (*afclient.KitSignatureResu
 }
 
 func (f *fakeKitClient) InstallKit(id string, req afclient.KitInstallRequest) (*afclient.KitInstallResult, error) {
+	f.gotInstallCalls++
 	f.gotInstallID = id
 	f.gotInstallVersion = req.Version
 	f.gotInstallTrustOverride = req.TrustOverride
+	if req.Source != nil {
+		source := *req.Source
+		f.gotInstallSource = &source
+	} else {
+		f.gotInstallSource = nil
+	}
 	return f.installResp, f.installErr
 }
 
@@ -244,6 +253,115 @@ func TestKitCmd_Install_PassesVersion(t *testing.T) {
 	}
 }
 
+func TestKitCmd_Install_PassesGitSourceFlags(t *testing.T) {
+	client := &fakeKitClient{
+		installResp: &afclient.KitInstallResult{Kit: sampleKit(), Message: "installed"},
+	}
+	root := newKitRootForTest(client)
+	out, err := runRootCmd(t, root,
+		"kit", "install", "spring/java",
+		"--version", "2.0",
+		"--source-kind", "git",
+		"--source-url", "https://example.invalid/kits.git",
+		"--source-ref", "refs/tags/v2.0.0",
+		"--allow-unsigned", "--plain",
+	)
+	if err != nil {
+		t.Fatalf("kit install with Git source: %v", err)
+	}
+	wantSource := &afclient.KitInstallSource{
+		Kind: "git", URL: "https://example.invalid/kits.git", Ref: "refs/tags/v2.0.0",
+	}
+	if client.gotInstallCalls != 1 || client.gotInstallID != "spring/java" || client.gotInstallVersion != "2.0" {
+		t.Errorf("install request identity/version: calls=%d id=%q version=%q", client.gotInstallCalls, client.gotInstallID, client.gotInstallVersion)
+	}
+	if client.gotInstallSource == nil || *client.gotInstallSource != *wantSource {
+		t.Errorf("install source: got %+v, want %+v", client.gotInstallSource, wantSource)
+	}
+	if client.gotInstallTrustOverride != afclient.TrustOverrideAllowedThisOnce {
+		t.Errorf("trustOverride: want %q, got %q", afclient.TrustOverrideAllowedThisOnce, client.gotInstallTrustOverride)
+	}
+	if !strings.Contains(out, "WARNING") || !strings.Contains(out, "installed") {
+		t.Errorf("install output missing bypass warning or result:\n%s", out)
+	}
+}
+
+func TestKitCmd_Install_RejectsInvalidSourceFlagsBeforeRequest(t *testing.T) {
+	const sourceURL = "https://example.invalid/kits.git"
+	tests := []struct {
+		name string
+		args []string
+		want string
+	}{
+		{
+			name: "URL requires an explicit kind",
+			args: []string{"--source-url", sourceURL},
+			want: "--source-kind is required",
+		},
+		{
+			name: "ref requires an explicit kind",
+			args: []string{"--source-ref", "main"},
+			want: "--source-kind is required",
+		},
+		{
+			name: "ref requires a URL",
+			args: []string{"--source-kind", "git", "--source-ref", "main"},
+			want: "--source-url is required",
+		},
+		{
+			name: "git kind requires a URL",
+			args: []string{"--source-kind", "git"},
+			want: "--source-url is required",
+		},
+		{
+			name: "unsupported federation kind is rejected locally",
+			args: []string{"--source-kind", "tessl", "--source-url", sourceURL},
+			want: "supported source kind: git",
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			client := &fakeKitClient{}
+			root := newKitRootForTest(client)
+			args := append([]string{"kit", "install", "spring/java"}, tt.args...)
+			_, err := runRootCmd(t, root, args...)
+			if err == nil || !strings.Contains(err.Error(), tt.want) {
+				t.Fatalf("error = %v, want substring %q", err, tt.want)
+			}
+			if client.gotInstallCalls != 0 {
+				t.Fatalf("invalid source options reached InstallKit %d times", client.gotInstallCalls)
+			}
+		})
+	}
+}
+
+func TestKitCmd_Install_HelpExplainsSupportedGitSource(t *testing.T) {
+	root := newKitRootForTest(&fakeKitClient{})
+	installHelp, err := runRootCmd(t, root, "kit", "install", "--help")
+	if err != nil {
+		t.Fatalf("kit install --help: %v", err)
+	}
+	for _, want := range []string{"--source-kind", "--source-url", "--source-ref", "branch name or fully-qualified ref", "A source is required", "HTTP 501", "rejected by the CLI"} {
+		if !strings.Contains(installHelp, want) {
+			t.Errorf("install help missing %q:\n%s", want, installHelp)
+		}
+	}
+	if strings.Contains(installHelp, "commit") || strings.Contains(installHelp, "Tessl") {
+		t.Errorf("install help promises unsupported ref/kind semantics:\n%s", installHelp)
+	}
+	if strings.Contains(installHelp, "Wave 9 caveat") || strings.Contains(installHelp, "only locally-installed kits are supported") {
+		t.Errorf("install help retains the stale local-only caveat:\n%s", installHelp)
+	}
+
+	kitHelp, err := runRootCmd(t, newKitRootForTest(&fakeKitClient{}), "kit", "--help")
+	if err != nil {
+		t.Fatalf("kit --help: %v", err)
+	}
+	if !strings.Contains(kitHelp, "Install a kit from a Git source") || !strings.Contains(kitHelp, "rejects source kinds other than") || strings.Contains(kitHelp, "Only the `local` source has a working backend") {
+		t.Errorf("kit help does not describe the Git install source accurately:\n%s", kitHelp)
+	}
+}
+
 func TestKitCmd_Install_NotFound(t *testing.T) {
 	client := &fakeKitClient{installErr: fmt.Errorf("i: %w", afclient.ErrNotFound)}
 	root := newKitRootForTest(client)
@@ -265,6 +383,9 @@ func TestKitCmd_Install_DefaultSendsNoTrustOverride(t *testing.T) {
 	}
 	if client.gotInstallTrustOverride != "" {
 		t.Errorf("trustOverride: want empty without --allow-unsigned, got %q", client.gotInstallTrustOverride)
+	}
+	if client.gotInstallCalls != 1 || client.gotInstallSource != nil {
+		t.Errorf("no-source install: calls=%d source=%+v, want one call with nil Source", client.gotInstallCalls, client.gotInstallSource)
 	}
 }
 

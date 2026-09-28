@@ -10,7 +10,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
-## v0.72.49 — 2026-09-27
+## v0.72.50 — 2026-09-27
+
+### Features
+
+- Install kits from Git through the CLI with explicit source kind, URL and
+  optional branch or fully qualified ref. Unsupported kinds and incomplete
+  source options fail before sending an install request.
 
 ### Fixes
 
@@ -21,6 +27,19 @@ No unreleased changes.
   fixture moves to 0.157.1 with them, and a new worker test fails when the two
   images pin different Claude Code or Codex versions, or when the images' Codex
   pin differs from the version that fixture exercises.
+- Constrain legacy signature-bundle reads to bounded regular files and reject
+  linked or special files before verification and persistence. Missing bundles
+  remain unsigned and valid released signatures retain their trust behavior.
+
+### Chores
+
+- Join native Codex MCP fixture writers before removing their temporary homes,
+  so background plugin clones cannot race test cleanup.
+
+## v0.72.49 — 2026-09-27
+
+### Fixes
+
 - pi sessions no longer run under a fixed 16384-token output cap. The output
   limit is configuration: a dispatch carries it as the resolved profile's
   top-level `maxOutputTokens`, the harness passes it to the policy extension,

@@ -287,23 +287,20 @@ func runDirectMCPFixture(
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	process, err := startNativeFixtureProcess(cmd)
+	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
 	finished := false
 	defer func() {
 		if finished {
 			return
 		}
 		_ = stdin.Close()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+		if err := process.owned.stop(3 * time.Second); err != nil {
+			t.Errorf("stop owned native fixture writers: %v", err)
 		}
+		<-process.done
 	}()
 	client := NewClient(stdin, stdout)
 	t.Cleanup(func() { client.Stop(errors.New("fixture complete")) })
@@ -390,14 +387,17 @@ func runDirectMCPFixture(
 		t.Fatal(err)
 	}
 	select {
-	case err := <-done:
+	case err := <-process.done:
 		finished = true
 		if err != nil {
 			t.Fatalf("app-server exit: %v (stderr=%q)", err, stderr.String())
 		}
 	case <-time.After(3 * time.Second):
-		_ = cmd.Process.Kill()
-		<-done
+		if err := process.owned.stop(0); err != nil {
+			t.Errorf("stop timed-out native fixture writers: %v", err)
+		}
+		<-process.done
+		finished = true
 		t.Fatal("app-server did not exit after owned stdin closed")
 	}
 	if !allowedRealMCPFixtureStderr(stderr.String()) {
@@ -446,6 +446,7 @@ func TestAllowedRealMCPFixtureStderrIsNarrow(t *testing.T) {
 
 func TestIntegration_RealCodexInteractiveMCPDirectCalls(t *testing.T) {
 	launcher, native := requireCodexFixtureBinaries(t)
+	t.Run("OwnedDescendantCleanup", testNativeFixtureDescendantCleanup)
 	parentHome := os.Getenv("HOME")
 	for _, key := range codexEnvironmentAuthKeys {
 		t.Setenv(key, "")

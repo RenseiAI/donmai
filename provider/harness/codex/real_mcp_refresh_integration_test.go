@@ -178,19 +178,16 @@ func runNativeRefreshCalls(t *testing.T, ctx context.Context, native, ownedHome,
 	}
 	var stderr bytes.Buffer
 	cmd.Stderr = &stderr
-	if err := cmd.Start(); err != nil {
+	process, err := startNativeFixtureProcess(cmd)
+	if err != nil {
 		t.Fatal(err)
 	}
-	done := make(chan error, 1)
-	go func() { done <- cmd.Wait() }()
 	defer func() {
 		_ = stdin.Close()
-		select {
-		case <-done:
-		case <-time.After(3 * time.Second):
-			_ = cmd.Process.Kill()
-			<-done
+		if err := process.owned.stop(3 * time.Second); err != nil {
+			t.Errorf("stop owned native refresh writers: %v", err)
 		}
+		<-process.done
 	}()
 	client := NewClient(stdin, stdout)
 	defer client.Stop(errors.New("fixture complete"))
