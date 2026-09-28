@@ -168,7 +168,7 @@ Inspect and control individual agent sessions.
 donmai agent list [--all] [--json] [--sandbox <id>]
 donmai agent status <session-id>
 donmai agent stop <session-id>
-donmai agent chat <session-id>          # forward a prompt to a running agent
+donmai agent chat <session-id> <message> # forward a prompt to a running agent
 donmai agent reconnect <session-id>     # reconnect to an orphaned session
 ```
 
