@@ -66,6 +66,7 @@ type nativeLabelFixture struct {
 	issueLabelReads     int
 	forbidWrite         bool
 	keepArchivedSibling bool
+	ignoreLabelFilter   bool
 }
 
 func (f *nativeLabelFixture) label(id string) map[string]any {
@@ -118,7 +119,7 @@ func (f *nativeLabelFixture) serve(w http.ResponseWriter, r *http.Request) {
 			if label["archived"] == true {
 				continue
 			}
-			if len(allowed) > 0 {
+			if len(allowed) > 0 && !f.ignoreLabelFilter {
 				team, _ := label["team"].(map[string]any)
 				if team == nil && !allowed[""] || team != nil && !allowed[team["id"].(string)] {
 					continue
@@ -321,6 +322,20 @@ func TestNativeGroupSelectionInheritsParentTeamButRefusesUnrelatedTeam(t *testin
 	out, err := runLinearCmd(t, "", "select-group-label", "ENG-1", "--label-id", "next")
 	if err != nil || decodeJSON(t, out)["appliedLabelId"] != "next" || fixture.adds != 1 {
 		t.Fatalf("inherited parent-team group selection failed: out=%s err=%v adds=%d", out, err, fixture.adds)
+	}
+}
+
+func TestNativeGroupSelectionRefusesOutOfScopeProviderRowBeforeMutation(t *testing.T) {
+	fixture := &nativeLabelFixture{teams: []map[string]any{
+		{"id": "team-1", "key": "ENG", "name": "Engineering", "parent": nil},
+		{"id": "other-team", "key": "OTHER", "name": "Other", "parent": nil},
+	}, labels: []map[string]any{
+		{"id": "other-group", "name": "Type", "isGroup": true, "groupType": "singleSelect", "team": map[string]any{"id": "other-team", "key": "OTHER"}, "parent": nil},
+		{"id": "other-child", "name": "Feature", "isGroup": false, "groupType": nil, "team": map[string]any{"id": "other-team", "key": "OTHER"}, "parent": map[string]any{"id": "other-group", "name": "Type"}},
+	}, ignoreLabelFilter: true}
+	setupLinearTest(t, fixture.serve)
+	if _, err := runLinearCmd(t, "", "select-group-label", "ENG-1", "--label-id", "other-child"); err == nil || !strings.Contains(err.Error(), "outside the requested team's hierarchy") || fixture.adds != 0 {
+		t.Fatalf("out-of-scope provider row selected: err=%v adds=%d", err, fixture.adds)
 	}
 }
 

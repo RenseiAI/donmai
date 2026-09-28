@@ -1289,7 +1289,20 @@ func (c *Client) ListLabelDetailsForTeam(ctx context.Context, teamRef string) ([
 	}
 	or = append(or, map[string]any{"team": map[string]any{"null": true}})
 	filter := map[string]any{"or": or}
-	return c.listLabelDetails(ctx, filter)
+	labels, err := c.listLabelDetails(ctx, filter)
+	if err != nil {
+		return nil, err
+	}
+	allowed := map[string]bool{"": true}
+	for _, id := range ancestors {
+		allowed[id] = true
+	}
+	for _, label := range labels {
+		if !allowed[label.TeamID] {
+			return nil, fmt.Errorf("native label %s has team %s outside the requested team's hierarchy", label.ID, label.TeamID)
+		}
+	}
+	return labels, nil
 }
 
 func applicableLabelTeamIDs(teams []Team, ref string) ([]string, error) {
