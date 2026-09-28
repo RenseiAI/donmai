@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.51 — 2026-09-28
+
 ### Features
 
 - The runner reads the session's stamped execution-security levels
@@ -29,6 +33,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - Registration publishes the host's `executionSecurityEnforcement`
   attestation (index 0 on every substrate dimension unless the embedder
   attests more), on every registration path.
+- Reasoning effort accepts `max` above `xhigh`. Each session records the
+  effort it was spawned with, once, before any turn output: an activity
+  context marker (`contextKey: reasoningEffort`, whose value is the level,
+  `not-configured` or `unrecognized`) and `reasoningEffort` in `state.json`.
 
 ### Fixes
 
@@ -39,6 +47,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - Registrations no longer advertise a `sandbox` capability unless an
   isolation boundary is attested; an embedder-supplied `sandbox` tag is
   dropped otherwise.
+- A configured reasoning effort reaches the model unchanged on every harness
+  and session mode, and no harness picks a level when none is configured.
+  pi ran `xhigh` at `high` and dropped `max` to its own `medium` default; it
+  now sends both as configured, and on Chat Completions sends no reasoning
+  effort when none is configured. Claude and Codex interactive sessions now pass the effort.
+  Every Claude spawn fixes `CLAUDE_CODE_EFFORT_LEVEL` to the configured
+  level, or `auto` when none is configured, so a saved user setting or an
+  inherited variable no longer overrides it. gemini maps `max` to the model
+  family's highest level or budget instead of the medium default. A model profile without a `mode` keeps
+  the resolved profile's effort.
+- The runner resolves the turn verdict again after every follow-up turn,
+  whether steering or memory inject. A turn-result manifest written during
+  the follow-up now supplies the verdict and summary; before, it was ignored,
+  and the session reported completed with no verdict and the follow-up's
+  bare pull request URL as its summary. An earlier manifest still speaks for
+  the session: its summary beats the follow-up's closing text, and a
+  follow-up marker can only lower its verdict to failed or blocked, never
+  raise it. An agent-reported block never relabels a failure the runner
+  recorded itself.
+- `WORK_RESULT` and `AGENT_BLOCKED:` markers count only at the start of a
+  line, after optional blanks or an opening HTML-comment fence, so prose
+  that quotes a marker no longer sets the verdict. Within one message the
+  first anchored marker wins; across turns the latest message with a marker
+  decides. `WORK_RESULT: blocked` is a verdict of its own, a blocked
+  follow-up takes the blocked path even with no manifest, and its reason
+  comes from the message's first anchored `AGENT_BLOCKED:` line. Matching
+  folds ASCII case only. An `Intended manifest:` block counts only when its
+  label starts a line (markdown lead-ins allowed) and never raises a
+  standing verdict. A marker written after prose on the same line is no
+  longer a runner verdict.
 
 ## v0.72.50 — 2026-09-27
 
