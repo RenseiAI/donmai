@@ -8,6 +8,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+## v0.72.53 — 2026-09-28
+
+### Fixes
+
+- Native architecture assessment fetches paginated file metadata when a pull
+  request exceeds the file list returned by `gh pr view`. Strict assessments
+  still reject missing pages, duplicate paths, and incomplete patches instead
+  of reporting a clean result.
+
 ### Chores
 
 - Release tags can be pinned to one dedicated tagging identity. With the
