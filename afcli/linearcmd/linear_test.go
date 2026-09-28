@@ -593,6 +593,103 @@ func TestLinearUpdateIssue(t *testing.T) {
 	}
 }
 
+func TestLinearUpdateIssueReturnsResultingPriority(t *testing.T) {
+	tests := []struct {
+		name         string
+		args         []string
+		result       int
+		wantInput    *float64
+		throughProxy bool
+	}{
+		{name: "nonzero result from mutation", args: []string{"--priority", "1"}, result: 3, wantInput: func() *float64 { v := float64(1); return &v }()},
+		{name: "explicitly cleared priority", args: []string{"--priority", "0"}, result: 0, wantInput: func() *float64 { v := float64(0); return &v }()},
+		{name: "unchanged priority", args: []string{"--title", "Renamed"}, result: 4},
+		{name: "proxied composed command", args: []string{"--priority", "1"}, result: 4, wantInput: func() *float64 { v := float64(1); return &v }(), throughProxy: true},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			initial := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "team-1", "ENG", "Engineering")
+			updated := strings.Replace(initial, `"priority":2`, fmt.Sprintf(`"priority":%d`, tt.result), 1)
+			var updateCalls int
+			var mutationInput map[string]any
+			var queryIncludesPriority bool
+			var proxyAuth string
+			handler := func(w http.ResponseWriter, r *http.Request) {
+				proxyAuth = r.Header.Get("Authorization")
+				var req struct {
+					Query     string         `json:"query"`
+					Variables map[string]any `json:"variables"`
+				}
+				if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+					t.Errorf("decode request: %v", err)
+					return
+				}
+				switch {
+				case strings.Contains(req.Query, "GetIssue"):
+					writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, initial))
+				case strings.Contains(req.Query, "UpdateIssue"):
+					updateCalls++
+					mutationInput, _ = req.Variables["input"].(map[string]any)
+					queryIncludesPriority = strings.Contains(req.Query, "url priority sortOrder")
+					writeLinearGQLData(w, fmt.Sprintf(`{"issueUpdate":{"success":true,"issue":%s}}`, updated))
+				default:
+					t.Errorf("unexpected query: %s", req.Query)
+					writeLinearGQLData(w, `{}`)
+				}
+			}
+
+			var out string
+			var err error
+			if tt.throughProxy {
+				t.Setenv("LINEAR_API_KEY", "")
+				t.Setenv("LINEAR_ACCESS_TOKEN", "")
+				t.Setenv("WORKER_AUTH_TOKEN", "")
+				setTestBaseURL("")
+				t.Cleanup(func() { setTestBaseURL("") })
+				srv := httptest.NewServer(http.HandlerFunc(handler))
+				t.Cleanup(srv.Close)
+				ds := func() afclient.DataSource { return afclient.NewAuthenticatedClient(srv.URL, "rsk_fixture") }
+				root := New(ds, "donmai")
+				root.SilenceErrors = true
+				var buf bytes.Buffer
+				root.SetOut(&buf)
+				root.SetErr(&buf)
+				root.SetArgs(append([]string{"update-issue", "ENG-1"}, tt.args...))
+				err = root.Execute()
+				out = buf.String()
+			} else {
+				setupLinearTest(t, handler)
+				out, err = runLinearCmd(t, "", append([]string{"update-issue", "ENG-1"}, tt.args...)...)
+			}
+			if err != nil {
+				t.Fatalf("update-issue: %v\nout: %s", err, out)
+			}
+			if updateCalls != 1 || !queryIncludesPriority {
+				t.Fatalf("mutation calls = %d, query selects priority = %t", updateCalls, queryIncludesPriority)
+			}
+			if tt.throughProxy && proxyAuth != "Bearer rsk_fixture" {
+				t.Errorf("proxy authorization = %q", proxyAuth)
+			}
+			if tt.wantInput == nil {
+				if _, ok := mutationInput["priority"]; ok {
+					t.Errorf("unexpected priority mutation input: %#v", mutationInput)
+				}
+			} else if mutationInput["priority"] != *tt.wantInput {
+				t.Errorf("priority mutation input = %v, want %v", mutationInput["priority"], *tt.wantInput)
+			}
+			result := decodeJSON(t, out)
+			if got, ok := result["priority"].(float64); !ok || int(got) != tt.result {
+				t.Errorf("response priority = %v, want authoritative result %d", result["priority"], tt.result)
+			}
+			for _, field := range []string{"id", "identifier", "title", "status", "project", "url"} {
+				if _, ok := result[field]; !ok {
+					t.Errorf("existing response field %q missing", field)
+				}
+			}
+		})
+	}
+}
+
 func TestLinearUpdateIssue_ProjectOnlyResolvesSlugAndMutatesOnce(t *testing.T) {
 	original := issueNodeJSON("issue-1", "ENG-1", "Issue", "Backlog", "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee", "ENG", "Engineering")
 	updated := strings.Replace(original, `"name":"TestProject"`, `"name":"Destination"`, 1)
