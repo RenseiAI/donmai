@@ -42,12 +42,22 @@ func resolveNativeLabelScope(ctx context.Context, client linear.Linear, workspac
 	if workspace {
 		return nativeLabelScope{}, nil
 	}
-	team, err := client.GetTeamByName(ctx, teamRef)
+	teams, err := client.ListTeams(ctx)
 	if err != nil {
-		return nativeLabelScope{}, fmt.Errorf("resolve explicit label team %q: %w", teamRef, err)
+		return nativeLabelScope{}, fmt.Errorf("list accessible label teams: %w", err)
 	}
-	if team == nil || team.ID == "" || team.Key == "" ||
-		(!strings.EqualFold(teamRef, team.Key) && !strings.EqualFold(teamRef, team.ID)) {
+	var team *linear.Team
+	for i := range teams {
+		candidate := &teams[i]
+		if candidate.Key != teamRef && !strings.EqualFold(candidate.ID, teamRef) {
+			continue
+		}
+		if team != nil {
+			return nativeLabelScope{}, fmt.Errorf("team scope %q is ambiguous", teamRef)
+		}
+		team = candidate
+	}
+	if team == nil || team.ID == "" || team.Key == "" {
 		return nativeLabelScope{}, fmt.Errorf("team scope %q is not an accessible canonical team key or UUID", teamRef)
 	}
 	return nativeLabelScope{teamID: team.ID, teamKey: team.Key}, nil
@@ -402,7 +412,7 @@ func newLinearSelectGroupLabelCmd(ds func() afclient.DataSource, bin string) *co
 				return fmt.Errorf("list issue-team labels: %w", err)
 			}
 			target, found := nativeLabelByID(catalog, strings.TrimSpace(labelID))
-			if !found || target.IsGroup || target.ParentID == "" || (target.TeamID != "" && target.TeamID != issue.Team.ID) {
+			if !found || target.IsGroup || target.ParentID == "" {
 				return fmt.Errorf("label id %q is not an applicable native group child for team %s", labelID, issue.Team.Key)
 			}
 			group, found := nativeLabelByID(catalog, target.ParentID)

@@ -428,7 +428,7 @@ func TestLinearCreateIssueDoesNotCreateWithUnknownLabels(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}]}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}]}}`)
 		case strings.Contains(req.Query, "ListLabels"):
 			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-bug","name":"Bug"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "CreateIssue"):
@@ -2782,7 +2782,7 @@ func TestLinearListLabelsScopesByTeam(t *testing.T) {
 		}
 		switch {
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			sawLabelFilter, _ = req.Variables["filter"].(map[string]any)
 			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-1","name":"Bug","isGroup":false,"groupType":null,"team":null,"parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
@@ -2888,7 +2888,7 @@ func TestLinearListProjectsTeamFilter(t *testing.T) {
 		_ = json.NewDecoder(r.Body).Decode(&req)
 		switch {
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListProjects"):
 			filter, _ := req.Variables["filter"].(map[string]any)
 			accessible, _ := filter["accessibleTeams"].(map[string]any)
@@ -2956,7 +2956,7 @@ func TestLinearApplyLabel(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "issueLabels"):
 			writeLinearGQLData(w, labelsData)
 		case strings.Contains(req.Query, "issueAddLabel"):
@@ -3009,7 +3009,7 @@ func TestLinearApplyLabelNotFound(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "issueLabels"):
 			writeLinearGQLData(w, labelsData)
 		default:
@@ -3040,7 +3040,7 @@ func TestLinearApplyLabelCreateUsesIssueTeam(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			labelReads++
 			if labelReads == 1 {
@@ -3083,7 +3083,7 @@ func TestLinearApplyLabelCreateDoesNotDuplicateApplicableLabel(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			writeLinearGQLData(w, `{"issueLabels":{"nodes":[{"id":"label-1","name":"Feature","isGroup":false,"groupType":null,"team":null,"parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "issueLabelCreate"):
@@ -3120,7 +3120,7 @@ func TestLinearApplyLabelCreateFailureDoesNotMutateIssue(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			labelReads++
 			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
@@ -3154,7 +3154,7 @@ func TestLinearApplyLabelCreateReportsAuthorizationFailure(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			labelReads++
 			writeLinearGQLData(w, `{"issueLabels":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
@@ -3188,7 +3188,7 @@ func TestLinearApplyLabelCreateRecoversDuplicateRace(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			labelReads++
 			if labelReads == 1 {
@@ -3230,7 +3230,7 @@ func TestLinearApplyLabelReportsCreateThenApplyPartialFailure(t *testing.T) {
 		case strings.Contains(req.Query, "GetIssue"):
 			writeLinearGQLData(w, fmt.Sprintf(`{"issue":%s}`, issueJSON))
 		case strings.Contains(req.Query, "ListTeams"):
-			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering"}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
+			writeLinearGQLData(w, `{"teams":{"nodes":[{"id":"team-1","key":"ENG","name":"Engineering","parent":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 		case strings.Contains(req.Query, "ListLabelDetails"):
 			labelReads++
 			if labelReads == 1 {

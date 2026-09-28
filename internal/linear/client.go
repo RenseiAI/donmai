@@ -170,7 +170,7 @@ const (
 
 	queryListTeams = `query ListTeams($filter: TeamFilter, $after: String) {
 	  teams(filter: $filter, first: 100, after: $after) {
-	    nodes { id key name }
+	    nodes { id key name parent { id } }
 	    pageInfo { hasNextPage endCursor }
 	  }
 }`
@@ -1268,20 +1268,72 @@ func (c *Client) ListLabelDetails(ctx context.Context) ([]LabelInfo, error) {
 	return c.listLabelDetails(ctx, nil)
 }
 
-// ListLabelDetailsForTeam includes that team's labels and workspace labels.
+// ListLabelDetailsForTeam includes the team's labels, labels inherited from
+// accessible ancestor teams, and workspace labels. An incomplete hierarchy
+// fails closed rather than presenting an incomplete applicability catalog.
 func (c *Client) ListLabelDetailsForTeam(ctx context.Context, teamRef string) ([]LabelInfo, error) {
 	if err := c.requireStrictLabelProxy(); err != nil {
 		return nil, err
 	}
-	team, err := c.resolveCatalogTeamKeyOrID(ctx, teamRef)
+	teams, err := c.ListTeams(ctx)
 	if err != nil {
 		return nil, fmt.Errorf("resolve team for label scope: %w", err)
 	}
-	filter := map[string]any{"or": []map[string]any{
-		{"team": map[string]any{"id": map[string]any{"eq": team.ID}}},
-		{"team": map[string]any{"null": true}},
-	}}
+	ancestors, err := applicableLabelTeamIDs(teams, teamRef)
+	if err != nil {
+		return nil, fmt.Errorf("resolve team for label scope: %w", err)
+	}
+	or := make([]map[string]any, 0, len(ancestors)+1)
+	for _, id := range ancestors {
+		or = append(or, map[string]any{"team": map[string]any{"id": map[string]any{"eq": id}}})
+	}
+	or = append(or, map[string]any{"team": map[string]any{"null": true}})
+	filter := map[string]any{"or": or}
 	return c.listLabelDetails(ctx, filter)
+}
+
+func applicableLabelTeamIDs(teams []Team, ref string) ([]string, error) {
+	byID := make(map[string]Team, len(teams))
+	var selected *Team
+	for i := range teams {
+		team := teams[i]
+		if _, duplicate := byID[team.ID]; duplicate {
+			return nil, fmt.Errorf("duplicate accessible team id %q", team.ID)
+		}
+		byID[team.ID] = team
+		if (looksLikeID(ref) && strings.EqualFold(team.ID, ref)) || (!looksLikeID(ref) && team.Key == ref) {
+			if selected != nil {
+				return nil, fmt.Errorf("team key or id %q is ambiguous", ref)
+			}
+			selected = &teams[i]
+		}
+	}
+	if selected == nil {
+		return nil, fmt.Errorf("team key or id %q not found", ref)
+	}
+	ids := make([]string, 0, 5)
+	seen := make(map[string]bool)
+	for current := *selected; ; {
+		if !current.ParentKnown {
+			return nil, fmt.Errorf("team %s parent hierarchy is missing", current.ID)
+		}
+		if seen[current.ID] {
+			return nil, fmt.Errorf("team %s parent hierarchy contains a cycle", current.ID)
+		}
+		if len(ids) >= 6 {
+			return nil, fmt.Errorf("team parent hierarchy exceeds supported depth")
+		}
+		seen[current.ID] = true
+		ids = append(ids, current.ID)
+		if current.ParentID == "" {
+			return ids, nil
+		}
+		parent, ok := byID[current.ParentID]
+		if !ok {
+			return nil, fmt.Errorf("parent team %s is not accessible in the complete team catalog", current.ParentID)
+		}
+		current = parent
+	}
 }
 
 func (c *Client) listLabelDetails(ctx context.Context, filter map[string]any) ([]LabelInfo, error) {
@@ -1527,7 +1579,23 @@ func catalogTeam(node *teamNode, index int) (Team, error) {
 	if err != nil {
 		return Team{}, err
 	}
-	return Team{ID: id, Key: key, Name: name}, nil
+	team := Team{ID: id, Key: key, Name: name}
+	if node.Parent != nil {
+		team.ParentKnown = true
+		if !bytes.Equal(node.Parent, []byte("null")) {
+			var parent struct {
+				ID *string `json:"id"`
+			}
+			if err := json.Unmarshal(node.Parent, &parent); err != nil {
+				return Team{}, fmt.Errorf("teams node %d parent: %w", index, err)
+			}
+			team.ParentID, err = requiredCatalogString(parent.ID, fmt.Sprintf("teams node %d parent id", index))
+			if err != nil {
+				return Team{}, err
+			}
+		}
+	}
+	return team, nil
 }
 
 func catalogTeams(connection *teamConnection) ([]Team, error) {

@@ -1,6 +1,9 @@
 package linear
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // OptionalString preserves Linear's three nullable-input states: omitted,
 // explicit null, and a string value. Use StringValue or NullString when
@@ -156,9 +159,11 @@ type Project struct {
 
 // Team represents a Linear team.
 type Team struct {
-	ID   string `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID          string `json:"id"`
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	ParentID    string `json:"parentId,omitempty"`
+	ParentKnown bool   `json:"-"` // the hierarchy query returned parent, even when null
 }
 
 // CreateIssueInput is the input for creating a Linear issue.
@@ -369,9 +374,10 @@ type userNode struct {
 
 // teamNode is the JSON structure for a team.
 type teamNode struct {
-	ID   *string `json:"id"`
-	Key  *string `json:"key"`
-	Name *string `json:"name"`
+	ID     *string         `json:"id"`
+	Key    *string         `json:"key"`
+	Name   *string         `json:"name"`
+	Parent json.RawMessage `json:"parent"`
 }
 
 // projectNode is the JSON structure for a project.

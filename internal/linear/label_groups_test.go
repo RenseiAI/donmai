@@ -47,6 +47,24 @@ func TestNativeLabelCatalogPreservesScopesAndPaginates(t *testing.T) {
 	}
 }
 
+func TestApplicableLabelTeamHierarchyFailsClosed(t *testing.T) {
+	for _, tc := range []struct {
+		name  string
+		teams []Team
+	}{
+		{"missing_parent_field", []Team{{ID: "child", Key: "CHILD"}}},
+		{"inaccessible_parent", []Team{{ID: "child", Key: "CHILD", ParentID: "private", ParentKnown: true}}},
+		{"cycle", []Team{{ID: "child", Key: "CHILD", ParentID: "parent", ParentKnown: true}, {ID: "parent", Key: "PARENT", ParentID: "child", ParentKnown: true}}},
+		{"duplicate_id", []Team{{ID: "child", Key: "CHILD", ParentKnown: true}, {ID: "child", Key: "OTHER", ParentKnown: true}}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if ids, err := applicableLabelTeamIDs(tc.teams, "CHILD"); err == nil || ids != nil {
+				t.Fatalf("incomplete/ambiguous hierarchy accepted: ids=%v err=%v", ids, err)
+			}
+		})
+	}
+}
+
 func TestListIssueLabelsPaginatesAndFailsClosedOnMissingCursor(t *testing.T) {
 	for _, tc := range []struct {
 		name       string

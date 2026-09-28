@@ -58,6 +58,7 @@ func TestListLabelsPreservesNativeGroupAndDuplicateScopeMetadata(t *testing.T) {
 
 type nativeLabelFixture struct {
 	labels              []map[string]any
+	teams               []map[string]any
 	issueLabels         []string
 	creates             int
 	updates             int
@@ -95,13 +96,35 @@ func (f *nativeLabelFixture) serve(w http.ResponseWriter, r *http.Request) {
 	}
 	switch {
 	case strings.Contains(request.Query, "ListTeams"):
-		write(map[string]any{"teams": map[string]any{"nodes": []map[string]any{{"id": "team-1", "key": "ENG", "name": "Engineering"}}, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil}}})
+		teams := f.teams
+		if teams == nil {
+			teams = []map[string]any{{"id": "team-1", "key": "ENG", "name": "Engineering", "parent": nil}}
+		}
+		write(map[string]any{"teams": map[string]any{"nodes": teams, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil}}})
 	case strings.Contains(request.Query, "ListLabelDetails"):
 		active := make([]map[string]any, 0, len(f.labels))
-		for _, label := range f.labels {
-			if label["archived"] != true {
-				active = append(active, label)
+		allowed := map[string]bool{}
+		if filter, ok := request.Variables["filter"].(map[string]any); ok {
+			for _, clause := range filter["or"].([]any) {
+				team := clause.(map[string]any)["team"].(map[string]any)
+				if team["null"] == true {
+					allowed[""] = true
+				} else {
+					allowed[team["id"].(map[string]any)["eq"].(string)] = true
+				}
 			}
+		}
+		for _, label := range f.labels {
+			if label["archived"] == true {
+				continue
+			}
+			if len(allowed) > 0 {
+				team, _ := label["team"].(map[string]any)
+				if team == nil && !allowed[""] || team != nil && !allowed[team["id"].(string)] {
+					continue
+				}
+			}
+			active = append(active, label)
 		}
 		write(map[string]any{"issueLabels": map[string]any{"nodes": active, "pageInfo": map[string]any{"hasNextPage": false, "endCursor": nil}}})
 	case strings.Contains(request.Query, "ListIssueLabels"):
@@ -276,6 +299,40 @@ func TestNativeGroupSelectionRefusesProviderRetainingArchivedSibling(t *testing.
 	}
 	if fixture.adds != 1 {
 		t.Fatalf("native atomic add calls=%d, want one", fixture.adds)
+	}
+}
+
+func TestNativeGroupSelectionInheritsParentTeamButRefusesUnrelatedTeam(t *testing.T) {
+	fixture := &nativeLabelFixture{teams: []map[string]any{
+		{"id": "team-1", "key": "ENG", "name": "Engineering", "parent": map[string]any{"id": "parent-team"}},
+		{"id": "parent-team", "key": "PARENT", "name": "Parent", "parent": nil},
+		{"id": "other-team", "key": "OTHER", "name": "Other", "parent": nil},
+	}, labels: []map[string]any{
+		{"id": "parent-group", "name": "Type", "isGroup": true, "groupType": "singleSelect", "team": map[string]any{"id": "parent-team", "key": "PARENT"}, "parent": nil},
+		{"id": "old", "name": "Bug", "isGroup": false, "groupType": nil, "team": map[string]any{"id": "parent-team", "key": "PARENT"}, "parent": map[string]any{"id": "parent-group", "name": "Type"}},
+		{"id": "next", "name": "Feature", "isGroup": false, "groupType": nil, "team": map[string]any{"id": "parent-team", "key": "PARENT"}, "parent": map[string]any{"id": "parent-group", "name": "Type"}},
+		{"id": "other-group", "name": "Other Type", "isGroup": true, "groupType": "singleSelect", "team": map[string]any{"id": "other-team", "key": "OTHER"}, "parent": nil},
+		{"id": "other-child", "name": "Other", "isGroup": false, "groupType": nil, "team": map[string]any{"id": "other-team", "key": "OTHER"}, "parent": map[string]any{"id": "other-group", "name": "Other Type"}},
+	}, issueLabels: []string{"old"}}
+	setupLinearTest(t, fixture.serve)
+	if _, err := runLinearCmd(t, "", "select-group-label", "ENG-1", "--label-id", "other-child"); err == nil || !strings.Contains(err.Error(), "not an applicable") || fixture.adds != 0 {
+		t.Fatalf("unrelated team label selected: err=%v adds=%d", err, fixture.adds)
+	}
+	out, err := runLinearCmd(t, "", "select-group-label", "ENG-1", "--label-id", "next")
+	if err != nil || decodeJSON(t, out)["appliedLabelId"] != "next" || fixture.adds != 1 {
+		t.Fatalf("inherited parent-team group selection failed: out=%s err=%v adds=%d", out, err, fixture.adds)
+	}
+}
+
+func TestNativeLabelScopePrefersCanonicalKeyOverAnotherTeamDisplayName(t *testing.T) {
+	fixture := &nativeLabelFixture{teams: []map[string]any{
+		{"id": "other-team", "key": "OTHER", "name": "ENG", "parent": nil},
+		{"id": "team-1", "key": "ENG", "name": "Engineering", "parent": nil},
+	}}
+	setupLinearTest(t, fixture.serve)
+	out, err := runLinearCmd(t, "", "create-label-group", "--name", "Type", "--team", "ENG")
+	if err != nil || decodeJSON(t, out)["label"].(map[string]any)["teamId"] != "team-1" || fixture.creates != 1 {
+		t.Fatalf("canonical key lost to display-name collision: out=%s err=%v creates=%d", out, err, fixture.creates)
 	}
 }
 
