@@ -66,7 +66,7 @@ type Config struct {
 	// model-access narrowing block (P3 / ADR-2026-06-06 D5). nil = no
 	// machine narrowing => the platform ceiling holds unchanged (identity).
 	// Written by the modelAccess.set / modelAccess.clear daemon mutations
-	// (mutation_apply.go); read by the rensei-tui fail-closed gate one step
+	// (mutation_apply.go); read by the downstream UI fail-closed gate one step
 	// before the credential hop. Policy/routing only — NEVER credentials.
 	// The type lives in runner/access so the enforcement mirror and the
 	// daemon read the same struct (daemon -> runner/access, one-way; no
@@ -83,8 +83,8 @@ type Config struct {
 	// Trust holds the daemon-wide signature-verification policy
 	// (sigstore bundle-mode verifier mode + issuer allowlist + audit
 	// actor). Optional; applyDefaults seeds Mode via
-	// resolveDefaultTrustMode — TrustModeSignedByAllowlist unless the
-	// operator opts out through DONMAI_KIT_TRUST_MODE. Per
+	// resolveDefaultTrustMode — TrustModeSignedByAllowlist unless another
+	// non-permissive environment mode is selected. Per
 	// 002-provider-base-contract.md § "Signing and trust". Lives on
 	// Config (not on KitConfig) because the trust mode applies across
 	// all plugin families per 015-plugin-spec.md § "Auth + trust".
@@ -408,8 +408,8 @@ func applyDefaults(c *Config) {
 		c.Kit.ScanPaths = []string{DefaultKitScanPath()}
 	}
 	if c.Trust.Mode == "" {
-		// Secure default: signed-by-allowlist unless the operator opts
-		// out via DONMAI_KIT_TRUST_MODE. Kept in lock-step with
+		// Secure default: signed-by-allowlist; environment cannot
+		// lower it to permissive. Kept in lock-step with
 		// kitRegistryOrEmpty (handle_kit.go), which applies the same
 		// default when no Config is loaded at all.
 		c.Trust.Mode = resolveDefaultTrustMode()

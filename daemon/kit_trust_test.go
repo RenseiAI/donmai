@@ -37,7 +37,7 @@ const minimalKitTOML = `api = "donmai.dev/v1"
 [kit]
 id = "rensei/example"
 version = "0.1.0"
-name = "Rensei Example"
+name = "Example Kit"
 authorIdentity = "did:web:example.com"
 `
 
@@ -296,7 +296,7 @@ func TestResolveDefaultTrustMode(t *testing.T) {
 		want TrustMode
 	}{
 		{"unset-defaults-allowlist", "", TrustModeSignedByAllowlist},
-		{"permissive-opt-out", "permissive", TrustModePermissive},
+		{"permissive-cannot-downgrade-default", "permissive", TrustModeSignedByAllowlist},
 		{"explicit-allowlist", "signed-by-allowlist", TrustModeSignedByAllowlist},
 		{"attested-recognised", "attested", TrustModeAttested},
 		{"unrecognised-falls-back-to-allowlist", "anything-goes", TrustModeSignedByAllowlist},
@@ -337,7 +337,7 @@ func TestValidateTrustConfig(t *testing.T) {
 	if err == nil {
 		t.Fatal("validateTrustConfig: want error for allowlist + empty issuer set")
 	}
-	for _, want := range []string{"trust.issuerSet", envKitTrustMode} {
+	for _, want := range []string{"trust.issuerSet", "trust.mode: permissive"} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error: want substring %q, got: %s", want, err.Error())
 		}
@@ -366,7 +366,7 @@ func TestKitRegistry_InstallTrustGateRejectionIsActionable(t *testing.T) {
 		string(afclient.KitTrustUnsigned),
 		"trust.issuerSet",
 		"--allow-unsigned",
-		envKitTrustMode,
+		"trust.mode: permissive",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("rejection error: want substring %q, got: %s", want, err.Error())

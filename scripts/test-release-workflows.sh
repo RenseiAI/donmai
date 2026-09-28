@@ -300,6 +300,45 @@ certificate_count=$(grep -Fc 'certificate: "${artifact}.pem"' "${root_dir}/.gore
 [[ "${certificate_count}" == 2 ]] || fail 'archive and checksum certificates are not both registered with GoReleaser'
 grep -Fq 'install -m 0755 scripts/sign-and-notarize.sh' "${root_dir}/.github/workflows/release.yml" || fail 'manual retries can pair the current config with an older signing script'
 grep -Fq 'version: "v2.17.1"' "${root_dir}/.github/workflows/release.yml" || fail 'release GoReleaser version is not pinned to the verified pipeline implementation'
+ruby -ryaml - "${root_dir}/.github/workflows/release.yml" "${root_dir}/.github/workflows/release-signing-integration.yml" <<'RUBY'
+release_file, integration_file = ARGV
+release = YAML.safe_load(File.read(release_file), permitted_classes: [], permitted_symbols: [], aliases: false)
+integration = YAML.safe_load(File.read(integration_file), permitted_classes: [], permitted_symbols: [], aliases: false)
+abort 'FAIL: signing integration must have read-only contents permission' unless integration['permissions'] == { 'contents' => 'read' }
+
+# Psych's YAML 1.1 parser reads the GitHub Actions `on` key as true.
+triggers = integration[true] || integration['on']
+required_paths = %w[
+  .github/workflows/release-signing-integration.yml
+  .github/workflows/release.yml
+  .goreleaser.yaml
+  scripts/sign-and-notarize.sh
+  scripts/test-sign-and-notarize.sh
+  scripts/test-release-workflows.sh
+  go.mod
+]
+%w[pull_request push].each do |event|
+  entry = triggers.is_a?(Hash) && triggers[event]
+  abort "FAIL: signing integration missing bounded #{event} trigger" unless entry.is_a?(Hash) && entry['branches'] == ['main']
+  abort "FAIL: signing integration #{event} paths changed" unless entry['paths'] == required_paths
+end
+abort 'FAIL: signing integration has an unreviewed trigger' unless triggers.keys.sort == %w[pull_request push]
+
+jobs = integration['jobs']
+abort 'FAIL: signing integration must declare one job' unless jobs.is_a?(Hash) && jobs.keys == ['signing-integration']
+job = jobs['signing-integration']
+abort 'FAIL: signing integration job has no timeout' unless job['timeout-minutes'].is_a?(Integer) && job['timeout-minutes'] <= 30
+steps = job['steps']
+abort 'FAIL: signing integration job has no steps' unless steps.is_a?(Array)
+release_action = release.fetch('jobs').fetch('release').fetch('steps').find { |step| step['uses'].to_s.start_with?('goreleaser/goreleaser-action@') }
+integration_action = steps.find { |step| step['uses'].to_s.start_with?('goreleaser/goreleaser-action@') }
+abort 'FAIL: signing integration GoReleaser action is absent or differs from release' unless integration_action && release_action && integration_action['uses'] == release_action['uses']
+abort 'FAIL: signing integration GoReleaser version differs from release' unless integration_action.dig('with', 'version') == release_action.dig('with', 'version')
+abort 'FAIL: signing integration must install GoReleaser without publishing' unless integration_action.dig('with', 'install-only') == true && !integration_action.dig('with', 'args')
+run = steps.find { |step| step['name'] == 'Hermetic signing pipeline' }
+abort 'FAIL: GoReleaser signing integration is not enrolled in CI' unless run && run['run'].strip == 'bash scripts/test-sign-and-notarize.sh --goreleaser'
+abort 'FAIL: signing integration must use the release Go toolchain floor' unless run['env'] == { 'GOTOOLCHAIN' => 'go1.26.6', 'GOWORK' => 'off' }
+RUBY
 if awk '/^signs:/{in_signs=1} in_signs && /^[[:space:]]+cmd:.*sign-and-notarize/{found=1} END{exit found ? 0 : 1}' "${root_dir}/.goreleaser.yaml"; then
   fail 'archive/checksum signs pipe still invokes the archive-mutating Apple signer'
 fi

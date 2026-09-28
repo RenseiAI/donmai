@@ -602,8 +602,8 @@ autoUpdate:
 
 // TestLoadConfig_TrustMode_DefaultsToSignedByAllowlist asserts the
 // secure default trust mode — daemon.yaml with no `trust:` block lands
-// `trust.mode: signed-by-allowlist` after applyDefaults, unless the
-// operator opts out via DONMAI_KIT_TRUST_MODE.
+// `trust.mode: signed-by-allowlist` after applyDefaults, including when
+// the environment asks for permissive mode.
 func TestLoadConfig_TrustMode_DefaultsToSignedByAllowlist(t *testing.T) {
 	t.Setenv(envKitTrustMode, "")
 	dir := t.TempDir()
@@ -642,15 +642,25 @@ autoUpdate:
 		t.Errorf("Trust.IssuerSet default: want [%q], got %v", vendorSignerSAN, got)
 	}
 
-	// Operator opt-out: DONMAI_KIT_TRUST_MODE=permissive flips the
-	// applyDefaults seed back to permissive.
+	// An environment-only permissive request cannot lower the default.
 	t.Setenv(envKitTrustMode, string(TrustModePermissive))
 	cfg2, err := LoadConfig(path)
 	if err != nil {
 		t.Fatalf("LoadConfig (env override): %v", err)
 	}
-	if cfg2.Trust.Mode != TrustModePermissive {
-		t.Errorf("Trust.Mode with %s=permissive: want %q, got %q", envKitTrustMode, TrustModePermissive, cfg2.Trust.Mode)
+	if cfg2.Trust.Mode != TrustModeSignedByAllowlist {
+		t.Errorf("Trust.Mode with %s=permissive: want %q, got %q", envKitTrustMode, TrustModeSignedByAllowlist, cfg2.Trust.Mode)
+	}
+	if err := os.WriteFile(path, append(body, []byte("trust:\n  mode: permissive\n")...), 0o600); err != nil {
+		t.Fatalf("write explicit mode: %v", err)
+	}
+	t.Setenv(envKitTrustMode, string(TrustModeAttested))
+	cfg3, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("LoadConfig (explicit YAML mode): %v", err)
+	}
+	if cfg3.Trust.Mode != TrustModePermissive {
+		t.Errorf("explicit YAML mode with attested environment: want %q, got %q", TrustModePermissive, cfg3.Trust.Mode)
 	}
 }
 

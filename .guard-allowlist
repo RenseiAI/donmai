@@ -97,6 +97,9 @@ TRACKER_ID_SLUG :: ^runner/operational_payload_test\.go :: r[e]n-2034 :: qw\.Bra
 CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (platform's /api/cl[i]/linear/graphql proxy where APIKey holds the|platform's /api/cl[i]/linear/graphql proxy under the caller's rsk_ token|BaseURL:[[:space:]]+origin \+ "/api/cl[i]/linear/graphql")
 CLOSED_CLI_ENDPOINT :: ^internal/linear/client_test\.go :: /api/cl[i]/ :: c\.BaseURL != "https://platform\.example\.com/api/cl[i]/linear/graphql"
 CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear_test\.go :: /api/cl[i]/ :: (subcommand routes its GraphQL through `/api/cl[i]/linear/graphql`|subcommand proxies GraphQL through /api/cl[i]/linear/graphql|gotPath != "/api/cl[i]/linear/graphql"|t\.Errorf\("path = %q, want %q", gotPath, "/api/cl[i]/linear/graphql"\))
+# The update-response fixture also checks the accepted proxy suffix directly;
+# constrain this exemption to its condition and matching failure message.
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/linear_test\.go :: /api/cl[i]/ :: (tt\.throughProxy && proxyPath != "/api/cl[i]/linear/graphql"|t\.Errorf\("proxy path = %q, want %q", proxyPath, "/api/cl[i]/linear/graphql"\))
 
 # afcli/linearcmd/linear.go: the auth-strategy header and the Path-1.5 comment
 # name the concrete hosted GraphQL proxy suffix frozen by the accepted OSS CLI

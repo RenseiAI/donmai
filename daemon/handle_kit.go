@@ -326,8 +326,8 @@ func writeKitNotFound(w http.ResponseWriter, err error) bool {
 //
 // When the daemon has no Config loaded yet (no daemon.yaml on disk),
 // trust.Mode falls back to resolveDefaultTrustMode(), which returns
-// TrustModeSignedByAllowlist unless the operator has set
-// DONMAI_KIT_TRUST_MODE=permissive, and trust.IssuerSet falls back to
+// TrustModeSignedByAllowlist even if the environment asks for permissive,
+// and trust.IssuerSet falls back to
 // defaultVendorIssuerSet() (the official donmai-kits signing identity).
 // This means kit installs from an unconfigured daemon default to strict
 // mode AND already trust official signed kits — no --allow-unsigned needed.
@@ -362,8 +362,8 @@ func (s *Server) kitRegistryOrEmpty() kitRegistryDoer {
 	}
 	if trust.Mode == "" {
 		// Use the secure default rather than hard-coding TrustModePermissive.
-		// resolveDefaultTrustMode() returns TrustModeSignedByAllowlist unless
-		// DONMAI_KIT_TRUST_MODE overrides it.
+		// resolveDefaultTrustMode() does not allow an environment-only
+		// permissive downgrade.
 		trust.Mode = resolveDefaultTrustMode()
 	}
 	if len(trust.IssuerSet) == 0 {

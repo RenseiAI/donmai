@@ -307,8 +307,7 @@ To proceed, either:
      (inspect the signer first:   kit verify <id>)
   2. bypass once (audit-logged):  kit install <id> --allow-unsigned
   3. disable the gate entirely:   set trust.mode: permissive in daemon.yaml
-     or export DONMAI_KIT_TRUST_MODE=permissive (not recommended — unsigned
-     kits can execute arbitrary shell commands)`
+     (not recommended — unsigned kits can execute arbitrary shell commands)`
 
 func runKitInstall(out io.Writer, client kitDaemonClient, id, version string, source *afclient.KitInstallSource, allowUnsigned, jsonOut, plain bool) error {
 	req := afclient.KitInstallRequest{Version: version, Source: source}

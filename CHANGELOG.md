@@ -10,6 +10,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.52 — 2026-09-28
+
+### Fixes
+
+- An environment-only `DONMAI_KIT_TRUST_MODE=permissive` now warns and keeps
+  the default signature gate. To deliberately allow unsigned kits, configure
+  `trust.mode: permissive` in `daemon.yaml` or use the audited
+  `kit install --allow-unsigned` override for a single installation. Explicit
+  YAML policy continues to take precedence over the environment.
+- Linear issue updates include the resulting priority in their output,
+  including an explicit zero returned by the tracker.
+
+### Chores
+
+- Pull requests that change release packaging run the hermetic signing
+  integration with the same pinned GoReleaser version used for releases.
+
 ## v0.72.51 — 2026-09-28
 
 ### Features

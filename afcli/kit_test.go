@@ -423,7 +423,7 @@ func TestKitCmd_Install_TrustGateRejectedShowsGuidance(t *testing.T) {
 		"trust gate",
 		"trust.issuerSet",
 		"--allow-unsigned",
-		"DONMAI_KIT_TRUST_MODE=permissive",
+		"trust.mode: permissive",
 	} {
 		if !strings.Contains(err.Error(), want) {
 			t.Errorf("error missing %q:\n%s", want, err.Error())

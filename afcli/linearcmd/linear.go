@@ -877,6 +877,7 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 				"identifier": updated.Identifier,
 				"title":      updated.Title,
 				"status":     updated.State.Name,
+				"priority":   updated.Priority,
 				"project":    updated.Project.Name,
 				"url":        updated.URL,
 			})
