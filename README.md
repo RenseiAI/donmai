@@ -368,10 +368,11 @@ notice to stderr; will be removed once `donmai-libraries` is archived).
 
 ### `donmai arch`
 
-Assess a GitHub pull request or commit for architectural drift with the native
-Go pipeline. With `gh` available it reads the PR diff; otherwise the default
-degrades to metadata-only analysis. `--require-diff` returns an error when the
-complete diff cannot be read.
+Assess a GitHub pull request for architectural drift with native diff analysis.
+Pass a PR URL or `--repository` with `--pr`. With `gh` available, the command
+reads the PR diff; without it, the default warns and returns metadata-only
+output. Use `--require-diff` for checks that need a complete diff: it returns
+exit code 2 when that diff is unavailable. A triggered policy returns exit code 1.
 
 ```bash
 donmai arch assess https://github.com/RenseiAI/donmai/pull/667 --summary
