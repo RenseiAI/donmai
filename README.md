@@ -200,7 +200,7 @@ donmai host status                        # running / stopped / draining
 donmai host stop
 donmai host pause                         # stop accepting new work
 donmai host resume
-donmai host drain                         # wait for in-flight sessions, then stop
+donmai host drain                         # drain work; keep the daemon resumable
 donmai host update                        # trigger a manual update check
 donmai host doctor                        # health check: config, credentials, disk
 donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
