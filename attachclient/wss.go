@@ -60,10 +60,10 @@ func (h *host) runWSS(ctx context.Context, tok string, cl hostClaims, exitDeadli
 		return res, fmt.Errorf("attachclient: wss handshake: subprotocol %q not echoed", got)
 	}
 
-	return h.runWSSLeg(ctx, conn, cl, tok, exitDeadline)
+	return h.runWSSLeg(ctx, conn, cl, exitDeadline)
 }
 
-func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaims, tok string, exitDeadline time.Time) (res attemptResult, retErr error) {
+func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaims, exitDeadline time.Time) (res attemptResult, retErr error) {
 	leg := &wssLeg{conn: conn}
 	authorityAt := make(chan time.Time, 1)
 	defer func() {
@@ -77,7 +77,7 @@ func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaim
 
 	legCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
-	legCtx = h.continuationContext(legCtx, func() string { return tok })
+	legCtx = h.continuationContext(legCtx)
 	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
 
 	// Send the subscribe control on open (§ 7, zeroed headers per § 2).

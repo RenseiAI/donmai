@@ -3,7 +3,9 @@ package attachclient
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"errors"
 	"io"
 	"log/slog"
 	"net/http"
@@ -40,8 +42,8 @@ func TestContinuationUploadChunksAndBoundedRetry(t *testing.T) {
 	var chunks []attachwire.ContinuationChunk
 	attempts := 0
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		if r.URL.Path != "/v3/rooms/room/continuation/request_1" || r.Header.Get("Authorization") != "Bearer fixture-token" {
-			t.Error("upload origin/path/authority changed")
+		if r.URL.Path != "/v3/rooms/room/continuation/request_1" || r.Header.Get("Authorization") != "" || r.Header.Get(attachwire.ContinuationUploadGrantHeader) != continuationTestGrant() {
+			t.Error("upload origin/path/grant changed")
 			w.WriteHeader(http.StatusForbidden)
 			return
 		}
@@ -72,7 +74,7 @@ func TestContinuationUploadChunksAndBoundedRetry(t *testing.T) {
 	defer server.Close()
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
-	if err := uploadContinuation(ctx, server.Client(), server.URL+"/v2/rooms/room", "fixture-token", attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "request_1"}, 3, encoded); err != nil {
+	if err := uploadContinuation(ctx, server.Client(), server.URL+"/v2/rooms/room", attachwire.ContinuationRequest{UploadGrant: continuationTestGrant(), Schema: attachwire.ContinuationSchema, RequestID: "request_1"}, 3, encoded); err != nil {
 		t.Fatal(err)
 	}
 	mu.Lock()
@@ -111,7 +113,7 @@ func TestContinuationUploadRejectsRedirectAndWrongAck(t *testing.T) {
 				_, _ = io.WriteString(w, `{"nextOffset":0,"complete":false}`)
 			}))
 			defer server.Close()
-			err := uploadContinuation(context.Background(), server.Client(), server.URL+"/v1/rooms/room", "fixture-token", attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "request"}, 3, encoded)
+			err := uploadContinuation(context.Background(), server.Client(), server.URL+"/v1/rooms/room", attachwire.ContinuationRequest{UploadGrant: continuationTestGrant(), Schema: attachwire.ContinuationSchema, RequestID: "request"}, 3, encoded)
 			if err == nil {
 				t.Fatal("unsafe upload response accepted")
 			}
@@ -210,7 +212,7 @@ func TestContinuationDegradedAdvertisementAndLegacySnapshot(t *testing.T) {
 	}
 	// New metadata leaves the ordinary picture response unchanged even when the
 	// caller has no OOB leg context (unsupported receiver fails closed).
-	if _, err := h.handleControl(context.Background(), attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "request"}}); err != nil {
+	if _, err := h.handleControl(context.Background(), attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{UploadGrant: continuationTestGrant(), Schema: attachwire.ContinuationSchema, RequestID: "request"}}); err != nil {
 		t.Fatal(err)
 	}
 	source.mu.Lock()
@@ -236,8 +238,8 @@ func TestContinuationControlStartsOOBAndKeepsCanonicalPicture(t *testing.T) {
 			t.Error(err)
 			return
 		}
-		if r.Header.Get("Authorization") != "Bearer active-leg" {
-			t.Error("active bearer was not reused")
+		if r.Header.Get("Authorization") != "" || r.Header.Get(attachwire.ContinuationUploadGrantHeader) != continuationTestGrant() {
+			t.Error("request grant was not used exclusively")
 		}
 		uploaded <- chunk
 		_ = json.NewEncoder(w).Encode(attachwire.ContinuationChunkAck{NextOffset: chunk.Total, Complete: true})
@@ -246,8 +248,8 @@ func TestContinuationControlStartsOOBAndKeepsCanonicalPicture(t *testing.T) {
 	h := &host{cfg: HostConfig{Session: source, AttachURL: server.URL + "/v1/rooms/room", HTTPClient: server.Client()}, log: slog.New(slog.NewTextHandler(io.Discard, nil))}
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
-	ctx = h.continuationContext(ctx, func() string { return "active-leg" })
-	request := attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "capture"}}
+	ctx = h.continuationContext(ctx)
+	request := attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{UploadGrant: continuationTestGrant(), Schema: attachwire.ContinuationSchema, RequestID: "capture"}}
 	if _, err := h.handleControl(ctx, request); err != nil {
 		t.Fatal(err)
 	}
@@ -272,11 +274,17 @@ func TestContinuationV2SubscribeAdvertisesActualSource(t *testing.T) {
 	seen := make(chan attachwire.Subscribe, 1)
 	ready := make(chan struct{})
 	uploaded := make(chan struct{}, 1)
-	token := v2TestToken(t, nil)
+	token := v2TestToken(t, func(claims map[string]any) {
+		claims["iat"] = time.Now().Add(-2 * time.Hour).Unix()
+		claims["exp"] = time.Now().Add(-time.Hour).Unix()
+	})
+	if _, err := parseV2HostClaims(token, time.Now()); err == nil {
+		t.Fatal("long-session fixture bearer is not expired")
+	}
 	var legacyCalls atomic.Int32
 	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodPost {
-			if r.Header.Get("Authorization") != "Bearer "+token || r.URL.Path != "/v3/rooms/session-v2/continuation/v2_capture" {
+			if r.Header.Get("Authorization") != "" || r.Header.Get(attachwire.ContinuationUploadGrantHeader) != continuationTestGrant() || r.URL.Path != "/v3/rooms/session-v2/continuation/v2_capture" {
 				t.Error("v2 upload lost active authority or endpoint")
 			}
 			body, err := io.ReadAll(io.LimitReader(r.Body, attachwire.ContinuationChunkJSONLimit+1))
@@ -328,7 +336,7 @@ func TestContinuationV2SubscribeAdvertisesActualSource(t *testing.T) {
 		case <-r.Context().Done():
 			return
 		}
-		request, err := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "v2_capture"}})
+		request, err := attachwirev2.BuildControlFrame(attachwire.SnapshotRequest{Reason: attachwire.ReasonJoin, Continuation: &attachwire.ContinuationRequest{UploadGrant: continuationTestGrant(), Schema: attachwire.ContinuationSchema, RequestID: "v2_capture"}})
 		if err != nil {
 			t.Error(err)
 			return
@@ -346,7 +354,7 @@ func TestContinuationV2SubscribeAdvertisesActualSource(t *testing.T) {
 	source := uploadFixture(t, 8)
 	ctx, cancel := context.WithCancel(context.Background())
 	t.Cleanup(cancel)
-	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{AttachURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/v2/rooms/session-v2", TokenSource: func(context.Context) (string, error) { return token, nil }, ContinuationSource: source, OnSnapshotRequest: func(context.Context, attachwire.SnapshotRequest) error {
+	candidate, err := DialV2HostCandidate(ctx, V2HostConfig{AttachURL: "ws" + strings.TrimPrefix(server.URL, "http") + "/v2/rooms/session-v2", TokenSource: func(context.Context) (string, error) { return token, nil }, ContinuationSource: source, Now: func() time.Time { return time.Now().Add(-90 * time.Minute) }, OnSnapshotRequest: func(context.Context, attachwire.SnapshotRequest) error {
 		legacyCalls.Add(1)
 		_, _, err := source.EmitSnapshot()
 		return err
@@ -384,5 +392,74 @@ func TestContinuationV2SubscribeAdvertisesActualSource(t *testing.T) {
 	envelope, err := attachwire.DecodeSnapshotEnvelope(legacy.Payload)
 	if err != nil || envelope.SnapFormat != attachwire.SnapFormatScreen {
 		t.Fatal("v2 OOB request changed canonical0x01")
+	}
+}
+
+func continuationTestGrant() string {
+	return base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0xab}, 32))
+}
+
+func TestContinuationUploadAbsentOrMalformedGrantSendsNothing(t *testing.T) {
+	source := uploadFixture(t, 8)
+	payload, err := source.checkpoint.Encode(attachwire.ContinuationSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var calls atomic.Int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) { calls.Add(1); w.WriteHeader(http.StatusForbidden) }))
+	defer server.Close()
+	for _, grant := range []string{"", "malformed", continuationTestGrant() + "="} {
+		request := attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "request", UploadGrant: grant}
+		if err := uploadContinuation(context.Background(), server.Client(), server.URL+"/v1/rooms/room", request, 3, payload); err == nil {
+			t.Fatal("invalid grant accepted")
+		}
+	}
+	if calls.Load() != 0 {
+		t.Fatal("invalid grant fell back to another authorization path")
+	}
+}
+
+func TestContinuationUploadCancellation(t *testing.T) {
+	entered := make(chan struct{}, 1)
+	release := make(chan struct{})
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "" || r.Header.Get(attachwire.ContinuationUploadGrantHeader) != continuationTestGrant() {
+			t.Error("grant-only authorization changed")
+		}
+		_, _ = io.Copy(io.Discard, io.LimitReader(r.Body, attachwire.ContinuationChunkJSONLimit))
+		entered <- struct{}{}
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(server.Close)
+	t.Cleanup(func() { close(release) })
+	source := uploadFixture(t, 8)
+	payload, err := source.checkpoint.Encode(attachwire.ContinuationSchema)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	result := make(chan error, 1)
+	request := attachwire.ContinuationRequest{Schema: attachwire.ContinuationSchema, RequestID: "request", UploadGrant: continuationTestGrant()}
+	go func() {
+		result <- uploadContinuation(ctx, server.Client(), server.URL+"/v2/rooms/room", request, 3, payload)
+	}()
+	select {
+	case <-entered:
+	case <-time.After(time.Second):
+		t.Fatal("upload did not reach transport")
+	}
+	cancel()
+	select {
+	case err := <-result:
+		if !errors.Is(err, context.Canceled) {
+			t.Fatalf("cancellation=%v", err)
+		}
+	case <-time.After(time.Second):
+		t.Fatal("upload ignored cancellation")
 	}
 }

@@ -27,7 +27,6 @@ const (
 type continuationUploadState struct {
 	source    ContinuationSource
 	attachURL string
-	bearer    func() string
 	client    *http.Client
 	logger    *slog.Logger
 	mu        sync.Mutex
@@ -60,7 +59,7 @@ func (h *host) continuationSource() ContinuationSource {
 	return nil
 }
 
-func newContinuationUploadState(source ContinuationSource, attachURL string, bearer func() string, client *http.Client, logger *slog.Logger) *continuationUploadState {
+func newContinuationUploadState(source ContinuationSource, attachURL string, client *http.Client, logger *slog.Logger) *continuationUploadState {
 	if len(continuationSchemas(source)) == 0 {
 		return nil
 	}
@@ -70,11 +69,11 @@ func newContinuationUploadState(source ContinuationSource, attachURL string, bea
 	if logger == nil {
 		logger = slog.New(slog.NewTextHandler(io.Discard, nil))
 	}
-	return &continuationUploadState{source: source, attachURL: attachURL, bearer: bearer, client: client, logger: logger}
+	return &continuationUploadState{source: source, attachURL: attachURL, client: client, logger: logger}
 }
 
-func (h *host) continuationContext(ctx context.Context, bearer func() string) context.Context {
-	state := newContinuationUploadState(h.continuationSource(), h.cfg.AttachURL, bearer, h.httpClient(), h.log)
+func (h *host) continuationContext(ctx context.Context) context.Context {
+	state := newContinuationUploadState(h.continuationSource(), h.cfg.AttachURL, h.httpClient(), h.log)
 	if state == nil {
 		return ctx
 	}
@@ -124,7 +123,7 @@ func (s *continuationUploadState) start(ctx context.Context, request attachwire.
 			s.epoch = epoch
 			s.mu.Unlock()
 		}
-		if err := uploadContinuation(bounded, s.client, s.attachURL, s.bearer(), request, epoch, payload); err != nil {
+		if err := uploadContinuation(bounded, s.client, s.attachURL, request, epoch, payload); err != nil {
 			s.logger.Warn("continuation upload unavailable", "requestId", request.RequestID, "code", "upload_failed")
 		}
 	}()
@@ -163,11 +162,11 @@ func continuationUploadURL(attachURL, requestID string) (string, error) {
 	return parsed.String(), nil
 }
 
-func uploadContinuation(ctx context.Context, client *http.Client, attachURL, bearer string, request attachwire.ContinuationRequest, epoch uint64, payload []byte) error {
+func uploadContinuation(ctx context.Context, client *http.Client, attachURL string, request attachwire.ContinuationRequest, epoch uint64, payload []byte) error {
 	if err := request.Validate(); err != nil {
 		return err
 	}
-	if len(payload) == 0 || len(payload) > attachwire.MaxContinuationBytes || bearer == "" {
+	if len(payload) == 0 || len(payload) > attachwire.MaxContinuationBytes {
 		return fmt.Errorf("attachclient: invalid continuation upload")
 	}
 	endpoint, err := continuationUploadURL(attachURL, request.RequestID)
@@ -195,20 +194,20 @@ func uploadContinuation(ctx context.Context, client *http.Client, attachURL, bea
 		if err != nil {
 			return fmt.Errorf("attachclient: encode continuation upload: %w", err)
 		}
-		if err := postContinuationChunk(ctx, &safeClient, endpoint, bearer, body, uint32(uint64(end)&0xffffffff), end == len(payload)); err != nil {
+		if err := postContinuationChunk(ctx, &safeClient, endpoint, request.UploadGrant, body, uint32(uint64(end)&0xffffffff), end == len(payload)); err != nil {
 			return err
 		}
 	}
 	return nil
 }
 
-func postContinuationChunk(ctx context.Context, client *http.Client, endpoint, bearer string, body []byte, next uint32, complete bool) error {
+func postContinuationChunk(ctx context.Context, client *http.Client, endpoint, grant string, body []byte, next uint32, complete bool) error {
 	for attempt := 0; attempt < continuationUploadAttempts; attempt++ {
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 		if err != nil {
 			return fmt.Errorf("attachclient: continuation POST: %w", err)
 		}
-		req.Header.Set("Authorization", "Bearer "+bearer)
+		req.Header.Set(attachwire.ContinuationUploadGrantHeader, grant)
 		req.Header.Set("Content-Type", "application/json")
 		response, err := client.Do(req)
 		retry := false

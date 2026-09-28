@@ -386,7 +386,7 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 		closedCh: make(chan struct{}), ackSeq: seed, highestSent: seed,
 		snapshotRequests: make(chan attachwire.SnapshotRequest, 1), localActiveCh: make(chan struct{}), cancel: cancel,
 	}
-	candidate.continuation = newContinuationUploadState(cfg.ContinuationSource, cfg.AttachURL, func() string { return token }, cfg.HTTPClient, cfg.Logger)
+	candidate.continuation = newContinuationUploadState(cfg.ContinuationSource, cfg.AttachURL, cfg.HTTPClient, cfg.Logger)
 	if cfg.ResumeDisposition != nil {
 		resume := cloneV2ResumeDisposition(*cfg.ResumeDisposition)
 		candidate.resumeDisposition = &resume

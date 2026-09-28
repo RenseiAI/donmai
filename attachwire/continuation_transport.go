@@ -2,15 +2,20 @@ package attachwire
 
 import (
 	"bytes"
+	"encoding/base64"
 	"encoding/binary"
 	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
+	"log/slog"
 )
 
 // ContinuationSubprotocol is separate from every legacy attach subprotocol.
 const ContinuationSubprotocol = "interactive-continuation-v1"
+
+// ContinuationUploadGrantHeader carries only the request-scoped upload grant.
+const ContinuationUploadGrantHeader = "X-Continuation-Upload-Grant"
 
 // ContinuationChunkBytes bounds one opaque checkpoint chunk.
 const ContinuationChunkBytes = 256 << 10
@@ -23,15 +28,18 @@ type ContinuationHello struct {
 	Schema string `json:"schema"`
 }
 
-// ContinuationRequest is optional metadata on an ordinary snapshot request.
-// It is sent only after the active host positively advertises support.
+// ContinuationRequest carries host-only request authority as an optional
+// snapshot-request field. It is never a viewer-message DTO and is sent only
+// after the active host positively advertises support.
 type ContinuationRequest struct {
-	RequestID string `json:"requestId"`
-	Schema    string `json:"schema"`
+	RequestID   string `json:"requestId"`
+	Schema      string `json:"schema"`
+	UploadGrant string `json:"uploadGrant"`
 }
 
 // ContinuationChunk uploads a piece of one immutable complete checkpoint.
-// The bearer token supplies host/carrier authority; fields do not grant it.
+// A short-lived grant supplies request-scoped authority in a header; payload
+// fields never grant authority or carry the grant to viewers.
 type ContinuationChunk struct {
 	Schema    string `json:"schema"`
 	RequestID string `json:"requestId"`
@@ -83,10 +91,34 @@ type ContinuationMessage struct {
 
 // Validate enforces the exact schema and URL-safe bounded request identity.
 func (r ContinuationRequest) Validate() error {
-	if r.Schema != ContinuationSchema || len(r.RequestID) == 0 || len(r.RequestID) > 128 {
+	if err := validateContinuationIdentity(r.Schema, r.RequestID); err != nil {
+		return err
+	}
+	if len(r.UploadGrant) != 43 {
+		return fmt.Errorf("attachwire: missing or invalid continuation upload grant")
+	}
+	decoded, err := base64.RawURLEncoding.Strict().DecodeString(r.UploadGrant)
+	if err != nil || len(decoded) != 32 || base64.RawURLEncoding.EncodeToString(decoded) != r.UploadGrant {
+		return fmt.Errorf("attachwire: missing or invalid continuation upload grant")
+	}
+	return nil
+}
+
+// Format redacts the grant even when a containing control is formatted.
+func (r ContinuationRequest) Format(state fmt.State, _ rune) {
+	_, _ = fmt.Fprintf(state, "{requestId:%q schema:%q uploadGrant:<redacted>}", r.RequestID, r.Schema)
+}
+
+// LogValue prevents structured logging from disclosing the upload grant.
+func (r ContinuationRequest) LogValue() slog.Value {
+	return slog.GroupValue(slog.String("requestId", r.RequestID), slog.String("schema", r.Schema), slog.String("uploadGrant", "<redacted>"))
+}
+
+func validateContinuationIdentity(schema, requestID string) error {
+	if schema != ContinuationSchema || len(requestID) == 0 || len(requestID) > 128 {
 		return fmt.Errorf("attachwire: unsupported continuation request")
 	}
-	for _, c := range r.RequestID {
+	for _, c := range requestID {
 		if !(c >= 'a' && c <= 'z' || c >= 'A' && c <= 'Z' || c >= '0' && c <= '9' || c == '-' || c == '_') {
 			return fmt.Errorf("attachwire: invalid continuation request identity")
 		}
@@ -109,7 +141,7 @@ func validContinuationDigest(value string) bool {
 
 // Validate checks bounds and complete chunk geometry without allocating state.
 func (c ContinuationChunk) Validate() error {
-	if err := (ContinuationRequest{RequestID: c.RequestID, Schema: c.Schema}).Validate(); err != nil {
+	if err := validateContinuationIdentity(c.Schema, c.RequestID); err != nil {
 		return err
 	}
 	if c.Total == 0 || c.Total > MaxContinuationBytes || c.Offset >= c.Total || c.Offset%ContinuationChunkBytes != 0 || !validContinuationDigest(c.SHA256) || uint64(len(c.Data)) != min(uint64(ContinuationChunkBytes), uint64(c.Total-c.Offset)) {
@@ -120,7 +152,7 @@ func (c ContinuationChunk) Validate() error {
 
 // Validate checks the immutable checkpoint boundary metadata.
 func (a ContinuationAccepted) Validate() error {
-	if err := (ContinuationRequest{RequestID: a.RequestID, Schema: a.Schema}).Validate(); err != nil {
+	if err := validateContinuationIdentity(a.Schema, a.RequestID); err != nil {
 		return err
 	}
 	if a.Total == 0 || a.Total > MaxContinuationBytes || !validContinuationDigest(a.SHA256) {
@@ -304,4 +336,13 @@ func DecodeContinuationChunkAck(b []byte) (ContinuationChunkAck, error) {
 		return ack, fmt.Errorf("attachwire: upload acknowledgement exceeds bound")
 	}
 	return ack, nil
+}
+
+// LogValue also protects the grant when the containing host control is logged.
+func (r SnapshotRequest) LogValue() slog.Value {
+	attrs := []slog.Attr{slog.String("type", string(r.ControlType())), slog.String("reason", string(r.Reason))}
+	if r.Continuation != nil {
+		attrs = append(attrs, slog.Any("continuation", r.Continuation))
+	}
+	return slog.GroupValue(attrs...)
 }

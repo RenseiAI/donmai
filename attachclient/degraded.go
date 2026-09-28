@@ -194,7 +194,7 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 	// Session's immutable PTY epoch, not merely parse a bearer. validatedToken
 	// applies the same ground-truth check as the top-level reconnect loop.
 	tokH := &tokenHolder{cur: tok, src: h.validatedToken}
-	legCtx = h.continuationContext(legCtx, tokH.current)
+	legCtx = h.continuationContext(legCtx)
 
 	// Open SSE-down: binds the host leg (epoch CAS). 409 == epoch-stale.
 	sseResp, err := h.openHostSSE(legCtx, sseURL, tokH, cl)

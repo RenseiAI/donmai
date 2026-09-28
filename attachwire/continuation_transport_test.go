@@ -3,8 +3,11 @@ package attachwire
 import (
 	"bytes"
 	"crypto/sha256"
+	"encoding/base64"
 	"encoding/hex"
 	"encoding/json"
+	"fmt"
+	"log/slog"
 	"strings"
 	"testing"
 )
@@ -88,5 +91,43 @@ func TestContinuationHostFramePreservesNonminimalOriginalVarint(t *testing.T) {
 	}
 	if !bytes.Equal(decoded.Data, raw) {
 		t.Fatal("opaque rail normalized original receipt bytes")
+	}
+}
+
+func TestContinuationUploadGrantIsRequiredAndRedacted(t *testing.T) {
+	grant := base64.RawURLEncoding.EncodeToString(bytes.Repeat([]byte{0xab}, 32))
+	request := ContinuationRequest{Schema: ContinuationSchema, RequestID: "request", UploadGrant: grant}
+	if err := request.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	for _, bad := range []string{"", "not-a-grant", grant + "=", strings.Repeat("A", 42)} {
+		r := request
+		r.UploadGrant = bad
+		if err := r.Validate(); err == nil {
+			t.Fatal("absent/malformed upload grant accepted")
+		}
+	}
+	control := SnapshotRequest{Reason: ReasonJoin, Continuation: &request}
+	for _, value := range []any{request, &request, control, &control} {
+		if formatted := fmt.Sprintf("%+v", value); strings.Contains(formatted, grant) {
+			t.Fatal("grant reached formatted log")
+		}
+		var out bytes.Buffer
+		slog.New(slog.NewJSONHandler(&out, nil)).Info("control", "value", value)
+		if strings.Contains(out.String(), grant) {
+			t.Fatal("grant reached structured log")
+		}
+	}
+	wire, err := json.Marshal(control)
+	if err != nil || !bytes.Contains(wire, []byte(grant)) {
+		t.Fatal("host control did not carry grant")
+	}
+	viewer := ContinuationAccepted{Schema: ContinuationSchema, RequestID: request.RequestID, HostEpoch: 1, AtSeq: 2, Total: 1, SHA256: strings.Repeat("a", 64)}
+	frame, err := EncodeContinuationMessage(ContinuationMessage{Kind: ContinuationAcceptedKind, Accepted: viewer})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(frame, []byte(grant)) {
+		t.Fatal("grant leaked onto viewer rail")
 	}
 }
