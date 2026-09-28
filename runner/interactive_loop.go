@@ -113,6 +113,22 @@ func (a sessAdapter) WriteAttributedInput(userID, p []byte) (int, error) {
 	return a.InteractiveSession.WriteInput(p)
 }
 
+// SupportsContinuation forwards the optional capability through the interface
+// adapter, without advertising support from an older interactive session.
+func (a sessAdapter) SupportsContinuation() bool {
+	source, ok := a.InteractiveSession.(attachclient.ContinuationSource)
+	return ok && source.SupportsContinuation()
+}
+
+// InspectContinuation preserves request cancellation across the optional source.
+func (a sessAdapter) InspectContinuation(ctx context.Context, selected string) (attachwire.ContinuationCheckpoint, error) {
+	source, ok := a.InteractiveSession.(attachclient.ContinuationSource)
+	if !ok || !source.SupportsContinuation() {
+		return attachwire.ContinuationCheckpoint{}, fmt.Errorf("interactive session has no complete continuation support")
+	}
+	return source.InspectContinuation(ctx, selected)
+}
+
 // dispatchInteractive drives a mode:"interactive" session: it attaches the
 // spawned PTY surface's live byte stream OUTBOUND to the relay and
 // supervises the session until the child exits, ctx cancel / wall-clock

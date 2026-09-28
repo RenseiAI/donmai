@@ -35,13 +35,16 @@ const (
 	// requires ControllerOptions.RequireFullHostFrames — keeps working
 	// unchanged at V4.
 	V4 uint32 = 4
+	// V5 adds correlated out-of-band complete continuation inspection.
+	// Canonical host frames and all selected v1-v4 messages remain unchanged.
+	V5 uint32 = 5
 
 	// ProtocolMin / ProtocolMax is the range THIS build advertises. A protocol
 	// bump widens Max and only ever raises Min after an overlap window at least
 	// as long as the maximum supported session duration (ADR-2026-08-17 §D3) —
 	// raising Min is a separate migration decision, not a release detail.
 	ProtocolMin = V1
-	ProtocolMax = V4
+	ProtocolMax = V5
 )
 
 // Negotiate selects the highest version both peers speak.
@@ -84,6 +87,9 @@ const (
 	// puts its epoch here. It deliberately names no relay, service, or endpoint
 	// — an OSS-only daemon omits it entirely and nothing degrades (§D3).
 	ExtCarrierEpoch = "carrier_epoch"
+	// ExtContinuationCheckpoint advertises optional v5 checkpoint support in
+	// Hello. Older controllers ignore its value before selecting their version.
+	ExtContinuationCheckpoint = "continuation_checkpoint"
 )
 
 // Extensions is the optional, namespaced negotiation map carried on

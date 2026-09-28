@@ -56,6 +56,9 @@ type V2HostConfig struct {
 	OnResize          func(context.Context, attachwire.ResizePayload) error
 	OnKill            func(context.Context, attachwire.Kill) error
 	OnSnapshotRequest func(context.Context, attachwire.SnapshotRequest) error
+	// ContinuationSource enables positive schema advertisement only while the
+	// selected local source reports complete continuation support.
+	ContinuationSource ContinuationSource
 }
 
 // V2ResumeState is the closed durable carrier-reload posture.
@@ -315,6 +318,7 @@ type V2HostCandidate struct {
 	notify              chan struct{}
 	closedCh            chan struct{}
 
+	continuation     *continuationUploadState
 	snapshotRequests chan attachwire.SnapshotRequest
 	cancel           context.CancelFunc
 }
@@ -382,6 +386,7 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 		closedCh: make(chan struct{}), ackSeq: seed, highestSent: seed,
 		snapshotRequests: make(chan attachwire.SnapshotRequest, 1), localActiveCh: make(chan struct{}), cancel: cancel,
 	}
+	candidate.continuation = newContinuationUploadState(cfg.ContinuationSource, cfg.AttachURL, cfg.HTTPClient, cfg.Logger)
 	if cfg.ResumeDisposition != nil {
 		resume := cloneV2ResumeDisposition(*cfg.ResumeDisposition)
 		candidate.resumeDisposition = &resume
@@ -402,7 +407,8 @@ func DialV2HostCandidate(ctx context.Context, cfg V2HostConfig) (*V2HostCandidat
 		}
 	}
 	subscribe, err := attachwirev2.BuildControlFrame(attachwire.Subscribe{
-		SessionID: claims.SessionID, AsRole: attachwire.RoleHost,
+		ContinuationSchemas: continuationSchemas(cfg.ContinuationSource),
+		SessionID:           claims.SessionID, AsRole: attachwire.RoleHost,
 		Epoch: int64Pointer(claims.Epoch), ResumeFrom: nil,
 	})
 	if err != nil {
@@ -984,7 +990,12 @@ func (c *V2HostCandidate) handleV2Inbound(ctx context.Context, frame attachwire.
 				}
 			}
 			if c.cfg.OnSnapshotRequest != nil {
-				return c.cfg.OnSnapshotRequest(ctx, typed)
+				if err := c.cfg.OnSnapshotRequest(ctx, typed); err != nil {
+					return err
+				}
+			}
+			if typed.Continuation != nil && c.continuation != nil {
+				c.continuation.start(ctx, *typed.Continuation)
 			}
 			return nil
 		case attachwirev2.CarrierActive:

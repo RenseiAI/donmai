@@ -1,6 +1,9 @@
 package linear
 
-import "time"
+import (
+	"encoding/json"
+	"time"
+)
 
 // OptionalString preserves Linear's three nullable-input states: omitted,
 // explicit null, and a string value. Use StringValue or NullString when
@@ -80,8 +83,36 @@ type Issue struct {
 
 // Label represents a Linear issue label.
 type Label struct {
-	ID   string `json:"id"`
-	Name string `json:"name"`
+	ID       string `json:"id"`
+	Name     string `json:"name"`
+	IsGroup  bool   `json:"isGroup,omitempty"`
+	ParentID string `json:"parentId,omitempty"`
+}
+
+// LabelInfo preserves native Linear label identity, scope and group relation.
+// A colon in Name has no meaning here: only IsGroup and ParentID establish a
+// native group. Empty TeamID means workspace scope; empty GroupType on a group
+// means Linear's default single-selection behavior.
+type LabelInfo struct {
+	ID         string
+	Name       string
+	TeamID     string
+	TeamKey    string
+	IsGroup    bool
+	GroupType  string
+	ParentID   string
+	ParentName string
+}
+
+// NativeLabelCreateInput is one explicit group or child-label creation. A
+// workspace caller intentionally leaves TeamID empty; the CLI enforces that
+// the operator selected that scope rather than defaulting it silently.
+type NativeLabelCreateInput struct {
+	Name      string
+	TeamID    string
+	ParentID  string
+	IsGroup   bool
+	GroupType string
 }
 
 // User represents a Linear user.
@@ -128,9 +159,11 @@ type Project struct {
 
 // Team represents a Linear team.
 type Team struct {
-	ID   string `json:"id"`
-	Key  string `json:"key"`
-	Name string `json:"name"`
+	ID          string `json:"id"`
+	Key         string `json:"key"`
+	Name        string `json:"name"`
+	ParentID    string `json:"parentId,omitempty"`
+	ParentKnown bool   `json:"-"` // the hierarchy query returned parent, even when null
 }
 
 // CreateIssueInput is the input for creating a Linear issue.
@@ -309,8 +342,27 @@ type workflowStateNode struct {
 
 // labelNode is the JSON structure for a label.
 type labelNode struct {
-	ID   *string `json:"id"`
-	Name *string `json:"name"`
+	ID      *string `json:"id"`
+	Name    *string `json:"name"`
+	IsGroup *bool   `json:"isGroup"`
+	Parent  *struct {
+		ID *string `json:"id"`
+	} `json:"parent"`
+}
+
+type labelInfoNode struct {
+	ID        *string `json:"id"`
+	Name      *string `json:"name"`
+	IsGroup   *bool   `json:"isGroup"`
+	GroupType *string `json:"groupType"`
+	Team      *struct {
+		ID  *string `json:"id"`
+		Key *string `json:"key"`
+	} `json:"team"`
+	Parent *struct {
+		ID   *string `json:"id"`
+		Name *string `json:"name"`
+	} `json:"parent"`
 }
 
 // userNode is the JSON structure for a user.
@@ -322,9 +374,10 @@ type userNode struct {
 
 // teamNode is the JSON structure for a team.
 type teamNode struct {
-	ID   *string `json:"id"`
-	Key  *string `json:"key"`
-	Name *string `json:"name"`
+	ID     *string         `json:"id"`
+	Key    *string         `json:"key"`
+	Name   *string         `json:"name"`
+	Parent json.RawMessage `json:"parent"`
 }
 
 // projectNode is the JSON structure for a project.
@@ -463,6 +516,33 @@ type projectConnection struct {
 type labelConnection struct {
 	Nodes    *[]*labelNode       `json:"nodes"`
 	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
+type labelInfoConnection struct {
+	Nodes    *[]*labelInfoNode   `json:"nodes"`
+	PageInfo *connectionPageInfo `json:"pageInfo"`
+}
+
+type listLabelDetailsData struct {
+	IssueLabels *labelInfoConnection `json:"issueLabels"`
+}
+
+type issueLabelsPageData struct {
+	Issue *struct {
+		ID     string           `json:"id"`
+		Labels *labelConnection `json:"labels"`
+	} `json:"issue"`
+}
+
+type nativeLabelMutationData struct {
+	IssueLabelCreate struct {
+		Success    bool           `json:"success"`
+		IssueLabel *labelInfoNode `json:"issueLabel"`
+	} `json:"issueLabelCreate"`
+	IssueLabelUpdate struct {
+		Success    bool           `json:"success"`
+		IssueLabel *labelInfoNode `json:"issueLabel"`
+	} `json:"issueLabelUpdate"`
 }
 
 type listRelationsData struct {

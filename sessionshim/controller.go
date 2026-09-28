@@ -288,6 +288,10 @@ type Controller struct {
 	streamEndMu sync.Mutex
 	streamEnd   error
 
+	checkpointMu     sync.Mutex
+	checkpointCall   *continuationCall
+	nextCheckpointID uint64
+
 	snapshotMu     sync.Mutex
 	nextSnapshotID uint64
 	snapshotCalls  map[uint64]*snapshotCall
@@ -1378,6 +1382,13 @@ func (c *Controller) readLoop() {
 			c.failSnapshotCalls(shimwire.ErrSnapshotMismatch)
 			c.closeStream("requested Snapshot was not followed by its result", shimwire.ErrSnapshotMismatch)
 			return
+		}
+		if msg.Type == shimwire.TypeCheckpointResult {
+			if err := c.acceptContinuationChunk(msg.Body); err != nil {
+				c.closeStream("checkpoint result was refused", err)
+				return
+			}
+			continue
 		}
 		if c.selected >= shimwire.V3 && msg.Type == shimwire.TypeHeartbeat {
 			receipt, decodeErr := shimwire.DecodeHeartbeat(msg.Body)

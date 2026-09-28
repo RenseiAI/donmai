@@ -30,6 +30,10 @@ const (
 
 	// v4-only. This value remains illegal under selected v1, v2, and v3.
 	TypeAttributedInput MessageType = 0x10 // daemon -> shim: generation + relay-stamped userId + input bytes
+
+	// v5-only complete-state inspection; never canonical host frames.
+	TypeCheckpointRequest MessageType = 0x11
+	TypeCheckpointResult  MessageType = 0x12
 )
 
 // Known reports whether t is assigned in the frozen v1 vocabulary. It remains
@@ -45,15 +49,18 @@ func (t MessageType) Known() bool { return t >= TypeHello && t <= TypeError }
 // TypeAttributedInput is exclusive to it.
 func (t MessageType) AllowedIn(version uint32) bool {
 	if t >= TypeHello && t <= TypeError {
-		return version == V1 || version == V2 || version == V3 || version == V4
+		return version == V1 || version == V2 || version == V3 || version == V4 || version == V5
 	}
 	if t == TypeSnapshotRequest || t == TypeSnapshotResult {
-		return version == V2 || version == V3 || version == V4
+		return version == V2 || version == V3 || version == V4 || version == V5
 	}
 	if t == TypeHostFrame {
-		return version == V3 || version == V4
+		return version == V3 || version == V4 || version == V5
 	}
-	return version == V4 && t == TypeAttributedInput
+	if t == TypeAttributedInput {
+		return version == V4 || version == V5
+	}
+	return version == V5 && (t == TypeCheckpointRequest || t == TypeCheckpointResult)
 }
 
 // Mutating reports whether t carries controller authority and therefore MUST
@@ -65,7 +72,7 @@ func (t MessageType) AllowedIn(version uint32) bool {
 // and a per-caller check is exactly where an omission hides.
 func (t MessageType) Mutating() bool {
 	switch t {
-	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest, TypeAttributedInput:
+	case TypeInput, TypeResize, TypeStop, TypeSnapshotRequest, TypeAttributedInput, TypeCheckpointRequest:
 		return true
 	default:
 		return false
@@ -106,6 +113,10 @@ func (t MessageType) String() string {
 		return "HostFrame"
 	case TypeAttributedInput:
 		return "AttributedInput"
+	case TypeCheckpointRequest:
+		return "CheckpointRequest"
+	case TypeCheckpointResult:
+		return "CheckpointResult"
 	default:
 		return "Unknown(0x" + hexByte(byte(t)) + ")"
 	}

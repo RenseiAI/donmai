@@ -4,13 +4,11 @@ import (
 	"image/color"
 	"io"
 	"log/slog"
-	"reflect"
 	"strconv"
-	"unsafe"
 
+	vt "github.com/RenseiAI/donmai/internal/terminalvt"
 	uv "github.com/charmbracelet/ultraviolet"
 	"github.com/charmbracelet/x/ansi"
-	vt "github.com/charmbracelet/x/vt"
 )
 
 // terminal is the small internal interface the Session feeds and snapshots.
@@ -53,16 +51,9 @@ type vtHost struct {
 	// ANSI parser re-entrancy.
 	pendingFeed []byte
 
-	// Cached unsafe pointers into unexported emulator/screen state (duty 4). The
-	// Emulator pointer and its embedded scrs array are stable for the emulator's
-	// life, so these are computed once. They are the two documented upstream
-	// accessor gaps:
-	//   - atPhantom  -> upstream PendingWrap() bool   (deferred-wrap fidelity)
-	//   - scrs[0].saved -> upstream SavedCursor() Cursor (?1049 restore point)
-	atPhantom   *bool
-	savedCursor *vt.Cursor
-	primaryScr  *vt.Screen // &scrs[0]
-	altScr      *vt.Screen // &scrs[1]
+	// Stable buffer objects exposed by the supported owned engine API.
+	primaryScr *vt.Screen
+	altScr     *vt.Screen
 }
 
 // modeState is the raw mode tracking accumulated from EnableMode/DisableMode.
@@ -97,8 +88,8 @@ func newVTHost(cols, rows, scrollback int, resp io.Writer, logger *slog.Logger) 
 	// Duty 7: bound scrollback.
 	e.SetScrollbackSize(scrollback)
 
-	// Duty 4: cache the two unexported accessors and both screen pointers.
-	v.bindReflection()
+	// Duty 4: supported state readers; no private-layout assumptions.
+	v.primaryScr, v.altScr = e.PrimaryScreen(), e.AlternateScreen()
 
 	// Duties 2 & 3: synchronous query responders write to the master and return
 	// true so the emulator's default handlers (which write to its internal
@@ -142,29 +133,7 @@ func (v *vtHost) setScrollbackSize(maxLines int) { v.emu.SetScrollbackSize(maxLi
 
 func (v *vtHost) altScreen() bool { return v.emu.IsAltScreen() }
 
-// ---- reflection binding (duty 4) -------------------------------------------
-
-func (v *vtHost) bindReflection() {
-	ev := reflect.ValueOf(v.emu).Elem()
-	if f := ev.FieldByName("atPhantom"); f.IsValid() && f.CanAddr() {
-		v.atPhantom = (*bool)(unsafe.Pointer(f.UnsafeAddr())) //nolint:gosec
-	}
-	scrs := ev.FieldByName("scrs")
-	if scrs.IsValid() && scrs.Len() >= 2 {
-		v.primaryScr = (*vt.Screen)(unsafe.Pointer(scrs.Index(0).UnsafeAddr())) //nolint:gosec
-		v.altScr = (*vt.Screen)(unsafe.Pointer(scrs.Index(1).UnsafeAddr()))     //nolint:gosec
-		if sv := scrs.Index(0).FieldByName("saved"); sv.IsValid() && sv.CanAddr() {
-			v.savedCursor = (*vt.Cursor)(unsafe.Pointer(sv.UnsafeAddr())) //nolint:gosec
-		}
-	}
-}
-
-func (v *vtHost) pendingWrap() bool {
-	if v.atPhantom == nil {
-		return false
-	}
-	return *v.atPhantom
-}
+func (v *vtHost) pendingWrap() bool { return v.emu.PendingWrap() }
 
 // ---- modes (duty 1) --------------------------------------------------------
 
@@ -413,9 +382,8 @@ func (v *vtHost) raw() vtRaw {
 	if alt {
 		r.alt = readGrid(v.altScr, cols, rows)
 		// Saved primary cursor = the ?1049 restore point.
-		if v.savedCursor != nil {
-			r.savedX, r.savedY = v.savedCursor.X, v.savedCursor.Y
-		}
+		saved := v.primaryScr.SavedCursor()
+		r.savedX, r.savedY = saved.X, saved.Y
 	} else {
 		// Primary active: saved cursor equals the active cursor (§12.1).
 		r.savedX, r.savedY = pos.X, pos.Y

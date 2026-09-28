@@ -109,13 +109,15 @@ type Viewport struct {
 // claim. ResumeFrom/ResumeEpoch are int|null (null ≡ 0 ≡ "no applied history",
 // §13). Nil pointers marshal as JSON null.
 type Subscribe struct {
-	Type        ControlType `json:"type"`
-	SessionID   string      `json:"sessionId"`
-	AsRole      Role        `json:"asRole"`
-	Epoch       *int64      `json:"epoch,omitempty"`
-	ResumeFrom  *int64      `json:"resumeFrom"`
-	ResumeEpoch *int64      `json:"resumeEpoch"`
-	Viewport    *Viewport   `json:"viewport,omitempty"`
+	// ContinuationSchemas is a positive host capability advertisement.
+	ContinuationSchemas []string    `json:"continuationSchemas,omitempty"`
+	Type                ControlType `json:"type"`
+	SessionID           string      `json:"sessionId"`
+	AsRole              Role        `json:"asRole"`
+	Epoch               *int64      `json:"epoch,omitempty"`
+	ResumeFrom          *int64      `json:"resumeFrom"`
+	ResumeEpoch         *int64      `json:"resumeEpoch"`
+	Viewport            *Viewport   `json:"viewport,omitempty"`
 }
 
 // ControlType implements ControlMessage for Subscribe, returning CtrlSubscribe.
@@ -133,8 +135,11 @@ func (ResumeFrom) ControlType() ControlType { return CtrlResumeFrom }
 
 // SnapshotRequest asks the host to emit a Snapshot (§7). Relay → host.
 type SnapshotRequest struct {
-	Type   ControlType    `json:"type"`
-	Reason SnapshotReason `json:"reason"`
+	// Continuation requests an additional opaque checkpoint, never a different
+	// canonical Snapshot format. Only advertised hosts receive this field.
+	Continuation *ContinuationRequest `json:"continuation,omitempty"`
+	Type         ControlType          `json:"type"`
+	Reason       SnapshotReason       `json:"reason"`
 }
 
 // ControlType implements ControlMessage for SnapshotRequest, returning

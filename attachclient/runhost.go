@@ -486,13 +486,14 @@ func (h *host) invokeKill(ctx context.Context, reason, signal string) {
 // buildHostSubscribe builds the § 7 host subscribe control frame:
 // {sessionId, asRole:"host", epoch, resumeFrom:null}. Host resume is by
 // re-subscribe (§ 4.1), so resumeFrom is always null here.
-func buildHostSubscribe(cl hostClaims) (attachwire.Frame, error) {
+func buildHostSubscribe(cl hostClaims, schemas ...string) (attachwire.Frame, error) {
 	epoch := cl.Epoch
 	return attachwire.BuildControlFrame(attachwire.Subscribe{
-		SessionID:  cl.SessionID,
-		AsRole:     attachwire.RoleHost,
-		Epoch:      &epoch,
-		ResumeFrom: nil,
+		ContinuationSchemas: schemas,
+		SessionID:           cl.SessionID,
+		AsRole:              attachwire.RoleHost,
+		Epoch:               &epoch,
+		ResumeFrom:          nil,
 	})
 }
 
