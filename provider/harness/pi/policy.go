@@ -167,13 +167,14 @@ type PolicyEngine struct {
 	autonomous bool
 	cwd        string
 
-	// bypass is the session's effective toolApproval level being "bypass"
-	// (ADR-2026-09-27-execution-security-levels.md): no policy gate the
-	// runner did not configure. It turns off the autonomous network-bash
-	// fallback deny (step 6), which only ever ran when no allow list was
-	// configured. Safety denies, containment, the deny entries and an
-	// explicitly configured allow list still apply.
-	bypass bool
+	// allowGated is the session's effective toolApproval level being
+	// allow-list or stronger (ADR-2026-09-27-execution-security-levels.md).
+	// Below it (bypass, deny-list) no call waits on a gate the runner did
+	// not configure, so the autonomous network-bash fallback deny (step 6),
+	// which only ever stood in for an unconfigured allow list, is off.
+	// Safety denies, containment, the deny entries and an explicitly
+	// configured allow list still apply at every level.
+	allowGated bool
 
 	allowRegexes []*regexp.Regexp
 	denyRegexes  []*regexp.Regexp
@@ -195,7 +196,7 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 	e := &PolicyEngine{
 		autonomous:      spec.Autonomous,
 		cwd:             spec.Cwd,
-		bypass:          spec.ToolApprovalBypass(),
+		allowGated:      spec.ToolApprovalAllowGated(),
 		allowedTools:    parseToolPatterns(spec.AllowedTools),
 		disallowedTools: parseToolPatterns(spec.DisallowedTools),
 		defaultAllow:    true,
@@ -225,8 +226,8 @@ func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 //  4. PermissionConfig DisallowPatterns regex match ⇒ deny.
 //  5. Spec.AllowedTools / PermissionConfig AllowPatterns ⇒ allow-gate: when
 //     any allow rule is configured, ONLY matching calls pass; the rest deny.
-//  6. Autonomous network-reaching bash with no allow ⇒ deny, except at
-//     toolApproval bypass, where no unconfigured gate applies.
+//  6. Autonomous network-reaching bash with no allow ⇒ deny, only when the
+//     toolApproval level is allow-list or stronger.
 //  7. defaultAllow.
 func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 	subject := call.subject()
@@ -280,8 +281,8 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 	}
 
 	// 6. Autonomous network-reaching bash defaults deny — a fallback gate
-	// that is not part of the bypass level.
-	if e.autonomous && !e.bypass && call.Kind == ToolBash && networkReaching.MatchString(call.Command) {
+	// that only an allow-gated level carries.
+	if e.autonomous && e.allowGated && call.Kind == ToolBash && networkReaching.MatchString(call.Command) {
 		return Decision{Allow: false, Reason: "network-reaching bash denied by default in autonomous session (no allow pattern configured)"}
 	}
 
@@ -466,11 +467,11 @@ func newNativeCodeIntelPolicy(spec agent.Spec, selected []string) (*nativeCodeIn
 		hasAllowGate: len(spec.AllowedTools) > 0 || spec.PermissionConfig != nil && len(spec.PermissionConfig.AllowPatterns) > 0,
 		defaultAllow: spec.PermissionConfig != nil && strings.EqualFold(spec.PermissionConfig.DefaultDecision, "allow"),
 	}
-	// At toolApproval bypass with no configured policy at all, the selected
-	// surface runs like every other tool: nothing but the deny entries
-	// stands in front of it. A configured PermissionConfig keeps its own
-	// default decision.
-	if !policy.hasAllowGate && spec.ToolApprovalBypass() && spec.PermissionConfig == nil {
+	// Below an allow-gated toolApproval level with no configured policy at
+	// all, the selected surface runs like every other tool: nothing but the
+	// deny entries stands in front of it. A configured PermissionConfig keeps
+	// its own default decision.
+	if !policy.hasAllowGate && !spec.ToolApprovalAllowGated() && spec.PermissionConfig == nil {
 		policy.defaultAllow = true
 	}
 	if len(selected) == 0 {

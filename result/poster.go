@@ -272,6 +272,12 @@ type statusRequest struct {
 	// successful workarea is durably retained before this status can trigger
 	// downstream verification.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
+
+	// ExecutionSecurityRefusal is the typed pre-spawn refusal of a session
+	// refused for its stamped execution-security levels (closed code plus
+	// the dimensions it names), paired with failureMode
+	// "execution-security". Additive; omitted for every other result.
+	ExecutionSecurityRefusal *agent.ExecutionSecurityRefusal `json:"executionSecurityRefusal,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -484,6 +490,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, TerminalWorkareaLease: projection,
+		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

@@ -21,6 +21,10 @@ const (
 	functionCallingModeNone = "NONE"
 )
 
+// nativeToolNames is the native tool surface this loop offers when no allow
+// list bounds it, in declaration order.
+var nativeToolNames = []string{"Bash", "Edit", "Write", "Read", "Grep", "Glob", "Task"}
+
 // toolsFromSpec builds the request body's tools array from BOTH
 // Spec.AllowedTools and Spec.MCPServers. Every native allowed tool and
 // every declared MCP tool/server becomes one functionDeclaration so the
@@ -36,9 +40,10 @@ const (
 // to connect keeps its catch-all and resolves calls to a structured
 // error.
 //
-// Returns nil when the session declares no tools (no AllowedTools, no
-// MCPToolNames, no MCPServers) so the request omits the tools field and
-// the model behaves as a plain text generator.
+// Returns nil when an allow gate admits no tools — an explicitly empty
+// AllowedTools, as a one-shot completion sends — and the session declares no
+// MCPToolNames or MCPServers, so the request omits the tools field and the
+// model behaves as a plain text generator.
 //
 // All functionDeclarations are collected into a single tools[] entry —
 // Gemini merges declarations across array entries, but one entry keeps
@@ -68,8 +73,18 @@ func toolsFromSpec(spec agent.Spec) []requestTool {
 
 	// Native allow-listed tools (Claude permission-pattern strings like
 	// "Bash(git:*)" or bare "Edit"). The leading verb is the tool name.
-	for _, t := range spec.AllowedTools {
-		add(toolNameFromPattern(t), "Allow-listed tool: "+t)
+	// Without an allow gate (no configured list below an allow-gated
+	// toolApproval level) the session is offered the full native surface:
+	// removing the runner's hidden allow list removed a gate, never the
+	// tools behind it.
+	if allowListGated(spec) {
+		for _, t := range spec.AllowedTools {
+			add(toolNameFromPattern(t), "Allow-listed tool: "+t)
+		}
+	} else {
+		for _, name := range nativeToolNames {
+			add(name, "Native tool: "+name)
+		}
 	}
 
 	// Explicit MCP tool names already fully-qualified

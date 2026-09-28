@@ -1189,6 +1189,9 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
 		// than inheriting an unreceipted compatibility mirror.
+		if err := runner.ValidateExecutionSecurityMember(d.OperationalPayload); err != nil {
+			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)
+		}
 		var admitted runner.QueuedWork
 		if err := json.Unmarshal(d.OperationalPayload, &admitted); err != nil {
 			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)

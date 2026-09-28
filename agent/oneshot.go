@@ -205,8 +205,13 @@ func specFromOneShot(req OneShotRequest) Spec {
 		Autonomous:         true,
 		Effort:             req.Effort,
 		MaxTurns:           &one,
-		Model:              req.Model,          // bare model id (when no Endpoint bound)
-		ResponseSchema:     req.ResponseSchema, // native-strict for NativeJSONMode harnesses
+		// An explicitly empty allow list: a one-shot is a single completion,
+		// so a harness whose tool surface follows the allow list offers it no
+		// tools. (nil would mean "unconfigured", which offers the harness's
+		// native surface below an allow-gated toolApproval level.)
+		AllowedTools:   []string{},
+		Model:          req.Model,          // bare model id (when no Endpoint bound)
+		ResponseSchema: req.ResponseSchema, // native-strict for NativeJSONMode harnesses
 	}
 	if req.Endpoint != nil {
 		spec.Endpoint = req.Endpoint

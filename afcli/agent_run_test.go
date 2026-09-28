@@ -2219,9 +2219,11 @@ func TestSessionNameSurvivesDaemonWireIntoRunnerQueuedWork(t *testing.T) {
 
 // TestDetailToQueuedWork_ExecutionSecurity covers the poll lane's hop into
 // the runner: the stamped levels are read from the operational payload with
-// the closed decoder, so a valid section reaches QueuedWork, an absent one
-// stays absent (index 0), and a malformed one fails the translation with
-// execution_security_unresolvable instead of being guessed.
+// the closed decoder, so a valid section (the exact control-plane shape
+// included) reaches QueuedWork, an absent one stays absent (index 0), and a
+// malformed one — an explicit null or a mismatched digest included — fails
+// the translation with execution_security_unresolvable instead of being
+// guessed.
 func TestDetailToQueuedWork_ExecutionSecurity(t *testing.T) {
 	levels := `{"toolApproval":"bypass","fileRead":"host","fileWrite":"workarea","network":"open","credentials":"ambient-host-login","isolation":"host-user"}`
 	cases := []struct {
@@ -2234,6 +2236,12 @@ func TestDetailToQueuedWork_ExecutionSecurity(t *testing.T) {
 		{name: "present", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + levels + `}}`, wantWrite: agent.FileWriteWorkarea},
 		{name: "unknown level", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + strings.Replace(levels, `"workarea"`, `"anywhere"`, 1) + `}}`, wantErr: true},
 		{name: "unsupported version", payload: `{"sessionId":"sess-es","executionSecurity":{"version":9,"levels":` + levels + `}}`, wantErr: true},
+		{name: "explicit null", payload: `{"sessionId":"sess-es","executionSecurity":null}`, wantErr: true},
+		{name: "exact platform shape", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + levels +
+			`,"sources":{"toolApproval":"system","fileRead":"system","fileWrite":"project","network":"system","credentials":"system","isolation":"session"}` +
+			`,"digest":"sha256:b9e51a0a19bb9cbc21112dcbe2a4e831ea284635aeb3a49fca1d6aefcdc44157","parentSessionId":"parent-1"}}`, wantWrite: agent.FileWriteWorkarea},
+		{name: "digest over other levels", payload: `{"sessionId":"sess-es","executionSecurity":{"version":1,"levels":` + levels +
+			`,"digest":"sha256:7a648e38b88ab49be6eb837709b6905be87abaa9e36dadbdf97bb56324a4ebe9"}}`, wantErr: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

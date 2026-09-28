@@ -436,3 +436,15 @@ func TestSpecFromOneShot_ModelThreading(t *testing.T) {
 		t.Errorf("Endpoint.Model should win, got %q", s2.Model)
 	}
 }
+
+// TestSpecFromOneShotOffersNoTools pins the explicitly empty allow list a
+// one-shot sends: a single completion must not be offered a harness's native
+// tool surface, which an unconfigured (nil) list offers below an allow-gated
+// toolApproval level.
+func TestSpecFromOneShotOffersNoTools(t *testing.T) {
+	t.Parallel()
+	spec := specFromOneShot(OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if spec.AllowedTools == nil || len(spec.AllowedTools) != 0 {
+		t.Fatalf("one-shot AllowedTools = %#v, want an explicitly empty list", spec.AllowedTools)
+	}
+}

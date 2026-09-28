@@ -121,8 +121,9 @@ type HarnessManifest struct {
 	ToolLifecycle  []ToolLifecycleProfile  `json:"toolLifecycle"`
 	// ExecutionSecurity declares, per dimension and session mode, the
 	// execution-security levels above index 0 this exact harness/version
-	// renders natively and the layer that enforces each, plus how its tool
-	// deny entries are carried at bypass. The zero value renders index 0 only.
+	// renders natively and the layer that enforces each. How the tool deny
+	// entries travel is derived from the ToolLifecycle profiles, not declared
+	// here. The zero value renders index 0 only.
 	ExecutionSecurity ExecutionSecurityRendering `json:"executionSecurity,omitzero"`
 }
 

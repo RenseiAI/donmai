@@ -50,32 +50,42 @@ var producerCapabilities = []string{receiptPreflightNackReasonCapability}
 // Appending is safe precisely because the lanes and producer contracts are
 // wired in the daemon rather than by each embedder: a capability tag reaching
 // the coordinator always has a matching implementation behind it on this host.
-//
-// The sandbox tag is the one substrate tag the daemon decides itself: it is
-// removed from any list, the embedder's included, unless enforcement attests
-// an isolation boundary, and added when it does.
-func effectiveRegistrationCapabilities(embedder []string, enforcement agent.ExecutionSecurityEnforcement) []string {
+// The sandbox tag is not decided here: Register reconciles it with the
+// execution-security attestation on every registration path.
+func effectiveRegistrationCapabilities(embedder []string) []string {
 	base := embedder
 	if base == nil {
 		base = baseSubstrateCapabilities
 	}
-	substrate := make([]string, 0, len(base)+1)
-	for _, tag := range base {
+	return worker.MergeCapabilities(base, append(laneCapabilities, producerCapabilities...)...)
+}
+
+// attestedRegistrationCapabilities reconciles a registration's capability
+// tags with its execution-security attestation: the sandbox tag is dropped
+// unless the attestation proves an isolation boundary, and added when it
+// does. A nil list stays nil (the field is omitted on the wire).
+func attestedRegistrationCapabilities(capabilities []string, enforcement agent.ExecutionSecurityEnforcement) []string {
+	if capabilities == nil {
+		return nil
+	}
+	out := make([]string, 0, len(capabilities)+1)
+	for _, tag := range capabilities {
 		if tag != sandboxCapability {
-			substrate = append(substrate, tag)
+			out = append(out, tag)
 		}
 	}
 	if enforcement.AttestsSandbox() {
-		substrate = append(substrate, sandboxCapability)
+		out = append(out, sandboxCapability)
 	}
-	return worker.MergeCapabilities(substrate, append(laneCapabilities, producerCapabilities...)...)
+	return out
 }
 
 // registrationExecutionSecurityEnforcement is the attestation published at
-// registration. A daemon configured with no attestation applies no
-// containment around the harness, so it attests index 0 on every substrate
-// dimension — explicitly, so the control plane reads a statement rather than
-// an absence.
+// registration. A caller that supplies none applies no containment around
+// the harness, so it attests index 0 on every substrate dimension —
+// explicitly, so the control plane reads a statement rather than an absence.
+// A supplied attestation is embedder-attested (see
+// agent.ExecutionSecurityEnforcement) and is validated and normalized.
 func registrationExecutionSecurityEnforcement(configured *agent.ExecutionSecurityEnforcement) (agent.ExecutionSecurityEnforcement, error) {
 	if configured == nil {
 		return agent.UncontainedHostEnforcement(), nil
@@ -83,31 +93,13 @@ func registrationExecutionSecurityEnforcement(configured *agent.ExecutionSecurit
 	if err := configured.Validate(); err != nil {
 		return agent.ExecutionSecurityEnforcement{}, err
 	}
-	out := *configured
-	// Normalize absent substrate dimensions to their explicit index-0 value
-	// so the published attestation names every dimension it covers.
-	for _, dimension := range agent.ExecutionSecurityDimensions() {
-		if dimension == agent.ExecutionSecurityToolApproval {
-			continue
-		}
-		setEnforcementLevel(&out, dimension, out.Level(dimension))
-	}
-	return out, nil
-}
-
-func setEnforcementLevel(e *agent.ExecutionSecurityEnforcement, dimension agent.ExecutionSecurityDimension, level agent.ExecutionSecurityLevel) {
-	switch dimension {
-	case agent.ExecutionSecurityFileRead:
-		e.FileRead = level
-	case agent.ExecutionSecurityFileWrite:
-		e.FileWrite = level
-	case agent.ExecutionSecurityNetwork:
-		e.Network = level
-	case agent.ExecutionSecurityCredentials:
-		e.Credentials = level
-	case agent.ExecutionSecurityIsolation:
-		e.Isolation = level
-	}
+	return agent.ExecutionSecurityEnforcement{
+		FileRead:    configured.Level(agent.ExecutionSecurityFileRead),
+		FileWrite:   configured.Level(agent.ExecutionSecurityFileWrite),
+		Network:     configured.Level(agent.ExecutionSecurityNetwork),
+		Credentials: configured.Level(agent.ExecutionSecurityCredentials),
+		Isolation:   configured.Level(agent.ExecutionSecurityIsolation),
+	}, nil
 }
 
 func mergePreflightRegistrationCapability(capabilities []string) []string {

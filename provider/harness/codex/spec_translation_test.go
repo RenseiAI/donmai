@@ -47,10 +47,6 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// protocol (codex-cli 0.139.0 generate-json-schema). See
 		// turnStartParams for the degrade path on older binaries.
 		"ResponseSchema",
-		// ExecutionSecurity: a stamped fileWrite "workarea" narrows the
-		// sandbox to workspace-write and the approval policy to "never"
-		// (requiresWorkareaWrites / effectiveSandboxLevel).
-		"ExecutionSecurity",
 	}
 
 	// All fields ignoredSpecFields can return — independent of
@@ -134,6 +130,11 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// treatment as ToolLifecyclePlan/ToolLifecycleReceipt above, not a
 		// JSON-RPC param this file's translation table ever sees.
 		"ToolSurfaceRequired",
+		// ExecutionSecurity is consumed by agent.PrepareHarness
+		// (RenderExecutionSecurity), which refuses before NewSpawnPlan runs
+		// any stamped level this adapter cannot render. Codex renders index 0
+		// only, so nothing in the JSON-RPC translation depends on it.
+		"ExecutionSecurity",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)
@@ -550,62 +551,5 @@ func TestNewSpawnPlan_IgnoredFieldsRecorded(t *testing.T) {
 		if !got[want] {
 			t.Errorf("expected ignored field %q in record, missing", want)
 		}
-	}
-}
-
-// TestExecutionSecurityFileWriteWorkareaRendersNatively pins the headless
-// rendering behind codex's fileWrite "workarea" declaration: the
-// workspace-write sandbox even when SandboxLevel asks for full access, and
-// the approval policy "never", so nothing escalates out of the sandbox. At
-// index 0 the legacy mapping is untouched, and read-only stays read-only.
-func TestExecutionSecurityFileWriteWorkareaRendersNatively(t *testing.T) {
-	t.Parallel()
-	workarea := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
-	workarea.Levels.FileWrite = agent.FileWriteWorkarea
-	indexZero := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
-	tests := []struct {
-		name         string
-		spec         agent.Spec
-		wantApproval string
-		wantSandbox  string
-		wantPolicy   string
-	}{
-		{
-			name:         "workarea narrows a full-access request",
-			spec:         agent.Spec{Cwd: "/wt", Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxFullAccess, ExecutionSecurity: workarea},
-			wantApproval: "never", wantSandbox: "workspace-write", wantPolicy: "workspaceWrite",
-		},
-		{
-			name:         "workarea keeps a narrower read-only level",
-			spec:         agent.Spec{Cwd: "/wt", Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxReadOnly, ExecutionSecurity: workarea},
-			wantApproval: "never", wantSandbox: "read-only", wantPolicy: "readOnly",
-		},
-		{
-			name:         "explicit index 0 keeps the legacy full-access mapping",
-			spec:         agent.Spec{Cwd: "/wt", Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxFullAccess, ExecutionSecurity: indexZero},
-			wantApproval: "on-request", wantSandbox: "danger-full-access", wantPolicy: "dangerFullAccess",
-		},
-		{
-			name:         "absent section keeps the legacy workspace-write mapping",
-			spec:         agent.Spec{Cwd: "/wt", Autonomous: true, SandboxEnabled: true, SandboxLevel: agent.SandboxWorkspaceWrite},
-			wantApproval: "on-request", wantSandbox: "workspace-write", wantPolicy: "workspaceWrite",
-		},
-	}
-	for _, tc := range tests {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			thread := threadStartParams(tc.spec)
-			turn := turnStartParams("thread-1", tc.spec, promptInput(tc.spec))
-			if thread["approvalPolicy"] != tc.wantApproval || turn["approvalPolicy"] != tc.wantApproval {
-				t.Errorf("approvalPolicy thread=%v turn=%v, want %q", thread["approvalPolicy"], turn["approvalPolicy"], tc.wantApproval)
-			}
-			if thread["sandbox"] != tc.wantSandbox {
-				t.Errorf("thread sandbox = %v, want %q", thread["sandbox"], tc.wantSandbox)
-			}
-			policy, _ := turn["sandboxPolicy"].(map[string]any)
-			if policy["type"] != tc.wantPolicy {
-				t.Errorf("turn sandboxPolicy = %v, want type %q", policy, tc.wantPolicy)
-			}
-		})
 	}
 }

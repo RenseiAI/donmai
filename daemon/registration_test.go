@@ -634,7 +634,9 @@ func TestRegister_CapabilitiesSentInBody(t *testing.T) {
 	}))
 	t.Cleanup(srv.Close)
 
-	caps := []string{"local", "sandbox", "workarea", "merge-queue"}
+	// No "sandbox" tag: Register drops it unless an attested isolation
+	// boundary backs it (TestRegisterReconcilesSandboxAndAttestationOnEveryPath).
+	caps := []string{"local", "workarea", "merge-queue"}
 	jwtPath := filepath.Join(t.TempDir(), "daemon.jwt")
 	tok := "rsk_live_" + "abc" //nolint:gosec // synthetic test token
 	_, err := Register(context.Background(), RegistrationOptions{

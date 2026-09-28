@@ -707,8 +707,14 @@ type Result struct {
 	// ExecutionSecurity is the per-dimension execution-security report the
 	// runner computed before spawn (ADR-2026-09-27-execution-security-levels.md
 	// D4): the stamped level, the level achieved and the layers enforcing it.
-	// Nil only for a run that never reached rendering.
+	// Present only for stamped work that reached rendering.
 	ExecutionSecurity *ExecutionSecurityReport `json:"executionSecurity,omitempty"`
+
+	// ExecutionSecurityRefusal is the typed refusal of a session refused
+	// before spawn for its stamped execution-security levels: the closed code
+	// and the dimensions it names. The status post carries it so the refusal
+	// is terminal and typed, never parsed out of Error.
+	ExecutionSecurityRefusal *ExecutionSecurityRefusal `json:"executionSecurityRefusal,omitempty"`
 
 	// WorkResult is the QA/acceptance verdict. Valid values:
 	// "passed" | "failed" | "unknown". Drives the acceptance gate on

@@ -50,8 +50,10 @@ type PreparedHarness struct {
 	ToolLifecycleReceipt  ToolLifecycleReceipt     `json:"toolLifecycleReceipt"`
 	// ExecutionSecurity is the applied receipt's per-dimension report
 	// (ADR-2026-09-27-execution-security-levels.md D4): what this exact
-	// harness renders for the session's stamped levels. Every plan this
-	// build compiles carries it; an absent report achieves exactly index 0.
+	// harness renders for the session's stamped levels. It is present exactly
+	// when the work item carries an executionSecurity section; a plan for
+	// work without one is byte-identical to the pre-field plan, and its
+	// absent report achieves exactly index 0.
 	ExecutionSecurity *ExecutionSecurityReport `json:"executionSecurity,omitempty"`
 }
 
@@ -158,7 +160,9 @@ func CompilePreparedHarness(spec Spec, manifest HarnessManifest, operationalDige
 	if securityErr != nil {
 		return plan, securityErr
 	}
-	plan.ExecutionSecurity = &report
+	if spec.ExecutionSecurity != nil {
+		plan.ExecutionSecurity = &report
+	}
 	return plan, nil
 }
 
@@ -240,6 +244,9 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 // never repaired from process state; a plan without one achieves index 0.
 func applyPreparedExecutionSecurity(spec Spec, manifest HarnessManifest, plan *PreparedHarness) error {
 	stamped := EffectiveExecutionSecurityLevels(spec.ExecutionSecurity)
+	if (plan.ExecutionSecurity == nil) != (spec.ExecutionSecurity == nil) {
+		return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Harness: manifest.Name, Detail: "host adaptation receipt and session disagree on whether the work is stamped"}
+	}
 	if plan.ExecutionSecurity != nil {
 		report, err := RenderExecutionSecurity(spec, manifest)
 		if err != nil {

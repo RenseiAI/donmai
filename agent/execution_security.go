@@ -2,6 +2,8 @@ package agent
 
 import (
 	"bytes"
+	"crypto/sha256"
+	"encoding/hex"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -188,15 +190,39 @@ const ExecutionSecurityWireVersion = 1
 // ExecutionSecurity is the queued-work section that stamps a session's
 // effective levels:
 //
-//	executionSecurity: { version: 1, levels: {<six dimensions>}, sources: {<dimension>: string} }
+//	executionSecurity: {
+//	  version: 1,
+//	  levels:  {<the six dimensions>},
+//	  sources: {<dimension>: <scope>},
+//	  digest:  "sha256:<hex>",          // over the canonical levels
+//	  parentSessionId?, rulesetRevision?, resolvedAt?: string
+//	}
 //
-// Sources are opaque, display-only references to the scope that set each
-// level. The decoder is closed: an unknown version, an unknown or missing
-// dimension, an unknown level, or any unknown member is refused.
+// Sources, parentSessionId, rulesetRevision and resolvedAt are opaque,
+// display-only provenance. The decoder is closed: an unknown version, an
+// unknown or missing dimension, an unknown level, a digest that does not
+// match the levels, an explicit null, or any other member is refused as
+// execution_security_unresolvable.
 type ExecutionSecurity struct {
-	Version int                                   `json:"version"`
-	Levels  ExecutionSecurityLevels               `json:"levels"`
-	Sources map[ExecutionSecurityDimension]string `json:"sources,omitempty"`
+	Version         int                                   `json:"version"`
+	Levels          ExecutionSecurityLevels               `json:"levels"`
+	Sources         map[ExecutionSecurityDimension]string `json:"sources,omitempty"`
+	Digest          string                                `json:"digest,omitempty"`
+	ParentSessionID string                                `json:"parentSessionId,omitempty"`
+	RulesetRevision string                                `json:"rulesetRevision,omitempty"`
+	ResolvedAt      string                                `json:"resolvedAt,omitempty"`
+}
+
+// ExecutionSecurityLevelsDigest is the canonical digest of a set of levels:
+// SHA-256 over the "<dimension>=<level>" lines, one per dimension in
+// canonical order, joined by "\n", rendered "sha256:<lowercase hex>".
+func ExecutionSecurityLevelsDigest(levels ExecutionSecurityLevels) string {
+	lines := make([]string, 0, len(executionSecurityLadders))
+	for _, dimension := range ExecutionSecurityDimensions() {
+		lines = append(lines, string(dimension)+"="+string(levels.Level(dimension)))
+	}
+	sum := sha256.Sum256([]byte(strings.Join(lines, "\n")))
+	return "sha256:" + hex.EncodeToString(sum[:])
 }
 
 // EffectiveExecutionSecurityLevels returns the levels a possibly-absent
@@ -226,40 +252,41 @@ func (e *ExecutionSecurity) Clone() *ExecutionSecurity {
 
 // UnmarshalJSON is the closed decoder for the queued-work section. Every
 // failure is an *ExecutionSecurityError with code
-// execution_security_unresolvable.
+// execution_security_unresolvable. encoding/json maps a null member onto a
+// nil pointer without calling this method, so a caller that must refuse an
+// explicit null reads the raw member with ExecutionSecurityFromOperationalPayload.
 func (e *ExecutionSecurity) UnmarshalJSON(raw []byte) error {
 	decoded, err := ParseExecutionSecurity(raw)
 	if err != nil {
 		return err
 	}
-	if decoded == nil {
-		return &ExecutionSecurityError{Code: ExecutionSecurityUnresolvable, Detail: "executionSecurity is null"}
-	}
 	*e = *decoded
 	return nil
 }
 
-// ParseExecutionSecurity strictly decodes one queued-work section. Empty
-// input (the member was absent) returns nil, nil. A JSON null is returned as
-// nil too — encoding/json already maps a null member to an absent pointer, so
-// the two cannot be told apart once decoded and are treated the same way.
+// ParseExecutionSecurity strictly decodes one present queued-work section. An
+// explicit null, like any other malformed value, is refused.
 func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
-	trimmed := bytes.TrimSpace(raw)
-	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
-		return nil, nil
-	}
 	malformed := func(dimension ExecutionSecurityDimension, level ExecutionSecurityLevel, detail string) error {
 		return &ExecutionSecurityError{Code: ExecutionSecurityUnresolvable, Dimension: dimension, Level: level, Detail: detail}
 	}
+	trimmed := bytes.TrimSpace(raw)
+	if len(trimmed) == 0 || bytes.Equal(trimmed, []byte("null")) {
+		return nil, malformed("", "", "executionSecurity is present but empty or null")
+	}
 	var wire struct {
-		Version *int               `json:"version"`
-		Levels  map[string]*string `json:"levels"`
-		Sources map[string]string  `json:"sources"`
+		Version         *int               `json:"version"`
+		Levels          map[string]*string `json:"levels"`
+		Sources         map[string]string  `json:"sources"`
+		Digest          *string            `json:"digest"`
+		ParentSessionID *string            `json:"parentSessionId"`
+		RulesetRevision *string            `json:"rulesetRevision"`
+		ResolvedAt      *string            `json:"resolvedAt"`
 	}
 	decoder := json.NewDecoder(bytes.NewReader(trimmed))
 	decoder.DisallowUnknownFields()
 	if err := decoder.Decode(&wire); err != nil {
-		return nil, malformed("", "", fmt.Sprintf("executionSecurity is not a closed {version, levels, sources} object: %v", err))
+		return nil, malformed("", "", fmt.Sprintf("executionSecurity is not the closed stamp object: %v", err))
 	}
 	if decoder.More() {
 		return nil, malformed("", "", "executionSecurity has trailing data")
@@ -300,11 +327,33 @@ func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
 			out.Sources[dimension] = source
 		}
 	}
+	for _, member := range []struct {
+		name  string
+		value *string
+		into  *string
+	}{
+		{"digest", wire.Digest, &out.Digest},
+		{"parentSessionId", wire.ParentSessionID, &out.ParentSessionID},
+		{"rulesetRevision", wire.RulesetRevision, &out.RulesetRevision},
+		{"resolvedAt", wire.ResolvedAt, &out.ResolvedAt},
+	} {
+		if member.value == nil {
+			continue
+		}
+		if strings.TrimSpace(*member.value) == "" {
+			return nil, malformed("", "", "executionSecurity "+member.name+" is empty")
+		}
+		*member.into = *member.value
+	}
+	if out.Digest != "" && out.Digest != ExecutionSecurityLevelsDigest(out.Levels) {
+		return nil, malformed("", "", "executionSecurity digest does not match its levels")
+	}
 	return out, nil
 }
 
 // ExecutionSecurityFromOperationalPayload reads the executionSecurity member
-// of a raw queued-work object. An absent member returns nil, nil.
+// of a raw queued-work object with the closed decoder. An absent member
+// returns nil, nil; a present one — an explicit null included — must decode.
 func ExecutionSecurityFromOperationalPayload(raw []byte) (*ExecutionSecurity, error) {
 	if len(bytes.TrimSpace(raw)) == 0 {
 		return nil, nil
@@ -313,7 +362,11 @@ func ExecutionSecurityFromOperationalPayload(raw []byte) (*ExecutionSecurity, er
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return nil, fmt.Errorf("agent: decode queued work for executionSecurity: %w", err)
 	}
-	return ParseExecutionSecurity(members["executionSecurity"])
+	member, present := members["executionSecurity"]
+	if !present {
+		return nil, nil
+	}
+	return ParseExecutionSecurity(member)
 }
 
 // ExecutionSecurityRefusalCode is the closed refusal-code enum of the ADR's D5.
@@ -394,21 +447,44 @@ const (
 	LayerCredentialBroker  EnforcingLayer = "credential_broker" //nolint:gosec // G101: an enforcing-layer name, not a credential.
 )
 
-// DenyBaselineStatus says how the always-on tool deny entries reached the
-// harness. It is reported for toolApproval only.
+// DenyBaselineStatus says how an always-on deny set held. Two dimensions
+// carry one: toolApproval (the tool deny baseline the control plane stamps)
+// and network (the always-on egress denies, cloud metadata first).
 type DenyBaselineStatus string
 
 // Deny-baseline statuses.
 const (
 	// DenyBaselineEnforced: the entries are enforced on parsed invocations and
-	// proven by the exact version's negative fixture. Required above bypass.
+	// proven by the exact version's negative fixture.
 	DenyBaselineEnforced DenyBaselineStatus = "enforced"
-	// DenyBaselineBestEffort: the entries are rendered through the harness's
-	// deny channel, unattested.
+	// DenyBaselineBestEffort: the entries are rendered through a channel the
+	// harness has, unattested.
 	DenyBaselineBestEffort DenyBaselineStatus = "best_effort"
-	// DenyBaselineUnavailable: the harness has no channel for the entries.
+	// DenyBaselineUnavailable: nothing carries the entries in this rendering.
 	DenyBaselineUnavailable DenyBaselineStatus = "unavailable"
 )
+
+// carriesDenyBaseline reports whether a dimension's report carries a
+// deny-baseline status.
+func carriesDenyBaseline(dimension ExecutionSecurityDimension) bool {
+	return dimension == ExecutionSecurityToolApproval || dimension == ExecutionSecurityNetwork
+}
+
+// enforcedDenyBaselineFrom returns the ladder index from which a dimension's
+// report must carry an enforced deny baseline: toolApproval above bypass, and
+// network at allow-list or above. Below it a report may claim the level with
+// any status; at or above it a report whose baseline is not enforced achieves
+// only the level just below.
+func enforcedDenyBaselineFrom(dimension ExecutionSecurityDimension) (int, bool) {
+	switch dimension {
+	case ExecutionSecurityToolApproval:
+		return 1, true
+	case ExecutionSecurityNetwork:
+		return 2, true
+	default:
+		return 0, false
+	}
+}
 
 // ExecutionSecurityDimensionReport is what one dimension achieved.
 type ExecutionSecurityDimensionReport struct {
@@ -417,9 +493,11 @@ type ExecutionSecurityDimensionReport struct {
 	Required      ExecutionSecurityLevel `json:"required"`
 	AchievedLevel ExecutionSecurityLevel `json:"achievedLevel"`
 	// EnforcingLayers is empty only when AchievedLevel is index 0.
-	EnforcingLayers []EnforcingLayer   `json:"enforcingLayers"`
-	DenyBaseline    DenyBaselineStatus `json:"denyBaseline,omitempty"`
-	EvidenceDigest  string             `json:"evidenceDigest,omitempty"`
+	EnforcingLayers []EnforcingLayer `json:"enforcingLayers"`
+	// DenyBaseline is required on toolApproval and network and absent on
+	// every other dimension.
+	DenyBaseline   DenyBaselineStatus `json:"denyBaseline,omitempty"`
+	EvidenceDigest string             `json:"evidenceDigest,omitempty"`
 }
 
 // ExecutionSecurityReport is the per-dimension record an applied adaptation
@@ -471,10 +549,11 @@ func (r *ExecutionSecurityReport) setDimension(dimension ExecutionSecurityDimens
 }
 
 // ExecutionSecurityReportMeets checks a report against the stamped levels. A
-// nil report is a peer that reported nothing and achieves exactly index 0. A
-// report that is malformed, claims a level above index 0 without an enforcing
-// layer, claims toolApproval above bypass without an enforced deny baseline,
-// or achieves less than a stamped level is execution_security_receipt_unmet.
+// nil report is a peer that reported nothing and achieves exactly index 0.
+// An unknown achieved level meets nothing; a level above index 0 without an
+// enforcing layer counts as index 0; a toolApproval or network level that
+// needs an enforced deny baseline and lacks one counts as the level below;
+// anything short of a stamped level is execution_security_receipt_unmet.
 func ExecutionSecurityReportMeets(report *ExecutionSecurityReport, stamped ExecutionSecurityLevels) error {
 	var unmet []ExecutionSecurityDimension
 	for _, dimension := range ExecutionSecurityDimensions() {
@@ -487,13 +566,14 @@ func ExecutionSecurityReportMeets(report *ExecutionSecurityReport, stamped Execu
 		if report != nil {
 			entry := report.Dimension(dimension)
 			index, known := ExecutionSecurityLevelIndex(dimension, entry.AchievedLevel)
-			switch {
-			case !known:
+			if !known {
 				index = -1
-			case index > 0 && len(entry.EnforcingLayers) == 0:
+			}
+			if index > 0 && len(entry.EnforcingLayers) == 0 {
 				index = 0
-			case dimension == ExecutionSecurityToolApproval && index > 0 && entry.DenyBaseline != DenyBaselineEnforced:
-				index = 0
+			}
+			if from, carries := enforcedDenyBaselineFrom(dimension); carries && index >= from && entry.DenyBaseline != DenyBaselineEnforced {
+				index = from - 1
 			}
 			achievedIndex = index
 		}
@@ -511,18 +591,20 @@ func ExecutionSecurityReportMeets(report *ExecutionSecurityReport, stamped Execu
 }
 
 // ExecutionSecurityRendering is an exact harness/version's declaration of what
-// it can render (the adaptation-manifest declaration of checklist row 9). The
-// zero value renders index 0 only and has no deny channel.
+// it can render above index 0 (the adaptation-manifest declaration of
+// checklist row 9). The zero value renders index 0 only. How the tool deny
+// baseline travels is not declared here: it is derived from the selected
+// tool/lifecycle profile's policy deliveries, so the two cannot disagree.
 type ExecutionSecurityRendering struct {
 	// Levels lists every level above index 0 the harness renders natively,
 	// per dimension and session mode, with its enforcing layers. A level not
 	// listed has no channel on this harness and is refused.
 	Levels []RenderedExecutionSecurityLevel `json:"levels,omitempty"`
-	// DenyBaseline is how the always-on deny entries reach the harness at
-	// bypass: best_effort when it has a deny channel, unavailable otherwise.
-	// A harness only renders toolApproval above bypass through a level entry,
-	// which implies an enforced baseline.
-	DenyBaseline DenyBaselineStatus `json:"denyBaseline,omitempty"`
+	// DenyChannelNeedsSandbox marks a harness whose tool policy channel only
+	// sees calls that leave the harness's own sandbox. Under a full-access
+	// sandbox grant nothing leaves it, so the deny entries have nothing to
+	// act on and the tool deny baseline is unavailable.
+	DenyChannelNeedsSandbox bool `json:"denyChannelNeedsSandbox,omitempty"`
 }
 
 // RenderedExecutionSecurityLevel declares one renderable level.
@@ -533,6 +615,10 @@ type RenderedExecutionSecurityLevel struct {
 	// mode the harness admits.
 	Modes  []PromptSessionMode `json:"modes,omitempty"`
 	Layers []EnforcingLayer    `json:"layers"`
+	// DenyBaseline is the status this rendering achieves on a dimension that
+	// carries one. Where the level needs an enforced baseline and this is not
+	// enforced, the level is refused.
+	DenyBaseline DenyBaselineStatus `json:"denyBaseline,omitempty"`
 }
 
 func (r ExecutionSecurityRendering) find(dimension ExecutionSecurityDimension, level ExecutionSecurityLevel, mode PromptSessionMode) (RenderedExecutionSecurityLevel, bool) {
@@ -571,17 +657,33 @@ func RenderExecutionSecurity(spec Spec, manifest HarnessManifest) (ExecutionSecu
 		required := levels.Level(dimension)
 		index, _ := ExecutionSecurityLevelIndex(dimension, required)
 		entry := ExecutionSecurityDimensionReport{Required: required, AchievedLevel: required, EnforcingLayers: []EnforcingLayer{}}
-		if index > 0 {
-			declared, ok := rendering.find(dimension, required, mode)
-			if !ok {
-				unrenderable = append(unrenderable, dimension)
-				continue
+		if index == 0 {
+			switch dimension {
+			case ExecutionSecurityToolApproval:
+				entry.DenyBaseline = toolDenyBaselineAtBypass(spec, manifest)
+			case ExecutionSecurityNetwork:
+				// No harness this runner drives, and no host placement,
+				// enforces the always-on egress denies.
+				entry.DenyBaseline = DenyBaselineUnavailable
 			}
-			entry.EnforcingLayers = sortedLayers(declared.Layers)
+			report.setDimension(dimension, entry)
+			continue
 		}
-		if dimension == ExecutionSecurityToolApproval {
-			entry.DenyBaseline = rendering.denyBaselineAt(index)
+		declared, ok := rendering.find(dimension, required, mode)
+		if ok && carriesDenyBaseline(dimension) {
+			entry.DenyBaseline = declared.DenyBaseline
+			if entry.DenyBaseline == "" {
+				entry.DenyBaseline = DenyBaselineUnavailable
+			}
+			if from, _ := enforcedDenyBaselineFrom(dimension); index >= from && entry.DenyBaseline != DenyBaselineEnforced {
+				ok = false
+			}
 		}
+		if !ok {
+			unrenderable = append(unrenderable, dimension)
+			continue
+		}
+		entry.EnforcingLayers = sortedLayers(declared.Layers)
 		report.setDimension(dimension, entry)
 	}
 	if len(unrenderable) > 0 {
@@ -594,14 +696,33 @@ func RenderExecutionSecurity(spec Spec, manifest HarnessManifest) (ExecutionSecu
 	return report, nil
 }
 
-func (r ExecutionSecurityRendering) denyBaselineAt(toolApprovalIndex int) DenyBaselineStatus {
-	if toolApprovalIndex > 0 {
-		return DenyBaselineEnforced
+// toolDenyBaselineAtBypass derives how the tool deny entries travel at
+// bypass from the exact tool/lifecycle profile the session selects: best
+// effort when the profile delivers a tool policy channel (a native allow/deny
+// grammar or a permission bridge), unavailable when it delivers none, or when
+// the harness's channel only sees sandbox escalations and the spec grants
+// full access.
+func toolDenyBaselineAtBypass(spec Spec, manifest HarnessManifest) DenyBaselineStatus {
+	profile, ok := SelectedToolLifecycleProfile(spec, manifest)
+	if !ok || !(deliversToolPolicy(profile.NativeToolPolicyDelivery) || deliversToolPolicy(profile.PermissionConfigDelivery)) {
+		return DenyBaselineUnavailable
 	}
-	if r.DenyBaseline == DenyBaselineBestEffort {
-		return DenyBaselineBestEffort
+	if manifest.ExecutionSecurity.DenyChannelNeedsSandbox && spec.SandboxLevel == SandboxFullAccess {
+		return DenyBaselineUnavailable
 	}
-	return DenyBaselineUnavailable
+	return DenyBaselineBestEffort
+}
+
+// deliversToolPolicy reports whether a tool-policy delivery reaches a real
+// enforcement point. The test double's oracle and the no-tool-surface marker
+// carry nothing.
+func deliversToolPolicy(kind ToolDeliveryKind) bool {
+	switch kind {
+	case "", ToolDeliveryUnsupported, ToolDeliveryNoToolSurface, ToolDeliveryStubOracle:
+		return false
+	default:
+		return true
+	}
 }
 
 func sortedLayers(layers []EnforcingLayer) []EnforcingLayer {
@@ -610,17 +731,21 @@ func sortedLayers(layers []EnforcingLayer) []EnforcingLayer {
 	return out
 }
 
-// ToolApprovalBypass reports whether spec's effective toolApproval level is
-// bypass. At bypass no tool runs behind an approval or a policy gate the
-// runner invented: only an explicitly configured allow list, the always-on
-// deny entries and the built-in destructive-command denies apply.
-func (s Spec) ToolApprovalBypass() bool {
-	return EffectiveExecutionSecurityLevels(s.ExecutionSecurity).ToolApproval == ToolApprovalBypass
+// ToolApprovalAllowGated reports whether spec's effective toolApproval level
+// puts every call behind an allow list (allow-list or stronger). At bypass
+// and deny-list no call waits on an allow gate the runner did not configure:
+// only an explicitly configured allow list, the deny entries and the
+// built-in destructive-command denies apply.
+func (s Spec) ToolApprovalAllowGated() bool {
+	index, _ := ExecutionSecurityLevelIndex(ExecutionSecurityToolApproval, EffectiveExecutionSecurityLevels(s.ExecutionSecurity).ToolApproval)
+	allowList, _ := ExecutionSecurityLevelIndex(ExecutionSecurityToolApproval, ToolApprovalAllowList)
+	return index >= allowList
 }
 
 // ValidateExecutionSecurityReport checks a report's closed shape: every
 // dimension carries known levels and layers, a level above index 0 names an
-// enforcing layer, and only toolApproval carries a deny-baseline status.
+// enforcing layer, and toolApproval and network — only they — carry a known
+// deny-baseline status.
 func ValidateExecutionSecurityReport(report ExecutionSecurityReport) error {
 	for _, dimension := range ExecutionSecurityDimensions() {
 		entry := report.Dimension(dimension)
@@ -640,10 +765,10 @@ func ValidateExecutionSecurityReport(report ExecutionSecurityReport) error {
 			}
 		}
 		switch {
-		case dimension == ExecutionSecurityToolApproval && !knownDenyBaseline(entry.DenyBaseline):
-			return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Dimension: dimension, Detail: "toolApproval report carries no known deny-baseline status"}
-		case dimension != ExecutionSecurityToolApproval && entry.DenyBaseline != "":
-			return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Dimension: dimension, Detail: "only toolApproval carries a deny-baseline status"}
+		case carriesDenyBaseline(dimension) && !knownDenyBaseline(entry.DenyBaseline):
+			return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Dimension: dimension, Detail: "report carries no known deny-baseline status"}
+		case !carriesDenyBaseline(dimension) && entry.DenyBaseline != "":
+			return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Dimension: dimension, Detail: "only toolApproval and network carry a deny-baseline status"}
 		}
 	}
 	return nil
@@ -667,19 +792,49 @@ func knownDenyBaseline(status DenyBaselineStatus) bool {
 	}
 }
 
+// ExecutionSecurityRefusal is the typed, value-free projection of an
+// execution-security refusal carried on a terminal status: the closed code
+// and the dimensions it names. Human-readable detail stays in the error text.
+type ExecutionSecurityRefusal struct {
+	Code       ExecutionSecurityRefusalCode `json:"code"`
+	Dimensions []ExecutionSecurityDimension `json:"dimensions,omitempty"`
+}
+
+// ExecutionSecurityRefusalFromError projects err's typed refusal, or nil when
+// err carries none.
+func ExecutionSecurityRefusalFromError(err error) *ExecutionSecurityRefusal {
+	var typed *ExecutionSecurityError
+	if !errors.As(err, &typed) || typed == nil || typed.Code == "" {
+		return nil
+	}
+	refusal := &ExecutionSecurityRefusal{Code: typed.Code}
+	named := typed.Dimensions
+	if len(named) == 0 && typed.Dimension != "" {
+		named = []ExecutionSecurityDimension{typed.Dimension}
+	}
+	// Only closed-vocabulary dimensions travel: an unknown name read off a
+	// malformed stamp is input, not a typed value.
+	for _, dimension := range named {
+		if _, known := executionSecurityLadders[dimension]; known {
+			refusal.Dimensions = append(refusal.Dimensions, dimension)
+		}
+	}
+	return refusal
+}
+
 // ExecutionSecurityEnforcement is a placement's attestation (the
 // executionSecurityEnforcement shape of 004-sandbox-capability-matrix.md):
-// per dimension, the strongest level the executor enforces, proven by a
-// negative probe on its exact version. An absent dimension is exactly index
-// 0. toolApproval is rendered by the harness layer, not the substrate, so a
-// placement leaves it absent.
+// per substrate dimension, the strongest level the executor enforces. It is
+// embedder-attested: a value above index 0 is a claim the embedder must back
+// with a negative probe on its exact executor version; this package does not
+// probe. An absent dimension is exactly index 0. toolApproval is rendered by
+// the harness layer, not the substrate, so the shape has no member for it.
 type ExecutionSecurityEnforcement struct {
-	ToolApproval ExecutionSecurityLevel `json:"toolApproval,omitempty"`
-	FileRead     ExecutionSecurityLevel `json:"fileRead,omitempty"`
-	FileWrite    ExecutionSecurityLevel `json:"fileWrite,omitempty"`
-	Network      ExecutionSecurityLevel `json:"network,omitempty"`
-	Credentials  ExecutionSecurityLevel `json:"credentials,omitempty"`
-	Isolation    ExecutionSecurityLevel `json:"isolation,omitempty"`
+	FileRead    ExecutionSecurityLevel `json:"fileRead,omitempty"`
+	FileWrite   ExecutionSecurityLevel `json:"fileWrite,omitempty"`
+	Network     ExecutionSecurityLevel `json:"network,omitempty"`
+	Credentials ExecutionSecurityLevel `json:"credentials,omitempty"`
+	Isolation   ExecutionSecurityLevel `json:"isolation,omitempty"`
 }
 
 // UncontainedHostEnforcement is what a host that applies no containment
@@ -696,7 +851,11 @@ func UncontainedHostEnforcement() ExecutionSecurityEnforcement {
 // Level returns the attested level for dimension, reading an absent
 // dimension as index 0.
 func (e ExecutionSecurityEnforcement) Level(dimension ExecutionSecurityDimension) ExecutionSecurityLevel {
-	if level := ExecutionSecurityLevels(e).Level(dimension); level != "" {
+	attested := ExecutionSecurityLevels{
+		FileRead: e.FileRead, FileWrite: e.FileWrite, Network: e.Network,
+		Credentials: e.Credentials, Isolation: e.Isolation,
+	}
+	if level := attested.Level(dimension); level != "" {
 		return level
 	}
 	ladder := executionSecurityLadders[dimension]

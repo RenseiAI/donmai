@@ -12,9 +12,10 @@ import (
 // asks the caller to execute tools, so this check must run immediately before
 // Bash/filesystem/MCP dispatch.
 type toolPolicy struct {
-	// gated is whether the allow list is a gate. It is, unless the session's
-	// toolApproval level is bypass and no allow list was configured: at
-	// bypass the runner imposes no allow list of its own
+	// gated is whether the allow list is a gate (allowListGated). It is when
+	// an allow list was configured or the session's toolApproval level is
+	// allow-list or stronger. Below that (bypass, deny-list) with no
+	// configured list the runner imposes no allow list of its own
 	// (ADR-2026-09-27-execution-security-levels.md), and a declared MCP
 	// server or tool name only widens a gate that exists.
 	gated      bool
@@ -29,7 +30,7 @@ type geminiToolPattern struct {
 }
 
 func newToolPolicy(spec agent.Spec) *toolPolicy {
-	policy := &toolPolicy{gated: len(spec.AllowedTools) > 0 || !spec.ToolApprovalBypass()}
+	policy := &toolPolicy{gated: allowListGated(spec)}
 	for _, raw := range spec.AllowedTools {
 		if pattern, ok := parseGeminiToolPattern(raw); ok {
 			policy.allowed = append(policy.allowed, pattern)
@@ -131,4 +132,14 @@ func argumentMatches(pattern, subject string) bool {
 func globMatchFold(pattern, value string) bool {
 	matched, err := filepath.Match(strings.ToLower(pattern), strings.ToLower(value))
 	return err == nil && matched
+}
+
+// allowListGated reports whether the allow list gates this session's tool
+// calls (and so bounds the declared native tools): a configured list — a
+// non-nil one, so an explicitly empty list offers nothing — or a toolApproval
+// level of allow-list or stronger. The runner never configures an empty list
+// (an unconfigured card list stays nil); a one-shot completion does, because
+// it is a single completion and not a tool loop.
+func allowListGated(spec agent.Spec) bool {
+	return spec.AllowedTools != nil || spec.ToolApprovalAllowGated()
 }

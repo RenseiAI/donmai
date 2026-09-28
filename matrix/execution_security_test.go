@@ -21,38 +21,40 @@ type renderedAbove struct {
 // (ADR-2026-09-27-execution-security-levels.md; checklist row 9), asserted
 // against every harvested manifest and every session mode it admits:
 //
-//   - index 0 renders everywhere and reports the harness's honest
-//     deny-baseline status;
+//   - index 0 renders everywhere, reports network's deny baseline as
+//     unavailable, and reports the tool deny baseline per harness AND mode,
+//     derived from the mode's tool/lifecycle profile;
 //   - every level above index 0 is refused with
 //     execution_security_unrenderable naming its dimension, except the
-//     renderings listed here, which achieve the level with their layers.
+//     renderings listed in wantAbove (none today).
 //
-// A harness that starts declaring a level fails here until this table — the
-// reviewed statement of what each exact adapter enforces — says so too.
+// A harness or mode that starts declaring a level, or whose deny channel
+// changes, fails here until this table — the reviewed statement of what each
+// exact adapter enforces — says so too.
 func TestExecutionSecurityRenderMatrix(t *testing.T) {
 	t.Parallel()
-	wantDenyBaseline := map[agent.HarnessName]agent.DenyBaselineStatus{
-		agent.HarnessClaudeCode:   agent.DenyBaselineBestEffort,
-		agent.HarnessCodex:        agent.DenyBaselineBestEffort,
-		agent.HarnessGeminiDirect: agent.DenyBaselineBestEffort,
-		agent.HarnessOpenCode:     agent.DenyBaselineBestEffort,
-		agent.HarnessPi:           agent.DenyBaselineBestEffort,
-		agent.HarnessAntigravity:  agent.DenyBaselineUnavailable,
-		agent.HarnessOllama:       agent.DenyBaselineUnavailable,
-		agent.HarnessAmp:          agent.DenyBaselineUnavailable,
-		agent.HarnessShell:        agent.DenyBaselineUnavailable,
-		agent.HarnessStub:         agent.DenyBaselineUnavailable,
+	const (
+		auto  = agent.PromptModeAutonomous
+		human = agent.PromptModeHumanControlled
+	)
+	best, none := agent.DenyBaselineBestEffort, agent.DenyBaselineUnavailable
+	wantDenyBaseline := map[agent.HarnessName]map[agent.PromptSessionMode]agent.DenyBaselineStatus{
+		agent.HarnessClaudeCode:   {auto: best, human: none},
+		agent.HarnessCodex:        {auto: best, human: none},
+		agent.HarnessGeminiDirect: {auto: best},
+		agent.HarnessOpenCode:     {auto: best},
+		agent.HarnessPi:           {auto: best, human: best},
+		agent.HarnessAntigravity:  {auto: none},
+		agent.HarnessOllama:       {auto: none},
+		agent.HarnessAmp:          {auto: none},
+		agent.HarnessShell:        {human: none},
+		agent.HarnessStub:         {auto: none, human: none},
 	}
-	wantAbove := map[agent.HarnessName][]renderedAbove{
-		agent.HarnessCodex: {{
-			dimension: agent.ExecutionSecurityFileWrite, level: agent.FileWriteWorkarea,
-			mode: agent.PromptModeAutonomous, layers: []agent.EnforcingLayer{agent.LayerHarnessNative},
-		}},
-	}
+	wantAbove := map[agent.HarnessName][]renderedAbove{}
 
 	for _, harvest := range HarnessHarvestList() {
 		manifest := harvest.Manifest()
-		want, known := wantDenyBaseline[harvest.Name]
+		wantModes, known := wantDenyBaseline[harvest.Name]
 		if !known {
 			t.Errorf("harness %q has no row in the execution-security render matrix", harvest.Name)
 			continue
@@ -62,14 +64,21 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 			modes[profile.Mode] = true
 		}
 		for mode := range modes {
-			base := agent.Spec{PromptMode: mode}
+			want, ok := wantModes[mode]
+			if !ok {
+				t.Errorf("%s/%s has no deny-baseline row in the render matrix", harvest.Name, mode)
+				continue
+			}
+			base := agent.Spec{PromptMode: mode, SandboxLevel: agent.SandboxWorkspaceWrite}
+			base.ExecutionSecurity = &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
 			report, err := agent.RenderExecutionSecurity(base, manifest)
 			if err != nil {
 				t.Errorf("%s/%s: index 0 refused: %v", harvest.Name, mode, err)
 				continue
 			}
-			if report.ToolApproval.DenyBaseline != want {
-				t.Errorf("%s/%s: deny baseline = %q, want %q", harvest.Name, mode, report.ToolApproval.DenyBaseline, want)
+			if report.ToolApproval.DenyBaseline != want || report.Network.DenyBaseline != none {
+				t.Errorf("%s/%s: deny baseline tool=%q network=%q, want tool=%q network=%q",
+					harvest.Name, mode, report.ToolApproval.DenyBaseline, report.Network.DenyBaseline, want, none)
 			}
 			for _, dimension := range agent.ExecutionSecurityDimensions() {
 				for _, level := range agent.ExecutionSecurityLadder(dimension)[1:] {
@@ -93,6 +102,30 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 			}
 		}
 	}
+}
+
+// TestCodexDenyBaselineUnderFullAccess: codex's approval bridge only sees
+// sandbox escalations, so under the full-access grant — what an index-0
+// stamp renders headless — the tool deny entries have nothing to act on and
+// the report says so.
+func TestCodexDenyBaselineUnderFullAccess(t *testing.T) {
+	t.Parallel()
+	for _, harvest := range HarnessHarvestList() {
+		if harvest.Name != agent.HarnessCodex {
+			continue
+		}
+		spec := agent.Spec{PromptMode: agent.PromptModeAutonomous, SandboxLevel: agent.SandboxFullAccess}
+		spec.ExecutionSecurity = &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+		report, err := agent.RenderExecutionSecurity(spec, harvest.Manifest())
+		if err != nil {
+			t.Fatal(err)
+		}
+		if report.ToolApproval.DenyBaseline != agent.DenyBaselineUnavailable {
+			t.Fatalf("codex full-access deny baseline = %q, want unavailable", report.ToolApproval.DenyBaseline)
+		}
+		return
+	}
+	t.Fatal("codex is not in the harvest list")
 }
 
 func findRendered(entries []renderedAbove, dimension agent.ExecutionSecurityDimension, level agent.ExecutionSecurityLevel, mode agent.PromptSessionMode) *renderedAbove {

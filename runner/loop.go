@@ -112,7 +112,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// provider side effect. The same function re-checks the final spec
 	// before spawn (step 6b) and records the report.
 	if _, err = executionSecurityReport(agent.Spec{ExecutionSecurity: qw.ExecutionSecurity, PromptMode: sessionPromptMode(qw, selection.effectiveCell)}, provider, nil); err != nil {
-		res.Status, res.FailureMode, res.Error = "failed", FailureExecutionSecurity, err.Error()
+		refuseForExecutionSecurity(res, err)
 		return res, err
 	}
 	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
@@ -149,7 +149,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		if _, err = agent.ApplyPreparedHarness(preparedSource, harness.Manifest()); err != nil {
 			if agent.ExecutionSecurityErrorCode(err) != "" {
-				res.Status, res.FailureMode, res.Error = "failed", FailureExecutionSecurity, err.Error()
+				refuseForExecutionSecurity(res, err)
 				return res, err
 			}
 			// A drift error names exactly which authority-projection fields
@@ -798,14 +798,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	// 6b. Execution security: refuse a stamped level this exact harness and
-	// session mode cannot render, and record what the run achieves, before
-	// any state, credential or provider side effect. Receipt-bearing work
-	// reports the host-compiled plan's report (the provider's PrepareHarness
-	// re-derives it byte-for-byte and checks it against the stamp);
+	// session mode cannot render, and record what a stamped run achieves,
+	// before any state, credential or provider side effect. Receipt-bearing
+	// work reports the host-compiled plan's report once it meets the stamp
+	// (the provider's PrepareHarness also re-derives it byte-for-byte);
 	// everything else renders here with the same function.
 	report, securityErr := executionSecurityReport(spec, provider, preparedPlan)
 	if securityErr != nil {
-		res.Status, res.FailureMode, res.Error = "failed", FailureExecutionSecurity, securityErr.Error()
+		refuseForExecutionSecurity(res, securityErr)
 		return res, securityErr
 	}
 	res.ExecutionSecurity = report

@@ -345,6 +345,9 @@ func decodeProviderViewPreflightWork(detailJSON json.RawMessage) (QueuedWork, ex
 	if err := json.Unmarshal(detailJSON, &wire); err != nil {
 		return QueuedWork{}, executioncell.RuntimeBinding{}, err
 	}
+	if err := ValidateExecutionSecurityMember(wire.OperationalPayload); err != nil {
+		return QueuedWork{}, executioncell.RuntimeBinding{}, err
+	}
 	var qw QueuedWork
 	if err := json.Unmarshal(wire.OperationalPayload, &qw); err != nil {
 		return QueuedWork{}, executioncell.RuntimeBinding{}, fmt.Errorf("decode host operational payload: %w", err)
