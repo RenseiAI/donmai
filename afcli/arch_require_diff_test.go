@@ -38,8 +38,8 @@ func TestArchRequireDiffCLI(t *testing.T) {
 	}{
 		{name: "missing gh", wantExit: 2, wantText: "required PR diff unavailable"},
 		{name: "auth failure", script: "#!/bin/sh\necho auth-required >&2\nexit 4\n", wantExit: 2, wantText: "auth-required"},
-		{name: "patch failure", script: "#!/bin/sh\nif [ \"$2\" = view ]; then\n printf '%s' '{\"title\":\"Change\",\"body\":\"\",\"files\":[{\"path\":\"src/auth/login.ts\",\"additions\":1,\"deletions\":0}]}'\nelse\n echo patch-unavailable >&2\n exit 1\nfi\n", wantExit: 2, wantText: "patch-unavailable"},
-		{name: "actual diff", script: "#!/bin/sh\nif [ \"$2\" = view ]; then\n printf '%s' '{\"title\":\"Change\",\"body\":\"\",\"files\":[{\"path\":\"src/auth/login.ts\",\"additions\":1,\"deletions\":0}]}'\nelse\n printf '%s\\n' 'diff --git a/src/auth/login.ts b/src/auth/login.ts' '@@ -0,0 +1 @@' '+const r: Result<User, Error> = ok(user)'\nfi\n", wantText: `"native-diff-only"`},
+		{name: "patch failure", script: "#!/bin/sh\nif [ \"$2\" = view ]; then\n printf '%s' '{\"title\":\"Change\",\"body\":\"\",\"changedFiles\":1,\"files\":[{\"path\":\"src/auth/login.ts\",\"additions\":1,\"deletions\":0}]}'\nelse\n echo patch-unavailable >&2\n exit 1\nfi\n", wantExit: 2, wantText: "patch-unavailable"},
+		{name: "actual diff", script: "#!/bin/sh\nif [ \"$2\" = view ]; then\n printf '%s' '{\"title\":\"Change\",\"body\":\"\",\"changedFiles\":1,\"files\":[{\"path\":\"src/auth/login.ts\",\"additions\":1,\"deletions\":0}]}'\nelse\n printf '%s\\n' 'diff --git a/src/auth/login.ts b/src/auth/login.ts' '@@ -0,0 +1 @@' '+const r: Result<User, Error> = ok(user)'\nfi\n", wantText: `"native-diff-only"`},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			dir := t.TempDir()
