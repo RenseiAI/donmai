@@ -50,8 +50,12 @@ On Linux, use Go installation or a release archive below.
 ### go install (requires Go 1.26.6+)
 
 ```bash
-go install github.com/RenseiAI/donmai/cmd/donmai@latest
+go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.52
 ```
+
+Use the explicit release pin: the public Go proxy currently resolves `@latest`
+to the historical `v1.0.0` module. This source-install command records the pinned
+module version in Go build information and reports `dev` for `donmai --version`.
 
 ### GitHub release download
 
@@ -59,12 +63,12 @@ Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
 [releases page](https://github.com/RenseiAI/donmai/releases).
 
-Example for macOS arm64, pinned to v0.72.47. See the releases page for newer
+Example for macOS arm64, pinned to v0.72.52. See the releases page for newer
 versions:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.47/donmai_0.72.47_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.52/donmai_0.72.52_darwin_arm64.tar.gz \
   | tar -xz -C "$HOME/.local/bin" donmai
 "$HOME/.local/bin/donmai" --version
 ```
