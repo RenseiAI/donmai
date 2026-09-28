@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -31,6 +32,9 @@ type verdictScriptTurn struct {
 	// with identical bytes still moves the mtime on filesystems whose
 	// timestamp tick is coarser than the gap between two turns.
 	laterMtime bool
+	// removeManifest deletes the manifest file before the turn's events, as a
+	// worktree clean during a follow-up turn would.
+	removeManifest bool
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -101,6 +105,11 @@ func (h *verdictScriptHandle) playLocked() {
 			if err := os.Chtimes(path, later, later); err != nil {
 				h.t.Errorf("chtimes turn-result manifest: %v", err)
 			}
+		}
+	}
+	if turn.removeManifest {
+		if err := os.Remove(filepath.Join(h.cwd, state.AgentDirName, ManifestFileName)); err != nil {
+			h.t.Errorf("remove turn-result manifest: %v", err)
 		}
 	}
 	if turn.text != "" {
@@ -177,6 +186,7 @@ type verdictWant struct {
 	pr           string
 	manifest     string // expected res.Manifest.Verdict; "" = no manifest on the envelope
 	wantSteering bool
+	errContains  string // expected substring of res.Error, when set
 }
 
 func assertVerdict(t *testing.T, res *Result, want verdictWant) {
@@ -186,6 +196,9 @@ func assertVerdict(t *testing.T, res *Result, want verdictWant) {
 	}
 	if res.Status != want.status {
 		t.Errorf("Status = %q; want %q (FailureMode=%q, Error=%q)", res.Status, want.status, res.FailureMode, res.Error)
+	}
+	if want.errContains != "" && !strings.Contains(res.Error, want.errContains) {
+		t.Errorf("Error = %q; want it to contain %q", res.Error, want.errContains)
 	}
 	if res.FailureMode != want.failureMode {
 		t.Errorf("FailureMode = %q; want %q", res.FailureMode, want.failureMode)
@@ -332,6 +345,54 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all fixed"}`},
 			},
 			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "a follow-up that deletes the manifest file and prints a passed block never raises it",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{removeManifest: true, text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all fixed"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "a printed passed block never raises an earlier turn's anchored failed marker",
+			turns: []verdictScriptTurn{
+				{text: "Round two is missing.\nWORK_RESULT: failed"},
+				{text: `> Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"recalled from an old run"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", wantSteering: true},
+		},
+		{
+			name: "a printed passed block never raises the same turn's own anchored failed marker",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"optimistic\"}\nWORK_RESULT: failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", wantSteering: true},
+		},
+		{
+			name: "a printed passed block never raises the same turn's own blocked marker",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"optimistic\"}\nWORK_RESULT: blocked\nAGENT_BLOCKED: need the staging credentials"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need the staging credentials", wantSteering: true},
+		},
+		{
+			name: "a printed block sets the verdict when none exists yet",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all green"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all green", manifest: "passed", wantSteering: true},
+		},
+		{
+			name: "a blocked follow-up keeps the AGENT_BLOCKED reason that follows its WORK_RESULT line",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: "WORK_RESULT: blocked\nAGENT_BLOCKED: need a product decision on the migration"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need a product decision on the migration", wantSteering: true},
 		},
 		{
 			name: "a printed inline manifest may lower a manifest file",
@@ -629,11 +690,58 @@ func TestScanVerdict(t *testing.T) {
 		{"WORK_RESULT: paſſed", "", ""},
 		{"WORK_RESULT: failedx", "", ""},
 		{"AGENT_BLOCKED_REASON: no", "", ""},
+		// Blocked in the prompts' own order keeps the AGENT_BLOCKED reason.
+		{"WORK_RESULT:blocked\nAGENT_BLOCKED: spec is ambiguous", "blocked", "spec is ambiguous"},
+		{"<!-- WORK_RESULT: blocked -->\n<!-- AGENT_BLOCKED: no repo access -->", "blocked", "no repo access"},
+		// AGENT_BLOCKED requires the colon, as the downstream reader does.
+		{"AGENT_BLOCKED", "", ""},
+		{"AGENT_BLOCKED.", "", ""},
+		{"AGENT_BLOCKED is the decline marker; I am not blocked.", "", ""},
+		// The first anchored marker wins whatever its value.
+		{"WORK_RESULT: unknown\nWORK_RESULT: passed", "unknown", ""},
+		// `passedly` is no marker (word boundary), so `failed` is the first
+		// one. The downstream reader reads `passed` here until it adopts the
+		// same word boundary (paired downstream change).
+		{"WORK_RESULT: passedly\nWORK_RESULT: failed", "failed", ""},
 	}
 	for _, tc := range cases {
 		verdict, reason := scanVerdict(tc.text)
 		if verdict != tc.verdict || reason != tc.reason {
 			t.Errorf("scanVerdict(%q) = (%q, %q); want (%q, %q)", tc.text, verdict, reason, tc.verdict, tc.reason)
 		}
+	}
+}
+
+// TestRun_PrintedManifestNeverRaisesTheSameTurnsMarker pins the never-raise
+// rule on the FIRST turn (step 10·M): a printed `Intended manifest` block
+// cannot raise the turn's own anchored marker verdict, but sets the verdict
+// when the turn carries no marker.
+func TestRun_PrintedManifestNeverRaisesTheSameTurnsMarker(t *testing.T) {
+	cases := []struct {
+		name string
+		text string
+		want verdictWant
+	}{
+		{
+			name: "printed passed block with an anchored failed marker stays failed",
+			text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"optimistic\"}\nWORK_RESULT: failed",
+			want: verdictWant{status: "completed", workResult: "failed"},
+		},
+		{
+			name: "printed failed block with an anchored passed marker lowers to failed",
+			text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"failed\",\"summary\":\"regression reproduces\"}\nWORK_RESULT: passed",
+			want: verdictWant{status: "completed", workResult: "failed", summary: "regression reproduces", manifest: "failed"},
+		},
+		{
+			name: "printed block without a marker sets the verdict",
+			text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all green"}`,
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all green", manifest: "passed"},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := runScripted(t, "qa", true, "", verdictScriptTurn{text: tc.text})
+			assertVerdict(t, res, tc.want)
+		})
 	}
 }

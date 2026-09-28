@@ -2536,17 +2536,26 @@ func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPS
 // transition of result-sensitive work, nor reclassify a successful session as
 // a decline. Matching is case-insensitive over ASCII only (see asciiLower).
 func scanVerdict(text string) (verdict, reason string) {
-	loc := workResultRE.FindStringSubmatchIndex(asciiLower(text))
+	lower := asciiLower(text)
+	loc := workResultRE.FindStringSubmatchIndex(lower)
 	if loc == nil {
 		return "", ""
 	}
 	if loc[2] >= 0 {
-		return asciiLower(text[loc[2]:loc[3]]), ""
+		if verdict = lower[loc[2]:loc[3]]; verdict != "blocked" {
+			return verdict, ""
+		}
 	}
-	reason = strings.TrimSpace(text[loc[4]:loc[5]])
-	// Drop a trailing HTML-comment fence so a marker emitted as
-	// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
-	return "blocked", strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
+	// Blocked, in either spelling: the reason is the message's FIRST anchored
+	// `AGENT_BLOCKED: <reason>` line, wherever it sits — so the prompts' own
+	// order (`WORK_RESULT: blocked` then `AGENT_BLOCKED: <reason>`) keeps it.
+	if m := agentBlockedRE.FindStringSubmatchIndex(lower); m != nil {
+		reason = strings.TrimSpace(text[m[2]:m[3]])
+		// Drop a trailing HTML-comment fence so a marker emitted as
+		// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
+		reason = strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
+	}
+	return "blocked", reason
 }
 
 // scanWorkResult returns the passed|failed|unknown verdict scanVerdict reads
@@ -2632,14 +2641,20 @@ const lineStartPrefix = `(?m)^[ \t]*`
 // `KEY:value`, `KEY: value` or `KEY value`. It never crosses a line break.
 const markerSeparator = `(?:[ \t]*:[ \t]*|[ \t]+)`
 
+// markerLead is where every marker starts: the line start plus an optional
+// opening HTML-comment fence.
+const markerLead = lineStartPrefix + `(?:<!--[ \t]*)?`
+
 // verdictMarkerPattern is the single line-anchored marker rule (see
-// scanVerdict). Group 1 captures a WORK_RESULT verdict; group 2 captures the
-// reason of an AGENT_BLOCKED line (possibly empty). Both keywords must end at
-// a word boundary, so `WORK_RESULT: passedly` and `AGENT_BLOCKED_X` do not
-// count.
-const verdictMarkerPattern = lineStartPrefix + `(?:<!--[ \t]*)?(?:` +
-	`work_result` + markerSeparator + `(passed|failed|blocked|unknown)\b` +
-	`|agent_blocked\b(?:` + markerSeparator + `)?([^\r\n]*))`
+// scanVerdict): `WORK_RESULT` + separator + a verdict (group 1) that must end
+// at a word boundary, so `WORK_RESULT: passedly` does not count; or
+// `AGENT_BLOCKED` followed by a colon (required, as downstream requires it).
+const verdictMarkerPattern = markerLead + `(?:work_result` + markerSeparator +
+	`(passed|failed|blocked|unknown)\b|agent_blocked[ \t]*:)`
+
+// agentBlockedRE captures the reason of an anchored `AGENT_BLOCKED: <reason>`
+// line, up to the end of that line (possibly empty; never the next line).
+var agentBlockedRE = regexp.MustCompile(markerLead + `agent_blocked[ \t]*:([^\r\n]*)`)
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.

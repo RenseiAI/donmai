@@ -467,6 +467,8 @@ func TestScanBlocked_DetectsDeclineMarkers(t *testing.T) {
 		{"work-result-blocked-never-crosses-a-line", "WORK_RESULT:\nblocked", false, ""},
 		{"first-marker-wins-passed-then-blocked", "WORK_RESULT: passed\nAGENT_BLOCKED: second thoughts", false, ""},
 		{"first-marker-wins-blocked-then-passed", "AGENT_BLOCKED: need a decision\nWORK_RESULT: passed", true, "need a decision"},
+		{"work-result-blocked-then-agent-blocked-keeps-reason", "WORK_RESULT:blocked\nAGENT_BLOCKED: spec is ambiguous", true, "spec is ambiguous"},
+		{"agent-blocked-without-colon-is-prose", "AGENT_BLOCKED is how I would decline", false, ""},
 		{"passed-not-blocked", "WORK_RESULT:passed", false, ""},
 		{"failed-not-blocked", "WORK_RESULT:failed", false, ""},
 		{"no-marker", "I am working on the task now", false, ""},
@@ -589,6 +591,31 @@ func TestObserveEvent_SetsBlockedFlag(t *testing.T) {
 	}
 	if obs.blockedReason != "no acceptance criteria on the issue" {
 		t.Errorf("obs.blockedReason = %q; want captured reason", obs.blockedReason)
+	}
+}
+
+// TestObserveEvent_LaterVerdictClearsEarlierBlocked pins latest-message-wins
+// across messages: a later message's anchored passed verdict clears an
+// earlier message's decline, and a later decline clears an earlier verdict.
+func TestObserveEvent_LaterVerdictClearsEarlierBlocked(t *testing.T) {
+	t.Parallel()
+	h := newRunnerHarness(t)
+	wt := t.TempDir()
+
+	obs := &streamObservation{}
+	for _, text := range []string{"AGENT_BLOCKED: waiting on a decision", "Decision arrived; done.\nWORK_RESULT: passed"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if obs.blocked || obs.blockedReason != "" || obs.workResult != "passed" {
+		t.Errorf("after blocked then passed: blocked=%v reason=%q workResult=%q; want false, \"\", passed", obs.blocked, obs.blockedReason, obs.workResult)
+	}
+
+	obs = &streamObservation{}
+	for _, text := range []string{"WORK_RESULT: passed", "Second thoughts.\nAGENT_BLOCKED: the spec contradicts itself"} {
+		h.runner.observeEvent(agent.AssistantTextEvent{Text: text}, obs, wt, QueuedWork{})
+	}
+	if !obs.blocked || obs.blockedReason != "the spec contradicts itself" || obs.workResult != "" {
+		t.Errorf("after passed then blocked: blocked=%v reason=%q workResult=%q; want true, reason, \"\"", obs.blocked, obs.blockedReason, obs.workResult)
 	}
 }
 
