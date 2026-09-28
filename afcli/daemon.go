@@ -415,30 +415,37 @@ func newDaemonLogsCmd() *cobra.Command {
 				return nil
 			}
 
-			// Stream from current position (beginning of file for non-follow,
-			// continuously for follow).
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := scanner.Text()
-				printLogLine(out, line, !raw)
+			// Each scan reaches EOF. Start a fresh scanner at the file's
+			// current offset when following so appended lines remain visible.
+			readAvailable := func() error {
+				scanner := bufio.NewScanner(f)
+				for scanner.Scan() {
+					printLogLine(out, scanner.Text(), !raw)
+				}
+				if err := scanner.Err(); err != nil {
+					return fmt.Errorf("read log: %w", err)
+				}
+				return nil
 			}
-			if err := scanner.Err(); err != nil {
-				return fmt.Errorf("read log: %w", err)
+			if err := readAvailable(); err != nil {
+				return err
 			}
 
 			if !follow {
 				return nil
 			}
 
-			// Tail -f equivalent: poll for new content.
+			// Tail -f equivalent: poll for new content without a busy loop.
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
 			for {
-				time.Sleep(250 * time.Millisecond)
-				for scanner.Scan() {
-					line := scanner.Text()
-					printLogLine(out, line, !raw)
-				}
-				if err := scanner.Err(); err != nil {
-					return fmt.Errorf("read log: %w", err)
+				select {
+				case <-cmd.Context().Done():
+					return nil
+				case <-ticker.C:
+					if err := readAvailable(); err != nil {
+						return err
+					}
 				}
 			}
 		},
@@ -672,7 +679,8 @@ func newDaemonDrainCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "drain",
 		Short: "Gracefully drain in-flight work",
 		Long: "Signal the daemon to stop accepting new sessions and wait for in-flight\n" +
-			"sessions to complete before exiting. Use --timeout to cap the wait.\n" +
+			"sessions to complete while keeping the daemon running and resumable.\n" +
+			"Use --timeout to cap the wait.\n" +
 			"0 means use the daemon's configured drain timeout.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
