@@ -124,10 +124,12 @@ type User struct {
 
 // Comment represents a Linear issue comment.
 type Comment struct {
-	ID        string     `json:"id"`
-	Body      string     `json:"body"`
-	CreatedAt *time.Time `json:"createdAt,omitempty"`
-	User      *User      `json:"user,omitempty"`
+	ID           string     `json:"id"`
+	Body         string     `json:"body"`
+	CreatedAt    *time.Time `json:"createdAt,omitempty"`
+	UpdatedAt    *time.Time `json:"updatedAt,omitempty"`
+	User         *User      `json:"user"`
+	AuthorStatus string     `json:"authorStatus"` // available or unavailable; a null user never implies an identity
 }
 
 // IssueRelation represents a relation between two Linear issues.
@@ -318,6 +320,19 @@ type commentNode struct {
 	} `json:"user,omitempty"`
 }
 
+// listedCommentNode keeps required read fields nullable until they have been
+// checked. Mutation responses use commentNode's older, narrower projection.
+type listedCommentNode struct {
+	ID        *string    `json:"id"`
+	Body      *string    `json:"body"`
+	CreatedAt *time.Time `json:"createdAt"`
+	UpdatedAt *time.Time `json:"updatedAt"`
+	User      *struct {
+		ID   *string `json:"id"`
+		Name *string `json:"name"`
+	} `json:"user"`
+}
+
 // relationNode is the JSON structure for a single relation node.
 type relationNode struct {
 	ID    string  `json:"id"`
@@ -411,9 +426,11 @@ type getIssueData struct {
 }
 
 type listCommentsData struct {
-	Issue struct {
-		Comments struct {
-			Nodes []commentNode `json:"nodes"`
+	Issue *struct {
+		ID       *string `json:"id"`
+		Comments *struct {
+			Nodes    *[]*listedCommentNode `json:"nodes"`
+			PageInfo *connectionPageInfo   `json:"pageInfo"`
 		} `json:"comments"`
 	} `json:"issue"`
 }

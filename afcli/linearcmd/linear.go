@@ -905,12 +905,18 @@ func newLinearUpdateIssueCmd(ds func() afclient.DataSource, bin string) *cobra.C
 // ─── list-comments ────────────────────────────────────────────────────────────
 
 func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	return &cobra.Command{
+	var commentID string
+	cmd := &cobra.Command{
 		Use:          "list-comments <issue-id>",
-		Short:        "List comments on an issue",
+		Short:        "List complete comment history or one comment on an issue",
+		Long:         "Read every comment page for the requested issue. --comment-id returns only a comment found in that issue's complete history. Each row carries the authoritative user ID and updatedAt; a null user is reported as author unavailable, never inferred from display text.",
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
+			requestedID := strings.TrimSpace(commentID)
+			if cmd.Flags().Changed("comment-id") && requestedID == "" {
+				return fmt.Errorf("--comment-id requires a non-empty comment ID")
+			}
 			client, err := newLinearClient(ds, bin)
 			if err != nil {
 				return err
@@ -920,17 +926,28 @@ func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.
 				return fmt.Errorf("list comments: %w", err)
 			}
 
-			out := make([]map[string]any, len(comments))
-			for i, c := range comments {
-				out[i] = map[string]any{
-					"id":        c.ID,
-					"body":      c.Body,
-					"createdAt": c.CreatedAt,
+			out := make([]map[string]any, 0, len(comments))
+			for _, c := range comments {
+				if requestedID != "" && c.ID != requestedID {
+					continue
 				}
+				out = append(out, map[string]any{
+					"id":           c.ID,
+					"body":         c.Body,
+					"createdAt":    c.CreatedAt,
+					"updatedAt":    c.UpdatedAt,
+					"user":         c.User,
+					"authorStatus": c.AuthorStatus,
+				})
+			}
+			if requestedID != "" && len(out) == 0 {
+				return fmt.Errorf("comment %q is not present on issue %q", requestedID, args[0])
 			}
 			return cli.WriteJSON(cmd.OutOrStdout(), out)
 		},
 	}
+	cmd.Flags().StringVar(&commentID, "comment-id", "", "Return only this comment ID if it belongs to the requested issue")
+	return cmd
 }
 
 // ─── create-comment ───────────────────────────────────────────────────────────

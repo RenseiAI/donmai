@@ -109,9 +109,13 @@ const (
 	// when parents-only listing is requested.
 	parentNullFilterClause = `, parent: { null: true }`
 
-	queryListComments = `query ListComments($issueId: String!) {
+	queryListComments = `query ListComments($issueId: String!, $after: String) {
   issue(id: $issueId) {
-    comments { nodes { id body createdAt user { id name } } }
+    id
+    comments(first: 100, after: $after, includeArchived: true) {
+      nodes { id body createdAt updatedAt user { id name } }
+      pageInfo { hasNextPage endCursor }
+    }
   }
 }`
 
@@ -593,14 +597,43 @@ func nodesToIssues(nodes []issueNode) []Issue {
 
 func nodeToComment(n commentNode) Comment {
 	c := Comment{
-		ID:        n.ID,
-		Body:      n.Body,
-		CreatedAt: n.CreatedAt,
+		ID:           n.ID,
+		Body:         n.Body,
+		CreatedAt:    n.CreatedAt,
+		AuthorStatus: "unavailable",
 	}
 	if n.User != nil {
 		c.User = &User{ID: n.User.ID, Name: n.User.Name}
+		c.AuthorStatus = "available"
 	}
 	return c
+}
+
+func decodeListedComment(node *listedCommentNode) (Comment, error) {
+	if node == nil || node.ID == nil || strings.TrimSpace(*node.ID) == "" {
+		return Comment{}, fmt.Errorf("comment id is missing")
+	}
+	if node.Body == nil {
+		return Comment{}, fmt.Errorf("comment %s body is missing", *node.ID)
+	}
+	if node.CreatedAt == nil || node.UpdatedAt == nil {
+		return Comment{}, fmt.Errorf("comment %s createdAt or updatedAt is missing", *node.ID)
+	}
+	comment := Comment{
+		ID: *node.ID, Body: *node.Body, CreatedAt: node.CreatedAt,
+		UpdatedAt: node.UpdatedAt, AuthorStatus: "unavailable",
+	}
+	if node.User != nil {
+		if node.User.ID == nil || strings.TrimSpace(*node.User.ID) == "" {
+			return Comment{}, fmt.Errorf("comment %s user id is missing", comment.ID)
+		}
+		comment.User = &User{ID: *node.User.ID}
+		if node.User.Name != nil {
+			comment.User.Name = *node.User.Name
+		}
+		comment.AuthorStatus = "available"
+	}
+	return comment, nil
 }
 
 // ─── Read operations ──────────────────────────────────────────────────────────
@@ -1024,18 +1057,66 @@ func buildListBacklogQuery(parentsOnly bool) string {
 	return fmt.Sprintf(queryListBacklogIssuesFmt, clause)
 }
 
-// GetIssueComments returns comments for the given issue ID.
+// GetIssueComments returns a complete bounded listing from the selected issue.
+// It refuses malformed or incomplete pages rather than returning a partial
+// history that could silently omit a requested comment.
 func (c *Client) GetIssueComments(ctx context.Context, issueID string) ([]Comment, error) {
-	vars := map[string]any{"issueId": issueID}
-	var data listCommentsData
-	if err := c.do(ctx, queryListComments, vars, &data); err != nil {
-		return nil, err
+	if strings.TrimSpace(issueID) == "" {
+		return nil, fmt.Errorf("issue id is required for comment listing")
 	}
-	out := make([]Comment, len(data.Issue.Comments.Nodes))
-	for i, n := range data.Issue.Comments.Nodes {
-		out[i] = nodeToComment(n)
+	const pageSize, maxCommentPages = 100, 100
+	var after *string
+	var selectedIssueID string
+	out := make([]Comment, 0)
+	seenIDs := make(map[string]bool)
+	seenCursors := make(map[string]bool)
+	for page := 0; page < maxCommentPages; page++ {
+		var data listCommentsData
+		if err := c.do(ctx, queryListComments, map[string]any{"issueId": issueID, "after": after}, &data); err != nil {
+			return nil, err
+		}
+		if data.Issue == nil {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: issue is null", issueID)
+		}
+		if data.Issue.ID == nil || strings.TrimSpace(*data.Issue.ID) == "" {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: issue id is missing", issueID)
+		}
+		if selectedIssueID == "" {
+			selectedIssueID = *data.Issue.ID
+		} else if *data.Issue.ID != selectedIssueID {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: issue identity changed between pages", issueID)
+		}
+		if data.Issue.Comments == nil || data.Issue.Comments.Nodes == nil {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: comments connection or nodes are missing", issueID)
+		}
+		if len(*data.Issue.Comments.Nodes) > pageSize {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: page exceeds %d comments", issueID, pageSize)
+		}
+		for i, node := range *data.Issue.Comments.Nodes {
+			comment, err := decodeListedComment(node)
+			if err != nil {
+				return nil, fmt.Errorf("incomplete comments response for issue %q page %d node %d: %w", issueID, page+1, i, err)
+			}
+			if seenIDs[comment.ID] {
+				return nil, fmt.Errorf("incomplete comments response for issue %q: repeated comment id %s", issueID, comment.ID)
+			}
+			seenIDs[comment.ID] = true
+			out = append(out, comment)
+		}
+		next, complete, err := nextConnectionPage("comments", data.Issue.Comments.PageInfo, after)
+		if err != nil {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: %w", issueID, err)
+		}
+		if complete {
+			return out, nil
+		}
+		if seenCursors[*next] {
+			return nil, fmt.Errorf("incomplete comments response for issue %q: cursor repeated", issueID)
+		}
+		seenCursors[*next] = true
+		after = next
 	}
-	return out, nil
+	return nil, fmt.Errorf("incomplete comments response for issue %q: exceeded %d pages", issueID, maxCommentPages)
 }
 
 // GetIssueRelations returns forward and inverse relations for the given issue ID.

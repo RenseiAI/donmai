@@ -838,10 +838,10 @@ func TestLinearUpdateIssue_ProjectHelpNamesMutation(t *testing.T) {
 
 func TestLinearListComments(t *testing.T) {
 	now := time.Now().UTC().Format(time.RFC3339Nano)
-	commentsData := fmt.Sprintf(`{"issue":{"comments":{"nodes":[
-		{"id":"c-1","body":"Hello","createdAt":%q,"user":{"id":"u-1","name":"Alice"}},
-		{"id":"c-2","body":"World","createdAt":%q,"user":null}
-	]}}}`, now, now)
+	commentsData := fmt.Sprintf(`{"issue":{"id":"issue-1","comments":{"nodes":[
+		{"id":"c-1","body":"Hello","createdAt":%q,"updatedAt":%q,"user":{"id":"u-1","name":"Alice"}},
+		{"id":"c-2","body":"World","createdAt":%q,"updatedAt":%q,"user":null}
+	],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`, now, now, now, now)
 
 	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeLinearGQLData(w, commentsData)
