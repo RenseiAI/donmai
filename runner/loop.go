@@ -363,6 +363,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			"sessionId", qw.SessionID, "repository", repositoryDeclaration.Selected.Name)
 	}
 
+	// Record every mutable checkout with the commit it starts at, so teardown
+	// can tell the session's own unpublished work from the base and preserve
+	// it before deleting the workarea (Run → preserveUnpublishedWork).
+	switch {
+	case repositoryFree:
+	case repositoryDeclaration != nil:
+		targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
+		for _, repository := range repositoryDeclaration.Repositories {
+			if repository.Authority == workarea.RepositoryMutable {
+				targets = append(targets, rescueTarget{name: repository.Name, path: declaredRepositoryPaths[repository.Name]})
+			}
+		}
+		recordRescueTargets(ctx, res, targets)
+	case selectedRepositoryMutable:
+		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+	}
+
 	// 2a-bis. Materialize read-only sibling context repos named by
 	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
 	// their governing corpus at ../<name> as their repo AGENTS.md
@@ -1288,6 +1305,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// a manifest the follow-up wrote from one it merely left in place.
 	manifestBeforeFollowUp := stampManifest(runnerStatePath)
 
+	// 10·PR. A pull request URL in the conversation is only a candidate. For
+	// work that owes a pull request, accept one only when it exists on the
+	// session's own repository with the session's branch or commit as its
+	// head (see pull_request_verify.go); otherwise the envelope carries no
+	// pull request, so steering and the backstop still run and a quoted
+	// example URL can never mark the run complete. Re-run after every
+	// follow-up turn. Lookups outlive a cancelled run context (each is
+	// individually bounded) so a late verification is not lost to it.
+	verifyCtx := context.WithoutCancel(ctx)
+	var prVerifier *sessionPullRequestVerifier
+	if RequiresPRURL(qw.WorkType) {
+		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, repositoryFree)
+	}
+	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
+
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
 	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also
@@ -1322,6 +1354,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	applyFollowUp := func(tail streamObservation) {
 		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, tail, manifestBeforeFollowUp)
 		manifestBeforeFollowUp = stampManifest(runnerStatePath)
+		r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, tail)
 		followUpRan = true
 	}
 	if runtimeInjectEnabled && !streamRes.blocked {
@@ -1661,9 +1694,14 @@ type streamObservation struct {
 	terminalEvent   *agent.ResultEvent
 	errorEvent      *agent.ErrorEvent
 	pullRequestURL  string
-	commentPosted   bool
-	issueUpdated    bool
-	subIssuesMade   bool
+	// pullRequestCandidates is every GitHub pull request URL the stream
+	// carried (assistant text and tool output), oldest first, each once at
+	// its latest position. They are candidates only: the session pull
+	// request verifier decides which, if any, is the session's own.
+	pullRequestCandidates []string
+	commentPosted         bool
+	issueUpdated          bool
+	subIssuesMade         bool
 	// workResult is this stream's passed|failed|unknown verdict: the one
 	// carried by the LATEST assistant message with a line-anchored marker
 	// (the FIRST anchored marker within that message wins — see
@@ -1935,6 +1973,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if u := scanPRURL(e.Text); u != "" {
 			obs.pullRequestURL = u
 		}
+		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Text)
 	case agent.ToolUseEvent:
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
@@ -1956,6 +1995,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if u := scanPRURL(e.Content); u != "" && obs.pullRequestURL == "" {
 			obs.pullRequestURL = u
 		}
+		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Content)
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success

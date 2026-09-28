@@ -383,6 +383,11 @@ type Result struct {
 	// TerminalWorkareaLease is the exact four-field external projection attached
 	// after the full descriptor and host-local path are durable.
 	TerminalWorkareaLease *workarea.TerminalLeaseProjection `json:"terminalWorkareaLease,omitempty"`
+
+	// rescueTargets are the session's git checkouts, each with the commit it
+	// was provisioned at. Run reads them before teardown to preserve any work
+	// that exists nowhere else (see preserveUnpublishedWork).
+	rescueTargets []rescueTarget
 }
 
 // LinearStatusTransition records the runner's post-session attempt to

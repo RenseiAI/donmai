@@ -77,6 +77,13 @@ Verbatim from F.1.1 §5; classification owned by `runner/failure.go`.
 
 ## Tail recovery
 
+A pull request URL in the conversation is only a candidate. For work that owes
+a pull request, the runner accepts one only when it exists on the session's own
+repository with the session's branch or commit as its head (read through
+`gh pr view`); a quoted example URL, or a pull request on another repository or
+branch, leaves the session without one, so the stages below still run. See
+`pull_request_verify.go`.
+
 Two-stage post-completion recovery (F.0.1 §1):
 
 1. **Stage 1 — steering.** Fires when the provider supports `SupportsMessageInjection` *or* `SupportsSessionResume` AND the session ended successfully but without a PR URL. The runner delivers a templated follow-up prompt asking the agent to commit/push/PR — via `Handle.Inject` when the live handle accepts it, falling back to a stop-and-resume (`Handle.Stop` then `Provider.Resume` with the prompt riding the resumed `Spec.Prompt`) when the handle rejects the inject as unsupported and the harness declares `SupportsSessionResume` (Codex; OpenCode's one-shot lane). `Result.SteeringResumeFallback` records when the fallback path fired. Skipped via `Options.SkipSteering`.
@@ -92,6 +99,19 @@ Backstop steps:
 5. `git commit -m "Backstop: <session-id> (<identifier>)"` (skipped when nothing remains staged).
 6. `git push -u origin <branch>` (with `--force-with-lease` retry on non-fast-forward).
 7. `gh pr create --title --body` — return the URL on `BackstopReport.PRURL`.
+
+## Teardown never deletes unpublished work
+
+Before teardown deletes the workarea, every git checkout in it is checked for
+work that exists nowhere else: uncommitted changes (including untracked files)
+and commits no remote holds. That work is archived as a patch against the
+commit the checkout started at, at
+`<RescueDir>/<session>/<time>/<repository>.patch` with a JSON sidecar, and the
+log names the file. Paths the backstop never commits (dependency and build
+output, runner and harness state) are left out. The checkout itself is not
+touched. When the archive cannot be written, the workarea is kept instead of
+deleted. `Options.RescueDir` defaults to a `rescue` directory beside the
+worktree parent. See `workarea_rescue.go`.
 
 ## Telemetry
 

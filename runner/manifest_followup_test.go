@@ -35,6 +35,9 @@ type verdictScriptTurn struct {
 	// removeManifest deletes the manifest file before the turn's events, as a
 	// worktree clean during a follow-up turn would.
 	removeManifest bool
+	// files are written into the session worktree (path relative to it)
+	// before the turn's events, as work the agent left uncommitted.
+	files map[string]string
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -46,10 +49,12 @@ type verdictScriptProvider struct {
 	agent.HarnessProvider
 	t     *testing.T
 	turns []verdictScriptTurn
+	// prompts records every follow-up prompt injected into the session.
+	prompts []string
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64)}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts}
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
 	return h, nil
@@ -67,17 +72,20 @@ type verdictScriptHandle struct {
 	mu     sync.Mutex
 	closed bool
 	events chan agent.Event
+	// prompts records every follow-up prompt the runner injected.
+	prompts *[]string
 }
 
 func (h *verdictScriptHandle) SessionID() string          { return "scripted-session" }
 func (h *verdictScriptHandle) Events() <-chan agent.Event { return h.events }
 func (h *verdictScriptHandle) Stop(context.Context) error { h.closeEvents(); return nil }
-func (h *verdictScriptHandle) Inject(context.Context, string) error {
+func (h *verdictScriptHandle) Inject(_ context.Context, text string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed || h.next >= len(h.turns) {
 		return errors.New("scripted: no turn left to play")
 	}
+	*h.prompts = append(*h.prompts, text)
 	h.playLocked()
 	return nil
 }
@@ -112,6 +120,15 @@ func (h *verdictScriptHandle) playLocked() {
 			h.t.Errorf("remove turn-result manifest: %v", err)
 		}
 	}
+	for path, content := range turn.files {
+		full := filepath.Join(h.cwd, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			h.t.Errorf("mkdir for %s: %v", path, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+			h.t.Errorf("write %s: %v", path, err)
+		}
+	}
 	if turn.text != "" {
 		h.events <- agent.AssistantTextEvent{Text: turn.text}
 	}
@@ -140,10 +157,53 @@ const (
 	failedManifest  = `{"schemaVersion":1,"verdict":"failed","summary":"` + manifestSummary + `"}`
 )
 
-// runScripted runs one development session against the scripted turns and
-// returns the terminal envelope. inject, when non-empty, arms a runtime memory
-// inject the heartbeat delivers so the runner drains it as a follow-up turn.
+// runScripted runs one session against the scripted turns and returns the
+// terminal envelope. inject, when non-empty, arms a runtime memory inject the
+// heartbeat delivers so the runner drains it as a follow-up turn.
+//
+// The session's repository is a GitHub one (github.com/example/repo, served
+// from disk) on which followUpPR exists with the session branch as its head,
+// so a turn that reports followUpPR has really opened the session's pull
+// request — the runner accepts no other kind (see pull_request_verify.go).
 func runScripted(t *testing.T, workType string, skipSteering bool, inject string, turns ...verdictScriptTurn) *Result {
+	t.Helper()
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     workType,
+		skipSteering: skipSteering,
+		inject:       inject,
+		github:       "example/repo",
+		lookup: &fakePullRequestLookup{heads: map[string]pullRequestHead{
+			followUpPR: {Number: 7, URL: followUpPR, HeadRefName: scriptedSessionBranch},
+		}},
+		turns: turns,
+	})
+	return res
+}
+
+// scriptedSessionBranch is the branch the runner owns for a scripted session.
+const scriptedSessionBranch = "agent/test-session-MANIFEST-FOLLOWUP"
+
+// scriptedSession configures runScriptedSession.
+type scriptedSession struct {
+	workType     string
+	skipSteering bool
+	inject       string
+	// github, when set, is the "owner/repo" of a GitHub repository the
+	// session provisions (served from a local bare repository); otherwise
+	// the session repository is a plain local path.
+	github string
+	// lookup answers the session pull request verifier's lookups.
+	lookup *fakePullRequestLookup
+	// teardown lets Run tear the worktree down on success (the default keeps
+	// it for inspection); rescueDir is where unpublished work is archived.
+	teardown  bool
+	rescueDir string
+	turns     []verdictScriptTurn
+}
+
+// runScriptedSession runs one scripted session and returns the terminal
+// envelope and the runner.
+func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *Runner) {
 	t.Helper()
 	base, err := stub.New()
 	if err != nil {
@@ -154,11 +214,21 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 		t.Fatal("stub provider is not a HarnessProvider")
 	}
 	platform := newRecordingPlatformServer(t)
-	if inject != "" {
-		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: inject})
+	if cfg.inject != "" {
+		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: cfg.inject})
 	}
-	r := newFollowUpRunner(t, platform.URL, platform.Client(), &verdictScriptProvider{HarnessProvider: harness, t: t, turns: turns})
-	r.skipSteering = skipSteering
+	provider := &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
+	r := newFollowUpRunner(t, platform.URL, platform.Client(), provider)
+	r.skipSteering = cfg.skipSteering
+	if cfg.teardown {
+		r.preserveAlways = false
+	}
+	if cfg.rescueDir != "" {
+		r.rescueDir = cfg.rescueDir
+	}
+	if cfg.lookup != nil {
+		r.pullRequestLookup = cfg.lookup.lookup
+	}
 	qw := QueuedWork{
 		QueuedWork:      queuedWorkBase("MANIFEST-FOLLOWUP"),
 		WorkerID:        "worker-1",
@@ -166,8 +236,12 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 		PlatformURL:     platform.URL,
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 	}
-	qw.WorkType = workType
-	qw.Repository = makeBareRepo(t)
+	qw.WorkType = cfg.workType
+	if cfg.github != "" {
+		qw.Repository = githubRepositoryFixture(t, cfg.github)
+	} else {
+		qw.Repository = makeBareRepo(t)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -175,7 +249,7 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 	if err != nil && res == nil {
 		t.Fatalf("Run: %v", err)
 	}
-	return res
+	return res, r
 }
 
 type verdictWant struct {
