@@ -87,6 +87,9 @@ const (
 	// puts its epoch here. It deliberately names no relay, service, or endpoint
 	// — an OSS-only daemon omits it entirely and nothing degrades (§D3).
 	ExtCarrierEpoch = "carrier_epoch"
+	// ExtContinuationCheckpoint advertises optional v5 checkpoint support in
+	// Hello. Older controllers ignore its value before selecting their version.
+	ExtContinuationCheckpoint = "continuation_checkpoint"
 )
 
 // Extensions is the optional, namespaced negotiation map carried on

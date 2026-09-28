@@ -227,3 +227,32 @@ func TestV5ContinuationDeadlineWhileWriterBackpressured(t *testing.T) {
 		t.Fatal("cancelled in-flight request was falsely committed")
 	}
 }
+
+func TestContinuationSupportRequiresDecodedOptionalAdvertisement(t *testing.T) {
+	for _, tc := range []struct {
+		name       string
+		selected   uint32
+		capability *shimwire.CheckpointCapability
+		want       bool
+	}{
+		{"max5_without_capability", shimwire.V5, nil, false},
+		{"unknown_schema", shimwire.V5, &shimwire.CheckpointCapability{Schema: "unknown", HostEpoch: 19}, false},
+		{"selected4", shimwire.V4, &shimwire.CheckpointCapability{Schema: attachwire.ContinuationSchema, HostEpoch: 19}, false},
+		{"selected5_explicit_zero_epoch", shimwire.V5, &shimwire.CheckpointCapability{Schema: attachwire.ContinuationSchema, HostEpoch: 0}, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			raw, err := shimwire.EncodeHello(shimwire.Hello{Min: shimwire.V1, Max: shimwire.V5, Continuation: tc.capability})
+			if err != nil {
+				t.Fatal(err)
+			}
+			hello, err := shimwire.DecodeHello(raw)
+			if err != nil {
+				t.Fatal(err)
+			}
+			c := &Controller{selected: tc.selected, hello: hello}
+			if got := c.SupportsContinuation(); got != tc.want {
+				t.Fatalf("support=%t want=%t", got, tc.want)
+			}
+		})
+	}
+}

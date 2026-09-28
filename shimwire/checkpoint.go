@@ -2,7 +2,6 @@ package shimwire
 
 import (
 	"encoding/binary"
-	"encoding/json"
 	"fmt"
 
 	"github.com/RenseiAI/donmai/attachwire"
@@ -117,7 +116,7 @@ func (c *CheckpointCapability) UnmarshalJSON(b []byte) error {
 		Schema    *string `json:"schema"`
 		HostEpoch *uint64 `json:"hostEpoch"`
 	}
-	if err := json.Unmarshal(b, &fields); err != nil {
+	if err := decodeJSON(b, &fields); err != nil {
 		return fmt.Errorf("shimwire: checkpoint capability: %w", err)
 	}
 	if fields.Schema == nil || fields.HostEpoch == nil {
@@ -125,4 +124,27 @@ func (c *CheckpointCapability) UnmarshalJSON(b []byte) error {
 	}
 	c.Schema, c.HostEpoch = *fields.Schema, *fields.HostEpoch
 	return nil
+}
+
+// MaxCheckpointCapabilityBytes bounds the optional preselection advertisement.
+const MaxCheckpointCapabilityBytes = 256
+
+// CheckpointCapability returns the typed optional Hello advertisement. Absence
+// is unsupported; ProtocolMax alone never implies this capability.
+func (e Extensions) CheckpointCapability() (*CheckpointCapability, error) {
+	value, ok := e.Values[ExtContinuationCheckpoint]
+	if !ok {
+		return nil, nil
+	}
+	if len(value) == 0 || len(value) > MaxCheckpointCapabilityBytes {
+		return nil, fmt.Errorf("shimwire: %w: invalid checkpoint capability size", ErrMalformed)
+	}
+	var capability CheckpointCapability
+	if err := decodeJSON([]byte(value), &capability); err != nil {
+		return nil, err
+	}
+	if capability.Schema == "" {
+		return nil, fmt.Errorf("shimwire: %w: empty checkpoint schema", ErrMalformed)
+	}
+	return &capability, nil
 }
