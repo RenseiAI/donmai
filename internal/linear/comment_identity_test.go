@@ -4,9 +4,30 @@ import (
 	"context"
 	"encoding/json"
 	"net/http"
+	"net/http/httptest"
 	"strings"
 	"testing"
 )
+
+func TestGetIssueCommentsProxyRequiresNegotiatedStrictCapability(t *testing.T) {
+	posts := 0
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method == http.MethodPost {
+			posts++
+		}
+		writeGQLData(w, `{"issue":{"id":"issue-uuid","comments":{"nodes":[],"pageInfo":{"hasNextPage":false,"endCursor":null}}}}`)
+	}))
+	t.Cleanup(server.Close)
+	client, err := NewProxiedClient(server.URL, "rsk_comment_fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	client.HTTPClient = server.Client()
+	comments, err := client.GetIssueComments(context.Background(), "ENG-1")
+	if err == nil || comments != nil || posts != 0 {
+		t.Fatalf("proxied comment read bypassed strict capability: comments=%v err=%v posts=%d", comments, err, posts)
+	}
+}
 
 func TestGetIssueCommentsCompleteIdentityAndRevision(t *testing.T) {
 	const issueRef = "ENG-1"

@@ -70,6 +70,11 @@ CLOSED_CLI_ENDPOINT :: ^afclient/types\.go :: /api/cl[i]/ :: WhoAmIResponse matc
 CLOSED_CLI_ENDPOINT :: ^internal/linear/client\.go :: /api/cl[i]/ :: (strictLabelProxyPath|legacyLabelProxyPath)
 CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/label_groups_test\.go :: /api/cl[i]/ :: r\.URL\.Path != "/api/cl[i]/linear/graphql/no-fallback-v1"
 
+# Comment-read tests assert the same frozen acknowledged proxy route and that
+# a refusal never falls through to the legacy route. Only these two expected
+# path constant declarations are exempt; other references remain guarded.
+CLOSED_CLI_ENDPOINT :: ^afcli/linearcmd/comment_identity_test\.go :: /api/cl[i]/ :: ^[[:space:]]*comment(LegacyProxyPath = "/api/cl[i]/linear/graphql"|StrictProxyPath = "/api/cl[i]/linear/graphql/no-fallback-v1")$
+
 # runner/README.md: the package Status header and lifecycle-diagram ASCII art
 # name the closed downstream TUI repo (`rens[e]i-tui`) that embeds this
 # package as a library — both pre-existing, unrelated to the change that

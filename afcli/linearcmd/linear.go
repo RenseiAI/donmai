@@ -921,6 +921,14 @@ func newLinearListCommentsCmd(ds func() afclient.DataSource, bin string) *cobra.
 			if err != nil {
 				return err
 			}
+			// A mediated comment read must bind to the acknowledged strict
+			// route before fetching even its first page. Direct Linear mode
+			// needs no proxy capability probe.
+			if concrete, ok := client.(*linear.Client); ok && concrete.ProxyMode {
+				if err := concrete.EnableNoFallbackLabelProxy(cmd.Context()); err != nil {
+					return fmt.Errorf("list comments proxy preflight: %w", err)
+				}
+			}
 			comments, err := client.GetIssueComments(cmd.Context(), args[0])
 			if err != nil {
 				return fmt.Errorf("list comments: %w", err)

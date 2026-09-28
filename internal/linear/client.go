@@ -393,7 +393,7 @@ func (c *Client) EnableNoFallbackLabelProxy(ctx context.Context) error {
 
 func (c *Client) requireStrictLabelProxy() error {
 	if c.ProxyMode && !c.strictLabelProxy {
-		return fmt.Errorf("linear: native label-group proxy capability is required before provider operations")
+		return fmt.Errorf("linear: strict no-fallback proxy capability is required before provider operations")
 	}
 	return nil
 }
@@ -1063,6 +1063,9 @@ func buildListBacklogQuery(parentsOnly bool) string {
 func (c *Client) GetIssueComments(ctx context.Context, issueID string) ([]Comment, error) {
 	if strings.TrimSpace(issueID) == "" {
 		return nil, fmt.Errorf("issue id is required for comment listing")
+	}
+	if err := c.requireStrictLabelProxy(); err != nil {
+		return nil, err
 	}
 	const pageSize, maxCommentPages = 100, 100
 	var after *string
