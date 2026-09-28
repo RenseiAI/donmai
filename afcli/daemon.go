@@ -2,6 +2,7 @@ package afcli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -415,39 +416,13 @@ func newDaemonLogsCmd() *cobra.Command {
 				return nil
 			}
 
-			// Each scan reaches EOF. Start a fresh scanner at the file's
-			// current offset when following so appended lines remain visible.
-			readAvailable := func() error {
-				scanner := bufio.NewScanner(f)
-				for scanner.Scan() {
-					printLogLine(out, scanner.Text(), !raw)
-				}
-				if err := scanner.Err(); err != nil {
-					return fmt.Errorf("read log: %w", err)
-				}
-				return nil
-			}
-			if err := readAvailable(); err != nil {
-				return err
-			}
-
 			if !follow {
-				return nil
+				return scanDaemonLog(f, out, !raw)
 			}
 
-			// Tail -f equivalent: poll for new content without a busy loop.
 			ticker := time.NewTicker(250 * time.Millisecond)
 			defer ticker.Stop()
-			for {
-				select {
-				case <-cmd.Context().Done():
-					return nil
-				case <-ticker.C:
-					if err := readAvailable(); err != nil {
-						return err
-					}
-				}
-			}
+			return followDaemonLog(cmd.Context(), f, out, !raw, ticker.C)
 		},
 	}
 
@@ -457,6 +432,40 @@ func newDaemonLogsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&raw, "raw", false, "Print raw NDJSON without pretty-printing")
 
 	return cmd
+}
+
+// scanDaemonLog reads available complete and EOF-terminated lines from the
+// current file offset, preserving the command's existing Scanner limits.
+func scanDaemonLog(r io.Reader, out io.Writer, parseJSON bool) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		printLogLine(out, scanner.Text(), parseJSON)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read log: %w", err)
+	}
+	return nil
+}
+
+// followDaemonLog starts a new scan after each observed EOF. The reader's file
+// offset advances, so later scans see only bytes appended since the last one.
+func followDaemonLog(ctx context.Context, r io.Reader, out io.Writer, parseJSON bool, ticks <-chan time.Time) error {
+	if err := scanDaemonLog(r, out, parseJSON); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case _, ok := <-ticks:
+			if !ok {
+				return nil
+			}
+			if err := scanDaemonLog(r, out, parseJSON); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // tailLines reads the last n lines from r and writes them to w. If parseJSON
