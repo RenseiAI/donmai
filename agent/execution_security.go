@@ -201,7 +201,8 @@ const ExecutionSecurityWireVersion = 1
 // Sources, parentSessionId, rulesetRevision and resolvedAt are opaque,
 // display-only provenance. The decoder is closed: an unknown version, an
 // unknown or missing dimension, an unknown level, a digest that does not
-// match the levels, an explicit null, or any other member is refused as
+// match the levels, an explicit null (for the section or any member of it),
+// an empty member, or any other member is refused as
 // execution_security_unresolvable.
 type ExecutionSecurity struct {
 	Version         int                                   `json:"version"`
@@ -252,9 +253,11 @@ func (e *ExecutionSecurity) Clone() *ExecutionSecurity {
 
 // UnmarshalJSON is the closed decoder for the queued-work section. Every
 // failure is an *ExecutionSecurityError with code
-// execution_security_unresolvable. encoding/json maps a null member onto a
+// execution_security_unresolvable. encoding/json maps a null section onto a
 // nil pointer without calling this method, so a caller that must refuse an
-// explicit null reads the raw member with ExecutionSecurityFromOperationalPayload.
+// explicit null section reads the raw member with
+// ExecutionSecurityFromOperationalPayload. A null member inside a present
+// section is refused here.
 func (e *ExecutionSecurity) UnmarshalJSON(raw []byte) error {
 	decoded, err := ParseExecutionSecurity(raw)
 	if err != nil {
@@ -277,7 +280,7 @@ func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
 	var wire struct {
 		Version         *int               `json:"version"`
 		Levels          map[string]*string `json:"levels"`
-		Sources         map[string]string  `json:"sources"`
+		Sources         map[string]*string `json:"sources"`
 		Digest          *string            `json:"digest"`
 		ParentSessionID *string            `json:"parentSessionId"`
 		RulesetRevision *string            `json:"rulesetRevision"`
@@ -290,6 +293,18 @@ func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
 	}
 	if decoder.More() {
 		return nil, malformed("", "", "executionSecurity has trailing data")
+	}
+	// A member that is present must carry a value: encoding/json reads an
+	// explicit null as absent, which would silently turn a stamped
+	// "digest": null (or sources, parentSessionId, …) into an omission.
+	var members map[string]json.RawMessage
+	if err := json.Unmarshal(trimmed, &members); err != nil {
+		return nil, malformed("", "", fmt.Sprintf("executionSecurity is not an object: %v", err))
+	}
+	for name, value := range members {
+		if bytes.Equal(bytes.TrimSpace(value), []byte("null")) {
+			return nil, malformed("", "", "executionSecurity "+name+" is null")
+		}
 	}
 	if wire.Version == nil || *wire.Version != ExecutionSecurityWireVersion {
 		return nil, malformed("", "", fmt.Sprintf("executionSecurity version must be %d", ExecutionSecurityWireVersion))
@@ -324,7 +339,10 @@ func ParseExecutionSecurity(raw []byte) (*ExecutionSecurity, error) {
 			if _, known := executionSecurityLadders[dimension]; !known {
 				return nil, malformed(dimension, "", "unknown source dimension")
 			}
-			out.Sources[dimension] = source
+			if source == nil || strings.TrimSpace(*source) == "" {
+				return nil, malformed(dimension, "", "source is null or empty")
+			}
+			out.Sources[dimension] = *source
 		}
 	}
 	for _, member := range []struct {

@@ -103,6 +103,15 @@ func TestParseExecutionSecurity(t *testing.T) {
 		{name: "empty digest", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"digest":""}`, wantErr: true},
 		{name: "empty parent session", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"parentSessionId":""}`, wantErr: true},
 		{name: "non-string parent session", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"parentSessionId":7}`, wantErr: true},
+		{name: "null digest", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"digest":null}`, wantErr: true},
+		{name: "null sources", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"sources":null}`, wantErr: true},
+		{name: "null parent session", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"parentSessionId":null}`, wantErr: true},
+		{name: "null ruleset revision", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"rulesetRevision":null}`, wantErr: true},
+		{name: "null resolution time", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"resolvedAt":null}`, wantErr: true},
+		{name: "null levels", raw: `{"version":1,"levels":null}`, wantErr: true},
+		{name: "null version", raw: `{"version":null,"levels":` + indexZeroLevelsJSON + `}`, wantErr: true},
+		{name: "null source", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"sources":{"network":null}}`, wantErr: true, wantDimension: agent.ExecutionSecurityNetwork},
+		{name: "empty source", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `,"sources":{"network":""}}`, wantErr: true, wantDimension: agent.ExecutionSecurityNetwork},
 		{
 			name: "every dimension at index 0", raw: `{"version":1,"levels":` + indexZeroLevelsJSON + `}`,
 			wantLevels: func() *agent.ExecutionSecurityLevels { l := agent.IndexZeroExecutionSecurityLevels(); return &l }(),
@@ -620,5 +629,68 @@ func TestUncontainedHostEnforcement(t *testing.T) {
 	}
 	if err := (agent.ExecutionSecurityEnforcement{Isolation: "chroot"}).Validate(); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityUnresolvable {
 		t.Fatalf("unknown attested level err = %v", err)
+	}
+}
+
+// TestPreparedHarnessAndSessionAgreeOnStampedness: the child refuses a plan
+// whose stamped-ness disagrees with the session's even when the authority
+// digest agrees — a stamped session whose host plan lost its report, or an
+// unstamped session whose plan gained one.
+func TestPreparedHarnessAndSessionAgreeOnStampedness(t *testing.T) {
+	t.Parallel()
+	manifest := (&codex.Provider{}).Manifest()
+	const digest = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+	compile := func(t *testing.T, source agent.Spec) *agent.PreparedHarness {
+		t.Helper()
+		plan, err := agent.CompilePreparedHarness(source, manifest, digest, nil, preparedMaterializations(digest))
+		if err != nil {
+			t.Fatalf("compile: %v", err)
+		}
+		return plan
+	}
+
+	stamped := compile(t, codexAutonomousSource(stampedLevels(nil)))
+	reportless := *stamped
+	reportless.ExecutionSecurity = nil
+	stampedChild := codexAutonomousSource(stampedLevels(nil))
+	stampedChild.PreparedHarness = &reportless
+	if _, err := agent.PrepareHarness(stampedChild, manifest); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+		t.Fatalf("stamped session with a report-less plan err = %v, want execution_security_receipt_unmet", err)
+	}
+
+	unstamped := compile(t, codexAutonomousSource(nil))
+	gained, err := agent.RenderExecutionSecurity(codexAutonomousSource(nil), manifest)
+	if err != nil {
+		t.Fatal(err)
+	}
+	withReport := *unstamped
+	withReport.ExecutionSecurity = &gained
+	unstampedChild := codexAutonomousSource(nil)
+	unstampedChild.PreparedHarness = &withReport
+	if _, err := agent.PrepareHarness(unstampedChild, manifest); agent.ExecutionSecurityErrorCode(err) != agent.ExecutionSecurityReceiptUnmet {
+		t.Fatalf("unstamped session with a reporting plan err = %v, want execution_security_receipt_unmet", err)
+	}
+}
+
+// TestExecutionSecurityRefusalFromErrorKeepsOnlyKnownDimensions: the typed
+// refusal sent to the control plane names only closed-vocabulary
+// dimensions; an unknown name read off a malformed stamp is input and is
+// dropped, never echoed as a typed value.
+func TestExecutionSecurityRefusalFromErrorKeepsOnlyKnownDimensions(t *testing.T) {
+	t.Parallel()
+	_, unknownErr := agent.ParseExecutionSecurity([]byte(`{"version":1,"levels":` + levelsJSON(map[string]string{"gpu": "none"}) + `}`))
+	if refusal := agent.ExecutionSecurityRefusalFromError(unknownErr); refusal == nil || refusal.Code != agent.ExecutionSecurityUnresolvable || len(refusal.Dimensions) != 0 {
+		t.Fatalf("refusal for an unknown dimension = %+v, want the code with no dimensions", refusal)
+	}
+	mixed := &agent.ExecutionSecurityError{
+		Code:       agent.ExecutionSecurityUnrenderable,
+		Dimensions: []agent.ExecutionSecurityDimension{"gpu", agent.ExecutionSecurityNetwork, "clearance", agent.ExecutionSecurityIsolation},
+	}
+	refusal := agent.ExecutionSecurityRefusalFromError(mixed)
+	if refusal == nil || !reflect.DeepEqual(refusal.Dimensions, []agent.ExecutionSecurityDimension{agent.ExecutionSecurityNetwork, agent.ExecutionSecurityIsolation}) {
+		t.Fatalf("refusal for mixed dimensions = %+v, want only network and isolation", refusal)
+	}
+	if agent.ExecutionSecurityRefusalFromError(errors.New("unrelated")) != nil {
+		t.Fatal("an untyped error produced a refusal")
 	}
 }

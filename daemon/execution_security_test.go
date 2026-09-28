@@ -111,13 +111,18 @@ func (o *recordingOrchestrator) handler(t *testing.T) http.HandlerFunc {
 // is not NACKed back onto the queue. Only when that report cannot be
 // delivered does the legacy NACK run, so the claim is never stranded.
 func TestHandlePollWorkItemRefusesMalformedStampPermanently(t *testing.T) {
+	unknownDimension := strings.Replace(platformStampIndexZero, `"isolation":"host-user"}`, `"isolation":"host-user","clearance":"secret"}`, 1)
 	cases := []struct {
 		name       string
+		stamp      string
 		statusCode int
 		wantNacks  int
 	}{
-		{name: "terminal report delivered", wantNacks: 0},
-		{name: "terminal report undeliverable falls back to nack", statusCode: http.StatusBadRequest, wantNacks: 1},
+		{name: "terminal report delivered", stamp: platformStampWrongDigest, wantNacks: 0},
+		{name: "terminal report undeliverable falls back to nack", stamp: platformStampWrongDigest, statusCode: http.StatusBadRequest, wantNacks: 1},
+		// The unknown dimension name is input from the malformed stamp: the
+		// typed refusal sent to the platform carries the code alone.
+		{name: "unknown dimension name is not echoed", stamp: unknownDimension, wantNacks: 0},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -131,7 +136,7 @@ func TestHandlePollWorkItemRefusesMalformedStampPermanently(t *testing.T) {
 
 			var item PollWorkItem
 			raw := `{"sessionId":"es-poll-refusal","issueId":"issue-1","issueIdentifier":"ES-1","priority":1,"queuedAt":1,` +
-				`"executionSecurity":` + platformStampWrongDigest + `}`
+				`"executionSecurity":` + tc.stamp + `}`
 			if err := json.Unmarshal([]byte(raw), &item); err != nil {
 				t.Fatal(err)
 			}
