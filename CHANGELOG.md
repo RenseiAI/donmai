@@ -31,6 +31,11 @@ No unreleased changes.
   linked or special files before verification and persistence. Missing bundles
   remain unsigned and valid released signatures retain their trust behavior.
 
+### Chores
+
+- Join native Codex MCP fixture writers before removing their temporary homes,
+  so background plugin clones cannot race test cleanup.
+
 ## v0.72.49 — 2026-09-27
 
 ### Fixes
