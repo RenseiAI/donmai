@@ -14,10 +14,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessGeminiDirect,
-		HumanLabel:  "Gemini (direct)",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessGeminiDirect,
+		HumanLabel:        "Gemini (direct)",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: geminiExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,
 			SupportsSessionResume:    false,

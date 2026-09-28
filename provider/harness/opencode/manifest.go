@@ -14,10 +14,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventSystem, agent.EventAssistantText, agent.EventLlmCall, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessOpenCode,
-		HumanLabel:  "OpenCode",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessOpenCode,
+		HumanLabel:        "OpenCode",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: opencodeExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true,  // Lane B: Prompt on a live session (07 §7)
 			SupportsSessionResume:    true,  // Lane B: Resume / create-with-session (07 §7, §9)

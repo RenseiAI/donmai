@@ -174,10 +174,10 @@ func TestTranslateSpec_ToolUse_Honored(t *testing.T) {
 			Name: "af_linear", Command: "pnpm", Args: []string{"af-linear"},
 		}},
 	}
-	qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Read", "Bash(git:*)"}}}
 	spec := translateSpec(qw, caps, in)
-	if len(spec.AllowedTools) == 0 {
-		t.Fatal("AllowedTools: expected default list to flow through, got nil")
+	if !slices.Equal(spec.AllowedTools, qw.AllowedTools) {
+		t.Fatalf("AllowedTools: expected the configured list to flow through, got %v", spec.AllowedTools)
 	}
 	if len(spec.MCPServers) != 1 || spec.MCPServers[0].Name != "af_linear" {
 		t.Fatalf("MCPServers: want [af_linear], got %+v", spec.MCPServers)
@@ -236,7 +236,7 @@ func TestTranslateSpec_ToolUse_RetainedForExactAdapter(t *testing.T) {
 					Name: "af_linear", Command: "pnpm", Args: []string{"af-linear"},
 				}},
 			}
-			qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
+			qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Read"}}}
 			spec := translateSpec(qw, tt.caps, in)
 			if got := len(spec.AllowedTools) > 0; got != tt.wantAllowed {
 				t.Errorf("AllowedTools non-empty: want %v, got %v (%v)", tt.wantAllowed, got, spec.AllowedTools)
@@ -248,11 +248,11 @@ func TestTranslateSpec_ToolUse_RetainedForExactAdapter(t *testing.T) {
 	}
 }
 
-// TestTranslateSpec_CardAllowedTools_ReplacesDefault verifies the WS5 rule:
-// when the agent card supplies an explicit AllowedTools list it is
-// AUTHORITATIVE and used verbatim in place of the runner's curated default.
-// An empty/absent card list falls back to defaultAllowedTools().
-func TestTranslateSpec_CardAllowedTools_ReplacesDefault(t *testing.T) {
+// TestTranslateSpec_CardAllowedTools_Verbatim verifies the WS5 rule: when the
+// agent card supplies an explicit AllowedTools list it is AUTHORITATIVE and
+// used verbatim. An empty/absent card list yields no allow list at all — the
+// runner has no default of its own.
+func TestTranslateSpec_CardAllowedTools_Verbatim(t *testing.T) {
 	t.Parallel()
 	caps := agent.Capabilities{AcceptsAllowedToolsList: true}
 	in := SpecInputs{Cwd: "/tmp/wt", Prompt: "do"}
@@ -271,40 +271,54 @@ func TestTranslateSpec_CardAllowedTools_ReplacesDefault(t *testing.T) {
 		}
 	})
 
-	t.Run("absent card falls back to default", func(t *testing.T) {
+	t.Run("absent card imposes no hidden allow list", func(t *testing.T) {
 		t.Parallel()
 		qw := QueuedWork{QueuedWork: prompt.QueuedWork{}}
 		spec := translateSpec(qw, caps, in)
-		if !slices.Equal(spec.AllowedTools, defaultAllowedTools()) {
-			t.Errorf("AllowedTools = %v, want default %v", spec.AllowedTools, defaultAllowedTools())
+		if spec.AllowedTools != nil {
+			t.Errorf("AllowedTools = %v, want none: the runner imposes no allow list of its own", spec.AllowedTools)
+		}
+		if !slices.Contains(spec.DisallowedTools, "AskUserQuestion") {
+			t.Errorf("DisallowedTools = %v, want the always-on deny baseline kept", spec.DisallowedTools)
 		}
 	})
 }
 
-func TestTranslateSpec_AutonomousDefaultsRemainUsableByPi(t *testing.T) {
+// TestTranslateSpec_BypassWithoutCardLeavesPiUngated pins the removal of the
+// runner's hidden headless allow list: at toolApproval bypass with no
+// configured list, the translated Spec reaches pi's policy engine with no
+// allow gate, so ordinary and network-reaching shell commands run while the
+// built-in destructive-command denies still hold. An explicit card list
+// still gates exactly as configured.
+func TestTranslateSpec_BypassWithoutCardLeavesPiUngated(t *testing.T) {
 	t.Parallel()
 	provider := &piprovider.Provider{}
-	spec := translateSpec(
-		QueuedWork{QueuedWork: prompt.QueuedWork{}},
-		provider.Capabilities(),
-		SpecInputs{Cwd: "/work", Autonomous: true},
-	)
-	if !slices.Contains(spec.DisallowedTools, "AskUserQuestion") || !slices.Contains(spec.AllowedTools, "Task") {
-		t.Fatalf("test no longer exercises foreign default tool names: allowed=%v disallowed=%v", spec.AllowedTools, spec.DisallowedTools)
-	}
-	engine := piprovider.NewPolicyEngine(spec)
+	caps := provider.Capabilities()
+	in := SpecInputs{Cwd: "/work", Autonomous: true}
 
+	ungated := piprovider.NewPolicyEngine(translateSpec(QueuedWork{}, caps, in))
 	for _, call := range []piprovider.ToolCall{
 		{Kind: piprovider.ToolRead, Path: "/work/README.md", Cwd: "/work"},
 		{Kind: piprovider.ToolWrite, Path: "/work/result.txt", Cwd: "/work"},
 		{Kind: piprovider.ToolBash, Command: "git status", Cwd: "/work"},
+		{Kind: piprovider.ToolBash, Command: "printf outside-any-list", Cwd: "/work"},
+		{Kind: piprovider.ToolBash, Command: "git push origin HEAD", Cwd: "/work"},
 	} {
-		if decision := engine.Evaluate(call); !decision.Allow {
-			t.Errorf("translated autonomous defaults denied Pi %s: %q", call.Kind, decision.Reason)
+		if decision := ungated.Evaluate(call); !decision.Allow {
+			t.Errorf("bypass without a configured list denied pi %s %q: %q", call.Kind, call.Command, decision.Reason)
 		}
 	}
-	if decision := engine.Evaluate(piprovider.ToolCall{Kind: piprovider.ToolBash, Command: "printf outside-list", Cwd: "/work"}); decision.Allow {
-		t.Error("translated autonomous defaults granted an out-of-allowlist shell command")
+	if decision := ungated.Evaluate(piprovider.ToolCall{Kind: piprovider.ToolBash, Command: "sudo true", Cwd: "/work"}); decision.Allow {
+		t.Error("bypass dropped the built-in destructive-command deny")
+	}
+
+	card := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Bash(git:*)"}}}
+	gated := piprovider.NewPolicyEngine(translateSpec(card, caps, in))
+	if decision := gated.Evaluate(piprovider.ToolCall{Kind: piprovider.ToolBash, Command: "git status", Cwd: "/work"}); !decision.Allow {
+		t.Errorf("explicit card list denied a listed command: %q", decision.Reason)
+	}
+	if decision := gated.Evaluate(piprovider.ToolCall{Kind: piprovider.ToolBash, Command: "printf outside-list", Cwd: "/work"}); decision.Allow {
+		t.Error("explicit card list stopped gating an unlisted command")
 	}
 }
 

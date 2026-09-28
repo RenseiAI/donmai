@@ -94,6 +94,11 @@ type State struct {
 	ToolLifecycleReceipt *agent.ToolLifecycleReceipt `json:"toolLifecycleAdaptationReceipt,omitempty"`
 
 	ToolLifecycleReceiptHistory []agent.ToolLifecycleReceipt `json:"toolLifecycleAdaptationReceiptHistory,omitempty"`
+
+	// ExecutionSecurity is the pre-spawn execution-security report: per
+	// dimension, the stamped level, the level achieved and the layers
+	// enforcing it (ADR-2026-09-27-execution-security-levels.md D4).
+	ExecutionSecurity *agent.ExecutionSecurityReport `json:"executionSecurityReport,omitempty"`
 }
 
 // AppendToolLifecycleReceipt appends a digest-only admission decision and

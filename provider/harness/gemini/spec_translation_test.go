@@ -9,7 +9,7 @@ import (
 
 func TestBuildSpawnPlan_Minimal(t *testing.T) {
 	t.Parallel()
-	plan, err := buildSpawnPlan(agent.Spec{Prompt: "hello"}, "gemini-3.5-flash")
+	plan, err := buildSpawnPlan(agent.Spec{Prompt: "hello", AllowedTools: []string{}}, "gemini-3.5-flash")
 	if err != nil {
 		t.Fatalf("buildSpawnPlan: %v", err)
 	}
@@ -92,7 +92,10 @@ func TestToolsFromSpec_AllowedToolsAndMCP(t *testing.T) {
 
 func TestToolsFromSpec_NoToolsReturnsNil(t *testing.T) {
 	t.Parallel()
-	if got := toolsFromSpec(agent.Spec{Prompt: "hi"}); got != nil {
+	// An explicitly empty allow list (what a one-shot completion sends)
+	// declares no tools; a nil one is unconfigured and offers the native
+	// surface (TestToolsFromSpecOffersTheNativeSurfaceWithoutAnAllowGate).
+	if got := toolsFromSpec(agent.Spec{Prompt: "hi", AllowedTools: []string{}}); got != nil {
 		t.Errorf("toolsFromSpec: want nil for no-tools spec, got %#v", got)
 	}
 }

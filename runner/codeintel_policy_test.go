@@ -23,9 +23,8 @@ func TestTranslateSpecForCodeIntelDeliveryProjectsDefaultOrExplicitAuthority(t *
 	if err != nil {
 		t.Fatal(err)
 	}
-	wantDefault := append(defaultAllowedTools(), codeintelcontract.ToolGetRepoMap, codeintelcontract.ToolSearchSymbols)
-	if !reflect.DeepEqual(projected.AllowedTools, wantDefault) {
-		t.Fatalf("default native allowlist=%v want=%v", projected.AllowedTools, wantDefault)
+	if projected.AllowedTools != nil {
+		t.Fatalf("native route without a configured list conjured an allow list: %v", projected.AllowedTools)
 	}
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{AllowedTools: []string{"Read", "Bash(git:*)"}}}
 	explicit, err := translateSpecForCodeIntelDelivery(qw, caps, SpecInputs{Autonomous: true}, selection, nil)
@@ -45,7 +44,7 @@ func TestTranslateSpecForCodeIntelDeliveryRejectsNoncanonicalSelectionOrder(t *t
 	}
 }
 
-func TestTranslateSpecForCodeIntelDeliveryKeepsCanonicalInputAndRendersDisplayOrder(t *testing.T) {
+func TestTranslateSpecForCodeIntelDeliveryKeepsCanonicalInputAndConjuresNoAllowList(t *testing.T) {
 	t.Parallel()
 	selection := codeIntelDeliverySelection{Route: codeIntelDeliveryNative, Tools: []string{codeintelcontract.ToolSearchCode, codeintelcontract.ToolSearchSymbols}}
 	wantInput := append([]string(nil), selection.Tools...)
@@ -56,9 +55,8 @@ func TestTranslateSpecForCodeIntelDeliveryKeepsCanonicalInputAndRendersDisplayOr
 	if !reflect.DeepEqual(selection.Tools, wantInput) {
 		t.Fatalf("canonical authority input mutated: got=%v want=%v", selection.Tools, wantInput)
 	}
-	wantTail := []string{codeintelcontract.ToolSearchSymbols, codeintelcontract.ToolSearchCode}
-	if !reflect.DeepEqual(spec.AllowedTools[len(spec.AllowedTools)-2:], wantTail) {
-		t.Fatalf("projected display order=%v want tail=%v", spec.AllowedTools, wantTail)
+	if spec.AllowedTools != nil {
+		t.Fatalf("native selection widened into an allow list: %v", spec.AllowedTools)
 	}
 }
 

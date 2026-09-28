@@ -107,6 +107,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		return res, err
 	}
 	provider := selection.Provider
+	// Refuse a stamped execution-security level this exact harness cannot
+	// render in the session's mode before any workarea, credential or
+	// provider side effect. The same function re-checks the final spec
+	// before spawn (step 6b) and records the report.
+	if _, err = executionSecurityReport(agent.Spec{ExecutionSecurity: qw.ExecutionSecurity, PromptMode: sessionPromptMode(qw, selection.effectiveCell)}, provider, nil); err != nil {
+		refuseForExecutionSecurity(res, err)
+		return res, err
+	}
 	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
 	if workareaErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
@@ -140,6 +148,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			return res, err
 		}
 		if _, err = agent.ApplyPreparedHarness(preparedSource, harness.Manifest()); err != nil {
+			if agent.ExecutionSecurityErrorCode(err) != "" {
+				refuseForExecutionSecurity(res, err)
+				return res, err
+			}
 			// A drift error names exactly which authority-projection fields
 			// disagreed (never their values — see agent.AuthorityDriftError);
 			// log it as a structured line so a production refusal is
@@ -785,6 +797,19 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		spec.RepositoryAuthority = policy
 	}
 
+	// 6b. Execution security: refuse a stamped level this exact harness and
+	// session mode cannot render, and record what a stamped run achieves,
+	// before any state, credential or provider side effect. Receipt-bearing
+	// work reports the host-compiled plan's report once it meets the stamp
+	// (the provider's PrepareHarness also re-derives it byte-for-byte);
+	// everything else renders here with the same function.
+	report, securityErr := executionSecurityReport(spec, provider, preparedPlan)
+	if securityErr != nil {
+		refuseForExecutionSecurity(res, securityErr)
+		return res, securityErr
+	}
+	res.ExecutionSecurity = report
+
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
 	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
@@ -799,6 +824,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			s.StartedAt = startedAt
 		}
 		s.AttemptCount++
+		s.ExecutionSecurity = report
 		return nil
 	}); err != nil {
 		// state.json is best-effort — log and continue.

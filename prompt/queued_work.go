@@ -216,11 +216,11 @@ type QueuedWork struct {
 
 	// AllowedTools is the platform-supplied set of tool-call patterns the
 	// agent card authorises for this session. When non-empty it is
-	// AUTHORITATIVE — the runner uses it verbatim in place of its own
-	// defaultAllowedTools() baseline (the card is the source of truth for
-	// what the agent may call). When empty/absent the runner falls back to
-	// defaultAllowedTools() — backward-compatible. The runner's
-	// defaultDisallowedTools() floor still applies regardless.
+	// AUTHORITATIVE — the runner uses it verbatim (the card is the source of
+	// truth for what the agent may call). When empty/absent the runner
+	// imposes no allow list of its own: at toolApproval bypass there is then
+	// no allow gate. The runner's defaultDisallowedTools() floor still
+	// applies regardless.
 	//
 	// Wire shape: "allowedTools" (camelCase, omitempty). Mirrors the
 	// claude/gemini AllowedTools permission-pattern grammar

@@ -14,10 +14,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessOllama,
-		HumanLabel:  "Ollama (local)",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessOllama,
+		HumanLabel:        "Ollama (local)",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: ollamaExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: false,
 			SupportsSessionResume:    false,

@@ -322,6 +322,11 @@ func PrepareHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	if err := ValidateSpecCapabilities(spec, manifest); err != nil {
 		return spec, err
 	}
+	// Refuse a stamped execution-security level this exact harness and mode
+	// cannot render before any prompt, tool or provider side effect.
+	if _, err := RenderExecutionSecurity(spec, manifest); err != nil {
+		return spec, err
+	}
 	adapted, err := PreparePrompt(spec, manifest)
 	if err != nil {
 		return spec, err

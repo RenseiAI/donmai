@@ -15,12 +15,15 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/gateway"
 	"github.com/RenseiAI/donmai/gateway/costfeed"
 	internaldaemon "github.com/RenseiAI/donmai/internal/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/rulesetsnapshot"
+	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -197,6 +200,17 @@ type Options struct {
 	// neither forget them nor advertise them without the executor, because the
 	// executor is wired by the poll service, not by the embedder.
 	RegistrationCapabilities []string
+
+	// ExecutionSecurityEnforcement is this host's execution-security
+	// attestation (004-sandbox-capability-matrix.md
+	// executionSecurityEnforcement): per substrate dimension, the strongest
+	// level the executor enforces around the harness. It is
+	// embedder-attested: a level above index 0 must be backed by the
+	// embedder's own negative probe on its exact executor version. Nil means
+	// the daemon applies no containment and attests index 0 on every
+	// dimension. Only an attested isolation boundary (os-sandbox or
+	// stronger) lets a registration advertise the "sandbox" capability.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement
 
 	// OnLandingWork handles a landing-run poll item (WorkType ==
 	// LandingWorkType) out-of-band from the session-spawn path. The whole
@@ -1014,6 +1028,8 @@ func (d *Daemon) Start(ctx context.Context) error {
 			SessionShim:         d.SessionShimHostAttestation(),
 			WorkareaExecutors:   workareaExecutors,
 			AuthOnly:            d.sessionShimEnabled(),
+
+			ExecutionSecurityEnforcement: d.opts.ExecutionSecurityEnforcement,
 		}
 	}
 
@@ -1839,6 +1855,23 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		opts...,
 	)
 	if _, err := d.AcceptWorkWithDetail(spec, detail); err != nil {
+		// A session refused for its execution-security stamp (malformed, or
+		// a level no channel here can render) is refused permanently: any
+		// host would refuse the same stamp for the same exact harness, so a
+		// requeue would only bounce it across the fleet. Report it as a
+		// terminal failure with the typed refusal instead of a NACK. Only
+		// when that report cannot be delivered does the legacy NACK below
+		// run, so the claim is never left stranded.
+		if refusal := agent.ExecutionSecurityRefusalFromError(err); refusal != nil {
+			postErr := d.reportExecutionSecurityRefusal(orchestratorURL, item.SessionID, err, refusal)
+			if postErr == nil {
+				slog.Warn("daemon poll: refused session for its execution-security stamp; reported terminal",
+					"sessionId", item.SessionID, "code", refusal.Code, "dimensions", refusal.Dimensions)
+				return fmt.Errorf("accept work %s: %w", item.SessionID, err)
+			}
+			slog.Warn("daemon poll: terminal execution-security refusal not delivered; falling back to nack",
+				"sessionId", item.SessionID, "code", refusal.Code, "postErr", postErr.Error())
+		}
 		// Local accept-work failure means the orchestrator's claim of this
 		// session is stale on first contact — the session is in `claimed`
 		// state with this worker, but no `donmai agent run` subprocess will
@@ -1876,6 +1909,35 @@ func (d *Daemon) handlePollWorkItem(item PollWorkItem, orchestratorURL string) e
 		return fmt.Errorf("accept work %s: %w", item.SessionID, err)
 	}
 	return nil
+}
+
+// executionSecurityRefusalReportTimeout bounds the terminal refusal report so
+// a slow platform cannot stall the poll loop; an undelivered report falls
+// back to the legacy NACK.
+const executionSecurityRefusalReportTimeout = 10 * time.Second
+
+// reportExecutionSecurityRefusal posts the terminal status of a session this
+// daemon refused before spawn for its execution-security stamp: failed, with
+// failureMode "execution-security" and the typed refusal. It uses the same
+// status endpoint and worker credentials a runner's terminal report uses.
+func (d *Daemon) reportExecutionSecurityRefusal(orchestratorURL, sessionID string, cause error, refusal *agent.ExecutionSecurityRefusal) error {
+	workerID, runtimeJWT := d.WorkerID(), d.runtimeJWT()
+	if strings.TrimSpace(orchestratorURL) == "" || workerID == "" {
+		return errors.New("execution-security refusal report requires the orchestrator URL and worker identity")
+	}
+	poster, err := result.NewPoster(result.Options{
+		PlatformURL: orchestratorURL, WorkerID: workerID, AuthToken: runtimeJWT, MaxAttempts: 3,
+	})
+	if err != nil {
+		return fmt.Errorf("execution-security refusal poster: %w", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), executionSecurityRefusalReportTimeout)
+	defer cancel()
+	outcome := poster.PostWithOptionsOutcome(ctx, sessionID, agent.Result{
+		Status: "failed", FailureMode: runner.FailureExecutionSecurity, Error: cause.Error(),
+		ExecutionSecurityRefusal: refusal,
+	}, result.PostOptions{})
+	return outcome.StatusErr
 }
 
 // runLandingWork owns one landing callback from admission through completion.
@@ -2050,6 +2112,14 @@ func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (
 		}
 		if spec.OrganizationID == "" {
 			spec.OrganizationID = detail.OrganizationID
+		}
+		// Every lane — receipt-bearing or not — reads the stamped
+		// execution-security levels with the same closed decoder before a
+		// child exists. A malformed section is refused here
+		// (execution_security_unresolvable) instead of spawning a runner
+		// that would refuse it anyway.
+		if _, err := agent.ExecutionSecurityFromOperationalPayload(detail.OperationalPayload); err != nil {
+			return nil, fmt.Errorf("execution security: %w", err)
 		}
 		if len(detail.AdmissionReceipt) > 0 {
 			// The narrow-only claim gate runs first: for a claim-bound

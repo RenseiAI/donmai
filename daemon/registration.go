@@ -14,6 +14,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
@@ -104,6 +105,12 @@ type RegistrationOptions struct {
 	// Nil/empty preserves legacy registration and means no positive protocol
 	// or repository-authority attestation.
 	WorkareaExecutors []workarea.ExecutorCapabilityAttestation
+
+	// ExecutionSecurityEnforcement is the host's embedder-attested
+	// execution-security attestation. Nil registers the honest index-0
+	// attestation of a host with no containment. Register reconciles the
+	// "sandbox" capability tag with it on every registration path.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement
 
 	// AuthOnly suppresses registration-time capacity publication during hosted
 	// recovery. It is valid only with a supported SessionShim attestation; the
@@ -215,6 +222,12 @@ type RegisterRequest struct {
 	// WorkareaExecutors keeps protocol/enforcement attestations bound to the
 	// exact executor instead of widening them into a host-level bool.
 	WorkareaExecutors []workarea.ExecutorCapabilityAttestation `json:"workareaExecutors,omitempty"`
+
+	// ExecutionSecurityEnforcement is the host's per-dimension
+	// execution-security attestation, in the executionSecurityEnforcement
+	// shape of 004-sandbox-capability-matrix.md. Additive; Register always
+	// sends it.
+	ExecutionSecurityEnforcement *agent.ExecutionSecurityEnforcement `json:"executionSecurityEnforcement,omitempty"`
 }
 
 // ProjectAllowlistEntry is the wire shape for a single allowlisted project
@@ -420,6 +433,10 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 	if opts.AuthOnly && !opts.SessionShim.enabled() {
 		return nil, errors.New("auth-only registration requires session shim attestation")
 	}
+	enforcement, err := registrationExecutionSecurityEnforcement(opts.ExecutionSecurityEnforcement)
+	if err != nil {
+		return nil, fmt.Errorf("registration execution-security attestation: %w", err)
+	}
 
 	// Decide real-vs-stub up front so the JWT cache can be validated against
 	// the daemon's *current* config before it is trusted. Computing useStub
@@ -469,7 +486,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		Version:                    opts.Version,
 		Region:                     opts.Region,
 		Provides:                   opts.Provides,
-		Capabilities:               opts.Capabilities,
+		Capabilities:               attestedRegistrationCapabilities(opts.Capabilities, enforcement),
 		DaemonProjects:             opts.DaemonProjects,
 		ProjectIDs:                 normalizeProjectIDs(opts.ProjectIDs),
 		ProjectAdmissionVersion:    opts.ProjectAdmissionVersion,
@@ -478,6 +495,7 @@ func Register(ctx context.Context, opts RegistrationOptions) (*RegisterResponse,
 		SessionShimHostAttestation: cloneSessionShimHostAttestation(opts.SessionShim),
 		WorkareaExecutors:          append([]workarea.ExecutorCapabilityAttestation(nil), opts.WorkareaExecutors...),
 	}
+	req.ExecutionSecurityEnforcement = &enforcement
 	if req.MachineID == "" {
 		// The stable machine identity, NOT the hostname. Falling back to the
 		// hostname is what let one machine present itself under every

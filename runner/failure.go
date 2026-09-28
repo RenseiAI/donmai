@@ -132,4 +132,14 @@ const (
 	// but could not durably acquire the requested bounded terminal-workarea hold
 	// or record ordinary teardown as deferred. A successful status is never sent.
 	FailureTerminalWorkareaLease = "terminal-workarea-lease"
+
+	// FailureExecutionSecurity indicates the runner refused the session
+	// before spawn because of its stamped execution-security levels
+	// (ADR-2026-09-27-execution-security-levels.md): the exact harness and
+	// session mode cannot render a required level
+	// (execution_security_unrenderable), or a host-compiled report does not
+	// meet the stamp (execution_security_receipt_unmet). Permanent for the
+	// same harness: re-dispatching the identical stamp fails the same way.
+	// The typed code and dimension are in Result.Error.
+	FailureExecutionSecurity = "execution-security"
 )

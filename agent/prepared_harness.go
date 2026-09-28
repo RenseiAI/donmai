@@ -48,6 +48,13 @@ type PreparedHarness struct {
 	Materializations      []HarnessMaterialization `json:"materializations"`
 	PromptReceipt         PromptDeliveryReceipt    `json:"promptReceipt"`
 	ToolLifecycleReceipt  ToolLifecycleReceipt     `json:"toolLifecycleReceipt"`
+	// ExecutionSecurity is the applied receipt's per-dimension report
+	// (ADR-2026-09-27-execution-security-levels.md D4): what this exact
+	// harness renders for the session's stamped levels. It is present exactly
+	// when the work item carries an executionSecurity section; a plan for
+	// work without one is byte-identical to the pre-field plan, and its
+	// absent report achieves exactly index 0.
+	ExecutionSecurity *ExecutionSecurityReport `json:"executionSecurity,omitempty"`
 }
 
 // AuthorityDriftError is returned by ApplyPreparedHarness when the child's
@@ -149,6 +156,13 @@ func CompilePreparedHarness(spec Spec, manifest HarnessManifest, operationalDige
 	if toolErr != nil {
 		return plan, toolErr
 	}
+	report, securityErr := RenderExecutionSecurity(spec, manifest)
+	if securityErr != nil {
+		return plan, securityErr
+	}
+	if spec.ExecutionSecurity != nil {
+		plan.ExecutionSecurity = &report
+	}
 	return plan, nil
 }
 
@@ -214,11 +228,35 @@ func ApplyPreparedHarness(spec Spec, manifest HarnessManifest) (Spec, error) {
 	// or the exact adapter would materialize deliveries the host-persisted
 	// receipt refused (the recompute matching byte-for-byte proves the drop
 	// decision is the same one the host made).
+	if err := applyPreparedExecutionSecurity(spec, manifest, plan); err != nil {
+		return spec, err
+	}
 	adapted = dropDeniedAdvisoryExtensions(adapted, plan.ToolLifecycleReceipt.Entries)
 	adapted = WithToolLifecycleProfile(adapted, toolProfile.ID)
 	adapted.PromptReceipt = copyPromptReceipt(&plan.PromptReceipt)
 	adapted.ToolLifecycleReceipt = copyToolReceipt(&plan.ToolLifecycleReceipt)
 	return adapted, nil
+}
+
+// applyPreparedExecutionSecurity is the child-side half of the execution
+// security receipt: the recomputed report must byte-equal the host's, and the
+// host's report must meet the levels the session is stamped with. A report is
+// never repaired from process state; a plan without one achieves index 0.
+func applyPreparedExecutionSecurity(spec Spec, manifest HarnessManifest, plan *PreparedHarness) error {
+	stamped := EffectiveExecutionSecurityLevels(spec.ExecutionSecurity)
+	if (plan.ExecutionSecurity == nil) != (spec.ExecutionSecurity == nil) {
+		return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Harness: manifest.Name, Detail: "host adaptation receipt and session disagree on whether the work is stamped"}
+	}
+	if plan.ExecutionSecurity != nil {
+		report, err := RenderExecutionSecurity(spec, manifest)
+		if err != nil {
+			return err
+		}
+		if !equalJSON(report, *plan.ExecutionSecurity) {
+			return &ExecutionSecurityError{Code: ExecutionSecurityReceiptUnmet, Harness: manifest.Name, Detail: "execution-security application differs from host adaptation receipt"}
+		}
+	}
+	return ExecutionSecurityReportMeets(plan.ExecutionSecurity, stamped)
 }
 
 // DigestPreparedHarness returns the stable SHA-256 digest of plan's JSON form.
@@ -261,6 +299,10 @@ type harnessAuthorityProjection struct {
 	PromptPlan         *PromptPlan           `json:"promptPlan"`
 	ToolLifecyclePlan  *ToolLifecyclePlan    `json:"toolLifecyclePlan"`
 	PromptMode         PromptSessionMode     `json:"promptMode"`
+	// ExecutionSecurity binds the stamped levels into the authority digest.
+	// omitempty keeps every plan compiled for a work item without the
+	// section byte-identical to the pre-field projection.
+	ExecutionSecurity *ExecutionSecurity `json:"executionSecurity,omitempty"`
 }
 
 func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuthorityProjection {
@@ -290,6 +332,7 @@ func newHarnessAuthorityProjection(spec Spec, plan *PreparedHarness) harnessAuth
 		PromptPlan:         normalized.PromptPlan,
 		ToolLifecyclePlan:  normalized.ToolLifecyclePlan,
 		PromptMode:         normalized.PromptMode,
+		ExecutionSecurity:  normalized.ExecutionSecurity,
 	}
 }
 
@@ -309,7 +352,7 @@ func digestAuthorityProjection(p harnessAuthorityProjection) string {
 // combined AuthorityDigest can be localized to the field(s) that actually
 // drifted instead of surfacing one undiagnosable 64-hex inequality.
 func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
-	return map[string]string{
+	digests := map[string]string{
 		"prompt":             digestValue(p.Prompt),
 		"autonomous":         digestValue(p.Autonomous),
 		"sandboxEnabled":     digestValue(p.SandboxEnabled),
@@ -335,6 +378,10 @@ func authorityFieldDigests(p harnessAuthorityProjection) map[string]string {
 		"toolLifecyclePlan":  digestValue(p.ToolLifecyclePlan),
 		"promptMode":         digestValue(p.PromptMode),
 	}
+	if p.ExecutionSecurity != nil {
+		digests["executionSecurity"] = digestValue(p.ExecutionSecurity)
+	}
+	return digests
 }
 
 // driftingAuthorityFields returns the sorted set of field names present in
@@ -498,6 +545,11 @@ func ValidatePreparedHarnessRegistration(plan *PreparedHarness, operationalDiges
 	}
 	if err := validateToolReceiptForRegistration(plan.ToolLifecycleReceipt); err != nil {
 		return err
+	}
+	if plan.ExecutionSecurity != nil {
+		if err := ValidateExecutionSecurityReport(*plan.ExecutionSecurity); err != nil {
+			return fmt.Errorf("agent: registered execution-security report is invalid: %w", err)
+		}
 	}
 	return nil
 }

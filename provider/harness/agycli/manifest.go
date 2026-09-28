@@ -13,10 +13,11 @@ var _ agent.HarnessProvider = (*Provider)(nil)
 func (*Provider) Manifest() agent.HarnessManifest {
 	events := []agent.EventKind{agent.EventInit, agent.EventAssistantText, agent.EventToolUse, agent.EventToolResult, agent.EventResult, agent.EventError}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessAntigravity,
-		HumanLabel:  "Antigravity",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessAntigravity,
+		HumanLabel:        "Antigravity",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: agyExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: false,
 			SupportsSessionResume:    false,

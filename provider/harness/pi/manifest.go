@@ -34,10 +34,11 @@ func (*Provider) Manifest() agent.HarnessManifest {
 	// the headless RPC lane carries.
 	ptyEvents := []agent.EventKind{agent.EventInit, agent.EventResult}
 	return agent.HarnessManifest{
-		Name:        agent.HarnessPi,
-		HumanLabel:  "pi",
-		Family:      agent.FamilyHarness,
-		ContractABI: "harness/v2",
+		Name:              agent.HarnessPi,
+		HumanLabel:        "pi",
+		Family:            agent.FamilyHarness,
+		ContractABI:       "harness/v2",
+		ExecutionSecurity: piExecutionSecurity,
 		Caps: agent.HarnessCaps{
 			SupportsMessageInjection: true, // steer / follow_up
 			SupportsSessionResume:    true, // session file + cursor replay (get_entries since=<id>)

@@ -130,6 +130,11 @@ func TestSpecFieldCoverage(t *testing.T) {
 		// treatment as ToolLifecyclePlan/ToolLifecycleReceipt above, not a
 		// JSON-RPC param this file's translation table ever sees.
 		"ToolSurfaceRequired",
+		// ExecutionSecurity is consumed by agent.PrepareHarness
+		// (RenderExecutionSecurity), which refuses before NewSpawnPlan runs
+		// any stamped level this adapter cannot render. Codex renders index 0
+		// only, so nothing in the JSON-RPC translation depends on it.
+		"ExecutionSecurity",
 	}
 	all := append([]string{}, translatedFields...)
 	all = append(all, ignoredFields...)

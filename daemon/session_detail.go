@@ -253,8 +253,8 @@ type SessionDetail struct {
 	// so the daemon stays free of the runner/prompt/agent packages.
 
 	// AllowedTools forwards the agent-card tool allowlist. When non-empty the
-	// runner uses it verbatim in place of its default allowlist (card is
-	// authoritative). Consumed by runner/spec_translation.go.
+	// runner uses it verbatim (card is authoritative); when empty the runner
+	// imposes no allow list of its own. Consumed by runner/spec_translation.go.
 	AllowedTools []string `json:"allowedTools,omitempty"`
 
 	// McpServers forwards the agent-card MCP server set. The runner appends

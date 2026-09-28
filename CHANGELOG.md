@@ -8,7 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- The runner reads the session's stamped execution-security levels
+  (`executionSecurity` on queued work: `version`, `levels`, `sources`, the
+  `sha256:` digest of the canonical levels, and optional `parentSessionId`,
+  `rulesetRevision` and `resolvedAt`) with a closed decoder on every lane. It
+  verifies the digest, binds the stamp into the prepared-harness authority
+  digest, renders the levels per exact harness and session mode, and refuses
+  before any side effect what a harness cannot render
+  (`execution_security_unrenderable`) or a malformed or null stamp
+  (`execution_security_unresolvable`). Such a refusal is reported as a
+  terminal failure (`failureMode: execution-security`) carrying a typed
+  `executionSecurityRefusal`, never NACKed back onto the queue. Stamped work
+  records, per dimension, the level achieved, its enforcing layers and the
+  tool and network deny-baseline status; work without the section produces
+  exactly the plans and receipts it did before. Every harness renders index 0
+  only for now.
+- Registration publishes the host's `executionSecurityEnforcement`
+  attestation (index 0 on every substrate dimension unless the embedder
+  attests more), on every registration path.
+
+### Fixes
+
+- The runner no longer imposes a hardcoded headless allow list when no allow
+  list is configured; configured lists and the always-on deny entries still
+  apply, as do the built-in destructive-command denies. gemini-direct still
+  offers its full native tool set when no allow list bounds it.
+- Registrations no longer advertise a `sandbox` capability unless an
+  isolation boundary is attested; an embedder-supplied `sandbox` tag is
+  dropped otherwise.
 
 ## v0.72.50 — 2026-09-27
 

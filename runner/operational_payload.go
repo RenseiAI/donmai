@@ -35,6 +35,7 @@ type OperationalPayload struct {
 	Branch                string                            `json:"branch,omitempty"`
 	TerminalWorkareaLease *workarea.TerminalLeaseRequest    `json:"terminalWorkareaLease,omitempty"`
 	PermissionProfile     PermissionProfile                 `json:"permissionProfile,omitempty"`
+	ExecutionSecurity     *agent.ExecutionSecurity          `json:"executionSecurity,omitempty"`
 }
 
 // ProjectOperationalPayload returns the exact admission-time payload shared by
@@ -54,6 +55,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		Branch:                qw.Branch,
 		TerminalWorkareaLease: qw.TerminalWorkareaLease,
 		PermissionProfile:     qw.PermissionProfile,
+		ExecutionSecurity:     qw.ExecutionSecurity.Clone(),
 	}
 }
 
