@@ -1277,6 +1277,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// streamRes.blocked signal the marker scan produces, so the blocked
 	// classification fork below treats both channels identically.
 	r.applyTurnManifest(runnerStatePath, qw, res, &streamRes)
+	// Stamp the manifest file before any follow-up turn so step 11·M can tell
+	// a manifest the follow-up wrote from one it merely left in place.
+	manifestBeforeFollowUp := stampManifest(runnerStatePath)
 
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
@@ -1301,9 +1304,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// provider capability; a no-op when nothing was buffered. Runs BEFORE
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
+	// followUp is the observation of the latest follow-up turn (memory inject
+	// or steering), when one ran; step 11·M re-resolves the manifest after it.
+	var followUp *streamObservation
 	if runtimeInjectEnabled && !streamRes.blocked {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
+		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
+			followUp = &injRes
+		}
 	}
 
 	// 11. Tail recovery. Skipped entirely when the agent deliberately
@@ -1329,6 +1338,25 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			// Re-consume any events the steering inject/resume produced.
 			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
+			followUp = &tailRes
+		}
+	}
+
+	// 11·M. Re-resolve the turn verdict after a follow-up turn. The agent may
+	// write its manifest during the follow-up turn, and the follow-up's
+	// terminal message (often just the PR URL steering asked for) has replaced
+	// res.Summary. The newest signal wins: a manifest the follow-up produced,
+	// else the follow-up's own WORK_RESULT verdict over a stale earlier
+	// manifest, else the earlier manifest (see reapplyTurnManifest). A blocked
+	// verdict takes the 10a fork — but only when the runner has recorded no
+	// failure of its own: an agent-authored decline never relabels a crash.
+	if followUp != nil {
+		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, *followUp, manifestBeforeFollowUp)
+		if res.FailureMode == "" && classifyBlocked(res, streamRes) {
+			r.logger.Info("agent blocked: deliberate decline detected after follow-up turn",
+				"sessionId", qw.SessionID,
+				"reason", streamRes.blockedReason,
+			)
 		}
 	}
 
@@ -1626,8 +1654,14 @@ type streamObservation struct {
 	issueUpdated    bool
 	subIssuesMade   bool
 	workResult      string
-	cost            *agent.CostData
-	providerID      string
+	// lineVerdict is the latest verdict from a LINE-ANCHORED WORK_RESULT
+	// marker (passed|failed|blocked) — the same anchoring rule the platform's
+	// sentinel reader applies. workResult above is the historical unanchored
+	// scrape; lineVerdict is what may supersede a stale manifest (step 11·M),
+	// so a marker merely quoted mid-sentence can never override one.
+	lineVerdict string
+	cost        *agent.CostData
+	providerID  string
 	// lastAssistantText is the most recent non-empty assistant message
 	// observed on this stream. It is the summary fallback for providers
 	// whose terminal ResultEvent carries no Message (codex's
@@ -1862,6 +1896,9 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		}
 		if marker := scanWorkResult(e.Text); marker != "" {
 			obs.workResult = marker
+		}
+		if verdict := scanLineVerdict(e.Text); verdict != "" {
+			obs.lineVerdict = verdict
 		}
 		// Structural blocked-agent signal: a deliberate decline the agent
 		// announced via "WORK_RESULT:blocked" or "AGENT_BLOCKED: <reason>".
@@ -2480,6 +2517,19 @@ func scanWorkResult(text string) string {
 	return ""
 }
 
+// scanLineVerdict returns the verdict of the LAST line-anchored WORK_RESULT
+// marker in text ("passed", "failed" or "blocked"), or "" when none. A marker
+// counts only at the start of a line (modulo leading blanks and an optional
+// opening HTML-comment fence), so prose that merely mentions a marker is
+// ignored.
+func scanLineVerdict(text string) string {
+	matches := workResultLineRE.FindAllStringSubmatch(text, -1)
+	if len(matches) == 0 {
+		return ""
+	}
+	return strings.ToLower(matches[len(matches)-1][1])
+}
+
 // scanPRURL extracts a github.com/<owner>/<repo>/pull/<number> URL
 // from arbitrary text. Returns the empty string on no match.
 func scanPRURL(text string) string {
@@ -2559,6 +2609,12 @@ var (
 	// workResultBlockedRE to avoid mid-sentence false positives.
 	agentBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?AGENT_BLOCKED[:\s]+([^\r\n]+)`)
 )
+
+// workResultLineRE is the line-anchored verdict marker: start of a line,
+// optional blanks and HTML-comment fence, then `WORK_RESULT:<verdict>`,
+// `WORK_RESULT: <verdict>` or `WORK_RESULT <verdict>` on the SAME line (the
+// separator never crosses a newline).
+var workResultLineRE = regexp.MustCompile(`(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)(passed|failed|blocked)`)
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.
