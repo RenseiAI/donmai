@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.52 — 2026-09-28
+
 ### Fixes
 
 - An environment-only `DONMAI_KIT_TRUST_MODE=permissive` now warns and keeps
