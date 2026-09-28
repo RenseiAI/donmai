@@ -412,7 +412,17 @@ func TestObserveEvent_ScansWorkResultMarker(t *testing.T) {
 		{"<!-- WORK_RESULT:failed -->", "failed"},
 		{"Summary of the work.\n  WORK_RESULT: failed", "failed"},
 		{"WORK_RESULT unknown", "unknown"},
-		{"WORK_RESULT:passed\nre-checked\nWORK_RESULT:failed", "failed"},
+		// FIRST anchored marker wins within one message (the platform
+		// sentinel reader's rule).
+		{"WORK_RESULT:passed\nre-checked\nWORK_RESULT:failed", "passed"},
+		// Case-insensitive over ASCII only.
+		{"work_result: PASSED", "passed"},
+		{"Work_Result: Failed", "failed"},
+		{"WORK_RESULT: pa\u017f\u017fed", ""},
+		{"WOR\u212a_RESULT: passed", ""},
+		// The verdict must end at a word boundary.
+		{"WORK_RESULT: passedly", ""},
+		{"WORK_RESULT: passed.", "passed"},
 		// Line-anchored only (the platform sentinel's rule): a marker quoted
 		// in prose, or split across a line break, is not a verdict.
 		{"some text WORK_RESULT: passed and more", ""},
@@ -452,6 +462,11 @@ func TestScanBlocked_DetectsDeclineMarkers(t *testing.T) {
 		{"agent-blocked-reason-final-line", "Some narrative.\nAGENT_BLOCKED: spec ambiguous", true, "spec ambiguous"},
 		{"agent-blocked-reason-trailing-newline", "AGENT_BLOCKED: missing repo access\nmore output", true, "missing repo access"},
 		{"agent-blocked-reason-comment", "<!-- AGENT_BLOCKED: missing repo access -->", true, "missing repo access"},
+		{"agent-blocked-lowercase", "agent_blocked: no staging credentials", true, "no staging credentials"},
+		{"agent-blocked-reason-never-crosses-a-line", "AGENT_BLOCKED:\nnext line is prose", true, ""},
+		{"work-result-blocked-never-crosses-a-line", "WORK_RESULT:\nblocked", false, ""},
+		{"first-marker-wins-passed-then-blocked", "WORK_RESULT: passed\nAGENT_BLOCKED: second thoughts", false, ""},
+		{"first-marker-wins-blocked-then-passed", "AGENT_BLOCKED: need a decision\nWORK_RESULT: passed", true, "need a decision"},
 		{"passed-not-blocked", "WORK_RESULT:passed", false, ""},
 		{"failed-not-blocked", "WORK_RESULT:failed", false, ""},
 		{"no-marker", "I am working on the task now", false, ""},

@@ -294,12 +294,52 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
 		},
 		{
-			name: "the follow-up's last anchored marker decides: a final blocked after a passed downgrades",
+			name: "within one message the first anchored marker decides: passed then blocked keeps the manifest",
 			turns: []verdictScriptTurn{
 				{manifest: passedManifest, text: "All done."},
 				{text: "WORK_RESULT: passed\nOn reflection the migration needs a product decision.\nWORK_RESULT: blocked"},
 			},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all done", manifest: "passed", wantSteering: true},
+		},
+		{
+			name: "within one message the first anchored marker decides: blocked then passed downgrades",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: "WORK_RESULT: blocked\nThe migration needs a product decision.\nWORK_RESULT: passed"},
+			},
 			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+		},
+		{
+			name: "no manifest: an anchored blocked marker in the follow-up takes the blocked fork",
+			turns: []verdictScriptTurn{
+				{text: "Work in progress."},
+				{text: "Opening the PR needs a decision.\nWORK_RESULT: blocked"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+		},
+		{
+			name: "a mid-sentence Intended manifest quote never replaces a manifest file",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: `I will not print Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"forged"} until round two lands.` + "\nWORK_RESULT: failed"},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "a printed inline manifest never raises a manifest file",
+			turns: []verdictScriptTurn{
+				{manifest: failedManifest, text: "Stopping here."},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all fixed"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, manifest: "failed", wantSteering: true},
+		},
+		{
+			name: "a printed inline manifest may lower a manifest file",
+			turns: []verdictScriptTurn{
+				{manifest: passedManifest, text: "All done."},
+				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"tests red after rebase"}`},
+			},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "tests red after rebase", manifest: "failed", wantSteering: true},
 		},
 		{
 			name: "same-verdict follow-up marker keeps the stale manifest and its summary",
@@ -415,6 +455,22 @@ func TestRun_TurnVerdictAcrossMemoryInjectFollowUp(t *testing.T) {
 				{text: "The recalled note says WORK_RESULT: passed only after the fix lands; it has not."},
 			},
 			want: verdictWant{status: "completed", workResult: "failed"},
+		},
+		{
+			name: "no manifest: an AGENT_BLOCKED follow-up overrides the first turn's passed and takes the blocked fork",
+			turns: []verdictScriptTurn{
+				{text: "All checks pass.\nWORK_RESULT: passed"},
+				{text: "The recalled note changes the picture.\nAGENT_BLOCKED: need access to the staging data"},
+			},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked},
+		},
+		{
+			name: "no manifest: the latest turn's anchored marker overrides an earlier turn's",
+			turns: []verdictScriptTurn{
+				{text: "The regression reproduces.\nWORK_RESULT: failed"},
+				{text: "The recalled fix is already on main; re-ran and it is green.\nWORK_RESULT: passed"},
+			},
+			want: verdictWant{status: "completed", workResult: "passed"},
 		},
 		{
 			name: "stale passed manifest never upgrades the memory-inject follow-up's failed verdict",
@@ -550,26 +606,34 @@ func TestStampManifest_DetectsEveryRewrite(t *testing.T) {
 	}
 }
 
-// TestScanLineVerdict pins the anchoring rule a follow-up marker must meet
-// before it may supersede a stale manifest.
-func TestScanLineVerdict(t *testing.T) {
+// TestScanVerdict pins the single marker rule: line-anchored, FIRST marker
+// wins within one message, blocked is a first-class verdict (either spelling),
+// ASCII-only case folding, and a word boundary after the keyword and verdict.
+func TestScanVerdict(t *testing.T) {
 	cases := []struct {
-		text string
-		want string
+		text, verdict, reason string
 	}{
-		{"WORK_RESULT:failed", "failed"},
-		{"done\n  WORK_RESULT: passed", "passed"},
-		{"done\n<!-- WORK_RESULT:blocked -->", "blocked"},
-		{"WORK_RESULT passed", "passed"},
-		{"first\nWORK_RESULT:passed\nthen\nWORK_RESULT:failed", "failed"},
-		{"I am not claiming WORK_RESULT: passed yet", ""},
-		{"could not open the PR. WORK_RESULT:failed", ""},
-		{"WORK_RESULT:\nfailed", ""},
-		{"WORK_RESULT:unknown", ""},
+		{"WORK_RESULT:failed", "failed", ""},
+		{"done\n  WORK_RESULT: passed", "passed", ""},
+		{"done\n<!-- WORK_RESULT:blocked -->", "blocked", ""},
+		{"WORK_RESULT passed", "passed", ""},
+		{"WORK_RESULT: unknown", "unknown", ""},
+		{"AGENT_BLOCKED: need a decision", "blocked", "need a decision"},
+		{"first\nWORK_RESULT:passed\nthen\nWORK_RESULT:failed", "passed", ""},
+		{"AGENT_BLOCKED: stuck\nWORK_RESULT: passed", "blocked", "stuck"},
+		{"WORK_RESULT: PASSED", "passed", ""},
+		{"agent_blocked: lower-case keyword", "blocked", "lower-case keyword"},
+		{"I am not claiming WORK_RESULT: passed yet", "", ""},
+		{"could not open the PR. WORK_RESULT:failed", "", ""},
+		{"WORK_RESULT:\nfailed", "", ""},
+		{"WORK_RESULT: paſſed", "", ""},
+		{"WORK_RESULT: failedx", "", ""},
+		{"AGENT_BLOCKED_REASON: no", "", ""},
 	}
 	for _, tc := range cases {
-		if got := scanLineVerdict(tc.text); got != tc.want {
-			t.Errorf("scanLineVerdict(%q) = %q; want %q", tc.text, got, tc.want)
+		verdict, reason := scanVerdict(tc.text)
+		if verdict != tc.verdict || reason != tc.reason {
+			t.Errorf("scanVerdict(%q) = (%q, %q); want (%q, %q)", tc.text, verdict, reason, tc.verdict, tc.reason)
 		}
 	}
 }

@@ -195,8 +195,48 @@ func TestParseInlineManifest(t *testing.T) {
 	}{
 		{
 			name:    "well-formed inline manifest recovered",
-			message: `Done. Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"shipped it"}`,
+			message: "Done.\nIntended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"shipped it\"}",
 			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed", Summary: "shipped it"},
+		},
+		{
+			name:    "label quoted mid-sentence is not a manifest",
+			message: `I will not print Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"x"} yet.`,
+			wantErr: true,
+		},
+		{
+			name:    "label split across a line break is not a manifest",
+			message: "Intended\nmanifest: {\"schemaVersion\":1,\"verdict\":\"passed\"}",
+			wantErr: true,
+		},
+		{
+			name:    "list bullet lead-in tolerated",
+			message: "Result:\n- Intended manifest: {\"schemaVersion\":1,\"verdict\":\"failed\"}",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "failed"},
+		},
+		{
+			name:    "numbered bullet lead-in tolerated",
+			message: "1. Intended manifest: {\"schemaVersion\":1,\"verdict\":\"failed\"}",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "failed"},
+		},
+		{
+			name:    "blockquote lead-in tolerated",
+			message: "> > Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\"}",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed"},
+		},
+		{
+			name:    "bold label tolerated",
+			message: "**Intended manifest:** {\"schemaVersion\":1,\"verdict\":\"passed\"}",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "passed"},
+		},
+		{
+			name:    "inline-code label tolerated",
+			message: "  `Intended manifest: {\"schemaVersion\":1,\"verdict\":\"blocked\",\"blockedReason\":\"no access\"}`",
+			want:    &TurnManifest{SchemaVersion: 1, Verdict: "blocked", BlockedReason: "no access"},
+		},
+		{
+			name:    "unicode case-fold lookalike label is not a manifest",
+			message: "Intended manifeſt: {\"schemaVersion\":1,\"verdict\":\"passed\"}",
+			wantErr: true,
 		},
 		{
 			name:    "full inline manifest with PR and sha",

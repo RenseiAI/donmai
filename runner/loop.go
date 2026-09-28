@@ -1304,14 +1304,24 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// provider capability; a no-op when nothing was buffered. Runs BEFORE
 	// steering so a memory-driven follow-up turn can itself produce the PR
 	// that makes steering unnecessary.
-	// followUp is the observation of the latest follow-up turn (memory inject
-	// or steering), when one ran; step 11·M re-resolves the manifest after it.
-	var followUp *streamObservation
+	// 11·M (per follow-up turn). After EACH follow-up turn (memory inject,
+	// then steering) re-resolve the turn verdict against it: the agent may
+	// write its manifest during the follow-up, the follow-up's terminal
+	// message (often just the PR URL steering asked for) has replaced
+	// res.Summary, and its own anchored marker may lower — or, with no
+	// manifest, replace — the verdict (see reapplyTurnManifest). Applying it
+	// per turn lets a memory-inject follow-up that declines suppress steering.
+	followUpRan := false
+	applyFollowUp := func(tail streamObservation) {
+		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, tail, manifestBeforeFollowUp)
+		manifestBeforeFollowUp = stampManifest(runnerStatePath)
+		followUpRan = true
+	}
 	if runtimeInjectEnabled && !streamRes.blocked {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
-			followUp = &injRes
+			applyFollowUp(injRes)
 		}
 	}
 
@@ -1338,20 +1348,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			// Re-consume any events the steering inject/resume produced.
 			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
-			followUp = &tailRes
+			applyFollowUp(tailRes)
 		}
 	}
 
-	// 11·M. Re-resolve the turn verdict after a follow-up turn. The agent may
-	// write its manifest during the follow-up turn, and the follow-up's
-	// terminal message (often just the PR URL steering asked for) has replaced
-	// res.Summary. The newest signal wins: a manifest the follow-up produced,
-	// else the follow-up's own WORK_RESULT verdict over a stale earlier
-	// manifest, else the earlier manifest (see reapplyTurnManifest). A blocked
-	// verdict takes the 10a fork — but only when the runner has recorded no
-	// failure of its own: an agent-authored decline never relabels a crash.
-	if followUp != nil {
-		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, *followUp, manifestBeforeFollowUp)
+	// 11·M (blocked fork). A blocked verdict a follow-up turn produced takes
+	// the 10a fork — but only when the runner has recorded no failure of its
+	// own: an agent-authored decline never relabels a crash.
+	if followUpRan {
 		if res.FailureMode == "" && classifyBlocked(res, streamRes) {
 			r.logger.Info("agent blocked: deliberate decline detected after follow-up turn",
 				"sessionId", qw.SessionID,
@@ -1653,15 +1657,13 @@ type streamObservation struct {
 	commentPosted   bool
 	issueUpdated    bool
 	subIssuesMade   bool
-	workResult      string
-	// lineVerdict is the latest verdict from a LINE-ANCHORED WORK_RESULT
-	// marker (passed|failed|blocked) — the same anchoring rule the platform's
-	// sentinel reader applies. workResult above is the historical unanchored
-	// scrape; lineVerdict is what may supersede a stale manifest (step 11·M),
-	// so a marker merely quoted mid-sentence can never override one.
-	lineVerdict string
-	cost        *agent.CostData
-	providerID  string
+	// workResult is this stream's passed|failed|unknown verdict: the one
+	// carried by the LATEST assistant message with a line-anchored marker
+	// (the FIRST anchored marker within that message wins — see
+	// scanVerdict). A blocked verdict sets blocked instead and clears it.
+	workResult string
+	cost       *agent.CostData
+	providerID string
 	// lastAssistantText is the most recent non-empty assistant message
 	// observed on this stream. It is the summary fallback for providers
 	// whose terminal ResultEvent carries no Message (codex's
@@ -1693,6 +1695,15 @@ type streamObservation struct {
 	// generic FailureTimeout (ctx-cancelled) branch, so a wedged session
 	// is routed distinctly from a deadline expiry.
 	noProgress bool
+}
+
+// verdict is the stream's single verdict: "blocked" when its latest anchored
+// marker declined, else its passed|failed|unknown work-result, else "".
+func (o streamObservation) verdict() string {
+	if o.blocked {
+		return "blocked"
+	}
+	return o.workResult
 }
 
 // applyTo merges the observation into a Result envelope. Idempotent
@@ -1894,22 +1905,25 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
 		}
-		if marker := scanWorkResult(e.Text); marker != "" {
-			obs.workResult = marker
-		}
-		if verdict := scanLineVerdict(e.Text); verdict != "" {
-			obs.lineVerdict = verdict
-		}
-		// Structural blocked-agent signal: a deliberate decline the agent
-		// announced via "WORK_RESULT:blocked" or "AGENT_BLOCKED: <reason>".
-		// Captured here so the post-stream classifier can fork to
+		// One verdict per message, from its FIRST line-anchored marker
+		// (scanVerdict); the latest message that carries one decides the
+		// stream's verdict. "blocked" — "WORK_RESULT: blocked" or
+		// "AGENT_BLOCKED: <reason>" — is a deliberate decline, captured on
+		// obs.blocked so the post-stream classifier forks to
 		// FailureAgentBlocked instead of funneling a reasoned refusal as a
 		// crash/silent-exit (which would trigger backstop + re-dispatch).
-		if reason, ok := scanBlocked(e.Text); ok {
+		switch verdict, reason := scanVerdict(e.Text); verdict {
+		case "":
+		case "blocked":
 			obs.blocked = true
-			if reason != "" && obs.blockedReason == "" {
+			obs.workResult = ""
+			if reason != "" {
 				obs.blockedReason = reason
 			}
+		default:
+			obs.workResult = verdict
+			obs.blocked = false
+			obs.blockedReason = ""
 		}
 		if u := scanPRURL(e.Text); u != "" {
 			obs.pullRequestURL = u
@@ -2504,39 +2518,73 @@ func mergeMCPServers(defaults, cardServers []agent.MCPServerConfig) []agent.MCPS
 	return merged
 }
 
-// scanWorkResult scans the assistant text for the WORK_RESULT marker
-// the platform expects (per F.0.1 §1). Returns "passed" / "failed" /
-// "unknown" / "" matching the wire shape.
+// scanVerdict returns the verdict of the FIRST line-anchored marker in text —
+// "passed", "failed", "unknown" or "blocked" — plus the reason of an
+// `AGENT_BLOCKED: <reason>` line, or ("", "") when text carries none.
 //
-// The marker counts only when it is LINE-ANCHORED — at the start of a line,
-// modulo leading blanks and an optional opening HTML-comment fence
-// ("WORK_RESULT:passed", "  WORK_RESULT: failed", "<!-- WORK_RESULT:passed -->")
-// — the same rule the platform's sentinel reader applies. A marker merely
-// quoted in prose ("I am not claiming WORK_RESULT: passed") is ignored, so it
-// can never set the verdict that drives the post-session transition of
-// result-sensitive work. When a text carries several anchored markers the
-// LAST one wins (the agent's final word).
-func scanWorkResult(text string) string {
-	return lastAnchoredVerdict(workResultRE, text)
-}
-
-// scanLineVerdict returns the verdict of the LAST line-anchored WORK_RESULT
-// marker in text ("passed", "failed" or "blocked"), or "" when none. A marker
-// counts only at the start of a line (modulo leading blanks and an optional
-// opening HTML-comment fence), so prose that merely mentions a marker is
-// ignored.
-func scanLineVerdict(text string) string {
-	return lastAnchoredVerdict(workResultLineRE, text)
-}
-
-// lastAnchoredVerdict returns the lower-cased verdict captured by the LAST
-// match of a line-anchored marker regex in text, or "" when none matches.
-func lastAnchoredVerdict(re *regexp.Regexp, text string) string {
-	matches := re.FindAllStringSubmatch(text, -1)
-	if len(matches) == 0 {
-		return ""
+// A marker counts only at the start of a line, modulo leading blanks and an
+// optional opening HTML-comment fence, with the verdict on the SAME line and
+// followed by a word boundary:
+//
+//	WORK_RESULT:passed    WORK_RESULT: failed    <!-- WORK_RESULT:blocked -->
+//	AGENT_BLOCKED: spec is ambiguous    <!-- AGENT_BLOCKED: no repo access -->
+//
+// This is the platform sentinel reader's rule, including FIRST-match-wins
+// within one message, so the runner and the platform never disagree about the
+// same text. A marker quoted in prose ("I am not claiming WORK_RESULT: passed")
+// is ignored, so it can never set the verdict that drives the post-session
+// transition of result-sensitive work, nor reclassify a successful session as
+// a decline. Matching is case-insensitive over ASCII only (see asciiLower).
+func scanVerdict(text string) (verdict, reason string) {
+	loc := workResultRE.FindStringSubmatchIndex(asciiLower(text))
+	if loc == nil {
+		return "", ""
 	}
-	return strings.ToLower(matches[len(matches)-1][1])
+	if loc[2] >= 0 {
+		return asciiLower(text[loc[2]:loc[3]]), ""
+	}
+	reason = strings.TrimSpace(text[loc[4]:loc[5]])
+	// Drop a trailing HTML-comment fence so a marker emitted as
+	// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
+	return "blocked", strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
+}
+
+// scanWorkResult returns the passed|failed|unknown verdict scanVerdict reads
+// from text, or "" (a blocked verdict is not a QA work-result; it drives
+// FailureAgentBlocked through scanBlocked instead).
+func scanWorkResult(text string) string {
+	if verdict, _ := scanVerdict(text); verdict != "blocked" {
+		return verdict
+	}
+	return ""
+}
+
+// scanBlocked reports whether scanVerdict reads a blocked verdict from text —
+// "WORK_RESULT: blocked" (no reason) or "AGENT_BLOCKED: <reason>" (reason up
+// to the end of the line) — and returns the reason.
+func scanBlocked(text string) (string, bool) {
+	verdict, reason := scanVerdict(text)
+	return reason, verdict == "blocked"
+}
+
+// asciiLower lower-cases ASCII letters only, leaving every other byte — and
+// therefore every byte offset — unchanged. Marker and label regexes are
+// written in lower case and matched against this form instead of using (?i),
+// whose Unicode case folding would accept lookalikes such as "paſſed" (long
+// s) or a Kelvin-sign "K".
+func asciiLower(text string) string {
+	for i := 0; i < len(text); i++ {
+		if c := text[i]; 'A' <= c && c <= 'Z' {
+			b := []byte(text)
+			for j := i; j < len(b); j++ {
+				if 'A' <= b[j] && b[j] <= 'Z' {
+					b[j] += 'a' - 'A'
+				}
+			}
+			return string(b)
+		}
+	}
+	return text
 }
 
 // scanPRURL extracts a github.com/<owner>/<repo>/pull/<number> URL
@@ -2569,67 +2617,29 @@ func classifyBlocked(res *Result, obs streamObservation) bool {
 	return true
 }
 
-// scanBlocked detects a deliberate agent decline in assistant text and
-// returns (reason, true) when found. Two marker forms are recognised,
-// both provider-generic (the agent prints them as plain text):
-//
-//   - "WORK_RESULT:blocked"          — the verdict-marker form, no reason.
-//   - "AGENT_BLOCKED: <reason text>" — captures the reason up to EOL.
-//
-// A blocked signal is a reasoned refusal (ambiguous spec, unmet
-// preconditions), NOT a crash. The runner forks to FailureAgentBlocked so
-// the deliberate decline is not funneled as a failure that triggers the
-// empty-branch backstop or a re-dispatch into the same wall.
-//
-// Both markers MUST appear at the start of a line (modulo leading
-// whitespace and an optional opening HTML-comment fence) to count. This
-// mirrors the verdict convention agents are instructed to emit on their
-// final line and prevents a false positive when a narrative turn merely
-// quotes or discusses the marker mid-sentence (e.g. "I'd emit
-// AGENT_BLOCKED if I were stuck, but I'm not"). Without the anchor a
-// successful NO-PR-by-design session (research, qa, acceptance, …) whose
-// prose mentioned the marker would be reclassified as a decline.
-func scanBlocked(text string) (string, bool) {
-	if m := agentBlockedRE.FindStringSubmatch(text); m != nil {
-		reason := strings.TrimSpace(m[1])
-		// Drop a trailing HTML-comment fence so a marker emitted as
-		// "<!-- AGENT_BLOCKED: reason -->" yields just the reason.
-		reason = strings.TrimSpace(strings.TrimSuffix(reason, "-->"))
-		return reason, true
-	}
-	if workResultBlockedRE.MatchString(text) {
-		return "", true
-	}
-	return "", false
-}
-
 var (
-	workResultRE = regexp.MustCompile(workResultLinePrefix + `(passed|failed|unknown)`)
+	workResultRE = regexp.MustCompile(verdictMarkerPattern)
 	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
-	// workResultBlockedRE matches the verdict-marker decline form. Kept
-	// separate from workResultRE so the existing passed/failed/unknown
-	// transition mapping is untouched (blocked is an outcome, not a QA
-	// verdict the Linear status mapper should consume). Anchored to
-	// line-start (with an optional HTML-comment fence) so it fires only on
-	// a deliberate verdict line, not on a quote of the marker in prose.
-	workResultBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?WORK_RESULT[:\s]+blocked`)
-	// agentBlockedRE captures the reason from "AGENT_BLOCKED: <reason>"
-	// up to the end of the line. Anchored the same way as
-	// workResultBlockedRE to avoid mid-sentence false positives.
-	agentBlockedRE = regexp.MustCompile(`(?im)^\s*(?:<!--\s*)?AGENT_BLOCKED[:\s]+([^\r\n]+)`)
 )
 
-// workResultLinePrefix is the single anchoring rule for every WORK_RESULT
-// verdict read: start of a line, optional blanks and HTML-comment fence, then
-// `WORK_RESULT:`, `WORK_RESULT: ` or `WORK_RESULT ` with the verdict on the
-// SAME line (the separator never crosses a newline). Both workResultRE (the
-// wire verdict: passed|failed|unknown) and workResultLineRE (the follow-up
-// override: passed|failed|blocked) are built from it.
-const workResultLinePrefix = `(?im)^[ \t]*(?:<!--[ \t]*)?WORK_RESULT(?:[ \t]*:[ \t]*|[ \t]+)`
+// lineStartPrefix anchors every structured line the runner reads out of
+// assistant text — verdict markers here and the `Intended manifest:` label
+// (manifest.go): start of a line, then optional blanks. Patterns built on it
+// are written in lower case and matched against asciiLower(text).
+const lineStartPrefix = `(?m)^[ \t]*`
 
-// workResultLineRE is the line-anchored verdict marker the step 11·M
-// override reads (passed|failed|blocked).
-var workResultLineRE = regexp.MustCompile(workResultLinePrefix + `(passed|failed|blocked)`)
+// markerSeparator joins a marker keyword to its value on the SAME line:
+// `KEY:value`, `KEY: value` or `KEY value`. It never crosses a line break.
+const markerSeparator = `(?:[ \t]*:[ \t]*|[ \t]+)`
+
+// verdictMarkerPattern is the single line-anchored marker rule (see
+// scanVerdict). Group 1 captures a WORK_RESULT verdict; group 2 captures the
+// reason of an AGENT_BLOCKED line (possibly empty). Both keywords must end at
+// a word boundary, so `WORK_RESULT: passedly` and `AGENT_BLOCKED_X` do not
+// count.
+const verdictMarkerPattern = lineStartPrefix + `(?:<!--[ \t]*)?(?:` +
+	`work_result` + markerSeparator + `(passed|failed|blocked|unknown)\b` +
+	`|agent_blocked\b(?:` + markerSeparator + `)?([^\r\n]*))`
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.
