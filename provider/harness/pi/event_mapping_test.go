@@ -98,3 +98,75 @@ func TestMapEvent_ResponseCommand(t *testing.T) {
 		})
 	}
 }
+
+// TestMapEvent_MessageEndProviderError pins that an assistant message which
+// ended on a provider error (stopReason "error") surfaces the provider-error
+// observation after any buffered text, and that every other stop reason does
+// not.
+func TestMapEvent_MessageEndProviderError(t *testing.T) {
+	t.Parallel()
+
+	providerError := func(detail string) agent.Event {
+		return agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: detail, Raw: "line"}
+	}
+	tests := []struct {
+		name       string
+		buffered   string
+		message    map[string]any
+		wantEvents []agent.Event
+	}{
+		{
+			name:       "error with the provider's message and no text",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"},
+			wantEvents: []agent.Event{providerError("503 Service Unavailable")},
+		},
+		{
+			name:     "error after partial text keeps the text first",
+			buffered: "Let me check",
+			message:  map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "504 Gateway Timeout"},
+			wantEvents: []agent.Event{
+				agent.AssistantTextEvent{Text: "Let me check", Raw: "line"},
+				providerError("504 Gateway Timeout"),
+			},
+		},
+		{
+			name:       "error without a message still names a provider error",
+			message:    map[string]any{"role": "assistant", "stopReason": "error"},
+			wantEvents: []agent.Event{providerError("model provider error")},
+		},
+		{
+			name:       "a clean stop is only text",
+			buffered:   "Done.",
+			message:    map[string]any{"role": "assistant", "stopReason": "stop"},
+			wantEvents: []agent.Event{agent.AssistantTextEvent{Text: "Done.", Raw: "line"}},
+		},
+		{
+			name:    "an aborted message is not a provider error",
+			message: map[string]any{"role": "assistant", "stopReason": "aborted"},
+		},
+		{
+			name:    "a non-assistant message is ignored",
+			message: map[string]any{"role": "toolResult", "stopReason": "error"},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := &mapperState{initEmitted: true}
+			st.textBuf.WriteString(tt.buffered)
+			ev := rawEvent{Type: "message_end", Fields: map[string]any{"message": tt.message}, Line: []byte("line")}
+			gotEvents, gotTerm := mapEvent(ev, st)
+			if gotTerm {
+				t.Errorf("terminal = true; a message end never ends the turn")
+			}
+			if len(gotEvents) != len(tt.wantEvents) {
+				t.Fatalf("events = %#v, want %#v", gotEvents, tt.wantEvents)
+			}
+			for i := range gotEvents {
+				if gotEvents[i] != tt.wantEvents[i] {
+					t.Errorf("events[%d] = %#v, want %#v", i, gotEvents[i], tt.wantEvents[i])
+				}
+			}
+		})
+	}
+}

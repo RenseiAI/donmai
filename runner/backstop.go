@@ -181,7 +181,9 @@ func shouldBackstop(res *Result, workType string) bool {
 		return false
 	}
 	switch res.FailureMode {
-	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
+	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled, FailureContinuationsExhausted:
+		// FailureContinuationsExhausted: the turn still ended unfinished
+		// after every continuation; unfinished work is not published.
 		// FailureAgentBlocked: the agent deliberately declined — there is
 		// no in-progress work to commit, and an empty-branch backstop PR
 		// would misrepresent a reasoned refusal as abandoned work.

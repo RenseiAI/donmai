@@ -233,9 +233,9 @@ func TestAppendPullRequestCandidates_KeepsLatestPositionAndBound(t *testing.T) {
 // repository whose single turn is turn. Steering and the backstop are off, so
 // the session's pull request is exactly what the runner accepted from the
 // conversation, and teardown runs on success.
-func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueDir string, turn verdictScriptTurn) (*Result, *Runner) {
+func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueDir string, turn verdictScriptTurn) *Result {
 	t.Helper()
-	res, r := runScriptedSession(t, scriptedSession{
+	res, _ := runScriptedSession(t, scriptedSession{
 		workType:     "development",
 		skipSteering: true,
 		github:       "acme/widgets",
@@ -244,7 +244,7 @@ func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueD
 		teardown:     true,
 		turns:        []verdictScriptTurn{turn},
 	})
-	return res, r
+	return res
 }
 
 // TestRun_QuotedExamplePullRequestURLIsNotTheSessionsPR is the incident: the
@@ -254,7 +254,7 @@ func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueD
 func TestRun_QuotedExamplePullRequestURLIsNotTheSessionsPR(t *testing.T) {
 	lookup := &fakePullRequestLookup{}
 	rescueDir := t.TempDir()
-	res, _ := runPullRequestScenario(t, lookup, rescueDir, verdictScriptTurn{
+	res := runPullRequestScenario(t, lookup, rescueDir, verdictScriptTurn{
 		files: map[string]string{"notes/copied-prompt.md": "the work the agent was doing\n"},
 		text:  "Copied the prompt, which links " + quotedExamplePR + " as the example.",
 	})
@@ -282,7 +282,7 @@ func TestRun_OwnPullRequestIsAcceptedOverAQuotedExample(t *testing.T) {
 	lookup := &fakePullRequestLookup{heads: map[string]pullRequestHead{
 		own: {Number: 7, URL: own, HeadRefName: "agent/test-session-MANIFEST-FOLLOWUP"},
 	}}
-	res, _ := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
+	res := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
 		text: "Opened " + own + " following the example at " + quotedExamplePR + ".",
 	})
 	if res.PullRequestURL != own {
@@ -301,7 +301,7 @@ func TestRun_PullRequestOnAnotherBranchIsRejected(t *testing.T) {
 	lookup := &fakePullRequestLookup{heads: map[string]pullRequestHead{
 		theirs: {Number: 9, URL: theirs, HeadRefName: "feature/someone-else", HeadRefOid: strings.Repeat("c", 40)},
 	}}
-	res, _ := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
+	res := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
 		text: "Related work is in " + theirs + ".",
 	})
 	if res.PullRequestURL != "" {

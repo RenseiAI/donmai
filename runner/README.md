@@ -74,6 +74,7 @@ Verbatim from F.1.1 §5; classification owned by `runner/failure.go`.
 | `lost-ownership` | Heartbeat 3-strike threshold tripped (or worktree retry detected ownership loss). |
 | `timeout` | `ctx` cancelled before terminal event. |
 | `backstop-failed` | Stage 2 of tail recovery ran but could not push or open a PR. |
+| `continuations-exhausted` | A turn still ended unfinished (no turn-result manifest, no PR, no verdict) after the limit of continuation prompts. |
 
 ## Tail recovery
 
@@ -83,6 +84,24 @@ repository with the session's branch or commit as its head (read through
 `gh pr view`); a quoted example URL, or a pull request on another repository or
 branch, leaves the session without one, so the stages below still run. See
 `pull_request_verify.go`.
+
+Before either stage, the runner reads how the latest turn ended
+(`turn_continuation.go`), for work that owes a pull request:
+
+- A turn that stopped early — a clean end with no turn-result manifest, no
+  verified pull request and no verdict — gets a short "continue the task"
+  prompt instead of the pull request nudge.
+- A turn that ended on a model provider error (`agent.SystemSubtypeProviderError`,
+  which the pi harness emits for an assistant message with stopReason
+  `error`) is retried after a short wait, never nudged.
+- A blocked or failed verdict is never continued; a passed verdict without a
+  pull request gets the steering nudge, once.
+
+Continuations and retries are each bounded by `Options.TurnContinuationLimit`
+(default 3; negative disables them). A turn still unfinished at the bound fails
+the session (`continuations-exhausted`, or `provider-error` for retries), and
+the unfinished work is not published by steering or the backstop.
+`Result.TurnContinuations` carries the counts onto the terminal status.
 
 Two-stage post-completion recovery (F.0.1 §1):
 

@@ -771,6 +771,27 @@ type Result struct {
 	// content hash) instead of re-deriving it from the scalars. nil when no
 	// manifest was written. Additive — old platforms ignore it.
 	Manifest *TurnManifest `json:"manifest,omitempty"`
+
+	// TurnContinuations counts the follow-up prompts the runner sent because
+	// a turn ended before the work was finished. nil when none was needed.
+	// Additive — old platforms ignore it.
+	TurnContinuations *TurnContinuations `json:"turnContinuations,omitempty"`
+}
+
+// TurnContinuations records the runner-driven follow-up turns of a session
+// whose turns ended unfinished: "continue the task" prompts after a turn that
+// stopped early (no turn-result manifest, no pull request, no verdict) and
+// retries after a turn that ended on a model provider error.
+type TurnContinuations struct {
+	// Continued counts the continuation prompts sent.
+	Continued int `json:"continued"`
+	// Retried counts the retries sent after a provider error.
+	Retried int `json:"retried"`
+	// Limit is the bound the runner applied to each of the two counts.
+	Limit int `json:"limit"`
+	// Exhausted is set when a turn still ended unfinished once its count had
+	// reached Limit; the session then ended as failed.
+	Exhausted bool `json:"exhausted,omitempty"`
 }
 
 // TurnManifest is the deterministic turn-outcome the agent writes to

@@ -195,6 +195,23 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 	return rejected
 }
 
+// reportsOwnRepository reports whether turn carried a pull request URL on the
+// session's own repository, verified or not. Such a turn reported a pull
+// request — it did not stop early — even when the lookup could not confirm
+// it; the nudge and the backstop then settle it as they always have. A nil
+// verifier reports none.
+func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
+	if v == nil || v.repository == "" {
+		return false
+	}
+	for _, candidate := range turn.pullRequestCandidates {
+		if slug, _, err := parseCanonicalGitHubPullRequestURL(candidate); err == nil && normalizeGitHubRepositorySlug(slug) == v.repository {
+			return true
+		}
+	}
+	return false
+}
+
 // pullRequestRejection is one candidate the verifier refused, and why.
 type pullRequestRejection struct {
 	url    string

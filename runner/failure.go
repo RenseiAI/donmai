@@ -142,4 +142,12 @@ const (
 	// same harness: re-dispatching the identical stamp fails the same way.
 	// The typed code and dimension are in Result.Error.
 	FailureExecutionSecurity = "execution-security"
+
+	// FailureContinuationsExhausted indicates a turn still ended unfinished —
+	// no turn-result manifest, no pull request, no verdict — after the runner
+	// had sent its limit of "continue the task" prompts
+	// (runner/turn_continuation.go). The work is incomplete: steering and the
+	// backstop do not publish it, and Result.TurnContinuations records the
+	// counts.
+	FailureContinuationsExhausted = "continuations-exhausted"
 )

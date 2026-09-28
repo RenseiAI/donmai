@@ -314,6 +314,15 @@ type Options struct {
 	// legacy single selectors.
 	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
 
+	// TurnContinuationLimit bounds the runner-driven follow-up turns of work
+	// that owes a pull request (turn_continuation.go): how many "continue the
+	// task" prompts a turn that stopped early gets and, separately, how many
+	// retries a turn that ended on a model provider error gets. A turn still
+	// unfinished after that fails the session. Zero uses
+	// DefaultTurnContinuationLimit; negative disables both, leaving only the
+	// single pull request nudge.
+	TurnContinuationLimit int
+
 	// RescueDir is where teardown archives a session's unpublished work —
 	// uncommitted changes and commits no remote holds — as a patch before it
 	// deletes the workarea (<RescueDir>/<session>/<time>/<repository>.patch).
@@ -386,6 +395,11 @@ type Runner struct {
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
+	// turnContinuationLimit is Options.TurnContinuationLimit.
+	turnContinuationLimit int
+	// providerRetryBackoff spaces provider-error retries; nil uses
+	// defaultProviderRetryBackoff. Tests substitute a zero wait.
+	providerRetryBackoff func(attempt int) time.Duration
 	// pullRequestLookup reads a pull request's head for the session pull
 	// request verifier. Nil uses `gh pr view`; tests substitute a fake.
 	pullRequestLookup pullRequestHeadLookup
@@ -464,6 +478,7 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
 		rescueDir:                     opts.RescueDir,
+		turnContinuationLimit:         opts.TurnContinuationLimit,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
