@@ -258,7 +258,7 @@ func newDaemonUninstallCmd(bin string) *cobra.Command {
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 
-func newDaemonSetupCmd() *cobra.Command {
+func newDaemonSetupCmd(bin string) *cobra.Command {
 	var configPath string
 	cmd := &cobra.Command{
 		Use:   "setup",
@@ -280,6 +280,7 @@ func newDaemonSetupCmd() *cobra.Command {
 			cfg, err := daemonRuntime.RunSetupWizard(daemonRuntime.WizardOptions{
 				Existing:   existing,
 				ConfigPath: path,
+				BinaryName: bin,
 				Stdin:      os.Stdin,
 				Stdout:     cmd.OutOrStdout(),
 			})

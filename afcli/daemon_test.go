@@ -1116,7 +1116,7 @@ func TestDaemonSetupWritesDefaultConfig(t *testing.T) {
 	t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "1")
 
 	cfgPath := filepath.Join(t.TempDir(), "daemon.yaml")
-	cmd := newDaemonSetupCmd()
+	cmd := newDaemonSetupCmd("donmai")
 	buf := &bytes.Buffer{}
 	cmd.SetOut(buf)
 	cmd.SetErr(buf)

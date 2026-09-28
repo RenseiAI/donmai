@@ -41,6 +41,9 @@ type Options struct {
 	// ConfigPath is where to load / persist daemon.yaml. Defaults to
 	// DefaultConfigPath().
 	ConfigPath string
+	// BinaryName is the invoking binary used in first-run wizard guidance.
+	// Empty uses the standalone OSS default, donmai.
+	BinaryName string
 	// JWTPath is where to cache the runtime JWT. Defaults to
 	// DefaultJWTPath().
 	JWTPath string
@@ -949,6 +952,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		// First run — wizard or default.
 		cfg, err = RunSetupWizard(WizardOptions{
 			ConfigPath: d.opts.ConfigPath,
+			BinaryName: d.opts.BinaryName,
 			SkipWizard: d.opts.SkipWizard,
 		})
 		if err != nil {
