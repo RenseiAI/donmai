@@ -225,8 +225,8 @@ donmai host set capacity.maxConcurrentSessions <sessions>
 donmai host set capacity.poolMaxDiskGb <gb>
 ```
 
-Use `donmai host setup` to configure local registration and credentials before
-installing the service.
+Use `donmai host setup` to configure the work source, daemon settings, and
+resource limits before installing the service.
 
 ### `donmai governor`
 
