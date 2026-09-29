@@ -303,10 +303,14 @@ donmai linear list-sub-issues <parent-id>
 donmai linear list-sub-issue-statuses <parent-id>
 donmai linear update-sub-issue <id> [--state "..."] [--comment "..."]
 donmai linear check-blocked <issue-id>
-donmai linear list-backlog-issues --project "..."
-donmai linear list-unblocked-backlog --project "..."
+donmai linear list-backlog-issues --project "..." --statuses Backlog
+donmai linear list-unblocked-backlog --project "..." --statuses Backlog
 donmai linear create-blocker <source-issue-id> --title "..."
 ```
+
+The two backlog grooming helpers default to top-level `Icebox` issues. Pass
+`--statuses Backlog` to select the project's prioritized Backlog state; their
+default `--parents-only` filter excludes sub-issues.
 
 `get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
 strings for a child issue and explicit `null` values for a root issue.
