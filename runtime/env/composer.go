@@ -300,8 +300,10 @@ func IsRunnerOnly(key string) bool {
 		// The host control-API bearer token and its path override address
 		// the supervisor (daemon/CLI), never the workload. A spawned
 		// session that inherited either could call the host's mutating
-		// control routes; stripping them here keeps the credential with
-		// the operator's CLI, which reads it from the state-dir file.
+		// control routes; stripping them here keeps the credential out of
+		// the session's environment. The operator's CLI reads it from the
+		// state-dir file, which a same-user unsandboxed session can still
+		// read — env stripping does not isolate the file.
 		return true
 	case InjectedEnvKeysVar, GatewayUpstreamEnvKeysVar:
 		// Both address this package's own inherited-env filter, which is the

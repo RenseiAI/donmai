@@ -216,7 +216,7 @@ func TestControlAuth_MutatingRoutesRequireToken(t *testing.T) {
 	for _, key := range []string{afclient.ControlTokenEnv, afclient.ControlTokenFileEnv} {
 		for _, kv := range sessionEnv {
 			if strings.HasPrefix(kv, key+"=") {
-				t.Fatalf("composed worker env carries %s; sessions must never receive the control token", key)
+				t.Fatalf("composed worker env carries %s; the control token must not travel in a session's environment", key)
 			}
 		}
 	}

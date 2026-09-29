@@ -29,8 +29,9 @@ import (
 // applyDaemonControlAuth arms the host control-API gate on opts. The host
 // control API requires a bearer token on mutating routes: mint it into the
 // operator's state dir (0600) and hand it to both the server gate and the
-// CLI resolver so they agree; spawned sessions never receive it (runner-only
-// env, stripped from every worker environment).
+// CLI resolver so they agree. The token does not travel in a spawned
+// session's environment (runner-only env, stripped from every worker
+// environment); a same-user, unsandboxed session can still read the file.
 //
 // The gate is always required here, so it fails closed: when the token
 // cannot be minted or read (or its path does not resolve), the daemon still

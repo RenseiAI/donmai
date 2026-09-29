@@ -1798,6 +1798,14 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 // Filtering here rather than at the poll boundary keeps the rule where the
 // composition happens, and leaves exactly one author: OnPreSpawn, which runs
 // AFTER this function and is by definition the embedding daemon.
+//
+// The daemon's own inherited environment goes through the same runner-only
+// filter. The daemon process is the supervisor, so its environment can hold
+// supervisor controls: the host control-API token and its file override
+// (runtimeenv.IsRunnerOnly), attach controls, the session-shim and acceptance
+// settings. None of them may reach a session. Both spawn paths (direct and
+// shim) build their env here, so the parent filter covers both; the shim's
+// own launch contract is appended by the shim launcher afterwards.
 func composeEnv(parts ...map[string]string) []string {
 	merged := map[string]string{}
 	for _, p := range parts {
@@ -1805,7 +1813,7 @@ func composeEnv(parts ...map[string]string) []string {
 			merged[k] = v
 		}
 	}
-	parent := os.Environ()
+	parent := runtimeenv.FilterRunnerOnly(os.Environ())
 	out := make([]string, 0, len(parent)+len(merged))
 	out = append(out, parent...)
 	for k, v := range merged {

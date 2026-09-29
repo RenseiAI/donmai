@@ -51,7 +51,8 @@ func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
 
 // withControlToken attaches the operator's control token (best-effort) to
 // an outbound daemon config. The token file lives in the operator's state
-// dir; spawned sessions never see it because the env names are runner-only.
+// dir; the env names are runner-only, so the token does not travel in a
+// spawned session's environment.
 // The resolver lives here — not in afclient — because this package owns
 // the CLI process environment and afclient stays env-free by policy.
 func withControlToken(cfg afclient.DaemonConfig) afclient.DaemonConfig {

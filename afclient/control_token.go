@@ -7,10 +7,16 @@
 // GET routes stay open so status dashboards, spawned workers fetching their
 // own session detail, and liveness probes keep working without a credential.
 //
-// Sessions spawned by the daemon never receive this token: the env names
-// below are runner-only and are stripped from every worker environment, and
-// the daemon states only the control URL — never the token — in
-// daemon-owned spawn env.
+// What the token does and does not protect: the gate refuses unauthenticated
+// mutating calls (a session or tool calling the control API without the
+// token, another local user who cannot read the file). The token does not
+// travel in a spawned session's environment: the env names below are
+// runner-only and are stripped from every worker environment, including the
+// daemon's own inherited environment, and the daemon states only the control
+// URL in daemon-owned spawn env. It does NOT stop a same-user, unsandboxed
+// session that reads the token file directly — file permissions cannot
+// separate processes running as the same user. Hiding the state dir from
+// sessions is the job of the execution sandbox, and is follow-up work.
 //
 // This file intentionally takes explicit paths and never reads the process
 // environment: path resolution (state dir, env overrides) belongs to the
@@ -77,6 +83,10 @@ func EnsureControlToken(path string) (string, error) {
 	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		return "", fmt.Errorf("create control token dir: %w", err)
 	}
+	// Mode 0600 keeps the token from other local users. It does not keep it
+	// from a session running as this same user without a sandbox: such a
+	// session can read this file. Isolating the state dir from sessions is
+	// the execution sandbox's job, not this file mode's.
 	tmp := path + ".tmp"
 	if err := os.WriteFile(tmp, []byte(token+"\n"), 0o600); err != nil {
 		return "", fmt.Errorf("write control token: %w", err)
