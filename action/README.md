@@ -1,7 +1,7 @@
 # Donmai native drift check
 
 Analyze a pull request's complete diff without checking out or running its code.
-The Action downloads Donmai **v0.72.47**, verifies the archive against a SHA-256
+The Action downloads Donmai **v0.72.53**, verifies the archive against a SHA-256
 embedded in the Action, and runs `donmai arch assess --require-diff`.
 It produces a job summary, a check annotation, and (when permitted) a PR comment.
 
@@ -11,10 +11,10 @@ Save these three lines as
 ```yaml
 on: pull_request
 permissions: {contents: read, pull-requests: write}
-jobs: {drift: {runs-on: ubuntu-latest, steps: [{uses: RenseiAI/donmai-drift-action@729b5d1fe1525eabf21517cf9c43be5f0a6fc7d6}]}}
+jobs: {drift: {runs-on: ubuntu-latest, steps: [{uses: RenseiAI/donmai-drift-action@a52d98dcee713278d505c482f3975695bf233e8e}]}}
 ```
 
-The example uses the reviewed **full commit SHA of v1.0.0** for a stable,
+The example uses the reviewed **full commit SHA of v1.0.1** for a stable,
 reviewable pin. The executable has its own independent version/checksum pin;
 changing the Action ref does not select an arbitrary executable version.
 No checkout step, model account, server, daemon, or additional credential is needed.

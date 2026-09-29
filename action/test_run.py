@@ -1,4 +1,4 @@
-"""Run with DONMAI_ACTION_TEST_BINARY pointing to verified Donmai v0.72.47."""
+"""Run with DONMAI_ACTION_TEST_BINARY pointing to verified Donmai v0.72.53."""
 import contextlib
 import io
 import json
@@ -176,7 +176,7 @@ class ReleasedCLI(unittest.TestCase):
     def setUpClass(cls):
         binary = os.environ.get("DONMAI_ACTION_TEST_BINARY")
         if not binary or not Path(binary).is_file():
-            raise RuntimeError("Set DONMAI_ACTION_TEST_BINARY to verified Donmai v0.72.47; real CLI controls are mandatory")
+            raise RuntimeError("Set DONMAI_ACTION_TEST_BINARY to verified Donmai v0.72.53; real CLI controls are mandatory")
         cls.binary = Path(binary).resolve()
 
     def assess(self, policy="none", fail_diff=False, missing_patch=False):
@@ -184,6 +184,7 @@ class ReleasedCLI(unittest.TestCase):
             directory = Path(temporary)
             # Metadata and patch content are hostile data, not shell fragments.
             metadata = {"title": "`@everyone`\n::error::forged", "body": "<script>bad</script>",
+                        "changedFiles": 1,
                         "files": [{"path": "src/auth/entry.go", "additions": 1, "deletions": 0}]}
             diff = "diff --git a/src/auth/entry.go b/src/auth/entry.go\n--- a/src/auth/entry.go\n+++ b/src/auth/entry.go\n@@ -0,0 +1 @@\n+package auth\n"
             fixture = directory / "fixture-gh"

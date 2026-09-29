@@ -16,12 +16,12 @@ import tempfile
 import urllib.error
 import urllib.request
 
-VERSION = "0.72.47"
+VERSION = "0.72.53"
 ARCHIVES = {
-    ("Linux", "x86_64"): ("linux_amd64", "0c4318c0ebfe6f1f27103c2bbb2191cf5eba9f7db1806c4683598a7b8a562f7b"),
-    ("Linux", "aarch64"): ("linux_arm64", "f460d3d7e45ff447973ab407b116faff69dc9bfe8f745dddd1e47d8a40a73b8d"),
-    ("Darwin", "x86_64"): ("darwin_amd64", "da96669454559f830867cad1ee9c94afd9bfb9a1d5a70a8178e1fbdb4c5e3c70"),
-    ("Darwin", "arm64"): ("darwin_arm64", "c9026a30f61dfc1151546d9007061ae381f9c64835c87f96856ee7170650b049"),
+    ("Linux", "x86_64"): ("linux_amd64", "f0446e55d5f71068b116606dcbd89de4f18bda482b7c791edca17b207049c87c"),
+    ("Linux", "aarch64"): ("linux_arm64", "6fa53176ec361a7318cde1240a27365a2eec8d355fd782aa7102d9c34d1079c7"),
+    ("Darwin", "x86_64"): ("darwin_amd64", "fc736500f92013bbc5efc90eff3f2fbd8983dbeb8cf800c6139333c522048d95"),
+    ("Darwin", "arm64"): ("darwin_arm64", "f53601aa7c42cffb2b4e820d9d0ebbd93baadfcf565eba4a32544d2c85efe095"),
 }
 MARKER = "<!-- donmai-native-drift-check -->"
 LIMIT = 256 * 1024 * 1024
