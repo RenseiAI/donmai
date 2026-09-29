@@ -70,3 +70,41 @@ func TestDaemonClient_GetSessions_Error(t *testing.T) {
 		t.Fatal("want error on 500, got nil")
 	}
 }
+
+// TestDaemonClient_GetSessions_DisplayMetadata decodes the additive session
+// display identity (loop driver, resolved model, vendor, workflow) the
+// daemon projects onto its session handles. An old daemon omits the fields;
+// they decode as empty and the reader layer renders them as unknown.
+func TestDaemonClient_GetSessions_DisplayMetadata(t *testing.T) {
+	t.Parallel()
+	fixture := []DaemonSessionHandle{
+		{
+			SessionID: "sess-1", State: "running",
+			Harness: "loop-driver", Model: "model-id",
+			ModelProvider: "vendor", WorkType: "development",
+		},
+		{SessionID: "sess-old", State: "running"},
+	}
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/daemon/sessions" {
+			http.NotFound(w, r)
+			return
+		}
+		w.Header().Set("Content-Type", "application/json")
+		_ = json.NewEncoder(w).Encode(fixture)
+	}))
+	t.Cleanup(srv.Close)
+
+	got, err := NewDaemonClientFromURL(srv.URL).GetSessions()
+	if err != nil {
+		t.Fatalf("GetSessions: %v", err)
+	}
+	h := got[0]
+	if h.Harness != "loop-driver" || h.Model != "model-id" ||
+		h.ModelProvider != "vendor" || h.WorkType != "development" {
+		t.Errorf("display metadata not decoded: %+v", h)
+	}
+	if o := got[1]; o.Harness != "" || o.Model != "" || o.ModelProvider != "" || o.WorkType != "" {
+		t.Errorf("old-daemon handle must decode absent fields as empty: %+v", o)
+	}
+}

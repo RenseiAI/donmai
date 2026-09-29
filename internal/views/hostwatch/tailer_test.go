@@ -226,6 +226,79 @@ func TestTailer_PartialLineCarried(t *testing.T) {
 	}
 }
 
+func TestTailer_ScrollBackFlagsHistoryAsReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	writeEvents(t, path,
+		agent.InitEvent{SessionID: "p"},
+		agent.ToolUseEvent{ToolName: "Bash", Input: map[string]any{"command": "x"}},
+	)
+	// Scroll-back mode reads pre-existing history: every event is replay.
+	tl := NewTailer("s1", path, false, fixedClock())
+	got, err := tl.Poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(got) != 2 {
+		t.Fatalf("want 2 history events, got %d", len(got))
+	}
+	for i, e := range got {
+		if !e.Replay {
+			t.Errorf("history event %d must be Replay", i)
+		}
+	}
+}
+
+func TestTailer_SteadyStateAppendsAreLive(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	writeEvents(t, path, agent.InitEvent{SessionID: "p"})
+	tl := NewTailer("s1", path, true /*startAtEnd*/, fixedClock())
+	if got, _ := tl.Poll(); len(got) != 0 {
+		t.Fatalf("first poll must skip history, got %d", len(got))
+	}
+	writeEvents(t, path, agent.AssistantTextEvent{Text: "hi"})
+	got, err := tl.Poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 live event, got %d", len(got))
+	}
+	if got[0].Replay {
+		t.Error("post-attach append must read as live, not replay")
+	}
+}
+
+func TestTailer_TruncatedContentReadsAsReplay(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "events.jsonl")
+	writeEvents(t, path,
+		agent.InitEvent{SessionID: "p"},
+		agent.ToolUseEvent{ToolName: "Bash", Input: map[string]any{"command": "a-long-command-to-grow-the-file"}},
+	)
+	tl := NewTailer("s1", path, true /*startAtEnd*/, fixedClock())
+	if got, _ := tl.Poll(); len(got) != 0 {
+		t.Fatalf("first poll must skip history, got %d", len(got))
+	}
+	// A reused path is a new incarnation: shrink below the consumed
+	// offset so the tailer re-reads from the top as history.
+	if err := os.WriteFile(path, nil, 0o600); err != nil {
+		t.Fatalf("truncate: %v", err)
+	}
+	writeEvents(t, path, agent.SystemEvent{Subtype: "ok"})
+	got, err := tl.Poll()
+	if err != nil {
+		t.Fatalf("poll: %v", err)
+	}
+	if len(got) != 1 {
+		t.Fatalf("want 1 re-read event, got %d", len(got))
+	}
+	if !got[0].Replay {
+		t.Error("reused-path content must read as replay, not live")
+	}
+}
+
 func TestTailer_MalformedLineSurfacesError(t *testing.T) {
 	dir := t.TempDir()
 	path := filepath.Join(dir, "events.jsonl")

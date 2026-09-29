@@ -31,18 +31,46 @@ import (
 //   - otherwise the turn stopped early: it gets a short "continue the task"
 //     prompt.
 //
-// Continuations and retries are each bounded by Options.TurnContinuationLimit
-// (default DefaultTurnContinuationLimit). A turn that still ends unfinished
-// once its bound is reached fails the session — FailureContinuationsExhausted
-// for early stops, FailureProviderError for provider errors. No pull request
-// nudge follows, but the backstop still makes its open-PR attempt, so the
-// work is pushed and a real pull request the verifier could not confirm is
-// recovered; the session stays failed. The counts ride
+// Continuations are bounded by progress, not by count alone. A turn is
+// productive when its event stream carried at least one tool call
+// (agent.ToolUseEvent) — deterministic and harness-neutral. Whether a call
+// changed the workspace is not judged: tool names and their read or write
+// semantics differ per harness (a shell call can do either), so that test
+// would be a heuristic. A turn loop that only reads is bounded by the
+// ceiling below and by the session's own duration and token budgets, which
+// cover every follow-up turn.
+//
+//   - Options.TurnContinuationLimit (default DefaultTurnContinuationLimit)
+//     bounds the CONSECUTIVE continuation prompts whose turn made no tool
+//     call. Any productive turn — a continuation, a retry or the pull
+//     request nudge — resets that streak, so an agent that ends its turns
+//     early but keeps working is not cut off. A turn that stops early again
+//     once the streak has reached the bound fails the session as
+//     FailureContinuationsUnproductive.
+//   - Options.TurnContinuationCeiling (default DefaultTurnContinuationCeiling)
+//     bounds the continuation prompts in total, productive or not: a runaway
+//     guard. A turn that stops early again once that many were sent fails
+//     the session as FailureContinuationsCeiling.
+//   - Provider-error retries keep their own total bound,
+//     Options.TurnContinuationLimit, with no progress reset: a model provider
+//     that keeps failing is not retried longer because the agent made tool
+//     calls before each failure. Exhausting it fails the session as
+//     FailureProviderError.
+//
+// No pull request nudge follows an exhausted bound, but the backstop still
+// makes its open-PR attempt, so the work is pushed and a real pull request
+// the verifier could not confirm is recovered; the session stays failed.
+// The counts, the unproductive streak and both bounds ride
 // Result.TurnContinuations onto the terminal status.
 
-// DefaultTurnContinuationLimit is the per-kind follow-up bound applied when
-// Options.TurnContinuationLimit is zero.
+// DefaultTurnContinuationLimit is the bound applied when
+// Options.TurnContinuationLimit is zero: consecutive continuation prompts
+// whose turn made no tool call, and, separately, provider-error retries.
 const DefaultTurnContinuationLimit = 3
+
+// DefaultTurnContinuationCeiling is the bound on continuation prompts in
+// total applied when Options.TurnContinuationCeiling is zero.
+const DefaultTurnContinuationCeiling = 50
 
 // defaultProviderRetryBackoff spaces the retries after a provider error. The
 // harness has usually retried the model call itself before giving up, so the
@@ -100,20 +128,45 @@ const (
 	tailExhausted
 )
 
+// followUpBound names the bound a session ran out of; zero while none has.
+type followUpBound int
+
+const (
+	// boundUnproductive: too many consecutive continuation turns made no
+	// tool call.
+	boundUnproductive followUpBound = iota + 1
+	// boundCeiling: the continuation prompts in total reached the ceiling.
+	boundCeiling
+	// boundRetries: the provider-error retries reached their bound.
+	boundRetries
+)
+
 // turnFollowUps is one session's runner-driven follow-up state.
 type turnFollowUps struct {
-	limit     int
+	// limit bounds the unproductive streak and, separately, the retries.
+	limit int
+	// ceiling bounds the continuation prompts in total; zero is no ceiling.
+	ceiling   int
 	continued int
-	retried   int
-	steered   bool
-	// exhausted records the ending that ran out of follow-ups.
+	// unproductive is the streak of consecutive continuation prompts whose
+	// turn made no tool call and ended unfinished; a productive turn of any
+	// kind resets it.
+	unproductive int
+	retried      int
+	steered      bool
+	// last is the follow-up that produced the latest turn; tailDone while
+	// the latest turn is the session's own first turn.
+	last tailStep
+	// exhausted records that a bound ran out; bound says which.
 	exhausted     bool
-	exhaustedBy   turnEnding
+	bound         followUpBound
 	providerError string
 }
 
-// newTurnFollowUps resolves the configured bound: zero is the default and a
-// negative value disables continuations and retries.
+// newTurnFollowUps resolves the configured bounds. For each, zero is the
+// default; a negative limit disables continuations and retries, and a
+// negative ceiling leaves continuations bounded only by the unproductive
+// streak and the session's own budgets.
 func (r *Runner) newTurnFollowUps() *turnFollowUps {
 	limit := r.turnContinuationLimit
 	switch {
@@ -122,26 +175,55 @@ func (r *Runner) newTurnFollowUps() *turnFollowUps {
 	case limit < 0:
 		limit = 0
 	}
-	return &turnFollowUps{limit: limit}
+	ceiling := r.turnContinuationCeiling
+	switch {
+	case ceiling == 0:
+		ceiling = DefaultTurnContinuationCeiling
+	case ceiling < 0:
+		ceiling = 0
+	}
+	return &turnFollowUps{limit: limit, ceiling: ceiling}
 }
 
-// next decides the next step for a turn that ended as ending. continuable is
-// false when this session cannot be continued at all (work that owes no pull
-// request, or a harness that takes no follow-up prompt); canSteer reports
-// whether the pull request nudge's own conditions hold.
-func (f *turnFollowUps) next(ending turnEnding, continuable, canSteer bool) tailStep {
+// record folds the latest turn into the unproductive streak: a turn that
+// made a tool call resets it, and a continuation turn that made none and
+// ended unfinished extends it. A retry or nudge turn without a tool call,
+// or a turn that left a result, leaves it as is.
+func (f *turnFollowUps) record(ending turnEnding, productive bool) {
+	switch {
+	case productive:
+		f.unproductive = 0
+	case f.last == tailContinue && ending != turnFinished:
+		f.unproductive++
+	}
+}
+
+// next decides the next step for a turn that ended as ending; productive
+// reports whether that turn made a tool call. continuable is false when
+// this session cannot be continued at all (work that owes no pull request,
+// or a harness that takes no follow-up prompt); canSteer reports whether
+// the pull request nudge's own conditions hold.
+func (f *turnFollowUps) next(ending turnEnding, productive, continuable, canSteer bool) tailStep {
+	f.record(ending, productive)
+	step := f.decide(ending, continuable, canSteer)
+	f.last = step
+	return step
+}
+
+func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) tailStep {
 	if continuable && f.limit > 0 {
 		switch ending {
 		case turnProviderError:
 			if f.retried >= f.limit {
-				f.exhausted, f.exhaustedBy = true, ending
-				return tailExhausted
+				return f.exhaust(boundRetries)
 			}
 			return tailRetry
 		case turnStoppedEarly:
-			if f.continued >= f.limit {
-				f.exhausted, f.exhaustedBy = true, ending
-				return tailExhausted
+			switch {
+			case f.unproductive >= f.limit:
+				return f.exhaust(boundUnproductive)
+			case f.ceiling > 0 && f.continued >= f.ceiling:
+				return f.exhaust(boundCeiling)
 			}
 			return tailContinue
 		}
@@ -152,20 +234,31 @@ func (f *turnFollowUps) next(ending turnEnding, continuable, canSteer bool) tail
 	return tailDone
 }
 
-// fail ends an exhausted session as failed, never relabelling a failure the
-// runner already recorded.
+func (f *turnFollowUps) exhaust(bound followUpBound) tailStep {
+	f.exhausted, f.bound = true, bound
+	return tailExhausted
+}
+
+// fail ends an exhausted session as failed with the failure mode of the
+// bound it ran out of, never relabelling a failure the runner already
+// recorded.
 func (f *turnFollowUps) fail(res *Result) {
 	if res.FailureMode != "" {
 		return
 	}
 	res.Status = "failed"
-	if f.exhaustedBy == turnProviderError {
+	const unfinished = "no turn-result manifest, no pull request and no verdict"
+	switch f.bound {
+	case boundRetries:
 		res.FailureMode = FailureProviderError
 		res.Error = fmt.Sprintf("the turn still ended on a model provider error after %d retries: %s", f.retried, f.providerError)
-		return
+	case boundCeiling:
+		res.FailureMode = FailureContinuationsCeiling
+		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts, the ceiling (%d in a row made no tool call): %s", f.continued, f.unproductive, unfinished)
+	default:
+		res.FailureMode = FailureContinuationsUnproductive
+		res.Error = fmt.Sprintf("the turn still ended unfinished after %d consecutive continuation prompts whose turns made no tool call (%d continuation prompts in total): %s", f.unproductive, f.continued, unfinished)
 	}
-	res.FailureMode = FailureContinuationsExhausted
-	res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts: no turn-result manifest, no pull request and no verdict", f.continued)
 }
 
 // report is the counts for Result.TurnContinuations; nil when no follow-up
@@ -174,7 +267,14 @@ func (f *turnFollowUps) report() *agent.TurnContinuations {
 	if f.continued == 0 && f.retried == 0 && !f.exhausted {
 		return nil
 	}
-	return &agent.TurnContinuations{Continued: f.continued, Retried: f.retried, Limit: f.limit, Exhausted: f.exhausted}
+	return &agent.TurnContinuations{
+		Continued:    f.continued,
+		Unproductive: f.unproductive,
+		Retried:      f.retried,
+		Limit:        f.limit,
+		Ceiling:      f.ceiling,
+		Exhausted:    f.exhausted,
+	}
 }
 
 // continuePrompt is the short prompt sent after a turn that stopped early.

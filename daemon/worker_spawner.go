@@ -1154,12 +1154,16 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	}
 
 	handle := SessionHandle{
-		SessionID:   spec.SessionID,
-		PID:         pid,
-		AcceptedAt:  s.opts.Now().UTC().Format(time.RFC3339),
-		State:       SessionRunning,
-		ProjectName: project.ID,
-		Repository:  spec.Repository,
+		SessionID:     spec.SessionID,
+		PID:           pid,
+		AcceptedAt:    s.opts.Now().UTC().Format(time.RFC3339),
+		State:         SessionRunning,
+		ProjectName:   project.ID,
+		Repository:    spec.Repository,
+		Harness:       spec.Harness,
+		Model:         spec.Model,
+		ModelProvider: spec.Company,
+		WorkType:      spec.WorkType,
 	}
 	// Publish the worktree path so GET /api/daemon/sessions is
 	// self-sufficient for a local reader (host-watch). The worker resolves

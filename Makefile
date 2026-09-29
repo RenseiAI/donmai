@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-podman ship release test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -34,6 +34,37 @@ run-status-mock: build
 
 test:
 	go test -race ./...
+
+# test-podman runs the suite in a Linux podman container, the way CI runs it.
+# On a macOS host with a live daemon, prefer it to `make test`: the daemon
+# install/uninstall tests cannot reach the host's launchd service there.
+test-podman:
+	./scripts/podman-go-test.sh -race ./...
+
+# ship and release are the fast lane (RELEASING.md "Fast lane"); both refuse
+# unless the organization FAST_LANE variable is on. ship lands this worktree's
+# branch on main as one gated, attested commit and never tags. release is the
+# once-a-day release train: it prepares the CHANGELOG, lands that commit the
+# same way, tags it and watches the publishers. DRY_RUN=1 checks and previews
+# either without changing anything.
+#
+# Values reach the script through the environment ("$$TITLE"), so the shell,
+# not make, quotes them: a title may hold quotes or backticks (make itself still
+# expands `$`, so write `$$` for a literal one).
+# Only values given on the make command line count: a VERSION or TITLE left
+# in the caller's environment never reaches the script.
+FAST_LANE_SH ?= ./scripts/fast-lane.sh
+fast_lane_arg = $(if $(filter command line,$(origin $(1))),$($(1)))
+FAST_LANE_COMMON = $(if $(filter 1 true yes,$(call fast_lane_arg,FULL)),--full) \
+	$(if $(filter 1 true yes,$(call fast_lane_arg,DRY_RUN)),--dry-run)
+
+ship:
+	$(FAST_LANE_SH) ship $(strip $(if $(call fast_lane_arg,TITLE),--title "$$TITLE") $(FAST_LANE_COMMON))
+
+release:
+	$(FAST_LANE_SH) release $(strip $(if $(call fast_lane_arg,VERSION),--version "$$VERSION") \
+		$(if $(call fast_lane_arg,TAGGER),--tagger "$$TAGGER") $(FAST_LANE_COMMON) \
+		$(if $(filter 1 true yes,$(call fast_lane_arg,NO_WATCH)),--no-watch))
 
 # test-tagged type-checks every build-tag-gated test file in the repo.
 #

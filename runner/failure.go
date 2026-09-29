@@ -143,13 +143,19 @@ const (
 	// The typed code and dimension are in Result.Error.
 	FailureExecutionSecurity = "execution-security"
 
-	// FailureContinuationsExhausted indicates a turn still ended unfinished —
-	// no turn-result manifest, no pull request, no verdict — after the runner
-	// had sent its limit of "continue the task" prompts
-	// (runner/turn_continuation.go). The work is incomplete, so no pull
-	// request nudge is sent; the backstop still makes its open-PR attempt
-	// (pushing the work and recovering a pull request the runner could not
-	// confirm) and the session stays failed. Result.TurnContinuations
-	// records the counts.
-	FailureContinuationsExhausted = "continuations-exhausted"
+	// FailureContinuationsUnproductive indicates a turn still ended
+	// unfinished — no turn-result manifest, no pull request, no verdict —
+	// after Options.TurnContinuationLimit consecutive "continue the task"
+	// prompts whose turns made no tool call (runner/turn_continuation.go).
+	// The work is incomplete, so no pull request nudge is sent; the
+	// backstop still makes its open-PR attempt (pushing the work and
+	// recovering a pull request the runner could not confirm) and the
+	// session stays failed. Result.TurnContinuations records the counts.
+	FailureContinuationsUnproductive = "continuations-unproductive"
+
+	// FailureContinuationsCeiling indicates a turn still ended unfinished
+	// after Options.TurnContinuationCeiling continuation prompts in total,
+	// productive or not — the runaway guard. Recovery is as for
+	// FailureContinuationsUnproductive.
+	FailureContinuationsCeiling = "continuations-ceiling"
 )

@@ -834,6 +834,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
+		s.Harness = selection.Harness.ID
+		s.Model = qw.ResolvedProfile.Model
+		s.ModelProvider = spanruntime.ProviderSystem(provider.Name())
 		s.WorkType = qw.WorkType
 		s.WorkerID = qw.WorkerID
 		s.CurrentStep = "spawning"
@@ -1291,9 +1294,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Each pass reads how the LATEST turn ended (turn_continuation.go): a
 	// turn that stopped early is continued, a turn that ended on a provider
 	// error is retried, and a turn that left its verdict but no pull request
-	// gets the pull request nudge (steering), once. Continuations and
-	// retries are bounded; a turn still unfinished at the bound fails the
-	// session. The loop runs at most 2×limit+1 follow-up turns.
+	// gets the pull request nudge (steering), once. Continuations are
+	// bounded by progress (consecutive turns without a tool call) and by a
+	// total ceiling, retries by their own count; a turn still unfinished at
+	// a bound fails the session. The session's duration and token budgets
+	// cover every follow-up turn.
 	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
 	continuable := RequiresPRURL(qw.WorkType) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
@@ -1302,7 +1307,7 @@ tailRecovery:
 		steerView := streamRes
 		steerView.terminalSuccess = lastTurn.terminalSuccess
 		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn))
-		step := followUps.next(ending, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
+		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
 		switch step {
 		case tailDone:
 			break tailRecovery
@@ -1311,11 +1316,14 @@ tailRecovery:
 				followUps.providerError = lastTurn.providerError
 			}
 			followUps.fail(res)
-			r.logger.Warn("turn still unfinished after the continuation limit; failing the session",
+			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
 				"sessionId", qw.SessionID,
+				"failureMode", res.FailureMode,
 				"continued", followUps.continued,
+				"unproductive", followUps.unproductive,
 				"retried", followUps.retried,
 				"limit", followUps.limit,
+				"ceiling", followUps.ceiling,
 			)
 			break tailRecovery
 		case tailSteer:
@@ -1360,7 +1368,9 @@ tailRecovery:
 			r.logger.Info("turn ended before the work was finished; continuing",
 				"sessionId", qw.SessionID,
 				"continuation", followUps.continued+1,
+				"unproductive", followUps.unproductive,
 				"limit", followUps.limit,
+				"ceiling", followUps.ceiling,
 			)
 		}
 		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
@@ -1453,8 +1463,8 @@ tailRecovery:
 	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
-	// An exhausted session keeps its continuations-exhausted label: the
-	// backstop's open-PR attempt ran, but the turn never finished.
+	// An exhausted session keeps the failure mode of the bound it ran out
+	// of: the backstop's open-PR attempt ran, but the turn never finished.
 	if repositoryDeclaration != nil && len(missingPRs) > 0 && !followUps.exhausted {
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop
@@ -1846,6 +1856,10 @@ type streamObservation struct {
 	// assistant message or tool call after it in this stream — the turn
 	// ended on that error rather than because the agent stopped.
 	providerError string
+	// toolCalls counts the tool calls (agent.ToolUseEvent) this stream
+	// carried. Tail recovery reads a turn with at least one as productive
+	// (turn_continuation.go).
+	toolCalls int
 	// noProgress is set when the idle/no-progress watchdog fired — the
 	// event stream produced no agent.Event for longer than the runner's
 	// IdleTimeout window. The runner reads it in the post-stream
@@ -2096,6 +2110,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			}
 		}
 	case agent.ToolUseEvent:
+		obs.toolCalls++
 		// The model produced a tool call: any earlier provider error in
 		// this stream was recovered from.
 		obs.providerError = ""
@@ -2336,16 +2351,14 @@ func envOrDefault(key, def string) string {
 // here, so the runner's backstop commits carry the SAME identity as the agent's
 // own in-box commits instead of overriding them with a divergent "Donmai Agent"
 // persona. Absent a provisioner value (standalone / local worktree), fall back
-// to a session-derived default: the issue identifier as the display name and
-// the session id as the email so every commit is unambiguously linked to its
-// originating session.
+// to a session-derived default: the fixed display name "Donmai Agent" and the
+// session id as the email, so every commit is unambiguously linked to its
+// originating session. The display name never carries the issue identifier:
+// tracker keys can be private, and commits on a public repository (including
+// the co-author trailers a squash merge composes from them) would publish it.
 func buildSessionEnv(qw QueuedWork) map[string]string {
-	// Derive a stable display name: prefer the issue identifier, fall back
-	// to a shortened session id prefix.
+	// A fixed display name; the session id in the email carries attribution.
 	gitName := "Donmai Agent"
-	if qw.IssueIdentifier != "" {
-		gitName = "Donmai Agent (" + qw.IssueIdentifier + ")"
-	}
 	gitEmail := "agent+" + qw.SessionID + "@donmai.dev"
 
 	// Honor a provisioner-supplied identity when set; committer defaults to the

@@ -315,13 +315,21 @@ type Options struct {
 	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
 
 	// TurnContinuationLimit bounds the runner-driven follow-up turns of work
-	// that owes a pull request (turn_continuation.go): how many "continue the
-	// task" prompts a turn that stopped early gets and, separately, how many
-	// retries a turn that ended on a model provider error gets. A turn still
-	// unfinished after that fails the session. Zero uses
-	// DefaultTurnContinuationLimit; negative disables both, leaving only the
-	// single pull request nudge.
+	// that owes a pull request (turn_continuation.go) by progress: how many
+	// CONSECUTIVE "continue the task" prompts may produce a turn that made
+	// no tool call (any turn with a tool call resets the streak) and,
+	// separately, how many retries in total a turn that ended on a model
+	// provider error gets. A turn still unfinished after that fails the
+	// session. Zero uses DefaultTurnContinuationLimit; negative disables
+	// both, leaving only the single pull request nudge.
 	TurnContinuationLimit int
+
+	// TurnContinuationCeiling bounds the "continue the task" prompts of one
+	// session in total, productive or not — the runaway guard behind the
+	// progress bound above; the session's own duration and token budgets
+	// still apply to every follow-up turn. Zero uses
+	// DefaultTurnContinuationCeiling; negative removes the ceiling.
+	TurnContinuationCeiling int
 
 	// RescueDir is where teardown archives a session's unpublished work —
 	// uncommitted changes and commits no remote holds — as a patch before it
@@ -397,6 +405,8 @@ type Runner struct {
 	rescueDir string
 	// turnContinuationLimit is Options.TurnContinuationLimit.
 	turnContinuationLimit int
+	// turnContinuationCeiling is Options.TurnContinuationCeiling.
+	turnContinuationCeiling int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -480,6 +490,7 @@ func New(opts Options) (*Runner, error) {
 		selectionPolicy:               selectionPolicy,
 		rescueDir:                     opts.RescueDir,
 		turnContinuationLimit:         opts.TurnContinuationLimit,
+		turnContinuationCeiling:       opts.TurnContinuationCeiling,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

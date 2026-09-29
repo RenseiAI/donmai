@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"net/http"
 	"os"
 	"path/filepath"
@@ -42,6 +43,9 @@ type verdictScriptTurn struct {
 	// the turn emits the provider-error observation before its clean
 	// terminal, as the pi harness does when its own retries give up.
 	providerError string
+	// toolCalls is how many tool calls (each with its result) the turn makes
+	// before its text: a turn with any is productive.
+	toolCalls int
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -133,6 +137,11 @@ func (h *verdictScriptHandle) playLocked() {
 			h.t.Errorf("write %s: %v", path, err)
 		}
 	}
+	for i := range turn.toolCalls {
+		id := fmt.Sprintf("call-%d-%d", h.next, i)
+		h.events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: id, Input: map[string]any{"command": "go test ./..."}}
+		h.events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: id, Content: "ok"}
+	}
 	if turn.text != "" {
 		h.events <- agent.AssistantTextEvent{Text: turn.text}
 	}
@@ -219,7 +228,9 @@ type scriptedSession struct {
 	rescueDir string
 	// continuationLimit is Options.TurnContinuationLimit (0 = default).
 	continuationLimit int
-	turns             []verdictScriptTurn
+	// continuationCeiling is Options.TurnContinuationCeiling (0 = default).
+	continuationCeiling int
+	turns               []verdictScriptTurn
 }
 
 // runScriptedSession runs one scripted session and returns the terminal
@@ -240,7 +251,10 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: cfg.inject})
 	}
 	provider := &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
-	r := newFollowUpRunner(t, platform.URL, platform.Client(), provider)
+	r := newFollowUpRunner(t, platform.URL, platform.Client(), provider, func(o *Options) {
+		o.TurnContinuationLimit = cfg.continuationLimit
+		o.TurnContinuationCeiling = cfg.continuationCeiling
+	})
 	r.skipSteering = cfg.skipSteering
 	if cfg.teardown {
 		r.preserveAlways = false
@@ -252,7 +266,6 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		r.pullRequestLookup = cfg.lookup
 	}
 	r.skipBackstop = !cfg.backstop
-	r.turnContinuationLimit = cfg.continuationLimit
 	r.providerRetryBackoff = func(int) time.Duration { return 0 }
 	qw := QueuedWork{
 		QueuedWork:      queuedWorkBase("MANIFEST-FOLLOWUP"),
@@ -680,7 +693,9 @@ func TestFoldTurnManifest_NeverClearsRunnerFailure(t *testing.T) {
 // newFollowUpRunner builds a Runner with tail steering enabled around the
 // supplied provider. Backstop and post-session stay off so the tests observe
 // exactly the manifest / follow-up interaction.
-func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p agent.Provider) *Runner {
+// newFollowUpRunner builds the runner through New, so the Options each test
+// sets through configure are threaded exactly as a caller's would be.
+func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p agent.Provider, configure func(*Options)) *Runner {
 	t.Helper()
 	wtm, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
 	if err != nil {
@@ -700,7 +715,7 @@ func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p 
 	if err := reg.Register(p); err != nil {
 		t.Fatalf("Register: %v", err)
 	}
-	r, err := New(Options{
+	opts := Options{
 		Registry:               reg,
 		WorktreeManager:        wtm,
 		Poster:                 poster,
@@ -708,7 +723,11 @@ func newFollowUpRunner(t *testing.T, platformURL string, client *http.Client, p 
 		SkipBackstop:           true,
 		SkipPostSession:        true,
 		PreserveWorktreeAlways: true,
-	})
+	}
+	if configure != nil {
+		configure(&opts)
+	}
+	r, err := New(opts)
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}

@@ -625,11 +625,13 @@ func TestRunBackstop_CommitIdentity(t *testing.T) {
 		unsetGitIdentityEnv(t)
 
 		authorOut := commitAuthor(t)
-		// buildSessionEnv produces "Donmai Agent (ENG-42)" + "agent+test-session-ENG-42@donmai.dev".
-		wantName := "Donmai Agent (ENG-42)"
+		// buildSessionEnv produces "Donmai Agent" + "agent+test-session-ENG-42@donmai.dev".
+		// The display name is exactly "Donmai Agent": the issue identifier must
+		// never reach a public commit's author or a squash co-author trailer.
+		wantName := "Donmai Agent"
 		wantEmail := "agent+test-session-ENG-42@donmai.dev"
-		if !strings.Contains(authorOut, wantName) {
-			t.Errorf("commit author = %q; want name %q", authorOut, wantName)
+		if gotName, _, _ := strings.Cut(authorOut, " <"); gotName != wantName {
+			t.Errorf("commit author name = %q; want exactly %q", gotName, wantName)
 		}
 		if !strings.Contains(authorOut, wantEmail) {
 			t.Errorf("commit author = %q; want email %q", authorOut, wantEmail)
