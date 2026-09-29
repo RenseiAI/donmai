@@ -28,7 +28,6 @@ import (
 	"github.com/RenseiAI/donmai/matrix"
 	"github.com/RenseiAI/donmai/prompt"
 	provideragycli "github.com/RenseiAI/donmai/provider/harness/agycli"
-	provideramp "github.com/RenseiAI/donmai/provider/harness/amp"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -782,8 +781,8 @@ type providerCtor struct {
 // misconfiguration and any subsequent runner.Run will fail because
 // no provider can resolve.
 //
-// Foundation-runtime-stubs adds three more probe-and-skip entries
-// (amp, gemini, opencode). Each follows
+// Foundation-runtime-stubs adds two more probe-and-skip entries
+// (gemini, opencode). Each follows
 // the same warn-and-skip contract as claude / codex: if the
 // constructor returns ErrProviderUnavailable (no API key, server
 // unreachable) the registry build logs WARN and proceeds without
@@ -966,15 +965,11 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		// runner.Resolve with agent.ErrNoProvider — which is the
 		// correct loud failure when the local runtime is missing.
 		{name: "ollama", new: func() (agent.Provider, error) { return providerollama.New(providerollama.Options{}) }},
-		// Amp is registration-only today (no public stable runner API); the
-		// constructor probes env vars / endpoints and warns-and-skips when
-		// missing. OpenCode (registered below) no longer belongs in this
-		// bucket: it ships two real managed-spawn lanes (CLI one-shot,
-		// serve/HTTP with real tool/MCP policy delivery) plus a fail-closed
-		// external-attach posture — see its own ctor comment for how
-		// PreferServer routes between them. Gemini is a full streaming impl
-		// against generativelanguage.googleapis.com.
-		{name: "amp", new: func() (agent.Provider, error) { return provideramp.New(provideramp.Options{}) }},
+		// OpenCode (registered below) ships two real managed-spawn lanes
+		// (CLI one-shot, serve/HTTP with real tool/MCP policy delivery)
+		// plus a fail-closed external-attach posture — see its own ctor
+		// comment for how PreferServer routes between them. Gemini is a
+		// full streaming impl against generativelanguage.googleapis.com.
 		{name: "gemini", new: func() (agent.Provider, error) { return providergemini.New(providergemini.Options{}) }},
 		// agy-cli is a LOCAL/HOST-SESSION/OAUTH provider wrapping the Antigravity `agy` CLI under a pty.
 		// It is the SUBSCRIPTION/no-key local-Gemini path (the user's own OAuth-authed agy on the user's
@@ -990,7 +985,7 @@ func agentRunProviderCtors(hints ...agentRunCtorHints) []providerCtor {
 		{name: "opencode", new: func() (agent.Provider, error) {
 			return provideropencode.New(opencodeCtorOptions(h))
 		}},
-		// pi is registration-only today, mirroring amp/opencode: the
+		// pi is registration-only today, mirroring opencode: the
 		// constructor probes the binary + version pin and warns-and-skips
 		// when absent/below-pin (provider/harness/pi/probe.go). Greenfield
 		// harness (09-design-pi-adapter.md); real-binary smoke coverage is

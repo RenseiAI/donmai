@@ -2,7 +2,7 @@
 // /api/daemon/providers* operator surface. Wave 9 / A1.
 //
 // The handlers expose the daemon's in-process AgentRuntime registry
-// (claude/codex/ollama/opencode/gemini/amp/stub) as JSON. The remaining
+// (claude/codex/ollama/opencode/gemini/stub) as JSON. The remaining
 // seven Provider Families (Sandbox, Workarea, VCS, IssueTracker,
 // Deployment, AgentRegistry, Kit) return empty until per-family
 // registries land in a future wave. The endpoint MUST emit

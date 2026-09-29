@@ -51,7 +51,6 @@ func TestSpawn_NoticePermissionComesFromTheDeclaredChannel(t *testing.T) {
 		{name: "codex declares mcp-rpc", declared: agent.NoticeDeliveryMCPRPC},
 		{name: "opencode declares http-session", declared: agent.NoticeDeliveryHTTPSession},
 		{name: "pi declares rpc-steer", declared: agent.NoticeDeliveryRPCSteer},
-		{name: "amp declares resume-inject", declared: agent.NoticeDeliveryResumeInject},
 		{name: "an explicit none", declared: agent.NoticeDeliveryNone},
 		{name: "an undeclared manifest refuses too", declared: ""},
 	}

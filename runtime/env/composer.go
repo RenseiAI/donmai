@@ -44,7 +44,9 @@ const sessionShimEnvPrefix = "DONMAI_SESSION_SHIM"
 //
 // When the legacy TS adds a new entry, port it here and update the
 // inline comment in package env's README.
-//
+// (The retired harness credential that used to sit at the head of this
+// list has no replacement; the Anthropic/OpenAI/Gemini keys above are
+// the remaining model-provider surface.)
 // DONMAI_GATEWAY_UPSTREAM_API_KEY and DONMAI_GATEWAY_UPSTREAM_BASE_URL have
 // no legacy-TS counterparts: they configure the donmai-native worker-local
 // translating gateway (afcli/gateway_bind.go). They MUST be blocked here,
@@ -52,16 +54,7 @@ const sessionShimEnvPrefix = "DONMAI_SESSION_SHIM"
 // receives only the gateway's per-session loopback bearer while the upstream
 // credential and route stay in the worker process. An inherited copy in the
 // child would silently undo that isolation.
-//
-// AMP_API_KEY likewise has no legacy-TS counterpart: it is the amp harness's
-// personal access token (provider/harness/amp, EnvAPIKey), a model-provider
-// credential like the Anthropic/OpenAI/Gemini keys above. The platform's
-// suppressed model-provider set already includes it; blocking it here keeps
-// the runtime layer in parity so a host operator's Amp token cannot leak
-// into an agent subprocess. Per-session Amp credentials still ride Spec.Env,
-// which is trusted (see Composer.Compose).
 var AgentEnvBlocklist = []string{
-	"AMP_API_KEY",
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",

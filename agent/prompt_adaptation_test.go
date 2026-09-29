@@ -9,7 +9,6 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/agycli"
-	"github.com/RenseiAI/donmai/provider/harness/amp"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -35,7 +34,6 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "ollama", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
@@ -168,7 +166,7 @@ func TestPromptAdaptation_ReplacementMatrix(t *testing.T) {
 	t.Parallel()
 	manifests := []agent.HarnessManifest{
 		(&claude.Provider{}).Manifest(), (&codex.Provider{}).Manifest(), (&gemini.Provider{}).Manifest(),
-		(&ollama.Provider{}).Manifest(), (&amp.Provider{}).Manifest(), (&agycli.Provider{}).Manifest(),
+		(&ollama.Provider{}).Manifest(), (&agycli.Provider{}).Manifest(),
 		(&opencode.Provider{}).Manifest(), (&pi.Provider{}).Manifest(), (&shell.Provider{}).Manifest(),
 	}
 	for _, manifest := range manifests {
@@ -214,6 +212,27 @@ func TestPromptAdaptation_RejectsUnknownDeliveryAndMalformedIdentity(t *testing.
 	_, _, err = agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
 	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
 		t.Fatalf("missing stable id error = %v", err)
+	}
+}
+
+// TestRetiredAmpPromptDeliveryKindStaysUnknown is the retirement guard for the
+// removed amp harness's prompt delivery kind. "amp_stdin" is the literal
+// former PromptDeliveryAmpStdin wire value; a generic "invented" string (as
+// used above) would pass this test whether or not that constant and its
+// knownPromptDelivery case were ever restored, so this pins the exact
+// retired string. Re-adding PromptDeliveryAmpStdin = "amp_stdin" and its
+// case in knownPromptDelivery flips this test red.
+func TestRetiredAmpPromptDeliveryKindStaysUnknown(t *testing.T) {
+	t.Parallel()
+	profile, ok := (&claude.Provider{}).Manifest().PromptProfile(agent.PromptModeAutonomous)
+	if !ok {
+		t.Fatal("claude manifest has no autonomous prompt profile")
+	}
+	profile.UserDelivery = agent.PromptDeliveryKind("amp_stdin")
+	plan := fullPromptPlan()
+	_, _, err := agent.AdaptPrompt(agent.Spec{PromptPlan: &plan}, profile)
+	if !agent.IsPromptAdaptationError(err, agent.PromptDenialMalformedPlan) {
+		t.Fatalf("retired amp_stdin delivery error = %v, want malformed-plan denial", err)
 	}
 }
 

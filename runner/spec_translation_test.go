@@ -364,11 +364,11 @@ func TestTranslateSpec_Codex_RoutesAllowedToolsToPermissionConfig(t *testing.T) 
 	}
 }
 
-// TestTranslateSpec_AmpAgyCli_RetainsUnsupportedPolicy verifies a requested
+// TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy verifies a requested
 // policy is preserved for the exact adapter's typed pre-spawn denial.
-func TestTranslateSpec_AmpAgyCli_RetainsUnsupportedPolicy(t *testing.T) {
+func TestTranslateSpec_AgyCli_RetainsUnsupportedPolicy(t *testing.T) {
 	t.Parallel()
-	for _, provider := range []string{"amp", "agy-cli"} {
+	for _, provider := range []string{"agy-cli"} {
 		t.Run(provider, func(t *testing.T) {
 			t.Parallel()
 			caps := agent.Capabilities{

@@ -117,7 +117,7 @@ func spawnFakeCtx(ctx context.Context, t *testing.T, binary string, spec agent.S
 // fork/exec + bufio.Scanner setup latency under contention doesn't
 // time-bomb a deterministic JSONL fixture. In healthy conditions
 // these helpers return in <50 ms via the terminal-event path. This
-// mirrors the F3 fix in provider/amp (commit d7df186), replacing the
+// mirrors the bounded-retry fix for fake-script ETXTBSY races, replacing the
 // historical 5s hard timeout + 200ms post-terminal idle wait that
 // flaked under -race + full-suite load.
 func collect(t *testing.T, h agent.Handle) []agent.Event {

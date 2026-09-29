@@ -9,9 +9,9 @@ import (
 	"github.com/RenseiAI/donmai/runner"
 )
 
-// TestLegacyAlias_EightProvidersResolveToTheirHarness is the load-bearing
+// TestLegacyAlias_ProvidersResolveToTheirHarness is the load-bearing
 // P2 acceptance: after splitting the fused providers into
-// provider/harness/*, every one of the eight legacy ProviderNames still
+// provider/harness/*, every one of the legacy ProviderNames still
 // resolves through runner.Registry to a concrete provider whose harness
 // identity matches the matrix's LegacyAliasMap. The package move changed
 // import paths only — the resolution behaviour is byte-identical.
@@ -20,16 +20,16 @@ import (
 // matrix.HarnessProvidersForParity() (zero-value / New(), no probe), the
 // same set the matrix is harvested from, so the assertion is against the
 // exact instances the matrix is built on.
-func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
+func TestLegacyAlias_ProvidersResolveToTheirHarness(t *testing.T) {
 	t.Parallel()
 
 	reg := runner.NewRegistry()
 	providers := matrix.HarnessProvidersForParity()
-	// 9 legacy-aliased providers (pi joined as the R2/DEC-3 addition) + the
+	// 8 legacy-aliased providers (pi joined as the R2/DEC-3 addition) + the
 	// interactive-only shell harness (W4; no legacy alias by definition — it
 	// is not a back-compat name).
-	if len(providers) != 10 {
-		t.Fatalf("expected 10 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if err := reg.Register(p); err != nil {
@@ -37,7 +37,7 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 		}
 	}
 
-	// The back-compat ProviderNames that must keep resolving (the eight P2
+	// The back-compat ProviderNames that must keep resolving (the seven P2
 	// names + pi).
 	wantNames := []agent.ProviderName{
 		agent.ProviderClaude,
@@ -47,7 +47,6 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 		agent.ProviderOllama,
 		agent.ProviderOpenCode,
 		agent.ProviderPi,
-		agent.ProviderAmp,
 		agent.ProviderStub,
 	}
 
@@ -88,11 +87,11 @@ func TestLegacyAlias_EightProvidersResolveToTheirHarness(t *testing.T) {
 	}
 }
 
-// TestLegacyAliasMap_ExactlyTheEightLegacyNames pins the alias map's key
+// TestLegacyAliasMap_ExactlyTheLegacyNames pins the alias map's key
 // set so a future provider addition/removal updates the cell anchors
 // deliberately (and re-runs the byte-identical matrix gate), rather than
 // silently widening the back-compat surface.
-func TestLegacyAliasMap_ExactlyTheEightLegacyNames(t *testing.T) {
+func TestLegacyAliasMap_ExactlyTheLegacyNames(t *testing.T) {
 	t.Parallel()
 
 	want := map[agent.ProviderName]matrix.CellKey{
@@ -103,7 +102,6 @@ func TestLegacyAliasMap_ExactlyTheEightLegacyNames(t *testing.T) {
 		agent.ProviderOllama:   {Harness: agent.HarnessOllama, Endpoint: agent.CompanyLocal, Host: "local"},
 		agent.ProviderOpenCode: {Harness: agent.HarnessOpenCode, Endpoint: agent.CompanyOpenAI, Host: "direct"},
 		agent.ProviderPi:       {Harness: agent.HarnessPi, Endpoint: agent.CompanyAnthropic, Host: "direct"},
-		agent.ProviderAmp:      {Harness: agent.HarnessAmp, Endpoint: agent.CompanyAnthropic, Host: "direct"},
 		agent.ProviderStub:     {Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: "local"},
 	}
 
@@ -151,9 +149,9 @@ func TestAssertLegacyAlias_NoMismatchForRealProviders(t *testing.T) {
 				name, got, cell.Harness)
 		}
 	}
-	// The back-compat guarantee itself must not shrink: the eight P2 legacy
+	// The back-compat guarantee itself must not shrink: the seven P2 legacy
 	// names plus pi (R2/DEC-3) carry cells.
-	if legacyCells != 9 {
-		t.Errorf("legacy-aliased shipped providers = %d; want 9", legacyCells)
+	if legacyCells != 8 {
+		t.Errorf("legacy-aliased shipped providers = %d; want 8", legacyCells)
 	}
 }

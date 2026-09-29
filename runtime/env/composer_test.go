@@ -41,7 +41,6 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 
 	c := env.NewComposer()
 	base := map[string]string{
-		"AMP_API_KEY":                      "leak-0",
 		"ANTHROPIC_API_KEY":                "leak-1",
 		"ANTHROPIC_AUTH_TOKEN":             "leak-2",
 		"ANTHROPIC_BASE_URL":               "leak-3",
@@ -54,8 +53,7 @@ func TestComposeBlocksDefaultBlocklist(t *testing.T) {
 	got := c.Compose(base, agent.Spec{})
 	for _, kv := range got {
 		switch kv {
-		case "AMP_API_KEY=leak-0",
-			"ANTHROPIC_API_KEY=leak-1",
+		case "ANTHROPIC_API_KEY=leak-1",
 			"ANTHROPIC_AUTH_TOKEN=leak-2",
 			"ANTHROPIC_BASE_URL=leak-3",
 			"OPENCLAW_GATEWAY_TOKEN=leak-4",
@@ -288,12 +286,9 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 	// AGENT_ENV_BLOCKLIST, plus the donmai-native entries that have no legacy
 	// counterpart (DONMAI_GATEWAY_UPSTREAM_API_KEY and
 	// DONMAI_GATEWAY_UPSTREAM_BASE_URL — the worker-local gateway's upstream
-	// credential and route, which must never reach a harness child — and
-	// AMP_API_KEY, the amp harness's model-provider credential; see the
-	// AgentEnvBlocklist doc comment). If the legacy list grows, port the new
-	// entries AND update this test.
+	// credential and route, which must never reach a harness child).
+	// If the legacy list grows, port the new entries AND update this test.
 	want := []string{
-		"AMP_API_KEY",
 		"ANTHROPIC_API_KEY",
 		"ANTHROPIC_AUTH_TOKEN",
 		"ANTHROPIC_BASE_URL",

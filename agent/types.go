@@ -20,7 +20,7 @@ import (
 //
 // It mirrors AgentProviderName from the legacy TS port. v0.5.0 ships
 // claude, codex, and stub. Additional families (gemini, agy-cli,
-// ollama, opencode, jules, amp) extend this enum without breaking the
+// ollama, opencode, jules) extend this enum without breaking the
 // contract.
 //
 // Source: ../donmai-libraries/packages/core/src/providers/types.ts (AgentProviderName).
@@ -33,7 +33,6 @@ const (
 	ProviderClaude   ProviderName = "claude"
 	ProviderCodex    ProviderName = "codex"
 	ProviderStub     ProviderName = "stub" // test-only; deterministic
-	ProviderAmp      ProviderName = "amp"
 	ProviderGemini   ProviderName = "gemini"
 	ProviderAGYCLI   ProviderName = "agy-cli" // Antigravity `agy` CLI-wrap; OAuth/local/host-session, pty, no key.
 	ProviderOllama   ProviderName = "ollama"
@@ -503,7 +502,7 @@ type Spec struct {
 	// (direct/vertex — spawnURL in provider/harness/gemini/gemini.go), and
 	// OpenCode injects a session-scoped generic openai-chat config. All three
 	// honor Endpoint.Model over Spec.Model when set. Harnesses without a read
-	// site (codex / amp / agycli) still intentionally ignore the field.
+	// site (codex / agycli) still intentionally ignore the field.
 	//
 	// Declared as a POINTER (not a value) so the json:"endpoint,omitempty"
 	// tag actually omits the field for pre-P1 producers — Go's encoding/json

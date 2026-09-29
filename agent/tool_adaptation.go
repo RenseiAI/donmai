@@ -53,7 +53,6 @@ const (
 	ToolDeliveryCodexCLIMCPConfig     ToolDeliveryKind = "codex_cli_mcp_config"
 	ToolDeliveryGeminiNativeBoundary  ToolDeliveryKind = "gemini_in_box_native_boundary"
 	ToolDeliveryGeminiMCPBridge       ToolDeliveryKind = "gemini_in_box_mcp_bridge"
-	ToolDeliveryAmpMCPConfig          ToolDeliveryKind = "amp_cli_mcp_config"
 	ToolDeliveryOpenCodePermissionMap ToolDeliveryKind = "opencode_permission_map"
 	ToolDeliveryOpenCodeProjectMCP    ToolDeliveryKind = "opencode_project_mcp_config"
 	ToolDeliveryPiInjectedBoundary    ToolDeliveryKind = "pi_handshake_policy_extension"
@@ -1150,7 +1149,7 @@ func isKnownToolDelivery(delivery ToolDeliveryKind) bool {
 	case ToolDeliveryUnsupported, ToolDeliveryStubOracle, ToolDeliveryClaudeCLIAllowDeny,
 		ToolDeliveryClaudeMCPConfig, ToolDeliveryCodexApprovalBridge, ToolDeliveryCodexAppServerMCP,
 		ToolDeliveryCodexCLIMCPConfig,
-		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge, ToolDeliveryAmpMCPConfig,
+		ToolDeliveryGeminiNativeBoundary, ToolDeliveryGeminiMCPBridge,
 		ToolDeliveryOpenCodePermissionMap, ToolDeliveryOpenCodeProjectMCP, ToolDeliveryPiInjectedBoundary,
 		ToolDeliveryPiAdditionalExtension, ToolDeliveryPiInteractiveLocalToolPolicy,
 		ToolDeliveryNoToolSurface,

@@ -64,7 +64,6 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 	providers := []*selectorFakeProvider{
 		{name: agent.ProviderClaude, harness: agent.HarnessClaudeCode},
 		{name: agent.ProviderCodex, harness: agent.HarnessCodex},
-		{name: agent.ProviderAmp, harness: agent.HarnessAmp},
 		{name: agent.ProviderAGYCLI, harness: agent.HarnessAntigravity},
 		{name: agent.ProviderOpenCode, harness: agent.HarnessOpenCode},
 		{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
@@ -80,7 +79,6 @@ func TestExplicitHarnessSelectionWireAndCanonicalMatrix(t *testing.T) {
 	}{
 		{name: "legacy claude wire", harness: "claude", provider: agent.ProviderClaude, wantProvider: agent.ProviderClaude, wantHarness: "claude-code"},
 		{name: "legacy codex wire", harness: "codex", provider: agent.ProviderCodex, wantProvider: agent.ProviderCodex, wantHarness: "codex"},
-		{name: "legacy amp wire", harness: "amp", provider: agent.ProviderAmp, wantProvider: agent.ProviderAmp, wantHarness: "amp"},
 		{name: "legacy agy wire", harness: "agy", provider: agent.ProviderGemini, wantProvider: agent.ProviderAGYCLI, wantHarness: "antigravity"},
 		{name: "legacy opencode wire", harness: "opencode", provider: agent.ProviderOpenCode, wantProvider: agent.ProviderOpenCode, wantHarness: "opencode"},
 		{name: "legacy native gemini wire", harness: "native", provider: agent.ProviderGemini, wantProvider: agent.ProviderGemini, wantHarness: "gemini-direct", wantSource: "legacy-harness:native"},
@@ -130,9 +128,9 @@ func TestExplicitHarnessSelectionTypedDenials(t *testing.T) {
 		{name: "invalid whitespace", harness: " codex", provider: agent.ProviderCodex, wantCode: executioncell.DenialUnknownHarness},
 		{name: "known canonical but unavailable", harness: "claude-code", provider: agent.ProviderClaude, wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "known raw compatibility alias remains ambiguous without provider", harness: "raw", wantCode: executioncell.DenialHarnessUnavailable},
-		{name: "known raw compatibility alias has invalid provider", harness: "raw", provider: agent.ProviderAmp, wantCode: executioncell.DenialHarnessUnavailable},
+		{name: "known raw compatibility alias has invalid provider", harness: "raw", provider: agent.ProviderName("retired"), wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "known native missing provider pairing", harness: "native", wantCode: executioncell.DenialHarnessUnavailable},
-		{name: "known native has unsupported provider pairing", harness: "native", provider: agent.ProviderAmp, wantCode: executioncell.DenialHarnessUnavailable},
+		{name: "known native has unsupported provider pairing", harness: "native", provider: agent.ProviderName("retired"), wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "native must not conflate claude API and CLI", harness: "native", provider: agent.ProviderClaude, wantCode: executioncell.DenialHarnessUnavailable},
 		{name: "native must not conflate codex API and CLI", harness: "native", provider: agent.ProviderCodex, wantCode: executioncell.DenialHarnessUnavailable},
 	}
@@ -361,5 +359,33 @@ func TestExplicitHarnessDenialPrecedesAllSideEffects(t *testing.T) {
 				t.Fatalf("typed error receipt %q != result receipt %q", denial.Receipt.Value().ReceiptID, result.AdmissionReceipt.ReceiptID)
 			}
 		})
+	}
+}
+
+// TestRetiredHarnessTokenIsUnknown is the retirement guard: the removed
+// harness token must fail closed as an unknown harness rather than
+// resolving to any registered runtime. "amp" is the literal wire token
+// recognizedHarnessToken used to accept (case string(agent.HarnessAmp)); a
+// generic placeholder token would pass this test whether or not that case
+// were ever restored, so this pins the exact retired string. Restoring the
+// token (or its provider mapping) flips this test red — see the retirement
+// guard revert proof in the PR description.
+func TestRetiredHarnessTokenIsUnknown(t *testing.T) {
+	t.Parallel()
+	registry := selectorRegistry(t,
+		&selectorFakeProvider{name: agent.ProviderCodex, harness: agent.HarnessCodex},
+		&selectorFakeProvider{name: agent.ProviderGemini, harness: agent.HarnessGeminiDirect},
+	)
+	for _, profile := range []ResolvedProfile{
+		{Harness: "amp"},
+		{Harness: "amp", Provider: agent.ProviderName("amp")},
+		{Harness: "retired-harness"},
+		{Harness: "retired-harness", Provider: "retired-harness"},
+	} {
+		_, err := registry.selectExplicitHarness(profile)
+		var denial *HarnessAdmissionError
+		if !errors.As(err, &denial) || denial.Code != executioncell.DenialUnknownHarness {
+			t.Fatalf("selectExplicitHarness(%+v) error = %v, want HarnessAdmissionError code %q", profile, err, executioncell.DenialUnknownHarness)
+		}
 	}
 }

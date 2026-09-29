@@ -22,7 +22,6 @@ var canonicalAgentRunProviders = []agent.ProviderName{
 	agent.ProviderClaude,
 	agent.ProviderCodex,
 	agent.ProviderOllama,
-	agent.ProviderAmp,
 	agent.ProviderGemini,
 	agent.ProviderAGYCLI,
 	agent.ProviderOpenCode,

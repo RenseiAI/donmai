@@ -101,8 +101,6 @@ const (
 	PromptDeliveryOllamaSystemMessage PromptDeliveryKind = "ollama_system_message"
 	// PromptDeliveryOllamaUserMessage uses an Ollama user message.
 	PromptDeliveryOllamaUserMessage PromptDeliveryKind = "ollama_user_message"
-	// PromptDeliveryAmpStdin uses Amp execute-mode stdin.
-	PromptDeliveryAmpStdin PromptDeliveryKind = "amp_stdin"
 	// PromptDeliveryAgyPromptFlag uses agy's prompt flag.
 	PromptDeliveryAgyPromptFlag PromptDeliveryKind = "agy_prompt_flag"
 	// PromptDeliveryOpenCodePrompt uses OpenCode's prompt request.
@@ -576,7 +574,6 @@ func knownPromptDelivery(delivery PromptDeliveryKind) bool {
 		PromptDeliveryGeminiUserContent,
 		PromptDeliveryOllamaSystemMessage,
 		PromptDeliveryOllamaUserMessage,
-		PromptDeliveryAmpStdin,
 		PromptDeliveryAgyPromptFlag,
 		PromptDeliveryOpenCodePrompt,
 		PromptDeliveryPiSystemAppend,
