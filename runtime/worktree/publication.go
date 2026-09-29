@@ -144,41 +144,47 @@ func (m *Manager) assessRepositoryPublication(
 	}
 	config := []string{
 		"-c", "core.hooksPath=/dev/null",
+		"-c", "core.bare=false",
 		"-c", "core.fsmonitor=false",
 		"-c", "core.untrackedCache=false",
 		"-c", "credential.helper=",
-		"-c", "protocol.ext.allow=never",
+		"-c", "core.askPass=/usr/bin/false",
+		"-c", "protocol.allow=never",
+		"-c", "protocol.file.allow=always",
+		"-c", "protocol.http.allow=always",
+		"-c", "protocol.https.allow=always",
+		"-c", "protocol.ssh.allow=always",
 		"-c", "submodule.recurse=false",
 	}
-	statusArgs := append(append([]string{}, config...), "-C", path, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
-	status, err := m.runPublicationGit(ctx, target.Repository, statusArgs...)
-	if err != nil || len(status) > publicationMaxGitOutput {
+	localConfig := append([]string{"--work-tree=" + path}, config...)
+	dirty, err := m.publicationWorktreeDirty(ctx, path, localConfig)
+	if err != nil {
 		return retain(PublicationReasonUncertain)
 	}
-	if strings.TrimSpace(string(status)) != "" {
+	if dirty {
 		return retain(PublicationReasonDirty)
 	}
-	ignoredArgs := append(append([]string{}, config...), "-C", path, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
-	ignored, err := m.runPublicationGit(ctx, target.Repository, ignoredArgs...)
+	ignoredArgs := append(append([]string{}, localConfig...), "-C", path, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
+	ignored, err := m.runPublicationGit(ctx, "", ignoredArgs...)
 	if err != nil || len(ignored) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
 	if hasMeaningfulIgnoredFiles(ignored) {
 		return retain(PublicationReasonDirty)
 	}
-	branchArgs := append(append([]string{}, config...), "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
-	currentBranch, err := m.runPublicationGit(ctx, target.Repository, branchArgs...)
+	branchArgs := append(append([]string{}, localConfig...), "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
+	currentBranch, err := m.runPublicationGit(ctx, "", branchArgs...)
 	if err != nil || len(currentBranch) > publicationMaxGitOutput || strings.TrimSpace(string(currentBranch)) != branch {
 		return retain(PublicationReasonUncertain)
 	}
-	headArgs := append(append([]string{}, config...), "-C", path, "rev-parse", "--verify", "HEAD^{commit}")
-	head, err := m.runPublicationGit(ctx, target.Repository, headArgs...)
+	headArgs := append(append([]string{}, localConfig...), "-C", path, "rev-parse", "--verify", "HEAD^{commit}")
+	head, err := m.runPublicationGit(ctx, "", headArgs...)
 	if err != nil || len(head) > publicationMaxGitOutput || !validGitObjectID(strings.TrimSpace(string(head))) {
 		return retain(PublicationReasonUncertain)
 	}
 	localHead := strings.TrimSpace(string(head))
-	localRefsArgs := append(append([]string{}, config...), "-C", path, "for-each-ref", "--format=%(objectname)%09%(refname)%09%(symref)", "refs")
-	localRefsOutput, err := m.runPublicationGit(ctx, target.Repository, localRefsArgs...)
+	localRefsArgs := append(append([]string{}, localConfig...), "-C", path, "for-each-ref", "--format=%(objectname)%09%(refname)%09%(symref)", "refs")
+	localRefsOutput, err := m.runPublicationGit(ctx, "", localRefsArgs...)
 	if err != nil || len(localRefsOutput) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
@@ -321,18 +327,6 @@ func hasMeaningfulIgnoredFiles(output []byte) bool {
 		}
 	}
 	return false
-}
-
-func safePublicationRepository(repository string) bool {
-	trimmed := strings.TrimSpace(repository)
-	return trimmed != "" && !strings.HasPrefix(trimmed, "-") && !strings.Contains(trimmed, "::") &&
-		!strings.ContainsAny(trimmed, "\x00\r\n")
-}
-
-func (m *Manager) runPublicationGit(ctx context.Context, repository string, args ...string) ([]byte, error) {
-	commandCtx, cancel := context.WithTimeout(ctx, publicationGitTimeout)
-	defer cancel()
-	return m.runGit(commandCtx, repository, args...)
 }
 
 func exactRemoteHead(output []byte, ref string) (string, bool) {
