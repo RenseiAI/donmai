@@ -24,6 +24,12 @@ type DaemonConfig struct {
 	Port int `json:"port" yaml:"port"`
 	// Host is the bind address (default "127.0.0.1").
 	Host string `json:"host" yaml:"host"`
+	// ControlToken is the per-install bearer credential for mutating
+	// control-API requests. It is attached as
+	// `Authorization: Bearer <token>` on non-GET requests only; GET
+	// routes stay credential-free. Empty preserves the legacy
+	// unauthenticated mode (tests, daemons that predate the token).
+	ControlToken string `json:"-" yaml:"-"`
 }
 
 // DefaultDaemonConfig returns a DaemonConfig with sane defaults.
@@ -424,16 +430,18 @@ type DaemonSessionHandle struct {
 // DaemonClient is an HTTP client for the local daemon's control API.
 // Construct with NewDaemonClient. All methods are safe for concurrent use.
 type DaemonClient struct {
-	baseURL    string
-	httpClient *http.Client
+	baseURL      string
+	httpClient   *http.Client
+	controlToken string
 }
 
 // NewDaemonClient constructs a DaemonClient pointing at the daemon derived
 // from cfg. The HTTP timeout is set to 10 seconds.
 func NewDaemonClient(cfg DaemonConfig) *DaemonClient {
 	return &DaemonClient{
-		baseURL:    cfg.BaseURL(),
-		httpClient: &http.Client{Timeout: 10 * time.Second},
+		baseURL:      cfg.BaseURL(),
+		httpClient:   &http.Client{Timeout: 10 * time.Second},
+		controlToken: strings.TrimSpace(cfg.ControlToken),
 	}
 }
 
@@ -444,6 +452,12 @@ func NewDaemonClientFromURL(baseURL string) *DaemonClient {
 		baseURL:    strings.TrimRight(baseURL, "/"),
 		httpClient: &http.Client{Timeout: 10 * time.Second},
 	}
+}
+
+// SetControlToken overrides the bearer credential attached to mutating
+// (non-GET) requests. Empty clears it.
+func (c *DaemonClient) SetControlToken(token string) {
+	c.controlToken = strings.TrimSpace(token)
 }
 
 func (c *DaemonClient) get(path string, target any) error {
@@ -474,6 +488,9 @@ func (c *DaemonClient) postContext(ctx context.Context, httpClient *http.Client,
 		return fmt.Errorf("create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.controlToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.controlToken)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return fmt.Errorf("request failed: %w", err)
@@ -629,6 +646,9 @@ func (c *DaemonClient) prepareRestart(ctx context.Context, httpClient *http.Clie
 		return nil, fmt.Errorf("daemon restart prepare: create request: %w", err)
 	}
 	req.Header.Set("Content-Type", "application/json")
+	if c.controlToken != "" {
+		req.Header.Set("Authorization", "Bearer "+c.controlToken)
+	}
 	resp, err := httpClient.Do(req)
 	if err != nil {
 		return nil, fmt.Errorf("daemon restart prepare: request failed: %w", err)

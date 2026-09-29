@@ -21,6 +21,7 @@ import (
 	daemonRuntime "github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/installer"
 	"github.com/RenseiAI/donmai/internal/anontoken"
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -44,7 +45,42 @@ type daemonClientFactory func(cfg afclient.DaemonConfig) daemonDoer
 
 // defaultDaemonFactory is the production factory — always returns a real client.
 func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
+}
+
+// withControlToken attaches the operator's control token (best-effort) to
+// an outbound daemon config. The token file lives in the operator's state
+// dir; spawned sessions never see it because the env names are runner-only.
+// The resolver lives here — not in afclient — because this package owns
+// the CLI process environment and afclient stays env-free by policy.
+func withControlToken(cfg afclient.DaemonConfig) afclient.DaemonConfig {
+	if strings.TrimSpace(cfg.ControlToken) != "" {
+		return cfg
+	}
+	if v := strings.TrimSpace(os.Getenv(afclient.ControlTokenEnv)); v != "" {
+		cfg.ControlToken = v
+		return cfg
+	}
+	path := controlTokenPath()
+	if path == "" {
+		return cfg
+	}
+	if tok, err := afclient.LoadControlToken(path); err == nil && strings.TrimSpace(tok) != "" {
+		cfg.ControlToken = strings.TrimSpace(tok)
+	}
+	return cfg
+}
+
+// controlTokenPath resolves the token file path: the explicit file-env
+// override wins when absolute, otherwise the brand state dir.
+func controlTokenPath() string {
+	if override := strings.TrimSpace(os.Getenv(afclient.ControlTokenFileEnv)); override != "" {
+		if filepath.IsAbs(override) {
+			return override
+		}
+		return ""
+	}
+	return statepath.Resolve(afclient.ControlTokenFileName, "/tmp/.donmai/"+afclient.ControlTokenFileName)
 }
 
 // defaultDaemonLogFile is the default path for the daemon log file per 011.

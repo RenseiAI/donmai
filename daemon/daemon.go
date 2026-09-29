@@ -76,6 +76,14 @@ type Options struct {
 	// itself does NOT auto-fill — leaving zero-as-ephemeral makes
 	// parallel tests collision-free under -race.
 	HTTPPort int
+	// ControlToken is the per-install bearer credential the HTTP control
+	// API requires on every mutating (non-GET) route. The production
+	// entry point mints it into the state dir and loads it here; the
+	// operator CLI reads the same file. Empty preserves the legacy
+	// unauthenticated mode (tests, harnesses, pre-token daemons).
+	// Sessions spawned by the daemon never receive it — the env names
+	// are runner-only and stripped from every worker environment.
+	ControlToken string
 	// PoolStatsProvider returns the current workarea pool snapshot. May be
 	// nil — the /api/daemon/pool/stats endpoint will return an empty
 	// snapshot in that case (acceptance criterion: pool integration is

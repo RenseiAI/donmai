@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
@@ -225,12 +226,23 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("construct daemon provider view: %w", err)
 			}
+			// The host control API requires a bearer token on mutating
+			// routes. Mint it into the operator's state dir (0600) and
+			// hand it to both the server gate and the CLI resolver so
+			// they agree; spawned sessions never receive it (runner-only
+			// env, stripped from every worker environment).
+			controlToken, tokErr := afclient.EnsureControlToken(controlTokenPath())
+			if tokErr != nil {
+				_, _ = fmt.Fprintf(errOut, "[daemon] control token unavailable: %v (mutating control routes stay open)\n", tokErr)
+				controlToken = ""
+			}
 			d := daemon.New(daemon.Options{
 				ConfigPath:       configPath,
 				JWTPath:          jwtPath,
 				HTTPHost:         host,
 				HTTPPort:         port,
 				SkipWizard:       skipWizard,
+				ControlToken:     controlToken,
 				ProviderRegistry: providerView,
 				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
 					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
