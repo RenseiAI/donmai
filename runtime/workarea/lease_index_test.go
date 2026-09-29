@@ -253,19 +253,26 @@ func TestBoundedSchedulerUsesSerialFullBatchesAndConcurrency(t *testing.T) {
 		positionOf[id] = i
 	}
 
-	// Closing overlapped is the synchronization point that proves concurrency:
-	// the first attempt cannot return until the scheduler dispatches a peer
-	// alongside it. A scheduler that serialized burns its attempt budget instead,
-	// so the property is decided by a rendezvous rather than by whether two
-	// attempt windows happened to overlap in wall-clock time.
+	// Each batch has its own rendezvous: its first attempts cannot return until
+	// all configured slots in that batch have entered and recorded their order.
+	// A single shared rendezvous would stay open after the first batch, allowing
+	// a fast worker to finish both later peers before a delayed callback records
+	// its earlier position. That measures goroutine scheduling, not FIFO job
+	// admission. A serialized scheduler still burns its attempt budget instead
+	// of meeting a batch's rendezvous.
 	//
 	// The seven leases still span three batches, but the batch boundary itself is
 	// deliberately not asserted here: a releaser can observe that batch k+1 began
 	// early, yet it can never observe that the scheduler declined to start it, so
 	// the drain-before-advance half of the contract has no positive signal to wait
 	// on. Cover that on the batch arithmetic instead of by observing attempts.
-	overlapped := make(chan struct{})
-	var entered, inFlight, maxInFlight atomic.Int32
+	const batches = (total + batchSize - 1) / batchSize
+	var overlapped [batches]chan struct{}
+	var entered [batches]atomic.Int32
+	for batch := range overlapped {
+		overlapped[batch] = make(chan struct{})
+	}
+	var inFlight, maxInFlight atomic.Int32
 	var mu sync.Mutex
 	var order []string
 	considered, err := store.ReapSnapshot(context.Background(), SchedulerOptions{
@@ -286,11 +293,13 @@ func TestBoundedSchedulerUsesSerialFullBatchesAndConcurrency(t *testing.T) {
 		order = append(order, lease.LeaseID)
 		mu.Unlock()
 
-		if entered.Add(1) == concurrency {
-			close(overlapped)
+		batch := positionOf[lease.LeaseID] / batchSize
+		slots := min(concurrency, total-batch*batchSize)
+		if int(entered[batch].Add(1)) == slots {
+			close(overlapped[batch])
 		}
 		select {
-		case <-overlapped:
+		case <-overlapped[batch]:
 			return nil
 		case <-ctx.Done():
 			return fmt.Errorf("%w: lease %s: %w", errAttemptsNeverOverlapped, lease.LeaseID, ctx.Err())

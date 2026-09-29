@@ -50,8 +50,12 @@ On Linux, use Go installation or a release archive below.
 ### go install (requires Go 1.26.6+)
 
 ```bash
-go install github.com/RenseiAI/donmai/cmd/donmai@latest
+go install github.com/RenseiAI/donmai/cmd/donmai@v0.72.52
 ```
+
+Use the explicit release pin: the public Go proxy currently resolves `@latest`
+to the historical `v1.0.0` module. This source-install command records the pinned
+module version in Go build information and reports `dev` for `donmai --version`.
 
 ### GitHub release download
 
@@ -59,12 +63,12 @@ Pre-built binaries for macOS (arm64, amd64) and Linux (arm64, amd64) are
 attached to every release on the
 [releases page](https://github.com/RenseiAI/donmai/releases).
 
-Example for macOS arm64, pinned to v0.72.47. See the releases page for newer
+Example for macOS arm64, pinned to v0.72.52. See the releases page for newer
 versions:
 
 ```bash
 mkdir -p "$HOME/.local/bin"
-curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.47/donmai_0.72.47_darwin_arm64.tar.gz \
+curl -fsSL https://github.com/RenseiAI/donmai/releases/download/v0.72.52/donmai_0.72.52_darwin_arm64.tar.gz \
   | tar -xz -C "$HOME/.local/bin" donmai
 "$HOME/.local/bin/donmai" --version
 ```
@@ -164,7 +168,7 @@ Inspect and control individual agent sessions.
 donmai agent list [--all] [--json] [--sandbox <id>]
 donmai agent status <session-id>
 donmai agent stop <session-id>
-donmai agent chat <session-id>          # forward a prompt to a running agent
+donmai agent chat <session-id> <message> # forward a prompt to a running agent
 donmai agent reconnect <session-id>     # reconnect to an orphaned session
 ```
 
@@ -184,7 +188,7 @@ Manage this machine. `host` owns the local daemon's lifecycle, this machine's
 capacity envelope and workarea pool, the providers and kits installed on it, the
 projects it admits work for, and the live dashboard of sessions running on it.
 The daemon installs as a launchd agent (macOS) or systemd user unit (Linux) and
-manages the workarea pool, auto-updates, and session lifecycle.
+manages the workarea pool and session lifecycle.
 
 `donmai daemon …` still resolves in v0.72.47 as a hidden deprecated lifecycle
 alias. It prints a notice on stderr when invoked; use `host` for new scripts.
@@ -196,20 +200,25 @@ donmai host status                        # running / stopped / draining
 donmai host stop
 donmai host pause                         # stop accepting new work
 donmai host resume
-donmai host drain                         # wait for in-flight sessions, then stop
-donmai host update                        # trigger a manual update check
+donmai host drain                         # drain work; keep the daemon resumable
 donmai host doctor                        # health check: config, credentials, disk
 donmai host logs [--follow]               # tail daemon log (NDJSON / pretty)
 donmai host stats [--pool]                # capacity, sessions, pool state
 donmai host setup                         # first-run interactive wizard
 donmai host set <key> <value>             # mutate a single config key
-donmai host evict --repo <repo> --older-than <duration>
 donmai host watch [--all]                 # live dashboard of this host's sessions
 donmai host provider list                 # providers installed on this machine
 donmai host kit list                      # kits installed on this machine
 donmai host workarea list                 # this machine's workarea pool
 donmai host project list                  # projects this machine admits work for
 ```
+
+By default, the daemon has no update source configured and does not support
+manual pool eviction. `donmai host update` can acknowledge a request without
+downloading or installing a new binary and leave the host `draining`; use
+`donmai host resume` to restore
+admission if that happens. `donmai host evict` returns HTTP 501 and evicts
+nothing in the stock daemon.
 
 On Linux, `host install --system` selects a system-scoped unit and requires
 administrator privileges; `--user` selects the user-scoped unit.
@@ -221,15 +230,19 @@ donmai host set capacity.maxConcurrentSessions <sessions>
 donmai host set capacity.poolMaxDiskGb <gb>
 ```
 
-Use `donmai host setup` to configure local registration and credentials before
-installing the service.
+Use `donmai host setup` to configure the work source, daemon settings, and
+resource limits before installing the service.
 
 ### `donmai governor`
 
-Start, stop, and query the governor scan loop.
+The governor scans named Linear projects and enqueues eligible issues in Redis;
+execution requires a separate worker. Set `LINEAR_API_KEY` and a `REDIS_URL`
+that reaches Redis before starting it. Pass a Linear project name with
+`--project`, or set `GOVERNOR_PROJECTS` to a comma-separated list of project
+names. `status` reports whether the recorded governor process is running.
 
 ```bash
-donmai governor start [--max-dispatches <n>] [--scan-interval <duration>]
+donmai governor start --project "<project-name>" [--max-dispatches <n>] [--scan-interval <duration>]
 donmai governor stop
 donmai governor status
 ```
@@ -294,10 +307,14 @@ donmai linear list-sub-issues <parent-id>
 donmai linear list-sub-issue-statuses <parent-id>
 donmai linear update-sub-issue <id> [--state "..."] [--comment "..."]
 donmai linear check-blocked <issue-id>
-donmai linear list-backlog-issues --project "..."
-donmai linear list-unblocked-backlog --project "..."
+donmai linear list-backlog-issues --project "..." --statuses Backlog
+donmai linear list-unblocked-backlog --project "..." --statuses Backlog
 donmai linear create-blocker <source-issue-id> --title "..."
 ```
+
+The two backlog grooming helpers default to top-level `Icebox` issues. Pass
+`--statuses Backlog` to select the project's prioritized Backlog state; their
+default `--parents-only` filter excludes sub-issues.
 
 `get-issue` always includes `parentId` and `parentIdentifier`. Both are JSON
 strings for a child issue and explicit `null` values for a root issue.
@@ -368,10 +385,11 @@ notice to stderr; will be removed once `donmai-libraries` is archived).
 
 ### `donmai arch`
 
-Assess a GitHub pull request or commit for architectural drift with the native
-Go pipeline. With `gh` available it reads the PR diff; otherwise the default
-degrades to metadata-only analysis. `--require-diff` returns an error when the
-complete diff cannot be read.
+Assess a GitHub pull request for architectural drift with native diff analysis.
+Pass a PR URL or `--repository` with `--pr`. With `gh` available, the command
+reads the PR diff; without it, the default warns and returns metadata-only
+output. Use `--require-diff` for checks that need a complete diff: it returns
+exit code 2 when that diff is unavailable. A triggered policy returns exit code 1.
 
 ```bash
 donmai arch assess https://github.com/RenseiAI/donmai/pull/667 --summary

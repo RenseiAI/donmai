@@ -32,18 +32,21 @@ import (
 // ready. The correlation fields are deliberately per session: session-shim-v1
 // defines no host-wide controller generation.
 type SessionShimAdoptionEvidence struct {
-	Identity               sessionshim.Identity
-	HostID                 string
-	ControllerID           string
-	ShimID                 string
-	ProcessEpoch           uint64
-	ControllerGeneration   uint64
-	LastForwardedSeq       uint64
-	Extensions             shimwire.Extensions
-	PreparedCorrelation    []byte
-	ObservedAtUnixNano     int64
-	ProtocolVersion        uint32
-	CarrierCompatible      bool
+	Identity             sessionshim.Identity
+	HostID               string
+	ControllerID         string
+	ShimID               string
+	ProcessEpoch         uint64
+	ControllerGeneration uint64
+	LastForwardedSeq     uint64
+	Extensions           shimwire.Extensions
+	PreparedCorrelation  []byte
+	ObservedAtUnixNano   int64
+	ProtocolVersion      uint32
+	CarrierCompatible    bool
+	// ContinuationSupported is authenticated controller capability evidence
+	// available before publication, never permission to inspect or mutate.
+	ContinuationSupported  bool
 	CarrierIncompatibility SessionShimCarrierIncompatibility
 	// SnapshotProxy is the exact just-adopted controller capability. It is
 	// callable during OnAdoption, before the controller enters the daemon's
@@ -3479,6 +3482,7 @@ func (d *Daemon) sessionShimAdoptionEvidence(
 		ObservedAtUnixNano:     d.shimNow().UnixNano(),
 		ProtocolVersion:        ctrl.SelectedVersion(),
 		CarrierCompatible:      carrierCompatible,
+		ContinuationSupported:  ctrl.SupportsContinuation(),
 		CarrierIncompatibility: carrierIncompatibility,
 		SnapshotProxy: func() *SessionShimSnapshotProxy {
 			if ctrl.SupportsAuthoritativeSnapshot() {

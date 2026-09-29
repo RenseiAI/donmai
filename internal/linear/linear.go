@@ -33,3 +33,14 @@ type Linear interface {
 	CreateRelation(ctx context.Context, issueID, relatedIssueID, relationType string) (string, bool, error)
 	DeleteRelation(ctx context.Context, relationID string) error
 }
+
+// LabelManager is additive beside Linear so existing embedders and unrelated
+// command test doubles keep their published interface. Native label-group
+// commands require this capability and refuse explicitly when absent.
+type LabelManager interface {
+	ListLabelDetails(ctx context.Context) ([]LabelInfo, error)
+	ListLabelDetailsForTeam(ctx context.Context, teamRef string) ([]LabelInfo, error)
+	ListIssueLabels(ctx context.Context, issueID string) ([]Label, error)
+	CreateNativeLabel(ctx context.Context, input NativeLabelCreateInput) (*LabelInfo, error)
+	ReparentLabel(ctx context.Context, labelID, parentID string) (*LabelInfo, error)
+}

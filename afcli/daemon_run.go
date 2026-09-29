@@ -227,6 +227,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			}
 			d := daemon.New(daemon.Options{
 				ConfigPath:       configPath,
+				BinaryName:       binaryName(cfg),
 				JWTPath:          jwtPath,
 				HTTPHost:         host,
 				HTTPPort:         port,

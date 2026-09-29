@@ -18,6 +18,9 @@ import (
 type WizardOptions struct {
 	// Existing is an existing config (if any) used as defaults.
 	Existing *Config
+	// BinaryName is the invoking command name used in completion guidance.
+	// Empty defaults to the standalone OSS binary name, donmai.
+	BinaryName string
 	// ConfigPath is where to write the resulting config. Empty means do not
 	// persist.
 	ConfigPath string
@@ -73,6 +76,10 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	if skip {
 		return BuildDefaultConfigFromExisting(opts.Existing, opts.ConfigPath)
 	}
+	binaryName := strings.TrimSpace(opts.BinaryName)
+	if binaryName == "" {
+		binaryName = "donmai"
+	}
 
 	in := opts.Stdin
 	if in == nil {
@@ -96,7 +103,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	wln := func(msg string) { _, _ = fmt.Fprintln(out, msg) }
 	wf := func(format string, args ...any) { _, _ = fmt.Fprintf(out, format, args...) }
 
-	wln("\nWelcome to Rensei. Let's get your machine working.")
+	wln("\nLet's get your machine working.")
 
 	// [1/5] Machine identity
 	wln("\n[1/5] Machine identity")
@@ -354,9 +361,9 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		}
 		wf("Setup complete. Config written to %s\n", opts.ConfigPath)
 	}
-	wln("  Status: rensei daemon status")
-	wln("  Logs:   rensei daemon logs")
-	wln("  Stop:   rensei daemon stop")
+	wf("  Status: %s host status\n", binaryName)
+	wf("  Logs:   %s host logs\n", binaryName)
+	wf("  Stop:   %s host stop\n", binaryName)
 
 	return cfg, nil
 }

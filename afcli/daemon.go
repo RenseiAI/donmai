@@ -2,6 +2,7 @@ package afcli
 
 import (
 	"bufio"
+	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -257,7 +258,7 @@ func newDaemonUninstallCmd(bin string) *cobra.Command {
 
 // ── setup ─────────────────────────────────────────────────────────────────────
 
-func newDaemonSetupCmd() *cobra.Command {
+func newDaemonSetupCmd(bin string) *cobra.Command {
 	var configPath string
 	cmd := &cobra.Command{
 		Use:   "setup",
@@ -279,6 +280,7 @@ func newDaemonSetupCmd() *cobra.Command {
 			cfg, err := daemonRuntime.RunSetupWizard(daemonRuntime.WizardOptions{
 				Existing:   existing,
 				ConfigPath: path,
+				BinaryName: bin,
 				Stdin:      os.Stdin,
 				Stdout:     cmd.OutOrStdout(),
 			})
@@ -415,32 +417,13 @@ func newDaemonLogsCmd() *cobra.Command {
 				return nil
 			}
 
-			// Stream from current position (beginning of file for non-follow,
-			// continuously for follow).
-			scanner := bufio.NewScanner(f)
-			for scanner.Scan() {
-				line := scanner.Text()
-				printLogLine(out, line, !raw)
-			}
-			if err := scanner.Err(); err != nil {
-				return fmt.Errorf("read log: %w", err)
-			}
-
 			if !follow {
-				return nil
+				return scanDaemonLog(f, out, !raw)
 			}
 
-			// Tail -f equivalent: poll for new content.
-			for {
-				time.Sleep(250 * time.Millisecond)
-				for scanner.Scan() {
-					line := scanner.Text()
-					printLogLine(out, line, !raw)
-				}
-				if err := scanner.Err(); err != nil {
-					return fmt.Errorf("read log: %w", err)
-				}
-			}
+			ticker := time.NewTicker(250 * time.Millisecond)
+			defer ticker.Stop()
+			return followDaemonLog(cmd.Context(), f, out, !raw, ticker.C)
 		},
 	}
 
@@ -450,6 +433,40 @@ func newDaemonLogsCmd() *cobra.Command {
 	cmd.Flags().BoolVar(&raw, "raw", false, "Print raw NDJSON without pretty-printing")
 
 	return cmd
+}
+
+// scanDaemonLog reads available complete and EOF-terminated lines from the
+// current file offset, preserving the command's existing Scanner limits.
+func scanDaemonLog(r io.Reader, out io.Writer, parseJSON bool) error {
+	scanner := bufio.NewScanner(r)
+	for scanner.Scan() {
+		printLogLine(out, scanner.Text(), parseJSON)
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read log: %w", err)
+	}
+	return nil
+}
+
+// followDaemonLog starts a new scan after each observed EOF. The reader's file
+// offset advances, so later scans see only bytes appended since the last one.
+func followDaemonLog(ctx context.Context, r io.Reader, out io.Writer, parseJSON bool, ticks <-chan time.Time) error {
+	if err := scanDaemonLog(r, out, parseJSON); err != nil {
+		return err
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			return nil
+		case _, ok := <-ticks:
+			if !ok {
+				return nil
+			}
+			if err := scanDaemonLog(r, out, parseJSON); err != nil {
+				return err
+			}
+		}
+	}
 }
 
 // tailLines reads the last n lines from r and writes them to w. If parseJSON
@@ -672,7 +689,8 @@ func newDaemonDrainCmd(factory daemonClientFactory) *cobra.Command {
 		Use:   "drain",
 		Short: "Gracefully drain in-flight work",
 		Long: "Signal the daemon to stop accepting new sessions and wait for in-flight\n" +
-			"sessions to complete before exiting. Use --timeout to cap the wait.\n" +
+			"sessions to complete while keeping the daemon running and resumable.\n" +
+			"Use --timeout to cap the wait.\n" +
 			"0 means use the daemon's configured drain timeout.",
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {

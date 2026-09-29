@@ -5,8 +5,37 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/tui-components/theme"
 )
+
+func TestRenderCard_CombinedIdentityAndScope(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	card := SessionCard{
+		SessionID: "session-1", IssueIdentifier: "ENG-1284", ProjectName: "web",
+		Harness: "driver", Model: "model-id", ModelProvider: "vendor",
+		DaemonState: "running", WorkType: "development",
+	}
+	for _, plain := range []bool{true, false} {
+		out := renderCard(theme.DefaultTheme(), card, 0, true, plain, now)
+		for _, want := range []string{
+			"project web · issue ENG-1284", "harness driver", "model model-id",
+			"provider vendor", "state running", "elapsed unknown", "tools not reported",
+			"cost not reported", "turns not reported", "heartbeat never", "output never", "work never",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("plain=%v: card missing %q:\n%s", plain, want, out)
+			}
+		}
+		if !plain {
+			for _, line := range strings.Split(out, "\n") {
+				if width := lipgloss.Width(line); width > cardWidth {
+					t.Errorf("selected card line width %d exceeds %d: %q", width, cardWidth, line)
+				}
+			}
+		}
+	}
+}
 
 func TestRenderCard_Plain(t *testing.T) {
 	tm := theme.DefaultTheme()
@@ -120,7 +149,7 @@ func TestAgeSeconds(t *testing.T) {
 	}
 }
 
-func TestRenderGrid_PlainGroupsByIssue(t *testing.T) {
+func TestRenderGrid_PlainFlowsAcrossFullWidth(t *testing.T) {
 	tm := theme.DefaultTheme()
 	now := time.Now()
 	cards := []SessionCard{
@@ -128,26 +157,58 @@ func TestRenderGrid_PlainGroupsByIssue(t *testing.T) {
 		{SessionID: "b", IssueIdentifier: "ENG-1", WorkType: "development", DaemonState: "running"},
 		{SessionID: "c", IssueIdentifier: "ENG-2", WorkType: "qa", DaemonState: "running"},
 	}
-	out := renderGrid(tm, cards, 0, 0, 120, true, now)
-	if !strings.Contains(out, "ENG-1") || !strings.Contains(out, "ENG-2") {
-		t.Fatalf("grid missing issue group heads:\n%s", out)
+	// Sessions flow in flat snapshot order regardless of issue grouping,
+	// and issue context lives in the cards — no group heading rows.
+	// (Plain mode stacks cards vertically; row-sharing applies to the
+	// styled grid covered below.)
+	out := renderGrid(tm, cards, 0, 0, 120, 0, true, now)
+	if got := strings.Count(out, "ENG-1"); got < 2 {
+		t.Errorf("each card should carry its own issue id (want >=2 ENG-1), got %d:\n%s", got, out)
 	}
-	// The ENG-1 group HEADING (a line that starts with the issue id, no
-	// leading status dot) should appear exactly once even though the group
-	// has two cards. Card header lines start with "● ".
-	headCount := 0
 	for _, line := range strings.Split(out, "\n") {
-		if strings.HasPrefix(strings.TrimSpace(line), "ENG-1  development") {
-			headCount++
+		trimmed := strings.TrimSpace(line)
+		if strings.HasPrefix(trimmed, "ENG-1  development") || strings.HasPrefix(trimmed, "ENG-2  qa") {
+			t.Errorf("grid should not emit group heading rows, got line %q:\n%s", line, out)
 		}
 	}
-	if headCount != 1 {
-		t.Errorf("ENG-1 group head should appear once, got %d:\n%s", headCount, out)
+}
+
+func TestRenderGrid_DifferentIssuesShareRows(t *testing.T) {
+	tm := theme.DefaultTheme()
+	now := time.Now()
+	cards := []SessionCard{
+		{SessionID: "a", IssueIdentifier: "ENG-1", WorkType: "development", DaemonState: "running"},
+		{SessionID: "b", IssueIdentifier: "ENG-2", WorkType: "qa", DaemonState: "running"},
+	}
+	// 120 columns fit both 44-wide cards side by side: the styled grid
+	// renders one shared row whose height equals a single card height,
+	// holding cards from different issues.
+	out := renderGrid(tm, cards, 0, 0, 120, 0, false, now)
+	if !strings.Contains(out, "ENG-1") || !strings.Contains(out, "ENG-2") {
+		t.Fatalf("grid missing cards:\n%s", out)
+	}
+	// Card 0 is selected (full border ring: taller); card 1 is not.
+	// The shared row takes the tallest card's height.
+	sel := renderCard(tm, cards[0], 0, true, false, now)
+	if got, want := displayLines(out), displayLines(sel); got != want {
+		t.Errorf("want one shared row of %d lines, got %d:\n%s", want, got, out)
+	}
+}
+
+func TestRenderGrid_ProjectContextInsideCards(t *testing.T) {
+	tm := theme.DefaultTheme()
+	now := time.Now()
+	cards := []SessionCard{
+		{SessionID: "a", IssueIdentifier: "ENG-1", ProjectName: "web", WorkType: "development", DaemonState: "running"},
+	}
+	out := renderGrid(tm, cards, 0, 0, 120, 0, true, now)
+	if !strings.Contains(out, "web") {
+		t.Errorf("card should carry its project context, got:\n%s", out)
 	}
 }
 
 func TestRenderGrid_Empty(t *testing.T) {
-	out := renderGrid(theme.DefaultTheme(), nil, -1, 0, 80, true, time.Now())
+	out := renderGrid(theme.DefaultTheme(), nil, -1, 0, 80, 0, true, time.Now())
 	if !strings.Contains(out, "No active sessions") {
 		t.Errorf("empty grid should say so, got %q", out)
 	}

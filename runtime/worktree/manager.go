@@ -220,23 +220,25 @@ type ProvisionResult struct {
 // Concurrency: the Manager serializes Provision/Teardown for the
 // same session id but allows different sessions to run in parallel.
 type Manager struct {
-	parentDir        string
-	logger           *slog.Logger
-	prober           OwnershipProber
-	runner           CommandRunner
-	envRunner        EnvCommandRunner
-	gitAuth          GitAuth
-	baseFetchTimeout time.Duration
-	delay            time.Duration
-	leases           *workarea.LeaseStore
-	acquisitions     *workarea.AcquisitionStore
-	seeds            *workarea.SeedStore
-	provisionHook    ProvisionHook
-	archiveRoot      ArchiveRootFunc
-	restoreSessionID string
-	authorityMu      sync.Mutex
-	now              func() time.Time
-	lifecycleHook    func(string)
+	parentDir               string
+	logger                  *slog.Logger
+	prober                  OwnershipProber
+	runner                  CommandRunner
+	publicationCustomRunner bool
+	publicationGitPath      string
+	envRunner               EnvCommandRunner
+	gitAuth                 GitAuth
+	baseFetchTimeout        time.Duration
+	delay                   time.Duration
+	leases                  *workarea.LeaseStore
+	acquisitions            *workarea.AcquisitionStore
+	seeds                   *workarea.SeedStore
+	provisionHook           ProvisionHook
+	archiveRoot             ArchiveRootFunc
+	restoreSessionID        string
+	authorityMu             sync.Mutex
+	now                     func() time.Time
+	lifecycleHook           func(string)
 
 	mu           sync.Mutex
 	sessions     map[string]*ProvisionResult
@@ -339,6 +341,12 @@ func NewManager(opts Options) (*Manager, error) {
 	if runner == nil {
 		runner = defaultRunner
 	}
+	publicationGitPath, _ := exec.LookPath("git")
+	if publicationGitPath != "" {
+		if resolved, resolveErr := filepath.EvalSymlinks(publicationGitPath); resolveErr == nil {
+			publicationGitPath = resolved
+		}
+	}
 	envRunner := opts.EnvCommandRunner
 	if envRunner == nil {
 		envRunner = defaultEnvRunner
@@ -386,24 +394,26 @@ func NewManager(opts Options) (*Manager, error) {
 		}
 	}
 	manager := &Manager{
-		parentDir:        abs,
-		logger:           logger,
-		prober:           opts.OwnershipProber,
-		runner:           runner,
-		envRunner:        envRunner,
-		gitAuth:          opts.GitAuth,
-		baseFetchTimeout: baseFetchTimeout,
-		delay:            delay,
-		leases:           leases,
-		acquisitions:     acquisitions,
-		seeds:            seeds,
-		provisionHook:    opts.ProvisionHook,
-		archiveRoot:      opts.ArchiveRoot,
-		restoreSessionID: opts.RestoreSessionID,
-		now:              opts.Now,
-		lifecycleHook:    opts.LifecycleHook,
-		sessions:         make(map[string]*ProvisionResult),
-		sessionLocks:     make(map[string]*sync.Mutex),
+		parentDir:               abs,
+		logger:                  logger,
+		prober:                  opts.OwnershipProber,
+		runner:                  runner,
+		publicationCustomRunner: opts.CommandRunner != nil,
+		publicationGitPath:      publicationGitPath,
+		envRunner:               envRunner,
+		gitAuth:                 opts.GitAuth,
+		baseFetchTimeout:        baseFetchTimeout,
+		delay:                   delay,
+		leases:                  leases,
+		acquisitions:            acquisitions,
+		seeds:                   seeds,
+		provisionHook:           opts.ProvisionHook,
+		archiveRoot:             opts.ArchiveRoot,
+		restoreSessionID:        opts.RestoreSessionID,
+		now:                     opts.Now,
+		lifecycleHook:           opts.LifecycleHook,
+		sessions:                make(map[string]*ProvisionResult),
+		sessionLocks:            make(map[string]*sync.Mutex),
 	}
 	if acquisitions != nil {
 		if err := manager.restoreReadyAcquisitions(); err != nil {

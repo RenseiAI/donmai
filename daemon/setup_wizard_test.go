@@ -49,6 +49,7 @@ func TestRunSetupWizard_Interactive_HappyPath(t *testing.T) {
 	cfgPath := filepath.Join(t.TempDir(), "daemon.yaml")
 	cfg, err := RunSetupWizard(WizardOptions{
 		ConfigPath:      cfgPath,
+		BinaryName:      "fleetctl",
 		Stdin:           in,
 		Stdout:          &out,
 		IsTTY:           &tru,
@@ -82,6 +83,11 @@ func TestRunSetupWizard_Interactive_HappyPath(t *testing.T) {
 	}
 	if !cfg.AdmitsAnyRoutedProject() {
 		t.Errorf("ProjectAdmissionMode = %q, want the accepted all-routed consent", cfg.EffectiveProjectAdmissionMode())
+	}
+	for _, guidance := range []string{"fleetctl host status", "fleetctl host logs", "fleetctl host stop"} {
+		if !strings.Contains(out.String(), guidance) {
+			t.Errorf("setup completion omitted configured-binary guidance %q: %s", guidance, out.String())
+		}
 	}
 }
 
@@ -127,6 +133,11 @@ func TestRunSetupWizard_Interactive_DeclinedAdmissionStaysEnumerated(t *testing.
 	}
 	if got := cfg.EffectiveProjectAdmissionMode(); got != ProjectAdmissionModeEnumerated {
 		t.Fatalf("mode = %q, want %q", got, ProjectAdmissionModeEnumerated)
+	}
+	for _, guidance := range []string{"donmai host status", "donmai host logs", "donmai host stop"} {
+		if !strings.Contains(out.String(), guidance) {
+			t.Errorf("setup completion omitted usable host guidance %q: %s", guidance, out.String())
+		}
 	}
 }
 

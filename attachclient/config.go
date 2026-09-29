@@ -53,6 +53,10 @@ type HostConfig struct {
 	// Session is the live PTY surface (structurally == agent.InteractiveSession).
 	Session Session
 
+	// ContinuationSource explicitly supplies the supported complete checkpoint
+	// rail. Nil uses Session only when it implements positive capability support.
+	ContinuationSource ContinuationSource
+
 	// Logger receives structured logs. Optional; nil is quiet (discard).
 	Logger *slog.Logger
 

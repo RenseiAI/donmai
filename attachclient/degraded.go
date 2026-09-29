@@ -194,6 +194,7 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 	// Session's immutable PTY epoch, not merely parse a bearer. validatedToken
 	// applies the same ground-truth check as the top-level reconnect loop.
 	tokH := &tokenHolder{cur: tok, src: h.validatedToken}
+	legCtx = h.continuationContext(legCtx)
 
 	// Open SSE-down: binds the host leg (epoch CAS). 409 == epoch-stale.
 	sseResp, err := h.openHostSSE(legCtx, sseURL, tokH, cl)
@@ -217,7 +218,7 @@ func (h *host) runDegraded(ctx context.Context, tok string, cl hostClaims, exitD
 	// Announce the host leg with a subscribe control in the first batch's
 	// outOfSeq (§ 14: host Control rides outOfSeq). Binding also happened on the
 	// SSE GET, so a failure here is non-fatal.
-	if subFrame, serr := buildHostSubscribe(cl); serr == nil {
+	if subFrame, serr := buildHostSubscribe(cl, continuationSchemas(h.continuationSource())...); serr == nil {
 		batch := attachwire.HostFrameBatch{
 			BatchID:  newBatchID(),
 			OutOfSeq: []string{attachwire.EncodeFrameBase64(subFrame)},
@@ -396,6 +397,9 @@ func (h *host) degradedWindow(legCtx context.Context, postURL string, tokH *toke
 // local-PTY-grounded bounded recovery decision.
 func (h *host) openHostSSE(ctx context.Context, sseURL string, tokH *tokenHolder, cl hostClaims) (*http.Response, error) {
 	u := sseURL + "?epoch=" + strconv.FormatInt(cl.Epoch, 10)
+	if h.continuationSource() != nil {
+		u += "&continuation_schema=" + url.QueryEscape(attachwire.ContinuationSchema)
+	}
 	authRetried := false
 	for {
 		rejected := tokH.current()

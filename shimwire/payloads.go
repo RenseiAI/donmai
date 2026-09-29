@@ -71,6 +71,11 @@ type Hello struct {
 	OrphanDeadlineUnixNano int64 `json:"orphanDeadlineAt,omitempty"`
 
 	Extensions Extensions `json:"extensions,omitempty"`
+	// Continuation is advertised only by v5 producers; HostEpoch is the PTY
+	// stream epoch, not ProcessEpoch or a carrier generation. EncodeHello and
+	// DecodeHello carry it through the optional extension map, never a new
+	// top-level field that released strict decoders would reject.
+	Continuation *CheckpointCapability `json:"-"`
 }
 
 // Welcome is the daemon's adoption proposal.
@@ -429,12 +434,39 @@ func decodeJSON(body []byte, v any) error {
 }
 
 // EncodeHello encodes a Hello body.
-func EncodeHello(h Hello) ([]byte, error) { return encodeJSON(h) }
+func EncodeHello(h Hello) ([]byte, error) {
+	if h.Continuation != nil {
+		value, err := encodeJSON(h.Continuation)
+		if err != nil {
+			return nil, err
+		}
+		if len(value) > MaxCheckpointCapabilityBytes {
+			return nil, fmt.Errorf("shimwire: %w: oversized checkpoint capability", ErrMalformed)
+		}
+		values := make(map[string]string, len(h.Extensions.Values)+1)
+		for k, v := range h.Extensions.Values {
+			values[k] = v
+		}
+		if old, ok := values[ExtContinuationCheckpoint]; ok && old != string(value) {
+			return nil, fmt.Errorf("shimwire: %w: conflicting checkpoint capability", ErrMalformed)
+		}
+		values[ExtContinuationCheckpoint] = string(value)
+		h.Extensions.Values = values
+	}
+	if _, err := h.Extensions.CheckpointCapability(); err != nil {
+		return nil, err
+	}
+	return encodeJSON(h)
+}
 
 // DecodeHello strictly decodes a Hello body.
 func DecodeHello(body []byte) (Hello, error) {
 	var h Hello
-	err := decodeJSON(body, &h)
+	if err := decodeJSON(body, &h); err != nil {
+		return h, err
+	}
+	var err error
+	h.Continuation, err = h.Extensions.CheckpointCapability()
 	return h, err
 }
 

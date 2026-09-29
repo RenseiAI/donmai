@@ -74,9 +74,46 @@ if [[ "${uid}" == 0 ]]; then
 fi
 
 printf 'podman-go-test: go test %s (Linux container, go%s)\n' "$*" "${go_version}"
+# --rm enables Podman's volatile overlay optimization, which omits fsync.
+# Archive and journal tests need real filesystem sync semantics. Retain the
+# container until the test exits, then remove only the ID recorded by this run.
+container_receipt="$(mktemp -d)"
+container_client_pid=''
+container_creating=1
+cleanup() {
+  local status=$? container_id cleanup_failed=0
+  trap - EXIT INT TERM
+  # Let an in-flight create finish writing its receipt. It cannot start the
+  # test workload; killing its client could abandon a server-side creation.
+  if [[ -n "${container_client_pid}" && "${container_creating}" -eq 1 ]]; then
+    wait "${container_client_pid}" 2>/dev/null || true
+  fi
+  if [[ -s "${container_receipt}/cid" ]]; then
+    container_id="$(cat "${container_receipt}/cid")"
+    if [[ ! "${container_id}" =~ ^[0-9a-f]{64}$ ]]; then
+      printf 'podman-go-test: invalid container ID receipt\n' >&2
+      [[ "${status}" -ne 0 ]] || status=1
+    elif ! podman rm --force "${container_id}" >/dev/null; then
+      printf 'podman-go-test: cleanup failed for container %s\n' "${container_id}" >&2
+      cleanup_failed=1
+      [[ "${status}" -ne 0 ]] || status=1
+    fi
+  fi
+  if [[ -n "${container_client_pid}" ]]; then
+    if [[ "${cleanup_failed}" -ne 0 ]]; then
+      kill -TERM "${container_client_pid}" 2>/dev/null || true
+    fi
+    wait "${container_client_pid}" 2>/dev/null || true
+  fi
+  rm -rf -- "${container_receipt}"
+  exit "${status}"
+}
+trap cleanup EXIT
+trap 'exit 130' INT
+trap 'exit 143' TERM
 # --init: a real PID 1 reaps orphaned grandchildren, as on a CI runner; with go
 # test as PID 1 a killed orphan stays a zombie and process-group tests fail.
-exec podman run --rm --init --user "${uid}:${gid}" \
+podman create --cidfile "${container_receipt}/cid" --init --user "${uid}:${gid}" \
   --volume "${root}:${root}" \
   --volume "${common}:${common}" \
   --volume "${cache_volume}:/cache:U" \
@@ -91,4 +128,12 @@ exec podman run --rm --init --user "${uid}:${gid}" \
   --env GIT_CONFIG_KEY_0=safe.directory \
   --env GIT_CONFIG_VALUE_0='*' \
   "${image}" \
-  sh -c 'mkdir -p "$HOME" && exec go test "$@"' go-test "$@"
+  sh -c 'mkdir -p "$HOME" && exec go test "$@"' go-test "$@" >/dev/null &
+container_client_pid=$!
+wait "${container_client_pid}"
+container_id="$(cat "${container_receipt}/cid")"
+[[ "${container_id}" =~ ^[0-9a-f]{64}$ ]] || die 'invalid container ID receipt'
+container_creating=0
+podman start --attach "${container_id}" &
+container_client_pid=$!
+wait "${container_client_pid}"

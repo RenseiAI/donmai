@@ -240,12 +240,8 @@ func TestModelProvider_LegacyFallback(t *testing.T) {
 	}
 }
 
-// TestRenderCard_Widths renders the grid at the required terminal widths
-// (40/80/120/200 columns, plain mode, overflow list) as terminal evidence
-// for the change record. Cards are a fixed cardWidth wide by design — grid
-// geometry belongs to the parallel layout run — so this asserts the render
-// carries the labeled fields at every width rather than fitting narrow
-// terminals. The full output is logged as evidence.
+// TestRenderCard_Widths checks truthful labels at card widths and the
+// deliberate compact fallback below the minimum card width.
 func TestRenderCard_Widths(t *testing.T) {
 	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
 	cards := []SessionCard{
@@ -263,8 +259,14 @@ func TestRenderCard_Widths(t *testing.T) {
 	}
 	tm := theme.DefaultTheme()
 	for _, width := range []int{40, 80, 120, 200} {
-		out := renderGrid(tm, cards, 0, 0, width, true, now)
+		out := renderGrid(tm, cards, 0, 0, width, 0, true, now)
 		t.Logf("--- width %d ---\n%s", width, out)
+		if width < minCardWidth {
+			if !strings.Contains(out, "ENG-1284") || strings.Contains(out, "harness loop-driver") {
+				t.Errorf("width %d: compact fallback must show identity without full fields:\n%s", width, out)
+			}
+			continue
+		}
 		for _, want := range []string{
 			"harness loop-driver", "provider vendor", "tools 37",
 			"harness unknown", "tools not reported",

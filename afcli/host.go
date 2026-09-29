@@ -80,7 +80,7 @@ func addHostLifecycleCommands(parent *cobra.Command, factory daemonClientFactory
 
 	parent.AddCommand(newDaemonInstallCmd(bin))
 	parent.AddCommand(newDaemonUninstallCmd(bin))
-	parent.AddCommand(newDaemonSetupCmd())
+	parent.AddCommand(newDaemonSetupCmd(bin))
 	parent.AddCommand(newDaemonRunCmd(cfg))
 	parent.AddCommand(newDaemonStatusCmd(factory, bin))
 	parent.AddCommand(newDaemonLogsCmd())

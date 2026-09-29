@@ -1,0 +1,9 @@
+{
+  "module": "github.com/charmbracelet/x/ansi",
+  "version": "v0.11.7",
+  "license": "MIT",
+  "originalSHA256": {
+    "parser.go": "76688ad4b12d3708654dc7c9de31164e13db1e0ff60973918bf68a28d9578b3f",
+    "LICENSE": "0baa4a5942a801d93f4050d2bc0039d8c037105fcd335230d118eec99a11782b"
+  }
+}

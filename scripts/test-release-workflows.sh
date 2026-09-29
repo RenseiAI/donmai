@@ -561,5 +561,6 @@ NODE
 
 bash "${root_dir}/scripts/test-sign-and-notarize.sh"
 bash "${root_dir}/scripts/test-fast-lane.sh"
+bash "${root_dir}/scripts/test-podman-go-test.sh"
 
 printf 'release workflow tests: PASS\n'

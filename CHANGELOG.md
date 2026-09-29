@@ -8,8 +8,35 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- Host watch uses a responsive session grid, a compact host header, and an
+  adjustable card/stream split. Cards retain issue and project context,
+  label session state and freshness, and keep overflow selection visible.
+- Negotiated terminal continuation checkpoints preserve parser, screen, and
+  history state for compatible viewers. The additive protocol carries bounded
+  checkpoints and a contiguous output suffix; legacy viewers retain their
+  existing output behavior.
+- Linear label commands support native label groups, group membership, and
+  single-select groups while preserving existing label identities.
+- Linear comment reads include author identity and revision metadata, support
+  selecting one comment, and require complete pagination. Hosted consumers can
+  negotiate a strict no-fallback contract for these reads and label operations.
+
 ### Fixes
 
+- Creating or reusing a Linear blocker verifies the directed blocking
+  relation before reporting success. Relation and notice failures return
+  contextual errors that preserve the completed steps.
+- Publication inspection isolates Git from executable ambient configuration
+  and checks both staged and unstaged changes before permitting cleanup.
+  Uncertain or transformed workspaces are retained conservatively.
+- Session commits preserve the configured author identity without appending
+  issue identifiers.
+- Host log following continues after reaching the current end of a file, so
+  later records appear without restarting the command.
+- Host setup and drain documentation describe configuration and resumable
+  draining accurately. Embedded setup flows use the configured binary name.
 - Turn continuations are bounded by progress instead of a fixed count. A
   turn is productive when it made at least one tool call; a productive turn
   resets the count, so an agent that ends its turns early with a plan
@@ -27,6 +54,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Chores
 
+- The drift Action uses the verified v0.72.53 analyzer and an immutable
+  v1.0.1 Action commit, enabling complete assessment of larger pull requests.
+- Interactive readiness test failures include bounded terminal and process
+  diagnostics without relaxing the existing readiness deadline.
 - While the fast lane is on, `make ship` lands a change from a worktree on
   `main` as one commit. It runs the local gates, with the test suite in a
   Linux podman container (`make test-podman`) and the release contract tests

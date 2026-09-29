@@ -14,7 +14,7 @@ jobs:
     timeout-minutes: 8
     steps:
       - name: Assess complete PR diff
-        uses: RenseiAI/donmai-drift-action@729b5d1fe1525eabf21517cf9c43be5f0a6fc7d6 # v1.0.0
+        uses: RenseiAI/donmai-drift-action@a52d98dcee713278d505c482f3975695bf233e8e # v1.0.1
         with:
           token: ${{ github.token }}
           comment: auto

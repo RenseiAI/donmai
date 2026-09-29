@@ -73,7 +73,10 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"never affects the daemon or any running agent.\n\n" +
 			"With no --project/--all, the scope auto-detects from the current repo's git\n" +
 			"remote (the \"one tab per project\" ergonomic). --all shows every session on the\n" +
-			"host, grouped by project.",
+			"host, grouped by project.\n\n" +
+			"The header leads with the host; session cards flow across the full width\n" +
+			"and share it 50/50 with the merged stream by default. [ and ] move the\n" +
+			"split, 0 resets it, and the ratio survives terminal resizes.",
 		SilenceUsage: true,
 		RunE: func(_ *cobra.Command, _ []string) error {
 			cfg := afclient.DefaultDaemonConfig()

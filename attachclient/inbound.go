@@ -106,6 +106,11 @@ func (h *host) handleControl(ctx context.Context, msg attachwire.ControlMessage)
 		if err != nil {
 			return nil, fmt.Errorf("attachclient: emitting snapshot for %s request: %w", m.Reason, err)
 		}
+		if m.Continuation != nil {
+			if upload, ok := ctx.Value(continuationContextKey{}).(*continuationUploadState); ok {
+				upload.start(ctx, *m.Continuation)
+			}
+		}
 		if inStream {
 			// Pre-Exit: the snapshot is seq-bearing and rides the subscription —
 			// nothing to transmit directly.

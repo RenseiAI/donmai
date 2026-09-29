@@ -77,10 +77,11 @@ func (h *host) runWSSLeg(ctx context.Context, conn *websocket.Conn, cl hostClaim
 
 	legCtx, cancel := context.WithCancel(ctx)
 	defer cancel()
+	legCtx = h.continuationContext(legCtx)
 	defer conn.CloseNow() //nolint:errcheck // best-effort teardown
 
 	// Send the subscribe control on open (§ 7, zeroed headers per § 2).
-	subFrame, err := buildHostSubscribe(cl)
+	subFrame, err := buildHostSubscribe(cl, continuationSchemas(h.continuationSource())...)
 	if err != nil {
 		return res, err
 	}
