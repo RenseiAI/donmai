@@ -34,9 +34,11 @@ import (
 // Continuations and retries are each bounded by Options.TurnContinuationLimit
 // (default DefaultTurnContinuationLimit). A turn that still ends unfinished
 // once its bound is reached fails the session — FailureContinuationsExhausted
-// for early stops, FailureProviderError for provider errors — and the
-// unfinished work is not published by steering or the backstop. The counts
-// ride Result.TurnContinuations onto the terminal status.
+// for early stops, FailureProviderError for provider errors. No pull request
+// nudge follows, but the backstop still makes its open-PR attempt, so the
+// work is pushed and a real pull request the verifier could not confirm is
+// recovered; the session stays failed. The counts ride
+// Result.TurnContinuations onto the terminal status.
 
 // DefaultTurnContinuationLimit is the per-kind follow-up bound applied when
 // Options.TurnContinuationLimit is zero.

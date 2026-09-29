@@ -325,7 +325,7 @@ type Options struct {
 
 	// RescueDir is where teardown archives a session's unpublished work —
 	// uncommitted changes and commits no remote holds — as a patch before it
-	// deletes the workarea (<RescueDir>/<session>/<time>/<repository>.patch).
+	// deletes the workarea (<RescueDir>/<session>/<time>-<id>/<repository>.patch).
 	// Empty uses a "rescue" directory beside the worktree parent. When the
 	// archive cannot be written the workarea is kept instead.
 	RescueDir string
@@ -400,9 +400,10 @@ type Runner struct {
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
-	// pullRequestLookup reads a pull request's head for the session pull
-	// request verifier. Nil uses `gh pr view`; tests substitute a fake.
-	pullRequestLookup pullRequestHeadLookup
+	// pullRequestLookup reads refs from the session checkout's origin for
+	// the session pull request verifier. Nil uses `git ls-remote origin`;
+	// tests wrap it to observe lookups.
+	pullRequestLookup pullRequestRefLookup
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a

@@ -146,8 +146,10 @@ const (
 	// FailureContinuationsExhausted indicates a turn still ended unfinished —
 	// no turn-result manifest, no pull request, no verdict — after the runner
 	// had sent its limit of "continue the task" prompts
-	// (runner/turn_continuation.go). The work is incomplete: steering and the
-	// backstop do not publish it, and Result.TurnContinuations records the
-	// counts.
+	// (runner/turn_continuation.go). The work is incomplete, so no pull
+	// request nudge is sent; the backstop still makes its open-PR attempt
+	// (pushing the work and recovering a pull request the runner could not
+	// confirm) and the session stays failed. Result.TurnContinuations
+	// records the counts.
 	FailureContinuationsExhausted = "continuations-exhausted"
 )

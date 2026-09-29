@@ -11,6 +11,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"regexp"
+	"sort"
 	"strings"
 	"time"
 
@@ -29,7 +30,12 @@ import (
 // throw-away index file, so the checkout's own index, branch and files are
 // exactly as the agent left them. Paths the backstop would never commit
 // (dependency and build output, runner and harness state) do not count as
-// work and are left out of the archive.
+// work and are left out of the archive. The patch is written with plumbing
+// (git diff-tree with every output option pinned), so no user or repository
+// diff configuration can alter it, and it is proven before teardown: applied
+// to the base in another scratch index it must reproduce the working state
+// exactly, or the workarea is kept. The last rescueKeepPerSession archives of
+// a session are kept; older ones of the same session are pruned.
 
 // rescueTarget is one git checkout of the session and the commit it was
 // provisioned at.
@@ -51,6 +57,31 @@ const rescueMaxPatchBytes = 256 << 20
 
 // rescueResetBatch caps the paths passed to one `git reset` invocation.
 const rescueResetBatch = 100
+
+// rescueKeepPerSession is how many archives (one per teardown) a session's
+// rescue directory keeps; older ones are pruned after a new one is written.
+// Archives of other sessions are never pruned: each holds work that exists
+// nowhere else, so the directory is left to the operator rather than capped
+// globally.
+const rescueKeepPerSession = 5
+
+// rescueArchiveDirRE matches the per-teardown archive directories this file
+// creates (a UTC stamp plus a unique suffix); pruning touches nothing else.
+var rescueArchiveDirRE = regexp.MustCompile(`^\d{8}T\d{6}Z-`)
+
+// rescuePatchArgs is the git command that writes the patch from base to tree:
+// plumbing, recursive, binary-safe, with the external diff driver, textconv,
+// color, rename detection and path prefixes all pinned, so user or repository
+// configuration (diff.external, diff.noprefix, color.diff=always, textconv
+// attributes) cannot change a byte. A variable so a test can prove the
+// round-trip check refuses a patch that does not reproduce the work.
+var rescuePatchArgs = func(base, tree string) []string {
+	return []string{
+		"diff-tree", "-r", "-p", "--binary", "--full-index",
+		"--no-ext-diff", "--no-textconv", "--no-color", "--no-renames",
+		"--src-prefix=a/", "--dst-prefix=b/", base, tree,
+	}
+}
 
 // rescueRoot is the directory unpublished work is archived under: the
 // configured RescueDir, else a "rescue" directory beside the worktree parent
@@ -85,8 +116,26 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 	}
 	preserved := true
 	stamp := r.now().UTC().Format("20060102T150405Z")
+	sessionRoot := filepath.Join(r.rescueRoot(), rescueSegment(qw.SessionID))
+	archiveDir := ""
+	// dirFor creates this teardown's archive directory on first use, unique
+	// even when two teardowns of one session share a second.
+	dirFor := func() (string, error) {
+		if archiveDir != "" {
+			return archiveDir, nil
+		}
+		if err := os.MkdirAll(sessionRoot, 0o700); err != nil {
+			return "", fmt.Errorf("create rescue directory: %w", err)
+		}
+		dir, err := os.MkdirTemp(sessionRoot, stamp+"-")
+		if err != nil {
+			return "", fmt.Errorf("create rescue directory: %w", err)
+		}
+		archiveDir = dir
+		return dir, nil
+	}
 	for _, target := range res.rescueTargets {
-		archive, err := r.rescueCheckout(qw.SessionID, stamp, target)
+		archive, err := r.rescueCheckout(qw.SessionID, dirFor, target)
 		switch {
 		case err != nil:
 			preserved = false
@@ -107,7 +156,36 @@ func (r *Runner) preserveUnpublishedWork(qw QueuedWork, res *Result) bool {
 			)
 		}
 	}
+	if archiveDir != "" {
+		// Removes the directory only when every checkout turned out to hold
+		// nothing but non-work paths.
+		_ = os.Remove(archiveDir)
+		pruneRescueArchives(r, qw.SessionID, sessionRoot)
+	}
 	return preserved
+}
+
+// pruneRescueArchives keeps the newest rescueKeepPerSession archive
+// directories of one session and removes the older ones.
+func pruneRescueArchives(r *Runner, sessionID, sessionRoot string) {
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		return
+	}
+	var archives []string
+	for _, entry := range entries {
+		if entry.IsDir() && rescueArchiveDirRE.MatchString(entry.Name()) {
+			archives = append(archives, entry.Name())
+		}
+	}
+	sort.Strings(archives)
+	for len(archives) > rescueKeepPerSession {
+		old := filepath.Join(sessionRoot, archives[0])
+		archives = archives[1:]
+		if err := os.RemoveAll(old); err != nil {
+			r.logger.Warn("could not prune an old rescue archive", "sessionId", sessionID, "path", old, "err", err)
+		}
+	}
 }
 
 // rescueArchive describes one written archive; patch is "" when the checkout
@@ -132,8 +210,9 @@ type rescueMetadata struct {
 	Apply           string   `json:"apply"`
 }
 
-// rescueCheckout archives one checkout's unpublished work, if it has any.
-func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (rescueArchive, error) {
+// rescueCheckout archives one checkout's unpublished work, if it has any,
+// into the directory dirFor returns.
+func (r *Runner) rescueCheckout(sessionID string, dirFor func() (string, error), target rescueTarget) (rescueArchive, error) {
 	ctx, cancel := context.WithTimeout(context.Background(), rescueGitTimeout)
 	defer cancel()
 	if _, err := os.Stat(target.path); err != nil {
@@ -142,13 +221,13 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 		}
 		return rescueArchive{}, fmt.Errorf("stat checkout: %w", err)
 	}
-	head, err := rescueGitOutput(ctx, target.path, nil, "rev-parse", "--verify", "HEAD^{commit}")
+	head, err := gitStdout(ctx, target.path, nil, "rev-parse", "--verify", "HEAD^{commit}")
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("resolve HEAD: %w", err)
 	}
 	head = strings.TrimSpace(head)
 
-	status, err := rescueGitOutput(ctx, target.path, nil,
+	status, err := gitStdout(ctx, target.path, nil,
 		"-c", "core.quotePath=false", "status", "--porcelain=v1", "-z", "--untracked-files=all")
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("git status: %w", err)
@@ -172,13 +251,13 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 	}
 	defer func() { _ = os.RemoveAll(indexDir) }()
 	indexEnv := []string{"GIT_INDEX_FILE=" + filepath.Join(indexDir, "index"), "GIT_LITERAL_PATHSPECS=1"}
-	if _, err := rescueGitOutput(ctx, target.path, indexEnv, "read-tree", "HEAD"); err != nil {
+	if _, err := gitStdout(ctx, target.path, indexEnv, "read-tree", "HEAD"); err != nil {
 		return rescueArchive{}, fmt.Errorf("seed scratch index: %w", err)
 	}
-	if _, err := rescueGitOutput(ctx, target.path, indexEnv, "add", "-A", "--", "."); err != nil {
+	if _, err := gitStdout(ctx, target.path, indexEnv, "add", "-A", "--", "."); err != nil {
 		return rescueArchive{}, fmt.Errorf("stage working state: %w", err)
 	}
-	staged, err := rescueGitOutput(ctx, target.path, indexEnv,
+	staged, err := gitStdout(ctx, target.path, indexEnv,
 		"-c", "core.quotePath=false", "diff", "--cached", "--name-only", "-z", "HEAD")
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("list staged working state: %w", err)
@@ -191,11 +270,11 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 	}
 	for i := 0; i < len(excluded); i += rescueResetBatch {
 		batch := excluded[i:min(i+rescueResetBatch, len(excluded))]
-		if _, err := rescueGitOutput(ctx, target.path, indexEnv, append([]string{"reset", "-q", "HEAD", "--"}, batch...)...); err != nil {
+		if _, err := gitStdout(ctx, target.path, indexEnv, append([]string{"reset", "-q", "HEAD", "--"}, batch...)...); err != nil {
 			return rescueArchive{}, fmt.Errorf("drop non-work paths from scratch index: %w", err)
 		}
 	}
-	tree, err := rescueGitOutput(ctx, target.path, indexEnv, "write-tree")
+	tree, err := gitStdout(ctx, target.path, indexEnv, "write-tree")
 	if err != nil {
 		return rescueArchive{}, fmt.Errorf("write working-state tree: %w", err)
 	}
@@ -205,9 +284,9 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 	if base == "" {
 		base = head
 	}
-	dir := filepath.Join(r.rescueRoot(), rescueSegment(sessionID), stamp)
-	if err := os.MkdirAll(dir, 0o700); err != nil {
-		return rescueArchive{}, fmt.Errorf("create rescue directory: %w", err)
+	dir, err := dirFor()
+	if err != nil {
+		return rescueArchive{}, err
 	}
 	label := rescueSegment(rescueLabel(target.name))
 	patchPath := filepath.Join(dir, label+".patch")
@@ -218,11 +297,13 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 	if written == 0 {
 		// Everything that differed was non-work; nothing to keep.
 		_ = os.Remove(patchPath)
-		_ = os.Remove(dir)
 		return rescueArchive{}, nil
 	}
+	if err := verifyRescuePatch(ctx, target.path, patchPath, base, tree); err != nil {
+		return rescueArchive{}, err
+	}
 
-	branch, _ := rescueGitOutput(ctx, target.path, nil, "branch", "--show-current")
+	branch, _ := gitStdout(ctx, target.path, nil, "branch", "--show-current")
 	meta := rescueMetadata{
 		SessionID:       sessionID,
 		Repository:      rescueLabel(target.name),
@@ -250,11 +331,11 @@ func (r *Runner) rescueCheckout(sessionID, stamp string, target rescueTarget) (r
 // remote-tracking refs there is nothing to measure against, so none are
 // reported (the working-state patch still carries every uncommitted change).
 func unpushedCommits(ctx context.Context, target rescueTarget) ([]string, error) {
-	args := []string{"log", "--format=%H %s", "HEAD", "--not", "--remotes"}
+	args := []string{"-c", "log.showSignature=false", "log", "--no-color", "--format=%H %s", "HEAD", "--not", "--remotes"}
 	if target.base != "" {
 		args = append(args, target.base)
 	} else {
-		remotes, err := rescueGitOutput(ctx, target.path, nil, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes")
+		remotes, err := gitStdout(ctx, target.path, nil, "for-each-ref", "--count=1", "--format=%(refname)", "refs/remotes")
 		if err != nil {
 			return nil, fmt.Errorf("list remote-tracking refs: %w", err)
 		}
@@ -262,15 +343,16 @@ func unpushedCommits(ctx context.Context, target rescueTarget) ([]string, error)
 			return nil, nil
 		}
 	}
-	out, err := rescueGitOutput(ctx, target.path, nil, args...)
+	out, err := gitStdout(ctx, target.path, nil, args...)
 	if err != nil {
 		return nil, fmt.Errorf("list unpushed commits: %w", err)
 	}
 	return filterEmpty(strings.Split(strings.TrimSpace(out), "\n")), nil
 }
 
-// writeRescuePatch writes `git diff --binary base tree` to path, refusing a
-// patch larger than rescueMaxPatchBytes. It returns the bytes written.
+// writeRescuePatch writes the rescuePatchArgs patch from base to tree to path,
+// refusing a patch larger than rescueMaxPatchBytes. It returns the bytes
+// written.
 func writeRescuePatch(ctx context.Context, dir, path, base, tree string) (int64, error) {
 	//nolint:gosec // G304: path is runner-owned, built from sanitized segments.
 	f, err := os.OpenFile(path, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
@@ -278,7 +360,7 @@ func writeRescuePatch(ctx context.Context, dir, path, base, tree string) (int64,
 		return 0, fmt.Errorf("create rescue patch: %w", err)
 	}
 	capped := &cappedWriter{w: f, limit: rescueMaxPatchBytes}
-	diffErr := rescueGitTo(ctx, dir, capped, "diff", "--binary", "--full-index", base, tree)
+	diffErr := gitStdoutTo(ctx, dir, capped, rescuePatchArgs(base, tree)...)
 	closeErr := f.Close()
 	switch {
 	case capped.exceeded:
@@ -291,6 +373,33 @@ func writeRescuePatch(ctx context.Context, dir, path, base, tree string) (int64,
 		return 0, fmt.Errorf("close rescue patch: %w", closeErr)
 	}
 	return capped.written, nil
+}
+
+// verifyRescuePatch proves the archived patch reproduces the working state:
+// applied to base in a scratch index (never the checkout's own), it must
+// yield exactly tree. A patch that does not is no preservation, so the caller
+// keeps the workarea instead of reporting success.
+func verifyRescuePatch(ctx context.Context, dir, patchPath, base, tree string) error {
+	indexDir, err := os.MkdirTemp("", "rescue-verify-")
+	if err != nil {
+		return fmt.Errorf("create scratch index dir: %w", err)
+	}
+	defer func() { _ = os.RemoveAll(indexDir) }()
+	env := []string{"GIT_INDEX_FILE=" + filepath.Join(indexDir, "index")}
+	if _, err := gitStdout(ctx, dir, env, "read-tree", base); err != nil {
+		return fmt.Errorf("verify rescue patch: seed base: %w", err)
+	}
+	if _, err := gitStdout(ctx, dir, env, "apply", "--cached", "--whitespace=nowarn", patchPath); err != nil {
+		return fmt.Errorf("verify rescue patch: it does not apply to its base: %w", err)
+	}
+	got, err := gitStdout(ctx, dir, env, "write-tree")
+	if err != nil {
+		return fmt.Errorf("verify rescue patch: write result: %w", err)
+	}
+	if strings.TrimSpace(got) != tree {
+		return fmt.Errorf("verify rescue patch: applied to its base it yields %s, not the working state %s", strings.TrimSpace(got), tree)
+	}
+	return nil
 }
 
 // cappedWriter forwards writes until limit bytes, then fails every write.
@@ -359,22 +468,22 @@ func rescueSegment(s string) string {
 	return s
 }
 
-// rescueGitOutput runs one git command in dir and returns its stdout; the
-// error carries stderr.
-func rescueGitOutput(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
+// gitStdout runs one git command in dir and returns its stdout; the error
+// carries stderr.
+func gitStdout(ctx context.Context, dir string, extraEnv []string, args ...string) (string, error) {
 	var stdout bytes.Buffer
-	if err := rescueGit(ctx, dir, extraEnv, &stdout, args...); err != nil {
+	if err := gitExec(ctx, dir, extraEnv, &stdout, args...); err != nil {
 		return "", err
 	}
 	return stdout.String(), nil
 }
 
-// rescueGitTo runs one git command in dir, streaming its stdout to w.
-func rescueGitTo(ctx context.Context, dir string, w io.Writer, args ...string) error {
-	return rescueGit(ctx, dir, nil, w, args...)
+// gitStdoutTo runs one git command in dir, streaming its stdout to w.
+func gitStdoutTo(ctx context.Context, dir string, w io.Writer, args ...string) error {
+	return gitExec(ctx, dir, nil, w, args...)
 }
 
-func rescueGit(ctx context.Context, dir string, extraEnv []string, stdout io.Writer, args ...string) error {
+func gitExec(ctx context.Context, dir string, extraEnv []string, stdout io.Writer, args ...string) error {
 	//nolint:gosec // G204: args come from runner-controlled call sites.
 	cmd := exec.CommandContext(ctx, "git", args...)
 	cmd.Dir = dir

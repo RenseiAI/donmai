@@ -1409,12 +1409,6 @@ tailRecovery:
 			backstopEligible = true
 		}
 	}
-	// A turn still unfinished after the continuation limit is not work to
-	// publish: the session failed, and its worktree is kept (or its work
-	// archived before teardown).
-	if followUps.exhausted {
-		backstopEligible = false
-	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible {
 		switch {
 		case trimRef(qw.Ref) != "":
@@ -1459,6 +1453,8 @@ tailRecovery:
 	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
+	// An exhausted session keeps its continuations-exhausted label: the
+	// backstop's open-PR attempt ran, but the turn never finished.
 	if repositoryDeclaration != nil && len(missingPRs) > 0 && !followUps.exhausted {
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop

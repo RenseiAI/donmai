@@ -2,8 +2,8 @@ package runner
 
 import (
 	"context"
-	"encoding/json"
 	"fmt"
+	"net/url"
 	"strings"
 	"time"
 
@@ -21,57 +21,75 @@ import (
 // So for work whose completion contract owes a pull request, the runner
 // accepts a URL only when the pull request EXISTS on the session's own
 // repository and its head is the session's branch or the session's commit
-// (the checkout's HEAD). Existence and head are read through the same GitHub
-// access the runner already uses for pull request facts (`gh pr view`). A
-// candidate that cannot be confirmed — including when that lookup fails — is
-// rejected, so the nudge and the backstop run: the backstop's own
-// `gh pr create --head <session branch>` recovers a real pull request that
-// only failed to verify.
+// (the checkout's HEAD). Both are read from the checkout's own remote with the
+// git credential the session already pushes with — `git ls-remote origin
+// refs/pull/<n>/head refs/heads/<session branch>` — so verification needs no
+// GitHub CLI and works wherever the session can push. A candidate that cannot
+// be confirmed is refused, so the nudge and the backstop run; the backstop's
+// own `gh pr create --head <session branch>` still recovers a real pull
+// request that only failed to verify.
 
-// pullRequestLookupTimeout bounds one `gh pr view` lookup.
-const pullRequestLookupTimeout = 10 * time.Second
+// pullRequestLookupTimeout bounds one remote lookup.
+const pullRequestLookupTimeout = 15 * time.Second
 
-// maxPullRequestLookups bounds the network lookups one verification pass may
+// maxPullRequestLookups bounds the remote lookups one verification pass may
 // spend, so a transcript full of URLs cannot stall the session end.
 const maxPullRequestLookups = 4
 
 // maxPullRequestCandidates bounds the distinct candidate URLs a stream keeps.
 const maxPullRequestCandidates = 8
 
-// pullRequestHead is the GitHub projection the verifier reads.
-type pullRequestHead struct {
-	Number            int    `json:"number"`
-	URL               string `json:"url"`
-	HeadRefName       string `json:"headRefName"`
-	HeadRefOid        string `json:"headRefOid"`
-	IsCrossRepository bool   `json:"isCrossRepository"`
-}
+// pullRequestRefLookup reads refs from the checkout's origin remote and
+// returns the commit of each named ref that exists there.
+type pullRequestRefLookup func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error)
 
-// pullRequestHeadLookup reads one pull request's head. worktreePath is the
-// directory the lookup runs in.
-type pullRequestHeadLookup func(ctx context.Context, worktreePath, prURL string) (pullRequestHead, error)
-
-// ghPullRequestHead is the production lookup: `gh pr view <url>`, the same
-// GitHub access lookupGitHubPullRequest uses.
-func ghPullRequestHead(ctx context.Context, worktreePath, prURL string) (pullRequestHead, error) {
+// originRefs is the production lookup: `git ls-remote origin <refs>` in the
+// checkout, with the credential and remote the session already uses.
+func originRefs(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
 	lookupCtx, cancel := context.WithTimeout(ctx, pullRequestLookupTimeout)
 	defer cancel()
-	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
-		"--json", "number,url,headRefName,headRefOid,isCrossRepository")
+	out, err := gitStdout(lookupCtx, worktreePath, nil, append([]string{"ls-remote", "origin"}, refs...)...)
 	if err != nil {
-		return pullRequestHead{}, fmt.Errorf("gh pr view: %w: %s", err, firstLine(out))
+		return nil, err
 	}
-	var head pullRequestHead
-	if err := json.Unmarshal([]byte(out), &head); err != nil {
-		return pullRequestHead{}, fmt.Errorf("decode gh pr view output: %w", err)
+	wanted := make(map[string]struct{}, len(refs))
+	for _, ref := range refs {
+		wanted[ref] = struct{}{}
 	}
-	return head, nil
+	found := make(map[string]string, len(refs))
+	for _, line := range strings.Split(out, "\n") {
+		sha, ref, ok := strings.Cut(strings.TrimSpace(line), "\t")
+		if !ok {
+			continue
+		}
+		// ls-remote matches patterns by suffix; keep exact names only.
+		if _, exact := wanted[ref]; exact && headSHARE.MatchString(sha) {
+			found[ref] = sha
+		}
+	}
+	return found, nil
 }
+
+// candidateOutcome is what the verifier learned about one candidate URL.
+type candidateOutcome int
+
+const (
+	// The zero value: not looked at yet (or skipped for budget).
+	_ candidateOutcome = iota
+	// candidateAccepted: the session's own pull request.
+	candidateAccepted
+	// candidateRefused: confirmed not the session's pull request.
+	candidateRefused
+	// candidateUnconfirmed: on the session's repository, but the remote
+	// could not be read to confirm or refuse it.
+	candidateUnconfirmed
+)
 
 // sessionPullRequestVerifier decides which candidate URL, if any, is this
 // session's pull request. One verifier lives for one session; it remembers the
 // URL it accepted so a later turn that only quotes some other URL cannot
-// displace a verified pull request.
+// displace a verified pull request, and what it learned about every other
+// candidate.
 type sessionPullRequestVerifier struct {
 	// repository is the session repository's canonical lower-case
 	// "owner/repo", or "" when the session's repository is not on GitHub
@@ -81,69 +99,128 @@ type sessionPullRequestVerifier struct {
 	branch string
 	// worktreePath is the selected repository's checkout.
 	worktreePath string
-	lookup       pullRequestHeadLookup
+	lookup       pullRequestRefLookup
 	accepted     string
+	outcomes     map[string]candidateOutcome
 }
 
 // newSessionPullRequestVerifier resolves the session's GitHub repository:
 // the declared selected repository's source, else the dispatched repository,
-// else the checkout's origin remote. A repository-free workarea resolves to
-// none without running git (that contract forbids any git invocation).
+// else the checkout's origin remote — each in any remote form (https, ssh,
+// scp-like, with or without credentials in it). A repository-free workarea
+// resolves to none without running git (that contract forbids any git
+// invocation).
 func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath, branch string, repositoryFree bool) *sessionPullRequestVerifier {
-	v := &sessionPullRequestVerifier{branch: branch, worktreePath: worktreePath, lookup: r.pullRequestLookup}
+	v := &sessionPullRequestVerifier{branch: branch, worktreePath: worktreePath, lookup: r.pullRequestLookup, outcomes: map[string]candidateOutcome{}}
 	if v.lookup == nil {
-		v.lookup = ghPullRequestHead
+		v.lookup = originRefs
 	}
 	switch {
 	case repositoryFree:
 	case declaration != nil:
-		v.repository = workarea.CanonicalGitHubRepositorySource(declaration.Selected.Source.Repository)
+		v.repository = githubRepositorySlug(declaration.Selected.Source.Repository)
 	default:
-		v.repository = workarea.CanonicalGitHubRepositorySource(qw.Repository)
-		if v.repository == "" && strings.TrimSpace(worktreePath) != "" {
-			originCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-			if origin, err := runGit(originCtx, worktreePath, gitIdentity{}, "remote", "get-url", "origin"); err == nil {
-				v.repository = workarea.CanonicalGitHubRepositorySource(strings.TrimSpace(origin))
-			}
-			cancel()
+		v.repository = githubRepositorySlug(qw.Repository)
+	}
+	if v.repository == "" && !repositoryFree && strings.TrimSpace(worktreePath) != "" {
+		originCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+		if origin, err := gitStdout(originCtx, worktreePath, nil, "remote", "get-url", "origin"); err == nil {
+			v.repository = githubRepositorySlug(origin)
 		}
+		cancel()
 	}
 	return v
 }
 
-// verify reports whether candidate is this session's pull request, with the
-// reason when it is not.
-func (v *sessionPullRequestVerifier) verify(ctx context.Context, candidate string) (bool, string, bool) {
-	slug, number, err := parseCanonicalGitHubPullRequestURL(candidate)
-	if err != nil {
-		return false, "not a canonical GitHub pull request URL", false
+// githubRepositorySlug returns the lower-case "owner/repo" of a GitHub
+// repository address in any form git accepts — https://github.com/o/r(.git),
+// the same with credentials in it, ssh://[user@]github.com[:port]/o/r(.git),
+// scp-like [user@]github.com:o/r(.git), or bare github.com/o/r — or "" for
+// anything that is not a GitHub repository.
+func githubRepositorySlug(remote string) string {
+	s := strings.TrimSpace(remote)
+	if s == "" || strings.ContainsAny(s, " \t\r\n") {
+		return ""
 	}
-	if v.repository == "" {
-		return false, "the session's repository is not a GitHub repository", false
-	}
-	if normalizeGitHubRepositorySlug(slug) != v.repository {
-		return false, "the pull request is on another repository", false
-	}
-	head, err := v.lookup(ctx, v.worktreePath, candidate)
-	if err != nil {
-		return false, "could not confirm the pull request exists: " + err.Error(), true
-	}
-	viewSlug, viewNumber, err := parseCanonicalGitHubPullRequestURL(head.URL)
-	if err != nil || normalizeGitHubRepositorySlug(viewSlug) != v.repository || viewNumber != number || head.Number != number {
-		return false, "the pull request lookup returned a different pull request", true
-	}
-	if !head.IsCrossRepository && v.branch != "" && head.HeadRefName == v.branch {
-		return true, "", true
-	}
-	if oid := strings.ToLower(strings.TrimSpace(head.HeadRefOid)); oid != "" {
-		shaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-		sha, shaErr := captureHeadSHA(shaCtx, v.worktreePath)
-		cancel()
-		if shaErr == nil && sha == oid {
-			return true, "", true
+	var host, path string
+	switch {
+	case strings.Contains(s, "://"):
+		u, err := url.Parse(s)
+		if err != nil {
+			return ""
+		}
+		switch strings.ToLower(u.Scheme) {
+		case "https", "http", "ssh", "git", "git+ssh", "ssh+git":
+		default:
+			return ""
+		}
+		if u.RawQuery != "" || u.Fragment != "" {
+			return ""
+		}
+		host, path = u.Hostname(), u.Path
+	default:
+		// scp-like [user@]host:path, or a bare host/path.
+		if at := strings.LastIndex(s, "@"); at >= 0 {
+			s = s[at+1:]
+		}
+		if colon := strings.Index(s, ":"); colon > 0 && !strings.Contains(s[:colon], "/") {
+			host, path = s[:colon], s[colon+1:]
+		} else if slash := strings.Index(s, "/"); slash > 0 {
+			host, path = s[:slash], s[slash:]
 		}
 	}
-	return false, "the pull request's head is neither the session branch nor the session commit", true
+	switch strings.ToLower(host) {
+	case "github.com", "www.github.com", "ssh.github.com":
+	default:
+		return ""
+	}
+	path = strings.TrimSuffix(strings.Trim(path, "/"), ".git")
+	parts := strings.Split(path, "/")
+	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
+		return ""
+	}
+	return strings.ToLower(parts[0] + "/" + parts[1])
+}
+
+// verify reports what candidate is — the outcome to remember for it — with
+// the reason when it is not this session's pull request, and whether it
+// spent a remote lookup.
+func (v *sessionPullRequestVerifier) verify(ctx context.Context, candidate string) (outcome candidateOutcome, reason string, lookedUp bool) {
+	slug, number, err := parseCanonicalGitHubPullRequestURL(candidate)
+	if err != nil {
+		return candidateRefused, "not a canonical GitHub pull request URL", false
+	}
+	if v.repository == "" {
+		return candidateRefused, "the session's repository is not a GitHub repository", false
+	}
+	if normalizeGitHubRepositorySlug(slug) != v.repository {
+		return candidateRefused, "the pull request is on another repository", false
+	}
+	pullRef := fmt.Sprintf("refs/pull/%d/head", number)
+	refs := []string{pullRef}
+	branchRef := ""
+	if v.branch != "" {
+		branchRef = "refs/heads/" + v.branch
+		refs = append(refs, branchRef)
+	}
+	found, err := v.lookup(ctx, v.worktreePath, refs...)
+	if err != nil {
+		return candidateUnconfirmed, "could not read the pull request from the session's remote: " + err.Error(), true
+	}
+	pullHead := found[pullRef]
+	if pullHead == "" {
+		return candidateRefused, "no such pull request on the session's repository", true
+	}
+	if branchRef != "" && found[branchRef] == pullHead {
+		return candidateAccepted, "", true
+	}
+	shaCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	sha, shaErr := captureHeadSHA(shaCtx, v.worktreePath)
+	cancel()
+	if shaErr == nil && sha == pullHead {
+		return candidateAccepted, "", true
+	}
+	return candidateRefused, "the pull request's head is neither the session branch nor the session commit", true
 }
 
 // settle picks the session's pull request from the candidates a turn offered,
@@ -175,15 +252,19 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 			accepted = candidate
 			break
 		}
+		if v.outcomes[candidate] == candidateRefused {
+			continue
+		}
 		if lookups >= maxPullRequestLookups {
 			rejected = append(rejected, pullRequestRejection{url: candidate, reason: "not checked: lookup budget spent"})
 			continue
 		}
-		ok, reason, lookedUp := v.verify(ctx, candidate)
+		outcome, reason, lookedUp := v.verify(ctx, candidate)
 		if lookedUp {
 			lookups++
 		}
-		if ok {
+		v.outcomes[candidate] = outcome
+		if outcome == candidateAccepted {
 			accepted = candidate
 			break
 		}
@@ -196,16 +277,22 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 }
 
 // reportsOwnRepository reports whether turn carried a pull request URL on the
-// session's own repository, verified or not. Such a turn reported a pull
-// request — it did not stop early — even when the lookup could not confirm
-// it; the nudge and the backstop then settle it as they always have. A nil
+// session's own repository that the verifier has NOT confirmed to be someone
+// else's — one it could not read from the remote, or did not get to. Such a
+// turn reported a pull request, so it did not stop early; the nudge and the
+// backstop then settle it as they always have. A URL confirmed to be another
+// pull request (another head, or no such pull request) does not count. A nil
 // verifier reports none.
 func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
 	if v == nil || v.repository == "" {
 		return false
 	}
 	for _, candidate := range turn.pullRequestCandidates {
-		if slug, _, err := parseCanonicalGitHubPullRequestURL(candidate); err == nil && normalizeGitHubRepositorySlug(slug) == v.repository {
+		slug, _, err := parseCanonicalGitHubPullRequestURL(candidate)
+		if err != nil || normalizeGitHubRepositorySlug(slug) != v.repository {
+			continue
+		}
+		if v.outcomes[candidate] != candidateRefused {
 			return true
 		}
 	}

@@ -2,7 +2,6 @@ package runner
 
 import (
 	"context"
-	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -16,16 +15,24 @@ import (
 // request URL but belongs to no session.
 const quotedExamplePR = "https://github.com/org/repo/pull/42"
 
-// githubRepositoryFixture returns https://github.com/<slug> and makes that URL
-// resolve, for every git subprocess of this test, to a fresh local bare
+// Markers for scriptedSession.pulls: where refs/pull/<n>/head points.
+const (
+	// pullAtSessionCommit: the commit the session's checkout is at (the
+	// bare repository's main, which a scripted session never moves).
+	pullAtSessionCommit = "session"
+	// pullAtOtherCommit: a commit the session never had.
+	pullAtOtherCommit = "other"
+)
+
+// githubRepositoryFixture makes repoURL — a GitHub repository address in any
+// form — resolve, for every git subprocess of this test, to a fresh local bare
 // repository (git's url.<base>.insteadOf, carried in GIT_CONFIG_* environment
-// variables). A Run then provisions from disk while its session repository is
-// a GitHub one, so the session pull request verifier resolves a real identity.
+// variables), and returns that bare repository. A Run then provisions, pushes
+// and ls-remotes against disk while its session repository is a GitHub one.
 // It uses t.Setenv, so it cannot serve a parallel test.
-func githubRepositoryFixture(t *testing.T, slug string) string {
+func githubRepositoryFixture(t *testing.T, repoURL string) string {
 	t.Helper()
 	bare := makeBareRepo(t)
-	repoURL := "https://github.com/" + slug
 	n := 0
 	if existing := os.Getenv("GIT_CONFIG_COUNT"); existing != "" {
 		parsed, err := strconv.Atoi(existing)
@@ -37,124 +44,190 @@ func githubRepositoryFixture(t *testing.T, slug string) string {
 	t.Setenv(fmt.Sprintf("GIT_CONFIG_KEY_%d", n), "url."+bare+".insteadOf")
 	t.Setenv(fmt.Sprintf("GIT_CONFIG_VALUE_%d", n), repoURL)
 	t.Setenv("GIT_CONFIG_COUNT", strconv.Itoa(n+1))
-	return repoURL
+	return bare
 }
 
-// fakePullRequestLookup answers pull request lookups from a table; any other
-// URL fails the way `gh pr view` fails for a pull request that does not exist.
-type fakePullRequestLookup struct {
-	mu    sync.Mutex
-	heads map[string]pullRequestHead
-	calls []string
-}
-
-func (f *fakePullRequestLookup) lookup(_ context.Context, _, prURL string) (pullRequestHead, error) {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	f.calls = append(f.calls, prURL)
-	head, ok := f.heads[prURL]
-	if !ok {
-		return pullRequestHead{}, errors.New("could not resolve to a pull request")
+// setPullRef points refs/pull/<number>/head of a bare repository at target:
+// a sha, pullAtSessionCommit or pullAtOtherCommit.
+func setPullRef(t *testing.T, bare string, number int, target string) {
+	t.Helper()
+	sha := target
+	switch target {
+	case pullAtSessionCommit:
+		sha = gitRun(t, bare, "rev-parse", "main")
+	case pullAtOtherCommit:
+		sha = bareCommit(t, bare, "someone else's work")
 	}
-	return head, nil
+	gitRun(t, bare, "update-ref", fmt.Sprintf("refs/pull/%d/head", number), sha)
 }
 
-func (f *fakePullRequestLookup) called(prURL string) bool {
-	f.mu.Lock()
-	defer f.mu.Unlock()
-	for _, call := range f.calls {
-		if call == prURL {
+// bareCommit creates a commit on top of main in a bare repository, on no
+// branch, and returns it.
+func bareCommit(t *testing.T, bare, message string) string {
+	t.Helper()
+	tree := gitRun(t, bare, "rev-parse", "main^{tree}")
+	out, err := runGit(context.Background(), bare, gitIdentity{Name: "test", Email: "test@example.com"},
+		"commit-tree", tree, "-p", "main", "-m", message)
+	if err != nil {
+		t.Fatalf("commit-tree: %v\n%s", err, out)
+	}
+	return strings.TrimSpace(out)
+}
+
+// recordingRefLookup is the production originRefs, recording every ref
+// looked up.
+type recordingRefLookup struct {
+	mu   sync.Mutex
+	refs []string
+}
+
+func (l *recordingRefLookup) lookup(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
+	l.mu.Lock()
+	l.refs = append(l.refs, refs...)
+	l.mu.Unlock()
+	return originRefs(ctx, worktreePath, refs...)
+}
+
+func (l *recordingRefLookup) lookedUp(ref string) bool {
+	l.mu.Lock()
+	defer l.mu.Unlock()
+	for _, got := range l.refs {
+		if got == ref {
 			return true
 		}
 	}
 	return false
 }
 
-// stubGhPullRequestView shadows `gh` on PATH with a stub that answers
-// `gh pr view <url> --json <the verifier's fields>` from views (keyed by URL)
-// and fails like the real gh for any other pull request.
-func stubGhPullRequestView(t *testing.T, views map[string]string) {
+// sentinelGh shadows gh on PATH with a stub that records any call and fails.
+func sentinelGh(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
-	var cases strings.Builder
-	for prURL, view := range views {
-		file := filepath.Join(dir, strconv.Itoa(len(cases.String()))+".json")
-		if err := os.WriteFile(file, []byte(view), 0o600); err != nil {
-			t.Fatalf("write gh view fixture: %v", err)
-		}
-		fmt.Fprintf(&cases, "  %q) cat %q; exit 0 ;;\n", prURL, file)
-	}
-	script := fmt.Sprintf(`#!/bin/sh
-if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$4" != "--json" ] || [ "$5" != "number,url,headRefName,headRefOid,isCrossRepository" ]; then
-  echo "unexpected gh argv: $*" 1>&2
-  exit 1
-fi
-case "$3" in
-%s  *) echo "GraphQL: Could not resolve to a PullRequest" 1>&2; exit 1 ;;
-esac
-`, cases.String())
+	calls := filepath.Join(dir, "gh-calls.log")
+	script := fmt.Sprintf("#!/bin/sh\necho \"$*\" >> %q\necho 'gh is not available' 1>&2\nexit 1\n", calls)
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
 	if err := os.WriteFile(filepath.Join(dir, "gh"), []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh stub: %v", err)
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return calls
+}
+
+func TestGithubRepositorySlug(t *testing.T) {
+	cases := map[string]string{
+		"https://github.com/Acme/Widgets":                         "acme/widgets",
+		"https://github.com/acme/widgets.git":                     "acme/widgets",
+		"https://github.com/acme/widgets/":                        "acme/widgets",
+		"https://x-access-token:secret@github.com/acme/widgets":   "acme/widgets",
+		"http://github.com/acme/widgets":                          "acme/widgets",
+		"ssh://git@github.com/acme/widgets.git":                   "acme/widgets",
+		"ssh://git@ssh.github.com:443/acme/widgets.git":           "acme/widgets",
+		"git+ssh://git@github.com/acme/widgets":                   "acme/widgets",
+		"git@github.com:acme/widgets.git":                         "acme/widgets",
+		"github.com:acme/widgets":                                 "acme/widgets",
+		"github.com/acme/widgets":                                 "acme/widgets",
+		"https://gitlab.com/acme/widgets":                         "",
+		"git@gitlab.com:acme/widgets.git":                         "",
+		"https://github.com/acme":                                 "",
+		"https://github.com/acme/widgets/pull/7":                  "",
+		"https://github.com/acme/widgets?x=1":                     "",
+		"file:///srv/git/widgets.git":                             "",
+		"/srv/git/widgets.git":                                    "",
+		"":                                                        "",
+		"https://github.com/acme/widgets and more":                "",
+		"https://github.com.attacker.example/acme/widgets":        "",
+		"ssh://git@github.com.attacker.example/acme/widgets.git":  "",
+		"git@github.com.attacker.example:acme/widgets.git":        "",
+		"https://attacker.example/github.com/acme/widgets":        "",
+		"https://user@attacker.example@github.com/acme/widgets":   "acme/widgets",
+		"https://github.com@attacker.example/acme/widgets":        "",
+		"https://github.com:8443@attacker.example/acme/widgets":   "",
+		"ssh://github.com@attacker.example/acme/widgets":          "",
+		"git@attacker.example:github.com/acme/widgets":            "",
+		"attacker.example:github.com/acme/widgets":                "",
+		"https://github.com/acme/widgets.git/":                    "acme/widgets",
+		"https://GitHub.com/acme/widgets":                         "acme/widgets",
+		"https://github.com/acme/widgets#frag":                    "",
+		"https://github.com/acme//widgets":                        "",
+		"https://github.com/acme/widgets/extra":                   "",
+		"ftp://github.com/acme/widgets":                           "",
+		"ssh://git@github.com:22/acme/widgets":                    "acme/widgets",
+		"https://github.com:443/acme/widgets":                     "acme/widgets",
+		"https://token@github.com/acme/widgets.git":               "acme/widgets",
+		"git@github.com:/acme/widgets.git":                        "acme/widgets",
+		"git@github.com:acme/widgets.git/":                        "acme/widgets",
+		"git://github.com/acme/widgets.git":                       "acme/widgets",
+		"https://www.github.com/acme/widgets":                     "acme/widgets",
+		"github.com/acme/widgets.git":                             "acme/widgets",
+		"user@github.com/acme/widgets":                            "acme/widgets",
+		"https://github.com/acme/widgets\n":                       "acme/widgets",
+		"https://github.com/acme/widgets\nhttps://github.com/x/y": "",
+	}
+	for in, want := range cases {
+		if got := githubRepositorySlug(in); got != want {
+			t.Errorf("githubRepositorySlug(%q) = %q; want %q", in, got, want)
+		}
+	}
 }
 
 // TestSessionPullRequestVerifier_AcceptsOnlyTheSessionsOwnPullRequest pins the
-// acceptance rule through the production `gh pr view` lookup (a stub gh):
-// the pull request must exist on the session's repository with the session's
-// branch or commit as its head.
+// acceptance rule through the production lookup, `git ls-remote origin`, on a
+// real remote: the pull request must exist on the session's repository with
+// the session branch's remote head or the session commit as its head.
 func TestSessionPullRequestVerifier_AcceptsOnlyTheSessionsOwnPullRequest(t *testing.T) {
-	checkout := t.TempDir()
-	gitInit(t, checkout)
-	head := gitRun(t, checkout, "rev-parse", "HEAD")
 	const branch = "agent/session-1"
-	const (
-		byBranch  = "https://github.com/acme/widgets/pull/7"
-		byCommit  = "https://github.com/acme/widgets/pull/8"
-		otherHead = "https://github.com/acme/widgets/pull/9"
-		fork      = "https://github.com/acme/widgets/pull/10"
-		renamed   = "https://github.com/acme/widgets/pull/11"
-		missing   = "https://github.com/acme/widgets/pull/404"
-		otherRepo = "https://github.com/acme/gadgets/pull/7"
-	)
-	other := strings.Repeat("b", 40)
-	view := func(prURL string, number int, headRef, oid string, cross bool) string {
-		return fmt.Sprintf(`{"number":%d,"url":%q,"headRefName":%q,"headRefOid":%q,"isCrossRepository":%t}`, number, prURL, headRef, oid, cross)
-	}
-	stubGhPullRequestView(t, map[string]string{
-		byBranch:  view(byBranch, 7, branch, other, false),
-		byCommit:  view(byCommit, 8, "feature/own-name", head, false),
-		otherHead: view(otherHead, 9, "feature/someone-else", other, false),
-		fork:      view(fork, 10, branch, other, true),
-		renamed:   view("https://github.com/acme/other/pull/11", 11, branch, head, false),
-		otherRepo: view(otherRepo, 7, branch, head, false),
-	})
+	clone, remote, _ := cloneForRescue(t)
+	gitRun(t, clone, "checkout", "-q", "-b", branch)
+	writeFile(t, clone, "work.txt", "pushed work\n")
+	gitRun(t, clone, "add", "work.txt")
+	gitRun(t, clone, "commit", "-q", "-m", "pushed work")
+	pushed := gitRun(t, clone, "rev-parse", "HEAD")
+	gitRun(t, clone, "push", "-q", "origin", "HEAD:refs/heads/"+branch)
+	writeFile(t, clone, "more.txt", "later work\n")
+	gitRun(t, clone, "add", "more.txt")
+	gitRun(t, clone, "commit", "-q", "-m", "later work")
+	local := gitRun(t, clone, "rev-parse", "HEAD")
+	gitRun(t, clone, "push", "-q", "origin", "HEAD:refs/heads/feature/own-name")
+	setPullRef(t, remote, 7, pushed)            // head: the session branch's remote head
+	setPullRef(t, remote, 8, local)             // head: the session commit, another branch name
+	setPullRef(t, remote, 9, pullAtOtherCommit) // someone else's work
+
+	unreachable := filepath.Join(t.TempDir(), "unreachable")
+	gitRun(t, filepath.Dir(unreachable), "clone", "-q", remote, unreachable)
+	gitRun(t, unreachable, "remote", "set-url", "origin", filepath.Join(t.TempDir(), "gone.git"))
 
 	cases := []struct {
 		name       string
 		repository string
+		checkout   string
 		url        string
-		wantOK     bool
+		want       candidateOutcome
 		wantReason string
 	}{
-		{name: "the prompt's quoted example URL", repository: "acme/widgets", url: quotedExamplePR, wantReason: "another repository"},
-		{name: "own repository, head is the session branch", repository: "acme/widgets", url: byBranch, wantOK: true},
-		{name: "own repository, head is the session commit", repository: "acme/widgets", url: byCommit, wantOK: true},
-		{name: "own repository, another branch and commit", repository: "acme/widgets", url: otherHead, wantReason: "neither the session branch nor the session commit"},
-		{name: "a fork's branch that shares the session branch name", repository: "acme/widgets", url: fork, wantReason: "neither the session branch nor the session commit"},
-		{name: "lookup answers for a different pull request", repository: "acme/widgets", url: renamed, wantReason: "different pull request"},
-		{name: "a pull request that does not exist", repository: "acme/widgets", url: missing, wantReason: "could not confirm the pull request exists"},
-		{name: "another repository", repository: "acme/widgets", url: otherRepo, wantReason: "another repository"},
-		{name: "session repository is not on GitHub", repository: "", url: byBranch, wantReason: "not a GitHub repository"},
-		{name: "not a canonical pull request URL", repository: "acme/widgets", url: byBranch + "?tab=files", wantReason: "not a canonical"},
+		{name: "the prompt's quoted example URL", url: quotedExamplePR, want: candidateRefused, wantReason: "another repository"},
+		{name: "head is the session branch's remote head", url: "https://github.com/acme/widgets/pull/7", want: candidateAccepted},
+		{name: "head is the session commit on another branch", url: "https://github.com/Acme/Widgets/pull/8", want: candidateAccepted},
+		{name: "head is someone else's commit", url: "https://github.com/acme/widgets/pull/9", want: candidateRefused, wantReason: "neither the session branch nor the session commit"},
+		{name: "no such pull request", url: "https://github.com/acme/widgets/pull/404", want: candidateRefused, wantReason: "no such pull request"},
+		{name: "another repository", url: "https://github.com/acme/gadgets/pull/7", want: candidateRefused, wantReason: "another repository"},
+		{name: "session repository is not on GitHub", repository: "-", url: "https://github.com/acme/widgets/pull/7", want: candidateRefused, wantReason: "not a GitHub repository"},
+		{name: "not a canonical pull request URL", url: "https://github.com/acme/widgets/pull/7?tab=files", want: candidateRefused, wantReason: "not a canonical"},
+		{name: "remote cannot be read", checkout: unreachable, url: "https://github.com/acme/widgets/pull/7", want: candidateUnconfirmed, wantReason: "could not read the pull request"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			v := &sessionPullRequestVerifier{repository: tc.repository, branch: branch, worktreePath: checkout, lookup: ghPullRequestHead}
-			ok, reason, _ := v.verify(context.Background(), tc.url)
-			if ok != tc.wantOK {
-				t.Fatalf("verify(%s) = %v (%q); want %v", tc.url, ok, reason, tc.wantOK)
+			repository := "acme/widgets"
+			if tc.repository == "-" {
+				repository = ""
+			}
+			checkout := clone
+			if tc.checkout != "" {
+				checkout = tc.checkout
+			}
+			v := &sessionPullRequestVerifier{repository: repository, branch: branch, worktreePath: checkout, lookup: originRefs, outcomes: map[string]candidateOutcome{}}
+			got, reason, _ := v.verify(context.Background(), tc.url)
+			if got != tc.want {
+				t.Fatalf("verify(%s) = %d (%q); want %d", tc.url, got, reason, tc.want)
 			}
 			if !strings.Contains(reason, tc.wantReason) {
 				t.Errorf("reason = %q; want it to contain %q", reason, tc.wantReason)
@@ -170,10 +243,16 @@ func TestSessionPullRequestVerifier_AcceptsOnlyTheSessionsOwnPullRequest(t *test
 // candidate leaves the envelope without one.
 func TestSessionPullRequestVerifier_SettleNewestVerifiedCandidateWins(t *testing.T) {
 	const own = "https://github.com/acme/widgets/pull/7"
-	fake := &fakePullRequestLookup{heads: map[string]pullRequestHead{
-		own: {Number: 7, URL: own, HeadRefName: "agent/s"},
-	}}
-	v := &sessionPullRequestVerifier{repository: "acme/widgets", branch: "agent/s", worktreePath: t.TempDir(), lookup: fake.lookup}
+	head := strings.Repeat("a", 40)
+	var looked []string
+	lookup := func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
+		looked = append(looked, refs...)
+		return map[string]string{"refs/pull/7/head": head, "refs/heads/agent/s": head}, nil
+	}
+	newVerifier := func() *sessionPullRequestVerifier {
+		return &sessionPullRequestVerifier{repository: "acme/widgets", branch: "agent/s", worktreePath: t.TempDir(), lookup: lookup, outcomes: map[string]candidateOutcome{}}
+	}
+	v := newVerifier()
 
 	// Turn 1: the agent opens its PR, then quotes the prompt's example.
 	var turn1 streamObservation
@@ -189,8 +268,10 @@ func TestSessionPullRequestVerifier_SettleNewestVerifiedCandidateWins(t *testing
 	if len(rejected) != 1 || rejected[0].url != quotedExamplePR {
 		t.Errorf("rejected = %+v; want only the quoted example", rejected)
 	}
-	if fake.called(quotedExamplePR) {
-		t.Errorf("the example URL on another repository was looked up; want it refused without a lookup")
+	for _, ref := range looked {
+		if ref == "refs/pull/42/head" {
+			t.Errorf("the example URL on another repository was looked up")
+		}
 	}
 
 	// Turn 2 only quotes the example again: the verified PR stands.
@@ -203,7 +284,7 @@ func TestSessionPullRequestVerifier_SettleNewestVerifiedCandidateWins(t *testing
 	}
 
 	// A fresh session whose only candidate is the example has no PR.
-	fresh := &sessionPullRequestVerifier{repository: "acme/widgets", branch: "agent/s", worktreePath: t.TempDir(), lookup: fake.lookup}
+	fresh := newVerifier()
 	res = &Result{}
 	res.PullRequestURL = quotedExamplePR
 	obs = &streamObservation{pullRequestURL: quotedExamplePR}
@@ -229,21 +310,25 @@ func TestAppendPullRequestCandidates_KeepsLatestPositionAndBound(t *testing.T) {
 	}
 }
 
-// runPullRequestScenario runs one development session on a GitHub-identified
-// repository whose single turn is turn. Steering and the backstop are off, so
-// the session's pull request is exactly what the runner accepted from the
-// conversation, and teardown runs on success.
-func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueDir string, turn verdictScriptTurn) *Result {
+// runPullRequestScenario runs one development session on a GitHub repository
+// (addressed as repoURL) whose single turn is turn. Steering and the backstop
+// are off, so the session's pull request is exactly what the runner accepted
+// from the conversation, and teardown runs on success.
+func runPullRequestScenario(t *testing.T, repoURL string, pulls map[int]string, lookup *recordingRefLookup, rescueDir string, turn verdictScriptTurn) *Result {
 	t.Helper()
-	res, _ := runScriptedSession(t, scriptedSession{
+	cfg := scriptedSession{
 		workType:     "development",
 		skipSteering: true,
-		github:       "acme/widgets",
-		lookup:       lookup,
+		repository:   repoURL,
+		pulls:        pulls,
 		rescueDir:    rescueDir,
 		teardown:     true,
 		turns:        []verdictScriptTurn{turn},
-	})
+	}
+	if lookup != nil {
+		cfg.lookup = lookup.lookup
+	}
+	res, _ := runScriptedSession(t, cfg)
 	return res
 }
 
@@ -252,16 +337,16 @@ func runPullRequestScenario(t *testing.T, lookup *fakePullRequestLookup, rescueD
 // is still uncommitted. The run must not report that URL, and teardown must
 // not delete the uncommitted work without archiving it.
 func TestRun_QuotedExamplePullRequestURLIsNotTheSessionsPR(t *testing.T) {
-	lookup := &fakePullRequestLookup{}
+	lookup := &recordingRefLookup{}
 	rescueDir := t.TempDir()
-	res := runPullRequestScenario(t, lookup, rescueDir, verdictScriptTurn{
+	res := runPullRequestScenario(t, "https://github.com/acme/widgets", nil, lookup, rescueDir, verdictScriptTurn{
 		files: map[string]string{"notes/copied-prompt.md": "the work the agent was doing\n"},
 		text:  "Copied the prompt, which links " + quotedExamplePR + " as the example.",
 	})
 	if res.PullRequestURL != "" {
 		t.Fatalf("PullRequestURL = %q; want none (the quoted example is not the session's pull request)", res.PullRequestURL)
 	}
-	if lookup.called(quotedExamplePR) {
+	if lookup.lookedUp("refs/pull/42/head") {
 		t.Errorf("the example URL on another repository was looked up; want it refused without a lookup")
 	}
 	if _, err := os.Stat(res.WorktreePath); !os.IsNotExist(err) {
@@ -273,23 +358,33 @@ func TestRun_QuotedExamplePullRequestURLIsNotTheSessionsPR(t *testing.T) {
 	}
 }
 
-// TestRun_OwnPullRequestIsAcceptedOverAQuotedExample pins the other side: a
-// pull request that exists on the session's repository with the session
-// branch as its head is the session's pull request, even when the agent also
-// quoted the example URL after it.
-func TestRun_OwnPullRequestIsAcceptedOverAQuotedExample(t *testing.T) {
+// TestRun_OwnPullRequestIsAcceptedInEveryRemoteForm pins acceptance of the
+// session's real pull request — on its repository, head at the session
+// commit — whatever form the dispatched repository address takes, through
+// `git ls-remote` alone: a gh that fails every call is never asked.
+func TestRun_OwnPullRequestIsAcceptedInEveryRemoteForm(t *testing.T) {
 	const own = "https://github.com/acme/widgets/pull/7"
-	lookup := &fakePullRequestLookup{heads: map[string]pullRequestHead{
-		own: {Number: 7, URL: own, HeadRefName: "agent/test-session-MANIFEST-FOLLOWUP"},
-	}}
-	res := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
-		text: "Opened " + own + " following the example at " + quotedExamplePR + ".",
-	})
-	if res.PullRequestURL != own {
-		t.Fatalf("PullRequestURL = %q; want the session's own %q", res.PullRequestURL, own)
-	}
-	if res.Status != "completed" {
-		t.Errorf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	for _, repoURL := range []string{
+		"https://github.com/acme/widgets",
+		"https://x-access-token:secret@github.com/acme/widgets",
+		"ssh://git@github.com/acme/widgets.git",
+		"git@github.com:acme/widgets.git",
+	} {
+		t.Run(repoURL, func(t *testing.T) {
+			ghCalls := sentinelGh(t)
+			res := runPullRequestScenario(t, repoURL, map[int]string{7: pullAtSessionCommit}, nil, t.TempDir(), verdictScriptTurn{
+				text: "Opened " + own + " following the example at " + quotedExamplePR + ".",
+			})
+			if res.PullRequestURL != own {
+				t.Fatalf("PullRequestURL = %q; want the session's own %q", res.PullRequestURL, own)
+			}
+			if res.Status != "completed" {
+				t.Errorf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+			}
+			if _, err := os.Stat(ghCalls); !os.IsNotExist(err) {
+				t.Errorf("gh was called (%s): verification must not need it", readFile(t, ghCalls))
+			}
+		})
 	}
 }
 
@@ -298,16 +393,14 @@ func TestRun_OwnPullRequestIsAcceptedOverAQuotedExample(t *testing.T) {
 // session commit is not the session's pull request.
 func TestRun_PullRequestOnAnotherBranchIsRejected(t *testing.T) {
 	const theirs = "https://github.com/acme/widgets/pull/9"
-	lookup := &fakePullRequestLookup{heads: map[string]pullRequestHead{
-		theirs: {Number: 9, URL: theirs, HeadRefName: "feature/someone-else", HeadRefOid: strings.Repeat("c", 40)},
-	}}
-	res := runPullRequestScenario(t, lookup, t.TempDir(), verdictScriptTurn{
+	lookup := &recordingRefLookup{}
+	res := runPullRequestScenario(t, "https://github.com/acme/widgets", map[int]string{9: pullAtOtherCommit}, lookup, t.TempDir(), verdictScriptTurn{
 		text: "Related work is in " + theirs + ".",
 	})
 	if res.PullRequestURL != "" {
 		t.Fatalf("PullRequestURL = %q; want none", res.PullRequestURL)
 	}
-	if !lookup.called(theirs) {
+	if !lookup.lookedUp("refs/pull/9/head") {
 		t.Errorf("the same-repository candidate was never looked up")
 	}
 }

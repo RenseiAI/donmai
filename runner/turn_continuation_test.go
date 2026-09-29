@@ -1,8 +1,12 @@
 package runner
 
 import (
+	"context"
+	"errors"
+	"slices"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -13,11 +17,9 @@ import (
 func runContinuationScenario(t *testing.T, limit int, turns ...verdictScriptTurn) (*Result, []string) {
 	t.Helper()
 	res, provider := runScriptedSession(t, scriptedSession{
-		workType: "development",
-		github:   "example/repo",
-		lookup: &fakePullRequestLookup{heads: map[string]pullRequestHead{
-			followUpPR: {Number: 7, URL: followUpPR, HeadRefName: scriptedSessionBranch},
-		}},
+		workType:          "development",
+		repository:        followUpRepository,
+		pulls:             map[int]string{7: pullAtSessionCommit},
 		continuationLimit: limit,
 		turns:             turns,
 	})
@@ -192,16 +194,29 @@ func TestRun_EarlyStopAfterThePullRequestNudgeIsContinued(t *testing.T) {
 }
 
 // TestRun_UnconfirmedOwnPullRequestIsNudgedNotContinued pins that a turn which
-// reported a pull request on the session's repository that could not be
-// confirmed did not stop early: it gets the pull request nudge (and then the
-// backstop), as before, never a continuation — so a lookup outage cannot turn
-// a finished session into a continuation loop.
+// reported a pull request on the session's repository that the remote could
+// not be read to confirm did not stop early: it gets the pull request nudge
+// (and then the backstop), as before, never a continuation — so a remote
+// outage cannot turn a finished session into a continuation loop.
 func TestRun_UnconfirmedOwnPullRequestIsNudgedNotContinued(t *testing.T) {
 	const unconfirmed = "https://github.com/example/repo/pull/99"
-	res, prompts := runContinuationScenario(t, 0,
-		verdictScriptTurn{text: "Opened " + unconfirmed},
-		verdictScriptTurn{text: "Opened " + followUpPR},
-	)
+	outage := func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
+		if slices.Contains(refs, "refs/pull/99/head") {
+			return nil, errors.New("remote unreachable")
+		}
+		return originRefs(ctx, worktreePath, refs...)
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		lookup:     outage,
+		turns: []verdictScriptTurn{
+			{text: "Opened " + unconfirmed},
+			{text: "Opened " + followUpPR},
+		},
+	})
+	prompts := provider.prompts
 	if !res.SteeringTriggered {
 		t.Errorf("SteeringTriggered = false; want the pull request nudge")
 	}
@@ -216,13 +231,119 @@ func TestRun_UnconfirmedOwnPullRequestIsNudgedNotContinued(t *testing.T) {
 	wantContinuations(t, res, 0, 0, false)
 }
 
+// TestRun_OtherOwnRepositoryPullRequestThenEarlyStopIsContinued pins that an
+// own-repository pull request confirmed to be someone else's does not count as
+// the session reporting its pull request: a turn that cites one and stops
+// early is continued, not nudged.
+func TestRun_OtherOwnRepositoryPullRequestThenEarlyStopIsContinued(t *testing.T) {
+	const other = "https://github.com/example/repo/pull/100"
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit, 100: pullAtOtherCommit},
+		turns: []verdictScriptTurn{
+			{text: "Read " + other + " for context. Now implementing."},
+			{text: "Opened " + followUpPR},
+		},
+	})
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a turn citing someone else's pull request stopped early")
+	}
+	wantPrompts(t, provider.prompts, continuePrompt)
+	wantContinuations(t, res, 1, 0, false)
+	if res.PullRequestURL != followUpPR {
+		t.Errorf("PullRequestURL = %q; want %q", res.PullRequestURL, followUpPR)
+	}
+}
+
+// TestRun_ContinuationExhaustedStillRunsTheBackstop pins that a session whose
+// turn never finished still gets the backstop's open-PR attempt: the work is
+// committed and pushed to the session branch and a pull request is opened,
+// while the session stays failed as continuations-exhausted.
+func TestRun_ContinuationExhaustedStillRunsTheBackstop(t *testing.T) {
+	const opened = "https://github.com/example/repo/pull/12"
+	ghArgs := stubGhRecordingArgs(t, opened)
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:          "development",
+		repository:        followUpRepository,
+		backstop:          true,
+		continuationLimit: 1,
+		turns: []verdictScriptTurn{
+			{files: map[string]string{"feature.txt": "half done\n"}, text: "Working on it."},
+			{text: "Still working."},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsExhausted {
+		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureContinuationsExhausted)
+	}
+	wantPrompts(t, provider.prompts, continuePrompt)
+	if res.BackstopReport == nil || !res.BackstopReport.Pushed || !res.BackstopReport.PRCreated {
+		t.Fatalf("BackstopReport = %+v; want the work pushed and a pull request opened", res.BackstopReport)
+	}
+	if res.PullRequestURL != opened {
+		t.Errorf("PullRequestURL = %q; want the backstop's %q", res.PullRequestURL, opened)
+	}
+	if !strings.Contains(readFile(t, ghArgs), "--head") {
+		t.Errorf("gh pr create was not asked to open the session branch's pull request")
+	}
+}
+
+// TestRun_WorkThatOwesNoPullRequestIsNotContinued pins the gate on the
+// continuation: a QA turn that ends without a verdict is not continued (its
+// contract is a verdict, not a pull request).
+func TestRun_WorkThatOwesNoPullRequestIsNotContinued(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "qa",
+		repository: followUpRepository,
+		turns: []verdictScriptTurn{
+			{text: "Looking at the change."},
+			{text: "never reached"},
+		},
+	})
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
+// TestWaitRetryBackoff_Cancellable pins that the wait before a provider-error
+// retry ends as soon as the session's context does.
+func TestWaitRetryBackoff_Cancellable(t *testing.T) {
+	r := minimalRunner(t)
+	r.providerRetryBackoff = func(int) time.Duration { return time.Hour }
+	ctx, cancel := context.WithCancel(context.Background())
+	time.AfterFunc(20*time.Millisecond, cancel)
+	start := time.Now()
+	if err := r.waitRetryBackoff(ctx, 1); !errors.Is(err, context.Canceled) {
+		t.Fatalf("waitRetryBackoff = %v; want context.Canceled", err)
+	}
+	if elapsed := time.Since(start); elapsed > 10*time.Second {
+		t.Fatalf("waitRetryBackoff returned after %s; want it to end with the context", elapsed)
+	}
+	r.providerRetryBackoff = func(int) time.Duration { return time.Millisecond }
+	if err := r.waitRetryBackoff(context.Background(), 1); err != nil {
+		t.Fatalf("waitRetryBackoff with a live context = %v; want nil", err)
+	}
+	if got := defaultProviderRetryBackoff(3); got != 30*time.Second {
+		t.Errorf("defaultProviderRetryBackoff(3) = %s; want 30s", got)
+	}
+}
+
 func TestSessionPullRequestVerifier_ReportsOwnRepository(t *testing.T) {
-	v := &sessionPullRequestVerifier{repository: "acme/widgets"}
+	v := &sessionPullRequestVerifier{repository: "acme/widgets", outcomes: map[string]candidateOutcome{
+		"https://github.com/acme/widgets/pull/5": candidateRefused,
+		"https://github.com/acme/widgets/pull/6": candidateUnconfirmed,
+	}}
 	turn := func(text string) streamObservation {
 		return streamObservation{pullRequestCandidates: appendPullRequestCandidates(nil, text)}
 	}
 	if !v.reportsOwnRepository(turn("see https://github.com/Acme/Widgets/pull/3")) {
-		t.Error("an own-repository URL (any case) is a reported pull request")
+		t.Error("an unchecked own-repository URL (any case) is a reported pull request")
+	}
+	if !v.reportsOwnRepository(turn("see https://github.com/acme/widgets/pull/6")) {
+		t.Error("an own-repository URL the remote could not confirm is a reported pull request")
+	}
+	if v.reportsOwnRepository(turn("see https://github.com/acme/widgets/pull/5")) {
+		t.Error("an own-repository URL confirmed to be someone else's is not")
 	}
 	if v.reportsOwnRepository(turn("see " + quotedExamplePR)) {
 		t.Error("the quoted example on another repository is not")

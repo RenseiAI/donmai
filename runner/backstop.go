@@ -181,9 +181,11 @@ func shouldBackstop(res *Result, workType string) bool {
 		return false
 	}
 	switch res.FailureMode {
-	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled, FailureContinuationsExhausted:
-		// FailureContinuationsExhausted: the turn still ended unfinished
-		// after every continuation; unfinished work is not published.
+	case FailureLostOwnership, FailureTimeout, FailureProviderResolve, FailureAgentBlocked, FailureOperatorCancelled:
+		// FailureContinuationsExhausted is deliberately absent: a session
+		// whose turn never finished still gets the open-PR attempt, so a
+		// real pull request the verifier could not confirm is recovered and
+		// the work is pushed rather than left only on this host.
 		// FailureAgentBlocked: the agent deliberately declined — there is
 		// no in-progress work to commit, and an empty-branch backstop PR
 		// would misrepresent a reasoned refusal as abandoned work.

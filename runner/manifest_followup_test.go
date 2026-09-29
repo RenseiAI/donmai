@@ -169,20 +169,19 @@ const (
 // heartbeat delivers so the runner drains it as a follow-up turn.
 //
 // The session's repository is a GitHub one (github.com/example/repo, served
-// from disk) on which followUpPR exists with the session branch as its head,
-// so a turn that reports followUpPR has really opened the session's pull
-// request — the runner accepts no other kind (see pull_request_verify.go).
+// from disk) on which followUpPR exists with the session's commit as its
+// head, so a turn that reports followUpPR has really opened the session's
+// pull request — the runner accepts no other kind (see
+// pull_request_verify.go).
 func runScripted(t *testing.T, workType string, skipSteering bool, inject string, turns ...verdictScriptTurn) *Result {
 	t.Helper()
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType:     workType,
 		skipSteering: skipSteering,
 		inject:       inject,
-		github:       "example/repo",
-		lookup: &fakePullRequestLookup{heads: map[string]pullRequestHead{
-			followUpPR: {Number: 7, URL: followUpPR, HeadRefName: scriptedSessionBranch},
-		}},
-		turns: turns,
+		repository:   followUpRepository,
+		pulls:        map[int]string{7: pullAtSessionCommit},
+		turns:        turns,
 	})
 	return res
 }
@@ -195,20 +194,25 @@ func continuedCount(res *Result) int {
 	return res.TurnContinuations.Continued
 }
 
-// scriptedSessionBranch is the branch the runner owns for a scripted session.
-const scriptedSessionBranch = "agent/test-session-MANIFEST-FOLLOWUP"
+// followUpRepository is the GitHub repository followUpPR lives on.
+const followUpRepository = "https://github.com/example/repo"
 
 // scriptedSession configures runScriptedSession.
 type scriptedSession struct {
 	workType     string
 	skipSteering bool
 	inject       string
-	// github, when set, is the "owner/repo" of a GitHub repository the
-	// session provisions (served from a local bare repository); otherwise
-	// the session repository is a plain local path.
-	github string
-	// lookup answers the session pull request verifier's lookups.
-	lookup *fakePullRequestLookup
+	// repository, when set, is a GitHub repository address (any remote
+	// form) the session provisions, served from a local bare repository;
+	// otherwise the session repository is a plain local path.
+	repository string
+	// pulls creates refs/pull/<n>/head on that repository, pointing at a
+	// sha, pullAtSessionCommit or pullAtOtherCommit.
+	pulls map[int]string
+	// lookup, when set, replaces the verifier's remote lookup.
+	lookup pullRequestRefLookup
+	// backstop lets the deterministic backstop run (off by default).
+	backstop bool
 	// teardown lets Run tear the worktree down on success (the default keeps
 	// it for inspection); rescueDir is where unpublished work is archived.
 	teardown  bool
@@ -245,8 +249,9 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		r.rescueDir = cfg.rescueDir
 	}
 	if cfg.lookup != nil {
-		r.pullRequestLookup = cfg.lookup.lookup
+		r.pullRequestLookup = cfg.lookup
 	}
+	r.skipBackstop = !cfg.backstop
 	r.turnContinuationLimit = cfg.continuationLimit
 	r.providerRetryBackoff = func(int) time.Duration { return 0 }
 	qw := QueuedWork{
@@ -257,8 +262,12 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 	}
 	qw.WorkType = cfg.workType
-	if cfg.github != "" {
-		qw.Repository = githubRepositoryFixture(t, cfg.github)
+	if cfg.repository != "" {
+		bare := githubRepositoryFixture(t, cfg.repository)
+		for number, target := range cfg.pulls {
+			setPullRef(t, bare, number, target)
+		}
+		qw.Repository = cfg.repository
 	} else {
 		qw.Repository = makeBareRepo(t)
 	}

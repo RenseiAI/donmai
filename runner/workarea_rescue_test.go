@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // onlyRescuePatch returns the single archived patch under dir, failing the
@@ -194,5 +195,115 @@ func TestRun_TeardownKeepsAWorkareaWhoseWorkCannotBePreserved(t *testing.T) {
 	}
 	if got := readFile(t, filepath.Join(res.WorktreePath, "work.txt")); got != "uncommitted\n" {
 		t.Fatalf("work.txt = %q; want the uncommitted work kept in place", got)
+	}
+}
+
+// TestPreserveUnpublishedWork_PatchIgnoresDiffConfiguration pins that user or
+// repository diff configuration cannot alter the archived patch: each of these
+// settings once produced a patch that did not apply (or applied converted
+// content) while the rescue reported success and the worktree was deleted.
+func TestPreserveUnpublishedWork_PatchIgnoresDiffConfiguration(t *testing.T) {
+	cases := []struct {
+		name string
+		cfg  [][2]string
+		attr string
+	}{
+		{name: "diff.noprefix", cfg: [][2]string{{"diff.noprefix", "true"}}},
+		{name: "diff.mnemonicPrefix", cfg: [][2]string{{"diff.mnemonicPrefix", "true"}}},
+		{name: "color.diff always", cfg: [][2]string{{"color.diff", "always"}, {"color.ui", "always"}}},
+		{name: "diff.external", cfg: [][2]string{{"diff.external", "/bin/echo"}}},
+		{name: "textconv attribute", cfg: [][2]string{{"diff.upper.textconv", "tr a-z A-Z <"}}, attr: "*.txt diff=upper\n"},
+		{name: "rename detection", cfg: [][2]string{{"diff.renames", "copies"}}},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			clone, remote, base := cloneForRescue(t)
+			for _, kv := range tc.cfg {
+				gitRun(t, clone, "config", kv[0], kv[1])
+			}
+			if tc.attr != "" {
+				writeFile(t, clone, ".git/info/attributes", tc.attr)
+			}
+			writeFile(t, clone, "notes.txt", "lower case work\n")
+			gitRun(t, clone, "mv", "README.md", "READ-ME.md")
+			r := minimalRunner(t)
+			r.rescueDir = t.TempDir()
+			res := &Result{rescueTargets: []rescueTarget{{path: clone, base: base}}}
+			if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("RESCUE-CONFIG")}, res) {
+				t.Fatal("preserveUnpublishedWork = false; want the work archived")
+			}
+			patch := onlyRescuePatch(t, r.rescueDir)
+			restored := filepath.Join(t.TempDir(), "restored")
+			gitRun(t, filepath.Dir(restored), "clone", "--quiet", remote, restored)
+			gitRun(t, restored, "checkout", "--quiet", base)
+			gitRun(t, restored, "apply", patch)
+			if got := readFile(t, filepath.Join(restored, "notes.txt")); got != "lower case work\n" {
+				t.Fatalf("restored notes.txt = %q; want the work byte for byte", got)
+			}
+			if _, err := os.Stat(filepath.Join(restored, "READ-ME.md")); err != nil {
+				t.Errorf("the rename was not restored: %v", err)
+			}
+		})
+	}
+}
+
+// TestPreserveUnpublishedWork_RefusesAPatchThatDoesNotReproduceTheWork pins
+// the proof step: a patch that does not rebuild the working state from its
+// base is not a preservation, so the caller is told to keep the workarea.
+func TestPreserveUnpublishedWork_RefusesAPatchThatDoesNotReproduceTheWork(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, "README.md", "# edited\n")
+	writeFile(t, clone, "notes.txt", "more work\n")
+	original := rescuePatchArgs
+	t.Cleanup(func() { rescuePatchArgs = original })
+	// A patch that silently leaves notes.txt out.
+	rescuePatchArgs = func(base, tree string) []string {
+		return append(original(base, tree), "--", "README.md")
+	}
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	res := &Result{rescueTargets: []rescueTarget{{path: clone, base: base}}}
+	if r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase("RESCUE-PROOF")}, res) {
+		t.Fatal("preserveUnpublishedWork = true for a patch that loses notes.txt; want false so the workarea is kept")
+	}
+}
+
+// TestPreserveUnpublishedWork_KeepsTheNewestArchivesPerSession pins the
+// retention cap: a session keeps its last rescueKeepPerSession archives, and
+// another session's archives are untouched.
+func TestPreserveUnpublishedWork_KeepsTheNewestArchivesPerSession(t *testing.T) {
+	clone, _, base := cloneForRescue(t)
+	writeFile(t, clone, "work.txt", "uncommitted\n")
+	r := minimalRunner(t)
+	r.rescueDir = t.TempDir()
+	clock := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	r.now = func() time.Time { return clock }
+	preserve := func(session string) {
+		t.Helper()
+		clock = clock.Add(time.Minute)
+		res := &Result{rescueTargets: []rescueTarget{{path: clone, base: base}}}
+		if !r.preserveUnpublishedWork(QueuedWork{QueuedWork: queuedWorkBase(session)}, res) {
+			t.Fatal("preserveUnpublishedWork = false")
+		}
+	}
+	preserve("OTHER")
+	for i := 0; i < rescueKeepPerSession+2; i++ {
+		preserve("RETAIN")
+	}
+	sessionRoot := filepath.Join(r.rescueDir, "test-session-RETAIN")
+	entries, err := os.ReadDir(sessionRoot)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(entries) != rescueKeepPerSession {
+		t.Fatalf("archives kept = %d; want %d", len(entries), rescueKeepPerSession)
+	}
+	// OTHER ran at 03:05:05 and RETAIN at 03:06:05 … 03:12:05: the two
+	// oldest RETAIN archives are pruned.
+	if oldest := entries[0].Name(); !strings.HasPrefix(oldest, "20260102T030805Z-") {
+		t.Errorf("oldest kept archive = %s; want the third one (the two oldest pruned)", oldest)
+	}
+	if got := len(rescuePatches(t, filepath.Join(r.rescueDir, "test-session-OTHER"))); got != 1 {
+		t.Errorf("another session's archives = %d; want its 1 untouched", got)
 	}
 }
