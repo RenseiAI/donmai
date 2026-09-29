@@ -613,7 +613,7 @@ else
     exit 0
   fi
   log "CHANGELOG ${version} section: ${changelog_source}"
-  awk -v v="^## ${version//./\\.}([[:space:]]|$)" '
+  awk -v v="^## ${version//./[.]}([[:space:]]|$)" '
     $0 ~ v { f = 1; print; next } f && /^## / { exit } f { print }
   ' "${scratch}/CHANGELOG.md" >"${scratch}/changelog-section.md"
   log "CHANGELOG section for ${version}:"
