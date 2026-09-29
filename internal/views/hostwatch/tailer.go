@@ -121,6 +121,11 @@ type Tailer struct {
 	// liveness. Bytes at or above backlog were observed live.
 	backlog int64
 	primed  bool // backlog has been fixed for this file incarnation
+	// replayAll marks scroll-back mode (startAtEnd=false): every byte
+	// read predates the watcher's attach, so every event is history and
+	// is flagged Replay. Steady-state tailers leave this false and use
+	// the backlog boundary instead.
+	replayAll bool
 }
 
 // NewTailer constructs a Tailer for the events.jsonl at path, attributing
@@ -146,6 +151,12 @@ func NewTailer(sessionID, path string, startAtEnd bool, now func() time.Time) *T
 		now = time.Now
 	}
 	t := &Tailer{sessionID: sessionID, path: path, now: now}
+	if !startAtEnd {
+		// Scroll-back mode reads the whole file from the top: all of it
+		// is history relative to the watcher's attach.
+		t.replayAll = true
+		return t
+	}
 	if startAtEnd {
 		if info, err := os.Stat(path); err == nil {
 			// File exists now — skip its current content. The skipped
@@ -197,13 +208,15 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 	// Truncation / rotation / reuse detection: the file shrank below our
 	// consumed offset, so the bytes we were tracking are gone. Re-read from
 	// the top and discard any half-line we were carrying. A reused path is
-	// a new incarnation: nothing observed so far is live output.
+	// a new incarnation: the bytes present now appeared while this
+	// incarnation was unwatched, so they are history (replay) and only
+	// later appends read as live.
 	if size < t.offset {
 		t.offset = 0
 		t.partial = nil
 		t.partialStart = 0
-		t.primed = false
-		t.backlog = 0
+		t.backlog = size
+		t.primed = true
 	}
 	if size == t.offset {
 		// Prime the backlog boundary on first contact with content: in
@@ -251,7 +264,7 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 					t.partialStart = 0
 				}
 				if ev, ok := t.decode(line); ok {
-					ev.Replay = t.isReplay(lineStart)
+					ev.Replay = t.replayAll || t.isReplay(lineStart)
 					out = append(out, ev)
 					if isTerminal(ev.Event) {
 						t.done = true
