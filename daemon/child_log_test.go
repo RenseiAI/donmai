@@ -163,7 +163,7 @@ func TestSpawner_DefaultsChildOutputToSlog(t *testing.T) {
 // Write to buf (via syncBuffer.notify) rather than sleeping a fixed interval,
 // so green runs return as soon as the pump goroutines flush — regardless of
 // scheduler load. The deadline is a liveness backstop only (green runs return
-// in milliseconds); 30s matches the amp harness convention after a loaded CI
+// in milliseconds); 30s is the fleet-wide convention after a loaded CI
 // runner burned through the previous 10s (2026-07-06, run 28821240724).
 func waitSlogRecords(t *testing.T, buf *syncBuffer, sessionID string) ([]slogRecord, bool, bool) {
 	t.Helper()

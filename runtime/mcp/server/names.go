@@ -7,7 +7,7 @@
 // server over stdio, negotiates the handshake, lists the tools, and routes a
 // model's mcp__* calls to them. The wire framing here mirrors what stdio.go +
 // client.go expect (one JSON object per line, responses correlated by id),
-// and what the claude/amp CLIs consume via --mcp-config
+// and what the claude CLI consumes via --mcp-config
 // (provider/harness/clijsonl/mcp.go) and the gemini direct harness bridges
 // through (provider/harness/gemini/mcp.go).
 //
@@ -28,7 +28,7 @@ import "github.com/RenseiAI/donmai/internal/codeintelcontract"
 const ServerName = codeintelcontract.ServerName
 
 // serverVersion is the serverInfo.version reported in initialize. The in-repo
-// client ignores it; other consumers (claude/amp CLIs) surface it for
+// client ignores it; other consumers (claude CLI) surface it for
 // diagnostics only.
 const serverVersion = "0.1.0"
 

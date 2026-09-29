@@ -4,25 +4,6 @@
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "cells": [
     {
-      "harness": "amp",
-      "endpoint": "anthropic",
-      "host": "direct",
-      "protocol": "anthropic-messages",
-      "transport": "cli-injection",
-      "authModes": [
-        "metered"
-      ],
-      "bringsOwnAuth": false,
-      "needsApiKey": true,
-      "costModel": "metered",
-      "oneShot": true,
-      "nativeJsonMode": false,
-      "structuredVia": "spawn-collect",
-      "legacyProviderId": "amp",
-      "stability": "beta",
-      "smoked": false
-    },
-    {
       "harness": "antigravity",
       "endpoint": "google",
       "host": "oauth-cli",
@@ -366,14 +347,6 @@
         "harness": "antigravity",
         "endpoint": "google",
         "host": "oauth-cli"
-      }
-    },
-    {
-      "providerName": "amp",
-      "cell": {
-        "harness": "amp",
-        "endpoint": "anthropic",
-        "host": "direct"
       }
     },
     {

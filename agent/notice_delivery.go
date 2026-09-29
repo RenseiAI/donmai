@@ -91,7 +91,7 @@ const (
 
 	// NoticeDeliveryResumeInject declares that the only way in is to start a
 	// NEW invocation that continues the existing conversation
-	// (`claude --resume <id>`, `amp threads continue <threadId>`). Delivery is
+	// (`claude --resume <id>`). Delivery is
 	// real but it is not delivery into the live process: the running session
 	// must be finished, or the resumed one becomes a second writer.
 	NoticeDeliveryResumeInject NoticeDelivery = "resume-inject"

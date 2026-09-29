@@ -98,15 +98,15 @@ func TestBuildCellsRejectsHostOutsideHarnessDrivesHosts(t *testing.T) {
 		want string
 	}{
 		{
-			name: "amp cannot use Anthropic OAuth host",
+			name: "codex cannot use Anthropic OAuth host",
 			cell: HarnessEndpointCell{
-				Harness:   agent.HarnessAmp,
+				Harness:   agent.HarnessCodex,
 				Endpoint:  agent.CompanyAnthropic,
 				Host:      agent.HostOAuthCLI,
 				Protocol:  agent.ProtoAnthropicMessages,
 				AuthModes: []agent.AuthMode{agent.AuthHostSession},
 			},
-			want: `host "oauth-cli" not in harness "amp" drivesHosts [direct]`,
+			want: `protocol "anthropic-messages" not in harness "codex" drives [openai-chat openai-responses]`,
 		},
 		{
 			name: "codex cannot use OpenAI gateway host",

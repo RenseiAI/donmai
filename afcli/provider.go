@@ -108,7 +108,7 @@ Providers are queried from the daemon's HTTP control API at
 http://127.0.0.1:7734 by default. Set ` + providerEnvDaemonURL + ` to override.
 
 Provider families currently enumerated by the daemon:
-  AgentRuntime (claude/codex/ollama/opencode/gemini/amp/stub).
+  AgentRuntime (claude/codex/ollama/opencode/gemini/stub).
 
 Families whose registry is not yet wired locally list as empty.
 Clients distinguishing "no providers" from "registry absent" can

@@ -10,7 +10,6 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/agycli"
-	"github.com/RenseiAI/donmai/provider/harness/amp"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -35,7 +34,6 @@ func TestToolLifecycleAdapterMatrix(t *testing.T) {
 		{"codex", (&codex.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, true, false, true},
 		{"gemini", (&gemini.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"ollama", (&ollama.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, true},
-		{"amp", (&amp.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, false, true},
 		{"agy-cli", (&agycli.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, false, false, false},
 		{"opencode", (&opencode.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous}, true, true, true},
 		{"pi", (&pi.Provider{}).Manifest(), []agent.PromptSessionMode{agent.PromptModeAutonomous, agent.PromptModeHumanControlled}, false, true, true},
@@ -140,7 +138,6 @@ func TestToolLifecycleAdapterUnsupportedPoliciesDeny(t *testing.T) {
 		mode     agent.PromptSessionMode
 	}{
 		{"codex-flat-list", (&codex.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
-		{"amp", (&amp.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"agy-cli", (&agycli.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"ollama", (&ollama.Provider{}).Manifest(), agent.Spec{Autonomous: true, AllowedTools: []string{"Read"}}, agent.PromptModeAutonomous},
 		{"shell", (&shell.Provider{}).Manifest(), agent.Spec{Interactive: &agent.InteractiveSpec{}, AllowedTools: []string{"Read"}}, agent.PromptModeHumanControlled},
@@ -199,7 +196,6 @@ func TestToolLifecycleRuntimeEvidenceIsPerHarness(t *testing.T) {
 	}{
 		{(&claude.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"claude-headless", structured, replayed, cleanup, structured}},
 		{(&codex.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"codex-headless", structured, replayed, cleanup, structured}},
-		{(&amp.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"amp", structured, replayed, cleanup, structured}},
 		{(&pi.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"pi", structured, replayed, cleanup, structured}},
 		{(&opencode.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"opencode", structured, replayed, cleanup, structured}},
 		{(&gemini.Provider{}).Manifest(), agent.PromptModeAutonomous, agent.EvidenceStructured, runtimeEvidenceCase{"gemini", structured, replayed, cleanup, structured}},
@@ -496,7 +492,7 @@ func TestToolLifecycleDeniedReceiptPersistenceFailsClosed(t *testing.T) {
 			return errors.New("store unavailable")
 		},
 	}
-	_, err := agent.PrepareToolLifecycle(spec, (&amp.Provider{}).Manifest())
+	_, err := agent.PrepareToolLifecycle(spec, (&agycli.Provider{}).Manifest())
 	var adaptationErr *agent.ToolAdaptationError
 	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialApplicationFailed {
 		t.Fatalf("PrepareToolLifecycle error = %v, want application-failed denial", err)
@@ -525,6 +521,26 @@ func TestToolLifecycleClosedDeliveryAndChannelEnums(t *testing.T) {
 				t.Fatalf("error = %v, want malformed-plan denial", err)
 			}
 		})
+	}
+}
+
+// TestRetiredAmpToolDeliveryKindStaysUnknown is the retirement guard for the
+// removed amp harness's tool delivery kind. "amp_cli_mcp_config" is the
+// literal former ToolDeliveryAmpMCPConfig wire value; a generic
+// "future_delivery" string (as used above) would pass this test whether or
+// not that constant and its isKnownToolDelivery case were ever restored, so
+// this pins the exact retired string. Re-adding
+// ToolDeliveryAmpMCPConfig = "amp_cli_mcp_config" and its case in
+// isKnownToolDelivery flips this test red.
+func TestRetiredAmpToolDeliveryKindStaysUnknown(t *testing.T) {
+	t.Parallel()
+	profile := mustProfile(t, (&claude.Provider{}).Manifest(), agent.PromptModeAutonomous)
+	profile.ToolPluginDelivery = agent.ToolDeliveryKind("amp_cli_mcp_config")
+	plan := agent.ToolLifecyclePlan{ContractVersion: agent.ToolLifecycleContractVersion}
+	_, _, err := agent.AdaptToolLifecycle(agent.Spec{Autonomous: true, ToolLifecyclePlan: &plan}, profile)
+	var adaptationErr *agent.ToolAdaptationError
+	if !errors.As(err, &adaptationErr) || adaptationErr.Code != agent.ToolDenialMalformedPlan {
+		t.Fatalf("retired amp_cli_mcp_config delivery error = %v, want malformed-plan denial", err)
 	}
 }
 
@@ -1356,7 +1372,7 @@ func TestToolLifecyclePlanRequireToolPluginsNowAdmitsOnPi(t *testing.T) {
 // TestInteractiveProfiles_TellCoarseTruthNoInjectedBoundary). RED proof: set
 // the interactive profile's NativeToolPolicyDelivery back to Unsupported and
 // this admission fails closed again, exactly like
-// TestToolLifecycleAdapterUnsupportedPoliciesDeny's shell/codex/amp/agy-cli/
+// TestToolLifecycleAdapterUnsupportedPoliciesDeny's shell/codex/agy-cli/
 // ollama cases above.
 func TestToolLifecyclePiInteractiveAllowedDisallowedToolsAdmitLocally(t *testing.T) {
 	t.Parallel()
