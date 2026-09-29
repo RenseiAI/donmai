@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # podman-go-test.sh — run this module's Go tests inside a Linux podman
 # container (the fast lane: `make test-podman`, and the test gate of
-# `make ship`).
+# `make ship` and `make release`).
 #
 # Why a container: CI runs the suite on Linux, and on a macOS host with a live
 # daemon the daemon install/uninstall tests can boot out the developer's own
@@ -45,15 +45,18 @@ image="localhost/donmai-go-test:go${go_version}"
 cache_volume="donmai-go-test-cache"
 
 if ! podman image exists "${image}"; then
+  # Removed right after the build: the exec below would skip an EXIT trap.
   context="$(mktemp -d)"
-  trap 'rm -rf -- "${context}"' EXIT
   printf 'podman-go-test: building %s (once per Go version)\n' "${image}"
-  podman build --quiet --tag "${image}" --file - "${context}" <<CONTAINERFILE >/dev/null
+  build_status=0
+  podman build --quiet --tag "${image}" --file - "${context}" <<CONTAINERFILE >/dev/null || build_status=$?
 FROM docker.io/library/golang:${go_version}-bookworm
 RUN apt-get update \\
  && apt-get install -y --no-install-recommends jq openssh-client python3 ruby \\
  && rm -rf /var/lib/apt/lists/*
 CONTAINERFILE
+  rm -rf -- "${context}"
+  [[ "${build_status}" -eq 0 ]] || die "podman build of ${image} failed (exit ${build_status})"
 fi
 
 if [[ $# -eq 0 ]]; then

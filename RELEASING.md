@@ -349,81 +349,191 @@ that landed through a reviewed pull request carries no attestation, so it keeps
 the full release gate even while the switch is on. The attestation is a record,
 not a proof: anyone with write access can post a commit status, so the trust
 anchor remains the credential that landed the commit. Turn the lane off by
-setting `FAST_LANE` to anything other than `on` or deleting it.
+setting `FAST_LANE` to anything other than `on` or deleting it. `make ship` and
+`make release` read the switch more strictly, as described below.
+
+### Ship and release: two commands
+
+While the lane is on, `make ship` and `make release` replace the
+release-preparation pull request and the manual tag steps above. They split
+landing from publishing on purpose: a change can land on `main` many times a
+day, but a public release, with its Homebrew cask update, happens at most once
+a day, so people installing `donmai` see one version per day rather than a
+stream of them.
+
+- **`make ship`** lands one change on `main`. It never tags or publishes.
+- **`make release`** is the daily release train. It publishes whatever has
+  landed since the last release.
+
+Both commands are for an operator with admin rights on this repository. Both
+refuse (exit 3) unless the lane is on. For these commands, on means both of
+the following:
+
+- The organization Actions variable `FAST_LANE` is exactly `on`.
+- No repository variable of that name exists.
+
+A repository variable, even one set to `on`, keeps both commands off. That
+way, one repository cannot hold the lane open against the organization's
+decision. Both commands read the switch again just before `main` moves, and
+`make release` reads it once more just before it creates the tag.
 
 ### Fast-lane ship (`make ship`)
 
-While `FAST_LANE` is `on`, one command takes a change from a worktree to a
-published release, replacing the release-preparation pull request and the
-manual tag steps above. It is for an operator with admin rights on this
-repository, run from a linked worktree whose branch holds the change (or
-nothing, to release `main` as it is):
+Run it from a linked worktree whose branch holds the change:
 
 ```bash
-make ship DRY_RUN=1        # every read-only check, the composed CHANGELOG, the guard; changes nothing
-make ship                  # next patch version
-make ship VERSION=v0.73.0  # a minor release
-make ship FULL=1           # also make vuln and make release-dry-run
+make ship DRY_RUN=1   # every read-only check and the guard; changes nothing
+make ship             # land the branch on main
+make ship FULL=1      # also make vuln and make release-dry-run
 ```
 
-`scripts/fast-ship.sh` then:
+`scripts/fast-lane.sh ship` then:
 
 1. **Refuses** before anything changes (exit 3) unless:
-   - `FAST_LANE` is exactly `on`. A repository variable of the same name wins
-     over the organization one, as in the workflows.
-   - The `gh` login is a repository admin.
-   - It runs in a linked worktree on a branch, never the primary checkout or
-     `main`, and the branch name passes guard-b.
-   - The tree is clean, and HEAD contains fresh `origin/main`. The remote
+   - the lane is on;
+   - the `gh` login is a repository admin;
+   - it runs in a linked worktree on a branch, never the primary checkout or
+     `main`, and the branch name passes guard-b;
+   - the tree is clean, HEAD contains fresh `origin/main`, and the remote
      branch holds nothing HEAD lacks.
-   - The version is the smallest increment from the latest `origin` tag, with
-     no tag and no GitHub release yet.
-   - The tag signer is ready.
-2. **Composes** the CHANGELOG section. An existing `## vX.Y.Z` section wins,
-   then the `## [Unreleased]` entries. Otherwise it composes one from the
-   subjects landed since the last tag plus this change's title. It runs
-   `guard-b-lint.sh --stdin` over the squashed commit message, the section,
-   and those subjects, which are what GoReleaser turns into the release
-   notes. A violation is a refusal.
+
+   A branch with nothing beyond `origin/main` is "nothing to ship" (exit 0).
+2. **Composes** the squashed commit message: the open pull request's title
+   and body, the single commit's message, or `TITLE=`. A guard-b violation in
+   the message is a refusal.
 3. **Runs the gates**, stopping at the first red:
-   - the guard self-tests;
-   - `guard-b-lint.sh` over every file that differs from `origin/main`
-     (`--staged` would see only the index);
-   - the attach-path listener check;
-   - `make lint` (gofumpt included) and `make test-tagged`;
+   - `guard`:
+     - the guard self-tests;
+     - the vendored-guard drift check, so a branch cannot weaken its own
+       guard;
+     - `guard-b-lint.sh` over every file that differs from `origin/main`
+       (`--staged` would see only the index);
+     - the attach-path listener check.
+
+     Each step's failure fails the gate.
+   - `release-contracts`: `scripts/test-release-workflows.sh`, whenever the
+     change touches `scripts/`, `.github/workflows/` or `.goreleaser.yaml`.
+     The release workflows run those files, so their contract tests gate
+     them.
+   - `make lint` (gofumpt included) and `make test-tagged`.
    - `go test -race ./...` in a Linux podman container
      (`scripts/podman-go-test.sh`, also `make test-podman`), so the daemon
-     install tests never touch the host's service;
+     install tests never touch the host's service.
    - `make build`.
 
-   A red gate restores the files the script edited and lands nothing.
+   A red gate lands nothing.
 4. **Lands** exactly the tested tree as one commit on `origin/main`:
-   - The branch's commits are squashed. The message is the open pull
-     request's title and body, the single commit's message, or `TITLE=`. It
-     carries `Local-Verify-Host`, `Local-Verify-Gates`, `Local-Verify-Duration`
-     and `Fast-Lane: on` trailers, and passes guard-b.
-   - The commit is pushed to the branch. The `local-verify` status is posted
-     on that SHA and read back, and the gate lines go in a comment on the open
-     pull request.
-   - `main` is fast-forwarded (`git push origin <sha>:refs/heads/main`, never
-     forced). If `main` moved during the gates, it stops without landing; run
-     it again.
-5. **Tags** `vX.Y.Z` at that SHA:
-   - Until the central tagging identity is live, the operator's registered
-     signing key signs it (`TAGGER=local`, the default while the pins are
-     unset), with the preflight and candidate verification above.
-   - Once the pins are set, an operator-signed tag is refused by
-     `release-authority`, so the script requires `TAGGER=central`. It
-     dispatches the central tagging workflow with the repository, SHA and
-     version, and waits for the tag at that SHA.
-   - Either way, GitHub must report the tag signature verified, or the script
-     stops. The tag is immutable, so the fix is the next patch.
-6. **Watches** the `release.yml` run to success, the published GitHub
-   release, and `Casks/donmai.rb` moving to the new version. The fast-lane job
-   skips `harness-smoke` because the SHA is attested. The worker-image and E2B
-   workflows run alongside, unchanged. `NO_WATCH=1` stops after the tag.
+   - The commit carries `Local-Verify-Platform` (an OS and architecture such
+     as `darwin/arm64`, never the host name), `Local-Verify-Gates`,
+     `Local-Verify-Duration` and `Fast-Lane: on` trailers, and passes
+     guard-b.
+   - It is pushed to the branch. The `local-verify` status is posted on that
+     SHA and read back, and the gate lines go in a comment on the open pull
+     request.
+   - The switch is read again. Then `main` is fast-forwarded
+     (`git push origin <sha>:refs/heads/main`, never forced). If `main` moved
+     during the gates, the command stops without landing; run it again.
 
-Verify the release as below; roll back by publishing the next patch.
+Add user-facing notes under `## [Unreleased]` in `CHANGELOG.md` as part of the
+change. The release train moves them into the version section.
+
+### Daily release train (`make release`)
+
+The policy is one release a day, at midnight `America/New_York`, and only when
+there is unreleased work: `main` has commits since the latest `v*` tag. Run
+the train from a scheduler (a launchd job or cron) on the operator's host.
+Update the checkout first: the train refuses to run with a copy of its scripts
+that differs from `origin/main`.
+
+```bash
+git -C <checkout> pull --ff-only --quiet && make -C <checkout> release
+```
+
+For a manual run:
+
+```bash
+make release DRY_RUN=1        # every read-only check, the composed CHANGELOG, the guard
+make release                  # next patch version
+make release VERSION=v0.73.0  # a minor release
+make release NO_WATCH=1       # stop after the tag
+```
+
+The command is non-interactive. It exits 0 when it released or when there
+was nothing to release. It exits non-zero with a `FAILED:` or `REFUSED:` line
+on anything else. `scripts/fast-lane.sh release` then:
+
+1. **Preflight**, read-only (exit 3 on a refusal):
+   - the lane is on;
+   - the `gh` login is an admin;
+   - this checkout's `scripts/` equal `origin/main`'s.
+
+   It exits 0 with "nothing to release" when either of these holds:
+   - `main` has no commits since the latest `origin` tag;
+   - the only new commits are `docs`, `test` or `ci` commits, and
+     `CHANGELOG.md` has no Unreleased entries.
+
+   Then the version and the tag signer:
+   - The version is the next patch from the latest `origin` tag, or
+     `VERSION=` as the smallest minor or major increment. It must have no tag
+     and no GitHub release yet.
+   - With the local signer:
+     - the signing-key preflight passes;
+     - `verify-release-authority.sh --audit-policy` proves that this login
+       may create `v*` tags under the exact rulesets
+       (`current_user_can_bypass=always`).
+   - With the central signer, the tagging workflow must exist.
+2. **Composes** the release preparation in a scratch worktree at
+   `origin/main`. The caller's checkout and branch are never released. The
+   `## vX.Y.Z — YYYY-MM-DD` section comes from, in order:
+   - an existing section;
+   - the `## [Unreleased]` entries, leaving the `No unreleased changes.`
+     placeholder behind;
+   - one composed from the subjects landed since the last tag.
+
+   guard-b runs over the section, the commit message and those subjects.
+   GoReleaser turns the subjects into the release notes. A violation is a
+   refusal.
+3. **Runs the same gates** in that worktree. `release-contracts` runs when
+   anything under `scripts/`, `.github/workflows/` or `.goreleaser.yaml`
+   changed since the last tag.
+4. **Lands** `chore(release): prepare vX.Y.Z` through the ship's attested
+   path:
+   - It pushes the commit to `release-train/vX.Y.Z` and posts and reads back
+     `local-verify`.
+   - It reads the switch again and checks that the version is still free.
+   - It fast-forwards `main`, then deletes the `release-train/vX.Y.Z` branch.
+5. **Tags** `vX.Y.Z` at that SHA, after reading the switch and checking the
+   version once more:
+   - Until the tagging-identity pins are set, the operator's registered key
+     signs the tag, as the transitional signer.
+   - Once the pins are set, an operator-signed tag would be refused. The
+     train then uses the central tagging workflow (`TAGGER=central`): it
+     dispatches that workflow with the repository, SHA and version, and waits
+     for the tag. A tag that appears on another SHA fails at once. The
+     workflow's repository is named only by the `RELEASE_TAGGER_REPOSITORY`
+     Actions variable, and its file by `RELEASE_TAGGER_WORKFLOW` (default
+     `tag-release.yml`). The central path is refused while
+     `RELEASE_TAGGER_REPOSITORY` is unset.
+   - Either way, GitHub must report the tag signature verified.
+6. **Watches** each publisher to success:
+   - the `release.yml`, `worker-image.yml` and `e2b-template.yml` runs for the
+     tag;
+   - the published GitHub release;
+   - `Casks/donmai.rb` moving to the new version.
+
+   The release run's fast-lane job skips `harness-smoke`, because the SHA is
+   attested.
+
+Re-running after a failure is safe:
+- Nothing lands unless every earlier step passed.
+- If `main` already carries the version's section, from a run that failed
+  after landing, the train tags `main` as it is.
+- A failed tag push removes its local tag, and the train replaces a local-only
+  tag that a killed run left behind.
+
+A published tag is never moved. If the tag, a publisher or the signature
+check fails after the tag exists, fix the cause, then either retry the
+publisher (below) or release the next patch.
 
 ## Retry a release workflow
 

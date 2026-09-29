@@ -1,4 +1,4 @@
-.PHONY: build run run-mock run-status run-status-mock test test-podman ship test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
+.PHONY: build run run-mock run-status run-status-mock test test-podman ship release test-tagged test-shim-overlap test-attach-v1-compat verify-operational-payload-provenance verify-operational-payload-provenance-artifact verify-operational-payload-provenance-empty-cache warm-operational-payload-provenance-cache lint fmt vuln coverage clean release-dry-run generate verify-generated guard guard-report hooks hooks-test
 
 BUILD_DIR := bin
 LDFLAGS := -ldflags="-s -w"
@@ -41,21 +41,27 @@ test:
 test-podman:
 	./scripts/podman-go-test.sh -race ./...
 
-# ship is the fast-lane ship command: local gates, the local-verify
-# attestation, a fast-forward of main, a signed tag at that SHA, and a watch of
-# the release and cask. It refuses unless the FAST_LANE Actions variable is on.
-# DRY_RUN=1 checks and previews without changing anything. See RELEASING.md
-# "Fast-lane ship".
-SHIP_FLAGS = $(strip \
-	$(if $(VERSION),--version "$(VERSION)") \
-	$(if $(TITLE),--title "$(TITLE)") \
-	$(if $(TAGGER),--tagger "$(TAGGER)") \
-	$(if $(filter 1 true yes,$(FULL)),--full) \
-	$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run) \
-	$(if $(filter 1 true yes,$(NO_WATCH)),--no-watch))
+# ship and release are the fast lane (RELEASING.md "Fast lane"); both refuse
+# unless the organization FAST_LANE variable is on. ship lands this worktree's
+# branch on main as one gated, attested commit and never tags. release is the
+# once-a-day release train: it prepares the CHANGELOG, lands that commit the
+# same way, tags it and watches the publishers. DRY_RUN=1 checks and previews
+# either without changing anything.
+#
+# Values reach the script through the environment ("$$TITLE"), so the shell,
+# not make, quotes them: a title may hold quotes or backticks (make itself still
+# expands `$`, so write `$$` for a literal one).
+FAST_LANE_SH ?= ./scripts/fast-lane.sh
+FAST_LANE_COMMON = $(if $(filter 1 true yes,$(FULL)),--full) \
+	$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run)
 
 ship:
-	./scripts/fast-ship.sh $(SHIP_FLAGS)
+	$(FAST_LANE_SH) ship $(strip $(if $(TITLE),--title "$$TITLE") $(FAST_LANE_COMMON))
+
+release:
+	$(FAST_LANE_SH) release $(strip $(if $(VERSION),--version "$$VERSION") \
+		$(if $(TAGGER),--tagger "$$TAGGER") $(FAST_LANE_COMMON) \
+		$(if $(filter 1 true yes,$(NO_WATCH)),--no-watch))
 
 # test-tagged type-checks every build-tag-gated test file in the repo.
 #

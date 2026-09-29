@@ -8,7 +8,26 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Chores
+
+- While the fast lane is on, `make ship` lands a change from a worktree on
+  `main` as one commit. It runs the local gates, with the test suite in a
+  Linux podman container (`make test-podman`) and the release contract tests
+  whenever release-path files change. It then posts the `local-verify`
+  attestation and fast-forwards `main`. It never tags or publishes.
+- `make release` is the daily release train. When `main` has commits since
+  the last tag, it:
+  - prepares the CHANGELOG section;
+  - lands that commit through the same gated, attested path;
+  - tags it with a signed tag;
+  - watches the release, worker-image and E2B runs and the Homebrew cask.
+
+  It is non-interactive and safe to re-run after a failure. It prints
+  "nothing to release" when there is nothing new.
+- Both commands require the organization `FAST_LANE` variable to be `on`, with
+  no repository variable of that name. They read it again before `main` moves
+  and before tagging. `DRY_RUN=1` previews either one without changing
+  anything.
 
 ## v0.72.54 — 2026-09-28
 
@@ -65,12 +84,6 @@ No unreleased changes.
   variable is `on` and the tagged commit carries a successful `local-verify`
   status, the remote smoke re-run is skipped; every signing, notarization,
   provenance, and publication step still runs.
-- `make ship` takes a change from a worktree to a published release while the
-  fast lane is on: local gates with the test suite in a Linux podman
-  container (`make test-podman`), a guard-b check of everything it publishes,
-  the `local-verify` attestation, a fast-forward of `main`, a signed tag at
-  that commit, and a watch of the release and cask. `DRY_RUN=1` previews it
-  without changing anything.
 
 ## v0.72.52 — 2026-09-28
 

@@ -45,7 +45,7 @@ any commercial control plane.
 | are about to claim a behaviour is covered / "I added a test" | `../donmai-architecture/agents/PROTOCOL.md` §V V16–V21 (revert → RED → restore → GREEN) |
 | hit a failing test or a `-race` flake | `../donmai-architecture/agents/PROTOCOL.md` §D |
 | cut or dry-run a release | `PROTOCOL.md` §R + `.goreleaser.yaml` |
-| ship straight to a release while `FAST_LANE` is on (`make ship`) | `RELEASING.md` § Fast-lane ship |
+| land work on main (`make ship`) or run the daily release train (`make release`) while the fast lane is on | `RELEASING.md` § Fast lane |
 
 When a row matches, read that doc before your next edit and follow it literally.
 
@@ -61,10 +61,11 @@ make build       # type/compile gate — lint and test alone do not prove linkag
 
 On a host with a live daemon, run the suite in a Linux container instead:
 `make test-podman` (`scripts/podman-go-test.sh`), which is also the test gate
-of `make ship`. Also available and CI-relevant: `make fmt` (gofumpt), `make vuln`
-(govulncheck), `make verify-generated` (`GOWORK=off go test -race ./matrix/...`
-after `make generate`), `make release-dry-run`. CI's parallel `-race` run
-exposes flakes a local serial run hides — treat them as real bugs, not noise.
+of `make ship` and `make release`. Also available and CI-relevant: `make fmt`
+(gofumpt), `make vuln` (govulncheck), `make verify-generated`
+(`GOWORK=off go test -race ./matrix/...` after `make generate`),
+`make release-dry-run`. CI's parallel `-race` run exposes flakes a local
+serial run hides — treat them as real bugs, not noise.
 Quote each gate's result line in your completion report.
 
 **Adding a test does not make a behaviour covered — the red does.** Before you
