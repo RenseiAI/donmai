@@ -42,6 +42,12 @@ func renderGrid(t theme.Theme, cards []SessionCard, selectedIdx, frame, width, m
 	}
 
 	perRow := width / (cardWidth + 2)
+	// Plain cards stack vertically. A grid row containing several plain
+	// cards is taller than the viewport, so windowing by row can hide the
+	// selected card even while reporting its row as visible.
+	if plain {
+		perRow = 1
+	}
 	if perRow < 1 {
 		perRow = 1
 	}
@@ -149,32 +155,29 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 		return n
 	}
 
-	// Reserve marker lines for sides that overflow; markers that end up
-	// unneeded (all blocks on that side fit) are dropped when assembling.
-	budget := maxLines
-	if selBlock > 0 {
-		budget--
+	cost := func(lo, hi int) int {
+		n := 0
+		for i := lo; i <= hi; i++ {
+			n += heights[i]
+		}
+		if lo > 0 {
+			n++
+		}
+		if hi < len(blocks)-1 {
+			n++
+		}
+		return n
 	}
-	if selBlock < len(blocks)-1 {
-		budget--
-	}
-	if budget < 1 {
-		budget = 1
-	}
-
 	lo, hi := selBlock, selBlock
-	used := heights[selBlock]
-	if used <= budget {
+	if cost(lo, hi) <= maxLines {
 		for {
 			progress := false
-			if lo > 0 && used+heights[lo-1] <= budget {
+			if lo > 0 && cost(lo-1, hi) <= maxLines {
 				lo--
-				used += heights[lo]
 				progress = true
 			}
-			if hi < len(blocks)-1 && used+heights[hi+1] <= budget {
+			if hi < len(blocks)-1 && cost(lo, hi+1) <= maxLines {
 				hi++
-				used += heights[hi]
 				progress = true
 			}
 			if !progress {
@@ -194,19 +197,44 @@ func windowBlocks(t theme.Theme, blocks []string, counts []int, selBlock, maxLin
 		return strings.Join(out, "\n")
 	}
 
-	// The selected block alone exceeds the budget: show its head and mark
-	// the truncation. Top marker only when blocks above are hidden.
+	// A selected block can itself exceed the pane. Keep its identity line
+	// visible first, then spend remaining rows on content and markers. A
+	// one-line pane cannot fit both a card and an overflow marker.
 	lines := strings.Split(blocks[selBlock], "\n")
-	head := lines
-	if len(head) > budget {
-		head = head[:budget]
+	if !plain && len(lines) > 1 && strings.Contains(lines[0], "╭") {
+		lines = lines[1:] // selected styled ring begins with a border-only row
+	}
+	above := hiddenAbove(selBlock)
+	below := hiddenBelow(selBlock)
+	markers := 0
+	if above > 0 && maxLines > 1 {
+		markers++
+	}
+	if below > 0 && maxLines-markers > 1 {
+		markers++
+	}
+	visible := maxLines - markers
+	partial := len(lines) > visible
+	if partial && below == 0 && maxLines-markers > 1 {
+		markers++
+		visible--
+	}
+	if visible > len(lines) {
+		visible = len(lines)
 	}
 	var out []string
-	if n := hiddenAbove(selBlock); n > 0 {
-		out = append(out, overflowMarker(t, true, n, plain))
+	if above > 0 && markers > 0 {
+		out = append(out, overflowMarker(t, true, above, plain))
+		markers--
 	}
-	out = append(out, strings.Join(head, "\n"))
-	out = append(out, overflowMarker(t, false, -1, plain))
+	out = append(out, lines[:visible]...)
+	if markers > 0 {
+		if below > 0 {
+			out = append(out, overflowMarker(t, false, below, plain))
+		} else if partial {
+			out = append(out, overflowMarker(t, false, -1, plain))
+		}
+	}
 	return strings.Join(out, "\n")
 }
 

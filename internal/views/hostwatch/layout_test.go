@@ -1,6 +1,7 @@
 package hostwatch
 
 import (
+	"fmt"
 	"strings"
 	"testing"
 	"time"
@@ -181,23 +182,16 @@ func TestRenderGrid_SelectedStaysVisibleOnOverflow(t *testing.T) {
 	for i := 0; i < 10; i++ {
 		cards = append(cards, SessionCard{
 			SessionID:       string(rune('a'+i)) + "-sess",
-			IssueIdentifier: "ENG-1",
+			IssueIdentifier: fmt.Sprintf("ENG-%d", i),
 			WorkType:        "development",
 			DaemonState:     "running",
 		})
 	}
-	// One-line budget with the last card selected: the selection must show
-	// with an above-overflow marker, not silently clip.
+	// A one-line pane prioritizes the selected card's identity; no marker
+	// can fit beside it within the height budget.
 	out := renderGrid(tm, cards, 9, 0, 120, 1, true, now)
-	if !strings.Contains(out, "↑") {
-		t.Errorf("overflow above selection must be marked, got:\n%s", out)
-	}
-	// With maxLines=1 the selected row shows one card line with an
-	// above-marker for the 8 hidden sessions (the card itself plus the
-	// below-marker fill the single budget line... precisely: the head of
-	// the selected block shows, the above marker counts the rest).
-	if !strings.Contains(out, "8 more") {
-		t.Errorf("marker should count hidden sessions, got:\n%s", out)
+	if !strings.Contains(out, "ENG-9") || displayLines(out) != 1 {
+		t.Errorf("one-line pane must show the selected card only, got:\n%s", out)
 	}
 	// Roomier budget: selection visible, both markers present.
 	out = renderGrid(tm, cards, 5, 0, 120, 3, true, now)
