@@ -10,6 +10,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Features
 
+- Host watch uses a responsive session grid, a compact host header, and an
+  adjustable card/stream split. Cards retain issue and project context,
+  label session state and freshness, and keep overflow selection visible.
 - Negotiated terminal continuation checkpoints preserve parser, screen, and
   history state for compatible viewers. The additive protocol carries bounded
   checkpoints and a contiguous output suffix; legacy viewers retain their
@@ -22,6 +25,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- Creating or reusing a Linear blocker verifies the directed blocking
+  relation before reporting success. Relation and notice failures return
+  contextual errors that preserve the completed steps.
+- Publication inspection isolates Git from executable ambient configuration
+  and checks both staged and unstaged changes before permitting cleanup.
+  Uncertain or transformed workspaces are retained conservatively.
+- Session commits preserve the configured author identity without appending
+  issue identifiers.
 - Host log following continues after reaching the current end of a file, so
   later records appear without restarting the command.
 - Host setup and drain documentation describe configuration and resumable
