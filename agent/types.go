@@ -783,14 +783,23 @@ type Result struct {
 // stopped early (no turn-result manifest, no pull request, no verdict) and
 // retries after a turn that ended on a model provider error.
 type TurnContinuations struct {
-	// Continued counts the continuation prompts sent.
+	// Continued counts the continuation prompts sent in total.
 	Continued int `json:"continued"`
+	// Unproductive is the streak, at the end of the session, of consecutive
+	// continuation prompts whose turn made no tool call and ended
+	// unfinished. A turn with a tool call resets it.
+	Unproductive int `json:"unproductive"`
 	// Retried counts the retries sent after a provider error.
 	Retried int `json:"retried"`
-	// Limit is the bound the runner applied to each of the two counts.
+	// Limit is the bound the runner applied to Unproductive and,
+	// separately, to Retried.
 	Limit int `json:"limit"`
-	// Exhausted is set when a turn still ended unfinished once its count had
-	// reached Limit; the session then ended as failed.
+	// Ceiling is the bound the runner applied to Continued; zero when the
+	// session had no ceiling.
+	Ceiling int `json:"ceiling"`
+	// Exhausted is set when a turn still ended unfinished once one of those
+	// bounds was reached; the session then ended as failed, its failure mode
+	// naming the bound.
 	Exhausted bool `json:"exhausted,omitempty"`
 }
 

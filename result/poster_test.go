@@ -1062,8 +1062,9 @@ func TestPosterPost_StatusTurnContinuationsSerialized(t *testing.T) {
 		want string
 	}{
 		{name: "omitted when none was needed"},
-		{name: "counts", in: &agent.TurnContinuations{Continued: 3, Retried: 1, Limit: 3, Exhausted: true}, want: `{"continued":3,"retried":1,"limit":3,"exhausted":true}`},
-		{name: "not exhausted", in: &agent.TurnContinuations{Continued: 1, Limit: 3}, want: `{"continued":1,"retried":0,"limit":3}`},
+		{name: "counts", in: &agent.TurnContinuations{Continued: 7, Unproductive: 3, Retried: 1, Limit: 3, Ceiling: 50, Exhausted: true}, want: `{"continued":7,"unproductive":3,"retried":1,"limit":3,"ceiling":50,"exhausted":true}`},
+		{name: "not exhausted", in: &agent.TurnContinuations{Continued: 1, Limit: 3, Ceiling: 50}, want: `{"continued":1,"unproductive":0,"retried":0,"limit":3,"ceiling":50}`},
+		{name: "no ceiling", in: &agent.TurnContinuations{Continued: 60, Limit: 3}, want: `{"continued":60,"unproductive":0,"retried":0,"limit":3,"ceiling":0}`},
 	}
 	for _, tc := range tests {
 		t.Run(tc.name, func(t *testing.T) {
