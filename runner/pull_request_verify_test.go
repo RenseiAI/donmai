@@ -207,7 +207,7 @@ func TestSessionPullRequestVerifier_AcceptsOnlyTheSessionsOwnPullRequest(t *test
 		{name: "the prompt's quoted example URL", url: quotedExamplePR, want: candidateRefused, wantReason: "another repository"},
 		{name: "head is the session branch's remote head", url: "https://github.com/acme/widgets/pull/7", want: candidateAccepted},
 		{name: "head is the session commit on another branch", url: "https://github.com/Acme/Widgets/pull/8", want: candidateAccepted},
-		{name: "head is someone else's commit", url: "https://github.com/acme/widgets/pull/9", want: candidateRefused, wantReason: "neither the session branch nor the session commit"},
+		{name: "head is someone else's commit", url: "https://github.com/acme/widgets/pull/9", want: candidateHeadMismatch, wantReason: "neither the session branch nor the session commit"},
 		{name: "no such pull request", url: "https://github.com/acme/widgets/pull/404", want: candidateRefused, wantReason: "no such pull request"},
 		{name: "another repository", url: "https://github.com/acme/gadgets/pull/7", want: candidateRefused, wantReason: "another repository"},
 		{name: "session repository is not on GitHub", repository: "-", url: "https://github.com/acme/widgets/pull/7", want: candidateRefused, wantReason: "not a GitHub repository"},
@@ -404,3 +404,57 @@ func TestRun_PullRequestOnAnotherBranchIsRejected(t *testing.T) {
 		t.Errorf("the same-repository candidate was never looked up")
 	}
 }
+
+// TestRun_PullRefThatLagsAPushIsReverified pins that a head mismatch is not
+// remembered: the agent pushes to its open pull request and reports it in the
+// same turn, GitHub's refs/pull/<n>/head still shows the previous head at the
+// first check, and once the ref catches up the next check accepts the pull
+// request instead of refusing it for the rest of the session.
+func TestRun_PullRefThatLagsAPushIsReverified(t *testing.T) {
+	var mu sync.Mutex
+	lookups := 0
+	lookup := func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
+		mu.Lock()
+		lookups++
+		n := lookups
+		mu.Unlock()
+		switch n {
+		case 1:
+			// The agent's push: a new commit on the session branch, while
+			// refs/pull/7/head still shows the previous head.
+			writeFile(t, worktreePath, "feature.go", "package feature\n")
+			gitRun(t, worktreePath, "add", "feature.go")
+			if out, err := runGit(ctx, worktreePath, gitIdentity{Name: "test", Email: "test@example.com"}, "commit", "-q", "-m", "feature"); err != nil {
+				t.Fatalf("commit: %v\n%s", err, out)
+			}
+			gitRun(t, worktreePath, "push", "-q", "origin", "HEAD:refs/heads/"+scriptedSessionBranch)
+		case 2:
+			// GitHub has synced the pull request to the pushed head.
+			gitRun(t, worktreePath, "push", "-q", "-f", "origin", "HEAD:refs/pull/7/head")
+		}
+		return originRefs(ctx, worktreePath, refs...)
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		lookup:     lookup,
+		turns: []verdictScriptTurn{
+			{text: "Pushed the fix to " + followUpPR},
+			{text: "The PR is open: " + followUpPR},
+			{text: "The PR is open: " + followUpPR},
+			{text: "The PR is open: " + followUpPR},
+			{text: "The PR is open: " + followUpPR},
+		},
+	})
+	if res.PullRequestURL != followUpPR || res.Status != "completed" {
+		t.Fatalf("PullRequestURL=%q Status=%q (%s: %s); want the session's own PR accepted once its ref caught up",
+			res.PullRequestURL, res.Status, res.FailureMode, res.Error)
+	}
+	if len(provider.prompts) != 1 || provider.prompts[0] != continuePrompt {
+		t.Errorf("prompts = %q; want one continuation, then acceptance", provider.prompts)
+	}
+}
+
+// scriptedSessionBranch is the branch the runner owns for a scripted session.
+const scriptedSessionBranch = "agent/test-session-MANIFEST-FOLLOWUP"

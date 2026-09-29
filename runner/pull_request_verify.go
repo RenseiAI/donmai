@@ -78,8 +78,16 @@ const (
 	_ candidateOutcome = iota
 	// candidateAccepted: the session's own pull request.
 	candidateAccepted
-	// candidateRefused: confirmed not the session's pull request.
+	// candidateRefused: confirmed not the session's pull request, for good
+	// (another repository, no such pull request): never checked again.
 	candidateRefused
+	// candidateHeadMismatch: a pull request on the session's repository
+	// whose head is not (yet) the session's. Not cached: GitHub moves
+	// refs/pull/<n>/head a few seconds after each push, so an agent that
+	// pushes to its open pull request and reports it in the same turn can
+	// be seen before the ref catches up. It is re-read on every later
+	// check, and until it matches it does not count as the session's.
+	candidateHeadMismatch
 	// candidateUnconfirmed: on the session's repository, but the remote
 	// could not be read to confirm or refuse it.
 	candidateUnconfirmed
@@ -220,7 +228,7 @@ func (v *sessionPullRequestVerifier) verify(ctx context.Context, candidate strin
 	if shaErr == nil && sha == pullHead {
 		return candidateAccepted, "", true
 	}
-	return candidateRefused, "the pull request's head is neither the session branch nor the session commit", true
+	return candidateHeadMismatch, "the pull request's head is neither the session branch nor the session commit", true
 }
 
 // settle picks the session's pull request from the candidates a turn offered,
@@ -277,12 +285,12 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 }
 
 // reportsOwnRepository reports whether turn carried a pull request URL on the
-// session's own repository that the verifier has NOT confirmed to be someone
+// session's own repository that the verifier has NOT found to be someone
 // else's — one it could not read from the remote, or did not get to. Such a
 // turn reported a pull request, so it did not stop early; the nudge and the
-// backstop then settle it as they always have. A URL confirmed to be another
-// pull request (another head, or no such pull request) does not count. A nil
-// verifier reports none.
+// backstop then settle it as they always have. A URL whose pull request has
+// another head (for now) or does not exist does not count. A nil verifier
+// reports none.
 func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
 	if v == nil || v.repository == "" {
 		return false
@@ -292,7 +300,7 @@ func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation
 		if err != nil || normalizeGitHubRepositorySlug(slug) != v.repository {
 			continue
 		}
-		if v.outcomes[candidate] != candidateRefused {
+		if outcome := v.outcomes[candidate]; outcome != candidateRefused && outcome != candidateHeadMismatch {
 			return true
 		}
 	}
