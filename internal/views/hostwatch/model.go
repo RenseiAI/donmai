@@ -2,6 +2,7 @@ package hostwatch
 
 import (
 	"fmt"
+	"math"
 	"sort"
 	"strings"
 	"time"
@@ -66,6 +67,27 @@ type snapshotMsg struct{ snap Snapshot }
 // tailBatchMsg carries the events read from all active tailers this tick.
 type tailBatchMsg struct{ events []TailEvent }
 
+// Cards/stream split. The grid and the merged stream share the content
+// height 50/50 by default; the operator adjusts the ratio at runtime with
+// [ ] (0 resets). The ratio lives on the model so a terminal resize
+// preserves it — only an explicit keypress changes it.
+const (
+	// defaultSplitRatio is the initial fraction of content height given to
+	// the session-card grid (the stream takes the rest).
+	defaultSplitRatio = 0.5
+	// minSplitRatio / maxSplitRatio bound the adjustable split so neither
+	// pane can be squeezed away entirely.
+	minSplitRatio = 0.2
+	maxSplitRatio = 0.8
+	// splitStep is the per-keypress split adjustment.
+	splitStep = 0.1
+	// minGridHeight is the minimum grid height in rows.
+	minGridHeight = 1
+	// minStreamHeight is the minimum stream height in rows: the stream
+	// title row plus one body row.
+	minStreamHeight = 2
+)
+
 // Model is the host-watch fleet dashboard Bubble Tea model. It owns the
 // merged LogViewer, the per-session tailers, and the card grid. It is a pure
 // reader: every data path is local (daemon control API + on-disk files).
@@ -96,6 +118,10 @@ type Model struct {
 
 	stream *widget.LogViewer
 	frame  int
+
+	// split is the fraction of content height given to the session-card
+	// grid (the stream takes the rest). Operator-adjustable via [ ] / 0.
+	split float64
 }
 
 // New constructs a host-watch Model.
@@ -128,6 +154,7 @@ func New(opts Options) *Model {
 		prefixes:      newPrefixIndex(),
 		labels:        map[string]string{},
 		stream:        lv,
+		split:         defaultSplitRatio,
 	}
 }
 
@@ -230,8 +257,58 @@ func (m *Model) handleKey(msg tea.KeyPressMsg) (tea.Model, tea.Cmd) {
 		m.stream.SetFollowing(!m.stream.Following())
 	case "g":
 		m.stream.SetFollowing(true)
+	case "[":
+		m.setSplit(m.split - splitStep)
+	case "]":
+		m.setSplit(m.split + splitStep)
+	case "0":
+		m.setSplit(defaultSplitRatio)
 	}
 	return m, nil
+}
+
+// setSplit clamps ratio into bounds and re-applies the layout so the next
+// resize preserves the operator-chosen ratio.
+func (m *Model) setSplit(ratio float64) {
+	m.split = clampSplit(ratio)
+	m.layout()
+}
+
+// clampSplit bounds a split ratio so neither pane can vanish.
+func clampSplit(ratio float64) float64 {
+	if ratio < minSplitRatio {
+		return minSplitRatio
+	}
+	if ratio > maxSplitRatio {
+		return maxSplitRatio
+	}
+	return ratio
+}
+
+// splitPaneHeights divides contentH rows between the grid and the stream
+// (which includes its title row) per ratio. Minimums hold whenever they
+// fit; on a tiny terminal the grid keeps one row and the stream takes the
+// rest, so selection and the latest output stay reachable.
+func splitPaneHeights(contentH int, ratio float64) (gridH, streamH int) {
+	if contentH <= 0 {
+		return 0, 0
+	}
+	r := clampSplit(ratio)
+	gridH = int(math.Round(float64(contentH) * r))
+	if minGridHeight+minStreamHeight <= contentH {
+		if gridH < minGridHeight {
+			gridH = minGridHeight
+		}
+		if contentH-gridH < minStreamHeight {
+			gridH = contentH - minStreamHeight
+		}
+	} else if gridH < minGridHeight {
+		gridH = minGridHeight
+		if gridH > contentH {
+			gridH = contentH
+		}
+	}
+	return gridH, contentH - gridH
 }
 
 // applySnapshot folds a new index poll into the model: refreshes the cards +
@@ -354,24 +431,21 @@ func (m *Model) foldMetrics(ev TailEvent) {
 	}
 }
 
-// layout recomputes child sizes after a resize. The stream gets the bottom
-// third (min 6 rows); the grid + header take the rest.
+// layout recomputes child sizes after a resize or a split change. The
+// grid and the stream share the content height (everything below the
+// one-line header and above the one-line help) per the operator's split
+// ratio, so a resize preserves the chosen ratio.
 func (m *Model) layout() {
 	if m.width == 0 || m.height == 0 {
 		return
 	}
-	streamH := m.height / 3
-	if streamH < 6 {
-		streamH = 6
-	}
-	if streamH > m.height-4 {
-		streamH = m.height - 4
-	}
-	if streamH < 1 {
-		streamH = 1
-	}
+	_, streamH := splitPaneHeights(m.height-2, m.split)
 	// -1 for the "session stream" title row above the viewer.
-	m.stream.SetSize(m.width, streamH-1)
+	bodyH := streamH - 1
+	if bodyH < 0 {
+		bodyH = 0
+	}
+	m.stream.SetSize(m.width, bodyH)
 }
 
 // View renders the full dashboard: counters header, card grid, then the
@@ -395,16 +469,8 @@ func (m *Model) render() string {
 		return lipgloss.JoinVertical(lipgloss.Left, header, "", warn, "", m.renderHelp())
 	}
 
-	streamH := m.height / 3
-	if streamH < 6 {
-		streamH = 6
-	}
-	gridH := m.height - streamH - lineCount(header) - 2 // -2 for stream title + help
-	if gridH < 1 {
-		gridH = 1
-	}
-	grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, m.opts.Plain, m.now())
-	grid = clampHeight(grid, gridH)
+	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
 
 	streamTitle := "session stream"
 	if !m.opts.Plain {
@@ -426,8 +492,13 @@ func (m *Model) render() string {
 	)
 }
 
-// renderHeader renders the counters bar: scope label + running/queue/cost,
-// uptime, version. All values are local (daemon status/stats).
+// renderHeader renders the one-line counters bar: the host identity first,
+// then the scope (only when it narrows the default "all projects" view),
+// then running/queue/uptime/version counters. All values are local (daemon
+// status/stats). The single line is budgeted against the terminal width:
+// the counters pin right, the host-first segment truncates with an
+// ellipsis, and header padding is two spaces (one per side) — the only
+// horizontal chrome the style adds.
 func (m *Model) renderHeader() string {
 	scope := m.opts.ProjectLabel
 	if scope == "" {
@@ -436,9 +507,12 @@ func (m *Model) renderHeader() string {
 	host := m.opts.HostLabel
 	c := m.counters
 
-	left := fmt.Sprintf("donmai · project: %s", scope)
-	if host != "" {
-		left += " · host: " + host
+	left := host
+	if left == "" {
+		left = "host"
+	}
+	if scope != "all projects" {
+		left += " · " + scope
 	}
 	right := fmt.Sprintf("%d running   queue %d   uptime %s",
 		c.Running, c.QueueDepth, format.Duration(int(c.UptimeSeconds)))
@@ -447,42 +521,68 @@ func (m *Model) renderHeader() string {
 	}
 
 	if m.opts.Plain {
-		return left + "  —  " + right
+		left, gap := headerBudget(left, right, m.width)
+		return left + strings.Repeat(" ", gap) + right
 	}
+	left, gap := headerBudget(left, right, m.width)
 	leftStyled := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Accent).Render(left)
 	rightStyled := lipgloss.NewStyle().Foreground(m.theme.TextSecondary).Render(right)
-	gap := m.width - lipgloss.Width(leftStyled) - lipgloss.Width(rightStyled)
+	content := leftStyled + strings.Repeat(" ", gap) + rightStyled
+	return theme.Header().Width(m.width).Render(content)
+}
+
+// headerBudget composes a one-line header within width columns: the right
+// counters pin right and the left (host-first) segment truncates so the
+// counters stay fully visible. It returns the fitted left segment and the
+// gap between the segments. width <= 0 renders untruncated with a two-space
+// gap. The two cells of horizontal chrome (one padding cell per side from
+// the header style) are accounted in the budget — that is the entire padding
+// budget, fixing the earlier over-wide bar.
+func headerBudget(left, right string, width int) (string, int) {
+	if width <= 0 {
+		return left, 2
+	}
+	avail := width - 2 // header chrome: one padding cell per side
+	rightW := lipgloss.Width(right)
+	maxLeft := avail - rightW - 1 // at least one gap cell
+	if maxLeft < 1 {
+		maxLeft = 1
+	}
+	left = truncateWidth(left, maxLeft)
+	gap := avail - lipgloss.Width(left) - rightW
 	if gap < 1 {
 		gap = 1
 	}
-	bar := leftStyled + strings.Repeat(" ", gap) + rightStyled
-	return theme.Header().Width(m.width).Render(bar)
+	return left, gap
+}
+
+// truncateWidth shortens s to at most n display cells, appending an
+// ellipsis when truncated. n<=0 returns "". Unlike truncateRunes it
+// accounts wide (CJK) runes, so the result always fits its budget.
+func truncateWidth(s string, n int) string {
+	if n <= 0 {
+		return ""
+	}
+	if lipgloss.Width(s) <= n {
+		return s
+	}
+	w := 0
+	var out []rune
+	for _, r := range s {
+		rw := lipgloss.Width(string(r))
+		if w+rw > n-1 {
+			break
+		}
+		out = append(out, r)
+		w += rw
+	}
+	return string(out) + "…"
 }
 
 func (m *Model) renderHelp() string {
-	help := "↑↓ select   f follow/pause   g jump to tail   q quit"
+	help := "↑↓ select   [ ] split   0 reset   f follow/pause   g jump to tail   q quit"
 	if m.opts.Plain {
 		return help
 	}
 	return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
-}
-
-// lineCount returns the number of display lines in s (1 + newline count).
-func lineCount(s string) int {
-	if s == "" {
-		return 0
-	}
-	return strings.Count(s, "\n") + 1
-}
-
-// clampHeight truncates s to at most n lines.
-func clampHeight(s string, n int) string {
-	if n <= 0 {
-		return ""
-	}
-	lines := strings.Split(s, "\n")
-	if len(lines) <= n {
-		return s
-	}
-	return strings.Join(lines[:n], "\n")
 }

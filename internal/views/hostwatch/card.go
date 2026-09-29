@@ -68,7 +68,15 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	if st == "" {
 		st = "running"
 	}
+	// Issue and project context live in the card: the grid no longer
+	// spends rows on group headings, so each card names its scope.
 	chips := fmt.Sprintf("%s · %s · %s", card.roleBadge(), provider, st)
+	if card.ProjectName != "" {
+		chips += " · " + card.ProjectName
+	}
+	if card.IssueIdentifier != "" {
+		chips += " · " + card.IssueIdentifier
+	}
 
 	metrics := fmt.Sprintf("⏱ %s   ⌨ %d   %s   ↻ %d",
 		format.Duration(card.ageSeconds(now)),
@@ -96,6 +104,21 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		}
 		return strings.TrimRight(b.String(), "\n")
 	}
+
+	// Budget the body to the inner content width (cardWidth minus the
+	// left border + padding, or the full ring for selected cards) using
+	// display widths, so CJK content truncates inside the border instead
+	// of overflowing it. The card field list is unchanged — only the
+	// widths are enforced.
+	inner := cardWidth - 2
+	if selected {
+		inner = cardWidth - 4
+	}
+	header = truncateWidth(header, inner-4)
+	work = truncateWidth(work, inner-4)
+	chips = truncateWidth(chips, inner)
+	metrics = truncateWidth(metrics, inner)
+	ticker = truncateWidth(ticker, inner)
 
 	sc := statusColor(t, card)
 	dotStyle := lipgloss.NewStyle().Foreground(sc)
