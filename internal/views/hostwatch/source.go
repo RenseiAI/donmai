@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/runtime/state"
@@ -43,9 +44,15 @@ type SessionCard struct {
 	IssueID         string
 	IssueIdentifier string
 	Provider        string
+	Harness         string
+	Model           string
+	ModelProvider   string
 	WorkType        string
 	CurrentStep     string
 	StartedAtUnixMs int64
+	// LastHeartbeatUnixMs is the most recent session heartbeat the runner
+	// observed (state.json snapshot, unix-ms). Zero when not reported.
+	LastHeartbeatUnixMs int64
 
 	// Live metrics accumulated from the events.jsonl tail.
 	ToolCalls    int
@@ -54,6 +61,22 @@ type SessionCard struct {
 	CostUsd      float64
 	NumTurns     int
 	Errored      bool
+	// Observed reports whether any tail event (live or replayed history)
+	// has been folded into this card. Counts render as "not reported"
+	// until Observed; a zero is then a measured zero, not a guess.
+	Observed bool
+	// MetricsReported reports whether an authoritative terminal cost
+	// payload (ResultEvent.Cost) has arrived. Cost/turns render as
+	// "not reported" until then — they only arrive on the terminal
+	// result event, never incrementally.
+	MetricsReported bool
+	// Freshness timestamps. Only live (non-replay) events advance them:
+	// replaying history must not make an idle session look active now.
+	// LastWorkAt is the last meaningful-work event (tool invocation or
+	// model call with usage); LastOutputAt the last output observation
+	// (assistant text, tool result, progress tick, system notice).
+	LastWorkAt   time.Time
+	LastOutputAt time.Time
 }
 
 // EventsPath returns the absolute path to this card's events.jsonl, or ""
@@ -157,6 +180,14 @@ func (s *Source) Snapshot() Snapshot {
 			WorktreePath: h.WorktreePath,
 			ProjectName:  h.ProjectName,
 			Repository:   h.Repository,
+			// The daemon index is the owning seam for display metadata:
+			// the handle already carries the admitted identity, so a
+			// local reader needs no per-card fetch. state.json only
+			// backfills what an older daemon omits.
+			Harness:       h.Harness,
+			Model:         h.Model,
+			ModelProvider: h.ModelProvider,
+			WorkType:      h.WorkType,
 		}
 		s.enrichFromState(&card)
 		cards = append(cards, card)
@@ -189,9 +220,24 @@ func (s *Source) enrichFromState(card *SessionCard) {
 	card.IssueID = st.IssueID
 	card.IssueIdentifier = st.IssueIdentifier
 	card.Provider = string(st.ProviderName)
-	card.WorkType = st.WorkType
+	// state.json backfills only what the daemon index did not already
+	// supply, so an older daemon's local state still renders while a new
+	// daemon's admitted identity always wins.
+	if card.Harness == "" {
+		card.Harness = st.Harness
+	}
+	if card.Model == "" {
+		card.Model = st.Model
+	}
+	if card.ModelProvider == "" {
+		card.ModelProvider = st.ModelProvider
+	}
+	if card.WorkType == "" {
+		card.WorkType = st.WorkType
+	}
 	card.CurrentStep = st.CurrentStep
 	card.StartedAtUnixMs = st.StartedAt
+	card.LastHeartbeatUnixMs = st.LastHeartbeat
 	if card.PID == 0 && st.PID != 0 {
 		card.PID = st.PID
 	}
