@@ -1,6 +1,7 @@
 package worktree
 
 import (
+	"bytes"
 	"context"
 	"fmt"
 	"net/url"
@@ -9,9 +10,139 @@ import (
 	"path/filepath"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/internal/gitexec"
 )
+
+const (
+	publicationMaxTrackedBytes        int64 = 1 << 30
+	publicationLocalInspectionTimeout       = 15 * time.Second
+)
+
+// publicationWorktreeDirty compares the index with raw checkout bytes. Git
+// status/diff can invoke repository-configured clean or process filters while
+// hashing a changed tracked file. A raw mismatch is conservatively dirty,
+// including worktrees that require content filters for a clean Git status.
+func (m *Manager) publicationWorktreeDirty(ctx context.Context, path string, config []string) (bool, error) {
+	ctx, cancel := context.WithTimeout(ctx, publicationLocalInspectionTimeout)
+	defer cancel()
+	// Compare the index to HEAD before inspecting checkout bytes. A staged
+	// addition or edit can match the worktree exactly while remaining wholly
+	// unpublished. --cached reads only the index and object store; the explicit
+	// diff flags disable checkout-defined drivers and text conversion.
+	stagedArgs := append(append([]string{}, config...), "-C", path, "diff-index", "--cached", "--no-ext-diff", "--no-textconv", "--name-only", "HEAD", "--")
+	staged, err := m.runPublicationGit(ctx, "", stagedArgs...)
+	if err != nil || len(staged) > publicationMaxGitOutput {
+		return false, fmt.Errorf("runtime/worktree: compare publication index to HEAD: %w", publicationGitOutputError(err, staged))
+	}
+	if len(staged) != 0 {
+		return true, nil
+	}
+	args := append(append([]string{}, config...), "-C", path, "ls-files", "--stage", "-z")
+	output, err := m.runPublicationGit(ctx, "", args...)
+	if err != nil || len(output) > publicationMaxGitOutput {
+		return false, fmt.Errorf("runtime/worktree: enumerate publication index: %w", publicationGitOutputError(err, output))
+	}
+	seen := make(map[string]struct{})
+	var total int64
+	for _, record := range strings.Split(string(output), "\x00") {
+		if record == "" {
+			continue
+		}
+		metadata, name, found := strings.Cut(record, "\t")
+		fields := strings.Fields(metadata)
+		if !found || len(fields) != 3 || fields[2] != "0" || !filepath.IsLocal(name) {
+			return false, fmt.Errorf("runtime/worktree: invalid publication index entry")
+		}
+		if _, duplicate := seen[name]; duplicate {
+			return false, fmt.Errorf("runtime/worktree: duplicate publication index entry")
+		}
+		seen[name] = struct{}{}
+		dirty, size, compareErr := m.rawPublicationBlobDiffers(ctx, path, config, name, fields[0], fields[1], publicationMaxTrackedBytes-total)
+		if compareErr != nil {
+			return false, compareErr
+		}
+		if dirty {
+			return true, nil
+		}
+		total += size
+	}
+	otherArgs := append(append([]string{}, config...), "-C", path, "ls-files", "--others", "--exclude-standard", "-z")
+	other, err := m.runPublicationGit(ctx, "", otherArgs...)
+	if err != nil || len(other) > publicationMaxGitOutput {
+		return false, fmt.Errorf("runtime/worktree: enumerate publication untracked files: %w", publicationGitOutputError(err, other))
+	}
+	return len(other) != 0, nil
+}
+
+func publicationGitOutputError(err error, output []byte) error {
+	if err != nil {
+		return err
+	}
+	return fmt.Errorf("git output exceeded %d bytes (received %d)", publicationMaxGitOutput, len(output))
+}
+
+func (m *Manager) rawPublicationBlobDiffers(ctx context.Context, root string, config []string, name, mode, objectID string, remaining int64) (bool, int64, error) {
+	if err := ctx.Err(); err != nil {
+		return false, 0, fmt.Errorf("runtime/worktree: compare publication checkout: %w", err)
+	}
+	full := filepath.Join(root, name)
+	info, err := os.Lstat(full)
+	if os.IsNotExist(err) {
+		return true, 0, nil
+	}
+	if err != nil {
+		return false, 0, fmt.Errorf("runtime/worktree: inspect publication checkout: %w", err)
+	}
+	var size int64
+	switch mode {
+	case "100644", "100755":
+		if !info.Mode().IsRegular() || (mode == "100755") != (info.Mode().Perm()&0o111 != 0) {
+			return true, 0, nil
+		}
+		size = info.Size()
+		if size < 0 || size > remaining {
+			return false, 0, fmt.Errorf("runtime/worktree: publication tracked-byte bound exceeded")
+		}
+	case "120000":
+		if info.Mode()&os.ModeSymlink == 0 {
+			return true, 0, nil
+		}
+		link, readErr := os.Readlink(full)
+		if readErr != nil {
+			return false, 0, fmt.Errorf("runtime/worktree: read publication link: %w", readErr)
+		}
+		size = int64(len(link))
+		if size > remaining {
+			return false, 0, fmt.Errorf("runtime/worktree: publication tracked-byte bound exceeded")
+		}
+		args := append(append([]string{}, config...), "-C", root, "hash-object", "--no-filters", "--stdin")
+		output, hashErr := m.runPublicationGitInput(ctx, "", []byte(link), args...)
+		if hashErr != nil || len(output) > 128 {
+			return false, 0, fmt.Errorf("runtime/worktree: hash raw publication link: %w", publicationGitOutputError(hashErr, output))
+		}
+		return strings.TrimSpace(string(output)) != objectID, size, nil
+	default:
+		// Submodules and unknown modes retain rather than invoking checkout
+		// conversions or following paths outside the root.
+		return true, 0, nil
+	}
+	if !validGitObjectID(objectID) {
+		return false, 0, fmt.Errorf("runtime/worktree: invalid publication object ID")
+	}
+	// --no-filters makes hash-object read raw bytes; otherwise it can run a
+	// repository-configured clean/process filter just like git status.
+	args := append(append([]string{}, config...), "-C", root, "hash-object", "--no-filters", "--", name)
+	output, err := m.runPublicationGit(ctx, "", args...)
+	if err != nil || len(output) > 128 {
+		return false, 0, fmt.Errorf("runtime/worktree: hash raw publication checkout: %w", publicationGitOutputError(err, output))
+	}
+	if strings.TrimSpace(string(output)) != objectID {
+		return true, size, nil
+	}
+	return false, size, nil
+}
 
 // safePublicationRepository admits only transports whose Git execution path is
 // known here. Unknown git-remote-* protocols must never be discovered from PATH.
@@ -54,17 +185,28 @@ func safePublicationRepository(repository string) bool {
 // not inherit executable Git configuration from either that contract or the
 // operator's shell. An explicitly injected CommandRunner remains a test seam.
 func (m *Manager) runPublicationGit(ctx context.Context, repository string, args ...string) ([]byte, error) {
+	return m.runPublicationGitInput(ctx, repository, nil, args...)
+}
+
+func (m *Manager) runPublicationGitInput(ctx context.Context, repository string, input []byte, args ...string) ([]byte, error) {
 	commandCtx, cancel := context.WithTimeout(ctx, publicationGitTimeout)
 	defer cancel()
 	if m.publicationCustomRunner {
+		if input != nil {
+			return nil, fmt.Errorf("runtime/worktree: publication git input unsupported by custom runner")
+		}
 		return m.runner(commandCtx, "git", args...)
 	}
 	if m.publicationGitPath == "" {
 		return nil, fmt.Errorf("runtime/worktree: publication git executable unavailable")
 	}
-	authHeader, err := m.publicationAuthHeader(commandCtx, repository)
-	if err != nil {
-		return nil, err
+	var authHeader string
+	if repository != "" {
+		var err error
+		authHeader, err = m.publicationAuthHeader(commandCtx, repository)
+		if err != nil {
+			return nil, err
+		}
 	}
 	env := publicationGitEnv(repository, authHeader)
 	// nolint:gosec // fixed, construction-time-resolved git executable and
@@ -74,6 +216,9 @@ func (m *Manager) runPublicationGit(ctx context.Context, repository string, args
 	// Local reads carry an explicit -C checkout and keep their CLI overrides.
 	cmd.Dir = "/"
 	cmd.Env = env
+	if input != nil {
+		cmd.Stdin = bytes.NewReader(input)
+	}
 	return cmd.CombinedOutput()
 }
 

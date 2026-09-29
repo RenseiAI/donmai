@@ -157,16 +157,15 @@ func (m *Manager) assessRepositoryPublication(
 		"-c", "submodule.recurse=false",
 	}
 	localConfig := append([]string{"--work-tree=" + path}, config...)
-	statusArgs := append(append([]string{}, localConfig...), "-C", path, "status", "--porcelain=v1", "--untracked-files=all", "--ignore-submodules=none")
-	status, err := m.runPublicationGit(ctx, target.Repository, statusArgs...)
-	if err != nil || len(status) > publicationMaxGitOutput {
+	dirty, err := m.publicationWorktreeDirty(ctx, path, localConfig)
+	if err != nil {
 		return retain(PublicationReasonUncertain)
 	}
-	if strings.TrimSpace(string(status)) != "" {
+	if dirty {
 		return retain(PublicationReasonDirty)
 	}
 	ignoredArgs := append(append([]string{}, localConfig...), "-C", path, "ls-files", "--others", "--ignored", "--exclude-standard", "-z")
-	ignored, err := m.runPublicationGit(ctx, target.Repository, ignoredArgs...)
+	ignored, err := m.runPublicationGit(ctx, "", ignoredArgs...)
 	if err != nil || len(ignored) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}
@@ -174,18 +173,18 @@ func (m *Manager) assessRepositoryPublication(
 		return retain(PublicationReasonDirty)
 	}
 	branchArgs := append(append([]string{}, localConfig...), "-C", path, "symbolic-ref", "--quiet", "--short", "HEAD")
-	currentBranch, err := m.runPublicationGit(ctx, target.Repository, branchArgs...)
+	currentBranch, err := m.runPublicationGit(ctx, "", branchArgs...)
 	if err != nil || len(currentBranch) > publicationMaxGitOutput || strings.TrimSpace(string(currentBranch)) != branch {
 		return retain(PublicationReasonUncertain)
 	}
 	headArgs := append(append([]string{}, localConfig...), "-C", path, "rev-parse", "--verify", "HEAD^{commit}")
-	head, err := m.runPublicationGit(ctx, target.Repository, headArgs...)
+	head, err := m.runPublicationGit(ctx, "", headArgs...)
 	if err != nil || len(head) > publicationMaxGitOutput || !validGitObjectID(strings.TrimSpace(string(head))) {
 		return retain(PublicationReasonUncertain)
 	}
 	localHead := strings.TrimSpace(string(head))
 	localRefsArgs := append(append([]string{}, localConfig...), "-C", path, "for-each-ref", "--format=%(objectname)%09%(refname)%09%(symref)", "refs")
-	localRefsOutput, err := m.runPublicationGit(ctx, target.Repository, localRefsArgs...)
+	localRefsOutput, err := m.runPublicationGit(ctx, "", localRefsArgs...)
 	if err != nil || len(localRefsOutput) > publicationMaxGitOutput {
 		return retain(PublicationReasonUncertain)
 	}

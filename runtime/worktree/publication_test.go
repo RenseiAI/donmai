@@ -105,6 +105,137 @@ func TestInteractivePublicationInspectsOwnedWorktreeDespiteLocalConfig(t *testin
 	}
 }
 
+func TestInteractivePublicationDoesNotExecuteCheckoutCleanFilter(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	remote := publicationBareRemote(t)
+	const sessionID = "88888888-8888-4888-8888-888888888888"
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := manager.Provision(t.Context(), worktree.ProvisionSpec{SessionID: sessionID, RepoURL: remote, Strategy: worktree.StrategyClone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "agent/" + sessionID
+	publicationGit(t, path, "checkout", "-b", branch)
+	for name, body := range map[string]string{"filtered.txt": "before\n", ".gitattributes": "filtered.txt filter=fixture\n"} {
+		if err := os.WriteFile(filepath.Join(path, name), []byte(body), 0o600); err != nil {
+			t.Fatal(err)
+		}
+	}
+	publicationGit(t, path, "add", ".")
+	publicationGit(t, path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "fixture")
+	publicationGit(t, path, "push", "--quiet", "origin", "HEAD:refs/heads/"+branch)
+	canary := filepath.Join(t.TempDir(), "executed")
+	script := filepath.Join(t.TempDir(), "clean")
+	content := "#!/bin/sh\nprintf hit > " + fmt.Sprintf("%q", canary) + "\ncat\n"
+	if err := os.WriteFile(script, []byte(content), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Chmod(script, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	publicationGit(t, path, "config", "filter.fixture.clean", script)
+	if err := os.WriteFile(filepath.Join(path, "filtered.txt"), []byte("after!\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	publicationGit(t, path, "status", "--porcelain")
+	if _, err := os.Stat(canary); err != nil {
+		t.Fatalf("negative control did not arm clean filter: %v", err)
+	}
+	if err := os.Remove(canary); err != nil {
+		t.Fatal(err)
+	}
+	assessment := publicationAssessment(t, manager, sessionID, remote, branch)
+	if !assessment.Retain || assessment.Reason != worktree.PublicationReasonDirty {
+		t.Fatalf("modified tracked bytes assessment=%+v", assessment)
+	}
+	if _, err := os.Stat(canary); !os.IsNotExist(err) {
+		t.Fatalf("checkout clean filter executed during publication inspection: %v", err)
+	}
+}
+
+func TestInteractivePublicationRetainsStagedChanges(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	for _, tc := range []struct {
+		name  string
+		stage func(*testing.T, string)
+	}{
+		{name: "addition", stage: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "added.txt"), []byte("staged\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			publicationGit(t, path, "add", "added.txt")
+		}},
+		{name: "modification", stage: func(t *testing.T, path string) {
+			if err := os.WriteFile(filepath.Join(path, "tracked.txt"), []byte("changed\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			publicationGit(t, path, "add", "tracked.txt")
+		}},
+		{name: "deletion", stage: func(t *testing.T, path string) {
+			publicationGit(t, path, "rm", "tracked.txt")
+		}},
+		{name: "mode", stage: func(t *testing.T, path string) {
+			publicationGit(t, path, "update-index", "--chmod=+x", "tracked.txt")
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			remote := publicationBareRemote(t)
+			const sessionID = "99999999-9999-4999-8999-999999999999"
+			manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+			if err != nil {
+				t.Fatal(err)
+			}
+			path, err := manager.Provision(t.Context(), worktree.ProvisionSpec{SessionID: sessionID, RepoURL: remote, Strategy: worktree.StrategyClone})
+			if err != nil {
+				t.Fatal(err)
+			}
+			branch := "agent/" + sessionID
+			publicationGit(t, path, "checkout", "-b", branch)
+			publicationGit(t, path, "push", "--quiet", "origin", "HEAD:refs/heads/"+branch)
+			tc.stage(t, path)
+			assessment := publicationAssessment(t, manager, sessionID, remote, branch)
+			if !assessment.Retain || assessment.Reason != worktree.PublicationReasonDirty {
+				t.Fatalf("staged %s assessment=%+v", tc.name, assessment)
+			}
+		})
+	}
+}
+
+func TestInteractivePublicationAcceptsPublishedTrackedSymlink(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git unavailable")
+	}
+	remote := publicationBareRemote(t)
+	const sessionID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa"
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := manager.Provision(t.Context(), worktree.ProvisionSpec{SessionID: sessionID, RepoURL: remote, Strategy: worktree.StrategyClone})
+	if err != nil {
+		t.Fatal(err)
+	}
+	branch := "agent/" + sessionID
+	publicationGit(t, path, "checkout", "-b", branch)
+	if err := os.Symlink("tracked.txt", filepath.Join(path, "link.txt")); err != nil {
+		t.Fatal(err)
+	}
+	publicationGit(t, path, "add", "link.txt")
+	publicationGit(t, path, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-m", "link")
+	publicationGit(t, path, "push", "--quiet", "origin", "HEAD:refs/heads/"+branch)
+	assessment := publicationAssessment(t, manager, sessionID, remote, branch)
+	if assessment.Retain || assessment.Reason != worktree.PublicationReasonPublished {
+		t.Fatalf("published symlink assessment=%+v", assessment)
+	}
+}
+
 func TestInteractivePublicationRefusesAmbientGitExecutables(t *testing.T) {
 	if _, err := exec.LookPath("git"); err != nil {
 		t.Skip("git unavailable")
@@ -280,12 +411,12 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 	refsStarted := make(chan struct{})
 	allowRefs := make(chan struct{})
 	var once sync.Once
-	var observedStatusArgs []string
+	var observedIndexArgs []string
 	var observedRefArgs []string
 	runner := func(ctx context.Context, name string, args ...string) ([]byte, error) {
 		for _, arg := range args {
-			if arg == "status" {
-				observedStatusArgs = append([]string(nil), args...)
+			if arg == "--stage" {
+				observedIndexArgs = append([]string(nil), args...)
 			}
 			if arg == "for-each-ref" {
 				once.Do(func() {
@@ -366,10 +497,10 @@ func TestInteractivePublicationInspectionSerializesLeaseAheadOfTeardown(t *testi
 	if retained.lease.ReleaseDisposition != "archive" {
 		t.Fatalf("release disposition=%q", retained.lease.ReleaseDisposition)
 	}
-	statusCommand := strings.Join(observedStatusArgs, " ")
-	for _, required := range []string{"core.hooksPath=/dev/null", "core.fsmonitor=false", "protocol.allow=never", "protocol.https.allow=always", "--untracked-files=all"} {
-		if !strings.Contains(statusCommand, required) {
-			t.Errorf("publication status command omitted %q: %s", required, statusCommand)
+	indexCommand := strings.Join(observedIndexArgs, " ")
+	for _, required := range []string{"core.hooksPath=/dev/null", "core.fsmonitor=false", "protocol.allow=never", "protocol.https.allow=always", "ls-files", "--stage"} {
+		if !strings.Contains(indexCommand, required) {
+			t.Errorf("publication index command omitted %q: %s", required, indexCommand)
 		}
 	}
 	if refCommand := strings.Join(observedRefArgs, " "); !strings.Contains(refCommand, "for-each-ref") || !strings.Contains(refCommand, "%(objectname)%09%(refname)%09%(symref)") {
