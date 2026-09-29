@@ -21,6 +21,7 @@ import (
 
 func TestAgentRunProtectedRuntimeMCPSelectorReachesChildOptions(t *testing.T) {
 	const capability = "example.protected-mcp/v1"
+	const platformMCPServerName = "example-platform"
 	realizations := receiptCapabilityRealizationsForTest(t, capability, agent.HarnessPi, agent.PromptModeHumanControlled)
 	selector := runner.ProtectedRuntimeMCPSelector{
 		CapabilityID: capability, HarnessID: agent.HarnessPi,
@@ -29,11 +30,12 @@ func TestAgentRunProtectedRuntimeMCPSelectorReachesChildOptions(t *testing.T) {
 	commandOptions := agentRunOptions(Config{
 		CapabilityRealizations:      realizations,
 		ProtectedRuntimeMCPSelector: selector,
+		PlatformMCPServerName:       platformMCPServerName,
 	}, "embedder")
 	var child runner.Options
 	applyAgentRunCapabilityOptions(&child, commandOptions)
-	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPSelector != selector {
-		t.Fatalf("child capability options = registry %p selector %+v", child.CapabilityRealizations, child.ProtectedRuntimeMCPSelector)
+	if child.CapabilityRealizations != realizations || child.ProtectedRuntimeMCPSelector != selector || child.PlatformMCPServerName != platformMCPServerName {
+		t.Fatalf("child capability options = registry %p selector %+v serverName %q", child.CapabilityRealizations, child.ProtectedRuntimeMCPSelector, child.PlatformMCPServerName)
 	}
 }
 

@@ -13,6 +13,28 @@ import (
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
+const testPlatformMCPServerName = "example-platform"
+
+func TestResolvePlatformMCPServerNameCapturesDefaultAndRejectsMalformedExplicit(t *testing.T) {
+	statehome.ResetForTest()
+	t.Cleanup(statehome.ResetForTest)
+	statehome.SetBrand("example-local-a")
+	name, err := resolvePlatformMCPServerName("")
+	if err != nil || name != "example-local-a-platform" {
+		t.Fatalf("default name = %q err=%v", name, err)
+	}
+	statehome.SetBrand("example-local-b")
+	if name != "example-local-a-platform" {
+		t.Fatalf("captured default changed to %q", name)
+	}
+	if explicit, err := resolvePlatformMCPServerName(testPlatformMCPServerName); err != nil || explicit != testPlatformMCPServerName {
+		t.Fatalf("explicit name = %q err=%v", explicit, err)
+	}
+	if _, err := resolvePlatformMCPServerName(" example-platform"); err == nil {
+		t.Fatal("malformed explicit name accepted")
+	}
+}
+
 func TestMaterializeExecutionPreflightConfigAppliesAndReadsBackCommonConfig(t *testing.T) {
 	t.Parallel()
 	sessionID := "session-config-control"
@@ -108,18 +130,21 @@ func TestMaterializeProtectedRuntimeMCPConfigBindsExactRuntimeWithoutSecrets(t *
 		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersion,
 		RequirementID:   "protected-runtime-mcp/v1", AuthorityBindingDigest: strings.Repeat("a", 64),
 		OperationalPayloadDigest: operationalDigest,
-		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		ServerName:               testPlatformMCPServerName, Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
 		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
 		Headers: []executioncell.ProtectedRuntimeMCPHeaderV1{{
 			Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + detail.McpAuthToken),
 		}},
 	}
-	materialized, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement})
+	materialized, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}, testPlatformMCPServerName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(materialized) != 1 || executioncell.ValidateProtectedRuntimeMCPConfigMaterialization(materialized[0]) != nil {
 		t.Fatalf("materialization = %+v", materialized)
+	}
+	if _, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}, "example-local-b-platform"); err == nil || !strings.Contains(err.Error(), "current runtime authority") {
+		t.Fatalf("different V1 process authority error = %v", err)
 	}
 	raw, err := json.Marshal(materialized)
 	if err != nil {
@@ -139,7 +164,7 @@ func TestMaterializeProtectedRuntimeMCPConfigBindsExactRuntimeWithoutSecrets(t *
 	if err != nil || decoded.ContractVersion != executioncell.HostAdaptationV3ContractVersion || len(decoded.ProtectedRuntimeMCPConfigs) != 1 {
 		t.Fatalf("v3 receipt = %+v err=%v", decoded, err)
 	}
-	replayed, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement})
+	replayed, err := materializeProtectedRuntimeMCPConfigs(detail, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}, testPlatformMCPServerName)
 	if err != nil || !reflect.DeepEqual(replayed, materialized) {
 		t.Fatalf("unchanged replay = %+v err=%v", replayed, err)
 	}
@@ -152,7 +177,7 @@ func TestMaterializeProtectedRuntimeMCPConfigBindsExactRuntimeWithoutSecrets(t *
 		t.Run(name, func(t *testing.T) {
 			candidate := *detail
 			mutate(&candidate)
-			if _, err := materializeProtectedRuntimeMCPConfigs(&candidate, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}); err == nil {
+			if _, err := materializeProtectedRuntimeMCPConfigs(&candidate, []executioncell.ProtectedRuntimeMCPConfigRequirementV1{requirement}, testPlatformMCPServerName); err == nil {
 				t.Fatal("changed runtime authority accepted")
 			}
 		})
@@ -203,7 +228,7 @@ func protectedRuntimeMCPV2MaterializationFixture(t *testing.T) (
 		ContractVersion: executioncell.ProtectedRuntimeMCPConfigContractVersionV2,
 		RequirementID:   "protected-runtime-mcp/v2", AuthorityBindingDigest: strings.Repeat("b", 64),
 		OperationalPayloadDigest: digest,
-		ServerName:               statehome.Brand() + "-platform", Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
+		ServerName:               testPlatformMCPServerName, Transport: executioncell.ProtectedRuntimeMCPTransportHTTP,
 		EndpointDigest: digestConfigValue("https://platform.example/api/mcp/" + detail.SessionID),
 		Headers:        []executioncell.ProtectedRuntimeMCPHeaderV1{{Name: "Authorization", ValueDigest: digestConfigValue("Bearer " + token)}},
 		AuthorizationSource: executioncell.ProtectedRuntimeMCPAuthorizationSourceV2{
@@ -221,12 +246,15 @@ func TestMaterializeProtectedRuntimeMCPV2JoinsActualCommonEvidence(t *testing.T)
 	build := func(path string) (string, error) {
 		return "/example/donmai mcp gateway-headers --token-file " + path, nil
 	}
-	materialized, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build)
+	materialized, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build, testPlatformMCPServerName)
 	if err != nil {
 		t.Fatal(err)
 	}
 	if len(materialized) != 1 || executioncell.ValidateProtectedRuntimeMCPConfigMaterializationV2(materialized[0]) != nil {
 		t.Fatalf("v2 materialization = %+v", materialized)
+	}
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build, "example-local-b-platform"); err == nil || !strings.Contains(err.Error(), "current runtime authority") {
+		t.Fatalf("different V2 process authority error = %v", err)
 	}
 	got := materialized[0].AuthorizationSource
 	wantBinding := common[0].Bindings[0]
@@ -240,7 +268,7 @@ func TestMaterializeProtectedRuntimeMCPV2JoinsActualCommonEvidence(t *testing.T)
 	if strings.Contains(string(raw), detail.McpAuthToken) || strings.Contains(string(raw), spec.Env[executioncell.PreflightConfigSessionMCPBearerFileTarget]) {
 		t.Fatalf("v2 materialization leaked bearer or path: %s", raw)
 	}
-	replayed, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build)
+	replayed, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build, testPlatformMCPServerName)
 	if err != nil || !reflect.DeepEqual(replayed, materialized) {
 		t.Fatalf("unchanged v2 replay = %+v err=%v", replayed, err)
 	}
@@ -271,20 +299,20 @@ func TestMaterializeProtectedRuntimeMCPV2RefusesIncompleteOrChangedJoin(t *testi
 	detail, spec, requirement, common, lease := protectedRuntimeMCPV2MaterializationFixture(t)
 	t.Cleanup(lease.cleanup)
 	build := func(path string) (string, error) { return "helper --token-file " + path, nil }
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, nil); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, nil, testPlatformMCPServerName); err == nil {
 		t.Fatal("nil trusted helper builder accepted")
 	}
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, nil, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, nil, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("missing actual common materialization accepted")
 	}
 	duplicate := append(append([]executioncell.PreflightConfigMaterializationV1(nil), common...), common...)
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicate, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicate, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("duplicate common materialization accepted")
 	}
 	duplicateBindings := append([]executioncell.PreflightConfigMaterializationV1(nil), common...)
 	duplicateBindings[0].Bindings = append(append([]executioncell.PreflightConfigBindingMaterializationV1(nil), common[0].Bindings...), common[0].Bindings[0])
 	duplicateBindings[0].ConfigReferenceDigest, _ = executioncell.DigestPreflightConfigReference(duplicateBindings[0])
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicateBindings, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, duplicateBindings, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("duplicate matching common file binding accepted")
 	}
 	changedSpec := spec
@@ -293,20 +321,20 @@ func TestMaterializeProtectedRuntimeMCPV2RefusesIncompleteOrChangedJoin(t *testi
 		changedSpec.Env[key] = value
 	}
 	changedSpec.Env[executioncell.PreflightConfigSessionMCPBearerFileTarget] += ".changed"
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &changedSpec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &changedSpec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, common, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("changed actual file reference accepted")
 	}
 	changedCommon := append([]executioncell.PreflightConfigMaterializationV1(nil), common...)
 	changedCommon[0].Bindings = append([]executioncell.PreflightConfigBindingMaterializationV1(nil), common[0].Bindings...)
 	changedCommon[0].Bindings[0].BearerContentDigest = strings.Repeat("9", 64)
 	changedCommon[0].ConfigReferenceDigest, _ = executioncell.DigestPreflightConfigReference(changedCommon[0])
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, changedCommon, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{requirement}, changedCommon, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("changed initial bearer evidence accepted")
 	}
 	changedRequirement := requirement
 	changedRequirement.Headers = append([]executioncell.ProtectedRuntimeMCPHeaderV1(nil), requirement.Headers...)
 	changedRequirement.Headers[0].ValueDigest = strings.Repeat("8", 64)
-	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{changedRequirement}, common, build); err == nil {
+	if _, err := materializeProtectedRuntimeMCPConfigsV2(detail, &spec, []executioncell.ProtectedRuntimeMCPConfigRequirementV2{changedRequirement}, common, build, testPlatformMCPServerName); err == nil {
 		t.Fatal("changed initial Authorization evidence accepted")
 	}
 }

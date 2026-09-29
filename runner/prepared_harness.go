@@ -46,6 +46,10 @@ func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
 // a session with no registered decorator never had this mutation to
 // reconcile.
 func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, registries ...capabilityRealizationResolver) (agent.Spec, []string, error) {
+	return buildPreparedSourceSpecWithPlatformMCPServerName(qw, selection, decorate, platformMCPServerName(), registries...)
+}
+
+func buildPreparedSourceSpecWithPlatformMCPServerName(qw QueuedWork, selection harnessSelection, decorate agent.ExtensionDecorator, platformMCPServerName string, registries ...capabilityRealizationResolver) (agent.Spec, []string, error) {
 	provider := selection.Provider
 	if provider == nil {
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
@@ -108,7 +112,7 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 			promptPlan.InitialContext = []agent.PromptContent{{ID: "agent-memory-context", Text: composition.InitialContext, Required: true}}
 		}
 	}
-	defaults := defaultMCPServersForHarness(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, codeIntelDelivery.Route)
+	defaults := defaultMCPServersForHarnessWithPlatformMCPServerName(materializeRuntimeAuthority(working), "/runtime/worktree", provider, mode, platformMCPServerName, codeIntelDelivery.Route)
 	runtimeNames := make([]string, 0, len(defaults))
 	for _, server := range defaults {
 		runtimeNames = append(runtimeNames, server.Name)
@@ -242,7 +246,11 @@ func validateCapabilityRuntimeMaterializations(spec agent.Spec) error {
 // (ProviderView.PreflightExecution, the sole caller of this function) must
 // supply the SAME embedder decorator the real spawn's Provider will apply.
 func compilePreparedHarness(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, registries ...capabilityRealizationResolver) (*agent.PreparedHarness, agent.Spec, error) {
-	spec, runtimeNames, err := buildPreparedSourceSpec(qw, selection, decorate, registries...)
+	return compilePreparedHarnessWithPlatformMCPServerName(qw, selection, repositoryDeclaration, decorate, platformMCPServerName(), registries...)
+}
+
+func compilePreparedHarnessWithPlatformMCPServerName(qw QueuedWork, selection harnessSelection, repositoryDeclaration *workarea.NormalizedDeclaration, decorate agent.ExtensionDecorator, platformMCPServerName string, registries ...capabilityRealizationResolver) (*agent.PreparedHarness, agent.Spec, error) {
+	spec, runtimeNames, err := buildPreparedSourceSpecWithPlatformMCPServerName(qw, selection, decorate, platformMCPServerName, registries...)
 	if err != nil {
 		return nil, agent.Spec{}, err
 	}

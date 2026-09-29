@@ -335,12 +335,13 @@ func validateHostAdaptationReceipt(qw QueuedWork, admission executioncell.Admiss
 	return nil
 }
 
-func validateProtectedRuntimeMCPMaterialization(
+func validateProtectedRuntimeMCPMaterializationWithPlatformMCPServerName(
 	qw QueuedWork,
 	selection harnessSelection,
 	realizations *agent.CapabilityRealizationRegistry,
 	selector ProtectedRuntimeMCPSelector,
 	servers []agent.MCPServerConfig,
+	platformMCPServerName string,
 ) error {
 	if !selector.configured() {
 		if len(bytes.TrimSpace(qw.HostAdaptationReceipt)) == 0 {
@@ -394,7 +395,7 @@ func validateProtectedRuntimeMCPMaterialization(
 	if err != nil {
 		return err
 	}
-	requirement, err := resolveProtectedRuntimeMCPRequirement(qw, selection, realizations, selector, host)
+	requirement, err := resolveProtectedRuntimeMCPRequirementWithPlatformMCPServerName(qw, selection, realizations, selector, host, platformMCPServerName)
 	if err != nil {
 		return err
 	}
@@ -416,7 +417,7 @@ func validateProtectedRuntimeMCPMaterialization(
 	if err != nil || !reflect.DeepEqual(host.ProtectedRuntimeMCPConfigs[0], expected) {
 		return errors.New("runner: protected runtime MCP materialization differs from current runtime authority")
 	}
-	wantServer, err := protectedRuntimeMCPServer(qw, selection.Provider, sessionPromptMode(qw, selection.effectiveCell))
+	wantServer, err := protectedRuntimeMCPServerWithName(qw, selection.Provider, sessionPromptMode(qw, selection.effectiveCell), platformMCPServerName)
 	if err != nil {
 		return err
 	}

@@ -11,6 +11,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -357,7 +358,7 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	}
 
 	const capability = "example.protected-mcp/v1"
-	serverName := statehome.Brand() + "-platform"
+	const serverName = "example-platform"
 	entryID, err := agent.MCPServerCapabilityEntryID(serverName)
 	if err != nil {
 		t.Fatal(err)
@@ -399,7 +400,10 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 		CapabilityID: capability, HarnessID: agent.HarnessStub,
 		AdapterProfileID: "afcli-decorator-test-fake/tool-v1", Mode: agent.PromptModeAutonomous,
 	}
-	view, err := daemonProviderView(Config{CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector}, quietLogger())
+	view, err := daemonProviderView(Config{
+		CapabilityRealizations: realizations, ProtectedRuntimeMCPSelector: selector,
+		PlatformMCPServerName: serverName,
+	}, quietLogger())
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -444,6 +448,21 @@ func TestDaemonProviderViewForwardsExactProtectedRuntimeMCPSelector(t *testing.T
 	requirements, err := view.ResolveExecutionPreflightProtectedRuntimeMCPRequirements(detail, receipt)
 	if err != nil || len(requirements) != 1 {
 		t.Fatalf("daemon protected requirements = %+v err=%v", requirements, err)
+	}
+	if requirements[0].ServerName != serverName {
+		t.Fatalf("daemon protected requirement server = %q, want %q", requirements[0].ServerName, serverName)
+	}
+}
+
+func TestDaemonOptionsWithConfigForwardsPlatformMCPServerName(t *testing.T) {
+	const platformMCPServerName = "example-platform"
+	base := daemon.Options{Version: "example-version"}
+	got := daemonOptionsWithConfig(Config{PlatformMCPServerName: platformMCPServerName}, base)
+	if got.PlatformMCPServerName != platformMCPServerName || got.Version != base.Version {
+		t.Fatalf("daemon options = serverName %q version %q", got.PlatformMCPServerName, got.Version)
+	}
+	if empty := daemonOptionsWithConfig(Config{}, base); empty.PlatformMCPServerName != "" || empty.Version != base.Version {
+		t.Fatalf("default daemon options = serverName %q version %q", empty.PlatformMCPServerName, empty.Version)
 	}
 }
 
