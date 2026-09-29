@@ -235,10 +235,14 @@ resource limits before installing the service.
 
 ### `donmai governor`
 
-Start, stop, and query the governor scan loop.
+The governor scans named Linear projects and enqueues eligible issues in Redis;
+execution requires a separate worker. Set `LINEAR_API_KEY` and a `REDIS_URL`
+that reaches Redis before starting it. Pass a Linear project name with
+`--project`, or set `GOVERNOR_PROJECTS` to a comma-separated list of project
+names. `status` reports whether the recorded governor process is running.
 
 ```bash
-donmai governor start [--max-dispatches <n>] [--scan-interval <duration>]
+donmai governor start --project "<project-name>" [--max-dispatches <n>] [--scan-interval <duration>]
 donmai governor stop
 donmai governor status
 ```
