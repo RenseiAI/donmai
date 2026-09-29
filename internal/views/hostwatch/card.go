@@ -40,11 +40,15 @@ func statusColor(t theme.Theme, card SessionCard) color.Color {
 }
 
 // renderCard renders a single session card: a colored status dot + issue
-// header, a role/provider/state chip line, a 4-tile metric line (duration /
-// tool-calls / cost / turns), and a current-tool ticker. Colors are read
-// from the theme exclusively (no hardcoded hexes). frame drives the dot
-// pulse; selected draws a bright border. When plain is true, color and box
-// drawing are dropped for a pipe-/CI-friendly rendering.
+// header, a labeled harness/model/provider/state line, a labeled metric
+// line (elapsed / tool-calls / cost / turns), a freshness line
+// (heartbeat / output / work) and a current-tool ticker. Every field is
+// named; missing data renders as "unknown" or "not reported", never an
+// invented running state or a zero. Colors are read from the theme
+// exclusively (no hardcoded hexes). frame drives the dot pulse; selected
+// draws a bright border. When plain is true, color and box drawing are
+// dropped for a pipe-/CI-friendly rendering. Layout only flows the lines;
+// parallel layout work owns the grid/split geometry.
 func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time) string {
 	dot := animFrames[0]
 	if isLiveState(card.DaemonState) {
@@ -57,24 +61,29 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	}
 	work := card.WorkType
 	if work == "" {
-		work = "—"
+		work = "unknown"
 	}
 
-	provider := card.Provider
-	if provider == "" {
-		provider = "agent"
-	}
-	st := card.DaemonState
-	if st == "" {
-		st = "running"
-	}
-	chips := fmt.Sprintf("%s · %s · %s", card.roleBadge(), provider, st)
+	// The model card is assigned outside this repository; there is no
+	// local source for it, so it always renders as unknown rather than
+	// inventing a value.
+	chips := fmt.Sprintf("harness %s · model %s · provider %s · state %s",
+		unknownIfEmpty(card.Harness),
+		unknownIfEmpty(card.Model),
+		unknownIfEmpty(card.modelProvider()),
+		unknownIfEmpty(card.DaemonState))
 
-	metrics := fmt.Sprintf("⏱ %s   ⌨ %d   %s   ↻ %d",
-		format.Duration(card.ageSeconds(now)),
-		card.ToolCalls,
-		costStr(card.CostUsd),
-		card.NumTurns,
+	metrics := fmt.Sprintf("elapsed %s · tools %s · cost %s · turns %s",
+		elapsedStr(card, now),
+		countStr(card.Observed, card.ToolCalls),
+		costStr(card),
+		countStr(card.MetricsReported, card.NumTurns),
+	)
+
+	fresh := fmt.Sprintf("heartbeat %s · output %s · work %s",
+		freshStr(card.heartbeatTime(), now),
+		freshStr(card.LastOutputAt, now),
+		freshStr(card.LastWorkAt, now),
 	)
 
 	ticker := card.LastActivity
@@ -91,6 +100,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		fmt.Fprintf(&b, "%s %s  %s\n", dot, header, work)
 		fmt.Fprintf(&b, "  %s\n", chips)
 		fmt.Fprintf(&b, "  %s\n", metrics)
+		fmt.Fprintf(&b, "  %s\n", fresh)
 		if ticker != "" {
 			fmt.Fprintf(&b, "  %s\n", ticker)
 		}
@@ -109,6 +119,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		dotStyle.Render(dot) + " " + headStyle.Render(header) + "  " + workStyle.Render(work),
 		chipStyle.Render(chips),
 		metricStyle.Render(metrics),
+		chipStyle.Render(fresh),
 	}
 	if ticker != "" {
 		lines = append(lines, tickStyle.Render(ticker))
@@ -170,16 +181,90 @@ func (c SessionCard) ageSeconds(now time.Time) int {
 	return int(d.Seconds())
 }
 
-// costStr formats the running cost using the format helper's *float64 API.
-func costStr(usd float64) string {
-	v := usd
+// modelProvider returns the model-serving vendor identity. Provider is
+// the legacy conflated field: prefer the explicit ModelProvider axis and
+// fall back only for state written before the split.
+func (c SessionCard) modelProvider() string {
+	if c.ModelProvider != "" {
+		return c.ModelProvider
+	}
+	return c.Provider
+}
+
+// heartbeatTime returns the freshest heartbeat observation: live tail
+// freshness never exists (heartbeats are not tailed), so the persisted
+// runner heartbeat snapshot is the only heartbeat signal. Zero means the
+// runner never reported one.
+func (c SessionCard) heartbeatTime() time.Time {
+	if c.LastHeartbeatUnixMs <= 0 {
+		return time.Time{}
+	}
+	return time.UnixMilli(c.LastHeartbeatUnixMs)
+}
+
+// unknownIfEmpty renders an absent display field as unknown instead of an
+// empty chip or an invented default.
+func unknownIfEmpty(s string) string {
+	if strings.TrimSpace(s) == "" {
+		return "unknown"
+	}
+	return s
+}
+
+// elapsedStr renders the session age, or unknown when the start time was
+// never reported (never a zero duration).
+func elapsedStr(card SessionCard, now time.Time) string {
+	if card.StartedAtUnixMs <= 0 {
+		return "unknown"
+	}
+	start := time.UnixMilli(card.StartedAtUnixMs)
+	d := now.Sub(start)
+	if d < 0 {
+		return "unknown"
+	}
+	return format.Duration(int(d.Seconds()))
+}
+
+// countStr renders a cumulative count, or "not reported" until its source
+// has been observed: tool calls fold from the tail (Observed), cost/turns
+// only arrive on the terminal result event (MetricsReported). A zero after
+// that is a measured zero.
+func countStr(reported bool, n int) string {
+	if !reported {
+		return "not reported"
+	}
+	return fmt.Sprintf("%d", n)
+}
+
+// costStr renders the terminal cost payload, or "not reported" until it
+// arrives on the terminal result event (never incrementally).
+func costStr(card SessionCard) string {
+	if !card.MetricsReported {
+		return "not reported"
+	}
+	v := card.CostUsd
 	return format.Cost(&v)
 }
 
+// freshStr renders one freshness timestamp as a relative age, or "never"
+// when that signal has never been observed live. Replayed history never
+// advances these timestamps (see foldMetrics), so "never" stays honest.
+func freshStr(ts time.Time, now time.Time) string {
+	if ts.IsZero() {
+		return "never"
+	}
+	d := now.Sub(ts)
+	if d < 0 {
+		d = 0
+	}
+	return format.Duration(int(d.Seconds())) + " ago"
+}
+
 // isLiveState reports whether a daemon state should animate (running-ish).
+// An empty state is unknown, not running: it renders statically.
 func isLiveState(s string) bool {
 	switch strings.ToLower(s) {
-	case "", "running", "starting":
+	case "running", "starting":
 		return true
 	default:
 		return false

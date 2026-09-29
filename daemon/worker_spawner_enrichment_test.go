@@ -131,3 +131,39 @@ func TestSpawner_HandleEnrichment_NoParentLeavesPathEmpty(t *testing.T) {
 		t.Errorf("projectName should still be set, got %q", handles[0].ProjectName)
 	}
 }
+
+// TestSpawner_HandleDisplayMetadata verifies AcceptWork projects the admitted
+// session display identity (loop driver, resolved model, vendor, workflow)
+// onto the SessionHandle so GET /api/daemon/sessions is self-sufficient for
+// a local reader with no per-session fetch.
+func TestSpawner_HandleDisplayMetadata(t *testing.T) {
+	parent := t.TempDir()
+	s := NewWorkerSpawner(SpawnerOptions{
+		Projects:              []ProjectConfig{{ID: "acme", Repository: "github.com/acme/web"}},
+		MaxConcurrentSessions: 1,
+		WorktreeParentDir:     parent,
+		WorkerCommand:         []string{"/bin/sh", "-c", "sleep 5"},
+	})
+	t.Cleanup(func() { _ = s.Drain(time.Second) })
+
+	if _, err := s.AcceptWork(SessionSpec{
+		SessionID:  "sess-meta",
+		Repository: "github.com/acme/web",
+		Ref:        "main",
+		Harness:    "loop-driver",
+		Model:      "model-id",
+		Company:    "vendor",
+		WorkType:   "development",
+	}); err != nil {
+		t.Fatalf("accept: %v", err)
+	}
+	handles := s.ActiveSessions()
+	if len(handles) != 1 {
+		t.Fatalf("want 1 active session, got %d", len(handles))
+	}
+	h := handles[0]
+	if h.Harness != "loop-driver" || h.Model != "model-id" ||
+		h.ModelProvider != "vendor" || h.WorkType != "development" {
+		t.Errorf("display metadata not projected: %+v", h)
+	}
+}
