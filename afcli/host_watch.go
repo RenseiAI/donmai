@@ -88,7 +88,7 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 				if url := resolveHostWatchURL(daemonURL); url != "" {
 					client = afclient.NewDaemonClientFromURL(url)
 				} else {
-					client = afclient.NewDaemonClient(cfg)
+					client = afclient.NewDaemonClient(withControlToken(cfg))
 				}
 			}
 
