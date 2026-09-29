@@ -105,17 +105,200 @@ func TestRun_ContinuationLimitReachedFailsWithTheCount(t *testing.T) {
 		verdictScriptTurn{text: "Almost there."},
 		verdictScriptTurn{text: "Opened " + followUpPR + " (never reached)"},
 	)
-	if res.Status != "failed" || res.FailureMode != FailureContinuationsExhausted {
-		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureContinuationsExhausted)
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureContinuationsUnproductive)
 	}
-	if !strings.Contains(res.Error, "after 2 continuation prompts") {
-		t.Errorf("Error = %q; want it to name the 2 continuations", res.Error)
+	if !strings.Contains(res.Error, "after 2 consecutive continuation prompts whose turns made no tool call (2 continuation prompts in total)") {
+		t.Errorf("Error = %q; want it to name the 2 unproductive continuations", res.Error)
 	}
 	if res.SteeringTriggered || res.PullRequestURL != "" {
 		t.Errorf("SteeringTriggered=%v PullRequestURL=%q; unfinished work gets no nudge and no pull request", res.SteeringTriggered, res.PullRequestURL)
 	}
 	wantPrompts(t, prompts, continuePrompt, continuePrompt)
 	wantContinuations(t, res, 2, 0, true)
+}
+
+// TestRun_ContinuationBoundsFollowProgress pins the progress bound: a turn
+// that made a tool call is productive and resets the streak of unproductive
+// continuations, so an agent that ends its turns early but keeps working is
+// continued past TurnContinuationLimit; only that many CONSECUTIVE
+// continuations with no tool call fail the session, and the total ceiling
+// fails it with its own failure mode. Provider-error retries keep their own
+// count, which progress does not reset.
+func TestRun_ContinuationBoundsFollowProgress(t *testing.T) {
+	productive := func(text string) verdictScriptTurn { return verdictScriptTurn{toolCalls: 3, text: text} }
+	idle := func(text string) verdictScriptTurn { return verdictScriptTurn{text: text} }
+	repeat := func(n int, turn func(i int) verdictScriptTurn) []verdictScriptTurn {
+		turns := make([]verdictScriptTurn, n)
+		for i := range turns {
+			turns[i] = turn(i)
+		}
+		return turns
+	}
+	alternate := func(i int) verdictScriptTurn {
+		if i%2 == 0 {
+			return productive("Next I will run the tests.")
+		}
+		return idle("Next I will run the tests.")
+	}
+	done := verdictScriptTurn{text: "Opened " + followUpPR}
+	neverReached := verdictScriptTurn{text: "never reached"}
+	cases := []struct {
+		name        string
+		limit       int
+		ceiling     int
+		turns       []verdictScriptTurn
+		wantMode    string // "" = completed with followUpPR
+		wantErr     string
+		wantPrompts []string
+		want        agent.TurnContinuations
+	}{
+		{
+			name:        "productive early stops continue past the limit",
+			turns:       append(repeat(6, func(int) verdictScriptTurn { return productive("Next I will run the tests.") }), done),
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 6),
+			want:        agent.TurnContinuations{Continued: 6, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling},
+		},
+		{
+			name:        "three consecutive unproductive continuations fail",
+			turns:       []verdictScriptTurn{productive("Plan: edit."), productive("Plan: test."), idle("Plan: push."), idle("Plan: push."), idle("Plan: push."), neverReached},
+			wantMode:    FailureContinuationsUnproductive,
+			wantErr:     "after 3 consecutive continuation prompts whose turns made no tool call (4 continuation prompts in total)",
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 4),
+			want:        agent.TurnContinuations{Continued: 4, Unproductive: 3, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling, Exhausted: true},
+		},
+		{
+			name:        "a productive turn resets the unproductive streak",
+			turns:       []verdictScriptTurn{idle("a"), idle("b"), idle("c"), productive("d"), idle("e"), idle("f"), done},
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 6),
+			want:        agent.TurnContinuations{Continued: 6, Unproductive: 2, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling},
+		},
+		{
+			name:        "alternating productive and unproductive stops finish the work",
+			turns:       append(repeat(7, func(i int) verdictScriptTurn { return alternate(i + 1) }), done),
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 7),
+			want:        agent.TurnContinuations{Continued: 7, Unproductive: 1, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling},
+		},
+		{
+			name:        "alternating productive and unproductive stops run to the ceiling",
+			limit:       2,
+			ceiling:     6,
+			turns:       append(repeat(7, alternate), neverReached),
+			wantMode:    FailureContinuationsCeiling,
+			wantErr:     "after 6 continuation prompts, the ceiling (0 in a row made no tool call)",
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 6),
+			want:        agent.TurnContinuations{Continued: 6, Limit: 2, Ceiling: 6, Exhausted: true},
+		},
+		{
+			name:        "productive early stops fail at the ceiling",
+			ceiling:     4,
+			turns:       append(repeat(5, func(int) verdictScriptTurn { return productive("Next I will run the tests.") }), neverReached),
+			wantMode:    FailureContinuationsCeiling,
+			wantErr:     "after 4 continuation prompts, the ceiling",
+			wantPrompts: slices.Repeat([]string{continuePrompt}, 4),
+			want:        agent.TurnContinuations{Continued: 4, Limit: DefaultTurnContinuationLimit, Ceiling: 4, Exhausted: true},
+		},
+		{
+			name:        "a productive retry resets the unproductive streak",
+			turns:       []verdictScriptTurn{idle("a"), idle("b"), idle("c"), {text: "d", providerError: "504 Gateway Timeout"}, productive("e"), done},
+			wantPrompts: []string{continuePrompt, continuePrompt, continuePrompt, retryPrompt, continuePrompt},
+			want:        agent.TurnContinuations{Continued: 4, Retried: 1, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling},
+		},
+		{
+			name: "productive provider-error turns keep the retry bound",
+			turns: append(repeat(4, func(int) verdictScriptTurn {
+				return verdictScriptTurn{toolCalls: 3, text: "Working.", providerError: "503 Service Unavailable"}
+			}), neverReached),
+			wantMode:    FailureProviderError,
+			wantErr:     "after 3 retries: 503 Service Unavailable",
+			wantPrompts: slices.Repeat([]string{retryPrompt}, 3),
+			want:        agent.TurnContinuations{Retried: 3, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling, Exhausted: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res, provider := runScriptedSession(t, scriptedSession{
+				workType:            "development",
+				repository:          followUpRepository,
+				pulls:               map[int]string{7: pullAtSessionCommit},
+				continuationLimit:   tc.limit,
+				continuationCeiling: tc.ceiling,
+				turns:               tc.turns,
+			})
+			if tc.wantMode == "" {
+				if res.Status != "completed" || res.PullRequestURL != followUpPR {
+					t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+				}
+			} else {
+				if res.Status != "failed" || res.FailureMode != tc.wantMode {
+					t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, tc.wantMode)
+				}
+				if !strings.Contains(res.Error, tc.wantErr) {
+					t.Errorf("Error = %q; want it to contain %q", res.Error, tc.wantErr)
+				}
+				if res.PullRequestURL != "" {
+					t.Errorf("PullRequestURL = %q; unfinished work gets no pull request", res.PullRequestURL)
+				}
+			}
+			if res.SteeringTriggered {
+				t.Errorf("SteeringTriggered = true; an early stop is continued, not nudged")
+			}
+			wantPrompts(t, provider.prompts, tc.wantPrompts...)
+			if res.TurnContinuations == nil || *res.TurnContinuations != tc.want {
+				t.Fatalf("TurnContinuations = %+v; want %+v", res.TurnContinuations, tc.want)
+			}
+		})
+	}
+}
+
+// TestNewTurnFollowUps_ResolvesBounds pins the option values: zero is each
+// default, a negative limit disables continuations and retries, and a
+// negative ceiling removes the ceiling.
+func TestNewTurnFollowUps_ResolvesBounds(t *testing.T) {
+	cases := []struct {
+		name                         string
+		limit, ceiling               int
+		wantLimit, wantCeilingResult int
+	}{
+		{name: "defaults", wantLimit: DefaultTurnContinuationLimit, wantCeilingResult: DefaultTurnContinuationCeiling},
+		{name: "explicit", limit: 5, ceiling: 20, wantLimit: 5, wantCeilingResult: 20},
+		{name: "continuations disabled", limit: -1, wantLimit: 0, wantCeilingResult: DefaultTurnContinuationCeiling},
+		{name: "no ceiling", ceiling: -1, wantLimit: DefaultTurnContinuationLimit, wantCeilingResult: 0},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			r := &Runner{turnContinuationLimit: tc.limit, turnContinuationCeiling: tc.ceiling}
+			f := r.newTurnFollowUps()
+			if f.limit != tc.wantLimit || f.ceiling != tc.wantCeilingResult {
+				t.Fatalf("limit=%d ceiling=%d; want %d/%d", f.limit, f.ceiling, tc.wantLimit, tc.wantCeilingResult)
+			}
+		})
+	}
+}
+
+// TestTurnFollowUps_NoCeilingKeepsContinuingProductiveTurns pins that with
+// the ceiling removed, only the unproductive streak bounds continuations:
+// productive early stops are continued well past the default ceiling, and
+// the limit-th consecutive unproductive continuation turn still fails.
+func TestTurnFollowUps_NoCeilingKeepsContinuingProductiveTurns(t *testing.T) {
+	f := (&Runner{turnContinuationCeiling: -1}).newTurnFollowUps()
+	// endings are the productivity of each turn that stopped early: the
+	// session's first turn, then each continuation turn in order.
+	endings := slices.Repeat([]bool{true}, 2*DefaultTurnContinuationCeiling)
+	endings = append(endings, slices.Repeat([]bool{false}, DefaultTurnContinuationLimit)...)
+	for i, productive := range endings {
+		step := f.next(turnStoppedEarly, productive, true, false)
+		if i == len(endings)-1 {
+			if step != tailExhausted || f.bound != boundUnproductive || f.unproductive != DefaultTurnContinuationLimit {
+				t.Fatalf("last stop: step=%d bound=%d unproductive=%d; want tailExhausted by the unproductive bound at %d", step, f.bound, f.unproductive, DefaultTurnContinuationLimit)
+			}
+			break
+		}
+		if step != tailContinue {
+			t.Fatalf("stop %d (productive=%v): step = %d; want tailContinue", i, productive, step)
+		}
+		f.continued++
+	}
 }
 
 // TestRun_ProviderErrorRetriesExhaustedFailAsProviderError pins the retry
@@ -257,35 +440,68 @@ func TestRun_OtherOwnRepositoryPullRequestThenEarlyStopIsContinued(t *testing.T)
 }
 
 // TestRun_ContinuationExhaustedStillRunsTheBackstop pins that a session whose
-// turn never finished still gets the backstop's open-PR attempt: the work is
-// committed and pushed to the session branch and a pull request is opened,
-// while the session stays failed as continuations-exhausted.
+// turn never finished still gets the backstop's open-PR attempt, whichever
+// continuation bound it ran out of: the work is committed and pushed to the
+// session branch and a pull request is opened, while the session stays failed
+// with the failure mode of that bound.
 func TestRun_ContinuationExhaustedStillRunsTheBackstop(t *testing.T) {
-	const opened = "https://github.com/example/repo/pull/12"
-	ghArgs := stubGhRecordingArgs(t, opened)
-	res, provider := runScriptedSession(t, scriptedSession{
-		workType:          "development",
-		repository:        followUpRepository,
-		backstop:          true,
-		continuationLimit: 1,
-		turns: []verdictScriptTurn{
-			{files: map[string]string{"feature.txt": "half done\n"}, text: "Working on it."},
-			{text: "Still working."},
-			{text: "never reached"},
+	cases := []struct {
+		name     string
+		limit    int
+		ceiling  int
+		turns    []verdictScriptTurn
+		wantMode string
+	}{
+		{
+			name:  "unproductive bound",
+			limit: 1,
+			turns: []verdictScriptTurn{
+				{files: map[string]string{"feature.txt": "half done\n"}, text: "Working on it."},
+				{text: "Still working."},
+				{text: "never reached"},
+			},
+			wantMode: FailureContinuationsUnproductive,
 		},
-	})
-	if res.Status != "failed" || res.FailureMode != FailureContinuationsExhausted {
-		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureContinuationsExhausted)
+		{
+			name:    "ceiling",
+			ceiling: 1,
+			turns: []verdictScriptTurn{
+				{files: map[string]string{"feature.txt": "half done\n"}, toolCalls: 2, text: "Working on it."},
+				{toolCalls: 2, text: "Still working."},
+				{text: "never reached"},
+			},
+			wantMode: FailureContinuationsCeiling,
+		},
 	}
-	wantPrompts(t, provider.prompts, continuePrompt)
-	if res.BackstopReport == nil || !res.BackstopReport.Pushed || !res.BackstopReport.PRCreated {
-		t.Fatalf("BackstopReport = %+v; want the work pushed and a pull request opened", res.BackstopReport)
-	}
-	if res.PullRequestURL != opened {
-		t.Errorf("PullRequestURL = %q; want the backstop's %q", res.PullRequestURL, opened)
-	}
-	if !strings.Contains(readFile(t, ghArgs), "--head") {
-		t.Errorf("gh pr create was not asked to open the session branch's pull request")
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			const opened = "https://github.com/example/repo/pull/12"
+			ghArgs := stubGhRecordingArgs(t, opened)
+			res, provider := runScriptedSession(t, scriptedSession{
+				workType:            "development",
+				repository:          followUpRepository,
+				backstop:            true,
+				continuationLimit:   tc.limit,
+				continuationCeiling: tc.ceiling,
+				turns:               tc.turns,
+			})
+			if res.Status != "failed" || res.FailureMode != tc.wantMode {
+				t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, tc.wantMode)
+			}
+			if res.SteeringTriggered {
+				t.Errorf("SteeringTriggered = true; unfinished work gets no pull request nudge")
+			}
+			wantPrompts(t, provider.prompts, continuePrompt)
+			if res.BackstopReport == nil || !res.BackstopReport.Pushed || !res.BackstopReport.PRCreated {
+				t.Fatalf("BackstopReport = %+v; want the work pushed and a pull request opened", res.BackstopReport)
+			}
+			if res.PullRequestURL != opened {
+				t.Errorf("PullRequestURL = %q; want the backstop's %q", res.PullRequestURL, opened)
+			}
+			if !strings.Contains(readFile(t, ghArgs), "--head") {
+				t.Errorf("gh pr create was not asked to open the session branch's pull request")
+			}
+		})
 	}
 }
 
