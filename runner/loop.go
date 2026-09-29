@@ -834,6 +834,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
+		s.Harness = selection.Harness.ID
+		s.Model = qw.ResolvedProfile.Model
+		s.ModelProvider = string(spanruntime.ProviderSystem(provider.Name()))
 		s.WorkType = qw.WorkType
 		s.WorkerID = qw.WorkerID
 		s.CurrentStep = "spawning"

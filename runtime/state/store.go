@@ -54,6 +54,22 @@ type State struct {
 	// session.
 	ProviderName agent.ProviderName `json:"providerName,omitempty"`
 
+	// Harness is the resolved loop-driver identity (e.g. "claude-code").
+	// Distinct from ProviderName (the concrete provider impl) and from the
+	// model-serving vendor below. Empty on state written before the field
+	// existed; readers render that as unknown.
+	Harness string `json:"harness,omitempty"`
+
+	// Model is the resolved model id (e.g. "claude-sonnet-4-5"). Empty on
+	// state written before the field existed; readers render that as unknown.
+	Model string `json:"model,omitempty"`
+
+	// ModelProvider is the model-serving vendor identity (e.g.
+	// "anthropic"), a separate axis from Harness (the loop driver).
+	// Populated from the resolved profile/endpoint company where known.
+	// Empty on state written before the field existed.
+	ModelProvider string `json:"modelProvider,omitempty"`
+
 	// ReasoningEffort records the reasoning effort the runner requested
 	// from the harness at spawn: an agent.EffortLevel name, or
 	// ReasoningEffortNotConfigured when the session carried none. Empty on
