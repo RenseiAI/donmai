@@ -22,8 +22,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   - tags it with a signed tag;
   - watches the release, worker-image and E2B runs and the Homebrew cask.
 
-  It is non-interactive and safe to re-run after a failure. It prints
-  "nothing to release" when there is nothing new.
+  It is non-interactive and safe to re-run after a failure. When there is
+  nothing new, it checks that the latest release finished: its publisher
+  runs, the GitHub release and the cask. It prints "nothing to release" only
+  when they are all complete, and fails otherwise.
 - Both commands require the organization `FAST_LANE` variable to be `on`, with
   no repository variable of that name. They read it again before `main` moves
   and before tagging. `DRY_RUN=1` previews either one without changing

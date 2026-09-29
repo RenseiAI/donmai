@@ -25,11 +25,14 @@
 # release is the release train, run once a day (RELEASING.md "Daily release
 # train").
 #   1. Preflight, read-only: the switch, admin, and the scripts this run uses
-#      are origin/main's own. When main has no commits since the latest v* tag
-#      it prints "nothing to release" and exits 0. The version is the next
-#      patch (or --version, a smallest increment) and is unused on origin and
-#      as a GitHub release. The tag signer is ready and allowed to create
-#      release tags.
+#      (this script included) are origin/main's own. When main has no commits
+#      since the latest v* tag, it finishes that tag's release instead: it
+#      watches the tag's publisher runs, the GitHub release and the cask, and
+#      prints "nothing to release" (exit 0) only once all of them are
+#      complete, or FAILED (exit 1). The version is the next patch (or
+#      --version, a smallest increment; or the version of a release
+#      preparation already on main) and is unused on origin and as a GitHub
+#      release. The tag signer is ready and allowed to create release tags.
 #   2. Compose the release preparation in a scratch worktree at origin/main:
 #      the CHANGELOG section (an existing one, the Unreleased entries, or one
 #      composed from the subjects landed since the last tag). Run guard-b over
@@ -48,8 +51,9 @@
 #      then the published release and the Homebrew cask.
 #
 # Re-running after any failure is safe and never prompts: nothing lands unless
-# every earlier step passed, a failed tag push removes its local tag, and a
-# local-only tag left by a killed run is replaced.
+# every earlier step passed; a failure after the tag is resumed by the next
+# run's watch; a failed tag push removes its local tag; and a local-only tag
+# this script made in a killed run is replaced (any other one is refused).
 #
 # Usage: scripts/fast-lane.sh ship [--dry-run] [--title TEXT] [--full]
 #        scripts/fast-lane.sh release [--dry-run] [--version vX.Y.Z]
@@ -78,6 +82,8 @@ contract_paths=(scripts .github/workflows .goreleaser.yaml)
 # Waits; tests shorten them.
 poll_seconds="${FAST_LANE_POLL_SECONDS:-15}"
 tag_wait_seconds="${FAST_LANE_TAG_WAIT_SECONDS:-900}"
+run_wait_seconds="${FAST_LANE_RUN_WAIT_SECONDS:-300}"
+cask_wait_seconds="${FAST_LANE_CASK_WAIT_SECONDS:-600}"
 
 prog='fast-lane'
 mode=''
@@ -200,6 +206,55 @@ gh_lookup() {
   return 2
 }
 
+# watch_release <tag> <commit>: wait for every publisher of <tag> and stop
+# with a FAILED line unless all of them succeeded: the release.yml,
+# worker-image.yml and e2b-template.yml runs the tag push started, the
+# published GitHub release, and the Homebrew cask at that version. A run that
+# already finished answers at once, so this also resumes or re-checks an
+# earlier release.
+watch_release() {
+  local tag=$1 commit=$2 workflow runs run_id deadline index=0 release_json cask_json cask
+  local run_ids=()
+  for workflow in "${watched_workflows[@]}"; do
+    deadline=$((SECONDS + run_wait_seconds))
+    while :; do
+      runs="$(gh_read "list the ${workflow} runs" run list -R "${repo}" --workflow "${workflow}" --limit 50 \
+        --json databaseId,headSha,headBranch)" || fail "cannot find the ${workflow} run for ${tag}"
+      run_id="$(jq -r --arg sha "${commit}" --arg tag "${tag}" \
+        '[.[] | select(.headSha == $sha and .headBranch == $tag)] | first | .databaseId // ""' <<<"${runs}")"
+      [[ -z "${run_id}" ]] || break
+      [[ ${SECONDS} -lt ${deadline} ]] || fail "no ${workflow} run appeared for ${tag} within ${run_wait_seconds}s"
+      sleep "${poll_seconds}"
+    done
+    run_ids+=("${run_id}")
+  done
+  for workflow in "${watched_workflows[@]}"; do
+    run_id="${run_ids[${index}]}"
+    index=$((index + 1))
+    log "watching ${workflow} run ${run_id} for ${tag}"
+    gh run watch "${run_id}" -R "${repo}" --exit-status --interval 30 >"${scratch}/watch.log" 2>&1 </dev/null ||
+      fail "${workflow} run ${run_id} for ${tag} did not succeed ($(tail -1 "${scratch}/watch.log")): https://github.com/${repo}/actions/runs/${run_id}. Re-run its failed jobs (gh run rerun ${run_id} --failed) so the tag-push policy still applies; the next make release checks again"
+    log "${workflow} run ${run_id} succeeded"
+  done
+  release_json="$(gh_read "read the ${tag} release" api "repos/${repo}/releases/tags/${tag}")" ||
+    fail "the ${repo} ${tag} release is missing"
+  [[ "$(jq -r 'if .draft == false then .tag_name else "" end' <<<"${release_json}")" == "${tag}" ]] ||
+    fail "the ${repo} ${tag} release is still a draft"
+  log "${repo} ${tag} is published"
+  deadline=$((SECONDS + cask_wait_seconds))
+  while :; do
+    cask_json="$(gh_read "read ${tap_repo}/${cask_path}" api "repos/${tap_repo}/contents/${cask_path}")" ||
+      fail "cannot read the Homebrew cask"
+    cask="$(jq -r '.content // "" | gsub("\n"; "")' <<<"${cask_json}" | base64 --decode 2>/dev/null)" || cask=''
+    if grep -q "version \"${tag#v}\"" <<<"${cask}"; then
+      break
+    fi
+    [[ ${SECONDS} -lt ${deadline} ]] || fail "${tap_repo}/${cask_path} did not move to ${tag} within ${cask_wait_seconds}s"
+    sleep "${poll_seconds}"
+  done
+  log "${tap_repo}/${cask_path} is at ${tag}"
+}
+
 # --- 1. Preflight (read-only) ------------------------------------------------
 
 org_variables='{}'
@@ -276,9 +331,9 @@ version_free() {
   esac
 }
 
+common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
 if [[ "${mode}" == ship ]]; then
   git_dir="$(cd "$(git rev-parse --absolute-git-dir)" && pwd -P)"
-  common_dir="$(cd "$(git rev-parse --git-common-dir)" && pwd -P)"
   [[ "${git_dir}" != "${common_dir}" ]] ||
     refuse "this is the primary checkout; run make ship from a linked worktree (scripts/create-worktree.sh <name>)"
   branch="$(git symbolic-ref --quiet --short HEAD)" || refuse "HEAD is detached; run make ship from a branch"
@@ -310,6 +365,8 @@ else
   # cannot release with an unreviewed copy of this script or its helpers.
   git diff --quiet "${base}" -- scripts ||
     refuse "this checkout's scripts/ differ from origin/main ${base:0:12}; the release train runs main's own scripts. Update the checkout to origin/main and re-run."
+  git show "${base}:scripts/fast-lane.sh" 2>/dev/null | cmp -s - "$0" ||
+    refuse "the running $0 differs from origin/main's scripts/fast-lane.sh; run the checkout's own copy (make release) at origin/main"
 
   # The latest release is read from origin, so a stale local-only tag can
   # neither move the baseline nor hide an existing remote one.
@@ -326,7 +383,11 @@ else
     refuse "the ${latest} commit ${latest_commit:0:12} is not in this repository"
   pending="$(git rev-list --count "${latest_commit}..${base}")"
   if [[ "${pending}" -eq 0 ]]; then
-    log "nothing to release: origin/main ${base:0:12} is ${latest}"
+    # No new work. A run that failed after its tag is finished here, so a
+    # failed release never reads as "nothing to release".
+    log "no commits on main since ${latest}; checking that the ${latest} release completed"
+    watch_release "${latest}" "${latest_commit}"
+    log "nothing to release: origin/main ${base:0:12} is ${latest}, and its release, publishers and cask are complete"
     exit 0
   fi
   log "${pending} commit(s) on main since ${latest}"
@@ -335,7 +396,11 @@ else
   next_patch="v${major}.${minor}.$((patch + 1))"
   next_minor="v${major}.$((minor + 1)).0"
   next_major="v$((major + 1)).0.0"
-  version="${version:-${next_patch}}"
+  # A release preparation already on main (an earlier run that failed after
+  # landing it) names the version; releasing another would duplicate it.
+  prepared="$(git log --format=%s "${latest_commit}..${base}" |
+    awk '/^chore\(release\): prepare v[0-9]+\.[0-9]+\.[0-9]+( \(#[0-9]+\))?$/ && !found { print $3; found = 1 }')"
+  version="${version:-${prepared:-${next_patch}}}"
   case "${version}" in
     "${next_patch}" | "${next_minor}" | "${next_major}") ;;
     *) refuse "${version} is not the smallest increment from ${latest}; use ${next_patch}, ${next_minor} or ${next_major}" ;;
@@ -349,8 +414,13 @@ else
     *) refuse "cannot read ${repo} releases to prove ${version} is unused" ;;
   esac
   log "version ${version} (latest ${latest})"
-  if git rev-parse --quiet --verify "refs/tags/${version}" >/dev/null; then
-    log "a local-only ${version} tag (never pushed, left by an earlier run) will be replaced"
+  # A local tag this script made records its object here until it is pushed,
+  # so a killed run's tag is replaced and nobody else's ever is.
+  tag_marker="${common_dir}/fast-lane/local-tag-${version}"
+  if local_tag="$(git rev-parse --quiet --verify "refs/tags/${version}")"; then
+    [[ -f "${tag_marker}" && "$(cat "${tag_marker}")" == "${local_tag}" ]] ||
+      refuse "a local-only ${version} tag exists that the release train did not make; if it is not another lane's, remove it (git tag -d ${version}) and re-run"
+    log "a local-only ${version} tag an earlier run made (never pushed) will be replaced"
   fi
 
   pins_active=false
@@ -537,6 +607,8 @@ else
   changelog_source="$(compose_changelog "${scratch}/CHANGELOG.base.md" "${scratch}/CHANGELOG.md")" ||
     refuse "cannot compose the ${version} CHANGELOG section"
   if [[ "${changelog_source}" == none ]]; then
+    log "only docs, tests or CI since ${latest}; checking that the ${latest} release completed"
+    watch_release "${latest}" "${latest_commit}"
     log "nothing to release: the ${pending} commit(s) since ${latest} change only docs, tests or CI, and CHANGELOG.md has no Unreleased entries"
     exit 0
   fi
@@ -545,7 +617,7 @@ else
     $0 ~ v { f = 1; print; next } f && /^## / { exit } f { print }
   ' "${scratch}/CHANGELOG.md" >"${scratch}/changelog-section.md"
   log "CHANGELOG section for ${version}:"
-  sed 's/^/    | /' "${scratch}/changelog-section.md"
+  sed "s/^/${prog}: | /" "${scratch}/changelog-section.md"
   guard_text changelog-section "${scratch}/changelog-section.md"
   guard_text release-note-subjects "${scratch}/subjects"
 fi
@@ -760,26 +832,36 @@ version_free "tagging ${version}"
 if [[ "${tagger}" == local ]]; then
   # Interim until the central tagger is live: the operator's registered
   # signing key signs, exactly as in RELEASING.md "Create the release tag".
+  # drop_local_tag: remove the local tag this run made, and its marker.
+  drop_local_tag() {
+    git tag -d "${version}" >/dev/null 2>&1 || true
+    rm -f -- "${tag_marker}"
+  }
   if git rev-parse --quiet --verify "refs/tags/${version}" >/dev/null; then
-    git tag -d "${version}" >/dev/null || fail "cannot remove the local-only ${version} tag an earlier run left"
-    log "removed a local-only ${version} tag an earlier run left (it was never pushed)"
+    git tag -d "${version}" >/dev/null || fail "cannot remove the local-only ${version} tag an earlier run made"
+    log "removed a local-only ${version} tag an earlier run made (it was never pushed)"
   fi
   git tag -s "${version}" "${sha}" -m "${version}" </dev/null 2>"${scratch}/tag.err" || {
-    git tag -d "${version}" >/dev/null 2>&1 || true
+    drop_local_tag
     fail "git tag -s ${version} failed: $(tail -1 "${scratch}/tag.err")"
   }
+  if ! { mkdir -p "${tag_marker%/*}" && git rev-parse "refs/tags/${version}" >"${tag_marker}"; }; then
+    drop_local_tag
+    fail "cannot record the local ${version} tag at ${tag_marker}; removed it"
+  fi
   scripts/verify-release-signing-key.sh --verify-tag "${version}" >"${scratch}/verify-tag.log" 2>&1 </dev/null || {
-    git tag -d "${version}" >/dev/null 2>&1 || true
+    drop_local_tag
     fail "the local tag ${version} does not verify ($(tail -1 "${scratch}/verify-tag.log")); removed it"
   }
   if ! git push --quiet origin "refs/tags/${version}" 2>"${scratch}/push-tag.err"; then
     target="$(remote_tag_target)" || target=''
     if [[ "${target}" != "${sha}" ]]; then
-      git tag -d "${version}" >/dev/null 2>&1 || true
+      drop_local_tag
       fail "pushing tag ${version} failed ($(tail -1 "${scratch}/push-tag.err")); removed the local tag so the next run can retry"
     fi
     log "the tag push reported an error, but origin has ${version} at ${sha:0:12}"
   fi
+  rm -f -- "${tag_marker}"
 else
   gh_read "dispatch the central tagging workflow" workflow run "${tagger_workflow}" -R "${tagger_repo}" \
     -f repository=donmai -f sha="${sha}" -f version="${version}" >/dev/null ||
@@ -814,44 +896,5 @@ if [[ "${watch}" == false ]]; then
   log "tagged ${version} at ${sha:0:12}; not watching (--no-watch)"
   exit 0
 fi
-run_ids=()
-for workflow in "${watched_workflows[@]}"; do
-  deadline=$((SECONDS + 300))
-  while :; do
-    runs="$(gh_read "list the ${workflow} runs" run list -R "${repo}" --workflow "${workflow}" --limit 20 \
-      --json databaseId,headSha,headBranch)" || fail "cannot find the ${workflow} run for ${version}"
-    run_id="$(jq -r --arg sha "${sha}" --arg tag "${version}" \
-      '[.[] | select(.headSha == $sha and .headBranch == $tag)] | first | .databaseId // ""' <<<"${runs}")"
-    [[ -z "${run_id}" ]] || break
-    [[ ${SECONDS} -lt ${deadline} ]] || fail "no ${workflow} run appeared for ${version} within 5 minutes"
-    sleep "${poll_seconds}"
-  done
-  run_ids+=("${run_id}")
-done
-index=0
-for workflow in "${watched_workflows[@]}"; do
-  run_id="${run_ids[${index}]}"
-  index=$((index + 1))
-  log "watching ${workflow} run ${run_id}"
-  gh run watch "${run_id}" -R "${repo}" --exit-status --interval 30 >"${scratch}/watch.log" 2>&1 </dev/null ||
-    fail "${workflow} run ${run_id} for ${version} did not succeed ($(tail -1 "${scratch}/watch.log")): https://github.com/${repo}/actions/runs/${run_id}"
-  log "${workflow} run ${run_id} succeeded"
-done
-release_json="$(gh_read "read the ${version} release" api "repos/${repo}/releases/tags/${version}")" ||
-  fail "the ${repo} ${version} release is missing"
-[[ "$(jq -r 'if .draft == false then .tag_name else "" end' <<<"${release_json}")" == "${version}" ]] ||
-  fail "the ${repo} ${version} release is still a draft"
-log "${repo} ${version} is published"
-deadline=$((SECONDS + 600))
-while :; do
-  cask_json="$(gh_read "read ${tap_repo}/${cask_path}" api "repos/${tap_repo}/contents/${cask_path}")" ||
-    fail "cannot read the Homebrew cask"
-  cask="$(jq -r '.content // "" | gsub("\n"; "")' <<<"${cask_json}" | base64 --decode 2>/dev/null)" || cask=''
-  if grep -q "version \"${version#v}\"" <<<"${cask}"; then
-    break
-  fi
-  [[ ${SECONDS} -lt ${deadline} ]] || fail "${tap_repo}/${cask_path} did not move to ${version} within 10 minutes"
-  sleep "${poll_seconds}"
-done
-log "${tap_repo}/${cask_path} is at ${version}"
+watch_release "${version}" "${sha}"
 log "released ${version} at ${sha:0:12}; total $(((SECONDS - started) / 60))m$(((SECONDS - started) % 60))s"

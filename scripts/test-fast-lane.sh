@@ -10,6 +10,9 @@
 #   - release publishes only when main has unreleased work, lands the
 #     release preparation through the same attested path, tags that SHA,
 #     watches every publisher, and survives a re-run after a failure;
+#   - with no new work, release says "nothing to release" only when the
+#     latest tag's publishers, GitHub release and cask are all complete, and
+#     otherwise resumes the watch and fails;
 #   - each gate, switch re-read and version re-check stops the run when red.
 # Run from scripts/test-release-workflows.sh (CI: release-contracts).
 set -euo pipefail
@@ -57,7 +60,7 @@ export HOME="${temp_dir}/home"
 export GIT_CONFIG_GLOBAL="${temp_dir}/gitconfig"
 export GIT_CONFIG_NOSYSTEM=1
 unset MAKEFLAGS GOFLAGS GH_TOKEN
-export FAST_LANE_POLL_SECONDS=1
+export FAST_LANE_POLL_SECONDS=1 FAST_LANE_RUN_WAIT_SECONDS=2 FAST_LANE_CASK_WAIT_SECONDS=2
 
 mkdir -p "${temp_dir}/bin"
 cat >"${temp_dir}/bin/gh" <<'FAKE_GH'
@@ -90,6 +93,7 @@ case "$1" in
       workflow=''
       while [[ $# -gt 0 ]]; do [[ "$1" != --workflow ]] || workflow="$2"; shift; done
       case "${workflow}" in release.yml) id=101 ;; worker-image.yml) id=102 ;; *) id=103 ;; esac
+      [[ ! -f "$d/runs-missing-${workflow}" ]] || { echo '[]'; exit 0; }
       git --git-dir "${origin}" for-each-ref --format='%(refname:short)' 'refs/tags/v*' |
         while read -r tag; do
           jq -cn --argjson id "${id}" --arg sha "$(tag_commit "${tag}")" --arg tag "${tag}" \
@@ -124,8 +128,11 @@ case "${method} ${endpoint}" in
   "GET user") echo '{"login":"operator"}' ;;
   "GET repos/RenseiAI/donmai/releases/tags/"*)
     tag="${endpoint##*/}"
+    [[ ! -f "$d/release-missing" ]] || not_found
     [[ -f "$d/release-exists" ]] || tag_commit "${tag}" >/dev/null || not_found
-    jq -cn --arg tag "${tag}" '{draft:false,tag_name:$tag}' ;;
+    draft=false
+    [[ ! -f "$d/release-draft" ]] || draft=true
+    jq -cn --arg tag "${tag}" --argjson draft "${draft}" '{draft:$draft,tag_name:$tag}' ;;
   "GET repos/RenseiAI/donmai/git/ref/tags/"*)
     tag="${endpoint##*/}"
     object="$(git --git-dir "${origin}" rev-parse --verify --quiet "refs/tags/${tag}")" || not_found
@@ -157,8 +164,11 @@ case "${method} ${endpoint}" in
       jq -cn --arg sha "$sha" '{sha:$sha,statuses:[]}'
     fi ;;
   "GET repos/RenseiAI/homebrew-tap/contents/Casks/donmai.rb")
-    newest="$(git --git-dir "${origin}" for-each-ref --sort=-creatordate --count=1 --format='%(refname:short)' 'refs/tags/v*')"
-    printf 'cask "donmai" do\n  version "%s"\nend\n' "${newest#v}" | base64 | jq -Rsc '{content:.}' ;;
+    # The cask follows the highest release tag, unless a case holds it back.
+    newest="$(git --git-dir "${origin}" for-each-ref --format='%(refname:short)' 'refs/tags/v*' |
+      sed 's/^v//' | sort -t. -k1,1n -k2,2n -k3,3n | tail -1)"
+    [[ ! -f "$d/cask-version" ]] || newest="$(cat "$d/cask-version")"
+    printf 'cask "donmai" do\n  version "%s"\nend\n' "${newest}" | base64 | jq -Rsc '{content:.}' ;;
   *) echo "UNEXPECTED gh api ${method} ${endpoint}" >>"$d/unexpected"; exit 64 ;;
 esac
 FAKE_GH
@@ -204,6 +214,7 @@ HOOK
   git clone --quiet "${origin}" "${primary}" 2>/dev/null
   mkdir -p "${primary}/scripts"
   cp "${root_dir}/scripts/guard-b-lint.sh" "${root_dir}/scripts/verify-release-authority.sh" "${primary}/scripts/"
+  cp "${subject}" "${primary}/scripts/fast-lane.sh"
   # Stubs for the gates and helpers; each can be turned red from the case.
   cat >"${primary}/scripts/guard-b-lint-selftest.sh" <<'STUB'
 #!/usr/bin/env bash
@@ -332,7 +343,7 @@ assert_unchanged() {
     fail_case 'the repository changed' "${fx}/out"
     return 1
   fi
-  if grep -Eq -- '--method POST|^workflow run|^pr comment|^run watch' "${FAKE_GH_DIR}/calls" 2>/dev/null; then
+  if grep -Eq -- '--method POST|^workflow run|^pr comment' "${FAKE_GH_DIR}/calls" 2>/dev/null; then
     fail_case 'a refused or dry run wrote to GitHub' "${FAKE_GH_DIR}/calls"
     return 1
   fi
@@ -422,6 +433,14 @@ tagger_malformed() {
 key_not_ready() { export FAKE_SIGNING_KEY_EXIT=1; }
 no_tag_right() { jq -c '.current_user_can_bypass = "never"' "${FAKE_GH_DIR}/ruleset-1.json" >"${FAKE_GH_DIR}/r" && mv "${FAKE_GH_DIR}/r" "${FAKE_GH_DIR}/ruleset-1.json"; }
 stale_scripts() { printf '# edited\n' >>"${primary}/scripts/check-no-inbound-attach.sh"; }
+# stale_self: main moved on to a newer fast-lane.sh than the one running.
+stale_self() {
+  printf '# newer\n' >>"${primary}/scripts/fast-lane.sh"
+  git -C "${primary}" commit --quiet -am 'chore(release): newer train script'
+  git -C "${primary}" push --quiet origin main
+}
+# foreign_local_tag: a local v0.1.1 this script did not make (another lane's).
+foreign_local_tag() { git -C "${primary}" tag -a v0.1.1 -m 'manual' v0.1.0; }
 # push_main <subject> [file content]: lands a commit on origin main from the
 # primary checkout, as a reviewed pull request would.
 push_main() {
@@ -675,8 +694,10 @@ new_fixture
 tag_origin v0.1.1 main
 before="$(snapshot)"
 run_subject "${primary}" release
-if [[ "${code}" != 0 ]] || ! grep -Fq "nothing to release: origin/main $(origin_main | cut -c1-12) is v0.1.1" "${fx}/out"; then
+if [[ "${code}" != 0 ]] || ! grep -Fq "nothing to release: origin/main $(origin_main | cut -c1-12) is v0.1.1, and its release, publishers and cask are complete" "${fx}/out"; then
   fail_case "exit ${code}, want 0 with nothing to release" "${fx}/out"
+elif [[ "$(grep -c '^run watch 10[123] ' "${FAKE_GH_DIR}/calls")" != 3 ]]; then
+  fail_case 'the latest release was not checked before nothing to release' "${FAKE_GH_DIR}/calls"
 else
   assert_unchanged "${before}" && pass_case
 fi
@@ -699,6 +720,8 @@ expect_refusal release 'switch off' 3 "the organization FAST_LANE variable is 'o
 expect_refusal release 'a repository variable exists' 3 "a repository-level FAST_LANE variable exists (value 'on')" switch_both_on
 expect_refusal release 'not an admin' 3 'is not an admin' not_admin
 expect_refusal release "scripts that are not main's" 3 "the release train runs main's own scripts" stale_scripts
+expect_refusal release "a running script that is not main's" 3 "differs from origin/main's scripts/fast-lane.sh" stale_self
+expect_refusal release "another lane's local tag" 3 'a local-only v0.1.1 tag exists that the release train did not make' foreign_local_tag
 expect_refusal release 'version leap' 3 'is not the smallest increment from v0.1.0' none --version v0.3.0
 expect_refusal release 'release exists' 3 'RenseiAI/donmai already has a v0.1.1 release' release_exists
 expect_refusal release 'pins set, local signing' 3 'use --tagger central' pins_set --tagger local
@@ -727,8 +750,12 @@ elif expect_output 'CHANGELOG v0.1.1 section: composed' '| - Keep the stable cop
   'would check out origin/main' 'would run the gates: guard, lint, test-tagged, test-podman, build' \
   'then sign and push tag v0.1.1 at that SHA' 'would watch release.yml worker-image.yml e2b-template.yml' \
   'dry run complete: nothing was changed'; then
-  if grep -Eq '^    \|.*(\(#[0-9]+\)|No unreleased changes)' "${fx}/out"; then
+  if grep -Eq '^fast-lane release: \|.*(\(#[0-9]+\)|No unreleased changes)' "${fx}/out"; then
     fail_case 'the composed section kept a PR number or the placeholder' "${fx}/out"
+  elif grep -qv '^fast-lane release: ' "${fx}/out"; then
+    # Every line carries the label, so a caller can anchor on it: a section
+    # entry that quotes "nothing to release" can never read as the verdict.
+    fail_case 'an output line lacks the program label' "${fx}/out"
   else
     assert_unchanged "${before}" && pass_case
   fi
@@ -770,7 +797,7 @@ run_subject "${primary}" release
 if [[ "${code}" != 0 ]]; then
   fail_case "exit ${code}" "${fx}/out"
 elif check_released "${old_main}"; then
-  if ! git --git-dir "${origin}" cat-file tag v0.1.1 | grep -q -- '-----BEGIN SSH SIGNATURE-----'; then
+  if ! grep -q -- '-----BEGIN SSH SIGNATURE-----' <<<"$(git --git-dir "${origin}" cat-file tag v0.1.1)"; then
     fail_case 'tag v0.1.1 is not SSH-signed' "${fx}/out"
   elif [[ "$(grep -c '^run watch 10[123] ' "${FAKE_GH_DIR}/calls")" != 3 ]]; then
     fail_case 'not every publisher run was watched' "${FAKE_GH_DIR}/calls"
@@ -822,8 +849,8 @@ landed="$(origin_main)"
 if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: pushing tag v0.1.1 failed' "${fx}/out" ||
   ! grep -Fq 'removed the local tag so the next run can retry' "${fx}/out"; then
   fail_case "exit ${code}, want 1 with a failed tag push" "${fx}/out"
-elif [[ -n "$(git -C "${primary}" tag --list v0.1.1)" ]]; then
-  fail_case 'the failed tag push left a local tag' "${fx}/out"
+elif [[ -n "$(git -C "${primary}" tag --list v0.1.1)" || -e "${primary}/.git/fast-lane/local-tag-v0.1.1" ]]; then
+  fail_case 'the failed tag push left a local tag or its marker' "${fx}/out"
 elif [[ "${landed}" == "${old_main}" ]]; then
   fail_case 'the release preparation did not land before the tag step' "${fx}/out"
 else
@@ -843,12 +870,16 @@ fi
 case_name='release: a local-only tag left by a killed run is replaced'
 new_fixture
 git -C "${primary}" tag -a v0.1.1 -m v0.1.1 v0.1.0
+mkdir -p "${primary}/.git/fast-lane"
+git -C "${primary}" rev-parse refs/tags/v0.1.1 >"${primary}/.git/fast-lane/local-tag-v0.1.1"
 run_subject "${primary}" release --no-watch
 if [[ "${code}" != 0 ]]; then
   fail_case "exit ${code}" "${fx}/out"
 elif [[ "$(origin_tag v0.1.1)" != "$(origin_main)" ]]; then
   fail_case 'origin v0.1.1 does not point at the release' "${fx}/out"
-elif expect_output 'removed a local-only v0.1.1 tag an earlier run left'; then
+elif [[ -e "${primary}/.git/fast-lane/local-tag-v0.1.1" ]]; then
+  fail_case 'the local-tag marker outlived the pushed tag' "${fx}/out"
+elif expect_output 'removed a local-only v0.1.1 tag an earlier run made'; then
   pass_case
 fi
 
@@ -963,6 +994,107 @@ else
   pass_case
 fi
 
+# --- release: no new work, but the latest release did not finish ---------------
+
+# expect_incomplete <name> <want> <setup>: v0.1.1 is tagged at main, so there
+# is nothing new; the setup leaves part of its release unfinished. The run
+# must fail with <want>, never say "nothing to release", and change nothing.
+expect_incomplete() {
+  local name=$1 want=$2 setup=$3 before
+  case_name="release: nothing new, ${name}"
+  new_fixture
+  tag_origin v0.1.1 main
+  "${setup}"
+  before="$(snapshot)"
+  run_subject "${primary}" release
+  if [[ "${code}" != 1 ]] || ! grep -Fq -- "FAILED: ${want}" "${fx}/out"; then
+    fail_case "exit ${code}, want 1 with: FAILED: ${want}" "${fx}/out"
+  elif grep -Fq 'nothing to release' "${fx}/out"; then
+    fail_case 'an unfinished release read as nothing to release' "${fx}/out"
+  elif ! grep -Fq 'checking that the v0.1.1 release completed' "${fx}/out"; then
+    fail_case 'the latest release was not checked' "${fx}/out"
+  else
+    assert_unchanged "${before}" && pass_case
+  fi
+}
+release_missing() { : >"${FAKE_GH_DIR}/release-missing"; }
+release_draft() { : >"${FAKE_GH_DIR}/release-draft"; }
+release_run_failed() { : >"${FAKE_GH_DIR}/run-fail-101"; }
+image_run_failed() { : >"${FAKE_GH_DIR}/run-fail-102"; }
+template_run_missing() { : >"${FAKE_GH_DIR}/runs-missing-e2b-template.yml"; }
+cask_behind() { printf '0.1.0\n' >"${FAKE_GH_DIR}/cask-version"; }
+expect_incomplete 'the GitHub release is missing' 'the RenseiAI/donmai v0.1.1 release is missing' release_missing
+expect_incomplete 'the GitHub release is a draft' 'the RenseiAI/donmai v0.1.1 release is still a draft' release_draft
+expect_incomplete 'the release run failed' 'release.yml run 101 for v0.1.1 did not succeed' release_run_failed
+expect_incomplete 'the worker-image run failed' 'worker-image.yml run 102 for v0.1.1 did not succeed' image_run_failed
+expect_incomplete 'no e2b-template run' 'no e2b-template.yml run appeared for v0.1.1' template_run_missing
+expect_incomplete 'the cask is behind' 'RenseiAI/homebrew-tap/Casks/donmai.rb did not move to v0.1.1' cask_behind
+
+case_name='release: only docs since an unfinished release still fails'
+new_fixture
+tag_origin v0.1.1 main
+push_main 'docs: fix a typo'
+: >"${FAKE_GH_DIR}/release-draft"
+before="$(snapshot)"
+run_subject "${primary}" release
+if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: the RenseiAI/donmai v0.1.1 release is still a draft' "${fx}/out" ||
+  grep -Fq 'nothing to release' "${fx}/out"; then
+  fail_case "exit ${code}, want 1 with the draft release" "${fx}/out"
+else
+  assert_unchanged "${before}" && pass_case
+fi
+
+# The whole story: the watch fails after the tag, the operator re-runs the
+# failed jobs, and the next train finishes that release without a new one.
+case_name='release: a re-run resumes a release whose publisher failed after the tag'
+new_fixture
+: >"${FAKE_GH_DIR}/run-fail-103"
+run_subject "${primary}" release
+released="$(origin_main)"
+if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: e2b-template.yml run 103 for v0.1.1 did not succeed' "${fx}/out" ||
+  ! grep -Fq 'gh run rerun 103 --failed' "${fx}/out"; then
+  fail_case "exit ${code}, want 1 with the failed e2b-template run" "${fx}/out"
+elif [[ "$(origin_tag v0.1.1)" != "${released}" ]]; then
+  fail_case 'the first run did not tag the release' "${fx}/out"
+else
+  run_subject "${primary}" release
+  if [[ "${code}" != 1 ]] || grep -Fq 'nothing to release' "${fx}/out"; then
+    fail_case "still failing: exit ${code}, want 1 without nothing to release" "${fx}/out"
+  else
+    rm -f "${FAKE_GH_DIR}/run-fail-103"
+    run_subject "${primary}" release
+    if [[ "${code}" != 0 ]] || ! grep -Fq 'v0.1.1, and its release, publishers and cask are complete' "${fx}/out"; then
+      fail_case "after the re-run jobs: exit ${code}, want 0 with a complete v0.1.1" "${fx}/out"
+    elif [[ "$(origin_main)" != "${released}" || -n "$(origin_tag v0.1.2)" ]]; then
+      fail_case 'the resumed run landed or tagged something new' "${fx}/out"
+    else
+      pass_case
+    fi
+  fi
+fi
+
+# A release preparation already on main keeps its version on the re-run.
+case_name='release: a re-run keeps the version of the release preparation on main'
+new_fixture
+: >"${FAKE_GH_DIR}/reject-tag-push"
+run_subject "${primary}" release --version v0.2.0 --no-watch
+landed="$(origin_main)"
+rm -f "${FAKE_GH_DIR}/reject-tag-push"
+if [[ "${code}" != 1 || "$(git --git-dir "${origin}" log -1 --format=%s main)" != 'chore(release): prepare v0.2.0' ]]; then
+  fail_case "first run exit ${code}, want 1 after landing the v0.2.0 preparation" "${fx}/out"
+else
+  run_subject "${primary}" release --no-watch
+  if [[ "${code}" != 0 ]]; then
+    fail_case "re-run exit ${code}" "${fx}/out"
+  elif [[ "$(origin_tag v0.2.0)" != "${landed}" || -n "$(origin_tag v0.1.1)" ]]; then
+    fail_case 'the re-run did not tag the prepared v0.2.0' "${fx}/out"
+  elif [[ "$(origin_main)" != "${landed}" ]]; then
+    fail_case 'the re-run landed a second preparation' "${fx}/out"
+  else
+    pass_case
+  fi
+fi
+
 # --- source ----------------------------------------------------------------------
 
 # This repository is public: the script may name only the public repositories
@@ -978,7 +1110,7 @@ fi
 
 # --- make -------------------------------------------------------------------------
 
-case_name='make ship and make release pass only explicit inputs, shell-quoted'
+case_name='make ship and make release pass only command-line inputs, shell-quoted'
 make_ship="$(make -s -n -C "${root_dir}" ship TITLE='feat: widget' FULL=1 DRY_RUN=1)"
 make_release="$(make -s -n -C "${root_dir}" release VERSION=v1.2.3 TAGGER=central FULL=1 DRY_RUN=1 NO_WATCH=1)"
 title_with_quotes="feat: a \"quoted\" \`title\`"
@@ -992,6 +1124,9 @@ elif [[ "${make_release}" != "./scripts/fast-lane.sh release --version \"\$VERSI
 elif [[ "$(make -s -n -C "${root_dir}" ship | sed 's/[[:space:]]*$//')" != './scripts/fast-lane.sh ship' ||
   "$(make -s -n -C "${root_dir}" release | sed 's/[[:space:]]*$//')" != './scripts/fast-lane.sh release' ]]; then
   fail_case 'a plain make ship or make release passed flags nobody asked for' ''
+elif [[ "$(env VERSION=v9.9.9 TAGGER=central NO_WATCH=1 FULL=1 DRY_RUN=1 make -s -n -C "${root_dir}" release | sed 's/[[:space:]]*$//')" != './scripts/fast-lane.sh release' ||
+  "$(env TITLE=x FULL=1 DRY_RUN=1 make -s -n -C "${root_dir}" ship | sed 's/[[:space:]]*$//')" != './scripts/fast-lane.sh ship' ]]; then
+  fail_case 'make passed values from the environment, not the command line' ''
 elif [[ "${quoted}" != "$(printf '[ship]\n[--title]\n[%s]' "${title_with_quotes}")" ]]; then
   printf '%s\n' "${quoted}" >"${temp_dir}/make.out"
   fail_case 'make ship broke a quoted title' "${temp_dir}/make.out"

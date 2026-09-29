@@ -442,11 +442,14 @@ change. The release train moves them into the version section.
 The policy is one release a day, at midnight `America/New_York`, and only when
 there is unreleased work: `main` has commits since the latest `v*` tag. Run
 the train from a scheduler (a launchd job or cron) on the operator's host.
-Update the checkout first: the train refuses to run with a copy of its scripts
-that differs from `origin/main`.
+Update the checkout first: the train refuses to run with a copy of its scripts,
+or a `fast-lane.sh`, that differs from `origin/main`. Fetch and fast-forward,
+which also works on a worktree branch with no upstream:
 
 ```bash
-git -C <checkout> pull --ff-only --quiet && make -C <checkout> release
+git -C <checkout> fetch --quiet origin main &&
+  git -C <checkout> merge --ff-only --quiet origin/main &&
+  make -C <checkout> release
 ```
 
 For a manual run:
@@ -458,24 +461,42 @@ make release VERSION=v0.73.0  # a minor release
 make release NO_WATCH=1       # stop after the tag
 ```
 
-The command is non-interactive. It exits 0 when it released or when there
-was nothing to release. It exits non-zero with a `FAILED:` or `REFUSED:` line
-on anything else. `scripts/fast-lane.sh release` then:
+Only values given on the `make` command line count; a `VERSION` or `TAGGER`
+left in the environment is ignored. The command is non-interactive. It exits 0
+when it released, or when there was nothing to release and the latest release
+is complete. It exits non-zero with a `FAILED:` or `REFUSED:` line on anything
+else. `scripts/fast-lane.sh release` then:
 
 1. **Preflight**, read-only (exit 3 on a refusal):
    - the lane is on;
    - the `gh` login is an admin;
-   - this checkout's `scripts/` equal `origin/main`'s.
+   - this checkout's `scripts/`, and the running `fast-lane.sh`, equal
+     `origin/main`'s.
 
-   It exits 0 with "nothing to release" when either of these holds:
+   There is nothing new to release when either of these holds:
    - `main` has no commits since the latest `origin` tag;
    - the only new commits are `docs`, `test` or `ci` commits, and
      `CHANGELOG.md` has no Unreleased entries.
 
+   Then the train finishes the latest release instead: it runs the same watch
+   as step 6 for the latest tag. A run that already finished answers at once.
+   It prints "nothing to release" and exits 0 only when all of these are
+   complete:
+   - the tag's `release.yml`, `worker-image.yml` and `e2b-template.yml` runs
+     succeeded;
+   - the GitHub release is published;
+   - the cask is at that version.
+
+   Otherwise it exits 1 with a `FAILED:` line naming what is unfinished. A
+   release that failed after its tag therefore fails every run until it is
+   fixed. It is never reported as "nothing to release".
+
    Then the version and the tag signer:
    - The version is the next patch from the latest `origin` tag, or
-     `VERSION=` as the smallest minor or major increment. It must have no tag
-     and no GitHub release yet.
+     `VERSION=` as the smallest minor or major increment. When `main` already
+     holds a `chore(release): prepare vX.Y.Z` commit since that tag, left by
+     a run that failed after landing it, the default is that version. It must
+     have no tag and no GitHub release yet.
    - With the local signer:
      - the signing-key preflight passes;
      - `verify-release-authority.sh --audit-policy` proves that this login
@@ -527,13 +548,20 @@ on anything else. `scripts/fast-lane.sh release` then:
 Re-running after a failure is safe:
 - Nothing lands unless every earlier step passed.
 - If `main` already carries the version's section, from a run that failed
-  after landing, the train tags `main` as it is.
-- A failed tag push removes its local tag, and the train replaces a local-only
-  tag that a killed run left behind.
+  after landing, the train tags `main` as it is, under that version.
+- A failed tag push removes its local tag. The train records each local tag it
+  makes until the tag is pushed, so it replaces its own tag that a killed run
+  left behind. It refuses any other local-only tag of that version, which may
+  be another operator's.
+- A failure after the tag, such as a publisher run, the release or the cask,
+  is picked up by the next run, as described in step 1.
 
-A published tag is never moved. If the tag, a publisher or the signature
-check fails after the tag exists, fix the cause, then either retry the
-publisher (below) or release the next patch.
+A published tag is never moved. If a publisher run fails after the tag exists,
+re-run its failed jobs with `gh run rerun <run-id> --failed`. That keeps the
+tag-push policy that advances Latest and the cask; a manual retry through
+`workflow_dispatch` (below) skips the cask, and the train does not count it.
+Alternatively, release the next patch. If the signature check fails, the fix
+is the next patch.
 
 ## Retry a release workflow
 

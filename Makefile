@@ -51,17 +51,20 @@ test-podman:
 # Values reach the script through the environment ("$$TITLE"), so the shell,
 # not make, quotes them: a title may hold quotes or backticks (make itself still
 # expands `$`, so write `$$` for a literal one).
+# Only values given on the make command line count: a VERSION or TITLE left
+# in the caller's environment never reaches the script.
 FAST_LANE_SH ?= ./scripts/fast-lane.sh
-FAST_LANE_COMMON = $(if $(filter 1 true yes,$(FULL)),--full) \
-	$(if $(filter 1 true yes,$(DRY_RUN)),--dry-run)
+fast_lane_arg = $(if $(filter command line,$(origin $(1))),$($(1)))
+FAST_LANE_COMMON = $(if $(filter 1 true yes,$(call fast_lane_arg,FULL)),--full) \
+	$(if $(filter 1 true yes,$(call fast_lane_arg,DRY_RUN)),--dry-run)
 
 ship:
-	$(FAST_LANE_SH) ship $(strip $(if $(TITLE),--title "$$TITLE") $(FAST_LANE_COMMON))
+	$(FAST_LANE_SH) ship $(strip $(if $(call fast_lane_arg,TITLE),--title "$$TITLE") $(FAST_LANE_COMMON))
 
 release:
-	$(FAST_LANE_SH) release $(strip $(if $(VERSION),--version "$$VERSION") \
-		$(if $(TAGGER),--tagger "$$TAGGER") $(FAST_LANE_COMMON) \
-		$(if $(filter 1 true yes,$(NO_WATCH)),--no-watch))
+	$(FAST_LANE_SH) release $(strip $(if $(call fast_lane_arg,VERSION),--version "$$VERSION") \
+		$(if $(call fast_lane_arg,TAGGER),--tagger "$$TAGGER") $(FAST_LANE_COMMON) \
+		$(if $(filter 1 true yes,$(call fast_lane_arg,NO_WATCH)),--no-watch))
 
 # test-tagged type-checks every build-tag-gated test file in the repo.
 #
