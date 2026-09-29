@@ -313,6 +313,22 @@ type Options struct {
 	// retained operational payload bytes. It is mutually exclusive with the
 	// legacy single selectors.
 	ProtectedRuntimeMCPDualSelectionPolicy ProtectedRuntimeMCPDualSelectionPolicy
+
+	// TurnContinuationLimit bounds the runner-driven follow-up turns of work
+	// that owes a pull request (turn_continuation.go): how many "continue the
+	// task" prompts a turn that stopped early gets and, separately, how many
+	// retries a turn that ended on a model provider error gets. A turn still
+	// unfinished after that fails the session. Zero uses
+	// DefaultTurnContinuationLimit; negative disables both, leaving only the
+	// single pull request nudge.
+	TurnContinuationLimit int
+
+	// RescueDir is where teardown archives a session's unpublished work —
+	// uncommitted changes and commits no remote holds — as a patch before it
+	// deletes the workarea (<RescueDir>/<session>/<time>-<id>/<repository>.patch).
+	// Empty uses a "rescue" directory beside the worktree parent. When the
+	// archive cannot be written the workarea is kept instead.
+	RescueDir string
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -376,6 +392,18 @@ type Runner struct {
 	protectedRuntimeMCPSelector   ProtectedRuntimeMCPSelector
 	protectedRuntimeMCPV2Selector ProtectedRuntimeMCPV2Selector
 	selectionPolicy               protectedRuntimeMCPSelectionPolicy
+
+	// rescueDir is Options.RescueDir (see rescueRoot for the default).
+	rescueDir string
+	// turnContinuationLimit is Options.TurnContinuationLimit.
+	turnContinuationLimit int
+	// providerRetryBackoff spaces provider-error retries; nil uses
+	// defaultProviderRetryBackoff. Tests substitute a zero wait.
+	providerRetryBackoff func(attempt int) time.Duration
+	// pullRequestLookup reads refs from the session checkout's origin for
+	// the session pull request verifier. Nil uses `git ls-remote origin`;
+	// tests wrap it to observe lookups.
+	pullRequestLookup pullRequestRefLookup
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -450,6 +478,8 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPSelector:   selectionPolicy.v1,
 		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
 		selectionPolicy:               selectionPolicy,
+		rescueDir:                     opts.RescueDir,
+		turnContinuationLimit:         opts.TurnContinuationLimit,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()
@@ -554,6 +584,13 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 	// here own the result envelope + post-Run teardown.
 	res, runErr := r.runLoop(runCtx, qw, startedAt, admission)
 	teardownRequired := shouldTeardown(res, r.preserveOnFail, r.preserveAlways)
+	// Never delete work that exists nowhere else. An interactive session has
+	// its own publication check below, which retains an unpublished workarea.
+	retainUnpreserved := false
+	if teardownRequired && !qw.isInteractive() && !r.preserveUnpublishedWork(qw, res) {
+		teardownRequired = false
+		retainUnpreserved = true
+	}
 	leaseAcquired := false
 	leasePrepared := false
 	interactiveDisposition := qw.isInteractive() && res.Status == "completed" && teardownRequired
@@ -586,7 +623,7 @@ func (r *Runner) run(ctx context.Context, qw QueuedWork, admission *HarnessAdmis
 			} else {
 				terminalResultID = computedTerminalResultID
 				disposition := "destroy"
-				if r.preserveAlways {
+				if r.preserveAlways || retainUnpreserved {
 					disposition = "archive"
 				}
 				acquireSpec := workarea.AcquireSpec{

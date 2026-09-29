@@ -85,6 +85,16 @@ func (SystemEvent) isAgentEvent()   {}
 // the local event log.
 const SystemSubtypeToolCallRefusedOutputLimit = "tool_call_refused_output_limit"
 
+// SystemSubtypeProviderError is the SystemEvent subtype a harness emits when
+// a model call ended on a provider error (a gateway 503/504, an overloaded or
+// unreachable model) and the harness did not recover within the turn — the
+// turn is about to end on that error rather than because the agent stopped.
+// It is an observation, not a terminal: the turn still ends with its
+// ResultEvent. Message carries the provider's error text. A later assistant
+// message or tool call in the same turn means the model recovered. The runner
+// retries such a turn rather than nudging it (runner/turn_continuation.go).
+const SystemSubtypeProviderError = "provider_error"
+
 // SystemSubtypeReasoningEffort is the SystemEvent subtype the runner emits
 // once per session, after spawn and before any turn output, recording the
 // reasoning effort it requested from the harness. Message carries the

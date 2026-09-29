@@ -35,6 +35,13 @@ type verdictScriptTurn struct {
 	// removeManifest deletes the manifest file before the turn's events, as a
 	// worktree clean during a follow-up turn would.
 	removeManifest bool
+	// files are written into the session worktree (path relative to it)
+	// before the turn's events, as work the agent left uncommitted.
+	files map[string]string
+	// providerError ends the turn on a model provider error: after the text,
+	// the turn emits the provider-error observation before its clean
+	// terminal, as the pi harness does when its own retries give up.
+	providerError string
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -46,10 +53,12 @@ type verdictScriptProvider struct {
 	agent.HarnessProvider
 	t     *testing.T
 	turns []verdictScriptTurn
+	// prompts records every follow-up prompt injected into the session.
+	prompts []string
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
-	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64)}
+	h := &verdictScriptHandle{t: p.t, cwd: spec.Cwd, turns: p.turns, events: make(chan agent.Event, 64), prompts: &p.prompts}
 	h.events <- agent.InitEvent{SessionID: "scripted-session"}
 	h.play()
 	return h, nil
@@ -67,17 +76,20 @@ type verdictScriptHandle struct {
 	mu     sync.Mutex
 	closed bool
 	events chan agent.Event
+	// prompts records every follow-up prompt the runner injected.
+	prompts *[]string
 }
 
 func (h *verdictScriptHandle) SessionID() string          { return "scripted-session" }
 func (h *verdictScriptHandle) Events() <-chan agent.Event { return h.events }
 func (h *verdictScriptHandle) Stop(context.Context) error { h.closeEvents(); return nil }
-func (h *verdictScriptHandle) Inject(context.Context, string) error {
+func (h *verdictScriptHandle) Inject(_ context.Context, text string) error {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	if h.closed || h.next >= len(h.turns) {
 		return errors.New("scripted: no turn left to play")
 	}
+	*h.prompts = append(*h.prompts, text)
 	h.playLocked()
 	return nil
 }
@@ -112,8 +124,20 @@ func (h *verdictScriptHandle) playLocked() {
 			h.t.Errorf("remove turn-result manifest: %v", err)
 		}
 	}
+	for path, content := range turn.files {
+		full := filepath.Join(h.cwd, path)
+		if err := os.MkdirAll(filepath.Dir(full), 0o750); err != nil {
+			h.t.Errorf("mkdir for %s: %v", path, err)
+		}
+		if err := os.WriteFile(full, []byte(content), 0o600); err != nil {
+			h.t.Errorf("write %s: %v", path, err)
+		}
+	}
 	if turn.text != "" {
 		h.events <- agent.AssistantTextEvent{Text: turn.text}
+	}
+	if turn.providerError != "" {
+		h.events <- agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: turn.providerError}
 	}
 	if turn.crash {
 		h.events <- agent.ErrorEvent{Message: "provider crashed mid turn"}
@@ -140,10 +164,68 @@ const (
 	failedManifest  = `{"schemaVersion":1,"verdict":"failed","summary":"` + manifestSummary + `"}`
 )
 
-// runScripted runs one development session against the scripted turns and
-// returns the terminal envelope. inject, when non-empty, arms a runtime memory
-// inject the heartbeat delivers so the runner drains it as a follow-up turn.
+// runScripted runs one session against the scripted turns and returns the
+// terminal envelope. inject, when non-empty, arms a runtime memory inject the
+// heartbeat delivers so the runner drains it as a follow-up turn.
+//
+// The session's repository is a GitHub one (github.com/example/repo, served
+// from disk) on which followUpPR exists with the session's commit as its
+// head, so a turn that reports followUpPR has really opened the session's
+// pull request — the runner accepts no other kind (see
+// pull_request_verify.go).
 func runScripted(t *testing.T, workType string, skipSteering bool, inject string, turns ...verdictScriptTurn) *Result {
+	t.Helper()
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:     workType,
+		skipSteering: skipSteering,
+		inject:       inject,
+		repository:   followUpRepository,
+		pulls:        map[int]string{7: pullAtSessionCommit},
+		turns:        turns,
+	})
+	return res
+}
+
+// continuedCount is the continuation prompts the runner recorded.
+func continuedCount(res *Result) int {
+	if res.TurnContinuations == nil {
+		return 0
+	}
+	return res.TurnContinuations.Continued
+}
+
+// followUpRepository is the GitHub repository followUpPR lives on.
+const followUpRepository = "https://github.com/example/repo"
+
+// scriptedSession configures runScriptedSession.
+type scriptedSession struct {
+	workType     string
+	skipSteering bool
+	inject       string
+	// repository, when set, is a GitHub repository address (any remote
+	// form) the session provisions, served from a local bare repository;
+	// otherwise the session repository is a plain local path.
+	repository string
+	// pulls creates refs/pull/<n>/head on that repository, pointing at a
+	// sha, pullAtSessionCommit or pullAtOtherCommit.
+	pulls map[int]string
+	// lookup, when set, replaces the verifier's remote lookup.
+	lookup pullRequestRefLookup
+	// backstop lets the deterministic backstop run (off by default).
+	backstop bool
+	// teardown lets Run tear the worktree down on success (the default keeps
+	// it for inspection); rescueDir is where unpublished work is archived.
+	teardown  bool
+	rescueDir string
+	// continuationLimit is Options.TurnContinuationLimit (0 = default).
+	continuationLimit int
+	turns             []verdictScriptTurn
+}
+
+// runScriptedSession runs one scripted session and returns the terminal
+// envelope and the provider, which recorded every follow-up prompt.
+// Provider-error retries do not wait.
+func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScriptProvider) {
 	t.Helper()
 	base, err := stub.New()
 	if err != nil {
@@ -154,11 +236,24 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 		t.Fatal("stub provider is not a HarnessProvider")
 	}
 	platform := newRecordingPlatformServer(t)
-	if inject != "" {
-		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: inject})
+	if cfg.inject != "" {
+		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: cfg.inject})
 	}
-	r := newFollowUpRunner(t, platform.URL, platform.Client(), &verdictScriptProvider{HarnessProvider: harness, t: t, turns: turns})
-	r.skipSteering = skipSteering
+	provider := &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
+	r := newFollowUpRunner(t, platform.URL, platform.Client(), provider)
+	r.skipSteering = cfg.skipSteering
+	if cfg.teardown {
+		r.preserveAlways = false
+	}
+	if cfg.rescueDir != "" {
+		r.rescueDir = cfg.rescueDir
+	}
+	if cfg.lookup != nil {
+		r.pullRequestLookup = cfg.lookup
+	}
+	r.skipBackstop = !cfg.backstop
+	r.turnContinuationLimit = cfg.continuationLimit
+	r.providerRetryBackoff = func(int) time.Duration { return 0 }
 	qw := QueuedWork{
 		QueuedWork:      queuedWorkBase("MANIFEST-FOLLOWUP"),
 		WorkerID:        "worker-1",
@@ -166,8 +261,16 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 		PlatformURL:     platform.URL,
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 	}
-	qw.WorkType = workType
-	qw.Repository = makeBareRepo(t)
+	qw.WorkType = cfg.workType
+	if cfg.repository != "" {
+		bare := githubRepositoryFixture(t, cfg.repository)
+		for number, target := range cfg.pulls {
+			setPullRef(t, bare, number, target)
+		}
+		qw.Repository = cfg.repository
+	} else {
+		qw.Repository = makeBareRepo(t)
+	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
@@ -175,7 +278,7 @@ func runScripted(t *testing.T, workType string, skipSteering bool, inject string
 	if err != nil && res == nil {
 		t.Fatalf("Run: %v", err)
 	}
-	return res
+	return res, provider
 }
 
 type verdictWant struct {
@@ -186,6 +289,7 @@ type verdictWant struct {
 	pr           string
 	manifest     string // expected res.Manifest.Verdict; "" = no manifest on the envelope
 	wantSteering bool
+	continued    int    // expected continuation prompts (Result.TurnContinuations.Continued)
 	errContains  string // expected substring of res.Error, when set
 }
 
@@ -193,6 +297,9 @@ func assertVerdict(t *testing.T, res *Result, want verdictWant) {
 	t.Helper()
 	if res.SteeringTriggered != want.wantSteering {
 		t.Fatalf("SteeringTriggered = %v; want %v", res.SteeringTriggered, want.wantSteering)
+	}
+	if got := continuedCount(res); got != want.continued {
+		t.Fatalf("continuation prompts = %d; want %d", got, want.continued)
 	}
 	if res.Status != want.status {
 		t.Errorf("Status = %q; want %q (FailureMode=%q, Error=%q)", res.Status, want.status, res.FailureMode, res.Error)
@@ -222,8 +329,11 @@ func assertVerdict(t *testing.T, res *Result, want verdictWant) {
 }
 
 // TestRun_TurnVerdictAcrossSteeringFollowUp pins how the turn verdict is
-// resolved when tail steering runs a follow-up turn. The first turn always
-// ends cleanly without a PR, so steering fires. The newest signal must win:
+// resolved when tail recovery runs a follow-up turn. The first turn always
+// ends cleanly without a PR: one that leaves a manifest or a verdict gets the
+// pull request nudge (steering), and one that stopped early ("Work in
+// progress.") gets a continuation prompt instead — either way the follow-up
+// turn plays the second scripted turn. The newest signal must win:
 // a manifest the follow-up wrote, else the follow-up's own WORK_RESULT verdict
 // over a stale earlier manifest, else the earlier manifest over the
 // follow-up's bare terminal text. A runner-recorded failure is never cleared
@@ -240,7 +350,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{manifest: `{"schemaVersion":1,"verdict":"failed","summary":"` + manifestSummary + `","pullRequestUrl":"` + followUpPR + `"}`, text: followUpPR},
 			},
-			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", wantSteering: true},
+			want: verdictWant{status: "completed", workResult: "failed", summary: manifestSummary, pr: followUpPR, manifest: "failed", continued: 1},
 		},
 		{
 			name: "earlier manifest outranks the follow-up's bare terminal text",
@@ -328,7 +438,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: "Opening the PR needs a decision.\nWORK_RESULT: blocked"},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, continued: 1},
 		},
 		{
 			name: "a mid-sentence Intended manifest quote never replaces a manifest file",
@@ -368,7 +478,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"optimistic\"}\nWORK_RESULT: failed"},
 			},
-			want: verdictWant{status: "completed", workResult: "failed", wantSteering: true},
+			want: verdictWant{status: "completed", workResult: "failed", wantSteering: true, continued: 1},
 		},
 		{
 			name: "a printed passed block never raises the same turn's own blocked marker",
@@ -376,7 +486,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: "Intended manifest: {\"schemaVersion\":1,\"verdict\":\"passed\",\"summary\":\"optimistic\"}\nWORK_RESULT: blocked\nAGENT_BLOCKED: need the staging credentials"},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need the staging credentials", wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need the staging credentials", continued: 1},
 		},
 		{
 			name: "a printed block sets the verdict when none exists yet",
@@ -384,7 +494,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: `Intended manifest: {"schemaVersion":1,"verdict":"passed","summary":"all green"}`},
 			},
-			want: verdictWant{status: "completed", workResult: "passed", summary: "all green", manifest: "passed", wantSteering: true},
+			want: verdictWant{status: "completed", workResult: "passed", summary: "all green", manifest: "passed", wantSteering: true, continued: 1},
 		},
 		{
 			name: "a blocked follow-up keeps the AGENT_BLOCKED reason that follows its WORK_RESULT line",
@@ -392,7 +502,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: "WORK_RESULT: blocked\nAGENT_BLOCKED: need a product decision on the migration"},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need a product decision on the migration", wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, errContains: "need a product decision on the migration", continued: 1},
 		},
 		{
 			name: "a printed inline manifest may lower a manifest file",
@@ -416,7 +526,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: "The last run reported WORK_RESULT: failed, so I re-ran it. " + followUpPR},
 			},
-			want: verdictWant{status: "completed", pr: followUpPR, wantSteering: true},
+			want: verdictWant{status: "completed", pr: followUpPR, continued: 1},
 		},
 		{
 			name: "identical-content rewrite during the follow-up counts as the follow-up's manifest",
@@ -440,7 +550,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: `Intended manifest: {"schemaVersion":1,"verdict":"failed","summary":"inline says failed"}`},
 			},
-			want: verdictWant{status: "completed", workResult: "failed", summary: "inline says failed", manifest: "failed", wantSteering: true},
+			want: verdictWant{status: "completed", workResult: "failed", summary: "inline says failed", manifest: "failed", wantSteering: true, continued: 1},
 		},
 		{
 			name: "blocked manifest written during the follow-up takes the blocked fork",
@@ -448,7 +558,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{manifest: `{"schemaVersion":1,"verdict":"blocked","blockedReason":"need a product decision"}`, text: "Need a decision."},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, manifest: "blocked", wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureAgentBlocked, manifest: "blocked", continued: 1},
 		},
 		{
 			name: "blocked manifest never relabels a follow-up provider crash",
@@ -456,7 +566,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{manifest: `{"schemaVersion":1,"verdict":"blocked","blockedReason":"need a decision"}`, crash: true},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureProviderError, manifest: "blocked", wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureProviderError, manifest: "blocked", continued: 1},
 		},
 		{
 			name: "passed manifest never clears a follow-up provider crash",
@@ -464,7 +574,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{manifest: `{"schemaVersion":1,"verdict":"passed","summary":"all good","pullRequestUrl":"` + followUpPR + `"}`, crash: true},
 			},
-			want: verdictWant{status: "failed", failureMode: FailureProviderError, workResult: "passed", manifest: "passed", wantSteering: true},
+			want: verdictWant{status: "failed", failureMode: FailureProviderError, workResult: "passed", manifest: "passed", continued: 1},
 		},
 		{
 			name: "no manifest keeps the follow-up's terminal text",
@@ -472,7 +582,7 @@ func TestRun_TurnVerdictAcrossSteeringFollowUp(t *testing.T) {
 				{text: "Work in progress."},
 				{text: followUpPR},
 			},
-			want: verdictWant{status: "completed", summary: followUpPR, pr: followUpPR, wantSteering: true},
+			want: verdictWant{status: "completed", summary: followUpPR, pr: followUpPR, continued: 1},
 		},
 	}
 	for _, tc := range cases {

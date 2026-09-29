@@ -363,6 +363,23 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			"sessionId", qw.SessionID, "repository", repositoryDeclaration.Selected.Name)
 	}
 
+	// Record every mutable checkout with the commit it starts at, so teardown
+	// can tell the session's own unpublished work from the base and preserve
+	// it before deleting the workarea (Run → preserveUnpublishedWork).
+	switch {
+	case repositoryFree:
+	case repositoryDeclaration != nil:
+		targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
+		for _, repository := range repositoryDeclaration.Repositories {
+			if repository.Authority == workarea.RepositoryMutable {
+				targets = append(targets, rescueTarget{name: repository.Name, path: declaredRepositoryPaths[repository.Name]})
+			}
+		}
+		recordRescueTargets(ctx, res, targets)
+	case selectedRepositoryMutable:
+		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+	}
+
 	// 2a-bis. Materialize read-only sibling context repos named by
 	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
 	// their governing corpus at ../<name> as their repo AGENTS.md
@@ -1174,99 +1191,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	streamRes, streamErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-
-	// Disambiguate between ctx-cancelled and lost-ownership before
-	// classifying the failure mode.
-	select {
-	case <-lostOwnership:
-		res.Status = "failed"
-		// Distinguish a deterministic operator cancel ({"stop": true} on
-		// the lock-refresh, surfaced via Pulser.StopRequested) from the
-		// 3-strike heartbeat fuse / hand-off. Operator cancel is an
-		// intentional terminal outcome the platform MUST NOT
-		// blind-re-dispatch, so it gets its own FailureMode (mirroring
-		// FailureAgentBlocked routing); the fuse stays FailureLostOwnership.
-		if pulser != nil && pulser.StopRequested() {
-			res.FailureMode = FailureOperatorCancelled
-			if res.Error == "" {
-				res.Error = "operator cancelled session (lock-refresh stop=true)"
-			}
-		} else {
-			res.FailureMode = FailureLostOwnership
-			if res.Error == "" {
-				res.Error = heartbeat.ErrLostOwnership.Error()
-			}
-		}
-		// Best-effort stop the provider so it doesn't keep tokens
-		// running.
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = handle.Stop(stopCtx)
-		stopCancel()
-		return res, heartbeat.ErrLostOwnership
-	default:
-	}
-
-	// Budget-exceeded short-circuit.
-	// Either the enforcer surfaced *BudgetExceededError directly via
-	// streamErr, or the wall-clock deadline tripped streamCtx and we
-	// detect the breach now via CheckDuration. Either way the failure
-	// is classified as FailureBudgetExceeded — distinct from generic
-	// FailureTimeout so dashboards can group them.
-	var budgetErr *BudgetExceededError
-	if errors.As(streamErr, &budgetErr) { //nolint:revive // intentional: ObserveEvent already produced WORK_RESULT
-		// no-op: budget breach was already surfaced via ObserveEvent's WORK_RESULT emission
-	} else if errors.Is(streamErr, context.DeadlineExceeded) {
-		// May or may not be a duration cap. CheckDuration tells us.
-		if dErr := enforcer.CheckDuration(r.now()); dErr != nil {
-			budgetErr = dErr
-		}
-	}
-	if budgetErr != nil {
-		res.Status = "failed"
-		res.FailureMode = FailureBudgetExceeded
-		if res.Error == "" {
-			res.Error = budgetErr.Error()
-		}
-		// Best-effort stop the provider so it doesn't keep tokens
-		// running past the cap.
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = handle.Stop(stopCtx)
-		stopCancel()
-		res.BudgetReport = enforcer.Report(r.now())
-		r.logger.Warn("[runner-stage]",
-			"sid", qw.SessionID,
-			"stageId", qw.StageID,
-			"event", "budget.breach",
-			"cap", string(budgetErr.Cap),
-			"detail", budgetErr.Detail,
-		)
-		return res, budgetErr
-	}
-
-	// Idle/no-progress watchdog cut-off. The watchdog cancels the stream
-	// ctx (surfacing context.Canceled), so this must be checked BEFORE
-	// the generic ctx-cancelled timeout branch below to classify the
-	// wedged-but-channel-alive session as FailureNoProgress rather than
-	// FailureTimeout. Stop the provider so it doesn't keep burning tokens.
-	if streamRes.noProgress {
-		res.Status = "failed"
-		res.FailureMode = FailureNoProgress
-		if res.Error == "" {
-			res.Error = fmt.Sprintf("no agent event within idle timeout (%s)", r.idleTimeout)
-		}
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = handle.Stop(stopCtx)
-		stopCancel()
-		return res, streamErr
-	}
-
-	if streamErr != nil && errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
-		res.Status = "failed"
-		res.FailureMode = FailureTimeout
-		if res.Error == "" {
-			res.Error = streamErr.Error()
-		}
-		return res, streamErr
+	if stopped, err := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamRes, streamErr); stopped {
+		return res, err
 	}
 
 	// Apply event-stream observations onto the result envelope.
@@ -1287,6 +1213,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Stamp the manifest file before any follow-up turn so step 11·M can tell
 	// a manifest the follow-up wrote from one it merely left in place.
 	manifestBeforeFollowUp := stampManifest(runnerStatePath)
+
+	// 10·PR. A pull request URL in the conversation is only a candidate. For
+	// work that owes a pull request, accept one only when it exists on the
+	// session's own repository with the session's branch or commit as its
+	// head (see pull_request_verify.go); otherwise the envelope carries no
+	// pull request, so steering and the backstop still run and a quoted
+	// example URL can never mark the run complete. Re-run after every
+	// follow-up turn. Lookups outlive a cancelled run context (each is
+	// individually bounded) so a late verification is not lost to it.
+	verifyCtx := context.WithoutCancel(ctx)
+	var prVerifier *sessionPullRequestVerifier
+	if RequiresPRURL(qw.WorkType) {
+		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, repositoryFree)
+	}
+	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
 
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
@@ -1322,13 +1263,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	applyFollowUp := func(tail streamObservation) {
 		r.reapplyTurnManifest(runnerStatePath, qw, res, &streamRes, tail, manifestBeforeFollowUp)
 		manifestBeforeFollowUp = stampManifest(runnerStatePath)
+		r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, tail)
 		followUpRan = true
 	}
+	// lastTurn is the latest turn's own observation; tail recovery reads how
+	// it ended.
+	lastTurn := streamRes
 	if runtimeInjectEnabled && !streamRes.blocked {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
 			applyFollowUp(injRes)
+		}
+		if injRes.terminalEvent != nil {
+			lastTurn = injRes
 		}
 	}
 
@@ -1339,13 +1287,45 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// Belt-and-suspenders bypass on top of the publication gate inside
 	// shouldSteer/shouldBackstop: a passing result whose completion contract
 	// requires no PR has demonstrably completed its verdict-only obligation.
+	//
+	// Each pass reads how the LATEST turn ended (turn_continuation.go): a
+	// turn that stopped early is continued, a turn that ended on a provider
+	// error is retried, and a turn that left its verdict but no pull request
+	// gets the pull request nudge (steering), once. Continuations and
+	// retries are bounded; a turn still unfinished at the bound fails the
+	// session. The loop runs at most 2×limit+1 follow-up turns.
 	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
-	if selectedRepositoryMutable && !r.skipSteering && !streamRes.blocked && !publicationComplete && shouldSteer(streamRes, caps, qw.WorkType) {
-		res.SteeringTriggered = true
-		newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, streamRes, res)
-		if err != nil {
-			r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
-		} else {
+	followUps := r.newTurnFollowUps()
+	continuable := RequiresPRURL(qw.WorkType) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+tailRecovery:
+	for selectedRepositoryMutable && !r.skipSteering && !streamRes.blocked {
+		steerView := streamRes
+		steerView.terminalSuccess = lastTurn.terminalSuccess
+		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn))
+		step := followUps.next(ending, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
+		switch step {
+		case tailDone:
+			break tailRecovery
+		case tailExhausted:
+			if ending == turnProviderError {
+				followUps.providerError = lastTurn.providerError
+			}
+			followUps.fail(res)
+			r.logger.Warn("turn still unfinished after the continuation limit; failing the session",
+				"sessionId", qw.SessionID,
+				"continued", followUps.continued,
+				"retried", followUps.retried,
+				"limit", followUps.limit,
+			)
+			break tailRecovery
+		case tailSteer:
+			followUps.steered = true
+			res.SteeringTriggered = true
+			newHandle, err := r.attemptSteering(ctx, provider, handle, spec, caps, qw, steerView, res)
+			if err != nil {
+				r.logger.Warn("steering failed", "sessionId", qw.SessionID, "err", err)
+				break tailRecovery
+			}
 			// attemptSteering returns the handle to keep draining: unchanged
 			// on inject success/soft-fail, or the new Handle Provider.Resume
 			// returned on the stop-and-resume fallback. The deferred Stop
@@ -1356,8 +1336,55 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
+			lastTurn = tailRes
+			continue
 		}
+
+		prompt := continuePrompt
+		if step == tailRetry {
+			prompt = retryPrompt
+			r.logger.Warn("turn ended on a model provider error; retrying",
+				"sessionId", qw.SessionID,
+				"attempt", followUps.retried+1,
+				"limit", followUps.limit,
+				"providerError", lastTurn.providerError,
+			)
+			if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
+				if stopped, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err); stopped {
+					res.TurnContinuations = followUps.report()
+					return res, stopErr
+				}
+				break tailRecovery
+			}
+		} else {
+			r.logger.Info("turn ended before the work was finished; continuing",
+				"sessionId", qw.SessionID,
+				"continuation", followUps.continued+1,
+				"limit", followUps.limit,
+			)
+		}
+		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
+		handle = newHandle
+		if err != nil || !delivered {
+			r.logger.Warn("follow-up prompt not delivered; ending tail recovery",
+				"sessionId", qw.SessionID, "err", err)
+			break tailRecovery
+		}
+		if step == tailRetry {
+			followUps.retried++
+		} else {
+			followUps.continued++
+		}
+		tail, tailErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+		if stopped, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr); stopped {
+			res.TurnContinuations = followUps.report()
+			return res, stopErr
+		}
+		tail.applyTo(res, provider.Name())
+		applyFollowUp(tail)
+		lastTurn = tail
 	}
+	res.TurnContinuations = followUps.report()
 
 	// 11·M (blocked fork). A blocked verdict a follow-up turn produced takes
 	// the 10a fork — but only when the runner has recorded no failure of its
@@ -1426,7 +1453,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	if repositoryDeclaration != nil && RequiresPRURL(qw.WorkType) {
 		missingPRs = missingMutablePullRequests(res, *repositoryDeclaration)
 	}
-	if repositoryDeclaration != nil && len(missingPRs) > 0 {
+	// An exhausted session keeps its continuations-exhausted label: the
+	// backstop's open-PR attempt ran, but the turn never finished.
+	if repositoryDeclaration != nil && len(missingPRs) > 0 && !followUps.exhausted {
 		res.Status = "failed"
 		res.FailureMode = FailureBackstop
 		res.Error = "completion contract missing pull requests for mutable repositories: " + strings.Join(missingPRs, ", ")
@@ -1512,6 +1541,118 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	return res, nil
+}
+
+// classifyStreamStop stamps the terminal failure of a turn whose stream
+// stopped on lost ownership (or an operator cancel), a budget breach, the
+// idle watchdog or a cancelled context, stops the provider where tokens could
+// keep running, and reports whether it did so; the caller then returns
+// (res, err). It classifies the first turn and every runner-driven follow-up
+// turn alike (turn_continuation.go).
+func (r *Runner) classifyStreamStop(
+	qw QueuedWork,
+	res *Result,
+	handle agent.Handle,
+	enforcer *BudgetEnforcer,
+	pulser *heartbeat.Pulser,
+	lostOwnership <-chan struct{},
+	streamRes streamObservation,
+	streamErr error,
+) (bool, error) {
+	// Disambiguate between ctx-cancelled and lost-ownership before
+	// classifying the failure mode.
+	select {
+	case <-lostOwnership:
+		res.Status = "failed"
+		// Distinguish a deterministic operator cancel ({"stop": true} on
+		// the lock-refresh, surfaced via Pulser.StopRequested) from the
+		// 3-strike heartbeat fuse / hand-off. Operator cancel is an
+		// intentional terminal outcome the platform MUST NOT
+		// blind-re-dispatch, so it gets its own FailureMode (mirroring
+		// FailureAgentBlocked routing); the fuse stays FailureLostOwnership.
+		if pulser != nil && pulser.StopRequested() {
+			res.FailureMode = FailureOperatorCancelled
+			if res.Error == "" {
+				res.Error = "operator cancelled session (lock-refresh stop=true)"
+			}
+		} else {
+			res.FailureMode = FailureLostOwnership
+			if res.Error == "" {
+				res.Error = heartbeat.ErrLostOwnership.Error()
+			}
+		}
+		// Best-effort stop the provider so it doesn't keep tokens
+		// running.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		return true, heartbeat.ErrLostOwnership
+	default:
+	}
+
+	// Budget-exceeded short-circuit.
+	// Either the enforcer surfaced *BudgetExceededError directly via
+	// streamErr, or the wall-clock deadline tripped streamCtx and we
+	// detect the breach now via CheckDuration. Either way the failure
+	// is classified as FailureBudgetExceeded — distinct from generic
+	// FailureTimeout so dashboards can group them.
+	var budgetErr *BudgetExceededError
+	if errors.As(streamErr, &budgetErr) { //nolint:revive // intentional: ObserveEvent already produced WORK_RESULT
+		// no-op: budget breach was already surfaced via ObserveEvent's WORK_RESULT emission
+	} else if errors.Is(streamErr, context.DeadlineExceeded) {
+		// May or may not be a duration cap. CheckDuration tells us.
+		if dErr := enforcer.CheckDuration(r.now()); dErr != nil {
+			budgetErr = dErr
+		}
+	}
+	if budgetErr != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureBudgetExceeded
+		if res.Error == "" {
+			res.Error = budgetErr.Error()
+		}
+		// Best-effort stop the provider so it doesn't keep tokens
+		// running past the cap.
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		res.BudgetReport = enforcer.Report(r.now())
+		r.logger.Warn("[runner-stage]",
+			"sid", qw.SessionID,
+			"stageId", qw.StageID,
+			"event", "budget.breach",
+			"cap", string(budgetErr.Cap),
+			"detail", budgetErr.Detail,
+		)
+		return true, budgetErr
+	}
+
+	// Idle/no-progress watchdog cut-off. The watchdog cancels the stream
+	// ctx (surfacing context.Canceled), so this must be checked BEFORE
+	// the generic ctx-cancelled timeout branch below to classify the
+	// wedged-but-channel-alive session as FailureNoProgress rather than
+	// FailureTimeout. Stop the provider so it doesn't keep burning tokens.
+	if streamRes.noProgress {
+		res.Status = "failed"
+		res.FailureMode = FailureNoProgress
+		if res.Error == "" {
+			res.Error = fmt.Sprintf("no agent event within idle timeout (%s)", r.idleTimeout)
+		}
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		_ = handle.Stop(stopCtx)
+		stopCancel()
+		return true, streamErr
+	}
+
+	if streamErr != nil && errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
+		res.Status = "failed"
+		res.FailureMode = FailureTimeout
+		if res.Error == "" {
+			res.Error = streamErr.Error()
+		}
+		return true, streamErr
+	}
+	return false, nil
 }
 
 func (r *Runner) protectedRuntimeMCPV2Applies(qw QueuedWork, selection harnessSelection) bool {
@@ -1661,9 +1802,14 @@ type streamObservation struct {
 	terminalEvent   *agent.ResultEvent
 	errorEvent      *agent.ErrorEvent
 	pullRequestURL  string
-	commentPosted   bool
-	issueUpdated    bool
-	subIssuesMade   bool
+	// pullRequestCandidates is every GitHub pull request URL the stream
+	// carried (assistant text and tool output), oldest first, each once at
+	// its latest position. They are candidates only: the session pull
+	// request verifier decides which, if any, is the session's own.
+	pullRequestCandidates []string
+	commentPosted         bool
+	issueUpdated          bool
+	subIssuesMade         bool
 	// workResult is this stream's passed|failed|unknown verdict: the one
 	// carried by the LATEST assistant message with a line-anchored marker
 	// (the FIRST anchored marker within that message wins — see
@@ -1695,6 +1841,11 @@ type streamObservation struct {
 	// classification path to fork to FailureBudgetExceeded instead of
 	// the generic FailureProviderError / FailureSilentExit branches.
 	budgetBreach *BudgetExceededError
+	// providerError is the provider error text of a model call that ended
+	// on a provider error (agent.SystemSubtypeProviderError) with no
+	// assistant message or tool call after it in this stream — the turn
+	// ended on that error rather than because the agent stopped.
+	providerError string
 	// noProgress is set when the idle/no-progress watchdog fired — the
 	// event stream produced no agent.Event for longer than the runner's
 	// IdleTimeout window. The runner reads it in the post-stream
@@ -1911,6 +2062,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.AssistantTextEvent:
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
+			obs.providerError = ""
 		}
 		// One verdict per message, from its FIRST line-anchored marker
 		// (scanVerdict); the latest message that carries one decides the
@@ -1935,7 +2087,18 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if u := scanPRURL(e.Text); u != "" {
 			obs.pullRequestURL = u
 		}
+		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Text)
+	case agent.SystemEvent:
+		if e.Subtype == agent.SystemSubtypeProviderError {
+			obs.providerError = strings.TrimSpace(e.Message)
+			if obs.providerError == "" {
+				obs.providerError = "model provider error"
+			}
+		}
 	case agent.ToolUseEvent:
+		// The model produced a tool call: any earlier provider error in
+		// this stream was recovered from.
+		obs.providerError = ""
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
 		// Bash invocations of `gh pr create` are not tracked here —
@@ -1956,6 +2119,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if u := scanPRURL(e.Content); u != "" && obs.pullRequestURL == "" {
 			obs.pullRequestURL = u
 		}
+		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Content)
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success

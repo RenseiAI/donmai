@@ -278,6 +278,12 @@ type statusRequest struct {
 	// the dimensions it names), paired with failureMode
 	// "execution-security". Additive; omitted for every other result.
 	ExecutionSecurityRefusal *agent.ExecutionSecurityRefusal `json:"executionSecurityRefusal,omitempty"`
+
+	// TurnContinuations counts the follow-up prompts the runner sent because
+	// a turn ended before the work was finished (continuations after an early
+	// stop, retries after a provider error), so the session's record shows how
+	// many were used. Additive; omitted when none was needed.
+	TurnContinuations *agent.TurnContinuations `json:"turnContinuations,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -490,7 +496,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, TerminalWorkareaLease: projection,
-		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal,
+		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
