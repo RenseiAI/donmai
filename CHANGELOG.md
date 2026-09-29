@@ -8,6 +8,36 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+### Features
+
+- Negotiated terminal continuation checkpoints preserve parser, screen, and
+  history state for compatible viewers. The additive protocol carries bounded
+  checkpoints and a contiguous output suffix; legacy viewers retain their
+  existing output behavior.
+- Linear label commands support native label groups, group membership, and
+  single-select groups while preserving existing label identities.
+- Linear comment reads include author identity and revision metadata, support
+  selecting one comment, and require complete pagination. Hosted consumers can
+  negotiate a strict no-fallback contract for these reads and label operations.
+
+### Fixes
+
+- Host log following continues after reaching the current end of a file, so
+  later records appear without restarting the command.
+- Host setup and drain documentation describe configuration and resumable
+  draining accurately. Embedded setup flows use the configured binary name.
+- Runner pull-request verification accepts the session's own work and retries
+  a temporarily lagging pull-request head. Unpublished changes are preserved
+  before teardown, and unfinished turns receive bounded continuation or
+  provider-error retry attempts.
+
+### Chores
+
+- The drift Action uses the verified v0.72.53 analyzer and an immutable
+  v1.0.1 Action commit, enabling complete assessment of larger pull requests.
+- Interactive readiness test failures include bounded terminal and process
+  diagnostics without relaxing the existing readiness deadline.
+
 ## v0.72.53 — 2026-09-28
 
 ### Fixes
