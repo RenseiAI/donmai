@@ -161,13 +161,32 @@ func (r *Runner) attemptSteeringResume(
 	steerText string,
 	res *Result,
 ) (agent.Handle, error) {
+	next, _, err := r.resumeWithDirective(ctx, provider, handle, spec, qw, steerText, res)
+	return next, err
+}
+
+// resumeWithDirective is the stop-and-resume rail shared by steering and the
+// turn continuation (turn_continuation.go): stop the current turn, then resume
+// the same provider-native session with steerText as the resumed turn's
+// directive. resumed reports whether a new turn was started; it is false on
+// the soft no-op paths (no session id captured, Resume unsupported). res, when
+// non-nil, records the fallback on Result.SteeringResumeFallback.
+func (r *Runner) resumeWithDirective(
+	ctx context.Context,
+	provider agent.Provider,
+	handle agent.Handle,
+	spec agent.Spec,
+	qw QueuedWork,
+	steerText string,
+	res *Result,
+) (agent.Handle, bool, error) {
 	sessionID := handle.SessionID()
 	if sessionID == "" {
 		// No InitEvent was ever observed on this handle, so there is no
 		// provider-native session id to resume. Same soft no-op shape as
 		// the transient inject failures in attemptSteering.
 		r.logger.Debug("steering: resume fallback skipped: no session id captured")
-		return handle, nil
+		return handle, false, nil
 	}
 	r.logger.Info("steering: inject unsupported, falling back to stop-and-resume",
 		"sessionId", qw.SessionID,
@@ -183,7 +202,7 @@ func (r *Runner) attemptSteeringResume(
 	stopErr := handle.Stop(stopCtx)
 	stopCancel()
 	if stopErr != nil {
-		return handle, fmt.Errorf("steering: resume fallback: stop failed: %w", stopErr)
+		return handle, false, fmt.Errorf("steering: resume fallback: stop failed: %w", stopErr)
 	}
 
 	// The resumed turn's directive is the same steering prompt Inject
@@ -199,14 +218,14 @@ func (r *Runner) attemptSteeringResume(
 			r.logger.Debug("steering: resume fallback rejected as unsupported",
 				"sessionId", qw.SessionID,
 			)
-			return handle, nil
+			return handle, false, nil
 		}
-		return handle, fmt.Errorf("steering: resume fallback: resume failed: %w", err)
+		return handle, false, fmt.Errorf("steering: resume fallback: resume failed: %w", err)
 	}
 	if res != nil {
 		res.SteeringResumeFallback = true
 	}
-	return newHandle, nil
+	return newHandle, true, nil
 }
 
 // injectDirective delivers text into a live session as a follow-up user

@@ -74,8 +74,39 @@ Verbatim from F.1.1 §5; classification owned by `runner/failure.go`.
 | `lost-ownership` | Heartbeat 3-strike threshold tripped (or worktree retry detected ownership loss). |
 | `timeout` | `ctx` cancelled before terminal event. |
 | `backstop-failed` | Stage 2 of tail recovery ran but could not push or open a PR. |
+| `continuations-exhausted` | A turn still ended unfinished (no turn-result manifest, no PR, no verdict) after the limit of continuation prompts. |
 
 ## Tail recovery
+
+A pull request URL in the conversation is only a candidate. For work that owes
+a pull request, the runner accepts one only when it exists on the session's own
+repository with the session's branch or commit as its head, read from the
+checkout's own remote with the session's git credential
+(`git ls-remote origin refs/pull/<n>/head refs/heads/<branch>`; no GitHub CLI).
+The session's repository is recognised in any remote form (https, ssh,
+scp-like, with credentials). A quoted example URL, or a pull request on another
+repository or branch, leaves the session without one, so the stages below still
+run. See `pull_request_verify.go`.
+
+Before either stage, the runner reads how the latest turn ended
+(`turn_continuation.go`), for work that owes a pull request:
+
+- A turn that stopped early — a clean end with no turn-result manifest, no
+  verified pull request and no verdict — gets a short "continue the task"
+  prompt instead of the pull request nudge.
+- A turn that ended on a model provider error (`agent.SystemSubtypeProviderError`,
+  which the pi harness emits for an assistant message with stopReason
+  `error`) is retried after a short wait, never nudged.
+- A blocked or failed verdict is never continued; a passed verdict without a
+  pull request gets the steering nudge, once.
+
+Continuations and retries are each bounded by `Options.TurnContinuationLimit`
+(default 3; negative disables them). A turn still unfinished at the bound fails
+the session (`continuations-exhausted`, or `provider-error` for retries). No
+nudge follows, but the backstop still makes its open-PR attempt, so the work is
+pushed and a real pull request the verifier could not confirm is recovered; the
+session stays failed.
+`Result.TurnContinuations` carries the counts onto the terminal status.
 
 Two-stage post-completion recovery (F.0.1 §1):
 
@@ -92,6 +123,22 @@ Backstop steps:
 5. `git commit -m "Backstop: <session-id> (<identifier>)"` (skipped when nothing remains staged).
 6. `git push -u origin <branch>` (with `--force-with-lease` retry on non-fast-forward).
 7. `gh pr create --title --body` — return the URL on `BackstopReport.PRURL`.
+
+## Teardown never deletes unpublished work
+
+Before teardown deletes the workarea, every git checkout in it is checked for
+work that exists nowhere else: uncommitted changes (including untracked files)
+and commits no remote holds. That work is archived as a patch against the
+commit the checkout started at, at
+`<RescueDir>/<session>/<time>-<id>/<repository>.patch` with a JSON sidecar, and the
+log names the file. Paths the backstop never commits (dependency and build
+output, runner and harness state) are left out. The checkout itself is not
+touched. The patch is written with plumbing (`git diff-tree` with every output
+option pinned), so no diff configuration can alter it, and it must reproduce the
+working state when applied to its base in a scratch index. When the archive
+cannot be written or proven, the workarea is kept instead of deleted. Each
+session keeps its last 5 archives. `Options.RescueDir` defaults to a `rescue`
+directory beside the worktree parent. See `workarea_rescue.go`.
 
 ## Telemetry
 

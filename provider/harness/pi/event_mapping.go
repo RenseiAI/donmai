@@ -112,10 +112,23 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 	case "message_end":
 		text := st.textBuf.String()
 		st.textBuf.Reset()
-		if text == "" {
-			return nil, false
+		if text != "" {
+			out = append(out, agent.AssistantTextEvent{Text: text, Raw: raw(ev)})
 		}
-		return []agent.Event{agent.AssistantTextEvent{Text: text, Raw: raw(ev)}}, false
+		// An assistant message that ended on a provider error (stopReason
+		// "error": a gateway 503/504, an overloaded model) is surfaced as the
+		// provider-error observation, so the runner can tell a turn that
+		// ended on that error from one where the agent chose to stop. pi's
+		// own auto-retry may still recover; a later message or tool call
+		// then supersedes it.
+		if msg := mapField(f, "message"); stringField(msg, "role") == "assistant" && stringField(msg, "stopReason") == "error" {
+			detail := stringField(msg, "errorMessage")
+			if detail == "" {
+				detail = "model provider error"
+			}
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: detail, Raw: raw(ev)})
+		}
+		return out, false
 
 	case "tool_execution_start":
 		return []agent.Event{agent.ToolUseEvent{
