@@ -6,7 +6,6 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
-	provideramp "github.com/RenseiAI/donmai/provider/harness/amp"
 	providerclaude "github.com/RenseiAI/donmai/provider/harness/claude"
 	providergemini "github.com/RenseiAI/donmai/provider/harness/gemini"
 	provideropencode "github.com/RenseiAI/donmai/provider/harness/opencode"
@@ -88,28 +87,6 @@ func TestToolUseCapabilityMatrix(t *testing.T) {
 			// over runtime/mcp): Spawn dials the declared servers,
 			// discovers their tools, and routes mcp__* functionCalls live.
 			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: true, acceptsMcpServerSpec: true},
-		},
-		{
-			name: "amp",
-			new: func(t *testing.T) agent.Provider {
-				// Inject a fake LookPath so the test doesn't depend on whether
-				// `amp` is installed on the CI runner.
-				p, err := provideramp.New(provideramp.Options{
-					APIKey:   "test-key",
-					LookPath: func(string) (string, error) { return "/usr/bin/amp", nil },
-				})
-				if err != nil {
-					t.Fatalf("amp.New: %v", err)
-				}
-				return p
-			},
-			// Since commit 3c6b6c6, amp Spawn writes a
-			// per-session MCP tmpfile and passes --mcp-config, so
-			// SupportsToolPlugins+AcceptsMcpServerSpec are both true.
-			// AllowedTools is not honoured (amp has no --allowedTools;
-			// permission control is via settings.json + --dangerously-
-			// allow-all), so AcceptsAllowedToolsList stays false.
-			want: want{supportsToolPlugins: true, acceptsAllowedToolsList: false, acceptsMcpServerSpec: true},
 		},
 		{
 			name: "opencode",

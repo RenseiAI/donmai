@@ -85,7 +85,7 @@ type Options struct {
 	// returns 501 in that case.
 	EvictHandler EvictHandler
 	// ProviderRegistry exposes the daemon's locally-registered AgentRuntime
-	// providers (claude/codex/ollama/opencode/gemini/amp/stub) to the
+	// providers (claude/codex/ollama/opencode/gemini/stub) to the
 	// /api/daemon/providers* surface. May be nil — the endpoint will then
 	// return an empty list with PartialCoverage=true, which is the correct
 	// behaviour for a daemon that has not yet wired its runtime registry.

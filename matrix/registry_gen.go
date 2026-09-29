@@ -12,7 +12,6 @@ import "github.com/RenseiAI/donmai/agent"
 // hand-authored validCells' legacyProviderId anchors.
 var LegacyAliasMap = map[agent.ProviderName]CellKey{
 	"agy-cli":  {Harness: "antigravity", Endpoint: "google", Host: "oauth-cli"},
-	"amp":      {Harness: "amp", Endpoint: "anthropic", Host: "direct"},
 	"claude":   {Harness: "claude-code", Endpoint: "anthropic", Host: "oauth-cli"},
 	"codex":    {Harness: "codex", Endpoint: "openai", Host: "oauth-cli"},
 	"gemini":   {Harness: "gemini-direct", Endpoint: "google", Host: "direct"},

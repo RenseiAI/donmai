@@ -795,7 +795,7 @@ func TestInteractive_AttemptCapDeadLettersAndUnblocksTheQueue(t *testing.T) {
 // never calls Handle.Inject; it writes into its PTY, and every interactive
 // session has one. Gating the rail on the provider capability silently
 // disabled it for the harnesses that declare SupportsMessageInjection=false
-// (codex, shell, amp, agycli, ollama) while the platform still reported the
+// (codex, shell, agycli, ollama) while the platform still reported the
 // message delivered — so the capability=false row is the regression.
 func TestInteractive_RunLoopHandsInjectChToDispatch(t *testing.T) {
 	tests := []struct {

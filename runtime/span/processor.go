@@ -634,8 +634,6 @@ func ProviderSystem(provider agent.ProviderName) string {
 		return "ollama"
 	case agent.ProviderOpenCode:
 		return "opencode"
-	case agent.ProviderAmp:
-		return "amp"
 	case agent.ProviderStub:
 		return "stub"
 	default:

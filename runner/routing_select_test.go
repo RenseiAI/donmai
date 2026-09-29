@@ -166,8 +166,8 @@ func TestSelectProviderByPosterior_FiltersStubCandidate(t *testing.T) {
 func TestSelectProviderByPosterior_NotInCandidates_Fallback(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.WriteHeader(200)
-		// amp is not registered as a candidate.
-		_, _ = w.Write([]byte(`{"selectedProvider":"amp","source":"mab-routing"}`))
+		// retired is not registered as a candidate.
+		_, _ = w.Write([]byte(`{"selectedProvider":"retired","source":"mab-routing"}`))
 	}))
 	defer srv.Close()
 	t.Setenv("ROUTING_SELECTOR_ENABLED", "true")

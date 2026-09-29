@@ -133,8 +133,8 @@ func newFakeProvider(t *testing.T, script string, opts Options) *Provider {
 
 // spawnFake retries the Linux ETXTBSY race that can occur when a concurrently
 // forking sibling test inherits the recently closed write descriptor for the
-// executable fixture. The policy matches the bounded fixture retry used by the
-// Amp harness tests.
+// executable fixture. The policy matches the bounded fixture retry used
+// elsewhere in the fleet.
 func spawnFake(ctx context.Context, t *testing.T, p *Provider, spec agent.Spec) (agent.Handle, error) {
 	t.Helper()
 	if script, ok := fakeAgyScripts.Load(p); ok {

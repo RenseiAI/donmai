@@ -9,7 +9,6 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/agycli"
-	"github.com/RenseiAI/donmai/provider/harness/amp"
 	"github.com/RenseiAI/donmai/provider/harness/claude"
 	"github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/provider/harness/gemini"
@@ -35,7 +34,6 @@ func TestPromptAdaptation_AllConcreteHarnessModes(t *testing.T) {
 		{name: "codex/interactive", manifest: (&codex.Provider{}).Manifest(), mode: agent.PromptModeHumanControlled, supportsSystem: true, contextInUser: true},
 		{name: "gemini/raw", manifest: (&gemini.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
 		{name: "ollama", manifest: (&ollama.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
-		{name: "amp/headless", manifest: (&amp.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "agy/headless", manifest: (&agycli.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "opencode/headless", manifest: (&opencode.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsDowngrade: true},
 		{name: "pi/headless", manifest: (&pi.Provider{}).Manifest(), mode: agent.PromptModeAutonomous, supportsSystem: true},
@@ -168,7 +166,7 @@ func TestPromptAdaptation_ReplacementMatrix(t *testing.T) {
 	t.Parallel()
 	manifests := []agent.HarnessManifest{
 		(&claude.Provider{}).Manifest(), (&codex.Provider{}).Manifest(), (&gemini.Provider{}).Manifest(),
-		(&ollama.Provider{}).Manifest(), (&amp.Provider{}).Manifest(), (&agycli.Provider{}).Manifest(),
+		(&ollama.Provider{}).Manifest(), (&agycli.Provider{}).Manifest(),
 		(&opencode.Provider{}).Manifest(), (&pi.Provider{}).Manifest(), (&shell.Provider{}).Manifest(),
 	}
 	for _, manifest := range manifests {

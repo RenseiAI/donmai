@@ -619,8 +619,6 @@ func recognizedHarnessToken(token string) (agent.HarnessName, bool) {
 		return agent.HarnessOpenCode, true
 	case string(agent.HarnessAntigravity), "agy":
 		return agent.HarnessAntigravity, true
-	case string(agent.HarnessAmp):
-		return agent.HarnessAmp, true
 	case string(agent.HarnessGeminiDirect):
 		return agent.HarnessGeminiDirect, true
 	case string(agent.HarnessOllama):
@@ -670,8 +668,6 @@ func legacyHarnessNameForProvider(name agent.ProviderName) agent.HarnessName {
 		return agent.HarnessClaudeCode
 	case agent.ProviderCodex:
 		return agent.HarnessCodex
-	case agent.ProviderAmp:
-		return agent.HarnessAmp
 	case agent.ProviderAGYCLI:
 		return agent.HarnessAntigravity
 	case agent.ProviderOpenCode:
@@ -705,7 +701,7 @@ func explicitHarnessSourceRef(token string) string {
 	case "claude", "agy", "native", string(legacyRawHarness):
 		return "legacy-harness:" + token
 	default:
-		// codex, amp, and opencode are both live Platform wire values and
+		// codex and opencode are both live Platform wire values and
 		// canonical manifest ids; no alias translation is necessary.
 		return "canonical-harness:" + token
 	}

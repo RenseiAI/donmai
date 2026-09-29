@@ -112,7 +112,7 @@ type Provider struct {
 //
 // Per ADR-2026-05-07-daemon-http-control-api.md § D4, the Wave-9 ship of
 // the daemon's provider registry exposes only the AgentRuntime family
-// (claude/codex/ollama/opencode/gemini/amp/stub). The remaining seven
+// (claude/codex/ollama/opencode/gemini/stub). The remaining seven
 // families return as empty until their per-family registries land in a
 // future wave. Consumers MUST honour PartialCoverage when rendering — the
 // "other families coming" caveat is sourced from the flag, not from

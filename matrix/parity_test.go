@@ -238,13 +238,13 @@ func TestParity_CapsNarrowingOnly(t *testing.T) {
 }
 
 // TestParity_ManifestAgreesWithCapabilities is rule 7 (the P1 additive-safety
-// guard): for each of the 10 harness providers, the Manifest().Caps agent-loop
+// guard): for each of the 9 harness providers, the Manifest().Caps agent-loop
 // fields equal the corresponding Capabilities() fields — proving the manifest
 // is a faithful additive projection, not a divergent second source of truth.
 func TestParity_ManifestAgreesWithCapabilities(t *testing.T) {
 	providers := HarnessProvidersForParity()
-	if len(providers) != 10 {
-		t.Fatalf("expected 10 harness providers, got %d", len(providers))
+	if len(providers) != 9 {
+		t.Fatalf("expected 9 harness providers, got %d", len(providers))
 	}
 	for _, p := range providers {
 		if p == nil {
@@ -386,35 +386,6 @@ func TestParity_NoCrossProtocolOpencodeAnthropic(t *testing.T) {
 				t.Errorf("opencode cell %+v drives anthropic-messages (opencode is openai-chat only)", c.Key())
 			}
 		}
-	}
-}
-
-// TestParity_AmpCostHonesty guards the §6 cost-honesty invariant: the amp cell
-// is metered + needsApiKey + NOT bringsOwnAuth (a key-needing cell cannot be
-// bringsOwnAuth).
-func TestParity_AmpCostHonesty(t *testing.T) {
-	built, err := Build()
-	if err != nil {
-		t.Fatalf("Build(): %v", err)
-	}
-	found := false
-	for _, c := range built.Matrix.Cells {
-		if c.Harness != agent.HarnessAmp {
-			continue
-		}
-		found = true
-		if c.CostModel != agent.CostMeteredPerToken {
-			t.Errorf("amp cell %+v: costModel=%q, want metered", c.Key(), c.CostModel)
-		}
-		if !c.NeedsAPIKey {
-			t.Errorf("amp cell %+v: needsApiKey=false, want true", c.Key())
-		}
-		if c.BringsOwnAuth {
-			t.Errorf("amp cell %+v: bringsOwnAuth=true — a key-needing metered cell cannot bring its own auth", c.Key())
-		}
-	}
-	if !found {
-		t.Errorf("amp cell missing from the matrix")
 	}
 }
 

@@ -46,7 +46,6 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 		agent.HarnessPi:           {auto: best, human: best},
 		agent.HarnessAntigravity:  {auto: none},
 		agent.HarnessOllama:       {auto: none},
-		agent.HarnessAmp:          {auto: none},
 		agent.HarnessShell:        {human: none},
 		agent.HarnessStub:         {auto: none, human: none},
 	}

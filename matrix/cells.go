@@ -292,16 +292,6 @@ var validCells = []HarnessEndpointCell{
 		Stability: "experimental", Smoked: false,
 	},
 
-	// amp × Anthropic (direct, metered — cost-honest, key-needing) ----------
-	{
-		Harness: agent.HarnessAmp, Endpoint: agent.CompanyAnthropic, Host: agent.HostDirect,
-		Protocol: agent.ProtoAnthropicMessages, Transport: agent.TransportCLIInjection,
-		AuthModes: []agent.AuthMode{agent.AuthMetered}, BringsOwnAuth: false, NeedsAPIKey: true,
-		CostModel: agent.CostMeteredPerToken, OneShot: true, NativeJSONMode: false,
-		StructuredVia: "spawn-collect", LegacyProviderID: pn(agent.ProviderAmp),
-		Stability: "beta", Smoked: false,
-	},
-
 	// stub × stub -----------------------------------------------------------
 	{
 		Harness: agent.HarnessStub, Endpoint: agent.CompanyStub, Host: agent.HostLocal,

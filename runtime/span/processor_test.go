@@ -306,7 +306,6 @@ func TestProviderSystem_AllRuntimeHarnesses(t *testing.T) {
 		{agent.ProviderAGYCLI, "gcp.gemini"},
 		{agent.ProviderOllama, "ollama"},
 		{agent.ProviderOpenCode, "opencode"},
-		{agent.ProviderAmp, "amp"},
 		{agent.ProviderStub, "stub"},
 	}
 	for _, tt := range tests {

@@ -50,12 +50,12 @@ func TestInheritedBlocklistHonoursTheDeclaration(t *testing.T) {
 		{
 			name: "several declared names are all admitted",
 			parent: []string{
-				"AMP_API_KEY=a",
+				"GEMINI_API_KEY=a",
 				"ANTHROPIC_BASE_URL=b",
 				"GOOGLE_API_KEY=c",
-				env.InjectedEnvKeysVar + "=AMP_API_KEY,ANTHROPIC_BASE_URL,GOOGLE_API_KEY",
+				env.InjectedEnvKeysVar + "=GEMINI_API_KEY,ANTHROPIC_BASE_URL,GOOGLE_API_KEY",
 			},
-			want: []string{"AMP_API_KEY=a", "ANTHROPIC_BASE_URL=b", "GOOGLE_API_KEY=c"},
+			want: []string{"GEMINI_API_KEY=a", "ANTHROPIC_BASE_URL=b", "GOOGLE_API_KEY=c"},
 		},
 		{
 			name: "declaring a runner-only attach control changes nothing",
