@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.55 — 2026-09-29
+
 ### Features
 
 - Host watch uses a responsive session grid, a compact host header, and an
