@@ -25,6 +25,7 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"strconv"
 	"strings"
 	"time"
 
@@ -47,22 +48,109 @@ var diffFetchWarnWriter io.Writer = os.Stderr
 // is rare; 60s is generous headroom over the typical sub-second `gh` call.
 const diffFetchTimeout = 60 * time.Second
 
-// ghPRFiles is the subset of `gh pr view --json files,title,body` we consume.
+// ghPRFiles is the subset of `gh pr view` we consume. GitHub caps its files
+// connection at 100 entries, so changedFiles is needed to detect that cap.
 type ghPRFiles struct {
-	Title string `json:"title"`
-	Body  string `json:"body"`
-	Files []struct {
-		Path      string `json:"path"`
-		Additions int    `json:"additions"`
-		Deletions int    `json:"deletions"`
-	} `json:"files"`
+	Title        string     `json:"title"`
+	Body         string     `json:"body"`
+	ChangedFiles *int       `json:"changedFiles"`
+	Files        []ghPRFile `json:"files"`
+}
+
+type ghPRFile struct {
+	Path      string `json:"path"`
+	Additions int    `json:"additions"`
+	Deletions int    `json:"deletions"`
+	Filename  string `json:"filename"`
 }
 
 // runGhPRView fetches PR metadata + the changed-file list as JSON. Package-level
 // var so tests substitute a fixture. The endpoint is a full PR URL OR an
 // "owner/repo#N" / "N" ref understood by `gh pr view`.
 var runGhPRView = func(ctx context.Context, ref string) ([]byte, error) {
-	return runGh(ctx, "pr", "view", ref, "--json", "title,body,files")
+	return runGh(ctx, "pr", "view", ref, "--json", "title,body,changedFiles,files")
+}
+
+// runGhPRFiles fetches the REST file pages. gh --paginate can emit one merged
+// JSON array or page-separated arrays; either must match changedFiles exactly.
+var runGhPRFiles = func(ctx context.Context, repo string, prNum int) ([]byte, error) {
+	parts := strings.Split(strings.TrimPrefix(repo, "github.com/"), "/")
+	if len(parts) != 2 || !validGhPathSegment(parts[0]) || !validGhPathSegment(parts[1]) || prNum <= 0 {
+		return nil, errors.New("arch diff-fetch: invalid GitHub repository or PR number")
+	}
+	endpoint := "repos/" + parts[0] + "/" + parts[1] + "/pulls/" + strconv.Itoa(prNum) + "/files?per_page=100"
+	return runGh(ctx, "api", "--paginate", endpoint)
+}
+
+func validGhPathSegment(s string) bool {
+	if s == "" || s == "." || s == ".." {
+		return false
+	}
+	for _, r := range s {
+		if !((r >= 'a' && r <= 'z') || (r >= 'A' && r <= 'Z') ||
+			(r >= '0' && r <= '9') || r == '-' || r == '_' || r == '.') {
+			return false
+		}
+	}
+	return true
+}
+
+func completePRFiles(ctx context.Context, repo string, prNum int, view ghPRFiles) ([]ghPRFile, error) {
+	if view.Files == nil {
+		return nil, errors.New("arch diff-fetch: PR metadata is missing the changed-file list")
+	}
+	if view.ChangedFiles == nil || *view.ChangedFiles < 0 || *view.ChangedFiles > 3000 {
+		return nil, errors.New("arch diff-fetch: missing or unsupported changed-file count")
+	}
+	want := *view.ChangedFiles
+	if len(view.Files) > want {
+		return nil, errors.New("arch diff-fetch: PR metadata exceeds the changed-file count")
+	}
+	if len(view.Files) == want {
+		return validatePRFiles(view.Files, want)
+	}
+
+	out, err := runGhPRFiles(ctx, repo, prNum)
+	if err != nil {
+		return nil, fmt.Errorf("arch diff-fetch: fetch paginated PR files: %w", err)
+	}
+	dec := json.NewDecoder(strings.NewReader(string(out)))
+	files := make([]ghPRFile, 0, want)
+	pages := 0
+	for {
+		var page []ghPRFile
+		err := dec.Decode(&page)
+		if errors.Is(err, io.EOF) {
+			break
+		}
+		if err != nil {
+			return nil, fmt.Errorf("arch diff-fetch: decode paginated PR files: %w", err)
+		}
+		pages++
+		if pages > 30 || len(page) == 0 || len(files)+len(page) > want {
+			return nil, errors.New("arch diff-fetch: invalid paginated PR file response")
+		}
+		files = append(files, page...)
+	}
+	return validatePRFiles(files, want)
+}
+
+func validatePRFiles(files []ghPRFile, want int) ([]ghPRFile, error) {
+	if len(files) != want {
+		return nil, fmt.Errorf("arch diff-fetch: incomplete changed-file list: got %d, want %d", len(files), want)
+	}
+	seen := make(map[string]bool, len(files))
+	for i := range files {
+		if files[i].Path == "" {
+			files[i].Path = files[i].Filename // REST names this field filename.
+		}
+		f := files[i]
+		if f.Path == "" || seen[f.Path] || f.Additions < 0 || f.Deletions < 0 {
+			return nil, errors.New("arch diff-fetch: invalid or duplicate changed-file metadata")
+		}
+		seen[f.Path] = true
+	}
+	return files, nil
 }
 
 // runGhPRDiff fetches the unified diff for a PR. Package-level var for tests.
@@ -121,8 +209,9 @@ func fetchPRDiff(ctx context.Context, repo string, prNum int, ref string, requir
 	if err := json.Unmarshal(viewOut, &view); err != nil {
 		return PrDiff{}, fmt.Errorf("arch diff-fetch: decode gh pr view: %w", err)
 	}
-	if requirePatches && view.Files == nil {
-		return PrDiff{}, errors.New("arch diff-fetch: PR metadata is missing the changed-file list")
+	files, err := completePRFiles(ctx, repo, prNum, view)
+	if err != nil {
+		return PrDiff{}, err
 	}
 
 	diff := PrDiff{
@@ -141,11 +230,11 @@ func fetchPRDiff(ctx context.Context, repo string, prNum int, ref string, requir
 	} else if requirePatches {
 		return PrDiff{}, fmt.Errorf("arch diff-fetch: fetch patches: %w", derr)
 	}
-	if requirePatches && len(patchesByPath) != len(view.Files) {
+	if requirePatches && len(patchesByPath) != len(files) {
 		return PrDiff{}, errors.New("arch diff-fetch: patch sections do not match the changed-file list")
 	}
 
-	for _, f := range view.Files {
+	for _, f := range files {
 		if requirePatches && patchesByPath[f.Path] == "" {
 			return PrDiff{}, fmt.Errorf("arch diff-fetch: missing patch section for %q", f.Path)
 		}

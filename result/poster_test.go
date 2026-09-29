@@ -1050,3 +1050,50 @@ func TestPosterPost_StatusFailureModeSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusTurnContinuationsSerialized pins that the runner's
+// continuation counts reach the status body, and are omitted when none was
+// needed.
+func TestPosterPost_StatusTurnContinuationsSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   *agent.TurnContinuations
+		want string
+	}{
+		{name: "omitted when none was needed"},
+		{name: "counts", in: &agent.TurnContinuations{Continued: 3, Retried: 1, Limit: 3, Exhausted: true}, want: `{"continued":3,"retried":1,"limit":3,"exhausted":true}`},
+		{name: "not exhausted", in: &agent.TurnContinuations{Continued: 1, Limit: 3}, want: `{"continued":1,"retried":0,"limit":3}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.TurnContinuations = tc.in
+			if err := p.Post(context.Background(), "sess-tc", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["turnContinuations"]
+			if present != (tc.want != "") {
+				t.Fatalf("turnContinuations present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("turnContinuations = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
