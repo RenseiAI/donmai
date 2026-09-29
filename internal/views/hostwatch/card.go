@@ -67,24 +67,36 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	// The model card is assigned outside this repository; there is no
 	// local source for it, so it always renders as unknown rather than
 	// inventing a value.
-	chips := fmt.Sprintf("harness %s · model %s · provider %s · state %s",
+	identity := fmt.Sprintf("harness %s · model %s",
 		unknownIfEmpty(card.Harness),
-		unknownIfEmpty(card.Model),
+		unknownIfEmpty(card.Model))
+	state := fmt.Sprintf("provider %s · state %s",
 		unknownIfEmpty(card.modelProvider()),
 		unknownIfEmpty(card.DaemonState))
+	// Scope stays visible inside the card. Appending it after the identity
+	// fields would truncate it at ordinary card widths.
+	scope := ""
+	if card.ProjectName != "" {
+		scope = "project " + card.ProjectName
+	}
+	if card.IssueIdentifier != "" {
+		if scope != "" {
+			scope += " · "
+		}
+		scope += "issue " + card.IssueIdentifier
+	}
 
-	metrics := fmt.Sprintf("elapsed %s · tools %s · cost %s · turns %s",
+	metrics := fmt.Sprintf("elapsed %s · tools %s",
 		elapsedStr(card, now),
-		countStr(card.Observed, card.ToolCalls),
+		countStr(card.Observed, card.ToolCalls))
+	cost := fmt.Sprintf("cost %s · turns %s",
 		costStr(card),
-		countStr(card.MetricsReported, card.NumTurns),
-	)
+		countStr(card.MetricsReported, card.NumTurns))
 
-	fresh := fmt.Sprintf("heartbeat %s · output %s · work %s",
+	fresh := fmt.Sprintf("heartbeat %s · output %s",
 		freshStr(card.heartbeatTime(), now),
-		freshStr(card.LastOutputAt, now),
-		freshStr(card.LastWorkAt, now),
-	)
+		freshStr(card.LastOutputAt, now))
+	workFresh := "work " + freshStr(card.LastWorkAt, now)
 
 	ticker := card.LastActivity
 	if ticker == "" {
@@ -98,14 +110,40 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	if plain {
 		var b strings.Builder
 		fmt.Fprintf(&b, "%s %s  %s\n", dot, header, work)
-		fmt.Fprintf(&b, "  %s\n", chips)
+		if scope != "" {
+			fmt.Fprintf(&b, "  %s\n", scope)
+		}
+		fmt.Fprintf(&b, "  %s\n", identity)
+		fmt.Fprintf(&b, "  %s\n", state)
 		fmt.Fprintf(&b, "  %s\n", metrics)
+		fmt.Fprintf(&b, "  %s\n", cost)
 		fmt.Fprintf(&b, "  %s\n", fresh)
+		fmt.Fprintf(&b, "  %s\n", workFresh)
 		if ticker != "" {
 			fmt.Fprintf(&b, "  %s\n", ticker)
 		}
 		return strings.TrimRight(b.String(), "\n")
 	}
+
+	// Budget the body to the inner content width (cardWidth minus the
+	// left border + padding, or the full ring for selected cards) using
+	// display widths, so CJK content truncates inside the border instead
+	// of overflowing it. The card field list is unchanged — only the
+	// widths are enforced.
+	inner := cardWidth - 2
+	if selected {
+		inner = cardWidth - 4
+	}
+	header = truncateWidth(header, inner-4)
+	work = truncateWidth(work, inner-4)
+	identity = truncateWidth(identity, inner)
+	state = truncateWidth(state, inner)
+	scope = truncateWidth(scope, inner)
+	metrics = truncateWidth(metrics, inner)
+	cost = truncateWidth(cost, inner)
+	fresh = truncateWidth(fresh, inner)
+	workFresh = truncateWidth(workFresh, inner)
+	ticker = truncateWidth(ticker, inner)
 
 	sc := statusColor(t, card)
 	dotStyle := lipgloss.NewStyle().Foreground(sc)
@@ -117,10 +155,14 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 
 	lines := []string{
 		dotStyle.Render(dot) + " " + headStyle.Render(header) + "  " + workStyle.Render(work),
-		chipStyle.Render(chips),
-		metricStyle.Render(metrics),
-		chipStyle.Render(fresh),
 	}
+	if scope != "" {
+		lines = append(lines, chipStyle.Render(scope))
+	}
+	lines = append(lines,
+		chipStyle.Render(identity), chipStyle.Render(state),
+		metricStyle.Render(metrics), metricStyle.Render(cost),
+		chipStyle.Render(fresh), chipStyle.Render(workFresh))
 	if ticker != "" {
 		lines = append(lines, tickStyle.Render(ticker))
 	}
