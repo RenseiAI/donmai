@@ -1727,6 +1727,98 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 
 // ─── create-blocker ───────────────────────────────────────────────────────────
 
+// findReusableBlocker returns an existing same-title Icebox/Needs Human issue
+// only after the bounded candidate inventory is complete. ListIssues returns
+// at its requested limit even when another page may exist, so a cap hit is
+// ambiguous and must not be treated as absence.
+func findReusableBlocker(ctx context.Context, client linear.Linear, projectName, title string) (*linear.Issue, error) {
+	if projectName == "" {
+		return nil, nil // no project scope was supplied or inherited
+	}
+	proj, err := client.GetProjectByName(ctx, projectName)
+	if err != nil {
+		return nil, fmt.Errorf("resolve blocker candidate project: %w", err)
+	}
+	filter := map[string]any{
+		"project": map[string]any{"id": map[string]any{"eq": proj.ID}},
+		"state":   map[string]any{"name": map[string]any{"eqIgnoreCase": "Icebox"}},
+		"labels":  map[string]any{"name": map[string]any{"eqIgnoreCase": "Needs Human"}},
+	}
+	const limit = linear.MaxIssueListLimit
+	candidates, err := client.ListIssues(ctx, filter, limit, "createdAt")
+	if err != nil {
+		return nil, fmt.Errorf("blocker candidate lookup: %w", err)
+	}
+	if len(candidates) >= limit {
+		return nil, fmt.Errorf("blocker candidate lookup reached limit %d; completeness is unknown", limit)
+	}
+	for i := range candidates {
+		if strings.EqualFold(candidates[i].Title, title) {
+			return &candidates[i], nil
+		}
+	}
+	return nil, nil
+}
+
+// hasDirectedBlockerEdge checks the authoritative inverse edge on the source:
+// blocker → source, never source → blocker or blocker → another issue.
+func hasDirectedBlockerEdge(relations *linear.RelationsResult, blockerID string) bool {
+	if relations == nil {
+		return false
+	}
+	for _, rel := range relations.InverseRelations {
+		if rel.Type == "blocks" && rel.IssueID == blockerID {
+			return true
+		}
+	}
+	return false
+}
+
+// ensureDirectedBlockerEdge reads the complete validated relation inventory
+// before and after a single create attempt. A failed create may have raced
+// another writer; exactly one authoritative read reconciles that outcome.
+func ensureDirectedBlockerEdge(ctx context.Context, client linear.Linear, blockerID, sourceID string) error {
+	if blockerID == "" || sourceID == "" {
+		return errors.New("directed blocks relation requires both issue IDs")
+	}
+	relations, err := client.GetIssueRelations(ctx, sourceID)
+	if err != nil {
+		return fmt.Errorf("read directed blocks relation: %w", err)
+	}
+	if hasDirectedBlockerEdge(relations, blockerID) {
+		return nil
+	}
+	_, success, createErr := client.CreateRelation(ctx, blockerID, sourceID, "blocks")
+	if createErr != nil || !success {
+		// A concurrent writer may have created the exact edge. Do not replay the
+		// mutation; reconcile once through the fully paginated read path.
+		relations, readErr := client.GetIssueRelations(ctx, sourceID)
+		if readErr != nil {
+			return fmt.Errorf("reconcile directed blocks relation after create failure: %w", errors.Join(createErr, readErr))
+		}
+		if hasDirectedBlockerEdge(relations, blockerID) {
+			return nil
+		}
+		if createErr != nil {
+			return fmt.Errorf("create directed blocks relation: %w", createErr)
+		}
+		return errors.New("create directed blocks relation was not acknowledged")
+	}
+	relations, err = client.GetIssueRelations(ctx, sourceID)
+	if err != nil {
+		return fmt.Errorf("verify directed blocks relation: %w", err)
+	}
+	if !hasDirectedBlockerEdge(relations, blockerID) {
+		return errors.New("directed blocks relation absent after acknowledged create")
+	}
+	return nil
+}
+
+func blockerPartialError(disposition string, blocker *linear.Issue, completed string, err error) error {
+	return fmt.Errorf("create-blocker partial: %s blocker %s (%s); %s: %w",
+		disposition, blocker.ID, blocker.Identifier, completed, err)
+}
+
 func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	var (
 		title       string
@@ -1780,33 +1872,30 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 				projectName = sourceIssue.Project.Name
 			}
 
-			// 2. Deduplicate: check Icebox + "Needs Human" label
-			if projectName != "" {
-				proj, projErr := client.GetProjectByName(ctx, projectName)
-				if projErr == nil {
-					filter := map[string]any{
-						"project": map[string]any{"id": map[string]any{"eq": proj.ID}},
-						"state":   map[string]any{"name": map[string]any{"eqIgnoreCase": "Icebox"}},
-						"labels":  map[string]any{"name": map[string]any{"eqIgnoreCase": "Needs Human"}},
-					}
-					candidates, _ := client.ListIssues(ctx, filter, 50, "createdAt")
-					for _, c := range candidates {
-						if strings.EqualFold(c.Title, title) {
-							// +1 comment on duplicate
-							_, _ = client.CreateComment(ctx, c.ID,
-								fmt.Sprintf("+1 - Also needed by %s", sourceIssue.Identifier))
-							return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
-								"id":           c.ID,
-								"identifier":   c.Identifier,
-								"title":        c.Title,
-								"url":          c.URL,
-								"sourceIssue":  sourceIssue.Identifier,
-								"relation":     "blocks",
-								"deduplicated": true,
-							})
-						}
-					}
+			// 2. Deduplicate only after completing the bounded candidate read.
+			candidate, err := findReusableBlocker(ctx, client, projectName, title)
+			if err != nil {
+				return err
+			}
+			if candidate != nil {
+				if err := ensureDirectedBlockerEdge(ctx, client, candidate.ID, sourceIssue.ID); err != nil {
+					return blockerPartialError("reused", candidate,
+						"directed blocks relation not verified; +1 notice not posted", err)
 				}
+				if _, err := client.CreateComment(ctx, candidate.ID,
+					fmt.Sprintf("+1 - Also needed by %s", sourceIssue.Identifier)); err != nil {
+					return blockerPartialError("reused", candidate,
+						"directed blocks relation verified; +1 notice failed", err)
+				}
+				return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
+					"id":           candidate.ID,
+					"identifier":   candidate.Identifier,
+					"title":        candidate.Title,
+					"url":          candidate.URL,
+					"sourceIssue":  sourceIssue.Identifier,
+					"relation":     "blocks",
+					"deduplicated": true,
+				})
 			}
 
 			// 3. Resolve team object
@@ -1862,11 +1951,14 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 				return fmt.Errorf("create blocker issue: %w", err)
 			}
 
-			// 6. Create blocking relation: blocker → source
-			_, _, _ = client.CreateRelation(ctx, blockerIssue.ID, sourceIssue.ID, "blocks")
+			// 6. Establish and verify blocker → source before a success notice.
+			if err := ensureDirectedBlockerEdge(ctx, client, blockerIssue.ID, sourceIssue.ID); err != nil {
+				return blockerPartialError("created", blockerIssue,
+					"directed blocks relation not verified; source notice not posted", err)
+			}
 
 			// 7. Comment on source issue
-			_, _ = client.CreateComment(ctx, sourceIssue.ID,
+			_, noticeErr := client.CreateComment(ctx, sourceIssue.ID,
 				fmt.Sprintf("🚧 Human blocker created: [%s](%s) - %s",
 					blockerIssue.Identifier, blockerIssue.URL, title))
 
@@ -1879,6 +1971,10 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 					})
 				}
 				// Non-critical: blocker still created without assignee
+			}
+			if noticeErr != nil {
+				return blockerPartialError("created", blockerIssue,
+					"directed blocks relation verified; source notice failed", noticeErr)
 			}
 
 			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
