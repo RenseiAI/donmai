@@ -29,6 +29,68 @@ func NewCodeIntelParameterBinder(sourceDigest string) (CapabilityParameterBinder
 func (b *codeIntelParameterBinder) ContractID() string   { return codeintelbridge.ParameterContractID }
 func (b *codeIntelParameterBinder) SourceDigest() string { return b.sourceDigest }
 
+// rejectDuplicateJSONFields refuses JSON objects that repeat a member name
+// at any nesting level. Go's map decode silently keeps the last duplicate,
+// so the binder checks the raw bytes before decoding the closed
+// code-intelligence parameter object.
+func rejectDuplicateJSONFields(raw json.RawMessage) error {
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	if err := scanJSONValueNoDuplicate(decoder); err != nil {
+		return err
+	}
+	if _, err := decoder.Token(); err == nil {
+		return fmt.Errorf("code-intelligence parameters contain trailing data")
+	}
+	return nil
+}
+
+func scanJSONValueNoDuplicate(decoder *json.Decoder) error {
+	token, err := decoder.Token()
+	if err != nil {
+		return err
+	}
+	delimiter, ok := token.(json.Delim)
+	if !ok {
+		return nil
+	}
+	switch delimiter {
+	case '{':
+		seen := map[string]struct{}{}
+		for decoder.More() {
+			keyToken, err := decoder.Token()
+			if err != nil {
+				return err
+			}
+			key, ok := keyToken.(string)
+			if !ok {
+				return fmt.Errorf("code-intelligence parameters contain a non-string key")
+			}
+			if _, duplicate := seen[key]; duplicate {
+				return fmt.Errorf("code-intelligence parameters contain a duplicate field")
+			}
+			seen[key] = struct{}{}
+			if err := scanJSONValueNoDuplicate(decoder); err != nil {
+				return err
+			}
+		}
+		if end, err := decoder.Token(); err != nil || end != json.Delim('}') {
+			return fmt.Errorf("code-intelligence parameters are malformed")
+		}
+	case '[':
+		for decoder.More() {
+			if err := scanJSONValueNoDuplicate(decoder); err != nil {
+				return err
+			}
+		}
+		if end, err := decoder.Token(); err != nil || end != json.Delim(']') {
+			return fmt.Errorf("code-intelligence parameters are malformed")
+		}
+	default:
+		return fmt.Errorf("code-intelligence parameters are malformed")
+	}
+	return nil
+}
+
 type rawCodeIntelParameters struct {
 	Repo     string
 	Ref      string
@@ -42,9 +104,15 @@ func decodeCodeIntelParameters(payload json.RawMessage) (rawCodeIntelParameters,
 	if err := json.Unmarshal(payload, &outer); err != nil {
 		return rawCodeIntelParameters{}, fmt.Errorf("decode operational payload")
 	}
+	if err := rejectDuplicateJSONFields(payload); err != nil {
+		return rawCodeIntelParameters{}, fmt.Errorf("decode operational payload")
+	}
 	raw, ok := outer["codeIntel"]
 	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return rawCodeIntelParameters{}, fmt.Errorf("code-intelligence parameters are missing")
+	}
+	if err := rejectDuplicateJSONFields(raw); err != nil {
+		return rawCodeIntelParameters{}, fmt.Errorf("decode code-intelligence parameters")
 	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {

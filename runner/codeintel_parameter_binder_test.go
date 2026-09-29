@@ -146,6 +146,32 @@ func TestCodeIntelParameterBinderRejectsStrictToolAndPathInputs(t *testing.T) {
 	}
 }
 
+func TestCodeIntelParameterBinderRefusesDuplicateJSONKeys(t *testing.T) {
+	tests := []string{
+		`{"codeIntel":{"repo":"a","repo":"b","tools":[]}}`,
+		`{"codeIntel":{"tools":[]},"codeIntel":{"tools":[]}}`,
+		`{"codeIntel":{"repoPath":"pkg","repoPath":"other"}}`,
+	}
+	for _, raw := range tests {
+		t.Run(raw, func(t *testing.T) {
+			if _, err := decodeCodeIntelParameters(json.RawMessage(raw)); err == nil {
+				t.Fatal("duplicate parameter key decoded")
+			}
+			realizations, _ := codeIntelRealizationFixture(t, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
+			binder, _ := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
+			binders, _ := NewCapabilityParameterBinderRegistry(binder)
+			payload := json.RawMessage(raw)
+			var members map[string]json.RawMessage
+			_ = json.Unmarshal(payload, &members)
+			parametersDigest, _ := executioncell.DigestCapabilityParameters(members["codeIntel"])
+			operationalDigest, _ := executioncell.DigestOperationalPayload(payload)
+			if _, err := binders.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: "example.code-intelligence/v1", ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}, payload, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous); err == nil {
+				t.Fatal("duplicate parameter key bound")
+			}
+		})
+	}
+}
+
 func TestSameBinderContractSupportsDistinctCapabilityMaterializations(t *testing.T) {
 	_, first := codeIntelRealizationFixtureForCapability(t, "example.code-intelligence/a", agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous, false)
 	_, second := codeIntelRealizationFixtureForCapability(t, "example.code-intelligence/b", agent.HarnessCodex, "codex/test/mcp-v1", agent.PromptModeAutonomous, false)
