@@ -313,11 +313,24 @@ func splitPaneHeights(contentH int, ratio float64) (gridH, streamH int) {
 
 // applySnapshot folds a new index poll into the model: refreshes the cards +
 // counters, then reconciles the tailer set (start tailers for new sessions,
-// drop tailers for sessions that vanished or finished).
+// drop tailers for sessions that vanished or finished). Folded live metrics
+// (tool counts, cost/turns, activity, freshness) survive the refresh: the
+// index poll carries no metrics, so a fresh card would otherwise zero them
+// on every tick. Metrics keyed by session id carry over; reordered cards
+// keep their own metrics and removed ids drop theirs.
 func (m *Model) applySnapshot(snap Snapshot) {
 	m.snapErr = snap.Err
 	m.counters = snap.Counters
 	if snap.Err == nil {
+		kept := make(map[string]SessionCard, len(m.cards))
+		for _, c := range m.cards {
+			kept[c.SessionID] = c
+		}
+		for i := range snap.Cards {
+			if prev, ok := kept[snap.Cards[i].SessionID]; ok {
+				snap.Cards[i].retainFolded(prev)
+			}
+		}
 		m.cards = snap.Cards
 	}
 	if m.cursor >= len(m.cards) {
@@ -391,10 +404,31 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 	}
 }
 
+// retainFolded carries the tail-accumulated live metrics from a previous
+// card generation onto a refreshed card for the same session. Index polls
+// carry identity and header fields only; without this the refresh would
+// zero tool counts, cost/turns, activity text and freshness every tick.
+func (c *SessionCard) retainFolded(prev SessionCard) {
+	c.ToolCalls = prev.ToolCalls
+	c.LastTool = prev.LastTool
+	c.LastActivity = prev.LastActivity
+	c.CostUsd = prev.CostUsd
+	c.NumTurns = prev.NumTurns
+	c.Errored = prev.Errored
+	c.Observed = prev.Observed
+	c.MetricsReported = prev.MetricsReported
+	c.LastWorkAt = prev.LastWorkAt
+	c.LastOutputAt = prev.LastOutputAt
+}
+
 // foldMetrics updates the live per-card metrics from one event. Cards are
 // matched by session id; an event for a card not currently in view is
 // ignored (its card will pick up state.json header data on the next index
-// poll).
+// poll). Cumulative metrics (tool counts, cost/turns, activity text) fold
+// from every event including replayed history; freshness timestamps advance
+// only on live events, so replaying history never makes an idle session
+// look active now. Heartbeats are liveness only: they advance the
+// heartbeat freshness the runner persists, never tool counts or output.
 func (m *Model) foldMetrics(ev TailEvent) {
 	idx := -1
 	for i := range m.cards {
@@ -407,27 +441,57 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		return
 	}
 	c := &m.cards[idx]
+	c.Observed = true
+	live := !ev.Replay
 	switch e := ev.Event.(type) {
 	case agent.ToolUseEvent:
 		c.ToolCalls++
 		c.LastTool = toolUseSummary(e)
 		c.LastActivity = c.LastTool
+		if live {
+			c.LastWorkAt = ev.EventAt()
+		}
+	case agent.LlmCallEvent:
+		// A model call with usage is meaningful work even without a tool
+		// invocation; a call without usage is an observation only.
+		if e.InputTokens > 0 || e.OutputTokens > 0 {
+			if live {
+				c.LastWorkAt = ev.EventAt()
+			}
+		} else if live {
+			c.LastOutputAt = ev.EventAt()
+		}
+	case agent.ToolResultEvent, agent.ToolProgressEvent, agent.SystemEvent:
+		if live {
+			c.LastOutputAt = ev.EventAt()
+		}
 	case agent.AssistantTextEvent:
 		if txt := collapseWS(e.Text); txt != "" {
 			c.LastActivity = truncateRunes(txt, cardWidth)
+			if live {
+				c.LastOutputAt = ev.EventAt()
+			}
 		}
 	case agent.ResultEvent:
+		// Cost/turn counts only arrive on the terminal result event.
 		if e.Cost != nil {
 			c.CostUsd = e.Cost.TotalCostUsd
 			c.NumTurns = e.Cost.NumTurns
+			c.MetricsReported = true
 		}
 		if !e.Success {
 			c.Errored = true
 		}
 		c.LastActivity = streamTickerText(ev)
+		if live {
+			c.LastOutputAt = ev.EventAt()
+		}
 	case agent.ErrorEvent:
 		c.Errored = true
 		c.LastActivity = truncateRunes(e.Message, cardWidth)
+		if live {
+			c.LastOutputAt = ev.EventAt()
+		}
 	}
 }
 

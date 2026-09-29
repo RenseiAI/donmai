@@ -834,6 +834,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
+		s.Harness = selection.Harness.ID
+		s.Model = qw.ResolvedProfile.Model
+		s.ModelProvider = spanruntime.ProviderSystem(provider.Name())
 		s.WorkType = qw.WorkType
 		s.WorkerID = qw.WorkerID
 		s.CurrentStep = "spawning"
@@ -2348,16 +2351,14 @@ func envOrDefault(key, def string) string {
 // here, so the runner's backstop commits carry the SAME identity as the agent's
 // own in-box commits instead of overriding them with a divergent "Donmai Agent"
 // persona. Absent a provisioner value (standalone / local worktree), fall back
-// to a session-derived default: the issue identifier as the display name and
-// the session id as the email so every commit is unambiguously linked to its
-// originating session.
+// to a session-derived default: the fixed display name "Donmai Agent" and the
+// session id as the email, so every commit is unambiguously linked to its
+// originating session. The display name never carries the issue identifier:
+// tracker keys can be private, and commits on a public repository (including
+// the co-author trailers a squash merge composes from them) would publish it.
 func buildSessionEnv(qw QueuedWork) map[string]string {
-	// Derive a stable display name: prefer the issue identifier, fall back
-	// to a shortened session id prefix.
+	// A fixed display name; the session id in the email carries attribution.
 	gitName := "Donmai Agent"
-	if qw.IssueIdentifier != "" {
-		gitName = "Donmai Agent (" + qw.IssueIdentifier + ")"
-	}
 	gitEmail := "agent+" + qw.SessionID + "@donmai.dev"
 
 	// Honor a provisioner-supplied identity when set; committer defaults to the

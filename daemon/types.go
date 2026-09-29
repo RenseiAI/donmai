@@ -274,6 +274,28 @@ type SessionHandle struct {
 	// the fleet view to the sessions for one repo (the CWD's repo) without
 	// a per-session detail call.
 	Repository string `json:"repository,omitempty"`
+
+	// Session display metadata is an additive, display-safe projection of
+	// the admitted session identity for local readers (e.g. the host-watch
+	// dashboard). Every field is omitempty; an older daemon omits them all
+	// and a new reader renders each absence as unknown. No secrets,
+	// endpoint credentials, or URLs ride these fields — identifiers only.
+
+	// Harness is the resolved loop-driver identity (e.g. "claude-code",
+	// "codex"). Mirrors SessionSpec.Harness.
+	Harness string `json:"harness,omitempty"`
+
+	// Model is the resolved model id (e.g. "claude-sonnet-4-5").
+	// Mirrors SessionSpec.Model.
+	Model string `json:"model,omitempty"`
+
+	// ModelProvider is the model-serving vendor identity, a separate axis
+	// from Harness (the loop driver). Mirrors SessionSpec.Company.
+	ModelProvider string `json:"modelProvider,omitempty"`
+
+	// WorkType is the workflow discriminant ("development", "qa", ...).
+	// Mirrors SessionSpec.WorkType.
+	WorkType string `json:"workType,omitempty"`
 }
 
 // ── Heartbeat payload ──────────────────────────────────────────────────────

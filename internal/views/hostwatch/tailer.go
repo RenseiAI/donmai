@@ -26,28 +26,68 @@ import (
 	"fmt"
 	"io"
 	"os"
+	"strconv"
 	"sync"
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
 
-// TailEvent is one decoded line from a session's events.jsonl, stamped
-// with the local ingestion time (the events.jsonl line itself carries no
-// timestamp — the runner appends the marshaled agent.Event verbatim, so
-// the watcher uses read time, exactly as the legacy af-worker-fleet did
-// for its multiplexed feed).
+// TailEvent is one decoded line from a session's events.jsonl. At is the
+// local ingestion time (the events.jsonl line itself carries no timestamp —
+// the runner appends the marshaled agent.Event verbatim, so the watcher
+// uses read time). At must never drive liveness: replaying history would
+// make an idle session look active now. Use EventAt for freshness — the
+// event's own time where it carries one — and Replay to gate liveness
+// updates off replayed history entirely.
 type TailEvent struct {
 	// SessionID is the session whose events.jsonl produced this event.
 	SessionID string
 	// At is the local time the tailer read the line.
 	At time.Time
+	// Replay marks events that pre-date the watcher's attach: history
+	// re-read from the top (scroll-back mode) rather than output observed
+	// live. Replay events still feed the stream and cumulative metrics,
+	// but never freshness timestamps.
+	Replay bool
 	// Event is the decoded agent event. Nil only when Err is set.
 	Event agent.Event
 	// Err is set when the line could not be decoded (malformed JSON or
 	// unknown kind). The tailer surfaces it rather than silently dropping
 	// so callers can render a diagnostic; the byte offset still advances.
 	Err error
+}
+
+// EventAt returns the event's own time where it carries one, else the
+// ingestion time. LlmCallEvent carries call-boundary nanosecond stamps;
+// every other variant has no clock, so At is the only honest value.
+func (e TailEvent) EventAt() time.Time {
+	if call, ok := e.Event.(agent.LlmCallEvent); ok {
+		if ts := parseUnixNano(firstNonEmpty(call.EndTimeUnixNano, call.StartTimeUnixNano)); !ts.IsZero() {
+			return ts
+		}
+	}
+	return e.At
+}
+
+func firstNonEmpty(ss ...string) string {
+	for _, s := range ss {
+		if s != "" {
+			return s
+		}
+	}
+	return ""
+}
+
+func parseUnixNano(s string) time.Time {
+	if s == "" {
+		return time.Time{}
+	}
+	ns, err := strconv.ParseInt(s, 10, 64)
+	if err != nil || ns <= 0 {
+		return time.Time{}
+	}
+	return time.Unix(0, ns)
 }
 
 // Tailer follows a single `.agent/events.jsonl` file, emitting one
@@ -65,10 +105,27 @@ type Tailer struct {
 	path      string
 	now       func() time.Time
 
-	mu      sync.Mutex
-	offset  int64  // byte offset already consumed
-	partial []byte // bytes of an incomplete trailing line carried to next Poll
-	done    bool   // a terminal ResultEvent was seen; Poll is a no-op after
+	mu     sync.Mutex
+	offset int64 // byte offset already consumed
+	// partial carries an incomplete trailing line (writer mid-append)
+	// plus the offset that line started at, so its replay verdict is
+	// exact once the line completes on a later poll.
+	partial      []byte
+	partialStart int64
+	done         bool // a terminal ResultEvent was seen; Poll is a no-op after
+	// backlog is the byte length that pre-dates the watcher's attach:
+	// construction-time file size in steady-state mode (startAtEnd), or
+	// the size of the first observed content when the file did not yet
+	// exist at construction. Bytes at offsets below backlog are history
+	// re-read after attach and are flagged Replay so they never drive
+	// liveness. Bytes at or above backlog were observed live.
+	backlog int64
+	primed  bool // backlog has been fixed for this file incarnation
+	// replayAll marks scroll-back mode (startAtEnd=false): every byte
+	// read predates the watcher's attach, so every event is history and
+	// is flagged Replay. Steady-state tailers leave this false and use
+	// the backlog boundary instead.
+	replayAll bool
 }
 
 // NewTailer constructs a Tailer for the events.jsonl at path, attributing
@@ -94,10 +151,19 @@ func NewTailer(sessionID, path string, startAtEnd bool, now func() time.Time) *T
 		now = time.Now
 	}
 	t := &Tailer{sessionID: sessionID, path: path, now: now}
+	if !startAtEnd {
+		// Scroll-back mode reads the whole file from the top: all of it
+		// is history relative to the watcher's attach.
+		t.replayAll = true
+		return t
+	}
 	if startAtEnd {
 		if info, err := os.Stat(path); err == nil {
-			// File exists now — skip its current content.
+			// File exists now — skip its current content. The skipped
+			// bytes are history, not live output.
 			t.offset = info.Size()
+			t.backlog = info.Size()
+			t.primed = true
 		}
 		// File does not exist yet — leave offset 0 so all future content
 		// (which is all post-start) is read.
@@ -141,12 +207,28 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 
 	// Truncation / rotation / reuse detection: the file shrank below our
 	// consumed offset, so the bytes we were tracking are gone. Re-read from
-	// the top and discard any half-line we were carrying.
+	// the top and discard any half-line we were carrying. A reused path is
+	// a new incarnation: the bytes present now appeared while this
+	// incarnation was unwatched, so they are history (replay) and only
+	// later appends read as live.
 	if size < t.offset {
 		t.offset = 0
 		t.partial = nil
+		t.partialStart = 0
+		t.backlog = size
+		t.primed = true
 	}
 	if size == t.offset {
+		// Prime the backlog boundary on first contact with content: in
+		// steady-state mode the construction-time stat may have missed a
+		// file created later, so the first observed size is the history
+		// cutoff — everything below it is replay, everything appended
+		// after is live. In scroll-back mode the boundary stays 0 and
+		// every event reads as replay.
+		if !t.primed {
+			t.backlog = size
+			t.primed = true
+		}
 		return nil, nil // no new bytes
 	}
 
@@ -170,15 +252,19 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 	for {
 		chunk, readErr := r.ReadBytes('\n')
 		if len(chunk) > 0 {
+			lineStart := t.offset
 			t.offset += int64(len(chunk))
 			if chunk[len(chunk)-1] == '\n' {
 				// Complete line: prepend any carried partial.
 				line := chunk[:len(chunk)-1]
 				if len(t.partial) > 0 {
 					line = append(t.partial, line...)
+					lineStart = t.partialStart
 					t.partial = nil
+					t.partialStart = 0
 				}
 				if ev, ok := t.decode(line); ok {
+					ev.Replay = t.replayAll || t.isReplay(lineStart)
 					out = append(out, ev)
 					if isTerminal(ev.Event) {
 						t.done = true
@@ -187,6 +273,9 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 				}
 			} else {
 				// Incomplete trailing line (writer mid-append): carry it.
+				if len(t.partial) == 0 {
+					t.partialStart = lineStart
+				}
 				t.partial = append(t.partial, chunk...)
 			}
 		}
@@ -219,6 +308,17 @@ func (t *Tailer) decode(line []byte) (TailEvent, bool) {
 	}
 	te.Event = ev
 	return te, true
+}
+
+// isReplay reports whether a line starting at byte offset start predates
+// the watcher's attach. Offsets below the primed backlog boundary are
+// history (scroll-back mode, pre-existing content, or a reused path's
+// earlier incarnation); offsets at or above it were observed live.
+func (t *Tailer) isReplay(start int64) bool {
+	if start < 0 {
+		return true
+	}
+	return start < t.backlog
 }
 
 // isTerminal reports whether ev is the session's terminal ResultEvent.

@@ -417,6 +417,23 @@ type DaemonSessionHandle struct {
 	ProjectName string `json:"projectName,omitempty"`
 	// Repository is the git URL (or owner/name slug) the session runs on.
 	Repository string `json:"repository,omitempty"`
+
+	// Harness is the resolved loop-driver identity (e.g. "claude-code").
+	// Display-only; absent against an older daemon (renders as unknown).
+	Harness string `json:"harness,omitempty"`
+
+	// Model is the resolved model id (e.g. "claude-sonnet-4-5").
+	// Display-only; absent against an older daemon (renders as unknown).
+	Model string `json:"model,omitempty"`
+
+	// ModelProvider is the model-serving vendor identity, a separate axis
+	// from Harness (the loop driver). Display-only; absent against an
+	// older daemon (renders as unknown).
+	ModelProvider string `json:"modelProvider,omitempty"`
+
+	// WorkType is the workflow discriminant ("development", "qa", ...).
+	// Display-only; absent against an older daemon (renders as unknown).
+	WorkType string `json:"workType,omitempty"`
 }
 
 // ── DaemonClient ─────────────────────────────────────────────────────────────

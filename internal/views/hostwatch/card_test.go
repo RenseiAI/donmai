@@ -5,8 +5,37 @@ import (
 	"testing"
 	"time"
 
+	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/tui-components/theme"
 )
+
+func TestRenderCard_CombinedIdentityAndScope(t *testing.T) {
+	now := time.Date(2026, 9, 29, 12, 0, 0, 0, time.UTC)
+	card := SessionCard{
+		SessionID: "session-1", IssueIdentifier: "ENG-1284", ProjectName: "web",
+		Harness: "driver", Model: "model-id", ModelProvider: "vendor",
+		DaemonState: "running", WorkType: "development",
+	}
+	for _, plain := range []bool{true, false} {
+		out := renderCard(theme.DefaultTheme(), card, 0, true, plain, now)
+		for _, want := range []string{
+			"project web · issue ENG-1284", "harness driver", "model model-id",
+			"provider vendor", "state running", "elapsed unknown", "tools not reported",
+			"cost not reported", "turns not reported", "heartbeat never", "output never", "work never",
+		} {
+			if !strings.Contains(out, want) {
+				t.Errorf("plain=%v: card missing %q:\n%s", plain, want, out)
+			}
+		}
+		if !plain {
+			for _, line := range strings.Split(out, "\n") {
+				if width := lipgloss.Width(line); width > cardWidth {
+					t.Errorf("selected card line width %d exceeds %d: %q", width, cardWidth, line)
+				}
+			}
+		}
+	}
+}
 
 func TestRenderCard_Plain(t *testing.T) {
 	tm := theme.DefaultTheme()
@@ -15,19 +44,76 @@ func TestRenderCard_Plain(t *testing.T) {
 		SessionID:       "sess-1",
 		DaemonState:     "running",
 		IssueIdentifier: "ENG-1284",
+		Harness:         "claude-code",
+		Model:           "claude-sonnet-4-5",
+		ModelProvider:   "anthropic",
 		Provider:        "claude",
 		WorkType:        "development",
 		StartedAtUnixMs: now.Add(-4 * time.Minute).UnixMilli(),
 		ToolCalls:       37,
+		Observed:        true,
 		CostUsd:         0.84,
 		NumTurns:        5,
+		MetricsReported: true,
 		LastActivity:    "Bash: pnpm test",
+		LastWorkAt:      now.Add(-30 * time.Second),
+		LastOutputAt:    now.Add(-10 * time.Second),
 	}
 	out := renderCard(tm, card, 0, false, true /*plain*/, now)
-	for _, want := range []string{"ENG-1284", "development", "impl", "claude", "running", "37", "Bash: pnpm test"} {
+	for _, want := range []string{
+		"ENG-1284", "development",
+		"harness claude-code", "model claude-sonnet-4-5", "provider anthropic", "state running",
+		"tools 37", "Bash: pnpm test",
+	} {
 		if !strings.Contains(out, want) {
 			t.Errorf("card output missing %q:\n%s", want, out)
 		}
+	}
+}
+
+func TestRenderCard_MissingDataIsUnknown(t *testing.T) {
+	tm := theme.DefaultTheme()
+	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
+	// A card straight from an old daemon with no state.json: no invented
+	// running state, no zero metrics — every absent field is labeled.
+	card := SessionCard{SessionID: "sess-9"}
+	out := renderCard(tm, card, 0, false, true /*plain*/, now)
+	for _, want := range []string{
+		"harness unknown", "model unknown", "provider unknown", "state unknown",
+		"elapsed unknown", "tools not reported", "cost not reported", "turns not reported",
+		"heartbeat never", "output never", "work never",
+	} {
+		if !strings.Contains(out, want) {
+			t.Errorf("card output missing %q:\n%s", want, out)
+		}
+	}
+	for _, bad := range []string{"· agent · running", "unknown · unknown · running"} {
+		if strings.Contains(out, bad) {
+			t.Errorf("card invents defaults in %q:\n%s", bad, out)
+		}
+	}
+}
+
+func TestRenderCard_MeasuredZeroAfterObserved(t *testing.T) {
+	tm := theme.DefaultTheme()
+	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
+	// Once the tail has been observed, a zero count is measured — it must
+	// render as 0, not "not reported".
+	card := SessionCard{SessionID: "s", Observed: true, MetricsReported: true}
+	out := renderCard(tm, card, 0, false, true /*plain*/, now)
+	for _, want := range []string{"tools 0", "turns 0"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("card output missing %q:\n%s", want, out)
+		}
+	}
+}
+
+func TestIsLiveState_EmptyIsNotLive(t *testing.T) {
+	if isLiveState("") {
+		t.Error("empty daemon state must not animate as running")
+	}
+	if !isLiveState("running") {
+		t.Error("running must stay live")
 	}
 }
 

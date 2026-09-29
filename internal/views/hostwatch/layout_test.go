@@ -226,10 +226,10 @@ func TestRenderGrid_TinyTerminalCompactList(t *testing.T) {
 		t.Errorf("compact list must keep issue ids, got:\n%s", out)
 	}
 	// At minCardWidth-1 the fallback engages; at minCardWidth cards render.
-	if got := renderGrid(tm, cards, 0, 0, minCardWidth-1, 0, true, now); strings.Contains(got, "⏱") {
+	if got := renderGrid(tm, cards, 0, 0, minCardWidth-1, 0, true, now); strings.Contains(got, "elapsed ") {
 		t.Errorf("below min width should be compact, got:\n%s", got)
 	}
-	if got := renderGrid(tm, cards, 0, 0, minCardWidth, 0, true, now); !strings.Contains(got, "⏱") {
+	if got := renderGrid(tm, cards, 0, 0, minCardWidth, 0, true, now); !strings.Contains(got, "elapsed unknown") {
 		t.Errorf("at min width full cards should render, got:\n%s", got)
 	}
 }
