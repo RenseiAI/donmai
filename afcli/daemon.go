@@ -58,18 +58,26 @@ func withControlToken(cfg afclient.DaemonConfig) afclient.DaemonConfig {
 	if strings.TrimSpace(cfg.ControlToken) != "" {
 		return cfg
 	}
+	cfg.ControlToken = resolveControlToken()
+	return cfg
+}
+
+// resolveControlToken returns the operator's control token (best-effort):
+// the explicit env override wins, otherwise the token file. "" when neither
+// yields one.
+func resolveControlToken() string {
 	if v := strings.TrimSpace(os.Getenv(afclient.ControlTokenEnv)); v != "" {
-		cfg.ControlToken = v
-		return cfg
+		return v
 	}
 	path := controlTokenPath()
 	if path == "" {
-		return cfg
+		return ""
 	}
-	if tok, err := afclient.LoadControlToken(path); err == nil && strings.TrimSpace(tok) != "" {
-		cfg.ControlToken = strings.TrimSpace(tok)
+	tok, err := afclient.LoadControlToken(path)
+	if err != nil {
+		return ""
 	}
-	return cfg
+	return strings.TrimSpace(tok)
 }
 
 // controlTokenPath resolves the token file path: the explicit file-env

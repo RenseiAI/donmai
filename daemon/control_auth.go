@@ -6,63 +6,69 @@ import (
 	"strings"
 )
 
-// controlAuthForTest overrides the token gate in tests. Non-nil means the
-// gate is active with exactly this token; nil + empty daemon token means
-// legacy open mode. Production never sets it.
-var controlAuthForTest *string
+// controlAuthMode is the state of the mutating-route gate for one request.
+type controlAuthMode int
 
-// setControlAuthForTest activates the mutating-route gate with token for
-// the calling test, restoring the previous state on cleanup.
-func setControlAuthForTest(t interface {
-	Cleanup(func())
-	Helper()
-}, token string,
-) {
-	t.Helper()
-	prev := controlAuthForTest
-	cp := token
-	controlAuthForTest = &cp
-	t.Cleanup(func() { controlAuthForTest = prev })
-}
+const (
+	// controlAuthOpen passes every request through. Only reachable when
+	// the daemon was built without RequireControlToken and without a
+	// token — the legacy mode tests and local harnesses use.
+	controlAuthOpen controlAuthMode = iota
+	// controlAuthEnforced requires the configured bearer token.
+	controlAuthEnforced
+	// controlAuthUnavailable refuses every mutating request: the gate is
+	// required but the daemon holds no token (minting or reading it
+	// failed). Fail closed rather than run the routes unauthenticated.
+	controlAuthUnavailable
+)
 
-// controlTokenForRequest returns the gate token when the gate is active:
-// the test override wins, otherwise the daemon's own configured token.
-// ("", false) means open mode — no gate.
-func controlTokenForRequest(d *Daemon) (string, bool) {
-	if controlAuthForTest != nil {
-		return *controlAuthForTest, true
-	}
+// controlTokenUnavailableMessage is the body the gate returns while it is
+// required but holds no token. It names the remedy without echoing any
+// path, error detail, or credential.
+const controlTokenUnavailableMessage = "control token unavailable: mutating control routes are disabled until the daemon restarts with a readable control token; read-only routes stay available"
+
+// controlAuthState reports the gate mode and, when enforced, the token.
+func controlAuthState(d *Daemon) (controlAuthMode, string) {
 	if d == nil {
-		return "", false
+		return controlAuthOpen, ""
 	}
 	if tok := strings.TrimSpace(d.opts.ControlToken); tok != "" {
-		return tok, true
+		return controlAuthEnforced, tok
 	}
-	return "", false
+	if d.opts.RequireControlToken {
+		return controlAuthUnavailable, ""
+	}
+	return controlAuthOpen, ""
 }
 
 // requireControlAuth gates the mutating methods of a control handler behind
 // the per-install bearer token. GET requests pass through untouched so
 // read-only status stays available to dashboards, spawned workers fetching
-// their own session detail, and liveness probes. When no token is configured
-// the gate stays open so pre-token daemons, tests, and local harnesses keep
-// working; the production entry point always configures one.
+// their own session detail, and liveness probes. When the gate is required
+// but no token is loaded, mutating requests get 503 — the gate fails
+// closed. Only a daemon built with neither a token nor RequireControlToken
+// (tests, harnesses) runs the routes open.
 func (s *Server) requireControlAuth(next http.HandlerFunc) http.HandlerFunc {
 	return func(w http.ResponseWriter, r *http.Request) {
 		if r.Method == http.MethodGet {
 			next(w, r)
 			return
 		}
-		want, gated := controlTokenForRequest(s.daemon)
-		if !gated {
+		mode, want := controlAuthState(s.daemon)
+		switch mode {
+		case controlAuthOpen:
 			next(w, r)
-			return
+		case controlAuthEnforced:
+			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
+			if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid control token"})
+				return
+			}
+			next(w, r)
+		default:
+			// controlAuthUnavailable, and any mode added later without a
+			// case here, refuses: the gate fails closed.
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": controlTokenUnavailableMessage})
 		}
-		got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
-		if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid control token"})
-			return
-		}
-		next(w, r)
 	}
 }
