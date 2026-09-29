@@ -74,7 +74,8 @@ Verbatim from F.1.1 §5; classification owned by `runner/failure.go`.
 | `lost-ownership` | Heartbeat 3-strike threshold tripped (or worktree retry detected ownership loss). |
 | `timeout` | `ctx` cancelled before terminal event. |
 | `backstop-failed` | Stage 2 of tail recovery ran but could not push or open a PR. |
-| `continuations-exhausted` | A turn still ended unfinished (no turn-result manifest, no PR, no verdict) after the limit of continuation prompts. |
+| `continuations-unproductive` | A turn still ended unfinished (no turn-result manifest, no PR, no verdict) after `TurnContinuationLimit` consecutive continuation prompts whose turns made no tool call. |
+| `continuations-ceiling` | A turn still ended unfinished after `TurnContinuationCeiling` continuation prompts in total, productive or not. |
 
 ## Tail recovery
 
@@ -100,13 +101,29 @@ Before either stage, the runner reads how the latest turn ended
 - A blocked or failed verdict is never continued; a passed verdict without a
   pull request gets the steering nudge, once.
 
-Continuations and retries are each bounded by `Options.TurnContinuationLimit`
-(default 3; negative disables them). A turn still unfinished at the bound fails
-the session (`continuations-exhausted`, or `provider-error` for retries). No
+Continuations are bounded by progress. A turn is productive when its event
+stream carried at least one tool call (`agent.ToolUseEvent`); whether the call
+changed the workspace is not judged, because read or write semantics are
+harness-specific.
+
+- `Options.TurnContinuationLimit` (default 3) bounds the *consecutive*
+  continuation prompts whose turn made no tool call. Any productive turn
+  (continuation, retry or nudge) resets the streak, so an agent that ends its
+  turns early but keeps working is not cut off. Exhausted:
+  `continuations-unproductive`.
+- `Options.TurnContinuationCeiling` (default 50) bounds continuation prompts in
+  total, productive or not. Exhausted: `continuations-ceiling`.
+- Provider-error retries keep a total bound of `TurnContinuationLimit` with no
+  progress reset. Exhausted: `provider-error`.
+
+For each option zero is the default; a negative limit disables continuations
+and retries, and a negative ceiling removes the ceiling. The session's own
+duration and token budgets cover every follow-up turn. At an exhausted bound no
 nudge follows, but the backstop still makes its open-PR attempt, so the work is
 pushed and a real pull request the verifier could not confirm is recovered; the
-session stays failed.
-`Result.TurnContinuations` carries the counts onto the terminal status.
+session stays failed. `Result.TurnContinuations` carries the counts (total
+continuations, the unproductive streak, retries) and both bounds onto the
+terminal status.
 
 Two-stage post-completion recovery (F.0.1 §1):
 
