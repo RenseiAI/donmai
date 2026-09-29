@@ -560,5 +560,6 @@ Promise.resolve()
 NODE
 
 bash "${root_dir}/scripts/test-sign-and-notarize.sh"
+bash "${root_dir}/scripts/test-fast-lane.sh"
 
 printf 'release workflow tests: PASS\n'

@@ -25,6 +25,29 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   status adds `unproductive` (the streak at the end of the session) and
   `ceiling`.
 
+### Chores
+
+- While the fast lane is on, `make ship` lands a change from a worktree on
+  `main` as one commit. It runs the local gates, with the test suite in a
+  Linux podman container (`make test-podman`) and the release contract tests
+  whenever release-path files change. It then posts the `local-verify`
+  attestation and fast-forwards `main`. It never tags or publishes.
+- `make release` is the daily release train. When `main` has commits since
+  the last tag, it:
+  - prepares the CHANGELOG section;
+  - lands that commit through the same gated, attested path;
+  - tags it with a signed tag;
+  - watches the release, worker-image and E2B runs and the Homebrew cask.
+
+  It is non-interactive and safe to re-run after a failure. When there is
+  nothing new, it checks that the latest release finished: its publisher
+  runs, the GitHub release and the cask. It prints "nothing to release" only
+  when they are all complete, and fails otherwise.
+- Both commands require the organization `FAST_LANE` variable to be `on`, with
+  no repository variable of that name. They read it again before `main` moves
+  and before tagging. `DRY_RUN=1` previews either one without changing
+  anything.
+
 ## v0.72.54 — 2026-09-28
 
 ### Fixes
