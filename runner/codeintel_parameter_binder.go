@@ -46,6 +46,11 @@ func decodeCodeIntelParameters(payload json.RawMessage) (rawCodeIntelParameters,
 	if !ok || bytes.Equal(bytes.TrimSpace(raw), []byte("null")) {
 		return rawCodeIntelParameters{}, fmt.Errorf("code-intelligence parameters are missing")
 	}
+	// encoding/json silently replaces invalid UTF-8 with U+FFFD, so validate
+	// the raw member bytes before any decode can make the input lossy.
+	if !utf8.Valid(raw) {
+		return rawCodeIntelParameters{}, fmt.Errorf("code-intelligence parameters are not valid UTF-8")
+	}
 	var members map[string]json.RawMessage
 	if err := json.Unmarshal(raw, &members); err != nil {
 		return rawCodeIntelParameters{}, fmt.Errorf("decode code-intelligence parameters")
@@ -60,7 +65,7 @@ func decodeCodeIntelParameters(payload json.RawMessage) (rawCodeIntelParameters,
 	var out rawCodeIntelParameters
 	for name, target := range map[string]*string{"repo": &out.Repo, "ref": &out.Ref, "repoPath": &out.RepoPath} {
 		if value, present := members[name]; present {
-			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) || json.Unmarshal(value, target) != nil || !utf8.ValidString(*target) {
+			if bytes.Equal(bytes.TrimSpace(value), []byte("null")) || json.Unmarshal(value, target) != nil {
 				return rawCodeIntelParameters{}, fmt.Errorf("code-intelligence parameter %q is malformed", name)
 			}
 		}
@@ -133,6 +138,11 @@ func selectedCodeIntelSurface(declaration agent.CapabilityRealizationDeclaration
 }
 
 func (b *codeIntelParameterBinder) Bind(context CapabilityParameterBindingContext) (CapabilityParameterBindResult, error) {
+	// The executioncell digest refuses duplicate member names at any depth,
+	// which Go's map decode below would otherwise resolve last-wins.
+	if payloadDigest, err := executioncell.DigestOperationalPayload(context.OperationalPayload); err != nil || payloadDigest != context.Requirement.OperationalPayloadDigest {
+		return CapabilityParameterBindResult{}, fmt.Errorf("code-intelligence operational payload digest mismatch")
+	}
 	params, err := decodeCodeIntelParameters(context.OperationalPayload)
 	if err != nil {
 		return CapabilityParameterBindResult{}, err

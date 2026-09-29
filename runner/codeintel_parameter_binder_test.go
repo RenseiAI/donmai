@@ -79,24 +79,42 @@ func codeIntelBindingFixture(t *testing.T, raw string, harness agent.HarnessName
 	if err != nil {
 		t.Fatal(err)
 	}
-	payload := json.RawMessage(raw)
+	resolved, err := binders.ResolveAndBind(realizations, codeIntelRequirementFacts(t, raw), json.RawMessage(raw), harness, profile, mode)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return resolved
+}
+
+// codeIntelRequirementFacts derives admission facts from a well-formed payload;
+// it fails the test when either digest cannot be computed.
+func codeIntelRequirementFacts(t *testing.T, raw string) agent.CapabilityParameterRequirementFacts {
+	t.Helper()
 	var members map[string]json.RawMessage
-	if err := json.Unmarshal(payload, &members); err != nil {
+	if err := json.Unmarshal([]byte(raw), &members); err != nil {
 		t.Fatal(err)
 	}
 	parametersDigest, err := executioncell.DigestCapabilityParameters(members["codeIntel"])
 	if err != nil {
 		t.Fatal(err)
 	}
-	operationalDigest, err := executioncell.DigestOperationalPayload(payload)
+	operationalDigest, err := executioncell.DigestOperationalPayload([]byte(raw))
 	if err != nil {
 		t.Fatal(err)
 	}
-	resolved, err := binders.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: "example.code-intelligence/v1", ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}, payload, harness, profile, mode)
+	return agent.CapabilityParameterRequirementFacts{CapabilityID: "example.code-intelligence/v1", ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}
+}
+
+// bindCodeIntelDirect calls the binder itself, bypassing the registry's own
+// operational digest check, so each test pins the binder boundary alone.
+func bindCodeIntelDirect(t *testing.T, raw string, facts agent.CapabilityParameterRequirementFacts) (CapabilityParameterBindResult, error) {
+	t.Helper()
+	_, compiled := codeIntelRealizationFixture(t, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous, true)
+	binder, err := NewCodeIntelParameterBinder(testCodeIntelBinderDigest)
 	if err != nil {
 		t.Fatal(err)
 	}
-	return resolved
+	return binder.Bind(CapabilityParameterBindingContext{Requirement: facts, OperationalPayload: json.RawMessage(raw), Realization: compiled})
 }
 
 func TestCodeIntelParameterBinderProducesAtomicNativeResult(t *testing.T) {
@@ -141,6 +159,107 @@ func TestCodeIntelParameterBinderRejectsStrictToolAndPathInputs(t *testing.T) {
 			operationalDigest, _ := executioncell.DigestOperationalPayload(payload)
 			if _, err := binders.ResolveAndBind(realizations, agent.CapabilityParameterRequirementFacts{CapabilityID: "example.code-intelligence/v1", ParametersDigest: parametersDigest, OperationalPayloadDigest: operationalDigest}, payload, agent.HarnessPi, "pi/test/native-v1", agent.PromptModeAutonomous); err == nil {
 				t.Fatal("malformed parameter input bound")
+			}
+		})
+	}
+}
+
+func TestCodeIntelParameterBinderRefusesDuplicateJSONKeys(t *testing.T) {
+	// Each duplicate-bearing payload decodes last-wins to its clean
+	// counterpart, so the facts are exactly what an admitted clean payload
+	// would carry. The clean control must bind; the duplicate must not.
+	tests := []struct {
+		name, clean, duplicate string
+		secrets                []string
+	}{
+		{
+			name:      "outer codeIntel member",
+			clean:     `{"codeIntel":{"repoPath":"kept-path"}}`,
+			duplicate: `{"codeIntel":{"repoPath":"shadowed-path"},"codeIntel":{"repoPath":"kept-path"}}`,
+			secrets:   []string{"codeIntel", "shadowed-path", "kept-path"},
+		},
+		{
+			name:      "sibling key",
+			clean:     `{"codeIntel":{"tools":[]},"siblingNote":"kept-note"}`,
+			duplicate: `{"codeIntel":{"tools":[]},"siblingNote":"shadowed-note","siblingNote":"kept-note"}`,
+			secrets:   []string{"siblingNote", "shadowed-note", "kept-note"},
+		},
+		{
+			name:      "nested sibling key",
+			clean:     `{"codeIntel":{"tools":[]},"siblingMeta":{"depth":"kept-depth"}}`,
+			duplicate: `{"codeIntel":{"tools":[]},"siblingMeta":{"depth":"shadowed-depth","depth":"kept-depth"}}`,
+			secrets:   []string{"siblingMeta", "depth", "shadowed-depth", "kept-depth"},
+		},
+		{
+			name:      "inside codeIntel",
+			clean:     `{"codeIntel":{"repoPath":"kept-path"}}`,
+			duplicate: `{"codeIntel":{"repoPath":"shadowed-path","repoPath":"kept-path"}}`,
+			secrets:   []string{"repoPath", "shadowed-path", "kept-path"},
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := codeIntelRequirementFacts(t, tc.clean)
+			if _, err := bindCodeIntelDirect(t, tc.clean, facts); err != nil {
+				t.Fatalf("clean control refused: %v", err)
+			}
+			_, err := bindCodeIntelDirect(t, tc.duplicate, facts)
+			if err == nil {
+				t.Fatal("duplicate parameter key bound")
+			}
+			for _, secret := range tc.secrets {
+				if strings.Contains(err.Error(), secret) {
+					t.Fatalf("refusal echoes payload content %q: %v", secret, err)
+				}
+			}
+		})
+	}
+}
+
+func TestCodeIntelParameterBinderRefusesInvalidUTF8Parameters(t *testing.T) {
+	// encoding/json would bind these as U+FFFD replacements, and both
+	// admission digests accept them, so only the raw-byte check refuses.
+	tests := []struct{ name, clean, invalid string }{
+		{name: "repoPath", clean: `{"codeIntel":{"repoPath":"pkg"}}`, invalid: "{\"codeIntel\":{\"repoPath\":\"pkg\xff\"}}"},
+		{name: "repo", clean: `{"codeIntel":{"repo":"example/repo"}}`, invalid: "{\"codeIntel\":{\"repo\":\"example/\xffrepo\"}}"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if _, err := bindCodeIntelDirect(t, tc.clean, codeIntelRequirementFacts(t, tc.clean)); err != nil {
+				t.Fatalf("clean control refused: %v", err)
+			}
+			result, err := bindCodeIntelDirect(t, tc.invalid, codeIntelRequirementFacts(t, tc.invalid))
+			if err == nil {
+				t.Fatalf("invalid UTF-8 parameter bound lossily: config=%s", result.Materialization.Config)
+			}
+			if strings.Contains(err.Error(), "\xff") || strings.Contains(err.Error(), "\uFFFD") {
+				t.Fatalf("refusal echoes payload bytes: %q", err)
+			}
+		})
+	}
+}
+
+func TestCodeIntelParameterBinderRefusesDigestMismatch(t *testing.T) {
+	const payload = `{"codeIntel":{"repoPath":"pkg"}}`
+	other := codeIntelRequirementFacts(t, `{"codeIntel":{"repoPath":"other"},"extra":true}`)
+	tests := []struct {
+		name   string
+		mutate func(*agent.CapabilityParameterRequirementFacts)
+	}{
+		{name: "parameters digest", mutate: func(f *agent.CapabilityParameterRequirementFacts) { f.ParametersDigest = other.ParametersDigest }},
+		{name: "operational payload digest", mutate: func(f *agent.CapabilityParameterRequirementFacts) {
+			f.OperationalPayloadDigest = other.OperationalPayloadDigest
+		}},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			facts := codeIntelRequirementFacts(t, payload)
+			if _, err := bindCodeIntelDirect(t, payload, facts); err != nil {
+				t.Fatalf("matching facts refused: %v", err)
+			}
+			tc.mutate(&facts)
+			if _, err := bindCodeIntelDirect(t, payload, facts); err == nil {
+				t.Fatal("payload bound against mismatched requirement facts")
 			}
 		})
 	}
