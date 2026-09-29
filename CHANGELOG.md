@@ -8,6 +8,43 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.54 — 2026-09-28
+
+### Fixes
+
+- For work that owes a pull request, the runner accepts a pull request URL
+  only after it verifies, with `git ls-remote` and the credential the session
+  already pushes with, that the pull request is on the session's own
+  repository and its head is the session branch or the checkout's HEAD. A URL
+  that merely appears in the conversation, such as an example quoted in the
+  task prompt, no longer ends the session as completed with the "open a pull
+  request" nudge and the backstop skipped. The GitHub CLI is not needed;
+  https, credential-bearing https, `ssh://` and scp-like remotes are all
+  recognised, and a pull request head that lags a push is re-read on the next
+  check instead of being refused for good.
+- A turn that ends before the work is done gets follow-up turns. A clean turn
+  end with no turn-result manifest, no verified pull request and no verdict
+  gets a short "continue the task" prompt; a turn that ended on a model
+  provider error is retried after a short wait instead of being nudged. A
+  blocked or failed verdict is never continued. Each count is bounded by
+  `Options.TurnContinuationLimit` (default 3; a negative value keeps the
+  single nudge). A turn still unfinished at the bound fails the session as
+  `continuations-exhausted` or `provider-error`, with the count in the error;
+  on an exhausted continuation limit the backstop still makes its
+  open-pull-request attempt. The counts are reported as `turnContinuations`
+  on the terminal status. The pi harness now reports an assistant message
+  that ended with stop reason `error` as a provider-error observation.
+- Before teardown, the runner archives work that no remote holds
+  (uncommitted and untracked changes and unpushed commits in each mutable
+  checkout) as a patch plus a JSON sidecar under `Options.RescueDir` (default:
+  a `rescue` directory beside the worktree parent), and the log names the
+  file. The patch must reproduce the working tree when applied to its base;
+  when it cannot be written or proven, the workarea is kept instead of
+  deleted. A session keeps its newest 5 archives, and other sessions'
+  archives are never pruned.
+
 ## v0.72.53 — 2026-09-28
 
 ### Fixes
