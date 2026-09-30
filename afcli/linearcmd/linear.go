@@ -128,7 +128,6 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearUpdateIssueCmd(ds, bin))
 	cmd.AddCommand(newLinearListCommentsCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateCommentCmd(ds, bin))
-	cmd.AddCommand(newLinearCommentCmd(ds, bin))
 	cmd.AddCommand(newLinearAddRelationCmd(ds, bin))
 	cmd.AddCommand(newLinearListRelationsCmd(ds, bin))
 	cmd.AddCommand(newLinearRemoveRelationCmd(ds, bin))
@@ -361,7 +360,7 @@ func resolveLabelIDs(ctx context.Context, client labelLister, names []string) ([
 	return ids, nil
 }
 
-// getBlockingIssues returns issues that are blocking the given issue (non-Accepted).
+// getBlockingIssues returns active blockers; Done and Accepted dependencies are ready.
 func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string) ([]map[string]any, error) {
 	relations, err := client.GetIssueRelations(ctx, issueID)
 	if err != nil {
@@ -376,7 +375,7 @@ func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string
 		if err != nil {
 			return nil, fmt.Errorf("get blocking issue %q: %w", rel.IssueID, err)
 		}
-		if blocker.State.Name == "Accepted" {
+		if blocker.State.Name == "Done" || blocker.State.Name == "Accepted" {
 			continue
 		}
 		blockers = append(blockers, map[string]any{
@@ -967,8 +966,13 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 	)
 
 	cmd := &cobra.Command{
-		Use:          "create-comment <issue-id>",
-		Short:        "Create a comment on an issue",
+		Use:     "create-comment <issue-id>",
+		Aliases: []string{"comment"},
+		Short:   "Create a comment on an issue",
+		Long: `Create a comment on an issue.
+
+The comment spelling remains supported for existing automation.
+Both spellings accept --body or --body-file; file content takes precedence.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1499,8 +1503,13 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 
 func newLinearCheckBlockedCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
-		Use:          "check-blocked <issue-id>",
-		Short:        "Check if an issue is blocked",
+		Use:   "check-blocked <issue-id>",
+		Short: "Check if an issue is blocked",
+		Long: `Check active blockers of an issue.
+
+Dependencies named Done or Accepted are ready. Other states, including
+Finished and Delivered, remain active blockers. Use list-relations to inspect
+historical relations, including dependencies that are already ready.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1629,8 +1638,14 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 	)
 
 	cmd := &cobra.Command{
-		Use:          "list-unblocked-backlog",
-		Short:        "List unblocked grooming-target issues for a project",
+		Use:   "list-unblocked-backlog",
+		Short: "List unblocked grooming-target issues for a project",
+		Long: `List candidate issues without active blockers for a project.
+
+Dependencies named Done or Accepted are ready. Other states, including
+Finished and Delivered, remain active blockers. Use list-relations to inspect
+historical relations. The --statuses flag selects candidate workflow states;
+dependency readiness does not change that selection.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Apply env defaults for grooming scope (brand-neutral DONMAI_* vars).
@@ -1994,58 +2009,6 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 	cmd.Flags().StringVar(&team, "team", "", "Team name or key (defaults to source issue's team)")
 	cmd.Flags().StringVar(&project, "project", "", "Project name (defaults to source issue's project)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee name or email")
-
-	return cmd
-}
-
-// ─── comment ──────────────────────────────────────────────────────────────────
-
-// newLinearCommentCmd provides the `comment <issue-id> --body <text>` verb used
-// by the backlog groomer to post its run summary. It is a first-class command
-// (rather than an alias for create-comment) so the grooming CLI contract is
-// met exactly: `rensei linear comment <id> --body <text>`.
-func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	var (
-		body     string
-		bodyFile string
-	)
-
-	cmd := &cobra.Command{
-		Use:          "comment <issue-id>",
-		Short:        "Post a comment on an issue (groomer run summary)",
-		Args:         cobra.ExactArgs(1),
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			resolvedBody, err := resolveFileArg(body, bodyFile)
-			if err != nil {
-				return err
-			}
-			if resolvedBody == "" {
-				return cli.UserError(
-					"--body or --body-file is required",
-					"Usage: "+cmd.UseLine()+" --body \"Comment text\"",
-				)
-			}
-
-			client, err := newLinearClient(ds, bin)
-			if err != nil {
-				return err
-			}
-			comment, err := client.CreateComment(cmd.Context(), args[0], resolvedBody)
-			if err != nil {
-				return fmt.Errorf("create comment: %w", err)
-			}
-
-			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
-				"id":        comment.ID,
-				"body":      comment.Body,
-				"createdAt": comment.CreatedAt,
-			})
-		},
-	}
-
-	cmd.Flags().StringVar(&body, "body", "", "Comment body text")
-	cmd.Flags().StringVar(&bodyFile, "body-file", "", "Path to file containing comment body")
 
 	return cmd
 }

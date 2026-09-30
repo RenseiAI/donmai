@@ -1016,6 +1016,30 @@ func rootedMkdirAll(name string, mode fs.FileMode) error {
 	return root.MkdirAll(filepath.FromSlash(rel), mode)
 }
 
+// lstatDirectoryLeaf inspects the final component relative to its opened
+// parent. It preserves Lstat's refusal to follow a leaf symlink while keeping
+// directory creation and inspection on the same descriptor-based API.
+func lstatDirectoryLeaf(name string) (os.FileInfo, error) {
+	parent := filepath.Dir(name)
+	leaf := filepath.Base(name)
+	if parent == name {
+		leaf = "."
+	}
+	root, err := os.OpenRoot(parent)
+	if err != nil {
+		return nil, err
+	}
+	info, statErr := root.Lstat(leaf)
+	closeErr := root.Close()
+	if statErr != nil {
+		return nil, statErr
+	}
+	if closeErr != nil {
+		return nil, closeErr
+	}
+	return info, nil
+}
+
 func durableMkdirAll(name string, mode fs.FileMode, syncFn func(string) error) error {
 	abs, err := filepath.Abs(name)
 	if err != nil {
@@ -1024,7 +1048,7 @@ func durableMkdirAll(name string, mode fs.FileMode, syncFn func(string) error) e
 	var missing []string
 	ancestor := filepath.Clean(abs)
 	for {
-		info, statErr := os.Lstat(ancestor)
+		info, statErr := lstatDirectoryLeaf(ancestor)
 		if statErr == nil {
 			if !info.IsDir() || info.Mode()&os.ModeSymlink != 0 {
 				return fmt.Errorf("durable mkdir ancestor %q is not a non-link directory", ancestor)
