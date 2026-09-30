@@ -19,7 +19,8 @@ import "context"
 //   - Spawn returns a Handle whose Events channel emits exactly one
 //     InitEvent, then zero or more assistant/tool events, then exactly
 //     one terminal ResultEvent (or ErrorEvent followed by close), then
-//     closes.
+//     closes. An ErrorEvent with SessionContinues set is not a terminal:
+//     it is one of the events before it.
 //   - Resume continues a previously interrupted session, gated by
 //     Capabilities().SupportsSessionResume; providers that do not
 //     support resume return ErrUnsupported.

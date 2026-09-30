@@ -221,6 +221,21 @@ func TestSpawnComplete_ErrorEvent_IsError(t *testing.T) {
 	}
 }
 
+func TestSpawnComplete_ErrorTheSessionContinuesPast_IsNotAFailure(t *testing.T) {
+	h := &fakeHarness{events: []Event{
+		ErrorEvent{Message: "one tool call unproven; the session continues", Code: "policy_adjudication_missing", SessionContinues: true},
+		AssistantTextEvent{Text: `{"verdict":"pass"}`},
+		ResultEvent{Success: true},
+	}}
+	res, err := SpawnComplete(context.Background(), h, OneShotRequest{Messages: []Message{{Content: "x"}}})
+	if err != nil {
+		t.Fatalf("an error the session continued past failed the one-shot: %v", err)
+	}
+	if res.Text != `{"verdict":"pass"}` {
+		t.Errorf("Text = %q; want the session's answer", res.Text)
+	}
+}
+
 func TestSpawnComplete_NoTerminalEvent_IsError(t *testing.T) {
 	h := &fakeHarness{events: []Event{AssistantTextEvent{Text: "partial"}}} // channel closes, no ResultEvent
 	_, err := SpawnComplete(context.Background(), h, OneShotRequest{Messages: []Message{{Content: "x"}}})
