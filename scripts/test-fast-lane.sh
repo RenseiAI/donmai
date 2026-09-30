@@ -88,20 +88,35 @@ case "$1" in
     git --git-dir "${origin}" tag -a "${version}" -m "${version}" "${sha}"
     exit 0 ;;
   run)
-    if [[ "$2" == list ]]; then
-      [[ ! -f "$d/run-list.fail" ]] || { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
-      workflow=''
-      while [[ $# -gt 0 ]]; do [[ "$1" != --workflow ]] || workflow="$2"; shift; done
-      case "${workflow}" in release.yml) id=101 ;; worker-image.yml) id=102 ;; *) id=103 ;; esac
-      [[ ! -f "$d/runs-missing-${workflow}" ]] || { echo '[]'; exit 0; }
-      git --git-dir "${origin}" for-each-ref --format='%(refname:short)' 'refs/tags/v*' |
-        while read -r tag; do
-          jq -cn --argjson id "${id}" --arg sha "$(tag_commit "${tag}")" --arg tag "${tag}" \
-            '{databaseId:$id,headSha:$sha,headBranch:$tag}'
-        done | jq -s .
-      exit 0
+    [[ "$2" == list ]] || { echo "UNEXPECTED gh run $*" >>"$d/unexpected"; exit 64; }
+    [[ ! -f "$d/run-list.fail" ]] || { echo 'HTTP 502: Bad Gateway' >&2; exit 1; }
+    workflow=''
+    while [[ $# -gt 0 ]]; do [[ "$1" != --workflow ]] || workflow="$2"; shift; done
+    case "${workflow}" in release.yml) id=101 ;; worker-image.yml) id=102 ;; *) id=103 ;; esac
+    [[ ! -f "$d/runs-missing-${workflow}" ]] || { echo '[]'; exit 0; }
+    # The base run is completed+success unless a fixture marks it failed
+    # (run-fail-<id>) or still running (run-pending-<id>). A fixture can also
+    # add duplicate runs of the same workflow/tag/sha via dup-runs-<workflow>:
+    # one JSON run object (without headSha/headBranch, added below) per line.
+    status=completed
+    conclusion=success
+    [[ ! -f "$d/run-fail-${id}" ]] || conclusion=failure
+    if [[ -f "$d/run-pending-${id}" ]]; then
+      status=in_progress
+      conclusion=null
     fi
-    [[ ! -f "$d/run-fail-$3" ]] || { echo "run $3 failed" >&2; exit 1; }
+    git --git-dir "${origin}" for-each-ref --format='%(refname:short)' 'refs/tags/v*' |
+      while read -r tag; do
+        sha="$(tag_commit "${tag}")"
+        jq -cn --argjson id "${id}" --arg sha "${sha}" --arg tag "${tag}" \
+          --arg status "${status}" --arg conclusion "${conclusion}" \
+          '{databaseId:$id,headSha:$sha,headBranch:$tag,status:$status,
+            conclusion:(if $conclusion == "null" then null else $conclusion end)}'
+        [[ ! -f "$d/dup-runs-${workflow}" ]] || while IFS= read -r extra; do
+          [[ -z "${extra}" ]] || jq -c --arg sha "${sha}" --arg tag "${tag}" \
+            '. + {headSha:$sha,headBranch:$tag}' <<<"${extra}"
+        done <"$d/dup-runs-${workflow}"
+      done | jq -s .
     exit 0 ;;
   api) shift ;;
   *) echo "UNEXPECTED gh $*" >>"$d/unexpected"; exit 64 ;;
@@ -696,7 +711,7 @@ before="$(snapshot)"
 run_subject "${primary}" release
 if [[ "${code}" != 0 ]] || ! grep -Fq "nothing to release: origin/main $(origin_main | cut -c1-12) is v0.1.1, and its release, publishers and cask are complete" "${fx}/out"; then
   fail_case "exit ${code}, want 0 with nothing to release" "${fx}/out"
-elif [[ "$(grep -c '^run watch 10[123] ' "${FAKE_GH_DIR}/calls")" != 3 ]]; then
+elif [[ "$(grep -oE -- '--workflow (release|worker-image|e2b-template)\.yml' "${FAKE_GH_DIR}/calls" | sort -u | wc -l | tr -d ' ')" != 3 ]]; then
   fail_case 'the latest release was not checked before nothing to release' "${FAKE_GH_DIR}/calls"
 else
   assert_unchanged "${before}" && pass_case
@@ -799,11 +814,44 @@ if [[ "${code}" != 0 ]]; then
 elif check_released "${old_main}"; then
   if ! grep -q -- '-----BEGIN SSH SIGNATURE-----' <<<"$(git --git-dir "${origin}" cat-file tag v0.1.1)"; then
     fail_case 'tag v0.1.1 is not SSH-signed' "${fx}/out"
-  elif [[ "$(grep -c '^run watch 10[123] ' "${FAKE_GH_DIR}/calls")" != 3 ]]; then
-    fail_case 'not every publisher run was watched' "${FAKE_GH_DIR}/calls"
+  elif [[ "$(grep -oE -- '--workflow (release|worker-image|e2b-template)\.yml' "${FAKE_GH_DIR}/calls" | sort -u | wc -l | tr -d ' ')" != 3 ]]; then
+    fail_case 'not every publisher workflow was checked' "${FAKE_GH_DIR}/calls"
   elif expect_output 'Casks/donmai.rb is at v0.1.1' 'released v0.1.1 at '; then
     pass_case
   fi
+fi
+
+# A tag push can start more than one run of the same workflow for the same
+# commit (GitHub occasionally delivers a duplicate push event); these pin
+# that a workflow reads as done as soon as ANY of its matching runs
+# succeeded, and that a still-running duplicate never blocks a run that
+# already succeeded.
+case_name='release: a duplicate release.yml run succeeding is enough even though another failed'
+new_fixture
+: >"${FAKE_GH_DIR}/run-fail-101"
+printf '{"databaseId":201,"status":"completed","conclusion":"success"}\n' >"${FAKE_GH_DIR}/dup-runs-release.yml"
+old_main="$(origin_main)"
+run_subject "${primary}" release
+if [[ "${code}" != 0 ]]; then
+  fail_case "exit ${code}, want 0 when a duplicate release.yml run succeeded" "${fx}/out"
+elif ! grep -Fq 'release.yml run 201 for v0.1.1 succeeded' "${fx}/out"; then
+  fail_case 'the successful duplicate run was not recognized' "${fx}/out"
+elif check_released "${old_main}"; then
+  pass_case
+fi
+
+case_name='release: one worker-image.yml run succeeding is enough while a duplicate is still running'
+new_fixture
+: >"${FAKE_GH_DIR}/run-pending-102"
+printf '{"databaseId":202,"status":"completed","conclusion":"success"}\n' >"${FAKE_GH_DIR}/dup-runs-worker-image.yml"
+old_main="$(origin_main)"
+run_subject "${primary}" release
+if [[ "${code}" != 0 ]]; then
+  fail_case "exit ${code}, want 0 when a duplicate worker-image.yml run succeeded while another was still running" "${fx}/out"
+elif ! grep -Fq 'worker-image.yml run 202 for v0.1.1 succeeded' "${fx}/out"; then
+  fail_case 'the successful duplicate run was not recognized while another was pending' "${fx}/out"
+elif check_released "${old_main}"; then
+  pass_case
 fi
 
 case_name="release: releases origin/main, not the caller's branch"
@@ -964,7 +1012,7 @@ case_name='release: a failed worker-image run fails the release'
 new_fixture
 : >"${FAKE_GH_DIR}/run-fail-102"
 run_subject "${primary}" release
-if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: worker-image.yml run 102 for v0.1.1 did not succeed' "${fx}/out"; then
+if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: every worker-image.yml run for v0.1.1 failed (102)' "${fx}/out"; then
   fail_case "exit ${code}, want 1 with a failed worker-image run" "${fx}/out"
 else
   pass_case
@@ -1023,12 +1071,17 @@ release_run_failed() { : >"${FAKE_GH_DIR}/run-fail-101"; }
 image_run_failed() { : >"${FAKE_GH_DIR}/run-fail-102"; }
 template_run_missing() { : >"${FAKE_GH_DIR}/runs-missing-e2b-template.yml"; }
 cask_behind() { printf '0.1.0\n' >"${FAKE_GH_DIR}/cask-version"; }
+release_all_duplicates_failed() {
+  : >"${FAKE_GH_DIR}/run-fail-101"
+  printf '{"databaseId":201,"status":"completed","conclusion":"failure"}\n' >"${FAKE_GH_DIR}/dup-runs-release.yml"
+}
 expect_incomplete 'the GitHub release is missing' 'the RenseiAI/donmai v0.1.1 release is missing' release_missing
 expect_incomplete 'the GitHub release is a draft' 'the RenseiAI/donmai v0.1.1 release is still a draft' release_draft
-expect_incomplete 'the release run failed' 'release.yml run 101 for v0.1.1 did not succeed' release_run_failed
-expect_incomplete 'the worker-image run failed' 'worker-image.yml run 102 for v0.1.1 did not succeed' image_run_failed
+expect_incomplete 'the release run failed' 'every release.yml run for v0.1.1 failed (101)' release_run_failed
+expect_incomplete 'the worker-image run failed' 'every worker-image.yml run for v0.1.1 failed (102)' image_run_failed
 expect_incomplete 'no e2b-template run' 'no e2b-template.yml run appeared for v0.1.1' template_run_missing
 expect_incomplete 'the cask is behind' 'RenseiAI/homebrew-tap/Casks/donmai.rb did not move to v0.1.1' cask_behind
+expect_incomplete 'every duplicate release.yml run failed' 'every release.yml run for v0.1.1 failed (101, 201)' release_all_duplicates_failed
 
 case_name='release: only docs since an unfinished release still fails'
 new_fixture
@@ -1051,7 +1104,7 @@ new_fixture
 : >"${FAKE_GH_DIR}/run-fail-103"
 run_subject "${primary}" release
 released="$(origin_main)"
-if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: e2b-template.yml run 103 for v0.1.1 did not succeed' "${fx}/out" ||
+if [[ "${code}" != 1 ]] || ! grep -Fq 'FAILED: every e2b-template.yml run for v0.1.1 failed (103)' "${fx}/out" ||
   ! grep -Fq 'gh run rerun 103 --failed' "${fx}/out"; then
   fail_case "exit ${code}, want 1 with the failed e2b-template run" "${fx}/out"
 elif [[ "$(origin_tag v0.1.1)" != "${released}" ]]; then

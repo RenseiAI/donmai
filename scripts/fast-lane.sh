@@ -207,34 +207,43 @@ gh_lookup() {
 }
 
 # watch_release <tag> <commit>: wait for every publisher of <tag> and stop
-# with a FAILED line unless all of them succeeded: the release.yml,
-# worker-image.yml and e2b-template.yml runs the tag push started, the
-# published GitHub release, and the Homebrew cask at that version. A run that
+# with a FAILED line unless each has at least one successful run: the
+# release.yml, worker-image.yml and e2b-template.yml runs the tag push
+# started, the published GitHub release, and the Homebrew cask at that
+# version. A tag push can start more than one run of the same workflow for
+# the same commit (a duplicated push delivery), so a workflow reads as done
+# as soon as ANY of its matching runs concludes success; this keeps polling
+# while any matching run is still in progress and none has succeeded, and
+# only fails once every matching run has concluded and none did. A run that
 # already finished answers at once, so this also resumes or re-checks an
 # earlier release.
 watch_release() {
-  local tag=$1 commit=$2 workflow runs run_id deadline index=0 release_json cask_json cask
-  local run_ids=()
+  local tag=$1 commit=$2 workflow runs matches deadline count success_id pending fail_ids rerun_cmds
+  local release_json cask_json cask
   for workflow in "${watched_workflows[@]}"; do
     deadline=$((SECONDS + run_wait_seconds))
     while :; do
       runs="$(gh_read "list the ${workflow} runs" run list -R "${repo}" --workflow "${workflow}" --limit 50 \
-        --json databaseId,headSha,headBranch)" || fail "cannot find the ${workflow} run for ${tag}"
-      run_id="$(jq -r --arg sha "${commit}" --arg tag "${tag}" \
-        '[.[] | select(.headSha == $sha and .headBranch == $tag)] | first | .databaseId // ""' <<<"${runs}")"
-      [[ -z "${run_id}" ]] || break
-      [[ ${SECONDS} -lt ${deadline} ]] || fail "no ${workflow} run appeared for ${tag} within ${run_wait_seconds}s"
+        --json databaseId,headSha,headBranch,status,conclusion)" || fail "cannot find the ${workflow} run for ${tag}"
+      matches="$(jq -c --arg sha "${commit}" --arg tag "${tag}" \
+        '[.[] | select(.headSha == $sha and .headBranch == $tag)]' <<<"${runs}")"
+      count="$(jq 'length' <<<"${matches}")"
+      if [[ "${count}" -gt 0 ]]; then
+        success_id="$(jq -r '[.[] | select(.conclusion == "success")][0].databaseId // empty' <<<"${matches}")"
+        if [[ -n "${success_id}" ]]; then
+          log "${workflow} run ${success_id} for ${tag} succeeded"
+          break
+        fi
+        pending="$(jq '[.[] | select(.status != "completed")] | length' <<<"${matches}")"
+        if [[ "${pending}" -eq 0 ]]; then
+          fail_ids="$(jq -r '[.[] | (.databaseId | tostring)] | join(", ")' <<<"${matches}")"
+          rerun_cmds="$(jq -r '[.[] | "gh run rerun \(.databaseId) --failed"] | join("; ")' <<<"${matches}")"
+          fail "every ${workflow} run for ${tag} failed (${fail_ids}): https://github.com/${repo}/actions/workflows/${workflow}. Re-run the failed jobs (${rerun_cmds}) so the tag-push policy still applies; the next make release checks again"
+        fi
+      fi
+      [[ "${count}" -gt 0 || ${SECONDS} -lt ${deadline} ]] || fail "no ${workflow} run appeared for ${tag} within ${run_wait_seconds}s"
       sleep "${poll_seconds}"
     done
-    run_ids+=("${run_id}")
-  done
-  for workflow in "${watched_workflows[@]}"; do
-    run_id="${run_ids[${index}]}"
-    index=$((index + 1))
-    log "watching ${workflow} run ${run_id} for ${tag}"
-    gh run watch "${run_id}" -R "${repo}" --exit-status --interval 30 >"${scratch}/watch.log" 2>&1 </dev/null ||
-      fail "${workflow} run ${run_id} for ${tag} did not succeed ($(tail -1 "${scratch}/watch.log")): https://github.com/${repo}/actions/runs/${run_id}. Re-run its failed jobs (gh run rerun ${run_id} --failed) so the tag-push policy still applies; the next make release checks again"
-    log "${workflow} run ${run_id} succeeded"
   done
   release_json="$(gh_read "read the ${tag} release" api "repos/${repo}/releases/tags/${tag}")" ||
     fail "the ${repo} ${tag} release is missing"
