@@ -191,9 +191,12 @@ type nativeDispatcher struct {
 }
 
 // Dispatch runs one issue on the selected native harness provider and
-// awaits its terminal outcome before returning.
-func (d *nativeDispatcher) Dispatch(ctx context.Context, issue linear.Issue, cfg Config) (*AgentDispatch, error) {
-	ad := &AgentDispatch{
+// awaits its terminal outcome before returning. Cleanup failures join
+// the returned error: a successful terminal result followed by a
+// Shutdown failure still reports failure to the caller, and a terminal
+// error is never lost to (or masked by) a Shutdown failure.
+func (d *nativeDispatcher) Dispatch(ctx context.Context, issue linear.Issue, cfg Config) (ad *AgentDispatch, retErr error) {
+	ad = &AgentDispatch{
 		IssueID:    issue.ID,
 		Identifier: issue.Identifier,
 		Title:      issue.Title,
@@ -223,19 +226,26 @@ func (d *nativeDispatcher) Dispatch(ctx context.Context, issue linear.Issue, cfg
 	}
 
 	ad.Status = DispatchRunning
-	finish := func() {
+	// The deferred cleanup mutates the named return: plain `return ad,
+	// ad.Error` values are evaluated BEFORE deferred calls run, so
+	// without the retErr assignment below a Shutdown failure after a
+	// successful terminal result would label the dispatch failed while
+	// the caller still received a nil error.
+	defer func() {
 		ad.CompletedAt = time.Now()
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 		defer cancel()
 		if serr := provider.Shutdown(shutdownCtx); serr != nil {
 			serr = fmt.Errorf("orchestrator: shutdown %s provider: %w", harness, serr)
+			ad.Status = DispatchFailed
 			if ad.Error == nil {
 				ad.Error = serr
-				ad.Status = DispatchFailed
+			} else {
+				ad.Error = errors.Join(ad.Error, serr)
 			}
+			retErr = ad.Error
 		}
-	}
-	defer finish()
+	}()
 
 	handle, serr := provider.Spawn(ctx, spec)
 	if serr != nil {

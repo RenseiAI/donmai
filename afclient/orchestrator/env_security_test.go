@@ -2,6 +2,7 @@ package orchestrator
 
 import (
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
@@ -249,8 +250,9 @@ func TestNativeDispatcher_CancelStopsOwnedWork(t *testing.T) {
 // scriptedProvider is a minimal agent.Provider for terminal-event controls
 // the stub behavior set does not cover (ResultEvent{Success:false}).
 type scriptedProvider struct {
-	events []agent.Event
-	shut   *atomic.Int64
+	events      []agent.Event
+	shut        *atomic.Int64
+	shutdownErr error
 }
 
 func (p *scriptedProvider) Name() agent.ProviderName { return agent.ProviderStub }
@@ -270,8 +272,19 @@ func (p *scriptedProvider) Shutdown(_ context.Context) error {
 	if p.shut != nil {
 		p.shut.Add(1)
 	}
-	return nil
+	return p.shutdownErr
 }
+
+// failingShutdownProvider wraps an agent.Provider, delegates Spawn to
+// the inner provider, and fails Shutdown with the configured error.
+// It models a provider whose session succeeds while releasing the
+// owned resource fails.
+type failingShutdownProvider struct {
+	agent.Provider
+	err error
+}
+
+func (p *failingShutdownProvider) Shutdown(_ context.Context) error { return p.err }
 
 type scriptedHandle struct {
 	events []agent.Event
@@ -292,6 +305,76 @@ func (h *scriptedHandle) Events() <-chan agent.Event {
 }
 func (h *scriptedHandle) Inject(_ context.Context, _ string) error { return agent.ErrUnsupported }
 func (h *scriptedHandle) Stop(_ context.Context) error             { return nil }
+
+// TestNativeDispatcher_ShutdownFailureAfterSuccessPropagates is the
+// causal control for the cleanup-error defect: a successful terminal
+// ResultEvent followed by a Shutdown failure must label the dispatch
+// failed AND return a non-nil error to the caller. The deferred
+// cleanup runs after `return ad, ad.Error` values are evaluated, so
+// the fix must assign the joined error to the named return — without
+// it this test sees ad.Status=failed with err=nil.
+func TestNativeDispatcher_ShutdownFailureAfterSuccessPropagates(t *testing.T) {
+	issue := linear.Issue{ID: "issue-id", Identifier: "ENG-49", Title: "shutdown fails"}
+	issue.Project.Name = "Project"
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	shutdownErr := errors.New("fixture shutdown failure")
+	factory := ProviderFactoryFunc(func(ctx context.Context, _ string) (agent.Provider, error) {
+		inner, err := (&stubFactory{}).NewProvider(ctx, HarnessClaude)
+		if err != nil {
+			return nil, err
+		}
+		return &failingShutdownProvider{Provider: inner, err: shutdownErr}, nil
+	})
+	d := &nativeDispatcher{factory: factory}
+	ad, err := d.Dispatch(ctx, issue, Config{GitRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("expected dispatch error for Shutdown failure after success, got nil")
+	}
+	if !errors.Is(err, shutdownErr) {
+		t.Fatalf("returned error = %v, want it to wrap the shutdown failure", err)
+	}
+	if ad.Status != DispatchFailed {
+		t.Fatalf("Status = %q, want failed", ad.Status)
+	}
+	if ad.Error == nil || !errors.Is(ad.Error, shutdownErr) {
+		t.Fatalf("AgentDispatch.Error = %v, want the shutdown failure recorded", ad.Error)
+	}
+}
+
+// TestNativeDispatcher_TerminalAndShutdownErrorsJoin proves neither
+// error is lost when the terminal outcome already failed and Shutdown
+// also fails: the returned error must wrap both the terminal error
+// and the shutdown failure.
+func TestNativeDispatcher_TerminalAndShutdownErrorsJoin(t *testing.T) {
+	issue := linear.Issue{ID: "issue-id", Identifier: "ENG-50", Title: "both fail"}
+	issue.Project.Name = "Project"
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	shutdownErr := errors.New("fixture shutdown failure")
+	factory := ProviderFactoryFunc(func(_ context.Context, _ string) (agent.Provider, error) {
+		return &scriptedProvider{
+			events: []agent.Event{
+				agent.ResultEvent{Success: false, Message: "tests failed"},
+			},
+			shutdownErr: shutdownErr,
+		}, nil
+	})
+	d := &nativeDispatcher{factory: factory}
+	ad, err := d.Dispatch(ctx, issue, Config{GitRoot: t.TempDir()})
+	if err == nil {
+		t.Fatal("expected joined dispatch error, got nil")
+	}
+	if !errors.Is(err, shutdownErr) {
+		t.Fatalf("returned error = %v, want it to wrap the shutdown failure", err)
+	}
+	if ad.Error == nil || !strings.Contains(ad.Error.Error(), "tests failed") {
+		t.Fatalf("AgentDispatch.Error = %v, want the terminal failure preserved", ad.Error)
+	}
+	if ad.Status != DispatchFailed {
+		t.Fatalf("Status = %q, want failed", ad.Status)
+	}
+}
 
 // TestNativeDispatcher_FailedResultPropagates proves a terminal
 // ResultEvent{Success:false} maps to DispatchFailed — the literal
