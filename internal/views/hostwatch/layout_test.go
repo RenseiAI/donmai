@@ -99,29 +99,6 @@ func TestModel_SplitKeysAdjustResetAndPersist(t *testing.T) {
 	}
 }
 
-func TestHeaderBudget_HostFirstAndBounded(t *testing.T) {
-	left, gap := headerBudget("myhost", "1 running", 40)
-	line := left + strings.Repeat(" ", gap) + "1 running"
-	if !strings.HasPrefix(line, "myhost") {
-		t.Errorf("header must lead with the host, got %q", line)
-	}
-	if w := lipgloss.Width(line); w != 38 { // width minus 2 chrome cells
-		t.Errorf("header content must fit width-2, got width %d for %q", w, line)
-	}
-	// Narrow: the left truncates with an ellipsis, counters stay intact.
-	left, gap = headerBudget("a-very-long-hostname-that-cannot-fit", "1 running", 24)
-	line = left + strings.Repeat(" ", gap) + "1 running"
-	if !strings.HasSuffix(line, "1 running") {
-		t.Errorf("counters must survive truncation, got %q", line)
-	}
-	if !strings.Contains(left, "…") {
-		t.Errorf("truncated host should carry an ellipsis, got %q", left)
-	}
-	if w := lipgloss.Width(line); w > 22 {
-		t.Errorf("truncated header must fit, got width %d for %q", w, line)
-	}
-}
-
 func TestTruncateWidth_CJK(t *testing.T) {
 	if got := truncateWidth("日本語test", 7); lipgloss.Width(got) != 7 {
 		t.Errorf("CJK truncation must hit its budget, got %q (width %d)", got, lipgloss.Width(got))
@@ -164,14 +141,86 @@ func TestModel_HeaderStyledWidthBounded(t *testing.T) {
 	if w := lipgloss.Width(out); w != 80 {
 		t.Errorf("styled header must fill exactly 80 columns, got %d:\n%s", w, out)
 	}
-	// Narrow styled header truncates left, keeps counters.
+	// Narrow styled header keeps the complete host and primary counter while
+	// reducing secondary counters.
 	m.width = 40
 	out = m.renderHeader()
 	if w := lipgloss.Width(out); w != 40 {
 		t.Errorf("narrow styled header must fill exactly 40 columns, got %d:\n%s", w, out)
 	}
 	if !strings.Contains(stripANSI(out), "running") {
-		t.Errorf("counters must survive narrow truncation:\n%s", out)
+		t.Errorf("primary counter must survive narrow truncation:\n%s", out)
+	}
+	if !strings.Contains(stripANSI(out), "myhost-日本語") {
+		t.Errorf("narrow header must preserve the host prefix:\n%s", out)
+	}
+}
+
+func TestModel_HeaderWidthPriority(t *testing.T) {
+	for _, plain := range []bool{true, false} {
+		mode := "styled"
+		if plain {
+			mode = "plain"
+		}
+		for _, width := range []int{40, 80, 120, 200} {
+			t.Run(fmt.Sprintf("%s/%d", mode, width), func(t *testing.T) {
+				m := New(Options{Plain: plain, HostLabel: "studio-test", ProjectLabel: "qa"})
+				m.width, m.height = width, 36
+				m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+				out := m.renderHeader()
+				if lipgloss.Height(out) != 1 {
+					t.Fatalf("header must remain one line, got %d: %q", lipgloss.Height(out), out)
+				}
+				gotWidth := lipgloss.Width(out)
+				if (!plain && gotWidth != width) || (plain && gotWidth > width) {
+					t.Errorf("header physical width=%d, terminal width=%d, plain=%v: %q", gotWidth, width, plain, out)
+				}
+				visible := strings.TrimSpace(stripANSI(out))
+				if !strings.HasPrefix(visible, "studio-test") {
+					t.Errorf("header lost the meaningful host prefix: %q", visible)
+				}
+				if !strings.Contains(visible, "· qa") {
+					t.Errorf("header dropped a scope that fits beside the host: %q", visible)
+				}
+				if !strings.Contains(visible, "1 running") {
+					t.Errorf("header lost its primary counter: %q", visible)
+				}
+				if width == 40 {
+					if !strings.Contains(visible, "queue 0") || strings.Contains(visible, "uptime") || strings.Contains(visible, "v0.72.55") {
+						t.Errorf("40-column header should keep queue and drop lower-priority uptime/version: %q", visible)
+					}
+				} else if !strings.Contains(visible, "uptime 1m") || !strings.Contains(visible, "v0.72.55") {
+					t.Errorf("wide header should preserve complete counters: %q", visible)
+				}
+			})
+		}
+	}
+}
+
+func TestModel_HeaderTinyWidthsAndUnicode(t *testing.T) {
+	for _, plain := range []bool{true, false} {
+		for _, width := range []int{1, 2, 3, 4, 5, 8, 12, 20, 40} {
+			t.Run(fmt.Sprintf("plain=%t/width=%d", plain, width), func(t *testing.T) {
+				m := New(Options{Plain: plain, HostLabel: "東京-node", ProjectLabel: "team/qa"})
+				m.width, m.height = width, 10
+				m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+				out := m.renderHeader()
+				gotWidth := lipgloss.Width(out)
+				if (!plain && gotWidth != width) || (plain && gotWidth > width) {
+					t.Errorf("tiny/Unicode header width=%d exceeds terminal width=%d: %q", gotWidth, width, out)
+				}
+				if lipgloss.Height(out) != 1 {
+					t.Errorf("tiny/Unicode header must remain one line, got %q", out)
+				}
+				visible := strings.TrimSpace(stripANSI(out))
+				if width >= 12 && !strings.HasPrefix(visible, "東京-node") {
+					t.Errorf("header must preserve the full Unicode host before optional scope/counters: %q", visible)
+				}
+				if width < 12 && width > 2 && !strings.HasPrefix(visible, "東") {
+					t.Errorf("truncated Unicode host must retain its first glyph: %q", visible)
+				}
+			})
+		}
 	}
 }
 
