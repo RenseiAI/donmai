@@ -20,6 +20,13 @@ import (
 
 func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {
 	t.Helper()
+	return mustStartDaemonWith(t, nil)
+}
+
+// mustStartDaemonWith is mustStartDaemon with a hook that adjusts the
+// daemon Options (e.g. the control-token gate) before construction.
+func mustStartDaemonWith(t *testing.T, mutate func(*Options)) (*Daemon, *Server, func()) {
+	t.Helper()
 	tmp := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.Machine.ID = "test-machine"
@@ -31,7 +38,7 @@ func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {
 		t.Fatalf("write config: %v", err)
 	}
 	jwtPath := filepath.Join(tmp, "daemon.jwt")
-	d := New(Options{
+	opts := Options{
 		ConfigPath: cfgPath,
 		JWTPath:    jwtPath,
 		HTTPHost:   "127.0.0.1",
@@ -49,7 +56,11 @@ func mustStartDaemon(t *testing.T) (*Daemon, *Server, func()) {
 		SpawnerOptions: SpawnerOptions{
 			WorkerCommand: []string{"sleep", "10"},
 		},
-	})
+	}
+	if mutate != nil {
+		mutate(&opts)
+	}
+	d := New(opts)
 	if err := d.Start(context.Background()); err != nil {
 		t.Fatalf("daemon Start: %v", err)
 	}

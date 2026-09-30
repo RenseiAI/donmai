@@ -234,24 +234,24 @@ func (s *Server) Shutdown(ctx context.Context) error {
 func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/status", s.method(http.MethodGet, s.handleStatus))
 	mux.HandleFunc("/api/daemon/stats", s.method(http.MethodGet, s.handleStats))
-	mux.HandleFunc("/api/daemon/pause", s.method(http.MethodPost, s.handlePause))
-	mux.HandleFunc("/api/daemon/resume", s.method(http.MethodPost, s.handleResume))
-	mux.HandleFunc("/api/daemon/stop", s.method(http.MethodPost, s.handleStop))
-	mux.HandleFunc("/api/daemon/drain", s.method(http.MethodPost, s.handleDrain))
-	mux.HandleFunc("/api/daemon/restart/prepare", s.method(http.MethodPost, s.handleRestartPrepare))
+	mux.HandleFunc("/api/daemon/pause", s.requireControlAuth(s.method(http.MethodPost, s.handlePause)))
+	mux.HandleFunc("/api/daemon/resume", s.requireControlAuth(s.method(http.MethodPost, s.handleResume)))
+	mux.HandleFunc("/api/daemon/stop", s.requireControlAuth(s.method(http.MethodPost, s.handleStop)))
+	mux.HandleFunc("/api/daemon/drain", s.requireControlAuth(s.method(http.MethodPost, s.handleDrain)))
+	mux.HandleFunc("/api/daemon/restart/prepare", s.requireControlAuth(s.method(http.MethodPost, s.handleRestartPrepare)))
 	mux.HandleFunc(sessionShimAcceptanceRoute, s.handleSessionShimAcceptanceControl)
-	mux.HandleFunc("/api/daemon/update", s.method(http.MethodPost, s.handleUpdate))
-	mux.HandleFunc("/api/daemon/capacity", s.method(http.MethodPost, s.handleSetCapacity))
+	mux.HandleFunc("/api/daemon/update", s.requireControlAuth(s.method(http.MethodPost, s.handleUpdate)))
+	mux.HandleFunc("/api/daemon/capacity", s.requireControlAuth(s.method(http.MethodPost, s.handleSetCapacity)))
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
-	mux.HandleFunc("/api/daemon/pool/evict", s.method(http.MethodPost, s.handlePoolEvict))
-	mux.HandleFunc("/api/daemon/sessions", s.handleSessions) // GET=list, POST=accept
+	mux.HandleFunc("/api/daemon/pool/evict", s.requireControlAuth(s.method(http.MethodPost, s.handlePoolEvict)))
+	mux.HandleFunc("/api/daemon/sessions", s.requireControlAuth(s.handleSessions)) // GET=list, POST=accept
 	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
 	// their full QueuedWork shape via GET <id>; the deterministic cancel
 	// wire posts to <id>/stop to kill exactly one session + free its slot.
 	// The path-pattern dispatch is custom because the stdlib mux only
 	// supports prefix matching pre-Go 1.22 in this codebase, so the single
 	// prefix handler multiplexes both shapes.
-	mux.HandleFunc("/api/daemon/sessions/", s.handleSessionSubroute)
+	mux.HandleFunc("/api/daemon/sessions/", s.requireControlAuth(s.handleSessionSubroute))
 	mux.HandleFunc("/api/daemon/heartbeat", s.method(http.MethodGet, s.handleHeartbeat))
 	mux.HandleFunc("/api/daemon/doctor", s.method(http.MethodGet, s.handleDoctor))
 	// providers (Wave 9)
@@ -264,13 +264,13 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/routing/explain/", s.handleExplainRouting) // trailing slash → prefix matcher
 	// kits (Wave 9)
 	mux.HandleFunc("/api/daemon/kits", s.handleKitsCollection)
-	mux.HandleFunc(kitRoutePrefix, s.handleKitDetail)
+	mux.HandleFunc(kitRoutePrefix, s.requireControlAuth(s.handleKitDetail))
 	mux.HandleFunc("/api/daemon/kit-sources", s.handleKitSourcesCollection)
-	mux.HandleFunc(kitSourceRoutePrefix, s.handleKitSourceDetail)
+	mux.HandleFunc(kitSourceRoutePrefix, s.requireControlAuth(s.handleKitSourceDetail))
 	// workareas (Wave 9) — list, inspect, restore, and diff over the
 	// on-disk archive registry plus active pool members.
 	mux.HandleFunc("/api/daemon/workareas", s.handleWorkareasRoot)
-	mux.HandleFunc("/api/daemon/workareas/", s.handleWorkareaItem)
+	mux.HandleFunc("/api/daemon/workareas/", s.requireControlAuth(s.handleWorkareaItem))
 	// capabilities (Stream H — pool-aware daemon advertises substrate).
 	// GET /api/daemon/capabilities returns the provides[] set detected
 	// at startup and sent to POST /api/workers/register.

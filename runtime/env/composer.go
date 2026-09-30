@@ -288,7 +288,15 @@ func lastEnvValue(entries []string, key string) string {
 // owns it.
 func IsRunnerOnly(key string) bool {
 	switch key {
-	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL":
+	case "ATTACH_TOKEN", "ATTACH_TOKEN_FILE", "ATTACH_URL",
+		"DONMAI_CONTROL_TOKEN", "DONMAI_CONTROL_TOKEN_FILE":
+		// The host control-API bearer token and its path override address
+		// the supervisor (daemon/CLI), never the workload. A spawned
+		// session that inherited either could call the host's mutating
+		// control routes; stripping them here keeps the credential out of
+		// the session's environment. The operator's CLI reads it from the
+		// state-dir file, which a same-user unsandboxed session can still
+		// read — env stripping does not isolate the file.
 		return true
 	case InjectedEnvKeysVar, GatewayUpstreamEnvKeysVar:
 		// Both address this package's own inherited-env filter, which is the

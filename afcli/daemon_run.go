@@ -16,6 +16,7 @@ import (
 	"github.com/spf13/cobra"
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner"
@@ -24,6 +25,35 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
+
+// applyDaemonControlAuth arms the host control-API gate on opts. The host
+// control API requires a bearer token on mutating routes: mint it into the
+// operator's state dir (0600) and hand it to both the server gate and the
+// CLI resolver so they agree. The token does not travel in a spawned
+// session's environment (runner-only env, stripped from every worker
+// environment); a same-user, unsandboxed session can still read the file.
+//
+// The gate is always required here, so it fails closed: when the token
+// cannot be minted or read (or its path does not resolve), the daemon still
+// starts, but every mutating control route refuses with 503 until a restart
+// finds a readable token. Read-only routes and the rest of the daemon keep
+// working. The failure is logged loudly on errOut and through slog.
+func applyDaemonControlAuth(opts *daemon.Options, tokenPath string, errOut io.Writer) {
+	opts.RequireControlToken = true
+	token, err := afclient.EnsureControlToken(tokenPath)
+	token = strings.TrimSpace(token)
+	if err == nil && token == "" {
+		err = fmt.Errorf("control token path unresolved (%s must be an absolute path)", afclient.ControlTokenFileEnv)
+	}
+	if err != nil {
+		_, _ = fmt.Fprintf(errOut,
+			"[daemon] ERROR control token unavailable: %v — mutating control routes are DISABLED (fail closed) "+
+				"until the daemon restarts with a readable control token; read-only routes stay up\n", err)
+		slog.Error("control token unavailable; mutating control routes disabled (fail closed)", "err", err)
+		token = ""
+	}
+	opts.ControlToken = token
+}
 
 func protectedRuntimeMCPHelperCommand(tokenFilePath string) (string, error) {
 	executable, err := mcpheaders.ResolveExecutablePath()
@@ -225,7 +255,7 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if err != nil {
 				return fmt.Errorf("construct daemon provider view: %w", err)
 			}
-			d := daemon.New(daemon.Options{
+			daemonOpts := daemon.Options{
 				ConfigPath:       configPath,
 				BinaryName:       binaryName(cfg),
 				JWTPath:          jwtPath,
@@ -238,7 +268,9 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				ProtectedRuntimeMCPHelperCommandBuilder: protectedRuntimeMCPHelperCommand,
 				SpawnerOptions:                          spawnerOpts,
 				Version:                                 hostVersion,
-			})
+			}
+			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
+			d := daemon.New(daemonOpts)
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 

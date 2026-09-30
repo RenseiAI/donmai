@@ -35,7 +35,7 @@ type providerClientFactory func(cfg afclient.DaemonConfig) providerDaemonClient
 
 // defaultProviderClientFactory is the production factory.
 func defaultProviderClientFactory(cfg afclient.DaemonConfig) providerDaemonClient {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
 }
 
 // providerEnvDaemonURL names the env var that overrides the daemon

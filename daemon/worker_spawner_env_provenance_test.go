@@ -2,8 +2,11 @@ package daemon
 
 import (
 	"strings"
+	"sync"
 	"testing"
+	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -67,6 +70,134 @@ func TestComposeEnv_OrdinaryEntriesStillMerge(t *testing.T) {
 			t.Errorf("composeEnv() = %v, missing %q", got, want)
 		}
 	}
+}
+
+// parentSupervisorKeys are supervisor controls a daemon process can carry in
+// its OWN environment (exported by the operator's shell or service manager).
+// None of them may reach a spawned session.
+var parentSupervisorKeys = []string{
+	afclient.ControlTokenEnv,
+	afclient.ControlTokenFileEnv,
+	"ATTACH_TOKEN",
+	"ATTACH_URL",
+	runtimeenv.InjectedEnvKeysVar,
+	"DONMAI_SESSION_SHIM_ACCEPTANCE_TOKEN_FILE",
+}
+
+// parentOrdinaryEntry is an ordinary inherited variable: the control that the
+// parent filter still passes the rest of the daemon's environment through.
+const (
+	parentOrdinaryKey   = "DONMAI_TEST_PARENT_ORDINARY"
+	parentOrdinaryEntry = parentOrdinaryKey + "=keep"
+)
+
+// setParentSupervisorEnv places every parentSupervisorKeys entry and one
+// ordinary variable in this test process's environment, which is the daemon
+// parent environment composeEnv inherits.
+func setParentSupervisorEnv(t *testing.T) {
+	t.Helper()
+	for _, key := range parentSupervisorKeys {
+		t.Setenv(key, "parent-"+strings.ToLower(key))
+	}
+	t.Setenv(parentOrdinaryKey, "keep")
+}
+
+// TestComposeEnv_StripsRunnerOnlyFromParentEnv pins that the daemon's own
+// inherited environment goes through the runner-only filter: a daemon started
+// with the control token (or its file override) exported must not hand either
+// to the sessions it spawns.
+func TestComposeEnv_StripsRunnerOnlyFromParentEnv(t *testing.T) {
+	setParentSupervisorEnv(t)
+
+	got := composeEnv(nil, nil, nil)
+	for _, key := range parentSupervisorKeys {
+		if envHasKey(got, key) {
+			t.Errorf("parent env %q reached the composed worker env", key)
+		}
+	}
+	if !envHasEntry(got, parentOrdinaryEntry) {
+		t.Errorf("ordinary parent entry %q must still pass through", parentOrdinaryEntry)
+	}
+}
+
+// TestSpawnPaths_ParentControlTokenNeverReachesSession drives both spawn
+// paths with a token-bearing daemon parent: the direct path's exec'd child
+// reports what it actually sees, and the shim path's launcher records the env
+// it is handed.
+func TestSpawnPaths_ParentControlTokenNeverReachesSession(t *testing.T) {
+	setParentSupervisorEnv(t)
+
+	t.Run("direct", func(t *testing.T) {
+		capture := newCaptureWriter()
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "p", Repository: "github.com/a/b"}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand: []string{
+				"/bin/sh", "-c",
+				`printf 'probe ctl=%s ctlfile=%s ordinary=%s\n' "${DONMAI_CONTROL_TOKEN-unset}" "${DONMAI_CONTROL_TOKEN_FILE-unset}" "${DONMAI_TEST_PARENT_ORDINARY-unset}"; exit 0`,
+			},
+			StdoutPrefixWriter: capture,
+		})
+		ended := sessionEnds(s)
+		if _, err := s.AcceptWork(SessionSpec{SessionID: "sess-parent-direct", Repository: "github.com/a/b", Ref: "main"}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		lines := waitForLine(t, capture, "probe ")
+		waitSessionEnd(t, ended)
+		const want = "probe ctl=unset ctlfile=unset ordinary=keep"
+		found := false
+		for _, l := range lines {
+			if strings.Contains(l, want) {
+				found = true
+			}
+		}
+		if !found {
+			t.Errorf("direct child env probe = %v, want a line containing %q", lines, want)
+		}
+	})
+
+	t.Run("shim", func(t *testing.T) {
+		var (
+			mu     sync.Mutex
+			gotEnv []string
+		)
+		launched := make(chan struct{}, 1)
+		s := NewWorkerSpawner(SpawnerOptions{
+			Projects:              []ProjectConfig{{ID: "p", Repository: "github.com/a/b"}},
+			MaxConcurrentSessions: 1,
+			WorkerCommand:         []string{"/bin/sh", "-c", "exit 0"},
+			ShimOwns:              func(SessionSpec) bool { return true },
+			ShimSpawn: func(spec SessionSpec, _ ProjectConfig, env []string) (*SessionHandle, error) {
+				mu.Lock()
+				gotEnv = append([]string(nil), env...)
+				mu.Unlock()
+				select {
+				case launched <- struct{}{}:
+				default:
+				}
+				return &SessionHandle{SessionID: spec.SessionID, State: SessionRunning}, nil
+			},
+		})
+		if _, err := s.AcceptWork(SessionSpec{SessionID: "sess-parent-shim", Repository: "github.com/a/b", Ref: "main"}); err != nil {
+			t.Fatalf("AcceptWork: %v", err)
+		}
+		select {
+		case <-launched:
+		case <-time.After(spawnerWaitTimeout):
+			t.Fatal("timed out waiting for the shim launcher")
+		}
+		mu.Lock()
+		env := append([]string(nil), gotEnv...)
+		mu.Unlock()
+		for _, key := range parentSupervisorKeys {
+			if envHasKey(env, key) {
+				t.Errorf("shim launch env carries parent %q", key)
+			}
+		}
+		if !envHasEntry(env, parentOrdinaryEntry) {
+			t.Errorf("shim launch env lost ordinary parent entry %q", parentOrdinaryEntry)
+		}
+	})
 }
 
 func envHasKey(entries []string, key string) bool {

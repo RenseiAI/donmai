@@ -1,14 +1,18 @@
 package afcli
 
 import (
+	"bytes"
 	"context"
+	"errors"
 	"os"
 	"path/filepath"
 	"strconv"
 	"strings"
 	"testing"
+	"time"
 
 	afcreds "github.com/RenseiAI/donmai/afcli/credentials"
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
@@ -302,5 +306,134 @@ func TestTerminalReceiverAuthorizationResolvesFreshRuntimeToken(t *testing.T) {
 	}
 	if got != "" {
 		t.Fatalf("unauthenticated authorization = %q, want empty", got)
+	}
+}
+
+// unmintableControlTokenPath returns a token path whose parent is a regular
+// file, so minting fails on every platform and for every user (root too).
+func unmintableControlTokenPath(t *testing.T) string {
+	t.Helper()
+	blocker := filepath.Join(t.TempDir(), "not-a-dir")
+	if err := os.WriteFile(blocker, []byte("x"), 0o600); err != nil {
+		t.Fatalf("write blocker: %v", err)
+	}
+	return filepath.Join(blocker, afclient.ControlTokenFileName)
+}
+
+// TestApplyDaemonControlAuth pins the entry-point half of the fail-closed
+// control gate: the daemon always requires the token, and when it cannot be
+// minted or its path does not resolve, it carries no token (so the gate
+// refuses) and says so loudly instead of leaving the routes open.
+func TestApplyDaemonControlAuth(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name      string
+		path      func(t *testing.T) string
+		wantToken bool
+		wantLog   string
+	}{
+		{
+			name:      "minted",
+			path:      func(t *testing.T) string { return filepath.Join(t.TempDir(), "state", afclient.ControlTokenFileName) },
+			wantToken: true,
+		},
+		{name: "mint fails", path: unmintableControlTokenPath, wantLog: "mutating control routes are DISABLED (fail closed)"},
+		{name: "path unresolved", path: func(*testing.T) string { return "" }, wantLog: "control token path unresolved"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			path := tc.path(t)
+			var errOut bytes.Buffer
+			var opts daemon.Options
+			applyDaemonControlAuth(&opts, path, &errOut)
+
+			if !opts.RequireControlToken {
+				t.Fatal("RequireControlToken = false; the daemon entry point must always require the control token")
+			}
+			if strings.Contains(errOut.String(), "stay open") {
+				t.Errorf("errOut still advertises open routes: %q", errOut.String())
+			}
+			if !tc.wantToken {
+				if opts.ControlToken != "" {
+					t.Errorf("ControlToken = %q, want empty on failure", opts.ControlToken)
+				}
+				if !strings.Contains(errOut.String(), tc.wantLog) {
+					t.Errorf("errOut = %q, want it to contain %q", errOut.String(), tc.wantLog)
+				}
+				return
+			}
+			if opts.ControlToken == "" {
+				t.Fatal("ControlToken empty after a successful mint")
+			}
+			if errOut.Len() != 0 {
+				t.Errorf("errOut = %q, want silence on success", errOut.String())
+			}
+			info, err := os.Stat(path)
+			if err != nil {
+				t.Fatalf("stat minted token: %v", err)
+			}
+			if perm := info.Mode().Perm(); perm != 0o600 {
+				t.Errorf("token file mode = %o, want 600", perm)
+			}
+		})
+	}
+}
+
+// TestDaemonRunControlAuth_FailsClosedEndToEnd drives the entry-point wiring
+// against a live daemon whose token cannot be minted: the operator client's
+// mutating call is refused with ErrUnavailable and a non-sensitive reason,
+// while a read-only call still succeeds.
+func TestDaemonRunControlAuth_FailsClosedEndToEnd(t *testing.T) {
+	tmp := t.TempDir()
+	cfgPath := filepath.Join(tmp, "daemon.yaml")
+	cfg := daemon.DefaultConfig()
+	cfg.Machine.ID = "test-control-auth"
+	cfg.Orchestrator.URL = "file:///tmp/queue"
+	cfg.Projects = []daemon.ProjectConfig{{ID: "p1", Repository: "github.com/foo/bar"}}
+	if err := daemon.WriteConfig(cfgPath, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	opts := daemon.Options{
+		ConfigPath:       cfgPath,
+		JWTPath:          filepath.Join(tmp, "daemon.jwt"),
+		HTTPHost:         "127.0.0.1",
+		HTTPPort:         0,
+		SkipWizard:       true,
+		SkipRegistration: true,
+	}
+	var errOut bytes.Buffer
+	applyDaemonControlAuth(&opts, unmintableControlTokenPath(t), &errOut)
+
+	d := daemon.New(opts)
+	if err := d.Start(context.Background()); err != nil {
+		t.Fatalf("daemon Start: %v", err)
+	}
+	t.Cleanup(func() { _ = d.Stop(context.Background()) })
+	srv := daemon.NewServer(d)
+	if _, err := srv.Start(); err != nil {
+		t.Fatalf("server Start: %v", err)
+	}
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = srv.Shutdown(ctx)
+	})
+
+	client := afclient.NewDaemonClientFromURL("http://" + srv.Addr())
+	client.SetControlToken("operator-guess")
+	_, err := client.Pause()
+	if !errors.Is(err, afclient.ErrUnavailable) {
+		t.Fatalf("Pause on a daemon without a control token: err = %v, want ErrUnavailable", err)
+	}
+	if !strings.Contains(err.Error(), "control token unavailable") {
+		t.Errorf("Pause error = %q, want the control-token reason", err)
+	}
+	if strings.Contains(err.Error(), afclient.ControlTokenFileName) || strings.Contains(err.Error(), "operator-guess") {
+		t.Errorf("Pause error leaks a path or credential: %q", err)
+	}
+	if _, err := client.GetStatus(); err != nil {
+		t.Fatalf("GetStatus on a daemon without a control token: %v, want read-only routes to keep working", err)
 	}
 }
