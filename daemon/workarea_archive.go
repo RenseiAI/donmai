@@ -24,6 +24,7 @@ package daemon
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"crypto/rand"
 	"crypto/sha256"
@@ -47,8 +48,11 @@ import (
 )
 
 const (
-	workareaArchiveSchemaV1     = "donmai.workarea-archive.v1"
-	workareaArchiveLegacyFlatV1 = "donmai.workarea-archive.legacy-flat-v1"
+	workareaArchiveSchemaV1        = "donmai.workarea-archive.v1"
+	workareaArchiveLegacyFlatV1    = "donmai.workarea-archive.legacy-flat-v1"
+	archivePublicationIntentName   = ".publication-intent.json"
+	archivePublicationIntentFormat = "donmai.workarea-archive-publication.v1"
+	archivePublicationIntentLimit  = 4096
 )
 
 // defaultArchiveDir resolves the default archive root, ~/.donmai/workareas.
@@ -131,6 +135,16 @@ type archiveManifest struct {
 	// them without the registry needing to evolve the manifest schema in
 	// lockstep with archive producers.
 	Extra map[string]any `json:"-"`
+}
+
+// archivePublicationIntent is private producer evidence, not archive metadata.
+// Its exact stage/final/token relationship distinguishes a generated stage from
+// a legitimate custom archive with an arbitrary or stage-shaped name.
+type archivePublicationIntent struct {
+	Format    string `json:"format"`
+	FinalID   string `json:"finalId"`
+	StageLeaf string `json:"stageLeaf"`
+	Token     string `json:"token"`
 }
 
 // WorkareaRootArchiveSpec is the secret-free whole-root capture input used by
@@ -415,10 +429,17 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err != nil {
 		return fmt.Errorf("archive root: create stage: %w", err)
 	}
+	stageIdentity, err := archiveRoot.Lstat(stage)
+	if err != nil {
+		return fmt.Errorf("archive root: inspect created stage identity: %w", err)
+	}
+	if !stageIdentity.IsDir() || stageIdentity.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("archive root: created stage is not a real directory")
+	}
 	committed := false
 	defer func() {
 		if !committed {
-			_ = archiveRoot.RemoveAll(stage)
+			r.cleanupArchiveStage(archiveRoot, stage, stageIdentity)
 		}
 	}()
 	if r.archiveHook != nil {
@@ -434,6 +455,9 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 		return fmt.Errorf("archive root: open stage: %w", err)
 	}
 	defer func() { _ = stageRoot.Close() }()
+	if err := writeArchivePublicationIntent(stageRoot, final, stage); err != nil {
+		return err
+	}
 	sourceInfo, err := rootHandle.Stat(".")
 	if err != nil || !sourceInfo.IsDir() {
 		return fmt.Errorf("archive root: source root unavailable")
@@ -448,6 +472,11 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	defer func() { _ = archiveHandle.Close() }()
 	if err := archiveHandle.Chmod(".", sourceInfo.Mode().Perm()); err != nil {
 		return fmt.Errorf("archive root: set copied tree mode: %w", err)
+	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("before-copy-archive-tree"); err != nil {
+			return err
+		}
 	}
 	if err := copyRootContents(rootHandle, archiveHandle); err != nil {
 		return fmt.Errorf("archive root: copy complete tree: %w", err)
@@ -468,6 +497,24 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err != nil {
 		return fmt.Errorf("archive root: create manifest: %w", err)
 	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-open-archive-manifest"); err != nil {
+			_ = manifestFile.Close()
+			return err
+		}
+		// The seam writes real producer bytes rather than injecting a fixture
+		// file. Ordinary production retains its existing single write.
+		prefix := len(body) / 2
+		if _, err := manifestFile.Write(body[:prefix]); err != nil {
+			_ = manifestFile.Close()
+			return fmt.Errorf("archive root: write manifest prefix: %w", err)
+		}
+		if err := r.archiveHook("after-write-archive-manifest-prefix"); err != nil {
+			_ = manifestFile.Close()
+			return err
+		}
+		body = body[prefix:]
+	}
 	if _, err := manifestFile.Write(body); err != nil {
 		_ = manifestFile.Close()
 		return fmt.Errorf("archive root: write manifest: %w", err)
@@ -482,8 +529,18 @@ func (r *WorkareaArchiveRegistry) ArchiveRoot(ctx context.Context, spec Workarea
 	if err := syncArchiveRoot(stageRoot); err != nil {
 		return err
 	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("before-publish-archive"); err != nil {
+			return err
+		}
+	}
 	if err := archiveRootRenameNoReplace(archiveRoot, stage, final); err != nil {
 		return fmt.Errorf("archive root: publish archive: %w", err)
+	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-publish-archive"); err != nil {
+			return err
+		}
 	}
 	if err := syncArchiveDirectory(archiveRoot); err != nil {
 		return err
@@ -1504,18 +1561,11 @@ func (r *WorkareaArchiveRegistry) summaryForV1(id string) (afclient.WorkareaSumm
 		return afclient.WorkareaSummaryV1{}, false, nil
 	}
 	defer func() { _ = archiveRoot.Close() }()
-	info, err := archiveRoot.Stat(filepath.Join(id, "manifest.json"))
+	manifest, err := readArchiveManifestRoot(archiveRoot, id, r.archiveHook)
 	if err != nil {
-		if errors.Is(err, fs.ErrNotExist) {
+		if errors.Is(err, ErrArchiveNotFound) {
 			return afclient.WorkareaSummaryV1{}, false, nil
 		}
-		return afclient.WorkareaSummaryV1{}, false, fmt.Errorf("stat manifest: %w", err)
-	}
-	if info.IsDir() {
-		return afclient.WorkareaSummaryV1{}, false, fmt.Errorf("manifest is a directory: %w", ErrArchiveCorrupted)
-	}
-	manifest, err := r.readManifest(id)
-	if err != nil {
 		return afclient.WorkareaSummaryV1{}, false, err
 	}
 	created, _ := parseRFC3339(manifest.CreatedAt)
@@ -1559,16 +1609,67 @@ func (r *WorkareaArchiveRegistry) readManifest(id string) (*archiveManifest, err
 		return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
 	}
 	defer func() { _ = archiveRoot.Close() }()
-	return readArchiveManifestRoot(archiveRoot, id)
+	return readArchiveManifestRoot(archiveRoot, id, r.archiveHook)
 }
 
-func readArchiveManifestRoot(archiveRoot *os.Root, id string) (*archiveManifest, error) {
-	file, err := archiveRoot.Open(filepath.Join(id, "manifest.json"))
+func readArchiveManifestRoot(archiveRoot *os.Root, id string, hooks ...func(string) error) (*archiveManifest, error) {
+	entry, err := archiveRoot.OpenRoot(id)
+	if err != nil {
+		if errors.Is(err, fs.ErrNotExist) {
+			return nil, fmt.Errorf("archive missing for %q: %w", id, ErrArchiveNotFound)
+		}
+		return nil, fmt.Errorf("open archive %q: %w: %w", id, err, ErrArchiveCorrupted)
+	}
+	defer func() { _ = entry.Close() }()
+	entryInfo, err := entry.Stat(".")
+	if err != nil {
+		return nil, fmt.Errorf("inspect archive entry %q: %w: %w", id, err, ErrArchiveCorrupted)
+	}
+	file, err := entry.Open("manifest.json")
 	if err != nil {
 		if errors.Is(err, fs.ErrNotExist) {
 			return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
 		}
 		return nil, fmt.Errorf("read manifest %q: %w: %w", id, err, ErrArchiveCorrupted)
+	}
+	defer func() { _ = file.Close() }()
+	for _, hook := range hooks {
+		if hook != nil {
+			if err := hook("after-open-archive-manifest-reader"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	info, err := file.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("inspect manifest for %q: %w", id, ErrArchiveCorrupted)
+	}
+	intent, recognized := readArchivePublicationIntent(entry)
+	for _, hook := range hooks {
+		if hook != nil {
+			if err := hook("after-stat-archive-manifest"); err != nil {
+				return nil, err
+			}
+		}
+	}
+	if err := checkArchiveEntryBinding(archiveRoot, id, entryInfo); err != nil {
+		return nil, err
+	}
+	// Opening the manifest precedes the marker read: the producer guarantees
+	// durable intent before any manifest exists. Both reads stay on this entry
+	// descriptor, including when publication concurrently renames its path.
+	if recognized {
+		finalInfo, finalErr := archiveRoot.Lstat(intent.FinalID)
+		published := finalErr == nil && finalInfo.IsDir() && os.SameFile(entryInfo, finalInfo)
+		if !published {
+			stageInfo, stageErr := archiveRoot.Lstat(intent.StageLeaf)
+			if (stageErr == nil && stageInfo.IsDir() && os.SameFile(entryInfo, stageInfo)) || id == intent.StageLeaf {
+				return nil, fmt.Errorf("archive %q is unpublished: %w", id, ErrArchiveNotFound)
+			}
+		}
+	}
+	if info.IsDir() {
+		return nil, fmt.Errorf("manifest is a directory for %q: %w", id, ErrArchiveCorrupted)
 	}
 	data, readErr := io.ReadAll(file)
 	closeErr := file.Close()
@@ -1577,6 +1678,23 @@ func readArchiveManifestRoot(archiveRoot *os.Root, id string) (*archiveManifest,
 	}
 	if closeErr != nil {
 		return nil, fmt.Errorf("close manifest %q: %w: %w", id, closeErr, ErrArchiveCorrupted)
+	}
+	// Check disappearance of the entry before checking its vanished manifest:
+	// real failed-publication cleanup is not committed archive corruption.
+	if err := checkArchiveEntryBinding(archiveRoot, id, entryInfo); err != nil {
+		return nil, err
+	}
+	manifestInfo, manifestErr := entry.Stat("manifest.json")
+	if errors.Is(manifestErr, fs.ErrNotExist) {
+		return nil, fmt.Errorf("manifest missing for %q: %w", id, ErrArchiveNotFound)
+	}
+	if manifestErr != nil || !os.SameFile(info, manifestInfo) {
+		return nil, fmt.Errorf("manifest %q identity changed during read: %w", id, ErrArchiveCorrupted)
+	}
+	parentInfo, parentErr := archiveRoot.Stat(".")
+	parentPathInfo, parentPathErr := os.Lstat(archiveRoot.Name())
+	if parentErr != nil || parentPathErr != nil || !os.SameFile(parentInfo, parentPathInfo) {
+		return nil, fmt.Errorf("archive %q registry identity changed during read: %w", id, ErrArchiveCorrupted)
 	}
 	var m archiveManifest
 	if err := json.Unmarshal(data, &m); err != nil {
@@ -1590,6 +1708,17 @@ func readArchiveManifestRoot(archiveRoot *os.Root, id string) (*archiveManifest,
 		m.Extra = extra
 	}
 	return &m, nil
+}
+
+func checkArchiveEntryBinding(archiveRoot *os.Root, id string, opened os.FileInfo) error {
+	named, err := archiveRoot.Stat(id)
+	if errors.Is(err, fs.ErrNotExist) {
+		return fmt.Errorf("archive %q moved during read: %w", id, ErrArchiveNotFound)
+	}
+	if err != nil || !os.SameFile(opened, named) {
+		return fmt.Errorf("archive %q directory identity changed: %w", id, ErrArchiveCorrupted)
+	}
+	return nil
 }
 
 // openExistingArchiveRoot opens and validates an existing archive root. A
@@ -2082,6 +2211,122 @@ func hashRootFile(root *os.Root, name string, expected os.FileInfo) (string, err
 		return "", err
 	}
 	return hex.EncodeToString(hash.Sum(nil)), nil
+}
+
+// cleanupArchiveStage never leaves a readable staged manifest without its
+// producer intent. The parent archive descriptor outlives the stage/tree
+// descriptors, which have already closed when ArchiveRoot's defer runs.
+func (r *WorkareaArchiveRegistry) cleanupArchiveStage(archiveRoot *os.Root, stage string, expected os.FileInfo) {
+	// The original leaf must still identify the producer's real directory.
+	// In particular, never follow a replaced stage symlink into another archive,
+	// or use a surviving stage descriptor after it became the published final.
+	if !archiveStageStillNamed(archiveRoot, stage, expected) {
+		return
+	}
+	entry, err := archiveRoot.OpenRoot(stage)
+	if err != nil {
+		return
+	}
+	defer func() { _ = entry.Close() }()
+	opened, err := entry.Stat(".")
+	if err != nil || !os.SameFile(expected, opened) || !archiveStageStillNamed(archiveRoot, stage, expected) {
+		return
+	}
+	if err := entry.Remove("manifest.json"); err != nil && !errors.Is(err, fs.ErrNotExist) {
+		return
+	}
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-remove-unpublished-archive-manifest"); err != nil {
+			return
+		}
+	}
+	_ = entry.Remove(archivePublicationIntentName)
+	if r.archiveHook != nil {
+		if err := r.archiveHook("after-remove-archive-publication-intent"); err != nil {
+			return
+		}
+	}
+	if !archiveStageStillNamed(archiveRoot, stage, expected) {
+		return
+	}
+	_ = archiveRoot.RemoveAll(stage)
+}
+
+func archiveStageStillNamed(root *os.Root, stage string, expected os.FileInfo) bool {
+	named, err := root.Lstat(stage)
+	return err == nil && named.IsDir() && named.Mode()&os.ModeSymlink == 0 && os.SameFile(expected, named)
+}
+
+func writeArchivePublicationIntent(stage *os.Root, finalID, stageLeaf string) error {
+	intent := archivePublicationIntent{Format: archivePublicationIntentFormat, FinalID: finalID, StageLeaf: stageLeaf, Token: strings.TrimPrefix(stageLeaf, ".archive-"+finalID+"-")}
+	if !validArchivePublicationIntent(intent) {
+		return fmt.Errorf("archive root: invalid publication intent")
+	}
+	body, err := json.Marshal(intent)
+	if err != nil || len(body) > archivePublicationIntentLimit {
+		return fmt.Errorf("archive root: publication intent exceeds bounded format")
+	}
+	file, err := stage.OpenFile(archivePublicationIntentName, os.O_CREATE|os.O_EXCL|os.O_WRONLY, 0o600)
+	if err != nil {
+		return fmt.Errorf("archive root: create publication intent: %w", err)
+	}
+	if _, err := file.Write(body); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("archive root: write publication intent: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("archive root: sync publication intent: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("archive root: close publication intent: %w", err)
+	}
+	return syncArchiveDirectory(stage)
+}
+
+func validArchivePublicationIntent(intent archivePublicationIntent) bool {
+	token, err := hex.DecodeString(intent.Token)
+	return intent.Format == archivePublicationIntentFormat && validArchiveID(intent.FinalID) && validArchiveID(intent.StageLeaf) &&
+		err == nil && len(token) == 12 && hex.EncodeToString(token) == intent.Token && intent.StageLeaf == ".archive-"+intent.FinalID+"-"+intent.Token
+}
+
+func readArchivePublicationIntent(entry *os.Root) (*archivePublicationIntent, bool) {
+	// Only exact, bounded producer metadata is evidence. Arbitrary legacy
+	// bookkeeping (including malformed, oversized or link-shaped sidecars)
+	// does not turn a valid custom archive into an unpublished stage.
+	info, err := entry.Lstat(archivePublicationIntentName)
+	if err != nil || !info.Mode().IsRegular() || info.Size() > archivePublicationIntentLimit {
+		return nil, false
+	}
+	file, err := entry.Open(archivePublicationIntentName)
+	if err != nil {
+		return nil, false
+	}
+	defer func() { _ = file.Close() }()
+	opened, err := file.Stat()
+	if err != nil || !os.SameFile(info, opened) {
+		return nil, false
+	}
+	body, err := io.ReadAll(io.LimitReader(file, archivePublicationIntentLimit+1))
+	if err != nil || len(body) > archivePublicationIntentLimit {
+		return nil, false
+	}
+	var intent archivePublicationIntent
+	decoder := json.NewDecoder(bytes.NewReader(body))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&intent); err != nil || !validArchivePublicationIntent(intent) {
+		return nil, false
+	}
+	var extra any
+	if err := decoder.Decode(&extra); !errors.Is(err, io.EOF) {
+		return nil, false
+	}
+	canonical, err := json.Marshal(intent)
+	// Duplicate keys and non-producer encodings are not positive stage proof.
+	if err != nil || !bytes.Equal(body, canonical) {
+		return nil, false
+	}
+	return &intent, true
 }
 
 func createArchiveStage(root *os.Root, archiveID string) (string, error) {
