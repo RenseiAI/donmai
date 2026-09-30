@@ -571,53 +571,134 @@ func (m *Model) renderHeader() string {
 	host := m.opts.HostLabel
 	c := m.counters
 
-	left := host
-	if left == "" {
-		left = "host"
+	contentWidth := m.width
+	style := theme.Header()
+	if !m.opts.Plain && m.width > 0 {
+		chrome := 2 // Header style padding: one cell on each side.
+		if m.width < 4 {
+			chrome = 0
+			style = style.Padding(0, 0)
+		}
+		contentWidth -= chrome
 	}
-	if scope != "all projects" {
-		left += " · " + scope
-	}
-	right := fmt.Sprintf("%d running   queue %d   uptime %s",
-		c.Running, c.QueueDepth, format.Duration(int(c.UptimeSeconds)))
-	if c.Version != "" {
-		right += "   v" + c.Version
-	}
-
+	left, gap, right := headerBudgetVariants(host, scope, headerCounterVariants(c), contentWidth)
+	content := left + strings.Repeat(" ", gap) + right
 	if m.opts.Plain {
-		left, gap := headerBudget(left, right, m.width)
-		return left + strings.Repeat(" ", gap) + right
+		return content
 	}
-	left, gap := headerBudget(left, right, m.width)
 	leftStyled := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Accent).Render(left)
 	rightStyled := lipgloss.NewStyle().Foreground(m.theme.TextSecondary).Render(right)
-	content := leftStyled + strings.Repeat(" ", gap) + rightStyled
-	return theme.Header().Width(m.width).Render(content)
+	content = leftStyled + strings.Repeat(" ", gap) + rightStyled
+	return style.Width(m.width).Render(content)
 }
 
-// headerBudget composes a one-line header within width columns: the right
-// counters pin right and the left (host-first) segment truncates so the
-// counters stay fully visible. It returns the fitted left segment and the
-// gap between the segments. width <= 0 renders untruncated with a two-space
-// gap. The two cells of horizontal chrome (one padding cell per side from
-// the header style) are accounted in the budget — that is the entire padding
-// budget, fixing the earlier over-wide bar.
-func headerBudget(left, right string, width int) (string, int) {
+// headerCounterVariants keeps useful counters in priority order, removing
+// optional details before the running count when the terminal narrows.
+func headerCounterVariants(c Counters) []string {
+	status := fmt.Sprintf("%d running", c.Running)
+	queue := fmt.Sprintf("queue %d", c.QueueDepth)
+	uptime := "uptime " + format.Duration(int(c.UptimeSeconds))
+	full := status + "   " + queue + "   " + uptime
+	if c.Version != "" {
+		full += "   v" + c.Version
+	}
+	variants := []string{
+		full,
+		status + "   " + queue + "   " + uptime,
+		status + "   " + queue,
+		status + "   " + uptime,
+		status,
+		"",
+	}
+	unique := make([]string, 0, len(variants))
+	for _, variant := range variants {
+		if len(unique) == 0 || unique[len(unique)-1] != variant {
+			unique = append(unique, variant)
+		}
+	}
+	return unique
+}
+
+// headerBudgetVariants composes a one-line header within the content width left
+// after any style padding. It preserves the host and scope before shortening
+// the host, then selects the richest counters that fit. Width <= 0 means
+// unbounded and retains the full header with its normal two-cell gap.
+func headerBudgetVariants(host, scope string, rightVariants []string, width int) (string, int, string) {
+	if len(rightVariants) == 0 {
+		rightVariants = []string{""}
+	}
+	if host == "" {
+		host = "host"
+	}
 	if width <= 0 {
-		return left, 2
+		left := host
+		if scope != "" && scope != "all projects" {
+			left += " · " + scope
+		}
+		return left, 2, rightVariants[0]
 	}
-	avail := width - 2 // header chrome: one padding cell per side
-	rightW := lipgloss.Width(right)
-	maxLeft := avail - rightW - 1 // at least one gap cell
-	if maxLeft < 1 {
-		maxLeft = 1
+	leftWidthFor := func(right string) int {
+		gapWidth := 0
+		if right != "" {
+			gapWidth = 1
+		}
+		return width - lipgloss.Width(right) - gapWidth
 	}
-	left = truncateWidth(left, maxLeft)
-	gap := avail - lipgloss.Width(left) - rightW
-	if gap < 1 {
-		gap = 1
+	scopedHost := host
+	if scope != "" && scope != "all projects" {
+		scopedHost += " · " + scope
 	}
-	return left, gap
+	for _, right := range rightVariants {
+		leftWidth := leftWidthFor(right)
+		if lipgloss.Width(scopedHost) <= leftWidth {
+			gap := 0
+			if right != "" {
+				gap = width - lipgloss.Width(scopedHost) - lipgloss.Width(right)
+			}
+			return scopedHost, gap, right
+		}
+	}
+	for _, right := range rightVariants {
+		leftWidth := leftWidthFor(right)
+		if leftWidth < lipgloss.Width(host) {
+			continue
+		}
+		gap := 0
+		if right != "" {
+			gap = width - lipgloss.Width(host) - lipgloss.Width(right)
+		}
+		return host, gap, right
+	}
+	// No counter variant fits beside the complete host. Keep only the primary
+	// running count if at least one host cell remains; otherwise let the host
+	// use the full line by itself.
+	primary := ""
+	if len(rightVariants) > 1 {
+		primary = rightVariants[len(rightVariants)-2]
+	}
+	primaryWidth := lipgloss.Width(primary)
+	if primary != "" && width-primaryWidth-1 >= 1 {
+		leftWidth := width - primaryWidth - 1
+		return truncateHeaderHost(host, leftWidth), 1, primary
+	}
+	return truncateHeaderHost(host, width), 0, ""
+}
+
+func truncateHeaderHost(host string, width int) string {
+	runes := []rune(host)
+	if width == 1 && len(runes) > 0 {
+		if lipgloss.Width(string(runes[0])) == 1 {
+			return string(runes[0])
+		}
+		return "…"
+	}
+	if width == 2 && len(runes) > 0 {
+		if lipgloss.Width(string(runes[0])) == 2 {
+			return string(runes[0])
+		}
+		return truncateWidth(host, width)
+	}
+	return truncateWidth(host, width)
 }
 
 // truncateWidth shortens s to at most n display cells, appending an
