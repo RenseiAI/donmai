@@ -230,11 +230,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		"mode", stageMode,
 	)
 
-	// Sub-agent budget
-	// enforcement. The enforcer is always constructed; when qw.StageBudget
-	// is nil (legacy path) it is a disabled no-op so the runner can
-	// observe events through it unconditionally.
+	// Budget enforcement and the session's usage meter. The enforcer is
+	// always constructed; when qw.StageBudget is nil (legacy path) it
+	// enforces no cap, but still meters every turn for Result.Cost.
 	enforcer := NewBudgetEnforcer(qw.StageBudget, time.UnixMilli(startedAt))
+	enforcer.midTurnWrapUp = caps.SupportsMessageInjection && takesMidTurnWrapUp(noticeDelivery)
 	if enforcer.Enabled() {
 		r.logger.Info("[runner-stage]",
 			"sid", qw.SessionID,
@@ -1194,7 +1194,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 
 	streamRes, streamErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-	if stopped, err := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamRes, streamErr); stopped {
+	// budgetStop is the budget cap that ended the session, once one did: the
+	// provider is stopped and no further turn starts. The turn it ended is
+	// still resolved below (its manifest, verdict and pull request) so the
+	// session can end completed when that work was already delivered.
+	stopped, budgetStop, err := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamRes, streamErr)
+	if stopped {
+		res.Cost = enforcer.cost()
 		return res, err
 	}
 
@@ -1272,7 +1278,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// lastTurn is the latest turn's own observation; tail recovery reads how
 	// it ended.
 	lastTurn := streamRes
-	if runtimeInjectEnabled && !streamRes.blocked {
+	if runtimeInjectEnabled && !streamRes.blocked && budgetStop == nil {
 		injRes := r.drainMemoryInjects(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor, injectCh)
 		injRes.applyTo(res, provider.Name())
 		if injRes.terminalEvent != nil || injRes.lastAssistantText != "" {
@@ -1281,6 +1287,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		if injRes.terminalEvent != nil {
 			lastTurn = injRes
 		}
+		budgetStop = r.stopAtBudget(qw, handle, enforcer, nil)
 	}
 
 	// 11. Tail recovery. Skipped entirely when the agent deliberately
@@ -1298,14 +1305,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// bounded by progress (consecutive turns without a tool call) and by a
 	// total ceiling, retries by their own count; a turn still unfinished at
 	// a bound fails the session. The session's duration and token budgets
-	// cover every follow-up turn.
+	// cover every follow-up turn: once the token meter passes the wrap-up
+	// point, the next follow-up prompt asks the agent to wrap up (unless the
+	// request already reached it mid-turn), and once a cap ends the session
+	// no follow-up turn starts.
 	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
 	reviewWork := RequiresReviewVerdict(qw.WorkType)
 	continuable := (RequiresPRURL(qw.WorkType) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
 	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
-	for tailRecoverable && !r.skipSteering && !streamRes.blocked {
+	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
 		steerView := streamRes
 		steerView.terminalSuccess = lastTurn.terminalSuccess
 		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn), reviewWork)
@@ -1343,10 +1353,13 @@ tailRecovery:
 			// makes teardown target whichever handle is now live.
 			handle = newHandle
 			// Re-consume any events the steering inject/resume produced.
-			tailRes, _ := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
+			tailRes, tailErr := r.consumeEvents(ctx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 			tailRes.applyTo(res, provider.Name())
 			applyFollowUp(tailRes)
 			lastTurn = tailRes
+			if budgetStop = r.stopAtBudget(qw, handle, enforcer, tailErr); budgetStop != nil {
+				break tailRecovery
+			}
 			continue
 		}
 
@@ -1354,6 +1367,7 @@ tailRecovery:
 		if reviewWork {
 			prompt = continueReviewPrompt
 		}
+		wrapUp := enforcer.wrapUpDue()
 		if step == tailRetry {
 			prompt = retryPrompt
 			r.logger.Warn("turn ended on a model provider error; retrying",
@@ -1363,10 +1377,13 @@ tailRecovery:
 				"providerError", lastTurn.providerError,
 			)
 			if err := r.waitRetryBackoff(streamCtx, followUps.retried+1); err != nil {
-				if stopped, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err); stopped {
+				stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, streamObservation{}, err)
+				if stopped {
 					res.TurnContinuations = followUps.report()
+					res.Cost = enforcer.cost()
 					return res, stopErr
 				}
+				budgetStop = budget
 				break tailRecovery
 			}
 		} else {
@@ -1378,6 +1395,13 @@ tailRecovery:
 				"ceiling", followUps.ceiling,
 			)
 		}
+		if wrapUp {
+			// The token meter passed the wrap-up point and the agent has
+			// not been asked yet: this follow-up asks it to finish.
+			prompt = wrapUpPrompt
+			r.logger.Info("token budget nearly spent; asking the agent to wrap up",
+				"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
+		}
 		newHandle, delivered, err := r.deliverFollowUp(ctx, provider, handle, spec, caps, qw, prompt)
 		handle = newHandle
 		if err != nil || !delivered {
@@ -1385,21 +1409,54 @@ tailRecovery:
 				"sessionId", qw.SessionID, "err", err)
 			break tailRecovery
 		}
+		if wrapUp {
+			enforcer.wrapUpSent()
+		}
 		if step == tailRetry {
 			followUps.retried++
 		} else {
 			followUps.continued++
 		}
 		tail, tailErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
-		if stopped, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr); stopped {
+		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)
+		if stopped {
 			res.TurnContinuations = followUps.report()
+			res.Cost = enforcer.cost()
 			return res, stopErr
 		}
 		tail.applyTo(res, provider.Name())
 		applyFollowUp(tail)
 		lastTurn = tail
+		if budget != nil {
+			budgetStop = budget
+			break tailRecovery
+		}
 	}
 	res.TurnContinuations = followUps.report()
+	res.Cost = enforcer.cost()
+
+	// 11·B. Budget stop. A cap ended the session: the runner stopped the
+	// provider at the turn boundary and started no further turn. When the
+	// work was already delivered — a verified pull request and a passed
+	// turn result — the session ends completed with the breach recorded;
+	// otherwise it fails as budget-exceeded, as before.
+	if budgetStop != nil {
+		res.BudgetReport = enforcer.Report(r.now())
+		res.BudgetBreach = &agent.BudgetBreach{Cap: string(budgetStop.Cap), Detail: budgetStop.Detail}
+		if !deliveredAtBudgetStop(qw, res, repositoryDeclaration) {
+			res.Status = "failed"
+			res.FailureMode = FailureBudgetExceeded
+			res.Error = budgetStop.Error()
+			return res, budgetStop
+		}
+		res.Status = "completed"
+		r.logger.Info("budget cap reached after the work was delivered; ending the session completed",
+			"sessionId", qw.SessionID,
+			"cap", string(budgetStop.Cap),
+			"detail", budgetStop.Detail,
+			"pullRequestUrl", res.PullRequestURL,
+		)
+	}
 
 	// 11·M (blocked fork). A blocked verdict a follow-up turn produced takes
 	// the 10a fork — but only when the runner has recorded no failure of its
@@ -1424,7 +1481,7 @@ tailRecovery:
 			backstopEligible = true
 		}
 	}
-	if !r.skipBackstop && !publicationComplete && backstopEligible {
+	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		switch {
 		case trimRef(qw.Ref) != "":
 			r.logger.Info("skipping backstop gh pr create on ref-bearing run", "branch", branch, "ref", qw.Ref)
@@ -1559,11 +1616,15 @@ tailRecovery:
 }
 
 // classifyStreamStop stamps the terminal failure of a turn whose stream
-// stopped on lost ownership (or an operator cancel), a budget breach, the
-// idle watchdog or a cancelled context, stops the provider where tokens could
-// keep running, and reports whether it did so; the caller then returns
-// (res, err). It classifies the first turn and every runner-driven follow-up
-// turn alike (turn_continuation.go).
+// stopped on lost ownership (or an operator cancel), the idle watchdog or a
+// cancelled context, stops the provider where tokens could keep running, and
+// reports whether it did so; the caller then returns (res, err). It
+// classifies the first turn and every runner-driven follow-up turn alike
+// (turn_continuation.go).
+//
+// A budget cap is not a terminal failure here: the provider is stopped and
+// the cap is returned as budget, so the caller resolves the turn the cap
+// ended — the work may already be delivered — and starts no further turn.
 func (r *Runner) classifyStreamStop(
 	qw QueuedWork,
 	res *Result,
@@ -1573,7 +1634,7 @@ func (r *Runner) classifyStreamStop(
 	lostOwnership <-chan struct{},
 	streamRes streamObservation,
 	streamErr error,
-) (bool, error) {
+) (stopped bool, budget *BudgetExceededError, err error) {
 	// Disambiguate between ctx-cancelled and lost-ownership before
 	// classifying the failure mode.
 	select {
@@ -1601,45 +1662,16 @@ func (r *Runner) classifyStreamStop(
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = handle.Stop(stopCtx)
 		stopCancel()
-		return true, heartbeat.ErrLostOwnership
+		return true, nil, heartbeat.ErrLostOwnership
 	default:
 	}
 
-	// Budget-exceeded short-circuit.
-	// Either the enforcer surfaced *BudgetExceededError directly via
-	// streamErr, or the wall-clock deadline tripped streamCtx and we
-	// detect the breach now via CheckDuration. Either way the failure
-	// is classified as FailureBudgetExceeded — distinct from generic
-	// FailureTimeout so dashboards can group them.
-	var budgetErr *BudgetExceededError
-	if errors.As(streamErr, &budgetErr) { //nolint:revive // intentional: ObserveEvent already produced WORK_RESULT
-		// no-op: budget breach was already surfaced via ObserveEvent's WORK_RESULT emission
-	} else if errors.Is(streamErr, context.DeadlineExceeded) {
-		// May or may not be a duration cap. CheckDuration tells us.
-		if dErr := enforcer.CheckDuration(r.now()); dErr != nil {
-			budgetErr = dErr
-		}
-	}
-	if budgetErr != nil {
-		res.Status = "failed"
-		res.FailureMode = FailureBudgetExceeded
-		if res.Error == "" {
-			res.Error = budgetErr.Error()
-		}
-		// Best-effort stop the provider so it doesn't keep tokens
-		// running past the cap.
-		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
-		_ = handle.Stop(stopCtx)
-		stopCancel()
-		res.BudgetReport = enforcer.Report(r.now())
-		r.logger.Warn("[runner-stage]",
-			"sid", qw.SessionID,
-			"stageId", qw.StageID,
-			"event", "budget.breach",
-			"cap", string(budgetErr.Cap),
-			"detail", budgetErr.Detail,
-		)
-		return true, budgetErr
+	// Budget cap. Checked before the watchdog and the generic timeout: a
+	// wall-clock cap surfaces as the stream ctx's deadline, and a token cap
+	// the meter crossed mid-turn stays the reason even when the turn then
+	// wedged before its boundary.
+	if budget = r.stopAtBudget(qw, handle, enforcer, streamErr); budget != nil {
+		return false, budget, nil
 	}
 
 	// Idle/no-progress watchdog cut-off. The watchdog cancels the stream
@@ -1656,7 +1688,7 @@ func (r *Runner) classifyStreamStop(
 		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
 		_ = handle.Stop(stopCtx)
 		stopCancel()
-		return true, streamErr
+		return true, nil, streamErr
 	}
 
 	if streamErr != nil && errors.Is(streamErr, context.Canceled) || errors.Is(streamErr, context.DeadlineExceeded) {
@@ -1665,9 +1697,71 @@ func (r *Runner) classifyStreamStop(
 		if res.Error == "" {
 			res.Error = streamErr.Error()
 		}
-		return true, streamErr
+		return true, nil, streamErr
 	}
-	return false, nil
+	return false, nil, nil
+}
+
+// stopAtBudget reports the budget cap that ended the latest turn, if one
+// did, and stops the provider so it spends nothing more. The cap is the
+// enforcer's error the stream returned, a wall-clock cap its deadline
+// tripped (CheckDuration), or a breach the enforcer recorded during a turn
+// whose stream error the caller did not see (a memory-inject turn) or that
+// stopped for another reason after the cap was crossed. nil when the
+// session is within its budget.
+func (r *Runner) stopAtBudget(qw QueuedWork, handle agent.Handle, enforcer *BudgetEnforcer, streamErr error) *BudgetExceededError {
+	var budget *BudgetExceededError
+	if !errors.As(streamErr, &budget) {
+		if errors.Is(streamErr, context.DeadlineExceeded) {
+			budget = enforcer.CheckDuration(r.now())
+		}
+		if budget == nil {
+			budget = enforcer.breached()
+		}
+	}
+	if budget == nil {
+		return nil
+	}
+	// Best-effort stop the provider so it doesn't keep tokens running past
+	// the cap.
+	stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+	_ = handle.Stop(stopCtx)
+	stopCancel()
+	r.logger.Warn("[runner-stage]",
+		"sid", qw.SessionID,
+		"stageId", qw.StageID,
+		"event", "budget.breach",
+		"cap", string(budget.Cap),
+		"detail", budget.Detail,
+	)
+	return budget
+}
+
+// deliveredAtBudgetStop reports whether a session a budget cap ended had
+// already delivered its work: work that owes a pull request, with the
+// session's own verified pull request (one per mutable repository of a
+// declared workarea), a passed turn result, and no failure the runner
+// recorded. Such a session ends completed with the breach recorded, not
+// failed: the cap stopped work that was already done.
+func deliveredAtBudgetStop(qw QueuedWork, res *Result, declaration *workarea.NormalizedDeclaration) bool {
+	if !RequiresPRURL(qw.WorkType) || res.PullRequestURL == "" || res.WorkResult != "passed" {
+		return false
+	}
+	if res.FailureMode != "" || res.Status == "failed" {
+		return false
+	}
+	return declaration == nil || len(missingMutablePullRequests(res, *declaration)) == 0
+}
+
+// takesMidTurnWrapUp reports whether a harness that declares nd takes the
+// wrap-up request while its turn is still running. Only a steer channel
+// does: pi's RPC steer delivers a message after the current model turn's
+// tool calls and before its next model call. Every other mechanism either
+// runs a second writer against a live turn (resume-inject), queues the
+// message behind the whole turn, or delivers nothing, so there the request
+// rides the next follow-up prompt instead.
+func takesMidTurnWrapUp(nd agent.NoticeDelivery) bool {
+	return nd == agent.NoticeDeliveryRPCSteer
 }
 
 func (r *Runner) protectedRuntimeMCPV2Applies(qw QueuedWork, selection harnessSelection) bool {
@@ -1801,6 +1895,10 @@ func (r *Runner) drainMemoryInjects(
 			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
 			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
+			if enforcer != nil && enforcer.breached() != nil {
+				// A budget cap ended the turn: deliver nothing more.
+				return merged
+			}
 		default:
 			// No more buffered injects.
 			return merged
@@ -1835,7 +1933,6 @@ type streamObservation struct {
 	// REQUEST_CHANGES from the LATEST assistant message carrying a
 	// line-anchored REVIEW_VERDICT marker. Empty when the turn gave none.
 	reviewVerdict string
-	cost          *agent.CostData
 	providerID    string
 	// lastAssistantText is the most recent non-empty assistant message
 	// observed on this stream. It is the summary fallback for providers
@@ -1857,9 +1954,9 @@ type streamObservation struct {
 	// "AGENT_BLOCKED: <reason>" marker, surfaced on Result.Error.
 	blockedReason string
 	// budgetBreach is set when the in-flight enforcer tripped a cap
-	// during ObserveEvent. The runner reads this in the post-stream
-	// classification path to fork to FailureBudgetExceeded instead of
-	// the generic FailureProviderError / FailureSilentExit branches.
+	// during ObserveEvent. consumeEvents then ends the turn at its next
+	// boundary and returns the breach, which the runner's budget stop
+	// (stopAtBudget) acts on.
 	budgetBreach *BudgetExceededError
 	// providerError is the provider error text of a model call that ended
 	// on a provider error (agent.SystemSubtypeProviderError) with no
@@ -1906,9 +2003,9 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	if o.reviewVerdict != "" {
 		res.ReviewVerdict = o.reviewVerdict
 	}
-	if o.cost != nil {
-		res.Cost = o.cost
-	}
+	// Cost is not taken from the stream: the session's usage meter (the
+	// budget enforcer) counts every turn, and runLoop reports its total.
+	//
 	// Terminal summary stamping. The terminal event's message is
 	// authoritative and LAST-wins: when a background-poll wakeup (memory
 	// inject / steering) produces a resume turn, its terminal message is
@@ -1948,6 +2045,12 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 // the loop). A nil err with terminalSuccess=false means the channel
 // closed without a terminal Result — the caller classifies as
 // FailureSilentExit.
+//
+// Every event also feeds the budget enforcer. A sub-agent cap ends the
+// stream at once; a token cap the meter crossed ends it at the turn's next
+// boundary (atTurnBoundary), returning the *BudgetExceededError. Past the
+// wrap-up point, on a harness that takes a message into a running turn, the
+// agent is asked to wrap up at its next tool call (wrapUpMidTurn).
 func (r *Runner) consumeEvents(
 	ctx context.Context,
 	handle agent.Handle,
@@ -2049,6 +2152,9 @@ func (r *Runner) consumeEvents(
 			clear(toolInFlight)
 		}
 	}
+	// wrapUpTried limits the mid-turn wrap-up request to one attempt per
+	// turn; a request the harness refused rides the next follow-up prompt.
+	wrapUpTried := false
 
 	for {
 		select {
@@ -2093,8 +2199,24 @@ func (r *Runner) consumeEvents(
 				sink.Send(watchCtx, correlatedEvent)
 				if enforcer != nil {
 					if berr := enforcer.ObserveEvent(correlatedEvent); berr != nil {
-						obs.budgetBreach = berr
-						return obs, berr
+						if berr.Cap != CapTokens {
+							obs.budgetBreach = berr
+							return obs, berr
+						}
+						// Keep the crossing: later calls repeat the breach
+						// with a larger count.
+						if obs.budgetBreach == nil {
+							obs.budgetBreach = berr
+						}
+					}
+					// A token cap the meter crossed mid-turn ends the
+					// turn at its next boundary, not at once: a tool call
+					// already running is never cut off.
+					if obs.budgetBreach != nil && atTurnBoundary(correlatedEvent, len(toolInFlight)) {
+						return obs, obs.budgetBreach
+					}
+					if !wrapUpTried && obs.budgetBreach == nil && r.wrapUpMidTurn(watchCtx, handle, enforcer, qw, correlatedEvent) {
+						wrapUpTried = true
 					}
 				}
 				if _, terminal := correlatedEvent.(agent.ResultEvent); terminal {
@@ -2103,6 +2225,47 @@ func (r *Runner) consumeEvents(
 			}
 		}
 	}
+}
+
+// atTurnBoundary reports whether the stream is at a turn boundary once ev
+// is applied: the turn ended (ResultEvent), or a model call just reported
+// its usage (a harness-reported, non-synthetic LlmCallEvent) with no tool
+// call running. It is where the runner stops a turn the token cap ended.
+// Harnesses report a model call's usage at different points — pi after the
+// call's tool calls ran, a Claude-style stream before them — so at the call
+// that crossed the cap, the tool calls that call requested may not run; the
+// usage the call spent is metered either way. A tool call that is running is
+// never cut off.
+func atTurnBoundary(ev agent.Event, toolsInFlight int) bool {
+	switch e := ev.(type) {
+	case agent.ResultEvent:
+		return true
+	case agent.LlmCallEvent:
+		return !e.Synthetic && e.UsageSource != agent.LlmUsageAggregate && toolsInFlight == 0
+	default:
+		return false
+	}
+}
+
+// wrapUpMidTurn asks the agent to wrap up while its turn is still running,
+// once the token meter has passed the wrap-up point: on a harness that
+// takes a message into a running turn (takesMidTurnWrapUp), at a tool call
+// — the turn is certainly in flight then, so the request reaches the model
+// before its next call. It reports whether it tried; a refused request stays
+// due and rides the next follow-up prompt.
+func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforcer *BudgetEnforcer, qw QueuedWork, ev agent.Event) bool {
+	if _, toolCall := ev.(agent.ToolUseEvent); !toolCall || !enforcer.midTurnWrapUp || !enforcer.wrapUpDue() {
+		return false
+	}
+	if err := handle.Inject(ctx, wrapUpPrompt); err != nil {
+		r.logger.Warn("mid-turn wrap-up request not delivered; it rides the next follow-up prompt",
+			"sessionId", qw.SessionID, "err", err)
+		return true
+	}
+	enforcer.wrapUpSent()
+	r.logger.Info("token budget nearly spent; asked the agent to wrap up mid-turn",
+		"sessionId", qw.SessionID, "maxTokens", enforcer.limits.MaxTokens)
+	return true
 }
 
 // observeEvent applies a single event to the observation accumulator.
@@ -2195,9 +2358,6 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
-		if e.Cost != nil {
-			obs.cost = e.Cost
-		}
 	case agent.ErrorEvent:
 		obs.errorEvent = &e
 	}

@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -101,6 +102,26 @@ type recordingPlatformServer struct {
 		DeliveryID string `json:"deliveryId"`
 		Reason     string `json:"reason"`
 	}
+	// statuses are the bodies of every /status post other than the
+	// "running" transition, in order: the terminal status the platform
+	// received.
+	statuses [][]byte
+}
+
+// terminalStatus returns the last terminal /status body the double received,
+// decoded; it fails the test when none arrived.
+func (s *recordingPlatformServer) terminalStatus(t *testing.T) map[string]json.RawMessage {
+	t.Helper()
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	if len(s.statuses) == 0 {
+		t.Fatal("no terminal status was posted")
+	}
+	var body map[string]json.RawMessage
+	if err := json.Unmarshal(s.statuses[len(s.statuses)-1], &body); err != nil {
+		t.Fatalf("terminal status body is not JSON: %v", err)
+	}
+	return body
 }
 
 // injectReports returns every ack and dead-letter the worker echoed.
@@ -144,6 +165,17 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 	t.Helper()
 	rec := &recordingPlatformServer{}
 	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/status") {
+			body, _ := io.ReadAll(r.Body)
+			var status struct {
+				Status string `json:"status"`
+			}
+			if json.Unmarshal(body, &status) == nil && status.Status != "running" {
+				rec.mu.Lock()
+				rec.statuses = append(rec.statuses, body)
+				rec.mu.Unlock()
+			}
+		}
 		if strings.Contains(r.URL.Path, "/lock-refresh") {
 			var body struct {
 				SessionClass        string `json:"sessionClass"`

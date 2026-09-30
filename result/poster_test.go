@@ -1099,6 +1099,64 @@ func TestPosterPost_StatusTurnContinuationsSerialized(t *testing.T) {
 	}
 }
 
+// TestPosterPost_StatusBudgetBreachSerialized pins that the budget cap the
+// runner stopped a session at reaches the status body — beside a completed
+// status it is the flag that delivered work ran over its budget — and is
+// omitted for a session that stayed within its budget.
+func TestPosterPost_StatusBudgetBreachSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name   string
+		status string
+		in     *agent.BudgetBreach
+		want   string
+	}{
+		{name: "omitted within budget", status: "completed"},
+		{
+			name:   "completed over budget",
+			status: "completed",
+			in:     &agent.BudgetBreach{Cap: "max-tokens", Detail: "max-tokens exceeded: observed=5010000 limit=5000000"},
+			want:   `{"cap":"max-tokens","detail":"max-tokens exceeded: observed=5010000 limit=5000000"}`,
+		},
+		{name: "failed at the cap", status: "failed", in: &agent.BudgetBreach{Cap: "max-duration-seconds"}, want: `{"cap":"max-duration-seconds"}`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.Status = tc.status
+			r.BudgetBreach = tc.in
+			if err := p.Post(context.Background(), "sess-budget", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			if got := string(body["status"]); got != `"`+tc.status+`"` {
+				t.Errorf("status = %s; want %q", got, tc.status)
+			}
+			got, present := body["budgetBreach"]
+			if present != (tc.want != "") {
+				t.Fatalf("budgetBreach present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("budgetBreach = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPosterPost_StatusReviewVerdictSerialized pins that the structured
 // review outcome reaches the status body, and is omitted when empty.
 func TestPosterPost_StatusReviewVerdictSerialized(t *testing.T) {
