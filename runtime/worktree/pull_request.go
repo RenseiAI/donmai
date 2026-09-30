@@ -90,8 +90,17 @@ func (m *Manager) fetchPullRequestHead(ctx context.Context, dst string, spec Pro
 	localRef := pr.ResolvedLocalRef()
 	remoteRef := pr.RemoteHeadRef()
 
-	if out, err := m.runGit(ctx, spec.RepoURL, "-C", dst, "fetch", "--no-tags", originRemote,
-		"+"+remoteRef+":"+localRef); err != nil {
+	fetchOut, fetchErr := m.runRemoteWithCredentialRetry(ctx, spec.SessionID, "fetch", m.credentialPropagationDelays(), func() ([]byte, error) {
+		out, err := m.runGit(ctx, spec.RepoURL, "-C", dst, "fetch", "--no-tags", originRemote,
+			"+"+remoteRef+":"+localRef)
+		if err != nil && isCredentialPropagationError(out) {
+			err = fmt.Errorf("%w: %w (%s)", ErrCredentialPropagation, err, strings.TrimSpace(string(out)))
+		}
+		return out, err
+	})
+	if fetchErr != nil {
+		out := fetchOut
+		err := fetchErr
 		return fmt.Errorf("%w: pull request #%d %s into %s: %w (%s)",
 			ErrPullRequestFetch, pr.Number, remoteRef, localRef, err, gitDetail(out))
 	}
