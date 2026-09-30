@@ -3,13 +3,19 @@ package orchestrator_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/afclient/orchestrator"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/linear"
+	stub "github.com/RenseiAI/donmai/provider/harness/stub"
 )
 
 // ── Fixtures ──────────────────────────────────────────────────────────────────
@@ -330,6 +336,96 @@ func TestRunBacklog_RepoMismatch(t *testing.T) {
 	}
 }
 
+type changingRemoteDispatcher struct {
+	root  string
+	calls atomic.Int64
+}
+
+func (d *changingRemoteDispatcher) Dispatch(ctx context.Context, issue linear.Issue, _ orchestrator.Config) (*orchestrator.AgentDispatch, error) {
+	if d.calls.Add(1) == 1 {
+		cmd := exec.CommandContext(ctx, "git", "remote", "set-url", "origin", "https://example.invalid/other/repo.git")
+		cmd.Dir = d.root
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("change fixture origin: %w: %s", err, output)
+		}
+	}
+
+	return &orchestrator.AgentDispatch{
+		IssueID:    issue.ID,
+		Identifier: issue.Identifier,
+		Status:     orchestrator.DispatchCompleted,
+	}, nil
+}
+
+func TestRunBacklog_RevalidatesRepositoryBeforeEachDispatch(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
+	dir := t.TempDir()
+	initGitRepo(t, dir, "https://example.invalid/expected/repo.git")
+	issues := []linear.Issue{
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
+		makeIssue("id-3", "ENG-3", "Issue three", "Alpha"),
+	}
+	lin := &mockLinear{issues: issues}
+	disp := &changingRemoteDispatcher{root: dir}
+	cfg := orchestrator.Config{
+		Project:    "Alpha",
+		Repository: "example.invalid/expected/repo",
+		Max:        1,
+		GitRoot:    dir,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, disp)
+	result, err := o.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls := disp.calls.Load(); calls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 after the remote changes", calls)
+	}
+	if len(result.Dispatched) != 1 || result.Dispatched[0].Identifier != "ENG-1" {
+		t.Fatalf("dispatched = %v, want only ENG-1", result.Dispatched)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "repository mismatch") {
+		t.Fatalf("errors = %v, want one repository mismatch", result.Errors)
+	}
+}
+
+func TestRunBacklog_MatchingRepositoryDispatchesAllIssues(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
+	dir := t.TempDir()
+	initGitRepo(t, dir, "https://example.invalid/expected/repo.git")
+	issues := []linear.Issue{
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
+		makeIssue("id-3", "ENG-3", "Issue three", "Alpha"),
+	}
+	lin := &mockLinear{issues: issues}
+	disp := &mockDispatcher{}
+	cfg := orchestrator.Config{
+		Project:    "Alpha",
+		Repository: "example.invalid/expected/repo",
+		Max:        1,
+		GitRoot:    dir,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, disp)
+	result, err := o.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("errors = %v, want none", result.Errors)
+	}
+	if len(result.Dispatched) != len(issues) || len(disp.dispatched) != len(issues) {
+		t.Fatalf("dispatched = %d result entries, %d dispatcher calls; want %d", len(result.Dispatched), len(disp.dispatched), len(issues))
+	}
+}
+
 func TestValidateGitRemote_Match(t *testing.T) {
 	dir := t.TempDir()
 	initGitRepo(t, dir, "https://github.com/org/my-repo.git")
@@ -382,4 +478,138 @@ allowedProjects:
 	if err == nil {
 		t.Fatal("expected allowlist enforcement error, got nil")
 	}
+}
+
+// ── Native backlog lifecycle controls ───────────────────────────────────────
+
+// concurrencyFactory tracks the maximum concurrent NewProvider calls to prove
+// the backlog run respects its --max bound.
+type concurrencyFactory struct {
+	current atomic.Int64
+	peak    atomic.Int64
+	delay   time.Duration
+}
+
+func (f *concurrencyFactory) NewProvider(_ context.Context, _ string) (agent.Provider, error) {
+	cur := f.current.Add(1)
+	for {
+		peak := f.peak.Load()
+		if cur <= peak || f.peak.CompareAndSwap(peak, cur) {
+			break
+		}
+	}
+	if f.delay > 0 {
+		time.Sleep(f.delay)
+	}
+	p, err := stub.New(stub.WithDefaultBehavior(stub.BehaviorSucceedWithPR))
+	f.current.Add(-1)
+	return p, err
+}
+
+func TestRunBacklog_NativeRespectsConcurrencyLimit(t *testing.T) {
+	dir := t.TempDir()
+	issues := []linear.Issue{
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
+		makeIssue("id-3", "ENG-3", "Issue three", "Alpha"),
+		makeIssue("id-4", "ENG-4", "Issue four", "Alpha"),
+		makeIssue("id-5", "ENG-5", "Issue five", "Alpha"),
+		makeIssue("id-6", "ENG-6", "Issue six", "Alpha"),
+	}
+	lin := &mockLinear{issues: issues}
+	fac := &concurrencyFactory{delay: 100 * time.Millisecond}
+
+	cfg := orchestrator.Config{
+		LinearAPIKey:    "test-key",
+		Project:         "Alpha",
+		Max:             2,
+		GitRoot:         dir,
+		ProviderFactory: fac,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, &mockDispatcher{})
+	o.WithProviderFactory(fac)
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	result, err := o.Run(ctx)
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Dispatched) != len(issues) {
+		t.Fatalf("expected %d dispatched entries, got %d", len(issues), len(result.Dispatched))
+	}
+	for _, d := range result.Dispatched {
+		if d.Status != orchestrator.DispatchCompleted {
+			t.Errorf("expected DispatchCompleted, got %s for %s", d.Status, d.Identifier)
+		}
+		if !d.CompletedAt.After(d.StartedAt) && !d.CompletedAt.Equal(d.StartedAt) {
+			t.Errorf("expected CompletedAt to be set for %s", d.Identifier)
+		}
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("expected no errors, got %v", result.Errors)
+	}
+	if peak := fac.peak.Load(); peak > 2 {
+		t.Fatalf("peak provider concurrency = %d, want <= 2", peak)
+	}
+	if peak := fac.peak.Load(); peak < 1 {
+		t.Fatal("expected at least one provider construction")
+	}
+}
+
+func TestRunSingle_NativeFailureRecorded(t *testing.T) {
+	dir := t.TempDir()
+	issue := makeIssue("id-1", "ENG-1", "Clone breaks", "MyProject")
+	lin := &mockLinear{issues: []linear.Issue{issue}}
+	lin.singleFn = func(_ context.Context, _ string) (*linear.Issue, error) { return &issue, nil }
+
+	cfg := orchestrator.Config{
+		LinearAPIKey: "test-key",
+		Single:       "ENG-1",
+		GitRoot:      dir,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, &mockDispatcher{})
+	o.WithProviderFactory(&stubBehaviorFactory{behavior: stub.BehaviorFailOnClone})
+	result, err := o.Run(context.Background())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Dispatched) != 1 {
+		t.Fatalf("expected 1 dispatched entry, got %d", len(result.Dispatched))
+	}
+	if result.Dispatched[0].Status != orchestrator.DispatchFailed {
+		t.Fatalf("Status = %q, want failed", result.Dispatched[0].Status)
+	}
+	if len(result.Errors) != 1 {
+		t.Fatalf("expected 1 recorded error, got %d", len(result.Errors))
+	}
+}
+
+func TestRunBacklog_UnknownHarnessFailsFast(t *testing.T) {
+	dir := t.TempDir()
+	issues := []linear.Issue{makeIssue("id-1", "ENG-1", "Issue one", "Alpha")}
+	lin := &mockLinear{issues: issues}
+
+	cfg := orchestrator.Config{
+		LinearAPIKey: "test-key",
+		Project:      "Alpha",
+		GitRoot:      dir,
+		Harness:      "nope",
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, &mockDispatcher{})
+	_, err := o.Run(context.Background())
+	if err == nil {
+		t.Fatal("expected unknown-harness error, got nil")
+	}
+}
+
+// stubBehaviorFactory builds stub providers with one fixed behavior.
+type stubBehaviorFactory struct {
+	behavior stub.Behavior
+}
+
+func (f *stubBehaviorFactory) NewProvider(_ context.Context, _ string) (agent.Provider, error) {
+	return stub.New(stub.WithDefaultBehavior(f.behavior))
 }

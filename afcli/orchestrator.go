@@ -22,6 +22,7 @@ type orchestratorFlags struct {
 	dryRun    bool
 	repo      string
 	templates string
+	harness   string
 	linearKey string
 	debug     bool
 	quiet     bool
@@ -37,6 +38,7 @@ type orchestratorFlags struct {
 //	--dry-run    Print what would be dispatched without spawning agents
 //	--repo       Git remote URL pattern to validate against origin
 //	--templates  Custom workflow template directory path
+//	--harness    Native harness provider: auto, claude or codex (default: auto)
 func newOrchestratorCmd(cfg Config) *cobra.Command {
 	bin := binaryName(cfg)
 	flags := &orchestratorFlags{}
@@ -66,7 +68,10 @@ Examples:
   ` + bin + ` orchestrator --project MyProject --repo github.com/org/repo
 
   # Use custom workflow templates
-  ` + bin + ` orchestrator --project MyProject --templates .donmai/templates`,
+  ` + bin + ` orchestrator --project MyProject --templates .donmai/templates
+
+  # Pin the native harness provider (default: auto probes claude, then codex)
+  ` + bin + ` orchestrator --project MyProject --harness codex`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			return runOrchestrator(cmd, flags)
@@ -79,6 +84,7 @@ Examples:
 	cmd.Flags().BoolVar(&flags.dryRun, "dry-run", false, "Print what would be dispatched without spawning agents")
 	cmd.Flags().StringVar(&flags.repo, "repo", "", "Git remote URL pattern to validate against origin (e.g. github.com/org/repo)")
 	cmd.Flags().StringVar(&flags.templates, "templates", "", "Custom workflow template directory path")
+	cmd.Flags().StringVar(&flags.harness, "harness", "auto", "Native harness provider: auto, claude or codex")
 	cmd.Flags().StringVar(&flags.linearKey, "linear-key", "", "Linear API key (default: $LINEAR_API_KEY)")
 	cmd.Flags().BoolVar(&flags.debug, "debug", false, "Enable debug logging")
 	cmd.Flags().BoolVar(&flags.quiet, "quiet", false, "Suppress non-error output")
@@ -115,6 +121,7 @@ func runOrchestrator(_ *cobra.Command, flags *orchestratorFlags) error {
 		DryRun:       flags.dryRun,
 		Repository:   flags.repo,
 		TemplateDir:  flags.templates,
+		Harness:      flags.harness,
 		Logger:       logger,
 	}
 
