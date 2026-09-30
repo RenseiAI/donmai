@@ -1989,6 +1989,8 @@ func (d *Daemon) trackLaunchedShim(
 		ProjectName:   project.ID,
 		Repository:    spec.Repository,
 		Harness:       spec.Harness,
+		AgentCardID:   spec.AgentCardID,
+		AgentCardName: spec.AgentCardName,
 		Model:         spec.Model,
 		ModelProvider: spec.Company,
 		WorkType:      spec.WorkType,

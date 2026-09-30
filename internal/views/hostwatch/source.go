@@ -33,12 +33,18 @@ type stateReader interface {
 // live metrics the tailer accumulates (tool count, last tool, cost). It is
 // the unit the FleetGrid renders.
 type SessionCard struct {
-	SessionID    string
-	PID          int
-	DaemonState  string // daemon lifecycle: starting/running/...
-	WorktreePath string
-	ProjectName  string
-	Repository   string
+	AcceptedAt          string
+	AgentCardID         string
+	AgentCardName       string
+	ActualModel         string
+	ActualModelProvider string
+	ActualModelVersion  string
+	SessionID           string
+	PID                 int
+	DaemonState         string // daemon lifecycle: starting/running/...
+	WorktreePath        string
+	ProjectName         string
+	Repository          string
 
 	// From state.json (best-effort; zero values when unreadable).
 	IssueID         string
@@ -174,12 +180,15 @@ func (s *Source) Snapshot() Snapshot {
 			continue
 		}
 		card := SessionCard{
-			SessionID:    h.SessionID,
-			PID:          h.PID,
-			DaemonState:  h.State,
-			WorktreePath: h.WorktreePath,
-			ProjectName:  h.ProjectName,
-			Repository:   h.Repository,
+			SessionID:     h.SessionID,
+			AcceptedAt:    h.AcceptedAt,
+			AgentCardID:   h.AgentCardID,
+			AgentCardName: h.AgentCardName,
+			PID:           h.PID,
+			DaemonState:   h.State,
+			WorktreePath:  h.WorktreePath,
+			ProjectName:   h.ProjectName,
+			Repository:    h.Repository,
 			// The daemon index is the owning seam for display metadata:
 			// the handle already carries the admitted identity, so a
 			// local reader needs no per-card fetch. state.json only
@@ -217,9 +226,18 @@ func (s *Source) enrichFromState(card *SessionCard) {
 		_ = errors.Is(err, state.ErrNotFound)
 		return
 	}
+	if st.SessionID != "" && st.SessionID != card.SessionID {
+		return // a reused path still contains another session's state
+	}
 	card.IssueID = st.IssueID
 	card.IssueIdentifier = st.IssueIdentifier
 	card.Provider = string(st.ProviderName)
+	// Card name and ID belong to one annotation. Do not mix an index ID
+	// with an unrelated stale state name (or the converse).
+	if card.AgentCardID == "" && card.AgentCardName == "" {
+		card.AgentCardID = st.AgentCardID
+		card.AgentCardName = st.AgentCardName
+	}
 	// state.json backfills only what the daemon index did not already
 	// supply, so an older daemon's local state still renders while a new
 	// daemon's admitted identity always wins.

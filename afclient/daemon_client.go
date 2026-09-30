@@ -404,6 +404,12 @@ type DaemonDrainRequest struct {
 // per-session detail call. See
 // ADR-2026-06-13-daemon-sessionhandle-enrichment.
 type DaemonSessionHandle struct {
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// SessionID is the platform session UUID.
 	SessionID string `json:"sessionId"`
 	// PID is the spawned worker process id.

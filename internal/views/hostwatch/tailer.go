@@ -41,6 +41,9 @@ import (
 // event's own time where it carries one — and Replay to gate liveness
 // updates off replayed history entirely.
 type TailEvent struct {
+	// source fences asynchronously read batches to the registered reader.
+	// It is local bookkeeping only and never part of the event wire.
+	source *Tailer
 	// SessionID is the session whose events.jsonl produced this event.
 	SessionID string
 	// At is the local time the tailer read the line.

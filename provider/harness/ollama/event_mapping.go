@@ -96,12 +96,14 @@ func mapLine(line []byte) ([]agent.Event, error) {
 	}
 	return []agent.Event{
 		agent.LlmCallEvent{
-			System:       "ollama",
-			Model:        c.Model,
-			InputTokens:  c.PromptEvalCount,
-			OutputTokens: c.EvalCount,
-			FinishReason: c.DoneReason,
-			UsageSource:  agent.LlmUsageProvider,
+			System:                "ollama",
+			Model:                 c.Model,
+			ResponseModel:         c.Model,
+			ResponseModelProvider: "ollama",
+			InputTokens:           c.PromptEvalCount,
+			OutputTokens:          c.EvalCount,
+			FinishReason:          c.DoneReason,
+			UsageSource:           agent.LlmUsageProvider,
 		},
 		res,
 	}, nil

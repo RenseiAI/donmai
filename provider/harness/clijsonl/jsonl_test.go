@@ -8,6 +8,7 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	spanruntime "github.com/RenseiAI/donmai/runtime/span"
 )
 
 // readFixture loads a JSONL fixture from testdata/. The trailing
@@ -64,6 +65,7 @@ func TestMapLine_AssistantText(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "assistant_text.jsonl"))
+	events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -87,7 +89,7 @@ func TestMapLine_AssistantPerCallUsage(t *testing.T) {
 	if !ok {
 		t.Fatalf("event[0] %T, want LlmCallEvent", events[0])
 	}
-	if llm.Model != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
+	if llm.Model != "claude-opus-4" || llm.ResponseModel != "claude-opus-4" || llm.InputTokens != 120 || llm.OutputTokens != 30 || llm.CachedInputTokens != 80 {
 		t.Fatalf("unexpected usage event: %+v", llm)
 	}
 	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
@@ -109,6 +111,7 @@ func TestMapLine_AssistantToolUse(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "assistant_tool_use.jsonl"))
+	events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1", len(events))
 	}
@@ -131,6 +134,7 @@ func TestMapLine_AssistantMixed(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "assistant_mixed.jsonl"))
+	events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
 	if len(events) != 2 {
 		t.Fatalf("got %d events, want 2 (text + tool_use): %v", len(events), events)
 	}
@@ -152,6 +156,7 @@ func TestMapLine_AssistantThinking(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "assistant_thinking.jsonl"))
+	events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
 	if len(events) != 2 {
 		t.Fatalf("got %d events, want 2 (reasoning + text): %v", len(events), events)
 	}
@@ -183,6 +188,7 @@ func TestMapLine_AssistantRedactedThinking(t *testing.T) {
 	t.Parallel()
 
 	events := mapLine(readFixture(t, "assistant_redacted_thinking.jsonl"))
+	events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
 	if len(events) != 1 {
 		t.Fatalf("got %d events, want 1 (text only): %v", len(events), events)
 	}
@@ -455,5 +461,83 @@ func TestDecodeInput_MalformedReturnsNil(t *testing.T) {
 	}
 	if got := decodeInput(nil); got != nil {
 		t.Errorf("decodeInput(nil) = %v, want nil", got)
+	}
+}
+
+func TestResponseModelFromNativeMessageWithoutUsage(t *testing.T) {
+	t.Parallel()
+	events := mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[]}}`))
+	if len(events) != 1 {
+		t.Fatalf("response identity was dropped without usage: %+v", events)
+	}
+	observation, ok := events[0].(agent.SystemEvent)
+	if !ok || observation.Subtype != agent.SystemSubtypeModelIdentity || observation.ObservedModel == nil || observation.ObservedModel.Model != "native-response-id" || observation.ObservedModel.Provider != "" || observation.ObservedModel.Version != "" {
+		t.Fatalf("response identity = %+v; provider/version must remain unknown", events[0])
+	}
+}
+
+// The native model observation precedes the existing content projections.
+// Validate it strictly before asserting the original content sequence below.
+func requireResponseModelPrefix(t *testing.T, events []agent.Event, model string) []agent.Event {
+	t.Helper()
+	if len(events) == 0 {
+		t.Fatal("native response model observation missing")
+	}
+	observation, ok := events[0].(agent.SystemEvent)
+	if !ok || observation.Subtype != agent.SystemSubtypeModelIdentity || observation.ObservedModel == nil || observation.ObservedModel.Model != model || observation.ObservedModel.Provider != "" || observation.ObservedModel.Version != "" {
+		t.Fatalf("native response model prefix = %+v, want model %q and unknown provider/version", events[0], model)
+	}
+	return events[1:]
+}
+
+func TestNativeModelObservationPreservesTerminalAggregateUsage(t *testing.T) {
+	t.Parallel()
+	var spans []agent.Span
+	processor, err := spanruntime.NewProcessor(spanruntime.ProcessorConfig{SessionID: "local-session", OrgID: "local", WorkspaceID: "local", System: "configured", Model: "requested-alias", Sender: spanruntime.SendFunc(func(s agent.Span) bool { spans = append(spans, s); return true })})
+	if err != nil {
+		t.Fatal(err)
+	}
+	var observation *agent.ObservedModelIdentity
+	for _, ev := range mapLine([]byte(`{"type":"assistant","message":{"model":"native-response-id","content":[{"type":"text","text":"done"}]}}`)) {
+		for _, processed := range processor.Process(ev) {
+			if status, ok := processed.(agent.SystemEvent); ok && status.ObservedModel != nil {
+				observation = status.ObservedModel
+			}
+			if call, ok := processed.(agent.LlmCallEvent); ok && call.ResponseModel != "" {
+				observation = &agent.ObservedModelIdentity{Model: call.ResponseModel, Provider: call.ResponseModelProvider, Version: call.ModelSnapshotID}
+			}
+		}
+	}
+	preTerminalSpans := len(spans)
+	if observation == nil || observation.Model != "native-response-id" {
+		t.Fatal("native response model observation was lost")
+	}
+	var aggregate *agent.LlmCallEvent
+	var terminal *agent.ResultEvent
+	for _, ev := range mapLine([]byte(`{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":1.25,"usage":{"input_tokens":120,"output_tokens":30,"cache_read_input_tokens":80}}`)) {
+		for _, processed := range processor.Process(ev) {
+			if call, ok := processed.(agent.LlmCallEvent); ok {
+				aggregate = &call
+			}
+			if res, ok := processed.(agent.ResultEvent); ok {
+				terminal = &res
+			}
+		}
+	}
+	if aggregate == nil || !aggregate.Synthetic || aggregate.UsageSource != agent.LlmUsageAggregate || aggregate.InputTokens != 120 || aggregate.OutputTokens != 30 || aggregate.CachedInputTokens != 80 {
+		t.Fatalf("terminal aggregate usage was suppressed/changed: %+v", aggregate)
+	}
+	if preTerminalSpans != 0 {
+		t.Fatalf("metadata-only response emitted %d usage spans before terminal", preTerminalSpans)
+	}
+	if terminal == nil || terminal.Cost == nil || terminal.Cost.TotalCostUsd != 1.25 || terminal.Cost.NumTurns != 3 {
+		t.Fatalf("terminal cost/turns changed: %+v", terminal)
+	}
+	if len(spans) != 1 {
+		t.Fatalf("got %d spans, want one terminal aggregate LLM span", len(spans))
+	}
+	llm, ok := spans[0].(agent.LlmCallSpan)
+	if !ok || llm.GenAI.UsageInputTokens != 120 || llm.GenAI.UsageOutputTokens != 30 || llm.GenAI.UsageCacheReadInputTokens != 80 {
+		t.Fatalf("terminal aggregate span changed: %+v", spans[0])
 	}
 }

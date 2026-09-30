@@ -59,9 +59,24 @@ type InitEvent struct {
 func (InitEvent) Kind() EventKind { return EventInit }
 func (InitEvent) isAgentEvent()   {}
 
+// ObservedModelIdentity carries only native response evidence. Components
+// remain empty independently when the response does not report them.
+type ObservedModelIdentity struct {
+	Model    string `json:"model,omitempty"`
+	Provider string `json:"provider,omitempty"`
+	Version  string `json:"version,omitempty"`
+}
+
+// SystemSubtypeModelIdentity is a metadata-only serving observation. It is
+// not a model call or usage measurement and must not suppress aggregate usage.
+const SystemSubtypeModelIdentity = "model_identity"
+
 // SystemEvent is a provider-emitted lifecycle/status event (compaction,
 // rate-limit notice, etc.). Verbatim port of AgentSystemEvent.
 type SystemEvent struct {
+	// ObservedModel is native response metadata, independent of configured
+	// model/provider and ordinary status Message. Nil means not observed.
+	ObservedModel *ObservedModelIdentity `json:"observedModel,omitempty"`
 	// Subtype is the provider-defined event subtype (e.g. "compaction",
 	// "rate_limited").
 	Subtype string `json:"subtype"`
@@ -179,6 +194,13 @@ type LlmCallEvent struct {
 	// "anthropic" or "openai"). Model is the requested model identifier.
 	System string `json:"system,omitempty"`
 	Model  string `json:"model,omitempty"`
+
+	// ResponseModel and ResponseModelProvider are observed response metadata.
+	// Producers must leave either empty when the native response does not
+	// identify it. Requested aliases, configured providers and System are not
+	// response evidence. ModelSnapshotID separately identifies an exact version.
+	ResponseModel         string `json:"responseModel,omitempty"`
+	ResponseModelProvider string `json:"responseModelProvider,omitempty"`
 
 	InputTokens       int64  `json:"inputTokens,omitempty"`
 	OutputTokens      int64  `json:"outputTokens,omitempty"`

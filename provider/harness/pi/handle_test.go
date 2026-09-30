@@ -784,3 +784,31 @@ func checkTerminalLast(evs []agent.Event) error {
 	}
 	return nil
 }
+
+func TestRPCResponseModelIsObservedWithoutConfiguredIdentityFallback(t *testing.T) {
+	t.Parallel()
+	for _, test := range []struct{ name, response, want string }{
+		{name: "native response metadata", response: `,"responseModel":"served-model"`, want: "served-model"},
+		{name: "configured model alone", want: ""},
+	} {
+		t.Run(test.name, func(t *testing.T) {
+			body := `{"type":"turn_end","message":{"role":"assistant","provider":"configured-vendor","model":"requested-alias","usage":{"input":1,"output":2}` + test.response + `}}` + "\n" + `{"type":"agent_settled"}` + "\n"
+			cmds, h, err := spawnScripted(t, agent.Spec{Cwd: t.TempDir(), Prompt: "hello"}, handshakeEvent("hs"), body)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var got *agent.LlmCallEvent
+			for _, ev := range drain(t, h) {
+				if call, ok := ev.(agent.LlmCallEvent); ok {
+					got = &call
+				}
+			}
+			if got == nil || got.ResponseModel != test.want || got.ResponseModelProvider != "" || got.ModelSnapshotID != "" {
+				t.Fatalf("observed RPC identity = %+v, want model %q and unknown provider/version", got, test.want)
+			}
+			if len(cmds.commands()) == 0 {
+				t.Fatal("RPC command surface was not exercised")
+			}
+		})
+	}
+}
