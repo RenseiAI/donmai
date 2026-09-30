@@ -699,6 +699,20 @@ func (o *Orchestrator) runBacklog(ctx context.Context, result *Result) (*Result,
 				goto done
 			case sem <- struct{}{}:
 			}
+
+			// Revalidate after capacity admission and immediately before
+			// starting the dispatch. A mismatch stops later work, and this
+			// loop releases the slot because no worker owns it yet.
+			if o.cfg.Repository != "" {
+				if verr := ValidateGitRemote(o.cfg.Repository, o.cfg.GitRoot); verr != nil {
+					mu.Lock()
+					result.Errors = append(result.Errors, verr)
+					mu.Unlock()
+					<-sem
+					goto done
+				}
+			}
+
 			wg.Add(1)
 
 			issueCopy := issue

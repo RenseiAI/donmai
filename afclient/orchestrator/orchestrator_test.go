@@ -3,9 +3,11 @@ package orchestrator_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strings"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -331,6 +333,96 @@ func TestRunBacklog_RepoMismatch(t *testing.T) {
 	_, err := o.Run(context.Background())
 	if err == nil {
 		t.Fatal("expected repo mismatch error, got nil")
+	}
+}
+
+type changingRemoteDispatcher struct {
+	root  string
+	calls atomic.Int64
+}
+
+func (d *changingRemoteDispatcher) Dispatch(ctx context.Context, issue linear.Issue, _ orchestrator.Config) (*orchestrator.AgentDispatch, error) {
+	if d.calls.Add(1) == 1 {
+		cmd := exec.CommandContext(ctx, "git", "remote", "set-url", "origin", "https://example.invalid/other/repo.git")
+		cmd.Dir = d.root
+		if output, err := cmd.CombinedOutput(); err != nil {
+			return nil, fmt.Errorf("change fixture origin: %w: %s", err, output)
+		}
+	}
+
+	return &orchestrator.AgentDispatch{
+		IssueID:    issue.ID,
+		Identifier: issue.Identifier,
+		Status:     orchestrator.DispatchCompleted,
+	}, nil
+}
+
+func TestRunBacklog_RevalidatesRepositoryBeforeEachDispatch(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
+	dir := t.TempDir()
+	initGitRepo(t, dir, "https://example.invalid/expected/repo.git")
+	issues := []linear.Issue{
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
+		makeIssue("id-3", "ENG-3", "Issue three", "Alpha"),
+	}
+	lin := &mockLinear{issues: issues}
+	disp := &changingRemoteDispatcher{root: dir}
+	cfg := orchestrator.Config{
+		Project:    "Alpha",
+		Repository: "example.invalid/expected/repo",
+		Max:        1,
+		GitRoot:    dir,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, disp)
+	result, err := o.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if calls := disp.calls.Load(); calls != 1 {
+		t.Fatalf("dispatch calls = %d, want 1 after the remote changes", calls)
+	}
+	if len(result.Dispatched) != 1 || result.Dispatched[0].Identifier != "ENG-1" {
+		t.Fatalf("dispatched = %v, want only ENG-1", result.Dispatched)
+	}
+	if len(result.Errors) != 1 || !strings.Contains(result.Errors[0].Error(), "repository mismatch") {
+		t.Fatalf("errors = %v, want one repository mismatch", result.Errors)
+	}
+}
+
+func TestRunBacklog_MatchingRepositoryDispatchesAllIssues(t *testing.T) {
+	t.Setenv("GIT_CONFIG_NOSYSTEM", "1")
+	t.Setenv("GIT_CONFIG_GLOBAL", "/dev/null")
+
+	dir := t.TempDir()
+	initGitRepo(t, dir, "https://example.invalid/expected/repo.git")
+	issues := []linear.Issue{
+		makeIssue("id-1", "ENG-1", "Issue one", "Alpha"),
+		makeIssue("id-2", "ENG-2", "Issue two", "Alpha"),
+		makeIssue("id-3", "ENG-3", "Issue three", "Alpha"),
+	}
+	lin := &mockLinear{issues: issues}
+	disp := &mockDispatcher{}
+	cfg := orchestrator.Config{
+		Project:    "Alpha",
+		Repository: "example.invalid/expected/repo",
+		Max:        1,
+		GitRoot:    dir,
+	}
+
+	o := newTestOrchestrator(t, cfg, lin, disp)
+	result, err := o.Run(t.Context())
+	if err != nil {
+		t.Fatalf("Run: %v", err)
+	}
+	if len(result.Errors) != 0 {
+		t.Fatalf("errors = %v, want none", result.Errors)
+	}
+	if len(result.Dispatched) != len(issues) || len(disp.dispatched) != len(issues) {
+		t.Fatalf("dispatched = %d result entries, %d dispatcher calls; want %d", len(result.Dispatched), len(disp.dispatched), len(issues))
 	}
 }
 
