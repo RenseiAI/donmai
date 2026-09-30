@@ -252,11 +252,103 @@ func TestBudgetEnforcer_RunningTotalResultCost(t *testing.T) {
 				if rep.ObservedTokens != tc.wantTokens {
 					t.Errorf("ObservedTokens = %d, want %d", rep.ObservedTokens, tc.wantTokens)
 				}
+				// The reported cost is the same meter.
+				if cost := enf.cost(); cost == nil || cost.InputTokens+cost.OutputTokens != tc.wantTokens {
+					t.Errorf("cost = %+v, want %d tokens", cost, tc.wantTokens)
+				}
 				if breached != tc.wantBreach || (rep.CapBreached == CapTokens) != tc.wantBreach {
 					t.Errorf("breach = %v (report cap %q), want %v", breached, rep.CapBreached, tc.wantBreach)
 				}
 			})
 		}
+	}
+}
+
+// TestBudgetEnforcer_TokenCapTripsMidTurn pins the live meter: the model
+// call whose usage crosses the cap trips it, before the turn's ResultEvent;
+// the turn's ResultEvent then reconciles the running total without counting
+// it twice, and the breach keeps the crossing.
+func TestBudgetEnforcer_TokenCapTripsMidTurn(t *testing.T) {
+	t.Parallel()
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000}, time.Now())
+	for _, ev := range []agent.Event{callUsage(500, 100), agent.ToolUseEvent{ToolName: "bash"}, callUsage(300, 50)} {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("within the cap at %T: %v", ev, err)
+		}
+	}
+	err := enf.ObserveEvent(callUsage(100, 0))
+	if err == nil || err.Cap != CapTokens || err.Detail != "max-tokens exceeded: observed=1050 limit=1000" {
+		t.Fatalf("crossing call = %v; want the max-tokens breach at observed=1050", err)
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 1_050 || rep.CapBreached != CapTokens {
+		t.Fatalf("Report = %+v; want 1050 observed and the max-tokens breach", rep)
+	}
+	if err := enf.ObserveEvent(resultCost(900, 150)); err == nil {
+		t.Fatal("the turn's ResultEvent is still over the cap; want the breach again")
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 1_050 || rep.BreachDetail != "max-tokens exceeded: observed=1050 limit=1000" {
+		t.Fatalf("Report = %+v; want the running total counted once and the crossing kept", rep)
+	}
+}
+
+// TestBudgetEnforcer_WrapUpPoint pins the wrap-up point: due once the meter
+// reaches four fifths of the token cap, whether a model call or a turn's
+// result moves it there, until the request is sent; never without a token cap.
+func TestBudgetEnforcer_WrapUpPoint(t *testing.T) {
+	t.Parallel()
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000}, time.Now())
+	_ = enf.ObserveEvent(callUsage(799, 0))
+	if enf.wrapUpDue() {
+		t.Fatal("wrap-up due at 799 of 1000 tokens")
+	}
+	_ = enf.ObserveEvent(callUsage(1, 0))
+	if !enf.wrapUpDue() {
+		t.Fatal("wrap-up not due at 800 of 1000 tokens")
+	}
+	enf.wrapUpSent()
+	_ = enf.ObserveEvent(callUsage(50, 0))
+	if enf.wrapUpDue() {
+		t.Fatal("wrap-up due again after it was sent")
+	}
+
+	byResult := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000}, time.Now())
+	_ = byResult.ObserveEvent(resultCost(850, 0))
+	if !byResult.wrapUpDue() {
+		t.Fatal("wrap-up not due after a result of 850 of 1000 tokens")
+	}
+
+	for _, b := range []*prompt.StageBudget{nil, {MaxDurationSeconds: 60}} {
+		enf := NewBudgetEnforcer(b, time.Now())
+		_ = enf.ObserveEvent(callUsage(1_000_000, 0))
+		if enf.wrapUpDue() {
+			t.Errorf("wrap-up due with budget %+v; there is no token cap", b)
+		}
+	}
+}
+
+// TestBudgetEnforcer_MetersWithoutABudget pins that the usage meter runs for
+// every session — the reported cost comes from it — while a session with no
+// budget is never breached.
+func TestBudgetEnforcer_MetersWithoutABudget(t *testing.T) {
+	t.Parallel()
+	enf := NewBudgetEnforcer(nil, time.Now())
+	for _, ev := range []agent.Event{
+		agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 300, OutputTokens: 100, CachedInputTokens: 20, TotalCostUsd: 0.5, NumTurns: 3}},
+		callUsage(40, 10),
+	} {
+		if err := enf.ObserveEvent(ev); err != nil {
+			t.Fatalf("no budget, no breach: %v", err)
+		}
+	}
+	want := agent.CostData{InputTokens: 340, OutputTokens: 110, CachedInputTokens: 20, TotalCostUsd: 0.5, NumTurns: 4}
+	if got := enf.cost(); got == nil || *got != want {
+		t.Fatalf("cost = %+v; want %+v", got, want)
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 450 || rep.Enforced || rep.CapBreached != "" {
+		t.Fatalf("Report = %+v; want 450 observed, not enforced, no breach", rep)
+	}
+	if NewBudgetEnforcer(nil, time.Now()).cost() != nil {
+		t.Fatal("cost of a session that metered nothing; want nil")
 	}
 }
 

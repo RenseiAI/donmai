@@ -304,6 +304,14 @@ const continueReviewPrompt = "Your previous review turn ended before the review 
 	"verdict as the structured review-verdict field on the turn result. " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
+// wrapUpPrompt asks the agent to finish once the session's token meter has
+// passed the wrap-up point (four fifths of its token budget): delivered into
+// the running turn where the harness takes that (wrapUpMidTurn), otherwise
+// as the next follow-up prompt in place of the continuation or retry prompt.
+const wrapUpPrompt = "This session has used most of its token budget, and the runner stops it when the budget runs out. " +
+	"Wrap up now and do not start new work: commit your changes, push the branch, open the pull request if the task owes one, " +
+	"and write the turn result with your verdict. If you cannot finish, end with an explicit blocked verdict and the reason."
+
 // retryPrompt is sent after a turn that ended on a model provider error.
 const retryPrompt = "Your previous turn was cut off by a model provider error before the task was finished. " +
 	"Continue the task from where you stopped."

@@ -783,6 +783,25 @@ type Result struct {
 	// a turn ended before the work was finished. nil when none was needed.
 	// Additive — old platforms ignore it.
 	TurnContinuations *TurnContinuations `json:"turnContinuations,omitempty"`
+
+	// BudgetBreach names the session budget cap the runner stopped the
+	// session at. With Status "failed" (FailureMode "budget-exceeded") it is
+	// the reason the session failed. With Status "completed" the work was
+	// delivered — a verified pull request and a passed turn result — before
+	// the cap was reached: the session ended completed, over its budget. nil
+	// when the session stayed within its budget. Additive — old platforms
+	// ignore it.
+	BudgetBreach *BudgetBreach `json:"budgetBreach,omitempty"`
+}
+
+// BudgetBreach is the budget cap a session ran into.
+type BudgetBreach struct {
+	// Cap names the cap: "max-tokens", "max-duration-seconds" or
+	// "max-sub-agents".
+	Cap string `json:"cap"`
+	// Detail is the human-readable breach, e.g.
+	// "max-tokens exceeded: observed=5010000 limit=5000000".
+	Detail string `json:"detail,omitempty"`
 }
 
 // TurnContinuations records the runner-driven follow-up turns of a session

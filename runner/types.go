@@ -376,8 +376,10 @@ type Result struct {
 	// for every Run; the .Enforced flag distinguishes
 	// stage-dispatched work (caps configured) from legacy work
 	// (caps absent). When a cap was breached .CapBreached + .BreachDetail
-	// surface the reason; the session's Status is "failed" with
-	// FailureMode=FailureBudgetExceeded.
+	// surface the reason and Result.BudgetBreach carries it on the status
+	// post; the session's Status is "failed" with
+	// FailureMode=FailureBudgetExceeded, or "completed" when the work was
+	// already delivered when the cap stopped the session.
 	BudgetReport *BudgetReport `json:"budgetReport,omitempty"`
 
 	// TerminalWorkareaLease is the exact four-field external projection attached

@@ -26,8 +26,8 @@ const (
 )
 
 // FailureBudgetExceeded classifies a session that hit a stage-budget
-// cap. The
-// per-cap details live on Result.BudgetReport.
+// cap before its work was delivered. The per-cap details live on
+// Result.BudgetReport and Result.BudgetBreach.
 const FailureBudgetExceeded = "budget-exceeded"
 
 // BudgetReport is the per-session enforcement report. Always present
@@ -51,9 +51,12 @@ type BudgetReport struct {
 	ObservedSubAgents int `json:"observedSubAgents"`
 
 	// ObservedTokens is the cumulative input+output token count
-	// observed across all turns. Sourced from ResultEvent.Cost, counting
-	// each token once even when a harness reports a running total (see
-	// BudgetEnforcer.resultIncrement).
+	// observed across all turns: every ResultEvent.Cost, counting each
+	// token once even when a harness reports a running total (see
+	// BudgetEnforcer.resultIncrementLocked), plus the per-call usage the harness
+	// reported after its last ResultEvent — the model calls of a turn the
+	// runner stopped at the cap, which no ResultEvent will reconcile. It
+	// equals the input+output tokens of Result.Cost.
 	ObservedTokens int64 `json:"observedTokens"`
 
 	// ObservedDurationSeconds is the wall-clock the session ran for at
@@ -61,7 +64,8 @@ type BudgetReport struct {
 	ObservedDurationSeconds int `json:"observedDurationSeconds"`
 
 	// CapBreached names which cap tripped. Empty when the session
-	// completed within budget.
+	// stayed within budget. Set on a completed session too, when the cap
+	// stopped it after its work was delivered.
 	CapBreached BudgetCap `json:"capBreached,omitempty"`
 
 	// BreachDetail is the human-readable "<cap> exceeded: observed=X,
@@ -79,31 +83,67 @@ type BudgetReport struct {
 // elapses. Token + sub-agent enforcement is observation-driven: every
 // agent.Event the runner streams flows through ObserveEvent, which
 // returns a non-nil error when the cap is breached. The runner sees
-// the error, classifies the failure as budget-exceeded, and stops the
-// provider.
+// the error, stops the provider, and ends the session: completed with
+// the breach recorded when the work was already delivered, otherwise
+// failed as budget-exceeded.
 //
-// When the dispatch carries no StageBudget (legacy path) New returns a
-// no-op Enforcer whose Track* methods always return nil — the runner
-// can call them unconditionally.
+// The token meter runs during a turn, not only at its end: it counts the
+// usage a harness reports for each model call (a non-aggregate
+// LlmCallEvent) as the call completes, and reconciles it against the
+// turn's ResultEvent cost. So a turn that runs past the cap is seen at the
+// model call that crossed it, and the runner stops the session at the next
+// turn boundary instead of when the turn ends. The meter also marks the
+// point — four fifths of MaxTokens — at which the runner asks the agent to
+// wrap up (wrapUpDue).
+//
+// The enforcer is also the session's usage meter: it meters every event
+// whether or not a budget is set, and the runner reports its total as
+// Result.Cost, so the reported cost and the budget meter never disagree.
+//
+// When the dispatch carries no StageBudget (legacy path) New returns an
+// Enforcer with no caps whose ObserveEvent always returns nil — the runner
+// can call it unconditionally.
 type BudgetEnforcer struct {
 	limits  prompt.StageBudget
 	enabled bool
 
 	subAgents atomic.Int64
-	tokens    atomic.Int64
 	startedAt time.Time
+
+	// midTurnWrapUp is set when the session's harness takes a message into
+	// a turn that is still running (a steer channel), so the wrap-up
+	// request can reach the agent before its next model call instead of
+	// waiting for the turn to end. Set once by the runner before the stream
+	// starts.
+	midTurnWrapUp bool
 
 	mu     sync.Mutex
 	breach *budgetBreach
 
-	// Token-accounting state for resultIncrement, guarded by mu.
-	// callTokens/calls sum the harness-reported per-call usage
-	// (non-aggregate LlmCallEvents) since the last ResultEvent that carried
-	// a cost; lastResultTotal is that ResultEvent's input+output total.
-	callTokens      int64
-	calls           int
-	lastResultTotal int64
+	// Usage meter, guarded by mu. metered is the reconciled usage: the sum
+	// of every ResultEvent cost increment (resultIncrementLocked). pending is the
+	// harness-reported per-call usage (non-aggregate LlmCallEvents) since
+	// the last ResultEvent that carried a cost — its NumTurns counts those
+	// calls; lastResult is that ResultEvent's cost.
+	metered    agent.CostData
+	pending    agent.CostData
+	lastResult agent.CostData
+
+	// wrapUp is the wrap-up request's state, guarded by mu.
+	wrapUp wrapUpState
 }
+
+// wrapUpState is where a session stands with the wrap-up request.
+type wrapUpState int
+
+const (
+	// wrapUpNotDue: the meter has not reached the wrap-up point.
+	wrapUpNotDue wrapUpState = iota
+	// wrapUpPending: the meter reached it; the request is not delivered yet.
+	wrapUpPending
+	// wrapUpDelivered: the agent has been asked to wrap up.
+	wrapUpDelivered
+)
 
 type budgetBreach struct {
 	cap    BudgetCap
@@ -152,16 +192,17 @@ func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Contex
 // Callers should treat the error as a clean cancellation: stop the
 // provider, classify the failure, write WORK_RESULT.
 //
+// The token cap is checked against the live meter (observedLocked) on
+// every per-call usage event and every ResultEvent, so it can trip in the
+// middle of a turn. The runner then lets the turn reach its next boundary
+// before it stops the provider (consumeEvents).
+//
 // The enforcer continues to track counters after a breach — the
 // caller may receive the same error again on subsequent events. This
 // is intentional: the runner's first response is to cancel the stream
 // context, but events buffered by the provider may still flow until
 // the channel closes.
 func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
-	if !e.enabled {
-		return nil
-	}
-
 	switch v := ev.(type) {
 	case agent.ToolUseEvent:
 		// Sub-agent count = number of Task tool invocations. The
@@ -169,44 +210,85 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 		// task tools (e.g. `mcp__af__Task`) still count.
 		if isTaskTool(v.ToolName) {
 			n := e.subAgents.Add(1)
-			if limit := e.limits.MaxSubAgents; limit > 0 && n > int64(limit) {
+			if limit := e.limits.MaxSubAgents; e.enabled && limit > 0 && n > int64(limit) {
 				return e.recordBreach(CapSubAgents,
 					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, limit))
 			}
 		}
 	case agent.LlmCallEvent:
-		// Per-call usage is not counted on its own — ResultEvent.Cost stays
-		// the source — but it is the evidence resultIncrement needs to
-		// recognize a running total. Aggregate/synthetic events are derived
-		// FROM a ResultEvent (runtime/span), so they prove nothing about it.
+		// Per-call usage is the live meter between ResultEvents, and the
+		// evidence resultIncrementLocked needs to recognize a running total.
+		// Aggregate/synthetic events are derived FROM a ResultEvent
+		// (runtime/span), so they are neither new usage nor evidence.
 		if !v.Synthetic && v.UsageSource != agent.LlmUsageAggregate {
 			e.mu.Lock()
-			e.callTokens += v.InputTokens + v.OutputTokens
-			e.calls++
+			e.pending.InputTokens += v.InputTokens
+			e.pending.OutputTokens += v.OutputTokens
+			e.pending.CachedInputTokens += v.CachedInputTokens
+			e.pending.NumTurns++
+			breach := e.checkTokensLocked()
 			e.mu.Unlock()
+			return breach
 		}
 	case agent.ResultEvent:
 		// A run can see several ResultEvents: a steering or memory-inject
 		// turn re-consumes the stream after the first terminal.
-		if delta := e.resultIncrement(v.Cost); delta > 0 {
-			n := e.tokens.Add(delta)
-			if limit := e.limits.MaxTokens; limit > 0 && n > limit {
-				return e.recordBreach(CapTokens,
-					fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, limit))
-			}
+		e.mu.Lock()
+		var breach *BudgetExceededError
+		if e.resultIncrementLocked(v.Cost) > 0 {
+			breach = e.checkTokensLocked()
 		}
+		e.mu.Unlock()
+		return breach
 	}
 
 	return nil
 }
 
-// resultIncrement returns how many NEW tokens a ResultEvent's cost adds to
-// the session. Harnesses differ in what that cost means once a run has more
-// than one ResultEvent: some report the usage since the previous one, others
-// (pi, codex, gemini) report the handle's running total, so a second
-// ResultEvent repeats every token of the first. Summing running totals
-// double-counted — a steered pi session that spent 1.46M tokens was measured
-// at 2.78M, recording a breach of a 1.5M cap it never reached.
+// checkTokensLocked checks the live token meter against the token cap:
+// it marks the wrap-up point the first time the meter reaches it, and
+// returns the breach while the meter is over the cap. Called with e.mu
+// held, after the meter moved.
+func (e *BudgetEnforcer) checkTokensLocked() *BudgetExceededError {
+	limit := e.limits.MaxTokens
+	if !e.enabled || limit <= 0 {
+		return nil
+	}
+	n := e.observedLocked()
+	if e.wrapUp == wrapUpNotDue && n >= wrapUpTokens(limit) {
+		e.wrapUp = wrapUpPending
+	}
+	if n <= limit {
+		return nil
+	}
+	detail := fmt.Sprintf("max-tokens exceeded: observed=%d limit=%d", n, limit)
+	if e.breach == nil {
+		e.breach = &budgetBreach{cap: CapTokens, detail: detail}
+	}
+	return &BudgetExceededError{Cap: CapTokens, Detail: detail}
+}
+
+// wrapUpTokens is the token count at which the runner asks the agent to
+// wrap up: four fifths of the token cap, leaving the last fifth to commit,
+// push, open the pull request and write the turn result.
+func wrapUpTokens(limit int64) int64 {
+	return limit - limit/5
+}
+
+// observedLocked is the live token meter: the reconciled usage plus the
+// per-call usage reported since the last ResultEvent. Called with e.mu held.
+func (e *BudgetEnforcer) observedLocked() int64 {
+	return e.metered.InputTokens + e.metered.OutputTokens + e.pending.InputTokens + e.pending.OutputTokens
+}
+
+// resultIncrementLocked returns how many NEW tokens a ResultEvent's cost adds
+// to the session, and adds the new usage to the meter. Harnesses differ in
+// what that cost means once a run has more than one ResultEvent: some report
+// the usage since the previous one, others (pi, codex, gemini) report the
+// handle's running total, so a second ResultEvent repeats every token of the
+// first. Summing running totals double-counted — a steered pi session that
+// spent 1.46M tokens was measured at 2.78M, recording a breach of a 1.5M cap
+// it never reached.
 //
 // The two are told apart on evidence, not on the harness's name: when the
 // per-call usage the harness reported since the previous ResultEvent is
@@ -217,21 +299,90 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 // does not reconcile — keeps its previous accounting and is never
 // under-counted. A counter that restarts (a resumed handle) reconciles
 // against zero, not against the previous handle, so it is counted whole too.
-func (e *BudgetEnforcer) resultIncrement(cost *agent.CostData) int64 {
+//
+// The same increment — whole, or the difference field by field — is added to
+// every field of the meter (tokens, cached tokens, dollars, turns), so the
+// cost the runner reports counts each turn once, just as the token cap does.
+// Called with e.mu held.
+func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 	if cost == nil {
 		// No cost to reconcile: keep the per-call evidence for the next
 		// ResultEvent that carries one.
 		return 0
 	}
 	total := cost.InputTokens + cost.OutputTokens
+	previous := e.lastResult.InputTokens + e.lastResult.OutputTokens
+	callTokens := e.pending.InputTokens + e.pending.OutputTokens
+	increment := *cost
+	if previous > 0 && e.pending.NumTurns > 0 && total == previous+callTokens {
+		increment = costDifference(*cost, e.lastResult)
+	}
+	e.metered = addCost(e.metered, increment)
+	e.pending, e.lastResult = agent.CostData{}, *cost
+	return increment.InputTokens + increment.OutputTokens
+}
+
+// addCost returns the field-by-field sum of a and b.
+func addCost(a, b agent.CostData) agent.CostData {
+	return agent.CostData{
+		InputTokens:       a.InputTokens + b.InputTokens,
+		OutputTokens:      a.OutputTokens + b.OutputTokens,
+		CachedInputTokens: a.CachedInputTokens + b.CachedInputTokens,
+		TotalCostUsd:      a.TotalCostUsd + b.TotalCostUsd,
+		NumTurns:          a.NumTurns + b.NumTurns,
+	}
+}
+
+// costDifference returns what a running total adds over the previous one,
+// field by field; a field that did not grow adds nothing.
+func costDifference(total, previous agent.CostData) agent.CostData {
+	return agent.CostData{
+		InputTokens:       max(total.InputTokens-previous.InputTokens, 0),
+		OutputTokens:      max(total.OutputTokens-previous.OutputTokens, 0),
+		CachedInputTokens: max(total.CachedInputTokens-previous.CachedInputTokens, 0),
+		TotalCostUsd:      max(total.TotalCostUsd-previous.TotalCostUsd, 0),
+		NumTurns:          max(total.NumTurns-previous.NumTurns, 0),
+	}
+}
+
+// cost is the session's usage as the meter counted it: every ResultEvent
+// increment plus the per-call usage reported since the last one (which has
+// tokens and calls but no dollar amount). nil when nothing was metered. Its
+// input+output tokens equal Report's ObservedTokens.
+func (e *BudgetEnforcer) cost() *agent.CostData {
 	e.mu.Lock()
 	defer e.mu.Unlock()
-	callTokens, calls, previous := e.callTokens, e.calls, e.lastResultTotal
-	e.callTokens, e.calls, e.lastResultTotal = 0, 0, total
-	if previous > 0 && calls > 0 && total == previous+callTokens {
-		return callTokens
+	total := addCost(e.metered, e.pending)
+	if total == (agent.CostData{}) {
+		return nil
 	}
-	return total
+	return &total
+}
+
+// wrapUpDue reports whether the session reached the wrap-up point and the
+// agent has not yet been asked to wrap up.
+func (e *BudgetEnforcer) wrapUpDue() bool {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	return e.wrapUp == wrapUpPending
+}
+
+// wrapUpSent records that the wrap-up request reached the agent.
+func (e *BudgetEnforcer) wrapUpSent() {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	e.wrapUp = wrapUpDelivered
+}
+
+// breached returns the first recorded breach as an error, or nil while the
+// session is within its budget.
+func (e *BudgetEnforcer) breached() *BudgetExceededError {
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	if e.breach == nil {
+		return nil
+	}
+	return &BudgetExceededError{Cap: e.breach.cap, Detail: e.breach.detail}
 }
 
 // CheckDuration returns a non-nil *BudgetExceededError when the
@@ -264,11 +415,11 @@ func (e *BudgetEnforcer) Report(now time.Time) *BudgetReport {
 		Enforced:                e.enabled,
 		Limits:                  e.limits,
 		ObservedSubAgents:       int(e.subAgents.Load()),
-		ObservedTokens:          e.tokens.Load(),
 		ObservedDurationSeconds: int(now.Sub(e.startedAt).Seconds()),
 	}
 	e.mu.Lock()
 	defer e.mu.Unlock()
+	rep.ObservedTokens = e.observedLocked()
 	if e.breach != nil {
 		rep.CapBreached = e.breach.cap
 		rep.BreachDetail = e.breach.detail
