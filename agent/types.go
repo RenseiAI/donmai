@@ -742,6 +742,14 @@ type Result struct {
 	// the platform side.
 	WorkResult string `json:"workResult,omitempty"`
 
+	// ReviewVerdict is the review outcome for review work (qa/acceptance):
+	// one of "APPROVE" | "APPROVE_WITH_FOLLOWUPS" | "REQUEST_CHANGES".
+	// It rides next to the pass/fail WorkResult so graders, the scorecard
+	// and reviewer calibration can read it without scraping prose.
+	// Empty for non-review work or when the agent gave no review verdict.
+	// Additive — old platforms ignore it.
+	ReviewVerdict string `json:"reviewVerdict,omitempty"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
 
@@ -843,6 +851,13 @@ type TurnManifest struct {
 	// CommitSHA is the head commit sha of the work branch when the agent knows
 	// it. Optional — advisory; the runner's post-backstop capture wins.
 	CommitSHA string `json:"commitSha,omitempty"`
+
+	// ReviewVerdict is the structured review outcome for review work
+	// (qa/acceptance): one of "APPROVE" | "APPROVE_WITH_FOLLOWUPS" |
+	// "REQUEST_CHANGES". Optional — empty when the agent gave no review
+	// verdict. It rides next to Verdict so graders, the scorecard and
+	// reviewer calibration can read it without scraping prose.
+	ReviewVerdict string `json:"reviewVerdict,omitempty"`
 
 	// Repositories optionally carries the agent-owned outcome per declared
 	// repository. Absent retains schemaVersion 1 semantics: scalar artifacts

@@ -268,6 +268,13 @@ type statusRequest struct {
 	// posts no manifest and the platform falls back to the scalars/marker scan.
 	Manifest *agent.TurnManifest `json:"manifest,omitempty"`
 
+	// ReviewVerdict is the structured review outcome for review work
+	// (qa/acceptance): one of APPROVE | APPROVE_WITH_FOLLOWUPS |
+	// REQUEST_CHANGES. It rides next to Result so graders, the scorecard
+	// and reviewer calibration can read it without scraping prose.
+	// Additive; omitted when empty — old platforms ignore it.
+	ReviewVerdict string `json:"reviewVerdict,omitempty"`
+
 	// TerminalWorkareaLease is the immutable path-free descriptor proving the
 	// successful workarea is durably retained before this status can trigger
 	// downstream verification.
@@ -495,7 +502,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		WorkerID: creds.WorkerID, Status: r.Status, ProviderSessionID: r.ProviderSessionID,
 		WorktreePath: worktreePath, FailureMode: r.FailureMode, Summary: strings.TrimSpace(r.Summary),
 		Result: r.WorkResult, ResultMarker: workResultMarker(r.WorkResult), CommitSHA: r.CommitSHA,
-		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, TerminalWorkareaLease: projection,
+		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
+		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 	}
 	if r.Cost != nil {

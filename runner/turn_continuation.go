@@ -99,18 +99,27 @@ const (
 // request and the verdict resolved so far. reportedPR is set when the turn
 // carried a pull request URL on the session's own repository that did not
 // verify: the agent reported a pull request, so the turn did not stop early,
-// and the nudge and the backstop settle it instead.
-func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR bool) turnEnding {
+// and the nudge and the backstop settle it instead. reviewWork marks review
+// turns (QA/acceptance): a review turn that ends with no turn-result
+// manifest, no work-result marker and no review verdict stopped early and
+// gets the continuation prompt, bounded the same way as implement work.
+func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR bool, reviewWork bool) turnEnding {
 	switch {
 	case res.FailureMode != "" || res.Status == "failed":
 		return turnFinished
 	case res.Manifest != nil, res.PullRequestURL != "", reportedPR, session.blocked, res.WorkResult == "failed":
 		return turnFinished
+	case reviewWork && res.ReviewVerdict != "":
+		return turnFinished
 	case turn.errorEvent != nil || turn.terminalEvent == nil:
 		return turnFinished
 	case turn.providerError != "":
 		return turnProviderError
-	case !turn.terminalSuccess, turn.verdict() != "":
+	case !turn.terminalSuccess:
+		return turnFinished
+	case turn.verdict() != "":
+		return turnFinished
+	case reviewWork && turn.reviewVerdict != "":
 		return turnFinished
 	default:
 		return turnStoppedEarly
@@ -281,6 +290,18 @@ func (f *turnFollowUps) report() *agent.TurnContinuations {
 const continuePrompt = "Your previous turn ended before the task was finished: it left no turn result, " +
 	"no pull request, and no blocked or failed verdict. Continue the task from where you stopped. " +
 	"When the work is done, commit it, push the branch, open the pull request and report the result. " +
+	"If you cannot go on, end with an explicit blocked verdict and the reason."
+
+// continueReviewPrompt is the short prompt sent after a review turn that
+// stopped early: it left no turn result, no work-result marker and no review
+// verdict. It asks for the complete review — findings plus the verdict that
+// also appears as the structured field on the turn result — rather than a
+// progress note.
+const continueReviewPrompt = "Your previous review turn ended before the review was finished: it left no turn result, " +
+	"no work-result marker, and no review verdict. Continue the review from where you stopped. " +
+	"When the review is done, write the complete review as your final message — findings plus one review verdict " +
+	"(APPROVE, APPROVE_WITH_FOLLOWUPS or REQUEST_CHANGES) on its own REVIEW_VERDICT line — and report the same " +
+	"verdict as the structured review-verdict field on the turn result. " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
 // retryPrompt is sent after a turn that ended on a model provider error.

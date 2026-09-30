@@ -1098,3 +1098,49 @@ func TestPosterPost_StatusTurnContinuationsSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusReviewVerdictSerialized pins that the structured
+// review outcome reaches the status body, and is omitted when empty.
+func TestPosterPost_StatusReviewVerdictSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   string
+		want string
+	}{
+		{name: "omitted when empty"},
+		{name: "approve", in: "APPROVE", want: `"APPROVE"`},
+		{name: "request changes", in: "REQUEST_CHANGES", want: `"REQUEST_CHANGES"`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.ReviewVerdict = tc.in
+			if err := p.Post(context.Background(), "sess-rv", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["reviewVerdict"]
+			if present != (tc.want != "") {
+				t.Fatalf("reviewVerdict present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("reviewVerdict = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}

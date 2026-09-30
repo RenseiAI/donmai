@@ -76,6 +76,23 @@ func TestParseManifest(t *testing.T) {
 			},
 		},
 		{
+			name:      "valid passed with structured review verdict",
+			writeFile: true,
+			raw:       `{"schemaVersion":1,"verdict":"passed","summary":"review done","reviewVerdict":"APPROVE_WITH_FOLLOWUPS"}`,
+			want: &TurnManifest{
+				SchemaVersion: 1,
+				Verdict:       "passed",
+				Summary:       "review done",
+				ReviewVerdict: "APPROVE_WITH_FOLLOWUPS",
+			},
+		},
+		{
+			name:      "unknown review verdict is rejected",
+			writeFile: true,
+			raw:       `{"schemaVersion":1,"verdict":"passed","reviewVerdict":"APPROVED"}`,
+			wantErr:   true,
+		},
+		{
 			name:           "no file is benign",
 			writeFile:      false,
 			wantErr:        true,

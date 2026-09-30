@@ -506,19 +506,46 @@ func TestRun_ContinuationExhaustedStillRunsTheBackstop(t *testing.T) {
 }
 
 // TestRun_WorkThatOwesNoPullRequestIsNotContinued pins the gate on the
-// continuation: a QA turn that ends without a verdict is not continued (its
+// continuation: a QA turn that ends WITH a verdict is not continued (its
 // contract is a verdict, not a pull request).
 func TestRun_WorkThatOwesNoPullRequestIsNotContinued(t *testing.T) {
 	res, provider := runScriptedSession(t, scriptedSession{
 		workType:   "qa",
 		repository: followUpRepository,
 		turns: []verdictScriptTurn{
-			{text: "Looking at the change."},
+			{text: "Findings look good.\nWORK_RESULT: passed\nREVIEW_VERDICT: APPROVE"},
 			{text: "never reached"},
 		},
 	})
 	wantPrompts(t, provider.prompts)
 	wantContinuations(t, res, 0, 0, false)
+}
+
+// TestRun_ReviewTurnWithoutVerdictIsContinued replays the reported failure:
+// a review turn that ends on a one-line progress note — no manifest, no
+// work-result marker, no review verdict — gets the continuation prompt
+// (bounded like implement work), and the final message holds a verdict that
+// also appears as the structured field on the turn result.
+func TestRun_ReviewTurnWithoutVerdictIsContinued(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "qa",
+		repository: followUpRepository,
+		turns: []verdictScriptTurn{
+			{text: "Proving hook cache-token revert produces GREEN, confirming B1 blocks the change..."},
+			{text: "Findings complete.\nWORK_RESULT: passed\nREVIEW_VERDICT: REQUEST_CHANGES"},
+		},
+	})
+	wantPrompts(t, provider.prompts, continueReviewPrompt)
+	wantContinuations(t, res, 1, 0, false)
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
+	}
+	if res.ReviewVerdict != "REQUEST_CHANGES" {
+		t.Fatalf("ReviewVerdict = %q; want REQUEST_CHANGES", res.ReviewVerdict)
+	}
+	if !strings.Contains(res.Summary, "REVIEW_VERDICT: REQUEST_CHANGES") {
+		t.Fatalf("Summary = %q; want it to hold the final review verdict", res.Summary)
+	}
 }
 
 // TestWaitRetryBackoff_Cancellable pins that the wait before a provider-error
@@ -601,6 +628,7 @@ func TestClassifyTurnEnding(t *testing.T) {
 		session    streamObservation
 		turn       streamObservation
 		reportedPR bool
+		reviewWork bool
 		want       turnEnding
 	}{
 		{name: "clean end with nothing", turn: clean, want: turnStoppedEarly},
@@ -616,11 +644,14 @@ func TestClassifyTurnEnding(t *testing.T) {
 		{name: "no terminal", turn: streamObservation{}, want: turnFinished},
 		{name: "unsuccessful terminal", turn: with(func(o *streamObservation) { o.terminalSuccess = false }), want: turnFinished},
 		{name: "unsuccessful terminal on a provider error", turn: with(func(o *streamObservation) { o.terminalSuccess = false; o.providerError = "504" }), want: turnProviderError},
+		{name: "structured review verdict ends a review turn", res: func() Result { r := Result{}; r.ReviewVerdict = "APPROVE"; return r }(), turn: clean, reviewWork: true, want: turnFinished},
+		{name: "review verdict marker ends a review turn", turn: with(func(o *streamObservation) { o.reviewVerdict = "REQUEST_CHANGES" }), reviewWork: true, want: turnFinished},
+		{name: "review verdict does not end implement work", turn: with(func(o *streamObservation) { o.reviewVerdict = "APPROVE" }), want: turnStoppedEarly},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			res := tc.res
-			if got := classifyTurnEnding(&res, tc.session, tc.turn, tc.reportedPR); got != tc.want {
+			if got := classifyTurnEnding(&res, tc.session, tc.turn, tc.reportedPR, tc.reviewWork); got != tc.want {
 				t.Fatalf("classifyTurnEnding = %d; want %d", got, tc.want)
 			}
 		})

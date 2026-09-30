@@ -121,6 +121,15 @@ var validVerdicts = map[string]struct{}{
 	"blocked": {},
 }
 
+// validReviewVerdicts is the closed set the manifest schema accepts for the
+// optional structured review outcome on review work (runner/loop.go
+// scanReviewVerdict reads the same values from a REVIEW_VERDICT marker).
+var validReviewVerdicts = map[string]struct{}{
+	"APPROVE":                {},
+	"APPROVE_WITH_FOLLOWUPS": {},
+	"REQUEST_CHANGES":        {},
+}
+
 // manifestSchema is the JSON Schema the manifest is validated against, using
 // the santhosh-tekuri/jsonschema/v6 pattern established in agent/oneshot.go
 // (validateAgainstSchema). Keeping the contract as a schema — not just struct
@@ -134,6 +143,7 @@ const manifestSchema = `{
   "properties": {
     "schemaVersion": { "type": "integer", "minimum": 1 },
     "verdict": { "type": "string", "enum": ["passed", "failed", "blocked"] },
+    "reviewVerdict": { "type": "string", "enum": ["APPROVE", "APPROVE_WITH_FOLLOWUPS", "REQUEST_CHANGES"] },
     "summary": { "type": "string" },
     "blockedReason": { "type": "string" },
     "pullRequestUrl": { "type": "string" },
@@ -211,6 +221,11 @@ func ParseManifest(worktreePath string) (*TurnManifest, error) {
 	if _, ok := validVerdicts[m.Verdict]; !ok {
 		return nil, fmt.Errorf("runner: turn-result manifest verdict %q is not one of passed/failed/blocked", m.Verdict)
 	}
+	if m.ReviewVerdict != "" {
+		if _, ok := validReviewVerdicts[m.ReviewVerdict]; !ok {
+			return nil, fmt.Errorf("runner: turn-result manifest reviewVerdict %q is not one of APPROVE/APPROVE_WITH_FOLLOWUPS/REQUEST_CHANGES", m.ReviewVerdict)
+		}
+	}
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, err
 	}
@@ -272,6 +287,11 @@ func ParseInlineManifest(finalMessage string) (*TurnManifest, error) {
 	}
 	if _, ok := validVerdicts[m.Verdict]; !ok {
 		return nil, ErrNoInlineManifest
+	}
+	if m.ReviewVerdict != "" {
+		if _, ok := validReviewVerdicts[m.ReviewVerdict]; !ok {
+			return nil, ErrNoInlineManifest
+		}
 	}
 	if err := validateManifestRepositories(manifestRepositoryEntries(&m)); err != nil {
 		return nil, ErrNoInlineManifest
@@ -656,6 +676,13 @@ func foldTurnManifest(m *TurnManifest, res *Result, obs *streamObservation) {
 
 	if m.Summary != "" {
 		res.Summary = m.Summary
+	}
+	// Structured review outcome rides next to the pass/fail verdict so
+	// graders, the scorecard and reviewer calibration can read it without
+	// scraping prose. Additive: empty when the agent gave no review verdict.
+	if m.ReviewVerdict != "" {
+		res.ReviewVerdict = m.ReviewVerdict
+		obs.reviewVerdict = m.ReviewVerdict
 	}
 	if m.PullRequestURL != "" {
 		res.PullRequestURL = m.PullRequestURL
