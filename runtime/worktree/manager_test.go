@@ -245,7 +245,7 @@ func TestProvisionNonRetriableFailsFast(t *testing.T) {
 	dir := t.TempDir()
 	runner := newStubRunner(
 		func(_ string, _ ...string) ([]byte, error) {
-			return []byte("fatal: repository not found"), exec.Command("false").Run()
+			return []byte("fatal: unparseable rev-list input for the requested branch"), exec.Command("false").Run()
 		},
 	)
 	m, err := worktree.NewManager(worktree.Options{
@@ -1239,5 +1239,175 @@ func TestProvisionExcludesHarnessStateFromGitStatus(t *testing.T) {
 	}
 	if !strings.Contains(string(out), "new.go") {
 		t.Fatalf("real session output is not reported by git status:\n%s", out)
+	}
+}
+
+func TestProvisionCloneRetriesFreshCredentialRejection(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	var attempts atomic.Int64
+	const rejection = "remote: Repository not found.\nfatal: repository 'https://example.test/org/repo.git/' not found"
+	runner := newStubRunner(
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, args ...string) ([]byte, error) {
+			attempts.Add(1)
+			dst := args[len(args)-1]
+			_ = os.MkdirAll(dst, 0o750)
+			return nil, nil
+		},
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:                        dir,
+		CommandRunner:                    runner.run,
+		RetryDelay:                       1 * time.Millisecond,
+		CredentialPropagationRetryDelays: []time.Duration{0, 0, 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "fresh-credential",
+		RepoURL:   "https://example.test/org/repo.git",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if !strings.HasSuffix(path, "/fresh-credential") {
+		t.Fatalf("expected path to end in /fresh-credential, got %q", path)
+	}
+	if got := attempts.Load(); got != 3 {
+		t.Fatalf("expected 3 git clone attempts, got %d", got)
+	}
+}
+
+func TestProvisionCloneExhaustedCredentialRejectionFailsWithOriginalError(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	var attempts atomic.Int64
+	const rejection = "remote: Repository not found.\nfatal: repository 'https://example.test/org/repo.git/' not found"
+	runner := newStubRunner(
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:                        dir,
+		CommandRunner:                    runner.run,
+		RetryDelay:                       1 * time.Millisecond,
+		CredentialPropagationRetryDelays: []time.Duration{0, 0, 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "denied-credential",
+		RepoURL:   "https://example.test/org/repo.git",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err == nil {
+		t.Fatal("Provision succeeded, want the original rejection after retries")
+	}
+	if !strings.Contains(err.Error(), "Repository not found") {
+		t.Fatalf("failure reason %q does not carry the original rejection", err.Error())
+	}
+	// 1 initial clone + 3 propagation retries: the backoff schedule length is
+	// the retry count (default 2s/5s/10s configured to zero here for speed).
+	if got := attempts.Load(); got != 4 {
+		t.Fatalf("expected 4 git clone attempts, got %d", got)
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "denied-credential")); !os.IsNotExist(statErr) {
+		t.Fatalf("failed provision left a workarea behind: %v", statErr)
+	}
+}
+
+func TestProvisionCloneDoesNotRetryUnrelatedCloneFailure(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	var attempts atomic.Int64
+	runner := newStubRunner(
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte("fatal: unable to connect: connection refused"), exec.Command("false").Run()
+		},
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:                        dir,
+		CommandRunner:                    runner.run,
+		RetryDelay:                       1 * time.Millisecond,
+		CredentialPropagationRetryDelays: []time.Duration{0, 0, 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "unrelated-failure",
+		RepoURL:   "https://example.test/org/repo.git",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err == nil {
+		t.Fatal("Provision succeeded, want the transport failure")
+	}
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("expected 1 git clone attempt for a non-credential failure, got %d", got)
+	}
+}
+
+func TestProvisionFetchRetriesFreshCredentialRejection(t *testing.T) {
+	t.Parallel()
+
+	fixture := newPullRequestFixture(t)
+	var fetchCalls atomic.Int64
+	runner := func(_ context.Context, _ string, args ...string) ([]byte, error) {
+		if len(args) > 2 && args[2] == "fetch" {
+			if fetchCalls.Add(1) <= 2 {
+				return []byte("remote: Repository not found."), exec.Command("false").Run()
+			}
+		}
+		//nolint:gosec // test runner executes the git binary selected by PATH.
+		return exec.CommandContext(context.Background(), "git", args...).CombinedOutput()
+	}
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:                        t.TempDir(),
+		CommandRunner:                    runner,
+		RetryDelay:                       1 * time.Millisecond,
+		CredentialPropagationRetryDelays: []time.Duration{0, 0, 0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	record := fixture.bind(&workarea.PullRequestV1{Number: 7, HeadSHA: fixture.prHeadSHA})
+	_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "fetch-retry", RepoURL: fixture.origin, Branch: "main",
+		Strategy: worktree.StrategyClone, PullRequest: record,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if got := fetchCalls.Load(); got != 3 {
+		t.Fatalf("expected 3 fetch attempts, got %d", got)
 	}
 }

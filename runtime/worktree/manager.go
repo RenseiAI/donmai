@@ -30,6 +30,13 @@ const MaxSpawnRetries = 3
 // SPAWN_RETRY_DELAY_MS in the legacy TS.
 const SpawnRetryDelay = 15 * time.Second
 
+// credentialPropagationRetryDelays is the backoff between retries when a
+// remote rejects a clone or fetch as if the credential did not exist yet.
+// A freshly minted credential can take a few seconds before the remote
+// recognizes it, so a "not found" / "unauthorized" rejection immediately
+// after minting is usually propagation lag, not a real refusal.
+var defaultCredentialPropagationRetryDelays = []time.Duration{2 * time.Second, 5 * time.Second, 10 * time.Second}
+
 const (
 	// ModeExclusive creates and owns one session root.
 	ModeExclusive = "exclusive"
@@ -230,6 +237,7 @@ type Manager struct {
 	gitAuth                 GitAuth
 	baseFetchTimeout        time.Duration
 	delay                   time.Duration
+	credentialRetryDelays   []time.Duration
 	leases                  *workarea.LeaseStore
 	acquisitions            *workarea.AcquisitionStore
 	seeds                   *workarea.SeedStore
@@ -306,6 +314,13 @@ type Options struct {
 	GitAuth GitAuth
 	// RetryDelay overrides SpawnRetryDelay. Useful for tests.
 	RetryDelay time.Duration
+	// CredentialPropagationRetryDelays overrides the backoff between retries
+	// when a remote rejects a clone or fetch as if the credential did not
+	// exist yet. Nil keeps the production 2s/5s/10s schedule. The schedule
+	// length is the retry count (one wait per retry after the initial
+	// attempt). Useful for tests — pass e.g. three zero delays for fast
+	// retries without changing the attempt count.
+	CredentialPropagationRetryDelays []time.Duration
 	// Now supplies the clock used by the durable terminal lease store.
 	Now func() time.Time
 	// LeaseStore overrides the crash-recoverable terminal lease store. Nil
@@ -404,6 +419,7 @@ func NewManager(opts Options) (*Manager, error) {
 		gitAuth:                 opts.GitAuth,
 		baseFetchTimeout:        baseFetchTimeout,
 		delay:                   delay,
+		credentialRetryDelays:   opts.CredentialPropagationRetryDelays,
 		leases:                  leases,
 		acquisitions:            acquisitions,
 		seeds:                   seeds,
@@ -804,6 +820,14 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 			return res.Path, nil
 		}
 		if errors.Is(err, ErrWorkareaRootOccupied) {
+			return "", err
+		}
+		// A fresh credential the remote has not recognized yet surfaces as a
+		// deterministic-looking "not found" / "unauthorized" rejection, so it
+		// must not ride the legacy retriable-error loop (which handles local
+		// contention): the clone/fetch step already retried it with short
+		// backoff. Unwrap it here so its original reason reaches the session.
+		if errors.Is(err, ErrCredentialPropagation) {
 			return "", err
 		}
 		if !isRetriable(err) {
@@ -1839,7 +1863,18 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			args = append(args, "--branch", spec.Branch)
 		}
 		args = append(args, cloneURL, dst)
-		out, err := m.runGit(ctx, spec.RepoURL, args...)
+		cloneArgs := append([]string(nil), args...)
+		out, err := m.runRemoteWithCredentialRetry(ctx, spec.SessionID, "clone", m.credentialPropagationDelays(), func() ([]byte, error) {
+			// A failed clone can leave a partial destination behind; remove
+			// it before the next attempt so the retry starts from a clean
+			// directory instead of failing on "already exists".
+			_ = os.RemoveAll(dst)
+			out, err := m.runGit(ctx, spec.RepoURL, cloneArgs...)
+			if err != nil && isCredentialPropagationError(out) {
+				err = fmt.Errorf("%w: %w (%s)", ErrCredentialPropagation, err, strings.TrimSpace(string(out)))
+			}
+			return out, err
+		})
 		if err != nil {
 			return fmt.Errorf("git clone: %w (%s)", err, strings.TrimSpace(string(out)))
 		}
@@ -2001,6 +2036,93 @@ func (m *Manager) cleanupConflict(ctx context.Context, layout workarea.Layout, s
 		_ = os.RemoveAll(root)
 	}
 	return nil
+}
+
+// ErrCredentialPropagation wraps a clone/fetch rejection that looks like the
+// remote has not recognized a freshly minted credential yet, around the
+// underlying git failure, so the outer retry loop can tell it apart from
+// deterministic refusals; the message carries git's output but never the
+// credential itself.
+var ErrCredentialPropagation = errors.New("runtime/worktree: remote rejected a fresh credential")
+
+// isCredentialPropagationError reports whether a failed remote operation
+// looks like the remote has not recognized a freshly minted credential yet:
+// a "not found" / "unauthorized" style rejection rather than a transport
+// or input failure. The match is deliberately narrow — only rejections that
+// a propagation delay can plausibly produce — so a credential that truly
+// lacks access still fails instead of burning retries that cannot help.
+
+func isCredentialPropagationError(output []byte) bool {
+	msg := strings.ToLower(string(output))
+	for _, frag := range []string{
+		"repository not found",
+		"could not read from remote repository",
+		"401",
+		"403",
+		"404",
+		"authentication failed",
+		"access denied",
+	} {
+		if strings.Contains(msg, frag) {
+			return true
+		}
+	}
+	return false
+}
+
+// credentialPropagationDelays returns the backoff schedule between retries
+// when a remote rejects a clone or fetch as if the credential did not exist
+// yet. Nil on the manager keeps the production schedule; an explicitly empty
+// override disables the wait but not the retries, which keeps unit tests fast
+// without changing their attempt count.
+func (m *Manager) credentialPropagationDelays() []time.Duration {
+	if m.credentialRetryDelays == nil {
+		return defaultCredentialPropagationRetryDelays
+	}
+	return m.credentialRetryDelays
+}
+
+// runRemoteWithCredentialRetry runs op, retrying failures that look like a
+// freshly minted credential the remote has not recognized yet. At most
+// len(delays) retries run after the initial attempt, so the default 2s/5s/10s
+// schedule means up to four attempts total; an explicitly empty schedule
+// still retries len(delays) (zero) times — callers that need fast tests
+// pass a schedule whose length matches the retries under test.
+// The first error is preserved and returned when the retries are exhausted,
+// so a credential that truly lacks access still fails with its original
+// reason. The credential itself is never logged: only the operation, attempt,
+// and backoff are recorded.
+func (m *Manager) runRemoteWithCredentialRetry(ctx context.Context, sessionID, operation string, delays []time.Duration, op func() ([]byte, error)) ([]byte, error) {
+	out, err := op()
+	if err == nil {
+		return out, nil
+	}
+	firstErr, firstOut := err, out
+	if !isCredentialPropagationError(out) {
+		return out, err
+	}
+	for i, wait := range delays {
+		attempt := i + 2 // attempt 1 already ran above.
+		m.logger.Warn("worktree remote rejected a fresh credential; retrying",
+			"sessionId", sessionID, "operation", operation, "attempt", attempt, "wait", wait)
+		if wait > 0 {
+			timer := time.NewTimer(wait)
+			select {
+			case <-ctx.Done():
+				timer.Stop()
+				return firstOut, firstErr
+			case <-timer.C:
+			}
+		}
+		out, err = op()
+		if err == nil {
+			return out, nil
+		}
+		if !isCredentialPropagationError(out) {
+			return out, err
+		}
+	}
+	return firstOut, firstErr
 }
 
 // isRetriable returns true for errors that the legacy TS retry loop
