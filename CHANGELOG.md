@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.57 — 2026-09-30
+
 ### Fixes
 
 - The session token budget is enforced during the run, not only when a turn
