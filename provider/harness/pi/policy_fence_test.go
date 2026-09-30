@@ -17,6 +17,7 @@ package pi
 
 import (
 	"encoding/json"
+	"strings"
 	"testing"
 	"time"
 
@@ -106,6 +107,46 @@ func truncatedCallPair(toolName, callID string) string {
 	})
 }
 
+// Recorded shape: the runtime's argument validator rejecting an edit call
+// whose second replacement has no oldText. recordedRejectionText is the exact
+// text the validator produced for recordedMalformedEditArgs; the runtime
+// finalizes the call with it as the call's error result, without running the
+// tool_call hook.
+const recordedRejectionText = "Validation failed for tool \"edit\":\n  - edits.1.oldText: must have required properties oldText\n\nReceived arguments:\n{\n  \"path\": \"README.md\",\n  \"edits\": [\n    {\n      \"oldText\": \"old\",\n      \"newText\": \"new\"\n    },\n    {\n      \"newText\": \"orphan\"\n    }\n  ]\n}"
+
+var recordedMalformedEditArgs = map[string]any{
+	"path":  "README.md",
+	"edits": []any{map[string]any{"oldText": "old", "newText": "new"}, map[string]any{"newText": "orphan"}},
+}
+
+// startEvent builds the tool_execution_start pi emits for a call, before it
+// validates the call's arguments or runs the tool_call hook.
+func startEvent(toolName, callID string, args any) string {
+	return event(map[string]any{"type": "tool_execution_start", "toolCallId": callID, "toolName": toolName, "args": args})
+}
+
+// textEnd builds a tool_execution_end whose result is a single text part with
+// empty details — the shape the runtime gives every call it finalizes with an
+// error message.
+func textEnd(toolName, callID, text string, isError bool) string {
+	return event(map[string]any{
+		"type":       "tool_execution_end",
+		"toolCallId": callID,
+		"toolName":   toolName,
+		"result": map[string]any{
+			"content": []any{map[string]any{"type": "text", "text": text}},
+			"details": map[string]any{},
+		},
+		"isError": isError,
+	})
+}
+
+// rejectedCallPair builds the hook-less start/end pair pi emits for the
+// recorded edit call its argument validator rejected.
+func rejectedCallPair(callID string) string {
+	return startEvent("edit", callID, recordedMalformedEditArgs) + textEnd("edit", callID, recordedRejectionText, true)
+}
+
 // drainToResultOrClose collects events until the session produces a
 // ResultEvent or closes its channel. Unlike drain it does NOT stop on an
 // ErrorEvent: a non-fatal fence event is exactly the case under test, and the
@@ -152,6 +193,10 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 		// surface — as refused before execution on an output-limit stop, in
 		// order. nil means none.
 		wantRefusedIDs []string
+		// wantRejectedIDs are the call ids the monitor must record as
+		// rejected on their arguments before execution, in order. nil means
+		// none.
+		wantRejectedIDs []string
 	}{
 		{
 			// A ruling that never reached the registry — the ordering failure
@@ -307,6 +352,110 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 			wantMissIDs:    []string{"c-trunc"},
 			wantRefusedIDs: []string{"c-trunc"},
 		},
+		{
+			// The recorded failure: the runtime's argument validator rejected
+			// an edit call before the hook, so no ruling exists. It never ran,
+			// so it is not an unproven call.
+			name:            "call rejected on its arguments is not executed (recorded shape)",
+			body:            rejectedCallPair("c-invalid"),
+			wantRejectedIDs: []string{"c-invalid"},
+		},
+		{
+			// The agent reads the rejection, sends a valid call, and the
+			// session runs on to its own terminal with nothing to report.
+			name: "a rejected call followed by a valid one ends normally",
+			body: rejectedCallPair("c-invalid") +
+				startEvent("edit", "c-valid", map[string]any{"path": "README.md", "edits": []any{map[string]any{"oldText": "old", "newText": "new"}}}) +
+				adjudicateEvent("a1", "edit", "c-valid", map[string]any{"path": "README.md", "edits": []any{map[string]any{"oldText": "old", "newText": "new"}}}, "") +
+				endEvent("edit", "toolCallId", "c-valid", false),
+			wantDecisions:   1,
+			wantRejectedIDs: []string{"c-invalid"},
+		},
+		{
+			// A rejection excuses nothing after it: a later denied call that
+			// the runtime executed anyway still ends the session.
+			name: "a rejected call does not excuse a later denied call that ran",
+			body: rejectedCallPair("c-invalid") +
+				adjudicateEvent("a1", "bash", "c-denied", map[string]any{"command": denyCommand}, "") +
+				endEvent("bash", "toolCallId", "c-denied", false),
+			wantFatal:       true,
+			wantDecisions:   1,
+			wantRejectedIDs: []string{"c-invalid"},
+		},
+		{
+			// The text must close with the arguments the call's start
+			// carried; a rejection of other arguments is not this call's.
+			name: "a rejection of other arguments stays unproven",
+			body: startEvent("edit", "c-inv", map[string]any{"path": "OTHER.md", "edits": []any{}}) +
+				textEnd("edit", "c-inv", recordedRejectionText, true),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// An end that claims SUCCESS ran something: never excused.
+			name: "a rejection text on a successful end stays unproven",
+			body: startEvent("edit", "c-inv", recordedMalformedEditArgs) +
+				textEnd("edit", "c-inv", recordedRejectionText, false),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// Without the call's start there are no arguments to match.
+			name:        "a rejection with no start stays unproven",
+			body:        textEnd("edit", "c-inv", recordedRejectionText, true),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// Same id, different tool: not the call the start named.
+			name: "a rejection ending under another tool stays unproven",
+			body: startEvent("edit", "c-inv", recordedMalformedEditArgs) +
+				textEnd("write", "c-inv", strings.Replace(recordedRejectionText, `tool "edit"`, `tool "write"`, 1), true),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// The rejection line must name the call's own tool.
+			name: "a rejection naming another tool stays unproven",
+			body: startEvent("edit", "c-inv", recordedMalformedEditArgs) +
+				textEnd("edit", "c-inv", strings.Replace(recordedRejectionText, `tool "edit"`, `tool "write"`, 1), true),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// An executed command's error result carries its exit status
+			// after its output, so output that imitates a rejection is not
+			// one.
+			name: "command output imitating a rejection stays unproven",
+			body: startEvent("bash", "c-bash", map[string]any{"command": "printf imitation; exit 1"}) +
+				textEnd("bash", "c-bash", strings.Replace(recordedRejectionText, `tool "edit"`, `tool "bash"`, 1)+"\n\nCommand exited with code 1", true),
+			wantMissIDs: []string{"c-bash"},
+		},
+		{
+			// A result that carries tool details is not the runtime's bare
+			// rejection.
+			name: "a rejection text with result details stays unproven",
+			body: startEvent("edit", "c-inv", recordedMalformedEditArgs) +
+				event(map[string]any{
+					"type": "tool_execution_end", "toolCallId": "c-inv", "toolName": "edit", "isError": true,
+					"result": map[string]any{
+						"content": []any{map[string]any{"type": "text", "text": recordedRejectionText}},
+						"details": map[string]any{"diff": "+new"},
+					},
+				}),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// A start note does not outlive its turn.
+			name: "a start note does not survive turn_end",
+			body: startEvent("edit", "c-inv", recordedMalformedEditArgs) +
+				event(map[string]any{"type": "turn_end"}) +
+				textEnd("edit", "c-inv", recordedRejectionText, true),
+			wantMissIDs: []string{"c-inv"},
+		},
+		{
+			// One start explains one end, not a second one.
+			name: "a start explains a single end",
+			body: rejectedCallPair("c-inv") +
+				textEnd("edit", "c-inv", recordedRejectionText, true),
+			wantMissIDs:     []string{"c-inv"},
+			wantRejectedIDs: []string{"c-inv"},
+		},
 	}
 
 	for _, tc := range cases {
@@ -397,6 +546,19 @@ func TestPolicyFence_GuardedToolEndOutcomes(t *testing.T) {
 				}
 				if missEvents[i].Message == "" {
 					t.Errorf("miss[%d] event carried no message", i)
+				}
+				if !missEvents[i].SessionContinues {
+					t.Errorf("miss[%d] event does not say the session continues: %+v", i, missEvents[i])
+				}
+			}
+
+			rejected := h.(*Handle).recordedArgumentRejections()
+			if len(rejected) != len(tc.wantRejectedIDs) {
+				t.Fatalf("recorded argument rejections = %+v, want ids %q", rejected, tc.wantRejectedIDs)
+			}
+			for i, want := range tc.wantRejectedIDs {
+				if rejected[i].callID != want || rejected[i].tool == "" {
+					t.Errorf("rejection[%d] = %+v, want call id %q with its tool", i, rejected[i], want)
 				}
 			}
 		})

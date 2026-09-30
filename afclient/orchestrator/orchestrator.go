@@ -383,7 +383,8 @@ func statErrOrNotDir(err error) error {
 // ResultEvent/ErrorEvent arrives or the stream closes.  A ResultEvent
 // with Success=false, an ErrorEvent, a premature stream closure, or
 // context cancellation all map to DispatchFailed — none can appear
-// successful.
+// successful.  An ErrorEvent that says the session continues
+// (SessionContinues) is not a terminal and is passed over.
 func awaitTerminal(ctx context.Context, handle agent.Handle, ad *AgentDispatch) error {
 	events := handle.Events()
 	if events == nil {
@@ -429,6 +430,11 @@ func awaitTerminal(ctx context.Context, handle agent.Handle, ad *AgentDispatch) 
 				}
 				return nil
 			case agent.ErrorEvent:
+				if e.SessionContinues {
+					// Reported for the record; the session runs on to
+					// its own terminal.
+					continue
+				}
 				msg := e.Message
 				if msg == "" {
 					msg = "agent reported error"

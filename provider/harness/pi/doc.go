@@ -123,6 +123,11 @@
 //     isError:true "was not executed" result, and no ruling can exist. The
 //     message_end carrying the stop reason and the calls' ids is emitted
 //     BEFORE those pairs.
+//   - A call whose arguments fail the tool's schema validation is rejected
+//     before the tool_call hook too, and never runs. Its tool_execution_start
+//     carries the arguments as the model sent them; its tool_execution_end is
+//     isError:true with a single text result, the runtime's rejection, which
+//     ends with those same arguments as indented JSON.
 //
 // So every path that refuses a call records the refusal as that call's
 // outcome BEFORE the refusal is delivered: the policy engine's own deny
@@ -161,13 +166,22 @@
 //     runtime's own message_end, never result text; a length-stopped id whose
 //     end claims SUCCESS is not excused and falls to case 3, and every note is
 //     dropped at its turn's turn_end.
+//     A call the runtime rejected on its arguments is recorded as that
+//     rejection (rejectedForInvalidArguments), not as a miss, and nothing more
+//     is emitted: the agent reads the rejection as the call's error result and
+//     continues. Its start named the same call id and tool in the same turn,
+//     its end positively reports an error result, and the result is exactly
+//     the runtime's rejection of the arguments that start carried (see below
+//     for why this one reading of result text is safe).
 //  3. NO recorded outcome. Unknowable: a real bypass, a lost ruling, a refusal
 //     that could not be registered, or a call id that could not be correlated
 //     all land here. The call is recorded as unproven and surfaced as a
-//     NON-fatal ErrorEvent{Code:"policy_adjudication_missing"} naming the tool
-//     and the call id, and the session runs on to its own terminal. Downstream
-//     the run is still classified a provider failure (runner/loop.go), so the
-//     miss is loud — but the session's work, and its cost accounting, survive.
+//     NON-fatal ErrorEvent{Code:"policy_adjudication_missing",
+//     SessionContinues:true} naming the tool and the call id, and the session
+//     runs on to its own terminal. The event says the session continues, so
+//     it stays on the record (the event log, the activity stream) while no
+//     consumer makes it the run's failure (runner/loop.go): the session's
+//     work, its verdict and its cost accounting all survive.
 //
 // Why case 3 only records: there is no refusal left to deliver. The end event
 // is emitted after pi has already finalized the call's result, and the only
@@ -194,6 +208,18 @@
 // destroyed on evidence the session's own output can forge, in either
 // direction. The fatal stays anchored on a field the runtime owns.
 //
+// The argument-rejection reading in case 2 is the one place the monitor reads
+// result text, and it is bounded so that it cannot reopen that class. It is
+// consulted only for a call with NO ruling, so it can neither arm nor disarm
+// the fatal; all it can do is decline to record a miss. And the text must
+// close with JSON equal to the arguments the call's own tool_execution_start
+// carried, after the runtime's rejection line for that tool. An executed
+// built-in does not write a result that does both: bash appends its exit
+// status after the command's output, and the other built-ins' error texts
+// open with their own message or their helper program's diagnostic. A
+// hostile execution that forges the opening line still ends on text that is
+// not the call's arguments, and stays a miss.
+//
 // # Posture change (deliberate, and what compensates for it)
 //
 // Before this design a guarded end with no recorded outcome aborted the
@@ -207,11 +233,15 @@
 // was a ruling lost in transit. The compensating control is that the miss is
 // now durable and machine-readable rather than a session obituary: it is an
 // agent.ErrorEvent carrying its own code, so it lands in the session's
-// event-log audit trail, reaches the activity sink, is inspectable on the
-// handle, and classifies the whole run as a provider failure downstream — a
-// subverted extension cannot run quietly, it can only run loudly. And that
-// record is itself unforgeable from the channel an attacker has: only a
-// token-verified round-trip can write the registry that would silence it.
+// event-log audit trail, reaches the activity sink, and is inspectable on the
+// handle — a subverted extension cannot run quietly, it can only run loudly.
+// It no longer fails the run: it says the session continues
+// (SessionContinues), so the verdict of a session that went on to finish its
+// work stands, while the record stays. And that record is itself unforgeable
+// from the channel an attacker has: only a token-verified round-trip can
+// write the registry that would silence it, and the runtime-evidence
+// exceptions of case 2 (a verified receipt, an output-limit stop, an argument
+// rejection) each excuse only a call the runtime did not run.
 //
 // Two residual gaps, both deliberate and both bounded to "recorded, not
 // fatal":

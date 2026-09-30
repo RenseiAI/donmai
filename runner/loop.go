@@ -2148,8 +2148,13 @@ func (r *Runner) consumeEvents(
 			toolInFlight[e.ToolUseID] = struct{}{}
 		case agent.ToolResultEvent:
 			delete(toolInFlight, e.ToolUseID)
-		case agent.ResultEvent, agent.ErrorEvent:
+		case agent.ResultEvent:
 			clear(toolInFlight)
+		case agent.ErrorEvent:
+			// A call still runs past an error the session continues past.
+			if !e.SessionContinues {
+				clear(toolInFlight)
+			}
 		}
 	}
 	// wrapUpTried limits the mid-turn wrap-up request to one attempt per
@@ -2276,7 +2281,8 @@ func (r *Runner) wrapUpMidTurn(ctx context.Context, handle agent.Handle, enforce
 //   - AssistantTextEvent → scans for the WORK_RESULT marker and
 //     accumulates the agent's running narrative.
 //   - ResultEvent → captures terminal cost/success.
-//   - ErrorEvent → records for FailureProviderError classification.
+//   - ErrorEvent → records for FailureProviderError classification,
+//     unless it says the session continues (SessionContinues).
 func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePath string, _ QueuedWork) {
 	switch e := ev.(type) {
 	case agent.InitEvent:
@@ -2359,7 +2365,12 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
 	case agent.ErrorEvent:
-		obs.errorEvent = &e
+		// An error the session continues past is on the record (events.jsonl,
+		// the activity sink) but is not the session's terminal, so it never
+		// becomes the run's failure.
+		if !e.SessionContinues {
+			obs.errorEvent = &e
+		}
 	}
 }
 
