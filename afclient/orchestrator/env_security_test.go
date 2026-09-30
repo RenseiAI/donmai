@@ -53,12 +53,14 @@ func TestNativeDispatcher_ChildEnvSanitized(t *testing.T) {
 	t.Setenv("ATTACH_URL", "wss://parent.invalid/v1/rooms/room-1")
 
 	dir := t.TempDir()
+	report := filepath.Join(dir, "env-report.txt")
 	providerBin := filepath.Join(dir, "fake-claude-env.sh")
 	script := "#!/bin/sh\n" +
 		`printf '{"type":"system","subtype":"init","session_id":"sess-env-1"}\n'` + "\n" +
 		"status=leaked\n" +
 		"if [ \"${ATTACH_TOKEN+x}${ATTACH_TOKEN_FILE+x}${ATTACH_URL+x}\" = \"\" ]; then status=clean; fi\n" +
 		`printf '{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"%s:%s:%s"}]}}\n' "$status" "$LINEAR_ISSUE_ID" "$LINEAR_ISSUE_IDENTIFIER"` + "\n" +
+		`printf '%s:%s:%s\n' "$status" "$LINEAR_ISSUE_ID" "$LINEAR_ISSUE_IDENTIFIER" > env-report.txt` + "\n" +
 		`printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1}\n'` + "\n"
 	if err := os.WriteFile(providerBin, []byte(script), 0o600); err != nil { //nolint:gosec // test fixture
 		t.Fatalf("write fake provider: %v", err)
@@ -78,6 +80,13 @@ func TestNativeDispatcher_ChildEnvSanitized(t *testing.T) {
 	}
 	if ad.Status != DispatchCompleted {
 		t.Fatalf("Status = %q, want %q (err=%v)", ad.Status, DispatchCompleted, ad.Error)
+	}
+	reportBody, err := os.ReadFile(report) //nolint:gosec // report is inside this test's temporary directory
+	if err != nil {
+		t.Fatalf("read child environment report: %v", err)
+	}
+	if got, want := strings.TrimSpace(string(reportBody)), "clean:issue-id:ENG-42"; got != want {
+		t.Fatalf("child environment report = %q, want %q", got, want)
 	}
 }
 
