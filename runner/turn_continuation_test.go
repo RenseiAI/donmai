@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // runContinuationScenario runs one development session on a repository where
@@ -545,6 +546,39 @@ func TestRun_ReviewTurnWithoutVerdictIsContinued(t *testing.T) {
 	}
 	if !strings.Contains(res.Summary, "REVIEW_VERDICT: REQUEST_CHANGES") {
 		t.Fatalf("Summary = %q; want it to hold the final review verdict", res.Summary)
+	}
+}
+
+// TestRun_ReviewTurnWithoutVerdictIsContinuedOnReadOnlyCheckout pins the
+// 'works on read-only checkouts' half of the continuation change: a review
+// turn that ends with no verdict is still continued when the selected
+// repository is read-only (the harness only provisions a mutable checkout,
+// where the mutable-checkout arm of tailRecoverable would continue it
+// anyway). The run uses a session-root-v1 declaration selecting a read-only
+// repository, so the continuation must come from the review-work arm.
+func TestRun_ReviewTurnWithoutVerdictIsContinuedOnReadOnlyCheckout(t *testing.T) {
+	bare := githubRepositoryFixture(t, followUpRepository)
+	setPullRef(t, bare, 7, pullAtSessionCommit)
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType: "qa",
+		declaration: &workarea.RepositoryDeclarationV1{
+			Protocol: workarea.ProtocolSessionRootV1,
+			Repositories: []workarea.DeclaredRepositoryV1{
+				{Source: workarea.RepositorySource{Repository: followUpRepository}, Name: "primary", Role: workarea.RepositoryRolePrimary, Authority: workarea.RepositoryReadOnly},
+			},
+		},
+		turns: []verdictScriptTurn{
+			{text: "Still reading the diff; no verdict yet."},
+			{text: "Findings complete.\nWORK_RESULT: passed\nREVIEW_VERDICT: APPROVE"},
+		},
+	})
+	wantPrompts(t, provider.prompts, continueReviewPrompt)
+	wantContinuations(t, res, 1, 0, false)
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
+	}
+	if res.ReviewVerdict != "APPROVE" {
+		t.Fatalf("ReviewVerdict = %q; want APPROVE", res.ReviewVerdict)
 	}
 }
 

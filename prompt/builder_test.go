@@ -302,6 +302,50 @@ func TestBuilderBuild_InitialPromptExcluded(t *testing.T) {
 	}
 }
 
+// TestBuilderBuild_AcceptanceRendersQATemplate pins the acceptance gap the
+// continuation change left open: acceptance closes on the same structured
+// review outcome as QA, so its turns must receive the verdict-marker
+// instruction the QA prompt carries. Routing it through the development
+// template instead would leave acceptance turns untold to emit a verdict
+// and running until the continuation bound.
+func TestBuilderBuild_AcceptanceRendersQATemplate(t *testing.T) {
+	t.Parallel()
+	qa := fixtureSession()
+	qa.WorkType = string(prompt.WorkTypeQA)
+	qa.MentionContext = "Please verify the smoke walkthrough end-to-end."
+	acceptance := fixtureSession()
+	acceptance.WorkType = string(prompt.WorkTypeAcceptance)
+	acceptance.MentionContext = "Please verify the smoke walkthrough end-to-end."
+
+	_, qaUser, err := prompt.NewBuilder().Build(qa)
+	if err != nil {
+		t.Fatalf("Build qa: %v", err)
+	}
+	_, acceptanceUser, err := prompt.NewBuilder().Build(acceptance)
+	if err != nil {
+		t.Fatalf("Build acceptance: %v", err)
+	}
+	if qaUser != acceptanceUser {
+		t.Fatalf("acceptance user prompt differs from qa\n--- qa ---\n%s\n--- acceptance ---\n%s", qaUser, acceptanceUser)
+	}
+	if !strings.Contains(acceptanceUser, "REVIEW_VERDICT:") {
+		t.Fatalf("acceptance user prompt does not ask for the review verdict marker:\n%s", acceptanceUser)
+	}
+
+	reg, err := templates.New()
+	if err != nil {
+		t.Fatalf("templates.New: %v", err)
+	}
+	b := &prompt.Builder{Registry: reg}
+	_, raymondUser, err := b.Build(acceptance)
+	if err != nil {
+		t.Fatalf("raymond Build acceptance: %v", err)
+	}
+	if !strings.Contains(raymondUser, "WORK_RESULT:passed") {
+		t.Fatalf("raymond acceptance user prompt missing the review template:\n%s", raymondUser)
+	}
+}
+
 // assertGolden compares got against testdata/<name>.golden, rewriting
 // the file when -update is set. A golden mismatch dumps a unified diff
 // to make template diffs reviewable.

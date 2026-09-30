@@ -604,6 +604,36 @@ func TestApplyTurnManifest(t *testing.T) {
 	}
 }
 
+// TestApplyTurnManifest_ManifestOnlyReviewVerdictReachesStructuredResult pins
+// the gap the continuation change left open: an agent that reports its
+// review outcome only in the turn manifest — no WORK_RESULT marker, no
+// REVIEW_VERDICT line — still populates the structured field graders read.
+// Without the fold in foldTurnManifest the manifest verdict lands on the
+// envelope while the review verdict stays empty, so the run completes with
+// no review outcome for the scorecard to read.
+func TestApplyTurnManifest_ManifestOnlyReviewVerdictReachesStructuredResult(t *testing.T) {
+	dir := t.TempDir()
+	writeManifestFile(t, dir, `{"schemaVersion":1,"verdict":"passed","summary":"review done","reviewVerdict":"APPROVE_WITH_FOLLOWUPS"}`)
+
+	res := &Result{Result: agent.Result{}}
+	obs := &streamObservation{}
+	r := discardRunner()
+	r.applyTurnManifest(dir, QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "test-session"}}, res, obs)
+
+	if res.WorkResult != "passed" {
+		t.Fatalf("WorkResult = %q; want passed", res.WorkResult)
+	}
+	if res.ReviewVerdict != "APPROVE_WITH_FOLLOWUPS" {
+		t.Fatalf("ReviewVerdict = %q; want APPROVE_WITH_FOLLOWUPS", res.ReviewVerdict)
+	}
+	if obs.reviewVerdict != "APPROVE_WITH_FOLLOWUPS" {
+		t.Fatalf("obs.reviewVerdict = %q; want APPROVE_WITH_FOLLOWUPS", obs.reviewVerdict)
+	}
+	if res.Manifest == nil || res.Manifest.ReviewVerdict != "APPROVE_WITH_FOLLOWUPS" {
+		t.Fatalf("envelope manifest reviewVerdict = %+v; want it carried verbatim", res.Manifest)
+	}
+}
+
 // TestManifestTypeAlias asserts at compile time that runner.TurnManifest and
 // agent.TurnManifest are the SAME type (an alias, not a distinct named type) —
 // the single-source-of-truth contract the wire carrier (agent.Result.Manifest)
