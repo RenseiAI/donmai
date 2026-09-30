@@ -11,8 +11,10 @@
 //  3. Picks Linear backlog issues and dispatches them to provider processes.
 //  4. Tracks agent processes and reports results.
 //
-// Provider dispatch (Claude / Codex) shells out to the provider CLI tool.
-// Inject a Dispatcher to override in tests (e.g. dry-run or mock).
+// Provider dispatch (Claude / Codex) uses the existing native harness
+// provider implementations via an injected ProviderFactory — never a
+// provider-argv adapter. Inject a Dispatcher to override in tests
+// (e.g. dry-run or mock).
 package orchestrator
 
 import (
@@ -27,8 +29,12 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient/repoconfig"
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/internal/linear"
-	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
+	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/claude"
+	"github.com/RenseiAI/donmai/provider/harness/codex"
+	"github.com/RenseiAI/donmai/templates"
 )
 
 // DispatchStatus is the lifecycle status of a dispatched agent.
@@ -72,9 +78,50 @@ type AgentDispatch struct {
 }
 
 // Dispatcher decides how to run an agent for an issue.  The default
-// implementation shells out to the provider CLI.  Tests inject a mock.
+// implementation spawns the selected native harness provider and awaits
+// its terminal outcome.  Tests inject a mock.
 type Dispatcher interface {
 	Dispatch(ctx context.Context, issue linear.Issue, cfg Config) (*AgentDispatch, error)
+}
+
+// Supported Harness values for Config.Harness.
+const (
+	// HarnessAuto probes the supported harnesses in documented order
+	// (claude, then codex) and uses the first whose constructor
+	// succeeds.  Probe failures name the missing binary.
+	HarnessAuto = "auto"
+	// HarnessClaude selects the claude harness provider.
+	HarnessClaude = "claude"
+	// HarnessCodex selects the codex harness provider (app-server JSON-RPC).
+	HarnessCodex = "codex"
+)
+
+// ProviderFactory constructs a native harness provider for one dispatch.
+// The orchestrator owns the returned provider's lifecycle: it spawns one
+// session, awaits the terminal event, then shuts the provider down.
+// Implementations must be safe for concurrent use — backlog runs call
+// NewProvider from multiple workers.
+type ProviderFactory interface {
+	NewProvider(ctx context.Context, harness string) (agent.Provider, error)
+}
+
+// defaultProviderFactory builds the real harness providers compiled into
+// this binary.  "auto" tries claude first, then codex, mirroring the
+// historical provider preference without passing one harness's argv to
+// another: each provider owns its native spawn protocol.
+type defaultProviderFactory struct{}
+
+// NewProvider constructs the named harness provider, probing fail-fast
+// (a missing binary returns an error wrapping agent.ErrProviderUnavailable).
+func (defaultProviderFactory) NewProvider(_ context.Context, harness string) (agent.Provider, error) {
+	switch harness {
+	case HarnessClaude:
+		return claude.New(claude.Options{})
+	case HarnessCodex:
+		return codex.New(codex.Options{})
+	default:
+		return nil, fmt.Errorf("orchestrator: unsupported harness %q (want %q or %q)", harness, HarnessClaude, HarnessCodex)
+	}
 }
 
 // Config carries all settings for an Orchestrator run.
@@ -94,7 +141,18 @@ type Config struct {
 	// Overrides the repository: field from config.yaml when set.
 	Repository string
 	// TemplateDir is the path to custom workflow template YAML files.
+	// When set, the directory must exist and load as a template registry;
+	// template load failure fails the dispatch before any provider spawns.
 	TemplateDir string
+	// Harness selects the native harness provider ("auto", "claude" or
+	// "codex").  Empty means "auto".  Explicit values fail closed when
+	// the selected provider is unavailable; there is no silent fallback
+	// to the other harness.
+	Harness string
+	// ProviderFactory constructs the harness provider for each dispatch.
+	// Nil uses the default factory (real claude/codex constructors).
+	// Tests inject a stub factory via NewForTest or WithProviderFactory.
+	ProviderFactory ProviderFactory
 	// GitRoot is the root of the git repository.  Defaults to the directory
 	// returned by `git rev-parse --show-toplevel`.
 	GitRoot string
@@ -121,15 +179,20 @@ type Orchestrator struct {
 	logger     *slog.Logger
 }
 
-// providerDispatcher is the production Dispatcher implementation that shells
-// out to the claude / codex CLI tool.
-type providerDispatcher struct{}
+// nativeDispatcher is the production Dispatcher implementation.  It
+// resolves the harness (explicit or auto), constructs the native harness
+// provider via the configured ProviderFactory, builds an agent.Spec from
+// the issue plus the rendered prompt templates, spawns one session,
+// awaits its terminal ResultEvent/ErrorEvent (or stream closure), maps
+// the outcome onto the AgentDispatch, and shuts the owned provider down.
+// Dispatch is synchronous: the returned dispatch is always terminal.
+type nativeDispatcher struct {
+	factory ProviderFactory
+}
 
-// Dispatch shells out to the provider CLI to run an agent for the given issue.
-// In the Go port the provider binary is resolved from PATH (claude, codex, etc.).
-// The dispatch is fire-and-forget — the orchestrator tracks the os.Process and
-// waits for completion in a goroutine.
-func (d *providerDispatcher) Dispatch(ctx context.Context, issue linear.Issue, cfg Config) (*AgentDispatch, error) {
+// Dispatch runs one issue on the selected native harness provider and
+// awaits its terminal outcome before returning.
+func (d *nativeDispatcher) Dispatch(ctx context.Context, issue linear.Issue, cfg Config) (*AgentDispatch, error) {
 	ad := &AgentDispatch{
 		IssueID:    issue.ID,
 		Identifier: issue.Identifier,
@@ -139,72 +202,245 @@ func (d *providerDispatcher) Dispatch(ctx context.Context, issue linear.Issue, c
 		StartedAt:  time.Now(),
 	}
 
-	// Resolve the provider CLI binary.  We try "claude" first (most common),
-	// then "codex" as a fallback.  This matches the legacy TS default of the
-	// claude provider.
-	providerBin := resolveProviderBin()
-	if providerBin == "" {
-		ad.Status = DispatchFailed
-		ad.Error = errors.New("no provider binary found (tried: claude, codex)")
-		return ad, ad.Error
+	harness, err := resolveHarness(cfg.Harness)
+	if err != nil {
+		return failDispatch(ad, err), err
 	}
 
-	args := buildProviderArgs(issue, cfg)
-	cmd := exec.CommandContext(ctx, providerBin, args...) //nolint:gosec
-	cmd.Env = runtimeenv.ComposeChildEnv(os.Environ(), map[string]string{
-		"LINEAR_ISSUE_ID":         issue.ID,
-		"LINEAR_ISSUE_IDENTIFIER": issue.Identifier,
-	})
+	spec, buildErr := buildAgentSpec(issue, cfg)
+	if buildErr != nil {
+		return failDispatch(ad, buildErr), buildErr
+	}
 
-	if err := cmd.Start(); err != nil {
-		ad.Status = DispatchFailed
-		ad.Error = fmt.Errorf("dispatch: start %s: %w", providerBin, err)
-		return ad, ad.Error
+	factory := d.factory
+	if factory == nil {
+		factory = defaultProviderFactory{}
+	}
+
+	provider, perr := acquireProvider(ctx, factory, harness)
+	if perr != nil {
+		return failDispatch(ad, perr), perr
 	}
 
 	ad.Status = DispatchRunning
-
-	// Wait for completion in background.
-	go func() {
-		if werr := cmd.Wait(); werr != nil {
-			var exitErr *exec.ExitError
-			if errors.As(werr, &exitErr) {
-				ad.ExitCode = exitErr.ExitCode()
-			}
-			ad.Status = DispatchFailed
-			ad.Error = werr
-		} else {
-			ad.Status = DispatchCompleted
-			ad.ExitCode = 0
-		}
+	finish := func() {
 		ad.CompletedAt = time.Now()
-	}()
-
-	return ad, nil
-}
-
-// resolveProviderBin returns the first provider binary found in PATH.
-func resolveProviderBin() string {
-	for _, bin := range []string{"claude", "codex"} {
-		if p, err := exec.LookPath(bin); err == nil {
-			return p
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		if serr := provider.Shutdown(shutdownCtx); serr != nil {
+			serr = fmt.Errorf("orchestrator: shutdown %s provider: %w", harness, serr)
+			if ad.Error == nil {
+				ad.Error = serr
+				ad.Status = DispatchFailed
+			}
 		}
 	}
-	return ""
+	defer finish()
+
+	handle, serr := provider.Spawn(ctx, spec)
+	if serr != nil {
+		return failDispatch(ad, fmt.Errorf("orchestrator: spawn %s: %w", harness, serr)), ad.Error
+	}
+	stopOnCancel := context.AfterFunc(ctx, func() {
+		stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		_ = handle.Stop(stopCtx)
+	})
+	defer stopOnCancel()
+
+	if terr := awaitTerminal(ctx, handle, ad); terr != nil {
+		return ad, terr
+	}
+	return ad, ad.Error
 }
 
-// buildProviderArgs builds the argument list for the provider binary based on
-// the issue and orchestrator config.
-func buildProviderArgs(issue linear.Issue, cfg Config) []string {
-	// The provider CLI is expected to accept `--print` mode and a prompt
-	// describing the issue to work on.  The exact flags depend on the
-	// provider, but we standardise on the claude-code `--print` + prompt form.
-	prompt := fmt.Sprintf("Work on Linear issue %s: %s", issue.Identifier, issue.Title)
-	args := []string{"--print", prompt}
-	if cfg.TemplateDir != "" {
-		args = append(args, "--templates", cfg.TemplateDir)
+// failDispatch marks a dispatch failed and records the error.
+func failDispatch(ad *AgentDispatch, err error) *AgentDispatch {
+	ad.Status = DispatchFailed
+	ad.CompletedAt = time.Now()
+	ad.Error = err
+	return ad
+}
+
+// resolveHarness normalises the configured harness name.  Empty means
+// auto.  Unknown names fail closed.
+func resolveHarness(harness string) (string, error) {
+	switch strings.TrimSpace(harness) {
+	case "", HarnessAuto:
+		return HarnessAuto, nil
+	case HarnessClaude:
+		return HarnessClaude, nil
+	case HarnessCodex:
+		return HarnessCodex, nil
+	default:
+		return "", fmt.Errorf("orchestrator: unsupported harness %q (want %q, %q or %q)", harness, HarnessAuto, HarnessClaude, HarnessCodex)
 	}
-	return args
+}
+
+// acquireProvider constructs the provider for one dispatch.  "auto"
+// tries claude first, then codex, and joins both probe errors when
+// neither is available.  Explicit harnesses fail closed with the single
+// probe error — there is no silent fallback to the other harness.
+func acquireProvider(ctx context.Context, factory ProviderFactory, harness string) (agent.Provider, error) {
+	if harness != HarnessAuto {
+		p, err := factory.NewProvider(ctx, harness)
+		if err != nil {
+			return nil, fmt.Errorf("orchestrator: %s provider unavailable: %w", harness, err)
+		}
+		return p, nil
+	}
+	claudeProvider, claudeErr := factory.NewProvider(ctx, HarnessClaude)
+	if claudeErr == nil {
+		return claudeProvider, nil
+	}
+	codexProvider, codexErr := factory.NewProvider(ctx, HarnessCodex)
+	if codexErr == nil {
+		return codexProvider, nil
+	}
+	return nil, fmt.Errorf("orchestrator: no provider available (tried: %s, %s): %w; %w", HarnessClaude, HarnessCodex, claudeErr, codexErr)
+}
+
+// buildAgentSpec renders the issue prompt (custom templates when
+// configured, built-in registry otherwise) and projects it onto an
+// agent.Spec.  No template path is ever forwarded as provider argv —
+// each harness owns its native argument translation.
+func buildAgentSpec(issue linear.Issue, cfg Config) (agent.Spec, error) {
+	userPrompt, systemAppend, err := renderIssuePrompt(issue, cfg)
+	if err != nil {
+		return agent.Spec{}, err
+	}
+	cwd := cfg.GitRoot
+	env := map[string]string{
+		"LINEAR_ISSUE_ID":         issue.ID,
+		"LINEAR_ISSUE_IDENTIFIER": issue.Identifier,
+	}
+	return agent.Spec{
+		Prompt:             userPrompt,
+		SystemPromptAppend: systemAppend,
+		Cwd:                cwd,
+		Env:                env,
+		Autonomous:         true,
+	}, nil
+}
+
+// renderIssuePrompt renders the (system, user) prompt pair for an issue.
+// A configured TemplateDir must exist and load; failure fails the
+// dispatch before any provider spawns.  The built-in registry always
+// renders the development template.
+func renderIssuePrompt(issue linear.Issue, cfg Config) (user, systemAppend string, err error) {
+	qw := prompt.QueuedWork{
+		SessionID:       issue.ID,
+		IssueID:         issue.ID,
+		IssueIdentifier: issue.Identifier,
+		Title:           issue.Title,
+		Body:            issue.Description,
+		ProjectName:     issue.Project.Name,
+		Repository:      cfg.Repository,
+		WorkType:        "development",
+	}
+	if cfg.TemplateDir != "" {
+		info, statErr := os.Stat(cfg.TemplateDir)
+		if statErr != nil || !info.IsDir() {
+			return "", "", fmt.Errorf("orchestrator: template dir %q: %w", cfg.TemplateDir, statErrOrNotDir(statErr))
+		}
+		reg, loadErr := templates.NewFromFS(os.DirFS(cfg.TemplateDir), ".")
+		if loadErr != nil {
+			return "", "", fmt.Errorf("orchestrator: load templates from %q: %w", cfg.TemplateDir, loadErr)
+		}
+		builder := &prompt.Builder{Registry: reg}
+		system, userPrompt, buildErr := builder.Build(qw)
+		if buildErr != nil {
+			return "", "", fmt.Errorf("orchestrator: render custom template: %w", buildErr)
+		}
+		return userPrompt, system, nil
+	}
+	builder := prompt.NewBuilder()
+	system, userPrompt, buildErr := builder.Build(qw)
+	if buildErr != nil {
+		return "", "", fmt.Errorf("orchestrator: render prompt: %w", buildErr)
+	}
+	return userPrompt, system, nil
+}
+
+func statErrOrNotDir(err error) error {
+	if err != nil {
+		return err
+	}
+	return errors.New("not a directory")
+}
+
+// awaitTerminal consumes the handle's event stream until the terminal
+// ResultEvent/ErrorEvent arrives or the stream closes.  A ResultEvent
+// with Success=false, an ErrorEvent, a premature stream closure, or
+// context cancellation all map to DispatchFailed — none can appear
+// successful.
+func awaitTerminal(ctx context.Context, handle agent.Handle, ad *AgentDispatch) error {
+	events := handle.Events()
+	if events == nil {
+		return failDispatchErr(ad, errors.New("orchestrator: provider returned nil event stream"))
+	}
+	for {
+		select {
+		case <-ctx.Done():
+			stopCtx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+			stopErr := handle.Stop(stopCtx)
+			cancel()
+			if stopErr != nil {
+				return failDispatchErr(ad, fmt.Errorf("orchestrator: stop after cancel: %w", context.Cause(ctx)))
+			}
+			return failDispatchErr(ad, fmt.Errorf("orchestrator: dispatch canceled: %w", context.Cause(ctx)))
+		case ev, ok := <-events:
+			if !ok {
+				// The provider closed the stream without a terminal
+				// event.  That is a failure — never success.
+				if ad.Status != DispatchFailed && ad.Status != DispatchCompleted {
+					return failDispatchErr(ad, errors.New("orchestrator: provider stream closed before terminal event"))
+				}
+				return ad.Error
+			}
+			switch e := ev.(type) {
+			case agent.ResultEvent:
+				if e.Success {
+					ad.Status = DispatchCompleted
+					ad.ExitCode = 0
+					ad.Error = nil
+				} else {
+					msg := strings.Join(e.Errors, "; ")
+					if msg == "" {
+						msg = e.Message
+					}
+					if msg == "" {
+						msg = "agent reported failure"
+					}
+					if e.ErrorSubtype != "" {
+						msg += " (" + e.ErrorSubtype + ")"
+					}
+					return failDispatchErr(ad, errors.New(msg)) //nolint:goerr113
+				}
+				return nil
+			case agent.ErrorEvent:
+				msg := e.Message
+				if msg == "" {
+					msg = "agent reported error"
+				}
+				if e.Code != "" {
+					msg += " (" + e.Code + ")"
+				}
+				return failDispatchErr(ad, errors.New(msg)) //nolint:goerr113
+			default:
+				// Non-terminal events (assistant text, tool use, system)
+				// carry progress only; keep awaiting the terminal.
+			}
+		}
+	}
+}
+
+// failDispatchErr marks a running dispatch failed and returns the error.
+func failDispatchErr(ad *AgentDispatch, err error) error {
+	ad.Status = DispatchFailed
+	ad.CompletedAt = time.Now()
+	ad.Error = err
+	return err
 }
 
 // New creates an Orchestrator with a real Linear client and provider dispatcher.
@@ -230,7 +466,7 @@ func New(cfg Config) (*Orchestrator, error) {
 	o := &Orchestrator{
 		cfg:        cfg,
 		linClient:  linClient,
-		dispatcher: &providerDispatcher{},
+		dispatcher: &nativeDispatcher{factory: cfg.ProviderFactory},
 		logger:     logger,
 	}
 
@@ -290,7 +526,7 @@ func NewForTest(cfg Config, lin linear.Linear) (*Orchestrator, error) {
 	o := &Orchestrator{
 		cfg:        cfg,
 		linClient:  lin,
-		dispatcher: &providerDispatcher{},
+		dispatcher: &nativeDispatcher{factory: cfg.ProviderFactory},
 		logger:     logger,
 	}
 
@@ -316,6 +552,12 @@ func NewForTest(cfg Config, lin linear.Linear) (*Orchestrator, error) {
 	}
 
 	return o, nil
+}
+
+// WithProviderFactory replaces the harness provider factory — primarily
+// used in tests to inject stub providers.
+func (o *Orchestrator) WithProviderFactory(f ProviderFactory) {
+	o.dispatcher = &nativeDispatcher{factory: f}
 }
 
 // Run executes the orchestrator loop:
@@ -371,7 +613,9 @@ func (o *Orchestrator) runSingle(ctx context.Context, result *Result) (*Result, 
 	if err != nil {
 		result.Errors = append(result.Errors, err)
 	}
-	result.Dispatched = append(result.Dispatched, ad)
+	if ad != nil {
+		result.Dispatched = append(result.Dispatched, ad)
+	}
 	return result, nil
 }
 
@@ -386,6 +630,12 @@ func (o *Orchestrator) runBacklog(ctx context.Context, result *Result) (*Result,
 	maxInt := o.cfg.Max
 	if maxInt <= 0 {
 		maxInt = 3
+	}
+
+	// Validate the harness selection once, before listing, so a bad
+	// --harness value fails fast instead of once per issue.
+	if _, herr := resolveHarness(o.cfg.Harness); herr != nil {
+		return nil, herr
 	}
 
 	var (
@@ -413,16 +663,6 @@ func (o *Orchestrator) runBacklog(ctx context.Context, result *Result) (*Result,
 				goto done
 			}
 
-			// Re-validate git remote before each spawn.
-			if o.cfg.Repository != "" {
-				if verr := ValidateGitRemote(o.cfg.Repository, o.cfg.GitRoot); verr != nil {
-					mu.Lock()
-					result.Errors = append(result.Errors, verr)
-					mu.Unlock()
-					goto done
-				}
-			}
-
 			if o.cfg.DryRun {
 				o.logger.Info("dry-run: would dispatch",
 					"issue", issue.Identifier,
@@ -442,8 +682,13 @@ func (o *Orchestrator) runBacklog(ctx context.Context, result *Result) (*Result,
 				continue
 			}
 
-			// Acquire semaphore slot before spawning.
-			sem <- struct{}{}
+			// Acquire a semaphore slot, or stop when cancelled. Only this
+			// loop sends on sem; workers only release.
+			select {
+			case <-ctx.Done():
+				goto done
+			case sem <- struct{}{}:
+			}
 			wg.Add(1)
 
 			issueCopy := issue
@@ -463,15 +708,10 @@ func (o *Orchestrator) runBacklog(ctx context.Context, result *Result) (*Result,
 				}
 				mu.Unlock()
 
-				// Wait for the agent to complete before releasing the semaphore slot.
-				if ad != nil {
-					for ad.Status == DispatchStarting || ad.Status == DispatchRunning {
-						time.Sleep(500 * time.Millisecond)
-						if err := ctx.Err(); err != nil {
-							return
-						}
-					}
-				}
+				// Dispatch is synchronous in the native implementation: the
+				// returned dispatch is already terminal, so no polling loop
+				// runs here. The semaphore slot is held for the whole
+				// Dispatch call, which bounds concurrency.
 			}()
 		}
 	}
