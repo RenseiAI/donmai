@@ -841,6 +841,32 @@ func TestScanVerdict(t *testing.T) {
 	}
 }
 
+// TestScanReviewVerdict pins the structured review-outcome marker rule:
+// line-anchored, FIRST marker wins, ASCII-only case folding with canonical
+// upper-case output, and a word boundary after the value.
+func TestScanReviewVerdict(t *testing.T) {
+	cases := []struct {
+		text, want string
+	}{
+		{"REVIEW_VERDICT: APPROVE", "APPROVE"},
+		{"done\n  REVIEW_VERDICT: approve_with_followups", "APPROVE_WITH_FOLLOWUPS"},
+		{"done\n<!-- REVIEW_VERDICT: request_changes -->", "REQUEST_CHANGES"},
+		{"REVIEW_VERDICT approve", "APPROVE"},
+		{"first\nREVIEW_VERDICT:APPROVE\nthen\nREVIEW_VERDICT:REQUEST_CHANGES", "APPROVE"},
+		{"I am not claiming REVIEW_VERDICT: APPROVE yet", ""},
+		{"could not finish. REVIEW_VERDICT:APPROVE", ""},
+		{"REVIEW_VERDICT:\nAPPROVE", ""},
+		{"REVIEW_VERDICT: APPROVED", ""},
+		{"REVIEW_VERDICT: approve_with_followupss", ""},
+		{"", ""},
+	}
+	for _, tc := range cases {
+		if got := scanReviewVerdict(tc.text); got != tc.want {
+			t.Errorf("scanReviewVerdict(%q) = %q; want %q", tc.text, got, tc.want)
+		}
+	}
+}
+
 // TestRun_PrintedManifestNeverRaisesTheSameTurnsMarker pins the never-raise
 // rule on the FIRST turn (step 10·M): a printed `Intended manifest` block
 // cannot raise the turn's own anchored marker verdict, but sets the verdict

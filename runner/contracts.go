@@ -222,3 +222,18 @@ func RequiresPRURL(workType string) bool {
 	}
 	return false
 }
+
+// RequiresReviewVerdict reports whether the work type is review work that
+// closes on a structured review outcome: QA and acceptance carry one of
+// APPROVE | APPROVE_WITH_FOLLOWUPS | REQUEST_CHANGES on the turn result
+// (agent.TurnManifest.ReviewVerdict), next to the pass/fail outcome, so
+// graders, the scorecard and reviewer calibration can read it without
+// scraping prose.
+func RequiresReviewVerdict(workType string) bool {
+	switch workType {
+	case WorkTypeQAStr, WorkTypeAcceptance:
+		return true
+	default:
+		return false
+	}
+}

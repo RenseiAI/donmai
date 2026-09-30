@@ -1301,12 +1301,14 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// cover every follow-up turn.
 	publicationComplete := !RequiresPRURL(qw.WorkType) && res.WorkResult == "passed"
 	followUps := r.newTurnFollowUps()
-	continuable := RequiresPRURL(qw.WorkType) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+	reviewWork := RequiresReviewVerdict(qw.WorkType)
+	continuable := (RequiresPRURL(qw.WorkType) || reviewWork) && (caps.SupportsMessageInjection || caps.SupportsSessionResume)
+	tailRecoverable := selectedRepositoryMutable || reviewWork
 tailRecovery:
-	for selectedRepositoryMutable && !r.skipSteering && !streamRes.blocked {
+	for tailRecoverable && !r.skipSteering && !streamRes.blocked {
 		steerView := streamRes
 		steerView.terminalSuccess = lastTurn.terminalSuccess
-		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn))
+		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn), reviewWork)
 		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
 		switch step {
 		case tailDone:
@@ -1349,6 +1351,9 @@ tailRecovery:
 		}
 
 		prompt := continuePrompt
+		if reviewWork {
+			prompt = continueReviewPrompt
+		}
 		if step == tailRetry {
 			prompt = retryPrompt
 			r.logger.Warn("turn ended on a model provider error; retrying",
@@ -1825,8 +1830,13 @@ type streamObservation struct {
 	// (the FIRST anchored marker within that message wins — see
 	// scanVerdict). A blocked verdict sets blocked instead and clears it.
 	workResult string
-	cost       *agent.CostData
-	providerID string
+	// reviewVerdict is this stream's structured review outcome
+	// (scanReviewVerdict): one of APPROVE | APPROVE_WITH_FOLLOWUPS |
+	// REQUEST_CHANGES from the LATEST assistant message carrying a
+	// line-anchored REVIEW_VERDICT marker. Empty when the turn gave none.
+	reviewVerdict string
+	cost          *agent.CostData
+	providerID    string
 	// lastAssistantText is the most recent non-empty assistant message
 	// observed on this stream. It is the summary fallback for providers
 	// whose terminal ResultEvent carries no Message (codex's
@@ -1892,6 +1902,9 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	}
 	if o.workResult != "" {
 		res.WorkResult = o.workResult
+	}
+	if o.reviewVerdict != "" {
+		res.ReviewVerdict = o.reviewVerdict
 	}
 	if o.cost != nil {
 		res.Cost = o.cost
@@ -2097,6 +2110,12 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.workResult = verdict
 			obs.blocked = false
 			obs.blockedReason = ""
+		}
+		// Structured review outcome, independent of the pass/fail marker:
+		// the latest message carrying a line-anchored REVIEW_VERDICT
+		// marker decides the stream's review verdict.
+		if review := scanReviewVerdict(e.Text); review != "" {
+			obs.reviewVerdict = review
 		}
 		if u := scanPRURL(e.Text); u != "" {
 			obs.pullRequestURL = u
@@ -2760,6 +2779,31 @@ func scanBlocked(text string) (string, bool) {
 	return reason, verdict == "blocked"
 }
 
+// scanReviewVerdict returns the structured review outcome of the FIRST
+// line-anchored REVIEW_VERDICT marker in text — "APPROVE",
+// "APPROVE_WITH_FOLLOWUPS" or "REQUEST_CHANGES" — or "" when text
+// carries none. The rule mirrors scanVerdict (line-anchored, same-line
+// value, word boundary, ASCII-only case folding): a review verdict quoted
+// in prose is ignored, so it can never set the structured field graders
+// and the scorecard read. Matching is case-insensitive over ASCII only;
+// the returned value is always the canonical upper-case spelling.
+func scanReviewVerdict(text string) string {
+	loc := reviewVerdictRE.FindStringSubmatchIndex(asciiLower(text))
+	if loc == nil || loc[2] < 0 {
+		return ""
+	}
+	switch asciiLower(text[loc[2]:loc[3]]) {
+	case "approve":
+		return "APPROVE"
+	case "approve_with_followups":
+		return "APPROVE_WITH_FOLLOWUPS"
+	case "request_changes":
+		return "REQUEST_CHANGES"
+	default:
+		return ""
+	}
+}
+
 // asciiLower lower-cases ASCII letters only, leaving every other byte — and
 // therefore every byte offset — unchanged. Marker and label regexes are
 // written in lower case and matched against this form instead of using (?i),
@@ -2811,8 +2855,9 @@ func classifyBlocked(res *Result, obs streamObservation) bool {
 }
 
 var (
-	workResultRE = regexp.MustCompile(verdictMarkerPattern)
-	prURLRE      = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
+	workResultRE    = regexp.MustCompile(verdictMarkerPattern)
+	reviewVerdictRE = regexp.MustCompile(reviewVerdictMarkerPattern)
+	prURLRE         = regexp.MustCompile(`https://github\.com/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+/pull/\d+`)
 )
 
 // lineStartPrefix anchors every structured line the runner reads out of
@@ -2839,6 +2884,14 @@ const verdictMarkerPattern = markerLead + `(?:work_result` + markerSeparator +
 // agentBlockedRE captures the reason of an anchored `AGENT_BLOCKED: <reason>`
 // line, up to the end of that line (possibly empty; never the next line).
 var agentBlockedRE = regexp.MustCompile(markerLead + `agent_blocked[ \t]*:([^\r\n]*)`)
+
+// reviewVerdictMarkerPattern is the line-anchored marker rule for the
+// structured review outcome (see scanReviewVerdict): `REVIEW_VERDICT` +
+// separator + one of APPROVE | APPROVE_WITH_FOLLOWUPS | REQUEST_CHANGES
+// (group 1) ending at a word boundary, so `REVIEW_VERDICT: APPROVED` does
+// not count.
+const reviewVerdictMarkerPattern = markerLead + `review_verdict` + markerSeparator +
+	`(approve_with_followups|approve|request_changes)\b`
 
 // _ silences unused-import warnings for json when the package only
 // imports it transitively. Kept so future hooks can re-enable.
