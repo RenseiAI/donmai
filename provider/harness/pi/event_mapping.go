@@ -166,11 +166,14 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		st.accCostUSD += floatField(mapField(usage, "cost"), "total")
 		st.accTurns++
 		return []agent.Event{agent.LlmCallEvent{
-			System:       stringField(msg, "provider", "system"),
-			Model:        stringField(msg, "model"),
-			InputTokens:  in,
-			OutputTokens: outTok,
-			UsageSource:  agent.LlmUsageProvider,
+			System: stringField(msg, "provider", "system"),
+			Model:  stringField(msg, "model"),
+			// Pi pre-fills provider/model from its selected catalog entry.
+			// responseModel alone is native response evidence when supplied.
+			ResponseModel: stringField(msg, "responseModel"),
+			InputTokens:   in,
+			OutputTokens:  outTok,
+			UsageSource:   agent.LlmUsageProvider,
 		}}, false
 
 	case "agent_end":

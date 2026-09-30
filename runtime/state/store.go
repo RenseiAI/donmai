@@ -60,6 +60,12 @@ type State struct {
 	// existed; readers render that as unknown.
 	Harness string `json:"harness,omitempty"`
 
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// Model is the resolved model id (e.g. "claude-sonnet-4-5"). Empty on
 	// state written before the field existed; readers render that as unknown.
 	Model string `json:"model,omitempty"`

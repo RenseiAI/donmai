@@ -835,6 +835,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.SessionID = qw.SessionID
 		s.ProviderName = provider.Name()
 		s.Harness = selection.Harness.ID
+		s.AgentCardID = qw.AgentCardID
+		s.AgentCardName = qw.AgentCardName
 		s.Model = qw.ResolvedProfile.Model
 		s.ModelProvider = spanruntime.ProviderSystem(provider.Name())
 		s.WorkType = qw.WorkType

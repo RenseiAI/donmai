@@ -40,6 +40,12 @@ type QueuedWork struct {
 	// provider-native session id.
 	SessionName string `json:"sessionName,omitempty"`
 
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// IssueID is the Linear issue UUID this session was triggered for.
 	// May be empty for governor-generated sessions.
 	IssueID string `json:"issueId,omitempty"`

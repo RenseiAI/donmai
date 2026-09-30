@@ -260,11 +260,19 @@ func mapAssistant(line []byte) []agent.Event {
 		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.StopReason != "" {
 		out = append(out, agent.LlmCallEvent{
 			Model:             a.Message.Model,
+			ResponseModel:     a.Message.Model,
 			InputTokens:       a.Message.Usage.InputTokens,
 			OutputTokens:      a.Message.Usage.OutputTokens,
 			CachedInputTokens: a.Message.Usage.CacheReadInputTokens,
 			FinishReason:      a.Message.StopReason,
 			UsageSource:       agent.LlmUsageProvider,
+		})
+	} else if a.Message.Model != "" {
+		// A response model is not usage. Keep older emitters' terminal
+		// aggregate fallback intact by observing it as status metadata.
+		out = append(out, agent.SystemEvent{
+			Subtype:       agent.SystemSubtypeModelIdentity,
+			ObservedModel: &agent.ObservedModelIdentity{Model: a.Message.Model},
 		})
 	}
 	for _, block := range a.Message.Content {

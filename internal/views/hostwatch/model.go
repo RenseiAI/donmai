@@ -199,6 +199,9 @@ func (m *Model) pollTails() tea.Cmd {
 			if err != nil {
 				continue // I/O hiccup — skip this tailer this tick
 			}
+			for i := range evs {
+				evs[i].source = t
+			}
 			batch = append(batch, evs...)
 			if len(batch) >= maxLinesPerTick {
 				break
@@ -328,7 +331,18 @@ func (m *Model) applySnapshot(snap Snapshot) {
 		}
 		for i := range snap.Cards {
 			if prev, ok := kept[snap.Cards[i].SessionID]; ok {
-				snap.Cards[i].retainFolded(prev)
+				if snap.Cards[i].sameObservedRun(prev) {
+					snap.Cards[i].retainFolded(prev)
+				} else {
+					delete(m.tailers, snap.Cards[i].SessionID)
+					// The log has no per-row run identity for old status
+					// observations. On a proven replacement run, attach at
+					// its current end even under --replay; old bytes cannot
+					// become observations attributed to the new reader.
+					if path := snap.Cards[i].EventsPath(); path != "" {
+						m.tailers[snap.Cards[i].SessionID] = NewTailer(snap.Cards[i].SessionID, path, true, m.now)
+					}
+				}
 			}
 		}
 		m.cards = snap.Cards
@@ -383,6 +397,9 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 	}
 	var lines []string
 	for _, ev := range events {
+		if ev.source != nil && m.tailers[ev.SessionID] != ev.source {
+			continue // old asynchronous batch from a removed/replaced reader
+		}
 		label := m.labels[ev.SessionID]
 		idx := m.prefixes.get(ev.SessionID)
 		if line := formatStreamLine(m.theme, ev, label, idx, m.opts.Plain); line != "" {
@@ -408,6 +425,14 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 // card generation onto a refreshed card for the same session. Index polls
 // carry identity and header fields only; without this the refresh would
 // zero tool counts, cost/turns, activity text and freshness every tick.
+// sameObservedRun uses the runner's persisted start observation, not daemon
+// admission time: re-adoption can change AcceptedAt while the runner survives.
+// An absent start is not evidence of another run. Session removal separately
+// removes both card and tailer, and a later same-ID entry starts a fresh reader.
+func (c SessionCard) sameObservedRun(prev SessionCard) bool {
+	return c.StartedAtUnixMs <= 0 || prev.StartedAtUnixMs <= 0 || c.StartedAtUnixMs == prev.StartedAtUnixMs
+}
+
 func (c *SessionCard) retainFolded(prev SessionCard) {
 	c.ToolCalls = prev.ToolCalls
 	c.LastTool = prev.LastTool
@@ -419,6 +444,9 @@ func (c *SessionCard) retainFolded(prev SessionCard) {
 	c.MetricsReported = prev.MetricsReported
 	c.LastWorkAt = prev.LastWorkAt
 	c.LastOutputAt = prev.LastOutputAt
+	c.ActualModel = prev.ActualModel
+	c.ActualModelProvider = prev.ActualModelProvider
+	c.ActualModelVersion = prev.ActualModelVersion
 }
 
 // foldMetrics updates the live per-card metrics from one event. Cards are
@@ -452,6 +480,14 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			c.LastWorkAt = ev.EventAt()
 		}
 	case agent.LlmCallEvent:
+		// Only explicit native response metadata identifies the serving model.
+		// Replace the whole observation, including absent components, so a
+		// fallback model cannot inherit another response's provider/version.
+		if !e.Synthetic && (e.ResponseModel != "" || e.ResponseModelProvider != "" || e.ModelSnapshotID != "") {
+			c.ActualModel = e.ResponseModel
+			c.ActualModelProvider = e.ResponseModelProvider
+			c.ActualModelVersion = e.ModelSnapshotID
+		}
 		// A model call with usage is meaningful work even without a tool
 		// invocation; a call without usage is an observation only.
 		if e.InputTokens > 0 || e.OutputTokens > 0 {
@@ -461,7 +497,16 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		} else if live {
 			c.LastOutputAt = ev.EventAt()
 		}
-	case agent.ToolResultEvent, agent.ToolProgressEvent, agent.SystemEvent:
+	case agent.SystemEvent:
+		if e.Subtype == agent.SystemSubtypeModelIdentity && e.ObservedModel != nil {
+			c.ActualModel = e.ObservedModel.Model
+			c.ActualModelProvider = e.ObservedModel.Provider
+			c.ActualModelVersion = e.ObservedModel.Version
+		}
+		if live {
+			c.LastOutputAt = ev.EventAt()
+		}
+	case agent.ToolResultEvent, agent.ToolProgressEvent:
 		if live {
 			c.LastOutputAt = ev.EventAt()
 		}

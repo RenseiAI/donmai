@@ -34,6 +34,12 @@ type SessionDetail struct {
 	// SessionID is the platform session UUID. Always populated.
 	SessionID string `json:"sessionId"`
 
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// SessionName is the canonical user-facing name projected onto the native
 	// harness session. It remains unchanged across daemon and runner hops.
 	SessionName string                 `json:"sessionName,omitempty"`

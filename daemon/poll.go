@@ -48,6 +48,12 @@ type PollWorkItem struct {
 	// SessionName is forwarded opaquely to the selected native harness.
 	SessionName string `json:"sessionName,omitempty"`
 
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// AdmissionReceipt is forwarded opaquely to the per-session runner payload.
 	// The daemon does not interpret or reconstruct this closed contract.
 	AdmissionReceipt json.RawMessage `json:"admissionReceipt,omitempty"`
@@ -1271,6 +1277,8 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
 	spec := SessionSpec{
 		SessionID:              item.SessionID,
+		AgentCardID:            item.AgentCardID,
+		AgentCardName:          item.AgentCardName,
 		OrganizationID:         item.OrganizationID,
 		ProjectID:              item.ProjectID,
 		RepositoryID:           item.RepositoryID,
@@ -1496,6 +1504,8 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 	detail := &SessionDetail{
 		SessionID:               item.SessionID,
 		SessionName:             item.SessionName,
+		AgentCardID:             item.AgentCardID,
+		AgentCardName:           item.AgentCardName,
 		AdmissionReceipt:        bytes.Clone(item.AdmissionReceipt),
 		ClaimReceipt:            bytes.Clone(item.ClaimReceipt),
 		EffectiveCell:           bytes.Clone(item.EffectiveCell),

@@ -128,3 +128,15 @@ func TestMapLine_emptyLine(t *testing.T) {
 		t.Errorf("expected nil events for empty line, got %v", evs)
 	}
 }
+
+func TestResponseModelFromNativeOllamaChunk(t *testing.T) {
+	t.Parallel()
+	events, err := mapLine([]byte(`{"model":"native-response-id","done":true}`))
+	if err != nil {
+		t.Fatal(err)
+	}
+	call, ok := events[0].(agent.LlmCallEvent)
+	if !ok || call.ResponseModel != "native-response-id" || call.ResponseModelProvider != "ollama" || call.ModelSnapshotID != "" {
+		t.Fatalf("response identity = %+v; exact version must remain unknown", events[0])
+	}
+}

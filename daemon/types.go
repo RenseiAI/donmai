@@ -123,6 +123,13 @@ const worktreeModeShared = "shared"
 // path.
 type SessionSpec struct {
 	SessionID string `json:"sessionId"`
+
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	// OrganizationID is the organization half of the canonical session
 	// lifecycle identity. It is additive because standalone and legacy dispatch
 	// paths have no organization boundary; those paths continue to use the
@@ -247,6 +254,12 @@ type SessionResources struct {
 // ADR-2026-06-13-daemon-sessionhandle-enrichment (amends
 // ADR-2026-05-07-daemon-http-control-api).
 type SessionHandle struct {
+	// AgentCardID and AgentCardName identify the explicitly dispatched agent
+	// composition. Display annotations only; never inferred from work type,
+	// model profile, harness, or provider. Empty means not reported.
+	AgentCardID   string `json:"agentCardId,omitempty"`
+	AgentCardName string `json:"agentCardName,omitempty"`
+
 	SessionID  string       `json:"sessionId"`
 	PID        int          `json:"pid"`
 	AcceptedAt string       `json:"acceptedAt"`

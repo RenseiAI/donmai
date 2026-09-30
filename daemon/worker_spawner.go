@@ -1161,6 +1161,8 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 		ProjectName:   project.ID,
 		Repository:    spec.Repository,
 		Harness:       spec.Harness,
+		AgentCardID:   spec.AgentCardID,
+		AgentCardName: spec.AgentCardName,
 		Model:         spec.Model,
 		ModelProvider: spec.Company,
 		WorkType:      spec.WorkType,

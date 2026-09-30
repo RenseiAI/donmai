@@ -5,6 +5,9 @@ import (
 	"image/color"
 	"strings"
 	"time"
+	"unicode"
+
+	"github.com/charmbracelet/x/ansi"
 
 	"charm.land/lipgloss/v2"
 	"github.com/RenseiAI/tui-components/format"
@@ -64,9 +67,19 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		work = "unknown"
 	}
 
-	// The model card is assigned outside this repository; there is no
-	// local source for it, so it always renders as unknown rather than
-	// inventing a value.
+	// Dispatch composition and observed serving identity are independent of
+	// the requested model and harness. Missing components stay explicit.
+	agentCard := "Agent card " + safeIdentityText(card.AgentCardName)
+	cardID := "Card ID " + safeIdentityText(card.AgentCardID)
+	modelIdentity := "Model identity " + safeIdentityText(card.ActualModel)
+	actualProvider := "Actual provider " + safeIdentityText(card.ActualModelProvider)
+	modelVersion := "Model version " + safeIdentityText(card.ActualModelVersion)
+	// Plain cards also reserve one physical row per identity component.
+	agentCard = truncateWidth(agentCard, cardWidth-2)
+	cardID = truncateWidth(cardID, cardWidth-2)
+	modelIdentity = truncateWidth(modelIdentity, cardWidth-2)
+	actualProvider = truncateWidth(actualProvider, cardWidth-2)
+	modelVersion = truncateWidth(modelVersion, cardWidth-2)
 	identity := fmt.Sprintf("harness %s · model %s",
 		unknownIfEmpty(card.Harness),
 		unknownIfEmpty(card.Model))
@@ -113,6 +126,9 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		if scope != "" {
 			fmt.Fprintf(&b, "  %s\n", scope)
 		}
+		for _, line := range []string{agentCard, cardID, modelIdentity, actualProvider, modelVersion} {
+			fmt.Fprintf(&b, "  %s\n", line)
+		}
 		fmt.Fprintf(&b, "  %s\n", identity)
 		fmt.Fprintf(&b, "  %s\n", state)
 		fmt.Fprintf(&b, "  %s\n", metrics)
@@ -136,6 +152,11 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	}
 	header = truncateWidth(header, inner-4)
 	work = truncateWidth(work, inner-4)
+	agentCard = truncateWidth(agentCard, inner)
+	cardID = truncateWidth(cardID, inner)
+	modelIdentity = truncateWidth(modelIdentity, inner)
+	actualProvider = truncateWidth(actualProvider, inner)
+	modelVersion = truncateWidth(modelVersion, inner)
 	identity = truncateWidth(identity, inner)
 	state = truncateWidth(state, inner)
 	scope = truncateWidth(scope, inner)
@@ -160,6 +181,8 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		lines = append(lines, chipStyle.Render(scope))
 	}
 	lines = append(lines,
+		chipStyle.Render(agentCard), chipStyle.Render(cardID),
+		chipStyle.Render(modelIdentity), chipStyle.Render(actualProvider), chipStyle.Render(modelVersion),
 		chipStyle.Render(identity), chipStyle.Render(state),
 		metricStyle.Render(metrics), metricStyle.Render(cost),
 		chipStyle.Render(fresh), chipStyle.Render(workFresh))
@@ -335,4 +358,17 @@ func truncateRunes(s string, n int) string {
 		return string(r[:n])
 	}
 	return string(r[:n-1]) + "…"
+}
+
+// safeIdentityText removes native VT/OSC/CSI sequences and control characters
+// before row-width budgeting. Preserve printable Unicode; identity is data,
+// never terminal instructions. Plain rendering receives the same protection.
+func safeIdentityText(s string) string {
+	clean := strings.Map(func(r rune) rune {
+		if unicode.IsControl(r) {
+			return -1
+		}
+		return r
+	}, ansi.Strip(s))
+	return unknownIfEmpty(clean)
 }

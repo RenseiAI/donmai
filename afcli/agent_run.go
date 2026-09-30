@@ -1137,6 +1137,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		QueuedWork: prompt.QueuedWork{
 			SessionID:            d.SessionID,
 			SessionName:          d.SessionName,
+			AgentCardID:          d.AgentCardID,
+			AgentCardName:        d.AgentCardName,
 			IssueID:              d.IssueID,
 			IssueIdentifier:      d.IssueIdentifier,
 			LinearSessionID:      d.LinearSessionID,
@@ -1202,6 +1204,9 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
 			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
+		}
+		if d.AgentCardID != admitted.AgentCardID || d.AgentCardName != admitted.AgentCardName {
+			return runner.QueuedWork{}, errors.New("operational payload agent card annotation differs from compatibility mirror")
 		}
 		if err := applyResolvedRepositoryCompatibility(d, &admitted); err != nil {
 			return runner.QueuedWork{}, err
