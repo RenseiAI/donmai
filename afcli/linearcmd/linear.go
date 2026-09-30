@@ -128,7 +128,6 @@ LINEAR_TEAM_NAME can be set to provide a default team for create-issue.`,
 	cmd.AddCommand(newLinearUpdateIssueCmd(ds, bin))
 	cmd.AddCommand(newLinearListCommentsCmd(ds, bin))
 	cmd.AddCommand(newLinearCreateCommentCmd(ds, bin))
-	cmd.AddCommand(newLinearCommentCmd(ds, bin))
 	cmd.AddCommand(newLinearAddRelationCmd(ds, bin))
 	cmd.AddCommand(newLinearListRelationsCmd(ds, bin))
 	cmd.AddCommand(newLinearRemoveRelationCmd(ds, bin))
@@ -967,8 +966,13 @@ func newLinearCreateCommentCmd(ds func() afclient.DataSource, bin string) *cobra
 	)
 
 	cmd := &cobra.Command{
-		Use:          "create-comment <issue-id>",
-		Short:        "Create a comment on an issue",
+		Use:     "create-comment <issue-id>",
+		Aliases: []string{"comment"},
+		Short:   "Create a comment on an issue",
+		Long: `Create a comment on an issue.
+
+The comment spelling remains supported for existing automation.
+Both spellings accept --body or --body-file; file content takes precedence.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1994,58 +1998,6 @@ func newLinearCreateBlockerCmd(ds func() afclient.DataSource, bin string) *cobra
 	cmd.Flags().StringVar(&team, "team", "", "Team name or key (defaults to source issue's team)")
 	cmd.Flags().StringVar(&project, "project", "", "Project name (defaults to source issue's project)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Assignee name or email")
-
-	return cmd
-}
-
-// ─── comment ──────────────────────────────────────────────────────────────────
-
-// newLinearCommentCmd provides the `comment <issue-id> --body <text>` verb used
-// by the backlog groomer to post its run summary. It is a first-class command
-// (rather than an alias for create-comment) so the grooming CLI contract is
-// met exactly: `rensei linear comment <id> --body <text>`.
-func newLinearCommentCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
-	var (
-		body     string
-		bodyFile string
-	)
-
-	cmd := &cobra.Command{
-		Use:          "comment <issue-id>",
-		Short:        "Post a comment on an issue (groomer run summary)",
-		Args:         cobra.ExactArgs(1),
-		SilenceUsage: true,
-		RunE: func(cmd *cobra.Command, args []string) error {
-			resolvedBody, err := resolveFileArg(body, bodyFile)
-			if err != nil {
-				return err
-			}
-			if resolvedBody == "" {
-				return cli.UserError(
-					"--body or --body-file is required",
-					"Usage: "+cmd.UseLine()+" --body \"Comment text\"",
-				)
-			}
-
-			client, err := newLinearClient(ds, bin)
-			if err != nil {
-				return err
-			}
-			comment, err := client.CreateComment(cmd.Context(), args[0], resolvedBody)
-			if err != nil {
-				return fmt.Errorf("create comment: %w", err)
-			}
-
-			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
-				"id":        comment.ID,
-				"body":      comment.Body,
-				"createdAt": comment.CreatedAt,
-			})
-		},
-	}
-
-	cmd.Flags().StringVar(&body, "body", "", "Comment body text")
-	cmd.Flags().StringVar(&bodyFile, "body-file", "", "Path to file containing comment body")
 
 	return cmd
 }
