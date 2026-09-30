@@ -267,10 +267,9 @@ func TestApplyEndpoint_GatewayDoesNotMirrorBuiltinProviderCredential(t *testing.
 
 // TestSpawn_CodeIntelEnforcementDeniedPreTurn is the live-session half of the
 // same claim: a Spec carrying CodeIntelEnforcement must surface the typed
-// denial on the event stream, before the prompt command reaches the wire —
-// the "pre-spawn" half of "typed pre-spawn denial". A caller draining events
-// for this session sees the drop; nothing here silently proceeds as if the
-// field had been honored.
+// denial on the event stream, before any turn output — the "pre-spawn" half
+// of "typed pre-spawn denial". A caller draining events for this session sees
+// the drop; nothing here silently proceeds as if the field had been honored.
 func TestSpawn_CodeIntelEnforcementDeniedPreTurn(t *testing.T) {
 	t.Parallel()
 	body := getStateResponse("ses_ci") +
@@ -302,11 +301,12 @@ func TestSpawn_CodeIntelEnforcementDeniedPreTurn(t *testing.T) {
 		t.Fatalf("no %q SystemEvent in the drained stream (%d events); CodeIntelEnforcement was silently dropped", codeIntelEnforcementUnsupportedSubtype, len(evs))
 	}
 
-	// "Pre-spawn" means the notice is decided and emitted before the turn is
-	// dispatched, not merely before the caller happens to notice: launch()
-	// calls h.emit for this note before it writes the "prompt" wire command,
-	// so the prompt command must still have gone out (the field is a denial
-	// of ITSELF, never of the session).
+	// "Pre-spawn" means the notice is decided at launch, before the turn is
+	// dispatched (launchNotices), and emitted directly behind the session's
+	// InitEvent — ahead of any turn output, never ahead of the InitEvent the
+	// event contract requires first (TestConformance_EventContract pins that
+	// placement). The prompt command must still have gone out: the field is
+	// a denial of ITSELF, never of the session.
 	var sawPrompt bool
 	for _, cmd := range cmds.commands() {
 		if cmd["type"] == "prompt" {

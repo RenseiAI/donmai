@@ -1995,7 +1995,13 @@ func (r *Runner) consumeEvents(
 	// Idle/no-progress watchdog. A resettable timer is reset on every
 	// agent.Event; if no event arrives within r.idleTimeout the session
 	// is wedged-but-channel-alive (the events channel is still open, so
-	// it is not a silent exit, but forward progress has stopped). On
+	// it is not a silent exit, but forward progress has stopped). A tool
+	// call in flight also re-arms the timer: ToolUseEvent marks the call
+	// start and the matching ToolResultEvent (or a terminal/assistant-text
+	// event) clears it, so a legitimate long tool call that streams no
+	// intermediate events does not trip the timer — the bounded tool timeout
+	// (policy extension, 300s) still ends the CALL with an error the agent
+	// sees, while the idle watchdog keeps owning the session. On
 	// expiry we cancel a stream-scoped context and flag obs.noProgress so
 	// the caller classifies FailureNoProgress instead of the generic
 	// FailureTimeout. A non-positive r.idleTimeout disables the watchdog
@@ -2024,6 +2030,25 @@ func (r *Runner) consumeEvents(
 		}
 		idleTimer.Reset(r.idleTimeout)
 	}
+	// toolInFlight tracks tool calls that started (ToolUseEvent) without a
+	// matching result yet, keyed by tool-use id. A call in flight re-arms
+	// the watchdog on expiry instead of ending the session: the bounded
+	// tool timeout still ends the CALL with an error the agent sees.
+	toolInFlight := map[string]struct{}{}
+	// trackToolEvent maintains toolInFlight from the correlated stream.
+	// ToolUseID may be empty on some harnesses; those calls share the ""
+	// key as a single in-flight slot, which is enough to suppress the
+	// watchdog while any unidentified call runs.
+	trackToolEvent := func(ev agent.Event) {
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			toolInFlight[e.ToolUseID] = struct{}{}
+		case agent.ToolResultEvent:
+			delete(toolInFlight, e.ToolUseID)
+		case agent.ResultEvent, agent.ErrorEvent:
+			clear(toolInFlight)
+		}
+	}
 
 	for {
 		select {
@@ -2033,6 +2058,18 @@ func (r *Runner) consumeEvents(
 			// watchdog fired below. obs.noProgress disambiguates the latter.
 			return obs, watchCtx.Err()
 		case <-idleC:
+			if len(toolInFlight) > 0 {
+				// A tool call is still running: treat the call as
+				// progress, not a stall. Re-arm and keep waiting — the
+				// tool's own bounded timeout ends the CALL with an
+				// error the agent can continue from.
+				resetIdle()
+				r.logger.Info("idle watchdog: tool call in flight — re-arming, not cancelling",
+					"sessionId", qw.SessionID,
+					"inFlight", len(toolInFlight),
+				)
+				continue
+			}
 			r.logger.Warn("idle watchdog: no event within window — cancelling stream",
 				"sessionId", qw.SessionID,
 				"idleTimeout", r.idleTimeout.String(),
@@ -2047,6 +2084,7 @@ func (r *Runner) consumeEvents(
 			// Forward progress observed — re-arm the watchdog.
 			resetIdle()
 			for _, correlatedEvent := range traceProcessor.Process(ev) {
+				trackToolEvent(correlatedEvent)
 				appendJSONL(correlatedEvent)
 				r.observeEvent(correlatedEvent, &obs, worktreePath, qw)
 				// Push every correlated/synthetic event to the platform's

@@ -152,6 +152,15 @@ type Handle struct {
 	lengthStopped       map[string]string
 	outputLimitRefusals []outputLimitRefusal
 
+	// launchNotices are the session-scoped SystemEvents launch decides
+	// before the child's first event (an unverified-version label, a typed
+	// Spec-field denial, the per-call timeout bound). They ride directly
+	// behind the session's single InitEvent, never ahead of it: the event
+	// contract (agent/conformance CheckSingleInit) requires the InitEvent to
+	// be first. launch sets the slice before starting the pump and dispatch
+	// alone reads and clears it afterwards, so it needs no lock.
+	launchNotices []agent.Event
+
 	// turnInFlight is true between the first streaming event of a turn and its
 	// turn_end/agent_end — Inject routes to steer while in flight, follow_up
 	// while idle.
@@ -502,8 +511,22 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 			h.signalClosed()
 		}
 		h.emit(e)
+		if e.Kind() == agent.EventInit {
+			h.emitLaunchNotices()
+		}
 	}
 	return fatal
+}
+
+// emitLaunchNotices emits the launch-time notices directly behind the
+// session's InitEvent, once. mapEvent emits exactly one InitEvent per
+// session, so this runs at most once with a non-empty slice; clearing it
+// keeps that true even if the mapper's once-guard ever changed.
+func (h *Handle) emitLaunchNotices() {
+	for _, n := range h.launchNotices {
+		h.emit(n)
+	}
+	h.launchNotices = nil
 }
 
 // executionSucceeded reports whether a tool_execution_end says the call ran

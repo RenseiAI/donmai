@@ -229,3 +229,25 @@ func TestEvent_PolymorphicDispatch(t *testing.T) {
 		}
 	}
 }
+
+// TestToolCallBoundsEvent_SubtypeAndMessage proves the constructor emits the
+// tool_call_bounds subtype with the bound in seconds as its message, and an
+// empty message when no bound is enforced — the receipt the session record
+// carries for the per-call timeout.
+func TestToolCallBoundsEvent_SubtypeAndMessage(t *testing.T) {
+	t.Parallel()
+	got := ToolCallBoundsEvent(300)
+	if got.Subtype != SystemSubtypeToolCallBounds {
+		t.Errorf("Subtype = %q; want %q", got.Subtype, SystemSubtypeToolCallBounds)
+	}
+	if got.Message != "300" {
+		t.Errorf("Message = %q; want %q", got.Message, "300")
+	}
+	empty := ToolCallBoundsEvent(0)
+	if empty.Subtype != SystemSubtypeToolCallBounds {
+		t.Errorf("Subtype = %q; want %q", empty.Subtype, SystemSubtypeToolCallBounds)
+	}
+	if empty.Message != "" {
+		t.Errorf("Message = %q; want empty (no bound enforced)", empty.Message)
+	}
+}

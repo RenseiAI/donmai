@@ -1416,6 +1416,80 @@ func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
 	}
 }
 
+// TestConsumeEvents_IdleWatchdogRearmsWhileToolCallInFlight verifies an
+// in-flight tool call counts as progress: a ToolUseEvent with no matching
+// result yet re-arms the watchdog on expiry instead of ending the session.
+// A 12-minute shell search (the shape that ended a healthy session) stays
+// alive while the tool runs; the tool's own bounded timeout still ends the
+// CALL with an error the agent sees.
+func TestConsumeEvents_IdleWatchdogRearmsWhileToolCallInFlight(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = 30 * time.Millisecond
+
+	events := make(chan agent.Event, 4)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-TOOL-1")}
+
+	// Tool call starts, then silence past one idle window, then the
+	// bounded tool timeout surfaces as a result and the turn ends.
+	events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1"}
+	go func() {
+		time.Sleep(80 * time.Millisecond)
+		events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "Command timed out after 300 seconds", IsError: true}
+		events <- agent.ResultEvent{Success: true}
+	}()
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	if err != nil {
+		t.Fatalf("consumeEvents: %v; want nil (in-flight tool must suppress the watchdog)", err)
+	}
+	if obs.noProgress {
+		t.Fatalf("obs.noProgress = true; want false (in-flight tool call is progress)")
+	}
+	if !obs.terminalSuccess {
+		t.Fatalf("obs.terminalSuccess = false; want true (turn completed after the tool result)")
+	}
+	if obs.toolCalls != 1 {
+		t.Fatalf("obs.toolCalls = %d; want 1", obs.toolCalls)
+	}
+}
+
+// TestConsumeEvents_IdleWatchdogFiresAfterToolResult verifies the re-arm
+// ends when the call does: once the matching ToolResultEvent lands, a
+// further silent window fires the watchdog again.
+func TestConsumeEvents_IdleWatchdogFiresAfterToolResult(t *testing.T) {
+	t.Parallel()
+	r := minimalRunner(t)
+	r.idleTimeout = 30 * time.Millisecond
+
+	events := make(chan agent.Event, 2)
+	handle := &fakeHandle{events: events}
+	wpath := t.TempDir()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-TOOL-2")}
+
+	events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-2"}
+	events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-2", Content: "done"}
+	// Then silence: no terminal event follows.
+
+	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+	defer cancel()
+	enforcer := NewBudgetEnforcer(nil, time.Now())
+
+	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+	if !obs.noProgress {
+		t.Fatalf("obs.noProgress = false; want true (completed call must not suppress the watchdog forever)")
+	}
+	if !errors.Is(err, context.Canceled) {
+		t.Fatalf("err = %v; want context.Canceled", err)
+	}
+}
+
 // recordingSink is a test-only activitySink implementation that
 // captures every Send call for later assertion.
 type recordingSink struct {

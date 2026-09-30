@@ -27,6 +27,20 @@ func newHandshakeToken() string {
 	return hex.EncodeToString(b)
 }
 
+// DefaultToolCallTimeoutSeconds is the bound the policy extension applies
+// to every bash tool call on the headless RPC lane (extensions/donmai-policy.ts
+// resolveBashTimeoutSeconds): a call with no timeout, an invalid timeout, or
+// a timeout above the bound runs with the bound instead. pi's bash tool kills
+// the command at the timeout and reports it as a tool ERROR, so the agent
+// sees the failure and continues — the bound ends the CALL, never the
+// session. 300 stays below the runner's 12-minute no-progress window with
+// margin for model round trips around the call, and the runner's idle
+// watchdog additionally treats an in-flight call as progress. The value is
+// emitted once per session as an agent.SystemSubtypeToolCallBounds event,
+// directly behind the session's InitEvent (see launchNotices), so the session
+// record states the bound it runs at.
+const DefaultToolCallTimeoutSeconds = 300
+
 // Compile-time assertion: pi satisfies the base Provider contract.
 var _ agent.Provider = (*Provider)(nil)
 
@@ -374,6 +388,10 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 
 	client := newRPCClient(stdin, stdout)
 	h := newHandle(client, cmd, spec, token, receipt)
+	// Set before the pump starts (the go statement orders the write before
+	// every read on the pump goroutine); dispatch emits them directly behind
+	// the session's InitEvent. See launchNotices.
+	h.launchNotices = p.launchNotices(spec)
 	go h.run()
 
 	// Fail-closed handshake gate.
@@ -389,26 +407,6 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	case <-ctx.Done():
 		_ = h.Stop(context.Background())
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, ctx.Err())
-	}
-
-	// Handshake verified — the boundary is live. Label unverified versions.
-	if p.unverified {
-		h.emit(agent.SystemEvent{
-			Subtype: unverifiedVersionSubtype,
-			Message: fmt.Sprintf("pi binary version could not be confirmed within [%s, %s]; session proceeds labeled unverified", MinVersion, VerifiedAgainst),
-		})
-	}
-
-	// Typed pre-spawn denial for Spec fields this provider cannot honor: named
-	// on the event stream, before the turn is dispatched, rather than the
-	// silent drop agent.Spec's own doc comment concedes ("unsupported fields
-	// are silently ignored"). Today's only entry is CodeIntelEnforcement; see
-	// codeIntelEnforcementNote.
-	if note := codeIntelEnforcementNote(spec); note != nil {
-		h.emit(agent.SystemEvent{
-			Subtype: codeIntelEnforcementUnsupportedSubtype,
-			Message: note.Reason,
-		})
 	}
 
 	// Resolve the session id (agent_start carries none in the real protocol),
@@ -446,6 +444,46 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		spec.OnProcessSpawned(cmd.Process.Pid)
 	}
 	return h, nil
+}
+
+// launchNotices returns the session-scoped SystemEvents a headless RPC launch
+// states on its event stream, in order. The handle emits them directly
+// behind the session's single InitEvent — never ahead of it, which the event
+// contract forbids (agent/conformance CheckSingleInit) — and so before any
+// turn output. They are emitted only once the handshake has verified and
+// get_state (or agent_start) has resolved the session; a launch that fails
+// closed at the handshake gate emits none.
+func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
+	var notices []agent.Event
+	// The boundary is live by the time these are seen. Label unverified
+	// versions.
+	if p.unverified {
+		notices = append(notices, agent.SystemEvent{
+			Subtype: unverifiedVersionSubtype,
+			Message: fmt.Sprintf("pi binary version could not be confirmed within [%s, %s]; session proceeds labeled unverified", MinVersion, VerifiedAgainst),
+		})
+	}
+	// Typed pre-spawn denial for Spec fields this provider cannot honor: named
+	// on the event stream, before any turn output, rather than the silent drop
+	// agent.Spec's own doc comment concedes ("unsupported fields are silently
+	// ignored"). Today's only entry is CodeIntelEnforcement; see
+	// codeIntelEnforcementNote.
+	if note := codeIntelEnforcementNote(spec); note != nil {
+		notices = append(notices, agent.SystemEvent{
+			Subtype: codeIntelEnforcementUnsupportedSubtype,
+			Message: note.Reason,
+		})
+	}
+	// Bound a single tool call so it cannot end the session: the policy
+	// extension clamps every bash call to DefaultToolCallTimeoutSeconds (or
+	// below) and the runner's idle watchdog treats an in-flight call as
+	// progress. Stated once per session so the record carries the bound the
+	// session runs at. The interactive PTY lane carries no such event: its
+	// handle wraps the shared ptycli driver with no spawn-time event seam, and
+	// its local tool gate answers a narrower channel — see the residual note
+	// on the RPC tool_call hook.
+	notices = append(notices, agent.ToolCallBoundsEvent(DefaultToolCallTimeoutSeconds))
+	return notices
 }
 
 // spawnChild execs `pi --mode rpc …` with cmd.Dir = spec.Cwd, an allowlist-
