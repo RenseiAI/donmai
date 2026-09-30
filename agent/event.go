@@ -112,10 +112,11 @@ func ReasoningEffortEvent(effort EffortLevel) SystemEvent {
 }
 
 // SystemSubtypeToolCallBounds is the SystemEvent subtype a harness emits
-// once per session, after spawn and before any turn output, recording the
-// bound it applies to a single tool call: a call that runs past the bound
-// is stopped and returns an error to the agent, which can then continue —
-// the bound ends the CALL, never the session. Message carries the bound in
+// once per session, after the session's InitEvent (which stays first, per
+// the event contract) and before any turn output, recording the bound it
+// applies to a single tool call: a call that runs past the bound is stopped
+// and returns an error to the agent, which can then continue — the bound
+// ends the CALL, never the session. Message carries the bound in
 // seconds as a decimal integer ("300"), or is empty when the session
 // carries no bound. The activity poster forwards it as a context marker
 // built from that fixed vocabulary, so every session's record states the

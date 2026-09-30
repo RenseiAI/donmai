@@ -123,45 +123,44 @@ func spawnScripted(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncB
 // lines at will; t.Cleanup still closes it.
 func spawnScriptedLive(t *testing.T, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, *io.PipeWriter, error) {
 	t.Helper()
-	if spec.Cwd == "" {
-		spec.Cwd = t.TempDir()
-	}
-	cmds := &syncBuffer{}
-	pr, pw := io.Pipe()
-	t.Cleanup(func() { _ = pw.Close() })
-	p, err := New(Options{
-		skipProcess:      true,
-		stdinOverride:    cmds,
-		stdoutOverride:   pr,
-		handshakeToken:   testHandshakeToken,
-		HandshakeTimeout: 2 * time.Second,
-	})
-	if err != nil {
-		t.Fatalf("New: %v", err)
-	}
-	// preSpawn (typically the handshake) is delivered while Spawn blocks on the
-	// handshake gate.
-	go func() { _, _ = io.WriteString(pw, preSpawn) }()
-	h, err := p.Spawn(context.Background(), spec)
-	if err != nil {
-		_ = pw.Close()
-		return cmds, h, pw, err
-	}
-	// Deliver the rest of the session. The stream is NOT closed here (a real
-	// child keeps stdout open across the session); t.Cleanup closes it. A
-	// body ending in a FATAL event (a policy-bypass abort, extension_error)
-	// makes the pump exit on its own; a body ending in an ordinary completed
-	// turn (agent_settled) does NOT — the pump stays up past it (so a later
-	// Handle.Inject still has somewhere to land) until t.Cleanup's EOF or an
-	// explicit Stop().
-	go func() { _, _ = io.WriteString(pw, body) }()
-	return cmds, h, pw, err
+	return launchScripted(t, scriptedLaunch{spec: spec, preSpawn: preSpawn, body: body})
 }
 
 // resumeScripted mirrors spawnScripted but drives Resume(sessionID, spec)
 // instead of Spawn — the replay/resume half of the D8 pi fixture family.
 func resumeScripted(t *testing.T, sessionID string, spec agent.Spec, preSpawn, body string) (*syncBuffer, agent.Handle, error) {
 	t.Helper()
+	cmds, h, _, err := launchScripted(t, scriptedLaunch{spec: spec, preSpawn: preSpawn, body: body, resumeSessionID: sessionID})
+	return cmds, h, err
+}
+
+// scriptedLaunch configures one launchScripted session.
+type scriptedLaunch struct {
+	spec     agent.Spec
+	preSpawn string
+	body     string
+	// resumeSessionID, when set, drives Resume(resumeSessionID, spec)
+	// instead of Spawn(spec).
+	resumeSessionID string
+	// configure, when set, adjusts the constructed provider before launch
+	// (e.g. to label it unverified, as a version probe would).
+	configure func(*Provider)
+}
+
+// launchScripted is the shared body of the scripted-session helpers: it
+// launches a pi session over an io.Pipe stdout the test controls, so the child
+// cannot race to EOF before launch sends the prompt. preSpawn is written and
+// must be consumed before the handshake gate resolves; body is written after
+// launch returns. The stream is NOT closed after body (a real child keeps
+// stdout open across the session); t.Cleanup closes it. A body ending in a
+// FATAL event (a policy-bypass abort, extension_error) makes the pump exit on
+// its own; a body ending in an ordinary completed turn (agent_settled) does
+// NOT — the pump stays up past it (so a later Handle.Inject still has
+// somewhere to land) until t.Cleanup's EOF or an explicit Stop(). Every
+// command the handle writes is captured.
+func launchScripted(t *testing.T, sl scriptedLaunch) (*syncBuffer, agent.Handle, *io.PipeWriter, error) {
+	t.Helper()
+	spec := sl.spec
 	if spec.Cwd == "" {
 		spec.Cwd = t.TempDir()
 	}
@@ -178,14 +177,24 @@ func resumeScripted(t *testing.T, sessionID string, spec agent.Spec, preSpawn, b
 	if err != nil {
 		t.Fatalf("New: %v", err)
 	}
-	go func() { _, _ = io.WriteString(pw, preSpawn) }()
-	h, err := p.Resume(context.Background(), sessionID, spec)
+	if sl.configure != nil {
+		sl.configure(p)
+	}
+	// preSpawn (typically the handshake) is delivered while launch blocks on
+	// the handshake gate.
+	go func() { _, _ = io.WriteString(pw, sl.preSpawn) }()
+	var h agent.Handle
+	if sl.resumeSessionID != "" {
+		h, err = p.Resume(context.Background(), sl.resumeSessionID, spec)
+	} else {
+		h, err = p.Spawn(context.Background(), spec)
+	}
 	if err != nil {
 		_ = pw.Close()
-		return cmds, h, err
+		return cmds, h, pw, err
 	}
-	go func() { _, _ = io.WriteString(pw, body) }()
-	return cmds, h, err
+	go func() { _, _ = io.WriteString(pw, sl.body) }()
+	return cmds, h, pw, err
 }
 
 // drain reads events from h until the first terminal event (ResultEvent or
@@ -377,9 +386,10 @@ func TestSpawn_EventStreamShape(t *testing.T) {
 }
 
 // TestSpawn_EmitsToolCallBoundsEvent proves the headless RPC lane emits
-// the per-call timeout bound once per session, before the turn is
-// dispatched, so the session record states the bound it runs at: a call
-// that runs past it fails back to the agent while the session continues.
+// the per-call timeout bound once per session, directly behind the session's
+// InitEvent and before any turn output, so the session record states the
+// bound it runs at: a call that runs past it fails back to the agent while
+// the session continues.
 func TestSpawn_EmitsToolCallBoundsEvent(t *testing.T) {
 	t.Parallel()
 	body := getStateResponse("ses_bounds") +
@@ -390,18 +400,12 @@ func TestSpawn_EmitsToolCallBoundsEvent(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 	evs := drain(t, h)
-	var found *agent.SystemEvent
-	for _, e := range evs {
-		if se, ok := e.(agent.SystemEvent); ok && se.Subtype == agent.SystemSubtypeToolCallBounds {
-			cp := se
-			found = &cp
-		}
+	assertLaunchNoticesFollowInit(t, evs, []string{agent.SystemSubtypeToolCallBounds})
+	if _, ok := evs[0].(agent.InitEvent); !ok {
+		t.Fatalf("first event = %T; want the session's InitEvent", evs[0])
 	}
-	if found == nil {
-		t.Fatalf("want one %q SystemEvent among %d events", agent.SystemSubtypeToolCallBounds, len(evs))
-	}
-	if found.Message != "300" {
-		t.Errorf("bounds message = %q; want %q (DefaultToolCallTimeoutSeconds)", found.Message, "300")
+	if se, ok := evs[1].(agent.SystemEvent); ok && se.Message != "300" {
+		t.Errorf("bounds message = %q; want %q (DefaultToolCallTimeoutSeconds)", se.Message, "300")
 	}
 }
 

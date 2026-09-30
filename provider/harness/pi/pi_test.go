@@ -59,24 +59,123 @@ func TestVersionPin_BelowMinFailsConstruction(t *testing.T) {
 // cross-harness conformance suite's full composite (ADR-C row 6): a drained
 // pi session must satisfy every pure event-sequence invariant —
 // CheckSingleInit, CheckTerminalContract, and CheckCompleteAssistantTexts —
-// not the terminal-ordering rule alone. The fixture below exercises all
+// not the terminal-ordering rule alone. The base fixture exercises all
 // three: get_state resolves exactly one InitEvent (first), message_update/
 // message_end buffer into one complete AssistantTextEvent, and agent_settled
 // is the sole terminal event (last).
+//
+// The table also covers every launch-time notice the harness decides before
+// the child's first event (the per-call timeout bound on every session, plus
+// the unverified-version label and the code-intel-enforcement denial when
+// they apply), on Spawn and Resume and whichever of get_state/agent_start
+// resolves the InitEvent: none of them may precede the InitEvent, and each
+// must sit directly behind it, before any turn output.
 func TestConformance_EventContract(t *testing.T) {
 	t.Parallel()
-	body := getStateResponse("ses_conf") +
-		event(map[string]any{"type": "agent_start"}) +
-		event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "done"}}) +
-		event(map[string]any{"type": "message_end"}) +
-		event(map[string]any{"type": "agent_settled"})
-	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
-	if err != nil {
-		t.Fatalf("Spawn: %v", err)
+	textTurn := event(map[string]any{"type": "message_update", "assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "done"}}) +
+		event(map[string]any{"type": "message_end"})
+	cases := []struct {
+		name        string
+		launch      scriptedLaunch
+		wantNotices []string
+	}{
+		{
+			name: "spawn",
+			launch: scriptedLaunch{
+				spec: agent.Spec{Prompt: "hi"},
+				body: getStateResponse("ses_conf") +
+					event(map[string]any{"type": "agent_start"}) +
+					textTurn +
+					event(map[string]any{"type": "agent_settled"}),
+			},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+		},
+		{
+			name: "spawn, init resolved by agent_start before get_state",
+			launch: scriptedLaunch{
+				spec: agent.Spec{Prompt: "hi"},
+				body: event(map[string]any{"type": "agent_start"}) +
+					textTurn +
+					getStateResponse("ses_conf_late") +
+					event(map[string]any{"type": "agent_settled"}),
+			},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+		},
+		{
+			name: "spawn, every launch notice",
+			launch: scriptedLaunch{
+				spec: agent.Spec{
+					Prompt:               "hi",
+					CodeIntelEnforcement: &agent.CodeIntelEnforcement{EnforceUsage: true},
+				},
+				configure: func(p *Provider) { p.unverified = true },
+				body: getStateResponse("ses_conf_notices") +
+					event(map[string]any{"type": "agent_start"}) +
+					textTurn +
+					event(map[string]any{"type": "agent_settled"}),
+			},
+			wantNotices: []string{
+				unverifiedVersionSubtype,
+				codeIntelEnforcementUnsupportedSubtype,
+				agent.SystemSubtypeToolCallBounds,
+			},
+		},
+		{
+			name: "resume",
+			launch: scriptedLaunch{
+				spec:            agent.Spec{Prompt: "continue"},
+				resumeSessionID: "ses_conf_cursor",
+				body: getStateResponse("ses_conf_resumed") +
+					event(map[string]any{"type": "agent_start"}) +
+					event(map[string]any{"type": "agent_settled"}),
+			},
+			wantNotices: []string{agent.SystemSubtypeToolCallBounds},
+		},
 	}
-	evs := drain(t, h)
-	if err := conformance.CheckEventContract(evs); err != nil {
-		t.Errorf("pi session violates the event contract: %v", err)
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			sl := tc.launch
+			sl.preSpawn = handshakeEvent("h1")
+			_, h, _, err := launchScripted(t, sl)
+			if err != nil {
+				t.Fatalf("launch: %v", err)
+			}
+			evs := drain(t, h)
+			if err := conformance.CheckEventContract(evs); err != nil {
+				t.Errorf("pi session violates the event contract: %v", err)
+			}
+			assertLaunchNoticesFollowInit(t, evs, tc.wantNotices)
+		})
+	}
+}
+
+// assertLaunchNoticesFollowInit asserts want names the launch-notice
+// SystemEvent subtypes that sit directly behind the stream's first event (the
+// InitEvent), in order, and that none of them appears anywhere else. A notice
+// that went missing fails here too, so a case cannot pass by never exercising
+// the notice it names.
+func assertLaunchNoticesFollowInit(t *testing.T, evs []agent.Event, want []string) {
+	t.Helper()
+	if len(evs) < 1+len(want) {
+		t.Fatalf("got %d events; want an InitEvent followed by %d launch notices %v", len(evs), len(want), want)
+	}
+	for i, subtype := range want {
+		se, ok := evs[1+i].(agent.SystemEvent)
+		if !ok || se.Subtype != subtype {
+			t.Errorf("event %d = %T %+v; want launch notice %q directly behind the InitEvent", 1+i, evs[1+i], evs[1+i], subtype)
+		}
+	}
+	for _, subtype := range want {
+		n := 0
+		for _, ev := range evs {
+			if se, ok := ev.(agent.SystemEvent); ok && se.Subtype == subtype {
+				n++
+			}
+		}
+		if n != 1 {
+			t.Errorf("launch notice %q appears %d times; want exactly once per session", subtype, n)
+		}
 	}
 }
 
