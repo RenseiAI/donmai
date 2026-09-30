@@ -10,6 +10,18 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.56 — 2026-09-30
+
+### Fixes
+
+- Refuse duplicate code-intelligence parameter keys before binding
+
+### Chores
+
+- Retire the retired CLI harness adapter
+- Gate mutating host control routes behind a per-install bearer token
+- Dispatch via native harness providers
+
 ## v0.72.55 — 2026-09-29
 
 ### Features
