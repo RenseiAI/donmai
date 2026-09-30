@@ -85,11 +85,7 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			case factory != nil:
 				client = factory(cfg)
 			default:
-				if url := resolveHostWatchURL(daemonURL); url != "" {
-					client = afclient.NewDaemonClientFromURL(url)
-				} else {
-					client = afclient.NewDaemonClient(cfg)
-				}
+				client = newHostWatchClient(daemonURL, cfg)
 			}
 
 			repoScope := ""
@@ -119,6 +115,19 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 	cmd.Flags().BoolVar(&plainFlag, "plain", false, "Plain (no color / box) output for non-TTY / CI")
 	cmd.Flags().StringVar(&daemonURL, "daemon-url", "", "Daemon control URL (default: $DONMAI_DAEMON_URL or http://127.0.0.1:7734)")
 	return cmd
+}
+
+// newHostWatchClient builds the production daemon client for host watch.
+// An explicit daemon URL (flag or env) wins over cfg; either way the client
+// carries the operator's control token, so an explicit URL keeps the same
+// auth as the default one. The token is attached on mutating requests only.
+func newHostWatchClient(daemonURL string, cfg afclient.DaemonConfig) *afclient.DaemonClient {
+	if url := resolveHostWatchURL(daemonURL); url != "" {
+		client := afclient.NewDaemonClientFromURL(url)
+		client.SetControlToken(withControlToken(cfg).ControlToken)
+		return client
+	}
+	return afclient.NewDaemonClient(withControlToken(cfg))
 }
 
 // resolveHostWatchURL returns the explicit flag, else the env override, else "".

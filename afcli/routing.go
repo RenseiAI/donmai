@@ -35,7 +35,7 @@ type routingClientFactory func(cfg afclient.DaemonConfig) routingDaemonClient
 
 // defaultRoutingClientFactory is the production factory.
 func defaultRoutingClientFactory(cfg afclient.DaemonConfig) routingDaemonClient {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
 }
 
 // newRoutingCmd returns the `donmai routing` subcommand tree. The ds

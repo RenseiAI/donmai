@@ -42,7 +42,7 @@ type kitClientFactory func(cfg afclient.DaemonConfig) kitDaemonClient
 
 // defaultKitClientFactory is the production factory.
 func defaultKitClientFactory(cfg afclient.DaemonConfig) kitDaemonClient {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
 }
 
 // resolveKitDaemonConfig honours the DONMAI_DAEMON_URL env override

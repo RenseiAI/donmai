@@ -22,6 +22,7 @@ import (
 	daemonRuntime "github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/installer"
 	"github.com/RenseiAI/donmai/internal/anontoken"
+	"github.com/RenseiAI/donmai/internal/statepath"
 )
 
 // daemonDoer is the interface used by daemon subcommands. It is satisfied by
@@ -45,7 +46,51 @@ type daemonClientFactory func(cfg afclient.DaemonConfig) daemonDoer
 
 // defaultDaemonFactory is the production factory — always returns a real client.
 func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
+}
+
+// withControlToken attaches the operator's control token (best-effort) to
+// an outbound daemon config. The token file lives in the operator's state
+// dir; the env names are runner-only, so the token does not travel in a
+// spawned session's environment.
+// The resolver lives here — not in afclient — because this package owns
+// the CLI process environment and afclient stays env-free by policy.
+func withControlToken(cfg afclient.DaemonConfig) afclient.DaemonConfig {
+	if strings.TrimSpace(cfg.ControlToken) != "" {
+		return cfg
+	}
+	cfg.ControlToken = resolveControlToken()
+	return cfg
+}
+
+// resolveControlToken returns the operator's control token (best-effort):
+// the explicit env override wins, otherwise the token file. "" when neither
+// yields one.
+func resolveControlToken() string {
+	if v := strings.TrimSpace(os.Getenv(afclient.ControlTokenEnv)); v != "" {
+		return v
+	}
+	path := controlTokenPath()
+	if path == "" {
+		return ""
+	}
+	tok, err := afclient.LoadControlToken(path)
+	if err != nil {
+		return ""
+	}
+	return strings.TrimSpace(tok)
+}
+
+// controlTokenPath resolves the token file path: the explicit file-env
+// override wins when absolute, otherwise the brand state dir.
+func controlTokenPath() string {
+	if override := strings.TrimSpace(os.Getenv(afclient.ControlTokenFileEnv)); override != "" {
+		if filepath.IsAbs(override) {
+			return override
+		}
+		return ""
+	}
+	return statepath.Resolve(afclient.ControlTokenFileName, "/tmp/.donmai/"+afclient.ControlTokenFileName)
 }
 
 // defaultDaemonLogFile is the default path for the daemon log file per 011.

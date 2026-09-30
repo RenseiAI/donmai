@@ -36,7 +36,7 @@ type workareaClientFactory func(cfg afclient.DaemonConfig) workareaDaemonClient
 
 // defaultWorkareaClientFactory is the production factory.
 func defaultWorkareaClientFactory(cfg afclient.DaemonConfig) workareaDaemonClient {
-	return afclient.NewDaemonClient(cfg)
+	return afclient.NewDaemonClient(withControlToken(cfg))
 }
 
 // workareaEnvDaemonURL — env var that overrides the daemon address for
