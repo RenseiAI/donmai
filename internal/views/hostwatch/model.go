@@ -560,39 +560,138 @@ func (m *Model) render() string {
 // then the scope (only when it narrows the default "all projects" view),
 // then running/queue/uptime/version counters. All values are local (daemon
 // status/stats). The single line is budgeted against the terminal width:
-// the counters pin right, the host-first segment truncates with an
-// ellipsis, and header padding is two spaces (one per side) — the only
-// horizontal chrome the style adds.
+// secondary counters shed (version, then queue/uptime) so a meaningful host
+// prefix stays visible, and the fitted content never exceeds the width
+// (two style-padding cells on the styled path). The full
+// host/project/counters header is preserved whenever it fits.
 func (m *Model) renderHeader() string {
 	scope := m.opts.ProjectLabel
 	if scope == "" {
 		scope = "all projects"
 	}
 	host := m.opts.HostLabel
+	if host == "" {
+		host = "host"
+	}
 	c := m.counters
 
 	left := host
-	if left == "" {
-		left = "host"
-	}
 	if scope != "all projects" {
 		left += " · " + scope
 	}
-	right := fmt.Sprintf("%d running   queue %d   uptime %s",
-		c.Running, c.QueueDepth, format.Duration(int(c.UptimeSeconds)))
+
+	runningPart := fmt.Sprintf("%d running", c.Running)
+	rightFull := fmt.Sprintf("%s   queue %d   uptime %s",
+		runningPart, c.QueueDepth, format.Duration(int(c.UptimeSeconds)))
+	// Counter ladder, fullest first: version, then queue/uptime, shed so a
+	// meaningful host prefix survives narrowing. The bare running count is
+	// the last counter kept; "" is the host-only fallback.
+	rights := []string{rightFull}
 	if c.Version != "" {
-		right += "   v" + c.Version
+		rights = []string{rightFull + "   v" + c.Version, rightFull}
 	}
+	rights = append(rights,
+		runningPart+fmt.Sprintf("   queue %d", c.QueueDepth),
+		runningPart+"   uptime "+format.Duration(int(c.UptimeSeconds)),
+		runningPart,
+		"",
+	)
+	sort.SliceStable(rights, func(i, j int) bool {
+		return lipgloss.Width(rights[i]) > lipgloss.Width(rights[j])
+	})
+
+	left, right, gap := fitHeader(lipgloss.Width(host), left, rights, m.width)
 
 	if m.opts.Plain {
-		left, gap := headerBudget(left, right, m.width)
+		if gap == 0 {
+			return left
+		}
 		return left + strings.Repeat(" ", gap) + right
 	}
-	left, gap := headerBudget(left, right, m.width)
+	if gap == 0 {
+		// Host-only fallback (or a degenerate width the padded header
+		// style cannot fill): emit the fitted host prefix bare rather
+		// than overflowing the terminal.
+		return left
+	}
 	leftStyled := lipgloss.NewStyle().Bold(true).Foreground(m.theme.Accent).Render(left)
 	rightStyled := lipgloss.NewStyle().Foreground(m.theme.TextSecondary).Render(right)
 	content := leftStyled + strings.Repeat(" ", gap) + rightStyled
 	return theme.Header().Width(m.width).Render(content)
+}
+
+// fitHeader selects the fullest right-counter variant that fits beside the
+// host-first left segment within width columns, then budgets the line with
+// headerBudget. It returns the fitted left and right segments and the gap
+// between them. Selection prefers the complete left segment beside full
+// counters (the wide-terminal header is unchanged); as width shrinks it
+// sheds secondary counters to protect a meaningful host prefix (up to 10
+// cells of long host names, the whole of shorter ones); when even the bare
+// running count would crowd out the host it drops the counters and returns
+// the host-only segment with gap 0. width <= 0 keeps the legacy untruncated
+// layout with a two-space gap.
+
+// minHostCells is the minimum meaningful host-prefix width (display cells)
+// the header protects while shedding secondary counters. Shorter host
+// labels are protected whole; longer ones keep at most this prefix before
+// the counters shed further.
+const minHostCells = 5
+
+// maxHostCells caps the protected host prefix so a very long hostname does
+// not pin the full line: beyond this the scope segment truncates first,
+// then the host itself truncates with an ellipsis.
+const maxHostCells = 10
+
+// fitHeader selects the fullest right-counter variant that fits beside the
+// host-first left segment within width columns, then budgets the line with
+// headerBudget. It returns the fitted left and right segments and the gap
+// between them. Selection prefers the complete left segment beside full
+// counters (the wide-terminal header is unchanged); as width shrinks it
+// sheds secondary counters to protect a meaningful host prefix; when even
+// the bare running count would crowd out the host it drops the counters
+// and returns the host-only segment with gap 0. width <= 0 keeps the
+// legacy untruncated layout with a two-space gap.
+func fitHeader(hostW int, left string, rights []string, width int) (string, string, int) {
+	if width <= 0 {
+		if len(rights) == 0 {
+			return left, "", 2
+		}
+		return left, rights[0], 2
+	}
+	avail := width - 2 // header chrome: one padding cell per side
+	if avail < 1 {
+		avail = 1
+	}
+	protected := hostW
+	if protected > maxHostCells {
+		protected = maxHostCells
+	}
+	if protected < minHostCells {
+		protected = minHostCells
+	}
+	for _, right := range rights {
+		if right == "" {
+			// Host-only fallback: no counter fits beside a
+			// meaningful host prefix.
+			return truncateWidth(left, avail), "", 0
+		}
+		rightW := lipgloss.Width(right)
+		maxLeft := avail - rightW - 1 // at least one gap cell
+		if maxLeft < 1 {
+			continue // this counter variant leaves no room; try shorter
+		}
+		if lipgloss.Width(left) <= maxLeft {
+			// Full left segment fits beside these counters.
+			return left, right, avail - lipgloss.Width(left) - rightW
+		}
+		if maxLeft >= protected {
+			fl := truncateWidth(left, maxLeft)
+			return fl, right, avail - lipgloss.Width(fl) - rightW
+		}
+		// A meaningful host prefix would not survive beside these
+		// counters; shed to a shorter variant.
+	}
+	return truncateWidth(left, avail), "", 0
 }
 
 // headerBudget composes a one-line header within width columns: the right
