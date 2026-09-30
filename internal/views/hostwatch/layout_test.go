@@ -175,6 +175,131 @@ func TestModel_HeaderStyledWidthBounded(t *testing.T) {
 	}
 }
 
+func TestModel_HeaderNarrowKeepsHostAndFits(t *testing.T) {
+	// Exact reproduced narrow case: plain 40 columns must keep a meaningful
+	// host prefix and fit the terminal (the old renderer emitted an
+	// ellipsis-led 44-cell line).
+	for _, plain := range []bool{true, false} {
+		m := New(Options{Plain: plain, HostLabel: "studio-test", ProjectLabel: "qa"})
+		m.width, m.height = 40, 40
+		m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+		out := m.renderHeader()
+		body := out
+		if !plain {
+			body = stripANSI(out)
+			body = strings.TrimSpace(body)
+		}
+		body = strings.TrimSpace(body)
+		if w := lipgloss.Width(out); plain && w > 40 {
+			t.Errorf("plain=40: header width %d exceeds 40: %q", w, out)
+		}
+		if w := lipgloss.Width(out); !plain && w != 40 {
+			t.Errorf("styled=40: header width %d, want 40: %q", w, out)
+		}
+		if !strings.HasPrefix(body, "studio-test") {
+			t.Errorf("plain=%v: header must keep the host prefix, got %q", plain, body)
+		}
+		if !strings.Contains(body, "1 running") {
+			t.Errorf("plain=%v: running counter must survive narrowing, got %q", plain, body)
+		}
+	}
+}
+
+func TestModel_HeaderWidthsSweepKeepsHost(t *testing.T) {
+	// 40/80/120/200, styled and plain: the line fits and the host leads.
+	// Wider widths preserve the full counters; narrower ones shed version
+	// then queue/uptime before touching the host.
+	for _, width := range []int{40, 80, 120, 200} {
+		for _, plain := range []bool{true, false} {
+			m := New(Options{Plain: plain, HostLabel: "studio-test", ProjectLabel: "qa"})
+			m.width, m.height = width, 40
+			m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+			out := m.renderHeader()
+			body := out
+			if !plain {
+				body = stripANSI(out)
+				body = strings.TrimSpace(body)
+			}
+			if w := lipgloss.Width(out); plain && w > width {
+				t.Errorf("plain/%d: header width %d exceeds budget: %q", width, w, out)
+			}
+			if w := lipgloss.Width(out); !plain && w != width {
+				t.Errorf("styled/%d: header width %d, want %d", width, w, width)
+			}
+			if !strings.HasPrefix(body, "studio-test") {
+				t.Errorf("plain=%v/%d: host prefix lost: %q", plain, width, body)
+			}
+			if width >= 80 && !strings.Contains(body, "v0.72.55") {
+				t.Errorf("plain=%v/%d: wide header must keep the full counters: %q", plain, width, body)
+			}
+		}
+	}
+}
+
+func TestModel_HeaderNarrowerBoundsHostOnly(t *testing.T) {
+	// Below the width where even the bare running count fits beside a
+	// meaningful host prefix, the header falls back to host-only rather
+	// than an ellipsis-led overflow.
+	for _, width := range []int{16, 20, 24} {
+		for _, plain := range []bool{true, false} {
+			m := New(Options{Plain: plain, HostLabel: "studio-test", ProjectLabel: "qa"})
+			m.width, m.height = width, 40
+			m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+			out := m.renderHeader()
+			body := out
+			if !plain {
+				body = stripANSI(out)
+				body = strings.TrimSpace(body)
+			}
+			if w := lipgloss.Width(out); w > width {
+				t.Errorf("plain=%v/%d: header width %d exceeds budget: %q", plain, width, w, out)
+			}
+			if !strings.HasPrefix(body, "studi") {
+				t.Errorf("plain=%v/%d: meaningful host prefix lost: %q", plain, width, body)
+			}
+		}
+	}
+}
+
+func TestModel_HeaderUnicodeWidthsBounded(t *testing.T) {
+	// CJK host label: display-cell budgets hold on both render paths and
+	// the host prefix survives narrowing.
+	for _, width := range []int{40, 80} {
+		for _, plain := range []bool{true, false} {
+			m := New(Options{Plain: plain, HostLabel: "myhost-\u65e5\u672c\u8a9e", ProjectLabel: "qa"})
+			m.width, m.height = width, 40
+			m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+			out := m.renderHeader()
+			body := out
+			if !plain {
+				body = stripANSI(out)
+				body = strings.TrimSpace(body)
+			}
+			if w := lipgloss.Width(out); w > width {
+				t.Errorf("plain=%v/%d: unicode header width %d exceeds budget: %q", plain, width, w, out)
+			}
+			if !strings.HasPrefix(body, "myhost") {
+				t.Errorf("plain=%v/%d: unicode host prefix lost: %q", plain, width, body)
+			}
+		}
+	}
+}
+
+func TestModel_HeaderWideBaselinePreserved(t *testing.T) {
+	// Wide-header baseline: the full host/scope/counters line is unchanged
+	// where it fits (pins the pre-repair wide rendering against silent
+	// counter-shedding regressions).
+	m := New(Options{Plain: true, HostLabel: "studio-test", ProjectLabel: "qa"})
+	m.width, m.height = 120, 40
+	m.counters = Counters{Running: 1, QueueDepth: 0, UptimeSeconds: 60, Version: "0.72.55"}
+	left := "studio-test · qa"
+	right := "1 running   queue 0   uptime 1m   v0.72.55"
+	want := left + strings.Repeat(" ", 120-2-lipgloss.Width(left)-lipgloss.Width(right)) + right
+	if got := m.renderHeader(); got != want {
+		t.Errorf("wide plain header changed:\n got %q\nwant %q", got, want)
+	}
+}
+
 func TestRenderGrid_SelectedStaysVisibleOnOverflow(t *testing.T) {
 	tm := theme.DefaultTheme()
 	now := time.Now()
