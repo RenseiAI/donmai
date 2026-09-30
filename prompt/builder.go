@@ -32,6 +32,11 @@ const (
 	WorkTypeDevelopment WorkType = "development"
 	WorkTypeQA          WorkType = "qa"
 	WorkTypeResearch    WorkType = "research"
+	// WorkTypeAcceptance renders the QA template: acceptance closes on
+	// the same structured review outcome (verdict plus review verdict),
+	// so its turns need the verdict-marker instruction the QA prompt
+	// carries.
+	WorkTypeAcceptance WorkType = "acceptance"
 )
 
 // ErrEmptyWork is returned by [Builder.Build] when the QueuedWork
@@ -301,7 +306,7 @@ func systemTemplateNameRaymond(qw QueuedWork) string {
 // legacy behavior in [userTemplateName].
 func userTemplateNameRaymond(w WorkType) string {
 	switch w {
-	case WorkTypeQA:
+	case WorkTypeQA, WorkTypeAcceptance:
 		return "user_qa"
 	case WorkTypeResearch:
 		return "user_research"
@@ -542,7 +547,7 @@ func resolveContext(qw QueuedWork) string {
 // runner must never crash on an unrecognised value.
 func userTemplateName(w WorkType) string {
 	switch w {
-	case WorkTypeQA:
+	case WorkTypeQA, WorkTypeAcceptance:
 		return "user_qa.tmpl"
 	case WorkTypeResearch:
 		return "user_research.tmpl"

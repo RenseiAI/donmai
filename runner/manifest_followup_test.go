@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
 	"github.com/RenseiAI/donmai/runtime/state"
+	"github.com/RenseiAI/donmai/runtime/workarea"
 	"github.com/RenseiAI/donmai/runtime/worktree"
 )
 
@@ -60,12 +61,28 @@ type verdictScriptTurn struct {
 // every Inject — steering or a memory inject — runs the next one. It plays the
 // agent's side of the turn-result contract with real files in the session
 // worktree, so the runner's own resolution code is what the tests observe.
+// workareaCaps, when non-nil, replaces the stub manifest's workarea
+// attestation so a scripted session can negotiate a read-only selected
+// repository.
 type verdictScriptProvider struct {
 	agent.HarnessProvider
 	t     *testing.T
 	turns []verdictScriptTurn
 	// prompts records every follow-up prompt injected into the session.
 	prompts []string
+	// workareaCaps, when non-nil, overrides the wrapped harness manifest's
+	// multi-repository workarea attestation.
+	workareaCaps *agent.HarnessCaps
+}
+
+func (p *verdictScriptProvider) Manifest() agent.HarnessManifest {
+	m := p.HarnessProvider.Manifest()
+	if p.workareaCaps != nil {
+		m.Caps.MultiRepositoryWorkareaProtocols = p.workareaCaps.MultiRepositoryWorkareaProtocols
+		m.Caps.RepositoryAuthorityEnforcement = p.workareaCaps.RepositoryAuthorityEnforcement
+		m.Caps.SupportsReadOnlySelectedCWD = p.workareaCaps.SupportsReadOnlySelectedCWD
+	}
+	return m
 }
 
 func (p *verdictScriptProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
@@ -240,6 +257,11 @@ type scriptedSession struct {
 	continuationLimit int
 	// continuationCeiling is Options.TurnContinuationCeiling (0 = default).
 	continuationCeiling int
+	// declaration, when non-nil, provisions the session through the
+	// session-root-v1 workarea protocol with that repository declaration;
+	// the session's legacy Repository is cleared so the primary source
+	// agrees with the declaration's primary entry.
+	declaration *workarea.RepositoryDeclarationV1
 	// budget is the session's stage budget (nil = none).
 	budget *prompt.StageBudget
 	// platform, when set, is the platform double the session posts to, so a
@@ -277,6 +299,13 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		played = cfg.provider(harness)
 	} else {
 		provider = &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
+		if cfg.declaration != nil {
+			provider.workareaCaps = &agent.HarnessCaps{
+				MultiRepositoryWorkareaProtocols: []string{string(workarea.ProtocolSessionRootV1)},
+				RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
+				SupportsReadOnlySelectedCWD:      true,
+			}
+		}
 		played = provider
 	}
 	r := newFollowUpRunner(t, platform.URL, platform.Client(), played, func(o *Options) {
@@ -304,13 +333,23 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	}
 	qw.WorkType = cfg.workType
 	qw.StageBudget = cfg.budget
-	if cfg.repository != "" {
+	switch {
+	case cfg.declaration != nil:
+		qw.RepositoryDeclaration = cfg.declaration
+		for _, repo := range cfg.declaration.Repositories {
+			if repo.Role == workarea.RepositoryRolePrimary {
+				qw.Repository = repo.Source.Repository
+				qw.Ref = repo.Source.Ref
+				break
+			}
+		}
+	case cfg.repository != "":
 		bare := githubRepositoryFixture(t, cfg.repository)
 		for number, target := range cfg.pulls {
 			setPullRef(t, bare, number, target)
 		}
 		qw.Repository = cfg.repository
-	} else {
+	default:
 		qw.Repository = makeBareRepo(t)
 	}
 
