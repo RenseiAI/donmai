@@ -360,7 +360,7 @@ func resolveLabelIDs(ctx context.Context, client labelLister, names []string) ([
 	return ids, nil
 }
 
-// getBlockingIssues returns issues that are blocking the given issue (non-Accepted).
+// getBlockingIssues returns active blockers; Done and Accepted dependencies are ready.
 func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string) ([]map[string]any, error) {
 	relations, err := client.GetIssueRelations(ctx, issueID)
 	if err != nil {
@@ -375,7 +375,7 @@ func getBlockingIssues(ctx context.Context, client linear.Linear, issueID string
 		if err != nil {
 			return nil, fmt.Errorf("get blocking issue %q: %w", rel.IssueID, err)
 		}
-		if blocker.State.Name == "Accepted" {
+		if blocker.State.Name == "Done" || blocker.State.Name == "Accepted" {
 			continue
 		}
 		blockers = append(blockers, map[string]any{
@@ -1503,8 +1503,13 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 
 func newLinearCheckBlockedCmd(ds func() afclient.DataSource, bin string) *cobra.Command {
 	return &cobra.Command{
-		Use:          "check-blocked <issue-id>",
-		Short:        "Check if an issue is blocked",
+		Use:   "check-blocked <issue-id>",
+		Short: "Check if an issue is blocked",
+		Long: `Check active blockers of an issue.
+
+Dependencies named Done or Accepted are ready. Other states, including
+Finished and Delivered, remain active blockers. Use list-relations to inspect
+historical relations, including dependencies that are already ready.`,
 		Args:         cobra.ExactArgs(1),
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, args []string) error {
@@ -1633,8 +1638,14 @@ func newLinearListUnblockedBacklogCmd(ds func() afclient.DataSource, bin string)
 	)
 
 	cmd := &cobra.Command{
-		Use:          "list-unblocked-backlog",
-		Short:        "List unblocked grooming-target issues for a project",
+		Use:   "list-unblocked-backlog",
+		Short: "List unblocked grooming-target issues for a project",
+		Long: `List candidate issues without active blockers for a project.
+
+Dependencies named Done or Accepted are ready. Other states, including
+Finished and Delivered, remain active blockers. Use list-relations to inspect
+historical relations. The --statuses flag selects candidate workflow states;
+dependency readiness does not change that selection.`,
 		SilenceUsage: true,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			// Apply env defaults for grooming scope (brand-neutral DONMAI_* vars).
