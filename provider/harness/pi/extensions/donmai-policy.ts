@@ -91,6 +91,50 @@ const KIND_REFUSAL = "refusal";
 // not be able to wedge a blocking tool_call hook forever.
 const REFUSAL_REGISTER_TIMEOUT_MS = 2000;
 
+// --- Bounded shell-tool execution (one long tool call must not end the session) ---
+//
+// A dispatched seat ran a whole-filesystem search; the command ran past the
+// session's no-progress watchdog and the healthy session was ended, not just
+// the command. Two rails bound that failure here, at the last point that runs
+// before every guarded execution:
+//
+//   - DEFAULT_TOOL_CALL_TIMEOUT_SECONDS (300): a bash call with no timeout,
+//     an invalid timeout, or a timeout above the bound runs with the bound
+//     instead. pi's bash tool kills the command at the timeout and reports
+//     "Command timed out after N seconds" as a tool ERROR — the agent sees
+//     the failure and continues, and the session never waits on one call long
+//     enough to trip its own idle timer. 300 stays below the runner's
+//     12-minute no-progress window with margin for model round trips around
+//     the call.
+//   - withPipefailPrelude: a piped gate (`gate 2>&1 | tail -5`) otherwise
+//     reports tail's exit code, not the gate's. The prelude is idempotent and
+//     carries a `2>/dev/null` guard so a non-bash fallback shell runs the
+//     command unchanged instead of failing on an unknown option.
+//
+// Both are applied by mutating event.input in place after an allow verdict;
+// pi's extension docs guarantee input mutations affect the actual execution.
+// Exported for the scripted conformance fixture
+// (testdata/tool-call-bounds-harness.mjs), which invokes them against this
+// exact source without a running pi process.
+const DEFAULT_TOOL_CALL_TIMEOUT_SECONDS = 300;
+
+export function resolveBashTimeoutSeconds(timeout: unknown): number {
+  if (typeof timeout !== "number" || !Number.isFinite(timeout) || timeout <= 0) {
+    return DEFAULT_TOOL_CALL_TIMEOUT_SECONDS;
+  }
+  return Math.min(timeout, DEFAULT_TOOL_CALL_TIMEOUT_SECONDS);
+}
+
+const PIPEFAIL_PRELUDE = "set -o pipefail 2>/dev/null; ";
+
+export function withPipefailPrelude(command: unknown): string {
+  const text = String(command ?? "");
+  if (text.trimStart().startsWith("set -o pipefail")) {
+    return text;
+  }
+  return PIPEFAIL_PRELUDE + text;
+}
+
 // Built-in tools this extension guards. Every one routes through the Go-side
 // policy engine before it may execute (RPC mode) or the local matcher below
 // (interactive PTY mode, allowed/disallowed-tools channel only).
@@ -637,6 +681,19 @@ export default function activate(pi: ExtensionAPI) {
       };
       if (!decision.allow) {
         return { block: true, reason: decision.reason || "denied by donmai policy" };
+      }
+      // allow: bound the shell call before it executes, then let it run.
+      // The mutation must land before the Go adjudication record is written:
+      // a deny clamps nothing, an allow runs exactly this bounded input.
+      // NOTE (residual): mutating input here means the Go-side
+      // permission_decision audit event for this call still carries the
+      // pre-mutation command text, while pi executes the bounded form —
+      // the timeout clamp and the pipefail prelude are deterministic and
+      // visible on the wire (timeout field, command prefix), not in the
+      // audit message. A future change can re-emit the bounded text.
+      if (tool === "bash" && event?.input && typeof event.input === "object") {
+        event.input.timeout = resolveBashTimeoutSeconds((event.input as any).timeout);
+        event.input.command = withPipefailPrelude((event.input as any).command);
       }
       // allow: returning undefined lets the tool execute.
       return;

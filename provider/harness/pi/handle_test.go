@@ -376,6 +376,35 @@ func TestSpawn_EventStreamShape(t *testing.T) {
 	}
 }
 
+// TestSpawn_EmitsToolCallBoundsEvent proves the headless RPC lane emits
+// the per-call timeout bound once per session, before the turn is
+// dispatched, so the session record states the bound it runs at: a call
+// that runs past it fails back to the agent while the session continues.
+func TestSpawn_EmitsToolCallBoundsEvent(t *testing.T) {
+	t.Parallel()
+	body := getStateResponse("ses_bounds") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "agent_settled"})
+	_, h, err := spawnScripted(t, agent.Spec{Prompt: "hi"}, handshakeEvent("h1"), body)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	evs := drain(t, h)
+	var found *agent.SystemEvent
+	for _, e := range evs {
+		if se, ok := e.(agent.SystemEvent); ok && se.Subtype == agent.SystemSubtypeToolCallBounds {
+			cp := se
+			found = &cp
+		}
+	}
+	if found == nil {
+		t.Fatalf("want one %q SystemEvent among %d events", agent.SystemSubtypeToolCallBounds, len(evs))
+	}
+	if found.Message != "300" {
+		t.Errorf("bounds message = %q; want %q (DefaultToolCallTimeoutSeconds)", found.Message, "300")
+	}
+}
+
 // --- Smoke 4: permission-denial round-trip through the pump ---
 
 func TestSpawn_PermissionDenialRoundTrip(t *testing.T) {

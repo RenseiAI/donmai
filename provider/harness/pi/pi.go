@@ -27,6 +27,19 @@ func newHandshakeToken() string {
 	return hex.EncodeToString(b)
 }
 
+// DefaultToolCallTimeoutSeconds is the bound the policy extension applies
+// to every bash tool call on the headless RPC lane (extensions/donmai-policy.ts
+// resolveBashTimeoutSeconds): a call with no timeout, an invalid timeout, or
+// a timeout above the bound runs with the bound instead. pi's bash tool kills
+// the command at the timeout and reports it as a tool ERROR, so the agent
+// sees the failure and continues — the bound ends the CALL, never the
+// session. 300 stays below the runner's 12-minute no-progress window with
+// margin for model round trips around the call, and the runner's idle
+// watchdog additionally treats an in-flight call as progress. The value is
+// emitted once per session as an agent.SystemSubtypeToolCallBounds event so
+// the session record states the bound it runs at.
+const DefaultToolCallTimeoutSeconds = 300
+
 // Compile-time assertion: pi satisfies the base Provider contract.
 var _ agent.Provider = (*Provider)(nil)
 
@@ -410,6 +423,16 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 			Message: note.Reason,
 		})
 	}
+
+	// Bound a single tool call so it cannot end the session: the policy
+	// extension clamps every bash call to DefaultToolCallTimeoutSeconds (or
+	// below) and the runner's idle watchdog treats an in-flight call as
+	// progress. Emitted once per session, before the turn is dispatched, so
+	// the record states the bound the session runs at. The interactive PTY
+	// lane carries no such event: its handle wraps the shared ptycli driver
+	// with no spawn-time event seam, and its local tool gate answers a
+	// narrower channel — see the residual note on the RPC tool_call hook.
+	h.emit(agent.ToolCallBoundsEvent(DefaultToolCallTimeoutSeconds))
 
 	// Resolve the session id (agent_start carries none in the real protocol),
 	// then bring up the turn. The model + reasoning effort are pinned on the

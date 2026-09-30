@@ -3,6 +3,7 @@ package agent
 import (
 	"encoding/json"
 	"fmt"
+	"strconv"
 )
 
 // EventKind is the discriminant for Event variants.
@@ -108,6 +109,27 @@ const SystemSubtypeReasoningEffort = "reasoning_effort"
 // effort a session was spawned with.
 func ReasoningEffortEvent(effort EffortLevel) SystemEvent {
 	return SystemEvent{Subtype: SystemSubtypeReasoningEffort, Message: string(effort)}
+}
+
+// SystemSubtypeToolCallBounds is the SystemEvent subtype a harness emits
+// once per session, after spawn and before any turn output, recording the
+// bound it applies to a single tool call: a call that runs past the bound
+// is stopped and returns an error to the agent, which can then continue —
+// the bound ends the CALL, never the session. Message carries the bound in
+// seconds as a decimal integer ("300"), or is empty when the session
+// carries no bound. The activity poster forwards it as a context marker
+// built from that fixed vocabulary, so every session's record states the
+// bound it ran at.
+const SystemSubtypeToolCallBounds = "tool_call_bounds"
+
+// ToolCallBoundsEvent builds the SystemSubtypeToolCallBounds event for the
+// per-tool-call timeout bound a session was spawned with, in seconds.
+// A non-positive bound means no bound is enforced.
+func ToolCallBoundsEvent(boundSeconds int) SystemEvent {
+	if boundSeconds <= 0 {
+		return SystemEvent{Subtype: SystemSubtypeToolCallBounds}
+	}
+	return SystemEvent{Subtype: SystemSubtypeToolCallBounds, Message: strconv.Itoa(boundSeconds)}
 }
 
 // AssistantTextEvent carries an incremental assistant-text output chunk.

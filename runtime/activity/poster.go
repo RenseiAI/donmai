@@ -9,6 +9,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"strconv"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -751,6 +752,12 @@ func mapEvent(ev agent.Event, ts time.Time, providerName string, durationMs int6
 			out.ContextKey = ReasoningEffortContextKey
 			out.ContextValue = ReasoningEffortContextValue(effort)
 			return out, true
+		case agent.SystemSubtypeToolCallBounds:
+			out.Type = "context"
+			out.Content = ToolCallBoundsContent(e.Message)
+			out.ContextKey = ToolCallBoundsContextKey
+			out.ContextValue = ToolCallBoundsContextValue(e.Message)
+			return out, true
 		}
 		// Every other subtype (including interactive start/end, turn_started,
 		// command_progress, diff_updated, compaction, and unknown values) stays
@@ -801,6 +808,48 @@ func ReasoningEffortContent(effort agent.EffortLevel) string {
 	default:
 		return reasoningEffortUnknownContent
 	}
+}
+
+// ToolCallBoundsContextKey is the contextKey a tool-call-bounds marker
+// carries, so a control plane can read the per-call bound a session ran at
+// without parsing Content.
+const ToolCallBoundsContextKey = "toolCallTimeoutSeconds"
+
+// toolCallBoundsNotConfiguredContent is the fixed text forwarded when the
+// session carries no per-call bound; toolCallBoundsContentPrefix prefixes
+// the bound itself. Fixed for the same reason as the reasoning-effort
+// sentences above: the marker states the bound without forwarding the
+// event's free-form Message.
+const (
+	toolCallBoundsContentPrefix        = "tool call timeout: "
+	toolCallBoundsNotConfiguredContent = "tool call timeout: not configured; a long-running tool call may end the session"
+	toolCallBoundsInvalidContent       = "tool call timeout: the configured value is not a positive number of seconds"
+)
+
+// ToolCallBoundsContextValue is the contextValue of a tool-call-bounds
+// marker: the bound in seconds when Message parses as a positive integer,
+// else one of the two fixed sentinels. Like the Content, it never carries
+// free-form text.
+func ToolCallBoundsContextValue(message string) string {
+	if strings.TrimSpace(message) == "" {
+		return ReasoningEffortNotConfigured
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(message)); err == nil && n > 0 {
+		return strconv.Itoa(n)
+	}
+	return ReasoningEffortUnrecognized
+}
+
+// ToolCallBoundsContent is the fixed-vocabulary activity content for a
+// agent.SystemSubtypeToolCallBounds marker.
+func ToolCallBoundsContent(message string) string {
+	if strings.TrimSpace(message) == "" {
+		return toolCallBoundsNotConfiguredContent
+	}
+	if n, err := strconv.Atoi(strings.TrimSpace(message)); err == nil && n > 0 {
+		return toolCallBoundsContentPrefix + strconv.Itoa(n) + "s (a call that runs past it fails back to the agent; the session continues)"
+	}
+	return toolCallBoundsInvalidContent
 }
 
 // summarizeToolUse produces a short one-line summary of a tool call,
