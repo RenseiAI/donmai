@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/result"
 	"github.com/RenseiAI/donmai/runtime/heartbeat"
@@ -47,6 +48,12 @@ type verdictScriptTurn struct {
 	// toolCalls is how many tool calls (each with its result) the turn makes
 	// before its text: a turn with any is productive.
 	toolCalls int
+	// events are emitted in order after the files and before the tool calls
+	// and text: a turn's model calls (agent.LlmCallEvent usage), tool calls
+	// and messages in the order a harness streams them.
+	events []agent.Event
+	// cost rides the turn's terminal ResultEvent.
+	cost *agent.CostData
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -154,6 +161,9 @@ func (h *verdictScriptHandle) playLocked() {
 			h.t.Errorf("write %s: %v", path, err)
 		}
 	}
+	for _, ev := range turn.events {
+		h.events <- ev
+	}
 	for i := range turn.toolCalls {
 		id := fmt.Sprintf("call-%d-%d", h.next, i)
 		h.events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: id, Input: map[string]any{"command": "go test ./..."}}
@@ -171,7 +181,7 @@ func (h *verdictScriptHandle) playLocked() {
 		close(h.events)
 		return
 	}
-	h.events <- agent.ResultEvent{Success: true, Message: turn.text}
+	h.events <- agent.ResultEvent{Success: true, Message: turn.text, Cost: turn.cost}
 }
 
 func (h *verdictScriptHandle) closeEvents() {
@@ -252,12 +262,20 @@ type scriptedSession struct {
 	// the session's legacy Repository is cleared so the primary source
 	// agrees with the declaration's primary entry.
 	declaration *workarea.RepositoryDeclarationV1
-	turns       []verdictScriptTurn
+	// budget is the session's stage budget (nil = none).
+	budget *prompt.StageBudget
+	// platform, when set, is the platform double the session posts to, so a
+	// test can read the terminal status it received.
+	platform *recordingPlatformServer
+	// provider, when set, replaces verdictScriptProvider: it is built on the
+	// stub harness and plays the session instead of turns.
+	provider func(base agent.HarnessProvider) agent.Provider
+	turns    []verdictScriptTurn
 }
 
 // runScriptedSession runs one scripted session and returns the terminal
-// envelope and the provider, which recorded every follow-up prompt.
-// Provider-error retries do not wait.
+// envelope and the provider, which recorded every follow-up prompt (nil when
+// cfg.provider replaced it). Provider-error retries do not wait.
 func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScriptProvider) {
 	t.Helper()
 	base, err := stub.New()
@@ -268,19 +286,29 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	if !ok {
 		t.Fatal("stub provider is not a HarnessProvider")
 	}
-	platform := newRecordingPlatformServer(t)
+	platform := cfg.platform
+	if platform == nil {
+		platform = newRecordingPlatformServer(t)
+	}
 	if cfg.inject != "" {
 		platform.queueInject(heartbeat.InjectPayload{DeliveryID: "dlv-followup-1", Text: cfg.inject})
 	}
-	provider := &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
-	if cfg.declaration != nil {
-		provider.workareaCaps = &agent.HarnessCaps{
-			MultiRepositoryWorkareaProtocols: []string{string(workarea.ProtocolSessionRootV1)},
-			RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
-			SupportsReadOnlySelectedCWD:      true,
+	var provider *verdictScriptProvider
+	var played agent.Provider
+	if cfg.provider != nil {
+		played = cfg.provider(harness)
+	} else {
+		provider = &verdictScriptProvider{HarnessProvider: harness, t: t, turns: cfg.turns}
+		if cfg.declaration != nil {
+			provider.workareaCaps = &agent.HarnessCaps{
+				MultiRepositoryWorkareaProtocols: []string{string(workarea.ProtocolSessionRootV1)},
+				RepositoryAuthorityEnforcement:   string(workarea.RepositoryAuthorityIsolatedReadOnlyV1),
+				SupportsReadOnlySelectedCWD:      true,
+			}
 		}
+		played = provider
 	}
-	r := newFollowUpRunner(t, platform.URL, platform.Client(), provider, func(o *Options) {
+	r := newFollowUpRunner(t, platform.URL, platform.Client(), played, func(o *Options) {
 		o.TurnContinuationLimit = cfg.continuationLimit
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 	})
@@ -304,6 +332,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		ResolvedProfile: ResolvedProfile{Provider: agent.ProviderStub},
 	}
 	qw.WorkType = cfg.workType
+	qw.StageBudget = cfg.budget
 	switch {
 	case cfg.declaration != nil:
 		qw.RepositoryDeclaration = cfg.declaration

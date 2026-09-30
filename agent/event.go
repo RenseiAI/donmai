@@ -318,6 +318,11 @@ func (ResultEvent) isAgentEvent()   {}
 // ErrorEvent is a non-recoverable provider error fired before any
 // terminal ResultEvent. The provider closes the events channel after
 // emitting an ErrorEvent. Verbatim port of AgentErrorEvent.
+//
+// The one exception is an ErrorEvent with SessionContinues set: an error
+// the provider reports for the record while the session runs on to its own
+// terminal. It is not the session's terminal, so a consumer records it but
+// never treats it as the session's failure.
 type ErrorEvent struct {
 	// Message is the human-readable error message.
 	Message string `json:"message"`
@@ -325,6 +330,11 @@ type ErrorEvent struct {
 	// Code is an optional provider-defined error code (e.g.
 	// "spawn_no_result", "rate_limited").
 	Code string `json:"code,omitempty"`
+
+	// SessionContinues marks an error the provider reports without ending
+	// the session: the stream carries on, and the session ends on its own
+	// terminal event. Such an error is never the session's failure.
+	SessionContinues bool `json:"sessionContinues,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`

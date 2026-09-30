@@ -128,6 +128,7 @@ func Complete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneSh
 //
 // A session that ends with a failure ResultEvent, an ErrorEvent, or no terminal
 // event at all IS an error (distinct from a successful-but-unparseable result).
+// An ErrorEvent that says the session continues (SessionContinues) is not.
 func SpawnComplete(ctx context.Context, h HarnessProvider, req OneShotRequest) (OneShotResult, error) {
 	spec := specFromOneShot(req)
 	sess, err := h.Spawn(ctx, spec)
@@ -173,7 +174,10 @@ drain:
 					failErr = fmt.Errorf("oneshot: session failed: %s", strings.Join(e.Errors, "; "))
 				}
 			case ErrorEvent:
-				failErr = fmt.Errorf("oneshot: session error: %s", e.Message)
+				// An error the session continues past is not its failure.
+				if !e.SessionContinues {
+					failErr = fmt.Errorf("oneshot: session error: %s", e.Message)
+				}
 			}
 		}
 	}

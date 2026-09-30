@@ -8,7 +8,23 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- The session token budget is enforced during the run, not only when a turn
+  ends. The runner meters the usage a harness reports for each model call as
+  the call completes. At four fifths of `maxTokens` it asks the agent to wrap
+  up (commit, push, open the pull request, write the turn result): mid-turn
+  on a harness with a steer channel, otherwise as the next follow-up prompt.
+  At the cap it stops the session at the next turn boundary, never cutting
+  off a running tool call, and starts no further turn.
+- A session whose pull request was verified and whose turn result passed
+  before a budget cap stopped it ends `completed` with `budgetBreach` on the
+  terminal status, instead of failing as `budget-exceeded`. A session that
+  fails at a cap carries `budgetBreach` too.
+- The reported cost counts every turn once. `inputTokens`, `outputTokens` and
+  `totalCostUsd` on the terminal status come from the budget meter, including
+  follow-up turns and the model calls of a turn stopped at the cap, so they
+  equal `budgetReport.observedTokens`.
 
 ## v0.72.56 — 2026-09-30
 

@@ -291,6 +291,12 @@ type statusRequest struct {
 	// stop, retries after a provider error), so the session's record shows how
 	// many were used. Additive; omitted when none was needed.
 	TurnContinuations *agent.TurnContinuations `json:"turnContinuations,omitempty"`
+
+	// BudgetBreach names the session budget cap the runner stopped the
+	// session at: the failure reason on a failed session, and on a completed
+	// one the flag that the delivered work ran over its budget. Additive;
+	// omitted when the session stayed within its budget.
+	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -505,6 +511,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
+		BudgetBreach: r.BudgetBreach,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

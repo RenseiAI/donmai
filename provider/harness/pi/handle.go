@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os/exec"
 	"path/filepath"
+	"reflect"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -72,11 +73,41 @@ type outputLimitRefusal struct {
 // an outputLimitRefusal: an observation, never an error, because nothing ran.
 const outputLimitRefusalSubtype = agent.SystemSubtypeToolCallRefusedOutputLimit
 
+// argumentRejection is one guarded call the RUNTIME rejected before execution
+// because its arguments failed the tool's schema validation. Validation runs
+// before the tool_call hook, so no ruling can exist for such a call. Kept
+// apart from the adjudication registry and from the misses, like
+// outputLimitRefusal, so it is inspectable on the handle as what it is: a
+// call that never ran. The agent already sees the rejection as the call's
+// error result, so the monitor emits nothing more for it.
+type argumentRejection struct {
+	tool   string
+	callID string
+}
+
+// startedCall is what a guarded tool_execution_start said about one call: the
+// tool it named and the arguments the runtime is about to validate.
+type startedCall struct {
+	tool string
+	args any
+}
+
 // adjudicationMissingCode is the non-fatal error code the monitor emits for a
 // guarded tool call that ended without a recorded outcome. Distinct from
 // policy_extension_failed on purpose: that code means the session must stop,
-// this one means one call could not be proven and the session continues.
+// this one means one call could not be proven and the session continues —
+// which the event itself says structurally (agent.ErrorEvent.SessionContinues),
+// so no consumer makes it the session's failure.
 const adjudicationMissingCode = "policy_adjudication_missing"
+
+// Pieces of the runtime's own argument-validation rejection text for a tool
+// call: `Validation failed for tool "<name>":` + "\n", the failed checks, then
+// the marker and the call's arguments as indented JSON. See
+// isArgumentValidationRejection.
+const (
+	argumentValidationPrefix = `Validation failed for tool "`
+	receivedArgumentsMarker  = "\n\nReceived arguments:\n"
+)
 
 const (
 	// abortGrace is how long Stop waits for a clean agent_settled after sending
@@ -152,6 +183,15 @@ type Handle struct {
 	lengthStopped       map[string]string
 	outputLimitRefusals []outputLimitRefusal
 
+	// startedCalls maps the call id of every guarded tool_execution_start in
+	// the current turn to the tool and arguments it named. The runtime emits
+	// the start BEFORE it validates the arguments, so the entry is in place
+	// when a call rejected by validation ends. An entry is taken by the first
+	// guarded end for its id, whatever that end's outcome, and every entry is
+	// dropped at turn_end. Guarded by adjMu; never read as a ruling.
+	startedCalls       map[string]startedCall
+	argumentRejections []argumentRejection
+
 	// launchNotices are the session-scoped SystemEvents launch decides
 	// before the child's first event (an unverified-version label, a typed
 	// Spec-field denial, the per-call timeout bound). They ride directly
@@ -212,6 +252,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		handshakeResult: make(chan error, 1),
 		adjudications:   make(map[string]adjudicationOutcome),
 		lengthStopped:   make(map[string]string),
+		startedCalls:    make(map[string]startedCall),
 		events:          make(chan agent.Event, 256),
 		closed:          make(chan struct{}),
 	}
@@ -397,12 +438,14 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	switch ev.Type {
 	case "message_end":
 		h.noteLengthStoppedToolCalls(ev)
+	case "tool_execution_start":
+		h.noteStartedToolCall(ev)
 	case "turn_end":
 		// pi emits the refused start/end pairs before the turn_end that
 		// closes their turn, so any note still standing here explains nothing
 		// that can legitimately follow — drop it rather than let it excuse a
 		// later end that reuses the id.
-		h.clearLengthStoppedToolCalls()
+		h.clearTurnNotes()
 	}
 
 	// Integrity monitor: every guarded tool_execution_END is matched against
@@ -424,20 +467,24 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 	//     or a verified pre-execution refusal receipt. Nothing to report.
 	//     Likewise a call the runtime refused before execution because its
 	//     assistant message stopped on the output-token limit
-	//     (refusedForOutputLimit): recorded as that refusal, never as a miss.
+	//     (refusedForOutputLimit), or because its arguments failed the tool's
+	//     schema validation (rejectedForInvalidArguments): recorded as that
+	//     refusal, never as a miss.
 	//  3. NO recorded outcome. This cannot distinguish a real bypass from a
 	//     ruling that was lost in transit, an extension-side refusal that
 	//     never reached us, or a call id we could not correlate — so it is
-	//     recorded and surfaced as a NON-fatal error, and the session
-	//     continues. There is no refusal left to deliver at this point: the
-	//     end event is emitted after pi has already finalized the call's
-	//     result, and the only pre-execution hook (tool_call) has long
-	//     returned. Record only is all that is available here.
+	//     recorded and surfaced as a NON-fatal error that says the session
+	//     continues (SessionContinues), and the session continues. There is
+	//     no refusal left to deliver at this point: the end event is emitted
+	//     after pi has already finalized the call's result, and the only
+	//     pre-execution hook (tool_call) has long returned. Record only is
+	//     all that is available here.
 	if ev.Type == "tool_execution_end" {
 		tool := stringField(ev.Fields, "toolName", "tool", "name")
 		callID := toolCallID(ev.Fields)
 		_, claimsRefusal := ev.Fields["preExecutionRefusal"]
 		if isBuiltInTool(tool) || claimsRefusal {
+			started, hasStart := h.takeStartedCall(callID)
 			outcome, ruled := h.adjudication(callID)
 			switch {
 			case ruled && !outcome.allow && executionSucceeded(ev):
@@ -468,12 +515,16 @@ func (h *Handle) dispatch(ev rawEvent) bool {
 					Message: fmt.Sprintf("tool %q (call %q) was refused before execution: its assistant message stopped on the output-token limit, so the runtime did not run it", tool, callID),
 					Raw:     raw(ev),
 				})
+			case hasStart && h.rejectedForInvalidArguments(tool, callID, started, ev):
+				// Never ran. The agent reads the rejection as the call's own
+				// error result (mapped below) and continues from it.
 			default:
 				h.recordMiss(tool, callID)
 				h.emit(agent.ErrorEvent{
-					Message: fmt.Sprintf("policy adjudication missing: tool %q (call %q) ended without a recorded policy ruling — the call is unproven and the session continues", tool, callID),
-					Code:    adjudicationMissingCode,
-					Raw:     raw(ev),
+					Message:          fmt.Sprintf("policy adjudication missing: tool %q (call %q) ended without a recorded policy ruling — the call is unproven and the session continues", tool, callID),
+					Code:             adjudicationMissingCode,
+					SessionContinues: true,
+					Raw:              raw(ev),
 				})
 			}
 		}
@@ -595,11 +646,122 @@ func (h *Handle) noteLengthStoppedToolCalls(ev rawEvent) {
 	}
 }
 
-// clearLengthStoppedToolCalls drops every length-stop note at a turn boundary.
-func (h *Handle) clearLengthStoppedToolCalls() {
+// clearTurnNotes drops every length-stop and started-call note at a turn
+// boundary.
+func (h *Handle) clearTurnNotes() {
 	h.adjMu.Lock()
 	defer h.adjMu.Unlock()
 	clear(h.lengthStopped)
+	clear(h.startedCalls)
+}
+
+// noteStartedToolCall records the tool and arguments of a guarded
+// tool_execution_start. Only SDK-owned event fields are read (the call id,
+// the tool name, and args — the call's arguments exactly as the model sent
+// them, which the runtime then validates).
+func (h *Handle) noteStartedToolCall(ev rawEvent) {
+	tool := stringField(ev.Fields, "toolName", "tool", "name")
+	callID := toolCallID(ev.Fields)
+	if callID == "" || !isBuiltInTool(tool) {
+		return
+	}
+	args, ok := ev.Fields["args"]
+	if !ok {
+		return
+	}
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	h.startedCalls[callID] = startedCall{tool: tool, args: args}
+}
+
+// takeStartedCall removes and returns the started-call note for callID.
+func (h *Handle) takeStartedCall(callID string) (startedCall, bool) {
+	if callID == "" {
+		return startedCall{}, false
+	}
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	started, ok := h.startedCalls[callID]
+	delete(h.startedCalls, callID)
+	return started, ok
+}
+
+// rejectedForInvalidArguments reports whether a guarded end with no ruling is
+// the runtime's own rejection of the call's arguments, and records it as
+// such. The runtime validates a call's arguments against the tool's schema
+// BEFORE the tool_call hook our adjudication rides; a call that fails is
+// finalized as an error result and never runs. All of these must hold, or the
+// call stays unproven (the miss):
+//
+//   - started is this call id's tool_execution_start from the same turn
+//     (noteStartedToolCall), and it named the SAME tool;
+//   - the end event positively reports an error result — an end claiming
+//     SUCCESS ran something, and is never excused here;
+//   - the result is exactly the runtime's rejection for THOSE arguments
+//     (isArgumentValidationRejection).
+func (h *Handle) rejectedForInvalidArguments(tool, callID string, started startedCall, ev rawEvent) bool {
+	if started.tool != tool || !executionErrored(ev) || !isArgumentValidationRejection(tool, started.args, ev) {
+		return false
+	}
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	h.argumentRejections = append(h.argumentRejections, argumentRejection{tool: tool, callID: callID})
+	return true
+}
+
+// isArgumentValidationRejection reports whether a tool_execution_end's result
+// is the runtime's argument-validation rejection of a call to tool with args.
+// That result is a single text part, with no details, reading
+//
+//	Validation failed for tool "<tool>":
+//	  - <path>: <failed check>
+//
+//	Received arguments:
+//	<args as indented JSON>
+//
+// The arguments that close the text must decode to exactly the arguments the
+// call's tool_execution_start carried. That ties the text to this one call's
+// runtime-reported arguments, and an executed built-in does not write a result
+// that both opens with the rejection line and ends in that JSON (doc.go, "The
+// fail-safe fence", says why this reading may only ever excuse a miss).
+func isArgumentValidationRejection(tool string, args any, ev rawEvent) bool {
+	result := mapField(ev.Fields, "result")
+	switch details := result["details"].(type) {
+	case nil:
+	case map[string]any:
+		if len(details) != 0 {
+			return false
+		}
+	default:
+		return false
+	}
+	content, _ := result["content"].([]any)
+	if len(content) != 1 {
+		return false
+	}
+	part, _ := content[0].(map[string]any)
+	text, isText := part["text"].(string)
+	if !isText || stringField(part, "type") != "text" {
+		return false
+	}
+	head := argumentValidationPrefix + tool + "\":\n"
+	at := strings.LastIndex(text, receivedArgumentsMarker)
+	if !strings.HasPrefix(text, head) || at <= len(head) {
+		return false
+	}
+	var received any
+	if err := json.Unmarshal([]byte(text[at+len(receivedArgumentsMarker):]), &received); err != nil {
+		return false
+	}
+	return reflect.DeepEqual(received, args)
+}
+
+// recordedArgumentRejections returns a copy of the calls recorded as rejected
+// by argument validation before execution.
+func (h *Handle) recordedArgumentRejections() []argumentRejection {
+	h.adjMu.Lock()
+	defer h.adjMu.Unlock()
+	return append([]argumentRejection(nil), h.argumentRejections...)
 }
 
 // refusedForOutputLimit reports whether a guarded end with no ruling is the
