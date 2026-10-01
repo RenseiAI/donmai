@@ -651,7 +651,6 @@ type ProvisionSpec struct {
 	// work. It is an in-process contract, not a persisted/wire selector.
 	// False preserves legacy generic ref/tag behavior.
 	RequireBranchBase bool `json:"-"`
-	branchBaseSHA     string
 	// SkipBaseFetch explicitly preserves offline/test behaviour.
 	SkipBaseFetch bool
 	// PullRequest is the optional dispatched-pull-request record. When set,
@@ -773,8 +772,9 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	if fetchErr != nil {
 		return "", fetchErr
 	}
+	var branchBaseSHA string
 	if spec.RequireBranchBase && spec.Strategy == StrategyWorktreeAdd {
-		spec.branchBaseSHA = baseInfo.SHA
+		branchBaseSHA = baseInfo.SHA
 	}
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
@@ -792,7 +792,7 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 					"sessionId", spec.SessionID, "err", probeErr)
 			}
 		}
-		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec)
+		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec, branchBaseSHA)
 		if err == nil {
 			res := &ProvisionResult{
 				Path: dst, WorkareaRoot: root, WorkareaID: workareaID,
@@ -1554,9 +1554,10 @@ func (m *Manager) provisionLayoutOnce(
 	declaration *workarea.NormalizedDeclaration,
 	workareaID string,
 	spec ProvisionSpec,
+	branchBaseSHA string,
 ) (paths map[string]string, acquisition workarea.AcquisitionRecord, resultErr error) {
 	if declaration == nil {
-		if err := m.provisionOnce(ctx, layout.Repository.String(), spec); err != nil {
+		if err := m.provisionOnceWithReference(ctx, layout.Repository.String(), spec, "", branchBaseSHA); err != nil {
 			return nil, workarea.AcquisitionRecord{}, err
 		}
 		paths = make(map[string]string, 1)
@@ -1643,7 +1644,7 @@ func (m *Manager) provisionLayoutOnce(
 			Strategy:    StrategyClone,
 			SparsePaths: append([]string(nil), repository.Source.Paths...),
 		}
-		if err := m.provisionOnceWithReference(ctx, repositoryPath.String(), repositorySpec, seedPaths[repository.Name]); err != nil {
+		if err := m.provisionOnceWithReference(ctx, repositoryPath.String(), repositorySpec, seedPaths[repository.Name], ""); err != nil {
 			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: provision declared repository %q: %w", repository.Name, err)
 		}
 		paths[repository.Name] = filepath.Join(layout.Root.String(), repository.Leaf)
@@ -1678,7 +1679,7 @@ func (m *Manager) provisionLayoutOnce(
 
 // provisionOnce performs one materialization attempt for spec.Strategy.
 func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionSpec) error {
-	return m.provisionOnceWithReference(ctx, dst, spec, "")
+	return m.provisionOnceWithReference(ctx, dst, spec, "", "")
 }
 
 type baseFetchInfo struct {
@@ -1841,7 +1842,7 @@ func normalizeBaseRef(ref string) (string, error) {
 	return ref, nil
 }
 
-func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath string) error {
+func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, spec ProvisionSpec, referencePath, branchBaseSHA string) error {
 	if _, err := os.Stat(dst); err == nil {
 		// Every strategy requires exclusive ownership of the destination.
 		return fmt.Errorf("destination already exists: %s", dst)
@@ -1933,10 +1934,10 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 		}
 		args = append(args, dst)
 		if spec.RequireBranchBase {
-			if !branchTipSHA(spec.branchBaseSHA) {
+			if !branchTipSHA(branchBaseSHA) {
 				return fmt.Errorf("%w: no current branch fetch proof", ErrInvalidBaseRef)
 			}
-			args = append(args, spec.branchBaseSHA)
+			args = append(args, branchBaseSHA)
 		} else if spec.Branch != "" || spec.BaseRef != "" {
 			baseRef := baseRefForSpec(spec)
 			baseRef, refErr := normalizeBaseRef(baseRef)

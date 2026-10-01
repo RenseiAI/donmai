@@ -9,7 +9,9 @@ import (
 	"syscall"
 	"testing"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/daemon"
+	"github.com/RenseiAI/donmai/provider/harness/claude"
 )
 
 const localFactorySyntheticAuth = `{"auth_mode":"chatgpt","tokens":{"id_token":"e30.e30.signature","access_token":"synthetic-access","refresh_token":"synthetic-refresh"}}`
@@ -108,6 +110,8 @@ exit 91
 }
 
 func TestLocalCompilerClaudeChecksModelVersionBeforeLogin(t *testing.T) {
+	t.Setenv("GITHUB_TOKEN", "synthetic-source-only")
+	t.Setenv("NODE_OPTIONS", "synthetic-preload-only")
 	directory := localFactoryBinary(t, "claude", `
 dir="${0%/*}"
 if [ "$1" = '--version' ]; then
@@ -116,6 +120,7 @@ if [ "$1" = '--version' ]; then
  exit 0
 fi
 if [ "$1" = 'auth' ] && [ "$2" = 'status' ] && [ "$3" = '--json' ]; then
+ [ -z "${GITHUB_TOKEN+x}" ] && [ -z "${NODE_OPTIONS+x}" ] || exit 92
  printf 'login\n' >> "$dir/calls"
  printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\n'
  exit 0
@@ -160,6 +165,41 @@ exit 91
 	}
 	if localFactoryCalls(t, directory) != "version\nversion\nlogin\nversion\n" {
 		t.Fatal("failed version revalidation reached login or harness spawn")
+	}
+}
+
+func TestLocalSetupClaudeProbeKeepsIssueSourceCredentialPrivate(t *testing.T) {
+	t.Setenv("HOME", t.TempDir())
+	t.Setenv("GITHUB_TOKEN", "synthetic-source-only")
+	t.Setenv("NODE_OPTIONS", "synthetic-preload-only")
+	directory := localFactoryBinary(t, "claude", `
+if [ "$1" = '--version' ]; then printf '2.1.197 (Claude Code)\n'; exit 0; fi
+if [ "$1" = 'auth' ] && [ "$2" = 'status' ] && [ "$3" = '--json' ]; then
+ [ -z "${GITHUB_TOKEN+x}" ] && [ -z "${NODE_OPTIONS+x}" ] || exit 92
+ printf '{"loggedIn":true,"authMethod":"claude.ai","apiProvider":"firstParty"}\n'
+ exit 0
+fi
+exit 93
+`)
+	resolver := setupResolver{
+		lookPath: func(name string) (string, error) {
+			if name == "claude" {
+				return filepath.Join(directory, name), nil
+			}
+			return "", os.ErrNotExist
+		},
+		checkLogin:        checkNativeSetupLogin,
+		checkModelVersion: claude.CheckModelBinaryVersion,
+		models: func(harness string) []agent.ModelDesc {
+			if harness == "claude-code" {
+				return []agent.ModelDesc{{ID: "claude-sonnet-5", HumanLabel: "Claude Sonnet 5", Hosts: []agent.ServingHost{agent.HostOAuthCLI}}}
+			}
+			return nil
+		},
+	}
+	profiles, err := resolver.Profiles(t.Context())
+	if err != nil || len(profiles) != 1 || profiles[0].Harness != "claude-code" {
+		t.Fatalf("restricted setup observation = %+v, %v", profiles, err)
 	}
 }
 

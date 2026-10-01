@@ -58,7 +58,7 @@ func checkNativeSetupLogin(ctx context.Context, harness, binary string) error {
 	case "codex":
 		return codex.CheckHostSessionLogin(ctx, binary)
 	case "claude-code":
-		return checkLocalClaudeLogin(ctx, binary)
+		return claude.CheckHostSessionLogin(ctx, binary)
 	default:
 		return errors.New("unsupported local harness")
 	}

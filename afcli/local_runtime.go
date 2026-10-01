@@ -6,7 +6,6 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
-	"io"
 	"log/slog"
 	"net"
 	"net/http"
@@ -171,7 +170,7 @@ func newLocalCompiler(identity daemon.LocalRuntimeIdentity, settings *daemon.Loc
 			if err := claude.CheckModelBinaryVersion(ctx, binary, selectedModel); err != nil {
 				return err
 			}
-			return checkLocalClaudeLogin(ctx, binary)
+			return claude.CheckHostSessionLogin(ctx, binary)
 		}
 	default:
 		return fail(errors.New("local runtime supports only Claude Code or Codex"))
@@ -200,38 +199,6 @@ func newLocalCompiler(identity daemon.LocalRuntimeIdentity, settings *daemon.Loc
 	}
 	policy := *settings.ExecutionSecurity
 	return &localRuntimeCompiler{registry: registry, producer: producer, config: config, repositories: append([]daemon.LocalGitHubRepository(nil), settings.Repositories...), security: &policy}, nil
-}
-
-type localAuthStatusBuffer struct{ buffer bytes.Buffer }
-
-func (b *localAuthStatusBuffer) Write(data []byte) (int, error) {
-	if b.buffer.Len()+len(data) > 16<<10 {
-		return 0, errors.New("local auth status exceeded its output bound")
-	}
-	return b.buffer.Write(data)
-}
-
-func (b *localAuthStatusBuffer) Bytes() []byte { return b.buffer.Bytes() }
-
-func checkLocalClaudeLogin(ctx context.Context, binary string) error {
-	ctx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	command := exec.CommandContext(ctx, binary, "auth", "status", "--json")
-	var output localAuthStatusBuffer
-	command.Stdout = &output
-	command.Stderr = io.Discard
-	if err := command.Run(); err != nil {
-		return errors.New("local Claude host login is unavailable")
-	}
-	var status struct {
-		LoggedIn    bool   `json:"loggedIn"`
-		AuthMethod  string `json:"authMethod"`
-		APIProvider string `json:"apiProvider"`
-	}
-	if err := json.Unmarshal(output.Bytes(), &status); err != nil || !status.LoggedIn || status.AuthMethod != "claude.ai" || status.APIProvider != "firstParty" {
-		return errors.New("local Claude runtime requires an authenticated first-party host login")
-	}
-	return nil
 }
 
 type localProviderView struct {
@@ -309,12 +276,25 @@ func newLocalRuntimeComposition(configPath string, current func() *daemon.Config
 	return options, &localProviderView{settings: settings}, nil
 }
 
-func localAgentRegistry(logger *slog.Logger, hints agentRunCtorHints, bin string, mode runner.RuntimeTransportMode) (*runner.Registry, error) {
+func localAgentRegistry(logger *slog.Logger, hints agentRunCtorHints, bin string, mode runner.RuntimeTransportMode, selectedHarness string) (*runner.Registry, error) {
 	registry, err := runner.NewRegistryWithOptions(runner.RegistryOptions{RuntimeTransportMode: mode})
 	if err != nil {
 		return nil, err
 	}
+	selectedProvider := ""
+	switch selectedHarness {
+	case "":
+	case string(agent.HarnessCodex):
+		selectedProvider = string(agent.ProviderCodex)
+	case string(agent.HarnessClaudeCode):
+		selectedProvider = string(agent.ProviderClaude)
+	default:
+		return nil, errors.New("local runtime has no supported admitted harness")
+	}
 	for _, ctor := range agentRunProviderCtors(hints) {
+		if selectedProvider != "" && ctor.name != selectedProvider {
+			continue
+		}
 		provider, err := ctor.new()
 		if err != nil {
 			logger.Warn("local provider unavailable", "provider", ctor.name)

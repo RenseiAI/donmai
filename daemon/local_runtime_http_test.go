@@ -63,15 +63,103 @@ func (c *localHTTPTestCompiler) Revalidate(_ context.Context, e LocalAdmissionEv
 	return ValidateLocalExecutionSecurityEvidence(c.identity.ScopeID, e.OperationalPayload, e.HostPreflight)
 }
 
-type localHTTPTestSource struct{}
+type localHTTPTestSource struct {
+	mu          sync.Mutex
+	pollErr     error
+	publication func(LocalPublicationTask) (LocalPublicationResult, error)
+}
 
-func (*localHTTPTestSource) Poll(context.Context) ([]LocalIntakeRequest, error) { return nil, nil }
+func (s *localHTTPTestSource) Poll(context.Context) ([]LocalIntakeRequest, error) {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return nil, s.pollErr
+}
+
 func (*localHTTPTestSource) Eligible(context.Context, LocalIntakeRequest) (bool, error) {
 	return true, nil
 }
 
-func (*localHTTPTestSource) Publish(context.Context, LocalPublicationTask) (LocalPublicationResult, error) {
+func (s *localHTTPTestSource) Publish(_ context.Context, task LocalPublicationTask) (LocalPublicationResult, error) {
+	s.mu.Lock()
+	publication := s.publication
+	s.mu.Unlock()
+	if publication != nil {
+		return publication(task)
+	}
 	return LocalPublicationResult{}, fmt.Errorf("publication is not exercised by the receiver fixture")
+}
+
+func TestLocalPendingPublicationSurvivesIntakeErrorWithCurrentPolicy(t *testing.T) {
+	for _, policy := range []string{"current", "invalid", "stale-source"} {
+		t.Run(policy, func(t *testing.T) {
+			source := &localHTTPTestSource{}
+			f := startLocalHTTPFixture(t, func(d *Daemon) { d.opts.LocalRuntime.Source = source })
+			admitted := f.admit(t, 19)
+			token := f.claim(t, admitted.Session)
+			ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+			defer cancel()
+			// Join the real background cycle before arranging its next outcome;
+			// the daemon remains Running and cycle itself is the subject below.
+			if err := waitCompletionContext(ctx, f.runtime.beginStop()); err != nil {
+				t.Fatal(err)
+			}
+			body := []byte(fmt.Sprintf(`{"workerId":%q,"status":"failed","summary":"intake error publication fixture"}`, f.runtime.identity.WorkerID))
+			code, raw := f.request(t, http.MethodPost, basePath(admitted.Session.SessionID, "status"), token, body)
+			if code != http.StatusOK {
+				t.Fatalf("actual terminal commit %d: %s", code, raw)
+			}
+			projection, err := f.runtime.store.Session(ctx, f.runtime.identity.ScopeID, admitted.Session.SessionID)
+			if err != nil || projection.Terminal == nil {
+				t.Fatalf("terminal/outbox authority missing: %v", err)
+			}
+			pollErr := errors.New("fixture intake polling failed")
+			var publications atomic.Int32
+			source.mu.Lock()
+			source.pollErr = pollErr
+			source.publication = func(task LocalPublicationTask) (LocalPublicationResult, error) {
+				publications.Add(1)
+				if task.SessionID != admitted.Session.SessionID || task.Status != "failed" || task.Kind != localqueue.PublicationGitHubComment ||
+					task.ResultSHA256 != projection.Terminal.BodySHA256 || task.Key == "" || task.Source.RepositoryID != 42 ||
+					task.Source.OwnerRepo != "example/project" || task.Source.IssueNumber != 19 || task.Source.IssueURL != "https://github.com/example/project/issues/19" ||
+					task.Source.Title != "" || task.Source.Body != "" {
+					return LocalPublicationResult{}, errors.New("publication escaped its actual durable source/result authority")
+				}
+				return LocalPublicationResult{URL: task.Source.IssueURL + "#issuecomment-101", ReadAt: time.Now().UTC().Format(time.RFC3339Nano)}, nil
+			}
+			source.mu.Unlock()
+			if policy != "current" {
+				cfg := f.d.Config()
+				if policy == "invalid" {
+					cfg.LocalRuntime.ExecutionSecurity = nil
+				} else {
+					cfg.LocalRuntime.Repositories[0].Label = "changed-label"
+				}
+				if err := WriteConfig(f.d.opts.ConfigPath, cfg); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if f.d.State() != StateRunning {
+				t.Fatal("fixture must exercise the Running intake path")
+			}
+			cycleErr := f.runtime.cycle(ctx)
+			pending, err := f.runtime.store.PendingPublication(ctx)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if policy != "current" {
+				if cycleErr == nil || publications.Load() != 0 || len(pending) != 1 {
+					t.Fatalf("invalid/stale policy granted publication: err=%v calls=%d pending=%d", cycleErr, publications.Load(), len(pending))
+				}
+				return
+			}
+			if !errors.Is(cycleErr, pollErr) || publications.Load() != 1 || len(pending) != 0 {
+				t.Fatalf("intake failure starved authorized durable publication: err=%v calls=%d pending=%d", cycleErr, publications.Load(), len(pending))
+			}
+			if err := f.runtime.cycle(ctx); !errors.Is(err, pollErr) || publications.Load() != 1 {
+				t.Fatalf("delivered terminal was republished or intake error lost: err=%v calls=%d", err, publications.Load())
+			}
+		})
+	}
 }
 
 type localHTTPFixture struct {

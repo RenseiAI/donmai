@@ -396,10 +396,22 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		agentBin = "donmai"
 	}
 	hints := agentRunHints(detail)
+	selectedLocalHarness := ""
+	if opts.localRuntime {
+		// Only local/v2 replaces the existing constructor hint with an exact
+		// admitted binding. Local/v1 and controller behavior stay unchanged.
+		if opts.localRuntimeContract == string(runner.RuntimeTransportLocalV2) {
+			hints.CodexHostSessionAuth, err = localCodexHostSessionHint(detail)
+			if err != nil {
+				return preflightErr(fmt.Sprintf("local host authentication binding: %v", err))
+			}
+			selectedLocalHarness = detail.ResolvedProfile.Harness
+		}
+	}
 	hints.PiTrustedExtensions = append([]providerpi.TrustedExtensionIdentity(nil), opts.piTrustedExtensions...)
 	var reg *runner.Registry
 	if opts.localRuntime {
-		reg, err = localAgentRegistry(logger, hints, agentBin, localWorkerTransport(opts.localRuntimeContract))
+		reg, err = localAgentRegistry(logger, hints, agentBin, localWorkerTransport(opts.localRuntimeContract), selectedLocalHarness)
 		if err != nil {
 			return preflightErr(err.Error())
 		}
@@ -958,6 +970,79 @@ func codexHostSessionCtorHint(d *daemon.SessionDetail) bool {
 		return d.ResolvedProfile.Provider == string(agent.ProviderCodex)
 	}
 	return d.ResolvedProfile.Runner == string(agent.ProviderCodex)
+}
+
+// localCodexHostSessionHint uses admitted local/v2 bytes instead of the
+// controller's optional AuthMode mirror. It runs before provider construction
+// so an unselected or forged profile cannot cause a host credential lookup.
+func localCodexHostSessionHint(detail *daemon.SessionDetail) (bool, error) {
+	if detail == nil || detail.ResolvedProfile == nil || detail.SessionID == "" || detail.WorkerID == "" {
+		return false, errors.New("local admission has no complete worker identity")
+	}
+	receipt, err := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+	if err != nil {
+		return false, fmt.Errorf("decode local admission receipt: %w", err)
+	}
+	cell, err := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)
+	if err != nil {
+		return false, fmt.Errorf("decode local execution cell: %w", err)
+	}
+	binding, err := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+	if err != nil {
+		return false, fmt.Errorf("decode local runtime binding: %w", err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
+	if err != nil {
+		return false, fmt.Errorf("decode local host adaptation: %w", err)
+	}
+	payloadDigest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		return false, fmt.Errorf("digest local operational payload: %w", err)
+	}
+	admitted := receipt.Value()
+	if admitted.Decision != executioncell.AdmissionAdmitted || admitted.Cell == nil ||
+		admitted.RequestID != detail.SessionID || admitted.OperationalPayloadDigest != payloadDigest ||
+		!reflect.DeepEqual(*admitted.Cell, cell) ||
+		binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion ||
+		binding.RequestID != detail.SessionID || binding.WorkerID != detail.WorkerID ||
+		binding.PlacementID != cell.Placement.ID || binding.ClaimID != "" ||
+		binding.PreflightRegistration == nil || !binding.PreflightRegistration.Required ||
+		host.Decision != "ready" || host.RequestID != detail.SessionID ||
+		host.WorkerID != detail.WorkerID || host.PlacementID != cell.Placement.ID || host.ClaimID != "" ||
+		cell.Placement.Kind != executioncell.PlacementHost || cell.Placement.Resolution != executioncell.PlacementExact ||
+		cell.SessionMode != executioncell.SessionAutonomous ||
+		detail.Harness != cell.Harness.ID || detail.ResolvedProfile.Harness != cell.Harness.ID ||
+		detail.ResolvedProfile.Model != cell.Model.ID || detail.ModelProfile != nil {
+		return false, errors.New("local worker detail disagrees with exact admitted host binding")
+	}
+	endpoint := detail.ResolvedProfile.Endpoint
+	if endpoint == nil || endpoint.EndpointID != cell.Endpoint.ID ||
+		endpoint.EndpointRevision != cell.Endpoint.Revision || endpoint.Protocol != cell.Endpoint.Protocol ||
+		endpoint.EndpointOperator != cell.Endpoint.Operator || endpoint.Model != cell.Model.ID ||
+		endpoint.ModelAuthor != cell.Model.Author || endpoint.AuthBindingID != cell.AuthBinding.ID ||
+		endpoint.Mechanism != string(cell.AuthBinding.Mechanism) ||
+		endpoint.AuthAuthority != cell.AuthBinding.Authority ||
+		endpoint.AuthCommercialMode != string(cell.AuthBinding.CommercialMode) ||
+		endpoint.AuthBindingScope != string(cell.AuthBinding.BindingScope) ||
+		endpoint.AuthPortability != string(cell.AuthBinding.Portability) ||
+		endpoint.AuthDelivery != string(cell.AuthBinding.Delivery) {
+		return false, errors.New("local worker profile differs from admitted endpoint and auth binding")
+	}
+	if cell.Harness.ID == string(agent.HarnessClaudeCode) {
+		return false, nil
+	}
+	if cell.Harness.ID != string(agent.HarnessCodex) || cell.Model.Author != "openai" ||
+		cell.Endpoint.Operator != "openai" || cell.AuthBinding.Authority != "openai" ||
+		cell.AuthBinding.Mechanism != executioncell.AuthCLISession ||
+		cell.AuthBinding.CommercialMode != executioncell.CommercialSubscription ||
+		cell.AuthBinding.BindingScope != executioncell.ScopeHost ||
+		cell.AuthBinding.Portability != executioncell.HostBound ||
+		cell.AuthBinding.Delivery != executioncell.DeliveryHostCLIHomeReference ||
+		endpoint.Company != "openai" || endpoint.Host != string(agent.HostOAuthCLI) ||
+		(detail.ResolvedProfile.AuthMode != "" && detail.ResolvedProfile.AuthMode != string(agent.AuthHostSession)) {
+		return false, errors.New("local Codex host login lacks exact admitted authority")
+	}
+	return true, nil
 }
 
 // opencodeCtorHintKey is the typed ResolvedProfile.ProviderConfig knob that

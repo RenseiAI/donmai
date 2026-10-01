@@ -535,6 +535,40 @@ func TestConcurrentPRReceiptSourcesPostAtMostOnce(t *testing.T) {
 	}
 }
 
+func TestCommentPOSTEchoWithoutIndependentReadbackRemainsHeld(t *testing.T) {
+	fixture := newGitHubFixture(t)
+	fixture.postMode = "echo-only"
+	root := filepath.Join(t.TempDir(), "publication")
+	source := fixture.source(t, root)
+	task := fixtureTask(publicationComment)
+	result, err := source.Publish(context.Background(), task)
+	if !errors.Is(err, ErrAmbiguousPublication) || result.URL != "" || result.ReadAt != "" {
+		t.Fatalf("POST echo without independent remote readback was accepted: %+v, %v", result, err)
+	}
+	fixture.mu.Lock()
+	posts := fixture.postCalls
+	paths := strings.Join(fixture.paths, "\n")
+	comments := len(fixture.comments)
+	fixture.mu.Unlock()
+	if posts != 1 || comments != 0 || !strings.Contains(paths, "GET /repos/acme/repo/issues/comments/101") {
+		t.Fatalf("first attempt did not independently read a single uncertain POST: posts=%d comments=%d paths=%s", posts, comments, paths)
+	}
+	if err := source.Close(); err != nil {
+		t.Fatal(err)
+	}
+	reopened := fixture.source(t, root)
+	result, err = reopened.Publish(context.Background(), task)
+	if !errors.Is(err, ErrAmbiguousPublication) || result.URL != "" || result.ReadAt != "" {
+		t.Fatalf("restart trusted the prior POST echo: %+v, %v", result, err)
+	}
+	fixture.mu.Lock()
+	posts = fixture.postCalls
+	fixture.mu.Unlock()
+	if posts != 1 {
+		t.Fatalf("restart sent %d POSTs after unconfirmed echo, want one", posts)
+	}
+}
+
 func TestFailedCommentIntentPostsOnceAndReplaysAcrossRestart(t *testing.T) {
 	fixture := newGitHubFixture(t)
 	root := filepath.Join(t.TempDir(), "publication")

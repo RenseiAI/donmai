@@ -121,49 +121,52 @@ func (l *localRuntime) cycle(ctx context.Context) error {
 		return err
 	}
 	defer release()
-	if l.daemon.State() == StateRunning {
-		issues, err := source.Poll(ctx)
-		if err != nil {
-			return err
-		}
-		if len(issues) > 1000 {
-			return errors.New("local source exceeded bounded intake batch")
-		}
-		for _, issue := range issues {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			eligible, err := source.Eligible(ctx, issue)
+	intakeErr := func() error {
+		if l.daemon.State() == StateRunning {
+			issues, err := source.Poll(ctx)
 			if err != nil {
 				return err
 			}
-			if !eligible {
-				continue
+			if len(issues) > 1000 {
+				return errors.New("local source exceeded bounded intake batch")
 			}
-			if _, err = l.admitIntake(ctx, issue); err != nil {
+			for _, issue := range issues {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				eligible, err := source.Eligible(ctx, issue)
+				if err != nil {
+					return err
+				}
+				if !eligible {
+					continue
+				}
+				if _, err = l.admitIntake(ctx, issue); err != nil {
+					return err
+				}
+			}
+			pending, err := l.store.PendingDispatch(ctx)
+			if err != nil {
 				return err
 			}
-		}
-		pending, err := l.store.PendingDispatch(ctx)
-		if err != nil {
-			return err
-		}
-		for _, record := range pending {
-			if ctx.Err() != nil {
-				return ctx.Err()
-			}
-			if l.daemon.State() != StateRunning || l.daemon.ActiveSessionCount() >= l.daemon.MaxConcurrentSessions() {
-				break
-			}
-			if err = l.dispatch(ctx, record, source); err != nil {
-				slog.Warn("local dispatch held", "session_id", record.Envelope.Session.SessionID, "error", err)
+			for _, record := range pending {
+				if ctx.Err() != nil {
+					return ctx.Err()
+				}
+				if l.daemon.State() != StateRunning || l.daemon.ActiveSessionCount() >= l.daemon.MaxConcurrentSessions() {
+					break
+				}
+				if err = l.dispatch(ctx, record, source); err != nil {
+					slog.Warn("local dispatch held", "session_id", record.Envelope.Session.SessionID, "error", err)
+				}
 			}
 		}
-	}
+		return nil
+	}()
 	if err := l.sourcePolicyCurrent(); err != nil {
-		return err
+		return errors.Join(intakeErr, err)
 	}
-	return l.publishPending(ctx, source)
+	return errors.Join(intakeErr, l.publishPending(ctx, source))
 }
 
 func (l *localRuntime) dispatch(ctx context.Context, record localqueue.AdmissionRecord, source LocalRuntimeSource) error {

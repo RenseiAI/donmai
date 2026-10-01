@@ -55,7 +55,7 @@ type githubFixture struct {
 	postTargets  []int
 	userCalls    int
 	paths        []string
-	postMode     string // normal, lose-before, lose-after
+	postMode     string // normal, lose-before, lose-after, echo-only
 }
 
 func newGitHubFixture(t *testing.T) *githubFixture {
@@ -126,6 +126,13 @@ func newGitHubFixture(t *testing.T) *githubFixture {
 			if err := json.NewDecoder(io.LimitReader(r.Body, 4096)).Decode(&request); err != nil {
 				w.WriteHeader(http.StatusBadRequest)
 				return
+			}
+			if f.postMode == "echo-only" {
+				w.WriteHeader(http.StatusCreated)
+				_ = json.NewEncoder(w).Encode(fixtureCommentJSON(fixtureComment{
+					ID: 101, Body: request.Body, AuthorID: f.actorID, TargetNumber: targetNumber,
+				}))
+				return // matching response echo, no independently readable comment
 			}
 			if f.postMode != "lose-before" {
 				f.comments = append(f.comments, fixtureComment{ID: int64(100 + f.postCalls), Body: request.Body, AuthorID: f.actorID, TargetNumber: targetNumber})
