@@ -4,6 +4,8 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"net"
+	"net/http"
 	"os"
 	"path/filepath"
 	"strconv"
@@ -193,6 +195,163 @@ func TestDaemonRunRejectsMalformedConfigBeforeTerminalAuthority(t *testing.T) {
 	}
 	if _, statErr := os.Stat(statehome.StateDir("worktrees")); !os.IsNotExist(statErr) {
 		t.Errorf("terminal authority path exists after malformed config: %v", statErr)
+	}
+}
+
+// A skipped first-run wizard must leave default-config construction to
+// Daemon.Start. The command is real: it binds its own loopback listener,
+// performs stub registration, serves healthz, and stops through the authenticated
+// local control API. Every path and token belongs to this test's private home.
+func TestDaemonRunSkippedWizardStartsDefaultStub(t *testing.T) {
+	for _, tc := range []struct {
+		name         string
+		explicitFlag bool
+		envSkip      bool
+	}{
+		{name: "explicit-flag", explicitFlag: true},
+		{name: "non-tty"},
+		{name: "skip-env", envSkip: true},
+	} {
+		quiescenceUnknown := false
+		t.Run(tc.name, func(t *testing.T) {
+			home := t.TempDir()
+			priorHome := statehome.BaseHome()
+			statehome.SetBaseHome(home)
+			t.Cleanup(func() { statehome.SetBaseHome(priorHome) })
+			t.Setenv("HOME", home)
+			t.Setenv("DONMAI_STATE_HOME", home)
+			t.Setenv("DONMAI_DAEMON_FORCE_STUB", "1")
+			t.Setenv("DONMAI_ORCHESTRATOR_URL", "")
+			t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "")
+			t.Setenv(afclient.ControlTokenEnv, "")
+			t.Setenv(afclient.ControlTokenFileEnv, filepath.Join(home, "control-token"))
+			if tc.envSkip {
+				t.Setenv("DONMAI_DAEMON_SKIP_WIZARD", "1")
+			}
+			if !tc.explicitFlag && !tc.envSkip {
+				// go test supplies /dev/null (a character device) to its test
+				// process even when the go command reads a regular file. Install
+				// owned regular-file stdin for this exact no-TTY command case.
+				input, err := os.CreateTemp(home, "non-tty-stdin-")
+				if err != nil {
+					t.Fatal(err)
+				}
+				previousStdin := os.Stdin
+				os.Stdin = input
+				t.Cleanup(func() { os.Stdin = previousStdin; _ = input.Close() })
+				if !daemon.ShouldSkipWizard() {
+					t.Fatal("owned regular-file stdin did not select non-interactive setup")
+				}
+			}
+			listener, err := net.Listen("tcp", "127.0.0.1:0")
+			if err != nil {
+				t.Fatal(err)
+			}
+			port := listener.Addr().(*net.TCPAddr).Port
+			if err := listener.Close(); err != nil {
+				t.Fatal(err)
+			}
+			configPath := filepath.Join(home, "daemon.yaml")
+			cmd := newDaemonRunCmd(Config{HostBinaryVersion: "test"})
+			args := []string{"--config", configPath, "--jwt-path", filepath.Join(home, "daemon.jwt"), "--port", strconv.Itoa(port), "--standalone-creds=off"}
+			if tc.explicitFlag {
+				args = append(args, "--skip-wizard")
+			}
+			cmd.SetArgs(args)
+			var output bytes.Buffer
+			cmd.SetOut(&output)
+			cmd.SetErr(&output)
+			ctx, cancel := context.WithCancel(context.Background())
+			done := make(chan error, 1)
+			go func() { done <- cmd.ExecuteContext(ctx) }()
+			joined := false
+			t.Cleanup(func() {
+				cancel()
+				if joined {
+					return
+				}
+				select {
+				case <-done:
+					joined = true
+				case <-time.After(5 * time.Second):
+					quiescenceUnknown = true
+					t.Error("owned daemon command did not join after cancellation; quiescence unknown")
+				}
+			})
+
+			origin := "http://127.0.0.1:" + strconv.Itoa(port)
+			client := &http.Client{Timeout: 300 * time.Millisecond}
+			deadline := time.NewTimer(8 * time.Second)
+			defer deadline.Stop()
+			for {
+				resp, requestErr := client.Get(origin + "/healthz")
+				if requestErr == nil {
+					_ = resp.Body.Close()
+					if resp.StatusCode == http.StatusOK {
+						break
+					}
+				}
+				select {
+				case runErr := <-done:
+					joined = true
+					t.Fatalf("default stub daemon exited before healthz: %v; output=%s", runErr, output.String())
+				case <-deadline.C:
+					t.Fatal("default stub daemon did not reach healthz")
+				case <-time.After(50 * time.Millisecond):
+				}
+			}
+			token, err := afclient.LoadControlToken(filepath.Join(home, "control-token"))
+			if err != nil || token == "" {
+				t.Fatalf("private control token unavailable: %v", err)
+			}
+			controller := afclient.NewDaemonClientFromURL(origin)
+			controller.SetControlToken(token)
+			if _, err := controller.Stop(); err != nil {
+				t.Fatalf("stop owned stub daemon: %v", err)
+			}
+			select {
+			case runErr := <-done:
+				joined = true
+				if runErr != nil {
+					t.Fatalf("owned stub daemon exit: %v", runErr)
+				}
+			case <-time.After(12 * time.Second):
+				t.Fatal("owned stub daemon did not join after control stop")
+			}
+		})
+		if quiescenceUnknown {
+			t.Fatal("owned daemon quiescence unknown; refusing another case")
+		}
+	}
+}
+
+func TestDaemonRunSkippedWizardStillRejectsUnconfiguredFileQueue(t *testing.T) {
+	configPath := filepath.Join(t.TempDir(), "daemon.yaml")
+	config := daemon.DefaultConfig()
+	config.APIVersion = daemon.LocalRuntimeConfigAPIVersion
+	config.Orchestrator.URL = "file://" + filepath.Join(t.TempDir(), "queue")
+	if err := daemon.WriteConfig(configPath, config); err != nil {
+		t.Fatal(err)
+	}
+	before, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cmd := newDaemonRunCmd(Config{HostBinaryVersion: "test"})
+	cmd.SetArgs([]string{"--config", configPath, "--skip-wizard", "--standalone-creds=off"})
+	var output bytes.Buffer
+	cmd.SetOut(&output)
+	cmd.SetErr(&output)
+	err = cmd.Execute()
+	if err == nil || !strings.Contains(err.Error(), "local runtime and its outermost policy are required") {
+		t.Fatalf("incomplete file queue accepted: %v; output=%s", err, output.String())
+	}
+	after, err := os.ReadFile(configPath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Equal(after, before) {
+		t.Fatal("refused file queue configuration was rewritten")
 	}
 }
 

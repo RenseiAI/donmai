@@ -85,6 +85,74 @@ make build        # produces bin/donmai
 
 ## Quick start
 
+### GitHub issue to local agent
+
+This path uses a local file queue and a GitHub repository. You need permission
+to push branches and open pull requests there, plus an installed, signed-in
+Claude Code or Codex CLI. It does not require Linear or a hosted Donmai account.
+On macOS, this example uses Claude Code:
+
+```bash
+brew install RenseiAI/homebrew-tap/donmai gh
+brew install --cask claude-code
+claude --version                 # Sonnet 5 profiles need 2.1.197 or newer
+claude auth login                # use a Claude.ai subscription login
+gh auth login --hostname github.com --git-protocol https
+gh auth setup-git --hostname github.com
+export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+```
+
+For Codex, install its CLI and use a file-backed ChatGPT login instead:
+
+```bash
+codex -c 'cli_auth_credentials_store="file"' login
+codex -c 'cli_auth_credentials_store="file"' login status
+```
+
+The Codex status should say `Logged in using ChatGPT`. Setup offers only
+installed profiles whose local login and model-version checks pass. Those
+checks do not verify account entitlement or a successful model turn. Keep
+`GITHUB_TOKEN` in the shell running setup or a foreground host so Donmai can
+verify the repository, read issues, and publish authenticated session receipts.
+
+From a clone of the GitHub repository, choose **2. Local file queue** in the
+wizard. Select the native profile, enter `OWNER/REPO`, choose an issue label
+(for example, `donmai`), and confirm the base branch for new pull requests.
+The wizard verifies the repository and branch and displays the local execution
+security policy before saving it.
+
+```bash
+cd /path/to/your/repository
+donmai host setup
+donmai host run
+```
+
+Leave `host run` open for this foreground run. In another terminal, make the
+GitHub token available again, label a small open issue with a clear task and
+acceptance check, and watch the local sessions:
+
+```bash
+export GITHUB_TOKEN="$(gh auth token --hostname github.com)"
+donmai github add-labels --repo OWNER/REPO --number 42 --labels donmai
+donmai host watch --all
+```
+
+Replace `OWNER/REPO` and `42` with your repository and issue number. If the
+label does not exist, create it with `gh label create donmai --repo OWNER/REPO`
+before adding it to the issue. `host watch` is a live session view. If a run
+opens a pull request and completes, review the pull request and its Donmai
+session receipt comment on GitHub before merging. If no work starts or no
+pull request appears, check `donmai host logs`
+in another terminal. An issue label starts intake; it does not guarantee a
+successful agent run or pull request. Authentication failures are failures;
+Donmai does not automatically switch to another model or provider. Each issue
+is admitted once per local queue: relabeling a failed issue does not retry it.
+Keep the failed issue and its receipt for diagnosis. An unresolved recovered
+session appears as **held**, with no claim of live work; completed or failed
+results and verified publication receipts remain in the local session record.
+
+### Persistent host
+
 For a persistent local host, use the setup wizard, install the service, and
 read its status through the loopback daemon API:
 
@@ -96,6 +164,17 @@ donmai host doctor
 donmai host stats
 donmai host logs
 ```
+
+The installed service runs outside the setup shell. When it has no
+`GITHUB_TOKEN` or `GH_TOKEN` in its environment, its local GitHub source reads
+the active `github.com` login from `gh` under the service user's home. The
+`gh auth login` and `gh auth setup-git` steps above therefore serve both issue
+intake and pull-request publication after a restart. A custom personal access
+token that differs from that login needs intentional service-environment
+provisioning; a shell `export` for setup does not persist into the service.
+If `GITHUB_TOKEN` and `GH_TOKEN` are both present with different values, the
+local source refuses startup rather than using a different credential from
+the GitHub CLI that publishes the pull request.
 
 The standalone `orchestrator` is a separate path that starts an installed
 Claude or Codex CLI directly, without the daemon. In a Git checkout, set

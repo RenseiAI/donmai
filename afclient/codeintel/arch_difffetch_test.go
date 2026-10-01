@@ -191,7 +191,13 @@ set -eu
 case "$1 $2" in
   "pr view") [ "$3 $4" = "https://github.com/org/repo/pull/7 --json" ] && cat "$PR_VIEW_FIXTURE" ;;
   "api --paginate") [ "$3" = "repos/org/repo/pulls/7/files?per_page=100" ] && cat "$PR_FILES_FIXTURE" ;;
-  "pr diff") [ "$3" = "https://github.com/org/repo/pull/7" ] && cat "$PR_DIFF_FIXTURE" ;;
+  "pr diff")
+    [ "$3" = "https://github.com/org/repo/pull/7" ]
+    if [ "${PR_DIFF_HTTP406:-}" = "1" ]; then
+      printf '%s\n' 'HTTP 406: diff exceeded 20000 lines' >&2
+      exit 1
+    fi
+    cat "$PR_DIFF_FIXTURE" ;;
   *) exit 99 ;;
 esac
 `
@@ -204,20 +210,22 @@ esac
 		Filename  string `json:"filename"`
 		Additions int    `json:"additions"`
 		Deletions int    `json:"deletions"`
+		Patch     string `json:"patch,omitempty"`
 	}
 	viewFiles := make([]fixtureFile, 0, 100)
-	allFiles := make([]fixtureFile, 0, 108)
+	allFiles := make([]fixtureFile, 0, 130)
 	var patch strings.Builder
-	for i := range 108 {
+	for i := range 130 {
 		path := fmt.Sprintf("src/file-%03d.go", i)
-		f := fixtureFile{Path: path, Filename: path, Additions: 1}
+		f := fixtureFile{Path: path, Filename: path, Additions: 1, Patch: "@@ -0,0 +1 @@\n+const r: Result<User, Error> = ok(user)"}
 		allFiles = append(allFiles, f)
 		if i < 100 {
+			f.Patch = "" // GraphQL view supplies metadata, not REST patch bodies.
 			viewFiles = append(viewFiles, f)
 		}
 		fmt.Fprintf(&patch, "diff --git a/%s b/%s\n@@ -0,0 +1 @@\n+package example\n", path, path)
 	}
-	changedFiles := 108
+	changedFiles := 130
 	view, err := json.Marshal(struct {
 		Title        string        `json:"title"`
 		ChangedFiles int           `json:"changedFiles"`
@@ -248,12 +256,14 @@ esac
 		includeSecond bool
 		aggregate     bool
 		patches       int
+		http406       bool
 		wantErr       string
 	}{
-		{name: "complete", includeSecond: true, patches: 108},
-		{name: "aggregated pages", includeSecond: true, aggregate: true, patches: 108},
-		{name: "missing second page", includeSecond: false, patches: 108, wantErr: "incomplete changed-file list"},
-		{name: "missing patch", includeSecond: true, patches: 107, wantErr: "patch sections do not match"},
+		{name: "complete", includeSecond: true, patches: 130},
+		{name: "aggregated pages", includeSecond: true, aggregate: true, patches: 130},
+		{name: "missing second page", includeSecond: false, patches: 130, wantErr: "incomplete changed-file list"},
+		{name: "missing patch", includeSecond: true, patches: 129, wantErr: "patch sections do not match"},
+		{name: "complete REST after HTTP 406", includeSecond: true, patches: 130, http406: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			filesPath := filepath.Join(t.TempDir(), "files.json")
@@ -267,6 +277,39 @@ esac
 				t.Fatal(err)
 			}
 			t.Setenv("PR_DIFF_FIXTURE", patchPath)
+			t.Setenv("PR_DIFF_HTTP406", "")
+			if tc.http406 {
+				t.Setenv("PR_DIFF_HTTP406", "1")
+				t.Setenv("DONMAI_ARCH_BIN", "")
+				out, err := New(t.TempDir()).ArchAssess(ArchAssessOptions{
+					PrURL: "https://github.com/org/repo/pull/7", RequireDiff: true, GatePolicy: "none",
+				})
+				if err != nil {
+					t.Fatalf("strict native assessment refused complete REST patches: %v", err)
+				}
+				report, ok := out.(map[string]any)
+				if !ok || report["mode"] != "native-diff-only" || report["gated"] != false {
+					t.Fatalf("strict native report = %#v", out)
+				}
+				observations, ok := report["observations"].([]any)
+				foundPatchSignal := false
+				if ok {
+					for _, observation := range observations {
+						value, ok := observation.(map[string]any)
+						if !ok || value["kind"] != "convention" {
+							continue
+						}
+						payload, ok := value["payload"].(map[string]any)
+						if ok && payload["title"] == "Result<T, E> error handling" {
+							foundPatchSignal = true
+						}
+					}
+				}
+				if !foundPatchSignal {
+					t.Fatalf("strict assessment omitted convention found only in REST patch bodies: %#v", observations)
+				}
+				return
+			}
 			got, err := fetchPRDiff(context.Background(), "github.com/org/repo", 7, "https://github.com/org/repo/pull/7", true)
 			if tc.wantErr != "" {
 				if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
@@ -277,11 +320,11 @@ esac
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(got.Files) != 108 {
-				t.Fatalf("file count = %d, want 108", len(got.Files))
+			if len(got.Files) != 130 {
+				t.Fatalf("file count = %d, want 130", len(got.Files))
 			}
-			if got.Files[107].Path != "src/file-107.go" || got.Files[107].Patch == "" || !got.Files[107].Added {
-				t.Fatalf("last file missing metadata or patch: %+v", got.Files[107])
+			if got.Files[129].Path != "src/file-129.go" || got.Files[129].Patch == "" || !got.Files[129].Added {
+				t.Fatalf("last file missing metadata or patch: %+v", got.Files[129])
 			}
 		})
 	}
@@ -308,6 +351,79 @@ func TestFetchPRDiff_DiffFailureIsNonFatal(t *testing.T) {
 	}
 	if diff.Files[0].Patch != "" {
 		t.Errorf("patch should be empty on diff failure, got %q", diff.Files[0].Patch)
+	}
+}
+
+func TestFetchPRDiffRejectsIncompletePaginatedRESTPatches(t *testing.T) {
+	origView, origFiles, origDiff := runGhPRView, runGhPRFiles, runGhPRDiff
+	t.Cleanup(func() { runGhPRView, runGhPRFiles, runGhPRDiff = origView, origFiles, origDiff })
+	view, err := json.Marshal(ghPRFiles{
+		ChangedFiles: func() *int { n := 2; return &n }(),
+		Files:        []ghPRFile{{Path: "src/a.ts", Additions: 1}},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	runGhPRView = func(context.Context, string) ([]byte, error) { return view, nil }
+	runGhPRDiff = func(context.Context, string) ([]byte, error) { return nil, errors.New("HTTP 406 full diff too large") }
+	// Keep transport fixtures independent of new production fields so these
+	// final test bytes still compile against the original fetcher for RED.
+	type restFixtureFile struct {
+		Filename  string `json:"filename"`
+		Additions int    `json:"additions"`
+		Deletions int    `json:"deletions"`
+		Patch     string `json:"patch"`
+	}
+	base := []restFixtureFile{
+		{Filename: "src/a.ts", Additions: 1, Patch: "@@ -0,0 +1 @@\n+const a = 1"},
+		{Filename: "src/b.ts", Additions: 1, Patch: "@@ -0,0 +1 @@\n+const b = 2"},
+	}
+	for _, tc := range []struct {
+		name    string
+		mutate  func([]restFixtureFile) []restFixtureFile
+		wantErr string
+	}{
+		{name: "binary or missing patch", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Patch = ""; return f }, wantErr: "missing or binary REST patch"},
+		{name: "truncated hunk", mutate: func(f []restFixtureFile) []restFixtureFile {
+			f[1].Additions = 2
+			f[1].Patch = "@@ -0,0 +1,2 @@\n+const b = 2"
+			return f
+		}, wantErr: "incomplete REST patch hunk"},
+		{name: "metadata line count mismatch", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Additions = 2; return f }, wantErr: "line counts disagree"},
+		{name: "malformed hunk", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Patch = "@@ bad @@\n+const b = 2"; return f }, wantErr: "malformed REST patch hunk header"},
+		{name: "zero start with nonzero span", mutate: func(f []restFixtureFile) []restFixtureFile {
+			f[1].Deletions = 1
+			f[1].Patch = "@@ -0,1 +0,1 @@\n-const b = 1\n+const b = 2"
+			return f
+		}, wantErr: "invalid zero-start REST patch hunk"},
+		{name: "extra unprefixed text", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Patch += "\nforeign text"; return f }, wantErr: "malformed REST patch hunk line"},
+		{name: "overflowing hunk", mutate: func(f []restFixtureFile) []restFixtureFile {
+			f[1].Patch = "@@ -999999999999999999999999999,1 +1 @@\n+const b = 2"
+			return f
+		}, wantErr: "overflowing REST patch hunk number"},
+		{name: "control byte", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Patch += "\x1b"; return f }, wantErr: "control text"},
+		{name: "invalid UTF-8 replacement", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Patch += "\ufffd"; return f }, wantErr: "invalid UTF-8 REST patch"},
+		{name: "unsafe relative path", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Filename = "../escape.ts"; return f }, wantErr: "unsafe or changed REST patch path"},
+		{name: "header injection path", mutate: func(f []restFixtureFile) []restFixtureFile {
+			f[1].Filename = "src/b.ts\ndiff --git a/evil b/evil"
+			return f
+		}, wantErr: "unsafe or changed REST patch path"},
+		{name: "duplicate identity", mutate: func(f []restFixtureFile) []restFixtureFile { f[1].Filename = f[0].Filename; return f }, wantErr: "invalid or duplicate changed-file metadata"},
+		{name: "changed first-page identity", mutate: func(f []restFixtureFile) []restFixtureFile { f[0].Filename = "src/changed.ts"; return f }, wantErr: "file identity changed during pagination"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			files := append([]restFixtureFile(nil), base...)
+			files = tc.mutate(files)
+			payload, err := json.Marshal(files)
+			if err != nil {
+				t.Fatal(err)
+			}
+			runGhPRFiles = func(context.Context, string, int) ([]byte, error) { return payload, nil }
+			got, err := fetchPRDiff(context.Background(), "github.com/org/repo", 7, "https://github.com/org/repo/pull/7", true)
+			if err == nil || !strings.Contains(err.Error(), tc.wantErr) || len(got.Files) != 0 {
+				t.Fatalf("strict incomplete REST assessment = %+v, error %v; want %q refusal", got, err, tc.wantErr)
+			}
+		})
 	}
 }
 

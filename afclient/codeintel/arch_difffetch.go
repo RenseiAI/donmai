@@ -25,9 +25,13 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"path"
+	"regexp"
 	"strconv"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
@@ -62,6 +66,7 @@ type ghPRFile struct {
 	Additions int    `json:"additions"`
 	Deletions int    `json:"deletions"`
 	Filename  string `json:"filename"`
+	Patch     string `json:"patch"`
 }
 
 // runGhPRView fetches PR metadata + the changed-file list as JSON. Package-level
@@ -95,24 +100,25 @@ func validGhPathSegment(s string) bool {
 	return true
 }
 
-func completePRFiles(ctx context.Context, repo string, prNum int, view ghPRFiles) ([]ghPRFile, error) {
+func completePRFiles(ctx context.Context, repo string, prNum int, view ghPRFiles) ([]ghPRFile, bool, error) {
 	if view.Files == nil {
-		return nil, errors.New("arch diff-fetch: PR metadata is missing the changed-file list")
+		return nil, false, errors.New("arch diff-fetch: PR metadata is missing the changed-file list")
 	}
 	if view.ChangedFiles == nil || *view.ChangedFiles < 0 || *view.ChangedFiles > 3000 {
-		return nil, errors.New("arch diff-fetch: missing or unsupported changed-file count")
+		return nil, false, errors.New("arch diff-fetch: missing or unsupported changed-file count")
 	}
 	want := *view.ChangedFiles
 	if len(view.Files) > want {
-		return nil, errors.New("arch diff-fetch: PR metadata exceeds the changed-file count")
+		return nil, false, errors.New("arch diff-fetch: PR metadata exceeds the changed-file count")
 	}
 	if len(view.Files) == want {
-		return validatePRFiles(view.Files, want)
+		files, err := validatePRFiles(view.Files, want)
+		return files, false, err
 	}
 
 	out, err := runGhPRFiles(ctx, repo, prNum)
 	if err != nil {
-		return nil, fmt.Errorf("arch diff-fetch: fetch paginated PR files: %w", err)
+		return nil, false, fmt.Errorf("arch diff-fetch: fetch paginated PR files: %w", err)
 	}
 	dec := json.NewDecoder(strings.NewReader(string(out)))
 	files := make([]ghPRFile, 0, want)
@@ -124,15 +130,46 @@ func completePRFiles(ctx context.Context, repo string, prNum int, view ghPRFiles
 			break
 		}
 		if err != nil {
-			return nil, fmt.Errorf("arch diff-fetch: decode paginated PR files: %w", err)
+			return nil, false, fmt.Errorf("arch diff-fetch: decode paginated PR files: %w", err)
 		}
 		pages++
 		if pages > 30 || len(page) == 0 || len(files)+len(page) > want {
-			return nil, errors.New("arch diff-fetch: invalid paginated PR file response")
+			return nil, false, errors.New("arch diff-fetch: invalid paginated PR file response")
 		}
 		files = append(files, page...)
 	}
-	return validatePRFiles(files, want)
+	files, err = validatePRFiles(files, want)
+	if err != nil {
+		return nil, false, err
+	}
+	if err := matchPRViewFiles(view.Files, files); err != nil {
+		return nil, false, err
+	}
+	return files, true, nil
+}
+
+// The GraphQL connection may expose only its first 100 files. Those entries
+// must still describe the same paths and change counts as the complete REST
+// pages. This detects metadata disagreement, not a change of commit with
+// identical file metadata; the Action fences head/base before and after.
+func matchPRViewFiles(viewFiles, restFiles []ghPRFile) error {
+	byPath := make(map[string]ghPRFile, len(restFiles))
+	for _, file := range restFiles {
+		byPath[file.Path] = file
+	}
+	seen := make(map[string]bool, len(viewFiles))
+	for _, file := range viewFiles {
+		name := file.Path
+		if name == "" {
+			name = file.Filename
+		}
+		match, ok := byPath[name]
+		if name == "" || seen[name] || !ok || match.Additions != file.Additions || match.Deletions != file.Deletions {
+			return errors.New("arch diff-fetch: PR file identity changed during pagination")
+		}
+		seen[name] = true
+	}
+	return nil
 }
 
 func validatePRFiles(files []ghPRFile, want int) ([]ghPRFile, error) {
@@ -151,6 +188,148 @@ func validatePRFiles(files []ghPRFile, want int) ([]ghPRFile, error) {
 		seen[f.Path] = true
 	}
 	return files, nil
+}
+
+const maxRESTPatchBytes = 16 << 20
+
+var restHunkHeader = regexp.MustCompile(`^@@ -([0-9]+)(?:,([0-9]+))? \+([0-9]+)(?:,([0-9]+))? @@(?:[ \t].*)?$`)
+
+// completeRESTPatches uses exact GitHub hunk bytes, not a fabricated unified
+// diff header. The validated filename remains a separate PrFileDiff.Path, so
+// an untrusted path cannot inject a header or change the patch's attribution.
+func completeRESTPatches(files []ghPRFile) (map[string]string, error) {
+	patches := make(map[string]string, len(files))
+	for _, file := range files {
+		if !safeRESTPatchPath(file.Path) || (file.Filename != "" && file.Filename != file.Path) {
+			return nil, errors.New("arch diff-fetch: unsafe or changed REST patch path")
+		}
+		if err := validateRESTPatch(file); err != nil {
+			return nil, err
+		}
+		patches[file.Path] = file.Patch
+	}
+	return patches, nil
+}
+
+func safeRESTPatchPath(name string) bool {
+	if name == "" || !utf8.ValidString(name) || path.IsAbs(name) || path.Clean(name) != name || strings.Contains(name, `\`) {
+		return false
+	}
+	for _, segment := range strings.Split(name, "/") {
+		if segment == "" || segment == "." || segment == ".." {
+			return false
+		}
+	}
+	for _, r := range name {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.Is(unicode.Cf, r) {
+			return false
+		}
+	}
+	return true
+}
+
+func parseRESTHunkNumber(value string, omittedCount bool) (int, error) {
+	if omittedCount && value == "" {
+		return 1, nil
+	}
+	if value == "" || (len(value) > 1 && value[0] == '0') {
+		return 0, errors.New("arch diff-fetch: malformed REST patch hunk number")
+	}
+	n, err := strconv.Atoi(value)
+	if err != nil || n < 0 {
+		return 0, errors.New("arch diff-fetch: overflowing REST patch hunk number")
+	}
+	return n, nil
+}
+
+func validateRESTPatch(file ghPRFile) error {
+	if file.Patch == "" {
+		return errors.New("arch diff-fetch: missing or binary REST patch")
+	}
+	if len(file.Patch) > maxRESTPatchBytes || !utf8.ValidString(file.Patch) {
+		return errors.New("arch diff-fetch: oversized or invalid UTF-8 REST patch")
+	}
+	for _, r := range file.Patch {
+		if r == utf8.RuneError {
+			return errors.New("arch diff-fetch: oversized or invalid UTF-8 REST patch")
+		}
+		if r != '\n' && r != '\t' && (unicode.IsControl(r) || unicode.Is(unicode.Cf, r)) {
+			return errors.New("arch diff-fetch: REST patch contains control text")
+		}
+	}
+	lines := strings.Split(file.Patch, "\n")
+	if lines[len(lines)-1] == "" {
+		lines = lines[:len(lines)-1]
+	}
+	added, deleted, hunks := 0, 0, 0
+	lastOldEnd, lastNewEnd := -1, -1
+	for i := 0; i < len(lines); {
+		groups := restHunkHeader.FindStringSubmatch(lines[i])
+		if groups == nil {
+			return errors.New("arch diff-fetch: malformed REST patch hunk header")
+		}
+		oldStart, err := parseRESTHunkNumber(groups[1], false)
+		if err != nil {
+			return err
+		}
+		oldCount, err := parseRESTHunkNumber(groups[2], true)
+		if err != nil {
+			return err
+		}
+		newStart, err := parseRESTHunkNumber(groups[3], false)
+		if err != nil {
+			return err
+		}
+		newCount, err := parseRESTHunkNumber(groups[4], true)
+		if err != nil {
+			return err
+		}
+		if (oldStart == 0 && oldCount != 0) || (newStart == 0 && newCount != 0) {
+			return errors.New("arch diff-fetch: invalid zero-start REST patch hunk")
+		}
+		maxInt := int(^uint(0) >> 1)
+		if oldCount > len(lines) || newCount > len(lines) || oldStart > maxInt-oldCount || newStart > maxInt-newCount ||
+			(lastOldEnd >= 0 && (oldStart < lastOldEnd || newStart < lastNewEnd)) {
+			return errors.New("arch diff-fetch: invalid or overflowing REST patch hunk span")
+		}
+		lastOldEnd, lastNewEnd = oldStart+oldCount, newStart+newCount
+		hunks++
+		i++
+		oldUsed, newUsed, changed := 0, 0, false
+		lastContent := false
+		for i < len(lines) && !strings.HasPrefix(lines[i], "@@ ") {
+			line := lines[i]
+			switch {
+			case line == `\ No newline at end of file` && lastContent:
+				lastContent = false
+			case strings.HasPrefix(line, " "):
+				oldUsed++
+				newUsed++
+				lastContent = true
+			case strings.HasPrefix(line, "+"):
+				newUsed++
+				added++
+				changed, lastContent = true, true
+			case strings.HasPrefix(line, "-"):
+				oldUsed++
+				deleted++
+				changed, lastContent = true, true
+			default:
+				return errors.New("arch diff-fetch: malformed REST patch hunk line")
+			}
+			if oldUsed > oldCount || newUsed > newCount || added > file.Additions || deleted > file.Deletions {
+				return errors.New("arch diff-fetch: REST patch hunk exceeds declared counts")
+			}
+			i++
+		}
+		if !changed || oldUsed != oldCount || newUsed != newCount {
+			return errors.New("arch diff-fetch: incomplete REST patch hunk")
+		}
+	}
+	if hunks == 0 || added != file.Additions || deleted != file.Deletions {
+		return errors.New("arch diff-fetch: REST patch line counts disagree with metadata")
+	}
+	return nil
 }
 
 // runGhPRDiff fetches the unified diff for a PR. Package-level var for tests.
@@ -209,7 +388,7 @@ func fetchPRDiff(ctx context.Context, repo string, prNum int, ref string, requir
 	if err := json.Unmarshal(viewOut, &view); err != nil {
 		return PrDiff{}, fmt.Errorf("arch diff-fetch: decode gh pr view: %w", err)
 	}
-	files, err := completePRFiles(ctx, repo, prNum, view)
+	files, completeRESTPages, err := completePRFiles(ctx, repo, prNum, view)
 	if err != nil {
 		return PrDiff{}, err
 	}
@@ -228,7 +407,18 @@ func fetchPRDiff(ctx context.Context, repo string, prNum int, ref string, requir
 	if diffOut, derr := runGhPRDiff(ctx, ref); derr == nil {
 		patchesByPath = splitUnifiedDiff(string(diffOut))
 	} else if requirePatches {
-		return PrDiff{}, fmt.Errorf("arch diff-fetch: fetch patches: %w", derr)
+		// GitHub refuses a full diff over its 20,000-line API limit. Strict
+		// mode may use the per-file patches already obtained from complete
+		// REST pagination, but only after validating every hunk. A small PR
+		// whose GraphQL file list was complete has no REST patch provenance
+		// and still fails closed on this path.
+		if !completeRESTPages {
+			return PrDiff{}, fmt.Errorf("arch diff-fetch: fetch patches: %w", derr)
+		}
+		patchesByPath, err = completeRESTPatches(files)
+		if err != nil {
+			return PrDiff{}, fmt.Errorf("arch diff-fetch: complete paginated patches: %w", err)
+		}
 	}
 	if requirePatches && len(patchesByPath) != len(files) {
 		return PrDiff{}, errors.New("arch diff-fetch: patch sections do not match the changed-file list")

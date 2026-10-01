@@ -59,6 +59,16 @@ func (s *Server) requireControlAuth(next http.HandlerFunc) http.HandlerFunc {
 		case controlAuthOpen:
 			next(w, r)
 		case controlAuthEnforced:
+			// The local file runtime has a separate protected operator identity.
+			// Its outer gate already authenticates mutating requests; recheck
+			// the same exact bearer here before accepting it as the control
+			// route's local alternative. The controller token remains required
+			// for every non-local daemon.
+			if local := s.daemon.localRuntime.Load(); local != nil && local.auth != nil &&
+				local.auth.VerifyOperator(localBearer(r)) == nil {
+				next(w, r)
+				return
+			}
 			got := strings.TrimSpace(strings.TrimPrefix(r.Header.Get("Authorization"), "Bearer "))
 			if got == "" || subtle.ConstantTimeCompare([]byte(got), []byte(want)) != 1 {
 				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "missing or invalid control token"})

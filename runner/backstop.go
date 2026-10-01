@@ -380,11 +380,11 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	// head from the checked-out branch — which may be one this session does
 	// not own. An "already exists" PR recovered below is therefore always the
 	// session branch's own PR.
-	prOut, err := runGh(ctx, worktreePath, "pr", "create",
-		"--head", branch,
-		"--title", prTitle,
-		"--body", prBody,
-	)
+	prArgs := []string{"pr", "create", "--head", branch, "--title", prTitle, "--body", prBody}
+	if qw.BaseRef != "" {
+		prArgs = append(prArgs, "--base", qw.BaseRef)
+	}
+	prOut, err := runGh(ctx, worktreePath, prArgs...)
 	if err != nil {
 		// `gh pr create` fails ("a pull request for branch ... already
 		// exists:\n<url>") when the branch already has an open PR — e.g. the

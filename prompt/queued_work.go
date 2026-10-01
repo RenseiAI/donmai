@@ -79,8 +79,12 @@ type QueuedWork struct {
 	// touch a repo (e.g. research-only on issue description).
 	Repository string `json:"repository,omitempty"`
 
-	// Ref is the base branch / ref the worktree was checked out at.
+	// Ref names an existing ref being amended; it retains its legacy behavior.
 	Ref string `json:"ref,omitempty"`
+	// BaseRef is the explicit source/base branch for a new work branch and PR.
+	// It is admission-bound, mutually exclusive with Ref, and supported only
+	// by the negotiated local transport contract.
+	BaseRef string `json:"baseRef,omitempty"`
 
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].

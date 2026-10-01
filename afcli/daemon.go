@@ -46,7 +46,11 @@ type daemonClientFactory func(cfg afclient.DaemonConfig) daemonDoer
 
 // defaultDaemonFactory is the production factory — always returns a real client.
 func defaultDaemonFactory(cfg afclient.DaemonConfig) daemonDoer {
-	return afclient.NewDaemonClient(withControlToken(cfg))
+	client, err := localOperatorClient(cfg, daemonRuntime.DefaultConfigPath())
+	if err != nil || client == nil {
+		return afclient.NewDaemonClient(withControlToken(cfg))
+	}
+	return afclient.NewDaemonClientWithHTTPClient(cfg, client)
 }
 
 // withControlToken attaches the operator's control token (best-effort) to
@@ -323,11 +327,14 @@ func newDaemonSetupCmd(bin string) *cobra.Command {
 				return fmt.Errorf("read existing config: %w", err)
 			}
 			cfg, err := daemonRuntime.RunSetupWizard(daemonRuntime.WizardOptions{
-				Existing:   existing,
-				ConfigPath: path,
-				BinaryName: bin,
-				Stdin:      os.Stdin,
-				Stdout:     cmd.OutOrStdout(),
+				Existing:             existing,
+				ConfigPath:           path,
+				BinaryName:           bin,
+				Stdin:                os.Stdin,
+				Stdout:               cmd.OutOrStdout(),
+				Context:              cmd.Context(),
+				LocalRuntimeResolver: localSetupResolverFactory(),
+				IsTTY:                setupWizardTTYOverride,
 			})
 			if err != nil {
 				return fmt.Errorf("daemon setup: %w", err)

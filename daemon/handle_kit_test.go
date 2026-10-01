@@ -668,7 +668,9 @@ func TestKitRegistryOrEmpty_HonorsConfigScanPaths(t *testing.T) {
 	cfg := DefaultConfig()
 	cfg.Machine.ID = "test-machine"
 	cfg.Capacity.MaxConcurrentSessions = 1
-	cfg.Orchestrator.URL = "file:///tmp/queue"
+	// Exercise stub registration without selecting the local file runtime.
+	cfg.Orchestrator.URL = "http://127.0.0.1:1"
+	cfg.Orchestrator.AuthToken = "local-stub-no-token"
 	cfg.Kit = KitConfig{ScanPaths: []string{kitsA, kitsB}}
 	cfgPath := filepath.Join(tmp, "daemon.yaml")
 	if err := WriteConfig(cfgPath, cfg); err != nil {

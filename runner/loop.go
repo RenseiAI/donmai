@@ -106,6 +106,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		return res, err
 	}
+	qw.runtimeTransport = selection.runtimeTransport
+	if err := r.registry.validateRuntimeTransport(qw); err != nil {
+		res.Status, res.FailureMode, res.Error = "failed", FailureProviderResolve, err.Error()
+		return res, err
+	}
 	provider := selection.Provider
 	// Refuse a stamped execution-security level this exact harness cannot
 	// render in the session's mode before any workarea, credential or
@@ -275,6 +280,10 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	repositoryFree := provisionStrategy == worktree.StrategyEmpty
 	provisionBranch := refBranch
 	provisionSourceRef := qw.Ref
+	if qw.BaseRef != "" {
+		provisionBranch = qw.BaseRef
+		provisionSourceRef = qw.BaseRef
+	}
 	if repositoryFree {
 		provisionBranch = ""
 		provisionSourceRef = ""
@@ -283,6 +292,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		SessionID:             qw.SessionID,
 		RepoURL:               qw.Repository,
 		Branch:                provisionBranch,
+		BaseRef:               qw.BaseRef,
+		RequireBranchBase:     qw.BaseRef != "",
 		SourceRef:             provisionSourceRef,
 		Strategy:              provisionStrategy,
 		RepositoryDeclaration: qw.RepositoryDeclaration,
@@ -378,6 +389,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		recordRescueTargets(ctx, res, targets)
 	case selectedRepositoryMutable:
 		recordRescueTargets(ctx, res, []rescueTarget{{path: wpath}})
+	}
+
+	if qw.BaseRef != "" {
+		if err := verifyNewWorkBranch(ctx, wpath, branch); err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureWorktreeProvision
+			res.Error = err.Error()
+			return res, err
+		}
 	}
 
 	// 2a-bis. Materialize read-only sibling context repos named by
@@ -2847,7 +2867,7 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 
 	// Platform per-session HTTP gate — omitted in standalone mode (no platform
 	// creds). Always leads the list so it is never shadowed by a later entry.
-	if bearer := mcpGatewayBearer(qw); harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && bearer != "" && qw.SessionID != "" {
+	if bearer := mcpGatewayBearer(qw); !isLocalRuntimeTransport(qw.runtimeTransport) && harnessDeliversMCP(provider, mode) && qw.PlatformURL != "" && bearer != "" && qw.SessionID != "" {
 		protected := QueuedWork{PlatformURL: qw.PlatformURL, McpAuthToken: bearer}
 		protected.SessionID = qw.SessionID
 		server, _ := protectedRuntimeMCPServer(protected, provider, mode)

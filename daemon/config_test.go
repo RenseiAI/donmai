@@ -1,10 +1,12 @@
 package daemon
 
 import (
+	"context"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 
 	"gopkg.in/yaml.v3"
 
@@ -18,6 +20,187 @@ func TestLoadConfig_FileNotExist(t *testing.T) {
 	}
 	if cfg != nil {
 		t.Fatalf("expected nil config for missing file, got %+v", cfg)
+	}
+}
+
+func TestLoadConfig_MaxConcurrentSessionsPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name, capacity string
+		want           int
+		wantError      bool
+	}{
+		{name: "omitted", want: 8},
+		{name: "empty", capacity: "capacity: {}\n", want: 8},
+		{name: "zero", capacity: "capacity:\n  maxConcurrentSessions: 0\n", want: 0},
+		{name: "positive", capacity: "capacity:\n  maxConcurrentSessions: 3\n", want: 3},
+		{name: "negative", capacity: "capacity:\n  maxConcurrentSessions: -1\n", wantError: true},
+		{name: "null", capacity: "capacity:\n  maxConcurrentSessions: null\n", want: 8},
+		{name: "capacity_null", capacity: "capacity: null\n", want: 8},
+		{name: "merged_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 0}\n", want: 0},
+		{name: "merge_overridden_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 3}\n  maxConcurrentSessions: 0\n", want: 0},
+		{name: "alias_zero", capacity: "defaults: &defaults {maxConcurrentSessions: 0}\ncapacity: *defaults\n", want: 0},
+		{name: "alias_null", capacity: "defaults: &defaults {maxConcurrentSessions: null}\ncapacity: *defaults\n", want: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			body := "machine:\n  id: capacity-fixture\norchestrator:\n  url: https://example.test\n" + tc.capacity
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "capacity.maxConcurrentSessions must be >= 0") {
+					t.Fatalf("negative value not refused: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Capacity.MaxConcurrentSessions != tc.want {
+				t.Fatalf("loaded max sessions=%d want=%d", cfg.Capacity.MaxConcurrentSessions, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteConfig_MaxConcurrentSessionsNonzeroToZero(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg := &Config{
+		Machine:      MachineConfig{ID: "isolated-fixture"},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 3},
+	}
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatalf("write nonzero config: %v", err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load nonzero config: %v", err)
+	}
+	updated := *loaded
+	updated.Capacity.MaxConcurrentSessions = 0
+	if err := WriteConfig(path, &updated); err != nil {
+		t.Fatalf("write zero config: %v", err)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		t.Fatalf("decode written YAML: %v", err)
+	}
+	var fields map[string]any
+	if err := doc.Decode(&fields); err != nil {
+		t.Fatalf("decode written mapping: %v", err)
+	}
+	capacity, ok := fields["capacity"].(map[string]any)
+	if !ok || capacity["maxConcurrentSessions"] != 0 {
+		t.Fatalf("written capacity = %v, want explicit maxConcurrentSessions: 0", fields["capacity"])
+	}
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("reload zero config: %v", err)
+	}
+	if got := reloaded.Capacity.MaxConcurrentSessions; got != 0 {
+		t.Fatalf("reloaded max sessions = %d, want 0", got)
+	}
+}
+
+func TestDaemonStart_UsesAuthoredZeroCapacity(t *testing.T) {
+	for _, tt := range []struct {
+		name     string
+		capacity string
+		want     int
+	}{
+		{name: "omitted defaults", want: 8},
+		{name: "explicit zero refuses", capacity: "capacity:\n  maxConcurrentSessions: 0\n", want: 0},
+	} {
+		t.Run(tt.name, func(t *testing.T) {
+			dir := t.TempDir()
+			path := filepath.Join(dir, "daemon.yaml")
+			body := "machine:\n  id: isolated-fixture\norchestrator:\n  url: file:///" + dir + "/queue\n" + tt.capacity
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			d := New(Options{
+				ConfigPath:       path,
+				JWTPath:          filepath.Join(dir, "daemon.jwt"),
+				SkipWizard:       true,
+				SkipRegistration: true,
+				HTTPHost:         "127.0.0.1",
+				HTTPPort:         0,
+				SpawnerOptions:   SpawnerOptions{WorkerCommand: []string{"/bin/false"}},
+			})
+			if err := d.Start(context.Background()); err != nil {
+				t.Fatalf("foreground Start: %v", err)
+			}
+			t.Cleanup(func() {
+				ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+				defer cancel()
+				if err := d.Stop(ctx); err != nil {
+					t.Errorf("foreground Stop: %v", err)
+				}
+			})
+			if got := d.MaxConcurrentSessions(); got != tt.want {
+				t.Errorf("advertised max sessions = %d, want %d", got, tt.want)
+			}
+			d.spawner.mu.Lock()
+			spawnerLimit := d.spawner.opts.MaxConcurrentSessions
+			d.spawner.mu.Unlock()
+			if spawnerLimit != tt.want {
+				t.Fatalf("runtime spawner limit = %d, want %d", spawnerLimit, tt.want)
+			}
+			if tt.want == 0 {
+				if _, err := d.spawner.AcceptWork(SessionSpec{SessionID: "refused"}); err == nil || !strings.Contains(err.Error(), "at capacity (0/0 sessions)") {
+					t.Fatalf("zero-capacity admission error = %v", err)
+				}
+			}
+		})
+	}
+}
+
+func TestOnYamlChanged_MaxConcurrentSessionsZeroRetainsActiveWork(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	initial := &Config{
+		Machine:      MachineConfig{ID: "isolated-fixture"},
+		Orchestrator: OrchestratorConfig{URL: "https://example.test"},
+		Capacity:     CapacityConfig{MaxConcurrentSessions: 2},
+	}
+	if err := WriteConfig(path, initial); err != nil {
+		t.Fatalf("write initial config: %v", err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("load initial config: %v", err)
+	}
+	spawner := NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: loaded.Capacity.MaxConcurrentSessions})
+	existing := &spawnedSession{}
+	spawner.sessions["already-running"] = existing
+	d := &Daemon{config: loaded, spawner: spawner}
+	updated := *loaded
+	updated.Capacity.MaxConcurrentSessions = 0
+	if err := WriteConfig(path, &updated); err != nil {
+		t.Fatalf("write reduced capacity: %v", err)
+	}
+	reloaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatalf("reload config: %v", err)
+	}
+	d.onYamlChanged(reloaded)
+	if got := d.MaxConcurrentSessions(); got != 0 {
+		t.Fatalf("runtime advertised max sessions = %d, want 0", got)
+	}
+	spawner.mu.Lock()
+	limit := spawner.opts.MaxConcurrentSessions
+	retained := spawner.sessions["already-running"]
+	spawner.mu.Unlock()
+	if limit != 0 || retained != existing {
+		t.Fatalf("runtime limit = %d, retained session = %p; want 0 and %p", limit, retained, existing)
+	}
+	if _, err := spawner.AcceptWork(SessionSpec{SessionID: "new-work"}); err == nil || !strings.Contains(err.Error(), "at capacity (1/0 sessions)") {
+		t.Fatalf("new admission error = %v, want capacity refusal", err)
 	}
 }
 
@@ -921,47 +1104,6 @@ autoUpdate:
 	}
 	if cfg.Projects[0].Repository != "github.com/foo/canonical" {
 		t.Errorf("Repository = %q, want canonical to win", cfg.Projects[0].Repository)
-	}
-}
-
-func TestLoadConfig_MaxConcurrentSessionsPresence(t *testing.T) {
-	for _, tc := range []struct {
-		name, capacity string
-		want           int
-		wantError      bool
-	}{
-		{name: "omitted", want: 8},
-		{name: "empty", capacity: "capacity: {}\n", want: 8},
-		{name: "zero", capacity: "capacity:\n  maxConcurrentSessions: 0\n", want: 0},
-		{name: "positive", capacity: "capacity:\n  maxConcurrentSessions: 3\n", want: 3},
-		{name: "negative", capacity: "capacity:\n  maxConcurrentSessions: -1\n", wantError: true},
-		{name: "null", capacity: "capacity:\n  maxConcurrentSessions: null\n", want: 8},
-		{name: "capacity_null", capacity: "capacity: null\n", want: 8},
-		{name: "merged_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 0}\n", want: 0},
-		{name: "merge_overridden_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 3}\n  maxConcurrentSessions: 0\n", want: 0},
-		{name: "alias_zero", capacity: "defaults: &defaults {maxConcurrentSessions: 0}\ncapacity: *defaults\n", want: 0},
-		{name: "alias_null", capacity: "defaults: &defaults {maxConcurrentSessions: null}\ncapacity: *defaults\n", want: 8},
-	} {
-		t.Run(tc.name, func(t *testing.T) {
-			path := filepath.Join(t.TempDir(), "daemon.yaml")
-			body := "machine:\n  id: capacity-fixture\norchestrator:\n  url: https://example.test\n" + tc.capacity
-			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
-				t.Fatal(err)
-			}
-			cfg, err := LoadConfig(path)
-			if tc.wantError {
-				if err == nil || !strings.Contains(err.Error(), "capacity.maxConcurrentSessions must be >= 0") {
-					t.Fatalf("negative value not refused: %v", err)
-				}
-				return
-			}
-			if err != nil {
-				t.Fatal(err)
-			}
-			if cfg.Capacity.MaxConcurrentSessions != tc.want {
-				t.Fatalf("loaded max sessions=%d want=%d", cfg.Capacity.MaxConcurrentSessions, tc.want)
-			}
-		})
 	}
 }
 

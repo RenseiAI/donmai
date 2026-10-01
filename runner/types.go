@@ -26,6 +26,9 @@ type QueuedWork struct {
 	// every session and operational-payload wire representation.
 	toolLifecycleProfileID string
 
+	// runtimeTransport is derived solely from trusted registry configuration.
+	runtimeTransport RuntimeTransportMode
+
 	// RepositoryDeclaration is emitted only after exact session-root-v1
 	// negotiation. Nil preserves the legacy singular flat worktree path.
 	RepositoryDeclaration *workarea.RepositoryDeclarationV1 `json:"repositoryDeclaration,omitempty"`

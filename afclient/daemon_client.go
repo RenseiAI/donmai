@@ -468,6 +468,15 @@ func NewDaemonClient(cfg DaemonConfig) *DaemonClient {
 	}
 }
 
+// NewDaemonClientWithHTTPClient additively accepts caller-owned local control
+// authentication/transport policy. Nil preserves the ordinary constructor.
+func NewDaemonClientWithHTTPClient(cfg DaemonConfig, client *http.Client) *DaemonClient {
+	if client == nil {
+		return NewDaemonClient(cfg)
+	}
+	return &DaemonClient{baseURL: cfg.BaseURL(), httpClient: client, controlToken: strings.TrimSpace(cfg.ControlToken)}
+}
+
 // NewDaemonClientFromURL constructs a DaemonClient pointing at an arbitrary
 // base URL. Primarily used in tests with httptest.Server.
 func NewDaemonClientFromURL(baseURL string) *DaemonClient {

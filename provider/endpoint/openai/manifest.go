@@ -74,6 +74,14 @@ func (*Endpoint) Manifest() agent.ModelEndpointManifest {
 				SupportsJSONMode: true,
 				Hosts:            []agent.ServingHost{agent.HostDirect, agent.HostAzure},
 			},
+			{
+				ID:               "gpt-6-sol",
+				HumanLabel:       "GPT-6 Sol",
+				ContextWindow:    1050000,
+				SupportsTools:    true,
+				SupportsJSONMode: true,
+				Hosts:            []agent.ServingHost{agent.HostOAuthCLI},
+			},
 		},
 	}
 }

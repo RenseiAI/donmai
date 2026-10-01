@@ -57,11 +57,13 @@ const DefaultAgentRunDaemonURL = "http://127.0.0.1:7734"
 // Pulled out so tests can drive newAgentRunCmd's RunE directly without
 // going through cobra's flag-parsing layer.
 type agentRunOpts struct {
-	sessionID  string
-	daemonURL  string
-	worktree   string
-	preserveWT bool
-	jsonOut    bool
+	localRuntime         bool
+	localRuntimeContract string
+	sessionID            string
+	daemonURL            string
+	worktree             string
+	preserveWT           bool
+	jsonOut              bool
 	// keepRecording is the standalone --keep-recording flag: a LOCAL OPERATOR
 	// decision to suppress the runner's end-of-session deletion of an
 	// interactive session's on-disk asciinema-v2 cast. It sets
@@ -166,6 +168,10 @@ func newAgentRunCmd(cfg Config) *cobra.Command {
 			return runAgentRun(cmd.Context(), cmd, opts)
 		},
 	}
+	cmd.Flags().BoolVar(&opts.localRuntime, "local-runtime", false, "Use the trusted local runtime receiver")
+	_ = cmd.Flags().MarkHidden("local-runtime")
+	cmd.Flags().StringVar(&opts.localRuntimeContract, "local-runtime-contract", "", "Required local worker transport contract")
+	_ = cmd.Flags().MarkHidden("local-runtime-contract")
 	cmd.Flags().StringVar(&opts.sessionID, "session-id", "",
 		"Session ID to run (default: $DONMAI_SESSION_ID)")
 	cmd.Flags().StringVar(&opts.daemonURL, "daemon-url", "",
@@ -279,6 +285,9 @@ func resolveAgentRunDaemonURL(flagValue string, lookupEnv func(string) string) (
 // Cobra-free; takes opts directly so tests can drive it with a fake
 // daemon HTTP server.
 func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) error {
+	if opts.localRuntimeContract != "" && (!opts.localRuntime || opts.localRuntimeContract != string(runner.RuntimeTransportLocalV2)) {
+		return preflightErr("unsupported local worker transport contract")
+	}
 	// 1. Resolve the session id.
 	sessionID := strings.TrimSpace(opts.sessionID)
 	if sessionID == "" {
@@ -301,6 +310,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// localhost loopback at 127.0.0.1:7734) no Authorization header is
 	// sent, preserving the unauthenticated loopback behavior.
 	daemonToken := strings.TrimSpace(os.Getenv("DONMAI_RUNTIME_JWT"))
+	if opts.localRuntime && (daemonToken == "" || daemonURLSource == daemonURLSourceBuiltinDefault) {
+		return preflightErr("local worker requires its explicit daemon origin and attempt credential")
+	}
+
+	if opts.localRuntime {
+		if err := validateLocalAgentOrigin(daemonURL); err != nil {
+			return preflightErr(err.Error())
+		}
+	}
 
 	// 3. Set up signal handling so SIGTERM/SIGINT translates into a
 	// clean ctx cancellation through the runner.
@@ -324,10 +342,22 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	)
 
 	// 4. Fetch session detail from the daemon (3-attempt exp backoff).
-	detail, err := fetchSessionDetail(runCtx, &http.Client{Timeout: 10 * time.Second}, daemonURL, sessionID, daemonToken)
+	detailClient := &http.Client{Timeout: 10 * time.Second}
+	if opts.localRuntime {
+		detailClient = localCallbackClient(10 * time.Second)
+	}
+	detail, err := fetchSessionDetail(runCtx, detailClient, daemonURL, sessionID, daemonToken)
 	if err != nil {
 		return preflightErr(fmt.Sprintf(
 			"fetch session detail from %s (%s): %v", daemonURL, daemonURLSource, err))
+	}
+	if opts.localRuntime {
+		if err := validateLocalAgentDetail(daemonURL, detail); err != nil {
+			return preflightErr(err.Error())
+		}
+		if detail.SessionID != sessionID {
+			return preflightErr("local detail session identity mismatch")
+		}
 	}
 	logger.Info(
 		"agent run: session detail fetched",
@@ -343,13 +373,22 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 			return fmt.Errorf("receipt-bearing session has no valid daemon adaptation-ready receipt")
 		}
 	}
+	credentialClient := &http.Client{Timeout: 5 * time.Second}
+	if opts.localRuntime {
+		credentialClient = localCallbackClient(5 * time.Second)
+	}
 	credentialCache := newAgentRunCredentialCache(
-		&http.Client{Timeout: 5 * time.Second},
+		credentialClient,
 		daemonURL,
 		sessionID,
 		daemonToken,
 		detail,
 	)
+
+	if opts.localRuntime {
+		credentialCache.localRuntime = true
+		credentialCache.authToken = daemonToken
+	}
 
 	// 5. Construct registry, runner, and run.
 	agentBin := opts.bin
@@ -357,8 +396,28 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		agentBin = "donmai"
 	}
 	hints := agentRunHints(detail)
+	selectedLocalHarness := ""
+	if opts.localRuntime {
+		// Only local/v2 replaces the existing constructor hint with an exact
+		// admitted binding. Local/v1 and controller behavior stay unchanged.
+		if opts.localRuntimeContract == string(runner.RuntimeTransportLocalV2) {
+			hints.CodexHostSessionAuth, err = localCodexHostSessionHint(detail)
+			if err != nil {
+				return preflightErr(fmt.Sprintf("local host authentication binding: %v", err))
+			}
+			selectedLocalHarness = detail.ResolvedProfile.Harness
+		}
+	}
 	hints.PiTrustedExtensions = append([]providerpi.TrustedExtensionIdentity(nil), opts.piTrustedExtensions...)
-	reg := buildRegistryForAgentRun(logger, hints, agentBin)
+	var reg *runner.Registry
+	if opts.localRuntime {
+		reg, err = localAgentRegistry(logger, hints, agentBin, localWorkerTransport(opts.localRuntimeContract), selectedLocalHarness)
+		if err != nil {
+			return preflightErr(err.Error())
+		}
+	} else {
+		reg = buildRegistryForAgentRun(logger, hints, agentBin)
+	}
 	logger.Info("agent run: registry built", "providers", reg.Names())
 	if opts.specDecorator != nil {
 		decorateRegistryProviders(reg, opts.specDecorator)
@@ -394,7 +453,12 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		return preflightErr(fmt.Sprintf("worktree manager: %v", err))
 	}
 
+	var callbackClient *http.Client
+	if opts.localRuntime {
+		callbackClient = localCallbackClient(30 * time.Second)
+	}
 	poster, err := result.NewPoster(result.Options{
+		HTTPClient:         callbackClient,
 		PlatformURL:        detail.PlatformURL,
 		AuthToken:          detail.AuthToken,
 		WorkerID:           detail.WorkerID,
@@ -433,6 +497,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	}
 
 	runnerOptions := runner.Options{
+		HTTPClient:                callbackClient,
 		Registry:                  reg,
 		WorktreeManager:           wm,
 		Poster:                    poster,
@@ -447,7 +512,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 		// The library stays env-free; this binary is the operator boundary.
 		// Dispatch capability `llm-span-ingest` can also enable the pipeline
 		// per session once a compatible server advertises it.
-		SpanEmissionEnabled: donmaiSpanTracingEnabled(),
+		SpanEmissionEnabled: !opts.localRuntime && donmaiSpanTracingEnabled(),
 		// KITS PIVOT #3 — arm runner/loop.go step 2b so kit toolchain
 		// (toolchain_install + post_acquire) runs AFTER the repo is cloned.
 		// The platform-supplied demand on the work item (qw.Kits) overrides
@@ -493,7 +558,7 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// gateway-served but the worker cannot honor it (never a silent fallback to
 	// some other endpoint — see afcli/gateway_bind.go).
 	var gwSession *workerGateway
-	if admissionErr == nil {
+	if admissionErr == nil && !opts.localRuntime {
 		gwSession, err = bindWorkerGatewayForAgentRun(
 			runCtx, logger, detail, &qw, gatewayHarnessIdentity(detail, admission),
 		)
@@ -515,8 +580,15 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// maybePostRunning: the platform treats a repeated running transition
 	// as a no-op, so racing the two posts is safe.
 	if admissionErr == nil {
-		postSessionRunning(runCtx, &http.Client{Timeout: 5 * time.Second}, logger,
-			detail.PlatformURL, sessionID, detail.WorkerID, detail.AuthToken)
+		runningToken := detail.AuthToken
+		if opts.localRuntime {
+			_, runningToken, err = credentialCache.current(runCtx)
+			if err != nil {
+				return preflightErr("local result transport authentication is unavailable")
+			}
+		}
+		postSessionRunning(runCtx, credentialClient, logger,
+			detail.PlatformURL, sessionID, detail.WorkerID, runningToken)
 	}
 
 	logger.Info("donmai agent run: invoking runner.RunAdmitted", "sessionId", qw.SessionID)
@@ -695,13 +767,14 @@ func fetchSessionDetailOnce(ctx context.Context, client *http.Client, endpoint, 
 }
 
 type agentRunCredentialCache struct {
-	mu          sync.Mutex
-	client      *http.Client
-	daemonURL   string
-	sessionID   string
-	daemonToken string
-	workerID    string
-	authToken   string
+	localRuntime bool
+	mu           sync.Mutex
+	client       *http.Client
+	daemonURL    string
+	sessionID    string
+	daemonToken  string
+	workerID     string
+	authToken    string
 }
 
 func newAgentRunCredentialCache(client *http.Client, daemonURL, sessionID, daemonToken string, initial *daemon.SessionDetail) *agentRunCredentialCache {
@@ -723,6 +796,18 @@ func (c *agentRunCredentialCache) current(ctx context.Context) (workerID, authTo
 
 	c.mu.Lock()
 	defer c.mu.Unlock()
+	if c.localRuntime {
+		if fetchErr != nil {
+			return c.workerID, c.authToken, fetchErr
+		}
+		if err := validateLocalAgentDetail(c.daemonURL, detail); err != nil {
+			return c.workerID, c.authToken, err
+		}
+		if detail.SessionID != c.sessionID || detail.WorkerID != c.workerID {
+			return c.workerID, c.authToken, errors.New("local runtime credential binding changed")
+		}
+		return c.workerID, c.daemonToken, nil
+	}
 	if fetchErr == nil && detail != nil {
 		if detail.WorkerID != "" {
 			c.workerID = detail.WorkerID
@@ -885,6 +970,79 @@ func codexHostSessionCtorHint(d *daemon.SessionDetail) bool {
 		return d.ResolvedProfile.Provider == string(agent.ProviderCodex)
 	}
 	return d.ResolvedProfile.Runner == string(agent.ProviderCodex)
+}
+
+// localCodexHostSessionHint uses admitted local/v2 bytes instead of the
+// controller's optional AuthMode mirror. It runs before provider construction
+// so an unselected or forged profile cannot cause a host credential lookup.
+func localCodexHostSessionHint(detail *daemon.SessionDetail) (bool, error) {
+	if detail == nil || detail.ResolvedProfile == nil || detail.SessionID == "" || detail.WorkerID == "" {
+		return false, errors.New("local admission has no complete worker identity")
+	}
+	receipt, err := executioncell.DecodeAdmissionReceipt(detail.AdmissionReceipt)
+	if err != nil {
+		return false, fmt.Errorf("decode local admission receipt: %w", err)
+	}
+	cell, err := executioncell.DecodeResolvedExecutionCell(detail.EffectiveCell)
+	if err != nil {
+		return false, fmt.Errorf("decode local execution cell: %w", err)
+	}
+	binding, err := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding)
+	if err != nil {
+		return false, fmt.Errorf("decode local runtime binding: %w", err)
+	}
+	host, err := executioncell.DecodeHostAdaptationReceipt(detail.HostAdaptationReceipt)
+	if err != nil {
+		return false, fmt.Errorf("decode local host adaptation: %w", err)
+	}
+	payloadDigest, err := executioncell.DigestOperationalPayload(detail.OperationalPayload)
+	if err != nil {
+		return false, fmt.Errorf("digest local operational payload: %w", err)
+	}
+	admitted := receipt.Value()
+	if admitted.Decision != executioncell.AdmissionAdmitted || admitted.Cell == nil ||
+		admitted.RequestID != detail.SessionID || admitted.OperationalPayloadDigest != payloadDigest ||
+		!reflect.DeepEqual(*admitted.Cell, cell) ||
+		binding.ContractVersion != executioncell.RuntimeBindingV2ContractVersion ||
+		binding.RequestID != detail.SessionID || binding.WorkerID != detail.WorkerID ||
+		binding.PlacementID != cell.Placement.ID || binding.ClaimID != "" ||
+		binding.PreflightRegistration == nil || !binding.PreflightRegistration.Required ||
+		host.Decision != "ready" || host.RequestID != detail.SessionID ||
+		host.WorkerID != detail.WorkerID || host.PlacementID != cell.Placement.ID || host.ClaimID != "" ||
+		cell.Placement.Kind != executioncell.PlacementHost || cell.Placement.Resolution != executioncell.PlacementExact ||
+		cell.SessionMode != executioncell.SessionAutonomous ||
+		detail.Harness != cell.Harness.ID || detail.ResolvedProfile.Harness != cell.Harness.ID ||
+		detail.ResolvedProfile.Model != cell.Model.ID || detail.ModelProfile != nil {
+		return false, errors.New("local worker detail disagrees with exact admitted host binding")
+	}
+	endpoint := detail.ResolvedProfile.Endpoint
+	if endpoint == nil || endpoint.EndpointID != cell.Endpoint.ID ||
+		endpoint.EndpointRevision != cell.Endpoint.Revision || endpoint.Protocol != cell.Endpoint.Protocol ||
+		endpoint.EndpointOperator != cell.Endpoint.Operator || endpoint.Model != cell.Model.ID ||
+		endpoint.ModelAuthor != cell.Model.Author || endpoint.AuthBindingID != cell.AuthBinding.ID ||
+		endpoint.Mechanism != string(cell.AuthBinding.Mechanism) ||
+		endpoint.AuthAuthority != cell.AuthBinding.Authority ||
+		endpoint.AuthCommercialMode != string(cell.AuthBinding.CommercialMode) ||
+		endpoint.AuthBindingScope != string(cell.AuthBinding.BindingScope) ||
+		endpoint.AuthPortability != string(cell.AuthBinding.Portability) ||
+		endpoint.AuthDelivery != string(cell.AuthBinding.Delivery) {
+		return false, errors.New("local worker profile differs from admitted endpoint and auth binding")
+	}
+	if cell.Harness.ID == string(agent.HarnessClaudeCode) {
+		return false, nil
+	}
+	if cell.Harness.ID != string(agent.HarnessCodex) || cell.Model.Author != "openai" ||
+		cell.Endpoint.Operator != "openai" || cell.AuthBinding.Authority != "openai" ||
+		cell.AuthBinding.Mechanism != executioncell.AuthCLISession ||
+		cell.AuthBinding.CommercialMode != executioncell.CommercialSubscription ||
+		cell.AuthBinding.BindingScope != executioncell.ScopeHost ||
+		cell.AuthBinding.Portability != executioncell.HostBound ||
+		cell.AuthBinding.Delivery != executioncell.DeliveryHostCLIHomeReference ||
+		endpoint.Company != "openai" || endpoint.Host != string(agent.HostOAuthCLI) ||
+		(detail.ResolvedProfile.AuthMode != "" && detail.ResolvedProfile.AuthMode != string(agent.AuthHostSession)) {
+		return false, errors.New("local Codex host login lacks exact admitted authority")
+	}
+	return true, nil
 }
 
 // opencodeCtorHintKey is the typed ResolvedProfile.ProviderConfig knob that
@@ -1147,6 +1305,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			OrganizationID:       d.OrganizationID,
 			Repository:           d.Repository,
 			Ref:                  d.Ref,
+			BaseRef:              d.BaseRef,
 			WorkType:             d.WorkType,
 			PromptContext:        d.PromptContext,
 			Body:                 d.Body,
@@ -1186,6 +1345,9 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 	if len(d.OperationalPayload) > 0 {
 		// Decode into a zero value: absent receipted fields must stay absent rather
 		// than inheriting an unreceipted compatibility mirror.
+		if err := runner.ValidateBaseRefMember(d.OperationalPayload); err != nil {
+			return runner.QueuedWork{}, fmt.Errorf("operational payload base branch: %w", err)
+		}
 		if err := runner.ValidateExecutionSecurityMember(d.OperationalPayload); err != nil {
 			return runner.QueuedWork{}, fmt.Errorf("operational payload: %w", err)
 		}
@@ -1199,7 +1361,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		// disagreed would otherwise silently lose the record and provision a
 		// plain branch clone, which is the failure this change exists to
 		// prevent.
-		if !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
+		if d.BaseRef != admitted.BaseRef || !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
 			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) {
@@ -1432,3 +1594,10 @@ func emitResultJSON(w io.Writer, res *runner.Result) error {
 // unreachable, etc) so the caller can distinguish from a runner.Run
 // failure.
 func preflightErr(msg string) error { return fmt.Errorf("preflight: %s", msg) }
+
+func localWorkerTransport(contract string) runner.RuntimeTransportMode {
+	if contract == string(runner.RuntimeTransportLocalV2) {
+		return runner.RuntimeTransportLocalV2
+	}
+	return runner.RuntimeTransportLocal
+}

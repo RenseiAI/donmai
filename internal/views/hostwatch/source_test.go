@@ -83,6 +83,56 @@ func TestSource_Snapshot_ScopeFilter(t *testing.T) {
 	}
 }
 
+func TestSource_Snapshot_HeldRowsRespectRepositoryScope(t *testing.T) {
+	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{
+		{
+			SessionID: "held-known", State: "unknown", AcceptedAt: "2026-09-27T12:00:00Z",
+			ProjectName: "donmai", Repository: "https://github.com/RenseiAI/donmai", PID: 9876,
+			WorktreePath: "/fixture/must-not-be-used",
+		},
+		{SessionID: "held-unrelated", State: "unknown", ProjectName: "other", Repository: "", PID: 0},
+	}}
+
+	state := &countingState{}
+	scoped := NewSource(fd, state, "RenseiAI/donmai").Snapshot()
+	if len(scoped.Cards) != 1 {
+		t.Fatalf("scoped snapshot should retain only the matching held row, got %d", len(scoped.Cards))
+	}
+	c := scoped.Cards[0]
+	if c.SessionID != "held-known" || c.DaemonState != "unknown" || c.PID != 0 || c.WorktreePath != "" {
+		t.Fatalf("held row identity/state/path changed: %#v", c)
+	}
+	if c.ProjectName != "donmai" || c.Repository != "https://github.com/RenseiAI/donmai" {
+		t.Fatalf("held row project/repository metadata lost: %#v", c)
+	}
+	if c.AcceptedAt != "2026-09-27T12:00:00Z" {
+		t.Errorf("original AcceptedAt must be preserved, got %q", c.AcceptedAt)
+	}
+	if state.calls != 0 {
+		t.Errorf("held row must not read workarea state, got %d reads", state.calls)
+	}
+
+	unscoped := NewSource(fd, &noopState{}, "").Snapshot()
+	if len(unscoped.Cards) != 2 {
+		t.Fatalf("unscoped snapshot should include both held rows, got %d", len(unscoped.Cards))
+	}
+}
+
+func TestSourceCountersSeparateLiveFromHeldAndTerminal(t *testing.T) {
+	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{
+		{SessionID: "live", State: "running", Repository: "o/a"},
+		{SessionID: "starting", State: "starting", Repository: "o/a"},
+		{SessionID: "held", State: "unknown", Repository: "o/a"},
+		{SessionID: "terminal", State: "completed", Repository: "o/a"},
+		{SessionID: "unreported", Repository: "o/a"},
+		{SessionID: "other", State: "running", Repository: "o/b"},
+	}}
+	snap := NewSource(fd, nil, "o/a").Snapshot()
+	if snap.Err != nil || snap.Counters.Sessions != 5 || snap.Counters.Running != 2 {
+		t.Fatalf("scoped counts claimed unresolved/terminal rows as live: %+v", snap)
+	}
+}
+
 func TestSource_Snapshot_StateEnrichment(t *testing.T) {
 	dir := t.TempDir()
 	wt := filepath.Join(dir, "sess-1")
@@ -171,8 +221,8 @@ func TestSource_Counters(t *testing.T) {
 	}
 	// Scoped: Running reflects the scoped card count, not the daemon total.
 	scoped := NewSource(fd, &noopState{}, "o/a").Snapshot()
-	if scoped.Counters.Running != 1 {
-		t.Errorf("scoped running: want 1, got %d", scoped.Counters.Running)
+	if scoped.Counters.Sessions != 1 {
+		t.Errorf("scoped sessions: want 1, got %d", scoped.Counters.Sessions)
 	}
 	if scoped.Counters.QueueDepth != 2 {
 		t.Errorf("queue: want 2, got %d", scoped.Counters.QueueDepth)
@@ -180,10 +230,10 @@ func TestSource_Counters(t *testing.T) {
 	if scoped.Counters.Version != "0.39.0" {
 		t.Errorf("version: want 0.39.0, got %q", scoped.Counters.Version)
 	}
-	// Unscoped: Running trusts the daemon's own active count.
+	// Unscoped: Sessions counts the rows shown in the grid, including held rows.
 	unscoped := NewSource(fd, &noopState{}, "").Snapshot()
-	if unscoped.Counters.Running != 3 {
-		t.Errorf("unscoped running: want 3 (daemon total), got %d", unscoped.Counters.Running)
+	if unscoped.Counters.Sessions != 1 {
+		t.Errorf("unscoped sessions: want 1 visible row, got %d", unscoped.Counters.Sessions)
 	}
 }
 
@@ -210,3 +260,10 @@ func TestRepoMatch(t *testing.T) {
 type noopState struct{}
 
 func (noopState) Read(string) (*state.State, error) { return nil, state.ErrNotFound }
+
+type countingState struct{ calls int }
+
+func (s *countingState) Read(string) (*state.State, error) {
+	s.calls++
+	return nil, state.ErrNotFound
+}

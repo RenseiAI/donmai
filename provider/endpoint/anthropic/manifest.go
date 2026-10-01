@@ -72,6 +72,14 @@ func (*Endpoint) Manifest() agent.ModelEndpointManifest {
 				SupportsJSONMode: false,
 				Hosts:            []agent.ServingHost{agent.HostDirect, agent.HostBedrock, agent.HostVertex},
 			},
+			{
+				ID:               "claude-sonnet-5",
+				HumanLabel:       "Claude Sonnet 5",
+				ContextWindow:    1000000,
+				SupportsTools:    true,
+				SupportsJSONMode: false,
+				Hosts:            []agent.ServingHost{agent.HostOAuthCLI},
+			},
 		},
 	}
 }

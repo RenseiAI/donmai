@@ -46,3 +46,14 @@ Security guardrails (all implemented — keep them true):
   names only.
 - Malformed `.env.local` lines are non-fatal: name + line number logged, value
   dropped.
+
+The local GitHub issue source has a separate, source-only credential lookup.
+It reads the already merged `GITHUB_TOKEN`; a sole `GH_TOKEN` is also accepted.
+Different nonempty values for both names refuse startup. When neither exists,
+it reads the active `github.com` login through the installed GitHub CLI under
+the service user's home. This is not a third child-environment source: the
+looked-up bearer stays in the local source process and is never added to
+`SpawnerOptions.BaseEnv`, a worker environment, daemon configuration, or a
+service definition. A missing or unusable CLI login refuses local-source
+startup. The installed service does not search for a repository `.env.local`
+from an unrelated working directory.

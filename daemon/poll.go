@@ -80,6 +80,7 @@ type PollWorkItem struct {
 	PullRequest           *workarea.PullRequestV1           `json:"pullRequest,omitempty"`
 	RequiresRepository    bool                              `json:"requiresRepository,omitempty"`
 	Ref                   string                            `json:"ref,omitempty"`
+	BaseRef               string                            `json:"baseRef,omitempty"`
 	Priority              int                               `json:"priority,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
 	MaxDuration           int                               `json:"maxDurationSeconds,omitempty"`
@@ -1527,6 +1528,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		CacheSeedID:             item.CacheSeedID,
 		PullRequest:             item.PullRequest,
 		Ref:                     item.Ref,
+		BaseRef:                 item.BaseRef,
 		WorkType:                item.WorkType,
 		PromptContext:           item.PromptContext,
 		Body:                    item.Body,

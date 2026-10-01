@@ -1,14 +1,18 @@
 package afcli
 
 import (
+	"context"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"net/url"
 	"os"
 	"path/filepath"
 	"strconv"
+	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
 )
@@ -178,5 +182,112 @@ func TestNewHostWatchClient_CarriesControlToken(t *testing.T) {
 				t.Errorf("GET Authorization = %q (seen %v), want a credential-free GET", got, ok)
 			}
 		})
+	}
+}
+
+// Drive the real command in a child with pipe output and no terminal input.
+// The fixture exposes only read-only daemon endpoints on an owned loopback
+// server; the child context ends the actual Bubble Tea program and Wait joins
+// it before this test inspects output.
+func TestHostWatchPlainPipeRunsWithoutTTY(t *testing.T) {
+	if os.Getenv("DONMAI_TEST_HOST_WATCH_PIPE_CHILD") == "1" {
+		ctx, cancel := context.WithTimeout(context.Background(), 1500*time.Millisecond)
+		defer cancel()
+		cmd := newHostWatchCmd()
+		args := []string{"--all", "--daemon-url", os.Getenv("DONMAI_TEST_HOST_WATCH_PIPE_URL")}
+		if os.Getenv("DONMAI_TEST_HOST_WATCH_EXPLICIT_PLAIN") == "1" {
+			args = append(args, "--plain")
+		}
+		cmd.SetArgs(args)
+		cmd.SetOut(os.Stdout)
+		cmd.SetErr(os.Stderr)
+		if err := cmd.ExecuteContext(ctx); !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("watch should run until bounded context cancellation, got %v", err)
+		}
+		return
+	}
+
+	var mu sync.Mutex
+	requests := map[string]int{}
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		mu.Lock()
+		requests[r.URL.Path]++
+		mu.Unlock()
+		w.Header().Set("Content-Type", "application/json")
+		switch r.URL.Path {
+		case "/api/daemon/sessions":
+			_, _ = w.Write([]byte(`[{"sessionId":"watch-fixture-session-1234","pid":42,"state":"running","projectName":"private-watch-project","repository":"https://github.com/example/project.git","harness":"claude-code","model":"fixture-model","workType":"development"}]`))
+		case "/api/daemon/status":
+			_, _ = w.Write([]byte(`{"status":"running","version":"9.9.9-fixture","maxSessions":2,"uptimeSeconds":90}`))
+		case "/api/daemon/stats":
+			_, _ = w.Write([]byte(`{"queueDepth":1}`))
+		default:
+			http.NotFound(w, r)
+		}
+	}))
+	t.Cleanup(server.Close)
+	for _, explicit := range []bool{false, true} {
+		name := "auto-plain"
+		if explicit {
+			name = "explicit-plain"
+		}
+		t.Run(name, func(t *testing.T) {
+			root := t.TempDir()
+			binary, err := os.Executable()
+			if err != nil {
+				t.Fatal(err)
+			}
+			output, err := os.CreateTemp(root, "watch-output-")
+			if err != nil {
+				t.Fatal(err)
+			}
+			input, err := os.Open(os.DevNull)
+			if err != nil {
+				_ = output.Close()
+				t.Fatal(err)
+			}
+			env := []string{
+				"HOME=" + root, "TMPDIR=" + root, "PATH=" + os.Getenv("PATH"),
+				"TERM=dumb", "NO_COLOR=1", "GORACE=atexit_sleep_ms=0",
+				"DONMAI_TEST_HOST_WATCH_PIPE_CHILD=1",
+				"DONMAI_TEST_HOST_WATCH_PIPE_URL=" + server.URL,
+			}
+			if explicit {
+				env = append(env, "DONMAI_TEST_HOST_WATCH_EXPLICIT_PLAIN=1")
+			}
+			process, err := os.StartProcess(binary, []string{binary, "-test.run=^TestHostWatchPlainPipeRunsWithoutTTY$"}, &os.ProcAttr{
+				Dir: root, Env: env, Files: []*os.File{input, output, output},
+			})
+			_ = input.Close()
+			_ = output.Close()
+			if err != nil {
+				t.Fatalf("start owned watch child: %v", err)
+			}
+			state, err := process.Wait()
+			raw, readErr := os.ReadFile(output.Name())
+			if readErr != nil {
+				t.Fatal(readErr)
+			}
+			if err != nil || !state.Success() {
+				t.Fatalf("owned watch child failed: state=%v err=%v output=%s", state, err, raw)
+			}
+			text := string(raw)
+			t.Logf("piped renderer emitted ANSI control bytes: %t", strings.Contains(text, "\x1b["))
+			for _, wanted := range []string{"private-watch-project", "fixture-model", "9.9.9-fixture"} {
+				if !strings.Contains(text, wanted) {
+					t.Errorf("piped watch lost %q: %q", wanted, text)
+				}
+			}
+			if strings.Contains(text, "/dev/tty") {
+				t.Errorf("piped watch still attempted terminal input: %q", text)
+			}
+		})
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	for _, path := range []string{"/api/daemon/sessions", "/api/daemon/status", "/api/daemon/stats"} {
+		if requests[path] == 0 {
+			t.Errorf("real watch command did not read %s", path)
+		}
 	}
 }

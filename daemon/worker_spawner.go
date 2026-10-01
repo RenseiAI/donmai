@@ -121,6 +121,12 @@ type SpawnerOptions struct {
 	// Nil reads as zero, which is correct for an embedder with no shims.
 	ExternalOccupancy func() int
 
+	// ExternalSessionIDs reports unresolved external session identities. It runs
+	// under the spawner mutex and must not reenter any spawner API. The supplier
+	// must never hold its own lock while calling back into this spawner.
+	// Returned IDs are deduplicated against owned sessions and reservations.
+	ExternalSessionIDs func() []string
+
 	// ShimOwns, when non-nil, is the stable ownership selector consulted before
 	// ShimSpawn or OnPreSpawn. False goes directly to the ordinary child path;
 	// true requires ShimSpawn to return a handle or error and may never silently
@@ -793,7 +799,7 @@ func (s *WorkerSpawner) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 		s.mu.Unlock()
 		return nil, fmt.Errorf("session %q is already being started", spec.SessionID)
 	}
-	if active, capacity := len(s.sessions)+len(s.spawnReservations)+s.externalOccupancy(), s.opts.MaxConcurrentSessions; active >= capacity {
+	if active, capacity := len(s.sessions)+len(s.spawnReservations)+s.externalOccupancy()+s.externalSessionOccupancyLocked(), s.opts.MaxConcurrentSessions; active >= capacity {
 		s.mu.Unlock()
 		// Snapshot the counts BEFORE unlocking — formatting them after
 		// release races with spawn.func1's delete on s.sessions when an
@@ -832,6 +838,26 @@ func (s *WorkerSpawner) externalOccupancy() int {
 		return n
 	}
 	return 0
+}
+
+func (s *WorkerSpawner) externalSessionOccupancyLocked() int {
+	if s.opts.ExternalSessionIDs == nil {
+		return 0
+	}
+	seen := make(map[string]struct{})
+	for _, id := range s.opts.ExternalSessionIDs() {
+		if id == "" {
+			continue
+		}
+		if _, exists := s.sessions[id]; exists {
+			continue
+		}
+		if _, exists := s.spawnReservations[id]; exists {
+			continue
+		}
+		seen[id] = struct{}{}
+	}
+	return len(seen)
 }
 
 // spawnThroughShim offers the session to the shim launch path.
@@ -1816,7 +1842,7 @@ func composeEnv(parts ...map[string]string) []string {
 		}
 	}
 	parent := runtimeenv.FilterRunnerOnly(os.Environ())
-	out := make([]string, 0, len(parent)+len(merged))
+	out := make([]string, 0, len(parent))
 	out = append(out, parent...)
 	for k, v := range merged {
 		out = append(out, k+"="+v)

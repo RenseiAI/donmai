@@ -38,6 +38,10 @@ const LandingWorkType = "landing-run"
 
 // Options configure a Daemon.
 type Options struct {
+	// LocalRuntime supplies the shipped standalone file-queue implementation.
+	LocalRuntime *LocalRuntimeOptions
+	// SetupLocalRuntimeResolver supplies actual local setup observations.
+	SetupLocalRuntimeResolver LocalRuntimeSetupResolver
 	// ConfigPath is where to load / persist daemon.yaml. Defaults to
 	// DefaultConfigPath().
 	ConfigPath string
@@ -523,6 +527,7 @@ type Daemon struct {
 	// no-server embedders retain immediate polling after initialization.
 	controlStartup     *controlStartupBarrier
 	pollStartupContext context.Context
+	localRuntime       atomic.Pointer[localRuntime]
 
 	// routingTraces is the in-process record of cross-provider
 	// scheduler decisions. The /api/daemon/routing/* surface reads
@@ -750,6 +755,15 @@ func (d *Daemon) Config() *Config {
 		return nil
 	}
 	c := *d.config
+	if c.LocalRuntime != nil {
+		local := *c.LocalRuntime
+		local.Repositories = append([]LocalGitHubRepository(nil), local.Repositories...)
+		if local.ExecutionSecurity != nil {
+			policy := *local.ExecutionSecurity
+			local.ExecutionSecurity = &policy
+		}
+		c.LocalRuntime = &local
+	}
 	return &c
 }
 
@@ -869,11 +883,19 @@ func (d *Daemon) ActiveSessions() []SessionHandle {
 	if d.spawner != nil {
 		out = d.spawner.ActiveSessions()
 	}
-	shims := d.sessionShimHandles()
-	if len(shims) == 0 {
-		return out
+	out = append(out, d.sessionShimHandles()...)
+	if local := d.localRuntime.Load(); local != nil {
+		owned := map[string]bool{}
+		for _, handle := range out {
+			owned[handle.SessionID] = true
+		}
+		for _, handle := range local.heldSessions() {
+			if !owned[handle.SessionID] {
+				out = append(out, handle)
+			}
+		}
 	}
-	return append(out, shims...)
+	return out
 }
 
 // Spawner returns the daemon's WorkerSpawner so callers can subscribe to
@@ -961,6 +983,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.setState(StateStarting)
 	d.lifecycleMu.Unlock()
 
+	if !d.opts.SkipRegistration {
+		if _, err := PrepareLocalRuntimeConfig(d.opts.ConfigPath); err != nil {
+			return fmt.Errorf("prepare local execution-security configuration: %w", err)
+		}
+	}
 	cfg, err := LoadConfig(d.opts.ConfigPath)
 	if err != nil {
 		return fmt.Errorf("load config: %w", err)
@@ -968,9 +995,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if cfg == nil {
 		// First run — wizard or default.
 		cfg, err = RunSetupWizard(WizardOptions{
-			ConfigPath: d.opts.ConfigPath,
-			BinaryName: d.opts.BinaryName,
-			SkipWizard: d.opts.SkipWizard,
+			Context:              ctx,
+			LocalRuntimeResolver: d.opts.SetupLocalRuntimeResolver,
+			ConfigPath:           d.opts.ConfigPath,
+			BinaryName:           d.opts.BinaryName,
+			SkipWizard:           d.opts.SkipWizard,
 		})
 		if err != nil {
 			return fmt.Errorf("setup wizard: %w", err)
@@ -983,6 +1012,35 @@ func (d *Daemon) Start(ctx context.Context) error {
 	d.mu.Unlock()
 	if err := d.sessionShimReadinessGate(sessionShimReadinessResolveNow); err != nil {
 		return err
+	}
+
+	var local *localRuntime
+	localStarted := false
+	defer func() {
+		if local != nil && !localStarted {
+			_ = local.close(context.Background())
+			d.localRuntime.CompareAndSwap(local, nil)
+		}
+	}()
+	if localRuntimeRequested(cfg) && !d.opts.SkipRegistration {
+		if d.sessionShimEnabled() {
+			return errors.New("local file runtime supports direct headless execution only")
+		}
+		local, err = newLocalRuntime(ctx, d, cfg)
+		if err != nil {
+			return err
+		}
+		d.localRuntime.Store(local)
+		d.mu.Lock()
+		d.workerID = local.identity.WorkerID
+		d.jwt = ""
+		d.mu.Unlock()
+		if d.opts.ExecutionPreflightStore == nil {
+			d.opts.ExecutionPreflightStore = NewFileExecutionPreflightStore(local.options.QueueRoot + ".preflight")
+		}
+		if d.opts.ExecutionPreflightRegistrar == nil {
+			d.opts.ExecutionPreflightRegistrar = NewFileExecutionPreflightRegistrar(local.options.QueueRoot + ".registrar")
+		}
 	}
 
 	// Detect substrate capabilities before registration so they can be
@@ -999,7 +1057,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		regResp *RegisterResponse
 		regOpts RegistrationOptions
 	)
-	if !d.opts.SkipRegistration {
+	if !d.opts.SkipRegistration && local == nil {
 		token := cfg.Orchestrator.AuthToken
 		if token == "" {
 			token = os.Getenv("DONMAI_DAEMON_TOKEN")
@@ -1055,7 +1113,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 	}
 
 	register := func() error {
-		if d.opts.SkipRegistration {
+		if d.opts.SkipRegistration || local != nil {
 			return nil
 		}
 		var registerErr error
@@ -1139,6 +1197,39 @@ func (d *Daemon) Start(ctx context.Context) error {
 			spawnerOpts.WorkerCommand = cmd
 		}
 	}
+	if local != nil {
+		if len(spawnerOpts.WorkerCommand) == 0 {
+			return errors.New("local runtime requires an executable worker command")
+		}
+		spawnerOpts.WorkerCommand = append(append([]string(nil), spawnerOpts.WorkerCommand...), "--local-runtime", "--local-runtime-contract="+string(runner.RuntimeTransportLocalV2))
+		if err := local.bindWorkerCommand(spawnerOpts.WorkerCommand); err != nil {
+			return err
+		}
+		previous := spawnerOpts.OnPreSpawn
+		spawnerOpts.OnPreSpawn = func(spec SessionSpec, env []string) ([]string, error) {
+			if _, err := local.validateSecretRelease(spec); err != nil {
+				return nil, err
+			}
+			if previous != nil {
+				next, hookErr := previous(spec, env)
+				if hookErr != nil {
+					return nil, hookErr
+				}
+				if next != nil {
+					env = next
+				}
+			}
+			return local.preSpawn(spec, env)
+		}
+		priorIDs := spawnerOpts.ExternalSessionIDs
+		spawnerOpts.ExternalSessionIDs = func() []string {
+			ids := local.heldIDs()
+			if priorIDs != nil {
+				ids = append(ids, priorIDs()...)
+			}
+			return ids
+		}
+	}
 	// Default child stdout/stderr → slog so operators can see what the
 	// spawned `donmai agent run` is doing without manually attaching a
 	// debugger or rerunning under foreground. v0.5.0 had StdoutPrefixWriter
@@ -1186,6 +1277,9 @@ func (d *Daemon) Start(ctx context.Context) error {
 	// stale auth tokens do not linger.
 	d.spawner.On(func(ev SessionEvent) {
 		if ev.Kind == SessionEventEnded && d.sessionDetails != nil {
+			if local != nil {
+				local.ended(ev.Spec.SessionID)
+			}
 			if store, ok := d.opts.ExecutionPreflightStore.(ExecutionPreflightReplayStore); ok {
 				if detail, found := d.sessionDetails.Get(ev.Spec.SessionID); found {
 					if binding, decodeErr := executioncell.DecodeRuntimeBinding(detail.ExecutionRuntimeBinding); decodeErr == nil && binding.ContractVersion == executioncell.RuntimeBindingV2ContractVersion {
@@ -1457,6 +1551,11 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.startGateway(ctx)
 	}
 
+	if local != nil && d.controlURL.Load() != nil {
+		if err = local.publishEndpoint(ctx); err != nil {
+			return err
+		}
+	}
 	d.lifecycleMu.Lock()
 	if err := ctx.Err(); err != nil {
 		d.lifecycleMu.Unlock()
@@ -1472,6 +1571,7 @@ func (d *Daemon) Start(ctx context.Context) error {
 		d.activateStartupPollingLocked()
 	}
 	d.lifecycleMu.Unlock()
+	localStarted = true
 	return nil
 }
 
@@ -1519,38 +1619,47 @@ func (d *Daemon) GatewayStatus() gateway.Status {
 	return g.Status(ledger)
 }
 
-// onYamlChanged is the fsnotify callback wired in Start(). Called whenever
-// daemon.yaml is rewritten on disk (operator edit or our own mutation-apply
-// path). Replaces the live project admission projection in config, spawner,
-// and the credential refresher. The heartbeat reports the live spawner state;
-// a subsequent full registration also presents the same current declaration.
-//
-// Defensive: only mutates state when project entries, IDs, or admission mode
-// or the session ceiling differ from the in-memory copy. Other capacity fields
-// and the orchestrator URL remain restart-bound.
+// onYamlChanged is the fsnotify callback wired in Start(). It publishes
+// project, local-source and exact session-ceiling changes while preserving
+// restart-bound capacity fields and the orchestrator URL.
 func (d *Daemon) onYamlChanged(cfg *Config) {
+	// A local dispatch holds this read lease through its authority transition.
+	// Publish the new policy under the writer lease, then release it before
+	// calling source factories or other external code.
+	releasePolicy := func() {}
+	if local := d.localRuntime.Load(); local != nil {
+		local.policyMu.Lock()
+		releasePolicy = local.policyMu.Unlock
+	}
 	d.mu.Lock()
 	if d.config == nil {
 		d.mu.Unlock()
+		releasePolicy()
 		return
 	}
-	// Cheap equality check on the structured allowlist projection — same
-	// shape the heartbeat reports, so this exactly matches "what the
-	// platform would see change".
 	before := AllowlistEntriesFromConfig(d.config.EffectiveProjectConfigs())
 	after := AllowlistEntriesFromConfig(cfg.EffectiveProjectConfigs())
 	beforeIDs := strings.Join(d.config.EffectiveEnabledProjectIDs(), "\x00")
 	afterIDs := strings.Join(cfg.EffectiveEnabledProjectIDs(), "\x00")
-	beforeMode := d.config.EffectiveProjectAdmissionMode()
-	afterMode := cfg.EffectiveProjectAdmissionMode()
-	projectsChanged := allowlistHash(before) != allowlistHash(after) || beforeIDs != afterIDs || beforeMode != afterMode
+	projectsChanged := allowlistHash(before) != allowlistHash(after) || beforeIDs != afterIDs || d.config.EffectiveProjectAdmissionMode() != cfg.EffectiveProjectAdmissionMode()
+	localChanged := !reflect.DeepEqual(d.config.LocalRuntime, cfg.LocalRuntime)
+	var beforeRepositories, afterRepositories []LocalGitHubRepository
+	if d.config.LocalRuntime != nil {
+		beforeRepositories = d.config.LocalRuntime.Repositories
+	}
+	if cfg.LocalRuntime != nil {
+		afterRepositories = cfg.LocalRuntime.Repositories
+	}
+	repositoriesChanged := !reflect.DeepEqual(beforeRepositories, afterRepositories)
 	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
-	if !projectsChanged && !capacityChanged {
+	if !projectsChanged && !localChanged && !capacityChanged {
 		d.mu.Unlock()
+		releasePolicy()
 		return
 	}
 	if cfg.Capacity.MaxConcurrentSessions < 0 {
 		d.mu.Unlock()
+		releasePolicy()
 		slog.Warn("[yaml-watcher] rejected negative session limit")
 		return
 	}
@@ -1558,13 +1667,25 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		if d.spawner != nil {
 			if err := d.spawner.SetMaxConcurrentSessions(cfg.Capacity.MaxConcurrentSessions); err != nil {
 				d.mu.Unlock()
+				releasePolicy()
 				slog.Warn("[yaml-watcher] rejected session limit", "error", err)
 				return
 			}
 		}
 		d.config.Capacity.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
 	}
-	if projectsChanged {
+	if projectsChanged || localChanged {
+		if cfg.LocalRuntime == nil {
+			d.config.LocalRuntime = nil
+		} else {
+			local := *cfg.LocalRuntime
+			local.Repositories = append([]LocalGitHubRepository(nil), local.Repositories...)
+			if local.ExecutionSecurity != nil {
+				policy := *local.ExecutionSecurity
+				local.ExecutionSecurity = &policy
+			}
+			d.config.LocalRuntime = &local
+		}
 		d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
 		d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
 		d.config.ProjectAdmissionMode = cfg.ProjectAdmissionMode
@@ -1577,10 +1698,16 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 		d.refreshRegistrationProjectsLocked()
 	}
 	d.mu.Unlock()
+	releasePolicy()
 
-	slog.Info("[yaml-watcher] reloaded configuration",
-		"beforeCount", len(before), "afterCount", len(after),
-		"maxConcurrentSessions", cfg.Capacity.MaxConcurrentSessions)
+	if repositoriesChanged {
+		if local := d.localRuntime.Load(); local != nil {
+			if err := local.reconfigure(afterRepositories); err != nil {
+				slog.Warn("local source policy reload held", "error", err)
+			}
+		}
+	}
+	slog.Info("[yaml-watcher] reloaded configuration", "beforeCount", len(before), "afterCount", len(after), "maxConcurrentSessions", cfg.Capacity.MaxConcurrentSessions)
 }
 
 // refreshRegistrationProjectsLocked follows a committed config/spawner
@@ -1674,6 +1801,10 @@ func (d *Daemon) Stop(ctx context.Context) error {
 		pollDone = poller.beginStop()
 	}
 	landingDone := d.beginLandingStop()
+	var localDone <-chan struct{}
+	if local := d.localRuntime.Load(); local != nil {
+		localDone = local.beginStop()
+	}
 
 	drainCtx, cancel := context.WithTimeout(ctx, d.drainTimeout())
 	var drainErr error
@@ -1682,7 +1813,7 @@ func (d *Daemon) Stop(ctx context.Context) error {
 	}
 	cancel()
 
-	pollErr := waitCompletionContext(ctx, pollDone)
+	pollErr := errors.Join(waitCompletionContext(ctx, pollDone), waitCompletionContext(ctx, localDone))
 	landingErr := waitCompletionContext(ctx, landingDone)
 	var reloadErr error
 	if credentials != nil {
@@ -1703,6 +1834,12 @@ func (d *Daemon) Stop(ctx context.Context) error {
 			hook(attemptErr)
 		}
 		return attemptErr
+	}
+
+	if local := d.localRuntime.Load(); local != nil {
+		if err := local.close(ctx); err != nil {
+			return err
+		}
 	}
 
 	// Only a fully joined attempt owns terminal publication. The loop stoppers
@@ -2110,6 +2247,15 @@ func (d *Daemon) AcceptWork(spec SessionSpec) (*SessionHandle, error) {
 // corresponding SessionEventEnded event, so stale credentials never linger in
 // memory.
 func (d *Daemon) AcceptWorkWithDetail(spec SessionSpec, detail *SessionDetail) (*SessionHandle, error) {
+	return d.acceptWorkWithDetail(spec, detail, nil)
+}
+
+func (d *Daemon) acceptWorkWithDetail(spec SessionSpec, detail *SessionDetail, permit *localLaunchPermit) (*SessionHandle, error) {
+	if local := d.localRuntime.Load(); local != nil {
+		if err := local.allowAccept(spec, detail, permit); err != nil {
+			return nil, err
+		}
+	}
 	var localPreflight localExecutionPreflightAuthority
 	var preflightReplay ExecutionPreflightReplayStore
 	var localPreflightRequest *executioncell.PreflightRegistrationRequest
@@ -2922,6 +3068,9 @@ func (d *Daemon) spawnerActiveInteractiveCount() int {
 // Quarantined shims count toward the unclassed total only: this daemon could not
 // negotiate with them, so classifying their run mode would be a guess.
 func (d *Daemon) spawnerActiveSessionCounts() (active, activeInteractive int) {
+	if d.localRuntime.Load() != nil {
+		return len(d.ActiveSessions()), 0
+	}
 	if d.spawner != nil {
 		active, activeInteractive = d.spawner.ActiveSessionCounts()
 	}
@@ -3075,6 +3224,9 @@ func (d *Daemon) activateStartupPollingLocked() {
 	}
 	if d.poller != nil {
 		d.poller.Start()
+	}
+	if local := d.localRuntime.Load(); local != nil {
+		local.start(d.pollStartupContext)
 	}
 }
 

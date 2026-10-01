@@ -1,6 +1,9 @@
 package daemon
 
 import (
+	"context"
+	"os"
+	"os/exec"
 	"strings"
 	"sync"
 	"testing"
@@ -117,6 +120,56 @@ func TestComposeEnv_StripsRunnerOnlyFromParentEnv(t *testing.T) {
 	}
 	if !envHasEntry(got, parentOrdinaryEntry) {
 		t.Errorf("ordinary parent entry %q must still pass through", parentOrdinaryEntry)
+	}
+}
+
+// An empty filtered environment must remain an explicit empty child env.
+// A nil exec.Cmd.Env would silently re-inherit the supervisor's control token.
+func TestComposeEnv_EmptyFilteredParentDoesNotReinherit(t *testing.T) {
+	const (
+		producer = "compose-env-empty-producer"
+		assert   = "compose-env-empty-assert"
+	)
+	phase := ""
+	for _, arg := range os.Args {
+		if arg == producer || arg == assert {
+			phase = arg
+		}
+	}
+	if phase == assert {
+		if os.Getenv(afclient.ControlTokenEnv) != "" {
+			t.Fatal("worker inherited the supervisor control token")
+		}
+		return
+	}
+	if phase == producer {
+		executable, err := os.Executable()
+		if err != nil {
+			t.Fatal(err)
+		}
+		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+		defer cancel()
+		// Bind the current test executable after fixed-argument construction.
+		cmd := exec.CommandContext(ctx, "/donmai-env-probe", "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", assert)
+		cmd.Path, cmd.Args[0] = executable, executable
+		cmd.Env = composeEnv(nil, nil, nil)
+		if output, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("explicitly empty worker environment was not preserved: %v: %s", err, output)
+		}
+		return
+	}
+	executable, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
+	defer cancel()
+	// Bind the current test executable after fixed-argument construction.
+	cmd := exec.CommandContext(ctx, "/donmai-env-probe", "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", producer)
+	cmd.Path, cmd.Args[0] = executable, executable
+	cmd.Env = []string{afclient.ControlTokenEnv + "=synthetic-control-token"}
+	if output, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("isolated supervisor environment probe failed: %v: %s", err, output)
 	}
 }
 

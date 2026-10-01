@@ -191,6 +191,12 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			return nil
 		},
 		RunE: func(cmd *cobra.Command, _ []string) error {
+			// Resolve the optional CLI path before any startup reader or writer.
+			// Daemon.New resolves its own options later, after these consumers.
+			if configPath == "" {
+				configPath = daemon.DefaultConfigPath()
+			}
+
 			// Rotate the launchd-managed log files before anything writes
 			// to them this run, then re-check periodically for long-lived
 			// processes. launchd appends to daemon.log / daemon-error.log
@@ -251,26 +257,86 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				)
 			}
 
-			providerView, err := daemonProviderView(cfg, slog.Default())
+			// Preserve the established malformed-config refusal before any startup
+			// migration, provider construction or terminal authority can run.
+			if _, err := workareaArchiveRoot(configPath); err != nil {
+				return fmt.Errorf("load workarea archive configuration: %w", err)
+			}
+			if _, err := daemon.PrepareLocalRuntimeConfig(configPath); err != nil {
+				return fmt.Errorf("prepare local execution-security configuration: %w", err)
+			}
+			// An interactive first run must persist its selected mode before
+			// constructing mode-specific registries. When setup is skipped, leave
+			// the absent config to Daemon.Start's existing in-memory default path:
+			// a stub-only default can intentionally have no orchestrator URL and
+			// cannot be reloaded as an authored config before startup.
+			configured, err := daemon.LoadConfig(configPath)
 			if err != nil {
-				return fmt.Errorf("construct daemon provider view: %w", err)
+				return fmt.Errorf("load startup configuration: %w", err)
+			}
+			if configured == nil {
+				skipFirstRunWizard := skipWizard
+				if !skipFirstRunWizard {
+					if setupWizardTTYOverride != nil {
+						skipFirstRunWizard = !*setupWizardTTYOverride
+					} else {
+						skipFirstRunWizard = daemon.ShouldSkipWizard()
+					}
+				}
+				if !skipFirstRunWizard {
+					if _, err = daemon.RunSetupWizard(daemon.WizardOptions{
+						Context: cmd.Context(), ConfigPath: configPath, SkipWizard: skipWizard,
+						BinaryName:           binaryName(cfg),
+						LocalRuntimeResolver: localSetupResolverFactory(), Stdin: cmd.InOrStdin(),
+						Stdout: cmd.OutOrStdout(), IsTTY: setupWizardTTYOverride,
+					}); err != nil {
+						return fmt.Errorf("first-run setup: %w", err)
+					}
+				}
+			}
+			var providerView daemon.ProviderRegistry
+			var d *daemon.Daemon
+			localOptions, localProviders, err := newLocalRuntimeComposition(configPath, func() *daemon.Config {
+				if d == nil {
+					return nil
+				}
+				return d.Config()
+			}, spawnerOpts.BaseEnv)
+			if err != nil {
+				return fmt.Errorf("construct local runtime: %w", err)
+			}
+			if localProviders != nil {
+				if cfg.AgentSpecExtensionDecorator != nil {
+					return errors.New("local runtime does not yet admit additional extension decorators")
+				}
+				providerView = localProviders
+			} else {
+				providerView, err = daemonProviderView(cfg, slog.Default())
+				if err != nil {
+					return fmt.Errorf("construct daemon provider view: %w", err)
+				}
+			}
+			preflightStore := daemon.NewFileExecutionPreflightStore(statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts"))
+			if localOptions != nil {
+				preflightStore = daemon.NewFileExecutionPreflightStore(localOptions.QueueRoot + ".preflight")
 			}
 			daemonOpts := daemon.Options{
-				ConfigPath:       configPath,
-				BinaryName:       binaryName(cfg),
-				JWTPath:          jwtPath,
-				HTTPHost:         host,
-				HTTPPort:         port,
-				SkipWizard:       skipWizard,
-				ProviderRegistry: providerView,
-				ExecutionPreflightStore: daemon.NewFileExecutionPreflightStore(
-					statepath.Resolve("adaptation-receipts", "/tmp/.donmai/adaptation-receipts")),
+				LocalRuntime:                            localOptions,
+				SetupLocalRuntimeResolver:               localSetupResolverFactory(),
+				BinaryName:                              binaryName(cfg),
+				ConfigPath:                              configPath,
+				JWTPath:                                 jwtPath,
+				HTTPHost:                                host,
+				HTTPPort:                                port,
+				SkipWizard:                              skipWizard,
+				ProviderRegistry:                        providerView,
+				ExecutionPreflightStore:                 preflightStore,
 				ProtectedRuntimeMCPHelperCommandBuilder: protectedRuntimeMCPHelperCommand,
 				SpawnerOptions:                          spawnerOpts,
 				Version:                                 hostVersion,
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
-			d := daemon.New(daemonOpts)
+			d = daemon.New(daemonOpts)
 			ctx, cancel := context.WithCancel(cmd.Context())
 			defer cancel()
 

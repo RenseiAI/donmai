@@ -140,6 +140,70 @@ func TestModel_PreEnrichmentNoWorktreeNoTailer(t *testing.T) {
 	}
 }
 
+func TestModel_HeldSessionHasNoTailerActivityOrRunningClaim(t *testing.T) {
+	fd := &fakeDaemon{
+		sessions: []afclient.DaemonSessionHandle{
+			{SessionID: "held-123", State: "unknown", Repository: "o/a", ProjectName: "a"},
+			{SessionID: "live-123", State: "running", Repository: "o/a"},
+		},
+		status: &afclient.DaemonStatusResponse{ActiveSessions: 1, MaxSessions: 8},
+	}
+	m := newTestModel(t, fd, "")
+	// Plain cards stack; reserve enough rows for both complete cards.
+	resized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 80})
+	m = resized.(*Model)
+	// Model an earlier projection of the same identity as live: when the new
+	// held snapshot arrives, any stale event tailer must be dropped.
+	m.tailers["held-123"] = NewTailer("held-123", "/fixture/old/events.jsonl", true, time.Now)
+	m.applySnapshot(m.src.Snapshot())
+	if len(m.cards) != 2 {
+		t.Fatalf("want both visible sessions, got %d", len(m.cards))
+	}
+	if _, ok := m.tailers["held-123"]; ok {
+		t.Error("held session must not retain or start an event tailer")
+	}
+
+	m.applyTailBatch([]TailEvent{{
+		SessionID: "held-123", At: time.Now(), Event: agent.AssistantTextEvent{Text: "fabricated live activity"},
+	}})
+	out := m.render()
+	for _, want := range []string{"2 sessions", "held-123", "live-123", "held", "project a", "repo o/a"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("render missing %q:\n%s", want, out)
+		}
+	}
+	header := strings.SplitN(out, "\n", 2)[0]
+	if strings.Contains(header, "running") || !strings.Contains(header, "2 sessions") {
+		t.Errorf("header should count visible sessions without claiming all are running: %q", header)
+	}
+	for _, absent := range []string{"fabricated live activity"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("render should not claim/show %q:\n%s", absent, out)
+		}
+	}
+	if c := findCard(m, "held-123"); c == nil || c.LastActivity != "" || c.ToolCalls != 0 {
+		t.Errorf("held card acquired live metrics: %#v", c)
+	}
+}
+
+func TestHeldSnapshotDropsPreviousLiveObservations(t *testing.T) {
+	m := newTestModel(t, &fakeDaemon{}, "")
+	m.cards = []SessionCard{{
+		SessionID: "held", DaemonState: "running", Observed: true, MetricsReported: true,
+		ActualModel: "prior-response", ActualModelProvider: "prior-vendor", ActualModelVersion: "prior-version",
+		ToolCalls: 3, CostUsd: 1, LastActivity: "prior activity", LastWorkAt: time.Now(), LastOutputAt: time.Now(),
+	}}
+	m.applySnapshot(Snapshot{Cards: []SessionCard{{SessionID: "held", DaemonState: "unknown", AgentCardID: "card-id", AgentCardName: "Review"}}})
+	c := m.cards[0]
+	if c.Observed || c.MetricsReported || c.ActualModel != "" || c.ActualModelProvider != "" || c.ActualModelVersion != "" ||
+		c.ToolCalls != 0 || c.CostUsd != 0 || c.LastActivity != "" || !c.LastWorkAt.IsZero() || !c.LastOutputAt.IsZero() {
+		t.Fatalf("held projection inherited previous live data: %+v", c)
+	}
+	if c.AgentCardID != "card-id" || c.AgentCardName != "Review" {
+		t.Fatalf("held projection lost explicit card annotations: %+v", c)
+	}
+}
+
 func TestModel_KeyNavAndFollow(t *testing.T) {
 	fd := &fakeDaemon{
 		sessions: []afclient.DaemonSessionHandle{
