@@ -211,6 +211,15 @@ type SessionSpec struct {
 	// Company is the endpoint company key (e.g. "anthropic") — the matrix
 	// company-row key the gate resolves the machine cell against.
 	Company string `json:"company,omitempty"`
+	// Display-safe admitted axes. Company remains the endpoint wire surface;
+	// none of these values is inferred from it or from a model-name prefix.
+	// EndpointSurface is a display-only wire-surface annotation. Company
+	// remains the existing authorization/narrowing input and is never rewritten
+	// from this value. Unknown does not alter admission or spawn behavior.
+	EndpointSurface  string `json:"endpointSurface,omitempty"`
+	ModelAuthor      string `json:"modelAuthor,omitempty"`
+	EndpointOperator string `json:"endpointOperator,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
 
 	// Model is the platform-resolved model id (e.g. "claude-sonnet-4-5") —
 	// the most-specific matrix key in the model > company > '*' resolution.
@@ -302,9 +311,13 @@ type SessionHandle struct {
 	// Mirrors SessionSpec.Model.
 	Model string `json:"model,omitempty"`
 
-	// ModelProvider is the model-serving vendor identity, a separate axis
-	// from Harness (the loop driver). Mirrors SessionSpec.Company.
-	ModelProvider string `json:"modelProvider,omitempty"`
+	// ModelProvider is the configured endpoint company/surface, a separate
+	// axis from Harness and from the model author or observed provider.
+	// Mirrors SessionSpec.Company; the old wire key remains compatible.
+	ModelProvider    string `json:"modelProvider,omitempty"`
+	ModelAuthor      string `json:"modelAuthor,omitempty"`
+	EndpointOperator string `json:"endpointOperator,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
 
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Mirrors SessionSpec.WorkType.

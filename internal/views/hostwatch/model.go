@@ -42,6 +42,9 @@ type Options struct {
 	// Plain renders without color/box drawing (CI / non-TTY). The model
 	// still runs the full data path; only rendering changes.
 	Plain bool
+	// UnboundedCards retains complete cards in piped plain output.
+	// Interactive callers keep viewport limits.
+	UnboundedCards bool
 	// Replay, when true, reads each session's events.jsonl from the top
 	// (history) instead of seeking to the end. Off by default (steady-state
 	// "new output only").
@@ -316,11 +319,11 @@ func splitPaneHeights(contentH int, ratio float64) (gridH, streamH int) {
 
 // applySnapshot folds a new index poll into the model: refreshes the cards +
 // counters, then reconciles the tailer set (start tailers for new sessions,
-// drop tailers for sessions that vanished or finished). Folded live metrics
+// drop tailers for sessions that vanished). Folded live metrics
 // (tool counts, cost/turns, activity, freshness) survive the refresh: the
 // index poll carries no metrics, so a fresh card would otherwise zero them
-// on every tick. Metrics keyed by session id carry over; reordered cards
-// keep their own metrics and removed ids drop theirs.
+// on every tick. Metrics carry over only for the same fenced run;
+// reordered cards keep their own metrics and removed ids drop theirs.
 func (m *Model) applySnapshot(snap Snapshot) {
 	m.snapErr = snap.Err
 	m.counters = snap.Counters
@@ -335,16 +338,17 @@ func (m *Model) applySnapshot(snap Snapshot) {
 				continue // unresolved ownership cannot inherit earlier live observations
 			}
 			if prev, ok := kept[snap.Cards[i].SessionID]; ok {
-				if snap.Cards[i].sameObservedRun(prev) {
-					snap.Cards[i].retainFolded(prev)
+				if snap.Cards[i].sameLegacyObservedRun(prev) {
+					snap.Cards[i].retainLegacyFolded(prev)
+					if snap.Cards[i].sameMetricObservedRun(prev) {
+						snap.Cards[i].retainMetricFolded(prev)
+					}
 				} else {
 					delete(m.tailers, snap.Cards[i].SessionID)
-					// The log has no per-row run identity for old status
-					// observations. On a proven replacement run, attach at
-					// its current end even under --replay; old bytes cannot
-					// become observations attributed to the new reader.
+					// A valid per-run offset replays only this run's bytes;
+					// absent or invalid offsets attach at EOF, fail closed.
 					if path := snap.Cards[i].EventsPath(); path != "" {
-						m.tailers[snap.Cards[i].SessionID] = NewTailer(snap.Cards[i].SessionID, path, true, m.now)
+						m.tailers[snap.Cards[i].SessionID] = NewMetricTailer(snap.Cards[i].SessionID, path, snap.Cards[i].EventLogStartOffset, m.now)
 					}
 				}
 			}
@@ -362,8 +366,8 @@ func (m *Model) applySnapshot(snap Snapshot) {
 
 // reconcileTailers starts a tailer for every scoped session that has a known
 // worktree path and no tailer yet, and drops tailers whose session is no
-// longer present OR whose tailer is Done (terminal event consumed). Labels
-// are remembered so the merged stream stays attributed after a session ends.
+// longer present. A provider turn result need not end a continuing session.
+// Labels are remembered so the merged stream stays attributed after exit.
 func (m *Model) reconcileTailers() {
 	present := map[string]struct{}{}
 	for i := range m.cards {
@@ -382,7 +386,7 @@ func (m *Model) reconcileTailers() {
 			continue // held or pathless sessions have no session event stream
 		}
 		if _, ok := m.tailers[c.SessionID]; !ok {
-			m.tailers[c.SessionID] = NewTailer(c.SessionID, evPath, !m.opts.Replay, m.now)
+			m.tailers[c.SessionID] = NewMetricTailer(c.SessionID, evPath, c.EventLogStartOffset, m.now)
 		}
 	}
 	for id, t := range m.tailers {
@@ -410,8 +414,10 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 		}
 		label := m.labels[ev.SessionID]
 		idx := m.prefixes.get(ev.SessionID)
-		if line := formatStreamLine(m.theme, ev, label, idx, m.opts.Plain); line != "" {
-			lines = append(lines, line)
+		if !ev.Replay || m.opts.Replay {
+			if line := formatStreamLine(m.theme, ev, label, idx, m.opts.Plain); line != "" {
+				lines = append(lines, line)
+			}
 		}
 		m.foldMetrics(ev)
 	}
@@ -429,32 +435,52 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 	}
 }
 
-// retainFolded carries the tail-accumulated live metrics from a previous
-// card generation onto a refreshed card for the same session. Index polls
-// carry identity and header fields only; without this the refresh would
-// zero tool counts, cost/turns, activity text and freshness every tick.
-// sameObservedRun uses the runner's persisted start observation, not daemon
-// admission time: re-adoption can change AcceptedAt while the runner survives.
-// An absent start is not evidence of another run. Session removal separately
-// removes both card and tailer, and a later same-ID entry starts a fresh reader.
-func (c SessionCard) sameObservedRun(prev SessionCard) bool {
-	return c.StartedAtUnixMs <= 0 || prev.StartedAtUnixMs <= 0 || c.StartedAtUnixMs == prev.StartedAtUnixMs
+// Legacy live observations survive index refreshes in mixed-version runs.
+// A known change of run start or journal boundary is proof of replacement;
+// an absent field alone is not. Session removal still drops all folds.
+func (c SessionCard) sameLegacyObservedRun(prev SessionCard) bool {
+	if c.SessionID != prev.SessionID || c.WorktreePath != prev.WorktreePath {
+		return false
+	}
+	if c.StartedAtUnixMs > 0 && prev.StartedAtUnixMs > 0 && c.StartedAtUnixMs != prev.StartedAtUnixMs {
+		return false
+	}
+	if c.EventLogStartOffset != nil && prev.EventLogStartOffset != nil && *c.EventLogStartOffset != *prev.EventLogStartOffset {
+		return false
+	}
+	return true
 }
 
-func (c *SessionCard) retainFolded(prev SessionCard) {
+// New cumulative cost/turn observations need a positive exact run start and
+// journal boundary. Without either, they are not carried into a fresh card.
+func (c SessionCard) sameMetricObservedRun(prev SessionCard) bool {
+	return c.sameLegacyObservedRun(prev) && c.StartedAtUnixMs > 0 &&
+		prev.StartedAtUnixMs > 0 && c.StartedAtUnixMs == prev.StartedAtUnixMs &&
+		c.EventLogStartOffset != nil && prev.EventLogStartOffset != nil &&
+		*c.EventLogStartOffset == *prev.EventLogStartOffset
+}
+
+func (c *SessionCard) retainLegacyFolded(prev SessionCard) {
 	c.ToolCalls = prev.ToolCalls
 	c.LastTool = prev.LastTool
 	c.LastActivity = prev.LastActivity
-	c.CostUsd = prev.CostUsd
-	c.NumTurns = prev.NumTurns
 	c.Errored = prev.Errored
 	c.Observed = prev.Observed
-	c.MetricsReported = prev.MetricsReported
 	c.LastWorkAt = prev.LastWorkAt
 	c.LastOutputAt = prev.LastOutputAt
 	c.ActualModel = prev.ActualModel
 	c.ActualModelProvider = prev.ActualModelProvider
 	c.ActualModelVersion = prev.ActualModelVersion
+}
+
+func (c *SessionCard) retainMetricFolded(prev SessionCard) {
+	c.CostUsd = prev.CostUsd
+	c.NumTurns = prev.NumTurns
+	c.MetricsReported = prev.MetricsReported
+	c.CostReported = prev.CostReported
+	c.TurnsReported = prev.TurnsReported
+	c.seenCallSpanIDs = prev.seenCallSpanIDs
+	c.seenTerminalOffsets = prev.seenTerminalOffsets
 }
 
 func (m *Model) isHeldSession(sessionID string) bool {
@@ -508,6 +534,27 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			c.ActualModelProvider = e.ResponseModelProvider
 			c.ActualModelVersion = e.ModelSnapshotID
 		}
+		key := observedUsageKey(e, ev.Offset)
+		if !e.Synthetic && e.UsageSource == agent.LlmUsageProvider && key != "" {
+			if c.seenCallSpanIDs == nil {
+				c.seenCallSpanIDs = make(map[string]struct{})
+			}
+			if _, seen := c.seenCallSpanIDs[key]; !seen {
+				c.seenCallSpanIDs[key] = struct{}{}
+				if e.ObservedCostUsd != nil && finiteNonnegative(*e.ObservedCostUsd) {
+					next := c.CostUsd + *e.ObservedCostUsd
+					if finiteNonnegative(next) {
+						c.CostUsd = next
+						c.CostReported = true
+					}
+				}
+				if e.TurnCompleted {
+					c.NumTurns++
+					c.TurnsReported = true
+				}
+				c.MetricsReported = c.CostReported || c.TurnsReported
+			}
+		}
 		// A model call with usage is meaningful work even without a tool
 		// invocation; a call without usage is an observation only.
 		if e.InputTokens > 0 || e.OutputTokens > 0 {
@@ -538,11 +585,26 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			}
 		}
 	case agent.ResultEvent:
-		// Cost/turn counts only arrive on the terminal result event.
-		if e.Cost != nil {
-			c.CostUsd = e.Cost.TotalCostUsd
-			c.NumTurns = e.Cost.NumTurns
-			c.MetricsReported = true
+		// A native cumulative observation replaces the provisional sum. A
+		// missing field leaves the independently known field untouched.
+		terminalSeen := false
+		if ev.Offset != nil {
+			if c.seenTerminalOffsets == nil {
+				c.seenTerminalOffsets = make(map[int64]struct{})
+			}
+			_, terminalSeen = c.seenTerminalOffsets[*ev.Offset]
+			c.seenTerminalOffsets[*ev.Offset] = struct{}{}
+		}
+		if !terminalSeen {
+			if e.ObservedCostUsd != nil && finiteNonnegative(*e.ObservedCostUsd) {
+				c.CostUsd = *e.ObservedCostUsd
+				c.CostReported = true
+			}
+			if e.ObservedTurns != nil && *e.ObservedTurns >= 0 {
+				c.NumTurns = *e.ObservedTurns
+				c.TurnsReported = true
+			}
+			c.MetricsReported = c.CostReported || c.TurnsReported
 		}
 		if !e.Success {
 			c.Errored = true
@@ -558,6 +620,10 @@ func (m *Model) foldMetrics(ev TailEvent) {
 			c.LastOutputAt = ev.EventAt()
 		}
 	}
+}
+
+func finiteNonnegative(value float64) bool {
+	return !math.IsNaN(value) && !math.IsInf(value, 0) && value >= 0
 }
 
 // layout recomputes child sizes after a resize or a split change. The
@@ -599,6 +665,9 @@ func (m *Model) render() string {
 	}
 
 	gridH, _ := splitPaneHeights(m.height-2, m.split)
+	if m.opts.Plain && m.opts.UnboundedCards {
+		gridH = 0
+	}
 	grid := renderGrid(m.theme, m.cards, m.cursor, m.frame, m.width, gridH, m.opts.Plain, m.now())
 
 	streamTitle := "session stream"
@@ -611,6 +680,9 @@ func (m *Model) render() string {
 			lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render("  ["+follow+"]")
 	}
 	streamBody := m.stream.View().Content
+	if m.opts.Plain && m.opts.UnboundedCards {
+		streamBody = strings.TrimRight(streamBody, "\n ")
+	}
 
 	return lipgloss.JoinVertical(lipgloss.Left,
 		header,
@@ -798,4 +870,16 @@ func (m *Model) renderHelp() string {
 		return help
 	}
 	return lipgloss.NewStyle().Foreground(m.theme.TextTertiary).Render(help)
+}
+
+// A journal position identifies a local observation when optional span upload
+// is disabled. Both namespaces are stable on replay and reset with the run.
+func observedUsageKey(call agent.LlmCallEvent, offset *int64) string {
+	if call.SpanID != "" {
+		return "span:" + call.SpanID
+	}
+	if offset != nil && *offset >= 0 {
+		return fmt.Sprintf("journal:%d", *offset)
+	}
+	return ""
 }

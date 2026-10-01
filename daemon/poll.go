@@ -1276,6 +1276,7 @@ func pollItemCredentialMetadata(item PollWorkItem) (requirements []CredentialEnv
 func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionSpec {
 	repo, matched := resolveAllowlistedRepo(item, projects)
 	credentialRequirements, harness, servingHost := pollItemCredentialMetadata(item)
+	modelAuthor, endpointOperator, protocol, endpointSurface := pollItemDisplayAxes(item)
 	spec := SessionSpec{
 		SessionID:              item.SessionID,
 		AgentCardID:            item.AgentCardID,
@@ -1297,6 +1298,10 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		CredentialRequirements: credentialRequirements,
 		Harness:                harness,
 		ServingHost:            servingHost,
+		EndpointSurface:        endpointSurface,
+		ModelAuthor:            modelAuthor,
+		EndpointOperator:       endpointOperator,
+		Protocol:               protocol,
 		// ── P3 narrow-only gate inputs (ADR-2026-06-06 §5.3) ─────────────
 		// Copied through (NOT enforced) so the embedder's OnPreSpawn closure
 		// has everything access.ResolveMachineCell needs. WorkType + Mode are
@@ -1318,6 +1323,70 @@ func PollItemToSessionSpec(item PollWorkItem, projects []ProjectConfig) SessionS
 		spec.PlatformAllowed = rp.PlatformAllowed
 	}
 	return spec
+}
+
+// pollItemDisplayAxes projects only explicit carried axes. These annotations
+// are not admission authority: the existing receipt/claim/effective-cell
+// preflight join still decides whether any worker may launch.
+func pollItemDisplayAxes(item PollWorkItem) (string, string, string, string) {
+	var endpoint *SessionEndpointBinding
+	if item.ResolvedProfile != nil {
+		endpoint = item.ResolvedProfile.Endpoint
+	}
+	var author, operator, protocol, surface string
+	if item.ResolvedProfile != nil {
+		surface = sessionDisplayAxis(item.ResolvedProfile.Company)
+	}
+	if endpoint != nil && endpoint.Company != "" {
+		if item.ResolvedProfile.Company != "" && item.ResolvedProfile.Company != endpoint.Company {
+			return "", "", "", "unknown"
+		}
+		surface = sessionDisplayAxis(endpoint.Company)
+		if surface == "" {
+			surface = "unknown"
+		}
+	}
+	if len(item.EffectiveCell) != 0 {
+		cell, err := executioncell.DecodeResolvedExecutionCell(item.EffectiveCell)
+		if err != nil {
+			return "", "", "", "unknown"
+		}
+		author, operator, protocol = cell.Model.Author, cell.Endpoint.Operator, cell.Endpoint.Protocol
+		if endpoint != nil &&
+			((endpoint.ModelAuthor != "" && endpoint.ModelAuthor != author) ||
+				(endpoint.EndpointOperator != "" && endpoint.EndpointOperator != operator) ||
+				(endpoint.Protocol != "" && endpoint.Protocol != protocol) ||
+				(endpoint.Model != "" && endpoint.Model != cell.Model.ID) ||
+				(endpoint.EndpointID != "" && endpoint.EndpointID != cell.Endpoint.ID)) {
+			return "", "", "", "unknown"
+		}
+	} else if endpoint != nil {
+		author, operator, protocol = endpoint.ModelAuthor, endpoint.EndpointOperator, endpoint.Protocol
+	}
+	return sessionDisplayAxis(author), sessionDisplayAxis(operator), sessionDisplayAxis(protocol), surface
+}
+
+// sessionDisplayAxis permits identifier text only. Unknown does not block a
+// spawn, and URLs, control text or other material do not become display axes.
+func sessionDisplayAxis(value string) string {
+	if len(value) == 0 || len(value) > 64 {
+		return ""
+	}
+	for _, r := range value {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':') {
+			return ""
+		}
+	}
+	return value
+}
+
+// sessionDisplaySurface preserves legacy Company only as a display fallback;
+// it never changes that independent authorization input.
+func sessionDisplaySurface(spec SessionSpec) string {
+	if spec.EndpointSurface != "" {
+		return sessionDisplayAxis(spec.EndpointSurface)
+	}
+	return sessionDisplayAxis(spec.Company)
 }
 
 // resolveAllowlistedRepo returns the canonical clone URL for a poll

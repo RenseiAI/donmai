@@ -3,6 +3,7 @@ package hostwatch
 import (
 	"encoding/json"
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"testing"
@@ -266,4 +267,51 @@ type countingState struct{ calls int }
 func (s *countingState) Read(string) (*state.State, error) {
 	s.calls++
 	return nil, state.ErrNotFound
+}
+
+func TestSourcePreservesAdmittedDisplayAxesAndRunOffset(t *testing.T) {
+	wt := filepath.Join(t.TempDir(), "session")
+	zero := int64(0)
+	writeState(t, wt, state.State{
+		SessionID: "session", StartedAt: 12, EventLogStartOffset: &zero,
+		ModelAuthor: "meta", EndpointOperator: "operator", Protocol: "openai-chat",
+	})
+	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{{
+		SessionID: "session", State: "running", WorktreePath: wt,
+		ModelProvider: "openai", ModelAuthor: "meta", EndpointOperator: "operator", Protocol: "openai-chat",
+	}}}
+	snap := NewSource(fd, state.NewStore(), "").Snapshot()
+	if len(snap.Cards) != 1 {
+		t.Fatalf("cards=%d", len(snap.Cards))
+	}
+	card := snap.Cards[0]
+	if card.ModelProvider != "openai" || card.ModelAuthor != "meta" || card.EndpointOperator != "operator" ||
+		card.Protocol != "openai-chat" || card.EventLogStartOffset == nil || *card.EventLogStartOffset != 0 {
+		t.Fatalf("admitted axes or valid zero recovery offset lost: %+v", card)
+	}
+	*card.EventLogStartOffset = 99
+	again := NewSource(fd, state.NewStore(), "").Snapshot().Cards[0]
+	if again.EventLogStartOffset == nil || *again.EventLogStartOffset != 0 {
+		t.Fatal("card mutated persisted run offset")
+	}
+}
+
+func TestSourceDoesNotInferEndpointSurfaceFromJournalFence(t *testing.T) {
+	for _, known := range []bool{false, true} {
+		t.Run(fmt.Sprint(known), func(t *testing.T) {
+			dir := t.TempDir()
+			zero := int64(0)
+			st := state.State{SessionID: "surface", StartedAt: 1, ModelProvider: "openai"}
+			if known {
+				st.EventLogStartOffset = &zero
+			}
+			writeState(t, dir, st)
+			source := NewSource(&fakeDaemon{sessions: []afclient.DaemonSessionHandle{{SessionID: "surface", WorktreePath: dir}}}, state.NewStore(), "")
+			card := source.Snapshot().Cards[0]
+			want := ""
+			if card.ModelProvider != want {
+				t.Fatalf("known writer=%v surface=%q want=%q", known, card.ModelProvider, want)
+			}
+		})
+	}
 }

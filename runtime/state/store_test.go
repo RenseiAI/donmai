@@ -284,3 +284,23 @@ func TestWriteAtomicNoTempLeftover(t *testing.T) {
 		t.Fatalf("expected only state.json, got %v", names)
 	}
 }
+
+func TestEventLogStartOffsetDistinguishesAbsentAndZero(t *testing.T) {
+	worktree := t.TempDir()
+	store := state.NewStore()
+	zero := int64(0)
+	if err := store.Write(worktree, &state.State{SessionID: "run", StartedAt: 1, EventLogStartOffset: &zero}); err != nil {
+		t.Fatal(err)
+	}
+	got, err := store.Read(worktree)
+	if err != nil || got.EventLogStartOffset == nil || *got.EventLogStartOffset != 0 {
+		t.Fatalf("reported zero offset lost: state=%+v err=%v", got, err)
+	}
+	if err := store.Write(worktree, &state.State{SessionID: "older", StartedAt: 2}); err != nil {
+		t.Fatal(err)
+	}
+	got, err = store.Read(worktree)
+	if err != nil || got.EventLogStartOffset != nil {
+		t.Fatalf("absent offset became zero: state=%+v err=%v", got, err)
+	}
+}

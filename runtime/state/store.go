@@ -70,8 +70,8 @@ type State struct {
 	// state written before the field existed; readers render that as unknown.
 	Model string `json:"model,omitempty"`
 
-	// ModelProvider is the model-serving vendor identity (e.g.
-	// "anthropic"), a separate axis from Harness (the loop driver).
+	// ModelProvider is the configured endpoint company/surface (e.g.
+	// "anthropic"), separate from Harness, model author and observed provider.
 	// Populated from the resolved profile/endpoint company where known.
 	// Empty on state written before the field existed.
 	ModelProvider string `json:"modelProvider,omitempty"`
@@ -132,6 +132,18 @@ type State struct {
 	// dimension, the stamped level, the level achieved and the layers
 	// enforcing it (ADR-2026-09-27-execution-security-levels.md D4).
 	ExecutionSecurity *agent.ExecutionSecurityReport `json:"executionSecurityReport,omitempty"`
+
+	// EventLogStartOffset is the byte boundary in this run's events.jsonl
+	// before its first event. A non-nil zero is valid for a fresh log. The
+	// runner stamps it at run start; readers must not replay older bytes when
+	// it is absent. This is a recovery fence, not another session identity.
+	EventLogStartOffset *int64 `json:"eventLogStartOffset,omitempty"`
+
+	// Admitted display axes. The endpoint surface in ModelProvider is not a
+	// model-author or actual-response-provider observation.
+	ModelAuthor      string `json:"modelAuthor,omitempty"`
+	EndpointOperator string `json:"endpointOperator,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
 }
 
 // AppendToolLifecycleReceipt appends a digest-only admission decision and

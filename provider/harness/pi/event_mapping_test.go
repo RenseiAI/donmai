@@ -170,3 +170,45 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 		})
 	}
 }
+
+func TestObservedPiTurnCostAndMissingTerminalCost(t *testing.T) {
+	st := &mapperState{}
+	turn := func(cost map[string]any) agent.LlmCallEvent {
+		t.Helper()
+		events, terminal := mapEvent(rawEvent{
+			Type: "turn_end",
+			Fields: map[string]any{"message": map[string]any{
+				"provider": "fixture-surface", "model": "fixture-model",
+				"usage": map[string]any{"input": float64(3), "output": float64(2), "cost": cost},
+			}},
+		}, st)
+		if terminal || len(events) != 1 {
+			t.Fatalf("turn mapping: terminal=%v events=%d", terminal, len(events))
+		}
+		call, ok := events[0].(agent.LlmCallEvent)
+		if !ok || !call.TurnCompleted {
+			t.Fatalf("native completed turn missing: %#v", events[0])
+		}
+		return call
+	}
+	zero := turn(map[string]any{"total": float64(0)})
+	if zero.ObservedCostUsd == nil || *zero.ObservedCostUsd != 0 {
+		t.Fatalf("reported zero lost: %+v", zero)
+	}
+	missing := turn(map[string]any{})
+	if missing.ObservedCostUsd != nil {
+		t.Fatal("missing Pi price became observed zero")
+	}
+	events, terminal := mapEvent(rawEvent{Type: "agent_settled", Fields: map[string]any{}}, st)
+	if !terminal || len(events) != 1 {
+		t.Fatalf("settled mapping: terminal=%v events=%d", terminal, len(events))
+	}
+	result := events[0].(agent.ResultEvent)
+	if result.ObservedTurns == nil || *result.ObservedTurns != 2 || result.ObservedCostUsd != nil {
+		t.Fatalf("partial observed costs became authoritative total: %+v", result)
+	}
+	turn(map[string]any{"total": float64(1)})
+	if *result.ObservedTurns != 2 {
+		t.Fatal("emitted cumulative turn observation mutated on continuation")
+	}
+}

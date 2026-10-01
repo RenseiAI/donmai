@@ -251,3 +251,21 @@ func TestToolCallBoundsEvent_SubtypeAndMessage(t *testing.T) {
 		t.Errorf("Message = %q; want empty (no bound enforced)", empty.Message)
 	}
 }
+
+func TestObservedUsageFieldsRoundTripWithReportedZero(t *testing.T) {
+	zero := 0.0
+	turns := 0
+	for _, input := range []Event{
+		LlmCallEvent{SpanID: "call", UsageSource: LlmUsageProvider, ObservedCostUsd: &zero, TurnCompleted: true},
+		ResultEvent{Success: true, ObservedCostUsd: &zero, ObservedTurns: &turns},
+	} {
+		body, err := MarshalEvent(input)
+		if err != nil {
+			t.Fatalf("marshal %T: %v", input, err)
+		}
+		decoded, err := UnmarshalEvent(body)
+		if err != nil || !reflect.DeepEqual(input, decoded) {
+			t.Fatalf("observed zero lost for %T: decoded=%+v error=%v", input, decoded, err)
+		}
+	}
+}

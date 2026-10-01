@@ -48,6 +48,9 @@ type TailEvent struct {
 	SessionID string
 	// At is the local time the tailer read the line.
 	At time.Time
+	// Offset is the start byte of this line in the run's journal. It is
+	// local-only dedup identity, absent on caller-constructed events.
+	Offset *int64
 	// Replay marks events that pre-date the watcher's attach: history
 	// re-read from the top (scroll-back mode) rather than output observed
 	// live. Replay events still feed the stream and cumulative metrics,
@@ -96,7 +99,8 @@ func parseUnixNano(s string) time.Time {
 // Tailer follows a single `.agent/events.jsonl` file, emitting one
 // TailEvent per appended line. It is append- and truncate-safe: a file
 // that shrinks (copy-truncate logrotate, or a fresh run reusing the path)
-// is detected via a size regression and re-read from the top.
+// is detected via a size regression. Metric tailers refuse that incarnation
+// until the card receives a new run fence; ordinary tailers retain replay.
 //
 // A Tailer is single-goroutine: call Poll repeatedly from one goroutine.
 // It holds no open file handle between Poll calls — it opens, seeks to its
@@ -115,7 +119,7 @@ type Tailer struct {
 	// exact once the line completes on a later poll.
 	partial      []byte
 	partialStart int64
-	done         bool // a terminal ResultEvent was seen; Poll is a no-op after
+	done         bool // ordinary tailers stop at ResultEvent; metric tailers continue
 	// backlog is the byte length that pre-dates the watcher's attach:
 	// construction-time file size in steady-state mode (startAtEnd), or
 	// the size of the first observed content when the file did not yet
@@ -128,7 +132,29 @@ type Tailer struct {
 	// read predates the watcher's attach, so every event is history and
 	// is flagged Replay. Steady-state tailers leave this false and use
 	// the backlog boundary instead.
-	replayAll bool
+	replayAll     bool
+	continuous    bool
+	fileInfo      os.FileInfo
+	awaitRunFence bool
+	openFile      func(string) (*os.File, error) // test-local stat/open barrier; nil uses os.Open
+}
+
+// NewMetricTailer replays only the current run's journal bytes for metrics,
+// then follows appends. Unknown run boundaries start at EOF to avoid
+// attributing an older run's events to the current card.
+func NewMetricTailer(sessionID, path string, startOffset *int64, now func() time.Time) *Tailer {
+	t := NewTailer(sessionID, path, true, now)
+	t.continuous = true
+	if info, err := os.Stat(path); err == nil {
+		t.fileInfo = info
+		size := info.Size()
+		t.backlog = size
+		t.primed = true
+		if startOffset != nil && *startOffset >= 0 && *startOffset <= size {
+			t.offset = *startOffset
+		}
+	}
+	return t
 }
 
 // NewTailer constructs a Tailer for the events.jsonl at path, attributing
@@ -207,7 +233,21 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 		return nil, fmt.Errorf("hostwatch: stat %s: %w", t.path, err)
 	}
 	size := info.Size()
-
+	if t.continuous && t.awaitRunFence {
+		t.offset = size
+		return nil, nil
+	}
+	if t.continuous && t.fileInfo != nil && !os.SameFile(info, t.fileInfo) {
+		// A new journal inode may belong to a replacement run. Wait for the
+		// next index snapshot to supply its run-start fence.
+		t.fileInfo = info
+		t.offset = size
+		t.backlog = size
+		t.partial = nil
+		t.partialStart = 0
+		t.awaitRunFence = true
+		return nil, nil
+	}
 	// Truncation / rotation / reuse detection: the file shrank below our
 	// consumed offset, so the bytes we were tracking are gone. Re-read from
 	// the top and discard any half-line we were carrying. A reused path is
@@ -215,6 +255,16 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 	// incarnation was unwatched, so they are history (replay) and only
 	// later appends read as live.
 	if size < t.offset {
+		if t.continuous {
+			// Copy-truncation can also be a new run. Do not replay its old
+			// bytes under the current card's session/run identity.
+			t.offset = size
+			t.backlog = size
+			t.partial = nil
+			t.partialStart = 0
+			t.awaitRunFence = true
+			return nil, nil
+		}
 		t.offset = 0
 		t.partial = nil
 		t.partialStart = 0
@@ -235,9 +285,13 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 		return nil, nil // no new bytes
 	}
 
+	open := t.openFile
+	if open == nil {
+		open = os.Open
+	}
 	//nolint:gosec // G304: path comes from the daemon-owned worktree layout,
 	// not user input, and is opened read-only.
-	f, err := os.Open(t.path)
+	f, err := open(t.path)
 	if err != nil {
 		if errors.Is(err, os.ErrNotExist) {
 			return nil, nil
@@ -245,6 +299,28 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 		return nil, fmt.Errorf("hostwatch: open %s: %w", t.path, err)
 	}
 	defer func() { _ = f.Close() }()
+	openedInfo, err := f.Stat()
+	if err != nil {
+		return nil, fmt.Errorf("hostwatch: inspect opened journal: %w", err)
+	}
+	// A writer may append to the same inode between path Stat and f.Stat.
+	// Growth is ordinary live output; shrinking, replacement, or changed
+	// same-size content cannot be attributed to this run safely.
+	if !os.SameFile(info, openedInfo) || openedInfo.Size() < info.Size() ||
+		(openedInfo.Size() == info.Size() && !openedInfo.ModTime().Equal(info.ModTime())) ||
+		openedInfo.Size() < t.offset ||
+		(t.continuous && t.fileInfo != nil && !os.SameFile(t.fileInfo, openedInfo)) {
+		if t.continuous {
+			t.fileInfo = openedInfo
+			t.offset = openedInfo.Size()
+			t.backlog = openedInfo.Size()
+			t.partial = nil
+			t.partialStart = 0
+			t.awaitRunFence = true
+		}
+		return nil, nil // never read a different or truncated opened inode
+	}
+	t.fileInfo = openedInfo
 
 	if _, err := f.Seek(t.offset, io.SeekStart); err != nil {
 		return nil, fmt.Errorf("hostwatch: seek %s: %w", t.path, err)
@@ -266,11 +342,14 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 					t.partial = nil
 					t.partialStart = 0
 				}
-				if ev, ok := t.decode(line); ok {
+				if ev, ok := t.decode(line, lineStart); ok {
 					ev.Replay = t.replayAll || t.isReplay(lineStart)
 					out = append(out, ev)
-					if isTerminal(ev.Event) {
+					if !t.continuous && isTerminal(ev.Event) {
 						t.done = true
+						return out, nil
+					}
+					if t.continuous && len(out) >= 256 {
 						return out, nil
 					}
 				}
@@ -295,7 +374,7 @@ func (t *Tailer) Poll() ([]TailEvent, error) {
 // decode turns one trimmed line into a TailEvent. Blank lines are skipped
 // (ok=false). Decode failures yield ok=true with Err set so callers can
 // render a diagnostic without losing stream position.
-func (t *Tailer) decode(line []byte) (TailEvent, bool) {
+func (t *Tailer) decode(line []byte, offset int64) (TailEvent, bool) {
 	// Trim a trailing CR for CRLF-written files.
 	if n := len(line); n > 0 && line[n-1] == '\r' {
 		line = line[:n-1]
@@ -304,7 +383,7 @@ func (t *Tailer) decode(line []byte) (TailEvent, bool) {
 		return TailEvent{}, false
 	}
 	ev, err := agent.UnmarshalEvent(line)
-	te := TailEvent{SessionID: t.sessionID, At: t.now()}
+	te := TailEvent{SessionID: t.sessionID, At: t.now(), Offset: &offset}
 	if err != nil {
 		te.Err = fmt.Errorf("hostwatch: decode event: %w", err)
 		return te, true

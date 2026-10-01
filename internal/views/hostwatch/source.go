@@ -47,18 +47,22 @@ type SessionCard struct {
 	Repository          string
 
 	// From state.json (best-effort; zero values when unreadable).
-	IssueID         string
-	IssueIdentifier string
-	Provider        string
-	Harness         string
-	Model           string
-	ModelProvider   string
-	WorkType        string
-	CurrentStep     string
-	StartedAtUnixMs int64
+	IssueID          string
+	IssueIdentifier  string
+	Provider         string
+	Harness          string
+	Model            string
+	ModelProvider    string // configured endpoint surface, not model author
+	ModelAuthor      string
+	EndpointOperator string
+	Protocol         string
+	WorkType         string
+	CurrentStep      string
+	StartedAtUnixMs  int64
 	// LastHeartbeatUnixMs is the most recent session heartbeat the runner
 	// observed (state.json snapshot, unix-ms). Zero when not reported.
 	LastHeartbeatUnixMs int64
+	EventLogStartOffset *int64
 
 	// Live metrics accumulated from the events.jsonl tail.
 	ToolCalls    int
@@ -71,11 +75,13 @@ type SessionCard struct {
 	// has been folded into this card. Counts render as "not reported"
 	// until Observed; a zero is then a measured zero, not a guess.
 	Observed bool
-	// MetricsReported reports whether an authoritative terminal cost
-	// payload (ResultEvent.Cost) has arrived. Cost/turns render as
-	// "not reported" until then — they only arrive on the terminal
-	// result event, never incrementally.
-	MetricsReported bool
+	// CostReported and TurnsReported are independent native-observation
+	// availability bits. MetricsReported is their compatibility union.
+	MetricsReported     bool
+	CostReported        bool
+	TurnsReported       bool
+	seenCallSpanIDs     map[string]struct{}
+	seenTerminalOffsets map[int64]struct{}
 	// Freshness timestamps. Only live (non-replay) events advance them:
 	// replaying history must not make an idle session look active now.
 	// LastWorkAt is the last meaningful-work event (tool invocation or
@@ -195,10 +201,13 @@ func (s *Source) Snapshot() Snapshot {
 			// the handle already carries the admitted identity, so a
 			// local reader needs no per-card fetch. state.json only
 			// backfills what an older daemon omits.
-			Harness:       h.Harness,
-			Model:         h.Model,
-			ModelProvider: h.ModelProvider,
-			WorkType:      h.WorkType,
+			Harness:          h.Harness,
+			Model:            h.Model,
+			ModelProvider:    h.ModelProvider,
+			ModelAuthor:      h.ModelAuthor,
+			EndpointOperator: h.EndpointOperator,
+			Protocol:         h.Protocol,
+			WorkType:         h.WorkType,
 		}
 		if card.isHeld() {
 			// A held row has no live process or workarea, even if a malformed
@@ -259,8 +268,17 @@ func (s *Source) enrichFromState(card *SessionCard) {
 	if card.Model == "" {
 		card.Model = st.Model
 	}
-	if card.ModelProvider == "" {
-		card.ModelProvider = st.ModelProvider
+	// Older state writers populated ModelProvider from the harness rather
+	// than an admitted endpoint declaration. Only the daemon's SessionSpec
+	// company projection is a reliable configured surface for this card.
+	if card.ModelAuthor == "" && st.SessionID == card.SessionID {
+		card.ModelAuthor = st.ModelAuthor
+	}
+	if card.EndpointOperator == "" && st.SessionID == card.SessionID {
+		card.EndpointOperator = st.EndpointOperator
+	}
+	if card.Protocol == "" && st.SessionID == card.SessionID {
+		card.Protocol = st.Protocol
 	}
 	if card.WorkType == "" {
 		card.WorkType = st.WorkType
@@ -268,6 +286,10 @@ func (s *Source) enrichFromState(card *SessionCard) {
 	card.CurrentStep = st.CurrentStep
 	card.StartedAtUnixMs = st.StartedAt
 	card.LastHeartbeatUnixMs = st.LastHeartbeat
+	if st.SessionID == card.SessionID && st.StartedAt > 0 && st.EventLogStartOffset != nil {
+		offset := *st.EventLogStartOffset
+		card.EventLogStartOffset = &offset
+	}
 	if card.PID == 0 && st.PID != 0 {
 		card.PID = st.PID
 	}

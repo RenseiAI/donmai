@@ -1,6 +1,7 @@
 package hostwatch
 
 import (
+	"os"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -22,7 +23,7 @@ func TestIdentityObservedResponseAndCardSurviveRefresh(t *testing.T) {
 	// Requested/configured identity and synthetic aggregate events prove no
 	// actual response, even when they carry usage or plausible aliases.
 	m.applyTailBatch([]TailEvent{{SessionID: "one", Event: agent.LlmCallEvent{System: "configured-vendor", Model: "requested-alias", InputTokens: 1}}, {SessionID: "one", Event: agent.LlmCallEvent{Synthetic: true, ResponseModel: "invented", ResponseModelProvider: "invented", ModelSnapshotID: "invented"}}})
-	assertIdentityText(t, m.cards[0], "Agent card Reviewer", "Card ID card-review", "Model identity unknown", "Actual provider unknown", "Model version unknown", "model requested-alias", "provider configured-vendor")
+	assertIdentityText(t, m.cards[0], "Agent card Reviewer", "Card ID card-review", "Model identity unknown", "Actual provider unknown", "Model version unknown", "model requested-alias", "Endpoint surface configured-vendor")
 	m.applyTailBatch([]TailEvent{{SessionID: "one", Replay: true, Event: agent.LlmCallEvent{ResponseModel: "served-id", ResponseModelProvider: "response-vendor", ModelSnapshotID: "snapshot-v2"}}})
 	if !m.cards[0].LastWorkAt.IsZero() || !m.cards[0].LastOutputAt.IsZero() {
 		t.Fatal("historical identity changed freshness")
@@ -125,7 +126,9 @@ func TestIdentityMetadataStatusEventCodecAndTerminalUsage(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	m.applyTailBatch([]TailEvent{{SessionID: "one", Replay: true, Event: ev}, {SessionID: "one", Event: agent.LlmCallEvent{Synthetic: true, Model: "alias", System: "configured", InputTokens: 120, UsageSource: agent.LlmUsageAggregate}}, {SessionID: "one", Event: agent.ResultEvent{Success: true, Cost: &agent.CostData{TotalCostUsd: 1.25, NumTurns: 3}}}})
+	cost := 1.25
+	turns := 3
+	m.applyTailBatch([]TailEvent{{SessionID: "one", Replay: true, Event: ev}, {SessionID: "one", Event: agent.LlmCallEvent{Synthetic: true, Model: "alias", System: "configured", InputTokens: 120, UsageSource: agent.LlmUsageAggregate}}, {SessionID: "one", Event: agent.ResultEvent{Success: true, Cost: &agent.CostData{TotalCostUsd: cost, NumTurns: turns}, ObservedCostUsd: &cost, ObservedTurns: &turns}}})
 	assertIdentityText(t, m.cards[0], "Model identity served-id", "Actual provider observed", "Model version snapshot-v2", "cost $1.25", "turns 3")
 }
 
@@ -150,7 +153,8 @@ func TestIdentityRenderStripsNativeTerminalControlsAndBudgetsRows(t *testing.T) 
 
 func TestIdentityReplacementRunDoesNotReplayOldLog(t *testing.T) {
 	dir := t.TempDir()
-	writeState(t, dir, state.State{SessionID: "one", StartedAt: 1000})
+	zero := int64(0)
+	writeState(t, dir, state.State{SessionID: "one", StartedAt: 1000, EventLogStartOffset: &zero})
 	path := filepath.Join(dir, state.AgentDirName, "events.jsonl")
 	writeEvents(t, path, agent.SystemEvent{Subtype: agent.SystemSubtypeModelIdentity, ObservedModel: &agent.ObservedModelIdentity{Model: "old-model"}})
 	fd := &fakeDaemon{sessions: []afclient.DaemonSessionHandle{{SessionID: "one", WorktreePath: dir}}}
@@ -161,7 +165,12 @@ func TestIdentityReplacementRunDoesNotReplayOldLog(t *testing.T) {
 	if m.cards[0].ActualModel != "old-model" {
 		t.Fatal("ordinary initial replay lost observed identity")
 	}
-	writeState(t, dir, state.State{SessionID: "one", StartedAt: 2000})
+	info, err := os.Stat(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	boundary := info.Size()
+	writeState(t, dir, state.State{SessionID: "one", StartedAt: 2000, EventLogStartOffset: &boundary})
 	m.applySnapshot(m.src.Snapshot())
 	m.applyTailBatch(m.pollTails()().(tailBatchMsg).events)
 	if m.cards[0].ActualModel != "" {
@@ -171,5 +180,19 @@ func TestIdentityReplacementRunDoesNotReplayOldLog(t *testing.T) {
 	m.applyTailBatch(m.pollTails()().(tailBatchMsg).events)
 	if m.cards[0].ActualModel != "new-model" {
 		t.Fatal("replacement reader lost new live identity")
+	}
+}
+
+func TestIdentityUnknownRunBoundaryDoesNotAttributeReplay(t *testing.T) {
+	dir := t.TempDir()
+	writeState(t, dir, state.State{SessionID: "one", StartedAt: 1000})
+	path := filepath.Join(dir, state.AgentDirName, "events.jsonl")
+	writeEvents(t, path, agent.SystemEvent{Subtype: agent.SystemSubtypeModelIdentity, ObservedModel: &agent.ObservedModelIdentity{Model: "unproven-model"}})
+	m := newTestModel(t, &fakeDaemon{sessions: []afclient.DaemonSessionHandle{{SessionID: "one", WorktreePath: dir}}}, "")
+	m.opts.Replay = true
+	m.applySnapshot(m.src.Snapshot())
+	m.applyTailBatch(m.pollTails()().(tailBatchMsg).events)
+	if m.cards[0].ActualModel != "" {
+		t.Fatal("unknown run boundary attributed historical identity")
 	}
 }
