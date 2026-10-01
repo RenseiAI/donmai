@@ -143,28 +143,31 @@ func TestModel_PreEnrichmentNoWorktreeNoTailer(t *testing.T) {
 func TestModel_HeldSessionHasNoTailerActivityOrRunningClaim(t *testing.T) {
 	fd := &fakeDaemon{
 		sessions: []afclient.DaemonSessionHandle{
-			{SessionID: "held-1234", State: "unknown", Repository: "o/a", ProjectName: "a"},
-			{SessionID: "live-1234", State: "running", Repository: "o/a"},
+			{SessionID: "held-123", State: "unknown", Repository: "o/a", ProjectName: "a"},
+			{SessionID: "live-123", State: "running", Repository: "o/a"},
 		},
 		status: &afclient.DaemonStatusResponse{ActiveSessions: 1, MaxSessions: 8},
 	}
 	m := newTestModel(t, fd, "")
+	// Plain cards stack; reserve enough rows for both complete cards.
+	resized, _ := m.Update(tea.WindowSizeMsg{Width: 120, Height: 80})
+	m = resized.(*Model)
 	// Model an earlier projection of the same identity as live: when the new
 	// held snapshot arrives, any stale event tailer must be dropped.
-	m.tailers["held-1234"] = NewTailer("held-1234", "/fixture/old/events.jsonl", true, time.Now)
+	m.tailers["held-123"] = NewTailer("held-123", "/fixture/old/events.jsonl", true, time.Now)
 	m.applySnapshot(m.src.Snapshot())
 	if len(m.cards) != 2 {
 		t.Fatalf("want both visible sessions, got %d", len(m.cards))
 	}
-	if _, ok := m.tailers["held-1234"]; ok {
+	if _, ok := m.tailers["held-123"]; ok {
 		t.Error("held session must not retain or start an event tailer")
 	}
 
 	m.applyTailBatch([]TailEvent{{
-		SessionID: "held-1234", At: time.Now(), Event: agent.AssistantTextEvent{Text: "fabricated live activity"},
+		SessionID: "held-123", At: time.Now(), Event: agent.AssistantTextEvent{Text: "fabricated live activity"},
 	}})
 	out := m.render()
-	for _, want := range []string{"2 sessions", "held-1234", "held", "project a", "repo o/a"} {
+	for _, want := range []string{"2 sessions", "held-123", "live-123", "held", "project a", "repo o/a"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("render missing %q:\n%s", want, out)
 		}
@@ -178,7 +181,7 @@ func TestModel_HeldSessionHasNoTailerActivityOrRunningClaim(t *testing.T) {
 			t.Errorf("render should not claim/show %q:\n%s", absent, out)
 		}
 	}
-	if c := findCard(m, "held-1234"); c == nil || c.LastActivity != "" || c.ToolCalls != 0 {
+	if c := findCard(m, "held-123"); c == nil || c.LastActivity != "" || c.ToolCalls != 0 {
 		t.Errorf("held card acquired live metrics: %#v", c)
 	}
 }
