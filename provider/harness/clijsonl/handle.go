@@ -685,18 +685,22 @@ func (h *Handle) readStdout() {
 	// stdout fd before our scanner is descheduled. Force-closing the
 	// pipe makes the next read return immediately, breaking the loop
 	// regardless of OS-level signal delivery timing.
+	readerExit := make(chan struct{})
 	pipeCloseDone := make(chan struct{})
 	go func() {
 		defer close(pipeCloseDone)
 		select {
-		case <-h.done:
-			// Reader exited normally; pipe was closed by cmd.Wait.
+		case <-readerExit:
+			// Scanner finished normally; leave the pipe for cmd.Wait.
 		case <-h.shutdown:
 			// Shutdown initiated; force-close stdout to unblock scanner.
 			_ = h.stdoutPipe.Close()
 		}
 	}()
-	defer func() { <-pipeCloseDone }()
+	defer func() {
+		close(readerExit)
+		<-pipeCloseDone
+	}()
 
 	scanner := bufio.NewScanner(h.stdoutPipe)
 	// Each JSONL line can be large (an assistant message with

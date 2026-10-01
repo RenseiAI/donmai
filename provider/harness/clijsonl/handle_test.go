@@ -233,6 +233,83 @@ func TestHandle_NoTerminal_SyntheticErrorEvent(t *testing.T) {
 	}
 }
 
+// naturalParentReaped checks normal EOF without letting Stop supply the
+// shutdown signal. A delivered terminal event alone does not prove the native
+// child was waited or that the handle's parent owner finished.
+func naturalParentReaped(t *testing.T, h *Handle) {
+	t.Helper()
+	deadline := time.NewTimer(5 * time.Second)
+	defer deadline.Stop()
+	select {
+	case <-h.done:
+	case <-deadline.C:
+		t.Fatal("native CLI exited but parent reader did not reap it before Stop")
+	}
+	if h.cmd.ProcessState == nil || h.cmd.ProcessState.ExitCode() != 0 {
+		t.Fatalf("native CLI has no successful owned wait: processState=%v", h.cmd.ProcessState)
+	}
+}
+
+func cleanupNaturalExitHandle(t *testing.T, h *Handle) {
+	t.Helper()
+	t.Cleanup(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
+		defer cancel()
+		if err := h.Stop(ctx); err != nil {
+			t.Errorf("cleanup Stop: %v", err)
+		}
+	})
+}
+
+func TestHandle_NaturalEOFWithoutResultReapsBeforeStop(t *testing.T) {
+	cli := fakeCLI(t, `{"type":"system","subtype":"init","session_id":"natural-error"}`)
+	h := spawnFake(t, cli, agent.Spec{Prompt: "finite no-result task"})
+	cleanupNaturalExitHandle(t, h)
+	events := collect(t, h)
+	if len(events) == 0 {
+		t.Fatal("normal EOF emitted no event")
+	}
+	last, ok := events[len(events)-1].(agent.ErrorEvent)
+	if !ok || last.Code != "spawn_no_result" {
+		t.Fatalf("normal EOF last event = %T %#v, want spawn_no_result", events[len(events)-1], events[len(events)-1])
+	}
+	naturalParentReaped(t, h)
+}
+
+func TestHandle_NaturalTerminalEOFReapsAndKeepsInjection(t *testing.T) {
+	cli := fakeCLI(t, `{"type":"system","subtype":"init","session_id":"natural-terminal"}
+{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{}}`)
+	h := spawnFake(t, cli, agent.Spec{Prompt: "finite result task"})
+	cleanupNaturalExitHandle(t, h)
+	events := collect(t, h)
+	if len(events) == 0 {
+		t.Fatal("normal EOF emitted no event")
+	}
+	if _, ok := events[len(events)-1].(agent.ResultEvent); !ok {
+		t.Fatalf("normal EOF last event = %T, want ResultEvent", events[len(events)-1])
+	}
+	naturalParentReaped(t, h)
+	select {
+	case _, open := <-h.Events():
+		if !open {
+			t.Fatal("natural parent EOF closed the injection event channel")
+		}
+	default:
+	}
+	ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
+	defer cancel()
+	if err := h.Inject(ctx, "follow-up turn"); err != nil {
+		t.Fatalf("Inject after natural parent reap: %v", err)
+	}
+	more := collect(t, h)
+	if len(more) == 0 {
+		t.Fatal("injected turn emitted no event")
+	}
+	if _, ok := more[len(more)-1].(agent.ResultEvent); !ok {
+		t.Fatalf("injected turn last event = %T, want ResultEvent", more[len(more)-1])
+	}
+}
+
 func TestHandle_CtxCancel_Stops(t *testing.T) {
 	t.Parallel()
 
