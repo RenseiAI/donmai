@@ -5,12 +5,17 @@ package localqueue
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"syscall"
 )
 
 func lockWriter(file *os.File) error {
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+	fd := file.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("localqueue: lock writer: %w", syscall.EBADF)
+	}
+	if err := syscall.Flock(int(fd), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
 		if errors.Is(err, syscall.EWOULDBLOCK) || errors.Is(err, syscall.EAGAIN) {
 			return ErrWriterLocked
 		}
@@ -20,7 +25,11 @@ func lockWriter(file *os.File) error {
 }
 
 func unlockWriter(file *os.File) error {
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err != nil {
+	fd := file.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("localqueue: unlock writer: %w", syscall.EBADF)
+	}
+	if err := syscall.Flock(int(fd), syscall.LOCK_UN); err != nil {
 		return fmt.Errorf("localqueue: unlock writer: %w", err)
 	}
 	return nil

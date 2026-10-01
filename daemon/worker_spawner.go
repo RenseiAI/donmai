@@ -1842,7 +1842,7 @@ func composeEnv(parts ...map[string]string) []string {
 		}
 	}
 	parent := runtimeenv.FilterRunnerOnly(os.Environ())
-	out := make([]string, 0, len(parent)+len(merged))
+	out := make([]string, 0, len(parent))
 	out = append(out, parent...)
 	for k, v := range merged {
 		out = append(out, k+"="+v)

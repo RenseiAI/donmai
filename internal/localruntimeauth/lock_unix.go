@@ -5,26 +5,39 @@ package localruntimeauth
 import (
 	"fmt"
 	"io/fs"
+	"math"
 	"os"
 	"syscall"
 )
 
 func lockWriter(file *os.File) error {
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_EX); err != nil {
+	fd := file.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("lock private auth writer: %w", syscall.EBADF)
+	}
+	if err := syscall.Flock(int(fd), syscall.LOCK_EX); err != nil {
 		return fmt.Errorf("lock private auth writer: %w", err)
 	}
 	return nil
 }
 
 func lockReader(file *os.File) error {
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_SH); err != nil {
+	fd := file.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("lock private auth reader: %w", syscall.EBADF)
+	}
+	if err := syscall.Flock(int(fd), syscall.LOCK_SH); err != nil {
 		return fmt.Errorf("lock private auth reader: %w", err)
 	}
 	return nil
 }
 
 func unlockWriter(file *os.File) error {
-	if err := syscall.Flock(int(file.Fd()), syscall.LOCK_UN); err != nil {
+	fd := file.Fd()
+	if fd > uintptr(math.MaxInt) {
+		return fmt.Errorf("unlock private auth writer: %w", syscall.EBADF)
+	}
+	if err := syscall.Flock(int(fd), syscall.LOCK_UN); err != nil {
 		return fmt.Errorf("unlock private auth writer: %w", err)
 	}
 	return nil
