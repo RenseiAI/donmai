@@ -516,6 +516,15 @@ func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 			// Splice each {k, v} pair from value into existing, replacing on
 			// match.
 			for j := 0; j+1 < len(value.Content); j += 2 {
+				// The capacity leaf owns its anchor definition. Retain it on
+				// replacement so aliases remain valid and follow the new value.
+				// A borrowed alias has no local definition to transfer.
+				for k := 0; k+1 < len(existing.Content); k += 2 {
+					if existing.Content[k].Value == value.Content[j].Value && existing.Content[k+1].Kind == yaml.ScalarNode {
+						value.Content[j+1].Anchor = existing.Content[k+1].Anchor
+						break
+					}
+				}
 				upsertMappingKey(existing, value.Content[j].Value, value.Content[j+1])
 			}
 			return
