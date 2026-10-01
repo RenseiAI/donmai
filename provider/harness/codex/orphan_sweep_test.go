@@ -1542,3 +1542,78 @@ func TestSweepOrphans_ScanStartIsRotatedSoNoEntryIsPermanentlyExcluded(t *testin
 		t.Fatalf("the sweep did not begin where startAt pointed: the last-sorting orphan survived (report %+v): err=%v", report, err)
 	}
 }
+
+// TestSweepOrphans_SkipsProtectedHomesReferencedByLiveAdoption pins the
+// re-adoption guard: a home whose owner manifest names a dead process is
+// ordinarily reclaimable, but a live adopted session may still reference it
+// via its resume key (the restarting daemon never held the original
+// in-memory boundary). The caller passes those paths in ProtectedHomes and
+// the sweep leaves them alone before any manifest read, signal, or delete.
+func TestSweepOrphans_SkipsProtectedHomesReferencedByLiveAdoption(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := filepath.Join(root, codexHomePrefix+"adopted-live")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+	ageTree(t, home, time.Now(), 48*time.Hour)
+
+	protected := map[string]struct{}{filepath.Clean(home): {}}
+	report := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, ProtectedHomes: protected})
+	if report.SkippedProtected != 1 || report.Reclaimed != 0 {
+		t.Fatalf("report = %+v, want one skipped-protected and zero reclaimed", report)
+	}
+	if _, err := os.Stat(home); err != nil {
+		t.Fatalf("protected adopted home was reclaimed: %v", err)
+	}
+}
+
+// TestSweepOrphans_ReapsRetainedHomePastTTL pins the retention budget: a
+// retained home (resumable session state present, owner and child dead,
+// wholly idle) is preserved while its whole-tree idle age is under
+// RetainedHomeTTL and reclaimed in full past it, with an audit count. A
+// shorter-than-default TTL keeps the fixture fast without changing what the
+// default proves.
+func TestSweepOrphans_ReapsRetainedHomePastTTL(t *testing.T) {
+	requireManifestVerification(t)
+	root := t.TempDir()
+	home := filepath.Join(root, codexHomePrefix+"retained-ttl")
+	if err := os.Mkdir(home, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutDir := filepath.Join(home, codexSessionStateSubdir, "2026", "08", "31")
+	if err := os.MkdirAll(rolloutDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	rolloutPath := filepath.Join(rolloutDir, "rollout-2026-08-31T00-00-00-thread-old.jsonl")
+	if err := os.WriteFile(rolloutPath, []byte(`{"type":"session_meta"}`), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(home, codexConfigFileName), []byte("mcp_servers = {}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	persistDonmaiOwnerManifest(home, donmaiOwnerManifest{OwnerPID: fakeDeadPID(t), StartedAt: time.Now()})
+	ageTree(t, home, time.Now(), 72*time.Hour)
+
+	// Under the TTL: preserved as a retained home, not reaped.
+	young := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, RetainedHomeTTL: 30 * 24 * time.Hour})
+	if young.ExpiredRetained != 0 {
+		t.Fatalf("report = %+v, want zero expired-retained under the TTL", young)
+	}
+	if _, err := os.Stat(rolloutPath); err != nil {
+		t.Fatalf("retained home reaped before its TTL: %v", err)
+	}
+
+	// Past the TTL: reaped in full with an audit count.
+	old := SweepOrphans(context.Background(), SweepOptions{Root: root, MinAge: time.Hour, RetainedHomeTTL: time.Hour})
+	if old.ExpiredRetained != 1 {
+		t.Fatalf("report = %+v, want one expired-retained past the TTL", old)
+	}
+	if _, err := os.Stat(home); !os.IsNotExist(err) {
+		t.Fatalf("expired retained home survived: err=%v", err)
+	}
+}

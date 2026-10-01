@@ -1150,6 +1150,10 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if err := d.adoptSessionShims(ctx); err != nil {
 		return err
 	}
+	// Reclaim crash/SIGKILL/restart leftovers the lifecycle path can never
+	// reach again. Runs after adoption so live sessions' resume-keyed homes
+	// are protected, and never fails startup — see sweepCodexOrphans.
+	d.sweepCodexOrphans(ctx)
 	if !d.sessionShimEnabled() {
 		if err := register(); err != nil {
 			return err
