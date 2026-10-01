@@ -128,6 +128,73 @@ func TestDetailModelTimedOutIsTerminal(t *testing.T) {
 	}
 }
 
+func TestDetailModelStopPendingNotification(t *testing.T) {
+	t.Parallel()
+
+	m := New(afclient.NewMockClient())
+	m.SetSize(80, 24)
+	m.Update(stopAgentMsg{resp: &afclient.StopSessionResponse{
+		Stopped: false, SessionID: "sess-1",
+		PreviousStatus: afclient.StatusWorking, NewStatus: afclient.StatusWorking,
+		Delivered: true, Pending: true,
+	}})
+	if m.notifStack.Len() == 0 {
+		t.Fatal("pending stop produced no notification")
+	}
+	content := m.notifStack.View().Content
+	plain := normalizeToastForTest(content)
+	if !strings.Contains(plain, "Stop delivered, pending terminal evidence") {
+		t.Fatalf("pending toast missing pending message; got:\n%s", plain)
+	}
+
+	terminal := New(afclient.NewMockClient())
+	terminal.SetSize(80, 24)
+	terminal.Update(stopAgentMsg{resp: &afclient.StopSessionResponse{
+		Stopped: true, SessionID: "sess-1",
+		PreviousStatus: afclient.StatusWorking, NewStatus: afclient.StatusStopped,
+	}})
+	if terminal.notifStack.Len() == 0 {
+		t.Fatal("terminal stop produced no notification")
+	}
+	terminalPlain := normalizeToastForTest(terminal.notifStack.View().Content)
+	if strings.Contains(terminalPlain, "pending terminal evidence") {
+		t.Fatalf("terminal stop must not show pending message; got:\n%s", terminalPlain)
+	}
+}
+
+func normalizeToastForTest(s string) string {
+	stripped := stripANSIForTest(s)
+	// The toast box wraps the message across lines with variable padding;
+	// normalise all whitespace runs (including box borders and padding)
+	// down to single spaces so the assertion reads the message, not the art.
+	fields := strings.Fields(stripped)
+	joined := strings.Join(fields, " ")
+	for _, border := range []string{"╭", "╮", "╰", "╯", "│", "─", "✓"} {
+		joined = strings.ReplaceAll(joined, border, " ")
+	}
+	return strings.Join(strings.Fields(joined), " ")
+}
+
+func stripANSIForTest(s string) string {
+	var out strings.Builder
+	inEscape := false
+	for i := 0; i < len(s); i++ {
+		if !inEscape && s[i] == 0x1b && i+1 < len(s) && s[i+1] == '[' {
+			inEscape = true
+			i++
+			continue
+		}
+		if inEscape {
+			if (s[i] >= 'A' && s[i] <= 'Z') || (s[i] >= 'a' && s[i] <= 'z') {
+				inEscape = false
+			}
+			continue
+		}
+		out.WriteByte(s[i])
+	}
+	return out.String()
+}
+
 func TestBuildTimelineDistinguishesStartingAndTimedOut(t *testing.T) {
 	t.Parallel()
 

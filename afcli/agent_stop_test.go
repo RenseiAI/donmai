@@ -157,6 +157,57 @@ func TestAgentStopHTTPNotFound(t *testing.T) {
 	}
 }
 
+func TestAgentStopAcceptedHumanModeReportsPending(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return client }, []string{"stop", "sess-1"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "Stop delivered, pending terminal evidence") {
+		t.Errorf("expected pending delivery message; got:\n%s", out)
+	}
+	if strings.Contains(out, "Stopped sess-1") {
+		t.Errorf("pending 202 must not print the terminal Stopped line; got:\n%s", out)
+	}
+}
+
+func TestAgentStopAcceptedJSONEmitsStoppedFalse(t *testing.T) {
+	t.Parallel()
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+	}))
+	t.Cleanup(srv.Close)
+
+	client := afclient.NewClient(srv.URL)
+	cmd, buf := newTestAgentCmd(func() afclient.DataSource { return client }, []string{"stop", "sess-1", "--json"})
+	if err := cmd.Execute(); err != nil {
+		t.Fatalf("execute: %v", err)
+	}
+	var resp afclient.StopSessionResponse
+	if err := json.Unmarshal(buf.Bytes(), &resp); err != nil {
+		t.Fatalf("output not valid JSON: %v\n%s", err, buf.String())
+	}
+	if resp.Stopped {
+		t.Errorf("expected stopped=false for 202; got: %+v", resp)
+	}
+	if !resp.Delivered || !resp.Pending {
+		t.Errorf("expected delivered/pending envelope; got: %+v", resp)
+	}
+}
+
 func TestAgentStopJSONPreservesTypedReconciliationRequiredReceipt(t *testing.T) {
 	t.Parallel()
 

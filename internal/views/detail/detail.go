@@ -170,6 +170,9 @@ func (m *Model) Update(msg tea.Msg) tea.Cmd {
 			m.addInlineActivity(afclient.ActivityError, "Failed to stop agent: "+msg.err.Error())
 			return m.pushNotification(notification.VariantError, "Failed to stop agent")
 		}
+		if msg.resp != nil && msg.resp.PendingDelivery() {
+			return m.pushNotification(notification.VariantSuccess, "Stop delivered, pending terminal evidence")
+		}
 		return m.pushNotification(notification.VariantSuccess, "Agent stop requested")
 
 	case sendPromptMsg:

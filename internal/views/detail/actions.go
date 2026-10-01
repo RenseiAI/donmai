@@ -11,8 +11,8 @@ import (
 func (m *Model) stopAgentCmd() tea.Cmd {
 	id := m.sessionID
 	return func() tea.Msg {
-		_, err := m.dataSource.StopSession(id)
-		return stopAgentMsg{err: err}
+		resp, err := m.dataSource.StopSession(id)
+		return stopAgentMsg{resp: resp, err: err}
 	}
 }
 

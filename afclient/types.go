@@ -3,6 +3,7 @@ package afclient
 import (
 	"encoding/json"
 	"fmt"
+	"net/http"
 	"time"
 )
 
@@ -112,12 +113,34 @@ type ActivityListResponse struct {
 }
 
 // StopSessionResponse matches POST /api/public/sessions/:id/stop.
+//
+// A cooperative stop delivered to a live session is answered with HTTP 202
+// and an envelope carrying delivered/pending fields: the stop was accepted
+// but no terminal evidence exists yet, so Stopped stays false. Stopped is
+// true only for terminal (HTTP 200) responses.
 type StopSessionResponse struct {
 	Stopped        bool                `json:"stopped"`
 	SessionID      string              `json:"sessionId"`
 	PreviousStatus SessionStatus       `json:"previousStatus"`
 	NewStatus      SessionStatus       `json:"newStatus"`
+	Delivered      bool                `json:"delivered,omitempty"`
+	Pending        bool                `json:"pending,omitempty"`
 	Receipt        *StopSessionReceipt `json:"receipt,omitempty"`
+
+	// HTTPStatus is the raw response status (200 or 202). It is never
+	// serialised; it lets callers distinguish a delivered-but-pending
+	// cooperative stop from terminal evidence when the body omits
+	// the delivered/pending fields.
+	HTTPStatus int `json:"-"`
+}
+
+// PendingDelivery reports whether the stop was delivered but terminal
+// evidence is still pending (the HTTP 202 cooperative-stop envelope).
+func (r *StopSessionResponse) PendingDelivery() bool {
+	if r == nil {
+		return false
+	}
+	return r.Pending || r.HTTPStatus == http.StatusAccepted
 }
 
 // Stop receipt family discriminants returned by the public stop endpoint.
