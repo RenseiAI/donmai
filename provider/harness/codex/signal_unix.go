@@ -5,10 +5,12 @@ package codex
 import (
 	"errors"
 	"fmt"
+	"math"
 	"os"
 	"os/exec"
 	"strconv"
 	"strings"
+	"sync/atomic"
 	"syscall"
 	"time"
 )
@@ -25,19 +27,39 @@ func configureOwnedProcessGroup(cmd *exec.Cmd) {
 // stopResult is published before callbacks, including on inspection failure.
 type ownedProcess struct {
 	cmd     *exec.Cmd
-	request chan time.Duration
+	request chan struct{}
+	grace   atomic.Int64 // shortest requested grace; MaxInt64 means no request
 	stopped chan struct{}
-	stopErr error
+	// Optional per-owner test observation, set before wait starts. It does not
+	// grant signal authority to the observer.
+	graceStarted chan struct{}
+	stopErr      error
 }
 
 func newOwnedProcess(cmd *exec.Cmd) *ownedProcess {
-	return &ownedProcess{cmd: cmd, request: make(chan time.Duration, 1), stopped: make(chan struct{})}
+	p := &ownedProcess{cmd: cmd, request: make(chan struct{}, 1), stopped: make(chan struct{})}
+	p.grace.Store(math.MaxInt64)
+	return p
 }
 
 func (p *ownedProcess) stop(grace time.Duration) error {
-	select {
-	case p.request <- grace:
-	default:
+	if grace < 0 {
+		grace = 0
+	}
+	for {
+		previous := p.grace.Load()
+		if int64(grace) >= previous {
+			break
+		}
+		if p.grace.CompareAndSwap(previous, int64(grace)) {
+			// The channel is only a wakeup. A full channel never loses the
+			// stricter grace, which lives in the atomic minimum above.
+			select {
+			case p.request <- struct{}{}:
+			default:
+			}
+			break
+		}
 	}
 	<-p.stopped
 	return p.stopErr
@@ -49,7 +71,8 @@ func (p *ownedProcess) wait() error {
 	grace := 5 * time.Second
 	observed := false
 	select {
-	case grace = <-p.request:
+	case <-p.request:
+		grace = time.Duration(p.grace.Load())
 	case err := <-exited:
 		observed = true
 		if err != nil {
@@ -57,7 +80,9 @@ func (p *ownedProcess) wait() error {
 		}
 	}
 	if p.stopErr == nil {
-		p.stopErr = stopOwnedProcessGroup(p.cmd, grace, ownedProcessGroupState, syscall.Kill)
+		p.stopErr = stopOwnedProcessGroupWithUpdates(p.cmd, grace, p.request, func() time.Duration {
+			return time.Duration(p.grace.Load())
+		}, p.graceStarted, ownedProcessGroupState, syscall.Kill)
 	}
 	// On failure there is no quiescence proof. Return the error promptly and
 	// retain the home; the sole waiter still reaps the child when it exits.
@@ -84,6 +109,12 @@ type ownedGroupState struct {
 // The syscall seams exercise disappearance and refused signals without ever
 // targeting a foreign host process. They are local to this lifecycle operation.
 func stopOwnedProcessGroup(cmd *exec.Cmd, grace time.Duration,
+	inspect func(int) (ownedGroupState, error), signal func(int, syscall.Signal) error,
+) error {
+	return stopOwnedProcessGroupWithUpdates(cmd, grace, nil, nil, nil, inspect, signal)
+}
+
+func stopOwnedProcessGroupWithUpdates(cmd *exec.Cmd, grace time.Duration, updates <-chan struct{}, shortestGrace func() time.Duration, graceStarted chan<- struct{},
 	inspect func(int) (ownedGroupState, error), signal func(int, syscall.Signal) error,
 ) error {
 	if cmd.Process == nil || cmd.ProcessState != nil || cmd.SysProcAttr == nil ||
@@ -120,8 +151,11 @@ func stopOwnedProcessGroup(cmd *exec.Cmd, grace time.Duration,
 	if err := send(syscall.SIGTERM); err != nil {
 		return err
 	}
-	deadline := time.NewTimer(grace)
-	defer deadline.Stop()
+	graceStart := time.Now()
+	if graceStarted != nil {
+		close(graceStarted)
+	}
+	killed := false
 	tick := time.NewTicker(10 * time.Millisecond)
 	defer tick.Stop()
 	for {
@@ -129,11 +163,21 @@ func stopOwnedProcessGroup(cmd *exec.Cmd, grace time.Duration,
 		if err != nil || !running {
 			return err
 		}
-		select {
-		case <-deadline.C:
+		limit := grace
+		if shortestGrace != nil {
+			if requested := shortestGrace(); requested < limit {
+				limit = requested
+			}
+		}
+		if !killed && time.Since(graceStart) >= limit {
 			if err := send(syscall.SIGKILL); err != nil {
 				return err
 			}
+			killed = true
+			continue
+		}
+		select {
+		case <-updates:
 		case <-tick.C:
 		}
 	}
