@@ -1,6 +1,7 @@
 package afcli
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"log/slog"
@@ -78,7 +79,7 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 			"and share it 50/50 with the merged stream by default. [ and ] move the\n" +
 			"split, 0 resets it, and the ratio survives terminal resizes.",
 		SilenceUsage: true,
-		RunE: func(_ *cobra.Command, _ []string) error {
+		RunE: func(cmd *cobra.Command, _ []string) error {
 			cfg := afclient.DefaultDaemonConfig()
 			var client hostWatchSource
 			switch {
@@ -98,9 +99,10 @@ func newHostWatchCmdWithSource(factory func(afclient.DaemonConfig) hostWatchSour
 
 			src := hostwatch.NewSource(client, nil, repoScope)
 			label := scopeLabel(repoScope, allFlag)
-			plain := plainFlag || !isInteractiveTTY()
+			interactive := isInteractiveTTY()
+			plain := plainFlag || !interactive
 
-			return runHostWatch(hostwatch.Options{
+			return runHostWatch(cmd.Context(), cmd.OutOrStdout(), !interactive, hostwatch.Options{
 				Source:       src,
 				ProjectLabel: label,
 				HostLabel:    hostname(),
@@ -212,7 +214,7 @@ func isInteractiveTTY() bool {
 // suppressed while the TUI owns the terminal. In plain mode the program still
 // runs (it renders without AltScreen/color), so an operator piping output
 // gets a usable stream.
-func runHostWatch(opts hostwatch.Options) error {
+func runHostWatch(ctx context.Context, output io.Writer, nonTTY bool, opts hostwatch.Options) error {
 	prev := slog.Default()
 	slog.SetDefault(slog.New(slog.NewTextHandler(io.Discard, nil)))
 	defer slog.SetDefault(prev)
@@ -221,7 +223,14 @@ func runHostWatch(opts hostwatch.Options) error {
 	// the dashboard command — bubbletea v2 reads it per-view rather than as a
 	// program option.
 	model := hostwatch.New(opts)
-	p := tea.NewProgram(model)
+	programOptions := []tea.ProgramOption{tea.WithContext(ctx), tea.WithOutput(output)}
+	if nonTTY {
+		// Bubble Tea v2 otherwise opens /dev/tty for keyboard input even when
+		// stdout is a pipe. Keep the renderer and a bounded geometry so the
+		// same live model can still write its plain view to that pipe.
+		programOptions = append(programOptions, tea.WithInput(nil), tea.WithWindowSize(100, 30))
+	}
+	p := tea.NewProgram(model, programOptions...)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("run host watch: %w", err)
 	}
