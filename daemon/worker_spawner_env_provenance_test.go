@@ -149,7 +149,9 @@ func TestComposeEnv_EmptyFilteredParentDoesNotReinherit(t *testing.T) {
 		}
 		ctx, cancel := context.WithTimeout(t.Context(), 5*time.Second)
 		defer cancel()
-		cmd := exec.CommandContext(ctx, executable, "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", assert)
+		// Bind the current test executable after fixed-argument construction.
+		cmd := exec.CommandContext(ctx, "/donmai-env-probe", "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", assert)
+		cmd.Path, cmd.Args[0] = executable, executable
 		cmd.Env = composeEnv(nil, nil, nil)
 		if output, err := cmd.CombinedOutput(); err != nil {
 			t.Fatalf("explicitly empty worker environment was not preserved: %v: %s", err, output)
@@ -162,7 +164,9 @@ func TestComposeEnv_EmptyFilteredParentDoesNotReinherit(t *testing.T) {
 	}
 	ctx, cancel := context.WithTimeout(t.Context(), 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, executable, "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", producer)
+	// Bind the current test executable after fixed-argument construction.
+	cmd := exec.CommandContext(ctx, "/donmai-env-probe", "-test.run=^TestComposeEnv_EmptyFilteredParentDoesNotReinherit$", "--", producer)
+	cmd.Path, cmd.Args[0] = executable, executable
 	cmd.Env = []string{afclient.ControlTokenEnv + "=synthetic-control-token"}
 	if output, err := cmd.CombinedOutput(); err != nil {
 		t.Fatalf("isolated supervisor environment probe failed: %v: %s", err, output)
