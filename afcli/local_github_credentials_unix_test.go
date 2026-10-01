@@ -6,7 +6,6 @@ import (
 	"context"
 	"errors"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -45,7 +44,7 @@ func TestStoredGitHubCLIRefusesUnsafeCredentialLocators(t *testing.T) {
 func TestStoredGitHubCLIStopsOnlyOwnedDescendants(t *testing.T) {
 	home := t.TempDir()
 	t.Setenv("HOME", home)
-	localGitHubFakeCLI(t, home, "sleep 30 &\nprintf '%s\\n' \"$!\" > \"$HOME/owned-child-pid\"\nprintf 'native-child-token\\n'")
+	localGitHubFakeCLI(t, home, "printf '%s\\n' \"$$\" > \"$HOME/owned-leader-pid\"\nsleep 30 &\nprintf '%s\\n' \"$!\" > \"$HOME/owned-child-pid\"\nprintf 'native-child-token\\n'")
 	t.Setenv("PATH", filepath.Join(home, ".local", "bin")+string(os.PathListSeparator)+os.Getenv("PATH"))
 	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
 	defer cancel()
@@ -61,11 +60,32 @@ func TestStoredGitHubCLIStopsOnlyOwnedDescendants(t *testing.T) {
 	if err != nil || pid <= 0 {
 		t.Fatalf("invalid fixture descendant PID %q, %v", rawPID, err)
 	}
+	rawLeader, err := os.ReadFile(filepath.Join(home, "owned-leader-pid"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	leader, err := strconv.Atoi(strings.TrimSpace(string(rawLeader)))
+	if err != nil || leader <= 0 {
+		t.Fatalf("invalid fixture leader PID %q, %v", rawLeader, err)
+	}
 	// A just-killed child may briefly be a zombie under the container's PID 1.
 	// Neither an absent process nor a zombie has a live writer or credential use.
-	output, psErr := exec.Command("/bin/ps", "-p", strconv.Itoa(pid), "-o", "stat=").Output()
-	if psErr == nil && !strings.HasPrefix(strings.TrimSpace(string(output)), "Z") {
-		t.Fatalf("owned fixture descendant remains live: pid=%d state=%q", pid, output)
+	table, err := localGitHubPSTable() // fixed executable and fixed argv
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, line := range strings.Split(table, "\n") {
+		fields := strings.Fields(line)
+		if len(fields) != 4 || fields[0] != strconv.Itoa(pid) {
+			continue
+		}
+		group, parseErr := strconv.Atoi(fields[2])
+		if parseErr != nil || group != leader {
+			t.Fatalf("fixture descendant lost owned group: pid=%d leader=%d status=%q", pid, leader, line)
+		}
+		if !strings.HasPrefix(fields[3], "Z") {
+			t.Fatalf("owned fixture descendant remains live: pid=%d state=%q", pid, fields[3])
+		}
 	}
 }
 

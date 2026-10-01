@@ -126,7 +126,12 @@ func storedGitHubCLIToken(ctx context.Context) (string, error) {
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, localGitHubTokenTimeout)
 	defer cancel()
-	command := exec.CommandContext(probeCtx, binary, "auth", "token", "--hostname", "github.com")
+	// Construct the fixed GitHub CLI verb, then bind the command to the
+	// absolute, resolved, regular executable already checked above. The
+	// second PATH lookup in CommandContext grants no execution authority.
+	command := exec.CommandContext(probeCtx, "gh", "auth", "token", "--hostname", "github.com")
+	command.Path = binary
+	command.Args[0] = binary
 	command.Dir = "/"
 	command.Env = env
 	command.Stdin = nil

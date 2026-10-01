@@ -13,6 +13,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/RenseiAI/donmai/afcli/credentials"
@@ -58,7 +59,10 @@ func localGitHubFakeCLI(t *testing.T, home, body string) string {
 		"[ -z \"${GITHUB_TOKEN+x}\" ] && [ -z \"${GH_TOKEN+x}\" ] && [ -z \"${LD_PRELOAD+x}\" ] && [ -z \"${HTTP_PROXY+x}\" ] || exit 93\n" +
 		"[ \"$PWD\" = / ] || exit 94\n" +
 		"printf '%s\\n' \"$*\" >> \"$HOME/gh-args\"\n" + body + "\n"
-	if err := os.WriteFile(path, []byte(script), 0o700); err != nil {
+	if err := os.WriteFile(path, []byte(script), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Chmod(path, 0o700); err != nil {
 		t.Fatal(err)
 	}
 	return path
