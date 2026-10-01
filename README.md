@@ -112,8 +112,8 @@ codex -c 'cli_auth_credentials_store="file"' login status
 The Codex status should say `Logged in using ChatGPT`. Setup offers only
 installed profiles whose local login and model-version checks pass. Those
 checks do not verify account entitlement or a successful model turn. Keep
-`GITHUB_TOKEN` in the shell running Donmai so it can verify the repository,
-read issues, and publish authenticated session receipts.
+`GITHUB_TOKEN` in the shell running setup or a foreground host so Donmai can
+verify the repository, read issues, and publish authenticated session receipts.
 
 From a clone of the GitHub repository, choose **2. Local file queue** in the
 wizard. Select the native profile, enter `OWNER/REPO`, choose an issue label
@@ -164,6 +164,17 @@ donmai host doctor
 donmai host stats
 donmai host logs
 ```
+
+The installed service runs outside the setup shell. When it has no
+`GITHUB_TOKEN` or `GH_TOKEN` in its environment, its local GitHub source reads
+the active `github.com` login from `gh` under the service user's home. The
+`gh auth login` and `gh auth setup-git` steps above therefore serve both issue
+intake and pull-request publication after a restart. A custom personal access
+token that differs from that login needs intentional service-environment
+provisioning; a shell `export` for setup does not persist into the service.
+If `GITHUB_TOKEN` and `GH_TOKEN` are both present with different values, the
+local source refuses startup rather than using a different credential from
+the GitHub CLI that publishes the pull request.
 
 The standalone `orchestrator` is a separate path that starts an installed
 Claude or Codex CLI directly, without the daemon. In a Git checkout, set

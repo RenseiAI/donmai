@@ -10,7 +10,6 @@ import (
 	"net"
 	"net/http"
 	"net/url"
-	"os"
 	"os/exec"
 	"path/filepath"
 	"strconv"
@@ -259,12 +258,9 @@ func newLocalRuntimeComposition(configPath string, current func() *daemon.Config
 		}
 		return initial.LocalRuntime
 	}
-	token := strings.TrimSpace(baseEnv["GITHUB_TOKEN"])
-	if token == "" {
-		token = strings.TrimSpace(os.Getenv("GITHUB_TOKEN"))
-	}
-	if token == "" {
-		return nil, nil, errors.New("local GitHub source requires GITHUB_TOKEN in the standalone credential source")
+	token, err := localGitHubSourceToken(baseEnv)
+	if err != nil {
+		return nil, nil, err
 	}
 	options := &daemon.LocalRuntimeOptions{QueueRoot: root, AuthRoot: root + ".auth", Repositories: append([]daemon.LocalGitHubRepository(nil), initial.LocalRuntime.Repositories...)}
 	options.NewCompiler = func(identity daemon.LocalRuntimeIdentity) (daemon.LocalRuntimeCompiler, error) {
