@@ -265,21 +265,33 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 			if _, err := daemon.PrepareLocalRuntimeConfig(configPath); err != nil {
 				return fmt.Errorf("prepare local execution-security configuration: %w", err)
 			}
-			// Resolve first-run mode through the existing wizard before constructing
-			// mode-specific registries and callbacks. ConfigPath persists the choice,
-			// so Daemon.Start reads it without invoking the wizard a second time.
+			// An interactive first run must persist its selected mode before
+			// constructing mode-specific registries. When setup is skipped, leave
+			// the absent config to Daemon.Start's existing in-memory default path:
+			// a stub-only default can intentionally have no orchestrator URL and
+			// cannot be reloaded as an authored config before startup.
 			configured, err := daemon.LoadConfig(configPath)
 			if err != nil {
 				return fmt.Errorf("load startup configuration: %w", err)
 			}
 			if configured == nil {
-				if _, err = daemon.RunSetupWizard(daemon.WizardOptions{
-					Context: cmd.Context(), ConfigPath: configPath, SkipWizard: skipWizard,
-					BinaryName:           binaryName(cfg),
-					LocalRuntimeResolver: localSetupResolverFactory(), Stdin: cmd.InOrStdin(),
-					Stdout: cmd.OutOrStdout(), IsTTY: setupWizardTTYOverride,
-				}); err != nil {
-					return fmt.Errorf("first-run setup: %w", err)
+				skipFirstRunWizard := skipWizard
+				if !skipFirstRunWizard {
+					if setupWizardTTYOverride != nil {
+						skipFirstRunWizard = !*setupWizardTTYOverride
+					} else {
+						skipFirstRunWizard = daemon.ShouldSkipWizard()
+					}
+				}
+				if !skipFirstRunWizard {
+					if _, err = daemon.RunSetupWizard(daemon.WizardOptions{
+						Context: cmd.Context(), ConfigPath: configPath, SkipWizard: skipWizard,
+						BinaryName:           binaryName(cfg),
+						LocalRuntimeResolver: localSetupResolverFactory(), Stdin: cmd.InOrStdin(),
+						Stdout: cmd.OutOrStdout(), IsTTY: setupWizardTTYOverride,
+					}); err != nil {
+						return fmt.Errorf("first-run setup: %w", err)
+					}
 				}
 			}
 			var providerView daemon.ProviderRegistry
