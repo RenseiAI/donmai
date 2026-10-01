@@ -647,6 +647,11 @@ type ProvisionSpec struct {
 	// Branch. For StrategyWorktreeAdd, ParentRepoPath must have an origin remote
 	// whose fetch refspec publishes the requested branch.
 	BaseRef string
+	// RequireBranchBase opts into a verified refs/heads source for new-branch
+	// work. It is an in-process contract, not a persisted/wire selector.
+	// False preserves legacy generic ref/tag behavior.
+	RequireBranchBase bool `json:"-"`
+	branchBaseSHA     string
 	// SkipBaseFetch explicitly preserves offline/test behaviour.
 	SkipBaseFetch bool
 	// PullRequest is the optional dispatched-pull-request record. When set,
@@ -666,6 +671,9 @@ type ProvisionSpec struct {
 //
 // Returns the worktree path on success.
 func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, error) {
+	if err := validateRequiredBranchBase(spec); err != nil {
+		return "", err
+	}
 	if spec.SessionID == "" {
 		return "", errors.New("runtime/worktree: SessionID required")
 	}
@@ -764,6 +772,9 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 	baseInfo, fetchErr := m.refreshBase(ctx, parentRepoPath, spec)
 	if fetchErr != nil {
 		return "", fetchErr
+	}
+	if spec.RequireBranchBase && spec.Strategy == StrategyWorktreeAdd {
+		spec.branchBaseSHA = baseInfo.SHA
 	}
 	var attempts int
 	for attempt := 1; attempt <= MaxSpawnRetries; attempt++ {
@@ -1671,6 +1682,7 @@ func (m *Manager) provisionOnce(ctx context.Context, dst string, spec ProvisionS
 }
 
 type baseFetchInfo struct {
+	SHA      string
 	Ref      string
 	Duration time.Duration
 	Fetched  bool
@@ -1729,17 +1741,25 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 	if ref == "" {
 		return baseFetchInfo{}, nil
 	}
-	ref, err := normalizeBaseRef(ref)
+	var err error
+	if spec.RequireBranchBase {
+		err = ValidateBranchBaseRef(ref)
+	} else {
+		ref, err = normalizeBaseRef(ref)
+	}
 	if err != nil {
 		return baseFetchInfo{}, err
 	}
 	key := canonicalParentPath(parent) + "\x00" + ref
+	if spec.RequireBranchBase {
+		key += "\x00refs-heads-only"
+	}
 	baseFetchFlights.Lock()
 	flight := baseFetchFlights.flights[key]
 	if flight == nil {
 		flight = &baseFetchFlight{done: make(chan struct{})}
 		baseFetchFlights.flights[key] = flight
-		go m.runBaseFetch(context.WithoutCancel(ctx), key, parent, ref, spec.RepoURL, flight)
+		go m.runBaseFetch(context.WithoutCancel(ctx), key, parent, ref, spec.RepoURL, spec.RequireBranchBase, flight)
 	}
 	baseFetchFlights.Unlock()
 	select {
@@ -1755,12 +1775,19 @@ func (m *Manager) refreshBase(ctx context.Context, parent string, spec Provision
 // caller that elected this flight; the only deadline applied is the manager's
 // BaseFetchTimeout policy. Closing flight.done is the happens-before edge that
 // publishes info and err to the waiters.
-func (m *Manager) runBaseFetch(ctx context.Context, key, parent, ref, repoURL string, flight *baseFetchFlight) {
+func (m *Manager) runBaseFetch(ctx context.Context, key, parent, ref, repoURL string, branchOnly bool, flight *baseFetchFlight) {
 	fetchCtx, cancel := context.WithTimeout(ctx, m.baseFetchTimeout)
 	defer cancel()
 	started := time.Now()
-	out, err := m.runGit(fetchCtx, repoURL, "-C", parent, "fetch", "origin", "--", ref)
+	args := []string{"-C", parent, "fetch", "origin", "--", ref}
+	if branchOnly {
+		args = []string{"-C", parent, "fetch", "--no-tags", "origin", "--", "+refs/heads/" + ref + ":refs/remotes/origin/" + ref}
+	}
+	out, err := m.runGit(fetchCtx, repoURL, args...)
 	info := baseFetchInfo{Ref: ref, Duration: time.Since(started), Fetched: true}
+	if err == nil && branchOnly {
+		info.SHA, err = m.exactBranchTrackingTip(fetchCtx, parent, ref)
+	}
 	if err != nil {
 		info = baseFetchInfo{}
 		if isAbsentBaseRef(out) {
@@ -1886,6 +1913,11 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 				return fmt.Errorf("git sparse-checkout: %w (%s)", err, strings.TrimSpace(string(out)))
 			}
 		}
+		if spec.RequireBranchBase {
+			if err := m.verifyClonedBranchBase(ctx, dst, spec.BaseRef); err != nil {
+				return err
+			}
+		}
 		// The dispatched pull request's head is materialized here, inside the
 		// clone step and before Provision returns, so the agent never observes
 		// a workarea that is missing the commit it was dispatched against.
@@ -1900,7 +1932,12 @@ func (m *Manager) provisionOnceWithReference(ctx context.Context, dst string, sp
 			args = append(args, "--no-track", "-B", spec.Branch)
 		}
 		args = append(args, dst)
-		if spec.Branch != "" || spec.BaseRef != "" {
+		if spec.RequireBranchBase {
+			if !branchTipSHA(spec.branchBaseSHA) {
+				return fmt.Errorf("%w: no current branch fetch proof", ErrInvalidBaseRef)
+			}
+			args = append(args, spec.branchBaseSHA)
+		} else if spec.Branch != "" || spec.BaseRef != "" {
 			baseRef := baseRefForSpec(spec)
 			baseRef, refErr := normalizeBaseRef(baseRef)
 			if refErr != nil {

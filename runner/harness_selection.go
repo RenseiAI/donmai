@@ -40,14 +40,15 @@ func (e *HarnessAdmissionError) Unwrap() error { return e.cause }
 // vocabulary so they can be attached to the full upstream receipt when the
 // dispatch contract is threaded end-to-end.
 type harnessSelection struct {
-	Provider      agent.Provider
-	Harness       executioncell.HarnessRef
-	Decisions     []executioncell.ResolverDecision
-	Explicit      bool
-	receipt       executioncell.ImmutableAdmissionReceipt
-	claimReceipt  executioncell.ImmutableClaimReceipt
-	effectiveCell executioncell.ResolvedExecutionCell
-	effectiveJSON []byte
+	runtimeTransport RuntimeTransportMode
+	Provider         agent.Provider
+	Harness          executioncell.HarnessRef
+	Decisions        []executioncell.ResolverDecision
+	Explicit         bool
+	receipt          executioncell.ImmutableAdmissionReceipt
+	claimReceipt     executioncell.ImmutableClaimReceipt
+	effectiveCell    executioncell.ResolvedExecutionCell
+	effectiveJSON    []byte
 }
 
 type harnessSelectorIntent struct {
@@ -95,6 +96,9 @@ func (a *HarnessAdmission) CanonicalHarnessRef() (executioncell.HarnessRef, bool
 // the named legacy adapter inside Run. Explicit denials carry a canonical
 // immutable denied receipt on HarnessAdmissionError.
 func (r *Registry) PreflightHarness(qw QueuedWork, realizations ...*agent.CapabilityRealizationRegistry) (*HarnessAdmission, error) {
+	if err := r.validateRuntimeTransport(qw); err != nil {
+		return nil, err
+	}
 	var realizationRegistry *agent.CapabilityRealizationRegistry
 	if len(realizations) > 0 {
 		realizationRegistry = realizations[0]
@@ -786,7 +790,7 @@ func (r *Registry) selectExplicitHarness(profile ResolvedProfile) (harnessSelect
 	ref := harnessRef(selected)
 	decision := explicitHarnessDecision(profile.Harness, ref)
 	return harnessSelection{
-		Provider: selected, Harness: ref,
+		Provider: selected, Harness: ref, runtimeTransport: r.runtimeTransport,
 		Decisions: []executioncell.ResolverDecision{decision}, Explicit: true,
 	}, nil
 }
@@ -858,7 +862,7 @@ func (r *Registry) legacyHarnessSelectionAdapter(profile ResolvedProfile, poster
 		SourceRef:   source.source, Reason: source.reason,
 	}
 	return harnessSelection{
-		Provider: provider, Harness: ref,
+		Provider: provider, Harness: ref, runtimeTransport: r.runtimeTransport,
 		Decisions: []executioncell.ResolverDecision{decision},
 	}, nil
 }

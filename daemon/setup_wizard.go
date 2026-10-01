@@ -2,20 +2,48 @@ package daemon
 
 import (
 	"bufio"
+	"context"
 	"errors"
 	"fmt"
 	"io"
+	"net/url"
 	"os"
 	"os/exec"
+	"path/filepath"
 	"runtime"
 	"strconv"
 	"strings"
 
 	"github.com/RenseiAI/donmai/internal/statepath"
+	"github.com/RenseiAI/donmai/runtime/worktree"
 )
+
+// LocalRuntimeSetupProfile is a native host-login route discovered by the
+// embedding CLI. Its catalog revision is empty for a built-in model pairing.
+type LocalRuntimeSetupProfile struct {
+	Label, Harness, Model, ModelAuthor, ModelCatalogRevision string
+}
+
+// LocalRuntimeSetupResolver supplies observed host and GitHub facts. Setup
+// never derives immutable repository identity or model catalog authority from
+// unverified text.
+type LocalRuntimeSetupResolver interface {
+	Profiles(context.Context) ([]LocalRuntimeSetupProfile, error)
+	Repository(context.Context, string) (LocalGitHubRepository, error)
+}
+
+// LocalRuntimeSetupBranchVerifier is the additive local new-branch setup seam.
+// Implementations verify repository.Ref as an actual branch under the observed
+// immutable repository identity; a tag/SHA or missing branch cannot substitute.
+// It does not alter the existing resolver's metadata/model methods.
+type LocalRuntimeSetupBranchVerifier interface {
+	VerifyBaseBranch(context.Context, LocalGitHubRepository) error
+}
 
 // WizardOptions configure the interactive setup wizard.
 type WizardOptions struct {
+	Context              context.Context
+	LocalRuntimeResolver LocalRuntimeSetupResolver
 	// Existing is an existing config (if any) used as defaults.
 	Existing *Config
 	// BinaryName is the invoking command name used in completion guidance.
@@ -90,6 +118,10 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		out = os.Stdout
 	}
 	r := bufio.NewReader(in)
+	ctx := opts.Context
+	if ctx == nil {
+		ctx = context.Background()
+	}
 
 	cpu := opts.CPUCount
 	if cpu == 0 {
@@ -167,11 +199,18 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	wln("  Where do work assignments come from?")
 	wln("  > 1. Remote orchestrator           — register with a platform you configure")
 	wln("    2. Local file queue (single-user) — for solo dev, no network")
-	choiceStr, err := promptDefault(r, out, "Choice", "1")
+	choiceDefault := "1"
+	if opts.Existing != nil && strings.HasPrefix(opts.Existing.Orchestrator.URL, "file:") {
+		choiceDefault = "2"
+	}
+	choiceStr, err := promptDefault(r, out, "Choice", choiceDefault)
 	if err != nil {
 		return nil, err
 	}
-	choice, _ := strconv.Atoi(choiceStr)
+	choice, err := strconv.Atoi(choiceStr)
+	if err != nil || (choice != 1 && choice != 2) {
+		return nil, errors.New("orchestrator choice must be 1 or 2")
+	}
 	var orchestratorURL string
 	authToken := ""
 	if opts.Existing != nil {
@@ -181,16 +220,27 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	case 2:
 		queue := statepath.Resolve("queue", "/tmp/.donmai/queue")
 		orchestratorURL = "file://" + queue
+		if opts.Existing != nil && strings.HasPrefix(opts.Existing.Orchestrator.URL, "file:") {
+			if !canonicalLocalQueueURL(opts.Existing.Orchestrator.URL) {
+				return nil, errors.New("existing local file queue URL is not canonical")
+			}
+			orchestratorURL = opts.Existing.Orchestrator.URL
+			queue = strings.TrimPrefix(orchestratorURL, "file://")
+		}
 		wf("  Using local file queue at %s\n", queue)
-	default:
+		authToken = ""
+	case 1:
 		// No vendor default — the operator supplies the orchestrator URL.
 		def := ""
-		if opts.Existing != nil && opts.Existing.Orchestrator.URL != "" {
+		if opts.Existing != nil && opts.Existing.Orchestrator.URL != "" && !strings.HasPrefix(opts.Existing.Orchestrator.URL, "file:") {
 			def = opts.Existing.Orchestrator.URL
 		}
 		orchestratorURL, err = promptDefault(r, out, "Orchestrator URL", def)
 		if err != nil {
 			return nil, err
+		}
+		if orchestratorURL == "" || strings.HasPrefix(orchestratorURL, "file:") {
+			return nil, errors.New("remote orchestrator URL must be nonempty and must not use file mode")
 		}
 		envTok := os.Getenv("DONMAI_DAEMON_TOKEN")
 		switch {
@@ -213,6 +263,14 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		return nil, errors.New("setup wizard cancelled by user")
 	}
 
+	var localRuntime *LocalRuntimeConfig
+	if choice == 2 {
+		localRuntime, err = configureLocalRuntime(ctx, r, out, opts)
+		if err != nil {
+			return nil, fmt.Errorf("configure local runtime: %w", err)
+		}
+	}
+
 	// [4/5] Project allowlist
 	wln("\n[4/5] Project allowlist")
 	projects := []ProjectConfig{}
@@ -223,7 +281,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	if detect == nil {
 		detect = detectGitRemote
 	}
-	if remote := detect(); remote != "" {
+	if remote := detect(); remote != "" && choice != 2 {
 		repo := remoteToRepository(remote)
 		alreadyAdded := false
 		for _, p := range projects {
@@ -242,7 +300,7 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			}
 		}
 	}
-	if confirmYes(r, out, "  Add another project?", false) {
+	if choice != 2 && confirmYes(r, out, "  Add another project?", false) {
 		repoURL, err := promptDefault(r, out, "Repository (e.g. github.com/org/repo)", "")
 		if err != nil {
 			return nil, err
@@ -267,12 +325,16 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	if opts.Existing != nil {
 		admissionDefaultAllRouted = opts.Existing.AdmitsAnyRoutedProject()
 	}
-	wln("\n  Project admission")
-	wln("    all-routed  any project your organization routes to this machine runs here")
-	wln("    enumerated  only projects you allow on this machine, one by one")
 	admissionMode := ProjectAdmissionModeEnumerated
-	if confirmYes(r, out, "  Accept any project routed to this machine?", admissionDefaultAllRouted) {
-		admissionMode = ProjectAdmissionModeAllRouted
+	if choice != 2 {
+		wln("\n  Project admission")
+		wln("    all-routed  any project your organization routes to this machine runs here")
+		wln("    enumerated  only projects you allow on this machine, one by one")
+		if confirmYes(r, out, "  Accept any project routed to this machine?", admissionDefaultAllRouted) {
+			admissionMode = ProjectAdmissionModeAllRouted
+		}
+	} else {
+		wln("  Local intake is limited to the configured GitHub repository and issue label.")
 	}
 	if !confirmYes(r, out, "  Continue?", true) {
 		return nil, errors.New("setup wizard cancelled by user")
@@ -344,6 +406,13 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 			DrainTimeoutSeconds: drain,
 		},
 	}
+	if choice == 2 {
+		cfg.APIVersion = LocalRuntimeConfigAPIVersion
+		cfg.LocalRuntime = localRuntime
+		if err := ValidateLocalExecutionSecurity(cfg); err != nil {
+			return nil, err
+		}
+	}
 	if opts.Existing != nil {
 		// Preserve per-session caps from existing config when present.
 		if opts.Existing.Capacity.MaxVCpuPerSession > 0 {
@@ -354,6 +423,9 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 		}
 	}
 	applyDefaults(cfg)
+	if err := validateConfig(cfg); err != nil {
+		return nil, fmt.Errorf("validate setup config: %w", err)
+	}
 
 	if opts.ConfigPath != "" {
 		if err := WriteConfig(opts.ConfigPath, cfg); err != nil {
@@ -368,6 +440,173 @@ func RunSetupWizard(opts WizardOptions) (*Config, error) {
 	return cfg, nil
 }
 
+func canonicalLocalQueueURL(raw string) bool {
+	parsed, err := url.Parse(raw)
+	return err == nil && parsed.Scheme == "file" && parsed.Host == "" && parsed.Opaque == "" && parsed.User == nil && parsed.RawQuery == "" && !parsed.ForceQuery && parsed.Fragment == "" && parsed.RawPath == "" && filepath.IsAbs(parsed.Path) && filepath.Clean(parsed.Path) == parsed.Path
+}
+
+func validLocalIssueSelection(label, ref string) bool {
+	return label != "" && len(label) <= 128 && strings.TrimSpace(label) == label && ref != "" && len(ref) <= 256 && strings.TrimSpace(ref) == ref && !strings.Contains(ref, "..") && !strings.ContainsAny(ref, " \t\r\n")
+}
+
+func configureLocalRuntime(ctx context.Context, r *bufio.Reader, out io.Writer, opts WizardOptions) (*LocalRuntimeConfig, error) {
+	if opts.LocalRuntimeResolver == nil {
+		return nil, errors.New("local setup requires a native profile and GitHub repository resolver")
+	}
+	var previous *LocalRuntimeConfig
+	if opts.Existing != nil {
+		switch opts.Existing.APIVersion {
+		case "donmai.dev/v1":
+			// This is an explicit operator transition from a known v1 config.
+		case LocalRuntimeConfigAPIVersion:
+			if err := ValidateLocalExecutionSecurity(opts.Existing); err != nil {
+				return nil, err
+			}
+			previous = opts.Existing.LocalRuntime
+			if previous.Harness != "codex" && previous.Harness != "claude-code" {
+				return nil, errors.New("existing local harness is invalid")
+			}
+			if strings.TrimSpace(previous.Model) == "" || strings.TrimSpace(previous.ModelAuthor) == "" || len(previous.Repositories) == 0 || len(previous.Repositories) > 128 {
+				return nil, errors.New("existing local profile or repository is invalid")
+			}
+			if err := validateLocalRepositories(previous.Repositories); err != nil {
+				return nil, err
+			}
+		default:
+			return nil, errors.New("unknown existing config schema; local setup refuses to guess a migration")
+		}
+	}
+	profiles, err := opts.LocalRuntimeResolver.Profiles(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("discover native profiles: %w", err)
+	}
+	if len(profiles) == 0 {
+		return nil, errors.New("no installed and authenticated native harness with a built-in host-login model")
+	}
+	defaultChoice := 1
+	_, _ = fmt.Fprintln(out, "\n  Installed and authenticated native profiles:")
+	for i, profile := range profiles {
+		if profile.Label == "" || (profile.Harness != "codex" && profile.Harness != "claude-code") || profile.Model == "" || profile.ModelAuthor == "" || profile.ModelCatalogRevision != "" {
+			return nil, errors.New("native profile resolver returned an invalid built-in pairing")
+		}
+		_, _ = fmt.Fprintf(out, "    %d. %s (%s, %s/%s)\n", i+1, profile.Label, profile.Harness, profile.ModelAuthor, profile.Model)
+		if previous != nil && previous.Harness == profile.Harness && previous.Model == profile.Model && previous.ModelAuthor == profile.ModelAuthor && previous.ModelCatalogRevision == profile.ModelCatalogRevision {
+			defaultChoice = i + 1
+		}
+	}
+	if previous != nil && (profiles[defaultChoice-1].Harness != previous.Harness || profiles[defaultChoice-1].Model != previous.Model || profiles[defaultChoice-1].ModelAuthor != previous.ModelAuthor || profiles[defaultChoice-1].ModelCatalogRevision != previous.ModelCatalogRevision) {
+		return nil, errors.New("existing native profile is no longer installed, authenticated, or in the built-in catalog")
+	}
+	choice, err := promptInt(r, out, "Native profile number", defaultChoice)
+	if err != nil {
+		return nil, err
+	}
+	if choice < 1 || choice > len(profiles) {
+		return nil, errors.New("native profile number is out of range")
+	}
+	selected := profiles[choice-1]
+
+	defaultRepo := ""
+	if previous != nil {
+		defaultRepo = previous.Repositories[0].OwnerRepo
+	} else {
+		detect := opts.DetectGitRemote
+		if detect == nil {
+			detect = detectGitRemote
+		}
+		if remote := remoteToRepository(detect()); strings.HasPrefix(remote, "github.com/") {
+			defaultRepo = strings.TrimPrefix(remote, "github.com/")
+		}
+	}
+	ownerRepo, err := promptDefault(r, out, "GitHub owner/repository", defaultRepo)
+	if err != nil {
+		return nil, err
+	}
+	if ownerRepo == "" || strings.ContainsAny(ownerRepo, " \t\r\n") {
+		return nil, errors.New("GitHub owner/repository is required")
+	}
+	repository, err := opts.LocalRuntimeResolver.Repository(ctx, ownerRepo)
+	if err != nil {
+		return nil, fmt.Errorf("verify GitHub repository: %w", err)
+	}
+	if repository.RepositoryID <= 0 || repository.OwnerRepo == "" || repository.Ref == "" {
+		return nil, errors.New("GitHub repository metadata lacks immutable ID, canonical name, or default ref")
+	}
+	if previous != nil && previous.Repositories[0].RepositoryID != repository.RepositoryID {
+		return nil, errors.New("existing GitHub repository ID changed")
+	}
+	labelDefault := "donmai"
+	refDefault := repository.Ref
+	if previous != nil {
+		labelDefault = previous.Repositories[0].Label
+		if previous.Repositories[0].Ref != "" {
+			refDefault = previous.Repositories[0].Ref
+		}
+	}
+	label, err := promptDefault(r, out, "Issue label to watch", labelDefault)
+	if err != nil {
+		return nil, err
+	}
+	ref, err := promptDefault(r, out, "Base branch for new PRs", refDefault)
+	if err != nil {
+		return nil, err
+	}
+	if !validLocalIssueSelection(label, ref) {
+		return nil, errors.New("GitHub issue label or ref is invalid")
+	}
+	repository.Label, repository.Ref = label, ref
+	verifier, ok := opts.LocalRuntimeResolver.(LocalRuntimeSetupBranchVerifier)
+	if !ok {
+		return nil, errors.New("local setup requires verified GitHub base-branch support")
+	}
+	if err = worktree.ValidateBranchBaseRef(ref); err != nil {
+		return nil, err
+	}
+	if err = verifier.VerifyBaseBranch(ctx, repository); err != nil {
+		return nil, fmt.Errorf("verify GitHub base branch: %w", err)
+	}
+	repositories := []LocalGitHubRepository{repository}
+	if previous != nil {
+		for _, configured := range previous.Repositories[1:] {
+			if !validLocalIssueSelection(configured.Label, configured.Ref) {
+				return nil, errors.New("configured GitHub issue label or ref is invalid")
+			}
+			observed, err := opts.LocalRuntimeResolver.Repository(ctx, configured.OwnerRepo)
+			if err != nil {
+				return nil, fmt.Errorf("verify configured GitHub repository: %w", err)
+			}
+			if observed.RepositoryID != configured.RepositoryID || observed.RepositoryID <= 0 || observed.OwnerRepo == "" || observed.Ref == "" {
+				return nil, errors.New("configured GitHub repository identity changed or metadata is incomplete")
+			}
+			configured.OwnerRepo = observed.OwnerRepo
+			if err = worktree.ValidateBranchBaseRef(configured.Ref); err != nil {
+				return nil, err
+			}
+			if err = verifier.VerifyBaseBranch(ctx, configured); err != nil {
+				return nil, fmt.Errorf("verify configured GitHub base branch: %w", err)
+			}
+			repositories = append(repositories, configured)
+		}
+	}
+	if err := validateLocalRepositories(repositories); err != nil {
+		return nil, err
+	}
+	policy := InitialLocalExecutionSecurity()
+	if previous != nil {
+		policy = previous.ExecutionSecurity
+	}
+	if err := policy.Validate(); err != nil {
+		return nil, err
+	}
+	_, _ = fmt.Fprintln(out, "\n  Local execution security (explicit policy):")
+	_, _ = fmt.Fprintf(out, "    toolApproval: %s\n    fileRead: %s\n    fileWrite: %s\n    network: %s\n    credentials: %s\n    isolation: %s\n", policy.ToolApproval, policy.FileRead, policy.FileWrite, policy.Network, policy.Credentials, policy.Isolation)
+	_, _ = fmt.Fprintln(out, "  host-user is uncontained. ambient-host-login lets the harness use logins available to this OS user.")
+	for _, configured := range repositories {
+		_, _ = fmt.Fprintf(out, "  GitHub intake: %s (repository ID %d), label %q, ref %q\n", configured.OwnerRepo, configured.RepositoryID, configured.Label, configured.Ref)
+	}
+	return &LocalRuntimeConfig{ExecutionSecurity: policy, Harness: selected.Harness, Model: selected.Model, ModelAuthor: selected.ModelAuthor, ModelCatalogRevision: selected.ModelCatalogRevision, Repositories: repositories}, nil
+}
+
 // BuildDefaultConfigFromExisting returns a default Config (or the existing
 // one) and optionally persists it to configPath.
 func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Config, error) {
@@ -376,6 +615,11 @@ func BuildDefaultConfigFromExisting(existing *Config, configPath string) (*Confi
 		cfg = DefaultConfig()
 	} else {
 		applyDefaults(cfg)
+	}
+	if strings.HasPrefix(cfg.Orchestrator.URL, "file:") {
+		if err := ValidateLocalExecutionSecurity(cfg); err != nil {
+			return nil, err
+		}
 	}
 	if configPath != "" {
 		if err := WriteConfig(configPath, cfg); err != nil {

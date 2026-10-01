@@ -153,6 +153,11 @@ func NewBuilder() *Builder {
 // operating protocol. It never replaces the content-safety invariant,
 // system_base.tmpl, repository instructions, or Kit skills.
 func (b *Builder) Build(qw QueuedWork) (system, user string, err error) {
+	defer func() {
+		if err == nil && qw.BaseRef != "" && !qw.isInteractiveMode() {
+			user += fmt.Sprintf("\n\nNew-branch source contract: the base branch is %q. Work on the current per-session branch, not the base branch, and target that base explicitly when opening the pull request.\n", qw.BaseRef)
+		}
+	}()
 	hasStagePrompt := strings.TrimSpace(qw.StagePrompt) != ""
 	// Interactive sessions are exempt from the empty-work check: an idle
 	// PTY session awaiting terminal input is valid work even with no issue

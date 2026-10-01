@@ -108,8 +108,10 @@ type SessionDetail struct {
 	// and no forge API access accompanies it.
 	PullRequest *workarea.PullRequestV1 `json:"pullRequest,omitempty"`
 
-	// Ref is the base branch / ref to check out from.
+	// Ref names an existing ref being amended.
 	Ref string `json:"ref,omitempty"`
+	// BaseRef mirrors the immutable source/base branch for new-branch work.
+	BaseRef string `json:"baseRef,omitempty"`
 
 	// WorkType is the workflow discriminant ("development", "qa",
 	// "research", ...).

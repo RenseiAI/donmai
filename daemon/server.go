@@ -127,10 +127,19 @@ func (s *Server) startLocked() (<-chan error, error) {
 	// well-known port.
 	if s.daemon != nil {
 		s.daemon.PublishControlAddr(s.addr)
+		if local := s.daemon.localRuntime.Load(); local != nil {
+			if err := local.publishEndpoint(context.Background()); err != nil {
+				_ = listener.Close()
+				return nil, err
+			}
+		}
 	}
 	errCh := make(chan error, 1)
 	go func() {
 		err := s.httpd.Serve(listener)
+		if local := s.daemon.localRuntime.Load(); local != nil {
+			local.beginStop()
+		}
 		if gate := s.startupBarrier.Load(); gate != nil {
 			if poller := s.daemon.fenceControlStartup(gate); poller != nil {
 				cancelCtx, cancel := context.WithCancel(context.Background())
@@ -145,6 +154,11 @@ func (s *Server) startLocked() (<-chan error, error) {
 		close(errCh)
 	}()
 	s.started = true
+	if s.startupBarrier.Load() == nil && s.daemon.localRuntime.Load() != nil {
+		s.daemon.lifecycleMu.Lock()
+		s.daemon.activateStartupPollingLocked()
+		s.daemon.lifecycleMu.Unlock()
+	}
 	return errCh, nil
 }
 
@@ -187,6 +201,12 @@ func (s *Server) StartBeforeDaemon() (<-chan error, error) {
 // racing it, because this is the edge that publishes everything Start built to
 // the handlers that read it.
 func (s *Server) DaemonStarted() {
+	if local := s.daemon.localRuntime.Load(); local != nil {
+		if err := local.publishEndpoint(context.Background()); err != nil {
+			slog.Error("local receiver publication refused", "error", err)
+			return
+		}
+	}
 	if gate := s.startupBarrier.Load(); gate != nil {
 		s.daemon.publishControlStartup(gate)
 		return
@@ -206,6 +226,17 @@ func (s *Server) gateHandler(mux http.Handler) http.Handler {
 			})
 			return
 		}
+		if local := s.daemon.localRuntime.Load(); local != nil {
+			if s.daemon.State() == StateStarting {
+				http.Error(w, "local runtime is still starting", http.StatusServiceUnavailable)
+				return
+			}
+			callback := strings.HasPrefix(r.URL.Path, localRuntimePrefix+"/api/sessions/")
+			if r.Method != http.MethodGet && r.Method != http.MethodHead && !callback && local.auth.VerifyOperator(localBearer(r)) != nil {
+				http.Error(w, "operator authentication required", http.StatusUnauthorized)
+				return
+			}
+		}
 		mux.ServeHTTP(w, r)
 	})
 }
@@ -219,8 +250,11 @@ func (s *Server) Shutdown(ctx context.Context) error {
 	started := s.started
 	s.mu.Unlock()
 	var pollErr error
+	if local := s.daemon.localRuntime.Load(); local != nil {
+		pollErr = waitCompletionContext(ctx, local.beginStop())
+	}
 	if poller != nil {
-		pollErr = poller.StopContext(ctx)
+		pollErr = errors.Join(pollErr, poller.StopContext(ctx))
 	}
 	if !started {
 		return pollErr
@@ -244,6 +278,7 @@ func (s *Server) register(mux *http.ServeMux) {
 	mux.HandleFunc("/api/daemon/capacity", s.requireControlAuth(s.method(http.MethodPost, s.handleSetCapacity)))
 	mux.HandleFunc("/api/daemon/pool/stats", s.method(http.MethodGet, s.handlePoolStats))
 	mux.HandleFunc("/api/daemon/pool/evict", s.requireControlAuth(s.method(http.MethodPost, s.handlePoolEvict)))
+	mux.HandleFunc(localRuntimePrefix+"/", s.handleLocalRuntime)
 	mux.HandleFunc("/api/daemon/sessions", s.requireControlAuth(s.handleSessions)) // GET=list, POST=accept
 	// Per-session sub-routes. Spawned `donmai agent run` processes fetch
 	// their full QueuedWork shape via GET <id>; the deterministic cancel
@@ -697,6 +732,20 @@ func (s *Server) handleSessionDetail(w http.ResponseWriter, r *http.Request, id 
 		http.NotFound(w, r)
 		return
 	}
+	if local := s.daemon.localRuntime.Load(); local != nil {
+		projection, err := local.authenticate(r.Context(), id, localBearer(r))
+		if err != nil {
+			http.Error(w, "attempt authentication required", http.StatusUnauthorized)
+			return
+		}
+		detail, err := local.detail(projection)
+		if err != nil {
+			http.Error(w, "local session detail is held for recovery", http.StatusServiceUnavailable)
+			return
+		}
+		writeJSON(w, http.StatusOK, detail)
+		return
+	}
 	detail, ok := s.daemon.SessionDetail(id)
 	if !ok {
 		writeJSON(w, http.StatusNotFound, map[string]string{
@@ -732,6 +781,15 @@ func (s *Server) handleSessionStop(w http.ResponseWriter, r *http.Request, id st
 		http.NotFound(w, r)
 		return
 	}
+	if local := s.daemon.localRuntime.Load(); local != nil {
+		if err := local.requestStop(r.Context(), id); err != nil {
+			http.Error(w, err.Error(), http.StatusConflict)
+			return
+		}
+		s.daemon.StopSession(id)
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "message": "stop requested"})
+		return
+	}
 	if !s.daemon.StopSession(id) {
 		writeJSON(w, http.StatusNotFound, map[string]string{
 			"error":     "session not found",
@@ -748,6 +806,10 @@ func (s *Server) handleSessions(w http.ResponseWriter, r *http.Request) {
 	case http.MethodGet:
 		writeJSON(w, http.StatusOK, s.daemon.ActiveSessions())
 	case http.MethodPost:
+		if s.daemon.localRuntime.Load() != nil {
+			http.Error(w, "local work must enter through authenticated issue intake", http.StatusForbidden)
+			return
+		}
 		var spec SessionSpec
 		if err := json.NewDecoder(r.Body).Decode(&spec); err != nil {
 			http.Error(w, "invalid body: "+err.Error(), http.StatusBadRequest)

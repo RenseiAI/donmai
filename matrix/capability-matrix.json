@@ -1044,6 +1044,16 @@
             "bedrock",
             "vertex"
           ]
+        },
+        {
+          "id": "claude-sonnet-5",
+          "humanLabel": "Claude Sonnet 5",
+          "contextWindow": 1000000,
+          "supportsTools": true,
+          "supportsJsonMode": false,
+          "hosts": [
+            "oauth-cli"
+          ]
         }
       ]
     },
@@ -1232,6 +1242,16 @@
           "hosts": [
             "direct",
             "azure"
+          ]
+        },
+        {
+          "id": "gpt-6-sol",
+          "humanLabel": "GPT-6 Sol",
+          "contextWindow": 1050000,
+          "supportsTools": true,
+          "supportsJsonMode": true,
+          "hosts": [
+            "oauth-cli"
           ]
         }
       ]

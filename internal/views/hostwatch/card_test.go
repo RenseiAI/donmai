@@ -117,6 +117,34 @@ func TestIsLiveState_EmptyIsNotLive(t *testing.T) {
 	}
 }
 
+func TestRenderCard_HeldSessionDoesNotImplyLiveWork(t *testing.T) {
+	card := SessionCard{
+		SessionID:    "held-1234",
+		DaemonState:  "unknown",
+		AcceptedAt:   "2026-09-27T12:00:00Z",
+		ProjectName:  "local-project",
+		Repository:   "https://github.com/example/project",
+		ToolCalls:    4,
+		CostUsd:      1.25,
+		NumTurns:     2,
+		LastActivity: "must not appear as live activity",
+	}
+	out := renderCard(theme.DefaultTheme(), card, 3, false, true, time.Now())
+	for _, want := range []string{"held-123", "held", "project local-project", "repo https://github.com/example/project", "accepted 2026-09-27T12:00:00Z"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("held card missing %q:\n%s", want, out)
+		}
+	}
+	if !strings.HasPrefix(out, "○ held-123") {
+		t.Errorf("held state should have a static neutral glyph:\n%s", out)
+	}
+	for _, absent := range []string{"running", "⏱", "must not appear as live activity", "$1.25"} {
+		if strings.Contains(out, absent) {
+			t.Errorf("held card should not show %q:\n%s", absent, out)
+		}
+	}
+}
+
 func TestRoleBadge(t *testing.T) {
 	tests := []struct {
 		workType, step, want string

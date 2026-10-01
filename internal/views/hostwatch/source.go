@@ -128,10 +128,11 @@ func NewSource(daemon daemonLister, st stateReader, repoScope string) *Source {
 	return &Source{daemon: daemon, state: st, repoScope: strings.TrimSpace(repoScope)}
 }
 
-// Counters is the dashboard header summary, all sourced from the daemon's
-// local status/stats endpoints (no platform call).
+// Counters is the dashboard header summary. Sessions is the visible row count;
+// status and stats are sourced from the daemon's local endpoints.
 type Counters struct {
-	Running       int
+	Sessions      int
+	Running       int // visible running/starting rows, excluding held and terminal rows
 	MaxSessions   int
 	QueueDepth    int
 	UptimeSeconds int64
@@ -171,10 +172,11 @@ func repoMatch(scope, repo string) bool {
 func (s *Source) Snapshot() Snapshot {
 	handles, err := s.daemon.GetSessions()
 	if err != nil {
-		return Snapshot{Err: fmt.Errorf("hostwatch: list sessions: %w", err), Counters: s.counters(0)}
+		return Snapshot{Err: fmt.Errorf("hostwatch: list sessions: %w", err), Counters: s.counters(0, 0)}
 	}
 
 	cards := make([]SessionCard, 0, len(handles))
+	running := 0
 	for _, h := range handles {
 		if !repoMatch(s.repoScope, h.Repository) {
 			continue
@@ -198,8 +200,18 @@ func (s *Source) Snapshot() Snapshot {
 			ModelProvider: h.ModelProvider,
 			WorkType:      h.WorkType,
 		}
-		s.enrichFromState(&card)
+		if card.isHeld() {
+			// A held row has no live process or workarea, even if a malformed
+			// older projection accidentally supplies those fields.
+			card.PID = 0
+			card.WorktreePath = ""
+		} else {
+			s.enrichFromState(&card)
+		}
 		cards = append(cards, card)
+		if isLiveState(card.DaemonState) {
+			running++
+		}
 	}
 
 	sort.SliceStable(cards, func(i, j int) bool {
@@ -209,7 +221,7 @@ func (s *Source) Snapshot() Snapshot {
 		return cards[i].SessionID < cards[j].SessionID
 	})
 
-	return Snapshot{Cards: cards, Counters: s.counters(len(cards))}
+	return Snapshot{Cards: cards, Counters: s.counters(len(cards), running)}
 }
 
 // enrichFromState reads <worktree>/.agent/state.json and folds its header
@@ -261,20 +273,16 @@ func (s *Source) enrichFromState(card *SessionCard) {
 	}
 }
 
-// counters reads the daemon status + stats and folds them into the header.
-// running is the scoped card count (what the grid shows); the daemon's own
-// activeSessions reflects the whole host, which we surface as MaxSessions
-// context. Header fetch errors are non-fatal.
-func (s *Source) counters(running int) Counters {
-	c := Counters{Running: running}
+// counters reads daemon status + stats and records the visible session count.
+// Header fetch errors are non-fatal. The daemon's ActiveSessions counter is
+// intentionally not used here because it counts running sessions only while
+// the grid also includes held sessions.
+func (s *Source) counters(sessions, running int) Counters {
+	c := Counters{Sessions: sessions, Running: running}
 	if st, err := s.daemon.GetStatus(); err == nil && st != nil {
 		c.MaxSessions = st.MaxSessions
 		c.UptimeSeconds = st.UptimeSeconds
 		c.Version = st.Version
-		if s.repoScope == "" {
-			// Unscoped: trust the daemon's own active count.
-			c.Running = st.ActiveSessions
-		}
 	} else if err != nil {
 		c.Err = err
 	}

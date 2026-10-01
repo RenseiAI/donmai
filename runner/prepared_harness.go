@@ -31,6 +31,9 @@ const runtimeMaterializedCredential = "runtime-materialized"
 // today, but keeping the two inputs symmetric costs one line and removes a
 // future divergence.
 func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
+	if isLocalRuntimeTransport(qw.runtimeTransport) {
+		return qw
+	}
 	qw.PlatformURL = "https://runtime.invalid"
 	qw.AuthToken = runtimeMaterializedCredential
 	qw.McpAuthToken = runtimeMaterializedCredential
@@ -51,6 +54,10 @@ func buildPreparedSourceSpec(qw QueuedWork, selection harnessSelection, decorate
 		return agent.Spec{}, nil, errors.New("runner: prepared source requires exact provider")
 	}
 	working := qw
+	working.runtimeTransport = selection.runtimeTransport
+	if isLocalRuntimeTransport(working.runtimeTransport) && (working.AuthToken != "" || working.McpAuthToken != "") {
+		return agent.Spec{}, nil, errors.New("runner: local transport cannot consume controller runtime credentials")
+	}
 	if working.isInterview() {
 		working.SystemPromptOverride = buildInterviewSystemPrompt(working.SystemPromptOverride, interview.InterviewCompleteSentinel)
 	}

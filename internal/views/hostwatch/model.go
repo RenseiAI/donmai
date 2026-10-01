@@ -330,6 +330,10 @@ func (m *Model) applySnapshot(snap Snapshot) {
 			kept[c.SessionID] = c
 		}
 		for i := range snap.Cards {
+			if snap.Cards[i].isHeld() {
+				delete(m.tailers, snap.Cards[i].SessionID)
+				continue // unresolved ownership cannot inherit earlier live observations
+			}
 			if prev, ok := kept[snap.Cards[i].SessionID]; ok {
 				if snap.Cards[i].sameObservedRun(prev) {
 					snap.Cards[i].retainFolded(prev)
@@ -373,8 +377,9 @@ func (m *Model) reconcileTailers() {
 		m.labels[c.SessionID] = label
 
 		evPath := c.EventsPath()
-		if evPath == "" {
-			continue // worktree path unknown — cannot tail (daemon pre-enrichment)
+		if c.isHeld() || evPath == "" {
+			delete(m.tailers, c.SessionID)
+			continue // held or pathless sessions have no session event stream
 		}
 		if _, ok := m.tailers[c.SessionID]; !ok {
 			m.tailers[c.SessionID] = NewTailer(c.SessionID, evPath, !m.opts.Replay, m.now)
@@ -397,6 +402,9 @@ func (m *Model) applyTailBatch(events []TailEvent) {
 	}
 	var lines []string
 	for _, ev := range events {
+		if m.isHeldSession(ev.SessionID) {
+			continue
+		}
 		if ev.source != nil && m.tailers[ev.SessionID] != ev.source {
 			continue // old asynchronous batch from a removed/replaced reader
 		}
@@ -449,6 +457,15 @@ func (c *SessionCard) retainFolded(prev SessionCard) {
 	c.ActualModelVersion = prev.ActualModelVersion
 }
 
+func (m *Model) isHeldSession(sessionID string) bool {
+	for i := range m.cards {
+		if m.cards[i].SessionID == sessionID {
+			return m.cards[i].isHeld()
+		}
+	}
+	return false
+}
+
 // foldMetrics updates the live per-card metrics from one event. Cards are
 // matched by session id; an event for a card not currently in view is
 // ignored (its card will pick up state.json header data on the next index
@@ -469,6 +486,9 @@ func (m *Model) foldMetrics(ev TailEvent) {
 		return
 	}
 	c := &m.cards[idx]
+	if c.isHeld() {
+		return
+	}
 	c.Observed = true
 	live := !ev.Replay
 	switch e := ev.Event.(type) {
@@ -641,6 +661,9 @@ func (m *Model) renderHeader() string {
 // optional details before the running count when the terminal narrows.
 func headerCounterVariants(c Counters) []string {
 	status := fmt.Sprintf("%d running", c.Running)
+	if c.Sessions > c.Running {
+		status = fmt.Sprintf("%d sessions", c.Sessions)
+	}
 	queue := fmt.Sprintf("queue %d", c.QueueDepth)
 	uptime := "uptime " + format.Duration(int(c.UptimeSeconds))
 	full := status + "   " + queue + "   " + uptime

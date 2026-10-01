@@ -32,7 +32,9 @@ func mustStartDaemonWith(t *testing.T, mutate func(*Options)) (*Daemon, *Server,
 	cfg.Machine.ID = "test-machine"
 	cfg.Capacity.MaxConcurrentSessions = 4
 	cfg.Projects = []ProjectConfig{{ID: "demo", Repository: "github.com/foo/bar"}}
-	cfg.Orchestrator.URL = "file:///tmp/queue"
+	// Exercise stub registration without selecting the local file runtime.
+	cfg.Orchestrator.URL = "http://127.0.0.1:1"
+	cfg.Orchestrator.AuthToken = "local-stub-no-token"
 	cfgPath := filepath.Join(tmp, "daemon.yaml")
 	if err := WriteConfig(cfgPath, cfg); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -197,7 +199,9 @@ func TestServer_Status_HostVersionOverride(t *testing.T) {
 	cfg.Machine.ID = "test-machine"
 	cfg.Capacity.MaxConcurrentSessions = 4
 	cfg.Projects = []ProjectConfig{{ID: "demo", Repository: "github.com/foo/bar"}}
-	cfg.Orchestrator.URL = "file:///tmp/queue"
+	// Exercise stub registration without selecting the local file runtime.
+	cfg.Orchestrator.URL = "http://127.0.0.1:1"
+	cfg.Orchestrator.AuthToken = "local-stub-no-token"
 	cfgPath := filepath.Join(tmp, "daemon.yaml")
 	if err := WriteConfig(cfgPath, cfg); err != nil {
 		t.Fatalf("write config: %v", err)
@@ -627,7 +631,9 @@ func TestServer_PoolStats_UsesProvider(t *testing.T) {
 	tmp := t.TempDir()
 	cfg := DefaultConfig()
 	cfg.Machine.ID = "x"
-	cfg.Orchestrator.URL = "file:///tmp/q"
+	// Exercise stub registration without selecting the local file runtime.
+	cfg.Orchestrator.URL = "http://127.0.0.1:1"
+	cfg.Orchestrator.AuthToken = "local-stub-no-token"
 	cfgPath := filepath.Join(tmp, "daemon.yaml")
 	if err := WriteConfig(cfgPath, cfg); err != nil {
 		t.Fatal(err)

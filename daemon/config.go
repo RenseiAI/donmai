@@ -2,6 +2,7 @@ package daemon
 
 import (
 	"crypto/sha256"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -12,6 +13,8 @@ import (
 	"sort"
 	"strings"
 
+	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/statepath"
 	"github.com/RenseiAI/donmai/runner/access"
 
@@ -22,11 +25,13 @@ import (
 // schema mirrors the TS DaemonConfig (donmai-architecture/004 §Configuration
 // shape).
 type Config struct {
-	APIVersion              string         `yaml:"apiVersion"                       json:"apiVersion"`
-	Kind                    string         `yaml:"kind"                             json:"kind"`
-	ProjectAdmissionVersion int            `yaml:"projectAdmissionVersion,omitempty" json:"projectAdmissionVersion,omitempty"`
-	Machine                 MachineConfig  `yaml:"machine"                  json:"machine"`
-	Capacity                CapacityConfig `yaml:"capacity"                 json:"capacity"`
+	// LocalRuntime selects a GitHub-only, exact-host file queue profile.
+	LocalRuntime            *LocalRuntimeConfig `yaml:"localRuntime,omitempty" json:"localRuntime,omitempty"`
+	APIVersion              string              `yaml:"apiVersion"                       json:"apiVersion"`
+	Kind                    string              `yaml:"kind"                             json:"kind"`
+	ProjectAdmissionVersion int                 `yaml:"projectAdmissionVersion,omitempty" json:"projectAdmissionVersion,omitempty"`
+	Machine                 MachineConfig       `yaml:"machine"                  json:"machine"`
+	Capacity                CapacityConfig      `yaml:"capacity"                 json:"capacity"`
 	// EnabledProjectIDs is the authoritative project-admission set. A
 	// project may be admitted before it has any repository resources.
 	// Legacy projects[] entries are projected only when
@@ -91,6 +96,112 @@ type Config struct {
 	Trust TrustConfig `yaml:"trust,omitempty"        json:"trust,omitempty"`
 }
 
+// LocalRuntimeConfig is non-secret operator policy. Credentials remain in
+// standalone credential sources and protected local files, never this block.
+type LocalRuntimeConfig struct {
+	ExecutionSecurity    *LocalExecutionSecurity `yaml:"executionSecurity" json:"executionSecurity"`
+	Harness              string                  `yaml:"harness" json:"harness"`
+	Model                string                  `yaml:"model" json:"model"`
+	ModelAuthor          string                  `yaml:"modelAuthor" json:"modelAuthor"`
+	ModelCatalogRevision string                  `yaml:"modelCatalogRevision,omitempty" json:"modelCatalogRevision,omitempty"`
+	Repositories         []LocalGitHubRepository `yaml:"repositories" json:"repositories"`
+}
+
+// LocalRuntimeConfigAPIVersion identifies an own-policy local file controller.
+// Its security policy is required; absence is never a compatibility default.
+const LocalRuntimeConfigAPIVersion = "donmai.dev/v2"
+
+// LocalExecutionSecurity is the explicit outermost local policy. The schema
+// version is Config.APIVersion; this object contains only six authored levels.
+type LocalExecutionSecurity struct {
+	ToolApproval agent.ExecutionSecurityLevel `yaml:"toolApproval" json:"toolApproval"`
+	FileRead     agent.ExecutionSecurityLevel `yaml:"fileRead" json:"fileRead"`
+	FileWrite    agent.ExecutionSecurityLevel `yaml:"fileWrite" json:"fileWrite"`
+	Network      agent.ExecutionSecurityLevel `yaml:"network" json:"network"`
+	Credentials  agent.ExecutionSecurityLevel `yaml:"credentials" json:"credentials"`
+	Isolation    agent.ExecutionSecurityLevel `yaml:"isolation" json:"isolation"`
+}
+
+// InitialLocalExecutionSecurity is the visible first-install/known-version
+// upgrade seed prescribed by the execution-security contract. Only installers
+// and the explicit startup migration may persist it. Readers/issuers must NOT
+// call it to fill a missing policy or dimension.
+func InitialLocalExecutionSecurity() *LocalExecutionSecurity {
+	return &LocalExecutionSecurity{ToolApproval: agent.ToolApprovalBypass, FileRead: agent.FileReadHost, FileWrite: agent.FileWriteHost, Network: agent.NetworkOpen, Credentials: agent.CredentialsAmbientHostLogin, Isolation: agent.IsolationHostUser}
+}
+
+// Levels returns the authored values without filling any missing dimension.
+func (s LocalExecutionSecurity) Levels() agent.ExecutionSecurityLevels {
+	return agent.ExecutionSecurityLevels{ToolApproval: s.ToolApproval, FileRead: s.FileRead, FileWrite: s.FileWrite, Network: s.Network, Credentials: s.Credentials, Isolation: s.Isolation}
+}
+
+// Validate refuses an absent own value before checking the closed vocabulary.
+func (s *LocalExecutionSecurity) Validate() error {
+	if s == nil {
+		return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnconfigured, Detail: "local outermost executionSecurity is required"}
+	}
+	levels := s.Levels()
+	for _, dimension := range agent.ExecutionSecurityDimensions() {
+		if levels.Level(dimension) == "" {
+			return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnconfigured, Dimension: dimension, Detail: "local outermost dimension is missing"}
+		}
+	}
+	return levels.Validate()
+}
+
+// UnmarshalJSON is closed: own configuration does not ignore unknown levels,
+// unknown dimensions or duplicates, and never obtains values by omission.
+func (s *LocalExecutionSecurity) UnmarshalJSON(raw []byte) error {
+	if _, err := executioncell.NormalizeOperationalPayload(raw); err != nil {
+		return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnresolvable, Detail: "local executionSecurity must be a unique-key object"}
+	}
+	var fields map[string]json.RawMessage
+	if err := json.Unmarshal(raw, &fields); err != nil {
+		return err
+	}
+	for _, dimension := range agent.ExecutionSecurityDimensions() {
+		value, exists := fields[string(dimension)]
+		if !exists || string(value) == "null" {
+			return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnconfigured, Dimension: dimension, Detail: "local outermost dimension is missing"}
+		}
+	}
+	wrapper := append([]byte(`{"version":1,"levels":`), raw...)
+	wrapper = append(wrapper, '}')
+	parsed, err := agent.ParseExecutionSecurity(wrapper)
+	if err != nil {
+		return err
+	}
+	value := parsed.Levels
+	*s = LocalExecutionSecurity{ToolApproval: value.ToolApproval, FileRead: value.FileRead, FileWrite: value.FileWrite, Network: value.Network, Credentials: value.Credentials, Isolation: value.Isolation}
+	return s.Validate()
+}
+
+// UnmarshalYAML shares the closed JSON vocabulary rather than YAML's default
+// unknown-field dropping behavior.
+func (s *LocalExecutionSecurity) UnmarshalYAML(node *yaml.Node) error {
+	var fields map[string]any
+	if err := node.Decode(&fields); err != nil {
+		return err
+	}
+	raw, err := json.Marshal(fields)
+	if err != nil {
+		return err
+	}
+	return s.UnmarshalJSON(raw)
+}
+
+// ValidateLocalExecutionSecurity reads the local controller's own scope. The
+// legacy version is handled only by the explicit startup migration, not here.
+func ValidateLocalExecutionSecurity(c *Config) error {
+	if c == nil || c.APIVersion != LocalRuntimeConfigAPIVersion {
+		return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnconfigured, Detail: "local file controller requires explicit donmai.dev/v2 policy"}
+	}
+	if c.LocalRuntime == nil {
+		return &agent.ExecutionSecurityError{Code: agent.ExecutionSecurityUnconfigured, Detail: "local runtime and its outermost policy are required"}
+	}
+	return c.LocalRuntime.ExecutionSecurity.Validate()
+}
+
 // ProjectAdmissionVersionV2 marks enabledProjectIds as the sole project
 // admission authority. Zero is the legacy repository-derived contract.
 const ProjectAdmissionVersionV2 = 2
@@ -110,6 +221,9 @@ const (
 // absent, blank, or unrecognized value reads as "enumerated" — admission never
 // widens by accident, only by an explicit, spelled-out opt-in.
 func (c *Config) EffectiveProjectAdmissionMode() string {
+	if localRuntimeRequested(c) && c.LocalRuntime != nil {
+		return ProjectAdmissionModeEnumerated
+	}
 	if c == nil {
 		return ProjectAdmissionModeEnumerated
 	}
@@ -379,7 +493,7 @@ func WriteConfig(path string, cfg *Config) error {
 	return nil
 }
 
-// applyDefaults fills in zero-valued fields with their schema defaults.
+// applyDefaults fills in omitted and zero-valued fields with their schema defaults.
 func applyDefaults(c *Config) {
 	applyDefaultsWithCapacityPresence(c, false)
 }
@@ -449,6 +563,13 @@ func applyDefaultsWithCapacityPresence(c *Config, sessionLimitAuthored bool) {
 // repository-bearing projects[] entries are projected so old configurations
 // retain their complete working behavior.
 func (c *Config) EffectiveEnabledProjectIDs() []string {
+	if localRuntimeRequested(c) && c.LocalRuntime != nil {
+		ids := make([]string, 0, len(c.LocalRuntime.Repositories))
+		for _, repository := range c.LocalRuntime.Repositories {
+			ids = append(ids, repository.OwnerRepo)
+		}
+		return normalizeProjectIDs(ids)
+	}
 	if c == nil {
 		return nil
 	}
@@ -519,6 +640,14 @@ func projectIDsFromRepositories(projects []ProjectConfig) []string {
 // EffectiveProjectConfigs projects normalized repository resources into the
 // legacy runtime shape consumed by the existing spawner and poll resolver.
 func (c *Config) EffectiveProjectConfigs() []ProjectConfig {
+	if localRuntimeRequested(c) && c.LocalRuntime != nil {
+		projects := make([]ProjectConfig, 0, len(c.LocalRuntime.Repositories))
+		for _, repository := range c.LocalRuntime.Repositories {
+			projects = append(projects, ProjectConfig{ID: repository.OwnerRepo, RepositoryID: fmt.Sprintf("github:%d", repository.RepositoryID), Repository: "https://github.com/" + repository.OwnerRepo + ".git", Primary: true, CloneStrategy: CloneFull})
+		}
+		return projects
+	}
+
 	if c == nil {
 		return nil
 	}
@@ -615,6 +744,22 @@ func syncLegacyProjectProjection(c *Config) {
 
 // validateConfig enforces required fields and value ranges.
 func validateConfig(c *Config) error {
+	if localRuntimeRequested(c) && c.APIVersion == LocalRuntimeConfigAPIVersion {
+		if err := ValidateLocalExecutionSecurity(c); err != nil {
+			return err
+		}
+	}
+	if c.LocalRuntime != nil {
+		if c.LocalRuntime.Harness != "" && c.LocalRuntime.Harness != "codex" && c.LocalRuntime.Harness != "claude-code" {
+			return errors.New("localRuntime.harness must be codex or claude-code")
+		}
+		if (strings.TrimSpace(c.LocalRuntime.Model) == "") != (strings.TrimSpace(c.LocalRuntime.ModelAuthor) == "") {
+			return errors.New("localRuntime.model and modelAuthor are required")
+		}
+		if err := validateLocalRepositories(c.LocalRuntime.Repositories); err != nil {
+			return err
+		}
+	}
 	if c.Machine.ID == "" {
 		return errors.New("machine.id is required")
 	}

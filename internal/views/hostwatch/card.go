@@ -28,6 +28,8 @@ var animFrames = []string{"●", "◉", "○", "◉"} // ● ◉ ○ ◉
 // colored left border bar. Colors are read from the theme exclusively.
 func statusColor(t theme.Theme, card SessionCard) color.Color {
 	switch {
+	case card.isHeld():
+		return t.TextTertiary
 	case card.Errored:
 		return t.StatusError
 	case strings.EqualFold(card.DaemonState, "completed"):
@@ -54,6 +56,9 @@ func statusColor(t theme.Theme, card SessionCard) color.Color {
 // parallel layout work owns the grid/split geometry.
 func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool, now time.Time) string {
 	dot := animFrames[0]
+	if card.isHeld() {
+		dot = "○"
+	}
 	if isLiveState(card.DaemonState) {
 		dot = animFrames[frame%len(animFrames)]
 	}
@@ -85,7 +90,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		unknownIfEmpty(card.Model))
 	state := fmt.Sprintf("provider %s · state %s",
 		unknownIfEmpty(card.modelProvider()),
-		unknownIfEmpty(card.DaemonState))
+		card.displayState())
 	// Scope stays visible inside the card. Appending it after the identity
 	// fields would truncate it at ordinary card widths.
 	scope := ""
@@ -115,7 +120,9 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	if ticker == "" {
 		ticker = card.LastTool
 	}
-	if ticker == "" {
+	if card.isHeld() {
+		ticker = ""
+	} else if ticker == "" {
 		ticker = card.CurrentStep
 	}
 	ticker = truncateRunes(ticker, cardWidth-2)
@@ -131,10 +138,16 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		}
 		fmt.Fprintf(&b, "  %s\n", identity)
 		fmt.Fprintf(&b, "  %s\n", state)
-		fmt.Fprintf(&b, "  %s\n", metrics)
-		fmt.Fprintf(&b, "  %s\n", cost)
-		fmt.Fprintf(&b, "  %s\n", fresh)
-		fmt.Fprintf(&b, "  %s\n", workFresh)
+		if card.isHeld() {
+			for _, detail := range strings.Split(heldDetails(card), "\n") {
+				fmt.Fprintf(&b, "  %s\n", detail)
+			}
+		} else {
+			fmt.Fprintf(&b, "  %s\n", metrics)
+			fmt.Fprintf(&b, "  %s\n", cost)
+			fmt.Fprintf(&b, "  %s\n", fresh)
+			fmt.Fprintf(&b, "  %s\n", workFresh)
+		}
 		if ticker != "" {
 			fmt.Fprintf(&b, "  %s\n", ticker)
 		}
@@ -183,9 +196,15 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	lines = append(lines,
 		chipStyle.Render(agentCard), chipStyle.Render(cardID),
 		chipStyle.Render(modelIdentity), chipStyle.Render(actualProvider), chipStyle.Render(modelVersion),
-		chipStyle.Render(identity), chipStyle.Render(state),
-		metricStyle.Render(metrics), metricStyle.Render(cost),
-		chipStyle.Render(fresh), chipStyle.Render(workFresh))
+		chipStyle.Render(identity), chipStyle.Render(state))
+	if card.isHeld() {
+		for _, detail := range strings.Split(heldDetails(card), "\n") {
+			lines = append(lines, chipStyle.Render(truncateWidth(detail, inner)))
+		}
+	} else {
+		lines = append(lines, metricStyle.Render(metrics), metricStyle.Render(cost),
+			chipStyle.Render(fresh), chipStyle.Render(workFresh))
+	}
 	if ticker != "" {
 		lines = append(lines, tickStyle.Render(ticker))
 	}
@@ -209,6 +228,37 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 			Width(cardWidth)
 	}
 	return box.Render(body)
+}
+
+func heldDetails(card SessionCard) string {
+	var parts []string
+	if card.ProjectName != "" {
+		parts = append(parts, "project "+safeIdentityText(card.ProjectName))
+	}
+	if card.Repository != "" {
+		parts = append(parts, "repo "+safeIdentityText(card.Repository))
+	}
+	if card.AcceptedAt != "" {
+		parts = append(parts, "accepted "+safeIdentityText(card.AcceptedAt))
+	}
+	if len(parts) == 0 {
+		return "awaiting local execution"
+	}
+	return strings.Join(parts, "\n")
+}
+
+func (c SessionCard) isHeld() bool {
+	return strings.EqualFold(c.DaemonState, "unknown")
+}
+
+func (c SessionCard) displayState() string {
+	if c.isHeld() {
+		return "held"
+	}
+	if c.DaemonState == "" {
+		return "unknown"
+	}
+	return c.DaemonState
 }
 
 // roleBadge derives a short role label from the work type, falling back to

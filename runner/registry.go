@@ -10,6 +10,24 @@ import (
 	"github.com/RenseiAI/donmai/agent"
 )
 
+// RuntimeTransportMode selects trusted process transport policy. It is not a
+// session payload field and never changes admission or capability authority.
+type RuntimeTransportMode string
+
+const (
+	// RuntimeTransportController preserves controller-managed runtime MCP delivery.
+	RuntimeTransportController RuntimeTransportMode = "controller"
+	// RuntimeTransportLocal uses local result transport without an implicit MCP gateway.
+	RuntimeTransportLocal RuntimeTransportMode = "local"
+	// RuntimeTransportLocalV2 negotiates explicit new-branch base selection.
+	RuntimeTransportLocalV2 RuntimeTransportMode = "local/v2"
+)
+
+// RegistryOptions are trusted host configuration, never decoded from queued work.
+type RegistryOptions struct {
+	RuntimeTransportMode RuntimeTransportMode
+}
+
 // Registry resolves [agent.ProviderName] values to their corresponding
 // [agent.Provider] instances. The runner builds one [Registry] at
 // daemon startup (per F.2.8 wire-up) and consults it on every Run.
@@ -21,14 +39,40 @@ import (
 // only safe before the runner starts dispatching Runs; treat it as
 // build-once, read-many.
 type Registry struct {
-	mu        sync.RWMutex
-	providers map[agent.ProviderName]agent.Provider
+	mu               sync.RWMutex
+	providers        map[agent.ProviderName]agent.Provider
+	runtimeTransport RuntimeTransportMode
 }
 
 // NewRegistry constructs an empty Registry. Use [Registry.Register]
 // to add providers.
 func NewRegistry() *Registry {
-	return &Registry{providers: make(map[agent.ProviderName]agent.Provider)}
+	return &Registry{providers: make(map[agent.ProviderName]agent.Provider), runtimeTransport: RuntimeTransportController}
+}
+
+// NewRegistryWithOptions constructs a registry with explicit trusted transport
+// policy. An omitted mode retains NewRegistry behavior; unknown modes refuse.
+func NewRegistryWithOptions(options RegistryOptions) (*Registry, error) {
+	mode := options.RuntimeTransportMode
+	if mode == "" {
+		mode = RuntimeTransportController
+	}
+	if mode != RuntimeTransportController && !isLocalRuntimeTransport(mode) {
+		return nil, errors.New("runner: unsupported runtime transport mode")
+	}
+	r := NewRegistry()
+	r.runtimeTransport = mode
+	return r, nil
+}
+
+func (r *Registry) validateRuntimeTransport(qw QueuedWork) error {
+	if err := validateBaseRefTransport(qw, r.runtimeTransport); err != nil {
+		return err
+	}
+	if isLocalRuntimeTransport(r.runtimeTransport) && (qw.AuthToken != "" || qw.McpAuthToken != "") {
+		return errors.New("runner: local transport cannot consume controller runtime credentials")
+	}
+	return nil
 }
 
 // Register adds p under its declared Name. Calling Register with a
@@ -100,4 +144,8 @@ func (r *Registry) Shutdown(ctx context.Context) error {
 		return nil
 	}
 	return errors.Join(errs...)
+}
+
+func isLocalRuntimeTransport(mode RuntimeTransportMode) bool {
+	return mode == RuntimeTransportLocal || mode == RuntimeTransportLocalV2
 }
