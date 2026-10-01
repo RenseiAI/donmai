@@ -1170,7 +1170,13 @@ func (d *Daemon) Start(ctx context.Context) error {
 	if spawnerOpts.ExternalOccupancy == nil {
 		spawnerOpts.ExternalOccupancy = d.SessionShimOccupancy
 	}
-	d.spawner = NewWorkerSpawner(spawnerOpts)
+	spawner := NewWorkerSpawner(spawnerOpts)
+	// Constructor zero retains its default semantics; loaded zero is an exact
+	// admission limit and must take effect before the spawner is published.
+	if err := spawner.SetMaxConcurrentSessions(d.config.Capacity.MaxConcurrentSessions); err != nil {
+		return fmt.Errorf("set configured session limit: %w", err)
+	}
+	d.spawner = spawner
 	if d.sessionShimEnabled() {
 		// D12: construction is not admission. Keep the spawner closed until the
 		// first exact heartbeat response accepts the published recovery state.
@@ -1520,9 +1526,8 @@ func (d *Daemon) GatewayStatus() gateway.Status {
 // a subsequent full registration also presents the same current declaration.
 //
 // Defensive: only mutates state when project entries, IDs, or admission mode
-// differ from the in-memory copy. Other fields (capacity, orchestrator URL) are NOT
-// hot-reloaded — those touch listeners we don't currently support
-// re-binding live.
+// or the session ceiling differ from the in-memory copy. Other capacity fields
+// and the orchestrator URL remain restart-bound.
 func (d *Daemon) onYamlChanged(cfg *Config) {
 	d.mu.Lock()
 	if d.config == nil {
@@ -1538,24 +1543,44 @@ func (d *Daemon) onYamlChanged(cfg *Config) {
 	afterIDs := strings.Join(cfg.EffectiveEnabledProjectIDs(), "\x00")
 	beforeMode := d.config.EffectiveProjectAdmissionMode()
 	afterMode := cfg.EffectiveProjectAdmissionMode()
-	if allowlistHash(before) == allowlistHash(after) && beforeIDs == afterIDs && beforeMode == afterMode {
+	projectsChanged := allowlistHash(before) != allowlistHash(after) || beforeIDs != afterIDs || beforeMode != afterMode
+	capacityChanged := d.config.Capacity.MaxConcurrentSessions != cfg.Capacity.MaxConcurrentSessions
+	if !projectsChanged && !capacityChanged {
 		d.mu.Unlock()
 		return
 	}
-	d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
-	d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
-	d.config.ProjectAdmissionMode = cfg.ProjectAdmissionMode
-	d.config.Repositories = cfg.Repositories
-	d.config.Projects = cfg.Projects
-	if d.spawner != nil {
-		d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
-		d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
+	if cfg.Capacity.MaxConcurrentSessions < 0 {
+		d.mu.Unlock()
+		slog.Warn("[yaml-watcher] rejected negative session limit")
+		return
 	}
-	d.refreshRegistrationProjectsLocked()
+	if capacityChanged {
+		if d.spawner != nil {
+			if err := d.spawner.SetMaxConcurrentSessions(cfg.Capacity.MaxConcurrentSessions); err != nil {
+				d.mu.Unlock()
+				slog.Warn("[yaml-watcher] rejected session limit", "error", err)
+				return
+			}
+		}
+		d.config.Capacity.MaxConcurrentSessions = cfg.Capacity.MaxConcurrentSessions
+	}
+	if projectsChanged {
+		d.config.ProjectAdmissionVersion = cfg.ProjectAdmissionVersion
+		d.config.EnabledProjectIDs = cfg.EffectiveEnabledProjectIDs()
+		d.config.ProjectAdmissionMode = cfg.ProjectAdmissionMode
+		d.config.Repositories = cfg.Repositories
+		d.config.Projects = cfg.Projects
+		if d.spawner != nil {
+			d.spawner.SetProjectConfiguration(cfg.EffectiveProjectConfigs(), cfg.EffectiveEnabledProjectIDs())
+			d.spawner.SetProjectAdmissionMode(cfg.EffectiveProjectAdmissionMode())
+		}
+		d.refreshRegistrationProjectsLocked()
+	}
 	d.mu.Unlock()
 
-	slog.Info("[yaml-watcher] reloaded projects",
-		"beforeCount", len(before), "afterCount", len(after))
+	slog.Info("[yaml-watcher] reloaded configuration",
+		"beforeCount", len(before), "afterCount", len(after),
+		"maxConcurrentSessions", cfg.Capacity.MaxConcurrentSessions)
 }
 
 // refreshRegistrationProjectsLocked follows a committed config/spawner

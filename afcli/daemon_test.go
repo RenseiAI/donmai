@@ -17,7 +17,53 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/afclient"
+	"gopkg.in/yaml.v3"
 )
+
+func TestDaemonSetMaxConcurrentSessionsZeroPersists(t *testing.T) {
+	for _, tc := range []struct{ name, capacity string }{
+		{"prior_positive", "capacity:\n  maxConcurrentSessions: 3\n"},
+		{"omitted", ""},
+		{"null", "capacity:\n  maxConcurrentSessions: null\n"},
+		{"merged", "defaults: &defaults {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\ncapacity:\n  <<: *defaults\n"},
+		{"alias", "defaults: &defaults {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\ncapacity: *defaults\n"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			if err := os.WriteFile(path, []byte("machine: {id: capacity-fixture}\norchestrator: {url: https://example.test}\n"+tc.capacity), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			mock := &mockDaemon{setCapResp: &afclient.SetCapacityResponse{OK: true, Key: "capacity.maxConcurrentSessions", Value: "0"}}
+			if _, err := newTestHostCmd(mock, []string{"set", "capacity.maxConcurrentSessions", "0", "--config", path}); err != nil {
+				t.Fatal(err)
+			}
+			body, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var doc map[string]any
+			if err := yaml.Unmarshal(body, &doc); err != nil {
+				t.Fatal(err)
+			}
+			capacity, ok := doc["capacity"].(map[string]any)
+			if !ok || capacity["maxConcurrentSessions"] != 0 {
+				t.Fatalf("explicit command zero not persisted: %s", body)
+			}
+			if mock.setCapKey != "capacity.maxConcurrentSessions" || mock.setCapValue != "0" {
+				t.Fatalf("runtime notification lost explicit zero: key=%s value=%s", mock.setCapKey, mock.setCapValue)
+			}
+			if tc.name == "merged" || tc.name == "alias" {
+				if capacity["maxVCpuPerSession"] != 6 {
+					t.Fatalf("unmodelled inherited capacity lost: %s", body)
+				}
+				defaults := doc["defaults"].(map[string]any)
+				if defaults["maxConcurrentSessions"] != 3 {
+					t.Fatalf("shared anchor mutated: %s", body)
+				}
+			}
+		})
+	}
+}
 
 // ── mock daemon ───────────────────────────────────────────────────────────────
 
