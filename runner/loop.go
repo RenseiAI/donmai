@@ -692,11 +692,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		// provider owns native delivery; dispatchInteractive must never replay
 		// these bytes after spawn.
 		userPrompt = qw.InitialPrompt
-		if promptBytes := len(userPrompt); promptBytes > maxInitialPromptBytes {
+		if limit := interactiveInitialPromptLimitForProvider(provider); len(userPrompt) > limit {
 			err = fmt.Errorf(
 				"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
-				promptBytes,
-				maxInitialPromptBytes,
+				len(userPrompt),
+				limit,
 			)
 			res.Status = "failed"
 			res.FailureMode = FailureInteractiveInput
@@ -1188,7 +1188,8 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// harness DECLARED before it writes anything: a PTY write is the correct
 	// primitive only where no agent sits behind the terminal.
 	if qw.isInteractive() {
-		return r.dispatchInteractive(ctx, handle, runnerStatePath, qw, res, sink, pulser, injectCh, noticeDelivery)
+		return r.dispatchInteractive(ctx, handle, runnerStatePath, qw, res, sink, pulser, injectCh, noticeDelivery,
+			interactiveInitialPromptLimitForProvider(provider))
 	}
 
 	// 10. Stream events; wait for terminal.

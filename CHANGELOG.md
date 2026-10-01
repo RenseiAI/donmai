@@ -8,7 +8,12 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Interactive initial prompts up to 32 KiB now spawn on harnesses that
+  carry the seed as a spawned argument instead of failing before start;
+  harnesses that type the seed into the live terminal keep the 1,023-byte
+  canonical-mode bound.
 
 ## v0.72.58 — 2026-10-01
 

@@ -44,12 +44,55 @@ const (
 	// maxInitialPromptBytes leaves one byte for the appended newline so the
 	// complete first PTY input stays within the conservative 1,024-byte
 	// canonical-mode boundary shared by the supported host environments.
+	// It applies ONLY to harnesses that type the seed into the live PTY
+	// after spawn (see interactiveInitialPromptLimit): argv-carried seeds
+	// never cross the line discipline and use maxArgvSeedPromptBytes.
 	maxInitialPromptBytes = 1023
+
+	// maxArgvSeedPromptBytes bounds an interactive initial prompt carried
+	// as a spawned argv element (the positional prompt argument) rather
+	// than typed into the live PTY. No kernel line discipline applies to
+	// argv, so the ceiling only needs to stop an unbounded caller payload
+	// from becoming an unbounded spawn argument — 32 KiB holds real
+	// coordinator briefs (~3 KiB observed) with wide headroom.
+	maxArgvSeedPromptBytes = 32 << 10
 
 	// maxAttachTokenFileBytes is deliberately generous for a compact host JWT
 	// while bounding a provisioner-controlled file read to a small allocation.
 	maxAttachTokenFileBytes = 16 << 10
 )
+
+// interactiveInitialPromptLimitForProvider selects the pre-spawn byte
+// ceiling for an interactive initial prompt from the resolved harness's
+// own live manifest (see interactiveInitialPromptLimit). A provider that
+// declares no manifest keeps the conservative PTY bound.
+func interactiveInitialPromptLimitForProvider(provider agent.Provider) int {
+	if hp, ok := provider.(agent.HarnessProvider); ok {
+		return interactiveInitialPromptLimit(hp.Manifest())
+	}
+	return maxInitialPromptBytes
+}
+
+func interactiveInitialPromptLimit(manifest agent.HarnessManifest) int {
+	// The ceiling follows the harness's own declared human-controlled user
+	// delivery — never inferred from the harness's name. Only deliveries
+	// PROVEN to ride a spawned argv element (the positional prompt argument
+	// each harness's interactive argv builder appends last) take the wider
+	// ceiling: argv never crosses the kernel line discipline. Everything
+	// else — the shell/stub seeds typed into the live PTY after spawn, an
+	// unsupported or empty delivery, and any future kind this selector does
+	// not recognise — keeps the conservative PTY bound, because a seed
+	// larger than MAX_CANON typed into a canonical-mode terminal arrives
+	// truncated.
+	if profile, ok := manifest.PromptProfile(agent.PromptModeHumanControlled); ok {
+		switch profile.UserDelivery {
+		case agent.PromptDeliveryClaudePTYSeed, agent.PromptDeliveryCodexPTYSeed,
+			agent.PromptDeliveryPiPTYSeed:
+			return maxArgvSeedPromptBytes
+		}
+	}
+	return maxInitialPromptBytes
+}
 
 var (
 	errAttachTokenFileOversized = errors.New("attach token file exceeds the JWT size limit")
@@ -177,6 +220,12 @@ func (r *Runner) dispatchInteractive(
 	pulser interactivePulser,
 	injectCh <-chan heartbeat.InjectPayload,
 	noticeDelivery agent.NoticeDelivery,
+	// initialPromptLimit overrides the conservative PTY-seed ceiling for
+	// harnesses whose seed rides a spawned argv element. runLoop passes the
+	// resolved harness's own manifest-derived ceiling
+	// (interactiveInitialPromptLimitForProvider); direct callers that pass
+	// nothing keep the conservative bound.
+	initialPromptLimit ...int,
 ) (*Result, error) {
 	if sink == nil {
 		sink = noopSink{}
@@ -206,11 +255,15 @@ func (r *Runner) dispatchInteractive(
 		}()
 	}
 
-	if promptBytes := len(qw.InitialPrompt); qw.isInteractive() && promptBytes > maxInitialPromptBytes {
+	limit := maxInitialPromptBytes
+	if len(initialPromptLimit) > 0 && initialPromptLimit[0] > 0 {
+		limit = initialPromptLimit[0]
+	}
+	if promptBytes := len(qw.InitialPrompt); qw.isInteractive() && promptBytes > limit {
 		err := fmt.Errorf(
 			"interactive initial prompt is %d UTF-8 bytes; limit is %d bytes",
 			promptBytes,
-			maxInitialPromptBytes,
+			limit,
 		)
 		res.Status = "failed"
 		res.FailureMode = FailureInteractiveInput
