@@ -536,6 +536,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// undeliverable one must deny loudly. Dedup is by server name with the
 	// default winning on collision.
 	mcpDefaults := defaultMCPServersForHarness(qw, wpath, provider, sessionPromptMode(qw, selection.effectiveCell), codeIntelDelivery.Route)
+	// Surface a degraded mint: a platform-connected session with no
+	// session-scoped bearer omits the gateway below, so name that omission
+	// here or it reads as an ordinary standalone session. Strictly a signal —
+	// the spawn proceeds with whatever defaults were emitted, and the worker
+	// bearer is never substituted for the missing session bearer.
+	logMCPGatewayDegradedMint(r.logger, qw)
+	res.PostSessionWarnings = appendDegradedMintWarning(res.PostSessionWarnings, qw)
 	// Advisory only — see logMCPGatewayBearerExpiry. The bearer below is
 	// written into a config file nothing rewrites, so this line is the only
 	// warning an operator gets that the session's tools have a horizon.
@@ -2757,12 +2764,15 @@ func platformMCPServerName() string { return statehome.Brand() + "-platform" }
 
 // mcpGatewayBearer returns the bearer for the platform per-session MCP gateway.
 //
-// Prefers the session-scoped, session-lifetime token the platform stamps on the
-// work item; falls back to the worker bearer for platforms that do not mint one
-// (self-hosted / older) — that fallback is the standalone contract, not a shim,
-// and must never be removed.
+// Only the session-scoped token the platform stamps on the work item is ever
+// returned. When the platform mints no session bearer (a degraded mint) there
+// is no usable gateway bearer: the worker runtime bearer (qw.AuthToken) is
+// worker/host authority for heartbeat, result-post, activity-post and session
+// preflight, and must never authenticate MCP calls as the host identity.
+// Callers omit the gateway when this returns empty and surface the degraded
+// mint instead of substituting the host bearer.
 //
-// Why the preference matters: the header this bearer lands in is written ONCE
+// Why session-scoped matters: the header this bearer lands in is written ONCE
 // into an MCP config file at spawn, and nothing — not the daemon's runtime-
 // credential refresh, not the harness — ever rewrites it. So the gateway keeps
 // presenting whichever bearer was chosen here for the session's whole life, and
@@ -2772,10 +2782,43 @@ func platformMCPServerName() string { return statehome.Brand() + "-platform" }
 //
 // The value is opaque to this repo: never parsed, validated, or logged.
 func mcpGatewayBearer(qw QueuedWork) string {
-	if t := strings.TrimSpace(qw.McpAuthToken); t != "" {
-		return t
+	return strings.TrimSpace(qw.McpAuthToken)
+}
+
+// isMCPGatewayDegradedMint reports whether a platform-connected session that
+// would otherwise mount the per-session MCP gateway has no session-scoped
+// bearer to mount it with. The gateway is then omitted (see
+// defaultMCPServersForHarness) and the run loop surfaces this condition
+// instead of authenticating MCP calls with the worker bearer.
+//
+// Pure — no I/O, no logging — so tests pin the condition without a harness.
+// Local-transport sessions never mount the gateway by policy, so they are
+// never degraded: standalone operation without a platform bearer is the
+// normal path there, not a degraded mint.
+func isMCPGatewayDegradedMint(qw QueuedWork) bool {
+	if isLocalRuntimeTransport(qw.runtimeTransport) {
+		return false
 	}
-	return strings.TrimSpace(qw.AuthToken)
+	if strings.TrimSpace(qw.PlatformURL) == "" || strings.TrimSpace(qw.SessionID) == "" {
+		return false
+	}
+	return strings.TrimSpace(qw.McpAuthToken) == ""
+}
+
+// logMCPGatewayDegradedMint emits one WARN line when a platform-connected
+// session omits the MCP gateway because no session-scoped bearer was minted.
+// This is the degraded-mint receipt: without it the missing gateway looks
+// exactly like a standalone session that never had a platform. Strictly a
+// signal — the caller never branches on it. Logs the session and worker
+// identifiers, never bearer bytes.
+func logMCPGatewayDegradedMint(logger *slog.Logger, qw QueuedWork) {
+	if logger == nil || !isMCPGatewayDegradedMint(qw) {
+		return
+	}
+	logger.Warn("[runner] platform MCP gateway omitted: no session bearer was minted",
+		"sessionId", qw.SessionID,
+		"workerId", qw.WorkerID,
+	)
 }
 
 // protectedRuntimeMCPServer derives the exact session-scoped HTTP server used
@@ -2841,11 +2884,12 @@ func logMCPGatewayBearerExpiry(logger *slog.Logger, qw QueuedWork, servers []age
 // defense-in-depth allow-list check at tool-call time — see the A2A ADR
 // at runs/2026-05-20-adr-a2a-per-session-mcp.md.
 //
-// When PlatformURL or a usable bearer is missing (standalone-mode sessions
-// without a platform), the gate entry is omitted: the agent runs without any
-// platform MCP gate, which matches the legacy back-compat path. "Usable
-// bearer" is mcpGatewayBearer's answer, not qw.AuthToken specifically — a
-// platform that stamps only the session-scoped token must still get a gate.
+// When PlatformURL or a session-scoped bearer is missing (standalone-mode
+// sessions without a platform, or a degraded mint with no session bearer), the
+// gate entry is omitted: the agent runs without any platform MCP gate. An
+// absent session bearer on a platform-connected session is a degraded mint —
+// the worker bearer is never substituted (see mcpGatewayBearer) — and the run
+// loop surfaces that condition via logMCPGatewayDegradedMint.
 //
 // The gate is ALSO omitted when the selected harness declares no MCP delivery
 // for this mode (harnessDeliversMCP). This entry is the runner's own implicit
@@ -2887,6 +2931,17 @@ func defaultMCPServersForHarness(qw QueuedWork, wpath string, provider agent.Pro
 	}
 
 	return servers
+}
+
+// appendDegradedMintWarning records the degraded-mint condition on the Result
+// envelope so it is visible wherever PostSessionWarnings surface (dashboards,
+// result payloads), not only in the runner log. Returns the warnings slice
+// unchanged when the session is not degraded. Pure — no I/O.
+func appendDegradedMintWarning(warnings []string, qw QueuedWork) []string {
+	if !isMCPGatewayDegradedMint(qw) {
+		return warnings
+	}
+	return append(warnings, "platform MCP gateway omitted: no session bearer was minted for session "+qw.SessionID)
 }
 
 // foldInlineSkills appends the agent card's INLINE skill bodies (WS5) to an

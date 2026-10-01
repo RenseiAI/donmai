@@ -471,6 +471,7 @@ func TestRunAdmittedReconcilesAutonomousRepositoryAuthorityBeforeEarlyApply(t *t
 			}
 
 			qw := h.queuedWork("AUTONOMOUS-REPOSITORY-AUTHORITY")
+			qw.McpAuthToken = "sess_test"
 			qw.ResolvedProfile = exactReceiptQueuedWork(qw.SessionID).ResolvedProfile
 			qw.PermissionProfile = PermissionProfileAutonomous
 			if test.declared {

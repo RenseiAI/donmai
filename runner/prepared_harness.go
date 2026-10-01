@@ -24,18 +24,17 @@ const runtimeMaterializedCredential = "runtime-materialized"
 // credentials, so the prepared-source lane derives the same implicit MCP server
 // set the spawn lane will.
 //
-// BOTH bearers are materialized. The gateway's bearer is mcpGatewayBearer(qw),
-// which prefers the session-scoped token, so materializing only the worker one
-// would let the two lanes disagree the moment the platform starts stamping a
-// session-scoped bearer. Only the server NAMES are carried out of this lane
-// today, but keeping the two inputs symmetric costs one line and removes a
-// future divergence.
+// Only the session-scoped bearer is materialized: it is the sole gateway
+// bearer (see mcpGatewayBearer), so the prepared lane must model exactly what
+// the spawn lane will emit. The worker bearer is not an MCP credential and
+// materializing it would let the prepared lane imagine a gateway the spawn
+// lane will omit on a degraded mint. Only the server NAMES are carried out of
+// this lane today, but keeping the bearer input exact removes a divergence.
 func materializeRuntimeAuthority(qw QueuedWork) QueuedWork {
 	if isLocalRuntimeTransport(qw.runtimeTransport) {
 		return qw
 	}
 	qw.PlatformURL = "https://runtime.invalid"
-	qw.AuthToken = runtimeMaterializedCredential
 	qw.McpAuthToken = runtimeMaterializedCredential
 	return qw
 }

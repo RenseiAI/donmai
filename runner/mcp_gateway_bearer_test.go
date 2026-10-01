@@ -5,7 +5,6 @@ import (
 	"encoding/json"
 	"log/slog"
 	"reflect"
-	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -37,9 +36,10 @@ func capturedRecords(t *testing.T, buf *bytes.Buffer) []map[string]any {
 }
 
 // platformGatewayWork builds the minimum QueuedWork that makes the platform
-// per-session MCP gateway emittable, carrying only the worker bearer.
+// per-session MCP gateway emittable, carrying the session-scoped bearer.
+// The worker bearer is set alongside so tests prove it is never used for MCP.
 func platformGatewayWork(sessionID string) QueuedWork {
-	qw := QueuedWork{AuthToken: workerRuntimeBearerFixture}
+	qw := QueuedWork{AuthToken: workerRuntimeBearerFixture, McpAuthToken: sessionScopedBearerFixture}
 	qw.SessionID = sessionID
 	qw.PlatformURL = "https://platform.example.com"
 	return qw
@@ -50,15 +50,16 @@ const (
 	workerRuntimeBearerFixture = "worker-runtime-bearer"
 )
 
-// TestMCPGatewayBearer_PrefersSessionScopedToken pins the selection rule: the
-// platform-stamped, session-scoped bearer wins whenever it is present, and the
-// worker runtime bearer remains the fallback for a platform that stamps none
-// (self-hosted / older). That fallback is the standalone contract, not a
-// migration shim, so "worker only" must keep working forever.
+// TestMCPGatewayBearer_ReturnsOnlyTheSessionScopedToken pins the fail-closed
+// rule: only the platform-stamped, session-scoped bearer is ever returned for
+// MCP calls. The worker runtime bearer is worker/host authority and must never
+// authenticate MCP calls — when the session bearer is absent (a degraded mint)
+// the answer is empty and the caller omits the gateway and surfaces the
+// condition instead of impersonating the host identity.
 //
 // Absent and empty-string are required to be indistinguishable on the wire, so
-// a whitespace-only value must fall back rather than emit a blank bearer.
-func TestMCPGatewayBearer_PrefersSessionScopedToken(t *testing.T) {
+// a whitespace-only session bearer yields empty rather than a blank bearer.
+func TestMCPGatewayBearer_ReturnsOnlyTheSessionScopedToken(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -67,14 +68,14 @@ func TestMCPGatewayBearer_PrefersSessionScopedToken(t *testing.T) {
 		worker  string
 		want    string
 	}{
-		{"both present — session-scoped wins", sessionScopedBearerFixture, workerRuntimeBearerFixture, sessionScopedBearerFixture},
+		{"both present — worker bearer is ignored", sessionScopedBearerFixture, workerRuntimeBearerFixture, sessionScopedBearerFixture},
 		{"session-scoped only", sessionScopedBearerFixture, "", sessionScopedBearerFixture},
-		{"worker only — standalone fallback", "", workerRuntimeBearerFixture, workerRuntimeBearerFixture},
+		{"worker only — no gateway bearer", "", workerRuntimeBearerFixture, ""},
 		{"neither", "", "", ""},
-		{"blank session-scoped falls back", "   ", workerRuntimeBearerFixture, workerRuntimeBearerFixture},
+		{"blank session-scoped yields empty", "   ", workerRuntimeBearerFixture, ""},
 		{"both blank", " ", "\t\n", ""},
 		{"session-scoped is trimmed", " " + sessionScopedBearerFixture + "\n", workerRuntimeBearerFixture, sessionScopedBearerFixture},
-		{"worker fallback is trimmed", "", "  " + workerRuntimeBearerFixture + " ", workerRuntimeBearerFixture},
+		{"worker bearer never leaks through", "", "  " + workerRuntimeBearerFixture + " ", ""},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -113,11 +114,12 @@ func TestDefaultMCPServersForHarness_GatewayHeaderCarriesSessionScopedBearer(t *
 	}
 }
 
-// TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerAlone pins the
-// emit condition against the session-scoped bearer rather than the worker one.
-// A platform that stamps only the session bearer must still get a gateway; a
-// work item with neither bearer must still get none (standalone back-compat).
-func TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerAlone(t *testing.T) {
+// TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerOnly pins the
+// emit condition against the session-scoped bearer alone. A platform that
+// stamps the session bearer gets a gateway; a work item with only the worker
+// bearer (a degraded mint) gets none — the worker bearer must never mount a
+// host-identity gateway.
+func TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerOnly(t *testing.T) {
 	t.Parallel()
 
 	cases := []struct {
@@ -127,8 +129,8 @@ func TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerAlone(t *testing
 		wantHeader string // "" means: no gateway at all
 	}{
 		{"session-scoped only", sessionScopedBearerFixture, "", "Bearer " + sessionScopedBearerFixture},
-		{"worker only", "", workerRuntimeBearerFixture, "Bearer " + workerRuntimeBearerFixture},
-		{"both", sessionScopedBearerFixture, workerRuntimeBearerFixture, "Bearer " + sessionScopedBearerFixture},
+		{"worker only — degraded mint mounts nothing", "", workerRuntimeBearerFixture, ""},
+		{"both — session bearer authenticates", sessionScopedBearerFixture, workerRuntimeBearerFixture, "Bearer " + sessionScopedBearerFixture},
 		{"neither — standalone", "", "", ""},
 		{"both blank — standalone", "  ", " ", ""},
 	}
@@ -156,16 +158,17 @@ func TestDefaultMCPServersForHarness_EmitsGatewayOnSessionBearerAlone(t *testing
 	}
 }
 
-// TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewayEmission is
+// TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewaySet is
 // the regression guard for the failure shape this file's change could
 // reintroduce: deciding anything about the gateway from the harness or provider
 // NAME. Hardcoding a name here once denied the spawn outright for every harness
 // that declares no MCP delivery.
 //
-// The invariant asserted per harness is that the session-scoped bearer changes
-// the gateway's HEADER and nothing else — never WHICH harnesses mount it. That
-// stays keyed on the declared MCPDelivery, exactly as before.
-func TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewayEmission(t *testing.T) {
+// The invariant asserted per harness is that adding the session-scoped bearer
+// to a worker-only work item adds exactly the gateway — never changes WHICH
+// harnesses mount it. That stays keyed on the declared MCPDelivery, exactly as
+// before.
+func TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewaySet(t *testing.T) {
 	t.Parallel()
 
 	for _, tc := range harnessMCPCases(t) {
@@ -173,15 +176,14 @@ func TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewayEmission(t 
 			t.Parallel()
 
 			workerOnly := platformGatewayWork("sess_" + tc.name)
-			withSession := workerOnly
-			withSession.McpAuthToken = sessionScopedBearerFixture
+			workerOnly.McpAuthToken = ""
+			withSession := platformGatewayWork("sess_" + tc.name)
 
 			workerLane := defaultMCPServersForHarness(workerOnly, "/abs/wt", tc.provider, tc.mode)
 			sessionLane := defaultMCPServersForHarness(withSession, "/abs/wt", tc.provider, tc.mode)
 
-			if got, want := mcpServerNames(sessionLane), mcpServerNames(workerLane); !slices.Equal(got, want) {
-				t.Fatalf("session-scoped bearer changed the emitted server set for %s: got %v, want %v",
-					tc.name, got, want)
+			if workerLane != nil {
+				t.Fatalf("worker-only work item mounted a gateway for %s: %v — a degraded mint must mount nothing", tc.name, mcpServerNames(workerLane))
 			}
 			if !tc.deliversMCP {
 				if sessionLane != nil {
@@ -194,6 +196,9 @@ func TestDefaultMCPServersForHarness_SessionBearerNeverChangesGatewayEmission(t 
 			}
 			if got, want := sessionLane[0].Headers["Authorization"], "Bearer "+sessionScopedBearerFixture; got != want {
 				t.Fatalf("%s: gateway Authorization = %q, want %q", tc.name, got, want)
+			}
+			if strings.Contains(sessionLane[0].Headers["Authorization"], workerRuntimeBearerFixture) {
+				t.Fatalf("%s: worker runtime bearer leaked into the gateway header: %q", tc.name, sessionLane[0].Headers["Authorization"])
 			}
 		})
 	}
@@ -365,20 +370,20 @@ func TestQueuedWork_SessionBearerNeverSerializes(t *testing.T) {
 	}
 }
 
-// TestMaterializeRuntimeAuthority_MaterializesBothBearers keeps the
+// TestMaterializeRuntimeAuthority_MaterializesSessionBearerOnly keeps the
 // prepared-source lane and the spawn lane computing the same implicit MCP set.
-// The gateway's bearer is mcpGatewayBearer(qw), so materializing only the
-// worker one would make the two lanes diverge the moment the platform stamps a
-// session-scoped bearer.
-func TestMaterializeRuntimeAuthority_MaterializesBothBearers(t *testing.T) {
+// Only the session-scoped bearer is materialized: it is the sole gateway
+// bearer, so the prepared lane must model exactly what the spawn lane emits.
+// The worker bearer is not an MCP credential and must stay empty in this lane.
+func TestMaterializeRuntimeAuthority_MaterializesSessionBearerOnly(t *testing.T) {
 	t.Parallel()
 
 	got := materializeRuntimeAuthority(QueuedWork{})
 	if got.PlatformURL == "" {
 		t.Fatal("PlatformURL must be materialized")
 	}
-	if got.AuthToken != runtimeMaterializedCredential {
-		t.Fatalf("AuthToken = %q, want %q", got.AuthToken, runtimeMaterializedCredential)
+	if got.AuthToken != "" {
+		t.Fatalf("AuthToken = %q, want empty: the worker bearer is not an MCP credential", got.AuthToken)
 	}
 	if got.McpAuthToken != runtimeMaterializedCredential {
 		t.Fatalf("McpAuthToken = %q, want %q", got.McpAuthToken, runtimeMaterializedCredential)
@@ -386,6 +391,78 @@ func TestMaterializeRuntimeAuthority_MaterializesBothBearers(t *testing.T) {
 	if bearer := mcpGatewayBearer(got); bearer != runtimeMaterializedCredential {
 		t.Fatalf("mcpGatewayBearer(materialized) = %q, want %q", bearer, runtimeMaterializedCredential)
 	}
+}
+
+// TestDegradedMint_SurfacesMissingSessionBearer pins the degraded-mint
+// receipt: a platform-connected session with no session-scoped bearer is
+// degraded, and the runner surfaces it instead of substituting the worker
+// bearer. The predicate stays quiet for standalone sessions (no platform
+// address), sessions without an identity, and local-transport runs — none of
+// those is a mint that could degrade.
+func TestDegradedMint_SurfacesMissingSessionBearer(t *testing.T) {
+	t.Parallel()
+
+	degraded := platformGatewayWork("sess_degraded")
+	degraded.McpAuthToken = ""
+	if !isMCPGatewayDegradedMint(degraded) {
+		t.Fatal("worker-only platform session must read as a degraded mint")
+	}
+	if servers := defaultMCPServersForHarness(degraded, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous); servers != nil {
+		t.Fatalf("degraded mint mounted a gateway: %v — the worker bearer must never authenticate MCP calls", mcpServerNames(servers))
+	}
+	if warnings := appendDegradedMintWarning(nil, degraded); len(warnings) != 1 || !strings.Contains(warnings[0], "sess_degraded") {
+		t.Fatalf("degraded mint left no result warning: %v", warnings)
+	}
+	var buf bytes.Buffer
+	logMCPGatewayDegradedMint(captureLogger(&buf), degraded)
+	records := capturedRecords(t, &buf)
+	if len(records) != 1 {
+		t.Fatalf("want exactly one degraded-mint record, got %d: %s", len(records), buf.String())
+	}
+	if got := records[0]["level"]; got != "WARN" {
+		t.Fatalf("level = %v, want WARN", got)
+	}
+	for _, bearer := range []string{sessionScopedBearerFixture, workerRuntimeBearerFixture} {
+		if strings.Contains(buf.String(), bearer) {
+			t.Fatalf("bearer %q leaked into the degraded-mint log: %s", bearer, buf.String())
+		}
+	}
+
+	quiet := []struct {
+		name string
+		mut  func(*QueuedWork)
+	}{
+		{"session bearer present", func(*QueuedWork) {}},
+		{"no platform address", func(qw *QueuedWork) { qw.PlatformURL = "" }},
+		{"no session identity", func(qw *QueuedWork) { qw.SessionID = "" }},
+		{"blank session bearer still degraded", func(qw *QueuedWork) { qw.McpAuthToken = "   " }},
+	}
+	for _, tc := range quiet[:3] {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qw := platformGatewayWork("sess_quiet")
+			tc.mut(&qw)
+			if isMCPGatewayDegradedMint(qw) {
+				t.Fatalf("%s must not read as a degraded mint", tc.name)
+			}
+			var logBuf bytes.Buffer
+			logMCPGatewayDegradedMint(captureLogger(&logBuf), qw)
+			if logBuf.Len() != 0 {
+				t.Fatalf("%s logged a degraded mint: %s", tc.name, logBuf.String())
+			}
+			if warnings := appendDegradedMintWarning(nil, qw); warnings != nil {
+				t.Fatalf("%s recorded a result warning: %v", tc.name, warnings)
+			}
+		})
+	}
+	t.Run(quiet[3].name, func(t *testing.T) {
+		t.Parallel()
+		qw := platformGatewayWork("sess_blank")
+		quiet[3].mut(&qw)
+		if !isMCPGatewayDegradedMint(qw) {
+			t.Fatal("whitespace-only session bearer must read as a degraded mint")
+		}
+	})
 }
 
 // TestPlatformMCPServerName_IsBrandDerived documents that the gateway's
