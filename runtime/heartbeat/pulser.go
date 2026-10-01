@@ -145,6 +145,15 @@ type Config struct {
 	Now func() time.Time
 	// Sleep overrides time.Sleep for inner-retry backoff in tests.
 	Sleep func(time.Duration)
+
+	// OnHeartbeatAck observes the actual acknowledged tick: it fires once
+	// per successful lock-refresh acknowledgement with the exact unix-ms
+	// tick snapshot the pulser just stored in LastTick. It runs on the
+	// heartbeat goroutine, so implementations must be cheap and
+	// non-blocking. Failed attempts, refused refreshes and replayed output
+	// never fire it. Nil (the default) disables observation without
+	// changing any tick, strike or ownership behaviour.
+	OnHeartbeatAck func(tickUnixMs int64)
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for a heartbeat
@@ -724,7 +733,11 @@ func (p *Pulser) tick(ctx context.Context) {
 		err := p.doRefresh(ctx)
 		if err == nil {
 			prev := p.strikes.Swap(0)
-			p.lastTick.Store(p.cfg.now().UnixMilli())
+			tick := p.cfg.now().UnixMilli()
+			p.lastTick.Store(tick)
+			if p.cfg.OnHeartbeatAck != nil {
+				p.cfg.OnHeartbeatAck(tick)
+			}
 			if p.degraded.CompareAndSwap(true, false) {
 				// Interactive degraded → healthy transition: connectivity
 				// (or lock acceptance) returned and the heartbeat resumed

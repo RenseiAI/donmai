@@ -962,10 +962,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		// (omitempty keeps the wire byte-identical for headless/interview).
 		SessionClass:       interactiveSessionClass(qw),
 		CredentialProvider: hbCredentialProvider,
-		Interval:           r.hbInterval,
-		HTTPClient:         r.httpClient,
-		Logger:             r.logger,
-		OnInject:           onInject,
+		// Persist the actual successful session-heartbeat acknowledgement
+		// into state.State.LastHeartbeat (the field host-watch reads),
+		// fenced to this exact session and run. Failed refreshes, replay
+		// ingestion and output-only activity never fire this callback.
+		OnHeartbeatAck: r.heartbeatAckObserver(runnerStatePath, qw.SessionID, startedAt),
+		Interval:       r.hbInterval,
+		HTTPClient:     r.httpClient,
+		Logger:         r.logger,
+		OnInject:       onInject,
 	})
 	if err != nil {
 		// Heartbeat is non-fatal at construction time only when
