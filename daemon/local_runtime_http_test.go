@@ -20,6 +20,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/localqueue"
@@ -777,4 +778,112 @@ func TestLocalNoResultWorkerHelper(t *testing.T) {
 	if os.Getenv("DONMAI_TEST_LOCAL_NO_RESULT") == "1" {
 		t.Fatal("owned worker exits without a terminal callback")
 	}
+}
+
+func localOperatorControlClient(t *testing.T, fixture *localHTTPFixture) *afclient.DaemonClient {
+	t.Helper()
+	host, textPort, err := net.SplitHostPort(fixture.server.Addr())
+	if err != nil {
+		t.Fatal(err)
+	}
+	port, err := strconv.Atoi(textPort)
+	if err != nil {
+		t.Fatal(err)
+	}
+	// The actual daemon client sends the protected local operator bearer on
+	// its ordinary POST routes. The auth store and both server gates stay real.
+	return afclient.NewDaemonClient(afclient.DaemonConfig{Host: host, Port: port, ControlToken: fixture.operator})
+}
+
+func TestLocalOperatorControlsUseVerifiedBearer(t *testing.T) {
+	configure := func(d *Daemon) {
+		d.opts.RequireControlToken = true
+		d.opts.ControlToken = "synthetic-installed-control-only"
+	}
+	t.Run("pause-resume-capacity", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, configure)
+		client := localOperatorControlClient(t, fixture)
+		if response, err := client.Pause(); err != nil || response == nil || !response.OK {
+			t.Fatalf("actual local pause client: response=%+v err=%v", response, err)
+		}
+		if response, err := client.Resume(); err != nil || response == nil || !response.OK {
+			t.Fatalf("actual local resume client: response=%+v err=%v", response, err)
+		}
+		if response, err := client.SetCapacityConfig("capacity.maxConcurrentSessions", "1"); err != nil || response == nil || !response.OK || fixture.d.MaxConcurrentSessions() != 1 {
+			t.Fatalf("actual local capacity client: response=%+v err=%v limit=%d", response, err, fixture.d.MaxConcurrentSessions())
+		}
+	})
+	t.Run("session-stop", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, configure)
+		admitted := fixture.admit(t, 28)
+		worker := fixture.claim(t, admitted.Session)
+		path := "/api/daemon/sessions/" + admitted.Session.SessionID + "/stop"
+		if code, _ := fixture.request(t, http.MethodPost, path, worker, nil); code != http.StatusUnauthorized {
+			t.Fatalf("worker attempt token gained session-stop control: %d", code)
+		}
+		if code, body := fixture.request(t, http.MethodPost, path, fixture.operator, nil); code != http.StatusOK || !bytes.Contains(body, []byte("stop requested")) {
+			t.Fatalf("operator session-stop: status=%d body=%s", code, body)
+		}
+		projection, err := fixture.runtime.store.Session(context.Background(), fixture.runtime.identity.ScopeID, admitted.Session.SessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		seen := false
+		for _, observation := range projection.Observations {
+			seen = seen || observation.Kind == localqueue.ObservationStopRequest
+		}
+		if !seen {
+			t.Fatal("operator session-stop did not reach the durable request handler")
+		}
+	})
+	t.Run("drain", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, configure)
+		response, err := localOperatorControlClient(t, fixture).Drain(1)
+		if err != nil || response == nil || !response.OK {
+			t.Fatalf("actual local drain client: response=%+v err=%v", response, err)
+		}
+	})
+	t.Run("stop", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, configure)
+		response, err := localOperatorControlClient(t, fixture).Stop()
+		if err != nil || response == nil || !response.OK {
+			t.Fatalf("actual local stop client: response=%+v err=%v", response, err)
+		}
+	})
+}
+
+func TestLocalOperatorControlsRefuseOtherBearersAndUnavailableControl(t *testing.T) {
+	t.Run("roles", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, func(d *Daemon) {
+			d.opts.RequireControlToken = true
+			d.opts.ControlToken = "synthetic-installed-control-only"
+		})
+		admitted := fixture.admit(t, 29)
+		worker := fixture.claim(t, admitted.Session)
+		before := fixture.d.State()
+		for _, bearer := range []string{"", "synthetic-wrong", worker, "synthetic-installed-control-only"} {
+			if code, _ := fixture.request(t, http.MethodPost, "/api/daemon/pause", bearer, nil); code != http.StatusUnauthorized {
+				t.Fatalf("nonoperator bearer reached pause: status=%d", code)
+			}
+		}
+		if fixture.d.State() != before {
+			t.Fatal("refused bearer changed daemon state")
+		}
+	})
+	t.Run("required-control-unavailable", func(t *testing.T) {
+		fixture := startLocalHTTPFixture(t, func(d *Daemon) {
+			d.opts.RequireControlToken = true
+			d.opts.ControlToken = ""
+		})
+		before := fixture.d.State()
+		if code, body := fixture.request(t, http.MethodPost, "/api/daemon/pause", fixture.operator, nil); code != http.StatusServiceUnavailable || !bytes.Contains(body, []byte("control token unavailable")) {
+			t.Fatalf("required unavailable material: status=%d body=%s", code, body)
+		}
+		if fixture.d.State() != before {
+			t.Fatal("required unavailable control material reached pause")
+		}
+		if code, _ := fixture.request(t, http.MethodPost, "/api/daemon/pause", "synthetic-wrong", nil); code != http.StatusUnauthorized {
+			t.Fatalf("wrong local bearer reached unavailable gate: %d", code)
+		}
+	})
 }
