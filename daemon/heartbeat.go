@@ -725,12 +725,14 @@ type heartbeatRequestBody struct {
 	// ActiveInteractiveCount is a *int so a nil (unreported) value drops the
 	// key via omitempty — an embedder that does not classify interactive
 	// occupancy must not send a misleading 0.
-	ActiveInteractiveCount *int                        `json:"activeInteractiveCount,omitempty"`
-	MaxSessions            int                         `json:"maxSessions,omitempty"`
-	Load                   *heartbeatLoadFields        `json:"load,omitempty"`
-	LoadAverage            *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
-	AllowlistHash          string                      `json:"allowlistHash,omitempty"`
-	Allowlist              []ProjectAllowlistEntry     `json:"allowlist,omitempty"`
+	ActiveInteractiveCount *int `json:"activeInteractiveCount,omitempty"`
+	// GetMaxCount is required: zero is an explicit admission ceiling, not an
+	// absent observation. Receivers retain their prior ceiling when omitted.
+	MaxSessions   int                         `json:"maxSessions"`
+	Load          *heartbeatLoadFields        `json:"load,omitempty"`
+	LoadAverage   *heartbeatLoadAverageFields `json:"loadAverage,omitempty"`
+	AllowlistHash string                      `json:"allowlistHash,omitempty"`
+	Allowlist     []ProjectAllowlistEntry     `json:"allowlist,omitempty"`
 	// A non-nil pointer carries the complete admission report's explicit empty
 	// set as `enabledProjectIds:[]`; nil preserves the unchanged-beat omission.
 	EnabledProjectIDs    *[]string                  `json:"enabledProjectIds,omitempty"`
