@@ -771,7 +771,12 @@ type SessionShimConfig struct {
 	// composition that owns the session still wants it. Nil means "yes" — a
 	// standalone daemon has nothing above it to ask — so leaving it unset
 	// leaves the discovery record as the only observation, which is correct and
-	// is the OSS default.
+	// is the OSS default. An embedder implementing this predicate answers the
+	// composing-layer half only; the shim half — running or orphaned — is the
+	// shared shimwire.Phase.HarnessLive predicate, the same one the daemon's
+	// own rebind gate consults. A predicate that re-lists phases itself risks
+	// drifting into a running-only copy that abandons orphaned shims still
+	// holding a live harness.
 	//
 	// CALL RATE: once per re-adoption attempt, and once per PACED keepalive
 	// tick during a lineage-live window — so at most once per attempt plus once

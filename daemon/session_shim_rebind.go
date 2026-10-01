@@ -32,6 +32,11 @@ var (
 	// returned alongside SessionShimRebindInProgress so a caller that only
 	// checks the error still learns the refusal was benign.
 	ErrSessionShimRebindInProgress = errors.New("a rebind of this lineage is already in flight")
+	// ErrSessionShimHarnessNotLive reports a rebind refused because the shim's
+	// latest published phase owns no live harness. Only running or orphaned
+	// phases do (shimwire.Phase.HarnessLive); rebinding a starting shim or an
+	// exited one cannot restore a live session.
+	ErrSessionShimHarnessNotLive = errors.New("the shim's harness is not live")
 )
 
 // SessionShimRebindResult is what RebindAdoptedSessionShim did, as a value
@@ -58,6 +63,9 @@ const (
 	// SessionShimRebindInProgress reports a concurrent caller's re-adoption of
 	// the same lineage. Exactly one of them performs the operation.
 	SessionShimRebindInProgress
+	// SessionShimHarnessNotLive reports a lineage whose shim phase owns no live
+	// harness. Returned with an error wrapping ErrSessionShimHarnessNotLive.
+	SessionShimHarnessNotLive
 )
 
 // String names the result for logs and diagnostics.
@@ -71,6 +79,8 @@ func (r SessionShimRebindResult) String() string {
 		return "not_adopted"
 	case SessionShimRebindInProgress:
 		return "rebind_in_progress"
+	case SessionShimHarnessNotLive:
+		return "harness_not_live"
 	default:
 		return "unknown"
 	}
@@ -86,7 +96,10 @@ func (r SessionShimRebindResult) String() string {
 // projection reports it as fine. AdoptedSessionShimBindings and
 // SessionShimDiagnostics carry CarrierBound so the state is detectable, and
 // SessionShimConfig.OnSessionShimCarrierBindLost raises it the moment the
-// daemon learns of it; this is the repair those two point at.
+// daemon learns of it; this is the repair those two point at. The shim's
+// latest published phase must own a live harness (shimwire.Phase.HarnessLive:
+// running or orphaned); anything else refuses with SessionShimHarnessNotLive
+// rather than re-adopting a shim that cannot hold a live session.
 //
 // It performs a REAL daemon-side operation, not a callback trampoline: the same
 // re-adoption pipeline a carrier fault runs — a fresh dial, a strictly newer
@@ -116,6 +129,9 @@ func (d *Daemon) RebindAdoptedSessionShim(ctx context.Context, orgID, sessionID 
 			result = SessionShimNotAdopted
 		}
 		return result, fmt.Errorf("session shim: rebind %s: %w", id, err)
+	}
+	if live, err := d.sessionShimHarnessLive(id); err == nil && !live {
+		return SessionShimHarnessNotLive, fmt.Errorf("session shim: rebind %s: %w", id, ErrSessionShimHarnessNotLive)
 	}
 	claimed, refusal := d.claimSessionShimRebind(id, entry)
 	if !claimed {
@@ -211,6 +227,25 @@ func (d *Daemon) ReportAdoptedSessionShimCarrierTransportLostFor(ref SessionShim
 	}
 	_ = entry.controller.Close()
 	return changed, nil
+}
+
+// sessionShimHarnessLive reports whether the registry's latest published
+// phase for id still owns a live harness, through the single
+// shimwire.Phase.HarnessLive predicate (running or orphaned). A registry read
+// failure is fail-open — it returns no error and leaves the rebind to the
+// adoption pass that dials the shim itself — because a momentarily unreadable
+// record must not refuse the repair of a lineage the shim can still serve.
+// Callers treat a nil error with live=false as "known not live, refuse".
+func (d *Daemon) sessionShimHarnessLive(id sessionshim.Identity) (bool, error) {
+	registry, err := d.sessionShimRegistry()
+	if err != nil {
+		return true, err
+	}
+	rec, err := registry.Get(id)
+	if err != nil {
+		return true, err
+	}
+	return rec.Phase.HarnessLive(), nil
 }
 
 // claimSessionShimRebind takes the one in-flight rebind slot for a lineage, or

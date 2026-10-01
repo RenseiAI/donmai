@@ -156,6 +156,18 @@ func (p Phase) Known() bool {
 	}
 }
 
+// HarnessLive reports whether a shim in phase p still owns a live harness:
+// running (a controller is attached) or orphaned (the controller is gone and
+// the bounded orphan deadline is counting down). It is the single source of
+// truth for that question: Controller.HarnessSurvived and the daemon rebind
+// gate both delegate to it, and an embedder's lineage-live predicate should
+// use it rather than re-listing phases, so a running-only copy cannot drift
+// back in. Starting owns no harness yet; exited owns only the immutable
+// terminal observation.
+func (p Phase) HarnessLive() bool {
+	return p == PhaseRunning || p == PhaseOrphaned
+}
+
 // GapReason is the closed set of reasons a contiguous replay could not be
 // served. It exists so a gap is always ATTRIBUTED: "we lost bytes" plus why,
 // never a silent renumber.
