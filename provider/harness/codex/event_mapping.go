@@ -15,13 +15,15 @@ import (
 // AppServerEventMapperState from
 // ../donmai-libraries/packages/core/src/providers/codex-app-server-provider.ts.
 type mapperState struct {
-	sessionID           string
-	model               string
-	totalInputTokens    int64
-	totalOutputTokens   int64
-	totalCachedInputTok int64
-	turnCount           int
-	turnStarted         time.Time
+	sessionID            string
+	model                string
+	totalInputTokens     int64
+	totalOutputTokens    int64
+	totalCachedInputTok  int64
+	turnCount            int
+	completedTurns       int
+	seenCompletedTurnIDs map[string]struct{}
+	turnStarted          time.Time
 }
 
 // mapNotification translates one inbound JSON-RPC notification into
@@ -199,6 +201,16 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		} `json:"turn"`
 	}
 	_ = json.Unmarshal(params, &p)
+	if p.Turn.ID != "" {
+		if _, duplicate := state.seenCompletedTurnIDs[p.Turn.ID]; duplicate {
+			return nil
+		}
+		if state.seenCompletedTurnIDs == nil {
+			state.seenCompletedTurnIDs = make(map[string]struct{})
+		}
+		state.seenCompletedTurnIDs[p.Turn.ID] = struct{}{}
+	}
+	state.completedTurns++
 
 	// Codex has shipped both snake_case and camelCase usage shapes.
 	// extractUsageTokens normalizes; we accept either form here.
@@ -237,6 +249,7 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 		CachedInputTokens: cached,
 		FinishReason:      finishReason,
 		UsageSource:       agent.LlmUsageProvider,
+		TurnCompleted:     true,
 	}
 	ended := time.Now()
 	started := state.turnStarted
@@ -246,10 +259,11 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 	llm.StartTimeUnixNano = fmt.Sprintf("%d", started.UnixNano())
 	llm.EndTimeUnixNano = fmt.Sprintf("%d", ended.UnixNano())
 	state.turnStarted = time.Time{}
+	completedTurns := state.completedTurns
 
 	switch p.Turn.Status {
 	case "", "completed":
-		return []agent.Event{llm, agent.ResultEvent{Success: true, Cost: cost, Raw: raw}}
+		return []agent.Event{llm, agent.ResultEvent{Success: true, Cost: cost, ObservedTurns: &completedTurns, Raw: raw}}
 	case "failed":
 		errMsg := p.Turn.Error.Message
 		if errMsg == "" {
@@ -260,19 +274,21 @@ func mapTurnCompleted(params json.RawMessage, state *mapperState, raw any) []age
 			subtype = "turn_failed"
 		}
 		return []agent.Event{llm, agent.ResultEvent{
-			Success:      false,
-			Errors:       []string{errMsg},
-			ErrorSubtype: subtype,
-			Cost:         cost,
-			Raw:          raw,
+			Success:       false,
+			Errors:        []string{errMsg},
+			ErrorSubtype:  subtype,
+			Cost:          cost,
+			ObservedTurns: &completedTurns,
+			Raw:           raw,
 		}}
 	case "interrupted":
 		return []agent.Event{llm, agent.ResultEvent{
-			Success:      false,
-			Errors:       []string{"Turn was interrupted"},
-			ErrorSubtype: "interrupted",
-			Cost:         cost,
-			Raw:          raw,
+			Success:       false,
+			Errors:        []string{"Turn was interrupted"},
+			ErrorSubtype:  "interrupted",
+			Cost:          cost,
+			ObservedTurns: &completedTurns,
+			Raw:           raw,
 		}}
 	default:
 		return []agent.Event{llm, agent.SystemEvent{

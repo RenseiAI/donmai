@@ -75,6 +75,9 @@ func TestMapNotification_TurnCompleted_Success(t *testing.T) {
 	if llm.UsageSource != agent.LlmUsageProvider || llm.Synthetic {
 		t.Fatalf("unexpected usage provenance: %+v", llm)
 	}
+	if !llm.TurnCompleted || llm.ObservedCostUsd != nil {
+		t.Fatalf("Codex completion must report turn, not locally estimated price: %+v", llm)
+	}
 	if llm.StartTimeUnixNano == "" || llm.EndTimeUnixNano == "" {
 		t.Fatalf("per-call timing missing: %+v", llm)
 	}
@@ -90,6 +93,9 @@ func TestMapNotification_TurnCompleted_Success(t *testing.T) {
 	}
 	if res.Cost == nil {
 		t.Fatalf("expected cost data")
+	}
+	if res.ObservedCostUsd != nil || res.ObservedTurns == nil || *res.ObservedTurns != 1 {
+		t.Fatalf("native turn count and estimated price availability confused: %+v", res)
 	}
 	// 400000 fresh*$2 + 100000 cached*$0.5 + 100000 output*$8 = $0.8 + $0.05 + $0.8 = $1.65
 	wantCost := 1.65

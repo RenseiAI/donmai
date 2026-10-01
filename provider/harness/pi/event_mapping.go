@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"math"
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -29,10 +30,11 @@ type mapperState struct {
 	debug       bool // when true, thinking deltas are surfaced; default drops them
 	initEmitted bool
 
-	accInputTokens  int64
-	accOutputTokens int64
-	accCostUSD      float64
-	accTurns        int
+	accInputTokens       int64
+	accOutputTokens      int64
+	accCostUSD           float64
+	accTurns             int
+	allTurnCostsObserved bool
 
 	sawAgentEnd bool
 	endSuccess  bool
@@ -163,17 +165,32 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		outTok := intField(usage, "output", "outputTokens")
 		st.accInputTokens += in
 		st.accOutputTokens += outTok
-		st.accCostUSD += floatField(mapField(usage, "cost"), "total")
+		cost := observedPiCost(mapField(usage, "cost"))
+		if st.accTurns == 0 {
+			st.allTurnCostsObserved = true
+		}
+		if cost == nil {
+			st.allTurnCostsObserved = false
+		} else {
+			next := st.accCostUSD + *cost
+			if math.IsInf(next, 0) {
+				st.allTurnCostsObserved = false
+			} else {
+				st.accCostUSD = next
+			}
+		}
 		st.accTurns++
 		return []agent.Event{agent.LlmCallEvent{
 			System: stringField(msg, "provider", "system"),
 			Model:  stringField(msg, "model"),
 			// Pi pre-fills provider/model from its selected catalog entry.
 			// responseModel alone is native response evidence when supplied.
-			ResponseModel: stringField(msg, "responseModel"),
-			InputTokens:   in,
-			OutputTokens:  outTok,
-			UsageSource:   agent.LlmUsageProvider,
+			ResponseModel:   stringField(msg, "responseModel"),
+			InputTokens:     in,
+			OutputTokens:    outTok,
+			UsageSource:     agent.LlmUsageProvider,
+			ObservedCostUsd: cost,
+			TurnCompleted:   true,
 		}}, false
 
 	case "agent_end":
@@ -196,6 +213,14 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		res := agent.ResultEvent{Success: true, Raw: raw(ev)}
 		if cost := st.accumulatedCost(); cost != nil {
 			res.Cost = cost
+		}
+		if st.accTurns > 0 {
+			turns := st.accTurns
+			res.ObservedTurns = &turns
+			if st.allTurnCostsObserved {
+				cost := st.accCostUSD
+				res.ObservedCostUsd = &cost
+			}
 		}
 		return []agent.Event{res}, true
 
@@ -227,6 +252,14 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		}
 		return []agent.Event{agent.SystemEvent{Subtype: ev.Type, Raw: raw(ev)}}, false
 	}
+}
+
+func observedPiCost(cost map[string]any) *float64 {
+	value, ok := cost["total"].(float64)
+	if !ok || math.IsNaN(value) || math.IsInf(value, 0) || value < 0 {
+		return nil
+	}
+	return &value
 }
 
 // accumulatedCost returns the session's accumulated CostData, or nil if nothing

@@ -20,7 +20,7 @@ func TestRenderCard_CombinedIdentityAndScope(t *testing.T) {
 		out := renderCard(theme.DefaultTheme(), card, 0, true, plain, now)
 		for _, want := range []string{
 			"project web · issue ENG-1284", "harness driver", "model model-id",
-			"provider vendor", "state running", "elapsed unknown", "tools not reported",
+			"Endpoint surface vendor", "state running", "elapsed unknown", "tools not reported",
 			"cost not reported", "turns not reported", "heartbeat never", "output never", "work never",
 		} {
 			if !strings.Contains(out, want) {
@@ -55,6 +55,8 @@ func TestRenderCard_Plain(t *testing.T) {
 		CostUsd:         0.84,
 		NumTurns:        5,
 		MetricsReported: true,
+		CostReported:    true,
+		TurnsReported:   true,
 		LastActivity:    "Bash: pnpm test",
 		LastWorkAt:      now.Add(-30 * time.Second),
 		LastOutputAt:    now.Add(-10 * time.Second),
@@ -62,7 +64,7 @@ func TestRenderCard_Plain(t *testing.T) {
 	out := renderCard(tm, card, 0, false, true /*plain*/, now)
 	for _, want := range []string{
 		"ENG-1284", "development",
-		"harness claude-code", "model claude-sonnet-4-5", "provider anthropic", "state running",
+		"harness claude-code", "model claude-sonnet-4-5", "Endpoint surface anthropic", "state running",
 		"tools 37", "Bash: pnpm test",
 	} {
 		if !strings.Contains(out, want) {
@@ -79,7 +81,7 @@ func TestRenderCard_MissingDataIsUnknown(t *testing.T) {
 	card := SessionCard{SessionID: "sess-9"}
 	out := renderCard(tm, card, 0, false, true /*plain*/, now)
 	for _, want := range []string{
-		"harness unknown", "model unknown", "provider unknown", "state unknown",
+		"harness unknown", "model unknown", "Endpoint surface unknown", "state unknown",
 		"elapsed unknown", "tools not reported", "cost not reported", "turns not reported",
 		"heartbeat never", "output never", "work never",
 	} {
@@ -99,9 +101,9 @@ func TestRenderCard_MeasuredZeroAfterObserved(t *testing.T) {
 	now := time.Date(2026, 6, 13, 14, 5, 0, 0, time.UTC)
 	// Once the tail has been observed, a zero count is measured — it must
 	// render as 0, not "not reported".
-	card := SessionCard{SessionID: "s", Observed: true, MetricsReported: true}
+	card := SessionCard{SessionID: "s", Observed: true, CostReported: true, TurnsReported: true}
 	out := renderCard(tm, card, 0, false, true /*plain*/, now)
-	for _, want := range []string{"tools 0", "turns 0"} {
+	for _, want := range []string{"tools 0", "turns 0", "cost $0.00"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("card output missing %q:\n%s", want, out)
 		}
@@ -257,6 +259,45 @@ func TestTruncateRunes(t *testing.T) {
 	for _, tc := range tests {
 		if got := truncateRunes(tc.in, tc.n); got != tc.want {
 			t.Errorf("truncateRunes(%q,%d)=%q want %q", tc.in, tc.n, got, tc.want)
+		}
+	}
+}
+
+func TestRenderCardSeparatesModelAuthorFromEndpointSurface(t *testing.T) {
+	card := SessionCard{
+		SessionID: "s", DaemonState: "running", Model: "muse-spark-1.3",
+		ModelAuthor: "meta", ModelProvider: "openai", EndpointOperator: "gateway",
+		Protocol: "openai-chat",
+	}
+	out := renderCard(theme.DefaultTheme(), card, 0, false, true, time.Now())
+	for _, want := range []string{
+		"Model author meta", "Endpoint operator gateway", "Endpoint surface openai",
+		"Protocol openai-chat", "Actual provider unknown",
+	} {
+		if !strings.Contains(out, want) {
+			t.Fatalf("missing truthful axis %q:\n%s", want, out)
+		}
+	}
+	if strings.Contains(out, "Actual provider meta") || strings.Contains(out, "Actual provider openai") {
+		t.Fatalf("configured axes became observed response identity:\n%s", out)
+	}
+}
+
+func TestRenderCardRejectsURLShapedDisplayAxis(t *testing.T) {
+	card := SessionCard{SessionID: "s", ModelAuthor: "https://example.test/token", EndpointOperator: "path/segment", Protocol: "openai-chat"}
+	out := renderCard(theme.DefaultTheme(), card, 0, false, true, time.Now())
+	if strings.Contains(out, "example.test") || strings.Contains(out, "path/segment") ||
+		!strings.Contains(out, "Model author unknown") || !strings.Contains(out, "Endpoint operator unknown") {
+		t.Fatalf("malformed display axis escaped card: %q", out)
+	}
+}
+
+func TestCompactAxesKeepIdentityAndMetricsInDefaultSplit(t *testing.T) {
+	card := SessionCard{SessionID: "s", IssueIdentifier: "CARD-1", ProjectName: "alpha", DaemonState: "running", AgentCardID: "card-review", AgentCardName: "Reviewer", Model: "muse-spark-1.3", Harness: "pi", ModelAuthor: "meta", EndpointOperator: "gateway", ModelProvider: "openai", Protocol: "openai-chat"}
+	grid := renderGrid(theme.DefaultTheme(), []SessionCard{card}, 0, 0, 180, 17, false, time.Now())
+	for _, want := range []string{"Card ID card-review", "Agent card Reviewer", "Model author meta", "operator gateway", "Endpoint surface openai", "openai-chat", "Actual provider unknown", "cost not reported", "heartbeat never"} {
+		if !strings.Contains(grid, want) {
+			t.Fatalf("default split clipped %q: %s", want, grid)
 		}
 	}
 }

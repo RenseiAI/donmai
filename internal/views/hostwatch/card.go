@@ -77,20 +77,26 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	agentCard := "Agent card " + safeIdentityText(card.AgentCardName)
 	cardID := "Card ID " + safeIdentityText(card.AgentCardID)
 	modelIdentity := "Model identity " + safeIdentityText(card.ActualModel)
-	actualProvider := "Actual provider " + safeIdentityText(card.ActualModelProvider)
+	actualProvider := "Actual provider " + safeAxisText(card.ActualModelProvider)
 	modelVersion := "Model version " + safeIdentityText(card.ActualModelVersion)
+	modelAuthor := "Model author " + safeAxisText(card.ModelAuthor)
+	endpointOperator := "Endpoint operator " + safeAxisText(card.EndpointOperator)
+	endpointSurface := "Endpoint surface " + safeAxisText(card.modelProvider())
+	protocol := "Protocol " + safeAxisText(card.Protocol)
 	// Plain cards also reserve one physical row per identity component.
 	agentCard = truncateWidth(agentCard, cardWidth-2)
 	cardID = truncateWidth(cardID, cardWidth-2)
 	modelIdentity = truncateWidth(modelIdentity, cardWidth-2)
 	actualProvider = truncateWidth(actualProvider, cardWidth-2)
 	modelVersion = truncateWidth(modelVersion, cardWidth-2)
+	modelAuthor = truncateWidth(modelAuthor, cardWidth-2)
+	endpointOperator = truncateWidth(endpointOperator, cardWidth-2)
+	endpointSurface = truncateWidth(endpointSurface, cardWidth-2)
+	protocol = truncateWidth(protocol, cardWidth-2)
 	identity := fmt.Sprintf("harness %s · model %s",
 		unknownIfEmpty(card.Harness),
 		unknownIfEmpty(card.Model))
-	state := fmt.Sprintf("provider %s · state %s",
-		unknownIfEmpty(card.modelProvider()),
-		card.displayState())
+	state := "state " + card.displayState()
 	// Scope stays visible inside the card. Appending it after the identity
 	// fields would truncate it at ordinary card widths.
 	scope := ""
@@ -109,7 +115,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		countStr(card.Observed, card.ToolCalls))
 	cost := fmt.Sprintf("cost %s · turns %s",
 		costStr(card),
-		countStr(card.MetricsReported, card.NumTurns))
+		countStr(card.TurnsReported, card.NumTurns))
 
 	fresh := fmt.Sprintf("heartbeat %s · output %s",
 		freshStr(card.heartbeatTime(), now),
@@ -133,9 +139,6 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		if scope != "" {
 			fmt.Fprintf(&b, "  %s\n", scope)
 		}
-		for _, line := range []string{agentCard, cardID, modelIdentity, actualProvider, modelVersion} {
-			fmt.Fprintf(&b, "  %s\n", line)
-		}
 		fmt.Fprintf(&b, "  %s\n", identity)
 		fmt.Fprintf(&b, "  %s\n", state)
 		if card.isHeld() {
@@ -147,6 +150,9 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 			fmt.Fprintf(&b, "  %s\n", cost)
 			fmt.Fprintf(&b, "  %s\n", fresh)
 			fmt.Fprintf(&b, "  %s\n", workFresh)
+		}
+		for _, line := range []string{modelAuthor, endpointSurface, endpointOperator, protocol, actualProvider, modelIdentity, modelVersion, agentCard, cardID} {
+			fmt.Fprintf(&b, "  %s\n", line)
 		}
 		if ticker != "" {
 			fmt.Fprintf(&b, "  %s\n", ticker)
@@ -170,6 +176,8 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	modelIdentity = truncateWidth(modelIdentity, inner)
 	actualProvider = truncateWidth(actualProvider, inner)
 	modelVersion = truncateWidth(modelVersion, inner)
+	modelAuthor = truncateWidth(modelAuthor, inner)
+	endpointSurface = truncateWidth(endpointSurface, inner)
 	identity = truncateWidth(identity, inner)
 	state = truncateWidth(state, inner)
 	scope = truncateWidth(scope, inner)
@@ -193,10 +201,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	if scope != "" {
 		lines = append(lines, chipStyle.Render(scope))
 	}
-	lines = append(lines,
-		chipStyle.Render(agentCard), chipStyle.Render(cardID),
-		chipStyle.Render(modelIdentity), chipStyle.Render(actualProvider), chipStyle.Render(modelVersion),
-		chipStyle.Render(identity), chipStyle.Render(state))
+	lines = append(lines, chipStyle.Render(identity), chipStyle.Render(state))
 	if card.isHeld() {
 		for _, detail := range strings.Split(heldDetails(card), "\n") {
 			lines = append(lines, chipStyle.Render(truncateWidth(detail, inner)))
@@ -205,6 +210,14 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		lines = append(lines, metricStyle.Render(metrics), metricStyle.Render(cost),
 			chipStyle.Render(fresh), chipStyle.Render(workFresh))
 	}
+	// Keep the admitted axes distinct while fitting the existing split pane:
+	// the model's author/operator and the endpoint surface/protocol each share
+	// one row. Plain output retains the full labels on individual rows.
+	lines = append(lines,
+		chipStyle.Render(truncateWidth(modelAuthor+" · operator "+safeAxisText(card.EndpointOperator), inner)),
+		chipStyle.Render(truncateWidth(endpointSurface+" · "+safeAxisText(card.Protocol), inner)),
+		chipStyle.Render(actualProvider), chipStyle.Render(modelIdentity), chipStyle.Render(modelVersion),
+		chipStyle.Render(agentCard), chipStyle.Render(cardID))
 	if ticker != "" {
 		lines = append(lines, tickStyle.Render(ticker))
 	}
@@ -296,14 +309,10 @@ func (c SessionCard) ageSeconds(now time.Time) int {
 	return int(d.Seconds())
 }
 
-// modelProvider returns the model-serving vendor identity. Provider is
-// the legacy conflated field: prefer the explicit ModelProvider axis and
-// fall back only for state written before the split.
+// modelProvider returns the configured endpoint surface only. The older
+// Provider field conflates harness and endpoint, so it cannot fill this axis.
 func (c SessionCard) modelProvider() string {
-	if c.ModelProvider != "" {
-		return c.ModelProvider
-	}
-	return c.Provider
+	return c.ModelProvider
 }
 
 // heartbeatTime returns the freshest heartbeat observation: live tail
@@ -342,8 +351,7 @@ func elapsedStr(card SessionCard, now time.Time) string {
 
 // countStr renders a cumulative count, or "not reported" until its source
 // has been observed: tool calls fold from the tail (Observed), cost/turns
-// only arrive on the terminal result event (MetricsReported). A zero after
-// that is a measured zero.
+// need separate native observations. A reported zero is distinct from absent.
 func countStr(reported bool, n int) string {
 	if !reported {
 		return "not reported"
@@ -351,11 +359,13 @@ func countStr(reported bool, n int) string {
 	return fmt.Sprintf("%d", n)
 }
 
-// costStr renders the terminal cost payload, or "not reported" until it
-// arrives on the terminal result event (never incrementally).
+// costStr renders a native observed cost, including live call prices.
 func costStr(card SessionCard) string {
-	if !card.MetricsReported {
+	if !card.CostReported {
 		return "not reported"
+	}
+	if card.CostUsd == 0 {
+		return "$0.00"
 	}
 	v := card.CostUsd
 	return format.Cost(&v)
@@ -421,4 +431,18 @@ func safeIdentityText(s string) string {
 		return r
 	}, ansi.Strip(s))
 	return unknownIfEmpty(clean)
+}
+
+// safeAxisText accepts only compact identifiers on the new display axes.
+// A malformed value cannot turn the card into a URL or credential display.
+func safeAxisText(s string) string {
+	if len(s) == 0 || len(s) > 64 {
+		return "unknown"
+	}
+	for _, r := range s {
+		if !(r >= 'a' && r <= 'z' || r >= 'A' && r <= 'Z' || r >= '0' && r <= '9' || r == '-' || r == '_' || r == '.' || r == ':') {
+			return "unknown"
+		}
+	}
+	return s
 }

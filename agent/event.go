@@ -206,6 +206,13 @@ type LlmCallEvent struct {
 	OutputTokens      int64  `json:"outputTokens,omitempty"`
 	CachedInputTokens int64  `json:"cachedInputTokens,omitempty"`
 	FinishReason      string `json:"finishReason,omitempty"`
+	// ObservedCostUsd is the provider's price for this exact call. A pointer
+	// distinguishes a reported zero from an absent price. Estimated prices
+	// and aggregate fallbacks must not populate it.
+	ObservedCostUsd *float64 `json:"observedCostUsd,omitempty"`
+	// TurnCompleted is set only by a native completed model-turn event.
+	// Synthetic usage, tool results and text output never set it.
+	TurnCompleted bool `json:"turnCompleted,omitempty"`
 
 	// StartTimeUnixNano and EndTimeUnixNano use decimal strings so JSON
 	// consumers do not lose fixed64 precision. Empty values are stamped by the
@@ -328,6 +335,11 @@ type ResultEvent struct {
 
 	// Cost is the rolled-up cost/usage for the session.
 	Cost *CostData `json:"cost,omitempty"`
+	// ObservedCostUsd and ObservedTurns are native cumulative observations.
+	// They can be independently absent; a non-nil zero is reported zero.
+	// Cost remains the legacy aggregate used by existing billing readers.
+	ObservedCostUsd *float64 `json:"observedCostUsd,omitempty"`
+	ObservedTurns   *int     `json:"observedTurns,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`

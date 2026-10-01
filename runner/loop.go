@@ -849,7 +849,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 
 	// 7. Initialise the per-session state.json so a crash mid-spawn
 	// is recoverable.
+	var journalBoundaryErr error
 	if _, err := r.store.Update(runnerStatePath, func(s *state.State) error {
+		journalBoundaryErr = stampRunJournalBoundary(s, qw.SessionID, startedAt, runnerStatePath)
 		s.IssueIdentifier = qw.IssueIdentifier
 		s.IssueID = qw.IssueID
 		s.SessionID = qw.SessionID
@@ -858,19 +860,26 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		s.AgentCardID = qw.AgentCardID
 		s.AgentCardName = qw.AgentCardName
 		s.Model = qw.ResolvedProfile.Model
-		s.ModelProvider = spanruntime.ProviderSystem(provider.Name())
+		// Display axes come from the final admitted binding, never from the
+		// harness name or a model-id prefix. Missing bindings stay unknown.
+		s.ModelProvider, s.ModelAuthor, s.EndpointOperator, s.Protocol = "", "", "", ""
+		if spec.Endpoint != nil {
+			s.ModelProvider = string(spec.Endpoint.Company)
+			s.ModelAuthor = spec.Endpoint.ModelAuthor
+			s.EndpointOperator = spec.Endpoint.EndpointOperator
+			s.Protocol = string(spec.Endpoint.Protocol)
+		}
 		s.WorkType = qw.WorkType
 		s.WorkerID = qw.WorkerID
 		s.CurrentStep = "spawning"
-		if s.StartedAt == 0 {
-			s.StartedAt = startedAt
-		}
 		s.AttemptCount++
 		s.ExecutionSecurity = report
 		return nil
 	}); err != nil {
 		// state.json is best-effort — log and continue.
 		r.logger.Warn("state init failed", "sessionId", qw.SessionID, "err", err)
+	} else if journalBoundaryErr != nil {
+		r.logger.Warn("event journal boundary unavailable", "sessionId", qw.SessionID)
 	}
 
 	// 8. Spawn provider.
@@ -943,7 +952,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			injectCh, seenInject, r.logger, qw.SessionID, !qw.isInteractive(),
 		)
 	}
-	pulser, err := heartbeat.New(heartbeat.Config{
+	pulser, err := heartbeat.NewWithAckObserver(heartbeat.Config{
 		SessionID: qw.SessionID,
 		WorkerID:  qw.WorkerID,
 		// IssueID is the Linear issue UUID — the platform's
@@ -962,11 +971,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		// (omitempty keeps the wire byte-identical for headless/interview).
 		SessionClass:       interactiveSessionClass(qw),
 		CredentialProvider: hbCredentialProvider,
-		Interval:           r.hbInterval,
-		HTTPClient:         r.httpClient,
-		Logger:             r.logger,
-		OnInject:           onInject,
-	})
+		// Persist the actual successful session-heartbeat acknowledgement
+		// into state.State.LastHeartbeat (the field host-watch reads),
+		// fenced to this exact session and run. Failed refreshes, replay
+		// ingestion and output-only activity never fire this callback.
+		Interval:   r.hbInterval,
+		HTTPClient: r.httpClient,
+		Logger:     r.logger,
+		OnInject:   onInject,
+	}, r.heartbeatAckObserver(runnerStatePath, qw.SessionID, startedAt))
 	if err != nil {
 		// Heartbeat is non-fatal at construction time only when
 		// PlatformURL is missing; that's caught by validateQueuedWork.

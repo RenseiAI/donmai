@@ -441,7 +441,10 @@ type DaemonSessionHandle struct {
 	// ModelProvider is the model-serving vendor identity, a separate axis
 	// from Harness (the loop driver). Display-only; absent against an
 	// older daemon (renders as unknown).
-	ModelProvider string `json:"modelProvider,omitempty"`
+	ModelProvider    string `json:"modelProvider,omitempty"`
+	ModelAuthor      string `json:"modelAuthor,omitempty"`
+	EndpointOperator string `json:"endpointOperator,omitempty"`
+	Protocol         string `json:"protocol,omitempty"`
 
 	// WorkType is the workflow discriminant ("development", "qa", ...).
 	// Display-only; absent against an older daemon (renders as unknown).

@@ -541,3 +541,29 @@ func TestNativeModelObservationPreservesTerminalAggregateUsage(t *testing.T) {
 		t.Fatalf("terminal aggregate span changed: %+v", spans[0])
 	}
 }
+
+func TestObservedClaudeResultAvailability(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		line      string
+		wantCost  bool
+		wantTurns bool
+	}{
+		{"reported zero", `{"type":"result","subtype":"success","is_error":false,"total_cost_usd":0,"num_turns":0}`, true, true},
+		{"missing values", `{"type":"result","subtype":"success","is_error":false}`, false, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			events := mapLine([]byte(tc.line))
+			if len(events) != 1 {
+				t.Fatalf("events=%d", len(events))
+			}
+			result := events[0].(agent.ResultEvent)
+			if (result.ObservedCostUsd != nil) != tc.wantCost || (result.ObservedTurns != nil) != tc.wantTurns {
+				t.Fatalf("availability confused: %+v", result)
+			}
+			if result.ObservedCostUsd != nil && *result.ObservedCostUsd != 0 {
+				t.Fatalf("reported cost changed: %+v", result)
+			}
+		})
+	}
+}

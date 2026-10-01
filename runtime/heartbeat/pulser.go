@@ -178,7 +178,7 @@ type CredentialProvider func(context.Context) (RuntimeCredentials, error)
 //	{"deliveryId": "...", "text": "...", "kind": "memory"|"user", "turnId": "..."}
 //
 // CONTRACT: defined in CONTRACT-FREEZE §3 and
-// platform/src/lib/interview/wire-types.ts (INJECT_KIND_USER / INJECT_KIND_MEMORY).
+// the shared inject wire contract (user message or runtime memory).
 type InjectPayload struct {
 	DeliveryID string `json:"deliveryId"`
 	Text       string `json:"text"`
@@ -263,7 +263,8 @@ func (c Config) credentials(ctx context.Context) RuntimeCredentials {
 // Pulser drives the heartbeat loop for one session. Construct via New
 // then call Start; Stop releases resources.
 type Pulser struct {
-	cfg Config
+	cfg            Config
+	onHeartbeatAck func(int64)
 
 	mu       sync.Mutex
 	stopped  bool
@@ -444,6 +445,19 @@ func New(cfg Config) (*Pulser, error) {
 		return nil, errors.New("runtime/heartbeat: BaseURL required")
 	}
 	return &Pulser{cfg: cfg}, nil
+}
+
+// NewWithAckObserver constructs a pulser that also reports successful session
+// lock-refresh acknowledgements. The callback receives the exact LastTick
+// snapshot synchronously; it should finish promptly. Refusals and failed
+// attempts do not call it. A nil observer preserves New's behavior.
+func NewWithAckObserver(cfg Config, observer func(int64)) (*Pulser, error) {
+	p, err := New(cfg)
+	if err != nil {
+		return nil, err
+	}
+	p.onHeartbeatAck = observer
+	return p, nil
 }
 
 // LostOwnership returns a channel that closes when the platform has
@@ -724,7 +738,11 @@ func (p *Pulser) tick(ctx context.Context) {
 		err := p.doRefresh(ctx)
 		if err == nil {
 			prev := p.strikes.Swap(0)
-			p.lastTick.Store(p.cfg.now().UnixMilli())
+			tick := p.cfg.now().UnixMilli()
+			p.lastTick.Store(tick)
+			if p.onHeartbeatAck != nil {
+				p.onHeartbeatAck(tick)
+			}
 			if p.degraded.CompareAndSwap(true, false) {
 				// Interactive degraded → healthy transition: connectivity
 				// (or lock acceptance) returned and the heartbeat resumed

@@ -140,11 +140,10 @@ func TestModel_ReplayNeverLooksActive(t *testing.T) {
 	}
 }
 
-// TestModel_TerminalCostArrivesOnlyOnResult pins the cost/turns contract:
-// tool output never reports cost, and only the terminal result event flips
-// MetricsReported (which is what the card's "not reported" rendering keys
-// on).
-func TestModel_TerminalCostArrivesOnlyOnResult(t *testing.T) {
+// TestModel_TerminalCostRequiresNativeAvailability keeps legacy CostData
+// available to old readers without presenting an estimated or absent price
+// as a native observation in host-watch.
+func TestModel_TerminalCostRequiresNativeAvailability(t *testing.T) {
 	fd := &fakeDaemon{
 		sessions: []afclient.DaemonSessionHandle{{
 			SessionID: "sess-cost", State: "running", Repository: "o/a",
@@ -168,8 +167,16 @@ func TestModel_TerminalCostArrivesOnlyOnResult(t *testing.T) {
 		Event: agent.ResultEvent{Success: true, Cost: &agent.CostData{TotalCostUsd: 1.25, NumTurns: 4}},
 	})
 	c := findCard(m, "sess-cost")
-	if !c.MetricsReported || c.CostUsd != 1.25 || c.NumTurns != 4 {
-		t.Errorf("terminal cost not folded: %+v", c)
+	if c.CostReported || c.TurnsReported {
+		t.Errorf("legacy aggregate without provenance became observed: %+v", c)
+	}
+	amount := 1.25
+	turns := 4
+	m.foldMetrics(TailEvent{SessionID: "sess-cost", At: now, Event: agent.ResultEvent{
+		Success: true, ObservedCostUsd: &amount, ObservedTurns: &turns,
+	}})
+	if !c.CostReported || !c.TurnsReported || c.CostUsd != amount || c.NumTurns != turns {
+		t.Errorf("native terminal observations not folded: %+v", c)
 	}
 }
 
@@ -223,20 +230,19 @@ func TestSource_HandleWinsOverState(t *testing.T) {
 	}
 }
 
-// TestModelProvider_LegacyFallback pins the vendor axis split: an explicit
-// ModelProvider always wins, and the legacy conflated Provider only fills
-// the gap for state written before the split.
-func TestModelProvider_LegacyFallback(t *testing.T) {
-	explicit := SessionCard{Provider: "legacy", ModelProvider: "anthropic"}
-	if got := explicit.modelProvider(); got != "anthropic" {
-		t.Errorf("explicit ModelProvider must win: got %q", got)
+// TestModelProviderDoesNotInferEndpointSurface keeps the harness identity
+// separate from explicitly supplied endpoint metadata.
+func TestModelProviderDoesNotInferEndpointSurface(t *testing.T) {
+	explicit := SessionCard{Provider: "legacy", ModelProvider: "openai", ModelAuthor: "meta"}
+	if got := explicit.modelProvider(); got != "openai" {
+		t.Errorf("explicit endpoint surface lost: %q", got)
 	}
 	legacy := SessionCard{Provider: "legacy"}
-	if got := legacy.modelProvider(); got != "legacy" {
-		t.Errorf("legacy Provider must backfill: got %q", got)
+	if got := legacy.modelProvider(); got != "" {
+		t.Errorf("harness identity became endpoint surface: %q", got)
 	}
 	if got := (SessionCard{}).modelProvider(); got != "" {
-		t.Errorf("absent vendor must stay absent: got %q", got)
+		t.Errorf("absent endpoint surface must stay absent: %q", got)
 	}
 }
 
@@ -252,6 +258,7 @@ func TestRenderCard_Widths(t *testing.T) {
 			StartedAtUnixMs: now.Add(-4 * time.Minute).UnixMilli(),
 			ToolCalls:       37, Observed: true, CostUsd: 0.84, NumTurns: 5,
 			MetricsReported: true, LastActivity: "Bash: pnpm test",
+			CostReported: true, TurnsReported: true,
 			LastWorkAt: now.Add(-30 * time.Second), LastOutputAt: now.Add(-10 * time.Second),
 		},
 		// An old-daemon card with absent fields overflows gracefully.
@@ -268,7 +275,7 @@ func TestRenderCard_Widths(t *testing.T) {
 			continue
 		}
 		for _, want := range []string{
-			"harness loop-driver", "provider vendor", "tools 37",
+			"harness loop-driver", "Endpoint surface vendor", "tools 37",
 			"harness unknown", "tools not reported",
 		} {
 			if !strings.Contains(out, want) {

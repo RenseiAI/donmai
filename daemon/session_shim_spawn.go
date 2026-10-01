@@ -1984,16 +1984,19 @@ func (d *Daemon) trackLaunchedShim(
 		// The workarea doubles as the worktree path a local reader joins with
 		// .agent/…; it is the same <parent>/<sessionID> leaf the direct path
 		// publishes, so a reader cannot tell shim-backed sessions apart by shape.
-		WorktreePath:  workarea,
-		WorkareaRoot:  workareaRoot,
-		ProjectName:   project.ID,
-		Repository:    spec.Repository,
-		Harness:       spec.Harness,
-		AgentCardID:   spec.AgentCardID,
-		AgentCardName: spec.AgentCardName,
-		Model:         spec.Model,
-		ModelProvider: spec.Company,
-		WorkType:      spec.WorkType,
+		WorktreePath:     workarea,
+		WorkareaRoot:     workareaRoot,
+		ProjectName:      project.ID,
+		Repository:       spec.Repository,
+		Harness:          spec.Harness,
+		AgentCardID:      spec.AgentCardID,
+		AgentCardName:    spec.AgentCardName,
+		Model:            spec.Model,
+		ModelProvider:    sessionDisplaySurface(spec),
+		ModelAuthor:      sessionDisplayAxis(spec.ModelAuthor),
+		EndpointOperator: sessionDisplayAxis(spec.EndpointOperator),
+		Protocol:         sessionDisplayAxis(spec.Protocol),
+		WorkType:         spec.WorkType,
 	}
 	entry := adoptedShim{
 		controller:      ctrl,

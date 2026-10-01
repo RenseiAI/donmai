@@ -222,6 +222,9 @@ func runHostWatch(ctx context.Context, output io.Writer, nonTTY bool, opts hostw
 	// AltScreen is requested from the model's View (v.AltScreen), matching
 	// the dashboard command — bubbletea v2 reads it per-view rather than as a
 	// program option.
+	if nonTTY {
+		opts.UnboundedCards = true
+	}
 	model := hostwatch.New(opts)
 	programOptions := []tea.ProgramOption{tea.WithContext(ctx), tea.WithOutput(output)}
 	if nonTTY {
@@ -230,9 +233,46 @@ func runHostWatch(ctx context.Context, output io.Writer, nonTTY bool, opts hostw
 		// same live model can still write its plain view to that pipe.
 		programOptions = append(programOptions, tea.WithInput(nil), tea.WithWindowSize(100, 30))
 	}
-	p := tea.NewProgram(model, programOptions...)
+	var engine tea.Model = model
+	var plain *hostWatchPipeModel
+	if nonTTY {
+		plain = &hostWatchPipeModel{inner: model, output: output}
+		engine = plain
+		programOptions = append(programOptions, tea.WithoutRenderer())
+	}
+	p := tea.NewProgram(engine, programOptions...)
 	if _, err := p.Run(); err != nil {
 		return fmt.Errorf("run host watch: %w", err)
 	}
+	if plain != nil && plain.err != nil {
+		return fmt.Errorf("write host watch: %w", plain.err)
+	}
+
 	return nil
+}
+
+// hostWatchPipeModel uses the same data/update engine while emitting complete
+// plain snapshots. A terminal renderer would clip them to its window height
+// and write cursor controls even though its output is a pipe.
+type hostWatchPipeModel struct {
+	inner  tea.Model
+	output io.Writer
+	last   string
+	err    error
+}
+
+func (m *hostWatchPipeModel) Init() tea.Cmd  { return m.inner.Init() }
+func (m *hostWatchPipeModel) View() tea.View { return m.inner.View() }
+func (m *hostWatchPipeModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
+	next, cmd := m.inner.Update(msg)
+	m.inner = next
+	content := m.inner.View().Content
+	if m.err == nil && content != "" && content != m.last {
+		if _, err := fmt.Fprintln(m.output, content); err != nil {
+			m.err = err
+			return m, tea.Quit
+		}
+		m.last = content
+	}
+	return m, cmd
 }

@@ -3,6 +3,7 @@ package clijsonl
 import (
 	"encoding/json"
 	"fmt"
+	"math"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -122,13 +123,13 @@ type rawAuthStatusEnvelope struct {
 //	  }
 //	}
 type rawResultEnvelope struct {
-	Type         string  `json:"type"`
-	Subtype      string  `json:"subtype"`
-	IsError      bool    `json:"is_error"`
-	Result       string  `json:"result,omitempty"`
-	SessionID    string  `json:"session_id,omitempty"`
-	TotalCostUSD float64 `json:"total_cost_usd"`
-	NumTurns     int     `json:"num_turns"`
+	Type         string   `json:"type"`
+	Subtype      string   `json:"subtype"`
+	IsError      bool     `json:"is_error"`
+	Result       string   `json:"result,omitempty"`
+	SessionID    string   `json:"session_id,omitempty"`
+	TotalCostUSD *float64 `json:"total_cost_usd"`
+	NumTurns     *int     `json:"num_turns"`
 	Errors       []struct {
 		Message string `json:"message,omitempty"`
 	} `json:"errors,omitempty"`
@@ -266,6 +267,7 @@ func mapAssistant(line []byte) []agent.Event {
 			CachedInputTokens: a.Message.Usage.CacheReadInputTokens,
 			FinishReason:      a.Message.StopReason,
 			UsageSource:       agent.LlmUsageProvider,
+			TurnCompleted:     true,
 		})
 	} else if a.Message.Model != "" {
 		// A response model is not usage. Keep older emitters' terminal
@@ -359,20 +361,34 @@ func mapResult(line []byte) []agent.Event {
 		}}
 	}
 
+	var observedCost *float64
+	if r.TotalCostUSD != nil && !math.IsNaN(*r.TotalCostUSD) && !math.IsInf(*r.TotalCostUSD, 0) && *r.TotalCostUSD >= 0 {
+		observedCost = r.TotalCostUSD
+	}
+	var observedTurns *int
+	if r.NumTurns != nil && *r.NumTurns >= 0 {
+		observedTurns = r.NumTurns
+	}
 	cost := &agent.CostData{
 		InputTokens:       r.Usage.InputTokens,
 		OutputTokens:      r.Usage.OutputTokens,
 		CachedInputTokens: r.Usage.CacheReadInputTokens,
-		TotalCostUsd:      r.TotalCostUSD,
-		NumTurns:          r.NumTurns,
+	}
+	if observedCost != nil {
+		cost.TotalCostUsd = *observedCost
+	}
+	if observedTurns != nil {
+		cost.NumTurns = *observedTurns
 	}
 
 	if r.Subtype == "success" && !r.IsError {
 		return []agent.Event{agent.ResultEvent{
-			Success: true,
-			Message: r.Result,
-			Cost:    cost,
-			Raw:     json.RawMessage(line),
+			Success:         true,
+			Message:         r.Result,
+			Cost:            cost,
+			ObservedCostUsd: observedCost,
+			ObservedTurns:   observedTurns,
+			Raw:             json.RawMessage(line),
 		}}
 	}
 
@@ -390,11 +406,13 @@ func mapResult(line []byte) []agent.Event {
 		subtype = "error"
 	}
 	return []agent.Event{agent.ResultEvent{
-		Success:      false,
-		Errors:       errMsgs,
-		ErrorSubtype: subtype,
-		Cost:         cost,
-		Raw:          json.RawMessage(line),
+		Success:         false,
+		Errors:          errMsgs,
+		ErrorSubtype:    subtype,
+		Cost:            cost,
+		ObservedCostUsd: observedCost,
+		ObservedTurns:   observedTurns,
+		Raw:             json.RawMessage(line),
 	}}
 }
 

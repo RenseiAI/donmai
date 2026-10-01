@@ -67,10 +67,7 @@ func TestModel_FullFlow_PlainRender(t *testing.T) {
 		agent.ToolUseEvent{ToolName: "Bash", Input: map[string]any{"command": "pnpm test"}},
 		agent.ToolResultEvent{ToolName: "Bash", Content: "ok"},
 	)
-	// The tailer was created with startAtEnd=true; the first poll resolves
-	// the seek-to-end, so events written BEFORE that first poll are skipped.
-	// Drive one empty poll to resolve the seek, then the real one.
-	drainTails(t, m) // resolves seek-to-end (sees nothing, file already had bytes pre-seek)
+	drainTails(t, m)
 
 	writeEvents(t, evPath, agent.AssistantTextEvent{Text: "running the suite"})
 	drainTails(t, m)
@@ -83,7 +80,7 @@ func TestModel_FullFlow_PlainRender(t *testing.T) {
 	}
 }
 
-func TestModel_TerminalEventDropsTailer(t *testing.T) {
+func TestModel_TerminalAggregateReplacesWithoutEndingLiveTail(t *testing.T) {
 	dir := t.TempDir()
 	wt := filepath.Join(dir, "sess-x")
 	writeState(t, wt, state.State{IssueIdentifier: "ENG-9", StartedAt: 1})
@@ -97,16 +94,17 @@ func TestModel_TerminalEventDropsTailer(t *testing.T) {
 	}
 	m := newTestModel(t, fd, "")
 	m.applySnapshot(m.src.Snapshot())
-	// startAtEnd resolves on first poll.
 	drainTails(t, m)
 
-	writeEvents(t, evPath, agent.ResultEvent{Success: true, Cost: &agent.CostData{TotalCostUsd: 2.0, NumTurns: 3}})
+	cost := 2.0
+	turns := 3
+	writeEvents(t, evPath, agent.ResultEvent{Success: true, Cost: &agent.CostData{TotalCostUsd: cost, NumTurns: turns}, ObservedCostUsd: &cost, ObservedTurns: &turns})
 	drainTails(t, m)
 
-	if _, ok := m.tailers["sess-x"]; ok {
-		t.Error("tailer should be dropped after terminal ResultEvent")
+	if _, ok := m.tailers["sess-x"]; !ok {
+		t.Error("live tailer must remain after a provider turn result")
 	}
-	if c := findCard(m, "sess-x"); c == nil || c.CostUsd != 2.0 || c.NumTurns != 3 {
+	if c := findCard(m, "sess-x"); c == nil || c.CostUsd != 2.0 || c.NumTurns != 3 || !c.CostReported || !c.TurnsReported {
 		t.Errorf("terminal cost/turns not folded onto card: %#v", c)
 	}
 }
