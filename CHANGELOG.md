@@ -10,6 +10,19 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.58 — 2026-10-01
+
+### Fixes
+
+- Treat a tag as released when any duplicate run succeeded
+
+### Chores
+
+- Show agent cards and observed model identity separately
+- Keep archive staging private and unify tracker operations
+- Bound cancellation during owned Codex login cleanup
+- Honor explicit zero session capacity
+
 ## v0.72.57 — 2026-09-30
 
 ### Fixes
