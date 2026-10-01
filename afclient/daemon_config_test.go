@@ -3,6 +3,7 @@ package afclient
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 
@@ -316,5 +317,231 @@ func TestWriteDaemonYAMLRepositoryPathIDRoundTrips(t *testing.T) {
 	}
 	if got := loaded.Repositories[0].PathID; got != "github:acme/widgets" {
 		t.Errorf("Repositories[0].PathID = %q, want github:acme/widgets", got)
+	}
+}
+
+func TestWriteDaemonYAMLWithCapacity_ExplicitZero(t *testing.T) {
+	cases := []struct{ name, seed string }{
+		{"fresh", ""},
+		{"omitted", "unknown: retained\n"},
+		{"null", "capacity: null\nunknown: retained\n"},
+		{"positive", "capacity: {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\nunknown: retained\n"},
+		{"merge", "defaults: &defaults {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\ncapacity: {<<: *defaults}\nunknown: retained\n"},
+		{"alias", "defaults: &defaults {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\ncapacity: *defaults\nunknown: retained\n"},
+	}
+	for _, key := range []string{"capacity.maxConcurrentSessions", "capacity.poolMaxDiskGb"} {
+		for _, tc := range cases {
+			t.Run(key+"/"+tc.name, func(t *testing.T) {
+				path := filepath.Join(t.TempDir(), "daemon.yaml")
+				if tc.seed != "" {
+					if err := os.WriteFile(path, []byte(tc.seed), 0o600); err != nil {
+						t.Fatal(err)
+					}
+				}
+				cfg, err := ReadDaemonYAML(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				if err := WriteDaemonYAMLWithCapacity(path, cfg, key, 0); err != nil {
+					t.Fatal(err)
+				}
+				data, err := os.ReadFile(path)
+				if err != nil {
+					t.Fatal(err)
+				}
+				var decoded map[string]any
+				if err := yaml.Unmarshal(data, &decoded); err != nil {
+					t.Fatal(err)
+				}
+				capacity, ok := decoded["capacity"].(map[string]any)
+				if !ok {
+					t.Fatalf("capacity missing: %s", data)
+				}
+				if v, exists := capacity[strings.TrimPrefix(key, "capacity.")]; !exists || v != 0 {
+					t.Fatalf("explicit zero missing: %s", data)
+				}
+				if strings.Contains(tc.seed, "unknown") && decoded["unknown"] != "retained" {
+					t.Fatalf("unknown lost: %s", data)
+				}
+				if strings.Contains(tc.seed, "maxVCpu") && capacity["maxVCpuPerSession"] != 6 {
+					t.Fatalf("capacity unknown lost: %s", data)
+				}
+				if strings.Contains(tc.seed, "defaults:") && decoded["defaults"].(map[string]any)["maxConcurrentSessions"] != 3 {
+					t.Fatalf("shared anchor changed: %s", data)
+				}
+			})
+		}
+	}
+}
+
+func TestWriteDaemonYAMLWithCapacity_ValidationBeforeWrite(t *testing.T) {
+	for _, tc := range []struct {
+		key       string
+		value     int
+		nilConfig bool
+	}{
+		{"capacity.maxConcurrentSessions", -1, false}, {"capacity.poolMaxDiskGb", -1, false}, {"capacity.maxVCpuPerSession", 0, false}, {"maxConcurrentSessions", 0, false}, {"capacity.maxConcurrentSessions", 0, true},
+	} {
+		t.Run(tc.key+"/"+strconv.Itoa(tc.value)+"/"+strconv.FormatBool(tc.nilConfig), func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "not-created", "daemon.yaml")
+			cfg := &DaemonYAML{}
+			if tc.nilConfig {
+				cfg = nil
+			}
+			if err := WriteDaemonYAMLWithCapacity(path, cfg, tc.key, tc.value); err == nil {
+				t.Fatal("invalid intent accepted")
+			}
+			if _, err := os.Stat(filepath.Dir(path)); !os.IsNotExist(err) {
+				t.Fatalf("invalid write created directory: %v", err)
+			}
+		})
+	}
+}
+
+func TestWriteDaemonYAML_GenericCapacityOmissionPreserved(t *testing.T) {
+	for _, seed := range []string{"unknown: retained\n", "capacity: null\n", "capacity: {maxConcurrentSessions: null}\n"} {
+		t.Run(seed, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := ReadDaemonYAML(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			cfg.Capacity.PoolMaxDiskGb = 9
+			if err := WriteDaemonYAML(path, cfg); err != nil {
+				t.Fatal(err)
+			}
+			data, err := os.ReadFile(path)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var decoded map[string]any
+			if err := yaml.Unmarshal(data, &decoded); err != nil {
+				t.Fatal(err)
+			}
+			capacity := decoded["capacity"].(map[string]any)
+			if value, exists := capacity["maxConcurrentSessions"]; exists && value != nil {
+				t.Fatalf("unrelated write authored limit: %s", data)
+			}
+			if capacity["poolMaxDiskGb"] != 9 {
+				t.Fatalf("disk write missing: %s", data)
+			}
+		})
+	}
+}
+
+func TestWriteDaemonYAMLWithCapacity_Anchors(t *testing.T) {
+	cases := []struct {
+		name, seed      string
+		borrowed        bool
+		observerMapping bool
+	}{
+		{name: "owned_scalar", seed: "capacity: {maxConcurrentSessions: &limit 3, maxVCpuPerSession: 6}\nobserver: {limit: *limit}\n"},
+		{name: "borrowed_scalar", seed: "defaults: {limit: &limit 3}\ncapacity: {maxConcurrentSessions: *limit, maxVCpuPerSession: 6}\nobserver: {limit: *limit}\n", borrowed: true},
+		{name: "owned_capacity_mapping", seed: "capacity: &limits {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\nobserver: *limits\n", observerMapping: true},
+		{name: "borrowed_capacity_mapping", seed: "defaults: &limits {maxConcurrentSessions: 3, maxVCpuPerSession: 6}\ncapacity: *limits\nobserver: *limits\n", borrowed: true, observerMapping: true},
+		{name: "owned_scalar_in_owned_mapping", seed: "capacity: &limits {maxConcurrentSessions: &limit 3, maxVCpuPerSession: 6}\nobserver: {limit: *limit}\nother: *limits\n"},
+	}
+	for _, key := range []string{"capacity.maxConcurrentSessions", "capacity.poolMaxDiskGb"} {
+		field := strings.TrimPrefix(key, "capacity.")
+		for _, value := range []int{0, 5} {
+			for _, tc := range cases {
+				t.Run(key+"/"+tc.name+"/"+strconv.Itoa(value), func(t *testing.T) {
+					path := filepath.Join(t.TempDir(), "daemon.yaml")
+					seed := strings.ReplaceAll(tc.seed, "maxConcurrentSessions", field) + "unknown: retained\n"
+					if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+						t.Fatal(err)
+					}
+					cfg, err := ReadDaemonYAML(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					if err := WriteDaemonYAMLWithCapacity(path, cfg, key, value); err != nil {
+						t.Fatal(err)
+					}
+					readback, err := ReadDaemonYAML(path)
+					if err != nil {
+						t.Fatalf("public readback after write: %v", err)
+					}
+					actual := readback.Capacity.MaxConcurrentSessions
+					if field == "poolMaxDiskGb" {
+						actual = readback.Capacity.PoolMaxDiskGb
+					}
+					if actual != value {
+						t.Fatalf("public readback = %d, want %d", actual, value)
+					}
+					data, err := os.ReadFile(path)
+					if err != nil {
+						t.Fatal(err)
+					}
+					var decoded map[string]any
+					if err := yaml.Unmarshal(data, &decoded); err != nil {
+						t.Fatal(err)
+					}
+					capacity := decoded["capacity"].(map[string]any)
+					if capacity["maxVCpuPerSession"] != 6 || decoded["unknown"] != "retained" {
+						t.Fatalf("unrelated fields lost: %s", data)
+					}
+					observer := decoded["observer"].(map[string]any)
+					observedKey := "limit"
+					if tc.observerMapping {
+						observedKey = field
+					}
+					wantObserver := value
+					if tc.borrowed {
+						wantObserver = 3
+					}
+					if observer[observedKey] != wantObserver {
+						t.Fatalf("observer = %v, want %d: %s", observer[observedKey], wantObserver, data)
+					}
+					if tc.name == "borrowed_scalar" && decoded["defaults"].(map[string]any)["limit"] != 3 {
+						t.Fatalf("external scalar target changed: %s", data)
+					}
+					if tc.name == "borrowed_capacity_mapping" && decoded["defaults"].(map[string]any)[field] != 3 {
+						t.Fatalf("external mapping target changed: %s", data)
+					}
+					if other, ok := decoded["other"].(map[string]any); ok && other[field] != value {
+						t.Fatalf("owned mapping alias lost updated value: %s", data)
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestWriteDaemonYAML_AnchoredCapacityOmission(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	seed := "capacity: {maxConcurrentSessions: &limit 3, maxVCpuPerSession: 6}\nobserver: {limit: *limit}\n"
+	if err := os.WriteFile(path, []byte(seed), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Capacity.MaxConcurrentSessions = 0
+	cfg.Capacity.PoolMaxDiskGb = 9
+	if err := WriteDaemonYAML(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	readback, err := ReadDaemonYAML(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if readback.Capacity.MaxConcurrentSessions != 3 || readback.Capacity.PoolMaxDiskGb != 9 {
+		t.Fatalf("generic omission changed values: %+v", readback.Capacity)
+	}
+	data, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var decoded map[string]any
+	if err := yaml.Unmarshal(data, &decoded); err != nil {
+		t.Fatal(err)
+	}
+	if decoded["observer"].(map[string]any)["limit"] != 3 {
+		t.Fatalf("omitted scalar alias changed: %s", data)
 	}
 }

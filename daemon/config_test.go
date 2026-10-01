@@ -923,3 +923,66 @@ autoUpdate:
 		t.Errorf("Repository = %q, want canonical to win", cfg.Projects[0].Repository)
 	}
 }
+
+func TestLoadConfig_MaxConcurrentSessionsPresence(t *testing.T) {
+	for _, tc := range []struct {
+		name, capacity string
+		want           int
+		wantError      bool
+	}{
+		{name: "omitted", want: 8},
+		{name: "empty", capacity: "capacity: {}\n", want: 8},
+		{name: "zero", capacity: "capacity:\n  maxConcurrentSessions: 0\n", want: 0},
+		{name: "positive", capacity: "capacity:\n  maxConcurrentSessions: 3\n", want: 3},
+		{name: "negative", capacity: "capacity:\n  maxConcurrentSessions: -1\n", wantError: true},
+		{name: "null", capacity: "capacity:\n  maxConcurrentSessions: null\n", want: 8},
+		{name: "capacity_null", capacity: "capacity: null\n", want: 8},
+		{name: "merged_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 0}\n", want: 0},
+		{name: "merge_overridden_zero", capacity: "capacity:\n  <<: {maxConcurrentSessions: 3}\n  maxConcurrentSessions: 0\n", want: 0},
+		{name: "alias_zero", capacity: "defaults: &defaults {maxConcurrentSessions: 0}\ncapacity: *defaults\n", want: 0},
+		{name: "alias_null", capacity: "defaults: &defaults {maxConcurrentSessions: null}\ncapacity: *defaults\n", want: 8},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			path := filepath.Join(t.TempDir(), "daemon.yaml")
+			body := "machine:\n  id: capacity-fixture\norchestrator:\n  url: https://example.test\n" + tc.capacity
+			if err := os.WriteFile(path, []byte(body), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			cfg, err := LoadConfig(path)
+			if tc.wantError {
+				if err == nil || !strings.Contains(err.Error(), "capacity.maxConcurrentSessions must be >= 0") {
+					t.Fatalf("negative value not refused: %v", err)
+				}
+				return
+			}
+			if err != nil {
+				t.Fatal(err)
+			}
+			if cfg.Capacity.MaxConcurrentSessions != tc.want {
+				t.Fatalf("loaded max sessions=%d want=%d", cfg.Capacity.MaxConcurrentSessions, tc.want)
+			}
+		})
+	}
+}
+
+func TestWriteConfig_ZeroSessionLimitRoundTrip(t *testing.T) {
+	path := filepath.Join(t.TempDir(), "daemon.yaml")
+	cfg := DefaultConfig()
+	cfg.Machine.ID = "capacity-fixture"
+	cfg.Orchestrator.URL = "https://example.test"
+	cfg.Capacity.MaxConcurrentSessions = 3
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Capacity.MaxConcurrentSessions = 0
+	if err := WriteConfig(path, cfg); err != nil {
+		t.Fatal(err)
+	}
+	loaded, err := LoadConfig(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if loaded.Capacity.MaxConcurrentSessions != 0 {
+		t.Fatalf("round trip limit = %d, want 0", loaded.Capacity.MaxConcurrentSessions)
+	}
+}

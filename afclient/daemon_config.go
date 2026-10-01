@@ -15,6 +15,7 @@ import (
 	"path/filepath"
 	"regexp"
 	"slices"
+	"strconv"
 	"strings"
 
 	"gopkg.in/yaml.v3"
@@ -250,6 +251,38 @@ func ReadDaemonYAML(path string) (*DaemonYAML, error) {
 // that want a fully-populated daemon.yaml should run the wizard first or
 // hand-author the file before calling this writer.
 func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
+	return writeDaemonYAML(path, cfg, nil)
+}
+
+type capacityWriteIntent struct {
+	key   string
+	value int
+}
+
+// WriteDaemonYAMLWithCapacity writes the usual config overlay and explicitly
+// authors one supported capacity value, including zero. Unlike WriteDaemonYAML,
+// this records the operator's intent even when the value would be omitted by
+// the exported config's YAML tags.
+func WriteDaemonYAMLWithCapacity(path string, cfg *DaemonYAML, key string, value int) error {
+	if cfg == nil {
+		return fmt.Errorf("daemon config is required")
+	}
+	var field string
+	switch key {
+	case "capacity.maxConcurrentSessions":
+		field = "maxConcurrentSessions"
+	case "capacity.poolMaxDiskGb":
+		field = "poolMaxDiskGb"
+	default:
+		return fmt.Errorf("unsupported capacity key %q", key)
+	}
+	if value < 0 {
+		return fmt.Errorf("%s must be >= 0", key)
+	}
+	return writeDaemonYAML(path, cfg, &capacityWriteIntent{key: field, value: value})
+}
+
+func writeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) error {
 	dir := filepath.Dir(path)
 	if err := os.MkdirAll(dir, 0o700); err != nil {
 		return fmt.Errorf("create config dir %q: %w", dir, err)
@@ -273,7 +306,7 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 	} else {
 		writeCfg.syncLegacyProjectProjection()
 	}
-	data, err := mergeDaemonYAML(path, &writeCfg)
+	data, err := mergeDaemonYAML(path, &writeCfg, intent)
 	if err != nil {
 		return fmt.Errorf("merge daemon config: %w", err)
 	}
@@ -293,8 +326,8 @@ func WriteDaemonYAML(path string, cfg *DaemonYAML) error {
 // mergeDaemonYAML loads the existing daemon.yaml at path (if present) as a
 // yaml.Node tree, replaces the project-admission, projects, and capacity keys
 // with the values from cfg, and returns the marshalled result. When the file does
-// not exist the cfg struct is marshalled directly.
-func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
+// not exist the cfg struct is marshalled with any explicit capacity intent.
+func mergeDaemonYAML(path string, cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, error) {
 	existing, readErr := os.ReadFile(path) //nolint:gosec // operator-supplied path
 	if readErr != nil {
 		if !errors.Is(readErr, os.ErrNotExist) {
@@ -304,7 +337,7 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 		// will reject this if it lacks machine.id / orchestrator.url; the
 		// CLI does not own those fields, so we leave the wizard /
 		// installer to populate them.
-		return yaml.Marshal(cfg)
+		return marshalDaemonYAML(cfg, intent)
 	}
 
 	var root yaml.Node
@@ -319,7 +352,7 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	}
 	if doc.Kind != yaml.MappingNode {
 		// File is empty / not a mapping — fall back to fresh emission.
-		return yaml.Marshal(cfg)
+		return marshalDaemonYAML(cfg, intent)
 	}
 
 	// Encode the cfg-side keys we own as nodes for splicing.
@@ -366,6 +399,20 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 	// Capacity is preserved as a partial overlay — only the cfg-modelled
 	// fields (e.g. poolMaxDiskGb) are merged into the existing capacity
 	// mapping. If no capacity key exists yet a new one is added.
+	if intent != nil {
+		upsertMappingKey(capacityNode, intent.key, capacityIntentNode(intent))
+		// Preserve alias inheritance without mutating the shared anchor. The
+		// new local mapping overrides only the explicitly authored capacity.
+		for i := 0; i+1 < len(doc.Content); i += 2 {
+			if doc.Content[i].Value == "capacity" && doc.Content[i+1].Kind == yaml.AliasNode {
+				doc.Content[i+1] = &yaml.Node{
+					Kind: yaml.MappingNode, Tag: "!!map",
+					Content: []*yaml.Node{{Kind: yaml.ScalarNode, Tag: "!!merge", Value: "<<"}, doc.Content[i+1]},
+				}
+				break
+			}
+		}
+	}
 	mergeMappingKey(doc, "capacity", capacityNode)
 
 	out, err := yaml.Marshal(&root)
@@ -373,6 +420,27 @@ func mergeDaemonYAML(path string, cfg *DaemonYAML) ([]byte, error) {
 		return nil, fmt.Errorf("marshal merged config: %w", err)
 	}
 	return out, nil
+}
+
+func capacityIntentNode(intent *capacityWriteIntent) *yaml.Node {
+	return &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!int", Value: strconv.Itoa(intent.value)}
+}
+
+func marshalDaemonYAML(cfg *DaemonYAML, intent *capacityWriteIntent) ([]byte, error) {
+	if intent == nil {
+		return yaml.Marshal(cfg)
+	}
+	root, err := encodeYAMLNode(cfg)
+	if err != nil {
+		return nil, err
+	}
+	capacity, err := encodeYAMLNode(cfg.Capacity)
+	if err != nil {
+		return nil, err
+	}
+	upsertMappingKey(capacity, intent.key, capacityIntentNode(intent))
+	upsertMappingKey(root, "capacity", capacity)
+	return yaml.Marshal(root)
 }
 
 // encodeYAMLNode marshals v through yaml.v3 and returns the resulting node
@@ -448,6 +516,15 @@ func mergeMappingKey(mapping *yaml.Node, key string, value *yaml.Node) {
 			// Splice each {k, v} pair from value into existing, replacing on
 			// match.
 			for j := 0; j+1 < len(value.Content); j += 2 {
+				// The capacity leaf owns its anchor definition. Retain it on
+				// replacement so aliases remain valid and follow the new value.
+				// A borrowed alias has no local definition to transfer.
+				for k := 0; k+1 < len(existing.Content); k += 2 {
+					if existing.Content[k].Value == value.Content[j].Value && existing.Content[k+1].Kind == yaml.ScalarNode {
+						value.Content[j+1].Anchor = existing.Content[k+1].Anchor
+						break
+					}
+				}
 				upsertMappingKey(existing, value.Content[j].Value, value.Content[j+1])
 			}
 			return

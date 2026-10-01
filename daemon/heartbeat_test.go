@@ -15,6 +15,60 @@ import (
 	"github.com/RenseiAI/donmai/internal/interview"
 )
 
+func TestHeartbeatService_ReportsExplicitZeroCapacity(t *testing.T) {
+	t.Setenv("DONMAI_DAEMON_REAL_REGISTRATION", "1")
+	t.Setenv("DONMAI_DAEMON_FORCE_STUB", "0")
+
+	requests := make(chan map[string]json.RawMessage, 2)
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/workers/capacity-worker/heartbeat" ||
+			r.Header.Get("Authorization") != "Bearer capacity-fixture-token" {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		var body map[string]json.RawMessage
+		if err := json.NewDecoder(r.Body).Decode(&body); err != nil {
+			w.WriteHeader(http.StatusBadRequest)
+			return
+		}
+		requests <- body
+		_ = json.NewEncoder(w).Encode(map[string]any{"acknowledged": true})
+	}))
+	t.Cleanup(server.Close)
+
+	maximum := 2
+	heartbeat := NewHeartbeatService(HeartbeatOptions{
+		WorkerID: "capacity-worker", Hostname: "capacity-fixture",
+		OrchestratorURL: server.URL, RuntimeJWT: "capacity-fixture-token",
+		GetActiveCount: func() int { return 1 },
+		GetMaxCount:    func() int { return maximum },
+		GetStatus:      func() RegistrationStatus { return RegistrationBusy },
+	})
+	for _, wanted := range []int{2, 0} {
+		maximum = wanted
+		ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+		err := heartbeat.sendOneResult(ctx)
+		cancel()
+		if err != nil {
+			t.Fatalf("send capacity %d heartbeat: %v", wanted, err)
+		}
+		var body map[string]json.RawMessage
+		select {
+		case body = <-requests:
+		default:
+			t.Fatal("heartbeat returned without an HTTP request")
+		}
+		raw, present := body["maxSessions"]
+		var actual int
+		if !present || json.Unmarshal(raw, &actual) != nil || actual != wanted {
+			t.Fatalf("heartbeat omitted or changed capacity: present=%t raw=%s want=%d", present, raw, wanted)
+		}
+		if string(body["activeCount"]) != "1" {
+			t.Fatalf("held worker occupancy changed: %s", body["activeCount"])
+		}
+	}
+}
+
 func TestHeartbeatService_StartStop(t *testing.T) {
 	var count int32
 	hs := NewHeartbeatService(HeartbeatOptions{

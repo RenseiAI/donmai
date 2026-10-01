@@ -201,7 +201,8 @@ func startSnapshotClaimGateDaemon(t *testing.T, registry ProviderRegistry, snaps
 	cfg := Config{
 		APIVersion: "donmai.dev/v1", Kind: "LocalDaemon",
 		ProjectAdmissionVersion: ProjectAdmissionVersionV2, ProjectAdmissionMode: ProjectAdmissionModeAllRouted,
-		Machine: MachineConfig{ID: "claim-gate-machine"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"},
+		Capacity: CapacityConfig{MaxConcurrentSessions: 8},
+		Machine:  MachineConfig{ID: "claim-gate-machine"}, Orchestrator: OrchestratorConfig{URL: "https://example.test"},
 	}
 	if err := WriteConfig(configPath, &cfg); err != nil {
 		t.Fatal(err)

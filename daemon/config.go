@@ -320,6 +320,17 @@ func LoadConfig(path string) (*Config, error) {
 		return nil, fmt.Errorf("parse daemon config %q: %w", path, err)
 	}
 
+	// Decode authored presence with the same YAML rules as Config, including
+	// aliases and merge keys. Null, like omission, requests the default.
+	var authored struct {
+		Capacity struct {
+			MaxConcurrentSessions *int `yaml:"maxConcurrentSessions"`
+		} `yaml:"capacity"`
+	}
+	if err := yaml.Unmarshal(data, &authored); err != nil {
+		return nil, fmt.Errorf("parse daemon capacity %q: %w", path, err)
+	}
+
 	// Apply env-var substitution on authToken.
 	if cfg.Orchestrator.AuthToken != "" {
 		cfg.Orchestrator.AuthToken = substituteEnvVars(cfg.Orchestrator.AuthToken)
@@ -332,7 +343,7 @@ func LoadConfig(path string) (*Config, error) {
 	}
 
 	normalizeProjectContract(&cfg)
-	applyDefaults(&cfg)
+	applyDefaultsWithCapacityPresence(&cfg, authored.Capacity.MaxConcurrentSessions != nil)
 	return &cfg, nil
 }
 
@@ -370,6 +381,10 @@ func WriteConfig(path string, cfg *Config) error {
 
 // applyDefaults fills in zero-valued fields with their schema defaults.
 func applyDefaults(c *Config) {
+	applyDefaultsWithCapacityPresence(c, false)
+}
+
+func applyDefaultsWithCapacityPresence(c *Config, sessionLimitAuthored bool) {
 	normalizeProjectContract(c)
 	if c.APIVersion == "" {
 		c.APIVersion = "donmai.dev/v1"
@@ -377,7 +392,7 @@ func applyDefaults(c *Config) {
 	if c.Kind == "" {
 		c.Kind = "LocalDaemon"
 	}
-	if c.Capacity.MaxConcurrentSessions == 0 {
+	if c.Capacity.MaxConcurrentSessions == 0 && !sessionLimitAuthored {
 		c.Capacity.MaxConcurrentSessions = 8
 	}
 	if c.Capacity.MaxVCpuPerSession == 0 {

@@ -1135,7 +1135,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 				if err != nil || n < 0 {
 					return fmt.Errorf("%s must be a non-negative integer, got %q", key, value)
 				}
-				// Write the value to daemon.yaml atomically via WriteDaemonYAML.
+				// Write explicit capacity intent to daemon.yaml atomically.
 				// The daemon also accepts it via HTTP; we do the local write so
 				// the config persists even if the daemon is not running.
 				yamlPath := cfgPath
@@ -1152,7 +1152,7 @@ func newDaemonSetCmd(factory daemonClientFactory) *cobra.Command {
 				case "capacity.poolMaxDiskGb":
 					cfg.Capacity.PoolMaxDiskGb = n
 				}
-				if writeErr := afclient.WriteDaemonYAML(yamlPath, cfg); writeErr != nil {
+				if writeErr := afclient.WriteDaemonYAMLWithCapacity(yamlPath, cfg, key, n); writeErr != nil {
 					return fmt.Errorf("write daemon config: %w", writeErr)
 				}
 			}

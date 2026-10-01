@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -341,31 +342,52 @@ func TestStartYamlWatcher_IgnoresUnrelatedFiles(t *testing.T) {
 	}
 }
 
-func TestOnYamlChanged_NoOpWhenAllowlistUnchanged(t *testing.T) {
+func TestOnYamlChanged_CapacityOnlyReload(t *testing.T) {
 	t.Parallel()
-
-	// Set up a Daemon with an initial projects list. The callback should
-	// short-circuit when the new config carries the same allowlist hash,
-	// regardless of other field changes.
-	d := &Daemon{
-		opts: Options{},
-		config: &Config{
-			Projects: []ProjectConfig{
-				{ID: "alpha", Repository: "github.com/x/alpha"},
-			},
-		},
+	spawner := NewWorkerSpawner(SpawnerOptions{MaxConcurrentSessions: 2})
+	d := &Daemon{config: &Config{Capacity: CapacityConfig{MaxConcurrentSessions: 2, MaxVCpuPerSession: 3}}, spawner: spawner}
+	d.onYamlChanged(&Config{Capacity: CapacityConfig{MaxConcurrentSessions: 0, MaxVCpuPerSession: 10}})
+	if got := d.MaxConcurrentSessions(); got != 0 {
+		t.Fatalf("live limit = %d, want 0", got)
 	}
-	d.onYamlChanged(&Config{
-		// Capacity changed; allowlist unchanged.
-		Capacity: CapacityConfig{MaxConcurrentSessions: 99},
-		Projects: []ProjectConfig{
-			{ID: "alpha", Repository: "github.com/x/alpha"},
-		},
-	})
+	if got := d.config.Capacity.MaxVCpuPerSession; got != 3 {
+		t.Fatalf("vCPU limit = %d, want unchanged 3", got)
+	}
+	_, err := spawner.AcceptWork(SessionSpec{SessionID: "refused-at-zero"})
+	if err == nil || !strings.Contains(err.Error(), "at capacity (0/0 sessions)") {
+		t.Fatalf("zero admission = %v, want capacity refusal", err)
+	}
+	d.onYamlChanged(&Config{Capacity: CapacityConfig{MaxConcurrentSessions: -1}})
+	if got := d.MaxConcurrentSessions(); got != 0 {
+		t.Fatalf("negative reload changed limit to %d", got)
+	}
+}
 
-	// Capacity should NOT have been hot-reloaded (out of scope for P3b).
-	if d.config.Capacity.MaxConcurrentSessions == 99 {
-		t.Error("capacity was hot-reloaded; should only reload projects[]")
+func TestDaemonStart_ExplicitZeroSessionLimit(t *testing.T) {
+	dir := t.TempDir()
+	path := filepath.Join(dir, "daemon.yaml")
+	if err := os.WriteFile(path, []byte("machine: {id: capacity-fixture}\norchestrator: {url: https://example.test}\ncapacity: {maxConcurrentSessions: 0}\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	d := New(Options{ConfigPath: path, JWTPath: filepath.Join(dir, "daemon.jwt"), SkipWizard: true, SkipRegistration: true, HTTPHost: "127.0.0.1", HTTPPort: 0})
+	ctx, cancel := context.WithCancel(context.Background())
+	t.Cleanup(cancel)
+	if err := d.Start(ctx); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		stopCtx, stopCancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer stopCancel()
+		if err := d.Stop(stopCtx); err != nil {
+			t.Errorf("stop: %v", err)
+		}
+	})
+	if got := d.MaxConcurrentSessions(); got != 0 {
+		t.Fatalf("started limit = %d, want 0", got)
+	}
+	_, err := d.spawner.AcceptWork(SessionSpec{SessionID: "refused-at-zero"})
+	if err == nil || !strings.Contains(err.Error(), "at capacity (0/0 sessions)") {
+		t.Fatalf("startup zero admission = %v, want capacity refusal", err)
 	}
 }
 

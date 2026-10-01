@@ -143,6 +143,7 @@ func TestActualProviderViewReceiptPassesV2RegistrationBeforeCredential(t *testin
 	if err := daemon.WriteConfig(configPath, &daemon.Config{
 		APIVersion: "donmai.dev/v1", Kind: "LocalDaemon", ProjectAdmissionVersion: daemon.ProjectAdmissionVersionV2,
 		ProjectAdmissionMode: daemon.ProjectAdmissionModeAllRouted, Machine: daemon.MachineConfig{ID: "actual-provider-view"},
+		Capacity:     daemon.CapacityConfig{MaxConcurrentSessions: 8},
 		Orchestrator: daemon.OrchestratorConfig{URL: "https://example.test"},
 	}); err != nil {
 		t.Fatal(err)
