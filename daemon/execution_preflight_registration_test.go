@@ -308,6 +308,7 @@ func startV2Daemon(t *testing.T, provider ProviderRegistry, store ExecutionPrefl
 		APIVersion: "donmai.dev/v1", Kind: "LocalDaemon",
 		ProjectAdmissionVersion: ProjectAdmissionVersionV2,
 		ProjectAdmissionMode:    ProjectAdmissionModeAllRouted,
+		Capacity:                CapacityConfig{MaxConcurrentSessions: 8},
 		Machine:                 MachineConfig{ID: "preflight-registration-machine"},
 		Orchestrator:            OrchestratorConfig{URL: "https://example.test"},
 	}); err != nil {
