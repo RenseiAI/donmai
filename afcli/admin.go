@@ -876,12 +876,17 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 		}
 		return result, fmt.Errorf("read dir %s: %w", worktreePath, err)
 	}
+	cleanupRoot, err := os.OpenRoot(worktreePath)
+	if err != nil {
+		return result, fmt.Errorf("open cleanup root %s: %w", worktreePath, err)
+	}
+	defer func() { _ = cleanupRoot.Close() }()
 
 	knownWorktrees, _ := gitWorktrees()
 
 	var leaseStore *workarea.LeaseStore
 	leaseDir := filepath.Join(worktreePath, ".terminal-leases")
-	if info, statErr := os.Stat(leaseDir); statErr == nil && info.IsDir() {
+	if info, statErr := cleanupRoot.Stat(".terminal-leases"); statErr == nil && info.IsDir() {
 		leaseStore, err = workarea.NewLeaseStore(workarea.StoreOptions{Dir: leaseDir})
 		if err != nil {
 			return result, fmt.Errorf("open terminal lease store: %w", err)
@@ -942,12 +947,19 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 		}
 
 		// Safety: refuse to remove the main working tree (where .git is a dir)
-		dotGit := filepath.Join(entryPath, ".git")
-		fi, statErr := os.Stat(dotGit)
+		fi, statErr := cleanupRoot.Stat(filepath.Join(entry.Name(), ".git"))
 		if statErr == nil && fi.IsDir() {
 			result.Errors = append(result.Errors, WorktreeError{
 				Path:  entryPath,
 				Error: "SAFETY: .git is a directory — refusing to remove main working tree",
+			})
+			result.Skipped++
+			continue
+		}
+		if statErr != nil && !os.IsNotExist(statErr) {
+			result.Errors = append(result.Errors, WorktreeError{
+				Path:  entryPath,
+				Error: fmt.Sprintf("SAFETY: .git metadata check failed: %v", statErr),
 			})
 			result.Skipped++
 			continue
@@ -968,20 +980,12 @@ func runWorktreeCleanup(_ context.Context, worktreePath string, dryRun, force bo
 		}
 	}
 
-	// Prune git metadata
-	if !dryRun {
-		_ = exec.Command("git", "worktree", "prune").Run()
-	}
-
 	return result, nil
 }
 
 // runBranchCleanup deletes merged (and optionally gone) local branches.
 func runBranchCleanup(_ context.Context, dryRun, force bool) (BranchCleanResult, error) {
 	result := BranchCleanResult{}
-
-	// Prune stale worktree metadata so locked branches can be deleted
-	_ = exec.Command("git", "worktree", "prune").Run()
 
 	// Determine base branch
 	var baseBranch string
