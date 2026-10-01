@@ -812,6 +812,9 @@ const envDaemonShimHelperStartDelayMS = "DONMAI_TEST_SHIM_HELPER_START_DELAY_MS"
 // opposite, a worker that dies before publishing anything.
 const envDaemonShimHelperNeverPublishMS = "DONMAI_TEST_SHIM_HELPER_NEVER_PUBLISH_MS"
 
+// Linux installs a failure-only numeric snapshot; other platforms do nothing.
+var shimPTYFailureDiagnostic = func(error) {}
+
 func runDaemonShimHelper() int {
 	launch, err := sessionshim.LaunchFromEnv(os.Getenv)
 	if err != nil {
@@ -839,6 +842,7 @@ func runDaemonShimHelper() int {
 	shim, err := sessionshim.StartFromEnv(launch,
 		ptyhost.Spec{Command: []string{"/bin/sh", "-c", interactiveFixture}}, workarea)
 	if err != nil {
+		shimPTYFailureDiagnostic(err)
 		fmt.Fprintln(os.Stderr, "daemon shim helper: start:", err)
 		return 1
 	}
