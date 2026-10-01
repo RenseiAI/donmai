@@ -181,11 +181,17 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	identity = truncateWidth(identity, inner)
 	state = truncateWidth(state, inner)
 	scope = truncateWidth(scope, inner)
+	// Give tool activity a full metric row instead of growing the card.
+	// Elapsed time shares the work-freshness row in the styled view.
+	metrics = "tools " + countStr(card.Observed, card.ToolCalls)
+	if ticker != "" {
+		metrics += " · " + ticker
+	}
+	workFresh = "elapsed " + elapsedStr(card, now) + " · " + workFresh
 	metrics = truncateWidth(metrics, inner)
 	cost = truncateWidth(cost, inner)
 	fresh = truncateWidth(fresh, inner)
 	workFresh = truncateWidth(workFresh, inner)
-	ticker = truncateWidth(ticker, inner)
 
 	sc := statusColor(t, card)
 	dotStyle := lipgloss.NewStyle().Foreground(sc)
@@ -193,7 +199,6 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 	workStyle := lipgloss.NewStyle().Foreground(t.TextSecondary)
 	chipStyle := lipgloss.NewStyle().Foreground(t.TextSecondary)
 	metricStyle := lipgloss.NewStyle().Foreground(t.TextPrimary)
-	tickStyle := lipgloss.NewStyle().Foreground(t.TextTertiary)
 
 	lines := []string{
 		dotStyle.Render(dot) + " " + headStyle.Render(header) + "  " + workStyle.Render(work),
@@ -218,9 +223,7 @@ func renderCard(t theme.Theme, card SessionCard, frame int, selected, plain bool
 		chipStyle.Render(truncateWidth(endpointSurface+" · "+safeAxisText(card.Protocol), inner)),
 		chipStyle.Render(actualProvider), chipStyle.Render(modelIdentity), chipStyle.Render(modelVersion),
 		chipStyle.Render(agentCard), chipStyle.Render(cardID))
-	if ticker != "" {
-		lines = append(lines, tickStyle.Render(ticker))
-	}
+
 	body := lipgloss.JoinVertical(lipgloss.Left, lines...)
 
 	borderColor := t.SurfaceBorder
@@ -436,6 +439,7 @@ func safeIdentityText(s string) string {
 // safeAxisText accepts only compact identifiers on the new display axes.
 // A malformed value cannot turn the card into a URL or credential display.
 func safeAxisText(s string) string {
+	s = safeIdentityText(s)
 	if len(s) == 0 || len(s) > 64 {
 		return "unknown"
 	}

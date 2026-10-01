@@ -301,3 +301,23 @@ func TestCompactAxesKeepIdentityAndMetricsInDefaultSplit(t *testing.T) {
 		}
 	}
 }
+
+func TestTwoActiveCardsRetainIdentityInDefaultSplit(t *testing.T) {
+	cards := []SessionCard{{SessionID: "rich", IssueIdentifier: "CARD-1", ProjectName: "alpha", DaemonState: "running", AgentCardID: "card-review", AgentCardName: "Reviewer", Observed: true, ToolCalls: 2, LastActivity: "Read fixture.txt"}, {SessionID: "legacy-identity", ProjectName: "beta", DaemonState: "running"}}
+	grid := renderGrid(theme.DefaultTheme(), cards, 0, 0, 180, 17, false, time.Now())
+	for _, want := range []string{"legacy-i", "Card ID card-review", "Read fixture.txt", "tools 2"} {
+		if !strings.Contains(grid, want) {
+			t.Fatalf("activity row clipped %q: %s", want, grid)
+		}
+	}
+}
+
+func TestResponseProviderStripsControlsBeforeAxisValidation(t *testing.T) {
+	card := SessionCard{SessionID: "s", ActualModelProvider: "actual\x1b]0;BAD-TITLE\a-vendor"}
+	for _, plain := range []bool{false, true} {
+		out := renderCard(theme.DefaultTheme(), card, 0, true, plain, time.Now())
+		if !strings.Contains(out, "Actual provider actual-vendor") || strings.Contains(out, "BAD-TITLE") {
+			t.Fatalf("native identity sanitation lost: %s", out)
+		}
+	}
+}
