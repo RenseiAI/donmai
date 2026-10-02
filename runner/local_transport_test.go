@@ -167,7 +167,7 @@ func TestControllerTransportKeepsImplicitGateway(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	qw := QueuedWork{PlatformURL: "https://controller.example", AuthToken: "synthetic"}
+	qw := QueuedWork{PlatformURL: "https://controller.example", AuthToken: "synthetic", McpAuthToken: "synthetic-session"}
 	qw.SessionID = "session"
 	actual := defaultMCPServersForHarness(qw, "/runtime/worktree", provider, agent.PromptModeAutonomous)
 	prepared := defaultMCPServersForHarness(materializeRuntimeAuthority(qw), "/runtime/worktree", provider, agent.PromptModeAutonomous)

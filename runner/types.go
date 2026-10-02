@@ -122,10 +122,10 @@ type QueuedWork struct {
 	// bearer for heartbeat, result-post, activity-post, and the session
 	// preflight fetch; the two are not interchangeable in either direction.
 	//
-	// Empty means the platform minted none (self-hosted, or one that predates
-	// the field), in which case the gateway falls back to AuthToken — see
-	// mcpGatewayBearer. That fallback is the standalone contract, not a
-	// migration shim.
+	// Empty means the platform minted none, which is a degraded mint: the
+	// gateway is omitted and the condition is surfaced (see mcpGatewayBearer
+	// and isMCPGatewayDegradedMint). The worker bearer is never substituted
+	// for MCP calls.
 	//
 	// `json:"-"` mirrors AuthToken deliberately: QueuedWork is re-unmarshalled
 	// from OperationalPayload and serialized onto other payloads, and a bearer

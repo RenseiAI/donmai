@@ -117,6 +117,7 @@ func TestCodeIntel_AbsentBlock_SpecByteIdentical(t *testing.T) {
 	gated.SessionID = "s"
 	gated.PlatformURL = "https://p.test"
 	gated.AuthToken = "rsk"
+	gated.McpAuthToken = "sess_test"
 	if servers := defaultMCPServersForHarness(gated, "/tmp/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous); len(servers) != 1 {
 		t.Errorf("absent block must not append a code-intel MCP entry; got %+v", servers)
 	}
@@ -250,6 +251,7 @@ func TestDefaultMCPServers_AppendsCodeIntelAfterPlatformGate(t *testing.T) {
 	qw.SessionID = "sess_abc"
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
 
 	root := "/abs/worktrees/sess_abc"
@@ -356,6 +358,7 @@ func TestDefaultMCPServersForHarness_ImplicitGatewayFollowsDeclaredMCPDelivery(t
 			qw.SessionID = "sess_" + tc.name
 			qw.PlatformURL = "https://platform.example.com"
 			qw.AuthToken = "rsk_test"
+			qw.McpAuthToken = "sess_test"
 			root := "/abs/worktrees/" + qw.SessionID
 
 			adapt := func(servers []agent.MCPServerConfig) (agent.ToolLifecycleReceipt, error) {
@@ -492,6 +495,7 @@ func TestDefaultMCPServers_NoBlockIsUnchanged(t *testing.T) {
 	gated.SessionID = "sess_x"
 	gated.PlatformURL = "https://platform.example.com"
 	gated.AuthToken = "rsk_test"
+	gated.McpAuthToken = "sess_test"
 	servers := defaultMCPServersForHarness(gated, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 || servers[0].Name != "donmai-platform" {
 		t.Errorf("no-block platform session must emit only the gate; got %+v", servers)
@@ -514,6 +518,7 @@ func TestMergeMCPServers_CodeIntelDefaultWinsOnCollision(t *testing.T) {
 	qw.SessionID = "sess_abc"
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 	qw.CodeIntel = &prompt.CodeIntelWork{Repo: "owner/repo"}
 	qw.McpServers = []agent.MCPServerConfig{
 		// A hostile/stale card entry trying to shadow the in-box code-intel entry.
@@ -598,6 +603,7 @@ func TestBuildPreparedSourceSpec_OmitsImplicitGatewayWithoutMCPDelivery(t *testi
 	qw := QueuedWork{QueuedWork: queuedWorkBase("PREPARED-NO-MCP")}
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 
 	spec, runtimeNames, err := buildPreparedSourceSpec(qw, harnessSelection{Provider: provider}, nil)
 	if err != nil {

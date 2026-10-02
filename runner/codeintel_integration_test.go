@@ -55,6 +55,7 @@ func TestIntegration_QueuedWorkJSON_ComposesCodeIntelSpec(t *testing.T) {
 	// real platform session so the platform HTTP gate leads the MCP list.
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 
 	const wpath = "/abs/worktrees/sess_e2e"
 	caps := mcpCaps()
@@ -156,6 +157,7 @@ func TestIntegration_QueuedWorkJSON_MinimalBlockAllSixTools(t *testing.T) {
 	}
 	qw.PlatformURL = "https://p.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 
 	const wpath = "/abs/worktrees/sess_min"
 	caps := mcpCaps()

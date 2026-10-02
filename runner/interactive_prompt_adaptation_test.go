@@ -617,9 +617,10 @@ for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' 
 		t.Fatal(err)
 	}
 	const token = "RUNNER_MCP_SECRET_DO_NOT_PUT_IN_ARGV"
+	const workerToken = "RUNNER_WORKER_SECRET_DO_NOT_PUT_IN_MCP"
 	qw := QueuedWork{
 		QueuedWork: prompt.QueuedWork{SessionID: "codex-default-mcp", IssueID: "issue", IssueIdentifier: "ISSUE-CODEX", WorkType: "development", Mode: prompt.InteractiveRunMode, InitialPrompt: "test", Repository: makeBareRepo(t)},
-		WorkerID:   "w", AuthToken: token, PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderCodex},
+		WorkerID:   "w", AuthToken: workerToken, McpAuthToken: token, PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderCodex},
 	}
 	got, err := runner.Run(context.Background(), qw)
 	if err != nil || got.Status != "completed" {
@@ -629,7 +630,7 @@ for key in OPENAI_API_KEY CODEX_API_KEY CODEX_ACCESS_TOKEN; do printf '%s=%s\n' 
 	if err != nil {
 		t.Fatal(err)
 	}
-	if !strings.Contains(string(argv), "mcp_servers=") || !strings.Contains(string(argv), "/api/mcp/codex-default-mcp") || strings.Contains(string(argv), token) {
+	if !strings.Contains(string(argv), "mcp_servers=") || !strings.Contains(string(argv), "/api/mcp/codex-default-mcp") || strings.Contains(string(argv), token) || strings.Contains(string(argv), workerToken) {
 		t.Fatalf("Codex argv did not carry a secret-free default HTTP MCP override: %s", argv)
 	}
 	childEnv, err := os.ReadFile(filepath.Join(provider.raw.Cwd, "codex-mcp-env"))

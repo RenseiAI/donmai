@@ -773,9 +773,11 @@ func TestShouldBackstop_SkipsBlocked(t *testing.T) {
 }
 
 // TestDefaultMCPServers_EmitsHTTPEntryPerSession pins the A2A per-session
-// MCP wire-up: when QueuedWork has PlatformURL + AuthToken + SessionID,
+// MCP wire-up: when QueuedWork has PlatformURL + session bearer + SessionID,
 // defaultMCPServers emits a single HTTP entry pointing at the platform's
-// /api/mcp/<sessionId> route with the worker bearer in Authorization.
+// /api/mcp/<sessionId> route with the session-scoped bearer in Authorization.
+// The worker bearer is present on the work item (it authenticates heartbeat /
+// result-post) and must not appear in the gateway header.
 func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	t.Parallel()
 
@@ -783,6 +785,7 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	qw.SessionID = "sess_abc"
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 
 	servers := defaultMCPServersForHarness(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 {
@@ -801,7 +804,7 @@ func TestDefaultMCPServers_EmitsHTTPEntryPerSession(t *testing.T) {
 	if got.URL != "https://platform.example.com/api/mcp/sess_abc" {
 		t.Errorf("url=%q", got.URL)
 	}
-	if got.Headers["Authorization"] != "Bearer rsk_test" {
+	if got.Headers["Authorization"] != "Bearer sess_test" {
 		t.Errorf("auth header=%q", got.Headers["Authorization"])
 	}
 }
@@ -815,6 +818,7 @@ func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
 	qw.SessionID = "sess_xyz"
 	qw.PlatformURL = "https://platform.example.com/"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 
 	servers := defaultMCPServersForHarness(qw, "/abs/wt", mcpDeliveringHarness(), agent.PromptModeAutonomous)
 	if len(servers) != 1 {
@@ -826,8 +830,9 @@ func TestDefaultMCPServers_TrimsTrailingSlash(t *testing.T) {
 }
 
 // TestDefaultMCPServers_OmitsWhenStandalone pins the back-compat path:
-// in standalone mode (no PlatformURL or no AuthToken), no MCP entry is
-// emitted at all and the agent runs without the per-session gate.
+// in standalone mode (no PlatformURL or no session bearer), no MCP entry is
+// emitted at all and the agent runs without the per-session gate. The worker
+// bearer alone never mounts a gateway.
 func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 	t.Parallel()
 
@@ -836,18 +841,19 @@ func TestDefaultMCPServers_OmitsWhenStandalone(t *testing.T) {
 		qw   QueuedWork
 	}{
 		{"no PlatformURL", func() QueuedWork {
-			qw := QueuedWork{AuthToken: "rsk_test"}
+			qw := QueuedWork{AuthToken: "rsk_test", McpAuthToken: "sess_test"}
 			qw.SessionID = "sess_1"
 			return qw
 		}()},
-		{"no AuthToken", func() QueuedWork {
-			qw := QueuedWork{PlatformURL: "https://platform.example.com"}
+		{"no session bearer", func() QueuedWork {
+			qw := QueuedWork{PlatformURL: "https://platform.example.com", AuthToken: "rsk_test"}
 			qw.SessionID = "sess_1"
 			return qw
 		}()},
 		{"no SessionID", QueuedWork{
-			PlatformURL: "https://platform.example.com",
-			AuthToken:   "rsk_test",
+			PlatformURL:  "https://platform.example.com",
+			AuthToken:    "rsk_test",
+			McpAuthToken: "sess_test",
 		}},
 	}
 	for _, tc := range cases {
@@ -871,6 +877,7 @@ func TestMergeMCPServers_RetainsPlatformGate(t *testing.T) {
 	qw.SessionID = "sess_abc"
 	qw.PlatformURL = "https://platform.example.com"
 	qw.AuthToken = "rsk_test"
+	qw.McpAuthToken = "sess_test"
 	qw.McpServers = []agent.MCPServerConfig{
 		{Name: "card-linear", Type: "stdio", Command: "pnpm", Args: []string{"af-linear"}},
 		{Name: "card-remote", Type: "http", URL: "https://card.test/mcp"},
