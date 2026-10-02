@@ -42,6 +42,13 @@ func (p *promptCaptureInteractiveProvider) Capabilities() agent.Capabilities {
 	return p.caps
 }
 
+// Manifest exposes the fixture's production manifest so the runner's
+// manifest-derived gates (the argv-seed initial-prompt ceiling) read the
+// same declaration Spawn compiles against.
+func (p *promptCaptureInteractiveProvider) Manifest() agent.HarnessManifest {
+	return p.manifest
+}
+
 func (p *promptCaptureInteractiveProvider) Spawn(_ context.Context, spec agent.Spec) (agent.Handle, error) {
 	p.raw = spec
 	adapted, err := agent.PreparePrompt(spec, p.manifest)
@@ -678,6 +685,8 @@ func TestRun_InteractiveInitialPromptOversizeFailsBeforeProviderSpawn(t *testing
 	}
 	// The direct dispatch test keeps its defensive boundary; this regression
 	// proves the real Runner.Run path rejects before Provider.Spawn or receipt.
+	// The claude harness carries its seed as a spawned argv element, so the
+	// Run-path gate enforces the wider argv ceiling here.
 	provider := &promptCaptureInteractiveProvider{
 		name: agent.ProviderClaude, caps: (&claude.Provider{}).Capabilities(), manifest: (&claude.Provider{}).Manifest(),
 	}
@@ -702,7 +711,7 @@ func TestRun_InteractiveInitialPromptOversizeFailsBeforeProviderSpawn(t *testing
 	qw := QueuedWork{
 		QueuedWork: prompt.QueuedWork{
 			SessionID: "oversize", IssueID: "issue", IssueIdentifier: "ISSUE-2", WorkType: "development",
-			Mode: prompt.InteractiveRunMode, InitialPrompt: string(make([]byte, maxInitialPromptBytes+1)), Repository: makeBareRepo(t),
+			Mode: prompt.InteractiveRunMode, InitialPrompt: string(make([]byte, maxArgvSeedPromptBytes+1)), Repository: makeBareRepo(t),
 		},
 		WorkerID: "w", AuthToken: "t", PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: agent.ProviderClaude},
 	}
@@ -713,6 +722,89 @@ func TestRun_InteractiveInitialPromptOversizeFailsBeforeProviderSpawn(t *testing
 	if provider.raw.PromptPlan != nil || provider.session != nil {
 		t.Fatal("provider Spawn ran for oversized InitialPrompt")
 	}
+}
+
+// TestRun_InteractiveInitialPromptArgvSeedAdmitsCoordinatorBrief proves the
+// reported defect end to end on the Runner.Run path: a 3,240-byte initial
+// prompt reaches Provider.Spawn on an argv-seeded harness (claude) instead
+// of failing pre-spawn, while the same Run path still gates a PTY-seed
+// harness (shell) at the 1,023-byte canonical-mode bound.
+func TestRun_InteractiveInitialPromptArgvSeedAdmitsCoordinatorBrief(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	brief := strings.Repeat("coordinator-brief-", 180) // 3,240 bytes: the observed failing size
+	if len(brief) <= maxInitialPromptBytes || len(brief) > maxArgvSeedPromptBytes {
+		t.Fatalf("test brief is %d bytes; want between %d and %d", len(brief), maxInitialPromptBytes, maxArgvSeedPromptBytes)
+	}
+	newRunHarness := func(t *testing.T, name agent.ProviderName, caps agent.Capabilities, manifest agent.HarnessManifest) (*Runner, *promptCaptureInteractiveProvider) {
+		t.Helper()
+		provider := &promptCaptureInteractiveProvider{name: name, caps: caps, manifest: manifest}
+		registry := NewRegistry()
+		if err := registry.Register(provider); err != nil {
+			t.Fatal(err)
+		}
+		server := mockPlatformServer(t)
+		t.Cleanup(server.Close)
+		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir()})
+		if err != nil {
+			t.Fatal(err)
+		}
+		poster, err := result.NewPoster(result.Options{PlatformURL: server.URL, WorkerID: "w", AuthToken: "t", HTTPClient: server.Client(), BaseDelay: 1})
+		if err != nil {
+			t.Fatal(err)
+		}
+		runner, err := New(Options{Registry: registry, WorktreeManager: manager, Poster: poster, HTTPClient: server.Client(), PreserveWorktreeAlways: true, SkipBackstop: true, SkipSteering: true, SkipPostSession: true})
+		if err != nil {
+			t.Fatal(err)
+		}
+		return runner, provider
+	}
+	makeQW := func(t *testing.T, sessionID string, provider agent.ProviderName) QueuedWork {
+		t.Helper()
+		server := mockPlatformServer(t)
+		t.Cleanup(server.Close)
+		return QueuedWork{
+			QueuedWork: prompt.QueuedWork{
+				SessionID: sessionID, IssueID: "issue", IssueIdentifier: "ISSUE-2", WorkType: "development",
+				Mode: prompt.InteractiveRunMode, InitialPrompt: brief, Repository: makeBareRepo(t),
+			},
+			WorkerID: "w", AuthToken: "t", PlatformURL: server.URL, ResolvedProfile: ResolvedProfile{Provider: provider},
+		}
+	}
+
+	t.Run("argv seed spawns", func(t *testing.T) {
+		runner, provider := newRunHarness(t, agent.ProviderClaude, (&claude.Provider{}).Capabilities(), (&claude.Provider{}).Manifest())
+		got, err := runner.Run(context.Background(), makeQW(t, "brief-argv", agent.ProviderClaude))
+		if err != nil {
+			t.Fatalf("Run: %v", err)
+		}
+		if got.Status != "completed" {
+			t.Fatalf("Run status = %q error=%q; want completed for argv-carried brief", got.Status, got.Error)
+		}
+		if provider.raw.Prompt != brief {
+			t.Fatal("provider Spawn did not receive the coordinator brief")
+		}
+	})
+
+	t.Run("pty seed still gated at the canonical bound", func(t *testing.T) {
+		shellProvider, err := shellprovider.New()
+		if err != nil {
+			t.Fatalf("shell.New: %v", err)
+		}
+		runner, provider := newRunHarness(t, agent.ProviderShell, shellProvider.Capabilities(), shellProvider.Manifest())
+		provider.manifest = shellProvider.Manifest()
+		got, runErr := runner.Run(context.Background(), makeQW(t, "brief-pty", agent.ProviderShell))
+		if runErr == nil || got.FailureMode != FailureInteractiveInput {
+			t.Fatalf("Run result=%+v err=%v, want pre-spawn interactive-input failure", got, runErr)
+		}
+		if !strings.Contains(got.Error, fmt.Sprintf("limit is %d bytes", maxInitialPromptBytes)) {
+			t.Fatalf("result error = %q, want the PTY-seed limit", got.Error)
+		}
+		if provider.raw.PromptPlan != nil || provider.session != nil {
+			t.Fatal("provider Spawn ran for an oversize PTY-seed prompt")
+		}
+	})
 }
 
 func TestRun_ShellExecutesOnlyExplicitUserSeed(t *testing.T) {

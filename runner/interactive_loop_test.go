@@ -659,6 +659,11 @@ func TestInteractive_InitialPromptContract(t *testing.T) {
 	}
 }
 
+// TestInteractive_InitialPromptOversizeFailsBeforeWrite keeps the
+// conservative PTY-seed ceiling for direct dispatch callers that pass no
+// explicit limit: a 21KB seed fails with the 1,023-byte limit and zero
+// writes. The argv-seeded widening lives behind an explicit
+// initialPromptLimit (see the argv tests below), never the default.
 func TestInteractive_InitialPromptOversizeFailsBeforeWrite(t *testing.T) {
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
@@ -703,6 +708,119 @@ func TestInteractive_InitialPromptOversizeFailsBeforeWrite(t *testing.T) {
 		if system, ok := ev.(agent.SystemEvent); ok && system.Subtype == "interactive-initial-prompt-delivered" {
 			t.Fatal("delivery activity emitted for rejected oversize prompt")
 		}
+	}
+}
+
+// TestInteractiveInitialPromptLimit locks the harness-declared ceiling
+// selector: PTY-seed deliveries (shell, stub) and unknown/absent profiles
+// keep the 1,023-byte canonical-mode bound, while the argv-carried seeds
+// (claude, codex, pi) take the wider 32 KiB ceiling.
+func TestInteractiveInitialPromptLimit(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		manifest agent.HarnessManifest
+		want     int
+	}{
+		{
+			name:     "shell PTY seed keeps the canonical bound",
+			manifest: (&shell.Provider{}).Manifest(),
+			want:     maxInitialPromptBytes,
+		},
+		{
+			name: "unknown delivery falls back to the canonical bound",
+			manifest: agent.HarnessManifest{PromptDelivery: []agent.PromptDeliveryProfile{{
+				ID: "test/human-controlled", Mode: agent.PromptModeHumanControlled,
+				UserDelivery: agent.PromptDeliveryKind("future-kind"),
+			}}},
+			want: maxInitialPromptBytes,
+		},
+		{
+			name:     "no human-controlled profile falls back to the canonical bound",
+			manifest: agent.HarnessManifest{},
+			want:     maxInitialPromptBytes,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			if got := interactiveInitialPromptLimit(tt.manifest); got != tt.want {
+				t.Fatalf("interactiveInitialPromptLimit = %d, want %d", got, tt.want)
+			}
+		})
+	}
+}
+
+// TestInteractive_InitialPromptArgvLimitAdmitsCoordinatorBrief proves the
+// reported defect is closed on the argv path: a 3,237-byte initial prompt
+// (the observed failing size) passes the manifest-derived ceiling when the
+// harness carries its seed as a spawned argv element, while a seed past
+// the 32 KiB argv ceiling still fails before any PTY write.
+func TestInteractive_InitialPromptArgvLimitAdmitsCoordinatorBrief(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	seed := strings.Repeat("brief-bytes-", 270) // 3,240 bytes: past 1,023, under 32 KiB
+	if len(seed) <= maxInitialPromptBytes || len(seed) >= maxArgvSeedPromptBytes {
+		t.Fatalf("test seed is %d bytes; want between %d and %d", len(seed), maxInitialPromptBytes, maxArgvSeedPromptBytes)
+	}
+
+	session := completedRecordingInteractiveSession()
+	handle := &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: session,
+	}
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID:     "seed-argv-brief",
+		Mode:          interactiveRunMode,
+		InitialPrompt: seed,
+	}}
+
+	out, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil, nil,
+		agent.NoticeDeliveryPTYNotice, maxArgvSeedPromptBytes,
+	)
+	if err != nil {
+		t.Fatalf("dispatchInteractive with argv limit: %v", err)
+	}
+	if out.Status != "completed" {
+		t.Fatalf("status=%q error=%q; want completed for argv-carried seed", out.Status, out.Error)
+	}
+	assertNoInitialPromptReplay(t, session, seed)
+
+	// Past the argv ceiling the same dispatch still fails before any
+	// write, with the argv limit (not the 1,023-byte PTY bound) in the
+	// error — the argv path widens the ceiling, it does not remove it.
+	oversize := strings.Repeat("x", maxArgvSeedPromptBytes+1)
+	oversizeSession := completedRecordingInteractiveSession()
+	oversizeHandle := &testInteractiveHandle{
+		Handle:  &fakeHandle{events: make(chan agent.Event)},
+		session: oversizeSession,
+	}
+	oversizeQW := QueuedWork{QueuedWork: prompt.QueuedWork{
+		SessionID:     "seed-argv-oversize",
+		Mode:          interactiveRunMode,
+		InitialPrompt: oversize,
+	}}
+	oversizeOut, oversizeErr := minimalRunner(t).dispatchInteractive(
+		context.Background(), oversizeHandle, t.TempDir(), oversizeQW, &Result{SessionID: oversizeQW.SessionID},
+		&recordingSink{}, nil, nil, agent.NoticeDeliveryPTYNotice, maxArgvSeedPromptBytes,
+	)
+	if oversizeErr == nil {
+		t.Fatal("expected argv-ceiling failure for a seed past 32 KiB")
+	}
+	if oversizeOut.Status != "failed" || oversizeOut.FailureMode != FailureInteractiveInput {
+		t.Fatalf("status=%q mode=%q; want failed/%s", oversizeOut.Status, oversizeOut.FailureMode, FailureInteractiveInput)
+	}
+	if got := oversizeSession.writeCount(); got != 0 {
+		t.Fatalf("oversize argv seed wrote %d time(s), want 0", got)
+	}
+	if !strings.Contains(oversizeOut.Error, fmt.Sprintf("limit is %d bytes", maxArgvSeedPromptBytes)) {
+		t.Fatalf("result error = %q, want the argv limit", oversizeOut.Error)
+	}
+	if strings.Contains(oversizeOut.Error, oversize) {
+		t.Fatalf("result error leaked prompt content: %q", oversizeOut.Error)
 	}
 }
 
