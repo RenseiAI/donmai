@@ -130,7 +130,13 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 		argv = append(argv, "--max-turns", strconv.Itoa(*spec.MaxTurns))
 	}
 
-	if spec.Effort != "" {
+	// Effort is emitted only when it is a level Claude recognises: an
+	// unrecognised stored value (e.g. another harness's "none" or
+	// "minimal") would be silently ignored by the CLI, which then falls
+	// back to the operator's saved level while the session records a
+	// different one. Omitting the flag lets the effort env var (effort.go)
+	// carry the model default instead.
+	if spec.Effort.Known() {
 		argv = append(argv, "--effort", string(spec.Effort))
 	}
 
