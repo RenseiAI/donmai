@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.60 — 2026-10-02
+
 ### Fixes
 
 - Interactive initial prompts up to 32 KiB now spawn on harnesses that
