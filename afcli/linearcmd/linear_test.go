@@ -1290,9 +1290,13 @@ func TestLinearListIssues(t *testing.T) {
 		t.Fatalf("list-issues failed: %v\nout: %s", err, out)
 	}
 
-	arr := decodeJSONArray(t, out)
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
 	if len(arr) != 2 {
 		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	if env["truncated"] != false || env["limit"] != float64(50) {
+		t.Fatalf("envelope = truncated %v limit %v, want false/50", env["truncated"], env["limit"])
 	}
 	first := arr[0].(map[string]any)
 	second := arr[1].(map[string]any)
@@ -1332,9 +1336,13 @@ func TestLinearListIssuesManualOrderPreservesNativeOrder(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list-issues manual failed: %v\nout: %s", err, out)
 	}
-	arr := decodeJSONArray(t, out)
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
 	if len(arr) != 2 {
 		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	if env["truncated"] != false {
+		t.Fatalf("truncated = %v, want false for an exhausted connection", env["truncated"])
 	}
 	first := arr[0].(map[string]any)
 	second := arr[1].(map[string]any)
@@ -1390,9 +1398,13 @@ func TestLinearListIssuesKeepsLegacyPriorityOrderByDefault(t *testing.T) {
 	if err != nil {
 		t.Fatalf("list-issues default failed: %v\nout: %s", err, out)
 	}
-	arr := decodeJSONArray(t, out)
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
 	if len(arr) != 2 || arr[0].(map[string]any)["id"] != "ENG-1" || arr[1].(map[string]any)["id"] != "ENG-2" {
 		t.Fatalf("default priority order = %#v", arr)
+	}
+	if env["truncated"] != false {
+		t.Fatalf("truncated = %v, want false for an exhausted connection", env["truncated"])
 	}
 	if listVariables["orderBy"] != "createdAt" || listVariables["sort"] != nil {
 		t.Fatalf("default GraphQL order = %#v, want createdAt without manual sort", listVariables)
@@ -1446,9 +1458,81 @@ func TestLinearListIssuesPaginatesLargeLimitWithoutChangingJSONArray(t *testing.
 	if err != nil {
 		t.Fatalf("list-issues failed: %v\nout: %s", err, out)
 	}
-	arr := decodeJSONArray(t, out)
+	env := decodeJSON(t, out)
+	arr, _ := env["issues"].([]any)
 	if len(arr) != 2 || request != 2 {
 		t.Fatalf("output/request count = %d/%d, want 2/2", len(arr), request)
+	}
+	if env["truncated"] != false || env["limit"] != float64(300) {
+		t.Fatalf("envelope = truncated %v limit %v, want false/300", env["truncated"], env["limit"])
+	}
+}
+
+func TestLinearListIssuesTruncationMarkerAndWarning(t *testing.T) {
+	issue1 := issueNodeJSON("issue-1", "ENG-1", "First", "Backlog", "team-1", "ENG", "Engineering")
+	issue2 := issueNodeJSON("issue-2", "ENG-2", "Second", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Query     string         `json:"query"`
+			Variables map[string]any `json:"variables"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			t.Fatalf("decode request: %v", err)
+		}
+		if !strings.Contains(req.Query, "ListIssues") {
+			writeLinearGQLData(w, `{}`)
+			return
+		}
+		// Two rows fill the --limit of 2 while another page remains.
+		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s,%s],"pageInfo":{"hasNextPage":true,"endCursor":"page-1"}}}`, issue1, issue2))
+	})
+
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"list-issues", "--limit", "2"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("list-issues failed: %v", err)
+	}
+	env := decodeJSON(t, stdout.String())
+	arr, _ := env["issues"].([]any)
+	if len(arr) != 2 {
+		t.Fatalf("got %d issues, want 2", len(arr))
+	}
+	if env["truncated"] != true {
+		t.Fatalf("truncated = %v, want true when the limit stops the walk with pages remaining", env["truncated"])
+	}
+	if env["limit"] != float64(2) {
+		t.Fatalf("limit = %v, want 2", env["limit"])
+	}
+	if warning := stderr.String(); !strings.Contains(warning, "--limit") || !strings.Contains(warning, "more matching issues exist") {
+		t.Fatalf("stderr warning = %q, want a loud --limit truncation warning", warning)
+	}
+}
+
+func TestLinearListIssuesNoWarningWhenExhausted(t *testing.T) {
+	issue1 := issueNodeJSON("issue-1", "ENG-1", "First", "Backlog", "team-1", "ENG", "Engineering")
+	setupLinearTest(t, func(w http.ResponseWriter, _ *http.Request) {
+		writeLinearGQLData(w, fmt.Sprintf(`{"issues":{"nodes":[%s],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`, issue1))
+	})
+
+	root := New(nil, "donmai")
+	root.SilenceErrors = true
+	var stdout, stderr bytes.Buffer
+	root.SetOut(&stdout)
+	root.SetErr(&stderr)
+	root.SetArgs([]string{"list-issues", "--limit", "2"})
+	if err := root.Execute(); err != nil {
+		t.Fatalf("list-issues failed: %v", err)
+	}
+	env := decodeJSON(t, stdout.String())
+	if env["truncated"] != false {
+		t.Fatalf("truncated = %v, want false for an exhausted connection", env["truncated"])
+	}
+	if warning := stderr.String(); warning != "" {
+		t.Fatalf("stderr = %q, want silence when nothing was truncated", warning)
 	}
 }
 
@@ -2781,10 +2865,10 @@ func (s *blockerLookupLimitStub) GetProjectByName(context.Context, string) (*lin
 	return &linear.Project{ID: "proj-1"}, nil
 }
 
-func (s *blockerLookupLimitStub) ListIssues(_ context.Context, filter map[string]any, limit int, _ string) ([]linear.Issue, error) {
+func (s *blockerLookupLimitStub) ListIssues(_ context.Context, filter map[string]any, limit int, _ string) (*linear.IssueListResult, error) {
 	s.limit = limit
 	s.filter = filter
-	return make([]linear.Issue, limit), nil // a full limit cannot prove the final page
+	return &linear.IssueListResult{Issues: make([]linear.Issue, limit), Truncated: true}, nil // a full limit cannot prove the final page
 }
 
 func TestFindReusableBlockerFailsClosedAtCandidateLimit(t *testing.T) {

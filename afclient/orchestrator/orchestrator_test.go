@@ -57,7 +57,7 @@ func (m *mockLinear) ListSubIssues(_ context.Context, _ string) ([]linear.Issue,
 	return nil, nil
 }
 
-func (m *mockLinear) ListIssues(_ context.Context, _ map[string]any, _ int, _ string) ([]linear.Issue, error) {
+func (m *mockLinear) ListIssues(_ context.Context, _ map[string]any, _ int, _ string) (*linear.IssueListResult, error) {
 	return nil, nil
 }
 

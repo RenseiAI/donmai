@@ -1437,10 +1437,11 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			issues, err := client.ListIssues(ctx, filter, limit, orderBy)
+			result, err := client.ListIssues(ctx, filter, limit, orderBy)
 			if err != nil {
 				return fmt.Errorf("list issues using %s order: %w", orderBy, err)
 			}
+			issues := result.Issues
 
 			if orderBy != "manual" {
 				// Preserve the existing numeric-priority grouping for timestamp modes.
@@ -1481,7 +1482,15 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 				}
 			}
 
-			return cli.WriteJSON(cmd.OutOrStdout(), out)
+			if result.Truncated {
+				_, _ = fmt.Fprintf(cmd.ErrOrStderr(), "Warning: list-issues reached the --limit of %d; more matching issues exist. Raise --limit (max %d) to see the rest.\n", limit, linear.MaxIssueListLimit)
+			}
+
+			return cli.WriteJSON(cmd.OutOrStdout(), map[string]any{
+				"issues":    out,
+				"limit":     limit,
+				"truncated": result.Truncated,
+			})
 		},
 	}
 
@@ -1492,7 +1501,7 @@ func newLinearListIssuesCmd(ds func() afclient.DataSource, bin string) *cobra.Co
 	cmd.Flags().IntVar(&priority, "priority", 0, "Filter by priority (1-4)")
 	cmd.Flags().StringVar(&assignee, "assignee", "", "Filter by assignee name, email, or 'me'")
 	cmd.Flags().StringVar(&team, "team", "", "Filter by team name")
-	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d)", linear.MaxIssueListLimit))
+	cmd.Flags().IntVar(&limit, "limit", 50, fmt.Sprintf("Maximum number of issues to return (max %d); the output envelope reports truncated:true plus a stderr warning when the cap hides further matches", linear.MaxIssueListLimit))
 	cmd.Flags().StringVar(&orderBy, "order-by", "createdAt", "Priority then createdAt/updatedAt, or ascending Linear manual order (flat; rank 0 valid; null last; ties keep Linear order)")
 	cmd.Flags().StringVar(&query, "query", "", "Text search query")
 
@@ -1760,16 +1769,16 @@ func findReusableBlocker(ctx context.Context, client linear.Linear, projectName,
 		"labels":  map[string]any{"name": map[string]any{"eqIgnoreCase": "Needs Human"}},
 	}
 	const limit = linear.MaxIssueListLimit
-	candidates, err := client.ListIssues(ctx, filter, limit, "createdAt")
+	result, err := client.ListIssues(ctx, filter, limit, "createdAt")
 	if err != nil {
 		return nil, fmt.Errorf("blocker candidate lookup: %w", err)
 	}
-	if len(candidates) >= limit {
+	if result.Truncated || len(result.Issues) >= limit {
 		return nil, fmt.Errorf("blocker candidate lookup reached limit %d; completeness is unknown", limit)
 	}
-	for i := range candidates {
-		if strings.EqualFold(candidates[i].Title, title) {
-			return &candidates[i], nil
+	for i := range result.Issues {
+		if strings.EqualFold(result.Issues[i].Title, title) {
+			return &result.Issues[i], nil
 		}
 	}
 	return nil, nil

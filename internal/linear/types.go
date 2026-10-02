@@ -81,6 +81,16 @@ type Issue struct {
 	Assignee         *User   `json:"assignee,omitempty"`
 }
 
+// IssueListResult is the bounded result of a ListIssues query. Truncated
+// reports whether the server held more matching issues than the requested
+// limit, so callers can distinguish "exactly N exist" from "N of many
+// returned". A full page (len(Issues) == limit) with further pages
+// available is truncated; a short page or an exhausted connection is not.
+type IssueListResult struct {
+	Issues    []Issue
+	Truncated bool
+}
+
 // Label represents a Linear issue label.
 type Label struct {
 	ID       string `json:"id"`

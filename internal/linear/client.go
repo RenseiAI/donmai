@@ -909,7 +909,10 @@ func ValidateIssueListLimit(limit int) error {
 // causing unbounded network work. orderBy accepts createdAt or updatedAt for
 // timestamp ordering, or "manual" for Linear's native manual issue order. The
 // manual order and filters are evaluated by Linear before each cursor page.
-func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) ([]Issue, error) {
+// The result reports Truncated when the requested limit stopped the walk
+// while further pages remained, so callers can tell a full page apart from
+// an exhausted result set.
+func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) (*IssueListResult, error) {
 	if err := ValidateIssueListLimit(limit); err != nil {
 		return nil, err
 	}
@@ -963,8 +966,13 @@ func (c *Client) ListIssues(ctx context.Context, filter map[string]any, limit in
 		if err != nil {
 			return nil, err
 		}
-		if complete || len(issues) == limit {
-			return issues, nil
+		if complete {
+			return &IssueListResult{Issues: issues}, nil
+		}
+		if len(issues) == limit {
+			// The requested limit stopped the walk with further pages
+			// available: more matching issues exist beyond this page.
+			return &IssueListResult{Issues: issues, Truncated: true}, nil
 		}
 		if _, repeated := seenCursors[*next]; repeated {
 			return nil, fmt.Errorf("issues cursor cycle detected at %q", *next)
