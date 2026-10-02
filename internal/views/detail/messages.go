@@ -20,7 +20,8 @@ type activityTickMsg struct{}
 
 // Action messages
 type stopAgentMsg struct {
-	err error
+	resp *afclient.StopSessionResponse
+	err  error
 }
 
 type sendPromptMsg struct {

@@ -63,6 +63,52 @@ func TestClientStopSessionSuccess(t *testing.T) {
 	}
 }
 
+func TestClientStopSessionAcceptedPendingEnvelope(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
+		if r.Method != http.MethodPost || r.URL.Path != "/api/public/sessions/sess-1/stop" {
+			t.Errorf("request = %s %s, want POST stop path", r.Method, r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		// The body claims stopped:true (a 2xx-is-success server); the
+		// client must still normalise a 202 to stopped=false because a
+		// 202 never carries terminal evidence.
+		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+	})
+	resp, err := c.StopSession("sess-1")
+	if err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+	if resp.Stopped {
+		t.Fatalf("202 envelope must decode stopped=false: %+v", resp)
+	}
+	if !resp.Delivered || !resp.Pending || !resp.PendingDelivery() {
+		t.Fatalf("202 envelope lost delivered/pending: %+v", resp)
+	}
+}
+
+func TestClientStopSessionAcceptedWithoutEnvelopeDefaultsPending(t *testing.T) {
+	t.Parallel()
+
+	_, c := newTestServer(t, func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		w.WriteHeader(http.StatusAccepted)
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working"}`))
+	})
+	resp, err := c.StopSession("sess-1")
+	if err != nil {
+		t.Fatalf("StopSession: %v", err)
+	}
+	if resp.Stopped {
+		t.Fatalf("bare 202 must decode stopped=false: %+v", resp)
+	}
+	if !resp.PendingDelivery() {
+		t.Fatalf("bare 202 must report pending delivery: %+v", resp)
+	}
+}
+
 func TestClientStopSessionPreSessionReconciliationSuccess(t *testing.T) {
 	_, c := newTestServer(t, func(w http.ResponseWriter, r *http.Request) {
 		if r.Method != http.MethodPost || r.URL.Path != "/api/public/sessions/public-session/stop" {

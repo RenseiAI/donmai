@@ -97,6 +97,41 @@ func TestStopSessionResponseRoundTrip(t *testing.T) {
 	}
 }
 
+func TestStopSessionResponseDecodesPendingEnvelope(t *testing.T) {
+	t.Parallel()
+
+	var out StopSessionResponse
+	if err := json.Unmarshal([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`), &out); err != nil {
+		t.Fatalf("unmarshal pending envelope: %v", err)
+	}
+	if out.Stopped || !out.Delivered || !out.Pending {
+		t.Fatalf("pending envelope changed: %+v", out)
+	}
+	if !out.PendingDelivery() {
+		t.Fatalf("PendingDelivery = false for delivered/pending envelope: %+v", out)
+	}
+	data, err := json.Marshal(out)
+	if err != nil {
+		t.Fatalf("marshal pending envelope: %v", err)
+	}
+	for _, f := range []string{`"delivered"`, `"pending"`, `"stopped"`} {
+		if !strings.Contains(string(data), f) {
+			t.Errorf("marshalled output missing field %s: %s", f, data)
+		}
+	}
+
+	var terminal StopSessionResponse
+	if err := json.Unmarshal([]byte(`{"stopped":true,"sessionId":"public","previousStatus":"working","newStatus":"stopped"}`), &terminal); err != nil {
+		t.Fatalf("unmarshal terminal success: %v", err)
+	}
+	if terminal.PendingDelivery() {
+		t.Fatalf("PendingDelivery = true for terminal response: %+v", terminal)
+	}
+	if terminal.Delivered || terminal.Pending {
+		t.Fatalf("terminal response gained pending flags: %+v", terminal)
+	}
+}
+
 func TestStopSessionResponseDecodesLegacySuccessWithoutReceipt(t *testing.T) {
 	var out StopSessionResponse
 	if err := json.Unmarshal([]byte(`{"stopped":true,"sessionId":"public","previousStatus":"working","newStatus":"stopped"}`), &out); err != nil {

@@ -495,17 +495,46 @@ func containsSecretMaterial(value any) bool {
 
 // StopSession sends a stop request for the given session and returns the
 // coordinator's response describing the status transition.
+//
+// A cooperative stop delivered to a live session is answered with HTTP 202
+// and a delivered/pending envelope: the stop was accepted but no terminal
+// evidence exists yet. The response normalises that case to Stopped=false;
+// Stopped is true only for terminal (HTTP 200) responses.
 func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
-	var resp StopSessionResponse
-	if err := c.postWithErrorDecoder(
-		"/api/public/sessions/"+id+"/stop",
-		nil,
-		&resp,
-		decodeStopSessionError,
-	); err != nil {
+	path := "/api/public/sessions/" + id + "/stop"
+	data, err := json.Marshal(nil)
+	if err != nil {
+		return nil, fmt.Errorf("marshal failed: %w", err)
+	}
+	req, err := http.NewRequest("POST", c.BaseURL+path, bytes.NewReader(data))
+	if err != nil {
+		return nil, fmt.Errorf("create request failed: %w", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+	c.setRequestHeaders(req)
+
+	resp, err := c.HTTPClient.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("request failed: %w", err)
+	}
+	defer func() { _ = resp.Body.Close() }()
+	if err := statusToError(resp.StatusCode, path); err != nil {
+		return nil, decodeStopSessionError(resp, err)
+	}
+	var out StopSessionResponse
+	if err := decodeJSONResponse(resp, &out); err != nil {
 		return nil, err
 	}
-	return &resp, nil
+	out.HTTPStatus = resp.StatusCode
+	if resp.StatusCode == http.StatusAccepted {
+		// A 202 never carries terminal evidence: force stopped=false and
+		// default the pending flag when the envelope omits both fields.
+		out.Stopped = false
+		if !out.Delivered && !out.Pending {
+			out.Pending = true
+		}
+	}
+	return &out, nil
 }
 
 // ChatSession forwards a prompt to the given session's agent and returns the
