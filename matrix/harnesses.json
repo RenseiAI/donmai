@@ -1,5 +1,5 @@
 {
-  "schemaVersion": "p1.2",
+  "schemaVersion": "p1.3",
   "contractAbi": "capability-matrix/v1",
   "generatedFrom": "donmai/matrix (go generate ./matrix/...)",
   "harnesses": [
@@ -74,6 +74,13 @@
           "cleanupDelivery": "handle_stop_and_resource_cleanup",
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     },
@@ -206,6 +213,18 @@
           ],
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        },
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     },
@@ -370,6 +389,18 @@
           "evidenceTier": "native_verified",
           "productionEligible": true
         }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        },
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
+        }
       ]
     },
     {
@@ -455,6 +486,13 @@
           "evidenceTier": "unit_verified",
           "productionEligible": false
         }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        }
       ]
     },
     {
@@ -531,6 +569,13 @@
           "cleanupDelivery": "handle_stop_and_resource_cleanup",
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     },
@@ -622,6 +667,13 @@
           "cleanupDelivery": "handle_stop_and_resource_cleanup",
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     },
@@ -761,6 +813,18 @@
           "evidenceTier": "unit_verified",
           "productionEligible": false
         }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        },
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "best_effort",
+          "networkDenyBaseline": "unavailable"
+        }
       ]
     },
     {
@@ -829,6 +893,13 @@
           ],
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     },
@@ -945,6 +1016,18 @@
           "cleanupDelivery": "stub_oracle",
           "evidenceTier": "unit_verified",
           "productionEligible": false
+        }
+      ],
+      "executionSecurity": [
+        {
+          "mode": "autonomous",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
+        },
+        {
+          "mode": "human_controlled",
+          "toolDenyBaseline": "unavailable",
+          "networkDenyBaseline": "unavailable"
         }
       ]
     }

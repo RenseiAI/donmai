@@ -24,6 +24,23 @@ type HarnessRow struct {
 	DrivesHosts    []agent.ServingHost           `json:"drivesHosts"`
 	PromptDelivery []agent.PromptDeliveryProfile `json:"promptDelivery"`
 	ToolLifecycle  []agent.ToolLifecycleProfile  `json:"toolLifecycle"`
+	// ExecutionSecurity holds one deny-baseline record per admitted session
+	// mode, derived from the live manifest the same way the
+	// execution-security render test derives it (workspace-write grant at
+	// index 0 via RenderExecutionSecurity). It publishes what the code
+	// already enforces; it never declares new enforcement.
+	ExecutionSecurity []HarnessExecutionSecurityRow `json:"executionSecurity"`
+}
+
+// HarnessExecutionSecurityRow is one harness+mode deny-baseline record: how
+// the always-on deny entries travel when the session stamps index 0 under a
+// workspace-write grant. ToolDenyBaseline covers the tool-approval dimension;
+// NetworkDenyBaseline covers the network dimension (unavailable on every
+// harness this runner drives).
+type HarnessExecutionSecurityRow struct {
+	Mode                agent.PromptSessionMode  `json:"mode"`
+	ToolDenyBaseline    agent.DenyBaselineStatus `json:"toolDenyBaseline"`
+	NetworkDenyBaseline agent.DenyBaselineStatus `json:"networkDenyBaseline"`
 }
 
 // EndpointRow is one model-endpoint company in the generated endpoints[].
@@ -212,6 +229,9 @@ func buildHarnessesFrom(harvests []HarnessHarvest) ([]HarnessRow, map[agent.Harn
 			DrivesHosts:    dedupHosts(mf.Caps.DrivesHosts),
 			PromptDelivery: append([]agent.PromptDeliveryProfile(nil), mf.PromptDelivery...),
 			ToolLifecycle:  append([]agent.ToolLifecycleProfile(nil), mf.ToolLifecycle...),
+			ExecutionSecurity: harnessExecutionSecurityRows(
+				mf,
+			),
 		}
 		byName[mf.Name] = &r
 	}
@@ -367,6 +387,46 @@ func buildBinaryPins(harnessByName map[agent.HarnessName]HarnessRow) ([]BinaryPi
 	}
 	sort.Slice(rows, func(i, j int) bool { return rows[i].Harness < rows[j].Harness })
 	return rows, nil
+}
+
+// harnessExecutionSecurityRows derives one deny-baseline record per admitted
+// session mode from the live manifest — the same derivation the
+// execution-security render test performs (workspace-write grant at index 0
+// via RenderExecutionSecurity). The mode set is the union of the prompt and
+// tool/lifecycle profile modes, so a mode declared on either axis is
+// published. Network is always unavailable: no harness this runner drives
+// enforces the always-on egress denies.
+func harnessExecutionSecurityRows(mf agent.HarnessManifest) []HarnessExecutionSecurityRow {
+	seen := map[agent.PromptSessionMode]bool{}
+	var modes []agent.PromptSessionMode
+	for _, profile := range mf.PromptDelivery {
+		if !seen[profile.Mode] {
+			seen[profile.Mode] = true
+			modes = append(modes, profile.Mode)
+		}
+	}
+	for _, profile := range mf.ToolLifecycle {
+		if !seen[profile.Mode] {
+			seen[profile.Mode] = true
+			modes = append(modes, profile.Mode)
+		}
+	}
+	sort.Slice(modes, func(i, j int) bool { return modes[i] < modes[j] })
+	rows := make([]HarnessExecutionSecurityRow, 0, len(modes))
+	for _, mode := range modes {
+		base := agent.Spec{PromptMode: mode, SandboxLevel: agent.SandboxWorkspaceWrite}
+		base.ExecutionSecurity = &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+		report, err := agent.RenderExecutionSecurity(base, mf)
+		if err != nil {
+			continue
+		}
+		rows = append(rows, HarnessExecutionSecurityRow{
+			Mode:                mode,
+			ToolDenyBaseline:    report.ToolApproval.DenyBaseline,
+			NetworkDenyBaseline: report.Network.DenyBaseline,
+		})
+	}
+	return rows
 }
 
 // ---------------------------------------------------------------------------

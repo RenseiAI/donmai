@@ -18,6 +18,10 @@ const (
 	FileMatrix                 = "matrix.json"
 	FileRegistryGen            = "registry_gen.go"
 	FileCapabilityRealizations = "capability-realizations.json"
+	// FileSupport is the generated harness support page (one row per harness
+	// and session mode). Committed at the matrix/ package root like the JSON
+	// artifacts so the parity test can byte-compare it.
+	FileSupport = "SUPPORT.md"
 )
 
 // Artifacts is the rendered byte content for every generated file, keyed by
@@ -120,6 +124,7 @@ func (b *Built) Render() (*Artifacts, error) {
 		FileMatrix:                 matrixJSON,
 		FileRegistryGen:            registry,
 		FileCapabilityRealizations: realizations,
+		FileSupport:                []byte(RenderSupportPage(b)),
 	}}, nil
 }
 

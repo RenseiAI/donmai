@@ -49,6 +49,14 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 		agent.HarnessShell:        {human: none},
 		agent.HarnessStub:         {auto: none, human: none},
 	}
+	// The hand-typed table above is the reviewed statement of what each
+	// exact adapter enforces; the generated harnesses.json executionSecurity
+	// section must publish exactly the same deny baselines, so the page and
+	// the test table can never drift apart.
+	generated, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
 	wantAbove := map[agent.HarnessName][]renderedAbove{}
 
 	for _, harvest := range HarnessHarvestList() {
@@ -79,6 +87,7 @@ func TestExecutionSecurityRenderMatrix(t *testing.T) {
 				t.Errorf("%s/%s: deny baseline tool=%q network=%q, want tool=%q network=%q",
 					harvest.Name, mode, report.ToolApproval.DenyBaseline, report.Network.DenyBaseline, want, none)
 			}
+			assertGeneratedDenyBaseline(t, generated, harvest.Name, mode, want, none)
 			for _, dimension := range agent.ExecutionSecurityDimensions() {
 				for _, level := range agent.ExecutionSecurityLadder(dimension)[1:] {
 					spec := base
@@ -125,6 +134,32 @@ func TestCodexDenyBaselineUnderFullAccess(t *testing.T) {
 		return
 	}
 	t.Fatal("codex is not in the harvest list")
+}
+
+// assertGeneratedDenyBaseline checks the generated harnesses.json row for one
+// harness and mode publishes exactly the deny baselines the reviewed table
+// asserts. The generated section is a derived check against the same live
+// derivation — a code change without regeneration fails here.
+func assertGeneratedDenyBaseline(t *testing.T, built *Built, name agent.HarnessName, mode agent.PromptSessionMode, wantTool, wantNetwork agent.DenyBaselineStatus) {
+	t.Helper()
+	for _, h := range built.Harnesses {
+		if h.Name != name {
+			continue
+		}
+		for _, row := range h.ExecutionSecurity {
+			if row.Mode != mode {
+				continue
+			}
+			if row.ToolDenyBaseline != wantTool || row.NetworkDenyBaseline != wantNetwork {
+				t.Errorf("generated harnesses.json %s/%s: deny baseline tool=%q network=%q, want tool=%q network=%q",
+					name, mode, row.ToolDenyBaseline, row.NetworkDenyBaseline, wantTool, wantNetwork)
+			}
+			return
+		}
+		t.Errorf("generated harnesses.json has no execution-security row for %s/%s", name, mode)
+		return
+	}
+	t.Errorf("generated harnesses.json has no harness %q", name)
 }
 
 func findRendered(entries []renderedAbove, dimension agent.ExecutionSecurityDimension, level agent.ExecutionSecurityLevel, mode agent.PromptSessionMode) *renderedAbove {
