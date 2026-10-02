@@ -272,25 +272,30 @@ func (r *Runner) injectDirective(ctx context.Context, handle agent.Handle, text 
 // (Claude/Codex/stub) accept it as a follow-up user message.
 //
 // The prompt is intentionally short and directive: it lists the
-// missing fields and the exact CLI commands the agent should run.
-// Long prose makes the agent more likely to "explore" instead of
-// finishing the work.
+// mechanical git steps, then points back to the task's own PR-body and
+// turn-result/handoff requirements instead of scripting an empty-body
+// PR. Prescribing an auto-filled body here previously let an agent that
+// was mid-handoff when nudged short-circuit it with an empty PR and no
+// turn result, so the PR-creation and follow-up wording stays
+// descriptive rather than a literal command script.
 func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 	var b strings.Builder
 	b.WriteString("Your previous turn finished without opening a pull request. ")
-	b.WriteString("Please commit your work and open a PR before stopping.\n\n")
+	b.WriteString("Please commit your work and open a pull request with a real description of the work, ")
+	b.WriteString("then post whatever turn-result/handoff format the task's own instructions require.\n\n")
 	b.WriteString("Run these commands now:\n")
 	b.WriteString("  git status\n")
 	b.WriteString("  git add -A\n")
 	b.WriteString(fmt.Sprintf("  git commit -m \"feat: %s\"\n", commitSubject(qw)))
 	b.WriteString("  git push -u origin HEAD\n")
-	b.WriteString("  gh pr create --fill\n\n")
+	b.WriteString("Then open a pull request with `gh pr create`, using a real title and a body that ")
+	b.WriteString("describes the work -- do not use an empty or auto-filled body.\n\n")
 	if !obs.commentPosted {
 		b.WriteString("Also post a brief progress comment on the Linear issue ")
 		b.WriteString(fmt.Sprintf("via `%s linear create-comment`.\n\n", prompt.ResolveBrand().BrandCLI))
 	}
 	b.WriteString("After the PR is open, output the PR URL on a single line ")
-	b.WriteString("and stop.\n")
+	b.WriteString("and post the task's required turn-result/handoff.\n")
 	return b.String()
 }
 
