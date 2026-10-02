@@ -254,7 +254,7 @@ type Manager struct {
 }
 
 type parentWorktreeLock struct {
-	mu   sync.Mutex
+	mu   sync.RWMutex
 	refs int
 }
 
@@ -1714,9 +1714,12 @@ type baseFetchInfo struct {
 //     serialized. Git takes a per-ref lock, so distinct remote-tracking refs do
 //     not contend; measured against real Git, 10 rounds of 6 concurrent
 //     distinct-ref fetches on one clone with every tip moving produced 0
-//     failures in 60.
-//     Serializing them instead would make provisioning latency linear in
-//     fan-out for no correctness gain. Pinned by
+//     failures in 60. Fetches share a reader gate: they may overlap each
+//     other, but not a worktree registration mutation. Git temporarily
+//     registers a null HEAD during worktree add, and fetch connectivity
+//     traverses other worktree HEADs even when fetching a different ref.
+//     Serializing all fetches would make provisioning latency linear in
+//     fan-out. Pinned by
 //     TestBaseFetchDoesNotSerializeDistinctRefs (max concurrency > 1) and
 //     TestIntegrationConcurrentDistinctRefProvisions (real Git, all succeed).
 //
@@ -1784,10 +1787,17 @@ func (m *Manager) runBaseFetch(ctx context.Context, key, parent, ref, repoURL st
 	if branchOnly {
 		args = []string{"-C", parent, "fetch", "--no-tags", "origin", "--", "+refs/heads/" + ref + ":refs/remotes/origin/" + ref}
 	}
-	out, err := m.runGit(fetchCtx, repoURL, args...)
+	var out []byte
+	fetchUnlock, err := acquireParentWorktreeFetchLock(fetchCtx, parent)
+	if err == nil {
+		out, err = m.runGit(fetchCtx, repoURL, args...)
+	}
 	info := baseFetchInfo{Ref: ref, Duration: time.Since(started), Fetched: true}
 	if err == nil && branchOnly {
 		info.SHA, err = m.exactBranchTrackingTip(fetchCtx, parent, ref)
+	}
+	if fetchUnlock != nil {
+		fetchUnlock()
 	}
 	if err != nil {
 		info = baseFetchInfo{}
@@ -1974,6 +1984,48 @@ func (m *Manager) lockSession(sessionID string) func() {
 }
 
 func acquireParentWorktreeLock(parent string) func() {
+	key, lock := retainParentWorktreeLock(parent)
+	lock.mu.Lock()
+	return func() {
+		lock.mu.Unlock()
+		releaseParentWorktreeLock(key, lock)
+	}
+}
+
+// acquireParentWorktreeFetchLock shares the parent gate with other fetches but
+// excludes worktree registration writers. Waiting for a writer consumes the
+// existing fetch timeout rather than extending it. A canceled pending handoff
+// releases its reader and registry reference as soon as the writer completes.
+func acquireParentWorktreeFetchLock(ctx context.Context, parent string) (func(), error) {
+	if err := ctx.Err(); err != nil {
+		return nil, err
+	}
+	key, lock := retainParentWorktreeLock(parent)
+	unlock := func() {
+		lock.mu.RUnlock()
+		releaseParentWorktreeLock(key, lock)
+	}
+	if lock.mu.TryRLock() {
+		return unlock, nil
+	}
+	acquired := make(chan struct{})
+	go func() {
+		lock.mu.RLock()
+		select {
+		case acquired <- struct{}{}:
+		case <-ctx.Done():
+			unlock()
+		}
+	}()
+	select {
+	case <-acquired:
+		return unlock, nil
+	case <-ctx.Done():
+		return nil, ctx.Err()
+	}
+}
+
+func retainParentWorktreeLock(parent string) (string, *parentWorktreeLock) {
 	key := canonicalParentPath(parent)
 	parentWorktreeLocks.Lock()
 	lock := parentWorktreeLocks.locks[key]
@@ -1983,16 +2035,16 @@ func acquireParentWorktreeLock(parent string) func() {
 	}
 	lock.refs++
 	parentWorktreeLocks.Unlock()
-	lock.mu.Lock()
-	return func() {
-		lock.mu.Unlock()
-		parentWorktreeLocks.Lock()
-		lock.refs--
-		if lock.refs == 0 {
-			delete(parentWorktreeLocks.locks, key)
-		}
-		parentWorktreeLocks.Unlock()
+	return key, lock
+}
+
+func releaseParentWorktreeLock(key string, lock *parentWorktreeLock) {
+	parentWorktreeLocks.Lock()
+	lock.refs--
+	if lock.refs == 0 {
+		delete(parentWorktreeLocks.locks, key)
 	}
+	parentWorktreeLocks.Unlock()
 }
 
 func canonicalParentPath(parent string) string {

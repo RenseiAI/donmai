@@ -204,6 +204,10 @@ func (p *Pool) waitWarm(ctx context.Context, key string, e *entry, binding Bindi
 		p.release(key)
 		return nil, fmt.Errorf("acquire workarea: %w", ctx.Err())
 	}
+	if err := ctx.Err(); err != nil {
+		p.release(key)
+		return nil, fmt.Errorf("acquire workarea: %w", err)
+	}
 	if e.warmErr != nil {
 		p.release(key)
 		return nil, e.warmErr
