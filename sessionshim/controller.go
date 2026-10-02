@@ -971,9 +971,10 @@ func (c *Controller) ResumeFrom() uint64 { return c.resumeFrom }
 
 // HarnessSurvived reports whether the shim's harness is still live. It is the
 // operative question after a restart: adoption succeeded AND the workload
-// continues.
+// continues. It delegates to shimwire.Phase.HarnessLive, the single source of
+// truth for the running-or-orphaned question.
 func (c *Controller) HarnessSurvived() bool {
-	return c.hello.Phase == shimwire.PhaseRunning || c.hello.Phase == shimwire.PhaseOrphaned
+	return c.hello.Phase.HarnessLive()
 }
 
 // HarnessIdentity returns the owned harness's process identity as the shim

@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/sessionshim"
+	"github.com/RenseiAI/donmai/shimwire"
 )
 
 // loseTheCarrierBinding drives the daemon through the exact transition a
@@ -264,6 +265,40 @@ func TestRebindErrorsAreDiscriminableThroughThePublicAPI(t *testing.T) {
 	bare.shims = nil
 	if _, err := bare.RebindAdoptedSessionShim(context.Background(), "org", "session"); !errors.Is(err, ErrSessionShimAdoptionNotConfigured) {
 		t.Fatalf("rebind on an unconfigured daemon = %v, want it to wrap ErrSessionShimAdoptionNotConfigured", err)
+	}
+}
+
+// TestRebindRefusesALineageWhoseHarnessIsNoLongerLive pins the rebind gate's
+// phase check through the shared predicate. A lineage whose published record
+// has left running/orphaned owns no live harness to re-adopt — exited keeps
+// only the terminal observation — so the rebind refuses with
+// SessionShimHarnessNotLive before claiming the slot or dialling the shim.
+// The orphaned half of the same predicate is covered by
+// TestLineageLiveKeepaliveOutlivesAnOrphanDeadlineShorterThanTheBackoff, which
+// drives a real orphaned shim through a full lineage-live window.
+func TestRebindRefusesALineageWhoseHarnessIsNoLongerLive(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Disabled: true}})
+	loseTheCarrierBinding(t, f)
+
+	rec, err := f.registry.Get(f.id)
+	if err != nil {
+		t.Fatalf("registry.Get: %v", err)
+	}
+	rec.Phase = shimwire.PhaseExited
+	if err := f.registry.Put(rec); err != nil {
+		t.Fatalf("registry.Put: %v", err)
+	}
+
+	result, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID)
+	if result != SessionShimHarnessNotLive {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v, want SessionShimHarnessNotLive", result, err)
+	}
+	if !errors.Is(err, ErrSessionShimHarnessNotLive) {
+		t.Fatalf("rebind of an exited lineage error = %v, want it to wrap ErrSessionShimHarnessNotLive", err)
+	}
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("durable adoption ran %d times for a lineage with no live harness, want none", adoptions)
 	}
 }
 
