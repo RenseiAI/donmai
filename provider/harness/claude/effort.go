@@ -16,12 +16,12 @@ const effortEnvVar = "CLAUDE_CODE_EFFORT_LEVEL"
 const effortModelDefault = "auto"
 
 // withEffortEnv returns a copy of env with effortEnvVar fixed for the
-// session: the configured effort when there is one, and effortModelDefault
-// when there is none. It always sets the variable, so neither a level saved
-// in the operator's settings nor a value inherited from the spawning
-// environment can stand in for the session's configuration. A settings-file
-// maxEffortLevel cap still applies on top, as Claude Code documents for
-// every effort source.
+// session: the configured effort when it is a level Claude recognises, and
+// effortModelDefault when there is none or it is not a recognised level. It
+// always sets the variable, so neither a level saved in the operator's
+// settings nor a value inherited from the spawning environment can stand in
+// for the session's configuration. A settings-file maxEffortLevel cap still
+// applies on top, as Claude Code documents for every effort source.
 func withEffortEnv(env map[string]string, effort agent.EffortLevel) map[string]string {
 	out := make(map[string]string)
 	for k, v := range env {
@@ -31,9 +31,14 @@ func withEffortEnv(env map[string]string, effort agent.EffortLevel) map[string]s
 	return out
 }
 
-// effortEnvValue is the effortEnvVar value for a configured effort.
+// effortEnvValue is the effortEnvVar value for a configured effort. A
+// non-empty value Claude does not recognise (e.g. another harness's naming
+// such as "none" or "minimal") is treated the same as none configured:
+// Claude silently ignores an unrecognised value and falls back to the
+// operator's own saved effort, so passing it through would let the recorded
+// and effective efforts silently diverge.
 func effortEnvValue(effort agent.EffortLevel) string {
-	if effort == "" {
+	if !effort.Known() {
 		return effortModelDefault
 	}
 	return string(effort)
