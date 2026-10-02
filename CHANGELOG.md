@@ -8,7 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- Honor caller cancellation when code-intelligence warm completion is also ready, while preserving the shared warm for other callers.
+- Keep Git fetches outside worktree registration changes while allowing independent branch fetches to run concurrently.
 
 ## v0.72.58 — 2026-10-01
 
