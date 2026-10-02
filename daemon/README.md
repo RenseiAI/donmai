@@ -1,7 +1,7 @@
-# `daemon/` — long-running rensei-daemon runtime
+# `daemon/` — long-running agent-fleet daemon
 
 > **Status:** Wave 6 / Phase F.2.8. Public package; the
-> `af host …` CLI surface is in `afcli/host.go` (`af daemon …` is a hidden
+> `donmai host …` CLI surface is in `afcli/host.go` (`donmai daemon …` is a hidden
 > deprecated alias, removed in v0.58.0).
 > **Architecture:** `donmai-architecture/004-sandbox-capability-matrix.md`
 > §Local daemon mode + `011-local-daemon-fleet.md`.
@@ -40,7 +40,7 @@ The daemon is a single-machine, multi-project supervisor that:
                    │
                    ▼
         ┌────────────────────┐
-        │ af agent run       │  GET 127.0.0.1:7734/api/daemon/sessions/<id>
+        │ donmai agent run   │  GET 127.0.0.1:7734/api/daemon/sessions/<id>
         │   (afcli/agent_run)│  → SessionDetail with QueuedWork shape +
         │                    │     AuthToken + PlatformURL + WorkerID
         └──────────┬─────────┘
@@ -53,8 +53,8 @@ The daemon is a single-machine, multi-project supervisor that:
 ```
 
 The `af` binary registered by `host install` doubles as both the
-daemon supervisor (`af host run`) and the per-session worker
-(`af agent run`) — the same binary, different subcommands. The
+daemon supervisor (`donmai host run`) and the per-session worker
+(`donmai agent run`) — the same binary, different subcommands. The
 WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
 `os.Executable()`; operators rarely override this.
 
@@ -65,7 +65,7 @@ WorkerCommand defaults to `[<self-exe>, "agent", "run"]` resolved via
   work item.
 - **Read**: `GET /api/daemon/sessions/<id>` (handled by
   `daemon/server.go::handleSessionDetail`) returns the JSON payload
-  to the spawned `af agent run` worker.
+  to the spawned `donmai agent run` worker.
 - **Delete**: the spawner emits `SessionEventEnded` when the worker
   child process exits; the daemon's listener removes the entry from
   the store so stale auth tokens do not linger in memory.
@@ -106,7 +106,7 @@ projectAdmissionMode: all-routed
 Absent, blank, and misspelled all read as `enumerated`, so admission only ever
 widens on a correctly spelled opt-in; an unrecognized value additionally fails
 config validation rather than being silently narrowed in place. Set it with
-`donmai project mode all-routed`, or answer the setup wizard's project-admission
+`donmai host project mode all-routed`, or answer the setup wizard's project-admission
 question.
 
 `all-routed` does not weaken the trust boundary. The daemon's registration token
@@ -296,7 +296,7 @@ autoUpdate:
 
 ## Kit install trust gate
 
-Kit installs (`donmai kit install`, `POST /api/daemon/kits/<id>/install`)
+Kit installs (`donmai host kit install`, `POST /api/daemon/kits/<id>/install`)
 prefer complete `donmai.dev/kit-package/v1` packages. The daemon authenticates
 the canonical descriptor first, verifies the exact path/digest/size/mode
 inventory in a private same-filesystem staging directory, and atomically
@@ -325,7 +325,7 @@ explicitly opts out.
 Opting out (accepting that unsigned kits can execute arbitrary shell
 commands):
 
-- **Per install** — `donmai kit install <id> --allow-unsigned` sends
+- **Per install** — `donmai host kit install <id> --allow-unsigned` sends
   `trustOverride: "allowed-this-once"`; the bypass is audit-logged with the
   kit id, signer, and configured `trust.actor`.
 - **Globally** — set `trust.mode: permissive` in `daemon.yaml`. Permissive
@@ -333,7 +333,7 @@ commands):
   `DONMAI_KIT_TRUST_MODE=permissive` alone leaves the signed-by-allowlist
   default in force and logs a warning.
 
-`donmai kit verify <id>` shows one of `package-verified`,
+`donmai host kit verify <id>` shows one of `package-verified`,
 `package-signed-unverified`, `legacy-manifest-verified`,
 `legacy-manifest-unverified`, or `unsigned`, plus the signer and package digest
 when applicable. These states are deliberately not interchangeable.
@@ -363,11 +363,11 @@ atomic activation only; it does not imply catalog freshness.
 
 When a session appears wedged in the dashboard:
 
-1. **Daemon log** — `af host logs --follow` (default
-   `~/.rensei/daemon.log`). Look for the `worker spawner` lines
+1. **Daemon log** — `donmai host logs --follow` (default
+   `~/.donmai/daemon.log`). Look for the `worker spawner` lines
    showing `pid=…` and the matching `[child stdout sessionID=<id>]`
    (INFO) and `[child stderr sessionID=<id>]` (WARN) records from
-   the spawned `af agent run` worker. Spawn output is wired to slog
+   the spawned `donmai agent run` worker. Spawn output is wired to slog
    by default as of v0.5.1 — earlier daemons drained
    child stdio silently.
 2. **Session detail** —
@@ -375,10 +375,10 @@ When a session appears wedged in the dashboard:
    the detail is recorded. A 404 here means the daemon never
    accepted the work (look for poll errors in the daemon log) or
    the session has already terminated and been cleaned up.
-3. **`af agent run` log** — the worker child writes its own slog
+3. **`donmai agent run` log** — the worker child writes its own slog
    output to stderr. The daemon's spawner captures both streams
    under `[child stdout|stderr sessionID=<id>]`; the same lines
-   appear inline in `af host logs` and in the control plane's
+   appear inline in `donmai host logs` and in the control plane's
    session-activity stream.
 4. **Provider logs** — when the runner reaches step 8 (`spawn
    provider`), the per-provider subprocess is the next layer
@@ -391,9 +391,9 @@ When a session appears wedged in the dashboard:
    to confirm the platform sees the session in the expected state.
    A divergence between the daemon's view (still active) and the
    platform's view (already terminal) usually indicates a missed
-   `result.Post` — re-run `af host stats` to see whether the
+   `result.Post` — re-run `donmai host stats` to see whether the
    poller has retried.
-6. **Worktree state** — `~/.rensei/worktrees/<sessionId>/.agent/`
+6. **Worktree state** — `~/.donmai/worktrees/<sessionId>/.agent/`
    contains the per-session `state.json` snapshot and the
    `events.jsonl` audit log. Look here when the agent emitted no
    visible output but the session is marked failed.
@@ -518,9 +518,9 @@ of the two cases it was.
 | Symptom | Where it surfaces |
 |---|---|
 | WorkerCommand falls through to `/bin/sh` stub | `worker spawner` warn line in daemon log |
-| Daemon HTTP unreachable from worker child | `af agent run preflight` error, exit code 2 |
-| Session detail expired between fetch attempts | `af agent run preflight` error, exit code 2 |
-| Provider probe failed at runner startup | `af agent run` Warn log "claude provider unavailable" — falls through to stub if the session asked for stub; otherwise the runner's `Resolve` fails with `FailureProviderResolve` |
+| Daemon HTTP unreachable from worker child | `donmai agent run preflight` error, exit code 2 |
+| Session detail expired between fetch attempts | `donmai agent run preflight` error, exit code 2 |
+| Provider probe failed at runner startup | `donmai agent run` Warn log "claude provider unavailable" — falls through to stub if the session asked for stub; otherwise the runner's `Resolve` fails with `FailureProviderResolve` |
 | Worker child exited with non-zero | `SessionEventEnded` with `ExitErr` non-nil; daemon emits the failure to its log |
 
 See `runner/README.md` for the runner-level failure-mode table that
