@@ -1,6 +1,7 @@
 package daemon
 
 import (
+	"bytes"
 	"crypto/sha256"
 	"encoding/json"
 	"errors"
@@ -8,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"path/filepath"
+	"reflect"
 	"regexp"
 	"runtime"
 	"sort"
@@ -94,6 +96,12 @@ type Config struct {
 	// Config (not on KitConfig) because the trust mode applies across
 	// all plugin families per 015-plugin-spec.md § "Auth + trust".
 	Trust TrustConfig `yaml:"trust,omitempty"        json:"trust,omitempty"`
+	// unknownFields holds top-level daemon.yaml keys the Config struct
+	// does not declare, captured verbatim at load time and merged back
+	// at write time so embedding binaries can share the file without
+	// losing their own settings on the next write. Declared fields
+	// always win: keys also present in the marshaled Config are skipped.
+	unknownFields map[string]*yaml.Node
 }
 
 // LocalRuntimeConfig is non-secret operator policy. Credentials remain in
@@ -458,6 +466,7 @@ func LoadConfig(path string) (*Config, error) {
 
 	normalizeProjectContract(&cfg)
 	applyDefaultsWithCapacityPresence(&cfg, authored.Capacity.MaxConcurrentSessions != nil)
+	cfg.unknownFields = captureUnknownFields(data)
 	return &cfg, nil
 }
 
@@ -478,7 +487,7 @@ func WriteConfig(path string, cfg *Config) error {
 	} else {
 		syncLegacyProjectProjection(&normalized)
 	}
-	data, err := yaml.Marshal(&normalized)
+	data, err := marshalConfigPreservingUnknown(&normalized)
 	if err != nil {
 		return fmt.Errorf("marshal config: %w", err)
 	}
@@ -491,6 +500,144 @@ func WriteConfig(path string, cfg *Config) error {
 		return fmt.Errorf("rename temp config: %w", err)
 	}
 	return nil
+}
+
+// knownConfigKeys is the set of top-level daemon.yaml keys declared by the
+// Config struct, derived from its yaml tags so the set cannot drift from
+// the struct.
+var knownConfigKeys = configYAMLKeys()
+
+func configYAMLKeys() map[string]struct{} {
+	keys := make(map[string]struct{})
+	t := reflect.TypeOf(Config{})
+	for i := 0; i < t.NumField(); i++ {
+		name := strings.Split(t.Field(i).Tag.Get("yaml"), ",")[0]
+		name = strings.TrimSpace(name)
+		if name == "" || name == "-" {
+			continue
+		}
+		keys[name] = struct{}{}
+	}
+	return keys
+}
+
+// captureUnknownFields returns the top-level mapping entries in data whose
+// keys the Config struct does not declare, cloned so they stay valid after
+// the source document is discarded. Merge keys ("<<") are skipped: their
+// content is already resolved into the declared fields during decode.
+func captureUnknownFields(data []byte) map[string]*yaml.Node {
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return nil
+	}
+	var out map[string]*yaml.Node
+	memo := make(map[*yaml.Node]*yaml.Node)
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		keyNode := root.Content[i]
+		if keyNode.Kind != yaml.ScalarNode {
+			continue
+		}
+		key := keyNode.Value
+		if key == "<<" {
+			continue
+		}
+		if _, known := knownConfigKeys[key]; known {
+			continue
+		}
+		if out == nil {
+			out = make(map[string]*yaml.Node)
+		}
+		out[key] = cloneYAMLNodeMemo(root.Content[i+1], memo)
+	}
+	return out
+}
+
+// marshalConfigPreservingUnknown marshals cfg and merges back the unknown
+// top-level keys captured at load time, verbatim. A key also present in
+// the marshaled Config is skipped so the declared field always wins over a
+// stale raw copy of that same key.
+func marshalConfigPreservingUnknown(cfg *Config) ([]byte, error) {
+	data, err := yaml.Marshal(cfg)
+	if err != nil {
+		return nil, err
+	}
+	if len(cfg.unknownFields) == 0 {
+		return data, nil
+	}
+	var doc yaml.Node
+	if err := yaml.Unmarshal(data, &doc); err != nil {
+		return nil, err
+	}
+	root := &doc
+	if root.Kind == yaml.DocumentNode && len(root.Content) > 0 {
+		root = root.Content[0]
+	}
+	if root.Kind != yaml.MappingNode {
+		return data, nil
+	}
+	present := make(map[string]struct{}, len(root.Content)/2)
+	for i := 0; i+1 < len(root.Content); i += 2 {
+		if root.Content[i].Kind == yaml.ScalarNode {
+			present[root.Content[i].Value] = struct{}{}
+		}
+	}
+	keys := make([]string, 0, len(cfg.unknownFields))
+	for k := range cfg.unknownFields {
+		if _, dup := present[k]; dup {
+			continue
+		}
+		keys = append(keys, k)
+	}
+	sort.Strings(keys)
+	memo := make(map[*yaml.Node]*yaml.Node)
+	for _, k := range keys {
+		keyNode := &yaml.Node{Kind: yaml.ScalarNode, Tag: "!!str", Value: k}
+		root.Content = append(root.Content, keyNode, cloneYAMLNodeMemo(cfg.unknownFields[k], memo))
+	}
+	var buf bytes.Buffer
+	enc := yaml.NewEncoder(&buf)
+	enc.SetIndent(4)
+	if err := enc.Encode(root); err != nil {
+		_ = enc.Close()
+		return nil, err
+	}
+	if err := enc.Close(); err != nil {
+		return nil, err
+	}
+	return buf.Bytes(), nil
+}
+
+// cloneYAMLNodeMemo deep-copies n, preserving alias relationships: nodes
+// shared via Alias pointers map to a single clone through memo, so an
+// anchor defined under one unknown key and referenced from another
+// survives the round-trip as one definition plus a reference instead of
+// two duplicate anchor definitions.
+func cloneYAMLNodeMemo(n *yaml.Node, memo map[*yaml.Node]*yaml.Node) *yaml.Node {
+	if n == nil {
+		return nil
+	}
+	if prev, ok := memo[n]; ok {
+		return prev
+	}
+	out := *n
+	memo[n] = &out
+	if n.Alias != nil {
+		out.Alias = cloneYAMLNodeMemo(n.Alias, memo)
+	}
+	if len(n.Content) > 0 {
+		out.Content = make([]*yaml.Node, len(n.Content))
+		for i, c := range n.Content {
+			out.Content[i] = cloneYAMLNodeMemo(c, memo)
+		}
+	}
+	return &out
 }
 
 // applyDefaults fills in omitted and zero-valued fields with their schema defaults.
