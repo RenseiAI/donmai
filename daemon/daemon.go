@@ -137,6 +137,18 @@ type Options struct {
 	// file. Nil refuses v2 protected materialization. It is never wire input.
 	ProtectedRuntimeMCPHelperCommandBuilder ProtectedRuntimeMCPHelperCommandBuilder
 
+	// CodexOrphanSweeper reclaims crash/SIGKILL/restart leftovers under the
+	// donmai-codex-home-*/donmai-codex-app-* naming fence once per Start,
+	// after shim adoption and before registration — see sweepCodexOrphans.
+	// Nil (the default every Start call gets unless a caller sets this field)
+	// makes the sweep step a no-op: no os.TempDir() read, no delete inside a
+	// session directory, no signal to a process. Only the production entry
+	// point (afcli/daemon_run.go) sets it, to providercodex.SweepOrphans, so
+	// a daemon built for real operator use always sweeps; a daemon built for
+	// a test — including every test that predates this field and never
+	// mentions it — never does.
+	CodexOrphanSweeper CodexOrphanSweepFunc
+
 	// RulesetSnapshot, when non-nil, wires the daemon to a configured
 	// ruleset-snapshot source: a signed, versioned bundle the daemon
 	// polls, verifies (Ed25519 + content hash), and caches to disk,

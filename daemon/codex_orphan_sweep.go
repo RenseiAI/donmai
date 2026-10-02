@@ -17,11 +17,12 @@ import (
 // early on context cancellation.
 const codexOrphanSweepTimeout = 45 * time.Second
 
-// codexOrphanSweepFunc is the package seam the startup sweep runs through.
-// Production points at providercodex.SweepOrphans; tests replace it to
-// observe the call without touching the real temp dir or signalling real
-// processes. Assign-only in tests; never nil in production Start.
-var codexOrphanSweepFunc = providercodex.SweepOrphans
+// CodexOrphanSweepFunc is the shape of the startup sweep call: the one the
+// real providercodex.SweepOrphans has, and the one Options.CodexOrphanSweeper
+// is typed as. Keeping it a named type (rather than inlining the signature at
+// both the field and the real function) is what lets a test assign
+// providercodex.SweepOrphans itself to it without a wrapper closure.
+type CodexOrphanSweepFunc func(context.Context, providercodex.SweepOptions) providercodex.SweepReport
 
 // sweepCodexOrphans runs the codex-harness orphan sweep once per daemon
 // start, after shim adoption (so every live session is known) and before the
@@ -38,11 +39,23 @@ var codexOrphanSweepFunc = providercodex.SweepOrphans
 // in ProtectedHomes so a previous generation's dead owner manifest cannot
 // condemn them. A sweep failure never fails startup — it is logged and the
 // next start retries.
+//
+// d.opts.CodexOrphanSweeper is nil unless a caller explicitly configures it,
+// which makes this a no-op — no os.TempDir() read, no delete, no signal —
+// for every Start call that does not ask for it. Only the production entry
+// point (afcli/daemon_run.go) sets it, to providercodex.SweepOrphans, so
+// operator behaviour is unchanged; a test that wants to observe or exercise
+// the sweep sets Options.CodexOrphanSweeper itself instead of relying on (or
+// fighting) a package-wide default.
 func (d *Daemon) sweepCodexOrphans(ctx context.Context) {
+	sweep := d.opts.CodexOrphanSweeper
+	if sweep == nil {
+		return
+	}
 	protected := d.liveAdoptedCodexHomes()
 	sweepCtx, cancel := context.WithTimeout(ctx, codexOrphanSweepTimeout)
 	defer cancel()
-	report := codexOrphanSweepFunc(sweepCtx, providercodex.SweepOptions{ProtectedHomes: protected})
+	report := sweep(sweepCtx, providercodex.SweepOptions{ProtectedHomes: protected})
 	slog.Info("daemon: codex orphan sweep complete",
 		"scanned", report.Scanned,
 		"reclaimed", report.Reclaimed,
