@@ -8,6 +8,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // spawnInteractive opens pi's OWN interactive TUI — bare `pi`, with NEITHER
@@ -179,7 +180,11 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 	// here, and summing len()s as an allocation size is exactly the shape a
 	// static scanner (go/allocation-size-overflow) flags as a potential overflow.
 	env := make(map[string]string)
-	for k, v := range spec.Env {
+	// Runner-only attach controls address the supervisor, never the workload:
+	// refuse them from the snapshot layer exactly as composeChildEnv (via the
+	// shared Composer) does on the headless lane. Without this, a snapshot
+	// key riding Spec.Env would reach the PTY child headless refuses it from.
+	for k, v := range runtimeenv.FilterRunnerOnlyMap(spec.Env) {
 		env[k] = v
 	}
 	env[piCodingAgentDirEnvVar] = layout.agentHome
