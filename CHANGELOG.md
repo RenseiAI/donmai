@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.59 — 2026-10-02
+
 ### Fixes
 
 - Honor caller cancellation when code-intelligence warm completion is also ready, while preserving the shared warm for other callers.
