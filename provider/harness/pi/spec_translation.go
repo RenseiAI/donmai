@@ -239,6 +239,14 @@ func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareM
 // resolves inside the session worktree — a fleet box's personal
 // ~/.pi/agent/auth.json is never visible.
 //
+// Credential-snapshot parity: pi carries the platform's full spawn-time
+// credential snapshot through the shared Spec.Env trusted layer — the same
+// rail the other harnesses use — not a pi-specific fan-out list. Any
+// snapshot key present on Spec.Env reaches the child unchanged; there is no
+// pi-side allowlist to extend when the snapshot gains a key. The blocklist
+// still applies to the inherited parent env only, and runner-only controls
+// are refused at every layer.
+//
 // It also carries the trust-boundary handshake token (piHandshakeEnvVar) and
 // the non-secret provider-pin vars (providerPinEnv) the policy extension reads
 // at load; the key itself already rides Spec.Env under PiKeyEnvVar.
