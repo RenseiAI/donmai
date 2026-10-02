@@ -75,6 +75,49 @@ func (d *Daemon) shimLaunchProcessControl(started sessionshim.ProcessIdentity) s
 	return newShimLaunchProcess(started)
 }
 
+// stopUnadoptedLaunchedShim stops the worker this daemon launched when the
+// launch fails AFTER the discovery record appeared but BEFORE adoption: a
+// spent prepare bound, a refused preparation (including the converting-branch
+// 409 folded onto the conflict sentinel), or any other dial failure.
+//
+// It is the discovery-abandon path's twin one step later in the launch. The
+// discovery path's own doc comment (stopAbandonedShimLaunch) gives the three
+// reasons only the process-group stop exists here: nothing was published, no
+// controller was returned (Dial returns nil on failure, so the
+// generation-fenced Controller.Stop cannot be sent), and no terminal proof is
+// owed. The difference from the discovery path is only the trigger — a shim
+// that published HAS armed its own orphan clock, but the orphan clock is the
+// escape hatch, not the plan.
+//
+// Called synchronously on the accept path, BEFORE the launch returns its
+// error and therefore before the spawner reports the launch aborted and
+// releases the workarea. That ordering is the whole fix: a still-running
+// harness must be stopped before the workarea is removed, never concurrently
+// with that removal, so it can never find its worktree gone out from under
+// it.
+//
+// Best-effort by contract, like its twin: the accept fails either way, and a
+// stop that cannot be completed is logged loudly with the pid.
+func (d *Daemon) stopUnadoptedLaunchedShim(
+	id sessionshim.Identity,
+	started sessionshim.ProcessIdentity,
+	process shimLaunchProcess,
+	causeErr error,
+) {
+	if process == nil {
+		return
+	}
+	if err := process.StopAndReap(); err != nil {
+		slog.Error("session shim: could not stop the worker this launch failed to adopt; it may keep running un-adopted "+
+			"(prepare-availability-2026-09-06)",
+			"session", id.String(), "pid", started.PID, "adoptionError", causeErr, "error", err)
+		return
+	}
+	slog.Warn("session shim: stopped and reaped the worker this launch failed to adopt, so the aborted spawn is true about this host "+
+		"(prepare-availability-2026-09-06)",
+		"session", id.String(), "pid", started.PID, "adoptionError", causeErr)
+}
+
 // stopAbandonedShimLaunch stops the worker this daemon launched and then walked
 // away from, so "the spawn was aborted" is TRUE about this host when the accept
 // error is returned.

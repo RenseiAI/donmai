@@ -48,8 +48,11 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
+	"strconv"
+	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
 
@@ -81,34 +84,97 @@ const (
 // allowed to condemn anything.
 var ErrSessionShimAdoptionPrepareUnavailable = errors.New("session shim: adoption preparation was not answered")
 
+// sessionShimPrepareBranchConflictToken is the closed refusal token the
+// composing authority returns when the branch it is asked to prepare on is
+// already converting: the lineage the prepare names collides with authority
+// state it will not supersede. It is matched as a token, not a substring, so
+// a longer word that happens to contain it can never be misread as a refusal.
+const sessionShimPrepareBranchConflictToken = "converting-branch"
+
+// sessionShimPrepareConflictStatusCode is the HTTP status the composing
+// authority's prepare endpoint returns for the same refusal: the branch it was
+// asked to prepare on is already converting.
+const sessionShimPrepareConflictStatusCode = 409
+
+// sessionShimPrepareConflict reports whether err is the composing authority's
+// decisive refusal of one adoption preparation: the branch under preparation
+// is converting, so re-asking cannot change the answer and no retry budget is
+// spent on it.
+//
+// A refusal arrives in one of three shapes, and all three are recognised:
+// the in-repo typed sentinel a composing authority wraps with %w, the shared
+// client conflict sentinel for an HTTP 409 the transport already decoded, or
+// the raw refusal text of an authority whose transport hands the failure back
+// as a plain error ("prepare ...: HTTP 409 ... converting-branch"). The last
+// shape is matched on the status code AND the closed refusal token together:
+// a bare 409 without the token is some other conflict this seam must not
+// claim, and the token without a 409-shaped failure is not a transport refusal
+// at all.
+func sessionShimPrepareConflict(err error) bool {
+	if err == nil {
+		return false
+	}
+	if errors.Is(err, ErrSessionShimAdoptionPrepareConflict) ||
+		errors.Is(err, afclient.ErrConflict) {
+		return true
+	}
+	var httpErr interface{ HTTPStatus() int }
+	if errors.As(err, &httpErr) && httpErr.HTTPStatus() == sessionShimPrepareConflictStatusCode {
+		return true
+	}
+	var statusErr interface{ StatusCode() int }
+	if errors.As(err, &statusErr) && statusErr.StatusCode() == sessionShimPrepareConflictStatusCode {
+		return true
+	}
+	return isSessionShimPrepareBranchConflictText(err.Error())
+}
+
+// isSessionShimPrepareBranchConflictText matches the raw-text refusal shape:
+// a 409-shaped failure that also carries the closed converting-branch token.
+func isSessionShimPrepareBranchConflictText(msg string) bool {
+	if !strings.Contains(msg, strconv.Itoa(sessionShimPrepareConflictStatusCode)) {
+		return false
+	}
+	for _, token := range strings.FieldsFunc(msg, func(r rune) bool {
+		return r != '-' && r != '_' && (r < 'a' || r > 'z') && (r < 'A' || r > 'Z') && (r < '0' || r > '9')
+	}) {
+		if strings.EqualFold(token, sessionShimPrepareBranchConflictToken) ||
+			strings.EqualFold(token, "converting_branch") {
+			return true
+		}
+	}
+	return false
+}
+
 // classifySessionShimPrepareFailure marks a composing authority's failure to
 // answer so callers can tell it from a refusal.
 //
 // A typed conflict is returned unchanged: it is the authority's verdict. So is
 // a failure already carrying the sentinel, so classification is idempotent
-// across the nested seams a preparation passes through. Everything else the
+// across the nested seams a preparation passes through. A converting-branch
+// 409 arrives in the same place: it is the same verdict in a transport's
+// clothing, so it is folded onto the conflict sentinel here rather than left
+// as a separate uncovered failure mode. Everything else the
 // authority hands back is a round trip that did not complete — a deadline, a
 // 5xx, a reset connection — and gains the sentinel. Local refusals raised
 // BEFORE the authority is asked (the readiness gate, the configuration checks)
 // and local validation of what it answered never reach here: both are this
 // daemon's own definite verdicts, and re-asking would only repeat them.
 //
-// THE CONFLICT EXEMPTION IS CURRENTLY LATENT, ON PURPOSE. No composing
-// authority in the field constructs ErrSessionShimAdoptionPrepareConflict yet,
-// so today a definite refusal is classified as unanswered and re-asked to the
-// bound. That is wasteful rather than wrong: a conforming authority resolves a
-// re-ask as the same content-addressed preparation and refuses it again before
-// any durable write, so the extra asks cost read-only round trips and are
-// spent, at most, once per launch. Defaulting the other way would be the
-// dangerous direction — it would make an unanswered ask terminal, which is the
-// exact bug this file exists to remove — so the classification stays
-// conservative and the exemption waits for an authority that maps its typed
-// refusal codes onto the sentinel.
+// THE CONFLICT EXEMPTION IS NO LONGER LATENT. A composing authority reports
+// its converting-branch refusal either by wrapping
+// ErrSessionShimAdoptionPrepareConflict or, when its transport hands the
+// failure back as a plain error, as an HTTP 409 carrying the closed
+// converting-branch token — sessionShimPrepareConflict recognises both, so a
+// definite 409 refusal is never retried as unanswered.
 func classifySessionShimPrepareFailure(err error) error {
 	if err == nil ||
 		errors.Is(err, ErrSessionShimAdoptionPrepareConflict) ||
 		errors.Is(err, ErrSessionShimAdoptionPrepareUnavailable) {
 		return err
+	}
+	if sessionShimPrepareConflict(err) {
+		return fmt.Errorf("%w: %w", ErrSessionShimAdoptionPrepareConflict, err)
 	}
 	return fmt.Errorf("%w: %w", ErrSessionShimAdoptionPrepareUnavailable, err)
 }

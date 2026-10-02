@@ -8,28 +8,53 @@ import (
 	"testing"
 	"time"
 
+	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/sessionshim"
 )
+
+// errTestConflict409 is the shared client conflict sentinel wrapped as a
+// composing authority's preparation failure: the transport decoded the HTTP
+// 409, so the refusal text carries no status code of its own.
+var errTestConflict409 = fmt.Errorf("prepare adoption: %w", afclient.ErrConflict)
 
 // TestSessionShimPrepareFailureClassification pins the rule everything else in
 // this file rests on: a composing authority's REFUSAL and its failure to answer
 // are different facts, and only the second one may be retried. The
 // classification is by sentinel and errors.Is, so rewording an embedder's
 // message can never silently turn a refusal into a retryable failure or the
-// other way round.
+// other way round. The converting-branch 409 fold belongs to the same rule:
+// a 409 carrying the closed refusal token is the same refusal in a
+// transport's clothing, and must classify as a conflict — never retried.
 func TestSessionShimPrepareFailureClassification(t *testing.T) {
 	t.Parallel()
 	conflict := fmt.Errorf("authority says no: %w", ErrSessionShimAdoptionPrepareConflict)
 	for name, tc := range map[string]struct {
 		err             error
 		wantUnavailable bool
+		wantConflict    bool
 		wantSame        bool
 	}{
 		"nil is not a failure at all": {
 			err: nil, wantSame: true,
 		},
 		"a typed conflict is an answer and is returned unchanged": {
-			err: conflict, wantSame: true,
+			err: conflict, wantSame: true, wantConflict: true,
+		},
+		"a converting-branch 409 is the same refusal in transport clothing": {
+			err:          errors.New("post adoption preparation: HTTP 409: branch converting-branch is converting"),
+			wantConflict: true,
+		},
+		"a 409 without the refusal token is not a preparation conflict": {
+			err:             errors.New("post adoption preparation: HTTP 409: some other conflict"),
+			wantUnavailable: true,
+		},
+		"a shared client 409 conflict is the same refusal": {
+			err:          fmt.Errorf("post adoption preparation: %w", errTestConflict409),
+			wantConflict: true,
+		},
+		"the token without a 409 is not a transport refusal": {
+			err:             errors.New("converting-branch state observed while polling"),
+			wantUnavailable: true,
 		},
 		"a deadline is the authority not answering": {
 			err:             fmt.Errorf("post adoption preparation: %w", context.DeadlineExceeded),
@@ -57,12 +82,18 @@ func TestSessionShimPrepareFailureClassification(t *testing.T) {
 			if gotUnavailable := errors.Is(got, ErrSessionShimAdoptionPrepareUnavailable); gotUnavailable != tc.wantUnavailable {
 				t.Fatalf("classify(%v) unavailable = %v, want %v", tc.err, gotUnavailable, tc.wantUnavailable)
 			}
+			if gotConflict := errors.Is(got, ErrSessionShimAdoptionPrepareConflict); gotConflict != tc.wantConflict {
+				t.Fatalf("classify(%v) conflict = %v, want %v", tc.err, gotConflict, tc.wantConflict)
+			}
 			if tc.err != nil && !errors.Is(got, tc.err) {
 				t.Fatalf("classify(%v) = %v; the original cause must survive classification", tc.err, got)
 			}
 			if errors.Is(tc.err, ErrSessionShimAdoptionPrepareConflict) &&
 				errors.Is(got, ErrSessionShimAdoptionPrepareUnavailable) {
 				t.Fatalf("classify(%v) turned an authority's refusal into a retryable failure", tc.err)
+			}
+			if tc.wantConflict && errors.Is(got, ErrSessionShimAdoptionPrepareUnavailable) {
+				t.Fatalf("classify(%v) turned a converting-branch refusal into a retryable failure", tc.err)
 			}
 		})
 	}
@@ -360,4 +391,104 @@ func TestAnUnansweredPreparationIsBoundedAndCostsOneLineageOnly(t *testing.T) {
 	if restored.revision == before.revision {
 		t.Fatalf("the recovered launch published no new revision: still %q", restored.revision)
 	}
+}
+
+// TestAConvertingBranchRefusalIsTerminalOnTheFirstAttempt pins the fold this
+// change exists for: a preparation the authority refuses because the branch is
+// converting is an ANSWER, not an unanswered round trip, so it is terminal on
+// the first attempt — no retry ladder is spent — and the same ordered teardown
+// runs as for a spent bound: the launched worker is stopped before the accept
+// fails, so it can never find its worktree gone.
+func TestAConvertingBranchRefusalIsTerminalOnTheFirstAttempt(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.opts.SessionShim.HostID = "host-prepare-conflict"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	d.opts.SessionShim.Orphan.Deadline = 6 * time.Second
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	probe := &dynamicPublicationProbe{}
+	probe.carrierEpoch.Store(40)
+	configureDynamicPublicationProbe(t, d, probe)
+	var mu sync.Mutex
+	var asks []int
+	healthy := d.opts.SessionShim.PrepareAdoption
+	d.opts.SessionShim.PrepareAdoption = func(_ context.Context, preparation SessionShimAdoptionPreparation) (sessionshim.PreparedAdoption, error) {
+		mu.Lock()
+		asks = append(asks, preparation.Attempt)
+		mu.Unlock()
+		// The raw transport shape: the HTTP 409 the prepare endpoint
+		// returns for a converting branch, handed back as a plain error.
+		return sessionshim.PreparedAdoption{}, errors.New("post adoption preparation: HTTP 409: branch converting-branch is converting")
+	}
+	_ = healthy
+	process := f.captureLaunchProcess(t)
+
+	handle, err := d.spawner.AcceptWork(f.interactiveSpec("prepare-conflict"))
+	if err == nil {
+		t.Fatalf("AcceptWork succeeded (%+v) for a refused preparation", handle)
+	}
+	if !errors.Is(err, ErrSessionShimAdoptionPrepareConflict) {
+		t.Fatalf("refused launch error = %v, want the preparation-conflict sentinel", err)
+	}
+	if errors.Is(err, ErrSessionShimAdoptionPrepareUnavailable) {
+		t.Fatalf("refused launch error = %v; a refusal must never classify as unanswered", err)
+	}
+	mu.Lock()
+	got := append([]int(nil), asks...)
+	mu.Unlock()
+	if len(got) != 1 || got[0] != 1 {
+		t.Fatalf("preparation asks = %v, want exactly one terminal attempt", got)
+	}
+	launched := process.identity()
+	if launched.PID <= 0 {
+		t.Fatal("no launched process identity was captured; the launch never reached the discovery wait")
+	}
+	if alive, aliveErr := launched.Alive(); alive || aliveErr != nil {
+		t.Fatalf("the refused worker %s is still alive after the accept failed (err: %v)", launched, aliveErr)
+	}
+	assertShimChildReaped(t, launched.PID)
+	if got := len(d.AdoptedSessionShims()); got != 0 {
+		t.Fatalf("adopted sessions = %d after a refused launch, want none", got)
+	}
+}
+
+// TestASpentPrepareBoundStopsTheLaunchedWorker pins the ordered teardown half:
+// a preparation bound spent on unanswered round trips stops the launched
+// worker before the accept fails, so a still-running harness never finds its
+// worktree gone. The existing end-to-end test proves the bound and the host
+// invariants; this one proves the pid is gone.
+func TestASpentPrepareBoundStopsTheLaunchedWorker(t *testing.T) {
+	f := newShimSpawnFixture(t)
+	d := f.daemon
+	d.setState(StateRunning)
+	d.shims.adoptionComplete = true
+	d.opts.SessionShim.HostID = "host-prepare-bound-stop"
+	d.opts.SessionShim.RequireAuthoritativeSnapshot = true
+	d.opts.SessionShim.Orphan.Deadline = 6 * time.Second
+	enableHostedFullHostFramesForTest(t, d, f.orgID)
+	probe := &dynamicPublicationProbe{}
+	probe.carrierEpoch.Store(40)
+	configureDynamicPublicationProbe(t, d, probe)
+	authority := &unansweredPrepareAuthority{healthy: d.opts.SessionShim.PrepareAdoption}
+	d.opts.SessionShim.PrepareAdoption = authority.prepare
+	process := f.captureLaunchProcess(t)
+
+	authority.arm(sessionShimPrepareAttempts)
+	handle, err := d.spawner.AcceptWork(f.interactiveSpec("prepare-bound-stop"))
+	if err == nil {
+		t.Fatalf("AcceptWork succeeded (%+v) for an unpreparable launch", handle)
+	}
+	if !errors.Is(err, ErrSessionShimAdoptionPrepareUnavailable) {
+		t.Fatalf("unpreparable launch error = %v, want the unanswered-preparation sentinel", err)
+	}
+	launched := process.identity()
+	if launched.PID <= 0 {
+		t.Fatal("no launched process identity was captured; the launch never reached the discovery wait")
+	}
+	if alive, aliveErr := launched.Alive(); alive || aliveErr != nil {
+		t.Fatalf("the unpreparable worker %s is still alive after the accept failed (err: %v)", launched, aliveErr)
+	}
+	assertShimChildReaped(t, launched.PID)
 }

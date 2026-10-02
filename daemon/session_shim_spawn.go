@@ -330,12 +330,38 @@ func (d *Daemon) launchSessionShim(spec SessionSpec, project ProjectConfig, env 
 	if err != nil {
 		slog.Error("session shim: could not adopt the shim it just launched",
 			"session", id.String(), "error", err)
+		// ORDERED TEARDOWN. The launch never reached trackLaunchedShim, so no
+		// adopted-set pass, startup adoption pass, or quarantine reconciliation
+		// can ever find this shim — and a worker that published its discovery
+		// record HAS armed sessionshim's own orphan clock, whose deadline still
+		// runs. But the orphan clock is the escape hatch, not the plan: a
+		// still-running harness must be stopped before the spawner reports the
+		// launch aborted and releases the workarea, never concurrently with
+		// that release, so it can never find its worktree gone out from under
+		// it. A spent prepare bound leaves no controller behind (Dial returns
+		// nil on failure), so the stop is the process-group termination this
+		// daemon pinned at spawn — the same verb the discovery-abandon path
+		// uses for a worker that never published at all. A refusal (the
+		// converting-branch 409 folded onto the conflict sentinel, or any
+		// other definite answer) is terminal on the first attempt and stops
+		// the same way: re-asking cannot change a refusal, and leaving the
+		// harness running cannot either.
+		d.stopUnadoptedLaunchedShim(id, started, launchProcess, err)
 		return nil, fmt.Errorf("session shim: adopt %s: %w", id, err)
 	}
 	// Everything left of the handshake belongs to the attempt that won it.
 	ctx = adoptCtx
 	evidence, err := d.sessionShimAdoptionEvidence(ctx, ctrl, prepared, preparedHostID)
 	if err != nil {
+		// The dial won and the preparation was answered, but the evidence
+		// resolution failed — so this path OWNS a live controller. Stop the
+		// harness through it (generation-fenced, the verb a bare Close cannot
+		// supply) before closing and before the spawner releases the
+		// workarea. Order is the whole point: see the dial-failure path above.
+		if stopErr := ctrl.Stop(shimwire.StopPolicy); stopErr != nil {
+			slog.Warn("session shim: could not ask the un-adopted shim to stop after a failed adoption",
+				"session", id.String(), "error", stopErr)
+		}
 		_ = ctrl.Close()
 		return nil, fmt.Errorf("session shim: resolve adoption host %s: %w", id, err)
 	}
