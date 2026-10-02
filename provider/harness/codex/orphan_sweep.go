@@ -285,6 +285,22 @@ type SweepOptions struct {
 	// call remove()/harvestPluginCache() themselves). Empty means the same
 	// default resolveCodexPluginCacheDir("") gives every boundary.
 	PluginCacheDir string
+	// RetainedHomeTTL bounds how long a codex-home holding resumable
+	// session state (codexSessionStateSubdir) is preserved once it is
+	// otherwise an orphan — owner dead, child dead or untracked, idle past
+	// the applicable age floor. Without it the rollout-retention rule keeps
+	// every turned session's home forever and per-crash growth becomes
+	// per-session growth. Past this whole-tree idle age the home is fully
+	// removed (an audit line names it) and reported as ExpiredRetained.
+	// Empty means DefaultRetainedHomeTTL.
+	RetainedHomeTTL time.Duration
+	// ProtectedHomes names absolute codex-home paths the sweep must never
+	// touch: homes still referenced by a live adopted session's resume key.
+	// A restarted daemon's owner manifest names a dead process for those
+	// homes, so the ordinary owner-liveness gate cannot protect them — yet
+	// their app-server may have been re-adopted and be serving. Entries are
+	// compared after filepath.Clean; an empty set protects nothing.
+	ProtectedHomes map[string]struct{}
 
 	// processAlive / processLooksLikeCodex / identityAlive / now / startAt
 	// are test seams; production leaves them nil and gets the real
@@ -328,11 +344,20 @@ type SweepReport struct {
 	// any future sweep while it stays in that shape: it is free, and it is
 	// the count an operator watches to see retained state accumulating.
 	SkippedIrreducible int
-	Terminated         int
-	SkippedYoung       int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
-	SkippedLive        int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
-	SkippedAmbiguous   int // a live PID that failed identity or binary-identity verification — never touched.
-	Errors             int
+	// ExpiredRetained counts retained homes (resumable session state present)
+	// reclaimed in full because their whole-tree idle age passed
+	// RetainedHomeTTL. The operator watches this climb to confirm the
+	// retention budget is actually reaping instead of accumulating.
+	ExpiredRetained int
+	// SkippedProtected counts entries left alone because their absolute path
+	// appears in ProtectedHomes — a live adopted session still references
+	// the home via its resume key.
+	SkippedProtected int
+	Terminated       int
+	SkippedYoung     int // MinAge or UnverifiedMinAge gate — "too young to judge yet", never a liveness signal.
+	SkippedLive      int // a verified-or-fallback-live owner (or, historically, child) — "still owned", not age.
+	SkippedAmbiguous int // a live PID that failed identity or binary-identity verification — never touched.
+	Errors           int
 }
 
 func (opts SweepOptions) withDefaults() SweepOptions {
@@ -359,6 +384,9 @@ func (opts SweepOptions) withDefaults() SweepOptions {
 	}
 	if opts.BinaryHint == "" {
 		opts.BinaryHint = "codex"
+	}
+	if opts.RetainedHomeTTL <= 0 {
+		opts.RetainedHomeTTL = DefaultRetainedHomeTTL
 	}
 	if opts.Logger == nil {
 		opts.Logger = slog.Default()
@@ -537,6 +565,8 @@ func SweepOrphans(ctx context.Context, opts SweepOptions) SweepReport {
 		"skippedUnowned", report.SkippedUnowned,
 		"skippedIrreducible", report.SkippedIrreducible,
 		"terminated", report.Terminated,
+		"expiredRetained", report.ExpiredRetained,
+		"skippedProtected", report.SkippedProtected,
 		"skippedYoung", report.SkippedYoung,
 		"skippedLive", report.SkippedLive,
 		"skippedAmbiguous", report.SkippedAmbiguous,
@@ -554,6 +584,17 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 	info, err := os.Lstat(path)
 	if err != nil || info.Mode()&os.ModeSymlink != 0 || !info.IsDir() {
 		// Not a plain directory (or already gone) — never our shape.
+		return false
+	}
+	// PROTECTED-HOME gate: a live adopted session may still reference this
+	// home via its resume key, while the owner manifest names a previous
+	// daemon generation that is definitionally dead. The manifest liveness
+	// gate below cannot protect those homes, so the caller's explicit set
+	// does — before any signal, delete, or manifest read.
+	if _, ok := opts.ProtectedHomes[filepath.Clean(path)]; ok {
+		report.SkippedProtected++
+		opts.Logger.Debug("codex: orphan sweep left an artifact directory referenced by a live adopted session",
+			"path", path, "kind", kind)
 		return false
 	}
 	// PROVENANCE first, and separately from any manifest: a donmai-codex-*
@@ -581,7 +622,7 @@ func (opts SweepOptions) sweepOne(ctx context.Context, path, kind string, report
 		report.SkippedYoung++
 		return false
 	}
-	return opts.reclaim(path, kind, report)
+	return opts.reclaim(path, kind, info, report)
 }
 
 // sweepManifested handles an entry whose owner manifest this process proved
@@ -601,7 +642,7 @@ func (opts SweepOptions) sweepManifested(ctx context.Context, path, kind string,
 			report.SkippedYoung++
 			return false
 		}
-		return opts.reclaim(path, kind, report)
+		return opts.reclaim(path, kind, info, report)
 	}
 	if opts.now().Sub(info.ModTime()) < opts.MinAge {
 		// The strongest-evidence path (a verified manifest with a pinned
@@ -620,7 +661,7 @@ func (opts SweepOptions) sweepManifested(ctx context.Context, path, kind string,
 	if !alive {
 		// Confirmed: the owner is dead AND the exact child incarnation it
 		// started is dead too (identity-verified, not just "PID absent").
-		return opts.reclaim(path, kind, report)
+		return opts.reclaim(path, kind, info, report)
 	}
 	if !opts.processLooksLikeCodex(manifest.ChildIdentity.PID, opts.BinaryHint) {
 		// The recorded identity is alive and IS the same incarnation this
@@ -635,7 +676,7 @@ func (opts SweepOptions) sweepManifested(ctx context.Context, path, kind string,
 	if !opts.terminate(ctx, manifest.ChildIdentity, path, report) {
 		return true // it did signal a process; the directory stays.
 	}
-	opts.reclaim(path, kind, report)
+	opts.reclaim(path, kind, info, report)
 	return true
 }
 
@@ -801,6 +842,14 @@ func (opts SweepOptions) ownerAlive(manifest donmaiOwnerManifest) bool {
 // relocation work above is what removes both.
 const codexSessionStateSubdir = "sessions"
 
+// DefaultRetainedHomeTTL bounds how long a codex-home holding resumable
+// session state is preserved once it is otherwise an orphan. Whole-tree
+// idle age past this reaps the home in full (see reclaimRetainedExpired).
+// Thirty days keeps a crashed session resumable across restarts and
+// holidays while still bounding the retained-home population a host
+// accumulates; a home touched more recently than this is never expired.
+const DefaultRetainedHomeTTL = 30 * 24 * time.Hour
+
 // declaredDeletableEntries returns the exact top-level entries donmai itself
 // creates inside an artifact directory of this kind — the ONLY things a
 // sweep may ever delete from it.
@@ -857,7 +906,7 @@ func declaredDeletableEntries(kind string, hasSessionState bool) map[string]bool
 // that session paid for is otherwise simply lost, for exactly the sessions
 // most likely to need the cache-reuse mechanism (ones that crashed before
 // they could call remove()/harvestPluginCache() themselves).
-func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) bool {
+func (opts SweepOptions) reclaim(path, kind string, info os.FileInfo, report *SweepReport) bool {
 	entries, err := os.ReadDir(path)
 	if err != nil {
 		report.Errors++
@@ -870,6 +919,26 @@ func (opts SweepOptions) reclaim(path, kind string, report *SweepReport) bool {
 		// conservative answer is "assume yes" rather than risk deleting the
 		// keys a resume needs.
 		hasSessionState = true
+	}
+	// Retention-budget reap: a retained home (resumable session state
+	// present) that has sat wholly idle past RetainedHomeTTL is reclaimed
+	// in full, with an audit line naming it. This is the ONLY path that
+	// removes session state, and it requires both provenance (established
+	// by the caller) and whole-tree idleness past a floor far larger than
+	// either liveness floor — a live session's writes keep resetting it.
+	// Protected homes never reach here: sweepOne returns before any
+	// manifest read, signal, or delete for them.
+	if hasSessionState && kind == sweepKindCodexHome && info != nil && opts.idleLongerThan(path, info, opts.RetainedHomeTTL) {
+		opts.harvestOrphanedPluginCache(path)
+		if err := os.RemoveAll(path); err != nil {
+			report.Errors++
+			opts.Logger.Warn("codex: orphan sweep failed to reap an expired retained home", "path", path, "kind", kind, "err", err)
+			return true
+		}
+		report.ExpiredRetained++
+		opts.Logger.Info("codex: orphan sweep reaped an expired retained home holding resumable session state",
+			"path", path, "kind", kind, "retainedTTL", opts.RetainedHomeTTL)
+		return true
 	}
 	deletable := declaredDeletableEntries(kind, hasSessionState)
 	present := 0

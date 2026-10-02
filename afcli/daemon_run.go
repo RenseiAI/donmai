@@ -19,6 +19,7 @@ import (
 	"github.com/RenseiAI/donmai/afclient"
 	"github.com/RenseiAI/donmai/daemon"
 	"github.com/RenseiAI/donmai/internal/statepath"
+	providercodex "github.com/RenseiAI/donmai/provider/harness/codex"
 	"github.com/RenseiAI/donmai/runner"
 	"github.com/RenseiAI/donmai/runtime/mcpheaders"
 	"github.com/RenseiAI/donmai/runtime/statehome"
@@ -334,6 +335,10 @@ func newDaemonRunCmd(cfg Config) *cobra.Command {
 				ProtectedRuntimeMCPHelperCommandBuilder: protectedRuntimeMCPHelperCommand,
 				SpawnerOptions:                          spawnerOpts,
 				Version:                                 hostVersion,
+				// The real, filesystem-scanning/process-signalling sweep —
+				// only the production entry point configures this seam; see
+				// Options.CodexOrphanSweeper's doc comment.
+				CodexOrphanSweeper: providercodex.SweepOrphans,
 			}
 			applyDaemonControlAuth(&daemonOpts, controlTokenPath(), errOut)
 			d = daemon.New(daemonOpts)
