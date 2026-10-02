@@ -675,12 +675,12 @@ func TestListIssuesPaginatesAboveLinearPageLimit(t *testing.T) {
 	})
 
 	filter := map[string]any{"team": map[string]any{"id": map[string]any{"eq": "team-1"}}}
-	issues, err := c.ListIssues(context.Background(), filter, 300, "updatedAt")
+	result, err := c.ListIssues(context.Background(), filter, 300, "updatedAt")
 	if err != nil {
 		t.Fatalf("ListIssues: %v", err)
 	}
-	if len(issues) != 300 || issues[0].ID != "issue-000" || issues[299].ID != "issue-299" {
-		t.Fatalf("issues length/order = %d, first=%q last=%q", len(issues), issues[0].ID, issues[len(issues)-1].ID)
+	if len(result.Issues) != 300 || result.Issues[0].ID != "issue-000" || result.Issues[299].ID != "issue-299" {
+		t.Fatalf("issues length/order = %d, first=%q last=%q", len(result.Issues), result.Issues[0].ID, result.Issues[len(result.Issues)-1].ID)
 	}
 	if len(requests) != 2 {
 		t.Fatalf("requests = %d, want 2", len(requests))
@@ -767,12 +767,12 @@ func TestListIssuesManualOrderUsesNativeSortAcrossPages(t *testing.T) {
 		}
 	})
 
-	issues, err := c.ListIssues(context.Background(), map[string]any{"state": map[string]any{"name": map[string]any{"eq": "Backlog"}}}, 251, "manual")
+	result, err := c.ListIssues(context.Background(), map[string]any{"state": map[string]any{"name": map[string]any{"eq": "Backlog"}}}, 251, "manual")
 	if err != nil {
 		t.Fatalf("ListIssues manual: %v", err)
 	}
-	if len(issues) != 251 || issues[0].ID != "issue-000" || issues[249].ID != "issue-249" || issues[250].ID != "issue-250" {
-		t.Fatalf("manual page order = len %d, first=%q last two=%q,%q", len(issues), issues[0].ID, issues[249].ID, issues[250].ID)
+	if len(result.Issues) != 251 || result.Issues[0].ID != "issue-000" || result.Issues[249].ID != "issue-249" || result.Issues[250].ID != "issue-250" {
+		t.Fatalf("manual page order = len %d, first=%q last two=%q,%q", len(result.Issues), result.Issues[0].ID, result.Issues[249].ID, result.Issues[250].ID)
 	}
 	if len(requests) != 2 || requests[1]["after"] != "manual-page-1" {
 		t.Fatalf("manual pagination variables = %#v", requests)
@@ -782,7 +782,7 @@ func TestListIssuesManualOrderUsesNativeSortAcrossPages(t *testing.T) {
 			t.Fatalf("page %d did not request native manual order and rank: variables=%#v selectedRank=%v", i+1, requests[i], rankSelections[i])
 		}
 	}
-	raw, err := json.Marshal(issues)
+	raw, err := json.Marshal(result.Issues)
 	if err != nil {
 		t.Fatalf("marshal issues: %v", err)
 	}
@@ -808,11 +808,11 @@ func TestListIssuesManualOrderPreservesZeroAndMissingRanks(t *testing.T) {
 		writeGQLData(w, `{"issues":{"nodes":[{"id":"zero","identifier":"ENG-1","title":"Zero","priority":0,"sortOrder":0},{"id":"missing","identifier":"ENG-2","title":"Missing","priority":2,"sortOrder":null}],"pageInfo":{"hasNextPage":false,"endCursor":null}}}`)
 	})
 
-	issues, err := c.ListIssues(context.Background(), nil, 2, "manual")
+	result, err := c.ListIssues(context.Background(), nil, 2, "manual")
 	if err != nil {
 		t.Fatalf("ListIssues manual: %v", err)
 	}
-	raw, err := json.Marshal(issues)
+	raw, err := json.Marshal(result.Issues)
 	if err != nil {
 		t.Fatalf("marshal issues: %v", err)
 	}
@@ -888,12 +888,12 @@ func TestListIssuesManualOrderSurfacesUnsupportedNativeSort(t *testing.T) {
 		writeGQLError(w, "Unknown argument sort")
 	})
 
-	issues, err := c.ListIssues(context.Background(), nil, 1, "manual")
+	result, err := c.ListIssues(context.Background(), nil, 1, "manual")
 	if err == nil || !strings.Contains(err.Error(), "Unknown argument sort") {
 		t.Fatalf("ListIssues manual error = %v, want native sort error", err)
 	}
-	if issues != nil {
-		t.Fatalf("manual sort returned partial issues: %#v", issues)
+	if result != nil {
+		t.Fatalf("manual sort returned partial issues: %#v", result)
 	}
 	if requests != 1 {
 		t.Fatalf("requests = %d, want one failed native-order request and no fallback", requests)
@@ -928,13 +928,13 @@ func TestListIssuesDeduplicatesAndPreservesFirstSeenOrder(t *testing.T) {
 		}
 	})
 
-	issues, err := c.ListIssues(context.Background(), nil, 4, "createdAt")
+	result, err := c.ListIssues(context.Background(), nil, 4, "createdAt")
 	if err != nil {
 		t.Fatalf("ListIssues: %v", err)
 	}
-	got := make([]string, len(issues))
-	for i := range issues {
-		got[i] = issues[i].ID
+	got := make([]string, len(result.Issues))
+	for i := range result.Issues {
+		got[i] = result.Issues[i].ID
 	}
 	if strings.Join(got, ",") != "a,b,c,d" {
 		t.Fatalf("issue order = %v, want [a b c d]", got)
@@ -944,18 +944,55 @@ func TestListIssuesDeduplicatesAndPreservesFirstSeenOrder(t *testing.T) {
 	}
 }
 
+func TestListIssuesReportsTruncationOnlyWhenPagesRemain(t *testing.T) {
+	t.Parallel()
+
+	newTruncatingClient := func(t *testing.T, hasNext bool) *Client {
+		t.Helper()
+		c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
+			nodes := []issueNode{
+				{ID: "issue-1", Identifier: "ENG-1", Title: "First"},
+				{ID: "issue-2", Identifier: "ENG-2", Title: "Second"},
+			}
+			cursor := "page-1"
+			var endCursor *string
+			if hasNext {
+				endCursor = &cursor
+			}
+			writeIssuePage(w, nodes, hasNext, endCursor)
+		})
+		return c
+	}
+
+	truncated, err := newTruncatingClient(t, true).ListIssues(context.Background(), nil, 2, "createdAt")
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(truncated.Issues) != 2 || !truncated.Truncated {
+		t.Fatalf("truncated result = %d issues truncated=%v, want 2/true", len(truncated.Issues), truncated.Truncated)
+	}
+
+	exhausted, err := newTruncatingClient(t, false).ListIssues(context.Background(), nil, 2, "createdAt")
+	if err != nil {
+		t.Fatalf("ListIssues: %v", err)
+	}
+	if len(exhausted.Issues) != 2 || exhausted.Truncated {
+		t.Fatalf("exhausted result = %d issues truncated=%v, want 2/false", len(exhausted.Issues), exhausted.Truncated)
+	}
+}
+
 func TestListIssuesRejectsInvalidLimitsWithoutRequest(t *testing.T) {
 	t.Parallel()
 
 	requests := 0
 	c, _ := newTestClient(t, func(http.ResponseWriter, *http.Request) { requests++ })
 	for _, limit := range []int{0, -1, MaxIssueListLimit + 1} {
-		issues, err := c.ListIssues(context.Background(), nil, limit, "createdAt")
+		result, err := c.ListIssues(context.Background(), nil, limit, "createdAt")
 		if err == nil {
 			t.Fatalf("limit %d: want error", limit)
 		}
-		if issues != nil {
-			t.Fatalf("limit %d: returned partial issues %#v", limit, issues)
+		if result != nil {
+			t.Fatalf("limit %d: returned partial issues %#v", limit, result)
 		}
 	}
 	if requests != 0 {
@@ -985,12 +1022,12 @@ func TestListIssuesFailsClosedOnMalformedConnection(t *testing.T) {
 			c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 				writeGQLData(w, tc.data)
 			})
-			issues, err := c.ListIssues(context.Background(), nil, 10, "createdAt")
+			result, err := c.ListIssues(context.Background(), nil, 10, "createdAt")
 			if err == nil || !strings.Contains(err.Error(), tc.wantErr) {
 				t.Fatalf("ListIssues error = %v, want %q", err, tc.wantErr)
 			}
-			if issues != nil {
-				t.Fatalf("returned partial issues: %#v", issues)
+			if result != nil {
+				t.Fatalf("returned partial issues: %#v", result)
 			}
 		})
 	}
@@ -1002,12 +1039,12 @@ func TestListIssuesRejectsPageLargerThanRequested(t *testing.T) {
 	c, _ := newTestClient(t, func(w http.ResponseWriter, _ *http.Request) {
 		writeIssuePage(w, []issueNode{{ID: "issue-1"}, {ID: "issue-2"}}, false, nil)
 	})
-	issues, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
+	result, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
 	if err == nil || !strings.Contains(err.Error(), "issues returned 2 nodes for page size 1") {
 		t.Fatalf("ListIssues error = %v, want oversized-page error", err)
 	}
-	if issues != nil {
-		t.Fatalf("returned partial issues: %#v", issues)
+	if result != nil {
+		t.Fatalf("returned partial issues: %#v", result)
 	}
 }
 
@@ -1024,12 +1061,12 @@ func TestListIssuesFailsClosedOnCursorCycle(t *testing.T) {
 		writeIssuePage(w, []issueNode{}, true, &cursor)
 	})
 
-	issues, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
+	result, err := c.ListIssues(context.Background(), nil, 1, "createdAt")
 	if err == nil || !strings.Contains(err.Error(), `issues cursor cycle detected at "page-1"`) {
 		t.Fatalf("ListIssues error = %v, want cursor-cycle error", err)
 	}
-	if issues != nil {
-		t.Fatalf("returned partial issues: %#v", issues)
+	if result != nil {
+		t.Fatalf("returned partial issues: %#v", result)
 	}
 }
 
@@ -1047,12 +1084,12 @@ func TestListIssuesDiscardsPartialResultsWhenLaterPageFails(t *testing.T) {
 		writeGQLError(w, "later page denied")
 	})
 
-	issues, err := c.ListIssues(context.Background(), nil, 2, "createdAt")
+	result, err := c.ListIssues(context.Background(), nil, 2, "createdAt")
 	if !errors.Is(err, ErrGraphQLError) {
 		t.Fatalf("ListIssues error = %v, want ErrGraphQLError", err)
 	}
-	if issues != nil {
-		t.Fatalf("returned partial issues: %#v", issues)
+	if result != nil {
+		t.Fatalf("returned partial issues: %#v", result)
 	}
 }
 

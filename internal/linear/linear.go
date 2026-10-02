@@ -7,7 +7,7 @@ type Linear interface {
 	// Read operations
 	GetIssue(ctx context.Context, id string) (*Issue, error)
 	ListIssuesByProject(ctx context.Context, projectName string, states []string) ([]Issue, error)
-	ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) ([]Issue, error)
+	ListIssues(ctx context.Context, filter map[string]any, limit int, orderBy string) (*IssueListResult, error)
 	ListSubIssues(ctx context.Context, parentID string) ([]Issue, error)
 	ListBacklogIssues(ctx context.Context, projectID string, states []string, parentsOnly bool) ([]Issue, error)
 	GetIssueComments(ctx context.Context, issueID string) ([]Comment, error)
