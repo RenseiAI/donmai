@@ -11,10 +11,11 @@ import (
 )
 
 // TestRedactShimChildLogMasksSecretShapes pins the redaction pass: every
-// shimChildLogSecretPatterns shape is masked to same-length 'x' runs, and
-// content the guard has no business touching — bytes past the snapshot size
-// it was given, simulating a concurrent append from the shim child's own
-// O_APPEND writes — is left completely untouched.
+// shimChildLogSecretPatterns shape is masked (KEY=VALUE env lines keep
+// their key name and mask only the value), and content the guard has no
+// business touching — bytes past the snapshot size it was given, simulating
+// a concurrent append from the shim child's own O_APPEND writes — is left
+// completely untouched.
 func TestRedactShimChildLogMasksSecretShapes(t *testing.T) {
 	t.Parallel()
 
@@ -23,6 +24,9 @@ func TestRedactShimChildLogMasksSecretShapes(t *testing.T) {
 		secret string
 	}{
 		{"bearer token", "Authorization: Bearer abcDEF012345678.ghiJKL901234"},
+		{"jwt", "auth eyJhbGciOiJIUzI1NiJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJVadQssw5c done"},
+		{"secret-like KEY=VALUE env line", "DATABASE_PASSWORD=hunter2supersecretvalue"},
+		{"exported secret-like KEY=VALUE env line", "export PRIVATE_KEY=AbCdEfGhIjKlMnOpQrStUvWxYz123456"},
 		{"openai-style sk- key", "OPENAI_API_KEY=sk-abcdefghijklmnopqrstuvwx"},
 		{"rensei rsk_ token", "token=rsk_abcdefghijklmnopqrstuvwxyz0123"},
 		{"rensei rsp_ token", "reg=rsp_abcdefghijklmnopqrstuvwxyz0123"},
@@ -63,6 +67,38 @@ func TestRedactShimChildLogMasksSecretShapes(t *testing.T) {
 			}
 			if !bytes.Contains(got, bytes.Repeat([]byte("x"), 8)) {
 				t.Fatalf("expected a masked run of 'x' characters in %q", got)
+			}
+		})
+	}
+}
+
+// TestRedactShimChildLogKeepsPathsUUIDsAndSessionIDsReadable pins the
+// other half of the contract: file paths, UUIDs, and session ids must
+// survive redaction untouched, because the failure tail exists to explain a
+// failed spawn and masking the path defeats it.
+func TestRedactShimChildLogKeepsPathsUUIDsAndSessionIDsReadable(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name string
+		line string
+	}{
+		{"missing scenario file path", "scenario file is missing: /var/lib/donmai/scenarios/acceptance-checklist.json\n"},
+		{"absolute json path", "open /tmp/.donmai/scenarios/run-42.json: no such file\n"},
+		{"uuid", "launch 550e8400-e29b-41d4-a716-446655440000 failed\n"},
+		{"session id", "session sess-3b1b6067-49ef-400a-98ef-766108de360a never published a record\n"},
+		{"digest filename beside its record", "kept 9f1c8a2b3d4e5f60718293a4b5c6d7e8f.log beside the record\n"},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			buf := []byte(tc.line)
+			if redactShimChildLogBytes(buf) {
+				t.Fatalf("redaction masked readable content %q, got %q", tc.line, buf)
+			}
+			if string(buf) != tc.line {
+				t.Fatalf("redaction changed readable content: got %q, want %q", buf, tc.line)
 			}
 		})
 	}

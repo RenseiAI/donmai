@@ -30,11 +30,10 @@ func TestFailedShimLaunchKeepsTheChildLogAndStopsTheGuard(t *testing.T) {
 	dir := t.TempDir()
 	registryDir := dir + "/registry"
 	const sessionID = "sess-failed-launch-keeps-log"
-	// Short, space-separated words on purpose: shimChildLogSecretPatterns
-	// carries a deliberately broad catch-all for any 32+ character opaque run,
-	// so a long hyphenated marker would be masked as a suspected credential —
-	// which is correct behaviour, and is pinned by
-	// TestPreservedShimChildLogTailIsRedacted below.
+	// Short, space-separated words on purpose: the generic base64 catch-all
+	// still masks long standalone opaque runs, so a long run without path
+	// or identifier neighbours is treated as a suspected credential — which
+	// is correct behaviour.
 	const childOutput = "the child said why it died"
 
 	d := New(Options{

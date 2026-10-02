@@ -1351,23 +1351,26 @@ const shimChildLogTruncationMarkerFormat = "\n[donmai] shim child log truncated 
 
 // shimChildLogSecretPatterns are the credential shapes redacted from a
 // launched shim's captured stdout/stderr before the guard leaves them on
-// disk: an authorization header ("Bearer <token>"), well-known prefixed
-// API-key/machine-token shapes (OpenAI-style sk-, and the dmk_/rsk_/rsp_
-// prefixes cmd/donmai/main.go's own credential resolution already
-// recognizes), and a generic catch-all for any other long opaque
-// base64/hex-shaped run a provider's own stderr might carry (e.g.
-// provider/harness/clijsonl's raw claude-CLI stderr passthrough). The
-// catch-all is deliberately broad — it will also mask non-secret long
-// identifiers (commit SHAs, session hashes) — a false positive there is the
-// accepted trade-off for an OSS-safe, provider-agnostic default; this file
-// never inspects or special-cases any one provider's output shape.
+// disk: an authorization header ("Bearer <token>"), JWT-shaped runs, the
+// well-known prefixed API-key/machine-token shapes (OpenAI-style sk-, and
+// the dmk_/rsk_/rsp_ prefixes the credential resolution already
+// recognizes), a generic catch-all for long opaque base64-shaped runs a
+// provider's own stderr might carry (e.g. a CLI harness's raw stderr
+// passthrough), and KEY=VALUE env lines whose key looks secret-like (the
+// value alone is masked). Paths, UUIDs and session ids stay readable: the
+// generic catch-all matches only standalone base64-shaped runs, and the
+// mask loop skips a catch-all hit sitting inside a longer path or
+// hyphenated identifier, so a missing-file path or session id in a failure
+// tail survives redaction.
 var shimChildLogSecretPatterns = []*regexp.Regexp{
 	regexp.MustCompile(`(?i)\bBearer\s+[A-Za-z0-9._~+/=-]{8,}`),
+	regexp.MustCompile(`\beyJ[A-Za-z0-9_-]{8,}\.[A-Za-z0-9_-]{8,}(\.[A-Za-z0-9_-]{8,})?`),
 	regexp.MustCompile(`\bsk-[A-Za-z0-9_-]{16,}`),
 	regexp.MustCompile(`\brsk_[A-Za-z0-9_-]{16,}`),
 	regexp.MustCompile(`\brsp_[A-Za-z0-9_-]{16,}`),
 	regexp.MustCompile(`\bdmk_[A-Za-z0-9]{16,}`),
-	regexp.MustCompile(`\b[A-Za-z0-9+/_-]{32,}\b`),
+	regexp.MustCompile("(?i)(?:^|[\\s\"'](?:export\\s+)?)[A-Za-z0-9_.-]*(?:api[_-]?key|auth[_-]?token|secret|password|passwd|private[_-]?key|access[_-]?token|client[_-]?secret|bearer[_-]?token)[A-Za-z0-9_.-]*(\\s*[=:]\\s*)([A-Za-z0-9._~+/=-]{8,})"),
+	regexp.MustCompile(`\b[A-Za-z0-9+/]{32,}={0,2}\b`),
 }
 
 // runShimChildLogGuard periodically redacts and caps a launched shim's
@@ -1466,7 +1469,12 @@ func redactShimChildLog(f *os.File, size int64) error {
 
 // redactShimChildLogBytes masks every shimChildLogSecretPatterns match in buf
 // with the ASCII byte 'x', in place and span-for-span, and reports whether it
-// changed anything.
+// changed anything. A KEY=VALUE pattern masks only its value group (submatch
+// 2) so the key name stays readable, and the generic base64 catch-all (the
+// last pattern entry) skips a match sitting inside a longer path or
+// identifier — a neighbouring '/', '.', or '-' means a path segment, a
+// filename with an extension, or a hyphenated UUID/session id, and masking
+// it would defeat the failure tail's purpose of explaining a failed spawn.
 //
 // Split out of redactShimChildLog so the on-disk pass and the failure tail
 // carried out on an error share ONE definition of what a secret looks like. A
@@ -1474,17 +1482,51 @@ func redactShimChildLog(f *os.File, size int64) error {
 // beside it had already masked.
 func redactShimChildLogBytes(buf []byte) bool {
 	changed := false
-	for _, pattern := range shimChildLogSecretPatterns {
-		for _, loc := range pattern.FindAllIndex(buf, -1) {
-			for i := loc[0]; i < loc[1]; i++ {
-				if buf[i] != 'x' {
-					changed = true
-				}
-				buf[i] = 'x'
+	mask := func(start, end int) {
+		for i := start; i < end; i++ {
+			if buf[i] != 'x' {
+				changed = true
 			}
+			buf[i] = 'x'
+		}
+	}
+	for pi, pattern := range shimChildLogSecretPatterns {
+		isCatchAll := pi == len(shimChildLogSecretPatterns)-1
+		for _, loc := range pattern.FindAllSubmatchIndex(buf, -1) {
+			start, end := loc[0], loc[1]
+			if len(loc) >= 6 && loc[4] >= 0 && loc[5] >= 0 && loc[5] > loc[4] {
+				mask(loc[4], loc[5])
+				continue
+			}
+			if isCatchAll && shimChildLogCatchAllSkip(buf, start, end) {
+				continue
+			}
+			mask(start, end)
 		}
 	}
 	return changed
+}
+
+// shimChildLogCatchAllSkip reports whether a generic base64 catch-all match
+// is really part of a path, filename, or hyphenated identifier rather than a
+// standalone opaque blob. A neighbouring slash, dot, or hyphen means the run
+// continues past the match boundary, and a trailing underscore means an
+// identifier continues there too. Standalone blobs after '=' or whitespace
+// have no such neighbour and are still masked.
+func shimChildLogCatchAllSkip(buf []byte, start, end int) bool {
+	if start > 0 {
+		switch buf[start-1] {
+		case '/', '.', '-':
+			return true
+		}
+	}
+	if end < len(buf) {
+		switch buf[end] {
+		case '/', '.', '-', '_':
+			return true
+		}
+	}
+	return false
 }
 
 // capShimChildLog truncates f back to shimChildLogCapBytes and appends one
