@@ -3,6 +3,8 @@ package daemon
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
@@ -299,6 +301,65 @@ func TestRebindRefusesALineageWhoseHarnessIsNoLongerLive(t *testing.T) {
 	}
 	if adoptions, _ := f.snapshot(); adoptions != 0 {
 		t.Fatalf("durable adoption ran %d times for a lineage with no live harness, want none", adoptions)
+	}
+}
+
+// TestRebindTreatsAnUnreadableRegistryRecordAsLive pins the fail-open half of
+// the rebind gate. When the registry record cannot be read,
+// sessionShimHarnessLive reports live WITH the read error — a momentarily
+// unreadable record must not refuse the repair of a lineage the shim can
+// still serve — so the rebind proceeds past the gate toward the adoption dial
+// instead of refusing with SessionShimHarnessNotLive. The adoption pass then
+// reports what it found (no adoptable record under the corrupted identity)
+// rather than the gate refusing a lineage it never examined.
+func TestRebindTreatsAnUnreadableRegistryRecordAsLive(t *testing.T) {
+	t.Parallel()
+	f := newReadoptFixtureWithOptions(t, readoptFixtureOptions{policy: SessionShimReadoptionPolicy{Disabled: true}})
+	loseTheCarrierBinding(t, f)
+
+	// Corrupt the fixture identity's discovery record in place: the daemon's
+	// registry handle is already open, so only the record READ fails — the
+	// transient-read-failure shape the fail-open branch exists for. The live
+	// shim keeps its controller throughout, so nothing republishes underneath
+	// the corrupted file.
+	if _, err := f.registry.Get(f.id); err != nil {
+		t.Fatalf("registry.Get before corruption: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(f.registry.Dir(), f.id.RecordName()), []byte("{not json"), 0o600); err != nil {
+		t.Fatalf("corrupt registry record: %v", err)
+	}
+
+	// The seam itself: an unreadable record reads live, with the read error
+	// alongside it — never fail-closed.
+	live, liveErr := f.daemon.sessionShimHarnessLive(f.id)
+	if liveErr == nil {
+		t.Fatal("sessionShimHarnessLive = (live, nil) for an unreadable record, want the registry read error alongside live=true")
+	}
+	if !live {
+		t.Fatalf("sessionShimHarnessLive = (false, %v) for an unreadable record, want live=true so the repair is not refused", liveErr)
+	}
+	if !errors.Is(liveErr, sessionshim.ErrRecordInvalid) {
+		t.Fatalf("sessionShimHarnessLive error = %v, want it to wrap the record read failure", liveErr)
+	}
+
+	// And the caller continues past the gate toward adoption: no
+	// SessionShimHarnessNotLive refusal, and the in-flight claim the gate
+	// precedes is taken and released by the attempt that follows.
+	result, err := f.daemon.RebindAdoptedSessionShim(context.Background(), f.id.OrgID, f.id.SessionID)
+	if result == SessionShimHarnessNotLive || errors.Is(err, ErrSessionShimHarnessNotLive) {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v for an unreadable record, want the rebind to proceed past the harness-live gate", result, err)
+	}
+	if err == nil || !strings.Contains(err.Error(), "re-adoption") {
+		t.Fatalf("RebindAdoptedSessionShim = %s, %v, want the adoption pass to report what it found for the corrupted identity", result, err)
+	}
+	f.daemon.shims.mu.RLock()
+	rebinding := f.daemon.shims.adopted[f.id].rebinding
+	f.daemon.shims.mu.RUnlock()
+	if rebinding {
+		t.Fatal("the rebind left the in-flight claim held after its adoption attempt failed")
+	}
+	if adoptions, _ := f.snapshot(); adoptions != 0 {
+		t.Fatalf("durable adoption ran %d times for an identity with no readable record, want none — the dial found nothing to adopt", adoptions)
 	}
 }
 
