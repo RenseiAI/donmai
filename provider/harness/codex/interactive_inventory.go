@@ -11,6 +11,7 @@ import (
 	"slices"
 	"sort"
 	"strings"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -19,6 +20,8 @@ import (
 // whose MCP surface differs from the exact server set the runner requested.
 // The PTY is never started after this error.
 var ErrInteractiveCodexMCPIsolation = errors.New("codex interactive MCP configuration is not exclusive")
+
+const codexRedactedHTTPHeadersHelper = "<redacted>"
 
 type interactiveMCPInventoryRunner func(
 	ctx context.Context,
@@ -121,6 +124,10 @@ func verifyExclusiveInteractiveMCP(
 	launch interactiveLaunch,
 	ownedHome string,
 ) error {
+	verifiedHelpers, err := verifyExactInteractiveMCPHelpers(ctx, binary, spec, launch, ownedHome)
+	if err != nil {
+		return fmt.Errorf("%w: effective protected helper readback failed: %v", ErrInteractiveCodexMCPIsolation, err)
+	}
 	configArgs, err := interactiveConfigArgs(launch.argv)
 	if err != nil {
 		return fmt.Errorf("%w: %v", ErrInteractiveCodexMCPIsolation, err)
@@ -159,11 +166,102 @@ func verifyExclusiveInteractiveMCP(
 		if entry.Name != strings.TrimSpace(server.Name) {
 			return fmt.Errorf("%w: requested server %q read back as %q", ErrInteractiveCodexMCPIsolation, server.Name, entry.Name)
 		}
+		if helper, ok := verifiedHelpers[entry.Name]; ok && entry.Transport.HTTPHeadersHelper != nil &&
+			*entry.Transport.HTTPHeadersHelper == codexRedactedHTTPHeadersHelper {
+			// Codex deliberately redacts this executable field from `mcp get`.
+			// Substitute only after the separate app-server config/read proof above
+			// returned the exact unredacted effective value from the same generated
+			// session override and private CODEX_HOME.
+			entry.Transport.HTTPHeadersHelper = &helper
+		}
 		if err := compareInteractiveMCPEntry(server, entry); err != nil {
 			return fmt.Errorf("%w: server %q: %v", ErrInteractiveCodexMCPIsolation, entry.Name, err)
 		}
 	}
 	return nil
+}
+
+func verifyExactInteractiveMCPHelpers(
+	ctx context.Context,
+	binary string,
+	spec agent.Spec,
+	launch interactiveLaunch,
+	ownedHome string,
+) (_ map[string]string, retErr error) {
+	want := make(map[string]string)
+	for _, server := range spec.MCPServers {
+		if helper, ok := agent.ProtectedRuntimeMCPHeadersHelper(server); ok {
+			want[strings.TrimSpace(server.Name)] = helper
+		}
+	}
+	if len(want) == 0 {
+		return nil, nil
+	}
+
+	// The probe performs only initialize/initialized and config/read. Clear the
+	// attach signal so this preflight can never resume or create a thread.
+	probeSpec := spec
+	probeSpec.SessionName = ""
+	probeSpec.Interactive = nil
+	probeCtx, cancel := context.WithTimeout(ctx, 35*time.Second)
+	defer cancel()
+	probe, err := startNamedInteractiveAppServer(
+		probeCtx,
+		binary,
+		Options{HandshakeTimeout: 15 * time.Second, RPCTimeout: 15 * time.Second},
+		probeSpec,
+		launch,
+		launch.env,
+		ownedHome,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("start bounded effective-config probe: %w", err)
+	}
+	defer func() {
+		retErr = errors.Join(retErr, probe.close())
+	}()
+	client := probe.getClient()
+	if client == nil {
+		return nil, errors.New("effective-config probe has no diagnostic client")
+	}
+	raw, err := client.request(probeCtx, "config/read", map[string]any{
+		"cwd": spec.Cwd, "includeLayers": true,
+	}, 15*time.Second)
+	if err != nil {
+		return nil, fmt.Errorf("config/read: %w", err)
+	}
+	var response struct {
+		Config map[string]json.RawMessage `json:"config"`
+	}
+	if err := json.Unmarshal(raw, &response); err != nil {
+		return nil, fmt.Errorf("decode config/read: %w", err)
+	}
+	serversRaw, ok := response.Config[codexMCPConfigKeyPath]
+	if !ok {
+		return nil, errors.New("config/read omitted the effective MCP server set")
+	}
+	var servers map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(serversRaw, &servers); err != nil {
+		return nil, fmt.Errorf("decode effective MCP server set: %w", err)
+	}
+	for name, expected := range want {
+		server, ok := servers[name]
+		if !ok {
+			return nil, fmt.Errorf("config/read omitted protected server %q", name)
+		}
+		helperRaw, ok := server["http_headers_helper"]
+		if !ok {
+			return nil, fmt.Errorf("config/read omitted protected helper for server %q", name)
+		}
+		var actual string
+		if err := json.Unmarshal(helperRaw, &actual); err != nil {
+			return nil, fmt.Errorf("decode protected helper for server %q: %w", name, err)
+		}
+		if actual != expected {
+			return nil, fmt.Errorf("effective protected helper differs for server %q", name)
+		}
+	}
+	return want, nil
 }
 
 func compareInteractiveMCPListNames(want []agent.MCPServerConfig, got []codexMCPInventoryEntry) error {
@@ -204,8 +302,16 @@ func compareInteractiveMCPEntry(want agent.MCPServerConfig, got codexMCPInventor
 		return errors.New("effective tool filters were widened by another config layer")
 	}
 	t := got.Transport
-	if t.Cwd != nil || len(t.Env) != 0 || t.BearerTokenEnvVar != nil || len(t.HTTPHeaders) != 0 || t.HTTPHeadersHelper != nil {
+	if t.Cwd != nil || len(t.Env) != 0 || t.BearerTokenEnvVar != nil || len(t.HTTPHeaders) != 0 {
 		return errors.New("effective transport contains undeclared fields from another config layer")
+	}
+	wantHelper, hasWantHelper := agent.ProtectedRuntimeMCPHeadersHelper(want)
+	if hasWantHelper {
+		if t.HTTPHeadersHelper == nil || *t.HTTPHeadersHelper != wantHelper {
+			return errors.New("effective protected header helper differs from the requested server")
+		}
+	} else if t.HTTPHeadersHelper != nil {
+		return errors.New("effective transport contains an undeclared protected header helper")
 	}
 	switch strings.ToLower(strings.TrimSpace(want.Type)) {
 	case "", "stdio":

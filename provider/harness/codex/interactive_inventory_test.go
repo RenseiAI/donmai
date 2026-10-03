@@ -55,6 +55,99 @@ func TestCompareInteractiveMCPInventoryRequiresExactExclusiveSurface(t *testing.
 	}
 }
 
+func TestCompareInteractiveMCPInventoryAcceptsOnlyExactDeclaredProtectedHelper(t *testing.T) {
+	want := helperBackedServer(t)
+	want.Headers = map[string]string{"X-Declared": "fixture-value"}
+	helper, ok := agent.ProtectedRuntimeMCPHeadersHelper(want)
+	if !ok {
+		t.Fatal("protected helper missing from requested server")
+	}
+	exact := codexMCPInventoryEntry{Name: want.Name, Enabled: true}
+	exact.Transport.Type = "streamable_http"
+	exact.Transport.URL = want.URL
+	exact.Transport.HTTPHeadersHelper = &helper
+	exact.Transport.EnvHTTPHeaders = map[string]string{
+		"X-Declared": codexHTTPHeaderEnvName(want.Name, "X-Declared"),
+	}
+	if err := compareInteractiveMCPEntry(want, exact); err != nil {
+		t.Fatalf("exact declared protected helper: %v", err)
+	}
+
+	missing := exact
+	missing.Transport.HTTPHeadersHelper = nil
+	if err := compareInteractiveMCPEntry(want, missing); err == nil {
+		t.Fatal("missing declared protected helper was accepted")
+	}
+
+	changed := exact
+	other := "different-private-helper"
+	changed.Transport.HTTPHeadersHelper = &other
+	if err := compareInteractiveMCPEntry(want, changed); err == nil {
+		t.Fatal("changed declared protected helper was accepted")
+	}
+
+	plainHTTP := agent.MCPServerConfig{
+		Name: want.Name, Type: "http", URL: want.URL,
+		Headers: map[string]string{"X-Declared": "fixture-value"},
+	}
+	if err := compareInteractiveMCPEntry(plainHTTP, exact); err == nil {
+		t.Fatal("undeclared protected helper was accepted")
+	}
+
+	stdio := agent.MCPServerConfig{Name: "stdio", Type: "stdio", Command: "/usr/bin/false"}
+	stdioInventory := codexMCPInventoryEntry{Name: stdio.Name, Enabled: true}
+	stdioInventory.Transport.Type = "stdio"
+	stdioInventory.Transport.Command = stdio.Command
+	stdioInventory.Transport.HTTPHeadersHelper = &helper
+	if err := compareInteractiveMCPEntry(stdio, stdioInventory); err == nil {
+		t.Fatal("protected HTTP helper on stdio transport was accepted")
+	}
+
+	for name, mutate := range map[string]func(*codexMCPInventoryEntry){
+		"disabled status": func(got *codexMCPInventoryEntry) { got.Enabled = false },
+		"disabled reason": func(got *codexMCPInventoryEntry) {
+			reason := "requirements"
+			got.DisabledReason = &reason
+		},
+		"startup timeout": func(got *codexMCPInventoryEntry) {
+			timeout := 1.0
+			got.StartupTimeout = &timeout
+		},
+		"tool timeout": func(got *codexMCPInventoryEntry) {
+			timeout := 1.0
+			got.ToolTimeout = &timeout
+		},
+		"enabled tool filter": func(got *codexMCPInventoryEntry) {
+			got.EnabledTools = []string{"tool"}
+		},
+		"disabled tool filter": func(got *codexMCPInventoryEntry) {
+			got.DisabledTools = []string{"tool"}
+		},
+		"cwd": func(got *codexMCPInventoryEntry) {
+			cwd := "/tmp/ambient"
+			got.Transport.Cwd = &cwd
+		},
+		"environment": func(got *codexMCPInventoryEntry) {
+			got.Transport.Env = map[string]string{"POISON": "present"}
+		},
+		"bearer environment": func(got *codexMCPInventoryEntry) {
+			key := "AMBIENT_TOKEN"
+			got.Transport.BearerTokenEnvVar = &key
+		},
+		"static authorization": func(got *codexMCPInventoryEntry) {
+			got.Transport.HTTPHeaders = map[string]string{"Authorization": "Bearer poison"}
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			widened := exact
+			mutate(&widened)
+			if err := compareInteractiveMCPEntry(want, widened); err == nil {
+				t.Fatal("ambient helper authority was accepted")
+			}
+		})
+	}
+}
+
 func TestVerifyExclusiveInteractiveMCPFailsBeforePTYOnReadbackError(t *testing.T) {
 	spec := agent.Spec{
 		Cwd: t.TempDir(),
