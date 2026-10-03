@@ -2199,25 +2199,19 @@ func (r *Runner) consumeEvents(
 	// (idleC stays nil → its select case never fires).
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	var idleTimer *time.Timer
+	var idleTimer interviewTimer
 	var idleC <-chan time.Time
 	if r.idleTimeout > 0 {
-		idleTimer = time.NewTimer(r.idleTimeout)
+		idleTimer = r.idleTimer(r.idleTimeout)
 		defer idleTimer.Stop()
-		idleC = idleTimer.C
+		idleC = idleTimer.Chan()
 	}
 	// resetIdle re-arms the watchdog after each observed event. Drains a
-	// possibly-already-fired timer channel before Reset per the stdlib
-	// time.Timer contract.
+	// possibly-already-fired timer tick before Reset so a stale fire from
+	// the prior window cannot trip the next select.
 	resetIdle := func() {
 		if idleTimer == nil {
 			return
-		}
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
 		}
 		idleTimer.Reset(r.idleTimeout)
 	}

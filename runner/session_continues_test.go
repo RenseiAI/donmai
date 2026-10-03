@@ -69,26 +69,60 @@ func TestConsumeEvents_ErrorTheSessionContinuesPast(t *testing.T) {
 	t.Run("continuing error", func(t *testing.T) {
 		t.Parallel()
 		r := minimalRunner(t)
-		r.idleTimeout = 30 * time.Millisecond
+		r.idleTimeout = time.Minute
+		clk := newIdleManualClock()
+		r.idleClock = clk
 		events := make(chan agent.Event, 4)
-		events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "long"}
-		events <- continuingError
-		go func() {
-			// Silent past several idle windows while the call runs.
-			time.Sleep(120 * time.Millisecond)
-			events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "long", Content: "ok"}
-			events <- agent.ResultEvent{Success: true}
-		}()
-		ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		type consumeResult struct {
+			obs streamObservation
+			err error
+		}
+		done := make(chan consumeResult, 1)
+		wpath := t.TempDir()
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 		defer cancel()
-		obs, err := r.consumeEvents(ctx, &fakeHandle{events: events}, t.TempDir(), QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-1")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
-		if err != nil || obs.noProgress {
-			t.Fatalf("err = %v, noProgress = %v; want the running call to keep the stream alive past the error", err, obs.noProgress)
+		go func() {
+			obs, err := r.consumeEvents(ctx, &fakeHandle{events: events}, wpath, QueuedWork{QueuedWork: queuedWorkBase("CONTINUES-1")}, nil, NewBudgetEnforcer(nil, time.Now()), noopSink{}, nil)
+			done <- consumeResult{obs: obs, err: err}
+		}()
+		// The ToolUseEvent is observed synchronously by the consumer
+		// before the first reset, so waiting for reset 1 proves the
+		// consumer saw the call start; the continuing error follows
+		// on the same stream (reset 2).
+		events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "long"}
+		clk.waitForIdleResets(t, 1)
+		events <- continuingError
+		clk.waitForIdleResets(t, 2)
+		// Several silent idle windows elapse while the call runs; each
+		// must re-arm (reset count grows) instead of ending the
+		// session with the parent-context error the old sleep-based
+		// test saw intermittently.
+		clk.fire()
+		clk.waitForIdleResets(t, 3)
+		clk.fire()
+		clk.waitForIdleResets(t, 4)
+		clk.fire()
+		clk.waitForIdleResets(t, 5)
+		select {
+		case res := <-done:
+			t.Fatalf("consumeEvents returned early: err = %v, noProgress = %v; want the running call to keep the stream alive past the error", res.err, res.obs.noProgress)
+		default:
 		}
-		if obs.errorEvent != nil {
-			t.Fatalf("errorEvent = %+v; want nil for an error the session continues past", obs.errorEvent)
+		events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "long", Content: "ok"}
+		events <- agent.ResultEvent{Success: true}
+		var res consumeResult
+		select {
+		case res = <-done:
+		case <-time.After(10 * time.Second):
+			t.Fatal("consumeEvents did not return after the tool result and terminal event")
 		}
-		if !obs.terminalSuccess {
+		if res.err != nil || res.obs.noProgress {
+			t.Fatalf("err = %v, noProgress = %v; want the running call to keep the stream alive past the error", res.err, res.obs.noProgress)
+		}
+		if res.obs.errorEvent != nil {
+			t.Fatalf("errorEvent = %+v; want nil for an error the session continues past", res.obs.errorEvent)
+		}
+		if !res.obs.terminalSuccess {
 			t.Fatal("terminalSuccess = false; want the session's own terminal")
 		}
 	})
