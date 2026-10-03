@@ -225,6 +225,8 @@ func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 			e.pending.InputTokens += v.InputTokens
 			e.pending.OutputTokens += v.OutputTokens
 			e.pending.CachedInputTokens += v.CachedInputTokens
+			e.pending.CacheWriteTokens += v.CacheWriteTokens
+			e.pending.ReasoningTokens += v.ReasoningTokens
 			e.pending.NumTurns++
 			breach := e.checkTokensLocked()
 			e.mu.Unlock()
@@ -322,12 +324,16 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 	return increment.InputTokens + increment.OutputTokens
 }
 
-// addCost returns the field-by-field sum of a and b.
+// addCost returns the field-by-field sum of a and b. ReasoningTokens rides
+// along as a count inside OutputTokens; the token cap meters InputTokens +
+// OutputTokens only, so cache and reasoning classes never move the meter.
 func addCost(a, b agent.CostData) agent.CostData {
 	return agent.CostData{
 		InputTokens:       a.InputTokens + b.InputTokens,
 		OutputTokens:      a.OutputTokens + b.OutputTokens,
 		CachedInputTokens: a.CachedInputTokens + b.CachedInputTokens,
+		CacheWriteTokens:  a.CacheWriteTokens + b.CacheWriteTokens,
+		ReasoningTokens:   a.ReasoningTokens + b.ReasoningTokens,
 		TotalCostUsd:      a.TotalCostUsd + b.TotalCostUsd,
 		NumTurns:          a.NumTurns + b.NumTurns,
 	}
@@ -340,6 +346,8 @@ func costDifference(total, previous agent.CostData) agent.CostData {
 		InputTokens:       max(total.InputTokens-previous.InputTokens, 0),
 		OutputTokens:      max(total.OutputTokens-previous.OutputTokens, 0),
 		CachedInputTokens: max(total.CachedInputTokens-previous.CachedInputTokens, 0),
+		CacheWriteTokens:  max(total.CacheWriteTokens-previous.CacheWriteTokens, 0),
+		ReasoningTokens:   max(total.ReasoningTokens-previous.ReasoningTokens, 0),
 		TotalCostUsd:      max(total.TotalCostUsd-previous.TotalCostUsd, 0),
 		NumTurns:          max(total.NumTurns-previous.NumTurns, 0),
 	}

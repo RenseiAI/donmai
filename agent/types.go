@@ -677,10 +677,17 @@ func ToolLifecycleProfileID(spec Spec) string { return spec.toolLifecycleProfile
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.
 //
 // All fields are optional; providers populate what they have available.
+//
+// Token accounting rule: InputTokens excludes cache read and cache write
+// tokens (those ride CachedInputTokens and CacheWriteTokens); ReasoningTokens
+// is a count inside OutputTokens, never an additive extra — totals must never
+// add it twice.
 type CostData struct {
 	InputTokens       int64   `json:"inputTokens,omitempty"`
 	OutputTokens      int64   `json:"outputTokens,omitempty"`
 	CachedInputTokens int64   `json:"cachedInputTokens,omitempty"`
+	CacheWriteTokens  int64   `json:"cacheWriteTokens,omitempty"`
+	ReasoningTokens   int64   `json:"reasoningTokens,omitempty"`
 	TotalCostUsd      float64 `json:"totalCostUsd,omitempty"`
 	NumTurns          int     `json:"numTurns,omitempty"`
 }

@@ -92,6 +92,8 @@ type SpanStatus struct {
 //	usageInputTokens          → gen_ai.usage.input_tokens
 //	usageOutputTokens         → gen_ai.usage.output_tokens
 //	usageCacheReadInputTokens → gen_ai.usage.cache_read_input_tokens
+//	usageCacheWriteInputTokens → gen_ai.usage.cache_creation.input_tokens
+//	usageReasoningTokens      → gen_ai.usage.reasoning_tokens
 //	responseFinishReason      → gen_ai.response.finish_reason
 //
 // Current OpenTelemetry conventions have since renamed several attributes:
@@ -113,6 +115,14 @@ type GenAIAttributes struct {
 	// UsageCacheReadInputTokens is the cache-read input token count. Current
 	// OTLP mapping targets gen_ai.usage.cache_read.input_tokens.
 	UsageCacheReadInputTokens int64 `json:"usageCacheReadInputTokens,omitempty"`
+	// UsageCacheWriteInputTokens is the cache-write (cache creation) input
+	// token count. Current OTLP mapping targets
+	// gen_ai.usage.cache_creation.input_tokens. Additive; omitted when zero.
+	UsageCacheWriteInputTokens int64 `json:"usageCacheWriteInputTokens,omitempty"`
+	// UsageReasoningTokens is the reasoning token count inside
+	// UsageOutputTokens, never an additive extra (see CostData). Additive;
+	// omitted when zero.
+	UsageReasoningTokens int64 `json:"usageReasoningTokens,omitempty"`
 	// ResponseFinishReason is the provider finish reason (e.g. "end_turn",
 	// "max_tokens"). Current OTLP mapping wraps it as the singular element of
 	// gen_ai.response.finish_reasons.
@@ -158,7 +168,7 @@ type DonmaiSpanExtensions struct {
 	ContextHash string `json:"contextHash,omitempty"`
 	// ModelSnapshotID is the exact model-snapshot identifier used.
 	ModelSnapshotID string `json:"modelSnapshotId,omitempty"`
-	// REN-2649 trace-correlation join keys (correlation only). Omitted when
+	// Trace-correlation join keys (correlation only). Omitted when
 	// absent; SessionID remains the legacy storage-id alias.
 	SessionStorageID string `json:"sessionStorageId,omitempty"`
 	SessionPublicID  string `json:"sessionPublicId,omitempty"`

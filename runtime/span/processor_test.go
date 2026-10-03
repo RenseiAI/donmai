@@ -62,13 +62,15 @@ func newTestProcessor(t *testing.T, recorder *spanRecorder, now func() time.Time
 func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name  string
-		cost  *agent.CostData
-		in    int64
-		out   int64
-		cache int64
+		name      string
+		cost      *agent.CostData
+		in        int64
+		out       int64
+		cache     int64
+		written   int64
+		reasoning int64
 	}{
-		{name: "reported aggregate", cost: &agent.CostData{InputTokens: 900, OutputTokens: 120, CachedInputTokens: 400, NumTurns: 7}, in: 900, out: 120, cache: 400},
+		{name: "reported aggregate", cost: &agent.CostData{InputTokens: 900, OutputTokens: 120, CachedInputTokens: 400, CacheWriteTokens: 50, ReasoningTokens: 30, NumTurns: 7}, in: 900, out: 120, cache: 400, written: 50, reasoning: 30},
 		{name: "usage unavailable", cost: nil},
 	}
 	for _, tc := range cases {
@@ -88,8 +90,8 @@ func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 			if !llm.Synthetic || llm.UsageSource != agent.LlmUsageAggregate {
 				t.Fatalf("fallback provenance = synthetic:%v source:%q", llm.Synthetic, llm.UsageSource)
 			}
-			if llm.InputTokens != tc.in || llm.OutputTokens != tc.out || llm.CachedInputTokens != tc.cache {
-				t.Fatalf("fallback changed aggregate counts: got %d/%d/%d want %d/%d/%d", llm.InputTokens, llm.OutputTokens, llm.CachedInputTokens, tc.in, tc.out, tc.cache)
+			if llm.InputTokens != tc.in || llm.OutputTokens != tc.out || llm.CachedInputTokens != tc.cache || llm.CacheWriteTokens != tc.written || llm.ReasoningTokens != tc.reasoning {
+				t.Fatalf("fallback changed aggregate counts: got %d/%d/%d/%d/%d want %d/%d/%d/%d/%d", llm.InputTokens, llm.OutputTokens, llm.CachedInputTokens, llm.CacheWriteTokens, llm.ReasoningTokens, tc.in, tc.out, tc.cache, tc.written, tc.reasoning)
 			}
 			if llm.PromptHash != "" || llm.ContextHash != "" {
 				t.Fatalf("fallback fabricated content correlation: %+v", llm)
@@ -102,7 +104,7 @@ func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 			if !ok {
 				t.Fatalf("span = %T, want LlmCallSpan", spans[0])
 			}
-			if span.GenAI.UsageInputTokens != tc.in || span.GenAI.UsageOutputTokens != tc.out || span.GenAI.UsageCacheReadInputTokens != tc.cache {
+			if span.GenAI.UsageInputTokens != tc.in || span.GenAI.UsageOutputTokens != tc.out || span.GenAI.UsageCacheReadInputTokens != tc.cache || span.GenAI.UsageCacheWriteInputTokens != tc.written || span.GenAI.UsageReasoningTokens != tc.reasoning {
 				t.Fatalf("span changed aggregate counts: %+v", span.GenAI)
 			}
 		})

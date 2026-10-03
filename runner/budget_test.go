@@ -326,6 +326,65 @@ func TestBudgetEnforcer_WrapUpPoint(t *testing.T) {
 	}
 }
 
+// TestBudgetEnforcer_CarriesEveryTokenClass pins that cache-write and
+// reasoning tokens ride the meter into the reported cost: per-call usage
+// accumulates them, a running-total ResultEvent reconciles them by
+// difference, and addCost sums them — while the token-cap meter still
+// counts input+output only.
+func TestBudgetEnforcer_CarriesEveryTokenClass(t *testing.T) {
+	t.Parallel()
+	turn := func(in, out, cached, written, reasoning int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			InputTokens: in, OutputTokens: out, CachedInputTokens: cached,
+			CacheWriteTokens: written, ReasoningTokens: reasoning,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000_000}, time.Now())
+	// First turn: per-call usage accumulates every class into pending.
+	if err := enf.ObserveEvent(turn(5, 200, 16526, 1200, 40)); err != nil {
+		t.Fatalf("ObserveEvent(call): %v", err)
+	}
+	got := enf.cost()
+	want := agent.CostData{
+		InputTokens: 5, OutputTokens: 200, CachedInputTokens: 16526,
+		CacheWriteTokens: 1200, ReasoningTokens: 40, NumTurns: 1,
+	}
+	if got == nil || *got != want {
+		t.Fatalf("per-call cost = %+v; want %+v", got, want)
+	}
+	// The turn's ResultEvent reports the running total; then a second
+	// turn's running total reconciles against it by difference per class.
+	first := &agent.CostData{
+		InputTokens: 5, OutputTokens: 200, CachedInputTokens: 16526,
+		CacheWriteTokens: 1200, ReasoningTokens: 40, NumTurns: 1,
+	}
+	if err := enf.ObserveEvent(agent.ResultEvent{Success: true, Cost: first}); err != nil {
+		t.Fatalf("ObserveEvent(first result): %v", err)
+	}
+	if err := enf.ObserveEvent(turn(5, 200, 0, 1200, 40)); err != nil {
+		t.Fatalf("ObserveEvent(call): %v", err)
+	}
+	second := &agent.CostData{
+		InputTokens: 10, OutputTokens: 400, CachedInputTokens: 16526,
+		CacheWriteTokens: 2400, ReasoningTokens: 80, NumTurns: 2,
+	}
+	if err := enf.ObserveEvent(agent.ResultEvent{Success: true, Cost: second}); err != nil {
+		t.Fatalf("ObserveEvent(second result): %v", err)
+	}
+	got = enf.cost()
+	want = agent.CostData{
+		InputTokens: 10, OutputTokens: 400, CachedInputTokens: 16526,
+		CacheWriteTokens: 2400, ReasoningTokens: 80, NumTurns: 2,
+	}
+	if got == nil || *got != want {
+		t.Fatalf("reconciled cost = %+v; want %+v", got, want)
+	}
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 410 {
+		t.Fatalf("ObservedTokens = %d; want 410 (input+output only)", rep.ObservedTokens)
+	}
+}
+
 // TestBudgetEnforcer_MetersWithoutABudget pins that the usage meter runs for
 // every session — the reported cost comes from it — while a session with no
 // budget is never breached.
