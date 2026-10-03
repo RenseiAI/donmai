@@ -192,7 +192,12 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 	if model != "" {
 		argv = append(argv, "--model", model)
 	}
-	if req.Effort != "" {
+	// Effort is emitted only when it is a level Claude recognises: an
+	// unrecognised stored value would be silently ignored by the CLI, which
+	// then falls back to the operator's saved level while the session records
+	// a different one. The effort env var (see oneShotEnv) already carries the
+	// model default in that case.
+	if req.Effort.Known() {
 		argv = append(argv, "--effort", string(req.Effort))
 	}
 	argv = append(argv, "--tools", "")

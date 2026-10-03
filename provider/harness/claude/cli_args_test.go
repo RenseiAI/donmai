@@ -157,6 +157,38 @@ func TestBuildArgs_ResumeFlag(t *testing.T) {
 	}
 }
 
+func TestBuildArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		effort   agent.EffortLevel
+		wantFlag bool
+		wantVal  string
+	}{
+		{name: "empty omits the flag", effort: "", wantFlag: false},
+		{name: "unrecognised value omits the flag", effort: agent.EffortLevel("none"), wantFlag: false},
+		{name: "another harness naming omits the flag", effort: agent.EffortLevel("minimal"), wantFlag: false},
+		{name: "known level emits the flag", effort: agent.EffortHigh, wantFlag: true, wantVal: "high"},
+		{name: "known max emits the flag", effort: agent.EffortMax, wantFlag: true, wantVal: "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			argv, _ := buildArgs(agent.Spec{Effort: tt.effort}, "", "")
+			idx := slices.Index(argv, "--effort")
+			if !tt.wantFlag {
+				if idx >= 0 {
+					t.Errorf("argv carries --effort %q for unrecognised effort %q: %v", argv[idx+1], tt.effort, argv)
+				}
+				return
+			}
+			if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != tt.wantVal {
+				t.Errorf("argv missing --effort %s for effort %q: %v", tt.wantVal, tt.effort, argv)
+			}
+		})
+	}
+}
+
 func TestBuildArgs_NoMCPConfig(t *testing.T) {
 	t.Parallel()
 

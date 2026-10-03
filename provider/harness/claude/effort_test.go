@@ -26,6 +26,8 @@ func TestWithEffortEnv(t *testing.T) {
 		want   string
 	}{
 		{name: "not configured selects the model default", effort: "", want: "auto"},
+		{name: "unrecognised value selects the model default", effort: agent.EffortLevel("none"), want: "auto"},
+		{name: "another harness naming selects the model default", effort: agent.EffortLevel("minimal"), want: "auto"},
 		{name: "configured max", effort: agent.EffortMax, want: "max"},
 		{name: "configured xhigh", effort: agent.EffortXHigh, want: "xhigh"},
 		{name: "configured low", effort: agent.EffortLow, want: "low"},

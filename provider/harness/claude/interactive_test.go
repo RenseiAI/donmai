@@ -68,6 +68,41 @@ func TestInteractiveArgs(t *testing.T) {
 	}
 }
 
+func TestInteractiveArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		effort   agent.EffortLevel
+		wantFlag bool
+		wantVal  string
+	}{
+		{name: "empty omits the flag", effort: "", wantFlag: false},
+		{name: "unrecognised value omits the flag", effort: agent.EffortLevel("none"), wantFlag: false},
+		{name: "another harness naming omits the flag", effort: agent.EffortLevel("minimal"), wantFlag: false},
+		{name: "known level emits the flag", effort: agent.EffortHigh, wantFlag: true, wantVal: "high"},
+		{name: "known max emits the flag", effort: agent.EffortMax, wantFlag: true, wantVal: "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			got := interactiveArgs(agent.Spec{Prompt: "fix the bug", Effort: tt.effort})
+			idx := slices.Index(got, "--effort")
+			if !tt.wantFlag {
+				if idx >= 0 {
+					t.Errorf("interactive argv carries --effort %q for unrecognised effort %q: %q", got[idx+1], tt.effort, got)
+				}
+				return
+			}
+			if idx < 0 || idx+1 >= len(got) || got[idx+1] != tt.wantVal {
+				t.Errorf("interactive argv missing --effort %s for effort %q: %q", tt.wantVal, tt.effort, got)
+			}
+			if last := got[len(got)-1]; last != "fix the bug" {
+				t.Errorf("prompt must stay last: %q", got)
+			}
+		})
+	}
+}
+
 func TestInteractiveArgs_MCPConfigPrecedesPositionalPrompt(t *testing.T) {
 	t.Parallel()
 	got := interactiveArgsWithMCP(agent.Spec{Prompt: "fix the bug"}, "/tmp/session-mcp.json")

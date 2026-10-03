@@ -178,7 +178,11 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// headless CLI does. Spawn also fixes CLAUDE_CODE_EFFORT_LEVEL
 	// (effort.go), which outranks every settings file, so an unconfigured
 	// session runs at the model's own default rather than the operator's.
-	if spec.Effort != "" {
+	// The flag is omitted unless the level is one Claude recognises: an
+	// unrecognised stored value would be silently ignored by the CLI, which
+	// then falls back to the operator's saved level while the session
+	// records a different one.
+	if spec.Effort.Known() {
 		argv = append(argv, "--effort", string(spec.Effort))
 	}
 

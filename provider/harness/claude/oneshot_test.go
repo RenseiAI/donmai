@@ -337,6 +337,49 @@ func TestComplete_ToolsFlagIsLastAndEmpty(t *testing.T) {
 	}
 }
 
+// TestBuildOneShotArgs_EffortFlagOnlyWhenKnown pins the one-shot lane's half
+// of the effort-flag gate: an unrecognised stored effort must not reach the
+// CLI as `--effort`, where it would be silently ignored in favour of the
+// operator's saved level. The env var (see oneShotEnv) already carries the
+// model default in that case.
+func TestBuildOneShotArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name     string
+		effort   agent.EffortLevel
+		wantFlag bool
+		wantVal  string
+	}{
+		{name: "empty omits the flag", effort: "", wantFlag: false},
+		{name: "unrecognised value omits the flag", effort: agent.EffortLevel("none"), wantFlag: false},
+		{name: "another harness naming omits the flag", effort: agent.EffortLevel("minimal"), wantFlag: false},
+		{name: "known level emits the flag", effort: agent.EffortLevel("high"), wantFlag: true, wantVal: "high"},
+		{name: "known max emits the flag", effort: agent.EffortMax, wantFlag: true, wantVal: "max"},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			argv, _ := buildOneShotArgs(agent.OneShotRequest{Effort: tt.effort})
+			idx := -1
+			for i, a := range argv {
+				if a == "--effort" {
+					idx = i
+					break
+				}
+			}
+			if !tt.wantFlag {
+				if idx >= 0 {
+					t.Errorf("one-shot argv carries --effort %q for unrecognised effort %q: %q", argv[idx+1], tt.effort, argv)
+				}
+				return
+			}
+			if idx < 0 || idx+1 >= len(argv) || argv[idx+1] != tt.wantVal {
+				t.Errorf("one-shot argv missing --effort %s for effort %q: %q", tt.wantVal, tt.effort, argv)
+			}
+		})
+	}
+}
+
 // TestComplete_EndpointModelWinsOverBareModel mirrors specFromOneShot's
 // precedence so the two one-shot lanes cannot disagree about which model runs.
 func TestComplete_EndpointModelWinsOverBareModel(t *testing.T) {
