@@ -265,16 +265,17 @@ func lockSiblingTarget(ctx context.Context, target string) (func(), error) {
 	if err != nil {
 		return nil, fmt.Errorf("open sibling lock: %w", err)
 	}
-	fd := file.Fd()
-	if fd > uintptr(math.MaxInt) {
+	raw := file.Fd()
+	if raw > uintptr(math.MaxInt) {
 		_ = file.Close()
 		return nil, fmt.Errorf("open sibling lock: %w", syscall.EBADF)
 	}
+	fd := int(raw)
 	for {
-		err := syscall.Flock(int(fd), syscall.LOCK_EX|syscall.LOCK_NB)
+		err := syscall.Flock(fd, syscall.LOCK_EX|syscall.LOCK_NB)
 		if err == nil {
 			return func() {
-				_ = syscall.Flock(int(fd), syscall.LOCK_UN)
+				_ = syscall.Flock(fd, syscall.LOCK_UN)
 				_ = file.Close()
 			}, nil
 		}
