@@ -34,7 +34,11 @@ import (
 // p1.1 -> p1.2: additive fixture-derived `realizations` and `capabilities`
 // arrays. The OSS catalog emits stable empty arrays; downstream generators
 // supply executed fixture sources without hand-authoring capability bits.
-const SchemaVersion = "p1.2"
+//
+// p1.2 -> p1.3: additive generated harness support page (SUPPORT.md) plus the
+// per-harness execution-security deny-baseline records in harnesses.json.
+// Both publish what the live manifests already declare; no consumer break.
+const SchemaVersion = "p1.3"
 
 // ContractABI pins the matrix-document contract version (distinct from the
 // per-manifest harness/v2 and model-endpoint/v1 ABIs).

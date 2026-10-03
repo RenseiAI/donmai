@@ -5,6 +5,7 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -39,7 +40,7 @@ func buildArtifacts(t *testing.T) *Artifacts {
 // byte-identical to the committed artifacts. If this fails, run `make generate`.
 func TestParity_ByteIdenticalToFreshGenerate(t *testing.T) {
 	arts := buildArtifacts(t)
-	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen, FileCapabilityRealizations} {
+	for _, name := range []string{FileCapabilityMatrix, FileHarnesses, FileEndpoints, FileMatrix, FileRegistryGen, FileCapabilityRealizations, FileSupport} {
 		want, err := os.ReadFile(name)
 		if err != nil {
 			t.Fatalf("read committed %s: %v (did you run `make generate`?)", name, err)
@@ -57,6 +58,49 @@ func TestParity_ByteIdenticalToFreshGenerate(t *testing.T) {
 	}
 	if _, err := os.Stat(filepath.Join(".", FileCapabilityRealizations)); err != nil {
 		t.Fatalf("capability realization artifact missing: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(".", FileSupport)); err != nil {
+		t.Fatalf("support page artifact missing: %v", err)
+	}
+}
+
+// TestParity_SupportPageDerivedFromGeneratedHarnesses proves the support page
+// is a derived projection, not a second source of truth: every page row maps
+// to a generated harness row's per-mode deny baselines, and the page carries
+// one row per generated execution-security record — no more, no fewer.
+func TestParity_SupportPageDerivedFromGeneratedHarnesses(t *testing.T) {
+	built, err := Build()
+	if err != nil {
+		t.Fatalf("Build(): %v", err)
+	}
+	arts, err := built.Render()
+	if err != nil {
+		t.Fatalf("Render(): %v", err)
+	}
+	page := string(arts.Files[FileSupport])
+	wantRows := 0
+	for _, h := range built.Harnesses {
+		wantRows += len(h.ExecutionSecurity)
+		for _, row := range h.ExecutionSecurity {
+			harnessCell := "| " + string(h.Name) + " | " + string(row.Mode) + " |"
+			if !strings.Contains(page, harnessCell) {
+				t.Errorf("support page has no row for harness %q mode %q", h.Name, row.Mode)
+			}
+			toolCell := "| " + string(row.ToolDenyBaseline) + " | "
+			if !strings.Contains(page, toolCell) {
+				t.Errorf("support page omits deny baseline %q for %q/%q", row.ToolDenyBaseline, h.Name, row.Mode)
+			}
+		}
+	}
+	lines := 0
+	for _, line := range strings.Split(page, "\n") {
+		if strings.HasPrefix(line, "| ") {
+			lines++
+		}
+	}
+	// Header row + separator row + one row per execution-security record.
+	if lines != wantRows+2 {
+		t.Errorf("support page has %d table lines; want %d (header + separator + %d harness/mode rows)", lines, wantRows+2, wantRows)
 	}
 }
 
