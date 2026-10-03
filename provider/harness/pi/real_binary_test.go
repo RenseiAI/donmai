@@ -128,9 +128,12 @@ type realBinaryStub struct {
 // stubResponse lets a focused conformance test make the real pi binary drive
 // one native tool call before the next model turn completes. The default stub
 // behavior remains the simple one-text-turn reply used by the existing tests.
+// ToolCalls carries a whole batch of tool calls in ONE assistant message —
+// the shape the sequential-tools fixture needs to prove ordering.
 type stubResponse struct {
-	Text     string
-	ToolCall *stubToolCall
+	Text      string
+	ToolCall  *stubToolCall
+	ToolCalls []stubToolCall
 }
 
 type stubToolCall struct {
@@ -193,7 +196,18 @@ func (s *realBinaryStub) handle(w http.ResponseWriter, r *http.Request) {
 	}
 	chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"role": "assistant"}}}})
 	finishReason := "stop"
-	if response.ToolCall != nil {
+	if len(response.ToolCalls) > 0 {
+		finishReason = "tool_calls"
+		calls := make([]map[string]any, 0, len(response.ToolCalls))
+		for i, tc := range response.ToolCalls {
+			calls = append(calls, map[string]any{
+				"index": i, "id": tc.ID, "type": "function", "function": map[string]any{
+					"name": tc.Name, "arguments": tc.Arguments,
+				},
+			})
+		}
+		chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": calls}}}})
+	} else if response.ToolCall != nil {
 		finishReason = "tool_calls"
 		chunk(map[string]any{"choices": []map[string]any{{"index": 0, "delta": map[string]any{"tool_calls": []map[string]any{{
 			"index": 0, "id": response.ToolCall.ID, "type": "function", "function": map[string]any{
