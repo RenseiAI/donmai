@@ -185,7 +185,7 @@ jobs:
   # never runs them; without this job the boundary has no CI coverage at all.
   macos-confinement:
     name: macOS executor confinement (seatbelt)
-    runs-on: macos-latest
+    runs-on: macos-15
     timeout-minutes: 25
     permissions:
       contents: read
