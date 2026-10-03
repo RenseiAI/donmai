@@ -82,6 +82,17 @@ const DefaultTurnContinuationLimit = 3
 // total applied when Options.TurnContinuationCeiling is zero.
 const DefaultTurnContinuationCeiling = 50
 
+// DefaultTurnContinuationUndeliveredLimit is the bound on continuation
+// prompts sent in a row while the session's pull request does not deliver
+// the work (still a draft, or, on a rework run, without a commit of the
+// session's own since the run started) and gains no commit of the
+// session's own, applied when Options.TurnContinuationUndeliveredLimit is
+// zero. A turn that pushes to the pull request starts the count again. It
+// is smaller than the overall ceiling: a session that keeps making tool
+// calls but neither pushes nor marks its draft ready ends not delivered
+// long before the runaway guard.
+const DefaultTurnContinuationUndeliveredLimit = 10
+
 // defaultProviderRetryBackoff spaces the retries after a provider error. The
 // harness has usually retried the model call itself before giving up, so the
 // runner waits a little longer each time before asking again.
@@ -197,6 +208,10 @@ const (
 	// prompt (continuations are disabled, or the harness takes no
 	// follow-up prompt).
 	boundUncontinuable
+	// boundUndelivered: the turn stopped early with a pull request that
+	// does not deliver the work, and the undelivered continuations reached
+	// their own bound.
+	boundUndelivered
 )
 
 // turnFollowUps is one session's runner-driven follow-up state.
@@ -204,8 +219,16 @@ type turnFollowUps struct {
 	// limit bounds the unproductive streak and, separately, the retries.
 	limit int
 	// ceiling bounds the continuation prompts in total; zero is no ceiling.
-	ceiling   int
-	continued int
+	ceiling int
+	// undeliveredLimit bounds undeliveredSent; zero is no separate bound.
+	undeliveredLimit int
+	continued        int
+	// undeliveredSent counts the continuation prompts sent while the
+	// session's pull request did not deliver the work (still a draft or,
+	// on a rework run, without a commit of the session's own since the run
+	// started), since its head last moved to a commit of the session's own.
+	// Continuations for any other reason never count.
+	undeliveredSent int
 	// unproductive is the streak of consecutive continuation prompts whose
 	// turn made no tool call and ended unfinished; a productive turn of any
 	// kind resets it.
@@ -226,9 +249,10 @@ type turnFollowUps struct {
 }
 
 // newTurnFollowUps resolves the configured bounds. For each, zero is the
-// default; a negative limit disables continuations and retries, and a
-// negative ceiling leaves continuations bounded only by the unproductive
-// streak and the session's own budgets.
+// default; a negative limit disables continuations and retries, a negative
+// ceiling leaves continuations bounded only by the unproductive streak and
+// the session's own budgets, and a negative undelivered limit leaves
+// undelivered continuations bounded only by those same bounds.
 func (r *Runner) newTurnFollowUps() *turnFollowUps {
 	limit := r.turnContinuationLimit
 	switch {
@@ -244,7 +268,35 @@ func (r *Runner) newTurnFollowUps() *turnFollowUps {
 	case ceiling < 0:
 		ceiling = 0
 	}
-	return &turnFollowUps{limit: limit, ceiling: ceiling}
+	undeliveredLimit := r.turnContinuationUndeliveredLimit
+	switch {
+	case undeliveredLimit == 0:
+		undeliveredLimit = DefaultTurnContinuationUndeliveredLimit
+	case undeliveredLimit < 0:
+		undeliveredLimit = 0
+	}
+	return &turnFollowUps{limit: limit, ceiling: ceiling, undeliveredLimit: undeliveredLimit}
+}
+
+// noteUndelivered records that the session's pull request did not deliver
+// the latest turn's work, and why. moved reports that the turn pushed a
+// commit of the session's own to it: progress, so the undelivered
+// continuations count again from zero.
+func (f *turnFollowUps) noteUndelivered(reason string, moved bool) {
+	f.undelivered = reason
+	if moved {
+		f.undeliveredSent = 0
+	}
+}
+
+// sentContinuation records a continuation prompt delivered for the latest
+// turn; only one sent for an undelivered pull request counts toward
+// undeliveredSent.
+func (f *turnFollowUps) sentContinuation() {
+	f.continued++
+	if f.undelivered != "" {
+		f.undeliveredSent++
+	}
 }
 
 // record folds the latest turn into the unproductive streak: a turn that
@@ -286,6 +338,8 @@ func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) ta
 			return tailRetry
 		case turnStoppedEarly:
 			switch {
+			case f.undelivered != "" && f.undeliveredLimit > 0 && f.undeliveredSent >= f.undeliveredLimit:
+				return f.exhaust(boundUndelivered)
 			case f.unproductive >= f.limit:
 				return f.exhaust(boundUnproductive)
 			case f.ceiling > 0 && f.continued >= f.ceiling:
@@ -332,6 +386,9 @@ func (f *turnFollowUps) fail(res *Result) {
 	case boundUncontinuable:
 		res.FailureMode = FailureContinuationsUnproductive
 		res.Error = "the turn ended unfinished and this session takes no continuation prompt: " + unfinished
+	case boundUndelivered:
+		res.FailureMode = FailureContinuationsCeiling
+		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts in a row in which the pull request gained no commit of the session's own: %s", f.undeliveredSent, unfinished)
 	case boundCeiling:
 		res.FailureMode = FailureContinuationsCeiling
 		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts, the ceiling (%d in a row made no tool call): %s", f.continued, f.unproductive, unfinished)

@@ -331,6 +331,19 @@ type Options struct {
 	// DefaultTurnContinuationCeiling; negative removes the ceiling.
 	TurnContinuationCeiling int
 
+	// TurnContinuationUndeliveredLimit bounds the "continue the task"
+	// prompts sent in a row while the session's pull request does not
+	// deliver the work (still a draft or, on a rework run, without a commit
+	// of the session's own since the run started) and gains no commit of
+	// the session's own; a turn that pushes to the pull request starts the
+	// count again. It is smaller than the overall ceiling, so a session
+	// that keeps working but neither pushes nor marks its draft ready ends
+	// not delivered before the runaway guard. Zero uses
+	// DefaultTurnContinuationUndeliveredLimit; negative removes the
+	// separate bound, leaving undelivered continuations bounded only by
+	// the progress bound and the ceiling above.
+	TurnContinuationUndeliveredLimit int
+
 	// RescueDir is where teardown archives a session's unpublished work —
 	// uncommitted changes and commits no remote holds — as a patch before it
 	// deletes the workarea (<RescueDir>/<session>/<time>-<id>/<repository>.patch).
@@ -407,6 +420,9 @@ type Runner struct {
 	turnContinuationLimit int
 	// turnContinuationCeiling is Options.TurnContinuationCeiling.
 	turnContinuationCeiling int
+	// turnContinuationUndeliveredLimit is
+	// Options.TurnContinuationUndeliveredLimit.
+	turnContinuationUndeliveredLimit int
 	// providerRetryBackoff spaces provider-error retries; nil uses
 	// defaultProviderRetryBackoff. Tests substitute a zero wait.
 	providerRetryBackoff func(attempt int) time.Duration
@@ -417,6 +433,10 @@ type Runner struct {
 	// pullRequestDraftLookup reads whether the session's pull request is a
 	// draft. Nil uses the runner's `gh pr view` query; tests replace it.
 	pullRequestDraftLookup pullRequestDraftLookup
+	// pullRequestHeadLookup reads the session checkout's local HEAD for
+	// the session pull request verifier. Nil uses captureHeadSHA; tests
+	// replace it.
+	pullRequestHeadLookup pullRequestHeadLookup
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a
@@ -457,43 +477,44 @@ func New(opts Options) (*Runner, error) {
 		return nil, err
 	}
 	r := &Runner{
-		registry:                      opts.Registry,
-		wt:                            opts.WorktreeManager,
-		poster:                        opts.Poster,
-		credentialProvider:            opts.CredentialProvider,
-		envc:                          opts.EnvComposer,
-		mcpb:                          opts.MCPBuilder,
-		store:                         opts.StateStore,
-		promptBuilder:                 opts.PromptBuilder,
-		httpClient:                    opts.HTTPClient,
-		logger:                        opts.Logger,
-		now:                           opts.Now,
-		maxDuration:                   opts.MaxSessionDuration,
-		idleTimeout:                   opts.IdleTimeout,
-		preserveOnFail:                opts.PreserveWorktreeOnFailure,
-		preserveAlways:                opts.PreserveWorktreeAlways,
-		skipBackstop:                  opts.SkipBackstop,
-		skipSteering:                  opts.SkipSteering,
-		skipPostSession:               opts.SkipPostSession,
-		hbInterval:                    opts.HeartbeatInterval,
-		spanEmissionEnabled:           opts.SpanEmissionEnabled,
-		spanEndpointPath:              opts.SpanEndpointPath,
-		kitSkillSources:               opts.KitSkillSources,
-		kitSkillDetector:              opts.KitSkillDetector,
-		kitPromptFragDetector:         opts.KitPromptFragmentDetector,
-		kitDetector:                   opts.KitDetector,
-		kitComposer:                   opts.KitComposer,
-		kitTargetOS:                   opts.KitTargetOS,
-		additionalExtensionDecorator:  opts.AdditionalExtensionDecorator,
-		capabilityRealizations:        opts.CapabilityRealizations,
-		capabilityParameterBinders:    opts.CapabilityParameterBinders,
-		preparedCapabilities:          preparedCapabilities,
-		protectedRuntimeMCPSelector:   selectionPolicy.v1,
-		protectedRuntimeMCPV2Selector: selectionPolicy.v2,
-		selectionPolicy:               selectionPolicy,
-		rescueDir:                     opts.RescueDir,
-		turnContinuationLimit:         opts.TurnContinuationLimit,
-		turnContinuationCeiling:       opts.TurnContinuationCeiling,
+		registry:                         opts.Registry,
+		wt:                               opts.WorktreeManager,
+		poster:                           opts.Poster,
+		credentialProvider:               opts.CredentialProvider,
+		envc:                             opts.EnvComposer,
+		mcpb:                             opts.MCPBuilder,
+		store:                            opts.StateStore,
+		promptBuilder:                    opts.PromptBuilder,
+		httpClient:                       opts.HTTPClient,
+		logger:                           opts.Logger,
+		now:                              opts.Now,
+		maxDuration:                      opts.MaxSessionDuration,
+		idleTimeout:                      opts.IdleTimeout,
+		preserveOnFail:                   opts.PreserveWorktreeOnFailure,
+		preserveAlways:                   opts.PreserveWorktreeAlways,
+		skipBackstop:                     opts.SkipBackstop,
+		skipSteering:                     opts.SkipSteering,
+		skipPostSession:                  opts.SkipPostSession,
+		hbInterval:                       opts.HeartbeatInterval,
+		spanEmissionEnabled:              opts.SpanEmissionEnabled,
+		spanEndpointPath:                 opts.SpanEndpointPath,
+		kitSkillSources:                  opts.KitSkillSources,
+		kitSkillDetector:                 opts.KitSkillDetector,
+		kitPromptFragDetector:            opts.KitPromptFragmentDetector,
+		kitDetector:                      opts.KitDetector,
+		kitComposer:                      opts.KitComposer,
+		kitTargetOS:                      opts.KitTargetOS,
+		additionalExtensionDecorator:     opts.AdditionalExtensionDecorator,
+		capabilityRealizations:           opts.CapabilityRealizations,
+		capabilityParameterBinders:       opts.CapabilityParameterBinders,
+		preparedCapabilities:             preparedCapabilities,
+		protectedRuntimeMCPSelector:      selectionPolicy.v1,
+		protectedRuntimeMCPV2Selector:    selectionPolicy.v2,
+		selectionPolicy:                  selectionPolicy,
+		rescueDir:                        opts.RescueDir,
+		turnContinuationLimit:            opts.TurnContinuationLimit,
+		turnContinuationCeiling:          opts.TurnContinuationCeiling,
+		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,
 	}
 	if r.envc == nil {
 		r.envc = env.NewComposer()

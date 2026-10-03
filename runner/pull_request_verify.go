@@ -65,6 +65,15 @@ const maxPullRequestCandidates = 8
 // returns the commit of each named ref that exists there.
 type pullRequestRefLookup func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error)
 
+// pullRequestHeadLookup reads the checkout's local HEAD commit.
+type pullRequestHeadLookup func(ctx context.Context, worktreePath string) (string, error)
+
+// localHeadSHA is the production local-HEAD read: the checkout's own HEAD
+// commit via captureHeadSHA.
+func localHeadSHA(ctx context.Context, worktreePath string) (string, error) {
+	return captureHeadSHA(ctx, worktreePath)
+}
+
 // pullRequestDraftLookup reports whether the pull request at url is a draft.
 type pullRequestDraftLookup func(ctx context.Context, worktreePath, url string) (bool, error)
 
@@ -144,13 +153,17 @@ type sessionPullRequestVerifier struct {
 	worktreePath string
 	lookup       pullRequestRefLookup
 	draftLookup  pullRequestDraftLookup
+	headLookup   pullRequestHeadLookup
 	// startHead is, for a rework run that continues an existing pull
 	// request, that pull request's head when the run started, recorded
 	// before the agent's first turn (see reworkStartHead); "" for a session
 	// that opens its own pull request.
 	startHead string
-	accepted  string
-	outcomes  map[string]candidateOutcome
+	// lastHead is the accepted pull request's head at the latest re-read
+	// (undelivered); it starts at startHead.
+	lastHead string
+	accepted string
+	outcomes map[string]candidateOutcome
 }
 
 // newSessionPullRequestVerifier resolves the session's GitHub repository:
@@ -164,15 +177,19 @@ type sessionPullRequestVerifier struct {
 // that opens its own pull request.
 func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath, branch, startHead string, repositoryFree bool) *sessionPullRequestVerifier {
 	v := &sessionPullRequestVerifier{
-		branch: branch, worktreePath: worktreePath, startHead: startHead,
+		branch: branch, worktreePath: worktreePath, startHead: startHead, lastHead: startHead,
 		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
-		outcomes: map[string]candidateOutcome{},
+		headLookup: r.pullRequestHeadLookup,
+		outcomes:   map[string]candidateOutcome{},
 	}
 	if v.lookup == nil {
 		v.lookup = originRefs
 	}
 	if v.draftLookup == nil {
 		v.draftLookup = githubPullRequestDraft
+	}
+	if v.headLookup == nil {
+		v.headLookup = localHeadSHA
 	}
 	switch {
 	case repositoryFree:
@@ -371,28 +388,41 @@ const (
 
 // undelivered re-reads the accepted pull request and reports why it does
 // not deliver the work: undeliveredNoNewCommit when this is a rework run and
-// the pull request's head is still the head it had at run start,
-// undeliveredDraft when it is a draft, "" when it delivers or when there is
-// no accepted pull request. A read that fails is returned as err and does
-// not count against the pull request: the caller logs it and the session
-// keeps today's behaviour. A nil verifier reports "".
-func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason string, err error) {
+// the pull request's head is still the head it had at run start, or moved
+// to a commit that is not the session's own (neither the session branch's
+// remote head nor the checkout's local HEAD — a push by someone else does
+// not deliver the session's work), undeliveredDraft when it is a draft, ""
+// when it delivers or when there is no accepted pull request.
+//
+// moved reports that the pull request's head moved to a commit of the
+// session's own since the previous re-read: the turn pushed to it. A draft
+// or rework that keeps gaining the session's commits is making progress, so
+// the caller does not count its continuations against the undelivered bound
+// (turnFollowUps.undeliveredSent).
+//
+// A read that fails is returned as err and does not count against the pull
+// request: the caller logs it and the session keeps today's behaviour. A nil
+// verifier reports "".
+func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason string, moved bool, err error) {
 	if v == nil || v.accepted == "" {
-		return "", nil
+		return "", false, nil
 	}
 	var errs []error
 	if v.startHead != "" {
-		_, number, parseErr := parseCanonicalGitHubPullRequestURL(v.accepted)
-		if parseErr != nil {
-			return "", fmt.Errorf("accepted pull request URL: %w", parseErr)
-		}
-		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
-		found, lookupErr := v.lookup(ctx, v.worktreePath, pullRef)
+		head, own, readErr := v.readHead(ctx)
+		moved = v.noteHead(head, own)
 		switch {
-		case lookupErr != nil:
-			errs = append(errs, fmt.Errorf("read the pull request head: %w", lookupErr))
-		case found[pullRef] == v.startHead:
-			return undeliveredNoNewCommit, nil
+		case readErr != nil && head == "":
+			errs = append(errs, readErr)
+		case head == "" || head == v.startHead:
+			return undeliveredNoNewCommit, moved, nil
+		case readErr != nil:
+			// The session commit could not be read, so whose commit the
+			// new head is stays unknown, and an unknown does not count
+			// against the pull request. Fall through to the draft check.
+			errs = append(errs, readErr)
+		case !own:
+			return undeliveredNoNewCommit, moved, nil
 		}
 	}
 	if v.draftLookup != nil {
@@ -401,10 +431,84 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		case draftErr != nil:
 			errs = append(errs, fmt.Errorf("read the draft state: %w", draftErr))
 		case draft:
-			return undeliveredDraft, nil
+			if v.startHead == "" {
+				// A draft the session opened: read its head as well, so
+				// a turn that pushed to it counts as progress.
+				head, own, readErr := v.readHead(ctx)
+				moved = v.noteHead(head, own)
+				if readErr != nil {
+					errs = append(errs, readErr)
+				}
+			}
+			return undeliveredDraft, moved, errors.Join(errs...)
 		}
 	}
-	return "", errors.Join(errs...)
+	return "", moved, errors.Join(errs...)
+}
+
+// readHead reads the accepted pull request's head with the verifier's own
+// remote query (refs/pull/<n>/head beside the session branch), and whether
+// that head is a commit of the session's own: the session branch's remote
+// head, or the checkout's local HEAD. err reports a read that failed: with
+// head "" the remote could not be read; with a head, the session commit
+// could not be, and own is false.
+func (v *sessionPullRequestVerifier) readHead(ctx context.Context) (head string, own bool, err error) {
+	_, number, parseErr := parseCanonicalGitHubPullRequestURL(v.accepted)
+	if parseErr != nil {
+		return "", false, fmt.Errorf("accepted pull request URL: %w", parseErr)
+	}
+	pullRef := fmt.Sprintf("refs/pull/%d/head", number)
+	refs := []string{pullRef}
+	branchRef := ""
+	if v.branch != "" {
+		branchRef = "refs/heads/" + v.branch
+		refs = append(refs, branchRef)
+	}
+	found, lookupErr := v.lookup(ctx, v.worktreePath, refs...)
+	if lookupErr != nil {
+		return "", false, fmt.Errorf("read the pull request head: %w", lookupErr)
+	}
+	head = found[pullRef]
+	switch {
+	case head == "":
+		return "", false, nil
+	case branchRef != "" && found[branchRef] == head:
+		return head, true, nil
+	case head == v.lastHead && (v.startHead == "" || head == v.startHead):
+		// The head has not moved, and no rework judgement turns on whose
+		// commit it is: the local HEAD is not read.
+		return head, false, nil
+	}
+	local, headErr := v.sessionHead(ctx)
+	if headErr != nil {
+		return head, false, fmt.Errorf("read the session commit: %w", headErr)
+	}
+	return head, local == head, nil
+}
+
+// noteHead records the pull request head a re-read found and reports
+// whether it moved to a commit of the session's own since the previous one.
+// The first head seen (for a rework, the head at run start) is the baseline.
+func (v *sessionPullRequestVerifier) noteHead(head string, own bool) (moved bool) {
+	if head == "" {
+		return false
+	}
+	moved = own && v.lastHead != "" && head != v.lastHead
+	v.lastHead = head
+	return moved
+}
+
+// sessionHead reads the checkout's local HEAD commit: the session's own
+// commit. The runner's verifier reads it through captureHeadSHA; a verifier
+// built without a head lookup reads none, rather than running git in
+// whatever directory the process happens to be in.
+func (v *sessionPullRequestVerifier) sessionHead(ctx context.Context) (string, error) {
+	if v.headLookup == nil {
+		return "", errors.New("no session head lookup")
+	}
+	headCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return v.headLookup(headCtx, v.worktreePath)
 }
 
 // reworkStartHead is the head of the existing pull request a rework run
