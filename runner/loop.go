@@ -1372,13 +1372,13 @@ tailRecovery:
 			// The session's pull request is all this turn left: it counts
 			// only when it delivers the work (not a draft; on a rework, a
 			// new commit since the run started).
-			undelivered, readErr := prVerifier.undelivered(verifyCtx)
+			undelivered, moved, readErr := prVerifier.undelivered(verifyCtx)
 			if readErr != nil {
-				r.logger.Warn("could not re-read the session's pull request; counting it as delivered",
+				r.logger.Warn("could not fully re-read the session's pull request; an unread part counts as delivered",
 					"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
 			}
 			if undelivered != "" {
-				followUps.undelivered = undelivered
+				followUps.noteUndelivered(undelivered, moved)
 				ending = turnStoppedEarly
 			}
 		}
@@ -1477,10 +1477,7 @@ tailRecovery:
 		if step == tailRetry {
 			followUps.retried++
 		} else {
-			followUps.continued++
-			if followUps.undelivered != "" {
-				followUps.undeliveredSent++
-			}
+			followUps.sentContinuation()
 		}
 		tail, tailErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)

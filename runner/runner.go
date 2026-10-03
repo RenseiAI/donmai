@@ -332,12 +332,13 @@ type Options struct {
 	TurnContinuationCeiling int
 
 	// TurnContinuationUndeliveredLimit bounds the "continue the task"
-	// prompts sent while the session's pull request does not deliver the
-	// work (still a draft or, on a rework run, without a commit of the
-	// session's own since the run started) — smaller than the overall
-	// ceiling, so a session that keeps working but never marks its draft
-	// ready, or never pushes to the rework branch, ends not delivered
-	// before the runaway guard. Zero uses
+	// prompts sent in a row while the session's pull request does not
+	// deliver the work (still a draft or, on a rework run, without a commit
+	// of the session's own since the run started) and gains no commit of
+	// the session's own; a turn that pushes to the pull request starts the
+	// count again. It is smaller than the overall ceiling, so a session
+	// that keeps working but neither pushes nor marks its draft ready ends
+	// not delivered before the runaway guard. Zero uses
 	// DefaultTurnContinuationUndeliveredLimit; negative removes the
 	// separate bound, leaving undelivered continuations bounded only by
 	// the progress bound and the ceiling above.

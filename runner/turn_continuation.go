@@ -83,13 +83,14 @@ const DefaultTurnContinuationLimit = 3
 const DefaultTurnContinuationCeiling = 50
 
 // DefaultTurnContinuationUndeliveredLimit is the bound on continuation
-// prompts sent while the session's pull request does not deliver the work
-// (still a draft, or, on a rework run, without a commit of the session's
-// own since the run started) applied when
-// Options.TurnContinuationUndeliveredLimit is zero. It is smaller than the
-// overall ceiling: a session that keeps making tool calls but never marks
-// its draft ready, or never pushes to the rework branch, ends not
-// delivered long before the runaway guard.
+// prompts sent in a row while the session's pull request does not deliver
+// the work (still a draft, or, on a rework run, without a commit of the
+// session's own since the run started) and gains no commit of the
+// session's own, applied when Options.TurnContinuationUndeliveredLimit is
+// zero. A turn that pushes to the pull request starts the count again. It
+// is smaller than the overall ceiling: a session that keeps making tool
+// calls but neither pushes nor marks its draft ready ends not delivered
+// long before the runaway guard.
 const DefaultTurnContinuationUndeliveredLimit = 10
 
 // defaultProviderRetryBackoff spaces the retries after a provider error. The
@@ -219,14 +220,14 @@ type turnFollowUps struct {
 	limit int
 	// ceiling bounds the continuation prompts in total; zero is no ceiling.
 	ceiling int
-	// undeliveredLimit bounds the continuation prompts sent while the
-	// session's pull request does not deliver the work (still a draft or,
-	// on a rework run, without a commit of the session's own since the run
-	// started); zero is no separate bound.
+	// undeliveredLimit bounds undeliveredSent; zero is no separate bound.
 	undeliveredLimit int
 	continued        int
 	// undeliveredSent counts the continuation prompts sent while the
-	// session's pull request did not deliver the work.
+	// session's pull request did not deliver the work (still a draft or,
+	// on a rework run, without a commit of the session's own since the run
+	// started), since its head last moved to a commit of the session's own.
+	// Continuations for any other reason never count.
 	undeliveredSent int
 	// unproductive is the streak of consecutive continuation prompts whose
 	// turn made no tool call and ended unfinished; a productive turn of any
@@ -275,6 +276,27 @@ func (r *Runner) newTurnFollowUps() *turnFollowUps {
 		undeliveredLimit = 0
 	}
 	return &turnFollowUps{limit: limit, ceiling: ceiling, undeliveredLimit: undeliveredLimit}
+}
+
+// noteUndelivered records that the session's pull request did not deliver
+// the latest turn's work, and why. moved reports that the turn pushed a
+// commit of the session's own to it: progress, so the undelivered
+// continuations count again from zero.
+func (f *turnFollowUps) noteUndelivered(reason string, moved bool) {
+	f.undelivered = reason
+	if moved {
+		f.undeliveredSent = 0
+	}
+}
+
+// sentContinuation records a continuation prompt delivered for the latest
+// turn; only one sent for an undelivered pull request counts toward
+// undeliveredSent.
+func (f *turnFollowUps) sentContinuation() {
+	f.continued++
+	if f.undelivered != "" {
+		f.undeliveredSent++
+	}
 }
 
 // record folds the latest turn into the unproductive streak: a turn that
@@ -366,7 +388,7 @@ func (f *turnFollowUps) fail(res *Result) {
 		res.Error = "the turn ended unfinished and this session takes no continuation prompt: " + unfinished
 	case boundUndelivered:
 		res.FailureMode = FailureContinuationsCeiling
-		res.Error = fmt.Sprintf("the turn still ended unfinished after %d undelivered continuation prompts: %s", f.undeliveredSent, unfinished)
+		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts in a row in which the pull request gained no commit of the session's own: %s", f.undeliveredSent, unfinished)
 	case boundCeiling:
 		res.FailureMode = FailureContinuationsCeiling
 		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts, the ceiling (%d in a row made no tool call): %s", f.continued, f.unproductive, unfinished)

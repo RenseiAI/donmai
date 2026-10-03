@@ -3,6 +3,7 @@ package runner
 import (
 	"context"
 	"errors"
+	"fmt"
 	"os"
 	"slices"
 	"strings"
@@ -1152,7 +1153,7 @@ func TestRun_UndeliveredContinuationsHaveTheirOwnLimit(t *testing.T) {
 	if res.WorkResult == "passed" {
 		t.Errorf("WorkResult = passed; a draft pull request is not delivered work")
 	}
-	wantErr := "the turn still ended unfinished after 2 undelivered continuation prompts: " +
+	wantErr := "the turn still ended unfinished after 2 continuation prompts in a row in which the pull request gained no commit of the session's own: " +
 		"no turn-result manifest and no verdict, and the pull request does not deliver the work: pull request still draft"
 	if res.Error != wantErr {
 		t.Errorf("Error = %q; want %q", res.Error, wantErr)
@@ -1162,6 +1163,96 @@ func TestRun_UndeliveredContinuationsHaveTheirOwnLimit(t *testing.T) {
 	}
 	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, undeliveredLimit)...)
 	wantContinuations(t, res, undeliveredLimit, 0, true)
+}
+
+// TestRun_DraftThatKeepsPushingIsNotCapped pins that the undelivered bound
+// counts only continuations without progress: a session that opens a draft,
+// then pushes a commit of its own to it on more turns than the bound, each
+// ending on a progress note, is continued every time and completes once it
+// marks the pull request ready.
+func TestRun_DraftThatKeepsPushingIsNotCapped(t *testing.T) {
+	const pushes = DefaultTurnContinuationUndeliveredLimit + 2
+	turns := []verdictScriptTurn{{toolCalls: 2, text: "Opened draft " + followUpPR + "; continuing."}}
+	for i := 1; i <= pushes; i++ {
+		turns = append(turns, verdictScriptTurn{
+			toolCalls: 2,
+			files:     map[string]string{fmt.Sprintf("step-%02d.txt", i): fmt.Sprintf("step %d\n", i)},
+			push:      []string{"refs/heads/" + scriptedSessionBranch, "refs/pull/7/head"},
+			text:      fmt.Sprintf("Pushed step %d to %s; continuing.", i, followUpPR),
+		})
+	}
+	turns = append(turns,
+		verdictScriptTurn{toolCalls: 1, text: followUpPR + " is ready for review."},
+		verdictScriptTurn{text: "never reached"},
+	)
+	draft := &scriptedDraft{states: append(slices.Repeat([]bool{true}, pushes+1), false)}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		turns:      turns,
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, pushes+1)...)
+	wantContinuations(t, res, pushes+1, 0, false)
+}
+
+// TestRun_DraftThatNeverMovesHitsTheUndeliveredBound pins the bound at its
+// production default: a session whose turns keep making tool calls (so the
+// progress bound never fires) but neither push to its draft nor mark it
+// ready ends not delivered after DefaultTurnContinuationUndeliveredLimit
+// continuations.
+func TestRun_DraftThatNeverMovesHitsTheUndeliveredBound(t *testing.T) {
+	busy := verdictScriptTurn{toolCalls: 2, text: "Draft " + followUpPR + " is open; continuing."}
+	draft := &scriptedDraft{states: []bool{true}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		turns: append(slices.Repeat([]verdictScriptTurn{busy}, DefaultTurnContinuationUndeliveredLimit+1),
+			verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsCeiling {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsCeiling)
+	}
+	wantErr := fmt.Sprintf("the turn still ended unfinished after %d continuation prompts in a row in which the pull request gained no commit of the session's own: "+
+		"no turn-result manifest and no verdict, and the pull request does not deliver the work: pull request still draft", DefaultTurnContinuationUndeliveredLimit)
+	if res.Error != wantErr {
+		t.Errorf("Error = %q; want %q", res.Error, wantErr)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, DefaultTurnContinuationUndeliveredLimit)...)
+	wantContinuations(t, res, DefaultTurnContinuationUndeliveredLimit, 0, true)
+}
+
+// TestRun_OnlyUndeliveredContinuationsCountTowardTheirBound pins what the
+// undelivered bound counts: continuations of a turn that stopped early with
+// no pull request at all do not, so a session that needed more of them than
+// the bound before it opened its draft is still continued on the draft.
+func TestRun_OnlyUndeliveredContinuationsCountTowardTheirBound(t *testing.T) {
+	const undeliveredLimit = 2
+	working := verdictScriptTurn{toolCalls: 2, text: "Now let me run the tests."}
+	draft := &scriptedDraft{states: []bool{true, false}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:                     "development",
+		repository:                   followUpRepository,
+		pulls:                        map[int]string{7: pullAtSessionCommit},
+		draft:                        draft.lookup,
+		continuationUndeliveredLimit: undeliveredLimit,
+		turns: append(slices.Repeat([]verdictScriptTurn{working}, undeliveredLimit+1),
+			verdictScriptTurn{toolCalls: 2, text: "Opened draft " + followUpPR + "; continuing."},
+			verdictScriptTurn{toolCalls: 1, text: followUpPR + " is ready for review."},
+			verdictScriptTurn{text: "never reached"},
+		),
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts, append(slices.Repeat([]string{continuePrompt}, undeliveredLimit+1), continueDraftPrompt)...)
+	wantContinuations(t, res, undeliveredLimit+2, 0, false)
 }
 
 // TestRun_VerdictFollowedByAnotherTurnEndsCompleted pins the passing path
