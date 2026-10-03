@@ -27,7 +27,7 @@ permissions:
 jobs:
   release-authority:
     name: release-authority (signed tag + two rulesets)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -64,7 +64,7 @@ jobs:
   fast-lane:
     needs: release-authority
     name: fast-lane (switch + local-verify attestation)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -101,7 +101,7 @@ jobs:
     needs: [release-authority, fast-lane]
     if: ${{ !cancelled() && needs.release-authority.result == 'success' && needs.fast-lane.outputs.skip_remote_gates != 'true' }}
     name: harness-smoke (donmai-smokes @ main, tag under test)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     permissions:
       contents: read
@@ -275,7 +275,7 @@ jobs:
     # macOS runner is required for codesign + xcrun notarytool.
     # Cross-compile to linux/amd64 + linux/arm64 still works from darwin via
     # CGO_ENABLED=0 (set in .goreleaser.yaml).
-    runs-on: blacksmith-6vcpu-macos-15
+    runs-on: macos-15
     timeout-minutes: 45
     # Job-level env block, deliberately. Step-level env: blocks on
     # goreleaser/goreleaser-action@v7 (node24 action) did not propagate

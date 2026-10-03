@@ -21,7 +21,7 @@ permissions:
 jobs:
   build:
     name: Build worker image
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - name: Checkout pull request
@@ -32,31 +32,13 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
-      # SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern):
-      # useblacksmith/setup-docker-builder mounts a persistent BuildKit state
-      # dir (a Blacksmith "sticky disk") at /var/lib/buildkit and commits it
-      # back at the end of every job. Confirmed against the pinned action's
-      # own action.yml/README (useblacksmith/setup-docker-builder@33803e6,
-      # tag v2.0.0): the sticky disk is scoped by an explicit `cache-key`
-      # input, NOT by git ref/trust level, and when `cache-key` is omitted
-      # (as both this workflow and worker-image.yml previously did) it falls
-      # back to an implicit default derived from the Dockerfile path — the
-      # SAME implicit key worker-image.yml (the release build, on push tags
-      # v*) also fell back to. That meant an untrusted PR build here and the
-      # trusted release build shared one persistent layer cache: a PR build
-      # could seed layers the release build would later reuse without ever
-      # rebuilding them. There is no input to disable the sticky disk on this
-      # action — persistence is the entire point of it — so PR builds no
-      # longer use it at all: plain, ephemeral docker/setup-buildx-action +
-      # docker/build-push-action below, no cache-from/cache-to, no state
-      # survives the job. worker-image.yml keeps the fast Blacksmith path but
-      # now pins its own explicit cache-key (see that file) so its cache can
-      # only ever have been seeded by trusted push/tag builds.
-      #
-      # This makes PR builds slower (no warm cache) than before. That's an
-      # accepted tradeoff: PR validation only needs to prove the image
-      # BUILDS, it does not need cache warmth, and it must never be able to
-      # influence what a release publishes.
+      # Cache isolation: both builds use the GitHub Actions cache backend
+      # (cache-from: type=gha, cache-to: type=gha,mode=max). GHA cache
+      # writes are scoped to the git ref that produced them — a pull_request
+      # build's cache entries never feed the tag-triggered release build —
+      # so the PR build can stay warm without ever influencing what a
+      # release publishes. Neither build touches a persistent sticky-disk
+      # builder.
       - name: Set up Docker Buildx
         uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
@@ -67,5 +49,7 @@ jobs:
           file: worker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: false
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             DONMAI_VERSION=pr-${{ github.event.pull_request.number }}-${{ github.sha }}

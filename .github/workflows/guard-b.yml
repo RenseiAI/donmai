@@ -68,6 +68,10 @@ on:
   push:
     branches:
       - main
+  # The merge-queue ruleset builds merge-group refs; without this trigger
+  # the guard check never reports there and queued PRs stall until the
+  # queue's check timeout.
+  merge_group:
   workflow_dispatch:
 
 permissions:
@@ -75,7 +79,7 @@ permissions:
 
 jobs:
   guard-b:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - name: Check out repo
         uses: actions/checkout@v7
@@ -135,7 +139,7 @@ jobs:
 
   guard-b-tree-residue:
     name: guard-b tree scan (report-only — see guard-b.yml header)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
 

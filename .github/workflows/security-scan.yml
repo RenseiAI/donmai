@@ -19,7 +19,7 @@ permissions:
 jobs:
   secret-scan:
     name: Secret scan (trufflehog)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -30,7 +30,7 @@ jobs:
           extra_args: --only-verified
   govulncheck:
     name: Go vuln scan (report-only)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
@@ -42,7 +42,7 @@ jobs:
           govulncheck ./... || echo "::warning::govulncheck reported vulnerabilities (report-only)"
   semgrep:
     name: SAST (semgrep, report-only)
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 15
     steps:
       - uses: actions/checkout@v7
