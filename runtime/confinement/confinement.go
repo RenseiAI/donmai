@@ -274,8 +274,10 @@ func (p *Plan) Environment() []string {
 // Record returns the per-session confinement record.
 func (p *Plan) Record() Record { return p.record }
 
-// Release removes the rendered profile. A process already started under it
-// stays confined; the profile is only read at exec.
+// Release removes the rendered profile. The launcher reads the profile when
+// the wrapped command starts, so release only after the confined process has
+// exited (or at least read it); a process already running under the profile
+// stays confined. Releasing early makes the start fail, never run unconfined.
 func (p *Plan) Release() error {
 	if p.applied.Release == nil {
 		return nil
@@ -286,7 +288,9 @@ func (p *Plan) Release() error {
 // Prepare renders and writes the confinement for spec. It refuses with a
 // typed *Error when the confinement cannot be applied: no backend, a nested
 // profile, no passing or a stale self-test, an unrepresentable writable set,
-// or an unrenderable composer rule. It never returns a weaker plan.
+// or an unrenderable composer rule. It never returns a weaker plan. It walks
+// the writable set once to account for hard links (D2.3), so its cost grows
+// with the number of files in the set.
 func (c *Confiner) Prepare(spec Spec) (*Plan, error) {
 	if err := validMode(spec.SessionMode); err != nil {
 		return nil, err
