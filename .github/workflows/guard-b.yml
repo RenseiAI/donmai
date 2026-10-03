@@ -95,6 +95,9 @@ jobs:
       - name: Self-test — prove the DEV_ABS_PATH diff gate fires correctly
         run: bash scripts/guard-b-diff-gate-selftest.sh
 
+      - name: Self-test — prove the identity wrapper flags authors, committers and trailers
+        run: bash scripts/guard-b-identity-lint-selftest.sh
+
       - name: Run guard-b-lint (commit messages added by this PR, merges included)
         if: github.event_name == 'pull_request'
         run: |
@@ -105,6 +108,12 @@ jobs:
         if: github.event_name == 'pull_request'
         run: |
           bash scripts/guard-b-diff-gate.sh DEV_ABS_PATH "origin/${{ github.base_ref }}...HEAD"
+
+      - name: Run guard-b identity lint (commit authors, committers, co-author trailers)
+        if: github.event_name == 'pull_request'
+        run: |
+          git fetch --no-tags origin "${{ github.base_ref }}"
+          bash scripts/guard-b-identity-lint.sh --commits "origin/${{ github.base_ref }}..HEAD"
 
       - name: Run guard-b-lint (the squash-merge message GitHub will compose)
         if: github.event_name == 'pull_request'
@@ -132,6 +141,10 @@ jobs:
           echo "scanning commit messages in $RANGE"
           echo "RANGE=$RANGE" >> "$GITHUB_ENV"
           bash scripts/guard-b-lint.sh --commits "$RANGE"
+
+      - name: Run guard-b identity lint (commit identities just pushed to main)
+        if: github.event_name == 'push'
+        run: bash scripts/guard-b-identity-lint.sh --commits "$RANGE"
 
       - name: Run guard-b DEV_ABS_PATH gate (files just pushed to main)
         if: github.event_name == 'push'
