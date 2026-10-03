@@ -49,6 +49,11 @@ type compositionHarness struct {
 	// closed 409 revision-stale conflict, the way the real preflight does.
 	// Empty keeps the legacy always-acknowledge behavior.
 	heartbeatRequireRevision string
+	// refuseRefreshForController, when set, makes the refresh endpoint refuse
+	// (HTTP 403) a founding declaration that presents the attestation with
+	// the named controller id. It models the platform refusing one org's
+	// founding declaration while still accepting another's.
+	refuseRefreshForController string
 }
 
 // setRefreshReceiptState changes what the control plane answers to later
@@ -73,6 +78,14 @@ func (h *compositionHarness) setHeartbeatRequireRevision(revision string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.heartbeatRequireRevision = revision
+}
+
+// setRefuseRefreshForController arms (or, with "", disarms) the refresh
+// endpoint's founding-declaration refusal. See refuseRefreshForController.
+func (h *compositionHarness) setRefuseRefreshForController(controller string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseRefreshForController = controller
 }
 
 // heartbeats returns every heartbeat body the control plane has received.
@@ -152,7 +165,10 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			_ = json.NewEncoder(w).Encode(resp)
 		case "/api/workers/" + workerID + "/refresh-token":
 			raw, _ := io.ReadAll(r.Body)
+			var presented SessionShimHostAttestation
+			_ = json.Unmarshal(raw, &presented)
 			h.mu.Lock()
+			refuseController := h.refuseRefreshForController
 			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
 			// Every refresh mints a DISTINCT token, so a test can tell a refresh
 			// that was adopted from one that was refused before adoption.
@@ -160,14 +176,16 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			state := h.refreshReceiptState
 			revision := h.refreshReceiptRevision
 			h.mu.Unlock()
+			if presented.Supports() && refuseController != "" && presented.ControllerID == refuseController {
+				http.Error(w, "founding declaration refused", http.StatusForbidden)
+				return
+			}
 			if state == "" {
 				state = SessionShimCredentialStateRecovering
 			}
 			if revision == "" {
 				revision = "revision-declared"
 			}
-			var presented SessionShimHostAttestation
-			_ = json.Unmarshal(raw, &presented)
 			resp := refreshResponse{RuntimeToken: token}
 			if presented.Supports() {
 				resp.SessionShim = activationTestCredentialReceipt(
