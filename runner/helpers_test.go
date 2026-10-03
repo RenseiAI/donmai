@@ -106,6 +106,8 @@ type recordingPlatformServer struct {
 	// "running" transition, in order: the terminal status the platform
 	// received.
 	statuses [][]byte
+	// stepHeartbeats are the bodies of every /step-heartbeat post, in order.
+	stepHeartbeats [][]byte
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -122,6 +124,13 @@ func (s *recordingPlatformServer) terminalStatus(t *testing.T) map[string]json.R
 		t.Fatalf("terminal status body is not JSON: %v", err)
 	}
 	return body
+}
+
+// stepBeats returns a copy of every step-heartbeat body received.
+func (s *recordingPlatformServer) stepBeats() [][]byte {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return append([][]byte(nil), s.stepHeartbeats...)
 }
 
 // injectReports returns every ack and dead-letter the worker echoed.
@@ -165,6 +174,12 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 	t.Helper()
 	rec := &recordingPlatformServer{}
 	rec.Server = httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if strings.HasSuffix(r.URL.Path, "/step-heartbeat") {
+			body, _ := io.ReadAll(r.Body)
+			rec.mu.Lock()
+			rec.stepHeartbeats = append(rec.stepHeartbeats, body)
+			rec.mu.Unlock()
+		}
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			body, _ := io.ReadAll(r.Body)
 			var status struct {
