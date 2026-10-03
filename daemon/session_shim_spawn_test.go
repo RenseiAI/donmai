@@ -22,6 +22,7 @@ import (
 	"github.com/RenseiAI/donmai/attachclient"
 	"github.com/RenseiAI/donmai/attachwire"
 	attachwirev2 "github.com/RenseiAI/donmai/attachwire/v2"
+	"github.com/RenseiAI/donmai/internal/testisolation"
 	"github.com/RenseiAI/donmai/ptyhost"
 	"github.com/RenseiAI/donmai/sessionshim"
 	"github.com/RenseiAI/donmai/shimwire"
@@ -792,7 +793,10 @@ func TestMain(m *testing.M) {
 	if os.Getenv(envDaemonShimHelper) == "1" {
 		os.Exit(runDaemonShimHelper())
 	}
-	os.Exit(m.Run())
+	cleanup := testisolation.Isolate()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 // envDaemonShimHelperStartDelayMS is a TEST-ONLY seam, read only by this
