@@ -1274,10 +1274,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	// example URL can never mark the run complete. Re-run after every
 	// follow-up turn. Lookups outlive a cancelled run context (each is
 	// individually bounded) so a late verification is not lost to it.
+	// A rework run's pull request existed before the run: its head at run
+	// start (recorded before the agent's first turn) is what a delivered
+	// rework must have moved past.
 	verifyCtx := context.WithoutCancel(ctx)
 	var prVerifier *sessionPullRequestVerifier
 	if RequiresPRURL(qw.WorkType) {
-		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, repositoryFree)
+		prVerifier = r.newSessionPullRequestVerifier(verifyCtx, qw, repositoryDeclaration, wpath, branch, reworkStartHead(qw, res, wpath), repositoryFree)
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
 
@@ -1361,7 +1364,23 @@ tailRecovery:
 	for tailRecoverable && !r.skipSteering && !streamRes.blocked && budgetStop == nil {
 		steerView := streamRes
 		steerView.terminalSuccess = lastTurn.terminalSuccess
-		ending := classifyTurnEnding(res, streamRes, lastTurn, prVerifier.reportsOwnRepository(lastTurn), reviewWork)
+		reportedPR := prVerifier.reportsOwnRepository(lastTurn)
+		ending := classifyTurnEnding(res, streamRes, lastTurn, reportedPR, reviewWork)
+		followUps.undelivered = ""
+		if pullRequestIsTheOnlyResult(res, streamRes, lastTurn, reportedPR, reviewWork) {
+			// The session's pull request is all this turn left: it counts
+			// only when it delivers the work (not a draft; on a rework, a
+			// new commit since the run started).
+			undelivered, readErr := prVerifier.undelivered(verifyCtx)
+			if readErr != nil {
+				r.logger.Warn("could not re-read the session's pull request; counting it as delivered",
+					"sessionId", qw.SessionID, "url", res.PullRequestURL, "err", readErr)
+			}
+			if undelivered != "" {
+				followUps.undelivered = undelivered
+				ending = turnStoppedEarly
+			}
+		}
 		step := followUps.next(ending, lastTurn.toolCalls > 0, continuable, !publicationComplete && shouldSteer(steerView, caps, qw.WorkType))
 		switch step {
 		case tailDone:
@@ -1374,6 +1393,7 @@ tailRecovery:
 			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
 				"sessionId", qw.SessionID,
 				"failureMode", res.FailureMode,
+				"undelivered", followUps.undelivered,
 				"continued", followUps.continued,
 				"unproductive", followUps.unproductive,
 				"retried", followUps.retried,
@@ -1406,10 +1426,7 @@ tailRecovery:
 			continue
 		}
 
-		prompt := continuePrompt
-		if reviewWork {
-			prompt = continueReviewPrompt
-		}
+		prompt := continuationPrompt(reviewWork, followUps.undelivered)
 		wrapUp := enforcer.wrapUpDue()
 		if step == tailRetry {
 			prompt = retryPrompt
@@ -1432,6 +1449,7 @@ tailRecovery:
 		} else {
 			r.logger.Info("turn ended before the work was finished; continuing",
 				"sessionId", qw.SessionID,
+				"undelivered", followUps.undelivered,
 				"continuation", followUps.continued+1,
 				"unproductive", followUps.unproductive,
 				"limit", followUps.limit,

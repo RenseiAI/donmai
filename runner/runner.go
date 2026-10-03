@@ -414,6 +414,9 @@ type Runner struct {
 	// the session pull request verifier. Nil uses `git ls-remote origin`;
 	// tests wrap it to observe lookups.
 	pullRequestLookup pullRequestRefLookup
+	// pullRequestDraftLookup reads whether the session's pull request is a
+	// draft. Nil uses the runner's `gh pr view` query; tests replace it.
+	pullRequestDraftLookup pullRequestDraftLookup
 
 	// interactiveNoticeClock overrides the interactive supervisor's
 	// notice-retry clock. Nil in production (real time); tests substitute a

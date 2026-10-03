@@ -31,6 +31,15 @@ import (
 //   - otherwise the turn stopped early: it gets a short "continue the task"
 //     prompt.
 //
+// A verified pull request that does not deliver the work — still a draft,
+// or, on a rework run, without a commit since the run started (see
+// sessionPullRequestVerifier.undelivered) — does not count as the turn's
+// result. When it is all the turn left, the turn stopped early and gets a
+// continuation prompt that names the reason, under the same bounds. A
+// session still in that state when its continuations run out, or that
+// cannot be continued at all, ends not delivered: failed, with the reason
+// in Result.Error.
+//
 // Continuations are bounded by progress, not by count alone. A turn is
 // productive when its event stream carried at least one tool call
 // (agent.ToolUseEvent) — deterministic and harness-neutral. Whether a call
@@ -126,6 +135,19 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 	}
 }
 
+// pullRequestIsTheOnlyResult reports whether the session's verified pull
+// request is all that finished the latest turn: without it the turn would
+// have stopped early. Only then is the pull request re-read to see whether
+// it delivers the work.
+func pullRequestIsTheOnlyResult(res *Result, session, turn streamObservation, reportedPR, reviewWork bool) bool {
+	if res.PullRequestURL == "" {
+		return false
+	}
+	withoutPR := *res
+	withoutPR.PullRequestURL = ""
+	return classifyTurnEnding(&withoutPR, session, turn, reportedPR, reviewWork) == turnStoppedEarly
+}
+
 // tailStep is the next tail-recovery action.
 type tailStep int
 
@@ -148,6 +170,11 @@ const (
 	boundCeiling
 	// boundRetries: the provider-error retries reached their bound.
 	boundRetries
+	// boundUncontinuable: the turn stopped early with a pull request that
+	// does not deliver the work, and the session takes no continuation
+	// prompt (continuations are disabled, or the harness takes no
+	// follow-up prompt).
+	boundUncontinuable
 )
 
 // turnFollowUps is one session's runner-driven follow-up state.
@@ -170,6 +197,10 @@ type turnFollowUps struct {
 	exhausted     bool
 	bound         followUpBound
 	providerError string
+	// undelivered is why the session's pull request did not deliver the
+	// latest turn's work (sessionPullRequestVerifier.undelivered); "" when
+	// it did, or when the turn did not end on one.
+	undelivered string
 }
 
 // newTurnFollowUps resolves the configured bounds. For each, zero is the
@@ -237,6 +268,11 @@ func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) ta
 			return tailContinue
 		}
 	}
+	if ending == turnStoppedEarly && f.undelivered != "" {
+		// The pull request does not deliver the work and the turn cannot
+		// be continued: there is nothing to nudge toward.
+		return f.exhaust(boundUncontinuable)
+	}
 	if canSteer && !f.steered {
 		return tailSteer
 	}
@@ -256,11 +292,17 @@ func (f *turnFollowUps) fail(res *Result) {
 		return
 	}
 	res.Status = "failed"
-	const unfinished = "no turn-result manifest, no pull request and no verdict"
+	unfinished := "no turn-result manifest, no pull request and no verdict"
+	if f.undelivered != "" {
+		unfinished = "no turn-result manifest and no verdict, and the pull request does not deliver the work: " + f.undelivered
+	}
 	switch f.bound {
 	case boundRetries:
 		res.FailureMode = FailureProviderError
 		res.Error = fmt.Sprintf("the turn still ended on a model provider error after %d retries: %s", f.retried, f.providerError)
+	case boundUncontinuable:
+		res.FailureMode = FailureContinuationsUnproductive
+		res.Error = "the turn ended unfinished and this session takes no continuation prompt: " + unfinished
 	case boundCeiling:
 		res.FailureMode = FailureContinuationsCeiling
 		res.Error = fmt.Sprintf("the turn still ended unfinished after %d continuation prompts, the ceiling (%d in a row made no tool call): %s", f.continued, f.unproductive, unfinished)
@@ -291,6 +333,37 @@ const continuePrompt = "Your previous turn ended before the task was finished: i
 	"no pull request, and no blocked or failed verdict. Continue the task from where you stopped. " +
 	"When the work is done, commit it, push the branch, open the pull request and report the result. " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
+
+// continueDraftPrompt is the continuation prompt after a turn that stopped
+// early while the session's pull request is still a draft.
+const continueDraftPrompt = "Your previous turn ended before the task was finished: your pull request is still a draft, " +
+	"and the turn left no turn result and no blocked or failed verdict. Continue the task from where you stopped. " +
+	"When the work is done, commit it, push the branch, mark the pull request ready for review and report the result. " +
+	"If you cannot go on, end with an explicit blocked verdict and the reason."
+
+// continueNoNewCommitPrompt is the continuation prompt after a turn of a
+// rework run that stopped early while the pull request it continues has no
+// new commit since the run started.
+const continueNoNewCommitPrompt = "Your previous turn ended before the task was finished: the pull request this run continues " +
+	"has no new commit since the run started, and the turn left no turn result and no blocked or failed verdict. " +
+	"Continue the task from where you stopped. When the work is done, commit it, push it to the pull request's branch " +
+	"and report the result. If you cannot go on, end with an explicit blocked verdict and the reason."
+
+// continuationPrompt is the continuation prompt for a turn that stopped
+// early: undelivered is why the session's pull request did not deliver the
+// work, "" when the turn left none.
+func continuationPrompt(reviewWork bool, undelivered string) string {
+	switch {
+	case undelivered == undeliveredDraft:
+		return continueDraftPrompt
+	case undelivered == undeliveredNoNewCommit:
+		return continueNoNewCommitPrompt
+	case reviewWork:
+		return continueReviewPrompt
+	default:
+		return continuePrompt
+	}
+}
 
 // continueReviewPrompt is the short prompt sent after a review turn that
 // stopped early: it left no turn result, no work-result marker and no review
