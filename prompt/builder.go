@@ -349,10 +349,14 @@ func stagePreamble(qw QueuedWork) string {
 		lines = append(lines, fmt.Sprintf("<stage>%s</stage>", qw.StageID))
 	}
 	if b := qw.StageBudget; b != nil {
+		subAgents := "unlimited"
+		if b.MaxSubAgents != nil {
+			subAgents = fmt.Sprintf("%d", *b.MaxSubAgents)
+		}
 		lines = append(lines, fmt.Sprintf(
 			"<stageBudget maxDurationSeconds=%q maxSubAgents=%q maxTokens=%q />",
 			fmt.Sprintf("%d", b.MaxDurationSeconds),
-			fmt.Sprintf("%d", b.MaxSubAgents),
+			subAgents,
 			fmt.Sprintf("%d", b.MaxTokens),
 		))
 	}
