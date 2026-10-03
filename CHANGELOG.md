@@ -29,6 +29,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   retries; a status is read only from structured fields or a strictly
   anchored text form, never from a port or a number in prose; and a verdict
   the turn gave before the error still decides the turn.
+- Continuations for a draft pull request, or a rework with no new commit, now
+  have their own bound (`TurnContinuationUndeliveredLimit`, default 10): a
+  session that keeps working but neither pushes to its pull request nor marks
+  it ready ends not delivered well before the overall ceiling. A turn that
+  pushes a commit of the session's own to the pull request starts the count
+  again, so a session that keeps pushing is never cut off by it. A rework
+  counts as having a new commit only when the pull request's head is the
+  session's own commit, not someone else's push.
 
 ## v0.72.61 — 2026-10-03
 

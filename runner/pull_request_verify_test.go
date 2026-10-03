@@ -463,9 +463,12 @@ func TestRun_PullRefThatLagsAPushIsReverified(t *testing.T) {
 const scriptedSessionBranch = "agent/test-session-MANIFEST-FOLLOWUP"
 
 // TestSessionPullRequestVerifier_Undelivered pins the re-read of the accepted
-// pull request: a rework whose head has not moved since run start has no new
-// commit (and is not asked about its draft state), a draft is a draft, and a
-// read that fails does not count against the pull request.
+// pull request: a rework whose head has not moved to a commit of the
+// session's own since run start has no new commit (and is not asked about its
+// draft state), a draft is a draft, a head that moved to a commit of the
+// session's own since the previous re-read is progress, and a read that fails
+// does not count against the pull request. Every read is stubbed: an
+// unexpected one fails the case, and none runs git.
 func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	const own = "https://github.com/acme/widgets/pull/7"
 	start := strings.Repeat("a", 40)
@@ -478,6 +481,18 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 			return map[string]string{"refs/pull/7/head": head}, nil
 		}
 	}
+	refsAtBranch := func(pullHead, branchHead string) pullRequestRefLookup {
+		return func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
+			if len(refs) != 2 || refs[0] != "refs/pull/7/head" || refs[1] != "refs/heads/agent/s" {
+				return nil, fmt.Errorf("unexpected refs %q", refs)
+			}
+			return map[string]string{"refs/pull/7/head": pullHead, "refs/heads/agent/s": branchHead}, nil
+		}
+	}
+	headIs := func(head string) pullRequestHeadLookup {
+		return func(context.Context, string) (string, error) { return head, nil }
+	}
+	headUnreadable := func(context.Context, string) (string, error) { return "", errors.New("not a git repository") }
 	unreadable := func(context.Context, string, ...string) (map[string]string, error) {
 		return nil, errors.New("remote unreachable")
 	}
@@ -493,35 +508,56 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	cases := []struct {
 		name      string
 		accepted  string
+		branch    string
 		startHead string
+		lastHead  string
 		lookup    pullRequestRefLookup
+		head      pullRequestHeadLookup
 		draft     pullRequestDraftLookup
 		want      string
+		wantMoved bool
 		wantErr   string
 	}{
 		{name: "no accepted pull request", draft: draftIs(true)},
 		{name: "ready pull request the session opened", accepted: own, draft: draftIs(false)},
-		{name: "draft pull request the session opened", accepted: own, draft: draftIs(true), want: undeliveredDraft},
-		{name: "rework with no new commit", accepted: own, startHead: start, lookup: refsAt(start), draft: ghDown, want: undeliveredNoNewCommit},
-		{name: "rework with a new commit, ready", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(false)},
-		{name: "rework with a new commit, still draft", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "draft the session opened, first re-read", accepted: own, branch: "agent/s", lookup: refsAtBranch(moved, moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "draft the session pushed to since the last re-read", accepted: own, branch: "agent/s", lastHead: start, lookup: refsAtBranch(moved, moved), draft: draftIs(true), want: undeliveredDraft, wantMoved: true},
+		{name: "draft whose head is the session commit on another branch", accepted: own, branch: "agent/s", lastHead: start, lookup: refsAtBranch(moved, start), head: headIs(moved), draft: draftIs(true), want: undeliveredDraft, wantMoved: true},
+		{name: "draft whose head moved to someone else's commit", accepted: own, branch: "agent/s", lastHead: start, lookup: refsAtBranch(moved, start), head: headIs(start), draft: draftIs(true), want: undeliveredDraft},
+		{name: "draft that did not move", accepted: own, branch: "agent/s", lastHead: moved, lookup: refsAtBranch(moved, moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "draft whose head is unreadable", accepted: own, branch: "agent/s", lastHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft, wantErr: "remote unreachable"},
+		{name: "rework with no new commit", accepted: own, startHead: start, lastHead: start, lookup: refsAt(start), draft: ghDown, want: undeliveredNoNewCommit},
+		{name: "rework with a new commit, ready", accepted: own, branch: "agent/s", startHead: start, lastHead: start, lookup: refsAtBranch(moved, moved), draft: draftIs(false), wantMoved: true},
+		{name: "rework with a new commit, still draft", accepted: own, branch: "agent/s", startHead: start, lastHead: start, lookup: refsAtBranch(moved, moved), draft: draftIs(true), want: undeliveredDraft, wantMoved: true},
+		{name: "rework whose head moved to someone else's commit", accepted: own, branch: "agent/s", startHead: start, lastHead: start, lookup: refsAtBranch(moved, start), head: headIs(start), draft: draftIs(false), want: undeliveredNoNewCommit},
+		{name: "rework whose session commit is unreadable", accepted: own, branch: "agent/s", startHead: start, lastHead: start, lookup: refsAtBranch(moved, start), head: headUnreadable, draft: draftIs(false), wantErr: "read the session commit"},
 		{name: "draft state unknown", accepted: own, draft: ghDown, wantErr: "not authenticated"},
-		{name: "rework head unreadable", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(false), wantErr: "remote unreachable"},
-		{name: "rework head unreadable, draft", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft},
+		{name: "rework head unreadable", accepted: own, startHead: start, lastHead: start, lookup: unreadable, draft: draftIs(false), wantErr: "remote unreachable"},
+		{name: "rework head unreadable, draft", accepted: own, startHead: start, lastHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft, wantErr: "remote unreachable"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			lookup := tc.lookup
 			if lookup == nil {
 				lookup = func(context.Context, string, ...string) (map[string]string, error) {
-					t.Fatal("a session that opened its own pull request read its head")
+					t.Fatal("read the pull request head from the remote; this case must not")
 					return nil, nil
 				}
 			}
-			v := &sessionPullRequestVerifier{repository: "acme/widgets", accepted: tc.accepted, startHead: tc.startHead, lookup: lookup, draftLookup: tc.draft}
-			got, err := v.undelivered(context.Background())
-			if got != tc.want {
-				t.Fatalf("undelivered = %q (err %v); want %q", got, err, tc.want)
+			head := tc.head
+			if head == nil {
+				head = func(context.Context, string) (string, error) {
+					t.Fatal("read the checkout's HEAD; this case must not")
+					return "", nil
+				}
+			}
+			v := &sessionPullRequestVerifier{
+				repository: "acme/widgets", branch: tc.branch, worktreePath: t.TempDir(), accepted: tc.accepted,
+				startHead: tc.startHead, lastHead: tc.lastHead, lookup: lookup, draftLookup: tc.draft, headLookup: head,
+			}
+			got, gotMoved, err := v.undelivered(context.Background())
+			if got != tc.want || gotMoved != tc.wantMoved {
+				t.Fatalf("undelivered = %q, moved %v (err %v); want %q, moved %v", got, gotMoved, err, tc.want, tc.wantMoved)
 			}
 			switch {
 			case tc.wantErr == "" && err != nil:
@@ -532,8 +568,15 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 		})
 	}
 	var none *sessionPullRequestVerifier
-	if got, err := none.undelivered(context.Background()); got != "" || err != nil {
-		t.Errorf("nil verifier: undelivered = %q, %v; want none", got, err)
+	if got, moved, err := none.undelivered(context.Background()); got != "" || moved || err != nil {
+		t.Errorf("nil verifier: undelivered = %q, %v, %v; want none", got, moved, err)
+	}
+	// A verifier built without a head lookup reads no HEAD, even in a real
+	// checkout where git would answer.
+	checkout, _, _ := cloneForRescue(t)
+	unwired := &sessionPullRequestVerifier{worktreePath: checkout}
+	if head, err := unwired.sessionHead(context.Background()); head != "" || err == nil {
+		t.Errorf("verifier without a head lookup: sessionHead = %q, %v; want an error and no git run", head, err)
 	}
 }
 

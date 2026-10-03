@@ -140,11 +140,18 @@ harness-specific.
   `continuations-unproductive`.
 - `Options.TurnContinuationCeiling` (default 50) bounds continuation prompts in
   total, productive or not. Exhausted: `continuations-ceiling`.
+- `Options.TurnContinuationUndeliveredLimit` (default 10) bounds the
+  continuation prompts sent in a row while the session's pull request does not
+  deliver the work (still a draft, or a rework with no new commit) and gains no
+  commit of the session's own. A turn that pushes to the pull request starts
+  the count again; continuations for any other reason never count. Exhausted:
+  `continuations-ceiling`.
 - Provider-error retries keep a total bound of `TurnContinuationLimit` with no
   progress reset. Exhausted: `provider-error`.
 
 For each option zero is the default; a negative limit disables continuations
-and retries, and a negative ceiling removes the ceiling. The session's own
+and retries, a negative ceiling removes the ceiling, and a negative undelivered
+limit removes that separate bound. The session's own
 duration and token budgets cover every follow-up turn. At an exhausted bound no
 nudge follows, but the backstop still makes its open-PR attempt, so the work is
 pushed and a real pull request the verifier could not confirm is recovered; the
