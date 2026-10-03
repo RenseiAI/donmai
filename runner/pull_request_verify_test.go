@@ -571,7 +571,10 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	if got, moved, err := none.undelivered(context.Background()); got != "" || moved || err != nil {
 		t.Errorf("nil verifier: undelivered = %q, %v, %v; want none", got, moved, err)
 	}
-	unwired := &sessionPullRequestVerifier{worktreePath: t.TempDir()}
+	// A verifier built without a head lookup reads no HEAD, even in a real
+	// checkout where git would answer.
+	checkout, _, _ := cloneForRescue(t)
+	unwired := &sessionPullRequestVerifier{worktreePath: checkout}
 	if head, err := unwired.sessionHead(context.Background()); head != "" || err == nil {
 		t.Errorf("verifier without a head lookup: sessionHead = %q, %v; want an error and no git run", head, err)
 	}
