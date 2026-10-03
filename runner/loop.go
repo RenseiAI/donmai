@@ -326,6 +326,17 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, err.Error()
 			return res, err
 		}
+		// A declared read-only context repository whose clone failed is
+		// skipped with a warning instead of failing the session: record
+		// each skip on the result so it is visible wherever
+		// PostSessionWarnings surface.
+		if skipped, skippedErr := r.wt.SkippedRepositories(qw.SessionID); skippedErr == nil {
+			for _, name := range skipped {
+				warning := fmt.Sprintf("declared read-only context repository %q failed to clone; continuing without it", name)
+				r.logger.Warn("declared repository skipped", "sessionId", qw.SessionID, "repository", name)
+				res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
+			}
+		}
 	}
 	runnerStatePath := wpath
 	selectedRepositoryReadOnly := repositoryDeclaration != nil && repositoryDeclaration.Selected.Authority == workarea.RepositoryReadOnly
@@ -358,6 +369,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				continue
 			}
 			repositoryPath := declaredRepositoryPaths[repository.Name]
+			if repositoryPath == "" {
+				continue
+			}
 			if _, gitErr := runGit(ctx, repositoryPath, gitIdentity{}, "checkout", "-b", branch); gitErr != nil {
 				r.logger.Debug("create declared repository work branch failed (may already exist)",
 					"repository", repository.Name, "branch", branch, "err", gitErr)
@@ -384,7 +398,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
 		for _, repository := range repositoryDeclaration.Repositories {
 			if repository.Authority == workarea.RepositoryMutable {
-				targets = append(targets, rescueTarget{name: repository.Name, path: declaredRepositoryPaths[repository.Name]})
+				if path := declaredRepositoryPaths[repository.Name]; path != "" {
+					targets = append(targets, rescueTarget{name: repository.Name, path: path})
+				}
 			}
 		}
 		recordRescueTargets(ctx, res, targets)
@@ -399,16 +415,6 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Error = err.Error()
 			return res, err
 		}
-	}
-
-	// 2a-bis. Materialize read-only sibling context repos named by
-	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
-	// their governing corpus at ../<name> as their repo AGENTS.md
-	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
-	// fatal: a failed sibling logs a warning and the session proceeds —
-	// agents fall back to cloning it themselves.
-	if !repositoryFree && repositoryDeclaration == nil {
-		r.provisionSiblings(ctx, qw, wpath)
 	}
 
 	// 2b. Provision kit toolchain into the worktree (Seam 2 / 006).
@@ -816,6 +822,13 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		for _, repository := range repositoryDeclaration.Repositories {
 			path := declaredRepositoryPaths[repository.Name]
 			if path == "" {
+				// A skipped read-only context repository is absent from
+				// the paths map by construction; only a missing path for
+				// any other repository is a contract violation (a
+				// writable repository never skips).
+				if repository.Authority == workarea.RepositoryReadOnly {
+					continue
+				}
 				missingErr := &workarea.RepositoryContractError{
 					Reason: workarea.ReasonDeclarationRecordInvalid, RuleID: workarea.RuleDeclarationRecordSecretFree,
 					Repository: repository.Name, Detail: "declared repository has no provisioned path",

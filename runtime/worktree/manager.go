@@ -195,7 +195,14 @@ type ProvisionResult struct {
 	CacheSeedID string
 	// Repositories maps normalized declared names to their repository paths.
 	// Legacy flat workareas contain only the selected repository when known.
+	// Repositories that were skipped after a failed clone (see
+	// SkippedRepositories) are absent here.
 	Repositories map[string]string
+	// SkippedRepositories names declared read-only context repositories
+	// whose clone failed and were skipped with a warning. The session
+	// proceeds without them; they are absent from Repositories and from
+	// the durable declaration record. Empty for legacy flat workareas.
+	SkippedRepositories []string
 	// Strategy is the strategy that succeeded.
 	Strategy CloneStrategy
 	// ParentRepoPath is the parent clone used by StrategyWorktreeAdd. It is the
@@ -792,12 +799,12 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 					"sessionId", spec.SessionID, "err", probeErr)
 			}
 		}
-		repositories, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec, branchBaseSHA)
+		repositories, skipped, acquisition, err := m.provisionLayoutOnce(ctx, layout, declaration, workareaID, spec, branchBaseSHA)
 		if err == nil {
 			res := &ProvisionResult{
 				Path: dst, WorkareaRoot: root, WorkareaID: workareaID,
 				Mode: ModeExclusive, OwnerSessionID: spec.SessionID, CacheSeedID: spec.CacheSeedID,
-				Repositories: repositories, Strategy: spec.Strategy,
+				Repositories: repositories, SkippedRepositories: skipped, Strategy: spec.Strategy,
 				ParentRepoPath: parentRepoPath, Attempts: attempts,
 				BaseRef: baseInfo.Ref, BaseFetchDuration: baseInfo.Duration,
 				BaseFetched: baseInfo.Fetched,
@@ -1008,17 +1015,33 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 }
 
 func declarationMatchesNormalized(record workarea.DeclarationRecord, normalized workarea.NormalizedDeclaration) error {
-	if record.Protocol != normalized.Protocol || len(record.Repositories) != len(normalized.Repositories) {
+	if record.Protocol != normalized.Protocol || len(record.Repositories) > len(normalized.Repositories) {
 		return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
 	}
 	byName := make(map[string]workarea.NormalizedRepository, len(normalized.Repositories))
 	for _, repository := range normalized.Repositories {
 		byName[repository.Name] = repository
 	}
+	seen := make(map[string]struct{}, len(record.Repositories))
 	for _, repository := range record.Repositories {
 		bound, ok := byName[repository.Name]
 		sourceDigest, err := workarea.RepositorySourceDigest(bound.Source.Repository)
 		if !ok || err != nil || bound.Leaf != repository.Leaf || bound.Role != repository.Role || bound.Authority != repository.Authority || bound.Source.Ref != repository.RequestedRef || sourceDigest != repository.SourceDigest || !slices.Equal(bound.Source.Paths, repository.SparsePaths) {
+			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+		}
+		seen[repository.Name] = struct{}{}
+	}
+	// A record that is a strict subset of the bound declaration is only
+	// valid when every omitted repository is skippable: a failed
+	// read-only context clone that warned and continued at provision
+	// time. Re-entry into a root whose skipped set is unknown (for
+	// example a generation provisioned before skip-tracking existed)
+	// stays exact: it must carry the full declaration.
+	for _, repository := range normalized.Repositories {
+		if _, present := seen[repository.Name]; present {
+			continue
+		}
+		if repository.Role != workarea.RepositoryRoleContext || repository.Authority != workarea.RepositoryReadOnly {
 			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
 		}
 	}
@@ -1507,7 +1530,21 @@ func (m *Manager) Result(sessionID string) (ProvisionResult, error) {
 	for name, path := range res.Repositories {
 		out.Repositories[name] = path
 	}
+	out.SkippedRepositories = append([]string(nil), res.SkippedRepositories...)
 	return out, nil
+}
+
+// SkippedRepositories names declared read-only context repositories whose
+// clone failed and were skipped with a warning. Empty when the provision
+// materialized every declared repository (or used the legacy flat layout).
+func (m *Manager) SkippedRepositories(sessionID string) ([]string, error) {
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	res, ok := m.sessions[sessionID]
+	if !ok {
+		return nil, fmt.Errorf("%w: %s", ErrUnknownSession, sessionID)
+	}
+	return append([]string(nil), res.SkippedRepositories...), nil
 }
 
 func (r ProvisionResult) workareaRootOrPath() string {
@@ -1555,22 +1592,22 @@ func (m *Manager) provisionLayoutOnce(
 	workareaID string,
 	spec ProvisionSpec,
 	branchBaseSHA string,
-) (paths map[string]string, acquisition workarea.AcquisitionRecord, resultErr error) {
+) (paths map[string]string, skipped []string, acquisition workarea.AcquisitionRecord, resultErr error) {
 	if declaration == nil {
 		if err := m.provisionOnceWithReference(ctx, layout.Repository.String(), spec, "", branchBaseSHA); err != nil {
-			return nil, workarea.AcquisitionRecord{}, err
+			return nil, nil, workarea.AcquisitionRecord{}, err
 		}
 		paths = make(map[string]string, 1)
 		if leaf, err := workarea.RepositoryLeaf(spec.RepoURL); err == nil {
 			paths[leaf] = layout.Repository.String()
 		}
-		return paths, workarea.AcquisitionRecord{}, nil
+		return paths, nil, workarea.AcquisitionRecord{}, nil
 	}
 	seedPaths := map[string]string(nil)
 	if spec.CacheSeedID != "" {
 		seeds, seedErr := m.seedStore()
 		if seedErr != nil {
-			return nil, workarea.AcquisitionRecord{}, seedErr
+			return nil, nil, workarea.AcquisitionRecord{}, seedErr
 		}
 		_, resolvedSeedPaths, seedErr := seeds.Ensure(ctx, spec.CacheSeedID, *declaration, func(ctx context.Context, repository workarea.NormalizedRepository, destination string) error {
 			return m.provisionOnce(ctx, destination, ProvisionSpec{
@@ -1580,22 +1617,30 @@ func (m *Manager) provisionLayoutOnce(
 			})
 		})
 		if seedErr != nil {
-			return nil, workarea.AcquisitionRecord{}, seedErr
+			// A seed is a best-effort fast path, never session fate:
+			// when the cached seed cannot be built (for example a
+			// read-only context repository fails to clone into the
+			// seed), fall back to unseeded provisioning so the
+			// per-repository skip rule below still applies instead of
+			// failing the session here.
+			m.logger.Warn("cache seed unavailable; provisioning without seed",
+				"sessionId", spec.SessionID, "seed", spec.CacheSeedID, "err", seedErr)
+		} else {
+			seedPaths = resolvedSeedPaths
 		}
-		seedPaths = resolvedSeedPaths
 	}
 	acquisitions, err := m.acquisitionStore()
 	if err != nil {
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	claim, err := acquisitions.Begin(
 		spec.SessionID, workareaID, layout.Root, declaration.Selected.Leaf, spec.CacheSeedID,
 	)
 	if err != nil {
 		if errors.Is(err, workarea.ErrAcquisitionRootOccupied) {
-			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
+			return nil, nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
 		}
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	committed := false
 	preserveForRecovery := false
@@ -1621,12 +1666,12 @@ func (m *Manager) provisionLayoutOnce(
 		return nil
 	}
 	if err := crashBoundary("root-created"); err != nil {
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	stagingLayout := workarea.Layout{Root: claim.StagingRoot}
 	selectedPath, err := stagingLayout.RepositoryPathFor(declaration.Selected.Leaf)
 	if err != nil {
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	stagingLayout.Repository = selectedPath
 
@@ -1635,7 +1680,7 @@ func (m *Manager) provisionLayoutOnce(
 	for index, repository := range declaration.Repositories {
 		repositoryPath, err := stagingLayout.RepositoryPathFor(repository.Leaf)
 		if err != nil {
-			return nil, workarea.AcquisitionRecord{}, err
+			return nil, nil, workarea.AcquisitionRecord{}, err
 		}
 		repositorySpec := ProvisionSpec{
 			SessionID:   spec.SessionID,
@@ -1645,36 +1690,89 @@ func (m *Manager) provisionLayoutOnce(
 			SparsePaths: append([]string(nil), repository.Source.Paths...),
 		}
 		if err := m.provisionOnceWithReference(ctx, repositoryPath.String(), repositorySpec, seedPaths[repository.Name], ""); err != nil {
-			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: provision declared repository %q: %w", repository.Name, err)
+			if !skippableDeclaredRepository(repository, declaration) {
+				return nil, nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: provision declared repository %q: %w", repository.Name, err)
+			}
+			// A read-only context repository is reference material, not
+			// session state: one missing sibling must not fail every seat
+			// in the project. Warn, drop the partial checkout, and let
+			// the session run without it.
+			m.logger.Warn("declared read-only context repository clone failed; skipping",
+				"sessionId", spec.SessionID, "repository", repository.Name, "err", err)
+			_ = os.RemoveAll(repositoryPath.String())
+			skipped = append(skipped, repository.Name)
+			continue
 		}
 		paths[repository.Name] = filepath.Join(layout.Root.String(), repository.Leaf)
 		out, err := m.runGit(ctx, "", "-C", repositoryPath.String(), "rev-parse", "HEAD")
 		if err != nil {
-			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: resolve declared repository %q ref: %w (%s)", repository.Name, err, strings.TrimSpace(string(out)))
+			if !skippableDeclaredRepository(repository, declaration) {
+				return nil, nil, workarea.AcquisitionRecord{}, fmt.Errorf("runtime/worktree: resolve declared repository %q ref: %w (%s)", repository.Name, err, strings.TrimSpace(string(out)))
+			}
+			m.logger.Warn("declared read-only context repository ref unresolvable; skipping",
+				"sessionId", spec.SessionID, "repository", repository.Name, "err", err)
+			_ = os.RemoveAll(repositoryPath.String())
+			delete(paths, repository.Name)
+			skipped = append(skipped, repository.Name)
+			continue
 		}
 		resolvedRefs[repository.Name] = strings.TrimSpace(string(out))
 		if index == 0 {
 			if err := crashBoundary("mid-clone"); err != nil {
-				return nil, workarea.AcquisitionRecord{}, err
+				return nil, nil, workarea.AcquisitionRecord{}, err
 			}
 		}
 	}
 	if err := crashBoundary("pre-record"); err != nil {
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
-	record := workarea.NewDeclarationRecord(spec.SessionID, workareaID, *declaration, resolvedRefs, claim.Record.AcquisitionID)
+	// The durable record covers exactly the repositories the session can
+	// see: skipped context repositories are absent, so restart adoption
+	// and root-handle validation never demand a directory that was never
+	// materialized.
+	recordDeclaration := *declaration
+	if len(skipped) > 0 {
+		kept := make([]workarea.NormalizedRepository, 0, len(declaration.Repositories)-len(skipped))
+		skipSet := make(map[string]struct{}, len(skipped))
+		for _, name := range skipped {
+			skipSet[name] = struct{}{}
+		}
+		for _, repository := range declaration.Repositories {
+			if _, skip := skipSet[repository.Name]; !skip {
+				kept = append(kept, repository)
+			}
+		}
+		recordDeclaration.Repositories = kept
+	}
+	record := workarea.NewDeclarationRecord(spec.SessionID, workareaID, recordDeclaration, resolvedRefs, claim.Record.AcquisitionID)
 	if err := workarea.WriteDeclaration(ctx, claim.StagingRoot, record); err != nil {
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	acquisition, err = acquisitions.Commit(claim.Record.AcquisitionID)
 	if err != nil {
 		if errors.Is(err, workarea.ErrAcquisitionRootOccupied) {
-			return nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
+			return nil, nil, workarea.AcquisitionRecord{}, fmt.Errorf("%w: %s", ErrWorkareaRootOccupied, layout.Root.String())
 		}
-		return nil, workarea.AcquisitionRecord{}, err
+		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	committed = true
-	return paths, acquisition, nil
+	return paths, skipped, acquisition, nil
+}
+
+// skippableDeclaredRepository reports whether a declared repository may be
+// skipped when its clone fails without failing the session. Only a
+// non-selected read-only context repository qualifies: it is reference
+// material, never the session's working state. The selected repository
+// always fails the session (the harness CWD must exist), as does any
+// writable or non-context repository.
+func skippableDeclaredRepository(repository workarea.NormalizedRepository, declaration *workarea.NormalizedDeclaration) bool {
+	if declaration == nil {
+		return false
+	}
+	if repository.Name == declaration.Selected.Name {
+		return false
+	}
+	return repository.Role == workarea.RepositoryRoleContext && repository.Authority == workarea.RepositoryReadOnly
 }
 
 // provisionOnce performs one materialization attempt for spec.Strategy.
