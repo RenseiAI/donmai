@@ -103,9 +103,10 @@ func relativeStateDirTokenStart(output string, idx int) bool {
 }
 
 // interactiveStateLossHandle preserves ptycli's coarse Init/Result contract
-// while adding at most one typed state-loss SystemEvent. It listens on the
-// public InteractiveSession subscription seam, so no ptyhost or platform wire
-// change is required.
+// while adding at most one typed state-loss SystemEvent plus the session's
+// own transcript activity (assistant turns, tool calls, tool results). It
+// listens on the public InteractiveSession subscription seam, so no ptyhost
+// or platform wire change is required.
 type interactiveStateLossHandle struct {
 	*ptycli.Handle
 	events chan agent.Event
@@ -114,9 +115,20 @@ type interactiveStateLossHandle struct {
 func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string) *interactiveStateLossHandle {
 	h := &interactiveStateLossHandle{
 		Handle: handle,
-		// Init + one state-loss condition + terminal ResultEvent. The fixed
-		// capacity preserves direct-handle callers that never drain Events.
-		events: make(chan agent.Event, 3),
+		// Init + one state-loss condition + terminal ResultEvent, plus
+		// transcript activity. The fixed capacity preserves direct-handle
+		// callers: transcript emission is non-blocking (see emit below),
+		// so a caller that never drains Events cannot stall the PTY.
+		events: make(chan agent.Event, 64),
+	}
+	// emit forwards one transcript event best-effort: when the consumer is
+	// slow the event is dropped rather than blocking the tailer (and with
+	// it the PTY supervision) behind the terminal byte stream.
+	emit := func(ev agent.Event) {
+		select {
+		case h.events <- ev:
+		default:
+		}
 	}
 	var wg sync.WaitGroup
 	wg.Add(2)
@@ -144,8 +156,24 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string) *inte
 			}
 		}
 	}()
+	// Transcript tailer: while the session runs, its JSONL transcript is
+	// tailed and mapped to the same agent events headless emits, so an
+	// interactive session's turns and tool calls reach the session activity
+	// stream. Best-effort and rate-limited (see interactive_transcript.go).
+	// The tailer ends when the handle's own event channel closes
+	// (ptycli.Handle.run owns that close, strictly after the child exits),
+	// and its final sweep flushes trailing writes before h.events closes.
+	transcriptDone := make(chan struct{})
+	var transcriptWG sync.WaitGroup
+	transcriptWG.Add(1)
+	go func() {
+		defer transcriptWG.Done()
+		runInteractiveTranscriptTailer(stateDir, transcriptDone, emit)
+	}()
 	go func() {
 		wg.Wait()
+		close(transcriptDone)
+		transcriptWG.Wait()
 		close(h.events)
 	}()
 	return h

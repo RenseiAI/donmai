@@ -496,6 +496,15 @@ func (r *Runner) dispatchInteractive(
 			}
 			if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
 				r.postInteractiveActivity(interactiveCtx, worktreePath, sink, system.Subtype, system.Message)
+				continue
+			}
+			// Transcript tail (interactive pi): assistant turns, tool
+			// calls, tool results, and per-turn usage arrive on the
+			// handle's own event channel and flow through the same
+			// activity sink as the headless lane's events.
+			switch event.(type) {
+			case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent, agent.LlmCallEvent:
+				r.postInteractiveTranscriptActivity(interactiveCtx, worktreePath, sink, event)
 			}
 
 		case err := <-attachDone:
@@ -610,7 +619,27 @@ func (r *Runner) recordAttachLoss(qw QueuedWork, res *Result, err error) {
 // to the session's events.jsonl for audit parity with the headless /
 // interview paths. Both legs are best-effort.
 func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath string, sink activitySink, subtype, message string) {
-	ev := agent.SystemEvent{Subtype: subtype, Message: message}
+	r.postInteractiveTranscriptActivity(ctx, worktreePath, sink, agent.SystemEvent{Subtype: subtype, Message: message})
+}
+
+// postInteractiveTranscriptActivity forwards one interactive session event
+// through the existing activity sink and mirrors it to events.jsonl for
+// audit parity with the headless/interview paths. Both legs are best-effort.
+// A per-kind token budget keeps a chatty transcript from flooding the
+// activity buffer: assistant text is capped at 2 KiB per event and tool
+// result content at 4 KiB, while tool-call input and usage counts ride
+// uncapped (they are small and structured).
+func (r *Runner) postInteractiveTranscriptActivity(ctx context.Context, worktreePath string, sink activitySink, ev agent.Event) {
+	switch e := ev.(type) {
+	case agent.AssistantTextEvent:
+		if len(e.Text) > 2048 {
+			ev = agent.AssistantTextEvent{Text: e.Text[:2048] + "\u2026", Raw: e.Raw}
+		}
+	case agent.ToolResultEvent:
+		if len(e.Content) > 4096 {
+			ev = agent.ToolResultEvent{ToolName: e.ToolName, ToolUseID: e.ToolUseID, Content: e.Content[:4096] + "\u2026", IsError: e.IsError, Raw: e.Raw}
+		}
+	}
 	if sink != nil {
 		sink.Send(ctx, ev)
 	}
