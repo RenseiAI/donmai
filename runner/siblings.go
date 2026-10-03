@@ -110,15 +110,18 @@ func safeSiblingName(name string) bool {
 
 // siblingContextEligible reports whether qw is a plain single-repository work
 // item whose DONMAI_SIBLING_REPOS entries may become declared context leaves:
-// it declares no repositories itself, has a repository, and uses none of the
-// shapes whose provisioning a declaration would change (a new branch from a
-// base ref, a dispatched pull request, a shared or seeded workarea, an
-// interactive session).
+// it declares no repositories itself, has a repository, requests a
+// non-full-access sandbox, and uses none of the shapes whose provisioning a
+// declaration would change (a new branch from a base ref, a dispatched pull
+// request, a shared or seeded workarea, an interactive session). A full-access
+// item is ineligible on purpose: a declaration would force workspace-write
+// sandboxing, so it keeps the original placement beside the worktree.
 func siblingContextEligible(qw QueuedWork) bool {
 	return qw.RepositoryDeclaration == nil && strings.TrimSpace(qw.Repository) != "" &&
 		worktreeProvisionStrategy(qw) != worktree.StrategyEmpty &&
 		qw.BaseRef == "" && qw.PullRequest == nil && qw.CacheSeedID == "" &&
 		qw.WorkareaMode != worktree.ModeShared && qw.Mode == "" &&
+		resolveSandboxLevel(qw, nil) != agent.SandboxFullAccess &&
 		siblingReposSpec(qw) != ""
 }
 

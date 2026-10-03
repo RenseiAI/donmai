@@ -19,10 +19,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 - `DONMAI_SIBLING_REPOS` entries become read-only context leaves under the
   session root on an executor that attests `session-root-v1` and
   `isolated-read-only-v1`, so a failed sibling clone is skipped and recorded
-  like any context repository. Other executors keep the clone beside the
-  session worktree, now bounded by a timeout and locked across processes. A
-  work item that declares its own repositories ignores the variable, with a
-  warning.
+  like any context repository. Eligibility is exact: only a plain
+  single-repository headless item with no base ref, pull request, cache
+  seed, shared workarea, or full-access sandbox derives the declaration
+  (a ref-bearing item still derives); anything else keeps the clone beside
+  the session worktree, now bounded by a timeout and locked across
+  processes. A work item that declares its own repositories ignores the
+  variable, with a warning.
 
 - A turn that ends on a progress note with the session's pull request still
   a draft is now continued instead of being recorded as passed; a rework run

@@ -15,7 +15,12 @@ ADR-2026-08-22-session-owned-multi-repository-workarea, in
   sibling at `../<name>` from its working directory.
   - An executor that attests the `session-root-v1` workarea protocol and
     `isolated-read-only-v1` enforcement gets each entry as a read-only
-    `context` leaf under the session root, beside the selected repository.
+    `context` leaf under the session root, beside the selected repository,
+    but only for a plain single-repository headless item: no declared
+    repositories, no base ref, pull request, cache seed, or shared workarea,
+    no interactive mode, and a non-full-access sandbox (a ref-bearing item
+    still derives). A full-access item keeps the original placement so the
+    declaration never downgrades its sandbox.
     The leaf belongs to the session: it is torn down, archived and adopted
     with it, and the executor holds it read-only. An entry whose name repeats
     the primary repository's or an earlier entry's is left out.
