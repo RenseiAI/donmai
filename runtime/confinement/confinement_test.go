@@ -108,6 +108,9 @@ func TestPrepare_RefusesWhenUnavailable(t *testing.T) {
 		{"self-test passed for the other mode only", func(t *testing.T, w specWorld) (*Confiner, Spec) {
 			c := newTestConfiner(t, w, renderingBackend{}, nil, "")
 			passingRecord(t, c, agent.PromptModeHumanControlled)
+			if attestation, ok := c.Attestation(); !ok || len(attestation.SessionModes) != 1 || attestation.SessionModes[0] != agent.PromptModeHumanControlled {
+				t.Fatalf("Attestation = %+v, %v; want exactly the mode that passed", attestation, ok)
+			}
 			return c, w.spec()
 		}, ReasonSelfTestFailed},
 		{"self-test taken under another executable", func(t *testing.T, w specWorld) (*Confiner, Spec) {

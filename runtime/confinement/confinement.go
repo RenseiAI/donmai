@@ -225,10 +225,11 @@ func (c *Confiner) SelfTestRecord() (SelfTestRecord, bool) {
 }
 
 // Attestation returns the per-harness confinement attestation when the last
-// self-test passed and is still current, or false.
+// self-test passed in at least one session mode and is still current, or
+// false. Its session modes are exactly the spawn paths that passed.
 func (c *Confiner) Attestation() (Attestation, bool) {
 	record, ok := c.SelfTestRecord()
-	if !ok || !record.Passed {
+	if !ok || len(record.SessionModes) == 0 {
 		return Attestation{}, false
 	}
 	if err := c.checkCurrent(record); err != nil {
