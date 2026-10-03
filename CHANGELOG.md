@@ -22,6 +22,13 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   continuation limit, now end not delivered right away when the turn's only
   result is a draft pull request or a rework pull request with no new commit,
   instead of completing.
+- A turn that ends on a model provider error a retry cannot fix (marked not
+  retryable, or a 4xx other than 408, 409 and 429) now ends at once with the
+  error recorded, where the runner used to spend its bounded retries on it.
+  Network errors, 408, 409, 429, 5xx and context-overflow errors keep their
+  retries; a status is read only from structured fields or a strictly
+  anchored text form, never from a port or a number in prose; and a verdict
+  the turn gave before the error still decides the turn.
 
 ## v0.72.61 — 2026-10-03
 
