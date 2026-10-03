@@ -42,6 +42,10 @@
 // every probe by what changed on disk. Replacing the backend with nothing, or
 // with same-identity permission bits, turns it red.
 //
+// A spawn site that wraps a harness must not hand it a descriptor open on a
+// file outside the writable set: the boundary judges an open, not a write
+// through a descriptor the process inherited.
+//
 // The macOS backend renders a sandbox profile and runs the harness under
 // /usr/bin/sandbox-exec. Other operating systems have no backend yet.
 package confinement

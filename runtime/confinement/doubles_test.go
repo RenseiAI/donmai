@@ -1,10 +1,6 @@
 package confinement
 
-import (
-	"io/fs"
-	"os"
-	"path/filepath"
-)
+import "path/filepath"
 
 // noopBackend applies nothing: the discriminating control a self-test must
 // turn red against.
@@ -22,29 +18,24 @@ func (noopBackend) Apply(ApplyRequest) (Applied, error) {
 	return Applied{Rendered: []byte("noop"), Wrap: func(argv []string) []string { return argv }}, nil
 }
 
-// chmodBackend makes the read-only leaves and protected paths read-only by
-// permission bits under the same identity, which ADR-2026-08-22 D6.7 rules
-// out: the harness can undo it. The self-test must turn red against it too.
-type chmodBackend struct{ noopBackend }
+// renderingBackend renders the real macOS profile without applying it, so
+// the rendering and its refusals are exercised on every OS.
+type renderingBackend struct {
+	noopBackend
+	version string
+}
 
-func (chmodBackend) Apply(req ApplyRequest) (Applied, error) {
-	paths := append(append([]string{}, req.Resolved.ReadOnly...), req.Resolved.Protected...)
-	for _, path := range paths {
-		_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
-			if err != nil {
-				return nil
-			}
-			if d.IsDir() {
-				return nil
-			}
-			return os.Chmod(p, 0o444) //nolint:gosec // G302: the double makes files read-only by permission bits.
-		})
-		_ = filepath.WalkDir(path, func(p string, d fs.DirEntry, err error) error {
-			if err == nil && d.IsDir() {
-				_ = os.Chmod(p, 0o555) //nolint:gosec // G302: the double makes directories read-only by permission bits.
-			}
-			return nil
-		})
+func (r renderingBackend) Version() (string, error) {
+	if r.version == "" {
+		return "rendering-v1", nil
 	}
-	return Applied{Rendered: []byte("chmod"), Wrap: func(argv []string) []string { return argv }}, nil
+	return r.version, nil
+}
+
+func (r renderingBackend) Apply(req ApplyRequest) (Applied, error) {
+	text, err := renderSeatbelt(req.Resolved, []string{"/tmp"}, req.Rules, r.Canonical)
+	if err != nil {
+		return Applied{}, err
+	}
+	return Applied{Rendered: []byte(text), Wrap: func(argv []string) []string { return append([]string{"/wrapped"}, argv...) }}, nil
 }

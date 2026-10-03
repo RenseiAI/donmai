@@ -129,31 +129,34 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		resolved.Sockets = append(resolved.Sockets, path)
 	}
 
-	guardPaths := map[string]string{"workarea root": root}
-	for name, raw := range map[string]string{"operator home": g.home, "host state home": g.stateHome, "profile directory": g.profileDir} {
-		if raw == "" {
+	type guardPath struct{ name, path string }
+	var guardPaths []guardPath
+	for _, candidate := range []guardPath{
+		{"operator home", g.home},
+		{"host state home", g.stateHome},
+		{"workarea root", root},
+		{"profile directory", g.profileDir},
+	} {
+		if candidate.path == "" {
 			continue
 		}
-		path, err := canonicalLoose(raw, canonical)
+		path, err := canonicalLoose(candidate.path, canonical)
 		if err != nil {
-			return nil, refuse(ReasonWritableSetUnrepresentable, "%s: %v", name, err)
+			return nil, refuse(ReasonWritableSetUnrepresentable, "%s: %v", candidate.name, errnoText(err))
 		}
-		guardPaths[name] = path
-	}
-	if g.profileDir != "" {
-		profileDir := guardPaths["profile directory"]
-		if insideOrEqual(profileDir, root) {
+		if candidate.name == "profile directory" && insideOrEqual(path, root) {
 			return nil, refuse(ReasonWritableSetUnrepresentable, "the profile directory is inside the workarea root")
 		}
+		guardPaths = append(guardPaths, guardPath{candidate.name, path})
 	}
 
 	for _, entry := range resolved.Writable {
 		if entry.Path == string(filepath.Separator) {
 			return nil, refuse(ReasonWritableSetUnrepresentable, "%s is the filesystem root", entry.Class)
 		}
-		for name, guard := range guardPaths {
-			if insideOrEqual(guard, entry.Path) {
-				return nil, refuse(ReasonWritableSetUnrepresentable, "%s covers the %s", entry.Class, name)
+		for _, guard := range guardPaths {
+			if insideOrEqual(guard.path, entry.Path) {
+				return nil, refuse(ReasonWritableSetUnrepresentable, "%s covers the %s", entry.Class, guard.name)
 			}
 		}
 		if entry.Class == ClassMutableLeaf {

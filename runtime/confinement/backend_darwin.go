@@ -48,13 +48,22 @@ func (s *seatbeltBackend) Version() (string, error) {
 	return seatbeltProfileVersion + "+darwin-" + build, nil
 }
 
-// Check runs a trivial profile through the launcher. A process already
-// under a profile cannot apply another, so a refusal from the profile apply
-// step is nested_sandbox; any other failure is backend_absent.
+// Check refuses with nested_sandbox when this process is already inside a
+// profile — whether or not the outer profile would let a second one apply,
+// the harness must never run under an outer profile while the inner level is
+// reported (D4.2) — and with backend_absent when the launcher is missing or
+// cannot apply a trivial profile.
 func (s *seatbeltBackend) Check() error {
 	info, err := os.Stat(s.exe)
 	if err != nil || !info.Mode().IsRegular() || info.Mode().Perm()&0o111 == 0 {
 		return refuse(ReasonBackendAbsent, "the macOS profile launcher is missing")
+	}
+	sandboxed, err := alreadySandboxed()
+	if err != nil {
+		return refuse(ReasonBackendAbsent, "cannot tell whether this process is already confined: %v", err)
+	}
+	if sandboxed {
+		return refuse(ReasonNestedSandbox, "this process is already inside a sandbox profile")
 	}
 	ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
 	defer cancel()
@@ -66,6 +75,43 @@ func (s *seatbeltBackend) Check() error {
 		return refuse(ReasonNestedSandbox, "this process is already inside a sandbox profile")
 	}
 	return refuse(ReasonBackendAbsent, "the macOS profile launcher failed: %s", strings.TrimSpace(string(out)))
+}
+
+// sandboxCheckScript asks the kernel whether the process running it is under
+// a profile. A child inherits its parent's profile, so the answer for the
+// child is the answer for this process.
+const sandboxCheckScript = `ObjC.bindFunction("sandbox_check", ["int", ["int", "void *", "int"]]);
+ObjC.bindFunction("getpid", ["int", []]);
+"sandboxed=" + $.sandbox_check($.getpid(), null, 0)`
+
+var (
+	sandboxedOnce  sync.Once
+	sandboxedValue bool
+	sandboxedErr   error
+)
+
+// alreadySandboxed reports whether this process is inside a profile. The
+// answer cannot change for the life of the process — it never applies a
+// profile to itself — so it is asked once.
+func alreadySandboxed() (bool, error) {
+	sandboxedOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/usr/bin/osascript", "-l", "JavaScript", "-e", sandboxCheckScript).Output() //nolint:gosec // G204: fixed tool and script.
+		if err != nil {
+			sandboxedErr = fmt.Errorf("sandbox check: %w", err)
+			return
+		}
+		switch strings.TrimSpace(string(out)) {
+		case "sandboxed=0":
+			sandboxedValue = false
+		case "sandboxed=1":
+			sandboxedValue = true
+		default:
+			sandboxedErr = fmt.Errorf("sandbox check: unexpected answer %q", strings.TrimSpace(string(out)))
+		}
+	})
+	return sandboxedValue, sandboxedErr
 }
 
 // Canonical resolves symbolic links and folds the data-volume firmlink, so a
@@ -162,4 +208,36 @@ func sharedLocations() ([]string, error) {
 		sharedValue = locations
 	})
 	return append([]string(nil), sharedValue...), sharedErr
+}
+
+// profileName is a profile file name for one rendering: the harness and
+// session ids reduced to a safe alphabet plus a random suffix, so two
+// renderings never share a file.
+func profileName(r *Resolved) string {
+	return safeName(r.HarnessID) + "-" + safeName(r.SessionID) + "-" + randomSuffix() + ".sb"
+}
+
+// writeProfile writes a profile atomically with owner-only permissions.
+func writeProfile(dir, name string, text []byte) (string, error) {
+	tmp, err := os.CreateTemp(dir, ".profile-*")
+	if err != nil {
+		return "", fmt.Errorf("confinement: write profile: %w", err)
+	}
+	defer func() { _ = os.Remove(tmp.Name()) }()
+	if _, err := tmp.Write(text); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("confinement: write profile: %w", err)
+	}
+	if err := tmp.Chmod(0o600); err != nil {
+		_ = tmp.Close()
+		return "", fmt.Errorf("confinement: write profile: %w", err)
+	}
+	if err := tmp.Close(); err != nil {
+		return "", fmt.Errorf("confinement: write profile: %w", err)
+	}
+	path := filepath.Join(dir, name)
+	if err := os.Rename(tmp.Name(), path); err != nil {
+		return "", fmt.Errorf("confinement: write profile: %w", err)
+	}
+	return path, nil
 }
