@@ -443,6 +443,12 @@ type Runner struct {
 	// fake so a refused notice's retry is driven deterministically instead of
 	// by sleeping. See Runner.noticeRetryClock.
 	interactiveNoticeClock interviewClock
+
+	// idleClock overrides the idle/no-progress watchdog timer source in
+	// consumeEvents. Nil in production (real time); tests substitute a
+	// manual clock so watchdog expiry is tripped explicitly instead of by
+	// sleeping past a wall-clock window. See Runner.idleTimer.
+	idleClock interviewClock
 }
 
 // RuntimeCredentials are the bearer-token credentials needed for session
