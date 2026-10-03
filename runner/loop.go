@@ -18,6 +18,7 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 	"github.com/RenseiAI/donmai/internal/interview"
 	"github.com/RenseiAI/donmai/internal/kit"
+	"github.com/RenseiAI/donmai/internal/providerretry"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/activity"
 	"github.com/RenseiAI/donmai/runtime/executionevent"
@@ -1386,7 +1387,7 @@ tailRecovery:
 		case tailDone:
 			break tailRecovery
 		case tailExhausted:
-			if ending == turnProviderError {
+			if ending == turnProviderError || ending == turnProviderErrorFatal {
 				followUps.providerError = lastTurn.providerError
 			}
 			followUps.fail(res)
@@ -2023,7 +2024,12 @@ type streamObservation struct {
 	// on a provider error (agent.SystemSubtypeProviderError) with no
 	// assistant message or tool call after it in this stream — the turn
 	// ended on that error rather than because the agent stopped.
-	providerError string
+	// providerErrorNotRetryable is set when that error is one a new
+	// attempt cannot fix (splitProviderErrorRetryable): where the runner
+	// would retry the turn, it ends it at once with the error recorded.
+	// The zero value is retryable, as every provider error was before.
+	providerError             string
+	providerErrorNotRetryable bool
 	// toolCalls counts the tool calls (agent.ToolUseEvent) this stream
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
@@ -2035,6 +2041,27 @@ type streamObservation struct {
 	// generic FailureTimeout (ctx-cancelled) branch, so a wedged session
 	// is routed distinctly from a deadline expiry.
 	noProgress bool
+}
+
+// splitProviderErrorRetryable separates the harness-reported retryability
+// marker (agent.ProviderErrorNotRetryableSuffix) from the provider's own
+// error text and reports whether a new attempt cannot fix the failure. A
+// context overflow is always retryable (providerretry.ContextOverflow); else
+// an explicit marker wins; else the text is judged by
+// providerretry.TextRetryable, which reads a status only from a strictly
+// anchored form, so a port or a number in prose never makes a network error
+// fatal.
+func splitProviderErrorRetryable(detail string) (text string, notRetryable bool) {
+	text, marked := strings.CutSuffix(detail, agent.ProviderErrorNotRetryableSuffix)
+	text = strings.TrimSpace(text)
+	switch {
+	case providerretry.ContextOverflow(text):
+		return text, false
+	case marked:
+		return text, true
+	default:
+		return text, !providerretry.TextRetryable(text)
+	}
 }
 
 // verdict is the stream's single verdict: "blocked" when its latest anchored
@@ -2358,6 +2385,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
 			obs.providerError = ""
+			obs.providerErrorNotRetryable = false
 		}
 		// One verdict per message, from its FIRST line-anchored marker
 		// (scanVerdict); the latest message that carries one decides the
@@ -2391,7 +2419,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Text)
 	case agent.SystemEvent:
 		if e.Subtype == agent.SystemSubtypeProviderError {
-			obs.providerError = strings.TrimSpace(e.Message)
+			obs.providerError, obs.providerErrorNotRetryable = splitProviderErrorRetryable(strings.TrimSpace(e.Message))
 			if obs.providerError == "" {
 				obs.providerError = "model provider error"
 			}
@@ -2401,6 +2429,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		// The model produced a tool call: any earlier provider error in
 		// this stream was recovered from.
 		obs.providerError = ""
+		obs.providerErrorNotRetryable = false
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
 		// Bash invocations of `gh pr create` are not tracked here —

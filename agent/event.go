@@ -106,10 +106,18 @@ const SystemSubtypeToolCallRefusedOutputLimit = "tool_call_refused_output_limit"
 // unreachable model) and the harness did not recover within the turn — the
 // turn is about to end on that error rather than because the agent stopped.
 // It is an observation, not a terminal: the turn still ends with its
-// ResultEvent. Message carries the provider's error text. A later assistant
-// message or tool call in the same turn means the model recovered. The runner
-// retries such a turn rather than nudging it (runner/turn_continuation.go).
+// ResultEvent. Message carries the provider's error text, with a
+// "; isRetryable=false" suffix when the harness reports the failure as not
+// retryable (a deterministic 4xx such as invalid parameters). A later
+// assistant message or tool call in the same turn means the model recovered.
+// The runner retries a retryable turn rather than nudging it, and ends a
+// non-retryable one at once with the error recorded (runner/turn_continuation.go).
 const SystemSubtypeProviderError = "provider_error"
+
+// ProviderErrorNotRetryableSuffix marks a provider-error observation the
+// harness reports as not retryable. The runner strips it before recording
+// the error text, so the receipt keeps the provider's own message.
+const ProviderErrorNotRetryableSuffix = "; isRetryable=false"
 
 // SystemSubtypeReasoningEffort is the SystemEvent subtype the runner emits
 // once per session, after spawn and before any turn output, recording the

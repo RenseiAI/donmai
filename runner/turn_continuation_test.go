@@ -304,6 +304,199 @@ func TestTurnFollowUps_NoCeilingKeepsContinuingProductiveTurns(t *testing.T) {
 	}
 }
 
+// TestRun_ProviderErrorNotRetryableEndsAtOnce pins the fail-fast path: a
+// turn that ends on a provider error the provider marks as not retryable
+// (a 400 for invalid parameters) ends right away with the error recorded —
+// no retry prompt, no pull request nudge.
+func TestRun_ProviderErrorNotRetryableEndsAtOnce(t *testing.T) {
+	res, prompts := runContinuationScenario(t, 0,
+		verdictScriptTurn{text: "Working.", providerError: "400 The request contains invalid parameters"},
+		verdictScriptTurn{text: "never reached"},
+	)
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureProviderError)
+	}
+	if !strings.Contains(res.Error, "not retryable") || !strings.Contains(res.Error, "400 The request contains invalid parameters") {
+		t.Errorf("Error = %q; want the not-retryable reason and the provider error", res.Error)
+	}
+	if len(prompts) != 0 {
+		t.Errorf("prompts = %q; want no retry for a non-retryable provider error", prompts)
+	}
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a non-retryable provider error is failed, not nudged")
+	}
+	wantContinuations(t, res, 0, 0, true)
+}
+
+// TestRun_ProviderErrorRetryableStatusesKeepBoundedRetries pins that 503
+// and 429 provider errors keep today's bounded retries.
+func TestRun_ProviderErrorRetryableStatusesKeepBoundedRetries(t *testing.T) {
+	for _, status := range []string{"503 Service Unavailable", "429 Too Many Requests"} {
+		t.Run(status, func(t *testing.T) {
+			res, prompts := runContinuationScenario(t, 1,
+				verdictScriptTurn{text: "Working.", providerError: status},
+				verdictScriptTurn{providerError: status},
+				verdictScriptTurn{text: "never reached"},
+			)
+			if res.Status != "failed" || res.FailureMode != FailureProviderError {
+				t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureProviderError)
+			}
+			if !strings.Contains(res.Error, "after 1 retries") || !strings.Contains(res.Error, status) {
+				t.Errorf("Error = %q; want the retry count and the provider error", res.Error)
+			}
+			wantPrompts(t, prompts, retryPrompt)
+			wantContinuations(t, res, 0, 1, true)
+		})
+	}
+}
+
+// providerErrorThenSuccess runs a development session whose first turn ends
+// on the provider error text and whose retry delivers the work.
+func providerErrorThenSuccess(t *testing.T, providerError string) (*Result, []string) {
+	t.Helper()
+	return runContinuationScenario(t, 0,
+		verdictScriptTurn{text: "Working.", providerError: providerError},
+		verdictScriptTurn{text: "Opened " + followUpPR + "\nWORK_RESULT: passed"},
+		verdictScriptTurn{text: "never reached"},
+	)
+}
+
+// wantRetriedToCompletion asserts the session retried its provider error
+// once and then completed with its pull request.
+func wantRetriedToCompletion(t *testing.T, res *Result, prompts []string) {
+	t.Helper()
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s after one retry",
+			res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, prompts, retryPrompt)
+	wantContinuations(t, res, 0, 1, false)
+}
+
+// TestRun_NetworkErrorsWithNumbersStayRetryable pins that a status is never
+// read from a port, an address or a number in prose: each of these network
+// errors is retried, and the retry completes the work.
+func TestRun_NetworkErrorsWithNumbersStayRetryable(t *testing.T) {
+	for _, text := range []string{
+		"connect ETIMEDOUT 104.18.32.47:443",
+		"connect ECONNREFUSED 10.0.0.12:443",
+		"dial tcp 10.0.0.12:443: i/o timeout",
+		"timeout after 400 seconds",
+		"stream reset after 404 bytes of the response body",
+	} {
+		t.Run(text, func(t *testing.T) {
+			res, prompts := providerErrorThenSuccess(t, text)
+			wantRetriedToCompletion(t, res, prompts)
+		})
+	}
+}
+
+// TestRun_RetryableStatusesThenSuccessComplete pins the statuses the policy
+// retries: 408 and 409 (and 429 and 5xx) are retried, and the retry
+// completes the work.
+func TestRun_RetryableStatusesThenSuccessComplete(t *testing.T) {
+	for _, text := range []string{
+		"408 Request Timeout",
+		"409 Conflict",
+		"429 Too Many Requests",
+		"HTTP 503 Service Unavailable",
+	} {
+		t.Run(text, func(t *testing.T) {
+			res, prompts := providerErrorThenSuccess(t, text)
+			wantRetriedToCompletion(t, res, prompts)
+		})
+	}
+}
+
+// TestRun_ContextOverflowStaysRetryable pins that a context overflow is
+// retried even though the provider answers it with a 400 (or the harness
+// marks it not retryable): the harness compacts its context on the next user
+// message, so the runner's retry prompt is a new attempt that can succeed.
+func TestRun_ContextOverflowStaysRetryable(t *testing.T) {
+	for _, text := range []string{
+		`400 {"type":"error","error":{"type":"invalid_request_error","message":"prompt is too long: 213456 tokens > 200000 maximum"}}`,
+		"400 This model's maximum context length is 128000 tokens. However, your messages resulted in 131072 tokens.",
+		"400 prompt is too long" + agent.ProviderErrorNotRetryableSuffix,
+	} {
+		t.Run(text, func(t *testing.T) {
+			res, prompts := providerErrorThenSuccess(t, text)
+			wantRetriedToCompletion(t, res, prompts)
+		})
+	}
+}
+
+// TestRun_VerdictWinsOverANonRetryableProviderError pins the fatal path's
+// limits. A turn that gave its own verdict before a provider error a retry
+// cannot fix is classified by that verdict: research ends completed and
+// passed, and development without a pull request gets the pull request
+// nudge, as before the policy existed. Work the runner never retries (here
+// research without a verdict) ends as it did before, too: the fatal path
+// only replaces a retry the runner would have sent.
+func TestRun_VerdictWinsOverANonRetryableProviderError(t *testing.T) {
+	const invalid = "400 The request contains invalid parameters"
+	cases := []struct {
+		name           string
+		workType       string
+		turns          []verdictScriptTurn
+		wantWorkResult string
+		wantPR         string
+		wantSteering   bool
+		wantPrompts    int
+	}{
+		{
+			name:           "research verdict, then a non-retryable 400",
+			workType:       "research",
+			turns:          []verdictScriptTurn{{text: "Findings written to the report.\nWORK_RESULT: passed", providerError: invalid}, {text: "never reached"}},
+			wantWorkResult: "passed",
+		},
+		{
+			name:     "research without a verdict, then a non-retryable 400",
+			workType: "research",
+			turns:    []verdictScriptTurn{{text: "Reading the sources.", providerError: invalid}, {text: "never reached"}},
+		},
+		{
+			name:           "development verdict without a pull request, then a non-retryable 400",
+			workType:       "development",
+			turns:          []verdictScriptTurn{{text: "Implemented.\nWORK_RESULT: passed", providerError: invalid}, {text: "Opened " + followUpPR}, {text: "never reached"}},
+			wantWorkResult: "passed",
+			wantPR:         followUpPR,
+			wantSteering:   true,
+			wantPrompts:    1,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := scriptedSession{workType: tc.workType, turns: tc.turns}
+			if tc.workType == "development" {
+				cfg.repository = followUpRepository
+				cfg.pulls = map[int]string{7: pullAtSessionCommit}
+			}
+			res, provider := runScriptedSession(t, cfg)
+			if res.Status != "completed" || res.FailureMode != "" {
+				t.Fatalf("Status=%q FailureMode=%q (%s); want completed", res.Status, res.FailureMode, res.Error)
+			}
+			if res.WorkResult != tc.wantWorkResult {
+				t.Errorf("WorkResult = %q; want %q", res.WorkResult, tc.wantWorkResult)
+			}
+			if res.PullRequestURL != tc.wantPR {
+				t.Errorf("PullRequestURL = %q; want %q", res.PullRequestURL, tc.wantPR)
+			}
+			if res.SteeringTriggered != tc.wantSteering {
+				t.Errorf("SteeringTriggered = %v; want %v", res.SteeringTriggered, tc.wantSteering)
+			}
+			if len(provider.prompts) != tc.wantPrompts {
+				t.Errorf("follow-up prompts = %q; want %d", provider.prompts, tc.wantPrompts)
+			}
+			for _, prompt := range provider.prompts {
+				if prompt == retryPrompt {
+					t.Errorf("sent a retry for a provider error a retry cannot fix")
+				}
+			}
+			wantContinuations(t, res, 0, 0, false)
+		})
+	}
+}
+
 // TestRun_ProviderErrorRetriesExhaustedFailAsProviderError pins the retry
 // bound: a turn that still ends on a provider error after the limit fails as a
 // provider error, with the count and the provider's text.
@@ -674,6 +867,19 @@ func TestClassifyTurnEnding(t *testing.T) {
 	}{
 		{name: "clean end with nothing", turn: clean, want: turnStoppedEarly},
 		{name: "provider error", turn: with(func(o *streamObservation) { o.providerError = "503" }), want: turnProviderError},
+		{name: "non-retryable provider error ends at once", turn: with(func(o *streamObservation) {
+			o.providerError = "400 The request contains invalid parameters"
+			o.providerErrorNotRetryable = true
+		}), want: turnProviderErrorFatal},
+		{name: "a verdict in the turn wins over a non-retryable provider error", turn: with(func(o *streamObservation) {
+			o.workResult = "passed"
+			o.providerError = "400 The request contains invalid parameters"
+			o.providerErrorNotRetryable = true
+		}), want: turnFinished},
+		{name: "a retryable provider error is retried even after a verdict", turn: with(func(o *streamObservation) {
+			o.workResult = "passed"
+			o.providerError = "503"
+		}), want: turnProviderError},
 		{name: "verified pull request", res: func() Result { r := Result{}; r.PullRequestURL = followUpPR; return r }(), turn: clean, want: turnFinished},
 		{name: "turn-result manifest", res: func() Result { r := Result{}; r.Manifest = &TurnManifest{Verdict: "passed"}; return r }(), turn: clean, want: turnFinished},
 		{name: "an own-repository pull request that did not verify", turn: clean, reportedPR: true, want: turnFinished},
@@ -705,15 +911,26 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 	r := minimalRunner(t)
 	dir := t.TempDir()
 	errEvent := agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "503 Service Unavailable"}
+	nonRetryableEvent := agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "400 invalid parameters" + agent.ProviderErrorNotRetryableSuffix}
+	providerErr := func(text string) agent.Event {
+		return agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: text}
+	}
 	cases := []struct {
-		name   string
-		events []agent.Event
-		want   string
+		name             string
+		events           []agent.Event
+		want             string
+		wantNotRetryable bool
 	}{
 		{name: "error ends the stream", events: []agent.Event{agent.AssistantTextEvent{Text: "partial"}, errEvent}, want: "503 Service Unavailable"},
 		{name: "assistant text after the error", events: []agent.Event{errEvent, agent.AssistantTextEvent{Text: "recovered"}}},
 		{name: "tool call after the error", events: []agent.Event{errEvent, agent.ToolUseEvent{ToolName: "bash"}}},
 		{name: "other system events keep it", events: []agent.Event{errEvent, agent.SystemEvent{Subtype: "auto_retry_end"}}, want: "503 Service Unavailable"},
+		{name: "non-retryable marker strips the suffix and keeps the text", events: []agent.Event{nonRetryableEvent}, want: "400 invalid parameters", wantNotRetryable: true},
+		{name: "non-retryable 400 by status", events: []agent.Event{providerErr("400 invalid parameters")}, want: "400 invalid parameters", wantNotRetryable: true},
+		{name: "recovery clears a non-retryable error", events: []agent.Event{nonRetryableEvent, agent.AssistantTextEvent{Text: "recovered"}}},
+		{name: "429 stays retryable", events: []agent.Event{providerErr("429 Too Many Requests")}, want: "429 Too Many Requests"},
+		{name: "a port is not a status", events: []agent.Event{providerErr("connect ECONNREFUSED 10.0.0.12:443")}, want: "connect ECONNREFUSED 10.0.0.12:443"},
+		{name: "a context overflow stays retryable even when marked", events: []agent.Event{providerErr("400 prompt is too long" + agent.ProviderErrorNotRetryableSuffix)}, want: "400 prompt is too long"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -723,6 +940,9 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 			}
 			if obs.providerError != tc.want {
 				t.Fatalf("providerError = %q; want %q", obs.providerError, tc.want)
+			}
+			if obs.providerErrorNotRetryable != tc.wantNotRetryable {
+				t.Fatalf("providerErrorNotRetryable = %v; want %v", obs.providerErrorNotRetryable, tc.wantNotRetryable)
 			}
 		})
 	}

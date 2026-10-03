@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/providerretry"
 )
 
 // mapperState carries cross-event state for the live mapping (design §4):
@@ -128,7 +129,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			if detail == "" {
 				detail = "model provider error"
 			}
-			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: detail, Raw: raw(ev)})
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: providerErrorDetail(msg, detail), Raw: raw(ev)})
 		}
 		return out, false
 
@@ -294,6 +295,113 @@ func toolResultContent(f map[string]any) string {
 		}
 	}
 	return b.String()
+}
+
+// providerErrorDetail folds the harness-reported retryability into the
+// provider-error observation the runner classifies. A gateway marks a
+// deterministic failure (for example a 400 for invalid parameters) with
+// isRetryable false; without it the text alone cannot tell a failure that
+// cannot succeed on retry from a transient one. The marker rides as the
+// agent.ProviderErrorNotRetryableSuffix suffix so older readers still see the
+// provider's own text first, and the runner strips it before recording the
+// receipt. A context overflow is never marked, whatever its status or flag:
+// pi re-arms its compaction on the next user message, so the runner's retry
+// prompt is a new attempt with a smaller context
+// (providerretry.ContextOverflow).
+func providerErrorDetail(msg map[string]any, detail string) string {
+	if providerretry.ContextOverflow(detail) {
+		return detail
+	}
+	if retryable := providerErrorRetryable(msg); retryable == nil || *retryable {
+		return detail
+	}
+	return detail + agent.ProviderErrorNotRetryableSuffix
+}
+
+// providerErrorRetryable reports the harness's own retryability verdict for
+// a failed assistant message, read from structured fields only: an explicit
+// isRetryable flag on the message or its diagnostics, else an HTTP status
+// field (providerretry.StatusRetryable: 408, 409, 429 and 5xx retry; any
+// other 4xx does not). It returns nil when the message carries no verdict
+// either way; the runner then judges the error text by
+// providerretry.TextRetryable. Unknown shapes stay retryable: only a
+// positive signal that the request cannot succeed stops the retry.
+func providerErrorRetryable(msg map[string]any) *bool {
+	if v, ok := providerErrorFlag(msg); ok {
+		return &v
+	}
+	for _, d := range providerErrorDiagnostics(msg) {
+		if v, ok := providerErrorFlag(d); ok {
+			return &v
+		}
+		if status, ok := providerErrorStatus(d); ok {
+			retryable := providerretry.StatusRetryable(status)
+			return &retryable
+		}
+	}
+	if status, ok := providerErrorStatus(msg); ok {
+		retryable := providerretry.StatusRetryable(status)
+		return &retryable
+	}
+	return nil
+}
+
+// providerErrorFlag reads an explicit isRetryable verdict. The gateway
+// nests it under error ({"error":{"isRetryable":false}}); accept a
+// top-level flag too so a flatter shape is not missed.
+func providerErrorFlag(m map[string]any) (bool, bool) {
+	if v, ok := m["isRetryable"].(bool); ok {
+		return v, true
+	}
+	if err, ok := m["error"].(map[string]any); ok {
+		if v, ok := err["isRetryable"].(bool); ok {
+			return v, true
+		}
+	}
+	return false, false
+}
+
+// providerErrorDiagnostics returns the message's diagnostic entries: the
+// pi-messages failure path attaches the gateway status there
+// ({"details":{"status":400}}).
+func providerErrorDiagnostics(msg map[string]any) []map[string]any {
+	raw, ok := msg["diagnostics"].([]any)
+	if !ok {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(raw))
+	for _, item := range raw {
+		if d, ok := item.(map[string]any); ok {
+			out = append(out, d)
+		}
+	}
+	return out
+}
+
+// providerErrorStatus reads an HTTP status from a message or diagnostic
+// entry: details.status first (the diagnostic shape), then status and
+// statusCode spellings.
+func providerErrorStatus(m map[string]any) (int, bool) {
+	if details, ok := m["details"].(map[string]any); ok {
+		if status, ok := providerErrorNumber(details, "status", "statusCode"); ok {
+			return status, true
+		}
+	}
+	return providerErrorNumber(m, "status", "statusCode")
+}
+
+func providerErrorNumber(m map[string]any, keys ...string) (int, bool) {
+	for _, k := range keys {
+		switch v := m[k].(type) {
+		case float64:
+			return int(v), true
+		case int:
+			return v, true
+		case int64:
+			return int(v), true
+		}
+	}
+	return 0, false
 }
 
 // raw returns the raw event bytes as a string for the agent.Event Raw field.
