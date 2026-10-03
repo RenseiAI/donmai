@@ -185,6 +185,16 @@ func TestResolveSpec_RefusesUnrepresentableSets(t *testing.T) {
 			spec.Protected = []string{filepath.Join(w.state, "absent")}
 		}},
 		{"relative declared socket", func(_ *testing.T, _ specWorld, spec *Spec, _ *guards) { spec.Sockets = []string{"sock"} }},
+		{"declared socket through a link planted in harness state", func(t *testing.T, w specWorld, spec *Spec, _ *guards) {
+			elsewhere := filepath.Join(w.base, "runtime")
+			if err := os.MkdirAll(elsewhere, 0o750); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(elsewhere, filepath.Join(w.state, "run")); err != nil {
+				t.Fatal(err)
+			}
+			spec.Sockets = []string{filepath.Join(w.state, "run", "agent.sock")}
+		}},
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {

@@ -91,6 +91,7 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 	}
 	allDeclared = append(allDeclared, spec.ReadOnlyLeaves...)
 	allDeclared = append(allDeclared, spec.Protected...)
+	allDeclared = append(allDeclared, spec.Sockets...)
 	for _, path := range allDeclared {
 		if err := checkLinkPlants(path, writablePaths, canonical); err != nil {
 			return nil, err
