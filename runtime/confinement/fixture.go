@@ -58,16 +58,23 @@ type harnessStep struct {
 // read-only leaf, harness state with a protected artifact inside it, session
 // tmp and cache, decoys outside the set, and the write proxies in reach.
 type fixture struct {
-	dir, ws, meta, mut, git, state, ext, ro, tmp, cache, out string
-	tag                                                      string
-	steps                                                    []harnessStep
-	cleanups                                                 []func()
-	listener                                                 net.Listener
-	accepts                                                  atomic.Int32
+	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out string
+	tag                                                           string
+	steps                                                         []harnessStep
+	cleanups                                                      []func()
+	listener                                                      net.Listener
+	accepts                                                       atomic.Int32
 	// mounted records whether the mount probe got a volume over the
 	// read-only leaf; settle takes it before detaching.
 	mounted bool
+	// moves are the renames that would move a whole leaf or directory the
+	// other probes are judged in; settle records and undoes them.
+	moves []move
+	moved map[string]bool
 }
+
+// move is one directory rename probe: from is where the directory belongs.
+type move struct{ id, from, to string }
 
 func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskImage string, diskImageErr error) (fx *fixture, err error) {
 	fx = &fixture{dir: dir, tag: randomSuffix()}
@@ -83,10 +90,11 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	fx.state = filepath.Join(fx.mut, ".h")
 	fx.ext = filepath.Join(fx.state, "ext")
 	fx.ro = filepath.Join(fx.ws, "ro")
+	fx.rom = filepath.Join(fx.ws, "rom")
 	fx.tmp = filepath.Join(dir, "t")
 	fx.cache = filepath.Join(dir, "c")
 	fx.out = filepath.Join(dir, "o")
-	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.tmp, fx.cache, fx.out} {
+	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.rom, fx.tmp, fx.cache, fx.out} {
 		if err := os.MkdirAll(path, 0o755); err != nil { //nolint:gosec // G301: fixture directories.
 			return nil, fmt.Errorf("confinement: fixture: %w", err)
 		}
@@ -166,15 +174,18 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	}
 
 	// Renames that move a whole leaf or an ancestor of a protected path run
-	// last: when one wrongly succeeds it moves paths the earlier probes use.
-	gone := func(path string) func(stepResult) bool {
-		return func(stepResult) bool { return !exists(path) }
-	}
-	fx.add(classProtected, false, probeStep{ID: "protected.rename_ancestor", Op: opRename, Path: fx.ext, Path2: filepath.Join(fx.state, "ext-moved")}, gone(fx.ext))
-	fx.add(classProtected, false, probeStep{ID: "protected.rename_state", Op: opRename, Path: fx.state, Path2: filepath.Join(fx.mut, ".h-moved")}, gone(fx.state))
-	fx.add(classProtected, false, probeStep{ID: "protected.rename_leaf_into_tmp", Op: opRename, Path: fx.mut, Path2: filepath.Join(fx.tmp, "mut-moved")}, gone(fx.mut))
-	fx.add(classReadOnly, false, probeStep{ID: "ro.rename_leaf", Op: opRename, Path: fx.ro, Path2: filepath.Join(fx.tmp, "ro-moved")}, gone(fx.ro))
+	// last, and settle undoes any that got through before anything is
+	// judged, so they cannot move paths the other probes are judged in.
+	fx.moveProbe(classProtected, "protected.rename_ancestor", fx.ext, filepath.Join(fx.state, "ext-moved"))
+	fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
+	fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
+	fx.moveProbe(classReadOnly, "ro.rename_leaf", fx.ro, filepath.Join(fx.tmp, "ro-moved"))
 	return fx, nil
+}
+
+func (fx *fixture) moveProbe(class, id, from, to string) {
+	fx.moves = append(fx.moves, move{id: id, from: from, to: to})
+	fx.add(class, false, probeStep{ID: id, Op: opRename, Path: from, Path2: to}, func(stepResult) bool { return fx.moved[id] })
 }
 
 func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
@@ -187,7 +198,7 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 		HarnessState:   []string{fx.state},
 		SessionTmp:     fx.tmp,
 		Caches:         []Cache{{Env: probeCacheEnv, Dir: fx.cache}},
-		ReadOnlyLeaves: []string{fx.ro},
+		ReadOnlyLeaves: []string{fx.ro, fx.rom},
 		Protected:      []string{fx.ext},
 	}
 }
@@ -271,8 +282,9 @@ func (fx *fixture) outside(id, base, dir string) error {
 
 // readOnly adds the read-only leaf probes: the file operations, renames
 // within, into and out of the leaf, a hard link and a symbolic link planted
-// in the mutable sibling, a permission change on the leaf itself and a mount
-// over it.
+// in the mutable sibling, and a permission change on the leaf itself. The
+// mount probe targets a second read-only leaf, so a volume it wrongly gets
+// mounted cannot hide what the probes on the first one changed.
 func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 	if err := fx.fileOps(classReadOnly, "ro", false, fx.ro); err != nil {
 		return err
@@ -298,7 +310,7 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 	fx.add(classReadOnly, false, probeStep{ID: "ro.symlink_write_from_mutable", Op: opSymlinkWrite, Path: at("sw"), Path2: filepath.Join(fx.mut, "ro-symlink")}, changedEffect(at("sw")))
 	fx.add(classReadOnly, false, probeStep{ID: "ro.chmod_leaf", Op: opChmod, Path: fx.ro}, modeEffect(fx.ro, 0o755))
 	mount := harnessStep{
-		probe:  probeStep{ID: "ro.mount_over", Op: opMount, Path: fx.ro, Path2: diskImage},
+		probe:  probeStep{ID: "ro.mount_over", Op: opMount, Path: fx.rom, Path2: diskImage},
 		class:  classReadOnly,
 		effect: func(stepResult) bool { return fx.mounted },
 	}
@@ -311,18 +323,25 @@ func (fx *fixture) readOnly(diskImage string, diskImageErr error) error {
 }
 
 // settle runs after the probe exits and before any effect is judged: it
-// records whether a volume was mounted over the read-only leaf, then
-// detaches it, so the volume cannot hide what the other probes changed.
+// records whether a volume was mounted over the read-only leaf and detaches
+// it, then records and undoes every directory move that got through, last
+// first.
 func (fx *fixture) settle() {
-	fx.mounted = isMountPoint(fx.ro) || isMountPoint(filepath.Join(fx.tmp, "ro-moved"))
+	fx.mounted = isMountPoint(fx.rom)
 	fx.detach()
+	fx.moved = map[string]bool{}
+	for i := len(fx.moves) - 1; i >= 0; i-- {
+		m := fx.moves[i]
+		if !exists(m.from) && exists(m.to) {
+			fx.moved[m.id] = true
+			_ = os.Rename(m.to, m.from)
+		}
+	}
 }
 
 func (fx *fixture) detach() {
-	for _, path := range []string{fx.ro, filepath.Join(fx.tmp, "ro-moved")} {
-		if isMountPoint(path) {
-			_ = exec.Command("/usr/bin/hdiutil", "detach", "-force", "-quiet", path).Run() //nolint:gosec // G204: fixed tool, fixture path.
-		}
+	if isMountPoint(fx.rom) {
+		_ = exec.Command("/usr/bin/hdiutil", "detach", "-force", "-quiet", fx.rom).Run() //nolint:gosec // G204: fixed tool, fixture path.
 	}
 }
 

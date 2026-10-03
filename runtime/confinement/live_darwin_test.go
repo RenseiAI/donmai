@@ -54,39 +54,6 @@ func TestSeatbelt_SelfTestPassesBothModes(t *testing.T) {
 	t.Logf("self-test passed: %d probes across %v, backend %s", len(record.Probes), record.SessionModes, record.BackendVersion)
 }
 
-// probesHeldByTheBackend are the probes the boundary, and nothing else,
-// holds: with the backend replaced by nothing they must each turn red.
-var probesHeldByTheBackend = []string{
-	"outside.home.create",
-	"outside.home.write",
-	"outside.state_home.write",
-	"outside.shared_tmp.create",
-	"outside.user_tmp.create",
-	"outside.user_cache.create",
-	"outside.git_common_dir.write",
-	"outside.sibling_session.write",
-	"outside.workarea_root.create_direct",
-	"ro.write",
-	"ro.create",
-	"ro.rename_within",
-	"ro.remove",
-	"ro.chmod",
-	"ro.hardlink_from_mutable",
-	"ro.symlink_write_from_mutable",
-	"ro.mount_over",
-	"protected.write",
-	"protected.rename_ancestor",
-	"protected.rename_state",
-	"widen.reenter_backend",
-	"widen.job_launcher",
-	"widen.open_application",
-	"widen.service_lookup.apple_events",
-	"widen.service_lookup.launch_services",
-	"widen.service_lookup.mount",
-	"widen.attach_process",
-	"widen.socket_outside",
-}
-
 func failedIn(record SelfTestRecord) map[string]bool {
 	failed := map[string]bool{}
 	for _, probe := range record.Failures() {
@@ -96,8 +63,9 @@ func failedIn(record SelfTestRecord) map[string]bool {
 }
 
 // TestSeatbelt_SelfTestRedWithoutBackend is the discriminating control of
-// D1.5: with the backend replaced by nothing, the exact probes the backend
-// holds fail, in both session modes.
+// D1.5: with the backend replaced by nothing, every probe that expects a
+// refusal — each one held by the backend and nothing else — fails, in both
+// session modes, while every positive control still passes.
 func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 	c, _ := newLiveConfiner(t, noopBackend{}, nil)
 	record, err := runSelfTest(t, c)
@@ -107,12 +75,21 @@ func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 	if record.Passed || len(record.SessionModes) != 0 {
 		t.Fatalf("record passed=%v modes=%v, want no attested mode", record.Passed, record.SessionModes)
 	}
-	failed := failedIn(record)
-	for _, mode := range []string{"autonomous", "human_controlled"} {
-		for _, id := range probesHeldByTheBackend {
-			if !failed[mode+"/"+id] {
-				t.Errorf("%s/%s passed with no backend; the probe does not discriminate", mode, id)
-			}
+	refused := map[string]int{}
+	for _, probe := range record.Probes {
+		switch {
+		case probe.Expected == outcomeRefused && probe.Pass:
+			t.Errorf("%s/%s passed with no backend; the probe does not discriminate", probe.Mode, probe.ID)
+		case probe.Expected == outcomeAccepted && !probe.Pass:
+			t.Errorf("positive control %s/%s failed with no backend: %s", probe.Mode, probe.ID, probe.Detail)
+		}
+		if probe.Expected == outcomeRefused {
+			refused[probe.Class]++
+		}
+	}
+	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening} {
+		if refused[class] == 0 {
+			t.Errorf("no %s probe ran", class)
 		}
 	}
 	if _, err := c.Prepare(Spec{SessionMode: "autonomous"}); err == nil {
@@ -133,7 +110,7 @@ func TestSeatbelt_SelfTestRedWithChmod(t *testing.T) {
 	}
 	failed := failedIn(record)
 	for _, mode := range []string{"autonomous", "human_controlled"} {
-		for _, id := range []string{"ro.chmod", "ro.chmod_leaf", "protected.chmod", "outside.home.create", "widen.reenter_backend"} {
+		for _, id := range []string{"ro.chmod", "ro.chmod_leaf", "ro.rename_leaf", "protected.chmod", "outside.home.create", "widen.reenter_backend"} {
 			if !failed[mode+"/"+id] {
 				t.Errorf("%s/%s passed under chmod", mode, id)
 			}
