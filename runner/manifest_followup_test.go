@@ -286,6 +286,11 @@ type scriptedSession struct {
 	ref string
 	// backstop lets the deterministic backstop run (off by default).
 	backstop bool
+	// stepHeartbeatInterval, when positive, sets the runner's private
+	// step-heartbeat cadence for tests that need several beats in a fast
+	// scripted session. Zero keeps the 15s production default. Tests only:
+	// production leaves this at zero.
+	stepHeartbeatInterval time.Duration
 	// teardown lets Run tear the worktree down on success (the default keeps
 	// it for inspection); rescueDir is where unpublished work is archived.
 	teardown  bool
@@ -353,6 +358,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
 	})
+	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.skipSteering = cfg.skipSteering
 	if cfg.teardown {
 		r.preserveAlways = false

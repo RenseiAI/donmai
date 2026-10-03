@@ -345,6 +345,18 @@ func costDifference(total, previous agent.CostData) agent.CostData {
 	}
 }
 
+// usageSnapshot is the session's cumulative usage total as the meter
+// counted it: every ResultEvent increment plus the per-call usage reported
+// since the last one. The zero value means "nothing metered yet". Its
+// input+output tokens equal Report's ObservedTokens.
+func (e *BudgetEnforcer) usageSnapshot() (in, out, cached int64, costUsd float64) {
+	cost := e.cost()
+	if cost == nil {
+		return 0, 0, 0, 0
+	}
+	return cost.InputTokens, cost.OutputTokens, cost.CachedInputTokens, cost.TotalCostUsd
+}
+
 // cost is the session's usage as the meter counted it: every ResultEvent
 // increment plus the per-call usage reported since the last one (which has
 // tokens and calls but no dollar amount). nil when nothing was metered. Its

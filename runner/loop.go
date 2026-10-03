@@ -1165,10 +1165,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		HTTPClient:         r.httpClient,
-		Logger:             r.logger,
-		// Interval intentionally left at the 15s default — calibrated
-		// against the platform's 60s SESSION_STALE_THRESHOLD_MS.
+		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
+			in, out, cached, usd := enforcer.usageSnapshot()
+			return stepheartbeat.UsageSnapshot{
+				InputTokens:       in,
+				OutputTokens:      out,
+				CachedInputTokens: cached,
+				TotalCostUsd:      usd,
+			}
+		},
+		HTTPClient: r.httpClient,
+		Logger:     r.logger,
+		Interval:   r.stepHeartbeatInterval,
+		// Interval is zero in production, keeping the 15s default —
+		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
 	if stepErr != nil {
 		r.logger.Warn("step-heartbeat construct failed", "err", stepErr)
