@@ -121,7 +121,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		refuseForExecutionSecurity(res, err)
 		return res, err
 	}
-	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
+	repositoryDeclaration, provisionDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkareaDeclaration(qw, provider)
 	if workareaErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
 		return res, workareaErr
@@ -297,7 +297,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		RequireBranchBase:     qw.BaseRef != "",
 		SourceRef:             provisionSourceRef,
 		Strategy:              provisionStrategy,
-		RepositoryDeclaration: qw.RepositoryDeclaration,
+		RepositoryDeclaration: provisionDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
 		Mode:                  qw.WorkareaMode,
 		ParentWorkareaID:      qw.ParentWorkareaID,
@@ -423,6 +423,21 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			res.Error = err.Error()
 			return res, err
 		}
+	}
+
+	// 2a-bis. Sibling context repositories (DONMAI_SIBLING_REPOS; see
+	// siblings.go). An executor that can hold a declared read-only leaf got
+	// each entry as a context leaf under the session root above; any other
+	// executor keeps the original placement beside the session worktree. A
+	// work item that declares its own repositories is authoritative, and the
+	// variable is ignored for it. Never fatal.
+	switch {
+	case qw.RepositoryDeclaration != nil && siblingReposSpec(qw) != "":
+		warning := siblingReposEnv + " is ignored: the work item declares its own repositories"
+		r.logger.Warn(warning, "sessionId", qw.SessionID)
+		res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
+	case !repositoryFree && repositoryDeclaration == nil:
+		r.provisionSiblings(ctx, qw, wpath)
 	}
 
 	// 2b. Provision kit toolchain into the worktree (Seam 2 / 006).

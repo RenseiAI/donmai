@@ -876,7 +876,11 @@ func (m *Manager) Provision(ctx context.Context, spec ProvisionSpec) (string, er
 }
 
 func (m *Manager) reenterProvision(spec ProvisionSpec, mode string, existing ProvisionResult) (string, error) {
-	if existing.AcquisitionID == "" || existing.Mode != mode || spec.RepositoryDeclaration == nil || spec.CacheSeedID != existing.CacheSeedID {
+	// A generation records only the seed it was actually provisioned from:
+	// one that requested a seed it could not build records none, and is
+	// still this request's generation.
+	seedMatches := spec.CacheSeedID == existing.CacheSeedID || existing.CacheSeedID == ""
+	if existing.AcquisitionID == "" || existing.Mode != mode || spec.RepositoryDeclaration == nil || !seedMatches {
 		return "", fmt.Errorf("runtime/worktree: existing session generation does not match provision request")
 	}
 	normalized, err := spec.RepositoryDeclaration.Normalize()
@@ -1622,6 +1626,10 @@ func (m *Manager) provisionLayoutOnce(
 		return paths, nil, workarea.AcquisitionRecord{}, nil
 	}
 	seedPaths := map[string]string(nil)
+	// usedSeedID is the seed the generation was actually provisioned from:
+	// the requested one, or "" when it could not be built and provisioning
+	// fell back to unseeded clones. Only a seed actually used is recorded.
+	usedSeedID := spec.CacheSeedID
 	if spec.CacheSeedID != "" {
 		seeds, seedErr := m.seedStore()
 		if seedErr != nil {
@@ -1643,6 +1651,7 @@ func (m *Manager) provisionLayoutOnce(
 			// failing the session here.
 			m.logger.Warn("cache seed unavailable; provisioning without seed",
 				"sessionId", spec.SessionID, "seed", spec.CacheSeedID, "err", seedErr)
+			usedSeedID = ""
 		} else {
 			seedPaths = resolvedSeedPaths
 		}
@@ -1652,7 +1661,7 @@ func (m *Manager) provisionLayoutOnce(
 		return nil, nil, workarea.AcquisitionRecord{}, err
 	}
 	claim, err := acquisitions.Begin(
-		spec.SessionID, workareaID, layout.Root, declaration.Selected.Leaf, spec.CacheSeedID,
+		spec.SessionID, workareaID, layout.Root, declaration.Selected.Leaf, usedSeedID,
 	)
 	if err != nil {
 		if errors.Is(err, workarea.ErrAcquisitionRootOccupied) {

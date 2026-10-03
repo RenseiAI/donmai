@@ -5,16 +5,66 @@ import (
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
+// resolveRepositoryWorkarea resolves the work item's normalized repository
+// declaration for provider and validates it against the executor's
+// attestations. Both the daemon preflight and the runner call it, so both
+// derive the same declaration from the same work item.
 func resolveRepositoryWorkarea(
 	qw QueuedWork,
 	provider agent.Provider,
 ) (*workarea.NormalizedDeclaration, workarea.ExecutorWorkareaCapabilities, error) {
+	normalized, _, capabilities, err := resolveRepositoryWorkareaDeclaration(qw, provider)
+	return normalized, capabilities, err
+}
+
+// effectiveRepositoryDeclaration is the work item's own repository
+// declaration, else, for a plain single-repository work item whose executor
+// can hold a declared read-only leaf, the declaration its
+// DONMAI_SIBLING_REPOS entries describe (siblings.go). Nil when neither
+// applies; derived = true for the second.
+func effectiveRepositoryDeclaration(qw QueuedWork, provider agent.Provider) (declaration *workarea.RepositoryDeclarationV1, derived bool) {
+	if qw.RepositoryDeclaration != nil {
+		return qw.RepositoryDeclaration, false
+	}
+	if !siblingContextEligible(qw) || !executorAttestsSiblingContext(provider) {
+		return nil, false
+	}
+	declaration = siblingContextDeclaration(qw)
+	return declaration, declaration != nil
+}
+
+// resolveRepositoryWorkareaDeclaration is resolveRepositoryWorkarea that also
+// returns the wire declaration it resolved, for provisioning. A declaration
+// derived from DONMAI_SIBLING_REPOS that does not validate is dropped rather
+// than failing the session: sibling context is never fatal, and the work item
+// then provisions as it did without one.
+func resolveRepositoryWorkareaDeclaration(
+	qw QueuedWork,
+	provider agent.Provider,
+) (*workarea.NormalizedDeclaration, *workarea.RepositoryDeclarationV1, workarea.ExecutorWorkareaCapabilities, error) {
+	capabilities := workarea.ExecutorWorkareaCapabilities{}
+	declaration, derived := effectiveRepositoryDeclaration(qw, provider)
+	if declaration == nil {
+		return nil, nil, capabilities, nil
+	}
+	normalized, capabilities, err := validateRepositoryWorkarea(qw, provider, declaration)
+	if err != nil {
+		if derived {
+			return nil, nil, workarea.ExecutorWorkareaCapabilities{}, nil
+		}
+		return nil, nil, capabilities, err
+	}
+	return normalized, declaration, capabilities, nil
+}
+
+func validateRepositoryWorkarea(
+	qw QueuedWork,
+	provider agent.Provider,
+	declaration *workarea.RepositoryDeclarationV1,
+) (*workarea.NormalizedDeclaration, workarea.ExecutorWorkareaCapabilities, error) {
 	capabilities := workarea.ExecutorWorkareaCapabilities{}
 	supportsReadOnlySelectedCWD := false
-	if qw.RepositoryDeclaration == nil {
-		return nil, capabilities, nil
-	}
-	normalized, err := qw.RepositoryDeclaration.Normalize()
+	normalized, err := declaration.Normalize()
 	if err != nil {
 		return nil, capabilities, err
 	}

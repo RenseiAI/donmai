@@ -27,6 +27,8 @@ func TestMain(m *testing.M) {
 	switch os.Getenv(testRoleEnv) {
 	case "rawkeys":
 		rawKeysChild()
+	case "sibling-clone":
+		siblingCloneChild()
 	case "":
 		os.Exit(m.Run())
 	default:

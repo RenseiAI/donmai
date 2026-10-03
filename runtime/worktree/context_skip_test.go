@@ -291,6 +291,23 @@ func workareaClone(clones [][]string, leaf string) []string {
 // The fallback never rescues a failing primary: its unseeded clone fails the
 // session as before.
 func TestCacheSeedIsAFastPathNotSessionFate(t *testing.T) {
+	// recordedSeed is the seed the session's durable acquisition records.
+	recordedSeed := func(t *testing.T, manager *worktree.Manager, sessionID string) string {
+		t.Helper()
+		layout, err := manager.Layout(sessionID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		declaration, err := workarea.ReadDeclaration(layout.Root)
+		if err != nil {
+			t.Fatal(err)
+		}
+		record, err := manager.AcquisitionRecord(declaration.WorkareaID)
+		if err != nil {
+			t.Fatal(err)
+		}
+		return record.CacheSeedID
+	}
 	t.Run("a seed that builds is used", func(t *testing.T) {
 		runner, clones := recordingCloneStub()
 		manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), CommandRunner: runner})
@@ -307,6 +324,9 @@ func TestCacheSeedIsAFastPathNotSessionFate(t *testing.T) {
 				t.Fatalf("workarea clone of %s = %q; want it to reference the seed", leaf, clone)
 			}
 		}
+		if got := recordedSeed(t, manager, "seeded"); got != "seed-ok" {
+			t.Fatalf("acquisition seed = %q; want the seed it used", got)
+		}
 	})
 	t.Run("a seed that cannot be built falls back and skips the context repository", func(t *testing.T) {
 		runner, clones := recordingCloneStub("corpus")
@@ -316,7 +336,8 @@ func TestCacheSeedIsAFastPathNotSessionFate(t *testing.T) {
 		}
 		spec := nestedSpec("seed-fallback", nil)
 		spec.CacheSeedID = "seed-broken"
-		if _, err := manager.Provision(context.Background(), spec); err != nil {
+		path, err := manager.Provision(context.Background(), spec)
+		if err != nil {
 			t.Fatalf("Provision: %v; want the session provisioned without the seed", err)
 		}
 		if skipped, err := manager.SkippedRepositories("seed-fallback"); err != nil || len(skipped) != 1 || skipped[0] != "corpus" {
@@ -324,6 +345,13 @@ func TestCacheSeedIsAFastPathNotSessionFate(t *testing.T) {
 		}
 		if clone := workareaClone(clones(), "web"); clone == nil || slices.Contains(clone, "--reference") {
 			t.Fatalf("workarea clone of web = %q; want an unseeded clone", clone)
+		}
+		if got := recordedSeed(t, manager, "seed-fallback"); got != "" {
+			t.Fatalf("acquisition seed = %q; want none recorded for a seed that was not used", got)
+		}
+		again, err := manager.Provision(context.Background(), spec)
+		if err != nil || again != path {
+			t.Fatalf("re-entry = %q, %v; want the same generation %q for the same request", again, err, path)
 		}
 	})
 	t.Run("a failing primary still fails the session", func(t *testing.T) {
@@ -338,4 +366,27 @@ func TestCacheSeedIsAFastPathNotSessionFate(t *testing.T) {
 			t.Fatalf("Provision err = %v; want the failed primary named", err)
 		}
 	})
+}
+
+// TestProvisionFailsWithTheCloneErrorOfASelectedContextRepository pins that
+// the skip rule never applies to the selected repository: a session that
+// selects a read-only context repository whose clone fails fails with that
+// clone error, not with a later, generic record-validation error.
+func TestProvisionFailsWithTheCloneErrorOfASelectedContextRepository(t *testing.T) {
+	t.Parallel()
+	manager, err := worktree.NewManager(worktree.Options{ParentDir: t.TempDir(), CommandRunner: failingContextStub()})
+	if err != nil {
+		t.Fatal(err)
+	}
+	selected := &workarea.RepositoryFilter{Kind: workarea.RepositoryFilterNamed, Name: "corpus"}
+	_, err = manager.Provision(context.Background(), nestedSpec("selected-context-fails", selected))
+	if err == nil {
+		t.Fatal("Provision succeeded; want the selected repository's clone failure")
+	}
+	if !strings.Contains(err.Error(), `provision declared repository "corpus"`) || !errors.Is(err, errCloneFailed) {
+		t.Fatalf("error = %v; want the clone error of the selected corpus repository", err)
+	}
+	if skipped, _ := manager.SkippedRepositories("selected-context-fails"); len(skipped) != 0 {
+		t.Fatalf("skipped = %v; the selected repository is never skipped", skipped)
+	}
 }
