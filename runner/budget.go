@@ -43,11 +43,12 @@ type BudgetReport struct {
 	Enforced bool `json:"enforced"`
 
 	// Limits captures the configured caps the runner was enforcing.
-	// All-zero means "no caps set, proceed unbounded."
+	// A nil sub-agent cap (absent) means "not enforced"; an
+	// explicit zero means "no sub-agents allowed".
 	Limits prompt.StageBudget `json:"limits"`
 
-	// ObservedSubAgents counts the Task tool invocations seen across
-	// the session.
+	// ObservedSubAgents counts the sub-agent delegation tool
+	// invocations seen across the session.
 	ObservedSubAgents int `json:"observedSubAgents"`
 
 	// ObservedTokens is the cumulative input+output token count
@@ -205,14 +206,18 @@ func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Contex
 func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 	switch v := ev.(type) {
 	case agent.ToolUseEvent:
-		// Sub-agent count = number of Task tool invocations. The
-		// match is case-insensitive + suffix-tolerant so MCP-namespaced
-		// task tools (e.g. `mcp__af__Task`) still count.
-		if isTaskTool(v.ToolName) {
+		// Sub-agent count = number of sub-agent delegation tool
+		// invocations ("Task" or "Agent"). The match is
+		// case-insensitive + suffix-tolerant so MCP-namespaced
+		// tools (e.g. `mcp__af__Task`) still count. An explicit
+		// zero cap means no sub-agents are allowed — the first
+		// counted call breaches — while an absent (nil) cap is
+		// not enforced.
+		if isSubAgentTool(v.ToolName) {
 			n := e.subAgents.Add(1)
-			if limit := e.limits.MaxSubAgents; e.enabled && limit > 0 && n > int64(limit) {
+			if limit := e.limits.MaxSubAgents; e.enabled && limit != nil && n > int64(*limit) {
 				return e.recordBreach(CapSubAgents,
-					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, limit))
+					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, *limit))
 			}
 		}
 	case agent.LlmCallEvent:
@@ -463,15 +468,16 @@ func IsBudgetExceeded(err error) bool {
 	return ok
 }
 
-// isTaskTool reports whether the tool name represents Claude's Task
-// (sub-agent) tool. Match is case-insensitive + tolerates MCP-style
-// namespace prefixes (e.g. "mcp__af__Task", "task", "Task").
-func isTaskTool(name string) bool {
+// isSubAgentTool reports whether the tool name represents a sub-agent
+// delegation tool ("Task" or "Agent"). Match is case-insensitive +
+// tolerates MCP-style namespace prefixes (e.g. "mcp__af__Task",
+// "mcp__af__Agent", "task", "Agent").
+func isSubAgentTool(name string) bool {
 	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "task" {
+	if n == "task" || n == "agent" {
 		return true
 	}
-	if strings.HasSuffix(n, "__task") {
+	if strings.HasSuffix(n, "__task") || strings.HasSuffix(n, "__agent") {
 		return true
 	}
 	return false

@@ -426,7 +426,7 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 		{
 			name: "zero-duration budget keeps runner default",
 			detail: &daemon.SessionDetail{
-				StageBudget: &daemon.PollStageBudget{MaxSubAgents: 4},
+				StageBudget: &daemon.PollStageBudget{MaxSubAgents: ptr(4)},
 			},
 		},
 		{
