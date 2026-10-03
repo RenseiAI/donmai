@@ -1,6 +1,6 @@
 # `runtime/` — cross-cutting machinery for the agent runner
 
-> **Status:** Wave 6 / Phase F.2.5. Public package; importable by `rensei-tui` without depending on the rest of `donmai`.
+> **Status:** Wave 6 / Phase F.2.5. Public package; importable by downstream embedders without depending on the rest of `donmai`.
 > **Spec:** `../../../runs/2026-05-01-wave-6-fleet-iteration/F1.1-runner-contract.md` §1 (layout) + §5 (failure modes).
 > **Legacy reference:** `../../../donmai-libraries/packages/core/src/orchestrator/{state-recovery,heartbeat-writer}.ts`, `../../../donmai-libraries/packages/core/src/workarea/git-worktree.ts`, `../../../donmai-libraries/packages/cli/src/lib/worker-runner.ts`.
 
@@ -15,6 +15,7 @@
 | [`runtime/mcp`](./mcp/) | Per-session MCP stdio config tmpfile; cleanup tied to session lifecycle. Wire shape consistent with `provider/claude` and `provider/codex`. |
 | [`runtime/state`](./state/) | `.agent/state.json` persistence per-worktree. Atomic tmpfile + rename, per-worktree mutex, cross-issue recovery guard, malformed-recovery. |
 | [`runtime/heartbeat`](./heartbeat/) | Per-session heartbeat to platform `POST /api/sessions/<id>/lock-refresh`. 3-strike rule emits `LostOwnership` event the runner consumes. Distinct from worker-level heartbeat in `daemon/heartbeat.go`. |
+| [`runtime/confinement`](./confinement/) | Executor OS confinement of a harness process (`ADR-2026-10-03-executor-os-confinement.md`): the closed writable set, the macOS profile backend, the deny-only composer callback, the typed refusals and the startup self-test. |
 | [`runtime/span`](./span/) | Correlate per-call LLM/tool/session spans and forward metadata-only JSON batches through a bounded, non-blocking poster. |
 
 ## Layered consumption
