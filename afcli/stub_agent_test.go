@@ -11,6 +11,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/attachwire"
+	"github.com/RenseiAI/donmai/internal/testisolation"
 	"github.com/RenseiAI/donmai/provider/harness/stub"
 	"github.com/RenseiAI/donmai/provider/harness/stub/stubagent"
 )
@@ -29,7 +30,10 @@ func TestMain(m *testing.M) {
 	if os.Getenv(stubAgentChildEnv) == "1" {
 		os.Exit(runStubAgentChild())
 	}
-	os.Exit(m.Run())
+	cleanup := testisolation.Isolate()
+	code := m.Run()
+	cleanup()
+	os.Exit(code)
 }
 
 func runStubAgentChild() int {
