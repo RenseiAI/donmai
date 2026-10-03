@@ -8,7 +8,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Fixes
+
+- A turn that ends on a progress note with the session's pull request still
+  a draft is now continued instead of being recorded as passed; a rework run
+  that continues an existing pull request counts as delivered only once the
+  pull request gains a commit. A session still in either state when its
+  continuations run out ends failed, its error naming "pull request still
+  draft" or "no new commit".
 
 ## v0.72.61 — 2026-10-03
 

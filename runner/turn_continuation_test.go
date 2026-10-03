@@ -3,8 +3,10 @@ package runner
 import (
 	"context"
 	"errors"
+	"os"
 	"slices"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
@@ -625,6 +627,11 @@ func TestSessionPullRequestVerifier_ReportsOwnRepository(t *testing.T) {
 	if v.reportsOwnRepository(turn("see " + quotedExamplePR)) {
 		t.Error("the quoted example on another repository is not")
 	}
+	v.accepted = "https://github.com/acme/widgets/pull/8"
+	v.outcomes[v.accepted] = candidateAccepted
+	if v.reportsOwnRepository(turn("opened " + v.accepted)) {
+		t.Error("the accepted pull request is judged from the envelope, not reported again")
+	}
 	if (&sessionPullRequestVerifier{}).reportsOwnRepository(turn("https://github.com/acme/widgets/pull/3")) {
 		t.Error("a session with no GitHub repository reports none")
 	}
@@ -716,6 +723,252 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 			}
 			if obs.providerError != tc.want {
 				t.Fatalf("providerError = %q; want %q", obs.providerError, tc.want)
+			}
+		})
+	}
+}
+
+// scriptedDraft is a draft read that answers from states in order — one
+// per read, the last repeating — and records the URLs it was asked about.
+type scriptedDraft struct {
+	mu     sync.Mutex
+	states []bool
+	urls   []string
+}
+
+func (d *scriptedDraft) lookup(_ context.Context, _ string, url string) (bool, error) {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	d.urls = append(d.urls, url)
+	i := min(len(d.urls), len(d.states)) - 1
+	return d.states[i], nil
+}
+
+func (d *scriptedDraft) reads() []string {
+	d.mu.Lock()
+	defer d.mu.Unlock()
+	return slices.Clone(d.urls)
+}
+
+// reworkBranch is the existing branch a scripted rework run continues; the
+// session's pull request (followUpPR) has it as its head.
+const reworkBranch = "feature/rework"
+
+// TestRun_DraftPullRequestIsContinued is the reported failure: the brief asked
+// for a draft pull request early, and the turn ended on a progress note with
+// that draft as its only result. The turn is continued with a prompt that
+// names the draft, and once the pull request is ready the work is delivered.
+func TestRun_DraftPullRequestIsContinued(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{true, false}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		turns: []verdictScriptTurn{
+			{toolCalls: 2, text: "Opened draft " + followUpPR + " to keep the work safe. Next I will write the tests."},
+			{toolCalls: 2, text: "Tests written; " + followUpPR + " is ready for review."},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts, continueDraftPrompt)
+	wantContinuations(t, res, 1, 0, false)
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a draft is continued, not nudged to open a pull request")
+	}
+	if got := draft.reads(); len(got) != 2 || got[0] != followUpPR || got[1] != followUpPR {
+		t.Errorf("draft reads = %q; want the session's pull request read after each turn", got)
+	}
+}
+
+// TestRun_DraftPullRequestStillDraftIsNotDelivered pins the end of the draft
+// path: a session whose pull request is still a draft when its continuations
+// run out — or that cannot be continued at all — ends not delivered: failed,
+// not passed, the receipt naming the draft.
+func TestRun_DraftPullRequestStillDraftIsNotDelivered(t *testing.T) {
+	stillDraft := verdictScriptTurn{text: "Draft " + followUpPR + " is open; still working on it."}
+	cases := []struct {
+		name        string
+		limit       int
+		wantErr     string
+		wantPrompts []string
+		want        agent.TurnContinuations
+	}{
+		{
+			name:        "continuations run out",
+			wantErr:     "the turn still ended unfinished after 3 consecutive continuation prompts whose turns made no tool call (3 continuation prompts in total): no turn-result manifest and no verdict, and the pull request does not deliver the work: pull request still draft",
+			wantPrompts: slices.Repeat([]string{continueDraftPrompt}, DefaultTurnContinuationLimit),
+			want:        agent.TurnContinuations{Continued: 3, Unproductive: 3, Limit: DefaultTurnContinuationLimit, Ceiling: DefaultTurnContinuationCeiling, Exhausted: true},
+		},
+		{
+			name:    "continuations disabled",
+			limit:   -1,
+			wantErr: "the turn ended unfinished and this session takes no continuation prompt: no turn-result manifest and no verdict, and the pull request does not deliver the work: pull request still draft",
+			want:    agent.TurnContinuations{Ceiling: DefaultTurnContinuationCeiling, Exhausted: true},
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			draft := &scriptedDraft{states: []bool{true}}
+			res, provider := runScriptedSession(t, scriptedSession{
+				workType:          "development",
+				repository:        followUpRepository,
+				pulls:             map[int]string{7: pullAtSessionCommit},
+				draft:             draft.lookup,
+				continuationLimit: tc.limit,
+				turns:             append(slices.Repeat([]verdictScriptTurn{stillDraft}, 4), verdictScriptTurn{text: "never reached"}),
+			})
+			if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+				t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+			}
+			if res.WorkResult == "passed" {
+				t.Errorf("WorkResult = passed; a draft pull request is not delivered work")
+			}
+			if res.Error != tc.wantErr {
+				t.Errorf("Error = %q; want %q", res.Error, tc.wantErr)
+			}
+			if res.PullRequestURL != followUpPR {
+				t.Errorf("PullRequestURL = %q; want the session's draft %s kept on the receipt", res.PullRequestURL, followUpPR)
+			}
+			if res.SteeringTriggered {
+				t.Errorf("SteeringTriggered = true; a draft gets no pull request nudge")
+			}
+			wantPrompts(t, provider.prompts, tc.wantPrompts...)
+			if res.TurnContinuations == nil || *res.TurnContinuations != tc.want {
+				t.Fatalf("TurnContinuations = %+v; want %+v", res.TurnContinuations, tc.want)
+			}
+		})
+	}
+}
+
+// TestRun_ReworkReadyPullRequestWithANewCommitIsAccepted pins the delivered
+// rework: the run continues an existing pull request, pushes a new commit to
+// it, and reports it ready. Its head differs from the head recorded at run
+// start, it is not a draft, and the run completes without a continuation.
+func TestRun_ReworkReadyPullRequestWithANewCommitIsAccepted(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{false}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      draft.lookup,
+		turns: []verdictScriptTurn{
+			{
+				files: map[string]string{"fix.txt": "review comments addressed\n"},
+				push:  []string{"refs/heads/" + reworkBranch, "refs/pull/7/head"},
+				text:  "Pushed the review fixes to " + followUpPR + ".",
+			},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+	if got := draft.reads(); len(got) != 1 {
+		t.Errorf("draft reads = %q; want the pull request's draft state read once, after the new commit was seen", got)
+	}
+}
+
+// TestRun_ReworkWithoutANewCommitIsContinuedThenNotDelivered pins the
+// undelivered rework: the run continues an existing pull request, and its
+// turns report that pull request without pushing to it. Each such turn is
+// continued with a prompt naming the missing commit, and when the
+// continuations run out the run ends not delivered, the receipt saying
+// "no new commit". The check reads only the git remote: gh fails every call
+// here and is never asked.
+func TestRun_ReworkWithoutANewCommitIsContinuedThenNotDelivered(t *testing.T) {
+	ghCalls := sentinelGh(t)
+	note := verdictScriptTurn{text: "Read the review on " + followUpPR + "; I will fix the comments next."}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		draft:      githubPullRequestDraft,
+		turns:      append(slices.Repeat([]verdictScriptTurn{note}, 4), verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsUnproductive {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsUnproductive)
+	}
+	if res.WorkResult == "passed" {
+		t.Errorf("WorkResult = passed; a rework without a new commit is not delivered work")
+	}
+	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
+		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueNoNewCommitPrompt}, DefaultTurnContinuationLimit)...)
+	wantContinuations(t, res, DefaultTurnContinuationLimit, 0, true)
+	if _, err := os.Stat(ghCalls); !os.IsNotExist(err) {
+		t.Errorf("gh was called (%s): the new-commit check must not need it", readFile(t, ghCalls))
+	}
+}
+
+// TestRun_DraftStateUnknownWhenGhFailsKeepsTheSession pins the fallback: on a
+// host where gh cannot answer (absent, unauthenticated, offline), the draft
+// state is unknown, and a turn whose only result is the session's pull
+// request ends as it did before the draft check — accepted, not continued.
+func TestRun_DraftStateUnknownWhenGhFailsKeepsTheSession(t *testing.T) {
+	ghCalls := sentinelGh(t)
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      githubPullRequestDraft,
+		turns: []verdictScriptTurn{
+			{text: "Opened " + followUpPR + "."},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR {
+		t.Fatalf("Status=%q PullRequestURL=%q (%s: %s); want completed with %s", res.Status, res.PullRequestURL, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+	if calls := readFile(t, ghCalls); !strings.Contains(calls, "pr view "+followUpPR+" --json "+ghPullRequestViewFields) {
+		t.Errorf("gh calls = %q; want the draft read through gh pr view", calls)
+	}
+}
+
+// TestPullRequestIsTheOnlyResult pins when the session's pull request is
+// re-read: only when, without it, the turn would have stopped early.
+func TestPullRequestIsTheOnlyResult(t *testing.T) {
+	clean := streamObservation{terminalSuccess: true, terminalEvent: &agent.ResultEvent{Success: true}}
+	withPR := func(mutate func(*Result)) Result {
+		r := Result{}
+		r.PullRequestURL = followUpPR
+		if mutate != nil {
+			mutate(&r)
+		}
+		return r
+	}
+	cases := []struct {
+		name       string
+		res        Result
+		turn       streamObservation
+		reportedPR bool
+		want       bool
+	}{
+		{name: "pull request and a progress note", res: withPR(nil), turn: clean, want: true},
+		{name: "no pull request", turn: clean},
+		{name: "turn-result manifest", res: withPR(func(r *Result) { r.Manifest = &TurnManifest{Verdict: "passed"} }), turn: clean},
+		{name: "verdict in the turn", res: withPR(nil), turn: func() streamObservation { o := clean; o.workResult = "passed"; return o }()},
+		{name: "another own-repository pull request reported", res: withPR(nil), turn: clean, reportedPR: true},
+		{name: "provider error", res: withPR(nil), turn: func() streamObservation { o := clean; o.providerError = "503"; return o }()},
+		{name: "runner-recorded failure", res: withPR(func(r *Result) { r.FailureMode = FailureProviderError }), turn: clean},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			res := tc.res
+			if got := pullRequestIsTheOnlyResult(&res, streamObservation{}, tc.turn, tc.reportedPR, false); got != tc.want {
+				t.Fatalf("pullRequestIsTheOnlyResult = %v; want %v", got, tc.want)
+			}
+			if res.PullRequestURL != tc.res.PullRequestURL {
+				t.Fatalf("PullRequestURL changed to %q", res.PullRequestURL)
 			}
 		})
 	}

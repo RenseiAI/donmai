@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -9,6 +10,8 @@ import (
 	"strings"
 	"sync"
 	"testing"
+
+	"github.com/RenseiAI/donmai/runtime/workarea"
 )
 
 // The example URL a task prompt quoted in the incident: it looks like a pull
@@ -458,3 +461,140 @@ func TestRun_PullRefThatLagsAPushIsReverified(t *testing.T) {
 
 // scriptedSessionBranch is the branch the runner owns for a scripted session.
 const scriptedSessionBranch = "agent/test-session-MANIFEST-FOLLOWUP"
+
+// TestSessionPullRequestVerifier_Undelivered pins the re-read of the accepted
+// pull request: a rework whose head has not moved since run start has no new
+// commit (and is not asked about its draft state), a draft is a draft, and a
+// read that fails does not count against the pull request.
+func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
+	const own = "https://github.com/acme/widgets/pull/7"
+	start := strings.Repeat("a", 40)
+	moved := strings.Repeat("b", 40)
+	refsAt := func(head string) pullRequestRefLookup {
+		return func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
+			if len(refs) != 1 || refs[0] != "refs/pull/7/head" {
+				return nil, fmt.Errorf("unexpected refs %q", refs)
+			}
+			return map[string]string{"refs/pull/7/head": head}, nil
+		}
+	}
+	unreadable := func(context.Context, string, ...string) (map[string]string, error) {
+		return nil, errors.New("remote unreachable")
+	}
+	draftIs := func(draft bool) pullRequestDraftLookup {
+		return func(_ context.Context, _ string, url string) (bool, error) {
+			if url != own {
+				return false, fmt.Errorf("unexpected url %q", url)
+			}
+			return draft, nil
+		}
+	}
+	ghDown := func(context.Context, string, string) (bool, error) { return false, errors.New("gh: not authenticated") }
+	cases := []struct {
+		name      string
+		accepted  string
+		startHead string
+		lookup    pullRequestRefLookup
+		draft     pullRequestDraftLookup
+		want      string
+		wantErr   string
+	}{
+		{name: "no accepted pull request", draft: draftIs(true)},
+		{name: "ready pull request the session opened", accepted: own, draft: draftIs(false)},
+		{name: "draft pull request the session opened", accepted: own, draft: draftIs(true), want: undeliveredDraft},
+		{name: "rework with no new commit", accepted: own, startHead: start, lookup: refsAt(start), draft: ghDown, want: undeliveredNoNewCommit},
+		{name: "rework with a new commit, ready", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(false)},
+		{name: "rework with a new commit, still draft", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "draft state unknown", accepted: own, draft: ghDown, wantErr: "not authenticated"},
+		{name: "rework head unreadable", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(false), wantErr: "remote unreachable"},
+		{name: "rework head unreadable, draft", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			lookup := tc.lookup
+			if lookup == nil {
+				lookup = func(context.Context, string, ...string) (map[string]string, error) {
+					t.Fatal("a session that opened its own pull request read its head")
+					return nil, nil
+				}
+			}
+			v := &sessionPullRequestVerifier{repository: "acme/widgets", accepted: tc.accepted, startHead: tc.startHead, lookup: lookup, draftLookup: tc.draft}
+			got, err := v.undelivered(context.Background())
+			if got != tc.want {
+				t.Fatalf("undelivered = %q (err %v); want %q", got, err, tc.want)
+			}
+			switch {
+			case tc.wantErr == "" && err != nil:
+				t.Fatalf("err = %v; want none", err)
+			case tc.wantErr != "" && (err == nil || !strings.Contains(err.Error(), tc.wantErr)):
+				t.Fatalf("err = %v; want it to contain %q", err, tc.wantErr)
+			}
+		})
+	}
+	var none *sessionPullRequestVerifier
+	if got, err := none.undelivered(context.Background()); got != "" || err != nil {
+		t.Errorf("nil verifier: undelivered = %q, %v; want none", got, err)
+	}
+}
+
+// TestGithubPullRequestDraft pins the production draft read: the runner's
+// one gh pr view query, with isDraft decoded, and a gh failure surfaced as an
+// error rather than as "not a draft".
+func TestGithubPullRequestDraft(t *testing.T) {
+	const prURL = "https://github.com/acme/widgets/pull/7"
+	cases := []struct {
+		name     string
+		exitCode int
+		output   string
+		want     bool
+		wantErr  bool
+	}{
+		{name: "draft", output: `{"number":7,"url":"` + prURL + `","baseRefName":"main","headRefName":"agent/s","isDraft":true}`, want: true},
+		{name: "ready", output: `{"number":7,"url":"` + prURL + `","baseRefName":"main","headRefName":"agent/s","isDraft":false}`},
+		{name: "gh fails", exitCode: 1, output: "gh: To get started with GitHub CLI, please run: gh auth login", wantErr: true},
+		{name: "not JSON", output: "unexpected", wantErr: true},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubGhOnPathExpectingPullRequestView(t, prURL, tc.exitCode, tc.output)
+			got, err := githubPullRequestDraft(context.Background(), t.TempDir(), prURL)
+			if (err != nil) != tc.wantErr {
+				t.Fatalf("githubPullRequestDraft err = %v; want error %v", err, tc.wantErr)
+			}
+			if got != tc.want {
+				t.Fatalf("githubPullRequestDraft = %v; want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestReworkStartHead pins which runs carry a start head, and where it comes
+// from: the dispatched pull request's recorded head, else the commit the
+// checkout of a run provisioned at an existing branch started at.
+func TestReworkStartHead(t *testing.T) {
+	recorded := strings.Repeat("c", 40)
+	checkoutStart := strings.Repeat("d", 40)
+	started := &Result{rescueTargets: []rescueTarget{{path: "/work/other", base: strings.Repeat("e", 40)}, {path: "/work/repo", base: checkoutStart}}}
+	cases := []struct {
+		name string
+		qw   QueuedWork
+		want string
+	}{
+		{name: "a run that opens its own pull request"},
+		{name: "dispatched pull request", qw: QueuedWork{PullRequest: &workarea.PullRequestV1{Number: 7, HeadSHA: recorded}}, want: recorded},
+		{name: "existing branch", qw: func() QueuedWork { var qw QueuedWork; qw.Ref = "feature/rework"; return qw }(), want: checkoutStart},
+		{name: "dispatched pull request with no usable head, existing branch", qw: func() QueuedWork {
+			var qw QueuedWork
+			qw.Ref = "feature/rework"
+			qw.PullRequest = &workarea.PullRequestV1{Number: 7, HeadSHA: "not-a-sha"}
+			return qw
+		}(), want: checkoutStart},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := reworkStartHead(tc.qw, started, "/work/repo"); got != tc.want {
+				t.Fatalf("reworkStartHead = %q; want %q", got, tc.want)
+			}
+		})
+	}
+}
