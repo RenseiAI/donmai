@@ -304,6 +304,52 @@ func TestTurnFollowUps_NoCeilingKeepsContinuingProductiveTurns(t *testing.T) {
 	}
 }
 
+// TestRun_ProviderErrorNotRetryableEndsAtOnce pins the fail-fast path: a
+// turn that ends on a provider error the provider marks as not retryable
+// (a 400 for invalid parameters) ends right away with the error recorded —
+// no retry prompt, no pull request nudge.
+func TestRun_ProviderErrorNotRetryableEndsAtOnce(t *testing.T) {
+	res, prompts := runContinuationScenario(t, 0,
+		verdictScriptTurn{text: "Working.", providerError: "400 The request contains invalid parameters"},
+		verdictScriptTurn{text: "never reached"},
+	)
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureProviderError)
+	}
+	if !strings.Contains(res.Error, "not retryable") || !strings.Contains(res.Error, "400 The request contains invalid parameters") {
+		t.Errorf("Error = %q; want the not-retryable reason and the provider error", res.Error)
+	}
+	if len(prompts) != 0 {
+		t.Errorf("prompts = %q; want no retry for a non-retryable provider error", prompts)
+	}
+	if res.SteeringTriggered {
+		t.Errorf("SteeringTriggered = true; a non-retryable provider error is failed, not nudged")
+	}
+	wantContinuations(t, res, 0, 0, true)
+}
+
+// TestRun_ProviderErrorRetryableStatusesKeepBoundedRetries pins that 503
+// and 429 provider errors keep today's bounded retries.
+func TestRun_ProviderErrorRetryableStatusesKeepBoundedRetries(t *testing.T) {
+	for _, status := range []string{"503 Service Unavailable", "429 Too Many Requests"} {
+		t.Run(status, func(t *testing.T) {
+			res, prompts := runContinuationScenario(t, 1,
+				verdictScriptTurn{text: "Working.", providerError: status},
+				verdictScriptTurn{providerError: status},
+				verdictScriptTurn{text: "never reached"},
+			)
+			if res.Status != "failed" || res.FailureMode != FailureProviderError {
+				t.Fatalf("Status=%q FailureMode=%q; want failed/%s", res.Status, res.FailureMode, FailureProviderError)
+			}
+			if !strings.Contains(res.Error, "after 1 retries") || !strings.Contains(res.Error, status) {
+				t.Errorf("Error = %q; want the retry count and the provider error", res.Error)
+			}
+			wantPrompts(t, prompts, retryPrompt)
+			wantContinuations(t, res, 0, 1, true)
+		})
+	}
+}
+
 // TestRun_ProviderErrorRetriesExhaustedFailAsProviderError pins the retry
 // bound: a turn that still ends on a provider error after the limit fails as a
 // provider error, with the count and the provider's text.
@@ -673,7 +719,13 @@ func TestClassifyTurnEnding(t *testing.T) {
 		want       turnEnding
 	}{
 		{name: "clean end with nothing", turn: clean, want: turnStoppedEarly},
-		{name: "provider error", turn: with(func(o *streamObservation) { o.providerError = "503" }), want: turnProviderError},
+		{name: "provider error", turn: with(func(o *streamObservation) {
+			o.providerError = "503"
+			o.providerErrorRetryable = true
+		}), want: turnProviderError},
+		{name: "non-retryable provider error ends at once", turn: with(func(o *streamObservation) {
+			o.providerError = "400 The request contains invalid parameters"
+		}), want: turnProviderErrorFatal},
 		{name: "verified pull request", res: func() Result { r := Result{}; r.PullRequestURL = followUpPR; return r }(), turn: clean, want: turnFinished},
 		{name: "turn-result manifest", res: func() Result { r := Result{}; r.Manifest = &TurnManifest{Verdict: "passed"}; return r }(), turn: clean, want: turnFinished},
 		{name: "an own-repository pull request that did not verify", turn: clean, reportedPR: true, want: turnFinished},
@@ -684,7 +736,11 @@ func TestClassifyTurnEnding(t *testing.T) {
 		{name: "crash", turn: with(func(o *streamObservation) { o.errorEvent = &agent.ErrorEvent{Message: "boom"} }), want: turnFinished},
 		{name: "no terminal", turn: streamObservation{}, want: turnFinished},
 		{name: "unsuccessful terminal", turn: with(func(o *streamObservation) { o.terminalSuccess = false }), want: turnFinished},
-		{name: "unsuccessful terminal on a provider error", turn: with(func(o *streamObservation) { o.terminalSuccess = false; o.providerError = "504" }), want: turnProviderError},
+		{name: "unsuccessful terminal on a provider error", turn: with(func(o *streamObservation) {
+			o.terminalSuccess = false
+			o.providerError = "504"
+			o.providerErrorRetryable = true
+		}), want: turnProviderError},
 		{name: "structured review verdict ends a review turn", res: func() Result { r := Result{}; r.ReviewVerdict = "APPROVE"; return r }(), turn: clean, reviewWork: true, want: turnFinished},
 		{name: "review verdict marker ends a review turn", turn: with(func(o *streamObservation) { o.reviewVerdict = "REQUEST_CHANGES" }), reviewWork: true, want: turnFinished},
 		{name: "review verdict does not end implement work", turn: with(func(o *streamObservation) { o.reviewVerdict = "APPROVE" }), want: turnStoppedEarly},
@@ -705,15 +761,20 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 	r := minimalRunner(t)
 	dir := t.TempDir()
 	errEvent := agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "503 Service Unavailable"}
+	nonRetryableEvent := agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "400 invalid parameters" + agent.ProviderErrorNotRetryableSuffix}
 	cases := []struct {
-		name   string
-		events []agent.Event
-		want   string
+		name          string
+		events        []agent.Event
+		want          string
+		wantRetryable bool
 	}{
-		{name: "error ends the stream", events: []agent.Event{agent.AssistantTextEvent{Text: "partial"}, errEvent}, want: "503 Service Unavailable"},
-		{name: "assistant text after the error", events: []agent.Event{errEvent, agent.AssistantTextEvent{Text: "recovered"}}},
-		{name: "tool call after the error", events: []agent.Event{errEvent, agent.ToolUseEvent{ToolName: "bash"}}},
-		{name: "other system events keep it", events: []agent.Event{errEvent, agent.SystemEvent{Subtype: "auto_retry_end"}}, want: "503 Service Unavailable"},
+		{name: "error ends the stream", events: []agent.Event{agent.AssistantTextEvent{Text: "partial"}, errEvent}, want: "503 Service Unavailable", wantRetryable: true},
+		{name: "assistant text after the error", events: []agent.Event{errEvent, agent.AssistantTextEvent{Text: "recovered"}}, wantRetryable: true},
+		{name: "tool call after the error", events: []agent.Event{errEvent, agent.ToolUseEvent{ToolName: "bash"}}, wantRetryable: true},
+		{name: "other system events keep it", events: []agent.Event{errEvent, agent.SystemEvent{Subtype: "auto_retry_end"}}, want: "503 Service Unavailable", wantRetryable: true},
+		{name: "non-retryable marker strips the suffix and keeps the text", events: []agent.Event{nonRetryableEvent}, want: "400 invalid parameters"},
+		{name: "non-retryable 400 by status", events: []agent.Event{agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "400 invalid parameters"}}, want: "400 invalid parameters"},
+		{name: "429 stays retryable", events: []agent.Event{agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "429 Too Many Requests"}}, want: "429 Too Many Requests", wantRetryable: true},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -723,6 +784,9 @@ func TestObserveEvent_ProviderErrorClearsOnRecovery(t *testing.T) {
 			}
 			if obs.providerError != tc.want {
 				t.Fatalf("providerError = %q; want %q", obs.providerError, tc.want)
+			}
+			if obs.providerErrorRetryable != tc.wantRetryable {
+				t.Fatalf("providerErrorRetryable = %v; want %v", obs.providerErrorRetryable, tc.wantRetryable)
 			}
 		})
 	}
@@ -1059,7 +1123,12 @@ func TestPullRequestIsTheOnlyResult(t *testing.T) {
 		{name: "turn-result manifest", res: withPR(func(r *Result) { r.Manifest = &TurnManifest{Verdict: "passed"} }), turn: clean},
 		{name: "verdict in the turn", res: withPR(nil), turn: func() streamObservation { o := clean; o.workResult = "passed"; return o }()},
 		{name: "another own-repository pull request reported", res: withPR(nil), turn: clean, reportedPR: true},
-		{name: "provider error", res: withPR(nil), turn: func() streamObservation { o := clean; o.providerError = "503"; return o }()},
+		{name: "provider error", res: withPR(nil), turn: func() streamObservation {
+			o := clean
+			o.providerError = "503"
+			o.providerErrorRetryable = true
+			return o
+		}()},
 		{name: "runner-recorded failure", res: withPR(func(r *Result) { r.FailureMode = FailureProviderError }), turn: clean},
 		{name: "verdict from an earlier turn", res: withPR(func(r *Result) { r.WorkResult = "passed" }), turn: clean},
 		{name: "unknown verdict from an earlier turn", res: withPR(func(r *Result) { r.WorkResult = "unknown" }), turn: clean},

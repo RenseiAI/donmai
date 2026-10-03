@@ -135,6 +135,21 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 			wantEvents: []agent.Event{providerError("model provider error")},
 		},
 		{
+			name:       "non-retryable gateway failure carries the marker",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 invalid parameters", "error": map[string]any{"isRetryable": false}},
+			wantEvents: []agent.Event{providerError("400 invalid parameters" + agent.ProviderErrorNotRetryableSuffix)},
+		},
+		{
+			name:       "diagnostic status marks a 400 as non-retryable",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request failed", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}},
+			wantEvents: []agent.Event{providerError("request failed" + agent.ProviderErrorNotRetryableSuffix)},
+		},
+		{
+			name:       "a 503 stays retryable",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"},
+			wantEvents: []agent.Event{providerError("503 Service Unavailable")},
+		},
+		{
 			name:       "a clean stop is only text",
 			buffered:   "Done.",
 			message:    map[string]any{"role": "assistant", "stopReason": "stop"},

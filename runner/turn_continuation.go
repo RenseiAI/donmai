@@ -99,8 +99,14 @@ const (
 	// turnStoppedEarly: a clean end with no turn-result manifest, no
 	// verified pull request and no verdict.
 	turnStoppedEarly
-	// turnProviderError: the turn ended on a model provider error.
+	// turnProviderError: the turn ended on a retryable model provider
+	// error — the runner retries it with bounded backoff.
 	turnProviderError
+	// turnProviderErrorFatal: the turn ended on a provider error the
+	// provider marks as not retryable (or a 4xx other than 408, 409 and
+	// 429): retrying cannot succeed, so the turn ends at once with the
+	// error recorded in the receipt.
+	turnProviderErrorFatal
 )
 
 // classifyTurnEnding reads the latest turn's ending. session is the running
@@ -124,7 +130,10 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 	case turn.errorEvent != nil || turn.terminalEvent == nil:
 		return turnFinished
 	case turn.providerError != "":
-		return turnProviderError
+		if turn.providerErrorRetryable {
+			return turnProviderError
+		}
+		return turnProviderErrorFatal
 	case !turn.terminalSuccess:
 		return turnFinished
 	case turn.verdict() != "":
@@ -176,6 +185,9 @@ const (
 	boundCeiling
 	// boundRetries: the provider-error retries reached their bound.
 	boundRetries
+	// boundProviderErrorFatal: the turn ended on a provider error the
+	// provider marks as not retryable — no retry was sent.
+	boundProviderErrorFatal
 	// boundUncontinuable: the turn stopped early with a pull request that
 	// does not deliver the work, and the session takes no continuation
 	// prompt (continuations are disabled, or the harness takes no
@@ -257,6 +269,12 @@ func (f *turnFollowUps) next(ending turnEnding, productive, continuable, canStee
 }
 
 func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) tailStep {
+	if ending == turnProviderErrorFatal {
+		// A deterministic provider failure cannot succeed on retry: end
+		// the turn at once with the error recorded, without sending a
+		// retry or a pull request nudge.
+		return f.exhaust(boundProviderErrorFatal)
+	}
 	if continuable && f.limit > 0 {
 		switch ending {
 		case turnProviderError:
@@ -303,6 +321,9 @@ func (f *turnFollowUps) fail(res *Result) {
 		unfinished = "no turn-result manifest and no verdict, and the pull request does not deliver the work: " + f.undelivered
 	}
 	switch f.bound {
+	case boundProviderErrorFatal:
+		res.FailureMode = FailureProviderError
+		res.Error = fmt.Sprintf("the turn ended on a model provider error the provider marks as not retryable: %s", f.providerError)
 	case boundRetries:
 		res.FailureMode = FailureProviderError
 		res.Error = fmt.Sprintf("the turn still ended on a model provider error after %d retries: %s", f.retried, f.providerError)

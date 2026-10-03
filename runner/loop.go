@@ -1386,7 +1386,7 @@ tailRecovery:
 		case tailDone:
 			break tailRecovery
 		case tailExhausted:
-			if ending == turnProviderError {
+			if ending == turnProviderError || ending == turnProviderErrorFatal {
 				followUps.providerError = lastTurn.providerError
 			}
 			followUps.fail(res)
@@ -2023,7 +2023,11 @@ type streamObservation struct {
 	// on a provider error (agent.SystemSubtypeProviderError) with no
 	// assistant message or tool call after it in this stream — the turn
 	// ended on that error rather than because the agent stopped.
-	providerError string
+	// providerErrorRetryable is false when the harness marked that error
+	// as not retryable (agent.ProviderErrorNotRetryableSuffix): the turn
+	// ends at once with the error recorded instead of being retried.
+	providerError          string
+	providerErrorRetryable bool
 	// toolCalls counts the tool calls (agent.ToolUseEvent) this stream
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
@@ -2035,6 +2039,56 @@ type streamObservation struct {
 	// generic FailureTimeout (ctx-cancelled) branch, so a wedged session
 	// is routed distinctly from a deadline expiry.
 	noProgress bool
+}
+
+// splitProviderErrorRetryable separates the harness-reported retryability
+// marker (agent.ProviderErrorNotRetryableSuffix) from the provider's own
+// error text. An explicit marker wins; otherwise the text is classified by
+// HTTP status: 408, 409, 429 and 5xx (and network errors, which carry no
+// status) retry, while any other 4xx is deterministic and does not.
+func splitProviderErrorRetryable(detail string) (string, bool) {
+	if strings.HasSuffix(detail, agent.ProviderErrorNotRetryableSuffix) {
+		return strings.TrimSpace(strings.TrimSuffix(detail, agent.ProviderErrorNotRetryableSuffix)), false
+	}
+	if status, ok := providerErrorHTTPStatus(detail); ok {
+		return detail, providerErrorStatusRetryable(status)
+	}
+	return detail, true
+}
+
+// providerErrorHTTPStatus finds the first HTTP status in the provider's
+// error text (a leading "400 ...", "status 400", "HTTP 400" or
+// "(400)" shape).
+func providerErrorHTTPStatus(detail string) (int, bool) {
+	for _, m := range providerErrorStatusPattern.FindAllStringSubmatch(detail, -1) {
+		for _, part := range m[1:] {
+			if part == "" {
+				continue
+			}
+			var status int
+			if _, err := fmt.Sscanf(part, "%d", &status); err == nil && status >= 100 && status <= 599 {
+				return status, true
+			}
+		}
+	}
+	return 0, false
+}
+
+var providerErrorStatusPattern = regexp.MustCompile(`(?i)(?:^|[\s:(])(4\d\d|5\d\d)(?:[\s:).,]|$)`)
+
+// providerErrorStatusRetryable mirrors the provider SDK retry policy: 408,
+// 409, 429 and 5xx retry; any other 4xx is deterministic and does not.
+func providerErrorStatusRetryable(status int) bool {
+	if status == 408 || status == 409 || status == 429 {
+		return true
+	}
+	if status >= 500 && status <= 599 {
+		return true
+	}
+	if status >= 400 && status <= 499 {
+		return false
+	}
+	return true
 }
 
 // verdict is the stream's single verdict: "blocked" when its latest anchored
@@ -2358,6 +2412,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		if strings.TrimSpace(e.Text) != "" {
 			obs.lastAssistantText = e.Text
 			obs.providerError = ""
+			obs.providerErrorRetryable = true
 		}
 		// One verdict per message, from its FIRST line-anchored marker
 		// (scanVerdict); the latest message that carries one decides the
@@ -2391,7 +2446,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		obs.pullRequestCandidates = appendPullRequestCandidates(obs.pullRequestCandidates, e.Text)
 	case agent.SystemEvent:
 		if e.Subtype == agent.SystemSubtypeProviderError {
-			obs.providerError = strings.TrimSpace(e.Message)
+			obs.providerError, obs.providerErrorRetryable = splitProviderErrorRetryable(strings.TrimSpace(e.Message))
 			if obs.providerError == "" {
 				obs.providerError = "model provider error"
 			}
@@ -2401,6 +2456,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		// The model produced a tool call: any earlier provider error in
 		// this stream was recovered from.
 		obs.providerError = ""
+		obs.providerErrorRetryable = true
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
 		// Bash invocations of `gh pr create` are not tracked here —
