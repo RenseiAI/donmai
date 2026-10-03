@@ -976,7 +976,7 @@ func stubGhOnPathExpectingPullRequestView(t *testing.T, expectedURL string, exit
 		t.Fatalf("write gh stub output: %v", err)
 	}
 	script := fmt.Sprintf(`#!/bin/sh
-if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName" ]; then
+if [ "$#" -ne 5 ] || [ "$1" != "pr" ] || [ "$2" != "view" ] || [ "$3" != %[1]q ] || [ "$4" != "--json" ] || [ "$5" != "number,url,baseRefName,headRefName,isDraft" ]; then
   echo "unexpected gh argv: $*" 1>&2
   exit 1
 fi

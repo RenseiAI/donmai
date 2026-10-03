@@ -2,6 +2,7 @@ package runner
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"net/url"
 	"strings"
@@ -28,6 +29,27 @@ import (
 // be confirmed is refused, so the nudge and the backstop run; the backstop's
 // own `gh pr create --head <session branch>` still recovers a real pull
 // request that only failed to verify.
+//
+// A verified pull request is the session's, but it does not always deliver
+// the work. Run briefs ask for a draft pull request early, so the work
+// survives a cut-off run; and a rework run continues a pull request that
+// existed before the run started. So when the session's pull request is the
+// only result a turn left (no turn-result manifest, and no verdict in this or
+// any earlier turn), the runner re-reads it at the turn boundary (see
+// undelivered):
+//
+//   - a rework run's pull request must have gained a commit since the run
+//     started: its head now (refs/pull/<n>/head, from the same `git
+//     ls-remote` the verifier makes) must differ from the head recorded at
+//     run start, before the agent's first turn. No GitHub CLI is involved.
+//   - the pull request must not be a draft. Git refs carry no draft flag,
+//     so this is read from the runner's existing `gh pr view` query. When gh
+//     cannot answer (absent, unauthenticated, offline) the draft state is
+//     unknown and the pull request counts as before.
+//
+// A pull request that fails either check leaves the turn unfinished, so it
+// is continued (turn_continuation.go); a session still in that state when
+// its continuations run out ends not delivered, naming the reason.
 
 // pullRequestLookupTimeout bounds one remote lookup.
 const pullRequestLookupTimeout = 15 * time.Second
@@ -42,6 +64,19 @@ const maxPullRequestCandidates = 8
 // pullRequestRefLookup reads refs from the checkout's origin remote and
 // returns the commit of each named ref that exists there.
 type pullRequestRefLookup func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error)
+
+// pullRequestDraftLookup reports whether the pull request at url is a draft.
+type pullRequestDraftLookup func(ctx context.Context, worktreePath, url string) (bool, error)
+
+// githubPullRequestDraft is the production draft read: the runner's `gh pr
+// view` query, in the checkout.
+func githubPullRequestDraft(ctx context.Context, worktreePath, url string) (bool, error) {
+	view, err := viewGitHubPullRequest(ctx, worktreePath, url)
+	if err != nil {
+		return false, err
+	}
+	return view.IsDraft, nil
+}
 
 // originRefs is the production lookup: `git ls-remote origin <refs>` in the
 // checkout, with the credential and remote the session already uses.
@@ -108,8 +143,14 @@ type sessionPullRequestVerifier struct {
 	// worktreePath is the selected repository's checkout.
 	worktreePath string
 	lookup       pullRequestRefLookup
-	accepted     string
-	outcomes     map[string]candidateOutcome
+	draftLookup  pullRequestDraftLookup
+	// startHead is, for a rework run that continues an existing pull
+	// request, that pull request's head when the run started, recorded
+	// before the agent's first turn (see reworkStartHead); "" for a session
+	// that opens its own pull request.
+	startHead string
+	accepted  string
+	outcomes  map[string]candidateOutcome
 }
 
 // newSessionPullRequestVerifier resolves the session's GitHub repository:
@@ -118,10 +159,20 @@ type sessionPullRequestVerifier struct {
 // scp-like, with or without credentials in it). A repository-free workarea
 // resolves to none without running git (that contract forbids any git
 // invocation).
-func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath, branch string, repositoryFree bool) *sessionPullRequestVerifier {
-	v := &sessionPullRequestVerifier{branch: branch, worktreePath: worktreePath, lookup: r.pullRequestLookup, outcomes: map[string]candidateOutcome{}}
+//
+// startHead is the rework start head (reworkStartHead); "" for a session
+// that opens its own pull request.
+func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWork, declaration *workarea.NormalizedDeclaration, worktreePath, branch, startHead string, repositoryFree bool) *sessionPullRequestVerifier {
+	v := &sessionPullRequestVerifier{
+		branch: branch, worktreePath: worktreePath, startHead: startHead,
+		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
+		outcomes: map[string]candidateOutcome{},
+	}
 	if v.lookup == nil {
 		v.lookup = originRefs
+	}
+	if v.draftLookup == nil {
+		v.draftLookup = githubPullRequestDraft
 	}
 	switch {
 	case repositoryFree:
@@ -289,13 +340,17 @@ func (v *sessionPullRequestVerifier) settle(ctx context.Context, res *Result, ob
 // else's — one it could not read from the remote, or did not get to. Such a
 // turn reported a pull request, so it did not stop early; the nudge and the
 // backstop then settle it as they always have. A URL whose pull request has
-// another head (for now) or does not exist does not count. A nil verifier
-// reports none.
+// another head (for now) or does not exist does not count, and neither does
+// the accepted pull request: whether it finished the turn is judged from the
+// envelope and undelivered. A nil verifier reports none.
 func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation) bool {
 	if v == nil || v.repository == "" {
 		return false
 	}
 	for _, candidate := range turn.pullRequestCandidates {
+		if candidate == v.accepted {
+			continue
+		}
 		slug, _, err := parseCanonicalGitHubPullRequestURL(candidate)
 		if err != nil || normalizeGitHubRepositorySlug(slug) != v.repository {
 			continue
@@ -305,6 +360,72 @@ func (v *sessionPullRequestVerifier) reportsOwnRepository(turn streamObservation
 		}
 	}
 	return false
+}
+
+// Why the session's verified pull request does not deliver the work. They
+// are receipt text: a session that ends on one names it in Result.Error.
+const (
+	undeliveredDraft       = "pull request still draft"
+	undeliveredNoNewCommit = "no new commit"
+)
+
+// undelivered re-reads the accepted pull request and reports why it does
+// not deliver the work: undeliveredNoNewCommit when this is a rework run and
+// the pull request's head is still the head it had at run start,
+// undeliveredDraft when it is a draft, "" when it delivers or when there is
+// no accepted pull request. A read that fails is returned as err and does
+// not count against the pull request: the caller logs it and the session
+// keeps today's behaviour. A nil verifier reports "".
+func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason string, err error) {
+	if v == nil || v.accepted == "" {
+		return "", nil
+	}
+	var errs []error
+	if v.startHead != "" {
+		_, number, parseErr := parseCanonicalGitHubPullRequestURL(v.accepted)
+		if parseErr != nil {
+			return "", fmt.Errorf("accepted pull request URL: %w", parseErr)
+		}
+		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
+		found, lookupErr := v.lookup(ctx, v.worktreePath, pullRef)
+		switch {
+		case lookupErr != nil:
+			errs = append(errs, fmt.Errorf("read the pull request head: %w", lookupErr))
+		case found[pullRef] == v.startHead:
+			return undeliveredNoNewCommit, nil
+		}
+	}
+	if v.draftLookup != nil {
+		draft, draftErr := v.draftLookup(ctx, v.worktreePath, v.accepted)
+		switch {
+		case draftErr != nil:
+			errs = append(errs, fmt.Errorf("read the draft state: %w", draftErr))
+		case draft:
+			return undeliveredDraft, nil
+		}
+	}
+	return "", errors.Join(errs...)
+}
+
+// reworkStartHead is the head of the existing pull request a rework run
+// continues, as it was when the run started: the dispatched pull request's
+// recorded head (the provisioner refuses any other tip), else, for a run
+// provisioned at an existing branch, the commit the session's checkout
+// started at — recorded right after provisioning, before the agent's first
+// turn. "" for a run that opens its own pull request.
+func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
+	if qw.PullRequest != nil && headSHARE.MatchString(qw.PullRequest.HeadSHA) {
+		return qw.PullRequest.HeadSHA
+	}
+	if trimRef(qw.Ref) == "" {
+		return ""
+	}
+	for _, target := range res.rescueTargets {
+		if target.path == worktreePath {
+			return target.base
+		}
+	}
+	return ""
 }
 
 // pullRequestRejection is one candidate the verifier refused, and why.

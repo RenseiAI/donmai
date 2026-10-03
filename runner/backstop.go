@@ -478,6 +478,27 @@ type ghPullRequestView struct {
 	URL         string `json:"url"`
 	BaseRefName string `json:"baseRefName"`
 	HeadRefName string `json:"headRefName"`
+	IsDraft     bool   `json:"isDraft"`
+}
+
+// ghPullRequestViewFields is the field list of the runner's one `gh pr view`
+// query, shared by the pr.opened fact and the draft read.
+const ghPullRequestViewFields = "number,url,baseRefName,headRefName,isDraft"
+
+// viewGitHubPullRequest runs the runner's `gh pr view` query for prURL in
+// the checkout.
+func viewGitHubPullRequest(ctx context.Context, worktreePath, prURL string) (ghPullRequestView, error) {
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL, "--json", ghPullRequestViewFields)
+	if err != nil {
+		return ghPullRequestView{}, fmt.Errorf("gh pr view: %w: %s", err, firstLine(out))
+	}
+	var view ghPullRequestView
+	if err := json.Unmarshal([]byte(out), &view); err != nil {
+		return ghPullRequestView{}, fmt.Errorf("gh pr view: decode: %w", err)
+	}
+	return view, nil
 }
 
 // lookupGitHubPullRequest reads the complete PR projection after gh created
@@ -488,15 +509,8 @@ func lookupGitHubPullRequest(ctx context.Context, worktreePath, prURL string, al
 	if strings.TrimSpace(worktreePath) == "" || strings.TrimSpace(prURL) == "" || len(allowedRepositories) == 0 {
 		return nil
 	}
-	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
-	defer cancel()
-	out, err := runGh(lookupCtx, worktreePath, "pr", "view", prURL,
-		"--json", "number,url,baseRefName,headRefName")
+	view, err := viewGitHubPullRequest(ctx, worktreePath, prURL)
 	if err != nil {
-		return nil
-	}
-	var view ghPullRequestView
-	if err := json.Unmarshal([]byte(out), &view); err != nil {
 		return nil
 	}
 	return pullRequestFactFromGitHubViewAuthorized(view, allowedRepositories)

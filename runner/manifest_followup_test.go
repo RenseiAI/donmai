@@ -54,6 +54,10 @@ type verdictScriptTurn struct {
 	events []agent.Event
 	// cost rides the turn's terminal ResultEvent.
 	cost *agent.CostData
+	// push commits the turn's files and pushes the session's HEAD to each
+	// of these refs on origin (e.g. a branch and refs/pull/<n>/head), as an
+	// agent that pushes to its pull request does.
+	push []string
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -161,6 +165,9 @@ func (h *verdictScriptHandle) playLocked() {
 			h.t.Errorf("write %s: %v", path, err)
 		}
 	}
+	if len(turn.push) > 0 {
+		h.commitAndPush(turn)
+	}
 	for _, ev := range turn.events {
 		h.events <- ev
 	}
@@ -182,6 +189,30 @@ func (h *verdictScriptHandle) playLocked() {
 		return
 	}
 	h.events <- agent.ResultEvent{Success: true, Message: turn.text, Cost: turn.cost}
+}
+
+// commitAndPush commits the turn's files in the session worktree and pushes
+// HEAD to each of turn.push on origin.
+func (h *verdictScriptHandle) commitAndPush(turn verdictScriptTurn) {
+	ctx := context.Background()
+	identity := gitIdentity{Name: "test", Email: "test@example.com"}
+	paths := make([]string, 0, len(turn.files))
+	for path := range turn.files {
+		paths = append(paths, path)
+	}
+	if out, err := runGit(ctx, h.cwd, identity, append([]string{"add", "--"}, paths...)...); err != nil {
+		h.t.Errorf("scripted push: add: %v\n%s", err, out)
+		return
+	}
+	if out, err := runGit(ctx, h.cwd, identity, "commit", "-q", "--allow-empty", "-m", "scripted turn"); err != nil {
+		h.t.Errorf("scripted push: commit: %v\n%s", err, out)
+		return
+	}
+	for _, ref := range turn.push {
+		if out, err := runGit(ctx, h.cwd, identity, "push", "-q", "-f", "origin", "HEAD:"+ref); err != nil {
+			h.t.Errorf("scripted push: push %s: %v\n%s", ref, err, out)
+		}
+	}
 }
 
 func (h *verdictScriptHandle) closeEvents() {
@@ -247,6 +278,12 @@ type scriptedSession struct {
 	pulls map[int]string
 	// lookup, when set, replaces the verifier's remote lookup.
 	lookup pullRequestRefLookup
+	// draft, when set, replaces the pull request draft read; otherwise the
+	// session's pull request is never a draft (and no gh is run).
+	draft pullRequestDraftLookup
+	// ref, when set, makes the session a rework run on that existing
+	// branch of repository (qw.Ref), created at main.
+	ref string
 	// backstop lets the deterministic backstop run (off by default).
 	backstop bool
 	// teardown lets Run tear the worktree down on success (the default keeps
@@ -322,6 +359,10 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	if cfg.lookup != nil {
 		r.pullRequestLookup = cfg.lookup
 	}
+	r.pullRequestDraftLookup = cfg.draft
+	if r.pullRequestDraftLookup == nil {
+		r.pullRequestDraftLookup = func(context.Context, string, string) (bool, error) { return false, nil }
+	}
 	r.skipBackstop = !cfg.backstop
 	r.providerRetryBackoff = func(int) time.Duration { return 0 }
 	qw := QueuedWork{
@@ -349,6 +390,10 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 			setPullRef(t, bare, number, target)
 		}
 		qw.Repository = cfg.repository
+		if cfg.ref != "" {
+			gitRun(t, bare, "branch", cfg.ref, "main")
+			qw.Ref = cfg.ref
+		}
 	default:
 		qw.Repository = makeBareRepo(t)
 	}
