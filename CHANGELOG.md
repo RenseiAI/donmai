@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ### Fixes
 
+- A declared read-only context repository that fails to clone no longer
+  fails the session: it is skipped with a warning on the result, recorded in
+  the workarea's durable declaration, and left out of the sandbox policy. A
+  writable or selected repository that fails to clone still fails the
+  session, and a cache seed that cannot be built falls back to unseeded
+  clones. The `DONMAI_SIBLING_REPOS` variable, which cloned extra
+  repositories next to the worktree, is removed; declare context
+  repositories instead.
+
 - A turn that ends on a progress note with the session's pull request still
   a draft is now continued instead of being recorded as passed; a rework run
   that continues an existing pull request counts as delivered only once the
