@@ -2173,6 +2173,79 @@ func TestPostSessionRunning_Non2xxIsSwallowed(_ *testing.T) {
 		quietLogger(), srv.URL, "sess-5xx", "wkr", "tok")
 }
 
+// TestPostSessionRunning_RetriesTransientFailuresUntilSuccess verifies the
+// bounded retry: a server that fails twice with 500 then returns 200 sees
+// three posts and the session proceeds. A single-attempt implementation
+// posts once and turns this test red.
+func TestPostSessionRunning_RetriesTransientFailuresUntilSuccess(t *testing.T) {
+	oldDelay := postSessionRunningRetryDelay
+	postSessionRunningRetryDelay = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { postSessionRunningRetryDelay = oldDelay })
+
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if posts.Add(1) <= 2 {
+			w.WriteHeader(http.StatusInternalServerError)
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+	}))
+	defer srv.Close()
+
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), srv.URL, "sess-retry", "wkr", "tok")
+
+	if got := posts.Load(); got != 3 {
+		t.Fatalf("running posts = %d, want 3 (two failures then success)", got)
+	}
+}
+
+// TestPostSessionRunning_ExhaustedRetriesLogsWarning verifies the retry
+// loop is bounded (exactly postSessionRunningMaxAttempts posts) and the
+// final failure surfaces at warn level so a lost nudge is visible.
+func TestPostSessionRunning_ExhaustedRetriesLogsWarning(t *testing.T) {
+	oldDelay := postSessionRunningRetryDelay
+	postSessionRunningRetryDelay = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { postSessionRunningRetryDelay = oldDelay })
+
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		logger, srv.URL, "sess-exhausted", "wkr", "tok")
+
+	if got := posts.Load(); got != int64(postSessionRunningMaxAttempts) {
+		t.Fatalf("running posts = %d, want %d (bounded retry)", got, postSessionRunningMaxAttempts)
+	}
+	if out := buf.String(); !strings.Contains(out, "after retries") {
+		t.Errorf("expected warn log with retry exhaustion, got %q", out)
+	}
+}
+
+// TestPostSessionRunning_ClientErrorFailsFast verifies a 4xx response is
+// permanent: one post, no retry.
+func TestPostSessionRunning_ClientErrorFailsFast(t *testing.T) {
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		quietLogger(), srv.URL, "sess-404", "wkr", "tok")
+
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("running posts = %d, want 1 (4xx fails fast)", got)
+	}
+}
+
 func TestDonmaiSpanTracingEnabled(t *testing.T) {
 	tests := []struct {
 		value string
