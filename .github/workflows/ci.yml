@@ -20,7 +20,7 @@ permissions:
 jobs:
   release-authority-visibility:
     name: release-authority visibility (read-only)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -40,7 +40,7 @@ jobs:
   # triggers this workflow's `on:` block doesn't carry, since a PR body edit
   # is the squash-merge message and can introduce a leak no commit contains.
   release-contracts:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
 
 
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7

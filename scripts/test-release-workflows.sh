@@ -460,9 +460,8 @@ assert_line '  contents: read' "${pr_workflow}"
 assert_line '          platforms: linux/amd64,linux/arm64' "${pr_workflow}"
 assert_line '          push: false' "${pr_workflow}"
 assert_line "            DONMAI_VERSION=pr-\${{ github.event.pull_request.number }}-\${{ github.sha }}" "${pr_workflow}"
-if grep -Eq '^[[:space:]]+cache-(from|to):' "${pr_workflow}"; then
-  fail 'PR worker workflow duplicates the Blacksmith builder cache'
-fi
+assert_line '          cache-from: type=gha' "${pr_workflow}"
+assert_line '          cache-to: type=gha,mode=max' "${pr_workflow}"
 
 permission_count=$(grep -Ec '^  [a-z-]+: (read|write|none)$' "${pr_workflow}")
 [[ "${permission_count}" == 1 ]] || fail 'PR worker workflow permissions are not contents:read only'
@@ -480,13 +479,22 @@ if ! grep -Eq '^[[:space:]]*uses: actions/checkout@[0-9a-f]{40}( |$)' "${pr_work
   fail 'PR worker workflow checkout action is not pinned to a commit SHA'
 fi
 
-# CREEP isolation (CVE-2025-36852 class): the PR workflow must never touch the
-# persistent Blacksmith builder — its sticky-disk cache is cache-key-scoped,
-# not ref-scoped, so a pull_request build could seed layers the tag-triggered
-# release build silently reuses. PR builds use plain, non-persistent buildx.
+# Cache isolation: both image builds use the GitHub Actions cache backend
+# (cache-from: type=gha, cache-to: type=gha,mode=max), whose writes are
+# scoped to the git ref that produced them — a pull_request build's entries
+# never feed the tag-triggered release build — so the PR build stays warm
+# without ever influencing what a release publishes. Neither build touches
+# a persistent builder: no useblacksmith/* action may appear in either file.
 if grep -Eq '^[[:space:]]*uses:[[:space:]]*useblacksmith/' "${pr_workflow}"; then
-  fail 'PR worker workflow must not use the persistent Blacksmith builder (CREEP isolation)'
+  fail 'PR worker workflow must not use the persistent builder (cache isolation)'
 fi
+if grep -Eq '^[[:space:]]*uses:[[:space:]]*useblacksmith/' "${worker_workflow}"; then
+  fail 'release worker workflow must not use the persistent builder (cache isolation)'
+fi
+for action in docker/setup-buildx-action docker/build-push-action; do
+  release_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${worker_workflow}")
+  [[ -n "${release_ref}" ]] || fail "release worker workflow does not pin ${action}"
+done
 for action in docker/setup-buildx-action docker/build-push-action; do
   pr_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${pr_workflow}")
   [[ -n "${pr_ref}" ]] || fail "PR worker workflow does not pin ${action}"
@@ -500,13 +508,54 @@ for action in docker/setup-qemu-action; do
   [[ "${pr_ref}" == "${release_ref}" ]] || fail "PR worker workflow does not reuse ${release_ref}"
 done
 
-# The release workflow keeps its pinned persistent builder and, post-isolation,
-# an explicit cache-key so its cache lineage starts from trusted builds only.
-for action in useblacksmith/setup-docker-builder useblacksmith/build-push-action; do
-  release_ref=$(grep -Eo "${action}@[0-9a-f]{40}" "${worker_workflow}")
-  [[ -n "${release_ref}" ]] || fail "release worker workflow does not pin ${action}"
+# Both image builds share the GitHub Actions cache backend; the release
+# build must carry the same cache-from/cache-to lines as the PR build.
+for line in '          cache-from: type=gha' '          cache-to: type=gha,mode=max'; do
+  assert_line "${line}" "${worker_workflow}"
 done
-grep -Eq '^[[:space:]]+cache-key:' "${worker_workflow}" || fail 'release worker workflow does not pin an explicit sticky-disk cache-key'
+
+# Runner policy: every workflow job runs on a standard hosted runner —
+# ubuntu-latest for Linux, macos-15 for the signed macOS release — and the
+# guard still reports on merge_group so queued PRs cannot stall. Job names
+# stay identical so required checks keep reporting. No self-hosted runner
+# may appear anywhere.
+ruby -ryaml - "${root_dir}" <<'RUBY'
+root_dir = ARGV.fetch(0)
+allowed = %w[ubuntu-latest macos-15]
+abort 'FAIL: no workflow files found' if Dir.glob(File.join(root_dir, '.github/workflows/*.yml')).empty?
+Dir.glob(File.join(root_dir, '.github/workflows/*.yml')).sort.each do |path|
+  raw = File.binread(path).force_encoding('UTF-8')
+  abort "FAIL: #{File.basename(path)} is not valid UTF-8" unless raw.valid_encoding?
+  workflow = YAML.safe_load(raw, permitted_classes: [], permitted_symbols: [], aliases: false)
+  jobs = workflow['jobs']
+  next unless jobs.is_a?(Hash)
+  jobs.each do |name, job|
+    runner = job['runs-on']
+    runners = runner.is_a?(Array) ? runner : [runner]
+    runners.each do |label|
+      abort "FAIL: #{File.basename(path)} jobs.#{name} runs on #{label.inspect}" unless allowed.include?(label)
+    end
+  end
+  content = File.binread(path).force_encoding('UTF-8')
+  abort "FAIL: #{File.basename(path)} references a persistent builder" if content.match?(/useblacksmith\//)
+  abort "FAIL: #{File.basename(path)} uses a self-hosted runner" if content.match?(/self-hosted/)
+end
+guard = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/guard-b.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+triggers = guard[true] || guard['on']
+abort 'FAIL: guard-b lost its pull_request trigger' unless triggers.is_a?(Hash) && triggers.key?('pull_request')
+abort 'FAIL: guard-b must keep running on every PR and on merge_group' unless triggers.key?('merge_group')
+ci = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/ci.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+abort 'FAIL: CI lost its test job' unless ci.fetch('jobs').key?('test')
+abort 'FAIL: CI lost its release-contracts job' unless ci.fetch('jobs').key?('release-contracts')
+release = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/release.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+abort 'FAIL: release job lost its macOS runner' unless release.fetch('jobs').fetch('release')['runs-on'] == 'macos-15'
+steps = release.fetch('jobs').fetch('release').fetch('steps')
+abort 'FAIL: release job lost its signing step' unless steps.any? { |step| step['name'] == 'Import Apple Developer ID cert to keychain' }
+scan = YAML.safe_load(File.read(File.join(root_dir, '.github/workflows/security-scan.yml')), permitted_classes: [], permitted_symbols: [], aliases: false)
+%w[secret-scan govulncheck semgrep].each do |job|
+  abort "FAIL: security scan lost job #{job}" unless scan.fetch('jobs').key?(job)
+end
+RUBY
 
 # The E2B build wrapper must pass the versioned target on every build and add
 # the rolling default only when requested by an automatic tag push.

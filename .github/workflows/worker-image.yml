@@ -20,7 +20,7 @@ permissions:
 jobs:
   release-authority:
     name: release-authority (signed tag + two rulesets)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -45,7 +45,7 @@ jobs:
 
   build-and-push:
     needs: release-authority
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       # Stage the current workflow's verifier before checking out an older tag
@@ -83,23 +83,12 @@ jobs:
       - name: Set up QEMU
         uses: docker/setup-qemu-action@96fe6ef7f33517b61c61be40b68a1882f3264fb8 # v4
 
-      # SECURITY (CREEP-class cache poisoning, CVE-2025-36852 pattern; see
-      # worker-image-pr.yml for the full finding): this action's sticky disk
-      # is scoped by `cache-key`, which neither this workflow nor
-      # worker-image-pr.yml used to set — both fell back to the same implicit
-      # default key, so the untrusted PR build and this release build shared
-      # one persistent layer cache. worker-image-pr.yml no longer touches a
-      # Blacksmith sticky disk at all, but any layers a PR run already wrote
-      # under that old implicit default key could still be sitting in it.
-      # Pin an explicit cache-key here that no prior run (PR or release) has
-      # ever used, so this build's cache is provably seeded only by trusted
-      # push/tag builds from this point forward — a one-time invalidation.
-      # To force another invalidation later (e.g. after a compromised build),
-      # bump the suffix (-v2, -v3, ...).
-      - name: Setup Blacksmith Builder
-        uses: useblacksmith/setup-docker-builder@33803e640bd9d674f2843a8c323aa2a7da478d23 # v2.0.0
-        with:
-          cache-key: donmai/worker-image-release-v1
+      # Both image builds share the GitHub Actions cache backend
+      # (cache-from: type=gha, cache-to: type=gha,mode=max). GHA cache
+      # writes are scoped to the git ref that produced them, so PR builds
+      # cannot seed layers the tag-triggered release build would reuse.
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@bb05f3f5519dd87d3ba754cc423b652a5edd6d2c # v4.2.0
 
       - name: Log in to GHCR
         uses: docker/login-action@abd2ef45e78c5afb21d64d4ca52ee8550d9572c7 # v4
@@ -109,12 +98,14 @@ jobs:
           password: ${{ secrets.GITHUB_TOKEN }}
 
       - name: Build and push worker image
-        uses: useblacksmith/build-push-action@fb9e3e6a9299c78462bfadd0d93352c316adc9b8 # v2.2.0
+        uses: docker/build-push-action@53b7df96c91f9c12dcc8a07bcb9ccacbed38856a # v7.3.0
         with:
           context: .
           file: worker/Dockerfile
           platforms: linux/amd64,linux/arm64
           push: true
+          cache-from: type=gha
+          cache-to: type=gha,mode=max
           build-args: |
             DONMAI_VERSION=${{ steps.release.outputs.tag }}
           tags: ${{ steps.release.outputs.image_tags }}
