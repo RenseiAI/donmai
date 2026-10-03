@@ -121,7 +121,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		refuseForExecutionSecurity(res, err)
 		return res, err
 	}
-	repositoryDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkarea(qw, provider)
+	repositoryDeclaration, provisionDeclaration, executorWorkareaCapabilities, workareaErr := resolveRepositoryWorkareaDeclaration(qw, provider)
 	if workareaErr != nil {
 		res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, workareaErr.Error()
 		return res, workareaErr
@@ -297,7 +297,7 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		RequireBranchBase:     qw.BaseRef != "",
 		SourceRef:             provisionSourceRef,
 		Strategy:              provisionStrategy,
-		RepositoryDeclaration: qw.RepositoryDeclaration,
+		RepositoryDeclaration: provisionDeclaration,
 		ExecutorCapabilities:  executorWorkareaCapabilities,
 		Mode:                  qw.WorkareaMode,
 		ParentWorkareaID:      qw.ParentWorkareaID,
@@ -320,11 +320,30 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	res.WorkareaRoot = layout.Root.String()
 	r.logger.Debug("worktree provisioned", "sessionId", qw.SessionID, "path", wpath, "workareaRoot", res.WorkareaRoot, "nested", layout.IsNested())
 	var declaredRepositoryPaths map[string]string
+	var skippedRepositories map[string]struct{}
 	if repositoryDeclaration != nil {
 		declaredRepositoryPaths, err = r.wt.RepositoryPaths(qw.SessionID)
 		if err != nil {
 			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, err.Error()
 			return res, err
+		}
+		// A declared read-only context repository whose clone failed is
+		// skipped with a warning instead of failing the session: record
+		// each skip on the result so it is visible wherever
+		// PostSessionWarnings surface. The skipped set is also the only
+		// thing that excuses a declared repository without a path when the
+		// sandbox authority policy is built below.
+		skipped, skippedErr := r.wt.SkippedRepositories(qw.SessionID)
+		if skippedErr != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, skippedErr.Error()
+			return res, skippedErr
+		}
+		skippedRepositories = make(map[string]struct{}, len(skipped))
+		for _, name := range skipped {
+			skippedRepositories[name] = struct{}{}
+			warning := fmt.Sprintf("declared read-only context repository %q failed to clone; continuing without it", name)
+			r.logger.Warn("declared repository skipped", "sessionId", qw.SessionID, "repository", name)
+			res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
 		}
 	}
 	runnerStatePath := wpath
@@ -358,6 +377,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 				continue
 			}
 			repositoryPath := declaredRepositoryPaths[repository.Name]
+			if repositoryPath == "" {
+				continue
+			}
 			if _, gitErr := runGit(ctx, repositoryPath, gitIdentity{}, "checkout", "-b", branch); gitErr != nil {
 				r.logger.Debug("create declared repository work branch failed (may already exist)",
 					"repository", repository.Name, "branch", branch, "err", gitErr)
@@ -384,7 +406,9 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		targets := make([]rescueTarget, 0, len(repositoryDeclaration.Repositories))
 		for _, repository := range repositoryDeclaration.Repositories {
 			if repository.Authority == workarea.RepositoryMutable {
-				targets = append(targets, rescueTarget{name: repository.Name, path: declaredRepositoryPaths[repository.Name]})
+				if path := declaredRepositoryPaths[repository.Name]; path != "" {
+					targets = append(targets, rescueTarget{name: repository.Name, path: path})
+				}
 			}
 		}
 		recordRescueTargets(ctx, res, targets)
@@ -401,13 +425,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
-	// 2a-bis. Materialize read-only sibling context repos named by
-	// DONMAI_SIBLING_REPOS next to the session worktree so agents find
-	// their governing corpus at ../<name> as their repo AGENTS.md
-	// contracts promise (ADR-2026-07-07-sibling-context-repos). Never
-	// fatal: a failed sibling logs a warning and the session proceeds —
-	// agents fall back to cloning it themselves.
-	if !repositoryFree && repositoryDeclaration == nil {
+	// 2a-bis. Sibling context repositories (DONMAI_SIBLING_REPOS; see
+	// siblings.go). An executor that can hold a declared read-only leaf got
+	// each entry as a context leaf under the session root above; any other
+	// executor keeps the original placement beside the session worktree. A
+	// work item that declares its own repositories is authoritative, and the
+	// variable is ignored for it. Never fatal.
+	switch {
+	case qw.RepositoryDeclaration != nil && siblingReposSpec(qw) != "":
+		warning := siblingReposEnv + " is ignored: the work item declares its own repositories"
+		r.logger.Warn(warning, "sessionId", qw.SessionID)
+		res.PostSessionWarnings = append(res.PostSessionWarnings, warning)
+	case !repositoryFree && repositoryDeclaration == nil:
 		r.provisionSiblings(ctx, qw, wpath)
 	}
 
@@ -809,25 +838,11 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 	if repositoryDeclaration != nil {
-		policy := &agent.RepositoryAuthorityPolicy{
-			Protocol: string(repositoryDeclaration.Protocol), WorkareaRoot: res.WorkareaRoot,
-			SelectedPath: wpath, Enforcement: string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement),
-		}
-		for _, repository := range repositoryDeclaration.Repositories {
-			path := declaredRepositoryPaths[repository.Name]
-			if path == "" {
-				missingErr := &workarea.RepositoryContractError{
-					Reason: workarea.ReasonDeclarationRecordInvalid, RuleID: workarea.RuleDeclarationRecordSecretFree,
-					Repository: repository.Name, Detail: "declared repository has no provisioned path",
-				}
-				res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, missingErr.Error()
-				return res, missingErr
-			}
-			if repository.Authority == workarea.RepositoryMutable {
-				policy.MutablePaths = append(policy.MutablePaths, path)
-			} else {
-				policy.ReadOnlyPaths = append(policy.ReadOnlyPaths, path)
-			}
+		policy, policyErr := repositoryAuthorityPolicy(*repositoryDeclaration, declaredRepositoryPaths, skippedRepositories,
+			res.WorkareaRoot, wpath, string(executorWorkareaCapabilities.RepositoryAuthorityEnforcement))
+		if policyErr != nil {
+			res.Status, res.FailureMode, res.Error = "failed", FailureWorktreeProvision, policyErr.Error()
+			return res, policyErr
 		}
 		// The authority declaration is stronger than a caller's autonomous
 		// full-access preference. Only declared mutable paths may be writable.

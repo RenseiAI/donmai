@@ -538,6 +538,12 @@ type DeclarationRecord struct {
 	WorkareaID         string                        `json:"workareaId"`
 	SelectedRepository string                        `json:"selectedRepository"`
 	Repositories       []DeclarationRepositoryRecord `json:"repositories"`
+	// SkippedRepositories are declared read-only context repositories whose
+	// clone failed at provisioning and were skipped with a warning: never
+	// materialized under the root, so they are not in Repositories. They are
+	// recorded so a later re-entry can tell a recorded skip from a root that
+	// never had the repository. Empty, and omitted, when nothing was skipped.
+	SkippedRepositories []DeclarationRepositoryRecord `json:"skippedRepositories,omitempty"`
 }
 
 // NewDeclarationRecord builds the secret-free durable projection. Resolved
@@ -553,16 +559,54 @@ func NewDeclarationRecord(sessionID, workareaID string, declaration NormalizedDe
 		record.AcquisitionID = acquisitionIDs[0]
 	}
 	for _, repository := range declaration.Repositories {
-		sourceDigest, _ := RepositorySourceDigest(repository.Source.Repository)
-		record.Repositories = append(record.Repositories, DeclarationRepositoryRecord{
-			Name: repository.Name, Leaf: repository.Leaf, Role: repository.Role,
-			Authority: repository.Authority, RequestedRef: repository.Source.Ref,
-			ResolvedRef:               resolvedRefs[repository.Name],
-			CanonicalGitHubRepository: CanonicalGitHubRepositorySource(repository.Source.Repository),
-			SourceDigest:              sourceDigest, SparsePaths: append([]string(nil), repository.Source.Paths...),
-		})
+		record.Repositories = append(record.Repositories, newDeclarationRepositoryRecord(repository, resolvedRefs[repository.Name]))
 	}
 	return record
+}
+
+// SkippedRepositoryRecords projects the named repositories of declaration —
+// read-only context repositories skipped at provisioning — for
+// DeclarationRecord.SkippedRepositories, in declaration order. A name the
+// declaration does not carry is ignored.
+func SkippedRepositoryRecords(declaration NormalizedDeclaration, names []string) []DeclarationRepositoryRecord {
+	if len(names) == 0 {
+		return nil
+	}
+	wanted := make(map[string]struct{}, len(names))
+	for _, name := range names {
+		wanted[name] = struct{}{}
+	}
+	var records []DeclarationRepositoryRecord
+	for _, repository := range declaration.Repositories {
+		if _, ok := wanted[repository.Name]; ok {
+			records = append(records, newDeclarationRepositoryRecord(repository, ""))
+		}
+	}
+	return records
+}
+
+// SkippedRepositoryNames names the repositories the record says were skipped
+// at provisioning.
+func (r DeclarationRecord) SkippedRepositoryNames() []string {
+	if len(r.SkippedRepositories) == 0 {
+		return nil
+	}
+	names := make([]string, 0, len(r.SkippedRepositories))
+	for _, repository := range r.SkippedRepositories {
+		names = append(names, repository.Name)
+	}
+	return names
+}
+
+func newDeclarationRepositoryRecord(repository NormalizedRepository, resolvedRef string) DeclarationRepositoryRecord {
+	sourceDigest, _ := RepositorySourceDigest(repository.Source.Repository)
+	return DeclarationRepositoryRecord{
+		Name: repository.Name, Leaf: repository.Leaf, Role: repository.Role,
+		Authority: repository.Authority, RequestedRef: repository.Source.Ref,
+		ResolvedRef:               resolvedRef,
+		CanonicalGitHubRepository: CanonicalGitHubRepositorySource(repository.Source.Repository),
+		SourceDigest:              sourceDigest, SparsePaths: append([]string(nil), repository.Source.Paths...),
+	}
 }
 
 // Validate proves the durable record is internally coherent and secret-free by
@@ -612,6 +656,35 @@ func (r DeclarationRecord) Validate() error {
 	}
 	if primary != 1 || !selected {
 		return repositoryError(ReasonDeclarationRecordInvalid, RuleSinglePrimary, r.SelectedRepository, "record must contain one primary and its selected repository")
+	}
+	// A skipped repository can only ever be a read-only context repository
+	// that is not selected, and it shares no leaf with any other entry.
+	for _, repository := range r.SkippedRepositories {
+		if repository.Name == "" || repository.Name != repository.Leaf {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleLeafSafe, repository.Name, "record skipped name and leaf must match")
+		}
+		if err := ValidateRepositoryLeaf(repository.Leaf); err != nil {
+			return err
+		}
+		leafKey := strings.ToLower(repository.Leaf)
+		if _, exists := seen[leafKey]; exists {
+			return repositoryError(ReasonRepositoryLeafCollision, RuleLeafUnique, repository.Name, "record skips a repository it also carries, or skips one twice")
+		}
+		seen[leafKey] = struct{}{}
+		if repository.Role != RepositoryRoleContext || repository.Authority != RepositoryReadOnly || repository.Name == r.SelectedRepository {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleReadOnlyExecutorEnforced, repository.Name, "record skips a repository that is not a read-only context repository")
+		}
+		if repository.CanonicalGitHubRepository != "" && normalizeGitHubRepositorySlug(repository.CanonicalGitHubRepository) != repository.CanonicalGitHubRepository {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "record skipped canonical GitHub repository is invalid")
+		}
+		if !validRepositorySourceDigest(repository.SourceDigest) {
+			return repositoryError(ReasonDeclarationRecordInvalid, RuleDeclarationRecordSecretFree, repository.Name, "record skipped source digest is missing or invalid")
+		}
+		for _, sparsePath := range repository.SparsePaths {
+			if err := validateSparsePath(sparsePath); err != nil {
+				return repositoryError(ReasonDeclarationRecordInvalid, RuleLeafSafe, repository.Name, err.Error())
+			}
+		}
 	}
 	return nil
 }

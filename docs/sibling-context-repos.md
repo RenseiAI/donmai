@@ -1,22 +1,42 @@
 # Sibling context repos (`DONMAI_SIBLING_REPOS`)
 
-The runner can materialize read-only context repositories — typically the
-governing architecture corpus a repo's `AGENTS.md` expects at `../<name>` —
-next to the session worktree before the agent spawns
-(ADR-2026-07-07-sibling-context-repos in `donmai-architecture`).
+The runner can materialize read-only context repositories, typically the
+governing architecture corpus a repo's `AGENTS.md` expects at `../<name>`,
+before the agent spawns (ADR-2026-07-07-sibling-context-repos, as amended by
+ADR-2026-08-22-session-owned-multi-repository-workarea, in
+`donmai-architecture`).
 
-- **Env var**: `DONMAI_SIBLING_REPOS`. Carried on the work item's `env` map
-  (the daemon injects work-item env into the worker child's process env);
-  plain process env works for standalone runs.
+- **Env var**: `DONMAI_SIBLING_REPOS`. Carried on the work item's `env` map;
+  the process env is the fallback for standalone runs.
 - **Format**: comma-separated entries, each `<git-url>` or `<git-url>#<ref>`.
-  Example: `https://github.com/Example/docs-corpus.git#main`.
-- **Placement**: each repo is shallow-cloned (`git clone --depth 1`, plus
-  `--branch <ref>` when given) into `<worktree-parent>/<name>`, where `<name>`
-  is the URL path basename with a trailing `.git` stripped — i.e. a sibling of
-  the session worktree, reachable as `../<name>` from inside it.
-- **Freshen**: an existing sibling with a `.git` gets a best-effort
-  `git pull --ff-only --quiet`; on failure the stale copy is kept. A directory
-  without a `.git` is left untouched (never deleted).
-- **Non-fatal**: any sibling failure logs a warning and the session proceeds —
-  agents fall back to cloning the repo themselves. Unsafe names (empty, `.`,
-  `..`, path separators, or a collision with the worktree itself) are skipped.
+  Example: `https://github.com/Example/docs-corpus.git#main`. `<name>` is the
+  URL path basename with a trailing `.git` stripped.
+- **Placement** depends on the executor. Either way the agent finds each
+  sibling at `../<name>` from its working directory.
+  - An executor that attests the `session-root-v1` workarea protocol and
+    `isolated-read-only-v1` enforcement gets each entry as a read-only
+    `context` leaf under the session root, beside the selected repository,
+    but only for a plain single-repository headless item: no declared
+    repositories, no base ref, pull request, cache seed, or shared workarea,
+    no interactive mode, and a non-full-access sandbox (a ref-bearing item
+    still derives). A full-access item keeps the original placement so the
+    declaration never downgrades its sandbox.
+    The leaf belongs to the session: it is torn down, archived and adopted
+    with it, and the executor holds it read-only. An entry whose name repeats
+    the primary repository's or an earlier entry's is left out.
+  - Any other executor keeps the original placement: a shallow clone
+    (`git clone --depth 1`, plus `--branch <ref>` when given) into
+    `<worktree-parent>/<name>`, beside the session worktree. An existing
+    sibling with a `.git` gets a best-effort `git pull --ff-only --quiet`;
+    on failure the stale copy is kept, and a directory without a `.git` is
+    left untouched. Each entry is bounded by a timeout and serialized across
+    processes by a file lock beside the target
+    (`<worktree-parent>/.<name>.sibling-lock`).
+- **Precedence**: a work item that declares its own repositories
+  (`repositoryDeclaration`) is authoritative. The variable is ignored for it,
+  with a warning on the result.
+- **Non-fatal**: any sibling failure logs a warning and the session proceeds.
+  A context leaf that fails to clone is skipped with a warning on the result
+  and recorded in the workarea's declaration; agents fall back to cloning the
+  repo themselves. Unsafe names (empty, `.`, `..`, path separators, or a
+  collision with the worktree itself) are skipped.
