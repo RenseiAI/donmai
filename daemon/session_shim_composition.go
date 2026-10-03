@@ -257,6 +257,21 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 
 	var err error
 	if declared, err = d.declareSessionShimComposition(ctx); err != nil {
+		// A refused founder must not block a later healthy founder. The
+		// deferred rollback above has already restored the stand-down
+		// posture, so a later install with another composed configuration
+		// may found the composition. The refusal is retained and readable
+		// from SessionShimDurabilityRefusal() so an operator who sees `off`
+		// can see why; anything that is not a definite platform refusal
+		// keeps its ordinary untyped error.
+		if refused := newSessionShimFoundingDurabilityRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+			slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+				"founding declaration; the daemon keeps serving direct-owned "+
+				"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+				"scope", refused.Scope, "refusal", refused.Err)
+			d.retainSessionShimDurabilityRefusal(refused)
+			return fmt.Errorf("session shim: declare composition: %w", refused)
+		}
 		return err
 	}
 

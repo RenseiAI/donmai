@@ -638,10 +638,20 @@ func (d *Daemon) waitSessionShimRecompositionBackoff(ctx context.Context, pass i
 // refused for a reason no bounded recovery can settle, and that the daemon has
 // stood the composition down rather than failing.
 //
+// A founding declaration the platform refuses with a definite client error
+// (HTTP 400/403/409/422 on the declaring refresh) is classified the same
+// way: the attestation was heard and answered, and nothing in this daemon
+// can turn that answer into an acceptance. The install rolls back to the
+// stand-down posture, retains the refusal, and a later install with another
+// composed configuration may found the composition. An accepted composition
+// still refuses a second install; a recovered founder does not create a
+// second composition.
+//
 // IT IS A CLASSIFICATION, NOT A SWALLOW, AND THE DISTINCTION IS THE POINT.
 // This type is produced ONLY for a refusal whose shape says re-asking cannot
-// help: a completeness refusal this daemon has nothing left to declare for, or
-// a recorded-evidence conflict its own recovery could not narrow. A transport
+// help: a completeness refusal this daemon has nothing left to declare for,
+// a recorded-evidence conflict its own recovery could not narrow, or a
+// definite founding-declaration refusal as above. A transport
 // failure, a deadline, an expired credential, an opaque status refusal, an
 // ambiguous commit — none of those produce it, because all of them are
 // recovered by the ordinary path a plain error already takes, and a host that
@@ -710,6 +720,42 @@ func sessionShimBatchRefusalIsUnresolvable(err error) bool {
 	}
 	var recorded *SessionShimAdoptionEvidenceRecorded
 	return errors.As(err, &recorded)
+}
+
+// sessionShimFoundingRefusalIsDefinite reports whether a failed founding
+// declaration is a definite platform refusal rather than a transient outage.
+// Only the definite client errors qualify: the platform heard the composed
+// attestation and answered it. A transport failure, a deadline, an auth or
+// missing-endpoint status, a 5xx, or anything else keeps its ordinary error
+// and its ordinary consequence, because those are the failures a supervised
+// restart recovers from.
+func sessionShimFoundingRefusalIsDefinite(err error) bool {
+	if err == nil || sessionShimCommitOutcomeUnknown(err) ||
+		errors.Is(err, errSessionShimAmbiguousBatchCommit) {
+		return false
+	}
+	var refreshErr *refreshHTTPError
+	if !errors.As(err, &refreshErr) {
+		return false
+	}
+	switch refreshErr.status {
+	case 400, 403, 409, 422:
+		return true
+	default:
+		return false
+	}
+}
+
+// newSessionShimFoundingDurabilityRefused classifies a refused founding
+// declaration as a durability refusal the caller retries by founding the
+// composition with another composed configuration. It returns nil when the
+// failure is not a definite platform refusal, which is the caller's signal
+// to keep its ordinary error.
+func newSessionShimFoundingDurabilityRefused(scope string, err error) *SessionShimDurabilityRefused {
+	if !sessionShimFoundingRefusalIsDefinite(err) {
+		return nil
+	}
+	return &SessionShimDurabilityRefused{Scope: scope, Err: err}
 }
 
 // newSessionShimDurabilityRefused classifies one spent batch refusal, lifting

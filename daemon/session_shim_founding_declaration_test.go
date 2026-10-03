@@ -413,3 +413,57 @@ func TestFailedInstallAfterAnAcceptedDeclarationWithdrawsItExactlyOnce(t *testin
 		})
 	}
 }
+
+// TestRefusedFoundingDeclarationLetsAnotherCompositionFound is the retry
+// contract: when the platform refuses one founder's declaring refresh, the
+// install rolls back to stand-down, the refusal stays readable, and a later
+// install with another composed configuration founds the composition. An
+// accepted composition still refuses a second install.
+func TestRefusedFoundingDeclarationLetsAnotherCompositionFound(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForController(first.ControllerID)
+	firstErr := h.daemon.InstallSessionShimComposition(ctx, first)
+	var refused *SessionShimDurabilityRefused
+	if !errors.As(firstErr, &refused) {
+		t.Fatalf("refused founding install error = %v, want it classified as a durability refusal", firstErr)
+	}
+	if refused.Scope != h.orgID {
+		t.Fatalf("refused scope = %q, want %q", refused.Scope, h.orgID)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.StandsDown() {
+		t.Fatalf("attestation after a refused founding = %#v, want the stand-down", got)
+	}
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after a refused founding = %q, want %q", state, StateRunning)
+	}
+	retained := h.daemon.SessionShimDurabilityRefusal()
+	if retained == nil || retained.Scope != h.orgID || retained.Reason == "" {
+		t.Fatalf("retained refusal = %+v, want the scope and a reason", retained)
+	}
+
+	second := h.composedConfig(acceptingBatch)
+	second.ControllerID = "controller-second-founder"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err != nil {
+		t.Fatalf("a refused founder blocked a later healthy founder: %v", err)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the second install = %#v, want the composed attestation", got)
+	}
+	if h.daemon.SessionShimDiagnostics().DurabilityRefusal != nil {
+		t.Fatal("host status still reports a refusal the daemon has since recovered from")
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the second install never reached a projected heartbeat")
+	}
+
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err == nil {
+		t.Fatal("a second install over an accepted composition was accepted")
+	}
+}
