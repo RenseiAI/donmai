@@ -64,6 +64,11 @@
 // import) and brand-neutral.
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
+import {
+  createBashToolDefinition,
+  createEditToolDefinition,
+  createWriteToolDefinition,
+} from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
 import { fileURLToPath } from "node:url";
 import { createHash } from "node:crypto";
@@ -574,6 +579,34 @@ export default function activate(pi: ExtensionAPI) {
       // the Go side still gates on the handshake, and tool calls stay blocked
       // until verified.
     }
+  }
+
+  // Sequential shell and file-write tools. pi runs sibling tool calls from
+  // one assistant message concurrently by default; a batch of shell calls
+  // (for example git add, git status, git commit) then races. Registering
+  // an override of a built-in tool with executionMode "sequential" makes
+  // ANY batch containing that tool run one at a time, in order (verified
+  // against the pinned agent-core's executeToolCalls: a single sequential
+  // tool in the batch selects the sequential path for the whole batch).
+  // The override delegates to pi's own built-in implementation fetched
+  // through the matching create*ToolDefinition factory, so behaviour is
+  // unchanged apart from ordering; only executionMode is added. This must
+  // run in BOTH lanes (it needs no RPC round trip) and before any early
+  // return below, so interactive sessions order shell calls too.
+  // Fail-closed: a factory that throws would replace a working built-in
+  // with nothing, so any failure leaves the built-ins untouched — ordering
+  // is then best-effort, while the tool_call adjudication below still runs.
+  try {
+    const cwd = process.cwd();
+    for (const definition of [
+      createBashToolDefinition(cwd),
+      createWriteToolDefinition(cwd),
+      createEditToolDefinition(cwd),
+    ]) {
+      pi.registerTool({ ...(definition as object), executionMode: "sequential" } as never);
+    }
+  } catch {
+    // Best-effort ordering only; the policy boundary below still applies.
   }
 
   // Interactive PTY mode: no handshake, no RPC-backed blocking adjudication

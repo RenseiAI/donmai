@@ -168,6 +168,103 @@ func TestRealBinary_AdditionalExtension_ToolRegistersAndHeadlessUIRefusesPromptl
 // so a typo cannot silently desync this file from testdata/conformance-fixture.ts.
 const fixtureMarkerEnvVar = "DONMAI_FIXTURE_MARKER"
 
+// TestRealBinary_SequentialShellTools_RunInOrder proves, against the REAL
+// pinned binary, that three bash calls issued together in one assistant
+// message run in order with max concurrency 1: the policy extension
+// overrides bash with executionMode "sequential", so the agent loop takes
+// its sequential path for the whole batch. The stub answers the first turn
+// with three `sleep 1` bash calls; the test asserts on the tool_execution
+// start/end stream that the three executions are ordered and non-
+// overlapping. Removing the sequential registration turns this red: without
+// it the three calls preflight together and their executions overlap.
+func TestRealBinary_SequentialShellTools_RunInOrder(t *testing.T) {
+	realBinaryAvailable(t)
+
+	stub := newRealBinaryStub(t, realBinaryModel)
+	stub.mu.Lock()
+	stub.responses = []stubResponse{
+		{ToolCalls: []stubToolCall{
+			{ID: "call-one", Name: "bash", Arguments: `{"command":"sleep 1; echo one"}`},
+			{ID: "call-two", Name: "bash", Arguments: `{"command":"sleep 1; echo two"}`},
+			{ID: "call-three", Name: "bash", Arguments: `{"command":"sleep 1; echo three"}`},
+		}},
+		{Text: "complete"},
+	}
+	stub.mu.Unlock()
+
+	spec := realBinarySpec(t.TempDir(), "run the three requested shell calls", stub.baseURL())
+
+	p, err := New(Options{HandshakeTimeout: 30 * time.Second})
+	if err != nil {
+		t.Fatalf("New: %v", err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 90*time.Second)
+	defer cancel()
+	h, err := p.Spawn(ctx, spec)
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+
+	type bound struct {
+		id    string
+		start int
+		end   int
+	}
+	starts := map[string]int{}
+	ends := map[string]int{}
+	order := []string{}
+	seq := 0
+	for _, ev := range drainToResult(t, h, 60*time.Second) {
+		if e, ok := ev.(agent.ErrorEvent); ok {
+			t.Fatalf("session ended with an ErrorEvent instead of completing: %+v", e)
+		}
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if e.ToolName != "bash" {
+				continue
+			}
+			starts[e.ToolUseID] = seq
+			seq++
+			order = append(order, "start:"+e.ToolUseID)
+		case agent.ToolResultEvent:
+			if e.ToolName != "bash" {
+				continue
+			}
+			if e.IsError {
+				t.Fatalf("bash call %s ended as an error: %v", e.ToolUseID, e.Content)
+			}
+			ends[e.ToolUseID] = seq
+			seq++
+			order = append(order, "end:"+e.ToolUseID)
+		}
+	}
+
+	want := []string{"call-one", "call-two", "call-three"}
+	for _, id := range want {
+		if _, ok := starts[id]; !ok {
+			t.Fatalf("no tool_execution_start observed for %s (order=%v)", id, order)
+		}
+		if _, ok := ends[id]; !ok {
+			t.Fatalf("no tool_execution_end observed for %s (order=%v)", id, order)
+		}
+	}
+	// Ordered and non-overlapping: each call starts only after the previous
+	// one ended, in assistant source order.
+	var bounds []bound
+	for _, id := range want {
+		bounds = append(bounds, bound{id: id, start: starts[id], end: ends[id]})
+	}
+	for i, b := range bounds {
+		if b.start > b.end {
+			t.Fatalf("call %s ends before it starts (order=%v)", b.id, order)
+		}
+		if i > 0 && b.start < bounds[i-1].end {
+			t.Fatalf("call %s started before %s ended — executions overlap (order=%v)", b.id, bounds[i-1].id, order)
+		}
+	}
+}
+
 // TestRealBinary_WorkspaceDiscovery_StaysDisabled plants a workspace-local
 // auto-discovered extension (<cwd>/.pi/extensions/canary.ts — the exact
 // location docs/extensions.md names for project-local auto-discovery) and
