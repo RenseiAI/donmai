@@ -350,6 +350,18 @@ type Options struct {
 	// Empty uses a "rescue" directory beside the worktree parent. When the
 	// archive cannot be written the workarea is kept instead.
 	RescueDir string
+
+	// DepsExecer runs the post-acquire repository dependency install
+	// step (loop.go step 2b-bis). Nil uses the same local in-box shell
+	// executor as kit provisioning. Tests substitute a fake to assert
+	// the install command, working directory and order without
+	// running real installs.
+	DepsExecer DepsExecer
+
+	// DepsInstallTimeout bounds the whole dependency install step.
+	// Zero uses DefaultDepsInstallTimeout; negative disables the
+	// step-side timeout (the caller owns ctx expiry).
+	DepsInstallTimeout time.Duration
 }
 
 // KitDetector resolves the ordered kit manifests that apply to a worktree
@@ -369,6 +381,13 @@ type KitSkillDetector func(repoRoot, targetOS string) ([]kit.KitSkillSource, err
 // the cloned worktree path for workType-filtered injection. Implemented
 // by KitRegistry.PromptFragmentSourcesForRepo.
 type KitPromptFragmentDetector func(repoRoot, targetOS string) ([]kit.KitPromptFragmentSource, error)
+
+// DepsExecer runs repository dependency install commands against
+// the acquired worktree. It mirrors kit.Execer so the dependency
+// install step reuses the same local in-box shell execution as kit
+// provisioning. Production code leaves Options.DepsExecer nil and
+// gets shellExecer; tests substitute a fake.
+type DepsExecer = kit.Execer
 
 // Runner is the long-lived per-daemon orchestrator. Build one via
 // [New] at daemon startup and call [Runner.Run] for every claimed
@@ -416,6 +435,10 @@ type Runner struct {
 
 	// rescueDir is Options.RescueDir (see rescueRoot for the default).
 	rescueDir string
+	// depsExecer is Options.DepsExecer.
+	depsExecer DepsExecer
+	// depsInstallTimeout is Options.DepsInstallTimeout.
+	depsInstallTimeout time.Duration
 	// turnContinuationLimit is Options.TurnContinuationLimit.
 	turnContinuationLimit int
 	// turnContinuationCeiling is Options.TurnContinuationCeiling.
@@ -512,6 +535,8 @@ func New(opts Options) (*Runner, error) {
 		protectedRuntimeMCPV2Selector:    selectionPolicy.v2,
 		selectionPolicy:                  selectionPolicy,
 		rescueDir:                        opts.RescueDir,
+		depsExecer:                       opts.DepsExecer,
+		depsInstallTimeout:               opts.DepsInstallTimeout,
 		turnContinuationLimit:            opts.TurnContinuationLimit,
 		turnContinuationCeiling:          opts.TurnContinuationCeiling,
 		turnContinuationUndeliveredLimit: opts.TurnContinuationUndeliveredLimit,

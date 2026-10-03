@@ -494,6 +494,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
+	// 2b-bis. Repository dependency install. After the kit toolchain
+	// (step 2b) and before spawn: a pnpm lockfile triggers
+	// `pnpm install --prefer-offline --frozen-lockfile`, a go.mod
+	// triggers `go mod download`. Bounded by one timeout; a failure is
+	// logged and the run continues. Skipped when the kit hook already
+	// installed (node_modules/.bin present) and when the selected
+	// repository is read-only.
+	r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
+
 	// 2c. Post-clone kit skill + prompt-fragment re-detection.
 	//
 	// The daemon pre-computed KitSkillSources at runner construction time
