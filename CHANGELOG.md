@@ -10,6 +10,15 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.61 — 2026-10-03
+
+### Chores
+
+- Default unrecognised effort level to the model default on Claude seats
+- Preserve unknown top-level keys across daemon config writes
+- Point no-PR steering nudge back at task PR-body and turn-result requirements
+- Generate harness support page from live declarations
+
 ## v0.72.60 — 2026-10-02
 
 ### Fixes
