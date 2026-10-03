@@ -179,6 +179,32 @@ func TestBuildSteeringPrompt_ContainsCommands(t *testing.T) {
 	}
 }
 
+// TestBuildSteeringPrompt_PointsBackToTaskRequirements pins the nudge's
+// wording: it must ask for a PR with a real description plus the task's
+// own turn-result/handoff, and must NOT script an auto-filled body or tell
+// the agent to stop before posting that result. Reverting buildSteeringPrompt
+// to `gh pr create --fill` / "and stop" fails this test.
+func TestBuildSteeringPrompt_PointsBackToTaskRequirements(t *testing.T) {
+	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-T-1")}
+	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true})
+	lower := strings.ToLower(got)
+	if strings.Contains(got, "--fill") {
+		t.Errorf("steering prompt must not prescribe --fill\nfull:\n%s", got)
+	}
+	if strings.Contains(lower, "and stop") {
+		t.Errorf("steering prompt must not tell the agent to stop before posting the task result\nfull:\n%s", got)
+	}
+	for _, want := range []string{
+		"real description",
+		"turn-result",
+		"handoff",
+	} {
+		if !strings.Contains(lower, want) {
+			t.Errorf("steering prompt missing %q\nfull:\n%s", want, got)
+		}
+	}
+}
+
 // TestAttemptSteering_InjectStub uses the stub provider's
 // BehaviorInjectTest to confirm the runner's steering path delivers a
 // message that produces an AssistantTextEvent + ResultEvent on the
