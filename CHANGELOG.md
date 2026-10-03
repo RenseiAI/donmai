@@ -15,9 +15,14 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
   the workarea's durable declaration, and left out of the sandbox policy. A
   writable or selected repository that fails to clone still fails the
   session, and a cache seed that cannot be built falls back to unseeded
-  clones. The `DONMAI_SIBLING_REPOS` variable, which cloned extra
-  repositories next to the worktree, is removed; declare context
-  repositories instead.
+  clones (recording no seed on the workarea).
+- `DONMAI_SIBLING_REPOS` entries become read-only context leaves under the
+  session root on an executor that attests `session-root-v1` and
+  `isolated-read-only-v1`, so a failed sibling clone is skipped and recorded
+  like any context repository. Other executors keep the clone beside the
+  session worktree, now bounded by a timeout and locked across processes. A
+  work item that declares its own repositories ignores the variable, with a
+  warning.
 
 - A turn that ends on a progress note with the session's pull request still
   a draft is now continued instead of being recorded as passed; a rework run

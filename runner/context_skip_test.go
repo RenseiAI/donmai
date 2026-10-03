@@ -116,13 +116,17 @@ const (
 // started together overlap.
 func siblingCloneChild() {
 	siblingCloneHook = func() { time.Sleep(750 * time.Millisecond) }
-	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-	defer cancel()
-	if err := ensureSibling(ctx, slog.New(slog.NewTextHandler(os.Stderr, nil)), os.Getenv(siblingCloneTargetEnv), os.Getenv(siblingCloneURLEnv), ""); err != nil {
+	if err := provisionOneSibling(); err != nil {
 		fmt.Fprintln(os.Stderr, "ensureSibling:", err)
 		os.Exit(1)
 	}
 	os.Exit(0)
+}
+
+func provisionOneSibling() error {
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	return ensureSibling(ctx, slog.New(slog.NewTextHandler(os.Stderr, nil)), os.Getenv(siblingCloneTargetEnv), os.Getenv(siblingCloneURLEnv), "")
 }
 
 // TestEnsureSiblingSerializesAcrossProcesses pins the legacy placement's

@@ -225,10 +225,12 @@ func ensureSibling(ctx context.Context, logger *slog.Logger, target, url, ref st
 	}
 	defer unlock()
 
+	//nolint:gosec // G703: target = worktree parent + safeSiblingName-validated basename (no separators, no dot dirs).
 	if fi, err := os.Stat(target); err == nil {
 		if !fi.IsDir() {
 			return fmt.Errorf("target exists and is not a directory")
 		}
+		//nolint:gosec // G703: same validated target path as above.
 		if _, gerr := os.Stat(filepath.Join(target, ".git")); gerr != nil {
 			logger.Warn("sibling repo exists without .git; leaving untouched", "path", target)
 			return nil
