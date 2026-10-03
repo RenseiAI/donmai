@@ -5,6 +5,7 @@ import (
 	"strings"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/internal/providerretry"
 )
 
 // mapperState carries cross-event state for the live mapping (design §4):
@@ -300,23 +301,31 @@ func toolResultContent(f map[string]any) string {
 // provider-error observation the runner classifies. A gateway marks a
 // deterministic failure (for example a 400 for invalid parameters) with
 // isRetryable false; without it the text alone cannot tell a failure that
-// cannot succeed on retry from a transient one. The marker rides as a
-// "; isRetryable=false" suffix so older readers still see the provider's
-// own text first, and the runner strips it before recording the receipt.
+// cannot succeed on retry from a transient one. The marker rides as the
+// agent.ProviderErrorNotRetryableSuffix suffix so older readers still see the
+// provider's own text first, and the runner strips it before recording the
+// receipt. A context overflow is never marked, whatever its status or flag:
+// pi re-arms its compaction on the next user message, so the runner's retry
+// prompt is a new attempt with a smaller context
+// (providerretry.ContextOverflow).
 func providerErrorDetail(msg map[string]any, detail string) string {
+	if providerretry.ContextOverflow(detail) {
+		return detail
+	}
 	if retryable := providerErrorRetryable(msg); retryable == nil || *retryable {
 		return detail
 	}
-	return detail + "; isRetryable=false"
+	return detail + agent.ProviderErrorNotRetryableSuffix
 }
 
 // providerErrorRetryable reports the harness's own retryability verdict for
-// a failed assistant message: an explicit isRetryable flag on the message
-// or its diagnostics, else the HTTP status when the text carries one (408,
-// 409, 429 and 5xx retry; any other 4xx does not). It returns nil when the
-// message carries no verdict either way, so the runner keeps its current
-// bounded retries. Unknown shapes stay retryable: only a positive signal
-// that the request cannot succeed stops the retry.
+// a failed assistant message, read from structured fields only: an explicit
+// isRetryable flag on the message or its diagnostics, else an HTTP status
+// field (providerretry.StatusRetryable: 408, 409, 429 and 5xx retry; any
+// other 4xx does not). It returns nil when the message carries no verdict
+// either way; the runner then judges the error text by
+// providerretry.TextRetryable. Unknown shapes stay retryable: only a
+// positive signal that the request cannot succeed stops the retry.
 func providerErrorRetryable(msg map[string]any) *bool {
 	if v, ok := providerErrorFlag(msg); ok {
 		return &v
@@ -326,12 +335,12 @@ func providerErrorRetryable(msg map[string]any) *bool {
 			return &v
 		}
 		if status, ok := providerErrorStatus(d); ok {
-			retryable := providerErrorStatusRetryable(status)
+			retryable := providerretry.StatusRetryable(status)
 			return &retryable
 		}
 	}
 	if status, ok := providerErrorStatus(msg); ok {
-		retryable := providerErrorStatusRetryable(status)
+		retryable := providerretry.StatusRetryable(status)
 		return &retryable
 	}
 	return nil
@@ -393,22 +402,6 @@ func providerErrorNumber(m map[string]any, keys ...string) (int, bool) {
 		}
 	}
 	return 0, false
-}
-
-// providerErrorStatusRetryable mirrors the provider SDK retry policy: 408,
-// 409, 429 and 5xx (plus unknown/no status, handled by the caller) retry;
-// any other 4xx is deterministic and does not.
-func providerErrorStatusRetryable(status int) bool {
-	if status == 408 || status == 409 || status == 429 {
-		return true
-	}
-	if status >= 500 && status <= 599 {
-		return true
-	}
-	if status >= 400 && status <= 499 {
-		return false
-	}
-	return true
 }
 
 // raw returns the raw event bytes as a string for the agent.Event Raw field.

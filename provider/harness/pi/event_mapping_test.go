@@ -150,6 +150,31 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 			wantEvents: []agent.Event{providerError("503 Service Unavailable")},
 		},
 		{
+			name:       "a 408 diagnostic status stays retryable",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request timed out", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(408)}}}},
+			wantEvents: []agent.Event{providerError("request timed out")},
+		},
+		{
+			name:       "a 409 status stays retryable",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "conflict", "statusCode": float64(409)},
+			wantEvents: []agent.Event{providerError("conflict")},
+		},
+		{
+			name:       "a context overflow with a 400 status is not marked",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "prompt is too long: 213456 tokens > 200000 maximum", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}},
+			wantEvents: []agent.Event{providerError("prompt is too long: 213456 tokens > 200000 maximum")},
+		},
+		{
+			name:       "a context overflow flagged not retryable is not marked",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 context_length_exceeded", "error": map[string]any{"isRetryable": false}},
+			wantEvents: []agent.Event{providerError("400 context_length_exceeded")},
+		},
+		{
+			name:       "a network error with a port and no structured status is not marked",
+			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "connect ECONNREFUSED 10.0.0.12:443"},
+			wantEvents: []agent.Event{providerError("connect ECONNREFUSED 10.0.0.12:443")},
+		},
+		{
 			name:       "a clean stop is only text",
 			buffered:   "Done.",
 			message:    map[string]any{"role": "assistant", "stopReason": "stop"},

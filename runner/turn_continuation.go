@@ -102,10 +102,12 @@ const (
 	// turnProviderError: the turn ended on a retryable model provider
 	// error — the runner retries it with bounded backoff.
 	turnProviderError
-	// turnProviderErrorFatal: the turn ended on a provider error the
-	// provider marks as not retryable (or a 4xx other than 408, 409 and
-	// 429): retrying cannot succeed, so the turn ends at once with the
-	// error recorded in the receipt.
+	// turnProviderErrorFatal: the turn ended, without a verdict of its
+	// own, on a provider error a new attempt cannot fix (marked not
+	// retryable, or a 4xx other than 408, 409 and 429; see
+	// internal/providerretry). Where the runner would retry the turn, it
+	// ends it at once with the error recorded in the receipt instead; where
+	// it would not, the turn ends as it did before.
 	turnProviderErrorFatal
 )
 
@@ -119,7 +121,12 @@ const (
 // turns (QA/acceptance): a review turn that ends with no turn-result
 // manifest, no work-result marker and no review verdict stopped early and
 // gets the continuation prompt, bounded the same way as implement work.
+//
+// A turn that gave its own verdict and then ended on a provider error a new
+// attempt cannot fix is classified by that verdict: the agent reported the
+// work, and the failure after it is not a reason to fail the session.
 func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR bool, reviewWork bool) turnEnding {
+	turnVerdict := turn.verdict() != "" || (reviewWork && turn.reviewVerdict != "")
 	switch {
 	case res.FailureMode != "" || res.Status == "failed":
 		return turnFinished
@@ -129,16 +136,13 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 		return turnFinished
 	case turn.errorEvent != nil || turn.terminalEvent == nil:
 		return turnFinished
-	case turn.providerError != "":
-		if turn.providerErrorRetryable {
-			return turnProviderError
-		}
+	case turn.providerError != "" && !turn.providerErrorNotRetryable:
+		return turnProviderError
+	case turn.providerError != "" && !turnVerdict:
 		return turnProviderErrorFatal
 	case !turn.terminalSuccess:
 		return turnFinished
-	case turn.verdict() != "":
-		return turnFinished
-	case reviewWork && turn.reviewVerdict != "":
+	case turnVerdict:
 		return turnFinished
 	default:
 		return turnStoppedEarly
@@ -269,14 +273,12 @@ func (f *turnFollowUps) next(ending turnEnding, productive, continuable, canStee
 }
 
 func (f *turnFollowUps) decide(ending turnEnding, continuable, canSteer bool) tailStep {
-	if ending == turnProviderErrorFatal {
-		// A deterministic provider failure cannot succeed on retry: end
-		// the turn at once with the error recorded, without sending a
-		// retry or a pull request nudge.
-		return f.exhaust(boundProviderErrorFatal)
-	}
 	if continuable && f.limit > 0 {
 		switch ending {
+		case turnProviderErrorFatal:
+			// A retry cannot fix it: end the turn at once with the error
+			// recorded, sending neither a retry nor the pull request nudge.
+			return f.exhaust(boundProviderErrorFatal)
 		case turnProviderError:
 			if f.retried >= f.limit {
 				return f.exhaust(boundRetries)
