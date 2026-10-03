@@ -934,6 +934,107 @@ func TestRun_DraftStateUnknownWhenGhFailsKeepsTheSession(t *testing.T) {
 	}
 }
 
+// TestRun_SessionVerdictEndsThePullRequestReRead pins that a verdict the
+// agent gave in an earlier turn stands: a later turn without a marker — a
+// memory inject or the pull request nudge — does not make the session's pull
+// request the only result, so an intentional draft or a rework that needed no
+// change completes as it did before the draft check, without a continuation.
+func TestRun_SessionVerdictEndsThePullRequestReRead(t *testing.T) {
+	note := verdictScriptTurn{text: "Noted; nothing else to do."}
+	// Enough unmarked turns for a re-read to run the continuations out.
+	notes := slices.Repeat([]verdictScriptTurn{note}, DefaultTurnContinuationLimit+1)
+	cases := []struct {
+		name         string
+		ref          string
+		inject       string
+		draft        bool
+		first        []verdictScriptTurn
+		wantSteering bool
+	}{
+		{
+			name:   "rework that needed no change, then a memory inject",
+			ref:    reworkBranch,
+			inject: "recall: this area was reworked last week",
+			first:  []verdictScriptTurn{{text: "No change is needed: " + followUpPR + " already addresses the review.\nWORK_RESULT: passed"}},
+		},
+		{
+			name:   "intentional draft with a verdict, then a memory inject",
+			inject: "recall: design reviews happen on draft pull requests",
+			draft:  true,
+			first:  []verdictScriptTurn{{text: "Opened draft " + followUpPR + "; the task asks for it to stay a draft until the design review.\nWORK_RESULT: passed"}},
+		},
+		{
+			name: "rework verdict, then the pull request nudge",
+			ref:  reworkBranch,
+			first: []verdictScriptTurn{
+				{text: "The review comments are already addressed on the branch.\nWORK_RESULT: passed"},
+				{text: "The pull request is " + followUpPR + "."},
+			},
+			wantSteering: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			draft := &scriptedDraft{states: []bool{tc.draft}}
+			res, provider := runScriptedSession(t, scriptedSession{
+				workType:   "development",
+				repository: followUpRepository,
+				pulls:      map[int]string{7: pullAtSessionCommit},
+				ref:        tc.ref,
+				inject:     tc.inject,
+				draft:      draft.lookup,
+				turns:      append(slices.Clone(tc.first), notes...),
+			})
+			if res.Status != "completed" || res.PullRequestURL != followUpPR || res.WorkResult != "passed" {
+				t.Fatalf("Status=%q PullRequestURL=%q WorkResult=%q (%s: %s); want completed and passed with %s",
+					res.Status, res.PullRequestURL, res.WorkResult, res.FailureMode, res.Error, followUpPR)
+			}
+			if res.SteeringTriggered != tc.wantSteering {
+				t.Errorf("SteeringTriggered = %v; want %v", res.SteeringTriggered, tc.wantSteering)
+			}
+			for _, prompt := range provider.prompts {
+				if prompt == continueDraftPrompt || prompt == continueNoNewCommitPrompt || prompt == continuePrompt {
+					t.Errorf("sent the continuation %q after the session gave a verdict", prompt)
+				}
+			}
+			wantContinuations(t, res, 0, 0, false)
+			if got := draft.reads(); len(got) != 0 {
+				t.Errorf("draft reads = %q; want none after a verdict", got)
+			}
+		})
+	}
+}
+
+// TestRun_IntentionalDraftVerdictAfterTheDraftPromptCompletes pins the way
+// out the draft prompt offers: a task that deliberately keeps its pull
+// request a draft says so and reports its turn result, and the session
+// completes instead of being continued to its bound.
+func TestRun_IntentionalDraftVerdictAfterTheDraftPromptCompletes(t *testing.T) {
+	for _, want := range []string{"deliberately needs the pull request to stay a draft", "report your turn result (WORK_RESULT)"} {
+		if !strings.Contains(continueDraftPrompt, want) {
+			t.Fatalf("continueDraftPrompt does not offer the intentional-draft way out (%q):\n%s", want, continueDraftPrompt)
+		}
+	}
+	draft := &scriptedDraft{states: []bool{true}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		draft:      draft.lookup,
+		turns: []verdictScriptTurn{
+			{text: "Opened draft " + followUpPR + "; writing the design notes next."},
+			{text: "The task asks for " + followUpPR + " to stay a draft until the design review.\nWORK_RESULT: passed"},
+			{text: "never reached"},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR || res.WorkResult != "passed" {
+		t.Fatalf("Status=%q PullRequestURL=%q WorkResult=%q (%s: %s); want completed and passed with %s",
+			res.Status, res.PullRequestURL, res.WorkResult, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts, continueDraftPrompt)
+	wantContinuations(t, res, 1, 0, false)
+}
+
 // TestPullRequestIsTheOnlyResult pins when the session's pull request is
 // re-read: only when, without it, the turn would have stopped early.
 func TestPullRequestIsTheOnlyResult(t *testing.T) {
@@ -960,6 +1061,8 @@ func TestPullRequestIsTheOnlyResult(t *testing.T) {
 		{name: "another own-repository pull request reported", res: withPR(nil), turn: clean, reportedPR: true},
 		{name: "provider error", res: withPR(nil), turn: func() streamObservation { o := clean; o.providerError = "503"; return o }()},
 		{name: "runner-recorded failure", res: withPR(func(r *Result) { r.FailureMode = FailureProviderError }), turn: clean},
+		{name: "verdict from an earlier turn", res: withPR(func(r *Result) { r.WorkResult = "passed" }), turn: clean},
+		{name: "unknown verdict from an earlier turn", res: withPR(func(r *Result) { r.WorkResult = "unknown" }), turn: clean},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {

@@ -34,7 +34,8 @@ import (
 // A verified pull request that does not deliver the work — still a draft,
 // or, on a rework run, without a commit since the run started (see
 // sessionPullRequestVerifier.undelivered) — does not count as the turn's
-// result. When it is all the turn left, the turn stopped early and gets a
+// result. When it is all the turn left, and no turn of the session gave a
+// verdict, the turn stopped early and gets a
 // continuation prompt that names the reason, under the same bounds. A
 // session still in that state when its continuations run out, or that
 // cannot be continued at all, ends not delivered: failed, with the reason
@@ -138,9 +139,14 @@ func classifyTurnEnding(res *Result, session, turn streamObservation, reportedPR
 // pullRequestIsTheOnlyResult reports whether the session's verified pull
 // request is all that finished the latest turn: without it the turn would
 // have stopped early. Only then is the pull request re-read to see whether
-// it delivers the work.
+// it delivers the work. A verdict the session recorded in any turn (a
+// WORK_RESULT marker or a turn-result manifest, on res.WorkResult) is the
+// agent's explicit word on the work, so a later turn without one — a memory
+// inject or the pull request nudge — never makes the pull request the only
+// result: an intentional draft, or a rework that needed no change, is not
+// second-guessed.
 func pullRequestIsTheOnlyResult(res *Result, session, turn streamObservation, reportedPR, reviewWork bool) bool {
-	if res.PullRequestURL == "" {
+	if res.PullRequestURL == "" || res.WorkResult != "" {
 		return false
 	}
 	withoutPR := *res
@@ -339,6 +345,7 @@ const continuePrompt = "Your previous turn ended before the task was finished: i
 const continueDraftPrompt = "Your previous turn ended before the task was finished: your pull request is still a draft, " +
 	"and the turn left no turn result and no blocked or failed verdict. Continue the task from where you stopped. " +
 	"When the work is done, commit it, push the branch, mark the pull request ready for review and report the result. " +
+	"If the task deliberately needs the pull request to stay a draft, say so and report your turn result (WORK_RESULT). " +
 	"If you cannot go on, end with an explicit blocked verdict and the reason."
 
 // continueNoNewCommitPrompt is the continuation prompt after a turn of a

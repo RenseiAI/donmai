@@ -34,8 +34,9 @@ import (
 // the work. Run briefs ask for a draft pull request early, so the work
 // survives a cut-off run; and a rework run continues a pull request that
 // existed before the run started. So when the session's pull request is the
-// only result a turn left (no turn-result manifest, no verdict), the runner
-// re-reads it at the turn boundary (see undelivered):
+// only result a turn left (no turn-result manifest, and no verdict in this or
+// any earlier turn), the runner re-reads it at the turn boundary (see
+// undelivered):
 //
 //   - a rework run's pull request must have gained a commit since the run
 //     started: its head now (refs/pull/<n>/head, from the same `git
