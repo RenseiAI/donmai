@@ -521,7 +521,8 @@ func provisionResultForSession(record workarea.AcquisitionRecord, declaration wo
 	return ProvisionResult{
 		Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
 		AcquisitionID: record.AcquisitionID, Mode: mode, OwnerSessionID: record.SessionID,
-		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone,
+		CacheSeedID: record.CacheSeedID, Repositories: paths, SkippedRepositories: declaration.SkippedRepositoryNames(),
+		Strategy: StrategyClone,
 	}, nil
 }
 
@@ -955,6 +956,7 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 	}
 	var record workarea.AcquisitionRecord
 	var paths map[string]string
+	var skipped []string
 	selectedPath := ""
 	if err := acquisitions.WithRootTransaction(ctx, spec.ParentWorkareaID, func() error {
 		var err error
@@ -994,6 +996,7 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 			return err
 		}
 		paths = declarationRepositoryPaths(record.FinalRoot, declaration)
+		skipped = declaration.SkippedRepositoryNames()
 		selectedPath = paths[selected.Name]
 		if selectedPath == "" {
 			return errors.New("runtime/worktree: shared selection did not resolve inside parent root")
@@ -1006,7 +1009,7 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 	m.sessions[spec.SessionID] = &ProvisionResult{
 		Path: selectedPath, WorkareaRoot: record.FinalRoot, WorkareaID: record.WorkareaID,
 		AcquisitionID: record.AcquisitionID, Mode: ModeShared, OwnerSessionID: record.SessionID,
-		CacheSeedID: record.CacheSeedID, Repositories: paths, Strategy: StrategyClone, Attempts: 1,
+		CacheSeedID: record.CacheSeedID, Repositories: paths, SkippedRepositories: skipped, Strategy: StrategyClone, Attempts: 1,
 	}
 	m.mu.Unlock()
 	m.excludeHarnessState(selectedPath, StrategyClone)
@@ -1014,38 +1017,53 @@ func (m *Manager) provisionShared(ctx context.Context, spec ProvisionSpec) (stri
 	return selectedPath, nil
 }
 
+// declarationMatchesNormalized proves a durable record describes exactly the
+// bound declaration: every declared repository is either carried by the
+// record with the same projection, or recorded in its skipped set with the
+// same projection (a read-only context repository whose clone failed at
+// provisioning). Nothing else may be missing, and nothing may be extra: a root
+// that never had a repository, or one whose skipped entry describes some
+// other repository, does not match.
 func declarationMatchesNormalized(record workarea.DeclarationRecord, normalized workarea.NormalizedDeclaration) error {
-	if record.Protocol != normalized.Protocol || len(record.Repositories) > len(normalized.Repositories) {
-		return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+	mismatch := errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+	if record.Protocol != normalized.Protocol || len(record.Repositories)+len(record.SkippedRepositories) != len(normalized.Repositories) {
+		return mismatch
 	}
 	byName := make(map[string]workarea.NormalizedRepository, len(normalized.Repositories))
 	for _, repository := range normalized.Repositories {
 		byName[repository.Name] = repository
 	}
-	seen := make(map[string]struct{}, len(record.Repositories))
-	for _, repository := range record.Repositories {
-		bound, ok := byName[repository.Name]
-		sourceDigest, err := workarea.RepositorySourceDigest(bound.Source.Repository)
-		if !ok || err != nil || bound.Leaf != repository.Leaf || bound.Role != repository.Role || bound.Authority != repository.Authority || bound.Source.Ref != repository.RequestedRef || sourceDigest != repository.SourceDigest || !slices.Equal(bound.Source.Paths, repository.SparsePaths) {
-			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+	accounted := make(map[string]struct{}, len(normalized.Repositories))
+	account := func(recorded workarea.DeclarationRepositoryRecord) bool {
+		bound, ok := byName[recorded.Name]
+		if !ok || !declarationRepositoryMatches(bound, recorded) {
+			return false
 		}
-		seen[repository.Name] = struct{}{}
+		if _, twice := accounted[recorded.Name]; twice {
+			return false
+		}
+		accounted[recorded.Name] = struct{}{}
+		return true
 	}
-	// A record that is a strict subset of the bound declaration is only
-	// valid when every omitted repository is skippable: a failed
-	// read-only context clone that warned and continued at provision
-	// time. Re-entry into a root whose skipped set is unknown (for
-	// example a generation provisioned before skip-tracking existed)
-	// stays exact: it must carry the full declaration.
-	for _, repository := range normalized.Repositories {
-		if _, present := seen[repository.Name]; present {
-			continue
+	for _, repository := range record.Repositories {
+		if !account(repository) {
+			return mismatch
 		}
-		if repository.Role != workarea.RepositoryRoleContext || repository.Authority != workarea.RepositoryReadOnly {
-			return errors.New("runtime/worktree: shared parent declaration does not match the bound carrier")
+	}
+	for _, repository := range record.SkippedRepositories {
+		if repository.Role != workarea.RepositoryRoleContext || repository.Authority != workarea.RepositoryReadOnly || !account(repository) {
+			return mismatch
 		}
 	}
 	return nil
+}
+
+// declarationRepositoryMatches reports whether a recorded repository is the
+// secret-free projection of the bound one.
+func declarationRepositoryMatches(bound workarea.NormalizedRepository, recorded workarea.DeclarationRepositoryRecord) bool {
+	sourceDigest, err := workarea.RepositorySourceDigest(bound.Source.Repository)
+	return err == nil && bound.Leaf == recorded.Leaf && bound.Role == recorded.Role && bound.Authority == recorded.Authority &&
+		bound.Source.Ref == recorded.RequestedRef && sourceDigest == recorded.SourceDigest && slices.Equal(bound.Source.Paths, recorded.SparsePaths)
 }
 
 func repositoryFiltersEqual(left, right *workarea.RepositoryFilter) bool {
@@ -1745,6 +1763,7 @@ func (m *Manager) provisionLayoutOnce(
 		recordDeclaration.Repositories = kept
 	}
 	record := workarea.NewDeclarationRecord(spec.SessionID, workareaID, recordDeclaration, resolvedRefs, claim.Record.AcquisitionID)
+	record.SkippedRepositories = workarea.SkippedRepositoryRecords(*declaration, skipped)
 	if err := workarea.WriteDeclaration(ctx, claim.StagingRoot, record); err != nil {
 		return nil, nil, workarea.AcquisitionRecord{}, err
 	}

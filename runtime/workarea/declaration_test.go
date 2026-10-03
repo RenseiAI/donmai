@@ -395,3 +395,64 @@ func TestDiscoverLayoutDoesNotFollowUserControlledSymlinks(t *testing.T) {
 		t.Fatal("nested discovery accepted a symlinked declared repository")
 	}
 }
+
+// TestDeclarationRecordSkippedRepositories pins the durable skipped set: a
+// skipped read-only context repository round-trips through the closed
+// record, secret-free, and the record refuses a skipped entry that is not a
+// read-only context repository, is the selected one, or is also carried.
+func TestDeclarationRecordSkippedRepositories(t *testing.T) {
+	normalized, err := testDeclaration().Normalize()
+	if err != nil {
+		t.Fatal(err)
+	}
+	kept := normalized
+	kept.Repositories = normalized.Repositories[:1]
+	record := NewDeclarationRecord("session", "wa_fixture", kept, map[string]string{"primary": "abc123"})
+	record.SkippedRepositories = SkippedRepositoryRecords(normalized, []string{"corpus", "not-declared"})
+	if got := record.SkippedRepositoryNames(); len(got) != 1 || got[0] != "corpus" {
+		t.Fatalf("SkippedRepositoryNames = %v; want [corpus]", got)
+	}
+	root := RootPath(filepath.Join(t.TempDir(), "session"))
+	if err := os.MkdirAll(root.String(), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	if err := WriteDeclaration(context.Background(), root, record); err != nil {
+		t.Fatalf("WriteDeclaration: %v", err)
+	}
+	body, err := os.ReadFile(DeclarationPath(root))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(string(body), "fixture-secret") || strings.Contains(string(body), "example.test") {
+		t.Fatalf("skipped entry leaked source material: %s", body)
+	}
+	loaded, err := ReadDeclaration(root)
+	if err != nil {
+		t.Fatalf("ReadDeclaration: %v", err)
+	}
+	if got := loaded.SkippedRepositoryNames(); len(got) != 1 || got[0] != "corpus" {
+		t.Fatalf("loaded skipped = %v; want [corpus]", got)
+	}
+
+	invalid := map[string]func(*DeclarationRecord){
+		"a mutable repository": func(r *DeclarationRecord) { r.SkippedRepositories[0].Authority = RepositoryMutable },
+		"a non-context role":   func(r *DeclarationRecord) { r.SkippedRepositories[0].Role = RepositoryRoleSecondary },
+		"the selected repository": func(r *DeclarationRecord) {
+			r.SkippedRepositories[0].Name, r.SkippedRepositories[0].Leaf = "primary", "primary"
+		},
+		"the same repository twice": func(r *DeclarationRecord) {
+			r.SkippedRepositories = append(r.SkippedRepositories, r.SkippedRepositories[0])
+		},
+		"a missing source digest": func(r *DeclarationRecord) { r.SkippedRepositories[0].SourceDigest = "" },
+	}
+	for name, mutate := range invalid {
+		t.Run(name, func(t *testing.T) {
+			bad := record
+			bad.SkippedRepositories = append([]DeclarationRepositoryRecord(nil), record.SkippedRepositories...)
+			mutate(&bad)
+			if err := bad.Validate(); err == nil {
+				t.Fatalf("Validate accepted a record that skips %s", name)
+			}
+		})
+	}
+}
