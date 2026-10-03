@@ -624,18 +624,34 @@ func donmaiSpanTracingEnabled() bool {
 	return v == "1" || strings.EqualFold(v, "true")
 }
 
-// postSessionRunning fires an eager, best-effort POST
+// postSessionRunningMaxAttempts bounds the eager running-post retry loop so a
+// slow or loaded host gets a few chances without delaying the run
+// indefinitely. Three attempts cover the "fails twice then returns 200"
+// case in the done-when criteria with minimal pre-spawn latency.
+const postSessionRunningMaxAttempts = 3
+
+// postSessionRunningRetryDelay is the backoff between running-post attempts,
+// indexed by the attempt that just failed (1-based). A var so tests can
+// shrink it to zero without waiting out real backoff.
+var postSessionRunningRetryDelay = func(failedAttempt int) time.Duration {
+	return time.Duration(200*(1<<(failedAttempt-1))) * time.Millisecond
+}
+
+// postSessionRunning fires an eager POST
 // /api/sessions/<id>/status with {"status":"running","workerId":"..."}
 // against the PLATFORM (not the local daemon) before the runner spawns the
 // provider. It mirrors the wire shape of runtime/activity's maybePostRunning
 // so the two are interchangeable and idempotent: the platform treats a
 // repeated running transition as a no-op.
 //
-// All failures are logged at debug and discarded — the running nudge is
+// The post is retried with backoff up to postSessionRunningMaxAttempts on
+// transient failures (transport errors and 5xx); 4xx responses are permanent
+// and fail fast. Every failure path is best-effort — the running nudge is
 // pure observability + it unblocks the platform-side lock re-acquire path
 // (which only passes once the session is 'running'); it must never fail the
-// worker. A no-op when platformURL is empty (standalone / no-platform mode,
-// where there is no platform status endpoint to hit).
+// worker. The final failure logs at warn so a lost nudge is visible; earlier
+// attempts log at debug. A no-op when platformURL is empty (standalone /
+// no-platform mode, where there is no platform status endpoint to hit).
 func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.Logger, platformURL, sessionID, workerID, authToken string) {
 	platformURL = strings.TrimSpace(platformURL)
 	if platformURL == "" {
@@ -656,27 +672,75 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 		return
 	}
 	url := strings.TrimRight(platformURL, "/") + "/api/sessions/" + sessionID + "/status"
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body)) //nolint:gosec // G704: platformURL is the operator-configured platform base URL (trusted daemon/session config, not request-derived input)
-	if err != nil {
-		logger.Debug("agent run: status=running new request failed", "sessionId", sessionID, "err", err)
-		return
+	for attempt := 1; attempt <= postSessionRunningMaxAttempts; attempt++ {
+		last := attempt == postSessionRunningMaxAttempts
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body)) //nolint:gosec // G704: platformURL is the operator-configured platform base URL (trusted daemon/session config, not request-derived input)
+		if err != nil {
+			if last {
+				logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "err", err)
+			} else {
+				logger.Debug("agent run: status=running new request failed", "sessionId", sessionID, "attempt", attempt, "err", err)
+			}
+			if !last && !sleepForRunningRetry(ctx, attempt) {
+				return
+			}
+			continue
+		}
+		req.Header.Set("Content-Type", "application/json")
+		if authToken != "" {
+			req.Header.Set("Authorization", "Bearer "+authToken)
+		}
+		resp, err := client.Do(req) //nolint:gosec // G704: same trusted operator-configured URL as above
+		if err != nil {
+			if last {
+				logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "err", err)
+			} else {
+				logger.Debug("agent run: status=running post failed", "sessionId", sessionID, "attempt", attempt, "err", err)
+			}
+			if !last && !sleepForRunningRetry(ctx, attempt) {
+				return
+			}
+			continue
+		}
+		_, _ = io.Copy(io.Discard, resp.Body)
+		_ = resp.Body.Close()
+		if resp.StatusCode >= 200 && resp.StatusCode < 300 {
+			logger.Info("agent run: session flipped to running (pre-spawn)",
+				"sessionId", sessionID, "workerId", workerID)
+			return
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
+			logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
+			return
+		}
+		if last {
+			logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
+			return
+		}
+		logger.Debug("agent run: status=running non-2xx", "sessionId", sessionID, "attempt", attempt, "status", resp.StatusCode)
+		if !sleepForRunningRetry(ctx, attempt) {
+			return
+		}
 	}
-	req.Header.Set("Content-Type", "application/json")
-	if authToken != "" {
-		req.Header.Set("Authorization", "Bearer "+authToken)
+}
+
+// sleepForRunningRetry waits out the backoff after a failed running-post
+// attempt. It reports false when the context expired first, in which case
+// the caller gives up without logging a retry-exhausted warning — the run
+// is already shutting down.
+func sleepForRunningRetry(ctx context.Context, failedAttempt int) bool {
+	delay := postSessionRunningRetryDelay(failedAttempt)
+	if delay <= 0 {
+		return ctx.Err() == nil
 	}
-	resp, err := client.Do(req) //nolint:gosec // G704: same trusted operator-configured URL as above
-	if err != nil {
-		logger.Debug("agent run: status=running post failed", "sessionId", sessionID, "err", err)
-		return
+	t := time.NewTimer(delay)
+	defer t.Stop()
+	select {
+	case <-ctx.Done():
+		return false
+	case <-t.C:
+		return true
 	}
-	defer func() { _, _ = io.Copy(io.Discard, resp.Body); _ = resp.Body.Close() }()
-	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		logger.Debug("agent run: status=running non-2xx", "sessionId", sessionID, "status", resp.StatusCode)
-		return
-	}
-	logger.Info("agent run: session flipped to running (pre-spawn)",
-		"sessionId", sessionID, "workerId", workerID)
 }
 
 // fetchSessionDetail retrieves the per-session payload from the
