@@ -299,6 +299,7 @@ func (c *Confiner) selfTestMode(ctx context.Context, mode agent.PromptSessionMod
 // whether it got through, so only their observed effect counts.
 var toolOps = map[stepOp]bool{
 	opReenter: true, opJobSubmit: true, opAppOpen: true, opLookup: true, opAttach: true, opMount: true,
+	opPrefWrite: true,
 }
 
 func describeResult(result stepResult) string {

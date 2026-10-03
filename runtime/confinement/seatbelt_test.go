@@ -104,7 +104,7 @@ func TestRenderSeatbelt_ClosesTheWriteProxies(t *testing.T) {
 	text := mustRender(t, sampleResolved(), nil)
 	for _, rule := range []string{
 		"(deny file-mount)", "(deny file-unmount)", "(deny job-creation)", "(deny lsopen)",
-		"(deny appleevent-send)", "(deny mach-priv-task-port)", "(deny mach-task-read)",
+		"(deny appleevent-send)", "(deny user-preference-write)", "(deny mach-priv-task-port)", "(deny mach-task-read)",
 		"(deny mach-task-inspect)", "(deny mach-task-name)", "(deny network-outbound (remote unix-socket))",
 	} {
 		if !strings.Contains(text, rule) {

@@ -55,6 +55,7 @@ const (
 	opLookup       stepOp = "lookup"
 	opAttach       stepOp = "attach"
 	opMount        stepOp = "mount"
+	opPrefWrite    stepOp = "preference_write"
 )
 
 type probeStep struct {
@@ -172,6 +173,8 @@ func runStep(step probeStep) stepResult {
 		result.Lookups = parseLookups(result.Output)
 	case opAttach:
 		result.Exit, result.Output, err = runTool("/usr/bin/vmmap", "--summary", strconv.Itoa(step.PID))
+	case opPrefWrite:
+		result.Exit, result.Output, err = runTool("/usr/bin/defaults", "write", step.Label, "probe", "1")
 	case opMount:
 		result.Exit, result.Output, err = runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", step.Path, step.Path2)
 	default:

@@ -66,7 +66,8 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 //     its metadata, and pin every ancestor between a writable root and a
 //     nested denied path against rename — after the allows, so they win;
 //  5. close the write proxies: mounting, job submission, launch services,
-//     scripting events, task ports and local sockets outside the set (D2.5);
+//     scripting events, preference writes, task ports and local sockets
+//     outside the set (D2.5);
 //  6. the composer's deny-only rules, last, so they always win (D4.3).
 func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(string) (string, error)) (string, error) {
 	var b strings.Builder
@@ -158,6 +159,9 @@ func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(s
 	b.WriteString("(deny job-creation)\n")
 	b.WriteString("(deny lsopen)\n")
 	b.WriteString("(deny appleevent-send)\n")
+	// The preferences daemon writes a domain's file on the caller's behalf,
+	// outside any path rule.
+	b.WriteString("(deny user-preference-write)\n")
 	var lookups []string
 	for _, class := range seatbeltLookupDenies {
 		for _, service := range class.services {

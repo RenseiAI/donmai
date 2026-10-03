@@ -8,6 +8,7 @@ import (
 	"net"
 	"os"
 	"os/exec"
+	"os/user"
 	"path/filepath"
 	"runtime"
 	"strings"
@@ -176,7 +177,7 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	// Renames that move a whole leaf or an ancestor of a protected path run
 	// last, and settle undoes any that got through before anything is
 	// judged, so they cannot move paths the other probes are judged in.
-	fx.moveProbe(classProtected, "protected.rename_ancestor", fx.ext, filepath.Join(fx.state, "ext-moved"))
+	fx.moveProbe(classProtected, "protected.rename", fx.ext, filepath.Join(fx.state, "ext-moved"))
 	fx.moveProbe(classProtected, "protected.rename_state", fx.state, filepath.Join(fx.mut, ".h-moved"))
 	fx.moveProbe(classProtected, "protected.rename_leaf_into_tmp", fx.mut, filepath.Join(fx.tmp, "mut-moved"))
 	fx.moveProbe(classReadOnly, "ro.rename_leaf", fx.ro, filepath.Join(fx.tmp, "ro-moved"))
@@ -363,8 +364,9 @@ func (fx *fixture) protected() error {
 
 // widening adds the probes that try to leave or replace the boundary:
 // re-entering the backend, submitting a job to the per-user job launcher,
-// opening an application, reaching the scripting, launch and mount services,
-// attaching to a process outside, and connecting to a socket outside.
+// having the preferences daemon write a domain, opening an application,
+// reaching the scripting, launch and mount services, attaching to a process
+// outside, and connecting to a socket outside.
 func (fx *fixture) widening(shared []string) error {
 	reenter := filepath.Join(fx.out, "reenter")
 	fx.add(classWidening, false, probeStep{ID: "widen.reenter_backend", Op: opReenter, Path: reenter}, existsEffect(reenter))
@@ -374,6 +376,13 @@ func (fx *fixture) widening(shared []string) error {
 	fx.cleanups = append(fx.cleanups, func() { _ = exec.Command("/bin/launchctl", "remove", label).Run() }) //nolint:gosec // G204: fixed tool, generated label.
 	fx.add(classWidening, false, probeStep{ID: "widen.job_launcher", Op: opJobSubmit, Label: label, Path: job},
 		func(res stepResult) bool { return res.Exit == 0 || waitExists(job) })
+
+	domain := "dev.donmai.confinement.selftest." + fx.tag
+	fx.cleanups = append(fx.cleanups, func() { removePreferenceDomain(domain) })
+	fx.add(classWidening, false, probeStep{ID: "widen.preferences_write", Op: opPrefWrite, Label: domain},
+		func(res stepResult) bool {
+			return res.Exit == 0 || exec.Command("/usr/bin/defaults", "read", domain, "probe").Run() == nil //nolint:gosec // G204: fixed tool, generated domain.
+		})
 
 	app := filepath.Join(fx.out, "app")
 	bundle, err := writeProbeApp(filepath.Join(fx.dir, "app"), app)
@@ -429,6 +438,16 @@ func (fx *fixture) cleanup() {
 		fx.cleanups[i]()
 	}
 	fx.cleanups = nil
+}
+
+// removePreferenceDomain deletes a probe preference domain the preferences
+// daemon wrote, and its file in the user's real home, which is the daemon's
+// and not this process's HOME.
+func removePreferenceDomain(domain string) {
+	_ = exec.Command("/usr/bin/defaults", "delete", domain).Run() //nolint:gosec // G204: fixed tool, generated domain.
+	if account, err := user.Current(); err == nil && account.HomeDir != "" {
+		_ = os.Remove(filepath.Join(account.HomeDir, "Library", "Preferences", domain+".plist"))
+	}
 }
 
 // writeProbeApp writes a background-only application bundle whose only act
