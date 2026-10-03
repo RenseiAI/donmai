@@ -1128,3 +1128,83 @@ func TestWriteConfig_ZeroSessionLimitRoundTrip(t *testing.T) {
 		t.Fatalf("round trip limit = %d, want 0", loaded.Capacity.MaxConcurrentSessions)
 	}
 }
+
+// TestWriteConfig_PreservesUnknownTopLevelKeys asserts the writer keeps
+// top-level keys the Config struct does not declare: a fixture carrying
+// an extra key survives a LoadConfig -> WriteConfig cycle verbatim in
+// the re-read raw bytes, alongside the declared fields.
+func TestWriteConfig_PreservesUnknownTopLevelKeys(t *testing.T) {
+	dir := t.TempDir()
+	src := filepath.Join(dir, "daemon.yaml")
+	body := []byte(`apiVersion: donmai.dev/v1
+kind: LocalDaemon
+machine:
+  id: test-machine
+capacity:
+  maxConcurrentSessions: 1
+  maxVCpuPerSession: 1
+  maxMemoryMbPerSession: 1024
+  reservedForSystem:
+    vCpu: 1
+    memoryMb: 1024
+orchestrator:
+  url: https://platform.example.com
+autoUpdate:
+  channel: stable
+  schedule: nightly
+  drainTimeoutSeconds: 600
+extraEmbeddingKey:
+  nested: preserved-value
+  count: 3
+`)
+	if err := os.WriteFile(src, body, 0o600); err != nil {
+		t.Fatalf("write fixture: %v", err)
+	}
+	cfg, err := LoadConfig(src)
+	if err != nil {
+		t.Fatalf("LoadConfig: %v", err)
+	}
+	dst := filepath.Join(dir, "rewritten.yaml")
+	if err := WriteConfig(dst, cfg); err != nil {
+		t.Fatalf("WriteConfig: %v", err)
+	}
+	raw, err := os.ReadFile(dst)
+	if err != nil {
+		t.Fatalf("read rewritten: %v", err)
+	}
+	var fields map[string]any
+	if err := yaml.Unmarshal(raw, &fields); err != nil {
+		t.Fatalf("decode rewritten YAML: %v", err)
+	}
+	extra, ok := fields["extraEmbeddingKey"].(map[string]any)
+	if !ok {
+		t.Fatalf("rewritten YAML dropped unknown key: %s", raw)
+	}
+	if extra["nested"] != "preserved-value" || extra["count"] != 3 {
+		t.Fatalf("unknown key value changed: %v", extra)
+	}
+	if cfg.Machine.ID != "test-machine" {
+		t.Fatalf("Machine.ID = %q, want test-machine", cfg.Machine.ID)
+	}
+	// A declared field set through Config wins over a stale raw copy of
+	// that same key: smuggle one in, then confirm the live value is
+	// what the writer emits.
+	cfg.unknownFields["machine"] = &yaml.Node{Kind: yaml.MappingNode, Tag: "!!map"}
+	cfg.Machine.ID = "updated-machine"
+	overridePath := filepath.Join(dir, "overridden.yaml")
+	if err := WriteConfig(overridePath, cfg); err != nil {
+		t.Fatalf("WriteConfig with stale raw key: %v", err)
+	}
+	overrideRaw, err := os.ReadFile(overridePath)
+	if err != nil {
+		t.Fatalf("read overridden: %v", err)
+	}
+	var overrideFields map[string]any
+	if err := yaml.Unmarshal(overrideRaw, &overrideFields); err != nil {
+		t.Fatalf("decode overridden YAML: %v", err)
+	}
+	machine, ok := overrideFields["machine"].(map[string]any)
+	if !ok || machine["id"] != "updated-machine" {
+		t.Fatalf("declared field lost to stale raw copy: %s", overrideRaw)
+	}
+}
