@@ -1478,6 +1478,9 @@ tailRecovery:
 			followUps.retried++
 		} else {
 			followUps.continued++
+			if followUps.undelivered != "" {
+				followUps.undeliveredSent++
+			}
 		}
 		tail, tailErr := r.consumeEvents(streamCtx, handle, runnerStatePath, qw, res, enforcer, sink, traceProcessor)
 		stopped, budget, stopErr := r.classifyStreamStop(qw, res, handle, enforcer, pulser, lostOwnership, tail, tailErr)

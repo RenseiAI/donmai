@@ -65,6 +65,15 @@ const maxPullRequestCandidates = 8
 // returns the commit of each named ref that exists there.
 type pullRequestRefLookup func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error)
 
+// pullRequestHeadLookup reads the checkout's local HEAD commit.
+type pullRequestHeadLookup func(ctx context.Context, worktreePath string) (string, error)
+
+// localHeadSHA is the production local-HEAD read: the checkout's own HEAD
+// commit via captureHeadSHA.
+func localHeadSHA(ctx context.Context, worktreePath string) (string, error) {
+	return captureHeadSHA(ctx, worktreePath)
+}
+
 // pullRequestDraftLookup reports whether the pull request at url is a draft.
 type pullRequestDraftLookup func(ctx context.Context, worktreePath, url string) (bool, error)
 
@@ -144,6 +153,7 @@ type sessionPullRequestVerifier struct {
 	worktreePath string
 	lookup       pullRequestRefLookup
 	draftLookup  pullRequestDraftLookup
+	headLookup   pullRequestHeadLookup
 	// startHead is, for a rework run that continues an existing pull
 	// request, that pull request's head when the run started, recorded
 	// before the agent's first turn (see reworkStartHead); "" for a session
@@ -166,13 +176,17 @@ func (r *Runner) newSessionPullRequestVerifier(ctx context.Context, qw QueuedWor
 	v := &sessionPullRequestVerifier{
 		branch: branch, worktreePath: worktreePath, startHead: startHead,
 		lookup: r.pullRequestLookup, draftLookup: r.pullRequestDraftLookup,
-		outcomes: map[string]candidateOutcome{},
+		headLookup: r.pullRequestHeadLookup,
+		outcomes:   map[string]candidateOutcome{},
 	}
 	if v.lookup == nil {
 		v.lookup = originRefs
 	}
 	if v.draftLookup == nil {
 		v.draftLookup = githubPullRequestDraft
+	}
+	if v.headLookup == nil {
+		v.headLookup = localHeadSHA
 	}
 	switch {
 	case repositoryFree:
@@ -371,11 +385,14 @@ const (
 
 // undelivered re-reads the accepted pull request and reports why it does
 // not deliver the work: undeliveredNoNewCommit when this is a rework run and
-// the pull request's head is still the head it had at run start,
-// undeliveredDraft when it is a draft, "" when it delivers or when there is
-// no accepted pull request. A read that fails is returned as err and does
-// not count against the pull request: the caller logs it and the session
-// keeps today's behaviour. A nil verifier reports "".
+// the pull request's head is still the head it had at run start, or moved
+// to a commit that is not the session's own (neither the session branch's
+// remote head nor the checkout's local HEAD — a push by someone else does
+// not deliver the session's work), undeliveredDraft when it is a draft, ""
+// when it delivers or when there is no accepted pull request. A read that
+// fails is returned as err and does not count against the pull request:
+// the caller logs it and the session keeps today's behaviour. A nil
+// verifier reports "".
 func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason string, err error) {
 	if v == nil || v.accepted == "" {
 		return "", nil
@@ -387,12 +404,29 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 			return "", fmt.Errorf("accepted pull request URL: %w", parseErr)
 		}
 		pullRef := fmt.Sprintf("refs/pull/%d/head", number)
-		found, lookupErr := v.lookup(ctx, v.worktreePath, pullRef)
+		refs := []string{pullRef}
+		branchRef := ""
+		if v.branch != "" {
+			branchRef = "refs/heads/" + v.branch
+			refs = append(refs, branchRef)
+		}
+		found, lookupErr := v.lookup(ctx, v.worktreePath, refs...)
 		switch {
 		case lookupErr != nil:
 			errs = append(errs, fmt.Errorf("read the pull request head: %w", lookupErr))
-		case found[pullRef] == v.startHead:
+		case found[pullRef] == "" || found[pullRef] == v.startHead:
 			return undeliveredNoNewCommit, nil
+		case branchRef != "" && found[branchRef] != "" && found[pullRef] == found[branchRef]:
+			// The new head is the session branch's remote head: the
+			// session's own push. Fall through to the draft check.
+		default:
+			if head, headErr := v.sessionHead(ctx); headErr != nil {
+				errs = append(errs, fmt.Errorf("read the session commit: %w", headErr))
+			} else if head == "" || found[pullRef] != head {
+				return undeliveredNoNewCommit, nil
+			}
+			// Else the new head is the checkout's local HEAD: the
+			// session's own commit. Fall through to the draft check.
 		}
 	}
 	if v.draftLookup != nil {
@@ -405,6 +439,19 @@ func (v *sessionPullRequestVerifier) undelivered(ctx context.Context) (reason st
 		}
 	}
 	return "", errors.Join(errs...)
+}
+
+// sessionHead reads the checkout's local HEAD commit: the session's own
+// commit. A nil head lookup (verifiers built by hand in tests) reads it
+// through captureHeadSHA, like production.
+func (v *sessionPullRequestVerifier) sessionHead(ctx context.Context) (string, error) {
+	lookup := v.headLookup
+	if lookup == nil {
+		lookup = localHeadSHA
+	}
+	headCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	return lookup(headCtx, v.worktreePath)
 }
 
 // reworkStartHead is the head of the existing pull request a rework run

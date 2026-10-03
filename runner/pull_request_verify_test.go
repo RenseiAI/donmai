@@ -472,11 +472,22 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	moved := strings.Repeat("b", 40)
 	refsAt := func(head string) pullRequestRefLookup {
 		return func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
-			if len(refs) != 1 || refs[0] != "refs/pull/7/head" {
+			if len(refs) < 1 || refs[0] != "refs/pull/7/head" {
 				return nil, fmt.Errorf("unexpected refs %q", refs)
 			}
 			return map[string]string{"refs/pull/7/head": head}, nil
 		}
+	}
+	refsAtBranch := func(pullHead, branchHead string) pullRequestRefLookup {
+		return func(_ context.Context, _ string, refs ...string) (map[string]string, error) {
+			if len(refs) != 2 || refs[0] != "refs/pull/7/head" || refs[1] != "refs/heads/agent/s" {
+				return nil, fmt.Errorf("unexpected refs %q", refs)
+			}
+			return map[string]string{"refs/pull/7/head": pullHead, "refs/heads/agent/s": branchHead}, nil
+		}
+	}
+	headIs := func(head string) pullRequestHeadLookup {
+		return func(context.Context, string) (string, error) { return head, nil }
 	}
 	unreadable := func(context.Context, string, ...string) (map[string]string, error) {
 		return nil, errors.New("remote unreachable")
@@ -493,8 +504,10 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 	cases := []struct {
 		name      string
 		accepted  string
+		branch    string
 		startHead string
 		lookup    pullRequestRefLookup
+		head      pullRequestHeadLookup
 		draft     pullRequestDraftLookup
 		want      string
 		wantErr   string
@@ -503,8 +516,9 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 		{name: "ready pull request the session opened", accepted: own, draft: draftIs(false)},
 		{name: "draft pull request the session opened", accepted: own, draft: draftIs(true), want: undeliveredDraft},
 		{name: "rework with no new commit", accepted: own, startHead: start, lookup: refsAt(start), draft: ghDown, want: undeliveredNoNewCommit},
-		{name: "rework with a new commit, ready", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(false)},
-		{name: "rework with a new commit, still draft", accepted: own, startHead: start, lookup: refsAt(moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "rework with a new commit, ready", accepted: own, branch: "agent/s", startHead: start, lookup: refsAtBranch(moved, moved), draft: draftIs(false)},
+		{name: "rework with a new commit, still draft", accepted: own, branch: "agent/s", startHead: start, lookup: refsAtBranch(moved, moved), draft: draftIs(true), want: undeliveredDraft},
+		{name: "rework whose head moved to someone else's commit", accepted: own, branch: "agent/s", startHead: start, lookup: refsAtBranch(moved, start), head: headIs(start), draft: draftIs(false), want: undeliveredNoNewCommit},
 		{name: "draft state unknown", accepted: own, draft: ghDown, wantErr: "not authenticated"},
 		{name: "rework head unreadable", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(false), wantErr: "remote unreachable"},
 		{name: "rework head unreadable, draft", accepted: own, startHead: start, lookup: unreadable, draft: draftIs(true), want: undeliveredDraft},
@@ -518,7 +532,7 @@ func TestSessionPullRequestVerifier_Undelivered(t *testing.T) {
 					return nil, nil
 				}
 			}
-			v := &sessionPullRequestVerifier{repository: "acme/widgets", accepted: tc.accepted, startHead: tc.startHead, lookup: lookup, draftLookup: tc.draft}
+			v := &sessionPullRequestVerifier{repository: "acme/widgets", branch: tc.branch, accepted: tc.accepted, startHead: tc.startHead, lookup: lookup, draftLookup: tc.draft, headLookup: tc.head}
 			got, err := v.undelivered(context.Background())
 			if got != tc.want {
 				t.Fatalf("undelivered = %q (err %v); want %q", got, err, tc.want)

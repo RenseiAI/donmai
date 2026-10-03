@@ -1128,6 +1128,129 @@ func TestRun_ReworkWithoutANewCommitIsContinuedThenNotDelivered(t *testing.T) {
 	}
 }
 
+// TestRun_UndeliveredContinuationsHaveTheirOwnLimit pins the separate bound
+// on draft and no-new-commit continuations: a session whose turns keep
+// making tool calls — so the progress bound never fires — still ends not
+// delivered once the undelivered continuations reach their own limit, which
+// is smaller than the overall ceiling.
+func TestRun_UndeliveredContinuationsHaveTheirOwnLimit(t *testing.T) {
+	const undeliveredLimit = 2
+	busy := verdictScriptTurn{toolCalls: 3, text: "Draft " + followUpPR + " is open; still working on it."}
+	draft := &scriptedDraft{states: []bool{true}}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:                     "development",
+		repository:                   followUpRepository,
+		pulls:                        map[int]string{7: pullAtSessionCommit},
+		draft:                        draft.lookup,
+		continuationUndeliveredLimit: undeliveredLimit,
+		turns: append(slices.Repeat([]verdictScriptTurn{busy}, undeliveredLimit+1),
+			verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuationsCeiling {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/%s", res.Status, res.FailureMode, res.Error, FailureContinuationsCeiling)
+	}
+	if res.WorkResult == "passed" {
+		t.Errorf("WorkResult = passed; a draft pull request is not delivered work")
+	}
+	wantErr := "the turn still ended unfinished after 2 undelivered continuation prompts: " +
+		"no turn-result manifest and no verdict, and the pull request does not deliver the work: pull request still draft"
+	if res.Error != wantErr {
+		t.Errorf("Error = %q; want %q", res.Error, wantErr)
+	}
+	if res.PullRequestURL != followUpPR {
+		t.Errorf("PullRequestURL = %q; want the session's draft %s kept on the receipt", res.PullRequestURL, followUpPR)
+	}
+	wantPrompts(t, provider.prompts, slices.Repeat([]string{continueDraftPrompt}, undeliveredLimit)...)
+	wantContinuations(t, res, undeliveredLimit, 0, true)
+}
+
+// TestRun_VerdictFollowedByAnotherTurnEndsCompleted pins the passing path
+// the undelivered bound must not disturb: a turn that leaves a verdict and
+// a second turn after it end completed, with no continuation sent.
+func TestRun_VerdictFollowedByAnotherTurnEndsCompleted(t *testing.T) {
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		turns: []verdictScriptTurn{
+			{text: "Implementation done. Opening " + followUpPR + ".\nWORK_RESULT: passed"},
+			{text: "The pull request is " + followUpPR + "."},
+		},
+	})
+	if res.Status != "completed" || res.PullRequestURL != followUpPR || res.WorkResult != "passed" {
+		t.Fatalf("Status=%q PullRequestURL=%q WorkResult=%q (%s: %s); want completed and passed with %s",
+			res.Status, res.PullRequestURL, res.WorkResult, res.FailureMode, res.Error, followUpPR)
+	}
+	wantPrompts(t, provider.prompts)
+	wantContinuations(t, res, 0, 0, false)
+}
+
+// TestRun_ReworkHeadMovedBySomeoneElseIsNotDelivered pins the ownership
+// check on the rework head: the pull request's head moved since the run
+// started, but to a commit that is neither the session branch's remote head
+// nor the checkout's local HEAD — a push by someone else. The run is
+// continued as undelivered, not completed.
+func TestRun_ReworkHeadMovedBySomeoneElseIsNotDelivered(t *testing.T) {
+	draft := &scriptedDraft{states: []bool{false}}
+	// The pull request's head moved since the run started, but to someone
+	// else's commit: it matches neither the session branch's remote head
+	// nor the checkout's local HEAD. The run is continued as undelivered
+	// with the no-new-commit prompt, not completed.
+	note := verdictScriptTurn{text: "Read the review on " + followUpPR + "; I will fix the comments next."}
+	session := ""
+	var mu sync.Mutex
+	first := true
+	// Settle through the production lookup so the pull request is accepted
+	// as the session's own; afterwards move its head to someone else's
+	// commit, while the session's own HEAD stays where the checkout left
+	// it — so the undelivered re-read sees a moved head that is not the
+	// session's own.
+	lookup := func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
+		found, err := originRefs(ctx, worktreePath, refs...)
+		if err != nil {
+			return nil, err
+		}
+		mu.Lock()
+		defer mu.Unlock()
+		if first {
+			first = false
+			if head, headErr := captureHeadSHA(ctx, worktreePath); headErr == nil {
+				session = head
+			}
+			return found, nil
+		}
+		if session == "" {
+			return found, nil
+		}
+		for _, ref := range refs {
+			if ref == "refs/pull/7/head" {
+				found[ref] = strings.Repeat("c", 40)
+			}
+		}
+		return found, nil
+	}
+	res, provider := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		ref:        reworkBranch,
+		lookup:     lookup,
+		draft:      draft.lookup,
+		turns:      append(slices.Repeat([]verdictScriptTurn{note}, 3), verdictScriptTurn{text: "never reached"}),
+	})
+	if res.Status != "failed" {
+		t.Fatalf("Status=%q (%s: %s); want the run continued as undelivered, not completed", res.Status, res.FailureMode, res.Error)
+	}
+	if !strings.HasSuffix(res.Error, "the pull request does not deliver the work: no new commit") {
+		t.Errorf("Error = %q; want it to end with the reason, no new commit", res.Error)
+	}
+	for _, prompt := range provider.prompts {
+		if prompt != continueNoNewCommitPrompt {
+			t.Errorf("prompt = %q; want only the no-new-commit continuation", prompt)
+		}
+	}
+}
+
 // TestRun_DraftStateUnknownWhenGhFailsKeepsTheSession pins the fallback: on a
 // host where gh cannot answer (absent, unauthenticated, offline), the draft
 // state is unknown, and a turn whose only result is the session's pull

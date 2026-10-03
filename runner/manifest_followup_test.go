@@ -294,6 +294,9 @@ type scriptedSession struct {
 	continuationLimit int
 	// continuationCeiling is Options.TurnContinuationCeiling (0 = default).
 	continuationCeiling int
+	// continuationUndeliveredLimit is
+	// Options.TurnContinuationUndeliveredLimit (0 = default).
+	continuationUndeliveredLimit int
 	// declaration, when non-nil, provisions the session through the
 	// session-root-v1 workarea protocol with that repository declaration;
 	// the session's legacy Repository is cleared so the primary source
@@ -348,6 +351,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 	r := newFollowUpRunner(t, platform.URL, platform.Client(), played, func(o *Options) {
 		o.TurnContinuationLimit = cfg.continuationLimit
 		o.TurnContinuationCeiling = cfg.continuationCeiling
+		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
 	})
 	r.skipSteering = cfg.skipSteering
 	if cfg.teardown {
