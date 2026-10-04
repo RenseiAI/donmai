@@ -555,7 +555,7 @@ func TestBuildSteeringPrompt_ContinueModePushesToHeadBranch(t *testing.T) {
 	t.Parallel()
 	qw := QueuedWork{QueuedWork: queuedWorkBase("CONT-STEER")}
 	qw.ContinuePullRequest = &prompt.ContinuePullRequest{Number: 12, HeadRef: "continued/pr-12", HeadSha: continueFixtureSHA()}
-	got := buildSteeringPrompt(qw, streamObservation{})
+	got := buildSteeringPrompt(qw, streamObservation{}, backstopVisibilityPrivate)
 	if !strings.Contains(got, "git push origin HEAD:refs/heads/continued/pr-12") {
 		t.Fatalf("steering prompt does not push to the head branch:\n%s", got)
 	}

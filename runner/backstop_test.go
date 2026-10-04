@@ -941,6 +941,35 @@ type ghPRCapture struct {
 	body  string
 }
 
+// stubGhVisibilityOnly shadows `gh` on PATH with a stub that answers
+// only the backstop's `repo view` visibility probe: it prints visibility,
+// or fails with exit 1 when visibility is empty (modelling gh missing /
+// unauthenticated / not-a-repo). Any other gh invocation fails so a test
+// notices an unexpected public-surface call.
+func stubGhVisibilityOnly(t *testing.T, visibility string) {
+	t.Helper()
+	dir := t.TempDir()
+	visFile := filepath.Join(dir, "gh-visibility.txt")
+	if err := os.WriteFile(visFile, []byte(visibility), 0o600); err != nil {
+		t.Fatalf("write gh visibility output: %v", err)
+	}
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "repo" ]; then
+  v=$(cat %[1]q)
+  if [ -z "$v" ]; then echo "no visibility" 1>&2; exit 1; fi
+  echo "$v"; exit 0
+fi
+echo "unexpected gh argv: $*" 1>&2
+exit 1
+`, visFile)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+}
+
 // stubGhVisibilityAndPRCreate shadows `gh` on PATH with a stub that
 // answers the backstop's two gh calls: `repo view` returns visibility
 // (or fails with exit 1 when visibility is "") and `pr create` records
@@ -1110,14 +1139,18 @@ func TestBackstopVisibilitySurfaces(t *testing.T) {
 func TestBackstopVisibilityFallbackTitle(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name  string
-		title string
-		ident string
-		want  string
+		name        string
+		title       string
+		ident       string
+		want        string
+		wantPrivate string
 	}{
 		{name: "empty title", title: "", ident: "VIS-7", want: "Auto-recovered session work"},
 		{name: "identifier-only title", title: "VIS-7", ident: "VIS-7", want: "Auto-recovered session work"},
 		{name: "identifier prefix stripped", title: "VIS-7: repair the widget", ident: "VIS-7", want: "repair the widget"},
+		{name: "other identifier scrubbed", title: "Follow-up to SYNC-31: repair the widget", ident: "VIS-7", want: "Follow-up to: repair the widget"},
+		{name: "lowercase copy scrubbed", title: "repair the widget (vis-7)", ident: "vis-7", want: "repair the widget"},
+		{name: "private keeps its own identifier", title: "repair the widget", ident: "VIS-7", want: "repair the widget", wantPrivate: "VIS-7: repair the widget"},
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
@@ -1129,6 +1162,11 @@ func TestBackstopVisibilityFallbackTitle(t *testing.T) {
 			}
 			if got := backstopPRTitle(qw, backstopVisibilityUnknown); got != tc.want {
 				t.Errorf("backstopPRTitle(unknown) = %q, want %q", got, tc.want)
+			}
+			if tc.wantPrivate != "" {
+				if got := backstopPRTitle(qw, backstopVisibilityPrivate); got != tc.wantPrivate {
+					t.Errorf("backstopPRTitle(private) = %q, want %q", got, tc.wantPrivate)
+				}
 			}
 			if got := backstopPRTitle(qw, backstopVisibilityPublic); strings.Contains(got, tc.ident) {
 				t.Errorf("public title %q still contains the work identifier", got)

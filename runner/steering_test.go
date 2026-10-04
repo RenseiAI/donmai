@@ -161,8 +161,8 @@ func TestAttemptSteeringReadOnlyReviewDoesNotInjectOrResume(t *testing.T) {
 // TestBuildSteeringPrompt_ContainsCommands ensures the steering
 // prompt directs the agent to the canonical commit/push/PR workflow.
 func TestBuildSteeringPrompt_ContainsCommands(t *testing.T) {
-	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-T-1")}
-	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true})
+	qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-101")}
+	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true}, backstopVisibilityPrivate)
 	for _, want := range []string{
 		"git status",
 		"git add -A",
@@ -174,7 +174,7 @@ func TestBuildSteeringPrompt_ContainsCommands(t *testing.T) {
 			t.Errorf("steering prompt missing %q\nfull:\n%s", want, got)
 		}
 	}
-	if !strings.Contains(got, "REN-T-1") {
+	if !strings.Contains(got, "xyq-101") {
 		t.Errorf("steering prompt missing identifier; got:\n%s", got)
 	}
 }
@@ -185,8 +185,8 @@ func TestBuildSteeringPrompt_ContainsCommands(t *testing.T) {
 // the agent to stop before posting that result. Reverting buildSteeringPrompt
 // to `gh pr create --fill` / "and stop" fails this test.
 func TestBuildSteeringPrompt_PointsBackToTaskRequirements(t *testing.T) {
-	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-T-1")}
-	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true})
+	qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-102")}
+	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true}, backstopVisibilityPrivate)
 	lower := strings.ToLower(got)
 	if strings.Contains(got, "--fill") {
 		t.Errorf("steering prompt must not prescribe --fill\nfull:\n%s", got)
@@ -560,5 +560,176 @@ func TestAttemptSteeringResume_NoSessionIDIsSoftFail(t *testing.T) {
 	}
 	if res.SteeringResumeFallback {
 		t.Fatal("expected no resume fallback recorded")
+	}
+}
+
+// TestSteeringPromptVisibility_Table pins the tail-recovery prompt to the
+// backstop's visibility result: private keeps this run's own identifier,
+// public and unknown scrub every tracker-id-shaped token (other
+// identifiers and lowercase copies included) from the instructed commit
+// subject. Deleting the visibility branch (always keeping the
+// identifier) fails the public and unknown rows; narrowing the scrub to
+// this run's own identifier fails the other-identifier and lowercase
+// rows; narrowing it to the exact case fails the lowercase row.
+func TestSteeringPromptVisibility_Table(t *testing.T) {
+	t.Parallel()
+	base := func() QueuedWork {
+		qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-301")}
+		qw.SessionID = "sess-steer-301"
+		return qw
+	}
+	cases := []struct {
+		name      string
+		mutate    func(*QueuedWork)
+		vis       backstopVisibility
+		wantIdent bool
+		wantNoIDs bool
+	}{
+		{
+			name:      "private keeps this run's identifier",
+			mutate:    func(qw *QueuedWork) { qw.Title = "Repair the widget" },
+			vis:       backstopVisibilityPrivate,
+			wantIdent: true,
+		},
+		{
+			name:      "public scrubs this run's identifier",
+			mutate:    func(qw *QueuedWork) { qw.Title = "Repair the widget" },
+			vis:       backstopVisibilityPublic,
+			wantNoIDs: true,
+		},
+		{
+			name:      "unknown fails safe to scrubbed",
+			mutate:    func(qw *QueuedWork) { qw.Title = "Repair the widget" },
+			vis:       backstopVisibilityUnknown,
+			wantNoIDs: true,
+		},
+		{
+			name: "public scrubs another identifier from the title",
+			mutate: func(qw *QueuedWork) {
+				qw.Title = "Follow-up to qwx-88: repair the widget"
+				qw.IssueIdentifier = ""
+			},
+			vis:       backstopVisibilityPublic,
+			wantNoIDs: true,
+		},
+		{
+			name: "public scrubs a lowercase copy",
+			mutate: func(qw *QueuedWork) {
+				qw.Title = "Repair the widget"
+				qw.IssueIdentifier = "xyq-301"
+				qw.SessionID = "sess-steer-lower"
+			},
+			vis:       backstopVisibilityPublic,
+			wantNoIDs: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qw := base()
+			tc.mutate(&qw)
+			got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true}, tc.vis)
+			for _, want := range []string{"git commit", "git push"} {
+				if !strings.Contains(got, want) {
+					t.Errorf("steering prompt missing %q\nfull:\n%s", want, got)
+				}
+			}
+			if tc.wantIdent && !strings.Contains(got, "xyq-301") {
+				t.Errorf("private steering prompt must keep this run's identifier\nfull:\n%s", got)
+			}
+			if tc.wantNoIDs && trackerIDPattern.MatchString(got) {
+				t.Errorf("public/unknown steering prompt must carry no tracker-id-shaped token\nfull:\n%s", got)
+			}
+		})
+	}
+}
+
+// TestSteeringPromptIdentifierOnlyTitleFallsBack pins the neutral subject:
+// when the whole commit subject is an identifier, the public prompt
+// instructs a neutral subject rather than an empty one.
+func TestSteeringPromptIdentifierOnlyTitleFallsBack(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-302")}
+	qw.Title = ""
+	qw.SessionID = "sess-steer-302"
+	got := buildSteeringPrompt(qw, streamObservation{terminalSuccess: true}, backstopVisibilityPublic)
+	if !strings.Contains(got, "recovered session work") {
+		t.Errorf("identifier-only public prompt must fall back to a neutral subject\nfull:\n%s", got)
+	}
+	if trackerIDPattern.MatchString(got) {
+		t.Errorf("identifier-only public prompt must carry no tracker-id-shaped token\nfull:\n%s", got)
+	}
+}
+
+// TestAttemptSteeringReusesBackstopVisibility drives the production entry
+// point: attemptSteering resolves repository visibility through the
+// backstop's `gh repo view` probe, and the injected prompt carries this
+// run's identifier only for PRIVATE. The stub harness records the
+// injected prompt so the test observes the real steering text.
+func TestAttemptSteeringReusesBackstopVisibility(t *testing.T) {
+	cases := []struct {
+		name       string
+		visibility string
+		wantIdent  bool
+	}{
+		{name: "private", visibility: "PRIVATE", wantIdent: true},
+		{name: "public", visibility: "PUBLIC", wantIdent: false},
+		{name: "gh failure fails safe", visibility: "", wantIdent: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			stubGhVisibilityOnly(t, tc.visibility)
+			r := minimalRunner(t)
+			p, err := stub.New(stub.WithCapabilities(agent.Capabilities{SupportsMessageInjection: true}))
+			if err != nil {
+				t.Fatalf("stub.New: %v", err)
+			}
+			if err := r.registry.Register(p); err != nil {
+				t.Fatalf("register: %v", err)
+			}
+			ctx, cancel := withCtx(t)
+			defer cancel()
+			spec := agent.Spec{
+				ProviderConfig: map[string]any{
+					"stub.behavior": string(stub.BehaviorInjectTest),
+				},
+			}
+			handle, err := p.Spawn(ctx, spec)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-303")}
+			qw.SessionID = "sess-steer-303"
+			qw.Title = "Repair the widget"
+			res := &Result{}
+			res.WorktreePath = t.TempDir()
+			newHandle, err := r.attemptSteering(ctx, p, handle, spec, p.Capabilities(), qw, streamObservation{terminalSuccess: true}, res)
+			if err != nil {
+				t.Fatalf("attemptSteering: %v", err)
+			}
+			if newHandle != handle {
+				t.Fatal("expected the same handle back on the inject-success path")
+			}
+			// The stub echoes the injected prompt as an AssistantTextEvent
+			// prefixed with "injected: "; read it back and assert on the
+			// real steering text.
+			var injected string
+			for ev := range handle.Events() {
+				if at, ok := ev.(agent.AssistantTextEvent); ok {
+					if s, found := strings.CutPrefix(at.Text, "injected: "); found {
+						injected = s
+					}
+				}
+			}
+			if injected == "" {
+				t.Fatal("expected the stub to echo the injected steering prompt")
+			}
+			if hasIdent := strings.Contains(injected, "xyq-303"); hasIdent != tc.wantIdent {
+				t.Errorf("injected prompt contains identifier = %v, want %v\nfull:\n%s", hasIdent, tc.wantIdent, injected)
+			}
+			if !tc.wantIdent && trackerIDPattern.MatchString(injected) {
+				t.Errorf("non-private injected prompt must carry no tracker-id-shaped token\nfull:\n%s", injected)
+			}
+		})
 	}
 }

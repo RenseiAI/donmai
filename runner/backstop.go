@@ -201,6 +201,19 @@ func shouldBackstop(res *Result, workType string) bool {
 	return res.PullRequestURL == ""
 }
 
+// backstopVisibility is the repository-visibility gate for the backstop's
+// public surfaces (commit message, PR title/body). Only
+// backstopVisibilityPrivate keeps the tracker identifier; every other
+// value — public or unknown — uses the redacted format so a private
+// tracker identifier never leaks into a public repository.
+type backstopVisibility string
+
+const (
+	backstopVisibilityPublic  backstopVisibility = "PUBLIC"
+	backstopVisibilityPrivate backstopVisibility = "PRIVATE"
+	backstopVisibilityUnknown backstopVisibility = "UNKNOWN"
+)
+
 // runBackstop executes the deterministic git workflow when the agent
 // failed to commit/push/PR. Returns a [agent.BackstopReport]
 // describing what happened so the caller can attach it to the
@@ -224,19 +237,6 @@ func shouldBackstop(res *Result, workType string) bool {
 // Errors at any step short-circuit and are recorded on
 // BackstopReport.Diagnostics; the caller decides whether to surface
 // them as Result.FailureMode = FailureBackstop.
-//
-// backstopVisibility is the repository-visibility gate for the backstop's
-// public surfaces (commit message, PR title/body). Only
-// backstopVisibilityPrivate keeps the tracker identifier; every other
-// value — public or unknown — uses the redacted format so a private
-// tracker identifier never leaks into a public repository.
-type backstopVisibility string
-
-const (
-	backstopVisibilityPublic  backstopVisibility = "PUBLIC"
-	backstopVisibilityPrivate backstopVisibility = "PRIVATE"
-	backstopVisibilityUnknown backstopVisibility = "UNKNOWN"
-)
 
 // parseBackstopVisibility normalizes `gh repo view` output. Anything that
 // is not an explicit PRIVATE — including empty output and future values —
@@ -259,6 +259,9 @@ func parseBackstopVisibility(out string) backstopVisibility {
 // unauthenticated, not a GitHub repository) returns UNKNOWN, which
 // renders with the public (redacted) format.
 func resolveBackstopVisibility(ctx context.Context, worktreePath string) backstopVisibility {
+	if strings.TrimSpace(worktreePath) == "" {
+		return backstopVisibilityUnknown
+	}
 	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
 	defer cancel()
 	out, err := runGh(lookupCtx, worktreePath, "repo", "view", "--json", "visibility", "-q", ".visibility")
@@ -268,6 +271,36 @@ func resolveBackstopVisibility(ctx context.Context, worktreePath string) backsto
 	return parseBackstopVisibility(out)
 }
 
+// trackerIDPattern matches any tracker-identifier-shaped token: a letter
+// followed by letters/digits, a hyphen, then digits — matched
+// case-insensitively so a lowercase copy scrubs too. It is deliberately
+// broader than this run's own identifier format: public surfaces must
+// carry no such token at all, not just this session's.
+var trackerIDPattern = regexp.MustCompile(`(?i)\b[A-Z][A-Z0-9]+-\d+\b`)
+
+// spaceBeforeSeparatorPattern collapses the gap a scrubbed token leaves
+// before a separator ("Follow-up to : x" → "Follow-up to: x").
+var spaceBeforeSeparatorPattern = regexp.MustCompile(`\s+([:,;—–-])`)
+
+// emptyParensPattern removes brackets a scrubbed token empties
+// ("(ABC-99)" → "()").
+var emptyParensPattern = regexp.MustCompile(`\(\s*\)|\[\s*\]`)
+
+// scrubTrackerIDs removes every tracker-identifier-shaped token from s and
+// tidies the gaps the removal leaves: collapsed whitespace, no space before
+// a leftover separator, no emptied parens, no leading or trailing
+// separators. A string without such a token is returned unchanged.
+func scrubTrackerIDs(s string) string {
+	if !trackerIDPattern.MatchString(s) {
+		return s
+	}
+	s = trackerIDPattern.ReplaceAllString(s, "")
+	s = spaceBeforeSeparatorPattern.ReplaceAllString(s, "$1")
+	s = emptyParensPattern.ReplaceAllString(s, "")
+	s = strings.Join(strings.Fields(s), " ")
+	return strings.Trim(s, ":—–-,; ")
+}
+
 // backstopCommitMessage composes the backstop commit message. Private
 // repositories keep the tracker identifier for correlation; public or
 // unknown-visibility repositories carry only the session id.
@@ -275,13 +308,16 @@ func backstopCommitMessage(qw QueuedWork, vis backstopVisibility) string {
 	if vis == backstopVisibilityPrivate && qw.IssueIdentifier != "" {
 		return fmt.Sprintf("Backstop: %s (%s)", qw.IssueIdentifier, qw.SessionID)
 	}
-	return fmt.Sprintf("Backstop: %s", qw.SessionID)
+	// The session id is scrubbed too: the public commit must carry no
+	// tracker-identifier-shaped token at all, whatever the id looks like.
+	// Real session ids are opaque and pass through unchanged.
+	return fmt.Sprintf("Backstop: %s", scrubTrackerIDs(qw.SessionID))
 }
 
 // backstopPRTitle composes the backstop PR title. Private repositories
 // keep the tracker identifier prefix; public or unknown-visibility
 // repositories use a neutral title with no tracker identifier — the
-// session's title with any identifier occurrence removed, or the
+// session's title with every tracker-id-shaped token scrubbed, or the
 // fallback when nothing remains.
 func backstopPRTitle(qw QueuedWork, vis backstopVisibility) string {
 	if vis == backstopVisibilityPrivate {
@@ -291,11 +327,7 @@ func backstopPRTitle(qw QueuedWork, vis backstopVisibility) string {
 		}
 		return title
 	}
-	title := strings.TrimSpace(qw.Title)
-	if title != "" && qw.IssueIdentifier != "" && strings.Contains(title, qw.IssueIdentifier) {
-		title = strings.TrimSpace(strings.ReplaceAll(title, qw.IssueIdentifier, ""))
-		title = strings.TrimSpace(strings.TrimLeft(title, ":\u2014\u2013- "))
-	}
+	title := scrubTrackerIDs(strings.TrimSpace(qw.Title))
 	if title == "" {
 		title = "Auto-recovered session work"
 	}
