@@ -451,7 +451,10 @@ func (p *Processor) emitTool(pending pendingTool, toolName string, isError bool,
 
 // processSubagent correlates the typed sub-agent lifecycle and emits the
 // `subagent` span: `started` opens the span, `completed`/`failed` closes
-// it. Unknown phases pass through untouched.
+// it. The span nests under the delegating `tool` span (matched by ToolUseID
+// through the pending, then completed, tool records) instead of hanging off
+// the session root, so a delegation reads as a child of the call that
+// started it. Unknown phases pass through untouched.
 func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.SubagentEvent {
 	switch e.Phase {
 	case agent.SubagentStarted:
@@ -461,7 +464,7 @@ func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.
 		}
 		e.TraceID = p.traceID
 		e.SpanID = spanID
-		e.ParentSpanID = p.rootSpanID
+		e.ParentSpanID = p.subagentParent(e.ToolUseID)
 		if e.ToolUseID != "" {
 			p.pendingSubagents[e.ToolUseID] = pendingSubagent{
 				traceID:      e.TraceID,
@@ -484,7 +487,7 @@ func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.
 			pending = pendingSubagent{
 				traceID:      p.traceID,
 				spanID:       spanID,
-				parentSpanID: p.rootSpanID,
+				parentSpanID: p.subagentParent(e.ToolUseID),
 				toolName:     e.ToolName,
 				toolUseID:    e.ToolUseID,
 				start:        now,
@@ -506,6 +509,21 @@ func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.
 	default:
 		return e
 	}
+}
+
+// subagentParent resolves the parent span for a sub-agent lifecycle event:
+// the delegating `tool` span matched by ToolUseID when the correlator has
+// seen that tool call (pending or already completed), else the session root.
+func (p *Processor) subagentParent(toolUseID string) string {
+	if toolUseID != "" {
+		if pending, ok := p.pendingTools[toolUseID]; ok {
+			return pending.spanID
+		}
+		if completed, ok := p.completedTools[toolUseID]; ok {
+			return completed.spanID
+		}
+	}
+	return p.rootSpanID
 }
 
 func (p *Processor) emitSubagent(pending pendingSubagent, toolName string, end time.Time, status agent.SpanStatus) {

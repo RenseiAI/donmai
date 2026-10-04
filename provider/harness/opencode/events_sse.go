@@ -48,12 +48,15 @@ const (
 // sseMapper holds the per-session mapping state: which session to filter to,
 // whether the synthetic InitEvent has fired, and a dedup set over SSE frame
 // ids (a replay after an SSE drop re-delivers frames — dedup keeps the
-// terminal-contract "exactly one" invariant intact).
+// terminal-contract "exactly one" invariant intact). It also pairs native
+// `task` delegation tool calls with their results by CallID so a delegation
+// emits the typed sub-agent lifecycle alongside the plain tool events.
 type sseMapper struct {
 	sessionID string
 	initSent  bool
 	terminal  bool
 	seen      map[string]bool
+	pending   map[string]string // CallID -> delegation tool name
 }
 
 func newSSEMapper(sessionID string) *sseMapper {
@@ -169,38 +172,44 @@ func (m *sseMapper) Map(ev serverEvent) []agent.Event {
 		if err := json.Unmarshal(ev.Properties, &p); err != nil {
 			return append(out, decodeErr("tool.called", ev, err))
 		}
-		return append(out, agent.ToolUseEvent{
+		out = append(out, agent.ToolUseEvent{
 			ToolName:  p.Tool,
 			ToolUseID: p.CallID,
 			Input:     p.Input,
 			Raw:       ev.Properties,
 		})
+		m.trackDelegationStart(&out, p.Tool, p.CallID, ev.Properties)
+		return out
 
 	case evToolSuccess:
 		var p propToolSuccess
 		if err := json.Unmarshal(ev.Properties, &p); err != nil {
 			return append(out, decodeErr("tool.success", ev, err))
 		}
-		return append(out, agent.ToolResultEvent{
+		out = append(out, agent.ToolResultEvent{
 			ToolName:  p.Tool,
 			ToolUseID: p.CallID,
 			Content:   p.Content,
 			IsError:   false,
 			Raw:       ev.Properties,
 		})
+		m.trackDelegationEnd(&out, p.Tool, p.CallID, false, ev.Properties)
+		return out
 
 	case evToolFailed:
 		var p propToolFailed
 		if err := json.Unmarshal(ev.Properties, &p); err != nil {
 			return append(out, decodeErr("tool.failed", ev, err))
 		}
-		return append(out, agent.ToolResultEvent{
+		out = append(out, agent.ToolResultEvent{
 			ToolName:  p.Tool,
 			ToolUseID: p.CallID,
 			Content:   p.Error,
 			IsError:   true,
 			Raw:       ev.Properties,
 		})
+		m.trackDelegationEnd(&out, p.Tool, p.CallID, true, ev.Properties)
+		return out
 
 	case evStepEnded:
 		var p propStepEnded
@@ -273,6 +282,55 @@ func (m *sseMapper) serverCrashed(reason string) []agent.Event {
 		Message: "opencode serve child terminated mid-session: " + reason,
 		Code:    "server_crashed",
 	}}
+}
+
+// trackDelegationStart records a native `task` delegation call and appends
+// its typed `started` lifecycle event. Non-delegation tools and calls
+// without an id only contribute their plain tool event.
+func (m *sseMapper) trackDelegationStart(out *[]agent.Event, tool, callID string, raw json.RawMessage) {
+	if callID == "" || !isOpenCodeDelegationTool(tool) {
+		return
+	}
+	if m.pending == nil {
+		m.pending = make(map[string]string)
+	}
+	if _, dup := m.pending[callID]; dup {
+		return
+	}
+	m.pending[callID] = tool
+	*out = append(*out, agent.SubagentEvent{
+		ToolName:  tool,
+		ToolUseID: callID,
+		Phase:     agent.SubagentStarted,
+		Raw:       raw,
+	})
+}
+
+// trackDelegationEnd pairs a delegation result with its recorded call and
+// appends the typed terminal (`completed` or `failed`) lifecycle event.
+// Results without a matching delegation call contribute nothing further.
+func (m *sseMapper) trackDelegationEnd(out *[]agent.Event, tool, callID string, isError bool, raw json.RawMessage) {
+	if callID == "" || m.pending == nil {
+		return
+	}
+	name, ok := m.pending[callID]
+	if !ok {
+		return
+	}
+	delete(m.pending, callID)
+	phase := agent.SubagentCompleted
+	if isError {
+		phase = agent.SubagentFailed
+	}
+	if tool != "" {
+		name = tool
+	}
+	*out = append(*out, agent.SubagentEvent{
+		ToolName:  name,
+		ToolUseID: callID,
+		Phase:     phase,
+		Raw:       raw,
+	})
 }
 
 func decodeErr(what string, ev serverEvent, err error) agent.Event {

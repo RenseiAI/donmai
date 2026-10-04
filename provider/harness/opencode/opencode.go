@@ -326,7 +326,7 @@ func (*Provider) Capabilities() agent.Capabilities {
 		NeedsBaseInstructions:               false,
 		NeedsPermissionConfig:               false,
 		SupportsCodeIntelligenceEnforcement: false,
-		EmitsSubagentEvents:                 false,
+		EmitsSubagentEvents:                 true,
 		SupportsReasoningEffort:             true, // --variant flag maps to effort levels
 		ToolPermissionFormat:                "claude",
 		AcceptsAllowedToolsList:             true, // projected into the owned opencode.json permission map (07 §5.2)
@@ -831,6 +831,11 @@ type openCodeHandle struct {
 	sessionID atomic.Pointer[string]
 	initSent  atomic.Bool
 
+	// mapper is the stateful Lane-A NDJSON line mapper that pairs native
+	// `task` delegation tool calls with their results to emit the typed
+	// sub-agent lifecycle alongside the plain tool events.
+	mapper openCodeLineMapper
+
 	stopOnce sync.Once
 	stopErr  error
 
@@ -949,8 +954,8 @@ func (h *openCodeHandle) watchCtx(ctx context.Context) {
 }
 
 // readStdout is the goroutine that drains opencode's NDJSON stdout,
-// decodes each line via mapOpenCodeLine, and forwards events onto the
-// channel via sendEvent.
+// decodes each line via the stateful line mapper, and forwards events
+// onto the channel via sendEvent.
 func (h *openCodeHandle) readStdout() {
 	defer close(h.done)
 	defer func() {
@@ -987,7 +992,7 @@ func (h *openCodeHandle) readStdout() {
 			continue
 		}
 		line := append([]byte(nil), raw...)
-		for _, ev := range mapOpenCodeLine(line) {
+		for _, ev := range h.mapper.mapLine(line) {
 			if ev == nil {
 				continue
 			}
@@ -1084,8 +1089,22 @@ type tokens struct {
 	Output int64 `json:"output"`
 }
 
+// openCodeLineMapper is the stateful Lane-A NDJSON line mapper. It pairs
+// native `task` delegation tool calls with their results by CallID so a
+// delegation emits the typed sub-agent lifecycle (started on the tool_use
+// line, completed or failed on the matching tool_result line) alongside
+// the plain tool events. The zero value is ready to use; concurrent
+// callers are safe (readStdout uses a single goroutine, but tests may
+// share one mapper).
+type openCodeLineMapper struct {
+	mu      sync.Mutex
+	pending map[string]string // CallID -> delegation tool name
+}
+
 // mapOpenCodeLine decodes one NDJSON line from `opencode run --format json`
-// and returns the corresponding agent.Event slice.
+// and returns the corresponding agent.Event slice. Stateless: delegation
+// tool calls do NOT emit a sub-agent lifecycle here — use
+// openCodeLineMapper.mapLine for the stateful pairing.
 //
 // Mapping:
 //
@@ -1097,7 +1116,72 @@ type tokens struct {
 //	step_finish (reason=stop)          → ResultEvent(success=true)
 //	step_finish (reason=tool-calls)    → (internal step; no terminal event)
 //	unknown / decode error             → ErrorEvent
+func (m *openCodeLineMapper) mapLine(line []byte) []agent.Event {
+	events := decodeOpenCodeLine(line)
+	if m == nil {
+		return events
+	}
+	out := make([]agent.Event, 0, len(events)+1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending == nil {
+		m.pending = make(map[string]string)
+	}
+	for _, ev := range events {
+		out = append(out, ev)
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if e.ToolUseID == "" || !isOpenCodeDelegationTool(e.ToolName) {
+				continue
+			}
+			if _, dup := m.pending[e.ToolUseID]; dup {
+				continue
+			}
+			m.pending[e.ToolUseID] = e.ToolName
+			out = append(out, agent.SubagentEvent{
+				ToolName:  e.ToolName,
+				ToolUseID: e.ToolUseID,
+				Phase:     agent.SubagentStarted,
+				Raw:       e.Raw,
+			})
+		case agent.ToolResultEvent:
+			name, ok := m.pending[e.ToolUseID]
+			if e.ToolUseID == "" || !ok {
+				continue
+			}
+			delete(m.pending, e.ToolUseID)
+			phase := agent.SubagentCompleted
+			if e.IsError {
+				phase = agent.SubagentFailed
+			}
+			if e.ToolName != "" {
+				name = e.ToolName
+			}
+			out = append(out, agent.SubagentEvent{
+				ToolName:  name,
+				ToolUseID: e.ToolUseID,
+				Phase:     phase,
+				Raw:       e.Raw,
+			})
+		}
+	}
+	return out
+}
+
+// isOpenCodeDelegationTool reports whether name is this adapter's native
+// sub-agent delegation tool. The adapter maps the canonical delegation
+// onto opencode's native `task` tool (see claudeToolToOC); the runner
+// keeps no list of tool names and counts the typed SubagentEvent the
+// mapper emits instead.
+func isOpenCodeDelegationTool(name string) bool {
+	return strings.EqualFold(strings.TrimSpace(name), "task")
+}
+
 func mapOpenCodeLine(line []byte) []agent.Event {
+	return decodeOpenCodeLine(line)
+}
+
+func decodeOpenCodeLine(line []byte) []agent.Event {
 	var env rawOpenCodeEnvelope
 	if err := json.Unmarshal(line, &env); err != nil {
 		return []agent.Event{agent.ErrorEvent{
@@ -1175,8 +1259,14 @@ func mapOpenCodeLine(line []byte) []agent.Event {
 
 func mapOpenCodeToolUse(line []byte, part *rawOpenCodePart) []agent.Event {
 	var input map[string]any
-	if len(part.State.Input) > 0 {
-		_ = json.Unmarshal(part.State.Input, &input)
+	var status string
+	var output string
+	if part.State != nil {
+		status = part.State.Status
+		output = part.State.Output
+		if len(part.State.Input) > 0 {
+			_ = json.Unmarshal(part.State.Input, &input)
+		}
 	}
 
 	toolEvent := agent.ToolUseEvent{
@@ -1186,20 +1276,21 @@ func mapOpenCodeToolUse(line []byte, part *rawOpenCodePart) []agent.Event {
 		Raw:       json.RawMessage(line),
 	}
 
-	if part.State == nil || part.State.Status != "completed" {
-		// Tool still pending/running — emit tool_use only.
+	switch status {
+	case "completed", "error":
+		// Tool reached a terminal state — emit tool_use + tool_result.
+		resultEvent := agent.ToolResultEvent{
+			ToolName:  part.Tool,
+			ToolUseID: part.CallID,
+			Content:   output,
+			IsError:   status == "error",
+			Raw:       json.RawMessage(line),
+		}
+		return []agent.Event{toolEvent, resultEvent}
+	default:
+		// Tool still pending/running (or no state) — emit tool_use only.
 		return []agent.Event{toolEvent}
 	}
-
-	// Tool completed — emit tool_use + tool_result.
-	resultEvent := agent.ToolResultEvent{
-		ToolName:  part.Tool,
-		ToolUseID: part.CallID,
-		Content:   part.State.Output,
-		IsError:   part.State.Status == "error",
-		Raw:       json.RawMessage(line),
-	}
-	return []agent.Event{toolEvent, resultEvent}
 }
 
 func mapOpenCodeStepFinish(line []byte, part *rawOpenCodePart) []agent.Event {
