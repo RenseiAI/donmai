@@ -4,6 +4,7 @@ import (
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"net"
 	"net/url"
@@ -15,7 +16,9 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	credentials "github.com/RenseiAI/donmai/credentials-client"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
@@ -321,7 +324,9 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // harness state, so a confined rename cannot carry it out from under its
 // rule. Resolver sockets are declared so name resolution keeps working
 // inside the profile, and a model endpoint on this machine has its port
-// declared (endpointLoopbackPorts) so model calls keep working.
+// declared (endpointLoopbackPorts) so model calls keep working; an endpoint
+// naming the daemon control API or the credential socket is refused first,
+// before anything is written.
 //
 // The tmp and cache directories are created through sessionStateFS, so a
 // link planted there refuses the spawn before anything is created outside.
@@ -330,6 +335,10 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner) (*confinement.Plan, error) {
 	if confiner == nil {
 		return nil, nil
+	}
+	loopbackPorts, err := endpointLoopbackPorts(spec)
+	if err != nil {
+		return nil, fmt.Errorf("%w: pi confinement: %v", agent.ErrSpawnFailed, err)
 	}
 	state, err := openSessionStateFS(layout)
 	if err != nil {
@@ -361,7 +370,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		SessionTmp:       tmpDir,
 		Caches:           caches,
 		Sockets:          confinement.ResolverSockets(),
-		LoopbackTCPPorts: endpointLoopbackPorts(spec),
+		LoopbackTCPPorts: loopbackPorts,
 	}
 	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {
 		cspec.WorkareaRoot = authority.WorkareaRoot
@@ -391,17 +400,45 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 // adapter declares for the session (ADR-2026-10-03 D2.5); without it every
 // model call of a gateway-routed session would fail. A remote endpoint, or
 // none, declares nothing.
-func endpointLoopbackPorts(spec agent.Spec) []int {
+//
+// The declaration opens the port, not one address: the backend renders it
+// as localhost:<port>, which also opens that port on ::1 and on the host's
+// own addresses. So an endpoint that names a supervisor channel is refused
+// rather than opened: the daemon control API (its well-known port and the
+// one this worker was told to dial) and the credential socket.
+func endpointLoopbackPorts(spec agent.Spec) ([]int, error) {
 	if spec.Endpoint == nil || strings.TrimSpace(spec.Endpoint.BaseURL) == "" {
-		return nil
+		return nil, nil
 	}
-	u, err := url.Parse(spec.Endpoint.BaseURL)
+	raw := spec.Endpoint.BaseURL
+	if socket := strings.TrimSpace(os.Getenv(credentials.SocketEnvVar)); socket != "" {
+		unescaped, err := url.PathUnescape(raw)
+		if strings.Contains(raw, socket) || (err == nil && strings.Contains(unescaped, socket)) {
+			return nil, errors.New("the model endpoint names the credential socket")
+		}
+	}
+	port, ok := loopbackPort(raw)
+	if !ok {
+		return nil, nil
+	}
+	for _, control := range daemonControlPorts() {
+		if port == control {
+			return nil, fmt.Errorf("the model endpoint names the daemon control API port %d", port)
+		}
+	}
+	return []int{port}, nil
+}
+
+// loopbackPort returns the port of rawURL when its host is this machine
+// (localhost or a loopback address), defaulting by scheme.
+func loopbackPort(rawURL string) (int, bool) {
+	u, err := url.Parse(rawURL)
 	if err != nil || u.Host == "" {
-		return nil
+		return 0, false
 	}
 	host := u.Hostname()
 	if ip := net.ParseIP(host); !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
-		return nil
+		return 0, false
 	}
 	port := u.Port()
 	if port == "" {
@@ -411,14 +448,27 @@ func endpointLoopbackPorts(spec agent.Spec) []int {
 		case "https":
 			port = "443"
 		default:
-			return nil
+			return 0, false
 		}
 	}
 	n, err := strconv.Atoi(port)
 	if err != nil || n < 1 || n > 65535 {
-		return nil
+		return 0, false
 	}
-	return []int{n}
+	return n, true
+}
+
+// daemonControlPorts are the loopback ports of the daemon control API this
+// worker can reach: the well-known port, and the port of the control URL the
+// daemon stated in this worker's environment when it is on this machine.
+func daemonControlPorts() []int {
+	ports := []int{runtimeenv.DefaultDaemonControlPort}
+	if raw := strings.TrimSpace(os.Getenv(runtimeenv.DaemonControlURLEnv)); raw != "" {
+		if port, ok := loopbackPort(raw); ok && port != runtimeenv.DefaultDaemonControlPort {
+			ports = append(ports, port)
+		}
+	}
+	return ports
 }
 
 // confinePiArgv wraps argv in the session's confinement plan. A nil plan (a

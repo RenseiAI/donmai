@@ -127,9 +127,6 @@ func stateDirDeletionReasonForRoots(command, cwd, stateRoot string) string {
 	return ""
 }
 
-// firstStateDirPathInRoots returns the first operand resolving into any of
-// the guarded roots.
-
 // stateDirRefusal composes the refusal text for one offending command.
 func stateDirRefusal(command, path string) string {
 	return stateDirGuardReasonPrefix + " via `" + command + "` (" + path + ")" + stateDirGuardExplanation

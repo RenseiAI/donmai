@@ -871,7 +871,7 @@ func (s *WorkerSpawner) spawnThroughShim(spec SessionSpec, project *ProjectConfi
 	if s.opts.ShimSpawn == nil {
 		return nil, false, nil
 	}
-	env := composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
+	env := s.sessionEnv(spec, project)
 	// OnPreSpawn is the credential rail, and a shim-backed session needs it for
 	// exactly the same reason a direct one does: the harness cannot start without
 	// the credentials the hook resolves. Skipping it for shim sessions would make
@@ -1109,7 +1109,7 @@ func (s *WorkerSpawner) spawn(spec SessionSpec, project *ProjectConfig) (*Sessio
 	ctx, cancel := context.WithCancel(context.Background())
 	cmd := exec.Command(command[0], command[1:]...) //nolint:gosec
 	configureSessionProcessGroup(cmd)
-	cmd.Env = composeEnv(s.opts.BaseEnv, spec.Env, s.daemonOwnedEnv(spec, project))
+	cmd.Env = s.sessionEnv(spec, project)
 
 	// The daemon, rather than os/exec, owns these read ends. That lets a waiter
 	// observe direct-child exit without closing a pump mid-buffer, while still
@@ -1811,6 +1811,23 @@ func (s *WorkerSpawner) daemonOwnedEnv(spec SessionSpec, project *ProjectConfig)
 		}
 	}
 	return env
+}
+
+// sessionEnv is the environment both spawn paths (direct and shim) hand a
+// worker, before OnPreSpawn: the daemon's filtered inherited environment,
+// then SpawnerOptions.BaseEnv, then the work item's SessionSpec.Env, then
+// daemonOwnedEnv.
+//
+// The work item's map loses the host-owned settings first
+// (runtimeenv.IsHostOwned). SessionSpec.Env is copied verbatim from the
+// orchestrator's work item and is applied after the daemon's own
+// environment, so without the filter a work item could override a host
+// setting for its own session — for example turn a host's
+// DONMAI_PI_CONFINEMENT=required into an unconfined pi seat. The host's
+// value comes from the daemon's inherited environment or BaseEnv, both of
+// which the host controls.
+func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []string {
+	return composeEnv(s.opts.BaseEnv, runtimeenv.FilterHostOwnedMap(spec.Env), s.daemonOwnedEnv(spec, project))
 }
 
 // composeEnv flattens the merged env into the os.Environ() form expected by

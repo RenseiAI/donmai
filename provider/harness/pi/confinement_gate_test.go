@@ -12,7 +12,9 @@ import (
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	credentials "github.com/RenseiAI/donmai/credentials-client"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // TestPiConfinementEnabled_FollowsTheRequest pins the gate (ADR-2026-10-03
@@ -89,39 +91,56 @@ func TestConfinerForSession_RequestWithoutWorkdirRefuses(t *testing.T) {
 }
 
 // TestEndpointLoopbackPorts declares exactly the session's own model
-// endpoint port when it is on this machine.
+// endpoint port when it is on this machine, and refuses an endpoint that
+// names a supervisor channel: the daemon control API (its well-known port
+// and the one this worker was told to dial) or the credential socket.
 func TestEndpointLoopbackPorts(t *testing.T) {
-	t.Parallel()
+	t.Setenv(runtimeenv.DaemonControlURLEnv, "http://127.0.0.1:9911")
+	t.Setenv(credentials.SocketEnvVar, "/var/run/donmai-test/cred.sock")
 	for _, tc := range []struct {
 		baseURL string
 		want    []int
+		refused string
 	}{
-		{"http://127.0.0.1:8123/v1", []int{8123}},
-		{"http://localhost:9000", []int{9000}},
-		{"http://[::1]:7000/v1", []int{7000}},
-		{"http://127.0.0.1/v1", []int{80}},
-		{"https://localhost/v1", []int{443}},
-		{"https://api.example.com/v1", nil},
-		{"http://10.0.0.5:8080", nil},
-		{"", nil},
-		{"::not a url", nil},
+		{baseURL: "http://127.0.0.1:8123/v1", want: []int{8123}},
+		{baseURL: "http://localhost:9000", want: []int{9000}},
+		{baseURL: "http://[::1]:7000/v1", want: []int{7000}},
+		{baseURL: "http://127.0.0.1/v1", want: []int{80}},
+		{baseURL: "https://localhost/v1", want: []int{443}},
+		{baseURL: "https://api.example.com/v1"},
+		{baseURL: "http://10.0.0.5:8080"},
+		{baseURL: ""},
+		{baseURL: "::not a url"},
+		{baseURL: "http://127.0.0.1:7734/v1", refused: "daemon control"},
+		{baseURL: "http://localhost:7734", refused: "daemon control"},
+		{baseURL: "http://[::1]:9911/api", refused: "daemon control"},
+		{baseURL: "unix:///var/run/donmai-test/cred.sock", refused: "credential socket"},
+		{baseURL: "http://localhost:9000/%2Fvar%2Frun%2Fdonmai-test%2Fcred.sock", refused: "credential socket"},
 	} {
 		spec := agent.Spec{}
 		if tc.baseURL != "" {
 			spec.Endpoint = &agent.EndpointBinding{BaseURL: tc.baseURL}
 		}
-		if got := endpointLoopbackPorts(spec); !slices.Equal(got, tc.want) {
-			t.Errorf("endpointLoopbackPorts(%q) = %v, want %v", tc.baseURL, got, tc.want)
+		got, err := endpointLoopbackPorts(spec)
+		if tc.refused != "" {
+			if err == nil || !strings.Contains(err.Error(), tc.refused) {
+				t.Errorf("endpointLoopbackPorts(%q) = %v, %v; want a refusal naming the %s", tc.baseURL, got, err, tc.refused)
+			}
+			continue
+		}
+		if err != nil || !slices.Equal(got, tc.want) {
+			t.Errorf("endpointLoopbackPorts(%q) = %v, %v; want %v", tc.baseURL, got, err, tc.want)
 		}
 	}
 }
 
 // TestSessionStateFS_RefusesPlantedLinks is the portable half of the resume
-// hazard (the darwin live test drives it through Resume): for a confined
-// layout, a symbolic link at any parent-side write path — the working
-// directory, the state root, the boundary extension, the injected
-// extensions directory, a cache directory, the exclude file — refuses
-// before anything is written outside.
+// hazard (the darwin live tests drive it through Resume and interactive
+// Spawn): for a confined layout, a symbolic link at any parent-side write
+// path — the working directory, the state root, the boundary extension, the
+// injected extensions directory, a cache directory, the exclude file — and a
+// second hard link on the exclude file (the one file written in place)
+// refuse before anything is written outside.
 func TestSessionStateFS_RefusesPlantedLinks(t *testing.T) {
 	t.Parallel()
 	body := []byte("export default function activate(pi) {}\n")
@@ -130,24 +149,35 @@ func TestSessionStateFS_RefusesPlantedLinks(t *testing.T) {
 		name  string
 		plant func(t *testing.T, cwd, outside string, layout sessionLayout)
 		step  func(spec agent.Spec) error
+		want  string // the refusal must name this; empty means "symbolic link"
 	}{
 		{"working directory", func(t *testing.T, cwd, outside string, _ sessionLayout) {
 			relink(t, cwd, filepath.Join(outside, "leaf"), true)
-		}, materializeStep},
+		}, materializeStep, ""},
 		{"state root", func(t *testing.T, _, outside string, layout sessionLayout) {
 			relink(t, layout.root, filepath.Join(outside, "state"), true)
-		}, materializeStep},
+		}, materializeStep, ""},
 		{"boundary extension", func(t *testing.T, _, outside string, layout sessionLayout) {
 			mkdirFixture(t, layout.root)
 			relink(t, layout.extension, filepath.Join(outside, "policy.ts"), false)
-		}, materializeStep},
+		}, materializeStep, ""},
 		{"git exclude", func(t *testing.T, cwd, outside string, _ sessionLayout) {
 			mkdirFixture(t, filepath.Join(cwd, ".git", "info"))
 			relink(t, filepath.Join(cwd, ".git", "info", "exclude"), filepath.Join(outside, "exclude"), false)
-		}, materializeStep},
+		}, materializeStep, ""},
 		{"git directory", func(t *testing.T, cwd, outside string, _ sessionLayout) {
 			relink(t, filepath.Join(cwd, ".git"), filepath.Join(outside, "git"), true)
-		}, materializeStep},
+		}, materializeStep, ""},
+		{"hard-linked git exclude", func(t *testing.T, cwd, outside string, _ sessionLayout) {
+			mkdirFixture(t, filepath.Join(cwd, ".git", "info"))
+			target := filepath.Join(outside, "exclude")
+			if err := os.WriteFile(target, []byte("keep\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Link(target, filepath.Join(cwd, ".git", "info", "exclude")); err != nil {
+				t.Fatal(err)
+			}
+		}, materializeStep, "hard link"},
 		{"injected extensions", func(t *testing.T, _, outside string, layout sessionLayout) {
 			mkdirFixture(t, layout.root)
 			relink(t, layout.injected, filepath.Join(outside, "injected"), true)
@@ -158,7 +188,7 @@ func TestSessionStateFS_RefusesPlantedLinks(t *testing.T) {
 			}
 			_, err = materializeAdditionalExtensions(layout, []agent.ExtensionDelivery{delivery})
 			return err
-		}},
+		}, ""},
 		{"cache directory", func(t *testing.T, _, outside string, layout sessionLayout) {
 			mkdirFixture(t, layout.root)
 			relink(t, filepath.Join(layout.root, piSessionCacheDir), filepath.Join(outside, "cache"), true)
@@ -168,7 +198,7 @@ func TestSessionStateFS_RefusesPlantedLinks(t *testing.T) {
 				return err
 			}
 			return writeStateDirs(layout)
-		}},
+		}, ""},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
@@ -180,9 +210,13 @@ func TestSessionStateFS_RefusesPlantedLinks(t *testing.T) {
 			spec := agent.Spec{Cwd: cwd}
 			tc.plant(t, cwd, outside, newSessionLayoutForSpec(spec))
 			before := listTree(t, outside)
+			want := tc.want
+			if want == "" {
+				want = "symbolic link"
+			}
 			err := tc.step(spec)
-			if err == nil || !strings.Contains(err.Error(), "symbolic link") {
-				t.Fatalf("step = %v, want a refusal naming the symbolic link", err)
+			if err == nil || !strings.Contains(err.Error(), want) {
+				t.Fatalf("step = %v, want a refusal naming the %s", err, want)
 			}
 			if after := listTree(t, outside); after != before {
 				t.Fatalf("wrote outside before refusing:\nbefore %s\nafter  %s", before, after)

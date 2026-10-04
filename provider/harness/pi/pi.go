@@ -17,6 +17,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
 // newHandshakeToken returns a random hex secret the harness sets in the child
@@ -152,8 +153,9 @@ type Options struct {
 // on this host request confinement (ADR-2026-10-03 D5.1, placement-owned
 // configuration). The only recognized value is "required"; anything else
 // leaves Options.RequireConfinement as the caller set it. It can only
-// tighten.
-const piConfinementEnvVar = "DONMAI_PI_CONFINEMENT"
+// tighten. It is host-owned (runtimeenv.IsHostOwned): the daemon drops a
+// work item's copy, so the worker sees only the host's value.
+const piConfinementEnvVar = runtimeenv.PiConfinementEnv
 
 // New probes the pi binary and enforces the version pin (probe-time, per
 // design §2 / opencode §8). A confirmed-below-MinVersion binary fails

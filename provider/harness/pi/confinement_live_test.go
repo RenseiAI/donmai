@@ -9,6 +9,7 @@ import (
 	"errors"
 	"fmt"
 	"io/fs"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -23,6 +24,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
@@ -61,7 +63,8 @@ import (
 // set, a write into a read-only sibling, an append to the boundary extension
 // (protected under confinement), and a write into $TMPDIR (the session tmp
 // under confinement); it records $TMPDIR and $GOCACHE and the descriptors it
-// holds. Every attempt sends its errors into the report and the script
+// holds, and, when the test names two loopback ports, whether it can connect
+// to each. Every attempt sends its errors into the report and the script
 // always exits zero, so the verdict comes from the report. In headless mode
 // (`--mode rpc`) it then plays the RPC side: the handshake, and after the
 // provider's first two commands (get_state plus the prompt or get_entries) a
@@ -77,6 +80,10 @@ r="$PROBE_MUT/report.txt"
 (echo tmp-ok > "$TMPDIR/probe-tmp.txt") 2>>"$r"; echo "tmp=$?" >> "$r"
 echo "tmpdir=$TMPDIR" >> "$r"
 echo "gocache=$GOCACHE" >> "$r"
+if [ -n "$PROBE_PORT_DECLARED" ]; then
+	nc -z -G 3 127.0.0.1 "$PROBE_PORT_DECLARED" >/dev/null 2>&1; echo "declared=$?" >> "$r"
+	nc -z -G 3 127.0.0.1 "$PROBE_PORT_UNDECLARED" >/dev/null 2>&1; echo "undeclared=$?" >> "$r"
+fi
 ls -l /dev/fd > "$PROBE_MUT/fds.txt" 2>/dev/null
 case " $* " in
 *" --mode rpc "*)
@@ -193,8 +200,9 @@ func (w liveWorld) authority() *agent.RepositoryAuthorityPolicy {
 }
 
 // writeLiveHarness writes the fake harness and its per-test inputs into a
-// fresh directory outside the set and returns the harness path.
-func writeLiveHarness(t *testing.T, w liveWorld) string {
+// fresh directory outside the set and returns the harness path. extra are
+// further KEY=VALUE lines for probe.env.
+func writeLiveHarness(t *testing.T, w liveWorld, extra ...string) string {
 	t.Helper()
 	dir := t.TempDir()
 	bin := filepath.Join(dir, "fake-pi")
@@ -215,6 +223,9 @@ func writeLiveHarness(t *testing.T, w liveWorld) string {
 	extension := newSessionLayoutForSpec(w.spec()).extension
 	env := fmt.Sprintf("PROBE_MUT='%s'\nPROBE_OUTSIDE='%s'\nPROBE_RO='%s'\nPROBE_EXTENSION='%s'\nPROBE_HANDSHAKE='%s'\nPROBE_BODY='%s'\n",
 		w.mut, w.outside, w.ro, extension, handshake, body)
+	for _, line := range extra {
+		env += line + "\n"
+	}
 	if err := os.WriteFile(filepath.Join(dir, "probe.env"), []byte(env), 0o600); err != nil {
 		t.Fatal(err)
 	}
@@ -535,44 +546,52 @@ func TestPiConfinement_InlineRequiredExtensionStartsConfined(t *testing.T) {
 	}
 }
 
-// TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting pins the resume
-// hazard: the seat had the whole previous run to leave a symbolic link where
-// the parent expects state. The unconfined parent must refuse before any
-// write, never follow the link: nothing outside the set is created or
-// modified, and the child never runs.
-func TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting(t *testing.T) {
-	body := []byte("export default function activate(pi) {}\n")
-	cases := []struct {
-		name  string
-		plant func(t *testing.T, w liveWorld, layout sessionLayout)
-	}{
+// plantedLinkCase is one link the seat could have left in its state during
+// a previous run, and the refusal it must produce.
+type plantedLinkCase struct {
+	name  string
+	plant func(t *testing.T, w liveWorld, layout sessionLayout)
+	want  string // the refusal names this
+}
+
+func plantedLinkCases() []plantedLinkCase {
+	return []plantedLinkCase{
 		{"git exclude file", func(t *testing.T, w liveWorld, _ sessionLayout) {
 			target := filepath.Join(w.outside, "exclude")
 			mustWrite(t, target, "keep\n")
 			path := filepath.Join(w.mut, ".git", "info", "exclude")
 			_ = os.Remove(path)
 			mustSymlink(t, target, path)
-		}},
+		}, "symbolic link"},
+		{"hard-linked git exclude file", func(t *testing.T, w liveWorld, _ sessionLayout) {
+			target := filepath.Join(w.outside, "exclude")
+			mustWrite(t, target, "keep\n")
+			path := filepath.Join(w.mut, ".git", "info", "exclude")
+			_ = os.Remove(path)
+			if err := os.Link(target, path); err != nil {
+				t.Fatal(err)
+			}
+		}, "hard link"},
 		{"injected extensions directory", func(t *testing.T, w liveWorld, layout sessionLayout) {
 			mustMkdir(t, filepath.Join(w.outside, "injected"))
 			mustMkdir(t, layout.root)
 			mustSymlink(t, filepath.Join(w.outside, "injected"), layout.injected)
-		}},
+		}, "symbolic link"},
 		{"session cache directory", func(t *testing.T, w liveWorld, layout sessionLayout) {
 			mustMkdir(t, filepath.Join(w.outside, "cache"))
 			mustMkdir(t, layout.root)
 			mustSymlink(t, filepath.Join(w.outside, "cache"), filepath.Join(layout.root, piSessionCacheDir))
-		}},
+		}, "symbolic link"},
 		{"boundary extension file", func(t *testing.T, w liveWorld, layout sessionLayout) {
 			target := filepath.Join(w.outside, "policy.ts")
 			mustWrite(t, target, "keep\n")
 			mustMkdir(t, layout.root)
 			mustSymlink(t, target, layout.extension)
-		}},
+		}, "symbolic link"},
 		{"session state root", func(t *testing.T, w liveWorld, layout sessionLayout) {
 			mustMkdir(t, filepath.Join(w.outside, "state"))
 			mustSymlink(t, filepath.Join(w.outside, "state"), layout.root)
-		}},
+		}, "symbolic link"},
 		{"working directory", func(t *testing.T, w liveWorld, _ sessionLayout) {
 			leaf := filepath.Join(w.outside, "leaf")
 			mustMkdir(t, leaf)
@@ -581,26 +600,35 @@ func TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting(t *testing.T) {
 				t.Fatal(err)
 			}
 			mustSymlink(t, leaf, w.mut)
-		}},
+		}, "symbolic link"},
 	}
-	for _, tc := range cases {
+}
+
+// runPlantedLinkCases plants each case in a fresh world, starts the session
+// through start (a confined entry point), and asserts it was refused for the
+// link before the parent wrote anything outside the set, and that the child
+// never ran.
+func runPlantedLinkCases(t *testing.T, mode func(agent.Spec) agent.Spec, start func(p *Provider, spec agent.Spec) (agent.Handle, error)) {
+	t.Helper()
+	body := []byte("export default function activate(pi) {}\n")
+	for _, tc := range plantedLinkCases() {
 		t.Run(tc.name, func(t *testing.T) {
 			w := newLiveWorld(t)
 			bin := writeLiveHarness(t, w)
-			spec := w.spec()
+			spec := mode(w.spec())
 			spec.AdditionalExtensions = []agent.ExtensionDelivery{
 				{ID: "bridge", Kind: agent.ExtensionDeliveryInline, Source: body, Basename: "bridge.ts", Digest: sha256Hex(body), Required: true},
 			}
 			tc.plant(t, w, newSessionLayoutForSpec(spec))
 			before := snapshotTree(t, w.outside)
 
-			h, err := liveProvider(t, bin, true).Resume(liveCtx(t), "ses_live", spec)
+			h, err := start(liveProvider(t, bin, true), spec)
 			if err == nil {
-				finishHeadless(t, h)
-				t.Fatalf("Resume ran with a planted link")
+				_ = h.Stop(context.Background())
+				t.Fatalf("the session started with a planted link")
 			}
-			if !strings.Contains(err.Error(), "symbolic link") {
-				t.Errorf("Resume refused for another reason: %v", err)
+			if !strings.Contains(err.Error(), tc.want) {
+				t.Errorf("refused for another reason (want %q): %v", tc.want, err)
 			}
 			if after := snapshotTree(t, w.outside); after != before {
 				t.Errorf("the parent wrote outside the set before refusing.\nbefore:\n%s\nafter:\n%s", before, after)
@@ -609,6 +637,117 @@ func TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting(t *testing.T) {
 				t.Errorf("the child ran")
 			}
 		})
+	}
+}
+
+// TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting pins the resume
+// hazard: the seat had the whole previous run to leave a symbolic link (or a
+// hard link) where the parent expects state. The unconfined parent must
+// refuse before any write, never follow the link: nothing outside the set is
+// created or modified, and the child never runs.
+func TestPiConfinement_ResumeRefusesPlantedLinksBeforeWriting(t *testing.T) {
+	runPlantedLinkCases(t, func(spec agent.Spec) agent.Spec { return spec },
+		func(p *Provider, spec agent.Spec) (agent.Handle, error) {
+			return p.Resume(liveCtx(t), "ses_live", spec)
+		})
+}
+
+// TestPiConfinement_InteractiveRefusesPlantedLinksBeforeWriting is the same
+// for the interactive path: an interactive session started in a working
+// directory a previous run left links in is refused the same way.
+func TestPiConfinement_InteractiveRefusesPlantedLinksBeforeWriting(t *testing.T) {
+	runPlantedLinkCases(t, func(spec agent.Spec) agent.Spec {
+		spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+		return spec
+	}, func(p *Provider, spec agent.Spec) (agent.Handle, error) {
+		return p.Spawn(liveCtx(t), spec)
+	})
+}
+
+// TestPiConfinement_LoopbackEndpointPortIsTheOnlyLoopbackOpening pins the
+// declared-port rule under the real backend: a confined session whose model
+// endpoint is on loopback can connect to that port and to no other loopback
+// port; the unconfined control reaches both. An endpoint naming the daemon
+// control API port is refused before anything is written or run.
+func TestPiConfinement_LoopbackEndpointPortIsTheOnlyLoopbackOpening(t *testing.T) {
+	declared := liveListener(t)
+	undeclared := liveListener(t)
+	w := newLiveWorld(t)
+	bin := writeLiveHarness(t, w,
+		fmt.Sprintf("PROBE_PORT_DECLARED='%d'", declared),
+		fmt.Sprintf("PROBE_PORT_UNDECLARED='%d'", undeclared))
+	spec := w.spec()
+	spec.Endpoint = liveEndpoint(fmt.Sprintf("http://127.0.0.1:%d/v1", declared))
+
+	h, err := liveProvider(t, bin, true).Spawn(liveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("confined Spawn: %v", err)
+	}
+	finishHeadless(t, h)
+	r := readProbeReport(t, w)
+	if r.vals["declared"] != "0" {
+		t.Errorf("confined: the declared endpoint port was not reachable:\n%s", r.raw)
+	}
+	if got, ok := r.vals["undeclared"]; !ok || got == "0" {
+		t.Errorf("confined: an undeclared loopback port was reachable (status %q):\n%s", got, r.raw)
+	}
+
+	resetProbe(w)
+	h, err = liveProvider(t, bin, false).Spawn(liveCtx(t), spec)
+	if err != nil {
+		t.Fatalf("unconfined Spawn: %v", err)
+	}
+	finishHeadless(t, h)
+	r = readProbeReport(t, w)
+	if r.vals["declared"] != "0" || r.vals["undeclared"] != "0" {
+		t.Errorf("UNCONFINED control: a loopback port was unreachable, so the test cannot discriminate:\n%s", r.raw)
+	}
+
+	resetProbe(w)
+	daemonPort := spec
+	daemonPort.Endpoint = liveEndpoint(fmt.Sprintf("http://127.0.0.1:%d/v1", runtimeenv.DefaultDaemonControlPort))
+	if h, err := liveProvider(t, bin, true).Spawn(liveCtx(t), daemonPort); err == nil {
+		_ = h.Stop(context.Background())
+		t.Fatalf("a confined session whose endpoint names the daemon control port started")
+	} else if !strings.Contains(err.Error(), "daemon control") {
+		t.Errorf("refused for another reason: %v", err)
+	}
+	if _, err := os.Lstat(filepath.Join(w.mut, "report.txt")); err == nil {
+		t.Errorf("the child ran for an endpoint naming the daemon control port")
+	}
+}
+
+// liveListener accepts and closes loopback connections until the test ends,
+// and returns its port.
+func liveListener(t *testing.T) int {
+	t.Helper()
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = ln.Close() })
+	go func() {
+		for {
+			conn, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	return ln.Addr().(*net.TCPAddr).Port
+}
+
+// liveEndpoint is a model endpoint binding at baseURL that admission
+// accepts; nothing in these tests calls it as a model.
+func liveEndpoint(baseURL string) *agent.EndpointBinding {
+	return &agent.EndpointBinding{
+		Company:  agent.CompanyStub,
+		Model:    "live-endpoint-model",
+		BaseURL:  baseURL,
+		Protocol: agent.ProtoOpenAIChat,
+		Host:     agent.HostDirect,
+		Env:      map[string]string{"OPENAI_API_KEY": "live-endpoint-placeholder"}, //nolint:gosec // G101: fixture placeholder, not a credential.
 	}
 }
 
