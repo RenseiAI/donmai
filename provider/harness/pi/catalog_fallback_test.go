@@ -201,6 +201,43 @@ func TestPrepare_CatalogMiss_KeepsRefusingUnbound(t *testing.T) {
 	}
 }
 
+// TestPrepare_CatalogMiss_MirrorsSpecKeyNotHostKey pins the fallback's
+// credential source: the injected provider must read the resolved cell key
+// from the spec (the vendor var applyEndpoint left on Spec.Env), never from
+// the host process env. The spec carries only the vendor variable with a
+// spec value while the host export holds a different value; the mirrored
+// key must equal the spec value. RED proof: change the fallback mirror to
+// read os.Getenv(envVar) and this test fails with the host value.
+func TestPrepare_CatalogMiss_MirrorsSpecKeyNotHostKey(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv("ZAI_API_KEY", "host-vendor-key")
+	p := &Provider{binary: "pi", opts: Options{
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			return "provider  model\n", nil // confirmed miss
+		},
+	}}
+	spec, err := p.prepare(context.Background(), agent.Spec{
+		Prompt: "hi",
+		Cwd:    t.TempDir(),
+		Model:  "zai/glm-9.9-next",
+		Env:    map[string]string{"ZAI_API_KEY": "spec-cell-key"},
+		Endpoint: &agent.EndpointBinding{
+			Company:  agent.CompanyOpenAI,
+			Host:     agent.HostDirect,
+			BaseURL:  "https://api.z.ai/api/coding/paas/v4",
+			Protocol: agent.ProtoOpenAIChat,
+			Env:      map[string]string{},
+		},
+		ProviderConfig: map[string]any{"maxOutputTokens": 64000},
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if got := spec.Env[PiKeyEnvVar]; got != "spec-cell-key" {
+		t.Errorf("%s = %q, want the spec value %q (host value must not win)", PiKeyEnvVar, got, "spec-cell-key")
+	}
+}
+
 // TestSpawn_CatalogMiss_FallsBackToInjectedProvider drives the fallback
 // through a full Spawn on a direct provider endpoint pinned to an id the
 // scripted catalog lacks: the session spawns through the injected provider
