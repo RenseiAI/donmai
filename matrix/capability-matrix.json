@@ -595,7 +595,7 @@
         "tools": false,
         "mcp": true,
         "allowedToolsList": true,
-        "subagents": false,
+        "subagents": true,
         "parentToolUseId": false,
         "reasoningEffort": true,
         "oneShot": true,
@@ -655,6 +655,7 @@
             "llm_call",
             "tool_use",
             "tool_result",
+            "subagent",
             "result",
             "error"
           ],
@@ -667,6 +668,7 @@
             "llm_call",
             "tool_use",
             "tool_result",
+            "subagent",
             "result",
             "error"
           ],

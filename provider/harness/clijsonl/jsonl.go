@@ -189,6 +189,7 @@ type rawAPIError struct {
 // in `Raw` so the runner can persist it to <worktree>/.agent/events.jsonl per
 // F.1.1 §4 step 9. LlmCallEvent is the deliberate exception: it stays
 // metadata/digest-only and never duplicates prompt/completion content.
+
 // delegationToolName reports whether name is one of this adapter's native
 // sub-agent delegation tools. The adapter names its own delegation tools
 // (matched the same way the runner historically matched them: "Task" and
