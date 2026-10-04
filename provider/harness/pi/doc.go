@@ -261,6 +261,28 @@
 //     audit file to decide a security outcome, which is worse than recording
 //     the calls as unproven.
 //
+// # Sequential shell and file-write tools (ordering, not a trust layer)
+//
+// pi runs the tool calls of one assistant message concurrently by default:
+// every call's tool_call hook runs first, in order, then all executions
+// start together, so dependent shell calls (git add, git status, git commit)
+// race. The runtime's only switch is a per-tool executionMode — a batch that
+// names any tool registered "sequential" runs one call at a time, in source
+// order, each hook immediately before its own execution. The policy extension
+// therefore re-registers bash, write and edit under their own names with that
+// mode and pi's own implementation (registerSequentialTools). It is layered
+// under the fence above, not beside it: tool_call still fires for every call
+// under the unchanged names, so adjudication, the bounds rail and the
+// state-dir guard all apply, and the overrides are registered only after
+// those handlers. A hook-side queue cannot do this (every hook in a parallel
+// batch returns before the first execution starts), and a missing host
+// factory leaves the built-ins in place, unordered, with the fence intact.
+// Fixtures: tool_call_bounds_test.go —
+// TestToolCallBounds_SequentialOverridesLayerUnderTheFence (scripted, both
+// lanes); extension_delivery_real_binary_test.go —
+// TestRealBinary_SequentialShellTools_RunInOrder and
+// TestRealBinary_SequentialToolOverride_KeepsPolicyFence (real binary).
+//
 // # D8 fixture family
 //
 // ADR-2026-08-06 D8 requires a named positive/negative fixture family per

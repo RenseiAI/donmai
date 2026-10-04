@@ -13,6 +13,16 @@
 // JSON line on stdout so the Go test can assert on real extension behavior
 // without spawning pi.
 //
+// It also proves the sequential shell and file-write overrides
+// (sequentialToolOverride / registerSequentialTools) without a pi process:
+// the extension is activated in both lanes against a stub ExtensionAPI, once
+// with its host-package import pointed at a stub module of tool factories
+// (the import specifier is rewritten in this harness's copy of the source,
+// and the rewrite must hit exactly once — a renamed or removed import fails
+// loudly here, never silently), and once unrewritten, where the import
+// cannot resolve from a data: URL, standing in for a host that lacks the
+// factories.
+//
 // Usage: node tool-call-bounds-harness.mjs <extensionPath>
 // Env: none.
 
@@ -277,7 +287,11 @@ checkStrippedSyntax(stripped);
 const dataURL = "data:text/javascript;base64," + Buffer.from(stripped, "utf8").toString("base64");
 const mod = await import(dataURL);
 
-if (typeof mod.resolveBashTimeoutSeconds !== "function" || typeof mod.withPipefailPrelude !== "function") {
+if (
+  typeof mod.resolveBashTimeoutSeconds !== "function" ||
+  typeof mod.withPipefailPrelude !== "function" ||
+  typeof mod.sequentialToolOverride !== "function"
+) {
   console.log(JSON.stringify({ ok: false, reason: "helpers not exported" }));
   process.exit(0);
 }
@@ -298,4 +312,107 @@ const preludeCases = {
   alreadyPrefixed: withPipefailPrelude("set -o pipefail 2>/dev/null; echo hi"),
   empty: withPipefailPrelude(""),
 };
-console.log(JSON.stringify({ ok: true, timeoutCases, preludeCases }));
+// --- Sequential overrides ---
+
+const HOST_IMPORT = 'import("@earendil-works/pi-coding-agent")';
+const stubHostURL =
+  "data:text/javascript;base64," +
+  Buffer.from(
+    `export const calls = [];
+const make = (name) => (cwd) => ({
+  name,
+  label: name,
+  description: "stub " + name,
+  promptSnippet: "snippet " + name,
+  parameters: { type: "object" },
+  async execute(toolCallId, params, signal, onUpdate, ctx) {
+    calls.push({ name, cwd, toolCallId, params });
+    return { content: [{ type: "text", text: name + " ran" }], details: { cwd } };
+  },
+});
+export const createBashToolDefinition = make("bash");
+export const createWriteToolDefinition = make("write");
+export const createEditToolDefinition = make("edit");
+export const createReadToolDefinition = make("read");
+`,
+    "utf8",
+  ).toString("base64");
+
+const hostImports = stripped.split(HOST_IMPORT).length - 1;
+if (hostImports !== 1) {
+  console.log(JSON.stringify({ ok: false, reason: "expected exactly one " + HOST_IMPORT + " in the extension, found " + hostImports }));
+  process.exit(0);
+}
+const wired = stripped.replace(HOST_IMPORT, "import(" + JSON.stringify(stubHostURL) + ")");
+const wiredMod = await import("data:text/javascript;base64," + Buffer.from(wired, "utf8").toString("base64"));
+const stubHost = await import(stubHostURL);
+
+// activateLane runs the extension's default export against a stub
+// ExtensionAPI and records, in order, every handler and tool it registers.
+async function activateLane(module, handshakeToken) {
+  if (handshakeToken) process.env.DONMAI_PI_HANDSHAKE = handshakeToken;
+  else delete process.env.DONMAI_PI_HANDSHAKE;
+  const sequence = [];
+  const tools = [];
+  const stubPi = {
+    registerProvider() {},
+    registerTool(definition) {
+      sequence.push("tool:" + definition.name);
+      tools.push(definition);
+    },
+    on(event) {
+      sequence.push("on:" + event);
+    },
+  };
+  await module.default(stubPi);
+  delete process.env.DONMAI_PI_HANDSHAKE;
+  return { sequence, tools };
+}
+
+function describeLane(lane) {
+  return {
+    sequence: lane.sequence,
+    tools: lane.tools.map((tool) => ({
+      name: tool.name,
+      executionMode: tool.executionMode ?? null,
+      promptSnippet: tool.promptSnippet ?? null,
+    })),
+  };
+}
+
+const interactiveLane = await activateLane(wiredMod, "");
+const rpcLane = await activateLane(wiredMod, "fixture-handshake-token");
+const unresolvedLane = await activateLane(mod, "fixture-handshake-token");
+
+// Delegation: the override runs pi's own factory, built for the session's
+// cwd, with the very params object the tool_call hook mutated.
+const bash = rpcLane.tools.find((tool) => tool.name === "bash");
+const params = { command: "set -o pipefail 2>/dev/null; true", timeout: 300 };
+let delegation = null;
+if (bash) {
+  const result = await bash.execute("fixture-call", params, undefined, undefined, { cwd: "/fixture/session-cwd" });
+  const call = stubHost.calls[stubHost.calls.length - 1] ?? {};
+  delegation = {
+    cwd: call.cwd ?? null,
+    toolCallId: call.toolCallId ?? null,
+    sameParams: call.params === params,
+    resultCwd: result?.details?.cwd ?? null,
+  };
+}
+
+const goodFactory = (cwd) => ({ name: "bash", execute: async () => ({ content: [], details: { cwd } }) });
+const rejects = {
+  notAFunction: mod.sequentialToolOverride(undefined, "bash", "/fixture") === undefined,
+  wrongTool: mod.sequentialToolOverride(goodFactory, "write", "/fixture") === undefined,
+  noExecute: mod.sequentialToolOverride(() => ({ name: "bash" }), "bash", "/fixture") === undefined,
+  accepted: mod.sequentialToolOverride(goodFactory, "bash", "/fixture")?.executionMode ?? null,
+};
+
+const sequential = {
+  lanes: { interactive: describeLane(interactiveLane), rpc: describeLane(rpcLane) },
+  unresolvedHost: describeLane(unresolvedLane),
+  delegation,
+  rejects,
+};
+
+console.log(JSON.stringify({ ok: true, timeoutCases, preludeCases, sequential }));
