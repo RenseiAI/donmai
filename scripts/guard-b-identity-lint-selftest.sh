@@ -22,9 +22,17 @@ set -eo pipefail
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 WRAPPER="$REPO_ROOT/scripts/guard-b-identity-lint.sh"
 
-# Isolate every git command from the invoking user's real git config.
+# Isolate every git command from the invoking user's real git config,
+# and from ambient identity: CI runners have no user.name/user.email and
+# no GIT_AUTHOR_*/GIT_COMMITTER_* env, so every throwaway `git commit`
+# below must not depend on ambient config (else git exits 128 and `set -e`
+# aborts the step with no output). Mirrors guard-b-lint-selftest.sh.
 export GIT_CONFIG_GLOBAL=/dev/null
 export GIT_CONFIG_SYSTEM=/dev/null
+export GIT_AUTHOR_NAME=t
+export GIT_AUTHOR_EMAIL=t@example.invalid
+export GIT_COMMITTER_NAME=t
+export GIT_COMMITTER_EMAIL=t@example.invalid
 
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
@@ -44,7 +52,7 @@ L='r'
 init_repo() {
   local d="$1"
   mkdir -p "$d"
-  (cd "$d" && git init -q .) >/dev/null 2>&1
+  (cd "$d" && git -c init.defaultBranch=main init -q .) >/dev/null 2>&1
 }
 
 commit_with_ident() {
