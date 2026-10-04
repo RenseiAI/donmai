@@ -47,6 +47,7 @@ const (
 	opSymlinkWrite stepOp = "symlink_write"
 	opListen       stepOp = "listen"
 	opDial         stepOp = "dial"
+	opTCPDial      stepOp = "tcp_dial"
 	opDevWrite     stepOp = "dev_write"
 	opStdout       stepOp = "stdout"
 	opReenter      stepOp = "reenter"
@@ -66,6 +67,7 @@ type probeStep struct {
 	Label    string   `json:"label,omitempty"`
 	Services []string `json:"services,omitempty"`
 	PID      int      `json:"pid,omitempty"`
+	Port     int      `json:"port,omitempty"`
 }
 
 type probePlan struct {
@@ -157,6 +159,8 @@ func runStep(step probeStep) stepResult {
 		err = listenAndDial(step.Path)
 	case opDial:
 		err = dial(step.Path)
+	case opTCPDial:
+		err = dialTCP(step.Port)
 	case opDevWrite:
 		err = appendFile(step.Path)
 	case opStdout:
@@ -237,6 +241,16 @@ func listenAndDial(path string) error {
 
 func dial(path string) error {
 	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// dialTCP connects to the loopback address on one port: the probe the
+// profile's loopback deny is judged by.
+func dialTCP(port int) error {
+	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 5*time.Second)
 	if err != nil {
 		return err
 	}

@@ -11,7 +11,19 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v1"
+const seatbeltProfileVersion = "seatbelt-profile-v2"
+
+// loopbackTCPDeny closes outbound TCP to the local machine (loopback and
+// the host's own addresses, which the profile names "localhost"): the
+// write proxy through a local TCP service. The spawner declares the ports
+// the harness legitimately needs; nothing is allowed by default.
+const loopbackTCPDeny = `(deny network-outbound (remote tcp "localhost:*"))`
+
+// loopbackTCPAllow re-opens one declared loopback TCP port. It renders
+// after the deny, so the last matching rule wins.
+func loopbackTCPAllow(port int) string {
+	return fmt.Sprintf(`(allow network-outbound (remote tcp "localhost:%d"))`, port)
+}
 
 // lookupDeny is one class of named services the profile closes (D2.5).
 type lookupDeny struct {
@@ -31,6 +43,9 @@ var seatbeltLookupDenies = []lookupDeny{
 	}},
 	{class: "apple_events", services: []string{
 		"com.apple.coreservices.appleevents",
+	}},
+	{class: "pasteboard", services: []string{
+		"com.apple.pasteboard.1",
 	}},
 	{class: "mount", services: []string{
 		"com.apple.DiskArbitration.diskarbitrationd",
@@ -66,8 +81,9 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 //     its metadata, and pin every ancestor between a writable root and a
 //     nested denied path against rename — after the allows, so they win;
 //  5. close the write proxies: mounting, job submission, launch services,
-//     scripting events, preference writes, task ports and local sockets
-//     outside the set (D2.5);
+//     scripting events, preference writes, task ports, local sockets
+//     outside the set, loopback TCP outside the declared ports, and the
+//     pasteboard (D2.5);
 //  6. the composer's deny-only rules, last, so they always win (D4.3).
 func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(string) (string, error)) (string, error) {
 	var b strings.Builder
@@ -187,6 +203,10 @@ func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(s
 		socketAllows = append(socketAllows, fmt.Sprintf("(remote unix-socket (path-literal %s))", quoted))
 	}
 	rule("allow", "network-outbound", socketAllows)
+	b.WriteString(loopbackTCPDeny + "\n")
+	for _, port := range r.LoopbackTCPPorts {
+		b.WriteString(loopbackTCPAllow(port) + "\n")
+	}
 
 	composer, err := renderComposerRules(r, rules, canonical)
 	if err != nil {

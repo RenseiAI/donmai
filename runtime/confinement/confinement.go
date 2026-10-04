@@ -45,7 +45,7 @@ var classOrder = map[WritableClass]int{
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
 // every earlier self-test record stale.
-const ProbeSetVersion = "executor-confinement-probes-v1"
+const ProbeSetVersion = "executor-confinement-probes-v2"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the
@@ -80,6 +80,10 @@ type Spec struct {
 	// (its control channel, an agent socket the credentials level grants, the
 	// OS resolver). Every other socket outside the writable set is closed.
 	Sockets []string
+	// LoopbackTCPPorts are the loopback TCP ports the adapter declares for
+	// the session. Outbound TCP to the local machine is denied except on
+	// these ports; nothing is allowed by default.
+	LoopbackTCPPorts []int
 }
 
 // Cache is one per-session toolchain cache bound to an environment variable.
