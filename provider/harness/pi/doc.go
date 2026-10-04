@@ -277,6 +277,15 @@
 // those handlers. A hook-side queue cannot do this (every hook in a parallel
 // batch returns before the first execution starts), and a missing host
 // factory leaves the built-ins in place, unordered, with the fence intact.
+// The overrides are extension tools, so they re-enable bash, write and edit
+// even when a defaultTools setting or --no-builtin-tools left those built-ins
+// off: the runtime builds its tool list with extension tools switched on
+// regardless of the built-in defaults (only --tools/--exclude-tools still
+// constrain extension tools, and donmai passes neither flag — only a
+// repo-controlled .pi/settings.json could narrow the built-ins). This stays
+// ordering-only, never a wider tool surface: tool_call still fires for every
+// call under the unchanged names, so the fence above still adjudicates each
+// one.
 // Fixtures: tool_call_bounds_test.go —
 // TestToolCallBounds_SequentialOverridesLayerUnderTheFence (scripted, both
 // lanes); extension_delivery_real_binary_test.go —

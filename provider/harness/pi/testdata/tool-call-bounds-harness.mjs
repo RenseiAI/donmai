@@ -354,19 +354,21 @@ async function activateLane(module, handshakeToken) {
   else delete process.env.DONMAI_PI_HANDSHAKE;
   const sequence = [];
   const tools = [];
+  const handlers = {};
   const stubPi = {
     registerProvider() {},
     registerTool(definition) {
       sequence.push("tool:" + definition.name);
       tools.push(definition);
     },
-    on(event) {
+    on(event, handler) {
       sequence.push("on:" + event);
+      handlers[event] = handler;
     },
   };
   await module.default(stubPi);
   delete process.env.DONMAI_PI_HANDSHAKE;
-  return { sequence, tools };
+  return { sequence, tools, handlers };
 }
 
 function describeLane(lane) {
@@ -413,6 +415,37 @@ const sequential = {
   unresolvedHost: describeLane(unresolvedLane),
   delegation,
   rejects,
+  fenceProbe: await probeFenceWhileUnverified(rpcLane),
+};
+
+// probeFenceWhileUnverified drives the REAL rpc-lane tool_call handler for
+// every overridden tool while the boundary is still unverified (no handshake
+// round-trip has run, so verified is false). A fail-closed fence blocks each
+// one — proving the calls the sequential overrides re-enable under the
+// unchanged names still reach adjudication. Returns one entry per tool:
+// { block: boolean, reason: string|null }.
+async function probeFenceWhileUnverified(lane) {
+  const out = {};
+  const handler = lane.handlers["tool_call"];
+  for (const tool of ["bash", "write", "edit"]) {
+    if (typeof handler !== "function") {
+      out[tool] = { block: false, reason: "no tool_call handler registered" };
+      continue;
+    }
+    try {
+      const verdict = await handler(
+        { toolName: tool, toolCallId: "probe-" + tool, input: {} },
+        { cwd: "/fixture" },
+      );
+      out[tool] = {
+        block: verdict?.block === true,
+        reason: typeof verdict?.reason === "string" ? verdict.reason : null,
+      };
+    } catch (err) {
+      out[tool] = { block: false, reason: "threw: " + String(err) };
+    }
+  }
+  return out;
 };
 
 console.log(JSON.stringify({ ok: true, timeoutCases, preludeCases, sequential }));
