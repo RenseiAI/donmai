@@ -639,19 +639,22 @@ func (d *Daemon) waitSessionShimRecompositionBackoff(ctx context.Context, pass i
 // stood the composition down rather than failing.
 //
 // A founding declaration the platform refuses with a definite client error
-// (HTTP 400/403/409/422 on the declaring refresh) is classified the same
-// way: the attestation was heard and answered, and nothing in this daemon
-// can turn that answer into an acceptance. The install rolls back to the
-// stand-down posture, retains the refusal, and a later install with another
-// composed configuration may found the composition. An accepted composition
+// (HTTP 400/403/409/422 on the declaring refresh or the first projected
+// heartbeat) is NOT classified this way: it is produced as
+// SessionShimFoundingRefused, which is always retryable — found again with
+// backoff, with another composed configuration when one exists, otherwise
+// with the same one. The install still rolls back to the stand-down posture
+// and retains the refusal, and a later install with another composed
+// configuration may found the composition. An accepted composition
 // still refuses a second install; a recovered founder does not create a
 // second composition.
 //
 // IT IS A CLASSIFICATION, NOT A SWALLOW, AND THE DISTINCTION IS THE POINT.
 // This type is produced ONLY for a refusal whose shape says re-asking cannot
 // help: a completeness refusal this daemon has nothing left to declare for,
-// a recorded-evidence conflict its own recovery could not narrow, or a
-// definite founding-declaration refusal as above. A transport
+// or a recorded-evidence conflict its own recovery could not narrow. A
+// refused founding declaration is never produced as this type — it is a
+// retryable SessionShimFoundingRefused instead. A transport
 // failure, a deadline, an expired credential, an opaque status refusal, an
 // ambiguous commit — none of those produce it, because all of them are
 // recovered by the ordinary path a plain error already takes, and a host that
@@ -824,9 +827,6 @@ func (e *SessionShimFoundingRefused) Retryable() bool { return true }
 // with the same one after backoff. It returns nil when the failure is not a
 // definite platform refusal, which is the caller's signal to keep its
 // ordinary error.
-// retries by founding the composition with another composed configuration.
-// It returns nil when the failure is not a definite platform refusal, which
-// is the caller's signal to keep its ordinary error.
 func newSessionShimFoundingRefused(scope string, err error) *SessionShimFoundingRefused {
 	if !sessionShimFoundingRefusalIsDefinite(err) {
 		return nil

@@ -54,6 +54,12 @@ type compositionHarness struct {
 	// the named controller id. It models the platform refusing one org's
 	// founding declaration while still accepting another's.
 	refuseRefreshForController string
+	// refuseRefreshOnceForController, when set, makes the refresh endpoint
+	// refuse (HTTP 403) exactly the next founding declaration that presents
+	// the attestation with the named controller id, then disarms. It models
+	// a founder the platform refuses once and then accepts, so the retry
+	// loop can found with the same configuration it started with.
+	refuseRefreshOnceForController string
 	// refuseFirstProjectedHeartbeat, when set, makes the heartbeat endpoint
 	// refuse (HTTP 403) the next beat carrying a session-shim projection,
 	// then disarms. It models the platform refusing one founder's first
@@ -100,6 +106,14 @@ func (h *compositionHarness) setRefuseRefreshForController(controller string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.refuseRefreshForController = controller
+}
+
+// setRefuseRefreshForControllerOnce arms the refresh endpoint's one-shot
+// founding-declaration refusal. See refuseRefreshOnceForController.
+func (h *compositionHarness) setRefuseRefreshForControllerOnce(controller string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseRefreshOnceForController = controller
 }
 
 // heartbeats returns every heartbeat body the control plane has received.
@@ -183,6 +197,10 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			_ = json.Unmarshal(raw, &presented)
 			h.mu.Lock()
 			refuseController := h.refuseRefreshForController
+			refuseOnce := h.refuseRefreshOnceForController
+			if refuseOnce != "" && presented.ControllerID == refuseOnce {
+				h.refuseRefreshOnceForController = ""
+			}
 			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
 			// Every refresh mints a DISTINCT token, so a test can tell a refresh
 			// that was adopted from one that was refused before adoption.
@@ -190,6 +208,10 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			state := h.refreshReceiptState
 			revision := h.refreshReceiptRevision
 			h.mu.Unlock()
+			if presented.Supports() && refuseOnce != "" && presented.ControllerID == refuseOnce {
+				http.Error(w, "founding declaration refused", http.StatusForbidden)
+				return
+			}
 			if presented.Supports() && refuseController != "" && presented.ControllerID == refuseController {
 				http.Error(w, "founding declaration refused", http.StatusForbidden)
 				return
