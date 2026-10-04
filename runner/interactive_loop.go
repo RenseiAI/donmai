@@ -423,9 +423,9 @@ func (r *Runner) dispatchInteractive(
 
 	// Interactive byte delivery is the product, but provider-owned system
 	// conditions can still be meaningful (for example pi detecting that its
-	// own session JSONL vanished). Consume that existing Handle event seam
-	// solely for typed SystemEvents; normal Init/Result events remain governed
-	// by the PTY session lifecycle below.
+	// own session JSONL vanished), and some harnesses surface their own
+	// transcript activity there (forwardInteractiveHandleEvent). Normal
+	// Init/Result events remain governed by the PTY session lifecycle below.
 	handleEvents := handle.Events()
 	for {
 		// A nil source parks the inject case while a notice is held.
@@ -467,7 +467,9 @@ func (r *Runner) dispatchInteractive(
 			continue
 
 		case <-isess.Done():
-			// Child exited and the PTY drained to EOF (Exit emitted).
+			// Child exited and the PTY drained to EOF (Exit emitted). Deliver
+			// the handle's trailing activity before the session-ended marker.
+			r.drainInteractiveActivity(interactiveCtx, handle, handleEvents, worktreePath, qw, sink)
 			return r.finishInteractive(worktreePath, qw, res, sink, isess), nil
 
 		case <-interactiveCtx.Done():
@@ -494,18 +496,7 @@ func (r *Runner) dispatchInteractive(
 				handleEvents = nil
 				continue
 			}
-			if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
-				r.postInteractiveActivity(interactiveCtx, worktreePath, sink, system.Subtype, system.Message)
-				continue
-			}
-			// Transcript tail (interactive pi): assistant turns, tool
-			// calls, tool results, and per-turn usage arrive on the
-			// handle's own event channel and flow through the same
-			// activity sink as the headless lane's events.
-			switch event.(type) {
-			case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent, agent.LlmCallEvent:
-				r.postInteractiveTranscriptActivity(interactiveCtx, worktreePath, sink, event)
-			}
+			r.forwardInteractiveHandleEvent(interactiveCtx, worktreePath, sink, event)
 
 		case err := <-attachDone:
 			// The attach leg terminated (epoch-stale, a non-retryable relay
@@ -611,6 +602,75 @@ func (r *Runner) recordAttachLoss(qw QueuedWork, res *Result, err error) {
 	r.logger.Warn("[interactive] attach lost", "sessionId", qw.SessionID, "err", err)
 }
 
+// interactiveActivityFlushGrace bounds how long a session whose child has
+// already exited waits for its handle's trailing activity. The flush is a
+// bounded local file read, so the grace only matters when a handle never
+// signals; the session still finishes, just without that activity.
+const interactiveActivityFlushGrace = 5 * time.Second
+
+// forwardInteractiveHandleEvent posts the handle events an interactive session
+// surfaces as activity: the typed harness-state-loss condition and, for
+// harnesses that tail their own transcript (interactive pi), assistant turns,
+// tool calls, tool results, and per-turn usage, which flow through the same
+// activity sink as the headless lane's events. Coarse Init/Result events are
+// governed by the PTY lifecycle instead and are ignored here.
+func (r *Runner) forwardInteractiveHandleEvent(ctx context.Context, worktreePath string, sink activitySink, event agent.Event) {
+	if system, ok := event.(agent.SystemEvent); ok && system.Subtype == "harness_state_lost" {
+		r.postInteractiveActivity(ctx, worktreePath, sink, system.Subtype, system.Message)
+		return
+	}
+	switch event.(type) {
+	case agent.AssistantTextEvent, agent.ToolUseEvent, agent.ToolResultEvent, agent.LlmCallEvent:
+		r.postInteractiveEvent(ctx, worktreePath, sink, event)
+	}
+}
+
+// drainInteractiveActivity runs once the PTY session is Done. A handle that
+// implements agent.InteractiveActivityFlusher enqueues its final activity
+// after Done, so keep forwarding events until it signals the flush (bounded
+// by interactiveActivityFlushGrace); then forward whatever is already
+// buffered without waiting. events may be nil (already closed).
+func (r *Runner) drainInteractiveActivity(
+	ctx context.Context,
+	handle agent.Handle,
+	events <-chan agent.Event,
+	worktreePath string,
+	qw QueuedWork,
+	sink activitySink,
+) {
+	if flusher, ok := handle.(agent.InteractiveActivityFlusher); ok {
+		grace := time.NewTimer(interactiveActivityFlushGrace)
+		defer grace.Stop()
+	wait:
+		for {
+			select {
+			case event, ok := <-events:
+				if !ok {
+					return
+				}
+				r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
+			case <-flusher.ActivityFlushed():
+				break wait
+			case <-grace.C:
+				r.logger.Warn("[interactive] handle did not flush its trailing activity within the grace — finishing without it",
+					"sessionId", qw.SessionID, "grace", interactiveActivityFlushGrace)
+				break wait
+			}
+		}
+	}
+	for {
+		select {
+		case event, ok := <-events:
+			if !ok {
+				return
+			}
+			r.forwardInteractiveHandleEvent(ctx, worktreePath, sink, event)
+		default:
+			return
+		}
+	}
+}
+
 // postInteractiveActivity emits ONE coarse, low-cadence lifecycle signal:
 // session-started / session-ended and marker-worthy transitions. It is
 // deliberately NOT per-byte or per-frame — the live terminal bytes ride the
@@ -619,27 +679,17 @@ func (r *Runner) recordAttachLoss(qw QueuedWork, res *Result, err error) {
 // to the session's events.jsonl for audit parity with the headless /
 // interview paths. Both legs are best-effort.
 func (r *Runner) postInteractiveActivity(ctx context.Context, worktreePath string, sink activitySink, subtype, message string) {
-	r.postInteractiveTranscriptActivity(ctx, worktreePath, sink, agent.SystemEvent{Subtype: subtype, Message: message})
+	r.postInteractiveEvent(ctx, worktreePath, sink, agent.SystemEvent{Subtype: subtype, Message: message})
 }
 
-// postInteractiveTranscriptActivity forwards one interactive session event
-// through the existing activity sink and mirrors it to events.jsonl for
-// audit parity with the headless/interview paths. Both legs are best-effort.
-// A per-kind token budget keeps a chatty transcript from flooding the
-// activity buffer: assistant text is capped at 2 KiB per event and tool
-// result content at 4 KiB, while tool-call input and usage counts ride
-// uncapped (they are small and structured).
-func (r *Runner) postInteractiveTranscriptActivity(ctx context.Context, worktreePath string, sink activitySink, ev agent.Event) {
-	switch e := ev.(type) {
-	case agent.AssistantTextEvent:
-		if len(e.Text) > 2048 {
-			ev = agent.AssistantTextEvent{Text: e.Text[:2048] + "\u2026", Raw: e.Raw}
-		}
-	case agent.ToolResultEvent:
-		if len(e.Content) > 4096 {
-			ev = agent.ToolResultEvent{ToolName: e.ToolName, ToolUseID: e.ToolUseID, Content: e.Content[:4096] + "\u2026", IsError: e.IsError, Raw: e.Raw}
-		}
-	}
+// postInteractiveEvent forwards one interactive session event through the
+// existing activity sink and mirrors it to events.jsonl for audit parity with
+// the headless/interview paths. Both legs are best-effort. Content rides
+// verbatim, exactly as on the headless lane: the activity poster applies its
+// own rune-safe head+tail cap to tool output, so cutting here first would
+// split UTF-8 runes and drop the tail (often the load-bearing line) before
+// the poster ever saw it.
+func (r *Runner) postInteractiveEvent(ctx context.Context, worktreePath string, sink activitySink, ev agent.Event) {
 	if sink != nil {
 		sink.Send(ctx, ev)
 	}

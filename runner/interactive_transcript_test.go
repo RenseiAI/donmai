@@ -3,85 +3,79 @@ package runner
 import (
 	"context"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
+	"github.com/RenseiAI/donmai/provider/harness/pi"
 )
+
+// sinkSummary renders the recorded sink stream as kind[:detail] tokens: the
+// SystemEvent subtype or the ToolUseEvent tool name, so order assertions can
+// name the events they care about.
+func sinkSummary(sink *recordingSink) []string {
+	sink.mu.Lock()
+	defer sink.mu.Unlock()
+	out := make([]string, 0, len(sink.events))
+	for _, ev := range sink.events {
+		switch e := ev.(type) {
+		case agent.SystemEvent:
+			out = append(out, string(e.Kind())+":"+e.Subtype)
+		case agent.ToolUseEvent:
+			out = append(out, string(e.Kind())+":"+e.ToolName)
+		default:
+			out = append(out, string(ev.Kind()))
+		}
+	}
+	return out
+}
 
 // TestInteractive_TranscriptEventsReachSink drives the real
 // dispatchInteractive supervisor with a handle whose event channel carries
 // transcript-mapped agent events, and asserts they reach the activity sink —
-// in order — alongside the existing lifecycle markers.
+// in order, before the session-ended marker — even though the PTY session is
+// already Done when the supervisor first looks: Done must not win over
+// activity the handle had already delivered.
 func TestInteractive_TranscriptEventsReachSink(t *testing.T) {
 	t.Setenv(envAttachURL, "")
 	t.Setenv(envAttachToken, "")
 
 	worktreePath := t.TempDir()
-	session := liveRecordingInteractiveSession()
+	session := completedRecordingInteractiveSession()
 	base := &fakeHandle{events: make(chan agent.Event, 8)}
 	base.events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1", Input: map[string]any{"command": "echo hi"}}
 	base.events <- agent.AssistantTextEvent{Text: "running it"}
 	base.events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "hi\n"}
 	base.events <- agent.LlmCallEvent{InputTokens: 10, OutputTokens: 20, UsageSource: agent.LlmUsageProvider, TurnCompleted: true}
-	close(base.events)
 	handle := &testInteractiveHandle{Handle: base, session: session}
 	sink := &recordingSink{}
 	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "transcript-sink", Mode: interactiveRunMode}}
 	r := minimalRunner(t)
 
-	type outcome struct {
-		result *Result
-		err    error
-	}
-	done := make(chan outcome, 1)
-	go func() {
-		result, err := r.dispatchInteractive(
-			context.Background(), handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
-		)
-		done <- outcome{result: result, err: err}
-	}()
-	// Wait until all four transcript events reach the sink before ending
-	// the session; closing done first would let the Done branch win the
-	// supervisor select and skip the buffered events.
-	deadline := time.After(5 * time.Second)
-	for {
-		sink.mu.Lock()
-		n := len(sink.events)
-		sink.mu.Unlock()
-		if n >= 5 { // started + 4 transcript events
-			break
-		}
-		select {
-		case <-deadline:
-			t.Fatalf("timed out waiting for transcript events to reach the sink (got %d)", n)
-		case <-time.After(10 * time.Millisecond):
-		}
-	}
-	close(session.done)
-	got := <-done
-	if got.err != nil || got.result.Status != "completed" {
-		t.Fatalf("dispatchInteractive = status %q err %v, want completed", got.result.Status, got.err)
+	result, err := r.dispatchInteractive(
+		context.Background(), handle, worktreePath, qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil || result.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want completed", result.Status, err)
 	}
 
-	var kinds []string
-	for _, ev := range sink.events {
-		kinds = append(kinds, string(ev.Kind()))
-	}
-	joined := strings.Join(kinds, ",")
-	wantOrder := []string{
-		string(agent.EventSystem),  // interactive-session-started
-		string(agent.EventToolUse), // transcript tool call
+	want := []string{
+		string(agent.EventSystem) + ":interactive-session-started",
+		string(agent.EventToolUse) + ":bash",
 		string(agent.EventAssistantText),
 		string(agent.EventToolResult),
 		string(agent.EventLlmCall),
-		string(agent.EventSystem), // interactive-session-ended
+		string(agent.EventSystem) + ":interactive-session-ended",
 	}
-	if joined != strings.Join(wantOrder, ",") {
-		t.Fatalf("sink event kinds = %v, want %v", kinds, wantOrder)
+	if got := sinkSummary(sink); !slices.Equal(got, want) {
+		t.Fatalf("sink stream = %v, want %v", got, want)
 	}
 
 	// Transcript events are also mirrored to events.jsonl for audit parity.
@@ -96,23 +90,148 @@ func TestInteractive_TranscriptEventsReachSink(t *testing.T) {
 	}
 }
 
-// TestInteractive_TranscriptActivityTruncatesLongText pins the per-event
-// token budget: a huge assistant chunk / tool result is capped before it
-// reaches the sink, so a chatty transcript cannot flood the buffer.
-func TestInteractive_TranscriptActivityTruncatesLongText(t *testing.T) {
+// flushingInteractiveHandle is a PTY handle that enqueues activity after its
+// session is Done and signals agent.InteractiveActivityFlusher when done.
+type flushingInteractiveHandle struct {
+	testInteractiveHandle
+	flushed chan struct{}
+}
+
+func (h *flushingInteractiveHandle) ActivityFlushed() <-chan struct{} { return h.flushed }
+
+// TestInteractive_DrainsTrailingActivityAfterDone pins the supervisor side of
+// the flush contract: activity a flushing handle enqueues only AFTER the PTY
+// session is Done still reaches the sink, ahead of the session-ended marker.
+func TestInteractive_DrainsTrailingActivityAfterDone(t *testing.T) {
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	base := &fakeHandle{events: make(chan agent.Event, 8)}
+	handle := &flushingInteractiveHandle{
+		testInteractiveHandle: testInteractiveHandle{Handle: base, session: completedRecordingInteractiveSession()},
+		flushed:               make(chan struct{}),
+	}
+	go func() {
+		// Long after the supervisor has observed the already-closed Done.
+		time.Sleep(100 * time.Millisecond)
+		base.events <- agent.ToolUseEvent{ToolName: "TRAILING_TOOL", ToolUseID: "call-9"}
+		base.events <- agent.ToolResultEvent{ToolName: "TRAILING_TOOL", ToolUseID: "call-9", Content: "done"}
+		close(handle.flushed)
+	}()
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "transcript-flush", Mode: interactiveRunMode}}
+	result, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, t.TempDir(), qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, agent.NoticeDeliveryPTYNotice,
+	)
+	if err != nil || result.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want completed", result.Status, err)
+	}
+	want := []string{
+		string(agent.EventSystem) + ":interactive-session-started",
+		string(agent.EventToolUse) + ":TRAILING_TOOL",
+		string(agent.EventToolResult),
+		string(agent.EventSystem) + ":interactive-session-ended",
+	}
+	if got := sinkSummary(sink); !slices.Equal(got, want) {
+		t.Fatalf("sink stream = %v, want %v", got, want)
+	}
+}
+
+// TestInteractive_PiTranscriptFinalFlushReachesSink is the end-to-end proof
+// through the production pi Spawn wiring: a fake pi under a real PTY writes
+// its last transcript line just before exiting, so only the handle's final
+// flush (enqueued after Done) carries it. The supervisor must deliver it to
+// the sink before the session-ended marker. An earlier session's transcript
+// left in the shared state dir must not appear at all.
+func TestInteractive_PiTranscriptFinalFlushReachesSink(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	if _, err := exec.LookPath("bash"); err != nil {
+		t.Skip("bash not available")
+	}
+	t.Setenv(envAttachURL, "")
+	t.Setenv(envAttachToken, "")
+
+	bin := filepath.Join(t.TempDir(), "fake-pi")
+	script := `#!/bin/bash
+dir=""
+while [ $# -gt 0 ]; do
+  if [ "$1" = "--session-dir" ]; then dir="$2"; shift 2; continue; fi
+  shift
+done
+sleep 0.3
+printf '{"type":"message","id":"final","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-final","name":"FINAL_TOOL","arguments":{}}]}}\n' >> "$dir/2099-01-01T00-00-00-000Z_live.jsonl"
+`
+	if err := os.WriteFile(bin, []byte(script), 0o755); err != nil { //nolint:gosec // test fixture needs the exec bit
+		t.Fatal(err)
+	}
+	provider, err := pi.New(pi.Options{
+		PiBin:        bin,
+		VersionProbe: func(context.Context, string) (string, error) { return pi.PinnedVersion, nil },
+	})
+	if err != nil {
+		t.Fatalf("pi.New: %v", err)
+	}
+
+	workdir := t.TempDir()
+	stateDir := filepath.Join(workdir, ".pi")
+	if err := os.MkdirAll(stateDir, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	earlier := `{"type":"message","id":"old","message":{"role":"assistant","content":[{"type":"toolCall","id":"call-old","name":"OLD_SESSION_TOOL","arguments":{}}]}}` + "\n"
+	if err := os.WriteFile(filepath.Join(stateDir, "2026-01-01T00-00-00-000Z_old.jsonl"), []byte(earlier), 0o600); err != nil {
+		t.Fatal(err)
+	}
+
+	handle, err := provider.Spawn(context.Background(), agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = handle.Stop(context.Background()) })
+
+	sink := &recordingSink{}
+	qw := QueuedWork{QueuedWork: prompt.QueuedWork{SessionID: "pi-transcript-e2e", Mode: interactiveRunMode}}
+	result, err := minimalRunner(t).dispatchInteractive(
+		context.Background(), handle, workdir, qw, &Result{SessionID: qw.SessionID}, sink, nil, nil, provider.Manifest().Caps.NoticeDelivery,
+	)
+	if err != nil || result.Status != "completed" {
+		t.Fatalf("dispatchInteractive = status %q err %v, want completed", result.Status, err)
+	}
+	want := []string{
+		string(agent.EventSystem) + ":interactive-session-started",
+		string(agent.EventToolUse) + ":FINAL_TOOL",
+		string(agent.EventSystem) + ":interactive-session-ended",
+	}
+	if got := sinkSummary(sink); !slices.Equal(got, want) {
+		t.Fatalf("sink stream = %v, want %v", got, want)
+	}
+}
+
+// TestInteractive_TranscriptActivityForwardsContentVerbatim pins that the
+// interactive lane does not pre-cut transcript content: a byte cut here split
+// multi-byte runes and dropped the tail of tool output before the activity
+// poster's own rune-safe head+tail cap ever saw it. Content rides verbatim,
+// exactly as on the headless lane.
+func TestInteractive_TranscriptActivityForwardsContentVerbatim(t *testing.T) {
 	r := minimalRunner(t)
 	sink := &recordingSink{}
 	dir := t.TempDir()
 	ctx := context.Background()
-	r.postInteractiveTranscriptActivity(ctx, dir, sink, agent.AssistantTextEvent{Text: strings.Repeat("x", 3000)})
-	r.postInteractiveTranscriptActivity(ctx, dir, sink, agent.ToolResultEvent{ToolName: "bash", Content: strings.Repeat("y", 5000)})
+	text := strings.Repeat("é", 3000) + " end-of-thought"
+	output := strings.Repeat("日本", 2000) + "\nhttps://example.invalid/pull/1"
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.AssistantTextEvent{Text: text})
+	r.forwardInteractiveHandleEvent(ctx, dir, sink, agent.ToolResultEvent{ToolName: "bash", Content: output})
 	if len(sink.events) != 2 {
 		t.Fatalf("sink got %d events, want 2", len(sink.events))
 	}
-	if got := sink.events[0].(agent.AssistantTextEvent).Text; len(got) > 2100 {
-		t.Errorf("assistant text not capped: %d bytes", len(got))
+	if got := sink.events[0].(agent.AssistantTextEvent).Text; got != text || !utf8.ValidString(got) {
+		t.Errorf("assistant text altered: %d bytes, valid UTF-8 %v", len(got), utf8.ValidString(got))
 	}
-	if got := sink.events[1].(agent.ToolResultEvent).Content; len(got) > 4200 {
-		t.Errorf("tool result not capped: %d bytes", len(got))
+	if got := sink.events[1].(agent.ToolResultEvent).Content; got != output || !utf8.ValidString(got) {
+		t.Errorf("tool output altered: %d bytes, valid UTF-8 %v", len(got), utf8.ValidString(got))
 	}
 }

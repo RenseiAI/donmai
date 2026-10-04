@@ -102,46 +102,85 @@ func relativeStateDirTokenStart(output string, idx int) bool {
 	return (prev == '/' || prev == '\\') && idx >= 2 && output[idx-2] == '.'
 }
 
+// Event channel sizing for interactiveStateLossHandle. The coarse events —
+// InitEvent, at most one state-loss SystemEvent, and the terminal
+// ResultEvent — always have a reserved slot, so their blocking sends complete
+// even when nobody drains Events. Transcript activity only ever fills the
+// remaining slots, and is dropped (never queued) once they are taken.
+const (
+	interactiveCoarseEventSlots     = 3
+	interactiveTranscriptEventSlots = 64
+)
+
 // interactiveStateLossHandle preserves ptycli's coarse Init/Result contract
 // while adding at most one typed state-loss SystemEvent plus the session's
 // own transcript activity (assistant turns, tool calls, tool results). It
 // listens on the public InteractiveSession subscription seam, so no ptyhost
 // or platform wire change is required.
+//
+// Ordering: transcript activity the child wrote on its way out can only be
+// read after InteractiveSession().Done closes, so the final transcript flush
+// is enqueued strictly after Done. ActivityFlushed closes once that flush is
+// enqueued, and the terminal ResultEvent is forwarded only after it, so a
+// consumer reading to the ResultEvent (or waiting on ActivityFlushed after
+// Done) sees every delivered transcript event.
+//
+// Teardown: every helper goroutine returns at session end whether or not the
+// caller drains Events — the tailer stops on Done and never blocks, and the
+// coarse sends always fit the reserved slots — after which Events closes.
 type interactiveStateLossHandle struct {
 	*ptycli.Handle
 	events chan agent.Event
+	// activityFlushed closes once the transcript tailer has enqueued its
+	// final flush (or dropped it on a full channel) and returned.
+	activityFlushed chan struct{}
+	// finished closes after events is closed, i.e. once every helper
+	// goroutine has returned.
+	finished chan struct{}
 }
 
-func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string) *interactiveStateLossHandle {
+// newInteractiveStateLossHandle wraps a spawned PTY handle. tailer must have
+// been constructed before the child was spawned (see
+// newInteractiveTranscriptTailer).
+func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string, tailer *interactiveTranscriptTailer) *interactiveStateLossHandle {
 	h := &interactiveStateLossHandle{
-		Handle: handle,
-		// Init + one state-loss condition + terminal ResultEvent, plus
-		// transcript activity. The fixed capacity preserves direct-handle
-		// callers: transcript emission is non-blocking (see emit below),
-		// so a caller that never drains Events cannot stall the PTY.
-		events: make(chan agent.Event, 64),
+		Handle:          handle,
+		events:          make(chan agent.Event, interactiveCoarseEventSlots+interactiveTranscriptEventSlots),
+		activityFlushed: make(chan struct{}),
+		finished:        make(chan struct{}),
 	}
-	// emit forwards one transcript event best-effort: when the consumer is
-	// slow the event is dropped rather than blocking the tailer (and with
-	// it the PTY supervision) behind the terminal byte stream.
+	session := handle.InteractiveSession()
+	// emit forwards one transcript event best-effort. Only the tailer
+	// goroutine calls it, and it never takes a slot reserved for the coarse
+	// events: with at most interactiveCoarseEventSlots coarse sends over the
+	// handle's life, the coarse senders below can never block on a channel
+	// transcript events filled. When the consumer is slow the event is
+	// dropped rather than blocking the tailer behind the terminal.
 	emit := func(ev agent.Event) {
+		if len(h.events) >= cap(h.events)-interactiveCoarseEventSlots {
+			return
+		}
 		select {
 		case h.events <- ev:
 		default:
 		}
 	}
 	var wg sync.WaitGroup
-	wg.Add(2)
+	wg.Add(3)
 	go func() {
 		defer wg.Done()
 		for event := range handle.Events() {
+			if _, terminal := event.(agent.ResultEvent); terminal {
+				// ptycli sends the result strictly after Done; the tailer's
+				// final flush, which also starts at Done, goes first.
+				<-h.activityFlushed
+			}
 			h.events <- event
 		}
 	}()
 	go func() {
 		defer wg.Done()
 		scanner := newInteractiveStateLossScanner(stateDir)
-		session := handle.InteractiveSession()
 		subscription, err := session.Subscribe(0)
 		if err != nil {
 			return
@@ -160,27 +199,29 @@ func newInteractiveStateLossHandle(handle *ptycli.Handle, stateDir string) *inte
 	// tailed and mapped to the same agent events headless emits, so an
 	// interactive session's turns and tool calls reach the session activity
 	// stream. Best-effort and rate-limited (see interactive_transcript.go).
-	// The tailer ends when the handle's own event channel closes
-	// (ptycli.Handle.run owns that close, strictly after the child exits),
-	// and its final sweep flushes trailing writes before h.events closes.
-	transcriptDone := make(chan struct{})
-	var transcriptWG sync.WaitGroup
-	transcriptWG.Add(1)
+	// It stops when the PTY child has exited and drained, after one final
+	// flush of trailing writes.
 	go func() {
-		defer transcriptWG.Done()
-		runInteractiveTranscriptTailer(stateDir, transcriptDone, emit)
+		defer wg.Done()
+		defer close(h.activityFlushed)
+		tailer.run(session.Done(), emit)
 	}()
 	go func() {
 		wg.Wait()
-		close(transcriptDone)
-		transcriptWG.Wait()
 		close(h.events)
+		close(h.finished)
 	}()
 	return h
 }
 
 // Events overrides ptycli.Handle.Events with the same coarse events plus the
-// typed state-loss condition above.
+// typed state-loss condition and transcript activity above.
 func (h *interactiveStateLossHandle) Events() <-chan agent.Event { return h.events }
+
+// ActivityFlushed implements agent.InteractiveActivityFlusher: it closes once
+// the session's final transcript activity has been enqueued on Events.
+func (h *interactiveStateLossHandle) ActivityFlushed() <-chan struct{} { return h.activityFlushed }
+
+var _ agent.InteractiveActivityFlusher = (*interactiveStateLossHandle)(nil)
 
 var _ agent.InteractiveCapable = (*interactiveStateLossHandle)(nil)
