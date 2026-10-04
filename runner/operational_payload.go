@@ -30,6 +30,7 @@ type OperationalPayload struct {
 	RepositoryFilter      *workarea.RepositoryFilter        `json:"repositoryFilter,omitempty"`
 	CacheSeedID           string                            `json:"cacheSeedId,omitempty"`
 	PullRequest           *workarea.PullRequestV1           `json:"pullRequest,omitempty"`
+	ContinuePullRequest   *prompt.ContinuePullRequest       `json:"continuePullRequest,omitempty"`
 	Env                   map[string]string                 `json:"env,omitempty"`
 	ResolvedProfile       ResolvedProfile                   `json:"resolvedProfile,omitempty"`
 	Branch                string                            `json:"branch,omitempty"`
@@ -50,6 +51,7 @@ func ProjectOperationalPayload(qw QueuedWork) OperationalPayload {
 		RepositoryFilter:      qw.RepositoryFilter,
 		CacheSeedID:           qw.CacheSeedID,
 		PullRequest:           qw.PullRequest,
+		ContinuePullRequest:   qw.ContinuePullRequest,
 		Env:                   maps.Clone(qw.Env),
 		ResolvedProfile:       qw.ResolvedProfile,
 		Branch:                qw.Branch,

@@ -309,6 +309,14 @@ type statusRequest struct {
 	// one the flag that the delivered work ran over its budget. Additive;
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
+
+	// UpstreamError carries the model endpoint's structured refusal or
+	// throttle (HTTP status, provider code, truncated provider message,
+	// reset time) on a session that failed because the endpoint refused
+	// it, so the control plane can tell "quota exhausted" from "key
+	// rejected" from "server error". Additive; omitted on every run
+	// without an endpoint error — old platforms ignore it.
+	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -523,7 +531,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach,
+		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

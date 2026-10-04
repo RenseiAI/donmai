@@ -65,6 +65,15 @@ type pendingTool struct {
 	start        time.Time
 }
 
+type pendingSubagent struct {
+	traceID      string
+	spanID       string
+	parentSpanID string
+	toolName     string
+	toolUseID    string
+	start        time.Time
+}
+
 // Processor stamps one trace-id spine across a session, enriches LLM/tool
 // events with span correlation, and emits completed span variants. Process and
 // Finish are safe for concurrent callers, although the runner normally invokes
@@ -88,7 +97,9 @@ type Processor struct {
 	pendingTools   map[string]pendingTool
 	pendingOrder   []string
 	completedTools map[string]pendingTool
-	finished       bool
+
+	pendingSubagents map[string]pendingSubagent
+	finished         bool
 }
 
 // NewProcessor validates cfg and allocates the session trace/root ids.
@@ -146,6 +157,7 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 		turnStart:        now,
 		pendingTools:     make(map[string]pendingTool),
 		completedTools:   make(map[string]pendingTool),
+		pendingSubagents: make(map[string]pendingSubagent),
 	}, nil
 }
 
@@ -181,6 +193,8 @@ func (p *Processor) Process(ev agent.Event) []agent.Event {
 		return []agent.Event{p.processToolUse(e, now)}
 	case agent.ToolResultEvent:
 		return []agent.Event{p.processToolResult(e, now)}
+	case agent.SubagentEvent:
+		return []agent.Event{p.processSubagent(e, now)}
 	case agent.ResultEvent:
 		out := make([]agent.Event, 0, 2)
 		if !p.llmSinceResult {
@@ -435,6 +449,86 @@ func (p *Processor) emitTool(pending pendingTool, toolName string, isError bool,
 	})
 }
 
+// processSubagent correlates the typed sub-agent lifecycle and emits the
+// `subagent` span: `started` opens the span, `completed`/`failed` closes
+// it. Unknown phases pass through untouched.
+func (p *Processor) processSubagent(e agent.SubagentEvent, now time.Time) agent.SubagentEvent {
+	switch e.Phase {
+	case agent.SubagentStarted:
+		spanID := e.SpanID
+		if !validHexID(spanID, 8) {
+			spanID = p.mustID(8)
+		}
+		e.TraceID = p.traceID
+		e.SpanID = spanID
+		e.ParentSpanID = p.rootSpanID
+		if e.ToolUseID != "" {
+			p.pendingSubagents[e.ToolUseID] = pendingSubagent{
+				traceID:      e.TraceID,
+				spanID:       e.SpanID,
+				parentSpanID: e.ParentSpanID,
+				toolName:     e.ToolName,
+				toolUseID:    e.ToolUseID,
+				start:        now,
+			}
+		}
+		return e
+	case agent.SubagentCompleted, agent.SubagentFailed:
+		pending, ok := p.pendingSubagents[e.ToolUseID]
+		if !ok || e.ToolUseID == "" {
+			p.ensureLlm(now)
+			spanID := e.SpanID
+			if !validHexID(spanID, 8) {
+				spanID = p.mustID(8)
+			}
+			pending = pendingSubagent{
+				traceID:      p.traceID,
+				spanID:       spanID,
+				parentSpanID: p.rootSpanID,
+				toolName:     e.ToolName,
+				toolUseID:    e.ToolUseID,
+				start:        now,
+			}
+		}
+		if e.ToolName == "" {
+			e.ToolName = pending.toolName
+		}
+		e.TraceID = pending.traceID
+		e.SpanID = pending.spanID
+		e.ParentSpanID = pending.parentSpanID
+		status := agent.SpanStatus{Code: agent.StatusOK}
+		if e.Phase == agent.SubagentFailed {
+			status = agent.SpanStatus{Code: agent.StatusError, Message: "subagent failed"}
+		}
+		p.emitSubagent(pending, e.ToolName, now, status)
+		delete(p.pendingSubagents, e.ToolUseID)
+		return e
+	default:
+		return e
+	}
+}
+
+func (p *Processor) emitSubagent(pending pendingSubagent, toolName string, end time.Time, status agent.SpanStatus) {
+	name := "subagent"
+	if toolName != "" {
+		name += " " + toolName
+	}
+	p.cfg.Sender.Send(agent.SubagentSpan{
+		SpanCore: agent.SpanCore{
+			TraceID:           pending.traceID,
+			SpanID:            pending.spanID,
+			ParentSpanID:      pending.parentSpanID,
+			Kind:              agent.SpanKindSubagent,
+			Name:              name,
+			StartTimeUnixNano: unixNanoString(pending.start),
+			EndTimeUnixNano:   unixNanoString(end),
+			Status:            status,
+			Donmai:            p.extensions("", "", ""),
+		},
+		SubagentProvider: pending.toolName,
+	})
+}
+
 func (p *Processor) flushPendingTools(now time.Time, terminalStatus agent.SpanStatus) {
 	for key, pending := range p.pendingTools {
 		status := agent.SpanStatus{Code: agent.StatusUnset, Message: "tool result not observed"}
@@ -450,6 +544,14 @@ func (p *Processor) flushPendingTools(now time.Time, terminalStatus agent.SpanSt
 		delete(p.pendingTools, key)
 	}
 	p.pendingOrder = p.pendingOrder[:0]
+	for key, pending := range p.pendingSubagents {
+		status := agent.SpanStatus{Code: agent.StatusUnset, Message: "subagent result not observed"}
+		if terminalStatus.Code == agent.StatusError {
+			status = terminalStatus
+		}
+		p.emitSubagent(pending, pending.toolName, now, status)
+		delete(p.pendingSubagents, key)
+	}
 }
 
 func (p *Processor) startProvisionalLlm(now time.Time) {

@@ -26,6 +26,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:     true,  // provider-owned per-session config; see config.go projectMCP.
 			AcceptsAllowedToolsList:  true,  // owned opencode.json permission map (07 §5.2)
 			EmitsSubagentEvents:      false,
+			SetsParentToolUseID:      false, // this adapter cannot know the parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort:  true,
 			SupportsOneShot:          true,
 			NativeJSONMode:           true, // /v1 honors response_format

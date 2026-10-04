@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -43,11 +42,12 @@ type BudgetReport struct {
 	Enforced bool `json:"enforced"`
 
 	// Limits captures the configured caps the runner was enforcing.
-	// All-zero means "no caps set, proceed unbounded."
+	// A nil sub-agent cap (absent) means "not enforced"; an
+	// explicit zero means "no sub-agents allowed".
 	Limits prompt.StageBudget `json:"limits"`
 
-	// ObservedSubAgents counts the Task tool invocations seen across
-	// the session.
+	// ObservedSubAgents counts the sub-agent delegation tool
+	// invocations seen across the session.
 	ObservedSubAgents int `json:"observedSubAgents"`
 
 	// ObservedTokens is the cumulative input+output token count
@@ -204,16 +204,20 @@ func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Contex
 // the channel closes.
 func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 	switch v := ev.(type) {
-	case agent.ToolUseEvent:
-		// Sub-agent count = number of Task tool invocations. The
-		// match is case-insensitive + suffix-tolerant so MCP-namespaced
-		// task tools (e.g. `mcp__af__Task`) still count.
-		if isTaskTool(v.ToolName) {
-			n := e.subAgents.Add(1)
-			if limit := e.limits.MaxSubAgents; e.enabled && limit > 0 && n > int64(limit) {
-				return e.recordBreach(CapSubAgents,
-					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, limit))
-			}
+	case agent.SubagentEvent:
+		// Sub-agent count = number of typed sub-agent lifecycles the
+		// adapter emitted (`started`). Adapters name their own
+		// delegation tools; the runner keeps no list of tool names.
+		// An explicit zero cap means no sub-agents are allowed — the
+		// first counted call breaches — while an absent (nil) cap is
+		// not enforced.
+		if v.Phase != agent.SubagentStarted {
+			break
+		}
+		n := e.subAgents.Add(1)
+		if limit := e.limits.MaxSubAgents; e.enabled && limit != nil && n > int64(*limit) {
+			return e.recordBreach(CapSubAgents,
+				fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, *limit))
 		}
 	case agent.LlmCallEvent:
 		// Per-call usage is the live meter between ResultEvents, and the
@@ -353,6 +357,18 @@ func costDifference(total, previous agent.CostData) agent.CostData {
 	}
 }
 
+// usageSnapshot is the session's cumulative usage total as the meter
+// counted it: every ResultEvent increment plus the per-call usage reported
+// since the last one. The zero value means "nothing metered yet". Its
+// input+output tokens equal Report's ObservedTokens.
+func (e *BudgetEnforcer) usageSnapshot() (in, out, cached int64, costUsd float64) {
+	cost := e.cost()
+	if cost == nil {
+		return 0, 0, 0, 0
+	}
+	return cost.InputTokens, cost.OutputTokens, cost.CachedInputTokens, cost.TotalCostUsd
+}
+
 // cost is the session's usage as the meter counted it: every ResultEvent
 // increment plus the per-call usage reported since the last one (which has
 // tokens and calls but no dollar amount). nil when nothing was metered. Its
@@ -469,18 +485,4 @@ func IsBudgetExceeded(err error) bool {
 	}
 	_, ok := err.(*BudgetExceededError)
 	return ok
-}
-
-// isTaskTool reports whether the tool name represents Claude's Task
-// (sub-agent) tool. Match is case-insensitive + tolerates MCP-style
-// namespace prefixes (e.g. "mcp__af__Task", "task", "Task").
-func isTaskTool(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "task" {
-		return true
-	}
-	if strings.HasSuffix(n, "__task") {
-		return true
-	}
-	return false
 }

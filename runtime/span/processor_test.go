@@ -319,3 +319,49 @@ func TestProviderSystem_AllRuntimeHarnesses(t *testing.T) {
 		})
 	}
 }
+
+func TestProcessor_SubagentLifecycleEmitsSubagentSpan(t *testing.T) {
+	t.Parallel()
+	recorder := &spanRecorder{}
+	now := time.Unix(1_700_000_000, 0)
+	p := newTestProcessor(t, recorder, func() time.Time { return now })
+
+	started := p.Process(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_agent_1", Phase: agent.SubagentStarted})[0].(agent.SubagentEvent)
+	if started.TraceID == "" || started.SpanID == "" || started.ParentSpanID == "" {
+		t.Fatalf("started event lost correlation: %+v", started)
+	}
+	completed := p.Process(agent.SubagentEvent{ToolUseID: "toolu_agent_1", Phase: agent.SubagentCompleted})[0].(agent.SubagentEvent)
+	if completed.SpanID != started.SpanID || completed.TraceID != started.TraceID {
+		t.Fatalf("completed lost correlation: started=%+v completed=%+v", started, completed)
+	}
+	if completed.ToolName != "Agent" {
+		t.Fatalf("completed ToolName = %q, want Agent (carried from pending)", completed.ToolName)
+	}
+
+	failed := p.Process(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_agent_2", Phase: agent.SubagentStarted})[0].(agent.SubagentEvent)
+	failedOut := p.Process(agent.SubagentEvent{ToolUseID: "toolu_agent_2", Phase: agent.SubagentFailed})[0].(agent.SubagentEvent)
+	if failedOut.SpanID != failed.SpanID {
+		t.Fatalf("failed lost correlation: started=%+v failed=%+v", failed, failedOut)
+	}
+
+	_ = p.Process(agent.ResultEvent{Success: true})
+	p.Finish("completed", "")
+	var subagents []agent.SubagentSpan
+	for _, s := range recorder.snapshot() {
+		if sub, ok := s.(agent.SubagentSpan); ok {
+			subagents = append(subagents, sub)
+		}
+	}
+	if len(subagents) != 2 {
+		t.Fatalf("emitted %d subagent spans, want 2", len(subagents))
+	}
+	if subagents[0].Status.Code != agent.StatusOK || subagents[1].Status.Code != agent.StatusError {
+		t.Fatalf("subagent span statuses wrong: %+v", subagents)
+	}
+	if subagents[0].Kind != agent.SpanKindSubagent || subagents[0].SpanID != started.SpanID {
+		t.Fatalf("completed span correlation wrong: %+v started=%+v", subagents[0], started)
+	}
+	if subagents[0].TraceID == "" || subagents[0].ParentSpanID == "" {
+		t.Fatalf("completed span missing trace spine: %+v", subagents[0])
+	}
+}

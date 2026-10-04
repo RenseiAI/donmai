@@ -1376,6 +1376,105 @@ func TestProvisionCloneDoesNotRetryUnrelatedCloneFailure(t *testing.T) {
 	}
 }
 
+func TestProvisionCloneDoesNotRetryUnrelatedStatusCodeLookalike(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name   string
+		output string
+	}{
+		{
+			name:   "sha containing 404",
+			output: "fatal: unable to read blob 9f404c2aa71b3d0e5f6a7890abcdef1234567890ab",
+		},
+		{
+			name:   "port containing 404",
+			output: "fatal: unable to connect to host port 14041: connection refused",
+		},
+		{
+			name:   "byte count containing 404",
+			output: "fatal: early EOF: read 14041 of 22000 bytes",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			dir := t.TempDir()
+			var attempts atomic.Int64
+			runner := newStubRunner(
+				func(_ string, _ ...string) ([]byte, error) {
+					attempts.Add(1)
+					return []byte(tc.output), exec.Command("false").Run()
+				},
+			)
+			m, err := worktree.NewManager(worktree.Options{
+				ParentDir:                        dir,
+				CommandRunner:                    runner.run,
+				RetryDelay:                       1 * time.Millisecond,
+				CredentialPropagationRetryDelays: []time.Duration{0, 0, 0},
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			_, err = m.Provision(context.Background(), worktree.ProvisionSpec{
+				SessionID: "unrelated-404",
+				RepoURL:   "https://example.test/org/repo.git",
+				Strategy:  worktree.StrategyClone,
+			})
+			if err == nil {
+				t.Fatal("Provision succeeded, want the clone failure")
+			}
+			if got := attempts.Load(); got != 1 {
+				t.Fatalf("expected 1 git clone attempt for output %q, got %d", tc.output, got)
+			}
+		})
+	}
+}
+
+func TestProvisionCloneRetriesAnchoredStatusRejection(t *testing.T) {
+	t.Parallel()
+
+	dir := t.TempDir()
+	var attempts atomic.Int64
+	const rejection = "fatal: unable to access 'https://example.test/org/repo.git/': The requested URL returned error: 403"
+	runner := newStubRunner(
+		func(_ string, _ ...string) ([]byte, error) {
+			attempts.Add(1)
+			return []byte(rejection), exec.Command("false").Run()
+		},
+		func(_ string, args ...string) ([]byte, error) {
+			attempts.Add(1)
+			dst := args[len(args)-1]
+			_ = os.MkdirAll(dst, 0o750)
+			return nil, nil
+		},
+	)
+	m, err := worktree.NewManager(worktree.Options{
+		ParentDir:                        dir,
+		CommandRunner:                    runner.run,
+		RetryDelay:                       1 * time.Millisecond,
+		CredentialPropagationRetryDelays: []time.Duration{0},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := m.Provision(context.Background(), worktree.ProvisionSpec{
+		SessionID: "anchored-403",
+		RepoURL:   "https://example.test/org/repo.git",
+		Strategy:  worktree.StrategyClone,
+	})
+	if err != nil {
+		t.Fatalf("Provision: %v", err)
+	}
+	if !strings.HasSuffix(path, "/anchored-403") {
+		t.Fatalf("expected path to end in /anchored-403, got %q", path)
+	}
+	if got := attempts.Load(); got != 2 {
+		t.Fatalf("expected 2 git clone attempts for an anchored 403 rejection, got %d", got)
+	}
+}
+
 func TestProvisionFetchRetriesFreshCredentialRejection(t *testing.T) {
 	t.Parallel()
 

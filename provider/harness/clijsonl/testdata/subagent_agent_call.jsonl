@@ -1,0 +1,4 @@
+{"type":"assistant","session_id":"sess-sub-1","message":{"model":"claude-opus-4-7","id":"msg_1","role":"assistant","content":[{"type":"tool_use","id":"toolu_agent_1","name":"Agent","input":{"description":"delegate"}}]}}
+{"type":"user","session_id":"sess-sub-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent_1","content":"done","is_error":false}]}}
+{"type":"assistant","session_id":"sess-sub-1","message":{"model":"claude-opus-4-7","id":"msg_2","role":"assistant","content":[{"type":"tool_use","id":"toolu_agent_2","name":"Agent","input":{"description":"delegate"}}]}}
+{"type":"user","session_id":"sess-sub-1","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_agent_2","content":"boom","is_error":true}]}}

@@ -351,6 +351,81 @@ func TestMapLine_StreamEvent_Dropped(t *testing.T) {
 	}
 }
 
+func TestMapLine_StreamEvent_APIError_ProviderError(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "api_error_event.jsonl"))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event %T, want SystemEvent", events[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeProviderError {
+		t.Errorf("Subtype = %q, want %q", sys.Subtype, agent.SystemSubtypeProviderError)
+	}
+	if sys.Message != "Overloaded" {
+		t.Errorf("Message = %q, want Overloaded", sys.Message)
+	}
+	if sys.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's structured error")
+	}
+	if sys.Upstream.HTTPStatus != 529 {
+		t.Errorf("Upstream.HTTPStatus = %d, want 529", sys.Upstream.HTTPStatus)
+	}
+	if sys.Upstream.ProviderCode != "overloaded_error" {
+		t.Errorf("Upstream.ProviderCode = %q, want overloaded_error", sys.Upstream.ProviderCode)
+	}
+	// A non-error frame still maps to nothing.
+	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 0 {
+		t.Errorf("non-error stream_event produced %d events, want 0", len(events))
+	}
+}
+
+func TestMapLine_ResultUpstreamError(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "result_upstream_error.jsonl"))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	r, ok := events[0].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event %T, want ResultEvent", events[0])
+	}
+	if r.Success {
+		t.Errorf("Success should be false")
+	}
+	if r.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's structured error")
+	}
+	if r.Upstream.HTTPStatus != 429 {
+		t.Errorf("Upstream.HTTPStatus = %d, want 429", r.Upstream.HTTPStatus)
+	}
+	if r.Upstream.ProviderCode != "usage_limit" {
+		t.Errorf("Upstream.ProviderCode = %q, want usage_limit", r.Upstream.ProviderCode)
+	}
+	if r.Upstream.ProviderMessage != "Rate limited: quota exhausted" {
+		t.Errorf("Upstream.ProviderMessage = %q", r.Upstream.ProviderMessage)
+	}
+	if r.Upstream.ResetAt != "1777673400" {
+		t.Errorf("Upstream.ResetAt = %q, want 1777673400", r.Upstream.ResetAt)
+	}
+	// A success result carries no upstream error.
+	for _, ev := range mapLine(readFixture(t, "result_success.jsonl")) {
+		if r, ok := ev.(agent.ResultEvent); ok && r.Upstream != nil {
+			t.Errorf("success ResultEvent carries Upstream = %+v, want nil", r.Upstream)
+		}
+	}
+	// An error result without structured fields carries none either.
+	for _, ev := range mapLine(readFixture(t, "result_error.jsonl")) {
+		if r, ok := ev.(agent.ResultEvent); ok && r.Upstream != nil {
+			t.Errorf("plain error ResultEvent carries Upstream = %+v, want nil", r.Upstream)
+		}
+	}
+}
+
 func TestMapLine_RateLimitEvent_System(t *testing.T) {
 	t.Parallel()
 
@@ -565,5 +640,194 @@ func TestObservedClaudeResultAvailability(t *testing.T) {
 				t.Fatalf("reported cost changed: %+v", result)
 			}
 		})
+	}
+}
+
+// A nested sub-agent delegation carries the delegating call's id on every
+// message emitted inside it: assistant text, tool use, and tool result all
+// surface the same ParentToolUseID, while the top-level delegating call
+// itself stays empty. Table-driven on the raw stream-json lines so removing
+// the mapping turns the assertions RED.
+func TestMapLine_SubagentNestedParentToolUseID(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_nested.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4", len(lines))
+	}
+
+	// The delegating call is top-level: no parent id.
+	parent := mapLine(lines[0])
+	parent = requireResponseModelPrefix(t, parent, "claude-opus-4-7")
+	if len(parent) != 1 {
+		t.Fatalf("parent line: got %d events, want 1", len(parent))
+	}
+	tu, ok := parent[0].(agent.ToolUseEvent)
+	if !ok {
+		t.Fatalf("parent event %T, want ToolUseEvent", parent[0])
+	}
+	if tu.ToolUseID != "toolu_parent" {
+		t.Fatalf("parent ToolUseID = %q, want toolu_parent", tu.ToolUseID)
+	}
+	if tu.ParentToolUseID != "" {
+		t.Fatalf("parent ParentToolUseID = %q, want empty", tu.ParentToolUseID)
+	}
+
+	// Everything emitted inside the sub-agent names the delegating call.
+	cases := []struct {
+		name      string
+		line      []byte
+		wantKind  agent.EventKind
+		wantID    string
+		wantEmpty bool
+	}{
+		{"assistant text", lines[1], agent.EventAssistantText, "", false},
+		{"tool use", lines[2], agent.EventToolUse, "toolu_child", false},
+		{"tool result", lines[3], agent.EventToolResult, "toolu_child", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			events := mapLine(tc.line)
+			if tc.wantKind == agent.EventAssistantText || tc.wantKind == agent.EventToolUse {
+				events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
+			}
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			var got string
+			switch ev := events[0].(type) {
+			case agent.AssistantTextEvent:
+				got = ev.ParentToolUseID
+			case agent.ToolUseEvent:
+				got = ev.ParentToolUseID
+				if ev.ToolUseID != tc.wantID {
+					t.Fatalf("ToolUseID = %q, want %q", ev.ToolUseID, tc.wantID)
+				}
+			case agent.ToolResultEvent:
+				got = ev.ParentToolUseID
+				if ev.ToolUseID != tc.wantID {
+					t.Fatalf("ToolUseID = %q, want %q", ev.ToolUseID, tc.wantID)
+				}
+			default:
+				t.Fatalf("event %T, want %s", events[0], tc.wantKind)
+			}
+			if got != "toolu_parent" {
+				t.Fatalf("ParentToolUseID = %q, want %q", got, "toolu_parent")
+			}
+		})
+	}
+}
+
+// Lines without the delegation marker stay parentless: adapters never guess.
+func TestMapLine_TopLevelLinesHaveEmptyParentToolUseID(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range [][]byte{
+		readFixture(t, "assistant_tool_use.jsonl"),
+		readFixture(t, "assistant_mixed.jsonl"),
+		readFixture(t, "assistant_text.jsonl"),
+		readFixture(t, "user_tool_result.jsonl"),
+	} {
+		for _, ev := range mapLine(line) {
+			switch ev := ev.(type) {
+			case agent.AssistantTextEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("AssistantText ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			case agent.ToolUseEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("ToolUse ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			case agent.ToolResultEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("ToolResult ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			}
+		}
+	}
+}
+
+// A fixture with a native delegation (Agent) call emits the typed
+// sub-agent lifecycle: `started` on the tool_use line, then
+// `completed` on the matching successful result and `failed` on the
+// matching error result. Table-driven on the raw stream-json lines so
+// removing the emission turns the assertions RED.
+func TestLineMapper_SubagentLifecycleFromFixture(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4", len(lines))
+	}
+
+	var mapper LineMapper
+	got := make([]agent.Event, 0, 8)
+	for _, line := range lines {
+		got = append(got, mapper.MapLine(line)...)
+	}
+
+	var phases []agent.SubagentPhase
+	var ids []string
+	for _, ev := range got {
+		sub, ok := ev.(agent.SubagentEvent)
+		if !ok {
+			continue
+		}
+		phases = append(phases, sub.Phase)
+		ids = append(ids, sub.ToolUseID)
+		if sub.ToolName != "Agent" {
+			t.Fatalf("SubagentEvent ToolName = %q, want Agent", sub.ToolName)
+		}
+	}
+	wantPhases := []agent.SubagentPhase{agent.SubagentStarted, agent.SubagentCompleted, agent.SubagentStarted, agent.SubagentFailed}
+	wantIDs := []string{"toolu_agent_1", "toolu_agent_1", "toolu_agent_2", "toolu_agent_2"}
+	if !reflect.DeepEqual(phases, wantPhases) {
+		t.Fatalf("subagent phases = %v, want %v", phases, wantPhases)
+	}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("subagent toolUseIds = %v, want %v", ids, wantIDs)
+	}
+}
+
+// The stateless line decoder stays name-blind: a raw delegation tool_use
+// line decodes to plain tool events only, with no typed lifecycle. The
+// stateful mapper adds the lifecycle; removing it turns the lifecycle
+// test RED while this pin stays GREEN.
+func TestMapLine_DelegationToolUseHasNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	for _, ev := range mapLine(lines[0]) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("stateless mapLine emitted SubagentEvent: %#v", ev)
+		}
+	}
+}
+
+// Non-delegation tool calls never emit a lifecycle, even across the
+// matching result line.
+func TestLineMapper_NonDelegationToolsEmitNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	var mapper LineMapper
+	assistant := []byte(`{"type":"assistant","session_id":"s","message":{"model":"m","id":"msg","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}`)
+	user := []byte(`{"type":"user","session_id":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"ok","is_error":false}]}}`)
+	for _, ev := range append(mapper.MapLine(assistant), mapper.MapLine(user)...) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("non-delegation tool emitted SubagentEvent: %#v", ev)
+		}
 	}
 }
