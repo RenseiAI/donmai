@@ -189,10 +189,15 @@ const pinnedProviderName = "donmai"
 // A bound endpoint narrows the native route. pi's native route talks to the
 // built-in provider's OWN endpoint and ignores Endpoint.BaseURL, so a pin
 // routes natively only when the binding carries no BaseURL (the
-// pre-existing unbound/direct behavior) or its BaseURL is an https URL on
-// that provider's own serving host (builtinProviderServingHost). Any other
-// BaseURL — an unknown proxy, a look-alike host, plain http, or an
-// aggregator such as https://ai-gateway.vercel.sh/v1 — stays on the injected
+// pre-existing unbound/direct behavior) or its BaseURL is that provider's
+// own endpoint (baseURLMatchesProviderEndpoint): the same https host AND,
+// for direct providers, a path under pi's own catalog base URL for the
+// provider (builtinProviderBaseURL). One vendor host can serve separately
+// billed APIs on different paths, so a same-host binding to a different
+// path stays on the injected provider, which is registered against the
+// BaseURL itself. Any other BaseURL — an unknown proxy, a look-alike host,
+// plain http, or an aggregator such as https://ai-gateway.vercel.sh/v1 —
+// stays on the injected
 // provider, which is registered against the BaseURL itself, so a proxy key
 // never reaches a vendor's own endpoint.
 //
@@ -219,7 +224,7 @@ func nativeProviderPin(model string, ep *agent.EndpointBinding) (provider, bareM
 		return provider, bareModel, false
 	case ep.BaseURL == "":
 		return provider, bareModel, true
-	case baseURLIsProviderHost(ep.BaseURL, provider):
+	case baseURLMatchesProviderEndpoint(ep.BaseURL, provider):
 		return provider, bareModel, true
 	case aggregatorHost:
 		return provider, model, false
@@ -424,7 +429,8 @@ func applyEndpoint(spec agent.Spec) (agent.Spec, error) {
 // mirrorNativeProviderCredential copies the resolved cell key onto the
 // built-in provider's own credential env var when model routes natively
 // (nativeProviderPin). The key is taken from the binding's in-process Env
-// first. Only when the binding names that provider's own serving host does
+// first. Only when the binding names that provider's own endpoint
+// (baseURLMatchesProviderEndpoint) does
 // it fall back to the PiKeyEnvVar value on env: a binding that travelled over
 // the dispatch wire carries no Env values (json:"-"), so on a runner the key
 // arrives on Spec.Env, and it may only be handed to a provider whose own
@@ -445,7 +451,7 @@ func mirrorNativeProviderCredential(env map[string]string, model string, ep *age
 	key := ""
 	if ep != nil {
 		key = pickAPIKey(ep.Env)
-		if key == "" && baseURLIsProviderHost(ep.BaseURL, provider) {
+		if key == "" && baseURLMatchesProviderEndpoint(ep.BaseURL, provider) {
 			key = env[PiKeyEnvVar]
 		}
 	}
