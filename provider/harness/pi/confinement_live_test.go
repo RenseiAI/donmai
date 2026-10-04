@@ -35,7 +35,7 @@ import (
 // leaf (with its own .git directory, as the confinement requires), a
 // read-only leaf, and a decoy outside the set. The state override keeps the
 // session state root on a short path.
-func liveWorldForConfinement(t *testing.T) (workareaRoot, mut, ro, outside, stateBase string) {
+func liveWorldForConfinement(t *testing.T) (workareaRoot, mut, ro, outside string) {
 	t.Helper()
 	base, err := os.MkdirTemp("/tmp", "piconf")
 	if err != nil {
@@ -51,18 +51,16 @@ func liveWorldForConfinement(t *testing.T) (workareaRoot, mut, ro, outside, stat
 	mut = filepath.Join(workareaRoot, "mut")
 	ro = filepath.Join(workareaRoot, "ro")
 	outside = filepath.Join(base, "outside")
-	stateBase = filepath.Join(base, "state")
 	for _, dir := range []string{
 		filepath.Join(mut, ".git"),
 		filepath.Join(workareaRoot, ".workarea"),
-		ro, outside, stateBase,
+		ro, outside,
 	} {
 		if err := os.MkdirAll(dir, 0o750); err != nil {
 			t.Fatal(err)
 		}
 	}
-	t.Setenv(piStateDirEnvOverride, stateBase)
-	return workareaRoot, mut, ro, outside, stateBase
+	return workareaRoot, mut, ro, outside
 }
 
 // liveConfinerForTest runs the real self-test once: the probe is this test
@@ -256,7 +254,7 @@ func runHeadlessProbe(t *testing.T, plan *confinement.Plan, dir string, bin stri
 // Done-when: the forbidden writes are refused through the real headless
 // spawn with the real backend, and the same writes succeed unwrapped.
 func TestPiConfinement_HeadlessForbiddenWriteRefused(t *testing.T) {
-	workareaRoot, mut, ro, outside, _ := liveWorldForConfinement(t)
+	workareaRoot, mut, ro, outside := liveWorldForConfinement(t)
 	home := t.TempDir()
 	stateHome := t.TempDir()
 	profileDir := filepath.Join(stateHome, "profiles")
@@ -288,7 +286,7 @@ func TestPiConfinement_HeadlessForbiddenWriteRefused(t *testing.T) {
 // TestPiConfinement_InteractiveForbiddenWriteRefused is the interactive half
 // of Done-when: the same refusal through the real PTY spawn path.
 func TestPiConfinement_InteractiveForbiddenWriteRefused(t *testing.T) {
-	workareaRoot, mut, ro, outside, _ := liveWorldForConfinement(t)
+	workareaRoot, mut, ro, outside := liveWorldForConfinement(t)
 	home := t.TempDir()
 	stateHome := t.TempDir()
 	profileDir := filepath.Join(stateHome, "profiles")
@@ -367,7 +365,7 @@ func runInteractiveProbe(t *testing.T, plan *confinement.Plan, dir, bin string, 
 // RED: wire a constant digest into ensurePiConfiner and the second Prepare
 // succeeds.
 func TestPiConfinement_DigestChangeRetiresAttestation(t *testing.T) {
-	workareaRoot, mut, ro, _, _ := liveWorldForConfinement(t)
+	workareaRoot, mut, ro, _ := liveWorldForConfinement(t)
 	home := t.TempDir()
 	stateHome := t.TempDir()
 	profileDir := filepath.Join(stateHome, "profiles")

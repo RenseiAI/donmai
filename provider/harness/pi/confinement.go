@@ -56,12 +56,6 @@ import (
 // stale record fails the spawn closed. The one deliberate fallback is a
 // session with no working directory at all, which has nothing to confine.
 
-// piStateDirEnvOverride names the environment variable that redirects the
-// parent under which per-session harness state directories are created.
-// Tests set it to a throwaway directory for hermetic layouts; production
-// never sets it.
-const piStateDirEnvOverride = "DONMAI_PI_STATE_DIR"
-
 // piHarnessID is the harness identity the confinement record carries.
 const piHarnessID = "pi"
 
@@ -69,24 +63,23 @@ const piHarnessID = "pi"
 // session state root. The confinement binds TMPDIR, TMP and TEMP to it.
 const piSessionTmpDir = "tmp"
 
+// piSessionCacheDir is the per-session toolchain-cache directory name under
+// the session state root. Each toolchain cache (build, module and package
+// manager state) gets its own subdirectory, bound to its environment
+// variable, so confined builds keep working without reaching the shared
+// caches outside the set.
+const piSessionCacheDir = "cache"
+
 // piSelfTestTimeout bounds the one-time startup self-test. Zero means the
 // confinement default.
 var piSelfTestTimeout time.Duration
 
-// sessionKey derives the per-session state directory key: the session name
-// when the caller set one, else the working directory's own name. Both are
+// sessionLeafKey derives the per-session directory key from the session's own
+// worktree leaf (the base name of the working directory), never from the
+// display name: the display name is shared across concurrent sessions running
+// the same workflow, while the worktree leaf is unique per session. It is
 // stable across a Resume of the same session, so a resumed session finds the
 // state its first incarnation wrote.
-func sessionKey(spec agent.Spec) string {
-	if name := strings.TrimSpace(spec.SessionName); name != "" {
-		return sanitizeStateKey(name)
-	}
-	if base := filepath.Base(filepath.Clean(spec.Cwd)); base != "" && base != "." && base != string(filepath.Separator) {
-		return sanitizeStateKey(base)
-	}
-	return "session"
-}
-
 // sanitizeStateKey reduces s to the safe alphabet the profile renderer and
 // the filesystem both accept. Empty maps to "session".
 func sanitizeStateKey(s string) string {
@@ -108,36 +101,40 @@ func sanitizeStateKey(s string) string {
 	return b.String()
 }
 
-// sessionStateBase is the parent directory under which this session's
-// harness state directory is created: the override for tests, else the
-// working directory's own parent, so the state sits beside the checkout and
-// shares its lifecycle.
-func sessionStateBase(spec agent.Spec) string {
-	if dir := strings.TrimSpace(os.Getenv(piStateDirEnvOverride)); dir != "" && filepath.IsAbs(dir) {
-		return dir
+// sessionLeafKey derives the per-session directory key from the session's own
+// worktree leaf (the base name of the working directory), never from the
+// display name: the display name is shared across concurrent sessions running
+// the same workflow, while the worktree leaf is unique per session. It is
+// stable across a Resume of the same session, so a resumed session finds the
+// state its first incarnation wrote.
+func sessionLeafKey(spec agent.Spec) string {
+	if base := filepath.Base(filepath.Clean(spec.Cwd)); base != "" && base != "." && base != string(filepath.Separator) {
+		return sanitizeStateKey(base)
 	}
-	parent := filepath.Dir(filepath.Clean(spec.Cwd))
-	if parent == "" || parent == "." {
-		parent = os.TempDir()
-	}
-	return parent
+	return "session"
 }
 
 // sessionStateRoot is the session's harness state directory:
-// <base>/.pi-<key>. It holds everything pi writes that is not repository
-// content: session storage (--session-dir), the per-session agent home
-// (PI_CODING_AGENT_DIR), the materialized boundary extension and any
-// injected deliveries.
+// <cwd>/.pi-<worktree-leaf>. It holds everything pi writes that is not
+// repository content: session storage (--session-dir), the per-session agent
+// home (PI_CODING_AGENT_DIR), the materialized boundary extension and any
+// injected deliveries. It lives inside the session's own workarea, keyed by
+// the worktree leaf, so concurrent sessions never share it and the worktree
+// lifecycle that removes the workarea removes the state with it.
 func sessionStateRoot(spec agent.Spec) string {
-	return filepath.Join(sessionStateBase(spec), ".pi-"+sessionKey(spec))
+	cwd := filepath.Clean(spec.Cwd)
+	if cwd == "" || cwd == "." {
+		return filepath.Join(os.TempDir(), ".pi-session")
+	}
+	return filepath.Join(cwd, ".pi-"+sessionLeafKey(spec))
 }
 
 // newSessionLayoutForSpec builds the session layout rooted at the session
-// state root instead of inside the working directory. The three paths keep
-// their relative shapes (root/extension, root/extensions-injected,
-// root/agent-home) so pi's own session-resume lookup — which requires the
-// agent directory and the session-storage directory to differ — is
-// unaffected; only the parent moves out of the confined working folder.
+// state root. The three paths keep their relative shapes (root/extension,
+// root/extensions-injected, root/agent-home) so pi's own session-resume
+// lookup — which requires the agent directory and the session-storage
+// directory to differ — is unaffected; only the parent moved off the legacy
+// shared in-checkout directory.
 func newSessionLayoutForSpec(spec agent.Spec) sessionLayout {
 	root := sessionStateRoot(spec)
 	return sessionLayout{
@@ -149,11 +146,11 @@ func newSessionLayoutForSpec(spec agent.Spec) sessionLayout {
 }
 
 // materializeExtensionForSpec materializes the boundary extension into the
-// session state root. It is materializeExtension rooted out of the working
-// folder; the write, mode and digest-verification semantics are identical.
-// The extension is written fresh (never hard-linked from the shared cache):
-// the confinement accounts hard links inside the writable set, and a link
-// to a blob outside it would make the set unrepresentable.
+// session state root. It is materializeExtension rooted at the per-session
+// state directory; the write, mode and digest-verification semantics are
+// identical. The extension is written fresh (never hard-linked from the
+// shared cache): the confinement accounts hard links inside the writable
+// set, and a link to a blob outside it would make the set unrepresentable.
 func materializeExtensionForSpec(spec agent.Spec) (sessionLayout, error) {
 	layout := newSessionLayoutForSpec(spec)
 	if err := os.MkdirAll(layout.root, 0o700); err != nil {
@@ -276,12 +273,14 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // authority when the session carries one — mutable leaves writable,
 // read-only leaves read-only — and otherwise treats the working directory
 // itself as the one mutable leaf under its parent. The session state root
-// (already materialized, outside the working folder) is the harness_state
+// (already materialized, inside the session workarea) is the harness_state
 // class; the per-session temporary directory is created here and bound to
-// TMPDIR/TMP/TEMP; the materialized boundary extension is protected even
-// though it sits inside harness state, so a confined rename cannot carry it
-// out from under its rule. Resolver sockets are declared so name resolution
-// keeps working inside the profile.
+// TMPDIR/TMP/TEMP; per-session toolchain caches (build, module and package
+// manager state) are declared so confined builds keep working; the
+// materialized boundary extension is protected even though it sits inside
+// harness state, so a confined rename cannot carry it out from under its
+// rule. Resolver sockets are declared so name resolution keeps working
+// inside the profile.
 //
 // A nil confiner means no backend exists for this OS: the caller spawns
 // unconfined, exactly as before. Any other failure refuses the spawn — the
@@ -294,14 +293,26 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
 		return nil, fmt.Errorf("%w: pi confinement session tmp: %v", agent.ErrSpawnFailed, err)
 	}
+	cacheBase := filepath.Join(layout.root, piSessionCacheDir)
+	caches := []confinement.Cache{
+		{Env: "GOCACHE", Dir: filepath.Join(cacheBase, "go-build")},
+		{Env: "GOMODCACHE", Dir: filepath.Join(cacheBase, "go-mod")},
+		{Env: "NPM_CONFIG_CACHE", Dir: filepath.Join(cacheBase, "npm")},
+	}
+	for _, cache := range caches {
+		if err := os.MkdirAll(cache.Dir, 0o700); err != nil {
+			return nil, fmt.Errorf("%w: pi confinement session cache: %v", agent.ErrSpawnFailed, err)
+		}
+	}
 	cspec := confinement.Spec{
-		SessionID:   "pi-" + sessionKey(spec),
+		SessionID:   "pi-" + sessionLeafKey(spec),
 		HarnessID:   piHarnessID,
 		SessionMode: agent.PromptModeForSpec(spec),
 		HarnessState: []string{
 			layout.root,
 		},
 		SessionTmp: tmpDir,
+		Caches:     caches,
 		Sockets:    confinement.ResolverSockets(),
 	}
 	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {

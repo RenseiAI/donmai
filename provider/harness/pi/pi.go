@@ -533,12 +533,12 @@ func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
 // and the TestMain hook in confinement_test_main_test.go), so the self-test
 // drives the probe through the exact production spawn binding.
 //
-// Confinement is gated on the test hook allowPiConfinement: the shared
-// driver and the bare-struct-literal Providers the unit tests build declare
-// no repository authority, so their specs carry no closed writable set to
-// confine. Production callers (the runner) stamp RepositoryAuthority on
-// every declared workarea session; only those sessions are wrapped. The
-// live confinement tests enable the hook and drive the real backend.
+// Confinement is gated on the declared repository authority: the runner
+// stamps RepositoryAuthority on every declared workarea session (loop.go),
+// and only those sessions carry a closed writable set to confine. Sessions
+// without an authority keep the legacy unconfined spawn. The live
+// confinement tests declare the authority explicitly and drive the real
+// backend.
 func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*confinement.Confiner, error) {
 	if !piConfinementEnabled(spec) {
 		return nil, nil
@@ -617,6 +617,9 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 		}
 	}
 	if err := cmd.Start(); err != nil {
+		if plan != nil {
+			_ = plan.Release()
+		}
 		return nil, nil, nil, fmt.Errorf("pi spawn: %w", err)
 	}
 	go drainStderr(stderr)
