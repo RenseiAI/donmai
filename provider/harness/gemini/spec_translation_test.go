@@ -235,6 +235,8 @@ func TestCalculateCostUSD(t *testing.T) {
 		{name: "cached slice priced at cached rate", model: "gemini-3.6-flash", in: 1_000_000, cached: 400_000, out: 1_000_000, want: (600_000.0 / 1_000_000 * 0.75) + (400_000.0 / 1_000_000 * 0.075) + 3.75},
 		{name: "legacy table entry prices cached at input rate", model: "gemini-3.5-flash", in: 1_000_000, cached: 500_000, out: 0, want: 1.50},
 		{name: "dispatcher prices win", model: "gemini-4-pro", in: 1_000_000, cached: 200_000, out: 1_000_000, pc: map[string]any{"inputPricePer1M": 2.0, "cachedPricePer1M": 0.5, "outputPricePer1M": 8.0}, want: (800_000.0 / 1_000_000 * 2.0) + (200_000.0 / 1_000_000 * 0.5) + 8.0},
+		{name: "cached-only override applies", model: "gemini-3.5-flash", in: 1_000_000, cached: 1_000_000, out: 0, pc: map[string]any{"cachedPricePer1M": 0.25}, want: 0.25},
+		{name: "cached-only override on unknown model", model: "unknown-model", in: 1_000_000, cached: 1_000_000, out: 0, pc: map[string]any{"cachedPricePer1M": 0.25}, want: 0.25},
 		{name: "partial override keeps table side", model: "gemini-3.5-flash", in: 1_000_000, out: 1_000_000, pc: map[string]any{"outputPricePer1M": 5.0}, want: 1.50 + 5.00},
 		{name: "unknown → 0", model: "unknown-model", in: 1_000_000, out: 1_000_000, want: 0},
 	}

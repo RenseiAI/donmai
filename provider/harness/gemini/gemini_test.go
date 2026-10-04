@@ -158,6 +158,108 @@ func TestProvider_Spawn_HappyPath(t *testing.T) {
 	}
 }
 
+// TestProvider_Spawn_ThinkingLevelAndDispatcherCost drives the production
+// entry point end to end: Spawn POSTs the plan to an HTTP fake, the fake
+// answers with usage, and the terminal ResultEvent carries the
+// wire-selected thinking knob plus dispatcher-supplied pricing. It goes
+// RED when providerConfig forwarding is dropped (cost falls back to the
+// table), when family routing sends the budget knob (no thinkingLevel on
+// the wire), and when cached-rate assignment is lost (the cached slice is
+// priced at the input rate).
+func TestProvider_Spawn_ThinkingLevelAndDispatcherCost(t *testing.T) {
+	t.Parallel()
+	var mu sync.Mutex
+	var gotLevel string
+	var gotBudget *int
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		var req requestBody
+		_ = json.Unmarshal(body, &req)
+		mu.Lock()
+		if req.GenerationConfig != nil && req.GenerationConfig.ThinkingConfig != nil {
+			gotLevel = req.GenerationConfig.ThinkingConfig.ThinkingLevel
+			gotBudget = req.GenerationConfig.ThinkingConfig.ThinkingBudget
+		}
+		mu.Unlock()
+		writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":1000000,"cachedContentTokenCount":200000}}`)
+	}))
+	defer srv.Close()
+
+	p := mustNew(t, srv.URL)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt: "x",
+		Model:  "gemini-4-pro",
+		Effort: agent.EffortMedium,
+		ProviderConfig: map[string]any{
+			"inputPricePer1M": 2.0, "cachedPricePer1M": 0.5, "outputPricePer1M": 8.0,
+		},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	events := drainUntilResult(t, h)
+	res, ok := events[len(events)-1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("events[-1]: want ResultEvent, got %T", events[len(events)-1])
+	}
+
+	mu.Lock()
+	defer mu.Unlock()
+	if gotLevel != "medium" {
+		t.Errorf("wire thinkingLevel: want medium (gemini-4-pro effort medium), got %q", gotLevel)
+	}
+	if gotBudget != nil {
+		t.Errorf("wire thinkingBudget: want nil for a level-knob model, got %d", *gotBudget)
+	}
+	// 800k fresh @ 2.00/M + 200k cached @ 0.50/M + 1M out @ 8.00/M.
+	want := 1.6 + 0.1 + 8.0
+	if res.Cost == nil {
+		t.Fatal("Result.Cost: want non-nil")
+	}
+	if diff := res.Cost.TotalCostUsd - want; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("Cost.TotalCostUsd: want %g (dispatcher rates), got %g", want, res.Cost.TotalCostUsd)
+	}
+	if res.Cost.CachedInputTokens != 200000 {
+		t.Errorf("Cost.CachedInputTokens: want 200000, got %d", res.Cost.CachedInputTokens)
+	}
+}
+
+// TestProvider_Spawn_CachedOnlyOverrideApplies verifies a dispatcher spec
+// carrying ONLY a cached price still overrides the cached slice: 1M cached
+// tokens at $0.25/M costs $0.25. Before the fix the override path required
+// a positive input or output price, so the spec was ignored and the table
+// priced the cached slice at the input rate ($1.50).
+func TestProvider_Spawn_CachedOnlyOverrideApplies(t *testing.T) {
+	t.Parallel()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		writeJSON(w, `{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":0,"cachedContentTokenCount":1000000}}`)
+	}))
+	defer srv.Close()
+
+	p := mustNew(t, srv.URL)
+	h, err := p.Spawn(context.Background(), agent.Spec{
+		Prompt:         "x",
+		Model:          "gemini-3.5-flash",
+		ProviderConfig: map[string]any{"cachedPricePer1M": 0.25},
+	})
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	events := drainUntilResult(t, h)
+	res, ok := events[len(events)-1].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("events[-1]: want ResultEvent, got %T", events[len(events)-1])
+	}
+	if res.Cost == nil {
+		t.Fatal("Result.Cost: want non-nil")
+	}
+	if diff := res.Cost.TotalCostUsd - 0.25; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("Cost.TotalCostUsd: want 0.25 (cached-only override), got %g", res.Cost.TotalCostUsd)
+	}
+}
+
 // TestProvider_Spawn_ToolRoundTrip drives the full agentic loop: the
 // model emits a Bash functionCall, the provider's session-local executor
 // runs it in-box (NO runner Inject), and the model returns final text.

@@ -347,41 +347,48 @@ func floatFromProviderConfig(pc map[string]any, key string) (float64, bool) {
 // resolveModelPricing returns the per-1M-token USD pricing for a model.
 // Per-model prices supplied by the dispatcher via Spec.ProviderConfig
 // (inputPricePer1M / cachedPricePer1M / outputPricePer1M) win over the
-// fallback table: each supplied positive side replaces the table value,
-// an unsupplied side keeps the table value for a known model (0 for an
-// unknown one), and an unsupplied cached side falls back to the resolved
-// input rate so cached tokens are never silently free under an override.
-// A table entry without a published cached rate likewise resolves cached
-// to its input rate. The second return value is false when neither an
-// override nor a table entry exists — the caller then reports zero cost.
+// fallback table, each applied independently: a supplied positive input
+// or output price replaces the table value, a supplied non-negative
+// cached price replaces the cached rate (so a cached-only override
+// still takes effect), an unsupplied input/output side keeps the table
+// value for a known model (0 for an unknown one), and an unsupplied
+// cached side falls back to the resolved input rate so cached tokens
+// are never silently free under an override. A table entry without a
+// published cached rate likewise resolves cached to its input rate.
+// The second return value is false when neither an override nor a
+// table entry exists — the caller then reports zero cost.
 func resolveModelPricing(providerConfig map[string]any, model string) (modelPrice, bool) {
 	in, hasIn := floatFromProviderConfig(providerConfig, providerConfigInputPricePer1M)
 	out, hasOut := floatFromProviderConfig(providerConfig, providerConfigOutputPricePer1M)
-	if (hasIn && in > 0) || (hasOut && out > 0) {
-		table, _ := modelPricing[model]
-		p := modelPrice{}
-		if hasIn && in > 0 {
-			p.input = in
-		} else {
-			p.input = table.input
+	cached, hasCached := floatFromProviderConfig(providerConfig, providerConfigCachedPricePer1M)
+	hasIn = hasIn && in > 0
+	hasOut = hasOut && out > 0
+	hasCached = hasCached && cached >= 0
+	if !hasIn && !hasOut && !hasCached {
+		p, ok := modelPricing[model]
+		if !ok {
+			return modelPrice{}, false
 		}
-		if hasOut && out > 0 {
-			p.output = out
-		} else {
-			p.output = table.output
-		}
-		if cached, hasCached := floatFromProviderConfig(providerConfig, providerConfigCachedPricePer1M); hasCached && cached >= 0 {
-			p.cached = cached
-		} else {
+		if p.cached == 0 {
 			p.cached = p.input
 		}
 		return p, true
 	}
-	p, ok := modelPricing[model]
-	if !ok {
-		return modelPrice{}, false
+	table := modelPricing[model]
+	p := modelPrice{}
+	if hasIn {
+		p.input = in
+	} else {
+		p.input = table.input
 	}
-	if p.cached == 0 {
+	if hasOut {
+		p.output = out
+	} else {
+		p.output = table.output
+	}
+	if hasCached {
+		p.cached = cached
+	} else {
 		p.cached = p.input
 	}
 	return p, true
