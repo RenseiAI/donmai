@@ -163,6 +163,12 @@ func TestOperationalPayloadProjectionClassifiesEveryQueuedWorkField(t *testing.T
 		// must never influence admission evidence, so it stays out of the
 		// canonical projection alongside the other daemon-runtime annotations.
 		"RetainRecording": "daemon-runtime",
+		// DeferFailureTransition is a per-work policy flag that gates only
+		// the post-session tracker transition, not admission: like
+		// Capabilities (which gates the merge-queue deferral), it is
+		// supplied per spawn by the daemon/detail path and stays out of
+		// the canonical admission projection.
+		"DeferFailureTransition": "daemon-runtime",
 	}
 	typeOfQueuedWork := reflect.TypeOf(QueuedWork{})
 	for index := 0; index < typeOfQueuedWork.NumField(); index++ {

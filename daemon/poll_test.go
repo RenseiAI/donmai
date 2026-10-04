@@ -2277,3 +2277,30 @@ func TestPollItemToSessionDetail_WS5FidelityForwarded(t *testing.T) {
 		}
 	})
 }
+
+// TestPollItemToSessionDetail_DeferFailureTransitionForwarded pins the
+// per-work deferral forwarder: the poll opt-in reaches SessionDetail and an
+// absent flag defaults to false (prior behaviour).
+func TestPollItemToSessionDetail_DeferFailureTransitionForwarded(t *testing.T) {
+	on := PollItemToSessionDetail(PollWorkItem{SessionID: "defer-t", DeferFailureTransition: true}, nil, "", "", "")
+	if !on.DeferFailureTransition {
+		t.Errorf("DeferFailureTransition = false; want true")
+	}
+	off := PollItemToSessionDetail(PollWorkItem{SessionID: "defer-f"}, nil, "", "", "")
+	if off.DeferFailureTransition {
+		t.Errorf("DeferFailureTransition = true; want false (absent defaults to prior behaviour)")
+	}
+}
+
+// TestPollResponse_DecodesDeferFailureTransition proves the per-work deferral
+// flag survives the strict poll wire decode — the silent-drop regression
+// guard for the new field.
+func TestPollResponse_DecodesDeferFailureTransition(t *testing.T) {
+	var resp PollResponse
+	if err := json.Unmarshal([]byte(`{"work":[{"sessionId":"dft","deferFailureTransition":true}]}`), &resp); err != nil {
+		t.Fatalf("decode deferFailureTransition wire shape: %v", err)
+	}
+	if len(resp.Work) != 1 || !resp.Work[0].DeferFailureTransition {
+		t.Fatalf("DeferFailureTransition not decoded: %+v", resp.Work)
+	}
+}

@@ -188,6 +188,15 @@ type PollWorkItem struct {
 	// distinguishable from explicit false, preserving the legacy capability fallback.
 	MergeQueueLanding *bool `json:"mergeQueueLanding,omitempty"`
 
+	// DeferFailureTransition opts this work item into deferring the
+	// failure-side tracker transition when a failed attempt may be
+	// retried on another endpoint. The runner skips the failure-side
+	// transition only for a provider-error failure with zero tool
+	// calls, and records the deferral on the terminal result. False
+	// (including every dispatch that predates this field) keeps the
+	// prior behaviour. Opaque forwarder only.
+	DeferFailureTransition bool `json:"deferFailureTransition,omitempty"`
+
 	// InjectedPoolID is the non-secret pool accounting sentinel the
 	// platform stamps for metered and shared auth modes:
 	// "metered_pool_<provider>" or "shared_pool_<provider>". Safe at
@@ -1639,6 +1648,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		SessionStorageID:        item.SessionStorageID,
 		SessionPublicID:         item.SessionPublicID,
 		TrackerSessionID:        item.TrackerSessionID,
+		DeferFailureTransition:  item.DeferFailureTransition,
 	}
 	for _, opt := range opts {
 		opt(detail)
