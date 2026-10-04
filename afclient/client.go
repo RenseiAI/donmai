@@ -528,10 +528,10 @@ func (c *Client) StopSession(id string) (*StopSessionResponse, error) {
 	out.HTTPStatus = resp.StatusCode
 	if resp.StatusCode == http.StatusAccepted {
 		// A 202 never carries terminal evidence: force stopped=false and
-		// default the pending flag when the envelope omits both fields.
+		// default the pending reason when the envelope omits both fields.
 		out.Stopped = false
-		if !out.Delivered && !out.Pending {
-			out.Pending = true
+		if !out.Delivered && out.Pending == "" {
+			out.Pending = StopPendingTerminalEvidence
 		}
 	}
 	return &out, nil

@@ -100,17 +100,50 @@ func TestStopSessionResponseRoundTrip(t *testing.T) {
 func TestStopSessionResponseDecodesPendingEnvelope(t *testing.T) {
 	t.Parallel()
 
-	var out StopSessionResponse
-	if err := json.Unmarshal([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`), &out); err != nil {
+	tests := []struct {
+		name string
+		body string
+		want StopSessionResponse
+	}{
+		{
+			name: "200 stopped terminal",
+			body: `{"stopped":true,"sessionId":"sess-1","previousStatus":"working","newStatus":"stopped"}`,
+			want: StopSessionResponse{Stopped: true, SessionID: "sess-1", PreviousStatus: StatusWorking, NewStatus: StatusStopped},
+		},
+		{
+			name: "202 delivered with pending reason",
+			body: `{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":"terminal_evidence"}`,
+			want: StopSessionResponse{Stopped: false, SessionID: "sess-1", PreviousStatus: StatusWorking, NewStatus: StatusWorking, Delivered: true, Pending: StopPendingTerminalEvidence},
+		},
+	}
+
+	for _, test := range tests {
+		t.Run(test.name, func(t *testing.T) {
+			t.Parallel()
+			var out StopSessionResponse
+			if err := json.Unmarshal([]byte(test.body), &out); err != nil {
+				t.Fatalf("unmarshal stop envelope: %v", err)
+			}
+			if out.Stopped != test.want.Stopped || out.Delivered != test.want.Delivered || out.Pending != test.want.Pending {
+				t.Fatalf("stop envelope changed: got %+v, want stopped=%v delivered=%v pending=%q", out, test.want.Stopped, test.want.Delivered, test.want.Pending)
+			}
+			if got, want := out.PendingDelivery(), test.want.Pending != ""; got != want {
+				t.Fatalf("PendingDelivery = %v, want %v: %+v", got, want, out)
+			}
+		})
+	}
+
+	// A bool pending must not decode: the contract carries a reason string.
+	var legacyBool StopSessionResponse
+	if err := json.Unmarshal([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`), &legacyBool); err == nil {
+		t.Fatalf("bool pending decoded without error: %+v", legacyBool)
+	}
+
+	var pending StopSessionResponse
+	if err := json.Unmarshal([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":"terminal_evidence"}`), &pending); err != nil {
 		t.Fatalf("unmarshal pending envelope: %v", err)
 	}
-	if out.Stopped || !out.Delivered || !out.Pending {
-		t.Fatalf("pending envelope changed: %+v", out)
-	}
-	if !out.PendingDelivery() {
-		t.Fatalf("PendingDelivery = false for delivered/pending envelope: %+v", out)
-	}
-	data, err := json.Marshal(out)
+	data, err := json.Marshal(pending)
 	if err != nil {
 		t.Fatalf("marshal pending envelope: %v", err)
 	}
@@ -119,16 +152,8 @@ func TestStopSessionResponseDecodesPendingEnvelope(t *testing.T) {
 			t.Errorf("marshalled output missing field %s: %s", f, data)
 		}
 	}
-
-	var terminal StopSessionResponse
-	if err := json.Unmarshal([]byte(`{"stopped":true,"sessionId":"public","previousStatus":"working","newStatus":"stopped"}`), &terminal); err != nil {
-		t.Fatalf("unmarshal terminal success: %v", err)
-	}
-	if terminal.PendingDelivery() {
-		t.Fatalf("PendingDelivery = true for terminal response: %+v", terminal)
-	}
-	if terminal.Delivered || terminal.Pending {
-		t.Fatalf("terminal response gained pending flags: %+v", terminal)
+	if pending.PendingMessage() != "Stop delivered, pending terminal evidence" {
+		t.Errorf("pending message = %q, want the terminal-evidence line", pending.PendingMessage())
 	}
 }
 

@@ -163,7 +163,7 @@ func TestAgentStopAcceptedHumanModeReportsPending(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":"terminal_evidence"}`))
 	}))
 	t.Cleanup(srv.Close)
 
@@ -187,7 +187,7 @@ func TestAgentStopAcceptedJSONEmitsStoppedFalse(t *testing.T) {
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")
 		w.WriteHeader(http.StatusAccepted)
-		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":"terminal_evidence"}`))
 	}))
 	t.Cleanup(srv.Close)
 
@@ -203,7 +203,7 @@ func TestAgentStopAcceptedJSONEmitsStoppedFalse(t *testing.T) {
 	if resp.Stopped {
 		t.Errorf("expected stopped=false for 202; got: %+v", resp)
 	}
-	if !resp.Delivered || !resp.Pending {
+	if !resp.Delivered || resp.Pending != afclient.StopPendingTerminalEvidence {
 		t.Errorf("expected delivered/pending envelope; got: %+v", resp)
 	}
 }
