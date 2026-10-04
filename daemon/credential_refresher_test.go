@@ -714,3 +714,159 @@ func TestCredentialRefresher_ConcurrentLanesConverge(t *testing.T) {
 		}
 	}
 }
+
+// TestCredentialRefresher_UpdateRegistrationTokenTakesEffectOnNextRefresh pins
+// the token-swap contract: after UpdateRegistrationToken, the next refresh
+// presents the NEW token on the wire, and the refresh result carries the
+// platform's registration-token lifetime hints when present. A response that
+// omits both fields leaves them empty (older platforms do not send them).
+//
+// Against the pre-change code this test fails twice over: there is no setter
+// to call (compile error), and without the swap the server sees the stale
+// token.
+func TestCredentialRefresher_UpdateRegistrationTokenTakesEffectOnNextRefresh(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		sendHints bool
+	}{
+		{name: "lifetime hints surfaced", sendHints: true},
+		{name: "absent hints stay empty", sendHints: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var mu sync.Mutex
+			var gotAuth []string
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+					http.NotFound(w, r)
+					return
+				}
+				mu.Lock()
+				gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+				mu.Unlock()
+				body := map[string]any{"runtimeToken": "refreshed.jwt"}
+				if tc.sendHints {
+					body["registrationTokenExpiresAt"] = "2030-06-01T00:00:00Z"
+					body["registrationTokenRenewAfter"] = "2030-05-01T00:00:00Z"
+				}
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			defer srv.Close()
+
+			r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+			// #nosec G101 -- test fixture token
+			r.UpdateRegistrationToken("rsp_live_rotated")
+
+			result, err := r.Refresh(context.Background(), "runtime-token-expired")
+			if err != nil {
+				t.Fatalf("Refresh: %v", err)
+			}
+
+			mu.Lock()
+			defer mu.Unlock()
+			if len(gotAuth) != 1 || gotAuth[0] != "Bearer rsp_live_rotated" {
+				t.Errorf("refresh presented auth %v, want exactly [Bearer rsp_live_rotated] — the swap did not take effect", gotAuth)
+			}
+			if tc.sendHints {
+				if result.RegistrationTokenExpiresAt != "2030-06-01T00:00:00Z" {
+					t.Errorf("RegistrationTokenExpiresAt = %q, want the platform hint", result.RegistrationTokenExpiresAt)
+				}
+				if result.RegistrationTokenRenewAfter != "2030-05-01T00:00:00Z" {
+					t.Errorf("RegistrationTokenRenewAfter = %q, want the platform hint", result.RegistrationTokenRenewAfter)
+				}
+			} else if result.RegistrationTokenExpiresAt != "" || result.RegistrationTokenRenewAfter != "" {
+				t.Errorf("absent hints must stay empty, got (%q, %q)", result.RegistrationTokenExpiresAt, result.RegistrationTokenRenewAfter)
+			}
+		})
+	}
+}
+
+// TestCredentialRefresher_UpdateRegistrationTokenIsSafeDuringRefresh hammers
+// the setter against an in-flight refresh under -race. The refresh in flight
+// may legitimately present either the old or the new token, but the refresh
+// AFTER the swap settles must present the new one — and nothing may race.
+func TestCredentialRefresher_UpdateRegistrationTokenIsSafeDuringRefresh(t *testing.T) {
+	t.Parallel()
+
+	release := make(chan struct{})
+	var mu sync.Mutex
+	var gotAuth []string
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/api/workers/wkr_before/refresh-token" {
+			http.NotFound(w, r)
+			return
+		}
+		<-release
+		mu.Lock()
+		gotAuth = append(gotAuth, r.Header.Get("Authorization"))
+		mu.Unlock()
+		_ = json.NewEncoder(w).Encode(map[string]any{"runtimeToken": "refreshed.jwt"})
+	}))
+	defer srv.Close()
+
+	r := NewCredentialRefresher(testRefresherOptions(t, srv.URL, "wkr_before", "before.jwt"))
+
+	refreshDone := make(chan error, 1)
+	go func() {
+		_, err := r.Refresh(context.Background(), "runtime-token-expired")
+		refreshDone <- err
+	}()
+
+	// Swap while the first refresh is blocked inside the endpoint handler.
+	var wg sync.WaitGroup
+	for i := 0; i < 4; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			// #nosec G101 -- test fixture token
+			r.UpdateRegistrationToken("rsp_live_rotated")
+		}()
+	}
+	wg.Wait()
+	close(release)
+	if err := <-refreshDone; err != nil {
+		t.Fatalf("in-flight refresh: %v", err)
+	}
+
+	if _, err := r.Refresh(context.Background(), "runtime-token-expired"); err != nil {
+		t.Fatalf("post-swap refresh: %v", err)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(gotAuth) != 2 {
+		t.Fatalf("refresh calls = %d, want 2", len(gotAuth))
+	}
+	if gotAuth[1] != "Bearer rsp_live_rotated" {
+		t.Errorf("post-swap refresh presented %q, want Bearer rsp_live_rotated", gotAuth[1])
+	}
+}
+
+// TestCredentialRefresher_UpdateRegistrationTokenPreservesOtherFields keeps
+// the token setter aligned with its UpdateRegistrationProjects precedent: only
+// the token changes, everything else retains its current value.
+func TestCredentialRefresher_UpdateRegistrationTokenPreservesOtherFields(t *testing.T) {
+	t.Parallel()
+
+	opts := testRefresherOptions(t, "http://127.0.0.1:1", "wkr_before", "before.jwt")
+	opts.Registration.MaxAgents = 3
+	r := NewCredentialRefresher(opts)
+	// #nosec G101 -- test fixture token
+	r.UpdateRegistrationToken("rsp_live_rotated")
+
+	r.mu.Lock()
+	got := r.opts.Registration
+	r.mu.Unlock()
+	if got.RegistrationToken != "rsp_live_rotated" {
+		t.Fatalf("token = %q, want the rotated value", got.RegistrationToken)
+	}
+	if got.OrchestratorURL != opts.Registration.OrchestratorURL ||
+		got.JWTPath != opts.Registration.JWTPath ||
+		got.MaxAgents != 3 {
+		t.Fatal("token update replaced non-token registration fields")
+	}
+}
