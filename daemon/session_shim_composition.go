@@ -183,7 +183,10 @@ func (d *Daemon) SessionShimCompositionPending() bool {
 // ONE failure is CLASSIFIED for the caller rather than left opaque: a boot
 // adoption batch the control plane refused for a reason no bounded recovery
 // can settle comes back as *SessionShimDurabilityRefused, wrapped, so
-// errors.As reaches it. It is still an error and it still means nothing was
+// errors.As reaches it. A founding declaration or first projected heartbeat
+// the platform refuses with a definite client error classifies the same way,
+// so a classifier-driven caller can found the composition with another
+// composed configuration. It is still an error and it still means nothing was
 // installed — but it is the one failure whose honest handling is "warn, do not
 // announce durable sessions, keep serving direct-owned ones" rather than
 // "exit". An embedder that exits on any error from this call keeps a working
@@ -315,6 +318,20 @@ func (d *Daemon) InstallSessionShimComposition(ctx context.Context, cfg SessionS
 	d.shimIdentityRef.Store(&live)
 
 	if err := d.publishSessionShimHeartbeatProjection(ctx); err != nil {
+		// Same contract as a refused declaring refresh: the first beat
+		// presenting the composition was heard and answered, so a
+		// classifier-driven caller can found the composition with another
+		// composed configuration. The deferred rollback above has already
+		// restored the stand-down posture and re-declared it, because
+		// `declared` flipped when the declaration was accepted.
+		if refused := newSessionShimFoundingDurabilityRefused(d.sessionShimConfig().orgID(), err); refused != nil {
+			slog.Error("session shim: DURABLE SESSIONS ARE OFF for this host — the control plane refused this scope's "+
+				"first projected heartbeat; the daemon keeps serving direct-owned "+
+				"sessions (shim-boot-dead-lineage-tolerance-2026-09-06)",
+				"scope", refused.Scope, "refusal", refused.Err)
+			d.retainSessionShimDurabilityRefusal(refused)
+			return fmt.Errorf("session shim: first projected heartbeat: %w", refused)
+		}
 		return err
 	}
 	installed = true

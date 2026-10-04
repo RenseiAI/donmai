@@ -54,6 +54,11 @@ type compositionHarness struct {
 	// the named controller id. It models the platform refusing one org's
 	// founding declaration while still accepting another's.
 	refuseRefreshForController string
+	// refuseFirstProjectedHeartbeat, when set, makes the heartbeat endpoint
+	// refuse (HTTP 403) the next beat carrying a session-shim projection,
+	// then disarms. It models the platform refusing one founder's first
+	// projected heartbeat while still accepting another's.
+	refuseFirstProjectedHeartbeat bool
 }
 
 // setRefreshReceiptState changes what the control plane answers to later
@@ -78,6 +83,15 @@ func (h *compositionHarness) setHeartbeatRequireRevision(revision string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.heartbeatRequireRevision = revision
+}
+
+// setRefuseFirstProjectedHeartbeat arms (or, with false, disarms) the
+// heartbeat endpoint's one-shot first-projection refusal. See
+// refuseFirstProjectedHeartbeat.
+func (h *compositionHarness) setRefuseFirstProjectedHeartbeat(refuse bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseFirstProjectedHeartbeat = refuse
 }
 
 // setRefuseRefreshForController arms (or, with "", disarms) the refresh
@@ -201,7 +215,15 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			h.mu.Lock()
 			h.heartbeatBodies = append(h.heartbeatBodies, body)
 			requireRevision := h.heartbeatRequireRevision
+			refuseFirst := h.refuseFirstProjectedHeartbeat
+			if refuseFirst && body.SessionShim != nil {
+				h.refuseFirstProjectedHeartbeat = false
+			}
 			h.mu.Unlock()
+			if refuseFirst && body.SessionShim != nil {
+				http.Error(w, "first projected heartbeat refused", http.StatusForbidden)
+				return
+			}
 			if requireRevision != "" &&
 				(body.SessionShim == nil || body.SessionShim.AdoptionRevision != requireRevision) {
 				w.WriteHeader(http.StatusConflict)

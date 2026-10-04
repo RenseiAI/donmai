@@ -723,7 +723,8 @@ func sessionShimBatchRefusalIsUnresolvable(err error) bool {
 }
 
 // sessionShimFoundingRefusalIsDefinite reports whether a failed founding
-// declaration is a definite platform refusal rather than a transient outage.
+// declaration or first projected heartbeat is a definite platform refusal
+// rather than a transient outage.
 // Only the definite client errors qualify: the platform heard the composed
 // attestation and answered it. A transport failure, a deadline, an auth or
 // missing-endpoint status, a 5xx, or anything else keeps its ordinary error
@@ -734,11 +735,22 @@ func sessionShimFoundingRefusalIsDefinite(err error) bool {
 		errors.Is(err, errSessionShimAmbiguousBatchCommit) {
 		return false
 	}
+	// Both legs of the founding round trip carry their HTTP status: the
+	// declaring refresh as *refreshHTTPError, the first projected heartbeat
+	// as *heartbeatHTTPError. Either one heard and answered is a definite
+	// refusal either way.
+	var status int
 	var refreshErr *refreshHTTPError
-	if !errors.As(err, &refreshErr) {
+	var heartbeatErr *heartbeatHTTPError
+	switch {
+	case errors.As(err, &refreshErr):
+		status = refreshErr.status
+	case errors.As(err, &heartbeatErr):
+		status = heartbeatErr.status
+	default:
 		return false
 	}
-	switch refreshErr.status {
+	switch status {
 	case 400, 403, 409, 422:
 		return true
 	default:
@@ -747,10 +759,10 @@ func sessionShimFoundingRefusalIsDefinite(err error) bool {
 }
 
 // newSessionShimFoundingDurabilityRefused classifies a refused founding
-// declaration as a durability refusal the caller retries by founding the
-// composition with another composed configuration. It returns nil when the
-// failure is not a definite platform refusal, which is the caller's signal
-// to keep its ordinary error.
+// declaration or first projected heartbeat as a durability refusal the caller
+// retries by founding the composition with another composed configuration.
+// It returns nil when the failure is not a definite platform refusal, which
+// is the caller's signal to keep its ordinary error.
 func newSessionShimFoundingDurabilityRefused(scope string, err error) *SessionShimDurabilityRefused {
 	if !sessionShimFoundingRefusalIsDefinite(err) {
 		return nil
