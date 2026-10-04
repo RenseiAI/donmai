@@ -202,6 +202,14 @@ func (p *Provider) promoteAggregatorPin(ctx context.Context, spec agent.Spec) (a
 	if !ok || strings.HasPrefix(spec.Model, agg+"/") {
 		return spec, false
 	}
+	// Google-authored slugs stay on the injected Chat Completions lane: the
+	// aggregator's built-in provider serves them over Anthropic Messages,
+	// where the gateway ignores the thinking budget, so promoting them
+	// natively would silently drop the configured reasoning effort. The
+	// injected lane (openai-completions) honours it.
+	if strings.HasPrefix(spec.Model, "google/") {
+		return spec, false
+	}
 	probe := p.resolveCatalogProbe()
 	if probe == nil {
 		return spec, false

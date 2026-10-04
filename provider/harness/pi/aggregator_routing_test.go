@@ -267,6 +267,55 @@ func TestSpawn_AggregatorEndpoint_CatalogPromotion(t *testing.T) {
 	}
 }
 
+// TestSpawn_AggregatorEndpoint_GoogleSlugStaysInjected proves a google/*
+// gateway slug keeps the injected Chat Completions lane even when pi's
+// catalog lists it: the probe must not run, the argv must pin the injected
+// provider with the whole slug plus the configured effort level, and the
+// provider env must carry the same model id and thinking level — the
+// aggregator's native lane serves Gemini over Anthropic Messages, where the
+// thinking budget is ignored.
+func TestSpawn_AggregatorEndpoint_GoogleSlugStaysInjected(t *testing.T) {
+	t.Parallel()
+	const googleSlug = "google/gemini-3.8-flash"
+	const googleListing = "provider           model                  context  max-out  thinking  images\nvercel-ai-gateway  google/gemini-3.8-flash  1M       128K     yes       yes   \n"
+	p := &Provider{binary: "pi", opts: Options{
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			t.Error("catalog probe must not run for a google gateway slug")
+			return googleListing, nil
+		},
+	}}
+	spec, err := p.prepare(context.Background(), agent.Spec{
+		Prompt: "hi",
+		Cwd:    t.TempDir(),
+		Model:  googleSlug,
+		Effort: agent.EffortHigh,
+		Env:    map[string]string{PiKeyEnvVar: "gw-key"},
+		Endpoint: &agent.EndpointBinding{
+			Company:     agent.CompanyOpenAI,
+			Model:       googleSlug,
+			ModelAuthor: "google",
+			BaseURL:     aggregatorGatewayBaseURL,
+			Protocol:    agent.ProtoOpenAIChat,
+			Host:        agent.HostDirect,
+			Auth:        agent.AuthBYOK,
+		},
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	wantArgs := []string{"--provider", pinnedProviderName, "--model", googleSlug + ":high"}
+	if args := modelPinArgs(spec); !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("modelPinArgs = %q, want %q", args, wantArgs)
+	}
+	env := providerPinEnv(spec)
+	if !slices.Contains(env, piModelEnvVar+"="+googleSlug) {
+		t.Errorf("providerPinEnv = %v, want it to contain %q", env, piModelEnvVar+"="+googleSlug)
+	}
+	if !slices.Contains(env, piThinkingLevelEnvVar+"=high") {
+		t.Errorf("providerPinEnv = %v, want it to contain %q", env, piThinkingLevelEnvVar+"=high")
+	}
+}
+
 // TestSpawn_AggregatorEndpoint_Native completes a full Spawn on the promoted
 // native route, proving prepare's promotion composes with the launch path.
 func TestSpawn_AggregatorEndpoint_Native(t *testing.T) {
