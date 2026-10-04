@@ -39,14 +39,16 @@ func IsHostOwned(key string) bool {
 // FilterHostOwnedMap returns a defensive copy of a work item's environment
 // with the host-owned settings removed, so the host's own value — inherited
 // from the daemon's environment or set in its base environment — is the one
-// the worker sees.
+// the worker sees. Entries whose key is not a valid variable name are
+// dropped as well (ValidEnvKey): {"DONMAI_PI_CONFINEMENT=off": ""} would
+// otherwise set the host-owned variable through a key that is not it.
 func FilterHostOwnedMap(entries map[string]string) map[string]string {
 	if entries == nil {
 		return nil
 	}
 	out := make(map[string]string, len(entries))
 	for key, value := range entries {
-		if IsHostOwned(key) {
+		if !ValidEnvKey(key) || IsHostOwned(key) {
 			continue
 		}
 		out[key] = value

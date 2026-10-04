@@ -1843,6 +1843,12 @@ func (s *WorkerSpawner) sessionEnv(spec SessionSpec, project *ProjectConfig) []s
 // leak runtime/env's blocklist exists to prevent, and one no value of item.Env
 // could reach before that variable existed.
 //
+// The same filter drops an entry whose key is not a valid variable name
+// (runtimeenv.ValidEnvKey): an entry is serialized as key+"="+value and the
+// process environment splits it at the first '=', so a key like
+// "DONMAI_CONTROL_TOKEN=x" or "DONMAI_PI_CONFINEMENT=" would set a variable
+// every by-name check had already refused.
+//
 // Filtering here rather than at the poll boundary keeps the rule where the
 // composition happens, and leaves exactly one author: OnPreSpawn, which runs
 // AFTER this function and is by definition the embedding daemon.

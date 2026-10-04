@@ -29,12 +29,18 @@ func TestSessionEnv_WorkItemCannotOverrideHostConfinement(t *testing.T) {
 		daemon   string // the daemon process's own environment; "" = unset
 		baseEnv  map[string]string
 		workItem string
+		smuggled map[string]string // raw work-item entries, keys included
 		want     string
 	}{
 		{name: "daemon requires, work item says off", daemon: "required", workItem: "off", want: "required"},
 		{name: "base env requires, work item says off", baseEnv: map[string]string{key: "required"}, workItem: "off", want: "required"},
 		{name: "daemon requires, work item says nothing", daemon: "required", want: "required"},
 		{name: "host says nothing, work item says required", workItem: "required", want: ""},
+		// The entry is serialized as key+"="+value and split at the first
+		// '=', so a key holding one names the host-owned variable while
+		// failing every by-name comparison.
+		{name: "daemon requires, key smuggles =off", daemon: "required", smuggled: map[string]string{key + "=off": ""}, want: "required"},
+		{name: "daemon requires, key ends in =", daemon: "required", smuggled: map[string]string{key + "=": "off"}, want: "required"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Setenv(key, tc.daemon)
@@ -46,6 +52,9 @@ func TestSessionEnv_WorkItemCannotOverrideHostConfinement(t *testing.T) {
 			spec := SessionSpec{SessionID: "sess-host-owned", Env: map[string]string{"KEEP": "yes"}}
 			if tc.workItem != "" {
 				spec.Env[key] = tc.workItem
+			}
+			for k, v := range tc.smuggled {
+				spec.Env[k] = v
 			}
 			s := NewWorkerSpawner(SpawnerOptions{BaseEnv: tc.baseEnv})
 			env := s.sessionEnv(spec, nil)
@@ -63,6 +72,45 @@ func TestSessionEnv_WorkItemCannotOverrideHostConfinement(t *testing.T) {
 				t.Errorf("worker sees %s=%q, want %q", key, got, tc.want)
 			}
 		})
+	}
+}
+
+// TestSessionEnv_DropsMalformedWorkItemKeys pins the same rule for the
+// runner-only names: a work-item key holding '=' must not set a supervisor
+// control the by-name filter refuses (the injected-keys declaration would
+// re-admit the daemon's own provider key; the control token would hand the
+// session the host's control API), and an empty or NUL-bearing key is
+// dropped rather than handed to the child — a NUL would fail the spawn.
+//
+// RED: drop the ValidEnvKey check from runtimeenv.FilterRunnerOnlyMap.
+func TestSessionEnv_DropsMalformedWorkItemKeys(t *testing.T) {
+	for _, name := range []string{runtimeenv.InjectedEnvKeysVar, "DONMAI_CONTROL_TOKEN"} {
+		t.Setenv(name, "")
+		if err := os.Unsetenv(name); err != nil {
+			t.Fatal(err)
+		}
+	}
+	spec := SessionSpec{SessionID: "sess-malformed", Env: map[string]string{
+		runtimeenv.InjectedEnvKeysVar + "=ANTHROPIC_API_KEY": "",
+		"DONMAI_CONTROL_TOKEN=":                              "smuggled",
+		"":                                                   "empty-key",
+		"BAD\x00KEY":                                         "nul-key",
+		"KEEP":                                               "yes",
+	}}
+	env := NewWorkerSpawner(SpawnerOptions{}).sessionEnv(spec, nil)
+	for _, entry := range env {
+		if strings.HasPrefix(entry, "=") || strings.ContainsRune(entry, 0) {
+			t.Errorf("malformed entry reached the worker env: %q", entry)
+		}
+	}
+	cmd := exec.Command("/bin/sh", "-c", `printf '%s|%s|%s' "${DONMAI_INJECTED_ENV_KEYS-unset}" "${DONMAI_CONTROL_TOKEN-unset}" "${KEEP-unset}"`)
+	cmd.Env = env
+	out, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("child: %v", err)
+	}
+	if got, want := string(out), "unset|unset|yes"; got != want {
+		t.Errorf("worker sees %q, want %q (injected-keys|control-token|ordinary)", got, want)
 	}
 }
 
