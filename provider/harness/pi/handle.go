@@ -142,6 +142,13 @@ type Handle struct {
 	// historical fatal bypass behavior.
 	receipt *receiptAdmission
 
+	// confinementRelease removes the rendered sandbox profile for a
+	// confined spawn. It must run only after the confined child has exited
+	// (or at least read the profile); releaseConfinement runs it idempotently
+	// from Stop and from the pump teardown. Nil for unconfined spawns.
+	confinementRelease func() error
+	confinementOnce    sync.Once
+
 	// token is the per-session handshake secret the harness set in the child
 	// env (piHandshakeEnvVar). The policy extension echoes it on every
 	// round-trip; the handle rejects any request whose token does not match.
@@ -234,6 +241,22 @@ type Handle struct {
 	closed       chan struct{}
 	eventsMu     sync.RWMutex
 	eventsClosed atomic.Bool
+}
+
+// newHandleWithRelease is newHandle plus the confinement profile release:
+// the rendered sandbox profile must stay on disk until the confined child
+// has exited, so the release runs when the session stops or the pump drains.
+// A nil release is a no-op (unconfined spawns).
+func (h *Handle) setConfinementRelease(release func() error) {
+	h.confinementRelease = release
+}
+
+func (h *Handle) releaseConfinement() {
+	h.confinementOnce.Do(func() {
+		if h.confinementRelease != nil {
+			_ = h.confinementRelease()
+		}
+	})
 }
 
 func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, admissions ...*receiptAdmission) *Handle {
@@ -334,6 +357,7 @@ func (h *Handle) Stop(ctx context.Context) error {
 	})
 	h.signalClosed()
 	h.closeEvents()
+	h.releaseConfinement()
 	return nil
 }
 
@@ -379,6 +403,7 @@ func (h *Handle) run() {
 		h.resolveHandshake(fmt.Errorf("pi: event stream closed before handshake"))
 		h.signalClosed()
 		h.closeEvents()
+		h.releaseConfinement()
 	}()
 
 	for {

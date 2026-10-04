@@ -65,21 +65,24 @@ var (
 	redirectionPrefix = regexp.MustCompile(`^[0-9&]*(>>?|<)`)
 )
 
-// stateDirDeletionReason returns a non-empty refusal reason when command
-// would delete (or move away) the session's harness state directory or
-// anything inside it. cwd is the session worktree root; an empty cwd falls
-// back to a purely relative comparison against piStateDir.
+// stateDirDeletionReasonForRoots guards the legacy in-checkout directory
+// plus one explicit relocated session state root. When stateRoot is
+// non-empty, operands resolving into it are refused exactly like operands
+// resolving into the legacy <cwd>/.pi directory.
 //
 // It recognizes the deletion verbs a session actually reaches for — rm,
 // rmdir, unlink, shred, mv (moving the directory away is losing it), a `find`
 // whose search root is the state dir and whose action deletes, and a forced
 // `git clean` that would sweep it. Everything else is left to the ordinary
 // rules: this is a targeted guard, not a general filesystem policy.
-func stateDirDeletionReason(command, cwd string) string {
+func stateDirDeletionReasonForRoots(command, cwd, stateRoot string) string {
 	if strings.TrimSpace(command) == "" {
 		return ""
 	}
-	root := stateDirRoot(cwd)
+	roots := []string{stateDirRoot(cwd)}
+	if strings.TrimSpace(stateRoot) != "" {
+		roots = append(roots, filepath.Clean(stateRoot))
+	}
 	for _, segment := range shellSegmentSplit.Split(command, -1) {
 		tokens := shellTokens(segment)
 		// Skip leading `KEY=value` env assignments to reach the real command.
@@ -94,7 +97,7 @@ func stateDirDeletionReason(command, cwd string) string {
 
 		switch name {
 		case "rm", "rmdir", "unlink", "shred":
-			if hit, ok := firstStateDirPath(args, cwd, root); ok {
+			if hit, ok := firstStateDirPathInRoots(args, cwd, roots); ok {
 				return stateDirRefusal(name, hit)
 			}
 		case "mv":
@@ -102,7 +105,7 @@ func stateDirDeletionReason(command, cwd string) string {
 			// its session file) somewhere else loses it exactly as deleting it
 			// does. The final operand is the destination.
 			if paths := pathOperands(args); len(paths) > 1 {
-				if hit, ok := firstStateDirPath(paths[:len(paths)-1], cwd, root); ok {
+				if hit, ok := firstStateDirPathInRoots(paths[:len(paths)-1], cwd, roots); ok {
 					return stateDirRefusal(name, hit)
 				}
 			}
@@ -110,17 +113,22 @@ func stateDirDeletionReason(command, cwd string) string {
 			if !findDeletes(args) {
 				continue
 			}
-			if hit, ok := firstStateDirPath(findSearchRoots(args), cwd, root); ok {
+			if hit, ok := firstStateDirPathInRoots(findSearchRoots(args), cwd, roots); ok {
 				return stateDirRefusal(name, hit)
 			}
 		case "git":
-			if reason := gitCleanStateDirReason(args, cwd, root); reason != "" {
-				return reason
+			for _, root := range roots {
+				if reason := gitCleanStateDirReason(args, cwd, root); reason != "" {
+					return reason
+				}
 			}
 		}
 	}
 	return ""
 }
+
+// firstStateDirPathInRoots returns the first operand resolving into any of
+// the guarded roots.
 
 // stateDirRefusal composes the refusal text for one offending command.
 func stateDirRefusal(command, path string) string {
@@ -166,6 +174,19 @@ func resolvesIntoStateDir(operand, cwd, root string) bool {
 		resolved = filepath.Clean(operand)
 	}
 	return resolved == root || strings.HasPrefix(resolved, root+string(filepath.Separator))
+}
+
+// firstStateDirPathInRoots returns the first operand resolving into any of
+// the guarded roots.
+func firstStateDirPathInRoots(args []string, cwd string, roots []string) (string, bool) {
+	for _, operand := range pathOperands(args) {
+		for _, root := range roots {
+			if resolvesIntoStateDir(operand, cwd, root) {
+				return operand, true
+			}
+		}
+	}
+	return "", false
 }
 
 // firstStateDirPath returns the first operand in args that resolves into the

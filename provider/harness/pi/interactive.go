@@ -8,6 +8,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -50,8 +51,9 @@ import (
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	// Materialize the embedded policy extension so its provider pin registers in
 	// the child. A materialization failure means no pin — fail closed, exactly
-	// as the headless lane does.
-	layout, err := materializeExtension(spec.Cwd)
+	// as the headless lane does. The state lands in the session state root
+	// beside the working folder (confinement.go), never inside it.
+	layout, err := materializeExtensionForSpec(spec)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -76,15 +78,66 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// an explicit override.
 	spec.Env = interactiveChildEnv(spec, layout)
 
+	// Confine the interactive child the same way the headless lane confines
+	// its own: the wrapped argv runs under the session profile, and the
+	// plan's tmp/cache bindings ride the override env. A nil plan is the
+	// no-backend case. The PTY child inherits only the slave side of its
+	// terminal as its standard descriptors — ptyhost never passes ExtraFiles
+	// — so no out-of-set descriptor reaches it either.
+	var plan *confinement.Plan
+	if strings.TrimSpace(spec.Cwd) != "" {
+		confiner, cerr := p.confinerForSession(ctx, spec)
+		if cerr != nil {
+			return nil, cerr
+		}
+		// A nil confiner is the ineligible case (no authority, no
+		// backend): the spawn proceeds unconfined, exactly as before.
+		if confiner != nil {
+			plan, err = confinePiSession(spec, layout, confiner)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
 	// Snapshot the shared state dir's existing transcripts BEFORE the child
 	// starts, so the transcript tail reads only what this session writes.
 	tailer := newInteractiveTranscriptTailer(layout.root)
 
-	handle, err := ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
+	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
 	if err != nil {
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	for _, kv := range confinePiEnv(nil, plan) {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			if spec.Env == nil {
+				spec.Env = map[string]string{}
+			}
+			spec.Env[kv[:i]] = kv[i+1:]
+		}
+	}
+
+	handle, err := ptycli.SpawnWithCleanup(ctx, wrapped[0], wrapped[1:], spec, p.Manifest(), releaseOnStop(plan))
+	if err != nil {
+		if plan != nil {
+			_ = plan.Release()
+		}
 		return nil, err
 	}
 	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
+}
+
+// releaseOnStop turns the plan release into the ptycli per-session cleanup:
+// it runs exactly once on spawn failure, child exit, context cancellation,
+// or Stop, whichever happens first. The rendered profile must stay on disk
+// until the confined child has exited; the profile is read when the wrapped
+// command starts, so releasing once the session is over is safe, and a
+// process already running under the profile stays confined. A nil plan
+// (no backend) needs no cleanup.
+func releaseOnStop(plan *confinement.Plan) func() error {
+	if plan == nil {
+		return nil
+	}
+	return plan.Release
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.

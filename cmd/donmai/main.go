@@ -16,6 +16,7 @@ import (
 
 	"github.com/RenseiAI/donmai/afcli"
 	"github.com/RenseiAI/donmai/afclient"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
@@ -230,6 +231,13 @@ func newRootCmd() (*cobra.Command, *rootFlags) {
 }
 
 func main() {
+	// The confinement self-test drives its probe through the production
+	// spawn binding: a re-executed donmai binary with the probe variable set
+	// runs the probe instead of the CLI. A library never exits; the probe
+	// answers from main, first thing, before anything else runs.
+	if handled, code := confinement.RunProbeFromEnv(); handled {
+		os.Exit(code)
+	}
 	// Configure the host-state seam before constructing any command so the
 	// daemon/runner resolve brand-correct state and log paths. Note that
 	// dotenv files load in PersistentPreRunE (after this), so DONMAI_STATE_HOME
