@@ -70,6 +70,18 @@ type Provider struct {
 	pinnedSessionEnv map[string]string
 	sessionEnvPinned bool
 
+	// pinnedGatewayBaseURL/pinnedGatewayRouted freeze the gateway route the
+	// running app-server child was started with, and gatewayRoutePinned
+	// records that a headless Spawn/Resume pinned it. Guarded by startMu.
+	// A later Spawn/Resume naming a different route is refused rather than
+	// silently served the first session's gateway — see
+	// checkGatewayRouteLocked. The provider block is append-once, so without
+	// this pin a same-key resume against a different base URL would succeed
+	// while the child stayed on the first gateway.
+	pinnedGatewayBaseURL string
+	pinnedGatewayRouted  bool
+	gatewayRoutePinned   bool
+
 	// mcpMu serializes app-server-global config changes. mcpUsers counts
 	// live handles holding the current config digest: equal configs may share
 	// it, while an incompatible config is denied until all prior handles have
@@ -546,6 +558,14 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	if gatewayRouted {
 		projectedEnv = projectGatewayKey(spec.Env, gatewayKey)
 	}
+	// The provider block is append-once: a boundary already carrying the
+	// provider id keeps the FIRST base URL. Without a route pin, a same-key
+	// Resume against a different base URL would succeed while the child
+	// stayed on the first gateway — a silent misroute. Refuse it here,
+	// before the session-env check and before any side effect.
+	if err := p.checkGatewayRouteLocked(baseURL, gatewayRouted); err != nil {
+		return spec, err
+	}
 	if err := p.checkSessionEnvLocked(projectedEnv); err != nil {
 		return spec, err
 	}
@@ -579,6 +599,12 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	if err := p.startLocked(spec.Env); err != nil {
 		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
+	// Freeze the route the child was started with. baseURL is empty when the
+	// session is not gateway-routed, so the pin also refuses a later flip
+	// between a routed and an unrouted session on the same child.
+	p.pinnedGatewayBaseURL = baseURL
+	p.pinnedGatewayRouted = gatewayRouted
+	p.gatewayRoutePinned = true
 	return spec, nil
 }
 
@@ -1054,6 +1080,33 @@ func mergeEnv(extra, session map[string]string, codexHome string) []string {
 // this never fires; it exists so an embedder that pools Providers across
 // sessions gets a loud failure instead of a wrong answer.
 var errSessionEnvConflict = errors.New("codex app-server is already bound to a different session environment")
+
+// errGatewayRouteConflict marks a headless Spawn/Resume whose gateway route
+// (routed vs unrouted, and the routed base URL) differs from the route the
+// running app-server child was started with. The private config's provider
+// block is append-once and the child authenticates with the pinned session
+// key, so a different route could never be what the child actually serves;
+// it fails closed with this instead of silently staying on the first route.
+var errGatewayRouteConflict = errors.New("codex app-server is already bound to a different gateway route")
+
+// checkGatewayRouteLocked refuses a session whose gateway route the running
+// app-server child cannot actually be serving. startMu must be held.
+//
+// Before any headless start there is nothing to conflict with, so the first
+// caller always passes and ensureHeadlessReady pins its route after a
+// successful start. A matching route passes forever after, which is what
+// keeps same-route Resume working. The comparison names the conflict but
+// never echoes either base URL: a base URL can carry a tenant-scoped path
+// segment, and this error reaches session records.
+func (p *Provider) checkGatewayRouteLocked(baseURL string, routed bool) error {
+	if !p.gatewayRoutePinned {
+		return nil
+	}
+	if p.pinnedGatewayRouted == routed && (!routed || p.pinnedGatewayBaseURL == baseURL) {
+		return nil
+	}
+	return fmt.Errorf("%w: %w: gateway endpoint differs from the pinned route", agent.ErrSpawnFailed, errGatewayRouteConflict)
+}
 
 // checkSessionEnvLocked refuses a session whose environment layer the running
 // app-server child cannot actually be carrying. startMu must be held.
