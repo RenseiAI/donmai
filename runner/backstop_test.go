@@ -1133,6 +1133,26 @@ func TestBackstopVisibilitySurfaces(t *testing.T) {
 	}
 }
 
+// TestBackstopCommitKeepsPatternShapedSessionID pins the correlation
+// contract: the public/unknown backstop commit carries the session id
+// verbatim, even when the session id itself is tracker-id-shaped, while
+// the title is still scrubbed. Scrubbing the session id (the pre-fix
+// behaviour) fails every row: e.g. "sess-steer-301" became "sess".
+func TestBackstopCommitKeepsPatternShapedSessionID(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("xyq-401")}
+	qw.SessionID = "sess-steer-401"
+	qw.Title = "Follow-up to qwx-88: repair the widget"
+	for _, vis := range []backstopVisibility{backstopVisibilityPublic, backstopVisibilityUnknown} {
+		if got := backstopCommitMessage(qw, vis); got != "Backstop: sess-steer-401" {
+			t.Errorf("backstopCommitMessage(%s) = %q, want verbatim session id", vis, got)
+		}
+		if got := backstopPRTitle(qw, vis); trackerIDPattern.MatchString(got) {
+			t.Errorf("backstopPRTitle(%s) = %q, want no tracker-id-shaped token", vis, got)
+		}
+	}
+}
+
 // TestBackstopVisibilityFallbackTitle covers the neutral-title path: when
 // the session title is empty or carries only the identifier, a public
 // backstop still produces a title with no identifier.

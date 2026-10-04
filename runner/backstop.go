@@ -303,15 +303,15 @@ func scrubTrackerIDs(s string) string {
 
 // backstopCommitMessage composes the backstop commit message. Private
 // repositories keep the tracker identifier for correlation; public or
-// unknown-visibility repositories carry only the session id.
+// unknown-visibility repositories carry only the session id, kept verbatim
+// as the correlation key with the PR body (which carries the same raw
+// session id). The session id is never a tracker identifier, so it is not
+// scrubbed — only the title path strips identifier-shaped tokens.
 func backstopCommitMessage(qw QueuedWork, vis backstopVisibility) string {
 	if vis == backstopVisibilityPrivate && qw.IssueIdentifier != "" {
 		return fmt.Sprintf("Backstop: %s (%s)", qw.IssueIdentifier, qw.SessionID)
 	}
-	// The session id is scrubbed too: the public commit must carry no
-	// tracker-identifier-shaped token at all, whatever the id looks like.
-	// Real session ids are opaque and pass through unchanged.
-	return fmt.Sprintf("Backstop: %s", scrubTrackerIDs(qw.SessionID))
+	return fmt.Sprintf("Backstop: %s", qw.SessionID)
 }
 
 // backstopPRTitle composes the backstop PR title. Private repositories
