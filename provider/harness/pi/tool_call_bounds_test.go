@@ -145,6 +145,10 @@ type sequentialReport struct {
 		NoExecute    bool    `json:"noExecute"`
 		Accepted     *string `json:"accepted"`
 	} `json:"rejects"`
+	FenceProbe map[string]struct {
+		Block  bool    `json:"block"`
+		Reason *string `json:"reason"`
+	} `json:"fenceProbe"`
 }
 
 // TestToolCallBounds_SequentialOverridesLayerUnderTheFence proves, against
@@ -221,5 +225,42 @@ func TestToolCallBounds_SequentialOverridesLayerUnderTheFence(t *testing.T) {
 	}
 	if r.Accepted == nil || *r.Accepted != "sequential" {
 		t.Errorf("a usable factory produced executionMode %v, want sequential", r.Accepted)
+	}
+}
+
+// TestToolCallBounds_SequentialOverridesStayAdjudicated proves the
+// documented re-enable: the calls the sequential overrides switch back on
+// (bash, write, edit — the same names the overrides register) still reach
+// the policy fence. The harness drives the REAL rpc-lane tool_call handler
+// for each overridden tool while the boundary is unverified (no handshake),
+// so a fail-closed fence must block every one. Moving the overrides outside
+// the fence (or dropping the fence) turns this red; the doc.go paragraph
+// above names exactly this property.
+func TestToolCallBounds_SequentialOverridesStayAdjudicated(t *testing.T) {
+	t.Parallel()
+	out := toolCallBoundsFixture(t)
+	if ok, _ := out["ok"].(bool); !ok {
+		t.Fatalf("harness did not report ok: %v", out)
+	}
+	raw, err := json.Marshal(out["sequential"])
+	if err != nil {
+		t.Fatalf("re-encode sequential report: %v", err)
+	}
+	var report sequentialReport
+	if err := json.Unmarshal(raw, &report); err != nil {
+		t.Fatalf("decode sequential report %s: %v", raw, err)
+	}
+	if len(report.FenceProbe) == 0 {
+		t.Fatalf("harness reported no fence probe: %s", raw)
+	}
+	for _, tool := range []string{"bash", "write", "edit"} {
+		probe, ok := report.FenceProbe[tool]
+		if !ok {
+			t.Errorf("no fence probe for %q: %s", tool, raw)
+			continue
+		}
+		if !probe.Block {
+			t.Errorf("%s: re-enabled call was not blocked while unverified (reason %v) — the override bypasses the fence", tool, probe.Reason)
+		}
 	}
 }
