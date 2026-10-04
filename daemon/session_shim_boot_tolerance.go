@@ -724,30 +724,50 @@ func sessionShimBatchRefusalIsUnresolvable(err error) bool {
 
 // sessionShimFoundingRefusalIsDefinite reports whether a failed founding
 // declaration or first projected heartbeat is a definite platform refusal
-// rather than a transient outage.
+// rather than a transient outage or a republishable answer.
 // Only the definite client errors qualify: the platform heard the composed
 // attestation and answered it. A transport failure, a deadline, an auth or
 // missing-endpoint status, a 5xx, or anything else keeps its ordinary error
 // and its ordinary consequence, because those are the failures a supervised
 // restart recovers from.
+//
+// A revision-stale conflict and a projection rejection are excluded even when
+// they arrive with a definite status: the heartbeat path already recovers
+// from both by republishing the authoritative projection, so a founding round
+// trip answered that way is behind, not refused, and failing the install over
+// one would stand durable sessions down over a beat that simply needed to be
+// sent again.
 func sessionShimFoundingRefusalIsDefinite(err error) bool {
 	if err == nil || sessionShimCommitOutcomeUnknown(err) ||
 		errors.Is(err, errSessionShimAmbiguousBatchCommit) {
 		return false
 	}
-	// Both legs of the founding round trip carry their HTTP status: the
-	// declaring refresh as *refreshHTTPError, the first projected heartbeat
-	// as *heartbeatHTTPError. Either one heard and answered is a definite
-	// refusal either way.
+	// A revision-stale conflict or a projection rejection is recovered by
+	// republishing the authoritative projection, so neither is a founding
+	// refusal even when it arrives on the founding round trip itself.
+	if isSessionShimReconciliationRequired(err) {
+		return false
+	}
+	// Both legs of the founding round trip carry their HTTP status and body:
+	// the declaring refresh as *refreshHTTPError, the first projected
+	// heartbeat as *heartbeatHTTPError. Either one heard and answered is a
+	// definite refusal either way.
 	var status int
+	var body string
 	var refreshErr *refreshHTTPError
 	var heartbeatErr *heartbeatHTTPError
 	switch {
 	case errors.As(err, &refreshErr):
-		status = refreshErr.status
+		status, body = refreshErr.status, refreshErr.body
 	case errors.As(err, &heartbeatErr):
-		status = heartbeatErr.status
+		status, body = heartbeatErr.status, heartbeatErr.body
 	default:
+		return false
+	}
+	// The same stale-revision exclusion for the declaring leg, matched on the
+	// closed conflict code rather than the carrier type: a behind answer is
+	// behind whichever round trip carried it.
+	if strings.Contains(body, sessionShimRevisionStaleCode) {
 		return false
 	}
 	switch status {
@@ -758,16 +778,60 @@ func sessionShimFoundingRefusalIsDefinite(err error) bool {
 	}
 }
 
-// newSessionShimFoundingDurabilityRefused classifies a refused founding
-// declaration or first projected heartbeat as a durability refusal the caller
+// SessionShimFoundingRefused reports that the platform refused this scope's
+// founding declaration or first projected heartbeat with a definite client
+// error, and that the install rolled back to stand-down rather than failing.
+//
+// IT IS DELIBERATELY NOT A *SessionShimDurabilityRefused. That type tells a
+// caller durable sessions are off for a reason no bounded recovery settles,
+// and a caller that treats it as terminal keeps a working host by doing so.
+// Treating a founding refusal the same way would turn one refused founder
+// into durable sessions off for every scope until restart — the exact outage
+// this type exists to prevent. errors.As for one never matches the other, so
+// a caller that classifies the batch refusal as terminal cannot accidentally
+// make a founding refusal terminal the same way.
+//
+// RETRY CONTRACT. This error is always retryable: wait with backoff and call
+// InstallSessionShimComposition again — with another composed configuration
+// when one exists, otherwise with the same one.
+// InstallSessionShimCompositionRetrying runs exactly that loop; a caller with
+// its own loop keys it off this type. A recovered founder never creates a
+// second composition: an accepted composition still refuses a second install
+// outright.
+type SessionShimFoundingRefused struct {
+	// Scope is the organization whose founding was refused.
+	Scope string
+	// Err is the underlying refusal, kept for the operator line and for
+	// callers that classify on what is beneath it.
+	Err error
+}
+
+func (e *SessionShimFoundingRefused) Error() string {
+	return fmt.Sprintf("session shim: durable-session founding for organization %q refused: %v", e.Scope, e.Err)
+}
+
+func (e *SessionShimFoundingRefused) Unwrap() error { return e.Err }
+
+// Retryable reports whether the caller should found again with backoff
+// rather than treating this error as terminal. It is always true: a founding
+// refusal answers one founder, never the composition, so another founder —
+// or the same one after backoff — may still succeed.
+func (e *SessionShimFoundingRefused) Retryable() bool { return true }
+
+// newSessionShimFoundingRefused classifies a refused founding declaration or
+// first projected heartbeat as a retryable founding refusal the caller founds
+// again from — with another composed configuration when one exists, otherwise
+// with the same one after backoff. It returns nil when the failure is not a
+// definite platform refusal, which is the caller's signal to keep its
+// ordinary error.
 // retries by founding the composition with another composed configuration.
 // It returns nil when the failure is not a definite platform refusal, which
 // is the caller's signal to keep its ordinary error.
-func newSessionShimFoundingDurabilityRefused(scope string, err error) *SessionShimDurabilityRefused {
+func newSessionShimFoundingRefused(scope string, err error) *SessionShimFoundingRefused {
 	if !sessionShimFoundingRefusalIsDefinite(err) {
 		return nil
 	}
-	return &SessionShimDurabilityRefused{Scope: scope, Err: err}
+	return &SessionShimFoundingRefused{Scope: scope, Err: err}
 }
 
 // newSessionShimDurabilityRefused classifies one spent batch refusal, lifting
@@ -795,15 +859,28 @@ func newSessionShimDurabilityRefused(scope string, err error) *SessionShimDurabi
 	return refused
 }
 
-// retainSessionShimDurabilityRefusal records the refusal on the daemon so an
-// operator can read WHY durable sessions are off, not merely THAT they are.
-//
-// A boolean is not a diagnosis. The posture this sets lasts until something
-// re-installs the composition, and an operator who can only see `off` has to
-// go and find the process log to learn which scope refused and which lineage
-// it was about — on a host whose durable sessions are already gone. The record
-// is deliberately non-secret: a scope id, lifecycle identities, and the
-// refusal's own text.
+// retainSessionShimFoundingRefusal records a refused founder on the
+// daemon's diagnostics slot, so an operator can read WHY durable sessions
+// are still standing down, not merely THAT they are. A later install that
+// succeeds clears it. A boolean is not a diagnosis: the posture this sets
+// lasts until something re-installs the composition, and an operator who can
+// only see `off` has to go and find the process log to learn which scope
+// refused — on a host whose durable sessions are already gone. The record is
+// deliberately non-secret: a scope id and the refusal's own text.
+func (d *Daemon) retainSessionShimFoundingRefusal(refused *SessionShimFoundingRefused) {
+	if d == nil || refused == nil {
+		return
+	}
+	d.retainSessionShimDurabilityRefusal(&SessionShimDurabilityRefused{Scope: refused.Scope, Err: refused.Err})
+}
+
+// retainSessionShimDurabilityRefusal records the refusal on the daemon so
+// an operator can read WHY durable sessions are off, not merely THAT they
+// are. A boolean is not a diagnosis: the posture this sets lasts until
+// something re-installs the composition, and an operator who can only see
+// `off` has to go and find the process log to learn which scope refused — on
+// a host whose durable sessions are already gone. The record is deliberately
+// non-secret: a scope id, lifecycle identities, and the refusal's own text.
 func (d *Daemon) retainSessionShimDurabilityRefusal(refused *SessionShimDurabilityRefused) {
 	if d == nil || refused == nil {
 		return
