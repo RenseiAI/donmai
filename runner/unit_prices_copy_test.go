@@ -101,3 +101,50 @@ func TestReconciledEndpointBinding_NilUnitPricesStaysNil(t *testing.T) {
 		t.Errorf("UnitPrices = %+v, want nil", got.UnitPrices)
 	}
 }
+
+// TestTranslateSpec_PreservesUnitPrices drives the production entry point:
+// bound prices on the queued work must reach Spec.Endpoint as a deep copy.
+func TestTranslateSpec_PreservesUnitPrices(t *testing.T) {
+	t.Parallel()
+	endpoint := &agent.EndpointBinding{
+		Model:      "model-a",
+		UnitPrices: &agent.UnitPrices{Input: 3, Output: 15},
+	}
+	spec := translateSpec(QueuedWork{ResolvedProfile: ResolvedProfile{Endpoint: endpoint}}, agent.Capabilities{}, SpecInputs{})
+	if spec.Endpoint == nil || spec.Endpoint.UnitPrices == nil {
+		t.Fatal("Spec.Endpoint.UnitPrices missing for priced binding")
+	}
+	if *spec.Endpoint.UnitPrices != *endpoint.UnitPrices {
+		t.Errorf("Spec UnitPrices = %+v, want %+v", spec.Endpoint.UnitPrices, endpoint.UnitPrices)
+	}
+	spec.Endpoint.UnitPrices.Input = 999
+	if endpoint.UnitPrices.Input != 3 {
+		t.Errorf("queued UnitPrices.Input mutated through Spec: %v", endpoint.UnitPrices.Input)
+	}
+}
+
+// TestReconcileResolvedProfile_PreservesUnitPrices drives the production
+// entry point: bound prices on the resolved-profile wire JSON must reach
+// the reconciled queued work.
+func TestReconcileResolvedProfile_PreservesUnitPrices(t *testing.T) {
+	t.Parallel()
+	rp := marshalFixture(t, map[string]any{
+		"provider": "pi",
+		"model":    "m",
+		"endpoint": map[string]any{
+			"company": "openai", "model": "m",
+			"unitPrices": map[string]any{"input": 3, "output": 15},
+		},
+	})
+	qw, err := ReconcileResolvedProfile(QueuedWork{}, nil, rp)
+	if err != nil {
+		t.Fatalf("ReconcileResolvedProfile: %v", err)
+	}
+	if qw.ResolvedProfile.Endpoint == nil || qw.ResolvedProfile.Endpoint.UnitPrices == nil {
+		t.Fatal("reconciled Endpoint.UnitPrices missing for priced binding")
+	}
+	want := agent.UnitPrices{Input: 3, Output: 15}
+	if *qw.ResolvedProfile.Endpoint.UnitPrices != want {
+		t.Errorf("UnitPrices = %+v, want %+v", qw.ResolvedProfile.Endpoint.UnitPrices, want)
+	}
+}
