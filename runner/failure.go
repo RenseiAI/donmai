@@ -158,4 +158,14 @@ const (
 	// productive or not — the runaway guard. Recovery is as for
 	// FailureContinuationsUnproductive.
 	FailureContinuationsCeiling = "continuations-ceiling"
+
+	// FailureContinuePullRequestDiverged indicates a continue-mode run
+	// whose push to the continued pull request's head branch was refused
+	// as a non-fast-forward: the head moved after dispatch, so the
+	// session's commits were not published (never forced over work the
+	// session cannot vouch for). Distinct from FailureBackstop so the
+	// platform can tell "diverged, needs a fresh dispatch against the new
+	// head" from "did nothing"; Result.Error wraps
+	// ErrContinuePullRequestDiverged.
+	FailureContinuePullRequestDiverged = "continue-pr-diverged"
 )

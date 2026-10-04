@@ -137,7 +137,9 @@ lint:
 guard:
 	bash scripts/guard-b-lint-selftest.sh
 	bash scripts/guard-b-diff-gate-selftest.sh
+	bash scripts/guard-b-identity-lint-selftest.sh
 	bash scripts/guard-b-lint.sh --staged
+	bash scripts/guard-b-identity-lint.sh --staged
 	bash scripts/check-no-inbound-attach.sh
 
 guard-report:

@@ -275,10 +275,42 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		refBranch = ref
 	}
+	// Continue-mode contract: when the spec names a pull request to
+	// continue, the run checks out the pull request's head branch at the
+	// dispatched head commit — never a fresh agent/<session> branch. The
+	// head branch is also the push target and the run's own pull request.
+	if err := validateContinuePullRequest(qw.ContinuePullRequest); err != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
+	continueMode := qw.ContinuePullRequest != nil
+	// The platform keeps sending the ref pin (older runners rely on it)
+	// alongside the continued record, so a ref that names the continued
+	// head branch is accepted; only a ref naming a DIFFERENT branch is a
+	// typed refusal.
+	if continueMode && refBranch != "" && !strings.EqualFold(refBranch, strings.TrimSpace(qw.ContinuePullRequest.HeadRef)) {
+		err := errors.New("runner: continued pull request head ref differs from the dispatched amend ref")
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
+	if continueMode && (qw.RepositoryDeclaration != nil || qw.PullRequest != nil || qw.BaseRef != "") {
+		err := errors.New("runner: continued pull request is mutually exclusive with repository declarations, dispatched pull requests, and base branches")
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
 	branch := qw.Branch
-	if refBranch != "" {
+	switch {
+	case continueMode:
+		branch = continuePullRequestBranch(qw.ContinuePullRequest)
+	case refBranch != "":
 		branch = refBranch
-	} else if branch == "" {
+	case branch == "":
 		branch = "agent/" + qw.SessionID
 	}
 	provisionStrategy := worktreeProvisionStrategy(qw)
@@ -369,10 +401,25 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
+	// Check out the continued pull request's head branch at the dispatched
+	// head commit before the agent starts. The branch may exist only on the
+	// remote, so this fetches it and checks it out at the pinned commit;
+	// anything else fails the session rather than running on a moved head.
+	if continueMode && !repositoryFree {
+		if err := checkoutContinuePullRequest(ctx, wpath, qw.ContinuePullRequest); err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureWorktreeProvision
+			res.Error = err.Error()
+			return res, err
+		}
+		r.logger.Info("checked out continued pull request head", "branch", branch, "sessionId", qw.SessionID)
+	}
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
 	selectedRepositoryMutable := !repositoryFree && !selectedRepositoryReadOnly
 	switch {
+	case continueMode:
+		r.logger.Info("continuing pull request head branch", "branch", branch, "sessionId", qw.SessionID)
 	case repositoryFree:
 		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
@@ -497,6 +544,15 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 			defer provisioner.Release(context.Background(), execer, wpath, demand)
 		}
 	}
+
+	// 2b-bis. Repository dependency install. After the kit toolchain
+	// (step 2b) and before spawn: a pnpm lockfile triggers
+	// `pnpm install --prefer-offline --frozen-lockfile`, a go.mod
+	// triggers `go mod download`. Bounded by one timeout; a failure is
+	// logged and the run continues. Skipped when the kit hook already
+	// installed (node_modules/.bin present) and when the selected
+	// repository is read-only.
+	r.installSessionDependencies(ctx, qw, wpath, selectedRepositoryReadOnly)
 
 	// 2c. Post-clone kit skill + prompt-fragment re-detection.
 	//
@@ -1314,6 +1370,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
 
+	// Continue-mode delivery: the run's pull request is the continued
+	// one. Seed it on the envelope BEFORE the first tail-recovery pass
+	// so the no-new-commit and draft continuation rules treat the
+	// continued pull request exactly like the rework pull requests they
+	// already pin: a noop continue run keeps turning instead of ending
+	// completed against an unchanged head.
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
+			r.seedContinuedPullRequest(prVerifier, continuedURL, res, &streamRes)
+		}
+	}
+
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
 	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also
@@ -1575,9 +1643,22 @@ tailRecovery:
 			backstopEligible = true
 		}
 	}
+	// Continue-mode delivery: the run's pull request is the continued
+	// one, seeded on the envelope before tail recovery (see above). The
+	// seed must not read as delivered work that disables the backstop:
+	// evaluate eligibility with the seed cleared so the session's commits
+	// are still pushed to the continued head branch. The backstop itself
+	// never opens a new pull request in continue mode.
+	if qw.ContinuePullRequest != nil {
+		probe := *res
+		probe.PullRequestURL = ""
+		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType)
+	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		switch {
-		case trimRef(qw.Ref) != "":
+		// Continue+ref runs take the push lane below: the ref names the
+		// continued head branch, which IS the push target.
+		case trimRef(qw.Ref) != "" && qw.ContinuePullRequest == nil:
 			r.logger.Info("skipping backstop gh pr create on ref-bearing run", "branch", branch, "ref", qw.Ref)
 		case repositoryDeclaration != nil:
 			bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1592,6 +1673,61 @@ tailRecovery:
 			if bsReport.PRURL != "" && res.PullRequestURL == "" {
 				res.PullRequestURL = bsReport.PRURL
 			}
+		}
+	}
+
+	// Continue-mode divergence: the backstop refused to push because the
+	// continued pull request's head moved after dispatch. Record the typed
+	// failure here, before the delivery gate, so the terminal status says
+	// the head diverged instead of the gate reading the unpushed head as
+	// "no new commit".
+	if qw.ContinuePullRequest != nil && res.FailureMode == "" && continueDiverged(res.BackstopReport) {
+		res.Status = "failed"
+		res.FailureMode = FailureContinuePullRequestDiverged
+		res.Error = fmt.Sprintf("%s: pull request #%d branch %q refused the session's push as a non-fast-forward; its commits were not published",
+			ErrContinuePullRequestDiverged, qw.ContinuePullRequest.Number, continuePullRequestBranch(qw.ContinuePullRequest))
+	}
+
+	// Continue-mode delivery gate: the run's pull request is the
+	// continued one, and it counts as delivered only when the session
+	// moved its head past the dispatched head — pushed, so the remote
+	// head carries the session's commit — and the pull request is not a
+	// draft. A no-new-commit continue run (and a draft) must NOT read as
+	// delivered: fail the session instead of ending completed against an
+	// unchanged head, mirroring the verifier's no-new-commit/draft rules.
+	// Runs only when no failure was already recorded, so a runner-authored
+	// refusal (divergence, provision) keeps its own typed reason.
+	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
+		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
+		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			func() {
+				defer gateCancel()
+				localHead, _ := captureHeadSHA(gateCtx, wpath)
+				remoteHead, _ := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				if fields := strings.Fields(remoteHead); len(fields) > 0 {
+					remoteHead = fields[0]
+				}
+				lookup := r.pullRequestDraftLookup
+				if lookup == nil {
+					lookup = githubPullRequestDraft
+				}
+				continuedURL := res.PullRequestURL
+				if continuedURL == "" {
+					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
+				}
+				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
+				switch {
+				case draftErr == nil && draft:
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
+				case !continueDelivered(localHead, remoteHead, startHead):
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				}
+			}()
 		}
 	}
 

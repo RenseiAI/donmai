@@ -85,6 +85,36 @@ func TestNativeProviderPin(t *testing.T) {
 			wantProvider: "zai", wantBare: "glm-5.3", wantNative: true,
 		},
 		{
+			name:         "zai pin, same host with a catalog trailing slash, routes natively",
+			model:        "zai/glm-5.3",
+			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://api.z.ai/api/coding/paas/v4/"},
+			wantProvider: "zai", wantBare: "glm-5.3", wantNative: true,
+		},
+		{
+			name:         "zai pin, same host with a different path, stays on the injected provider",
+			model:        "zai/glm-5.3",
+			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://api.z.ai/api/paas/v4"},
+			wantProvider: "zai", wantBare: "glm-5.3", wantNative: false,
+		},
+		{
+			name:         "openai pin, same host with a different path, stays on the injected provider",
+			model:        "openai/gpt-5.4",
+			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://api.openai.com/v2"},
+			wantProvider: "openai", wantBare: "gpt-5.4", wantNative: false,
+		},
+		{
+			name:         "google pin on a host-root direct binding routes natively (empty bound path matches)",
+			model:        "google/gemini-3-pro-preview",
+			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://generativelanguage.googleapis.com"},
+			wantProvider: "google", wantBare: "gemini-3-pro-preview", wantNative: true,
+		},
+		{
+			name:         "zai pin, different host, stays on the injected provider",
+			model:        "zai/glm-5.3",
+			ep:           &agent.EndpointBinding{Host: agent.HostDirect, BaseURL: "https://proxy.example.com/api/coding/paas/v4"},
+			wantProvider: "zai", wantBare: "glm-5.3", wantNative: false,
+		},
+		{
 			// provider is still reported (the pin WAS recognized) — only
 			// useNative flips false; every production call site gates on
 			// useNative before ever reading provider in this branch.
@@ -120,6 +150,97 @@ func TestNativeProviderPin(t *testing.T) {
 					tc.model, tc.ep, provider, bare, native, tc.wantProvider, tc.wantBare, tc.wantNative)
 			}
 		})
+	}
+}
+
+// TestBaseURLMatchesProviderEndpoint pins the bound-URL check behind the
+// native route: a direct built-in provider matches only when the bound URL
+// names the provider's own host AND its path extends pi's own catalog base
+// URL for it (trailing slash aside); aggregators stay host-based so the
+// gateway promotion lane below keeps working on any gateway path.
+func TestBaseURLMatchesProviderEndpoint(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name     string
+		baseURL  string
+		provider string
+		want     bool
+	}{
+		{name: "direct catalog URL matches", baseURL: "https://api.z.ai/api/coding/paas/v4", provider: "zai", want: true},
+		{name: "direct catalog URL with trailing slash matches", baseURL: "https://api.z.ai/api/coding/paas/v4/", provider: "zai", want: true},
+		{name: "direct URL under the catalog path matches", baseURL: "https://api.openai.com/v1/projects/x", provider: "openai", want: true},
+		{name: "direct sibling path does not match", baseURL: "https://api.openai.com/v10", provider: "openai", want: false},
+		{name: "direct same-host different path does not match", baseURL: "https://api.z.ai/api/paas/v4", provider: "zai", want: false},
+		{name: "direct shorter path does not match", baseURL: "https://api.z.ai/api/coding/paas", provider: "zai", want: false},
+		{name: "direct host root matches: no path to disagree on", baseURL: "https://api.z.ai", provider: "zai", want: true},
+		{name: "direct host root slash matches: no path to disagree on", baseURL: "https://api.z.ai/", provider: "zai", want: true},
+		{name: "direct host-root binding matches a catalog path", baseURL: "https://generativelanguage.googleapis.com", provider: "google", want: true},
+		{name: "direct dot-dot path that escapes the catalog prefix does not match", baseURL: "https://api.z.ai/api/coding/paas/v4/../../../paas/v4", provider: "zai", want: false},
+		{name: "direct different host does not match", baseURL: "https://proxy.example.com/api/coding/paas/v4", provider: "zai", want: false},
+		{name: "direct plain http does not match", baseURL: "http://api.z.ai/api/coding/paas/v4", provider: "zai", want: false},
+		{name: "direct host-root catalog matches any path on the host", baseURL: "https://api.anthropic.com/v1", provider: "anthropic", want: true},
+		{name: "direct provider without a catalog entry stays host-based", baseURL: "https://opencode.ai/zen/v1/extra", provider: "opencode", want: true},
+		{name: "aggregator matches on any path on its host", baseURL: "https://ai-gateway.vercel.sh/v1", provider: "vercel-ai-gateway", want: true},
+		{name: "aggregator matches on a different path on its host (never path-checked)", baseURL: "https://openrouter.ai/api/v2", provider: "openrouter", want: true},
+		{name: "aggregator matches at the host root", baseURL: "https://ai-gateway.vercel.sh", provider: "vercel-ai-gateway", want: true},
+		{name: "unknown provider never matches", baseURL: "https://api.z.ai/api/coding/paas/v4", provider: "nope", want: false},
+		{name: "empty URL never matches", baseURL: "", provider: "zai", want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := baseURLMatchesProviderEndpoint(tc.baseURL, tc.provider); got != tc.want {
+				t.Errorf("baseURLMatchesProviderEndpoint(%q, %q) = %v, want %v", tc.baseURL, tc.provider, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestBuiltinProviderBaseURL_HostAgreesWithServingHost pins the catalog
+// table against the host table it refines: every catalog entry must parse
+// as an https URL on exactly the host the serving-host map names, so the
+// path check can never widen (or move) the host check.
+func TestBuiltinProviderBaseURL_HostAgreesWithServingHost(t *testing.T) {
+	t.Parallel()
+	for provider, base := range builtinProviderBaseURL {
+		wantHost, inHostMap := builtinProviderServingHost[provider]
+		if !inHostMap {
+			t.Errorf("builtinProviderBaseURL[%q] has no builtinProviderServingHost entry", provider)
+			continue
+		}
+		if builtinAggregatorProviders[provider] {
+			continue
+		}
+		host, ok := httpsHostname(base)
+		if !ok || host != wantHost {
+			t.Errorf("builtinProviderBaseURL[%q] = %q, want an https URL on host %q", provider, base, wantHost)
+		}
+	}
+}
+
+// TestNativeProviderPin_SameHostDifferentPathStaysInjected is the revert-RED
+// half of the bound-URL path check: a direct built-in pin on the provider's
+// own host but a different path must stay on the injected custom provider
+// at the bound URL (argv, pin env, and no vendor credential mirror).
+// Reverting nativeProviderPin to the host-only comparison turns this red.
+func TestNativeProviderPin_SameHostDifferentPathStaysInjected(t *testing.T) {
+	t.Parallel()
+	ep := &agent.EndpointBinding{
+		Company: agent.CompanyOpenAI, BaseURL: "https://api.z.ai/api/paas/v4", Protocol: agent.ProtoOpenAIChat,
+		Host: agent.HostDirect, Auth: agent.AuthBYOK,
+	}
+	spec, err := applyEndpoint(agent.Spec{Model: "zai/glm-5.3", Env: map[string]string{PiKeyEnvVar: "wire-key"}, Endpoint: ep})
+	if err != nil {
+		t.Fatalf("applyEndpoint: %v", err)
+	}
+	if got, want := modelPinArgs(spec), []string{"--provider", pinnedProviderName, "--model", "glm-5.3"}; !reflect.DeepEqual(got, want) {
+		t.Errorf("modelPinArgs = %q, want %q", got, want)
+	}
+	if _, set := spec.Env["ZAI_API_KEY"]; set {
+		t.Errorf("same-host different-path route must not mirror the vendor credential, got %q", spec.Env["ZAI_API_KEY"])
+	}
+	if spec.Env[PiKeyEnvVar] != "wire-key" {
+		t.Errorf("injected provider key = %q, want the wire key", spec.Env[PiKeyEnvVar])
 	}
 }
 

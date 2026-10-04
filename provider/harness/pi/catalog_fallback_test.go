@@ -201,6 +201,90 @@ func TestPrepare_CatalogMiss_KeepsRefusingUnbound(t *testing.T) {
 	}
 }
 
+// TestPrepare_CatalogMiss_MirrorsSpecKeyNotHostKey pins the fallback's
+// credential source: the injected provider must read the resolved cell key
+// from the spec (the vendor var applyEndpoint left on Spec.Env), never from
+// the host process env. The spec carries only the vendor variable with a
+// spec value while the host export holds a different value; the mirrored
+// key must equal the spec value. RED proof: change the fallback mirror to
+// read os.Getenv(envVar) and this test fails with the host value.
+func TestPrepare_CatalogMiss_MirrorsSpecKeyNotHostKey(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv("ZAI_API_KEY", "host-vendor-key")
+	p := &Provider{binary: "pi", opts: Options{
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			return "provider  model\n", nil // confirmed miss
+		},
+	}}
+	spec, err := p.prepare(context.Background(), agent.Spec{
+		Prompt: "hi",
+		Cwd:    t.TempDir(),
+		Model:  "zai/glm-9.9-next",
+		Env:    map[string]string{"ZAI_API_KEY": "spec-cell-key"},
+		Endpoint: &agent.EndpointBinding{
+			Company:  agent.CompanyOpenAI,
+			Host:     agent.HostDirect,
+			BaseURL:  "https://api.z.ai/api/coding/paas/v4",
+			Protocol: agent.ProtoOpenAIChat,
+			Env:      map[string]string{},
+		},
+		ProviderConfig: map[string]any{"maxOutputTokens": 64000},
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if got := spec.Env[PiKeyEnvVar]; got != "spec-cell-key" {
+		t.Errorf("%s = %q, want the spec value %q (host value must not win)", PiKeyEnvVar, got, "spec-cell-key")
+	}
+}
+
+// TestPrepare_CatalogMiss_KeylessSpecYieldsNoInjectedKey pins the
+// catalog-miss fallback's credential source through the real prepare(): a
+// keyless spec (no key on Spec.Env, none on the binding) with a host vendor
+// key set must still yield no injected-provider key — neither on the
+// prepared spec nor in the composed child env. RED proof: change the
+// fallback mirror in catalog_preflight.go to fall back to the host vendor
+// key when the spec has none (os.Getenv(envVar)) and this test fails with
+// the host value on the injected-provider key var.
+func TestPrepare_CatalogMiss_KeylessSpecYieldsNoInjectedKey(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv("GEMINI_API_KEY", "host-vendor-key")
+	p := &Provider{binary: "pi", opts: Options{
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			return "provider  model\n", nil // confirmed miss
+		},
+	}}
+	spec, err := p.prepare(context.Background(), agent.Spec{
+		Prompt: "hi",
+		Cwd:    t.TempDir(),
+		Model:  "google/gemini-4-pro",
+		Endpoint: &agent.EndpointBinding{
+			Company:  agent.CompanyGoogle,
+			Model:    "google/gemini-4-pro",
+			BaseURL:  "https://generativelanguage.googleapis.com/v1beta",
+			Host:     agent.HostDirect,
+			Protocol: agent.ProtoGeminiGenerate,
+			Env:      map[string]string{},
+		},
+		ProviderConfig: map[string]any{"maxOutputTokens": 64000},
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	// The miss must still have translated into the injected fallback (not
+	// a denial): the pin rides the injected provider with the bare id.
+	if args := modelPinArgs(spec); !reflect.DeepEqual(args, []string{"--provider", pinnedProviderName, "--model", "gemini-4-pro"}) {
+		t.Fatalf("modelPinArgs = %q, want the injected fallback route (otherwise this test does not exercise the fallback)", args)
+	}
+	if _, ok := spec.Env[PiKeyEnvVar]; ok {
+		t.Errorf("%s = %q on the prepared spec of a keyless session; a keyless spec yields no key", PiKeyEnvVar, spec.Env[PiKeyEnvVar])
+	}
+	child := composeChildEnv(spec, newSessionLayout(t.TempDir()), "sess-token")
+	if hasEnvKey(child, PiKeyEnvVar) {
+		t.Errorf("%s present in the child env of a keyless session; the host vendor key must not ride the fallback", PiKeyEnvVar)
+	}
+}
+
 // TestSpawn_CatalogMiss_FallsBackToInjectedProvider drives the fallback
 // through a full Spawn on a direct provider endpoint pinned to an id the
 // scripted catalog lacks: the session spawns through the injected provider

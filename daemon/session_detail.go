@@ -306,6 +306,11 @@ type SessionDetail struct {
 	// Mode / InitialPrompt.
 	RecordingEnabled *bool `json:"recordingEnabled,omitempty"`
 
+	// ContinuePullRequest forwards the named pull request to continue from
+	// PollWorkItem onto the runner's QueuedWork. nil/absent preserves
+	// today's new-PR behaviour. Opaque forwarder only.
+	ContinuePullRequest *PollContinuePullRequest `json:"continuePullRequest,omitempty"`
+
 	// InterviewBudget forwards the per-interview wall-clock + idle-grace
 	// budget from PollWorkItem onto the runner's QueuedWork. nil/absent
 	// is safe and backward-compatible. Opaque forwarder only.

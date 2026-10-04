@@ -751,3 +751,83 @@ func TestMapLine_TopLevelLinesHaveEmptyParentToolUseID(t *testing.T) {
 		}
 	}
 }
+
+// A fixture with a native delegation (Agent) call emits the typed
+// sub-agent lifecycle: `started` on the tool_use line, then
+// `completed` on the matching successful result and `failed` on the
+// matching error result. Table-driven on the raw stream-json lines so
+// removing the emission turns the assertions RED.
+func TestLineMapper_SubagentLifecycleFromFixture(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4", len(lines))
+	}
+
+	var mapper LineMapper
+	got := make([]agent.Event, 0, 8)
+	for _, line := range lines {
+		got = append(got, mapper.MapLine(line)...)
+	}
+
+	var phases []agent.SubagentPhase
+	var ids []string
+	for _, ev := range got {
+		sub, ok := ev.(agent.SubagentEvent)
+		if !ok {
+			continue
+		}
+		phases = append(phases, sub.Phase)
+		ids = append(ids, sub.ToolUseID)
+		if sub.ToolName != "Agent" {
+			t.Fatalf("SubagentEvent ToolName = %q, want Agent", sub.ToolName)
+		}
+	}
+	wantPhases := []agent.SubagentPhase{agent.SubagentStarted, agent.SubagentCompleted, agent.SubagentStarted, agent.SubagentFailed}
+	wantIDs := []string{"toolu_agent_1", "toolu_agent_1", "toolu_agent_2", "toolu_agent_2"}
+	if !reflect.DeepEqual(phases, wantPhases) {
+		t.Fatalf("subagent phases = %v, want %v", phases, wantPhases)
+	}
+	if !reflect.DeepEqual(ids, wantIDs) {
+		t.Fatalf("subagent toolUseIds = %v, want %v", ids, wantIDs)
+	}
+}
+
+// The stateless line decoder stays name-blind: a raw delegation tool_use
+// line decodes to plain tool events only, with no typed lifecycle. The
+// stateful mapper adds the lifecycle; removing it turns the lifecycle
+// test RED while this pin stays GREEN.
+func TestMapLine_DelegationToolUseHasNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_agent_call.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	for _, ev := range mapLine(lines[0]) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("stateless mapLine emitted SubagentEvent: %#v", ev)
+		}
+	}
+}
+
+// Non-delegation tool calls never emit a lifecycle, even across the
+// matching result line.
+func TestLineMapper_NonDelegationToolsEmitNoSubagentEvent(t *testing.T) {
+	t.Parallel()
+
+	var mapper LineMapper
+	assistant := []byte(`{"type":"assistant","session_id":"s","message":{"model":"m","id":"msg","role":"assistant","content":[{"type":"tool_use","id":"toolu_bash","name":"Bash","input":{"command":"ls"}}]}}`)
+	user := []byte(`{"type":"user","session_id":"s","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_bash","content":"ok","is_error":false}]}}`)
+	for _, ev := range append(mapper.MapLine(assistant), mapper.MapLine(user)...) {
+		if _, ok := ev.(agent.SubagentEvent); ok {
+			t.Fatalf("non-delegation tool emitted SubagentEvent: %#v", ev)
+		}
+	}
+}

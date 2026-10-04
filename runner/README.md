@@ -78,6 +78,7 @@ PTY-hosted dispatch (`dispatchInteractive`).
 | `backstop-failed` | Stage 2 of tail recovery ran but could not push or open a PR. |
 | `continuations-unproductive` | A turn still ended unfinished (no turn-result manifest, no PR, no verdict) after `TurnContinuationLimit` consecutive continuation prompts whose turns made no tool call. |
 | `continuations-ceiling` | A turn still ended unfinished after `TurnContinuationCeiling` continuation prompts in total, productive or not. |
+| `continue-pr-diverged` | A continue-mode run's push to the continued pull request's head branch was refused as a non-fast-forward: the head moved after dispatch, so the session's commits were not published. |
 | `interactive-input` | The interactive initial prompt exceeded the harness-declared ceiling before spawn (`interactiveInitialPromptLimit` in `interactive_loop.go`): 1,023 bytes for harnesses that type the seed into the live PTY (the kernel canonical-mode bound), 32 KiB for harnesses that carry the seed as a spawned argv element. Counts and the limit travel on the session record; prompt content never does. |
 | `interactive-unsupported` | A mode:`interactive` dispatch spawned a non-interactive handle (no PTY transport). |
 | `interactive-config` | Exactly one of the relay-attach variables was set (both or neither required). |

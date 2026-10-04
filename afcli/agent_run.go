@@ -1453,6 +1453,7 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 			McpServers:           detailMCPServers(d.McpServers),
 			Skills:               detailSkills(d.Skills),
 			MemoryBlock:          d.MemoryBlock,
+			ContinuePullRequest:  detailContinuePullRequest(d.ContinuePullRequest),
 			Mode:                 d.Mode,
 			InitialPrompt:        d.InitialPrompt,
 			RecordingEnabled:     d.RecordingEnabled,
@@ -1494,7 +1495,8 @@ func detailToQueuedWork(d *daemon.SessionDetail) (runner.QueuedWork, error) {
 		if d.BaseRef != admitted.BaseRef || !reflect.DeepEqual(d.RepositoryDeclaration, admitted.RepositoryDeclaration) ||
 			d.WorkareaMode != admitted.WorkareaMode || d.ParentWorkareaID != admitted.ParentWorkareaID ||
 			!reflect.DeepEqual(d.RepositoryFilter, admitted.RepositoryFilter) || d.CacheSeedID != admitted.CacheSeedID ||
-			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) {
+			!reflect.DeepEqual(d.PullRequest, admitted.PullRequest) ||
+			!reflect.DeepEqual(detailContinuePullRequest(d.ContinuePullRequest), admitted.ContinuePullRequest) {
 			return runner.QueuedWork{}, errors.New("operational payload workarea intent differs from compatibility mirror")
 		}
 		if d.AgentCardID != admitted.AgentCardID || d.AgentCardName != admitted.AgentCardName {
@@ -1650,6 +1652,20 @@ func detailMCPServers(in []daemon.PollMCPServer) []agent.MCPServerConfig {
 		}
 	}
 	return out
+}
+
+// detailContinuePullRequest re-types the daemon's PollContinuePullRequest
+// mirror into the runner-consumable prompt.ContinuePullRequest. Nil in
+// returns nil so the omitempty round-trip is faithful.
+func detailContinuePullRequest(in *daemon.PollContinuePullRequest) *prompt.ContinuePullRequest {
+	if in == nil {
+		return nil
+	}
+	return &prompt.ContinuePullRequest{
+		Number:  in.Number,
+		HeadRef: in.HeadRef,
+		HeadSha: in.HeadSha,
+	}
 }
 
 // detailSkills re-types the daemon's PollSkill mirror slice into the

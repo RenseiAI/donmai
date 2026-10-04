@@ -684,3 +684,103 @@ func TestRefusedFirstHeartbeatLetsAnotherCompositionFound(t *testing.T) {
 		t.Fatal("the second install never reached a projected heartbeat")
 	}
 }
+
+// TestFoundingRetryLoopRefusedOnceThenAcceptedThroughRetrying is the
+// refused-then-accepted half the other retry tests leave out: the platform
+// refuses the founder's declaring refresh exactly once, and the retry loop
+// founds the composition with the SAME configuration after backoff — no other
+// founder listed. It drives the production retry entry point, not a helper.
+func TestFoundingRetryLoopRefusedOnceThenAcceptedThroughRetrying(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForControllerOnce(first.ControllerID)
+	var waits []time.Duration
+	policy := SessionShimFoundingRetryPolicy{
+		MaxAttempts:    2,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		},
+	}
+	if err := h.daemon.InstallSessionShimCompositionRetrying(ctx, first, policy); err != nil {
+		t.Fatalf("retrying install after a one-shot founding refusal: %v", err)
+	}
+	if len(waits) != 1 || waits[0] != time.Millisecond {
+		t.Fatalf("backoff waits = %v, want exactly one 1ms wait between the refused and accepted attempts", waits)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the retrying install = %#v, want the composed attestation", got)
+	}
+	if h.daemon.SessionShimDiagnostics().DurabilityRefusal != nil {
+		t.Fatal("host status still reports a refusal the retrying install has since recovered from")
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the retrying install never reached a projected heartbeat")
+	}
+
+	// A recovered founder still holds the composition: no second install.
+	if err := h.daemon.InstallSessionShimComposition(ctx, first); err == nil {
+		t.Fatal("an install over the recovered composition was accepted")
+	}
+}
+
+// TestRefusedFoundingLetsDifferentOrgFound is the retry contract across an
+// organization boundary: when the platform refuses one org's founding
+// declaration, a later install for a DIFFERENT org (different OrgID, not just
+// a different controller) founds the composition. The refusal answers one
+// founder, never the composition.
+func TestRefusedFoundingLetsDifferentOrgFound(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForController(first.ControllerID)
+	firstErr := h.daemon.InstallSessionShimComposition(ctx, first)
+	var refused *SessionShimFoundingRefused
+	if !errors.As(firstErr, &refused) {
+		t.Fatalf("refused founding install error = %v, want it classified as a founding refusal", firstErr)
+	}
+	if refused.Scope != h.orgID {
+		t.Fatalf("refused scope = %q, want %q", refused.Scope, h.orgID)
+	}
+
+	second := h.composedConfig(acceptingBatch)
+	second.OrgID = "org-second-composition"
+	second.ControllerID = "controller-second-org"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err != nil {
+		t.Fatalf("a refused founder blocked a later healthy org: %v", err)
+	}
+	if got := h.daemon.sessionShimConfig().orgID(); got != second.OrgID {
+		t.Fatalf("installed configuration org = %q, want %q", got, second.OrgID)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the second install = %#v, want the composed attestation", got)
+	}
+	if got := h.daemon.SessionShimHostAttestation().ControllerID; got != second.ControllerID {
+		t.Fatalf("installed attestation controller = %q, want %q", got, second.ControllerID)
+	}
+	if h.daemon.SessionShimDiagnostics().DurabilityRefusal != nil {
+		t.Fatal("host status still reports a refusal the daemon has since recovered from")
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the second install never reached a projected heartbeat")
+	}
+	if beat.SessionShim.ControllerID != second.ControllerID {
+		t.Fatalf("projected heartbeat controller = %q, want %q", beat.SessionShim.ControllerID, second.ControllerID)
+	}
+	retained := h.daemon.sessionShimCredentialReceipts()
+	if len(retained) != 1 || retained[0].Scope != second.OrgID {
+		t.Fatalf("retained receipts = %+v, want exactly the second org's authority", retained)
+	}
+}
