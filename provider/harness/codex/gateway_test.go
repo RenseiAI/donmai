@@ -384,6 +384,159 @@ func TestGatewayHeadlessResumeAfterSpawnWithEndpointKey(t *testing.T) {
 	}
 }
 
+// TestGatewayHeadlessResume_RefusesDifferentEndpointKey drives the
+// production Spawn then Resume entry points on the same provider, where the
+// Resume carries a different endpoint key. The running child was started
+// with the first key pinned into its environment layer, so comparing
+// against anything but the pinned gateway key would serve the second
+// session the first session's credential. It must fail closed: the Resume
+// refuses with errSessionEnvConflict naming the gateway env name, quotes
+// neither key, and leaves the child's pinned key untouched.
+//
+// RED proof: compare the Resume against the candidate spec's raw Spec.Env
+// (or drop the gateway projection) and this goes red — the Resume is
+// refused for carrying exactly what the child was started with, or the
+// divergence check misses the pinned-key difference.
+func TestGatewayHeadlessResume_RefusesDifferentEndpointKey(t *testing.T) {
+	const (
+		baseURL    = "https://gateway.example/codex/v1"
+		cellKey    = "cell-key"
+		sessionKey = "spec-key"
+		otherKey   = "other-cell-key"
+	)
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    t.TempDir(),
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	go fs.run(t, "thread-gateway-key-refusal")
+
+	spec := gatewayCellSpec(baseURL, cellKey, sessionKey)
+	spec.Cwd = t.TempDir()
+	spawned, err := p.Spawn(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("gateway Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = spawned.Stop(context.Background()) })
+	spawnThreadID := spawned.SessionID()
+	if spawnThreadID == "" {
+		t.Fatal("Spawn returned an empty session id")
+	}
+
+	_, err = p.Resume(t.Context(), spawnThreadID, gatewayCellSpec(baseURL, otherKey, sessionKey))
+	if err == nil {
+		t.Fatal("Resume with a different endpoint key was accepted, want a fail-closed refusal")
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("refusal error %v does not wrap agent.ErrSpawnFailed", err)
+	}
+	if !errors.Is(err, errSessionEnvConflict) {
+		t.Fatalf("refusal error %v does not wrap errSessionEnvConflict", err)
+	}
+	if message := err.Error(); !strings.Contains(message, codexGatewayEnvKey) {
+		t.Fatalf("refusal error %q does not name the gateway env name", message)
+	}
+	for _, secret := range []string{cellKey, otherKey} {
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("refusal error quotes a gateway key: %q", err.Error())
+		}
+	}
+	if got := p.pinnedSessionEnv[codexGatewayEnvKey]; got != cellKey {
+		t.Fatalf("pinned child env key = %q, want the spawned key %q", got, cellKey)
+	}
+}
+
+// TestGatewayHeadlessResume_RefusesDifferentBaseURL drives the production
+// Spawn then Resume entry points on the same provider, where the Resume
+// carries the same key but a different gateway base URL. The private
+// config's provider block is append-once, so the running child stays on the
+// first gateway no matter what the Resume names; accepting the Resume would
+// hand the caller a session that claims one route while serving another.
+// It must fail closed with errGatewayRouteConflict, quote neither URL, and
+// leave the private config and pinned route on the first gateway.
+//
+// RED proof: drop the checkGatewayRouteLocked call from ensureHeadlessReady
+// and the Resume succeeds while the config still carries the first base URL
+// — exactly the silent misroute this refuses.
+func TestGatewayHeadlessResume_RefusesDifferentBaseURL(t *testing.T) {
+	const (
+		firstBaseURL  = "https://gateway.example/codex/v1"
+		secondBaseURL = "https://gateway.example/codex/v2"
+		cellKey       = "cell-key"
+		sessionKey    = "spec-key"
+	)
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    t.TempDir(),
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	go fs.run(t, "thread-gateway-url-refusal")
+
+	spec := gatewayCellSpec(firstBaseURL, cellKey, sessionKey)
+	spec.Cwd = t.TempDir()
+	spawned, err := p.Spawn(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("gateway Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = spawned.Stop(context.Background()) })
+	spawnThreadID := spawned.SessionID()
+	if spawnThreadID == "" {
+		t.Fatal("Spawn returned an empty session id")
+	}
+
+	_, err = p.Resume(t.Context(), spawnThreadID, gatewayCellSpec(secondBaseURL, cellKey, sessionKey))
+	if err == nil {
+		t.Fatal("Resume with a different base URL was accepted, want a fail-closed refusal")
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("refusal error %v does not wrap agent.ErrSpawnFailed", err)
+	}
+	if !errors.Is(err, errGatewayRouteConflict) {
+		t.Fatalf("refusal error %v does not wrap errGatewayRouteConflict", err)
+	}
+	for _, url := range []string{firstBaseURL, secondBaseURL} {
+		if strings.Contains(err.Error(), url) {
+			t.Fatalf("refusal error quotes a gateway URL: %q", err.Error())
+		}
+	}
+	body, rerr := os.ReadFile(p.config.configPath)
+	if rerr != nil {
+		t.Fatalf("read private config: %v", rerr)
+	}
+	if !strings.Contains(string(body), `base_url = "`+firstBaseURL+`"`) {
+		t.Fatalf("private config lost the first gateway route:\n%s", body)
+	}
+	if strings.Contains(string(body), secondBaseURL) {
+		t.Fatalf("refused Resume re-pointed the private config:\n%s", body)
+	}
+	if !p.gatewayRoutePinned || p.pinnedGatewayBaseURL != firstBaseURL || !p.pinnedGatewayRouted {
+		t.Fatalf("pinned route = %q routed=%v pinned=%v, want the spawned route",
+			p.pinnedGatewayBaseURL, p.pinnedGatewayRouted, p.gatewayRoutePinned)
+	}
+}
+
 // TestGatewayHeadlessSpawn_SpecKeyFallback drives the production Spawn entry
 // point with the gateway key carried only on the session layer (the shape
 // production uses today). Dropping the session-layer fallback from
