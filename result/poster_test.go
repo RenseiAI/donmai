@@ -1159,6 +1159,78 @@ func TestPosterPost_StatusBudgetBreachSerialized(t *testing.T) {
 	}
 }
 
+// TestPosterPost_StatusTokenClassesSerialized pins that every token class
+// reaches the status body: input, output, cache-read (from
+// CostData.CachedInputTokens), cache-write and reasoning. Zero classes are
+// omitted (backward-compatible additive fields an old receiver ignores); a
+// nonzero cost posts all four usage keys.
+func TestPosterPost_StatusTokenClassesSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name      string
+		cost      *agent.CostData
+		wantKeys  map[string]float64
+		omitToken bool
+	}{
+		{
+			name: "all four usage classes",
+			cost: &agent.CostData{
+				InputTokens: 5, CachedInputTokens: 16526,
+				CacheWriteTokens: 1200, OutputTokens: 200, ReasoningTokens: 40,
+			},
+			wantKeys: map[string]float64{
+				"inputTokens": 5, "outputTokens": 200,
+				"cacheReadTokens": 16526, "cacheWriteTokens": 1200,
+				"reasoningTokens": 40,
+			},
+		},
+		{name: "nil cost omits every token key", omitToken: true},
+		{
+			name:      "zero cost omits every token key",
+			cost:      &agent.CostData{},
+			wantKeys:  map[string]float64{},
+			omitToken: true,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.Cost = tc.cost
+			if err := p.Post(context.Background(), "sess-tokens", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]any
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			for _, key := range []string{"inputTokens", "outputTokens", "cacheReadTokens", "cacheWriteTokens", "reasoningTokens"} {
+				got, present := body[key]
+				want, wanted := tc.wantKeys[key]
+				if tc.omitToken || !wanted {
+					if present {
+						t.Errorf("%s = %v, want the key omitted (body %s)", key, got, statusBody)
+					}
+					continue
+				}
+				if !present || got.(float64) != want {
+					t.Errorf("%s = %v, want %v (body %s)", key, got, want, statusBody)
+				}
+			}
+		})
+	}
+}
+
 // TestPosterPost_StatusReviewVerdictSerialized pins that the structured
 // review outcome reaches the status body, and is omitted when empty.
 func TestPosterPost_StatusReviewVerdictSerialized(t *testing.T) {

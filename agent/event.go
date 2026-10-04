@@ -222,10 +222,16 @@ type LlmCallEvent struct {
 	ResponseModel         string `json:"responseModel,omitempty"`
 	ResponseModelProvider string `json:"responseModelProvider,omitempty"`
 
-	InputTokens       int64  `json:"inputTokens,omitempty"`
-	OutputTokens      int64  `json:"outputTokens,omitempty"`
-	CachedInputTokens int64  `json:"cachedInputTokens,omitempty"`
-	FinishReason      string `json:"finishReason,omitempty"`
+	InputTokens       int64 `json:"inputTokens,omitempty"`
+	OutputTokens      int64 `json:"outputTokens,omitempty"`
+	CachedInputTokens int64 `json:"cachedInputTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) input token
+	// count. Like CachedInputTokens it is excluded from InputTokens.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens,
+	// never an additive extra (see CostData).
+	ReasoningTokens int64  `json:"reasoningTokens,omitempty"`
+	FinishReason    string `json:"finishReason,omitempty"`
 	// ObservedCostUsd is the provider's price for this exact call. A pointer
 	// distinguishes a reported zero from an absent price. Estimated prices
 	// and aggregate fallbacks must not populate it.

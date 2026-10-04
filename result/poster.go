@@ -212,6 +212,18 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+	// CacheReadTokens is the cache-read token count carried from
+	// CostData.CachedInputTokens. Additive and backward-compatible:
+	// omitted when zero, so an old receiver that ignores the key still
+	// parses the body.
+	CacheReadTokens int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) token count
+	// carried from CostData.CacheWriteTokens. Same additive contract.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens
+	// (see CostData), carried for observability only — never added to
+	// totals. Same additive contract.
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 
 	// FailureMode carries the runner's structural failure classification
 	// (e.g. "agent-blocked") so the platform routes on the authoritative
@@ -525,6 +537,9 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		body.TotalCostUsd = r.Cost.TotalCostUsd
 		body.InputTokens = r.Cost.InputTokens
 		body.OutputTokens = r.Cost.OutputTokens
+		body.CacheReadTokens = r.Cost.CachedInputTokens
+		body.CacheWriteTokens = r.Cost.CacheWriteTokens
+		body.ReasoningTokens = r.Cost.ReasoningTokens
 	}
 	if r.Error != "" {
 		body.Error = &errorEnvelope{Message: r.Error}

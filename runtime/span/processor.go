@@ -42,7 +42,7 @@ type ProcessorConfig struct {
 	System      string
 	Model       string
 
-	// REN-2649 incoming trace correlation (optional). When present the
+	// Incoming trace correlation (optional). When present the
 	// processor reuses the platform-minted trace ID and parents the session
 	// root to the dispatch parent ID; absent preserves locally minted trace.
 	Traceparent      string
@@ -122,7 +122,7 @@ func NewProcessor(cfg ProcessorConfig) (*Processor, error) {
 	if cfg.IDGenerator == nil {
 		cfg.IDGenerator = randomHexID
 	}
-	// REN-2649: reuse incoming W3C traceparent when valid; otherwise mint.
+	// Reuse incoming W3C traceparent when valid; otherwise mint.
 	var traceID, dispatchParentID string
 	if cfg.Traceparent != "" {
 		if tid, pid, ok := parseTraceparent(cfg.Traceparent); ok {
@@ -308,12 +308,14 @@ func (p *Processor) processLlm(e agent.LlmCallEvent, now time.Time) agent.LlmCal
 			),
 		},
 		GenAI: agent.GenAIAttributes{
-			System:                    e.System,
-			RequestModel:              e.Model,
-			UsageInputTokens:          e.InputTokens,
-			UsageOutputTokens:         e.OutputTokens,
-			UsageCacheReadInputTokens: e.CachedInputTokens,
-			ResponseFinishReason:      e.FinishReason,
+			System:                     e.System,
+			RequestModel:               e.Model,
+			UsageInputTokens:           e.InputTokens,
+			UsageOutputTokens:          e.OutputTokens,
+			UsageCacheReadInputTokens:  e.CachedInputTokens,
+			UsageCacheWriteInputTokens: e.CacheWriteTokens,
+			UsageReasoningTokens:       e.ReasoningTokens,
+			ResponseFinishReason:       e.FinishReason,
 		},
 	})
 	p.activeLlmEmitted = true
@@ -634,6 +636,8 @@ func aggregateLlmEvent(result agent.ResultEvent, system, model string) agent.Llm
 		e.InputTokens = result.Cost.InputTokens
 		e.OutputTokens = result.Cost.OutputTokens
 		e.CachedInputTokens = result.Cost.CachedInputTokens
+		e.CacheWriteTokens = result.Cost.CacheWriteTokens
+		e.ReasoningTokens = result.Cost.ReasoningTokens
 	}
 	switch {
 	case result.Success:
