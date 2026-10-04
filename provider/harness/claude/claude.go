@@ -145,10 +145,16 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	// Reasoning effort is fixed through the environment for BOTH spawn modes
-	// (effort.go): the configured level, or the model's own default when none
-	// is configured — never a level saved in the operator's settings.
-	spec.Env = withEffortEnv(spec.Env, spec.Effort)
+	// Reasoning effort is fixed through the environment only for stamped
+	// headless sessions (effort.go): the configured level, or the model's
+	// own default when none is configured — never a level saved in the
+	// operator's settings. Interactive sessions keep the operator's own
+	// effort control (the --effort flag when a level is known, plus the
+	// in-session effort command and saved preferences), and unstamped
+	// standalone sessions inherit the environment untouched.
+	if forceEffortEnv(spec) {
+		spec.Env = withEffortEnv(spec.Env, spec.Effort)
+	}
 	// Interactive spawn mode (W4): capability-gated on the live manifest, not
 	// a static branch — a future edit that flips SupportsInteractivePTY back
 	// to false makes this a silent no-op fallthrough to the headless path

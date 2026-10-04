@@ -134,8 +134,9 @@ func buildArgs(spec agent.Spec, mcpConfigPath, resumeSessionID string) (argv []s
 	// unrecognised stored value (e.g. another harness's "none" or
 	// "minimal") would be silently ignored by the CLI, which then falls
 	// back to the operator's saved level while the session records a
-	// different one. Omitting the flag lets the effort env var (effort.go)
-	// carry the model default instead.
+	// different one. Omitting the flag leaves the operator's saved level in
+	// place — except on stamped headless sessions, where the forced effort
+	// env var (effort.go) carries the model default instead.
 	if spec.Effort.Known() {
 		argv = append(argv, "--effort", string(spec.Effort))
 	}
