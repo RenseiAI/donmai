@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"os/exec"
 	"strings"
 	"time"
 
@@ -134,20 +135,48 @@ func continueDelivered(localHead, remoteHead, startHead string) bool {
 }
 
 // continueDiverged reports whether a backstop report carries the typed
-// continue-mode divergence refusal (see runBackstop). A declared session's
-// aggregate report folds every repository's diagnostics into its own, so
-// the top-level diagnostics are enough.
+// continue-mode divergence signal (see runBackstop). A declared session's
+// aggregate report folds every repository's flag into its own, so the
+// top-level flag is enough.
 func continueDiverged(report *agent.BackstopReport) bool {
-	return report != nil && strings.Contains(report.Diagnostics, ErrContinuePullRequestDiverged.Error())
+	if report == nil {
+		return false
+	}
+	if report.ContinueDiverged {
+		return true
+	}
+	for _, repository := range report.Repositories {
+		if repository.Report.ContinueDiverged {
+			return true
+		}
+	}
+	return false
 }
 
-// isContinueDivergence reports whether a push failure is the typed
-// non-fast-forward refusal: the continued branch moved on the remote.
-// It matches git's own explanation rather than the exit code so a
-// transport failure is never misreported as divergence.
-func isContinueDivergence(pushOutput string) bool {
-	lowered := strings.ToLower(pushOutput)
-	return strings.Contains(lowered, "non-fast-forward") ||
-		strings.Contains(lowered, "fetch first") ||
-		(strings.Contains(lowered, "rejected") && strings.Contains(lowered, "fetch"))
+// continueHeadDiverged probes whether the continued head branch moved on
+// the remote after dispatch: it fetches the head ref, then asks whether
+// the fetched head is an ancestor of the session's HEAD. A remote head
+// that is not an ancestor means the push would not fast-forward, so the
+// refusal is divergence; a remote head that IS an ancestor means some
+// other policy refused an otherwise fast-forward push. A failed probe
+// (fetch or ancestry check erroring for any other reason) reports false:
+// divergence must be proven, never assumed from an unreadable remote.
+func continueHeadDiverged(ctx context.Context, worktreePath, headRef string) bool {
+	if strings.TrimSpace(headRef) == "" || strings.TrimSpace(worktreePath) == "" {
+		return false
+	}
+	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
+	defer cancel()
+	if _, err := runGit(probeCtx, worktreePath, gitIdentity{}, "fetch", "origin", headRef); err != nil {
+		return false
+	}
+	_, err := runGit(probeCtx, worktreePath, gitIdentity{}, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD")
+	if err == nil {
+		return false
+	}
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) && exitErr.ExitCode() == 1 {
+		return true
+	}
+	return false
 }
