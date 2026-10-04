@@ -17,12 +17,14 @@
 // Capabilities: agentic parity for the native tool surface. The provider
 // drives a multi-turn generateContent conversation with native
 // function-calling, reasoning-effort via thinkingConfig (thinkingLevel
-// on the 3.x family, thinkingBudget on the 2.5 family), and post-
+// on major version 3 and later plus unversioned ids, thinkingBudget on
+// 2.x and earlier), and post-
 // completion steering by appending a turn and re-driving the loop.
 // Per-Spawn credentials resolve from Spec.Env[GEMINI_API_KEY] then
 // Spec.Env[GOOGLE_API_KEY] then the construction-time fallback,
-// supporting per-session BYOK + rotation. TotalCostUsd is computed from a
-// per-model USD pricing table.
+// supporting per-session BYOK + rotation. TotalCostUsd is computed from
+// dispatcher-supplied per-model prices (Spec.ProviderConfig) with a
+// per-model USD fallback pricing table.
 //
 // Conversation model: Gemini's REST endpoint is stateless AND does not
 // execute tools — it returns functionCall parts and expects the caller

@@ -41,6 +41,9 @@ type sessionParams struct {
 	plan      spawnPlan
 	client    *http.Client
 	sessionID string
+	// providerConfig carries the dispatcher's Spec.ProviderConfig into the
+	// session's cost state so per-model price overrides apply.
+	providerConfig map[string]any
 	// cwd / env configure the session-local toolExecutor (working
 	// directory native tools run in + per-session environment for Bash).
 	cwd string
@@ -151,7 +154,7 @@ func startSession(ctx context.Context, p sessionParams) (*Handle, error) {
 		inject:    make(chan injectMsg, 4),
 		contents:  append([]requestContent(nil), p.plan.initialContents...),
 		shutdown:  make(chan struct{}),
-		state:     &turnState{model: p.model},
+		state:     &turnState{model: p.model, providerConfig: p.providerConfig},
 	}
 	h.executor.policy = p.policy
 

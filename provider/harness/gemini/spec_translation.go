@@ -52,8 +52,10 @@ type requestSystemInstruction struct {
 // thinkingConfig mirrors GenerationConfig.thinkingConfig. Gemini exposes
 // two mutually-exclusive knobs:
 //
-//   - ThinkingLevel ("minimal"|"low"|"medium"|"high") on the 3.x family.
-//   - ThinkingBudget (token int; -1 dynamic, 0 off) on the 2.5 family.
+//   - ThinkingLevel ("minimal"|"low"|"medium"|"high") on level-knob
+//     models (major version 3 and later, plus unversioned ids).
+//   - ThinkingBudget (token int; -1 dynamic, 0 off) on budget-knob
+//     models (2.x and earlier).
 //
 // Exactly one is populated per model; the other stays nil/empty so the
 // wire payload only carries the knob the target model understands.
