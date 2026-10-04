@@ -567,3 +567,112 @@ func TestObservedClaudeResultAvailability(t *testing.T) {
 		})
 	}
 }
+
+// A nested sub-agent delegation carries the delegating call's id on every
+// message emitted inside it: assistant text, tool use, and tool result all
+// surface the same ParentToolUseID, while the top-level delegating call
+// itself stays empty. Table-driven on the raw stream-json lines so removing
+// the mapping turns the assertions RED.
+func TestMapLine_SubagentNestedParentToolUseID(t *testing.T) {
+	t.Parallel()
+
+	body, err := os.ReadFile(filepath.Join("testdata", "subagent_nested.jsonl"))
+	if err != nil {
+		t.Fatalf("read fixture: %v", err)
+	}
+	lines := bytes.Split(bytes.TrimRight(body, "\n"), []byte("\n"))
+	if len(lines) != 4 {
+		t.Fatalf("got %d lines, want 4", len(lines))
+	}
+
+	// The delegating call is top-level: no parent id.
+	parent := mapLine(lines[0])
+	parent = requireResponseModelPrefix(t, parent, "claude-opus-4-7")
+	if len(parent) != 1 {
+		t.Fatalf("parent line: got %d events, want 1", len(parent))
+	}
+	tu, ok := parent[0].(agent.ToolUseEvent)
+	if !ok {
+		t.Fatalf("parent event %T, want ToolUseEvent", parent[0])
+	}
+	if tu.ToolUseID != "toolu_parent" {
+		t.Fatalf("parent ToolUseID = %q, want toolu_parent", tu.ToolUseID)
+	}
+	if tu.ParentToolUseID != "" {
+		t.Fatalf("parent ParentToolUseID = %q, want empty", tu.ParentToolUseID)
+	}
+
+	// Everything emitted inside the sub-agent names the delegating call.
+	cases := []struct {
+		name      string
+		line      []byte
+		wantKind  agent.EventKind
+		wantID    string
+		wantEmpty bool
+	}{
+		{"assistant text", lines[1], agent.EventAssistantText, "", false},
+		{"tool use", lines[2], agent.EventToolUse, "toolu_child", false},
+		{"tool result", lines[3], agent.EventToolResult, "toolu_child", false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			events := mapLine(tc.line)
+			if tc.wantKind == agent.EventAssistantText || tc.wantKind == agent.EventToolUse {
+				events = requireResponseModelPrefix(t, events, "claude-opus-4-7")
+			}
+			if len(events) != 1 {
+				t.Fatalf("got %d events, want 1", len(events))
+			}
+			var got string
+			switch ev := events[0].(type) {
+			case agent.AssistantTextEvent:
+				got = ev.ParentToolUseID
+			case agent.ToolUseEvent:
+				got = ev.ParentToolUseID
+				if ev.ToolUseID != tc.wantID {
+					t.Fatalf("ToolUseID = %q, want %q", ev.ToolUseID, tc.wantID)
+				}
+			case agent.ToolResultEvent:
+				got = ev.ParentToolUseID
+				if ev.ToolUseID != tc.wantID {
+					t.Fatalf("ToolUseID = %q, want %q", ev.ToolUseID, tc.wantID)
+				}
+			default:
+				t.Fatalf("event %T, want %s", events[0], tc.wantKind)
+			}
+			if got != "toolu_parent" {
+				t.Fatalf("ParentToolUseID = %q, want %q", got, "toolu_parent")
+			}
+		})
+	}
+}
+
+// Lines without the delegation marker stay parentless: adapters never guess.
+func TestMapLine_TopLevelLinesHaveEmptyParentToolUseID(t *testing.T) {
+	t.Parallel()
+
+	for _, line := range [][]byte{
+		readFixture(t, "assistant_tool_use.jsonl"),
+		readFixture(t, "assistant_mixed.jsonl"),
+		readFixture(t, "assistant_text.jsonl"),
+		readFixture(t, "user_tool_result.jsonl"),
+	} {
+		for _, ev := range mapLine(line) {
+			switch ev := ev.(type) {
+			case agent.AssistantTextEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("AssistantText ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			case agent.ToolUseEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("ToolUse ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			case agent.ToolResultEvent:
+				if ev.ParentToolUseID != "" {
+					t.Fatalf("ToolResult ParentToolUseID = %q, want empty", ev.ParentToolUseID)
+				}
+			}
+		}
+	}
+}

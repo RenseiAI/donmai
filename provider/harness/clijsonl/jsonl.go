@@ -37,7 +37,11 @@ type rawJSONLEnvelope struct {
 type rawAssistantEnvelope struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
-	Message   struct {
+	// ParentToolUseID carries the stream-json `parent_tool_use_id` the
+	// CLI emits on messages produced inside a sub-agent: the id of the
+	// delegation tool call that started it. Absent on top-level lines.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Message         struct {
 		ID         string            `json:"id,omitempty"`
 		Model      string            `json:"model,omitempty"`
 		StopReason string            `json:"stop_reason,omitempty"`
@@ -69,8 +73,11 @@ type rawContentBlock struct {
 // echo back tool results so JSONL consumers can pair tool_use with
 // tool_result. Mirrors the legacy TS mapUserMessage handling.
 type rawUserEnvelope struct {
-	Type    string `json:"type"`
-	Message struct {
+	Type string `json:"type"`
+	// ParentToolUseID mirrors rawAssistantEnvelope: the delegation tool
+	// call id on user-message lines emitted inside a sub-agent.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Message         struct {
 		Content []rawContentBlock `json:"content"`
 	} `json:"message"`
 }
@@ -284,16 +291,18 @@ func mapAssistant(line []byte) []agent.Event {
 				continue
 			}
 			out = append(out, agent.AssistantTextEvent{
-				Text: block.Text,
-				Raw:  json.RawMessage(line),
+				Text:            block.Text,
+				ParentToolUseID: a.ParentToolUseID,
+				Raw:             json.RawMessage(line),
 			})
 		case "tool_use":
 			input := decodeInput(block.Input)
 			out = append(out, agent.ToolUseEvent{
-				ToolName:  block.Name,
-				ToolUseID: block.ID,
-				Input:     input,
-				Raw:       json.RawMessage(line),
+				ToolName:        block.Name,
+				ToolUseID:       block.ID,
+				ParentToolUseID: a.ParentToolUseID,
+				Input:           input,
+				Raw:             json.RawMessage(line),
 			})
 		case "thinking":
 			// Model reasoning rides as SystemEvent{Subtype: "reasoning"}
@@ -334,10 +343,11 @@ func mapUser(line []byte) []agent.Event {
 		}
 		content := decodeToolResultContent(block.Content)
 		out = append(out, agent.ToolResultEvent{
-			ToolUseID: block.ToolUseID,
-			Content:   content,
-			IsError:   block.IsError,
-			Raw:       json.RawMessage(line),
+			ToolUseID:       block.ToolUseID,
+			ParentToolUseID: u.ParentToolUseID,
+			Content:         content,
+			IsError:         block.IsError,
+			Raw:             json.RawMessage(line),
 		})
 	}
 	if len(out) == 0 {
