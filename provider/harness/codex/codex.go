@@ -423,9 +423,11 @@ func (p *Provider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, er
 		return spawnInteractivePrepared(ctx, p.opts, spec)
 	}
 
-	if err := p.ensureHeadlessReady(spec); err != nil {
+	ready, err := p.ensureHeadlessReady(spec)
+	if err != nil {
 		return nil, err
 	}
+	spec = ready
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -463,9 +465,11 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
-	if err := p.ensureHeadlessReady(spec); err != nil {
+	ready, err := p.ensureHeadlessReady(spec)
+	if err != nil {
 		return nil, err
 	}
+	spec = ready
 	if err := p.checkAlive(); err != nil {
 		return nil, err
 	}
@@ -513,29 +517,54 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // The overlay only applies at start, so this is also where the one-session
 // invariant is enforced: a divergent later layer is refused BEFORE the host
 // auth link and before startLocked, so a denied spawn leaves no side effect.
-func (p *Provider) ensureHeadlessReady(spec agent.Spec) error {
+func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
 	select {
 	case <-p.shutdown:
-		return fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
+		return spec, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
 	if err := p.checkSessionEnvLocked(spec.Env); err != nil {
-		return err
+		return spec, err
 	}
 	if err := p.prepareHeadlessProtectedMCPAuthorityLocked(spec.MCPServers); err != nil {
-		return err
+		return spec, err
 	}
-	if p.hostAuthFile != "" {
+	// A gateway-routed cell skips the host-session auth link so the child
+	// cannot fall back to an operator login; the provider block plus the
+	// gateway key are its only route.
+	if baseURL, _, routed, err := gatewayBinding(spec); err != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+	} else if routed {
+		if p.hostAuthFile != "" {
+			return spec, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
+		}
+		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, spec.Env)
+		if err != nil {
+			return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		}
+		if nextEnv == nil {
+			nextEnv = map[string]string{}
+		}
+		if spec.Env != nil {
+			if key := strings.TrimSpace(spec.Env[codexGatewayEnvKey]); key != "" {
+				nextEnv[codexGatewayEnvKey] = key
+			}
+		}
+		if v, ok := nextEnv[codexGatewayEnvKey]; !ok || strings.TrimSpace(v) == "" {
+			return spec, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
+		}
+		spec.Env = nextEnv
+	} else if p.hostAuthFile != "" {
 		if err := p.config.linkHostSessionAuth(p.hostAuthFile); err != nil {
-			return fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
+			return spec, fmt.Errorf("%w: codex host-session auth: %w", agent.ErrSpawnFailed, err)
 		}
 	}
 	if err := p.startLocked(spec.Env); err != nil {
-		return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	}
-	return nil
+	return spec, nil
 }
 
 func (p *Provider) prepareHeadlessProtectedMCPAuthorityLocked(servers []agent.MCPServerConfig) error {

@@ -97,20 +97,29 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	if !hasPlatformSessionMCPAuthority(spec.MCPServers) {
-		if spec.SessionName != "" {
-			home, homeErr := ambientCodexHome()
-			if homeErr != nil {
-				return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, homeErr)
-			}
-			server, nameErr := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, home)
-			if nameErr != nil {
-				return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, nameErr)
+		_, _, routed, routeErr := gatewayBinding(spec)
+		if routeErr != nil {
+			return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
+		}
+		if !routed {
+			if spec.SessionName != "" {
+				home, homeErr := ambientCodexHome()
+				if homeErr != nil {
+					return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, homeErr)
+				}
+				server, nameErr := startNamedInteractiveAppServer(ctx, bin, opts, spec, launch, launch.env, home)
+				if nameErr != nil {
+					return nil, fmt.Errorf("%w: name codex interactive session: %w", agent.ErrSpawnFailed, nameErr)
+				}
+				spec.Env = launch.env
+				return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
 			}
 			spec.Env = launch.env
-			return spawnNamedInteractivePTY(ctx, bin, opts, spec, launch, server, server.close)
+			return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 		}
-		spec.Env = launch.env
-		return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
+		// A gateway-routed cell falls through to the isolated boundary
+		// below so the provider block lands in a private config and the
+		// child cannot see ambient state.
 	}
 	config, auth, err := newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env)
 	if err != nil {
@@ -136,15 +145,49 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	// an explicit empty mcp_servers table.
 	launch.env["CODEX_HOME"] = config.home
 	spec.Env = launch.env
-	authSeeder := opts.interactiveAuthSeeder
-	if authSeeder == nil {
-		authSeeder = seedInteractiveCodexEnvironmentAuth
-	}
-	if err := authSeeder(ctx, bin, config.home, auth); err != nil {
+	// A gateway-routed cell skips the environment-auth seeding and the
+	// host-session link: the provider block plus the gateway key are its
+	// only route, so the child must never gain an operator login fallback.
+	baseURL, _, gatewayRouted, routeErr := gatewayBinding(spec)
+	if routeErr != nil {
 		return nil, errors.Join(
-			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr),
 			config.remove(),
 		)
+	}
+	if gatewayRouted {
+		if auth.kind == interactiveCodexAuthFile {
+			return nil, errors.Join(
+				fmt.Errorf("%w: gateway route cannot combine with host-session auth", agent.ErrSpawnFailed),
+				config.remove(),
+			)
+		}
+		nextEnv, err := config.appendGatewayProviderBlock(baseURL, launch.env)
+		if err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
+		if nextEnv == nil {
+			nextEnv = map[string]string{}
+		}
+		if key := strings.TrimSpace(spec.Env[codexGatewayEnvKey]); key != "" {
+			nextEnv[codexGatewayEnvKey] = key
+		}
+		launch.env = nextEnv
+		spec.Env = launch.env
+	} else {
+		authSeeder := opts.interactiveAuthSeeder
+		if authSeeder == nil {
+			authSeeder = seedInteractiveCodexEnvironmentAuth
+		}
+		if err := authSeeder(ctx, bin, config.home, auth); err != nil {
+			return nil, errors.Join(
+				fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
+				config.remove(),
+			)
+		}
 	}
 	if err := refuseProtectedMCPStoredOAuth(config.home, spec.MCPServers); err != nil {
 		return nil, errors.Join(fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err), config.remove())

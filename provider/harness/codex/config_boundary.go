@@ -7,6 +7,8 @@ import (
 	"path/filepath"
 	"strings"
 	"sync"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 const (
@@ -18,6 +20,13 @@ const (
 	codexConfigMode       = 0o600
 	codexMCPConfigKeyPath = "mcp_servers"
 	codexAuthFileName     = "auth.json"
+
+	// codexGatewayProviderID is the neutral model-provider id the private
+	// config names when a session's endpoint binding carries a base URL.
+	// codexGatewayEnvKey is the only credential the provider block reads;
+	// the session key is projected onto it at spawn time.
+	codexGatewayProviderID = "donmai-gateway"
+	codexGatewayEnvKey     = "AI_GATEWAY_API_KEY"
 )
 
 // codexConfigBoundary is a process-owned user-config layer. Codex app-server
@@ -222,6 +231,88 @@ func removeAuthLink(path string) error {
 		return fmt.Errorf("remove incomplete isolated Codex auth link: %w", err)
 	}
 	return nil
+}
+
+// gatewayBinding resolves the session's gateway route from its endpoint
+// binding: a non-empty base URL on the Responses wire protocol. It returns
+// the base URL with the session key projected onto the gateway env name, or
+// ok=false when the binding carries no base URL and today's config applies.
+// A base URL on any other protocol fails loudly rather than silently
+// spawning against the default endpoint. The model still travels through
+// thread/start (resolveModel); the provider id here only names the block.
+func gatewayBinding(spec agent.Spec) (baseURL, envKey string, ok bool, err error) {
+	ep := spec.Endpoint
+	if ep == nil || strings.TrimSpace(ep.BaseURL) == "" {
+		return "", "", false, nil
+	}
+	if ep.Protocol != agent.ProtoOpenAIResponses {
+		return "", "", false, fmt.Errorf("codex: endpoint base URL requires the Responses wire protocol, got %q", ep.Protocol)
+	}
+	if err := agent.ValidateEndpointBindingBaseURL(ep.BaseURL); err != nil {
+		return "", "", false, fmt.Errorf("codex: invalid endpoint base URL: %w", err)
+	}
+	key := ""
+	if ep.Env != nil {
+		key = strings.TrimSpace(ep.Env[codexGatewayEnvKey])
+	}
+	if key == "" && spec.Env != nil {
+		key = strings.TrimSpace(spec.Env[codexGatewayEnvKey])
+	}
+	if key == "" {
+		return "", "", false, fmt.Errorf("codex: endpoint base URL requires a key on %s", codexGatewayEnvKey)
+	}
+	env := map[string]string{}
+	for k, v := range spec.Env {
+		env[k] = v
+	}
+	env[codexGatewayEnvKey] = key
+	return strings.TrimSpace(ep.BaseURL), codexGatewayEnvKey, true, nil
+}
+
+// appendGatewayProviderBlock writes the neutral model-provider block into
+// the boundary's private config.toml and returns the session env with the
+// key projected onto the gateway env name. Idempotent: a boundary already
+// carrying the provider id is left untouched.
+func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL string, specEnv map[string]string) (map[string]string, error) {
+	if b == nil {
+		return nil, errors.New("isolated Codex config boundary is missing")
+	}
+	body, err := os.ReadFile(b.configPath) //nolint:gosec // provider-owned isolated config path
+	if err != nil {
+		return nil, fmt.Errorf("read isolated Codex config: %w", err)
+	}
+	if strings.Contains(string(body), codexGatewayProviderID) {
+		env := map[string]string{}
+		for k, v := range specEnv {
+			env[k] = v
+		}
+		return env, b.validate()
+	}
+	block := "model_provider = " + tomlBasicString(codexGatewayProviderID) + "\n" +
+		"[model_providers." + codexGatewayProviderID + "]\n" +
+		"name = " + tomlBasicString(codexGatewayProviderID) + "\n" +
+		"base_url = " + tomlBasicString(baseURL) + "\n" +
+		"env_key = " + tomlBasicString(codexGatewayEnvKey) + "\n" +
+		"wire_api = \"responses\"\n"
+	f, err := os.OpenFile(b.configPath, os.O_WRONLY|os.O_APPEND, codexConfigMode)
+	if err != nil {
+		return nil, fmt.Errorf("append gateway provider block: %w", err)
+	}
+	if _, err := f.WriteString(block); err != nil {
+		_ = f.Close()
+		return nil, fmt.Errorf("append gateway provider block: %w", err)
+	}
+	if err := f.Close(); err != nil {
+		return nil, fmt.Errorf("close isolated Codex config: %w", err)
+	}
+	if err := os.Chmod(b.configPath, codexConfigMode); err != nil {
+		return nil, fmt.Errorf("secure isolated Codex config: %w", err)
+	}
+	env := map[string]string{}
+	for k, v := range specEnv {
+		env[k] = v
+	}
+	return env, b.validate()
 }
 
 func rejectSymlink(path string, wantDir bool) error {
