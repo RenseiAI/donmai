@@ -68,6 +68,10 @@ type probeStep struct {
 	Services []string `json:"services,omitempty"`
 	PID      int      `json:"pid,omitempty"`
 	Port     int      `json:"port,omitempty"`
+	// Host selects the dial target for the loopback TCP probe: one of
+	// "127.0.0.1", "::1" or "localhost". Empty means the IPv4
+	// loopback, so older plans keep their meaning.
+	Host string `json:"host,omitempty"`
 }
 
 type probePlan struct {
@@ -160,7 +164,7 @@ func runStep(step probeStep) stepResult {
 	case opDial:
 		err = dial(step.Path)
 	case opTCPDial:
-		err = dialTCP(step.Port)
+		err = dialTCP(tcpHost(step.Host), step.Port)
 	case opDevWrite:
 		err = appendFile(step.Path)
 	case opStdout:
@@ -247,10 +251,23 @@ func dial(path string) error {
 	return conn.Close()
 }
 
-// dialTCP connects to the loopback address on one port: the probe the
+// tcpHost normalizes the loopback TCP probe's dial target. The deny rule
+// names the local machine, so the probe must cover the numeric IPv4 and
+// IPv6 loopbacks and the hostname that may resolve to either.
+func tcpHost(host string) string {
+	switch host {
+	case "::1", "localhost":
+		return host
+	default:
+		return "127.0.0.1"
+	}
+}
+
+// dialTCP connects to the loopback target on one port: the probe the
 // profile's loopback deny is judged by.
-func dialTCP(port int) error {
-	conn, err := net.DialTimeout("tcp", "127.0.0.1:"+strconv.Itoa(port), 5*time.Second)
+func dialTCP(host string, port int) error {
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		return err
 	}

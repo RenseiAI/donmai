@@ -45,7 +45,10 @@ var classOrder = map[WritableClass]int{
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
 // every earlier self-test record stale.
-const ProbeSetVersion = "executor-confinement-probes-v2"
+// The probe-set version bumps when a probe is added or its expectation
+// changes, so the v3 loopback (IPv6, hostname) and extra pasteboard
+// probes stale every earlier self-test record.
+const ProbeSetVersion = "executor-confinement-probes-v3"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the

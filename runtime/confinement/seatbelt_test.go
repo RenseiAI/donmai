@@ -123,6 +123,16 @@ func TestRenderSeatbelt_ClosesTheWriteProxies(t *testing.T) {
 			}
 		}
 	}
+	// The activity-continuation pasteboard client rides the same daemon as
+	// the main pasteboard service: dropping it re-opens the clipboard.
+	for _, service := range []string{
+		"com.apple.pasteboard.1",
+		"com.apple.coreservices.uauseractivitypasteboardclient.xpc",
+	} {
+		if !strings.Contains(text, `(global-name "`+service+`")`) {
+			t.Errorf("profile does not deny the pasteboard service %s", service)
+		}
+	}
 }
 
 func TestRenderSeatbelt_RefusesPathsItCannotQuote(t *testing.T) {
@@ -208,7 +218,8 @@ func TestSbplString(t *testing.T) {
 
 // TestRenderSeatbelt_LoopbackTCPPorts: the loopback deny is always rendered,
 // and each declared port renders one allow after it so the last matching
-// rule wins.
+// rule wins. The deny names the local machine rather than one address
+// family, so narrowing it to IPv4 (tcp4) must fail this test.
 func TestRenderSeatbelt_LoopbackTCPPorts(t *testing.T) {
 	plain := mustRender(t, sampleResolved(), nil)
 	if !strings.Contains(plain, `(deny network-outbound (remote tcp "localhost:*"))`) {
