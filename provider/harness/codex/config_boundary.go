@@ -235,12 +235,14 @@ func removeAuthLink(path string) error {
 
 // gatewayBinding resolves the session's gateway route from its endpoint
 // binding: a non-empty base URL on the Responses wire protocol. It returns
-// the base URL with the session key projected onto the gateway env name, or
-// ok=false when the binding carries no base URL and today's config applies.
-// A base URL on any other protocol fails loudly rather than silently
-// spawning against the default endpoint. The model still travels through
-// thread/start (resolveModel); the provider id here only names the block.
-func gatewayBinding(spec agent.Spec) (baseURL, envKey string, ok bool, err error) {
+// the base URL with the session key selected for the gateway env name — the
+// binding's own cell key beats the session layer — or ok=false when the
+// binding carries no base URL and today's config applies. A base URL on any
+// other protocol, or a routed cell without a key, fails loudly rather than
+// silently spawning against the default endpoint. The model still travels
+// through thread/start (resolveModel); the provider id here only names the
+// block.
+func gatewayBinding(spec agent.Spec) (baseURL, key string, ok bool, err error) {
 	ep := spec.Endpoint
 	if ep == nil || strings.TrimSpace(ep.BaseURL) == "" {
 		return "", "", false, nil
@@ -251,7 +253,7 @@ func gatewayBinding(spec agent.Spec) (baseURL, envKey string, ok bool, err error
 	if err := agent.ValidateEndpointBindingBaseURL(ep.BaseURL); err != nil {
 		return "", "", false, fmt.Errorf("codex: invalid endpoint base URL: %w", err)
 	}
-	key := ""
+	key = ""
 	if ep.Env != nil {
 		key = strings.TrimSpace(ep.Env[codexGatewayEnvKey])
 	}
@@ -261,32 +263,28 @@ func gatewayBinding(spec agent.Spec) (baseURL, envKey string, ok bool, err error
 	if key == "" {
 		return "", "", false, fmt.Errorf("codex: endpoint base URL requires a key on %s", codexGatewayEnvKey)
 	}
-	env := map[string]string{}
-	for k, v := range spec.Env {
-		env[k] = v
-	}
-	env[codexGatewayEnvKey] = key
-	return strings.TrimSpace(ep.BaseURL), codexGatewayEnvKey, true, nil
+	return strings.TrimSpace(ep.BaseURL), key, true, nil
 }
 
 // appendGatewayProviderBlock writes the neutral model-provider block into
 // the boundary's private config.toml and returns the session env with the
-// key projected onto the gateway env name. Idempotent: a boundary already
-// carrying the provider id is left untouched.
-func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL string, specEnv map[string]string) (map[string]string, error) {
+// binding-selected key projected onto the gateway env name, so the
+// app-server/PTY child authenticates to the routed endpoint with the cell's
+// own credential. Idempotent: a boundary already carrying the provider id
+// leaves the config untouched (the env projection still applies).
+func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL, key string, specEnv map[string]string) (map[string]string, error) {
 	if b == nil {
 		return nil, errors.New("isolated Codex config boundary is missing")
+	}
+	if strings.TrimSpace(key) == "" {
+		return nil, fmt.Errorf("codex: gateway provider block requires a key on %s", codexGatewayEnvKey)
 	}
 	body, err := os.ReadFile(b.configPath) //nolint:gosec // provider-owned isolated config path
 	if err != nil {
 		return nil, fmt.Errorf("read isolated Codex config: %w", err)
 	}
 	if strings.Contains(string(body), codexGatewayProviderID) {
-		env := map[string]string{}
-		for k, v := range specEnv {
-			env[k] = v
-		}
-		return env, b.validate()
+		return projectGatewayKey(specEnv, key), b.validate()
 	}
 	block := "model_provider = " + tomlBasicString(codexGatewayProviderID) + "\n" +
 		"[model_providers." + codexGatewayProviderID + "]\n" +
@@ -308,11 +306,20 @@ func (b *codexConfigBoundary) appendGatewayProviderBlock(baseURL string, specEnv
 	if err := os.Chmod(b.configPath, codexConfigMode); err != nil {
 		return nil, fmt.Errorf("secure isolated Codex config: %w", err)
 	}
+	return projectGatewayKey(specEnv, key), b.validate()
+}
+
+// projectGatewayKey returns the session env with the binding-selected key
+// projected onto the gateway env name, so the child authenticates to the
+// routed endpoint with the cell's own credential even when the session
+// layer carries a different value under the same name.
+func projectGatewayKey(specEnv map[string]string, key string) map[string]string {
 	env := map[string]string{}
 	for k, v := range specEnv {
 		env[k] = v
 	}
-	return env, b.validate()
+	env[codexGatewayEnvKey] = key
+	return env
 }
 
 func rejectSymlink(path string, wantDir bool) error {

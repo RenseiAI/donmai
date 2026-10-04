@@ -533,26 +533,22 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	}
 	// A gateway-routed cell skips the host-session auth link so the child
 	// cannot fall back to an operator login; the provider block plus the
-	// gateway key are its only route.
-	if baseURL, _, routed, err := gatewayBinding(spec); err != nil {
+	// binding-selected key projected below are its only route.
+	if baseURL, key, routed, err := gatewayBinding(spec); err != nil {
 		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 	} else if routed {
 		if p.hostAuthFile != "" {
 			return spec, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
 		}
-		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, spec.Env)
+		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, key, spec.Env)
 		if err != nil {
 			return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 		}
 		if nextEnv == nil {
 			nextEnv = map[string]string{}
 		}
-		if spec.Env != nil {
-			if key := strings.TrimSpace(spec.Env[codexGatewayEnvKey]); key != "" {
-				nextEnv[codexGatewayEnvKey] = key
-			}
-		}
-		if v, ok := nextEnv[codexGatewayEnvKey]; !ok || strings.TrimSpace(v) == "" {
+		nextEnv[codexGatewayEnvKey] = key
+		if strings.TrimSpace(nextEnv[codexGatewayEnvKey]) == "" {
 			return spec, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
 		}
 		spec.Env = nextEnv

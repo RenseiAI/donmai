@@ -96,12 +96,12 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
+	baseURL, gatewayKey, gatewayRouted, routeErr := gatewayBinding(spec)
+	if routeErr != nil {
+		return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
+	}
 	if !hasPlatformSessionMCPAuthority(spec.MCPServers) {
-		_, _, routed, routeErr := gatewayBinding(spec)
-		if routeErr != nil {
-			return nil, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
-		}
-		if !routed {
+		if !gatewayRouted {
 			if spec.SessionName != "" {
 				home, homeErr := ambientCodexHome()
 				if homeErr != nil {
@@ -117,12 +117,22 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 			spec.Env = launch.env
 			return ptycli.Spawn(ctx, bin, launch.argv, spec, (&Provider{}).Manifest())
 		}
-		// A gateway-routed cell falls through to the isolated boundary
-		// below so the provider block lands in a private config and the
-		// child cannot see ambient state.
 	}
-	config, auth, err := newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env)
-	if err != nil {
+	// A gateway-routed cell falls through to the isolated boundary below so
+	// the provider block lands in a private config and the child cannot see
+	// ambient state.
+	var config *codexConfigBoundary
+	auth := interactiveCodexAuthProjection{}
+	if gatewayRouted {
+		// The provider block plus the binding-selected key are the cell's
+		// only route, so the boundary is a plain private home: no host
+		// login is resolved, linked, or required here.
+		var berr error
+		config, berr = newCodexConfigBoundary(opts.configTempDir, true)
+		if berr != nil {
+			return nil, fmt.Errorf("%w: isolate codex interactive config: %w", agent.ErrSpawnFailed, berr)
+		}
+	} else if config, auth, err = newInteractiveCodexConfigBoundary(opts.configTempDir, launch.env); err != nil {
 		return nil, fmt.Errorf("%w: isolate codex interactive config: %w", agent.ErrSpawnFailed, err)
 	}
 	// Seed this interactive session's isolated home from the same
@@ -146,23 +156,13 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 	launch.env["CODEX_HOME"] = config.home
 	spec.Env = launch.env
 	// A gateway-routed cell skips the environment-auth seeding and the
-	// host-session link: the provider block plus the gateway key are its
-	// only route, so the child must never gain an operator login fallback.
-	baseURL, _, gatewayRouted, routeErr := gatewayBinding(spec)
-	if routeErr != nil {
-		return nil, errors.Join(
-			fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr),
-			config.remove(),
-		)
-	}
+	// host-session link: the provider block plus the binding-selected key
+	// are its only route, so the child must never gain an operator login
+	// fallback. The route was resolved once above, before operator-auth
+	// resolution; reuse it here rather than re-deriving it after the env
+	// was rewritten.
 	if gatewayRouted {
-		if auth.kind == interactiveCodexAuthFile {
-			return nil, errors.Join(
-				fmt.Errorf("%w: gateway route cannot combine with host-session auth", agent.ErrSpawnFailed),
-				config.remove(),
-			)
-		}
-		nextEnv, err := config.appendGatewayProviderBlock(baseURL, launch.env)
+		nextEnv, err := config.appendGatewayProviderBlock(baseURL, gatewayKey, launch.env)
 		if err != nil {
 			return nil, errors.Join(
 				fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err),
@@ -172,9 +172,7 @@ func spawnInteractivePreparedForGOOS(ctx context.Context, opts Options, spec age
 		if nextEnv == nil {
 			nextEnv = map[string]string{}
 		}
-		if key := strings.TrimSpace(spec.Env[codexGatewayEnvKey]); key != "" {
-			nextEnv[codexGatewayEnvKey] = key
-		}
+		nextEnv[codexGatewayEnvKey] = gatewayKey
 		launch.env = nextEnv
 		spec.Env = launch.env
 	} else {
