@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -491,4 +492,83 @@ func (h *steerScriptHandle) run() {
 		return
 	}
 	<-h.stop
+}
+
+// TestRun_StepHeartbeatsCarryNonDecreasingUsage drives two turns through the
+// real runner and asserts the step-heartbeat beats the platform double
+// received carry non-decreasing cumulative usage that is non-zero after the
+// first turn ends. The runner's emitter reads the budget accumulator live,
+// so the usage on the wire is the same total the terminal result reports.
+func TestRun_StepHeartbeatsCarryNonDecreasingUsage(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:              "development",
+		repository:            followUpRepository,
+		pulls:                 map[int]string{7: pullAtSessionCommit},
+		platform:              platform,
+		stepHeartbeatInterval: 5 * time.Millisecond,
+		turns: []verdictScriptTurn{
+			{text: "Now I will run the tests.", cost: &agent.CostData{InputTokens: 300, OutputTokens: 100, CachedInputTokens: 50, TotalCostUsd: 0.01, NumTurns: 1}},
+			{text: "Opened " + followUpPR + "\nWORK_RESULT: passed", cost: &agent.CostData{InputTokens: 500, OutputTokens: 150, CachedInputTokens: 50, TotalCostUsd: 0.03, NumTurns: 2}},
+		},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+
+	type usage struct {
+		Input  int64   `json:"inputTokens"`
+		Output int64   `json:"outputTokens"`
+		Cached int64   `json:"cachedInputTokens"`
+		Cost   float64 `json:"totalCostUsd"`
+	}
+	var (
+		beats      []usage
+		sawNonZero bool
+	)
+	deadline := time.Now().Add(5 * time.Second)
+	for time.Now().Before(deadline) {
+		beats = beats[:0]
+		sawNonZero = false
+		for _, raw := range platform.stepBeats() {
+			var body struct {
+				Usage *usage `json:"usage"`
+			}
+			if err := json.Unmarshal(raw, &body); err != nil {
+				t.Fatalf("step-heartbeat body is not JSON: %v", err)
+			}
+			if body.Usage == nil {
+				continue
+			}
+			beats = append(beats, *body.Usage)
+			if body.Usage.Input+body.Usage.Output > 0 {
+				sawNonZero = true
+			}
+		}
+		// Need at least two usage-carrying beats to pin non-decreasing.
+		if len(beats) >= 2 && sawNonZero {
+			break
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+	if len(beats) < 2 {
+		t.Fatalf("got %d usage-carrying step-heartbeats; want at least 2", len(beats))
+	}
+	if !sawNonZero {
+		t.Fatal("no step-heartbeat carried non-zero usage after the first turn")
+	}
+	for i := 1; i < len(beats); i++ {
+		if beats[i].Input < beats[i-1].Input || beats[i].Output < beats[i-1].Output ||
+			beats[i].Cached < beats[i-1].Cached || beats[i].Cost < beats[i-1].Cost {
+			t.Fatalf("step-heartbeat usage decreased: %+v -> %+v", beats[i-1], beats[i])
+		}
+	}
+	last := beats[len(beats)-1]
+	if res.Cost == nil {
+		t.Fatal("Cost = nil; want the metered total")
+	}
+	if last.Input != res.Cost.InputTokens || last.Output != res.Cost.OutputTokens ||
+		last.Cached != res.Cost.CachedInputTokens || last.Cost != res.Cost.TotalCostUsd {
+		t.Errorf("last step-heartbeat usage = %+v; want the terminal cost %+v", last, *res.Cost)
+	}
 }
