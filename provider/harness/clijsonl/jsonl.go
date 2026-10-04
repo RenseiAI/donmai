@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -138,6 +139,23 @@ type rawResultEnvelope struct {
 		OutputTokens         int64 `json:"output_tokens"`
 		CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
 	} `json:"usage"`
+	// APIError carries the endpoint's structured refusal on failure
+	// lines (for example HTTP 429 with a usage-limit code and a reset
+	// time). Unknown fields stay ignored; only this shape is read.
+	APIError *rawAPIError `json:"error,omitempty"`
+}
+
+// rawAPIError is the endpoint's structured refusal on a stream-json
+// result line. Only small fixed-shape fields are read — never request
+// bodies, headers, or credentials.
+type rawAPIError struct {
+	Type     string `json:"type,omitempty"`
+	Subtype  string `json:"subtype,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Status   *int   `json:"status,omitempty"`
+	ResetsAt any    `json:"resetsAt,omitempty"`
+	ResetAt  any    `json:"resetAt,omitempty"`
 }
 
 // mapLine decodes one JSONL line and returns the resulting
@@ -187,8 +205,11 @@ func mapLine(line []byte) []agent.Event {
 		return mapAuthStatus(line)
 	case "stream_event":
 		// Partial-message frames: high-frequency, low value to the
-		// orchestrator. Drop per the legacy port.
-		return nil
+		// orchestrator. Drop per the legacy port — unless the frame
+		// carries the endpoint's API error, which surfaces as the
+		// provider-error observation so the runner can record the
+		// structured cause.
+		return mapStreamEvent(line)
 	case "rate_limit_event":
 		// Surface as a system event so the runner can record it.
 		return []agent.Event{agent.SystemEvent{
@@ -388,6 +409,7 @@ func mapResult(line []byte) []agent.Event {
 			Cost:            cost,
 			ObservedCostUsd: observedCost,
 			ObservedTurns:   observedTurns,
+			Upstream:        resultUpstream(line, r),
 			Raw:             json.RawMessage(line),
 		}}
 	}
@@ -412,6 +434,7 @@ func mapResult(line []byte) []agent.Event {
 		Cost:            cost,
 		ObservedCostUsd: observedCost,
 		ObservedTurns:   observedTurns,
+		Upstream:        resultUpstream(line, r),
 		Raw:             json.RawMessage(line),
 	}}
 }
@@ -457,6 +480,107 @@ func mapAuthStatus(line []byte) []agent.Event {
 		Message: msg,
 		Raw:     json.RawMessage(line),
 	}}
+}
+
+// mapStreamEvent surfaces the endpoint's API error carried inside a
+// stream_event frame as the provider-error observation. Any other frame
+// stays dropped per the legacy port. The structured cause rides Upstream;
+// only small fixed-shape fields travel — never request bodies, headers,
+// or credentials.
+func mapStreamEvent(line []byte) []agent.Event {
+	var head struct {
+		Event struct {
+			Type  string `json:"type"`
+			Error *struct {
+				Type    string `json:"type,omitempty"`
+				Code    string `json:"code,omitempty"`
+				Message string `json:"message,omitempty"`
+				Status  *int   `json:"status,omitempty"`
+			} `json:"error,omitempty"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(line, &head); err != nil {
+		return []agent.Event{agent.ErrorEvent{
+			Message: fmt.Sprintf("provider/claude: decode stream event: %v", err),
+			Code:    "decode_stream_event",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	apiErr := head.Event.Error
+	if head.Event.Type != "message_stop" || apiErr == nil {
+		return nil
+	}
+	message := apiErr.Message
+	if message == "" {
+		message = "model provider error"
+	}
+	status := 0
+	if apiErr.Status != nil {
+		status = *apiErr.Status
+	}
+	code := apiErr.Code
+	if code == "" {
+		code = apiErr.Type
+	}
+	return []agent.Event{agent.SystemEvent{
+		Subtype:  agent.SystemSubtypeProviderError,
+		Message:  message,
+		Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
+		Raw:      json.RawMessage(line),
+	}}
+}
+
+// resultUpstream reads the endpoint's structured refusal off a failure
+// result line: the typed "error" object when present, else a tolerant
+// read of the whole line. Nil when the line carries no status, code, or
+// reset time.
+func resultUpstream(line []byte, r rawResultEnvelope) *agent.UpstreamError {
+	if r.APIError != nil {
+		status := 0
+		if r.APIError.Status != nil {
+			status = *r.APIError.Status
+		}
+		code := r.APIError.Code
+		if code == "" {
+			code = r.APIError.Subtype
+		}
+		if code == "" {
+			code = r.APIError.Type
+		}
+		reset := upstreamResetAny(r.APIError.ResetsAt)
+		if reset == "" {
+			reset = upstreamResetAny(r.APIError.ResetAt)
+		}
+		if u := agent.NormalizeUpstreamError(status, code, r.APIError.Message, reset); u != nil {
+			return u
+		}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(line, &m); err != nil {
+		return nil
+	}
+	return agent.ParseUpstreamError(m)
+}
+
+// upstreamResetAny renders the opaque reset-time representation of one
+// JSON value: a string verbatim, a number as decimal digits.
+func upstreamResetAny(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	default:
+		return ""
+	}
 }
 
 // decodeInput unmarshals a tool_use input as map[string]any. Any

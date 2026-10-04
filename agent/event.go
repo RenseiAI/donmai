@@ -84,6 +84,11 @@ type SystemEvent struct {
 	// Message is an optional human-readable message.
 	Message string `json:"message,omitempty"`
 
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -349,6 +354,11 @@ type ResultEvent struct {
 	ObservedCostUsd *float64 `json:"observedCostUsd,omitempty"`
 	ObservedTurns   *int     `json:"observedTurns,omitempty"`
 
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -377,6 +387,11 @@ type ErrorEvent struct {
 	// the session: the stream carries on, and the session ends on its own
 	// terminal event. Such an error is never the session's failure.
 	SessionContinues bool `json:"sessionContinues,omitempty"`
+
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
