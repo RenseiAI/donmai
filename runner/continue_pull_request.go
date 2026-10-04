@@ -111,6 +111,27 @@ func checkoutContinuePullRequest(ctx context.Context, worktreePath string, cpr *
 	return nil
 }
 
+// continueDelivered reports whether a continue-mode run delivered work
+// onto the continued pull request: the session's checkout moved past the
+// dispatched head commit. A run that changed nothing — local HEAD still
+// the dispatched head, or a local HEAD the remote head does not carry —
+// is not delivered, mirroring the verifier's no-new-commit rule.
+func continueDelivered(localHead, remoteHead, startHead string) bool {
+	localHead = strings.TrimSpace(localHead)
+	remoteHead = strings.TrimSpace(remoteHead)
+	startHead = strings.TrimSpace(startHead)
+	if localHead == "" || startHead == "" {
+		return false
+	}
+	if strings.EqualFold(localHead, startHead) {
+		return false
+	}
+	if remoteHead == "" {
+		return false
+	}
+	return strings.EqualFold(remoteHead, localHead)
+}
+
 // isContinueDivergence reports whether a push failure is the typed
 // non-fast-forward refusal: the continued branch moved on the remote.
 // It matches git's own explanation rather than the exit code so a

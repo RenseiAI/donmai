@@ -194,6 +194,9 @@ func TestRunBackstop_ContinueModeRefusesDivergence(t *testing.T) {
 	if out, err := exec.Command("git", "clone", "-q", remote, other).CombinedOutput(); err != nil {
 		t.Fatalf("git clone: %v\n%s", err, out)
 	}
+	gitRun(t, other, "config", "user.email", "test@example.com")
+	gitRun(t, other, "config", "user.name", "test")
+	gitRun(t, other, "config", "commit.gpgsign", "false")
 	gitRun(t, other, "fetch", "-q", "origin", branch)
 	gitRun(t, other, "checkout", "-q", branch)
 	writeFile(t, other, "src/other.go", "package other\n")
@@ -213,5 +216,142 @@ func TestRunBackstop_ContinueModeRefusesDivergence(t *testing.T) {
 	}
 	if !strings.Contains(report.Diagnostics, ErrContinuePullRequestDiverged.Error()) {
 		t.Fatalf("diagnostics = %q, want typed divergence reason", report.Diagnostics)
+	}
+}
+
+// TestRun_ContinueModeAcceptsMatchingAmendRef proves the cross-PR contract
+// through the production entry point: the platform keeps sending the ref
+// pin alongside the continued record, so a ref naming the continued head
+// branch runs to completion on that branch.
+func TestRun_ContinueModeAcceptsMatchingAmendRef(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		continueRef:    true,
+		backstop:       true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request", res.PullRequestURL)
+	}
+	if res.BackstopReport == nil || !res.BackstopReport.Pushed {
+		t.Fatalf("BackstopReport = %+v; want the backstop to have pushed", res.BackstopReport)
+	}
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	}
+	if got := gitRun(t, res.WorktreePath, "branch", "--show-current"); got != "continued/pr-12" {
+		t.Fatalf("checked out branch = %q; want the continued head branch", got)
+	}
+}
+
+// TestRun_ContinueModeRefusesMismatchedAmendRef proves the typed refusal
+// through the production entry point: a ref naming a different branch than
+// the continued head fails worktree provisioning.
+func TestRun_ContinueModeRefusesMismatchedAmendRef(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		ref:            "some-other-branch",
+		turns:          []verdictScriptTurn{{text: "WORK_RESULT:passed"}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureWorktreeProvision {
+		t.Fatalf("Status = %q (%s: %s); want failed worktree-provision", res.Status, res.FailureMode, res.Error)
+	}
+	if !strings.Contains(res.Error, "differs from the dispatched amend ref") {
+		t.Fatalf("Error = %q; want the typed amend-ref refusal", res.Error)
+	}
+}
+
+// TestRun_ContinueModePushesToTheContinuedBranch proves the push target
+// through the production entry point: the session's commit lands on the
+// continued head branch, never on a fresh agent/<session> branch.
+func TestRun_ContinueModePushesToTheContinuedBranch(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	refs := gitRun(t, res.WorktreePath, "ls-remote", "origin")
+	if strings.Contains(refs, "refs/heads/agent/test-session-MANIFEST-FOLLOWUP") {
+		t.Fatalf("a fresh session branch was created; want the push on the continued branch only:\n%s", refs)
+	}
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	}
+}
+
+// TestRun_ContinueModeNoNewCommitIsNotDelivered proves the delivery rule
+// through the production entry point: an agent that changes nothing ends
+// unfinished against the continued pull request instead of completed.
+func TestRun_ContinueModeNoNewCommitIsNotDelivered(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+	})
+	if res.Status == "completed" && res.PullRequestURL == "https://github.com/example/repo/pull/12" {
+		t.Fatalf("a no-new-commit continue run was reported delivered: %+v", res)
+	}
+	if res.PullRequestURL != "https://github.com/example/repo/pull/12" {
+		t.Fatalf("PullRequestURL = %q; want the continued pull request under test", res.PullRequestURL)
+	}
+}
+
+// TestRun_ContinueModeDraftIsNotDelivered proves the draft rule through the
+// production entry point: a draft continued pull request never reports the
+// run delivered, even when the agent changed nothing else.
+func TestRun_ContinueModeDraftIsNotDelivered(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		draft:          func(context.Context, string, string) (bool, error) { return true, nil },
+		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+	})
+	if res.Status == "completed" && res.PullRequestURL == "https://github.com/example/repo/pull/12" {
+		t.Fatalf("a draft continue run was reported delivered: %+v", res)
+	}
+}
+
+// TestBuildSteeringPrompt_ContinueModePushesToHeadBranch proves the steering
+// entry point: the continue prompt names the head-branch push and never a
+// new pull request.
+func TestBuildSteeringPrompt_ContinueModePushesToHeadBranch(t *testing.T) {
+	t.Parallel()
+	qw := QueuedWork{QueuedWork: queuedWorkBase("CONT-STEER")}
+	qw.ContinuePullRequest = &prompt.ContinuePullRequest{Number: 12, HeadRef: "continued/pr-12", HeadSha: continueFixtureSHA()}
+	got := buildSteeringPrompt(qw, streamObservation{})
+	if !strings.Contains(got, "git push origin HEAD:refs/heads/continued/pr-12") {
+		t.Fatalf("steering prompt does not push to the head branch:\n%s", got)
+	}
+	if strings.Contains(got, "gh pr create") {
+		t.Fatalf("steering prompt must never open a new pull request:\n%s", got)
 	}
 }
