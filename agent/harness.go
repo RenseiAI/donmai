@@ -56,17 +56,25 @@ const (
 // the matrix is grounded in the live declaration (no second source of truth).
 type HarnessCaps struct {
 	// agent-loop (carried forward from Capabilities)
-	SupportsMessageInjection bool   `json:"inject"`
-	SupportsSessionResume    bool   `json:"resume"`
-	SupportsToolPlugins      bool   `json:"tools"`
-	AcceptsMcpServerSpec     bool   `json:"mcp"`
-	AcceptsAllowedToolsList  bool   `json:"allowedToolsList"`
-	EmitsSubagentEvents      bool   `json:"subagents"`
-	SupportsReasoningEffort  bool   `json:"reasoningEffort"`
-	SupportsOneShot          bool   `json:"oneShot"`        // can satisfy a future SpawnComplete projection
-	NativeJSONMode           bool   `json:"nativeJsonMode"` // strict structured-out vs spawn-collect-validate
-	ToolPermissionFormat     string `json:"toolPermissionFormat"`
-	StreamingTransport       string `json:"streamingTransport"` // "sse"|"ndjson"|"websocket"|"none"
+	SupportsMessageInjection bool `json:"inject"`
+	SupportsSessionResume    bool `json:"resume"`
+	SupportsToolPlugins      bool `json:"tools"`
+	AcceptsMcpServerSpec     bool `json:"mcp"`
+	AcceptsAllowedToolsList  bool `json:"allowedToolsList"`
+	EmitsSubagentEvents      bool `json:"subagents"`
+	// SetsParentToolUseID reports whether the adapter populates the
+	// normalized ParentToolUseID field (agent.ToolUseEvent,
+	// ToolResultEvent, AssistantTextEvent) from the provider-native
+	// parent delegation id. Adapters that cannot know it leave the field
+	// empty and declare false here — never guess. Manifest-only: it names
+	// an event-mapping property, not an agent-loop capability, so it has
+	// no Capabilities() projection.
+	SetsParentToolUseID     bool   `json:"parentToolUseId"`
+	SupportsReasoningEffort bool   `json:"reasoningEffort"`
+	SupportsOneShot         bool   `json:"oneShot"`        // can satisfy a future SpawnComplete projection
+	NativeJSONMode          bool   `json:"nativeJsonMode"` // strict structured-out vs spawn-collect-validate
+	ToolPermissionFormat    string `json:"toolPermissionFormat"`
+	StreamingTransport      string `json:"streamingTransport"` // "sse"|"ndjson"|"websocket"|"none"
 
 	// SupportsInteractivePTY declares an ADDITIONAL spawn mode (W4,
 	// interactive-attach-v1): this harness can be spawned under a PTY

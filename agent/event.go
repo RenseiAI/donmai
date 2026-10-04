@@ -24,6 +24,7 @@ const (
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
+	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
 )
@@ -32,7 +33,7 @@ const (
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
 // LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
-// ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
+// SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -83,6 +84,11 @@ type SystemEvent struct {
 
 	// Message is an optional human-readable message.
 	Message string `json:"message,omitempty"`
+
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
@@ -163,6 +169,12 @@ type AssistantTextEvent struct {
 	// Text is the assistant text chunk.
 	Text string `json:"text"`
 
+	// ParentToolUseID is the provider-native id of the delegation tool
+	// call this text was emitted inside (the sub-agent's parent). Empty
+	// when the text belongs to the top-level agent or the adapter cannot
+	// know the parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -210,10 +222,16 @@ type LlmCallEvent struct {
 	ResponseModel         string `json:"responseModel,omitempty"`
 	ResponseModelProvider string `json:"responseModelProvider,omitempty"`
 
-	InputTokens       int64  `json:"inputTokens,omitempty"`
-	OutputTokens      int64  `json:"outputTokens,omitempty"`
-	CachedInputTokens int64  `json:"cachedInputTokens,omitempty"`
-	FinishReason      string `json:"finishReason,omitempty"`
+	InputTokens       int64 `json:"inputTokens,omitempty"`
+	OutputTokens      int64 `json:"outputTokens,omitempty"`
+	CachedInputTokens int64 `json:"cachedInputTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) input token
+	// count. Like CachedInputTokens it is excluded from InputTokens.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens,
+	// never an additive extra (see CostData).
+	ReasoningTokens int64  `json:"reasoningTokens,omitempty"`
+	FinishReason    string `json:"finishReason,omitempty"`
 	// ObservedCostUsd is the provider's price for this exact call. A pointer
 	// distinguishes a reported zero from an absent price. Estimated prices
 	// and aggregate fallbacks must not populate it.
@@ -261,6 +279,12 @@ type ToolUseEvent struct {
 	// with ToolResultEvent.ToolUseID.
 	ToolUseID string `json:"toolUseId,omitempty"`
 
+	// ParentToolUseID is the provider-native id of the delegation tool
+	// call this tool call was emitted inside (the sub-agent's parent).
+	// Empty on top-level calls and on adapters that cannot know the
+	// parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+
 	// Input is the tool-call input map.
 	Input map[string]any `json:"input"`
 
@@ -291,6 +315,12 @@ type ToolResultEvent struct {
 
 	// ToolUseID pairs with ToolUseEvent.ToolUseID.
 	ToolUseID string `json:"toolUseId,omitempty"`
+
+	// ParentToolUseID mirrors ToolUseEvent.ParentToolUseID: the
+	// provider-native id of the delegation tool call this result belongs
+	// to. Empty on top-level results and on adapters that cannot know
+	// the parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 
 	// Content is the tool's output text or stringified result.
 	Content string `json:"content"`
@@ -323,6 +353,54 @@ type ToolProgressEvent struct {
 func (ToolProgressEvent) Kind() EventKind { return EventToolProgress }
 func (ToolProgressEvent) isAgentEvent()   {}
 
+// SubagentPhase is the lifecycle phase carried on a SubagentEvent.
+type SubagentPhase string
+
+// Subagent lifecycle phases. Stable wire values.
+const (
+	SubagentStarted   SubagentPhase = "started"
+	SubagentCompleted SubagentPhase = "completed"
+	SubagentFailed    SubagentPhase = "failed"
+)
+
+// SubagentEvent is the typed lifecycle event an adapter emits around a
+// native sub-agent delegation tool call: `started` when the delegation
+// tool is invoked, `completed` when its result arrives successfully,
+// `failed` when its result arrives as an error.
+//
+// ToolName is the adapter's own delegation tool name (the adapter names
+// its tools; the runner keeps no list). ToolUseID pairs the lifecycle
+// with the delegating ToolUseEvent/ToolResultEvent. ChildSessionID is
+// the sub-agent's session ref when the harness exposes one, else empty
+// — adapters never guess.
+type SubagentEvent struct {
+	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
+	// correlator. SpanID identifies the subagent span the runtime span
+	// processor emits for this lifecycle.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
+	// ToolName is the delegation tool identifier (e.g. "Task", "Agent").
+	ToolName string `json:"toolName"`
+
+	// ToolUseID pairs with the delegating ToolUseEvent.ToolUseID.
+	ToolUseID string `json:"toolUseId,omitempty"`
+
+	// Phase is the lifecycle phase: started | completed | failed.
+	Phase SubagentPhase `json:"phase"`
+
+	// ChildSessionID is the sub-agent's session ref when known.
+	ChildSessionID string `json:"childSessionId,omitempty"`
+
+	// Raw is the provider-native event payload.
+	Raw any `json:"raw,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (SubagentEvent) Kind() EventKind { return EventSubagent }
+func (SubagentEvent) isAgentEvent()   {}
+
 // ResultEvent is the terminal session-outcome event from the provider.
 // Distinct from agent.Result which is the runner's higher-level
 // session-result struct (see types.go). Verbatim port of AgentResultEvent.
@@ -348,6 +426,11 @@ type ResultEvent struct {
 	// Cost remains the legacy aggregate used by existing billing readers.
 	ObservedCostUsd *float64 `json:"observedCostUsd,omitempty"`
 	ObservedTurns   *int     `json:"observedTurns,omitempty"`
+
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
@@ -377,6 +460,11 @@ type ErrorEvent struct {
 	// the session: the stream carries on, and the session ends on its own
 	// terminal event. Such an error is never the session's failure.
 	SessionContinues bool `json:"sessionContinues,omitempty"`
+
+	// Upstream is the structured endpoint error captured where the
+	// harness exposes it (pi provider-error observations and the
+	// stream-json API-error event). Nil elsewhere.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
 
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
@@ -472,6 +560,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev ToolProgressEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode ToolProgressEvent: %w", err)
+		}
+		return ev, nil
+	case EventSubagent:
+		var ev SubagentEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode SubagentEvent: %w", err)
 		}
 		return ev, nil
 	case EventResult:

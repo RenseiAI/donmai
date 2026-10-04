@@ -129,7 +129,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 			if detail == "" {
 				detail = "model provider error"
 			}
-			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: providerErrorDetail(msg, detail), Raw: raw(ev)})
+			out = append(out, agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: providerErrorDetail(msg, detail), Upstream: agent.ParseUpstreamError(msg), Raw: raw(ev)})
 		}
 		return out, false
 

@@ -426,7 +426,7 @@ func TestAgentRunMaxSessionDuration(t *testing.T) {
 		{
 			name: "zero-duration budget keeps runner default",
 			detail: &daemon.SessionDetail{
-				StageBudget: &daemon.PollStageBudget{MaxSubAgents: 4},
+				StageBudget: &daemon.PollStageBudget{MaxSubAgents: ptr(4)},
 			},
 		},
 		{
@@ -2201,8 +2201,16 @@ func TestPostSessionRunning_RetriesTransientFailuresUntilSuccess(t *testing.T) {
 }
 
 // TestPostSessionRunning_ExhaustedRetriesLogsWarning verifies the retry
-// loop is bounded (exactly postSessionRunningMaxAttempts posts) and the
-// final failure surfaces at warn level so a lost nudge is visible.
+// loop is bounded and the final failure surfaces at warn level so a lost
+// nudge is visible.
+//
+// The post count is pinned to the literal 3, not postSessionRunningMaxAttempts:
+// a bound silently raised to (say) 1000 would otherwise keep passing this
+// suite — every test zeroes the backoff, so nothing but the literal notices
+// the change — while multiplying the pre-spawn worst-case latency the budget
+// comment on the constant promises to keep inside the claimed-stale window.
+// Raising the bound turns this test red on purpose: re-derive that budget
+// before making it green again.
 func TestPostSessionRunning_ExhaustedRetriesLogsWarning(t *testing.T) {
 	oldDelay := postSessionRunningRetryDelay
 	postSessionRunningRetryDelay = func(int) time.Duration { return 0 }
@@ -2220,11 +2228,11 @@ func TestPostSessionRunning_ExhaustedRetriesLogsWarning(t *testing.T) {
 	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
 		logger, srv.URL, "sess-exhausted", "wkr", "tok")
 
-	if got := posts.Load(); got != int64(postSessionRunningMaxAttempts) {
-		t.Fatalf("running posts = %d, want %d (bounded retry)", got, postSessionRunningMaxAttempts)
+	if got := posts.Load(); got != 3 {
+		t.Fatalf("running posts = %d, want 3 (bounded retry — if the attempt bound changed, re-check the claimed-stale budget before updating this pin)", got)
 	}
-	if out := buf.String(); !strings.Contains(out, "after retries") {
-		t.Errorf("expected warn log with retry exhaustion, got %q", out)
+	if out := buf.String(); !strings.Contains(out, "after 3 attempts") {
+		t.Errorf("expected warn log naming the 3 spent attempts, got %q", out)
 	}
 }
 
@@ -2244,6 +2252,237 @@ func TestPostSessionRunning_ClientErrorFailsFast(t *testing.T) {
 	if got := posts.Load(); got != 1 {
 		t.Fatalf("running posts = %d, want 1 (4xx fails fast)", got)
 	}
+}
+
+// TestPostSessionRunning_FirstAttemptFailureWordingIsHonest pins the
+// final-failure wording when a 4xx kills the very first attempt: no retries
+// ran, so the log must not claim "after N attempts". The pre-fix message
+// said "failed after retries" even here, which misleads whoever triages a
+// genuinely-permanent platform rejection as a retry-exhaustion blip.
+func TestPostSessionRunning_FirstAttemptFailureWordingIsHonest(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.WriteHeader(http.StatusNotFound)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		logger, srv.URL, "sess-wording", "wkr", "tok")
+
+	out := buf.String()
+	if !strings.Contains(out, "post failed on the first attempt (no retries)") {
+		t.Errorf("expected first-attempt failure wording, got %q", out)
+	}
+	if strings.Contains(out, "after") {
+		t.Errorf("first-attempt failure must not claim retries happened, got %q", out)
+	}
+}
+
+// TestPostSessionRunning_ConflictAfterRetryMeansEarlierAttemptLanded pins
+// the 409-after-landing reading: when a retry gets 409 Conflict, an earlier
+// attempt almost certainly landed (its response was lost client-side, the
+// session is already running) — the log must record success at info level,
+// not a fail-fast warn, and no third post may follow.
+func TestPostSessionRunning_ConflictAfterRetryMeansEarlierAttemptLanded(t *testing.T) {
+	oldDelay := postSessionRunningRetryDelay
+	postSessionRunningRetryDelay = func(int) time.Duration { return 0 }
+	t.Cleanup(func() { postSessionRunningRetryDelay = oldDelay })
+
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if posts.Add(1) == 1 {
+			// First attempt: response lost in transit — the platform never
+			// delivered it, so the client sees a transport error and retries.
+			hijack, ok := w.(http.Hijacker)
+			if !ok {
+				t.Error("test server cannot hijack connections")
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			conn, _, err := hijack.Hijack()
+			if err != nil {
+				t.Errorf("hijack: %v", err)
+				w.WriteHeader(http.StatusInternalServerError)
+				return
+			}
+			_ = conn.Close()
+			return
+		}
+		// Retry meets an already-running session.
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		logger, srv.URL, "sess-conflict-landed", "wkr", "tok")
+
+	if got := posts.Load(); got != 2 {
+		t.Fatalf("running posts = %d, want 2 (lost response, then conflict answers the retry)", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "earlier running post likely landed") {
+		t.Errorf("expected info log crediting the earlier landed attempt, got %q", out)
+	}
+	if lvl := func() bool {
+		for _, line := range strings.Split(out, "\n") {
+			if strings.Contains(line, "earlier running post likely landed") && strings.Contains(line, "level=INFO") {
+				return true
+			}
+		}
+		return false
+	}(); !lvl {
+		t.Errorf("conflict-after-retry must log at INFO, not WARN, got %q", out)
+	}
+	if strings.Contains(out, "level=WARN") {
+		t.Errorf("conflict-after-retry is not a failure, got warn: %q", out)
+	}
+}
+
+// TestPostSessionRunning_ConflictOnFirstAttemptStaysAFailure pins the
+// complement: a 409 with no earlier attempt to credit is just another
+// permanent 4xx — one post, fail-fast warn, no "landed" reading.
+func TestPostSessionRunning_ConflictOnFirstAttemptStaysAFailure(t *testing.T) {
+	var posts atomic.Int64
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		posts.Add(1)
+		w.WriteHeader(http.StatusConflict)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	postSessionRunning(context.Background(), &http.Client{Timeout: 2 * time.Second},
+		logger, srv.URL, "sess-conflict-first", "wkr", "tok")
+
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("running posts = %d, want 1 (first-attempt conflict fails fast)", got)
+	}
+	out := buf.String()
+	if !strings.Contains(out, "level=WARN") {
+		t.Errorf("first-attempt conflict is a client error, expected warn, got %q", out)
+	}
+	if strings.Contains(out, "likely landed") {
+		t.Errorf("first-attempt conflict has no earlier attempt to credit, got %q", out)
+	}
+}
+
+// TestPostSessionRunning_CancelAbortsBackoffAndStopsPosting pins the
+// shutdown contract: once the run's context is cancelled, the retry loop
+// stops — no further ack post leaves the process, and the in-flight backoff
+// sleep aborts instead of waiting out its delay. Ignoring cancellation
+// previously survived the suite; this test turns that red.
+func TestPostSessionRunning_CancelAbortsBackoffAndStopsPosting(t *testing.T) {
+	oldDelay := postSessionRunningRetryDelay
+	postSessionRunningRetryDelay = func(int) time.Duration { return 30 * time.Second }
+	t.Cleanup(func() { postSessionRunningRetryDelay = oldDelay })
+
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+
+	var posts atomic.Int64
+	firstSeen := make(chan struct{})
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		if posts.Add(1) == 1 {
+			close(firstSeen)
+		}
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	defer srv.Close()
+
+	var buf bytes.Buffer
+	logger := slog.New(slog.NewTextHandler(&buf, nil))
+	done := make(chan struct{})
+	go func() {
+		postSessionRunning(ctx, &http.Client{Timeout: 2 * time.Second},
+			logger, srv.URL, "sess-cancel", "wkr", "tok")
+		close(done)
+	}()
+
+	// Wait for the first attempt to reach the server, then cancel the run.
+	select {
+	case <-firstSeen:
+	case <-time.After(10 * time.Second):
+		t.Fatal("first running post never reached the test server")
+	}
+	cancel()
+
+	// The 30s backoff must abort on the cancellation. An implementation that
+	// ignores the context would sleep the full delay (and then post again),
+	// blowing well past this guard.
+	select {
+	case <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("backoff was not aborted by context cancellation — postSessionRunning kept waiting")
+	}
+
+	// No ack may leave the process after the cancellation: no second post,
+	// no success ack, no retry-exhausted warn (the run is shutting down).
+	time.Sleep(50 * time.Millisecond)
+	if got := posts.Load(); got != 1 {
+		t.Fatalf("running posts after cancellation = %d, want 1 (no ack after the context is cancelled)", got)
+	}
+	if out := buf.String(); strings.Contains(out, "flipped to running") || strings.Contains(out, "post failed") {
+		t.Errorf("no ack or final-failure log may follow cancellation, got %q", out)
+	}
+}
+
+// TestPostSessionRunningRetryDelaySchedule pins the backoff schedule: the
+// heartbeat's 1s/2s exponential convention with equal jitter in [base/2,
+// base]. The pre-fix 200ms/400ms fixed schedule burned all three attempts in
+// ~0.6s against fast 5xx errors and offered no jitter at all.
+func TestPostSessionRunningRetryDelaySchedule(t *testing.T) {
+	oldIntn := runningRetryJitterIntn
+	t.Cleanup(func() { runningRetryJitterIntn = oldIntn })
+
+	tests := []struct {
+		name          string
+		failedAttempt int
+		wantBase      time.Duration
+	}{
+		{name: "after attempt 1", failedAttempt: 1, wantBase: 1 * time.Second},
+		{name: "after attempt 2", failedAttempt: 2, wantBase: 2 * time.Second},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name+" min jitter", func(t *testing.T) {
+			runningRetryJitterIntn = func(int64) int64 { return 0 }
+			if got := postSessionRunningRetryDelay(tt.failedAttempt); got != tt.wantBase/2 {
+				t.Fatalf("delay after failed attempt %d = %v, want %v (equal jitter lower bound)",
+					tt.failedAttempt, got, tt.wantBase/2)
+			}
+		})
+		t.Run(tt.name+" max jitter", func(t *testing.T) {
+			runningRetryJitterIntn = func(n int64) int64 { return n - 1 }
+			if got := postSessionRunningRetryDelay(tt.failedAttempt); got != tt.wantBase {
+				t.Fatalf("delay after failed attempt %d = %v, want %v (equal jitter upper bound)",
+					tt.failedAttempt, got, tt.wantBase)
+			}
+		})
+	}
+
+	// The jittered delay never leaves its bounds for any roll: the whole
+	// [half, base] interval is reachable and nothing outside it.
+	t.Run("all rolls stay in bounds", func(t *testing.T) {
+		runningRetryJitterIntn = func(n int64) int64 { return n / 2 }
+		for attempt := 1; attempt <= postSessionRunningMaxAttempts; attempt++ {
+			base := time.Duration(1<<(attempt-1)) * time.Second
+			got := postSessionRunningRetryDelay(attempt)
+			if got < base/2 || got > base {
+				t.Fatalf("delay after failed attempt %d = %v, want within [%v, %v]", attempt, got, base/2, base)
+			}
+		}
+	})
+
+	// Zero base (tests shrink the schedule to zero) stays zero — never
+	// negative, never rounded up.
+	t.Run("zero base stays zero", func(t *testing.T) {
+		runningRetryJitterIntn = func(int64) int64 { return 0 }
+		if got := jitteredRunningRetryDelay(0); got != 0 {
+			t.Fatalf("jitteredRunningRetryDelay(0) = %v, want 0", got)
+		}
+	})
 }
 
 func TestDonmaiSpanTracingEnabled(t *testing.T) {

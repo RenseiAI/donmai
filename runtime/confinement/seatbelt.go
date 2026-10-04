@@ -11,7 +11,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v2"
+const seatbeltProfileVersion = "seatbelt-profile-v3"
 
 // loopbackTCPDeny closes outbound TCP to the local machine (loopback and
 // the host's own addresses, which the profile names "localhost"): the
@@ -46,6 +46,9 @@ var seatbeltLookupDenies = []lookupDeny{
 	}},
 	{class: "pasteboard", services: []string{
 		"com.apple.pasteboard.1",
+		// The activity-continuation pasteboard client is vended by the
+		// same daemon; without it the clipboard stays reachable.
+		"com.apple.coreservices.uauseractivitypasteboardclient.xpc",
 	}},
 	{class: "mount", services: []string{
 		"com.apple.DiskArbitration.diskarbitrationd",

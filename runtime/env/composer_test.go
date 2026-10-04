@@ -286,7 +286,10 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 	// AGENT_ENV_BLOCKLIST, plus the donmai-native entries that have no legacy
 	// counterpart (DONMAI_GATEWAY_UPSTREAM_API_KEY and
 	// DONMAI_GATEWAY_UPSTREAM_BASE_URL — the worker-local gateway's upstream
-	// credential and route, which must never reach a harness child).
+	// credential and route, which must never reach a harness child — plus
+	// DONMAI_PI_KEY, the resolved cell key the provider pin reads in the
+	// child, blocked from the parent env so a session spec with no key never
+	// inherits the host's copy).
 	// If the legacy list grows, port the new entries AND update this test.
 	want := []string{
 		"ANTHROPIC_API_KEY",
@@ -294,6 +297,7 @@ func TestAgentEnvBlocklistMatchesLegacyTS(t *testing.T) {
 		"ANTHROPIC_BASE_URL",
 		"DONMAI_GATEWAY_UPSTREAM_API_KEY",
 		"DONMAI_GATEWAY_UPSTREAM_BASE_URL",
+		"DONMAI_PI_KEY",
 		"GEMINI_API_KEY",
 		"GOOGLE_API_KEY",
 		"OPENCLAW_GATEWAY_TOKEN",

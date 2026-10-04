@@ -58,6 +58,10 @@ type verdictScriptTurn struct {
 	// of these refs on origin (e.g. a branch and refs/pull/<n>/head), as an
 	// agent that pushes to its pull request does.
 	push []string
+	// during runs after the turn's files and push, before its events: the
+	// world changing while the agent works (e.g. someone else pushing to
+	// the session's branch). It receives the session worktree.
+	during func(t *testing.T, cwd string)
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -167,6 +171,9 @@ func (h *verdictScriptHandle) playLocked() {
 	}
 	if len(turn.push) > 0 {
 		h.commitAndPush(turn)
+	}
+	if turn.during != nil {
+		turn.during(h.t, h.cwd)
 	}
 	for _, ev := range turn.events {
 		h.events <- ev
@@ -284,8 +291,27 @@ type scriptedSession struct {
 	// ref, when set, makes the session a rework run on that existing
 	// branch of repository (qw.Ref), created at main.
 	ref string
+	// continueNumber, when positive, makes the session a continue run on
+	// the pull request numbered here: its head branch is created on the
+	// fixture repository at main, the head commit is pinned on the
+	// dispatched record, and refs/pull/<n>/head tracks the head branch.
+	// continueRef additionally dispatches qw.Ref naming the head branch
+	// (the platform keeps sending the ref pin older runners rely on).
+	continueNumber int
+	continueRef    bool
+	// protectContinue arms a pre-receive hook on the fixture repository
+	// that rejects every push to the continued head branch with a policy
+	// message worded to trip the old diagnostics-text matcher: a policy
+	// rejection of an otherwise fast-forward push must not read as
+	// divergence.
+	protectContinue bool
 	// backstop lets the deterministic backstop run (off by default).
 	backstop bool
+	// stepHeartbeatInterval, when positive, sets the runner's private
+	// step-heartbeat cadence for tests that need several beats in a fast
+	// scripted session. Zero keeps the 15s production default. Tests only:
+	// production leaves this at zero.
+	stepHeartbeatInterval time.Duration
 	// teardown lets Run tear the worktree down on success (the default keeps
 	// it for inspection); rescueDir is where unpublished work is archived.
 	teardown  bool
@@ -353,6 +379,7 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
 	})
+	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.skipSteering = cfg.skipSteering
 	if cfg.teardown {
 		r.preserveAlways = false
@@ -397,6 +424,25 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		if cfg.ref != "" {
 			gitRun(t, bare, "branch", cfg.ref, "main")
 			qw.Ref = cfg.ref
+		}
+		if cfg.continueNumber > 0 {
+			// The continued head branch starts at main, exactly the
+			// shape a real pull request head the clone never saw has
+			// after the checkout fetches it.
+			continueBranch := fmt.Sprintf("continued/pr-%d", cfg.continueNumber)
+			gitRun(t, bare, "branch", continueBranch, "main")
+			gitRun(t, bare, "update-ref", fmt.Sprintf("refs/pull/%d/head", cfg.continueNumber), gitRun(t, bare, "rev-parse", continueBranch))
+			if cfg.protectContinue {
+				installProtectedBranchHook(t, bare, continueBranch)
+			}
+			qw.ContinuePullRequest = &prompt.ContinuePullRequest{
+				Number:  cfg.continueNumber,
+				HeadRef: continueBranch,
+				HeadSha: gitRun(t, bare, "rev-parse", continueBranch),
+			}
+			if cfg.continueRef {
+				qw.Ref = continueBranch
+			}
 		}
 	default:
 		qw.Repository = makeBareRepo(t)

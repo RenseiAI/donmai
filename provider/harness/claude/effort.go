@@ -15,6 +15,17 @@ const effortEnvVar = "CLAUDE_CODE_EFFORT_LEVEL"
 // default effort, ignoring any level saved in a settings file.
 const effortModelDefault = "auto"
 
+// forceEffortEnv reports whether Spawn fixes the effort environment
+// variable for this session. Only stamped headless sessions qualify: the
+// stamp alone is not enough, because interactive sessions are stamped too,
+// and interactive operators keep their own effort control (the --effort
+// flag when a level is known, plus the in-session effort command and saved
+// preferences). Unstamped standalone sessions inherit the environment
+// untouched.
+func forceEffortEnv(spec agent.Spec) bool {
+	return spec.ExecutionSecurity != nil && spec.Interactive == nil
+}
+
 // withEffortEnv returns a copy of env with effortEnvVar fixed for the
 // session: the configured effort when it is a level Claude recognises, and
 // effortModelDefault when there is none or it is not a recognised level. It
@@ -22,6 +33,11 @@ const effortModelDefault = "auto"
 // settings nor a value inherited from the spawning environment can stand in
 // for the session's configuration. A settings-file maxEffortLevel cap still
 // applies on top, as Claude Code documents for every effort source.
+//
+// Callers gate on forceEffortEnv first: only stamped headless sessions fix
+// the variable. Every other spawn mode leaves the operator's own effort
+// control (flag, in-session command, saved preferences, inherited
+// environment) in place.
 func withEffortEnv(env map[string]string, effort agent.EffortLevel) map[string]string {
 	out := make(map[string]string)
 	for k, v := range env {

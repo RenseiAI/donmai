@@ -44,7 +44,9 @@ import (
 //
 // Event semantics are the coarse ptycli contract (D4 — the byte-accurate PTY
 // stream is the product): an InitEvent once the PTY child is up and a single
-// terminal ResultEvent when the process exits.
+// terminal ResultEvent when the process exits, plus best-effort activity
+// tailed from this session's own transcript in between (see
+// interactive_state_loss.go and interactive_transcript.go).
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
 	// Materialize the embedded policy extension so its provider pin registers in
 	// the child. A materialization failure means no pin — fail closed, exactly
@@ -74,11 +76,15 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// an explicit override.
 	spec.Env = interactiveChildEnv(spec, layout)
 
+	// Snapshot the shared state dir's existing transcripts BEFORE the child
+	// starts, so the transcript tail reads only what this session writes.
+	tailer := newInteractiveTranscriptTailer(layout.root)
+
 	handle, err := ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
 	if err != nil {
 		return nil, err
 	}
-	return newInteractiveStateLossHandle(handle, layout.root), nil
+	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.

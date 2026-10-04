@@ -60,6 +60,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:    false, // pi has no MCP by design; Spec.MCPServers is capability-gated-ignored
 			AcceptsAllowedToolsList: true,  // enforced by OUR policy extension, not by pi
 			EmitsSubagentEvents:     false,
+			SetsParentToolUseID:     false, // the rpc protocol exposes no parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort: true,  // set_thinking_level off…max
 			SupportsOneShot:         true,  // pi --mode json single-shot lane
 			NativeJSONMode:          false, // no server-constrained structured output ⇒ spawn-collect

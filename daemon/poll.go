@@ -173,6 +173,11 @@ type PollWorkItem struct {
 	// Forwarded opaquely; absent/empty is safe (omitempty).
 	AllowedTools []string `json:"allowedTools,omitempty"`
 
+	// ContinuePullRequest names an existing pull request the session
+	// continues instead of opening a new one. Forwarded opaquely via the
+	// PollContinuePullRequest mirror. Nil preserves today's new-PR behaviour.
+	ContinuePullRequest *PollContinuePullRequest `json:"continuePullRequest,omitempty"`
+
 	// McpServers is the platform-supplied agent-card MCP server set.
 	// Forwarded opaquely via the PollMCPServer mirror.
 	McpServers []PollMCPServer `json:"mcpServers,omitempty"`
@@ -332,7 +337,7 @@ type PollInterviewBudget struct {
 // constructs the QueuedWork.
 type PollStageBudget struct {
 	MaxDurationSeconds int   `json:"maxDurationSeconds,omitempty"`
-	MaxSubAgents       int   `json:"maxSubAgents,omitempty"`
+	MaxSubAgents       *int  `json:"maxSubAgents,omitempty"`
 	MaxTokens          int64 `json:"maxTokens,omitempty"`
 }
 
@@ -356,6 +361,17 @@ type PollMCPServer struct {
 	Env     map[string]string `json:"env,omitempty"`
 	URL     string            `json:"url,omitempty"`
 	Headers map[string]string `json:"headers,omitempty"`
+}
+
+// PollContinuePullRequest mirrors prompt.ContinuePullRequest for the daemon
+// package so the daemon can decode + forward the record without importing
+// the prompt package. The runner re-types this into prompt.ContinuePullRequest
+// in detailToQueuedWork. JSON tags are byte-identical to
+// prompt.ContinuePullRequest.
+type PollContinuePullRequest struct {
+	Number  int    `json:"number,omitempty"`
+	HeadRef string `json:"headRef,omitempty"`
+	HeadSha string `json:"headSha,omitempty"`
 }
 
 // PollSkill mirrors prompt.SkillSpec for the daemon package so the daemon can
@@ -1628,6 +1644,7 @@ func PollItemToSessionDetail(item PollWorkItem, projects []ProjectConfig, platfo
 		McpServers:              item.McpServers,
 		Skills:                  item.Skills,
 		MemoryBlock:             item.MemoryBlock,
+		ContinuePullRequest:     item.ContinuePullRequest,
 		Mode:                    item.Mode,
 		InitialPrompt:           item.InitialPrompt,
 		RecordingEnabled:        item.RecordingEnabled,

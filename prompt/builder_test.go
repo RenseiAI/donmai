@@ -344,6 +344,12 @@ func TestBuilderBuild_AcceptanceRendersQATemplate(t *testing.T) {
 	if !strings.Contains(raymondUser, "WORK_RESULT:passed") {
 		t.Fatalf("raymond acceptance user prompt missing the review template:\n%s", raymondUser)
 	}
+	if !strings.Contains(raymondUser, "REVIEW_VERDICT:") {
+		t.Fatalf("raymond acceptance user prompt does not ask for the review verdict marker:\n%s", raymondUser)
+	}
+	if !strings.Contains(raymondUser, "reviewVerdict") {
+		t.Fatalf("raymond acceptance user prompt does not carry the review outcome as reviewVerdict:\n%s", raymondUser)
+	}
 }
 
 // assertGolden compares got against testdata/<name>.golden, rewriting

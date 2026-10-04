@@ -157,6 +157,11 @@ type Handle struct {
 	// terminal ResultEvent. Used by readStdout to suppress the
 	// "spawn_no_result" synthetic when the parent finished cleanly.
 	parentTerminal atomic.Bool
+
+	// mapper is the stateful stream-json line mapper that pairs native
+	// delegation tool calls with their results to emit the typed
+	// sub-agent lifecycle alongside the plain tool events.
+	mapper LineMapper
 }
 
 // sendEvent multiplexes one event onto the public events channel.
@@ -525,7 +530,7 @@ func (h *Handle) Inject(ctx context.Context, text string) error {
 				continue
 			}
 			line := append([]byte(nil), raw...)
-			for _, ev := range mapLine(line) {
+			for _, ev := range h.mapper.MapLine(line) {
 				if ev == nil {
 					continue
 				}
@@ -716,7 +721,7 @@ func (h *Handle) readStdout() {
 		}
 		// Copy: scanner reuses its buffer.
 		line := append([]byte(nil), raw...)
-		for _, ev := range mapLine(line) {
+		for _, ev := range h.mapper.MapLine(line) {
 			if ev == nil {
 				continue
 			}

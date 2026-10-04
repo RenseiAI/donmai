@@ -11,6 +11,7 @@ import (
 	"os/user"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"sync/atomic"
 	"syscall"
@@ -65,7 +66,7 @@ type fixture struct {
 	cleanups                                                      []func()
 	listener                                                      net.Listener
 	accepts                                                       atomic.Int32
-	tcpOpen, tcpClosed                                            net.Listener
+	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                      net.Listener
 	tcpOpenPort, tcpClosedPort                                    int
 	tcpAccepts                                                    atomic.Int32
 	// mounted records whether the mount probe got a volume over the
@@ -438,7 +439,9 @@ func (fx *fixture) widening(shared []string) error {
 
 	// The loopback TCP write proxy: a listener on the loopback interface
 	// answers every dial, so a dial that gets through is observed. One port
-	// is declared for the probe session and one is not.
+	// is declared for the probe session and one is not. The numeric IPv6
+	// loopback and the hostname get their own probes on the same ports:
+	// a profile rule that only matches IPv4 leaves them open.
 	openListener, openPort, err := listenLoopback()
 	if err != nil {
 		return fmt.Errorf("confinement: fixture: loopback listener: %w", err)
@@ -459,6 +462,39 @@ func (fx *fixture) widening(shared []string) error {
 		func(res stepResult) bool { return res.Err == "" })
 	fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp_declared", Op: opTCPDial, Port: openPort},
 		func(res stepResult) bool { return res.Err == "" })
+	// The IPv6 listeners reuse the same two ports, one declared and one
+	// not. Where IPv6 loopback is unavailable the probe fails closed with
+	// a setup error, like the mount probe without its disk image: the
+	// self-test never passes silently where it cannot judge.
+	open6, err := listenLoopback6(openPort)
+	if err != nil {
+		fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
+			func(stepResult) bool { return false })
+		fx.steps[len(fx.steps)-1].setupErr = "fixture: IPv6 loopback: " + errnoText(err)
+	} else {
+		fx.tcpOpen6 = open6
+		fx.cleanups = append(fx.cleanups, func() { _ = open6.Close() })
+		go acceptLoop(open6, &fx.tcpAccepts)
+		closed6, err := listenLoopback6(closedPort)
+		if err != nil {
+			_ = open6.Close()
+			fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
+				func(stepResult) bool { return false })
+			fx.steps[len(fx.steps)-1].setupErr = "fixture: IPv6 loopback: " + errnoText(err)
+		} else {
+			fx.tcpClosed6 = closed6
+			fx.cleanups = append(fx.cleanups, func() { _ = closed6.Close() })
+			go acceptLoop(closed6, &fx.tcpAccepts)
+			fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp6", Op: opTCPDial, Host: "::1", Port: closedPort},
+				func(res stepResult) bool { return res.Err == "" })
+			fx.add(classPositive, true, probeStep{ID: "allow.loopback_tcp6_declared", Op: opTCPDial, Host: "::1", Port: openPort},
+				func(res stepResult) bool { return res.Err == "" })
+		}
+	}
+	// The hostname probe resolves to a loopback address on this host; it
+	// dials the undeclared port so a name-resolution bypass fails it.
+	fx.add(classWidening, false, probeStep{ID: "widen.loopback_tcp_hostname", Op: opTCPDial, Host: "localhost", Port: closedPort},
+		func(res stepResult) bool { return res.Err == "" })
 	return nil
 }
 
@@ -475,6 +511,17 @@ func listenLoopback() (net.Listener, int, error) {
 		return nil, 0, errors.New("not a TCP listener")
 	}
 	return listener, addr.Port, nil
+}
+
+// listenLoopback6 binds the IPv6 loopback on one fixed port: the same port
+// the IPv4 listener already holds, so the declared-port allow is judged by
+// address family, not by port number.
+func listenLoopback6(port int) (net.Listener, error) {
+	listener, err := net.Listen("tcp", net.JoinHostPort("::1", strconv.Itoa(port)))
+	if err != nil {
+		return nil, err
+	}
+	return listener, nil
 }
 
 // acceptLoop answers every dial on a loopback probe listener.

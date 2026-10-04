@@ -36,6 +36,24 @@ func NormalizeEvent(sessionID string, seq uint64, observedAt time.Time, event ag
 			}
 			payload["inputDigest"] = digest
 		}
+	case agent.SubagentEvent:
+		switch ev.Phase {
+		case agent.SubagentStarted:
+			eventType = "subagent.started"
+		case agent.SubagentCompleted:
+			eventType = "subagent.completed"
+		case agent.SubagentFailed:
+			eventType = "subagent.failed"
+		default:
+			return Record{}, false, nil
+		}
+		payload = map[string]any{"toolName": ev.ToolName}
+		if ev.ToolUseID != "" {
+			payload["toolUseId"] = ev.ToolUseID
+		}
+		if ev.ChildSessionID != "" {
+			payload["childSessionId"] = ev.ChildSessionID
+		}
 	case agent.ErrorEvent:
 		eventType = "error.raised"
 		// Provider error text can contain prompt/tool/credential material.

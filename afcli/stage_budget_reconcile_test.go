@@ -17,7 +17,7 @@ func TestDetailToQueuedWorkReconcilesSiblingStageBudget(t *testing.T) {
 			name: "all limits",
 			budget: daemon.PollStageBudget{
 				MaxDurationSeconds: 1800,
-				MaxSubAgents:       3,
+				MaxSubAgents:       stageSubAgentCap(3),
 				MaxTokens:          24_000,
 			},
 		},
@@ -34,12 +34,25 @@ func TestDetailToQueuedWorkReconcilesSiblingStageBudget(t *testing.T) {
 				t.Fatal("detailToQueuedWork omitted the sibling stage budget")
 			}
 			if work.StageBudget.MaxDurationSeconds != tt.budget.MaxDurationSeconds ||
-				work.StageBudget.MaxSubAgents != tt.budget.MaxSubAgents ||
+				!stageSubAgentCapsEqual(work.StageBudget.MaxSubAgents, tt.budget.MaxSubAgents) ||
 				work.StageBudget.MaxTokens != tt.budget.MaxTokens {
 				t.Fatalf("StageBudget = %+v, want %+v", *work.StageBudget, tt.budget)
 			}
 		})
 	}
+}
+
+// stageSubAgentCap returns a pointer to n for PollStageBudget.MaxSubAgents
+// literals in tests.
+func stageSubAgentCap(n int) *int { return &n }
+
+// stageSubAgentCapsEqual compares two MaxSubAgents caps by value,
+// treating two nils as equal.
+func stageSubAgentCapsEqual(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
 }
 
 func TestDetailToQueuedWorkRejectsSiblingStageBudgetAbsentFromOperationalPayload(t *testing.T) {
