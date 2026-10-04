@@ -3,7 +3,6 @@ package runner
 import (
 	"context"
 	"fmt"
-	"strings"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -205,20 +204,20 @@ func (e *BudgetEnforcer) WithDurationCap(parent context.Context) (context.Contex
 // the channel closes.
 func (e *BudgetEnforcer) ObserveEvent(ev agent.Event) *BudgetExceededError {
 	switch v := ev.(type) {
-	case agent.ToolUseEvent:
-		// Sub-agent count = number of sub-agent delegation tool
-		// invocations ("Task" or "Agent"). The match is
-		// case-insensitive + suffix-tolerant so MCP-namespaced
-		// tools (e.g. `mcp__af__Task`) still count. An explicit
-		// zero cap means no sub-agents are allowed — the first
-		// counted call breaches — while an absent (nil) cap is
+	case agent.SubagentEvent:
+		// Sub-agent count = number of typed sub-agent lifecycles the
+		// adapter emitted (`started`). Adapters name their own
+		// delegation tools; the runner keeps no list of tool names.
+		// An explicit zero cap means no sub-agents are allowed — the
+		// first counted call breaches — while an absent (nil) cap is
 		// not enforced.
-		if isSubAgentTool(v.ToolName) {
-			n := e.subAgents.Add(1)
-			if limit := e.limits.MaxSubAgents; e.enabled && limit != nil && n > int64(*limit) {
-				return e.recordBreach(CapSubAgents,
-					fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, *limit))
-			}
+		if v.Phase != agent.SubagentStarted {
+			break
+		}
+		n := e.subAgents.Add(1)
+		if limit := e.limits.MaxSubAgents; e.enabled && limit != nil && n > int64(*limit) {
+			return e.recordBreach(CapSubAgents,
+				fmt.Sprintf("max-sub-agents exceeded: observed=%d limit=%d", n, *limit))
 		}
 	case agent.LlmCallEvent:
 		// Per-call usage is the live meter between ResultEvents, and the
@@ -478,19 +477,4 @@ func IsBudgetExceeded(err error) bool {
 	}
 	_, ok := err.(*BudgetExceededError)
 	return ok
-}
-
-// isSubAgentTool reports whether the tool name represents a sub-agent
-// delegation tool ("Task" or "Agent"). Match is case-insensitive +
-// tolerates MCP-style namespace prefixes (e.g. "mcp__af__Task",
-// "mcp__af__Agent", "task", "Agent").
-func isSubAgentTool(name string) bool {
-	n := strings.ToLower(strings.TrimSpace(name))
-	if n == "task" || n == "agent" {
-		return true
-	}
-	if strings.HasSuffix(n, "__task") || strings.HasSuffix(n, "__agent") {
-		return true
-	}
-	return false
 }

@@ -24,6 +24,7 @@ const (
 	EventToolUse       EventKind = "tool_use"
 	EventToolResult    EventKind = "tool_result"
 	EventToolProgress  EventKind = "tool_progress"
+	EventSubagent      EventKind = "subagent"
 	EventResult        EventKind = "result"
 	EventError         EventKind = "error"
 )
@@ -32,7 +33,7 @@ const (
 //
 // Implementations: InitEvent, SystemEvent, AssistantTextEvent,
 // LlmCallEvent, ToolUseEvent, ToolResultEvent, ToolProgressEvent,
-// ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
+// SubagentEvent, ResultEvent, ErrorEvent. The unexported isAgentEvent marker prevents external
 // packages from satisfying the interface, keeping the discriminated
 // union closed.
 //
@@ -346,6 +347,54 @@ type ToolProgressEvent struct {
 func (ToolProgressEvent) Kind() EventKind { return EventToolProgress }
 func (ToolProgressEvent) isAgentEvent()   {}
 
+// SubagentPhase is the lifecycle phase carried on a SubagentEvent.
+type SubagentPhase string
+
+// Subagent lifecycle phases. Stable wire values.
+const (
+	SubagentStarted   SubagentPhase = "started"
+	SubagentCompleted SubagentPhase = "completed"
+	SubagentFailed    SubagentPhase = "failed"
+)
+
+// SubagentEvent is the typed lifecycle event an adapter emits around a
+// native sub-agent delegation tool call: `started` when the delegation
+// tool is invoked, `completed` when its result arrives successfully,
+// `failed` when its result arrives as an error.
+//
+// ToolName is the adapter's own delegation tool name (the adapter names
+// its tools; the runner keeps no list). ToolUseID pairs the lifecycle
+// with the delegating ToolUseEvent/ToolResultEvent. ChildSessionID is
+// the sub-agent's session ref when the harness exposes one, else empty
+// — adapters never guess.
+type SubagentEvent struct {
+	// TraceID, SpanID, and ParentSpanID are populated by the runner's session
+	// correlator. SpanID identifies the subagent span the runtime span
+	// processor emits for this lifecycle.
+	TraceID      string `json:"traceId,omitempty"`
+	SpanID       string `json:"spanId,omitempty"`
+	ParentSpanID string `json:"parentSpanId,omitempty"`
+
+	// ToolName is the delegation tool identifier (e.g. "Task", "Agent").
+	ToolName string `json:"toolName"`
+
+	// ToolUseID pairs with the delegating ToolUseEvent.ToolUseID.
+	ToolUseID string `json:"toolUseId,omitempty"`
+
+	// Phase is the lifecycle phase: started | completed | failed.
+	Phase SubagentPhase `json:"phase"`
+
+	// ChildSessionID is the sub-agent's session ref when known.
+	ChildSessionID string `json:"childSessionId,omitempty"`
+
+	// Raw is the provider-native event payload.
+	Raw any `json:"raw,omitempty"`
+}
+
+// Kind reports the EventKind discriminant.
+func (SubagentEvent) Kind() EventKind { return EventSubagent }
+func (SubagentEvent) isAgentEvent()   {}
+
 // ResultEvent is the terminal session-outcome event from the provider.
 // Distinct from agent.Result which is the runner's higher-level
 // session-result struct (see types.go). Verbatim port of AgentResultEvent.
@@ -505,6 +554,12 @@ func UnmarshalEvent(data []byte) (Event, error) {
 		var ev ToolProgressEvent
 		if err := json.Unmarshal(data, &ev); err != nil {
 			return nil, fmt.Errorf("agent: decode ToolProgressEvent: %w", err)
+		}
+		return ev, nil
+	case EventSubagent:
+		var ev SubagentEvent
+		if err := json.Unmarshal(data, &ev); err != nil {
+			return nil, fmt.Errorf("agent: decode SubagentEvent: %w", err)
 		}
 		return ev, nil
 	case EventResult:
