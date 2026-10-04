@@ -991,8 +991,10 @@ func TestPosterPost_StatusFailureModeSerialized(t *testing.T) {
 		runner.FailureBackstop,          // "backstop-failed"
 		runner.FailureKitProvision,      // "kit-provision"
 		runner.FailureAgentBlocked,      // "agent-blocked"
+		// "continue-pr-diverged"
+		runner.FailureContinuePullRequestDiverged,
 	}
-	if got, want := len(allFailureModes), 11; got != want {
+	if got, want := len(allFailureModes), 12; got != want {
 		t.Fatalf("failure-mode count = %d, want %d — a constant was added to "+
 			"runner/failure.go without updating this table", got, want)
 	}

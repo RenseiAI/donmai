@@ -58,6 +58,10 @@ type verdictScriptTurn struct {
 	// of these refs on origin (e.g. a branch and refs/pull/<n>/head), as an
 	// agent that pushes to its pull request does.
 	push []string
+	// during runs after the turn's files and push, before its events: the
+	// world changing while the agent works (e.g. someone else pushing to
+	// the session's branch). It receives the session worktree.
+	during func(t *testing.T, cwd string)
 }
 
 // verdictScriptProvider wraps the stub harness (for its manifest + capabilities) and
@@ -167,6 +171,9 @@ func (h *verdictScriptHandle) playLocked() {
 	}
 	if len(turn.push) > 0 {
 		h.commitAndPush(turn)
+	}
+	if turn.during != nil {
+		turn.during(h.t, h.cwd)
 	}
 	for _, ev := range turn.events {
 		h.events <- ev

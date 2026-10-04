@@ -7,6 +7,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 	"github.com/RenseiAI/donmai/runtime/workarea"
 )
@@ -130,6 +131,14 @@ func continueDelivered(localHead, remoteHead, startHead string) bool {
 		return false
 	}
 	return strings.EqualFold(remoteHead, localHead)
+}
+
+// continueDiverged reports whether a backstop report carries the typed
+// continue-mode divergence refusal (see runBackstop). A declared session's
+// aggregate report folds every repository's diagnostics into its own, so
+// the top-level diagnostics are enough.
+func continueDiverged(report *agent.BackstopReport) bool {
+	return report != nil && strings.Contains(report.Diagnostics, ErrContinuePullRequestDiverged.Error())
 }
 
 // isContinueDivergence reports whether a push failure is the typed

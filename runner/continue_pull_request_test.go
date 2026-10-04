@@ -325,18 +325,90 @@ func TestRun_ContinueModeNoNewCommitIsNotDelivered(t *testing.T) {
 
 // TestRun_ContinueModeDraftIsNotDelivered proves the draft rule through the
 // production entry point: a draft continued pull request never reports the
-// run delivered, even when the agent changed nothing else.
+// run delivered. The session does deliver a new commit onto the continued
+// head, so the no-new-commit rule passes and only the draft rule can fail
+// the run.
 func TestRun_ContinueModeDraftIsNotDelivered(t *testing.T) {
 	res, _ := runScriptedSession(t, scriptedSession{
 		workType:       "development",
 		skipSteering:   true,
 		repository:     "https://github.com/example/repo",
 		continueNumber: 12,
+		backstop:       true,
 		draft:          func(context.Context, string, string) (bool, error) { return true, nil },
-		turns:          []verdictScriptTurn{{text: "nothing to do"}},
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
 	})
-	if res.Status == "completed" && res.PullRequestURL == "https://github.com/example/repo/pull/12" {
-		t.Fatalf("a draft continue run was reported delivered: %+v", res)
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed backstop-failed", res.Status, res.FailureMode, res.Error)
+	}
+	if !strings.Contains(res.Error, "is still a draft") {
+		t.Fatalf("Error = %q; want the draft refusal", res.Error)
+	}
+	// The commit really landed on the continued head: the draft rule, not
+	// a missing commit, is what failed the run.
+	remoteHead := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/continued/pr-12")
+	if !strings.Contains(remoteHead, gitRun(t, res.WorktreePath, "rev-parse", "HEAD")) {
+		t.Fatalf("continued head %q does not carry the session commit", remoteHead)
+	}
+}
+
+// TestRun_ContinueModeDivergedHeadIsTyped proves the divergence outcome
+// through the production entry point: the agent commits, then someone else
+// pushes to the continued head branch mid-session. The push is refused as
+// a non-fast-forward, and the terminal result — and the status the
+// platform receives — carry the typed divergence failure, not a
+// "no new commit" reading of the unpushed head.
+func TestRun_ContinueModeDivergedHeadIsTyped(t *testing.T) {
+	const branch = "continued/pr-12"
+	var moved string
+	platform := newRecordingPlatformServer(t)
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:       "development",
+		skipSteering:   true,
+		repository:     "https://github.com/example/repo",
+		continueNumber: 12,
+		backstop:       true,
+		platform:       platform,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+			during: func(t *testing.T, cwd string) {
+				// The agent commits its work locally.
+				gitRun(t, cwd, "add", "fix.go")
+				gitRun(t, cwd, "-c", "user.name=agent", "-c", "user.email=agent@example.com", "commit", "-q", "-m", "agent work")
+				// Someone else then pushes a sibling of the session's
+				// commit onto the continued head branch.
+				tree := gitRun(t, cwd, "rev-parse", "HEAD~1^{tree}")
+				other := gitRun(t, cwd, "-c", "user.name=other", "-c", "user.email=other@example.com", "commit-tree", tree, "-p", "HEAD~1", "-m", "someone else")
+				gitRun(t, cwd, "push", "-q", "origin", other+":refs/heads/"+branch)
+				moved = other
+			},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureContinuePullRequestDiverged {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureContinuePullRequestDiverged)
+	}
+	if !strings.Contains(res.Error, ErrContinuePullRequestDiverged.Error()) {
+		t.Fatalf("Error = %q; want the typed divergence reason", res.Error)
+	}
+	if strings.Contains(res.Error, "no new commit") {
+		t.Fatalf("Error = %q; the session committed, so it must not read as no new commit", res.Error)
+	}
+	// Nothing was forced: the other author's commit is still the head.
+	if got := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/"+branch); !strings.HasPrefix(got, moved) {
+		t.Fatalf("continued head = %q; want the other author's commit %s left in place", got, moved)
+	}
+	status := platform.terminalStatus(t)
+	if got := string(status["failureMode"]); got != `"`+FailureContinuePullRequestDiverged+`"` {
+		t.Fatalf("posted failureMode = %s; want %s", got, FailureContinuePullRequestDiverged)
+	}
+	if !strings.Contains(string(status["error"]), ErrContinuePullRequestDiverged.Error()) {
+		t.Fatalf("posted error = %s; want the typed divergence reason", status["error"])
 	}
 }
 

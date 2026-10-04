@@ -1667,6 +1667,18 @@ tailRecovery:
 		}
 	}
 
+	// Continue-mode divergence: the backstop refused to push because the
+	// continued pull request's head moved after dispatch. Record the typed
+	// failure here, before the delivery gate, so the terminal status says
+	// the head diverged instead of the gate reading the unpushed head as
+	// "no new commit".
+	if qw.ContinuePullRequest != nil && res.FailureMode == "" && continueDiverged(res.BackstopReport) {
+		res.Status = "failed"
+		res.FailureMode = FailureContinuePullRequestDiverged
+		res.Error = fmt.Sprintf("%s: pull request #%d branch %q refused the session's push as a non-fast-forward; its commits were not published",
+			ErrContinuePullRequestDiverged, qw.ContinuePullRequest.Number, continuePullRequestBranch(qw.ContinuePullRequest))
+	}
+
 	// Continue-mode delivery gate: the run's pull request is the
 	// continued one, and it counts as delivered only when the session
 	// moved its head past the dispatched head — pushed, so the remote
