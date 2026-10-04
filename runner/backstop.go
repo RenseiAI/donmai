@@ -359,12 +359,27 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 			"sessionId", qw.SessionID, "sessionBranch", branch, "checkedOut", checkedOut)
 	}
 	if out, err := runGit(ctx, worktreePath, id, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
+		// Continue-mode divergence is typed: the pull request's head moved
+		// after dispatch, so the push is refused as a non-fast-forward
+		// rather than forced. The typed reason tells the platform the run
+		// needs a fresh dispatch, not a retry of the same head.
+		if qw.ContinuePullRequest != nil && isContinueDivergence(out) {
+			report.Diagnostics = fmt.Sprintf("%s: continued pull request #%d branch %q moved after dispatch; refusing to push: %v\noutput: %s", ErrContinuePullRequestDiverged, qw.ContinuePullRequest.Number, branch, err, out)
+			return report
+		}
 		report.Diagnostics = fmt.Sprintf("git push of the work to session branch %q failed: %v\noutput: %s", branch, err, out)
 		return report
 	}
 	report.Pushed = true
 
-	// 7. Open a PR via the gh CLI.
+	// 7. Open a PR via the gh CLI. Continue-mode never opens one: the
+	// run's pull request is the continued one, already seeded on the
+	// envelope before the backstop ran. The pushed branch IS that pull
+	// request's head, so report the envelope URL without creating anything.
+	if qw.ContinuePullRequest != nil {
+		report.PRURL = res.PullRequestURL
+		return report
+	}
 	prTitle := commitSubject(qw)
 	if !strings.Contains(prTitle, qw.IssueIdentifier) && qw.IssueIdentifier != "" {
 		prTitle = qw.IssueIdentifier + ": " + prTitle
