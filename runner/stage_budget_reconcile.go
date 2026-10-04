@@ -39,5 +39,11 @@ func stageBudgetsEqual(left, right *prompt.StageBudget) bool {
 	if left == nil || right == nil {
 		return left == right
 	}
-	return *left == *right
+	if left.MaxDurationSeconds != right.MaxDurationSeconds || left.MaxTokens != right.MaxTokens {
+		return false
+	}
+	if left.MaxSubAgents == nil || right.MaxSubAgents == nil {
+		return left.MaxSubAgents == right.MaxSubAgents
+	}
+	return *left.MaxSubAgents == *right.MaxSubAgents
 }

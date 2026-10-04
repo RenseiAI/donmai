@@ -242,12 +242,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	enforcer := NewBudgetEnforcer(qw.StageBudget, time.UnixMilli(startedAt))
 	enforcer.midTurnWrapUp = caps.SupportsMessageInjection && takesMidTurnWrapUp(noticeDelivery)
 	if enforcer.Enabled() {
+		subAgents := "unlimited"
+		if qw.StageBudget.MaxSubAgents != nil {
+			subAgents = fmt.Sprintf("%d", *qw.StageBudget.MaxSubAgents)
+		}
 		r.logger.Info("[runner-stage]",
 			"sid", qw.SessionID,
 			"stageId", qw.StageID,
 			"event", "budget.enforce",
 			"maxDurationSeconds", qw.StageBudget.MaxDurationSeconds,
-			"maxSubAgents", qw.StageBudget.MaxSubAgents,
+			"maxSubAgents", subAgents,
 			"maxTokens", qw.StageBudget.MaxTokens,
 		)
 	}
@@ -2762,8 +2766,8 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
 			envMap["DONMAI_STAGE_MAX_DURATION_SECONDS"] = v
 		}
-		if b.MaxSubAgents > 0 {
-			v := fmt.Sprintf("%d", b.MaxSubAgents)
+		if b.MaxSubAgents != nil {
+			v := fmt.Sprintf("%d", *b.MaxSubAgents)
 			envMap["DONMAI_STAGE_MAX_SUB_AGENTS"] = v
 		}
 		if b.MaxTokens > 0 {
