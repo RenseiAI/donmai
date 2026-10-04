@@ -82,6 +82,10 @@ type Provider struct {
 	// trustedExtensions is the immutable ordered same-process extension set
 	// supplied by the compiled embedder at provider construction.
 	trustedExtensions []TrustedExtensionIdentity
+	// testConfiner overrides the self-tested confiner in tests that drive
+	// the production spawn paths under the real backend with throwaway
+	// host directories. Nil in production; confinerForSession ignores it.
+	testConfiner *confinement.Confiner
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -540,6 +544,9 @@ func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
 // confinement tests declare the authority explicitly and drive the real
 // backend.
 func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*confinement.Confiner, error) {
+	if p.testConfiner != nil {
+		return p.testConfiner, nil
+	}
 	if !piConfinementEnabled(spec) {
 		return nil, nil
 	}

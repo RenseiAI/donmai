@@ -4,8 +4,8 @@ package pi
 
 import (
 	"context"
+	"io"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strconv"
 	"strings"
@@ -13,7 +13,6 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
-	"github.com/RenseiAI/donmai/provider/harness/ptycli"
 	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
@@ -100,30 +99,6 @@ func liveConfinerForTest(t *testing.T, home, stateHome, profileDir string) *conf
 		t.Fatalf("self-test: %v", err)
 	}
 	return c
-}
-
-// confineLiveSession prepares a plan for the fixture workarea through the
-// provider's own confinePiSession mapping.
-func confineLiveSession(t *testing.T, c *confinement.Confiner, mode agent.PromptSessionMode, cwd, workareaRoot, mut, ro string, layout sessionLayout) *confinement.Plan {
-	t.Helper()
-	spec := agent.Spec{
-		SessionName: "live",
-		Cwd:         cwd,
-		PromptMode:  mode,
-		RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
-			Protocol:      "session-root-v1",
-			WorkareaRoot:  workareaRoot,
-			SelectedPath:  cwd,
-			MutablePaths:  []string{mut},
-			ReadOnlyPaths: []string{ro},
-		},
-	}
-	plan, err := confinePiSession(spec, layout, c)
-	if err != nil {
-		t.Fatalf("confinePiSession: %v", err)
-	}
-	t.Cleanup(func() { _ = plan.Release() })
-	return plan
 }
 
 // probeScript returns a shell script that attempts one write inside the set,
@@ -232,21 +207,42 @@ func assertNoLeakedDescriptors(t *testing.T, mut, outside, ro string) {
 }
 
 // runHeadlessProbe drives the probe through the provider's real headless
-// spawn: newHeadlessChildCommand with the confined (or, for the control,
-// unconfined) argv, waited to completion.
-func runHeadlessProbe(t *testing.T, plan *confinement.Plan, dir string, bin string, env []string) {
+// spawn: Provider.spawnChild with the probe script as the harness binary,
+// so the production argv construction plus the confinement wrap run exactly
+// as in a real launch. The test confiner rides the Provider, so the
+// production confinerForSession gate runs; a nil confiner drives the
+// unwrapped control through the same entry point.
+func runHeadlessProbe(t *testing.T, c *confinement.Confiner, spec agent.Spec, layout sessionLayout, bin string) {
 	t.Helper()
-	argv, err := confinePiArgv(plan, []string{bin})
+	p := &Provider{binary: bin, testConfiner: c}
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+	confiner, err := p.confinerForSession(ctx, spec)
 	if err != nil {
-		t.Fatalf("confinePiArgv: %v", err)
+		t.Fatalf("confinerForSession: %v", err)
 	}
-	// nolint:gosec // G204: test fixture; argv is the probe script path.
-	cmd := exec.Command(argv[0], argv[1:]...)
-	cmd.Dir = dir
-	cmd.Env = append(os.Environ(), env...)
-	out, err := cmd.CombinedOutput()
+	plan, err := confinePiSession(spec, layout, confiner)
 	if err != nil {
-		t.Fatalf("probe run: %v\n%s", err, out)
+		t.Fatalf("confinePiSession: %v", err)
+	}
+	if plan != nil {
+		t.Cleanup(func() { _ = plan.Release() })
+	}
+	childEnv := confinePiEnv(composeChildEnv(spec, layout, ""), plan)
+	cmd, stdin, stdout, err := p.spawnChild(spec, layout, nil, childEnv, launchPrompt, "", nil, nil, plan)
+	if err != nil {
+		t.Fatalf("spawnChild: %v", err)
+	}
+	// The probe writes nothing to stdout and exits; drain to EOF so the
+	// child's exit cannot block on a full pipe, then close stdin and wait.
+	if _, err := io.Copy(io.Discard, stdout); err != nil {
+		t.Fatalf("drain probe stdout: %v", err)
+	}
+	if err := stdin.Close(); err != nil {
+		t.Fatalf("close probe stdin: %v", err)
+	}
+	if err := cmd.Wait(); err != nil {
+		t.Fatalf("probe run: %v", err)
 	}
 }
 
@@ -260,31 +256,45 @@ func TestPiConfinement_HeadlessForbiddenWriteRefused(t *testing.T) {
 	profileDir := filepath.Join(stateHome, "profiles")
 	c := liveConfinerForTest(t, home, stateHome, profileDir)
 
-	spec := agent.Spec{SessionName: "live", Cwd: mut}
+	spec := agent.Spec{
+		SessionName: "live",
+		Cwd:         mut,
+		RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
+			Protocol:      "session-root-v1",
+			WorkareaRoot:  workareaRoot,
+			SelectedPath:  mut,
+			MutablePaths:  []string{mut},
+			ReadOnlyPaths: []string{ro},
+		},
+	}
 	layout, err := materializeExtensionForSpec(spec)
 	if err != nil {
 		t.Fatal(err)
 	}
-	plan := confineLiveSession(t, c, agent.PromptModeAutonomous, mut, workareaRoot, mut, ro, layout)
-	env := confinePiEnv(nil, plan)
 
 	bin := writeProbeBinary(t, t.TempDir(), probeScript(mut, outside, ro))
-	runHeadlessProbe(t, plan, mut, bin, env)
+	runHeadlessProbe(t, c, spec, layout, bin)
 	assertProbeOutcome(t, mut, outside, ro, filepath.Join(mut, "report.txt"), true)
 	assertNoLeakedDescriptors(t, mut, outside, ro)
 
-	// The discriminating control: the same script unwrapped must succeed at
-	// the forbidden writes. If it cannot, the test proves nothing about the
-	// wrap; if the wrap is removed, the confined assertions above go red.
+	// The discriminating control: the same spec with no declared authority
+	// through the same entry point must spawn unconfined (the production
+	// gate), so the forbidden writes succeed. If it cannot, the test proves
+	// nothing about the wrap; if the wrap is removed, the confined
+	// assertions above go red.
+	unconfined := spec
+	unconfined.RepositoryAuthority = nil
 	_ = os.Remove(filepath.Join(mut, "report.txt"))
 	_ = os.Remove(filepath.Join(outside, "planted.txt"))
 	_ = os.Remove(filepath.Join(ro, "planted.txt"))
-	runHeadlessProbe(t, nil, mut, bin, nil)
+	runHeadlessProbe(t, nil, unconfined, layout, bin)
 	assertProbeOutcome(t, mut, outside, ro, filepath.Join(mut, "report.txt"), false)
 }
 
 // TestPiConfinement_InteractiveForbiddenWriteRefused is the interactive half
-// of Done-when: the same refusal through the real PTY spawn path.
+// of Done-when: the same refusal through the real PTY spawn path —
+// Provider.spawnInteractive with the probe script as the harness binary, so
+// the production confinement wrap around the interactive argv runs.
 func TestPiConfinement_InteractiveForbiddenWriteRefused(t *testing.T) {
 	workareaRoot, mut, ro, outside := liveWorldForConfinement(t)
 	home := t.TempDir()
@@ -292,65 +302,67 @@ func TestPiConfinement_InteractiveForbiddenWriteRefused(t *testing.T) {
 	profileDir := filepath.Join(stateHome, "profiles")
 	c := liveConfinerForTest(t, home, stateHome, profileDir)
 
-	spec := agent.Spec{SessionName: "live", Cwd: mut, Interactive: &agent.InteractiveSpec{}}
-	layout, err := materializeExtensionForSpec(spec)
-	if err != nil {
-		t.Fatal(err)
-	}
-	plan := confineLiveSession(t, c, agent.PromptModeHumanControlled, mut, workareaRoot, mut, ro, layout)
-
 	bin := writeProbeBinary(t, t.TempDir(), probeScript(mut, outside, ro))
-	runInteractiveProbe(t, plan, mut, bin, confinePiEnv(nil, plan))
+	runInteractiveProbe(t, c, bin, workareaRoot, mut, ro)
 	assertProbeOutcome(t, mut, outside, ro, filepath.Join(mut, "report.txt"), true)
 	assertNoLeakedDescriptors(t, mut, outside, ro)
 
 	_ = os.Remove(filepath.Join(mut, "report.txt"))
 	_ = os.Remove(filepath.Join(outside, "planted.txt"))
 	_ = os.Remove(filepath.Join(ro, "planted.txt"))
-	runInteractiveProbe(t, nil, mut, bin, nil)
+	unconfinedInteractive := agent.Spec{
+		SessionName: "live-probe",
+		Cwd:         mut,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+	}
+	runInteractiveProbeWithSpec(t, nil, bin, unconfinedInteractive)
 	assertProbeOutcome(t, mut, outside, ro, filepath.Join(mut, "report.txt"), false)
 }
 
 // runInteractiveProbe drives the probe through the real interactive spawn:
-// the provider's own wrapped-argv shape through ptycli, waited to exit.
-func runInteractiveProbe(t *testing.T, plan *confinement.Plan, dir, bin string, env []string) {
+// Provider.spawnInteractive with the probe script as the harness binary,
+// waited to exit. A harness binary ignores the interactive argv flags the
+// production path appends (like the fake interactive provider's scripts do)
+// and just runs the probe body. The test confiner rides the Provider, so
+// the production confinerForSession gate runs; a nil confiner drives the
+// unwrapped control through the same entry point.
+func runInteractiveProbe(t *testing.T, c *confinement.Confiner, bin, workareaRoot, mut, ro string) {
 	t.Helper()
-	argv, err := confinePiArgv(plan, []string{bin})
-	if err != nil {
-		t.Fatalf("confinePiArgv: %v", err)
-	}
-	overrides := map[string]string{}
-	for _, kv := range env {
-		if i := strings.IndexByte(kv, '='); i >= 0 {
-			overrides[kv[:i]] = kv[i+1:]
-		}
-	}
-	spec := agent.Spec{
+	runInteractiveProbeWithSpec(t, c, bin, agent.Spec{
 		SessionName: "live-probe",
-		Cwd:         dir,
-		Env:         overrides,
-		Interactive: &agent.InteractiveSpec{},
-	}
-	p := &Provider{binary: "/bin/sh"}
-	_ = p
+		Cwd:         mut,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		RepositoryAuthority: &agent.RepositoryAuthorityPolicy{
+			Protocol:      "session-root-v1",
+			WorkareaRoot:  workareaRoot,
+			SelectedPath:  mut,
+			MutablePaths:  []string{mut},
+			ReadOnlyPaths: []string{ro},
+		},
+	})
+}
+
+// runInteractiveProbeWithSpec drives the probe through the real interactive
+// spawn with the caller-chosen spec: Provider.spawnInteractive with the
+// probe script as the harness binary, waited to exit.
+func runInteractiveProbeWithSpec(t *testing.T, c *confinement.Confiner, bin string, spec agent.Spec) {
+	t.Helper()
+	p := &Provider{binary: bin, testConfiner: c}
 	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
 	defer cancel()
-	h, err := ptycli.SpawnWithCleanup(ctx, argv[0], argv[1:], spec, agent.HarnessManifest{}, releaseOnStop(plan))
+	h, err := p.spawnInteractive(ctx, spec)
 	if err != nil {
-		t.Fatalf("pty spawn: %v", err)
+		t.Fatalf("spawnInteractive: %v", err)
 	}
+	defer func() { _ = h.Stop(context.Background()) }()
 	deadline := time.After(60 * time.Second)
 	for {
 		select {
 		case _, ok := <-h.Events():
 			if !ok {
-				if err := h.Stop(context.Background()); err != nil {
-					t.Logf("stop: %v", err)
-				}
 				return
 			}
 		case <-deadline:
-			_ = h.Stop(context.Background())
 			t.Fatal("timed out waiting for the interactive probe to exit")
 		}
 	}
