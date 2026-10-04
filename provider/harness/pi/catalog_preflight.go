@@ -182,7 +182,10 @@ func (p *Provider) preflightCatalogCheck(ctx context.Context, probe catalogProbe
 
 // promoteAggregatorPin selects pi's own built-in aggregator provider for an
 // aggregator-bound session when, and only when, pi's catalog lists the exact
-// slug. spec.Model must be the aggregator's whole "<author>/<model>" slug on
+// slug — except for the "google/" author, whose slugs always stay on the
+// injected Chat Completions lane: the aggregator serves them over a protocol
+// that ignores the thinking budget, while the injected lane grades effort.
+// spec.Model must be the aggregator's whole "<author>/<model>" slug on
 // a non-loopback binding whose BaseURL is the aggregator's own https host
 // (builtinAggregatorForBaseURL). On a confirmed match the pin is rewritten to
 // "<aggregator>/<slug>" — which nativeProviderPin then routes natively — and
@@ -196,6 +199,13 @@ func (p *Provider) preflightCatalogCheck(ctx context.Context, probe catalogProbe
 func (p *Provider) promoteAggregatorPin(ctx context.Context, spec agent.Spec) (agent.Spec, bool) {
 	ep := spec.Endpoint
 	if ep == nil || ep.Host == agent.HostGateway || spec.Model == "" {
+		return spec, false
+	}
+	// Gemini slugs stay on the injected Chat Completions lane: the
+	// aggregator serves them over a protocol that ignores the thinking
+	// budget, while the injected lane grades effort. Skip the native
+	// promotion for that author even when the catalog lists the slug.
+	if strings.HasPrefix(spec.Model, "google/") {
 		return spec, false
 	}
 	agg, ok := builtinAggregatorForBaseURL(ep.BaseURL)

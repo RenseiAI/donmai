@@ -267,6 +267,55 @@ func TestSpawn_AggregatorEndpoint_CatalogPromotion(t *testing.T) {
 	}
 }
 
+// TestSpawn_AggregatorEndpoint_GoogleSlugStaysInjected proves a Gemini gateway
+// slug stays on the injected Chat Completions lane even when pi's catalog
+// lists it: the promotion is skipped for the google author (no catalog probe
+// runs at all), and the effort level still rides the --model <id>:<level>
+// suffix on the injected provider.
+func TestSpawn_AggregatorEndpoint_GoogleSlugStaysInjected(t *testing.T) {
+	t.Parallel()
+	const googleSlug = "google/gemini-3.8-flash"
+	// A catalog HIT for the slug: the listing confirms the aggregator
+	// carries it, so any promotion logic that consulted the catalog would
+	// route natively. Staying injected here proves the author skip, not a
+	// catalog miss.
+	listing := "provider           model                  context  max-out  thinking  images\n" +
+		"vercel-ai-gateway  google/gemini-3.8-flash  1M       128K     yes       yes   \n"
+	probed := false
+	p := &Provider{binary: "pi", opts: Options{
+		CatalogProbe: func(_ context.Context, _, _, _, _, _ string) (string, error) {
+			probed = true
+			return listing, nil
+		},
+	}}
+	ep := aggregatorGatewayBinding()
+	ep.Model = googleSlug
+	spec, err := p.prepare(context.Background(), agent.Spec{
+		Prompt:   "hi",
+		Cwd:      t.TempDir(),
+		Model:    googleSlug,
+		Effort:   agent.EffortHigh,
+		Env:      map[string]string{PiKeyEnvVar: "gw-key"},
+		Endpoint: ep,
+	})
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	if probed {
+		t.Error("catalog probe ran for a google gateway slug; the promotion must be skipped for that author before any probe")
+	}
+	wantArgs := []string{"--provider", pinnedProviderName, "--model", googleSlug + ":high"}
+	if args := modelPinArgs(spec); !reflect.DeepEqual(args, wantArgs) {
+		t.Errorf("modelPinArgs = %q, want %q", args, wantArgs)
+	}
+	if env, want := providerPinEnv(spec), piModelEnvVar+"="+googleSlug; !slices.Contains(env, want) {
+		t.Errorf("providerPinEnv = %v, want it to contain %q (the whole slug)", env, want)
+	}
+	if spec.Env["AI_GATEWAY_API_KEY"] != "" {
+		t.Errorf("AI_GATEWAY_API_KEY = %q, want unset: the native aggregator route must not get a credential mirror", spec.Env["AI_GATEWAY_API_KEY"])
+	}
+}
+
 // TestSpawn_AggregatorEndpoint_Native completes a full Spawn on the promoted
 // native route, proving prepare's promotion composes with the launch path.
 func TestSpawn_AggregatorEndpoint_Native(t *testing.T) {
