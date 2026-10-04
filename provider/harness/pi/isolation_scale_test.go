@@ -67,8 +67,9 @@ func TestStateIsolation_NConcurrentSessions_DistinctRootsAndAgentHomes(t *testin
 				t.Errorf("session %d: MkdirAll cwd: %v", i, err)
 				return
 			}
-			layout := newSessionLayout(cwd)
-			env := composeChildEnv(agent.Spec{Cwd: cwd}, layout, "tok-"+strconv.Itoa(i))
+			spec := agent.Spec{Cwd: cwd}
+			layout := newSessionLayoutForSpec(spec)
+			env := composeChildEnv(spec, layout, "tok-"+strconv.Itoa(i))
 			sessions[i] = sessionState{layout: layout, env: env}
 		}(i)
 	}
@@ -90,11 +91,11 @@ func TestStateIsolation_NConcurrentSessions_DistinctRootsAndAgentHomes(t *testin
 		}
 		roots[s.layout.root] = i
 
-		dirVal := envValue(s.env, piCodingAgentDirEnvVar)
+		dirVal := lastEnvValue(s.env, piCodingAgentDirEnvVar)
 		if dirVal != s.layout.agentHome {
 			t.Errorf("session %d: %s = %q, want %q", i, piCodingAgentDirEnvVar, dirVal, s.layout.agentHome)
 		}
-		sessionDirVal := envValue(s.env, piCodingAgentSessionDirEnvVar)
+		sessionDirVal := lastEnvValue(s.env, piCodingAgentSessionDirEnvVar)
 		if prev, dup := sessionDirs[sessionDirVal]; dup && sessionDirVal != "" {
 			t.Errorf("session %d shares %s=%q with session %d", i, piCodingAgentSessionDirEnvVar, sessionDirVal, prev)
 		}
@@ -158,9 +159,14 @@ func TestStateIsolation_AuthLockfileBottleneckIsBypassed(t *testing.T) {
 	lockPaths := make(map[string]int, isolationScaleN)
 	for i := 0; i < isolationScaleN; i++ {
 		cwd := filepath.Join(t.TempDir(), "s")
-		layout := newSessionLayout(cwd)
-		env := composeChildEnv(agent.Spec{Cwd: cwd}, layout, "tok")
-		agentDir := envValue(env, piCodingAgentDirEnvVar)
+		if err := os.MkdirAll(cwd, 0o700); err != nil {
+			t.Fatal(err)
+		}
+		cwd = filepath.Join(cwd, "s-"+strconv.Itoa(i))
+		spec := agent.Spec{Cwd: cwd}
+		layout := newSessionLayoutForSpec(spec)
+		env := composeChildEnv(spec, layout, "tok")
+		agentDir := lastEnvValue(env, piCodingAgentDirEnvVar)
 		if agentDir == "" {
 			t.Fatalf("session %d: %s not set on the child env", i, piCodingAgentDirEnvVar)
 		}
@@ -178,12 +184,16 @@ func TestStateIsolation_AuthLockfileBottleneckIsBypassed(t *testing.T) {
 	}
 }
 
-func envValue(env []string, key string) string {
+// lastEnvValue reads the winning entry under exec's last-entry-wins
+// semantics: composeChildEnv appends the session redirect last so it wins
+// over any same-named inherited host variable.
+func lastEnvValue(env []string, key string) string {
 	prefix := key + "="
+	got := ""
 	for _, e := range env {
 		if v, ok := strings.CutPrefix(e, prefix); ok {
-			return v
+			got = v
 		}
 	}
-	return ""
+	return got
 }

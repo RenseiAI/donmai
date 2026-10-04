@@ -166,6 +166,10 @@ var networkReaching = regexp.MustCompile(`(?i)\b(curl|wget|nc|ncat|ssh|scp|rsync
 type PolicyEngine struct {
 	autonomous bool
 	cwd        string
+	// stateRoot is the session's relocated harness state root
+	// (sessionStateRoot). The state-dir guard protects it alongside the
+	// legacy in-checkout directory.
+	stateRoot string
 
 	// allowGated is the session's effective toolApproval level being
 	// allow-list or stronger (ADR-2026-09-27-execution-security-levels.md).
@@ -192,10 +196,14 @@ type PolicyEngine struct {
 // Spec.PermissionConfig (Claude-grammar allow/deny regexes + DefaultDecision),
 // Spec.AllowedTools / Spec.DisallowedTools (Claude tool patterns), Spec.Cwd
 // (containment root), and Spec.Autonomous (network-bash default-deny).
+// The harness state root is derived the same way the spawn path derives it
+// (sessionStateRoot), so the state-dir guard protects the relocated state
+// whether or not the caller materialized a layout first.
 func NewPolicyEngine(spec agent.Spec) *PolicyEngine {
 	e := &PolicyEngine{
 		autonomous:      spec.Autonomous,
 		cwd:             spec.Cwd,
+		stateRoot:       sessionStateRoot(spec),
 		allowGated:      spec.ToolApprovalAllowGated(),
 		allowedTools:    parseToolPatterns(spec.AllowedTools),
 		disallowedTools: parseToolPatterns(spec.DisallowedTools),
@@ -241,8 +249,11 @@ func (e *PolicyEngine) Evaluate(call ToolCall) Decision {
 		}
 		// 1b. The harness's own state directory. Same standing as the rules
 		// above — built-in, un-overridable — because losing it strands the
-		// running session (statedir_guard.go).
-		if reason := stateDirDeletionReason(call.Command, e.containmentRoot(call)); reason != "" {
+		// running session (statedir_guard.go). Both the relocated state
+		// root and the legacy in-checkout directory are guarded: the
+		// relocated root is live state, and the legacy path may hold a
+		// previous version's live state.
+		if reason := stateDirDeletionReasonForRoots(call.Command, e.containmentRoot(call), e.stateRoot); reason != "" {
 			return Decision{Allow: false, Reason: reason}
 		}
 	}

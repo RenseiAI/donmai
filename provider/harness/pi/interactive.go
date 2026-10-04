@@ -8,6 +8,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/provider/harness/ptycli"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 	runtimeenv "github.com/RenseiAI/donmai/runtime/env"
 )
 
@@ -48,10 +49,18 @@ import (
 // tailed from this session's own transcript in between (see
 // interactive_state_loss.go and interactive_transcript.go).
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Decide confinement before the parent writes anything into the
+	// session's state, exactly as the headless lane does (launch): a
+	// confined session's state is written through the strict writer.
+	confiner, err := p.confinerForSession(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
 	// Materialize the embedded policy extension so its provider pin registers in
 	// the child. A materialization failure means no pin — fail closed, exactly
-	// as the headless lane does.
-	layout, err := materializeExtension(spec.Cwd)
+	// as the headless lane does. The state lands in the session state root
+	// inside the working folder (confinement.go).
+	layout, err := materializeExtensionForSpec(spec, confiner != nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -76,15 +85,61 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// an explicit override.
 	spec.Env = interactiveChildEnv(spec, layout)
 
+	// Confine the interactive child the same way the headless lane confines
+	// its own: the wrapped argv runs under the session profile, and the
+	// plan's tmp/cache bindings ride the override env. A nil plan means the
+	// session did not request confinement. The PTY child inherits only the
+	// slave side of its terminal as its standard descriptors — ptyhost never
+	// passes ExtraFiles — so no out-of-set descriptor reaches it either.
+	var plan *confinement.Plan
+	if confiner != nil {
+		plan, err = confinePiSession(spec, layout, confiner)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Snapshot the shared state dir's existing transcripts BEFORE the child
 	// starts, so the transcript tail reads only what this session writes.
 	tailer := newInteractiveTranscriptTailer(layout.root)
 
-	handle, err := ptycli.SpawnWithCleanup(ctx, p.binary, interactiveArgs(spec, layout, extensionPaths), spec, p.Manifest(), nil)
+	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
 	if err != nil {
+		if plan != nil {
+			_ = plan.Release()
+		}
+		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
+	}
+	for _, kv := range confinePiEnv(nil, plan) {
+		if i := strings.IndexByte(kv, '='); i >= 0 {
+			if spec.Env == nil {
+				spec.Env = map[string]string{}
+			}
+			spec.Env[kv[:i]] = kv[i+1:]
+		}
+	}
+
+	handle, err := ptycli.SpawnWithCleanup(ctx, wrapped[0], wrapped[1:], spec, p.Manifest(), releaseOnStop(plan))
+	if err != nil {
+		if plan != nil {
+			_ = plan.Release()
+		}
 		return nil, err
 	}
 	return newInteractiveStateLossHandle(handle, layout.root, tailer), nil
+}
+
+// releaseOnStop turns the plan release into the ptycli per-session cleanup:
+// it runs exactly once on spawn failure, child exit, context cancellation,
+// or Stop, whichever happens first. The rendered profile must stay on disk
+// until the confined child has exited; the profile is read when the wrapped
+// command starts, so releasing once the session is over is safe, and a
+// process already running under the profile stays confined. A nil plan
+// (no backend) needs no cleanup.
+func releaseOnStop(plan *confinement.Plan) func() error {
+	if plan == nil {
+		return nil
+	}
+	return plan.Release
 }
 
 // interactiveArgs builds the argv for pi's own interactive TUI.
@@ -128,6 +183,14 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 	}
 	return args
 }
+
+// piStateDirEnvVar carries the relocated per-session state root onto the
+// interactive child so the embedded extension's local state-dir guard
+// (extensions/donmai-policy.ts stateDirRoots) covers the live session
+// state exactly as the Go engine's stateDirDeletionReasonForRoots does.
+// The headless lane needs no equivalent: its guard runs in-process in
+// policy.go against engine.stateRoot, not via the child env.
+const piStateDirEnvVar = "DONMAI_PI_STATE_DIR"
 
 // piAllowedToolsEnvVar / piDisallowedToolsEnvVar carry a JSON-encoded
 // Spec.AllowedTools / Spec.DisallowedTools array onto the interactive PTY
@@ -195,6 +258,7 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 	}
 	env[piCodingAgentDirEnvVar] = layout.agentHome
 	env[piCodingAgentSessionDirEnvVar] = layout.root
+	env[piStateDirEnvVar] = layout.root
 	for _, kv := range offlinePostureEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]

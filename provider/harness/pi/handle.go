@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
 // Compile-time assertion: Handle satisfies agent.Handle.
@@ -142,6 +143,15 @@ type Handle struct {
 	// historical fatal bypass behavior.
 	receipt *receiptAdmission
 
+	// confinement is the plan a confined spawn runs under: its record is
+	// the per-session confinement record, and its Release removes the
+	// rendered sandbox profile. The release must run only after the
+	// confined child has exited (or at least read the profile);
+	// releaseConfinement runs it idempotently from Stop and from the pump
+	// teardown. Nil for unconfined spawns.
+	confinement     *confinement.Plan
+	confinementOnce sync.Once
+
 	// token is the per-session handshake secret the harness set in the child
 	// env (piHandshakeEnvVar). The policy extension echoes it on every
 	// round-trip; the handle rejects any request whose token does not match.
@@ -234,6 +244,22 @@ type Handle struct {
 	closed       chan struct{}
 	eventsMu     sync.RWMutex
 	eventsClosed atomic.Bool
+}
+
+// setConfinement attaches the plan a confined spawn runs under. The
+// rendered sandbox profile must stay on disk until the confined child has
+// exited, so the release runs when the session stops or the pump drains. A
+// nil plan (an unconfined spawn) is a no-op. Set before the pump starts.
+func (h *Handle) setConfinement(plan *confinement.Plan) {
+	h.confinement = plan
+}
+
+func (h *Handle) releaseConfinement() {
+	h.confinementOnce.Do(func() {
+		if h.confinement != nil {
+			_ = h.confinement.Release()
+		}
+	})
 }
 
 func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, admissions ...*receiptAdmission) *Handle {
@@ -334,6 +360,7 @@ func (h *Handle) Stop(ctx context.Context) error {
 	})
 	h.signalClosed()
 	h.closeEvents()
+	h.releaseConfinement()
 	return nil
 }
 
@@ -379,6 +406,7 @@ func (h *Handle) run() {
 		h.resolveHandshake(fmt.Errorf("pi: event stream closed before handshake"))
 		h.signalClosed()
 		h.closeEvents()
+		h.releaseConfinement()
 	}()
 
 	for {

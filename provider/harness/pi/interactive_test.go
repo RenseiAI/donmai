@@ -543,7 +543,7 @@ func TestSpawn_Interactive_RealBinary_StateDirGuardRefusesAndSessionContinues(t 
 	if !strings.Contains(string(secondTurn), stateDirGuardReasonPrefix) {
 		t.Fatalf("second real-pi model turn did not receive the typed refusal: %s", secondTurn)
 	}
-	if _, err := os.Stat(filepath.Join(workdir, piStateDir)); err != nil {
+	if _, err := os.Stat(filepath.Join(workdir, ".pi-"+filepath.Base(workdir))); err != nil {
 		t.Fatalf("the guarded state directory did not survive the real tool call: %v", err)
 	}
 	capable, ok := h.(agent.InteractiveCapable)

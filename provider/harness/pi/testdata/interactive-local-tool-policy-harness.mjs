@@ -302,10 +302,10 @@ function stripVarAnnotations(s) {
 
 // --- Harness proper ---
 
-const [, , extensionPath, toolName, inputJSON] = process.argv;
+const [, , extensionPath, toolName, inputJSON, ctxJSON] = process.argv;
 
 if (!extensionPath || !toolName) {
-  console.error("usage: node interactive-local-tool-policy-harness.mjs <extensionPath> <toolName> <inputJSON>");
+  console.error("usage: node interactive-local-tool-policy-harness.mjs <extensionPath> <toolName> <inputJSON> [ctxJSON]");
   process.exit(2);
 }
 
@@ -374,5 +374,14 @@ if (inputJSON) {
   }
 }
 
-const verdict = await handler({ toolName, input }, {});
+let ctx = {};
+if (ctxJSON) {
+  try {
+    ctx = JSON.parse(ctxJSON);
+  } catch {
+    ctx = {};
+  }
+}
+
+const verdict = await handler({ toolName, input }, ctx);
 console.log(JSON.stringify({ registered: true, verdict: verdict ?? null, providers }));
