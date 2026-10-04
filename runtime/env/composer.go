@@ -54,12 +54,18 @@ const sessionShimEnvPrefix = "DONMAI_SESSION_SHIM"
 // receives only the gateway's per-session loopback bearer while the upstream
 // credential and route stay in the worker process. An inherited copy in the
 // child would silently undo that isolation.
+// DONMAI_PI_KEY is likewise donmai-native with no legacy counterpart: it is
+// the resolved cell key the provider pin reads in the child. A session spec
+// with no key must not inherit the host's copy (which would then ride the
+// injected provider to the vendor), so it is blocked from the parent env
+// while the spec layer may still set it (see Composer.Compose).
 var AgentEnvBlocklist = []string{
 	"ANTHROPIC_API_KEY",
 	"ANTHROPIC_AUTH_TOKEN",
 	"ANTHROPIC_BASE_URL",
 	GatewayUpstreamAPIKeyEnv,
 	GatewayUpstreamBaseURLEnv,
+	"DONMAI_PI_KEY",
 	"GEMINI_API_KEY",
 	"GOOGLE_API_KEY",
 	"OPENCLAW_GATEWAY_TOKEN",

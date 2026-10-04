@@ -332,7 +332,7 @@ type PollInterviewBudget struct {
 // constructs the QueuedWork.
 type PollStageBudget struct {
 	MaxDurationSeconds int   `json:"maxDurationSeconds,omitempty"`
-	MaxSubAgents       int   `json:"maxSubAgents,omitempty"`
+	MaxSubAgents       *int  `json:"maxSubAgents,omitempty"`
 	MaxTokens          int64 `json:"maxTokens,omitempty"`
 }
 

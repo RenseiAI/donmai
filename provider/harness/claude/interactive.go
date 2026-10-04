@@ -175,9 +175,11 @@ func interactiveArgsWith(spec agent.Spec, mcpConfigPath, settingsJSON string) []
 	// Effort: mirrors buildArgs' identical branch (cli_args.go) so a
 	// configured reasoning effort reaches the interactive REPL the same way
 	// it reaches a headless run. The REPL accepts --effort exactly as the
-	// headless CLI does. Spawn also fixes CLAUDE_CODE_EFFORT_LEVEL
-	// (effort.go), which outranks every settings file, so an unconfigured
-	// session runs at the model's own default rather than the operator's.
+	// headless CLI does. Spawn deliberately does NOT fix
+	// CLAUDE_CODE_EFFORT_LEVEL here (effort.go): the operator keeps their
+	// own effort control — the flag, the in-session effort command, and
+	// saved preferences — on interactive sessions. Only stamped headless
+	// sessions get the forced variable.
 	// The flag is omitted unless the level is one Claude recognises: an
 	// unrecognised stored value would be silently ignored by the CLI, which
 	// then falls back to the operator's saved level while the session

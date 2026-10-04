@@ -190,6 +190,47 @@ func TestApplyEndpoint_MirrorsKeyAndRejectsUnroutable(t *testing.T) {
 	}
 }
 
+// TestEnvHygiene_HostPiKeyNeverLeaks pins the injected-provider key
+// isolation: a host DONMAI_PI_KEY (another session's resolved cell key, or
+// an operator export) must never reach the pi child through the inherited
+// parent env — only the spec layer may set it. A session spec with no key
+// must yield a child env with no key at all; otherwise the catalog-miss
+// fallback would route such a session onto the injected provider carrying
+// the host's key to the vendor. RED proof: drop DONMAI_PI_KEY from
+// AgentEnvBlocklist (runtime/env/composer.go) and the host canary below
+// rides into the child env.
+func TestEnvHygiene_HostPiKeyNeverLeaks(t *testing.T) {
+	// Not parallel: mutates process env.
+	const hostKey = "host-pi-key-must-not-leak"
+	t.Setenv(PiKeyEnvVar, hostKey)
+
+	layout := newSessionLayout(t.TempDir())
+
+	// A spec with no key yields no key: the host copy is stripped, and
+	// nothing on the spec layer reintroduces it.
+	bare := composeChildEnv(agent.Spec{Cwd: t.TempDir()}, layout, "sess-token")
+	for _, e := range bare {
+		if strings.HasPrefix(e, PiKeyEnvVar+"=") {
+			t.Fatalf("host %s leaked into the child env of a keyless spec: %q", PiKeyEnvVar, e)
+		}
+	}
+
+	// A spec-set key still rides (the blocklist strips the parent env
+	// only), and the host copy is gone rather than shadowing it.
+	seeded := composeChildEnv(agent.Spec{
+		Cwd: t.TempDir(),
+		Env: map[string]string{PiKeyEnvVar: "cell-resolved-key"},
+	}, layout, "sess-token")
+	if !hasEnvVal(seeded, PiKeyEnvVar, "cell-resolved-key") {
+		t.Errorf("spec-set %s did not reach the child env", PiKeyEnvVar)
+	}
+	for _, e := range seeded {
+		if strings.Contains(e, hostKey) {
+			t.Fatalf("host %s value survived alongside the spec key: %q", PiKeyEnvVar, e)
+		}
+	}
+}
+
 func hasEnvKey(env []string, key string) bool {
 	for _, e := range env {
 		if strings.HasPrefix(e, key+"=") {

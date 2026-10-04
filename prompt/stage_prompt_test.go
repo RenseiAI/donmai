@@ -30,7 +30,7 @@ func TestBuilderBuild_StagePromptMode(t *testing.T) {
 				StageID:         "development",
 				StageBudget: &prompt.StageBudget{
 					MaxDurationSeconds: 14400,
-					MaxSubAgents:       5,
+					MaxSubAgents:       stageSubAgentCap(5),
 					MaxTokens:          200_000,
 				},
 				StageSourceEventID: "evt-abc-123",
@@ -107,6 +107,10 @@ func TestBuilderBuild_StagePromptMode(t *testing.T) {
 		})
 	}
 }
+
+// stageSubAgentCap returns a pointer to n for StageBudget.MaxSubAgents
+// literals in tests.
+func stageSubAgentCap(n int) *int { return &n }
 
 // TestBuilderBuild_StagePromptEmptyWorkRejected asserts that a
 // QueuedWork with NEITHER StagePrompt NOR legacy issue-context fields

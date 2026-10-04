@@ -242,12 +242,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	enforcer := NewBudgetEnforcer(qw.StageBudget, time.UnixMilli(startedAt))
 	enforcer.midTurnWrapUp = caps.SupportsMessageInjection && takesMidTurnWrapUp(noticeDelivery)
 	if enforcer.Enabled() {
+		subAgents := "unlimited"
+		if qw.StageBudget.MaxSubAgents != nil {
+			subAgents = fmt.Sprintf("%d", *qw.StageBudget.MaxSubAgents)
+		}
 		r.logger.Info("[runner-stage]",
 			"sid", qw.SessionID,
 			"stageId", qw.StageID,
 			"event", "budget.enforce",
 			"maxDurationSeconds", qw.StageBudget.MaxDurationSeconds,
-			"maxSubAgents", qw.StageBudget.MaxSubAgents,
+			"maxSubAgents", subAgents,
 			"maxTokens", qw.StageBudget.MaxTokens,
 		)
 	}
@@ -1165,10 +1169,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		HTTPClient:         r.httpClient,
-		Logger:             r.logger,
-		// Interval intentionally left at the 15s default — calibrated
-		// against the platform's 60s SESSION_STALE_THRESHOLD_MS.
+		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
+			in, out, cached, usd := enforcer.usageSnapshot()
+			return stepheartbeat.UsageSnapshot{
+				InputTokens:       in,
+				OutputTokens:      out,
+				CachedInputTokens: cached,
+				TotalCostUsd:      usd,
+			}
+		},
+		HTTPClient: r.httpClient,
+		Logger:     r.logger,
+		Interval:   r.stepHeartbeatInterval,
+		// Interval is zero in production, keeping the 15s default —
+		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
 	if stepErr != nil {
 		r.logger.Warn("step-heartbeat construct failed", "err", stepErr)
@@ -1404,6 +1418,9 @@ tailRecovery:
 		case tailExhausted:
 			if ending == turnProviderError || ending == turnProviderErrorFatal {
 				followUps.providerError = lastTurn.providerError
+				if res.Upstream == nil && lastTurn.upstream != nil {
+					res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
+				}
 			}
 			followUps.fail(res)
 			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
@@ -2045,6 +2062,12 @@ type streamObservation struct {
 	// The zero value is retryable, as every provider error was before.
 	providerError             string
 	providerErrorNotRetryable bool
+	// upstream is the structured endpoint error of the latest provider
+	// error observation (or failed terminal) in this stream — the HTTP
+	// status, provider code, truncated provider message, and reset time
+	// the harness exposed. A later assistant message or tool call means
+	// the model recovered and clears it, exactly like providerError.
+	upstream *agent.UpstreamError
 	// toolCalls counts the tool calls (agent.ToolUseEvent) this stream
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
@@ -2138,6 +2161,15 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 			res.FailureMode = FailureProviderError
 		}
 	}
+	// The structured endpoint cause rides only when the session failed
+	// on it: a terminal failure (or a provider-error exhaustion) with
+	// this stream's structured cause and no newer recovery. A later
+	// successful turn clears it (observeEvent clears upstream alongside
+	// providerError), and a failure with no structured cause leaves any
+	// older value untouched.
+	if res.Status == "failed" && res.Upstream == nil && o.upstream != nil && !o.upstream.Empty() {
+		res.Upstream = agent.CanonicalUpstreamError(o.upstream)
+	}
 }
 
 // consumeEvents drains the handle's events channel, mirrors each
@@ -2214,25 +2246,19 @@ func (r *Runner) consumeEvents(
 	// (idleC stays nil → its select case never fires).
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	var idleTimer *time.Timer
+	var idleTimer interviewTimer
 	var idleC <-chan time.Time
 	if r.idleTimeout > 0 {
-		idleTimer = time.NewTimer(r.idleTimeout)
+		idleTimer = r.idleTimer(r.idleTimeout)
 		defer idleTimer.Stop()
-		idleC = idleTimer.C
+		idleC = idleTimer.Chan()
 	}
 	// resetIdle re-arms the watchdog after each observed event. Drains a
-	// possibly-already-fired timer channel before Reset per the stdlib
-	// time.Timer contract.
+	// possibly-already-fired timer tick before Reset so a stale fire from
+	// the prior window cannot trip the next select.
 	resetIdle := func() {
 		if idleTimer == nil {
 			return
-		}
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
 		}
 		idleTimer.Reset(r.idleTimeout)
 	}
@@ -2401,6 +2427,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.lastAssistantText = e.Text
 			obs.providerError = ""
 			obs.providerErrorNotRetryable = false
+			obs.upstream = nil
 		}
 		// One verdict per message, from its FIRST line-anchored marker
 		// (scanVerdict); the latest message that carries one decides the
@@ -2435,6 +2462,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.SystemEvent:
 		if e.Subtype == agent.SystemSubtypeProviderError {
 			obs.providerError, obs.providerErrorNotRetryable = splitProviderErrorRetryable(strings.TrimSpace(e.Message))
+			obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
 			if obs.providerError == "" {
 				obs.providerError = "model provider error"
 			}
@@ -2445,6 +2473,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		// this stream was recovered from.
 		obs.providerError = ""
 		obs.providerErrorNotRetryable = false
+		obs.upstream = nil
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
 		// Bash invocations of `gh pr create` are not tracked here —
@@ -2469,12 +2498,18 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
+		if !e.Success && e.Upstream != nil {
+			obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
+		}
 	case agent.ErrorEvent:
 		// An error the session continues past is on the record (events.jsonl,
 		// the activity sink) but is not the session's terminal, so it never
 		// becomes the run's failure.
 		if !e.SessionContinues {
 			obs.errorEvent = &e
+			if e.Upstream != nil {
+				obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
+			}
 		}
 	}
 }
@@ -2758,8 +2793,8 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
 			envMap["DONMAI_STAGE_MAX_DURATION_SECONDS"] = v
 		}
-		if b.MaxSubAgents > 0 {
-			v := fmt.Sprintf("%d", b.MaxSubAgents)
+		if b.MaxSubAgents != nil {
+			v := fmt.Sprintf("%d", *b.MaxSubAgents)
 			envMap["DONMAI_STAGE_MAX_SUB_AGENTS"] = v
 		}
 		if b.MaxTokens > 0 {

@@ -9,6 +9,7 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"regexp"
 	"slices"
 	"strconv"
 	"strings"
@@ -2267,15 +2268,14 @@ var ErrCredentialPropagation = errors.New("runtime/worktree: remote rejected a f
 // or input failure. The match is deliberately narrow — only rejections that
 // a propagation delay can plausibly produce — so a credential that truly
 // lacks access still fails instead of burning retries that cannot help.
-
+// Status codes only match in git and HTTP error forms (for example
+// "returned error: 403" or "HTTP 404"); bare digits elsewhere in the
+// output (a SHA, a port, a byte count) are not a rejection.
 func isCredentialPropagationError(output []byte) bool {
 	msg := strings.ToLower(string(output))
 	for _, frag := range []string{
 		"repository not found",
 		"could not read from remote repository",
-		"401",
-		"403",
-		"404",
 		"authentication failed",
 		"access denied",
 	} {
@@ -2283,14 +2283,28 @@ func isCredentialPropagationError(output []byte) bool {
 			return true
 		}
 	}
+	for _, pattern := range credentialPropagationStatusPatterns {
+		if pattern.MatchString(msg) {
+			return true
+		}
+	}
 	return false
+}
+
+// credentialPropagationStatusPatterns matches 401/403/404 only in git and
+// HTTP error forms. Bare digits elsewhere in the output (a SHA, a port, a
+// byte count) must not read as a credential rejection.
+var credentialPropagationStatusPatterns = []*regexp.Regexp{
+	regexp.MustCompile(`error\s*:?\s*40[134]\b`),
+	regexp.MustCompile(`status(\s+code)?\s*:?\s*40[134]\b`),
+	regexp.MustCompile(`\bhttp\s+40[134]\b`),
+	regexp.MustCompile(`\b40[134]\s+(unauthorized|forbidden|not found)\b`),
 }
 
 // credentialPropagationDelays returns the backoff schedule between retries
 // when a remote rejects a clone or fetch as if the credential did not exist
 // yet. Nil on the manager keeps the production schedule; an explicitly empty
-// override disables the wait but not the retries, which keeps unit tests fast
-// without changing their attempt count.
+// override disables retries entirely, so only the initial attempt runs.
 func (m *Manager) credentialPropagationDelays() []time.Duration {
 	if m.credentialRetryDelays == nil {
 		return defaultCredentialPropagationRetryDelays
@@ -2302,8 +2316,9 @@ func (m *Manager) credentialPropagationDelays() []time.Duration {
 // freshly minted credential the remote has not recognized yet. At most
 // len(delays) retries run after the initial attempt, so the default 2s/5s/10s
 // schedule means up to four attempts total; an explicitly empty schedule
-// still retries len(delays) (zero) times — callers that need fast tests
-// pass a schedule whose length matches the retries under test.
+// performs no retries — only the initial attempt runs. Callers that need
+// fast tests pass a schedule of zero delays whose length matches the
+// retries under test.
 // The first error is preserved and returned when the retries are exhausted,
 // so a credential that truly lacks access still fails with its original
 // reason. The credential itself is never logged: only the operation, attempt,

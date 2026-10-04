@@ -630,3 +630,15 @@ func (r *Runner) noticeRetryClock() interviewClock {
 	}
 	return realInterviewClock{}
 }
+
+// idleTimer arms the idle/no-progress watchdog window consumeEvents owns.
+// Production uses real time; tests substitute a manual clock via
+// Runner.idleClock so expiry is tripped explicitly instead of by sleeping
+// past a wall-clock window.
+func (r *Runner) idleTimer(d time.Duration) interviewTimer {
+	clk := interviewClock(realInterviewClock{})
+	if r.idleClock != nil {
+		clk = r.idleClock
+	}
+	return clk.NewTimer(d)
+}

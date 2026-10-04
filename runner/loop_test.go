@@ -1357,41 +1357,61 @@ func TestConsumeEvents_IdleWatchdogFires(t *testing.T) {
 }
 
 // TestConsumeEvents_IdleWatchdogResetsOnEvent verifies the watchdog
-// timer is RESET on every observed event: a stream that emits events
-// faster than the idle window, then terminates, completes normally
-// with no no-progress flag even though the total run exceeds a single
-// idle window.
+// timer is RESET on every observed event: a stream that keeps emitting
+// events, then terminates, completes normally with no no-progress flag
+// even though the total run exceeds a single idle window.
+//
+// Event delivery is sequenced through the manual clock's reset-count
+// handshake — each event is sent only after the consumer re-armed for
+// the previous one — so no sleep-versus-timeout ratio remains to lose
+// on a loaded machine.
 func TestConsumeEvents_IdleWatchdogResetsOnEvent(t *testing.T) {
 	t.Parallel()
 	r := minimalRunner(t)
-	r.idleTimeout = 60 * time.Millisecond
+	r.idleTimeout = time.Minute
+	clk := newIdleManualClock()
+	r.idleClock = clk
 
 	events := make(chan agent.Event)
 	handle := &fakeHandle{events: events}
 	wpath := t.TempDir()
 	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-2")}
 
-	// Feed several events spaced under the idle window, then terminate.
+	type consumeResult struct {
+		obs streamObservation
+		err error
+	}
+	done := make(chan consumeResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	go func() {
-		for i := 0; i < 4; i++ {
-			time.Sleep(20 * time.Millisecond)
-			events <- agent.AssistantTextEvent{Text: "progress"}
-		}
-		events <- agent.ResultEvent{Success: true}
+		enforcer := NewBudgetEnforcer(nil, time.Now())
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		done <- consumeResult{obs: obs, err: err}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	enforcer := NewBudgetEnforcer(nil, time.Now())
-
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
-	if err != nil {
-		t.Fatalf("consumeEvents: %v; want nil (terminal Result reached)", err)
+	// Feed several events, each only after the consumer re-armed for
+	// the previous one, then terminate. A stale-window fire can never
+	// slip between them because expiry only happens on clk.fire().
+	for i := 1; i <= 4; i++ {
+		events <- agent.AssistantTextEvent{Text: "progress"}
+		clk.waitForIdleResets(t, i)
 	}
-	if obs.noProgress {
+	events <- agent.ResultEvent{Success: true}
+
+	var res consumeResult
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("consumeEvents did not return after the terminal event")
+	}
+	if res.err != nil {
+		t.Fatalf("consumeEvents: %v; want nil (terminal Result reached)", res.err)
+	}
+	if res.obs.noProgress {
 		t.Fatalf("obs.noProgress = true; want false (events kept resetting the watchdog)")
 	}
-	if !obs.terminalSuccess {
+	if !res.obs.terminalSuccess {
 		t.Fatalf("obs.terminalSuccess = false; want true (ResultEvent observed)")
 	}
 }
@@ -1429,41 +1449,76 @@ func TestConsumeEvents_IdleWatchdogDisabled(t *testing.T) {
 // A 12-minute shell search (the shape that ended a healthy session) stays
 // alive while the tool runs; the tool's own bounded timeout still ends the
 // CALL with an error the agent sees.
+//
+// The expiry is driven by a manual clock, not by sleeping past a
+// wall-clock window: each fire() models one silent idle window elapsing,
+// and the reset-count handshake proves the consumer re-armed before the
+// test proceeds. No sleep-versus-timeout ratio remains to lose on a loaded
+// machine.
 func TestConsumeEvents_IdleWatchdogRearmsWhileToolCallInFlight(t *testing.T) {
 	t.Parallel()
 	r := minimalRunner(t)
-	r.idleTimeout = 30 * time.Millisecond
+	r.idleTimeout = time.Minute
+	clk := newIdleManualClock()
+	r.idleClock = clk
 
 	events := make(chan agent.Event, 4)
 	handle := &fakeHandle{events: events}
 	wpath := t.TempDir()
 	qw := QueuedWork{QueuedWork: queuedWorkBase("REN-IDLE-TOOL-1")}
 
-	// Tool call starts, then silence past one idle window, then the
-	// bounded tool timeout surfaces as a result and the turn ends.
-	events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1"}
+	type consumeResult struct {
+		obs streamObservation
+		err error
+	}
+	done := make(chan consumeResult, 1)
+	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	defer cancel()
 	go func() {
-		time.Sleep(80 * time.Millisecond)
-		events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "Command timed out after 300 seconds", IsError: true}
-		events <- agent.ResultEvent{Success: true}
+		enforcer := NewBudgetEnforcer(nil, time.Now())
+		obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
+		done <- consumeResult{obs: obs, err: err}
 	}()
 
-	ctx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
-	defer cancel()
-	enforcer := NewBudgetEnforcer(nil, time.Now())
+	// The ToolUseEvent is observed synchronously by the consumer before
+	// the first reset, so waiting for reset 1 proves the consumer saw
+	// the call start.
+	events <- agent.ToolUseEvent{ToolName: "bash", ToolUseID: "call-1"}
+	clk.waitForIdleResets(t, 1)
 
-	obs, err := r.consumeEvents(ctx, handle, wpath, qw, nil, enforcer, noopSink{}, nil)
-	if err != nil {
-		t.Fatalf("consumeEvents: %v; want nil (in-flight tool must suppress the watchdog)", err)
+	// Two silent idle windows elapse while the call runs; each must
+	// re-arm (reset count grows) instead of ending the session.
+	clk.fire()
+	clk.waitForIdleResets(t, 2)
+	clk.fire()
+	clk.waitForIdleResets(t, 3)
+	select {
+	case res := <-done:
+		t.Fatalf("consumeEvents returned early: err = %v, noProgress = %v; want the running call to keep the stream alive", res.err, res.obs.noProgress)
+	default:
 	}
-	if obs.noProgress {
+
+	// The bounded tool timeout surfaces as a result and the turn ends.
+	events <- agent.ToolResultEvent{ToolName: "bash", ToolUseID: "call-1", Content: "Command timed out after 300 seconds", IsError: true}
+	events <- agent.ResultEvent{Success: true}
+
+	var res consumeResult
+	select {
+	case res = <-done:
+	case <-time.After(10 * time.Second):
+		t.Fatal("consumeEvents did not return after the tool result and terminal event")
+	}
+	if res.err != nil {
+		t.Fatalf("consumeEvents: %v; want nil (in-flight tool must suppress the watchdog)", res.err)
+	}
+	if res.obs.noProgress {
 		t.Fatalf("obs.noProgress = true; want false (in-flight tool call is progress)")
 	}
-	if !obs.terminalSuccess {
+	if !res.obs.terminalSuccess {
 		t.Fatalf("obs.terminalSuccess = false; want true (turn completed after the tool result)")
 	}
-	if obs.toolCalls != 1 {
-		t.Fatalf("obs.toolCalls = %d; want 1", obs.toolCalls)
+	if res.obs.toolCalls != 1 {
+		t.Fatalf("obs.toolCalls = %d; want 1", res.obs.toolCalls)
 	}
 }
 

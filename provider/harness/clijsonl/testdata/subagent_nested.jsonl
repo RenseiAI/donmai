@@ -1,0 +1,4 @@
+{"type":"assistant","session_id":"sess-nested-1","message":{"model":"claude-opus-4-7","id":"msg_parent","role":"assistant","content":[{"type":"tool_use","id":"toolu_parent","name":"Task","input":{"subagent_type":"Explore","description":"search"}}]}}
+{"type":"assistant","session_id":"sess-nested-1","parent_tool_use_id":"toolu_parent","message":{"model":"claude-opus-4-7","id":"msg_child_text","role":"assistant","content":[{"type":"text","text":"searching the tree"}]}}
+{"type":"assistant","session_id":"sess-nested-1","parent_tool_use_id":"toolu_parent","message":{"model":"claude-opus-4-7","id":"msg_child_tool","role":"assistant","content":[{"type":"tool_use","id":"toolu_child","name":"Read","input":{"file_path":"main.go"}}]}}
+{"type":"user","session_id":"sess-nested-1","parent_tool_use_id":"toolu_parent","message":{"role":"user","content":[{"type":"tool_result","tool_use_id":"toolu_child","content":"package main","is_error":false}]}}

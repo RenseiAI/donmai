@@ -408,17 +408,23 @@ type InterviewBudget struct {
 // StageBudget mirrors the platform's StageBudget type from
 // src/lib/workflow/stages/index.ts. The runner enforces these caps via
 // runner.BudgetEnforcer; see runner/budget.go for the cap-breach
-// semantics. A field with value 0 is treated as "no cap" so partial
-// budgets degrade gracefully.
+// semantics. MaxDurationSeconds and MaxTokens treat a field value of 0
+// as "no cap" so partial budgets degrade gracefully. MaxSubAgents is
+// the exception: it is a pointer so an absent cap (nil, the field
+// omitted on the wire) stays "not enforced" while an explicit 0
+// means "no sub-agents allowed".
 type StageBudget struct {
 	// MaxDurationSeconds is the wall-clock cap on the stage instance.
 	// 0 = no cap.
 	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
 
-	// MaxSubAgents is the cap on Task tool invocations the agent may
-	// spawn over the life of the stage. 0 = no cap. Sub-agents
-	// counted: every ToolUseEvent whose ToolName is "Task".
-	MaxSubAgents int `json:"maxSubAgents,omitempty"`
+	// MaxSubAgents is the cap on sub-agent tool invocations the agent
+	// may spawn over the life of the stage. nil (absent) = no cap;
+	// an explicit 0 means no sub-agents are allowed — the first
+	// counted call breaches. Sub-agents counted: every ToolUseEvent
+	// whose ToolName is a sub-agent delegation tool ("Task" or
+	// "Agent", case-insensitive, MCP-suffixed forms included).
+	MaxSubAgents *int `json:"maxSubAgents,omitempty"`
 
 	// MaxTokens is the cap on total token consumption (input + output
 	// across all turns, summed from per-turn ResultEvent.Cost or the

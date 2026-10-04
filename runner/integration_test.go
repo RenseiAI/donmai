@@ -240,7 +240,7 @@ func TestIntegration_StagePromptHappyPath(t *testing.T) {
 			StageID:         "development",
 			StageBudget: &prompt.StageBudget{
 				MaxDurationSeconds: 600,
-				MaxSubAgents:       10,
+				MaxSubAgents:       integrationSubAgentCap(10),
 				MaxTokens:          100_000,
 			},
 			StageSourceEventID: "evt-stage-1",
@@ -334,7 +334,7 @@ func TestIntegration_BudgetExceeded_SubAgentCap(t *testing.T) {
 			StagePrompt:     "Run development.",
 			StageID:         "development",
 			StageBudget: &prompt.StageBudget{
-				MaxSubAgents: 2,
+				MaxSubAgents: integrationSubAgentCap(2),
 			},
 		},
 		WorkerID:    "budget-worker",
@@ -368,6 +368,10 @@ func TestIntegration_BudgetExceeded_SubAgentCap(t *testing.T) {
 		t.Fatalf("expected ObservedSubAgents>=3, got %d", res.BudgetReport.ObservedSubAgents)
 	}
 }
+
+// integrationSubAgentCap returns a pointer to n for
+// StageBudget.MaxSubAgents literals in tests.
+func integrationSubAgentCap(n int) *int { return &n }
 
 // taskSpammingProvider is a minimal in-test agent.Provider that emits
 // repeated Task ToolUseEvents to drive the budget enforcer past its
