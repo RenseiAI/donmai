@@ -234,6 +234,12 @@ func TestSnapshot_UserQA(t *testing.T) {
 		"WORK_RESULT:passed",
 		"WORK_RESULT:failed",
 		"WORK_RESULT:blocked",
+		// The review verdict instruction MUST be present so QA turns are
+		// told to emit a REVIEW_VERDICT line and carry the same outcome
+		// as the manifest reviewVerdict field; without it review sessions
+		// rely on continuation to get a verdict.
+		"REVIEW_VERDICT:",
+		"reviewVerdict",
 	}
 	for _, s := range mustContain {
 		if !strings.Contains(raymondOut, s) {
