@@ -413,3 +413,274 @@ func TestFailedInstallAfterAnAcceptedDeclarationWithdrawsItExactlyOnce(t *testin
 		})
 	}
 }
+
+// TestRefusedFoundingDeclarationLetsAnotherCompositionFound is the retry
+// contract: when the platform refuses one founder's declaring refresh, the
+// install rolls back to stand-down with a retryable founding refusal — never
+// the batch refusal — and a later install with another composed configuration
+// founds the composition. An accepted composition still refuses a second
+// install.
+func TestRefusedFoundingDeclarationLetsAnotherCompositionFound(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForController(first.ControllerID)
+	firstErr := h.daemon.InstallSessionShimComposition(ctx, first)
+	var refused *SessionShimFoundingRefused
+	if !errors.As(firstErr, &refused) {
+		t.Fatalf("refused founding install error = %v, want it classified as a founding refusal", firstErr)
+	}
+	var batchRefused *SessionShimDurabilityRefused
+	if errors.As(firstErr, &batchRefused) {
+		t.Fatalf("refused founding install error = %v, want no batch refusal", firstErr)
+	}
+	if refused.Scope != h.orgID {
+		t.Fatalf("refused scope = %q, want %q", refused.Scope, h.orgID)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.StandsDown() {
+		t.Fatalf("attestation after a refused founding = %#v, want the stand-down", got)
+	}
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after a refused founding = %q, want %q", state, StateRunning)
+	}
+	retained := h.daemon.SessionShimDurabilityRefusal()
+	if retained == nil || retained.Scope != h.orgID || retained.Reason == "" {
+		t.Fatalf("retained refusal = %+v, want the scope and a reason", retained)
+	}
+
+	second := h.composedConfig(acceptingBatch)
+	second.ControllerID = "controller-second-founder"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err != nil {
+		t.Fatalf("a refused founder blocked a later healthy founder: %v", err)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the second install = %#v, want the composed attestation", got)
+	}
+	if h.daemon.SessionShimDiagnostics().DurabilityRefusal != nil {
+		t.Fatal("host status still reports a refusal the daemon has since recovered from")
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the second install never reached a projected heartbeat")
+	}
+
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err == nil {
+		t.Fatal("a second install over an accepted composition was accepted")
+	}
+}
+
+// TestFoundingRefusalClassifierIsDefiniteOnlyForHeardAndAnsweredClientErrors
+// is the negative side: every status that is not a heard-and-answered
+// client error keeps its ordinary error — including the republishable 409
+// revision-stale conflict and 400 projection rejection the heartbeat path
+// recovers from by republishing, which must never classify as a founding
+// refusal even on the founding round trip itself.
+func TestFoundingRefusalClassifierIsDefiniteOnlyForHeardAndAnsweredClientErrors(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		err      error
+		definite bool
+	}{
+		{name: "bad request", err: &refreshHTTPError{status: 400, body: "bad"}, definite: true},
+		{name: "forbidden", err: &refreshHTTPError{status: 403, body: "no"}, definite: true},
+		{name: "plain conflict", err: &refreshHTTPError{status: 409, body: "conflict"}, definite: true},
+		{name: "unprocessable", err: &refreshHTTPError{status: 422, body: "no"}, definite: true},
+		{name: "heartbeat forbidden", err: &heartbeatHTTPError{status: 403, body: "no"}, definite: true},
+		{name: "heartbeat plain conflict", err: &heartbeatHTTPError{status: 409, body: "conflict"}, definite: true},
+		{
+			name: "heartbeat revision-stale conflict republishes, never refuses",
+			err:  &heartbeatHTTPError{status: 409, body: `{"error":"SESSION_SHIM_ADOPTION_REVISION_STALE"}`},
+		},
+		{
+			name: "declaring refresh carrying the stale code is behind, not refused",
+			err:  &refreshHTTPError{status: 409, body: "SESSION_SHIM_ADOPTION_REVISION_STALE"},
+		},
+		{
+			name: "heartbeat projection rejection republishes, never refuses",
+			err:  &heartbeatHTTPError{status: 400, body: "unknown sessionshim projection"},
+		},
+		{name: "unauthorized stays ordinary", err: &refreshHTTPError{status: 401, body: "expired"}},
+		{name: "not found stays ordinary", err: &refreshHTTPError{status: 404, body: "gone"}},
+		{name: "server error stays ordinary", err: &refreshHTTPError{status: 503, body: "down"}},
+		{name: "heartbeat server error stays ordinary", err: &heartbeatHTTPError{status: 500, body: "down"}},
+		{name: "opaque error stays ordinary", err: errors.New("boom")},
+		{name: "no error", err: nil},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := sessionShimFoundingRefusalIsDefinite(tc.err); got != tc.definite {
+				t.Fatalf("sessionShimFoundingRefusalIsDefinite(%v) = %v, want %v", tc.err, got, tc.definite)
+			}
+			refused := newSessionShimFoundingRefused("scope", tc.err)
+			if (refused != nil) != tc.definite {
+				t.Fatalf("newSessionShimFoundingRefused(%v) classified = %v, want %v", tc.err, refused != nil, tc.definite)
+			}
+		})
+	}
+}
+
+// TestRevisionStaleFirstHeartbeatRepublishesInsteadOfRefusing drives the real
+// install through a fake platform whose first heartbeat answers with the
+// closed revision-stale 409. The install must NOT classify it as a founding
+// refusal — that answer is recovered by republishing, so the error stays
+// ordinary and retryable by the heartbeat path rather than by founding again.
+func TestRevisionStaleFirstHeartbeatRepublishesInsteadOfRefusing(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	h.setHeartbeatRequireRevision("revision-never-presented")
+	first := h.composedConfig(acceptingBatch)
+	firstErr := h.daemon.InstallSessionShimComposition(ctx, first)
+	if firstErr == nil {
+		t.Fatal("install over a stale first heartbeat succeeded")
+	}
+	var founding *SessionShimFoundingRefused
+	if errors.As(firstErr, &founding) {
+		t.Fatalf("revision-stale first heartbeat = %v, want no founding refusal", firstErr)
+	}
+	if !isSessionShimReconciliationRequired(firstErr) {
+		t.Fatalf("revision-stale first heartbeat = %v, want the republishable answer", firstErr)
+	}
+}
+
+// TestFoundingRetryLoopFoundsWithAnotherHealthyFounder drives the real retry
+// entry point: the first founder is refused and the loop founds the
+// composition with the next healthy founder, backing off between attempts —
+// with no sleeps in the test. Durable sessions come up for the second
+// founder. With no other founder listed, the loop retries the same
+// configuration with backoff instead of staying off until restart.
+func TestFoundingRetryLoopFoundsWithAnotherHealthyFounder(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForController(first.ControllerID)
+	second := h.composedConfig(acceptingBatch)
+	second.ControllerID = "controller-second-founder"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	var waits []time.Duration
+	policy := SessionShimFoundingRetryPolicy{
+		Configs:        []SessionShimConfig{second},
+		MaxAttempts:    2,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		},
+	}
+	if err := h.daemon.InstallSessionShimCompositionRetrying(ctx, first, policy); err != nil {
+		t.Fatalf("retrying install with a healthy second founder: %v", err)
+	}
+	if len(waits) != 1 {
+		t.Fatalf("backoff waits = %v, want exactly one between the two founders", waits)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the retrying install = %#v, want the composed attestation", got)
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the retrying install never reached a projected heartbeat")
+	}
+
+	// A founder that recovers later does not create a second composition.
+	if err := h.daemon.InstallSessionShimComposition(ctx, first); err == nil {
+		t.Fatal("an install over an accepted composition was accepted")
+	}
+}
+
+// TestFoundingRetryLoopRetriesTheSameFounderWithBackoff is the no-other-founder
+// half: with no further configuration listed, the loop retries the same
+// founder with doubling backoff instead of staying off until restart, and
+// gives up with the founding refusal after its attempt budget is spent.
+func TestFoundingRetryLoopRetriesTheSameFounderWithBackoff(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	first := h.composedConfig(acceptingBatch)
+	h.setRefuseRefreshForController(first.ControllerID)
+	var waits []time.Duration
+	policy := SessionShimFoundingRetryPolicy{
+		MaxAttempts:    3,
+		InitialBackoff: time.Millisecond,
+		MaxBackoff:     2 * time.Millisecond,
+		Sleep: func(_ context.Context, d time.Duration) error {
+			waits = append(waits, d)
+			return nil
+		},
+	}
+	err := h.daemon.InstallSessionShimCompositionRetrying(ctx, first, policy)
+	var refused *SessionShimFoundingRefused
+	if !errors.As(err, &refused) {
+		t.Fatalf("exhausted retrying install error = %v, want the founding refusal", err)
+	}
+	if len(waits) != 2 || waits[0] != time.Millisecond || waits[1] != 2*time.Millisecond {
+		t.Fatalf("backoff waits = %v, want the doubling 1ms then 2ms", waits)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.StandsDown() {
+		t.Fatalf("attestation after the exhausted retrying install = %#v, want the stand-down", got)
+	}
+}
+
+// TestRefusedFirstHeartbeatLetsAnotherCompositionFound is the same retry
+// contract for the other founding leg: when the platform refuses one
+// founder's first projected heartbeat, the install rolls back to stand-down
+// with a retryable founding refusal, and a later install with another
+// composed configuration founds the composition.
+func TestRefusedFirstHeartbeatLetsAnotherCompositionFound(t *testing.T) {
+	h := newCompositionHarness(t)
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	h.start(ctx)
+
+	h.setRefuseFirstProjectedHeartbeat(true)
+	first := h.composedConfig(acceptingBatch)
+	firstErr := h.daemon.InstallSessionShimComposition(ctx, first)
+	var refused *SessionShimFoundingRefused
+	if !errors.As(firstErr, &refused) {
+		t.Fatalf("refused first-heartbeat install error = %v, want it classified as a founding refusal", firstErr)
+	}
+	var batchRefused *SessionShimDurabilityRefused
+	if errors.As(firstErr, &batchRefused) {
+		t.Fatalf("refused first-heartbeat install error = %v, want no batch refusal", firstErr)
+	}
+	if refused.Scope != h.orgID {
+		t.Fatalf("refused scope = %q, want %q", refused.Scope, h.orgID)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.StandsDown() {
+		t.Fatalf("attestation after a refused first heartbeat = %#v, want the stand-down", got)
+	}
+	if state := h.daemon.State(); state != StateRunning {
+		t.Fatalf("daemon state after a refused first heartbeat = %q, want %q", state, StateRunning)
+	}
+	retained := h.daemon.SessionShimDurabilityRefusal()
+	if retained == nil || retained.Scope != h.orgID || retained.Reason == "" {
+		t.Fatalf("retained refusal = %+v, want the scope and a reason", retained)
+	}
+
+	second := h.composedConfig(acceptingBatch)
+	second.ControllerID = "controller-second-founder"
+	second.AttestationCapabilities = append([]string(nil), first.AttestationCapabilities...)
+	if err := h.daemon.InstallSessionShimComposition(ctx, second); err != nil {
+		t.Fatalf("a refused first heartbeat blocked a later healthy founder: %v", err)
+	}
+	if got := h.daemon.SessionShimHostAttestation(); !got.Supports() {
+		t.Fatalf("attestation after the second install = %#v, want the composed attestation", got)
+	}
+	if h.daemon.SessionShimDiagnostics().DurabilityRefusal != nil {
+		t.Fatal("host status still reports a refusal the daemon has since recovered from")
+	}
+	beat, ok := h.lastHeartbeat()
+	if !ok || beat.SessionShim == nil {
+		t.Fatal("the second install never reached a projected heartbeat")
+	}
+}
