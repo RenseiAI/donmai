@@ -95,33 +95,68 @@ func TestInteractiveArgs_EffortMatchesHeadless(t *testing.T) {
 	}
 }
 
-// TestSpawn_Interactive_FixesEffortEnv drives Spawn end to end through the PTY
-// lane with a fake claude that records CLAUDE_CODE_EFFORT_LEVEL and its argv:
-// the configured effort reaches the child's environment and flag, and an
-// unconfigured session runs with "auto" (the model default) and no flag.
-func TestSpawn_Interactive_FixesEffortEnv(t *testing.T) {
+// TestForceEffortEnv pins the stamped-headless gate: only a session carrying
+// an execution-security stamp that is not interactive gets the forced effort
+// environment variable. Interactive sessions are stamped too, so the stamp
+// alone is not enough — the operator keeps their own effort control there.
+func TestForceEffortEnv(t *testing.T) {
 	t.Parallel()
+	stamped := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+	cases := []struct {
+		name string
+		spec agent.Spec
+		want bool
+	}{
+		{name: "stamped headless forces", spec: agent.Spec{ExecutionSecurity: stamped}, want: true},
+		{name: "stamped interactive does not force", spec: agent.Spec{ExecutionSecurity: stamped, Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24}}, want: false},
+		{name: "unstamped standalone does not force", spec: agent.Spec{}, want: false},
+		{name: "unstamped interactive does not force", spec: agent.Spec{Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24}}, want: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := forceEffortEnv(tc.spec); got != tc.want {
+				t.Errorf("forceEffortEnv(%+v) = %t, want %t", tc.spec, got, tc.want)
+			}
+		})
+	}
+}
+
+// TestSpawn_Interactive_DoesNotForceEffortEnv drives Spawn end to end through
+// the PTY lane with a fake claude that records its argv and whether
+// CLAUDE_CODE_EFFORT_LEVEL is set at all: a stamped interactive session keeps
+// the --effort flag when a level is known, but the environment variable is
+// never forced — neither to the configured level nor to "auto". Restoring
+// the unconditional withEffortEnv call in Spawn turns this red.
+func TestSpawn_Interactive_DoesNotForceEffortEnv(t *testing.T) {
+	t.Parallel()
+	stamped := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
 	cases := []struct {
 		effort   agent.EffortLevel
-		wantEnv  string
 		wantFlag bool
+		wantVal  string
 	}{
-		{effort: agent.EffortMax, wantEnv: "max", wantFlag: true},
-		{effort: "", wantEnv: "auto"},
+		{effort: agent.EffortMax, wantFlag: true, wantVal: "max"},
+		{effort: ""},
 	}
 	for _, tc := range cases {
 		t.Run("effort="+string(tc.effort), func(t *testing.T) {
 			t.Parallel()
 			workdir := t.TempDir()
 			p := newFakeInteractiveProvider(t, `
-printf '%s' "$CLAUDE_CODE_EFFORT_LEVEL" > "$PWD/effort-env"
+if [ -z "${CLAUDE_CODE_EFFORT_LEVEL+x}" ]; then
+  printf 'unset' > "$PWD/effort-env"
+else
+  printf 'set:%s' "$CLAUDE_CODE_EFFORT_LEVEL" > "$PWD/effort-env"
+fi
 printf '%s\n' "$@" > "$PWD/argv"
 `)
 			h, err := p.Spawn(context.Background(), agent.Spec{
-				Prompt:      "hello",
-				Cwd:         workdir,
-				Effort:      tc.effort,
-				Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+				Prompt:            "hello",
+				Cwd:               workdir,
+				Effort:            tc.effort,
+				ExecutionSecurity: stamped,
+				Interactive:       &agent.InteractiveSpec{Cols: 80, Rows: 24},
 			})
 			if err != nil {
 				t.Fatalf("Spawn: %v", err)
@@ -131,14 +166,87 @@ printf '%s\n' "$@" > "$PWD/argv"
 			if err != nil {
 				t.Fatalf("read recorded effort env: %v", err)
 			}
-			if string(gotEnv) != tc.wantEnv {
-				t.Errorf("child %s = %q, want %q", effortEnvVar, gotEnv, tc.wantEnv)
+			if string(gotEnv) != "unset" {
+				t.Errorf("child %s = %q, want unset (never forced on interactive sessions)", effortEnvVar, gotEnv)
 			}
 			argv, err := os.ReadFile(filepath.Join(workdir, "argv"))
 			if err != nil {
 				t.Fatalf("read recorded argv: %v", err)
 			}
-			hasFlag := slices.Contains(strings.Split(string(argv), "\n"), "--effort")
+			argvLines := strings.Split(string(argv), "\n")
+			hasFlag := slices.Contains(argvLines, "--effort")
+			if hasFlag != tc.wantFlag {
+				t.Errorf("child argv --effort present=%t, want %t: %q", hasFlag, tc.wantFlag, argv)
+			}
+			if tc.wantFlag {
+				i := slices.Index(argvLines, "--effort")
+				if i+1 >= len(argvLines) || argvLines[i+1] != tc.wantVal {
+					t.Errorf("child argv --effort value = %q, want %q: %q", argvLines[i+1], tc.wantVal, argv)
+				}
+			}
+		})
+	}
+}
+
+// TestSpawn_Headless_ForcesEffortEnvWhenStamped drives Spawn end to end
+// through the headless lane with a fake CLI that records whether
+// CLAUDE_CODE_EFFORT_LEVEL is set: a stamped headless spawn carries the
+// variable (the configured level, or "auto" when none is configured),
+// while an unstamped standalone spawn leaves it unset so the operator's own
+// effort control stands. Restoring the unconditional withEffortEnv call in
+// Spawn turns the unstamped case red.
+func TestSpawn_Headless_ForcesEffortEnvWhenStamped(t *testing.T) {
+	t.Parallel()
+	stamped := &agent.ExecutionSecurity{Version: 1, Levels: agent.IndexZeroExecutionSecurityLevels()}
+	cases := []struct {
+		name     string
+		spec     agent.Spec
+		wantEff  string // "unset", or the exact forced value
+		wantFlag bool
+	}{
+		{name: "stamped headless with effort", spec: agent.Spec{Prompt: "hello", Effort: agent.EffortMax, ExecutionSecurity: stamped}, wantEff: "max", wantFlag: true},
+		{name: "stamped headless without effort", spec: agent.Spec{Prompt: "hello", ExecutionSecurity: stamped}, wantEff: "auto"},
+		{name: "unstamped standalone with effort", spec: agent.Spec{Prompt: "hello", Effort: agent.EffortMax}, wantEff: "unset", wantFlag: true},
+		{name: "unstamped standalone without effort", spec: agent.Spec{Prompt: "hello"}, wantEff: "unset"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			dir := t.TempDir()
+			cli := writeFakeCLI(t, "fake-claude-effort.sh",
+				"#!/bin/sh\n"+
+					"if [ -z \"${CLAUDE_CODE_EFFORT_LEVEL+x}\" ]; then\n"+
+					"  printf 'unset' > "+shQuote(filepath.Join(dir, "effort-env"))+"\n"+
+					"else\n"+
+					"  printf 'set:%s' \"$CLAUDE_CODE_EFFORT_LEVEL\" > "+shQuote(filepath.Join(dir, "effort-env"))+"\n"+
+					"fi\n"+
+					"printf '%s\\n' \"$@\" > "+shQuote(filepath.Join(dir, "argv"))+"\n"+
+					`printf '{"type":"system","subtype":"init","session_id":"sess-effort-1"}\n'`+"\n"+
+					`printf '{"type":"result","subtype":"success","is_error":false,"num_turns":1}\n'`+"\n")
+			p, err := New(Options{Binary: cli, LookPath: func(name string) (string, error) { return name, nil }})
+			if err != nil {
+				t.Fatalf("New: %v", err)
+			}
+			tc.spec.Cwd = dir
+			h, err := p.Spawn(t.Context(), tc.spec)
+			if err != nil {
+				t.Fatalf("Spawn: %v", err)
+			}
+			t.Cleanup(func() { _ = h.Stop(t.Context()) })
+			_ = drainAllWithIdle(t, h.Events(), 5*time.Second, 45*time.Second)
+			gotEnv, err := os.ReadFile(filepath.Join(dir, "effort-env"))
+			if err != nil {
+				t.Fatalf("read recorded effort env: %v", err)
+			}
+			want := tc.wantEff
+			if want != "unset" {
+				want = "set:" + want
+			}
+			if string(gotEnv) != want {
+				t.Errorf("child %s = %q, want %q", effortEnvVar, gotEnv, want)
+			}
+			argv := readLines(t, filepath.Join(dir, "argv"))
+			hasFlag := slices.Contains(argv, "--effort")
 			if hasFlag != tc.wantFlag {
 				t.Errorf("child argv --effort present=%t, want %t: %q", hasFlag, tc.wantFlag, argv)
 			}
@@ -161,23 +269,48 @@ func waitForExit(t *testing.T, h agent.Handle) {
 	}
 }
 
-// TestOneShotEnv_FixesEffort pins the one-shot lane to the same rule: the
-// request's effort, or the model default when it carries none, with or
-// without a bound endpoint.
-func TestOneShotEnv_FixesEffort(t *testing.T) {
+// TestOneShotEnv_NeverForcesEffort pins the one-shot lane's rule: one-shot
+// calls carry no execution-security stamp, so the effort environment variable
+// is never forced — with or without a bound endpoint. The request's --effort
+// flag (see buildOneShotArgs) is the only effort signal. Restoring the
+// withEffortEnv call in oneShotEnv turns this red.
+func TestOneShotEnv_NeverForcesEffort(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
 		name string
 		req  agent.OneShotRequest
-		want string
 	}{
-		{name: "no endpoint, no effort", req: agent.OneShotRequest{}, want: "auto"},
-		{name: "no endpoint, max", req: agent.OneShotRequest{Effort: agent.EffortMax}, want: "max"},
-		{name: "direct endpoint, xhigh", req: agent.OneShotRequest{Effort: agent.EffortXHigh, Endpoint: &agent.EndpointBinding{Host: agent.HostDirect}}, want: "xhigh"},
+		{name: "no endpoint, no effort", req: agent.OneShotRequest{}},
+		{name: "no endpoint, max", req: agent.OneShotRequest{Effort: agent.EffortMax}},
+		{name: "direct endpoint, xhigh", req: agent.OneShotRequest{Effort: agent.EffortXHigh, Endpoint: &agent.EndpointBinding{Host: agent.HostDirect}}},
 	}
 	for _, tc := range cases {
-		if got := oneShotEnv(tc.req)[effortEnvVar]; got != tc.want {
-			t.Errorf("%s: oneShotEnv %s = %q, want %q", tc.name, effortEnvVar, got, tc.want)
-		}
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if _, forced := oneShotEnv(tc.req)[effortEnvVar]; forced {
+				t.Errorf("%s: oneShotEnv forces %s, want unset (one-shot calls carry no stamp)", tc.name, effortEnvVar)
+			}
+		})
+	}
+}
+
+// TestOneShotEnv_ProjectsEndpointWithoutEffort pins that dropping the forced
+// variable did not drop the endpoint projection: a bound endpoint still
+// contributes its serving-host env, just without the effort variable.
+func TestOneShotEnv_ProjectsEndpointWithoutEffort(t *testing.T) {
+	t.Parallel()
+	env := oneShotEnv(agent.OneShotRequest{
+		Endpoint: &agent.EndpointBinding{
+			Company: agent.CompanyAnthropic,
+			Host:    agent.HostBedrock,
+			Region:  "us-east-1",
+			Env:     map[string]string{"AWS_ACCESS_KEY_ID": "AKIATEST"},
+		},
+	})
+	if _, forced := env[effortEnvVar]; forced {
+		t.Errorf("oneShotEnv forces %s, want unset", effortEnvVar)
+	}
+	if env[EnvUseBedrock] != "1" {
+		t.Errorf("oneShotEnv lost the bedrock projection: %v", env)
 	}
 }
