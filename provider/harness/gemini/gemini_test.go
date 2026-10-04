@@ -10,6 +10,7 @@ import (
 	"strings"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -509,11 +510,21 @@ func TestProvider_Spawn_NoKeyResolvable(t *testing.T) {
 
 func TestHandle_Stop_ClosesChannel(t *testing.T) {
 	t.Parallel()
-	// Slow server that blocks until ctx cancel — Stop must unblock.
+	// Slow server that parks the request until the client goes away.
+	// The release backstop plus CloseClientConnections keep teardown
+	// bounded even if request-context cancellation never tears down the
+	// connection: httptest Close waits for active handlers, so a parked
+	// handler would otherwise hang the suite to the package timeout.
+	release := make(chan struct{})
 	srv := httptest.NewServer(http.HandlerFunc(func(_ http.ResponseWriter, r *http.Request) {
-		<-r.Context().Done()
+		select {
+		case <-r.Context().Done():
+		case <-release:
+		}
 	}))
 	defer srv.Close()
+	defer srv.CloseClientConnections()
+	defer close(release)
 
 	p := mustNew(t, srv.URL)
 	h, err := p.Spawn(context.Background(), agent.Spec{Prompt: "hi"})
@@ -521,11 +532,33 @@ func TestHandle_Stop_ClosesChannel(t *testing.T) {
 		t.Fatalf("Spawn: %v", err)
 	}
 	<-h.Events() // InitEvent
-	if err := h.Stop(context.Background()); err != nil {
-		t.Fatalf("Stop: %v", err)
+
+	// Stop must return promptly even though no turn ever ran.
+	stopDone := make(chan error, 1)
+	go func() { stopDone <- h.Stop(context.Background()) }()
+	select {
+	case err := <-stopDone:
+		if err != nil {
+			t.Fatalf("Stop: %v", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatalf("Stop did not return within 10s with no turn run")
 	}
-	//nolint:revive // draining to verify close
-	for range h.Events() {
+
+	// The driver must exit and close the events channel. Bounded: a
+	// regressed Stop that never unblocks the driver fails here within
+	// the test's own deadline instead of hanging the suite.
+	drainDone := make(chan struct{})
+	go func() {
+		defer close(drainDone)
+		//nolint:revive // draining to verify close
+		for range h.Events() {
+		}
+	}()
+	select {
+	case <-drainDone:
+	case <-time.After(30 * time.Second):
+		t.Fatalf("events channel did not close within 30s after Stop")
 	}
 }
 
