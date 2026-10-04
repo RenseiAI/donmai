@@ -317,6 +317,12 @@ type statusRequest struct {
 	// rejected" from "server error". Additive; omitted on every run
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
+
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -532,6 +538,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
+		ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

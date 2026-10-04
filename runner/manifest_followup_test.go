@@ -58,6 +58,12 @@ type verdictScriptTurn struct {
 	// of these refs on origin (e.g. a branch and refs/pull/<n>/head), as an
 	// agent that pushes to its pull request does.
 	push []string
+	// hang leaves the turn open after its events: no terminal event, and
+	// the stream stays open, as a wedged harness does.
+	hang bool
+	// before, when set, runs before the turn plays (inside the Inject that
+	// starts it), so a test can hold the turn until a condition holds.
+	before func()
 	// during runs after the turn's files and push, before its events: the
 	// world changing while the agent works (e.g. someone else pushing to
 	// the session's branch). It receives the session worktree.
@@ -139,6 +145,9 @@ func (h *verdictScriptHandle) play() {
 func (h *verdictScriptHandle) playLocked() {
 	turn := h.turns[h.next]
 	h.next++
+	if turn.before != nil {
+		turn.before()
+	}
 	if turn.manifest != "" {
 		dir := filepath.Join(h.cwd, state.AgentDirName)
 		if err := os.MkdirAll(dir, 0o750); err != nil {
@@ -193,6 +202,9 @@ func (h *verdictScriptHandle) playLocked() {
 		h.events <- agent.ErrorEvent{Message: "provider crashed mid turn"}
 		h.closed = true
 		close(h.events)
+		return
+	}
+	if turn.hang {
 		return
 	}
 	h.events <- agent.ResultEvent{Success: true, Message: turn.text, Cost: turn.cost}
@@ -323,6 +335,10 @@ type scriptedSession struct {
 	// continuationUndeliveredLimit is
 	// Options.TurnContinuationUndeliveredLimit (0 = default).
 	continuationUndeliveredLimit int
+	// idleTimeout is Options.IdleTimeout (0 = default).
+	idleTimeout time.Duration
+	// heartbeatInterval is Options.HeartbeatInterval (0 = default).
+	heartbeatInterval time.Duration
 	// declaration, when non-nil, provisions the session through the
 	// session-root-v1 workarea protocol with that repository declaration;
 	// the session's legacy Repository is cleared so the primary source
@@ -378,6 +394,8 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 		o.TurnContinuationLimit = cfg.continuationLimit
 		o.TurnContinuationCeiling = cfg.continuationCeiling
 		o.TurnContinuationUndeliveredLimit = cfg.continuationUndeliveredLimit
+		o.IdleTimeout = cfg.idleTimeout
+		o.HeartbeatInterval = cfg.heartbeatInterval
 	})
 	r.stepHeartbeatInterval = cfg.stepHeartbeatInterval
 	r.skipSteering = cfg.skipSteering

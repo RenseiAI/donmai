@@ -2121,7 +2121,10 @@ func (r *Runner) drainMemoryInjects(
 				return merged
 			}
 			// Re-consume the resume turn's events so the follow-up work
-			// (commit/PR/cost) is observed + mirrored.
+			// (commit/PR/cost) is observed + mirrored. Each turn is applied
+			// as it ends so an earlier turn's pull request, verdict or error
+			// still reaches the envelope when a later turn carries none;
+			// consumeEvents already counted the turn's tool calls.
 			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
 			injRes.applyTo(res, res.ProviderName)
 			merged = injRes
@@ -2249,6 +2252,8 @@ func (o streamObservation) verdict() string {
 
 // applyTo merges the observation into a Result envelope. Idempotent
 // when called multiple times (e.g. after steering re-consumes events).
+// The session's tool-call count is not applied here: consumeEvents meters
+// it onto the envelope for every stream, on every exit path.
 func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName) {
 	if res.ProviderName == "" {
 		res.ProviderName = providerName
@@ -2322,12 +2327,17 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 // boundary (atTurnBoundary), returning the *BudgetExceededError. Past the
 // wrap-up point, on a harness that takes a message into a running turn, the
 // agent is asked to wrap up at its next tool call (wrapUpMidTurn).
+//
+// The stream's tool calls are added to res.ToolCalls (res may be nil) on
+// every return: each stream counts exactly once, including a turn the
+// caller stops on (no progress, timeout, lost ownership, cancel) before
+// applying its observation.
 func (r *Runner) consumeEvents(
 	ctx context.Context,
 	handle agent.Handle,
 	worktreePath string,
 	qw QueuedWork,
-	_ *Result,
+	res *Result,
 	enforcer *BudgetEnforcer,
 	sink activitySink,
 	traceProcessor spanEventProcessor,
@@ -2339,6 +2349,9 @@ func (r *Runner) consumeEvents(
 		traceProcessor = noopSpanProcessor{}
 	}
 	obs := streamObservation{}
+	if res != nil {
+		defer func() { res.ToolCalls += obs.toolCalls }()
+	}
 
 	// Open the events.jsonl audit file under <worktree>/.agent/.
 	jsonlPath := filepath.Join(worktreePath, state.AgentDirName, "events.jsonl")

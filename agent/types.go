@@ -757,6 +757,12 @@ type Result struct {
 	// Additive — old platforms ignore it.
 	ReviewVerdict string `json:"reviewVerdict,omitempty"`
 
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
+
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
 

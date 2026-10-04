@@ -1277,6 +1277,53 @@ func TestPosterPost_StatusReviewVerdictSerialized(t *testing.T) {
 	}
 }
 
+// TestPosterPost_StatusToolCallsSerialized pins that the session's tool-call
+// count reaches the status body as a plain number, with zero emitted
+// explicitly: the field has no omitempty, so "did nothing" (0) is
+// distinguishable from absent (unknown).
+func TestPosterPost_StatusToolCallsSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   int
+		want string
+	}{
+		{name: "zero emitted", in: 0, want: `0`},
+		{name: "sum", in: 5, want: `5`},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.ToolCalls = tc.in
+			if err := p.Post(context.Background(), "sess-tc", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["toolCalls"]
+			if !present {
+				t.Fatalf("toolCalls absent from status body %s; want %s", statusBody, tc.want)
+			}
+			if string(got) != tc.want {
+				t.Errorf("toolCalls = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}
+
 // TestPosterPost_StatusUpstreamErrorSerialized pins the optional endpoint
 // cause on the /status body: a failed session that ended on a 429 with a
 // provider code and reset time posts upstreamError with those values, and
