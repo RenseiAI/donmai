@@ -86,6 +86,17 @@ type QueuedWork struct {
 	// by the negotiated local transport contract.
 	BaseRef string `json:"baseRef,omitempty"`
 
+	// ContinuePullRequest names an existing pull request the session
+	// continues instead of opening a new one. Nil is ordinary branch
+	// work; non-nil makes the runner check out the pull request's head
+	// branch at HeadSha, push the session's commits to that branch
+	// (fast-forward only), and treat that pull request as the run's own.
+	//
+	// Wire shape: "continuePullRequest" (camelCase, omitempty) carrying
+	// {"number": <int>, "headRef": "<branch>", "headSha": "<40-hex>"}.
+	// Absent means today's behaviour, byte for byte.
+	ContinuePullRequest *ContinuePullRequest `json:"continuePullRequest,omitempty"`
+
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
 	// Unknown values fall through to the development template.
@@ -354,6 +365,22 @@ type QueuedWork struct {
 	TrackerSessionID string `json:"trackerSessionId,omitempty"`
 }
 
+// ContinuePullRequest is the session-spec record naming an existing pull
+// request the run continues instead of opening a new one. Number selects
+// the pull request, HeadRef is the branch the session checks out and
+// pushes to, and HeadSha is the commit the checkout must start at.
+type ContinuePullRequest struct {
+	// Number is the pull request number. Required; it selects the pull
+	// request the runner continues.
+	Number int `json:"number,omitempty"`
+	// HeadRef is the pull request's head branch name. Required; the
+	// runner checks out and pushes to this branch.
+	HeadRef string `json:"headRef,omitempty"`
+	// HeadSha is the head commit the dispatch was decided against.
+	// Required; the runner checks out the branch at exactly this commit.
+	HeadSha string `json:"headSha,omitempty"`
+}
+
 // CodeIntelWork is the typed code-intelligence capability block on QueuedWork.
 // It is the platform→runner signal that the session should run with the in-box
 // code-intelligence engine exposed as an MCP tool surface. The runner — never
@@ -408,17 +435,23 @@ type InterviewBudget struct {
 // StageBudget mirrors the platform's StageBudget type from
 // src/lib/workflow/stages/index.ts. The runner enforces these caps via
 // runner.BudgetEnforcer; see runner/budget.go for the cap-breach
-// semantics. A field with value 0 is treated as "no cap" so partial
-// budgets degrade gracefully.
+// semantics. MaxDurationSeconds and MaxTokens treat a field value of 0
+// as "no cap" so partial budgets degrade gracefully. MaxSubAgents is
+// the exception: it is a pointer so an absent cap (nil, the field
+// omitted on the wire) stays "not enforced" while an explicit 0
+// means "no sub-agents allowed".
 type StageBudget struct {
 	// MaxDurationSeconds is the wall-clock cap on the stage instance.
 	// 0 = no cap.
 	MaxDurationSeconds int `json:"maxDurationSeconds,omitempty"`
 
-	// MaxSubAgents is the cap on Task tool invocations the agent may
-	// spawn over the life of the stage. 0 = no cap. Sub-agents
-	// counted: every ToolUseEvent whose ToolName is "Task".
-	MaxSubAgents int `json:"maxSubAgents,omitempty"`
+	// MaxSubAgents is the cap on sub-agent tool invocations the agent
+	// may spawn over the life of the stage. nil (absent) = no cap;
+	// an explicit 0 means no sub-agents are allowed — the first
+	// counted call breaches. Sub-agents counted: every ToolUseEvent
+	// whose ToolName is a sub-agent delegation tool ("Task" or
+	// "Agent", case-insensitive, MCP-suffixed forms included).
+	MaxSubAgents *int `json:"maxSubAgents,omitempty"`
 
 	// MaxTokens is the cap on total token consumption (input + output
 	// across all turns, summed from per-turn ResultEvent.Cost or the

@@ -242,12 +242,16 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	enforcer := NewBudgetEnforcer(qw.StageBudget, time.UnixMilli(startedAt))
 	enforcer.midTurnWrapUp = caps.SupportsMessageInjection && takesMidTurnWrapUp(noticeDelivery)
 	if enforcer.Enabled() {
+		subAgents := "unlimited"
+		if qw.StageBudget.MaxSubAgents != nil {
+			subAgents = fmt.Sprintf("%d", *qw.StageBudget.MaxSubAgents)
+		}
 		r.logger.Info("[runner-stage]",
 			"sid", qw.SessionID,
 			"stageId", qw.StageID,
 			"event", "budget.enforce",
 			"maxDurationSeconds", qw.StageBudget.MaxDurationSeconds,
-			"maxSubAgents", qw.StageBudget.MaxSubAgents,
+			"maxSubAgents", subAgents,
 			"maxTokens", qw.StageBudget.MaxTokens,
 		)
 	}
@@ -271,10 +275,42 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		refBranch = ref
 	}
+	// Continue-mode contract: when the spec names a pull request to
+	// continue, the run checks out the pull request's head branch at the
+	// dispatched head commit — never a fresh agent/<session> branch. The
+	// head branch is also the push target and the run's own pull request.
+	if err := validateContinuePullRequest(qw.ContinuePullRequest); err != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
+	continueMode := qw.ContinuePullRequest != nil
+	// The platform keeps sending the ref pin (older runners rely on it)
+	// alongside the continued record, so a ref that names the continued
+	// head branch is accepted; only a ref naming a DIFFERENT branch is a
+	// typed refusal.
+	if continueMode && refBranch != "" && !strings.EqualFold(refBranch, strings.TrimSpace(qw.ContinuePullRequest.HeadRef)) {
+		err := errors.New("runner: continued pull request head ref differs from the dispatched amend ref")
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
+	if continueMode && (qw.RepositoryDeclaration != nil || qw.PullRequest != nil || qw.BaseRef != "") {
+		err := errors.New("runner: continued pull request is mutually exclusive with repository declarations, dispatched pull requests, and base branches")
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
 	branch := qw.Branch
-	if refBranch != "" {
+	switch {
+	case continueMode:
+		branch = continuePullRequestBranch(qw.ContinuePullRequest)
+	case refBranch != "":
 		branch = refBranch
-	} else if branch == "" {
+	case branch == "":
 		branch = "agent/" + qw.SessionID
 	}
 	provisionStrategy := worktreeProvisionStrategy(qw)
@@ -365,10 +401,25 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
+	// Check out the continued pull request's head branch at the dispatched
+	// head commit before the agent starts. The branch may exist only on the
+	// remote, so this fetches it and checks it out at the pinned commit;
+	// anything else fails the session rather than running on a moved head.
+	if continueMode && !repositoryFree {
+		if err := checkoutContinuePullRequest(ctx, wpath, qw.ContinuePullRequest); err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureWorktreeProvision
+			res.Error = err.Error()
+			return res, err
+		}
+		r.logger.Info("checked out continued pull request head", "branch", branch, "sessionId", qw.SessionID)
+	}
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
 	selectedRepositoryMutable := !repositoryFree && !selectedRepositoryReadOnly
 	switch {
+	case continueMode:
+		r.logger.Info("continuing pull request head branch", "branch", branch, "sessionId", qw.SessionID)
 	case repositoryFree:
 		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
@@ -1174,10 +1225,20 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		BaseURL:            qw.PlatformURL,
 		AuthToken:          qw.AuthToken,
 		CredentialProvider: stepCredentialProvider,
-		HTTPClient:         r.httpClient,
-		Logger:             r.logger,
-		// Interval intentionally left at the 15s default — calibrated
-		// against the platform's 60s SESSION_STALE_THRESHOLD_MS.
+		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
+			in, out, cached, usd := enforcer.usageSnapshot()
+			return stepheartbeat.UsageSnapshot{
+				InputTokens:       in,
+				OutputTokens:      out,
+				CachedInputTokens: cached,
+				TotalCostUsd:      usd,
+			}
+		},
+		HTTPClient: r.httpClient,
+		Logger:     r.logger,
+		Interval:   r.stepHeartbeatInterval,
+		// Interval is zero in production, keeping the 15s default —
+		// calibrated against the platform's 60s SESSION_STALE_THRESHOLD_MS.
 	})
 	if stepErr != nil {
 		r.logger.Warn("step-heartbeat construct failed", "err", stepErr)
@@ -1309,6 +1370,18 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 	}
 	r.acceptSessionPullRequest(verifyCtx, prVerifier, qw, res, &streamRes, streamRes)
 
+	// Continue-mode delivery: the run's pull request is the continued
+	// one. Seed it on the envelope BEFORE the first tail-recovery pass
+	// so the no-new-commit and draft continuation rules treat the
+	// continued pull request exactly like the rework pull requests they
+	// already pin: a noop continue run keeps turning instead of ending
+	// completed against an unchanged head.
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
+			r.seedContinuedPullRequest(prVerifier, continuedURL, res, &streamRes)
+		}
+	}
+
 	// 10a. Structural blocked-agent classification. When the agent
 	// announced a deliberate decline (scanBlocked picked up a
 	// "WORK_RESULT:blocked" / "AGENT_BLOCKED: …" marker) and did not also
@@ -1413,6 +1486,9 @@ tailRecovery:
 		case tailExhausted:
 			if ending == turnProviderError || ending == turnProviderErrorFatal {
 				followUps.providerError = lastTurn.providerError
+				if res.Upstream == nil && lastTurn.upstream != nil {
+					res.Upstream = agent.CanonicalUpstreamError(lastTurn.upstream)
+				}
 			}
 			followUps.fail(res)
 			r.logger.Warn("turn still unfinished at a follow-up bound; failing the session",
@@ -1567,9 +1643,22 @@ tailRecovery:
 			backstopEligible = true
 		}
 	}
+	// Continue-mode delivery: the run's pull request is the continued
+	// one, seeded on the envelope before tail recovery (see above). The
+	// seed must not read as delivered work that disables the backstop:
+	// evaluate eligibility with the seed cleared so the session's commits
+	// are still pushed to the continued head branch. The backstop itself
+	// never opens a new pull request in continue mode.
+	if qw.ContinuePullRequest != nil {
+		probe := *res
+		probe.PullRequestURL = ""
+		backstopEligible = !repositoryFree && shouldBackstop(&probe, qw.WorkType)
+	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
 		switch {
-		case trimRef(qw.Ref) != "":
+		// Continue+ref runs take the push lane below: the ref names the
+		// continued head branch, which IS the push target.
+		case trimRef(qw.Ref) != "" && qw.ContinuePullRequest == nil:
 			r.logger.Info("skipping backstop gh pr create on ref-bearing run", "branch", branch, "ref", qw.Ref)
 		case repositoryDeclaration != nil:
 			bsCtx, bsCancel := context.WithTimeout(context.Background(), 90*time.Second)
@@ -1584,6 +1673,61 @@ tailRecovery:
 			if bsReport.PRURL != "" && res.PullRequestURL == "" {
 				res.PullRequestURL = bsReport.PRURL
 			}
+		}
+	}
+
+	// Continue-mode divergence: the backstop refused to push because the
+	// continued pull request's head moved after dispatch. Record the typed
+	// failure here, before the delivery gate, so the terminal status says
+	// the head diverged instead of the gate reading the unpushed head as
+	// "no new commit".
+	if qw.ContinuePullRequest != nil && res.FailureMode == "" && continueDiverged(res.BackstopReport) {
+		res.Status = "failed"
+		res.FailureMode = FailureContinuePullRequestDiverged
+		res.Error = fmt.Sprintf("%s: pull request #%d branch %q refused the session's push as a non-fast-forward; its commits were not published",
+			ErrContinuePullRequestDiverged, qw.ContinuePullRequest.Number, continuePullRequestBranch(qw.ContinuePullRequest))
+	}
+
+	// Continue-mode delivery gate: the run's pull request is the
+	// continued one, and it counts as delivered only when the session
+	// moved its head past the dispatched head — pushed, so the remote
+	// head carries the session's commit — and the pull request is not a
+	// draft. A no-new-commit continue run (and a draft) must NOT read as
+	// delivered: fail the session instead of ending completed against an
+	// unchanged head, mirroring the verifier's no-new-commit/draft rules.
+	// Runs only when no failure was already recorded, so a runner-authored
+	// refusal (divergence, provision) keeps its own typed reason.
+	if qw.ContinuePullRequest != nil && !repositoryFree && RequiresPRURL(qw.WorkType) && res.FailureMode == "" && budgetStop == nil {
+		startHead := strings.TrimSpace(qw.ContinuePullRequest.HeadSha)
+		if res.PullRequestURL != "" || continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath) != "" {
+			gateCtx, gateCancel := context.WithTimeout(context.Background(), 30*time.Second)
+			func() {
+				defer gateCancel()
+				localHead, _ := captureHeadSHA(gateCtx, wpath)
+				remoteHead, _ := gitStdout(gateCtx, wpath, nil, "ls-remote", "origin", "refs/heads/"+continuePullRequestBranch(qw.ContinuePullRequest))
+				if fields := strings.Fields(remoteHead); len(fields) > 0 {
+					remoteHead = fields[0]
+				}
+				lookup := r.pullRequestDraftLookup
+				if lookup == nil {
+					lookup = githubPullRequestDraft
+				}
+				continuedURL := res.PullRequestURL
+				if continuedURL == "" {
+					continuedURL = continuePullRequestURL(gateCtx, qw, repositoryDeclaration, wpath)
+				}
+				draft, draftErr := lookup(gateCtx, wpath, continuedURL)
+				switch {
+				case draftErr == nil && draft:
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d is still a draft", qw.ContinuePullRequest.Number)
+				case !continueDelivered(localHead, remoteHead, startHead):
+					res.Status = "failed"
+					res.FailureMode = FailureBackstop
+					res.Error = fmt.Sprintf("continued pull request #%d has no new commit since dispatch", qw.ContinuePullRequest.Number)
+				}
+			}()
 		}
 	}
 
@@ -2054,6 +2198,12 @@ type streamObservation struct {
 	// The zero value is retryable, as every provider error was before.
 	providerError             string
 	providerErrorNotRetryable bool
+	// upstream is the structured endpoint error of the latest provider
+	// error observation (or failed terminal) in this stream — the HTTP
+	// status, provider code, truncated provider message, and reset time
+	// the harness exposed. A later assistant message or tool call means
+	// the model recovered and clears it, exactly like providerError.
+	upstream *agent.UpstreamError
 	// toolCalls counts the tool calls (agent.ToolUseEvent) this stream
 	// carried. Tail recovery reads a turn with at least one as productive
 	// (turn_continuation.go).
@@ -2147,6 +2297,15 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 			res.FailureMode = FailureProviderError
 		}
 	}
+	// The structured endpoint cause rides only when the session failed
+	// on it: a terminal failure (or a provider-error exhaustion) with
+	// this stream's structured cause and no newer recovery. A later
+	// successful turn clears it (observeEvent clears upstream alongside
+	// providerError), and a failure with no structured cause leaves any
+	// older value untouched.
+	if res.Status == "failed" && res.Upstream == nil && o.upstream != nil && !o.upstream.Empty() {
+		res.Upstream = agent.CanonicalUpstreamError(o.upstream)
+	}
 }
 
 // consumeEvents drains the handle's events channel, mirrors each
@@ -2223,25 +2382,19 @@ func (r *Runner) consumeEvents(
 	// (idleC stays nil → its select case never fires).
 	watchCtx, watchCancel := context.WithCancel(ctx)
 	defer watchCancel()
-	var idleTimer *time.Timer
+	var idleTimer interviewTimer
 	var idleC <-chan time.Time
 	if r.idleTimeout > 0 {
-		idleTimer = time.NewTimer(r.idleTimeout)
+		idleTimer = r.idleTimer(r.idleTimeout)
 		defer idleTimer.Stop()
-		idleC = idleTimer.C
+		idleC = idleTimer.Chan()
 	}
 	// resetIdle re-arms the watchdog after each observed event. Drains a
-	// possibly-already-fired timer channel before Reset per the stdlib
-	// time.Timer contract.
+	// possibly-already-fired timer tick before Reset so a stale fire from
+	// the prior window cannot trip the next select.
 	resetIdle := func() {
 		if idleTimer == nil {
 			return
-		}
-		if !idleTimer.Stop() {
-			select {
-			case <-idleTimer.C:
-			default:
-			}
 		}
 		idleTimer.Reset(r.idleTimeout)
 	}
@@ -2410,6 +2563,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 			obs.lastAssistantText = e.Text
 			obs.providerError = ""
 			obs.providerErrorNotRetryable = false
+			obs.upstream = nil
 		}
 		// One verdict per message, from its FIRST line-anchored marker
 		// (scanVerdict); the latest message that carries one decides the
@@ -2444,6 +2598,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.SystemEvent:
 		if e.Subtype == agent.SystemSubtypeProviderError {
 			obs.providerError, obs.providerErrorNotRetryable = splitProviderErrorRetryable(strings.TrimSpace(e.Message))
+			obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
 			if obs.providerError == "" {
 				obs.providerError = "model provider error"
 			}
@@ -2454,6 +2609,7 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 		// this stream was recovered from.
 		obs.providerError = ""
 		obs.providerErrorNotRetryable = false
+		obs.upstream = nil
 		toolName := strings.ToLower(e.ToolName)
 		// Heuristic: track Linear-side outputs and PR creation.
 		// Bash invocations of `gh pr create` are not tracked here —
@@ -2478,12 +2634,18 @@ func (r *Runner) observeEvent(ev agent.Event, obs *streamObservation, worktreePa
 	case agent.ResultEvent:
 		obs.terminalEvent = &e
 		obs.terminalSuccess = e.Success
+		if !e.Success && e.Upstream != nil {
+			obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
+		}
 	case agent.ErrorEvent:
 		// An error the session continues past is on the record (events.jsonl,
 		// the activity sink) but is not the session's terminal, so it never
 		// becomes the run's failure.
 		if !e.SessionContinues {
 			obs.errorEvent = &e
+			if e.Upstream != nil {
+				obs.upstream = agent.CanonicalUpstreamError(e.Upstream)
+			}
 		}
 	}
 }
@@ -2767,8 +2929,8 @@ func buildSessionEnv(qw QueuedWork) map[string]string {
 			v := fmt.Sprintf("%d", b.MaxDurationSeconds)
 			envMap["DONMAI_STAGE_MAX_DURATION_SECONDS"] = v
 		}
-		if b.MaxSubAgents > 0 {
-			v := fmt.Sprintf("%d", b.MaxSubAgents)
+		if b.MaxSubAgents != nil {
+			v := fmt.Sprintf("%d", *b.MaxSubAgents)
 			envMap["DONMAI_STAGE_MAX_SUB_AGENTS"] = v
 		}
 		if b.MaxTokens > 0 {

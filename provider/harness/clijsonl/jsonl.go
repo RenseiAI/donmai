@@ -4,6 +4,9 @@ import (
 	"encoding/json"
 	"fmt"
 	"math"
+	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -37,7 +40,11 @@ type rawJSONLEnvelope struct {
 type rawAssistantEnvelope struct {
 	Type      string `json:"type"`
 	SessionID string `json:"session_id,omitempty"`
-	Message   struct {
+	// ParentToolUseID carries the stream-json `parent_tool_use_id` the
+	// CLI emits on messages produced inside a sub-agent: the id of the
+	// delegation tool call that started it. Absent on top-level lines.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Message         struct {
 		ID         string            `json:"id,omitempty"`
 		Model      string            `json:"model,omitempty"`
 		StopReason string            `json:"stop_reason,omitempty"`
@@ -69,8 +76,11 @@ type rawContentBlock struct {
 // echo back tool results so JSONL consumers can pair tool_use with
 // tool_result. Mirrors the legacy TS mapUserMessage handling.
 type rawUserEnvelope struct {
-	Type    string `json:"type"`
-	Message struct {
+	Type string `json:"type"`
+	// ParentToolUseID mirrors rawAssistantEnvelope: the delegation tool
+	// call id on user-message lines emitted inside a sub-agent.
+	ParentToolUseID string `json:"parent_tool_use_id,omitempty"`
+	Message         struct {
 		Content []rawContentBlock `json:"content"`
 	} `json:"message"`
 }
@@ -138,6 +148,23 @@ type rawResultEnvelope struct {
 		OutputTokens         int64 `json:"output_tokens"`
 		CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
 	} `json:"usage"`
+	// APIError carries the endpoint's structured refusal on failure
+	// lines (for example HTTP 429 with a usage-limit code and a reset
+	// time). Unknown fields stay ignored; only this shape is read.
+	APIError *rawAPIError `json:"error,omitempty"`
+}
+
+// rawAPIError is the endpoint's structured refusal on a stream-json
+// result line. Only small fixed-shape fields are read — never request
+// bodies, headers, or credentials.
+type rawAPIError struct {
+	Type     string `json:"type,omitempty"`
+	Subtype  string `json:"subtype,omitempty"`
+	Code     string `json:"code,omitempty"`
+	Message  string `json:"message,omitempty"`
+	Status   *int   `json:"status,omitempty"`
+	ResetsAt any    `json:"resetsAt,omitempty"`
+	ResetAt  any    `json:"resetAt,omitempty"`
 }
 
 // mapLine decodes one JSONL line and returns the resulting
@@ -162,6 +189,80 @@ type rawResultEnvelope struct {
 // in `Raw` so the runner can persist it to <worktree>/.agent/events.jsonl per
 // F.1.1 §4 step 9. LlmCallEvent is the deliberate exception: it stays
 // metadata/digest-only and never duplicates prompt/completion content.
+// delegationToolName reports whether name is one of this adapter's native
+// sub-agent delegation tools. The adapter names its own delegation tools
+// (matched the same way the runner historically matched them: "Task" and
+// "Agent", case-insensitive with MCP-style namespace suffixes); the
+// runner keeps no list of tool names and counts the typed SubagentEvent
+// the mapper emits instead.
+func delegationToolName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "task" || n == "agent" {
+		return true
+	}
+	return strings.HasSuffix(n, "__task") || strings.HasSuffix(n, "__agent")
+}
+
+// LineMapper is the stateful stream-json line mapper. It pairs delegation
+// tool calls with their results by ToolUseID so a delegation emits the
+// typed sub-agent lifecycle (started on the tool_use line, completed or
+// failed on the matching tool_result line) alongside the plain tool events.
+// The zero value is ready to use; concurrent callers are safe.
+type LineMapper struct {
+	mu      sync.Mutex
+	pending map[string]string // ToolUseID -> delegation tool name
+}
+
+// MapLine maps one JSONL line, tracking delegation pairs across lines.
+func (m *LineMapper) MapLine(line []byte) []agent.Event {
+	events := mapLine(line)
+	if m == nil {
+		return events
+	}
+	out := make([]agent.Event, 0, len(events)+1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending == nil {
+		m.pending = make(map[string]string)
+	}
+	for _, ev := range events {
+		out = append(out, ev)
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if e.ToolUseID == "" || !delegationToolName(e.ToolName) {
+				continue
+			}
+			m.pending[e.ToolUseID] = e.ToolName
+			out = append(out, agent.SubagentEvent{
+				ToolName:  e.ToolName,
+				ToolUseID: e.ToolUseID,
+				Phase:     agent.SubagentStarted,
+				Raw:       e.Raw,
+			})
+		case agent.ToolResultEvent:
+			name, ok := m.pending[e.ToolUseID]
+			if e.ToolUseID == "" || !ok {
+				continue
+			}
+			delete(m.pending, e.ToolUseID)
+			phase := agent.SubagentCompleted
+			if e.IsError {
+				phase = agent.SubagentFailed
+			}
+			if e.ToolName != "" {
+				name = e.ToolName
+			}
+			out = append(out, agent.SubagentEvent{
+				ToolName:  name,
+				ToolUseID: e.ToolUseID,
+				Phase:     phase,
+				Raw:       e.Raw,
+			})
+		}
+	}
+	return out
+}
+
 func mapLine(line []byte) []agent.Event {
 	var head rawJSONLEnvelope
 	if err := json.Unmarshal(line, &head); err != nil {
@@ -187,8 +288,11 @@ func mapLine(line []byte) []agent.Event {
 		return mapAuthStatus(line)
 	case "stream_event":
 		// Partial-message frames: high-frequency, low value to the
-		// orchestrator. Drop per the legacy port.
-		return nil
+		// orchestrator. Drop per the legacy port — unless the frame
+		// carries the endpoint's API error, which surfaces as the
+		// provider-error observation so the runner can record the
+		// structured cause.
+		return mapStreamEvent(line)
 	case "rate_limit_event":
 		// Surface as a system event so the runner can record it.
 		return []agent.Event{agent.SystemEvent{
@@ -284,16 +388,18 @@ func mapAssistant(line []byte) []agent.Event {
 				continue
 			}
 			out = append(out, agent.AssistantTextEvent{
-				Text: block.Text,
-				Raw:  json.RawMessage(line),
+				Text:            block.Text,
+				ParentToolUseID: a.ParentToolUseID,
+				Raw:             json.RawMessage(line),
 			})
 		case "tool_use":
 			input := decodeInput(block.Input)
 			out = append(out, agent.ToolUseEvent{
-				ToolName:  block.Name,
-				ToolUseID: block.ID,
-				Input:     input,
-				Raw:       json.RawMessage(line),
+				ToolName:        block.Name,
+				ToolUseID:       block.ID,
+				ParentToolUseID: a.ParentToolUseID,
+				Input:           input,
+				Raw:             json.RawMessage(line),
 			})
 		case "thinking":
 			// Model reasoning rides as SystemEvent{Subtype: "reasoning"}
@@ -334,10 +440,11 @@ func mapUser(line []byte) []agent.Event {
 		}
 		content := decodeToolResultContent(block.Content)
 		out = append(out, agent.ToolResultEvent{
-			ToolUseID: block.ToolUseID,
-			Content:   content,
-			IsError:   block.IsError,
-			Raw:       json.RawMessage(line),
+			ToolUseID:       block.ToolUseID,
+			ParentToolUseID: u.ParentToolUseID,
+			Content:         content,
+			IsError:         block.IsError,
+			Raw:             json.RawMessage(line),
 		})
 	}
 	if len(out) == 0 {
@@ -388,6 +495,7 @@ func mapResult(line []byte) []agent.Event {
 			Cost:            cost,
 			ObservedCostUsd: observedCost,
 			ObservedTurns:   observedTurns,
+			Upstream:        resultUpstream(line, r),
 			Raw:             json.RawMessage(line),
 		}}
 	}
@@ -412,6 +520,7 @@ func mapResult(line []byte) []agent.Event {
 		Cost:            cost,
 		ObservedCostUsd: observedCost,
 		ObservedTurns:   observedTurns,
+		Upstream:        resultUpstream(line, r),
 		Raw:             json.RawMessage(line),
 	}}
 }
@@ -457,6 +566,107 @@ func mapAuthStatus(line []byte) []agent.Event {
 		Message: msg,
 		Raw:     json.RawMessage(line),
 	}}
+}
+
+// mapStreamEvent surfaces the endpoint's API error carried inside a
+// stream_event frame as the provider-error observation. Any other frame
+// stays dropped per the legacy port. The structured cause rides Upstream;
+// only small fixed-shape fields travel — never request bodies, headers,
+// or credentials.
+func mapStreamEvent(line []byte) []agent.Event {
+	var head struct {
+		Event struct {
+			Type  string `json:"type"`
+			Error *struct {
+				Type    string `json:"type,omitempty"`
+				Code    string `json:"code,omitempty"`
+				Message string `json:"message,omitempty"`
+				Status  *int   `json:"status,omitempty"`
+			} `json:"error,omitempty"`
+		} `json:"event"`
+	}
+	if err := json.Unmarshal(line, &head); err != nil {
+		return []agent.Event{agent.ErrorEvent{
+			Message: fmt.Sprintf("provider/claude: decode stream event: %v", err),
+			Code:    "decode_stream_event",
+			Raw:     json.RawMessage(line),
+		}}
+	}
+	apiErr := head.Event.Error
+	if head.Event.Type != "message_stop" || apiErr == nil {
+		return nil
+	}
+	message := apiErr.Message
+	if message == "" {
+		message = "model provider error"
+	}
+	status := 0
+	if apiErr.Status != nil {
+		status = *apiErr.Status
+	}
+	code := apiErr.Code
+	if code == "" {
+		code = apiErr.Type
+	}
+	return []agent.Event{agent.SystemEvent{
+		Subtype:  agent.SystemSubtypeProviderError,
+		Message:  message,
+		Upstream: agent.NormalizeUpstreamError(status, code, message, ""),
+		Raw:      json.RawMessage(line),
+	}}
+}
+
+// resultUpstream reads the endpoint's structured refusal off a failure
+// result line: the typed "error" object when present, else a tolerant
+// read of the whole line. Nil when the line carries no status, code, or
+// reset time.
+func resultUpstream(line []byte, r rawResultEnvelope) *agent.UpstreamError {
+	if r.APIError != nil {
+		status := 0
+		if r.APIError.Status != nil {
+			status = *r.APIError.Status
+		}
+		code := r.APIError.Code
+		if code == "" {
+			code = r.APIError.Subtype
+		}
+		if code == "" {
+			code = r.APIError.Type
+		}
+		reset := upstreamResetAny(r.APIError.ResetsAt)
+		if reset == "" {
+			reset = upstreamResetAny(r.APIError.ResetAt)
+		}
+		if u := agent.NormalizeUpstreamError(status, code, r.APIError.Message, reset); u != nil {
+			return u
+		}
+	}
+	var m map[string]any
+	if err := json.Unmarshal(line, &m); err != nil {
+		return nil
+	}
+	return agent.ParseUpstreamError(m)
+}
+
+// upstreamResetAny renders the opaque reset-time representation of one
+// JSON value: a string verbatim, a number as decimal digits.
+func upstreamResetAny(v any) string {
+	switch t := v.(type) {
+	case nil:
+		return ""
+	case string:
+		return t
+	case float64:
+		return strconv.FormatFloat(t, 'f', -1, 64)
+	case float32:
+		return strconv.FormatFloat(float64(t), 'f', -1, 32)
+	case int:
+		return strconv.Itoa(t)
+	case int64:
+		return strconv.FormatInt(t, 10)
+	default:
+		return ""
+	}
 }
 
 // decodeInput unmarshals a tool_use input as map[string]any. Any

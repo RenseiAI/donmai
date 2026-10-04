@@ -89,6 +89,19 @@ type Config struct {
 	// set, every tick calls it before posting so child runners pick up
 	// daemon-side runtime-token refreshes mid-session.
 	CredentialProvider CredentialProvider
+	// UsageProvider returns the session's current cumulative usage total.
+	// When set, every beat carries it as the `usage` object
+	// (inputTokens, outputTokens, cachedInputTokens, totalCostUsd — all
+	// optional, omitted when zero). When nil, or while the snapshot is
+	// fully zero, the beat keeps today's body shape (workerId + emittedAt
+	// only) so older readers see no change. The emitter clamps the
+	// reported values so they never decrease within the session: a
+	// regressed snapshot is reported as the previous beat's values.
+	//
+	// The accumulator behind this has no cache-write token field, so the
+	// beat carries none either (absent keeps today's behaviour); a
+	// companion producer change adds it when a source field exists.
+	UsageProvider UsageProvider
 
 	// Interval overrides DefaultInterval. Zero falls back to the 15s
 	// default; do NOT override it in production (see package doc).
@@ -157,13 +170,53 @@ func (c Config) credentials(ctx context.Context) RuntimeCredentials {
 	return creds
 }
 
+// UsageSnapshot is the session's cumulative usage total as the runner's
+// accumulator counted it. Every field is optional: zero values are omitted
+// from the wire body so a beat with nothing metered yet keeps today's
+// shape. Values never decrease within a session — the emitter clamps a
+// regressed snapshot up to the previous beat's values.
+//
+// There is no cache-write token field: the accumulator the runner reads
+// has no cache-write source field, so the beat carries none (absent keeps
+// today's behaviour); a companion producer change adds it when a source
+// field exists.
+type UsageSnapshot struct {
+	InputTokens       int64   `json:"inputTokens,omitempty"`
+	OutputTokens      int64   `json:"outputTokens,omitempty"`
+	CachedInputTokens int64   `json:"cachedInputTokens,omitempty"`
+	TotalCostUsd      float64 `json:"totalCostUsd,omitempty"`
+}
+
+// UsageProvider returns the session's current cumulative usage total.
+// Implementations should be cheap and concurrency-safe; the emitter
+// invokes it before every POST. A zero snapshot means "nothing metered
+// yet" and is left off the wire body.
+type UsageProvider func(context.Context) UsageSnapshot
+
+func (u UsageSnapshot) isZero() bool { return u == UsageSnapshot{} }
+
+// clampFloor returns u with every field raised to at least the matching
+// field of prev, so reported usage never decreases within a session.
+func (u UsageSnapshot) clampFloor(prev UsageSnapshot) UsageSnapshot {
+	return UsageSnapshot{
+		InputTokens:       max(u.InputTokens, prev.InputTokens),
+		OutputTokens:      max(u.OutputTokens, prev.OutputTokens),
+		CachedInputTokens: max(u.CachedInputTokens, prev.CachedInputTokens),
+		TotalCostUsd:      max(u.TotalCostUsd, prev.TotalCostUsd),
+	}
+}
+
 // stepHeartbeatBody is the request body sent to
 // POST /api/sessions/<id>/step-heartbeat. WorkerID attributes the beat;
 // EmittedAt is a monotonic RFC3339 timestamp the platform stamps onto
-// agent_sessions.last_step_heartbeat + last_progress_at.
+// agent_sessions.last_step_heartbeat + last_progress_at. Usage carries the
+// session's cumulative usage total when the runner has metered any; it is
+// omitted while nothing is metered and on builds without a UsageProvider,
+// so older readers see no change.
 type stepHeartbeatBody struct {
-	WorkerID  string `json:"workerId,omitempty"`
-	EmittedAt string `json:"emittedAt"`
+	WorkerID  string         `json:"workerId,omitempty"`
+	EmittedAt string         `json:"emittedAt"`
+	Usage     *UsageSnapshot `json:"usage,omitempty"`
 }
 
 // Emitter drives the step-heartbeat loop for one session. Construct via New,
@@ -177,6 +230,10 @@ type Emitter struct {
 	stopped bool
 	stopCh  chan struct{}
 	doneCh  chan struct{}
+	// lastUsage is the usage the previous beat reported, guarded by mu.
+	// A regressed snapshot is clamped up to it so values never
+	// decrease within a session.
+	lastUsage UsageSnapshot
 }
 
 // New validates cfg and returns a non-started Emitter. Returns an error when
@@ -264,6 +321,26 @@ func (e *Emitter) run(ctx context.Context) {
 	}
 }
 
+// currentUsage snapshots the UsageProvider, clamps the snapshot so it
+// never decreases below the previous beat, and records it. It returns nil
+// when no provider is configured or nothing is metered yet, keeping the
+// beat's body at today's shape.
+func (e *Emitter) currentUsage(ctx context.Context) *UsageSnapshot {
+	if e.cfg.UsageProvider == nil {
+		return nil
+	}
+	snap := e.cfg.UsageProvider(ctx)
+	e.mu.Lock()
+	defer e.mu.Unlock()
+	snap = snap.clampFloor(e.lastUsage)
+	e.lastUsage = snap
+	if snap.isZero() {
+		return nil
+	}
+	out := snap
+	return &out
+}
+
 func (e *Emitter) stopChannel() <-chan struct{} {
 	e.mu.Lock()
 	defer e.mu.Unlock()
@@ -280,6 +357,7 @@ func (e *Emitter) beat(ctx context.Context) {
 	body, err := json.Marshal(stepHeartbeatBody{
 		WorkerID:  creds.WorkerID,
 		EmittedAt: e.cfg.now().UTC().Format(time.RFC3339),
+		Usage:     e.currentUsage(ctx),
 	})
 	if err != nil {
 		e.cfg.logger().Debug("step-heartbeat marshal failed",

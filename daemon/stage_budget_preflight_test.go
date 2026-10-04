@@ -8,6 +8,20 @@ import (
 	"github.com/RenseiAI/donmai/executioncell"
 )
 
+// ptrMaxSubAgents returns a pointer to n for PollStageBudget.MaxSubAgents
+// literals in tests.
+func ptrMaxSubAgents(n int) *int { return &n }
+
+// pollSubAgentCapsEqual compares two MaxSubAgents caps by value,
+// treating two nils as equal (pointer identity is meaningless after
+// a JSON round trip).
+func pollSubAgentCapsEqual(left, right *int) bool {
+	if left == nil || right == nil {
+		return left == right
+	}
+	return *left == *right
+}
+
 func TestAcceptWorkForwardsSiblingStageBudgetToExecutionPreflight(t *testing.T) {
 	admission, cell := claimBoundAdmission(t)
 	reality := executioncell.ClaimLocalReality{
@@ -28,7 +42,7 @@ func TestAcceptWorkForwardsSiblingStageBudgetToExecutionPreflight(t *testing.T) 
 		ExecutionRuntimeBinding: mustMarshal(t, binding),
 		StageBudget: &PollStageBudget{
 			MaxDurationSeconds: 1800,
-			MaxSubAgents:       3,
+			MaxSubAgents:       ptrMaxSubAgents(3),
 			MaxTokens:          24_000,
 		},
 	}
@@ -49,7 +63,9 @@ func TestAcceptWorkForwardsSiblingStageBudgetToExecutionPreflight(t *testing.T) 
 	if wire.StageBudget == nil {
 		t.Fatal("preflight input omitted the sibling stage budget")
 	}
-	if got := *wire.StageBudget; got != *detail.StageBudget {
-		t.Fatalf("preflight stage budget = %+v, want %+v", got, *detail.StageBudget)
+	if got := wire.StageBudget; got.MaxDurationSeconds != detail.StageBudget.MaxDurationSeconds ||
+		!pollSubAgentCapsEqual(got.MaxSubAgents, detail.StageBudget.MaxSubAgents) ||
+		got.MaxTokens != detail.StageBudget.MaxTokens {
+		t.Fatalf("preflight stage budget = %+v, want %+v", *got, *detail.StageBudget)
 	}
 }

@@ -26,6 +26,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:     true, // in-box MCP bridge (mcp.go + runtime/mcp)
 			AcceptsAllowedToolsList:  true,
 			EmitsSubagentEvents:      false,
+			SetsParentToolUseID:      false, // this adapter cannot know the parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort:  true,
 			SupportsOneShot:          true,
 			NativeJSONMode:           true, // responseSchema

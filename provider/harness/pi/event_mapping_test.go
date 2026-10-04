@@ -1,6 +1,7 @@
 package pi
 
 import (
+	"reflect"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
@@ -106,8 +107,8 @@ func TestMapEvent_ResponseCommand(t *testing.T) {
 func TestMapEvent_MessageEndProviderError(t *testing.T) {
 	t.Parallel()
 
-	providerError := func(detail string) agent.Event {
-		return agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: detail, Raw: "line"}
+	providerError := func(detail string, msg map[string]any) agent.Event {
+		return agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: detail, Upstream: agent.ParseUpstreamError(msg), Raw: "line"}
 	}
 	tests := []struct {
 		name       string
@@ -118,7 +119,7 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 		{
 			name:       "error with the provider's message and no text",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"},
-			wantEvents: []agent.Event{providerError("503 Service Unavailable")},
+			wantEvents: []agent.Event{providerError("503 Service Unavailable", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"})},
 		},
 		{
 			name:     "error after partial text keeps the text first",
@@ -126,53 +127,53 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 			message:  map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "504 Gateway Timeout"},
 			wantEvents: []agent.Event{
 				agent.AssistantTextEvent{Text: "Let me check", Raw: "line"},
-				providerError("504 Gateway Timeout"),
+				providerError("504 Gateway Timeout", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "504 Gateway Timeout"}),
 			},
 		},
 		{
 			name:       "error without a message still names a provider error",
 			message:    map[string]any{"role": "assistant", "stopReason": "error"},
-			wantEvents: []agent.Event{providerError("model provider error")},
+			wantEvents: []agent.Event{providerError("model provider error", map[string]any{"role": "assistant", "stopReason": "error"})},
 		},
 		{
 			name:       "non-retryable gateway failure carries the marker",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 invalid parameters", "error": map[string]any{"isRetryable": false}},
-			wantEvents: []agent.Event{providerError("400 invalid parameters" + agent.ProviderErrorNotRetryableSuffix)},
+			wantEvents: []agent.Event{providerError("400 invalid parameters"+agent.ProviderErrorNotRetryableSuffix, map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 invalid parameters", "error": map[string]any{"isRetryable": false}})},
 		},
 		{
 			name:       "diagnostic status marks a 400 as non-retryable",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request failed", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}},
-			wantEvents: []agent.Event{providerError("request failed" + agent.ProviderErrorNotRetryableSuffix)},
+			wantEvents: []agent.Event{providerError("request failed"+agent.ProviderErrorNotRetryableSuffix, map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request failed", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}})},
 		},
 		{
 			name:       "a 503 stays retryable",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"},
-			wantEvents: []agent.Event{providerError("503 Service Unavailable")},
+			wantEvents: []agent.Event{providerError("503 Service Unavailable", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "503 Service Unavailable"})},
 		},
 		{
 			name:       "a 408 diagnostic status stays retryable",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request timed out", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(408)}}}},
-			wantEvents: []agent.Event{providerError("request timed out")},
+			wantEvents: []agent.Event{providerError("request timed out", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "request timed out", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(408)}}}})},
 		},
 		{
 			name:       "a 409 status stays retryable",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "conflict", "statusCode": float64(409)},
-			wantEvents: []agent.Event{providerError("conflict")},
+			wantEvents: []agent.Event{providerError("conflict", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "conflict", "statusCode": float64(409)})},
 		},
 		{
 			name:       "a context overflow with a 400 status is not marked",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "prompt is too long: 213456 tokens > 200000 maximum", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}},
-			wantEvents: []agent.Event{providerError("prompt is too long: 213456 tokens > 200000 maximum")},
+			wantEvents: []agent.Event{providerError("prompt is too long: 213456 tokens > 200000 maximum", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "prompt is too long: 213456 tokens > 200000 maximum", "diagnostics": []any{map[string]any{"details": map[string]any{"status": float64(400)}}}})},
 		},
 		{
 			name:       "a context overflow flagged not retryable is not marked",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 context_length_exceeded", "error": map[string]any{"isRetryable": false}},
-			wantEvents: []agent.Event{providerError("400 context_length_exceeded")},
+			wantEvents: []agent.Event{providerError("400 context_length_exceeded", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "400 context_length_exceeded", "error": map[string]any{"isRetryable": false}})},
 		},
 		{
 			name:       "a network error with a port and no structured status is not marked",
 			message:    map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "connect ECONNREFUSED 10.0.0.12:443"},
-			wantEvents: []agent.Event{providerError("connect ECONNREFUSED 10.0.0.12:443")},
+			wantEvents: []agent.Event{providerError("connect ECONNREFUSED 10.0.0.12:443", map[string]any{"role": "assistant", "stopReason": "error", "errorMessage": "connect ECONNREFUSED 10.0.0.12:443"})},
 		},
 		{
 			name:       "a clean stop is only text",
@@ -203,7 +204,7 @@ func TestMapEvent_MessageEndProviderError(t *testing.T) {
 				t.Fatalf("events = %#v, want %#v", gotEvents, tt.wantEvents)
 			}
 			for i := range gotEvents {
-				if gotEvents[i] != tt.wantEvents[i] {
+				if !reflect.DeepEqual(gotEvents[i], tt.wantEvents[i]) {
 					t.Errorf("events[%d] = %#v, want %#v", i, gotEvents[i], tt.wantEvents[i])
 				}
 			}
@@ -250,5 +251,45 @@ func TestObservedPiTurnCostAndMissingTerminalCost(t *testing.T) {
 	turn(map[string]any{"total": float64(1)})
 	if *result.ObservedTurns != 2 {
 		t.Fatal("emitted cumulative turn observation mutated on continuation")
+	}
+}
+
+func TestMapEvent_MessageEndProviderError_Upstream(t *testing.T) {
+	t.Parallel()
+
+	st := &mapperState{initEmitted: true}
+	ev := rawEvent{Type: "message_end", Fields: map[string]any{"message": map[string]any{
+		"role": "assistant", "stopReason": "error", "errorMessage": "Rate limited: quota exhausted",
+		"statusCode": float64(429), "error": map[string]any{"code": "usage_limit"},
+		"diagnostics": []any{map[string]any{"details": map[string]any{"resetsAt": float64(1777673400)}}},
+	}}, Line: []byte("line")}
+	got, term := mapEvent(ev, st)
+	if term {
+		t.Fatal("terminal = true; a message end never ends the turn")
+	}
+	if len(got) != 1 {
+		t.Fatalf("events = %#v, want 1 provider-error event", got)
+	}
+	sys, ok := got[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event %T, want SystemEvent", got[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeProviderError {
+		t.Errorf("Subtype = %q, want provider_error", sys.Subtype)
+	}
+	if sys.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's structured error")
+	}
+	if sys.Upstream.HTTPStatus != 429 {
+		t.Errorf("Upstream.HTTPStatus = %d, want 429", sys.Upstream.HTTPStatus)
+	}
+	if sys.Upstream.ProviderCode != "usage_limit" {
+		t.Errorf("Upstream.ProviderCode = %q, want usage_limit", sys.Upstream.ProviderCode)
+	}
+	if sys.Upstream.ProviderMessage != "Rate limited: quota exhausted" {
+		t.Errorf("Upstream.ProviderMessage = %q", sys.Upstream.ProviderMessage)
+	}
+	if sys.Upstream.ResetAt != "1777673400" {
+		t.Errorf("Upstream.ResetAt = %q, want 1777673400", sys.Upstream.ResetAt)
 	}
 }

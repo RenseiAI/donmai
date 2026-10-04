@@ -24,7 +24,7 @@ func fullOperationalFixture() QueuedWork {
 		OrganizationID: "org-id", Repository: "RenseiAI/donmai", Ref: "refs/heads/main", WorkType: "development",
 		PromptContext: "prompt context", Body: "issue body", Title: "issue title", MentionContext: "mention",
 		ParentContext: "parent", StagePrompt: "stage prompt", StageID: "development",
-		StageBudget:    &prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: 2, MaxTokens: 10000},
+		StageBudget:    &prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: subAgentCap(2), MaxTokens: 10000},
 		StageLifecycle: map[string]any{"policy": "strict", "requiresApproval": true}, StageSourceEventID: "event-id",
 		SystemPromptOverride: "system override",
 		Kits: &kit.ToolchainDemand{

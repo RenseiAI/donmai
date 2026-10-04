@@ -49,6 +49,22 @@ type compositionHarness struct {
 	// closed 409 revision-stale conflict, the way the real preflight does.
 	// Empty keeps the legacy always-acknowledge behavior.
 	heartbeatRequireRevision string
+	// refuseRefreshForController, when set, makes the refresh endpoint refuse
+	// (HTTP 403) a founding declaration that presents the attestation with
+	// the named controller id. It models the platform refusing one org's
+	// founding declaration while still accepting another's.
+	refuseRefreshForController string
+	// refuseRefreshOnceForController, when set, makes the refresh endpoint
+	// refuse (HTTP 403) exactly the next founding declaration that presents
+	// the attestation with the named controller id, then disarms. It models
+	// a founder the platform refuses once and then accepts, so the retry
+	// loop can found with the same configuration it started with.
+	refuseRefreshOnceForController string
+	// refuseFirstProjectedHeartbeat, when set, makes the heartbeat endpoint
+	// refuse (HTTP 403) the next beat carrying a session-shim projection,
+	// then disarms. It models the platform refusing one founder's first
+	// projected heartbeat while still accepting another's.
+	refuseFirstProjectedHeartbeat bool
 }
 
 // setRefreshReceiptState changes what the control plane answers to later
@@ -73,6 +89,31 @@ func (h *compositionHarness) setHeartbeatRequireRevision(revision string) {
 	h.mu.Lock()
 	defer h.mu.Unlock()
 	h.heartbeatRequireRevision = revision
+}
+
+// setRefuseFirstProjectedHeartbeat arms (or, with false, disarms) the
+// heartbeat endpoint's one-shot first-projection refusal. See
+// refuseFirstProjectedHeartbeat.
+func (h *compositionHarness) setRefuseFirstProjectedHeartbeat(refuse bool) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseFirstProjectedHeartbeat = refuse
+}
+
+// setRefuseRefreshForController arms (or, with "", disarms) the refresh
+// endpoint's founding-declaration refusal. See refuseRefreshForController.
+func (h *compositionHarness) setRefuseRefreshForController(controller string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseRefreshForController = controller
+}
+
+// setRefuseRefreshForControllerOnce arms the refresh endpoint's one-shot
+// founding-declaration refusal. See refuseRefreshOnceForController.
+func (h *compositionHarness) setRefuseRefreshForControllerOnce(controller string) {
+	h.mu.Lock()
+	defer h.mu.Unlock()
+	h.refuseRefreshOnceForController = controller
 }
 
 // heartbeats returns every heartbeat body the control plane has received.
@@ -152,7 +193,14 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			_ = json.NewEncoder(w).Encode(resp)
 		case "/api/workers/" + workerID + "/refresh-token":
 			raw, _ := io.ReadAll(r.Body)
+			var presented SessionShimHostAttestation
+			_ = json.Unmarshal(raw, &presented)
 			h.mu.Lock()
+			refuseController := h.refuseRefreshForController
+			refuseOnce := h.refuseRefreshOnceForController
+			if refuseOnce != "" && presented.ControllerID == refuseOnce {
+				h.refuseRefreshOnceForController = ""
+			}
 			h.refreshBodies = append(h.refreshBodies, append([]byte(nil), raw...))
 			// Every refresh mints a DISTINCT token, so a test can tell a refresh
 			// that was adopted from one that was refused before adoption.
@@ -160,14 +208,20 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			state := h.refreshReceiptState
 			revision := h.refreshReceiptRevision
 			h.mu.Unlock()
+			if presented.Supports() && refuseOnce != "" && presented.ControllerID == refuseOnce {
+				http.Error(w, "founding declaration refused", http.StatusForbidden)
+				return
+			}
+			if presented.Supports() && refuseController != "" && presented.ControllerID == refuseController {
+				http.Error(w, "founding declaration refused", http.StatusForbidden)
+				return
+			}
 			if state == "" {
 				state = SessionShimCredentialStateRecovering
 			}
 			if revision == "" {
 				revision = "revision-declared"
 			}
-			var presented SessionShimHostAttestation
-			_ = json.Unmarshal(raw, &presented)
 			resp := refreshResponse{RuntimeToken: token}
 			if presented.Supports() {
 				resp.SessionShim = activationTestCredentialReceipt(
@@ -183,7 +237,15 @@ func newCompositionHarness(t *testing.T) *compositionHarness {
 			h.mu.Lock()
 			h.heartbeatBodies = append(h.heartbeatBodies, body)
 			requireRevision := h.heartbeatRequireRevision
+			refuseFirst := h.refuseFirstProjectedHeartbeat
+			if refuseFirst && body.SessionShim != nil {
+				h.refuseFirstProjectedHeartbeat = false
+			}
 			h.mu.Unlock()
+			if refuseFirst && body.SessionShim != nil {
+				http.Error(w, "first projected heartbeat refused", http.StatusForbidden)
+				return
+			}
 			if requireRevision != "" &&
 				(body.SessionShim == nil || body.SessionShim.AdoptionRevision != requireRevision) {
 				w.WriteHeader(http.StatusConflict)

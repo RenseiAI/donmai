@@ -44,6 +44,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:             true,
 			AcceptsAllowedToolsList:          false,
 			EmitsSubagentEvents:              false,
+			SetsParentToolUseID:              false, // the app-server protocol exposes no parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort:          true,
 			SupportsOneShot:                  true,
 			NativeJSONMode:                   true, // turn/start outputSchema (app-server v2; see turnStartParams)

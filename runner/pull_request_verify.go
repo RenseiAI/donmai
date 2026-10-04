@@ -518,6 +518,9 @@ func (v *sessionPullRequestVerifier) sessionHead(ctx context.Context) (string, e
 // started at — recorded right after provisioning, before the agent's first
 // turn. "" for a run that opens its own pull request.
 func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
+	if qw.ContinuePullRequest != nil && headSHARE.MatchString(qw.ContinuePullRequest.HeadSha) {
+		return qw.ContinuePullRequest.HeadSha
+	}
 	if qw.PullRequest != nil && headSHARE.MatchString(qw.PullRequest.HeadSHA) {
 		return qw.PullRequest.HeadSHA
 	}
@@ -536,6 +539,25 @@ func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
 type pullRequestRejection struct {
 	url    string
 	reason string
+}
+
+// seedContinuedPullRequest accepts the continued pull request as the
+// run's own before tail recovery: the seed goes through the same settle
+// path as a pull request the agent reported, so verification (same
+// repository, head at the session branch or commit) and the no-new-commit
+// and draft delivery rules apply unchanged. A nil verifier (work that owes
+// no pull request) leaves the envelope untouched.
+func (r *Runner) seedContinuedPullRequest(v *sessionPullRequestVerifier, continuedURL string, res *Result, obs *streamObservation) {
+	if v == nil || strings.TrimSpace(continuedURL) == "" {
+		return
+	}
+	seed := streamObservation{pullRequestURL: continuedURL, pullRequestCandidates: []string{continuedURL}}
+	for _, rejection := range v.settle(context.Background(), res, obs, seed) {
+		r.logger.Warn("continued pull request is not this session's pull request; ignored",
+			"url", rejection.url,
+			"reason", rejection.reason,
+		)
+	}
 }
 
 // acceptSessionPullRequest runs the verifier over one turn and logs every

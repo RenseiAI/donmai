@@ -11,7 +11,7 @@ import (
 )
 
 func TestReconcileStageBudgetPreservesOperationalAuthority(t *testing.T) {
-	budget := prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: 3, MaxTokens: 24_000}
+	budget := prompt.StageBudget{MaxDurationSeconds: 1800, MaxSubAgents: subAgentCap(3), MaxTokens: 24_000}
 	different := budget
 	different.MaxTokens++
 	tests := []struct {
@@ -62,7 +62,7 @@ func TestReconcileStageBudgetPreservesOperationalAuthority(t *testing.T) {
 				t.Fatalf("ReconcileStageBudget: %v", err)
 			}
 			if tt.wantSiblingAdopted {
-				if got.StageBudget == nil || *got.StageBudget != budget {
+				if got.StageBudget == nil || !stageBudgetsEqual(got.StageBudget, &budget) {
 					t.Fatalf("legacy StageBudget = %+v, want %+v", got.StageBudget, budget)
 				}
 				return
@@ -80,13 +80,13 @@ func TestPreflightAndSpawnAgreeForAutonomousStageDispatchWithMatchingSiblingBudg
 		budget prompt.StageBudget
 	}{
 		{name: "duration limit only", budget: prompt.StageBudget{MaxDurationSeconds: 1800}},
-		{name: "subagent limit only", budget: prompt.StageBudget{MaxSubAgents: 3}},
+		{name: "subagent limit only", budget: prompt.StageBudget{MaxSubAgents: subAgentCap(3)}},
 		{name: "token limit only", budget: prompt.StageBudget{MaxTokens: 8_000}},
 		{
 			name: "all limits",
 			budget: prompt.StageBudget{
 				MaxDurationSeconds: 1800,
-				MaxSubAgents:       3,
+				MaxSubAgents:       subAgentCap(3),
 				MaxTokens:          24_000,
 			},
 		},

@@ -68,6 +68,11 @@ func TestEvent_AllVariantsRoundTrip(t *testing.T) {
 			EventToolProgress,
 		},
 		{
+			"subagent",
+			SubagentEvent{ToolName: "Task", ToolUseID: "toolu_1", Phase: SubagentStarted, ChildSessionID: "child-1"},
+			EventSubagent,
+		},
+		{
 			"result",
 			ResultEvent{
 				Success: true,

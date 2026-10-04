@@ -20,7 +20,7 @@ permissions:
 jobs:
   release-authority-visibility:
     name: release-authority visibility (read-only)
-    runs-on: blacksmith-2vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       contents: read
@@ -40,7 +40,7 @@ jobs:
   # triggers this workflow's `on:` block doesn't carry, since a PR body edit
   # is the squash-merge message and can introduce a leak no commit contains.
   release-contracts:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 10
     steps:
       - uses: actions/checkout@v7
@@ -50,7 +50,7 @@ jobs:
 
 
   test:
-    runs-on: blacksmith-4vcpu-ubuntu-2404
+    runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v7
@@ -176,3 +176,57 @@ jobs:
       # sit here was continue-on-error, so it gated nothing, and it re-ran
       # `go install ...@latest` on every build — a network fetch of an
       # unpinned tool inside the one job that main requires.
+
+  # The executor confinement suite applies real macOS profiles with
+  # /usr/bin/sandbox-exec and judges what the kernel let through: the
+  # startup self-test over both spawn paths, its discriminating controls (no
+  # backend, same-identity chmod), nested-profile refusal, composer rules and
+  # declared sockets. Those tests are darwin-only, so the Linux `test` job
+  # never runs them; without this job the boundary has no CI coverage at all.
+  macos-confinement:
+    name: macOS executor confinement (seatbelt)
+    runs-on: macos-15
+    timeout-minutes: 25
+    permissions:
+      contents: read
+    steps:
+      - uses: actions/checkout@v7
+        with:
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Set up Go
+        uses: actions/setup-go@v7
+        with:
+          go-version-file: go.mod
+
+      - name: Confinement suite (live sandbox-exec)
+        run: |
+          set -o pipefail
+          # -timeout explicitly: the self-test runs three times under -race
+          # (real backend, no backend, chmod), each through a headless and a
+          # PTY spawn. The job's timeout-minutes is the real cap.
+          go test -race -count=1 -timeout 15m -v ./runtime/confinement/... 2>&1 | tee "${RUNNER_TEMP}/confinement.log"
+
+      - name: Guard — the live confinement tests must RUN, not skip
+        run: |
+          LOG="${RUNNER_TEMP}/confinement.log"
+          if grep -Eq '^\s*--- SKIP: ' "$LOG"; then
+            echo "::error::a confinement test SKIPPED on macos-latest"
+            grep -E '^\s*--- SKIP: ' "$LOG"
+            exit 1
+          fi
+          # Every live test in the darwin-only file must report PASS by name:
+          # a test that silently stops running protects nothing.
+          LIVE=$(grep -oE '^func (TestSeatbelt_[A-Za-z0-9_]+)' runtime/confinement/live_darwin_test.go | awk '{print $2}')
+          if [ -z "$LIVE" ]; then
+            echo "::error::no live confinement tests found"
+            exit 1
+          fi
+          for TEST in $LIVE; do
+            if ! grep -Eq "^--- PASS: ${TEST} " "$LOG"; then
+              echo "::error::${TEST} did not report PASS"
+              exit 1
+            fi
+          done
+          echo "Gate-liveness OK: $(echo "$LIVE" | wc -l | tr -d ' ') live sandbox-exec tests ran and passed, no SKIPs."
