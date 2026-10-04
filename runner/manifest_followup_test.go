@@ -299,6 +299,12 @@ type scriptedSession struct {
 	// (the platform keeps sending the ref pin older runners rely on).
 	continueNumber int
 	continueRef    bool
+	// protectContinue arms a pre-receive hook on the fixture repository
+	// that rejects every push to the continued head branch with a policy
+	// message worded to trip the old diagnostics-text matcher: a policy
+	// rejection of an otherwise fast-forward push must not read as
+	// divergence.
+	protectContinue bool
 	// backstop lets the deterministic backstop run (off by default).
 	backstop bool
 	// stepHeartbeatInterval, when positive, sets the runner's private
@@ -426,6 +432,9 @@ func runScriptedSession(t *testing.T, cfg scriptedSession) (*Result, *verdictScr
 			continueBranch := fmt.Sprintf("continued/pr-%d", cfg.continueNumber)
 			gitRun(t, bare, "branch", continueBranch, "main")
 			gitRun(t, bare, "update-ref", fmt.Sprintf("refs/pull/%d/head", cfg.continueNumber), gitRun(t, bare, "rev-parse", continueBranch))
+			if cfg.protectContinue {
+				installProtectedBranchHook(t, bare, continueBranch)
+			}
 			qw.ContinuePullRequest = &prompt.ContinuePullRequest{
 				Number:  cfg.continueNumber,
 				HeadRef: continueBranch,

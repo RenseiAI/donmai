@@ -8,6 +8,7 @@ import (
 	"strings"
 	"testing"
 
+	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
 )
 
@@ -94,25 +95,114 @@ func TestCheckoutContinuePullRequest_RefusesWrongSHA(t *testing.T) {
 	}
 }
 
-func TestIsContinueDivergence(t *testing.T) {
-	t.Parallel()
-	cases := []struct {
-		name   string
-		output string
-		want   bool
-	}{
-		{name: "fast-forward rejection", output: "! [rejected] HEAD -> feature/x (non-fast-forward)", want: true},
-		{name: "fetch-first hint", output: "! [rejected] HEAD -> feature/x (fetch first)", want: true},
-		{name: "transport failure", output: "error: failed to push some refs: connection reset", want: false},
-		{name: "empty", output: "", want: false},
+// installProtectedBranchHook arms a pre-receive hook on the bare repository
+// that rejects every push to branch with a policy message deliberately
+// worded to trip the old diagnostics-text matcher ("non-fast-forward",
+// "fetch first"): a policy rejection of an otherwise fast-forward push
+// must not read as divergence.
+func installProtectedBranchHook(t *testing.T, bare, branch string) {
+	t.Helper()
+	hook := filepath.Join(bare, "hooks", "pre-receive")
+	script := "#!/bin/sh\n" +
+		"while read old new ref; do\n" +
+		"  if [ \"$ref\" = \"refs/heads/" + branch + "\" ]; then\n" +
+		"    echo \"remote: error: refusing update to protected branch " + branch + " (non-fast-forward policy check: fetch first)\" 1>&2\n" +
+		"    exit 1\n" +
+		"  fi\n" +
+		"done\n" +
+		"exit 0\n"
+	//nolint:gosec // G306: a hook stub must carry the exec bit.
+	if err := os.WriteFile(hook, []byte(script), 0o700); err != nil {
+		t.Fatalf("write pre-receive hook: %v", err)
 	}
-	for _, tc := range cases {
-		t.Run(tc.name, func(t *testing.T) {
-			t.Parallel()
-			if got := isContinueDivergence(tc.output); got != tc.want {
-				t.Fatalf("isContinueDivergence(%q) = %v, want %v", tc.output, got, tc.want)
-			}
-		})
+}
+
+func TestContinueHeadDiverged(t *testing.T) {
+	const branch = "continued/pr-12"
+
+	t.Run("moved head is diverged", func(t *testing.T) {
+		remote, repo := backstopRemoteFixture(t)
+		gitRun(t, repo, "push", "-q", "origin", "origin/main:refs/heads/"+branch)
+		gitRun(t, repo, "fetch", "-q", "origin", branch)
+		gitRun(t, repo, "checkout", "-q", branch)
+		writeFile(t, repo, "src/fix.go", "package fix\n")
+		// Someone else pushes to the continued branch after dispatch.
+		other := t.TempDir()
+		//nolint:gosec // G204: test fixture, paths come from t.TempDir.
+		if out, err := exec.Command("git", "clone", "-q", remote, other).CombinedOutput(); err != nil {
+			t.Fatalf("git clone: %v\n%s", err, out)
+		}
+		gitRun(t, other, "config", "user.email", "test@example.com")
+		gitRun(t, other, "config", "user.name", "test")
+		gitRun(t, other, "config", "commit.gpgsign", "false")
+		gitRun(t, other, "fetch", "-q", "origin", branch)
+		gitRun(t, other, "checkout", "-q", branch)
+		writeFile(t, other, "src/other.go", "package other\n")
+		gitRun(t, other, "add", "-A")
+		gitRun(t, other, "commit", "-q", "-m", "someone else")
+		gitRun(t, other, "push", "-q", "origin", branch)
+		if !continueHeadDiverged(context.Background(), repo, branch) {
+			t.Fatal("continueHeadDiverged = false after the head moved; want true")
+		}
+	})
+
+	t.Run("fast-forwardable head is not diverged", func(t *testing.T) {
+		_, repo := backstopRemoteFixture(t)
+		gitRun(t, repo, "push", "-q", "origin", "origin/main:refs/heads/"+branch)
+		gitRun(t, repo, "fetch", "-q", "origin", branch)
+		gitRun(t, repo, "checkout", "-q", branch)
+		writeFile(t, repo, "src/fix.go", "package fix\n")
+		if continueHeadDiverged(context.Background(), repo, branch) {
+			t.Fatal("continueHeadDiverged = true with the remote head behind the session; want false")
+		}
+	})
+
+	t.Run("policy rejection is not diverged", func(t *testing.T) {
+		remote, repo := backstopRemoteFixture(t)
+		gitRun(t, repo, "push", "-q", "origin", "origin/main:refs/heads/"+branch)
+		installProtectedBranchHook(t, remote, branch)
+		gitRun(t, repo, "fetch", "-q", "origin", branch)
+		gitRun(t, repo, "checkout", "-q", branch)
+		writeFile(t, repo, "src/fix.go", "package fix\n")
+		gitRun(t, repo, "add", "-A")
+		gitRun(t, repo, "commit", "-q", "-m", "session work")
+		// The hook rejects the push with the old matcher's trigger words;
+		// the ancestry probe must still say the head did not move.
+		if out, err := runGit(context.Background(), repo, gitIdentity{}, "push", "origin", "HEAD:refs/heads/"+branch); err == nil {
+			t.Fatal("hook setup: push succeeded, want the policy rejection")
+		} else if !strings.Contains(out, "non-fast-forward") {
+			t.Fatalf("push output = %q; want the hook's misleading wording present", out)
+		}
+		if continueHeadDiverged(context.Background(), repo, branch) {
+			t.Fatal("continueHeadDiverged = true for a policy rejection; want false")
+		}
+	})
+
+	t.Run("empty ref is not diverged", func(t *testing.T) {
+		_, repo := backstopRemoteFixture(t)
+		if continueHeadDiverged(context.Background(), repo, "") {
+			t.Fatal("continueHeadDiverged with an empty ref = true; want false")
+		}
+	})
+}
+
+func TestContinueDivergedFlag(t *testing.T) {
+	t.Parallel()
+	if continueDiverged(nil) {
+		t.Fatal("continueDiverged(nil) = true; want false")
+	}
+	if continueDiverged(&agent.BackstopReport{}) {
+		t.Fatal("continueDiverged(empty) = true; want false")
+	}
+	// Diagnostics text alone — the old signal — must not count.
+	if continueDiverged(&agent.BackstopReport{Diagnostics: ErrContinuePullRequestDiverged.Error() + ": something moved"}) {
+		t.Fatal("continueDiverged(diagnostics-only) = true; want false: the flag decides, not text")
+	}
+	if !continueDiverged(&agent.BackstopReport{ContinueDiverged: true}) {
+		t.Fatal("continueDiverged(flag) = false; want true")
+	}
+	if !continueDiverged(&agent.BackstopReport{Repositories: []agent.RepositoryBackstopReport{{Name: "primary", Report: agent.BackstopReport{ContinueDiverged: true}}}}) {
+		t.Fatal("continueDiverged(aggregate) = false; want true: a declared session folds the flag")
 	}
 }
 
@@ -216,6 +306,9 @@ func TestRunBackstop_ContinueModeRefusesDivergence(t *testing.T) {
 	}
 	if !strings.Contains(report.Diagnostics, ErrContinuePullRequestDiverged.Error()) {
 		t.Fatalf("diagnostics = %q, want typed divergence reason", report.Diagnostics)
+	}
+	if !report.ContinueDiverged {
+		t.Fatal("report.ContinueDiverged = false; want the typed divergence flag set")
 	}
 }
 
@@ -399,6 +492,9 @@ func TestRun_ContinueModeDivergedHeadIsTyped(t *testing.T) {
 	if strings.Contains(res.Error, "no new commit") {
 		t.Fatalf("Error = %q; the session committed, so it must not read as no new commit", res.Error)
 	}
+	if res.BackstopReport == nil || !res.BackstopReport.ContinueDiverged {
+		t.Fatalf("BackstopReport = %+v; want the typed divergence flag set", res.BackstopReport)
+	}
 	// Nothing was forced: the other author's commit is still the head.
 	if got := gitRun(t, res.WorktreePath, "ls-remote", "origin", "refs/heads/"+branch); !strings.HasPrefix(got, moved) {
 		t.Fatalf("continued head = %q; want the other author's commit %s left in place", got, moved)
@@ -409,6 +505,43 @@ func TestRun_ContinueModeDivergedHeadIsTyped(t *testing.T) {
 	}
 	if !strings.Contains(string(status["error"]), ErrContinuePullRequestDiverged.Error()) {
 		t.Fatalf("posted error = %s; want the typed divergence reason", status["error"])
+	}
+}
+
+// TestRun_ContinueModeProtectedRejectionIsNotDiverged proves the typed
+// signal through the production entry point: the continued head never
+// moves, but a server-side policy hook rejects the push with the old
+// text matcher's trigger words. The run must fail as a backstop failure
+// — never as divergence — because the fetched head is still an ancestor
+// of the session's work.
+func TestRun_ContinueModeProtectedRejectionIsNotDiverged(t *testing.T) {
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:        "development",
+		skipSteering:    true,
+		repository:      "https://github.com/example/repo",
+		continueNumber:  12,
+		backstop:        true,
+		protectContinue: true,
+		turns: []verdictScriptTurn{{
+			manifest: passedManifest,
+			text:     "WORK_RESULT:passed",
+			files:    map[string]string{"fix.go": "package fix\n"},
+		}},
+	})
+	if res.Status != "failed" || res.FailureMode != FailureBackstop {
+		t.Fatalf("Status = %q (%s: %s); want failed %s", res.Status, res.FailureMode, res.Error, FailureBackstop)
+	}
+	if res.FailureMode == FailureContinuePullRequestDiverged {
+		t.Fatalf("FailureMode = %q; a policy rejection must not read as divergence", res.FailureMode)
+	}
+	if res.BackstopReport == nil {
+		t.Fatal("BackstopReport is nil; want the push failure recorded")
+	}
+	if res.BackstopReport.ContinueDiverged {
+		t.Fatal("BackstopReport.ContinueDiverged = true; want false for a policy rejection")
+	}
+	if got := res.BackstopReport.Diagnostics; !strings.Contains(got, "non-fast-forward") {
+		t.Fatalf("diagnostics = %q; want the hook's wording present so the test proves text alone would mislabel it", got)
 	}
 }
 
