@@ -5,6 +5,8 @@ import (
 	"fmt"
 	"math"
 	"strconv"
+	"strings"
+	"sync"
 
 	"github.com/RenseiAI/donmai/agent"
 )
@@ -187,6 +189,80 @@ type rawAPIError struct {
 // in `Raw` so the runner can persist it to <worktree>/.agent/events.jsonl per
 // F.1.1 §4 step 9. LlmCallEvent is the deliberate exception: it stays
 // metadata/digest-only and never duplicates prompt/completion content.
+// delegationToolName reports whether name is one of this adapter's native
+// sub-agent delegation tools. The adapter names its own delegation tools
+// (matched the same way the runner historically matched them: "Task" and
+// "Agent", case-insensitive with MCP-style namespace suffixes); the
+// runner keeps no list of tool names and counts the typed SubagentEvent
+// the mapper emits instead.
+func delegationToolName(name string) bool {
+	n := strings.ToLower(strings.TrimSpace(name))
+	if n == "task" || n == "agent" {
+		return true
+	}
+	return strings.HasSuffix(n, "__task") || strings.HasSuffix(n, "__agent")
+}
+
+// LineMapper is the stateful stream-json line mapper. It pairs delegation
+// tool calls with their results by ToolUseID so a delegation emits the
+// typed sub-agent lifecycle (started on the tool_use line, completed or
+// failed on the matching tool_result line) alongside the plain tool events.
+// The zero value is ready to use; concurrent callers are safe.
+type LineMapper struct {
+	mu      sync.Mutex
+	pending map[string]string // ToolUseID -> delegation tool name
+}
+
+// MapLine maps one JSONL line, tracking delegation pairs across lines.
+func (m *LineMapper) MapLine(line []byte) []agent.Event {
+	events := mapLine(line)
+	if m == nil {
+		return events
+	}
+	out := make([]agent.Event, 0, len(events)+1)
+	m.mu.Lock()
+	defer m.mu.Unlock()
+	if m.pending == nil {
+		m.pending = make(map[string]string)
+	}
+	for _, ev := range events {
+		out = append(out, ev)
+		switch e := ev.(type) {
+		case agent.ToolUseEvent:
+			if e.ToolUseID == "" || !delegationToolName(e.ToolName) {
+				continue
+			}
+			m.pending[e.ToolUseID] = e.ToolName
+			out = append(out, agent.SubagentEvent{
+				ToolName:  e.ToolName,
+				ToolUseID: e.ToolUseID,
+				Phase:     agent.SubagentStarted,
+				Raw:       e.Raw,
+			})
+		case agent.ToolResultEvent:
+			name, ok := m.pending[e.ToolUseID]
+			if e.ToolUseID == "" || !ok {
+				continue
+			}
+			delete(m.pending, e.ToolUseID)
+			phase := agent.SubagentCompleted
+			if e.IsError {
+				phase = agent.SubagentFailed
+			}
+			if e.ToolName != "" {
+				name = e.ToolName
+			}
+			out = append(out, agent.SubagentEvent{
+				ToolName:  name,
+				ToolUseID: e.ToolUseID,
+				Phase:     phase,
+				Raw:       e.Raw,
+			})
+		}
+	}
+	return out
+}
+
 func mapLine(line []byte) []agent.Event {
 	var head rawJSONLEnvelope
 	if err := json.Unmarshal(line, &head); err != nil {
