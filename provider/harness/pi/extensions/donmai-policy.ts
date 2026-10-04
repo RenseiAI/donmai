@@ -669,6 +669,30 @@ export default async function activate(pi: ExtensionAPI) {
       : thinkingLevel === "" && api === "openai-completions"
         ? { supportsReasoningEffort: false }
         : undefined;
+  // Per-token price pin: the runner exports the endpoint binding's
+  // optional per-token prices (USD per million tokens) on
+  // DONMAI_PI_PRICE_{INPUT,OUTPUT,CACHE_READ,CACHE_WRITE} plus the
+  // DONMAI_PI_PRICES_BOUND presence flag (extension.go unitPricePinEnv).
+  // Bound prices register as the model's cost table so pi computes the
+  // real per-turn cost. Unbound, a zero cost table is registered (pi
+  // requires the cost field, and omitting it crashes its cost
+  // computation) while the Go mapper suppresses the reported cost, so
+  // the session reads as cost-absent, not $0. A non-nil but all-zero
+  // binding is an explicit zero price, not an absent one.
+  const pricesBound = process.env.DONMAI_PI_PRICES_BOUND === "1";
+  const priceEnv = (name) => {
+    const raw = process.env[name] ?? "";
+    const value = Number(raw);
+    return Number.isFinite(value) && value >= 0 ? value : 0;
+  };
+  const modelCost = pricesBound
+    ? {
+        input: priceEnv("DONMAI_PI_PRICE_INPUT"),
+        output: priceEnv("DONMAI_PI_PRICE_OUTPUT"),
+        cacheRead: priceEnv("DONMAI_PI_PRICE_CACHE_READ"),
+        cacheWrite: priceEnv("DONMAI_PI_PRICE_CACHE_WRITE"),
+      }
+    : { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 };
   if (baseUrl && model) {
     try {
       pi.registerProvider("donmai", {
@@ -681,7 +705,7 @@ export default async function activate(pi: ExtensionAPI) {
             name: model,
             reasoning: true,
             input: ["text"],
-            cost: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0 },
+            cost: modelCost,
             contextWindow,
             ...(maxTokens === undefined ? {} : { maxTokens }),
             ...(thinkingLevelMap === undefined ? {} : { thinkingLevelMap }),

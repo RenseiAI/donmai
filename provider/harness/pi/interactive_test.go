@@ -29,6 +29,11 @@ printf '%s\n' "$@" > "$PWD/argv.txt"
   printf 'DONMAI_PI_MODEL=%s\n' "$DONMAI_PI_MODEL"
   printf 'DONMAI_PI_KEY=%s\n' "$DONMAI_PI_KEY"
   printf 'DONMAI_PI_HANDSHAKE=[%s]\n' "$DONMAI_PI_HANDSHAKE"
+  printf 'DONMAI_PI_PRICES_BOUND=%s\n' "$DONMAI_PI_PRICES_BOUND"
+  printf 'DONMAI_PI_PRICE_INPUT=%s\n' "$DONMAI_PI_PRICE_INPUT"
+  printf 'DONMAI_PI_PRICE_OUTPUT=%s\n' "$DONMAI_PI_PRICE_OUTPUT"
+  printf 'DONMAI_PI_PRICE_CACHE_READ=%s\n' "$DONMAI_PI_PRICE_CACHE_READ"
+  printf 'DONMAI_PI_PRICE_CACHE_WRITE=%s\n' "$DONMAI_PI_PRICE_CACHE_WRITE"
   printf 'PI_HOME=%s\n' "$PI_HOME"
 } > "$PWD/env.txt"
 `
@@ -410,6 +415,90 @@ func TestSpawn_Interactive_MismatchedEndpointFailsLoudly(t *testing.T) {
 	})
 	if err == nil {
 		t.Fatal("Spawn: want error for an unroutable endpoint host on the interactive lane, got nil")
+	}
+}
+
+// interactiveGatewaySpec builds the gateway-backed spec the PTY price tests
+// share: an aggregator slug served through the injected provider lane.
+func interactiveGatewaySpec(workdir string, prices *agent.UnitPrices) agent.Spec {
+	return agent.Spec{
+		Cwd:         workdir,
+		Interactive: &agent.InteractiveSpec{Cols: 80, Rows: 24},
+		Endpoint: &agent.EndpointBinding{
+			Company:    agent.CompanyAnthropic,
+			Model:      "agg-vendor/claude-3-haiku",
+			Protocol:   agent.ProtoOpenAIChat,
+			Host:       agent.HostDirect,
+			BaseURL:    "https://ai-gateway.invalid/v1",
+			Env:        map[string]string{"OPENAI_API_KEY": "gw-secret"},
+			UnitPrices: prices,
+		},
+	}
+}
+
+// TestSpawn_Interactive_BoundPricesReachPTYChild drives the production
+// interactive Spawn entry point with a priced binding: the PTY child env
+// carries the bound flag plus all four rates, so the extension registers
+// the real cost table on this lane too.
+func TestSpawn_Interactive_BoundPricesReachPTYChild(t *testing.T) {
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	h, err := p.Spawn(context.Background(), interactiveGatewaySpec(workdir,
+		&agent.UnitPrices{Input: 3, Output: 15, CacheRead: 0.3, CacheWrite: 3.75}))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	env := readCapturedFile(t, workdir, "env.txt")
+	for _, want := range []string{
+		"DONMAI_PI_PRICES_BOUND=1",
+		"DONMAI_PI_PRICE_INPUT=3",
+		"DONMAI_PI_PRICE_OUTPUT=15",
+		"DONMAI_PI_PRICE_CACHE_READ=0.3",
+		"DONMAI_PI_PRICE_CACHE_WRITE=3.75",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("PTY child env missing %q; got:\n%s", want, env)
+		}
+	}
+}
+
+// TestSpawn_Interactive_UnboundPricesClearPTYChild drives the production
+// interactive Spawn entry point with no prices bound: every price key is
+// present but empty in the PTY child env, so no inherited stale price
+// survives. RED proof: drop the price pin from interactiveChildEnv and the
+// stale host values below ride into the child.
+func TestSpawn_Interactive_UnboundPricesClearPTYChild(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv(piPricesBoundEnvVar, "1")
+	t.Setenv(piPriceInputEnvVar, "99")
+	t.Setenv(piPriceOutputEnvVar, "99")
+	t.Setenv(piPriceCacheReadEnvVar, "99")
+	t.Setenv(piPriceCacheWriteEnvVar, "99")
+
+	workdir := t.TempDir()
+	p := newFakeInteractivePiProvider(t, captureArgvEnvScript)
+	h, err := p.Spawn(context.Background(), interactiveGatewaySpec(workdir, nil))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = h.Stop(context.Background()) })
+	awaitPTYExit(t, h)
+	env := readCapturedFile(t, workdir, "env.txt")
+	for _, want := range []string{
+		"DONMAI_PI_PRICES_BOUND=\n",
+		"DONMAI_PI_PRICE_INPUT=\n",
+		"DONMAI_PI_PRICE_OUTPUT=\n",
+		"DONMAI_PI_PRICE_CACHE_READ=\n",
+		"DONMAI_PI_PRICE_CACHE_WRITE=\n",
+	} {
+		if !strings.Contains(env, want) {
+			t.Errorf("PTY child env missing clearing entry %q; got:\n%s", want, env)
+		}
+	}
+	if strings.Contains(env, "=99") {
+		t.Errorf("stale inherited price survived into the PTY child; got:\n%s", env)
 	}
 }
 
