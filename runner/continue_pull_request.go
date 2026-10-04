@@ -49,6 +49,16 @@ func continuePullRequestBranch(cpr *prompt.ContinuePullRequest) string {
 	return strings.TrimSpace(cpr.HeadRef)
 }
 
+// continueBranchRef returns the fully-qualified branch ref for a
+// continued head branch name, so a fetch names the branch explicitly.
+// A short name would let a same-named remote tag win, because git
+// matches tags before branches when resolving a bare refspec.
+func continueBranchRef(headRef string) string {
+	ref := strings.TrimSpace(headRef)
+	ref = strings.TrimPrefix(ref, "refs/heads/")
+	return "refs/heads/" + ref
+}
+
 // continuePullRequestURL builds the run's pull request URL from the session
 // repository and the continued number. It resolves the repository the same
 // way the verifier does — the declared selected source, else the dispatched
@@ -87,7 +97,7 @@ func continuePullRequestURL(ctx context.Context, qw QueuedWork, declaration *wor
 func checkoutContinuePullRequest(ctx context.Context, worktreePath string, cpr *prompt.ContinuePullRequest) error {
 	headRef := strings.TrimSpace(cpr.HeadRef)
 	headSha := strings.TrimSpace(cpr.HeadSha)
-	if _, err := runGit(ctx, worktreePath, gitIdentity{}, "fetch", "origin", headRef); err != nil {
+	if _, err := runGit(ctx, worktreePath, gitIdentity{}, "fetch", "origin", continueBranchRef(headRef)); err != nil {
 		return fmt.Errorf("runner: fetch continued pull request branch %q: %w", headRef, err)
 	}
 	// Prove the fetched head IS the dispatched head before checking it
@@ -167,7 +177,7 @@ func continueHeadDiverged(ctx context.Context, worktreePath, headRef string) boo
 	}
 	probeCtx, cancel := context.WithTimeout(ctx, 30*time.Second)
 	defer cancel()
-	if _, err := runGit(probeCtx, worktreePath, gitIdentity{}, "fetch", "origin", headRef); err != nil {
+	if _, err := runGit(probeCtx, worktreePath, gitIdentity{}, "fetch", "origin", continueBranchRef(headRef)); err != nil {
 		return false
 	}
 	_, err := runGit(probeCtx, worktreePath, gitIdentity{}, "merge-base", "--is-ancestor", "FETCH_HEAD", "HEAD")

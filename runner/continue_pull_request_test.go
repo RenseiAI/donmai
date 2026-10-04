@@ -95,6 +95,34 @@ func TestCheckoutContinuePullRequest_RefusesWrongSHA(t *testing.T) {
 	}
 }
 
+// TestCheckoutContinuePullRequest_IgnoresSameNamedTag proves the checkout
+// fetches the branch explicitly: a same-named remote tag pointing at a
+// different commit must not satisfy the head pin.
+func TestCheckoutContinuePullRequest_IgnoresSameNamedTag(t *testing.T) {
+	remote, repo := backstopRemoteFixture(t)
+	gitRun(t, repo, "push", "-q", "origin", "origin/develop:refs/heads/continued/pr-12")
+	head := gitRun(t, remote, "rev-parse", "refs/heads/continued/pr-12")
+	other := gitRun(t, remote, "rev-parse", "refs/heads/main")
+	if head == other {
+		t.Fatal("fixture setup: heads must differ")
+	}
+	// Point a same-named tag at the wrong commit: a checkout that fetches
+	// the short name resolves the tag and compares against the wrong head.
+	gitRun(t, repo, "-c", "tag.gpgsign=false", "tag", "continued/pr-12", other)
+	gitRun(t, repo, "push", "-q", "origin", "tag", "continued/pr-12")
+	if got := gitRun(t, remote, "rev-parse", "refs/tags/continued/pr-12"); got != other {
+		t.Fatalf("remote tag = %q, want %q", got, other)
+	}
+	gitRun(t, repo, "checkout", "-q", "main")
+	cpr := &prompt.ContinuePullRequest{Number: 12, HeadRef: "continued/pr-12", HeadSha: head}
+	if err := checkoutContinuePullRequest(context.Background(), repo, cpr); err != nil {
+		t.Fatalf("checkoutContinuePullRequest with a same-named tag: %v", err)
+	}
+	if got := gitRun(t, repo, "rev-parse", "HEAD"); got != head {
+		t.Fatalf("HEAD = %q, want dispatched head %q", got, head)
+	}
+}
+
 // installProtectedBranchHook arms a pre-receive hook on the bare repository
 // that rejects every push to branch with a policy message deliberately
 // worded to trip the old diagnostics-text matcher ("non-fast-forward",
@@ -178,10 +206,66 @@ func TestContinueHeadDiverged(t *testing.T) {
 		}
 	})
 
+	t.Run("same-named tag does not shadow the branch", func(t *testing.T) {
+		remote, repo := backstopRemoteFixture(t)
+		// The continued branch matches the session checkout: the fetched
+		// remote head is an ancestor of the session's HEAD, so the probe
+		// must report no divergence.
+		gitRun(t, repo, "push", "-q", "origin", "origin/main:refs/heads/"+branch)
+		gitRun(t, repo, "fetch", "-q", "origin", branch)
+		gitRun(t, repo, "checkout", "-q", branch)
+		writeFile(t, repo, "src/fix.go", "package fix\n")
+		// A tag with the same name as the branch points at a commit the
+		// session does not carry: a probe that fetches the short name
+		// resolves the tag first and misreads the branch as diverged.
+		seedTree := gitRun(t, repo, "rev-parse", "HEAD^{tree}")
+		tagTarget := gitRun(t, repo, "-c", "user.name=test", "-c", "user.email=test@example.com", "commit-tree", seedTree, "-m", "same-named tag")
+		gitRun(t, repo, "-c", "tag.gpgsign=false", "tag", branch, tagTarget)
+		gitRun(t, repo, "push", "-q", "origin", "tag", branch)
+		if got := gitRun(t, remote, "rev-parse", "refs/tags/"+branch); got != tagTarget {
+			t.Fatalf("remote tag = %q, want %q", got, tagTarget)
+		}
+		if continueHeadDiverged(context.Background(), repo, branch) {
+			t.Fatal("continueHeadDiverged = true with a same-named tag; want false: the probe must fetch the branch, not the tag")
+		}
+	})
+
 	t.Run("empty ref is not diverged", func(t *testing.T) {
 		_, repo := backstopRemoteFixture(t)
 		if continueHeadDiverged(context.Background(), repo, "") {
 			t.Fatal("continueHeadDiverged with an empty ref = true; want false")
+		}
+	})
+
+	t.Run("failed fetch is not diverged", func(t *testing.T) {
+		// A probe that cannot read the remote proves nothing: an unknown
+		// ref fails the fetch, and the failure must read as "not
+		// diverged", never as divergence.
+		_, repo := backstopRemoteFixture(t)
+		if out, err := runGit(context.Background(), repo, gitIdentity{}, "fetch", "origin", continueBranchRef("continued/does-not-exist")); err == nil {
+			t.Fatalf("fixture setup: fetch of a missing ref succeeded: %q", out)
+		}
+		if continueHeadDiverged(context.Background(), repo, "continued/does-not-exist") {
+			t.Fatal("continueHeadDiverged = true for a failed fetch; want false")
+		}
+	})
+
+	t.Run("unreadable ancestry is not diverged", func(t *testing.T) {
+		// merge-base exits 128 when the ancestry question cannot even be
+		// asked (here an unborn HEAD): a usage-level git failure is not
+		// proof the remote head moved.
+		_, repo := backstopRemoteFixture(t)
+		gitRun(t, repo, "push", "-q", "origin", "origin/main:refs/heads/continued/pr-12")
+		const orphan = "orphan-probe-branch"
+		gitRun(t, repo, "checkout", "-q", "--orphan", orphan)
+		gitRun(t, repo, "rm", "-q", "-rf", ".")
+		if out, err := runGit(context.Background(), repo, gitIdentity{}, "merge-base", "--is-ancestor", "HEAD", "HEAD"); err == nil {
+			t.Fatalf("fixture setup: merge-base on an unborn HEAD succeeded: %q", out)
+		} else if exitErr, ok := err.(*exec.ExitError); !ok || exitErr.ExitCode() != 128 {
+			t.Fatalf("fixture setup: merge-base err = %v (%q); want exit 128", err, out)
+		}
+		if continueHeadDiverged(context.Background(), repo, "continued/pr-12") {
+			t.Fatal("continueHeadDiverged = true with an unreadable HEAD; want false")
 		}
 	})
 }
