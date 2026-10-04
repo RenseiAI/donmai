@@ -108,6 +108,11 @@ type recordingPlatformServer struct {
 	statuses [][]byte
 	// stepHeartbeats are the bodies of every /step-heartbeat post, in order.
 	stepHeartbeats [][]byte
+	// stepBeatNotify, when non-nil, gets a non-blocking send for every
+	// /step-heartbeat post so a test can wait for the next beat without
+	// polling. Buffered by the test; a full buffer coalesces wakeups and
+	// the waiter always re-scans the full history, so no beat is missed.
+	stepBeatNotify chan struct{}
 }
 
 // terminalStatus returns the last terminal /status body the double received,
@@ -178,7 +183,14 @@ func newRecordingPlatformServer(t *testing.T) *recordingPlatformServer {
 			body, _ := io.ReadAll(r.Body)
 			rec.mu.Lock()
 			rec.stepHeartbeats = append(rec.stepHeartbeats, body)
+			notify := rec.stepBeatNotify
 			rec.mu.Unlock()
+			if notify != nil {
+				select {
+				case notify <- struct{}{}:
+				default:
+				}
+			}
 		}
 		if strings.HasSuffix(r.URL.Path, "/status") {
 			body, _ := io.ReadAll(r.Body)
