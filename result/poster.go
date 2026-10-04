@@ -297,6 +297,12 @@ type statusRequest struct {
 	// one the flag that the delivered work ran over its budget. Additive;
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
+
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -511,7 +517,7 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach,
+		BudgetBreach: r.BudgetBreach, ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

@@ -1968,9 +1968,12 @@ func (r *Runner) drainMemoryInjects(
 				return merged
 			}
 			// Re-consume the resume turn's events so the follow-up work
-			// (commit/PR/cost) is observed + mirrored.
+			// (commit/PR/cost) is observed + mirrored. The merged
+			// observation keeps the latest turn's scalar fields and sums
+			// every buffered turn's tool calls; the caller applies it to
+			// the envelope exactly once.
 			injRes, _ := r.consumeEvents(ctx, handle, worktreePath, qw, res, enforcer, sink, traceProcessor)
-			injRes.applyTo(res, res.ProviderName)
+			injRes.toolCalls += merged.toolCalls
 			merged = injRes
 			if enforcer != nil && enforcer.breached() != nil {
 				// A budget cap ended the turn: deliver nothing more.
@@ -2088,8 +2091,10 @@ func (o streamObservation) verdict() string {
 	return o.workResult
 }
 
-// applyTo merges the observation into a Result envelope. Idempotent
-// when called multiple times (e.g. after steering re-consumes events).
+// applyTo merges the observation into a Result envelope. Scalar fields
+// are last-wins and idempotent when called multiple times (e.g. after
+// steering re-consumes events); ToolCalls instead accumulates, so each
+// distinct turn observation must be applied exactly once.
 func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName) {
 	if res.ProviderName == "" {
 		res.ProviderName = providerName
@@ -2106,6 +2111,12 @@ func (o streamObservation) applyTo(res *Result, providerName agent.ProviderName)
 	if o.reviewVerdict != "" {
 		res.ReviewVerdict = o.reviewVerdict
 	}
+	// Tool-call count accumulates across every turn applied to the
+	// envelope: the initial turn, injected turns, continuations and
+	// in-session retries each contribute their own stream count exactly
+	// once (drainMemoryInjects merges its turns before this runs, so a
+	// buffered inject is never counted twice).
+	res.ToolCalls += o.toolCalls
 	// Cost is not taken from the stream: the session's usage meter (the
 	// budget enforcer) counts every turn, and runLoop reports its total.
 	//
