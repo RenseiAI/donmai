@@ -354,7 +354,10 @@ const stubPi = {
 };
 
 const mod = await import(dataURL);
-mod.default(stubPi);
+// activate is async (its last step registers the sequential tool overrides);
+// every handler is registered before that step, but await it anyway so the
+// verdict below never races the activation.
+await mod.default(stubPi);
 
 const handler = handlers["tool_call"];
 if (!handler) {

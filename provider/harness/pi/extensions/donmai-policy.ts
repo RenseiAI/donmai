@@ -54,6 +54,12 @@
 //     — those stay Unsupported on the interactive profile because they need
 //     the Go round trip this lane does not run.
 //
+//   - Sequential shell and file-write tools: bash, write and edit are
+//     re-registered under their own names with executionMode "sequential",
+//     so a batch of tool calls from one assistant message that includes any
+//     of them runs one call at a time, in order. Ordering only, layered under
+//     the boundary: see registerSequentialTools below.
+//
 //   - Provider pin: at load the factory registers a single "donmai" provider
 //     from env (baseUrl / api / key / model, plus an optional context-window
 //     size), so the session can only reach the resolved cell endpoint. The
@@ -61,7 +67,10 @@
 //     inlined in this source (so the source SHA stays stable and verifiable).
 //
 // This file is intentionally dependency-free (node builtins + a type-only
-// import) and brand-neutral.
+// import) and brand-neutral. The one exception is a guarded dynamic import of
+// the host pi package's own tool factories for the sequential-tools override;
+// it runs after every policy handler is registered, and nothing in the
+// boundary depends on it resolving (see registerSequentialTools).
 
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { readFileSync } from "node:fs";
@@ -473,7 +482,83 @@ export function evaluateLocalToolPolicy(
   return undefined;
 }
 
-export default function activate(pi: ExtensionAPI) {
+// --- Sequential shell and file-write tools (ordering, not a trust layer) ---
+//
+// pi executes the tool calls of one assistant message concurrently by
+// default: it runs every call's tool_call hook first, in order, and only then
+// starts all the executions together. A batch of dependent shell calls (git
+// add, git status, git commit) therefore races. The runtime's own switch is a
+// per-tool executionMode: when ANY call in a batch names a tool registered
+// with executionMode "sequential", the whole batch runs one call at a time in
+// the order the model wrote it, each call's tool_call hook running right
+// before its own execution (verified against the pinned agent-core's
+// executeToolCalls). pi offers no other knob for this, and the tool_call hook
+// cannot provide it: in a parallel batch every hook has returned before the
+// first execution starts, so a queue held inside the hook would deadlock.
+//
+// So bash, write and edit are re-registered under their own names, with
+// executionMode "sequential" and pi's own implementation. The override sits
+// UNDER the boundary, never around it:
+//
+//   - pi fires tool_call for an overriding tool exactly as for the built-in,
+//     keyed on the unchanged tool name, so adjudication, the bounds rail
+//     (timeout clamp, pipefail prelude) and the state-dir guard all still
+//     run, and their in-place input mutations are the params execute gets.
+//   - execute delegates to pi's own factory for that tool, built for the
+//     session's working directory (ctx.cwd), so the tool behaves as the
+//     built-in does apart from ordering. Residual: the built-in bash also
+//     receives the shellPath / shellCommandPrefix settings, which an
+//     extension cannot read; the override runs pi's default shell resolution.
+//
+// The factories come from the host pi package through a dynamic import that
+// runs only after every policy handler is registered. A static import would
+// make the whole boundary fail to load wherever that module does not resolve
+// (the scripted fixtures load this file from a data: URL; a later pi could
+// rename an export), and in the interactive lane a failed load runs the
+// session with no local rail at all. Here a failed import or an unusable
+// factory changes nothing: the built-ins stay registered, unordered, and the
+// boundary is untouched. Ordering is best-effort; the boundary is not.
+const SEQUENTIAL_TOOL_FACTORIES = [
+  ["bash", "createBashToolDefinition"],
+  ["write", "createWriteToolDefinition"],
+  ["edit", "createEditToolDefinition"],
+];
+
+// sequentialToolOverride builds the sequential override for one tool from
+// pi's own factory, or returns undefined when the factory is unusable (not a
+// function, or it built a definition for some other tool). Exported for the
+// scripted conformance fixture (testdata/tool-call-bounds-harness.mjs).
+export function sequentialToolOverride(factory: any, toolName: string, fallbackCwd: string): any {
+  if (typeof factory !== "function") return undefined;
+  const template = factory(fallbackCwd);
+  if (!template || template.name !== toolName || typeof template.execute !== "function") return undefined;
+  return {
+    ...template,
+    executionMode: "sequential",
+    execute(toolCallId: string, params: any, signal: any, onUpdate: any, ctx: any) {
+      const cwd = typeof ctx?.cwd === "string" && ctx.cwd !== "" ? ctx.cwd : fallbackCwd;
+      return factory(cwd).execute(toolCallId, params, signal, onUpdate, ctx);
+    },
+  };
+}
+
+// registerSequentialTools registers the overrides. Called LAST in both lanes,
+// after every tool_call handler is in place; it never throws.
+async function registerSequentialTools(pi: ExtensionAPI): Promise<void> {
+  try {
+    const host: any = await import("@earendil-works/pi-coding-agent");
+    const fallbackCwd = process.cwd();
+    for (const [toolName, factoryName] of SEQUENTIAL_TOOL_FACTORIES) {
+      const override = sequentialToolOverride(host?.[factoryName], toolName, fallbackCwd);
+      if (override) pi.registerTool(override as never);
+    }
+  } catch {
+    // The host package did not resolve or a factory threw: the built-ins
+    // stay as they are and the boundary above is unaffected.
+  }
+}
+
+export default async function activate(pi: ExtensionAPI) {
   // The harness sets DONMAI_PI_HANDSHAKE only for the headless RPC lane. Its
   // PRESENCE is what distinguishes the two spawn modes to this extension:
   //
@@ -597,8 +682,9 @@ export default function activate(pi: ExtensionAPI) {
         return evaluateLocalToolPolicy(allowed, disallowed, tool, event?.input ?? {});
       }
     });
-    // Provider registration already ran, which is everything else this mode
-    // needs from us — no handshake, no Go-side adjudication round trip.
+    // Provider registration already ran; the sequential overrides are the
+    // last step. No handshake, no Go-side adjudication round trip.
+    await registerSequentialTools(pi);
     return;
   }
 
@@ -703,4 +789,6 @@ export default function activate(pi: ExtensionAPI) {
       return { block: true, reason };
     }
   });
+
+  await registerSequentialTools(pi);
 }
