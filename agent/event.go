@@ -168,6 +168,12 @@ type AssistantTextEvent struct {
 	// Text is the assistant text chunk.
 	Text string `json:"text"`
 
+	// ParentToolUseID is the provider-native id of the delegation tool
+	// call this text was emitted inside (the sub-agent's parent). Empty
+	// when the text belongs to the top-level agent or the adapter cannot
+	// know the parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+
 	// Raw is the provider-native event payload.
 	Raw any `json:"raw,omitempty"`
 }
@@ -266,6 +272,12 @@ type ToolUseEvent struct {
 	// with ToolResultEvent.ToolUseID.
 	ToolUseID string `json:"toolUseId,omitempty"`
 
+	// ParentToolUseID is the provider-native id of the delegation tool
+	// call this tool call was emitted inside (the sub-agent's parent).
+	// Empty on top-level calls and on adapters that cannot know the
+	// parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
+
 	// Input is the tool-call input map.
 	Input map[string]any `json:"input"`
 
@@ -296,6 +308,12 @@ type ToolResultEvent struct {
 
 	// ToolUseID pairs with ToolUseEvent.ToolUseID.
 	ToolUseID string `json:"toolUseId,omitempty"`
+
+	// ParentToolUseID mirrors ToolUseEvent.ParentToolUseID: the
+	// provider-native id of the delegation tool call this result belongs
+	// to. Empty on top-level results and on adapters that cannot know
+	// the parent — adapters never guess.
+	ParentToolUseID string `json:"parentToolUseId,omitempty"`
 
 	// Content is the tool's output text or stringified result.
 	Content string `json:"content"`

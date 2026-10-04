@@ -39,6 +39,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:     false,
 			AcceptsAllowedToolsList:  false,
 			EmitsSubagentEvents:      false,
+			SetsParentToolUseID:      false, // this adapter cannot know the parent delegation id; the field stays empty by contract
 			SupportsReasoningEffort:  false,
 			SupportsOneShot:          false, // no headless mode at all
 			NativeJSONMode:           false,
