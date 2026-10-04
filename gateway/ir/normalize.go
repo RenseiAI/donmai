@@ -99,6 +99,10 @@ func (t ThinkingSpec) BudgetForBudgetUpstream() int {
 
 // EffortForOpenAI returns the reasoning_effort string to apply for an OpenAI-
 // style upstream, or "" when thinking is off (the caller then omits the field).
+// A level with no table entry (never produced by LevelFromEffort, which maps
+// every non-empty inbound value onto the ladder) is omitted too: the table
+// lookup's zero value keeps an unrecognized tier off the wire rather than
+// forwarding an enum value the upstream rejects with a 400.
 func (t ThinkingSpec) EffortForOpenAI() string {
 	if t.IsOff() {
 		return ""
@@ -107,7 +111,12 @@ func (t ThinkingSpec) EffortForOpenAI() string {
 }
 
 // LevelFromEffort maps an inbound OpenAI reasoning_effort value onto the
-// canonical ladder. Unknown/empty yields ThinkingOff.
+// canonical ladder. Unknown/empty yields ThinkingOff. The extended harness
+// tiers above high ("xhigh" and "max") map onto ThinkingMax, which encodes
+// back onto the OpenAI wire as "high" (EffortForOpenAI): the wire enum has
+// no token for them, and dropping xhigh to off would silently lose the
+// session's configured reasoning while a verbatim forward draws a 400 from
+// an upstream that validates the enum.
 func LevelFromEffort(effort string) ThinkingLevel {
 	switch effort {
 	case "minimal":
@@ -118,6 +127,10 @@ func LevelFromEffort(effort string) ThinkingLevel {
 		return ThinkingMedium
 	case "high":
 		return ThinkingHigh
+	case "max":
+		return ThinkingMax
+	case "xhigh":
+		return ThinkingMax
 	default:
 		return ThinkingOff
 	}

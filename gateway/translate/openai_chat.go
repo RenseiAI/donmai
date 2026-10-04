@@ -427,7 +427,13 @@ func joinText(parts []ir.Part) string {
 
 // messageFromIR maps one IR message onto one or more chat messages. A tool
 // result becomes a role:"tool" message; assistant text + tool calls collapse
-// into a single assistant message.
+// into a single assistant message. An assistant message with no text and no
+// tool calls is dropped (nil): pi surfaces an assistant turn whose thinking
+// blocks are empty as text-less IR, and some OpenAI-compatible upstreams
+// reject the content-less assistant message on the wire with a 400. A
+// thinking-only turn already degrades to this shape because PartThinking is
+// never encoded here; omitting the empty message keeps the replayed context
+// the harness re-sends on its next turn well-formed.
 func messageFromIR(m ir.Message) []ChatMessage {
 	if m.Role == ir.RoleTool {
 		var out []ChatMessage
@@ -456,6 +462,9 @@ func messageFromIR(m ir.Message) []ChatMessage {
 	}
 	if text.Len() > 0 {
 		cm.Content = text.String()
+	}
+	if text.Len() == 0 && len(cm.ToolCalls) == 0 && m.Role == ir.RoleAssistant {
+		return nil
 	}
 	return []ChatMessage{cm}
 }

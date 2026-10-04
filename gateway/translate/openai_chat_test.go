@@ -178,3 +178,43 @@ func TestContentArrayFlattened(t *testing.T) {
 		t.Errorf("content array not flattened: %+v", req.Messages)
 	}
 }
+
+// The failing shape replayed an assistant turn with empty thinking blocks and
+// no text: it decodes to an assistant IR message with neither text nor tool
+// calls, which several OpenAI-compatible upstreams reject with a 400. The
+// encoder must drop that message while keeping an assistant turn that does
+// carry a tool call (the pending call the tool result answers).
+func TestEncodeRequest_DropsEmptyAssistantKeepsToolCall(t *testing.T) {
+	req := ir.Request{
+		Model: "m",
+		Messages: []ir.Message{
+			{Role: ir.RoleAssistant, Parts: nil},
+			{Role: ir.RoleAssistant, Parts: []ir.Part{
+				{Kind: ir.PartToolCall, ToolCall: &ir.ToolCall{ID: "c1", Name: "bash", Arguments: "{}"}},
+			}},
+			{Role: ir.RoleTool, Parts: []ir.Part{
+				{Kind: ir.PartToolResult, Text: "output", ToolCallID: "c1"},
+			}},
+		},
+	}
+	out, err := EncodeRequest(req)
+	if err != nil {
+		t.Fatalf("encode: %v", err)
+	}
+	var cr ChatRequest
+	if err := json.Unmarshal(out, &cr); err != nil {
+		t.Fatalf("re-decode: %v", err)
+	}
+	assistants := 0
+	for _, m := range cr.Messages {
+		if m.Role == "assistant" {
+			assistants++
+			if len(m.ToolCalls) != 1 || m.ToolCalls[0].ID != "c1" {
+				t.Fatalf("kept assistant lost its tool call: %+v", m)
+			}
+		}
+	}
+	if assistants != 1 {
+		t.Fatalf("assistant messages = %d, want 1 (empty dropped, tool-call kept)", assistants)
+	}
+}

@@ -38,16 +38,90 @@ type OpenAICompat struct {
 // Name implements Upstream.
 func (u *OpenAICompat) Name() string { return u.Company }
 
-// Invoke implements Upstream.
-func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Credential) (Outcome, error) {
+// maxToolResultBytes caps one tool-result text part when a request is
+// re-sent after the upstream rejects it with a 400. A harness replays its
+// whole context on every turn, so one huge tool result (tens of kilobytes of
+// error output) can push the replayed request past what the upstream accepts;
+// the retry keeps the head of the output (where the actionable error lines
+// live) and marks the cut with truncatedToolResultMarker. First attempts are
+// never capped: only the retry path truncates, so a session that fits never
+// loses tool output.
+const maxToolResultBytes = 32 << 10
+
+// truncatedToolResultMarker marks a tool result the retry path cut to
+// maxToolResultBytes. ASCII-only so it survives any upstream charset handling.
+const truncatedToolResultMarker = "\n...[truncated by gateway retry: output exceeded 32 KiB]"
+
+// sanitizeRequestForRetry returns a copy of req with the parts an upstream
+// has rejected with a 400 removed or cut down: content-less assistant messages
+// (empty thinking blocks decode to no text and no tool call, which several
+// OpenAI-compatible upstreams reject on replay) are dropped, and tool-result
+// text over maxToolResultBytes is cut to the marker. Tool-result messages are
+// never dropped — losing the answer to a tool call would strand the turn —
+// and nothing else is touched, so the retry still answers every pending call.
+func sanitizeRequestForRetry(req ir.Request) (ir.Request, bool) {
+	out := req
+	out.Messages = make([]ir.Message, 0, len(req.Messages))
+	changed := false
+	for _, m := range req.Messages {
+		switch m.Role {
+		case ir.RoleAssistant:
+			hasText, hasCall := false, false
+			for _, p := range m.Parts {
+				switch p.Kind {
+				case ir.PartText:
+					if p.Text != "" {
+						hasText = true
+					}
+				case ir.PartToolCall:
+					hasCall = true
+				}
+			}
+			if !hasText && !hasCall {
+				changed = true
+				continue
+			}
+			out.Messages = append(out.Messages, m)
+		case ir.RoleTool:
+			cp := m
+			cp.Parts = make([]ir.Part, 0, len(m.Parts))
+			for _, part := range m.Parts {
+				if part.Kind == ir.PartToolResult && len(part.Text) > maxToolResultBytes {
+					part.Text = truncateToolResult(part.Text)
+					changed = true
+				}
+				cp.Parts = append(cp.Parts, part)
+			}
+			out.Messages = append(out.Messages, cp)
+		default:
+			out.Messages = append(out.Messages, m)
+		}
+	}
+	return out, changed
+}
+
+// truncateToolResult cuts text to maxToolResultBytes on a rune boundary and
+// appends truncatedToolResultMarker.
+func truncateToolResult(text string) string {
+	cut := maxToolResultBytes
+	for cut > 0 && cut < len(text) && (text[cut]&0xC0) == 0x80 {
+		cut--
+	}
+	return text[:cut] + truncatedToolResultMarker
+}
+
+// doPost encodes req and performs one POST against the upstream chat
+// completions endpoint, returning the raw response (open on success so the
+// caller can stream or decode it; drained and closed on a non-2xx).
+func (u *OpenAICompat) doPost(ctx context.Context, req ir.Request, cred pool.Credential) (*http.Response, error) {
 	body, err := translate.EncodeRequest(req)
 	if err != nil {
-		return Outcome{}, err
+		return nil, err
 	}
 	endpoint := strings.TrimRight(u.BaseURL, "/") + "/chat/completions"
 	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, endpoint, bytes.NewReader(body))
 	if err != nil {
-		return Outcome{}, fmt.Errorf("gateway/upstream: build request: %w", err)
+		return nil, fmt.Errorf("gateway/upstream: build request: %w", err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 	if req.Stream {
@@ -59,9 +133,30 @@ func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Cre
 	if client == nil {
 		client = http.DefaultClient
 	}
-	resp, err := client.Do(httpReq)
+	return client.Do(httpReq)
+}
+
+// Invoke implements Upstream. A 400 response is retried ONCE with a sanitized
+// request (sanitizeRequestForRetry): the failure that motivated this path saw
+// the replay of an empty-thinking assistant turn plus a tens-of-kilobytes
+// error tool result rejected as invalid parameters, and the turn can continue
+// without either. Only a 400 retries, and only once — any other status, a
+// transport error, or a second 400 returns as before.
+func (u *OpenAICompat) Invoke(ctx context.Context, req ir.Request, cred pool.Credential) (Outcome, error) {
+	resp, err := u.doPost(ctx, req, cred)
 	if err != nil {
 		return Outcome{Status: 0}, fmt.Errorf("gateway/upstream: dial %s: %w", u.Company, err)
+	}
+
+	if resp.StatusCode == http.StatusBadRequest {
+		if sanitized, ok := sanitizeRequestForRetry(req); ok {
+			_ = resp.Body.Close()
+			sresp, serr := u.doPost(ctx, sanitized, cred)
+			if serr != nil {
+				return Outcome{Status: 0}, fmt.Errorf("gateway/upstream: dial %s: %w", u.Company, serr)
+			}
+			resp = sresp
+		}
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {

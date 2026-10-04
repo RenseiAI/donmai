@@ -46,12 +46,27 @@ func TestBudgetForBudgetUpstream(t *testing.T) {
 func TestLevelFromEffort(t *testing.T) {
 	cases := map[string]ThinkingLevel{
 		"minimal": ThinkingMinimal, "low": ThinkingLow, "medium": ThinkingMedium,
-		"high": ThinkingHigh, "": ThinkingOff, "bogus": ThinkingOff,
+		"high": ThinkingHigh, "max": ThinkingMax, "xhigh": ThinkingMax,
+		"": ThinkingOff, "bogus": ThinkingOff,
 	}
 	for in, want := range cases {
 		if got := LevelFromEffort(in); got != want {
 			t.Errorf("LevelFromEffort(%q) = %q, want %q", in, got, want)
 		}
+	}
+}
+
+// The failing shape replayed an assistant turn whose thinking blocks were
+// empty under an extended reasoning tier, followed by a tens-of-kilobytes
+// error tool result. The extended tier must survive the inbound decode onto
+// the canonical ladder and back out as the wire's top tier — never dropped
+// to off, never forwarded verbatim as an enum value the upstream rejects.
+func TestLevelFromEffort_ExtendedTierRoundTrip(t *testing.T) {
+	if got := LevelFromEffort("xhigh"); got != ThinkingMax {
+		t.Fatalf("LevelFromEffort(xhigh) = %q, want max", got)
+	}
+	if got := (ThinkingSpec{Level: LevelFromEffort("xhigh")}).EffortForOpenAI(); got != "high" {
+		t.Fatalf("xhigh round trip effort = %q, want high", got)
 	}
 }
 
