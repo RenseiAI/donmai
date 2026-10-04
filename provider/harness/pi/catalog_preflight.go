@@ -140,6 +140,25 @@ func (p *Provider) resolveCatalogProbe() catalogProbeFunc {
 	return defaultCatalogProbe
 }
 
+// catalogMissError reports a CONFIRMED catalog absence: the probe ran,
+// returned a real listing, and no row matched the exact (provider, model)
+// pair. prepare() (pi.go) translates it into a fallback onto the injected
+// provider (fallbackToInjectedProvider) instead of denying spawn, so a
+// model newer than the bundled catalog still starts on launch day. It wraps
+// agent.ErrSpawnFailed, preserving the preflight's fail-closed contract at
+// this layer for callers that do not translate it — and for the
+// untranslatable cases (unknown provider, or no bound base URL for the
+// injected provider to register against).
+type catalogMissError struct {
+	provider string
+	model    string
+}
+
+func (e *catalogMissError) Error() string {
+	return fmt.Sprintf("pi has no built-in model %q for provider %q in its catalog (checked with `pi --list-models %s/%s`); the resolved pin would 400 on its first turn",
+		e.model, e.provider, e.provider, e.model)
+}
+
 // preflightCatalogCheck is requirement 2: fail fast, before any child spawns,
 // when a NATIVE built-in-provider routing decision (nativeProviderPin's
 // useNative case) resolves to a (provider, model) pair pi's own catalog does
@@ -176,8 +195,77 @@ func (p *Provider) preflightCatalogCheck(ctx context.Context, probe catalogProbe
 	if catalogHasModel(raw, provider, model) {
 		return nil
 	}
-	return fmt.Errorf("%w: pi has no built-in model %q for provider %q in its catalog (checked with `pi --list-models %s/%s`); the resolved pin would 400 on its first turn",
-		agent.ErrSpawnFailed, model, provider, provider, model)
+	return fmt.Errorf("%w: %w", agent.ErrSpawnFailed, &catalogMissError{provider: provider, model: model})
+}
+
+// fallbackToInjectedProvider reroutes a session whose NATIVE built-in-provider
+// pin missed the bundled catalog (a *catalogMissError from
+// preflightCatalogCheck) onto the injected "donmai" provider, so a model
+// newer than the installed catalog still starts on launch day. The rewrite
+// keeps the bound endpoint (its BaseURL, credential env, and wire protocol)
+// and the resolved limits (ProviderConfig contextWindow/maxOutputTokens)
+// untouched: providerPinEnv registers exactly that endpoint as the injected
+// provider's base URL, its wire API (piAPIForProtocol, e.g. the provider's
+// own native API for a direct cell), and the provider-native bare model id.
+// prepare() logs the fallback at the call site; this function only rewrites.
+//
+// The provider must be a known built-in provider (it just classified as a
+// native "<provider>/<model>" pin) and the endpoint must carry a bound
+// base URL for the injected provider to register against. Anything else
+// keeps today's denial: an unknown provider refuses (there is no wire API
+// or credential mapping to select), and an unbound session refuses (the
+// injected provider registers only under a bound endpoint — modelPinArgs'
+// injected branch — so there is no endpoint to route it through).
+func fallbackToInjectedProvider(spec agent.Spec, miss *catalogMissError) (agent.Spec, error) {
+	envVar, known := builtinProviderCredentialEnv[miss.provider]
+	if !known {
+		return spec, miss
+	}
+	ep := spec.Endpoint
+	if ep == nil || ep.BaseURL == "" {
+		return spec, miss
+	}
+	out := spec
+	if ep.Model != "" {
+		// applyEndpoint projected Endpoint.Model onto Spec.Model before the
+		// preflight ran; the fallback must rewrite both so the binding and
+		// the pin cannot disagree about which model serves this session.
+		// The provider prefix is pi's own "--model provider/id" selector
+		// syntax, never the wire model code: strip it so nativeProviderPin
+		// no longer classifies the rewritten pin as native and every
+		// consumer (modelPinArgs, providerPinEnv) routes on the injected
+		// provider with the provider-native bare model id. Unknown future
+		// ids pass through verbatim — no allowlist is consulted here.
+		if _, bare, ok := splitBuiltinProviderPin(ep.Model); ok {
+			nep := *ep
+			nep.Model = bare
+			out.Endpoint = &nep
+		}
+	}
+	if _, bare, ok := splitBuiltinProviderPin(out.Model); ok {
+		out.Model = bare
+	} else {
+		out.Model = miss.model
+	}
+	if out.Env == nil {
+		out.Env = map[string]string{}
+	} else {
+		env := make(map[string]string, len(out.Env))
+		for k, v := range out.Env {
+			env[k] = v
+		}
+		out.Env = env
+	}
+	// The native-route credential mirror (applyEndpoint) may have placed the
+	// cell key on the provider's own env var; the injected provider reads
+	// the same key from PiKeyEnvVar (providerPinEnv), so make sure it rides
+	// there too. Never overwrite an explicit value already present.
+	if key := out.Env[envVar]; key != "" {
+		if _, already := out.Env[PiKeyEnvVar]; !already {
+			out.Env[PiKeyEnvVar] = key
+		}
+	}
+	return out, nil
 }
 
 // promoteAggregatorPin selects pi's own built-in aggregator provider for an
