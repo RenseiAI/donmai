@@ -86,6 +86,17 @@ type QueuedWork struct {
 	// by the negotiated local transport contract.
 	BaseRef string `json:"baseRef,omitempty"`
 
+	// ContinuePullRequest names an existing pull request the session
+	// continues instead of opening a new one. Nil is ordinary branch
+	// work; non-nil makes the runner check out the pull request's head
+	// branch at HeadSha, push the session's commits to that branch
+	// (fast-forward only), and treat that pull request as the run's own.
+	//
+	// Wire shape: "continuePullRequest" (camelCase, omitempty) carrying
+	// {"number": <int>, "headRef": "<branch>", "headSha": "<40-hex>"}.
+	// Absent means today's behaviour, byte for byte.
+	ContinuePullRequest *ContinuePullRequest `json:"continuePullRequest,omitempty"`
+
 	// WorkType is the work-type discriminant (e.g. "development",
 	// "qa", "research"). Drives template selection in [Builder.Build].
 	// Unknown values fall through to the development template.
@@ -352,6 +363,22 @@ type QueuedWork struct {
 	SessionStorageID string `json:"sessionStorageId,omitempty"`
 	SessionPublicID  string `json:"sessionPublicId,omitempty"`
 	TrackerSessionID string `json:"trackerSessionId,omitempty"`
+}
+
+// ContinuePullRequest is the session-spec record naming an existing pull
+// request the run continues instead of opening a new one. Number selects
+// the pull request, HeadRef is the branch the session checks out and
+// pushes to, and HeadSha is the commit the checkout must start at.
+type ContinuePullRequest struct {
+	// Number is the pull request number. Required; it selects the pull
+	// request the runner continues.
+	Number int `json:"number,omitempty"`
+	// HeadRef is the pull request's head branch name. Required; the
+	// runner checks out and pushes to this branch.
+	HeadRef string `json:"headRef,omitempty"`
+	// HeadSha is the head commit the dispatch was decided against.
+	// Required; the runner checks out the branch at exactly this commit.
+	HeadSha string `json:"headSha,omitempty"`
 }
 
 // CodeIntelWork is the typed code-intelligence capability block on QueuedWork.

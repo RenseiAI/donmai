@@ -518,6 +518,9 @@ func (v *sessionPullRequestVerifier) sessionHead(ctx context.Context) (string, e
 // started at — recorded right after provisioning, before the agent's first
 // turn. "" for a run that opens its own pull request.
 func reworkStartHead(qw QueuedWork, res *Result, worktreePath string) string {
+	if qw.ContinuePullRequest != nil && headSHARE.MatchString(qw.ContinuePullRequest.HeadSha) {
+		return qw.ContinuePullRequest.HeadSha
+	}
 	if qw.PullRequest != nil && headSHARE.MatchString(qw.PullRequest.HeadSHA) {
 		return qw.PullRequest.HeadSHA
 	}

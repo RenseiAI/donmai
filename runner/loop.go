@@ -275,10 +275,31 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 		refBranch = ref
 	}
+	// Continue-mode contract: when the spec names a pull request to
+	// continue, the run checks out the pull request's head branch at the
+	// dispatched head commit — never a fresh agent/<session> branch. The
+	// head branch is also the push target and the run's own pull request.
+	if err := validateContinuePullRequest(qw.ContinuePullRequest); err != nil {
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
+	continueMode := qw.ContinuePullRequest != nil
+	if continueMode && (qw.RepositoryDeclaration != nil || qw.PullRequest != nil || qw.BaseRef != "" || refBranch != "") {
+		err := errors.New("runner: continued pull request is mutually exclusive with repository declarations, dispatched pull requests, base branches, and amend refs")
+		res.Status = "failed"
+		res.FailureMode = FailureWorktreeProvision
+		res.Error = err.Error()
+		return res, err
+	}
 	branch := qw.Branch
-	if refBranch != "" {
+	switch {
+	case continueMode:
+		branch = continuePullRequestBranch(qw.ContinuePullRequest)
+	case refBranch != "":
 		branch = refBranch
-	} else if branch == "" {
+	case branch == "":
 		branch = "agent/" + qw.SessionID
 	}
 	provisionStrategy := worktreeProvisionStrategy(qw)
@@ -369,10 +390,25 @@ func (r *Runner) runLoop(ctx context.Context, qw QueuedWork, startedAt int64, ad
 		}
 	}
 
+	// Check out the continued pull request's head branch at the dispatched
+	// head commit before the agent starts. The branch may exist only on the
+	// remote, so this fetches it and checks it out at the pinned commit;
+	// anything else fails the session rather than running on a moved head.
+	if continueMode && !repositoryFree {
+		if err := checkoutContinuePullRequest(ctx, wpath, qw.ContinuePullRequest); err != nil {
+			res.Status = "failed"
+			res.FailureMode = FailureWorktreeProvision
+			res.Error = err.Error()
+			return res, err
+		}
+		r.logger.Info("checked out continued pull request head", "branch", branch, "sessionId", qw.SessionID)
+	}
 	// Create the per-session work branch in the worktree (skipped when
 	// provisioning at an existing ref — that ref IS the working branch).
 	selectedRepositoryMutable := !repositoryFree && !selectedRepositoryReadOnly
 	switch {
+	case continueMode:
+		r.logger.Info("continuing pull request head branch", "branch", branch, "sessionId", qw.SessionID)
 	case repositoryFree:
 		r.logger.Info("repository-free workarea provisioned without a git branch", "sessionId", qw.SessionID)
 	case repositoryDeclaration != nil && refBranch == "":
@@ -1570,6 +1606,16 @@ tailRecovery:
 			backstopEligible = false
 		default:
 			backstopEligible = true
+		}
+	}
+	// Continue-mode delivery: the run's pull request is the continued one.
+	// Seed it on the envelope before tail recovery ends so steering and the
+	// verifier treat the continued pull request as the run's own, and so the
+	// backstop pushes to its head branch instead of opening a new PR.
+	if qw.ContinuePullRequest != nil && !repositoryFree && res.PullRequestURL == "" && RequiresPRURL(qw.WorkType) {
+		if continuedURL := continuePullRequestURL(verifyCtx, qw, repositoryDeclaration, wpath); continuedURL != "" {
+			res.PullRequestURL = continuedURL
+			streamRes.pullRequestURL = continuedURL
 		}
 	}
 	if !r.skipBackstop && !publicationComplete && backstopEligible && budgetStop == nil {
