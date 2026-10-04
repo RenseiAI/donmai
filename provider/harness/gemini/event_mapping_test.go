@@ -127,6 +127,28 @@ func TestMapResponse_MalformedJSON_Error(t *testing.T) {
 	}
 }
 
+// TestMapResponse_CostCarriesDispatcherPrices verifies a per-model price
+// override supplied by the dispatcher reaches the terminal cost.
+func TestMapResponse_CostCarriesDispatcherPrices(t *testing.T) {
+	t.Parallel()
+	state := &turnState{model: "gemini-4-pro", providerConfig: map[string]any{
+		"inputPricePer1M": 2.0, "cachedPricePer1M": 0.5, "outputPricePer1M": 8.0,
+	}}
+	turn := mapResponse([]byte(`{"candidates":[{"content":{"parts":[{"text":"done"}]},"finishReason":"STOP"}],"usageMetadata":{"promptTokenCount":1000000,"candidatesTokenCount":1000000,"cachedContentTokenCount":200000}}`), state)
+	res, ok := turn.result.(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("result: want ResultEvent, got %T", turn.result)
+	}
+	// 800k fresh @ 2.00/M + 200k cached @ 0.50/M + 1M out @ 8.00/M.
+	want := 1.6 + 0.1 + 8.0
+	if diff := res.Cost.TotalCostUsd - want; diff > 1e-9 || diff < -1e-9 {
+		t.Errorf("Cost.TotalCostUsd: want %g, got %g", want, res.Cost.TotalCostUsd)
+	}
+	if res.Cost.CachedInputTokens != 200000 {
+		t.Errorf("Cost.CachedInputTokens: want 200000, got %d", res.Cost.CachedInputTokens)
+	}
+}
+
 // TestMapResponse_CostAccumulatesAcrossTurns verifies the running totals
 // fold across multiple turns (function-call round-trip then final).
 func TestMapResponse_CostAccumulatesAcrossTurns(t *testing.T) {

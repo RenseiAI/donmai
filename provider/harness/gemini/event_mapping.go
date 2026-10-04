@@ -54,8 +54,12 @@ type promptFeedback struct {
 
 // turnState carries the running cost totals across turns so the terminal
 // ResultEvent reflects the whole conversation, not just the last turn.
+// providerConfig carries the dispatcher's per-model price overrides
+// (inputPricePer1M / cachedPricePer1M / outputPricePer1M) so cost math
+// honors them; nil means the fallback pricing table applies.
 type turnState struct {
 	model             string
+	providerConfig    map[string]any
 	totalInputTokens  int64
 	totalOutputTokens int64
 	totalCachedTokens int64
@@ -236,13 +240,16 @@ func buildResultEvent(finishReason string, state *turnState, raw any) agent.Resu
 }
 
 // buildCost assembles the CostData with TotalCostUsd computed from the
-// per-model pricing table.
+// resolved per-model pricing (dispatcher-supplied prices first, the
+// fallback table second). Cached tokens ride inside the input total and
+// are priced at the cached rate.
 func buildCost(state *turnState) *agent.CostData {
 	return &agent.CostData{
 		InputTokens:       state.totalInputTokens,
 		OutputTokens:      state.totalOutputTokens,
 		CachedInputTokens: state.totalCachedTokens,
-		TotalCostUsd:      calculateCostUSD(state.totalInputTokens, state.totalOutputTokens, state.model),
-		NumTurns:          state.turnCount,
+		TotalCostUsd: calculateCostUSD(state.totalInputTokens, state.totalCachedTokens,
+			state.totalOutputTokens, state.model, state.providerConfig),
+		NumTurns: state.turnCount,
 	}
 }

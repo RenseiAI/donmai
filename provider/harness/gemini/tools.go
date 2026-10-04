@@ -162,29 +162,60 @@ func defaultToolParameters() map[string]any {
 	}
 }
 
-// is3xModel reports whether the model id belongs to the Gemini 3.x
-// family (gemini-3.5-flash, gemini-3.1-pro-preview, gemini-3.1-flash-lite,
-// …). The 3.x family uses thinkingConfig.thinkingLevel; the 2.5 family
-// uses thinkingConfig.thinkingBudget.
-func is3xModel(model string) bool {
-	return strings.HasPrefix(model, "gemini-3")
+// geminiMajorVersion parses the Gemini family major version from a model
+// id of the form "gemini-<major>[.<minor>]-…" (gemini-3.5-flash → 3,
+// gemini-4.1-flash → 4, gemini-2.5-pro → 2). It returns false when the id
+// carries no explicit numeric major (gemini-flash-latest, an empty id,
+// or any shape that does not open with "gemini-<digit>").
+func geminiMajorVersion(model string) (int, bool) {
+	rest, ok := strings.CutPrefix(model, "gemini-")
+	if !ok {
+		return 0, false
+	}
+	end := 0
+	for end < len(rest) && rest[end] >= '0' && rest[end] <= '9' {
+		end++
+	}
+	if end == 0 {
+		return 0, false
+	}
+	major := 0
+	for i := 0; i < end; i++ {
+		major = major*10 + int(rest[i]-'0')
+	}
+	return major, true
+}
+
+// usesThinkingLevel reports whether the model id routes reasoning effort
+// to thinkingConfig.thinkingLevel (the level knob) rather than
+// thinkingConfig.thinkingBudget (the token-budget knob). Major version 3
+// and later use the level knob; 2.x (and 1.x) keep the budget knob; ids
+// without a parseable major version default to the level knob — the
+// current and forward-compatible surface (e.g. gemini-flash-latest).
+func usesThinkingLevel(model string) bool {
+	major, ok := geminiMajorVersion(model)
+	if !ok {
+		return true
+	}
+	return major >= 3
 }
 
 // thinkingConfigFor maps Spec.Effort onto the model family's thinking
 // knob. Returns nil when no effort is requested.
 //
-//   - 3.x models  → thinkingLevel: low → "low", medium → "medium",
-//     high/xhigh/max → "high" (the family's highest level). (3.x has no off
+//   - Level-knob models (major >= 3, or an unversioned id) →
+//     thinkingLevel: low → "low", medium → "medium", high/xhigh/max →
+//     "high" (the family's highest level). (The level knob has no off
 //     switch; minimal is the floor.)
-//   - 2.5 models  → thinkingBudget: low → 2048, medium → 8192,
-//     high/xhigh/max → 24576 tokens. (-1 dynamic, 0 off are also valid but we
-//     map effort tiers to concrete budgets.)
+//   - Budget-knob models (2.x and earlier) → thinkingBudget: low → 2048,
+//     medium → 8192, high/xhigh/max → 24576 tokens. (-1 dynamic, 0 off
+//     are also valid but we map effort tiers to concrete budgets.)
 //
 // ProviderConfig may override via the "thinkingLevel" (string) or
 // "thinkingBudget" (int) keys for callers that want raw control.
 func thinkingConfigFor(spec agent.Spec, model string) *thinkingConfig {
 	// Explicit ProviderConfig overrides win over the effort mapping.
-	if is3xModel(model) {
+	if usesThinkingLevel(model) {
 		if lvl, ok := stringFromProviderConfig(spec.ProviderConfig, "thinkingLevel"); ok && lvl != "" {
 			return &thinkingConfig{ThinkingLevel: lvl}
 		}
@@ -199,7 +230,7 @@ func thinkingConfigFor(spec agent.Spec, model string) *thinkingConfig {
 		return nil
 	}
 
-	if is3xModel(model) {
+	if usesThinkingLevel(model) {
 		return &thinkingConfig{ThinkingLevel: thinkingLevelForEffort(spec.Effort)}
 	}
 	budget := thinkingBudgetForEffort(spec.Effort)
@@ -256,14 +287,34 @@ func stringFromProviderConfig(pc map[string]any, key string) (string, bool) {
 	return s, ok
 }
 
-// modelPricing is the per-1M-token USD pricing (input, output) for the
-// Gemini models donmai exposes. Verified 2026-06-02. Unknown models fall
+// modelPrice is the per-1M-token USD pricing (input, cached input,
+// output) for one Gemini model.
+type modelPrice struct {
+	input  float64
+	cached float64
+	output float64
+}
+
+// ProviderConfig keys carrying per-model per-1M-token USD prices supplied
+// by the dispatcher. They win over the fallback table below (see
+// resolveModelPricing).
+const (
+	providerConfigInputPricePer1M  = "inputPricePer1M"
+	providerConfigCachedPricePer1M = "cachedPricePer1M"
+	providerConfigOutputPricePer1M = "outputPricePer1M"
+)
+
+// modelPricing is the per-1M-token USD pricing fallback for the Gemini
+// models donmai exposes. Verified 2026-06-02; the 3.6/3.7/3.8 flash rows
+// carry the current flash rate. A zero cached rate means no cached-input
+// rate is published for that model — resolution then prices cached tokens
+// at the input rate, preserving the pre-split totals. Unknown models fall
 // through to a zero result (TotalCostUsd stays 0 but the wire path is
 // still exercised).
-var modelPricing = map[string]struct {
-	input  float64
-	output float64
-}{
+var modelPricing = map[string]modelPrice{
+	"gemini-3.8-flash":       {input: 0.75, cached: 0.075, output: 3.75},
+	"gemini-3.7-flash":       {input: 0.75, cached: 0.075, output: 3.75},
+	"gemini-3.6-flash":       {input: 0.75, cached: 0.075, output: 3.75},
 	"gemini-3.5-flash":       {input: 1.50, output: 9.00},
 	"gemini-3.1-pro-preview": {input: 2.00, output: 12.00},
 	"gemini-3.1-flash-lite":  {input: 0.25, output: 1.50},
@@ -272,15 +323,88 @@ var modelPricing = map[string]struct {
 	"gemini-2.5-flash-lite":  {input: 0.10, output: 0.40},
 }
 
-// calculateCostUSD computes the dollar cost for a token split against the
-// per-model pricing table. Unknown models return 0 (the path is wired so
-// adding a table entry is the only change needed for a new model).
-func calculateCostUSD(inputTokens, outputTokens int64, model string) float64 {
+// floatFromProviderConfig reads a float-valued key from the opaque
+// ProviderConfig map. JSON decoding yields float64 for numbers, so int
+// and int64 are accepted as well.
+func floatFromProviderConfig(pc map[string]any, key string) (float64, bool) {
+	if len(pc) == 0 {
+		return 0, false
+	}
+	switch v := pc[key].(type) {
+	case float64:
+		return v, true
+	case float32:
+		return float64(v), true
+	case int:
+		return float64(v), true
+	case int64:
+		return float64(v), true
+	default:
+		return 0, false
+	}
+}
+
+// resolveModelPricing returns the per-1M-token USD pricing for a model.
+// Per-model prices supplied by the dispatcher via Spec.ProviderConfig
+// (inputPricePer1M / cachedPricePer1M / outputPricePer1M) win over the
+// fallback table: each supplied positive side replaces the table value,
+// an unsupplied side keeps the table value for a known model (0 for an
+// unknown one), and an unsupplied cached side falls back to the resolved
+// input rate so cached tokens are never silently free under an override.
+// A table entry without a published cached rate likewise resolves cached
+// to its input rate. The second return value is false when neither an
+// override nor a table entry exists — the caller then reports zero cost.
+func resolveModelPricing(providerConfig map[string]any, model string) (modelPrice, bool) {
+	in, hasIn := floatFromProviderConfig(providerConfig, providerConfigInputPricePer1M)
+	out, hasOut := floatFromProviderConfig(providerConfig, providerConfigOutputPricePer1M)
+	if (hasIn && in > 0) || (hasOut && out > 0) {
+		table, _ := modelPricing[model]
+		p := modelPrice{}
+		if hasIn && in > 0 {
+			p.input = in
+		} else {
+			p.input = table.input
+		}
+		if hasOut && out > 0 {
+			p.output = out
+		} else {
+			p.output = table.output
+		}
+		if cached, hasCached := floatFromProviderConfig(providerConfig, providerConfigCachedPricePer1M); hasCached && cached >= 0 {
+			p.cached = cached
+		} else {
+			p.cached = p.input
+		}
+		return p, true
+	}
 	p, ok := modelPricing[model]
+	if !ok {
+		return modelPrice{}, false
+	}
+	if p.cached == 0 {
+		p.cached = p.input
+	}
+	return p, true
+}
+
+// calculateCostUSD computes the dollar cost for a token split against the
+// resolved per-model pricing (dispatcher-supplied Spec.ProviderConfig
+// prices first, the fallback table second). inputTokens is the total
+// prompt count including cached tokens; the cached slice is priced at the
+// cached rate, the remainder at the input rate. Unknown models return 0
+// (the path is wired so adding a table entry is the only change needed
+// for a new model).
+func calculateCostUSD(inputTokens, cachedTokens, outputTokens int64, model string, providerConfig map[string]any) float64 {
+	p, ok := resolveModelPricing(providerConfig, model)
 	if !ok {
 		return 0
 	}
-	return (float64(inputTokens)/1_000_000)*p.input +
+	freshInput := inputTokens - cachedTokens
+	if freshInput < 0 {
+		freshInput = 0
+	}
+	return (float64(freshInput)/1_000_000)*p.input +
+		(float64(cachedTokens)/1_000_000)*p.cached +
 		(float64(outputTokens)/1_000_000)*p.output
 }
 
