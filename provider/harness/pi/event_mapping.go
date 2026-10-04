@@ -31,6 +31,14 @@ type mapperState struct {
 	debug       bool // when true, thinking deltas are surfaced; default drops them
 	initEmitted bool
 
+	// suppressCost is set when the session runs on the injected provider
+	// with no per-token prices bound (extension.go unitPricePinEnv): pi
+	// still reports a cost computed from the registered zero cost table,
+	// but it is not a real price, so per-turn observed costs and the
+	// terminal totals are dropped and cost reads as absent, not $0.
+	// Native lanes leave it false and are unchanged.
+	suppressCost bool
+
 	accInputTokens       int64
 	accOutputTokens      int64
 	accCostUSD           float64
@@ -167,6 +175,12 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		st.accInputTokens += in
 		st.accOutputTokens += outTok
 		cost := observedPiCost(mapField(usage, "cost"))
+		// On an unpriced injected lane the zero cost pi reports comes
+		// from the registered zero cost table, not a real price: drop it
+		// so cost reads as absent. Native lanes are unchanged.
+		if st.suppressCost {
+			cost = nil
+		}
 		if st.accTurns == 0 {
 			st.allTurnCostsObserved = true
 		}
@@ -218,7 +232,7 @@ func mapEvent(ev rawEvent, st *mapperState) (out []agent.Event, terminal bool) {
 		if st.accTurns > 0 {
 			turns := st.accTurns
 			res.ObservedTurns = &turns
-			if st.allTurnCostsObserved {
+			if st.allTurnCostsObserved && !st.suppressCost {
 				cost := st.accCostUSD
 				res.ObservedCostUsd = &cost
 			}
@@ -264,8 +278,20 @@ func observedPiCost(cost map[string]any) *float64 {
 }
 
 // accumulatedCost returns the session's accumulated CostData, or nil if nothing
-// was observed.
+// was observed. On an unpriced injected lane the dollar total is suppressed
+// (cost reads as absent, not $0) while token counts still accumulate, so
+// the terminal status omits the total cost but keeps usage.
 func (st *mapperState) accumulatedCost() *agent.CostData {
+	if st.suppressCost {
+		if st.accInputTokens == 0 && st.accOutputTokens == 0 && st.accTurns == 0 {
+			return nil
+		}
+		return &agent.CostData{
+			InputTokens:  st.accInputTokens,
+			OutputTokens: st.accOutputTokens,
+			NumTurns:     st.accTurns,
+		}
+	}
 	if st.accInputTokens == 0 && st.accOutputTokens == 0 && st.accCostUSD == 0 && st.accTurns == 0 {
 		return nil
 	}

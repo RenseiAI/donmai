@@ -265,6 +265,10 @@ func copyEndpointBinding(in *agent.EndpointBinding) *agent.EndpointBinding {
 			out.Env[k] = v
 		}
 	}
+	if in.UnitPrices != nil {
+		prices := *in.UnitPrices
+		out.UnitPrices = &prices
+	}
 	return &out
 }
 
