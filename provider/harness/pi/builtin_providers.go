@@ -2,6 +2,7 @@ package pi
 
 import (
 	"net/url"
+	"path"
 	"strings"
 )
 
@@ -214,13 +215,17 @@ func httpsHostname(baseURL string) (string, bool) {
 // provider's own serving host (exact hostname match; no suffix or subdomain
 // matching) whose path agrees with pi's own catalog base URL for a DIRECT
 // (non-aggregator) built-in provider. The comparison is a normalized,
-// segment-bounded path-prefix match: both paths are trimmed of a single
-// trailing slash (so "…/v1" and "…/v1/" agree), and either they are equal
-// or the bound path extends the catalog path at a "/" boundary (so a
-// binding "…/v1/projects/…" still selects the catalog's "…/v1", but
-// "…/v10" does not). The reverse — a bound path SHORTER than the catalog
-// path — never matches: the bound URL must carry at least the catalog's own
-// path before it can be that provider's endpoint.
+// segment-bounded path-prefix match: both paths are Clean-normalized (so a
+// bound path smuggling ".." segments cannot fake the catalog prefix) with
+// any trailing slash trimmed (so "…/v1" and "…/v1/" agree), and either
+// they are equal or the bound path extends the catalog path at a "/"
+// boundary (so a binding "…/v1/projects/…" still selects the catalog's
+// "…/v1", but "…/v10" does not). A bound URL with no path at all (a
+// host-root binding, the shape donmai's own direct bindings use) always
+// matches: it names the provider's endpoint without narrowing it. The
+// reverse — a non-empty bound path SHORTER than the catalog path — never
+// matches: the bound URL must carry at least the catalog's own path before
+// it can be that provider's endpoint.
 //
 // Aggregator providers never reach the path check: their routing stays
 // host-based (builtinAggregatorForBaseURL + promoteAggregatorPin), and a
@@ -253,15 +258,36 @@ func baseURLMatchesProviderEndpoint(baseURL, provider string) bool {
 	if !strings.EqualFold(u.Hostname(), wantURL.Hostname()) {
 		return false
 	}
-	return boundPathExtendsCatalogPath(strings.TrimSuffix(u.EscapedPath(), "/"), strings.TrimSuffix(wantURL.EscapedPath(), "/"))
+	return boundPathExtendsCatalogPath(normalizeURLPath(u.EscapedPath()), normalizeURLPath(wantURL.EscapedPath()))
 }
 
-// boundPathExtendsCatalogPath reports whether bound (a URL path with any
-// trailing slash already trimmed) names the catalog path itself or a route
-// under it: equal, or bound extends catalog at a "/" segment boundary.
-// An empty catalog path (a host-root base URL) matches every path on that
-// host; a non-empty one never matches a shorter or sibling path.
+// normalizeURLPath Cleans a URL path for comparison: ".." segments resolve
+// lexically (so "/a/b/../c" compares as "/a/c"), a trailing slash drops
+// (so "…/v1/" compares as "…/v1"), and the host root — "" or "/" —
+// normalizes to "". A Clean failure mode cannot occur here: inputs are
+// already-parsed URL paths, and path.Clean is total over strings.
+func normalizeURLPath(p string) string {
+	if p == "" {
+		return ""
+	}
+	cleaned := path.Clean(p)
+	if cleaned == "." {
+		return ""
+	}
+	return strings.TrimSuffix(cleaned, "/")
+}
+
+// boundPathExtendsCatalogPath reports whether bound (a normalized URL path —
+// see normalizeURLPath) names the catalog path itself or a route under it:
+// equal, or bound extends catalog at a "/" segment boundary. An empty
+// bound path (a host-root binding, which carries no path to disagree on)
+// matches every catalog entry on that host; an empty catalog path (a
+// host-root base URL) matches every path on that host; a non-empty bound
+// path never matches a longer or sibling catalog path.
 func boundPathExtendsCatalogPath(bound, catalog string) bool {
+	if bound == "" {
+		return true
+	}
 	if catalog == "" {
 		return true
 	}

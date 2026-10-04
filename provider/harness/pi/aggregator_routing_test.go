@@ -122,6 +122,12 @@ func TestModelRouting_BoundEndpoint(t *testing.T) {
 			wantVendorVar: "OPENROUTER_API_KEY",
 		},
 		{
+			name:  "promoted openrouter pin routes natively on a non-catalog path (aggregators stay host-based)",
+			model: "openrouter/anthropic/claude-sonnet-4.6", baseURL: "https://openrouter.ai/api/v2",
+			wantArgs: []string{"--provider", "openrouter", "--model", "anthropic/claude-sonnet-4.6"}, wantPinModel: "anthropic/claude-sonnet-4.6",
+			wantVendorVar: "OPENROUTER_API_KEY",
+		},
+		{
 			name:  "direct vendor on its own host routes natively (unchanged)",
 			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/coding/paas/v4",
 			wantArgs: []string{"--provider", "zai", "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
