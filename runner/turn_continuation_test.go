@@ -1510,3 +1510,35 @@ func TestPullRequestIsTheOnlyResult(t *testing.T) {
 		})
 	}
 }
+
+// TestRun_ProviderErrorExhaustionPostsUpstreamError pins the fixture run:
+// turns that keep ending on a 429 with a provider code and reset time fail
+// as provider-error and carry those values on the result; a recovered
+// session carries nothing new.
+func TestRun_ProviderErrorExhaustionPostsUpstreamError(t *testing.T) {
+	upstream := &agent.UpstreamError{HTTPStatus: 429, ProviderCode: "usage_limit", ProviderMessage: "Rate limited: quota exhausted", ResetAt: "1777673400"}
+	res, _ := runContinuationScenario(t, 1,
+		verdictScriptTurn{events: []agent.Event{
+			agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "Rate limited: quota exhausted", Upstream: upstream},
+		}},
+		verdictScriptTurn{events: []agent.Event{
+			agent.SystemEvent{Subtype: agent.SystemSubtypeProviderError, Message: "Rate limited: quota exhausted", Upstream: upstream},
+		}},
+		verdictScriptTurn{text: "never reached"},
+	)
+	if res.Status != "failed" || res.FailureMode != FailureProviderError {
+		t.Fatalf("Status=%q FailureMode=%q (%s); want failed/provider-error", res.Status, res.FailureMode, res.Error)
+	}
+	if res.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's 429 with code and reset time")
+	}
+	if res.Upstream.HTTPStatus != 429 || res.Upstream.ProviderCode != "usage_limit" || res.Upstream.ResetAt != "1777673400" {
+		t.Errorf("Upstream = %+v, want 429/usage_limit/1777673400", res.Upstream)
+	}
+
+	recovered, prompts := providerErrorThenSuccess(t, "503 Service Unavailable")
+	wantRetriedToCompletion(t, recovered, prompts)
+	if recovered.Upstream != nil {
+		t.Errorf("recovered session Upstream = %+v, want nil", recovered.Upstream)
+	}
+}

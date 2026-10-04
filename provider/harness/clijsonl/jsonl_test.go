@@ -351,6 +351,81 @@ func TestMapLine_StreamEvent_Dropped(t *testing.T) {
 	}
 }
 
+func TestMapLine_StreamEvent_APIError_ProviderError(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "api_error_event.jsonl"))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	sys, ok := events[0].(agent.SystemEvent)
+	if !ok {
+		t.Fatalf("event %T, want SystemEvent", events[0])
+	}
+	if sys.Subtype != agent.SystemSubtypeProviderError {
+		t.Errorf("Subtype = %q, want %q", sys.Subtype, agent.SystemSubtypeProviderError)
+	}
+	if sys.Message != "Overloaded" {
+		t.Errorf("Message = %q, want Overloaded", sys.Message)
+	}
+	if sys.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's structured error")
+	}
+	if sys.Upstream.HTTPStatus != 529 {
+		t.Errorf("Upstream.HTTPStatus = %d, want 529", sys.Upstream.HTTPStatus)
+	}
+	if sys.Upstream.ProviderCode != "overloaded_error" {
+		t.Errorf("Upstream.ProviderCode = %q, want overloaded_error", sys.Upstream.ProviderCode)
+	}
+	// A non-error frame still maps to nothing.
+	if events := mapLine([]byte(`{"type":"stream_event","event":{"type":"content_block_delta"}}`)); len(events) != 0 {
+		t.Errorf("non-error stream_event produced %d events, want 0", len(events))
+	}
+}
+
+func TestMapLine_ResultUpstreamError(t *testing.T) {
+	t.Parallel()
+
+	events := mapLine(readFixture(t, "result_upstream_error.jsonl"))
+	if len(events) != 1 {
+		t.Fatalf("got %d events, want 1", len(events))
+	}
+	r, ok := events[0].(agent.ResultEvent)
+	if !ok {
+		t.Fatalf("event %T, want ResultEvent", events[0])
+	}
+	if r.Success {
+		t.Errorf("Success should be false")
+	}
+	if r.Upstream == nil {
+		t.Fatal("Upstream is nil, want the endpoint's structured error")
+	}
+	if r.Upstream.HTTPStatus != 429 {
+		t.Errorf("Upstream.HTTPStatus = %d, want 429", r.Upstream.HTTPStatus)
+	}
+	if r.Upstream.ProviderCode != "usage_limit" {
+		t.Errorf("Upstream.ProviderCode = %q, want usage_limit", r.Upstream.ProviderCode)
+	}
+	if r.Upstream.ProviderMessage != "Rate limited: quota exhausted" {
+		t.Errorf("Upstream.ProviderMessage = %q", r.Upstream.ProviderMessage)
+	}
+	if r.Upstream.ResetAt != "1777673400" {
+		t.Errorf("Upstream.ResetAt = %q, want 1777673400", r.Upstream.ResetAt)
+	}
+	// A success result carries no upstream error.
+	for _, ev := range mapLine(readFixture(t, "result_success.jsonl")) {
+		if r, ok := ev.(agent.ResultEvent); ok && r.Upstream != nil {
+			t.Errorf("success ResultEvent carries Upstream = %+v, want nil", r.Upstream)
+		}
+	}
+	// An error result without structured fields carries none either.
+	for _, ev := range mapLine(readFixture(t, "result_error.jsonl")) {
+		if r, ok := ev.(agent.ResultEvent); ok && r.Upstream != nil {
+			t.Errorf("plain error ResultEvent carries Upstream = %+v, want nil", r.Upstream)
+		}
+	}
+}
+
 func TestMapLine_RateLimitEvent_System(t *testing.T) {
 	t.Parallel()
 

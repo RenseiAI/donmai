@@ -769,6 +769,12 @@ type Result struct {
 	// "failed".
 	Error string `json:"error,omitempty"`
 
+	// Upstream is the structured endpoint error (HTTP status, provider
+	// code, truncated provider message, reset time) of a session that
+	// failed because the model endpoint refused or throttled it. Nil on
+	// every other run. Additive — old platforms ignore it.
+	Upstream *UpstreamError `json:"upstream,omitempty"`
+
 	// Manifest is the structured turn-result manifest the agent wrote to
 	// `.agent/turn-result.json`, when one was present + valid (W3 —
 	// deterministic turn outcome). The runner parses + validates it
