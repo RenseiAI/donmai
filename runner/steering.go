@@ -97,7 +97,7 @@ func (r *Runner) attemptSteering(
 		// don't accidentally double-steer.
 		return handle, nil
 	}
-	steerText := buildSteeringPrompt(qw, obs)
+	steerText := buildSteeringPrompt(qw, obs, resolveSteeringVisibility(ctx, res))
 	r.logger.Info("steering: injecting follow-up prompt",
 		"sessionId", qw.SessionID,
 		"len", len(steerText),
@@ -132,6 +132,17 @@ func (r *Runner) attemptSteering(
 	default:
 		return handle, fmt.Errorf("steering: inject failed: %w", err)
 	}
+}
+
+// resolveSteeringVisibility reuses the backstop's visibility result for
+// the tail-recovery prompt: public or unknown-visibility repositories get
+// a prompt with no tracker identifier. A missing worktree path fails safe
+// to unknown without shelling out.
+func resolveSteeringVisibility(ctx context.Context, res *Result) backstopVisibility {
+	if res == nil {
+		return backstopVisibilityUnknown
+	}
+	return resolveBackstopVisibility(ctx, res.WorktreePath)
 }
 
 // attemptSteeringResume performs the stop-and-resume fallback documented
@@ -278,7 +289,7 @@ func (r *Runner) injectDirective(ctx context.Context, handle agent.Handle, text 
 // was mid-handoff when nudged short-circuit it with an empty PR and no
 // turn result, so the PR-creation and follow-up wording stays
 // descriptive rather than a literal command script.
-func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
+func buildSteeringPrompt(qw QueuedWork, obs streamObservation, vis backstopVisibility) string {
 	var b strings.Builder
 	if qw.ContinuePullRequest != nil {
 		b.WriteString(fmt.Sprintf("Your previous turn finished without updating pull request #%d. ", qw.ContinuePullRequest.Number))
@@ -287,7 +298,7 @@ func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 		b.WriteString("Run these commands now:\n")
 		b.WriteString("  git status\n")
 		b.WriteString("  git add -A\n")
-		b.WriteString(fmt.Sprintf("  git commit -m \"feat: %s\"\n", commitSubject(qw)))
+		b.WriteString(fmt.Sprintf("  git commit -m \"feat: %s\"\n", steeringCommitSubject(qw, vis)))
 		b.WriteString(fmt.Sprintf("  git push origin HEAD:refs/heads/%s\n", continuePullRequestBranch(qw.ContinuePullRequest)))
 		b.WriteString("Do not open a new pull request: the run continues the existing one.\n\n")
 	} else {
@@ -297,7 +308,7 @@ func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 		b.WriteString("Run these commands now:\n")
 		b.WriteString("  git status\n")
 		b.WriteString("  git add -A\n")
-		b.WriteString(fmt.Sprintf("  git commit -m \"feat: %s\"\n", commitSubject(qw)))
+		b.WriteString(fmt.Sprintf("  git commit -m \"feat: %s\"\n", steeringCommitSubject(qw, vis)))
 		b.WriteString("  git push -u origin HEAD\n")
 		b.WriteString("Then open a pull request with `gh pr create`, using a real title and a body that ")
 		b.WriteString("describes the work -- do not use an empty or auto-filled body.\n\n")
@@ -309,6 +320,22 @@ func buildSteeringPrompt(qw QueuedWork, obs streamObservation) string {
 	b.WriteString("After the PR is open, output the PR URL on a single line ")
 	b.WriteString("and post the task's required turn-result/handoff.\n")
 	return b.String()
+}
+
+// steeringCommitSubject returns the commit subject the tail-recovery
+// prompt instructs the agent to use. Private repositories keep the work
+// identifier for correlation; public or unknown-visibility repositories
+// scrub every tracker-identifier-shaped token (not just this run's own)
+// and fall back to a neutral subject when nothing remains, so following
+// the prompt cannot leak an identifier into a public commit.
+func steeringCommitSubject(qw QueuedWork, vis backstopVisibility) string {
+	if vis == backstopVisibilityPrivate {
+		return commitSubject(qw)
+	}
+	if subject := scrubTrackerIDs(strings.TrimSpace(commitSubject(qw))); subject != "" {
+		return subject
+	}
+	return "recovered session work"
 }
 
 // commitSubject returns a sensible default commit subject derived
