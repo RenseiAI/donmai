@@ -275,3 +275,24 @@ func TestInsideOrEqual_FoldsCase(t *testing.T) {
 		}
 	}
 }
+
+func TestResolveSpec_LoopbackTCPPorts(t *testing.T) {
+	w := newSpecWorld(t)
+	spec := w.spec()
+	spec.LoopbackTCPPorts = []int{8080, 22}
+	resolved, err := resolveSpec(spec, w.guards(), evalSymlinks)
+	if err != nil {
+		t.Fatalf("resolveSpec: %v", err)
+	}
+	if len(resolved.LoopbackTCPPorts) != 2 || resolved.LoopbackTCPPorts[0] != 22 || resolved.LoopbackTCPPorts[1] != 8080 {
+		t.Fatalf("ports = %v, want sorted [22 8080]", resolved.LoopbackTCPPorts)
+	}
+	for _, ports := range [][]int{{0}, {65536}, {-1}, {80, 80}} {
+		bad := w.spec()
+		bad.LoopbackTCPPorts = ports
+		_, err := resolveSpec(bad, w.guards(), evalSymlinks)
+		if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
+			t.Fatalf("ports %v: err=%v, want writable_set_unrepresentable", ports, err)
+		}
+	}
+}
