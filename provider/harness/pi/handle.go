@@ -236,6 +236,18 @@ type Handle struct {
 	eventsClosed atomic.Bool
 }
 
+// suppressInjectedCost reports whether the session runs on the injected
+// provider with no per-token prices bound: the extension registers a zero
+// cost table (pi requires the field), but the reported cost is not a real
+// price, so the mapper drops it and cost reads as absent, not $0. Native
+// lanes (useNative, or no injected provider at all) are unchanged.
+func suppressInjectedCost(spec agent.Spec) bool {
+	if !injectedProviderSelected(spec) {
+		return false
+	}
+	return endpointUnitPrices(spec) == nil
+}
+
 func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, admissions ...*receiptAdmission) *Handle {
 	var receipt *receiptAdmission
 	if len(admissions) > 0 {
@@ -246,7 +258,7 @@ func newHandle(client *rpcClient, cmd *exec.Cmd, spec agent.Spec, token string, 
 		cmd:             cmd,
 		policy:          NewPolicyEngine(spec),
 		spec:            spec,
-		state:           &mapperState{},
+		state:           &mapperState{suppressCost: suppressInjectedCost(spec)},
 		token:           token,
 		receipt:         receipt,
 		handshakeResult: make(chan error, 1),

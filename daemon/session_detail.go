@@ -442,6 +442,16 @@ type SessionResolvedProfile struct {
 	PlatformAllowed []access.AuthMode `json:"platformAllowed,omitempty"`
 }
 
+// SessionUnitPrices mirrors agent.UnitPrices without importing the agent
+// package (this wire package stays agent-free). Per-token prices in USD
+// per million tokens; nil means no prices are bound.
+type SessionUnitPrices struct {
+	Input      float64 `json:"input,omitempty"`
+	Output     float64 `json:"output,omitempty"`
+	CacheRead  float64 `json:"cacheRead,omitempty"`
+	CacheWrite float64 `json:"cacheWrite,omitempty"`
+}
+
 // SessionEndpointBinding mirrors agent.EndpointBinding without credential
 // values. String fields keep the daemon independent of the agent package while
 // preserving every execution-cell axis across the poll/detail boundary.
@@ -471,6 +481,11 @@ type SessionEndpointBinding struct {
 	AuthPortability    string `json:"authPortability"`
 	AuthDelivery       string `json:"authDelivery"`
 	Mechanism          string `json:"mechanism"`
+	// UnitPrices carries optional per-token prices in USD per million
+	// tokens, mirroring agent.UnitPrices. Nil means no prices are bound:
+	// the runner reports cost as absent rather than zero. Additive +
+	// omitempty; absent on every dispatch that predates it.
+	UnitPrices *SessionUnitPrices `json:"unitPrices,omitempty"`
 }
 
 // SessionModelProfile mirrors runner.ResolvedModelProfile but lives in

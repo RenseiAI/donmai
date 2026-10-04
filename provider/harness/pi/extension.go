@@ -70,6 +70,21 @@ const (
 	piThinkingLevelEnvVar = "DONMAI_PI_THINKING_LEVEL"
 	piHandshakeEnvVar     = "DONMAI_PI_HANDSHAKE"
 
+	// Per-token price pins (USD per million tokens) the child extension
+	// reads to register the injected model's cost table
+	// (extensions/donmai-policy.ts). Each is exported only when the
+	// endpoint binding carries prices (spec.Endpoint.UnitPrices != nil);
+	// absent, the extension registers a zero cost table and the Go mapper
+	// suppresses the reported cost so it reads as absent, not $0.
+	// piPricesBoundEnvVar is the presence flag: "1" when prices are
+	// bound (even all-zero), absent otherwise, so the extension and the
+	// mapper can tell an explicit zero price from no prices at all.
+	piPricesBoundEnvVar     = "DONMAI_PI_PRICES_BOUND"
+	piPriceInputEnvVar      = "DONMAI_PI_PRICE_INPUT"
+	piPriceOutputEnvVar     = "DONMAI_PI_PRICE_OUTPUT"
+	piPriceCacheReadEnvVar  = "DONMAI_PI_PRICE_CACHE_READ"
+	piPriceCacheWriteEnvVar = "DONMAI_PI_PRICE_CACHE_WRITE"
+
 	// injectedExtensionsDir holds materialized agent.ExtensionDelivery
 	// (Kind == ExtensionDeliveryInline) artifacts, one level under piStateDir
 	// (ADR-2026-08-12 D1). Kept out of piStateDir's root so it never collides
@@ -485,7 +500,46 @@ func providerPinEnv(spec agent.Spec) []string {
 	// Always exported — empty when no effort is configured — so a value
 	// inherited from the spawning environment can never stand in for one.
 	out = append(out, piThinkingLevelEnvVar+"="+thinkingLevelForEffort(spec.Effort))
+	out = append(out, unitPricePinEnv(spec)...)
 	return out
+}
+
+// unitPricePinEnv exports the endpoint binding's optional per-token prices
+// (USD per million tokens) to the child extension. A nil UnitPrices means
+// no prices are bound: nothing is exported and the mapper suppresses the
+// reported cost (absent, not $0). A non-nil value exports the bound flag
+// plus all four rates — including explicit zeros — so the extension
+// registers them and pi computes the real per-turn cost. Negative or
+// non-finite rates are refused: the entry is dropped and prices count as
+// unbound rather than inventing a value the dispatch did not carry.
+func unitPricePinEnv(spec agent.Spec) []string {
+	prices := endpointUnitPrices(spec)
+	if prices == nil {
+		return nil
+	}
+	return []string{
+		piPricesBoundEnvVar + "=1",
+		piPriceInputEnvVar + "=" + strconv.FormatFloat(prices.Input, 'g', -1, 64),
+		piPriceOutputEnvVar + "=" + strconv.FormatFloat(prices.Output, 'g', -1, 64),
+		piPriceCacheReadEnvVar + "=" + strconv.FormatFloat(prices.CacheRead, 'g', -1, 64),
+		piPriceCacheWriteEnvVar + "=" + strconv.FormatFloat(prices.CacheWrite, 'g', -1, 64),
+	}
+}
+
+// endpointUnitPrices returns the endpoint binding's per-token prices, or
+// nil when none are bound. Invalid rates (negative, NaN, +Inf) fail closed
+// to nil so no invented price ever reaches the extension.
+func endpointUnitPrices(spec agent.Spec) *agent.UnitPrices {
+	if spec.Endpoint == nil || spec.Endpoint.UnitPrices == nil {
+		return nil
+	}
+	p := *spec.Endpoint.UnitPrices
+	for _, rate := range []float64{p.Input, p.Output, p.CacheRead, p.CacheWrite} {
+		if math.IsNaN(rate) || math.IsInf(rate, 0) || rate < 0 {
+			return nil
+		}
+	}
+	return &p
 }
 
 // positiveProviderConfigInt reads a token count (context window, output
