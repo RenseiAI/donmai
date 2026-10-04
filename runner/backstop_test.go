@@ -922,15 +922,91 @@ func gitRun(t *testing.T, dir string, args ...string) string {
 	return strings.TrimSpace(out)
 }
 
-// stubGhRecordingArgs shadows `gh` on PATH with a stub that records its argv
-// (one argument per line, after a leading blank line) and answers `pr create`
-// the way the real gh does: without --head it refuses exactly as the
-// recorded failure did; with it, it prints url.
+// readGhArgs reads the newline-separated argv file written by the gh
+// recording stubs below and returns the arguments (dropping the leading
+// blank line the stubs emit for shell-quoting simplicity).
+func readGhArgs(t *testing.T, argsFile string) []string {
+	t.Helper()
+	raw, err := os.ReadFile(argsFile) //nolint:gosec // G304: path created by this test.
+	if err != nil {
+		t.Fatalf("read gh args: %v", err)
+	}
+	return strings.Split(strings.TrimSpace(string(raw)), "\n")
+}
+
+// ghPRCapture holds the paths the gh visibility/pr-create stub writes.
+type ghPRCapture struct {
+	args  string
+	title string
+	body  string
+}
+
+// stubGhVisibilityAndPRCreate shadows `gh` on PATH with a stub that
+// answers the backstop's two gh calls: `repo view` returns visibility
+// (or fails with exit 1 when visibility is "") and `pr create` records
+// its full argv plus the --title/--body values to sibling files and
+// prints url. Title and body get their own files because the body spans
+// multiple lines, which makes positional argv parsing unreliable.
+func stubGhVisibilityAndPRCreate(t *testing.T, visibility, url string) ghPRCapture {
+	t.Helper()
+	dir := t.TempDir()
+	capture := ghPRCapture{
+		args:  filepath.Join(dir, "gh-args.txt"),
+		title: filepath.Join(dir, "gh-title.txt"),
+		body:  filepath.Join(dir, "gh-body.txt"),
+	}
+	visFile := filepath.Join(dir, "gh-visibility.txt")
+	if err := os.WriteFile(visFile, []byte(visibility), 0o600); err != nil {
+		t.Fatalf("write gh visibility output: %v", err)
+	}
+	// The stub answers the backstop's two gh calls: `repo view` prints the
+	// visibility (or fails when the file is empty, modelling gh missing /
+	// unauthenticated / not-a-repo), and `pr create` records its argv and
+	// prints url. Only the `pr create` argv is recorded — the visibility
+	// probe's fixed argv would otherwise overwrite it.
+	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "repo" ]; then
+  v=$(cat %[1]q)
+  if [ -z "$v" ]; then echo "no visibility" 1>&2; exit 1; fi
+  echo "$v"; exit 0
+fi
+{ echo; printf '%%s\n' "$@"; } > %[2]q
+prev=""
+for a in "$@"; do
+  case "$prev" in
+    --title) printf '%%s' "$a" > %[3]q ;;
+    --body) printf '%%s' "$a" > %[4]q ;;
+  esac
+  prev="$a"
+done
+for a in "$@"; do
+  if [ "$a" = "--head" ]; then echo %[5]q; exit 0; fi
+done
+echo "aborted: you must first push the current branch to a remote, or use the --head flag" 1>&2
+exit 1
+`, visFile, capture.args, capture.title, capture.body, url)
+	ghPath := filepath.Join(dir, "gh")
+	//nolint:gosec // G306: a stub executable must carry the exec bit.
+	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
+		t.Fatalf("write gh stub: %v", err)
+	}
+	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
+	return capture
+}
+
+// stubGhRecordingArgs shadows `gh` on PATH with a stub that records the
+// `pr create` argv (one argument per line, after a leading blank line)
+// and answers `pr create` the way the real gh does: without --head it
+// refuses exactly as the recorded failure did; with it, it prints url.
+// The backstop's read-only `repo view` visibility probe is answered
+// PRIVATE without recording, so tests asserting "gh was never invoked"
+// after a failed push only observe PR creation.
 func stubGhRecordingArgs(t *testing.T, url string) string {
 	t.Helper()
 	dir := t.TempDir()
 	argsFile := filepath.Join(dir, "gh-args.txt")
 	script := fmt.Sprintf(`#!/bin/sh
+if [ "$1" = "repo" ]; then echo PRIVATE; exit 0; fi
 { echo; printf '%%s\n' "$@"; } > %[1]q
 for a in "$@"; do
   if [ "$a" = "--head" ]; then echo %[2]q; exit 0; fi
@@ -945,6 +1021,209 @@ exit 1
 	}
 	t.Setenv("PATH", dir+string(os.PathListSeparator)+os.Getenv("PATH"))
 	return argsFile
+}
+
+// TestBackstopVisibilitySurfaces table-tests the visibility gate over the
+// backstop's public surfaces: the commit message, the PR title, and the
+// PR body. Private keeps the work identifier for correlation; public
+// and every unknown value (gh missing, empty output, a future enum)
+// render the redacted format. Each case carries a distinct want so
+// deleting the visibility branch fails it.
+func TestBackstopVisibilitySurfaces(t *testing.T) {
+	t.Parallel()
+	// Distinct session id and work identifier: the helper embeds the
+	// identifier in the session id, which would make every
+	// contains-identifier assertion a false positive.
+	qw := QueuedWork{QueuedWork: queuedWorkBase("VIS-12")}
+	qw.SessionID = "sess-abc123"
+	qw.Title = "Repair the widget"
+	cases := []struct {
+		name        string
+		raw         string
+		wantVis     backstopVisibility
+		wantCommit  string
+		wantTitle   string
+		wantNoIdent bool
+	}{
+		{
+			name:       "private keeps identifier",
+			raw:        "PRIVATE",
+			wantVis:    backstopVisibilityPrivate,
+			wantCommit: "Backstop: VIS-12 (sess-abc123)",
+			wantTitle:  "VIS-12: Repair the widget",
+		},
+		{
+			name:        "public redacts identifier",
+			raw:         "PUBLIC",
+			wantVis:     backstopVisibilityPublic,
+			wantCommit:  "Backstop: sess-abc123",
+			wantTitle:   "Repair the widget",
+			wantNoIdent: true,
+		},
+		{
+			name:        "unknown fails safe to redacted",
+			raw:         "INTERNAL",
+			wantVis:     backstopVisibilityUnknown,
+			wantCommit:  "Backstop: sess-abc123",
+			wantTitle:   "Repair the widget",
+			wantNoIdent: true,
+		},
+		{
+			name:        "empty fails safe to redacted",
+			raw:         "",
+			wantVis:     backstopVisibilityUnknown,
+			wantCommit:  "Backstop: sess-abc123",
+			wantTitle:   "Repair the widget",
+			wantNoIdent: true,
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			if got := parseBackstopVisibility(tc.raw); got != tc.wantVis {
+				t.Fatalf("parseBackstopVisibility(%q) = %q, want %q", tc.raw, got, tc.wantVis)
+			}
+			vis := parseBackstopVisibility(tc.raw)
+			if got := backstopCommitMessage(qw, vis); got != tc.wantCommit {
+				t.Errorf("backstopCommitMessage = %q, want %q", got, tc.wantCommit)
+			}
+			if got := backstopPRTitle(qw, vis); got != tc.wantTitle {
+				t.Errorf("backstopPRTitle = %q, want %q", got, tc.wantTitle)
+			}
+			if tc.wantNoIdent {
+				for _, got := range []string{backstopCommitMessage(qw, vis), backstopPRTitle(qw, vis), backstopPRBody(qw)} {
+					if strings.Contains(got, qw.IssueIdentifier) {
+						t.Errorf("redacted surface %q still contains the work identifier", got)
+					}
+				}
+			}
+			if body := backstopPRBody(qw); !strings.Contains(body, qw.SessionID) || strings.Contains(body, qw.IssueIdentifier) {
+				t.Errorf("backstopPRBody = %q, want session id without the work identifier", body)
+			}
+		})
+	}
+}
+
+// TestBackstopVisibilityFallbackTitle covers the neutral-title path: when
+// the session title is empty or carries only the identifier, a public
+// backstop still produces a title with no identifier.
+func TestBackstopVisibilityFallbackTitle(t *testing.T) {
+	t.Parallel()
+	cases := []struct {
+		name  string
+		title string
+		ident string
+		want  string
+	}{
+		{name: "empty title", title: "", ident: "VIS-7", want: "Auto-recovered session work"},
+		{name: "identifier-only title", title: "VIS-7", ident: "VIS-7", want: "Auto-recovered session work"},
+		{name: "identifier prefix stripped", title: "VIS-7: repair the widget", ident: "VIS-7", want: "repair the widget"},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			qw := QueuedWork{QueuedWork: queuedWorkBase(tc.ident)}
+			qw.Title = tc.title
+			if got := backstopPRTitle(qw, backstopVisibilityPublic); got != tc.want {
+				t.Errorf("backstopPRTitle = %q, want %q", got, tc.want)
+			}
+			if got := backstopPRTitle(qw, backstopVisibilityUnknown); got != tc.want {
+				t.Errorf("backstopPRTitle(unknown) = %q, want %q", got, tc.want)
+			}
+			if got := backstopPRTitle(qw, backstopVisibilityPublic); strings.Contains(got, tc.ident) {
+				t.Errorf("public title %q still contains the work identifier", got)
+			}
+		})
+	}
+}
+
+// TestRunBackstop_VisibilityGatesPublicSurfaces drives the production
+// entry point: the backstop resolves visibility through `gh repo view`
+// and the recorded `pr create` argv plus the commit message carry the
+// identifier only for PRIVATE. The gh-failure case proves the
+// fail-safe: an undeterminable repository renders the redacted format.
+func TestRunBackstop_VisibilityGatesPublicSurfaces(t *testing.T) {
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	cases := []struct {
+		name       string
+		visibility string
+		wantIdent  bool
+	}{
+		{name: "private", visibility: "PRIVATE", wantIdent: true},
+		{name: "public", visibility: "PUBLIC", wantIdent: false},
+		{name: "gh failure fails safe", visibility: "", wantIdent: false},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			remote, repo := backstopRemoteFixture(t)
+			session := "agent/visibility-gate-" + strings.ToLower(tc.name[:3])
+			session = strings.ReplaceAll(session, " ", "-")
+			gitRun(t, repo, "checkout", "-q", "-b", session)
+			writeFile(t, repo, "src/fix.go", "package fix\n")
+
+			qw := QueuedWork{QueuedWork: queuedWorkBase("SYNC-31")}
+			// Decouple the session id from the identifier: the helper
+			// embeds the identifier, which would make the
+			// contains-identifier assertion a false positive.
+			qw.SessionID = "sess-vis-" + strings.ReplaceAll(strings.ToLower(tc.name[:3]), " ", "")
+			qw.Title = "Repair the widget"
+			wantCommit := "Backstop: " + qw.SessionID
+			wantTitle := "Repair the widget"
+			if tc.wantIdent {
+				wantCommit = "Backstop: SYNC-31 (" + qw.SessionID + ")"
+				wantTitle = "SYNC-31: Repair the widget"
+			}
+			const wantURL = "https://github.com/example/project/pull/99"
+			capture := stubGhVisibilityAndPRCreate(t, tc.visibility, wantURL)
+
+			res := &Result{}
+			res.WorktreePath = repo
+			report := minimalRunner(t).runBackstop(context.Background(), qw, session, res, nil)
+			if report.Diagnostics != "" {
+				t.Fatalf("backstop diagnostics = %q, want none", report.Diagnostics)
+			}
+			if !report.Pushed || !report.PRCreated || report.PRURL != wantURL {
+				t.Fatalf("report = %+v, want pushed + PR %s", report, wantURL)
+			}
+			commitMsg := gitRun(t, repo, "log", "-1", "--pretty=format:%s")
+			if commitMsg != wantCommit {
+				t.Errorf("commit subject = %q, want %q", commitMsg, wantCommit)
+			}
+			if got := gitRun(t, remote, "rev-parse", "refs/heads/"+session); got != gitRun(t, repo, "rev-parse", "HEAD") {
+				t.Errorf("remote %s is not the committed work", session)
+			}
+			readFile := func(path string) string {
+				raw, err := os.ReadFile(path) //nolint:gosec // G304: path created by this test.
+				if err != nil {
+					t.Fatalf("read gh capture %s: %v", path, err)
+				}
+				return string(raw)
+			}
+			args := readGhArgs(t, capture.args)
+			if len(args) < 2 || args[0] != "pr" || args[1] != "create" {
+				t.Fatalf("gh argv = %q, want pr create", args)
+			}
+			if got := readFile(capture.title); got != wantTitle {
+				t.Errorf("gh --title = %q, want %q", got, wantTitle)
+			}
+			body := readFile(capture.body)
+			if !strings.Contains(body, qw.SessionID) {
+				t.Errorf("gh --body = %q, want it to keep the session id", body)
+			}
+			// The body never carries the identifier on any visibility —
+			// assert that separately from the commit/title gate above.
+			if strings.Contains(body, "SYNC-31") {
+				t.Errorf("gh --body = %q, must never contain the work identifier", body)
+			}
+			for _, surface := range []string{commitMsg, readFile(capture.title)} {
+				if hasIdent := strings.Contains(surface, "SYNC-31"); hasIdent != tc.wantIdent {
+					t.Errorf("surface %q contains identifier = %v, want %v", surface, hasIdent, tc.wantIdent)
+				}
+			}
+		})
+	}
 }
 
 // stubGhOnPath writes a fake `gh` executable that echoes output to stderr

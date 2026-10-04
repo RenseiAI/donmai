@@ -225,6 +225,96 @@ func shouldBackstop(res *Result, workType string) bool {
 // BackstopReport.Diagnostics; the caller decides whether to surface
 // them as Result.FailureMode = FailureBackstop.
 //
+// backstopVisibility is the repository-visibility gate for the backstop's
+// public surfaces (commit message, PR title/body). Only
+// backstopVisibilityPrivate keeps the tracker identifier; every other
+// value — public or unknown — uses the redacted format so a private
+// tracker identifier never leaks into a public repository.
+type backstopVisibility string
+
+const (
+	backstopVisibilityPublic  backstopVisibility = "PUBLIC"
+	backstopVisibilityPrivate backstopVisibility = "PRIVATE"
+	backstopVisibilityUnknown backstopVisibility = "UNKNOWN"
+)
+
+// parseBackstopVisibility normalizes `gh repo view` output. Anything that
+// is not an explicit PRIVATE — including empty output and future values —
+// maps to UNKNOWN so callers fail safe to the redacted format.
+func parseBackstopVisibility(out string) backstopVisibility {
+	switch strings.ToUpper(strings.TrimSpace(out)) {
+	case string(backstopVisibilityPrivate):
+		return backstopVisibilityPrivate
+	case string(backstopVisibilityPublic):
+		return backstopVisibilityPublic
+	default:
+		return backstopVisibilityUnknown
+	}
+}
+
+// resolveBackstopVisibility determines repository visibility via
+// `gh repo view --json visibility`. Callers resolve it once per backstop
+// run, before composing any public surface, and reuse it for the commit
+// message and the PR title/body. Any failure (gh missing,
+// unauthenticated, not a GitHub repository) returns UNKNOWN, which
+// renders with the public (redacted) format.
+func resolveBackstopVisibility(ctx context.Context, worktreePath string) backstopVisibility {
+	lookupCtx, cancel := context.WithTimeout(ctx, 5*time.Second)
+	defer cancel()
+	out, err := runGh(lookupCtx, worktreePath, "repo", "view", "--json", "visibility", "-q", ".visibility")
+	if err != nil {
+		return backstopVisibilityUnknown
+	}
+	return parseBackstopVisibility(out)
+}
+
+// backstopCommitMessage composes the backstop commit message. Private
+// repositories keep the tracker identifier for correlation; public or
+// unknown-visibility repositories carry only the session id.
+func backstopCommitMessage(qw QueuedWork, vis backstopVisibility) string {
+	if vis == backstopVisibilityPrivate && qw.IssueIdentifier != "" {
+		return fmt.Sprintf("Backstop: %s (%s)", qw.IssueIdentifier, qw.SessionID)
+	}
+	return fmt.Sprintf("Backstop: %s", qw.SessionID)
+}
+
+// backstopPRTitle composes the backstop PR title. Private repositories
+// keep the tracker identifier prefix; public or unknown-visibility
+// repositories use a neutral title with no tracker identifier — the
+// session's title with any identifier occurrence removed, or the
+// fallback when nothing remains.
+func backstopPRTitle(qw QueuedWork, vis backstopVisibility) string {
+	if vis == backstopVisibilityPrivate {
+		title := commitSubject(qw)
+		if qw.IssueIdentifier != "" && !strings.Contains(title, qw.IssueIdentifier) {
+			title = qw.IssueIdentifier + ": " + title
+		}
+		return title
+	}
+	title := strings.TrimSpace(qw.Title)
+	if title != "" && qw.IssueIdentifier != "" && strings.Contains(title, qw.IssueIdentifier) {
+		title = strings.TrimSpace(strings.ReplaceAll(title, qw.IssueIdentifier, ""))
+		title = strings.TrimSpace(strings.TrimLeft(title, ":\u2014\u2013- "))
+	}
+	if title == "" {
+		title = "Auto-recovered session work"
+	}
+	return title
+}
+
+// backstopPRBody composes the backstop PR body. It carries only the
+// session id — never the tracker identifier — on every visibility, so
+// the body needs no visibility branch.
+func backstopPRBody(qw QueuedWork) string {
+	return fmt.Sprintf(
+		"## Summary\n\nAuto-recovered by the runner backstop for session %s.\n\n"+
+			"The agent finished without opening a pull request. The backstop "+
+			"committed pending changes (excluding build artifacts) and opened "+
+			"this PR so the work is not lost.",
+		qw.SessionID,
+	)
+}
+
 //nolint:gocyclo,funlen // step ordering is the package's contract; splitting hides intent
 func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, res *Result, allowedRepositories map[string]struct{}) agent.BackstopReport {
 	// Keep the completion contract at the mutation boundary too. Normal callers
@@ -315,11 +405,24 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	}
 
 	// 5. Commit when there's something to commit.
-	if len(stagedAfter) > 0 {
-		commitMsg := fmt.Sprintf("Backstop: %s", qw.SessionID)
-		if qw.IssueIdentifier != "" {
-			commitMsg = fmt.Sprintf("Backstop: %s (%s)", qw.IssueIdentifier, qw.SessionID)
+	// Visibility is resolved before composing any public surface so a
+	// private work identifier never reaches a public repository's
+	// commit message, PR title, or PR body. Only PRIVATE keeps the
+	// identifier; PUBLIC and UNKNOWN (including every gh failure) use
+	// the redacted format. Continue mode returns before any PR is
+	// opened, so defer the gh visibility lookup until the new-PR path
+	// actually needs it.
+	var vis backstopVisibility
+	visibilityResolved := false
+	resolveVis := func() backstopVisibility {
+		if !visibilityResolved {
+			vis = resolveBackstopVisibility(ctx, worktreePath)
+			visibilityResolved = true
 		}
+		return vis
+	}
+	if len(stagedAfter) > 0 {
+		commitMsg := backstopCommitMessage(qw, resolveVis())
 		if _, err := runGit(ctx, worktreePath, id, "commit", "-m", commitMsg); err != nil {
 			report.Diagnostics = fmt.Sprintf("git commit failed: %v", err)
 			return report
@@ -384,17 +487,8 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 		report.PRURL = res.PullRequestURL
 		return report
 	}
-	prTitle := commitSubject(qw)
-	if !strings.Contains(prTitle, qw.IssueIdentifier) && qw.IssueIdentifier != "" {
-		prTitle = qw.IssueIdentifier + ": " + prTitle
-	}
-	prBody := fmt.Sprintf(
-		"## Summary\n\nAuto-recovered by the runner backstop for session %s.\n\n"+
-			"The agent finished without opening a pull request. The backstop "+
-			"committed pending changes (excluding build artifacts) and opened "+
-			"this PR so the work is not lost.",
-		qw.SessionID,
-	)
+	prTitle := backstopPRTitle(qw, resolveVis())
+	prBody := backstopPRBody(qw)
 	// --head names the session branch just pushed, so gh never infers the
 	// head from the checked-out branch — which may be one this session does
 	// not own. An "already exists" PR recovered below is therefore always the

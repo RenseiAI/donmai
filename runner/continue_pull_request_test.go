@@ -232,10 +232,13 @@ func TestRunBackstop_ContinueModePushesHeadWithoutNewPR(t *testing.T) {
 	gitRun(t, repo, "checkout", "-q", branch)
 	writeFile(t, repo, "src/fix.go", "package fix\n")
 
-	// gh must never run in continue mode: fail loudly if it does.
+	// gh must never open a PR in continue mode: fail loudly if it tries
+	// anything but the read-only visibility probe (`repo view` answers
+	// PRIVATE so the commit keeps its identifier; every other gh
+	// invocation exits 99).
 	dir := t.TempDir()
 	ghPath := filepath.Join(dir, "gh")
-	script := "#!/bin/sh\necho 'gh must not run in continue mode' 1>&2\nexit 99\n"
+	script := "#!/bin/sh\nif [ \"$1\" = \"repo\" ]; then echo PRIVATE; exit 0; fi\necho 'gh must not run in continue mode' 1>&2\nexit 99\n"
 	//nolint:gosec // G306: a stub executable must carry the exec bit.
 	if err := os.WriteFile(ghPath, []byte(script), 0o700); err != nil {
 		t.Fatalf("write gh guard stub: %v", err)
