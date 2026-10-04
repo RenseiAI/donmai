@@ -2,10 +2,12 @@ package codex
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"os"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"testing"
 	"time"
@@ -312,6 +314,170 @@ func TestSpawnInteractive_GatewayRouteNeedsNoOperatorAuth(t *testing.T) {
 	}, spec)
 	if !hookCalled {
 		t.Fatal("gateway cell never reached the isolated pre-PTY boundary")
+	}
+	if !seenBlock {
+		t.Fatal("private interactive config lacks the gateway provider block")
+	}
+	if seenKey != cellKey {
+		t.Fatalf("pre-PTY child env key = %q, want the binding cell key %q", seenKey, cellKey)
+	}
+	if !errors.Is(err, agent.ErrSpawnFailed) {
+		t.Fatalf("hook-aborted SpawnInteractive error = %v, want ErrSpawnFailed", err)
+	}
+	if entries, rerr := os.ReadDir(boundaryRoot); rerr != nil || len(entries) != 0 {
+		t.Fatalf("hook-aborted spawn leaked its private boundary: err=%v entries=%v", rerr, entries)
+	}
+}
+
+// TestGatewayHeadlessResumeAfterSpawnWithEndpointKey drives the production
+// Spawn then Resume entry points on the same provider with an endpoint-bound
+// gateway key, and the resume succeeds with the child carrying the endpoint
+// key. Against the pre-fix comparison (raw Spec.Env instead of the projected
+// layer) the Resume refuses with errSessionEnvConflict naming the gateway env
+// name — the exact stop-and-resume steering failure this change fixes.
+func TestGatewayHeadlessResumeAfterSpawnWithEndpointKey(t *testing.T) {
+	const (
+		baseURL    = "https://gateway.example/codex/v1"
+		cellKey    = "cell-key"
+		sessionKey = "spec-key"
+	)
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    t.TempDir(),
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	go fs.run(t, "thread-gateway-resume")
+
+	spec := gatewayCellSpec(baseURL, cellKey, sessionKey)
+	spec.Cwd = t.TempDir()
+	spawned, err := p.Spawn(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("gateway Spawn: %v", err)
+	}
+	t.Cleanup(func() { _ = spawned.Stop(context.Background()) })
+	spawnThreadID := spawned.SessionID()
+	if spawnThreadID == "" {
+		t.Fatal("Spawn returned an empty session id")
+	}
+
+	resumed, err := p.Resume(t.Context(), spawnThreadID, gatewayCellSpec(baseURL, cellKey, sessionKey))
+	if err != nil {
+		t.Fatalf("gateway Resume on the same provider: %v", err)
+	}
+	t.Cleanup(func() { _ = resumed.Stop(context.Background()) })
+	if resumed.SessionID() != spawnThreadID {
+		t.Fatalf("resumed session id = %q, want the spawned thread %q", resumed.SessionID(), spawnThreadID)
+	}
+	if got := p.pinnedSessionEnv[codexGatewayEnvKey]; got != cellKey {
+		t.Fatalf("pinned child env key = %q, want the binding cell key %q", got, cellKey)
+	}
+}
+
+// TestGatewayHeadlessSpawn_SpecKeyFallback drives the production Spawn entry
+// point with the gateway key carried only on the session layer (the shape
+// production uses today). Dropping the session-layer fallback from
+// gatewayBinding turns this red with a missing-key refusal.
+func TestGatewayHeadlessSpawn_SpecKeyFallback(t *testing.T) {
+	const (
+		baseURL = "https://gateway.example/codex/v1"
+		key     = "spec-only-key"
+	)
+	fs, stdinW, stdoutR := newFakeServer()
+	p, err := New(Options{
+		skipProcess:      true,
+		stdinOverride:    stdinW,
+		stdoutOverride:   stdoutR,
+		configTempDir:    t.TempDir(),
+		HandshakeTimeout: 200 * time.Millisecond,
+	})
+	if err != nil {
+		fs.close()
+		t.Fatalf("New: %v", err)
+	}
+	t.Cleanup(func() {
+		_ = p.Shutdown(context.Background())
+		fs.close()
+	})
+	go fs.run(t, "thread-gateway-speckey")
+
+	spec := gatewayTestSpec(baseURL, key)
+	spec.Prompt = "gateway probe"
+	spec.Cwd = t.TempDir()
+	h, err := p.Spawn(t.Context(), spec)
+	if err != nil {
+		t.Fatalf("gateway Spawn with session-layer key: %v", err)
+	}
+	defer func() { _ = h.Stop(context.Background()) }()
+	if got := p.pinnedSessionEnv[codexGatewayEnvKey]; got != key {
+		t.Fatalf("pinned child env key = %q, want the session-layer key %q", got, key)
+	}
+}
+
+// TestSpawnInteractive_GatewayRouteWithoutPlatformMCP drives the production
+// interactive entry point with a gateway binding and no platform MCP
+// authority. The gateway route must still land in the isolated boundary:
+// skipping routing whenever the platform entry is absent (the non-routed
+// ambient branch) never calls the pre-PTY hook, so this goes red.
+func TestSpawnInteractive_GatewayRouteWithoutPlatformMCP(t *testing.T) {
+	if runtime.GOOS == "windows" {
+		t.Skip("pty spawn tests are unix-only")
+	}
+	clearInteractiveCodexAuthEnv(t)
+	t.Setenv("CODEX_HOME", filepath.Join(t.TempDir(), "absent-codex-home"))
+	workdir := t.TempDir()
+	boundaryRoot := t.TempDir()
+	bin := writeFakeCodexScript(t, `exit 0`)
+
+	const (
+		baseURL = "https://gateway.example/codex/v1"
+		cellKey = "cell-key"
+	)
+	spec := gatewayCellSpec(baseURL, cellKey, "")
+	spec.Cwd = workdir
+	spec.Interactive = &agent.InteractiveSpec{Cols: 80, Rows: 24}
+
+	var (
+		hookCalled bool
+		seenKey    string
+		seenBlock  bool
+	)
+	_, err := SpawnInteractive(context.Background(), Options{
+		CodexBin:      bin,
+		configTempDir: boundaryRoot,
+		interactiveMCPInventoryRunner: func(_ context.Context, _ string, _ string, _ []string, _ []string, queryArgs []string) ([]byte, error) {
+			if slices.Contains(queryArgs, "list") {
+				return json.Marshal([]codexMCPInventoryEntry{})
+			}
+			return nil, errors.New("unexpected fake inventory query")
+		},
+		interactiveBeforePTYSpawn: func(_ context.Context, _ string, _ agent.Spec, launch interactiveLaunch, home string) error {
+			hookCalled = true
+			seenKey = launch.env[codexGatewayEnvKey]
+			body, rerr := os.ReadFile(filepath.Join(home, codexConfigFileName))
+			if rerr != nil {
+				return rerr
+			}
+			seenBlock = strings.Contains(string(body), `model_provider = "donmai-gateway"`) &&
+				strings.Contains(string(body), `base_url = "`+baseURL+`"`)
+			if _, serr := os.Lstat(filepath.Join(home, codexAuthFileName)); !errors.Is(serr, os.ErrNotExist) {
+				return errors.New("gateway boundary carries an operator auth file")
+			}
+			return errors.New("stop before PTY")
+		},
+	}, spec)
+	if !hookCalled {
+		t.Fatal("gateway cell without platform MCP never reached the isolated pre-PTY boundary")
 	}
 	if !seenBlock {
 		t.Fatal("private interactive config lacks the gateway provider block")

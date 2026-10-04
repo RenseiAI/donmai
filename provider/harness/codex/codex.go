@@ -517,6 +517,10 @@ func (p *Provider) Resume(ctx context.Context, sessionID string, spec agent.Spec
 // The overlay only applies at start, so this is also where the one-session
 // invariant is enforced: a divergent later layer is refused BEFORE the host
 // auth link and before startLocked, so a denied spawn leaves no side effect.
+// The comparison runs against the gateway-projected layer, not the raw
+// Spec.Env: a gateway-routed cell's child carries the binding-selected key
+// under the gateway env name, so comparing the original layer would refuse a
+// same-session Resume for carrying exactly what the child was started with.
 func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	p.startMu.Lock()
 	defer p.startMu.Unlock()
@@ -525,7 +529,24 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 		return spec, fmt.Errorf("%w: %w: codex provider already shut down", agent.ErrSpawnFailed, agent.ErrProviderUnavailable)
 	default:
 	}
-	if err := p.checkSessionEnvLocked(spec.Env); err != nil {
+	// Resolve the gateway route first: gatewayBinding is pure (no side
+	// effects) and the projected layer is what the running child actually
+	// carries, so the session-env check below must compare against it. A
+	// gateway-routed cell's child carries the binding-selected key under
+	// the gateway env name; comparing the original Spec.Env would refuse a
+	// same-session Resume for carrying exactly what the child was started
+	// with. Keeping the resolution and the check before the protected-MCP
+	// pin, the host-auth link, and startLocked preserves the fail-closed
+	// ordering: a refused spawn leaves no side effect.
+	baseURL, gatewayKey, gatewayRouted, routeErr := gatewayBinding(spec)
+	if routeErr != nil {
+		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, routeErr)
+	}
+	projectedEnv := spec.Env
+	if gatewayRouted {
+		projectedEnv = projectGatewayKey(spec.Env, gatewayKey)
+	}
+	if err := p.checkSessionEnvLocked(projectedEnv); err != nil {
 		return spec, err
 	}
 	if err := p.prepareHeadlessProtectedMCPAuthorityLocked(spec.MCPServers); err != nil {
@@ -534,20 +555,18 @@ func (p *Provider) ensureHeadlessReady(spec agent.Spec) (agent.Spec, error) {
 	// A gateway-routed cell skips the host-session auth link so the child
 	// cannot fall back to an operator login; the provider block plus the
 	// binding-selected key projected below are its only route.
-	if baseURL, key, routed, err := gatewayBinding(spec); err != nil {
-		return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
-	} else if routed {
+	if gatewayRouted {
 		if p.hostAuthFile != "" {
 			return spec, fmt.Errorf("%w: codex gateway route cannot combine with host-session auth", agent.ErrSpawnFailed)
 		}
-		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, key, spec.Env)
+		nextEnv, err := p.config.appendGatewayProviderBlock(baseURL, gatewayKey, spec.Env)
 		if err != nil {
 			return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, err)
 		}
 		if nextEnv == nil {
 			nextEnv = map[string]string{}
 		}
-		nextEnv[codexGatewayEnvKey] = key
+		nextEnv[codexGatewayEnvKey] = gatewayKey
 		if strings.TrimSpace(nextEnv[codexGatewayEnvKey]) == "" {
 			return spec, fmt.Errorf("%w: codex gateway route requires a key on %s", agent.ErrSpawnFailed, codexGatewayEnvKey)
 		}
