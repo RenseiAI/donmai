@@ -82,7 +82,7 @@ func isInside(path, dir string) (bool, error) {
 func TestMaterializeExtensionForSpec_SessionWorkarea(t *testing.T) {
 	cwd := t.TempDir()
 	spec := agent.Spec{Cwd: cwd, SessionName: "s1"}
-	layout, err := materializeExtensionForSpec(spec)
+	layout, err := materializeExtensionForSpec(spec, false)
 	if err != nil {
 		t.Fatalf("materializeExtensionForSpec: %v", err)
 	}
@@ -141,7 +141,7 @@ func TestMaterializeExtensionForSpec_LeavesCheckoutClean(t *testing.T) {
 	if err := os.MkdirAll(cwd, 0o700); err != nil {
 		t.Fatal(err)
 	}
-	layout, err := materializeExtensionForSpec(agent.Spec{Cwd: cwd, SessionName: "s1"})
+	layout, err := materializeExtensionForSpec(agent.Spec{Cwd: cwd, SessionName: "s1"}, false)
 	if err != nil {
 		t.Fatalf("materializeExtensionForSpec: %v", err)
 	}

@@ -14,6 +14,7 @@ import (
 	"time"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/confinement"
 )
 
 // Compile-time assertion: Handle satisfies agent.Handle.
@@ -142,12 +143,14 @@ type Handle struct {
 	// historical fatal bypass behavior.
 	receipt *receiptAdmission
 
-	// confinementRelease removes the rendered sandbox profile for a
-	// confined spawn. It must run only after the confined child has exited
-	// (or at least read the profile); releaseConfinement runs it idempotently
-	// from Stop and from the pump teardown. Nil for unconfined spawns.
-	confinementRelease func() error
-	confinementOnce    sync.Once
+	// confinement is the plan a confined spawn runs under: its record is
+	// the per-session confinement record, and its Release removes the
+	// rendered sandbox profile. The release must run only after the
+	// confined child has exited (or at least read the profile);
+	// releaseConfinement runs it idempotently from Stop and from the pump
+	// teardown. Nil for unconfined spawns.
+	confinement     *confinement.Plan
+	confinementOnce sync.Once
 
 	// token is the per-session handshake secret the harness set in the child
 	// env (piHandshakeEnvVar). The policy extension echoes it on every
@@ -243,18 +246,18 @@ type Handle struct {
 	eventsClosed atomic.Bool
 }
 
-// newHandleWithRelease is newHandle plus the confinement profile release:
-// the rendered sandbox profile must stay on disk until the confined child
-// has exited, so the release runs when the session stops or the pump drains.
-// A nil release is a no-op (unconfined spawns).
-func (h *Handle) setConfinementRelease(release func() error) {
-	h.confinementRelease = release
+// setConfinement attaches the plan a confined spawn runs under. The
+// rendered sandbox profile must stay on disk until the confined child has
+// exited, so the release runs when the session stops or the pump drains. A
+// nil plan (an unconfined spawn) is a no-op. Set before the pump starts.
+func (h *Handle) setConfinement(plan *confinement.Plan) {
+	h.confinement = plan
 }
 
 func (h *Handle) releaseConfinement() {
 	h.confinementOnce.Do(func() {
-		if h.confinementRelease != nil {
-			_ = h.confinementRelease()
+		if h.confinement != nil {
+			_ = h.confinement.Release()
 		}
 	})
 }

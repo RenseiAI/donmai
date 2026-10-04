@@ -183,6 +183,8 @@ jobs:
   # backend, same-identity chmod), nested-profile refusal, composer rules and
   # declared sockets. Those tests are darwin-only, so the Linux `test` job
   # never runs them; without this job the boundary has no CI coverage at all.
+  # The pi harness's live confinement tests ride the same job for the same
+  # reason.
   macos-confinement:
     name: macOS executor confinement (seatbelt)
     runs-on: macos-15
@@ -230,3 +232,33 @@ jobs:
             fi
           done
           echo "Gate-liveness OK: $(echo "$LIVE" | wc -l | tr -d ' ') live sandbox-exec tests ran and passed, no SKIPs."
+
+      # The pi harness wraps its seats in that boundary on both spawn paths.
+      # Its live tests drive Provider.Spawn and Resume (headless and
+      # interactive) through the production gate under the real backend,
+      # and refuse planted links on resume; they are darwin-only too.
+      - name: pi confinement suite (live sandbox-exec)
+        run: |
+          set -o pipefail
+          go test -race -count=1 -timeout 15m -v -run 'TestPiConfinement_' ./provider/harness/pi/ 2>&1 | tee "${RUNNER_TEMP}/pi-confinement.log"
+
+      - name: Guard — the pi confinement tests must RUN, not skip
+        run: |
+          LOG="${RUNNER_TEMP}/pi-confinement.log"
+          if grep -Eq '^\s*--- SKIP: ' "$LOG"; then
+            echo "::error::a pi confinement test SKIPPED on macOS"
+            grep -E '^\s*--- SKIP: ' "$LOG"
+            exit 1
+          fi
+          LIVE=$(grep -oE '^func (TestPiConfinement_[A-Za-z0-9_]+)' provider/harness/pi/confinement_live_test.go | awk '{print $2}')
+          if [ -z "$LIVE" ]; then
+            echo "::error::no pi confinement tests found"
+            exit 1
+          fi
+          for TEST in $LIVE; do
+            if ! grep -Eq "^--- PASS: ${TEST} " "$LOG"; then
+              echo "::error::${TEST} did not report PASS"
+              exit 1
+            fi
+          done
+          echo "Gate-liveness OK: $(echo "$LIVE" | wc -l | tr -d ' ') pi confinement tests ran and passed, no SKIPs."

@@ -5,8 +5,11 @@ import (
 	"crypto/sha256"
 	"encoding/hex"
 	"fmt"
+	"net"
+	"net/url"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"sync"
 	"time"
@@ -19,27 +22,36 @@ import (
 
 // This file wraps the pi harness process in the executor OS confinement
 // (runtime/confinement) on both spawn paths — the headless RPC child and the
-// interactive PTY child — and moves pi's own per-session state out of the
-// working folder into a per-session harness state directory beside it, so the
-// working folder itself can be confined as repository content.
+// interactive PTY child — and gives pi's own per-session state one declared
+// home, so the confinement can name it as harness state.
 //
-// Where the state lives: sessionStateRoot returns the session's harness
-// state directory. It is a sibling of the session working directory
-// (<parent-of-cwd>/.pi-<key>), NOT inside it: the working directory is the
-// mutable repository leaf the confinement declares, and pi's session
-// storage, agent home and materialized extensions cannot live inside a leaf
-// the harness itself may rewrite. The key is the session name when set, else
-// the working directory's own name, sanitized to a safe alphabet. Sibling
-// placement keeps cleanup owned by the same lifecycle that removes the
-// workarea (the worktree manager deletes the parent), so no new orphan sweep
-// is needed; DONMAI_PI_STATE_DIR overrides the parent for tests.
+// Where the state lives: sessionStateRoot returns <cwd>/.pi-<leaf>, INSIDE
+// the session working directory (the mutable repository leaf), keyed by the
+// working directory's own name. This is deliberate. The executor-owned home
+// for harness state outside every repository leaf belongs to a workarea
+// layout that is still proposed, not accepted; until it lands, the
+// confinement record treats harness state as living inside the selected
+// leaf, which already covers it (ADR-2026-10-03 D2 and D2.6). A directory
+// beside the working directory would sit in the parent every flat-layout
+// session shares, where sessions can collide and which teardown does not
+// remove; inside the working directory, the worktree lifecycle that removes
+// the workarea removes the state with it, and no two sessions share it. The
+// state root is still declared to the confinement as its own harness_state
+// root, and the boundary extension inside it is protected, so the seat can
+// write its state but cannot rewrite the extension that polices it.
 //
 // What the harness may write under confinement: the declared mutable leaves,
 // the harness state root, and a per-session temporary directory the
-// confinement binds to TMPDIR/TMP/TEMP. Everything else — the workarea root
-// itself, its metadata, read-only leaves, the materialized boundary
-// extension, and any path outside the set — is refused by the OS profile,
-// judged on open, not only on write.
+// confinement binds to TMPDIR/TMP/TEMP, plus per-session toolchain caches
+// bound to their variables. Everything else — the workarea root itself, its
+// metadata, read-only leaves, the materialized boundary extension, and any
+// path outside the set — is refused by the OS profile, judged on open, not
+// only on write.
+//
+// What the parent writes before the child starts: the state root, the
+// extension files and the tmp/cache directories, all through
+// sessionStateFS (state_fs.go), which refuses a symbolic link anywhere on
+// the way — on Resume the seat has had the whole previous run to plant one.
 //
 // What the harness inherits: the headless child inherits exactly three
 // descriptors, the stdin/stdout/stderr pipes os/exec creates (ExtraFiles is
@@ -50,12 +62,14 @@ import (
 // The descriptor tests in confinement_live_test.go prove this by listing the
 // descriptors a confined child actually holds.
 //
-// When confinement applies: only where a backend exists (macOS today) and
-// the session has a working directory. Elsewhere the spawn proceeds exactly
-// as before. Where a backend exists the wrap is mandatory, never best
-// effort: a set the backend cannot represent, a missing self-test, or a
-// stale record fails the spawn closed. The one deliberate fallback is a
-// session with no working directory at all, which has nothing to confine.
+// When confinement applies: exactly when it is requested
+// (piConfinementEnabled, ADR-2026-10-03 D5.1) — the host's own configuration
+// requires it for pi (Options.RequireConfinement, or DONMAI_PI_CONFINEMENT=
+// required), or the session carries a declared repository authority. A
+// request is never best effort: no backend for this OS, a session with no
+// working directory, a set the backend cannot represent, a missing or stale
+// self-test, or an unsafe state path refuses the spawn. A session that does
+// not request confinement spawns exactly as before.
 
 // piHarnessID is the harness identity the confinement record carries.
 const piHarnessID = "pi"
@@ -75,12 +89,6 @@ const piSessionCacheDir = "cache"
 // confinement default.
 var piSelfTestTimeout time.Duration
 
-// sessionLeafKey derives the per-session directory key from the session's own
-// worktree leaf (the base name of the working directory), never from the
-// display name: the display name is shared across concurrent sessions running
-// the same workflow, while the worktree leaf is unique per session. It is
-// stable across a Resume of the same session, so a resumed session finds the
-// state its first incarnation wrote.
 // sanitizeStateKey reduces s to the safe alphabet the profile renderer and
 // the filesystem both accept. Empty maps to "session".
 func sanitizeStateKey(s string) string {
@@ -147,14 +155,25 @@ func newSessionLayoutForSpec(spec agent.Spec) sessionLayout {
 }
 
 // materializeExtensionForSpec materializes the boundary extension into the
-// session state root. It is materializeExtension rooted at the per-session
-// state directory; the write, mode and digest-verification semantics are
-// identical. The extension is written fresh (never hard-linked from the
-// shared cache): the confinement accounts hard links inside the writable
-// set, and a link to a blob outside it would make the set unrepresentable.
-func materializeExtensionForSpec(spec agent.Spec) (sessionLayout, error) {
+// session state root, after creating the root, and records the root in the
+// checkout's exclude file. confined marks the layout strict: the session will
+// run under the confinement, so the working directory itself must be a real
+// directory and the exclude entry is written into the leaf's own .git
+// directory without asking git (state_fs.go). Every write goes through
+// sessionStateFS, so a symbolic link planted in the state refuses the spawn
+// before anything is written. The extension is written fresh (never
+// hard-linked from the shared cache): the confinement accounts hard links
+// inside the writable set, and a link to a blob outside it would make the set
+// unrepresentable.
+func materializeExtensionForSpec(spec agent.Spec, confined bool) (sessionLayout, error) {
 	layout := newSessionLayoutForSpec(spec)
-	if err := os.MkdirAll(layout.root, 0o700); err != nil {
+	layout.strict = confined
+	state, err := openSessionStateFS(layout)
+	if err != nil {
+		return layout, fmt.Errorf("pi: open state dir: %w", err)
+	}
+	defer func() { _ = state.Close() }()
+	if err := state.mkdirAll(layout.root, 0o700); err != nil {
 		return layout, fmt.Errorf("pi: create state dir: %w", err)
 	}
 	// Keep this session's state dir out of `git status` for the checkout
@@ -162,10 +181,18 @@ func materializeExtensionForSpec(spec agent.Spec) (sessionLayout, error) {
 	// is per-session (`.pi-<worktree-leaf>`) — so the exact entry is
 	// written at materialize time. A glob would over-match
 	// prefix-sharing names the table deliberately leaves visible.
-	// Deliberately best-effort, mirroring materializeExtension: a session
-	// whose exclude file could not be written is noisier, not broken.
-	_ = harnessstate.EnsureGitExcluded(spec.Cwd, filepath.Base(layout.root)+"/")
-	if err := os.WriteFile(layout.extension, extensionSource(), 0o600); err != nil {
+	// Deliberately best-effort: a session whose exclude file could not be
+	// written is noisier, not broken. The one exception is a confined
+	// session whose exclude path is a planted link: that refuses.
+	entry := filepath.Base(layout.root) + "/"
+	if confined {
+		if err := state.ensureGitExcluded(entry); err != nil {
+			return layout, fmt.Errorf("pi: git exclude: %w", err)
+		}
+	} else {
+		_ = harnessstate.EnsureGitExcluded(spec.Cwd, entry)
+	}
+	if err := state.writeFile(layout.extension, extensionSource(), 0o600); err != nil {
 		return layout, fmt.Errorf("pi: write policy extension: %w", err)
 	}
 	return layout, nil
@@ -219,7 +246,10 @@ var piConfinerCache struct {
 }
 
 // ensurePiConfiner returns a confiner whose self-test passed for the harness
-// binary's CURRENT digest, running the self-test on first use. The cache is
+// binary's CURRENT digest, running the self-test on first use. It is called
+// only for a session that requested confinement, so a host with no backend
+// refuses (ADR-2026-10-03 D5.3: never run unconfined when confinement was
+// requested). The cache is
 // keyed by the host directories plus the executable digest: when the harness
 // binary changes, its digest changes, the old entry no longer matches, and
 // the cached attestation is not reused — the new binary earns its own
@@ -228,7 +258,8 @@ var piConfinerCache struct {
 func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs, probeCommand []string) (*confinement.Confiner, error) {
 	backend := confinement.DefaultBackend()
 	if backend == nil {
-		return nil, nil
+		return nil, fmt.Errorf("%w: pi confinement requested: %w", agent.ErrSpawnFailed,
+			&confinement.Error{Reason: confinement.ReasonBackendAbsent, Detail: "no confinement backend for this operating system"})
 	}
 	if dirs.profileDir == "" || dirs.home == "" || dirs.stateHome == "" || dirs.scratchDir == "" {
 		return nil, fmt.Errorf("%w: pi confinement host directories are unresolved", agent.ErrSpawnFailed)
@@ -289,17 +320,24 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 // materialized boundary extension is protected even though it sits inside
 // harness state, so a confined rename cannot carry it out from under its
 // rule. Resolver sockets are declared so name resolution keeps working
-// inside the profile.
+// inside the profile, and a model endpoint on this machine has its port
+// declared (endpointLoopbackPorts) so model calls keep working.
 //
-// A nil confiner means no backend exists for this OS: the caller spawns
-// unconfined, exactly as before. Any other failure refuses the spawn — the
-// plan never degrades to a weaker set.
+// The tmp and cache directories are created through sessionStateFS, so a
+// link planted there refuses the spawn before anything is created outside.
+// A nil confiner means the session did not request confinement: no plan.
+// Any failure refuses the spawn — the plan never degrades to a weaker set.
 func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confinement.Confiner) (*confinement.Plan, error) {
 	if confiner == nil {
 		return nil, nil
 	}
+	state, err := openSessionStateFS(layout)
+	if err != nil {
+		return nil, fmt.Errorf("%w: pi confinement state dir: %v", agent.ErrSpawnFailed, err)
+	}
+	defer func() { _ = state.Close() }()
 	tmpDir := filepath.Join(layout.root, piSessionTmpDir)
-	if err := os.MkdirAll(tmpDir, 0o700); err != nil {
+	if err := state.mkdirAll(tmpDir, 0o700); err != nil {
 		return nil, fmt.Errorf("%w: pi confinement session tmp: %v", agent.ErrSpawnFailed, err)
 	}
 	cacheBase := filepath.Join(layout.root, piSessionCacheDir)
@@ -309,7 +347,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		{Env: "NPM_CONFIG_CACHE", Dir: filepath.Join(cacheBase, "npm")},
 	}
 	for _, cache := range caches {
-		if err := os.MkdirAll(cache.Dir, 0o700); err != nil {
+		if err := state.mkdirAll(cache.Dir, 0o700); err != nil {
 			return nil, fmt.Errorf("%w: pi confinement session cache: %v", agent.ErrSpawnFailed, err)
 		}
 	}
@@ -320,9 +358,10 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		HarnessState: []string{
 			layout.root,
 		},
-		SessionTmp: tmpDir,
-		Caches:     caches,
-		Sockets:    confinement.ResolverSockets(),
+		SessionTmp:       tmpDir,
+		Caches:           caches,
+		Sockets:          confinement.ResolverSockets(),
+		LoopbackTCPPorts: endpointLoopbackPorts(spec),
 	}
 	if authority := spec.RepositoryAuthority; authority != nil && authority.WorkareaRoot != "" {
 		cspec.WorkareaRoot = authority.WorkareaRoot
@@ -345,8 +384,45 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 	return plan, nil
 }
 
-// confinePiArgv wraps argv in the session's confinement plan. A nil plan is
-// the no-backend case and returns argv unchanged.
+// endpointLoopbackPorts returns the port of the session's own model endpoint
+// when that endpoint is on this machine — a local gateway binding or a local
+// model server. The confinement closes outbound TCP to the local machine
+// except on declared ports, and the harness's own model channel is one the
+// adapter declares for the session (ADR-2026-10-03 D2.5); without it every
+// model call of a gateway-routed session would fail. A remote endpoint, or
+// none, declares nothing.
+func endpointLoopbackPorts(spec agent.Spec) []int {
+	if spec.Endpoint == nil || strings.TrimSpace(spec.Endpoint.BaseURL) == "" {
+		return nil
+	}
+	u, err := url.Parse(spec.Endpoint.BaseURL)
+	if err != nil || u.Host == "" {
+		return nil
+	}
+	host := u.Hostname()
+	if ip := net.ParseIP(host); !strings.EqualFold(host, "localhost") && (ip == nil || !ip.IsLoopback()) {
+		return nil
+	}
+	port := u.Port()
+	if port == "" {
+		switch strings.ToLower(u.Scheme) {
+		case "http":
+			port = "80"
+		case "https":
+			port = "443"
+		default:
+			return nil
+		}
+	}
+	n, err := strconv.Atoi(port)
+	if err != nil || n < 1 || n > 65535 {
+		return nil
+	}
+	return []int{n}
+}
+
+// confinePiArgv wraps argv in the session's confinement plan. A nil plan (a
+// session that did not request confinement) returns argv unchanged.
 func confinePiArgv(plan *confinement.Plan, argv []string) ([]string, error) {
 	if plan == nil {
 		return argv, nil

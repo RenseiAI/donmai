@@ -49,11 +49,18 @@ import (
 // tailed from this session's own transcript in between (see
 // interactive_state_loss.go and interactive_transcript.go).
 func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	// Decide confinement before the parent writes anything into the
+	// session's state, exactly as the headless lane does (launch): a
+	// confined session's state is written through the strict writer.
+	confiner, err := p.confinerForSession(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
 	// Materialize the embedded policy extension so its provider pin registers in
 	// the child. A materialization failure means no pin — fail closed, exactly
 	// as the headless lane does. The state lands in the session state root
-	// beside the working folder (confinement.go), never inside it.
-	layout, err := materializeExtensionForSpec(spec)
+	// inside the working folder (confinement.go).
+	layout, err := materializeExtensionForSpec(spec, confiner != nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -80,23 +87,15 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 
 	// Confine the interactive child the same way the headless lane confines
 	// its own: the wrapped argv runs under the session profile, and the
-	// plan's tmp/cache bindings ride the override env. A nil plan is the
-	// no-backend case. The PTY child inherits only the slave side of its
-	// terminal as its standard descriptors — ptyhost never passes ExtraFiles
-	// — so no out-of-set descriptor reaches it either.
+	// plan's tmp/cache bindings ride the override env. A nil plan means the
+	// session did not request confinement. The PTY child inherits only the
+	// slave side of its terminal as its standard descriptors — ptyhost never
+	// passes ExtraFiles — so no out-of-set descriptor reaches it either.
 	var plan *confinement.Plan
-	if strings.TrimSpace(spec.Cwd) != "" {
-		confiner, cerr := p.confinerForSession(ctx, spec)
-		if cerr != nil {
-			return nil, cerr
-		}
-		// A nil confiner is the ineligible case (no authority, no
-		// backend): the spawn proceeds unconfined, exactly as before.
-		if confiner != nil {
-			plan, err = confinePiSession(spec, layout, confiner)
-			if err != nil {
-				return nil, err
-			}
+	if confiner != nil {
+		plan, err = confinePiSession(spec, layout, confiner)
+		if err != nil {
+			return nil, err
 		}
 	}
 	// Snapshot the shared state dir's existing transcripts BEFORE the child
@@ -105,6 +104,9 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 
 	wrapped, err := confinePiArgv(plan, append([]string{p.binary}, interactiveArgs(spec, layout, extensionPaths)...))
 	if err != nil {
+		if plan != nil {
+			_ = plan.Release()
+		}
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
 	for _, kv := range confinePiEnv(nil, plan) {

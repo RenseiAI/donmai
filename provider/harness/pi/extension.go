@@ -158,6 +158,12 @@ type sessionLayout struct {
 	// into the invoking user's ~/.pi/agent, and root still carries session
 	// storage exactly as it always did.
 	agentHome string // <cwd>/.pi/agent-home
+	// strict marks a confined session's layout. Every parent-side write
+	// into it then refuses a working directory that is itself a symbolic
+	// link, and injected extensions are written as fresh, unlinked copies
+	// (state_fs.go): the confined set refuses any file hard-linked to a path
+	// outside it, which a shared-cache hard link would be.
+	strict bool
 }
 
 func newSessionLayout(cwd string) sessionLayout {
@@ -249,20 +255,33 @@ func materializeAdditionalExtensions(layout sessionLayout, deliveries []agent.Ex
 		case agent.ExtensionDeliveryPath:
 			loadPath = d.Path
 		case agent.ExtensionDeliveryInline:
-			if err := os.MkdirAll(layout.injected, 0o700); err != nil {
-				return nil, fmt.Errorf("pi: additional extension %q: create injected-extensions dir: %w", d.ID, err)
-			}
 			loadPath = filepath.Join(layout.injected, sanitizeInjectedBasename(d.ID, d.Basename))
-			// A capability pack admitted for one cell is typically byte-
-			// identical across every session the fleet spawns under that
-			// admission — the exact fan-out shape this cache targets. Reuse
-			// the shared content-addressed cache the same way the boundary
-			// extension does (writeViaCache), keyed on the ALREADY-VALIDATED
-			// digest (agent.ValidateExtensionDeliveries ran above and
-			// guarantees d.Digest is a well-formed lowercase sha256 hex
-			// string, so it is safe to use directly as a cache filename).
-			if err := writeViaCache(d.Digest, d.Source, loadPath, 0o600); err != nil {
-				return nil, fmt.Errorf("pi: additional extension %q: materialize: %w", d.ID, err)
+			if layout.strict {
+				// A confined session gets its own fresh copy, written
+				// without following any link the seat may have planted
+				// in its state. The shared cache below hard-links the
+				// session file to a blob outside the session, and the
+				// confinement refuses a writable set holding such a link
+				// (ADR-2026-10-03 D2.3).
+				if err := writeStateFile(layout, loadPath, d.Source, 0o600); err != nil {
+					return nil, fmt.Errorf("pi: additional extension %q: materialize: %w", d.ID, err)
+				}
+			} else {
+				if err := os.MkdirAll(layout.injected, 0o700); err != nil {
+					return nil, fmt.Errorf("pi: additional extension %q: create injected-extensions dir: %w", d.ID, err)
+				}
+				// A capability pack admitted for one cell is typically
+				// byte-identical across every session the fleet spawns
+				// under that admission — the exact fan-out shape this
+				// cache targets. Reuse the shared content-addressed cache
+				// (writeViaCache), keyed on the ALREADY-VALIDATED digest
+				// (agent.ValidateExtensionDeliveries ran above and
+				// guarantees d.Digest is a well-formed lowercase sha256 hex
+				// string, so it is safe to use directly as a cache
+				// filename).
+				if err := writeViaCache(d.Digest, d.Source, loadPath, 0o600); err != nil {
+					return nil, fmt.Errorf("pi: additional extension %q: materialize: %w", d.ID, err)
+				}
 			}
 		}
 

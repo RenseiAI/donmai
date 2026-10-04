@@ -82,10 +82,6 @@ type Provider struct {
 	// trustedExtensions is the immutable ordered same-process extension set
 	// supplied by the compiled embedder at provider construction.
 	trustedExtensions []TrustedExtensionIdentity
-	// testConfiner overrides the self-tested confiner in tests that drive
-	// the production spawn paths under the real backend with throwaway
-	// host directories. Nil in production; confinerForSession ignores it.
-	testConfiner *confinement.Confiner
 }
 
 // Options configures Provider construction. The empty value runs `pi` from
@@ -121,6 +117,13 @@ type Options struct {
 	// extend it.
 	TrustedExtensions []TrustedExtensionIdentity
 
+	// RequireConfinement is the host's own requirement that every pi session
+	// run inside the executor OS confinement (ADR-2026-10-03 D5.1, the
+	// placement-owned trigger). It only tightens: when set, a session the
+	// host cannot confine is refused, never run unconfined. New also sets it
+	// when the host environment carries DONMAI_PI_CONFINEMENT=required.
+	RequireConfinement bool
+
 	// Test seams. skipProcess wires stdin/stdout overrides instead of execing
 	// a real child; used by the pipe-stub tests that replay pi RPC shapes.
 	skipProcess    bool
@@ -138,7 +141,19 @@ type Options struct {
 	// handshakeToken pins the per-session token in skipProcess tests so a
 	// scripted handshake fixture can echo it. Empty ⇒ a random token per Spawn.
 	handshakeToken string
+	// confinementDirs points the confiner's host directories (profiles,
+	// operator home, host state home, self-test scratch) at throwaway paths
+	// in tests. Nil resolves them from the host (productionConfinementDirs).
+	// It never decides WHETHER a session is confined — the gate does.
+	confinementDirs *piConfinementDirs
 }
+
+// piConfinementEnvVar is the host-level switch that makes every pi session
+// on this host request confinement (ADR-2026-10-03 D5.1, placement-owned
+// configuration). The only recognized value is "required"; anything else
+// leaves Options.RequireConfinement as the caller set it. It can only
+// tighten.
+const piConfinementEnvVar = "DONMAI_PI_CONFINEMENT"
 
 // New probes the pi binary and enforces the version pin (probe-time, per
 // design §2 / opencode §8). A confirmed-below-MinVersion binary fails
@@ -156,6 +171,9 @@ func New(opts Options) (*Provider, error) {
 	}
 	if opts.VersionProbe == nil {
 		opts.VersionProbe = defaultVersionProbe
+	}
+	if strings.TrimSpace(os.Getenv(piConfinementEnvVar)) == "required" {
+		opts.RequireConfinement = true
 	}
 	p := &Provider{opts: opts, trustedExtensions: append([]TrustedExtensionIdentity(nil), opts.TrustedExtensions...)}
 
@@ -340,11 +358,24 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	// spec is already admitted + endpoint-projected by prepare() (called in
 	// Spawn/Resume before the spawn-mode split).
 	//
+	// Decide confinement FIRST, before the parent writes anything into the
+	// session's state: a confined session's state was writable by the seat
+	// for its whole previous run, so every parent-side write below goes
+	// through the strict writer, which refuses a planted symbolic link
+	// instead of following it out of the set. Process-less
+	// (protocol-scripted) launches spawn nothing and are never confined.
+	var confiner *confinement.Confiner
+	if !p.opts.skipProcess {
+		var err error
+		confiner, err = p.confinerForSession(ctx, spec)
+		if err != nil {
+			return nil, err
+		}
+	}
 	// Materialize the policy extension BEFORE spawning. A materialization
 	// failure means no boundary — fail closed. The state lands in the
-	// session state root beside the working folder (confinement.go), never
-	// inside it, so the working folder itself can be confined.
-	layout, err := materializeExtensionForSpec(spec)
+	// session state root inside the working folder (confinement.go).
+	layout, err := materializeExtensionForSpec(spec, confiner != nil)
 	if err != nil {
 		return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, err)
 	}
@@ -370,24 +401,22 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	if token == "" {
 		token = newHandshakeToken()
 	}
-	// Confine the session where a backend exists (macOS). The plan wraps
-	// the child argv below and binds the session tmp over TMPDIR/TMP/TEMP;
-	// a nil plan is the no-backend case and changes nothing. Any other
-	// failure refuses the spawn — the session never runs half-confined.
-	// Skip process-less (protocol-scripted) launches: they spawn nothing.
+	// Prepare the confinement plan for a session that requested it. The
+	// plan wraps the child argv below and binds the session tmp and caches
+	// over their variables; nil means the session did not request
+	// confinement and spawns exactly as before. Any failure refuses the
+	// spawn — the session never runs half-confined. Every failure path
+	// from here to the handle releases the rendered profile.
 	var plan *confinement.Plan
-	if !p.opts.skipProcess && strings.TrimSpace(spec.Cwd) != "" {
-		confiner, cerr := p.confinerForSession(ctx, spec)
-		if cerr != nil {
-			return nil, cerr
+	if confiner != nil {
+		plan, err = confinePiSession(spec, layout, confiner)
+		if err != nil {
+			return nil, err
 		}
-		// A nil confiner is the ineligible case (no authority, no
-		// backend): the spawn proceeds unconfined, exactly as before.
-		if confiner != nil {
-			plan, err = confinePiSession(spec, layout, confiner)
-			if err != nil {
-				return nil, err
-			}
+	}
+	releasePlan := func() {
+		if plan != nil {
+			_ = plan.Release()
 		}
 	}
 	// Compose once. Receipt admission inspects this exact final environment,
@@ -399,6 +428,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		startup := measureReceiptStartupContext(spec.Cwd, childEnv)
 		receipt, err = newReceiptAdmission(p.artifact, layout, actualExtensions, p.trustedExtensions, startup)
 		if err != nil {
+			releasePlan()
 			return nil, fmt.Errorf("%w: measure pi receipt extension closure: %v", agent.ErrSpawnFailed, err)
 		}
 	}
@@ -414,6 +444,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 	} else {
 		c, in, out, serr := p.spawnChild(spec, layout, extensionPaths, childEnv, mode, sessionID, p.artifact, receipt, plan)
 		if serr != nil {
+			releasePlan()
 			return nil, fmt.Errorf("%w: %v", agent.ErrSpawnFailed, serr)
 		}
 		cmd, stdin, stdout = c, in, out
@@ -423,6 +454,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 		if p.artifact != nil {
 			if err := revalidateLaunchTrust(p.artifact, receipt, childEnv); err != nil {
 				stopStartedChild(cmd)
+				releasePlan()
 				return nil, fmt.Errorf("%w: pi artifact changed after spawn: %v", agent.ErrSpawnFailed, err)
 			}
 		}
@@ -430,9 +462,7 @@ func (p *Provider) launch(ctx context.Context, spec agent.Spec, mode launchMode,
 
 	client := newRPCClient(stdin, stdout)
 	h := newHandle(client, cmd, spec, token, receipt)
-	if plan != nil {
-		h.setConfinementRelease(plan.Release)
-	}
+	h.setConfinement(plan)
 	// Set before the pump starts (the go statement orders the write before
 	// every read on the pump goroutine); dispatch emits them directly behind
 	// the session's InitEvent. See launchNotices.
@@ -531,44 +561,48 @@ func (p *Provider) launchNotices(spec agent.Spec) []agent.Event {
 	return notices
 }
 
-// confinerForSession returns the shared, self-tested confiner for the
-// harness binary, or nil where no backend exists. The probe is this process:
-// the main entrypoint answers the confinement probe (see cmd/donmai/main.go
-// and the TestMain hook in confinement_test_main_test.go), so the self-test
-// drives the probe through the exact production spawn binding.
-//
-// Confinement is gated on the declared repository authority: the runner
-// stamps RepositoryAuthority on every declared workarea session (loop.go),
-// and only those sessions carry a closed writable set to confine. Sessions
-// without an authority keep the legacy unconfined spawn. The live
-// confinement tests declare the authority explicitly and drive the real
-// backend.
+// confinerForSession returns the shared, self-tested confiner for a session
+// that requested confinement, and nil for one that did not. The probe is this
+// process: the main entrypoint answers the confinement probe (see
+// cmd/donmai/main.go and the TestMain hook in confinement_test_main_test.go),
+// so the self-test drives the probe through the exact production spawn
+// binding. A request that cannot be met — no working directory, no backend,
+// a failed self-test — refuses the spawn.
 func (p *Provider) confinerForSession(ctx context.Context, spec agent.Spec) (*confinement.Confiner, error) {
-	if p.testConfiner != nil {
-		return p.testConfiner, nil
-	}
-	if !piConfinementEnabled(spec) {
+	if !piConfinementEnabled(spec, p.opts.RequireConfinement) {
 		return nil, nil
+	}
+	if strings.TrimSpace(spec.Cwd) == "" {
+		return nil, fmt.Errorf("%w: pi confinement requested for a session with no working directory", agent.ErrSpawnFailed)
 	}
 	probe, err := os.Executable()
 	if err != nil {
 		return nil, fmt.Errorf("%w: pi confinement probe executable: %v", agent.ErrSpawnFailed, err)
 	}
-	return ensurePiConfiner(ctx, p.binary, productionConfinementDirs(), []string{probe})
+	dirs := productionConfinementDirs()
+	if p.opts.confinementDirs != nil {
+		dirs = *p.opts.confinementDirs
+	}
+	return ensurePiConfiner(ctx, p.binary, dirs, []string{probe})
 }
 
-// piConfinementEnabled reports whether the session is eligible for OS
-// confinement: it names a declared repository authority (the only specs
-// with a closed writable set) on an OS with a backend. Sessions without an
-// authority keep the legacy unconfined spawn.
-func piConfinementEnabled(spec agent.Spec) bool {
-	if confinement.DefaultBackend() == nil {
-		return false
+// piConfinementEnabled reports whether the session requested OS confinement
+// (ADR-2026-10-03 D5.1): the host's own configuration requires it for pi
+// (hostRequires — Options.RequireConfinement), or the session declares a
+// repository authority, whose read-only leaves need the executor boundary.
+// Confinement applies exactly when requested, never opportunistically, so
+// the answer does not depend on whether this host has a backend: a request
+// on a host without one is refused, not dropped (ensurePiConfiner).
+//
+// Today pi's manifest declares no multi-repository workarea protocol, so
+// admission refuses an authority-bearing spec before launch; the host
+// requirement is the trigger a pi session reaches in production. The
+// authority branch is kept for the day the manifest declares one.
+func piConfinementEnabled(spec agent.Spec, hostRequires bool) bool {
+	if hostRequires {
+		return true
 	}
-	if spec.RepositoryAuthority == nil || strings.TrimSpace(spec.RepositoryAuthority.WorkareaRoot) == "" {
-		return false
-	}
-	return true
+	return spec.RepositoryAuthority != nil && strings.TrimSpace(spec.RepositoryAuthority.WorkareaRoot) != ""
 }
 
 // newHeadlessChildCommand builds the headless harness child: argv runs
@@ -594,6 +628,7 @@ func newHeadlessChildCommand(argv []string, dir string, env []string) *exec.Cmd 
 // confinement; the child then inherits exactly three descriptors — the
 // stdin/stdout/stderr pipes created below — and never a descriptor open on
 // an out-of-set file (ExtraFiles is never set: newHeadlessChildCommand).
+// spawnChild never releases the plan: on any error the caller does.
 func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPaths []string, childEnv []string, mode launchMode, sessionID string, artifact *artifactLease, receipt *receiptAdmission, plan *confinement.Plan) (*exec.Cmd, io.WriteCloser, io.ReadCloser, error) {
 	argv, err := confinePiArgv(plan, append([]string{p.binary}, rpcArgs(layout, extensionPaths, mode, sessionID, spec)...))
 	if err != nil {
@@ -624,9 +659,6 @@ func (p *Provider) spawnChild(spec agent.Spec, layout sessionLayout, extensionPa
 		}
 	}
 	if err := cmd.Start(); err != nil {
-		if plan != nil {
-			_ = plan.Release()
-		}
 		return nil, nil, nil, fmt.Errorf("pi spawn: %w", err)
 	}
 	go drainStderr(stderr)

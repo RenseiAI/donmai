@@ -93,8 +93,14 @@
 // What this deliberately does NOT claim: OS-level sandboxing. The policy
 // extension is an in-process boundary — a hostile MODEL OUTPUT is contained
 // (it can only call overridden tools), but a hostile TOOL EXECUTION still
-// runs as the user. OS/sandbox-family enforcement stays the sandbox provider
-// family's job (E2B/container cells), unchanged. Do not mistake this
+// runs as the user. OS-level confinement is the executor's job, not this
+// extension's: when the host's own configuration requires it
+// (Options.RequireConfinement / DONMAI_PI_CONFINEMENT=required) or the
+// session declares a repository authority, the provider spawns pi inside the
+// executor confinement of ADR-2026-10-03-executor-os-confinement.md,
+// headless and interactive alike (confinement.go). Container and microVM
+// isolation stay with the sandbox provider family. Without that confinement
+// a hostile tool execution still runs as the user. Do not mistake this
 // extension for a sandbox.
 //
 // # The fail-safe fence
