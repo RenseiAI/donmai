@@ -215,6 +215,11 @@ function selfSHA256(): string {
 // headless-vs-interactive evidence).
 const DONMAI_ALLOWED_TOOLS_ENV = "DONMAI_PI_ALLOWED_TOOLS";
 const DONMAI_DISALLOWED_TOOLS_ENV = "DONMAI_PI_DISALLOWED_TOOLS";
+// DONMAI_STATE_DIR_ENV carries the relocated per-session state root
+// onto the interactive child. The Go engine guards the same root;
+// the local interactive guard must cover it too, or deleting live
+// session state from an interactive seat stays allowed.
+const DONMAI_STATE_DIR_ENV = "DONMAI_PI_STATE_DIR";
 
 // The interactive lane cannot round-trip to policy.go, but it MUST keep this
 // one non-negotiable local safety rail. The state directory is created by the
@@ -271,6 +276,35 @@ function shellTokens(segment: string): string[] {
 
 function stateDirRoot(cwd: string): string {
   return cwd ? join(normalize(cwd), PI_STATE_DIR) : PI_STATE_DIR;
+}
+
+// stateDirRoots returns every guarded root: the legacy directory plus
+// the relocated per-session root when the child env carries it. Anything
+// unparsable is ignored so a stray value cannot widen the guard.
+function stateDirRoots(cwd: string): string[] {
+  const roots = [stateDirRoot(cwd)];
+  const extra = (process.env[DONMAI_STATE_DIR_ENV] ?? "").trim();
+  if (extra) {
+    const resolved = isAbsolute(extra)
+      ? normalize(extra)
+      : cwd
+        ? normalize(join(normalize(cwd), extra))
+        : normalize(extra);
+    if (resolved && !roots.includes(resolved)) roots.push(resolved);
+  }
+  return roots;
+}
+
+function firstStateDirPathInRoots(args: string[], cwd: string, roots: string[]): string | undefined {
+  return pathOperands(args).find((arg) => roots.some((root) => resolvesIntoStateDir(arg, cwd, root)));
+}
+
+function stateDirReasonInRoots(args: string[], cwd: string, roots: string[]): string | undefined {
+  for (const root of roots) {
+    const reason = gitCleanStateDirReason(args, cwd, root);
+    if (reason) return reason;
+  }
+  return undefined;
 }
 
 function resolvesIntoStateDir(operand: string, cwd: string, root: string): boolean {
@@ -356,11 +390,12 @@ function gitCleanStateDirReason(args: string[], cwd: string, root: string): stri
 }
 
 // interactiveStateDirDeletionReason is the local !rpcMode counterpart to
-// stateDirDeletionReason in statedir_guard.go. It deliberately covers only
-// the session state rail; the richer policy/containment engine remains RPC.
+// stateDirDeletionReasonForRoots in statedir_guard.go. It deliberately
+// covers only the session state rail; the richer policy/containment engine
+// remains RPC. The relocated root travels on DONMAI_PI_STATE_DIR.
 export function interactiveStateDirDeletionReason(command: string, cwd: string): string | undefined {
   if (!command.trim()) return undefined;
-  const root = stateDirRoot(cwd);
+  const roots = stateDirRoots(cwd);
   for (const segment of command.split(/&&|\|\||;|\||&|\n/)) {
     let tokens = shellTokens(segment);
     while (tokens.length > 0 && /^[A-Za-z_][A-Za-z0-9_]*=/.test(tokens[0])) tokens = tokens.slice(1);
@@ -368,17 +403,17 @@ export function interactiveStateDirDeletionReason(command: string, cwd: string):
     const commandName = basename(tokens[0]);
     const args = tokens.slice(1);
     if (["rm", "rmdir", "unlink", "shred"].includes(commandName)) {
-      const hit = firstStateDirPath(args, cwd, root);
+      const hit = firstStateDirPathInRoots(args, cwd, roots);
       if (hit) return stateDirRefusal(commandName, hit);
     } else if (commandName === "mv") {
       const paths = pathOperands(args);
-      const hit = firstStateDirPath(paths.slice(0, -1), cwd, root);
+      const hit = firstStateDirPathInRoots(paths.slice(0, -1), cwd, roots);
       if (hit) return stateDirRefusal(commandName, hit);
     } else if (commandName === "find" && findDeletes(args)) {
-      const hit = firstStateDirPath(findSearchRoots(args), cwd, root);
+      const hit = firstStateDirPathInRoots(findSearchRoots(args), cwd, roots);
       if (hit) return stateDirRefusal(commandName, hit);
     } else if (commandName === "git") {
-      const reason = gitCleanStateDirReason(args, cwd, root);
+      const reason = stateDirReasonInRoots(args, cwd, roots);
       if (reason) return reason;
     }
   }

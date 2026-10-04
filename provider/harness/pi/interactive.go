@@ -182,6 +182,14 @@ func interactiveArgs(spec agent.Spec, layout sessionLayout, extensionPaths []str
 	return args
 }
 
+// piStateDirEnvVar carries the relocated per-session state root onto the
+// interactive child so the embedded extension's local state-dir guard
+// (extensions/donmai-policy.ts stateDirRoots) covers the live session
+// state exactly as the Go engine's stateDirDeletionReasonForRoots does.
+// The headless lane needs no equivalent: its guard runs in-process in
+// policy.go against engine.stateRoot, not via the child env.
+const piStateDirEnvVar = "DONMAI_PI_STATE_DIR"
+
 // piAllowedToolsEnvVar / piDisallowedToolsEnvVar carry a JSON-encoded
 // Spec.AllowedTools / Spec.DisallowedTools array onto the interactive PTY
 // child so the SAME embedded policy extension can answer the allowed/
@@ -248,6 +256,7 @@ func interactiveChildEnv(spec agent.Spec, layout sessionLayout) map[string]strin
 	}
 	env[piCodingAgentDirEnvVar] = layout.agentHome
 	env[piCodingAgentSessionDirEnvVar] = layout.root
+	env[piStateDirEnvVar] = layout.root
 	for _, kv := range offlinePostureEnv(spec) {
 		if i := strings.IndexByte(kv, '='); i >= 0 {
 			env[kv[:i]] = kv[i+1:]

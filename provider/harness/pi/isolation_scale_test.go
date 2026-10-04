@@ -197,13 +197,3 @@ func lastEnvValue(env []string, key string) string {
 	}
 	return got
 }
-
-func envValue(env []string, key string) string {
-	prefix := key + "="
-	for _, e := range env {
-		if v, ok := strings.CutPrefix(e, prefix); ok {
-			return v
-		}
-	}
-	return ""
-}

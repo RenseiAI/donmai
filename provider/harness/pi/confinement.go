@@ -13,6 +13,7 @@ import (
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/runtime/confinement"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 	"github.com/RenseiAI/donmai/runtime/statehome"
 )
 
@@ -156,6 +157,14 @@ func materializeExtensionForSpec(spec agent.Spec) (sessionLayout, error) {
 	if err := os.MkdirAll(layout.root, 0o700); err != nil {
 		return layout, fmt.Errorf("pi: create state dir: %w", err)
 	}
+	// Keep this session's state dir out of `git status` for the checkout
+	// it sits in. The static harnessstate table cannot name it — the leaf
+	// is per-session (`.pi-<worktree-leaf>`) — so the exact entry is
+	// written at materialize time. A glob would over-match
+	// prefix-sharing names the table deliberately leaves visible.
+	// Deliberately best-effort, mirroring materializeExtension: a session
+	// whose exclude file could not be written is noisier, not broken.
+	_ = harnessstate.EnsureGitExcluded(spec.Cwd, filepath.Base(layout.root)+"/")
 	if err := os.WriteFile(layout.extension, extensionSource(), 0o600); err != nil {
 		return layout, fmt.Errorf("pi: write policy extension: %w", err)
 	}

@@ -2,11 +2,13 @@ package pi
 
 import (
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
 
 	"github.com/RenseiAI/donmai/agent"
+	"github.com/RenseiAI/donmai/runtime/harnessstate"
 )
 
 // TestSessionStateRoot_SessionWorkarea pins the state placement: pi's own
@@ -27,15 +29,26 @@ func TestSessionStateRoot_SessionWorkarea(t *testing.T) {
 	if base := filepath.Base(filepath.Clean(root)); !strings.HasPrefix(base, ".pi-") {
 		t.Errorf("sessionStateRoot base = %q, want a .pi-<key> directory", base)
 	}
-	// Same display name, different workareas: distinct roots.
-	other := agent.Spec{Cwd: filepath.Join(t.TempDir(), "repo"), SessionName: "s1"}
-	if sessionStateRoot(other) == root {
-		t.Errorf("sessions sharing a display name share state root %q", root)
+	// Same display name must not pin the root: two sessions under one
+	// shared parent workarea with different worktree leaves get distinct
+	// roots even when their display names collide. Display-name keying
+	// collides here (same parent, same name) and goes RED.
+	sharedParent := t.TempDir()
+	siblingA := agent.Spec{Cwd: filepath.Join(sharedParent, "work-a"), SessionName: "shared"}
+	siblingB := agent.Spec{Cwd: filepath.Join(sharedParent, "work-b"), SessionName: "shared"}
+	if sessionStateRoot(siblingA) == sessionStateRoot(siblingB) {
+		t.Errorf("sessions sharing a display name share state root %q", sessionStateRoot(siblingA))
 	}
-	// Same workarea, resumed: same root.
-	resumed := agent.Spec{Cwd: cwd, SessionName: "s1"}
-	if got := sessionStateRoot(resumed); got != root {
-		t.Errorf("resumed sessionStateRoot = %q, want %q", got, root)
+	// The leaf key itself must differ: display-name keying gives both
+	// siblings the same `.pi-shared` leaf and goes RED here.
+	if baseA, baseB := filepath.Base(sessionStateRoot(siblingA)), filepath.Base(sessionStateRoot(siblingB)); baseA == baseB {
+		t.Errorf("same-name siblings share state leaf %q: the root must follow the worktree leaf, never the display name", baseA)
+	}
+	// Same workarea, resumed under a different display name: same root.
+	// The root follows the workarea, never the name.
+	renamed := agent.Spec{Cwd: cwd, SessionName: "s2"}
+	if got := sessionStateRoot(renamed); got != root {
+		t.Errorf("renamed sessionStateRoot = %q, want %q", got, root)
 	}
 	layout := newSessionLayoutForSpec(spec)
 	if layout.root != root {
@@ -88,6 +101,63 @@ func TestMaterializeExtensionForSpec_SessionWorkarea(t *testing.T) {
 	// separate sweep: it must sit under the directory teardown removes.
 	if dir := filepath.Dir(filepath.Clean(layout.root)); dir != filepath.Clean(cwd) {
 		t.Errorf("state root parent = %q, want the workarea teardown removes %q", dir, cwd)
+	}
+}
+
+// TestMaterializeExtensionForSpec_LeavesCheckoutClean pins the P3 motive:
+// the per-session `.pi-<leaf>` state dir must not report as untracked in
+// `git status` — a `?? .pi-<leaf>/` line reads as session-dropped junk
+// and invites deletion of live state. The static harnessstate table
+// cannot name the per-session leaf, so materialization writes the exact
+// entry to the checkout's exclude file at spawn time.
+//
+// RED: drop the EnsureGitExcluded call from materializeExtensionForSpec
+// and the checkout reports the state dir as untracked.
+func TestMaterializeExtensionForSpec_LeavesCheckoutClean(t *testing.T) {
+	t.Parallel()
+	if _, err := exec.LookPath("git"); err != nil {
+		t.Skip("git not on PATH")
+	}
+	dir := t.TempDir()
+	if err := os.WriteFile(filepath.Join(dir, "README.md"), []byte("hi\n"), 0o600); err != nil {
+		t.Fatalf("seed file: %v", err)
+	}
+	for _, args := range [][]string{
+		{"init", "--quiet"},
+		{"config", "user.email", "test@example.invalid"},
+		{"config", "user.name", "test"},
+		{"add", "README.md"},
+		{"commit", "--quiet", "-m", "seed"},
+	} {
+		cmd := exec.Command("git", append([]string{"-C", dir}, args...)...) //nolint:gosec // G204: test fixture; dir is t.TempDir() and args are literals.
+		cmd.Env = harnessstate.GitLocationNeutralEnv(os.Environ())
+		if out, err := cmd.CombinedOutput(); err != nil {
+			t.Fatalf("git %v: %v\n%s", args, err, out)
+		}
+	}
+	// The workarea is a subdirectory of the checkout, the way a session
+	// worktree sits inside one.
+	cwd := filepath.Join(dir, "work")
+	if err := os.MkdirAll(cwd, 0o700); err != nil {
+		t.Fatal(err)
+	}
+	layout, err := materializeExtensionForSpec(agent.Spec{Cwd: cwd, SessionName: "s1"})
+	if err != nil {
+		t.Fatalf("materializeExtensionForSpec: %v", err)
+	}
+	status := exec.Command("git", "-C", dir, "status", "--porcelain") //nolint:gosec // G204: test fixture; dir is t.TempDir().
+	status.Env = harnessstate.GitLocationNeutralEnv(os.Environ())
+	out, err := status.CombinedOutput()
+	if err != nil {
+		t.Fatalf("git status: %v\n%s", err, out)
+	}
+	if strings.TrimSpace(string(out)) != "" {
+		t.Fatalf("checkout is dirty after materializing session state:\n%s", out)
+	}
+	// The state dir really is there — a clean status because nothing was
+	// created would be a false pass.
+	if _, err := os.Stat(layout.root); err != nil {
+		t.Fatalf("state dir missing after materialize: %v", err)
 	}
 }
 
