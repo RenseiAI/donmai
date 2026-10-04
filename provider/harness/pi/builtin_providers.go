@@ -138,6 +138,46 @@ var builtinProviderServingHost = map[string]string{ //nolint:gosec // G101: map 
 	"xiaomi-token-plan-sgp": "token-plan-sgp.xiaomimimo.com",
 }
 
+// builtinProviderBaseURL maps each built-in provider with a fixed provider-level
+// endpoint to pi's own catalog base URL for it, transcribed from the baseUrl
+// each bundled @earendil-works/pi-ai providers/<name>.js registers. It sits
+// next to builtinProviderServingHost (which carries the host half of the
+// same endpoints) so nativeProviderPin can compare the bound URL's path
+// against pi's own catalog, not just the host: one vendor host can serve
+// separately billed APIs on different paths, and a binding to one path must
+// not be silently served from another path's quota. Providers whose endpoint
+// is templated per account or region, set per model rather than per provider,
+// or otherwise not shipped as a single fixed URL are absent; for those the
+// native check falls back to the host comparison. Aggregator entries are
+// data only: aggregator routing stays host-based (builtinAggregatorForBaseURL)
+// and is never path-checked.
+var builtinProviderBaseURL = map[string]string{ //nolint:gosec // G101: map values are public API base URLs, never credential bytes.
+	"anthropic":             "https://api.anthropic.com",
+	"ant-ling":              "https://api.ant-ling.com/v1",
+	"openai":                "https://api.openai.com/v1",
+	"deepseek":              "https://api.deepseek.com",
+	"nvidia":                "https://integrate.api.nvidia.com/v1",
+	"google":                "https://generativelanguage.googleapis.com/v1beta",
+	"mistral":               "https://api.mistral.ai",
+	"groq":                  "https://api.groq.com/openai/v1",
+	"cerebras":              "https://api.cerebras.ai/v1",
+	"xai":                   "https://api.x.ai/v1",
+	"openrouter":            "https://openrouter.ai/api/v1",
+	"vercel-ai-gateway":     "https://ai-gateway.vercel.sh",
+	"zai":                   "https://api.z.ai/api/coding/paas/v4",
+	"zai-coding-cn":         "https://open.bigmodel.cn/api/coding/paas/v4",
+	"huggingface":           "https://router.huggingface.co/v1",
+	"fireworks":             "https://api.fireworks.ai/inference",
+	"together":              "https://api.together.ai/v1",
+	"kimi-coding":           "https://api.kimi.com/coding",
+	"minimax":               "https://api.minimax.io/anthropic",
+	"minimax-cn":            "https://api.minimaxi.com/anthropic",
+	"xiaomi":                "https://api.xiaomimimo.com/v1",
+	"xiaomi-token-plan-cn":  "https://token-plan-cn.xiaomimimo.com/v1",
+	"xiaomi-token-plan-ams": "https://token-plan-ams.xiaomimimo.com/v1",
+	"xiaomi-token-plan-sgp": "https://token-plan-sgp.xiaomimimo.com/v1",
+}
+
 // builtinAggregatorProviders is the subset of built-in providers that are
 // AGGREGATORS: their own catalog ids are themselves "<author>/<model>" slugs
 // (pi's vercel-ai-gateway catalog lists "anthropic/claude-sonnet-4.6", served
@@ -168,6 +208,67 @@ func httpsHostname(baseURL string) (string, bool) {
 		return "", false
 	}
 	return strings.ToLower(u.Hostname()), true
+}
+
+// baseURLMatchesProviderEndpoint reports whether baseURL is an https URL on
+// provider's own serving host (exact hostname match; no suffix or subdomain
+// matching) whose path agrees with pi's own catalog base URL for a DIRECT
+// (non-aggregator) built-in provider. The comparison is a normalized,
+// segment-bounded path-prefix match: both paths are trimmed of a single
+// trailing slash (so "…/v1" and "…/v1/" agree), and either they are equal
+// or the bound path extends the catalog path at a "/" boundary (so a
+// binding "…/v1/projects/…" still selects the catalog's "…/v1", but
+// "…/v10" does not). The reverse — a bound path SHORTER than the catalog
+// path — never matches: the bound URL must carry at least the catalog's own
+// path before it can be that provider's endpoint.
+//
+// Aggregator providers never reach the path check: their routing stays
+// host-based (builtinAggregatorForBaseURL + promoteAggregatorPin), and a
+// provider with no catalog base URL entry falls back to the host
+// comparison, preserving today's behavior for templated or per-model
+// endpoints.
+func baseURLMatchesProviderEndpoint(baseURL, provider string) bool {
+	wantHost, known := builtinProviderServingHost[provider]
+	if !known {
+		return false
+	}
+	u, err := url.Parse(baseURL)
+	if err != nil || !strings.EqualFold(u.Scheme, "https") || u.Hostname() == "" {
+		return false
+	}
+	if !strings.EqualFold(u.Hostname(), wantHost) {
+		return false
+	}
+	if builtinAggregatorProviders[provider] {
+		return true
+	}
+	wantBase, known := builtinProviderBaseURL[provider]
+	if !known {
+		return true
+	}
+	wantURL, err := url.Parse(wantBase)
+	if err != nil || !strings.EqualFold(wantURL.Scheme, "https") || wantURL.Hostname() == "" {
+		return true
+	}
+	if !strings.EqualFold(u.Hostname(), wantURL.Hostname()) {
+		return false
+	}
+	return boundPathExtendsCatalogPath(strings.TrimSuffix(u.EscapedPath(), "/"), strings.TrimSuffix(wantURL.EscapedPath(), "/"))
+}
+
+// boundPathExtendsCatalogPath reports whether bound (a URL path with any
+// trailing slash already trimmed) names the catalog path itself or a route
+// under it: equal, or bound extends catalog at a "/" segment boundary.
+// An empty catalog path (a host-root base URL) matches every path on that
+// host; a non-empty one never matches a shorter or sibling path.
+func boundPathExtendsCatalogPath(bound, catalog string) bool {
+	if catalog == "" {
+		return true
+	}
+	if bound == catalog {
+		return true
+	}
+	return strings.HasPrefix(bound, catalog+"/")
 }
 
 // baseURLIsProviderHost reports whether baseURL is an https URL on provider's
