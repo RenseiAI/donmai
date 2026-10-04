@@ -1016,3 +1016,69 @@ func TestRefreshRuntimeToken_NetworkErrorReturnsErr(t *testing.T) {
 		t.Fatalf("expected error on 5xx refresh probe (avoid burning workerId)")
 	}
 }
+
+// TestRefreshRuntimeToken_SurfacesRegistrationTokenLifetime pins that the
+// refresh result carries the platform's optional registration-token lifetime
+// hints when the refresh endpoint sends them, and leaves them empty when it
+// does not. The hints are advisory only: absence (older platforms) must never
+// fail the refresh.
+func TestRefreshRuntimeToken_SurfacesRegistrationTokenLifetime(t *testing.T) {
+	t.Parallel()
+
+	tests := []struct {
+		name      string
+		sendHints bool
+	}{
+		{name: "hints present", sendHints: true},
+		{name: "hints absent", sendHints: false},
+	}
+
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				if r.URL.Path != "/api/workers/wkr_current/refresh-token" {
+					t.Errorf("unexpected request: %s %s", r.Method, r.URL.Path)
+					http.NotFound(w, r)
+					return
+				}
+				body := map[string]any{"runtimeToken": "fresh.runtime.jwt"}
+				if tc.sendHints {
+					body["registrationTokenExpiresAt"] = "2030-06-01T00:00:00Z"
+					body["registrationTokenRenewAfter"] = "2030-05-01T00:00:00Z"
+				}
+				_ = json.NewEncoder(w).Encode(body)
+			}))
+			defer srv.Close()
+
+			regOpts := RegistrationOptions{
+				OrchestratorURL: srv.URL,
+				// #nosec G101 -- test fixture
+				RegistrationToken: "rsp_live_x",
+				Hostname:          "h",
+				Version:           Version,
+				MaxAgents:         1,
+				JWTPath:           t.TempDir() + "/jwt.json",
+				HTTPClient:        &http.Client{Timeout: 5 * time.Second},
+			}
+			result, err := RefreshRuntimeToken(context.Background(), regOpts, "wkr_current", "runtime-token-expired")
+			if err != nil {
+				t.Fatalf("RefreshRuntimeToken: %v", err)
+			}
+			if result.Mode != "refresh" {
+				t.Fatalf("mode = %q, want refresh", result.Mode)
+			}
+			if tc.sendHints {
+				if result.RegistrationTokenExpiresAt != "2030-06-01T00:00:00Z" {
+					t.Errorf("RegistrationTokenExpiresAt = %q, want the platform hint", result.RegistrationTokenExpiresAt)
+				}
+				if result.RegistrationTokenRenewAfter != "2030-05-01T00:00:00Z" {
+					t.Errorf("RegistrationTokenRenewAfter = %q, want the platform hint", result.RegistrationTokenRenewAfter)
+				}
+			} else if result.RegistrationTokenExpiresAt != "" || result.RegistrationTokenRenewAfter != "" {
+				t.Errorf("absent hints must stay empty, got (%q, %q)", result.RegistrationTokenExpiresAt, result.RegistrationTokenRenewAfter)
+			}
+		})
+	}
+}

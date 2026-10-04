@@ -160,6 +160,18 @@ func (r *CredentialRefresher) UpdateRegistrationProjects(entries []ProjectAllowl
 	r.mu.Unlock()
 }
 
+// UpdateRegistrationToken replaces the registration token presented on the
+// next refresh or re-registration, so a rotated token takes effect without a
+// restart. Only the token changes; every other registration field retains its
+// current value. Safe for concurrent use with an in-flight refresh: Refresh,
+// Reregister, and DeclareSessionShim each copy the registration under the
+// same lock this setter holds.
+func (r *CredentialRefresher) UpdateRegistrationToken(token string) {
+	r.mu.Lock()
+	r.opts.Registration.RegistrationToken = token
+	r.mu.Unlock()
+}
+
 // Reregister sends the latest project declaration and publishes the resulting
 // identity to every credential lane. It is serialized with both ordinary
 // refresh and session-shim declaration operations.
