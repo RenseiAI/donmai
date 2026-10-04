@@ -677,10 +677,17 @@ func ToolLifecycleProfileID(spec Spec) string { return spec.toolLifecycleProfile
 // CostData mirrors AgentCostData from the legacy TS providers/types.ts.
 //
 // All fields are optional; providers populate what they have available.
+//
+// Token accounting rule: InputTokens excludes cache read and cache write
+// tokens (those ride CachedInputTokens and CacheWriteTokens); ReasoningTokens
+// is a count inside OutputTokens, never an additive extra — totals must never
+// add it twice.
 type CostData struct {
 	InputTokens       int64   `json:"inputTokens,omitempty"`
 	OutputTokens      int64   `json:"outputTokens,omitempty"`
 	CachedInputTokens int64   `json:"cachedInputTokens,omitempty"`
+	CacheWriteTokens  int64   `json:"cacheWriteTokens,omitempty"`
+	ReasoningTokens   int64   `json:"reasoningTokens,omitempty"`
 	TotalCostUsd      float64 `json:"totalCostUsd,omitempty"`
 	NumTurns          int     `json:"numTurns,omitempty"`
 }
@@ -749,6 +756,12 @@ type Result struct {
 	// Empty for non-review work or when the agent gave no review verdict.
 	// Additive — old platforms ignore it.
 	ReviewVerdict string `json:"reviewVerdict,omitempty"`
+
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
 
 	// Cost rolls up token usage and dollars across the session.
 	Cost *CostData `json:"cost,omitempty"`
@@ -980,6 +993,15 @@ type BackstopReport struct {
 
 	// Diagnostics is human-readable text describing what happened.
 	Diagnostics string `json:"diagnostics,omitempty"`
+
+	// ContinueDiverged is true when a continue-mode backstop push was
+	// refused because the continued pull request's head moved after
+	// dispatch. It is set from a git ancestry check (the fetched remote
+	// head is not an ancestor of the session's HEAD), never by matching
+	// push-output or diagnostics text, so a policy rejection of an
+	// otherwise fast-forward push leaves it false. The runner maps it to
+	// the continue-pr-diverged failure mode.
+	ContinueDiverged bool `json:"continueDiverged,omitempty"`
 
 	// Repositories is the additive per-mutable-repository backstop projection.
 	// Empty retains the legacy singular report semantics.

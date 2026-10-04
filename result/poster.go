@@ -212,6 +212,18 @@ type statusRequest struct {
 	TotalCostUsd      float64        `json:"totalCostUsd,omitempty"`
 	InputTokens       int64          `json:"inputTokens,omitempty"`
 	OutputTokens      int64          `json:"outputTokens,omitempty"`
+	// CacheReadTokens is the cache-read token count carried from
+	// CostData.CachedInputTokens. Additive and backward-compatible:
+	// omitted when zero, so an old receiver that ignores the key still
+	// parses the body.
+	CacheReadTokens int64 `json:"cacheReadTokens,omitempty"`
+	// CacheWriteTokens is the cache-write (cache creation) token count
+	// carried from CostData.CacheWriteTokens. Same additive contract.
+	CacheWriteTokens int64 `json:"cacheWriteTokens,omitempty"`
+	// ReasoningTokens is the reasoning token count inside OutputTokens
+	// (see CostData), carried for observability only — never added to
+	// totals. Same additive contract.
+	ReasoningTokens int64 `json:"reasoningTokens,omitempty"`
 
 	// FailureMode carries the runner's structural failure classification
 	// (e.g. "agent-blocked") so the platform routes on the authoritative
@@ -305,6 +317,12 @@ type statusRequest struct {
 	// rejected" from "server error". Additive; omitted on every run
 	// without an endpoint error — old platforms ignore it.
 	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
+
+	// ToolCalls counts the tool calls the session made across every
+	// stream: the initial turn, injected turns, continuations and
+	// in-session retries. Always serialized (no omitempty) so a zero
+	// reads as "did nothing" rather than unknown.
+	ToolCalls int `json:"toolCalls"`
 }
 
 // errorEnvelope mirrors the shape the platform expects under
@@ -520,11 +538,15 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
 		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
+		ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd
 		body.InputTokens = r.Cost.InputTokens
 		body.OutputTokens = r.Cost.OutputTokens
+		body.CacheReadTokens = r.Cost.CachedInputTokens
+		body.CacheWriteTokens = r.Cost.CacheWriteTokens
+		body.ReasoningTokens = r.Cost.ReasoningTokens
 	}
 	if r.Error != "" {
 		body.Error = &errorEnvelope{Message: r.Error}

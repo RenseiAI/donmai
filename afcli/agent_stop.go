@@ -55,7 +55,7 @@ func newAgentStopCmd(ds func() afclient.DataSource) *cobra.Command {
 			}
 
 			if resp.PendingDelivery() {
-				_, _ = fmt.Fprintln(out, "Stop delivered, pending terminal evidence")
+				_, _ = fmt.Fprintln(out, resp.PendingMessage())
 				return nil
 			}
 			_, _ = fmt.Fprintf(out, "Stopped %s (%s → %s)\n", resp.SessionID, resp.PreviousStatus, resp.NewStatus)

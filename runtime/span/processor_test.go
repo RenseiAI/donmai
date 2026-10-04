@@ -62,13 +62,15 @@ func newTestProcessor(t *testing.T, recorder *spanRecorder, now func() time.Time
 func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 	t.Parallel()
 	cases := []struct {
-		name  string
-		cost  *agent.CostData
-		in    int64
-		out   int64
-		cache int64
+		name      string
+		cost      *agent.CostData
+		in        int64
+		out       int64
+		cache     int64
+		written   int64
+		reasoning int64
 	}{
-		{name: "reported aggregate", cost: &agent.CostData{InputTokens: 900, OutputTokens: 120, CachedInputTokens: 400, NumTurns: 7}, in: 900, out: 120, cache: 400},
+		{name: "reported aggregate", cost: &agent.CostData{InputTokens: 900, OutputTokens: 120, CachedInputTokens: 400, CacheWriteTokens: 50, ReasoningTokens: 30, NumTurns: 7}, in: 900, out: 120, cache: 400, written: 50, reasoning: 30},
 		{name: "usage unavailable", cost: nil},
 	}
 	for _, tc := range cases {
@@ -88,8 +90,8 @@ func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 			if !llm.Synthetic || llm.UsageSource != agent.LlmUsageAggregate {
 				t.Fatalf("fallback provenance = synthetic:%v source:%q", llm.Synthetic, llm.UsageSource)
 			}
-			if llm.InputTokens != tc.in || llm.OutputTokens != tc.out || llm.CachedInputTokens != tc.cache {
-				t.Fatalf("fallback changed aggregate counts: got %d/%d/%d want %d/%d/%d", llm.InputTokens, llm.OutputTokens, llm.CachedInputTokens, tc.in, tc.out, tc.cache)
+			if llm.InputTokens != tc.in || llm.OutputTokens != tc.out || llm.CachedInputTokens != tc.cache || llm.CacheWriteTokens != tc.written || llm.ReasoningTokens != tc.reasoning {
+				t.Fatalf("fallback changed aggregate counts: got %d/%d/%d/%d/%d want %d/%d/%d/%d/%d", llm.InputTokens, llm.OutputTokens, llm.CachedInputTokens, llm.CacheWriteTokens, llm.ReasoningTokens, tc.in, tc.out, tc.cache, tc.written, tc.reasoning)
 			}
 			if llm.PromptHash != "" || llm.ContextHash != "" {
 				t.Fatalf("fallback fabricated content correlation: %+v", llm)
@@ -102,7 +104,7 @@ func TestProcessor_AggregateFallbackIsExplicitAndUnapportioned(t *testing.T) {
 			if !ok {
 				t.Fatalf("span = %T, want LlmCallSpan", spans[0])
 			}
-			if span.GenAI.UsageInputTokens != tc.in || span.GenAI.UsageOutputTokens != tc.out || span.GenAI.UsageCacheReadInputTokens != tc.cache {
+			if span.GenAI.UsageInputTokens != tc.in || span.GenAI.UsageOutputTokens != tc.out || span.GenAI.UsageCacheReadInputTokens != tc.cache || span.GenAI.UsageCacheWriteInputTokens != tc.written || span.GenAI.UsageReasoningTokens != tc.reasoning {
 				t.Fatalf("span changed aggregate counts: %+v", span.GenAI)
 			}
 		})
@@ -315,5 +317,51 @@ func TestProviderSystem_AllRuntimeHarnesses(t *testing.T) {
 				t.Fatalf("ProviderSystem(%q) = %q, want %q", tt.provider, got, tt.want)
 			}
 		})
+	}
+}
+
+func TestProcessor_SubagentLifecycleEmitsSubagentSpan(t *testing.T) {
+	t.Parallel()
+	recorder := &spanRecorder{}
+	now := time.Unix(1_700_000_000, 0)
+	p := newTestProcessor(t, recorder, func() time.Time { return now })
+
+	started := p.Process(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_agent_1", Phase: agent.SubagentStarted})[0].(agent.SubagentEvent)
+	if started.TraceID == "" || started.SpanID == "" || started.ParentSpanID == "" {
+		t.Fatalf("started event lost correlation: %+v", started)
+	}
+	completed := p.Process(agent.SubagentEvent{ToolUseID: "toolu_agent_1", Phase: agent.SubagentCompleted})[0].(agent.SubagentEvent)
+	if completed.SpanID != started.SpanID || completed.TraceID != started.TraceID {
+		t.Fatalf("completed lost correlation: started=%+v completed=%+v", started, completed)
+	}
+	if completed.ToolName != "Agent" {
+		t.Fatalf("completed ToolName = %q, want Agent (carried from pending)", completed.ToolName)
+	}
+
+	failed := p.Process(agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_agent_2", Phase: agent.SubagentStarted})[0].(agent.SubagentEvent)
+	failedOut := p.Process(agent.SubagentEvent{ToolUseID: "toolu_agent_2", Phase: agent.SubagentFailed})[0].(agent.SubagentEvent)
+	if failedOut.SpanID != failed.SpanID {
+		t.Fatalf("failed lost correlation: started=%+v failed=%+v", failed, failedOut)
+	}
+
+	_ = p.Process(agent.ResultEvent{Success: true})
+	p.Finish("completed", "")
+	var subagents []agent.SubagentSpan
+	for _, s := range recorder.snapshot() {
+		if sub, ok := s.(agent.SubagentSpan); ok {
+			subagents = append(subagents, sub)
+		}
+	}
+	if len(subagents) != 2 {
+		t.Fatalf("emitted %d subagent spans, want 2", len(subagents))
+	}
+	if subagents[0].Status.Code != agent.StatusOK || subagents[1].Status.Code != agent.StatusError {
+		t.Fatalf("subagent span statuses wrong: %+v", subagents)
+	}
+	if subagents[0].Kind != agent.SpanKindSubagent || subagents[0].SpanID != started.SpanID {
+		t.Fatalf("completed span correlation wrong: %+v started=%+v", subagents[0], started)
+	}
+	if subagents[0].TraceID == "" || subagents[0].ParentSpanID == "" {
+		t.Fatalf("completed span missing trace spine: %+v", subagents[0])
 	}
 }

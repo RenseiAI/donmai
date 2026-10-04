@@ -410,3 +410,26 @@ func TestTerminalRecordMatchesPlatformSessionEndedShape(t *testing.T) {
 		t.Fatalf("terminal payload shape = %s", body)
 	}
 }
+
+func TestNormalizeEventSubagentLifecycleTopics(t *testing.T) {
+	cases := []struct {
+		phase agent.SubagentPhase
+		topic string
+	}{
+		{agent.SubagentStarted, "subagent.started"},
+		{agent.SubagentCompleted, "subagent.completed"},
+		{agent.SubagentFailed, "subagent.failed"},
+	}
+	for _, tc := range cases {
+		r, emitted, err := NormalizeEvent("session_1", 1, time.Now(), agent.SubagentEvent{ToolName: "Agent", ToolUseID: "toolu_1", Phase: tc.phase, ChildSessionID: "child-1"})
+		if err != nil || !emitted {
+			t.Fatalf("phase %s emitted=%v err=%v", tc.phase, emitted, err)
+		}
+		if r.EventType != tc.topic {
+			t.Fatalf("phase %s topic = %q, want %q", tc.phase, r.EventType, tc.topic)
+		}
+		if r.Payload["toolUseId"] != "toolu_1" || r.Payload["childSessionId"] != "child-1" {
+			t.Fatalf("phase %s payload lost ids: %+v", tc.phase, r.Payload)
+		}
+	}
+}

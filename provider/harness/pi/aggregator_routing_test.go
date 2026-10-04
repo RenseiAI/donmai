@@ -122,10 +122,27 @@ func TestModelRouting_BoundEndpoint(t *testing.T) {
 			wantVendorVar: "OPENROUTER_API_KEY",
 		},
 		{
+			name:  "promoted openrouter pin routes natively on a non-catalog path (aggregators stay host-based)",
+			model: "openrouter/anthropic/claude-sonnet-4.6", baseURL: "https://openrouter.ai/api/v2",
+			wantArgs: []string{"--provider", "openrouter", "--model", "anthropic/claude-sonnet-4.6"}, wantPinModel: "anthropic/claude-sonnet-4.6",
+			wantVendorVar: "OPENROUTER_API_KEY",
+		},
+		{
 			name:  "direct vendor on its own host routes natively (unchanged)",
 			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/coding/paas/v4",
 			wantArgs: []string{"--provider", "zai", "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
 			wantVendorVar: "ZAI_API_KEY",
+		},
+		{
+			name:  "direct vendor on the same host with a different path stays injected",
+			model: "zai/glm-5.3", baseURL: "https://api.z.ai/api/paas/v4",
+			wantArgs: []string{"--provider", pinnedProviderName, "--model", "glm-5.3"}, wantPinModel: "glm-5.3",
+		},
+		{
+			name:  "gateway binding on a non-v1 path still promotes to the native lane after the catalog confirms the slug",
+			model: "vercel-ai-gateway/" + aggregatorGatewayModel, baseURL: "https://ai-gateway.vercel.sh/v2",
+			wantArgs: []string{"--provider", "vercel-ai-gateway", "--model", aggregatorGatewayModel}, wantPinModel: aggregatorGatewayModel,
+			wantVendorVar: "AI_GATEWAY_API_KEY",
 		},
 		{
 			name:  "vendor-prefixed model on an unknown https proxy stays injected",

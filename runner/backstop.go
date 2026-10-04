@@ -360,10 +360,14 @@ func (r *Runner) runBackstop(ctx context.Context, qw QueuedWork, branch string, 
 	}
 	if out, err := runGit(ctx, worktreePath, id, "push", "origin", "HEAD:refs/heads/"+branch); err != nil {
 		// Continue-mode divergence is typed: the pull request's head moved
-		// after dispatch, so the push is refused as a non-fast-forward
-		// rather than forced. The typed reason tells the platform the run
-		// needs a fresh dispatch, not a retry of the same head.
-		if qw.ContinuePullRequest != nil && isContinueDivergence(out) {
+		// after dispatch, so the push is refused rather than forced. The
+		// typed flag tells the platform the run needs a fresh dispatch,
+		// not a retry of the same head. The ancestry probe (not the push
+		// output) decides: a remote head that is not an ancestor of the
+		// session's HEAD is divergence, while a policy rejection of an
+		// otherwise fast-forward push is not.
+		if qw.ContinuePullRequest != nil && continueHeadDiverged(ctx, worktreePath, branch) {
+			report.ContinueDiverged = true
 			report.Diagnostics = fmt.Sprintf("%s: continued pull request #%d branch %q moved after dispatch; refusing to push: %v\noutput: %s", ErrContinuePullRequestDiverged, qw.ContinuePullRequest.Number, branch, err, out)
 			return report
 		}
@@ -468,6 +472,7 @@ func (r *Runner) runDeclaredBackstops(
 		aggregate.Triggered = aggregate.Triggered || report.Triggered
 		aggregate.Pushed = aggregate.Pushed || report.Pushed
 		aggregate.PRCreated = aggregate.PRCreated || report.PRCreated
+		aggregate.ContinueDiverged = aggregate.ContinueDiverged || report.ContinueDiverged
 		aggregate.UnfilledFields = append(aggregate.UnfilledFields, report.UnfilledFields...)
 		if report.Diagnostics != "" {
 			if aggregate.Diagnostics != "" {

@@ -75,7 +75,7 @@ func TestClientStopSessionAcceptedPendingEnvelope(t *testing.T) {
 		// The body claims stopped:true (a 2xx-is-success server); the
 		// client must still normalise a 202 to stopped=false because a
 		// 202 never carries terminal evidence.
-		_, _ = w.Write([]byte(`{"stopped":true,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":true}`))
+		_, _ = w.Write([]byte(`{"stopped":false,"sessionId":"sess-1","previousStatus":"working","newStatus":"working","delivered":true,"pending":"terminal_evidence"}`))
 	})
 	resp, err := c.StopSession("sess-1")
 	if err != nil {
@@ -84,7 +84,7 @@ func TestClientStopSessionAcceptedPendingEnvelope(t *testing.T) {
 	if resp.Stopped {
 		t.Fatalf("202 envelope must decode stopped=false: %+v", resp)
 	}
-	if !resp.Delivered || !resp.Pending || !resp.PendingDelivery() {
+	if !resp.Delivered || resp.Pending != StopPendingTerminalEvidence || !resp.PendingDelivery() {
 		t.Fatalf("202 envelope lost delivered/pending: %+v", resp)
 	}
 }

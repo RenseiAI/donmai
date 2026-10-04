@@ -374,8 +374,8 @@ func TestIntegration_BudgetExceeded_SubAgentCap(t *testing.T) {
 func integrationSubAgentCap(n int) *int { return &n }
 
 // taskSpammingProvider is a minimal in-test agent.Provider that emits
-// repeated Task ToolUseEvents to drive the budget enforcer past its
-// MaxSubAgents cap. Used only by the budget integration test.
+// repeated typed sub-agent lifecycle starts to drive the budget enforcer
+// past its MaxSubAgents cap. Used only by the budget integration test.
 type taskSpammingProvider struct{}
 
 func (taskSpammingProvider) Name() agent.ProviderName { return "task-spammer" }
@@ -410,9 +410,9 @@ func (p *taskSpammingProvider) spawnHandle(ctx context.Context) agent.Handle {
 		if !send(agent.InitEvent{SessionID: "task-spammer-1"}) {
 			return
 		}
-		// Emit way more Task events than any reasonable cap.
+		// Emit way more sub-agent starts than any reasonable cap.
 		for i := 0; i < 10; i++ {
-			if !send(agent.ToolUseEvent{ToolName: "Task", ToolUseID: "t" + string(rune('0'+i))}) {
+			if !send(agent.SubagentEvent{ToolName: "Task", ToolUseID: "t" + string(rune('0'+i)), Phase: agent.SubagentStarted}) {
 				return
 			}
 		}
