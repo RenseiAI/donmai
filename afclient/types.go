@@ -117,14 +117,16 @@ type ActivityListResponse struct {
 // A cooperative stop delivered to a live session is answered with HTTP 202
 // and an envelope carrying delivered/pending fields: the stop was accepted
 // but no terminal evidence exists yet, so Stopped stays false. Stopped is
-// true only for terminal (HTTP 200) responses.
+// true only for terminal (HTTP 200) responses. Pending carries the reason
+// the stop is still outstanding (for example "terminal_evidence"); it is
+// empty on terminal responses.
 type StopSessionResponse struct {
 	Stopped        bool                `json:"stopped"`
 	SessionID      string              `json:"sessionId"`
 	PreviousStatus SessionStatus       `json:"previousStatus"`
 	NewStatus      SessionStatus       `json:"newStatus"`
 	Delivered      bool                `json:"delivered,omitempty"`
-	Pending        bool                `json:"pending,omitempty"`
+	Pending        string              `json:"pending,omitempty"`
 	Receipt        *StopSessionReceipt `json:"receipt,omitempty"`
 
 	// HTTPStatus is the raw response status (200 or 202). It is never
@@ -134,13 +136,28 @@ type StopSessionResponse struct {
 	HTTPStatus int `json:"-"`
 }
 
+// StopPendingTerminalEvidence is the pending reason returned when a stop is
+// delivered to a live session and terminal proof is still outstanding.
+const StopPendingTerminalEvidence = "terminal_evidence"
+
 // PendingDelivery reports whether the stop was delivered but terminal
 // evidence is still pending (the HTTP 202 cooperative-stop envelope).
 func (r *StopSessionResponse) PendingDelivery() bool {
 	if r == nil {
 		return false
 	}
-	return r.Pending || r.HTTPStatus == http.StatusAccepted
+	return r.Pending != "" || r.HTTPStatus == http.StatusAccepted
+}
+
+// PendingMessage renders the human line for a delivered-but-pending stop,
+// naming the outstanding reason when it carries extra signal beyond the
+// standard terminal-evidence wait.
+func (r *StopSessionResponse) PendingMessage() string {
+	const base = "Stop delivered, pending terminal evidence"
+	if r == nil || r.Pending == "" || r.Pending == StopPendingTerminalEvidence {
+		return base
+	}
+	return base + " (" + r.Pending + ")"
 }
 
 // Stop receipt family discriminants returned by the public stop endpoint.

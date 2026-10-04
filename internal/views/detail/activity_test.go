@@ -136,7 +136,7 @@ func TestDetailModelStopPendingNotification(t *testing.T) {
 	m.Update(stopAgentMsg{resp: &afclient.StopSessionResponse{
 		Stopped: false, SessionID: "sess-1",
 		PreviousStatus: afclient.StatusWorking, NewStatus: afclient.StatusWorking,
-		Delivered: true, Pending: true,
+		Delivered: true, Pending: afclient.StopPendingTerminalEvidence,
 	}})
 	if m.notifStack.Len() == 0 {
 		t.Fatal("pending stop produced no notification")
