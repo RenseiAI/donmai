@@ -50,39 +50,53 @@ func TestUnitPricePinEnv_BoundPricesExported(t *testing.T) {
 	}
 }
 
-// TestUnitPricePinEnv_UnboundPricesExportNothing pins the other half: with no
-// prices bound the runner exports no price entry at all — not even the bound
-// flag — so the extension registers its zero table and the mapper suppresses
-// the reported cost (absent, not $0). An explicit all-zero binding still
-// counts as bound.
-func TestUnitPricePinEnv_UnboundPricesExportNothing(t *testing.T) {
+// TestUnitPricePinEnv_UnboundPricesExportClearing pins the other half: with
+// no prices bound the runner exports explicit clearing entries (each price
+// key present but empty, including the bound flag) — not an omission — so
+// a DONMAI_PI_PRICE_* value inherited from the spawning environment cannot
+// survive child-env layering as a stale price. The extension registers its
+// zero table on this lane and the mapper suppresses the reported cost
+// (absent, not $0). An explicit all-zero binding still counts as bound.
+func TestUnitPricePinEnv_UnboundPricesExportClearing(t *testing.T) {
 	t.Parallel()
+	clearing := []string{
+		piPricesBoundEnvVar + "=",
+		piPriceInputEnvVar + "=",
+		piPriceOutputEnvVar + "=",
+		piPriceCacheReadEnvVar + "=",
+		piPriceCacheWriteEnvVar + "=",
+	}
 	for _, tc := range []struct {
 		name   string
 		prices *agent.UnitPrices
 		bound  bool
 	}{
-		{name: "nil binding is unbound", prices: nil},
-		{name: "negative rate is unbound", prices: &agent.UnitPrices{Input: -1}},
-		{name: "NaN rate is unbound", prices: &agent.UnitPrices{Input: math.NaN()}},
-		{name: "infinite rate is unbound", prices: &agent.UnitPrices{Output: math.Inf(1)}},
+		{name: "nil binding clears", prices: nil},
+		{name: "negative rate clears", prices: &agent.UnitPrices{Input: -1}},
+		{name: "NaN rate clears", prices: &agent.UnitPrices{Input: math.NaN()}},
+		{name: "infinite rate clears", prices: &agent.UnitPrices{Output: math.Inf(1)}},
 		{name: "explicit zero is bound", prices: &agent.UnitPrices{}, bound: true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			t.Parallel()
 			env := providerPinEnv(pricedSpec(tc.prices))
-			hasPriceKey := false
-			for _, e := range env {
-				if strings.HasPrefix(e, piPricesBoundEnvVar+"=") ||
-					strings.HasPrefix(e, piPriceInputEnvVar+"=") ||
-					strings.HasPrefix(e, piPriceOutputEnvVar+"=") ||
-					strings.HasPrefix(e, piPriceCacheReadEnvVar+"=") ||
-					strings.HasPrefix(e, piPriceCacheWriteEnvVar+"=") {
-					hasPriceKey = true
+			if !tc.bound {
+				for _, want := range clearing {
+					found := false
+					for _, e := range env {
+						if e == want {
+							found = true
+							break
+						}
+					}
+					if !found {
+						t.Errorf("pin env missing clearing entry %q: %v", want, env)
+					}
 				}
+				return
 			}
-			if hasPriceKey != tc.bound {
-				t.Errorf("price keys present = %v, want bound = %v (env %v)", hasPriceKey, tc.bound, env)
+			if !hasEnvVal(env, piPricesBoundEnvVar, "1") {
+				t.Errorf("explicit-zero binding must export the bound flag: %v", env)
 			}
 		})
 	}
@@ -220,5 +234,215 @@ func TestMapperSuppressesUnpricedCost(t *testing.T) {
 	}
 	if res := settle(priced); res.ObservedCostUsd == nil || *res.ObservedCostUsd != 0.042 || res.Cost == nil || res.Cost.TotalCostUsd != 0.042 {
 		t.Errorf("priced terminal cost lost: %+v", res)
+	}
+}
+
+// lastEnvValue returns the value of the LAST KEY= entry in a composed child
+// env, matching exec.Cmd's last-entry-wins semantics: the pin this package
+// appends last must win over any inherited copy of the same key.
+func lastEnvValue(env []string, key string) string {
+	value := ""
+	found := false
+	for _, e := range env {
+		if strings.HasPrefix(e, key+"=") {
+			value = e[len(key)+1:]
+			found = true
+		}
+	}
+	if !found {
+		return "\x00absent"
+	}
+	return value
+}
+
+// TestComposeChildEnv_UnboundPricesClearInheritedStale drives the
+// production composeChildEnv entry point: an inherited price binding from
+// the spawning environment must not survive on an unpriced injected lane.
+// The unbound pin's clearing entries ride last and win under
+// last-entry-wins, so the extension sees an empty bound flag and registers
+// no stale price. RED proof: return nil from unitPricePinEnv on the unbound
+// path and the stale inherited values below reach the child.
+func TestComposeChildEnv_UnboundPricesClearInheritedStale(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv(piPricesBoundEnvVar, "1")
+	t.Setenv(piPriceInputEnvVar, "99")
+	t.Setenv(piPriceOutputEnvVar, "99")
+	t.Setenv(piPriceCacheReadEnvVar, "99")
+	t.Setenv(piPriceCacheWriteEnvVar, "99")
+
+	layout := newSessionLayout(t.TempDir())
+	env := composeChildEnv(pricedSpec(nil), layout, "sess-token")
+	for _, key := range []string{piPricesBoundEnvVar, piPriceInputEnvVar, piPriceOutputEnvVar, piPriceCacheReadEnvVar, piPriceCacheWriteEnvVar} {
+		if got := lastEnvValue(env, key); got != "" {
+			t.Errorf("unbound child env %s = %q, want cleared (empty, last wins)", key, got)
+		}
+	}
+}
+
+// TestComposeChildEnv_BoundPricesOverrideInheritedStale drives the
+// production composeChildEnv entry point for a priced binding: the bound
+// rates ride last and win over any inherited copy, so the extension
+// registers the real prices, not the stale host values.
+func TestComposeChildEnv_BoundPricesOverrideInheritedStale(t *testing.T) {
+	// Not parallel: mutates process env.
+	t.Setenv(piPriceInputEnvVar, "99")
+	t.Setenv(piPriceOutputEnvVar, "99")
+
+	layout := newSessionLayout(t.TempDir())
+	env := composeChildEnv(pricedSpec(&agent.UnitPrices{Input: 3, Output: 15}), layout, "sess-token")
+	if got := lastEnvValue(env, piPriceInputEnvVar); got != "3" {
+		t.Errorf("bound child env %s = %q, want 3 (pin wins last)", piPriceInputEnvVar, got)
+	}
+	if got := lastEnvValue(env, piPriceOutputEnvVar); got != "15" {
+		t.Errorf("bound child env %s = %q, want 15 (pin wins last)", piPriceOutputEnvVar, got)
+	}
+	if got := lastEnvValue(env, piPricesBoundEnvVar); got != "1" {
+		t.Errorf("bound child env %s = %q, want 1", piPricesBoundEnvVar, got)
+	}
+}
+
+// TestInteractiveChildEnv_UnboundPricesClearInheritedStale pins the same
+// clearing on the interactive lane: interactiveChildEnv layers the pin as
+// PTY overrides, so the stale inherited price must lose there too. RED
+// proof: drop the price pin from interactiveChildEnv and the stale values
+// below ride into the PTY child.
+func TestInteractiveChildEnv_UnboundPricesClearInheritedStale(t *testing.T) {
+	t.Parallel()
+	// Seed the snapshot layer with stale prices: it must not rescue them.
+	spec := pricedSpec(nil)
+	spec.Env = map[string]string{
+		piPricesBoundEnvVar:    "1",
+		piPriceInputEnvVar:     "99",
+		piPriceOutputEnvVar:    "99",
+		piPriceCacheReadEnvVar: "99",
+	}
+	layout := newSessionLayout(t.TempDir())
+	env := interactiveChildEnv(spec, layout)
+	for _, key := range []string{piPricesBoundEnvVar, piPriceInputEnvVar, piPriceOutputEnvVar, piPriceCacheReadEnvVar, piPriceCacheWriteEnvVar} {
+		if got, present := env[key]; !present || got != "" {
+			t.Errorf("unbound interactive env %s = %q (present=%v), want cleared (empty)", key, got, present)
+		}
+	}
+}
+
+// TestInteractiveChildEnv_BoundPricesOverrideStale pins that a priced
+// binding wins on the interactive lane too.
+func TestInteractiveChildEnv_BoundPricesOverrideStale(t *testing.T) {
+	t.Parallel()
+	spec := pricedSpec(&agent.UnitPrices{Input: 3, Output: 15})
+	spec.Env = map[string]string{piPriceInputEnvVar: "99"}
+	env := interactiveChildEnv(spec, newSessionLayout(t.TempDir()))
+	if env[piPriceInputEnvVar] != "3" || env[piPriceOutputEnvVar] != "15" || env[piPricesBoundEnvVar] != "1" {
+		t.Errorf("bound interactive env kept stale prices: %v", env)
+	}
+}
+
+// pricedTurnBody scripts one turn_end carrying fixture usage plus the
+// terminal agent_settled, so a Spawn/Resume test can assert the emitted
+// per-turn and terminal costs end to end through the production handle.
+func pricedTurnBody(total float64) string {
+	return getStateResponse("ses_prices") +
+		event(map[string]any{"type": "agent_start"}) +
+		event(map[string]any{"type": "turn_end", "message": map[string]any{
+			"provider": "fixture-surface", "model": "fixture-model",
+			"usage": map[string]any{"input": float64(1000), "output": float64(500), "cost": map[string]any{"total": total}},
+		}}) +
+		event(map[string]any{"type": "agent_settled"})
+}
+
+// collectCosts drains one scripted session and returns the per-turn
+// observed cost plus the terminal result event.
+func collectCosts(t *testing.T, h agent.Handle) (*float64, agent.ResultEvent) {
+	t.Helper()
+	var perTurn *float64
+	var terminal agent.ResultEvent
+	for _, e := range drain(t, h) {
+		switch ev := e.(type) {
+		case agent.LlmCallEvent:
+			perTurn = ev.ObservedCostUsd
+		case agent.ResultEvent:
+			terminal = ev
+		}
+	}
+	return perTurn, terminal
+}
+
+// boundFixtureTotal is the cost pi reports for the fixture usage below
+// when the bound prices register: (1000*3 + 500*15 + 200*0.3 +
+// 100*3.75) / 1e6. cacheRead/cacheWrite token counts ride no fixture
+// field, so they contribute only via the registered table on a real
+// binary; the scripted cost here is carried verbatim in the turn event.
+const boundFixtureTotal = 0.0105
+
+// TestSpawn_BoundPricesYieldNonzeroCost drives the production Spawn entry
+// point with a priced binding: the handle must not suppress the reported
+// cost, so a fixture usage carrying the bound-computed total emits it on
+// the per-turn event and the terminal result. RED proof: force
+// suppressInjectedCost true (drop the price check) and the per-turn cost
+// below reads nil.
+func TestSpawn_BoundPricesYieldNonzeroCost(t *testing.T) {
+	t.Parallel()
+	spec := pricedSpec(&agent.UnitPrices{Input: 3, Output: 15, CacheRead: 0.3, CacheWrite: 3.75})
+	_, h, err := spawnScripted(t, spec, handshakeEvent("h1"), pricedTurnBody(boundFixtureTotal))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	perTurn, terminal := collectCosts(t, h)
+	if perTurn == nil || *perTurn != boundFixtureTotal {
+		t.Errorf("bound per-turn observed cost = %+v, want %v", perTurn, boundFixtureTotal)
+	}
+	if terminal.ObservedCostUsd == nil || *terminal.ObservedCostUsd != boundFixtureTotal {
+		t.Errorf("bound terminal observed cost = %+v, want %v", terminal.ObservedCostUsd, boundFixtureTotal)
+	}
+	if terminal.Cost == nil || terminal.Cost.TotalCostUsd != boundFixtureTotal {
+		t.Errorf("bound terminal total = %+v, want %v", terminal.Cost, boundFixtureTotal)
+	}
+}
+
+// TestSpawn_UnboundPricesYieldNoCost drives the production Spawn entry
+// point with no prices bound: the reported zero cost must read as absent
+// (nil per-turn observed cost, nil terminal observed cost, zero terminal
+// total with token counts kept), not $0. RED proof: initialize the handle
+// without the suppressCost flag and the zero total below is reported
+// verbatim.
+func TestSpawn_UnboundPricesYieldNoCost(t *testing.T) {
+	t.Parallel()
+	_, h, err := spawnScripted(t, pricedSpec(nil), handshakeEvent("h1"), pricedTurnBody(0))
+	if err != nil {
+		t.Fatalf("Spawn: %v", err)
+	}
+	perTurn, terminal := collectCosts(t, h)
+	if perTurn != nil {
+		t.Errorf("unbound per-turn observed cost = %v, want nil (absent, not $0)", *perTurn)
+	}
+	if terminal.ObservedCostUsd != nil {
+		t.Errorf("unbound terminal observed cost = %v, want nil", *terminal.ObservedCostUsd)
+	}
+	if terminal.Cost == nil {
+		t.Fatalf("unbound terminal cost is nil, want token counts kept")
+	}
+	if terminal.Cost.TotalCostUsd != 0 {
+		t.Errorf("unbound terminal total = %v, want omitted (0)", terminal.Cost.TotalCostUsd)
+	}
+	if terminal.Cost.InputTokens != 1000 || terminal.Cost.OutputTokens != 500 {
+		t.Errorf("unbound terminal tokens = %+v, want 1000 in / 500 out", terminal.Cost)
+	}
+}
+
+// TestResume_UnboundPricesYieldNoCost drives the production Resume entry
+// point on the same unpriced lane: suppression is decided from the resumed
+// spec, so a resumed session reads cost-absent too.
+func TestResume_UnboundPricesYieldNoCost(t *testing.T) {
+	t.Parallel()
+	_, h, err := resumeScripted(t, "ses_prices", pricedSpec(nil), handshakeEvent("h1"), pricedTurnBody(0))
+	if err != nil {
+		t.Fatalf("Resume: %v", err)
+	}
+	perTurn, terminal := collectCosts(t, h)
+	if perTurn != nil {
+		t.Errorf("resumed unbound per-turn observed cost = %v, want nil", *perTurn)
+	}
+	if terminal.ObservedCostUsd != nil {
+		t.Errorf("resumed unbound terminal observed cost = %v, want nil", *terminal.ObservedCostUsd)
 	}
 }

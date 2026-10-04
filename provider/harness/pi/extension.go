@@ -505,17 +505,29 @@ func providerPinEnv(spec agent.Spec) []string {
 }
 
 // unitPricePinEnv exports the endpoint binding's optional per-token prices
-// (USD per million tokens) to the child extension. A nil UnitPrices means
-// no prices are bound: nothing is exported and the mapper suppresses the
-// reported cost (absent, not $0). A non-nil value exports the bound flag
-// plus all four rates — including explicit zeros — so the extension
-// registers them and pi computes the real per-turn cost. Negative or
-// non-finite rates are refused: the entry is dropped and prices count as
+// (USD per million tokens) to the child extension. A non-nil value exports
+// the bound flag plus all four rates — including explicit zeros — so the
+// extension registers them and pi computes the real per-turn cost. Negative
+// or non-finite rates are refused: the entry is dropped and prices count as
 // unbound rather than inventing a value the dispatch did not carry.
+//
+// When no prices are bound the pin exports explicit clearing entries
+// (each price key present but empty): child env composes by layering
+// overrides over the inherited parent (spec_translation.go composeChildEnv
+// appends this pin last; the interactive lane layers it as PTY overrides),
+// so omitting the keys here would let a DONMAI_PI_PRICE_* value inherited
+// from the spawning environment survive and register as a stale price. The
+// mapper suppresses the reported cost on this lane (absent, not $0).
 func unitPricePinEnv(spec agent.Spec) []string {
 	prices := endpointUnitPrices(spec)
 	if prices == nil {
-		return nil
+		return []string{
+			piPricesBoundEnvVar + "=",
+			piPriceInputEnvVar + "=",
+			piPriceOutputEnvVar + "=",
+			piPriceCacheReadEnvVar + "=",
+			piPriceCacheWriteEnvVar + "=",
+		}
 	}
 	return []string{
 		piPricesBoundEnvVar + "=1",
