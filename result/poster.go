@@ -298,6 +298,14 @@ type statusRequest struct {
 	// omitted when the session stayed within its budget.
 	BudgetBreach *agent.BudgetBreach `json:"budgetBreach,omitempty"`
 
+	// UpstreamError carries the model endpoint's structured refusal or
+	// throttle (HTTP status, provider code, truncated provider message,
+	// reset time) on a session that failed because the endpoint refused
+	// it, so the control plane can tell "quota exhausted" from "key
+	// rejected" from "server error". Additive; omitted on every run
+	// without an endpoint error — old platforms ignore it.
+	UpstreamError *agent.UpstreamError `json:"upstreamError,omitempty"`
+
 	// ToolCalls counts the tool calls the session made across every
 	// stream: the initial turn, injected turns, continuations and
 	// in-session retries. Always serialized (no omitempty) so a zero
@@ -517,7 +525,8 @@ func buildStatusRequest(creds RuntimeCredentials, r agent.Result, projection *wo
 		PullRequestURL: r.PullRequestURL, Manifest: r.Manifest, ReviewVerdict: r.ReviewVerdict,
 		TerminalWorkareaLease:    projection,
 		ExecutionSecurityRefusal: r.ExecutionSecurityRefusal, TurnContinuations: r.TurnContinuations,
-		BudgetBreach: r.BudgetBreach, ToolCalls: r.ToolCalls,
+		BudgetBreach: r.BudgetBreach, UpstreamError: agent.CanonicalUpstreamError(r.Upstream),
+		ToolCalls: r.ToolCalls,
 	}
 	if r.Cost != nil {
 		body.TotalCostUsd = r.Cost.TotalCostUsd

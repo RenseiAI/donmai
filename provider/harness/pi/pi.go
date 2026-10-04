@@ -4,8 +4,10 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
+	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -253,7 +255,18 @@ func (p *Provider) prepare(ctx context.Context, spec agent.Spec) (agent.Spec, er
 		if probe := p.resolveCatalogProbe(); probe != nil {
 			credEnvVar := builtinProviderCredentialEnv[provider]
 			if err := p.preflightCatalogCheck(ctx, probe, provider, bareModel, credEnvVar, spec.Env[credEnvVar]); err != nil {
-				return spec, err
+				var miss *catalogMissError
+				if !errors.As(err, &miss) {
+					return spec, err
+				}
+				fallback, ferr := fallbackToInjectedProvider(spec, miss)
+				if ferr != nil {
+					return spec, fmt.Errorf("%w: %w", agent.ErrSpawnFailed, ferr)
+				}
+				slog.Warn("pi catalog preflight miss; spawning through the injected provider",
+					"provider", miss.provider, "model", miss.model,
+					"fallbackModel", fallback.Model, "baseURL", fallback.Endpoint.BaseURL, "api", piAPIForProtocol(fallback.Endpoint.Protocol))
+				spec = fallback
 			}
 		}
 	}

@@ -1249,3 +1249,62 @@ func TestPosterPost_StatusToolCallsSerialized(t *testing.T) {
 		})
 	}
 }
+
+// TestPosterPost_StatusUpstreamErrorSerialized pins the optional endpoint
+// cause on the /status body: a failed session that ended on a 429 with a
+// provider code and reset time posts upstreamError with those values, and
+// runs without one post nothing new (backward-compatible additive field).
+func TestPosterPost_StatusUpstreamErrorSerialized(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		in   *agent.UpstreamError
+		want string
+	}{
+		{name: "omitted without an endpoint error"},
+		{
+			name: "429 with code and reset",
+			in:   &agent.UpstreamError{HTTPStatus: 429, ProviderCode: "usage_limit", ProviderMessage: "Rate limited: quota exhausted", ResetAt: "1777673400"},
+			want: `{"httpStatus":429,"providerCode":"usage_limit","providerMessage":"Rate limited: quota exhausted","resetAt":"1777673400"}`,
+		},
+		{
+			name: "status only",
+			in:   &agent.UpstreamError{HTTPStatus: 503},
+			want: `{"httpStatus":503}`,
+		},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			var statusBody []byte
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				if strings.HasSuffix(r.URL.Path, "/status") {
+					statusBody = body
+				}
+				w.WriteHeader(http.StatusOK)
+			}))
+			t.Cleanup(srv.Close)
+			p := newPoster(t, srv.URL, 0)
+			r := goodResult()
+			r.Status = "failed"
+			r.FailureMode = runner.FailureProviderError
+			r.Error = "the turn still ended on a model provider error after 3 retries: Rate limited"
+			r.Upstream = tc.in
+			if err := p.Post(context.Background(), "sess-upstream", r); err != nil {
+				t.Fatalf("Post: %v", err)
+			}
+			var body map[string]json.RawMessage
+			if err := json.Unmarshal(statusBody, &body); err != nil {
+				t.Fatalf("status body not JSON: %v (raw %q)", err, statusBody)
+			}
+			got, present := body["upstreamError"]
+			if present != (tc.want != "") {
+				t.Fatalf("upstreamError present = %v; want %v (body %s)", present, tc.want != "", statusBody)
+			}
+			if present && string(got) != tc.want {
+				t.Errorf("upstreamError = %s; want %s", got, tc.want)
+			}
+		})
+	}
+}

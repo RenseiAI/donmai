@@ -6,7 +6,9 @@ import (
 	"errors"
 	"fmt"
 	"sync"
+	"sync/atomic"
 	"testing"
+	"time"
 
 	"github.com/RenseiAI/donmai/agent"
 	"github.com/RenseiAI/donmai/prompt"
@@ -491,4 +493,212 @@ func (h *steerScriptHandle) run() {
 		return
 	}
 	<-h.stop
+}
+
+// usageGateProvider wraps the scripted verdict provider and holds the first
+// follow-up Inject until the step-heartbeat double has recorded a
+// usage-carrying beat at the first turn's cost. Test-only: it keeps the
+// emitter window open for that tick without touching production code.
+type usageGateProvider struct {
+	*verdictScriptProvider
+	waitFirstTurnBeat func()
+}
+
+func (p *usageGateProvider) Spawn(ctx context.Context, spec agent.Spec) (agent.Handle, error) {
+	h, err := p.verdictScriptProvider.Spawn(ctx, spec)
+	if err != nil {
+		return nil, err
+	}
+	return &usageGateHandle{Handle: h, wait: p.waitFirstTurnBeat}, nil
+}
+
+// usageGateHandle holds the first Inject — the runner's follow-up turn
+// trigger — until the first-turn usage beat has landed.
+type usageGateHandle struct {
+	agent.Handle
+	once sync.Once
+	wait func()
+}
+
+func (h *usageGateHandle) Inject(ctx context.Context, text string) error {
+	h.once.Do(func() { h.wait() })
+	return h.Handle.Inject(ctx, text)
+}
+
+// TestRun_StepHeartbeatsCarryNonDecreasingUsage drives two turns through the
+// real runner and asserts the step-heartbeat beats the platform double
+// received carry non-decreasing cumulative usage that is non-zero after the
+// first turn ends. The runner's emitter reads the budget accumulator live,
+// so the usage on the wire is the same total the terminal result reports.
+//
+// The two gates below make the beat count deterministic without loosening
+// any assertion and without sleeps. The first follow-up Inject blocks until
+// the double has recorded a usage-carrying beat at the first turn's cost,
+// so the session stays alive for at least one such tick; the turn-two
+// pull-request lookup blocks until the double has recorded a
+// usage-carrying beat above the first turn's cost, so the run holds the
+// emitter window open for the second distinct tick before the terminal
+// status post stops the emitter. Both waits are notify-driven with a
+// bounded timeout that fails the test clearly when it fires.
+func TestRun_StepHeartbeatsCarryNonDecreasingUsage(t *testing.T) {
+	platform := newRecordingPlatformServer(t)
+	platform.stepBeatNotify = make(chan struct{}, 64)
+	const (
+		firstTurnInputTokens = int64(300)
+		beatTimeout          = 10 * time.Second
+	)
+	// stepInputsAtLeast decodes every recorded step-heartbeat body and
+	// returns the input-token totals of the beats carrying usage at or
+	// above minInput.
+	stepInputsAtLeast := func(minInput int64) []int64 {
+		var inputs []int64
+		for _, raw := range platform.stepBeats() {
+			var body struct {
+				Usage *struct {
+					Input int64 `json:"inputTokens"`
+				} `json:"usage"`
+			}
+			if err := json.Unmarshal(raw, &body); err != nil || body.Usage == nil {
+				continue
+			}
+			if body.Usage.Input >= minInput {
+				inputs = append(inputs, body.Usage.Input)
+			}
+		}
+		return inputs
+	}
+	// waitForStepInputs blocks until at least want beats at or above
+	// minInput are recorded, or the bounded timeout fires. Notify-driven:
+	// each recorded beat wakes the waiter, which re-scans the full
+	// history, so a coalesced wakeup never misses a beat.
+	waitForStepInputs := func(minInput int64, want int) bool {
+		deadline := time.Now().Add(beatTimeout)
+		for {
+			if len(stepInputsAtLeast(minInput)) >= want {
+				return true
+			}
+			remaining := time.Until(deadline)
+			if remaining <= 0 {
+				return false
+			}
+			timer := time.NewTimer(remaining)
+			select {
+			case <-platform.stepBeatNotify:
+				timer.Stop()
+			case <-timer.C:
+				return false
+			}
+		}
+	}
+	var (
+		injectGateSeen   atomic.Bool
+		injectGateFailed atomic.Bool
+		lookupGateSeen   atomic.Bool
+		lookupGateFailed atomic.Bool
+	)
+	turns := []verdictScriptTurn{
+		{text: "Now I will run the tests.", cost: &agent.CostData{InputTokens: 300, OutputTokens: 100, CachedInputTokens: 50, TotalCostUsd: 0.01, NumTurns: 1}},
+		{text: "Opened " + followUpPR + "\nWORK_RESULT: passed", cost: &agent.CostData{InputTokens: 500, OutputTokens: 150, CachedInputTokens: 50, TotalCostUsd: 0.03, NumTurns: 2}},
+	}
+	res, _ := runScriptedSession(t, scriptedSession{
+		workType:   "development",
+		repository: followUpRepository,
+		pulls:      map[int]string{7: pullAtSessionCommit},
+		platform:   platform,
+		provider: func(base agent.HarnessProvider) agent.Provider {
+			scripted := &verdictScriptProvider{HarnessProvider: base, t: t, turns: turns}
+			return &usageGateProvider{
+				verdictScriptProvider: scripted,
+				waitFirstTurnBeat: func() {
+					injectGateSeen.Store(true)
+					// Holds the first follow-up Inject until the double
+					// has recorded a usage-carrying beat at the first
+					// turn's cost, so at least one such tick lands before
+					// the second turn's cost can move the meter. A timed-
+					// out wait lets the run proceed, so the failure
+					// surfaces as the test's own assertion instead of a
+					// wedged session.
+					if !waitForStepInputs(firstTurnInputTokens, 1) {
+						injectGateFailed.Store(true)
+					}
+				},
+			}
+		},
+		lookup: func(ctx context.Context, worktreePath string, refs ...string) (map[string]string, error) {
+			lookupGateSeen.Store(true)
+			// Turn two's pull-request verification runs after the second
+			// turn's cost moved the meter but before the terminal status
+			// post stops the emitter: holding it until a beat above the
+			// first turn's cost lands keeps the emitter window open for
+			// the second distinct tick the assertions below require.
+			if !waitForStepInputs(firstTurnInputTokens+1, 1) {
+				lookupGateFailed.Store(true)
+			}
+			return originRefs(ctx, worktreePath, refs...)
+		},
+		stepHeartbeatInterval: 5 * time.Millisecond,
+	})
+	if res.Status != "completed" {
+		t.Fatalf("Status = %q (%s: %s); want completed", res.Status, res.FailureMode, res.Error)
+	}
+	if !injectGateSeen.Load() {
+		t.Fatal("inject gate never ran; the follow-up turn was not injected")
+	}
+	if injectGateFailed.Load() {
+		t.Fatal("timed out waiting for a usage-carrying step-heartbeat at the first turn's cost")
+	}
+	if !lookupGateSeen.Load() {
+		t.Fatal("lookup gate never ran; turn two's pull-request verification did not run")
+	}
+	if lookupGateFailed.Load() {
+		t.Fatal("timed out waiting for a usage-carrying step-heartbeat above the first turn's cost")
+	}
+
+	type usage struct {
+		Input  int64   `json:"inputTokens"`
+		Output int64   `json:"outputTokens"`
+		Cached int64   `json:"cachedInputTokens"`
+		Cost   float64 `json:"totalCostUsd"`
+	}
+	// Both gates above already waited for the two required beats, so one
+	// snapshot read is enough: no polling loop, no sleep.
+	var (
+		beats      []usage
+		sawNonZero bool
+	)
+	for _, raw := range platform.stepBeats() {
+		var body struct {
+			Usage *usage `json:"usage"`
+		}
+		if err := json.Unmarshal(raw, &body); err != nil {
+			t.Fatalf("step-heartbeat body is not JSON: %v", err)
+		}
+		if body.Usage == nil {
+			continue
+		}
+		beats = append(beats, *body.Usage)
+		if body.Usage.Input+body.Usage.Output > 0 {
+			sawNonZero = true
+		}
+	}
+	if len(beats) < 2 {
+		t.Fatalf("got %d usage-carrying step-heartbeats; want at least 2", len(beats))
+	}
+	if !sawNonZero {
+		t.Fatal("no step-heartbeat carried non-zero usage after the first turn")
+	}
+	for i := 1; i < len(beats); i++ {
+		if beats[i].Input < beats[i-1].Input || beats[i].Output < beats[i-1].Output ||
+			beats[i].Cached < beats[i-1].Cached || beats[i].Cost < beats[i-1].Cost {
+			t.Fatalf("step-heartbeat usage decreased: %+v -> %+v", beats[i-1], beats[i])
+		}
+	}
+	last := beats[len(beats)-1]
+	if res.Cost == nil {
+		t.Fatal("Cost = nil; want the metered total")
+	}
+	if last.Input != res.Cost.InputTokens || last.Output != res.Cost.OutputTokens ||
+		last.Cached != res.Cost.CachedInputTokens || last.Cost != res.Cost.TotalCostUsd {
+		t.Errorf("last step-heartbeat usage = %+v; want the terminal cost %+v", last, *res.Cost)
+	}
 }

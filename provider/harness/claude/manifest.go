@@ -44,6 +44,7 @@ func (*Provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:     true,
 			AcceptsAllowedToolsList:  true,
 			EmitsSubagentEvents:      true,
+			SetsParentToolUseID:      true, // stream-json parent_tool_use_id is mapped onto ParentToolUseID
 			SupportsReasoningEffort:  true,
 			SupportsOneShot:          true,
 			NativeJSONMode:           false,

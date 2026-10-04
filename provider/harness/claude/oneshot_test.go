@@ -340,8 +340,9 @@ func TestComplete_ToolsFlagIsLastAndEmpty(t *testing.T) {
 // TestBuildOneShotArgs_EffortFlagOnlyWhenKnown pins the one-shot lane's half
 // of the effort-flag gate: an unrecognised stored effort must not reach the
 // CLI as `--effort`, where it would be silently ignored in favour of the
-// operator's saved level. The env var (see oneShotEnv) already carries the
-// model default in that case.
+// operator's saved level. One-shot calls carry no execution-security stamp,
+// so no effort env var is forced — omitting the flag leaves the operator's
+// saved level in place.
 func TestBuildOneShotArgs_EffortFlagOnlyWhenKnown(t *testing.T) {
 	t.Parallel()
 	tests := []struct {

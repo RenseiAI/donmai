@@ -34,11 +34,14 @@ func (p *provider) Manifest() agent.HarnessManifest {
 			AcceptsMcpServerSpec:     c.AcceptsMcpServerSpec,
 			AcceptsAllowedToolsList:  c.AcceptsAllowedToolsList,
 			EmitsSubagentEvents:      c.EmitsSubagentEvents,
-			SupportsReasoningEffort:  c.SupportsReasoningEffort,
-			SupportsOneShot:          true,
-			NativeJSONMode:           true,
-			ToolPermissionFormat:     c.ToolPermissionFormat,
-			StreamingTransport:       "none",
+			// Manifest-only: the stub emits no parent delegation id, so the
+			// normalized ParentToolUseID field stays empty by contract.
+			SetsParentToolUseID:     false,
+			SupportsReasoningEffort: c.SupportsReasoningEffort,
+			SupportsOneShot:         true,
+			NativeJSONMode:          true,
+			ToolPermissionFormat:    c.ToolPermissionFormat,
+			StreamingTransport:      "none",
 			// The stub's scripted loop lives in this process and its
 			// Handle.Inject appends to it directly (handle.go), so the honest
 			// declaration is the in-box one — the same answer the real in-box

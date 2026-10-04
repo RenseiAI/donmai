@@ -129,6 +129,15 @@ func resolveSpec(spec Spec, g guards, canonical func(string) (string, error)) (*
 		}
 		resolved.Sockets = append(resolved.Sockets, path)
 	}
+	seenPorts := map[int]bool{}
+	for _, port := range spec.LoopbackTCPPorts {
+		if port < 1 || port > 65535 || seenPorts[port] {
+			return nil, refuse(ReasonWritableSetUnrepresentable, "declared loopback TCP port %d is invalid or repeated", port)
+		}
+		seenPorts[port] = true
+		resolved.LoopbackTCPPorts = append(resolved.LoopbackTCPPorts, port)
+	}
+	sort.Ints(resolved.LoopbackTCPPorts)
 
 	type guardPath struct{ name, path string }
 	var guardPaths []guardPath

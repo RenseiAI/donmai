@@ -398,6 +398,7 @@ type Runner struct {
 	skipSteering                  bool
 	skipPostSession               bool
 	hbInterval                    time.Duration
+	stepHeartbeatInterval         time.Duration
 	spanEmissionEnabled           bool
 	spanEndpointPath              string
 	kitSkillSources               []kit.KitSkillSource

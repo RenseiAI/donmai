@@ -195,8 +195,9 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 	// Effort is emitted only when it is a level Claude recognises: an
 	// unrecognised stored value would be silently ignored by the CLI, which
 	// then falls back to the operator's saved level while the session records
-	// a different one. The effort env var (see oneShotEnv) already carries the
-	// model default in that case.
+	// a different one. One-shot calls carry no execution-security stamp, so
+	// no effort env var is forced (see oneShotEnv) — omitting the flag
+	// leaves the operator's saved level in place.
 	if req.Effort.Known() {
 		argv = append(argv, "--effort", string(req.Effort))
 	}
@@ -211,21 +212,22 @@ func buildOneShotArgs(req agent.OneShotRequest) (argv []string, stdinPrompt stri
 // lanes. A request with no Endpoint contributes no routing env and the child
 // inherits the parent environment — which is what carries host-session auth.
 //
-// The reasoning effort is fixed the same way the agent lane fixes it
-// (effort.go): the request's effort, or the model's own default when it
-// carries none — never a level saved in the operator's settings.
+// One-shot calls carry no execution-security stamp, so they never force the
+// reasoning-effort variable: the request's --effort flag (see
+// buildOneShotArgs) is the only effort signal, and the operator's saved
+// preferences and inherited environment stay in place.
 func oneShotEnv(req agent.OneShotRequest) map[string]string {
 	if req.Endpoint == nil {
-		return withEffortEnv(nil, req.Effort)
+		return nil
 	}
 	spec, err := applyEndpoint(agent.Spec{Endpoint: req.Endpoint})
 	if err != nil {
 		// A mis-bound endpoint is reported by the CLI itself (unknown model /
 		// missing credentials) rather than silently routed to the default host;
 		// there is no endpoint env to add in that case.
-		return withEffortEnv(nil, req.Effort)
+		return nil
 	}
-	return withEffortEnv(spec.Env, req.Effort)
+	return spec.Env
 }
 
 // parseOneShotEnvelope decodes the single `--output-format json` document. It

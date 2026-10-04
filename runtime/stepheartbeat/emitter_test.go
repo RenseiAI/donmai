@@ -543,3 +543,182 @@ func TestBeatLogsGenericNon2xxAtDebugForNonAuthFailures(t *testing.T) {
 		t.Fatalf("a 404 must not be classified as an auth rejection: %s", logs)
 	}
 }
+
+// TestBeatsCarryUsageFromProvider pins the wire contract: a configured
+// UsageProvider adds the `usage` object (inputTokens, outputTokens,
+// cachedInputTokens, totalCostUsd) to every beat, so a viewer can show cost
+// so far while the session runs.
+func TestBeatsCarryUsageFromProvider(t *testing.T) {
+	t.Parallel()
+
+	var bodies []string
+	var mu sync.Mutex
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	e, err := stepheartbeat.New(stepheartbeat.Config{
+		SessionID: "s1",
+		WorkerID:  "w1",
+		BaseURL:   srv.URL,
+		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
+			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 100, CachedInputTokens: 50, TotalCostUsd: 0.01}
+		},
+		HTTPClient: srv.Client(),
+		Interval:   24 * time.Hour,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop() })
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 1 {
+		t.Fatalf("got %d beats; want the synchronous first beat", len(bodies))
+	}
+	var body struct {
+		WorkerID string `json:"workerId"`
+		Usage    *struct {
+			Input  int64   `json:"inputTokens"`
+			Output int64   `json:"outputTokens"`
+			Cached int64   `json:"cachedInputTokens"`
+			Cost   float64 `json:"totalCostUsd"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(bodies[0]), &body); err != nil {
+		t.Fatalf("beat body is not JSON: %v", err)
+	}
+	if body.Usage == nil {
+		t.Fatalf("beat body has no usage object: %s", bodies[0])
+	}
+	if body.Usage.Input != 300 || body.Usage.Output != 100 || body.Usage.Cached != 50 || body.Usage.Cost != 0.01 {
+		t.Errorf("usage = %+v; want {300 100 50 0.01}", *body.Usage)
+	}
+}
+
+// TestBeatsOmitUsageWhileNothingMetered pins backward compatibility: with no
+// provider, or while the snapshot is fully zero, the beat keeps today's
+// body shape — no `usage` key at all — so older readers see no change.
+func TestBeatsOmitUsageWhileNothingMetered(t *testing.T) {
+	t.Parallel()
+
+	cases := []struct {
+		name     string
+		provider stepheartbeat.UsageProvider
+	}{
+		{"no provider", nil},
+		{"zero snapshot", func(context.Context) stepheartbeat.UsageSnapshot { return stepheartbeat.UsageSnapshot{} }},
+	}
+	for _, tc := range cases {
+		tc := tc
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+
+			var captured atomic.Pointer[string]
+			srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+				body, _ := io.ReadAll(r.Body)
+				s := string(body)
+				captured.Store(&s)
+				w.WriteHeader(http.StatusOK)
+			})
+
+			e, err := stepheartbeat.New(stepheartbeat.Config{
+				SessionID:     "s1",
+				BaseURL:       srv.URL,
+				UsageProvider: tc.provider,
+				HTTPClient:    srv.Client(),
+				Interval:      24 * time.Hour,
+			})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if err := e.Start(context.Background()); err != nil {
+				t.Fatal(err)
+			}
+			t.Cleanup(func() { _ = e.Stop() })
+
+			got := captured.Load()
+			if got == nil {
+				t.Fatal("no beat captured")
+			}
+			if strings.Contains(*got, `"usage"`) {
+				t.Fatalf("beat body carries a usage key while nothing is metered: %s", *got)
+			}
+		})
+	}
+}
+
+// TestBeatsNeverDecreaseUsage pins the monotonic clamp: a regressed snapshot
+// is reported as the previous beat's values, so viewers never see cost so
+// far go down.
+func TestBeatsNeverDecreaseUsage(t *testing.T) {
+	t.Parallel()
+
+	var bodies []string
+	var mu sync.Mutex
+	srv := newServer(t, func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		bodies = append(bodies, string(body))
+		mu.Unlock()
+		w.WriteHeader(http.StatusOK)
+	})
+
+	var second atomic.Bool
+	e, err := stepheartbeat.New(stepheartbeat.Config{
+		SessionID: "s1",
+		BaseURL:   srv.URL,
+		UsageProvider: func(context.Context) stepheartbeat.UsageSnapshot {
+			if second.Load() {
+				return stepheartbeat.UsageSnapshot{InputTokens: 100}
+			}
+			return stepheartbeat.UsageSnapshot{InputTokens: 300, OutputTokens: 50}
+		},
+		HTTPClient: srv.Client(),
+		Interval:   5 * time.Millisecond,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := e.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = e.Stop() })
+	second.Store(true)
+
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		mu.Lock()
+		n := len(bodies)
+		mu.Unlock()
+		if n >= 2 {
+			break
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) < 2 {
+		t.Fatalf("got %d beats; want at least 2", len(bodies))
+	}
+	var last struct {
+		Usage *struct {
+			Input  int64 `json:"inputTokens"`
+			Output int64 `json:"outputTokens"`
+		} `json:"usage"`
+	}
+	if err := json.Unmarshal([]byte(bodies[len(bodies)-1]), &last); err != nil {
+		t.Fatalf("beat body is not JSON: %v", err)
+	}
+	if last.Usage == nil || last.Usage.Input != 300 || last.Usage.Output != 50 {
+		t.Fatalf("regressed snapshot reported as %+v; want the clamped {300 50}", last.Usage)
+	}
+}
