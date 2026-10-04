@@ -184,15 +184,18 @@ func TestResolveCatalogProbe(t *testing.T) {
 	}
 }
 
-// TestSpawn_NativeRouting_CatalogPreflightDeniesUnknownModel is the Spawn-
-// level end-to-end proof of requirement 2: a native builtin-provider pin
-// whose (provider, model) pair the injected CatalogProbe reports as ABSENT
-// denies Spawn itself — before any child process, before the handshake gate,
-// before the prompt ever reaches a wire. RED proof: comment out the
-// preflightCatalogCheck call in prepare() (pi.go) and this test fails,
-// because Spawn would then proceed to the (never-scripted) stdin/stdout and
-// hang/fail for an unrelated reason instead of returning THIS denial.
-func TestSpawn_NativeRouting_CatalogPreflightDeniesUnknownModel(t *testing.T) {
+// TestSpawn_NativeRouting_CatalogPreflightDeniesUnknownModelUnbound is the
+// Spawn-level end-to-end proof of requirement 2's untranslatable case: a
+// native builtin-provider pin whose (provider, model) pair the injected
+// CatalogProbe reports as ABSENT, with NO bound endpoint for the injected
+// provider to register against, denies Spawn itself — before any child
+// process, before the handshake gate, before the prompt ever reaches a
+// wire. RED proof: comment out the preflightCatalogCheck call in prepare()
+// (pi.go) and this test fails, because Spawn would then proceed to the
+// (never-scripted) stdin/stdout and hang/fail for an unrelated reason
+// instead of returning THIS denial. (A BOUND miss instead falls back to
+// the injected provider — see catalog_fallback_test.go.)
+func TestSpawn_NativeRouting_CatalogPreflightDeniesUnknownModelUnbound(t *testing.T) {
 	t.Parallel()
 	p, err := New(Options{
 		skipProcess: true,
@@ -207,14 +210,9 @@ func TestSpawn_NativeRouting_CatalogPreflightDeniesUnknownModel(t *testing.T) {
 		Prompt: "hi",
 		Cwd:    t.TempDir(),
 		Model:  "zai/glm-9.9-does-not-exist",
-		Endpoint: &agent.EndpointBinding{
-			Company: agent.CompanyOpenAI, Host: agent.HostDirect,
-			BaseURL: "https://api.z.ai/api/coding/paas/v4", Protocol: agent.ProtoOpenAIChat,
-			Env: map[string]string{"OPENAI_API_KEY": "k"},
-		},
 	})
 	if err == nil {
-		t.Fatal("Spawn succeeded for a model the catalog preflight confirmed absent")
+		t.Fatal("Spawn succeeded for a model the catalog preflight confirmed absent with no bound endpoint to fall back onto")
 	}
 	if !errors.Is(err, agent.ErrSpawnFailed) {
 		t.Errorf("Spawn error does not wrap agent.ErrSpawnFailed: %v", err)

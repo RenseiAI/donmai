@@ -47,6 +47,7 @@ const (
 	opSymlinkWrite stepOp = "symlink_write"
 	opListen       stepOp = "listen"
 	opDial         stepOp = "dial"
+	opTCPDial      stepOp = "tcp_dial"
 	opDevWrite     stepOp = "dev_write"
 	opStdout       stepOp = "stdout"
 	opReenter      stepOp = "reenter"
@@ -66,6 +67,11 @@ type probeStep struct {
 	Label    string   `json:"label,omitempty"`
 	Services []string `json:"services,omitempty"`
 	PID      int      `json:"pid,omitempty"`
+	Port     int      `json:"port,omitempty"`
+	// Host selects the dial target for the loopback TCP probe: one of
+	// "127.0.0.1", "::1" or "localhost". Empty means the IPv4
+	// loopback, so older plans keep their meaning.
+	Host string `json:"host,omitempty"`
 }
 
 type probePlan struct {
@@ -157,6 +163,8 @@ func runStep(step probeStep) stepResult {
 		err = listenAndDial(step.Path)
 	case opDial:
 		err = dial(step.Path)
+	case opTCPDial:
+		err = dialTCP(tcpHost(step.Host), step.Port)
 	case opDevWrite:
 		err = appendFile(step.Path)
 	case opStdout:
@@ -237,6 +245,29 @@ func listenAndDial(path string) error {
 
 func dial(path string) error {
 	conn, err := net.DialTimeout("unix", path, 5*time.Second)
+	if err != nil {
+		return err
+	}
+	return conn.Close()
+}
+
+// tcpHost normalizes the loopback TCP probe's dial target. The deny rule
+// names the local machine, so the probe must cover the numeric IPv4 and
+// IPv6 loopbacks and the hostname that may resolve to either.
+func tcpHost(host string) string {
+	switch host {
+	case "::1", "localhost":
+		return host
+	default:
+		return "127.0.0.1"
+	}
+}
+
+// dialTCP connects to the loopback target on one port: the probe the
+// profile's loopback deny is judged by.
+func dialTCP(host string, port int) error {
+	target := net.JoinHostPort(host, strconv.Itoa(port))
+	conn, err := net.DialTimeout("tcp", target, 5*time.Second)
 	if err != nil {
 		return err
 	}

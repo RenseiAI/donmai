@@ -8,6 +8,7 @@ import (
 	"fmt"
 	"io"
 	"log/slog"
+	"math/rand/v2"
 	"net/http"
 	"os"
 	"os/signal"
@@ -573,12 +574,17 @@ func runAgentRun(ctx context.Context, cmd *cobra.Command, opts *agentRunOpts) er
 	// (runtime/activity/poster.go) only fires after the first successful
 	// activity POST, so a credential-blocked or slow-booting agent sits
 	// indistinguishably in 'pending' with no activity — the same terminal
-	// appearance as a stuck spawn. Posting running at spawn makes a
-	// no-activity failure a distinct reap signal and unblocks the
-	// platform-side lock re-acquire path, which only passes once the
-	// session is 'running'. Best-effort + idempotent with the later
-	// maybePostRunning: the platform treats a repeated running transition
-	// as a no-op, so racing the two posts is safe.
+	// appearance as a stuck spawn. Posting running at spawn makes the claim
+	// observably alive from the first seconds of the run, so a no-activity
+	// failure is a distinct reap signal.
+	//
+	// The eager post races the later maybePostRunning, and that race is
+	// safe but NOT a no-op: the platform answers a repeated running
+	// transition with 409 Conflict rather than ignoring it. The loser of the
+	// race learns the transition already happened (maybePostRunning
+	// discards the conflict at debug; postSessionRunning below treats a 409
+	// on its own retries as "an earlier attempt landed" for the same
+	// reason).
 	if admissionErr == nil {
 		runningToken := detail.AuthToken
 		if opts.localRuntime {
@@ -627,31 +633,79 @@ func donmaiSpanTracingEnabled() bool {
 // postSessionRunningMaxAttempts bounds the eager running-post retry loop so a
 // slow or loaded host gets a few chances without delaying the run
 // indefinitely. Three attempts cover the "fails twice then returns 200"
-// case in the done-when criteria with minimal pre-spawn latency.
+// case; with the delay schedule below the loop spans at most 3 s of backoff
+// sleep (plus per-request client timeouts), staying well inside the
+// claimed-stale window the nudge exists to beat. The literal count is pinned
+// by the exhausted-retry test — do not raise it without re-checking that
+// budget.
 const postSessionRunningMaxAttempts = 3
 
 // postSessionRunningRetryDelay is the backoff between running-post attempts,
-// indexed by the attempt that just failed (1-based). A var so tests can
-// shrink it to zero without waiting out real backoff.
+// indexed by the attempt that just failed (1-based). It follows the
+// heartbeat's 1s/2s/4s exponential convention (runtime/heartbeat's
+// DefaultMaxAttemptsPerTick) with equal jitter in [base/2, base] — the same
+// shape attachclient/backoff.go applies to reconnects — so a platform
+// returning fast 5xx errors cannot burn all attempts in under a second, and
+// many workers retrying at once do not stampede in lock-step. Worst case the
+// two sleeps total 3 s (typical ~2.25 s). A var so tests can shrink it to
+// zero without waiting out real backoff.
 var postSessionRunningRetryDelay = func(failedAttempt int) time.Duration {
-	return time.Duration(200*(1<<(failedAttempt-1))) * time.Millisecond
+	return jitteredRunningRetryDelay(time.Duration(1<<(failedAttempt-1)) * time.Second)
+}
+
+// runningRetryJitterIntn is the randomness seam behind the retry backoff's
+// equal jitter. A var so tests can pin both jitter bounds deterministically.
+var runningRetryJitterIntn = rand.Int64N
+
+// jitteredRunningRetryDelay applies the repo's equal-jitter convention to a
+// base backoff: a delay in [base/2, base], never zero and never above base
+// (attachclient/backoff.go uses the identical shape for reconnects).
+func jitteredRunningRetryDelay(base time.Duration) time.Duration {
+	half := base / 2
+	if half <= 0 {
+		return base
+	}
+	return half + time.Duration(runningRetryJitterIntn(int64(half)+1)) //nolint:gosec // G404: jitter, not crypto
+}
+
+// runningPostFailedMessage is the final-failure log line for the eager
+// running post. "after N attempts" is only honest wording when N > 1 — a
+// first-attempt 4xx fails fast with zero retries behind it, and claiming
+// "after retries" there misleads whoever reads the log.
+func runningPostFailedMessage(attempts int) string {
+	if attempts > 1 {
+		return fmt.Sprintf("agent run: status=running post failed after %d attempts", attempts)
+	}
+	return "agent run: status=running post failed on the first attempt (no retries)"
 }
 
 // postSessionRunning fires an eager POST
 // /api/sessions/<id>/status with {"status":"running","workerId":"..."}
 // against the PLATFORM (not the local daemon) before the runner spawns the
 // provider. It mirrors the wire shape of runtime/activity's maybePostRunning
-// so the two are interchangeable and idempotent: the platform treats a
-// repeated running transition as a no-op.
+// so the two are interchangeable — but they are NOT idempotent on the
+// platform: a repeated running transition is answered with 409 Conflict, not
+// ignored. Two consequences:
 //
-// The post is retried with backoff up to postSessionRunningMaxAttempts on
-// transient failures (transport errors and 5xx); 4xx responses are permanent
-// and fail fast. Every failure path is best-effort — the running nudge is
-// pure observability + it unblocks the platform-side lock re-acquire path
-// (which only passes once the session is 'running'); it must never fail the
-// worker. The final failure logs at warn so a lost nudge is visible; earlier
-// attempts log at debug. A no-op when platformURL is empty (standalone /
-// no-platform mode, where there is no platform status endpoint to hit).
+//   - A 409 arriving on attempt 2 or later most likely means an earlier
+//     attempt landed (its response was lost client-side) and the session is
+//     already running. That is logged at info as success, not as the
+//     fail-fast warn every other 4xx gets. A 409 on the first attempt has no
+//     earlier attempt to credit and stays a permanent client error.
+//   - Racing the later maybePostRunning is safe only in the sense that the
+//     loser's conflict is discarded — never because the platform no-ops the
+//     repeat.
+//
+// The post is retried with the jittered backoff above up to
+// postSessionRunningMaxAttempts on transient failures (transport errors and
+// 5xx); every other 4xx response is permanent and fails fast. All failure
+// paths are best-effort — the running nudge is pure observability (it makes
+// the claim observably alive before any activity arrives); it must never
+// fail the worker. The final failure logs at warn so a lost nudge is
+// visible; earlier attempts log at debug, and a cancelled context aborts the
+// backoff silently (the run is already shutting down). A no-op when
+// platformURL is empty (standalone / no-platform mode, where there is no
+// platform status endpoint to hit).
 func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.Logger, platformURL, sessionID, workerID, authToken string) {
 	platformURL = strings.TrimSpace(platformURL)
 	if platformURL == "" {
@@ -677,7 +731,7 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(body)) //nolint:gosec // G704: platformURL is the operator-configured platform base URL (trusted daemon/session config, not request-derived input)
 		if err != nil {
 			if last {
-				logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "err", err)
+				logger.Warn(runningPostFailedMessage(attempt), "sessionId", sessionID, "attempts", attempt, "err", err)
 			} else {
 				logger.Debug("agent run: status=running new request failed", "sessionId", sessionID, "attempt", attempt, "err", err)
 			}
@@ -693,7 +747,7 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 		resp, err := client.Do(req) //nolint:gosec // G704: same trusted operator-configured URL as above
 		if err != nil {
 			if last {
-				logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "err", err)
+				logger.Warn(runningPostFailedMessage(attempt), "sessionId", sessionID, "attempts", attempt, "err", err)
 			} else {
 				logger.Debug("agent run: status=running post failed", "sessionId", sessionID, "attempt", attempt, "err", err)
 			}
@@ -710,11 +764,23 @@ func postSessionRunning(ctx context.Context, client *http.Client, logger *slog.L
 			return
 		}
 		if resp.StatusCode >= 400 && resp.StatusCode < 500 {
-			logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
+			// A 409 on a retry most likely means an earlier attempt landed:
+			// its response was lost client-side, the session is already
+			// running, and the platform answers the repeat with a conflict.
+			// That is success for this nudge — log it at info, not as the
+			// fail-fast warn every other 4xx gets. A 409 on the first attempt
+			// has no earlier attempt to credit, so it stays a permanent
+			// client error.
+			if resp.StatusCode == http.StatusConflict && attempt > 1 {
+				logger.Info("agent run: session already running — earlier running post likely landed",
+					"sessionId", sessionID, "attempt", attempt, "status", resp.StatusCode)
+				return
+			}
+			logger.Warn(runningPostFailedMessage(attempt), "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
 			return
 		}
 		if last {
-			logger.Warn("agent run: status=running post failed after retries", "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
+			logger.Warn(runningPostFailedMessage(attempt), "sessionId", sessionID, "attempts", attempt, "status", resp.StatusCode)
 			return
 		}
 		logger.Debug("agent run: status=running non-2xx", "sessionId", sessionID, "attempt", attempt, "status", resp.StatusCode)

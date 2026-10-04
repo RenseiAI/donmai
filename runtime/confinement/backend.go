@@ -67,6 +67,8 @@ type Resolved struct {
 	Pins []string
 	// Sockets are the declared sockets outside the writable set.
 	Sockets []string
+	// LoopbackTCPPorts are the declared loopback TCP ports.
+	LoopbackTCPPorts []int
 	// SessionTmp and Caches feed the environment bindings.
 	SessionTmp string
 	Caches     []Cache

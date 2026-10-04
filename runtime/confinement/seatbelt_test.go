@@ -39,7 +39,9 @@ func mustRender(t *testing.T, r *Resolved, rules []Rule) string {
 // TestRenderSeatbelt_LastMatchOrder pins the order the boundary depends on:
 // SBPL applies the last matching rule.
 func TestRenderSeatbelt_LastMatchOrder(t *testing.T) {
-	text := mustRender(t, sampleResolved(), []Rule{{Kind: RuleDenyServiceLookup, Service: "com.example.composer"}})
+	r := sampleResolved()
+	r.LoopbackTCPPorts = []int{1234}
+	text := mustRender(t, r, []Rule{{Kind: RuleDenyServiceLookup, Service: "com.example.composer"}})
 	order := []string{
 		"(allow default)",
 		"(deny file-write*)\n",
@@ -54,6 +56,8 @@ func TestRenderSeatbelt_LastMatchOrder(t *testing.T) {
 		"(deny job-creation)",
 		"(deny network-outbound (remote unix-socket))",
 		`(remote unix-socket (path-literal "/var/run/resolver"))`,
+		`(deny network-outbound (remote tcp "localhost:*"))`,
+		`(allow network-outbound (remote tcp "localhost:1234"))`,
 		`(deny mach-lookup (global-name "com.example.composer"))`,
 	}
 	last := -1
@@ -106,6 +110,7 @@ func TestRenderSeatbelt_ClosesTheWriteProxies(t *testing.T) {
 		"(deny file-mount)", "(deny file-unmount)", "(deny job-creation)", "(deny lsopen)",
 		"(deny appleevent-send)", "(deny user-preference-write)", "(deny mach-priv-task-port)", "(deny mach-task-read)",
 		"(deny mach-task-inspect)", "(deny mach-task-name)", "(deny network-outbound (remote unix-socket))",
+		`(deny network-outbound (remote tcp "localhost:*"))`,
 	} {
 		if !strings.Contains(text, rule) {
 			t.Errorf("profile lacks %s", rule)
@@ -116,6 +121,16 @@ func TestRenderSeatbelt_ClosesTheWriteProxies(t *testing.T) {
 			if !strings.Contains(text, `(global-name "`+service+`")`) {
 				t.Errorf("profile does not close the %s service %s", class.class, service)
 			}
+		}
+	}
+	// The activity-continuation pasteboard client rides the same daemon as
+	// the main pasteboard service: dropping it re-opens the clipboard.
+	for _, service := range []string{
+		"com.apple.pasteboard.1",
+		"com.apple.coreservices.uauseractivitypasteboardclient.xpc",
+	} {
+		if !strings.Contains(text, `(global-name "`+service+`")`) {
+			t.Errorf("profile does not deny the pasteboard service %s", service)
 		}
 	}
 }
@@ -197,6 +212,36 @@ func TestSbplString(t *testing.T) {
 	for _, bad := range []string{"", `a"b`, `a\b`, "a\tb", "\xff"} {
 		if _, ok := sbplString(bad); ok {
 			t.Errorf("sbplString(%q) accepted", bad)
+		}
+	}
+}
+
+// TestRenderSeatbelt_LoopbackTCPPorts: the loopback deny is always rendered,
+// and each declared port renders one allow after it so the last matching
+// rule wins. The deny names the local machine rather than one address
+// family, so narrowing it to IPv4 (tcp4) must fail this test.
+func TestRenderSeatbelt_LoopbackTCPPorts(t *testing.T) {
+	plain := mustRender(t, sampleResolved(), nil)
+	if !strings.Contains(plain, `(deny network-outbound (remote tcp "localhost:*"))`) {
+		t.Fatalf("profile lacks the loopback TCP deny:\n%s", plain)
+	}
+	if strings.Contains(plain, `(allow network-outbound (remote tcp "localhost:`) {
+		t.Fatalf("profile allows a loopback TCP port nobody declared:\n%s", plain)
+	}
+	r := sampleResolved()
+	r.LoopbackTCPPorts = []int{22, 8080}
+	text := mustRender(t, r, nil)
+	denyAt := strings.Index(text, `(deny network-outbound (remote tcp "localhost:*"))`)
+	for _, want := range []string{
+		`(allow network-outbound (remote tcp "localhost:22"))`,
+		`(allow network-outbound (remote tcp "localhost:8080"))`,
+	} {
+		at := strings.Index(text, want)
+		if at < 0 {
+			t.Fatalf("profile lacks %s:\n%s", want, text)
+		}
+		if at < denyAt {
+			t.Fatalf("%s renders before the deny; the deny would win:\n%s", want, text)
 		}
 	}
 }

@@ -6,9 +6,11 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"net"
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -372,5 +374,250 @@ func TestSeatbelt_ToolsWorkInsideTheSet(t *testing.T) {
 	}
 	if code, _ := runConfined(t, plan, w.mut, nil, "/usr/bin/touch", filepath.Join(w.home, "planted")); code == 0 || exists(filepath.Join(w.home, "planted")) {
 		t.Fatal("the confined shell wrote the operator home")
+	}
+}
+
+// TestSeatbelt_LoopbackTCPDeclaredPortsOnly is the live proof for the
+// loopback deny: listeners answer on an undeclared loopback port over the
+// numeric IPv4 and IPv6 loopbacks, the confined connects to each fail, and
+// the connects to a declared port succeed — including through the hostname,
+// which may resolve to either family.
+func TestSeatbelt_LoopbackTCPDeclaredPortsOnly(t *testing.T) {
+	openPort := freeLoopbackPort(t)
+	closedPort := freeLoopbackPort(t)
+	if openPort == closedPort {
+		t.Skip("could not allocate two distinct loopback ports")
+	}
+	openListener := startLoopbackListener(t, openPort)
+	defer func() { _ = openListener.Process.Kill(); _ = openListener.Wait() }()
+	closedListener := startLoopbackListener(t, closedPort)
+	defer func() { _ = closedListener.Process.Kill(); _ = closedListener.Wait() }()
+	waitLoopbackListener(t, closedPort)
+	// The IPv6 listeners answer on the same two ports, one declared and
+	// one not, so the test judges address family rather than port number.
+	open6, closed6 := startLoopbackListener6(t, openPort), startLoopbackListener6(t, closedPort)
+	defer closeListener6(open6)
+	defer closeListener6(closed6)
+
+	w, c := liveWorld(t)
+	spec := w.spec()
+	spec.LoopbackTCPPorts = []int{openPort}
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	for _, target := range []struct{ host, port string }{
+		{"127.0.0.1", itoaPort(openPort)},
+		{"::1", itoaPort(openPort)},
+	} {
+		if code, out := runConfined(t, plan, w.mut, nil, "/usr/bin/nc", "-z", "-w", "2", target.host, target.port); code != 0 {
+			t.Fatalf("confined nc to declared %s port %s failed: exit %d: %s", target.host, target.port, code, out)
+		}
+	}
+	for _, target := range []struct{ host, port string }{
+		{"127.0.0.1", itoaPort(closedPort)},
+		{"::1", itoaPort(closedPort)},
+		{"localhost", itoaPort(closedPort)},
+	} {
+		if code, out := runConfined(t, plan, w.mut, nil, "/usr/bin/nc", "-z", "-w", "2", target.host, target.port); code == 0 {
+			t.Fatalf("confined nc to undeclared %s port %s succeeded: %s", target.host, target.port, out)
+		}
+	}
+}
+
+// TestSeatbelt_LoopbackTCPRedWithoutDeny is the discriminating control: the
+// same two nc connects with the loopback deny stripped from the rendered
+// profile both succeed, so the test above pins the deny and nothing else.
+func TestSeatbelt_LoopbackTCPRedWithoutDeny(t *testing.T) {
+	openPort := freeLoopbackPort(t)
+	closedPort := freeLoopbackPort(t)
+	if openPort == closedPort {
+		t.Skip("could not allocate two distinct loopback ports")
+	}
+	openListener := startLoopbackListener(t, openPort)
+	defer func() { _ = openListener.Process.Kill(); _ = openListener.Wait() }()
+	closedListener := startLoopbackListener(t, closedPort)
+	defer func() { _ = closedListener.Process.Kill(); _ = closedListener.Wait() }()
+	waitLoopbackListener(t, closedPort)
+
+	w, c := liveWorld(t)
+	plan, err := c.prepare(w.spec(), "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	wrapped, err := plan.Command([]string{"/usr/bin/true"})
+	if err != nil {
+		t.Fatalf("Command: %v", err)
+	}
+	// The wrapped argv is sandbox-exec -f <profile> -- <binary>: strip the
+	// loopback deny from the rendered profile so the red control runs the
+	// same harness under the same profile minus the change under test.
+	var profilePath string
+	for i, arg := range wrapped {
+		if arg == "-f" && i+1 < len(wrapped) {
+			profilePath = wrapped[i+1]
+		}
+	}
+	if profilePath == "" {
+		t.Fatal("wrapped command names no profile file")
+	}
+	raw, err := os.ReadFile(profilePath)
+	if err != nil {
+		t.Fatal(err)
+	}
+	stripped := strings.ReplaceAll(string(raw), loopbackTCPDeny+"\n", "")
+	if stripped == string(raw) {
+		t.Fatal("rendered profile holds no loopback deny to strip")
+	}
+	redPath := profilePath + ".red"
+	if err := os.WriteFile(redPath, []byte(stripped), 0o600); err != nil { //nolint:gosec // G703: the profile path comes from the plan under test.
+		t.Fatal(err)
+	}
+	defer func() { _ = os.Remove(redPath) }()
+	red := append([]string{}, wrapped...)
+	for i, arg := range red {
+		if arg == profilePath {
+			red[i] = redPath
+		}
+	}
+	runRed := func(args ...string) int {
+		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+		defer cancel()
+		full := append(append([]string{}, red[:len(red)-1]...), args...)
+		cmd := exec.CommandContext(ctx, full[0], full[1:]...) //nolint:gosec // G204: the confined argv under test.
+		cmd.Dir = w.mut
+		cmd.Env = overlayEnv(os.Environ(), plan.Environment())
+		if err := cmd.Run(); err != nil {
+			var exitErr *exec.ExitError
+			if errors.As(err, &exitErr) {
+				return exitErr.ExitCode()
+			}
+			t.Fatalf("run %v: %v", args, err)
+		}
+		return 0
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(openPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d", openPort, code)
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(closedPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d; the red control does not discriminate", closedPort, code)
+	}
+}
+
+func itoaPort(port int) string {
+	return strconv.Itoa(port)
+}
+
+// freeLoopbackPort returns a currently free loopback TCP port: bind port
+// zero, read the assigned port, close, and hand it to nc. The nc listener
+// rebinds it immediately; a collision fails the test loudly instead of
+// passing quietly.
+func freeLoopbackPort(t *testing.T) int {
+	t.Helper()
+	listener, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skipf("no loopback listener: %v", err)
+	}
+	port := listener.Addr().(*net.TCPAddr).Port
+	_ = listener.Close()
+	return port
+}
+
+// startLoopbackListener starts an nc listener on a loopback port. The -k
+// flag keeps it answering across the readiness probe and both connects.
+func startLoopbackListener(t *testing.T, port int) *exec.Cmd {
+	t.Helper()
+	cmd := exec.Command("/usr/bin/nc", "-l", "-k", "127.0.0.1", itoaPort(port)) //nolint:gosec // G204: fixed test tool, allocated port.
+	if err := cmd.Start(); err != nil {
+		t.Skipf("nc listener on %d: %v", port, err)
+	}
+	return cmd
+}
+
+// startLoopbackListener6 listens on the IPv6 loopback in-process: the
+// stock listener tool binds IPv4 only, so the IPv6 half cannot use it.
+// It returns nil where IPv6 loopback is unavailable; the caller skips
+// the IPv6 cases rather than passing without judging them.
+func startLoopbackListener6(t *testing.T, port int) net.Listener {
+	t.Helper()
+	listener, err := net.Listen("tcp", net.JoinHostPort("::1", itoaPort(port)))
+	if err != nil {
+		t.Skipf("no IPv6 loopback listener: %v", err)
+	}
+	go func() {
+		for {
+			conn, err := listener.Accept()
+			if err != nil {
+				return
+			}
+			_ = conn.Close()
+		}
+	}()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", net.JoinHostPort("::1", itoaPort(port)), time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return listener
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	_ = listener.Close()
+	t.Fatalf("IPv6 loopback listener on %d never answered", port)
+	return nil
+}
+
+func closeListener6(listener net.Listener) {
+	if listener != nil {
+		_ = listener.Close()
+	}
+}
+
+// waitLoopbackListener waits until a loopback port accepts, so the confined
+// connects race nothing.
+func waitLoopbackListener(t *testing.T, port int) {
+	t.Helper()
+	deadline := time.Now().Add(10 * time.Second)
+	for time.Now().Before(deadline) {
+		conn, err := net.DialTimeout("tcp", "127.0.0.1:"+itoaPort(port), time.Second)
+		if err == nil {
+			_ = conn.Close()
+			return
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	t.Fatalf("nc listener on %d never answered", port)
+}
+
+// TestSeatbelt_PasteboardClosed is the live proof for the pasteboard deny:
+// the confined lookup of each pasteboard service fails while the positive
+// control still resolves, and a confined pbcopy write fails.
+func TestSeatbelt_PasteboardClosed(t *testing.T) {
+	w, c := liveWorld(t)
+	plan, err := c.prepare(w.spec(), "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	defer func() { _ = plan.Release() }()
+	pasteboardServices := []string{
+		"com.apple.pasteboard.1",
+		"com.apple.coreservices.uauseractivitypasteboardclient.xpc",
+	}
+	results := runProbeSteps(t, plan, w,
+		probeStep{ID: "pasteboard", Op: opLookup, Services: pasteboardServices},
+		probeStep{ID: "control", Op: opLookup, Services: []string{lookupControlService}},
+	)
+	for _, service := range pasteboardServices {
+		if code, ok := results["pasteboard"].Lookups[service]; !ok || code == 0 {
+			t.Errorf("confined lookup of the pasteboard service %s succeeded: %+v", service, results["pasteboard"].Lookups)
+		}
+	}
+	if code, ok := results["control"].Lookups[lookupControlService]; !ok || code != 0 {
+		t.Errorf("positive control lookup failed under the profile: %+v", results["control"].Lookups)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/sh", "-c", "echo probe | /usr/bin/pbcopy -pboard probe-test-board"); code == 0 {
+		t.Errorf("confined pbcopy succeeded: %s", out)
 	}
 }
