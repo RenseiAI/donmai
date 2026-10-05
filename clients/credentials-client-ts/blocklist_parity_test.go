@@ -20,7 +20,6 @@ import (
 	"os"
 	"path/filepath"
 	"regexp"
-	"runtime"
 	"sort"
 	"strings"
 	"testing"
@@ -28,18 +27,17 @@ import (
 	"github.com/RenseiAI/donmai/internal/credentials"
 )
 
-// tsBlocklistPath returns the absolute path to the TS blocklist file,
-// resolved relative to this test file so the test works regardless of the
-// caller's CWD (e.g. `go test ./...` from the module root, or `go test .`
-// from within this directory).
+// tsBlocklistPath returns the path to the TS blocklist file. `go test`
+// runs with the package directory as the working directory, so the path is
+// resolved from there. runtime.Caller is deliberately avoided: under
+// `-trimpath` it reports a module-relative path rather than a location on
+// disk.
 func tsBlocklistPath(t *testing.T) string {
 	t.Helper()
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		t.Fatal("runtime.Caller(0) failed")
+	dir, err := os.Getwd()
+	if err != nil {
+		t.Fatalf("getwd: %v", err)
 	}
-	// thisFile == .../donmai/clients/credentials-client-ts/blocklist_parity_test.go
-	dir := filepath.Dir(thisFile)
 	return filepath.Join(dir, "src", "blocklist.ts")
 }
 
