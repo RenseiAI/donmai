@@ -10,6 +10,49 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 No unreleased changes.
 
+## v0.72.63 — 2026-10-05
+
+### Chores
+
+- Add review verdict instruction to QA prompt template
+- Report running usage totals on the step heartbeat
+- Enforce explicit zero sub-agent cap and count the Agent delegation tool
+- Keep gateway Gemini slugs on the injected provider so effort applies
+- Force Claude effort env only on stamped headless sessions
+- Report the endpoint status, error code and reset time on a failed session
+- Carry the delegating tool-call id on sub-agent events
+- Agent run: jittered running-ack backoff, conflict-after-landing logging
+- Route unlisted built-in model pins through the injected provider
+- Deflake TestRun_StepHeartbeatsCarryNonDecreasingUsage under -race
+- Pin the loopback deny over IPv6 and the hostname, deny the activity pasteboard service
+- Let a refused founding declaration roll back so another composition can found
+- Block host injected-provider key from session env; pin spec-key mirror
+- Correct founding-refusal docs and cover refused-then-accepted plus other-org founding
+- Stream interactive pi transcript turns and tool calls to the activity feed
+- Runner continues a named pull request instead of opening a new one
+- Pin keyless catalog-miss fallback through prepare with no injected key
+- Emit typed sub-agent lifecycle events and spans for native delegation tools
+- Check commit authors, committers and co-author trailers for leaks
+- Use the bound base URL when it differs from the built-in provider URL
+- Allow rotating the credential refresher registration token
+- Carry cache-write and reasoning tokens in run cost and status post
+- Install repository dependencies before agent spawn
+- Detect diverged continued branch with a typed ancestry check
+- Decode the stop pending reason string and report delivered stops cleanly
+- Report session tool-call count on the terminal result
+- Route gateway-bound Codex sessions through a private model-provider block
+- Run pi shell and file-write tools one at a time
+- Emit typed sub-agent lifecycle for native task delegations
+- Keep work identifiers out of backstop surfaces in public repos
+- Compare the gateway-projected env in the headless session check
+- Route reasoning effort and cost by model family
+- Document sequential overrides re-enabling narrowed built-in tools
+- Scrub all tracker-id shapes from public recovery surfaces
+- Confine pi seats in both spawn modes; relocate session state
+- Fetch the continued branch by its full ref so a same-named tag cannot shadow it
+- Refuse headless resume on a different gateway route
+- Report real injected-provider cost from bound per-token prices
+
 ## v0.72.62 — 2026-10-04
 
 ### Fixes
