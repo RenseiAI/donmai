@@ -50,13 +50,15 @@ type BudgetReport struct {
 	// invocations seen across the session.
 	ObservedSubAgents int `json:"observedSubAgents"`
 
-	// ObservedTokens is the cumulative input+output token count
-	// observed across all turns: every ResultEvent.Cost, counting each
-	// token once even when a harness reports a running total (see
-	// BudgetEnforcer.resultIncrementLocked), plus the per-call usage the harness
-	// reported after its last ResultEvent — the model calls of a turn the
-	// runner stopped at the cap, which no ResultEvent will reconcile. It
-	// equals the input+output tokens of Result.Cost.
+	// ObservedTokens is the token meter the max-tokens cap is checked
+	// against (meteredTokens): input + output, plus cache reads at one
+	// tenth of their count, observed across all turns — every
+	// ResultEvent.Cost, counting each token once even when a harness
+	// reports a running total (see BudgetEnforcer.resultIncrementLocked),
+	// plus the per-call usage the harness reported after its last
+	// ResultEvent — the model calls of a turn the runner stopped at the
+	// cap, which no ResultEvent will reconcile. It equals
+	// meteredTokens(Result.Cost).
 	ObservedTokens int64 `json:"observedTokens"`
 
 	// ObservedDurationSeconds is the wall-clock the session ran for at
@@ -284,11 +286,33 @@ func wrapUpTokens(limit int64) int64 {
 // observedLocked is the live token meter: the reconciled usage plus the
 // per-call usage reported since the last ResultEvent. Called with e.mu held.
 func (e *BudgetEnforcer) observedLocked() int64 {
-	return e.metered.InputTokens + e.metered.OutputTokens + e.pending.InputTokens + e.pending.OutputTokens
+	return meteredTokens(addCost(e.metered, e.pending))
 }
 
-// resultIncrementLocked returns how many NEW tokens a ResultEvent's cost adds
-// to the session, and adds the new usage to the meter. Harnesses differ in
+// cacheReadMeterDivisor is the weight cache-read tokens carry on the token
+// meter: every tenth cache-read token counts as one. The cap was sized when
+// harnesses that cache (pi, notably) reported their whole prompt as input
+// each turn; once cache reads ride their own bucket (CostData), metering
+// input + output alone would let a session read ten times the context
+// before the cap noticed. A tenth tracks what a cache read costs relative
+// to fresh input on the providers that price it, so the cap keeps bounding
+// the work a session does without treating a cached prefix as new input.
+// The dollar cost (TotalCostUsd, and the platform's own spend controls) is
+// still the binding guard on spend: this weight only keeps the token cap
+// meaningful. Cache writes are not metered: they are a provider's own
+// pricing class for input the meter has no fixed weight for.
+const cacheReadMeterDivisor = 10
+
+// meteredTokens is the token-cap weight of a usage total: input + output,
+// plus cache reads at one tenth (cacheReadMeterDivisor). Reasoning tokens
+// are a count inside output and cache writes are not metered, so neither
+// moves it.
+func meteredTokens(c agent.CostData) int64 {
+	return c.InputTokens + c.OutputTokens + c.CachedInputTokens/cacheReadMeterDivisor
+}
+
+// resultIncrementLocked returns how many NEW metered tokens (meteredTokens) a
+// ResultEvent's cost adds to the session, and adds the new usage to the meter. Harnesses differ in
 // what that cost means once a run has more than one ResultEvent: some report
 // the usage since the previous one, others (pi, codex, gemini) report the
 // handle's running total, so a second ResultEvent repeats every token of the
@@ -325,12 +349,12 @@ func (e *BudgetEnforcer) resultIncrementLocked(cost *agent.CostData) int64 {
 	}
 	e.metered = addCost(e.metered, increment)
 	e.pending, e.lastResult = agent.CostData{}, *cost
-	return increment.InputTokens + increment.OutputTokens
+	return meteredTokens(increment)
 }
 
 // addCost returns the field-by-field sum of a and b. ReasoningTokens rides
-// along as a count inside OutputTokens; the token cap meters InputTokens +
-// OutputTokens only, so cache and reasoning classes never move the meter.
+// along as a count inside OutputTokens; the token cap meters the sum through
+// meteredTokens, where only cache reads move it beyond input + output.
 func addCost(a, b agent.CostData) agent.CostData {
 	return agent.CostData{
 		InputTokens:       a.InputTokens + b.InputTokens,
@@ -360,7 +384,7 @@ func costDifference(total, previous agent.CostData) agent.CostData {
 // usageSnapshot is the session's cumulative usage total as the meter
 // counted it: every ResultEvent increment plus the per-call usage reported
 // since the last one. The zero value means "nothing metered yet". Its
-// input+output tokens equal Report's ObservedTokens.
+// metered tokens (meteredTokens) equal Report's ObservedTokens.
 func (e *BudgetEnforcer) usageSnapshot() (in, out, cached int64, costUsd float64) {
 	cost := e.cost()
 	if cost == nil {
@@ -372,7 +396,7 @@ func (e *BudgetEnforcer) usageSnapshot() (in, out, cached int64, costUsd float64
 // cost is the session's usage as the meter counted it: every ResultEvent
 // increment plus the per-call usage reported since the last one (which has
 // tokens and calls but no dollar amount). nil when nothing was metered. Its
-// input+output tokens equal Report's ObservedTokens.
+// metered tokens (meteredTokens) equal Report's ObservedTokens.
 func (e *BudgetEnforcer) cost() *agent.CostData {
 	e.mu.Lock()
 	defer e.mu.Unlock()

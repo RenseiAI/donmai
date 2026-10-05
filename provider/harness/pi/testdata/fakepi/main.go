@@ -1,19 +1,24 @@
 // Command fakepi is a minimal stand-in for the `pi --mode rpc` JSONL-over-
-// stdio protocol, built and used ONLY by provider/harness/pi's N-instance
-// load-validation harness (../../scale_load_test.go, build tag
-// pi_scale_load). It never runs a language model and never interprets a real
-// extension file; it exists purely to give the load harness a REAL
-// subprocess to fork/exec, so spawn-latency and inject/steer-latency
-// measurements reflect real process overhead — the thing the rest of this
-// package's tests deliberately avoid by stubbing stdin/stdout over an
-// io.Pipe (Options.skipProcess) for fast, deterministic correctness checks.
+// stdio protocol. It is built by two test suites: provider/harness/pi's
+// N-instance load-validation harness (../../scale_load_test.go, build tag
+// pi_scale_load), and the runner's usage test
+// (runner/pi_cache_usage_test.go), which drives a real pi handle through
+// the runner to the terminal status post. It never runs a language model
+// and never interprets a real extension file; it exists purely to give
+// those tests a REAL subprocess to fork/exec, so the load harness measures
+// real process overhead and the usage test exercises the real event
+// mapping — the things the rest of this package's tests deliberately avoid
+// by stubbing stdin/stdout over an io.Pipe (Options.skipProcess) for fast,
+// deterministic correctness checks.
 //
 // It reproduces exactly the wire shapes provider/harness/pi/handle.go
 // expects — the SAME shapes that package's own handle_test.go scripts by
 // hand (handshakeEvent, getStateResponse, uiRequest): a `--version` probe,
 // the extension_ui_request handshake carrying the donmai marker/token/sha,
 // get_state, and prompt/steer/follow_up/abort commands answered with
-// message_update/message_end/turn_end/agent_settled events.
+// message_update/message_end/turn_end/agent_settled events. Every turn_end
+// carries the same fixture usage (turnUsage*), in pi's own shape: input
+// excludes the cache-read and cache-write buckets.
 //
 // This file lives under testdata/ so the Go toolchain's own `...` pattern
 // exclusion keeps it out of every ordinary `go build ./...` / `go vet ./...`
@@ -45,6 +50,21 @@ const (
 	uiMarker     = "donmai-policy-v1"
 	handshakeKey = "handshake"
 )
+
+// The usage every turn reports on its turn_end, in pi's AssistantMessage
+// usage shape. Fixed values so a test can assert exactly what one turn
+// carries through the mapper, the runner and the status post.
+const (
+	turnUsageInput      = 1200
+	turnUsageOutput     = 80
+	turnUsageCacheRead  = 48000
+	turnUsageCacheWrite = 512
+)
+
+// replyEnvVar overrides the assistant text every turn replies with (default
+// "ok"), so a runner test can end a session on the verdict its work type
+// needs.
+const replyEnvVar = "FAKEPI_REPLY"
 
 func main() {
 	for _, a := range os.Args[1:] {
@@ -106,18 +126,31 @@ func main() {
 	}
 }
 
-// runTurn emits one minimal, complete turn: agent_start, one text delta, and
-// the terminal agent_settled — enough for handle.go's mapEvent to produce an
-// AssistantTextEvent followed by a ResultEvent, which is what the load
-// harness's consumeEvents-equivalent waits on.
+// runTurn emits one minimal, complete turn: agent_start, one text delta, a
+// turn_end carrying the fixture usage, and the terminal agent_settled —
+// enough for handle.go's mapEvent to produce an AssistantTextEvent, an
+// LlmCallEvent and a ResultEvent, which is what the load harness's
+// consumeEvents-equivalent and the runner wait on.
 func runTurn(out *bufio.Writer) {
+	reply := os.Getenv(replyEnvVar)
+	if reply == "" {
+		reply = "ok"
+	}
 	writeEvent(out, map[string]any{"type": "agent_start"})
 	writeEvent(out, map[string]any{
 		"type":                  "message_update",
-		"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": "ok"},
+		"assistantMessageEvent": map[string]any{"type": "text_delta", "delta": reply},
 	})
 	writeEvent(out, map[string]any{"type": "message_end"})
-	writeEvent(out, map[string]any{"type": "turn_end"})
+	writeEvent(out, map[string]any{"type": "turn_end", "message": map[string]any{
+		"role": "assistant",
+		"usage": map[string]any{
+			"input":      turnUsageInput,
+			"output":     turnUsageOutput,
+			"cacheRead":  turnUsageCacheRead,
+			"cacheWrite": turnUsageCacheWrite,
+		},
+	}})
 	writeEvent(out, map[string]any{"type": "agent_settled"})
 }
 

@@ -831,3 +831,67 @@ func TestLineMapper_NonDelegationToolsEmitNoSubagentEvent(t *testing.T) {
 		}
 	}
 }
+
+// TestMapLine_CacheWriteTokens pins the Anthropic cache-write bucket on both
+// usage carriers: a complete assistant message's per-call usage and the
+// terminal result's session usage. input_tokens excludes both cache classes,
+// so cache_creation_input_tokens must ride CacheWriteTokens; before it was
+// read, every cache write a session made (billed above the input price) was
+// dropped before the status post.
+func TestMapLine_CacheWriteTokens(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name string
+		line string
+		want agent.CostData
+	}{
+		{
+			name: "assistant usage carries every class",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":30,"cache_read_input_tokens":16526,"cache_creation_input_tokens":1200},"content":[{"type":"text","text":"done"}]}}`,
+			want: agent.CostData{InputTokens: 4, OutputTokens: 30, CachedInputTokens: 16526, CacheWriteTokens: 1200},
+		},
+		{
+			name: "assistant usage with only a cache write is still usage",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","usage":{"cache_creation_input_tokens":900},"content":[]}}`,
+			want: agent.CostData{CacheWriteTokens: 900},
+		},
+		{
+			name: "assistant usage without a cache write reports none",
+			line: `{"type":"assistant","message":{"model":"claude-opus-4","stop_reason":"end_turn","usage":{"input_tokens":4,"output_tokens":30,"cache_read_input_tokens":80},"content":[]}}`,
+			want: agent.CostData{InputTokens: 4, OutputTokens: 30, CachedInputTokens: 80},
+		},
+		{
+			name: "result usage carries every class",
+			line: `{"type":"result","subtype":"success","is_error":false,"num_turns":3,"total_cost_usd":1.25,"usage":{"input_tokens":12,"output_tokens":900,"cache_read_input_tokens":250000,"cache_creation_input_tokens":42000}}`,
+			want: agent.CostData{InputTokens: 12, OutputTokens: 900, CachedInputTokens: 250000, CacheWriteTokens: 42000, TotalCostUsd: 1.25, NumTurns: 3},
+		},
+		{
+			name: "result usage without a cache write reports none",
+			line: `{"type":"result","subtype":"success","is_error":false,"num_turns":1,"usage":{"input_tokens":5,"output_tokens":8,"cache_read_input_tokens":16526}}`,
+			want: agent.CostData{InputTokens: 5, OutputTokens: 8, CachedInputTokens: 16526, NumTurns: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			var got *agent.CostData
+			for _, ev := range mapLine([]byte(tt.line)) {
+				switch e := ev.(type) {
+				case agent.LlmCallEvent:
+					got = &agent.CostData{
+						InputTokens: e.InputTokens, OutputTokens: e.OutputTokens,
+						CachedInputTokens: e.CachedInputTokens, CacheWriteTokens: e.CacheWriteTokens,
+					}
+				case agent.ResultEvent:
+					got = e.Cost
+				}
+			}
+			if got == nil {
+				t.Fatalf("no usage-carrying event mapped from %s", tt.line)
+			}
+			if *got != tt.want {
+				t.Errorf("usage = %+v; want %+v", *got, tt.want)
+			}
+		})
+	}
+}

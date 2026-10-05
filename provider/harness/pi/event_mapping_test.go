@@ -293,3 +293,123 @@ func TestMapEvent_MessageEndProviderError_Upstream(t *testing.T) {
 		t.Errorf("Upstream.ResetAt = %q, want 1777673400", sys.Upstream.ResetAt)
 	}
 }
+
+// TestMapEvent_TurnEndCacheBuckets pins that pi's cache buckets survive the
+// mapper. pi reports usage as {input, output, cacheRead, cacheWrite} with
+// input already excluding both cache classes; before this mapping only input
+// and output were read, so every cache read and write a pi session made was
+// dropped before it reached the runner, the budget meter or the status post.
+// Each turn's LlmCallEvent must carry its own buckets, and the terminal
+// ResultEvent's Cost must carry their whole-session sums.
+func TestMapEvent_TurnEndCacheBuckets(t *testing.T) {
+	t.Parallel()
+
+	type usage = map[string]any
+	tests := []struct {
+		name         string
+		suppressCost bool
+		turns        []usage
+		wantCalls    []agent.LlmCallEvent
+		wantCost     agent.CostData
+	}{
+		{
+			name: "cache reads accumulate across turns",
+			turns: []usage{
+				{"input": float64(1200), "output": float64(80), "cacheRead": float64(48000), "cacheWrite": float64(0), "cost": usage{"total": 0.01}},
+				{"input": float64(1200), "output": float64(80), "cacheRead": float64(48000), "cacheWrite": float64(0), "cost": usage{"total": 0.02}},
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 1200, OutputTokens: 80, CachedInputTokens: 48000},
+				{InputTokens: 1200, OutputTokens: 80, CachedInputTokens: 48000},
+			},
+			wantCost: agent.CostData{InputTokens: 2400, OutputTokens: 160, CachedInputTokens: 96000, TotalCostUsd: 0.03, NumTurns: 2},
+		},
+		{
+			name: "a cache write then a read of the written prefix",
+			turns: []usage{
+				{"input": float64(500), "output": float64(40), "cacheRead": float64(0), "cacheWrite": float64(3000)},
+				{"input": float64(200), "output": float64(20), "cacheRead": float64(3000), "cacheWrite": float64(0)},
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 500, OutputTokens: 40, CacheWriteTokens: 3000},
+				{InputTokens: 200, OutputTokens: 20, CachedInputTokens: 3000},
+			},
+			wantCost: agent.CostData{InputTokens: 700, OutputTokens: 60, CachedInputTokens: 3000, CacheWriteTokens: 3000, NumTurns: 2},
+		},
+		{
+			name: "token-suffixed spellings are read too",
+			turns: []usage{
+				{"inputTokens": float64(10), "outputTokens": float64(5), "cacheReadTokens": float64(90), "cacheWriteTokens": float64(7)},
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 10, OutputTokens: 5, CachedInputTokens: 90, CacheWriteTokens: 7},
+			},
+			wantCost: agent.CostData{InputTokens: 10, OutputTokens: 5, CachedInputTokens: 90, CacheWriteTokens: 7, NumTurns: 1},
+		},
+		{
+			name:         "an unpriced injected lane keeps cache usage without a dollar total",
+			suppressCost: true,
+			turns: []usage{
+				{"input": float64(100), "output": float64(50), "cacheRead": float64(4000), "cacheWrite": float64(0), "cost": usage{"total": float64(0)}},
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 100, OutputTokens: 50, CachedInputTokens: 4000},
+			},
+			wantCost: agent.CostData{InputTokens: 100, OutputTokens: 50, CachedInputTokens: 4000, NumTurns: 1},
+		},
+		{
+			name: "a turn without cache buckets reports none",
+			turns: []usage{
+				{"input": float64(3), "output": float64(2)},
+			},
+			wantCalls: []agent.LlmCallEvent{
+				{InputTokens: 3, OutputTokens: 2},
+			},
+			wantCost: agent.CostData{InputTokens: 3, OutputTokens: 2, NumTurns: 1},
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			st := &mapperState{suppressCost: tt.suppressCost}
+			for i, u := range tt.turns {
+				events, terminal := mapEvent(rawEvent{
+					Type:   "turn_end",
+					Fields: map[string]any{"message": map[string]any{"role": "assistant", "usage": u}},
+				}, st)
+				if terminal || len(events) != 1 {
+					t.Fatalf("turn %d: terminal=%v events=%d; want one non-terminal event", i, terminal, len(events))
+				}
+				call, ok := events[0].(agent.LlmCallEvent)
+				if !ok {
+					t.Fatalf("turn %d: event %T; want LlmCallEvent", i, events[0])
+				}
+				want := tt.wantCalls[i]
+				if call.InputTokens != want.InputTokens || call.OutputTokens != want.OutputTokens ||
+					call.CachedInputTokens != want.CachedInputTokens || call.CacheWriteTokens != want.CacheWriteTokens {
+					t.Errorf("turn %d: tokens in=%d out=%d cacheRead=%d cacheWrite=%d; want in=%d out=%d cacheRead=%d cacheWrite=%d",
+						i, call.InputTokens, call.OutputTokens, call.CachedInputTokens, call.CacheWriteTokens,
+						want.InputTokens, want.OutputTokens, want.CachedInputTokens, want.CacheWriteTokens)
+				}
+			}
+			events, terminal := mapEvent(rawEvent{Type: "agent_settled", Fields: map[string]any{}}, st)
+			if !terminal || len(events) != 1 {
+				t.Fatalf("settle: terminal=%v events=%d; want one terminal event", terminal, len(events))
+			}
+			res, ok := events[0].(agent.ResultEvent)
+			if !ok || res.Cost == nil {
+				t.Fatalf("settle: %#v; want a ResultEvent carrying Cost", events[0])
+			}
+			got := *res.Cost
+			// The dollar sum is float arithmetic; compare it with a tolerance
+			// and the token classes exactly.
+			if diff := got.TotalCostUsd - tt.wantCost.TotalCostUsd; diff > 1e-12 || diff < -1e-12 {
+				t.Errorf("terminal TotalCostUsd = %v; want %v", got.TotalCostUsd, tt.wantCost.TotalCostUsd)
+			}
+			got.TotalCostUsd = tt.wantCost.TotalCostUsd
+			if got != tt.wantCost {
+				t.Errorf("terminal Cost = %+v; want %+v", got, tt.wantCost)
+			}
+		})
+	}
+}

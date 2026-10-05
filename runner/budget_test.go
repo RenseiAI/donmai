@@ -336,8 +336,9 @@ func TestBudgetEnforcer_WrapUpPoint(t *testing.T) {
 // TestBudgetEnforcer_CarriesEveryTokenClass pins that cache-write and
 // reasoning tokens ride the meter into the reported cost: per-call usage
 // accumulates them, a running-total ResultEvent reconciles them by
-// difference, and addCost sums them — while the token-cap meter still
-// counts input+output only.
+// difference, and addCost sums them — while the token-cap meter counts
+// input + output plus cache reads at a tenth, never cache writes or
+// reasoning.
 func TestBudgetEnforcer_CarriesEveryTokenClass(t *testing.T) {
 	t.Parallel()
 	turn := func(in, out, cached, written, reasoning int64) agent.LlmCallEvent {
@@ -387,8 +388,10 @@ func TestBudgetEnforcer_CarriesEveryTokenClass(t *testing.T) {
 	if got == nil || *got != want {
 		t.Fatalf("reconciled cost = %+v; want %+v", got, want)
 	}
-	if rep := enf.Report(time.Now()); rep.ObservedTokens != 410 {
-		t.Fatalf("ObservedTokens = %d; want 410 (input+output only)", rep.ObservedTokens)
+	// 10 input + 400 output + 16,526 cache reads / 10 = 2,062; the 2,400
+	// cache writes and 80 reasoning tokens do not move the meter.
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 2_062 {
+		t.Fatalf("ObservedTokens = %d; want 2062 (input + output + cache reads / 10)", rep.ObservedTokens)
 	}
 }
 
@@ -410,8 +413,9 @@ func TestBudgetEnforcer_MetersWithoutABudget(t *testing.T) {
 	if got := enf.cost(); got == nil || *got != want {
 		t.Fatalf("cost = %+v; want %+v", got, want)
 	}
-	if rep := enf.Report(time.Now()); rep.ObservedTokens != 450 || rep.Enforced || rep.CapBreached != "" {
-		t.Fatalf("Report = %+v; want 450 observed, not enforced, no breach", rep)
+	// 340 input + 110 output + 20 cache reads / 10.
+	if rep := enf.Report(time.Now()); rep.ObservedTokens != 452 || rep.Enforced || rep.CapBreached != "" {
+		t.Fatalf("Report = %+v; want 452 observed, not enforced, no breach", rep)
 	}
 	if NewBudgetEnforcer(nil, time.Now()).cost() != nil {
 		t.Fatal("cost of a session that metered nothing; want nil")
@@ -621,5 +625,77 @@ func TestIsBudgetExceeded(t *testing.T) {
 	}
 	if !IsBudgetExceeded(&BudgetExceededError{Cap: CapTokens, Detail: "x"}) {
 		t.Fatalf("BudgetExceededError should be detected")
+	}
+}
+
+// TestBudgetEnforcer_CacheReadsMeterAtATenth pins the token cap's weight for
+// cache reads. A harness that reports its cached prefix as cache reads, not
+// as input (pi, once its cache buckets are mapped), would otherwise read ten
+// times the context before the cap noticed; each cache-read token therefore
+// counts a tenth toward the cap, on the live per-call meter and on the
+// reconciled ResultEvent meter alike. Cache writes never move it.
+func TestBudgetEnforcer_CacheReadsMeterAtATenth(t *testing.T) {
+	t.Parallel()
+	call := func(in, out, cached, written int64) agent.LlmCallEvent {
+		return agent.LlmCallEvent{
+			InputTokens: in, OutputTokens: out, CachedInputTokens: cached, CacheWriteTokens: written,
+			UsageSource: agent.LlmUsageProvider,
+		}
+	}
+	cases := []struct {
+		name       string
+		events     []agent.Event
+		wantTokens int64
+		wantBreach string
+	}{
+		{
+			name:       "cache reads at a tenth stay within the cap",
+			events:     []agent.Event{call(100, 0, 9_000, 0)},
+			wantTokens: 1_000,
+		},
+		{
+			name:       "cache reads alone can cross the cap",
+			events:     []agent.Event{call(100, 0, 9_000, 0), call(0, 0, 20, 0)},
+			wantTokens: 1_002,
+			wantBreach: "max-tokens exceeded: observed=1002 limit=1000",
+		},
+		{
+			name:       "cache writes never move the meter",
+			events:     []agent.Event{call(100, 50, 0, 50_000)},
+			wantTokens: 150,
+		},
+		{
+			name: "a running-total result meters its cache reads once",
+			events: []agent.Event{
+				call(100, 10, 4_000, 0),
+				agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 100, OutputTokens: 10, CachedInputTokens: 4_000, NumTurns: 1}},
+				call(100, 10, 4_000, 0),
+				agent.ResultEvent{Success: true, Cost: &agent.CostData{InputTokens: 200, OutputTokens: 20, CachedInputTokens: 8_000, NumTurns: 2}},
+			},
+			wantTokens: 1_020,
+			wantBreach: "max-tokens exceeded: observed=1020 limit=1000",
+		},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Parallel()
+			enf := NewBudgetEnforcer(&prompt.StageBudget{MaxTokens: 1_000}, time.Now())
+			var breach *BudgetExceededError
+			for _, ev := range tc.events {
+				if err := enf.ObserveEvent(ev); err != nil && breach == nil {
+					breach = err
+				}
+			}
+			rep := enf.Report(time.Now())
+			if rep.ObservedTokens != tc.wantTokens {
+				t.Errorf("ObservedTokens = %d; want %d", rep.ObservedTokens, tc.wantTokens)
+			}
+			switch {
+			case tc.wantBreach == "" && breach != nil:
+				t.Errorf("breach = %v; want none", breach)
+			case tc.wantBreach != "" && (breach == nil || breach.Detail != tc.wantBreach):
+				t.Errorf("breach = %v; want %q", breach, tc.wantBreach)
+			}
+		})
 	}
 }

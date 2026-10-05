@@ -454,8 +454,9 @@ type StageBudget struct {
 	MaxSubAgents *int `json:"maxSubAgents,omitempty"`
 
 	// MaxTokens is the cap on total token consumption (input + output
-	// across all turns, summed from per-turn ResultEvent.Cost or the
-	// roll-up CostData on terminal). 0 = no cap.
+	// across all turns, plus cache-read tokens at one tenth of their
+	// count, summed from per-turn ResultEvent.Cost or the roll-up
+	// CostData on terminal). 0 = no cap.
 	MaxTokens int64 `json:"maxTokens,omitempty"`
 }
 
