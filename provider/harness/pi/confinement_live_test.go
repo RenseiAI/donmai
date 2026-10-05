@@ -134,6 +134,7 @@ func liveConfinementDirs(t *testing.T) *piConfinementDirs {
 			stateHome:  filepath.Join(base, "state"),
 			profileDir: filepath.Join(base, "state", "profiles"),
 			scratchDir: filepath.Join(base, "scratch"),
+			cacheDir:   filepath.Join(base, "state", "selftest-cache"),
 		}
 		for _, dir := range []string{dirs.home, dirs.stateHome, dirs.profileDir} {
 			if err := os.MkdirAll(dir, 0o700); err != nil {
@@ -1030,4 +1031,54 @@ func TestPiConfinement_ReadScopeConfinesReads(t *testing.T) {
 			t.Errorf("CONTROL with reads open: %s failed, so the test cannot discriminate:\n%s", key, r.raw)
 		}
 	}
+}
+
+// TestPiConfinement_SecondWorkerReusesTheSelfTest: every seat is its own
+// worker process, so the in-process confiner cache starts empty each time.
+// After one worker's self-test passes, the next worker's confinement setup —
+// the confiner (self-test from the host cache) plus the session plan under
+// the read scope — takes under a second, reusing the same record.
+func TestPiConfinement_SecondWorkerReusesTheSelfTest(t *testing.T) {
+	w := newLiveWorld(t)
+	bin := writeLiveHarness(t, w)
+	dirs := liveConfinementDirs(t)
+	exe, err := os.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	first, err := ensurePiConfiner(liveCtx(t), bin, *dirs, []string{exe})
+	if err != nil {
+		t.Fatalf("first worker: %v", err)
+	}
+	firstRecord, _ := first.SelfTestRecord()
+
+	// A new worker process: nothing cached in memory.
+	piConfinerCache.Lock()
+	piConfinerCache.entries = nil
+	piConfinerCache.Unlock()
+
+	p := &Provider{binary: bin, opts: Options{ConfinementReadScope: agent.FileReadWorkarea, RequireConfinement: true, confinementDirs: dirs}}
+	start := time.Now()
+	second, err := ensurePiConfiner(liveCtx(t), bin, *dirs, []string{exe})
+	if err != nil {
+		t.Fatalf("second worker: %v", err)
+	}
+	layout, err := materializeExtensionForSpec(w.spec(), true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	plan, err := p.confineSession(w.spec(), layout, second)
+	setup := time.Since(start)
+	if err != nil {
+		t.Fatalf("second worker's session plan: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	secondRecord, _ := second.SelfTestRecord()
+	if secondRecord.Digest != firstRecord.Digest {
+		t.Fatalf("the second worker probed again: record %s, want the cached %s", secondRecord.Digest, firstRecord.Digest)
+	}
+	if setup >= time.Second {
+		t.Fatalf("the second worker's confinement setup took %s, want under 1s", setup)
+	}
+	t.Logf("second worker confinement setup: %s", setup.Round(time.Millisecond))
 }

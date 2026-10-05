@@ -628,6 +628,50 @@ func TestSeatbelt_PasteboardClosed(t *testing.T) {
 	}
 }
 
+// TestSeatbelt_SelfTestCachedAcrossProcesses: a passing self-test is kept
+// under the host state home, and a later process on the same host — a new
+// confiner with the same backend, probe and harness executables and host
+// directories — reuses it in well under a second instead of probing again,
+// with the same record.
+func TestSeatbelt_SelfTestCachedAcrossProcesses(t *testing.T) {
+	home, stateHome, profileDir := hostDirs(t)
+	newConfiner := func() *Confiner {
+		c, err := New(Options{Backend: DefaultBackend(), ProfileDir: profileDir, Home: home, StateHome: stateHome, ExecutableDigest: "sha256:test"})
+		if err != nil {
+			t.Fatalf("New: %v", err)
+		}
+		return c
+	}
+	opts := SelfTestOptions{ProbeCommand: probeCommand(t), ScratchDir: shortTempDir(t, "dcs"), CacheDir: filepath.Join(stateHome, "selftest-cache")}
+	ctx, cancel := context.WithTimeout(context.Background(), 4*time.Minute)
+	defer cancel()
+	start := time.Now()
+	first, err := newConfiner().SelfTest(ctx, opts)
+	if err != nil {
+		t.Fatalf("first SelfTest: %v\n%s", err, failureIDs(first))
+	}
+	cold := time.Since(start)
+	start = time.Now()
+	again := newConfiner()
+	second, err := again.SelfTest(ctx, opts)
+	warm := time.Since(start)
+	if err != nil {
+		t.Fatalf("second SelfTest: %v", err)
+	}
+	if second.Digest != first.Digest {
+		t.Fatalf("the second process probed again: record %s, want the cached %s", second.Digest, first.Digest)
+	}
+	if warm >= time.Second {
+		t.Fatalf("the cached self-test took %s, want under 1s", warm)
+	}
+	if _, err := again.Prepare(Spec{SessionMode: agent.PromptModeAutonomous}); err != nil {
+		if reason, _ := ReasonOf(err); reason == ReasonSelfTestFailed || reason == ReasonSelfTestStale {
+			t.Fatalf("Prepare refused a cached passing self-test: %v", err)
+		}
+	}
+	t.Logf("self-test: %s probing, %s from the cache", cold.Round(time.Millisecond), warm.Round(time.Millisecond))
+}
+
 // openReadsBackend is the real macOS backend rendering every session with
 // reads open: the read-scope rules, and only they, are missing.
 type openReadsBackend struct{ *seatbeltBackend }

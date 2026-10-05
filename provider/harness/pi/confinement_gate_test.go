@@ -400,9 +400,9 @@ func TestNew_HostReadScopeOnlyTightens(t *testing.T) {
 }
 
 // TestSessionReadScope_DeclaresWhatASeatReads pins the read paths a
-// confined pi seat gets beside its workarea: pi's own install root, git's
-// user configuration under the operator home, and the host's declared
-// paths — and nothing at all without a read scope.
+// confined pi seat gets beside its workarea: pi's own install root, the
+// git, npm and pnpm user configuration under the operator home, and the
+// host's declared paths — and nothing at all without a read scope.
 func TestSessionReadScope_DeclaresWhatASeatReads(t *testing.T) {
 	t.Parallel()
 	base, err := filepath.EvalSymlinks(t.TempDir())
@@ -426,6 +426,9 @@ func TestSessionReadScope_DeclaresWhatASeatReads(t *testing.T) {
 		filepath.Join(base, "prefix", "lib", "node_modules"),
 		filepath.Join(home, ".gitconfig"),
 		filepath.Join(home, ".config", "git"),
+		filepath.Join(home, ".npmrc"),
+		filepath.Join(home, "Library", "Preferences", "pnpm"),
+		filepath.Join(home, ".config", "pnpm"),
 		"/host/declared",
 	}
 	if reads.level != agent.FileReadWorkarea || !slices.Equal(reads.paths, want) {

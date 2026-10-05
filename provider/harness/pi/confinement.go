@@ -69,13 +69,14 @@ import (
 // (Options.ConfinementReadScope, or DONMAI_PI_CONFINEMENT_READ=workarea,
 // which also requires confinement). Under the workarea read scope the
 // harness reads its writable set and read-only leaves, the runtime and
-// toolchain paths the backend declares, pi's own install root, git's user
-// configuration under the operator home (git treats an unreadable one as
-// fatal), and the paths the host declares (Options.ConfinementReadPaths,
-// DONMAI_PI_CONFINEMENT_READ_PATHS) — per-session credential or
-// configuration files an embedder places outside the workarea. Everything
-// else refuses file contents and directory listings; metadata stays
-// readable. The read settings are host-owned: a work item cannot set them.
+// toolchain paths the backend declares, pi's own install root, the git, npm
+// and pnpm user configuration under the operator home (homeReadPaths; the
+// npm one is secret-bearing), and the paths the host declares
+// (Options.ConfinementReadPaths, DONMAI_PI_CONFINEMENT_READ_PATHS) —
+// per-session credential or configuration files an embedder places outside
+// the workarea. Everything else refuses file contents and directory
+// listings; metadata stays readable. The read settings are host-owned: a
+// work item cannot set them.
 //
 // When confinement applies: exactly when it is requested
 // (piConfinementEnabled, ADR-2026-10-03 D5.1) — the host's own configuration
@@ -234,6 +235,9 @@ type piConfinementDirs struct {
 	home       string
 	stateHome  string
 	scratchDir string
+	// cacheDir keeps a passing self-test for later worker processes on
+	// this host (confinement.SelfTestOptions.CacheDir). Empty disables it.
+	cacheDir string
 }
 
 // productionConfinementDirs resolves the host directories from the operator
@@ -246,6 +250,7 @@ func productionConfinementDirs() piConfinementDirs {
 		home:       home,
 		stateHome:  statehome.StateDir(""),
 		scratchDir: filepath.Join(os.TempDir(), "pi-confinement-selftest"),
+		cacheDir:   statehome.StateDir("confinement-selftest"),
 	}
 }
 
@@ -309,10 +314,9 @@ type piReadScope struct {
 // sessionReadScope returns the read scope for this provider's confined
 // sessions. Under a read scope a pi seat may also read pi's own install
 // (the binary's install root: its node_modules tree, or its directory),
-// git's user configuration — git treats an unreadable one as fatal, so it
-// is declared whether or not it exists — and the paths the host declares.
-// pi's own configuration lives in the session state (PI_CODING_AGENT_DIR),
-// inside the workarea already.
+// the user configuration of the tools a seat runs (homeReadPaths), and the
+// paths the host declares. pi's own configuration lives in the session
+// state (PI_CODING_AGENT_DIR), inside the workarea already.
 func (p *Provider) sessionReadScope(home string) (piReadScope, error) {
 	if p.opts.ConfinementReadScope == "" {
 		return piReadScope{}, nil
@@ -322,11 +326,36 @@ func (p *Provider) sessionReadScope(home string) (piReadScope, error) {
 		return piReadScope{}, fmt.Errorf("%w: pi confinement read scope: %v", agent.ErrSpawnFailed, err)
 	}
 	paths := []string{root}
-	if home != "" {
-		paths = append(paths, filepath.Join(home, ".gitconfig"), filepath.Join(home, ".config", "git"))
-	}
+	paths = append(paths, homeReadPaths(home)...)
 	paths = append(paths, p.opts.ConfinementReadPaths...)
 	return piReadScope{level: p.opts.ConfinementReadScope, paths: paths}, nil
+}
+
+// homeReadPaths are the user configuration files and directories under the
+// operator home that the tools a seat runs read, declared whether or not
+// they exist:
+//
+//   - git's user configuration (~/.gitconfig, ~/.config/git): git treats an
+//     unreadable one as fatal;
+//   - npm's user configuration (~/.npmrc), which pnpm reads too, and
+//     pnpm's global configuration (~/Library/Preferences/pnpm on macOS,
+//     ~/.config/pnpm elsewhere): pnpm 12 refuses to start when it cannot
+//     read its global configuration.
+//
+// ~/.npmrc is secret-bearing: it holds the registry tokens private
+// installs authenticate with, so declaring it keeps the reach a seat had
+// with reads open, until those credentials are injected per session.
+func homeReadPaths(home string) []string {
+	if home == "" {
+		return nil
+	}
+	return []string{
+		filepath.Join(home, ".gitconfig"),
+		filepath.Join(home, ".config", "git"),
+		filepath.Join(home, ".npmrc"),
+		filepath.Join(home, "Library", "Preferences", "pnpm"),
+		filepath.Join(home, ".config", "pnpm"),
+	}
 }
 
 // piConfinerEntry is one cached, self-tested confiner.
@@ -349,7 +378,11 @@ var piConfinerCache struct {
 // binary changes, its digest changes, the old entry no longer matches, and
 // the cached attestation is not reused — the new binary earns its own
 // self-test record. A process that cannot run the self-test fails here,
-// before any harness spawns.
+// before any harness spawns. Each worker is its own process, so a passing
+// self-test is also kept on disk (dirs.cacheDir): a later worker reuses it
+// while the backend, probe set, harness and worker executables and host
+// directories are unchanged and the record is under a day old, instead of
+// probing again on every seat start.
 func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs, probeCommand []string) (*confinement.Confiner, error) {
 	backend := confinement.DefaultBackend()
 	if backend == nil {
@@ -394,6 +427,7 @@ func ensurePiConfiner(ctx context.Context, binary string, dirs piConfinementDirs
 		ProbeCommand: probeCommand,
 		ScratchDir:   dirs.scratchDir,
 		Timeout:      piSelfTestTimeout,
+		CacheDir:     dirs.cacheDir,
 	}); err != nil {
 		return nil, fmt.Errorf("%w: pi confinement self-test: %v", agent.ErrSpawnFailed, err)
 	}
@@ -445,7 +479,11 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 	// GOPATH holds the checksum database's state beside the module cache;
 	// pnpm reads its store location from NPM_CONFIG_STORE_DIR up to
 	// version 10 and from PNPM_CONFIG_STORE_DIR after, so both name the
-	// one per-session store.
+	// one per-session store. XDG_RUNTIME_DIR is the per-user runtime
+	// directory tools keep cross-process locks in: pnpm 12 takes its store
+	// operation locks there, and in a fixed shared directory under /tmp
+	// otherwise, which the confinement denies. The store is per-session, so
+	// its lock domain is too.
 	pnpmStore := filepath.Join(cacheBase, "pnpm-store")
 	caches := []confinement.Cache{
 		{Env: "GOCACHE", Dir: filepath.Join(cacheBase, "go-build")},
@@ -454,6 +492,7 @@ func confinePiSession(spec agent.Spec, layout sessionLayout, confiner *confineme
 		{Env: "NPM_CONFIG_CACHE", Dir: filepath.Join(cacheBase, "npm")},
 		{Env: "NPM_CONFIG_STORE_DIR", Dir: pnpmStore},
 		{Env: "PNPM_CONFIG_STORE_DIR", Dir: pnpmStore},
+		{Env: "XDG_RUNTIME_DIR", Dir: filepath.Join(cacheBase, "run")},
 	}
 	for _, cache := range caches {
 		if err := state.mkdirAll(cache.Dir, 0o700); err != nil {

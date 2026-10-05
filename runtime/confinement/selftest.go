@@ -30,7 +30,24 @@ type SelfTestOptions struct {
 	Launchers map[agent.PromptSessionMode]Launcher
 	// Timeout bounds each mode's probe run. Zero means two minutes.
 	Timeout time.Duration
+	// CacheDir, when set, keeps a passing self-test record on disk, so the
+	// next process on this host reuses it instead of probing again while
+	// nothing it proved has changed: the backend and its version (the
+	// profile version plus the OS build), the probe set, the harness
+	// executable, the probe executable and the host directories. A record
+	// that is stale by those, older than CacheTTL, or not passing in both
+	// session modes is never reused. It belongs under the host state home,
+	// outside every session root. Caching is off when the confiner has a
+	// composer callback, whose rules a cached record cannot vouch for.
+	CacheDir string
+	// CacheTTL bounds how long a cached record is reused. Zero means
+	// DefaultSelfTestCacheTTL.
+	CacheTTL time.Duration
 }
+
+// DefaultSelfTestCacheTTL is how long a cached passing self-test is reused
+// when SelfTestOptions.CacheTTL is zero.
+const DefaultSelfTestCacheTTL = 24 * time.Hour
 
 // ProbeOutcome is one probe's result in one session mode.
 type ProbeOutcome struct {
@@ -142,6 +159,13 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 		c.store(record)
 		return record, err
 	}
+	cache, cacheOK := c.selfTestCache(opts, current)
+	if cacheOK {
+		if cached, hit := cache.load(time.Now()); hit {
+			c.store(cached)
+			return cached, nil
+		}
+	}
 	launchers := opts.Launchers
 	if launchers == nil {
 		launchers = DefaultLaunchers()
@@ -185,6 +209,9 @@ func (c *Confiner) SelfTest(ctx context.Context, opts SelfTestOptions) (SelfTest
 	record.Passed = len(record.SessionModes) == 2 && allPass(record.Probes)
 	record.Digest = record.computeDigest()
 	c.store(record)
+	if cacheOK && record.Passed && refusal == nil {
+		cache.save(record)
+	}
 	if refusal != nil {
 		return record, refusal
 	}
