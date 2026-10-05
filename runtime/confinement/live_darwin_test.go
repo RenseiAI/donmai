@@ -791,6 +791,12 @@ func TestSeatbelt_ReadScopeSeatWork(t *testing.T) {
 		reads = append(reads, root)
 		optional[tool] = true
 	}
+	// pnpm 12 refuses to start when its global configuration is unreadable
+	// (pnpm 10 only warns); a host that runs pnpm in its seats declares it,
+	// as here.
+	if home, err := os.UserHomeDir(); err == nil && optional["pnpm"] {
+		reads = append(reads, filepath.Join(home, "Library", "Preferences", "pnpm"))
+	}
 	w, plan := readScopedWorld(t, reads...)
 	gomod, gopath := filepath.Join(w.cache, "go-mod"), filepath.Join(w.cache, "go-path")
 	for _, dir := range []string{gomod, gopath} {
