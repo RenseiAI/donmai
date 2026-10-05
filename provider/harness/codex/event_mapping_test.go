@@ -81,7 +81,9 @@ func TestMapNotification_TurnCompleted_Success(t *testing.T) {
 	if llm.StartTimeUnixNano == "" || llm.EndTimeUnixNano == "" {
 		t.Fatalf("per-call timing missing: %+v", llm)
 	}
-	if llm.InputTokens != 500_000 || llm.OutputTokens != 100_000 || llm.CachedInputTokens != 100_000 {
+	// Reported input (500000) includes the 100000 cached reads; the harness
+	// reports the fresh remainder as InputTokens.
+	if llm.InputTokens != 400_000 || llm.OutputTokens != 100_000 || llm.CachedInputTokens != 100_000 {
 		t.Fatalf("unexpected per-call usage: %+v", llm)
 	}
 	res, ok := got[1].(agent.ResultEvent)
@@ -115,12 +117,115 @@ func TestMapNotification_TurnCompleted_CamelCaseUsage(t *testing.T) {
 	})
 	got := mapNotification("turn/completed", params, state, nil)
 	llm := got[0].(agent.LlmCallEvent)
-	if llm.InputTokens != 1000 || llm.OutputTokens != 500 || llm.CachedInputTokens != 200 {
+	if llm.InputTokens != 800 || llm.OutputTokens != 500 || llm.CachedInputTokens != 200 {
 		t.Fatalf("unexpected per-call tokens: %+v", llm)
 	}
 	res := got[1].(agent.ResultEvent)
-	if res.Cost.InputTokens != 1000 || res.Cost.OutputTokens != 500 {
+	if res.Cost.InputTokens != 800 || res.Cost.OutputTokens != 500 {
 		t.Fatalf("unexpected token totals: %+v", res.Cost)
+	}
+}
+
+// Reported input_tokens include cached reads; the harness reports the
+// fresh remainder (reported minus cached, floored at zero) as InputTokens
+// on both the per-call event and the accumulated result cost, while cached
+// and output ride unchanged. Removing the subtraction turns this RED.
+func TestMapNotification_TurnCompleted_FreshInputExcludesCached(t *testing.T) {
+	t.Parallel()
+	tests := []struct {
+		name  string
+		turns []map[string]any
+		// per-call fresh input expectations, one per turn.
+		wantCallInput []int64
+		wantInput     int64
+		wantCached    int64
+		wantOutput    int64
+		wantCost      float64
+	}{
+		{
+			name: "cached over two turns accumulates fresh",
+			turns: []map[string]any{
+				{"input_tokens": 500_000, "output_tokens": 100_000, "cached_input_tokens": 100_000},
+				{"input_tokens": 300_000, "output_tokens": 50_000, "cached_input_tokens": 200_000},
+			},
+			wantCallInput: []int64{400_000, 100_000},
+			wantInput:     500_000,
+			wantCached:    300_000,
+			wantOutput:    150_000,
+			// 500000 fresh*$2 + 300000 cached*$0.5 + 150000 output*$8
+			// = $1.0 + $0.15 + $1.2 = $2.35
+			wantCost: 2.35,
+		},
+		{
+			name: "no cached tokens passes input through",
+			turns: []map[string]any{
+				{"input_tokens": 1000, "output_tokens": 500, "cached_input_tokens": 0},
+			},
+			wantCallInput: []int64{1000},
+			wantInput:     1000,
+			wantCached:    0,
+			wantOutput:    500,
+			wantCost:      0.006,
+		},
+		{
+			name: "cached above input floors fresh at zero",
+			turns: []map[string]any{
+				{"input_tokens": 100, "output_tokens": 50, "cached_input_tokens": 500},
+			},
+			wantCallInput: []int64{0},
+			wantInput:     0,
+			wantCached:    500,
+			wantOutput:    50,
+			// 0 fresh + 500 cached*$0.5 + 50 output*$8 = $0.00025 + $0.0004
+			wantCost: 0.00065,
+		},
+	}
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Parallel()
+			state := &mapperState{model: DefaultCodexModel}
+			var res agent.ResultEvent
+			for i, usage := range tt.turns {
+				params := mustJSON(t, map[string]any{
+					"turn": map[string]any{
+						"id":     strings.Repeat("t", i+1),
+						"status": "completed",
+						"usage":  usage,
+					},
+				})
+				got := mapNotification("turn/completed", params, state, nil)
+				if len(got) != 2 {
+					t.Fatalf("turn %d: expected LlmCallEvent + ResultEvent, got %d", i, len(got))
+				}
+				llm, ok := got[0].(agent.LlmCallEvent)
+				if !ok {
+					t.Fatalf("turn %d: expected LlmCallEvent first, got %T", i, got[0])
+				}
+				if llm.InputTokens != tt.wantCallInput[i] {
+					t.Fatalf("turn %d: per-call InputTokens = %d, want %d (usage %+v)", i, llm.InputTokens, tt.wantCallInput[i], usage)
+				}
+				r, ok := got[1].(agent.ResultEvent)
+				if !ok {
+					t.Fatalf("turn %d: expected ResultEvent second, got %T", i, got[1])
+				}
+				res = r
+			}
+			if res.Cost == nil {
+				t.Fatal("expected cost data")
+			}
+			if res.Cost.InputTokens != tt.wantInput {
+				t.Fatalf("accumulated InputTokens = %d, want %d", res.Cost.InputTokens, tt.wantInput)
+			}
+			if res.Cost.CachedInputTokens != tt.wantCached {
+				t.Fatalf("accumulated CachedInputTokens = %d, want %d", res.Cost.CachedInputTokens, tt.wantCached)
+			}
+			if res.Cost.OutputTokens != tt.wantOutput {
+				t.Fatalf("accumulated OutputTokens = %d, want %d", res.Cost.OutputTokens, tt.wantOutput)
+			}
+			if abs(res.Cost.TotalCostUsd-tt.wantCost) > 0.0001 {
+				t.Fatalf("total cost = %.5f, want %.5f", res.Cost.TotalCostUsd, tt.wantCost)
+			}
+		})
 	}
 }
 
@@ -492,7 +597,7 @@ func TestStripANSI(t *testing.T) {
 func TestCalculateCostUSD_DefaultPricing(t *testing.T) {
 	t.Parallel()
 	// 1M fresh input ($2.00) + 500k cached ($0.25) + 200k output ($1.6) = $3.85
-	got := calculateCostUSD(1_500_000, 500_000, 200_000, "gpt-5-codex")
+	got := calculateCostUSD(1_000_000, 500_000, 200_000, "gpt-5-codex")
 	want := 3.85
 	if abs(got-want) > 0.0001 {
 		t.Fatalf("expected %.4f, got %.4f", want, got)
