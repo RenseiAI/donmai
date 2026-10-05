@@ -8,7 +8,9 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
-No unreleased changes.
+### Features
+
+- Confine pi seat reads to the workarea on macOS: with `DONMAI_PI_CONFINEMENT_READ=workarea` the seat profile refuses file contents and directory listings outside the session, the runtime and toolchain paths, pi's install, git's user config and `DONMAI_PI_CONFINEMENT_READ_PATHS`, so a `find /` from a seat fails fast instead of walking the disk. The self-test gains a read-scope pass (probe set v4); confined sessions also bind `GOPATH` and the pnpm store per session.
 
 ## v0.72.63 — 2026-10-05
 
