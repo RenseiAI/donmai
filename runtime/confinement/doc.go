@@ -58,11 +58,17 @@
 // through a descriptor the process inherited.
 //
 // The macOS backend renders a sandbox profile and runs the harness under
-// /usr/bin/sandbox-exec. Its read allowlist names the OS userland, the
-// frameworks (the system volumes, a second spelling of every user tree,
+// /usr/bin/sandbox-exec. Under the read scope it denies file contents and
+// extended attributes together (a transparently compressed file keeps its
+// contents in attributes) and its read allowlist names the OS userland, the
+// frameworks (the system volumes, a second spelling of the data volume,
 // re-denied), the command line tools and the active developer application,
-// Homebrew, the system configuration and the device nodes; dyld reads the
-// root directory itself at every exec, so the root stays listable and
-// nothing under it does unless named. Other operating systems have no
-// backend yet.
+// Homebrew's binaries, libraries and configuration, the system
+// configuration, the Xcode licence record and xcrun's lookup cache that the
+// /usr/bin developer shims read, and the device nodes a process needs, by
+// name: never a terminal. Package data (Homebrew's var and /usr/local/var,
+// where database directories and keys live) is re-denied after the runtime
+// allows. dyld reads the root directory itself at every exec, so the root
+// stays listable and nothing under it does unless named. Other operating
+// systems have no backend yet.
 package confinement

@@ -44,8 +44,9 @@ var classOrder = map[WritableClass]int{
 
 // ProbeSetVersion names the probe set the self-test runs (D1.5). It changes
 // whenever a probe is added, removed or its expectation changes, which makes
-// every earlier self-test record stale. v4 adds the read-scope pass.
-const ProbeSetVersion = "executor-confinement-probes-v4"
+// every earlier self-test record stale. v4 adds the read-scope pass; v5 adds
+// the terminal, package data tree and extended attribute read probes.
+const ProbeSetVersion = "executor-confinement-probes-v5"
 
 // Spec is one session's confinement declaration: what the harness process and
 // every descendant may write. Everything not named here is read-only to the

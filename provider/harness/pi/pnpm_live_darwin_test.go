@@ -32,8 +32,91 @@ import (
 // bindings and its read allowlist. They skip without pnpm on PATH, like the
 // real-binary tests (hosted CI has none).
 
-// pnpmMajor returns the major version of the pnpm on PATH, or skips.
-func pnpmMajor(t *testing.T) int {
+// pnpmVersion is a pnpm release number.
+type pnpmVersion struct{ major, minor, patch int }
+
+// pnpmStoreLockFixed is the first pnpm 12 release that keeps its store
+// operation lock under XDG_RUNTIME_DIR, which a confined seat binds to its
+// own directory. Earlier pnpm 12 releases lock under a shared directory in
+// /tmp, which confinement denies: every install fails with
+// ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK. pnpm before 12 keeps no such lock.
+var pnpmStoreLockFixed = pnpmVersion{12, 8, 2}
+
+func (v pnpmVersion) String() string {
+	return fmt.Sprintf("%d.%d.%d", v.major, v.minor, v.patch)
+}
+
+func (v pnpmVersion) before(other pnpmVersion) bool {
+	return slices.Compare([]int{v.major, v.minor, v.patch}, []int{other.major, other.minor, other.patch}) < 0
+}
+
+// parsePnpmVersion reads the release number from `pnpm --version` output: the
+// last field, as major.minor.patch with any pre-release suffix dropped.
+func parsePnpmVersion(output string) (pnpmVersion, error) {
+	fields := strings.Fields(output)
+	if len(fields) == 0 {
+		return pnpmVersion{}, errors.New("no version printed")
+	}
+	core, _, _ := strings.Cut(strings.TrimPrefix(fields[len(fields)-1], "v"), "-")
+	parts := strings.Split(core, ".")
+	if len(parts) != 3 {
+		return pnpmVersion{}, fmt.Errorf("%q is not major.minor.patch", fields[len(fields)-1])
+	}
+	var nums [3]int
+	for i, part := range parts {
+		n, err := strconv.Atoi(part)
+		if err != nil || n < 0 {
+			return pnpmVersion{}, fmt.Errorf("%q is not major.minor.patch", fields[len(fields)-1])
+		}
+		nums[i] = n
+	}
+	return pnpmVersion{nums[0], nums[1], nums[2]}, nil
+}
+
+// storeLockUnsupported reports whether this pnpm locks its store somewhere a
+// confined seat cannot: a pnpm 12 release before pnpmStoreLockFixed.
+func (v pnpmVersion) storeLockUnsupported() bool {
+	return v.major == pnpmStoreLockFixed.major && v.before(pnpmStoreLockFixed)
+}
+
+// TestPnpmVersionGate pins which pnpm releases the live pnpm tests run
+// against and which they skip with the upgrade instruction.
+func TestPnpmVersionGate(t *testing.T) {
+	for _, tc := range []struct {
+		output      string
+		want        pnpmVersion
+		unsupported bool
+	}{
+		{"10.34.1\n", pnpmVersion{10, 34, 1}, false},
+		{"11.0.0", pnpmVersion{11, 0, 0}, false},
+		{"12.0.0", pnpmVersion{12, 0, 0}, true},
+		{"12.8.1\n", pnpmVersion{12, 8, 1}, true},
+		{"12.8.2", pnpmVersion{12, 8, 2}, false},
+		{"12.9.1\n", pnpmVersion{12, 9, 1}, false},
+		{"12.9.1-beta.3", pnpmVersion{12, 9, 1}, false},
+		{"v13.0.0", pnpmVersion{13, 0, 0}, false},
+	} {
+		got, err := parsePnpmVersion(tc.output)
+		if err != nil || got != tc.want {
+			t.Errorf("parsePnpmVersion(%q) = %v, %v; want %v", tc.output, got, err, tc.want)
+			continue
+		}
+		if got.storeLockUnsupported() != tc.unsupported {
+			t.Errorf("pnpm %s: storeLockUnsupported = %v, want %v", got, !tc.unsupported, tc.unsupported)
+		}
+	}
+	for _, bad := range []string{"", "pnpm", "12.9", "12.x.1", "-1.0.0"} {
+		if _, err := parsePnpmVersion(bad); err == nil {
+			t.Errorf("parsePnpmVersion(%q) accepted", bad)
+		}
+	}
+}
+
+// requirePnpm returns the version of the pnpm on PATH, or skips: without
+// pnpm, and with a pnpm 12 whose store lock a confined seat cannot take. A
+// skip says so and names the upgrade; the tests never run against a pnpm
+// they would fail on for that reason, and never pass without running.
+func requirePnpm(t *testing.T) pnpmVersion {
 	t.Helper()
 	if _, err := exec.LookPath("pnpm"); err != nil {
 		t.Skip("real-toolchain pnpm test: `pnpm` not on PATH — skipping")
@@ -42,15 +125,14 @@ func pnpmMajor(t *testing.T) int {
 	if err != nil {
 		t.Skipf("real-toolchain pnpm test: pnpm --version: %v — skipping", err)
 	}
-	fields := strings.Fields(strings.TrimSpace(string(out)))
-	if len(fields) == 0 {
-		t.Fatalf("pnpm --version printed nothing")
-	}
-	major, err := strconv.Atoi(strings.SplitN(fields[len(fields)-1], ".", 2)[0])
+	v, err := parsePnpmVersion(string(out))
 	if err != nil {
 		t.Fatalf("pnpm --version = %q: %v", out, err)
 	}
-	return major
+	if v.storeLockUnsupported() {
+		t.Skipf("real-toolchain pnpm test: pnpm %s locks its store under /tmp, which confinement denies (ERR_PNPM_STORE_DIR_OPEN_OPERATION_LOCK); pnpm %s and later lock under the seat's runtime directory — upgrade pnpm (`brew upgrade pnpm`) — skipping", v, pnpmStoreLockFixed)
+	}
+	return v
 }
 
 // privateRegistry is a registry stub serving one scoped package only to a
@@ -211,7 +293,8 @@ func runSeat(t *testing.T, plan *confinement.Plan, dir, home string, extra []str
 // without the runtime binding the store lock falls back to a shared
 // directory under /tmp the confinement refuses.
 func TestRealToolchain_PnpmPrivateInstallConfined(t *testing.T) {
-	major := pnpmMajor(t)
+	version := requirePnpm(t)
+	major := version.major
 	reg := newPrivateRegistry(t)
 	world := func(t *testing.T) (liveWorld, string) {
 		w := newLiveWorld(t)
@@ -266,8 +349,7 @@ func TestRealToolchain_PnpmPrivateInstallConfined(t *testing.T) {
 
 	t.Run("without the session runtime directory", func(t *testing.T) {
 		if major < 12 {
-			t.Logf("pnpm %d keeps no store operation lock; nothing to control", major)
-			return
+			t.Skipf("pnpm %s keeps no store operation lock; nothing to control", version)
 		}
 		w, home := world(t)
 		plan, _ := seatPlan(t, w, home, reg.srv.URL)
@@ -290,7 +372,7 @@ func TestRealToolchain_PnpmFrozenInstallInRepoConfined(t *testing.T) {
 	if repo == "" {
 		t.Skip("DONMAI_TEST_PNPM_REPO names no checkout — skipping")
 	}
-	major := pnpmMajor(t)
+	major := requirePnpm(t).major
 	repo, err := filepath.EvalSymlinks(repo)
 	if err != nil {
 		t.Fatal(err)

@@ -143,7 +143,7 @@ func (s *seatbeltBackend) Apply(req ApplyRequest) (Applied, error) {
 	}
 	host := seatbeltHost{shared: shared}
 	if req.Resolved.ReadScope != "" {
-		host.runtimeReads = developerReads()
+		host.runtimeReads = append(developerReads(), xcrunCacheReads()...)
 	}
 	text, err := renderSeatbelt(req.Resolved, host, req.Rules, s.Canonical)
 	if err != nil {
@@ -197,14 +197,9 @@ func sharedLocations() ([]string, error) {
 	sharedOnce.Do(func() {
 		locations := []string{"/private/tmp", "/private/var/tmp"}
 		for _, name := range []string{"DARWIN_USER_TEMP_DIR", "DARWIN_USER_CACHE_DIR"} {
-			out, err := exec.Command("/usr/bin/getconf", name).Output() //nolint:gosec // G204: fixed absolute tool, fixed names.
+			dir, err := darwinUserDir(name)
 			if err != nil {
-				sharedErr = fmt.Errorf("getconf %s: %w", name, err)
-				return
-			}
-			dir, err := canonicalDarwin(strings.TrimSpace(string(out)))
-			if err != nil {
-				sharedErr = fmt.Errorf("resolve %s: %w", name, err)
+				sharedErr = err
 				return
 			}
 			locations = append(locations, dir)
@@ -212,6 +207,36 @@ func sharedLocations() ([]string, error) {
 		sharedValue = locations
 	})
 	return append([]string(nil), sharedValue...), sharedErr
+}
+
+// darwinUserDir resolves one of the per-user directories the OS assigns
+// (getconf DARWIN_USER_TEMP_DIR and the like), canonicalized.
+func darwinUserDir(name string) (string, error) {
+	out, err := exec.Command("/usr/bin/getconf", name).Output() //nolint:gosec // G204: fixed absolute tool, fixed names.
+	if err != nil {
+		return "", fmt.Errorf("getconf %s: %w", name, err)
+	}
+	dir, err := canonicalDarwin(strings.TrimSpace(string(out)))
+	if err != nil {
+		return "", fmt.Errorf("resolve %s: %w", name, err)
+	}
+	return dir, nil
+}
+
+// xcrunCacheReads is the lookup cache xcrun keeps in the user temporary
+// directory, readable under a read scope: it holds only the paths of the
+// developer tools. Without it every /usr/bin developer shim fails to read
+// the cache, tries to write a new one (the shared temporary location is
+// denied) and prints an error on stderr; a shim run through cc
+// --print-prog-name, as the Go linker finds dsymutil, then returns that
+// error text as the tool's path and the link fails. The cache is read-only
+// here: writing it stays denied.
+func xcrunCacheReads() []string {
+	dir, err := darwinUserDir("DARWIN_USER_TEMP_DIR")
+	if err != nil {
+		return nil
+	}
+	return []string{filepath.Join(dir, "xcrun_db")}
 }
 
 var (

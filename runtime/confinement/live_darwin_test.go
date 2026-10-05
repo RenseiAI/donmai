@@ -15,6 +15,9 @@ import (
 	"testing"
 	"time"
 
+	"github.com/creack/pty"
+	"golang.org/x/sys/unix"
+
 	"github.com/RenseiAI/donmai/agent"
 )
 
@@ -180,7 +183,18 @@ func runConfined(t *testing.T, plan *Plan, dir string, env []string, argv ...str
 // runProbeSteps runs probe steps inside the plan and returns their results.
 func runProbeSteps(t *testing.T, plan *Plan, w specWorld, steps ...probeStep) map[string]stepResult {
 	t.Helper()
-	planPath := filepath.Join(w.base, "plan-"+randomSuffix()+".json")
+	return runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runConfined(t, plan, w.mut, env, argv...)
+	}, steps...)
+}
+
+// runProbeStepsVia runs probe steps through run, which starts the probe
+// executable under whatever profile the caller chose, and returns their
+// results.
+func runProbeStepsVia(t *testing.T, w specWorld, run func(env []string, argv []string) (int, string), steps ...probeStep) map[string]stepResult {
+	t.Helper()
+	// The plan sits in the session tmp: readable under a read scope.
+	planPath := filepath.Join(w.tmp, "plan-"+randomSuffix()+".json")
 	raw, err := json.Marshal(probePlan{ResultPath: probeResultPath(w.tmp), Steps: steps})
 	if err != nil {
 		t.Fatal(err)
@@ -188,7 +202,7 @@ func runProbeSteps(t *testing.T, plan *Plan, w specWorld, steps ...probeStep) ma
 	if err := os.WriteFile(planPath, raw, 0o600); err != nil {
 		t.Fatal(err)
 	}
-	if code, out := runConfined(t, plan, w.mut, []string{ProbeEnv + "=" + planPath}, probeCommand(t)...); code != 0 {
+	if code, out := run([]string{ProbeEnv + "=" + planPath}, probeCommand(t)); code != 0 {
 		t.Fatalf("probe exit %d: %s", code, out)
 	}
 	raw, err = os.ReadFile(probeResultPath(w.tmp))
@@ -467,6 +481,15 @@ func TestSeatbelt_LoopbackTCPRedWithoutDeny(t *testing.T) {
 // when the profile does not hold the rule.
 func runStripped(t *testing.T, plan *Plan, dir, remove string, argv ...string) (int, string) {
 	t.Helper()
+	return runRewritten(t, plan, dir, nil, remove, "", argv...)
+}
+
+// runRewritten runs argv under the plan's rendered profile with one piece of
+// it replaced, which is how a red control reverts one rule: the old text,
+// and only it, becomes the new. It fails the test when the profile does not
+// hold the old text.
+func runRewritten(t *testing.T, plan *Plan, dir string, env []string, old, replacement string, argv ...string) (int, string) {
+	t.Helper()
 	wrapped, err := plan.Command([]string{"/usr/bin/true"})
 	if err != nil {
 		t.Fatalf("Command: %v", err)
@@ -485,12 +508,12 @@ func runStripped(t *testing.T, plan *Plan, dir, remove string, argv ...string) (
 	if err != nil {
 		t.Fatal(err)
 	}
-	stripped := strings.ReplaceAll(string(raw), remove, "")
-	if stripped == string(raw) {
-		t.Fatalf("rendered profile holds no %q to strip", remove)
+	rewritten := strings.ReplaceAll(string(raw), old, replacement)
+	if rewritten == string(raw) {
+		t.Fatalf("rendered profile holds no %q to rewrite", old)
 	}
 	redPath := profilePath + ".red"
-	if err := os.WriteFile(redPath, []byte(stripped), 0o600); err != nil { //nolint:gosec // G703: the profile path comes from the plan under test.
+	if err := os.WriteFile(redPath, []byte(rewritten), 0o600); err != nil { //nolint:gosec // G703: the profile path comes from the plan under test.
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Remove(redPath) }()
@@ -500,7 +523,7 @@ func runStripped(t *testing.T, plan *Plan, dir, remove string, argv ...string) (
 	defer cancel()
 	cmd := exec.CommandContext(ctx, full[0], full[1:]...) //nolint:gosec // G204: the confined argv under test.
 	cmd.Dir = dir
-	cmd.Env = overlayEnv(os.Environ(), plan.Environment())
+	cmd.Env = overlayEnv(os.Environ(), append(plan.Environment(), env...))
 	out, err := cmd.CombinedOutput()
 	var exitErr *exec.ExitError
 	if errors.As(err, &exitErr) {
@@ -782,7 +805,7 @@ func TestSeatbelt_ReadScopeFindIsFastAndBlind(t *testing.T) {
 		t.Error("confined stat of the sentinel failed; metadata must stay readable")
 	}
 
-	_, red := runStripped(t, plan, w.mut, "(deny file-read-data)\n", "/usr/bin/find", home, "-maxdepth", "1", "-name", name)
+	_, red := runStripped(t, plan, w.mut, "(deny file-read-data file-read-xattr)\n", "/usr/bin/find", home, "-maxdepth", "1", "-name", name)
 	if !strings.Contains(red, sentinel) {
 		t.Fatalf("with the read deny stripped, find over the home did not report the sentinel; the test does not discriminate: %q", red)
 	}
@@ -866,6 +889,28 @@ func TestSeatbelt_ReadScopeSeatWork(t *testing.T) {
 	if code, out := runConfined(t, plan, w.mut, env, "/bin/sh", "-c", script); code != 0 || !strings.Contains(out, "ok") {
 		t.Fatalf("git and go under the read scope: exit %d: %s", code, out)
 	}
+	// The C toolchain: a compile through the /usr/bin shim, and a cgo build
+	// that links through it. Both go through xcrun, which reads the active
+	// developer application and the Xcode licence record.
+	if out, err := exec.Command("/usr/bin/cc", "--version").CombinedOutput(); err != nil {
+		t.Logf("cc fails unconfined (%v: %s): this host has no usable C toolchain, so none is exercised confined", err, strings.TrimSpace(string(out)))
+	} else {
+		cgo := strings.Join([]string{
+			`set -e`,
+			`mkdir -p "` + repo + `/c" && cd "` + repo + `/c"`,
+			`printf '#include <stdio.h>\nint main(void) { puts("cc compiled"); return 0; }\n' > hello.c`,
+			`/usr/bin/cc -o "$TMPDIR/hello" hello.c`,
+			`"$TMPDIR/hello"`,
+			`mkdir -p "` + repo + `/cgo" && cd "` + repo + `/cgo"`,
+			`printf 'module example.com/cgo\n\ngo 1.21\n' > go.mod`,
+			`printf 'package main\n\n// static int add(int a, int b) { return a + b; }\nimport "C"\n\nfunc main() { println("cgo", C.add(2, 3)) }\n' > main.go`,
+			`CGO_ENABLED=1 go build -o "$TMPDIR/cgoprobe" .`,
+			`"$TMPDIR/cgoprobe"`,
+		}, "\n")
+		if code, out := runConfined(t, plan, w.mut, env, "/bin/sh", "-c", cgo); code != 0 || !strings.Contains(out, "cc compiled") || !strings.Contains(out, "cgo 5") {
+			t.Fatalf("cc and cgo under the read scope: exit %d: %s", code, out)
+		}
+	}
 	for tool := range optional {
 		if code, out := runConfined(t, plan, w.mut, nil, tool, "--version"); code != 0 {
 			t.Errorf("%s --version under the read scope: exit %d: %s", tool, code, out)
@@ -879,5 +924,250 @@ func TestSeatbelt_ReadScopeSeatWork(t *testing.T) {
 	code, out := runConfined(t, plan, w.mut, []string{"GIT_CONFIG_GLOBAL=" + undeclared, "GIT_CONFIG_NOSYSTEM=1"}, "git", "-C", repo, "status")
 	if code == 0 || !strings.Contains(out, "Operation not permitted") {
 		t.Fatalf("git with an undeclared user config: exit %d: %s; want a refusal", code, out)
+	}
+}
+
+// plantXattr writes a file and plants an extended attribute on it.
+func plantXattr(t *testing.T, path string) {
+	t.Helper()
+	if err := os.WriteFile(path, []byte("decoy\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := unix.Setxattr(path, readXattrName, []byte("decoy attribute"), 0); err != nil {
+		t.Fatalf("Setxattr: %v", err)
+	}
+}
+
+// refused reports whether a probe step was refused by the profile.
+func refused(result stepResult) bool {
+	return strings.Contains(result.Err, "not permitted")
+}
+
+// TestSeatbelt_ReadScopeClosesPackageData: Homebrew and /usr are readable
+// whole, but the data trees under them (Homebrew's var and /usr/local/var,
+// where database directories and TLS keys live) are not, while the etc trees
+// beside them stay readable. With the deny removed the same read succeeds,
+// so the test discriminates it.
+func TestSeatbelt_ReadScopeClosesPackageData(t *testing.T) {
+	var dir, file string
+	for _, tree := range seatbeltPackageData {
+		if info, err := os.Stat(tree); err != nil || !info.IsDir() || unix.Access(tree, unix.W_OK) != nil {
+			continue
+		}
+		dir = filepath.Join(tree, ".donmai-confinement-test-"+randomSuffix())
+		if err := os.MkdirAll(dir, 0o755); err != nil { //nolint:gosec // G301: a decoy directory.
+			t.Fatal(err)
+		}
+		t.Cleanup(func() { _ = removeAllForce(dir) })
+		file = filepath.Join(dir, "server-key.pem")
+		plantXattr(t, file)
+		break
+	}
+	if file == "" {
+		t.Skipf("no writable package data tree (%s) on this host; nothing is kept there to read", strings.Join(seatbeltPackageData, ", "))
+	}
+	w, plan := readScopedWorld(t)
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", file); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined cat of a key under a package data tree: exit %d: %q; want a refusal", code, out)
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", dir); code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Errorf("confined ls of a package data directory: exit %d: %q; want a refusal", code, out)
+	}
+	results := runProbeSteps(t, plan, w, probeStep{ID: "xattr", Op: opGetxattr, Path: file, Label: readXattrName})
+	if !refused(results["xattr"]) {
+		t.Errorf("confined getxattr under a package data tree: %+v; want a refusal", results["xattr"])
+	}
+	for _, etc := range []string{"/opt/homebrew/etc", "/usr/local/etc"} {
+		if info, err := os.Stat(etc); err == nil && info.IsDir() {
+			if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", etc); code != 0 {
+				t.Errorf("confined ls of %s: exit %d: %q; the etc trees stay readable", etc, code, out)
+			}
+		}
+	}
+
+	var block strings.Builder
+	block.WriteString("(deny file-read-data file-read-xattr\n")
+	for i, tree := range seatbeltPackageData {
+		block.WriteString("  (subpath \"" + tree + "\")")
+		if i == len(seatbeltPackageData)-1 {
+			block.WriteString(")")
+		}
+		block.WriteString("\n")
+	}
+	if code, out := runStripped(t, plan, w.mut, block.String(), "/bin/cat", file); code != 0 {
+		t.Fatalf("with the package data deny stripped, cat of the key failed: exit %d: %q; the test does not discriminate", code, out)
+	}
+	if code, out := runStripped(t, plan, w.mut, block.String(), "/bin/ls", dir); code != 0 {
+		t.Fatalf("with the package data deny stripped, ls of the directory failed: exit %d: %q; the test does not discriminate", code, out)
+	}
+}
+
+// TestSeatbelt_ReadScopeClosesTerminals: the device nodes a process needs
+// stay readable (the random devices, the directory, the descriptors process
+// substitution hands out) but no terminal does: a pseudo-terminal slave
+// does not open for reading, so a seat cannot capture what is typed into
+// another session's terminal or the operator's. With the /dev subtree
+// allowed again the same open succeeds, so the test discriminates.
+func TestSeatbelt_ReadScopeClosesTerminals(t *testing.T) {
+	master, slave, err := pty.Open()
+	if err != nil {
+		t.Fatalf("pty.Open: %v", err)
+	}
+	t.Cleanup(func() { _ = slave.Close(); _ = master.Close() })
+	if fd, err := unix.Open(slave.Name(), unix.O_RDONLY|unix.O_NONBLOCK|unix.O_NOCTTY, 0); err != nil {
+		t.Fatalf("unconfined control: the pseudo-terminal slave does not open: %v", err)
+	} else {
+		_ = unix.Close(fd)
+	}
+	w, plan := readScopedWorld(t)
+	steps := []probeStep{
+		{ID: "pty", Op: opOpen, Path: slave.Name()},
+		{ID: "urandom", Op: opOpen, Path: "/dev/urandom"},
+		{ID: "null", Op: opOpen, Path: "/dev/null"},
+		{ID: "list", Op: opList, Path: "/dev"},
+	}
+	results := runProbeSteps(t, plan, w, steps...)
+	if !refused(results["pty"]) {
+		t.Errorf("confined open of a pseudo-terminal slave: %+v; want a refusal", results["pty"])
+	}
+	for _, id := range []string{"urandom", "null", "list"} {
+		if results[id].Err != "" {
+			t.Errorf("confined %s: %q; the device stays readable", id, results[id].Err)
+		}
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/bash", "-c", "cat <(echo substituted)"); code != 0 || !strings.Contains(out, "substituted") {
+		t.Errorf("process substitution under the read scope: exit %d: %q", code, out)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env, "(literal \"/dev\")\n", "(subpath \"/dev\")\n", argv...)
+	}, steps...)
+	if red["pty"].Err != "" {
+		t.Fatalf("with the /dev subtree allowed, the open of a pseudo-terminal slave failed: %q; the test does not discriminate", red["pty"].Err)
+	}
+}
+
+// TestSeatbelt_ReadScopeClosesExtendedAttributes: an extended attribute
+// outside the allowlist does not read, and neither does the content of a
+// transparently compressed file, which the file keeps in attributes that
+// getxattr returns when asked to show compression, while the same reads
+// inside the allowlist work. With the attribute rule dropped from the
+// blanket deny the outside reads succeed although the file itself is still
+// refused, so the test discriminates.
+func TestSeatbelt_ReadScopeClosesExtendedAttributes(t *testing.T) {
+	outside := shortTempDir(t, "dco")
+	w, plan := readScopedWorld(t)
+	places := map[string]string{"outside": outside, "inside": w.mut}
+	for _, dir := range places {
+		plantXattr(t, filepath.Join(dir, "plain"))
+		if _, err := cloneCompressed(dir); err != nil {
+			t.Fatalf("compressed decoy: %v", err)
+		}
+	}
+	// A compressed file keeps its contents in the resource fork, or, when
+	// small, in the decmpfs attribute alone: probe each that exists.
+	attrs := []struct{ id, name string }{{"decmpfs", decmpfsXattr}}
+	if _, err := getxattr(filepath.Join(outside, "cmp"), resourceFork, nil, showCompress); err == nil {
+		attrs = append(attrs, struct{ id, name string }{"fork", resourceFork})
+	}
+	var steps []probeStep
+	for place, dir := range places {
+		steps = append(steps, probeStep{ID: place + ".xattr", Op: opGetxattr, Path: filepath.Join(dir, "plain"), Label: readXattrName})
+		for _, attr := range attrs {
+			steps = append(steps, probeStep{ID: place + "." + attr.id, Op: opGetxattr, Path: filepath.Join(dir, "cmp"), Label: attr.name, Flags: showCompress})
+		}
+	}
+
+	results := runProbeSteps(t, plan, w, steps...)
+	for _, step := range steps {
+		got := results[step.ID]
+		if strings.HasPrefix(step.ID, "outside.") && !refused(got) {
+			t.Errorf("confined getxattr %s: %+v; want a refusal", step.ID, got)
+		}
+		if strings.HasPrefix(step.ID, "inside.") && got.Err != "" {
+			t.Errorf("confined getxattr %s inside the allowlist: %+v; want it served", step.ID, got)
+		}
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/cat", filepath.Join(outside, "cmp")); code == 0 {
+		t.Errorf("confined cat of the compressed decoy outside the allowlist: %q; want a refusal", out)
+	}
+
+	red := runProbeStepsVia(t, w, func(env []string, argv []string) (int, string) {
+		return runRewritten(t, plan, w.mut, env, "(deny file-read-data file-read-xattr)\n", "(deny file-read-data)\n", argv...)
+	}, steps...)
+	for _, step := range steps {
+		if strings.HasPrefix(step.ID, "outside.") && red[step.ID].Err != "" {
+			t.Errorf("with the attribute rule dropped, getxattr %s still failed: %q; the test does not discriminate", step.ID, red[step.ID].Err)
+		}
+	}
+}
+
+// TestSeatbelt_ReadScopeDeveloperShims: the /usr/bin developer shims (git,
+// python3, make, cc) run under the read scope on a host whose developer
+// directory is an application bundle. xcrun reads the Xcode licence record
+// to check the licence was accepted; refused, every shim exits with a
+// licence error. A shim that already fails unconfined says nothing about the
+// profile (the licence is not accepted, or no developer tools are
+// installed), so it is skipped with that said.
+func TestSeatbelt_ReadScopeDeveloperShims(t *testing.T) {
+	w, plan := readScopedWorld(t)
+	shims := [][]string{
+		{"/usr/bin/git", "--version"},
+		{"/usr/bin/python3", "--version"},
+		{"/usr/bin/make", "--version"},
+		{"/usr/bin/cc", "--version"},
+	}
+	for _, shim := range shims {
+		t.Run(filepath.Base(shim[0]), func(t *testing.T) {
+			if out, err := exec.Command(shim[0], shim[1:]...).CombinedOutput(); err != nil { //nolint:gosec // G204: fixed shims.
+				t.Skipf("%s fails unconfined (%v: %s): the host's developer tools are not usable (licence not accepted?); not a confinement result", shim[0], err, strings.TrimSpace(string(out)))
+			}
+			// A global git configuration of the operator's is not declared
+			// readable, and git treats an unreadable one as fatal.
+			env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+			if code, out := runConfined(t, plan, w.mut, env, shim...); code != 0 {
+				t.Errorf("confined %s: exit %d: %s", strings.Join(shim, " "), code, strings.TrimSpace(out))
+			}
+		})
+	}
+	t.Run("tool lookup", func(t *testing.T) {
+		// The Go linker finds dsymutil by running cc --print-prog-name and
+		// taking everything the shim prints as the tool's path, so a shim
+		// that complains about its lookup cache on stderr breaks every cgo
+		// link. The unconfined run also makes sure the cache exists.
+		out, err := exec.Command("/usr/bin/cc", "--print-prog-name", "dsymutil").CombinedOutput()
+		if err != nil || strings.Count(strings.TrimSpace(string(out)), "\n") != 0 {
+			t.Skipf("cc --print-prog-name fails or is noisy unconfined (%v: %s); not a confinement result", err, strings.TrimSpace(string(out)))
+		}
+		want := strings.TrimSpace(string(out))
+		env := []string{"GIT_CONFIG_GLOBAL=/dev/null", "GIT_CONFIG_NOSYSTEM=1"}
+		if code, got := runConfined(t, plan, w.mut, env, "/usr/bin/cc", "--print-prog-name", "dsymutil"); code != 0 || strings.TrimSpace(got) != want {
+			t.Errorf("confined cc --print-prog-name dsymutil: exit %d: %q; want exactly %q", code, got, want)
+		}
+		dir, err := darwinUserDir("DARWIN_USER_TEMP_DIR")
+		if err != nil {
+			t.Fatal(err)
+		}
+		_, got := runRewritten(t, plan, w.mut, env, `(subpath "`+filepath.Join(dir, "xcrun_db")+`")`, "", "/usr/bin/cc", "--print-prog-name", "dsymutil")
+		if strings.TrimSpace(got) == want {
+			t.Fatalf("with the xcrun cache unreadable, cc --print-prog-name still answered cleanly; the test does not discriminate")
+		}
+	})
+	if len(developerReads()) == 0 {
+		t.Log("the developer directory is not an application bundle on this host; the licence record control does not apply")
+		return
+	}
+	// The licence record is read on every lookup the shim's cache cannot
+	// answer; --no-cache asks for exactly that, whatever the cache holds.
+	lookup := []string{"/usr/bin/xcrun", "--no-cache", "-f", "clang"}
+	if out, err := exec.Command(lookup[0], lookup[1:]...).CombinedOutput(); err != nil { //nolint:gosec // G204: fixed tool.
+		t.Skipf("%s fails unconfined (%v: %s); the licence control cannot run", strings.Join(lookup, " "), err, strings.TrimSpace(string(out)))
+	}
+	if code, out := runConfined(t, plan, w.mut, nil, lookup...); code != 0 {
+		t.Errorf("confined %s: exit %d: %s", strings.Join(lookup, " "), code, strings.TrimSpace(out))
+	}
+	code, out := runRewritten(t, plan, w.mut, nil, "(literal \"/Library/Preferences/com.apple.dt.Xcode.plist\")\n", "", lookup...)
+	if code == 0 || !strings.Contains(out, "license") {
+		t.Fatalf("with the licence record unreadable, %s: exit %d: %q; want the licence refusal", strings.Join(lookup, " "), code, out)
 	}
 }

@@ -1,6 +1,7 @@
 package confinement
 
 import (
+	"slices"
 	"strings"
 	"testing"
 
@@ -277,21 +278,23 @@ func readSessionBlock(t *testing.T, text string) string {
 
 // TestRenderSeatbelt_ReadScopeOrder pins the read-scope order: the blanket
 // read deny comes after the default allow, the runtime allows after it, the
-// system-volume carve-out after them, and the session's own allowlist last,
-// so a session path wins over the carve-out; a composer read deny still
-// renders after everything and wins inside the allowlist.
+// package data deny and the system-volume carve-out after them, and the
+// session's own allowlist last, so a session path wins over the carve-outs;
+// a composer read deny still renders after everything and wins inside the
+// allowlist.
 func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
 	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}}
 	text := mustRenderHost(t, readScopedResolved(), host, []Rule{{Kind: RuleDenyRead, Path: "/r/ws/mut/secret", Scope: ScopeSubtree}})
 	order := []string{
 		"(allow default)",
-		"(deny file-read-data)\n",
-		"(allow file-read-data\n  (literal \"/\")",
+		"(deny file-read-data file-read-xattr)\n",
+		"(allow file-read-data file-read-xattr\n  (literal \"/\")",
 		`(subpath "/opt/homebrew")`,
 		`(subpath "/Applications/Xcode.app")`,
-		`(deny file-read-data (subpath "/System/Volumes"))`,
-		`(allow file-read-data (subpath "/System/Volumes/Preboot/Cryptexes"))`,
-		"(allow file-read-data\n  (subpath \"/h/.config/git\")",
+		"(deny file-read-data file-read-xattr\n  (subpath \"/opt/homebrew/var\")\n  (subpath \"/usr/local/var\"))",
+		`(deny file-read-data file-read-xattr (subpath "/System/Volumes"))`,
+		`(allow file-read-data file-read-xattr (subpath "/System/Volumes/Preboot/Cryptexes"))`,
+		"(allow file-read-data file-read-xattr\n  (subpath \"/h/.config/git\")",
 		`(subpath "/r/ws/mut")`,
 		"(deny file-write*)\n",
 		`(deny file-read* (subpath "/r/ws/mut/secret"))`,
@@ -304,8 +307,66 @@ func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
 		}
 		last += 1 + at
 	}
-	if got := strings.Count(text, "(deny file-read-data)"); got != 1 {
+	if got := strings.Count(text, "(deny file-read-data file-read-xattr)"); got != 1 {
 		t.Fatalf("%d blanket read denies, want 1:\n%s", got, text)
+	}
+}
+
+// TestRenderSeatbelt_ReadRulesPairExtendedAttributes: every read rule a read
+// scope renders governs extended attributes together with file contents.
+// A rule on file contents alone leaves getxattr open: it returns any
+// attribute, and the whole contents of a transparently compressed file,
+// outside the allowlist.
+func TestRenderSeatbelt_ReadRulesPairExtendedAttributes(t *testing.T) {
+	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}}
+	text := mustRenderHost(t, readScopedResolved(), host, nil)
+	data := strings.Count(text, "file-read-data")
+	paired := strings.Count(text, "file-read-data file-read-xattr")
+	if data == 0 || data != paired {
+		t.Fatalf("%d read rules name file-read-data, %d of them pair file-read-xattr, want all:\n%s", data, paired, text)
+	}
+	if got := strings.Count(text, "file-read-xattr"); got != paired {
+		t.Fatalf("%d rules name file-read-xattr, %d pair it with file-read-data:\n%s", got, paired, text)
+	}
+}
+
+// TestRenderSeatbelt_RuntimeReadsClosePackageDataAndTerminals: the runtime
+// allows name Homebrew and /usr whole, so the data trees under them are
+// denied after, while their etc trees stay readable; the allows name device
+// nodes one by one, never the /dev subtree, so no terminal is readable; and
+// the Xcode licence record is readable, so the /usr/bin developer shims run.
+func TestRenderSeatbelt_RuntimeReadsClosePackageDataAndTerminals(t *testing.T) {
+	text := mustRenderHost(t, readScopedResolved(), seatbeltHost{}, nil)
+	filters := readAllowFilters(t, text)
+	for _, want := range []string{
+		`(literal "/dev")`, `(literal "/dev/null")`, `(literal "/dev/zero")`, `(literal "/dev/random")`,
+		`(literal "/dev/urandom")`, `(literal "/dev/tty")`, `(literal "/dev/ptmx")`, `(literal "/dev/dtracehelper")`,
+		`(literal "/dev/autofs_nowait")`, `(literal "/dev/fd")`, `(regex #"^/dev/fd/[0-9]+$")`,
+		`(literal "/Library/Preferences/com.apple.dt.Xcode.plist")`,
+		`(subpath "/opt/homebrew")`, `(subpath "/usr")`,
+	} {
+		if !slices.Contains(filters, want) {
+			t.Errorf("the read allows lack %s", want)
+		}
+	}
+	if slices.Contains(filters, `(subpath "/dev")`) {
+		t.Error("a read allow names the /dev subtree: every terminal would be readable")
+	}
+	denied := false
+	for _, form := range sbplForms(t, text) {
+		if !strings.HasPrefix(form, "(deny file-read-data file-read-xattr") {
+			continue
+		}
+		got := sbplFilters(t, form)
+		if slices.Contains(got, `(subpath "/opt/homebrew/var")`) && slices.Contains(got, `(subpath "/usr/local/var")`) {
+			denied = true
+		}
+	}
+	if !denied {
+		t.Errorf("no read deny names /opt/homebrew/var and /usr/local/var:\n%s", text)
+	}
+	if strings.Contains(text, "/etc") && strings.Contains(strings.ReplaceAll(text, `(subpath "/private/etc")`, ""), "/etc") {
+		t.Errorf("a read rule names an etc tree other than /private/etc; those stay readable through the runtime allows:\n%s", text)
 	}
 }
 
@@ -328,26 +389,78 @@ func TestRenderSeatbelt_ReadAllowlistIsTheSession(t *testing.T) {
 	if strings.Join(got, ",") != strings.Join(want, ",") {
 		t.Fatalf("session read allowlist = %v, want %v", got, want)
 	}
-	for _, never := range []string{`"/r/ws"`, `"/r/ws/.workarea"`, `"/h"`, `"/Users"`, `"/private/tmp"`, `"/private/var/folders"`, `"/Volumes"`} {
+	filters := readAllowFilters(t, text)
+	for _, never := range []string{`"/r/ws"`, `"/r/ws/.workarea"`, `"/h"`, `"/Users"`, `"/private"`, `"/private/tmp"`, `"/private/var"`, `"/private/var/folders"`, `"/Volumes"`, `"/opt"`, `"/opt/homebrew/var"`, `"/usr/local/var"`} {
 		for _, rule := range []string{"(subpath " + never + ")", "(literal " + never + ")"} {
-			if strings.Contains(text, "(allow file-read-data") && strings.Contains(readAllows(text), rule) {
+			if slices.Contains(filters, rule) {
 				t.Errorf("a read allow names %s:\n%s", rule, text)
 			}
 		}
 	}
 }
 
-// readAllows returns every read-allow block of a rendering.
-func readAllows(text string) string {
-	var b strings.Builder
-	for _, part := range strings.Split(text, "(allow file-read-data")[1:] {
-		end := strings.Index(part, ")\n")
-		if end < 0 {
-			end = len(part)
+// readAllowFilters returns every filter of every read-allow rule of a
+// rendering: the runtime allows, the cryptex carve-out and the session's.
+func readAllowFilters(t *testing.T, text string) []string {
+	t.Helper()
+	var filters []string
+	for _, form := range sbplForms(t, text) {
+		if strings.HasPrefix(form, "(allow file-read-data") {
+			filters = append(filters, sbplFilters(t, form)...)
 		}
-		b.WriteString(part[:end+1])
 	}
-	return b.String()
+	if len(filters) == 0 {
+		t.Fatalf("profile has no read allow:\n%s", text)
+	}
+	return filters
+}
+
+// sbplFilters returns the filters of one rule: the forms nested in it, to
+// its closing parenthesis, however many lines the rule spans.
+func sbplFilters(t *testing.T, form string) []string {
+	t.Helper()
+	return sbplForms(t, strings.TrimSuffix(strings.TrimPrefix(form, "("), ")"))
+}
+
+// sbplForms splits profile text into its top-level forms, balancing
+// parentheses outside comments, string literals and regex literals.
+func sbplForms(t *testing.T, text string) []string {
+	t.Helper()
+	var forms []string
+	depth, start := 0, 0
+	inString := false
+	for i := 0; i < len(text); i++ {
+		c := text[i]
+		switch {
+		case inString:
+			if c == '"' {
+				inString = false
+			}
+		case c == ';':
+			for i < len(text) && text[i] != '\n' {
+				i++
+			}
+		case c == '"':
+			inString = true
+		case c == '(':
+			if depth == 0 {
+				start = i
+			}
+			depth++
+		case c == ')':
+			depth--
+			if depth < 0 {
+				t.Fatalf("unbalanced profile text at offset %d:\n%s", i, text)
+			}
+			if depth == 0 {
+				forms = append(forms, text[start:i+1])
+			}
+		}
+	}
+	if depth != 0 || inString {
+		t.Fatalf("unbalanced profile text:\n%s", text)
+	}
+	return forms
 }
 
 // TestRenderSeatbelt_OpenReadsRenderNoReadRules: without a read scope the

@@ -13,7 +13,7 @@ import (
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v4"
+const seatbeltProfileVersion = "seatbelt-profile-v5"
 
 // seatbeltHost is what a rendering needs from the host beside the session.
 type seatbeltHost struct {
@@ -25,6 +25,14 @@ type seatbeltHost struct {
 	runtimeReads []string
 }
 
+// seatbeltReadOps are the read operations a read scope governs. Extended
+// attributes are paired with file contents everywhere: a transparently
+// compressed file keeps its contents in the com.apple.ResourceFork and
+// com.apple.decmpfs attributes, which getxattr returns when asked to show
+// compression, and any other attribute is file data too. Metadata (stat,
+// existence) stays readable.
+const seatbeltReadOps = "file-read-data file-read-xattr"
+
 // seatbeltRuntimeReads are the runtime and toolchain paths readable under a
 // read scope. dyld reads the root directory itself at every exec, so the
 // root is readable as a literal: listing it shows the top-level names and
@@ -32,22 +40,58 @@ type seatbeltHost struct {
 // named here or in the session's allowlist.
 var seatbeltRuntimeReads = []string{
 	`(literal "/")`,
-	`(subpath "/usr")`, // the OS userland and /usr/local toolchains
+	`(subpath "/usr")`, // the OS userland and /usr/local toolchains; /usr/local/var is re-denied below
 	`(subpath "/bin")`,
 	`(subpath "/sbin")`,
 	`(subpath "/System")`, // frameworks; the data-volume mirror is re-denied below
 	`(subpath "/Library/Apple")`,
 	`(subpath "/Library/Developer")`, // command line tools
-	`(subpath "/opt/homebrew")`,
+	`(subpath "/opt/homebrew")`,      // Homebrew's binaries, libraries and etc; its var is re-denied below
 	`(subpath "/private/etc")`,
 	`(subpath "/private/var/db/timezone")`,
 	`(literal "/private/var/run/resolv.conf")`,
-	`(subpath "/dev")`,
+	// The Xcode licence record. Every /usr/bin developer shim (git, python3,
+	// make, cc) asks xcrun, and xcrun reads it to learn the licence was
+	// accepted; refused, the shim exits with "You have not agreed to the
+	// Xcode license agreements" on any host whose developer directory is
+	// Xcode.app.
+	`(literal "/Library/Preferences/com.apple.dt.Xcode.plist")`,
+	// Device nodes, by name. A subpath would make every terminal readable:
+	// a seat could open another session's pty, or an operator's terminal,
+	// and capture what is typed into it. The directory is listable (shells
+	// glob it) and /dev/fd/N are the descriptors a process substitution
+	// hands its children.
+	`(literal "/dev")`,
+	`(literal "/dev/null")`,
+	`(literal "/dev/zero")`,
+	`(literal "/dev/random")`,
+	`(literal "/dev/urandom")`,
+	`(literal "/dev/tty")`,
+	`(literal "/dev/ptmx")`,
+	`(literal "/dev/dtracehelper")`,
+	`(literal "/dev/autofs_nowait")`,
+	`(literal "/dev/fd")`,
+	`(regex #"^/dev/fd/[0-9]+$")`,
 }
 
-// seatbeltSystemVolumes holds the firmlinked data volume, a second spelling
-// of every user tree, and the other system volumes. It is re-denied after
-// the runtime allows; the OS cryptexes inside it stay readable.
+// seatbeltPackageData are package manager data trees inside the runtime
+// allows: the databases, keys and application caches Homebrew keeps beside
+// its binaries (MySQL and PostgreSQL data directories, TLS keys). They are
+// as sensitive as anything in the home, so they are re-denied after the
+// runtime allows. Their etc siblings stay readable: the system CA bundle and
+// gitconfig live there. The session's own allowlist still renders after,
+// and wins.
+var seatbeltPackageData = []string{
+	"/opt/homebrew/var",
+	"/usr/local/var",
+}
+
+// seatbeltSystemVolumes holds the firmlinked data volume and the other
+// system volumes. The kernel judges a firmlinked path by its canonical
+// spelling, so the blanket deny already closes the user trees reached
+// through the data volume; the re-deny keeps the volume roots unlistable
+// and is defence in depth. It renders after the runtime allows; the OS
+// cryptexes inside it stay readable.
 const (
 	seatbeltSystemVolumes = "/System/Volumes"
 	seatbeltCryptexes     = "/System/Volumes/Preboot/Cryptexes"
@@ -117,10 +161,11 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 // rule, so the order is the boundary:
 //
 //  1. allow by default;
-//  2. under a read scope only: deny reading file contents and listing
-//     directories, allow the runtime paths, re-deny the system volumes,
-//     re-allow the OS cryptexes, then allow the session's read allowlist
-//     last, so it wins over the system carve-out; metadata stays readable;
+//  2. under a read scope only: deny reading file contents, extended
+//     attributes and directory listings, allow the runtime paths, re-deny
+//     the package data trees and the system volumes, re-allow the OS
+//     cryptexes, then allow the session's read allowlist last, so it wins
+//     over the carve-outs; metadata stays readable;
 //  3. deny every write, every hard link, and the shared temporary and cache
 //     locations by name (D2, D2.1);
 //  4. allow the device nodes and the writable set (D2);
@@ -182,16 +227,22 @@ func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func
 		if err != nil {
 			return "", err
 		}
-		b.WriteString("; Read scope workarea: file contents and directory listings are denied\n")
-		b.WriteString("; outside the allowlist. Metadata stays readable.\n")
-		b.WriteString("(deny file-read-data)\n")
+		dataFilters, err := filters("subpath", seatbeltPackageData)
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("; Read scope workarea: file contents, extended attributes and directory listings\n")
+		b.WriteString("; are denied outside the allowlist. Metadata stays readable.\n")
+		fmt.Fprintf(&b, "(deny %s)\n", seatbeltReadOps)
 		b.WriteString("; Runtime and toolchain paths.\n")
-		rule("allow", "file-read-data", append(append([]string{}, seatbeltRuntimeReads...), runtimeFilters...))
-		b.WriteString("; The system volumes, a second spelling of every user tree, except the OS cryptexes.\n")
-		fmt.Fprintf(&b, "(deny file-read-data (subpath %q))\n", seatbeltSystemVolumes)
-		fmt.Fprintf(&b, "(allow file-read-data (subpath %q))\n", seatbeltCryptexes)
+		rule("allow", seatbeltReadOps, append(append([]string{}, seatbeltRuntimeReads...), runtimeFilters...))
+		b.WriteString("; Package data trees (databases, keys), inside the runtime allows.\n")
+		rule("deny", seatbeltReadOps, dataFilters)
+		b.WriteString("; The system volumes, except the OS cryptexes.\n")
+		fmt.Fprintf(&b, "(deny %s (subpath %q))\n", seatbeltReadOps, seatbeltSystemVolumes)
+		fmt.Fprintf(&b, "(allow %s (subpath %q))\n", seatbeltReadOps, seatbeltCryptexes)
 		b.WriteString("; The session: writable set, read-only leaves, declared read paths. Last, so they win.\n")
-		rule("allow", "file-read-data", sessionFilters)
+		rule("allow", seatbeltReadOps, sessionFilters)
 		b.WriteString("\n")
 	default:
 		return "", refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", r.ReadScope)
