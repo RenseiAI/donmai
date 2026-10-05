@@ -57,6 +57,9 @@ const (
 	opAttach       stepOp = "attach"
 	opMount        stepOp = "mount"
 	opPrefWrite    stepOp = "preference_write"
+	opRead         stepOp = "read"
+	opList         stepOp = "list"
+	opStat         stepOp = "stat"
 )
 
 type probeStep struct {
@@ -185,6 +188,12 @@ func runStep(step probeStep) stepResult {
 		result.Exit, result.Output, err = runTool("/usr/bin/defaults", "write", step.Label, "probe", "1")
 	case opMount:
 		result.Exit, result.Output, err = runTool("/usr/bin/hdiutil", "attach", "-nobrowse", "-noverify", "-noautoopen", "-mountpoint", step.Path, step.Path2)
+	case opRead:
+		_, err = os.ReadFile(step.Path) //nolint:gosec // G304: the probe's own target.
+	case opList:
+		_, err = os.ReadDir(step.Path)
+	case opStat:
+		_, err = os.Lstat(step.Path)
 	default:
 		err = fmt.Errorf("unknown probe operation %q", step.Op)
 	}

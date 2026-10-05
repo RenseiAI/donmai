@@ -141,7 +141,11 @@ func (s *seatbeltBackend) Apply(req ApplyRequest) (Applied, error) {
 	if err != nil {
 		return Applied{}, refuse(ReasonBackendAbsent, "shared locations: %v", err)
 	}
-	text, err := renderSeatbelt(req.Resolved, shared, req.Rules, s.Canonical)
+	host := seatbeltHost{shared: shared}
+	if req.Resolved.ReadScope != "" {
+		host.runtimeReads = developerReads()
+	}
+	text, err := renderSeatbelt(req.Resolved, host, req.Rules, s.Canonical)
 	if err != nil {
 		return Applied{}, err
 	}
@@ -208,6 +212,53 @@ func sharedLocations() ([]string, error) {
 		sharedValue = locations
 	})
 	return append([]string(nil), sharedValue...), sharedErr
+}
+
+var (
+	developerOnce  sync.Once
+	developerValue []string
+)
+
+// developerReads are the runtime paths of the active developer directory
+// readable under a read scope: the application bundle it lives in, which
+// carries the toolchains, SDKs and shared frameworks the developer tools
+// load. The command line tools are on the static list; a developer
+// directory outside an application bundle adds nothing, so a stray
+// DEVELOPER_DIR cannot open a home directory to reads. Resolved once.
+func developerReads() []string {
+	developerOnce.Do(func() {
+		ctx, cancel := context.WithTimeout(context.Background(), 15*time.Second)
+		defer cancel()
+		out, err := exec.CommandContext(ctx, "/usr/bin/xcode-select", "-p").Output() //nolint:gosec // G204: fixed absolute tool and argument.
+		if err != nil {
+			return
+		}
+		if bundle, ok := applicationBundle(strings.TrimSpace(string(out))); ok {
+			developerValue = []string{bundle}
+		}
+	})
+	return append([]string(nil), developerValue...)
+}
+
+// applicationBundle returns the canonical application bundle a developer
+// directory lives in, or false when it is in none.
+func applicationBundle(dir string) (string, bool) {
+	if !filepath.IsAbs(dir) {
+		return "", false
+	}
+	resolved, err := canonicalDarwin(dir)
+	if err != nil {
+		return "", false
+	}
+	at := strings.Index(resolved+"/", ".app/")
+	if at < 0 {
+		return "", false
+	}
+	bundle := resolved[:at+len(".app")]
+	if filepath.Dir(bundle) == string(filepath.Separator) {
+		return "", false
+	}
+	return bundle, true
 }
 
 // profileName is a profile file name for one rendering: the harness and

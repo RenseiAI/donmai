@@ -3,6 +3,8 @@ package confinement
 import (
 	"strings"
 	"testing"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func sampleResolved() *Resolved {
@@ -29,7 +31,7 @@ func identity(path string) (string, error) { return path, nil }
 
 func mustRender(t *testing.T, r *Resolved, rules []Rule) string {
 	t.Helper()
-	text, err := renderSeatbelt(r, []string{"/private/tmp"}, rules, identity)
+	text, err := renderSeatbelt(r, seatbeltHost{shared: []string{"/private/tmp"}}, rules, identity)
 	if err != nil {
 		t.Fatalf("renderSeatbelt: %v", err)
 	}
@@ -139,7 +141,7 @@ func TestRenderSeatbelt_RefusesPathsItCannotQuote(t *testing.T) {
 	for _, bad := range []string{`/r/t"x`, `/r/t\x`, "/r/t\nx", "/r/t\x7f"} {
 		r := sampleResolved()
 		r.Writable[2].Path = bad
-		_, err := renderSeatbelt(r, nil, nil, identity)
+		_, err := renderSeatbelt(r, seatbeltHost{}, nil, identity)
 		if reason, _ := ReasonOf(err); reason != ReasonWritableSetUnrepresentable {
 			t.Errorf("path %q: err=%v, want writable_set_unrepresentable", bad, err)
 		}
@@ -197,7 +199,7 @@ func TestRenderComposerRules_RefusesWhatItCannotRender(t *testing.T) {
 	}
 	for _, tt := range tests {
 		t.Run(tt.name, func(t *testing.T) {
-			_, err := renderSeatbelt(sampleResolved(), nil, []Rule{{Kind: RuleDenyServiceLookup, Service: "com.example.ok"}, tt.rule}, identity)
+			_, err := renderSeatbelt(sampleResolved(), seatbeltHost{}, []Rule{{Kind: RuleDenyServiceLookup, Service: "com.example.ok"}, tt.rule}, identity)
 			if reason, _ := ReasonOf(err); reason != ReasonRuleUnrenderable {
 				t.Fatalf("err=%v, want rule_unrenderable (the rule is refused, never dropped)", err)
 			}
@@ -243,5 +245,135 @@ func TestRenderSeatbelt_LoopbackTCPPorts(t *testing.T) {
 		if at < denyAt {
 			t.Fatalf("%s renders before the deny; the deny would win:\n%s", want, text)
 		}
+	}
+}
+
+func readScopedResolved() *Resolved {
+	r := sampleResolved()
+	r.ReadScope = agent.FileReadWorkarea
+	r.ReadPaths = []string{"/h/.config/git", "/h/.gitconfig"}
+	return r
+}
+
+func mustRenderHost(t *testing.T, r *Resolved, host seatbeltHost, rules []Rule) string {
+	t.Helper()
+	text, err := renderSeatbelt(r, host, rules, identity)
+	if err != nil {
+		t.Fatalf("renderSeatbelt: %v", err)
+	}
+	return text
+}
+
+// readSessionBlock returns the session read allowlist block of a rendering.
+func readSessionBlock(t *testing.T, text string) string {
+	t.Helper()
+	_, block, found := strings.Cut(text, "; The session: writable set, read-only leaves, declared read paths.")
+	if !found {
+		t.Fatalf("profile lacks the session read allowlist:\n%s", text)
+	}
+	block, _, _ = strings.Cut(block, "\n\n")
+	return block
+}
+
+// TestRenderSeatbelt_ReadScopeOrder pins the read-scope order: the blanket
+// read deny comes after the default allow, the runtime allows after it, the
+// system-volume carve-out after them, and the session's own allowlist last,
+// so a session path wins over the carve-out; a composer read deny still
+// renders after everything and wins inside the allowlist.
+func TestRenderSeatbelt_ReadScopeOrder(t *testing.T) {
+	host := seatbeltHost{shared: []string{"/private/tmp"}, runtimeReads: []string{"/Applications/Xcode.app"}}
+	text := mustRenderHost(t, readScopedResolved(), host, []Rule{{Kind: RuleDenyRead, Path: "/r/ws/mut/secret", Scope: ScopeSubtree}})
+	order := []string{
+		"(allow default)",
+		"(deny file-read-data)\n",
+		"(allow file-read-data\n  (literal \"/\")",
+		`(subpath "/opt/homebrew")`,
+		`(subpath "/Applications/Xcode.app")`,
+		`(deny file-read-data (subpath "/System/Volumes"))`,
+		`(allow file-read-data (subpath "/System/Volumes/Preboot/Cryptexes"))`,
+		"(allow file-read-data\n  (subpath \"/h/.config/git\")",
+		`(subpath "/r/ws/mut")`,
+		"(deny file-write*)\n",
+		`(deny file-read* (subpath "/r/ws/mut/secret"))`,
+	}
+	last := -1
+	for _, needle := range order {
+		at := strings.Index(text[last+1:], needle)
+		if at < 0 {
+			t.Fatalf("profile lacks %q after offset %d:\n%s", needle, last, text)
+		}
+		last += 1 + at
+	}
+	if got := strings.Count(text, "(deny file-read-data)"); got != 1 {
+		t.Fatalf("%d blanket read denies, want 1:\n%s", got, text)
+	}
+}
+
+// TestRenderSeatbelt_ReadAllowlistIsTheSession: the session's read
+// allowlist is exactly its writable roots, its read-only leaves and its
+// declared read paths — never the workarea root, its metadata, the home or
+// the shared temporary locations — and no runtime path widens to them.
+func TestRenderSeatbelt_ReadAllowlistIsTheSession(t *testing.T) {
+	r := readScopedResolved()
+	text := mustRenderHost(t, r, seatbeltHost{shared: []string{"/private/tmp"}}, nil)
+	block := readSessionBlock(t, text)
+	var got []string
+	for _, line := range strings.Split(block, "\n") {
+		line = strings.TrimRight(strings.TrimSpace(line), ")")
+		if path, ok := strings.CutPrefix(line, "(subpath "); ok {
+			got = append(got, strings.Trim(path, `"`))
+		}
+	}
+	want := []string{"/h/.config/git", "/h/.gitconfig", "/r/c", "/r/t", "/r/ws/mut", "/r/ws/mut/.h", "/r/ws/ro"}
+	if strings.Join(got, ",") != strings.Join(want, ",") {
+		t.Fatalf("session read allowlist = %v, want %v", got, want)
+	}
+	for _, never := range []string{`"/r/ws"`, `"/r/ws/.workarea"`, `"/h"`, `"/Users"`, `"/private/tmp"`, `"/private/var/folders"`, `"/Volumes"`} {
+		for _, rule := range []string{"(subpath " + never + ")", "(literal " + never + ")"} {
+			if strings.Contains(text, "(allow file-read-data") && strings.Contains(readAllows(text), rule) {
+				t.Errorf("a read allow names %s:\n%s", rule, text)
+			}
+		}
+	}
+}
+
+// readAllows returns every read-allow block of a rendering.
+func readAllows(text string) string {
+	var b strings.Builder
+	for _, part := range strings.Split(text, "(allow file-read-data")[1:] {
+		end := strings.Index(part, ")\n")
+		if end < 0 {
+			end = len(part)
+		}
+		b.WriteString(part[:end+1])
+	}
+	return b.String()
+}
+
+// TestRenderSeatbelt_OpenReadsRenderNoReadRules: without a read scope the
+// profile carries no read rule at all, as before; an unknown scope that
+// slips past resolution is refused, never rendered as open reads.
+func TestRenderSeatbelt_OpenReadsRenderNoReadRules(t *testing.T) {
+	text := mustRender(t, sampleResolved(), nil)
+	if strings.Contains(text, "file-read") {
+		t.Fatalf("a profile with open reads renders a read rule:\n%s", text)
+	}
+	r := sampleResolved()
+	r.ReadScope = agent.FileReadHomeMinusSecrets
+	if _, err := renderSeatbelt(r, seatbeltHost{}, nil, identity); err == nil {
+		t.Fatal("an unrendered read scope was rendered as open reads")
+	}
+}
+
+// TestRenderSeatbelt_ReadScopeRefusesPathsItCannotQuote: a read path or a
+// runtime path the profile cannot express refuses the rendering.
+func TestRenderSeatbelt_ReadScopeRefusesPathsItCannotQuote(t *testing.T) {
+	r := readScopedResolved()
+	r.ReadPaths = []string{`/h/"x`}
+	if _, err := renderSeatbelt(r, seatbeltHost{}, nil, identity); err == nil {
+		t.Fatal("a read path with a quote rendered")
+	}
+	if _, err := renderSeatbelt(readScopedResolved(), seatbeltHost{runtimeReads: []string{"/A\\pp"}}, nil, identity); err == nil {
+		t.Fatal("a runtime path with a backslash rendered")
 	}
 }

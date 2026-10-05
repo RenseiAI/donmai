@@ -21,6 +21,20 @@ package env
 // reads it at construction and it can only tighten.
 const PiConfinementEnv = "DONMAI_PI_CONFINEMENT"
 
+// PiConfinementReadEnv is the host-level read scope for confined pi
+// sessions, a fileRead level on the execution-security ladder: "workarea"
+// confines reads to the session's workarea plus the runtime, toolchain and
+// declared paths, and implies DONMAI_PI_CONFINEMENT=required; "host" or
+// unset leaves reads open. Any other value refuses pi at construction. It
+// can only tighten.
+const PiConfinementReadEnv = "DONMAI_PI_CONFINEMENT_READ"
+
+// PiConfinementReadPathsEnv lists further absolute paths, separated like
+// PATH, that confined pi sessions may read under a read scope: host
+// configuration or per-session credential files outside the workarea. An
+// embedder can set it per session from its pre-spawn hook.
+const PiConfinementReadPathsEnv = "DONMAI_PI_CONFINEMENT_READ_PATHS"
+
 // DaemonControlURLEnv is the variable the daemon sets on every worker it
 // spawns to name its own control API (daemon.EnvDaemonControlURL is this
 // constant). It is daemon-owned already: the daemon composes it last.
@@ -33,7 +47,12 @@ const DefaultDaemonControlPort = 7734
 // IsHostOwned reports whether key is a host-owned setting a work item may
 // not set.
 func IsHostOwned(key string) bool {
-	return key == PiConfinementEnv
+	switch key {
+	case PiConfinementEnv, PiConfinementReadEnv, PiConfinementReadPathsEnv:
+		return true
+	default:
+		return false
+	}
 }
 
 // FilterHostOwnedMap returns a defensive copy of a work item's environment

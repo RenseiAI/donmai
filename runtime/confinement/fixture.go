@@ -30,6 +30,7 @@ const (
 	classReadOnly  = "read_only_leaf"
 	classProtected = "protected"
 	classWidening  = "widening"
+	classReadScope = "read_scope"
 )
 
 // probeCacheEnv is the cache variable the self-test binds, standing in for a
@@ -58,17 +59,20 @@ type harnessStep struct {
 
 // fixture is one session mode's probe world: a workarea with a mutable and a
 // read-only leaf, harness state with a protected artifact inside it, session
-// tmp and cache, decoys outside the set, and the write proxies in reach.
+// tmp and cache, decoys outside the set, and the write proxies in reach. The
+// same world serves the read-scope pass (readSteps), which runs under the
+// read scope with a declared read path (rp) outside the set.
 type fixture struct {
-	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out string
-	tag                                                           string
-	steps                                                         []harnessStep
-	cleanups                                                      []func()
-	listener                                                      net.Listener
-	accepts                                                       atomic.Int32
-	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                      net.Listener
-	tcpOpenPort, tcpClosedPort                                    int
-	tcpAccepts                                                    atomic.Int32
+	dir, ws, meta, mut, git, state, ext, ro, rom, tmp, cache, out, rp string
+	tag                                                               string
+	steps                                                             []harnessStep
+	readSteps                                                         []harnessStep
+	cleanups                                                          []func()
+	listener                                                          net.Listener
+	accepts                                                           atomic.Int32
+	tcpOpen, tcpClosed, tcpOpen6, tcpClosed6                          net.Listener
+	tcpOpenPort, tcpClosedPort                                        int
+	tcpAccepts                                                        atomic.Int32
 	// mounted records whether the mount probe got a volume over the
 	// read-only leaf; settle takes it before detaching.
 	mounted bool
@@ -99,7 +103,8 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 	fx.tmp = filepath.Join(dir, "t")
 	fx.cache = filepath.Join(dir, "c")
 	fx.out = filepath.Join(dir, "o")
-	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.rom, fx.tmp, fx.cache, fx.out} {
+	fx.rp = filepath.Join(dir, "rp")
+	for _, path := range []string{fx.meta, fx.git, fx.ext, fx.ro, fx.rom, fx.tmp, fx.cache, fx.out, fx.rp} {
 		if err := os.MkdirAll(path, 0o755); err != nil { //nolint:gosec // G301: fixture directories.
 			return nil, fmt.Errorf("confinement: fixture: %w", err)
 		}
@@ -167,6 +172,13 @@ func newFixture(dir string, mode agent.PromptSessionMode, home, stateHome, diskI
 			return nil, err
 		}
 	}
+	outsideDirs := make([]readLocation, 0, len(locations))
+	for _, location := range locations {
+		outsideDirs = append(outsideDirs, readLocation{id: location.id, dir: location.dir})
+	}
+	if err := fx.readScope(home, stateHome, outsideDirs); err != nil {
+		return nil, err
+	}
 
 	if err := fx.readOnly(diskImage, diskImageErr); err != nil {
 		return nil, err
@@ -209,8 +221,76 @@ func (fx *fixture) spec(mode agent.PromptSessionMode) Spec {
 	}
 }
 
+// readSpec is the spec of the read-scope pass: the same world under the
+// workarea read scope, with one declared read path outside the set.
+func (fx *fixture) readSpec(mode agent.PromptSessionMode) Spec {
+	spec := fx.spec(mode)
+	spec.ReadScope = agent.FileReadWorkarea
+	spec.ReadPaths = []string{fx.rp}
+	return spec
+}
+
 func (fx *fixture) add(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
 	fx.steps = append(fx.steps, harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect})
+}
+
+func (fx *fixture) addRead(class string, expectAccepted bool, step probeStep, effect func(stepResult) bool) {
+	fx.readSteps = append(fx.readSteps, harnessStep{probe: step, class: class, expectAccepted: expectAccepted, effect: effect})
+}
+
+// readLocation is one decoy directory outside the read allowlist.
+type readLocation struct{ id, dir string }
+
+// readScope builds the read-scope pass. Positive controls first: every root
+// of the writable set, the read-only leaf, the declared read path and a
+// runtime path stay readable and listable, metadata stays readable outside
+// the allowlist, and a write inside the set still lands. Then the refusals:
+// reading a file in, and listing, every decoy outside the set, and listing
+// the operator home and the host state home themselves — the shape of a
+// search over the whole disk. The declared read path stays read-only, by
+// the write rules.
+func (fx *fixture) readScope(home, stateHome string, outside []readLocation) error {
+	reported := func(res stepResult) bool { return res.Err == "" }
+	pair := func(class string, expectAccepted bool, prefix, dir string) error {
+		file := filepath.Join(dir, "rd")
+		if err := seed(file); err != nil {
+			return err
+		}
+		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".file", Op: opRead, Path: file}, reported)
+		fx.addRead(class, expectAccepted, probeStep{ID: prefix + ".list", Op: opList, Path: dir}, reported)
+		return nil
+	}
+	for _, in := range []struct{ name, dir string }{
+		{"mutable_leaf", fx.mut},
+		{"mutable_leaf_git", fx.git},
+		{"harness_state", fx.state},
+		{"session_tmp", fx.tmp},
+		{"session_cache", fx.cache},
+		{"read_only_leaf", fx.ro},
+		{"read_path", fx.rp},
+	} {
+		if err := pair(classPositive, true, "allow.read."+in.name, in.dir); err != nil {
+			return err
+		}
+	}
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.runtime", Op: opRead, Path: "/bin/sh"}, reported)
+	written := filepath.Join(fx.mut, "rw")
+	fx.addRead(classPositive, true, probeStep{ID: "allow.read.mutable_leaf.write", Op: opCreate, Path: written}, existsEffect(written))
+	for _, location := range outside {
+		if err := pair(classReadScope, false, "read.outside."+location.id, location.dir); err != nil {
+			return err
+		}
+	}
+	if len(outside) > 0 {
+		fx.addRead(classPositive, true, probeStep{ID: "allow.read.metadata_outside", Op: opStat, Path: filepath.Join(outside[0].dir, "rd")}, reported)
+	}
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.operator_home.list", Op: opList, Path: home}, reported)
+	fx.addRead(classReadScope, false, probeStep{ID: "read.outside.state_home.list", Op: opList, Path: stateHome}, reported)
+	// A declared read path is outside the writable set: the write rules,
+	// not the read rules, keep it read-only.
+	created := filepath.Join(fx.rp, "n")
+	fx.addRead(classOutside, false, probeStep{ID: "outside.read_path.create", Op: opCreate, Path: created}, existsEffect(created))
+	return nil
 }
 
 // fileOps adds the file operation probes for one directory: create, write,

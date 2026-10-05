@@ -98,7 +98,12 @@
 // (Options.RequireConfinement / DONMAI_PI_CONFINEMENT=required) or the
 // session declares a repository authority, the provider spawns pi inside the
 // executor confinement of ADR-2026-10-03-executor-os-confinement.md,
-// headless and interactive alike (confinement.go). Container and microVM
+// headless and interactive alike (confinement.go). The host can also confine
+// a confined seat's reads (Options.ConfinementReadScope /
+// DONMAI_PI_CONFINEMENT_READ=workarea): file contents and directory listings
+// outside the session's workarea, the runtime and toolchain paths, pi's own
+// install, git's user configuration and the host-declared read paths are
+// refused, so a search over the whole disk fails fast. Container and microVM
 // isolation stay with the sandbox provider family. Without that confinement
 // a hostile tool execution still runs as the user. Do not mistake this
 // extension for a sandbox.

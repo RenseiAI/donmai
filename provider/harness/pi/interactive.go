@@ -93,7 +93,7 @@ func (p *Provider) spawnInteractive(ctx context.Context, spec agent.Spec) (agent
 	// passes ExtraFiles — so no out-of-set descriptor reaches it either.
 	var plan *confinement.Plan
 	if confiner != nil {
-		plan, err = confinePiSession(spec, layout, confiner)
+		plan, err = p.confineSession(spec, layout, confiner)
 		if err != nil {
 			return nil, err
 		}

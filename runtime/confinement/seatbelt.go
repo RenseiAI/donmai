@@ -6,12 +6,52 @@ import (
 	"regexp"
 	"strings"
 	"unicode/utf8"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 // seatbeltProfileVersion is the macOS profile backend's implementation
 // version. It is part of the backend version, so a self-test record taken
 // under an older profile shape is stale.
-const seatbeltProfileVersion = "seatbelt-profile-v3"
+const seatbeltProfileVersion = "seatbelt-profile-v4"
+
+// seatbeltHost is what a rendering needs from the host beside the session.
+type seatbeltHost struct {
+	// shared are the shared temporary and cache locations, named so their
+	// writes are denied (D2.1).
+	shared []string
+	// runtimeReads are host-specific runtime paths readable under a read
+	// scope beside the static list: the active developer directory.
+	runtimeReads []string
+}
+
+// seatbeltRuntimeReads are the runtime and toolchain paths readable under a
+// read scope. dyld reads the root directory itself at every exec, so the
+// root is readable as a literal: listing it shows the top-level names and
+// nothing below them, and no directory under it is listable unless it is
+// named here or in the session's allowlist.
+var seatbeltRuntimeReads = []string{
+	`(literal "/")`,
+	`(subpath "/usr")`, // the OS userland and /usr/local toolchains
+	`(subpath "/bin")`,
+	`(subpath "/sbin")`,
+	`(subpath "/System")`, // frameworks; the data-volume mirror is re-denied below
+	`(subpath "/Library/Apple")`,
+	`(subpath "/Library/Developer")`, // command line tools
+	`(subpath "/opt/homebrew")`,
+	`(subpath "/private/etc")`,
+	`(subpath "/private/var/db/timezone")`,
+	`(literal "/private/var/run/resolv.conf")`,
+	`(subpath "/dev")`,
+}
+
+// seatbeltSystemVolumes holds the firmlinked data volume, a second spelling
+// of every user tree, and the other system volumes. It is re-denied after
+// the runtime allows; the OS cryptexes inside it stay readable.
+const (
+	seatbeltSystemVolumes = "/System/Volumes"
+	seatbeltCryptexes     = "/System/Volumes/Preboot/Cryptexes"
+)
 
 // loopbackTCPDeny closes outbound TCP to the local machine (loopback and
 // the host's own addresses, which the profile names "localhost"): the
@@ -76,19 +116,24 @@ var servicePattern = regexp.MustCompile(`^[A-Za-z0-9][A-Za-z0-9._-]*$`)
 // renderSeatbelt renders the macOS profile. SBPL applies the last matching
 // rule, so the order is the boundary:
 //
-//  1. allow by default — reads stay open in this slice;
-//  2. deny every write, every hard link, and the shared temporary and cache
+//  1. allow by default;
+//  2. under a read scope only: deny reading file contents and listing
+//     directories, allow the runtime paths, re-deny the system volumes,
+//     re-allow the OS cryptexes, then allow the session's read allowlist
+//     last, so it wins over the system carve-out; metadata stays readable;
+//  3. deny every write, every hard link, and the shared temporary and cache
 //     locations by name (D2, D2.1);
-//  3. allow the device nodes and the writable set (D2);
-//  4. deny the read-only leaves, the protected paths, the workarea root and
+//  4. allow the device nodes and the writable set (D2);
+//  5. deny the read-only leaves, the protected paths, the workarea root and
 //     its metadata, and pin every ancestor between a writable root and a
 //     nested denied path against rename — after the allows, so they win;
-//  5. close the write proxies: mounting, job submission, launch services,
+//  6. close the write proxies: mounting, job submission, launch services,
 //     scripting events, preference writes, task ports, local sockets
 //     outside the set, loopback TCP outside the declared ports, and the
 //     pasteboard (D2.5);
-//  6. the composer's deny-only rules, last, so they always win (D4.3).
-func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(string) (string, error)) (string, error) {
+//  7. the composer's deny-only rules, last, so they always win (D4.3): a
+//     composer read deny holds inside the read allowlist too.
+func renderSeatbelt(r *Resolved, host seatbeltHost, rules []Rule, canonical func(string) (string, error)) (string, error) {
 	var b strings.Builder
 	quote := func(path string) (string, error) {
 		quoted, ok := sbplString(path)
@@ -126,9 +171,35 @@ func renderSeatbelt(r *Resolved, shared []string, rules []Rule, canonical func(s
 	fmt.Fprintf(&b, "(version 1)\n; executor OS confinement, %s\n", seatbeltProfileVersion)
 	b.WriteString("(allow default)\n\n")
 
+	switch r.ReadScope {
+	case "":
+	case agent.FileReadWorkarea:
+		runtimeFilters, err := filters("subpath", host.runtimeReads)
+		if err != nil {
+			return "", err
+		}
+		sessionFilters, err := filters("subpath", r.ReadAllowlist())
+		if err != nil {
+			return "", err
+		}
+		b.WriteString("; Read scope workarea: file contents and directory listings are denied\n")
+		b.WriteString("; outside the allowlist. Metadata stays readable.\n")
+		b.WriteString("(deny file-read-data)\n")
+		b.WriteString("; Runtime and toolchain paths.\n")
+		rule("allow", "file-read-data", append(append([]string{}, seatbeltRuntimeReads...), runtimeFilters...))
+		b.WriteString("; The system volumes, a second spelling of every user tree, except the OS cryptexes.\n")
+		fmt.Fprintf(&b, "(deny file-read-data (subpath %q))\n", seatbeltSystemVolumes)
+		fmt.Fprintf(&b, "(allow file-read-data (subpath %q))\n", seatbeltCryptexes)
+		b.WriteString("; The session: writable set, read-only leaves, declared read paths. Last, so they win.\n")
+		rule("allow", "file-read-data", sessionFilters)
+		b.WriteString("\n")
+	default:
+		return "", refuse(ReasonWritableSetUnrepresentable, "unknown read scope %q", r.ReadScope)
+	}
+
 	b.WriteString("; D2: writes and hard links are denied unless the writable set allows them.\n")
 	b.WriteString("(deny file-write*)\n(deny file-link)\n")
-	sharedFilters, err := filters("subpath", shared)
+	sharedFilters, err := filters("subpath", host.shared)
 	if err != nil {
 		return "", err
 	}

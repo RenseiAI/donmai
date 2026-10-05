@@ -14,6 +14,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"github.com/RenseiAI/donmai/agent"
 )
 
 func newLiveConfiner(t *testing.T, backend Backend, extra ExtraRules) (*Confiner, string) {
@@ -89,7 +91,7 @@ func TestSeatbelt_SelfTestRedWithoutBackend(t *testing.T) {
 			refused[probe.Class]++
 		}
 	}
-	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening} {
+	for _, class := range []string{classOutside, classReadOnly, classProtected, classWidening, classReadScope} {
 		if refused[class] == 0 {
 			t.Errorf("no %s probe ran", class)
 		}
@@ -447,13 +449,29 @@ func TestSeatbelt_LoopbackTCPRedWithoutDeny(t *testing.T) {
 		t.Fatalf("prepare: %v", err)
 	}
 	defer func() { _ = plan.Release() }()
+	runRed := func(args ...string) int {
+		code, _ := runStripped(t, plan, w.mut, loopbackTCPDeny+"\n", args...)
+		return code
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(openPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d", openPort, code)
+	}
+	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(closedPort)); code != 0 {
+		t.Fatalf("nc to port %d without the deny failed: exit %d; the red control does not discriminate", closedPort, code)
+	}
+}
+
+// runStripped runs argv under the plan's rendered profile with one rule
+// removed, through the same launcher and environment: the red control that
+// shows the removed rule, and nothing else, is what holds. It fails the test
+// when the profile does not hold the rule.
+func runStripped(t *testing.T, plan *Plan, dir, remove string, argv ...string) (int, string) {
+	t.Helper()
 	wrapped, err := plan.Command([]string{"/usr/bin/true"})
 	if err != nil {
 		t.Fatalf("Command: %v", err)
 	}
-	// The wrapped argv is sandbox-exec -f <profile> -- <binary>: strip the
-	// loopback deny from the rendered profile so the red control runs the
-	// same harness under the same profile minus the change under test.
+	// The wrapped argv is sandbox-exec -f <profile> -- <binary>.
 	var profilePath string
 	for i, arg := range wrapped {
 		if arg == "-f" && i+1 < len(wrapped) {
@@ -467,43 +485,31 @@ func TestSeatbelt_LoopbackTCPRedWithoutDeny(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	stripped := strings.ReplaceAll(string(raw), loopbackTCPDeny+"\n", "")
+	stripped := strings.ReplaceAll(string(raw), remove, "")
 	if stripped == string(raw) {
-		t.Fatal("rendered profile holds no loopback deny to strip")
+		t.Fatalf("rendered profile holds no %q to strip", remove)
 	}
 	redPath := profilePath + ".red"
 	if err := os.WriteFile(redPath, []byte(stripped), 0o600); err != nil { //nolint:gosec // G703: the profile path comes from the plan under test.
 		t.Fatal(err)
 	}
 	defer func() { _ = os.Remove(redPath) }()
-	red := append([]string{}, wrapped...)
-	for i, arg := range red {
-		if arg == profilePath {
-			red[i] = redPath
-		}
+	full := []string{sandboxExec, "-f", redPath, "--"}
+	full = append(full, argv...)
+	ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, full[0], full[1:]...) //nolint:gosec // G204: the confined argv under test.
+	cmd.Dir = dir
+	cmd.Env = overlayEnv(os.Environ(), plan.Environment())
+	out, err := cmd.CombinedOutput()
+	var exitErr *exec.ExitError
+	if errors.As(err, &exitErr) {
+		return exitErr.ExitCode(), string(out)
 	}
-	runRed := func(args ...string) int {
-		ctx, cancel := context.WithTimeout(context.Background(), time.Minute)
-		defer cancel()
-		full := append(append([]string{}, red[:len(red)-1]...), args...)
-		cmd := exec.CommandContext(ctx, full[0], full[1:]...) //nolint:gosec // G204: the confined argv under test.
-		cmd.Dir = w.mut
-		cmd.Env = overlayEnv(os.Environ(), plan.Environment())
-		if err := cmd.Run(); err != nil {
-			var exitErr *exec.ExitError
-			if errors.As(err, &exitErr) {
-				return exitErr.ExitCode()
-			}
-			t.Fatalf("run %v: %v", args, err)
-		}
-		return 0
+	if err != nil {
+		t.Fatalf("run %v: %v", argv, err)
 	}
-	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(openPort)); code != 0 {
-		t.Fatalf("nc to port %d without the deny failed: exit %d", openPort, code)
-	}
-	if code := runRed("/usr/bin/nc", "-z", "-w", "2", "127.0.0.1", itoaPort(closedPort)); code != 0 {
-		t.Fatalf("nc to port %d without the deny failed: exit %d; the red control does not discriminate", closedPort, code)
-	}
+	return 0, string(out)
 }
 
 func itoaPort(port int) string {
@@ -619,5 +625,209 @@ func TestSeatbelt_PasteboardClosed(t *testing.T) {
 	}
 	if code, out := runConfined(t, plan, w.mut, nil, "/bin/sh", "-c", "echo probe | /usr/bin/pbcopy -pboard probe-test-board"); code == 0 {
 		t.Errorf("confined pbcopy succeeded: %s", out)
+	}
+}
+
+// openReadsBackend is the real macOS backend rendering every session with
+// reads open: the read-scope rules, and only they, are missing.
+type openReadsBackend struct{ *seatbeltBackend }
+
+func (b openReadsBackend) Apply(req ApplyRequest) (Applied, error) {
+	open := *req.Resolved
+	open.ReadScope, open.ReadPaths = "", nil
+	req.Resolved = &open
+	return b.seatbeltBackend.Apply(req)
+}
+
+// TestSeatbelt_SelfTestRedWithOpenReads is the read scope's discriminating
+// control: with the read rules dropped from an otherwise real profile, every
+// read-scope refusal turns red in both session modes, and nothing else does.
+func TestSeatbelt_SelfTestRedWithOpenReads(t *testing.T) {
+	c, _ := newLiveConfiner(t, openReadsBackend{&seatbeltBackend{exe: sandboxExec}}, nil)
+	record, err := runSelfTest(t, c)
+	if reason, _ := ReasonOf(err); reason != ReasonSelfTestFailed {
+		t.Fatalf("SelfTest with open reads: err=%v, want self_test_failed", err)
+	}
+	if record.Passed {
+		t.Fatal("the self-test passed with the read rules dropped")
+	}
+	readRefusals := 0
+	for _, probe := range record.Probes {
+		switch {
+		case probe.Class == classReadScope && probe.Pass:
+			t.Errorf("%s/%s passed with open reads; the probe does not discriminate the read scope", probe.Mode, probe.ID)
+		case probe.Class != classReadScope && !probe.Pass:
+			t.Errorf("%s/%s failed although only the read rules are missing: %s", probe.Mode, probe.ID, probe.Detail)
+		}
+		if probe.Class == classReadScope {
+			readRefusals++
+		}
+	}
+	if readRefusals == 0 {
+		t.Fatal("no read-scope probe ran")
+	}
+}
+
+// readScopedWorld is a live session under the workarea read scope.
+func readScopedWorld(t *testing.T, readPaths ...string) (specWorld, *Plan) {
+	t.Helper()
+	w, c := liveWorld(t)
+	spec := w.spec()
+	spec.ReadScope = agent.FileReadWorkarea
+	spec.ReadPaths = readPaths
+	plan, err := c.prepare(spec, "")
+	if err != nil {
+		t.Fatalf("prepare: %v", err)
+	}
+	t.Cleanup(func() { _ = plan.Release() })
+	return w, plan
+}
+
+// TestSeatbelt_ReadScopeFindIsFastAndBlind is the whole-disk search under
+// the workarea read scope: find over the root to depth six finishes in
+// under five seconds and never reports a sentinel in the operator's home,
+// and find over the home is refused at the top instead of walking it. The
+// same search with the blanket read deny stripped finds the sentinel.
+func TestSeatbelt_ReadScopeFindIsFastAndBlind(t *testing.T) {
+	home, err := os.UserHomeDir()
+	if err != nil {
+		t.Fatalf("UserHomeDir: %v", err)
+	}
+	if home, err = filepath.EvalSymlinks(home); err != nil {
+		t.Fatal(err)
+	}
+	name := ".donmai-read-scope-sentinel-" + randomSuffix()
+	sentinel := filepath.Join(home, name)
+	if err := os.WriteFile(sentinel, []byte("sentinel\n"), 0o600); err != nil {
+		t.Fatalf("write sentinel: %v", err)
+	}
+	t.Cleanup(func() { _ = os.Remove(sentinel) })
+	out, err := exec.Command("/usr/bin/find", home, "-maxdepth", "1", "-name", name).Output() //nolint:gosec // G204: fixed tool, test paths.
+	if err != nil || !strings.Contains(string(out), sentinel) {
+		t.Fatalf("unconfined control: find over the home did not report the sentinel (err %v): %q", err, out)
+	}
+
+	w, plan := readScopedWorld(t)
+	start := time.Now()
+	_, out2 := runConfined(t, plan, w.mut, nil, "/usr/bin/find", "/", "-maxdepth", "6", "-name", name)
+	elapsed := time.Since(start)
+	if strings.Contains(out2, sentinel) {
+		t.Errorf("confined find over the root reported the sentinel in the home")
+	}
+	if elapsed >= 5*time.Second {
+		t.Errorf("confined find over the root to depth 6 took %s, want under 5s", elapsed)
+	}
+	t.Logf("confined find / -maxdepth 6: %s", elapsed.Round(time.Millisecond))
+
+	start = time.Now()
+	_, out2 = runConfined(t, plan, w.mut, nil, "/usr/bin/find", home, "-maxdepth", "4", "-name", name)
+	if strings.Contains(out2, sentinel) {
+		t.Error("confined find over the home reported the sentinel")
+	}
+	if !strings.Contains(out2, "Operation not permitted") {
+		t.Errorf("confined find over the home was not refused at the top: %q", out2)
+	}
+	t.Logf("confined find <home> -maxdepth 4: %s", time.Since(start).Round(time.Millisecond))
+	if code, out := runConfined(t, plan, w.mut, nil, "/bin/ls", home); code == 0 {
+		t.Errorf("confined ls of the home succeeded: %q", out)
+	}
+	if code, _ := runConfined(t, plan, w.mut, nil, "/bin/cat", sentinel); code == 0 {
+		t.Error("confined cat of the sentinel succeeded")
+	}
+	if code, _ := runConfined(t, plan, w.mut, nil, "/bin/test", "-f", sentinel); code != 0 {
+		t.Error("confined stat of the sentinel failed; metadata must stay readable")
+	}
+
+	_, red := runStripped(t, plan, w.mut, "(deny file-read-data)\n", "/usr/bin/find", home, "-maxdepth", "1", "-name", name)
+	if !strings.Contains(red, sentinel) {
+		t.Fatalf("with the read deny stripped, find over the home did not report the sentinel; the test does not discriminate: %q", red)
+	}
+}
+
+// goEnv returns one go env value from outside the boundary.
+func goEnv(t *testing.T, key string) string {
+	t.Helper()
+	out, err := exec.Command("go", "env", key).Output() //nolint:gosec // G204: fixed tool, fixed key.
+	if err != nil {
+		t.Fatalf("go env %s: %v", key, err)
+	}
+	return strings.TrimSpace(string(out))
+}
+
+// TestSeatbelt_ReadScopeSeatWork: ordinary seat work still succeeds inside
+// the workarea under the read scope — git status and commit with the user
+// config declared readable, a go build with the toolchain declared, and
+// node and pnpm where they are installed — while an undeclared git user
+// config is a fatal error for git, which is why an adapter declares it.
+func TestSeatbelt_ReadScopeSeatWork(t *testing.T) {
+	base := shortTempDir(t, "dcg")
+	gitconfig := filepath.Join(base, "gitconfig")
+	if err := os.WriteFile(gitconfig, []byte("[user]\n\tname = probe\n\temail = probe@example.invalid\n[init]\n\tdefaultBranch = main\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	reads := []string{goEnv(t, "GOROOT"), gitconfig}
+	optional := map[string]bool{}
+	for _, tool := range []string{"node", "pnpm"} {
+		path, err := exec.LookPath(tool)
+		if err != nil {
+			t.Logf("%s is not installed here; not exercised", tool)
+			continue
+		}
+		root, err := InstallRoot(path)
+		if err != nil {
+			t.Fatalf("InstallRoot(%s): %v", tool, err)
+		}
+		if resolved, _ := filepath.EvalSymlinks(path); strings.Contains(resolved, string(filepath.Separator)+"corepack"+string(filepath.Separator)) {
+			// A corepack shim runs a package manager it downloaded into a
+			// cache under the home: a host declares that cache, this test
+			// does not guess it.
+			t.Logf("%s is a corepack shim; not exercised", tool)
+			continue
+		}
+		if out, err := exec.Command(path, "--version").CombinedOutput(); err != nil { //nolint:gosec // G204: a tool found on PATH.
+			t.Logf("%s --version fails unconfined (%v: %s); not exercised", tool, err, strings.TrimSpace(string(out)))
+			continue
+		}
+		reads = append(reads, root)
+		optional[tool] = true
+	}
+	w, plan := readScopedWorld(t, reads...)
+	gomod, gopath := filepath.Join(w.cache, "go-mod"), filepath.Join(w.cache, "go-path")
+	for _, dir := range []string{gomod, gopath} {
+		if err := os.MkdirAll(dir, 0o750); err != nil {
+			t.Fatal(err)
+		}
+	}
+	env := []string{"GIT_CONFIG_GLOBAL=" + gitconfig, "GIT_CONFIG_NOSYSTEM=1", "GOMODCACHE=" + gomod, "GOPATH=" + gopath, "GOTOOLCHAIN=local", "GOFLAGS=", "GOENV=off"}
+	repo := filepath.Join(w.mut, "repo")
+	script := strings.Join([]string{
+		`set -e`,
+		`mkdir -p "` + repo + `" && cd "` + repo + `"`,
+		`git init -q .`,
+		`printf 'module example.com/probe\n\ngo 1.21\n' > go.mod`,
+		`printf 'package main\n\nfunc main() { println("ok") }\n' > main.go`,
+		`git add -A`,
+		`git commit -q -m first`,
+		`git status --porcelain`,
+		`git log --oneline | grep -q first`,
+		`go build -o "$TMPDIR/probe" .`,
+		`"$TMPDIR/probe"`,
+	}, "\n")
+	if code, out := runConfined(t, plan, w.mut, env, "/bin/sh", "-c", script); code != 0 || !strings.Contains(out, "ok") {
+		t.Fatalf("git and go under the read scope: exit %d: %s", code, out)
+	}
+	for tool := range optional {
+		if code, out := runConfined(t, plan, w.mut, nil, tool, "--version"); code != 0 {
+			t.Errorf("%s --version under the read scope: exit %d: %s", tool, code, out)
+		}
+	}
+
+	undeclared := filepath.Join(base, "undeclared-gitconfig")
+	if err := os.WriteFile(undeclared, []byte("[user]\n\tname = probe\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	code, out := runConfined(t, plan, w.mut, []string{"GIT_CONFIG_GLOBAL=" + undeclared, "GIT_CONFIG_NOSYSTEM=1"}, "git", "-C", repo, "status")
+	if code == 0 || !strings.Contains(out, "Operation not permitted") {
+		t.Fatalf("git with an undeclared user config: exit %d: %s; want a refusal", code, out)
 	}
 }
