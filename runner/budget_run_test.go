@@ -55,7 +55,9 @@ func concat(groups ...[]agent.Event) []agent.Event {
 }
 
 // wantMetered pins that the reported cost counts exactly what the budget meter
-// observed, on the envelope and on the status the platform received.
+// observed, on the envelope and on the status the platform received: tokens is
+// the cost's input + output, and the meter reads that plus any cache reads at
+// their tenth weight (meteredTokens).
 func wantMetered(t *testing.T, res *Result, status map[string]json.RawMessage, tokens int64) {
 	t.Helper()
 	if res.Cost == nil {
@@ -64,8 +66,8 @@ func wantMetered(t *testing.T, res *Result, status map[string]json.RawMessage, t
 	if got := res.Cost.InputTokens + res.Cost.OutputTokens; got != tokens {
 		t.Errorf("Cost tokens = %d; want %d", got, tokens)
 	}
-	if res.BudgetReport == nil || res.BudgetReport.ObservedTokens != tokens {
-		t.Errorf("BudgetReport = %+v; want ObservedTokens %d", res.BudgetReport, tokens)
+	if want := tokens + res.Cost.CachedInputTokens/cacheReadMeterDivisor; res.BudgetReport == nil || res.BudgetReport.ObservedTokens != want {
+		t.Errorf("BudgetReport = %+v; want ObservedTokens %d", res.BudgetReport, want)
 	}
 	if status != nil {
 		if got, want := string(status["inputTokens"]), fmt.Sprint(res.Cost.InputTokens); got != want {

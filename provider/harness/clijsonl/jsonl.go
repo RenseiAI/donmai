@@ -50,9 +50,10 @@ type rawAssistantEnvelope struct {
 		StopReason string            `json:"stop_reason,omitempty"`
 		Content    []rawContentBlock `json:"content"`
 		Usage      struct {
-			InputTokens          int64 `json:"input_tokens"`
-			OutputTokens         int64 `json:"output_tokens"`
-			CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+			InputTokens              int64 `json:"input_tokens"`
+			OutputTokens             int64 `json:"output_tokens"`
+			CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+			CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 		} `json:"usage,omitempty"`
 	} `json:"message"`
 }
@@ -129,6 +130,7 @@ type rawAuthStatusEnvelope struct {
 //	    "input_tokens": 5,
 //	    "output_tokens": 8,
 //	    "cache_read_input_tokens": 16526,
+//	    "cache_creation_input_tokens": 1200,
 //	    ...
 //	  }
 //	}
@@ -143,10 +145,15 @@ type rawResultEnvelope struct {
 	Errors       []struct {
 		Message string `json:"message,omitempty"`
 	} `json:"errors,omitempty"`
+	// Usage follows the Anthropic accounting: input_tokens excludes both
+	// cache classes, which ride cache_read_input_tokens (CostData
+	// CachedInputTokens) and cache_creation_input_tokens (CostData
+	// CacheWriteTokens).
 	Usage struct {
-		InputTokens          int64 `json:"input_tokens"`
-		OutputTokens         int64 `json:"output_tokens"`
-		CacheReadInputTokens int64 `json:"cache_read_input_tokens"`
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputTokens     int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 	// APIError carries the endpoint's structured refusal on failure
 	// lines (for example HTTP 429 with a usage-limit code and a reset
@@ -363,13 +370,15 @@ func mapAssistant(line []byte) []agent.Event {
 	// Older emitters omit message.usage; their terminal ResultEvent is handled
 	// conservatively by the aggregate fallback in runtime/span.
 	if a.Message.Usage.InputTokens != 0 || a.Message.Usage.OutputTokens != 0 ||
-		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.StopReason != "" {
+		a.Message.Usage.CacheReadInputTokens != 0 || a.Message.Usage.CacheCreationInputTokens != 0 ||
+		a.Message.StopReason != "" {
 		out = append(out, agent.LlmCallEvent{
 			Model:             a.Message.Model,
 			ResponseModel:     a.Message.Model,
 			InputTokens:       a.Message.Usage.InputTokens,
 			OutputTokens:      a.Message.Usage.OutputTokens,
 			CachedInputTokens: a.Message.Usage.CacheReadInputTokens,
+			CacheWriteTokens:  a.Message.Usage.CacheCreationInputTokens,
 			FinishReason:      a.Message.StopReason,
 			UsageSource:       agent.LlmUsageProvider,
 			TurnCompleted:     true,
@@ -481,6 +490,7 @@ func mapResult(line []byte) []agent.Event {
 		InputTokens:       r.Usage.InputTokens,
 		OutputTokens:      r.Usage.OutputTokens,
 		CachedInputTokens: r.Usage.CacheReadInputTokens,
+		CacheWriteTokens:  r.Usage.CacheCreationInputTokens,
 	}
 	if observedCost != nil {
 		cost.TotalCostUsd = *observedCost

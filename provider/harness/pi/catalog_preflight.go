@@ -272,7 +272,19 @@ func fallbackToInjectedProvider(spec agent.Spec, miss *catalogMissError) (agent.
 // aggregator-bound session when, and only when, pi's catalog lists the exact
 // slug — except for the "google/" author, whose slugs always stay on the
 // injected Chat Completions lane: the aggregator serves them over a protocol
-// that ignores the thinking budget, while the injected lane grades effort.
+// that ignores the thinking budget, while the injected lane grades effort —
+// and except for a binding whose protocol is the Responses API
+// (agent.ProtoOpenAIResponses), which always stays on the injected provider
+// over that protocol. Chat Completions is the control plane's default
+// binding protocol, so promoting such a binding only adds pi's own model
+// metadata; Responses is never a default, it is bound for a slug on
+// purpose, and pi's built-in aggregator provider would replace it with the
+// protocol its catalog lists for the slug. On the Vercel AI Gateway that
+// is the Anthropic Messages protocol, over which the gateway does not
+// prompt-cache models outside the Anthropic family (the "meta/" models,
+// for example); over Responses pi sends its session id as the
+// prompt_cache_key on every request, and the gateway caches the session's
+// prefix under it.
 // spec.Model must be the aggregator's whole "<author>/<model>" slug on
 // a non-loopback binding whose BaseURL is the aggregator's own https host
 // (builtinAggregatorForBaseURL). On a confirmed match the pin is rewritten to
@@ -294,6 +306,12 @@ func (p *Provider) promoteAggregatorPin(ctx context.Context, spec agent.Spec) (a
 	// budget, while the injected lane grades effort. Skip the native
 	// promotion for that author even when the catalog lists the slug.
 	if strings.HasPrefix(spec.Model, "google/") {
+		return spec, false
+	}
+	// A Responses binding keeps its protocol: the native provider would
+	// swap it for the catalog's, dropping the prompt_cache_key pi sends
+	// on every Responses request.
+	if ep.Protocol == agent.ProtoOpenAIResponses {
 		return spec, false
 	}
 	agg, ok := builtinAggregatorForBaseURL(ep.BaseURL)

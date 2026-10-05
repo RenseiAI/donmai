@@ -85,9 +85,10 @@ type oneShotEnvelope struct {
 	NumTurns       int      `json:"num_turns"`
 	TotalCostUSD   *float64 `json:"total_cost_usd"`
 	Usage          struct {
-		InputTokens         int64 `json:"input_tokens"`
-		OutputTokens        int64 `json:"output_tokens"`
-		CacheReadInputToken int64 `json:"cache_read_input_tokens"`
+		InputTokens              int64 `json:"input_tokens"`
+		OutputTokens             int64 `json:"output_tokens"`
+		CacheReadInputToken      int64 `json:"cache_read_input_tokens"`
+		CacheCreationInputTokens int64 `json:"cache_creation_input_tokens"`
 	} `json:"usage"`
 }
 
@@ -259,16 +260,22 @@ func parseOneShotEnvelope(stdout []byte) (oneShotEnvelope, error) {
 	return env, nil
 }
 
-// oneShotCost projects the envelope's usage onto agent.CostData. Returns nil
-// when the CLI reported nothing to attribute (a subscription/login cell).
+// oneShotCost projects the envelope's usage onto agent.CostData: input,
+// output, cache reads (cache_read_input_tokens) and cache writes
+// (cache_creation_input_tokens), which the Anthropic usage keeps out of
+// input_tokens. Returns nil when the CLI reported nothing to attribute (a
+// subscription/login cell).
 func oneShotCost(env oneShotEnvelope) *agent.CostData {
-	if env.TotalCostUSD == nil && env.Usage.InputTokens == 0 && env.Usage.OutputTokens == 0 {
+	u := env.Usage
+	if env.TotalCostUSD == nil && u.InputTokens == 0 && u.OutputTokens == 0 &&
+		u.CacheReadInputToken == 0 && u.CacheCreationInputTokens == 0 {
 		return nil
 	}
 	c := &agent.CostData{
-		InputTokens:       env.Usage.InputTokens,
-		OutputTokens:      env.Usage.OutputTokens,
-		CachedInputTokens: env.Usage.CacheReadInputToken,
+		InputTokens:       u.InputTokens,
+		OutputTokens:      u.OutputTokens,
+		CachedInputTokens: u.CacheReadInputToken,
+		CacheWriteTokens:  u.CacheCreationInputTokens,
 		NumTurns:          env.NumTurns,
 	}
 	if env.TotalCostUSD != nil {
