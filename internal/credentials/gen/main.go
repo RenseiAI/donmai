@@ -22,7 +22,8 @@
 // `make test` and `make verify-generated` — mirroring how matrix/gen pairs
 // a write-only generator with a parity test.
 //
-// Usage (output path resolves relative to this file, not the caller's CWD):
+// Usage (output path resolves from the module root, so any CWD inside the
+// module works):
 //
 //	go run ./internal/credentials/gen     # write blocklist.json
 package main
@@ -31,7 +32,6 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
-	"runtime"
 
 	"github.com/RenseiAI/donmai/internal/credentials"
 )
@@ -50,16 +50,36 @@ func main() {
 	fmt.Printf("gen: wrote %s (%d names, digest %s)\n", filepath.Base(outPath), len(credentials.AgentEnvBlocklist), digest)
 }
 
-// artifactPath resolves internal/credentials/blocklist.json relative to
-// this source file, so the tool works from any CWD (repo root under `make`,
-// or the package dir under `go generate`).
+// artifactPath resolves internal/credentials/blocklist.json from the module
+// root, found by walking up from the working directory (repo root under
+// `make` or `go run`, the package dir under `go generate`). It never uses
+// runtime.Caller: under `-trimpath` that returns a module-relative path that
+// does not exist on disk.
 func artifactPath() string {
-	_, thisFile, _, ok := runtime.Caller(0)
-	if !ok {
-		fatalf("runtime.Caller(0) failed")
+	wd, err := os.Getwd()
+	if err != nil {
+		fatalf("getwd: %v", err)
 	}
-	// thisFile == .../internal/credentials/gen/main.go
-	return filepath.Join(filepath.Dir(filepath.Dir(thisFile)), "blocklist.json")
+	root, err := moduleRoot(wd)
+	if err != nil {
+		fatalf("%v", err)
+	}
+	return filepath.Join(root, "internal", "credentials", "blocklist.json")
+}
+
+// moduleRoot walks up from dir to the directory holding go.mod.
+func moduleRoot(dir string) (string, error) {
+	start := dir
+	for {
+		if _, err := os.Stat(filepath.Join(dir, "go.mod")); err == nil {
+			return dir, nil
+		}
+		parent := filepath.Dir(dir)
+		if parent == dir {
+			return "", fmt.Errorf("no go.mod found walking up from %s", start)
+		}
+		dir = parent
+	}
 }
 
 func fatalf(format string, a ...any) {
