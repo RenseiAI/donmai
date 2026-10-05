@@ -8,6 +8,10 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 
 ## [Unreleased]
 
+No unreleased changes.
+
+## v0.72.65 — 2026-10-05
+
 ### Features
 
 - Confine pi seat reads to the workarea on macOS: with `DONMAI_PI_CONFINEMENT_READ=workarea` the seat profile refuses file contents and directory listings outside the session, the runtime and toolchain paths, pi's install, git's user config and `DONMAI_PI_CONFINEMENT_READ_PATHS`, so a `find /` from a seat fails fast instead of walking the disk. The read scope denies file contents and extended attributes together (a compressed file keeps its contents in attributes) and keeps package data (`/opt/homebrew/var`, `/usr/local/var`) and terminal devices closed; the Xcode licence record and xcrun's lookup cache stay readable so `/usr/bin/git`, `cc` and cgo run. The self-test gains a read-scope pass (probe set v5); confined sessions also bind `GOPATH` and the pnpm store per session.
