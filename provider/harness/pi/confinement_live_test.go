@@ -84,6 +84,7 @@ echo "tmpdir=$TMPDIR" >> "$r"
 echo "gocache=$GOCACHE" >> "$r"
 echo "gopath=$GOPATH" >> "$r"
 echo "pnpm_store=$PNPM_CONFIG_STORE_DIR" >> "$r"
+echo "xdg_runtime=$XDG_RUNTIME_DIR" >> "$r"
 if [ -n "$PROBE_READ_OUTSIDE" ]; then
 	(cat "$PROBE_READ_OUTSIDE" > /dev/null) 2>>"$r"; echo "read_outside=$?" >> "$r"
 	(ls "$PROBE_OUTSIDE" > /dev/null) 2>>"$r"; echo "list_outside=$?" >> "$r"
@@ -1010,13 +1011,19 @@ func TestPiConfinement_ReadScopeConfinesReads(t *testing.T) {
 		}
 	}
 	layout := newSessionLayoutForSpec(w.spec())
+	runtimeDir := filepath.Join(layout.root, piSessionCacheDir, "run")
 	for key, want := range map[string]string{
-		"gopath":     filepath.Join(layout.root, piSessionCacheDir, "go-path"),
-		"pnpm_store": filepath.Join(layout.root, piSessionCacheDir, "pnpm-store"),
+		"gopath":      filepath.Join(layout.root, piSessionCacheDir, "go-path"),
+		"pnpm_store":  filepath.Join(layout.root, piSessionCacheDir, "pnpm-store"),
+		"xdg_runtime": runtimeDir,
 	} {
 		if r.vals[key] != want {
 			t.Errorf("read scope: %s = %q, want the session cache %q", key, r.vals[key], want)
 		}
+	}
+	// Tools only keep locks in a runtime directory their user owns alone.
+	if info, err := os.Stat(runtimeDir); err != nil || info.Mode().Perm() != 0o700 {
+		t.Errorf("the session runtime directory is not owner-only: %v %v", info, err)
 	}
 
 	resetProbe(w)

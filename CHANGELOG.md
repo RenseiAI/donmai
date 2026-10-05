@@ -11,6 +11,8 @@ Format: `## vX.Y.Z — YYYY-MM-DD` with subsections `Features`, `Fixes`, `Chores
 ### Features
 
 - Confine pi seat reads to the workarea on macOS: with `DONMAI_PI_CONFINEMENT_READ=workarea` the seat profile refuses file contents and directory listings outside the session, the runtime and toolchain paths, pi's install, git's user config and `DONMAI_PI_CONFINEMENT_READ_PATHS`, so a `find /` from a seat fails fast instead of walking the disk. The self-test gains a read-scope pass (probe set v4); confined sessions also bind `GOPATH` and the pnpm store per session.
+- Confined pi seats can run `pnpm install`: `XDG_RUNTIME_DIR` is bound to a per-session owner-only directory, where pnpm 12.8.2 and later keep the store lock (older pnpm 12 locks under `/tmp`, which confinement denies). Under the read scope seats also read `~/.npmrc` (secret-bearing: registry tokens) and pnpm's global config.
+- A passing confinement self-test is cached under the host state home for 24 hours, keyed by backend and OS build, probe set, harness and worker executables and host directories, so later seats skip the ~14 s probe run.
 
 ## v0.72.63 — 2026-10-05
 
